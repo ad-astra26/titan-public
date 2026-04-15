@@ -1,0 +1,97 @@
+[project]
+name = "openclaw-plugin-titan"
+version = "2.0.0a1"
+description = "Titan Memory Architecture: Sovereign AI with Graph Memory, On-Chain Identity, and Offline RL for OpenClaw Agents"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Antigravity Labs"},
+]
+readme = "README.md"
+
+# ── Core Dependencies ──────────────────────────────────────────────────────────
+# These are the minimum required packages for a functional Titan.
+# OpenClaw SDK is a PEER dependency — the host framework provides it.
+# Solana SDKs (solders, solana) degrade gracefully when absent.
+dependencies = [
+    # Memory & Intelligence
+    "duckdb>=1.0.0",                    # Unified metadata store (replaces SQLite memory_nodes.db)
+    "faiss-cpu>=1.7.0",                 # FAISS vector index for semantic search
+    "kuzu>=0.4.0",                      # Knowledge graph (Trinity-typed entities)
+    "fastembed>=0.3.0",                 # Lightweight embeddings (bge-small-en-v1.5)
+    "sentence-transformers>=4.0.0",     # Lightweight embeddings (all-MiniLM-L6-v2)
+    "torch>=2.0.0",                     # RL backbone (IQL Actor/Critic/Value networks)
+    "tensordict>=0.4.0",               # TorchRL data structures
+    "torchrl>=0.4.0",                  # Offline RL (ReplayBuffer, IQLLoss)
+
+    # Blockchain (graceful degradation if absent)
+    "solders>=0.21.0",                 # Solana primitives (Pubkey, Keypair, Instruction)
+    "solana>=0.34.0",                  # Solana RPC client (AsyncClient)
+    "cryptography>=42.0.0",           # AES-256-GCM encryption, PBKDF2 key derivation
+
+    # API & Networking
+    "fastapi>=0.110.0",               # Sovereign Observatory API
+    "uvicorn>=0.27.0",                # ASGI server
+    "httpx>=0.27.0",                  # Async HTTP (OpenRouter, TwitterAPI.io, SearXNG, Ollama, Shadow Drive)
+    "websockets>=12.0",               # Real-time event stream (Observatory WebSocket)
+
+    # Expressive Engine
+    "pillow>=10.2.0",                 # Procedural art (flow fields, L-systems, NFT composites)
+    "pydub>=0.25.1",                  # Audio format conversion (WAV generation uses stdlib wave)
+]
+
+# ── Optional Dependency Tiers ──────────────────────────────────────────────────
+[project.optional-dependencies]
+
+# Research stack: Stealth-Sage multi-modal research pipeline (~500MB)
+# Install: pip install openclaw-plugin-titan[research]
+research = [
+    "crawl4ai>=0.4.0",                # Playwright-based stealth web scraper
+    "playwright>=1.42.0",             # Browser automation (needs: playwright install chromium)
+    "unstructured[pdf,docx,pptx,xlsx]>=0.14.0",  # Document intelligence
+    "ollama>=0.1.7",                  # Local LLM inference (distillation, haiku, scoring)
+]
+
+# Sovereign stack: ZK-Vault and Anchor program interaction
+# Install: pip install openclaw-plugin-titan[sovereign]
+sovereign = [
+    "anchorpy>=0.20.1",              # Anchor IDL interaction for titan_zk_vault
+]
+
+# Development: test document generation + QR codes for genesis ceremony
+# Install: pip install openclaw-plugin-titan[dev]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "reportlab>=4.0.0",              # PDF generation (test fixtures)
+    "python-docx>=1.1.0",           # DOCX generation (test fixtures)
+    "python-pptx>=0.6.23",          # PPTX generation (test fixtures)
+    "openpyxl>=3.1.2",              # XLSX generation (test fixtures)
+    "qrcode>=7.4",                   # QR code for Shard 1 display in genesis ceremony
+]
+
+# Everything: full sovereign deployment
+# Install: pip install openclaw-plugin-titan[full]
+full = [
+    "openclaw-plugin-titan[research,sovereign,dev]",
+]
+
+# ── Entry Points ───────────────────────────────────────────────────────────────
+[project.scripts]
+titan-main = "scripts.titan_main:main"
+
+[project.entry-points."openclaw.plugins"]
+titan = "titan_plugin:init_plugin"
+
+# ── Build System ───────────────────────────────────────────────────────────────
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["titan_plugin*", "scripts*"]
+
+# ── Pytest Configuration ───────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

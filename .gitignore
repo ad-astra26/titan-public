@@ -1,0 +1,45 @@
+# Data (training state, memories, consciousness)
+data/
+cognee_data/
+
+# Config with secrets (use config.toml.example as template)
+titan_plugin/config.toml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+test_env/
+.venv/
+*.egg-info/
+
+# Environment
+.env
+.env.*
+
+# Build artifacts
+target/
+node_modules/
+.next/
+
+# Logs and runtime
+*.log
+*.pid
+*.memmap
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Keypairs (NEVER commit)
+*_keypair.json
+*_authority.json
+authority.json
+*.enc
+
+# Test artifacts
+.pytest_cache/
+test-results/

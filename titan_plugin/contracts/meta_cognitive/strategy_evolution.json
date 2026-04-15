@@ -1,0 +1,28 @@
+{
+  "contract_id": "strategy_evolution",
+  "version": 1,
+  "contract_type": "genesis",
+  "author": "titan",
+  "description": "Detect strategy drift in meta-reasoning chain templates and emit META_STRATEGY_DRIFT for inverse-frequency-weighted bias adjustment in spirit_worker.",
+  "rules": [
+    {
+      "op": "AND",
+      "clauses": [
+        {"op": "IF", "field": "meta_chains", "cmp": "GTE", "value": 50},
+        {"op": "DELTA", "field": "dream_cycles", "n_back": 1, "cmp": "GTE", "value": 1}
+      ],
+      "then": {
+        "action": "emit",
+        "event": "META_STRATEGY_DRIFT",
+        "data": {
+          "reason": "post_dream_check",
+          "phase": "tuning_012_v2_sub_c"
+        }
+      }
+    }
+  ],
+  "triggers": ["genesis_seal"],
+  "fork_scope": "meta",
+  "status": "active",
+  "phase": "tuning_012_v2_sub_phase_c"
+}

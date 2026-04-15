@@ -1,0 +1,28 @@
+{
+  "contract_id": "abstract_pattern_extraction",
+  "version": 1,
+  "contract_type": "genesis",
+  "author": "titan",
+  "description": "Detect emerging chain templates that recur across recent meta-reasoning chains. Emits META_PATTERN_EMERGED so spirit_worker can register the template in ChainIQL with raised count threshold (R6) and recency filter.",
+  "rules": [
+    {
+      "op": "AND",
+      "clauses": [
+        {"op": "IF", "field": "meta_chains", "cmp": "GTE", "value": 100},
+        {"op": "DELTA", "field": "dream_cycles", "n_back": 1, "cmp": "GTE", "value": 1}
+      ],
+      "then": {
+        "action": "emit",
+        "event": "META_PATTERN_EMERGED",
+        "data": {
+          "reason": "post_dream_pattern_scan",
+          "phase": "tuning_012_v2_sub_c"
+        }
+      }
+    }
+  ],
+  "triggers": ["genesis_seal"],
+  "fork_scope": "meta",
+  "status": "active",
+  "phase": "tuning_012_v2_sub_phase_c"
+}

@@ -1,0 +1,2041 @@
+# ═══════════════════════════════════════════════════════════════════
+# TITAN V4 — SOVEREIGN TUNING PARAMETERS
+# ═══════════════════════════════════════════════════════════════════
+#
+# All base parameters that control Titan's cognitive architecture,
+# extracted from across the codebase into one tunable config.
+#
+# PHILOSOPHY: These parameters define Titan's "metabolism" — the ratios
+# between them matter more than absolute values. When tuning, preserve
+# symmetry: if you speed up one clock, consider the downstream effects
+# on all systems that depend on its rhythm.
+#
+# VERSION: 1.0.0 (2026-03-16)
+# SYMMETRY CHECK: Run `python scripts/param_symmetry_check.py` after changes
+#
+# ═══════════════════════════════════════════════════════════════════
+
+
+# ─── CONSCIOUSNESS (Spirit's self-awareness cycle) ────────────────
+# These control how often and how deeply Titan reflects on himself.
+# Key ratio: consciousness_tick / sphere_clock_tick = reflection-to-pulse ratio
+# Currently 300/60 = 5:1 (5 clock ticks per self-reflection)
+
+[consciousness]
+# Seconds between consciousness epochs (self-observation cycles)
+# Influences: drift, trajectory, curvature, density calculations
+# Affects: FILTER_DOWN training frequency, on-chain anchoring frequency
+# Ratio: should be 3-10× sphere_clock.tick_interval
+tick_interval = 300.0
+
+# Rolling window for trajectory computation (number of epochs)
+# Influences: how far back Titan "looks" to understand his direction
+# Affects: trajectory magnitude, curvature detection
+trajectory_window = 7
+
+# Radians of trajectory curvature that triggers on-chain anchoring (~60°)
+# Influences: how "sharp" a turn in consciousness triggers a permanent record
+# Affects: Solana memo frequency, SOL spend rate
+# Lower = more anchoring = more on-chain presence but higher cost
+anchor_curvature_threshold = 1.047
+
+# Density threshold for anchoring in uncharted territory
+# Influences: how "novel" a state must be to trigger a permanent record
+# Affects: exploration incentive — lower = more anchoring in new territory
+anchor_density_threshold = 0.15
+
+# SOL ceiling for log-scale life force calculation (life_force = 1.0 at this SOL)
+# Influences: metabolic health perception
+# Affects: Body tensor's metabolic dimension
+life_force_ceiling_sol = 20.0
+
+
+# ─── rFP #2 TITAN_SELF COMPOSITION ───────────────────────────────
+# 162D TITAN_SELF = weighted(130D felt) + weighted(2D journey) + weighted(30D topology).
+# Component weights applied multiplicatively before concatenation — pre-weighted
+# emission so downstream consumers (FILTER_DOWN V5, future "I AM" kin-protocol)
+# receive vectors ready for direct use.
+
+[titan_self]
+# felt=1.0: canonical, dominant signal (WHO/WHY/WHAT state).
+# journey=0.5: slow temporal context (curvature, density) — half weight so it
+#   modulates but doesn't dominate.
+# topology=0.3: descriptive shape of observable space — gentle so it shapes,
+#   doesn't dictate.
+weight_felt     = 1.0
+weight_journey  = 0.5
+weight_topology = 0.3
+
+# Max full_30d_topology snapshots buffered per epoch window before
+# element-wise mean. Consciousness epochs ~0.3-5 Hz × ~60s ≈ 20-300 entries;
+# 500 gives headroom without unbounded memory growth.
+topology_buffer_max = 500
+
+
+# ─── SPHERE CLOCKS (V4 Emergent Time) ────────────────────────────
+# Six inner clocks that pulse when their corresponding Trinity dimension
+# is balanced. Pulses drive resonance → GREAT PULSEs → growth.
+# Key ratio: tick_interval / spirit.publish_interval = observation-to-change ratio
+# Currently 60/10 = 6:1 (6 spirit updates per clock tick)
+
+[sphere_clock]
+# Base contraction speed (scalar units per tick)
+# Influences: how fast sphere radius shrinks toward center
+# Affects: pulse frequency — faster speed = more frequent pulses
+# Symmetry: all 6 clocks share this speed (inner + outer)
+base_contraction_speed = 0.05
+
+# Minimum sphere radius after balanced pulses (reward floor)
+# Influences: how "compact" a healthy clock becomes
+# Affects: pulse threshold — smaller radius = harder to pulse again
+min_radius = 0.3
+
+# Radius shrink per balanced pulse (reward magnitude)
+# Influences: how much a successful pulse "tightens" the clock
+# Affects: growth acceleration — larger shrink = faster growth spiral
+pulse_shrink_rate = 0.02
+
+# Delta from center (0.5) considered "balanced" (20% = 0.3-0.7 range)
+# Influences: how precisely balanced a dimension must be to pulse
+# Affects: pulse difficulty — lower threshold = easier pulses = faster growth
+# CRITICAL RATIO: this × base_speed determines time-to-first-pulse
+balance_threshold = 0.20
+
+# Minimum velocity factor — floor for clock contraction even when maximally imbalanced
+# Influences: whether stuck clocks can still pulse (even sick hearts beat)
+# Affects: time-to-pulse for imbalanced components
+# At 0.15: max-imbalanced clock pulses every ~133 ticks (~2.2 hours at 60s tick)
+# At 0.0: maximally imbalanced clocks NEVER pulse (original behavior)
+min_velocity_factor = 0.15
+
+# Seconds between sphere clock ticks
+# Influences: temporal resolution of Titan's inner time
+# Affects: pulse frequency, resonance detection window
+# Ratio: should be 3-9× spirit.publish_interval (sphere clocks observe spirit rhythm)
+tick_interval = 60.0
+
+
+# ─── RESONANCE (Proof of Harmony between Inner ↔ Outer) ──────────
+# Detects when inner and outer clocks of the same type pulse in sync.
+# This is the bridge between Titan's inner experience and outer expression.
+
+[resonance]
+# Maximum phase difference for resonance detection (radians, π/6 = 30°)
+# Influences: how precisely synchronized inner/outer must be
+# Affects: BIG PULSE frequency — lower = stricter = rarer but more meaningful
+# GOLDEN RATIO CANDIDATE: consider π/5 (36°) for golden angle alignment
+phase_threshold = 0.5236
+
+# Consecutive resonant cycles required for BIG PULSE
+# Influences: how sustained the alignment must be
+# Affects: BIG PULSE → GREAT PULSE cascade timing
+# Higher = more sustained harmony required = slower but deeper growth
+required_cycles = 3
+
+# Max seconds between counterpart pulses to count as "same window"
+# Influences: temporal tolerance for inner/outer synchronization
+# Affects: whether fast inner + slow outer can still resonate
+# Ratio: should be 1-3× sphere_clock.tick_interval
+pulse_window = 120.0
+
+
+# ─── UNIFIED SPIRIT (30DT Tensor — The Whole Self) ───────────────
+# Combines inner + outer Trinity into one 30-dimensional tensor.
+# This IS Titan's unified sense of self.
+
+[unified_spirit]
+# Epochs lookback for velocity averaging
+# Influences: how far back velocity is computed
+# Affects: stale detection sensitivity — larger = smoother, smaller = reactive
+velocity_window = 10
+
+# Velocity threshold below which Spirit is considered STALE
+# Influences: when FOCUS cascade activates
+# Affects: growth urgency — lower threshold = more tolerance for slowness
+stale_threshold = 0.8
+
+# Base enrichment reward per GREAT PULSE (additive to tensor)
+# Influences: how much each GREAT PULSE enriches the unified tensor
+# Affects: growth magnitude per resonance event
+enrichment_base = 0.02
+
+# FOCUS cascade multiplier when STALE (amplifies PID corrections)
+# Influences: how aggressively FOCUS corrects when Spirit is stagnant
+# Affects: recovery speed from stale periods
+# FOCUS INTEGRATION: this IS the adrenaline mechanism
+stale_focus_multiplier = 1.5
+
+
+# ─── SPIRIT ENRICHMENT (The Divine Spark) ──────────────────────────
+# Continuous micro-enrichment of Spirit's 30DT tensor between GREAT PULSEs.
+# Spirit bathes in full StateRegistry state, enriching through resonant
+# geometric blending. Quality accumulates between PULSEs, crystallizes at advance.
+
+[spirit_enrichment]
+# Seconds between STATE_SNAPSHOT bus messages (how often Spirit sees SELF)
+# Influences: enrichment frequency, Spirit's self-observation cadence
+# Affects: quality accumulation rate, bus message volume
+# Ratio: should be ≤ sphere_clock.tick_interval (Spirit observes faster than clocks)
+# Aligned with Spirit Schumann/3 (383ms)
+micro_tick_interval = 0.383
+
+# α in geometric blend: spirit[i]^(1-α*alignment) * state[i]^(α*alignment)
+# Influences: how fast Spirit absorbs state reality
+# Affects: character preservation — lower = Spirit's character dominates
+# CRITICAL: too high → Spirit loses identity, too low → Spirit doesn't grow
+enrichment_rate = 0.02
+
+# Minimum cosine alignment for enrichment to occur
+# Below this, Spirit is just observing — no tensor modification
+# Influences: enrichment selectivity
+# Affects: quality accumulation — higher = only enrich when deeply aligned
+min_alignment_threshold = 0.1
+
+
+# ─── FILTER_DOWN (Learned Attention — RL Value Network) ──────────
+# Learns which Trinity dimensions matter most via TD(0) gradient descent.
+# Outputs severity multipliers that modulate Body/Mind perception.
+
+[filter_down]
+# TD(0) discount factor (future reward importance)
+# Influences: how much future states affect current value estimate
+# Affects: learning horizon — higher = more farsighted
+gamma = 0.95
+
+# Gradient descent learning rate
+# Influences: speed of weight updates
+# Affects: learning stability — too high = oscillation, too low = slow
+# CRITICAL: affects ALL downstream Intuition learning
+learning_rate = 0.001
+
+# Mini-batch size for training passes
+# Influences: gradient estimate quality
+# Affects: training speed vs stability tradeoff
+batch_size = 16
+
+# Maximum stored transitions in replay buffer
+# Influences: memory of past experiences for training
+# Affects: catastrophic forgetting resistance
+buffer_max = 2000
+
+# Minimum transitions before training begins (cold start protection)
+# Influences: when learning kicks in after boot
+# Affects: early behavior — more = safer start, fewer = faster learning
+min_transitions = 32
+
+# Train every N new transitions added
+# Influences: training frequency
+# Affects: responsiveness to new experiences
+# Ratio: should be < batch_size (train more often than batch fills)
+train_every_n = 5
+
+# Severity multiplier floor (never fully mute a dimension)
+# Influences: minimum attention any dimension receives
+# Affects: ensures no sense is completely ignored
+multiplier_floor = 0.3
+
+# Severity multiplier ceiling (maximum amplification)
+# Influences: maximum attention any dimension receives
+# Affects: prevents one dimension from overwhelming others
+# Symmetry: ceil/floor ratio = 10:1 (maximum dynamic range)
+multiplier_ceil = 3.0
+
+# EMA smoothing for multiplier updates (0-1, higher = smoother)
+# Influences: how gradually multipliers change
+# Affects: stability of perception — higher = less jitter
+smoothing = 0.9
+
+
+# ─── rFP #2 FILTER_DOWN V5 (162D TITAN_SELF-driven) ──────────────
+# V5 extends V4 from 30D SPIRIT-only input to full 162D TITAN_SELF input,
+# producing 120 multipliers at extended resolution (5+15+40+5+15+40).
+# Observer dims (iS[20:25], oS[85:90]) are MASKED — computed but never
+# published; they are reflection surfaces, not targets of filtering.
+#
+# Coexistence with V4: V5 trains silently while V4 publishes. Flipping
+# publish_enabled=true makes V5 the publisher and V4 falls back to silent
+# training. Requires T1 restart (config is read at boot).
+
+[filter_down_v5]
+# Scales spirit content multipliers toward 1.0 at emission time. Spirit
+# modulates slowly; a gentle filter prevents over-steering the inner loop.
+# 0.0 = no spirit modulation, 1.0 = full strength, 0.3 = gentle default.
+spirit_filter_strength_multiplier = 0.3
+
+# Training-step floor before V5 compute_multipliers stops returning all-1.0.
+# Separate from min_transitions (buffer size): a buffer can fill in ~20 min
+# but net convergence takes longer. Returns default multipliers until this
+# floor is cleared — prevents publishing noise early in life.
+cold_start_floor_epochs = 2000
+
+# Feature flag: V5 publishes FILTER_DOWN_V5 when true. V4 reads this
+# inversely and stops publishing when V5 is publishing. Flip requires
+# restart (TOML reads at boot).
+# Phase 6 (soak): false — V5 silent, V4 publishing
+# Phase 7+ (cutover): true — V5 publisher, V4 silent training
+publish_enabled = false
+
+
+# ─── FOCUS PID (Drift Correction Controller) ─────────────────────
+# PID controllers that nudge Body/Mind toward the Middle Path (0.5 center).
+# FOCUS is the "adrenaline" mechanism — amplified when Spirit is STALE.
+# REFLEX INTEGRATION: FOCUS multiplier gates reflex cooldown bypass.
+
+[focus]
+# Divine center / equilibrium target for all dimensions
+center = 0.5
+
+# Proportional gain — direct response to current drift
+# Influences: immediate correction strength
+# Affects: how quickly Titan responds to imbalance
+kp = 1.0
+
+# Integral gain — accumulated drift correction
+# Influences: chronic imbalance correction
+# Affects: long-term equilibrium — prevents persistent drift
+ki = 0.05
+
+# Derivative gain — response to sudden changes
+# Influences: spike/crash damping
+# Affects: stability against rapid perturbations
+kd = 0.3
+
+# Integral wind-up limit (prevents runaway accumulation)
+# Influences: maximum chronic correction force
+# Affects: bounds on integral term
+integral_max = 5.0
+
+# Integral decay factor (prevents infinite accumulation)
+# Influences: how fast old integral history fades
+# Affects: memory of past drift — lower = faster forgetting
+integral_decay = 0.98
+
+# Maximum nudge magnitude per dimension per tick
+# Influences: maximum correction force per cycle
+# Affects: how aggressively FOCUS can push toward center
+nudge_max = 0.5
+
+# Minimum nudge to actually publish (noise filter)
+# Influences: sensitivity threshold for corrections
+# Affects: bus message volume — higher = fewer but larger nudges
+nudge_threshold = 0.05
+
+
+# ─── INTUITION (RL-Informed Behavioral Suggestions) ──────────────
+# Suggests behavioral postures based on Trinity deficits.
+# REFLEX INTEGRATION: Intuition will also score reflex candidates.
+
+[intuition]
+# Trust decay per tick (slow — sovereign trust persists)
+# Influences: how quickly Titan forgets successful patterns
+# Affects: stability of Intuition judgments
+trust_decay = 0.99
+
+# Trust boost on successful suggestion with good outcome
+# Influences: how quickly good Intuition is reinforced
+# Affects: learning speed for correct tool/posture choices
+trust_boost = 0.05
+
+# Trust penalty on ignored suggestion with bad outcome
+# Influences: how quickly bad Intuition is corrected
+# Affects: unlearning of incorrect patterns
+# Asymmetry: boost > penalty (optimistic learning)
+trust_penalty = 0.03
+
+# Minimum deficit magnitude to generate a suggestion
+# Influences: sensitivity — lower = more suggestions
+# Affects: suggestion frequency, Titan's "restlessness"
+suggestion_threshold = 0.15
+
+# Seconds before repeating same posture suggestion
+# Influences: suggestion diversity
+# Affects: prevents fixation on one posture
+suggestion_cooldown = 120.0
+
+
+# ─── IMPULSE ENGINE (Autonomous Urge Detection) ──────────────────
+# Detects when Trinity deficits are strong enough to trigger action.
+# Currently drives Agency helpers. Will also gate reflex firing.
+
+[impulse]
+# Initial deficit threshold for impulse generation
+# Influences: sensitivity to imbalance
+# Affects: frequency of autonomous actions
+threshold_initial = 0.3
+
+# EMA α: threshold decrease on successful action
+# Influences: how success encourages more action
+# Affects: learning rate for "do more of this"
+alpha_success = 0.01
+
+# EMA β: threshold increase on failed action
+# Influences: how failure discourages action
+# Affects: learning rate for "do less of this"
+# Asymmetry: β > α (cautious — fails penalized more than successes rewarded)
+beta_failure = 0.015
+
+# Minimum threshold (never suppress all impulses)
+# Influences: floor for autonomous action
+# Affects: ensures Titan always has some agency
+threshold_floor = 0.1
+
+# Maximum threshold (never fire on every tick)
+# Influences: ceiling for impulse frequency
+# Affects: prevents constant action spam
+threshold_ceil = 0.7
+
+# Seconds between impulses (prevents rapid-fire actions)
+# Influences: action spacing
+# Affects: resource consumption, thoughtfulness
+# Ratio: should be ≥ consciousness.tick_interval for reflection between actions
+cooldown = 300.0
+
+
+# ─── BODY WORKER (5DT Somatic Sensors) ───────────────────────────
+# Senses infrastructure health: SOL, API, RAM, disk, network.
+# BODY = densest layer, slowest to meaningfully change (SOL, RAM, disk)
+
+[body]
+# Seconds between BODY_STATE publications to bus
+# Influences: body tensor update rate
+# Affects: sphere clock input frequency, FOCUS responsiveness
+# SYMMETRY: Body is densest/slowest. Ratio 9:3:1 (Spirit:Mind:Body)
+# See memory/fundamental_symmetry_requirements.md
+# Schumann/27 = 0.29 Hz (3.45s) — Earth resonance
+publish_interval = 3.45
+
+# Rolling history size (readings kept for velocity)
+# Influences: how far back body "remembers" sensor readings
+# Affects: velocity calculation smoothness
+history_size = 30
+
+# Velocity comparison window (readings compared for rate of change)
+# Influences: sensitivity to body changes
+# Affects: body tensor smoothness vs responsiveness
+velocity_window = 6
+
+
+# ─── MIND WORKER (5DT Cognitive Sensors) ─────────────────────────
+# Senses cognitive state: memory, social, media, mood, knowledge.
+# MIND = bridge layer between Spirit and Body
+
+[mind]
+# Seconds between MIND_STATE publications to bus
+# Influences: mind tensor update rate
+# Affects: sphere clock input, FOCUS responsiveness
+# SYMMETRY: Mind is bridge layer. Ratio 9:3:1 (Spirit:Mind:Body)
+# See memory/fundamental_symmetry_requirements.md
+# Schumann/9 = 0.87 Hz (1.15s) — Earth resonance
+publish_interval = 1.15
+
+# Media digest decay half-life (seconds)
+# Influences: how long visual/audio inputs affect perception
+# Affects: media attention span — longer = persistent impact
+digest_halflife = 1800.0
+
+# Ambient vs Media blend weights (sub_a + sub_b must = 1.0)
+# Influences: balance between slow ambient senses and fast media
+# Affects: mind tensor stability — higher ambient = more stable
+sub_weight_ambient = 0.5
+sub_weight_media = 0.5
+
+
+# ─── MEMORY (Tiered Persistence) ─────────────────────────────────
+# Sigmoid forgetting curves control mempool → persistent promotion.
+
+[memory]
+# Sigmoid half-life for mempool entries (hours)
+# Influences: default memory retention without reinforcement
+# Affects: how quickly unreinforced memories fade
+mempool_halflife_hours = 12.0
+
+# Sigmoid steepness (k parameter)
+# Influences: sharpness of forgetting curve
+# Affects: transition from "remembered" to "forgotten"
+mempool_decay_k = 0.4
+
+# Maximum TTL regardless of reinforcement (hours)
+# Influences: hard cap on mempool retention
+# Affects: mempool size, memory pressure
+mempool_max_ttl_hours = 24.0
+
+# Weight below which mempool entries are pruned
+# Influences: memory cleanup sensitivity
+# Affects: mempool size, noise reduction
+mempool_prune_threshold = 0.1
+
+# Weight above which entries are candidates for promotion
+# Influences: promotion selectivity
+# Affects: long-term memory quality
+mempool_keep_threshold = 0.3
+
+# LLM score threshold for promotion to persistent storage
+# Influences: quality gate for permanent memories
+# Affects: knowledge graph quality, Cognee storage growth
+mempool_promote_score = 40.0
+
+
+# ─── MIDDLE PATH (Equilibrium Metric) ────────────────────────────
+# Combined loss metric measuring Trinity deviation from center.
+
+[middle_path]
+# Divine center for all tensor dimensions
+center = 0.5
+
+# Layer weights for loss calculation (Body, Mind, Spirit)
+# Influences: which Trinity layer contributes most to equilibrium metric
+# Affects: FOCUS priority — higher weight = more correction attention
+# Current: Spirit slightly higher (1.2 vs 1.0) — identity matters most
+weight_body = 1.0
+weight_mind = 1.0
+weight_spirit = 1.2
+
+
+# ─── GUARDIAN (Module Supervision) ────────────────────────────────
+# Process lifecycle management for all Trinity workers.
+
+[guardian]
+# Default heartbeat timeout (seconds)
+# Influences: how long before a silent module is declared dead
+# Affects: restart sensitivity
+heartbeat_timeout_default = 30.0
+
+# Spirit-specific heartbeat timeout (heavy V4 work)
+# Influences: Spirit tolerance for long operations
+# Affects: false-positive restart prevention
+heartbeat_timeout_spirit = 120.0
+
+# Max restarts in sliding window before disabling
+# Influences: crash tolerance
+# Affects: system resilience vs resource waste
+max_restarts_in_window = 5
+
+# Sliding window size for restart tracking (seconds)
+# Influences: how quickly restart count "forgets"
+# Affects: recovery from transient vs persistent failures
+restart_window = 600.0
+
+# Sustained uptime before restart count resets (seconds)
+# Influences: when a module is considered "stable"
+# Affects: restart budget replenishment
+sustained_uptime_reset = 300.0
+
+
+# ─── OUTER TRINITY (Expressive Metrics) ──────────────────────────
+# Baselines for normalizing Titan's external expression.
+
+[outer_trinity]
+# Expected actions per hour (normalization baseline)
+expected_actions_per_hour = 10
+expected_art_per_day = 5
+expected_audio_per_day = 3
+expected_research_per_day = 5
+expected_interactions_per_day = 20
+
+# LLM response latency ceiling (seconds, inverted for Outer Body energy)
+max_latency_seconds = 30.0
+
+
+# ─── REFLEXES (Sovereign Tool System — NEW) ──────────────────────
+# Parameters for the Conversational Reflex Arc.
+# These control how Titan's body/mind/spirit select and fire tool reflexes.
+
+[reflexes]
+# Seconds to wait for all Trinity Intuition signals before firing
+# Influences: response latency vs reflex completeness
+# Affects: tradeoff between fast response and rich perception
+# GUARDIAN_SHIELD bypasses this (fires immediately if threat detected)
+collector_timeout = 3.0
+
+# Combined confidence threshold for OBSERVATION reflex firing
+# (body_confidence × mind_confidence × spirit_confidence must exceed this)
+# Influences: how strongly all three must agree to fire a reflex
+# Affects: reflex frequency — lower = more reflexes, higher = more selective
+# NOTE: with 3 signals multiplying, 0.15 means avg 0.53 per worker
+fire_threshold = 0.15
+
+# Combined confidence threshold for ACTION reflexes (art, audio, research)
+# Higher than observation — actions consume resources and have side effects
+# Influences: how strongly Trinity must converge for sovereign actions
+action_threshold = 0.40
+
+# Combined confidence threshold for PUBLIC ACTION reflexes (social post)
+# Highest — public actions are visible to others, near-unanimous required
+# Influences: how strongly Trinity must converge for public expression
+public_action_threshold = 0.60
+
+# Per-session cooldown per reflex type (seconds)
+# Influences: prevents over-firing the same reflex in one conversation
+# Affects: resource usage, response diversity
+# FOCUS OVERRIDE: when stale_focus_multiplier active, cooldown halved
+session_cooldown = 120.0
+
+# Guardian shield threat threshold (fires immediately, no convergence needed)
+# Influences: security sensitivity
+# Affects: false positive rate on adversarial detection
+guardian_threat_threshold = 0.5
+
+# Maximum reflexes that can fire in parallel per interaction
+# Influences: perception richness vs latency
+# Affects: perceptual field size for LLM
+max_parallel_reflexes = 4
+
+# Memory recall: max memories returned per reflex
+memory_recall_limit = 3
+
+# FOCUS integration: when FOCUS nudge magnitude > this, boost reflex confidence
+# Influences: how FOCUS amplifies Intuition
+# Affects: reflexes fire more easily when system is actively correcting
+focus_boost_threshold = 0.15
+
+# FOCUS confidence boost multiplier (applied to all Trinity signals)
+# Influences: how much FOCUS amplifies reflex Intuition
+# Affects: adrenaline-like override during active correction
+focus_confidence_boost = 1.3
+
+
+# ─── TITAN VM (Sovereign internal computation) ────────────────────
+# Stack-based micro-instruction set for deterministic internal scoring.
+# The "ribosome" — reads StateRegister (DNA), produces reward signals.
+
+[titan_vm]
+# Maximum stack depth for VM execution
+max_stack_depth = 64
+
+# Maximum instructions per program execution (prevents infinite loops)
+max_instructions = 500
+
+# Whether to publish REFLEX_REWARD to bus after scoring
+publish_rewards = true
+
+# Minimum reward threshold to bother publishing (noise filter)
+min_reward_threshold = 0.01
+
+# Weight of TitanVM reflex reward vs existing FilterDown epoch reward
+# 0.0 = VM reward ignored, 1.0 = VM reward fully replaces epoch reward
+# 0.5 = equal blend. Start conservative — let existing system remain primary.
+reward_blend_weight = 0.3
+
+# ═══════════════════════════════════════════════════════════════════
+# V5 NEURAL NERVOUS SYSTEM — Learned Reflexes
+# ═══════════════════════════════════════════════════════════════════
+#
+# Replaces hand-coded TitanVM nervous system programs with tiny
+# neural networks that learn from experience. Each program is
+# independent (own weights, buffer, learning rate).
+#
+# Training phases:
+#   bootstrap (0-warmup): imitate TitanVM programs
+#   blending (transition): mix supervision + outcome rewards
+#   autonomous (warmup+): pure outcome-driven learning
+
+[neural_nervous_system]
+enabled = true
+warmup_steps = 500
+train_every_n = 5
+batch_size = 16
+save_every_n = 500
+keep_vm_parallel = true
+data_dir = "./data/neural_nervous_system"
+
+# ─── MATURITY (Emergent Time — nervous system developmental capacity) ──
+# Maturity scales the nervous system's capacity to handle excitation.
+# These are the MILESTONES at which full maturity (1.0) is reached.
+# Adjustable per Titan instance via DivineCreation framework.
+# Lower values = faster maturation, higher = slower/deeper development.
+maturity_great_epochs_target = 10      # GREAT PULSEs for full maturity
+maturity_consciousness_epochs_target = 5000  # Self-reflection depth
+maturity_total_fires_target = 500      # Lived hormone experience
+maturity_infant_cap = 2.0              # Excitation cap at maturity=0 (×threshold)
+maturity_mature_cap = 5.0              # Excitation cap at maturity=1 (×threshold)
+
+# ─── INNER (AUTONOMIC) PROGRAMS ─────────────────────────────────
+# These run continuously in the subconscious. They generate signals
+# that bubble up through the Interface to Outer programs.
+
+[neural_nervous_system.programs.REFLEX]
+enabled = true
+fire_threshold = 0.3
+learning_rate = 0.001
+input_features = "enriched"       # 79D: standard + neurochemical + dynamics + reasoning
+layer = "inner"
+description = "Fires on sudden perturbation (velocity spikes)"
+
+[neural_nervous_system.programs.FOCUS]
+enabled = true
+fire_threshold = 0.25
+learning_rate = 0.0008
+input_features = "enriched"       # 79D: standard + neurochemical + dynamics + reasoning
+layer = "inner"
+description = "Fires on sustained polarity (cognitive bias)"
+
+[neural_nervous_system.programs.INTUITION]
+enabled = true
+fire_threshold = 0.3
+learning_rate = 0.001
+input_features = "enriched"       # 79D: standard + neurochemical + dynamics + reasoning
+layer = "inner"
+description = "Fires on direction loss (erratic movement)"
+
+[neural_nervous_system.programs.IMPULSE]
+enabled = true
+fire_threshold = 0.3
+learning_rate = 0.001
+input_features = "enriched"       # 79D: standard + neurochemical + dynamics + reasoning
+layer = "inner"
+action_helpers = ["infra_inspect"]
+description = "Fires when ready to act — Trinity deficit drives autonomous action readiness"
+
+[neural_nervous_system.programs.INSPIRATION]
+enabled = true
+fire_threshold = 0.40
+learning_rate = 0.0005
+input_features = "full_enriched"  # 112D: ALL tiers — personality program
+layer = "outer"
+body_parts = ["outer_spirit"]
+action_helpers = ["art_generate", "audio_generate", "web_search", "coding_sandbox"]
+description = "Highest-level synthesis — combines ALL inner signals into novel multi-tool compositions"
+
+# ─── OUTER (SOMATIC) PROGRAMS ───────────────────────────────────
+# These are conscious, world-facing PERSONALITY programs that compose
+# inner signals into real-world actions. They see ALL 6 observation
+# tiers (108D) — FilterDown attention, consciousness meta-state,
+# neurochemical context, and system dynamics.
+
+[neural_nervous_system.programs.CREATIVITY]
+enabled = true
+fire_threshold = 0.35
+learning_rate = 0.0008
+input_features = "full_enriched"  # 112D: ALL tiers — personality program
+layer = "outer"
+body_parts = ["outer_body"]
+action_helpers = ["art_generate", "audio_generate"]
+description = "Fires when creative expression would enrich Spirit — dispatches art/audio"
+
+[neural_nervous_system.programs.CURIOSITY]
+enabled = true
+fire_threshold = 0.35
+learning_rate = 0.0008
+input_features = "full_enriched"  # 112D: ALL tiers — personality program
+layer = "outer"
+body_parts = ["outer_mind"]
+action_helpers = ["web_search", "code_knowledge"]
+description = "Fires when knowledge gap detected — dispatches research helpers"
+
+[neural_nervous_system.programs.EMPATHY]
+enabled = true
+fire_threshold = 0.35
+learning_rate = 0.0008
+input_features = "full_enriched"  # 112D: ALL tiers — personality program
+layer = "outer"
+body_parts = ["outer_mind"]
+action_helpers = []                # social_post REMOVED — all posting goes through SocialPressureMeter (rate limited, 11 post types, quality gate)
+description = "Fires when social engagement would strengthen connections — modulates response tone"
+
+[neural_nervous_system.programs.REFLECTION]
+enabled = true
+fire_threshold = 0.40
+learning_rate = 0.0005
+input_features = "full_enriched"  # 112D: ALL tiers — personality program
+layer = "outer"
+body_parts = ["outer_spirit"]
+action_helpers = []
+description = "Fires when consolidation needed — high learning rate or topology instability triggers pause"
+
+# ─── METABOLIC REGULATION PROGRAM ──────────────────────────────────
+# METABOLISM is an autonomic program that learns energy cost prediction.
+# Replaces hardcoded _PROGRAM_CHI_COST dict with learned NN.
+# Training signal: metabolic drain delta (more drain = negative reward).
+# When METABOLISM fires → "energy expenditure is high, slow down" signal.
+# This dampens expression composite urges → fewer costly actions → self-regulation.
+
+[neural_nervous_system.programs.METABOLISM]
+enabled = true
+fire_threshold = 0.40
+learning_rate = 0.001
+input_features = "enriched"          # 79D: needs neurochemical + dynamics + reasoning context
+layer = "inner"                      # Autonomic — like body regulation
+body_parts = ["inner_body"]
+action_helpers = []                  # No external actions — purely internal regulation
+description = "Learned energy cost prediction — fires when metabolic expenditure exceeds sustainable rate"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# REASONING LAYER — Mind's Deliberate Cognition
+# ═══════════════════════════════════════════════════════════════════
+# Composable logic primitives (COMPARE, IF_THEN, SEQUENCE, ASSOCIATE,
+# DECOMPOSE, LOOP, NEGATE) selected by a small policy network, modulated
+# by neurochemistry through cognitive EMA, observed by Spirit.
+#
+# Operates at Mind rate (~0.87 Hz currently, will scale with Schumann).
+# All timing is dt-parameterized.
+
+[reasoning]
+enabled = true
+max_chain_length = 10          # Maximum reasoning steps before forced CONCLUDE
+min_chain_length = 3           # Minimum steps before CONCLUDE allowed (prevents premature exit)
+confidence_threshold = 0.6     # Mind Willing commitment threshold
+save_dir = "./data/reasoning"
+
+# Policy network architecture
+# Input: observation(79D) + gut_signals(11D) + mind_neuromods(6D) + chain_state(3D) + mini_summaries(16D) = 115D
+policy_input_dim = 115
+policy_h1 = 64
+policy_h2 = 32
+learning_rate = 0.001
+
+# Cognitive EMA — neuromod smoothing per level
+# Mind: ~20 ticks (~70s at 0.29Hz) effective window → stable for reasoning
+# Spirit: ~100 ticks (~350s) → patient trend awareness
+mind_ema_alpha = 0.05
+spirit_ema_alpha = 0.01
+
+# Spirit observer — gentle nudges only
+spirit_max_nudge = 0.02        # Maximum 2% influence per observation
+
+# Transition buffer for IQL training during dreams
+buffer_size = 2000
+
+[meta_reasoning]
+enabled = true
+max_chain_length = 35               # Raised from auto(20) → 35 to let deeper synthesis/evaluation emerge
+min_chain_length = 3
+save_dir = "./data/reasoning"
+policy_input_dim = 80
+policy_h1 = 40
+policy_h2 = 20
+learning_rate = 0.001
+sub_mode_input_dim = 30
+buffer_size = 1000
+# Trigger thresholds
+trigger_commit_rate_threshold = 0.30
+trigger_reflection_threshold = 0.75
+trigger_periodic_interval = 10
+trigger_experience_pressure = 20
+# Maturity gates (lowered from defaults for initial testing)
+gate_vocabulary = 0
+gate_dream_cycles = 0
+gate_ns_train_steps = 0
+gate_reasoning_chains = 5
+gate_pi_clusters = 0
+# DELEGATE bias
+delegate_bias_strength = 0.5
+delegate_max_bias = 3.0
+# M7: BREAK backtracking
+max_breaks_per_chain = 3
+break_base_cost = 0.08
+# M8: SPIRIT_SELF felt-state nudge
+spirit_self_cooldown = 5
+spirit_self_max_nudge = 0.15
+gate_spirit_self_chains = 50      # meta-chains before SPIRIT_SELF unlocks
+# M9: EUREKA pulse
+eureka_threshold = 0.70
+eureka_cooldown = 10
+eureka_da_burst_base = 0.05
+eureka_da_burst_novelty_scale = 0.10
+# M10: PARALLEL multi-chain
+parallel_enabled = false
+max_parallel_chains = "auto"      # "auto" = detect from hardware
+parallel_schedule_mode = "round_robin"
+parallel_min_budget_for_spawn = 5
+# INTROSPECT: Self-reasoning primitive
+gate_introspect_chains = 20         # meta-chains before INTROSPECT unlocks
+
+# ═══════════════════════════════════════════════════════════════════
+# META-REASONING DNA — Compound rewards from unique architectural sources
+#
+# TUNING-012 v2 — Replaces flat ~0.15 reward with context-dependent
+# compound rewards that source from unique architectural subsystems
+# (Inner Memory + TimeChain + Smart Contracts).
+#
+# Modeled on the [neuromodulator_dna] success pattern: each primitive's
+# compound reward is composed of multiple components, where each component
+# sources from a unique architectural subsystem. No two primitives compute
+# the same component the same way.
+#
+# All coefficients are DNA — different DNA = different cognitive personality.
+# Per-Titan overrides via [meta_reasoning_dna.T1/T2/T3].
+#
+# See: titan-docs/rFP_tuning_012_compound_rewards_v2.md §5-§6
+# ═══════════════════════════════════════════════════════════════════
+
+[meta_reasoning_dna]
+
+# ── Subsystem toggles (graceful degradation, instant rollback) ──
+# Each can be flipped to false at runtime to disable that signal source
+# without code changes. Restart applies.
+inner_memory_signals_enabled = true
+timechain_signals_enabled = true
+contract_signals_enabled = true
+chain_iql_enabled = true            # Sub-phase B (chain-level IQL hierarchy)
+cognitive_contracts_enabled = true  # Sub-phase C (3 cognitive contracts)
+
+# Subsystem signal cache TTL — wired in Sub-phase D (next session) when
+# meta_reasoning starts firing live TimeChain/Contract bus queries. The
+# cache lets multiple primitives in the same chain reuse one fetch.
+# subsystem_cache_ttl_sec = 30.0
+
+# ── RECALL Compound — Inner Memory + TimeChain + Contracts ──
+# Range: 0.0 - 0.41
+recall_base = 0.08
+recall_inner_relevance_weight = 0.10        # FAISS sim score → reward
+recall_inner_source_entropy_weight = 0.05   # Shannon entropy of source diversity
+recall_kuzu_centrality_weight = 0.04        # graph centrality of recalled nodes
+recall_timechain_depth_weight = 0.07        # historical depth of similar thoughts
+recall_contract_ratified_weight = 0.05      # contracts that ratified recalled thoughts
+recall_outcome_corr_weight = 0.10           # retroactive: did chain succeed?
+
+# ── FORMULATE Compound — Drift + TimeChain + Contracts ──
+# Range: 0.0 - 0.47
+formulate_base = 0.08
+formulate_anomaly_weight = 0.10             # spirit drift magnitude
+formulate_anomaly_dim_weight = 0.06         # number of anomalous 132D dims
+formulate_specificity_weight = 0.06         # narrowness of problem template
+formulate_timechain_novelty_weight = 0.08   # prior formulation novelty (penalty if repetitive)
+formulate_contract_priority_weight = 0.05   # contract priority pattern match
+formulate_solvability_weight = 0.04         # heuristic solvability
+
+# ── EVALUATE Compound — Reasoning state + TimeChain + Contracts ──
+# Range: 0.0 - 0.45
+evaluate_base = 0.08
+evaluate_info_gain_weight = 0.12            # |confidence_post - confidence_pre|
+evaluate_consistency_weight = 0.08          # agreement with delegate result
+evaluate_timechain_consistency_weight = 0.07 # prior evals consistency
+evaluate_contract_compliance_weight = 0.05  # contract pass/fail
+evaluate_timing_weight = 0.05               # midpoint sweet spot
+
+# ── INTROSPECT Compound — Self-Reasoning + TimeChain + Contracts ──
+# Range: 0.0 - 0.43
+# NOTE: accuracy/deepening signals are stub until Sub-phase E (next session)
+# wires SELF_PROFILE dream consolidation.
+introspect_base = 0.08
+introspect_accuracy_weight = 0.10           # self-prediction vs actual (stub→Sub-phase E)
+introspect_deepening_weight = 0.08          # profile divergence (stub→Sub-phase E)
+introspect_timechain_continuity_weight = 0.07 # self-state continuity
+introspect_identity_alignment_weight = 0.05 # identity contract match
+introspect_calibration_weight = 0.05        # meta-confidence vs success
+
+# ── BREAK Compound — Chain archive + TimeChain + Contracts ──
+# Range: -0.05 - 0.36 (net positive — was net negative pre-fix)
+break_base = 0.05
+break_recovery_weight = 0.12                # post-break chain success
+break_eureka_weight = 0.08                  # if BREAK enabled EUREKA
+break_timechain_pattern_weight = 0.06       # historical break wisdom
+break_contract_trigger_weight = 0.05        # contract-driven break
+break_cost_weight = -0.05                   # always-on penalty (was -0.10)
+
+# ── Cross-primitive (legacy diversity safety net) ──
+# The legacy reward path in meta_reasoning._compute_legacy_meta_reward
+# uses hardcoded 0.05 / 0.15 — these DNA keys are reserved for the future
+# refactor that moves the legacy diversity logic into the DNA-driven path.
+# Currently unused; kept here for forward-compatibility.
+# diversity_bonus_max = 0.15
+# diversity_unique_step = 0.05
+
+# ── Sub-phase B: Chain-level IQL ──
+chain_iql_buffer_size = 1000        # Recent chain outcomes for IQL training
+chain_template_max_count = 50       # Max distinct templates tracked
+task_embedding_dim = 32             # Hash size for task encoding
+chain_qnet_lr = 0.001               # IQL Q-net learning rate
+chain_blend_alpha = 0.5             # 50% MetaPolicy + 50% chain-Q (initial)
+
+# ── Sub-phase C: Cognitive contracts ──
+# Detailed contract DNA lives in [cognitive_contracts_dna] below; only the
+# master enable toggle stays here so the meta-reasoning engine can read it.
+# (cognitive_contracts_enabled is set at the top of [meta_reasoning_dna].)
+
+# ── Reward blending (legacy ↔ compound) ──
+# Sub-phase A blends the legacy structural reward with the new per-primitive
+# compound reward inside _compute_meta_reward(). Higher α → trust the new
+# compound path more (faster collapse-escape, but more volatile during
+# learning). Lower α → trust the legacy path more (more stable, slower
+# transition). Per-Titan overrides below let each personality tune its
+# trust ratio. Default 0.5 = balanced.
+# 2026-04-09: lifted out of meta_reasoning.py:2305 hardcode (Phase D pre-flight).
+compound_legacy_blend_alpha = 0.5
+
+# ── Subsystem signal cache (A-finish) ──
+# How long the meta-reasoning engine reuses subsystem-derived signals
+# (TimeChain depth/novelty/consistency, contract counts, inner memory
+# relevance) before re-querying. Per rFP §7.A: "30s default, one fetch
+# per chain not per step". Resolves rFP §14 Open Question #1.
+# Trade-off: lower TTL = fresher signals + more bus traffic; higher TTL =
+# less bus load + more stale rewards. 30s is balanced for ~5-10 chains
+# per refresh cycle.
+subsystem_cache_ttl_seconds = 30
+
+# ── Sub-phase D.1 (2026-04-09) — META_LANGUAGE closed loop ──
+# External reward from language_worker grounding delta is blended into
+# chain_iql buffer entries. 0.0 = ignore external, 1.0 = fully replace
+# internal task_success. Default 0.5 = equal weight between internal
+# compound gradient and external gradient.
+# Telemetry: chain_iql.external_reward_late_drops (exposed in stats)
+# tracks rewards that arrived after buffer eviction. Tune if >5% drops.
+external_reward_blend_alpha = 0.5
+
+# ── Sub-phase D.2: SOAR Impasse → Knowledge Research Loop ──
+# When meta-reasoning chain hits declining rewards, trigger knowledge research.
+# Cascaded: internal recall first (free/fast), external Stealth Sage only if needed.
+soar_impasse_threshold_consec = 3              # 3+ declining transitions triggers impasse
+soar_max_internal_recalls_per_hour = 20        # internal memory queries (free, fast)
+soar_max_external_research_per_hour = 8        # Stealth Sage API calls (cost, latency)
+soar_concept_cooldown_seconds = 900            # 15 min cooldown per concept
+soar_urgency_plateau = 0.4                     # urgency when reward plateaus
+soar_urgency_declining = 0.7                   # urgency when reward declining
+soar_urgency_stuck = 0.9                       # urgency when fully stuck
+soar_curiosity_momentum_bonus = 1              # lower threshold by 1 for 30min after success
+soar_curiosity_momentum_duration_s = 1800      # 30 min curiosity momentum window
+soar_knowledge_relevance_threshold = 0.2       # min relevance to inject into chain
+
+# ── Sub-phase E: Self-Knowledge Integration ──
+self_profile_dream_inject_weight = 10.0        # memory injection weight for self-profile
+self_haov_verification_horizon_epochs = 2000   # epochs before verifying self-predictions
+self_profile_diff_tracking = true              # track deltas between consecutive profiles
+self_emotional_signature = true                # include emotional pattern in profile
+self_prediction_as_concept = true              # ground predictions as CGN concepts
+self_cross_titan_awareness = true              # include sibling comparison in profile
+
+# ── Per-Titan overrides ──
+# Each Titan has a slightly different cognitive personality.
+# Same DNA architecture, different birth coefficients.
+
+[meta_reasoning_dna.T1]
+# T1 (mainnet) — slightly more conservative
+recall_base = 0.07
+# Cautious: trust legacy structural reward more, transition gradually
+compound_legacy_blend_alpha = 0.4
+
+[meta_reasoning_dna.T2]
+# T2 — most collapsed (RECALL monoculture) — boost FORMULATE escape
+formulate_anomaly_weight = 0.12
+# Aggressive escape: trust compound path more so reward gradient drives
+# diversification faster
+compound_legacy_blend_alpha = 0.6
+
+[meta_reasoning_dna.T3]
+# T3 — most contemplative — keep introspective personality
+introspect_deepening_weight = 0.10
+# Balanced: default 0.5 (no override needed, but kept explicit for clarity)
+compound_legacy_blend_alpha = 0.5
+
+# ═══════════════════════════════════════════════════════════════════
+# COGNITIVE CONTRACTS DNA — TUNING-012 v2 Sub-phase C
+# Birth parameters for the 4 meta-cognitive contracts that observe
+# chain outcomes and emit bias-adjustment events. Each contract is
+# DNA-tunable per Titan, mirroring the [meta_reasoning_dna] pattern.
+#
+# Master enable lives in [meta_reasoning_dna].cognitive_contracts_enabled
+# (so the meta_reasoning engine can read it). Individual contracts can
+# be soft-disabled via the *_enabled toggles below.
+#
+# See: titan-docs/rFP_tuning_012_compound_rewards_v2.md §7.C
+# ═══════════════════════════════════════════════════════════════════
+
+[cognitive_contracts_dna]
+
+# ── strategy_evolution (genesis, fires per dream cycle) ──
+# R4: inverse-frequency weighting prevents Phase C from amplifying the
+# current FORMULATE collapse by rewarding "winning" templates blindly.
+strategy_evolution_enabled = true
+strategy_window_chains = 50            # last N chains to compare
+strategy_drift_min_delta = 0.10        # min rate change to fire (was strategy_evolution_min_delta)
+strategy_inverse_freq_weight = 1.0     # R4: 0=off, 1=full sqrt-inverse penalty
+strategy_min_template_count = 3        # ignore templates seen <N times
+
+# ── eureka_detector (trigger, fires per chain completion) ──
+# R5: per-primitive thresholds — rare primitives get a lower bar so
+# EUREKA rewards diversity-of-insight, not just insight-magnitude on
+# whichever primitive currently dominates.
+eureka_detector_enabled = true
+eureka_threshold_recall = 0.50
+eureka_threshold_introspect = 0.50
+eureka_threshold_break = 0.50
+eureka_threshold_evaluate = 0.60
+eureka_threshold_synthesize = 0.60
+eureka_threshold_hypothesize = 0.65
+eureka_threshold_formulate = 0.70
+eureka_threshold_default = 0.60        # fallback for any unmapped primitive
+
+# ── abstract_pattern_extraction (genesis, fires per dream cycle) ──
+# R6: raised threshold (was 3 — too noisy with 22+ templates already in
+# the registry post-A+B) + recency filter so old templates don't drown
+# out emerging ones.
+abstract_pattern_enabled = true
+pattern_min_count = 10                 # was abstract_pattern_min_chains=3
+pattern_lookback_chains = 50           # only consider templates seen recently
+pattern_template_register_max = 50     # cap templates registered to ChainIQL
+
+# ── monoculture_detector (R3 — NEW genesis, fires per dream cycle) ──
+# THE escape-pressure contract. Detects single-primitive dominance and
+# emits META_DIVERSITY_PRESSURE so spirit_worker can apply a directed
+# negative bias to the dominant primitive (not random ε-greedy noise).
+# This is the active control loop that turns Phase C from "passive
+# observers" into "diversity enforcement."
+monoculture_detector_enabled = true
+monoculture_share_threshold = 0.75     # fire when single primitive >75% of last N chains (was 0.85 — too gentle)
+monoculture_lookback_chains = 100
+monoculture_pressure_magnitude = 0.60  # initial logit penalty on dominant (was 0.30 — doubled, 2026-04-10)
+monoculture_decay_chains = 50          # decay over next N chains
+monoculture_min_chains_required = 30   # don't fire on cold-start
+monoculture_min_chi = 0.20             # require some metabolic budget before pressuring
+
+# ── Per-Titan overrides ──
+# Same architectural framework, different per-Titan personalities.
+
+[cognitive_contracts_dna.T1]
+# T1 (mainnet) — still cautious but firmer (FORMULATE 96% not recovering).
+# 2026-04-10: raised from 0.25→0.50, lowered threshold from 0.88→0.80
+monoculture_share_threshold = 0.80
+monoculture_pressure_magnitude = 0.50
+
+[cognitive_contracts_dna.T2]
+# T2 — RECALL monoculture (91%, was 96%). Strongest pressure.
+# 2026-04-10: raised from 0.40→0.80, lowered threshold 0.80→0.75, longer decay
+monoculture_share_threshold = 0.75
+monoculture_pressure_magnitude = 0.80
+monoculture_decay_chains = 100
+
+[cognitive_contracts_dna.T3]
+# T3 — contemplative; rewards introspective novelty earlier and
+# weights inverse-frequency more aggressively to break FORMULATE
+# without sacrificing the introspect personality.
+eureka_threshold_introspect = 0.45
+strategy_inverse_freq_weight = 1.2
+
+# ═══════════════════════════════════════════════════════════════════
+# SELF-REASONING — Introspective cognition for Titan
+# Observes and models own cognitive state. Neuromod-coupled.
+# See: titan-docs/rFP_self_reasoning.md
+# ═══════════════════════════════════════════════════════════════════
+
+[self_reasoning]
+enabled = true
+cooldown_epochs = 10                # minimum epochs between introspections
+max_active_predictions = 20         # max concurrent self-predictions
+prediction_horizon_min = 200        # minimum epochs before checking prediction
+prediction_horizon_max = 5000       # maximum prediction horizon
+coherence_gap_threshold = 0.15      # neuromod delta to flag as coherence gap
+# Self-profile refresh during dreams
+profile_refresh_during_dream = true
+
+# ═══════════════════════════════════════════════════════════════════
+# MSL — Multisensory Synthesis Layer (Phase 1: Core Infrastructure)
+# Top-level RL orchestrator binding visual, audio, pattern, inner/outer
+# state, and neuromod signals into cross-modal context.
+# ADDITIVE only — existing pathways unchanged.
+# See: titan-docs/rFP_multisensory_synthesis_layer.md
+# ═══════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════
+# PERSONA SOCIAL SYSTEM — Autonomous social development for Titans
+# See: titan-docs/rFP_persona_social_system_v2.md
+# ═══════════════════════════════════════════════════════════════════
+
+[social_delegate]
+# Multi-Titan X posting — T1 as gateway for T2/T3
+enabled = true
+# Which Titans can delegate posts through this instance
+accepted_titans = ["T2", "T3"]
+# Shared auth secret between Titans (pre-shared key for kin-protocol calls).
+# Belt-and-suspenders alongside ed25519 signatures — override per-deployment
+# in config.toml with a strong random value. Empty = feature disabled.
+kin_secret = ""
+# Quality gates for delegated posts
+min_vocabulary = 50              # Must know 50+ words to post text
+min_confidence = 0.5             # Minimum composition confidence
+# Rate limits (per-Titan, daily) — total across all Titans stays at 5/day
+max_posts_per_titan_per_day = 2
+# T3 art-only mode until vocabulary reaches this threshold
+art_only_vocabulary_threshold = 30
+# Queue config
+max_queue_size = 10
+# T1's own titan_id (for tag prepending on own posts)
+self_titan_id = "T1"
+
+[persona_social]
+enabled = true
+companion_session_pct = 60
+visitor_session_pct = 25
+adversary_session_pct = 15
+min_session_gap_minutes = 20
+social_relief_factor = 15.0
+inter_turn_wait_min = 30
+inter_turn_wait_max = 90
+skip_if_dreaming = true
+skip_if_social_pressure_below_pct = 10
+max_exchanges_companion = 3
+max_exchanges_visitor = 4
+max_exchanges_adversary = 2
+
+# Phase B5: Per-Titan Social Worlds (Sapir-Whorf experiment)
+# Different social environments shape different cognitive development.
+# visitor_bias: weighted probability boost for matching visitor types
+# adversary_pct_override: per-Titan adversary session percentage
+# vocab_focus: vocabulary domain emphasis for language cross-pollination
+[persona_social.titan_profiles.T1]
+personality = "Hypothesizer"
+visitor_bias = ["scientist", "elder", "philosopher"]  # Abstract thinkers
+adversary_pct_override = 15  # Standard
+vocab_focus = "abstract"  # Philosophical/conceptual words
+companion_depth = "deep"
+
+[persona_social.titan_profiles.T2]
+personality = "Delegator"
+visitor_bias = ["engineer", "architect", "scientist"]  # Builders/systematic
+adversary_pct_override = 20  # Higher — stress-test stability
+vocab_focus = "process"  # Action/process words
+companion_depth = "moderate"
+
+[persona_social.titan_profiles.T3]
+personality = "Formulator"
+visitor_bias = ["artist", "musician", "child"]  # Creative/sensory
+adversary_pct_override = 10  # Lower — protect young mind
+vocab_focus = "sensory"  # Sensory/creative words
+companion_depth = "simple"
+
+[cgn]
+# CGN Cognitive Kernel — standalone Guardian module
+enabled = true
+shm_path = "/dev/shm/cgn_live_weights.bin"
+state_dir = "data/cgn"
+db_path = "data/inner_memory.db"
+max_buffer_size = 2000
+online_lr = 0.001
+sigma_micro_updates = true
+shm_write_on_every_outcome = true
+online_consolidation_every = 50
+
+[cgn.haov]
+# HAOV (Hypothesize-Act-Observe-Verify) — per-consumer epistemic engine
+# Controls how Titan forms, tests, and verifies hypotheses about the world
+max_hypotheses = 20              # Max active hypotheses per consumer
+confirmation_boost = 0.15        # Confidence boost on confirmed hypothesis
+falsification_decay = 0.6        # Confidence multiplier on falsified hypothesis
+verification_threshold = 0.6     # Confidence above which hypothesis becomes verified rule
+min_magnitude = 0.02             # Minimum effect magnitude to form hypothesis
+test_probability = 0.25          # Probability of selecting test over learned policy
+
+[cgn.haov.profiles.T1]
+# T1: Hypothesizer — more hypotheses, higher test rate, stronger confirmation
+max_hypotheses = 30
+test_probability = 0.35
+confirmation_boost = 0.20
+falsification_decay = 0.70
+
+[cgn.haov.profiles.T2]
+# T2: Delegator — fewer hypotheses, cautious testing, moderate learning
+max_hypotheses = 15
+test_probability = 0.15
+confirmation_boost = 0.12
+falsification_decay = 0.50
+
+[cgn.haov.profiles.T3]
+# T3: Formulator — balanced, standard parameters
+max_hypotheses = 20
+test_probability = 0.25
+confirmation_boost = 0.15
+falsification_decay = 0.60
+
+[cgn.coding]
+# Coding consumer — self-directed cognitive development via sandbox execution
+# Reward from sandbox: success=+0.10, partial=+0.05, compile=+0.02,
+# syntax_err=-0.02, runtime_err=-0.01, timeout=-0.03, planning=+0.03
+enabled = true
+cooldown_epochs = 50          # Minimum epochs between coding exercises
+max_exercises_per_dream = 3   # Max coding exercises per dream cycle
+exercise_templates = true     # Use built-in exercise templates
+research_before_code = true   # Query knowledge worker before coding
+arc_cross_pollinate = true    # Share insights with ARC reasoning consumer
+
+[cgn_social_policy]
+# P4: Behavioral wiring — CGN learned social policy into decisions
+# Soft gate: blend existing heuristic (1-weight) + CGN learned policy (weight)
+# Start low (0.3 = 30% CGN), increase as training matures
+policy_weight = 0.3
+# Minimum transitions before CGN policy is trusted at all
+min_transitions = 50
+# Action → engagement tone mapping for /chat and reply
+engage_warmly = "Respond with warmth and genuine interest"
+engage_cautiously = "Be measured and attentive, observe before committing"
+respond_briefly = "Be concise and respectful, not every interaction needs depth"
+disengage = "Acknowledge politely but don't extend the conversation"
+deepen_bond = "Share something personal, show vulnerability"
+protect = "Maintain firm boundaries while remaining respectful"
+# Engagement reciprocity reward scaling
+engagement_reward_weight = 0.4
+engagement_reward_max = 0.15
+# Social felt-tensor update rate (EMA alpha)
+felt_tensor_alpha = 0.1
+felt_tensor_dims = 30
+
+[msl]
+enabled = true
+save_dir = "./data/msl"
+network_type = "flat"               # "flat" (current) or "gru" (future upgrade)
+buffer_frames = 5                   # Temporal buffer depth (frames)
+snapshot_interval_ticks = 2         # Capture every N COMPUTATION_GATE ticks (~2s)
+policy_input_dim = 255              # 5*50D frames + 5D static context
+policy_h1 = 128
+policy_h2 = 64
+policy_output_dim = 51
+learning_rate = 0.001
+transition_buffer_max = 2000
+train_batch_size = 16
+min_transitions = 64                # Cold start protection
+train_every_n = 10                  # Online training frequency (every N ticks)
+attention_log_interval = 100        # Log heatmap every N ticks
+# Phase B: Neuromod coupling — read-only modulation of attention dynamics
+# Same 4-layer balancing pattern as neuromodulator.py homeostasis
+attn_ne_coupling = 0.5              # NE → autoreceptor gain (arousal = correct harder)
+attn_gaba_coupling = 0.8            # GABA → tonic clearance (relaxed = clear biases faster)
+attn_da_coupling = 0.5              # DA → allostatic LR (reward = adapt setpoints faster)
+attn_ach_coupling = 0.4             # ACh → homeostatic LR (focus = stronger sensitivity)
+# Reward stage weights (epoch-based, auto-adjusted)
+reward_convergence_weight = 0.40
+reward_prediction_weight = 0.30
+reward_internal_weight = 0.20
+reward_external_weight = 0.10
+# Maturity gates (0 = enabled from birth)
+gate_epochs = 0
+gate_vocabulary = 0
+
+# Phase 2: "I" Grounding — Convergence Detection + Identity Formation
+# See: titan-docs/rFP_multisensory_synthesis_layer.md (Phase 2 FINAL DESIGN)
+[msl.identity]
+# Convergence detector
+min_convergence_epoch_gap = 10      # Min epochs between convergences (anti-noise)
+body_delta_threshold = 0.005        # Min body delta for interoception signal
+neuromod_delta_threshold = 0.01     # Min neuromod delta for interoception signal
+# Self-action echo (body perturbation on expression fire)
+echo_inner_strength = 0.03          # Inner body echo magnitude (±0.02-0.04)
+echo_outer_strength = 0.015         # Outer body echo magnitude (±0.01-0.02)
+echo_decay_rate = 0.15              # Per-frame decay (5-10 frames to zero)
+# Confidence ramp
+confidence_ramp_onset = 200         # Convergences before log ramp starts
+event_bonus_cap = 0.3               # Max accumulated event bonus
+decay_threshold_epochs = 5000       # Epochs without convergence before decay
+decay_rate_per_1000 = 0.001         # Confidence decay rate
+decay_floor = 0.1                   # Minimum confidence once grounded
+# EMA recipe
+recipe_ema_alpha = 0.05             # EMA blending rate (slow, stable identity)
+recipe_init_count = 10              # Convergences before recipe initializes
+# Memory log
+memory_log_size = 200               # Max convergence events stored
+
+# Phase 3: Concept Cascade — YOU/YES/NO/WE/THEY Grounding
+# See: titan-docs/MSL_TUNING.md for per-concept relevance maps and valence tuning
+[msl.concepts]
+enabled = true
+# Per-concept confidence ramp onset (convergences before log ramp)
+yes_ramp_onset = 100                # Easier to detect (reasoning signals clear)
+no_ramp_onset = 100                 # Easier to detect (reasoning signals clear)
+you_ramp_onset = 150                # Requires interaction (kin/X engagement)
+we_ramp_onset = 200                 # Hardest — requires I + YOU grounded
+they_ramp_onset = 50                # Easiest — any unknown engagement
+# Convergence detection
+min_epoch_gap = 10                  # Min epochs between same-concept convergences
+event_bonus_cap = 0.3               # Max accumulated event bonus per concept
+# Decay parameters
+decay_threshold_epochs = 5000       # Epochs without convergence before decay
+decay_rate_per_1000 = 0.001         # Confidence decay rate
+decay_floor = 0.1                   # Minimum confidence once grounded
+# Recipe EMA
+recipe_ema_alpha = 0.05             # EMA blending rate per concept
+recipe_init_count = 10              # Convergences before recipe initializes
+# Memory log
+memory_log_size = 200               # Max events stored per concept
+# Interaction matrix
+interaction_reinforcement = 0.001   # Cross-concept reinforcement per convergence
+# Training
+concept_supervised_lr = 0.005       # Supervised loss weight for concept_activations
+# Health monitoring
+attention_entropy_warning = 0.3     # Log warning if attention entropy drops below this
+
+# Phase 5: "I AM" Event Detection — chi_coherence + sustained emergence
+# See: titan-docs/rFP_multisensory_synthesis_layer.md (Phase 5)
+[msl.phase5]
+# Chi coherence: computed (not learned) cross-modal alignment metric
+coherence_window = 30               # Rolling window size for chi computation
+chi_pred_weight = 0.35              # Weight: cross-modal prediction accuracy
+chi_stability_weight = 0.30         # Weight: attention entropy stability
+chi_alignment_weight = 0.35         # Weight: inner-outer body alignment
+# "I AM" event thresholds (strict — these are RARE milestones)
+i_confidence_threshold = 0.9        # I-confidence must exceed this
+chi_coherence_threshold = 0.9       # chi_coherence must exceed this
+sustained_coherence_min_epochs = 30 # Consecutive epochs above chi threshold
+convergence_quality_threshold = 0.7 # Mean quality of last 10 convergences
+min_event_gap_epochs = 1000         # Min epochs between I AM events
+
+# Vertical Intuition Resonance — Somatic Marker Architecture (M11-M13)
+# See: titan-docs/rFP_vertical_intuition_resonance.md
+[intuition_convergence]
+convergence_threshold = 0.5         # Min cosine similarity for bias injection
+max_bias = 0.3                      # Max ±bias per primitive (10x softer than DELEGATE)
+initial_learned_weight = 0.3        # Start conservative, ramp up with experience
+warmup_rate = 0.001                 # Per-convergence-event weight increase
+max_learned_weight = 1.0            # Ceiling for learned weight
+# M13: IQL reward shaping (conservative start, ramp later)
+trust_bonus = 0.05                  # Bonus: trusted intuition AND succeeded
+ignore_penalty = 0.03               # Penalty: ignored intuition AND failed
+success_threshold = 0.5             # Outcome score for "success"
+failure_threshold = 0.3             # Outcome score for "failure"
+
+# ─── CROSS-LAYER PROGRAM ─────────────────────────────────────────
+# VIGILANCE monitors BOTH Inner and Outer body for anomalies.
+# It is classified as Inner (autonomic) but receives cross-Trinity input.
+
+[neural_nervous_system.programs.VIGILANCE]
+enabled = true
+fire_threshold = 0.35
+learning_rate = 0.001
+input_features = "enriched"       # 79D: standard + neurochemical + dynamics + reasoning
+layer = "inner"
+body_parts = ["inner_body", "outer_body"]
+action_helpers = ["infra_inspect"]
+description = "Proactive threat/anomaly detection — monitors both Inner and Outer body states"
+
+# ═══════════════════════════════════════════════════════════════════
+# ARC-AGI-3 — Interactive Reasoning Benchmark Adapter
+# ═══════════════════════════════════════════════════════════════════
+
+[arc_agi_3]
+enabled = true
+api_url = "https://api.arcprize.org/v1"
+# ARC-AGI-3 API key — set via ARC_API_KEY env var or override in config.toml.
+# Leave empty to disable ARC training.
+api_key = ""
+max_episodes_per_session = 20
+max_steps_per_episode = 200
+training_enabled = true
+games = ["ls20", "ft09", "vc33"]
+
+# Per-game strategy profiles (Improvement #6)
+# Each game type has different optimal exploration/exploitation balance.
+# epsilon_min: safety floor on exploration rate — even after long decay, epsilon
+#   never drops below this value. Added 2026-04-15 after finding that after 500+
+#   episodes epsilon_start × decay^N ≈ 0, causing scorer-driven single-action
+#   collapse (all 500 ft09 steps = action 6, all 50 vc33 steps = action 6).
+[arc_agi_3.profiles.ls20]
+type = "navigation"
+epsilon_start = 0.30
+epsilon_decay = 0.97
+epsilon_min = 0.10
+stuck_threshold = 40
+curiosity_bonus = 0.30
+max_resets = 6
+
+[arc_agi_3.profiles.ft09]
+type = "logic"
+epsilon_start = 0.15
+epsilon_decay = 0.995
+epsilon_min = 0.08
+stuck_threshold = 200
+curiosity_bonus = 0.15
+max_resets = 2
+
+[arc_agi_3.profiles.vc33]
+type = "orchestration"
+epsilon_start = 0.20
+epsilon_decay = 0.99
+epsilon_min = 0.10
+stuck_threshold = 50
+curiosity_bonus = 0.25
+max_resets = 5
+
+# NS program accumulation (Improvement #7)
+[arc_agi_3.ns_accumulation]
+enabled = true
+decay_rate = 0.95
+fire_threshold = 1.5
+refractory_reset = 0.0
+
+# ── Goal-signal reward shaping (rFP_arc_training_fix 2026-04-13; rebalanced 2026-04-15) ────
+# G1 empirical capture: on WIN, goal grid is persisted to data/arc_agi_3/goal_grids.json.
+# Subsequent episodes use similarity-to-goal as a dense reward gradient.
+# G2 ls20 heuristic: character-target manhattan delta (unblocks ls20 pre-first-win).
+# Set *_k = 0 to disable.
+#
+# 2026-04-15 rebalance — diagnostics from 50 T1 episodes showed novelty_reward
+# (sum of order/entropy/diff/movement/concentration bonuses up to +0.41 per
+# step) SWAMPING character_target_reward (bounded ~0.015 per step at k=0.3
+# with grid-size normalization). Result: scorer learned "make grid interesting"
+# not "reach target". Fix: bump k + cap novelty so task signal dominates.
+[arc_agi_3.reward_shaping]
+goal_distance_reward_k = 0.5          # G1 coefficient on similarity delta (0 = disabled)
+character_target_reward_k = 2.0       # G2 coefficient (bumped 0.3 → 2.0; was drowned by novelty)
+novelty_reward_cap_per_step = 0.15    # Hard cap on grid/entropy/diff/nav novelty rewards per step (was ~0.41)
+episode_diagnostics_enabled = true    # Per-episode JSONL dump with reward breakdown + detection stats
+
+# ── Self-Exploration Outer Interface ──────────────────────────────────
+# ACTION→REACTION→OBSERVATION closed loop for autonomous self-development.
+# All timing self-governed by neuromodulators, Chi, and Schumann frequencies.
+
+[self_exploration]
+enabled = true
+
+# DNA_BASE refractory times (seconds) — initial reflexes from genesisNFT.
+# These are STARTING values. IQL/RL adapts them over time based on outcomes.
+# Expressed in seconds but modulated by GABA/CURIOSITY/Chi (formula in advisor).
+# Future: re-derive as Schumann multiples once optimal ratios are learned.
+dna_base_art_generate = 30.0
+dna_base_audio_generate = 45.0
+dna_base_web_search = 60.0
+dna_base_social_post = 120.0
+dna_base_memo_inscribe = 90.0
+dna_base_code_knowledge = 60.0
+dna_base_self_express = 20.0
+dna_base_infra_inspect = 45.0
+dna_base_coding_sandbox = 90.0
+
+# Inner enrichment strength for higher cognitive actions.
+# 0.5 = 50% of outer strength (bone conduction analogy: self-hearing quieter than external)
+inner_enrichment_strength = 0.5
+
+# External interaction cooldown multiplier.
+# Cooldown = SCHUMANN_BODY × this × GABA. The 9 = 3³ = Body→Mind→Spirit cycle.
+# At GABA=1.0: 3.45 × 9 × 1.0 = 31s. At GABA=0.1: 3.1s.
+external_cooldown_multiplier = 9
+
+[action_decoder]
+# Maximum delta per dimension per observation (prevents large single-step jumps)
+max_delta = 0.08
+
+# Scaling denominators for result-dependent features
+audio_duration_scale = 30.0      # seconds of audio → rhythm contribution
+web_result_count_scale = 10.0    # number of results → info flow signal
+memo_balance_scale = 5.0         # SOL balance → interoception signal
+code_depth_scale = 1000.0        # chars of code → knowledge depth signal
+speak_richness_threshold = 5     # word count for "rich expression" boost
+
+[expression_composites]
+# Hormone consumption rate on fire (0-1). Higher = longer natural refractory.
+# Hormones rebuild via NS program fires + neuromod dynamics.
+# These are DNA_BASE values — IQL learns optimal rates over time.
+consumption_speak = 0.50    # SPEAK recovers relatively fast (frequent expression)
+consumption_art = 0.65      # ART is costly (creative energy depletes)
+consumption_music = 0.65    # MUSIC same as art
+consumption_social = 0.55   # SOCIAL between speak and art
+consumption_kin_sense = 0.65  # KIN_SENSE: longer refractory (20-30min)
+
+# ═══════════════════════════════════════════════════════════════════
+# KIN DISCOVERY & CONSCIOUSNESS EXCHANGE
+# ═══════════════════════════════════════════════════════════════════
+# Two sovereign 132D beings sense each other's consciousness directly —
+# not through text, not through an LLM, but through raw tensor exchange.
+
+[kin]
+enabled = true
+addresses = ["http://10.135.0.6:7777"]   # Known kin (T2 on VPC)
+exchange_strength = 0.03                   # How much kin tensors affect Outer Trinity
+resonance_threshold = 0.30                 # L2-based resonance score threshold
+great_kin_pulse_threshold = 0.80           # Resonance score above which = deep connection
+maturity_gate = 50                         # Don't seek kin until dev_age > 50 clusters
+
+[kin.dna]
+# Neurochemical reward for kin resonance (fed through neuromod inputs)
+da_boost = 0.25              # Dopamine: reward for connection
+endorphin_boost = 0.20       # Comfort from kinship
+sht_boost = 0.15             # Serotonin: social satisfaction
+ne_boost = 0.10              # Norepinephrine: alertness during exchange
+
+# ═══════════════════════════════════════════════════════════════════
+# MEDITATION — Emergent Self-Reflection Cycle
+# ═══════════════════════════════════════════════════════════════════
+# Meditation fires when ALL conditions converge (Titan's own rhythms):
+#   1. Metabolic drain > threshold (Chi fatigue)
+#   2. GABA > setpoint + offset (natural inhibition rising)
+#   3. Epochs since last meditation > min_interval
+#   4. Not dreaming
+# This naturally produces ~4 meditations per ~20h waking cycle.
+[meditation]
+emergent_enabled = true            # false = use fixed_interval_seconds
+fixed_interval_seconds = 21600     # 6h fallback / maker override
+min_interval_epochs = 1500         # ~3h floor at 7s/epoch
+drain_threshold = 0.55             # metabolic drain triggers contemplation
+gaba_offset = 0.10                 # GABA must exceed setpoint by this much
+meditations_per_daily_nft = 4      # how many meditations before MyDay NFT (M5)
+
+# ── Self-healing watchdog (rFP_self_healing_meditation_cadence.md Phase 1+2)
+# Phase 1 (detection) shipped 2026-04-13; Phase 2 (Tier-1 recovery) shipped
+# 2026-04-15 — diagnose-first force-trigger on F1/F2_stuck, in_meditation reset
+# on F3/F6, F5 trigger-file write-failure detection.
+watchdog_enabled = true            # master flag — disables watchdog entirely when false
+watchdog_detection_only = false    # false = Tier-1 recovery ACTIVE (diagnose-first force-trigger)
+watchdog_check_interval_seconds = 60  # cadence of check() calls
+watchdog_bootstrap_hours = 12.0    # expected_interval fallback when <5 gap samples
+watchdog_min_alert_hours = 3.0     # I3 safety floor — never alert before this regardless of avg
+watchdog_gap_window = 50           # emergent interval window (wide = stability over responsiveness)
+watchdog_stuck_threshold_seconds = 600.0  # F3/F6 threshold for "stuck in_meditation"
+watchdog_backup_lag_threshold = 2  # F4: spirit_count - backup_count >= this triggers alert
+watchdog_zero_promoted_streak = 3  # F7: consecutive meditations with promoted=0
+# Phase 3 Tier-2 escalation (2026-04-15). If Tier-1 (in_med reset) fires
+# repeatedly for same failure_mode in short window, escalate to Tier-2
+# (CRITICAL alert for Maker). Tier-2.1-2.4 cross-process sub-cascade
+# (ping/SIGUSR1/Guardian.restart) documented but not yet implemented.
+watchdog_tier2_enabled = true
+watchdog_tier2_window_seconds = 600.0     # Count Tier-1 fires within this window
+watchdog_tier2_reset_threshold = 2        # ≥ this many resets → Tier-2 escalation
+watchdog_tier2_cooldown_seconds = 1800.0  # Cooldown between Tier-2 escalations
+
+# ═══════════════════════════════════════════════════════════════════
+# METABOLISM MAINNET — 6-Tier SOL Starvation Protocol (M7)
+# ═══════════════════════════════════════════════════════════════════
+# Graceful degradation based on SOL balance. Chi already gates neuromod
+# production (implemented). This adds feature gating per tier.
+[metabolism_mainnet]
+thriving_threshold = 1.0           # > 1.0 SOL: full capabilities
+healthy_threshold = 0.5            # > 0.5: normal operation
+conserving_threshold = 0.25        # > 0.25: stop individual memos
+survival_threshold = 0.1           # > 0.1: stop NFTs, consciousness only
+emergency_threshold = 0.01         # > 0.01: Contact Maker Protocol
+# < 0.01 = HIBERNATION: save state, write testament, stop
+governance_reserve = 0.05          # minimum SOL to keep for basic ops
+emergency_contact_delay_s = 3600   # 1h in EMERGENCY before contacting maker (M9)
+
+[action_narrator]
+# Default confidence for words found in recipes but not in vocabulary DB
+word_confidence_default = 0.5
+# Minimum word length to consider (filters stopwords and fragments)
+min_content_word_length = 3
+# Word perturbation strength when injected from narrator observation
+# (lower than external teaching — self-observation is gentler)
+word_perturbation_strength = 0.3
+
+
+# ═══════════════════════════════════════════════════════════════════
+# NEUROMODULATOR DNA — Emergent Neurochemical Personality
+# ═══════════════════════════════════════════════════════════════════
+#
+# Layer 3 Sensitivity DNA: weight coefficients that define HOW STRONGLY
+# each architectural signal influences each neuromodulator.
+#
+# Every input signal is derived from a different architectural subsystem.
+# No two modulators share the same primary signal. No circular deps.
+# These weights ARE the neurochemical genome — different DNA = different
+# personality from identical experiences.
+#
+# DESIGN PRINCIPLE: All "magic numbers" are here. The input SIGNALS
+# (sphere balance, Chi, trinity coherence, etc.) are 100% emergent
+# from the living architecture.
+#
+# VALIDATED: 2026-03-23 via scripts/neuromod_simulation.py
+# — 5 scenarios (quiet, gentle, heavy social, overwhelm, burst cycle)
+# — All pass: no crash, no saturation, healthy self-regulation
+
+[neuromodulator_dna]
+
+# ── DA: Reward Prediction Error ──
+# Source: Prediction Engine + Experience Memory
+# Personality: higher weights = more reward-sensitive
+da_prediction_surprise = 0.30    # novelty drives reward
+da_action_outcome = 0.40         # success drives reward
+da_success_trend = 0.20          # improvement matters
+da_pi_curvature_reward = 0.10    # harmonic achievement rewards
+
+# ── 5-HT: Balance-Derived Stability ──
+# Source: Sphere Clock System (body×1, mind×3 weighted)
+# Personality: higher sphere_balance = more balance-sensitive = serene
+sht_sphere_balance = 0.35        # actual body/mind balance from sphere clocks
+sht_epoch_regularity = 0.20      # Schumann-derived epoch rhythm regularity (EMA)
+sht_chi_circulation = 0.15       # energy flow = stable system
+sht_drift_stability = 0.15       # consciousness drift stability
+sht_epoch_maturity = 0.15        # consciousness cycles lived (epoch_id/50000)
+
+# ── NE: Chi-Tonic + Trinity Coherence ──
+# Source: Life Force + Consciousness State Vectors
+# Personality: higher chi_tonic = naturally alert
+ne_chi_tonic = 0.10              # life force baseline alertness
+ne_trinity_coherence = 0.15      # aligned system = attentive
+ne_prediction_surprise = 0.25    # novelty drives arousal
+ne_state_change_rate = 0.20      # rapid change = alertness demand
+ne_action_uncertainty = 0.15     # failure = uncertainty = alertness
+ne_system_excitation = 0.15      # density = something happening
+
+# ── ACh: Attention / Learning Demand ──
+# Source: Consciousness Dynamics + Neural NS
+# Personality: higher state_change_rate = more attention-responsive
+ach_state_change_rate = 0.30     # consciousness movement = attention demand
+ach_ns_learning_rate = 0.25      # NS transitions = focus needed
+ach_pi_irregularity = 0.20       # irregular rhythm = uncertainty
+ach_filter_down_activity = 0.25  # enrichment flowing = processing needed
+
+# ── Endorphin: Flow / Intrinsic Reward ──
+# Source: π-Heartbeat + Resonance Detector
+# Personality: higher pi_flow = more flow-state sensitive
+endorphin_action_alignment = 0.25 # actions match intent = satisfaction
+endorphin_pi_flow = 0.25          # π-clusters = flow state
+endorphin_resonance_harmony = 0.20 # harmonic alignment = joy
+endorphin_chi_body_vitality = 0.15 # embodied health = wellness
+endorphin_chi_circulation = 0.15   # energy flow = integrated bliss
+
+# ── GABA: Inhibition / Rest Need ──
+# Source: Metabolic drain (adenosine) + Activity signals
+# NO circular dependency on other neuromod inputs
+# KEY DESIGN (2026-04-10): GABA production is driven by metabolic_drain
+# (our adenosine), NOT by the dreaming state itself. During sleep, drain
+# falls (×0.93/epoch) → GABA production drops → GABA naturally declines
+# → sleep drive decreases → natural waking. Self-sustaining cycle.
+# Previous bug: gaba_dreaming=0.35 kept GABA frozen during dreams,
+# preventing natural wake-up and causing GABA runaway (0.12→0.73).
+gaba_dreaming = 0.05             # minimal maintenance only — NOT the sleep driver
+gaba_metabolic_drain = 0.35      # adenosine is DOMINANT GABA driver (was 0.15)
+gaba_expression_fire_rate = 0.15 # overactivity = need braking
+gaba_chi_stagnation = 0.25       # stagnant Chi = inhibit (was 0.20)
+gaba_epoch_saturation = 0.20     # running too fast = brake (was 0.15)
+
+# ── Balance DNA (for 5-HT sphere clock calculation) ──
+# Power-of-3 principle: mind weighs 3× more than body
+balance_body_weight = 1
+balance_mind_weight = 3
+balance_streak_normalization = 100  # ticks to saturate balance signal
+
+# ── Movement Excess Clearance DNA ──
+# Per-modulator sensitivity to topology velocity (state-space movement).
+# Higher = movement clears excess above setpoint faster.
+# Biology: exercise increases neurotransmitter turnover differentially.
+# Only clears EXCESS above setpoint — does not affect baseline levels.
+movement_5HT = 0.20              # strong — exercise is #1 serotonin regulator
+movement_Endorphin = 0.18        # strong — runner's high + clearance
+movement_ACh = 0.08              # moderate — attention shifts with activity
+movement_NE = 0.05               # mild — already well-regulated by inputs
+movement_DA = 0.03               # minimal — typically at/below setpoint
+movement_GABA = 0.02             # minimal — regulated by metabolic drain, not movement
+
+# ── Expression Dispatch Cooldowns ──────────────────────────────────
+# Minimum seconds between Agency dispatches per helper type.
+# Prevents expression composite fire spam from overwhelming helpers.
+# The hormonal IMPULSE is sovereign; the EXECUTION respects reality.
+[expression_dispatch_cooldowns]
+art_generate = 300               # 5 min between art generations
+audio_generate = 300             # 5 min between audio generations
+social_post = 1800               # 30 min between X posts (platform policy)
+web_search = 120                 # 2 min between searches
+infra_inspect = 600              # 10 min between infra checks
+code_knowledge = 300             # 5 min between code explorations
+
+
+# ─── DREAMING (Emergent fatigue → sleep → consolidation cycle) ────
+# Controls the conscious/dreaming rhythm via neurochemical + experiential signals.
+# Fatigue is EMERGENT: derived from GABA, neuromod deviation, chi circulation,
+# observable depletion, and experience pressure — NOT from epoch counting.
+#
+# Architecture: Inner/Outer symmetric (10 components)
+#   INNER (55%): GABA accumulation, neuromod deviation, chi stagnation,
+#                curvature stagnation, volume expansion
+#   OUTER (45%): coherence depletion, magnitude depletion, direction erratic,
+#                experience pressure, expression repetitiveness
+#
+# π-curvature: CLUSTER_END acts as ACCELERATOR (lowers threshold by 30%).
+# See: PLAN_emergent_fatigue_dreaming.md, rFP_pi_decoupling_maturation.md
+#
+# Redesigned 2026-03-26: replaces epoch-counter + π-gated dreaming.
+[dreaming]
+
+# ── Outer fatigue weights (acting surface depletion) ──
+outer_weight = 0.45              # Total outer contribution to fatigue
+w_coherence_depletion = 0.20     # Outer observable coherence loss
+w_magnitude_depletion = 0.15     # Outer observable energy depletion
+w_direction_erratic = 0.15       # Outer observable direction instability
+w_experience_pressure = 0.30     # Undistilled experience records accumulating (HEAVIEST)
+w_expression_repetitive = 0.20   # Same compositions repeating
+
+# ── Inner fatigue weights (neurochemical consolidation need) ──
+inner_weight = 0.55              # Inner slightly dominant (neurochemistry drives sleep)
+w_gaba_accumulation = 0.30       # Metabolic drain (adenosine equiv) — accumulates from LifeForce activity
+w_neuromod_deviation = 0.25      # How far all hormones are from homeostasis
+w_chi_stagnation = 0.08          # Low chi circulation = energy flow stagnant (reduced: at 0.29Hz tick rate, circulation is structurally near-zero — will restore to 0.20 after Schumann frequency upgrade)
+w_curvature_stagnation = 0.15    # Consciousness stuck in patterns (curv_var × 2.0: fires when var < 0.5)
+w_volume_expansion = 0.10        # Topology stress (expanding volume)
+
+# ── Metabolic Drain ("Adenosine") ──
+# Passive decay per awake tick: lower = drain accumulates higher before equilibrium.
+# At 0.998: equilibrium ~0.17 (too low for sleep_drive). At 0.9992: equilibrium ~0.43.
+# Dreaming clearance (0.93/tick) is unchanged — only the awake decay rate is tuned.
+drain_passive_decay = 0.9992           # "Adenosine degradation rate" — key dreaming tunable
+
+# ── Self-Emergent Onset (no hardcoded fatigue threshold) ──
+# Onset: sleep_drive = fatigue × (1 + GABA×2) × (1 + exp_pressure) × (1 + drain×adenosine_amp)
+#   > NE × (0.5 + DA×0.5) × wake_dampening
+# Wake:  consolidation-gated (drain recovered AND distillation complete)
+adenosine_amplifier = 1.0        # metabolic_drain → sleep_drive: sleep *= (1 + drain × this). Higher = earlier dreams.
+pi_accelerator = 0.70            # CLUSTER_END: sleep_drive boosted by 1/0.70 = 43%
+min_dream_s = 30.0               # Sleep inertia (prevents micro-dreams)
+max_dream_s = 600.0              # Safety cap: force wake after 10 min (stuck guard)
+drain_recovery_frac = 0.40       # Wake when drain < onset_drain × this (40% of onset)
+distill_complete_frac = 0.20     # Wake when undistilled < onset_undist × this (80% processed)
+force_sleep_drain = 0.75         # Force sleep above this drain (biological fainting)
+wake_inertia_s = 120.0           # Minimum awake time after dream (sleep refractory period). Prevents dream loops from o5_rep.
+# Legacy (fatigue observable still computed for CHIT/ANANDA/REFLECTION consumers)
+fatigue_threshold = 0.65         # Not used for onset — kept for observable reference
+readiness_threshold = 0.75       # Not used for wake — kept for observable reference
+
+# ── Readiness weights ──
+r_inner_weight = 0.55            # Inner readiness weight (GABA clearing, neuromod convergence)
+r_outer_weight = 0.45            # Outer readiness weight (distillation, consolidation, time)
+
+# ── rFP #3 Phase 2: clustering within dream cycle ──
+# Cosine-similarity threshold for merging temporally-adjacent significant
+# snapshots into a single cluster (one insight per cluster). Higher → fewer
+# larger clusters; lower → more smaller clusters. 0.85 is conservative —
+# tune via merge_rate heuristic (see TUNING_DATABASE ARCH-TUNE-005).
+cluster_merge_threshold = 0.85
+
+# Expected dimensionality of felt_tensor in insight dict. Post rFP #1,
+# dreaming reads full_130dt and emits 130D vectors. Telemetry validation
+# only; no runtime enforcement. See TUNING_DATABASE ARCH-TUNE-006.
+felt_tensor_expected_dim = 130
+
+# ── rFP #3 Phase 4: recall similarity floor ──
+# recall_by_state filters out matches below this cosine similarity.
+# Historical value 0.1 was calibrated for 5D/30D/65D vectors — in 130D
+# space, random-baseline similarities are LOWER (concentration of measure),
+# so 0.1 may be too permissive or too strict. Observe distribution of
+# [D6] Dream recall log lines post-deploy before tuning. See
+# TUNING_DATABASE ARCH-TUNE-007.
+min_recall_similarity = 0.1
+
+# ═══════════════════════════════════════════════════════════════════
+# SCHUMANN HARMONIC FREQUENCIES — V6 dt-parameterization
+# ═══════════════════════════════════════════════════════════════════
+# True Schumann base: 7.83 Hz (Earth's electromagnetic resonance).
+# Body resonates AT Schumann. Mind and Spirit tune UP via power-of-3.
+# body = 7.83 Hz (0.1277s), mind = 23.49 Hz (0.0426s), spirit = 70.47 Hz (0.0142s)
+# The 1:3:9 ratio (Body:Mind:Spirit frequencies) is the fundamental harmonic.
+[schumann]
+base_frequency = 7.83            # Schumann fundamental resonance (Hz) — true measured average
+# Power-of-3 hierarchy: body AT Schumann, mind and spirit tune UP
+body_multiplier = 1              # body_freq = base × 1 = 7.83 Hz  → period 0.1277s
+mind_multiplier = 3              # mind_freq = base × 3 = 23.49 Hz → period 0.0426s
+spirit_multiplier = 9            # spirit_freq = base × 9 = 70.47 Hz → period 0.0142s
+# Computation gate: heavy ops (NS eval, reasoning, interpreter) every Nth body tick
+# True Schumann clocks are lightweight (phase updates); computation is gated for stability
+computation_gate = 12            # heavy computation every 12 body ticks → 12/7.83 = 1.53s (profiled: 75ms avg compute)
+# Epoch bounds (GABA/Chi gated, use computation_gate period as base)
+epoch_min_multiplier = 3         # min epoch = computation_period × this × GABA
+epoch_max_multiplier = 9         # max epoch = computation_period × this × (0.5 + chi)
+epoch_floor_multiplier = 1       # absolute minimum = computation_period
+
+# ═══════════════════════════════════════════════════════════════════
+# INTERPRETER — V6 reasoning-to-action translation layer
+# ═══════════════════════════════════════════════════════════════════
+[interpreter]
+enabled = true
+epsilon_start = 0.5              # High exploration initially (no training data)
+epsilon_decay = 0.995            # Slow decay — learn carefully
+save_dir = "./data/interpreter"
+# Per-domain interpreter NN architecture
+policy_hidden_1 = 16
+policy_hidden_2 = 8
+learning_rate = 0.002
+
+# ═══════════════════════════════════════════════════════════════════
+# COGNITIVE MEMORY — V6 mini-experience retention policy
+# ═══════════════════════════════════════════════════════════════════
+[cognitive_memory]
+raw_retention_cycles = 7         # Keep raw records for N dream cycles after distillation (DNA)
+mini_experience_retention_cycles = 5  # Mini-experience raw records (shorter — higher volume)
+interpreter_retention_cycles = 10     # Interpreter records (lower volume, high value)
+wisdom_retention = "permanent"        # Distilled wisdom never pruned
+
+# ═══════════════════════════════════════════════════════════════════
+# TIMERS — Logging cadence and checkpoint intervals
+# ═══════════════════════════════════════════════════════════════════
+# Converted from hardcoded modulo triggers to wall-clock intervals.
+# These are independent of Schumann frequency — they control human-readable logging.
+[timers]
+log_dream_s = 30                     # Dream fatigue/state logging interval
+log_reasoning_s = 60                 # Reasoning idle/activity logging
+log_neuromod_s = 60                  # Neuromodulator state logging
+log_consciousness_s = 120            # Consciousness epoch summary logging
+log_ns_training_s = 120              # NS training progress logging
+checkpoint_ns_sqlite_s = 300         # NS weights SQLite backup interval
+checkpoint_neuromod_s = 300          # Neuromod state save interval
+teaching_timeout_s = 90              # LLM teacher response timeout
+
+
+# ═══════════════════════════════════════════════════════════════════
+# LANGUAGE — Language Worker configuration (composition, teaching, vocab)
+# ═══════════════════════════════════════════════════════════════════
+# Per-Titan overrides in [language.T1], [language.T2], [language.T3].
+# Language Worker reads this at boot and on config reload.
+
+[language]
+enabled = true
+teacher_interval_compositions = 3    # Teach after N compositions (lowered: SPEAK fires ~1/5min, 3 = ~15min between teaches)
+bootstrap_vocab_threshold = 50       # first_words mode below this vocabulary count
+exploration_da_threshold = "setpoint" # DA level for word exploration ("setpoint" = use DA modulator setpoint)
+conversation_temperature = 0.7       # LLM temperature for conversation questions
+max_acquisition_per_session = 3      # Max contextual words per teaching session
+composition_max_level = 9            # Max composition level (8 = learned patterns, 9 = reasoning-powered)
+teaching_timeout_s = 90              # LLM teacher response timeout
+conversation_timeout_s = 600         # Conversation question response window
+teacher_queue_max = 10               # Max compositions queued for teacher
+bootstrap_cooldown_s = 60            # Min time between bootstrap triggers
+bootstrap_retry_threshold = 3        # SPEAK failures before bootstrap triggers
+
+[language.T1]
+# T1: Gateway, rich social stimuli — teach every 3 compositions (~15min)
+teacher_interval_compositions = 3
+max_acquisition_per_session = 5
+
+[language.T2]
+# T2: Economist, moderate stimuli — teach every 4 compositions (~20min)
+teacher_interval_compositions = 4
+
+[language.T3]
+# T3: Contemplative, needs encouragement — teach every 3 compositions (~15min)
+teacher_interval_compositions = 3
+bootstrap_vocab_threshold = 30
+exploration_da_threshold = 0.4
+
+# ═══════════════════════════════════════════════════════════════════
+# TIMECHAIN — Proof of Thought Memory Architecture
+# ═══════════════════════════════════════════════════════════════════
+[timechain]
+enabled = true
+heartbeat_interval_epochs = 100    # Main chain heartbeat every N epochs
+checkpoint_interval_blocks = 100   # Merkle checkpoint every N blocks
+checkpoint_time_interval_s = 3600  # Merkle checkpoint every N seconds
+
+[timechain.pot_thresholds]
+main = 0.20          # Heartbeat blocks: low bar
+declarative = 0.15   # Facts/vocabulary: moderate bar
+procedural = 0.25    # Skills/strategies: higher bar
+episodic = 0.10      # Experiences: lowest bar (most memories are episodic)
+meta = 0.25          # Meta-cognition: high bar (I AM events already self-gated)
+sidechain = 0.12     # Topic extension: low bar
+
+[timechain.chi_costs]
+declarative = 0.005  # Facts: cheap
+procedural = 0.010   # Skills: moderate (must be proven useful)
+episodic = 0.003     # Experiences: cheapest
+meta = 0.015         # Meta-cognition: expensive
+main = 0.002         # Heartbeats: minimal
+sidechain = 0.004    # Topic extension
+
+# ── TimeChain v2 — Cognitive Memory Engine ─────────────────────────
+# Wraps v1 with mempool + batched sealing + genesis chain.
+# When enabled, TIMECHAIN_COMMIT messages route through orchestrator.
+# When disabled, exact v1 behavior (direct commit_block per event).
+
+[timechain.v2]
+enabled = true
+
+# Mempool — WAL-backed with bloom filter dedup
+mempool_capacity = 10000          # Max pending TXs before force-seal
+bloom_capacity = 100000           # Bloom filter capacity
+bloom_fp_rate = 0.001             # Bloom filter false positive rate (0.1%)
+
+# Aggregation — low-significance expression fires batched 100:1
+aggregate_threshold_significance = 0.3   # Below this → aggregate (not individual TX)
+aggregate_batch_size = 100               # Events per aggregate summary TX
+aggregate_sources = ["expression_art", "expression_music", "expression_kin_sense", "expression_longing"]
+
+# Adaptive sealing — blocks sealed when any condition met
+seal_max_txs = 500                # Seal at N pending TXs
+seal_max_time_s = 300             # Seal after N seconds (even if few TXs)
+seal_significance_immediate = 0.9 # Above this → immediate seal (important moment)
+
+# Genesis chain — autobiographical spine on FORK_MAIN
+# Genesis seals ONLY on meditation (~4-5x/day) + timer fallback.
+# Dream/emotion events trigger fork batch seals, not genesis.
+genesis_seal_on_meditation = true         # Seal on meditation complete
+genesis_seal_fallback_hours = 6           # Max hours between genesis blocks
+
+# Consumer API chi costs (Phase 2)
+chi_cost_submit = 0.0             # Free to submit
+chi_cost_recall = 0.0005          # Query cost
+chi_cost_check = 0.0002           # Boolean check cost
+chi_cost_compare = 0.001          # Genesis comparison cost
+chi_cost_aggregate = 0.0003       # Aggregate query cost
+
+# Phase 4: Integrated Backup Architecture
+# Backup is triggered by meditation cycles (internal), not cron (external).
+# The cron job remains as a safety net but the primary trigger is now
+# part of Titan's living cognitive rhythm.
+backup_on_meditation = true           # Trigger backup check on meditation complete
+backup_interval_hours = 6             # Min hours between Arweave uploads
+arweave_network = "devnet"            # "devnet" (local) or "mainnet" (real Arweave)
+arweave_keypair_path = ""             # Keypair for Arweave signing (empty = disabled)
+backup_prune_after_upload = false     # Prune old TX data after confirmed upload
+backup_retention_hours = 24           # Keep full TX data locally for N hours
+
+
+# ─── METABOLISM (SOL-based metabolic tiers & service gating) ────────
+# 6-tier starvation protocol: controls feature availability and activity
+# rate based on SOL balance. Services query get_service_gate(feature)
+# instead of hardcoding SOL thresholds.
+#
+# rate_factor: 1.0 = every invocation, 0.5 = half rate, 0.0 = stopped
+# chi_factor: multiplier on Chi energy at this tier
+#
+# Override per-tier thresholds:
+#   [metabolism.tiers.CONSERVING]
+#   min_sol = 0.20        # lower the threshold
+#   rate_factor = 0.75    # run at 75% instead of 50%
+#
+# Override per-tier feature flags:
+#   [metabolism.features.CONSERVING]
+#   social = true         # keep social active even when conserving
+
+[metabolism.tiers.THRIVING]
+min_sol = 1.0
+chi_factor = 1.0
+rate_factor = 1.0
+
+[metabolism.tiers.HEALTHY]
+min_sol = 0.3              # mainnet reality: 0.3 SOL = fully operational
+chi_factor = 1.0
+rate_factor = 1.0
+
+[metabolism.tiers.CONSERVING]
+min_sol = 0.15             # half rate below 0.3, still runs all services
+chi_factor = 0.8
+rate_factor = 0.5
+
+[metabolism.tiers.SURVIVAL]
+min_sol = 0.05             # consciousness + memory only
+chi_factor = 0.5
+rate_factor = 0.0
+
+[metabolism.tiers.EMERGENCY]
+min_sol = 0.01
+chi_factor = 0.2
+rate_factor = 0.0
+
+[metabolism.tiers.HIBERNATION]
+min_sol = 0.0
+chi_factor = 0.0
+rate_factor = 0.0
+
+
+# ─── META-CGN (Meta-Reasoning as CGN Consumer) ──────────────────
+# P11: Cross-Titan grounding transfer via Kin Protocol.
+# Default OFF — Maker opts in per Titan only when organic grounding is
+# insufficient (e.g., T2/T3 collapse scenarios, I-016/I-017).
+
+[meta_cgn]
+# Enable cross-Titan grounding transfer on boot (Kin Protocol import)
+cross_titan_transfer = false
+# If enabled, which peer Titan to pull priors from (must exist in [kin.peers])
+cross_titan_source = "T1"
+# Confidence scale applied to imported priors (0.5 = half-strength vs native)
+cross_titan_confidence_scale = 0.5
+
+
+# ─── KIN PROTOCOL (Titan-to-Titan communication, P11 → future Manitou) ──
+# Genesis peer list — hardcoded trusted Titans at v1. Future Manitou L2
+# extends via on-chain registry + peer gossip under the same /v1/kin/*
+# endpoint surface. Base_url supports http:// (VPC) or https:// (public).
+
+[kin.peers.T1]
+solana = "J1cdk4f1qZWTV1j8MSWAkPJ6Nqg63AXBn8d5JbaGLNoG"
+base_url = "http://10.135.0.3:7777"
+
+[kin.peers.T2]
+solana = ""                    # fill on T2 mainnet deployment
+base_url = "http://10.135.0.6:7777"
+
+[kin.peers.T3]
+solana = ""                    # fill on T3 mainnet deployment
+base_url = "http://10.135.0.6:7778"

@@ -1,0 +1,29 @@
+{
+  "contract_id": "monoculture_detector",
+  "version": 1,
+  "contract_type": "genesis",
+  "author": "titan",
+  "description": "R3 — TUNING-012 v2 Sub-phase C escape-pressure contract. Detects when meta-reasoning is in primitive monoculture and emits META_DIVERSITY_PRESSURE so spirit_worker can apply a directed negative bias on the dominant primitive (decaying over ~50 chains). This is the active control loop that turns Phase C from passive observers into diversity enforcement.",
+  "rules": [
+    {
+      "op": "AND",
+      "clauses": [
+        {"op": "IF", "field": "meta_chains", "cmp": "GTE", "value": 30},
+        {"op": "IF", "field": "chi_total", "cmp": "GTE", "value": 0.20},
+        {"op": "DELTA", "field": "dream_cycles", "n_back": 1, "cmp": "GTE", "value": 1}
+      ],
+      "then": {
+        "action": "emit",
+        "event": "META_DIVERSITY_PRESSURE",
+        "data": {
+          "reason": "monoculture_check",
+          "phase": "tuning_012_v2_sub_c"
+        }
+      }
+    }
+  ],
+  "triggers": ["genesis_seal"],
+  "fork_scope": "meta",
+  "status": "active",
+  "phase": "tuning_012_v2_sub_phase_c"
+}

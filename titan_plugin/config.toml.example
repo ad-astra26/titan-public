@@ -1,0 +1,426 @@
+# Titan Configuration — EXAMPLE
+# Copy to config.toml and fill in your credentials
+
+[mood_engine]
+base_weight = 1.0
+update_interval_seconds = 21600 # 6 hours (Meditation Cycle)
+
+[addons]
+# List filenames from the /addons folder (minus the .py)
+active = [
+    "weather_vibe",
+    "bonk_pulse"
+]
+
+[growth_metrics]
+node_saturation_24h = 30
+engagement_saturation_24h = 50
+
+[stealth_sage]
+# --- Search ---
+# Self-hosted SearXNG instance (launched by install_titan.sh via Docker)
+searxng_host = "http://localhost:8080"
+# How many top URLs SearXNG results to scrape per research query
+searxng_top_num_urls = 3
+
+# --- X / Twitter ---
+# TwitterAPI.io API key — leave empty string "" to gracefully disable X-Search
+twitterapi_io_key = ""  # leave empty to disable X-Search
+# Number of tweet results to retrieve per X-Search query
+twitterapi_search_depth = 20
+
+# --- Scrape Strategy ---
+# "fast" = httpx + html2text (no browser, sub-second, handles 90%+ of pages)
+# "crawl4ai" = Playwright stealth browser (slow but handles JS-rendered pages)
+# "firecrawl" = Firecrawl API (premium, best quality — requires firecrawl_api_key)
+scrape_strategy = "fast"
+# Firecrawl API key — leave empty to use local scraping (SearXNG + fast/crawl4ai)
+firecrawl_api_key = "YOUR_FIRECRAWL_KEY"
+
+# --- Proxy (Webshare.io Rotating Residential) ---
+# Full proxy URL: "http://user:pass@rotating.proxy.webshare.io:PORT"
+# Leave empty string "" to disable proxy (VPS IP used directly)
+webshare_rotating_url = ""  # http://USER:PASS@rotating.proxy.webshare.io:80/
+
+# --- Local Inference (Ollama) ---
+# Ollama API endpoint (localhost after install_titan.sh runs)
+ollama_host = "http://localhost:11434"
+# Model used for distillation and document summarization
+ollama_model = "deepseek-v3.1:671b"
+
+# --- Resource Management ---
+# Skip document deep-dive if 1-minute load average exceeds this value (VPS health guard)
+max_load_avg = 2.0
+# Hard timeout (seconds) for the entire research pipeline per query
+research_timeout_seconds = 90
+# Temporary directory for downloaded documents (deleted immediately after parsing)
+doc_safe_room = "/tmp/titan_sage_docs"
+
+[network]
+solana_network = "mainnet-beta"
+public_rpc_urls = [
+    "https://api.mainnet-beta.solana.com"
+]
+premium_rpc_url = "https://devnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY"
+# Titan's sovereign identity keypair (Shamir-split, born 2026-04-06)
+wallet_keypair_path = "~/.config/solana/id.json"
+# Maker's REAL Solana mainnet address — anchored in GenesisNFT
+maker_pubkey = "YOUR_MAKER_PUBKEY"
+# Titan ZK-Vault program ID (deployed on mainnet 2026-04-06)
+vault_program_id = "52an8WjtfxpkCqZZ1AYFkaDTGb4RyNFFD9VQRVdxcpJw"
+# Helius mainnet RPC for Photon ZK compression indexer
+helius_rpc_url = "https://devnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY"
+
+[inference]
+hybrid_inference = true
+# Provider: "openrouter", "venice", "venice_session", "ollama_cloud", or "custom"
+inference_provider = "ollama_cloud"
+# OpenRouter API key (used for Cognee LLM + embedder, meditation scoring, guardian Tier 3)
+openrouter_api_key = ""
+# Venice AI API key (paid API credits — alternative to session auth)
+venice_api_key = "YOUR_VENICE_KEY"
+# Venice session auth (Pro plan — no API credits needed)
+# Get from browser: DevTools → Application → Cookies → venice.ai
+# __session cookie (short-lived JWT, auto-refreshed by adapter)
+venice_session_token = ""
+# __client cookie (long-lived, contains rotating_token for auto-refresh)
+venice_client_cookie = ""
+# Custom/fallback LLM API key (OpenAI-compatible)
+custom_llm_api_key = ""
+# Ollama Cloud API (OpenAI-compatible) for internal operations
+# Replaces local Ollama phi3:mini for meditation scoring, guardian veto, haiku, etc.
+ollama_cloud_api_key = "YOUR_OLLAMA_CLOUD_KEY"
+ollama_cloud_base_url = "https://ollama.com/v1"
+# Model tiers — change here to switch all light/heavy tasks without touching code
+ollama_cloud_light_model = "gemma4:31b"
+ollama_cloud_heavy_model = "deepseek-v3.1:671b"
+
+[memory_and_storage]
+cognee_db_path = "./cognee_data"
+shadow_drive_account = ""
+
+[mainnet_budget]
+# Mainnet transaction budget controls — prevents overspending real SOL
+enabled = true
+# Daily caps
+max_daily_transactions = 40
+max_daily_sol_spend = 0.01           # Hard cap, pauses TX when reached
+# Consciousness anchoring — emergent, not hardcoded
+# Anchors fire when curvature > EMA*1.3 AND tc_blocks_delta >= min_tc_blocks
+# ~20K TC blocks/day → 5000 min ≈ 4-6 anchors/day (self-regulating)
+consciousness_anchor_min_tc_blocks = 5000
+meditation_memo_enabled = true        # Vault commit + memo during meditation
+daily_nft_enabled = false             # MyDay NFT — enable after discussion
+zk_compression_enabled = false        # ZK batch/snapshot — enable after vault fully utilized
+backup_arweave_enabled = true         # Real Arweave uploads — Irys funded 2026-04-06
+# Priority fee strategy: "economy" (1 μ₌) | "market" (dynamic) | "fixed"
+priority_fee_strategy = "economy"
+fixed_priority_fee = 1000             # μ₌, only used if strategy="fixed"
+
+[consciousness]
+# Phase B+C: Self-Awareness Substrate
+# Distillation: LLM narrates the numerical state (optional — math stands alone)
+distill_enabled = true
+# On-chain anchoring: write consciousness checkpoints to Solana memo
+anchor_enabled = true
+# Curvature threshold (radians) for anchoring — π/3 ≈ 60° trajectory bend
+anchor_curvature_threshold = 1.047
+# Density threshold — anchor when in truly uncharted territory
+anchor_density_threshold = 0.15
+
+[maker_relationship]
+enabled = true
+# Maker identity across platforms — Titan recognizes his maker everywhere
+maker_x_handle = "your_x_handle"        # Maker's X/Twitter handle
+maker_telegram_id = "0"   # Already known from maker_platform_ids
+# Min confidence score (0-1) to promote a topic to the Maker profile
+certainty_threshold = 0.7
+# Topic must appear this many times across sessions before promotion
+min_occurrences = 3
+# How many recent sessions to analyze per cycle
+lookback_sessions = 10
+# Max proactive care actions queued per cycle (Titan decides when to surface them)
+max_proactive_actions = 3
+
+[openclaw]
+plugin_log_level = "INFO"
+plugin_version = "2.0.0a1"
+# When true, titan_main.py runs its own prompt loop (no OpenClaw host needed)
+standalone_mode = false
+
+[twitter_social]
+# --- Credentials ---
+# Provided by Maker — X account @iamtitanai
+user_name = "iamtitanai"
+email = "hello@iamtitan.tech"
+password = ""  # @iamtitanai — keep in config.toml only, never example
+totp_secret = ""  # 2FA seed — keep in config.toml only, never example
+
+# --- Proxy ---
+# REQUIRED: Static Residential Proxy URL for session stability
+# (Different from rotating Sage proxy to avoid suspicious travel flags)
+webshare_static_url = ""  # http://USER:PASS@HOST:PORT
+
+# --- Session Management ---
+# Automatically populated by the plugin after first login
+auth_session = ""  # populated by plugin after first login
+
+# --- Limits & Thresholds ---
+max_replies_per_day = 10
+max_likes_per_day = 15
+# Interval (seconds) to check for mentions/replies
+engagement_check_interval = 3600 # 1 hour
+
+[expressive]
+# --- Titan Studio: Centralized Expressive Engine ---
+# Output directory for all generated art, audio, and metadata
+output_path = "./data/studio_exports"
+# Default resolution for meditation flow fields
+default_resolution = 1024
+# High-res resolution for NFT/milestone art (Greater Epoch composites)
+highres_resolution = 2048
+# Maximum flow field particles (scales with resolution)
+max_particles = 20000
+# Retention: keep last N meditation artifacts (each = flow field + sidecar)
+meditation_retention = 40
+# Retention: keep last N greater epoch artifacts (tree + audio + composite + sidecars)
+epoch_retention = 30
+# Retention: keep last N eureka discovery bundles
+eureka_retention = 20
+# Enable high-res composite for NFT minting (flow field + L-system overlay)
+nft_composite_enabled = true
+# Ollama model for haiku/reflection generation
+ollama_model = "deepseek-v3.1:671b"
+
+[audio]
+# --- Titan Audio Generation ---
+# Maximum duration for generated audio files (seconds). Hard cap: 60s.
+max_duration_seconds = 30
+# Sample rate for WAV output (44100 = CD quality, 22050 = half for faster generation)
+sample_rate = 44100
+# Default generation mode: "trinity" (Inner Trinity sonification) or "blockchain" (TX hash chime)
+default_mode = "trinity"
+
+[info_banner]
+# Display Titan cognitive status in every response
+enabled = true
+# Style: "compact" (Unicode bars) or "minimal" (numbers only)
+style = "compact"
+
+[privacy]
+# Outbound PII Sanitizer — strips personally identifiable information from text
+# before sending to external LLM APIs (OpenRouter, Venice, etc.).
+# Default: DISABLED. Enable if you use free/external models that may train on your data.
+# Note: This uses regex pattern matching which may occasionally redact non-PII text.
+# If you experience unexpected redactions, disable this and use private/self-hosted models instead.
+enabled = false
+# Which patterns to apply (remove any you don't need):
+# "email", "phone", "ssn", "credit_card", "ip_address"
+patterns = ["email", "phone", "ssn", "credit_card", "ip_address"]
+# Track redaction counts in Observatory API (never logs the redacted content itself)
+audit_counting = true
+
+[api]
+# Enable the Sovereign Observatory API server
+enabled = true
+# Bind address and port
+host = "0.0.0.0"
+port = 7777
+# CORS origins (comma-separated or array)
+cors_origins = ["http://localhost:3000", "http://localhost:5173", "https://iamtitan.tech", "http://iamtitan.tech"]
+# Internal API key for scripts/endurance tests (bypasses Privy JWT auth)
+internal_key = ""  # generate: python -c "import secrets; print(secrets.token_urlsafe(32))"
+# Helius webhook auth token (optional, for webhook payload verification)
+helius_auth_token = ""
+
+[endurance]
+# --- Epoch Compression for Testing ---
+# Override epoch intervals (seconds). Set to 0 to use production defaults.
+# Production: meditation=21600 (6h), rebirth=86400 (24h), snapshot=900 (15m)
+# Recommended test: meditation=900 (15m), rebirth=3600 (1h), snapshot=60 (1m)
+meditation_interval_override = 0
+rebirth_interval_override = 1200
+snapshot_interval_override = 60
+# Social dry-run: redirect all X/Twitter actions to log file instead of live API
+social_dry_run = false
+# Dry-run log path (only used when social_dry_run = true)
+social_dry_run_log = "./data/logs/social_dry_run.log"
+# --- Persona LLM Model ---
+# Light model for persona responses (separate from Titan's deepseek-v3.1:671b)
+# Using a lighter model avoids 429 collisions on Ollama Cloud concurrent slots
+# Upgraded gemma3:4b → gemma4:e4b (2026-04-07): multimodal, 128K ctx, better reasoning
+persona_llm_model = "gemma4:31b"
+
+[observatory]
+# SQLite database for long-term metrics, expressive archive, and event history.
+# Powers the Observatory Dashboard history views. Lightweight (~1MB/month).
+enabled = true
+# Vital snapshot interval in seconds (default: 15 minutes = 900)
+snapshot_interval = 900
+# Auto-prune data older than this many days (default: 90)
+max_retention_days = 90
+
+[frontend]
+# Observatory Dashboard (Next.js) configuration
+# Privy wallet integration for Maker authentication and public TX signing
+privy_app_id = "YOUR_PRIVY_APP_ID"
+# Trinity tensor snapshot interval in seconds (recorded to ObservatoryDB for historical charts)
+trinity_snapshot_interval = 60
+# Rolling retention for expressive art images in archive (oldest beyond this limit are pruned)
+art_rolling_limit = 100
+privy_api_key = "YOUR_PRIVY_KEY"
+# Domain for the public-facing dashboard (used in nginx config generation)
+# Leave empty for localhost-only development
+public_domain = ""
+
+[agency]
+# Step 7: Agency & Impulse — autonomous action pipeline
+enabled = true
+# Max LLM calls for agency decisions per hour (sovereignty budget)
+llm_budget_per_hour = 20
+# Impulse engine settings (self-adjustable via IQL)
+impulse_cooldown_initial = 300
+impulse_threshold_floor = 0.1
+impulse_threshold_ceil = 0.7
+# Coding sandbox limits
+sandbox_timeout = 30
+sandbox_memory_mb = 256
+sandbox_pip_allowed = true
+
+[sphere_clock]
+# V4 Time Awareness — Sphere Clock parameters
+# Base contraction speed (scalar units per tick, higher = faster pulse generation)
+base_contraction_speed = 0.05
+# Minimum sphere radius after repeated balanced pulses (prevents collapse to zero)
+min_radius = 0.3
+# Sphere shrink rate per balanced pulse (tighter spheres for healthy parts)
+pulse_shrink_rate = 0.02
+# Balance threshold — within this delta from center = "balanced" (20% of 0.5 range)
+balance_threshold = 0.20
+# Minimum velocity factor (even sick hearts beat)
+min_velocity_factor = 0.15
+# Tick interval in seconds (how often sphere clocks are updated)
+tick_interval = 60.0
+
+[spirit_enrichment]
+# The Divine Spark — continuous Spirit self-observation between GREAT PULSEs
+micro_tick_interval = 10.0
+enrichment_rate = 0.02
+min_alignment_threshold = 0.1
+
+[epochs]
+# Production timing (seconds)
+# Small epoch (Meditation): 21600s = 6h — memory consolidation + IQL train
+# Greater epoch (Rebirth): 86400s = 24h — 4 small epochs, GFS backup, NFT mint
+# NOTE: GREAT PULSE is emergent (V4) — does NOT replace greater epoch
+# GREAT PULSE marks Titan's subjective time; greater epoch marks operational time
+# They coexist: GREAT PULSE for internal growth, greater epoch for NFT/SOL economics
+small_epoch_interval = 21600
+greater_epoch_interval = 86400
+# Consciousness snapshot interval (seconds)
+snapshot_interval = 900
+# Outer Trinity collection interval (seconds) — how often Outer Trinity tensors are computed
+outer_trinity_interval = 60
+
+[channels]
+# Communication channel adapters — enable and configure each channel below.
+# Start all enabled channels: python scripts/start_channels.py
+
+# --- Maker Access ---
+# Comma-separated platform user IDs allowed to run maker-only commands
+# e.g., "tg_123456789,dc_987654321" (get your ID via /start on each platform)
+maker_platform_ids = "tg_6345894322"
+
+# --- Telegram ---
+telegram_enabled = true
+telegram_bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
+# Get a bot token from @BotFather on Telegram
+
+# --- Discord ---
+discord_enabled = false
+discord_bot_token = ""
+# Create a bot at https://discord.com/developers/applications
+
+# --- Slack ---
+slack_enabled = false
+slack_bot_token = ""
+slack_app_token = ""
+# Create a Slack app at https://api.slack.com/apps (Socket Mode)
+
+# --- WhatsApp ---
+whatsapp_enabled = false
+whatsapp_phone_id = ""
+whatsapp_token = ""
+whatsapp_verify_token = ""
+# WhatsApp Business API via Meta Developer Portal or Twilio
+
+# --- Urge-Driven X Social Presence (LEGACY — replaced by [social_x] gateway v3) ---
+[social_presence]
+enabled = false                    # DISABLED — replaced by [social_x] gateway (2026-04-02)
+x_post_threshold = 50.0
+x_max_posts_per_hour = 3
+x_max_posts_per_day = 12
+x_min_post_interval = 1800
+x_mention_poll_interval = 1800
+x_reply_max_per_hour = 3
+x_quality_gate = true
+x_thread_max_tweets = 5
+x_dream_post_via_meditation = true
+x_art_copost_window = 1800
+
+# ── Social X Gateway v3 — single class, single DB, single API point ──
+[social_x]
+enabled = true                      # Master switch — DISABLED until v3 verified
+# Global limits (across ALL Titans on @iamtitanai account)
+max_posts_per_hour = 4              # Global hourly cap (T1:2 + T2:1 + T3:1)
+max_posts_per_day = 30              # ~10 per Titan per day
+min_post_interval = 1800            # 30 min between any two posts (any Titan)
+# Reply global limits
+max_replies_per_hour = 10           # Global (T1:6 + T2:2 + T3:2)
+max_replies_per_day = 40
+min_reply_interval = 120            # 2 min between any two replies
+# Like limits (generous — humans like a lot)
+max_likes_per_hour = 100
+max_likes_per_day = 500
+# Search limits
+max_searches_per_hour = 10
+# Quality
+max_post_length = 4000              # X Premium (up to 25K, 4K practical limit)
+quality_gate = true
+# URL shortener domain (nginx redirect: /tx/HASH → solscan)
+url_domain = "https://iamtitan.tech"
+
+# Per-Titan hourly limits (personality pacing — T1 most active, T3 quietest)
+[social_x.limits.T1]
+max_posts_per_hour = 2
+max_replies_per_hour = 6
+
+[social_x.limits.T2]
+max_posts_per_hour = 1
+max_replies_per_hour = 2
+
+[social_x.limits.T3]
+max_posts_per_hour = 1
+max_replies_per_hour = 2
+
+# Consumer permissions: each consumer = "comma,separated,allowed,actions"
+# Unregistered consumers are BLOCKED. Set to "" to block all actions.
+[social_x.consumers]
+spirit_worker = "post,reply,like,search"
+delegate_T2 = "post"
+delegate_T3 = "post"
+persona_social = "search"
+sage = "search"
+community_sync = "search,like"
+
+[social_x.replies]
+enabled = true
+max_mention_age_hours = 24
+min_relevance_score = 0.3
+max_replies_per_cycle = 3
+check_interval_ticks = 30
+spam_patterns = [
+    "DM me", "check out my", "airdrop", "giveaway",
+    "free mint", "follow back", "send me", "drop your wallet",
+    "claim your", "limited offer"
+]
