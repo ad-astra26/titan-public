@@ -14,6 +14,7 @@ Training phases:
   3. Autonomous (warmup_steps+): Pure outcome-driven learning
 """
 import logging
+import math
 import os
 import json
 import threading
@@ -141,6 +142,19 @@ class NeuralNervousSystem:
             "consciousness_epochs": 0,
         }
 
+        # rFP β Stage 2: per-program reward EMA + audit log + eligibility params
+        self._reward_ema_mean: dict[str, float] = {n: 0.0 for n in self.programs}
+        self._reward_ema_var: dict[str, float] = {n: 1.0 for n in self.programs}
+        self._reward_ema_alpha: float = 0.01  # ~1000-event horizon
+        self._reward_log_path = os.path.join(self.data_dir, "reward_log.jsonl")
+        self._reward_log_lines = 0
+        self._reward_log_max_lines = 50000
+        self._reward_log_enabled = True
+        self._stratified_sampling_enabled: bool = True
+        self._soft_fire_enabled: bool = True
+        # Eligibility params from Stage 0.5 empirical analysis (or defaults)
+        self._eligibility_params = self._load_eligibility_params()
+
         # Load persisted state
         self._load_all()
 
@@ -225,8 +239,11 @@ class NeuralNervousSystem:
             try:
                 for sig in self.vm_fallback.evaluate(observables):
                     vm_signals[sig["system"]] = sig.get("urgency", 0.0)
-            except Exception:
-                pass
+            except Exception as e:
+                # Rate-limited WARNING — VM supervision breaking is important
+                # but we don't want 10Hz log spam if it persists.
+                if self._total_transitions % 100 == 0:
+                    logger.warning("[NeuralNS] VM baseline eval failed: %s", e)
 
         # Refresh temporal events from inner memory (feeds boredom stimuli)
         self._hormonal_events = self._refresh_hormonal_events()
@@ -464,21 +481,334 @@ class NeuralNervousSystem:
             try:
                 self._hormonal.save(
                     os.path.join(self.data_dir, "hormonal_state.json"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("[NeuralNS] hormonal_state.json save failed: %s", e)
 
-    def record_outcome(self, reward: float) -> None:
+        # rFP β Stage 0: periodic health summary — every 1000 transitions
+        # Surfaces "which programs are alive" in the brain log so operators
+        # can catch regression without running arch_map. Rate-limited to once
+        # per 1000 transitions (~ every 2-3 min at typical tick rates).
+        if self._total_transitions > 0 and self._total_transitions % 1000 == 0:
+            try:
+                self._log_health_summary()
+            except Exception as e:
+                logger.warning("[NeuralNS] health summary log failed: %s", e)
+
+    def get_health_snapshot(self) -> dict:
+        """rFP β Stage 0: canonical health snapshot for /v4/ns-health endpoint,
+        periodic log, and arch_map ns-health. Computes buffer-derived stats
+        (urgency distribution, fire rate, %nonzero) that aren't in get_stats().
+
+        Returns dict with:
+          - training: {phase, supervision_weight, total_transitions, total_train_steps}
+          - programs: per-program stats with urgency+vm_baseline+reward distributions
+          - hormonal: per-hormone level/threshold/fire_count
+          - verdicts: {DEAD: [...], LOW: [...], OK: [...]}
         """
-        Called when interaction outcome is scored (via REFLEX_REWARD).
-        Updates the most recent fired transition for each program.
-        Also adapts hormone thresholds from the outcome.
+        import numpy as _np  # keep local — heavy import
+        snap = {
+            "training": {
+                "phase": self.training_phase,
+                "supervision_weight": round(self._get_supervision_weight(), 4),
+                "total_transitions": self._total_transitions,
+                "total_train_steps": self._total_train_steps,
+                "last_train_ts": self._last_train_ts,
+            },
+            "programs": {},
+            "verdicts": {"DEAD": [], "LOW": [], "OK": []},
+        }
+        urgency_eps = 0.01  # match arch_map threshold (noise floor filter)
+        for name, net in self.programs.items():
+            buf = self.buffers.get(name)
+            if buf is None or len(buf) == 0:
+                snap["programs"][name] = {"status": "empty_buffer"}
+                continue
+            # Use internal buffer arrays (same as _sqlite_backup_save pattern)
+            urgencies = list(buf._urgencies[-buf.max_size:]) if hasattr(buf, '_urgencies') else []
+            vm_baselines = list(buf._vm_baselines[-buf.max_size:]) if hasattr(buf, '_vm_baselines') else []
+            fired = list(buf._fired[-buf.max_size:]) if hasattr(buf, '_fired') else []
+            rewards = list(buf._rewards[-buf.max_size:]) if hasattr(buf, '_rewards') else []
+            n = len(urgencies)
+            if n == 0:
+                snap["programs"][name] = {"status": "empty_buffer"}
+                continue
+            avg_u = float(sum(urgencies) / n)
+            max_u = float(max(urgencies))
+            pct_nz_u = 100.0 * sum(1 for v in urgencies if abs(v) > urgency_eps) / n
+            pct_nz_vm = 100.0 * sum(1 for v in vm_baselines if abs(v) > urgency_eps) / n if vm_baselines else 0.0
+            fire_pct = 100.0 * sum(1 for f in fired if f) / n
+            pct_nz_r = 100.0 * sum(1 for v in rewards if abs(v) > urgency_eps) / n if rewards else 0.0
+
+            # Verdict — same logic as arch_map ns-signals
+            is_dead = n > 500 and (pct_nz_u < 5 or (avg_u < 0.01 and max_u < 0.05))
+            if is_dead:
+                verdict = "DEAD"
+            elif pct_nz_u < 30:
+                verdict = "LOW"
+            else:
+                verdict = "OK"
+            snap["verdicts"][verdict].append(name)
+
+            snap["programs"][name] = {
+                "status": "ok",
+                "n": n,
+                "avg_urgency": round(avg_u, 6),
+                "max_urgency": round(max_u, 6),
+                "pct_nonzero_urgency": round(pct_nz_u, 1),
+                "pct_nonzero_vm_baseline": round(pct_nz_vm, 1),
+                "fire_pct": round(fire_pct, 2),
+                "pct_nonzero_reward": round(pct_nz_r, 1),
+                "last_loss": round(float(getattr(net, 'last_loss', 0.0)), 8),
+                "total_updates": int(getattr(net, 'total_updates', 0)),
+                "fire_count": int(getattr(net, 'fire_count', 0)),
+                "layer": getattr(net, '_layer', 'inner'),
+                "feature_set": getattr(net, '_feature_set', '?'),
+                "verdict": verdict,
+            }
+
+        # Hormonal snapshot
+        if self._hormonal_enabled and self._hormonal:
+            snap["hormonal"] = {
+                "maturity": round(self._hormonal.maturity, 4),
+                "hormones": {
+                    name: {
+                        "level": round(h.level, 4),
+                        "threshold": round(h.threshold, 4),
+                        "refractory": round(h.refractory, 4),
+                        "fire_count": h.fire_count,
+                    }
+                    for name, h in self._hormonal._hormones.items()
+                },
+            }
+        # NeuromodRewardObserver stats (set by spirit_worker on init)
+        obs = getattr(self, "_neuromod_reward_observer", None)
+        if obs is not None:
+            try:
+                snap["neuromod_reward_observer"] = obs.get_stats()
+            except Exception:
+                snap["neuromod_reward_observer"] = {"error": "stats_unavailable"}
+
+        # Overall state for session-startup / CI gates
+        n_dead = len(snap["verdicts"]["DEAD"])
+        n_prog = sum(1 for p in snap["programs"].values() if p.get("status") == "ok")
+        if n_dead == 0:
+            snap["overall"] = "healthy"
+        elif n_dead < n_prog / 2:
+            snap["overall"] = "warning"
+        else:
+            snap["overall"] = "critical"
+        snap["overall_counts"] = {
+            "dead": n_dead, "low": len(snap["verdicts"]["LOW"]),
+            "ok": len(snap["verdicts"]["OK"]), "total_programs": n_prog,
+        }
+        return snap
+
+    def _log_health_summary(self) -> None:
+        """Periodic one-line health summary to the brain log. Called every
+        1000 transitions from _record_transition. rFP β § 4c observability.
+
+        Phase 3 addition: also persists snapshot to
+        data/neural_nervous_system/health_snapshot.json so the /v4/ns-health
+        dashboard endpoint can read NS state from across the spirit_worker
+        subprocess boundary. Per-titan unique by repo path (no collision
+        between T1 ~/projects/titan/ and T3 ~/projects/titan3/).
         """
-        for name, buf in self.buffers.items():
+        snap = self.get_health_snapshot()
+        counts = snap.get("overall_counts", {})
+        overall = snap.get("overall", "unknown")
+        # One-line summary
+        dead = snap["verdicts"]["DEAD"]
+        dead_str = ",".join(dead[:3]) + ("..." if len(dead) > 3 else "")
+        logger.info(
+            "[NeuralNS] health: %s  |  dead=%d/%d%s  |  low=%d  ok=%d  |  "
+            "phase=%s sup_w=%.3f  transitions=%d train_steps=%d",
+            overall, counts.get("dead", 0), counts.get("total_programs", 0),
+            f" ({dead_str})" if dead else "",
+            counts.get("low", 0), counts.get("ok", 0),
+            snap["training"]["phase"], snap["training"]["supervision_weight"],
+            snap["training"]["total_transitions"],
+            snap["training"]["total_train_steps"],
+        )
+        # Persist snapshot for cross-process /v4/ns-health endpoint access.
+        # Atomic write (tmp→rename) so dashboard readers never see partial JSON.
+        try:
+            snap["snapshot_ts"] = time.time()
+            snap_path = os.path.join(self.data_dir, "health_snapshot.json")
+            tmp = snap_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(snap, f, default=str)
+            os.replace(tmp, snap_path)
+        except Exception as e:
+            logger.debug("[NeuralNS] health snapshot persist failed: %s", e)
+
+    def _load_eligibility_params(self) -> dict:
+        """rFP β Stage 2: load per-program eligibility params from Stage 0.5 output.
+
+        Returns dict {program: {K, decay, freshness_window_s}} or empty dict
+        if params file missing (will use built-in defaults).
+        """
+        params_path = os.path.join(self.data_dir, "eligibility_params.json")
+        try:
+            with open(params_path) as f:
+                data = json.load(f)
+            params = data.get("params", {})
+            if params:
+                logger.info(
+                    "[NeuralNS] Loaded eligibility params for %d programs from %s "
+                    "(generated %s)",
+                    len(params), params_path,
+                    data.get("generated_at", "unknown"))
+            return params
+        except FileNotFoundError:
+            logger.info("[NeuralNS] No eligibility_params.json — using defaults "
+                        "(K=1, decay=0.5)")
+            return {}
+        except Exception as e:
+            logger.warning("[NeuralNS] Failed to load eligibility params: %s", e)
+            return {}
+
+    def _z_normalize_reward(self, program: str, reward: float) -> float:
+        """rFP β Stage 2 § 4a-quat: per-program z-score normalization.
+
+        Updates rolling EMA mean+var for the program, returns clipped z-score.
+        Programs that fire at very different rates (METABOLISM rare vs
+        REFLEX often) end up with comparable training-signal magnitudes.
+
+        URGENCY OUTPUT stays raw [0, 1] — only the training reward is
+        normalized. Downstream consumers (gut_signals, meta-reasoning,
+        composites) keep semantic urgency meaning.
+        """
+        a = self._reward_ema_alpha
+        prev_mean = self._reward_ema_mean.get(program, 0.0)
+        prev_var = self._reward_ema_var.get(program, 1.0)
+        new_mean = prev_mean + a * (reward - prev_mean)
+        # Naive Welford-ish online variance update
+        new_var = prev_var + a * ((reward - prev_mean) ** 2 - prev_var)
+        self._reward_ema_mean[program] = new_mean
+        self._reward_ema_var[program] = max(new_var, 1e-6)
+        std = max(math.sqrt(self._reward_ema_var[program]), 0.01)
+        z = (reward - new_mean) / std
+        return max(-3.0, min(3.0, z))
+
+    def _log_reward_event(self, program: str, reward_raw: float, reward_z: float,
+                          source: str, k_applied: int, fired: bool) -> None:
+        """rFP β Stage 2 § 4d: append to reward audit log.
+
+        Rolling truncation when line count exceeds max (defaults to 50k).
+        Daily archives + 30-day retention deferred to follow-up commit.
+        """
+        if not self._reward_log_enabled:
+            return
+        try:
+            entry = {
+                "ts": time.time(),
+                "program": program,
+                "reward_raw": round(float(reward_raw), 6),
+                "reward_z": round(float(reward_z), 4),
+                "source": source,
+                "k": k_applied,
+                "fired": bool(fired),
+                "ema_mean": round(self._reward_ema_mean.get(program, 0.0), 4),
+            }
+            with open(self._reward_log_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+            self._reward_log_lines += 1
+            # Rolling truncation every 1000 new events
+            if self._reward_log_lines % 1000 == 0:
+                self._truncate_reward_log()
+        except Exception as e:
+            logger.debug("[NeuralNS] reward log append failed: %s", e)
+
+    def _truncate_reward_log(self) -> None:
+        """Keep only the last `_reward_log_max_lines` lines of the audit log."""
+        try:
+            if not os.path.exists(self._reward_log_path):
+                return
+            with open(self._reward_log_path) as f:
+                lines = f.readlines()
+            if len(lines) > self._reward_log_max_lines:
+                kept = lines[-self._reward_log_max_lines:]
+                tmp = self._reward_log_path + ".tmp"
+                with open(tmp, "w") as f:
+                    f.writelines(kept)
+                os.replace(tmp, self._reward_log_path)
+                self._reward_log_lines = len(kept)
+        except Exception as e:
+            logger.debug("[NeuralNS] reward log truncate failed: %s", e)
+
+    def record_outcome(self, reward: float, program: str | None = None,
+                       k: int | None = None, decay: float | None = None,
+                       source: str = "firehose") -> None:
+        """rFP β Stage 2 — per-program reward routing with eligibility traces,
+        z-score normalization, soft-fire propagation, and audit log.
+
+        Args:
+            reward: Raw reward value (any scale — z-normalized internally).
+            program: If specified, only update that program's buffer.
+                     If None, FIREHOSE mode — apply to all programs whose
+                     last transition fired (preserves the old REFLEX_REWARD
+                     behavior for backward compat).
+            k: Override the eligibility K (number of recent fires to credit).
+               If None, uses Stage-0.5 empirical params or default 1.
+            decay: Override the decay factor (weight on each older fire).
+                   If None, uses params or default 0.5.
+            source: Free-text label for the audit log (e.g. "reasoning.commit",
+                    "neuromod.NE_spike", "drain_delta", "firehose").
+
+        Behavior:
+            For each target program:
+              1. Z-normalize reward against per-program rolling EMA
+              2. If last transition FIRED → apply z-reward to last K fires
+                 with eligibility decay (rFP β § 4a Option 1+ traces)
+              3. If last transition NOT-FIRED but urgency was close to
+                 threshold → apply soft-fire scaled reward (rFP β § 4a
+                 Option 1 propagation, breaks class imbalance)
+              4. Adapt hormone threshold from outcome
+              5. Append audit log entry
+
+        Backward compat: `record_outcome(0.5)` — single positional arg —
+        retains the old firehose behavior. New code should use
+        `record_outcome(reward=X, program=Y)` for per-program routing.
+        """
+        target_names = [program] if program else list(self.buffers.keys())
+        for name in target_names:
+            buf = self.buffers.get(name)
+            if buf is None:
+                if program:  # explicit program asked but missing — log
+                    logger.warning(
+                        "[NeuralNS] record_outcome: unknown program '%s' "
+                        "(known: %s)", name, list(self.buffers.keys()))
+                continue
+            net = self.programs.get(name)
+            if net is None:
+                continue
+
+            # 1. Z-normalize per-program (training signal equalization)
+            z = self._z_normalize_reward(name, reward)
+
+            # 2/3. Apply with eligibility traces or soft-fire
+            eparams = self._eligibility_params.get(name, {})
+            eK = k if k is not None else int(eparams.get("K", 1))
+            eDecay = decay if decay is not None else float(eparams.get("decay", 0.5))
+
+            applied_fired = False
             if buf.last_fired:
-                buf.update_last_reward(reward)
-                # Adapt hormone threshold from outcome
-                if self._hormonal_enabled:
-                    self._hormonal.adapt(name, reward - 0.5)
+                # Eligibility traces: credit last K fires
+                buf.update_recent_rewards(z, k=eK, decay=eDecay)
+                applied_fired = True
+            elif self._soft_fire_enabled:
+                # Soft-fire propagation: scaled reward proportional to urgency
+                threshold = getattr(net, 'fire_threshold', 0.3)
+                buf.update_soft_reward(z, fire_threshold=threshold,
+                                       soft_factor=0.5)
+
+            # 4. Adapt hormone threshold from raw reward (preserves prior dynamics)
+            if self._hormonal_enabled:
+                self._hormonal.adapt(name, reward - 0.5)
+
+            # 5. Audit log
+            self._log_reward_event(name, reward, z, source,
+                                   k_applied=eK, fired=applied_fired)
 
     def _train_all(self) -> None:
         """Train all programs from their transition buffers.
@@ -495,7 +825,13 @@ class NeuralNervousSystem:
             if len(buf) < self._batch_size:
                 continue
 
-            obs, urgencies, vm_baselines, rewards, fired = buf.sample(self._batch_size)
+            # rFP β Stage 2 § 4a Option 3: stratified sampling combats
+            # class imbalance (97-99% not-fired). Falls back to uniform
+            # if one class is empty (early training).
+            if self._stratified_sampling_enabled:
+                obs, urgencies, vm_baselines, rewards, fired = buf.sample_stratified(self._batch_size)
+            else:
+                obs, urgencies, vm_baselines, rewards, fired = buf.sample(self._batch_size)
 
             # Compute blended targets
             targets = self._compute_targets(
@@ -961,6 +1297,37 @@ class NeuralNervousSystem:
                 logger.info("[NeuralNS] Created initial hormonal_state.json")
 
     # ── Outer Program Dispatch ─────────────────────────────────────
+
+    def get_augmented_urgencies(self, hormone_blend: float = 0.3) -> dict:
+        """rFP β Phase 3 — blend NN urgency with hormonal pressure for gut input.
+
+        Pure NN urgency is one signal. Hormone level (which carries history
+        from environmental + recent fires) is a complementary signal.
+        Blending makes gut more robust when NN flickers or is collapsed.
+
+        Args:
+            hormone_blend: ratio of hormone pressure in the blend [0, 1].
+                           Default 0.3 → 70% NN + 30% hormone-pressure-ratio.
+                           Set to 0 to disable (pure NN urgencies returned).
+
+        Returns:
+            Dict of {program: blended_urgency} where blended_urgency is
+              (1 - blend) × nn_urgency + blend × (hormone.level / threshold)
+            Hormones above threshold contribute > 1.0 (clamped at 1.0).
+        """
+        nn_urgencies = dict(getattr(self, '_all_urgencies', {}))
+        if hormone_blend <= 0 or not self._hormonal_enabled or not self._hormonal:
+            return nn_urgencies
+
+        out = {}
+        for name, nn_urg in nn_urgencies.items():
+            hormone = self._hormonal._hormones.get(name) if self._hormonal else None
+            if hormone is None or hormone.threshold <= 0:
+                out[name] = nn_urg
+                continue
+            hormone_ratio = min(1.0, hormone.level / max(hormone.threshold, 0.01))
+            out[name] = (1.0 - hormone_blend) * nn_urg + hormone_blend * hormone_ratio
+        return out
 
     def get_outer_dispatch_signals(self) -> list[dict]:
         """

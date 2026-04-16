@@ -159,8 +159,8 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
             _net = {}
             _api_port = 7777
             try:
-                with open("titan_plugin/config.toml", "rb") as _cf:
-                    _cfg_full = tomllib.load(_cf)
+                from titan_plugin.config_loader import load_titan_config
+                _cfg_full = load_titan_config()
                 _net = _cfg_full.get("network", {})
                 _api_port = _cfg_full.get("api", {}).get("port", 7777)
             except Exception as _ce:

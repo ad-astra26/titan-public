@@ -41,13 +41,12 @@ def main():
     )
     logger = logging.getLogger("events_teacher")
 
-    # Load config
-    config_path = PROJECT_ROOT / "titan_plugin" / "config.toml"
-    if not config_path.exists():
-        logger.error("Config not found: %s", config_path)
+    # Load merged config (config.toml + ~/.titan/secrets.toml)
+    from titan_plugin.config_loader import load_titan_config
+    config = load_titan_config()
+    if not config:
+        logger.error("Merged config empty — check titan_plugin/config.toml exists")
         sys.exit(1)
-    with open(config_path, "rb") as f:
-        config = tomllib.load(f)
 
     # API base URL
     net = TITAN_CONFIGS[args.titan]

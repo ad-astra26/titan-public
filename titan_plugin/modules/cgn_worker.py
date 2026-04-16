@@ -131,6 +131,24 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         ))
         logger.info("[CGNWorker] Pre-registered 'coding' consumer for Self-Directed Development")
 
+    # ── Pre-register "reasoning_strategy" consumer (rFP α §2b) ──
+    # Distinct from "reasoning" (ARC-geometric) — this one grounds reasoning
+    # *strategy templates* (primitive sequences that led to successful COMMIT).
+    # Emitted by spirit_worker from reasoning.py _conclude_chain when
+    # outcome_score >= cgn_emission_threshold (default 0.55).
+    # Action space is N/A (consumer-only in v1) — action_dims=1 as placeholder.
+    if "reasoning_strategy" not in cgn._consumers:
+        cgn.register_consumer(CGNConsumerConfig(
+            name="reasoning_strategy",
+            feature_dims=30,
+            action_dims=1,
+            action_names=["observe"],
+            reward_source="reasoning_chain_outcome",
+            max_buffer_size=500,
+            consolidation_priority=2,
+        ))
+        logger.info("[CGNWorker] Pre-registered 'reasoning_strategy' consumer for rFP α")
+
     # ── Initialize /dev/shm weight writer ──────────────────────────────
     shm_writer = ShmWeightWriter(shm_path)
     _write_full_shm(cgn, shm_writer)

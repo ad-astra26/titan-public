@@ -75,8 +75,8 @@ logger = logging.getLogger("persona_endurance")
 # ─── Config ───────────────────────────────────────────────────────────────
 
 def _load_config() -> dict:
-    with open(CONFIG_PATH, "rb") as f:
-        return tomllib.load(f)
+    from titan_plugin.config_loader import load_titan_config
+    return load_titan_config()
 
 
 def _get_api_base() -> str:

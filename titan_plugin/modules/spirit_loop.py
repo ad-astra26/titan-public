@@ -61,6 +61,7 @@ def _post_epoch_learning(
     prev_body, prev_mind, prev_spirit,
     curr_body, curr_mind, curr_spirit,
     prev_loss: float,
+    neural_nervous_system=None,
 ) -> None:
     """
     After a consciousness epoch, run the learning pipeline:
@@ -68,6 +69,11 @@ def _post_epoch_learning(
       2. Maybe train value network
       3. Compute and publish severity multipliers
       4. Run INTUITION suggestion
+      5. (rFP β Stage 2 Phase 2c) Bridge intuition outcome to NS INTUITION program
+
+    Args:
+        neural_nervous_system: optional NeuralNervousSystem ref for INTUITION
+                                reward bridge (rFP β Phase 2c). If None, no bridge.
     """
     if filter_down:
         try:
@@ -114,6 +120,25 @@ def _post_epoch_learning(
                     # We don't know if the suggestion was followed — assume it was
                     # (Interface Module will provide real feedback in Step 5)
                     intuition.record_outcome(True, prev_loss, curr_loss)
+
+                    # rFP β Stage 2 Phase 2c — INTUITION discrete event hook.
+                    # Bridge intuition outcome to NS INTUITION program reward:
+                    #   loss improved (curr < prev) → intuition was right → positive
+                    #   loss worsened (curr > prev) → intuition was wrong → negative
+                    # Symmetric path (Q4 lock-in 2026-04-16). Magnitude scaled.
+                    if neural_nervous_system is not None and prev_loss is not None:
+                        try:
+                            loss_delta = float(prev_loss) - float(curr_loss)
+                            # Scale: typical loss ~0.1-1.0, delta ~0.01-0.1.
+                            # Multiply by 10 → reward in roughly [-1, +1].
+                            reward = max(-1.0, min(1.0, loss_delta * 10.0))
+                            if abs(reward) > 0.05:  # filter noise
+                                neural_nervous_system.record_outcome(
+                                    reward=reward,
+                                    program="INTUITION",
+                                    source="intuition.outcome")
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 

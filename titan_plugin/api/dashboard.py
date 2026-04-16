@@ -884,6 +884,59 @@ async def thread_pool_stats(request: Request):
         return _error(f"thread_pool_stats: {e}")
 
 
+@router.get("/v4/ns-health")
+async def ns_health(request: Request):
+    """Neural Nervous System health snapshot — per-program urgency distribution,
+    VM-baseline coverage, fire rates, training state, hormonal maturity.
+
+    Returns the canonical snapshot used by:
+      - arch_map ns-health (when live API available)
+      - Observatory NS widget (future)
+      - session-startup program-collapse detection
+      - CI gates for rFP β Stages 1+2
+
+    Key fields: overall ∈ {healthy, warning, critical}, verdicts (DEAD/LOW/OK
+    per program), programs (detailed per-program stats), hormonal (per-hormone
+    level/threshold/fire_count), training (phase + supervision weight + counts).
+
+    Cross-process design (rFP β Phase 3): NeuralNervousSystem lives in the
+    spirit_worker subprocess, so direct attribute access from the dashboard
+    main process returns None. Spirit_worker persists get_health_snapshot()
+    output to data/neural_nervous_system/health_snapshot.json every 1000
+    transitions; dashboard reads from disk. Snapshot freshness reported via
+    snapshot_age_s field (None if file missing, integer seconds otherwise).
+    """
+    import os, json, time
+    try:
+        # Try direct access first (works if NeuralNS happens to be in same
+        # process — e.g., during integration tests)
+        plugin = _get_plugin(request)
+        nns = getattr(plugin, "neural_nervous_system", None)
+        if nns is not None and hasattr(nns, "get_health_snapshot"):
+            snap = nns.get_health_snapshot()
+            snap["source"] = "direct"
+            snap["snapshot_age_s"] = 0
+            return _ok(snap)
+
+        # Fallback: read snapshot file persisted by spirit_worker
+        snap_path = "./data/neural_nervous_system/health_snapshot.json"
+        if not os.path.exists(snap_path):
+            return _error(
+                "NS health snapshot not yet written — wait until first 1000 "
+                "transitions accumulate after boot (~3 min)", code=503)
+        try:
+            with open(snap_path) as f:
+                snap = json.load(f)
+            snap_ts = snap.get("snapshot_ts", 0)
+            snap["snapshot_age_s"] = round(time.time() - snap_ts, 1) if snap_ts else None
+            snap["source"] = "snapshot_file"
+            return _ok(snap)
+        except Exception as e:
+            return _error(f"snapshot file read failed: {e}")
+    except Exception as e:
+        return _error(str(e))
+
+
 @router.get("/v4/bus-health")
 async def bus_health(request: Request):
     """Bus health snapshot: per-producer emission rates, queue depths,
@@ -3180,9 +3233,8 @@ def _get_ollama():
     if _ollama_client is not None:
         return _ollama_client
     try:
-        import tomllib
-        with open("titan_plugin/config.toml", "rb") as f:
-            cfg = tomllib.load(f)
+        from titan_plugin.config_loader import load_titan_config
+        cfg = load_titan_config()
         inf = cfg.get("inference", {})
         key = inf.get("ollama_cloud_api_key", "")
         if not key:
@@ -4004,6 +4056,169 @@ async def get_v4_reasoning(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# GET /v4/reasoning-rewards — rFP α Phase 1+ telemetry
+# ---------------------------------------------------------------------------
+@router.get("/v4/reasoning-rewards")
+async def get_v4_reasoning_rewards(request: Request):
+    """rFP α reward-shape telemetry.
+
+    Reads persisted state files from `data/reasoning/`:
+      - sequence_quality.json (Mechanism A EMA table)
+      - value_head.json       (Mechanism B weights + training stats)
+      - reasoning_totals.json (lifetime chain counts)
+
+    Also queries action_chains_step table size for Phase 0.5 visibility.
+    Intentionally file/DB-backed: works even when spirit worker is busy —
+    no proxy call required.
+    """
+    import os
+    import sqlite3
+    import json
+    try:
+        out = {
+            "enabled": False,
+            "publish_enabled": False,
+            "mech_a": None,
+            "mech_b": None,
+            "totals": None,
+            "step_snapshots": None,
+            "phase": "unknown",
+            "current_weights": [0.0, 0.0],
+        }
+
+        # Mechanism A — read sequence_quality.json
+        sq_path = "./data/reasoning/sequence_quality.json"
+        if os.path.exists(sq_path):
+            try:
+                def _read_sq():
+                    with open(sq_path) as f:
+                        return json.load(f)
+                sq = await asyncio.to_thread(_read_sq)
+                entries = sq.get("entries", [])
+                gate = int(sq.get("visit_gate", 3))
+                gated = sum(1 for e in entries if int(e.get("n", 0)) >= gate)
+                emas = [float(e.get("ema", 0.0)) for e in entries
+                        if int(e.get("n", 0)) >= gate]
+                out["mech_a"] = {
+                    "entries": len(entries),
+                    "gated_entries": gated,
+                    "visit_gate": gate,
+                    "ema_alpha": sq.get("ema_alpha"),
+                    "evictions": sq.get("evictions", 0),
+                    "ema_mean_gated": (sum(emas) / len(emas)) if emas else None,
+                }
+            except Exception as e:
+                out["mech_a"] = {"error": f"sq_read: {e}"}
+
+        # Mechanism B — read value_head.json (skip weights, just stats)
+        vh_path = "./data/reasoning/value_head.json"
+        if os.path.exists(vh_path):
+            try:
+                def _read_vh():
+                    with open(vh_path) as f:
+                        d = json.load(f)
+                    # Return a lite copy without the big weight arrays
+                    return {
+                        k: v for k, v in d.items()
+                        if k not in ("w1", "b1", "w2", "b2", "w3", "b3")
+                    }
+                out["mech_b"] = await asyncio.to_thread(_read_vh)
+            except Exception as e:
+                out["mech_b"] = {"error": f"vh_read: {e}"}
+
+        # Lifetime totals
+        rt_path = "./data/reasoning/reasoning_totals.json"
+        if os.path.exists(rt_path):
+            try:
+                def _read_rt():
+                    with open(rt_path) as f:
+                        return json.load(f)
+                out["totals"] = await asyncio.to_thread(_read_rt)
+            except Exception as e:
+                out["totals"] = {"error": f"rt_read: {e}"}
+
+        # Derive phase state + weights from config + totals
+        try:
+            import tomllib
+            def _read_cfg():
+                with open("titan_plugin/titan_params.toml", "rb") as f:
+                    return tomllib.load(f)
+            cfg = await asyncio.to_thread(_read_cfg)
+            rr = cfg.get("reasoning_rewards", {})
+            out["enabled"] = bool(rr.get("enabled", False))
+            out["publish_enabled"] = bool(rr.get("publish_enabled", False))
+            out["config"] = {
+                "intermediate_cap": rr.get("intermediate_cap"),
+                "phase1_end": rr.get("schedule_phase1_chains"),
+                "phase2_end": rr.get("schedule_phase2_chains"),
+                "weight_a_phase2": rr.get("weight_a_phase2"),
+                "weight_b_phase2": rr.get("weight_b_phase2"),
+                "weight_a_phase3": rr.get("weight_a_phase3"),
+                "weight_b_phase3": rr.get("weight_b_phase3"),
+                "cgn_emission_threshold": rr.get("cgn_emission_threshold"),
+            }
+            n = int((out.get("totals") or {}).get("total_chains", 0))
+            # Load activation offset if persisted
+            act_path = "./data/reasoning/rfp_alpha_activation.json"
+            anchor = None
+            try:
+                if os.path.exists(act_path):
+                    def _read_act():
+                        with open(act_path) as f:
+                            return json.load(f)
+                    act = await asyncio.to_thread(_read_act)
+                    anchor = act.get("chains_at_activation")
+                    out["chains_at_activation"] = anchor
+            except Exception:
+                anchor = None
+            offset = (n - anchor) if anchor is not None else n
+            out["offset_chains_since_activation"] = offset
+            p1 = int(rr.get("schedule_phase1_chains", 100))
+            p2 = int(rr.get("schedule_phase2_chains", 500))
+            if not out["enabled"] or not out["publish_enabled"]:
+                out["phase"] = "inactive"
+                out["current_weights"] = [0.0, 0.0]
+            elif offset < p1:
+                out["phase"] = f"phase1 ({offset}/{p1}) — telemetry only"
+                out["current_weights"] = [0.0, 0.0]
+            elif offset < p2:
+                out["phase"] = f"phase2 (+{offset}/{p2}) — Mech A active"
+                out["current_weights"] = [
+                    float(rr.get("weight_a_phase2", 0.5)),
+                    float(rr.get("weight_b_phase2", 0.0))]
+            else:
+                out["phase"] = f"phase3 (+{offset} from activation) — Mech A+B active"
+                out["current_weights"] = [
+                    float(rr.get("weight_a_phase3", 0.3)),
+                    float(rr.get("weight_b_phase3", 0.7))]
+        except Exception as e:
+            out["config_error"] = str(e)
+
+        # Phase 0.5 — action_chains_step table size
+        try:
+            def _count_steps():
+                conn = sqlite3.connect("./data/inner_memory.db", timeout=1.0)
+                try:
+                    cur = conn.execute(
+                        "SELECT COUNT(*), MIN(created_at), MAX(created_at) "
+                        "FROM action_chains_step")
+                    row = cur.fetchone()
+                    return {"rows": row[0], "oldest_ts": row[1], "newest_ts": row[2]} if row else None
+                except sqlite3.OperationalError:
+                    return {"rows": 0, "note": "table_not_yet_created"}
+                finally:
+                    conn.close()
+            out["step_snapshots"] = await asyncio.to_thread(_count_steps)
+        except Exception as e:
+            out["step_snapshots"] = {"error": str(e)}
+
+        return _ok(out)
+    except Exception as e:
+        logger.error("[Dashboard] /v4/reasoning-rewards error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
 # GET /v4/meta-reasoning — Meta-reasoning engine stats
 # ---------------------------------------------------------------------------
 @router.get("/v4/meta-reasoning")
@@ -4279,11 +4494,10 @@ async def get_v1_kin_identity(request: Request):
         titan_id = "T1"
         solana_pubkey = ""
         genesis_nft = ""
-        # Read config.toml for genesis NFT + keypair path
+        # Read merged config for genesis NFT + keypair path
         try:
-            cfg_path = _P(__file__).parent.parent / "config.toml"
-            with open(cfg_path, "rb") as f:
-                _cfg = _toml.load(f)
+            from titan_plugin.config_loader import load_titan_config
+            _cfg = load_titan_config()
             soul = _cfg.get("soul", {})
             genesis_nft = soul.get("genesis_nft_address", "")
             titan_id = _cfg.get("titan_id", "T1")
@@ -4391,9 +4605,8 @@ async def get_v1_kin_meta_cgn_snapshot(request: Request):
         signature = ""
         signed_by = "unsigned"
         try:
-            cfg_path = _P(__file__).parent.parent / "config.toml"
-            with open(cfg_path, "rb") as f:
-                _cfg = _toml.load(f)
+            from titan_plugin.config_loader import load_titan_config
+            _cfg = load_titan_config()
             kp_path = _P(_cfg.get("soul", {}).get(
                 "keypair_path", "~/.config/solana/id.json")).expanduser()
             if kp_path.exists():

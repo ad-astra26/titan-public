@@ -6510,6 +6510,279 @@ def run_bus_consumers(msg_type: str):
     print("=" * 90)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# NS PROGRAMS — Stage 0 of rFP β (NS Program Signal Restoration)
+# ══════════════════════════════════════════════════════════════════════════
+
+NS_PROGRAMS = [
+    "REFLEX", "FOCUS", "INTUITION", "IMPULSE", "INSPIRATION",
+    "CREATIVITY", "CURIOSITY", "EMPATHY", "REFLECTION",
+    "METABOLISM", "VIGILANCE",
+]
+
+NS_DATA_DIR = PROJECT_ROOT / "data" / "neural_nervous_system"
+
+
+def _ns_color(text, code):
+    if not sys.stdout.isatty():
+        return text
+    return f"\x1b[{code}m{text}\x1b[0m"
+
+
+def _ns_load_buffer(program: str, data_dir: Path = NS_DATA_DIR):
+    path = data_dir / f"{program.lower()}_buffer.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def _ns_load_weights(program: str, data_dir: Path = NS_DATA_DIR):
+    path = data_dir / f"{program.lower()}_weights.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def _ns_vm_program_set():
+    """Parse nervous_system.py to find which programs have VM baseline.
+
+    Post-Stage-1 (auto-discovery refactor): looks for _make_*_program function
+    definitions instead of the old hardcoded return-dict. Each function
+    matches one program (e.g. _make_metabolism_program → METABOLISM).
+    """
+    ns_path = PROJECT_ROOT / "titan_plugin" / "logic" / "nervous_system.py"
+    if not ns_path.exists():
+        return set()
+    src = ns_path.read_text()
+    # Auto-discovery convention: every _make_X_program function = X uppercase
+    matches = re.findall(r"^def _make_([a-z_]+)_program\b", src, re.MULTILINE)
+    return {m.upper() for m in matches}
+
+
+def _pct_nz(values, eps=0.01):
+    """Percent of values with magnitude > eps. Default 0.01 filters NN noise floor
+    (urgencies below 0.01 are effectively zero for downstream consumers)."""
+    if not values:
+        return 0.0
+    return 100.0 * sum(1 for v in values if abs(v) > eps) / len(values)
+
+
+def _ns_program_stats(program: str, data_dir: Path = NS_DATA_DIR):
+    buf = _ns_load_buffer(program, data_dir)
+    w = _ns_load_weights(program, data_dir)
+    if not buf:
+        return {"program": program, "status": "no_buffer"}
+    urg = buf.get("urgencies") or []
+    vmb = buf.get("vm_baselines") or []
+    rew = buf.get("rewards") or []
+    fired = buf.get("fired") or []
+    n = len(urg)
+    if n == 0:
+        return {"program": program, "status": "empty_buffer", "n": 0}
+    return {
+        "program": program, "status": "ok", "n": n,
+        "avg_u": sum(urg) / n, "max_u": max(urg), "pct_nz_u": _pct_nz(urg),
+        "avg_vm": (sum(vmb) / n) if vmb else 0.0,
+        "max_vm": max(vmb) if vmb else 0.0,
+        "pct_nz_vm": _pct_nz(vmb),
+        "fire_pct": 100.0 * sum(1 for f in fired if f) / n,
+        "avg_r": (sum(rew) / n) if rew else 0.0,
+        "pct_nz_r": _pct_nz(rew),
+        "input_dim": (w or {}).get("input_dim", 0),
+        "feature_set": (w or {}).get("feature_set", "?"),
+        "last_loss": (w or {}).get("last_loss", 0.0),
+        "total_updates": (w or {}).get("total_updates", 0),
+    }
+
+
+def run_ns_signals(titan: str = "T1") -> int:
+    """Per-program urgency distribution — answers 'which programs are alive?'"""
+    print(f"\nNS SIGNALS — {titan}")
+    print("=" * 108)
+
+    if titan != "T1":
+        print(f"  Remote titan {titan} support TBD (read local disk only in v1)")
+        return 2
+
+    vm_programs = _ns_vm_program_set()
+
+    print(f"  {'PROGRAM':<12} {'N':>5} {'AVG_U':>7} {'MAX_U':>7} {'%NZ_U':>6} "
+          f"{'%NZ_VM':>7} {'VM':>4} {'FIRE%':>6} {'LOSS':>11} {'UPDATES':>9}  VERDICT")
+    print("  " + "-" * 106)
+
+    dead_count = 0
+    for program in NS_PROGRAMS:
+        s = _ns_program_stats(program)
+        if s["status"] != "ok":
+            print(f"  {program:<12}  [{s['status']}]")
+            continue
+        vm_str = "YES" if program in vm_programs else "NO "
+        # DEAD: either almost no signal above noise floor, OR max urgency is
+        # trivially small (avg < 0.01 AND max < 0.05 with decent sample count)
+        is_dead = (
+            s["n"] > 500
+            and (s["pct_nz_u"] < 5 or (s["avg_u"] < 0.01 and s["max_u"] < 0.05))
+        )
+        if is_dead:
+            verdict, cc = "DEAD", "31"
+            dead_count += 1
+        elif s["pct_nz_u"] < 30:
+            verdict, cc = "LOW", "33"
+        else:
+            verdict, cc = "OK", "32"
+        print(f"  {program:<12} {s['n']:>5} {s['avg_u']:>7.4f} {s['max_u']:>7.4f} "
+              f"{s['pct_nz_u']:>5.1f}% {s['pct_nz_vm']:>6.1f}% {vm_str:>4} "
+              f"{s['fire_pct']:>5.1f}% {s['last_loss']:>11.8f} {s['total_updates']:>9}  "
+              f"{_ns_color(verdict, cc)}")
+
+    print()
+    missing = set(NS_PROGRAMS) - vm_programs
+    vm_line = f"  VM-supervised: {len(vm_programs)}/11 programs"
+    if missing:
+        vm_line += f"  |  MISSING: {', '.join(sorted(missing))}"
+    print(vm_line)
+    if dead_count > 0:
+        print(f"  {_ns_color(f'{dead_count} DEAD programs (pct_nz_u < 5% with >500 samples)', '31;1')}")
+        return 1
+    return 0
+
+
+def run_ns_persistence_check(titan: str = "T1") -> int:
+    """Verify all 11 programs have weights + buffer on disk + training state."""
+    print(f"\nNS PERSISTENCE CHECK — {titan}")
+    print("=" * 80)
+    data_dir = NS_DATA_DIR
+    failures = []
+
+    for program in NS_PROGRAMS:
+        w = data_dir / f"{program.lower()}_weights.json"
+        b = data_dir / f"{program.lower()}_buffer.json"
+        wsz = w.stat().st_size if w.exists() else 0
+        bsz = b.stat().st_size if b.exists() else 0
+        w_ok = w.exists() and wsz > 100
+        b_ok = b.exists() and bsz > 100
+        status = "OK" if (w_ok and b_ok) else "FAIL"
+        print(f"  {program:<12} weights={'✓' if w_ok else '✗'} ({wsz:>7}B)  "
+              f"buffer={'✓' if b_ok else '✗'} ({bsz:>7}B)  [{status}]")
+        if not (w_ok and b_ok):
+            failures.append(program)
+
+    for fname, min_size in [("training_state.json", 50), ("hormonal_state.json", 200)]:
+        p = data_dir / fname
+        sz = p.stat().st_size if p.exists() else 0
+        ok = p.exists() and sz > min_size
+        print(f"  {fname:<24} {'✓' if ok else '✗'} ({sz}B)")
+        if not ok:
+            failures.append(fname)
+
+    sb = data_dir / "ns_training_backup.db"
+    sb_sz = sb.stat().st_size if sb.exists() else 0
+    sb_ok = sb.exists() and sb_sz > 1024
+    print(f"  ns_training_backup.db    {'✓' if sb_ok else '✗'} ({sb_sz}B)")
+    if not sb_ok:
+        failures.append("ns_training_backup.db")
+
+    snap_dir = data_dir / "snapshots"
+    n_snap_sets = len(list(snap_dir.glob("step_*_training_state.json"))) if snap_dir.exists() else 0
+    n_rfp_snaps = len(list((snap_dir / "pre_rFP_beta").glob("*"))) if (snap_dir / "pre_rFP_beta").exists() else 0
+    print(f"  snapshots/               {'✓' if snap_dir.exists() else '✗'} "
+          f"(rolling: {n_snap_sets} sets, pre_rFP_beta: {n_rfp_snaps} files)")
+
+    print()
+    if failures:
+        print(f"  {_ns_color('FAIL', '31;1')}: {len(failures)} missing: {failures}")
+        return 1
+    print(f"  {_ns_color('PASS', '32;1')}: all 11 programs + state + hormone + SQLite + snapshots present")
+    return 0
+
+
+def run_ns_health(titan: str = "T1") -> int:
+    """Full per-program health report — combines ns-signals + persistence + training summary."""
+    rc_sig = run_ns_signals(titan)
+    rc_pers = run_ns_persistence_check(titan)
+
+    ts_path = NS_DATA_DIR / "training_state.json"
+    if ts_path.exists():
+        try:
+            ts = json.loads(ts_path.read_text())
+            import time as _t
+            age_s = _t.time() - ts.get("last_train_ts", 0)
+            age_str = f"{age_s:.0f}s ago" if age_s < 3600 else f"{age_s/3600:.1f}h ago"
+            print()
+            print(f"  Global state: transitions={ts.get('total_transitions', 0):,}  "
+                  f"train_steps={ts.get('total_train_steps', 0):,}  "
+                  f"last_train={age_str}")
+            program_names = ts.get("program_names", [])
+            print(f"  Registered programs: {len(program_names)}/11 "
+                  f"— {', '.join(program_names)}")
+        except Exception as e:
+            print(f"  training_state.json parse error: {e}")
+
+    h_path = NS_DATA_DIR / "hormonal_state.json"
+    if h_path.exists():
+        try:
+            h = json.loads(h_path.read_text())
+            print()
+            print(f"  Hormonal system: maturity={h.get('maturity', 0):.3f}  "
+                  f"hormones={len(h.get('hormones', {}))}")
+        except Exception:
+            pass
+
+    return rc_sig | rc_pers
+
+
+def run_ns_learning(titan: str = "T1", since_hours: int = 24) -> int:
+    """Learning trajectory per program — is the NN actually learning?"""
+    import time as _t
+    print(f"\nNS LEARNING — {titan} (last {since_hours}h)")
+    print("=" * 100)
+    cutoff = _t.time() - since_hours * 3600
+
+    print(f"  {'PROGRAM':<12} {'WEIGHT_AGE':>14} {'LAST_LOSS':>13} {'STATE':<15} "
+          f"{'UPDATES':>9}  RECENT?")
+    print("  " + "-" * 98)
+
+    active_count = 0
+    collapsed_count = 0
+    for program in NS_PROGRAMS:
+        w = _ns_load_weights(program)
+        if not w:
+            continue
+        last_loss = w.get("last_loss", 0.0)
+        updates = w.get("total_updates", 0)
+        wpath = NS_DATA_DIR / f"{program.lower()}_weights.json"
+        mtime = wpath.stat().st_mtime if wpath.exists() else 0
+        age_s = _t.time() - mtime
+        recent = mtime > cutoff
+
+        if last_loss < 1e-6 and updates > 10000:
+            state, cc = "COLLAPSED", "31"
+            collapsed_count += 1
+        elif last_loss < 0.01:
+            state, cc = "converged", "33"
+        else:
+            state, cc = "active", "32"
+            active_count += 1
+
+        age_str = f"{age_s/60:.0f}m" if age_s < 3600 else (
+            f"{age_s/3600:.1f}h" if age_s < 86400 else f"{age_s/86400:.1f}d")
+        print(f"  {program:<12} {age_str:>14} {last_loss:>13.10f} "
+              f"{_ns_color(state, cc):<24} {updates:>9}  {'✓' if recent else 'stale'}")
+
+    print()
+    print(f"  Active: {active_count}/11 | Collapsed: {collapsed_count}/11")
+    if collapsed_count >= 6:
+        print(f"  {_ns_color('DEGENERATE — majority of programs have collapsed to zero (rFP β scope)', '31;1')}")
+        return 1
+    return 0
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -6804,6 +7077,41 @@ def main():
                                      concurrency=concurrency, total=total,
                                      p95_max_ms=p95, p99_max_ms=p99)
         sys.exit(rc)
+
+    elif cmd == "ns-signals":
+        # 2026-04-16 rFP β Stage 0: per-program urgency distribution.
+        # Answers "which programs are alive?" from buffer files on disk.
+        titan = "T1"
+        for a in sys.argv[2:]:
+            if a.startswith("--titan="):
+                titan = a.split("=", 1)[1].upper()
+        sys.exit(run_ns_signals(titan))
+
+    elif cmd == "ns-health":
+        # 2026-04-16 rFP β Stage 0: full NS health — signals + persistence + state.
+        titan = "T1"
+        for a in sys.argv[2:]:
+            if a.startswith("--titan="):
+                titan = a.split("=", 1)[1].upper()
+        sys.exit(run_ns_health(titan))
+
+    elif cmd == "ns-learning":
+        # 2026-04-16 rFP β Stage 0: is the NN actually learning? Loss + weight age.
+        titan = "T1"
+        since = 24
+        for a in sys.argv[2:]:
+            if a.startswith("--titan="):
+                titan = a.split("=", 1)[1].upper()
+            elif a.startswith("--since-hours="):
+                try:
+                    since = int(a.split("=", 1)[1])
+                except ValueError:
+                    pass
+        sys.exit(run_ns_learning(titan, since))
+
+    elif cmd == "ns-persistence-check":
+        # 2026-04-16 rFP β Stage 0: all 11 programs have weights + buffer + state?
+        sys.exit(run_ns_persistence_check())
 
     elif cmd == "thread-pool":
         # 2026-04-14: thread-pool saturation snapshot for all Titans. Hits

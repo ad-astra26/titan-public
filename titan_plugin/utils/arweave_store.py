@@ -304,12 +304,10 @@ class ArweaveStore:
             return None
 
     def _get_rpc_url(self) -> str:
-        """Get the RPC URL from config or default."""
+        """Get the RPC URL from merged config or default."""
         try:
-            import tomllib
-            with open("titan_plugin/config.toml", "rb") as f:
-                cfg = tomllib.load(f)
-            return cfg.get("network", {}).get("premium_rpc_url", "https://api.mainnet-beta.solana.com")
+            from titan_plugin.config_loader import load_titan_config
+            return load_titan_config().get("network", {}).get("premium_rpc_url", "https://api.mainnet-beta.solana.com")
         except Exception:
             return "https://api.mainnet-beta.solana.com"
 

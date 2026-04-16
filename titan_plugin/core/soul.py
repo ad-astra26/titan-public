@@ -144,13 +144,11 @@ class SovereignSoul:
         except Exception as e:
             logger.warning("[Soul] Could not load local state: %s", e)
 
-        # Fallback: read GenesisNFT address from config.toml if not in state file
+        # Fallback: read GenesisNFT address from merged config if not in state file
         if not self._nft_address:
             try:
-                import tomllib
-                with open("titan_plugin/config.toml", "rb") as f:
-                    _cfg = tomllib.load(f)
-                self._nft_address = _cfg.get("network", {}).get("genesis_nft_address", "")
+                from titan_plugin.config_loader import load_titan_config
+                self._nft_address = load_titan_config().get("network", {}).get("genesis_nft_address", "")
                 if self._nft_address:
                     logger.info("[Soul] GenesisNFT address loaded from config: %s",
                                 self._nft_address[:20] + "...")
@@ -201,12 +199,10 @@ class SovereignSoul:
             if not is_available():
                 return
 
-            # Read config for RPC
+            # Read merged config for RPC
             try:
-                import tomllib
-                with open("titan_plugin/config.toml", "rb") as f:
-                    cfg = tomllib.load(f)
-                rpc_url = cfg.get("network", {}).get("premium_rpc_url",
+                from titan_plugin.config_loader import load_titan_config
+                rpc_url = load_titan_config().get("network", {}).get("premium_rpc_url",
                           "https://api.mainnet-beta.solana.com")
             except Exception:
                 rpc_url = "https://api.mainnet-beta.solana.com"

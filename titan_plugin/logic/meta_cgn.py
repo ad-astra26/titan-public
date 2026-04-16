@@ -359,6 +359,26 @@ SIGNAL_TO_PRIMITIVE: dict[tuple, dict[str, float]] = {
     # Intensity = novelty (first-time pattern recognition signal).
     ("meta_reasoning", "eureka"):       {"HYPOTHESIZE": 0.80, "SYNTHESIZE": 0.75,
                                          "BREAK": 0.70, "INTROSPECT": 0.65},
+
+    # rFP β Phase 3 — NS outer-program → META-CGN coupling (5 outer/personality
+    # programs become META-CGN producers via their existing Phase 2c discrete
+    # event hooks in spirit_worker). Bridges NS interoceptive layer to META-CGN
+    # cognitive layer — the architectural goal of § 4g.
+    #
+    # All entries are MONOCULTURE-AWARE per same discipline as Phase D producers:
+    # FORMULATE 0.20 + RECALL 0.30 BIAS AWAY from T1/T3 FORMULATE / T2 RECALL
+    # monoculture; underserved primitives (SYNTHESIZE, HYPOTHESIZE, DELEGATE,
+    # INTROSPECT, BREAK, SPIRIT_SELF) get the reinforcement.
+    ("inspiration", "fired"):           {"HYPOTHESIZE": 0.70, "SYNTHESIZE": 0.65,
+                                         "BREAK": 0.60},
+    ("creativity",  "fired"):           {"SYNTHESIZE": 0.70, "FORMULATE": 0.20,
+                                         "HYPOTHESIZE": 0.60},
+    ("curiosity",   "fired"):           {"HYPOTHESIZE": 0.70, "DELEGATE": 0.65,
+                                         "RECALL": 0.30},
+    ("empathy",     "fired"):           {"DELEGATE": 0.70, "SPIRIT_SELF": 0.60,
+                                         "EVALUATE": 0.55},
+    ("reflection",  "fired"):           {"INTROSPECT": 0.75, "SPIRIT_SELF": 0.65,
+                                         "EVALUATE": 0.55},
 }
 
 # D10.2: pseudo-observation weight (small vs real chain evidence weight=1.0)

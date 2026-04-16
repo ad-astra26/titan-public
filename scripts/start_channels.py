@@ -53,19 +53,12 @@ async def _launch_adapter(name: str, module_path: str, func_name: str, titan_url
 
 async def main(titan_url: str) -> None:
     """Discover enabled channels and start them concurrently."""
-    # Load the full channels config to check enabled flags
-    try:
-        import tomllib
-    except ModuleNotFoundError:
-        import tomli as tomllib  # type: ignore[no-redef]
-
-    config_path = _PROJECT_ROOT / "titan_plugin" / "config.toml"
-    if not config_path.exists():
-        logger.error("config.toml not found at %s", config_path)
+    # Load the full merged channels config (config.toml + ~/.titan/secrets.toml)
+    from titan_plugin.config_loader import load_titan_config
+    full_config = load_titan_config()
+    if not full_config:
+        logger.error("Merged config empty — check titan_plugin/config.toml + ~/.titan/secrets.toml")
         sys.exit(1)
-
-    with open(config_path, "rb") as fh:
-        full_config = tomllib.load(fh)
 
     channels_section = full_config.get("channels", {})
 

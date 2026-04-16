@@ -773,7 +773,14 @@ description = "Learned energy cost prediction — fires when metabolic expenditu
 [reasoning]
 enabled = true
 max_chain_length = 10          # Maximum reasoning steps before forced CONCLUDE
-min_chain_length = 3           # Minimum steps before CONCLUDE allowed (prevents premature exit)
+min_chain_length = 6           # Raised 3→6 on 2026-04-16 — see TUNING-015 in TUNING_DATABASE.md
+# Rationale: RL buffer analysis showed 100% of chains were exactly 3 steps —
+# policy had learned to CONCLUDE at the earliest legal step to maximize
+# reward-rate (terminal reward only, intermediate rewards = 0). Raising min
+# forces policy to experience longer chains, where confidence may rise
+# enough to COMMIT instead of ABANDON. Proper fix (dense intermediate
+# rewards) is tracked as rFP; this is the behavioral nudge to get data on
+# whether length or reward-shape is the binding constraint.
 confidence_threshold = 0.6     # Mind Willing commitment threshold
 save_dir = "./data/reasoning"
 
@@ -795,6 +802,60 @@ spirit_max_nudge = 0.02        # Maximum 2% influence per observation
 
 # Transition buffer for IQL training during dreams
 buffer_size = 2000
+
+# ── Reasoning reward shape (rFP α — 2026-04-16) ──────────────────────
+# Dense intermediate rewards via Mechanism A (sequence-quality EMA table)
+# + Mechanism B (StepValueNet TD-learned state-value). Ship all code;
+# phase schedule activates via weight ramp. See rFP §3 for design lock.
+[reasoning_rewards]
+enabled = true                        # Master toggle — false = rFP α inactive, pre-α behavior
+publish_enabled = true                # Phase gate: false = Phase 1 telemetry-only; true activates schedule
+                                      # FLIPPED 2026-04-16 ~14:56 UTC — Phase 2 ACTIVE post-restart
+                                      # Mechanism A warm-started from 963 post-TUNING-015 main chains
+                                      # (264 gated entries ready at launch)
+intermediate_cap = 0.2                # Max cumulative intermediate reward per chain (rFP D4 lock)
+
+# Phase schedule (compressed boundaries — D14 lock).
+# Values are RELATIVE to `chains_at_activation` (latched on first tick
+# after publish_enabled=true, persisted to data/reasoning/rfp_alpha_activation.json).
+# This means Titans of any lifetime counter run the full arc from scratch.
+schedule_phase1_chains = 100          # offset <100: telemetry only
+schedule_phase2_chains = 500          # offset 100-500: Phase 2 (Mech A active)
+                                      # offset >=500: Phase 3 (Mech A+B active)
+weight_a_phase2 = 0.5
+weight_b_phase2 = 0.0
+weight_a_phase3 = 0.3                 # chains 500+
+weight_b_phase3 = 0.7
+
+# Mechanism A — SequenceQualityStore (per-prefix EMA)
+mech_a_ema_alpha = 0.1                # After visit-count ramp — stable at 0.1 (D8)
+mech_a_visit_gate = 3                 # Require n >= 3 visits before returning signal (D10)
+mech_a_visit_ramp_cutoff = 20         # First 20 visits use 1/n; after that α=ema_alpha
+mech_a_table_cap = 10000              # LRU eviction beyond (D11)
+mech_a_horizon_entire = 0.4           # Blend weight: full prefix (locked per rFP §3)
+mech_a_horizon_last_k = 0.6           # Blend weight: last K prefix
+mech_a_horizon_k = 3                  # K for last-K prefix lookup
+
+# Mechanism B — StepValueNet (input = policy_input_dim + 11)
+mech_b_h1 = 64
+mech_b_h2 = 32
+mech_b_learning_rate = 0.001
+mech_b_vtarget_ema_alpha = 0.01       # Running mean/std normalization window (D25)
+
+# Companion bonuses (rFP §2a — LOW-impact defaults D12/D13)
+confidence_growth_coeff = 0.3         # bonus = max(0, Δconf) × coeff
+confidence_growth_step_cap = 0.05     # per-step cap on confidence-growth bonus
+threshold_cross_bonus = 0.1           # one-shot per chain
+threshold_cross_point = 0.6           # confidence value that triggers bonus
+
+# CGN emission (rFP §2b)
+cgn_emission_threshold = 0.55         # outcome_score threshold for reasoning_strategy emit
+cgn_state_embedding_dim = 30          # tier1 dim (D15 lock)
+
+# Step-snapshot persistence (D3+D18 — warm-start path for Mechanism B)
+step_snapshot_enabled = true          # Phase 0.5 persistence for offline B pre-training
+step_snapshot_retention_days = 7      # Auto-trim on engine save
+step_snapshot_table = "action_chains_step"
 
 [meta_reasoning]
 enabled = true

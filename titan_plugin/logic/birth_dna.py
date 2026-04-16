@@ -106,16 +106,11 @@ def serialize_for_arweave(
     from titan_plugin.utils.directive_signer import compute_constitution_hash
     directive_hash = compute_constitution_hash(constitution_path) if constitution_text else ""
 
-    # Read maker pubkey from config
+    # Read maker pubkey from merged config
     maker_pubkey = ""
     try:
-        try:
-            import tomllib
-        except ImportError:
-            import tomli as tomllib
-        with open(params_path.replace("titan_params.toml", "config.toml"), "rb") as f:
-            config = tomllib.load(f)
-        maker_pubkey = config.get("network", {}).get("maker_pubkey", "")
+        from titan_plugin.config_loader import load_titan_config
+        maker_pubkey = load_titan_config().get("network", {}).get("maker_pubkey", "") or ""
     except Exception:
         pass
 

@@ -278,14 +278,12 @@ class SocialXGateway:
         """Reload config from disk. Called before EVERY action.
 
         Returns merged dict of [social_x] + credential keys.
+        Uses titan_plugin.config_loader so secrets in ~/.titan/secrets.toml
+        are deep-merged over the base config.
         """
         try:
-            try:
-                import tomllib
-            except ImportError:
-                import toml as tomllib  # type: ignore
-            with open(self._config_path, "rb") as f:
-                full = tomllib.load(f)
+            from titan_plugin.config_loader import load_titan_config
+            full = load_titan_config(force_reload=True)
         except Exception as e:
             logger.warning("[SocialXGateway] Config load failed: %s", e)
             return {"enabled": False}
@@ -588,20 +586,14 @@ class SocialXGateway:
     def _refresh_session(self, api_key: str, proxy: str) -> str:
         """Refresh expired X session via twitterapi.io login.
 
-        Reads credentials from config.toml, calls user_login_v2,
-        saves new session back to config.toml and returns it.
-        Returns empty string on failure.
+        Reads credentials from the merged config (config.toml + ~/.titan/secrets.toml),
+        calls user_login_v2, and saves the new session to ~/.titan/secrets.toml
+        under [twitter_social].auth_session. Returns empty string on failure.
         """
         import httpx
         try:
-            config = self._load_config()
-            tc = {}
-            try:
-                import tomllib
-            except ImportError:
-                import toml as tomllib
-            with open(self._config_path, "rb") as f:
-                full_cfg = tomllib.load(f)
+            from titan_plugin.config_loader import load_titan_config
+            full_cfg = load_titan_config(force_reload=True)
             tc = full_cfg.get("twitter_social", {})
 
             user_name = tc.get("user_name", "")
@@ -630,19 +622,14 @@ class SocialXGateway:
                 new_session = data.get("login_cookies", "")
                 if new_session:
                     self._refreshed_session = new_session
-                    # Save back to config.toml
-                    try:
-                        with open(self._config_path, "r") as f:
-                            lines = f.readlines()
-                        with open(self._config_path, "w") as f:
-                            for line in lines:
-                                if line.strip().startswith("auth_session"):
-                                    f.write(f'auth_session = "{new_session}"\n')
-                                else:
-                                    f.write(line)
-                        logger.info("[SocialXGateway] Session refreshed and saved to config")
-                    except Exception as e:
-                        logger.warning("[SocialXGateway] Session refreshed but save failed: %s", e)
+                    # Save to ~/.titan/secrets.toml (external-secrets pattern,
+                    # introduced 2026-04-16). NOT to config.toml — secrets never
+                    # live in the repo tree.
+                    from titan_plugin.config_loader import update_secret
+                    if update_secret("twitter_social", "auth_session", new_session):
+                        logger.info("[SocialXGateway] Session refreshed and saved to ~/.titan/secrets.toml")
+                    else:
+                        logger.warning("[SocialXGateway] Session refreshed but save to ~/.titan/secrets.toml failed")
                     self._log_telemetry({"event": "session_refreshed"})
                     return new_session
             logger.warning("[SocialXGateway] Session refresh failed: %s",

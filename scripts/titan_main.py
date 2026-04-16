@@ -24,17 +24,10 @@ sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), ".."
 
 
 def setup_logging():
-    """Configure logging based on config.toml plugin_log_level."""
+    """Configure logging based on merged config plugin_log_level."""
     try:
-        try:
-            import tomllib
-        except ImportError:
-            import toml as tomllib  # type: ignore
-
-        config_path = os.path.join(os.path.dirname(__file__), "..", "titan_plugin", "config.toml")
-        with open(config_path, "rb") as f:
-            cfg = tomllib.load(f)
-        level_str = cfg.get("openclaw", {}).get("plugin_log_level", "INFO")
+        from titan_plugin.config_loader import load_titan_config
+        level_str = load_titan_config().get("openclaw", {}).get("plugin_log_level", "INFO")
     except Exception:
         level_str = "INFO"
 
@@ -197,14 +190,8 @@ async def run(health_only: bool = False, server_only: bool = False):
     # Load config for wallet path override
     wallet_path = os.path.join(os.path.dirname(__file__), "..", "authority.json")
     try:
-        try:
-            import tomllib
-        except ImportError:
-            import toml as tomllib  # type: ignore
-
-        config_path = os.path.join(os.path.dirname(__file__), "..", "titan_plugin", "config.toml")
-        with open(config_path, "rb") as f:
-            cfg = tomllib.load(f)
+        from titan_plugin.config_loader import load_titan_config
+        cfg = load_titan_config()
         wallet_path = cfg.get("network", {}).get("wallet_keypair_path", wallet_path)
     except Exception:
         cfg = {}

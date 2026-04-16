@@ -31,13 +31,8 @@ def setup_logging():
 
 def _load_config() -> dict:
     try:
-        try:
-            import tomllib
-        except ImportError:
-            import toml as tomllib  # type: ignore
-        config_path = os.path.join(os.path.dirname(__file__), "..", "titan_plugin", "config.toml")
-        with open(config_path, "rb") as f:
-            return tomllib.load(f)
+        from titan_plugin.config_loader import load_titan_config
+        return load_titan_config()
     except Exception:
         return {}
 

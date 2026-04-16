@@ -23,13 +23,11 @@ class MemoInscribeHelper:
     """Inscribe Titan's consciousness state on Solana blockchain."""
 
     def __init__(self, rpc_url: str = None, keypair_path: str = None):
-        # Read from config.toml if not explicitly provided
+        # Read from merged config (config.toml + ~/.titan/secrets.toml) if not explicitly provided
         if rpc_url is None or keypair_path is None:
             try:
-                import tomllib
-                with open("titan_plugin/config.toml", "rb") as f:
-                    cfg = tomllib.load(f)
-                net_cfg = cfg.get("network", {})
+                from titan_plugin.config_loader import load_titan_config
+                net_cfg = load_titan_config().get("network", {})
                 if rpc_url is None:
                     rpc_url = net_cfg.get("premium_rpc_url",
                                 net_cfg.get("public_rpc_urls", ["https://api.mainnet-beta.solana.com"])[0])

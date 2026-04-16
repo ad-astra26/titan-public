@@ -627,12 +627,11 @@ class RebirthBackup:
         Network defaults to configured solana_network (mainnet-beta or devnet).
         Gated by [mainnet_budget] backup_arweave_enabled in config.toml.
         """
-        # Resolve network from config if not explicitly passed
+        # Resolve network from merged config if not explicitly passed
         if network is None:
             try:
-                import tomllib
-                with open("titan_plugin/config.toml", "rb") as f:
-                    cfg = tomllib.load(f)
+                from titan_plugin.config_loader import load_titan_config
+                cfg = load_titan_config()
                 network = cfg.get("network", {}).get("solana_network", "devnet")
                 # Map "mainnet-beta" → "mainnet" for ArweaveStore
                 if network == "mainnet-beta":

@@ -19,6 +19,7 @@ Spirit_worker calls coordinator.tick() and coordinator.on_outer_snapshot()
 instead of managing individual components directly.
 """
 import logging
+import time
 from typing import Optional, Sequence
 
 logger = logging.getLogger(__name__)
@@ -369,13 +370,24 @@ class InnerTrinityCoordinator:
                              amount, source, _before, _gaba.level)
 
     def _on_dream_begin(self) -> None:
-        """Side-effects when dreaming begins. All 5 actions from π-CLUSTER_END."""
+        """Side-effects when dreaming begins. All 5 actions from π-CLUSTER_END.
+
+        Per-phase wall-clock durations are recorded and logged at the end as
+        one structured line. Added 2026-04-16 after investigation found
+        autoencoder phase could take 17 min on T2 due to un-batched SQLite
+        writes — we need ongoing visibility into which phase is slow.
+        """
+        _phase_times: dict[str, float] = {}
+        _t = time.perf_counter()
+
         # 1. Life force dreaming state
         if self._life_force:
             try:
                 self._life_force.set_dreaming(True)
             except Exception as e:
                 logger.warning("[Coordinator] Life force dream start error: %s", e)
+        _phase_times["life_force"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 2. NS dream consolidation (2× learning boost)
         if self.neural_ns:
@@ -390,6 +402,8 @@ class InnerTrinityCoordinator:
                     self._consume_dream_gaba(0.01, "ns_consolidation")
             except Exception as e:
                 logger.warning("[Coordinator] Dream consolidation error: %s", e)
+        _phase_times["ns"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 2b. Reasoning engine dream consolidation
         if hasattr(self, '_reasoning_engine') and self._reasoning_engine:
@@ -402,6 +416,8 @@ class InnerTrinityCoordinator:
                     self._consume_dream_gaba(0.01, "reasoning_consolidation")
             except Exception as e:
                 logger.warning("[Coordinator] Reasoning consolidation error: %s", e)
+        _phase_times["reasoning"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 2c. Meta-wisdom decay during dreams (M2)
         if hasattr(self, '_meta_wisdom') and self._meta_wisdom:
@@ -413,6 +429,8 @@ class InnerTrinityCoordinator:
                                 decay_stats["avg_confidence"], decay_stats.get("crystallized", 0))
             except Exception as e:
                 logger.warning("[Coordinator] Meta-wisdom decay error: %s", e)
+        _phase_times["meta_wisdom"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 2d. Autoencoder dream training (M3)
         if hasattr(self, '_meta_autoencoder') and self._meta_autoencoder:
@@ -429,6 +447,8 @@ class InnerTrinityCoordinator:
                         self._meta_autoencoder.save()
             except Exception as e:
                 logger.warning("[Coordinator] Autoencoder training error: %s", e)
+        _phase_times["autoencoder"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 2e. Meta-reasoning dream consolidation (System 1)
         if hasattr(self, '_meta_engine') and self._meta_engine:
@@ -442,6 +462,8 @@ class InnerTrinityCoordinator:
                     self._consume_dream_gaba(0.015, "meta_reasoning_consolidation")
             except Exception as e:
                 logger.warning("[Coordinator] Meta-reasoning consolidation error: %s", e)
+        _phase_times["meta_reasoning"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 2f. Mini-reasoner dream consolidation
         if hasattr(self, '_mini_registry') and self._mini_registry:
@@ -453,6 +475,8 @@ class InnerTrinityCoordinator:
                 self._mini_registry.save_all()
             except Exception as e:
                 logger.warning("[Coordinator] Mini-reasoner consolidation error: %s", e)
+        _phase_times["mini_reasoner"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 3. Experience Orchestrator dream distillation
         if self._exp_orchestrator:
@@ -468,6 +492,8 @@ class InnerTrinityCoordinator:
                                              "experience_distillation")
             except Exception as e:
                 logger.warning("[Coordinator] Dream distillation error: %s", e)
+        _phase_times["experience"] = time.perf_counter() - _t
+        _t = time.perf_counter()
 
         # 4. Neuromod clearance boost (GABA=1.0 normal, others=1+GABA×3)
         # Uses neuromodulator_system (neurotransmitter layer), not neural_ns._hormonal (program hormones)
@@ -486,6 +512,16 @@ class InnerTrinityCoordinator:
                             "others=%.2f", 1.0 + _gaba_val * 3.0)
             except Exception as e:
                 logger.warning("[Coordinator] Neuromod boost error: %s", e)
+        _phase_times["neuromod_boost"] = time.perf_counter() - _t
+
+        # ── Per-phase timing summary ───────────────────────────────
+        # Always log (even fast cases) so we build a baseline; ms resolution.
+        _total_s = sum(_phase_times.values())
+        logger.info(
+            "[Coordinator] _on_dream_begin phases (ms): total=%.0f %s",
+            _total_s * 1000.0,
+            " ".join(f"{k}={int(v * 1000)}" for k, v in _phase_times.items()),
+        )
 
     def _on_dream_end(self, summary: dict | None) -> None:
         """Side-effects when dreaming ends. All actions from π-CLUSTER_START."""

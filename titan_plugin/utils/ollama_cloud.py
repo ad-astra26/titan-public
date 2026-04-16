@@ -33,17 +33,12 @@ _LIGHT_MODEL = "gemma4:31b"
 _MEDIUM_MODEL = "ministral-3:8b"
 _HEAVY_MODEL = "deepseek-v3.1:671b"
 
-# Load from config.toml if available
+# Load from merged config (config.toml + ~/.titan/secrets.toml)
 try:
-    import tomllib
-    from pathlib import Path
-    _cfg_path = Path(__file__).parent.parent / "config.toml"
-    if _cfg_path.exists():
-        with open(_cfg_path, "rb") as _f:
-            _cfg = tomllib.load(_f)
-        _inf = _cfg.get("inference", {})
-        _LIGHT_MODEL = _inf.get("ollama_cloud_light_model", _LIGHT_MODEL)
-        _HEAVY_MODEL = _inf.get("ollama_cloud_heavy_model", _HEAVY_MODEL)
+    from titan_plugin.config_loader import load_titan_config
+    _inf = load_titan_config().get("inference", {})
+    _LIGHT_MODEL = _inf.get("ollama_cloud_light_model", _LIGHT_MODEL)
+    _HEAVY_MODEL = _inf.get("ollama_cloud_heavy_model", _HEAVY_MODEL)
 except Exception:
     pass  # Use defaults
 

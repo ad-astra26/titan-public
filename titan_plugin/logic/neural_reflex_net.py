@@ -350,6 +350,91 @@ class NervousTransitionBuffer:
         if self._last_fired_idx >= 0 and self._last_fired_idx < len(self._rewards):
             self._rewards[self._last_fired_idx] = reward
 
+    def update_recent_rewards(self, reward: float, k: int = 1,
+                              decay: float = 0.5) -> int:
+        """rFP β Stage 2: eligibility-trace credit assignment.
+
+        Apply `reward` to the last K fired transitions with exponential
+        decay: reward(0)=reward, reward(1)=reward*decay, reward(2)=reward*decay^2,
+        etc. Walks backward from the most recent fire.
+
+        Returns the number of transitions actually updated (≤ K).
+        """
+        updated = 0
+        decay_factor = 1.0
+        # Walk backward through buffer finding fired transitions
+        for i in range(len(self._fired) - 1, -1, -1):
+            if updated >= k:
+                break
+            if self._fired[i]:
+                self._rewards[i] = reward * decay_factor
+                decay_factor *= decay
+                updated += 1
+        return updated
+
+    def update_soft_reward(self, reward: float, fire_threshold: float,
+                            soft_factor: float = 0.5) -> bool:
+        """rFP β Stage 2: soft-fire propagation.
+
+        For a NOT-FIRED most-recent transition, apply a scaled reward
+        proportional to how close the urgency was to the fire threshold.
+
+        urgency_ratio = last_urgency / fire_threshold (clamped [0, 1])
+        soft_reward = reward * urgency_ratio * soft_factor
+
+        This breaks the class imbalance (target=0 dominance for not-fired
+        samples) by giving the network gradient signal for "close to firing"
+        states without polluting the genuinely-restraint cases.
+
+        Returns True if a soft reward was applied (urgency was meaningful).
+        """
+        if not self._urgencies:
+            return False
+        last_urg = self._urgencies[-1]
+        if fire_threshold <= 0:
+            return False
+        urgency_ratio = max(0.0, min(1.0, last_urg / fire_threshold))
+        if urgency_ratio < 0.1:  # too far from threshold — true restraint
+            return False
+        soft = reward * urgency_ratio * soft_factor
+        self._rewards[-1] = soft
+        return True
+
+    def sample_stratified(self, batch_size: int) -> tuple:
+        """rFP β Stage 2: 50/50 fired-vs-not-fired stratified sampling.
+
+        Combats class imbalance during training (97-99% of transitions
+        are not-fired by default). Falls back to uniform `sample()` if
+        one class is empty (e.g., very early training).
+
+        Returns same tuple shape as sample(): (obs, urgencies, vm_baselines,
+        rewards, fired) — each as np.ndarray.
+        """
+        import numpy as _np
+        fired_idx = [i for i, f in enumerate(self._fired) if f]
+        not_fired_idx = [i for i, f in enumerate(self._fired) if not f]
+
+        if not fired_idx or not not_fired_idx:
+            return self.sample(batch_size)
+
+        half = batch_size // 2
+        n_fired = min(half, len(fired_idx))
+        n_not_fired = min(batch_size - n_fired, len(not_fired_idx))
+
+        fired_sample = _np.random.choice(fired_idx, n_fired, replace=False)
+        not_fired_sample = _np.random.choice(not_fired_idx, n_not_fired, replace=False)
+        indices = _np.concatenate([fired_sample, not_fired_sample])
+        _np.random.shuffle(indices)
+
+        obs = _np.array([self._observations[i] for i in indices], dtype=_np.float64)
+        return (
+            obs,
+            _np.array([self._urgencies[i] for i in indices], dtype=_np.float64),
+            _np.array([self._vm_baselines[i] for i in indices], dtype=_np.float64),
+            _np.array([self._rewards[i] for i in indices], dtype=_np.float64),
+            _np.array([self._fired[i] for i in indices], dtype=bool),
+        )
+
     def sample(self, batch_size: int) -> tuple:
         """
         Random sample for training.

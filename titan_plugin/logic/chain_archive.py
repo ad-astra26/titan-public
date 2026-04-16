@@ -72,6 +72,15 @@ class ChainArchive:
             db.execute("CREATE INDEX IF NOT EXISTS idx_ca_domain ON chain_archive(domain)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_ca_outcome ON chain_archive(outcome_score)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_ca_consolidated ON chain_archive(dream_consolidated)")
+            # Composite index for get_unconsolidated() — satisfies
+            # WHERE dream_consolidated=0 + ORDER BY created_at DESC in one seek.
+            # Before this: full sort of ~60K rows per call (~1M comparisons).
+            # Added 2026-04-16 after observing autoencoder dream phase stalls
+            # (see titan-docs/INVESTIGATION_spirit_hang_root_cause.md).
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ca_unconsol_recent "
+                "ON chain_archive(dream_consolidated, created_at DESC)"
+            )
             db.commit()
             db.close()
         except Exception as e:
@@ -303,6 +312,41 @@ class ChainArchive:
             db.close()
         except Exception as e:
             logger.debug("[ChainArchive] Update embedding error: %s", e)
+
+    def update_embeddings_batch(self, pairs: list) -> int:
+        """Batch-update embeddings in a single transaction (one fsync).
+
+        ``pairs`` is a list of ``(chain_id, embedding_list)``. Uses the same
+        retry/backoff pattern as other writes. Returns the number of rows
+        queued for update (not necessarily the number actually persisted if
+        some ids don't exist — SQLite's UPDATE is silent on no-match).
+
+        Introduced 2026-04-16 to fix the autoencoder dream-cycle bottleneck:
+        previously backfilling N embeddings did N separate open+execute+commit+close
+        cycles, each subject to SQLite's 15s busy_timeout. On a contended DB
+        this produced 17-minute dream cycles on T2 (68 rows × ~15s each).
+        Single-transaction executemany drops that to one lock acquisition.
+        """
+        if not pairs:
+            return 0
+
+        def _do_batch():
+            db = self._get_db()
+            try:
+                db.executemany(
+                    "UPDATE chain_archive SET observation_embedding = ? WHERE id = ?",
+                    [(json.dumps(emb), cid) for cid, emb in pairs],
+                )
+                db.commit()
+                return len(pairs)
+            finally:
+                db.close()
+
+        try:
+            return self._retry_write(_do_batch)
+        except Exception as e:
+            logger.warning("[ChainArchive] Batch update embeddings error: %s", e)
+            return 0
 
     def get_chains_without_embedding(self, limit: int = 100) -> list:
         try:

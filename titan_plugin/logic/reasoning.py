@@ -40,6 +40,37 @@ PRIMITIVES = [
 
 NUM_ACTIONS = len(PRIMITIVES)  # 8
 
+# rFP β Phase 3 — Primitive-Affinity table for gut formula redesign.
+# Each NS program has visceral character that aligns with specific reasoning
+# primitives. Gut agreement is no longer the degenerate (1 - confidence)
+# formula but a measurement of how well firing programs match the chosen
+# primitive's semantic role.
+#
+# Encoding:
+#   1.0 = primary (program's defining cognitive operation)
+#   0.6 = secondary (program also resonates with this primitive)
+#   0.3 = explicit anti-affinity (program OPPOSES this primitive)
+#   not listed = 0.5 (true neutral — no contribution to gut)
+#
+# Formula: contribution = urgency × (affinity - 0.5) × 2  ∈ [-urgency, +urgency]
+# Symmetric by construction (Q4 lock-in 2026-04-16).
+PRIMITIVE_AFFINITY = {
+    # Inner / autonomic programs
+    "REFLEX":      {"CONCLUDE": 1.0},                        # end fast
+    "FOCUS":       {"DECOMPOSE": 1.0, "SEQUENCE": 0.6},      # depth-first
+    "INTUITION":   {"ASSOCIATE": 1.0, "LOOP": 0.6},          # gut-guided
+    "IMPULSE":     {"CONCLUDE": 1.0, "IF_THEN": 0.6},        # act-now or check-then-act
+    "METABOLISM":  {"CONCLUDE": 1.0, "LOOP": 0.3},           # end fast; OPPOSES deep loops
+    "VIGILANCE":   {"IF_THEN": 1.0, "COMPARE": 0.6},         # condition-checking
+    # Outer / personality programs
+    "INSPIRATION": {"ASSOCIATE": 1.0, "DECOMPOSE": 0.6},     # find connections
+    "CREATIVITY":  {"DECOMPOSE": 1.0, "ASSOCIATE": 0.6, "NEGATE": 0.6},  # generate variations
+    "CURIOSITY":   {"DECOMPOSE": 1.0, "IF_THEN": 0.6, "CONCLUDE": 0.3},  # explore; OPPOSES early CONCLUDE
+    "EMPATHY":     {"COMPARE": 1.0, "SEQUENCE": 0.6},        # perspective-taking
+    "REFLECTION":  {"LOOP": 1.0, "COMPARE": 0.6, "ASSOCIATE": 0.6},  # revisit + connect
+}
+NEUTRAL_AFFINITY = 0.5  # default for programs with no listed entry for this primitive
+
 # Observation decomposition labels for DECOMPOSE primitive
 DECOMPOSE_LABELS = {
     "body":     (0, 15),    # inner_body + outer_body observables
@@ -552,6 +583,361 @@ class ReasoningTransitionBuffer:
             return False
 
 
+# ── rFP α Mechanism A: Sequence-Quality Store ─────────────────────
+# Per-prefix EMA of terminal outcome score. Keys on tuple(chain[:step_idx]).
+# Visit-count-weighted for first N visits (true running mean), then fixed α.
+# LRU eviction at cap. No state bucketing in v1 (rFP §2a "start per-primitive").
+
+
+class SequenceQualityStore:
+    """Mechanism A — EMA table mapping primitive-prefix → expected terminal reward.
+
+    Built 2026-04-16 per rFP α §2a. Used to provide intermediate-step rewards
+    during reasoning chains: at step t with chain-so-far C[:t], query
+    `sequence_quality[C[:t]]` → lookup value multiplied by schedule weight.
+
+    Update cadence: on each chain conclusion, update the EMA for every
+    prefix of the completed chain with the terminal reward.
+
+    Count-weighted ramp:
+        visits < ramp_cutoff:  ema = running_mean (exact 1/n — trusts early aggregate)
+        visits ≥ ramp_cutoff:  ema = α × new + (1-α) × old (fixed rate, responsive)
+
+    Visit gate: query returns None (no signal) for prefixes with < visit_gate
+    visits — prevents spurious signal from under-sampled keys.
+
+    LRU eviction: when table exceeds cap, drop least-recently-updated entry.
+    Monitored via telemetry; rFP §2a anticipates growth to hundreds-thousands
+    of unique prefixes, cap 10k is generous.
+    """
+
+    def __init__(self, cap: int = 10000, visit_gate: int = 3,
+                 ema_alpha: float = 0.1, ramp_cutoff: int = 20):
+        self._table: dict[tuple, dict] = {}  # {seq: {"ema": float, "n": int, "last_ts": float}}
+        self._cap = cap
+        self._visit_gate = visit_gate
+        self._ema_alpha = ema_alpha
+        self._ramp_cutoff = ramp_cutoff
+        self._evictions = 0  # Counter for telemetry
+
+    def update_chain_prefixes(self, chain: list[str], terminal_reward: float) -> int:
+        """Update EMA for every prefix of the completed chain.
+
+        Returns number of prefixes updated.
+        """
+        if not chain:
+            return 0
+        now = time.time()
+        count = 0
+        for i in range(1, len(chain) + 1):
+            prefix = tuple(chain[:i])
+            self._update_one(prefix, terminal_reward, now)
+            count += 1
+        self._maybe_evict()
+        return count
+
+    def _update_one(self, prefix: tuple, reward: float, ts: float) -> None:
+        entry = self._table.get(prefix)
+        if entry is None:
+            self._table[prefix] = {"ema": float(reward), "n": 1, "last_ts": ts}
+            return
+        n = entry["n"] + 1
+        if n <= self._ramp_cutoff:
+            # Count-weighted: exact running mean, trusts aggregate
+            entry["ema"] = entry["ema"] + (reward - entry["ema"]) / n
+        else:
+            # Fixed α EMA: responsive
+            entry["ema"] = (1.0 - self._ema_alpha) * entry["ema"] + self._ema_alpha * reward
+        entry["n"] = n
+        entry["last_ts"] = ts
+
+    def query(self, prefix: tuple) -> Optional[float]:
+        """Return EMA if visit_gate satisfied, else None (no signal).
+
+        Updates last_ts for LRU ordering.
+        """
+        entry = self._table.get(prefix)
+        if entry is None or entry["n"] < self._visit_gate:
+            return None
+        entry["last_ts"] = time.time()
+        return float(entry["ema"])
+
+    def query_blended(self, chain_prefix: list[str], last_k: int,
+                      horizon_entire: float, horizon_last_k: float) -> float:
+        """Horizon-blended query per rFP §3 lock: 0.4 × entire + 0.6 × last_K.
+
+        Returns 0.0 if neither path returns signal (under-visited).
+        """
+        entire = self.query(tuple(chain_prefix))
+        lk_prefix = tuple(chain_prefix[-last_k:]) if len(chain_prefix) >= last_k else tuple(chain_prefix)
+        last_k_v = self.query(lk_prefix)
+        if entire is None and last_k_v is None:
+            return 0.0
+        if entire is None:
+            return float(last_k_v) * horizon_last_k
+        if last_k_v is None:
+            return float(entire) * horizon_entire
+        return float(entire) * horizon_entire + float(last_k_v) * horizon_last_k
+
+    def _maybe_evict(self) -> None:
+        """LRU eviction when over cap. Drops oldest last_ts."""
+        if len(self._table) <= self._cap:
+            return
+        over = len(self._table) - self._cap
+        sorted_items = sorted(self._table.items(), key=lambda kv: kv[1]["last_ts"])
+        for key, _ in sorted_items[:over]:
+            del self._table[key]
+            self._evictions += 1
+
+    def stats(self) -> dict:
+        gated = sum(1 for e in self._table.values() if e["n"] >= self._visit_gate)
+        return {
+            "size": len(self._table),
+            "cap": self._cap,
+            "gated_size": gated,
+            "visit_gate": self._visit_gate,
+            "evictions": self._evictions,
+            "ema_alpha": self._ema_alpha,
+        }
+
+    def save(self, path: str) -> None:
+        """Save table to JSON. Keys become stringified tuples (json-safe)."""
+        data = {
+            "schema": 1,
+            "visit_gate": self._visit_gate,
+            "ema_alpha": self._ema_alpha,
+            "ramp_cutoff": self._ramp_cutoff,
+            "evictions": self._evictions,
+            "entries": [
+                {"seq": list(k), "ema": v["ema"], "n": v["n"], "last_ts": v["last_ts"]}
+                for k, v in self._table.items()
+            ],
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+
+    def load(self, path: str) -> bool:
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            self._table.clear()
+            for entry in data.get("entries", []):
+                key = tuple(entry["seq"])
+                self._table[key] = {
+                    "ema": float(entry["ema"]),
+                    "n": int(entry["n"]),
+                    "last_ts": float(entry["last_ts"]),
+                }
+            self._evictions = int(data.get("evictions", 0))
+            return True
+        except Exception as e:
+            logger.error("[Reasoning/MechA] Failed to load seq_quality: %s", e)
+            return False
+
+    def seed_from_archive(self, archive_rows: list[dict]) -> int:
+        """Bulk-seed from chain_archive rows. Used for warm-start on T1.
+
+        Each row: {"chain_sequence": [str], "outcome_score": float}.
+        Updates every prefix of every chain with its outcome_score.
+        """
+        seeded = 0
+        now = time.time()
+        for row in archive_rows:
+            seq = row.get("chain_sequence") or row.get("chain") or []
+            score = float(row.get("outcome_score", 0.0))
+            if not seq or score < 0:
+                continue
+            for i in range(1, len(seq) + 1):
+                self._update_one(tuple(seq[:i]), score, now)
+                seeded += 1
+        self._maybe_evict()
+        return seeded
+
+
+# ── rFP α Mechanism B: Step Value Net ─────────────────────────────
+# Tiny TD-regression net: V(state, chain_len, last_primitive) → terminal reward.
+# Input dim: policy_input_dim + 11 (conf + gut_agreement + chain_len_norm + last-prim one-hot 8).
+# Output: scalar predicted terminal reward.
+# Training: MSE vs z-score normalized terminal reward, running μ/σ via EMA.
+
+
+class StepValueNet:
+    """Mechanism B — tiny value net predicting terminal reward from mid-chain state.
+
+    Architecture (rFP α D1/D2 lock):
+        Input: policy_input + confidence + gut_agreement + chain_len_norm +
+               last_primitive_onehot(8)  →  total = policy_input_dim + 11
+        Hidden: 2 layers (default 64 + 32) ReLU, Xavier init
+        Output: 1 scalar (normalized), denormalized at inference
+
+    Training: TD regression — trains on completed chains during chain
+    conclusion. V-targets z-score normalized via running EMA (μ, σ) to
+    handle terminal-reward distribution drift (D25).
+
+    Cold-started in v1; warm-start path via offline pre-training on
+    action_chains_step table (Phase 0.5 persistence).
+    """
+
+    def __init__(self, policy_input_dim: int, hidden_1: int = 64, hidden_2: int = 32,
+                 learning_rate: float = 0.001, vtarget_ema_alpha: float = 0.01):
+        # Input: policy dim + 2 (conf, gut_agreement) + 1 (chain_len_norm) + 8 (last_prim one-hot)
+        self.input_dim = policy_input_dim + 11
+        self.policy_input_dim = policy_input_dim  # stored for audit
+        self.h1 = hidden_1
+        self.h2 = hidden_2
+        self.lr = learning_rate
+
+        scale1 = math.sqrt(2.0 / self.input_dim)
+        scale2 = math.sqrt(2.0 / hidden_1)
+        scale3 = math.sqrt(2.0 / hidden_2)
+
+        self.w1 = np.random.randn(self.input_dim, hidden_1) * scale1
+        self.b1 = np.zeros(hidden_1)
+        self.w2 = np.random.randn(hidden_1, hidden_2) * scale2
+        self.b2 = np.zeros(hidden_2)
+        self.w3 = np.random.randn(hidden_2, 1) * scale3
+        self.b3 = np.zeros(1)
+
+        # V-target running normalization (D25)
+        self._vtarget_mean = 0.3   # seed near observed terminal-reward mean (~0.3)
+        self._vtarget_std = 0.15   # seed std near observed range (~0.15)
+        self._vtarget_alpha = vtarget_ema_alpha
+
+        # Training stats
+        self.total_updates = 0
+        self.last_loss = 0.0
+
+        # Backprop cache
+        self._cache = {}
+
+    def build_input(self, policy_input: np.ndarray, confidence: float,
+                    gut_agreement: float, chain_len: int, max_chain: int,
+                    last_primitive: Optional[str]) -> np.ndarray:
+        """Compose the 122D (or policy_input_dim+11) input vector.
+
+        last_primitive: None at chain start → all-zero one-hot.
+        """
+        chain_len_norm = float(min(chain_len, max_chain)) / max(1, max_chain)
+        last_prim_oh = np.zeros(NUM_ACTIONS, dtype=np.float64)
+        if last_primitive and last_primitive in PRIMITIVES:
+            last_prim_oh[PRIMITIVES.index(last_primitive)] = 1.0
+        extras = np.array([float(confidence), float(gut_agreement), chain_len_norm],
+                          dtype=np.float64)
+        return np.concatenate([policy_input.astype(np.float64), extras, last_prim_oh])
+
+    def forward(self, x: np.ndarray) -> float:
+        """Forward pass → normalized V prediction (denormalized via helper)."""
+        z1 = x @ self.w1 + self.b1
+        h1 = np.maximum(0, z1)
+        z2 = h1 @ self.w2 + self.b2
+        h2 = np.maximum(0, z2)
+        z3 = h2 @ self.w3 + self.b3  # shape (1,)
+        self._cache = {"x": x, "z1": z1, "h1": h1, "z2": z2, "h2": h2}
+        return float(z3[0])
+
+    def predict(self, x: np.ndarray) -> float:
+        """Denormalized V prediction — multiply by running σ, add running μ."""
+        v_norm = self.forward(x)
+        return v_norm * self._vtarget_std + self._vtarget_mean
+
+    def train_step(self, x: np.ndarray, target_v: float) -> float:
+        """TD regression step. Updates running μ/σ then MSE-backprops.
+
+        target_v is the raw terminal reward; we z-score normalize for training.
+        """
+        # Update running μ/σ (EMA)
+        delta = target_v - self._vtarget_mean
+        self._vtarget_mean += self._vtarget_alpha * delta
+        variance = (1.0 - self._vtarget_alpha) * (self._vtarget_std ** 2) \
+                   + self._vtarget_alpha * (delta ** 2)
+        self._vtarget_std = max(1e-4, math.sqrt(variance))
+
+        # Normalize target
+        target_norm = (target_v - self._vtarget_mean) / (self._vtarget_std + 1e-5)
+
+        # Forward + MSE gradient
+        v_pred = self.forward(x)
+        d_z3 = np.array([v_pred - target_norm])  # shape (1,)
+
+        # Backprop
+        d_w3 = self._cache["h2"].reshape(-1, 1) @ d_z3.reshape(1, -1)
+        d_b3 = d_z3
+        d_h2 = d_z3 @ self.w3.T
+        d_z2 = d_h2 * (self._cache["z2"] > 0)
+        d_w2 = self._cache["h1"].reshape(-1, 1) @ d_z2.reshape(1, -1)
+        d_b2 = d_z2
+        d_h1 = d_z2 @ self.w2.T
+        d_z1 = d_h1 * (self._cache["z1"] > 0)
+        d_w1 = self._cache["x"].reshape(-1, 1) @ d_z1.reshape(1, -1)
+        d_b1 = d_z1
+
+        for g in [d_w1, d_b1, d_w2, d_b2, d_w3, d_b3]:
+            np.clip(g, -5.0, 5.0, out=g)
+
+        self.w1 -= self.lr * d_w1
+        self.b1 -= self.lr * d_b1
+        self.w2 -= self.lr * d_w2
+        self.b2 -= self.lr * d_b2
+        self.w3 -= self.lr * d_w3
+        self.b3 -= self.lr * d_b3
+
+        self.total_updates += 1
+        loss = float(0.5 * (v_pred - target_norm) ** 2)
+        self.last_loss = loss
+        return loss
+
+    def save(self, path: str) -> None:
+        data = {
+            "schema": 1,
+            "input_dim": self.input_dim,
+            "policy_input_dim": self.policy_input_dim,
+            "h1": self.h1, "h2": self.h2,
+            "w1": self.w1.tolist(), "b1": self.b1.tolist(),
+            "w2": self.w2.tolist(), "b2": self.b2.tolist(),
+            "w3": self.w3.tolist(), "b3": self.b3.tolist(),
+            "vtarget_mean": self._vtarget_mean,
+            "vtarget_std": self._vtarget_std,
+            "vtarget_alpha": self._vtarget_alpha,
+            "total_updates": self.total_updates,
+            "last_loss": self.last_loss,
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+
+    def load(self, path: str) -> bool:
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            saved_dim = data.get("input_dim", self.input_dim)
+            if saved_dim != self.input_dim:
+                logger.warning("[Reasoning/MechB] Input dim mismatch: saved=%d current=%d — discarding",
+                               saved_dim, self.input_dim)
+                return False
+            self.w1 = np.array(data["w1"])
+            self.b1 = np.array(data["b1"])
+            self.w2 = np.array(data["w2"])
+            self.b2 = np.array(data["b2"])
+            self.w3 = np.array(data["w3"])
+            self.b3 = np.array(data["b3"])
+            self._vtarget_mean = float(data.get("vtarget_mean", 0.3))
+            self._vtarget_std = max(1e-4, float(data.get("vtarget_std", 0.15)))
+            self._vtarget_alpha = float(data.get("vtarget_alpha", 0.01))
+            self.total_updates = int(data.get("total_updates", 0))
+            self.last_loss = float(data.get("last_loss", 0.0))
+            return True
+        except Exception as e:
+            logger.error("[Reasoning/MechB] Failed to load value_head: %s", e)
+            return False
+
+
 # ── The Seven Logic Primitives ────────────────────────────────────
 
 
@@ -879,6 +1265,64 @@ class ReasoningEngine:
         # policy+buffer were saved, losing chain counters on every reboot.
         self._load_totals()
 
+        # ── rFP α Reasoning Rewards (Phase 1 infrastructure) ──────────
+        # Config section [reasoning_rewards] in titan_params.toml.
+        # v1 ships ALL code; phase schedule controlled by weights.
+        # Phase 1 has weights=0 → telemetry only, no behavior change.
+        _rr = cfg.get("reasoning_rewards") or {}
+        self._rr_enabled = bool(_rr.get("enabled", True))
+        self._rr_publish = bool(_rr.get("publish_enabled", False))
+        self._rr_cap = float(_rr.get("intermediate_cap", 0.2))
+        self._rr_phase1_end = int(_rr.get("schedule_phase1_chains", 100))
+        self._rr_phase2_end = int(_rr.get("schedule_phase2_chains", 500))
+        self._rr_w_a_p2 = float(_rr.get("weight_a_phase2", 0.5))
+        self._rr_w_b_p2 = float(_rr.get("weight_b_phase2", 0.0))
+        self._rr_w_a_p3 = float(_rr.get("weight_a_phase3", 0.3))
+        self._rr_w_b_p3 = float(_rr.get("weight_b_phase3", 0.7))
+        self._rr_conf_coeff = float(_rr.get("confidence_growth_coeff", 0.3))
+        self._rr_conf_step_cap = float(_rr.get("confidence_growth_step_cap", 0.05))
+        self._rr_thresh_bonus = float(_rr.get("threshold_cross_bonus", 0.1))
+        self._rr_thresh_point = float(_rr.get("threshold_cross_point", 0.6))
+        self._rr_horizon_entire = float(_rr.get("mech_a_horizon_entire", 0.4))
+        self._rr_horizon_last_k = float(_rr.get("mech_a_horizon_last_k", 0.6))
+        self._rr_horizon_k = int(_rr.get("mech_a_horizon_k", 3))
+        self._rr_cgn_threshold = float(_rr.get("cgn_emission_threshold", 0.55))
+
+        # Mechanism A — sequence-quality EMA store
+        self.seq_quality_store = SequenceQualityStore(
+            cap=int(_rr.get("mech_a_table_cap", 10000)),
+            visit_gate=int(_rr.get("mech_a_visit_gate", 3)),
+            ema_alpha=float(_rr.get("mech_a_ema_alpha", 0.1)),
+            ramp_cutoff=int(_rr.get("mech_a_visit_ramp_cutoff", 20)),
+        )
+        self.seq_quality_store.load(os.path.join(self.save_dir, "sequence_quality.json"))
+
+        # Mechanism B — StepValueNet (input = policy_input_dim + 11)
+        self.step_value_net = StepValueNet(
+            policy_input_dim=self.policy_input_dim,
+            hidden_1=int(_rr.get("mech_b_h1", 64)),
+            hidden_2=int(_rr.get("mech_b_h2", 32)),
+            learning_rate=float(_rr.get("mech_b_learning_rate", 0.001)),
+            vtarget_ema_alpha=float(_rr.get("mech_b_vtarget_ema_alpha", 0.01)),
+        )
+        self.step_value_net.load(os.path.join(self.save_dir, "value_head.json"))
+
+        # Per-chain rFP α state — reset by _start_chain
+        self._rr_cum_bonus: float = 0.0   # Σ intermediate reward this chain (cap = _rr_cap)
+        self._rr_threshold_crossed: bool = False  # one-shot per chain
+        self._rr_prev_confidence: float = 0.5
+        # Per-chain step snapshots for Mechanism B online training at conclusion
+        # and for action_chains_step SQLite persistence (Phase 0.5).
+        self._rr_step_snapshots: list[dict] = []
+
+        # rFP α: chains_at_activation — enables the phase schedule to be
+        # RELATIVE to when publish_enabled was first turned on, not absolute
+        # on the lifetime counter. Without this, a Titan with lifetime
+        # _total_chains=4881 would skip phase 1+2 on first activation and
+        # jump to phase 3 with cold Mechanism B. Persisted via reasoning_totals.json.
+        self._rr_chains_at_activation: Optional[int] = None
+        self._rr_load_activation_offset()
+
     def tick(self, observation: np.ndarray, gut_signals: dict,
              body_state: dict, raw_neuromods: dict,
              working_memory_items: list, dt: float = 1.0) -> dict:
@@ -980,11 +1424,30 @@ class ReasoningEngine:
         # 10. Spirit observes
         self.spirit_nudge = self.observer.observe(self.get_reasoning_state())
 
-        # 11. Record transition for IQL
+        # 10b. rFP α — compute intermediate reward (Phase 1 telemetry-only
+        # unless publish_enabled + past phase1 gate). See _compute_step_reward.
         next_input = self._build_policy_input(
             observation, gut_signals, working_memory_items)
+        step_reward, rr_tele = self._compute_step_reward(
+            policy_input=policy_input, action_name=action_name,
+        )
+        # Snapshot for Mechanism B online training at conclusion + Phase 0.5
+        # persistence. Keeps per-step state so V_step(s_k, chain[:k]) can be
+        # reconstructed accurately for TD regression.
+        if self._rr_enabled and len(self._rr_step_snapshots) < 40:
+            self._rr_step_snapshots.append({
+                "step_idx": len(self.chain) - 1,
+                "policy_input": policy_input.tolist(),
+                "chain_prefix": list(self.chain),
+                "confidence": float(self.confidence),
+                "gut_agreement": float(self.gut_agreement),
+                "last_primitive": action_name,
+                "intermediate_reward": step_reward,
+            })
+
+        # 11. Record transition for IQL — now uses shaped reward (Phase 2+)
         self.buffer.record(
-            state=policy_input, action=action_idx, reward=0.0,
+            state=policy_input, action=action_idx, reward=step_reward,
             next_state=next_input, done=False,
         )
 
@@ -997,7 +1460,173 @@ class ReasoningEngine:
             "gut_agreement": round(self.gut_agreement, 4),
             "spirit_nudge": round(self.spirit_nudge, 4),
             "persistence": round(self.perception.get_reasoning_persistence(), 4),
+            "step_reward": round(step_reward, 4),
+            "reward_telemetry": rr_tele,
         }
+
+    def _rr_current_phase_weights(self) -> tuple[float, float]:
+        """Return (weight_A, weight_B) based on schedule phase.
+
+        Phase gate counts are RELATIVE to chains_at_activation, not absolute
+        on the lifetime counter. On first observation of publish_enabled=true,
+        chains_at_activation is latched to the current lifetime _total_chains,
+        so the phase schedule runs its full arc from that moment.
+
+        Phase 1 (offset < phase1_end):           (0, 0)   — telemetry only
+        Phase 2 (phase1_end ≤ offset < phase2_end):  (w_a_p2, w_b_p2)
+        Phase 3 (offset ≥ phase2_end):           (w_a_p3, w_b_p3)
+        """
+        if not self._rr_enabled or not self._rr_publish:
+            return (0.0, 0.0)
+        # Latch activation baseline on first active tick after publish_enabled=true
+        if self._rr_chains_at_activation is None:
+            self._rr_chains_at_activation = int(self._total_chains)
+            logger.info(
+                "[Reasoning/rFP-α] phase schedule anchored — "
+                "chains_at_activation=%d (phase1_end=+%d, phase2_end=+%d)",
+                self._rr_chains_at_activation,
+                self._rr_phase1_end, self._rr_phase2_end)
+            self._rr_save_activation_offset()
+        offset = int(self._total_chains) - int(self._rr_chains_at_activation)
+        if offset < self._rr_phase1_end:
+            return (0.0, 0.0)
+        if offset < self._rr_phase2_end:
+            return (self._rr_w_a_p2, self._rr_w_b_p2)
+        return (self._rr_w_a_p3, self._rr_w_b_p3)
+
+    def _rr_activation_state_path(self) -> str:
+        return os.path.join(self.save_dir, "rfp_alpha_activation.json")
+
+    def _rr_save_activation_offset(self) -> None:
+        """Persist chains_at_activation + schedule params to disk."""
+        try:
+            path = self._rr_activation_state_path()
+            data = {
+                "version": 1,
+                "saved_ts": time.time(),
+                "chains_at_activation": int(self._rr_chains_at_activation) if self._rr_chains_at_activation is not None else None,
+                "phase1_end": int(self._rr_phase1_end),
+                "phase2_end": int(self._rr_phase2_end),
+            }
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.warning("[Reasoning/rFP-α] save activation offset failed: %s", e)
+
+    def _rr_load_activation_offset(self) -> None:
+        """Restore chains_at_activation from disk. Safe on first boot
+        (missing file → stays None, will be latched on first active tick)."""
+        try:
+            path = self._rr_activation_state_path()
+            if not os.path.exists(path):
+                return
+            with open(path) as f:
+                data = json.load(f)
+            val = data.get("chains_at_activation")
+            if val is not None:
+                self._rr_chains_at_activation = int(val)
+                logger.info(
+                    "[Reasoning/rFP-α] chains_at_activation restored from disk: %d",
+                    self._rr_chains_at_activation)
+        except Exception as e:
+            logger.warning("[Reasoning/rFP-α] load activation offset failed: %s", e)
+
+    def _compute_step_reward(self, policy_input: np.ndarray,
+                             action_name: str) -> tuple[float, dict]:
+        """rFP α §2a — intermediate reward at current step.
+
+        Always computes all four components for telemetry. Returns actual
+        injected reward (0.0 in Phase 1) and a telemetry dict.
+
+        Components:
+          - mech_a: blended sequence-quality lookup (0.4×entire + 0.6×last_K)
+          - mech_b: StepValueNet(state + chain_len + last_prim) denormalized
+          - bonus_growth: max(0, Δconf) × coeff, cap 0.05/step
+          - bonus_thresh: 0.1 one-shot when confidence first crosses 0.6
+
+        Cap: cumulative intermediate reward per chain bounded at _rr_cap (0.2).
+        """
+        wa, wb = self._rr_current_phase_weights()
+
+        # Mechanism A — horizon-blended prefix lookup
+        mech_a_signal = self.seq_quality_store.query_blended(
+            chain_prefix=list(self.chain),
+            last_k=self._rr_horizon_k,
+            horizon_entire=self._rr_horizon_entire,
+            horizon_last_k=self._rr_horizon_last_k,
+        )
+
+        # Mechanism B — V(state, chain_len, last_prim) denormalized prediction
+        try:
+            mech_b_input = self.step_value_net.build_input(
+                policy_input=policy_input,
+                confidence=self.confidence,
+                gut_agreement=self.gut_agreement,
+                chain_len=len(self.chain),
+                max_chain=self.max_chain_length,
+                last_primitive=action_name,
+            )
+            mech_b_signal = self.step_value_net.predict(mech_b_input)
+        except Exception as e:
+            logger.warning("[Reasoning/MechB] predict failed: %s", e)
+            mech_b_signal = 0.0
+
+        # Companion bonus 1 — confidence growth (D12)
+        conf_delta = self.confidence - self._rr_prev_confidence
+        bonus_growth = min(self._rr_conf_step_cap,
+                           max(0.0, conf_delta) * self._rr_conf_coeff)
+
+        # Companion bonus 2 — threshold crossing (D13, one-shot per chain)
+        bonus_thresh = 0.0
+        if (not self._rr_threshold_crossed
+                and self.confidence >= self._rr_thresh_point
+                and self._rr_prev_confidence < self._rr_thresh_point):
+            bonus_thresh = self._rr_thresh_bonus
+            self._rr_threshold_crossed = True
+
+        # Gross intermediate reward before cap (computed for telemetry always)
+        gross = (wa * mech_a_signal + wb * mech_b_signal
+                 + bonus_growth + bonus_thresh)
+
+        # Phase gate: if publish_enabled=false OR chain < phase1_end →
+        # weights are (0,0). Zero INJECTED reward, but all components still
+        # logged via telemetry. Bonuses also suppressed in this window so
+        # that Phase 1 is a clean "telemetry-only" validation run.
+        is_active_phase = (wa > 0.0 or wb > 0.0)
+        if is_active_phase:
+            remaining = max(0.0, self._rr_cap - self._rr_cum_bonus)
+            actual = max(0.0, min(gross, remaining))
+            self._rr_cum_bonus += actual
+        else:
+            actual = 0.0
+
+        # Update prev_confidence for next step's delta
+        self._rr_prev_confidence = self.confidence
+
+        tele = {
+            "mech_a": round(mech_a_signal, 4),
+            "mech_b": round(mech_b_signal, 4),
+            "bonus_growth": round(bonus_growth, 4),
+            "bonus_thresh": round(bonus_thresh, 4),
+            "weight_a": wa,
+            "weight_b": wb,
+            "gross": round(gross, 4),
+            "actual": round(actual, 4),
+            "cum_sum": round(self._rr_cum_bonus, 4),
+            "cap": self._rr_cap,
+        }
+        # Per-step log (INFO level — keep concise to avoid spam)
+        logger.info(
+            "[Reasoning/rFP-α] step=%d prim=%s conf=%.3f Δconf=%+.3f "
+            "mech_a=%.3f mech_b=%.3f bonus_g=%.3f bonus_t=%.3f "
+            "w=(%.2f,%.2f) actual=%.3f cum=%.3f/%.2f",
+            len(self.chain), action_name, self.confidence, conf_delta,
+            mech_a_signal, mech_b_signal, bonus_growth, bonus_thresh,
+            wa, wb, actual, self._rr_cum_bonus, self._rr_cap,
+        )
+        return actual, tele
 
     def _should_start_reasoning(self, gut_signals: dict, body_state: dict) -> bool:
         """Determine if there's enough stimulus to begin reasoning.
@@ -1039,6 +1668,11 @@ class ReasoningEngine:
         self._loop_count = 0
         self._chain_start_time = time.time()
         self._total_chains += 1
+        # rFP α — reset per-chain reward state
+        self._rr_cum_bonus = 0.0
+        self._rr_threshold_crossed = False
+        self._rr_prev_confidence = 0.5   # matches initial self.confidence
+        self._rr_step_snapshots = []
 
     def _conclude_chain(self, observation: np.ndarray, gut_signals: dict,
                         body_state: dict, policy_input: np.ndarray) -> dict:
@@ -1046,8 +1680,8 @@ class ReasoningEngine:
         # Check Mind Willing: body ready?
         body_ready = self._body_ready(body_state)
 
-        # Compute final gut agreement
-        self._update_gut_agreement(gut_signals)
+        # Compute final gut agreement against CONCLUDE primitive (Phase 3)
+        self._update_gut_agreement(gut_signals, current_primitive="CONCLUDE")
 
         # Determine action
         if self.confidence >= self.confidence_threshold and body_ready:
@@ -1098,6 +1732,82 @@ class ReasoningEngine:
             done=True,
         )
 
+        # ── rFP α — update Mechanism A + train Mechanism B ─────────────
+        # Mechanism A: update EMA for every prefix of the completed chain.
+        # Always runs (independent of publish_enabled) so table accumulates
+        # during Phase 1 telemetry window, ready for Phase 2 activation.
+        outcome_score_for_mech_a = float(reward)
+        a_updated = 0
+        if self._rr_enabled and self.chain:
+            try:
+                a_updated = self.seq_quality_store.update_chain_prefixes(
+                    list(self.chain), outcome_score_for_mech_a
+                )
+            except Exception as e:
+                logger.warning("[Reasoning/MechA] update failed: %s", e)
+
+        # Mechanism B: TD regression on per-step snapshots toward terminal reward.
+        # Always runs so B learns continuously from Phase 1 onward.
+        b_trained = 0
+        if self._rr_enabled and self._rr_step_snapshots:
+            try:
+                for snap in self._rr_step_snapshots:
+                    pi = np.array(snap["policy_input"], dtype=np.float64)
+                    v_input = self.step_value_net.build_input(
+                        policy_input=pi,
+                        confidence=snap["confidence"],
+                        gut_agreement=snap["gut_agreement"],
+                        chain_len=snap["step_idx"] + 1,
+                        max_chain=self.max_chain_length,
+                        last_primitive=snap["last_primitive"],
+                    )
+                    self.step_value_net.train_step(v_input, reward)
+                    b_trained += 1
+            except Exception as e:
+                logger.warning("[Reasoning/MechB] train failed: %s", e)
+
+        # Phase 0.5 step-snapshot persistence (D3+D18) — append to SQLite
+        # `action_chains_step` table for offline Mechanism B warm-start path.
+        # Table auto-created on first write; 7-day retention on engine save.
+        if self._rr_enabled and self._rr_step_snapshots:
+            try:
+                self._rr_persist_step_snapshots(reward, action)
+            except Exception as e:
+                # Non-fatal — step persistence is for future B training; live
+                # Mechanism B already trained in-memory above.
+                if self._total_chains % 20 == 0:
+                    logger.warning("[Reasoning/StepPersist] %s", e)
+
+        # rFP α §2b — CGN reasoning_strategy emission prep.
+        # On COMMIT with outcome_score > cgn_emission_threshold (default 0.55),
+        # attach a payload to the conclusion dict. The CALLER (spirit_worker)
+        # is responsible for actually emitting on the bus — reasoning engine
+        # has no bus handle. META-CGN observes via normal CGN→META flow (D16).
+        if action == "COMMIT" and self._rr_enabled:
+            try:
+                if reward >= self._rr_cgn_threshold:
+                    # state_embedding = tier1 30D slice (D15 lock)
+                    _tier1 = observation[:30].tolist() if len(observation) >= 30 else observation.tolist()
+                    # neuromod_state = current EMA'd mind-level perception
+                    _nm_state = {
+                        k: float(self.perception.mind.get(k, 0.0))
+                        for k in ("DA", "5-HT", "NE", "ACh", "Endorphin", "GABA")
+                    }
+                    conclusion["cgn_reasoning_strategy"] = {
+                        "chain_signature": list(self.chain),
+                        "outcome_score": round(float(reward), 4),
+                        "confidence_final": round(float(self.confidence), 4),
+                        "gut_agreement_final": round(float(self.gut_agreement), 4),
+                        "chain_length": len(self.chain),
+                        "state_embedding_tier1": _tier1,
+                        "neuromod_state": _nm_state,
+                        "source": "reasoning.chain_commit",
+                        "mech_a_size": len(self.seq_quality_store._table),
+                        "mech_b_updates": int(self.step_value_net.total_updates),
+                    }
+            except Exception as e:
+                logger.warning("[Reasoning/CGN] emission prep failed: %s", e)
+
         # Reset chain state
         self.is_active = False
         self.chain = []
@@ -1105,10 +1815,14 @@ class ReasoningEngine:
         self._last_result = None
         self._strategy_bias = None   # Clear meta-reasoning bias on chain end
         self._intuition_bias = None  # Clear vertical convergence bias on chain end
+        self._rr_step_snapshots = []  # rFP α — clear per-chain snapshots
 
-        logger.info("[Reasoning] %s — conf=%.3f gut=%.3f chain=%d dur=%.1fs reward=%.3f",
+        logger.info("[Reasoning] %s — conf=%.3f gut=%.3f chain=%d dur=%.1fs reward=%.3f "
+                    "cum_bonus=%.3f mech_a_updates=%d mech_b_train=%d seq_size=%d",
                     action, conclusion["confidence"], conclusion["gut_agreement"],
-                    conclusion["chain_length"], conclusion["duration_s"], reward)
+                    conclusion["chain_length"], conclusion["duration_s"], reward,
+                    self._rr_cum_bonus, a_updated, b_trained,
+                    len(self.seq_quality_store._table))
 
         return conclusion
 
@@ -1170,22 +1884,75 @@ class ReasoningEngine:
         self.confidence = max(0.0, min(1.0,
                               self.confidence + self.spirit_nudge))
 
-        # Update gut agreement
-        self._update_gut_agreement(gut_signals)
+        # Update gut agreement against the just-executed primitive (Phase 3)
+        self._update_gut_agreement(gut_signals, current_primitive=primitive)
 
-    def _update_gut_agreement(self, gut_signals: dict) -> None:
-        """How well does reasoning align with NS program gut signals?"""
+    def _update_gut_agreement(self, gut_signals: dict,
+                              current_primitive: str | None = None) -> None:
+        """rFP β Phase 3 — primitive-affinity gut formula.
+
+        Replaces the degenerate (1 - abs(conf - mean_urgency)) formula
+        which collapsed to (1 - conf) when all NS urgencies were 0.
+
+        New formula: gut measures how well firing programs align with the
+        currently-executing reasoning primitive. Each program has primitive
+        affinities (PRIMITIVE_AFFINITY table) — primary at 1.0, secondary
+        at 0.6, anti-affinity at 0.3, neutral default at 0.5.
+
+        Symmetric formula: contribution = urgency × (affinity - 0.5) × 2
+            affinity 1.0 → +urgency
+            affinity 0.6 → +0.2 × urgency
+            affinity 0.5 → 0 (neutral, no contribution)
+            affinity 0.3 → -0.4 × urgency
+            affinity 0   → -urgency
+
+        gut_agreement = 0.5 + 0.5 × (sum_contribution / total_urgency)
+            → in [0, 1], 0.5 = no information / neutral
+
+        Backward compat: if current_primitive=None (e.g. legacy callers),
+        use mean-urgency mode for graceful fallback.
+        """
         if not gut_signals:
             self.gut_agreement = 0.5
             return
 
-        # High-urgency programs "agree" when reasoning confidence is high
-        # Low-urgency programs "agree" when reasoning is cautious
-        urgencies = list(gut_signals.values())
-        mean_urgency = sum(urgencies) / len(urgencies)
+        # Filter noise floor — only programs with meaningful signal contribute
+        active = {p: u for p, u in gut_signals.items() if abs(u) >= 0.05}
+        if not active:
+            self.gut_agreement = 0.5
+            return
 
-        # Agreement = how similar reasoning confidence is to gut urgency average
-        self.gut_agreement = 1.0 - abs(self.confidence - mean_urgency)
+        # No primitive specified → fall back to mean-urgency agreement
+        # (graceful for callers that don't pass primitive — legacy tests etc.)
+        if not current_primitive:
+            mean_urgency = sum(active.values()) / len(active)
+            self.gut_agreement = 1.0 - abs(self.confidence - mean_urgency)
+            return
+
+        # Primitive-affinity gut (Phase 3)
+        prim = current_primitive.upper()
+        total_contribution = 0.0
+        total_urgency = 0.0
+        for prog, urgency in active.items():
+            aff = PRIMITIVE_AFFINITY.get(prog, {}).get(prim, NEUTRAL_AFFINITY)
+            # Symmetric contribution in [-urgency, +urgency]
+            total_contribution += urgency * (aff - 0.5) * 2.0
+            total_urgency += urgency
+
+        if total_urgency < 0.01:
+            self.gut_agreement = 0.5
+            return
+
+        net = total_contribution / total_urgency  # in [-1, +1]
+        # Map to [0, 1] with 0.5 = neutral
+        new_gut = 0.5 + 0.5 * max(-1.0, min(1.0, net))
+
+        # Phase 3 idea #2: time-smoothed gut via EMA. Less reactive to
+        # single-tick fluctuations; closer to "felt sense" than instantaneous
+        # measurement. Alpha = 0.3 → ~3-tick effective half-life.
+        gut_ema_alpha = getattr(self, '_gut_ema_alpha', 0.3)
+        prev_gut = getattr(self, 'gut_agreement', 0.5)
+        self.gut_agreement = (1.0 - gut_ema_alpha) * prev_gut + gut_ema_alpha * new_gut
 
     def _extract_plan(self) -> dict:
         """Extract a reasoning plan from the chain results.
@@ -1430,6 +2197,21 @@ class ReasoningEngine:
         # commit_rate shown in social posts was session-lifetime only and
         # often looked like "1% dormant" after a fresh boot.
         self._save_totals()
+        # rFP α: persist Mechanism A table + Mechanism B weights + activation offset
+        if self._rr_enabled:
+            try:
+                self.seq_quality_store.save(
+                    os.path.join(self.save_dir, "sequence_quality.json"))
+                self.step_value_net.save(
+                    os.path.join(self.save_dir, "value_head.json"))
+                self._rr_save_activation_offset()
+            except Exception as e:
+                logger.warning("[Reasoning/rFP-α] save_all failed: %s", e)
+            # Phase 0.5 retention trim (on engine save, not per-chain)
+            try:
+                self._rr_trim_step_snapshots_retention()
+            except Exception as e:
+                logger.warning("[Reasoning/StepPersist] trim failed: %s", e)
 
     def _save_totals(self) -> None:
         """Persist _total_chains / _total_conclusions / _total_reasoning_steps
@@ -1479,6 +2261,110 @@ class ReasoningEngine:
                 / max(1, self._total_chains))
         except Exception as e:
             logger.warning("[Reasoning] _load_totals failed: %s", e)
+
+    # ── rFP α Phase 0.5 — action_chains_step persistence ──────────────
+    # Stores per-step snapshots for offline Mechanism B pre-training.
+    # Schema kept minimal: chain_id + step_idx keyed, JSON blob for details.
+    # 7-day retention, trimmed on save_all().
+
+    _RR_STEP_TABLE_DDL = """
+        CREATE TABLE IF NOT EXISTS action_chains_step (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chain_id INTEGER NOT NULL,
+            step_idx INTEGER NOT NULL,
+            created_at REAL NOT NULL,
+            terminal_reward REAL NOT NULL,
+            outcome_action TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            gut_agreement REAL NOT NULL,
+            chain_prefix TEXT NOT NULL,
+            last_primitive TEXT NOT NULL,
+            policy_input_json TEXT NOT NULL,
+            intermediate_reward REAL DEFAULT 0.0
+        )
+    """
+    _RR_STEP_INDEX_DDL = """
+        CREATE INDEX IF NOT EXISTS ix_step_chain_id
+            ON action_chains_step(chain_id, step_idx)
+    """
+    _RR_STEP_CREATED_DDL = """
+        CREATE INDEX IF NOT EXISTS ix_step_created
+            ON action_chains_step(created_at)
+    """
+
+    def _rr_step_db_conn(self):
+        """Open SQLite connection to inner_memory.db, ensuring tables exist.
+
+        Uses same DB as action_chains/chain_archive (single-file convenience).
+        Caller responsible for closing; we do this inline with `with`.
+        """
+        import sqlite3
+        # Use same path pattern as existing inner_memory usage — project data/
+        db_path = "data/inner_memory.db"
+        conn = sqlite3.connect(db_path, timeout=2.0)
+        conn.execute(self._RR_STEP_TABLE_DDL)
+        conn.execute(self._RR_STEP_INDEX_DDL)
+        conn.execute(self._RR_STEP_CREATED_DDL)
+        return conn
+
+    def _rr_persist_step_snapshots(self, reward: float, action: str) -> None:
+        """Insert current chain's step snapshots into action_chains_step.
+
+        Only called if _rr_step_snapshots is non-empty.
+        Uses _total_chains as chain_id (lifetime counter, monotonic).
+        """
+        if not self._rr_step_snapshots:
+            return
+        now = time.time()
+        chain_id = self._total_chains  # lifetime counter, unique per chain
+        rows = []
+        for snap in self._rr_step_snapshots:
+            rows.append((
+                chain_id,
+                int(snap["step_idx"]),
+                now,
+                float(reward),
+                str(action),
+                float(snap["confidence"]),
+                float(snap["gut_agreement"]),
+                json.dumps(snap["chain_prefix"]),
+                str(snap["last_primitive"]),
+                json.dumps(snap["policy_input"]),
+                float(snap.get("intermediate_reward", 0.0)),
+            ))
+        try:
+            with self._rr_step_db_conn() as conn:
+                conn.executemany("""
+                    INSERT INTO action_chains_step (
+                        chain_id, step_idx, created_at, terminal_reward,
+                        outcome_action, confidence, gut_agreement,
+                        chain_prefix, last_primitive, policy_input_json,
+                        intermediate_reward
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, rows)
+                conn.commit()
+        except Exception as e:
+            raise RuntimeError(f"step_snapshot insert: {e}") from e
+
+    def _rr_trim_step_snapshots_retention(self, retention_days: int = 7) -> int:
+        """Delete step snapshots older than retention window. Called from save_all().
+
+        Returns count of rows deleted.
+        """
+        cutoff = time.time() - (retention_days * 86400)
+        try:
+            with self._rr_step_db_conn() as conn:
+                cur = conn.execute(
+                    "DELETE FROM action_chains_step WHERE created_at < ?",
+                    (cutoff,))
+                deleted = cur.rowcount
+                conn.commit()
+            if deleted > 0:
+                logger.info("[Reasoning/StepPersist] trimmed %d rows older than %dd",
+                            deleted, retention_days)
+            return deleted
+        except Exception:
+            return 0
 
     def get_reasoning_state(self) -> dict:
         """Current reasoning state for Spirit observer and API."""

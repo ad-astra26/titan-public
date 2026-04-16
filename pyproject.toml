@@ -38,6 +38,9 @@ dependencies = [
     # Expressive Engine
     "pillow>=10.2.0",                 # Procedural art (flow fields, L-systems, NFT composites)
     "pydub>=0.25.1",                  # Audio format conversion (WAV generation uses stdlib wave)
+
+    # Config
+    "tomli-w>=1.2.0",                 # TOML writer for ~/.titan/secrets.toml updates (session refresh)
 ]
 
 # ── Optional Dependency Tiers ──────────────────────────────────────────────────

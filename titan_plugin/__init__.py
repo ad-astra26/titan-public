@@ -533,30 +533,14 @@ class TitanPlugin:
 
     @staticmethod
     def _load_full_config() -> dict:
-        """Loads the entire config.toml and returns it as a nested dict."""
-        import os
-        config_path = os.path.join(os.path.dirname(__file__), "config.toml")
-        try:
-            try:
-                import tomllib
-            except ModuleNotFoundError:
-                import toml as tomllib  # type: ignore
-            with open(config_path, "rb") as f:
-                return tomllib.load(f)
-        except Exception as e:
-            logging.warning(f"[TitanPlugin] Could not load config.toml: {e}. Using empty config.")
-            return {}
+        """Loads the full merged Titan config (config.toml + ~/.titan/secrets.toml)."""
+        from titan_plugin.config_loader import load_titan_config
+        return load_titan_config()
 
     @staticmethod
     def _load_stealth_sage_config() -> dict:
-        """
-        Reads the [stealth_sage] section from titan_plugin/config.toml and returns it
-        as a dict with all keys resolved to their defaults if missing.
-        Uses the same tomllib binary-mode loading pattern as MoodEngine._load_config().
-        Falls back to a full default dict if the file or section is unavailable.
-        """
-        import os
-        config_path = os.path.join(os.path.dirname(__file__), "config.toml")
+        """Returns [stealth_sage] from merged config, with defaults filled in."""
+        from titan_plugin.config_loader import load_titan_config
         defaults = {
             "searxng_host": "http://localhost:8080",
             "searxng_top_num_urls": 3,
@@ -567,21 +551,8 @@ class TitanPlugin:
             "research_timeout_seconds": 30,
             "doc_safe_room": "/tmp/titan_sage_docs",
         }
-        try:
-            try:
-                import tomllib
-            except ModuleNotFoundError:
-                import toml as tomllib  # type: ignore
-            with open(config_path, "rb") as f:
-                config = tomllib.load(f)
-            loaded = config.get("stealth_sage", {})
-            # Merge: loaded values win over defaults
-            return {**defaults, **loaded}
-        except Exception as e:
-            logging.warning(
-                f"[TitanPlugin] Could not load [stealth_sage] from config.toml: {e}. Using defaults."
-            )
-            return defaults
+        loaded = load_titan_config().get("stealth_sage", {})
+        return {**defaults, **loaded}
 
     async def pre_prompt_hook(self, user_prompt: str, context: dict) -> dict:
         """

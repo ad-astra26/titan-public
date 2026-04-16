@@ -64,14 +64,10 @@ class XSessionManager:
         self._load_session_from_config()
 
     def _load_session_from_config(self) -> None:
-        """Read auth_session from config.toml and validate."""
+        """Read auth_session from merged config and validate."""
         try:
-            if hasattr(__builtins__, '__import__'):
-                import tomllib
-            else:
-                import tomllib
-            with open(self._config_path, "rb") as f:
-                cfg = tomllib.load(f)
+            from titan_plugin.config_loader import load_titan_config
+            cfg = load_titan_config()
             session = cfg.get("twitter_social", {}).get("auth_session", "")
             if session:
                 self._cached_session = session

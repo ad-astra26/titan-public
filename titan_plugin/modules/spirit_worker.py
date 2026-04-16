@@ -366,6 +366,29 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     )
     neuromodulator_system = NeuromodulatorSystem(data_dir="./data/neuromodulator")
 
+    # ── Boot NeuromodRewardObserver (rFP β Stage 2 Phase 2b) ──
+    # Bridges biological-analog neuromod dynamics to NS program training.
+    # Reads neuromod state every N ticks, emits per-program reward via
+    # neural_nervous_system.record_outcome(reward, program=, source="neuromod.X").
+    # Primary reward pathway for outer/personality programs + VIGILANCE NE-tracker.
+    try:
+        from titan_plugin.logic.neuromod_reward_observer import NeuromodRewardObserver
+        neuromod_reward_observer = NeuromodRewardObserver(
+            neural_nervous_system=neural_nervous_system,
+            neuromodulator_system=neuromodulator_system,
+            tick_interval=10,  # emit every 10 ticks (~1 sec at 10Hz tick rate)
+            ema_alpha=0.05,
+        )
+        logger.info("[SpiritWorker] NeuromodRewardObserver online "
+                    "(tick_interval=10, 11 programs covered)")
+        # Expose observer on neural_nervous_system so get_health_snapshot
+        # can include its stats in /v4/ns-health output (Phase 2b observability).
+        if neural_nervous_system:
+            neural_nervous_system._neuromod_reward_observer = neuromod_reward_observer
+    except Exception as e:
+        logger.warning("[SpiritWorker] NeuromodRewardObserver init failed: %s", e)
+        neuromod_reward_observer = None
+
     # ── Boot EXPRESSION Composites (SPEAK, ART, MUSIC, SOCIAL) ──
     from titan_plugin.logic.expression_composites import (
         ExpressionManager, create_speak, create_art, create_music, create_social,
@@ -455,7 +478,17 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                   "titan_params.toml")
             if os.path.exists(_rl_tp):
                 with open(_rl_tp, "rb") as _rl_f:
-                    _reasoning_cfg = _rl_tl.load(_rl_f).get("reasoning", {})
+                    _rl_full = _rl_tl.load(_rl_f)
+                    _reasoning_cfg = _rl_full.get("reasoning", {})
+                    # rFP α (2026-04-16): merge [reasoning_rewards] section
+                    # into engine config so publish_enabled, phase schedule,
+                    # and Mech A/B knobs reach ReasoningEngine.__init__.
+                    # Without this, engine falls back to defaults and phase
+                    # gate always reports weights=(0,0).
+                    if "reasoning_rewards" in _rl_full:
+                        _reasoning_cfg = dict(_reasoning_cfg)
+                        _reasoning_cfg["reasoning_rewards"] = dict(
+                            _rl_full["reasoning_rewards"])
         except Exception:
             pass
         if _reasoning_cfg.get("enabled", True):
@@ -1180,6 +1213,20 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             _send_heartbeat(send_queue, name)
             last_heartbeat = now
 
+        # ── NeuromodRewardObserver tick (rFP β Stage 2 Phase 2b) ──
+        # Reads current neuromod state, emits per-program rewards via
+        # record_outcome every tick_interval ticks. No-op if disabled or
+        # outside interval. Wrapped in try/except so observer failure
+        # cannot break the main tick loop.
+        if neuromod_reward_observer is not None:
+            try:
+                neuromod_reward_observer.tick()
+            except Exception as _nro_err:
+                # Rate-limited per § 4c — log every 100th failure max
+                if hash(("nro_tick", _nro_err.__class__.__name__)) % 100 == 0:
+                    logger.warning("[SpiritWorker] NeuromodRewardObserver tick failed: %s",
+                                   _nro_err)
+
         # ── Periodic NS SQLite backup (every 5 min) ──
         if neural_nervous_system and now - _last_ns_sqlite_save >= _checkpoint_ns_interval:
             try:
@@ -1195,6 +1242,17 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     msl.save_all()
                 except Exception:
                     pass
+            # Reasoning engine checkpoint (rFP α 2026-04-16): previously
+            # reasoning.save_all() only fired on SAVE_NOW / MODULE_RELOAD
+            # events, never periodically — meaning policy_net, buffer,
+            # lifetime totals, sequence_quality (Mech A), value_head
+            # (Mech B), and action_chains_step retention trim all depended
+            # on external triggers. Now piggybacks on the 5-min NS cycle.
+            if _reasoning_engine:
+                try:
+                    _reasoning_engine.save_all()
+                except Exception as _rse:
+                    logger.warning("[SpiritWorker] reasoning save_all failed: %s", _rse)
             # X Gateway: prune old rows periodically (gateway state is in SQLite, no save needed)
             if _x_gateway and _msl_tick_count % 10000 == 0:
                 try:
@@ -1233,6 +1291,10 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 _ed_cg = getattr(coordinator, "_p14_coherence_detector", None) if coordinator else None
                 if _ed_cg is not None:
                     _ed_detectors["coherence_gain"] = _ed_cg
+                # TUNING-016: composite META-CGN (EMPATHY + CREATIVITY) edge detector
+                _ed_cp = getattr(coordinator, "_composite_meta_cgn_edge", None) if coordinator else None
+                if _ed_cp is not None:
+                    _ed_detectors["composite_meta_cgn"] = _ed_cp
                 if _ed_detectors:
                     _save_edge_detector_state(_ed_detectors)
             except Exception as _ed_err:
@@ -1926,6 +1988,48 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                             "[META-CGN] Producer #3 dreaming.insight_distilled emit FAILED "
                             "— cycle=%s err=%s (signal missed)",
                             getattr(coordinator.dreaming, '_cycle_count', '?'), _p3_err)
+
+                    # rFP β Stage 2 Phase 2c: REFLECTION event hook
+                    # Reward REFLECTION when dream cycle distills meaningful insights.
+                    # Stage 0.5 empirical: REFLECTION K=5, decay=0.725, window=2014s
+                    # (matches dream cycle scale). Discrete sparse signal complements
+                    # the dense low-NE+high-ACh neuromod stream.
+                    if neural_nervous_system:
+                        try:
+                            _refl_count = len(_harvested) if '_harvested' in dir() else 0
+                            if _refl_count > 0:
+                                # Scale reward with insight count (0→0, 1→0.5, 4→0.8, 8+→1.0)
+                                _refl_reward = min(1.0, 0.4 + 0.1 * _refl_count)
+                                neural_nervous_system.record_outcome(
+                                    reward=_refl_reward,
+                                    program="REFLECTION",
+                                    source="dream.insight_distilled")
+                            elif _refl_count == 0:
+                                # Negative signal: dream completed but no insights distilled
+                                neural_nervous_system.record_outcome(
+                                    reward=-0.2,
+                                    program="REFLECTION",
+                                    source="dream.no_insights")
+                        except Exception as _refl_err:
+                            if hash(("refl_hook", _refl_err.__class__.__name__)) % 100 == 0:
+                                logger.warning("[NS-Hook] REFLECTION reward failed: %s", _refl_err)
+
+                        # rFP β Phase 3 § 4g: NS → META-CGN coupling on dream end
+                        # ("reflection", "fired") → INTROSPECT/SPIRIT_SELF/EVALUATE
+                        # Naturally rate-limited by dream cycle cadence (~3×/day per Titan).
+                        try:
+                            _refl_count_meta = len(_harvested) if '_harvested' in dir() else 0
+                            _refl_intensity = min(1.0, max(0.1, 0.3 + 0.1 * _refl_count_meta))
+                            from ..bus import emit_meta_cgn_signal
+                            emit_meta_cgn_signal(
+                                send_queue,
+                                src="reflection", consumer="reflection",
+                                event_type="fired",
+                                intensity=_refl_intensity,
+                                domain="dream_cycle",
+                                reason=f"REFLECTION dream end insights={_refl_count_meta}")
+                        except Exception:
+                            pass
 
                 # Autonomy-first: publish outer program dispatch signals to bus
                 # Agency core loop picks these up and dispatches helpers WITHOUT LLM
@@ -2980,7 +3084,14 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         # _all_urgencies has raw NN output for every program
                         _r_gut = {}
                         if neural_nervous_system and hasattr(neural_nervous_system, '_all_urgencies'):
-                            _r_gut = dict(neural_nervous_system._all_urgencies)
+                            # rFP β Phase 3: hormone-augmented urgencies for gut formula.
+                            # Blend NN urgency (current state) with hormone pressure
+                            # (recent history) — more robust when NN is wonky.
+                            try:
+                                _r_gut = neural_nervous_system.get_augmented_urgencies(
+                                    hormone_blend=0.3)
+                            except Exception:
+                                _r_gut = dict(neural_nervous_system._all_urgencies)
                         else:
                             # Fallback: use only fired signals
                             _r_last_signals = getattr(coordinator, '_last_nervous_signals', []) if coordinator else []
@@ -3137,6 +3248,42 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                 _r_detail = f" steps={_r_res.get('steps_completed', '?')}/{_r_res.get('max_steps', '?')}"
                             elif _r_prim == "LOOP":
                                 _r_detail = f" cont={_r_res.get('continue', '?')} persist={_r_res.get('persistence_ratio', '?')}"
+
+                            # rFP β Stage 2 Phase 2c: INSPIRATION event hook
+                            # Sparse high-magnitude reward on eureka/significant/condition_met.
+                            # Stage 0.5 finding: terminal eureka (outcome_score >= 0.7) is
+                            # structurally unreachable, so we hook the PRIMITIVE-LEVEL
+                            # signal (much more frequent) — this matches rFP α § 9 fix path.
+                            if neural_nervous_system and _r_res:
+                                _ins_signal = 0.0
+                                if _r_res.get("eureka"):
+                                    _ins_signal = 0.8
+                                elif _r_res.get("significant") or _r_res.get("condition_met"):
+                                    _ins_signal = 0.5
+                                if _ins_signal > 0:
+                                    try:
+                                        neural_nervous_system.record_outcome(
+                                            reward=_ins_signal,
+                                            program="INSPIRATION",
+                                            source=f"reasoning.{_r_prim.lower()}")
+                                    except Exception as _r_ins_err:
+                                        if hash(("ins_hook", _r_ins_err.__class__.__name__)) % 100 == 0:
+                                            logger.warning("[NS-Hook] INSPIRATION reward failed: %s", _r_ins_err)
+                                    # rFP β Phase 3 § 4g: NS → META-CGN coupling
+                                    # ("inspiration", "fired") signal — biases meta-reasoning
+                                    # toward HYPOTHESIZE/SYNTHESIZE/BREAK (creative-leap primitives)
+                                    try:
+                                        from ..bus import emit_meta_cgn_signal
+                                        emit_meta_cgn_signal(
+                                            send_queue,
+                                            src="inspiration", consumer="inspiration",
+                                            event_type="fired",
+                                            intensity=min(1.0, _ins_signal),
+                                            domain=_r_prim.lower(),
+                                            reason=f"INSPIRATION reward via {_r_prim}")
+                                    except Exception:
+                                        pass
+
                             logger.info("[Reasoning] STEP %d/%d — %s conf=%.3f%s",
                                         _reasoning_result.get("chain_length", 0),
                                         _reasoning_engine.max_chain_length,
@@ -3149,6 +3296,47 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                         _reasoning_result.get("confidence", 0),
                                         _reasoning_result.get("gut_agreement", 0),
                                         _reasoning_result.get("chain_length", 0))
+
+                            # rFP β Stage 2 Phase 2c: FOCUS event hook
+                            # Reward FOCUS when reasoning successfully commits with
+                            # decent confidence + gut. Sparse high-magnitude signal
+                            # complementing the dense neuromod ACh stream.
+                            if (_reasoning_result.get("action") == "COMMIT"
+                                    and neural_nervous_system):
+                                try:
+                                    _r_score = (_reasoning_result.get("confidence", 0) * 0.6
+                                                + _reasoning_result.get("gut_agreement", 0) * 0.4)
+                                    if _r_score > 0.3:
+                                        neural_nervous_system.record_outcome(
+                                            reward=float(_r_score),
+                                            program="FOCUS",
+                                            source="reasoning.commit")
+                                except Exception as _r_focus_err:
+                                    if hash(("focus_hook", _r_focus_err.__class__.__name__)) % 100 == 0:
+                                        logger.warning("[NS-Hook] FOCUS reward failed: %s", _r_focus_err)
+
+                            # rFP α §2b — CGN reasoning_strategy emission.
+                            # reasoning_engine attaches `cgn_reasoning_strategy` to the
+                            # conclusion dict when a COMMIT's outcome_score >= threshold
+                            # (default 0.55). META-CGN observes via normal CGN→META flow
+                            # per D16 — no duplicate emit via emit_meta_cgn_signal.
+                            _cgn_payload = _reasoning_result.get("cgn_reasoning_strategy")
+                            if _cgn_payload:
+                                try:
+                                    _cgn_payload["epoch_id"] = _ep_id if '_ep_id' in dir() else 0
+                                    _cgn_concept = "strategy_" + "_".join(
+                                        _cgn_payload.get("chain_signature", []))[:80]
+                                    _send_msg(send_queue, "CGN_TRANSITION", name, "cgn", {
+                                        "type": "outcome",
+                                        "consumer": "reasoning_strategy",
+                                        "concept_id": _cgn_concept,
+                                        "reward": float(_cgn_payload.get("outcome_score", 0.0)),
+                                        "outcome_context": _cgn_payload,
+                                    })
+                                except Exception as _cgn_err:
+                                    if hash(("cgn_rstrat", _cgn_err.__class__.__name__)) % 50 == 0:
+                                        logger.warning("[Reasoning/CGN-strat] emit failed: %s",
+                                                       _cgn_err)
 
                         # If reasoning COMMITs, attend the plan to working memory
                         if _reasoning_result and _reasoning_result.get("action") == "COMMIT" and working_mem:
@@ -3412,6 +3600,72 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         _send_msg(send_queue, "EXPRESSION_FIRED", name, "all", _ef_payload)
                         # TimeChain: explicit send (dst=all may not reach worker subprocess)
                         _send_msg(send_queue, "EXPRESSION_FIRED", name, "timechain", _ef_payload)
+
+                        # rFP β Stage 2 Phase 2c: CREATIVITY + EMPATHY event hooks
+                        # ART/MUSIC composite fires reward CREATIVITY (Endorphin+ACh
+                        # neuromod stream is primary; this is the discrete event signal).
+                        # SOCIAL/KIN_SENSE/LONGING fires reward EMPATHY.
+                        if neural_nervous_system:
+                            _cn = _tf.get("composite", "")
+                            _cu = float(_tf.get("urge", 0))
+                            if _cu > 0:
+                                _ce_program = None
+                                if _cn in ("ART", "MUSIC"):
+                                    _ce_program = "CREATIVITY"
+                                elif _cn in ("SOCIAL", "KIN_SENSE", "LONGING"):
+                                    _ce_program = "EMPATHY"
+                                if _ce_program:
+                                    try:
+                                        neural_nervous_system.record_outcome(
+                                            reward=min(1.0, _cu),
+                                            program=_ce_program,
+                                            source=f"composite.{_cn.lower()}")
+                                    except Exception as _ce_err:
+                                        if hash(("ce_hook", _ce_err.__class__.__name__)) % 100 == 0:
+                                            logger.warning("[NS-Hook] %s reward failed: %s",
+                                                           _ce_program, _ce_err)
+                                    # rFP β Phase 3 § 4g + TUNING-016: NS → META-CGN coupling
+                                    # ("creativity", "fired") → SYNTHESIZE/HYPOTHESIZE
+                                    # ("empathy", "fired")    → DELEGATE/SPIRIT_SELF/EVALUATE
+                                    #
+                                    # EdgeDetector gates emission per META-CGN architectural
+                                    # invariant "discrete state transitions only" (bus_health.py
+                                    # header + TUNING_DATABASE.md § TUNING-016). First crossing
+                                    # of intensity >= 0.2 per consumer fires; sustained elevated
+                                    # state is silent; drop-and-re-cross fires again. Pre-fix
+                                    # steady-state: EMPATHY 0.52 Hz (alone consuming 0.5 Hz
+                                    # global META-CGN budget). Post-fix expected: one emission
+                                    # per "wave" onset.
+                                    try:
+                                        from ..bus import emit_meta_cgn_signal
+                                        _ce_consumer = _ce_program.lower()
+                                        _ce_intensity = min(1.0, _cu / 3.0)  # urge can be > 1
+                                        # Lazy-init shared EdgeDetector for composite producers.
+                                        # Persisted state restored from edge_detector_state.json
+                                        # at init; checkpoint via bundle save (this file ~line 1256).
+                                        if not getattr(coordinator, "_composite_meta_cgn_edge_init", False):
+                                            from ..logic.meta_cgn import EdgeDetector
+                                            coordinator._composite_meta_cgn_edge = EdgeDetector()
+                                            _cp_persisted = _load_edge_detector_state().get("composite_meta_cgn")
+                                            if _cp_persisted:
+                                                coordinator._composite_meta_cgn_edge.load_dict(_cp_persisted)
+                                                logger.info(
+                                                    "[META-CGN] Composite EdgeDetector state restored "
+                                                    "(%d consumer(s) previously crossed)",
+                                                    sum(1 for v in _cp_persisted.get("crossed", {}).values() if v))
+                                            coordinator._composite_meta_cgn_edge_init = True
+                                        if coordinator._composite_meta_cgn_edge.observe(
+                                            _ce_consumer, _ce_intensity, 0.2
+                                        ):
+                                            emit_meta_cgn_signal(
+                                                send_queue,
+                                                src=_ce_consumer, consumer=_ce_consumer,
+                                                event_type="fired",
+                                                intensity=_ce_intensity,
+                                                domain=_cn.lower(),
+                                                reason=f"{_ce_program} via {_cn} composite urge={_cu:.2f}")
+                                    except Exception:
+                                        pass
                         if _tf["composite"] != "SPEAK":
                             logger.info("[T2:EXPRESSION.%s] FIRED — urge=%.3f, helper=%s",
                                         _tf["composite"], _tf["urge"], _tf["action_helper"])
@@ -3700,6 +3954,7 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 mind_state.get("values", [0.5] * 5),
                 new_spirit,
                 prev_middle_path_loss,
+                neural_nervous_system=neural_nervous_system,
             )
             _bio_learn_ms = (time.time() - _bio_learn_t0) * 1000
 
@@ -3828,17 +4083,25 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 for _cf in (_t2_fired if '_t2_fired' in dir() else []):
                     _neural_activity_pressure += _cf.get("total_consumption", 0.0) * 0.0002
 
-                # METABOLISM training signal: record drain delta for IQL
+                # METABOLISM training signal: record drain delta for IQL.
+                # rFP β § 2e fix (2026-04-16): pre-fix this was BROKEN —
+                # called as record_outcome("METABOLISM", reward=...) which
+                # raised TypeError silently swallowed by the bare except.
+                # Stage 2 upgrade lets us route correctly with kwargs.
                 if _metabolism_prog and neural_nervous_system and life_force_engine:
                     _current_drain = getattr(life_force_engine, '_metabolic_drain', 0.0)
                     _prev_drain = getattr(life_force_engine, '_prev_drain_for_metabolism', _current_drain)
                     _drain_delta = _current_drain - _prev_drain
                     if abs(_drain_delta) > 0.0001:  # Only record meaningful changes
                         neural_nervous_system.record_outcome(
-                            "METABOLISM", reward=-_drain_delta * 10.0)
+                            reward=-_drain_delta * 10.0,
+                            program="METABOLISM",
+                            source="metabolism.drain_delta")
                     life_force_engine._prev_drain_for_metabolism = _current_drain
-            except Exception:
-                pass
+            except Exception as e:
+                # rFP β § 4c: surface the failure rate-limited instead of silent swallow
+                if hash((id(neural_nervous_system), e.__class__.__name__)) % 100 == 0:
+                    logger.warning("[SpiritWorker] METABOLISM reward path failed: %s", e)
             if life_force_engine:
                 _neuromod_p = getattr(neuromodulator_system, '_neuromod_pressure', 0.0) if neuromodulator_system else 0.0
                 life_force_engine.accumulate_metabolic_pressure(
@@ -5247,13 +5510,8 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     if _msl_tick_count % 30 == 0 and _x_gateway:
                         _xg_social_window = False  # True = mentions/reply/like allowed
                         try:
-                            _xg_cfg_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.toml")
-                            try:
-                                import tomllib as _xg_tl
-                            except ImportError:
-                                import toml as _xg_tl
-                            with open(_xg_cfg_path, "rb") as _xg_f:
-                                _xg_full = _xg_tl.load(_xg_f)
+                            from titan_plugin.config_loader import load_titan_config
+                            _xg_full = load_titan_config()
                             _xg_tc = _xg_full.get("twitter_social", {})
                             _xg_inf = _xg_full.get("inference", {})
                             _xg_session = _xg_tc.get("auth_session", "")
@@ -5803,6 +6061,25 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     trinity_after = payload.get("trinity_after")
                     if impulse_id and trinity_before and trinity_after:
                         impulse_engine.record_outcome(impulse_id, trinity_before, trinity_after)
+                        # rFP β Stage 2 Phase 2c: IMPULSE event hook
+                        # Trinity delta as reward proxy — positive when action
+                        # moved Trinity in a productive direction. Discrete signal
+                        # complementing the dense DA-ACh neuromod stream.
+                        if neural_nervous_system:
+                            try:
+                                _imp_delta = (
+                                    (float(trinity_after.get("body", 0.5)) - float(trinity_before.get("body", 0.5))) * 0.4
+                                    + (float(trinity_after.get("mind", 0.5)) - float(trinity_before.get("mind", 0.5))) * 0.3
+                                    + (float(trinity_after.get("spirit", 0.5)) - float(trinity_before.get("spirit", 0.5))) * 0.3
+                                )
+                                if abs(_imp_delta) > 0.05:
+                                    neural_nervous_system.record_outcome(
+                                        reward=max(-1.0, min(1.0, _imp_delta * 2.0)),
+                                        program="IMPULSE",
+                                        source="impulse_engine.outcome")
+                            except Exception as _imp_err:
+                                if hash(("imp_hook", _imp_err.__class__.__name__)) % 100 == 0:
+                                    logger.warning("[NS-Hook] IMPULSE reward failed: %s", _imp_err)
                 except Exception as e:
                     logger.error("[SpiritWorker] ACTION_RESULT handling error: %s", e, exc_info=True)
 
@@ -6506,13 +6783,8 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
                 # Generate via Ollama Cloud (same provider T1 uses)
                 import httpx as _xp_httpx
-                try:
-                    import tomllib as _xp_tl
-                except ImportError:
-                    import toml as _xp_tl
-                _xp_cfg_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.toml")
-                with open(_xp_cfg_path, "rb") as _xp_f:
-                    _xp_full_cfg = _xp_tl.load(_xp_f)
+                from titan_plugin.config_loader import load_titan_config
+                _xp_full_cfg = load_titan_config()
 
                 # Skip LLM generation for delegated (pre-generated) posts
                 if _xp_pre:

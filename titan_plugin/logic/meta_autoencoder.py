@@ -237,18 +237,26 @@ class MetaAutoencoder:
         param -= v
 
     def backfill_embeddings(self, chain_archive) -> int:
-        """Encode chains that have snapshots but no embeddings."""
+        """Encode chains that have snapshots but no embeddings.
+
+        Computes all encodings in memory first, then persists them in a single
+        batched transaction. Prior implementation did N separate commits, which
+        under SQLite contention produced 17-minute dream cycles (see rFP
+        inner_memory_db_write_contention.md § Layer 3 investigation + INVESTIGATION
+        _spirit_hang_root_cause.md, 2026-04-16).
+        """
         if not self.is_trained:
             return 0
         chains = chain_archive.get_chains_without_embedding(limit=100)
-        updated = 0
+        pairs = []
         for chain in chains:
             obs = chain["observation_snapshot"]
             if len(obs) >= 65:
                 emb = self.encode(obs)
-                chain_archive.update_embedding(chain["id"], emb)
-                updated += 1
-        return updated
+                pairs.append((chain["id"], emb))
+        if not pairs:
+            return 0
+        return chain_archive.update_embeddings_batch(pairs)
 
     @property
     def is_trained(self) -> bool:

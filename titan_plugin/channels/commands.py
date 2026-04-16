@@ -50,17 +50,11 @@ class CommandRegistry:
     def _load_maker_ids(self) -> None:
         """Load registered maker platform IDs from config."""
         try:
-            try:
-                import tomllib
-            except ModuleNotFoundError:
-                import tomli as tomllib  # type: ignore[no-redef]
-            config_path = _PROJECT_ROOT / "titan_plugin" / "config.toml"
-            if config_path.exists():
-                with open(config_path, "rb") as f:
-                    cfg = tomllib.load(f)
-                maker_ids = cfg.get("channels", {}).get("maker_platform_ids", "")
-                if maker_ids:
-                    self._maker_ids = {mid.strip() for mid in maker_ids.split(",") if mid.strip()}
+            from titan_plugin.config_loader import load_titan_config
+            cfg = load_titan_config()
+            maker_ids = cfg.get("channels", {}).get("maker_platform_ids", "")
+            if maker_ids:
+                self._maker_ids = {mid.strip() for mid in maker_ids.split(",") if mid.strip()}
         except Exception:
             pass
 
@@ -312,16 +306,8 @@ class CommandRegistry:
 
     async def _cmd_wallet(self, args: str, user_id: str) -> str:
         try:
-            # Load wallet info from config + Solana RPC
-            try:
-                import tomllib
-            except ModuleNotFoundError:
-                import tomli as tomllib  # type: ignore[no-redef]
-
-            config_path = _PROJECT_ROOT / "titan_plugin" / "config.toml"
-            with open(config_path, "rb") as f:
-                cfg = tomllib.load(f)
-
+            from titan_plugin.config_loader import load_titan_config
+            cfg = load_titan_config()
             network_cfg = cfg.get("network", {})
             solana_network = network_cfg.get("solana_network", "devnet")
 
@@ -398,15 +384,8 @@ class CommandRegistry:
 
     async def _cmd_maker(self, args: str, user_id: str) -> str:
         try:
-            try:
-                import tomllib
-            except ModuleNotFoundError:
-                import tomli as tomllib  # type: ignore[no-redef]
-
-            config_path = _PROJECT_ROOT / "titan_plugin" / "config.toml"
-            with open(config_path, "rb") as f:
-                cfg = tomllib.load(f)
-
+            from titan_plugin.config_loader import load_titan_config
+            cfg = load_titan_config()
             network = cfg.get("network", {})
             twitter = cfg.get("twitter_social", {})
 
@@ -469,14 +448,12 @@ class CommandRegistry:
 
     async def _cmd_settings(self, args: str, user_id: str) -> str:
         try:
-            try:
-                import tomllib
-            except ModuleNotFoundError:
-                import tomli as tomllib  # type: ignore[no-redef]
-
+            from titan_plugin.config_loader import load_titan_config
             config_path = _PROJECT_ROOT / "titan_plugin" / "config.toml"
-            with open(config_path, "rb") as f:
-                cfg = tomllib.load(f)
+            # Read the merged view (config.toml + ~/.titan/secrets.toml) for display.
+            # Writes below still go to config.toml; sensitive-key writes are refused
+            # with a pointer to ~/.titan/secrets.toml.
+            cfg = load_titan_config()
 
             if not args:
                 # List top-level sections
@@ -517,6 +494,16 @@ class CommandRegistry:
 
             if key not in section:
                 return f"Key '{key}' not found in [{section_name}]."
+
+            # Refuse to write secret fields to config.toml — those live in
+            # ~/.titan/secrets.toml now (introduced 2026-04-16, see
+            # memory/feedback_public_sync_pipeline.md).
+            key_lower = key.lower()
+            if any(s in key_lower for s in ("key", "token", "password", "secret", "cookie", "session")):
+                return (
+                    f"[{section_name}] {key} is a secret. Edit ~/.titan/secrets.toml directly "
+                    "(chmod 600) and restart the Titan — /settings writes config.toml only."
+                )
 
             # Type-coerce based on existing value
             old_val = section[key]
@@ -692,17 +679,9 @@ def _mask_sensitive(key: str, value) -> str:
 
 
 def _get_internal_key() -> str:
-    """Load internal API key from config.toml."""
+    """Load internal API key from merged config."""
     try:
-        try:
-            import tomllib
-        except ModuleNotFoundError:
-            import tomli as tomllib  # type: ignore[no-redef]
-        config_path = _PROJECT_ROOT / "titan_plugin" / "config.toml"
-        if config_path.exists():
-            with open(config_path, "rb") as f:
-                cfg = tomllib.load(f)
-            return cfg.get("api", {}).get("internal_key", "")
+        from titan_plugin.config_loader import load_titan_config
+        return load_titan_config().get("api", {}).get("internal_key", "") or ""
     except Exception:
-        pass
-    return ""
+        return ""

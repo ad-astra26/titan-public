@@ -1974,18 +1974,9 @@ class TitanCore:
 
     @staticmethod
     def _load_full_config() -> dict:
-        """Load config.toml."""
-        config_path = os.path.join(os.path.dirname(__file__), "config.toml")
-        try:
-            try:
-                import tomllib
-            except ModuleNotFoundError:
-                import toml as tomllib  # type: ignore
-            with open(config_path, "rb") as f:
-                return tomllib.load(f)
-        except Exception as e:
-            logger.warning("[TitanCore] Could not load config.toml: %s", e)
-            return {}
+        """Load the full merged Titan config (config.toml + ~/.titan/secrets.toml)."""
+        from titan_plugin.config_loader import load_titan_config
+        return load_titan_config()
 
     def _resolve_wallet(self, wallet_path: str) -> Optional[str]:
         """Resolve wallet keypair (same logic as TitanPlugin)."""

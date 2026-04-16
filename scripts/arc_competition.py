@@ -44,25 +44,27 @@ ALL_GAMES = ["ls20", "ft09", "vc33"]
 
 
 def load_arc_config() -> dict:
-    """Load ARC-AGI-3 config from titan_params.toml, with optional override
-    from config.toml (where secrets like api_key live — gitignored)."""
+    """Load ARC-AGI-3 config: titan_params.toml (base) + merged Titan config
+    (config.toml + ~/.titan/secrets.toml, where [arc_agi_3].api_key lives)."""
     try:
         import tomllib
     except ImportError:
         import tomli as tomllib
     params_path = os.path.join(PROJECT_ROOT, "titan_plugin", "titan_params.toml")
-    config_path = os.path.join(PROJECT_ROOT, "titan_plugin", "config.toml")
 
     arc: dict = {}
     if os.path.exists(params_path):
         with open(params_path, "rb") as f:
             arc.update(tomllib.load(f).get("arc_agi_3", {}))
 
-    # Config.toml overrides titan_params.toml — secrets live in config.toml
-    if os.path.exists(config_path):
-        with open(config_path, "rb") as f:
-            override = tomllib.load(f).get("arc_agi_3", {})
+    # Merged config (config.toml + ~/.titan/secrets.toml) overrides titan_params.toml —
+    # the api_key secret lives in ~/.titan/secrets.toml.
+    try:
+        from titan_plugin.config_loader import load_titan_config
+        override = load_titan_config().get("arc_agi_3", {})
         arc.update(override)
+    except Exception:
+        pass
 
     return arc
 

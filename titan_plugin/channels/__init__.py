@@ -34,17 +34,9 @@ def _load_internal_key() -> str:
     if _cached_internal_key is not None:
         return _cached_internal_key
     try:
-        import pathlib
-        try:
-            import tomllib
-        except ModuleNotFoundError:
-            import tomli as tomllib  # type: ignore[no-redef]
-        config_path = pathlib.Path(__file__).resolve().parent.parent / "config.toml"
-        if config_path.exists():
-            with open(config_path, "rb") as fh:
-                cfg = tomllib.load(fh)
-            _cached_internal_key = cfg.get("api", {}).get("internal_key", "")
-            return _cached_internal_key
+        from titan_plugin.config_loader import load_titan_config
+        _cached_internal_key = load_titan_config().get("api", {}).get("internal_key", "") or ""
+        return _cached_internal_key
     except Exception:
         pass
     _cached_internal_key = ""
@@ -278,25 +270,8 @@ def get_channel_config(channel: str) -> dict:
     from the ``[channels]`` section.  Falls back to an empty dict if the
     section or keys are missing.
     """
-    try:
-        import tomllib
-    except ModuleNotFoundError:  # Python < 3.11
-        try:
-            import tomli as tomllib  # type: ignore[no-redef]
-        except ModuleNotFoundError:
-            logger.error("[Channel] Neither tomllib nor tomli available for config loading.")
-            return {}
-
-    import pathlib
-
-    config_path = pathlib.Path(__file__).resolve().parent.parent / "config.toml"
-    if not config_path.exists():
-        logger.warning("[Channel] config.toml not found at %s", config_path)
-        return {}
-
-    with open(config_path, "rb") as fh:
-        full = tomllib.load(fh)
-
+    from titan_plugin.config_loader import load_titan_config
+    full = load_titan_config()
     channels_section = full.get("channels", {})
     prefix = f"{channel}_"
     return {

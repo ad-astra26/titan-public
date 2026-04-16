@@ -78,18 +78,19 @@ class MoodEngine:
         self._load_config()
         
     def _load_config(self):
-        """Reads config.toml and triggers the registry hot-loader."""
-        if os.path.exists(self.config_path):
-            with open(self.config_path, "rb") as f:
-                config = tomllib.load(f)
-                
-            self.base_weight = config.get("mood_engine", {}).get("base_weight", 1.0)
-            active_modules = config.get("addons", {}).get("active", [])
-            
-            # Hot-load the requested addons
-            self.registry.hot_load(active_modules)
-        else:
-            logging.warning(f"[MoodEngine] Config file not found at {self.config_path}. Using defaults.")
+        """Reads merged config and triggers the registry hot-loader."""
+        try:
+            from titan_plugin.config_loader import load_titan_config
+            config = load_titan_config()
+        except Exception as e:
+            logging.warning(f"[MoodEngine] Config load failed: {e}. Using defaults.")
+            return
+
+        self.base_weight = config.get("mood_engine", {}).get("base_weight", 1.0)
+        active_modules = config.get("addons", {}).get("active", [])
+
+        # Hot-load the requested addons
+        self.registry.hot_load(active_modules)
 
     def force_zen(self):
         """

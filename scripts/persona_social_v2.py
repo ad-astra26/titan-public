@@ -140,9 +140,9 @@ def get_adversary_weights(evo: dict, adversary_keys: list[str]) -> dict[str, flo
 
 
 def load_config() -> dict:
-    """Load config.toml + titan_params.toml (merged). Pattern: persona_endurance.py:77-79."""
-    with open(CONFIG_PATH, "rb") as f:
-        cfg = tomllib.load(f)
+    """Load merged Titan config (config.toml + ~/.titan/secrets.toml) + persona_social params."""
+    from titan_plugin.config_loader import load_titan_config
+    cfg = dict(load_titan_config())
     # Merge persona_social params from titan_params.toml
     if PARAMS_PATH.exists():
         with open(PARAMS_PATH, "rb") as f:
