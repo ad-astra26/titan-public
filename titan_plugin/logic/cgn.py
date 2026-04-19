@@ -443,6 +443,11 @@ class TransitionBuffer:
 # ── Core CGN Class ──────────────────────────────────────────────────────────
 
 
+# PERSISTENCE_BY_DESIGN: ConceptGroundingNetwork._value_net / _action_nets /
+# _consumer_freq / _concept_journeys / _surprise_buffer / _haov_trackers
+# persist via _save_state → cgn_state.pt (torch.load/save) and are restored
+# via _load_state_dict / dict mutation patterns the AST scanner can't
+# statically trace as direct self-assignments.
 class ConceptGroundingNetwork:
     """Higher Cognitive Kernel — single concept grounding algorithm for all consumers.
 
@@ -791,6 +796,10 @@ class ConceptGroundingNetwork:
 
     # ── Bootstrap ───────────────────────────────────────────────────────
 
+    # UNUSED_PUBLIC_API: cold-start seeding path designed in the original
+    # CGN rFP (2026-04-03). No live caller — CGN bootstraps from per-
+    # consumer replay buffer instead of synthetic seed. Preserved as
+    # public API for future migrations / rebuild scenarios.
     def bootstrap_concepts(self, consumer: str,
                            concepts: List[ConceptFeatures]) -> int:
         """One-time initialization for concepts that predate CGN.
@@ -1056,6 +1065,10 @@ class ConceptGroundingNetwork:
 
     # ── Language Consumer Helpers ────────────────────────────────────────
 
+    # DEPRECATED: use language_pipeline.load_concept_from_db(db_path, word)
+    # instead. The standalone function works without a local CGN instance
+    # (needed by consumer-client-only workers). This instance method is
+    # retained for back-compat with any remaining dual-path callers.
     def load_concept(self, consumer: str, word: str) -> Optional[ConceptFeatures]:
         """Load a word from vocabulary DB as ConceptFeatures."""
         try:
@@ -1123,6 +1136,9 @@ class ConceptGroundingNetwork:
             logger.debug("[CGN] load_concept('%s') failed: %s", word, e)
             return None
 
+    # DEPRECATED: use language_pipeline.apply_grounding_action_to_db(
+    #   db_path, word, action, state_132d) instead. Standalone function
+    # for consumer-client-only workers. Retained for back-compat.
     def apply_grounding_action(self, word: str, action: GroundingAction,
                                sensory_ctx: SensoryContext = None) -> bool:
         """Apply a GroundingAction to a word in the vocabulary DB."""
@@ -1422,12 +1438,19 @@ class ConceptGroundingNetwork:
         if len(self._surprise_buffer) > 100:
             self._surprise_buffer = self._surprise_buffer[-100:]
 
+    # UNUSED_PUBLIC_API: cross-consumer surprise sharing surface. CGN collects
+    # per-consumer surprises via record_outcome, but no consumer currently
+    # queries peers. Reserved for planned higher-cognition arc (cross-domain
+    # analogical reasoning — see rFP_cgn_orchestrator_promotion).
     def get_shared_surprises(self, consumer: str,
                              max_count: int = 10) -> List[dict]:
         """Get surprise events from OTHER consumers (cross-domain surprise sharing)."""
         return [s for s in self._surprise_buffer[-50:]
                 if s["consumer"] != consumer][-max_count:]
 
+    # UNUSED_PUBLIC_API: concept-journey telemetry surface. Populated by
+    # the CGN sigma tracker; not yet surfaced via /v4/concept-lifecycle API
+    # endpoint. Reserved for observability dashboards.
     def get_concept_lifecycle(self, concept_id: str) -> Optional[dict]:
         """Get concept's journey across consumers."""
         journey = self._concept_journeys.get(concept_id)

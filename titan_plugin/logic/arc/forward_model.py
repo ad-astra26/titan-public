@@ -26,6 +26,9 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+# PERSISTENCE_BY_DESIGN: ForwardModel._num_actions is derived from the
+# network architecture's action-head dimension — a constant computed at
+# init from config, saved for debugging but rebuilt on load.
 class ForwardModel:
     """Predicts next grid features from current features + action.
 

@@ -30,7 +30,10 @@ class TitanDuckDB:
         import duckdb
         self._path = db_path
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-        self._conn = duckdb.connect(db_path)
+        self._conn = duckdb.connect(db_path, config={
+            "memory_limit": "256MB",   # Cap in-memory buffers (was unbounded)
+            "threads": "4",            # Limit thread pool
+        })
         self._init_schema()
 
     def _init_schema(self):

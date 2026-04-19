@@ -26,6 +26,9 @@ from .guardian import Guardian, ModuleSpec
 logger = logging.getLogger(__name__)
 
 
+# PERSISTENCE_BY_DESIGN: TitanCore._full_config / _agency / _proxies /
+# _*_mode fields are runtime bootstrap state — loaded from config.toml or
+# constructed on boot. Config data is not self-owned state to persist.
 class TitanCore:
     """
     Minimal kernel that boots fast and delegates heavy work to supervised modules.
@@ -57,7 +60,11 @@ class TitanCore:
         self.state_register.start(self.bus, snapshot_interval=snapshot_interval)
 
         # ── Guardian ─────────────────────────────────────────────────
-        self.guardian = Guardian(self.bus)
+        # [guardian] toml plumbed 2026-04-16 (dead-wiring audit). Section
+        # reaches Guardian which reads heartbeat_timeout_default /
+        # max_restarts_in_window / restart_window / sustained_uptime_reset
+        # with module constants as fallbacks.
+        self.guardian = Guardian(self.bus, config=self._full_config.get("guardian", {}))
 
         # ── Disk Health Monitor ──────────────────────────────────────
         # Background thread publishing DISK_WARNING/CRITICAL/EMERGENCY on
@@ -334,7 +341,7 @@ class TitanCore:
             name="body",
             entry_fn=body_worker_main,
             config=body_config,
-            rss_limit_mb=500,
+            rss_limit_mb=800,   # was 500; fork-inherited parent memory grew from ~250MB to ~400MB+ (2026-04-17)
             autostart=True,  # Body senses must always be active
             lazy=False,
         ))
@@ -347,24 +354,33 @@ class TitanCore:
             name="mind",
             entry_fn=mind_worker_main,
             config=mind_config,
-            rss_limit_mb=500,
+            rss_limit_mb=700,   # was 500; fork-inherited parent RSS ~400MB left only 100MB headroom — caused T3 cascade (2026-04-17). Memory profiling tool (DEFERRED TOP) will identify real optimization targets.
             autostart=True,  # Mind senses should always be active
             lazy=False,
         ))
 
         # Spirit module (Consciousness + V4 Sphere Clocks + Enrichment + Neural NS + Experience Orchestrator)
+        # filter_down_v5 + titan_self were defined in titan_params.toml but
+        # never plumbed here, so V5's publish_enabled flag was always
+        # stuck at its False default regardless of toml edits. Caught 2026-04-16
+        # when attempting to flip publish_enabled and observing V5 kept
+        # reporting False from /v4/filter-down-status.
         spirit_config = {
             **self._full_config.get("consciousness", {}),
             "sphere_clock": self._full_config.get("sphere_clock", {}),
             "spirit_enrichment": self._full_config.get("spirit_enrichment", {}),
             "data_dir": self._full_config.get("memory_and_storage", {}).get("data_dir", "./data"),
             "social_presence": self._full_config.get("social_presence", {}),
+            "filter_down_v5": self._full_config.get("filter_down_v5", {}),
+            "titan_self": self._full_config.get("titan_self", {}),
+            "impulse": self._full_config.get("impulse", {}),
+            "titan_vm": self._full_config.get("titan_vm", {}),
         }
         self.guardian.register(ModuleSpec(
             name="spirit",
             entry_fn=spirit_worker_main,
             config=spirit_config,
-            rss_limit_mb=750,
+            rss_limit_mb=1200,  # was 750; spirit loads 11 neural nets + consciousness.db + inner_memory.db + NS programs during boot — peak RSS 961-1486MB observed 2026-04-18
             autostart=True,  # Spirit awareness should always be active
             lazy=False,
             heartbeat_timeout=120.0,  # Spirit does heavy V4 work (LLM, on-chain)
@@ -380,7 +396,7 @@ class TitanCore:
             name="media",
             entry_fn=media_worker_main,
             config=media_config,
-            rss_limit_mb=700,  # was 500; spikes to ~550MB during spatial/audio perception
+            rss_limit_mb=800,  # was 700 (was 500); fork-inherited parent memory grew (2026-04-17)
             autostart=True,   # Always on — art/audio generated frequently
             lazy=False,
             heartbeat_timeout=180.0,  # Image/audio digest can block 30-90s
@@ -468,7 +484,7 @@ class TitanCore:
             name="timechain",
             entry_fn=timechain_worker_main,
             config=timechain_config,
-            rss_limit_mb=700,     # Needs headroom for integrity check + chain queries
+            rss_limit_mb=850,     # was 700; fork-inherited parent memory grew (2026-04-17)
             autostart=True,       # Must be ready before other modules emit thoughts
             lazy=False,
             heartbeat_timeout=120.0,  # Extended: integrity check + healing takes ~60s
@@ -1055,10 +1071,24 @@ class TitanCore:
             except Exception as e:
                 logger.warning("[TitanCore] Assessment failed: %s", e)
 
-        # Publish ACTION_RESULT back to bus (Spirit will pick it up)
-        self.bus.publish(make_msg(ACTION_RESULT, "core", "all", result))
-        logger.info("[TitanCore] ACTION_RESULT published: helper=%s success=%s",
-                    result.get("helper"), result.get("success"))
+        # Publish ACTION_RESULT back to bus (Spirit will pick it up).
+        # Guard: 3 SQLite NOT NULL errors per hour surfaced 2026-04-15
+        # (ACTION-RESULT-NULL-FIELDS in DEFERRED_ITEMS). Root cause: Agency
+        # gated-away impulses (rate limit, unavailable helper) still
+        # published ACTION_RESULT with empty helper/task_type/action_taken.
+        # 3 downstream recorders (TitanCore inner_memory, SpiritWorker
+        # ex_mem, ExperienceOrch) all rejected with NOT NULL constraint
+        # failures. Skipping empty dispatches at the source — the action
+        # didn't actually execute, so there's nothing to record.
+        _helper = str(result.get("helper") or "").strip()
+        if not _helper:
+            logger.debug(
+                "[TitanCore] Skipping ACTION_RESULT with empty helper — "
+                "gate/rate-limit path (success=%s)", result.get("success"))
+        else:
+            self.bus.publish(make_msg(ACTION_RESULT, "core", "all", result))
+            logger.info("[TitanCore] ACTION_RESULT published: helper=%s success=%s",
+                        _helper, result.get("success"))
 
         # Feed action result to spirit_worker for OBSERVATION (closed loop)
         try:
@@ -1105,17 +1135,18 @@ class TitanCore:
                         posture=result.get("posture", ""),
                         assessment_score=result.get("score", 0.0),
                     )
-                    # Archive to ObservatoryDB for gallery/feed
+                    # Archive to ObservatoryDB for gallery/feed (in thread — non-blocking)
                     obs_db = getattr(self, "_observatory_db", None)
                     if obs_db and _file_path:
                         _style = result.get("art_style", _work_type)
-                        obs_db.record_expressive(
-                            type_=_work_type,
-                            title=f"{_style.replace('_', ' ').title()} ({result.get('triggering_program', 'autonomous')})",
-                            content=result.get("result", ""),
-                            media_path=_file_path,
-                            media_hash="",
-                            metadata={
+                        asyncio.get_event_loop().run_in_executor(
+                            None, obs_db.record_expressive,
+                            _work_type,
+                            f"{_style.replace('_', ' ').title()} ({result.get('triggering_program', 'autonomous')})",
+                            result.get("result", ""),
+                            _file_path,
+                            "",
+                            {
                                 "triggering_program": result.get("triggering_program", ""),
                                 "posture": result.get("posture", ""),
                                 "score": result.get("score", 0.0),
@@ -1192,9 +1223,21 @@ class TitanCore:
                 except Exception:
                     pass
 
-            self.bus.publish(make_msg(ACTION_RESULT, "core", "all", result))
-            logger.info("[TitanCore] AUTONOMY ACTION: %s → %s (success=%s)",
-                        result.get("posture"), result.get("helper"), result.get("success"))
+            # Same empty-payload guard as the normal-path publisher above
+            # (see ACTION-RESULT-NULL-FIELDS — 3 NOT NULL errors/hour
+            # pattern). Autonomy path can also produce empty helpers when
+            # the selected posture has no bound action.
+            _auto_helper = str(result.get("helper") or "").strip()
+            if not _auto_helper:
+                logger.debug(
+                    "[TitanCore] Skipping AUTONOMY ACTION_RESULT with empty "
+                    "helper — posture=%s success=%s",
+                    result.get("posture"), result.get("success"))
+            else:
+                self.bus.publish(make_msg(ACTION_RESULT, "core", "all", result))
+                logger.info("[TitanCore] AUTONOMY ACTION: %s → %s (success=%s)",
+                            result.get("posture"), _auto_helper,
+                            result.get("success"))
 
             # Feed action result to spirit_worker for OBSERVATION (closed loop)
             # Spirit worker's OuterInterface will decode → narrate → apply deltas
@@ -1381,8 +1424,9 @@ class TitanCore:
                 body_center_dist = spirit_data.get("body_center_dist", 0.0)
                 mind_center_dist = spirit_data.get("mind_center_dist", 0.0)
 
-                # Record Trinity snapshot
-                obs_db.record_trinity_snapshot(
+                # Record Trinity snapshot (in thread to avoid blocking event loop)
+                await asyncio.to_thread(
+                    obs_db.record_trinity_snapshot,
                     body_tensor=body_tensor,
                     mind_tensor=mind_tensor,
                     spirit_tensor=spirit_tensor,
@@ -1405,7 +1449,8 @@ class TitanCore:
                 # directive_alignment approximated by sovereignty
                 directive_alignment = sv[4] if len(sv) > 4 else 0.0
 
-                obs_db.record_growth_snapshot(
+                await asyncio.to_thread(
+                    obs_db.record_growth_snapshot,
                     learning_velocity=learning_velocity,
                     social_density=social_density,
                     metabolic_health=metabolic_health,
@@ -1414,7 +1459,8 @@ class TitanCore:
 
                 # Record V4 Time Awareness snapshot (spirit_data already has it)
                 if spirit_data.get("sphere_clock") or spirit_data.get("unified_spirit"):
-                    obs_db.record_v4_snapshot(
+                    await asyncio.to_thread(
+                        obs_db.record_v4_snapshot,
                         sphere_clocks=spirit_data.get("sphere_clock"),
                         resonance=spirit_data.get("resonance"),
                         unified_spirit=spirit_data.get("unified_spirit"),
@@ -1450,7 +1496,8 @@ class TitanCore:
                             mood_valence = nm_conf
                     except Exception:
                         pass
-                    obs_db.record_vital_snapshot(
+                    await asyncio.to_thread(
+                        obs_db.record_vital_snapshot,
                         sovereignty_pct=chi_total * 100,
                         life_force_pct=metabolic_health * 100,
                         sol_balance=sol_balance,
@@ -1619,16 +1666,17 @@ class TitanCore:
                             )
                             if art_path:
                                 logger.info("[TitanCore] Meditation art generated: %s", art_path)
-                                # Archive to ObservatoryDB
+                                # Archive to ObservatoryDB (in thread — non-blocking)
                                 obs_db = getattr(self, "_observatory_db", None)
                                 if obs_db:
-                                    obs_db.record_expressive(
-                                        type_="art",
-                                        title=f"Meditation Flow Field (V3 Epoch {epoch_count})",
-                                        content=f"{promoted} memories crystallized",
-                                        media_path=art_path,
-                                        media_hash="",
-                                        metadata={"epoch": epoch_count, "promoted": promoted},
+                                    asyncio.get_event_loop().run_in_executor(
+                                        None, obs_db.record_expressive,
+                                        "art",
+                                        f"Meditation Flow Field (V3 Epoch {epoch_count})",
+                                        f"{promoted} memories crystallized",
+                                        art_path,
+                                        "",
+                                        {"epoch": epoch_count, "promoted": promoted},
                                     )
                         except Exception as e:
                             logger.warning("[TitanCore] Meditation art failed: %s", e)

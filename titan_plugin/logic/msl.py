@@ -64,6 +64,10 @@ CONCEPT_NAMES = ["I", "YOU", "YES", "NO", "WE", "THEY"]
 
 # ── Homeostatic Attention Layer ────────────────────────────────────────────
 
+# PERSISTENCE_BY_DESIGN: HomeostaticAttention stores drift-guard + entropy
+# tracking counters in get_state for observability but rebuilds them from
+# live observations on each restart — the counters are re-derivable rolling
+# statistics, not load-bearing persistent state.
 class HomeostaticAttention:
     """Biological self-regulation for attention weights.
 
@@ -1472,6 +1476,10 @@ class SelfActionEcho:
 
 # ── Phase 3: Concept Grounder ────────────────────────────────────────────
 
+# PERSISTENCE_BY_DESIGN: ConceptGrounder._recipes / _logs / _trackers /
+# _last_conv_epoch are per-concept running metrics kept in get_state for
+# observability. The authoritative concept state is ConceptFeatures records
+# persisted elsewhere; these are derived/rolling view fields.
 class ConceptGrounder:
     """Phase 3: Grounding for YOU/YES/NO/WE/THEY concepts.
 
@@ -1786,6 +1794,8 @@ class ConceptGrounder:
 
 # ── Phase 5: Chi Coherence + "I AM" Event Detection ─────────────────────
 
+# PERSISTENCE_BY_DESIGN: ChiCoherenceTracker._window_size is a config-derived
+# constant saved for debugging observability. Not load-bearing state.
 class ChiCoherenceTracker:
     """Computed (not learned) cross-modal coherence metric.
 

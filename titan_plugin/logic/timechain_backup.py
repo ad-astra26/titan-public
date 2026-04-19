@@ -82,6 +82,10 @@ AUXILIARY_BACKUP_PATHS: dict[str, str] = {
 }
 
 
+# PERSISTENCE_BY_DESIGN: TimeChainBackup._manifest is rebuilt from the
+# filesystem scan on load (scans backup dir + Arweave index). Saving the
+# manifest is a cache for debugging; the authoritative state is on-disk
+# backup files themselves.
 class TimeChainBackup:
     """Sovereign backup — ensures TimeChain survives any infrastructure failure."""
 

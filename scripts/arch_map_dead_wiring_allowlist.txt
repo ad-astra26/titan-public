@@ -1,0 +1,210 @@
+# arch_map dead-wiring allowlist
+#
+# One method name per line. Methods listed here are NEVER flagged as orphans,
+# even if they have zero static callers. Use for entry points, callbacks,
+# and externally-invoked APIs that static analysis can't resolve.
+#
+# Convention: keep this list lean. Each entry should document why it's
+# externally reachable. Prefer fixing the code (add @staticmethod, @property,
+# proper decorator) over adding to this list when possible.
+#
+# Format: method_name (one per line; # comments allowed on their own lines)
+
+# ── FastAPI route handlers without visible decorator matches ──
+# (most are caught by IGNORE_DECORATOR_SUBSTRINGS, list edge cases here)
+
+# ── Bus message handlers with non-conventional names ──
+# (most caught by IGNORE_NAME_PREFIXES: on_*, handle_*, _handle_*)
+
+# ── CLI entry points ──
+# main, run — caught by IGNORE_NAME_EXACT
+
+# ── Known stable external APIs ──
+# Add names here as they're identified during triage passes.
+
+# ── Titan-specific known-reachable ──
+spirit_worker_main
+media_worker_main
+body_worker_main
+mind_worker_main
+body_senses_worker_main
+mind_senses_worker_main
+llm_worker_main
+language_worker_main
+cgn_worker_main
+meditation_worker_main
+events_worker_main
+knowledge_worker_main
+memory_worker_main
+timechain_worker_main
+rl_worker_main
+
+# Guardian module entry points
+guardian_loop
+
+# ── OpenClaw plugin contract hooks (called by host CLI, not by us) ──
+pre_prompt_hook
+post_resolution_hook
+post_prompt_hook
+start_background_tasks
+stop_background_tasks
+init_plugin
+cleanup_plugin
+lifespan
+on_startup
+on_shutdown
+
+# ── FastAPI-style route/auth callables without visible decorator ──
+websocket_endpoint
+verify_privy_token
+verify_maker_auth
+get_current_user
+
+# ── Channel starters registered via string-keyed dispatch ──
+start_discord
+start_telegram
+start_twitter
+start_farcaster
+
+# ── Debug/admin hooks surfaced only via external commands ──
+force_graduate
+force_shadow
+reset_watchdog
+
+# ── Reserved public API surfaces (2026-04-19 triage sweep) ──
+# These are public methods that are intentionally defined-but-uncalled.
+# They preserve surface area for (a) imminent feature activation, (b) external
+# API/CLI access paths, (c) future rFP wiring. Each entry is categorized by
+# the subsystem that will eventually consume it.
+
+# Network / on-chain reserved surface — called by mainnet ops once wired:
+set_economy_mode
+send_jito_bundle
+fetch_memo_transaction
+start_divine_listener
+upload_file_mainnet
+fetch_json
+prove_memory_existence
+fetch_memory_timeline
+build_mpl_core_update_plugin_v1
+sign_shadow_drive_message
+
+# Soul / sovereignty on-chain surface:
+update_directives
+generate_genesis_metadata_uri
+
+# Hibernation / resurrection backup surface (triggered only on wallet loss):
+store_locally
+create_hibernation_testament
+restore_personality_from_arweave
+
+# Bus infrastructure / observability (enabled via TITAN_BUS_CENSUS env var
+# or called by separate monitoring processes):
+get_census
+start_writer
+stop_writer
+update_queue_depths
+get_drop_stats
+read_all
+sha256_hex
+
+# Memory backend query/export surface (used by /v4/memory API + tests):
+get_node
+export_parquet
+export_json
+get_all_journey_points
+
+# State/observability getters (surfaced via /v4 API endpoints):
+format_social_signature
+reset_quality
+get_coherences
+is_rise
+record_vigilance_fire
+template_visit_count
+warm_start
+is_they_unlocked
+get_attention_heatmap
+clear_intuition_bias
+query_mini
+get_latest_arweave_tx
+get_word_recipe
+summary_vector
+is_persona_active
+get_word_success_rates
+get_preferred_templates
+apply_perturbation_deltas
+get_refractory
+get_inner_signals_summary
+get_cached
+get_disagreements
+drift_personality
+get_volume_trend
+cleanup_patterns
+is_mature_for_transition
+express_eureka
+upload_media
+broadcast_starvation_plea
+commands_cmd
+get_autocomplete
+format_info_line
+build_dispatch_payload
+bias_weight
+compute_anchor_freshness
+reset_rate_limit
+start_server
+reset_thresholds_to_dna
+check_rate
+has_reflex
+get_result
+adapt_all
+update_hormonal_events
+record_visual_journey
+get_creative_works
+get_dist
+get_process
+periodic_check
+
+# Daily NFT + meditation memo lifecycle (on-chain features gated on tier +
+# metabolic gate wiring):
+should_mint_daily_nft
+build_daily_nft_metadata
+create_art_composite
+get_daily_nft_count
+store_daily_nft_record
+format_meditation_memo
+store_meditation_locally
+parse_meditation_memo
+
+# Events Teacher observability getters (exposed via /v4/events-teacher API):
+get_post_type_engagement_stats
+get_user_valences
+get_social_memory
+get_top_interacted_followers
+get_perception_context
+
+# ARC state-memory observability (exposed via /v4/arc API):
+get_visit_count
+is_novel_state
+seed_from_kin
+
+# TimeChain integrity verifier — awaits periodic scheduler wiring:
+refresh
+verify_batch
+is_tracked
+get_entry
+
+# META MultiChainScheduler — awaits MULTI-CHAIN-SCHEDULER-ACTIVATION:
+get_active_chain
+all_done
+remove_chain
+
+# Contract store observability:
+get_active
+reject_contract
+
+# Proxy dispatch surfaces (invoked via bus.request(dst="<proxy_name>") from
+# cross-process consumers — scanner can't see runtime routing):
+get_body_details
+queue_file
+get_spirit_tensor
+add_memory

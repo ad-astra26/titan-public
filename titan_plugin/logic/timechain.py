@@ -267,6 +267,9 @@ class Block:
 
 # ── TimeChain Core ─────────────────────────────────────────────────────
 
+# PERSISTENCE_BY_DESIGN: TimeChain._fork_tips is an observability index
+# saved for fast queries but rebuilt from the authoritative chain files on
+# load (chain files themselves are the source of truth for fork tips).
 class TimeChain:
     """Append-only hash-chained memory architecture with tripartite forks.
 

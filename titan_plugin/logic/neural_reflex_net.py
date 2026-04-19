@@ -298,6 +298,9 @@ class NeuralReflexNet:
 
 # ── Transition Buffer ──────────────────────────────────────────────
 
+# PERSISTENCE_BY_DESIGN: NervousTransitionBuffer._last_fired_idx is
+# recomputed from buffer contents on load — tracks position within the
+# ring-buffer, not an independently-persistable state field.
 class NervousTransitionBuffer:
     """
     Per-program transition buffer for neural training.

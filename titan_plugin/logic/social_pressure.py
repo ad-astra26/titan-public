@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 
 # ── X Session Manager ─────────────────────────────────────────────────────
 
+# PERSISTENCE_BY_DESIGN: XSessionManager state is intentionally reset on
+# restart — circuit-breaker state (consecutive_failures, circuit_open_until)
+# is recomputed from live refresh attempts, session validity is re-derived
+# from _cached_session via _validate_session(), refresh timestamps are
+# session-scoped. The actual session cookie persists via config.toml regex-
+# write path (not self-assignment). See Tier B triage 2026-04-19.
 class XSessionManager:
     """Permanent session lifecycle management for X/Twitter API.
 
@@ -544,6 +550,8 @@ class SocialPressureMeter:
                 ],
                 "recent_post_ids": self.recent_post_ids,
                 "timestamp": time.time(),
+                # v4 persistence gap fix (2026-04-17): circuit breaker survives restarts
+                "circuit_open_until": self._circuit_open_until if hasattr(self, '_circuit_open_until') else 0.0,
             }
             os.makedirs(os.path.dirname(self._STATE_FILE) or ".", exist_ok=True)
             tmp = self._STATE_FILE + ".tmp"
@@ -576,6 +584,9 @@ class SocialPressureMeter:
                     data=ce.get("data", {}),
                     timestamp=ce.get("timestamp", time.time()),
                 ))
+            # v4 persistence gap fix (2026-04-17): restore circuit breaker
+            if "circuit_open_until" in state and hasattr(self, '_circuit_open_until'):
+                self._circuit_open_until = float(state["circuit_open_until"])
             age = time.time() - state.get("timestamp", 0)
             logger.info("[SocialPressure] State restored (%.0fs old): urge=%.1f, "
                         "emotion=%s, catalysts=%d, posts=%d/hr %d/day",

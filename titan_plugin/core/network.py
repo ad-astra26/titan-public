@@ -12,6 +12,10 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 
+# PERSISTENCE_BY_DESIGN: HybridNetworkClient._keypair + _pubkey are loaded
+# from the Solana wallet file (JSON keypair), NOT from HybridNetworkClient's
+# own state file — so they're "loaded but never saved" by design. Wallet
+# management lives in the Solana CLI / SovereignSoul, not in this client.
 class HybridNetworkClient:
     """
     Client for Solana blockchain communications: balance queries, transaction

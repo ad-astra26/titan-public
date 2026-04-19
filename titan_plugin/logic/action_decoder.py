@@ -15,13 +15,15 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Defaults (overridden by [action_decoder] in titan_params.toml) ──
-MAX_DELTA = 0.08
-AUDIO_DURATION_SCALE = 30.0
-WEB_RESULT_COUNT_SCALE = 10.0
-MEMO_BALANCE_SCALE = 5.0
-CODE_DEPTH_SCALE = 1000.0
-SPEAK_RICHNESS_THRESHOLD = 5
+# ── Defaults (overridden per-instance by [action_decoder] in titan_params.toml).
+# Kept as module-level for back-compat reference; stored as instance attrs to
+# avoid global mutation across multiple ActionDecoder instances.
+DEFAULT_MAX_DELTA = 0.08
+DEFAULT_AUDIO_DURATION_SCALE = 30.0
+DEFAULT_WEB_RESULT_COUNT_SCALE = 10.0
+DEFAULT_MEMO_BALANCE_SCALE = 5.0
+DEFAULT_CODE_DEPTH_SCALE = 1000.0
+DEFAULT_SPEAK_RICHNESS_THRESHOLD = 5
 
 # ── Outer Body dims ──
 # [0] interoception  [1] proprioception  [2] somatosensation  [3] entropy  [4] thermal
@@ -32,24 +34,27 @@ SPEAK_RICHNESS_THRESHOLD = 5
 # Willing  [10:15]: action_throughput, social_initiative, creative_output, protective_response, exploration_drive
 
 
-def _clamp_delta(d: float) -> float:
-    return max(-MAX_DELTA, min(MAX_DELTA, d))
-
-
 class ActionDecoder:
     """Decode action results into outer Trinity dimension deltas."""
 
-    def __init__(self, params_config: dict = None):
-        # Load scaling params from [action_decoder] section
-        global MAX_DELTA, AUDIO_DURATION_SCALE, WEB_RESULT_COUNT_SCALE
-        global MEMO_BALANCE_SCALE, CODE_DEPTH_SCALE, SPEAK_RICHNESS_THRESHOLD
-        if params_config:
-            MAX_DELTA = float(params_config.get("max_delta", MAX_DELTA))
-            AUDIO_DURATION_SCALE = float(params_config.get("audio_duration_scale", AUDIO_DURATION_SCALE))
-            WEB_RESULT_COUNT_SCALE = float(params_config.get("web_result_count_scale", WEB_RESULT_COUNT_SCALE))
-            MEMO_BALANCE_SCALE = float(params_config.get("memo_balance_scale", MEMO_BALANCE_SCALE))
-            CODE_DEPTH_SCALE = float(params_config.get("code_depth_scale", CODE_DEPTH_SCALE))
-            SPEAK_RICHNESS_THRESHOLD = int(params_config.get("speak_richness_threshold", SPEAK_RICHNESS_THRESHOLD))
+    def __init__(self, config: Optional[dict] = None):
+        # Read [action_decoder] section. Accepts either a full config dict or
+        # (for back-compat with the earlier params_config=section calling
+        # convention) the section itself if "max_delta" appears at top level.
+        section: dict = {}
+        if isinstance(config, dict):
+            if "action_decoder" in config and isinstance(config["action_decoder"], dict):
+                section = config["action_decoder"]
+            elif "max_delta" in config or "audio_duration_scale" in config:
+                section = config
+
+        self._max_delta                = float(section.get("max_delta", DEFAULT_MAX_DELTA))
+        self._audio_duration_scale     = float(section.get("audio_duration_scale", DEFAULT_AUDIO_DURATION_SCALE))
+        self._web_result_count_scale   = float(section.get("web_result_count_scale", DEFAULT_WEB_RESULT_COUNT_SCALE))
+        self._memo_balance_scale       = float(section.get("memo_balance_scale", DEFAULT_MEMO_BALANCE_SCALE))
+        self._code_depth_scale         = float(section.get("code_depth_scale", DEFAULT_CODE_DEPTH_SCALE))
+        self._speak_richness_threshold = int(section.get("speak_richness_threshold", DEFAULT_SPEAK_RICHNESS_THRESHOLD))
+
         self._decoders = {
             "art_generate": self._decode_art,
             "audio_generate": self._decode_audio,
@@ -62,6 +67,10 @@ class ActionDecoder:
             "coding_sandbox": self._decode_code,
         }
         self._total_decodes = 0
+
+    def _clamp_delta(self, d: float) -> float:
+        """Clamp a per-dimension delta to ±max_delta."""
+        return max(-self._max_delta, min(self._max_delta, d))
 
     def decode(self, action_type: str, result: dict) -> dict:
         """Convert an action result into outer Trinity dimension deltas.
@@ -107,24 +116,24 @@ class ActionDecoder:
 
         if success:
             # Creative act completed → body feels the creation
-            body_deltas[2] = _clamp_delta(0.03)       # somatosensation: felt the act of creating
-            body_deltas[4] = _clamp_delta(0.02)        # thermal: creative warmth
+            body_deltas[2] = self._clamp_delta(0.03)       # somatosensation: felt the act of creating
+            body_deltas[4] = self._clamp_delta(0.02)        # thermal: creative warmth
 
             # Mind registers creative output and exploration
-            mind_deltas[10] = _clamp_delta(0.04)       # action_throughput: action completed
-            mind_deltas[12] = _clamp_delta(0.05)       # creative_output: art produced
-            mind_deltas[14] = _clamp_delta(0.02)       # exploration_drive: reinforced
+            mind_deltas[10] = self._clamp_delta(0.04)       # action_throughput: action completed
+            mind_deltas[12] = self._clamp_delta(0.05)       # creative_output: art produced
+            mind_deltas[14] = self._clamp_delta(0.02)       # exploration_drive: reinforced
 
             # Extract any color/style hints from result text
             if "warm" in result_text.lower():
-                body_deltas[4] = _clamp_delta(0.04)    # warmer creation
+                body_deltas[4] = self._clamp_delta(0.04)    # warmer creation
                 features["warmth"] = "warm"
             elif "cool" in result_text.lower() or "cold" in result_text.lower():
-                body_deltas[4] = _clamp_delta(-0.02)   # cooler creation
+                body_deltas[4] = self._clamp_delta(-0.02)   # cooler creation
                 features["warmth"] = "cool"
         else:
             # Failed creation → mild frustration signal
-            mind_deltas[12] = _clamp_delta(-0.02)      # creative_output: didn't produce
+            mind_deltas[12] = self._clamp_delta(-0.02)      # creative_output: didn't produce
             features["warmth"] = "none"
 
         return {"outer_body_deltas": body_deltas, "outer_mind_deltas": mind_deltas,
@@ -143,13 +152,13 @@ class ActionDecoder:
 
         if success:
             # Sound production → body rhythm + proprioception
-            body_deltas[1] = _clamp_delta(0.03)        # proprioception: spatial sound sense
-            body_deltas[4] = _clamp_delta(0.02)         # thermal: sound energy as warmth
+            body_deltas[1] = self._clamp_delta(0.03)        # proprioception: spatial sound sense
+            body_deltas[4] = self._clamp_delta(0.02)         # thermal: sound energy as warmth
 
             # Mind: creative output + environmental rhythm contribution
-            mind_deltas[8] = _clamp_delta(0.03)         # Feeling: environmental_rhythm (from new sound)
-            mind_deltas[10] = _clamp_delta(0.03)        # action_throughput
-            mind_deltas[12] = _clamp_delta(0.04)        # creative_output
+            mind_deltas[8] = self._clamp_delta(0.03)         # Feeling: environmental_rhythm (from new sound)
+            mind_deltas[10] = self._clamp_delta(0.03)        # action_throughput
+            mind_deltas[12] = self._clamp_delta(0.04)        # creative_output
 
             # Extract duration if present
             dur_match = re.search(r"(\d+\.?\d*)\s*s", result_text)
@@ -157,9 +166,9 @@ class ActionDecoder:
                 duration = float(dur_match.group(1))
                 features["duration"] = duration
                 # Longer pieces contribute more rhythm
-                mind_deltas[8] = _clamp_delta(0.02 + min(0.04, duration / AUDIO_DURATION_SCALE))
+                mind_deltas[8] = self._clamp_delta(0.02 + min(0.04, duration / self._audio_duration_scale))
         else:
-            mind_deltas[12] = _clamp_delta(-0.01)
+            mind_deltas[12] = self._clamp_delta(-0.01)
 
         return {"outer_body_deltas": body_deltas, "outer_mind_deltas": mind_deltas,
                 "features": features}
@@ -181,18 +190,18 @@ class ActionDecoder:
             features["result_count"] = result_count
 
             # Information flow → mind Thinking + Feeling
-            mind_deltas[0] = _clamp_delta(0.04)         # research_effectiveness
-            mind_deltas[1] = _clamp_delta(0.02)         # knowledge_retrieval
-            mind_deltas[9] = _clamp_delta(                # Feeling: external_info_flow
-                0.02 + min(0.04, result_count / WEB_RESULT_COUNT_SCALE))
-            mind_deltas[14] = _clamp_delta(0.03)        # exploration_drive reinforced
+            mind_deltas[0] = self._clamp_delta(0.04)         # research_effectiveness
+            mind_deltas[1] = self._clamp_delta(0.02)         # knowledge_retrieval
+            mind_deltas[9] = self._clamp_delta(                # Feeling: external_info_flow
+                0.02 + min(0.04, result_count / self._web_result_count_scale))
+            mind_deltas[14] = self._clamp_delta(0.03)        # exploration_drive reinforced
 
             # Extract query words for vocabulary encounter
             query_match = re.search(r"for '([^']+)'", result_text)
             if query_match:
                 features["query"] = query_match.group(1)
         else:
-            mind_deltas[0] = _clamp_delta(-0.01)        # research less effective
+            mind_deltas[0] = self._clamp_delta(-0.01)        # research less effective
             features["result_count"] = 0
 
         return {"outer_body_deltas": body_deltas, "outer_mind_deltas": mind_deltas,
@@ -210,22 +219,22 @@ class ActionDecoder:
 
         if success:
             # Social connection felt
-            mind_deltas[5] = _clamp_delta(0.04)         # Feeling: social_temperature
-            mind_deltas[6] = _clamp_delta(0.03)         # Feeling: community_resonance
-            mind_deltas[11] = _clamp_delta(0.04)        # Willing: social_initiative
-            mind_deltas[10] = _clamp_delta(0.02)        # action_throughput
+            mind_deltas[5] = self._clamp_delta(0.04)         # Feeling: social_temperature
+            mind_deltas[6] = self._clamp_delta(0.03)         # Feeling: community_resonance
+            mind_deltas[11] = self._clamp_delta(0.04)        # Willing: social_initiative
+            mind_deltas[10] = self._clamp_delta(0.02)        # action_throughput
 
             # Detect if it was a reply (higher social engagement)
             if "Replied" in result_text:
-                mind_deltas[6] = _clamp_delta(0.05)     # stronger community resonance
+                mind_deltas[6] = self._clamp_delta(0.05)     # stronger community resonance
                 features["interaction_type"] = "reply"
             elif "Posted" in result_text:
                 features["interaction_type"] = "post"
             elif "Found" in result_text:
                 features["interaction_type"] = "search"
-                mind_deltas[9] = _clamp_delta(0.03)     # external info flow
+                mind_deltas[9] = self._clamp_delta(0.03)     # external info flow
         else:
-            mind_deltas[5] = _clamp_delta(-0.01)        # social temperature drops slightly
+            mind_deltas[5] = self._clamp_delta(-0.01)        # social temperature drops slightly
 
         return {"outer_body_deltas": body_deltas, "outer_mind_deltas": mind_deltas,
                 "features": features}
@@ -241,23 +250,23 @@ class ActionDecoder:
 
         if success:
             # Physical world responsiveness — tx confirmed
-            body_deltas[0] = _clamp_delta(0.04)         # interoception: energy flow (SOL spent)
-            body_deltas[3] = _clamp_delta(-0.02)        # entropy decreases: state anchored
-            body_deltas[4] = _clamp_delta(0.02)         # thermal: blockchain pulse
+            body_deltas[0] = self._clamp_delta(0.04)         # interoception: energy flow (SOL spent)
+            body_deltas[3] = self._clamp_delta(-0.02)        # entropy decreases: state anchored
+            body_deltas[4] = self._clamp_delta(0.02)         # thermal: blockchain pulse
 
             # Mind registers grounding
-            mind_deltas[2] = _clamp_delta(0.02)         # situational_awareness
-            mind_deltas[10] = _clamp_delta(0.03)        # action_throughput
+            mind_deltas[2] = self._clamp_delta(0.02)         # situational_awareness
+            mind_deltas[10] = self._clamp_delta(0.03)        # action_throughput
 
             # Extract balance info if available
             balance = result.get("balance")
             if balance is not None:
                 features["balance"] = balance
                 # Balance health signal
-                body_deltas[0] = _clamp_delta(
-                    0.02 + min(0.04, balance / MEMO_BALANCE_SCALE))
+                body_deltas[0] = self._clamp_delta(
+                    0.02 + min(0.04, balance / self._memo_balance_scale))
         else:
-            body_deltas[3] = _clamp_delta(0.02)         # entropy increases: anchor failed
+            body_deltas[3] = self._clamp_delta(0.02)         # entropy increases: anchor failed
 
         return {"outer_body_deltas": body_deltas, "outer_mind_deltas": mind_deltas,
                 "features": features}
@@ -275,22 +284,22 @@ class ActionDecoder:
 
         if success:
             # Self-observation → Mind Thinking
-            mind_deltas[2] = _clamp_delta(0.03)         # situational_awareness
-            mind_deltas[3] = _clamp_delta(0.02)         # problem_solving
+            mind_deltas[2] = self._clamp_delta(0.03)         # situational_awareness
+            mind_deltas[3] = self._clamp_delta(0.02)         # problem_solving
 
             # Text length indicates depth of observation
             text_len = len(result_text)
             features["text_length"] = text_len
-            depth_signal = min(1.0, text_len / CODE_DEPTH_SCALE)
-            mind_deltas[1] = _clamp_delta(0.01 + 0.03 * depth_signal)  # knowledge_retrieval
+            depth_signal = min(1.0, text_len / self._code_depth_scale)
+            mind_deltas[1] = self._clamp_delta(0.01 + 0.03 * depth_signal)  # knowledge_retrieval
 
             # Body: proprioception from structural awareness
             if enrichment.get("body"):
-                body_deltas[1] = _clamp_delta(0.02)     # proprioception: body awareness
+                body_deltas[1] = self._clamp_delta(0.02)     # proprioception: body awareness
 
-            mind_deltas[14] = _clamp_delta(0.02)        # exploration_drive
+            mind_deltas[14] = self._clamp_delta(0.02)        # exploration_drive
         else:
-            mind_deltas[3] = _clamp_delta(-0.01)
+            mind_deltas[3] = self._clamp_delta(-0.01)
 
         return {"outer_body_deltas": body_deltas, "outer_mind_deltas": mind_deltas,
                 "features": features}
@@ -312,12 +321,12 @@ class ActionDecoder:
                 idx = int(dim_idx)
                 if 0 <= idx < 5:
                     # Convert absolute value to small delta toward that value
-                    body_deltas[idx] = _clamp_delta((val - 0.5) * 0.1)
+                    body_deltas[idx] = self._clamp_delta((val - 0.5) * 0.1)
                     features[f"body_{idx}"] = val
 
-            mind_deltas[2] = _clamp_delta(0.02)         # situational_awareness
+            mind_deltas[2] = self._clamp_delta(0.02)         # situational_awareness
         elif success:
-            mind_deltas[2] = _clamp_delta(0.01)
+            mind_deltas[2] = self._clamp_delta(0.01)
 
         return {"outer_body_deltas": body_deltas, "outer_mind_deltas": mind_deltas,
                 "features": features}
@@ -334,17 +343,17 @@ class ActionDecoder:
 
         if success and result_text:
             # Hearing own voice (outer path)
-            mind_deltas[4] = _clamp_delta(0.03)         # communication_clarity
-            mind_deltas[10] = _clamp_delta(0.03)        # action_throughput
-            mind_deltas[12] = _clamp_delta(0.02)        # creative_output
+            mind_deltas[4] = self._clamp_delta(0.03)         # communication_clarity
+            mind_deltas[10] = self._clamp_delta(0.03)        # action_throughput
+            mind_deltas[12] = self._clamp_delta(0.02)        # creative_output
 
             # Word count as richness measure
             word_count = len(result_text.split())
             features["word_count"] = word_count
-            if word_count > SPEAK_RICHNESS_THRESHOLD:
-                mind_deltas[4] = _clamp_delta(0.05)     # richer expression → clearer voice
+            if word_count > self._speak_richness_threshold:
+                mind_deltas[4] = self._clamp_delta(0.05)     # richer expression → clearer voice
         else:
-            mind_deltas[4] = _clamp_delta(-0.01)
+            mind_deltas[4] = self._clamp_delta(-0.01)
 
         return {"outer_body_deltas": body_deltas, "outer_mind_deltas": mind_deltas,
                 "features": features}
@@ -398,7 +407,7 @@ class ActionDecoder:
         features = {"success": success, "generic": True}
         mind_deltas = {}
         if success:
-            mind_deltas[10] = _clamp_delta(0.02)        # action_throughput
+            mind_deltas[10] = self._clamp_delta(0.02)        # action_throughput
         return {"outer_body_deltas": {}, "outer_mind_deltas": mind_deltas,
                 "features": features}
 

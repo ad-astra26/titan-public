@@ -159,6 +159,9 @@ class SelfProfile:
 
 # ── Self-Reasoning Engine ────────────────────────────────────────────
 
+# PERSISTENCE_BY_DESIGN: SelfReasoningEngine._active_predictions is the
+# in-flight prediction queue — loaded from the self-HAOV store on boot but
+# maintained via dict mutation rather than self-assignment the scanner sees.
 class SelfReasoningEngine:
     """Introspective cognition — Titan's thermometer for self-knowledge.
 

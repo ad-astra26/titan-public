@@ -294,6 +294,40 @@ class MetaWisdomStore:
                 imported += 1
         return imported
 
+    def prune_to_cap(self, max_entries: int = 500) -> int:
+        """Prune low-confidence wisdom to prevent embedding space saturation.
+
+        Keeps the top *max_entries* by confidence, deleting the rest.
+        Crystallized entries get a 0.2 confidence bonus for ranking.
+        Returns the number of entries deleted.
+        """
+        try:
+            db = self._get_db()
+            total = db.execute("SELECT COUNT(*) FROM meta_wisdom").fetchone()[0]
+            if total <= max_entries:
+                db.close()
+                return 0
+            # Keep highest effective confidence (crystallized get bonus)
+            # Use ROWID ordering as tiebreaker to prefer newer entries
+            db.execute("""
+                DELETE FROM meta_wisdom WHERE id NOT IN (
+                    SELECT id FROM meta_wisdom
+                    ORDER BY (confidence + CASE WHEN crystallized = 1 THEN 0.2 ELSE 0.0 END) DESC,
+                             id DESC
+                    LIMIT ?
+                )
+            """, (max_entries,))
+            deleted = db.execute("SELECT changes()").fetchone()[0]
+            db.commit()
+            db.close()
+            if deleted > 0:
+                logger.info("[MetaWisdom] Pruned %d entries (kept top %d by confidence, was %d)",
+                            deleted, max_entries, total)
+            return deleted
+        except Exception as e:
+            logger.warning("[MetaWisdom] Prune error: %s", e)
+            return 0
+
     def get_stats(self) -> dict:
         try:
             db = self._get_db()

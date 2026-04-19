@@ -69,6 +69,10 @@ METABOLIC_COSTS = {
 NEUROMOD_PRESSURE_RATE = 0.00045
 
 
+# PERSISTENCE_BY_DESIGN: Neuromodulator._peak_level / _trough_level are
+# dynamic observability metrics that recompute from the live level stream;
+# restoring them from stale disk state would be misleading. Only level /
+# tonic / sensitivity / setpoint are restored via restore_state.
 class Neuromodulator:
     """A single neuromodulator with self-regulating dynamics.
 
@@ -233,6 +237,10 @@ class Neuromodulator:
         self.setpoint = state.get("setpoint", self.setpoint)
 
 
+# PERSISTENCE_BY_DESIGN: NeuromodulatorSystem._total_evaluations is a
+# cumulative observability counter. Saved for debugging (in get_state) but
+# reset on boot is acceptable — the live neuromod levels themselves are
+# what actually persist.
 class NeuromodulatorSystem:
     """Manages all 6 neuromodulators with cross-coupling and emotion detection."""
 

@@ -178,7 +178,8 @@ fi
 LOG_SIZE=$(stat -c%s "$BRAIN_LOG" 2>/dev/null || echo 0)
 if [ "$LOG_SIZE" -gt 104857600 ]; then
     echo "[$NOW] Rotating brain log ($LOG_SIZE bytes)..."
-    mv "$BRAIN_LOG" "${BRAIN_LOG}.${DAY_STAMP}"
+    cp "$BRAIN_LOG" "${BRAIN_LOG}.${DAY_STAMP}"
+    : > "$BRAIN_LOG"  # truncate in-place (preserves running process fd with O_APPEND)
     gzip "${BRAIN_LOG}.${DAY_STAMP}" 2>/dev/null &
     echo "[$NOW] Log rotated"
 fi

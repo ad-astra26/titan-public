@@ -37,21 +37,29 @@ MIND_STATE = "MIND_STATE"
 SPIRIT_STATE = "SPIRIT_STATE"
 
 # Sense data (event-driven)
+# RESERVED: SENSE_INPUT is the generic superclass type — specific channels
+# (SENSE_VISUAL / SENSE_AUDIO) are what's actually published today.
 SENSE_INPUT = "SENSE_INPUT"
 SENSE_VISUAL = "SENSE_VISUAL"
 SENSE_AUDIO = "SENSE_AUDIO"
 
 # Counterpart messages
 FOCUS_NUDGE = "FOCUS_NUDGE"
+# LEGACY:INTUITION_SUGGEST/OUTCOME + FILTER_DOWN (V3) are v1 names.
+# Active intuition path: direct IntuitionEngine.suggest/record_outcome calls
+# from spirit_worker. Active filter-down path: FILTER_DOWN_V5.
 INTUITION_SUGGEST = "INTUITION_SUGGEST"
-INTUITION_OUTCOME = "INTUITION_OUTCOME"
-FILTER_DOWN = "FILTER_DOWN"
+INTUITION_OUTCOME = "INTUITION_OUTCOME"  # LEGACY:
+FILTER_DOWN = "FILTER_DOWN"              # LEGACY:
 
 # Interface messages (Step 5: human ↔ digital plane)
 INTERFACE_INPUT = "INTERFACE_INPUT"
 
 # Agency messages (Step 7: autonomous impulse → action)
 IMPULSE = "IMPULSE"
+# RESERVED: INTENT was designed as an intermediate stage between IMPULSE and
+# ACTION_RESULT; current pipeline goes straight IMPULSE → action → ACTION_RESULT.
+# Kept as reserved hook-point for future two-phase agency (impulse→intent→action).
 INTENT = "INTENT"
 ACTION_RESULT = "ACTION_RESULT"
 RATE_LIMIT = "RATE_LIMIT"
@@ -66,10 +74,14 @@ EPOCH_TICK = "EPOCH_TICK"
 # Disk health — edge-detected state transitions only (never continuous
 # telemetry). Published by DiskHealthMonitor when free-space crosses
 # hysteresis-protected thresholds. EMERGENCY triggers Guardian.stop_all.
+# RESERVED: DiskHealthMonitor class exists but is not instantiated in the
+# current boot path — constants are reserved for when the monitor is wired.
 DISK_WARNING = "DISK_WARNING"
 DISK_CRITICAL = "DISK_CRITICAL"
 DISK_EMERGENCY = "DISK_EMERGENCY"
 DISK_RECOVERED = "DISK_RECOVERED"  # emitted when state improves back to HEALTHY
+# RESERVED: RL_CYCLE_REQUEST + ANCHOR_REQUEST — reserved hook points for
+# offline IQL cycle scheduling and on-chain anchor scheduler (not yet wired).
 RL_CYCLE_REQUEST = "RL_CYCLE_REQUEST"
 ANCHOR_REQUEST = "ANCHOR_REQUEST"
 
@@ -79,6 +91,9 @@ OUTER_OBSERVATION = "OUTER_OBSERVATION"  # Action result → Spirit worker obser
 
 # Hot-Reload (Tier 2)
 RELOAD = "RELOAD"          # Request worker module reload
+# RESERVED: RELOAD_COMPLETE — workers currently confirm via MODULE_READY
+# after restart instead of a separate COMPLETE signal. Kept for future
+# two-phase reload protocol (request → confirm distinct from ready).
 RELOAD_COMPLETE = "RELOAD_COMPLETE"  # Worker confirms reload success
 CONFIG_RELOAD = "CONFIG_RELOAD"  # Hot-reload titan_params.toml without restart
 
@@ -87,12 +102,18 @@ OUTER_TRINITY_STATE = "OUTER_TRINITY_STATE"
 SPHERE_PULSE = "SPHERE_PULSE"
 BIG_PULSE = "BIG_PULSE"
 GREAT_PULSE = "GREAT_PULSE"
+# LEGACY:FILTER_DOWN_V4 superseded by FILTER_DOWN_V5 (162D TITAN_SELF).
+# V4 FilterDown engine is still instantiated for back-compat but the bus
+# message type is no longer published — V5 carries the live multipliers.
 FILTER_DOWN_V4 = "FILTER_DOWN_V4"
 
 # V4 Sovereign Reflex Arc messages
 CONVERSATION_STIMULUS = "CONVERSATION_STIMULUS"  # chat → workers (input features)
-REFLEX_SIGNAL = "REFLEX_SIGNAL"                  # workers → collector (Intuition signals)
-REFLEX_RESULT = "REFLEX_RESULT"                  # collector → consciousness (fired reflexes)
+# LEGACY:REFLEX_SIGNAL + REFLEX_RESULT were the v1 reflex arc carrier types.
+# Current path: TitanVM evaluates reflexes inline and emits REFLEX_REWARD
+# directly to FilterDown. Kept for future multi-worker reflex arbitration.
+REFLEX_SIGNAL = "REFLEX_SIGNAL"                  # LEGACY:workers → collector (Intuition signals)
+REFLEX_RESULT = "REFLEX_RESULT"                  # LEGACY:collector → consciousness (fired reflexes)
 REFLEX_REWARD = "REFLEX_REWARD"                  # TitanVM → FilterDown (interaction reward score)
 STATE_SNAPSHOT = "STATE_SNAPSHOT"                  # StateRegister → Spirit (full 30DT for enrichment)
 OBSERVABLES_SNAPSHOT = "OBSERVABLES_SNAPSHOT"      # spirit → state_register (rFP #1: 30D space topology + dict)
@@ -104,6 +125,9 @@ DREAM_STATE_CHANGED = "DREAM_STATE_CHANGED"  # spirit → all (sleep/wake transi
 DREAM_WAKE_REQUEST = "DREAM_WAKE_REQUEST"    # chat_api → spirit (maker gentle wake)
 
 # M8: External Intent (wallet observer → spirit → neuromod boost)
+# RESERVED: EXTERNAL_INTENT — WalletObserver helper class exists but
+# polling loop not yet wired into boot. Donation → neuromod boost path
+# awaits wallet_observer spawn site (tracked in mainnet master plan M8).
 EXTERNAL_INTENT = "EXTERNAL_INTENT"              # wallet_observer → spirit (DI/I/donation)
 
 # Observatory V2: real-time frontend events (spirit → v4_bridge → WebSocket)
@@ -130,6 +154,9 @@ META_CGN_SIGNAL = "META_CGN_SIGNAL"
 # Bus backpressure — edge-detected when worker queue depths cross > 30%
 # (enter) or < 20% (exit) threshold. Published by BusHealthMonitor only on
 # state transitions. Respects bus-clean invariant (discrete events only).
+# RESERVED: BusHealthMonitor.update_queue_depths is defined but currently
+# unused (also surfaced in orphan list). Constant reserved for when the
+# monitor's periodic sample loop is wired.
 BUS_BACKPRESSURE = "BUS_BACKPRESSURE"
 
 
@@ -463,10 +490,16 @@ def emit_meta_cgn_signal(
     if reason is not None:
         payload["reason"] = str(reason)[:120]
 
+    # dst="spirit": META_CGN_SIGNAL is consumed by handle_cross_consumer_signal
+    # at spirit_worker.py:8526, which runs inside the "spirit" subprocess
+    # (meta_engine + _meta_cgn live there). No module is registered as "meta",
+    # so dst="meta" silently dropped at DivineBus.publish (routing step).
+    # Caught 2026-04-19: 14k+ emissions observed by Guardian drain but
+    # signals_received=0 on meta_cgn — see HAOV signal-starvation fix.
     msg = {
         "type": META_CGN_SIGNAL,
         "src": src,
-        "dst": "meta",
+        "dst": "spirit",
         "ts": now,
         "rid": None,
         "payload": payload,

@@ -85,6 +85,8 @@ class ExperientialMemory:
         self._conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA cache_size = -4000")    # 4MB cap (small DB)
+        self._conn.execute("PRAGMA synchronous = NORMAL")
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
         # rFP #3 Phase 4: config-ified recall similarity floor

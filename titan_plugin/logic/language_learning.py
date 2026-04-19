@@ -85,6 +85,9 @@ def _flatten_perturbation(perturbation: dict) -> list:
     return flat
 
 
+# PERSISTENCE_BY_DESIGN: LanguageLearningExperience._word_data is loaded
+# from the vocabulary SQLite DB at init (via conn.execute("SELECT ...")
+# followed by dict-mutation). DB is the source of truth.
 class LanguageLearningExperience(ExperiencePlugin):
     """Titan learns words through felt-meaning association.
 

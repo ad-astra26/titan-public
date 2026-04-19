@@ -619,6 +619,9 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
 
         # ── QUERY — stats and diagnostics ─────────────────────────
         elif msg_type == "QUERY":
+            from titan_plugin.core.profiler import handle_memory_profile_query
+            if handle_memory_profile_query(msg, send_queue, name):
+                continue
             action = payload.get("action", "")
             if action == "get_knowledge_stats":
                 stats = _get_stats(db_path, _stats)

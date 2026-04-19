@@ -432,6 +432,9 @@ class CodingInterpreter(DomainInterpreter):
 
 # ── Interpreter Registry ──────────────────────────────────────────
 
+# PERSISTENCE_BY_DESIGN: InterpreterRegistry._interpreters is the plugin
+# dispatch table populated by explicit register() calls at boot. Not
+# state to persist — re-registered every run from code, not disk.
 class InterpreterRegistry:
     """Registry for domain interpreters. Pluggable — add new domains without core changes."""
 

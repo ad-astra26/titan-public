@@ -526,6 +526,9 @@ class EventsTeacherDB:
 # Events Teacher
 # ═══════════════════════════════════════════════════════════════════════
 
+# PERSISTENCE_BY_DESIGN: EventsTeacher._last_run_time (runtime schedule
+# tracking) + _follower_rotation_idx (rotation cursor) are ephemeral state
+# that resets on boot — no correctness impact from losing them.
 class EventsTeacher:
     """Distills X timeline content into felt experience for Titans."""
 
@@ -1417,6 +1420,31 @@ class EventsTeacher:
                 self._db.window_complete(window_id, result)
             self._log_telemetry(result)
             self.save_state()
+
+            # ── COMPLETE-4-EVENTS (2026-04-19): emit META_EVENT_REWARD ──
+            # Signal per-window quality to meta-reasoning's chain_iql via
+            # cross-system reward wiring (third worker after Language +
+            # Persona). Quality = events_stored / items_distilled when
+            # distillation happened; skip entirely on empty windows so we
+            # don't starve the Q-net with noise.
+            try:
+                if result.items_distilled > 0:
+                    _et_quality = max(0.0, min(1.0,
+                        result.events_stored / max(1, result.items_distilled)))
+                    import httpx
+                    httpx.post(
+                        f"{api_base}/v4/meta-reasoning/event-reward",
+                        json={
+                            "quality": _et_quality,
+                            "window_number": result.window_number,
+                            "titan_id": titan_id,
+                        },
+                        timeout=3.0,
+                    )
+            except Exception as _et_rwd_err:
+                logger.debug("[EventsTeacher] META_EVENT_REWARD emit "
+                             "failed: %s", _et_rwd_err)
+
             return result
 
         except Exception as exc:

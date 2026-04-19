@@ -423,6 +423,9 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
         # ── QUERY — stats and diagnostics ─────────────────────────
         elif msg_type == "QUERY":
+            from titan_plugin.core.profiler import handle_memory_profile_query
+            if handle_memory_profile_query(msg, send_queue, name):
+                continue
             action = payload.get("action", "")
             if action == "get_stats":
                 cgn_stats = cgn.get_stats()

@@ -466,13 +466,17 @@ def load_nervous_system_programs(program_names: list[str] | None = None) -> dict
 class NervousSystem:
     """Dispatches TitanVM micro-programs based on observable state."""
 
-    def __init__(self, vm: Optional[TitanVM] = None):
+    def __init__(self, vm: Optional[TitanVM] = None, config: Optional[dict] = None):
         """
         Args:
             vm: TitanVM instance. If None, creates a lightweight one
                 without state_register (programs use context only).
+            config: Optional dict passed to TitanVM (usually the parsed
+                [titan_vm] section from titan_params.toml). Ignored when a
+                pre-built ``vm`` is supplied. Plumbed 2026-04-16 so the toml
+                section actually reaches the VM — previously stranded.
         """
-        self.vm = vm or TitanVM()
+        self.vm = vm or TitanVM(config=config)
         self.programs = load_nervous_system_programs()
         self._last_signals: list[dict] = []
         self._total_evaluations: int = 0

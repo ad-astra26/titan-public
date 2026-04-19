@@ -39,6 +39,10 @@ _MEMPOOL_KEEP_THRESHOLD = 0.3  # between prune and this → keep but don't promo
 _MEMPOOL_PROMOTE_SCORE = 40.0  # LLM score threshold for promotion (was 50 batch-avg)
 
 
+# PERSISTENCE_BY_DESIGN: TieredMemoryGraph._duckdb is a database-connection
+# object reference rebuilt on boot; _next_id is reloaded from disk via
+# direct DuckDB query (MAX(id)+1) rather than via self-assignment, which
+# the AST scanner doesn't recognize as a load.
 class TieredMemoryGraph:
     """
     Manages the memory graph system, implementing tiered persistence (mempool vs persistent)

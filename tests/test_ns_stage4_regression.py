@@ -240,3 +240,189 @@ class TestZScoreNormalization:
         z_outlier = nns._z_normalize_reward("TEST_A", 1.0)
         assert z_outlier > 1.5, f"Outlier should produce high z, got {z_outlier}"
         assert z_outlier <= 3.0, "Should be clipped at +3"
+
+
+# ── 2026-04-19 _compute_targets refactor (autonomous-collapse fix) ──
+# Locks in the residual-learning formula that replaced the discrete-case
+# classifier. These tests would have caught the sigmoid(-10) collapse.
+
+
+class TestResidualTargetFormula:
+    def _ns(self, tmp_path):
+        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        return NeuralNervousSystem(
+            config=_make_test_config(1),
+            data_dir=str(tmp_path), vm_nervous_system=None)
+
+    def test_zero_reward_preserves_current_urgency(self, tmp_path):
+        """r=0 → target = urgency (no collapse pressure when no signal)."""
+        nns = self._ns(tmp_path)
+        urgencies = np.array([0.3, 0.5, 0.7])
+        rewards = np.array([0.0, 0.0, 0.0])
+        fired = np.array([False, True, False])
+        targets = nns._compute_targets(
+            vm_baselines=np.zeros(3), rewards=rewards,
+            fired=fired, urgencies=urgencies,
+            supervision_weight=0.0)  # autonomous phase
+        np.testing.assert_allclose(targets, urgencies, atol=1e-6)
+
+    def test_positive_reward_bumps_target_up(self, tmp_path):
+        """Positive reward + fired → target climbs above current urgency."""
+        nns = self._ns(tmp_path)
+        urgencies = np.array([0.3])
+        rewards = np.array([1.0])
+        fired = np.array([True])
+        targets = nns._compute_targets(
+            vm_baselines=np.zeros(1), rewards=rewards,
+            fired=fired, urgencies=urgencies, supervision_weight=0.0)
+        assert targets[0] > urgencies[0], (
+            f"Positive reward didn't bump target: {urgencies[0]} → {targets[0]}")
+        # Bounded by fire_gain via tanh
+        assert targets[0] <= urgencies[0] + nns._nn_target_fire_gain + 1e-6
+
+    def test_negative_reward_pushes_target_down(self, tmp_path):
+        """Negative reward + fired → target drops below current urgency
+        (the prior discrete formula silently lost negative-reward signal)."""
+        nns = self._ns(tmp_path)
+        urgencies = np.array([0.5])
+        rewards = np.array([-1.0])
+        fired = np.array([True])
+        targets = nns._compute_targets(
+            vm_baselines=np.zeros(1), rewards=rewards,
+            fired=fired, urgencies=urgencies, supervision_weight=0.0)
+        assert targets[0] < urgencies[0], (
+            f"Negative reward didn't discourage: {urgencies[0]} → {targets[0]}")
+
+    def test_fired_has_stronger_gain_than_not_fired(self, tmp_path):
+        """Same reward magnitude: fired transitions shift more than not-fired
+        (fire means the NN's decision caused the outcome)."""
+        nns = self._ns(tmp_path)
+        urgencies = np.array([0.3, 0.3])
+        rewards = np.array([1.0, 1.0])
+        fired = np.array([True, False])
+        targets = nns._compute_targets(
+            vm_baselines=np.zeros(2), rewards=rewards,
+            fired=fired, urgencies=urgencies, supervision_weight=0.0)
+        assert targets[0] > targets[1], (
+            "Fired gain not stronger than not-fired gain")
+
+    def test_sparse_reward_regression_no_collapse(self, tmp_path):
+        """Regression: 98%+ reward=0 transitions must NOT drive targets to 0.
+        Prior discrete formula: all r=0 → target=0 → NN collapse to
+        sigmoid(-10) = 4.5e-05. Residual formula keeps target = urgency."""
+        nns = self._ns(tmp_path)
+        n = 100
+        urgencies = np.full(n, 0.4)  # Current healthy urgency
+        rewards = np.zeros(n)
+        rewards[0] = 0.8  # Single sparse positive reward
+        fired = np.zeros(n, dtype=bool)
+        fired[0] = True
+        targets = nns._compute_targets(
+            vm_baselines=np.zeros(n), rewards=rewards,
+            fired=fired, urgencies=urgencies, supervision_weight=0.0)
+        # 99 non-reward transitions preserve urgency (no collapse toward 0)
+        np.testing.assert_allclose(targets[1:], 0.4, atol=1e-6)
+        # The 1 positive signal raises its target
+        assert targets[0] > 0.4
+
+    def test_tanh_bounds_extreme_rewards(self, tmp_path):
+        """Very large |r| doesn't cause target spike beyond ±gain —
+        tanh saturates smoothly."""
+        nns = self._ns(tmp_path)
+        urgencies = np.array([0.5])
+        rewards = np.array([100.0])  # Extreme outlier
+        fired = np.array([True])
+        targets = nns._compute_targets(
+            vm_baselines=np.zeros(1), rewards=rewards,
+            fired=fired, urgencies=urgencies, supervision_weight=0.0)
+        # Should cap at urgency + fire_gain (tanh(100) ≈ 1.0)
+        expected_cap = min(1.0, 0.5 + nns._nn_target_fire_gain)
+        assert abs(targets[0] - expected_cap) < 1e-6
+
+    def test_warmup_phase_still_uses_vm_supervision(self, tmp_path):
+        """During warmup (supervision_weight=1.0), VM baseline dominates —
+        outcome component is fully suppressed."""
+        nns = self._ns(tmp_path)
+        urgencies = np.array([0.1])  # Low urgency
+        rewards = np.array([1.0])  # High reward
+        fired = np.array([True])
+        vm_baselines = np.array([0.7])  # VM says 0.7
+        targets = nns._compute_targets(
+            vm_baselines=vm_baselines, rewards=rewards, fired=fired,
+            urgencies=urgencies, supervision_weight=1.0)
+        np.testing.assert_allclose(targets, vm_baselines)
+
+
+# ── 2026-04-19 Sigmoid-trap liberation (residual-learning rescue) ──
+# Residual target formula alone can't escape sigmoid saturation because
+# σ'(−10) ≈ 4.5e-5 makes gradients vanishingly small. Liberation resets
+# the output layer when saved b3 indicates saturation.
+
+
+class TestSigmoidTrapLiberation:
+    def _ns(self, tmp_path):
+        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        return NeuralNervousSystem(
+            config=_make_test_config(1),
+            data_dir=str(tmp_path), vm_nervous_system=None)
+
+    def test_liberation_resets_saturated_output_layer(self, tmp_path):
+        """Program with b3 < -5 gets w3 + b3 reset; escape sigmoid trap."""
+        nns = self._ns(tmp_path)
+        net = nns.programs["TEST_A"]
+        # Simulate saturation: push b3 deeply negative
+        net.b3 = np.array([-10.0])
+        net.w3 = np.random.randn(net.hidden_2, 1) * 0.01  # near-dead weights
+        pre_b3 = float(net.b3[0])
+        pre_w3_std = float(np.std(net.w3))
+        # Trigger liberation
+        nns._liberate_saturated_output_layers()
+        assert float(net.b3[0]) == 0.0, (
+            f"b3 not zeroed: {net.b3[0]}")
+        # w3 should be reinitialized (std different from pre)
+        post_w3_std = float(np.std(net.w3))
+        assert post_w3_std != pre_w3_std, (
+            "w3 unchanged — reinit didn't happen")
+
+    def test_liberation_preserves_hidden_layers(self, tmp_path):
+        """Hidden layer weights (w1, w2, b1, b2) must NOT be touched —
+        they carry learned feature representations."""
+        nns = self._ns(tmp_path)
+        net = nns.programs["TEST_A"]
+        # Snapshot hidden layers
+        w1_pre = net.w1.copy()
+        w2_pre = net.w2.copy()
+        b1_pre = net.b1.copy()
+        b2_pre = net.b2.copy()
+        # Force saturation + liberate
+        net.b3 = np.array([-10.0])
+        nns._liberate_saturated_output_layers()
+        # Hidden layers unchanged
+        np.testing.assert_array_equal(net.w1, w1_pre)
+        np.testing.assert_array_equal(net.w2, w2_pre)
+        np.testing.assert_array_equal(net.b1, b1_pre)
+        np.testing.assert_array_equal(net.b2, b2_pre)
+
+    def test_liberation_idempotent_on_healthy_nn(self, tmp_path):
+        """Healthy NN (b3 near 0) passes through liberation unchanged."""
+        nns = self._ns(tmp_path)
+        net = nns.programs["TEST_A"]
+        # Fresh NN has b3 = 0 (Xavier init)
+        w3_pre = net.w3.copy()
+        b3_pre = net.b3.copy()
+        nns._liberate_saturated_output_layers()
+        np.testing.assert_array_equal(net.w3, w3_pre)
+        np.testing.assert_array_equal(net.b3, b3_pre)
+
+    def test_liberation_threshold_boundary(self, tmp_path):
+        """b3 = exactly −5 is not liberated (boundary case); b3 = −5.1 is."""
+        nns = self._ns(tmp_path)
+        net = nns.programs["TEST_A"]
+        # Exactly at boundary — not liberated
+        net.b3 = np.array([-5.0])
+        nns._liberate_saturated_output_layers()
+        assert float(net.b3[0]) == -5.0, "Boundary case (-5.0) was liberated"
+        # Just past boundary — liberated
+        net.b3 = np.array([-5.1])
+        nns._liberate_saturated_output_layers()
+        assert float(net.b3[0]) == 0.0, "b3=-5.1 should have been liberated"

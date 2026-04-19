@@ -174,6 +174,8 @@ class ConsciousnessDB:
         self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA cache_size = -16000")   # 16MB page cache cap (was unbounded on 2.9GB DB)
+        self._conn.execute("PRAGMA synchronous = NORMAL")  # WAL handles durability
         self._create_tables()
 
     def _create_tables(self):
@@ -581,6 +583,10 @@ class ConsciousnessLoop:
             if self._bus is not None:
                 try:
                     from titan_plugin.bus import make_msg, TITAN_SELF_STATE
+                    # INTENTIONAL_BROADCAST: rFP #2 Phase 4 consumes the 162D inline
+                    # (spirit_loop._post_epoch_v5_filter_down); broadcast retained for
+                    # future kin-protocol "I AM" emission + external dashboards
+                    # (DEFERRED: TITAN_SELF_STATE-CONSUMER-DECISION — Option C).
                     self._bus.publish(make_msg(
                         TITAN_SELF_STATE, "consciousness", "broadcast",
                         {

@@ -44,13 +44,20 @@ class ImpulseEngine:
         floor: float = 0.1,
         ceil: float = 0.7,
         cooldown_seconds: float = 300.0,
+        config: dict | None = None,
     ):
-        self._threshold = threshold
-        self._alpha = alpha
-        self._beta = beta
-        self._floor = floor
-        self._ceil = ceil
-        self._cooldown = cooldown_seconds
+        # Config overrides take precedence when provided; fall back to
+        # explicit kwargs (which themselves default to historical constants).
+        # Plumbed 2026-04-16 after dead-wiring audit surfaced [impulse] toml
+        # section was silently ignored (ctor always fell through to hardcoded
+        # defaults because spirit_worker._init_impulse_engine passed nothing).
+        cfg = config or {}
+        self._threshold = float(cfg.get("threshold_initial", threshold))
+        self._alpha = float(cfg.get("alpha_success", alpha))
+        self._beta = float(cfg.get("beta_failure", beta))
+        self._floor = float(cfg.get("threshold_floor", floor))
+        self._ceil = float(cfg.get("threshold_ceil", ceil))
+        self._cooldown = float(cfg.get("cooldown", cooldown_seconds))
 
         # State
         self._impulse_counter = 0

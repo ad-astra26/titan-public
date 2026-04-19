@@ -146,6 +146,9 @@ class MiniPolicyNet:
 
 # ── Mini Experience Buffer ───────────────────────────────────────────────────
 
+# PERSISTENCE_BY_DESIGN: MiniExperienceBuffer + MiniReasoner state
+# (_timestamps, _policy) is reconstructed from buffer+weights on load via
+# helper methods and shared-array indexing the AST scanner doesn't trace.
 class MiniExperienceBuffer:
     """FIFO buffer for mini-reasoner transitions.
 
@@ -426,6 +429,9 @@ class MiniReasoner(ABC):
 
 # ── Mini Reasoner Registry ──────────────────────────────────────────────────
 
+# PERSISTENCE_BY_DESIGN: MiniReasonerRegistry._reasoners is the auto-
+# discovery plugin table rebuilt from module scan every boot. Not state
+# to persist — re-registered from code, not disk.
 class MiniReasonerRegistry:
     """Auto-discovery registry for mini-reasoning modules.
 

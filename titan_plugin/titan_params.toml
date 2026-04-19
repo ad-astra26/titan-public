@@ -273,7 +273,12 @@ cold_start_floor_epochs = 2000
 # restart (TOML reads at boot).
 # Phase 6 (soak): false — V5 silent, V4 publishing
 # Phase 7+ (cutover): true — V5 publisher, V4 silent training
-publish_enabled = false
+# Flipped true 2026-04-16 after Fix A (spirit_loop compute_multipliers
+# in silent mode) unblocked Gate #9. T1 V5 showed max |Δ|=0.84 (42×
+# threshold), train_steps=7319, loss healthy 0.003-0.007. V4 separately
+# observed at train_steps=0 (never trained this run) — so pre-flip
+# filter_down was effectively no-op.
+publish_enabled = true
 
 
 # ─── FOCUS PID (Drift Correction Controller) ─────────────────────
@@ -498,7 +503,7 @@ weight_spirit = 1.2
 # Default heartbeat timeout (seconds)
 # Influences: how long before a silent module is declared dead
 # Affects: restart sensitivity
-heartbeat_timeout_default = 30.0
+heartbeat_timeout_default = 90.0
 
 # Spirit-specific heartbeat timeout (heavy V4 work)
 # Influences: Spirit tolerance for long operations
@@ -637,6 +642,16 @@ batch_size = 16
 save_every_n = 500
 keep_vm_parallel = true
 data_dir = "./data/neural_nervous_system"
+
+# ── Reward-modulated residual target gains (2026-04-19 fix) ──
+# _compute_targets in autonomous phase uses: target = urgency + tanh(r) * gain
+# where `gain` is fire_gain for fired transitions, nofire_gain otherwise.
+# Fires get stronger shift because the NN's decision caused the outcome;
+# not-fired transitions are passive observations. tanh bounds per-step shift.
+# Replaces prior discrete-case formula which drove NN to sigmoid(-10)
+# saturation on 98%+ reward-zero transitions.
+nn_target_fire_gain = 0.3
+nn_target_nofire_gain = 0.1
 
 # ─── MATURITY (Emergent Time — nervous system developmental capacity) ──
 # Maturity scales the nervous system's capacity to handle excitation.
@@ -781,7 +796,7 @@ min_chain_length = 6           # Raised 3→6 on 2026-04-16 — see TUNING-015 i
 # enough to COMMIT instead of ABANDON. Proper fix (dense intermediate
 # rewards) is tracked as rFP; this is the behavioral nudge to get data on
 # whether length or reward-shape is the binding constraint.
-confidence_threshold = 0.6     # Mind Willing commitment threshold
+confidence_threshold = 0.50    # Mind Willing commitment threshold (was 0.6 — lowered to break FORMULATE abandon cycle)
 save_dir = "./data/reasoning"
 
 # Policy network architecture
@@ -930,6 +945,38 @@ timechain_signals_enabled = true
 contract_signals_enabled = true
 chain_iql_enabled = true            # Sub-phase B (chain-level IQL hierarchy)
 cognitive_contracts_enabled = true  # Sub-phase C (3 cognitive contracts)
+# Task 4 transitional monoculture measures (mono_adj reward penalty).
+# Unsunset 2026-04-18: META-CGN V(s) not yet strong enough to replace
+# mono_adj. FORMULATE monoculture returned to 60% after sunset. Re-enable
+# until SOAR impasse detection in META-CGN provides autonomous correction.
+# 2026-04-19 rFP_cgn_keystone_completion COMPLETE-5: FLIPPED TRUE.
+# With chain_iql v2 LRU eviction + UCB1 exploration + E3 β-dispersion gate
+# unblocked (FIX-5), monoculture prevention is now autonomous. The -0.30
+# mono_adj reward penalty was fighting the organic gradient; with the new
+# machinery in place it becomes redundant and counter-productive. Re-enable
+# only if monoculture > 70% persists for ≥2h without any template growth.
+sunset_task4 = true
+
+# ── TUNING-017: monoculture + repeat decay controls ──
+# 2026-04-19 rFP_cgn_keystone_completion COMPLETE-5: SUNSET.
+# Both pressures replaced by chain_iql v2's UCB1 exploration. UCB gives
+# low-visit templates a sqrt(log(N)/n) bonus that principled-ly drives
+# diversity based on uncertainty, not hand-tuned magnitude thresholds.
+# Keeping the config keys present (magnitude=0, decay=0) so we can re-arm
+# quickly if regression observed — no code removed.
+inengine_mono_dominance_threshold = 0.55
+inengine_mono_pressure_magnitude = 0.0   # was 1.5 — sunset, UCB replaces
+inengine_mono_min_actions = 50
+
+# Consecutive-repeat decay: SUNSET. UCB bonus discourages repetition
+# principled-ly (repeated picks build visit count → UCB bonus shrinks
+# → low-visit alternatives win). No hardcoded repeat penalty needed.
+repeat_decay_per_step = 0.0   # was 1.5 — sunset
+repeat_decay_max = 0.0        # was 5.0 — sunset
+
+# SOAR repeat-impasse detection (extends D.2 impasse with primitive-loop awareness)
+soar_repeat_threshold = 3           # N consecutive same-primitive = repeat_stuck impasse
+soar_repeat_urgency = 0.8           # urgency (between declining=0.7 and stuck=0.9)
 
 # Subsystem signal cache TTL — wired in Sub-phase D (next session) when
 # meta_reasoning starts firing live TimeChain/Contract bus queries. The
@@ -938,7 +985,7 @@ cognitive_contracts_enabled = true  # Sub-phase C (3 cognitive contracts)
 
 # ── RECALL Compound — Inner Memory + TimeChain + Contracts ──
 # Range: 0.0 - 0.41
-recall_base = 0.08
+recall_base = 0.10                              # TUNING-017: 0.08→0.10, boost minority vs FORMULATE
 recall_inner_relevance_weight = 0.10        # FAISS sim score → reward
 recall_inner_source_entropy_weight = 0.05   # Shannon entropy of source diversity
 recall_kuzu_centrality_weight = 0.04        # graph centrality of recalled nodes
@@ -958,7 +1005,7 @@ formulate_solvability_weight = 0.04         # heuristic solvability
 
 # ── EVALUATE Compound — Reasoning state + TimeChain + Contracts ──
 # Range: 0.0 - 0.45
-evaluate_base = 0.08
+evaluate_base = 0.10                            # TUNING-017: 0.08→0.10, boost minority vs FORMULATE
 evaluate_info_gain_weight = 0.12            # |confidence_post - confidence_pre|
 evaluate_consistency_weight = 0.08          # agreement with delegate result
 evaluate_timechain_consistency_weight = 0.07 # prior evals consistency
@@ -969,7 +1016,7 @@ evaluate_timing_weight = 0.05               # midpoint sweet spot
 # Range: 0.0 - 0.43
 # NOTE: accuracy/deepening signals are stub until Sub-phase E (next session)
 # wires SELF_PROFILE dream consolidation.
-introspect_base = 0.08
+introspect_base = 0.10                          # TUNING-017: 0.08→0.10, boost minority vs FORMULATE
 introspect_accuracy_weight = 0.10           # self-prediction vs actual (stub→Sub-phase E)
 introspect_deepening_weight = 0.08          # profile divergence (stub→Sub-phase E)
 introspect_timechain_continuity_weight = 0.07 # self-state continuity
@@ -994,11 +1041,17 @@ break_cost_weight = -0.05                   # always-on penalty (was -0.10)
 # diversity_unique_step = 0.05
 
 # ── Sub-phase B: Chain-level IQL ──
+# 2026-04-19 v2 redesign (rFP_chain_iql_v2): LRU eviction + UCB1 exploration
+# replace the v1 slot-0-FIFO pathology that caused 98.7% of chains to alias
+# to template_id=0 across 3 Titans for weeks. Template cap raised 50→500 to
+# match principled template space (no memory/compute reason to cap at 50).
 chain_iql_buffer_size = 1000        # Recent chain outcomes for IQL training
-chain_template_max_count = 50       # Max distinct templates tracked
+chain_template_max_count = 500      # was 50 — arbitrary v1 cap removed (rFP_chain_iql_v2 FIX-2)
 task_embedding_dim = 32             # Hash size for task encoding
 chain_qnet_lr = 0.001               # IQL Q-net learning rate
 chain_blend_alpha = 0.5             # 50% MetaPolicy + 50% chain-Q (initial)
+chain_iql_ucb_c = 0.3               # UCB1 exploration coefficient (rFP_chain_iql_v2 FIX-3)
+                                    # Higher = more exploration; 0 disables UCB (argmax Q only)
 
 # ── Sub-phase C: Cognitive contracts ──
 # Detailed contract DNA lives in [cognitive_contracts_dna] below; only the
@@ -1200,7 +1253,7 @@ accepted_titans = ["T2", "T3"]
 # Shared auth secret between Titans (pre-shared key for kin-protocol calls).
 # Belt-and-suspenders alongside ed25519 signatures — override per-deployment
 # in config.toml with a strong random value. Empty = feature disabled.
-kin_secret = ""
+kin_secret = "titan_social_kin_v1"
 # Quality gates for delegated posts
 min_vocabulary = 50              # Must know 50+ words to post text
 min_confidence = 0.5             # Minimum composition confidence
@@ -1638,20 +1691,12 @@ watchdog_tier2_window_seconds = 600.0     # Count Tier-1 fires within this windo
 watchdog_tier2_reset_threshold = 2        # ≥ this many resets → Tier-2 escalation
 watchdog_tier2_cooldown_seconds = 1800.0  # Cooldown between Tier-2 escalations
 
-# ═══════════════════════════════════════════════════════════════════
-# METABOLISM MAINNET — 6-Tier SOL Starvation Protocol (M7)
-# ═══════════════════════════════════════════════════════════════════
-# Graceful degradation based on SOL balance. Chi already gates neuromod
-# production (implemented). This adds feature gating per tier.
-[metabolism_mainnet]
-thriving_threshold = 1.0           # > 1.0 SOL: full capabilities
-healthy_threshold = 0.5            # > 0.5: normal operation
-conserving_threshold = 0.25        # > 0.25: stop individual memos
-survival_threshold = 0.1           # > 0.1: stop NFTs, consciousness only
-emergency_threshold = 0.01         # > 0.01: Contact Maker Protocol
-# < 0.01 = HIBERNATION: save state, write testament, stop
-governance_reserve = 0.05          # minimum SOL to keep for basic ops
-emergency_contact_delay_s = 3600   # 1h in EMERGENCY before contacting maker (M9)
+# NOTE: 6-tier SOL metabolism (M7) is implemented in core/metabolism.py.
+# Thresholds/features live in the _DEFAULT_TIERS / _DEFAULT_FEATURES tables
+# there and are overridden via [metabolism.tiers.THRIVING] etc. subsections
+# (see _load_metabolic_config). The former [metabolism_mainnet] flat-key
+# section was planning-doc leftover that never matched the actual override
+# schema and was never read. Removed 2026-04-16 (dead-wiring cleanup).
 
 [action_narrator]
 # Default confidence for words found in recipes but not in vocabulary DB
@@ -1889,14 +1934,13 @@ policy_hidden_1 = 16
 policy_hidden_2 = 8
 learning_rate = 0.002
 
-# ═══════════════════════════════════════════════════════════════════
-# COGNITIVE MEMORY — V6 mini-experience retention policy
-# ═══════════════════════════════════════════════════════════════════
-[cognitive_memory]
-raw_retention_cycles = 7         # Keep raw records for N dream cycles after distillation (DNA)
-mini_experience_retention_cycles = 5  # Mini-experience raw records (shorter — higher volume)
-interpreter_retention_cycles = 10     # Interpreter records (lower volume, high value)
-wisdom_retention = "permanent"        # Distilled wisdom never pruned
+# NOTE: A [cognitive_memory] section previously lived here defining
+# raw/mini-experience/interpreter retention cycle counts as designed in
+# rFP_cognitive_architecture_v2. The retention-pruning code path was
+# never implemented — mini_experience.py, spirit_worker.py, v5_core.py
+# all grew without ever reading these keys. Section removed 2026-04-16
+# (dead-wiring cleanup). If retention tiering is revisited, re-add as
+# part of the same rFP that wires the pruning job.
 
 # ═══════════════════════════════════════════════════════════════════
 # TIMERS — Logging cadence and checkpoint intervals
@@ -2083,6 +2127,29 @@ cross_titan_source = "T1"
 # Confidence scale applied to imported priors (0.5 = half-strength vs native)
 cross_titan_confidence_scale = 0.5
 
+# ── E3 β-dispersion gate (rFP_chain_iql_v2 FIX-5, 2026-04-19) ──
+# compute_blend_weights caps w_grounded at `e3_dispersion_cap` when
+# `_beta_dispersion_ema < e3_dispersion_threshold`. Original v1 threshold
+# was 0.05 but all 3 Titans measured dispersion 0.019-0.029 — gate
+# permanently on, w_grounded permanently capped, β layer permanently
+# unable to drive V differentiation (chicken-and-egg). Threshold lowered
+# 0.05 → 0.015 gives META-CGN real authority at currently-observed
+# dispersion levels; gate re-engages if β layer ever goes silent.
+e3_dispersion_threshold = 0.015
+e3_dispersion_cap = 0.05
+
+# ── Scale-invariant rollback detector (Option B, 2026-04-19) ──
+# Rollback fires when post-grad reward mean drops below baseline_mean − k·σ
+# (where baseline is the pre-graduation reward distribution). Replaces the
+# previous hardcoded success_rate ≥ 0.5 threshold, which broke after
+# COMPLETE-5 sunset reduced the compound reward scale from ~0.5 to ~0.27.
+# rollback_reward_sigma_k: number of standard deviations below baseline_mean
+#   before rollback fires. 2.0 ≈ 97.5% confidence the regression is real.
+# rollback_min_std_floor: floor for effective σ (avoids super-tight triggers
+#   when pre-grad rewards are tightly clustered). 0.05 = 5% reward drop floor.
+rollback_reward_sigma_k = 2.0
+rollback_min_std_floor = 0.05
+
 
 # ─── KIN PROTOCOL (Titan-to-Titan communication, P11 → future Manitou) ──
 # Genesis peer list — hardcoded trusted Titans at v1. Future Manitou L2
@@ -2100,3 +2167,15 @@ base_url = "http://10.135.0.6:7777"
 [kin.peers.T3]
 solana = ""                    # fill on T3 mainnet deployment
 base_url = "http://10.135.0.6:7778"
+
+# ── PROFILING (Memory + CPU observability) ─────────────────────────
+# Controls tracemalloc and /proc-based profiling for resource optimization.
+# Endpoint: GET /v4/admin/memory-profile
+# CLI: python scripts/arch_map.py profile [--all] [--diff] [--cpu]
+
+[profiling]
+tracemalloc_enabled = false    # DISABLED 2026-04-18: parent CPU 76% with it on. Re-enable for spot profiling only.
+tracemalloc_nframes = 1        # 1=file+line, higher=full traceback (more overhead)
+default_top_n = 25             # default top-N allocations in API response
+snapshot_cache_ttl_s = 30.0    # cache tracemalloc snapshots to prevent storm
+cpu_sample_duration_s = 1.0    # seconds to sample for CPU% measurement

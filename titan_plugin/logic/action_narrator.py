@@ -80,10 +80,18 @@ STOPWORDS = frozenset({
 })
 
 
+# PERSISTENCE_BY_DESIGN: ActionNarrator._word_recipes is loaded from
+# word_resonance*.json files on every init via _load_recipes(). The JSON
+# files are the authoritative source — not re-saved from memory state.
 class ActionNarrator:
     """Produce simple word descriptions of Titan's action results."""
 
-    def __init__(self, word_recipe_dir: str = "data"):
+    def __init__(self, word_recipe_dir: str = "data", config: Optional[dict] = None):
+        section = (config or {}).get("action_narrator", {}) if isinstance(config, dict) else {}
+        self._word_confidence_default = float(section.get("word_confidence_default", 0.5))
+        self._min_content_word_length = int(section.get("min_content_word_length", 3))
+        self._word_perturbation_strength = float(section.get("word_perturbation_strength", 0.3))
+
         self._word_recipes: dict = {}
         self._recipe_dir = word_recipe_dir
         self._load_recipes()
@@ -259,7 +267,7 @@ class ActionNarrator:
         # Extract content words (lowercase, alpha-only, no stopwords)
         raw_words = re.findall(r"[a-zA-Z]+", narration.lower())
         content_words = [w for w in raw_words
-                         if w not in STOPWORDS and len(w) > 2]
+                         if w not in STOPWORDS and len(w) >= self._min_content_word_length]
 
         known = []
         unknown = []
@@ -277,9 +285,9 @@ class ActionNarrator:
                     pass
 
             if has_recipe or vocab_entry:
-                confidence = 0.5
+                confidence = self._word_confidence_default
                 if vocab_entry and isinstance(vocab_entry, dict):
-                    confidence = vocab_entry.get("confidence", 0.5)
+                    confidence = vocab_entry.get("confidence", self._word_confidence_default)
                 known.append({"word": word, "confidence": confidence})
             else:
                 unknown.append({"word": word, "context": narration})

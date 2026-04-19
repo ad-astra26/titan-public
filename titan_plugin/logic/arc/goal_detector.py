@@ -34,6 +34,9 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+# PERSISTENCE_BY_DESIGN: GoalDetector._goals / _meta are per-session state
+# rebuilt from ARC game replay on boot — detecting goals from scratch each
+# run is safer than trusting stale goal inferences across sessions.
 class GoalDetector:
     """Per-game goal-signal state + detection helpers.
 

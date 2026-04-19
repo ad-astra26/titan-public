@@ -72,6 +72,13 @@ class PostContext(BaseContext):
     total_wisdom_saved: int = 0         # lifetime chain-wisdom saved
     distilled_count: int = 0            # lifetime dream-insights distilled
     meta_cgn_signals: int = 0           # cross-consumer signals received (this lifetime)
+    # META-WISDOM-SIBLINGS fix (2026-04-19): list of up to ~3 recent
+    # crystallized wisdom entries from MetaWisdomStore.get_crystallized.
+    # Each: {"problem_pattern", "strategy_sequence", "confidence",
+    # "times_reused"}. Was orphan before today (0 callers) — now surfaced
+    # in posts so LLM has concrete evidence of Titan's crystallized
+    # strategies rather than just the abstract total_wisdom_saved count.
+    crystallized_samples: list = field(default_factory=list)
     # B2 (2026-04-13): prediction_familiarity DROPPED from context/render.
     # The previous "(NOT 'no novelty')" disclaimer text still mentioned the
     # word "novelty", which gave the LLM a phrase hook. Safer to omit
@@ -1277,6 +1284,25 @@ class SocialXGateway:
             if context.meta_cgn_signals > 0:
                 lines.append(f"Cross-consumer signals: {context.meta_cgn_signals} "
                              f"received (META-CGN learning)")
+            # 2026-04-19 (META-WISDOM-SIBLINGS): surface one crystallized
+            # strategy in rotation so LLM sees a concrete sample of
+            # Titan's crystallized wisdom, not just the abstract count.
+            # Up to 3 most-confident entries are carried in context; render
+            # one per post (cycle index by epoch) to avoid repetition.
+            if context.crystallized_samples:
+                try:
+                    _cs_idx = (int(context.epoch)
+                               % max(1, len(context.crystallized_samples)))
+                    _cs = context.crystallized_samples[_cs_idx]
+                    _cs_pp = str(_cs.get("problem_pattern", ""))[:80]
+                    _cs_conf = float(_cs.get("confidence", 0.0))
+                    _cs_reuses = int(_cs.get("times_reused", 0))
+                    if _cs_pp:
+                        lines.append(
+                            f"Crystallized strategy sample: \"{_cs_pp}\" "
+                            f"(conf={_cs_conf:.2f}, reused={_cs_reuses}×)")
+                except Exception:
+                    pass
         else:
             # B1 (2026-04-13): counters empty — log a warning so the
             # operator can investigate (likely coordinator._meta_engine
@@ -1650,37 +1676,110 @@ class SocialXGateway:
         ok, _ = self._verify_post_on_x(tweet_id, expected_text, config)
         return ok
 
-    def _verify_post_on_x(self, tweet_id: str, expected_text: str,
-                          config: dict) -> tuple:
-        """Verify a post actually exists on X by checking the timeline.
+    @staticmethod
+    def _normalize_for_match(text: str) -> str:
+        """NFKD-fold unicode styling (math italic, sans-serif, etc.) to
+        plain ASCII before matching. Titan posts stylize grounded words
+        with U+1D400+ math alphanumeric blocks that .lower() doesn't fold."""
+        import unicodedata
+        return unicodedata.normalize("NFKD", text).lower()
 
-        Returns (verified: bool, found_tweet_id: str or "").
+    @staticmethod
+    def _extract_tx_fingerprint(text: str, prefix_len: int = 24) -> str:
+        """Pull a unique per-post fingerprint from the chain-identity URL.
+
+        Every post ends with `iamtitan.tech/tx/<hash>`; the first prefix_len
+        chars of <hash> are plain ASCII, survive unicode stylization, and
+        typically survive t.co wrapping (returned via entities.urls[].
+        expanded_url). Returns "" if the chain line is absent.
         """
-        try:
-            result = self._call_x_api(
-                "twitter/user/last_tweets",
-                method="GET",
-                payload={"userName": config.get("user_name", "iamtitanai"),
-                         "count": 5},
-                api_key=config.get("api_key", ""),
-            )
-            tweets = result.get("data", {}).get("tweets", [])
-            # Check by tweet ID first
-            if tweet_id:
+        marker = "iamtitan.tech/tx/"
+        idx = text.find(marker)
+        if idx < 0:
+            return ""
+        start = idx + len(marker)
+        end = min(start + prefix_len, len(text))
+        fp = text[start:end]
+        for i, ch in enumerate(fp):
+            if ch in " \n\t\r":
+                return fp[:i]
+        return fp
+
+    def _verify_post_on_x(self, tweet_id: str, expected_text: str,
+                          config: dict,
+                          retries: int = 3) -> tuple:
+        """Verify a post actually exists on X.
+
+        twitterapi.io's `last_tweets` index can lag real posting by 5-20s,
+        so we retry with exponential backoff. Match attempts in order:
+          1) exact tweet_id
+          2) chain-line tx-hash fingerprint (plain ASCII, unique per post)
+          3) NFKD-normalized text overlap (folds math italic stylization)
+        Also tolerates three known twitterapi.io response shapes.
+
+        Returns (verified: bool, found_tweet_id: str).
+        """
+        import time as _vtime
+
+        tx_fingerprint = self._extract_tx_fingerprint(expected_text)
+        exp_norm = self._normalize_for_match(expected_text[:120])
+        exp_words = set(exp_norm.split())
+
+        # Delay before each attempt; first is 0 (caller already slept 2s
+        # for initial propagation). Totals 0 + 2 + 5 = 7s across 3 attempts.
+        backoff = [0.0, 2.0, 5.0]
+
+        for attempt in range(retries):
+            if backoff[attempt] > 0:
+                _vtime.sleep(backoff[attempt])
+            try:
+                result = self._call_x_api(
+                    "twitter/user/last_tweets",
+                    method="GET",
+                    payload={"userName": config.get("user_name", "iamtitanai"),
+                             "count": 10},
+                    api_key=config.get("api_key", ""),
+                )
+                # Tolerate three known shapes: {data:{tweets:[]}}, {tweets:[]},
+                # {data:[]} — mirrors the pattern used in the search path.
+                tweets = result.get("tweets", result.get("data", []))
+                if isinstance(tweets, dict):
+                    tweets = tweets.get("tweets", [])
+                if not tweets:
+                    continue
+
+                # 1. Exact tweet_id — strongest signal
+                if tweet_id:
+                    for t in tweets:
+                        if t.get("id") == tweet_id:
+                            return True, tweet_id
+
+                # 2. Chain-line tx-hash fingerprint — unique per-post
+                if tx_fingerprint:
+                    for t in tweets:
+                        t_text = str(t.get("text", ""))
+                        if tx_fingerprint in t_text:
+                            return True, t.get("id", "")
+                        urls = t.get("entities", {}).get("urls", []) or []
+                        for u in urls:
+                            if tx_fingerprint in str(u.get("expanded_url", "")):
+                                return True, t.get("id", "")
+
+                # 3. NFKD-normalized word overlap — final fuzzy fallback
                 for t in tweets:
-                    if t.get("id") == tweet_id:
-                        return True, tweet_id
-            # Check by text overlap (for when API didn't return tweet_id)
-            text_words = set(expected_text[:100].lower().split())
-            for t in tweets:
-                t_words = set(t.get("text", "")[:100].lower().split())
-                if text_words and t_words:
-                    overlap = len(text_words & t_words) / max(len(text_words), 1)
-                    if overlap > 0.6:
-                        return True, t.get("id", "")
-            return False, ""
-        except Exception:
-            return False, ""
+                    t_norm = self._normalize_for_match(
+                        str(t.get("text", ""))[:120])
+                    t_words = set(t_norm.split())
+                    if exp_words and t_words:
+                        overlap = (len(exp_words & t_words)
+                                   / max(len(exp_words), 1))
+                        if overlap > 0.4:
+                            return True, t.get("id", "")
+            except Exception as e:
+                logger.debug("[SocialXGateway] verify attempt %d failed: %s",
+                             attempt + 1, e)
+
+        return False, ""
 
     # ── Public API: post() ──────────────────────────────────────────
 

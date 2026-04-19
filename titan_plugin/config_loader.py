@@ -31,6 +31,7 @@ except ModuleNotFoundError:  # pragma: no cover — Python 3.10 fallback
 
 _LOG = logging.getLogger("titan.config_loader")
 
+TITAN_PARAMS_PATH = Path(__file__).parent / "titan_params.toml"
 BASE_CONFIG_PATH = Path(__file__).parent / "config.toml"
 SECRETS_PATH = Path(os.path.expanduser("~/.titan/secrets.toml"))
 
@@ -55,19 +56,43 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
 
 
 def load_titan_config(force_reload: bool = False) -> dict:
-    """Load the full Titan config, deep-merging secrets on top of base.
+    """Load the full Titan config, deep-merging 3 layers bottom-up:
+      Layer 1 (base):    titan_params.toml  — engineering defaults, code-tracked
+      Layer 2 (middle):  config.toml         — deployment-specific, user-editable,
+                                                code NEVER writes this file
+      Layer 3 (top):     ~/.titan/secrets.toml  — secrets, external, out-of-repo
+
+    Later layers override earlier ones (deep-merge semantics).
 
     Args:
         force_reload: If True, bypass the in-process cache (for tests).
 
     Returns:
-        Deep-merged config dict. Empty dict if base config is missing/unreadable.
+        Deep-merged config dict. Empty dict if the base config.toml is
+        missing/unreadable. Missing titan_params.toml is non-fatal (treated
+        as empty layer); missing secrets.toml is non-fatal (warns once).
     """
     global _cache, _warned_missing_secrets
 
     if _cache is not None and not force_reload:
         return _cache
 
+    # Layer 1: titan_params.toml — engineering defaults. Non-fatal if missing
+    # (e.g., in minimal test fixtures). Historically loaded directly by ~15-20
+    # modules; this merge unifies access so all callers see consistent config.
+    params: dict = {}
+    if TITAN_PARAMS_PATH.exists():
+        try:
+            with open(TITAN_PARAMS_PATH, "rb") as f:
+                params = tomllib.load(f)
+        except Exception as e:
+            _LOG.warning(
+                "[config_loader] Failed to parse %s: %s — skipping Layer 1",
+                TITAN_PARAMS_PATH, e,
+            )
+            params = {}
+
+    # Layer 2: config.toml — deployment-specific overrides. Required.
     if not BASE_CONFIG_PATH.exists():
         _LOG.error("[config_loader] Base config not found at %s", BASE_CONFIG_PATH)
         _cache = {}
@@ -81,11 +106,14 @@ def load_titan_config(force_reload: bool = False) -> dict:
         _cache = {}
         return _cache
 
+    merged = _deep_merge(params, base)
+
+    # Layer 3: ~/.titan/secrets.toml — external secrets overrides.
     if SECRETS_PATH.exists():
         try:
             with open(SECRETS_PATH, "rb") as f:
                 secrets = tomllib.load(f)
-            merged = _deep_merge(base, secrets)
+            merged = _deep_merge(merged, secrets)
             _LOG.info(
                 "[config_loader] Merged secrets from %s (sections: %s)",
                 SECRETS_PATH,
@@ -99,7 +127,7 @@ def load_titan_config(force_reload: bool = False) -> dict:
                 SECRETS_PATH,
                 e,
             )
-            _cache = base
+            _cache = merged
             return _cache
 
     if not _warned_missing_secrets:
@@ -110,7 +138,7 @@ def load_titan_config(force_reload: bool = False) -> dict:
             SECRETS_PATH,
         )
         _warned_missing_secrets = True
-    _cache = base
+    _cache = merged
     return _cache
 
 

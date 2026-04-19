@@ -202,6 +202,9 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 logger.info("[MindWorker] Audio digest received: harmony=%.3f", features[4])
 
         elif msg_type == "QUERY":
+            from titan_plugin.core.profiler import handle_memory_profile_query
+            if handle_memory_profile_query(msg, send_queue, name):
+                continue
             _handle_query(msg, mood_engine, social_graph, media_state,
                          data_dir, session_db, send_queue, name,
                          severity_multipliers, focus_nudges)

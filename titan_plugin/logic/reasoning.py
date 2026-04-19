@@ -589,6 +589,9 @@ class ReasoningTransitionBuffer:
 # LRU eviction at cap. No state bucketing in v1 (rFP §2a "start per-primitive").
 
 
+# PERSISTENCE_BY_DESIGN: SequenceQualityStore._table is loaded from the
+# EMA table JSON file on init via custom load pattern (dict rebuild from
+# prefix-hash iteration), not a self-assignment the scanner can trace.
 class SequenceQualityStore:
     """Mechanism A — EMA table mapping primitive-prefix → expected terminal reward.
 
@@ -733,6 +736,13 @@ class SequenceQualityStore:
                     "last_ts": float(entry["last_ts"]),
                 }
             self._evictions = int(data.get("evictions", 0))
+            # Restore config params (saved since schema 1 but were never loaded — 2026-04-17 fix)
+            if "visit_gate" in data:
+                self._visit_gate = int(data["visit_gate"])
+            if "ema_alpha" in data:
+                self._ema_alpha = float(data["ema_alpha"])
+            if "ramp_cutoff" in data:
+                self._ramp_cutoff = int(data["ramp_cutoff"])
             return True
         except Exception as e:
             logger.error("[Reasoning/MechA] Failed to load seq_quality: %s", e)
@@ -1190,6 +1200,12 @@ PRIMITIVE_FUNCTIONS = {
 # ── Main Reasoning Engine ─────────────────────────────────────────
 
 
+# PERSISTENCE_BY_DESIGN: ReasoningEngine._rr_* fields (rFP α residual-reasoning
+# state: _rr_enabled / _rr_phase1_end / _rr_phase2_end / _rr_step_snapshots /
+# _last_result) are re-read from the [reasoning] config section on every
+# __init__; the JSON save in _save_rr_activation_state exists for stats/
+# telemetry observability, not reconstruction. Step snapshots are cleared
+# per-chain on commit (line 1825) — per-chain transient.
 class ReasoningEngine:
     """Mind's deliberate cognition through composable logic primitives.
 
@@ -2225,6 +2241,9 @@ class ReasoningEngine:
                 "total_chains": int(self._total_chains),
                 "total_conclusions": int(self._total_conclusions),
                 "total_reasoning_steps": int(self._total_reasoning_steps),
+                # v4 persistence gap fixes (2026-04-17)
+                "strategy_bias": self._strategy_bias.tolist() if getattr(self, '_strategy_bias', None) is not None else None,
+                "intuition_bias": self._intuition_bias.tolist() if getattr(self, '_intuition_bias', None) is not None else None,
             }
             tmp = path + ".tmp"
             with open(tmp, "w") as f:
@@ -2252,6 +2271,13 @@ class ReasoningEngine:
             self._total_conclusions = int(data.get("total_conclusions", 0))
             self._total_reasoning_steps = int(
                 data.get("total_reasoning_steps", 0))
+            # v4 persistence gap fixes (2026-04-17)
+            if data.get("strategy_bias") is not None and hasattr(self, '_strategy_bias'):
+                import numpy as np
+                self._strategy_bias = np.array(data["strategy_bias"], dtype=np.float32)
+            if data.get("intuition_bias") is not None and hasattr(self, '_intuition_bias'):
+                import numpy as np
+                self._intuition_bias = np.array(data["intuition_bias"], dtype=np.float32)
             logger.info(
                 "[Reasoning] Restored lifetime totals: chains=%d "
                 "conclusions=%d steps=%d (rate=%.1f%%)",
@@ -2299,9 +2325,11 @@ class ReasoningEngine:
         Caller responsible for closing; we do this inline with `with`.
         """
         import sqlite3
-        # Use same path pattern as existing inner_memory usage — project data/
+        # timeout=10.0 matches Layer 2 convention for inner_memory.db writers
+        # (rFP_inner_memory_db_write_contention, 2026-04-15). Shorter timeouts
+        # fail fast under multi-writer contention even with WAL enabled.
         db_path = "data/inner_memory.db"
-        conn = sqlite3.connect(db_path, timeout=2.0)
+        conn = sqlite3.connect(db_path, timeout=10.0)
         conn.execute(self._RR_STEP_TABLE_DDL)
         conn.execute(self._RR_STEP_INDEX_DDL)
         conn.execute(self._RR_STEP_CREATED_DDL)

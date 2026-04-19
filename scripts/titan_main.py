@@ -22,6 +22,23 @@ import signal
 # Ensure project root is on path
 sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), "..")))
 
+# ── tracemalloc: must start BEFORE any titan_plugin imports ──────────
+# Captures all Python allocations from this point forward (including imports).
+# Config-gated: reads [profiling].tracemalloc_enabled from titan_params.toml.
+# nframes=1 keeps overhead at ~5%. Disable via config if unneeded.
+_tracemalloc_started = False
+try:
+    import tomllib
+    _params_path = os.path.join(os.path.dirname(__file__), "..", "titan_plugin", "titan_params.toml")
+    with open(_params_path, "rb") as _pf:
+        _prof_cfg = tomllib.load(_pf).get("profiling", {})
+    if _prof_cfg.get("tracemalloc_enabled", True):
+        import tracemalloc
+        tracemalloc.start(_prof_cfg.get("tracemalloc_nframes", 1))
+        _tracemalloc_started = True
+except Exception:
+    pass  # Config not found or parse error — skip silently
+
 
 def setup_logging():
     """Configure logging based on merged config plugin_log_level."""
@@ -208,6 +225,18 @@ async def run(health_only: bool = False, server_only: bool = False):
     logging.info("Booting Titan microkernel...")
     core = TitanCore(wallet_path)
     await core.boot()
+
+    # ── Profiling baseline snapshot (after all boot allocations) ──
+    if _tracemalloc_started:
+        import tracemalloc as _tm
+        from titan_plugin.core.profiler import TraceMallocCollector
+        core._profiling_collector = TraceMallocCollector(
+            cache_ttl=_prof_cfg.get("snapshot_cache_ttl_s", 30.0))
+        core._profiling_collector.set_baseline(_tm.take_snapshot())
+        logging.info("[Profiling] tracemalloc baseline captured (nframes=%d)",
+                     _prof_cfg.get("tracemalloc_nframes", 1))
+    else:
+        core._profiling_collector = None
 
     if core._limbo_mode:
         logging.warning("Titan booted in LIMBO STATE.")

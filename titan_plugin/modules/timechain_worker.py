@@ -561,7 +561,9 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
             _send_msg("CONTRACT_VETO_RESP", src,
                       {"success": ok, "reason": reason})
             if ok:
-                # Emit rejection event for meta-reasoning feedback
+                # INTENTIONAL_BROADCAST: observability-only contract-veto
+                # telemetry. Originally designed for meta-reasoning feedback
+                # but consumer never wired; broadcast retained for dashboard.
                 send_queue.put({
                     "type": "CONTRACT_REJECTED",
                     "src": name, "dst": "all",
@@ -574,6 +576,9 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
 
         # ── QUERY — standard arch_map query handler ──
         elif msg_type == "QUERY":
+            from titan_plugin.core.profiler import handle_memory_profile_query
+            if handle_memory_profile_query(msg, send_queue, name):
+                continue
             action = payload.get("action", "")
             rid = msg.get("rid") or payload.get("rid")
             if action == "timechain_status":
@@ -666,6 +671,9 @@ def _handle_commit(tc, pot_validator, payload, src, current_epoch,
     if not pot.valid:
         logger.info("[TimeChain] REJECTED: %s → fork=%s reason=%s (score=%.4f < threshold=%.4f)",
                     src, fork_name, pot.rejection_reason, pot.pot_score, pot.threshold)
+        # INTENTIONAL_BROADCAST: reply-pattern response back to requesting
+        # module (dst=src dynamic routing). Callers subscribe via their own
+        # queue and filter by msg_type; audit can't trace dst=src statically.
         send_queue.put({
             "type": "TIMECHAIN_REJECTED", "src": name, "dst": src,
             "payload": {
@@ -716,6 +724,8 @@ def _handle_commit(tc, pot_validator, payload, src, current_epoch,
         logger.info("[TimeChain] COMMITTED: %s → fork=%s #%d (pot=%.3f, chi=%.4f, total=%d)",
                     src, fork_name, block.header.block_height,
                     pot.pot_score, pot.chi_cost, tc.total_blocks)
+        # INTENTIONAL_BROADCAST: reply-pattern response back to requesting
+        # module (dst=src dynamic routing).
         send_queue.put({
             "type": "TIMECHAIN_COMMITTED", "src": name, "dst": src,
             "payload": {
@@ -800,6 +810,7 @@ def _do_dream_event(tc, is_dreaming, current_epoch, payload,
 def _do_checkpoint(tc, current_epoch, send_queue, name):
     """Create a Merkle checkpoint."""
     cp = tc.create_checkpoint(epoch_id=current_epoch)
+    # INTENTIONAL_BROADCAST: observability-only checkpoint telemetry.
     send_queue.put({
         "type": "TIMECHAIN_CHECKPOINT", "src": name, "dst": "all",
         "payload": cp, "ts": time.time(),

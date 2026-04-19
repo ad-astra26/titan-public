@@ -80,6 +80,12 @@ class UserProfile:
         }
 
 
+# DEFERRED_CLASS_WIRING: SocialGraph kin-protocol registry (sync_community,
+# get_community, set_titan_preference, get_titan_favorites,
+# get_accounts_to_check, mark_checked, update_last_tweet) is designed but
+# never called on a schedule — see DEFERRED: SOCIAL-GRAPH-WIRING. Core user-
+# profile methods ARE used (by persona_social_v2, spirit_worker social window);
+# the orphans all cluster in the community-registry sub-API.
 class SocialGraph:
     """
     Manages user profiles, social relationships, and interaction quality scoring.

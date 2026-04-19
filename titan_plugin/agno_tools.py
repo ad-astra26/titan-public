@@ -57,102 +57,13 @@ def create_tools(plugin):
             plugin.memory.add_research_topic(query[:200])
         return findings or "No findings — research pipeline returned empty."
 
-    # ------------------------------------------------------------------
-    # Memory Recall Tool
-    # ------------------------------------------------------------------
-    async def recall_memory(query: str) -> str:
-        """
-        Search Titan's long-term memory graph (Cognee) for relevant past
-        interactions, knowledge, and experiences. Use this when the user
-        asks about previous conversations or when you need historical context.
-
-        Args:
-            query: Semantic search query for the memory graph.
-
-        Returns:
-            Formatted list of matching memories with relevance scores.
-        """
-        try:
-            memories = await plugin.memory.query(query)
-        except Exception as e:
-            logger.warning("[Tool:recall_memory] Memory query failed: %s", e)
-            return "Memory recall failed — graph may be initializing."
-
-        if not memories:
-            return "No relevant memories found for this query."
-
-        lines = []
-        for m in memories[:10]:
-            p = m.get("user_prompt", "")[:150]
-            r = m.get("agent_response", "")[:150]
-            w = m.get("effective_weight", 1.0)
-            lines.append(f"[{w:.2f}] Q: {p}\n  A: {r}")
-        return "### Memory Recall Results\n" + "\n\n".join(lines)
-
-    # ------------------------------------------------------------------
-    # Metabolism Status Tool
-    # ------------------------------------------------------------------
-    async def check_metabolism() -> str:
-        """
-        Check Titan's current metabolic state: SOL balance, energy level,
-        and Divine Growth metrics. Use this to assess whether Titan has
-        enough energy for costly operations (research, on-chain writes).
-
-        Returns:
-            Metabolic state summary including energy level and balance.
-        """
-        try:
-            state = await plugin.metabolism.get_current_state()
-            balance = plugin.metabolism._last_balance
-            balance_pct = plugin.metabolism._last_balance_pct
-
-            learning_v = await plugin.metabolism.get_learning_velocity()
-            social_d = await plugin.metabolism.get_social_density()
-            health = await plugin.metabolism.get_metabolic_health()
-
-            return (
-                f"### Metabolic Status\n"
-                f"- Energy State: {state}\n"
-                f"- SOL Balance: {balance:.4f} ({balance_pct:.0f}%)\n"
-                f"- Learning Velocity: {learning_v:.2f}\n"
-                f"- Social Density: {social_d:.2f}\n"
-                f"- Overall Health: {health:.2f}\n"
-            )
-        except Exception as e:
-            logger.warning("[Tool:check_metabolism] Failed: %s", e)
-            return f"Metabolism check failed: {e}"
-
-    # ------------------------------------------------------------------
-    # Social Post Tool
-    # ------------------------------------------------------------------
-    async def post_to_x(text: str) -> str:
-        """
-        Post a tweet to X/Twitter using Titan's authenticated social identity.
-        The post goes through metabolic governance (must be able to afford it)
-        and will be logged to the memory graph. Use this when the user asks
-        Titan to share something publicly or when a significant event warrants
-        social expression.
-
-        Args:
-            text: The tweet text (max 280 characters).
-
-        Returns:
-            Success or failure message.
-        """
-        if not text or not text.strip():
-            return "Cannot post empty tweet."
-
-        if len(text) > 280:
-            return f"Tweet too long ({len(text)} chars). Maximum is 280."
-
-        try:
-            success = await plugin.social.create_tweet(text)
-            if success:
-                return f"Tweet posted successfully: \"{text[:80]}...\""
-            return "Tweet failed — check social credentials and proxy configuration."
-        except Exception as e:
-            logger.warning("[Tool:post_to_x] Failed: %s", e)
-            return f"Social post failed: {e}"
+    # NOTE: recall_memory / check_metabolism / post_to_x tools were REMOVED
+    # in the Sovereign Reflex Arc migration (R4). The LLM now receives this
+    # information as [INNER STATE] via Trinity Intuition reflexes rather than
+    # calling tools. post_to_x was removed because all posting routes through
+    # SocialPressureMeter (social_narrator + quality gate + rate limits).
+    # Kept only action/creative tools below (generate_art, generate_audio,
+    # research).
 
     # ------------------------------------------------------------------
     # Art Generation Tool
@@ -222,44 +133,9 @@ def create_tools(plugin):
             logger.warning("[Tool:generate_audio] Failed: %s", e)
             return f"Audio generation failed: {e}"
 
-    # ------------------------------------------------------------------
-    # Soul Identity Tool
-    # ------------------------------------------------------------------
-    async def check_identity() -> str:
-        """
-        Check Titan's on-chain sovereign identity: wallet pubkey, Genesis NFT
-        status, active Prime Directives, and maker verification state.
-        Use this when the user asks about Titan's identity or sovereignty.
+    # check_identity tool was also removed in the R4 migration — sovereign
+    # identity is now surfaced via [INNER STATE] rather than a tool call.
 
-        Returns:
-            Identity summary including pubkey and directive count.
-        """
-        try:
-            pubkey = plugin.soul.pubkey
-            directives = await plugin.soul.get_active_directives()
-            mood_label = plugin.mood_engine.get_mood_label() if plugin.mood_engine else "Unknown"
-
-            return (
-                f"### Sovereign Identity\n"
-                f"- Pubkey: {pubkey}\n"
-                f"- Active Directives: {len(directives)}\n"
-                f"- Current Mood: {mood_label}\n"
-                f"- Execution Mode: {plugin._last_execution_mode}\n"
-                f"- Limbo: {plugin._limbo_mode}\n"
-            )
-        except Exception as e:
-            logger.warning("[Tool:check_identity] Failed: %s", e)
-            return f"Identity check failed: {e}"
-
-    # Sovereign Reflex Arc (R4): Observation tools are now handled by Trinity
-    # Intuition reflexes — the LLM receives results as [INNER STATE] rather
-    # than calling tools. Only creative/action tools remain for edge cases
-    # where the LLM needs to narrate an explicit user request.
-    #
-    # REMOVED (now reflexes): recall_memory, check_metabolism, check_identity
-    # REMOVED: post_to_x — all posting goes through SocialPressureMeter
-    # (social_narrator + quality gate + rate limits + 11 post types)
-    # KEPT (action/creative): generate_art, generate_audio, research
     return [
         research,
         generate_art,

@@ -48,6 +48,17 @@ _FUNCTION_COUNT = 15
 logger.info("[SpiritLoop] Module loaded v%s — %d helper functions available",
             _MODULE_VERSION, _FUNCTION_COUNT)
 
+# ── Coordinator snapshot cache (2026-04-19 query-backlog fix) ─────
+# get_coordinator builds a heavy stats dict across ALL modules (MSL,
+# meta-engine, self-reasoning, experience memory, …). Under CPU
+# contention (e.g. T2/T3 sharing a VPS), stats-building falls behind
+# incoming query rate → query thread backlog grows → SKIP-stale logic
+# drops queries > 30s old → /v4/meta-reasoning endpoints return "not
+# yet initialized". Observed on T2 with total_skipped=172+ across the
+# day. Cache collapses repeated queries within TTL into one build.
+_COORD_SNAPSHOT_CACHE: dict = {"data": None, "ts": 0.0}
+_COORD_SNAPSHOT_TTL = 8.0  # seconds — matches dashboard warmer cadence
+
 
 def post_reload_cleanup_helpers():
     """Called after hot-reload to clear any transient module-level state."""
@@ -566,6 +577,10 @@ def compose_and_emit_titan_self(send_queue, name: str, consciousness: dict,
         return None
     try:
         payload = {**ts, "timestamp": time.time()}
+        # INTENTIONAL_BROADCAST: dst=all — rFP #2 Phase 4 consumes the 162D inline
+        # via _post_epoch_v5_filter_down below; the bus broadcast is retained for
+        # future kin-protocol emission and external observability per
+        # DEFERRED: TITAN_SELF_STATE-CONSUMER-DECISION (Option C).
         _send_msg(send_queue, "TITAN_SELF_STATE", name, "all", payload)
     except Exception as e:
         logger.debug("[SpiritWorker] TITAN_SELF_STATE emit error: %s", e)
@@ -602,13 +617,24 @@ def _post_epoch_v5_filter_down(send_queue, name: str, filter_down_v5,
         _prev_titan_self = list(ts_curr)
         _prev_felt = list(felt_curr)
 
+        # Compute multipliers EVERY epoch (even during silent coexistence) so
+        # the EMA state (_ib_mults, etc.) reflects live gradient attention.
+        # Without this, Gate #9 (multiplier divergence vs V4) is unreachable
+        # by construction because EMAs would stay at their default [1.0,...]
+        # init until publish flipped — creating a bootstrapping paradox.
+        # The compute itself is cheap; only the bus send below is gated.
+        mults = None
+        try:
+            mults = filter_down_v5.compute_multipliers(ts_curr)
+        except Exception as _v5_compute_fail:
+            logger.debug("[SpiritWorker] V5 compute failed: %s", _v5_compute_fail)
+
         # Publish path — only if V5 is the active publisher (Phase 8 flag flip).
-        # Fail-soft: on compute/publish error, log WARNING so operators can see;
+        # Fail-soft: on publish error, log WARNING so operators can see;
         # V4 continues training silently and can be reactivated by reverting flag.
         v5_cfg = (config or {}).get("filter_down_v5", {}) if config else {}
-        if bool(v5_cfg.get("publish_enabled", False)):
+        if mults is not None and bool(v5_cfg.get("publish_enabled", False)):
             try:
-                mults = filter_down_v5.compute_multipliers(ts_curr)
                 _send_msg(send_queue, "FILTER_DOWN_V5", name, "all", {
                     "multipliers": mults,
                     "epoch_id":    titan_self.get("epoch_id", 0),
@@ -823,9 +849,8 @@ def _maybe_anchor_trinity(
     _min_tc_delta = config.get("mainnet_budget", {}).get("consciousness_anchor_min_tc_blocks", 5000)
     _last_anchor_tc = _prev_anchor.get("last_anchor_tc_blocks", 0)
     try:
-        import sqlite3 as _tc_sql_check
-        _tc_db = _tc_sql_check.connect("data/timechain/index.db", timeout=2)
-        _tc_db.execute("PRAGMA busy_timeout=2000")
+        from titan_plugin.utils.db import safe_connect as _sc_tc
+        _tc_db = _sc_tc("data/timechain/index.db")
         _current_tc_blocks = _tc_db.execute("SELECT COUNT(*) FROM block_index").fetchone()[0]
         _tc_db.close()
     except Exception:
@@ -886,9 +911,8 @@ def _maybe_anchor_trinity(
                 try:
                     from titan_plugin.logic.timechain import TimeChain
                     # Read directly from index DB to avoid creating full instance
-                    import sqlite3 as _tc_sql
-                    _tc_idx = _tc_sql.connect("data/timechain/index.db", timeout=5)
-                    _tc_idx.execute("PRAGMA busy_timeout=5000")
+                    from titan_plugin.utils.db import safe_connect as _sc_tc2
+                    _tc_idx = _sc_tc2("data/timechain/index.db")
                     _tc_cnt = _tc_idx.execute("SELECT COUNT(*) FROM block_index").fetchone()
                     _tc_height = _tc_cnt[0] if _tc_cnt else 0
                     # Compute merkle from genesis hash if available
@@ -1528,6 +1552,17 @@ def _handle_query(msg: dict, config: dict, body_state: dict, mind_state: dict,
                 _send_response(send_queue, name, src, {"error": "SpiritState not available"}, rid)
 
         elif action == "get_coordinator":
+            # Snapshot cache: if we built a snapshot within _COORD_SNAPSHOT_TTL,
+            # return it directly. Multiple endpoints hitting in the same cycle
+            # get one build; prevents the query-thread backlog that drops
+            # 30s+ stale queries without reply (T2/T3 observability loss).
+            _coord_now = time.time()
+            if (_COORD_SNAPSHOT_CACHE["data"] is not None
+                    and _coord_now - _COORD_SNAPSHOT_CACHE["ts"]
+                    < _COORD_SNAPSHOT_TTL):
+                _send_response(send_queue, name, src,
+                               _COORD_SNAPSHOT_CACHE["data"], rid)
+                return
             if coordinator:
                 stats = coordinator.get_stats()
                 if pi_monitor:
@@ -1566,14 +1601,47 @@ def _handle_query(msg: dict, config: dict, body_state: dict, mind_state: dict,
                 if reasoning_engine:
                     stats["reasoning"] = reasoning_engine.get_stats()
                 # Meta-reasoning stats
+                # Always initialize the key — even if meta_engine is unwired
+                # at this tick — so downstream snapshot consumers
+                # (dashboard.py /v4/meta-reasoning, /v4/inner-trinity,
+                # arch_map audit, test harnesses) see a consistent shape and
+                # can distinguish "transient cache race" (empty dict) from
+                # "missing feature" (key absent). Before 2026-04-19 this was
+                # conditional on `if _me:` → when _me was None the key was
+                # absent from the snapshot → /v4/meta-reasoning returned
+                # "data":{} → test harness sampling couldn't extract the
+                # signals_received counter (see verify_sweep_cross_titan
+                # t=0 / t=900 'cache?' readings).
+                stats["meta_reasoning"] = {}
                 _me = getattr(coordinator, '_meta_engine', None)
                 if _me:
-                    stats["meta_reasoning"] = _me.get_stats()
+                    # Defensive try/except: before 2026-04-19, unguarded
+                    # get_stats() would propagate exceptions up and leak
+                    # partial stats, or silently return {} when _me was
+                    # stale-wired, leaving /v4/inner-trinity with
+                    # meta_reasoning={} and the TimeChain orchestrator's
+                    # cognitive-contracts gate blind to meta_chains (read
+                    # as 0 default → gate never trips). Surface failures
+                    # at WARN so class-of-bug doesn't recur silently.
+                    try:
+                        stats["meta_reasoning"] = _me.get_stats()
+                    except Exception as _me_err:
+                        logger.warning(
+                            "[META] get_stats failed: %s — leaving "
+                            "meta_reasoning={} for this tick", _me_err)
+                        stats["meta_reasoning"] = {}
                     # Task 3: extended observability for /v4/meta-reasoning/audit
                     try:
                         stats["meta_reasoning_audit"] = _me.get_audit_stats()
                     except Exception as _au_err:
                         logger.warning("[META] get_audit_stats failed: %s", _au_err)
+                else:
+                    # _meta_engine not yet wired on coordinator — log once
+                    # per tick at DEBUG so investigators can correlate
+                    # with any observed empty snapshots downstream.
+                    logger.debug(
+                        "[META] coordinator._meta_engine is None at "
+                        "get_coordinator — snapshot meta_reasoning={}")
                 # Self-reasoning stats
                 if self_reasoning:
                     stats["self_reasoning"] = self_reasoning.get_stats()
@@ -1688,6 +1756,10 @@ def _handle_query(msg: dict, config: dict, body_state: dict, mind_state: dict,
                     }
                 if language_stats:
                     stats["language"] = language_stats
+                # Populate snapshot cache so subsequent queries within TTL
+                # return immediately without rebuilding the stats dict.
+                _COORD_SNAPSHOT_CACHE["data"] = stats
+                _COORD_SNAPSHOT_CACHE["ts"] = time.time()
                 _send_response(send_queue, name, src, stats, rid)
             else:
                 _send_response(send_queue, name, src, {"error": "Coordinator not available"}, rid)

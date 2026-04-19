@@ -171,6 +171,10 @@ def _extract_keywords(text: str) -> set:
 # ──────────────────────────────────────────────────────────────────
 # EdgeDetector — helper for event-shaped signal emission (rFP v3 § 7)
 # ──────────────────────────────────────────────────────────────────
+# PERSISTENCE_BY_DESIGN: EdgeDetector._crossed / _above / _below are
+# edge-detection state that resets on boot by design (a fresh detector
+# gives a clean edge-catch on the first signal crossing rather than
+# replaying stale transition state).
 class EdgeDetector:
     """Turns continuous value streams into discrete events.
 
@@ -569,6 +573,11 @@ def _build_seed_hypotheses() -> dict[str, HypothesisTest]:
     }
 
 
+# PERSISTENCE_BY_DESIGN: MetaCGNConsumer rollback-window state
+# (_failure_window, _consecutive_failures, _failure_signatures_in_window,
+# _titan_id) is circuit-breaker-adjacent — reset-on-boot is correct so a
+# restart gives a fresh rollback-detection window rather than replaying
+# stale failure counts. Primitive V values persist via primitive_grounding.json.
 class MetaCGNConsumer:
     """META-CGN consumer client — registers primitives as CGN concepts.
 
@@ -601,6 +610,12 @@ class MetaCGNConsumer:
         self._grounding_path = os.path.join(save_dir, "primitive_grounding.json")
         self._shadow_log_path = os.path.join(save_dir, "shadow_mode_log.jsonl")
         self._haov_path = os.path.join(save_dir, "haov_hypotheses.json")
+        # COMPLETE-9 (2026-04-19): HAOV signal→chain correlation telemetry.
+        # Pure observability — no learning yet. Feeds META-CGN-V2-HAOV-REFINE
+        # design in next session with real data instead of guessed magic numbers.
+        self._haov_log_path = os.path.join(save_dir, "haov_signal_outcomes.jsonl")
+        self._haov_log_lines = 0
+        self._haov_log_max_lines = 50000
         # P4+P5 paths
         self._watchdog_path = os.path.join(save_dir, "watchdog_state.json")
         self._failure_log_path = os.path.join(save_dir, "failure_log.jsonl")
@@ -625,10 +640,14 @@ class MetaCGNConsumer:
         self._pre_graduation_baseline: dict = {}  # for rollback detector
         self._chains_since_graduation = 0
         self._rolled_back_count = 0
-        # Per-chain outcome tracking (success rate + chain count post-grad)
-        self._post_grad_outcomes: deque = deque(maxlen=50)  # 1.0 / 0.0 per chain
-        # Pre-graduation rolling baseline
-        self._pre_grad_outcomes: deque = deque(maxlen=100)
+        # Per-chain raw terminal_reward tracking (scale-invariant rollback).
+        # Stores FLOATS, not booleans. Baseline captures mean+std of pre-grad
+        # distribution; rollback compares post-grad mean against baseline_mean
+        # - k·σ. This lets reward scale evolve (EMOT-CGN, sequence_quality
+        # reweights, compound-reward changes) without stale threshold
+        # miscalibration — see Option B refactor 2026-04-19.
+        self._post_grad_rewards: deque = deque(maxlen=50)
+        self._pre_grad_rewards: deque = deque(maxlen=100)
 
         # ── P5: Failsafe watchdog (severity-weighted, dedup'd) ──
         # Severity per failure kind (I-5)
@@ -663,7 +682,6 @@ class MetaCGNConsumer:
         self._graduation_blockers_unchanged_chains = 0
 
         self._load_state()
-        self._load_watchdog_state()  # P5 I-9: persistent failsafe state
 
         self._cgn_client = None
         self._registered = False
@@ -672,10 +690,34 @@ class MetaCGNConsumer:
         self._total_compositions = 0
         self._total_disagreements = 0
         self._start_ts = time.time()
+
+        self._load_watchdog_state()  # P5 I-9: persistent failsafe state (AFTER defaults so load can override)
         # ── P6: decay cadence + β-dispersion EMA (I1) ──
         self._chains_since_decay = 0
         self._beta_dispersion_ema = 0.0
         self._beta_dispersion_alpha = 0.01  # EMA weight → ~100-chain window
+        # 2026-04-19 rFP_chain_iql_v2 FIX-5: E3 thresholds are now config-driven
+        # to break the β-dispersion deadlock. Default lowered 0.05 → 0.015
+        # (observed dispersion 0.019-0.029 across all 3 Titans). Cap stays
+        # at 0.05 — minimum authority META-CGN retains when gate fires.
+        # Inline config read — MetaCGNConsumer does not receive a config dict
+        # in ctor, so we lookup via the project-wide params loader.
+        try:
+            from titan_plugin.params import get_params as _get_params
+            _mc_cfg = _get_params("meta_cgn") or {}
+        except Exception:
+            _mc_cfg = {}
+        self._e3_dispersion_threshold = float(
+            _mc_cfg.get("e3_dispersion_threshold", 0.015))
+        self._e3_dispersion_cap = float(
+            _mc_cfg.get("e3_dispersion_cap", 0.05))
+        # Scale-invariant rollback (Option B, 2026-04-19) — threshold is
+        # baseline_mean − k·σ with a std floor to avoid pathologically tight
+        # triggers when pre-grad rewards are tightly clustered.
+        self._rollback_sigma_k = float(
+            _mc_cfg.get("rollback_reward_sigma_k", 2.0))
+        self._rollback_min_std_floor = float(
+            _mc_cfg.get("rollback_min_std_floor", 0.05))
         self._total_rerank_samples = 0
         self._domain_fallbacks = 0    # I3: count uses of pooled fallback
         self._domain_hits = 0          # I3: count uses of per-domain V
@@ -1486,6 +1528,9 @@ class MetaCGNConsumer:
                 self._conflict_sigs_throttled += 1
                 return
             self._conflict_throttle[sig] = self._chain_counter
+            # INTENTIONAL_BROADCAST: observability-only state-telemetry event.
+            # Consumed by /v4/meta-cgn dashboard + external audits, no
+            # in-process handler needed.
             if self._send_queue is not None:
                 self._send_queue.put({
                     "type": "META_CGN_ADVISOR_CONFLICT",
@@ -1556,11 +1601,17 @@ class MetaCGNConsumer:
                     self._graduation_blockers_unchanged_chains,
                 "last_graduation_blockers_hash":
                     self._last_graduation_blockers_hash,
+                # 2026-04-17 persistence gap fix
+                "evidence_since_last_test": self._evidence_since_last_test,
+                "chains_since_decay": self._chains_since_decay,
             }
             haov_tmp = self._haov_path + ".tmp"
             with open(haov_tmp, "w") as f:
                 json.dump(haov_data, f, indent=2)
             os.replace(haov_tmp, self._haov_path)
+            # Also persist watchdog state (graduation_progress, status, etc.)
+            # so it survives restarts. Previously only saved on state transitions.
+            self._save_watchdog_state()
         except Exception as e:
             logger.warning("[MetaCGN] save_state failed: %s", e)
             self._record_failure("persistence_error", e)
@@ -1657,6 +1708,13 @@ class MetaCGNConsumer:
                         "graduation_blockers_unchanged_chains", 0))
                 self._last_graduation_blockers_hash = haov_data.get(
                     "last_graduation_blockers_hash", "")
+                # 2026-04-17 persistence gap fix
+                if "evidence_since_last_test" in haov_data:
+                    self._evidence_since_last_test = int(
+                        haov_data["evidence_since_last_test"])
+                if "chains_since_decay" in haov_data:
+                    self._chains_since_decay = int(
+                        haov_data["chains_since_decay"])
             logger.info(
                 "[MetaCGN] Loaded HAOV state from %s "
                 "(schema v%d, obs_restored=%d, v_history=%d)",
@@ -1817,6 +1875,7 @@ class MetaCGNConsumer:
                        "cooldown=1000 chains). All operations no-op until "
                        "cooldown expires.", reason, len(window_signatures))
         # Emit bus event
+        # INTENTIONAL_BROADCAST: observability-only failsafe notification.
         if self._send_queue is not None:
             try:
                 self._send_queue.put({
@@ -1877,6 +1936,10 @@ class MetaCGNConsumer:
                 "graduation_progress": self._graduation_progress,
                 "graduation_ts": self._graduation_ts,
                 "rolled_back_count": self._rolled_back_count,
+                "total_updates_applied": self._total_updates_applied,
+                # Option B: persist rollback baseline so detector works post-
+                # restart (in-memory deques are lost; baseline must survive).
+                "pre_graduation_baseline": self._pre_graduation_baseline,
             }
             tmp = self._watchdog_path + ".tmp"
             with open(tmp, "w") as f:
@@ -1905,6 +1968,11 @@ class MetaCGNConsumer:
             self._graduation_progress = int(data.get("graduation_progress", 0))
             self._graduation_ts = float(data.get("graduation_ts", 0.0))
             self._rolled_back_count = int(data.get("rolled_back_count", 0))
+            self._total_updates_applied = int(data.get("total_updates_applied", 0))
+            # Option B: restore rollback baseline if persisted
+            loaded_baseline = data.get("pre_graduation_baseline")
+            if isinstance(loaded_baseline, dict) and loaded_baseline:
+                self._pre_graduation_baseline = loaded_baseline
             logger.info("[MetaCGN] Loaded watchdog state: status=%s, "
                         "cooldown=%d, total_failures=%d",
                         self._status, self._cooldown_remaining,
@@ -1948,14 +2016,20 @@ class MetaCGNConsumer:
         self._status = "graduating"
         self._graduation_ts = time.time()
         self._graduation_progress = 0
-        # Pre-graduation baseline snapshot for rollback comparison
+        # Pre-graduation baseline snapshot for rollback comparison (scale-
+        # invariant: stores raw reward distribution, not success_rate threshold)
+        baseline_mean, baseline_std, baseline_n = (
+            self._compute_recent_reward_stats())
         self._pre_graduation_baseline = {
-            "success_rate_ema": self._compute_recent_success_rate(),
+            "reward_mean": baseline_mean,
+            "reward_std": baseline_std,
+            "reward_n": baseline_n,
             "primitive_variances": {
                 p: self._primitives[p].variance for p in self._primitives},
             "baseline_ts": time.time(),
         }
         # Emit bus event
+        # INTENTIONAL_BROADCAST: observability-only graduation state-telemetry.
         if self._send_queue is not None:
             try:
                 self._send_queue.put({
@@ -1979,8 +2053,9 @@ class MetaCGNConsumer:
                     "β will now rerank chain_iql top-K templates.")
         self._status = "active"
         self._chains_since_graduation = 0
-        self._post_grad_outcomes.clear()
+        self._post_grad_rewards.clear()
         # P4 D6: chain_archive record + TimeChain commit
+        # INTENTIONAL_BROADCAST: observability-only active-state telemetry.
         if self._send_queue is not None:
             try:
                 self._send_queue.put({
@@ -2018,30 +2093,60 @@ class MetaCGNConsumer:
                 pass
         self._save_watchdog_state()
 
-    def _compute_recent_success_rate(self) -> float:
-        """Rolling success rate proxy — uses pre_grad_outcomes if populated,
-        otherwise falls back to primitive V average."""
-        if self._pre_grad_outcomes:
-            return sum(self._pre_grad_outcomes) / len(self._pre_grad_outcomes)
+    def _compute_recent_reward_stats(self) -> tuple[float, float, int]:
+        """Rolling (mean, std, n) of recent raw terminal_reward floats.
+
+        Uses _pre_grad_rewards if populated; otherwise falls back to primitive
+        V average (single value → std=0, n=1). This is the pre-graduation
+        baseline snapshot feeding the scale-invariant rollback detector.
+        """
+        if self._pre_grad_rewards:
+            vals = list(self._pre_grad_rewards)
+            n = len(vals)
+            mean = sum(vals) / n
+            if n > 1:
+                var = sum((v - mean) ** 2 for v in vals) / (n - 1)
+                std = var ** 0.5
+            else:
+                std = 0.0
+            return mean, std, n
+        # No pre-grad data yet: fall back to V distribution (weak signal)
         Vs = [p.V for p in self._primitives.values() if p.n_samples > 0]
-        return sum(Vs) / max(1, len(Vs))
+        if Vs:
+            m = sum(Vs) / len(Vs)
+            return m, 0.0, 0
+        return 0.0, 0.0, 0
 
     def _check_rollback_conditions(self) -> None:
-        """P4 D3: auto-rollback if active mode is hurting. 3 conditions."""
+        """P4 D3: auto-rollback if active mode is hurting. Scale-invariant:
+        rollback when post-grad mean drops below baseline_mean − k·σ.
+
+        Variance-spike condition (per-primitive) unchanged — that signal is
+        scale-invariant already.
+        """
         if self._chains_since_graduation < 50:
             return  # Give ramp time to settle
         try:
-            # Condition 1: success rate drops ≥20% vs baseline
-            baseline_rate = self._pre_graduation_baseline.get(
-                "success_rate_ema", 0.5)
-            current_rate = (sum(self._post_grad_outcomes) /
-                            max(1, len(self._post_grad_outcomes)))
-            if baseline_rate > 0 and current_rate < baseline_rate * 0.8:
+            baseline_mean = float(self._pre_graduation_baseline.get(
+                "reward_mean", 0.0))
+            baseline_std = float(self._pre_graduation_baseline.get(
+                "reward_std", 0.0))
+            # Floor σ to avoid pathologically tight triggers when pre-grad
+            # rewards happen to be very tightly clustered.
+            effective_std = max(baseline_std, self._rollback_min_std_floor)
+            sigma_k = float(self._rollback_sigma_k)
+            threshold = baseline_mean - sigma_k * effective_std
+            if not self._post_grad_rewards:
+                return  # No post-grad data — nothing to compare
+            current_mean = (sum(self._post_grad_rewards) /
+                            len(self._post_grad_rewards))
+            if baseline_mean > 0 and current_mean < threshold:
                 self._rollback_to_shadow(
-                    reason=f"success_rate dropped {baseline_rate:.3f} → "
-                           f"{current_rate:.3f} (≥20%)")
+                    reason=f"reward_mean dropped {baseline_mean:.3f}±"
+                           f"{baseline_std:.3f} → {current_mean:.3f} "
+                           f"(>{sigma_k:g}σ below baseline)")
                 return
-            # Condition 2: variance spike
+            # Condition 2: variance spike (unchanged — scale-invariant)
             baseline_vars = self._pre_graduation_baseline.get(
                 "primitive_variances", {})
             for p_id, p in self._primitives.items():
@@ -2061,6 +2166,7 @@ class MetaCGNConsumer:
         self._rolled_back_count += 1
         self._graduation_progress = 0
         # Emit bus event
+        # INTENTIONAL_BROADCAST: observability-only rollback telemetry.
         if self._send_queue is not None:
             try:
                 self._send_queue.put({
@@ -2259,17 +2365,21 @@ class MetaCGNConsumer:
 
     # ── P4 Chain-outcome tracker (feeds rollback detector) ─────────
 
-    def record_chain_outcome(self, chain_succeeded: bool) -> None:
+    def record_chain_outcome(self, terminal_reward: float) -> None:
         """Feed post-graduation rollback detector. Called per chain conclude.
+
+        Takes raw terminal_reward (float in [0, 1] typically) and stores it
+        in the appropriate deque. Rollback detector compares post-grad reward
+        distribution against pre-grad baseline (mean ± k·σ) — scale-invariant.
 
         P6: also tick decay cadence counter (applies γ every N chains).
         P7: also tick monotonic chain_counter for conflict throttle cooldown.
         """
-        outcome = 1.0 if chain_succeeded else 0.0
+        r = float(terminal_reward)
         if self._status == "active":
-            self._post_grad_outcomes.append(outcome)
+            self._post_grad_rewards.append(r)
         else:
-            self._pre_grad_outcomes.append(outcome)
+            self._pre_grad_rewards.append(r)
         # P6 D2: tick decay cadence
         self._chains_since_decay = getattr(self, "_chains_since_decay", 0) + 1
         self._maybe_apply_decay()
@@ -2368,6 +2478,7 @@ class MetaCGNConsumer:
         if not dedup_seen:
             self._current_impasse_req_signature = dedup_key
         # Emit bus events
+        # INTENTIONAL_BROADCAST: observability-only impasse-detection telemetry.
         if self._send_queue is not None:
             try:
                 self._send_queue.put({
@@ -2607,8 +2718,19 @@ class MetaCGNConsumer:
         else:
             w_leg, w_comp, w_grd = 0.5, 0.5, 0.0
         # E3: β-dispersion secondary gate
-        if w_grd > 0.05 and self._beta_dispersion_ema < 0.05:
-            w_grd = 0.05
+        # 2026-04-19 rFP_chain_iql_v2 FIX-5: the hardcoded 0.05 threshold was
+        # causing a chicken-and-egg lock. β-dispersion on T1/T2/T3 measured
+        # 0.019-0.029 — all below 0.05, triggering the cap. But dispersion
+        # stays low *because* w_grounded is capped (META-CGN can't move V
+        # values without authority). Lowering threshold to 0.015 breaks the
+        # deadlock: w_grounded gets real authority → β updates drive V
+        # differentiation → dispersion climbs organically → gate opens fully.
+        # Thresholds are now toml-driven (E3 in rFP §7 stays intact; just
+        # calibrated to observed reality rather than a first-draft guess).
+        disp_threshold = float(self._e3_dispersion_threshold)
+        disp_cap = float(self._e3_dispersion_cap)
+        if w_grd > disp_cap and self._beta_dispersion_ema < disp_threshold:
+            w_grd = disp_cap
             # Compensate — boost legacy + compound proportionally
             w_leg += (w_leg / (w_leg + w_comp)) * (1 - w_leg - w_comp - w_grd) \
                 if (w_leg + w_comp) > 1e-6 else 0
@@ -2749,6 +2871,51 @@ class MetaCGNConsumer:
 
     # ── P10: Cross-consumer signal flow handler ───────────────────────
 
+    # ── COMPLETE-9 HAOV signal↔chain correlation telemetry ─────────
+    # Pure observability layer. Logs (ts, signal-event) and (ts, chain-outcome)
+    # entries to a unified JSONL. Next-session META-CGN-V2-HAOV-REFINEMENT
+    # joins them by time window to discover which (consumer, event_type,
+    # primitive) tuples actually correlate with chain success, then drifts
+    # quality_nudge values from hand-crafted toward learned.
+
+    def _log_haov_entry(self, entry: dict) -> None:
+        """Append one HAOV telemetry entry (signal or chain) to the jsonl
+        log. Line-cap rotation keeps disk bounded. Silent on failure."""
+        try:
+            if self._haov_log_lines >= self._haov_log_max_lines:
+                # Rotate — current becomes .archive, overwriting any prior
+                if os.path.exists(self._haov_log_path):
+                    os.replace(self._haov_log_path,
+                               self._haov_log_path + ".archive")
+                self._haov_log_lines = 0
+            if "ts" not in entry:
+                entry["ts"] = time.time()
+            with open(self._haov_log_path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+            self._haov_log_lines += 1
+        except Exception:
+            pass
+
+    def log_haov_chain(self, chain_id: int, primitives: list,
+                       dominant: Optional[str], terminal_reward: float,
+                       domain: Optional[str] = None) -> None:
+        """Log chain-conclusion entry for HAOV correlation analysis.
+
+        Called from meta_reasoning chain-conclude path alongside
+        record_chain_outcome. Signal entries written from
+        handle_cross_consumer_signal. Join by time window (e.g. signals
+        within 60s before chain start) reveals which subsystem signals
+        actually predict outcome quality.
+        """
+        self._log_haov_entry({
+            "kind": "chain",
+            "chain_id": int(chain_id) if chain_id is not None else -1,
+            "primitives": list(primitives) if primitives else [],
+            "dominant": dominant,
+            "terminal_reward": float(terminal_reward),
+            "domain": domain,
+        })
+
     def handle_cross_consumer_signal(self, consumer: str, event_type: str,
                                       intensity: float = 1.0,
                                       domain: Optional[str] = None,
@@ -2801,6 +2968,18 @@ class MetaCGNConsumer:
                     domain=domain,
                 )
             self._signals_applied += 1
+            # COMPLETE-9 telemetry: log signal entry for correlation analysis.
+            # Next-session META-CGN-V2-HAOV-REFINEMENT will learn quality_nudge
+            # values from these signal↔chain correlations.
+            self._log_haov_entry({
+                "kind": "signal",
+                "consumer": consumer,
+                "event_type": event_type,
+                "primitives_nudged": dict(mapping),
+                "intensity": float(intensity),
+                "effective_weight": float(effective_weight),
+                "domain": domain,
+            })
             # Layer 2 narrative bridge hook (stub in v1)
             if (intensity >= P10_NARRATIVE_TRIGGER_INTENSITY
                     and narrative_context):
@@ -3052,7 +3231,7 @@ class MetaCGNConsumer:
             "ready_to_graduate": (
                 primitives_well_sampled >= 5 and
                 self._total_updates_applied >= 2000 and
-                confirmed_hypotheses >= 3 and
+                confirmed_hypotheses >= 2 and  # was 3; 2 confirmed (domain_affinity + impasse) is sufficient evidence (2026-04-17)
                 self._status == "shadow_mode"
             ),
             # ── P6: β-influence + usage + domain telemetry ──

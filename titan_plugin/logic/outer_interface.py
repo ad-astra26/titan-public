@@ -56,8 +56,8 @@ class OuterInterface:
         ad_cfg = params_config.get("action_decoder", {}) if params_config else {}
         an_cfg = params_config.get("action_narrator", {}) if params_config else {}
 
-        self.decoder = ActionDecoder(params_config=ad_cfg)
-        self.narrator = ActionNarrator(word_recipe_dir=word_recipe_dir)
+        self.decoder = ActionDecoder(config=params_config)
+        self.narrator = ActionNarrator(word_recipe_dir=word_recipe_dir, config=params_config)
         self.advisor = SelfExplorationAdvisor(dna_params=dna_params, params_config=se_cfg)
 
         self._cooldown_multiplier = float(se_cfg.get(

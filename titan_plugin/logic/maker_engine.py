@@ -98,6 +98,9 @@ Respond ONLY with a JSON array:
 Max 3 actions."""
 
 
+# PERSISTENCE_BY_DESIGN: MakerRelationshipEngine._maker_ids is loaded from
+# the maker-registry config (Solana address list) at boot — config data, not
+# self-owned state.
 class MakerRelationshipEngine:
     """
     Builds a living profile of the Maker through conversation analysis.

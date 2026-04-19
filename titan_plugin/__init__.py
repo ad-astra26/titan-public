@@ -45,6 +45,10 @@ def __getattr__(name):
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
+# PERSISTENCE_BY_DESIGN: TitanPlugin._full_config / _stealth_sage_config /
+# _recovery_mode / _last_execution_mode / _last_research_sources are runtime
+# bootstrap state (config loaded from config.toml, flags from filesystem
+# markers, session caches). Not self-owned state to persist across restarts.
 class TitanPlugin:
     """
     Main entry point for the Titan Memory Architecture plugin.

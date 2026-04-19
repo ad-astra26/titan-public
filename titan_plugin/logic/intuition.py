@@ -33,10 +33,12 @@ POSTURES = {
 
 CENTER = 0.5
 
-# Trust tracking
+# Trust tracking — defaults, overridden by [intuition] TOML section if provided
 TRUST_DECAY = 0.99       # Trust decays slowly
 TRUST_BOOST = 0.05       # Good outcome boosts trust
 TRUST_PENALTY = 0.03     # Bad outcome after ignoring suggestion penalizes
+SUGGESTION_COOLDOWN_S = 120  # Min seconds between repeat suggestions of same posture
+MIN_DEFICIT_THRESHOLD = 0.15  # Below this, no suggestion surfaces
 
 
 class IntuitionEngine:
@@ -47,7 +49,14 @@ class IntuitionEngine:
     combined with value network confidence when FILTER_DOWN is trained.
     """
 
-    def __init__(self):
+    def __init__(self, config: Optional[dict] = None):
+        section = (config or {}).get("intuition", {}) if isinstance(config, dict) else {}
+        self._trust_decay       = float(section.get("trust_decay", TRUST_DECAY))
+        self._trust_boost       = float(section.get("trust_boost", TRUST_BOOST))
+        self._trust_penalty     = float(section.get("trust_penalty", TRUST_PENALTY))
+        self._cooldown_s        = float(section.get("suggestion_cooldown_s", SUGGESTION_COOLDOWN_S))
+        self._min_deficit       = float(section.get("min_deficit_threshold", MIN_DEFICIT_THRESHOLD))
+
         self._trust = 0.5  # Start neutral
         self._last_suggestion: Optional[dict] = None
         self._last_suggestion_ts = 0.0
@@ -80,7 +89,7 @@ class IntuitionEngine:
         all_deficits.sort(key=lambda x: x[2], reverse=True)
 
         # Only suggest if the worst deficit is significant
-        if not all_deficits or all_deficits[0][2] < 0.15:
+        if not all_deficits or all_deficits[0][2] < self._min_deficit:
             return None
 
         worst_layer, worst_dim, worst_deficit = all_deficits[0]
@@ -94,7 +103,7 @@ class IntuitionEngine:
         # Don't repeat the same suggestion too quickly
         if (self._last_suggestion and
             self._last_suggestion.get("posture_id") == posture_id and
-            time.time() - self._last_suggestion_ts < 120):
+            time.time() - self._last_suggestion_ts < self._cooldown_s):
             return None
 
         suggestion = {
@@ -125,12 +134,12 @@ class IntuitionEngine:
         improved = loss_after < loss_before
 
         if followed and improved:
-            self._trust = min(1.0, self._trust + TRUST_BOOST)
+            self._trust = min(1.0, self._trust + self._trust_boost)
         elif not followed and not improved:
-            self._trust = max(0.0, self._trust - TRUST_PENALTY)
+            self._trust = max(0.0, self._trust - self._trust_penalty)
 
         # Decay trust slightly over time
-        self._trust *= TRUST_DECAY
+        self._trust *= self._trust_decay
 
         self._outcome_history.append({
             "ts": time.time(),

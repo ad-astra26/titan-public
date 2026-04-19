@@ -95,6 +95,33 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             _handle_query(msg, memory, send_queue, name, loop, config)
             last_heartbeat = time.time()
 
+        elif msg_type == "MEMORY_ADD":
+            # spirit_worker emits MEMORY_ADD on Maker-dialogue profile enrichment
+            # (and any other text-ingest path that wants to bypass the mempool +
+            # skip the discovery delay). Payload: {text, source, weight}. Call
+            # inject_memory synchronously via the event loop, non-blocking on
+            # errors so a bad payload can't starve the main recv loop.
+            try:
+                payload = msg.get("payload", {}) or {}
+                text = payload.get("text", "")
+                source = payload.get("source", "bus")
+                weight = float(payload.get("weight", 1.0))
+                if not text:
+                    logger.debug("[MemoryWorker] MEMORY_ADD ignored (empty text)")
+                else:
+                    loop.run_until_complete(
+                        memory.inject_memory(text=text, source=source, weight=weight)
+                    )
+                    logger.info(
+                        "[MemoryWorker] MEMORY_ADD injected (source=%s, weight=%.2f, "
+                        "text_len=%d)",
+                        source, weight, len(text),
+                    )
+            except Exception as _ma_err:
+                logger.warning("[MemoryWorker] MEMORY_ADD handler error: %s", _ma_err,
+                               exc_info=True)
+            last_heartbeat = time.time()
+
     logger.info("[MemoryWorker] Exiting")
     loop.close()
 

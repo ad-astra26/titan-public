@@ -622,6 +622,11 @@ class MultiChainScheduler:
 
 # ── Meta-Reasoning Engine ─────────────────────────────────────────
 
+# PERSISTENCE_BY_DESIGN: MetaReasoningEngine._chain_iql + _meta_cgn are
+# sub-component object references that own their own persistence paths
+# (chain_iql state + primitive_grounding.json). _subsystem_cache_pending is
+# a transient async-fetch flag. None are state the MetaReasoningEngine
+# should restore itself.
 class MetaReasoningEngine:
     """Meta-reasoning: thinking about thinking.
 
@@ -708,6 +713,17 @@ class MetaReasoningEngine:
             self._dna.get("inengine_mono_pressure_decay", 100))
         self._inengine_mono_last_fire_chain: int = -1
         self._inengine_mono_total_fires: int = 0
+
+        # ── Consecutive-repeat decay (TUNING-017) ──
+        # Penalizes selecting the same primitive N times in a row within a chain.
+        # Real thinking has natural flow: FORMULATE→EVALUATE→RECALL, not
+        # FORMULATE→FORMULATE→FORMULATE. Each consecutive repeat gets a
+        # multiplicative logit penalty: -decay_per_repeat * consecutive_count.
+        # 1st repeat: small penalty. 3rd+: nearly impossible.
+        self._repeat_decay_per_step: float = float(
+            self._dna.get("repeat_decay_per_step", 1.5))
+        self._repeat_decay_max: float = float(
+            self._dna.get("repeat_decay_max", 5.0))
 
         # ── Audit telemetry (Task 3 observability — feeds /v4/meta-reasoning/audit) ──
         # Last 10 diversity pressure fires with timestamps for cadence analysis.
@@ -987,21 +1003,47 @@ class MetaReasoningEngine:
         meta_input = self._build_meta_input(sv, nm, chain_archive)
         temperature = self._get_temperature(nm)
 
+        # ── TUNING-017: consecutive-repeat decay ──
+        # Count how many times the last primitive repeated at the tail of the
+        # current chain. Apply a logit penalty proportional to the repeat count.
+        # FORMULATE→FORMULATE→FORMULATE is penalized; FORMULATE→EVALUATE→FORMULATE is not.
+        _repeat_bias = np.zeros(NUM_META_ACTIONS, dtype=np.float32)
+        if self.state.chain:
+            _last = self.state.chain[-1]
+            _consec = 0
+            for _p in reversed(self.state.chain):
+                if _p == _last:
+                    _consec += 1
+                else:
+                    break
+            if _consec >= 1:
+                try:
+                    _last_idx = META_PRIMITIVES.index(_last)
+                    _penalty = min(self._repeat_decay_per_step * _consec,
+                                   self._repeat_decay_max)
+                    _repeat_bias[_last_idx] = -_penalty
+                except ValueError:
+                    pass
+
         # TUNING-012 v2 Sub-phase C (R3): apply diversity pressure if active.
         # When monoculture_detector contract has fired and the handler called
         # apply_diversity_pressure(), we re-roll the primitive selection with
         # the directed negative bias added to the policy logits. This is the
         # active escape pressure that turns Phase C into a closed control loop.
-        if self._diversity_pressure_remaining > 0 and np.any(self._primitive_bias):
+        _has_bias = (self._diversity_pressure_remaining > 0 and np.any(self._primitive_bias)) or np.any(_repeat_bias)
+        if _has_bias:
             try:
                 _scores = self.meta_policy.forward(np.array(meta_input, dtype=np.float32))
-                _biased = _scores + self._primitive_bias
+                _total_bias = _repeat_bias.copy()
+                if self._diversity_pressure_remaining > 0 and np.any(self._primitive_bias):
+                    _total_bias += self._primitive_bias
+                _biased = _scores + _total_bias
                 _t = max(0.1, temperature)
                 _exp = np.exp((_biased - _biased.max()) / _t)
                 _probs = _exp / (_exp.sum() + 1e-8)
                 prim_idx = int(np.random.choice(NUM_META_ACTIONS, p=_probs))
             except Exception as _dp_err:
-                logger.warning("[META] Diversity pressure rebias failed: %s", _dp_err)
+                logger.warning("[META] Diversity/repeat bias failed: %s", _dp_err)
                 prim_idx = self.meta_policy.select_action(meta_input, temperature)
         else:
             prim_idx = self.meta_policy.select_action(meta_input, temperature)
@@ -1293,22 +1335,156 @@ class MetaReasoningEngine:
             except Exception as _mcgn_save_err:
                 logger.warning("[META] META-CGN save failed: %s",
                                _mcgn_save_err)
-        # Save stats
+        # Save stats — bulletproof pre-flight write.
+        # 2026-04-19 CRITICAL FIX: prior atomic-write pattern (open(w) +
+        # os.replace) was fundamentally fragile — open("w") truncates
+        # tmp to 0 bytes BEFORE any serialization check, so any
+        # json.dump exception left a 0-byte tmp that could corrupt the
+        # path file on os.replace. All 3 Titans lost meta-reasoning
+        # counter persistence since 2026-04-17 18:40-ish because a
+        # non-serializable attribute (likely numpy/torch leak into
+        # _diversity_pressure_target / _suggested_template) made
+        # json.dump raise on every dream cycle.
+        #
+        # Bulletproof fix:
+        #   1. Pre-flight: json.dumps() to an in-memory STRING. No file
+        #      touched. Uses default=_jsonable_default — a catch-all
+        #      that NEVER raises (falls back to repr() of the value).
+        #      Result: json.dumps always succeeds, even on exotic types.
+        #   2. Atomic write with PRE-SERIALIZED string. We only open(w)
+        #      tmp after we know the content is valid, so the tmp file
+        #      can't be 0 bytes.
+        #   3. os.replace only on successful write (same as before).
+        #   4. Outer try/except still wraps everything with WARN + tmp
+        #      cleanup as defense-in-depth against disk-full / permission
+        #      / other I/O failures.
         stats_path = os.path.join(self.save_dir, "meta_stats.json")
-        with open(stats_path, "w") as f:
-            json.dump({
-                "total_chains": self._total_meta_chains,
-                "total_steps": self._total_meta_steps,
-                "total_wisdom_saved": self._total_wisdom_saved,
-                "total_eurekas": self._total_eurekas,
-                "baseline_confidence": float(self._baseline_confidence),
-                "strategy_history": self._strategy_history.tolist(),
-                "ema_state": self._ema_state.tolist(),
-                # Adaptive epsilon-greedy: persist recent chain unique counts so
-                # epsilon doesn't reset to 0 every restart (would let collapsed
-                # policies stay stuck during the 10-chain warmup window)
-                "recent_chain_uniques": list(self._recent_chain_uniques),
-            }, f)
+        tmp_stats = stats_path + ".tmp"
+
+        def _jsonable_default(x):
+            """json.dumps default= handler. NEVER raises.
+            Coerces any unknown type to a JSON-safe value with progressively
+            more lossy fallbacks — tolist → item → to_dict → repr → placeholder.
+            """
+            try:
+                if hasattr(x, "tolist"):
+                    return x.tolist()
+            except Exception:
+                pass
+            try:
+                if hasattr(x, "item"):
+                    return x.item()
+            except Exception:
+                pass
+            try:
+                if hasattr(x, "to_dict"):
+                    return x.to_dict()
+            except Exception:
+                pass
+            try:
+                return repr(x)[:200]
+            except Exception:
+                return "<unrepresentable>"
+
+        # Wrap EVERYTHING (payload construction + serialize + write) in
+        # one try/except. The prior fix only wrapped json.dumps+write;
+        # payload construction could raise (e.g., numpy truth-value
+        # ambiguous error when an attribute unexpectedly became an
+        # array — confirmed as the actual failure mode from brain log
+        # analysis: "[Coordinator] Meta-reasoning consolidation error:
+        # The truth value of an array with more than one element is
+        # ambiguous. Use a.any() or a.all()" firing every consolidation
+        # since 16:34 on 2026-04-19).
+        #
+        # Also: replace `and X` truthy checks with explicit isinstance
+        # type guards so a numpy-array leak can't trigger the truth-value
+        # error. Bool conversions go through `_safe_bool_nonempty()`
+        # which handles dicts, sequences, and arrays correctly.
+        def _safe_nonempty_dict(attr_name: str) -> dict:
+            """Return {k: float(v)} for a dict-attribute, else {}.
+            Guards against the attribute being a non-dict (e.g., numpy
+            array leak) by explicit isinstance check."""
+            x = getattr(self, attr_name, None)
+            if isinstance(x, dict) and len(x) > 0:
+                try:
+                    return {str(k): float(v) for k, v in x.items()}
+                except Exception:
+                    return {}
+            return {}
+
+        def _safe_int(attr_name: str, default: int = 0) -> int:
+            x = getattr(self, attr_name, default)
+            try:
+                return int(x) if x is not None else default
+            except Exception:
+                return default
+
+        def _safe_float(attr_name: str, default: float = 0.0) -> float:
+            x = getattr(self, attr_name, default)
+            try:
+                return float(x) if x is not None else default
+            except Exception:
+                return default
+
+        try:
+            stats_payload = {
+                "total_chains": _safe_int("_total_meta_chains"),
+                "total_steps": _safe_int("_total_meta_steps"),
+                "total_wisdom_saved": _safe_int("_total_wisdom_saved"),
+                "total_eurekas": _safe_int("_total_eurekas"),
+                "baseline_confidence": _safe_float(
+                    "_baseline_confidence", 0.5),
+                "strategy_history": self._strategy_history.tolist()
+                if hasattr(self, "_strategy_history")
+                and hasattr(self._strategy_history, "tolist") else [],
+                "ema_state": self._ema_state.tolist()
+                if hasattr(self, "_ema_state")
+                and hasattr(self._ema_state, "tolist") else [],
+                "recent_chain_uniques": (
+                    list(self._recent_chain_uniques)
+                    if hasattr(self, "_recent_chain_uniques") else []),
+                "primitive_bias": _safe_nonempty_dict("_primitive_bias"),
+                "diversity_pressure_target": _jsonable_default(
+                    getattr(self, "_diversity_pressure_target", None)),
+                "reroute_count": _safe_int("_reroute_count"),
+                "suggested_template": _jsonable_default(
+                    getattr(self, "_suggested_template", None)),
+                "suggested_template_q": _safe_float(
+                    "_suggested_template_q"),
+                "subsystem_cache_pending": bool(
+                    getattr(self, "_subsystem_cache_pending", False)),
+            }
+            # Step 1 — pre-flight serialize to string (in-memory, no
+            # file touched). default= handles any exotic type.
+            payload_str = json.dumps(stats_payload,
+                                     default=_jsonable_default)
+            # Step 2 — atomic write of pre-serialized content. tmp can
+            # only reach this block with valid content.
+            with open(tmp_stats, "w") as f:
+                f.write(payload_str)
+            os.replace(tmp_stats, stats_path)
+        except Exception as _ss_err:
+            # Catches ANYTHING — payload construction, serialization, I/O.
+            # Before this, numpy truth-value errors in payload construction
+            # escaped all wrappers and propagated to the coordinator level
+            # ("Meta-reasoning consolidation error" logged there every
+            # dream cycle, but meta_stats save silently skipped).
+            logger.warning(
+                "[META] meta_stats.json save FAILED: %s — previous file "
+                "preserved (no overwrite). Attr types: "
+                "primitive_bias=%s reroute_count=%s suggested_template=%s "
+                "ema_state=%s",
+                _ss_err,
+                type(getattr(self, "_primitive_bias", None)).__name__,
+                type(getattr(self, "_reroute_count", None)).__name__,
+                type(getattr(self, "_suggested_template", None)).__name__,
+                type(getattr(self, "_ema_state", None)).__name__,
+            )
+            try:
+                if os.path.exists(tmp_stats):
+                    os.remove(tmp_stats)
+            except Exception:
+                pass
 
     def get_stats(self) -> dict:
         prim_counts = {}
@@ -1764,6 +1940,8 @@ class MetaReasoningEngine:
         contract_results: Optional[list] = None,
         inner_relevance: Optional[float] = None,
         kuzu_centrality: Optional[float] = None,
+        self_prediction_accuracy: Optional[float] = None,
+        self_profile_divergence: Optional[float] = None,
         now: Optional[float] = None,
     ) -> dict:
         """Populate the subsystem cache from bus query responses.
@@ -1809,13 +1987,24 @@ class MetaReasoningEngine:
         if timechain_results is not None:
             try:
                 blocks = list(timechain_results) if timechain_results else []
-                # Group by thought_type
+                # Group by thought_type.
+                # TimeChain uses: declarative|procedural|episodic|meta|genesis
+                # Map to meta-reasoning signal categories:
+                _TC_TYPE_MAP = {
+                    "declarative": "recall",      # stored knowledge retrieval
+                    "procedural": "formulate",     # plans, procedures, how-to
+                    "meta": "evaluate",            # meta-level assessment
+                    "episodic": "introspect",      # experiential / self-observation
+                    "genesis": "break",            # chain genesis = break/restart
+                }
                 by_type: dict = {}
                 for b in blocks:
                     if not isinstance(b, dict):
                         continue
-                    tt = (b.get("thought_type") or "").lower()
-                    by_type.setdefault(tt, []).append(b)
+                    tt = (b.get("thought_type") or b.get("t") or "").lower()
+                    # Map TimeChain types to meta-reasoning categories
+                    mapped = _TC_TYPE_MAP.get(tt, tt)
+                    by_type.setdefault(mapped, []).append(b)
 
                 def _avg_sig(items):
                     sigs = [float(it.get("significance", 0.0) or 0.0) for it in items]
@@ -1875,16 +2064,23 @@ class MetaReasoningEngine:
         if kuzu_centrality is not None:
             cache["kuzu_centrality"] = float(max(0.0, min(1.0, kuzu_centrality)))
 
-        # Mark refresh complete (only if BOTH TC and contracts arrived, OR if
-        # the safety-net pending TTL already expired)
-        if timechain_results is not None and contract_results is not None:
+        if self_prediction_accuracy is not None:
+            cache["self_prediction_accuracy"] = float(max(0.0, min(1.0, self_prediction_accuracy)))
+
+        if self_profile_divergence is not None:
+            cache["self_profile_divergence"] = float(max(0.0, min(1.0, self_profile_divergence)))
+
+        # Bump cache_ts on ANY response. TIMECHAIN_QUERY_RESP and
+        # CONTRACT_LIST_RESP always arrive as separate update_subsystem_cache
+        # calls, never with both args set. The prior "bump only when both"
+        # branch never fired past the first response, so is_subsystem_cache_stale
+        # stayed True forever and the audit displayed 24h-old timestamps.
+        if timechain_results is not None or contract_results is not None:
             self._subsystem_cache_ts = now
+        # Clear pending only when BOTH have arrived in the same call, OR when
+        # the ttl*2 safety-net auto-clear fires in is_subsystem_cache_pending.
+        if timechain_results is not None and contract_results is not None:
             self._subsystem_cache_pending = False
-        elif timechain_results is not None or contract_results is not None:
-            # Partial update — bump ts so the data is "fresher than nothing"
-            # but don't clear pending until both arrive
-            if self._subsystem_cache_ts == 0.0:
-                self._subsystem_cache_ts = now
 
         return dict(cache)
 
@@ -2206,8 +2402,25 @@ class MetaReasoningEngine:
                 })
                 # Phase 4+5 per-chain hooks — graduation ramp, rollback check,
                 # impasse detection, failsafe cooldown decrement.
-                # success proxy: terminal_reward ≥ 0.5 = "success"
-                self._meta_cgn.record_chain_outcome(task_success_mcgn >= 0.5)
+                # Pass RAW reward — rollback detector is scale-invariant
+                # (compares post-grad mean to baseline_mean − k·σ).
+                self._meta_cgn.record_chain_outcome(task_success_mcgn)
+                # Track last-concluded chain_id so late-arriving cross-system
+                # reward signals (persona session quality, events teacher
+                # outcomes, etc.) can correlate to the most recent chain via
+                # get_last_chain_id().
+                self._last_concluded_chain_id = int(self.state.chain_id)
+                # COMPLETE-9 HAOV telemetry — log chain outcome for
+                # signal↔chain correlation analysis (next-session
+                # META-CGN-V2-HAOV-REFINEMENT will learn SIGNAL_TO_PRIMITIVE
+                # quality_nudge values from this data).
+                self._meta_cgn.log_haov_chain(
+                    chain_id=self.state.chain_id,
+                    primitives=list(prims_in_chain),
+                    dominant=dominant_primitive,
+                    terminal_reward=task_success_mcgn,
+                    domain=final_domain_mcgn,
+                )
                 self._meta_cgn.evaluate_graduation()
                 self._meta_cgn.check_impasse()
                 self._meta_cgn.maybe_exit_impasse()
@@ -2284,6 +2497,20 @@ class MetaReasoningEngine:
                     self._total_meta_chains, terminal_reward, len(self.state.chain),
                     duration, self.state.trigger_reason)
 
+        # Close wisdom reuse loop: if this chain loaded prior wisdom via
+        # FORMULATE.load_wisdom, feed the chain outcome back so confidence
+        # and crystallization can update. Without this, wisdom accumulates
+        # with times_reused=0 forever (dead-wiring bug found 2026-04-16).
+        if meta_wisdom and self.state.formulate_output:
+            prior = self.state.formulate_output.get("prior_strategy")
+            if prior and isinstance(prior, dict) and "id" in prior:
+                try:
+                    meta_wisdom.record_reuse(
+                        prior["id"],
+                        success=(terminal_reward > 0.3))
+                except Exception:
+                    pass  # Non-fatal — reuse tracking is observability
+
         # Strategy collapse detection: every 100 chains, audit distribution
         if self._total_meta_chains > 0 and self._total_meta_chains % 100 == 0:
             prim_counts: dict = {}
@@ -2346,6 +2573,16 @@ class MetaReasoningEngine:
         return result
 
     # ── Phase D.1 — External reward injection (META_LANGUAGE loop) ────
+    def get_last_chain_id(self) -> int:
+        """Most-recently-concluded chain_id, for correlating late-arriving
+        external reward signals (e.g. persona session quality events that
+        fire after a chain already concluded). Returns -1 if no chain
+        concluded yet or chain_id unavailable."""
+        try:
+            return int(getattr(self, "_last_concluded_chain_id", -1))
+        except Exception:
+            return -1
+
     def add_external_reward(
         self, chain_id: int, external_reward: float
     ) -> bool:
@@ -2401,6 +2638,54 @@ class MetaReasoningEngine:
         """
         if not self.state.chain or self.state.impasse_detected:
             return None
+
+        # ── Check 1: Primitive-repeat impasse (TUNING-017 / SOAR rFP) ──
+        # Detects F→F→F as "stuck in a loop" — independent of reward trends.
+        # A chain can have stable rewards from passive signals (spirit drift)
+        # while being cognitively stuck in the same primitive.
+        repeat_thresh = int(self._soar_config.get("repeat_threshold", 3))
+        if len(self.state.chain) >= repeat_thresh:
+            _tail = self.state.chain[-repeat_thresh:]
+            if len(set(_tail)) == 1:
+                # All same primitive — repeat_stuck impasse
+                _repeated = _tail[0]
+                _repeat_count = 0
+                for _p in reversed(self.state.chain):
+                    if _p == _repeated:
+                        _repeat_count += 1
+                    else:
+                        break
+                _urgency = float(self._soar_config.get("repeat_urgency", 0.8))
+                _topic = f"cognitive diversity breaking {_repeated.lower()} repetition thinking strategies"
+
+                self.state.impasse_detected = True
+                self.state.impasse_topic = _topic
+                # Track repeat impasses for META-CGN learning
+                if not hasattr(self, "_repeat_impasse_count"):
+                    self._repeat_impasse_count = 0
+                self._repeat_impasse_count += 1
+                if not hasattr(self, "_repeat_impasse_primitives"):
+                    self._repeat_impasse_primitives = {}
+                self._repeat_impasse_primitives[_repeated] = (
+                    self._repeat_impasse_primitives.get(_repeated, 0) + 1)
+
+                logger.info(
+                    "[META] SOAR repeat impasse: primitive=%s count=%d "
+                    "urgency=%.2f chain_step=%d (lifetime_repeat_impasses=%d)",
+                    _repeated, _repeat_count, _urgency,
+                    len(self.state.chain), self._repeat_impasse_count)
+
+                return {
+                    "type": "repeat_stuck",
+                    "topic": _topic,
+                    "urgency": _urgency,
+                    "repeated_primitive": _repeated,
+                    "repeat_count": _repeat_count,
+                    "chain_id": getattr(self.state, "chain_id", 0),
+                    "chain_step": len(self.state.chain),
+                }
+
+        # ── Check 2: Declining-reward impasse (original D.2) ──
         rewards = self.state.step_rewards
         threshold = self._soar_config["threshold_consec"]
         # Curiosity momentum: lower threshold by bonus after successful research
@@ -3149,15 +3434,26 @@ class MetaReasoningEngine:
         styles produce insights through different primitives — T1 via SYNTHESIZE,
         T2 via recall-connection, T3 via FORMULATE articulation.
         """
-        # Compute novelty
-        novelty = 0.5
+        # Compute novelty — two complementary signals:
+        # 1. Wisdom-embedding novelty: cosine distance to nearest stored wisdom
+        # 2. Prediction novelty: from the Prediction engine's running EMA
+        # The max of both is used so that even when the wisdom store is
+        # saturated (novelty→0), the prediction novelty can still drive DA.
+        wisdom_novelty = 0.5
         if meta_wisdom and autoencoder and autoencoder.is_trained:
             emb = autoencoder.encode(sv[:132])
             similar = meta_wisdom.query_by_embedding(emb, min_confidence=0.3, top_k=1)
             if similar:
-                novelty = 1.0 - similar[0].get("similarity", 0.5)
+                wisdom_novelty = 1.0 - similar[0].get("similarity", 0.5)
             else:
-                novelty = 1.0
+                wisdom_novelty = 1.0
+        # Prediction-based novelty: 1 - prediction_accuracy from subsystem cache
+        # (populated by spirit_worker from prediction_engine._novelty_ema)
+        pred_novelty = 0.0
+        if self._subsystem_cache:
+            pred_acc = self._subsystem_cache.get("self_prediction_accuracy", 1.0)
+            pred_novelty = max(0.0, 1.0 - pred_acc)  # surprise = lack of prediction
+        novelty = max(wisdom_novelty, pred_novelty)
         # Immediate wisdom crystallization
         wisdom_id = -1
         if meta_wisdom and self.state.formulate_output:
@@ -3645,6 +3941,26 @@ class MetaReasoningEngine:
             getattr(self, "_chains_since_last_eureka", 100))
         ctx["chains_since_impasse"] = float(
             getattr(self, "_chains_since_last_impasse", 50))
+        # SOAR repeat-impasse awareness: lets META-CGN learn that
+        # repetitive chains → low V(s) → steer toward diversity
+        ctx["repeat_impasse_lifetime"] = float(
+            getattr(self, "_repeat_impasse_count", 0))
+        # Diversity score: Shannon entropy of primitive distribution (0=monoculture, 1=uniform)
+        try:
+            _actions = list(self.buffer._actions) if self.buffer else []
+            if _actions:
+                _counts = {}
+                for _a in _actions[-200:]:  # last 200 actions
+                    _counts[_a] = _counts.get(_a, 0) + 1
+                _total = sum(_counts.values())
+                import math as _m
+                _entropy = -sum((c/_total) * _m.log2(c/_total) for c in _counts.values() if c > 0)
+                _max_entropy = _m.log2(max(len(_counts), 1)) or 1.0
+                ctx["diversity_score"] = _entropy / _max_entropy  # normalized 0-1
+            else:
+                ctx["diversity_score"] = 0.5
+        except Exception:
+            ctx["diversity_score"] = 0.5
         return ctx
 
     def _compute_meta_reward(self) -> float:
@@ -3773,6 +4089,18 @@ class MetaReasoningEngine:
         # Stats
         stats_path = os.path.join(self.save_dir, "meta_stats.json")
         if os.path.exists(stats_path):
+            # 2026-04-19: surface empty/corrupt-file case at WARN level
+            # (was silent except pass, which hid T1's 0-byte file for
+            # 2 days — counters restarted from 0 every boot). See
+            # save_all defensive type coercion fix for the write side.
+            file_size = os.path.getsize(stats_path)
+            if file_size == 0:
+                logger.warning(
+                    "[META] meta_stats.json is 0 bytes at %s — counters "
+                    "will start from defaults. Previous save likely failed "
+                    "due to non-serializable type (see save_all try/except "
+                    "WARN in brain log). DATA LOSS unless backup exists.",
+                    stats_path)
             try:
                 with open(stats_path) as f:
                     s = json.load(f)
@@ -3791,8 +4119,28 @@ class MetaReasoningEngine:
                     self._recent_chain_uniques = deque(
                         (int(u) for u in saved_uniques), maxlen=50
                     )
-            except Exception:
-                pass
+                # v4 persistence gap fixes (2026-04-17)
+                saved_bias = s.get("primitive_bias", {})
+                if saved_bias and hasattr(self, '_primitive_bias'):
+                    self._primitive_bias = {k: float(v) for k, v in saved_bias.items()}
+                if s.get("diversity_pressure_target") is not None and hasattr(self, '_diversity_pressure_target'):
+                    self._diversity_pressure_target = s["diversity_pressure_target"]
+                if s.get("reroute_count") and hasattr(self, '_reroute_count'):
+                    self._reroute_count = int(s["reroute_count"])
+                if s.get("suggested_template") is not None and hasattr(self, '_suggested_template'):
+                    self._suggested_template = s["suggested_template"]
+                if s.get("suggested_template_q") and hasattr(self, '_suggested_template_q'):
+                    self._suggested_template_q = float(s["suggested_template_q"])
+            except Exception as _ld_err:
+                # 2026-04-19: surface the parse failure at WARN instead of
+                # silent pass. Prior behavior hid T1's 0-byte file for 2
+                # days. Legitimate reasons to reach here: empty file (handled
+                # above with 0-byte WARN), genuinely corrupt JSON,
+                # schema-mismatch after a save format change.
+                logger.warning(
+                    "[META] meta_stats.json load FAILED: %s — counters "
+                    "start from defaults this boot. Investigate file size "
+                    "and JSON validity.", _ld_err)
         logger.info("[META] Loaded: chains=%d, steps=%d, wisdom=%d, policy_updates=%d",
                     self._total_meta_chains, self._total_meta_steps,
                     self._total_wisdom_saved, self.meta_policy.total_updates)

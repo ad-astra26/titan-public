@@ -571,7 +571,8 @@ def test_force_graduate_transitions_to_graduating():
         assert c._status == "graduating"
         assert c._graduation_progress == 0
         assert c._graduation_ts > 0
-        assert "success_rate_ema" in c._pre_graduation_baseline
+        assert "reward_mean" in c._pre_graduation_baseline
+        assert "reward_std" in c._pre_graduation_baseline
 
 
 def test_evaluate_graduation_ramps_progress():
@@ -855,22 +856,78 @@ def test_get_failsafe_status_schema():
 
 
 def test_record_chain_outcome_feeds_rollback_detector():
-    """record_chain_outcome splits data into pre-grad vs post-grad buffers."""
+    """record_chain_outcome splits raw reward floats into pre-grad vs post-grad
+    deques. Scale-invariant after Option B refactor (2026-04-19)."""
     from titan_plugin.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Pre-graduation
         for _ in range(5):
-            c.record_chain_outcome(True)
-        assert len(c._pre_grad_outcomes) == 5
-        assert len(c._post_grad_outcomes) == 0
-        # Force to active; outcomes now feed post-grad
+            c.record_chain_outcome(0.7)
+        assert len(c._pre_grad_rewards) == 5
+        assert len(c._post_grad_rewards) == 0
+        # Force to active; rewards now feed post-grad
         c.force_graduate()
         for _ in range(100):
             c.evaluate_graduation()
         assert c._status == "active"
-        c.record_chain_outcome(False)
-        assert len(c._post_grad_outcomes) == 1
+        c.record_chain_outcome(0.2)
+        assert len(c._post_grad_rewards) == 1
+
+
+def test_rollback_detector_scale_invariant_no_drop():
+    """Scale-invariance regression: if rewards stay at the same scale as
+    pre-grad (no actual drop), rollback must NOT fire — even if the absolute
+    reward level is well below 0.5. Bug: pre-Option-B the hardcoded 0.5
+    threshold would rollback any scale < 0.5."""
+    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        # Populate pre-grad baseline with low-scale rewards (post-COMPLETE-5
+        # compound-reward scale: mean ~0.27, tight σ).
+        for v in [0.22, 0.25, 0.27, 0.28, 0.30, 0.26, 0.24, 0.29, 0.27, 0.25] * 10:
+            c.record_chain_outcome(v)
+        # Graduate — captures baseline_mean ~0.263, std ~0.023
+        c.force_graduate()
+        for _ in range(100):
+            c.evaluate_graduation()
+        assert c._status == "active"
+        baseline = c._pre_graduation_baseline
+        assert 0.24 < baseline["reward_mean"] < 0.29
+        # Now post-graduation: feed 60 chains at SAME reward scale (no drop)
+        # — drives chains_since_graduation past the 50-chain guard so rollback
+        # check actually fires.
+        for _ in range(60):
+            c.record_chain_outcome(0.26)
+            c.evaluate_graduation()
+        assert c._status == "active", (
+            f"Rollback fired on stable-scale rewards (baseline_mean="
+            f"{baseline['reward_mean']:.3f}, post-grad=0.26) — "
+            f"scale-invariance broken")
+
+
+def test_rollback_detector_fires_on_real_regression():
+    """Positive case: if post-grad rewards really drop below baseline − k·σ,
+    rollback DOES fire. Prevents over-loosening the detector."""
+    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        # Baseline ~0.60 with std ~0.05
+        for v in [0.55, 0.58, 0.60, 0.62, 0.65, 0.57, 0.61, 0.59, 0.63, 0.56] * 10:
+            c.record_chain_outcome(v)
+        c.force_graduate()
+        for _ in range(100):
+            c.evaluate_graduation()
+        assert c._status == "active"
+        # Now feed 60 chains at severely dropped scale (0.25 — well below
+        # baseline_mean − 2σ ≈ 0.60 − 0.10 = 0.50). Drive evaluate_graduation
+        # to tick chains_since_graduation past the 50-chain guard.
+        for _ in range(60):
+            c.record_chain_outcome(0.25)
+            c.evaluate_graduation()
+        assert c._status == "shadow_mode", (
+            "Rollback did NOT fire on real regression — detector too loose")
+        assert c._rolled_back_count == 1
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1022,7 +1079,7 @@ def test_chain_decay_reduces_n_but_preserves_V():
         V_before = p.V
         # Trigger cadence via record_chain_outcome
         for _ in range(cadence):
-            c.record_chain_outcome(True)
+            c.record_chain_outcome(1.0)
         n_after = p.n_samples
         V_after = p.V
         assert n_after < n_before, (n_before, n_after)
@@ -1042,7 +1099,7 @@ def test_chain_decay_skips_low_n_primitives():
         p = c._primitives["RECALL"]
         n_before = p.n_samples
         for _ in range(cadence):
-            c.record_chain_outcome(True)
+            c.record_chain_outcome(1.0)
         assert c._primitives["RECALL"].n_samples == n_before
 
 
@@ -1304,7 +1361,7 @@ def test_advisor_conflict_throttle_clears_after_cooldown():
         emits1 = c._conflict_bus_events_emitted
         # Advance chain counter 100 chains (past cooldown)
         for _ in range(100):
-            c.record_chain_outcome(True)
+            c.record_chain_outcome(1.0)
         ctx["chain_id"] = 2
         c.compose_template_score(
             template_id="FORMULATE", state_ctx=ctx,
@@ -1818,3 +1875,75 @@ def test_p11_import_kin_snapshot_merges_per_domain_entries():
         assert "reasoning" in t2._primitives["FORMULATE"].by_domain
         # Native domain-n counter stays 0 (priors don't claim to be own evidence)
         assert t2._primitives["FORMULATE"].by_domain["reasoning"][2] == 0
+
+
+# ══════════════════════════════════════════════════════════════════════
+# COMPLETE-9 HAOV signal↔chain correlation telemetry (2026-04-19)
+# ══════════════════════════════════════════════════════════════════════
+
+def test_haov_signal_entry_written():
+    """handle_cross_consumer_signal writes an entry to the HAOV log."""
+    import json as _json
+    from titan_plugin.logic.meta_cgn import (
+        MetaCGNConsumer, SIGNAL_TO_PRIMITIVE)
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        # Pick any real signal mapping
+        (consumer, event_type), _ = next(iter(SIGNAL_TO_PRIMITIVE.items()))
+        c.handle_cross_consumer_signal(
+            consumer=consumer, event_type=event_type, intensity=0.8)
+        log_path = os.path.join(tmp, "haov_signal_outcomes.jsonl")
+        assert os.path.exists(log_path)
+        with open(log_path) as f:
+            lines = [_json.loads(ln) for ln in f if ln.strip()]
+        assert len(lines) == 1
+        e = lines[0]
+        assert e["kind"] == "signal"
+        assert e["consumer"] == consumer
+        assert e["event_type"] == event_type
+        assert e["intensity"] == 0.8
+        assert isinstance(e["primitives_nudged"], dict)
+        assert "ts" in e
+
+
+def test_haov_chain_entry_written():
+    """log_haov_chain writes a chain-outcome entry."""
+    import json as _json
+    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        c.log_haov_chain(
+            chain_id=42, primitives=["FORMULATE", "RECALL"],
+            dominant="FORMULATE", terminal_reward=0.27, domain="meta")
+        log_path = os.path.join(tmp, "haov_signal_outcomes.jsonl")
+        with open(log_path) as f:
+            lines = [_json.loads(ln) for ln in f if ln.strip()]
+        assert len(lines) == 1
+        e = lines[0]
+        assert e["kind"] == "chain"
+        assert e["chain_id"] == 42
+        assert e["primitives"] == ["FORMULATE", "RECALL"]
+        assert e["dominant"] == "FORMULATE"
+        assert e["terminal_reward"] == 0.27
+
+
+def test_haov_log_rotates_at_cap():
+    """Log rotation: when line cap hit, current becomes .archive, new file
+    starts fresh. Prevents unbounded disk growth."""
+    import json as _json
+    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        c._haov_log_max_lines = 5  # Force early rotation for test
+        for i in range(12):
+            c.log_haov_chain(
+                chain_id=i, primitives=["FORMULATE"],
+                dominant="FORMULATE", terminal_reward=0.2)
+        log_path = os.path.join(tmp, "haov_signal_outcomes.jsonl")
+        archive_path = log_path + ".archive"
+        assert os.path.exists(log_path)
+        assert os.path.exists(archive_path), "Archive should have been created"
+        # Current file has fewer lines than cap + 1 cycle
+        with open(log_path) as f:
+            current = sum(1 for _ in f)
+        assert current <= c._haov_log_max_lines + 1

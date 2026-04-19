@@ -51,6 +51,26 @@ MULTIPLIER_FLOOR = 0.3    # Minimum severity multiplier (never fully mute a sens
 MULTIPLIER_CEIL = 3.0     # Maximum severity multiplier
 SMOOTHING = 0.9           # EMA smoothing for multiplier updates
 
+
+def _resolve_filter_down_cfg(config: Optional[dict]) -> dict:
+    """Resolve [filter_down] TOML section into per-instance params with module-
+    constant fallbacks. Shared by V3/V4/V5. Keys not present fall back to the
+    module constants above (which match the toml defaults, so behavior is
+    unchanged for callers that pass config=None).
+    """
+    section = (config or {}).get("filter_down", {}) if isinstance(config, dict) else {}
+    return {
+        "gamma":            float(section.get("gamma", GAMMA)),
+        "lr":               float(section.get("learning_rate", LR)),
+        "batch_size":       int(section.get("batch_size", BATCH_SIZE)),
+        "buffer_max":       int(section.get("buffer_max", BUFFER_MAX)),
+        "min_transitions":  int(section.get("min_transitions", MIN_TRANSITIONS)),
+        "train_every_n":    int(section.get("train_every_n", TRAIN_EVERY_N)),
+        "multiplier_floor": float(section.get("multiplier_floor", MULTIPLIER_FLOOR)),
+        "multiplier_ceil":  float(section.get("multiplier_ceil", MULTIPLIER_CEIL)),
+        "smoothing":        float(section.get("smoothing", SMOOTHING)),
+    }
+
 # ── Pure numpy value network ──────────────────────────────────────────
 # Using numpy instead of PyTorch to avoid ~150MB memory overhead in Spirit process.
 
@@ -233,6 +253,9 @@ class TrinityValueNet:
 
 # ── Transition Buffer ──────────────────────────────────────────────────
 
+# PERSISTENCE_BY_DESIGN: TransitionBuffer._write_idx is ring-buffer cursor
+# position recomputed from buffer length on load (`len(buffer) % max_size`).
+# Not independently-persistable state.
 class TransitionBuffer:
     """Ring buffer of (state, reward, next_state) tuples."""
 
@@ -292,9 +315,19 @@ class FilterDownEngine:
       3. compute_multipliers() — gradient-based severity multipliers
     """
 
-    def __init__(self, data_dir: str = "./data"):
+    def __init__(self, config: Optional[dict] = None, data_dir: str = "./data"):
+        p = _resolve_filter_down_cfg(config)
+        self._gamma            = p["gamma"]
+        self._lr               = p["lr"]
+        self._batch_size       = p["batch_size"]
+        self._min_transitions  = p["min_transitions"]
+        self._train_every_n    = p["train_every_n"]
+        self._multiplier_floor = p["multiplier_floor"]
+        self._multiplier_ceil  = p["multiplier_ceil"]
+        self._smoothing        = p["smoothing"]
+
         self._net = TrinityValueNet()
-        self._buffer = TransitionBuffer()
+        self._buffer = TransitionBuffer(max_size=p["buffer_max"])
         self._data_dir = data_dir
 
         self._weights_path = os.path.join(data_dir, "filter_down_weights.json")
@@ -339,13 +372,13 @@ class FilterDownEngine:
 
     def maybe_train(self) -> Optional[float]:
         """Train if enough new transitions have accumulated. Returns loss or None."""
-        if len(self._buffer) < MIN_TRANSITIONS:
+        if len(self._buffer) < self._min_transitions:
             return None
-        if self._transitions_since_train < TRAIN_EVERY_N:
+        if self._transitions_since_train < self._train_every_n:
             return None
 
-        states, rewards, next_states = self._buffer.sample(BATCH_SIZE)
-        loss = self._net.train_step(states, rewards, next_states)
+        states, rewards, next_states = self._buffer.sample(self._batch_size)
+        loss = self._net.train_step(states, rewards, next_states, lr=self._lr)
 
         self._total_train_steps += 1
         self._last_loss = loss
@@ -390,16 +423,16 @@ class FilterDownEngine:
         if max_grad < 1e-8:
             max_grad = 1.0
 
-        new_body = [max(MULTIPLIER_FLOOR, min(MULTIPLIER_CEIL, g / max_grad * 2.0)) for g in body_grad]
-        new_mind = [max(MULTIPLIER_FLOOR, min(MULTIPLIER_CEIL, g / max_grad * 2.0)) for g in mind_grad]
+        new_body = [max(self._multiplier_floor, min(self._multiplier_ceil, g / max_grad * 2.0)) for g in body_grad]
+        new_mind = [max(self._multiplier_floor, min(self._multiplier_ceil, g / max_grad * 2.0)) for g in mind_grad]
 
         # EMA smoothing to prevent jerky changes
         self._body_multipliers = [
-            SMOOTHING * old + (1 - SMOOTHING) * new
+            self._smoothing * old + (1 - self._smoothing) * new
             for old, new in zip(self._body_multipliers, new_body)
         ]
         self._mind_multipliers = [
-            SMOOTHING * old + (1 - SMOOTHING) * new
+            self._smoothing * old + (1 - self._smoothing) * new
             for old, new in zip(self._mind_multipliers, new_mind)
         ]
 
@@ -443,7 +476,17 @@ class FilterDownV4Engine:
     alongside for backward compatibility until V4 is fully calibrated.
     """
 
-    def __init__(self, data_dir: str = "./data"):
+    def __init__(self, config: Optional[dict] = None, data_dir: str = "./data"):
+        p = _resolve_filter_down_cfg(config)
+        self._gamma            = p["gamma"]
+        self._lr               = p["lr"]
+        self._batch_size       = p["batch_size"]
+        self._min_transitions  = p["min_transitions"]
+        self._train_every_n    = p["train_every_n"]
+        self._multiplier_floor = p["multiplier_floor"]
+        self._multiplier_ceil  = p["multiplier_ceil"]
+        self._smoothing        = p["smoothing"]
+
         self._net = TrinityValueNet(state_dim=V4_STATE_DIM)
         # Override hidden layers for V4 dimensions
         import numpy as np
@@ -454,7 +497,7 @@ class FilterDownV4Engine:
         self._net.w3 = np.random.randn(V4_HIDDEN_2, 1).astype(np.float64) * math.sqrt(2.0 / V4_HIDDEN_2)
         self._net.b3 = np.zeros(1, dtype=np.float64)
 
-        self._buffer = TransitionBuffer()
+        self._buffer = TransitionBuffer(max_size=p["buffer_max"])
         self._data_dir = data_dir
 
         self._weights_path = os.path.join(data_dir, "filter_down_v4_weights.json")
@@ -495,13 +538,13 @@ class FilterDownV4Engine:
 
     def maybe_train(self) -> Optional[float]:
         """Train if enough transitions. Returns loss or None."""
-        if len(self._buffer) < MIN_TRANSITIONS:
+        if len(self._buffer) < self._min_transitions:
             return None
-        if self._transitions_since_train < TRAIN_EVERY_N:
+        if self._transitions_since_train < self._train_every_n:
             return None
 
-        states, rewards, next_states = self._buffer.sample(BATCH_SIZE)
-        loss = self._net.train_step(states, rewards, next_states)
+        states, rewards, next_states = self._buffer.sample(self._batch_size)
+        loss = self._net.train_step(states, rewards, next_states, lr=self._lr)
 
         self._total_train_steps += 1
         self._last_loss = loss
@@ -547,7 +590,7 @@ class FilterDownV4Engine:
             max_grad = 1.0
 
         def _scale(grads):
-            return [max(MULTIPLIER_FLOOR, min(MULTIPLIER_CEIL, g / max_grad * 2.0)) for g in grads]
+            return [max(self._multiplier_floor, min(self._multiplier_ceil, g / max_grad * 2.0)) for g in grads]
 
         new_ib = _scale(ib_grad)
         new_im = _scale(im_grad)
@@ -556,7 +599,7 @@ class FilterDownV4Engine:
 
         # EMA smoothing
         def _ema(old, new):
-            return [SMOOTHING * o + (1 - SMOOTHING) * n for o, n in zip(old, new)]
+            return [self._smoothing * o + (1 - self._smoothing) * n for o, n in zip(old, new)]
 
         self._inner_body_multipliers = _ema(self._inner_body_multipliers, new_ib)
         self._inner_mind_multipliers = _ema(self._inner_mind_multipliers, new_im)
@@ -643,6 +686,18 @@ class FilterDownV5Engine:
     def __init__(self, config: Optional[dict] = None, data_dir: str = "./data"):
         import numpy as np
         cfg = (config or {}).get("filter_down_v5", {})
+        base = _resolve_filter_down_cfg(config)
+
+        # Shared base params — drive training cadence and multiplier clipping
+        # across V3/V4/V5. V5-specific params remain in [filter_down_v5].
+        self._gamma            = base["gamma"]
+        self._lr               = base["lr"]
+        self._batch_size       = base["batch_size"]
+        self._min_transitions  = base["min_transitions"]
+        self._train_every_n    = base["train_every_n"]
+        self._multiplier_floor = base["multiplier_floor"]
+        self._multiplier_ceil  = base["multiplier_ceil"]
+        self._smoothing        = base["smoothing"]
 
         self._spirit_filter_strength_mult = float(cfg.get(
             "spirit_filter_strength_multiplier", 0.3))
@@ -659,7 +714,7 @@ class FilterDownV5Engine:
         self._net.w3 = np.random.randn(V5_HIDDEN_2, 1).astype(np.float64) * math.sqrt(2.0 / V5_HIDDEN_2)
         self._net.b3 = np.zeros(1, dtype=np.float64)
 
-        self._buffer = TransitionBuffer()
+        self._buffer = TransitionBuffer(max_size=base["buffer_max"])
         self._data_dir = data_dir
 
         self._weights_path = os.path.join(data_dir, "filter_down_v5_weights.json")
@@ -710,6 +765,21 @@ class FilterDownV5Engine:
                 if isinstance(rl, list):
                     self._recent_losses = [float(x) for x in rl[-20:]]
                 self._phase8_snapshot_taken = bool(state.get("phase8_snapshot_taken", False))
+                # EMA multiplier state — restored if present. Older state files
+                # won't have this key; __init__ defaults to [1.0,...] so the
+                # fallback is safe.
+                ema = state.get("multipliers_ema") or {}
+                if isinstance(ema, dict):
+                    def _restore(name, attr, expected_len):
+                        vals = ema.get(name)
+                        if isinstance(vals, list) and len(vals) == expected_len:
+                            setattr(self, attr, [float(x) for x in vals])
+                    _restore("inner_body",           "_ib_mults",         5)
+                    _restore("inner_mind",           "_im_mults",        15)
+                    _restore("inner_spirit_content", "_is_content_mults", 40)
+                    _restore("outer_body",           "_ob_mults",         5)
+                    _restore("outer_mind",           "_om_mults",        15)
+                    _restore("outer_spirit_content", "_os_content_mults", 40)
         except Exception as e:
             logger.warning("[FilterDownV5] state load failed: %s (starting fresh)", e)
 
@@ -749,22 +819,22 @@ class FilterDownV5Engine:
         self._buffer.add(list(titan_self_prev), reward, list(titan_self_curr))
         self._transitions_since_train += 1
 
-        if len(self._buffer) >= BUFFER_MAX and not self._buffer_full_logged:
+        if len(self._buffer) >= self._buffer._max_size and not self._buffer_full_logged:
             logger.info(
                 "[FilterDownV5] Transition buffer reached BUFFER_MAX=%d; "
-                "further adds will evict oldest entries.", BUFFER_MAX,
+                "further adds will evict oldest entries.", self._buffer._max_size,
             )
             self._buffer_full_logged = True
 
     def maybe_train(self) -> Optional[float]:
         """Train the value network on a random mini-batch, if enough data."""
-        if len(self._buffer) < MIN_TRANSITIONS:
+        if len(self._buffer) < self._min_transitions:
             return None
-        if self._transitions_since_train < TRAIN_EVERY_N:
+        if self._transitions_since_train < self._train_every_n:
             return None
 
-        states, rewards, next_states = self._buffer.sample(BATCH_SIZE)
-        loss = self._net.train_step(states, rewards, next_states)
+        states, rewards, next_states = self._buffer.sample(self._batch_size)
+        loss = self._net.train_step(states, rewards, next_states, lr=self._lr)
         self._total_train_steps += 1
         self._last_loss = loss
         self._recent_losses.append(float(loss))
@@ -815,7 +885,7 @@ class FilterDownV5Engine:
             max_grad = 1.0
 
         def _scale(grads):
-            return [max(MULTIPLIER_FLOOR, min(MULTIPLIER_CEIL, g / max_grad * 2.0))
+            return [max(self._multiplier_floor, min(self._multiplier_ceil, g / max_grad * 2.0))
                     for g in grads]
 
         new_ib = _scale(ib_grad)
@@ -831,7 +901,7 @@ class FilterDownV5Engine:
         new_os_c = [(m - 1.0) * k + 1.0 for m in new_os_c]
 
         def _ema(old, new):
-            return [SMOOTHING * o + (1 - SMOOTHING) * n for o, n in zip(old, new)]
+            return [self._smoothing * o + (1 - self._smoothing) * n for o, n in zip(old, new)]
 
         self._ib_mults = _ema(self._ib_mults, new_ib)
         self._im_mults = _ema(self._im_mults, new_im)
@@ -907,11 +977,23 @@ class FilterDownV5Engine:
             self._net.save(self._weights_path)
             self._buffer.save(self._buffer_path)
             # Persist graduation-critical counters alongside weights/buffer.
+            # EMA multiplier state is persisted so Gate #9 divergence progress
+            # survives restarts — without this, every restart resets the EMAs
+            # to [1.0,...] and any drift accumulated during silent-mode compute
+            # is lost.
             state = {
                 "total_train_steps": int(self._total_train_steps),
                 "last_loss": float(self._last_loss),
                 "recent_losses": [float(x) for x in self._recent_losses[-20:]],
                 "phase8_snapshot_taken": bool(self._phase8_snapshot_taken),
+                "multipliers_ema": {
+                    "inner_body":           [float(x) for x in self._ib_mults],
+                    "inner_mind":           [float(x) for x in self._im_mults],
+                    "inner_spirit_content": [float(x) for x in self._is_content_mults],
+                    "outer_body":           [float(x) for x in self._ob_mults],
+                    "outer_mind":           [float(x) for x in self._om_mults],
+                    "outer_spirit_content": [float(x) for x in self._os_content_mults],
+                },
             }
             _tmp = self._state_path + ".tmp"
             with open(_tmp, "w") as f:

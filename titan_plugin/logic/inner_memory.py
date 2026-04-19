@@ -38,6 +38,8 @@ class InnerMemoryStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")  # concurrent readers + writer
         self._conn.execute("PRAGMA busy_timeout=5000")  # wait 5s on lock instead of failing
+        self._conn.execute("PRAGMA cache_size = -16000")   # 16MB cap (was unbounded on 362MB DB)
+        self._conn.execute("PRAGMA synchronous = NORMAL")
         self._init_schema()
         count = self._count_all()
         if count > 0:

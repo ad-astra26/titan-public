@@ -30,6 +30,11 @@ COLLAPSE_THRESHOLD = 0.05
 VIOLATION_DURATION = 100  # consecutive epochs at extreme = violation
 
 
+# DEFERRED_CLASS_WIRING: SovereigntyTracker is fully implemented but has
+# zero spawn sites in the codebase — entire class is awaiting wiring per
+# DEFERRED: SOVEREIGNTY-TRACKER-WIRING. All public methods (record_epoch,
+# transition_to_advisory, confirm_maker, increment_great_cycle, etc.) are
+# orphans by design until that rFP ships; suppress orphan-detection here.
 class SovereigntyTracker:
     """Track sovereignty transition criteria and convergence metrics."""
 

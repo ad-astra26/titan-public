@@ -108,13 +108,25 @@ class Guardian:
         guardian.monitor_tick()   # call periodically (e.g. every 5s)
     """
 
-    def __init__(self, bus: DivineBus):
+    def __init__(self, bus: DivineBus, config: dict | None = None):
         self.bus = bus
         self._modules: dict[str, ModuleInfo] = {}
         self._module_recv_queues: dict[str, AnyQueue] = {}  # name → recv queue (for bus routing)
         self._guardian_queue = bus.subscribe("guardian")
         self._stop_requested = False
         self._module_lock = threading.RLock()  # serialize start/stop/restart to prevent duplicate spawns
+
+        # [guardian] toml plumbing — 2026-04-16. Previously Guardian(bus)
+        # was constructed with no config, so the module-level constants
+        # HEARTBEAT_TIMEOUT / DEFAULT_RSS_LIMIT_MB / MAX_RESTARTS_IN_WINDOW
+        # etc. could not be tuned via titan_params.toml. Constants remain
+        # as fallbacks to preserve behavior when config is absent.
+        cfg = config or {}
+        self._heartbeat_timeout = float(cfg.get("heartbeat_timeout_default", HEARTBEAT_TIMEOUT))
+        self._heartbeat_timeout_spirit = float(cfg.get("heartbeat_timeout_spirit", 120.0))
+        self._max_restarts_in_window = int(cfg.get("max_restarts_in_window", MAX_RESTARTS_IN_WINDOW))
+        self._restart_window_seconds = float(cfg.get("restart_window", RESTART_WINDOW_SECONDS))
+        self._sustained_uptime_reset = float(cfg.get("sustained_uptime_reset", SUSTAINED_UPTIME_RESET))
 
     def register(self, spec: ModuleSpec) -> None:
         """Register a module specification. Does not start the module."""
@@ -391,21 +403,21 @@ class Guardian:
 
             now = time.time()
 
-            # Sliding window: count restarts in the last RESTART_WINDOW_SECONDS
+            # Sliding window: count restarts in the last _restart_window_seconds
             # Prune old timestamps
-            while info.restart_timestamps and (now - info.restart_timestamps[0]) > RESTART_WINDOW_SECONDS:
+            while info.restart_timestamps and (now - info.restart_timestamps[0]) > self._restart_window_seconds:
                 info.restart_timestamps.popleft()
 
-            if len(info.restart_timestamps) >= MAX_RESTARTS_IN_WINDOW:
+            if len(info.restart_timestamps) >= self._max_restarts_in_window:
                 logger.error("[Guardian] Module '%s' exceeded %d restarts in %.0fs window — disabling (auto-re-enable in %.0fs)",
-                             name, MAX_RESTARTS_IN_WINDOW, RESTART_WINDOW_SECONDS, REENABLE_COOLDOWN_S)
+                             name, self._max_restarts_in_window, self._restart_window_seconds, REENABLE_COOLDOWN_S)
                 self.stop(name, reason="max_restarts_disabled")
                 info.state = ModuleState.DISABLED
                 info.disabled_at = time.time()
                 self.bus.publish(make_msg(MODULE_CRASHED, "guardian", "core", {
                     "module": name, "reason": "max_restarts_in_window",
                     "restarts": len(info.restart_timestamps),
-                    "window_seconds": RESTART_WINDOW_SECONDS,
+                    "window_seconds": self._restart_window_seconds,
                 }))
                 return False
 
@@ -507,7 +519,7 @@ class Guardian:
 
             # Reset restart count after sustained uptime
             if info.state == ModuleState.RUNNING and info.ready_time > 0:
-                if now - info.ready_time > SUSTAINED_UPTIME_RESET and info.restart_count > 0:
+                if now - info.ready_time > self._sustained_uptime_reset and info.restart_count > 0:
                     logger.info("[Guardian] Module '%s' sustained uptime %.0fs — resetting restart count",
                                 name, now - info.ready_time)
                     info.restart_count = 0
@@ -579,6 +591,51 @@ class Guardian:
     def is_running(self, name: str) -> bool:
         info = self._modules.get(name)
         return info is not None and info.state == ModuleState.RUNNING
+
+    def query_module(self, name: str, action: str, payload: dict | None = None,
+                     timeout: float = 5.0) -> dict | None:
+        """Send a QUERY to a running module and wait for its RESPONSE.
+
+        Returns the response payload dict, or None on timeout/error.
+        Used by the profiling endpoint to collect child-process tracemalloc data.
+        """
+        import uuid
+        info = self._modules.get(name)
+        if info is None or info.state != ModuleState.RUNNING or info.queue is None:
+            return None
+        rid = str(uuid.uuid4())
+        msg = {
+            "type": "QUERY",
+            "src": "guardian",
+            "dst": name,
+            "rid": rid,
+            "payload": {"action": action, **(payload or {})},
+            "ts": time.time(),
+        }
+        try:
+            info.queue.put_nowait(msg)
+        except Exception:
+            return None
+        # Poll send_queue for the response (interleaved with other messages)
+        deadline = time.time() + timeout
+        stashed: list = []
+        result = None
+        while time.time() < deadline:
+            try:
+                resp = info.send_queue.get(timeout=0.2)
+                if resp.get("rid") == rid:
+                    result = resp.get("payload")
+                    break
+                stashed.append(resp)
+            except Exception:
+                continue
+        # Put back any messages we consumed that weren't our response
+        for m in stashed:
+            try:
+                info.send_queue.put_nowait(m)
+            except Exception:
+                pass
+        return result
 
     def drain_send_queues(self) -> int:
         """

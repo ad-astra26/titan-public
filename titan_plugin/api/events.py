@@ -121,7 +121,13 @@ class EventBus:
                     summary = f"\U0001f3af VM reward: {d.get('reward', 0):.3f} ({d.get('reflexes_fired', 0)} reflexes)"
                 else:
                     summary = f"\U0001f4e1 {event_type.replace('_', ' ')}"
-                self._observatory_db.record_event(event_type, summary, d)
+                # Run in thread to avoid blocking the event loop.
+                # Synchronous SQLite write here was the root cause of
+                # intermittent API freezes — disk I/O (WAL checkpoint,
+                # page cache miss) blocked the uvicorn event loop for
+                # hundreds of ms, causing all HTTP requests to hang.
+                asyncio.get_event_loop().run_in_executor(
+                    None, self._observatory_db.record_event, event_type, summary, d)
             except Exception:
                 pass  # Never let persistence failure block event delivery
         dead: list[asyncio.Queue] = []

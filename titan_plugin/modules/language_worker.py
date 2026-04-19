@@ -830,6 +830,9 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
 
         # ── QUERY handler (API → language stats) ─────────────────────
         elif msg_type == "QUERY":
+            from titan_plugin.core.profiler import handle_memory_profile_query
+            if handle_memory_profile_query(msg, send_queue, name):
+                continue
             _send_heartbeat(send_queue, name)
             _handle_query(msg, send_queue, name, language_stats, lang_config,
                           cached_vocab, teacher_queue, teacher_compositions_since,

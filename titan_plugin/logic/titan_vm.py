@@ -105,9 +105,22 @@ class TitanVM:
     Deterministic, inspectable, fast.
     """
 
-    def __init__(self, state_register=None, bus=None):
+    def __init__(self, state_register=None, bus=None, config: dict | None = None):
         self._state_register = state_register
         self._bus = bus
+        # [titan_vm] toml plumbing — 2026-04-16. Previously the section was
+        # defined in titan_params.toml but every call site constructed
+        # TitanVM() with no config, so max_stack_depth/max_instructions were
+        # forever pinned to the module-level MAX_STACK_DEPTH/MAX_INSTRUCTIONS
+        # constants. Constants remain as defaults to preserve behavior when
+        # config is absent.
+        cfg = config or {}
+        self._max_stack_depth = int(cfg.get("max_stack_depth", MAX_STACK_DEPTH))
+        self._max_instructions = int(cfg.get("max_instructions", MAX_INSTRUCTIONS))
+        # Downstream reward plumbing (agno_hooks REFLEX_REWARD publisher)
+        self._publish_rewards = bool(cfg.get("publish_rewards", True))
+        self._min_reward_threshold = float(cfg.get("min_reward_threshold", 0.01))
+        self._reward_blend_weight = float(cfg.get("reward_blend_weight", 0.3))
 
     def execute(self, program: list, context: dict = None) -> VMResult:
         """
@@ -141,15 +154,17 @@ class TitanVM:
         pc = 0  # program counter
         count = 0
 
+        max_stack = self._max_stack_depth
+        max_instr = self._max_instructions
         try:
-            while pc < len(instructions) and count < MAX_INSTRUCTIONS:
+            while pc < len(instructions) and count < max_instr:
                 instr = instructions[pc]
                 op = instr[0]
                 count += 1
 
                 if op == Op.PUSH:
                     val = float(instr[1])
-                    if len(stack) >= MAX_STACK_DEPTH:
+                    if len(stack) >= max_stack:
                         result.error = "stack overflow"
                         break
                     stack.append(val)
@@ -160,7 +175,7 @@ class TitanVM:
 
                 elif op == Op.DUP:
                     if stack:
-                        if len(stack) >= MAX_STACK_DEPTH:
+                        if len(stack) >= max_stack:
                             result.error = "stack overflow"
                             break
                         stack.append(stack[-1])
@@ -252,7 +267,7 @@ class TitanVM:
                         val = registers[path]
                     else:
                         val = self._load_value(path, context)
-                    if len(stack) >= MAX_STACK_DEPTH:
+                    if len(stack) >= max_stack:
                         result.error = "stack overflow"
                         break
                     stack.append(val)
@@ -302,7 +317,7 @@ class TitanVM:
             result.error = f"execution error: {e}"
             logger.warning("[TitanVM] Execution error at pc=%d: %s", pc, e)
 
-        if count >= MAX_INSTRUCTIONS:
+        if count >= max_instr:
             result.error = "instruction limit exceeded"
 
         result.instructions_executed = count

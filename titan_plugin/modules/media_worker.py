@@ -106,6 +106,9 @@ def media_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             break
 
         if msg_type == "QUERY":
+            from titan_plugin.core.profiler import handle_memory_profile_query
+            if handle_memory_profile_query(msg, send_queue, name):
+                continue
             payload = msg.get("payload", {})
             action = payload.get("action", "")
             rid = msg.get("rid")

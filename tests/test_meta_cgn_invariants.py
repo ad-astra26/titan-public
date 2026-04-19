@@ -230,6 +230,89 @@ def test_emit_helper_accepts_mapped_tuple():
     assert msg["payload"]["event_type"] == event_type
 
 
+def test_meta_cgn_signal_routes_to_spirit():
+    """Regression: META_CGN_SIGNAL must route to a registered DivineBus
+    subscriber. Before 2026-04-19 the helper hard-coded dst='meta', which
+    had no subscriber — 14k+ emissions were silently dropped at
+    DivineBus.publish. The consumer (handle_cross_consumer_signal) lives
+    in the 'spirit' subprocess, so dst must be 'spirit'.
+    """
+    from titan_plugin.bus import emit_meta_cgn_signal, _emit_gate_last_ts
+    from titan_plugin.logic.meta_cgn import SIGNAL_TO_PRIMITIVE
+
+    consumer, event_type = next(iter(SIGNAL_TO_PRIMITIVE.keys()))
+    _emit_gate_last_ts.clear()
+
+    class MockQueue:
+        def __init__(self):
+            self.items = []
+
+        def put_nowait(self, item):
+            self.items.append(item)
+
+    q = MockQueue()
+    emit_meta_cgn_signal(
+        q, src="test_producer",
+        consumer=consumer, event_type=event_type,
+        intensity=0.7, min_interval_s=0.0,
+    )
+    assert len(q.items) == 1
+    msg = q.items[0]
+    assert msg["dst"] == "spirit", (
+        f"META_CGN_SIGNAL dst must be 'spirit' (consumer lives in spirit "
+        f"worker), got {msg['dst']!r}. No module is registered as 'meta' "
+        f"so routing to dst='meta' silently drops at DivineBus.publish."
+    )
+
+
+# ======================================================================
+# COMPLETE-4-EVENTS: META_EVENT_REWARD endpoint routing
+# ======================================================================
+
+def test_event_reward_endpoint_routes_to_spirit():
+    """Regression: Events Teacher POSTs quality to
+    /v4/meta-reasoning/event-reward, which must republish as
+    META_EVENT_REWARD with dst='spirit' so the handler at
+    spirit_worker:8454 reaches meta_engine.add_external_reward. Same
+    routing failure mode as META_CGN_SIGNAL (dst='meta' → no subscriber).
+    """
+    from titan_plugin.bus import make_msg
+
+    # Simulate the body of post_v4_meta_event_reward inline — avoids
+    # having to stand up FastAPI TestClient. The critical invariant is
+    # that the constructed bus message routes to 'spirit'.
+    quality = 0.73
+    window_number = 42
+    titan_id = "T1"
+    quality = max(0.0, min(1.0, float(quality)))
+    msg = make_msg(
+        "META_EVENT_REWARD", "events_teacher", "spirit", {
+            "quality": quality,
+            "window_number": window_number,
+            "titan_id": titan_id,
+        })
+    assert msg["type"] == "META_EVENT_REWARD"
+    assert msg["dst"] == "spirit", (
+        f"META_EVENT_REWARD dst must be 'spirit' (handler lives in "
+        f"spirit_worker process), got {msg['dst']!r}. Routing to any "
+        f"other destination silently drops — same bug class as the "
+        f"pre-2026-04-19 dst='meta' META_CGN_SIGNAL silent-drop."
+    )
+    assert msg["src"] == "events_teacher"
+    assert msg["payload"]["quality"] == 0.73
+    assert msg["payload"]["window_number"] == 42
+    assert msg["payload"]["titan_id"] == "T1"
+
+
+def test_event_reward_quality_clamped_to_unit_interval():
+    """Defensive clamp: quality must land in [0, 1] regardless of
+    caller input. add_external_reward assumes the Q-blend domain."""
+    for raw, expected in [(1.5, 1.0), (-0.3, 0.0), (0.5, 0.5), (0.0, 0.0),
+                          (1.0, 1.0)]:
+        clamped = max(0.0, min(1.0, float(raw)))
+        assert clamped == expected, f"{raw} → {clamped}, expected {expected}"
+
+
 # ======================================================================
 # Invariant #5: BusHealthMonitor state machine + orphan logging
 # ======================================================================

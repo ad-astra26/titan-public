@@ -4197,7 +4197,8 @@ async def get_v4_reasoning_rewards(request: Request):
         # Phase 0.5 — action_chains_step table size
         try:
             def _count_steps():
-                conn = sqlite3.connect("./data/inner_memory.db", timeout=1.0)
+                from titan_plugin.utils.db import safe_connect
+                conn = safe_connect("data/inner_memory.db")
                 try:
                     cur = conn.execute(
                         "SELECT COUNT(*), MIN(created_at), MAX(created_at) "
@@ -4223,7 +4224,19 @@ async def get_v4_reasoning_rewards(request: Request):
 # ---------------------------------------------------------------------------
 @router.get("/v4/meta-reasoning")
 async def get_v4_meta_reasoning(request: Request):
-    """Meta-reasoning stats: chains, wisdom, primitives, rewards."""
+    """Meta-reasoning stats: chains, wisdom, primitives, rewards.
+
+    2026-04-19: previously the endpoint short-circuited on empty
+    meta_reasoning dict with a "not yet initialized" status. That
+    masked intermittent cache-race behavior (coordinator snapshot
+    built in a moment where coordinator._meta_engine hadn't yet been
+    wired, leaving meta_reasoning={} in the cached dict). Downstream
+    test harnesses sampling the counter saw spurious zeros. Fix:
+    distinguish "spirit proxy missing" (genuinely uninitialized) from
+    "empty snapshot this tick" (transient race). For the transient
+    case, pass through the empty dict — the 1.5s cache will serve
+    fresh data next call, and callers can retry rather than misread.
+    """
     plugin = _get_plugin(request)
     try:
         spirit_proxy = plugin._proxies.get("spirit")
@@ -4231,11 +4244,60 @@ async def get_v4_meta_reasoning(request: Request):
             return _ok({"error": "Spirit proxy not available"})
         coordinator = await _get_cached_coordinator_async(plugin)
         meta = coordinator.get("meta_reasoning", {})
-        if not meta:
-            return _ok({"status": "Meta-reasoning not yet initialized"})
+        # meta is always a dict (defensive try/except in spirit_loop ensures
+        # this). Return it as-is — empty means transient cache race, not
+        # uninitialized state. /v4/inner-trinity also surfaces meta_reasoning
+        # under the same snapshot and handles this correctly.
         return _ok(meta)
     except Exception as e:
         logger.error("[Dashboard] /v4/meta-reasoning error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# POST /v4/meta-reasoning/event-reward — Events Teacher → META_EVENT_REWARD
+# ---------------------------------------------------------------------------
+@router.post("/v4/meta-reasoning/event-reward")
+async def post_v4_meta_event_reward(request: Request):
+    """Bridge per-window Events Teacher quality into meta-reasoning's
+    chain_iql via META_EVENT_REWARD bus message.
+
+    Mirrors META_LANGUAGE_REWARD + META_PERSONA_REWARD pattern (COMPLETE-4
+    cross-system reward wiring). Events Teacher runs out-of-process (cron)
+    and cannot emit to bus directly; it POSTs its per-window quality
+    signal here. The endpoint republishes to the 'spirit' subsystem
+    where meta_engine lives. The spirit_worker handler resolves the
+    most-recently-concluded chain via meta_engine.get_last_chain_id()
+    (same pattern as Persona — no per-window chain_id linkage exists).
+
+    Body:
+      quality:        float in [0, 1] — per-window quality signal
+      window_number:  int (optional) — for telemetry/logging
+      titan_id:       str (optional) — for telemetry
+    """
+    try:
+        plugin = _get_plugin(request)
+        body = await request.json()
+        quality = float(body.get("quality", 0.0))
+        window_number = int(body.get("window_number", -1))
+        titan_id = str(body.get("titan_id", "?"))
+        # Clamp defensively — add_external_reward expects [0, 1]
+        quality = max(0.0, min(1.0, quality))
+
+        from titan_plugin.bus import make_msg
+        plugin.bus.publish(make_msg(
+            "META_EVENT_REWARD", "events_teacher", "spirit", {
+                "quality": quality,
+                "window_number": window_number,
+                "titan_id": titan_id,
+            }))
+        return _ok({
+            "emitted": True,
+            "quality": quality,
+            "window_number": window_number,
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-reasoning/event-reward error: %s", e)
         return _error(str(e))
 
 
@@ -5479,6 +5541,24 @@ async def post_v4_social_perception(request: Request):
                                     "[META-CGN] Producer #12 social.session_high_qual DROPPED "
                                     "— sid=%s quality=%.2f (rate-gate or bus-full)",
                                     _p11p12_sid, _p11p12_quality)
+                        # COMPLETE-4 (2026-04-19): emit META_PERSONA_REWARD bus
+                        # msg so spirit_worker's meta_engine can blend this
+                        # persona session quality into chain_iql via
+                        # apply_external_reward on the most-recently-concluded
+                        # chain. Same pattern as Language's META_LANGUAGE_REWARD
+                        # (chain_iql Q-net learns from downstream outcomes).
+                        # chain_id omitted — handler resolves via
+                        # meta_engine.get_last_chain_id(); quality is in [0,1].
+                        try:
+                            plugin.bus.publish(make_msg(
+                                "META_PERSONA_REWARD", "persona", "spirit", {
+                                    "quality": float(_p11p12_quality),
+                                    "session_id": _p11p12_sid,
+                                }))
+                        except Exception as _p_er_err:
+                            logger.debug(
+                                "[META] Persona external_reward emit error: %s",
+                                _p_er_err)
                     except Exception as _p11p12_err:
                         logger.warning(
                             "[META-CGN] Producers #11/#12 social session emit FAILED "
@@ -5574,17 +5654,17 @@ async def post_v4_social_delegate(request: Request):
             _dcfg = {}
 
         if not _dcfg.get("enabled", False):
-            return _error("social delegation disabled")
+            return _error("social delegation disabled", code=403)
 
         # Auth check
         expected_secret = _dcfg.get("kin_secret", "")
         if not expected_secret or auth_token != expected_secret:
-            return _error("invalid auth_token")
+            return _error("invalid auth_token", code=401)
 
         # Titan ID check
         accepted = _dcfg.get("accepted_titans", [])
         if titan_id not in accepted:
-            return _error(f"titan_id must be one of {accepted}")
+            return _error(f"titan_id must be one of {accepted}", code=403)
 
         # Quality gates
         min_vocab = _dcfg.get("min_vocabulary", 50)
@@ -6686,4 +6766,70 @@ async def get_maker_dialogue_history(request: Request):
         })
     except Exception as e:
         logger.error("[Dashboard] /v4/maker/dialogue-history error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# GET /v4/admin/memory-profile — Live memory + CPU profiling
+# ---------------------------------------------------------------------------
+# Returns /proc stats (RSS, VmPeak, CPU time, I/O, threads) for parent +
+# all Guardian modules, plus tracemalloc top allocations for the parent
+# process.  Optional CPU% sampling and diff-from-boot mode.
+#
+# Query params:
+#   top_n     (int, default 25)    — number of top allocations
+#   key_type  (str, default "filename") — "filename" or "lineno"
+#   diff      (bool, default false) — show growth since boot
+#   cpu       (bool, default false) — include 1s CPU% sample (adds latency)
+# ---------------------------------------------------------------------------
+@router.get("/v4/admin/memory-profile")
+async def get_v4_admin_memory_profile(request: Request,
+                                       top_n: int = 25,
+                                       key_type: str = "filename",
+                                       diff: bool = False,
+                                       cpu: bool = False):
+    """Live memory and CPU profiling for the Titan process tree."""
+    import asyncio
+    try:
+        plugin = _get_plugin(request)
+
+        # plugin IS TitanCore in production (v5_core passes self to create_app)
+        collector = getattr(plugin, '_profiling_collector', None)
+        guardian = getattr(plugin, 'guardian', None)
+
+        # Import here to keep module lazy
+        from titan_plugin.core.profiler import ProfileReport
+
+        profiler = ProfileReport(collector=collector)
+
+        # CPU sampling blocks for ~1s, run in thread to not block event loop
+        if cpu:
+            cpu_dur = 1.0
+            try:
+                prof_cfg = getattr(core, '_full_config', {}).get("profiling", {})
+                cpu_dur = float(prof_cfg.get("cpu_sample_duration_s", 1.0))
+            except Exception:
+                pass
+            report = await asyncio.to_thread(
+                profiler.full_report, guardian, top_n, diff, key_type,
+                include_cpu=True, cpu_duration=cpu_dur)
+        else:
+            report = await asyncio.to_thread(
+                profiler.full_report, guardian, top_n, diff, key_type)
+
+        # Per-module tracemalloc via Guardian bus QUERY (if specific module requested
+        # or if we want all child tracemalloc data)
+        module_param = request.query_params.get("module")
+        if guardian and module_param:
+            # Query specific module for its tracemalloc data
+            child_data = await asyncio.to_thread(
+                guardian.query_module, module_param, "get_memory_profile",
+                {"top_n": top_n, "key_type": key_type, "diff": diff},
+                5.0)
+            if child_data and module_param in report.get("modules", {}):
+                report["modules"][module_param]["tracemalloc"] = child_data.get("tracemalloc", {})
+
+        return _ok(report)
+    except Exception as e:
+        logger.error("[Dashboard] /v4/admin/memory-profile error: %s", e)
         return _error(str(e))

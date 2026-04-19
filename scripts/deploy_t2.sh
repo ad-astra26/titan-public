@@ -80,13 +80,53 @@ REMOTE_SCRIPT
     echo "✓ ${label} code updated"
 }
 
-# ── Ensure local changes are pushed to titan-dev ──────────────────
+# ── Pre-deploy: verify local is clean + pushed ───────────────────
+LOCAL_COMMIT=$(git rev-parse HEAD)
+LOCAL_SHORT=$(git rev-parse --short HEAD)
+UNCOMMITTED=$(git diff --name-only -- ':(exclude)data/' | wc -l)
+STAGED=$(git diff --cached --name-only | wc -l)
+
+if [ "$UNCOMMITTED" -gt 0 ] || [ "$STAGED" -gt 0 ]; then
+    echo "⚠ WARNING: ${UNCOMMITTED} uncommitted + ${STAGED} staged changes (excluding data/)"
+    echo "  T2/T3 will NOT get these changes. Commit first!"
+    echo "  Proceeding with deploy of committed code only..."
+    echo ""
+fi
+
 echo "=== Pushing local changes to titan-dev ==="
 git push origin titan-v6 2>/dev/null && echo "✓ Pushed to titan-dev" || echo "⚠ Push failed or nothing to push"
 
 # ── Deploy ────────────────────────────────────────────────────────
 deploy_one "${T2_HOST}" "${TITAN_DIR}" "T2"
 deploy_one "${T2_HOST}" "${T3_DIR}" "T3"
+
+# ── Post-deploy: verify remote commits match local ────────────────
+echo ""
+echo "=== Verifying commit alignment ==="
+T2_COMMIT=$(ssh "${T2_HOST}" "cd ${TITAN_DIR} && git rev-parse HEAD" 2>/dev/null)
+T3_COMMIT=$(ssh "${T2_HOST}" "cd ${T3_DIR} && git rev-parse HEAD" 2>/dev/null)
+T2_SHORT=$(echo "$T2_COMMIT" | cut -c1-7)
+T3_SHORT=$(echo "$T3_COMMIT" | cut -c1-7)
+
+ALL_MATCH=true
+if [ "$T2_COMMIT" = "$LOCAL_COMMIT" ]; then
+    echo "  ✓ T2 at ${T2_SHORT} — matches local"
+else
+    echo "  ✗ T2 at ${T2_SHORT} — LOCAL is ${LOCAL_SHORT} (MISMATCH!)"
+    ALL_MATCH=false
+fi
+if [ "$T3_COMMIT" = "$LOCAL_COMMIT" ]; then
+    echo "  ✓ T3 at ${T3_SHORT} — matches local"
+else
+    echo "  ✗ T3 at ${T3_SHORT} — LOCAL is ${LOCAL_SHORT} (MISMATCH!)"
+    ALL_MATCH=false
+fi
+
+if [ "$ALL_MATCH" = false ] && [[ "$1" == "--restart"* ]]; then
+    echo ""
+    echo "  ⚠ COMMIT MISMATCH — restarting anyway, but T2/T3 may run stale code."
+    echo "  ⚠ Did you forget to commit? Check: git status"
+fi
 
 echo ""
 echo "=== Deploy complete (config.toml preserved via backup→pull→restore) ==="

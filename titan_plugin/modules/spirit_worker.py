@@ -135,54 +135,127 @@ def _query_handler_thread(query_queue, handle_fn, state_refs, send_queue, name, 
 
     Reads QUERY messages from query_queue and responds using shared state.
     State dicts are read-only from this thread (CPython dict ops are GIL-atomic).
+
+    Deduplication: when multiple queries of the same action type pile up,
+    only the newest is processed — stale duplicates are discarded. This
+    prevents the thread from wasting time on queries whose HTTP clients
+    have already timed out (observed: 1100+ second queue ages on T2).
     """
     from queue import Empty as _QEmpty
+    _STALE_THRESHOLD = 30.0  # seconds — queries older than this are candidates for dedup
+    _dedup_discarded = 0
     while True:
         try:
             msg = query_queue.get(timeout=0.5)
             if msg is None:
                 break  # Shutdown signal
-            _qt0 = time.time()
-            _qt_action = msg.get("payload", {}).get("action", "?")
-            _qt_age = _qt0 - msg.get("ts", _qt0)
+            # ── Dedup: drain all pending, keep newest per action ──
+            _batch = [msg]
             try:
-                handle_fn(msg, config, state_refs["body_state"], state_refs["mind_state"],
-                          state_refs["consciousness"], state_refs.get("filter_down"),
-                          state_refs.get("intuition"), state_refs.get("impulse_engine"),
-                          state_refs.get("sphere_clock"), state_refs.get("resonance"),
-                          state_refs.get("unified_spirit"), send_queue, name,
-                          inner_state=state_refs.get("inner_state"),
-                          spirit_state=state_refs.get("spirit_state"),
-                          coordinator=state_refs.get("coordinator"),
-                          neural_nervous_system=state_refs.get("neural_nervous_system"),
-                          pi_monitor=state_refs.get("pi_monitor"),
-                          e_mem=state_refs.get("e_mem"),
-                          prediction_engine=state_refs.get("prediction_engine"),
-                          ex_mem=state_refs.get("ex_mem"),
-                          episodic_mem=state_refs.get("episodic_mem"),
-                          working_mem=state_refs.get("working_mem"),
-                          inner_lower_topo=state_refs.get("inner_lower_topo"),
-                          outer_lower_topo=state_refs.get("outer_lower_topo"),
-                          ground_up_enricher=state_refs.get("ground_up_enricher"),
-                          neuromodulator_system=state_refs.get("neuromodulator_system"),
-                          expression_manager=state_refs.get("expression_manager"),
-                          life_force_engine=state_refs.get("life_force_engine"),
-                          outer_interface=state_refs.get("outer_interface"),
-                          phase_tracker=state_refs.get("phase_tracker"),
-                          meditation_tracker=state_refs.get("meditation_tracker"),
-                          reasoning_engine=state_refs.get("reasoning_engine"),
-                          msl=state_refs.get("msl"),
-                          social_pressure_meter=state_refs.get("social_pressure_meter"),
-                          language_stats=state_refs.get("language_stats"),
-                          self_reasoning=state_refs.get("self_reasoning"),
-                          coding_explorer=state_refs.get("coding_explorer"),
-                          filter_down_v4=state_refs.get("filter_down_v4"),
-                          filter_down_v5=state_refs.get("filter_down_v5"),
-                          med_watchdog=state_refs.get("med_watchdog"))
-                logger.info("[QueryThread] %s handled in %.0fms (queued %.0fms)",
-                            _qt_action, (time.time() - _qt0) * 1000, _qt_age * 1000)
-            except Exception as e:
-                logger.warning("[QueryThread] Error handling %s: %s", _qt_action, e)
+                while True:
+                    _batch.append(query_queue.get_nowait())
+            except _QEmpty:
+                pass
+            if len(_batch) > 1:
+                # Keep newest message per action type (highest ts wins).
+                # Non-dedup-safe actions (those with unique payloads) keep all.
+                _DEDUP_ACTIONS = {
+                    "get_trinity", "get_coordinator", "get_nervous_system",
+                    "get_sphere_clock", "get_filter_down_status",
+                }
+                _newest: dict[str, dict] = {}  # action -> newest msg
+                _keep: list[dict] = []
+                for m in _batch:
+                    if m is None:
+                        _keep.append(m)
+                        continue
+                    act = m.get("payload", {}).get("action", "?")
+                    ts = m.get("ts", 0)
+                    if act in _DEDUP_ACTIONS:
+                        if act not in _newest or ts > _newest[act].get("ts", 0):
+                            _newest[act] = m
+                    else:
+                        _keep.append(m)  # non-dedup: keep all
+                _deduped = list(_newest.values()) + _keep
+                _n_discarded = len(_batch) - len(_deduped)
+                if _n_discarded > 0:
+                    _dedup_discarded += _n_discarded
+                    logger.info("[QueryThread] Dedup: %d queries → %d (discarded %d stale, total discarded=%d)",
+                                len(_batch), len(_deduped), _n_discarded, _dedup_discarded)
+                _batch = _deduped
+            for msg in _batch:
+                if msg is None:
+                    return  # Shutdown signal
+                _qt0 = time.time()
+                _qt_action = msg.get("payload", {}).get("action", "?")
+                _qt_age = _qt0 - msg.get("ts", _qt0)
+                # Fast-path for get_coordinator: serve from snapshot cache
+                # if fresh. Unlike handler-side caching, this bypasses the
+                # stale-drop below, so even 60s+ stale queries return data
+                # from a recent cached build. Breaks the T2/T3 observability
+                # loss where stale queries drop → dashboard times out →
+                # cache never fills → endpoints return "not initialized".
+                if _qt_action == "get_coordinator":
+                    try:
+                        from titan_plugin.modules import spirit_loop as _sl
+                        _cache = _sl._COORD_SNAPSHOT_CACHE
+                        if (_cache["data"] is not None
+                                and _qt0 - _cache["ts"]
+                                < _sl._COORD_SNAPSHOT_TTL):
+                            _src = msg.get("src", "")
+                            _rid = msg.get("rid")
+                            _sl._send_response(
+                                send_queue, name, _src,
+                                _cache["data"], _rid)
+                            continue
+                    except Exception:
+                        pass  # fall through to normal handling
+                # Drop queries older than 30s — the HTTP client (10s timeout)
+                # or frontend (10s fetch abort) already gave up. Processing
+                # stale queries just deepens the backlog spiral.
+                if _qt_age > _STALE_THRESHOLD:
+                    _dedup_discarded += 1
+                    logger.info("[QueryThread] SKIP stale %s (age=%.0fms > %.0fs threshold, total_skipped=%d)",
+                                _qt_action, _qt_age * 1000, _STALE_THRESHOLD, _dedup_discarded)
+                    continue
+                try:
+                    handle_fn(msg, config, state_refs["body_state"], state_refs["mind_state"],
+                              state_refs["consciousness"], state_refs.get("filter_down"),
+                              state_refs.get("intuition"), state_refs.get("impulse_engine"),
+                              state_refs.get("sphere_clock"), state_refs.get("resonance"),
+                              state_refs.get("unified_spirit"), send_queue, name,
+                              inner_state=state_refs.get("inner_state"),
+                              spirit_state=state_refs.get("spirit_state"),
+                              coordinator=state_refs.get("coordinator"),
+                              neural_nervous_system=state_refs.get("neural_nervous_system"),
+                              pi_monitor=state_refs.get("pi_monitor"),
+                              e_mem=state_refs.get("e_mem"),
+                              prediction_engine=state_refs.get("prediction_engine"),
+                              ex_mem=state_refs.get("ex_mem"),
+                              episodic_mem=state_refs.get("episodic_mem"),
+                              working_mem=state_refs.get("working_mem"),
+                              inner_lower_topo=state_refs.get("inner_lower_topo"),
+                              outer_lower_topo=state_refs.get("outer_lower_topo"),
+                              ground_up_enricher=state_refs.get("ground_up_enricher"),
+                              neuromodulator_system=state_refs.get("neuromodulator_system"),
+                              expression_manager=state_refs.get("expression_manager"),
+                              life_force_engine=state_refs.get("life_force_engine"),
+                              outer_interface=state_refs.get("outer_interface"),
+                              phase_tracker=state_refs.get("phase_tracker"),
+                              meditation_tracker=state_refs.get("meditation_tracker"),
+                              reasoning_engine=state_refs.get("reasoning_engine"),
+                              msl=state_refs.get("msl"),
+                              social_pressure_meter=state_refs.get("social_pressure_meter"),
+                              language_stats=state_refs.get("language_stats"),
+                              self_reasoning=state_refs.get("self_reasoning"),
+                              coding_explorer=state_refs.get("coding_explorer"),
+                              filter_down_v4=state_refs.get("filter_down_v4"),
+                              filter_down_v5=state_refs.get("filter_down_v5"),
+                              med_watchdog=state_refs.get("med_watchdog"))
+                    logger.info("[QueryThread] %s handled in %.0fms (queued %.0fms)",
+                                _qt_action, (time.time() - _qt0) * 1000, _qt_age * 1000)
+                except Exception as e:
+                    logger.warning("[QueryThread] Error handling %s: %s", _qt_action, e)
         except _QEmpty:
             continue
         except Exception:
@@ -289,7 +362,7 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     # messages (own loop's publish); empty dict = no modulation (coexistence-safe).
     _v5_mults_cache: dict = {}
     focus_body, focus_mind = _init_focus()
-    intuition = _init_intuition()
+    intuition = _init_intuition(config)
 
     # ── Boot V4 Sphere Clock Engine ─────────────────────────────────
     sphere_clock = _init_sphere_clock(config)
@@ -301,7 +374,7 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     unified_spirit = _init_unified_spirit(config)
 
     # ── Boot Step 7 Impulse Engine ─────────────────────────────────
-    impulse_engine = _init_impulse_engine()
+    impulse_engine = _init_impulse_engine(config)
 
     # ── Boot T1 Observable Engine ─────────────────────────────────
     observable_engine = _init_observable_engine()
@@ -314,7 +387,8 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
     # ── Boot T3 Inner Trinity Coordinator ─────────────────────────
     coordinator = _init_coordinator(inner_state, spirit_state, observable_engine,
-                                    neural_nervous_system=neural_nervous_system)
+                                    neural_nervous_system=neural_nervous_system,
+                                    config=config)
 
     # ── Boot π-Heartbeat Monitor ─────────────────────────────────
     from titan_plugin.logic.pi_heartbeat import PiHeartbeatMonitor
@@ -1159,7 +1233,7 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     # ── Query handler thread (Phase 6.2) — responds to QUERY without blocking on computation ──
     import threading
     from queue import Queue as _ThreadQueue
-    _query_queue = _ThreadQueue(maxsize=50)
+    _query_queue = _ThreadQueue(maxsize=200)
     _query_state_refs = {
         "body_state": body_state, "mind_state": mind_state,
         "consciousness": consciousness, "filter_down": filter_down,
@@ -1329,13 +1403,16 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         # Then block for next non-QUERY message at body rate (7.83 Hz).
         msg = None
         _deferred = []
+        _drain_query_count = 0
+        _drain_oldest_age = 0.0
         try:
             while True:
                 _drain_msg = recv_queue.get_nowait()
                 if _drain_msg.get("type") == "QUERY":
                     _drain_age = time.time() - _drain_msg.get("ts", time.time())
-                    logger.info("[QueryDrain] Routing QUERY %s to thread (age=%.0fms)",
-                                _drain_msg.get("payload", {}).get("action", "?"), _drain_age * 1000)
+                    _drain_query_count += 1
+                    if _drain_age > _drain_oldest_age:
+                        _drain_oldest_age = _drain_age
                     try:
                         _query_queue.put_nowait(_drain_msg)
                     except Exception:
@@ -1347,6 +1424,9 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             pass
         except (KeyboardInterrupt, SystemExit):
             break
+        if _drain_query_count > 0:
+            logger.info("[QueryDrain] Routed %d queries to thread (oldest age=%.0fms)",
+                        _drain_query_count, _drain_oldest_age * 1000)
         # If nothing drained, wait for next message
         if not _deferred:
             try:
@@ -1524,8 +1604,8 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             # O5: Expression repetitiveness from composition history
             # (unique_recent / total_recent over last 50 compositions)
             try:
-                import sqlite3 as _sql3_rep
-                _rep_conn = _sql3_rep.connect("./data/inner_memory.db", timeout=2.0)
+                from titan_plugin.utils.db import safe_connect as _sc_rep
+                _rep_conn = _sc_rep("data/inner_memory.db")
                 _rep_row = _rep_conn.execute(
                     "SELECT count(DISTINCT sentence) as u, count(*) as t "
                     "FROM (SELECT sentence FROM composition_history "
@@ -1595,7 +1675,14 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         "logged only, resonance transition is primary trigger")
 
                 elif coord_event == "BEGIN_DREAMING":
-                    logger.info("[SpiritWorker] Titan entering DREAM state")
+                    _pre_dream_undistilled = 0
+                    if exp_orchestrator:
+                        try:
+                            _pre_dream_undistilled = exp_orchestrator.get_pre_dream_undistilled()
+                        except Exception:
+                            pass
+                    logger.info("[SpiritWorker] Titan entering DREAM state (pre-dream undistilled=%d)",
+                                _pre_dream_undistilled)
                     _shared_is_dreaming = True
                     if life_force_engine:
                         life_force_engine.set_dreaming(True)
@@ -1649,6 +1736,36 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                         _retag_count)
                         except Exception as _retag_err:
                             logger.warning("[SpiritWorker] Dream retag error: %s", _retag_err)
+                        # Promote high-confidence wisdom to graph memory
+                        try:
+                            _promoted = exp_orchestrator.promote_to_graph()
+                            if _promoted:
+                                logger.info("[SpiritWorker] Promoted %d wisdom entries to graph after dream",
+                                            _promoted)
+                        except Exception as _promo_err:
+                            logger.warning("[SpiritWorker] Dream graph promotion error: %s", _promo_err)
+                        # Prune wisdom store to prevent novelty collapse
+                        if meta_wisdom:
+                            try:
+                                _pruned = meta_wisdom.prune_to_cap(max_entries=500)
+                            except Exception as _prune_err:
+                                logger.warning("[SpiritWorker] Wisdom prune error: %s", _prune_err)
+                    # Retention pruning — prevent unbounded growth of archives
+                    if chain_archive:
+                        try:
+                            _ca_pruned = chain_archive.prune_old(max_age_days=14, keep_min=100)
+                            if _ca_pruned:
+                                logger.info("[SpiritWorker] ChainArchive pruned %d old entries", _ca_pruned)
+                        except Exception as _ca_prune_err:
+                            logger.warning("[SpiritWorker] ChainArchive prune error: %s", _ca_prune_err)
+                    try:
+                        from titan_plugin.utils.observatory_db import ObservatoryDB
+                        _obs_db = ObservatoryDB()
+                        _obs_db.prune_old_data(max_days=90)
+                        logger.info("[SpiritWorker] ObservatoryDB pruned (>90 days)")
+                    except Exception as _obs_prune_err:
+                        if hash(("obs_prune", str(type(_obs_prune_err)))) % 20 == 0:
+                            logger.warning("[SpiritWorker] ObservatoryDB prune error: %s", _obs_prune_err)
                     # Neuromod: restore normal clearance + resensitize
                     if neuromodulator_system:
                         for _mn, _mm in neuromodulator_system.modulators.items():
@@ -3499,6 +3616,19 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         if _mini_registry:
                             _r_conf = _reasoning_result.get("confidence", 0.5)
                             _mini_registry.feedback_all(_r_conf)
+
+                        # Close interpreter feedback loop — learn from outcome
+                        if _interpreted and _interpreter:
+                            _r_outcome = (_reasoning_result.get("confidence", 0) * 0.6
+                                          + _reasoning_result.get("gut_agreement", 0) * 0.4)
+                            try:
+                                _interpreter.learn_outcome(
+                                    _interpreted.get("domain", _interp_domain),
+                                    _interpreted,
+                                    _r_outcome)
+                            except Exception as _lo_err:
+                                if hash(("learn_outcome", _lo_err.__class__.__name__)) % 50 == 0:
+                                    logger.warning("[Interpreter] learn_outcome error: %s", _lo_err)
                     except Exception as _interp_err:
                         logger.warning("[SpiritWorker] Interpreter error: %s", _interp_err)
 
@@ -4423,9 +4553,8 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         _lf_spirit_coh = (_is_coh + _os_coh) / 2.0
                     _lf_vocab = 0
                     try:
-                        import sqlite3 as _sql3
-                        _vdb = _sql3.connect("./data/inner_memory.db", timeout=5.0)
-                        _vdb.execute("PRAGMA journal_mode=WAL")
+                        from titan_plugin.utils.db import safe_connect as _sc_vdb
+                        _vdb = _sc_vdb("data/inner_memory.db")
                         _lf_vocab = _vdb.execute("SELECT COUNT(*) FROM vocabulary WHERE confidence > 0.3").fetchone()[0]
                         _vdb.close()
                     except Exception:
@@ -4561,6 +4690,12 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             # Runs at _med_watchdog_interval cadence. Reads _meditation_tracker,
             # emits MEDITATION_HEALTH_ALERT for any F1-F7 detections. MVP dry-run
             # (detection_only=True) = alerts but no force-trigger.
+            # INTENTIONAL_BROADCAST: MEDITATION_HEALTH_ALERT + MEDITATION_RECOVERY_TIER_1
+            # + MEDITATION_RECOVERY_TIER_2 are observability-only bus events per
+            # rFP_self_healing_meditation_cadence.md Phase 1 design. Alongside
+            # log.WARNING + send_maker_alert Telegram, the bus event is the open
+            # hook for frontend WebSocket / audit / external observers. No
+            # in-process consumer is required.
             if _med_watchdog is not None:
                 try:
                     _wd_now = time.time()
@@ -4586,6 +4721,8 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                 _wd_alert.severity, _wd_alert.failure_mode,
                                 _wd_alert.detail,
                             )
+                            # INTENTIONAL_BROADCAST: observability-only bus event
+                            # per rFP_self_healing_meditation_cadence.md Phase 1.
                             _send_msg(send_queue, "MEDITATION_HEALTH_ALERT", name, "core", {
                                 **_wd_alert.to_dict(),
                                 "detection_only": _med_watchdog_detection_only,
@@ -4649,6 +4786,7 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                                 "reason": "F1_F2_stuck",
                                                 "drain": _drain, "gaba": _gaba_level,
                                             })
+                                            # INTENTIONAL_BROADCAST: observability-only.
                                             _send_msg(send_queue, "MEDITATION_RECOVERY_TIER_1",
                                                       name, "core", {
                                                 "titan_id": _med_watchdog.titan_id,
@@ -4671,6 +4809,7 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                             _wd_alert.diagnostic.get("stuck_for_minutes", "?"),
                                         )
                                         _meditation_tracker["in_meditation"] = False
+                                        # INTENTIONAL_BROADCAST: observability-only.
                                         _send_msg(send_queue, "MEDITATION_RECOVERY_TIER_1",
                                                   name, "core", {
                                             "titan_id": _med_watchdog.titan_id,
@@ -4705,6 +4844,7 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                                     "Memory_worker likely needs restart.",
                                                     len(_hist), _med_tier2_window_s / 60,
                                                 )
+                                                # INTENTIONAL_BROADCAST: observability-only.
                                                 _send_msg(send_queue,
                                                           "MEDITATION_RECOVERY_TIER_2",
                                                           name, "core", {
@@ -4716,6 +4856,7 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                                     "window_seconds": _med_tier2_window_s,
                                                     "suggested_recovery": "Guardian.restart('memory')",
                                                 })
+                                                # INTENTIONAL_BROADCAST: observability-only.
                                                 _send_msg(send_queue,
                                                           "MEDITATION_HEALTH_ALERT",
                                                           name, "core", {
@@ -4955,6 +5096,46 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         logger.warning(
                             "[META] Subsystem cache refresh dispatch failed (site A): %s",
                             _ssrefresh_err)
+
+                    # ── Feed locally-available subsystem signals ──
+                    # These don't need bus queries — data is in-process.
+                    try:
+                        _local_pred_acc = None
+                        _local_prof_div = None
+                        _local_inner_rel = None
+                        # Self-prediction accuracy from prediction engine
+                        if prediction_engine:
+                            _pe_nov = getattr(prediction_engine, '_novelty_ema', None)
+                            if _pe_nov is not None:
+                                # Accuracy = 1 - novelty (low novelty = high prediction accuracy)
+                                _local_pred_acc = max(0.0, 1.0 - float(_pe_nov))
+                        # Self-profile divergence from consciousness drift
+                        if consciousness and isinstance(consciousness, dict):
+                            _c_drift = consciousness.get("latest_epoch", {}).get("drift", 0.0)
+                            if _c_drift:
+                                _local_prof_div = min(1.0, float(_c_drift))
+                        # Inner relevance from experience orchestrator stats.
+                        # ex_mem._latest_stats was designed but never written —
+                        # switch to direct exp_orchestrator.get_stats() which
+                        # returns the needed {total_records, undistilled} keys.
+                        if exp_orchestrator is not None:
+                            try:
+                                _ex_stats = exp_orchestrator.get_stats()
+                                _total = int(_ex_stats.get("total_records", 0) or 0)
+                                _undist = int(_ex_stats.get("undistilled", 0) or 0)
+                                if _total > 0:
+                                    _local_inner_rel = 1.0 - (_undist / max(_total, 1))
+                            except Exception:
+                                pass
+                        if any(v is not None for v in [_local_pred_acc, _local_prof_div, _local_inner_rel]):
+                            meta_engine.update_subsystem_cache(
+                                self_prediction_accuracy=_local_pred_acc,
+                                self_profile_divergence=_local_prof_div,
+                                inner_relevance=_local_inner_rel,
+                            )
+                    except Exception as _local_sig_err:
+                        if hash(("local_sig", str(type(_local_sig_err)))) % 100 == 0:
+                            logger.warning("[META] Local signal feed error: %s", _local_sig_err)
 
                     _meta_result = meta_engine.tick(
                         state_132d=_meta_sv,
@@ -5624,14 +5805,83 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                 if not _xg_comp_lvl_raw:
                                     # Fallback: query DB directly if language_stats not yet received
                                     try:
-                                        import sqlite3 as _cl_sql
-                                        _cl_db = _cl_sql.connect("data/inner_memory.db", timeout=3)
+                                        from titan_plugin.utils.db import safe_connect as _sc_cl
+                                        _cl_db = _sc_cl("data/inner_memory.db")
                                         _cl_count = _cl_db.execute("SELECT COUNT(*) FROM vocabulary WHERE confidence >= 0.5").fetchone()[0]
                                         _cl_db.close()
                                         _xg_comp_lvl_raw = f"L{min(9, max(1, _cl_count // 30))}"
                                     except Exception:
                                         _xg_comp_lvl_raw = "L1"
                                 _xg_comp_lvl = int(_xg_comp_lvl_raw[1:]) if isinstance(_xg_comp_lvl_raw, str) and _xg_comp_lvl_raw.startswith("L") else (int(_xg_comp_lvl_raw) if isinstance(_xg_comp_lvl_raw, (int, float)) else 0)
+
+                                # SOCIALXGATEWAY-WISDOM-COUNTERS-ZERO fix
+                                # (2026-04-19): resolve coordinator._meta_engine
+                                # + .dreaming + ._meta_cgn ONCE + log a
+                                # diagnostic if any pointer is None at render
+                                # time. Before this, four separate nested
+                                # getattr chains fell silently to 0 default;
+                                # the downstream all-zeros WARN couldn't
+                                # distinguish "genuinely zero counters" from
+                                # "attribute lookup missed a stale/unwired
+                                # pointer." Rendering still falls back to 0
+                                # on missing pointers (defensive) but logs a
+                                # per-pointer line at DEBUG so we can tell
+                                # which chain was broken when investigating.
+                                _xg_me_ref = getattr(coordinator,
+                                                     '_meta_engine', None)
+                                _xg_dr_ref = getattr(coordinator, 'dreaming',
+                                                     None)
+                                _xg_mcgn_ref = (getattr(_xg_me_ref, '_meta_cgn',
+                                                        None)
+                                                if _xg_me_ref is not None
+                                                else None)
+                                if _xg_me_ref is None or _xg_dr_ref is None \
+                                        or _xg_mcgn_ref is None:
+                                    logger.debug(
+                                        "[SpiritWorker] XPostContext pointer "
+                                        "diagnostic: meta_engine=%s dreaming=%s "
+                                        "meta_cgn=%s (None means attribute "
+                                        "chain broke for render tick)",
+                                        _xg_me_ref is not None,
+                                        _xg_dr_ref is not None,
+                                        _xg_mcgn_ref is not None)
+                                _xg_total_eurekas = int(
+                                    getattr(_xg_me_ref, '_total_eurekas', 0)
+                                    or 0) if _xg_me_ref is not None else 0
+                                _xg_total_wisdom_saved = int(
+                                    getattr(_xg_me_ref, '_total_wisdom_saved',
+                                            0) or 0) \
+                                    if _xg_me_ref is not None else 0
+                                _xg_distilled_count = int(
+                                    getattr(_xg_dr_ref, '_distilled_count', 0)
+                                    or 0) if _xg_dr_ref is not None else 0
+                                _xg_meta_cgn_signals = int(
+                                    getattr(_xg_mcgn_ref, '_signals_received',
+                                            0) or 0) \
+                                    if _xg_mcgn_ref is not None else 0
+
+                                # META-WISDOM-SIBLINGS (2026-04-19): fetch top-3
+                                # crystallized wisdom entries for post framing.
+                                # Surface crystallized samples (orphan API until
+                                # this session) so LLM references concrete
+                                # strategies, not just the abstract count.
+                                # MetaWisdomStore is attached to coordinator as
+                                # _meta_wisdom (see spirit_worker.py:612 where
+                                # it's set during Meta-Reasoning Foundation
+                                # init).
+                                _xg_crystallized: list = []
+                                try:
+                                    _mw = getattr(coordinator, '_meta_wisdom',
+                                                  None)
+                                    if _mw is not None and hasattr(
+                                            _mw, 'get_crystallized'):
+                                        _xg_crystallized = _mw.get_crystallized(
+                                            limit=3) or []
+                                except Exception as _xg_cr_err:
+                                    logger.debug(
+                                        "[SpiritWorker] crystallized fetch "
+                                        "failed: %s", _xg_cr_err)
+                                    _xg_crystallized = []
                                 _xg_ctx = _XPostContext(
                                     session=_xg_session, proxy=_xg_proxy,
                                     api_key=_xg_api_key,
@@ -5667,21 +5917,27 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                     # Wisdom & growth enrichment (2026-04-13
                                     # — fixes "novelty at zero" misinterpre-
                                     # tation by giving LLM concrete data on
-                                    # ongoing learning).
-                                    total_eurekas=int(getattr(
-                                        getattr(coordinator, '_meta_engine', None),
-                                        '_total_eurekas', 0) or 0),
-                                    total_wisdom_saved=int(getattr(
-                                        getattr(coordinator, '_meta_engine', None),
-                                        '_total_wisdom_saved', 0) or 0),
-                                    distilled_count=int(getattr(
-                                        getattr(coordinator, 'dreaming', None),
-                                        '_distilled_count', 0) or 0),
-                                    meta_cgn_signals=int(getattr(
-                                        getattr(getattr(coordinator,
-                                                        '_meta_engine', None),
-                                                '_meta_cgn', None),
-                                        '_signals_received', 0) or 0),
+                                    # ongoing learning). SOCIALXGATEWAY-
+                                    # WISDOM-COUNTERS-ZERO fix (2026-04-19):
+                                    # counter values resolved above in
+                                    # _xg_total_eurekas etc. so the down-
+                                    # stream all-zeros WARN can distinguish
+                                    # "genuinely zero" from "attribute chain
+                                    # None at render time."
+                                    total_eurekas=_xg_total_eurekas,
+                                    total_wisdom_saved=_xg_total_wisdom_saved,
+                                    distilled_count=_xg_distilled_count,
+                                    meta_cgn_signals=_xg_meta_cgn_signals,
+                                    # META-WISDOM-SIBLINGS fix (2026-04-19):
+                                    # fetch up to 3 crystallized wisdom entries
+                                    # so [WISDOM & GROWTH] renders one sample
+                                    # per post (cycled by epoch). Was orphan
+                                    # before — total_wisdom_saved showed the
+                                    # count but no concrete entries ever
+                                    # surfaced. get_crystallized query closes
+                                    # the loop. Best-effort; on import / DB
+                                    # issues, pass empty list and skip render.
+                                    crystallized_samples=_xg_crystallized,
                                     # B2 (2026-04-13): prediction_familiarity
                                     # field removed — its disclaimer text still
                                     # mentioned "novelty", giving the LLM a
@@ -6226,6 +6482,10 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             except Exception as _bt_err:
                 logger.error("[MEDITATION] F5 — Backup trigger write failed: %s", _bt_err,
                              exc_info=True)
+                # INTENTIONAL_BROADCAST: observability-only bus event — F5 trigger
+                # file failure detection. Per rFP Phase 1 design, the bus event
+                # sits alongside log.error + (future) Telegram alert; no in-process
+                # consumer required.
                 _send_msg(send_queue, "MEDITATION_HEALTH_ALERT", name, "core", {
                     "severity": "MEDIUM",
                     "failure_mode": "F5_TRIGGER_FILE_WRITE",
@@ -6583,9 +6843,8 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     # Mind inputs
                     _lf_vocab = 0
                     try:
-                        import sqlite3 as _sql3
-                        _vdb = _sql3.connect("./data/inner_memory.db", timeout=5.0)
-                        _vdb.execute("PRAGMA journal_mode=WAL")
+                        from titan_plugin.utils.db import safe_connect as _sc_vdb
+                        _vdb = _sc_vdb("data/inner_memory.db")
                         _lf_vocab = _vdb.execute("SELECT COUNT(*) FROM vocabulary WHERE confidence > 0.3").fetchone()[0]
                         _vdb.close()
                     except Exception:
@@ -7573,9 +7832,9 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                       if isinstance(_feat_30d, dict) else [])
                         if _j_journey:
                             try:
-                                import sqlite3 as _va_sql
+                                from titan_plugin.utils.db import safe_connect as _sc_va
                                 import json as _va_json
-                                _va_db = _va_sql.connect("./data/inner_memory.db", timeout=2.0)
+                                _va_db = _sc_va("data/inner_memory.db")
                                 _va_db.execute(
                                     "INSERT INTO visual_autobiography "
                                     "(timestamp, epoch_id, journey_5d, resonance_5d, "
@@ -8259,6 +8518,56 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 logger.warning(
                     "[META_LANGUAGE] Reward handler error: %s", _mlrw_err)
 
+        # ── META_PERSONA_REWARD: COMPLETE-4 (2026-04-19) — cross-system
+        # reward from persona session quality. Resolves to the most-recently-
+        # concluded chain via meta_engine.get_last_chain_id() since persona
+        # sessions don't carry a specific chain_id. Quality in [0, 1] maps
+        # directly to external_reward.
+        elif msg_type == "META_PERSONA_REWARD":
+            try:
+                if meta_engine is not None:
+                    _mpr_p = msg.get("payload", {}) or {}
+                    _mpr_q = float(_mpr_p.get("quality", 0.0))
+                    _mpr_sid = str(_mpr_p.get("session_id", "?"))
+                    _mpr_cid = meta_engine.get_last_chain_id()
+                    if _mpr_cid >= 0:
+                        _mpr_applied = meta_engine.add_external_reward(
+                            _mpr_cid, _mpr_q)
+                        if _mpr_applied:
+                            logger.info(
+                                "[META_PERSONA] Reward applied chain_id=%d "
+                                "quality=%.3f sid=%s",
+                                _mpr_cid, _mpr_q, _mpr_sid)
+            except Exception as _mpr_err:
+                logger.warning(
+                    "[META_PERSONA] Reward handler error: %s", _mpr_err)
+
+        # ── META_EVENT_REWARD: COMPLETE-4-EVENTS (2026-04-19) — third
+        # cross-system reward worker, following Language + Persona.
+        # Events Teacher cron computes per-window quality
+        # (events_stored / items_distilled) and POSTs to
+        # /v4/meta-reasoning/event-reward, which republishes here.
+        # Same chain resolution pattern as Persona — windows don't
+        # carry a specific chain_id.
+        elif msg_type == "META_EVENT_REWARD":
+            try:
+                if meta_engine is not None:
+                    _mer_p = msg.get("payload", {}) or {}
+                    _mer_q = float(_mer_p.get("quality", 0.0))
+                    _mer_w = int(_mer_p.get("window_number", -1))
+                    _mer_cid = meta_engine.get_last_chain_id()
+                    if _mer_cid >= 0:
+                        _mer_applied = meta_engine.add_external_reward(
+                            _mer_cid, _mer_q)
+                        if _mer_applied:
+                            logger.info(
+                                "[META_EVENTS] Reward applied chain_id=%d "
+                                "quality=%.3f window=%d",
+                                _mer_cid, _mer_q, _mer_w)
+            except Exception as _mer_err:
+                logger.warning(
+                    "[META_EVENTS] Reward handler error: %s", _mer_err)
+
         # ── CGN_KNOWLEDGE_RESP: knowledge response for meta-reasoning impasse ──
         # P8: if the response carries a request_id matching a pending META-CGN
         # knowledge request, route through the aggregator for windowed ranking.
@@ -8380,6 +8689,26 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                 float(response.get("confidence", 0)))
             except Exception as _kq_err:
                 logger.debug("[SOAR P8] META-CGN responder error: %s", _kq_err)
+
+        # ── MAKER_PROPOSAL_CREATED: log-only awareness of pending Maker proposals ──
+        # Per somatic_channel.py emit_proposal_created docstring: spirit_worker
+        # logs this so operators can see proposals surfacing alongside the felt-
+        # response handler below. ChatAPI surfacing (system message in the
+        # conversation stream) is a separate concern tracked in the Titan Maker
+        # substrate plan. No neuromod effect — creation is announcement only;
+        # the response (approve/decline) below is what Titan actually feels.
+        elif msg_type == "MAKER_PROPOSAL_CREATED":
+            try:
+                _mp_p = msg.get("payload", {}) or {}
+                logger.info(
+                    "[MAKER] Proposal pending: id=%s type=%s title=%r%s",
+                    _mp_p.get("proposal_id", "?"),
+                    _mp_p.get("proposal_type", "?"),
+                    (_mp_p.get("title", "") or "")[:80],
+                    " (requires_signature=true)" if _mp_p.get("requires_signature") else "",
+                )
+            except Exception as _mp_err:
+                logger.debug("[MAKER] proposal_created log error: %s", _mp_err)
 
         # ── MAKER_RESPONSE_RECEIVED: Tier 2 somatic processing of Maker dialogic responses ──
         # Approve: small DA + Endorphin + 5HT bumps (felt validation).
@@ -9180,6 +9509,9 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         len(_config_updated), ", ".join(_config_updated[:10]))
 
         elif msg_type == "QUERY":
+            from titan_plugin.core.profiler import handle_memory_profile_query
+            if handle_memory_profile_query(msg, send_queue, name):
+                continue
             # READ-ONLY queries → dedicated thread (never blocked by computation)
             _query_action = msg.get("payload", {}).get("action", "")
             if _query_action in ("chat", "conversation") and outer_interface:
@@ -9558,7 +9890,7 @@ def _init_filter_down(config: dict):
         data_dir = config.get("data_dir", "./data")
         if not data_dir or data_dir == "":
             data_dir = "./data"
-        return FilterDownEngine(data_dir=data_dir)
+        return FilterDownEngine(config=config, data_dir=data_dir)
     except Exception as e:
         logger.warning("[SpiritWorker] FilterDown init failed: %s", e)
         return None
@@ -9571,7 +9903,7 @@ def _init_filter_down_v4(config: dict):
         data_dir = config.get("data_dir", "./data")
         if not data_dir or data_dir == "":
             data_dir = "./data"
-        return FilterDownV4Engine(data_dir=data_dir)
+        return FilterDownV4Engine(config=config, data_dir=data_dir)
     except Exception as e:
         logger.warning("[SpiritWorker] FilterDownV4 init failed: %s", e)
         return None
@@ -9600,11 +9932,11 @@ def _init_focus():
         return None, None
 
 
-def _init_intuition():
+def _init_intuition(config: dict | None = None):
     """Initialize INTUITION engine."""
     try:
         from titan_plugin.logic.intuition import IntuitionEngine
-        return IntuitionEngine()
+        return IntuitionEngine(config=config)
     except Exception as e:
         logger.warning("[SpiritWorker] Intuition init failed: %s", e)
         return None
@@ -9656,11 +9988,17 @@ def _init_resonance(config: dict):
         return None
 
 
-def _init_impulse_engine():
-    """Initialize IMPULSE engine (Step 7.1)."""
+def _init_impulse_engine(config: dict | None = None):
+    """Initialize IMPULSE engine (Step 7.1).
+
+    Reads ``config["impulse"]`` (threshold_initial, alpha_success, beta_failure,
+    threshold_floor, threshold_ceil, cooldown). Plumbed 2026-04-16 — toml
+    values were previously ignored because ctor was called with no args.
+    """
     try:
         from titan_plugin.logic.impulse_engine import ImpulseEngine
-        return ImpulseEngine()
+        cfg = (config or {}).get("impulse", {})
+        return ImpulseEngine(config=cfg)
     except Exception as e:
         logger.warning("[SpiritWorker] ImpulseEngine init failed: %s", e)
         return None
@@ -9699,7 +10037,7 @@ def _init_neural_nervous_system(config: dict):
         vm_ns = None
         try:
             from titan_plugin.logic.nervous_system import NervousSystem
-            vm_ns = NervousSystem()
+            vm_ns = NervousSystem(config=config.get("titan_vm", {}))
         except Exception:
             pass
 
@@ -9719,15 +10057,21 @@ def _init_neural_nervous_system(config: dict):
 
 
 def _init_coordinator(inner_state, spirit_state, observable_engine,
-                      neural_nervous_system=None):
-    """Initialize T3 Inner Trinity Coordinator with T4/V5 Nervous System."""
+                      neural_nervous_system=None, config: dict | None = None):
+    """Initialize T3 Inner Trinity Coordinator with T4/V5 Nervous System.
+
+    ``config`` (the full spirit worker config dict) is threaded through so
+    the [titan_vm] toml section reaches the lightweight T4 VM. Added
+    2026-04-16 with the [titan_vm] plumb fix.
+    """
     try:
         from titan_plugin.logic.inner_coordinator import InnerTrinityCoordinator
         # T4: Create NervousSystem with lightweight TitanVM (context-only)
         nervous_system = None
         try:
             from titan_plugin.logic.nervous_system import NervousSystem
-            nervous_system = NervousSystem()
+            vm_cfg = (config or {}).get("titan_vm", {})
+            nervous_system = NervousSystem(config=vm_cfg)
         except Exception as e:
             logger.warning("[SpiritWorker] NervousSystem init failed: %s", e)
         # T5: Create TopologyEngine

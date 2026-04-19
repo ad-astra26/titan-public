@@ -180,15 +180,18 @@ class MetabolismController:
 
         return self._current_tier
 
+    # UNUSED_PUBLIC_API: gate method awaiting METABOLISM-GATE-WIRING rFP.
     def get_metabolic_tier(self) -> str:
         """Get the current 6-tier metabolic state."""
         return self._current_tier
 
+    # UNUSED_PUBLIC_API: gate method awaiting METABOLISM-GATE-WIRING rFP.
     def get_chi_factor(self) -> float:
         """Get Chi multiplier for current tier. Used by life_force_engine."""
         tier_info = METABOLIC_TIERS.get(self._current_tier, {})
         return tier_info.get("chi_factor", 1.0)
 
+    # UNUSED_PUBLIC_API: gate method awaiting METABOLISM-GATE-WIRING rFP.
     def can_use_feature(self, feature: str) -> bool:
         """Check if a feature is available at the current metabolic tier.
 
@@ -197,11 +200,13 @@ class MetabolismController:
         tier_features = TIER_FEATURES.get(self._current_tier, {})
         return tier_features.get(feature, False)
 
+    # UNUSED_PUBLIC_API: gate method awaiting METABOLISM-GATE-WIRING rFP.
     def get_rate_factor(self) -> float:
         """Activity rate multiplier for current tier. 1.0 = full, 0.5 = half, 0.0 = stopped."""
         tier_info = METABOLIC_TIERS.get(self._current_tier, {})
         return tier_info.get("rate_factor", 1.0)
 
+    # UNUSED_PUBLIC_API: gate method awaiting METABOLISM-GATE-WIRING rFP.
     def get_service_gate(self, feature: str) -> tuple[bool, float, str]:
         """Check if a service should run and at what rate.
 
@@ -244,6 +249,8 @@ class MetabolismController:
             "features": features,
         }
 
+    # UNUSED_PUBLIC_API: governance reserve protection — awaiting
+    # METABOLISM-GATE-WIRING rFP (should gate every on-chain spend).
     async def can_afford(self, cost: float) -> bool:
         """Check if a transaction is affordable without breaching governance reserve."""
         balance = await self.network.get_balance()

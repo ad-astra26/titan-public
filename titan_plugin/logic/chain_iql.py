@@ -163,9 +163,26 @@ class ChainTemplateQNet:
         }
 
     def from_dict(self, d: dict) -> None:
-        self.template_emb = np.array(d.get("template_emb", []), dtype=np.float32)
-        if self.template_emb.size == 0:
+        saved_emb = np.array(d.get("template_emb", []), dtype=np.float32)
+        if saved_emb.size == 0:
             return
+        # v2 2026-04-19: handle template_count growth (50 → 500).
+        # If saved embedding has fewer rows than current self.template_count,
+        # pad with fresh random init so the Q-net has its full capacity. The
+        # trained weights for known templates carry over; unknown slots start
+        # fresh (UCB exploration will prefer them correctly).
+        saved_count = saved_emb.shape[0]
+        if saved_count == self.template_count:
+            self.template_emb = saved_emb
+        elif saved_count < self.template_count:
+            rng = np.random.default_rng(42)
+            pad = rng.standard_normal(
+                (self.template_count - saved_count, self.template_emb_dim)
+            ).astype(np.float32) * 0.1
+            self.template_emb = np.concatenate([saved_emb, pad], axis=0)
+        else:
+            # Saved is larger than current (config shrunk) — truncate.
+            self.template_emb = saved_emb[: self.template_count]
         self.w1 = np.array(d["w1"], dtype=np.float32)
         self.b1 = np.array(d["b1"], dtype=np.float32)
         self.w2 = np.array(d["w2"], dtype=np.float32)
@@ -194,11 +211,14 @@ class ChainIQL:
     def __init__(self, dna: dict | None = None, save_dir: str = "./data/reasoning"):
         dna = dna or {}
         self._task_dim = int(dna.get("task_embedding_dim", 32))
-        self._template_max = int(dna.get("chain_template_max_count", 50))
+        # v2 2026-04-19: raise default 50 → 500 (removes arbitrary ceiling)
+        self._template_max = int(dna.get("chain_template_max_count", 500))
         self._lr = float(dna.get("chain_qnet_lr", 0.001))
         self._buffer_size = int(dna.get("chain_iql_buffer_size", 1000))
         self._blend_alpha = float(dna.get("chain_blend_alpha", 0.5))
         self._enabled = bool(dna.get("chain_iql_enabled", True))
+        # v2 2026-04-19: UCB1 exploration coefficient. Higher = more exploration.
+        self._ucb_c = float(dna.get("chain_iql_ucb_c", 0.3))
 
         self.qnet = ChainTemplateQNet(
             task_dim=self._task_dim,
@@ -207,11 +227,18 @@ class ChainIQL:
         )
         # Template registry: template_string → integer id (slot in qnet.template_emb)
         self.template_registry: dict[str, int] = {}
+        # v2 2026-04-19: LRU bookkeeping + UCB visit counts.
+        # _template_last_seen[tid] = last time this template was picked/observed
+        # _template_visits[tid] = total chains that used this template
+        self._template_last_seen: dict[int, float] = {}
+        self._template_visits: dict[int, int] = {}
         # Buffer of (task_emb, template_id, task_success, primitives, domain)
         self.buffer: deque = deque(maxlen=self._buffer_size)
         # Phase D.1: counter for external rewards that arrived after buffer
         # eviction (expected late-drop case). Exposed in get_stats() for tuning.
         self._external_reward_late_drops = 0
+        # v2 2026-04-19: telemetry on eviction behavior.
+        self._lru_evictions = 0
         # Save path
         self._save_path = os.path.join(save_dir, "chain_iql.json")
         os.makedirs(save_dir, exist_ok=True)
@@ -225,18 +252,60 @@ class ChainIQL:
     def blend_alpha(self) -> float:
         return self._blend_alpha
 
-    def get_or_assign_template_id(self, template: str) -> int:
-        """Look up the int id for a template string. Assigns a new slot if novel."""
+    def get_or_assign_template_id(self, template: str, now: float | None = None) -> int:
+        """Look up the int id for a template string. Assigns a new slot if novel.
+
+        v2 2026-04-19: LRU eviction replaces the pathological slot-0-FIFO.
+        When registry is full, evict the least-recently-seen template and
+        recycle its slot for the new template. Novel templates always get
+        a real slot — not aliased into a garbage bucket.
+
+        The v1 slot-0-FIFO bug caused 98.7% of chains to report template_id=0
+        across hundreds of structurally different templates, making the Q-net
+        unable to learn from slot 0.
+        """
+        import time as _time
+        if now is None:
+            now = _time.time()
         if template in self.template_registry:
-            return self.template_registry[template]
-        if len(self.template_registry) >= self._template_max:
-            # Registry full — recycle the least-used slot. For now, simple
-            # FIFO eviction by reusing slot 0 (oldest). A more sophisticated
-            # eviction strategy can come later.
-            return 0
-        new_id = len(self.template_registry)
-        self.template_registry[template] = new_id
-        return new_id
+            tid = self.template_registry[template]
+            self._template_last_seen[tid] = now
+            return tid
+        if len(self.template_registry) < self._template_max:
+            new_id = len(self.template_registry)
+            self.template_registry[template] = new_id
+            self._template_last_seen[new_id] = now
+            self._template_visits[new_id] = 0
+            return new_id
+        # Registry full — evict least-recently-seen template, recycle its slot.
+        if not self._template_last_seen:
+            # Defensive: registry full but bookkeeping missing (pre-v2 state).
+            # Rebuild from current registry with now() timestamps.
+            for t, tid in self.template_registry.items():
+                self._template_last_seen[tid] = now
+                self._template_visits.setdefault(tid, 0)
+        lru_tid = min(self._template_last_seen, key=self._template_last_seen.get)
+        # Find the old template string that owns lru_tid.
+        old_template = next(
+            (t for t, tid in self.template_registry.items() if tid == lru_tid),
+            None,
+        )
+        if old_template is not None:
+            del self.template_registry[old_template]
+        # Reset embedding for the recycled slot so new template doesn't inherit
+        # the evicted template's learned representation (fresh start).
+        try:
+            rng = np.random.default_rng(lru_tid + int(now))
+            self.qnet.template_emb[lru_tid] = (
+                rng.standard_normal(self.qnet.template_emb_dim).astype(np.float32) * 0.1
+            )
+        except Exception:
+            pass
+        self.template_registry[template] = lru_tid
+        self._template_last_seen[lru_tid] = now
+        self._template_visits[lru_tid] = 0
+        self._lru_evictions += 1
+        return lru_tid
 
     def record_chain_outcome(
         self,
@@ -259,6 +328,11 @@ class ChainIQL:
         if not template:
             return
         template_id = self.get_or_assign_template_id(template)
+        # v2 2026-04-19: bump visit count + LRU timestamp so UCB can measure
+        # novelty and LRU eviction stays accurate.
+        import time as _time
+        self._template_visits[template_id] = self._template_visits.get(template_id, 0) + 1
+        self._template_last_seen[template_id] = _time.time()
         self.buffer.append({
             "task_emb": task_emb.tolist() if isinstance(task_emb, np.ndarray) else list(task_emb),
             "template": template,
@@ -313,19 +387,31 @@ class ChainIQL:
     ) -> tuple[str | None, float]:
         """Return (best_template_string, q_value) for the given task embedding.
 
-        Searches all known templates and returns the one with the highest Q.
-        Returns (None, 0.0) if no templates are registered or all Qs are
-        below min_q.
+        v2 2026-04-19: UCB1 exploration. Replaces ε-greedy Q-argmax with
+        principled uncertainty-aware exploration. Score = Q + c*sqrt(log(N)/n),
+        where n is the per-template visit count and N is the total visits.
+        Low-visit templates earn a larger UCB bonus → explored naturally.
+        High-visit known-low-Q templates drop out. No hand-tuned ε.
+
+        Returns (None, 0.0) if no templates are registered or all Qs below min_q.
         """
         if not self._enabled or not self.template_registry:
             return None, 0.0
+        total_visits = max(1, sum(self._template_visits.values()) or 1)
+        log_total = math.log(total_visits + 1)
+        c = max(0.0, self._ucb_c)
         best_template = None
-        best_q = -1.0
+        best_score = -1e9
+        best_q = 0.0
         for template, tid in self.template_registry.items():
             q = self.qnet.predict(task_emb, tid)
-            if q > best_q:
-                best_q = q
+            n = max(1, self._template_visits.get(tid, 0))
+            ucb_bonus = c * math.sqrt(log_total / n) if c > 0 else 0.0
+            score = q + ucb_bonus
+            if score > best_score:
+                best_score = score
                 best_template = template
+                best_q = q
         if best_q < min_q:
             return None, 0.0
         return best_template, best_q
@@ -444,21 +530,37 @@ class ChainIQL:
         }
 
     def get_stats(self) -> dict:
+        # v2 2026-04-19: expose LRU/UCB telemetry
+        visits = list(self._template_visits.values())
+        min_v = min(visits) if visits else 0
+        max_v = max(visits) if visits else 0
         return {
             "enabled": self._enabled,
             "buffer_size": len(self.buffer),
             "template_count": len(self.template_registry),
+            "template_max": self._template_max,
             "total_updates": self.qnet.total_updates,
             "blend_alpha": self._blend_alpha,
             "external_reward_late_drops": self._external_reward_late_drops,
+            "lru_evictions": self._lru_evictions,
+            "ucb_c": self._ucb_c,
+            "visit_range": [min_v, max_v],
+            "visit_sum": sum(visits),
         }
 
     def save(self) -> None:
         try:
+            # v2 2026-04-19: persist LRU bookkeeping + UCB visit counts.
+            # Without this, LRU eviction after restart would evict templates
+            # randomly (no last_seen info) and UCB would re-explore from zero.
             payload = {
                 "qnet": self.qnet.to_dict(),
                 "template_registry": self.template_registry,
                 "buffer": list(self.buffer),
+                "template_last_seen": self._template_last_seen,
+                "template_visits": self._template_visits,
+                "lru_evictions": self._lru_evictions,
+                "schema_version": 2,
             }
             tmp = self._save_path + ".tmp"
             with open(tmp, "w") as f:
@@ -477,9 +579,32 @@ class ChainIQL:
             self.template_registry = dict(payload.get("template_registry", {}))
             saved_buffer = payload.get("buffer", [])
             self.buffer = deque(saved_buffer, maxlen=self._buffer_size)
+            # v2 2026-04-19: load LRU/UCB state; keys may be strings from JSON.
+            raw_last_seen = payload.get("template_last_seen", {})
+            self._template_last_seen = {int(k): float(v) for k, v in raw_last_seen.items()}
+            raw_visits = payload.get("template_visits", {})
+            self._template_visits = {int(k): int(v) for k, v in raw_visits.items()}
+            self._lru_evictions = int(payload.get("lru_evictions", 0))
+            # Migration: if v1 state (no LRU/visits), rebuild from buffer.
+            if not self._template_visits and self.buffer:
+                import time as _time
+                now = _time.time()
+                for entry in self.buffer:
+                    tid = entry.get("template_id", -1)
+                    if tid >= 0:
+                        self._template_visits[tid] = self._template_visits.get(tid, 0) + 1
+                        self._template_last_seen[tid] = now
+                logger.info("[ChainIQL] v1→v2 migration: rebuilt %d visit counts from buffer",
+                            len(self._template_visits))
             logger.info(
-                "[ChainIQL] Loaded: templates=%d, buffer=%d, updates=%d",
-                len(self.template_registry), len(self.buffer), self.qnet.total_updates,
+                "[ChainIQL] Loaded v%d: templates=%d/%d, buffer=%d, updates=%d, "
+                "visits_range=[%d,%d], lru_evictions=%d, ucb_c=%.2f",
+                payload.get("schema_version", 1),
+                len(self.template_registry), self._template_max,
+                len(self.buffer), self.qnet.total_updates,
+                min(self._template_visits.values()) if self._template_visits else 0,
+                max(self._template_visits.values()) if self._template_visits else 0,
+                self._lru_evictions, self._ucb_c,
             )
         except Exception as e:
             logger.warning("[ChainIQL] Load error: %s", e)

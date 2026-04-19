@@ -34,6 +34,9 @@ NUDGE_MAX = 0.5  # Maximum nudge magnitude per dimension
 NUDGE_THRESHOLD = 0.05  # Only publish nudges above this magnitude
 
 
+# PERSISTENCE_BY_DESIGN: FocusPID integral + prev_error are PID controller
+# state conventionally reset on warm-boot to avoid cross-session integral
+# windup. get_state returns them for observability only.
 class FocusPID:
     """
     PID controller for one Trinity layer (Body or Mind).

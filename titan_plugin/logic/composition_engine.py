@@ -280,6 +280,9 @@ L9_TEMPLATE_PREFERENCES = {
 }
 
 
+# PERSISTENCE_BY_DESIGN: CompositionEngine._l9_policy is loaded from a
+# persisted policy file via torch.load at init; stored as reference to
+# the loaded model rather than self-assignment the scanner recognizes.
 class CompositionEngine:
     """Composes sentences from felt-state using learned vocabulary.
 

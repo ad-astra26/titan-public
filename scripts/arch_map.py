@@ -180,10 +180,28 @@ class TitanASTVisitor(ast.NodeVisitor):
                     })
 
             # ── make_msg detection (resolves bus constants) ──
-            elif func_name == "make_msg" and len(node.args) >= 3:
-                msg_type = self._resolve_value(node.args[0])
-                src = self._resolve_value(node.args[1]) if len(node.args) > 1 else "?"
-                dst = self._resolve_value(node.args[2]) if len(node.args) > 2 else "?"
+            # Supports BOTH positional and keyword-argument calling conventions:
+            #   make_msg(MSG_TYPE, src, dst, payload=...)
+            #   make_msg(msg_type="MSG_TYPE", src=..., dst=..., payload=...)
+            # The keyword form is used e.g. by maker/narrative_channel.py.
+            elif func_name == "make_msg":
+                msg_type = None
+                src = "?"
+                dst = "?"
+                if len(node.args) >= 1:
+                    msg_type = self._resolve_value(node.args[0])
+                    if len(node.args) > 1:
+                        src = self._resolve_value(node.args[1])
+                    if len(node.args) > 2:
+                        dst = self._resolve_value(node.args[2])
+                # Fill in from keywords — these override missing positionals.
+                for kw in node.keywords:
+                    if kw.arg == "msg_type" and msg_type is None:
+                        msg_type = self._resolve_value(kw.value)
+                    elif kw.arg == "src":
+                        src = self._resolve_value(kw.value)
+                    elif kw.arg == "dst":
+                        dst = self._resolve_value(kw.value)
                 if msg_type:
                     # make_msg is always wrapped in bus.publish — record as publish
                     self.bus_publishes.append({
@@ -191,6 +209,35 @@ class TitanASTVisitor(ast.NodeVisitor):
                         "msg_type": msg_type,
                         "dst": dst,
                         "src": src,
+                        "context": self.context,
+                    })
+
+            # ── Raw send_queue.put({"type": "MSG_TYPE", ...}) pattern ──
+            # Used by spirit_worker for OBSERVABLES_SNAPSHOT and similar internal
+            # messages. Narrow match — only trigger on queue-named .put() calls
+            # to avoid collisions with list.put / dict-style helpers that happen
+            # to accept a dict argument.
+            elif (func_name.endswith(".put")
+                  and any(q in func_name for q in
+                          ("send_queue", "recv_queue", "queue.put", "_queue"))
+                  and len(node.args) >= 1 and isinstance(node.args[0], ast.Dict)):
+                d = node.args[0]
+                msg_type = None
+                dst = "?"
+                src = "?"
+                for k, v in zip(d.keys, d.values):
+                    if isinstance(k, ast.Constant):
+                        if k.value == "type":
+                            msg_type = self._resolve_value(v)
+                        elif k.value == "dst":
+                            dst = self._resolve_value(v) or "?"
+                        elif k.value == "src":
+                            src = self._resolve_value(v) or "?"
+                if msg_type:
+                    self.send_msgs.append({
+                        "line": node.lineno,
+                        "msg_type": msg_type,
+                        "dst": dst,
                         "context": self.context,
                     })
 
@@ -1043,10 +1090,91 @@ def show_audit(graph: dict):
                 return False
         return True
 
+    # ── Runtime-published signals (cognitive contracts JSON + helper fns) ──
+    # Some msg types are published at runtime by the TitanVM contract
+    # interpreter after evaluating JSON contracts (titan_plugin/contracts/**).
+    # AST analysis cannot see these — scan the JSON files for "event": "TYPE"
+    # entries and treat those types as having runtime publishers.
+    import json as _json, glob as _glob
+    _runtime_pubs: dict = defaultdict(list)
+    for jf in _glob.glob("titan_plugin/contracts/**/*.json", recursive=True):
+        try:
+            with open(jf) as _jfh:
+                _jd = _json.load(_jfh)
+            # Traverse dict/list looking for "event": "MSG_TYPE" entries
+            def _walk(obj, path_hint=""):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if k == "event" and isinstance(v, str):
+                            _runtime_pubs[v].append({
+                                "file": jf, "line": 0, "dst": "?",
+                            })
+                        else:
+                            _walk(v, path_hint=f"{path_hint}.{k}")
+                elif isinstance(obj, list):
+                    for item in obj:
+                        _walk(item, path_hint)
+            _walk(_jd)
+        except Exception:
+            continue
+
+    # Known-helper publishers — functions in bus.py/logic/*.py that build a
+    # msg dict and dispatch via duck-typed sender.put_nowait/publish. Static
+    # analysis can't trace because msg type appears as a bus-constant Name
+    # reference inside a variable assignment rather than a make_msg call.
+    # This allowlist closes the gap without needing full data-flow analysis.
+    _KNOWN_HELPER_PUBS = {
+        # emit_meta_cgn_signal → META_CGN_SIGNAL (bus.py:415)
+        "emit_meta_cgn_signal": "META_CGN_SIGNAL",
+    }
+
+    # Helper publisher discovery: functions whose body wraps make_msg/_send_msg
+    # for a specific msg_type act as publishers for that type when their
+    # CALLERS invoke them. Also combines with the _KNOWN_HELPER_PUBS allowlist.
+    _files = graph.get("files", {})
+    _helper_pubs: dict[str, str] = {}  # function_name → msg_type
+    # Build from the raw bus_publishes + send_msgs — each publish/send site
+    # records its enclosing context (function name). Top-level functions
+    # (no "." in context) are helper candidates.
+    for mtype_name, data in msg_types.items():
+        for p in data.get("publishers", []):
+            ctx = p.get("context", "")
+            if ctx and "." not in ctx and ctx != "<module>":
+                _helper_pubs.setdefault(ctx, mtype_name)
+        for s in data.get("send_msgs", []):
+            ctx = s.get("context", "")
+            if ctx and "." not in ctx and ctx != "<module>":
+                _helper_pubs.setdefault(ctx, mtype_name)
+    for k in ("make_msg", "_send_msg"):
+        _helper_pubs.pop(k, None)
+    # Merge known-helper allowlist (emit_meta_cgn_signal etc.) with discovered
+    # helpers; allowlist takes precedence.
+    for _name, _mtype in _KNOWN_HELPER_PUBS.items():
+        _helper_pubs[_name] = _mtype
+    # Walk function_calls: if a caller invokes a helper_pub, credit caller
+    # file as a publisher of the mapped msg_type.
+    _helper_caller_pubs: dict = defaultdict(list)
+    for fp, fdata in _files.items():
+        for fc in fdata.get("function_calls", []):
+            fn = fc.get("func", "")
+            short = fn.split(".")[-1] if fn else ""
+            if short and short in _helper_pubs:
+                mtype = _helper_pubs[short]
+                if mtype:
+                    _helper_caller_pubs[mtype].append({
+                        "file": fp, "line": fc.get("line", 0), "dst": "?",
+                    })
+    # Fold runtime-published signals (from contract JSON) into the caller list
+    # so Section B's "0 senders" check passes for contract-fired events.
+    for _mt, _locs in _runtime_pubs.items():
+        _helper_caller_pubs[_mt].extend(_locs)
+
     for mtype in sorted(msg_types.keys()):
         data = msg_types[mtype]
         sends = data.get("send_msgs", [])
         pubs = data.get("publishers", [])
+        # Augment with any callers of helper-publisher functions for this type.
+        pubs = list(pubs) + _helper_caller_pubs.get(mtype, [])
         consumers = data.get("consumers", [])
         # Filter consumers to only those inside titan_plugin/ (the bus's canonical tree)
         valid_consumers = [c for c in consumers
@@ -1055,6 +1183,13 @@ def show_audit(graph: dict):
             if _is_deprecated_handler(valid_consumers):
                 deprecated_count += 1
                 continue  # Intentional deprecated handler — not a deaf ear
+            # Skip QUERY/RESPONSE rid-routed pairs — audit can't trace rid
+            # dispatch (response routed by request-id, not by msg_type).
+            # Heuristic: if msg name ends with _RESP / _RESPONSE / _REPLY or
+            # is a QUERY response, assume it's rid-routed.
+            if mtype.endswith(("_RESP", "_RESPONSE", "_REPLY")):
+                deprecated_count += 1  # Counted under "skipped" bucket
+                continue
             b_count += 1
             print(f"  ⚠ {mtype:<25} → {len(valid_consumers)} consumer(s) waiting, 0 senders")
             for c in valid_consumers[:2]:
@@ -1062,7 +1197,7 @@ def show_audit(graph: dict):
     if b_count == 0:
         print("  ✓ All consumers have matching senders")
     if deprecated_count > 0:
-        print(f"  ℹ {deprecated_count} deprecated handler(s) skipped (marked REMOVED/DEPRECATED in source)")
+        print(f"  ℹ {deprecated_count} deprecated handler(s) + rid-routed response pairs skipped (marked REMOVED/DEPRECATED or ending with _RESP/_REPLY)")
 
     # C: Targeted messages to non-existent subscribers (dead letters)
     print("\n══ C. DEAD LETTERS (targeted to non-existent subscriber) ══")
@@ -1286,6 +1421,13 @@ def _audit_scope_leaks():
                         for t in top_node.targets:
                             if isinstance(t, ast.Name):
                                 module_level_names.add(t.id)
+                    # 2026-04-19: Also catch annotated assignments (e.g.,
+                    # `_COORD_SNAPSHOT_CACHE: dict = {"data": None, "ts": 0.0}`)
+                    # — prior code missed `ast.AnnAssign` and falsely flagged
+                    # module-level annotated caches as scope leaks.
+                    elif isinstance(top_node, ast.AnnAssign):
+                        if isinstance(top_node.target, ast.Name):
+                            module_level_names.add(top_node.target.id)
                     elif isinstance(top_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         module_level_names.add(top_node.name)
                     elif isinstance(top_node, ast.ClassDef):
@@ -4331,7 +4473,8 @@ def run_errors(all_titans: bool = False):
     print("=" * 90)
 
 
-def run_cgn_signals_audit(all_titans: bool = False):
+def run_cgn_signals_audit(all_titans: bool = False,
+                          audit_pattern: bool = False):
     """META-CGN signal audit — validates producer wiring vs SIGNAL_TO_PRIMITIVE.
 
     Scans source for emit_meta_cgn_signal(...) calls, extracts
@@ -4347,6 +4490,13 @@ def run_cgn_signals_audit(all_titans: bool = False):
       - queue fill fractions
       - orphan counts observed at runtime
       - overall state (healthy / warning / critical)
+
+    --audit-pattern (2026-04-19, META-CGN-PRODUCER-PATTERN): for each
+    producer site, verify an EdgeDetector observe call appears within
+    ±30 lines. Invariant from TUNING-016: every META-CGN producer MUST
+    gate emission via EdgeDetector (no continuous emission on every
+    event — per bus_health.py discrete-transition invariant). Sites
+    without edge gating are flagged as PATTERN-VIOLATION.
     """
     import re
     from pathlib import Path
@@ -4363,6 +4513,16 @@ def run_cgn_signals_audit(all_titans: bool = False):
     )
     event_type_pattern = re.compile(
         r'event_type\s*=\s*["\']([^"\']+)["\']'
+    )
+
+    # Pattern-audit state: map of (file, line) → (edge_gated, gate_hint)
+    pattern_audit_results: dict = {}
+    # Regex for the EdgeDetector invariant — detects references to the
+    # class name, instance names, or the observe() call in the ±30-line
+    # preceding window.
+    edge_gate_re = re.compile(
+        r"EdgeDetector|edge_detector|edge_det\b|\.observe\s*\(|"
+        r"_ed_observe|_edge_result"
     )
 
     titan_plugin_root = Path("titan_plugin")
@@ -4386,6 +4546,18 @@ def run_cgn_signals_audit(all_titans: bool = False):
                     producer_sites.append((py_file, i, cm.group(1), em.group(1)))
                 else:
                     producer_sites.append((py_file, i, "???", "???"))
+                # ── EdgeDetector-gate heuristic ─────────────────────
+                # Scan ±30 lines around the emit to check the producer
+                # is preceded by an edge-detector observe/gate. A strict
+                # AST check would be more precise but this heuristic
+                # covers the common patterns: local variable referencing
+                # an EdgeDetector instance, method call, or import.
+                if audit_pattern:
+                    ctx_start = max(0, i - 30)
+                    ctx_end = min(len(src_lines), i + 5)
+                    ctx = "\n".join(src_lines[ctx_start:ctx_end])
+                    has_gate = bool(edge_gate_re.search(ctx))
+                    pattern_audit_results[(py_file, i)] = has_gate
 
     # ── 2. Load SIGNAL_TO_PRIMITIVE from meta_cgn.py ──
     mapping_keys = set()
@@ -4434,6 +4606,38 @@ def run_cgn_signals_audit(all_titans: bool = False):
 
     print()
     print(f"  ✓ {len(mapped_sites)} correctly-wired producer site(s)")
+
+    # ── 4b. EdgeDetector pattern audit (2026-04-19) ──
+    if audit_pattern:
+        print()
+        print("  ── EDGE-DETECTOR PATTERN AUDIT ──")
+        print("  (producers must gate emit via EdgeDetector per TUNING-016)")
+        violations = []
+        compliant = []
+        for site in mapped_sites:
+            f, ln, c, et = site
+            gated = pattern_audit_results.get((f, ln), None)
+            if gated is False:
+                violations.append(site)
+            elif gated is True:
+                compliant.append(site)
+        if violations:
+            print(f"  ✗ {len(violations)} PATTERN-VIOLATION site(s) — no "
+                  "EdgeDetector observe() / gate reference within ±30 lines:")
+            for f, ln, c, et in violations:
+                print(f"    {rel(f)}:{ln} — ({c}, {et}) ← add EdgeDetector "
+                      "observe() gate before emit_meta_cgn_signal")
+            print()
+            print("  Rationale: bus_health invariant requires discrete state "
+                  "transitions,")
+            print("  not continuous per-event emission. Unbounded producers "
+                  "blow the")
+            print("  0.5 Hz global rate budget. See TUNING-016 + rFP_meta_cgn_v3"
+                  " § 7.")
+        else:
+            print(f"  ✓ All {len(compliant)} mapped producer(s) show an "
+                  "EdgeDetector gate in context")
+        print()
 
     # ── 5. Live runtime stats if Titans reachable ──
     print()
@@ -6911,7 +7115,13 @@ def main():
         # orphans that would be silently dropped by the consumer (the Phase
         # 2 failure mode). Also reports live emission rates if Titans are
         # reachable. Run during session startup to catch drift early.
-        run_cgn_signals_audit("--all" in sys.argv)
+        # --audit-pattern (2026-04-19, META-CGN-PRODUCER-PATTERN): adds
+        # TUNING-016 invariant check — every producer must gate emit via
+        # EdgeDetector within ±30 lines of the call site.
+        run_cgn_signals_audit(
+            all_titans="--all" in sys.argv,
+            audit_pattern="--audit-pattern" in sys.argv,
+        )
 
     elif cmd == "producers":
         # 2026-04-15 rFP_meta_cgn_v3 Phase D observability: live + historical
@@ -7135,9 +7345,136 @@ def main():
                     pass
         run_stability_check(hours=hours)
 
+    elif cmd == "profile":
+        # 2026-04-17: live memory + CPU profiling for resource optimization.
+        # Queries /v4/admin/memory-profile on target Titan(s).
+        run_memory_profile(
+            all_titans="--all" in sys.argv,
+            diff="--diff" in sys.argv,
+            cpu="--cpu" in sys.argv,
+            json_out="--json" in sys.argv,
+        )
+
     else:
         print(__doc__)
         sys.exit(1)
+
+
+# ── Memory Profiling ─────────────────────────────────────────────────
+
+def run_memory_profile(all_titans: bool = False, diff: bool = False,
+                       cpu: bool = False, json_out: bool = False):
+    """Memory + CPU profiling for Titan(s).
+
+    Usage:
+      arch_map profile              # T1 summary
+      arch_map profile --all        # All 3 Titans
+      arch_map profile --diff       # Growth since boot
+      arch_map profile --cpu        # Include CPU% sampling (~1s extra)
+      arch_map profile --json       # JSON output
+    """
+    import requests
+    import json as _json
+
+    targets = [
+        ("T1", "http://127.0.0.1:7777"),
+    ]
+    if all_titans:
+        targets += [
+            ("T2", "http://10.135.0.6:7777"),
+            ("T3", "http://10.135.0.6:7778"),
+        ]
+
+    params = {"diff": str(diff).lower(), "cpu": str(cpu).lower()}
+
+    for tid, base_url in targets:
+        try:
+            r = requests.get(f"{base_url}/v4/admin/memory-profile",
+                             params=params, timeout=30)
+            if r.status_code != 200:
+                print(f"\n{tid}: HTTP {r.status_code}")
+                continue
+            resp = r.json()
+            data = resp.get("data", resp)
+        except Exception as e:
+            print(f"\n{tid}: ERROR — {e}")
+            continue
+
+        if json_out:
+            print(_json.dumps({tid: data}, indent=2, default=str))
+            continue
+
+        # ── Formatted table output ──
+        sys_info = data.get("system", {})
+        parent = data.get("parent", {})
+        modules = data.get("modules", {})
+        totals = data.get("totals", {})
+
+        print()
+        print(f"TITAN MEMORY PROFILE — {tid} ({base_url})")
+        print("=" * 78)
+        print(f"  System: {sys_info.get('used_pct', '?')}% used"
+              f" | {sys_info.get('available_mb', '?')} MB available"
+              f" | Swap: {sys_info.get('swap_total_mb', 0) - sys_info.get('swap_free_mb', 0):.0f} MB used")
+        print(f"  Parent: PID {parent.get('pid', '?')}"
+              f" | RSS {parent.get('rss_mb', '?')} MB"
+              f" | Peak {parent.get('vm_peak_mb', '?')} MB"
+              f" | Threads {parent.get('threads', '?')}")
+        if cpu and "cpu_pct" in parent:
+            print(f"  Parent CPU: {parent['cpu_pct']}%")
+        print()
+
+        # Module table
+        header = f"  {'MODULE':<14} {'PID':>7} {'STATE':<10} {'RSS_MB':>8} {'PEAK_MB':>8} {'THREADS':>7}"
+        if cpu:
+            header += f" {'CPU%':>6}"
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+
+        for name in sorted(modules.keys()):
+            m = modules[name]
+            pid = m.get("pid", "-")
+            state = m.get("state", "?")[:9]
+            rss = m.get("rss_mb", "-")
+            peak = m.get("vm_peak_mb", "-")
+            threads = m.get("threads", "-")
+            line = f"  {name:<14} {str(pid):>7} {state:<10} {_pfmt(rss):>8} {_pfmt(peak):>8} {str(threads):>7}"
+            if cpu:
+                cp = m.get("cpu_pct", "-")
+                line += f" {_pfmt(cp):>6}"
+            print(line)
+
+        print("  " + "-" * (len(header) - 2))
+        print(f"  {'TOTAL':<14} {'':>7} {'':>10} {_pfmt(totals.get('total_rss_mb', '?')):>8}"
+              f" {'':>8} {'':>7}")
+
+        # tracemalloc top allocations
+        tm = parent.get("tracemalloc", {})
+        if tm.get("active") and tm.get("top"):
+            print()
+            label = "TOP ALLOCATIONS (growth since boot)" if diff else "TOP ALLOCATIONS (cumulative)"
+            print(f"  {label}:")
+            size_key = "size_diff_mb" if diff else "size_mb"
+            for item in tm["top"][:15]:
+                sz = item.get(size_key, item.get("size_mb", 0))
+                sign = "+" if diff and sz > 0 else ""
+                fname = item.get("file", "?")
+                # Shorten paths for readability
+                if "titan_plugin/" in fname:
+                    fname = fname[fname.index("titan_plugin/"):]
+                elif "site-packages/" in fname:
+                    fname = "..." + fname[fname.index("site-packages/") + 13:]
+                count = item.get("count", 0)
+                print(f"    {sign}{sz:>8.1f} MB  {fname:<55} ({count:,} allocs)")
+
+        print()
+
+
+def _pfmt(v) -> str:
+    """Format a numeric value or pass-through '-'."""
+    if isinstance(v, (int, float)):
+        return f"{v:.1f}"
+    return str(v)
 
 
 # ── Social Divergence ─────────────────────────────────────────────────
@@ -7746,6 +8083,30 @@ def run_session_close(title: str = "", commit: bool = True):
     print(f"  JSONL:      {jsonl_path}")
     print(f"  Session ID: {session_id}")
 
+    # ── 1a. Kick off dead-wiring full scan in background ─────────────────
+    # Runs in parallel with JSONL parsing (~2min scan vs ~30s parse).
+    # Non-blocking: we fire-and-wait at the reporting step. Result feeds
+    # into the session doc as a pre-close validation — surfaces any new
+    # orphan methods, bus gaps, or config sections the session introduced
+    # so we know of imminent problems BEFORE every close.
+    _dead_wiring_proc = None
+    _dead_wiring_out_path = f"/tmp/dead_wiring_session_{short_id}.json"
+    try:
+        print(f"  [1a] Launching arch_map dead-wiring scan (background)...")
+        _dead_wiring_proc = subprocess.Popen(
+            [
+                os.path.join("test_env", "bin", "python"),
+                "scripts/arch_map_dead_wiring.py",
+                "--all", "--json",
+            ],
+            stdout=open(_dead_wiring_out_path, "w"),
+            stderr=subprocess.DEVNULL,
+            cwd=os.getcwd(),
+        )
+    except Exception as _dw_err:
+        print(f"  [1a] dead-wiring launch failed (non-fatal): {_dw_err}")
+        _dead_wiring_proc = None
+
     # ── 2. Parse JSONL into conversation transcript ──
     human_msgs = []
     assistant_msgs = []
@@ -8005,6 +8366,67 @@ def run_session_close(title: str = "", commit: bool = True):
     except Exception:
         git_log = "(could not read git log)"
 
+    # ── Collect dead-wiring scan result (launched at step 1a) ──
+    # Waits for completion (scan takes ~2min; JSONL parsing usually runs
+    # longer so this typically returns instantly). Non-fatal if scan
+    # errored: session still closes, but the doc notes the skip.
+    dead_wiring_summary: dict = {}
+    dead_wiring_report_md = "*Dead-wiring scan unavailable — see stderr*"
+    if _dead_wiring_proc is not None:
+        try:
+            print(f"  [dead-wiring] Waiting for scan to complete...")
+            _dead_wiring_proc.wait(timeout=300)
+            with open(_dead_wiring_out_path, "r") as _f:
+                _dw_result = json.load(_f)
+            dead_wiring_summary = _dw_result.get("summary", {})
+            runtime_ev = _dw_result.get("runtime_evidence") or {}
+            # Build a compact markdown summary
+            lines = [
+                f"- **Files scanned:** {_dw_result.get('n_files', '?')}",
+                f"- **Method defs:** {_dw_result.get('n_defs', '?')}",
+                f"- **Call sites:** {_dw_result.get('n_calls', '?')}",
+                f"- **Runtime evidence:** "
+                f"{'available' if runtime_ev.get('available') else 'API unreachable'}",
+                "",
+                "| Category | Count |",
+                "|---|---:|",
+            ]
+            titles_map = {
+                "orphan": "Orphan methods",
+                "pair_gap": "Pair-closure gaps",
+                "unused_config": "Unused config sections",
+                "rfp_missing": "rFP entities missing",
+                "bus_dead_msg": "Bus dead messages",
+                "bus_dead_handler": "Bus dead handlers",
+                "bus_unused_type": "Bus unused types",
+                "crud_write_only": "DB write-only tables",
+                "crud_read_only": "DB read-only tables",
+                "static_runtime_divergence": "⚡ Static-runtime divergence",
+            }
+            for k, pretty in titles_map.items():
+                cnt = dead_wiring_summary.get(k, 0)
+                if cnt > 0 or k in ("orphan", "unused_config"):
+                    lines.append(f"| {pretty} | {cnt} |")
+            # Highlight any divergence findings (these are interesting)
+            divergences = [
+                f for f in _dw_result.get("findings", [])
+                if f.get("kind") == "static_runtime_divergence"
+            ]
+            if divergences:
+                lines.append("")
+                lines.append("### ⚡ Static-runtime divergences (new this session)")
+                for d in divergences[:5]:
+                    lines.append(f"- **{d.get('title', '')}** — {d.get('detail', '')[:120]}")
+            dead_wiring_report_md = "\n".join(lines)
+            print(f"  [dead-wiring] DONE — "
+                  f"orphans={dead_wiring_summary.get('orphan', 0)}, "
+                  f"config={dead_wiring_summary.get('unused_config', 0)}, "
+                  f"bus_dead_msg={dead_wiring_summary.get('bus_dead_msg', 0)}, "
+                  f"divergence={dead_wiring_summary.get('static_runtime_divergence', 0)}")
+        except Exception as _dw_err:
+            print(f"  [dead-wiring] collection failed: {_dw_err}")
+            dead_wiring_report_md = f"*Dead-wiring scan failed: {_dw_err}*"
+
     # Harvest architectural decision candidates from highlight_pairs
     # (first line of marker-bearing messages — short enough to be summary-ish)
     decision_candidates = []
@@ -8022,6 +8444,17 @@ def run_session_close(title: str = "", commit: bool = True):
         f.write(f"> **Significance:** TODO: one-line summary\n\n")
         f.write("---\n\n")
         f.write("## Summary\n\nTODO: 2-3 sentence summary of session.\n\n---\n\n")
+
+        # Dead-wiring pre-close validation scan — runs on every session-close
+        # as a signal for "did this session introduce any new silent-wiring
+        # issues?". A clean summary means work landed cleanly; non-zero in
+        # the DIVERGENCE category is the highest-priority signal (static
+        # scanner missed a dynamic dispatch → should refine next time).
+        f.write("## 🔍 Dead-wiring validation scan\n\n")
+        f.write("*Auto-generated by `arch_map_dead_wiring.py --all` at session-close. "
+                "Flags new silent-wiring issues before the session commits.*\n\n")
+        f.write(dead_wiring_report_md)
+        f.write("\n\n---\n\n")
 
         # Architectural Decisions (Part 1 of session-close enhancement)
         f.write("## Architectural Decisions\n\n")

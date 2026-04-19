@@ -812,8 +812,8 @@ def create_pre_hook(plugin):
                 import sqlite3 as _sl
                 import asyncio as _ol_asyncio
                 def _read_own_lang():
-                    db = _sl.connect("./data/inner_memory.db", timeout=3.0)
-                    db.execute("PRAGMA journal_mode=WAL")
+                    from titan_plugin.utils.db import safe_connect as _sc
+                    db = _sc("data/inner_memory.db")
                     try:
                         comp = db.execute(
                             "SELECT sentence, level, confidence FROM composition_history "
@@ -1009,8 +1009,8 @@ def create_pre_hook(plugin):
 
                     # Source 2: Knowledge acquisitions — recent concepts learned
                     try:
-                        db = _sql_en.connect("./data/inner_memory.db", timeout=2.0)
-                        db.execute("PRAGMA journal_mode=WAL")
+                        from titan_plugin.utils.db import safe_connect as _sc2
+                        db = _sc2("data/inner_memory.db")
                         db.row_factory = _sql_en.Row
                         try:
                             kn_rows = db.execute(
@@ -1029,8 +1029,8 @@ def create_pre_hook(plugin):
 
                     # Source 3: Reasoning chain outcomes — recent high-scoring chains
                     try:
-                        db = _sql_en.connect("./data/inner_memory.db", timeout=2.0)
-                        db.execute("PRAGMA journal_mode=WAL")
+                        from titan_plugin.utils.db import safe_connect as _sc3
+                        db = _sc3("data/inner_memory.db")
                         try:
                             ca_rows = db.execute(
                                 "SELECT domain, outcome_score, chain_length FROM chain_archive "
@@ -1089,8 +1089,8 @@ def create_pre_hook(plugin):
                     _kg_topic = " ".join(_kg_words[:3])
 
                     def _scan_knowledge_gap():
-                        db = _kg_sql.connect("./data/inner_memory.db", timeout=2.0)
-                        db.execute("PRAGMA journal_mode=WAL")
+                        from titan_plugin.utils.db import safe_connect as _sc4
+                        db = _sc4("data/inner_memory.db")
                         db.row_factory = _kg_sql.Row
                         try:
                             best = 0.0
@@ -1679,7 +1679,17 @@ def create_post_hook(plugin):
                     "reflexes_succeeded": float(reflexes_succeeded),
                 }
 
-                vm = TitanVM(state_register=state_register, bus=bus)
+                # Plumb [titan_vm] toml — 2026-04-16. Previously TitanVM()
+                # was built with no config, so max_stack_depth / max_instructions
+                # from titan_params.toml were ignored (module-level constants won).
+                vm_cfg = {}
+                try:
+                    full_cfg = getattr(plugin, "_full_config", None)
+                    if isinstance(full_cfg, dict):
+                        vm_cfg = full_cfg.get("titan_vm", {}) or {}
+                except Exception:
+                    vm_cfg = {}
+                vm = TitanVM(state_register=state_register, bus=bus, config=vm_cfg)
 
                 # Run main scoring program
                 score_result = vm.execute(get_program("reflex_score"), context=vm_context)

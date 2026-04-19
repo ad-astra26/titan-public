@@ -367,6 +367,10 @@ def verify_contract_signature(contract: Contract,
     return True, "valid"
 
 
+# PERSISTENCE_BY_DESIGN: ContractStore._bundle_verified + _last_reload are
+# in-memory throttle/verification state recomputed on each contract bundle
+# load. Contract data persists via the chain itself, not via ContractStore
+# state files.
 class ContractStore:
     """Manages contract lifecycle: deploy, load, hot-reload from meta fork.
 
@@ -2100,6 +2104,10 @@ class GenesisChain:
 # TimeChainOrchestrator — Top-level coordinator
 # ═══════════════════════════════════════════════════════════════════════
 
+# PERSISTENCE_BY_DESIGN: TimeChainOrchestrator._mempool and _contract_store
+# are object references to sub-components (Mempool, ContractStore) that are
+# instantiated fresh in __init__ and own their own persistence. The
+# references themselves are not state to persist.
 class TimeChainOrchestrator:
     """TimeChain v2 orchestrator — mempool + batched sealing + genesis chain.
 
@@ -2486,6 +2494,9 @@ class TimeChainOrchestrator:
                         tx_id[:24] if tx_id else "none", epoch_id,
                         self._tc.total_blocks)
                     if self._send_queue:
+                        # INTENTIONAL_BROADCAST: observability-only Arweave-
+                        # backup confirmation. Frontend dashboard + audit
+                        # consumer the stream; no in-process handler needed.
                         self._send_queue.put({
                             "type": "TIMECHAIN_BACKUP_COMPLETE",
                             "src": self._worker_name, "dst": "all",
@@ -2504,6 +2515,14 @@ class TimeChainOrchestrator:
         t.start()
         logger.info("[Orchestrator] Arweave backup started (background, epoch=%d)", epoch_id)
 
+    # UNUSED_PUBLIC_API: reserved for TIMECHAIN-ANCHOR-WIRING — shipped
+    # half-built in commit a45f18d (2026-04-11 Phase 4 Step 3) but never
+    # activated: zero callers + zero handlers. Current on-chain write path
+    # is the agency-initiated MemoInscribeHelper (autonomous memo decisions).
+    # Full activation awaits rFP_physical_time_anchoring.md ratification
+    # (currently DRAFT) — write side AND read side (block-ts → oBody
+    # physical-time ingestion) need matched design before wiring. See
+    # DEFERRED: TIMECHAIN-ANCHOR-WIRING for the full deferral record.
     def _anchor_to_solana(self, epoch_id: int):
         """Emit TIMECHAIN_ANCHOR event for spirit_loop to inscribe on-chain.
 

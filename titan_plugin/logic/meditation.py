@@ -741,8 +741,8 @@ class MeditationEpoch:
 
             # TimeChain blocks / 100000
             try:
-                import sqlite3
-                db = sqlite3.connect("data/timechain/index.db")
+                from titan_plugin.utils.db import safe_connect
+                db = safe_connect("data/timechain/index.db")
                 row = db.execute("SELECT COUNT(*) FROM block_index").fetchone()
                 db.close()
                 blocks = row[0] if row else 0

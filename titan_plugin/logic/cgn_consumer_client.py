@@ -51,6 +51,10 @@ class LocalGroundingResult:
 
 
 # ── Numpy-only inference nets (torch-free) ───────────────────────────────
+# SHM_SOURCED: NumpyValueNet + NumpyActionNet weights are loaded from
+# /dev/shm/cgn_live_weights.bin (written by the CGN worker process).
+# The client is a pure reader — it never persists weights to on-disk state,
+# so dead-wiring's persistence-asymmetry check is suppressed for these classes.
 
 class NumpyValueNet:
     """Pure numpy V(s) — mirrors SharedValueNet (30→48→LN→24→1)."""
@@ -84,6 +88,7 @@ class NumpyValueNet:
         return h.squeeze(-1)
 
 
+# SHM_SOURCED: weights loaded from /dev/shm (see NumpyValueNet header).
 class NumpyActionNet:
     """Pure numpy Q(s,a) — mirrors ConsumerActionNet (30→24→12→[action,param])."""
 
@@ -134,6 +139,7 @@ def _np_multinomial(probs: np.ndarray) -> int:
 
 # ── Main client ──────────────────────────────────────────────────────────
 
+# SHM_SOURCED: all weights + config loaded from /dev/shm via ShmWeightReader.
 class CGNConsumerClient:
     """Local inference client for a single CGN consumer.
 

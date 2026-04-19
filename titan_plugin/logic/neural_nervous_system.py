@@ -37,6 +37,10 @@ DEFAULT_SAVE_EVERY_N = 50
 DEFAULT_BUFFER_MAX = 2000
 
 
+# PERSISTENCE_BY_DESIGN: NeuralNervousSystem._save_in_progress (async write
+# guard flag) + _hormonal_enabled (runtime feature flag) + _steps_at_last_save
+# (observability counter) are transient — reset on boot is correct. Actual
+# nervous system state persists via neural_nervous_system/*.json pickle files.
 class NeuralNervousSystem:
     """
     V5 Neural Nervous System — learned reflexes that adapt from experience.
@@ -73,6 +77,14 @@ class NeuralNervousSystem:
         self._batch_size = config.get("batch_size", DEFAULT_BATCH_SIZE)
         self._save_every_n = config.get("save_every_n", DEFAULT_SAVE_EVERY_N)
         self._keep_vm_parallel = config.get("keep_vm_parallel", True)
+        # Reward-modulated residual targets (2026-04-19 autonomous-collapse
+        # fix). Replaces discrete-case classifier that reinforced "output 0"
+        # when 98%+ of transitions had reward=0. See _compute_targets for
+        # formula. Fire/no-fire gains control per-step target shift magnitude.
+        self._nn_target_fire_gain = float(
+            config.get("nn_target_fire_gain", 0.3))
+        self._nn_target_nofire_gain = float(
+            config.get("nn_target_nofire_gain", 0.1))
 
         # Programs + buffers
         self.programs: dict[str, NeuralReflexNet] = {}
@@ -157,6 +169,13 @@ class NeuralNervousSystem:
 
         # Load persisted state
         self._load_all()
+
+        # 2026-04-19: Rescue programs trapped at sigmoid(-10) saturation.
+        # Sigmoid's vanishing gradient makes escape via gradient descent
+        # astronomically slow once pre-sigmoid bias converges strongly
+        # negative. This one-time load-time action resets the output layer
+        # (preserving learned hidden features) on programs showing saturation.
+        self._liberate_saturated_output_layers()
 
         logger.info(
             "[NeuralNS] Initialized: %d programs, warmup=%d, data_dir=%s",
@@ -384,6 +403,53 @@ class NeuralNervousSystem:
                         "delta": 0.0,
                         "learned": False,
                     })
+
+        # ── Hormone snapshot (rate-limited) ──
+        # INNER-MEMORY-API-ORPHANS fix (2026-04-19): before today,
+        # inner_memory.record_hormone_snapshot had 0 callers in the
+        # codebase → hormone_snapshots table had 0 rows over 1+ month
+        # of runtime. EMOT-CGN v2 rFP (locked 2026-04-19) requires this
+        # history as its HORMONE_FIRE producer. Snapshot every 100
+        # epoch-ticks (rate-limited to avoid SQLite write pressure —
+        # per-fire records are already captured by record_program_fire).
+        if self._hormonal_enabled and self._inner_memory is not None:
+            try:
+                self._hormone_snapshot_tick = getattr(
+                    self, "_hormone_snapshot_tick", 0) + 1
+                if self._hormone_snapshot_tick % 100 == 0:
+                    _hs_levels = {
+                        n: round(float(h.level), 4)
+                        for n, h in self._hormonal._hormones.items()
+                    }
+                    _hs_thresh = {
+                        n: round(float(h.threshold), 4)
+                        for n, h in self._hormonal._hormones.items()
+                    }
+                    _hs_refr = {
+                        n: round(float(getattr(h, "refractory_until", 0.0)), 4)
+                        for n, h in self._hormonal._hormones.items()
+                    }
+                    _hs_fired = [
+                        s.get("system") for s in signals
+                        if s.get("system") and s.get("learned")
+                    ]
+                    _hs_epoch = int(
+                        self._maturity_signals.get("consciousness_epochs", 0)
+                        or self._total_transitions)
+                    self._inner_memory.record_hormone_snapshot(
+                        epoch_id=_hs_epoch,
+                        levels=_hs_levels,
+                        thresholds=_hs_thresh,
+                        refractory=_hs_refr,
+                        fired=_hs_fired,
+                        stimuli=env_stimuli,
+                    )
+            except Exception as _hs_err:
+                # Debug level — snapshot failures are non-critical; the
+                # per-fire record_program_fire path already captures
+                # the main signal for EMOT-CGN.
+                logger.debug(
+                    "[NeuralNS] Hormone snapshot failed: %s", _hs_err)
 
         return signals
 
@@ -851,35 +917,59 @@ class NeuralNervousSystem:
         fired: np.ndarray, urgencies: np.ndarray,
         supervision_weight: float,
     ) -> np.ndarray:
-        """
-        Compute training targets as blend of supervision + outcome.
+        """Compute training targets as blend of supervision + outcome.
 
-        Supervision target: VM baseline urgency (imitate TitanVM)
-        Outcome target: reward-modulated urgency
-          - high reward + fired → encourage (target high)
-          - high reward + not fired → missed opportunity (target moderate)
-          - low reward + fired → discourage (target low)
-          - low reward + not fired → correct restraint (target 0)
+        Supervision target: VM baseline urgency (imitate TitanVM during
+        warmup phase, supervision_weight 1.0 → 0.0 linear decay).
+
+        Outcome target (2026-04-19 refactor — reward-modulated residual
+        learning): Default (r ≈ 0) keeps target = current urgency so no
+        collapse pressure builds from the 98%+ reward-zero transitions.
+        Positive rewards bump target up (encourage); negative rewards bump
+        target down (discourage). Fired transitions carry stronger gain
+        because the NN's decision caused the outcome; not-fired transitions
+        are passive observations with lower gain. tanh bounds per-step shift
+        so extreme rewards can't spike targets beyond ±gain.
+
+        Fixes three bugs in the prior discrete-case formula:
+          (1) negative rewards silently mapped to target=0, no discouragement
+          (2) r ∈ (0.3, 0.5] fell through to target=0 regardless of fire
+          (3) r=0 + not_fired (98% of transitions) always target=0, which
+              drove the NN to sigmoid(-10) = 4.5e-05 saturation.
         """
-        # Supervision component
+        # Supervision component (VM imitation during warmup)
         sup_targets = vm_baselines
 
-        # Outcome component
-        outcome_targets = np.zeros_like(rewards)
-        for i in range(len(rewards)):
-            r = rewards[i]
-            f = fired[i]
-            if r > 0.5 and f:
-                outcome_targets[i] = min(1.0, r)           # Good fire
-            elif r > 0.5 and not f:
-                outcome_targets[i] = 0.5                    # Missed opportunity
-            elif r <= 0.3 and f:
-                outcome_targets[i] = 0.1                    # Bad fire
-            else:
-                outcome_targets[i] = 0.0                    # Correct restraint
+        # Outcome component — reward-modulated residual from current urgency
+        gain = np.where(
+            fired, self._nn_target_fire_gain, self._nn_target_nofire_gain)
+        delta = np.tanh(rewards) * gain
+        outcome_targets = np.clip(urgencies + delta, 0.0, 1.0)
 
-        # Blend
-        targets = supervision_weight * sup_targets + (1.0 - supervision_weight) * outcome_targets
+        # Extension #8 edge-case fix: dead-zone anti-fixed-point push.
+        # When rewards ≈ 0 AND not fired (98%+ of transitions for rare-fire
+        # programs like METABOLISM), residual delta = 0 → target = urgency.
+        # Any urgency value is a fixed point, including near-zero sigmoid-
+        # saturation. Observed 2026-04-19 evening on T2 METABOLISM after
+        # deep liberation: fresh Xavier init landed in σ < 0.001 region,
+        # NN learned to keep producing < 0.001, re-saturated within ~700
+        # training steps. Push targets in dead zones (< 0.05 or > 0.95)
+        # gently toward 0.5 only on passive transitions. Healthy programs
+        # (target ∈ [0.05, 0.95]) are UNAFFECTED. Active transitions
+        # (fired OR |reward| > 0) are UNAFFECTED. Pulls dead-zone programs
+        # back into the trainable region within ~100-200 batches.
+        in_dead_zone = (outcome_targets < 0.05) | (outcome_targets > 0.95)
+        passive = (~fired) & (np.abs(rewards) < 1e-6)
+        dormant_push = np.where(
+            in_dead_zone & passive,
+            0.01 * (0.5 - outcome_targets),
+            0.0,
+        )
+        outcome_targets = np.clip(outcome_targets + dormant_push, 0.0, 1.0)
+
+        # Blend supervision + outcome by phase weight
+        targets = (supervision_weight * sup_targets +
+                   (1.0 - supervision_weight) * outcome_targets)
         return np.clip(targets, 0.0, 1.0)
 
     def _get_supervision_weight(self) -> float:
@@ -1295,6 +1385,97 @@ class NeuralNervousSystem:
                 # First boot with hormonal system — persist initial state
                 self._hormonal.save(h_path)
                 logger.info("[NeuralNS] Created initial hormonal_state.json")
+
+    # ── Sigmoid-trap liberation (2026-04-19) ──────────────────────
+
+    def _liberate_saturated_output_layers(self) -> None:
+        """Rescue programs whose NN output is trapped at sigmoid saturation.
+
+        Two tiers (both run per-program, deep takes precedence):
+
+        SHALLOW (original, 2026-04-19): saved bias b3 < −5.0 → reinit w3+b3
+            only. Preserves w1/b1/w2/b2. Handles output-bias saturation.
+
+        DEEP / Extension #8 (2026-04-19 evening): buffer urgency trace
+            shows pct_nonzero_urgency < 5% over ≥500 samples → the trap
+            lives in hidden weights w2 producing z3 ≈ −10 regardless of
+            b3. Reinit w2+b2+w3+b3 AND clear the replay buffer (stale
+            urgency targets would re-saturate fresh NN via residual
+            learning). Preserves w1+b1 so first-layer feature detectors
+            survive. Runtime signal (pct_nz_u) is ground truth; saved b3
+            is one proxy among many.
+
+        Idempotent: healthy NNs (b3 near 0, pct_nz_u ≥ 5%) pass through
+        unchanged. Works with _compute_targets residual learning.
+        """
+        import math
+        SATURATION_B3_THRESHOLD = -5.0
+        RUNTIME_DEAD_PCT_NZ_U = 5.0
+        RUNTIME_DEAD_MIN_SAMPLES = 500
+        URGENCY_EPS = 0.001
+
+        shallow = []
+        deep = []
+
+        for name, net in self.programs.items():
+            try:
+                buf = self.buffers.get(name)
+                pct_nz_u = None
+                n_samples = 0
+                if buf is not None and hasattr(buf, '_urgencies'):
+                    urgencies = list(buf._urgencies[-buf.max_size:])
+                    n_samples = len(urgencies)
+                    if n_samples >= RUNTIME_DEAD_MIN_SAMPLES:
+                        pct_nz_u = 100.0 * sum(
+                            1 for v in urgencies if abs(v) > URGENCY_EPS
+                        ) / n_samples
+
+                b3_val = float(net.b3[0])
+                runtime_dead = (
+                    pct_nz_u is not None and pct_nz_u < RUNTIME_DEAD_PCT_NZ_U
+                )
+                b3_saturated = (b3_val < SATURATION_B3_THRESHOLD)
+
+                if runtime_dead:
+                    net.w2 = (np.random.randn(net.hidden_1, net.hidden_2).astype(np.float64)
+                              * math.sqrt(2.0 / net.hidden_1))
+                    net.b2 = np.zeros(net.hidden_2, dtype=np.float64)
+                    net.w3 = (np.random.randn(net.hidden_2, 1).astype(np.float64)
+                              * math.sqrt(2.0 / net.hidden_2))
+                    net.b3 = np.zeros(1, dtype=np.float64)
+                    if buf is not None:
+                        buf._observations.clear()
+                        buf._urgencies.clear()
+                        buf._vm_baselines.clear()
+                        buf._rewards.clear()
+                        buf._fired.clear()
+                        if hasattr(buf, '_last_fired_idx'):
+                            buf._last_fired_idx = -1
+                    deep.append(
+                        f"{name}(pct_nz_u={pct_nz_u:.1f}%, n={n_samples}, "
+                        f"b3={b3_val:.2f})"
+                    )
+                elif b3_saturated:
+                    net.w3 = (np.random.randn(net.hidden_2, 1).astype(np.float64)
+                              * math.sqrt(2.0 / net.hidden_2))
+                    net.b3 = np.zeros(1, dtype=np.float64)
+                    shallow.append(f"{name}(b3 was {b3_val:.2f})")
+            except Exception as e:
+                logger.debug(
+                    "[NeuralNS] %s liberation check error: %s", name, e)
+
+        if shallow:
+            logger.warning(
+                "[NeuralNS] SHALLOW liberation: %d programs — "
+                "output layer w3+b3 reinit (b3 < %.1f). w1/b1/w2/b2 preserved: %s",
+                len(shallow), SATURATION_B3_THRESHOLD, ", ".join(shallow))
+        if deep:
+            logger.warning(
+                "[NeuralNS] DEEP liberation (Extension #8): %d programs — "
+                "w2+b2+w3+b3 reinit + replay buffer cleared "
+                "(runtime pct_nz_u < %.1f%% over ≥%d samples). w1/b1 preserved: %s",
+                len(deep), RUNTIME_DEAD_PCT_NZ_U,
+                RUNTIME_DEAD_MIN_SAMPLES, ", ".join(deep))
 
     # ── Outer Program Dispatch ─────────────────────────────────────
 

@@ -22,13 +22,27 @@ import math
 from typing import Sequence
 
 
-# Divine Center — perfect equilibrium
-CENTER = 0.5
-
-# Per-layer weights (Body, Mind, Spirit)
-# Body and Mind weighted equally; Spirit slightly higher because it
-# aggregates the other two and adds consciousness metrics.
-DEFAULT_WEIGHTS = (1.0, 1.0, 1.2)
+# Divine Center — perfect equilibrium.
+# Per-layer weights (Body, Mind, Spirit): Body and Mind weighted equally;
+# Spirit slightly higher because it aggregates the other two and adds
+# consciousness metrics.
+#
+# Both are configurable via [middle_path] in titan_params.toml. Values are
+# loaded once at import time; hot-reload requires module re-import (rare —
+# these are Divine-Center constants, not tuning dials).
+try:
+    from ..params import get_params
+    _MP_PARAMS = get_params("middle_path")
+    CENTER = float(_MP_PARAMS.get("center", 0.5))
+    DEFAULT_WEIGHTS = (
+        float(_MP_PARAMS.get("weight_body", 1.0)),
+        float(_MP_PARAMS.get("weight_mind", 1.0)),
+        float(_MP_PARAMS.get("weight_spirit", 1.2)),
+    )
+except Exception:
+    # Fallback if params module unavailable (e.g. standalone test import).
+    CENTER = 0.5
+    DEFAULT_WEIGHTS = (1.0, 1.0, 1.2)
 
 # Max possible variance for values in [0, 1]: half at 0, half at 1 → 0.25
 _MAX_VARIANCE = 0.25

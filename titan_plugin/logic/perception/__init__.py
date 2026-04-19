@@ -160,6 +160,9 @@ def validate_modality(modality: SensoryModality,
 
 # ── SensoryHub ───────────────────────────────────────────────────────
 
+# PERSISTENCE_BY_DESIGN: SensoryHub._registry / _msg_type_map are the
+# sensory-modality dispatch table built up via explicit register() calls
+# at boot. Not state to persist — re-registered every run.
 class SensoryHub:
     """
     Extensible multi-modal perception router.

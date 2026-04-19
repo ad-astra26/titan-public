@@ -31,6 +31,8 @@ class Command:
     maker_only: bool = False
 
 
+# PERSISTENCE_BY_DESIGN: CommandRegistry._maker_ids is loaded from config
+# (maker Solana-address allowlist) at init — config data, not self-state.
 class CommandRegistry:
     """
     Unified command handler for all Titan communication channels.

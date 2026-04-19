@@ -11,12 +11,20 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _clear_loader_cache():
-    """Ensure cache is clean between tests."""
+def _clear_loader_cache(tmp_path_factory):
+    """Ensure cache is clean between tests + isolate titan_params layer.
+
+    The real titan_params.toml would be loaded as Layer 1 and pollute test
+    expectations. Patching TITAN_PARAMS_PATH to a non-existent path makes
+    Layer 1 empty by default for all tests — individual tests can override
+    with their own mock.patch.object if they need titan_params behavior.
+    """
     from titan_plugin import config_loader
 
     config_loader.clear_cache()
-    yield
+    fake_params = tmp_path_factory.mktemp("_no_params") / "titan_params.toml"
+    with mock.patch.object(config_loader, "TITAN_PARAMS_PATH", fake_params):
+        yield
     config_loader.clear_cache()
 
 
@@ -218,6 +226,77 @@ auth_session = "placeholder_old_sess"
         assert cfg["inference"]["openrouter_api_key"] == "or_placeholder_preserved"
         assert cfg["twitter_social"]["password"] == "placeholder_preserved_pw"
         assert cfg["twitter_social"]["auth_session"] == "new_sess_v2"
+
+
+def test_titan_params_layer1_merged_below_config(tmp_path):
+    """Layer 1 (titan_params.toml) provides engineering defaults; Layer 2
+    (config.toml) overrides them; Layer 3 (secrets) overrides those."""
+    params = tmp_path / "titan_params.toml"
+    base = tmp_path / "config.toml"
+    secrets = tmp_path / "secrets.toml"
+    _write_toml(
+        params,
+        """\
+[filter_down_v5]
+publish_enabled = true
+cold_start_floor_epochs = 2000
+spirit_filter_strength_multiplier = 0.3
+
+[titan_self]
+weight_felt = 1.0
+weight_journey = 0.5
+weight_topology = 0.3
+
+[inference]
+provider = "venice"
+timeout = 30
+""",
+    )
+    _write_toml(
+        base,
+        """\
+[inference]
+provider = "venice"
+venice_api_key = ""
+timeout = 60
+""",
+    )
+    _write_toml(secrets, '[inference]\nvenice_api_key = "vk_placeholder_l3"\n')
+
+    from titan_plugin import config_loader
+
+    with mock.patch.object(config_loader, "TITAN_PARAMS_PATH", params), \
+         mock.patch.object(config_loader, "BASE_CONFIG_PATH", base), \
+         mock.patch.object(config_loader, "SECRETS_PATH", secrets):
+        cfg = config_loader.load_titan_config(force_reload=True)
+
+    # Layer 1 only (not in config or secrets) flows through
+    assert cfg["filter_down_v5"]["publish_enabled"] is True
+    assert cfg["filter_down_v5"]["cold_start_floor_epochs"] == 2000
+    assert cfg["titan_self"]["weight_felt"] == 1.0
+    # Layer 2 overrides Layer 1 (timeout 30 → 60)
+    assert cfg["inference"]["timeout"] == 60
+    # Layer 3 overrides Layer 2 (api_key empty → placeholder)
+    assert cfg["inference"]["venice_api_key"] == "vk_placeholder_l3"
+    # Layer 1+2 agreement preserved
+    assert cfg["inference"]["provider"] == "venice"
+
+
+def test_titan_params_missing_is_non_fatal(tmp_path):
+    """If titan_params.toml doesn't exist, Layer 1 is empty; config works."""
+    missing_params = tmp_path / "no_params.toml"
+    base = tmp_path / "config.toml"
+    secrets = tmp_path / "no_secrets.toml"
+    _write_toml(base, '[api]\nport = 7777\n')
+
+    from titan_plugin import config_loader
+
+    with mock.patch.object(config_loader, "TITAN_PARAMS_PATH", missing_params), \
+         mock.patch.object(config_loader, "BASE_CONFIG_PATH", base), \
+         mock.patch.object(config_loader, "SECRETS_PATH", secrets):
+        cfg = config_loader.load_titan_config(force_reload=True)
+
+    assert cfg["api"]["port"] == 7777
 
 
 def test_overlay_preserves_other_sections(tmp_path):

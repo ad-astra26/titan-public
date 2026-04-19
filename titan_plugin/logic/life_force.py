@@ -500,6 +500,12 @@ class LifeForceEngine:
             "_total_evaluations": self._total_evaluations,
             "_state": self._state,
             "_metabolic_drain": self._metabolic_drain,
+            # 2026-04-17 persistence gap fix — 5 fields previously missing
+            "_is_dreaming": self._is_dreaming,
+            "_drain_passive_decay": self._drain_passive_decay,
+            "_total_neuromod_cost": self._total_neuromod_cost,
+            "_total_somatic_cost": self._total_somatic_cost,
+            "_max_history": self._max_history,
         }
 
     def restore_state(self, state: dict) -> None:
@@ -512,8 +518,19 @@ class LifeForceEngine:
         self._total_evaluations = state.get("_total_evaluations", self._total_evaluations)
         self._state = state.get("_state", self._state)
         self._metabolic_drain = state.get("_metabolic_drain", 0.0)
-        logger.info("[LifeForceEngine] State restored: %d evaluations, state=%s, conviction=%d, drain=%.3f",
-                    self._total_evaluations, self._state, self._conviction_counter, self._metabolic_drain)
+        # 2026-04-17 persistence gap fix — 5 fields previously missing
+        if "_is_dreaming" in state:
+            self._is_dreaming = bool(state["_is_dreaming"])
+        if "_drain_passive_decay" in state:
+            self._drain_passive_decay = float(state["_drain_passive_decay"])
+        if "_total_neuromod_cost" in state:
+            self._total_neuromod_cost = float(state["_total_neuromod_cost"])
+        if "_total_somatic_cost" in state:
+            self._total_somatic_cost = float(state["_total_somatic_cost"])
+        if "_max_history" in state:
+            self._max_history = int(state["_max_history"])
+        logger.info("[LifeForceEngine] State restored: %d evaluations, state=%s, conviction=%d, drain=%.3f, dreaming=%s",
+                    self._total_evaluations, self._state, self._conviction_counter, self._metabolic_drain, self._is_dreaming)
 
 
 # ── Helper Functions ──────────────────────────────────────────

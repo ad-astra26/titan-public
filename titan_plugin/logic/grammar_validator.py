@@ -64,6 +64,9 @@ BOOTSTRAP_RULES = [
 ]
 
 
+# PERSISTENCE_BY_DESIGN: GrammarValidator._rules is loaded from the grammar
+# rules SQLite DB at boot; never self-assigned. Scanner can't see DB-backed
+# loads via SQL queries — the rules persist in the DB itself.
 class GrammarValidator:
     """Learns and applies grammar correction rules."""
 
