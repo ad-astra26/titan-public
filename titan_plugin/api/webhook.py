@@ -156,27 +156,24 @@ async def _handle_inspiration(plugin, tx, memo_data, signature, fee_payer) -> bo
     amount_sol = _extract_sol_amount(tx, plugin)
 
     # Record in social graph.
-    # Phase E.2.5: social_graph methods do sync sqlite3 writes — wrap in
-    # to_thread so webhook handler doesn't block the FastAPI event loop.
-    # Per Maker request, we wrap at the caller site (here) rather than
-    # changing social_graph internals — keeps sync workers untouched.
-    import asyncio as _asyncio_local
+    # rFP_social_graph_async_safety §5.2: async companion replaces the
+    # Phase E.2.5 caller-side to_thread wrap — the lock + to_thread now
+    # live inside social_graph.py so all callers benefit uniformly and
+    # intra-process writers are serialized (closes R2).
     social_graph = getattr(plugin, "social_graph", None)
     matched_user = None
     if social_graph:
-        matched_user = await _asyncio_local.to_thread(
-            social_graph.record_inspiration,
+        matched_user = await social_graph.record_inspiration_async(
             tx_signature=signature,
             sender_address=fee_payer,
             message=message,
             amount_sol=amount_sol,
         )
 
-    # Calculate mood boost and memory weight
+    # Calculate mood boost and memory weight — pure math, no DB, no wrap needed.
     mood_delta, memory_weight = 0.01, 1.5
     if social_graph:
-        mood_delta, memory_weight = await _asyncio_local.to_thread(
-            social_graph.get_donation_mood_boost, amount_sol)
+        mood_delta, memory_weight = social_graph.get_donation_mood_boost(amount_sol)
 
     # Inject as weighted memory
     if hasattr(plugin, "memory") and plugin.memory:
@@ -215,21 +212,20 @@ async def _handle_donation(plugin, tx, signature, fee_payer, memo_data) -> bool:
     if amount_sol <= 0:
         return False
 
-    # Phase E.2.5: wrap social_graph sync sqlite calls in to_thread
-    import asyncio as _asyncio_local
+    # rFP_social_graph_async_safety §5.2: async companion replaces the
+    # Phase E.2.5 caller-side to_thread wrap. get_donation_mood_boost is
+    # pure math — no DB, no wrap needed.
     social_graph = getattr(plugin, "social_graph", None)
     matched_user = None
 
     if social_graph:
-        matched_user = await _asyncio_local.to_thread(
-            social_graph.record_donation,
+        matched_user = await social_graph.record_donation_async(
             tx_signature=signature,
             sender_address=fee_payer,
             amount_sol=amount_sol,
             memo=memo_data or "",
         )
-        mood_delta, _ = await _asyncio_local.to_thread(
-            social_graph.get_donation_mood_boost, amount_sol)
+        mood_delta, _ = social_graph.get_donation_mood_boost(amount_sol)
     else:
         mood_delta = 0.02
 

@@ -495,6 +495,20 @@ class ConceptGroundingNetwork:
         self._online_lr = 0.001  # 10x smaller than dream consolidation
         self._consumer_freq: Dict[str, int] = {}  # record_outcome call count per consumer
 
+        # BUG-CGN-SILENT-UNREGISTERED-CONSUMER Phase 0 observability (2026-04-21).
+        # record_outcome() silently no-ops when called with a consumer that
+        # was never CGN_REGISTER'd — the for-loop scans transitions, finds no
+        # match, exits without logging. On T2/T3 this hides language_worker's
+        # 7+2 ad-hoc "language"/"social" sites that ship transitions for
+        # consumers nobody registered. Likely root of T2/T3 meta-reasoning
+        # stuck-in-shadow (w_grounded=0.057 vs T1=0.535).
+        # Phase 0 = visibility ONLY (no behavior change). Counters drive
+        # arch_map cgn diagnostics + a /v4/cgn/silent-drops endpoint.
+        self._unregistered_outcome_attempts: Dict[str, int] = {}
+        self._unmatched_outcome_attempts: Dict[str, int] = {}
+        self._silent_drop_last_log_ts: Dict[str, float] = {}
+        self._silent_drop_log_interval_sec: float = 60.0  # throttle warns to ≤1/min/consumer
+
         # Concept lifecycle: track concept journey across consumers
         self._concept_journeys: Dict[str, dict] = {}  # concept_id → {first_consumer, consumers_seen, ...}
 
@@ -661,6 +675,28 @@ class ConceptGroundingNetwork:
         per outcome, with frequency-scaled learning rate to prevent
         dominant consumers from overwhelming the shared value net.
         """
+        # Phase 0 observability for BUG-CGN-SILENT-UNREGISTERED-CONSUMER.
+        # Distinguish two failure modes that previously both fell through silently:
+        #   (a) consumer was never registered at all → count + log throttled
+        #   (b) consumer registered but no matching transition for this concept
+        #       (already-rewarded or evicted from buffer) → count separately
+        # No behavior change — telemetry only.
+        if consumer not in self._consumers:
+            self._unregistered_outcome_attempts[consumer] = (
+                self._unregistered_outcome_attempts.get(consumer, 0) + 1)
+            _now = time.time()
+            _last = self._silent_drop_last_log_ts.get(consumer, 0.0)
+            if _now - _last >= self._silent_drop_log_interval_sec:
+                logger.warning(
+                    "[CGN] record_outcome called with UNREGISTERED consumer=%r "
+                    "(concept=%s, reward=%.3f) — total unregistered attempts=%d. "
+                    "Likely BUG-CGN-SILENT-UNREGISTERED-CONSUMER. Sender must "
+                    "send CGN_REGISTER before CGN_TRANSITION/record_outcome.",
+                    consumer, concept_id, reward,
+                    self._unregistered_outcome_attempts[consumer])
+                self._silent_drop_last_log_ts[consumer] = _now
+            return  # no transition match possible
+
         # Find most recent transition for this concept
         for t in reversed(self._buffer._buffer):
             if t.consumer == consumer and t.concept_id == concept_id and t.reward == 0.0:
@@ -695,6 +731,28 @@ class ConceptGroundingNetwork:
                     pass  # Non-critical — don't break reward recording
 
                 return
+        # Loop exited without a match: registered consumer, but no pending
+        # transition for this concept (already rewarded, evicted from buffer,
+        # or concept_id mismatch). Track separately from unregistered attempts.
+        self._unmatched_outcome_attempts[consumer] = (
+            self._unmatched_outcome_attempts.get(consumer, 0) + 1)
+
+    def get_silent_drop_telemetry(self) -> dict:
+        """Phase 0 observability accessor for BUG-CGN-SILENT-UNREGISTERED-CONSUMER.
+
+        Returns dict with cumulative counts per consumer:
+          - unregistered: record_outcome called for a consumer that never
+            sent CGN_REGISTER. Bug signal — these writes never landed.
+          - unmatched: registered consumer + record_outcome but no matching
+            pending transition. Usually benign (already rewarded / evicted).
+          - registered: list of currently registered consumer names (for diff).
+        """
+        return {
+            "unregistered": dict(self._unregistered_outcome_attempts),
+            "unmatched": dict(self._unmatched_outcome_attempts),
+            "registered": sorted(self._consumers.keys()),
+            "consumer_freq": dict(self._consumer_freq),
+        }
 
     # ── Dream Consolidation ─────────────────────────────────────��───────
 

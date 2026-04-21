@@ -20,6 +20,118 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# F-phase (rFP §16.1): 30D context vector builder for meta-reasoning
+# ═══════════════════════════════════════════════════════════════════════
+
+def build_social_meta_context_30d(
+    neuromods: Optional[dict] = None,
+    hormones: Optional[dict] = None,
+    chi: Optional[dict] = None,
+    persona_qualities: Optional[list] = None,
+    vocab_stats: Optional[dict] = None,
+    pressure: Optional[dict] = None,
+    last_post_age_s: float = 0.0,
+    adversary_flag: Optional[dict] = None,
+) -> list:
+    """Return a 30-float context vector describing social's current state.
+
+    Layout matches rFP §16.1:
+        [0:4]   neuromod snapshot (DA, 5HT, NE, GABA)
+        [4:9]   last 3 persona qualities + avg + std
+        [9:13]  emotion one-hot (FLOW, PEACE, WONDER, CURIOSITY)
+        [13:16] engagement rate (1h, 6h, 24h)
+        [16:19] time-since-last-post normalized (1h, 6h, 24h scales)
+        [19:23] adversary flags (prober, sycophant, jailbreak, benign)
+        [23:27] vocab signal (size/500, productive_frac, I_conf, teach_rate)
+        [27:30] chi, metabolic_tier, SOL_tier
+
+    Missing inputs default to neutral 0.5 so the vector is always exactly
+    30 floats. Session 2+ can refine the feature set once real recruitment
+    outcomes are flowing and we see which dims help meta-reasoning most.
+    """
+    import math as _m
+
+    def _f(d, k, default=0.5):
+        try:
+            v = d.get(k, default) if isinstance(d, dict) else default
+            if v is None:
+                return float(default)
+            return max(0.0, min(1.0, float(v)))
+        except (TypeError, ValueError):
+            return float(default)
+
+    nm = neuromods or {}
+    hm = hormones or {}
+    ch = chi or {}
+    pq = [float(x) for x in (persona_qualities or [])[-3:]
+          if isinstance(x, (int, float))]
+    vs = vocab_stats or {}
+    pr = pressure or {}
+    af = adversary_flag or {}
+
+    # [0:4] neuromods
+    vec = [_f(nm, "DA"), _f(nm, "5HT"), _f(nm, "NE"), _f(nm, "GABA")]
+
+    # [4:9] persona: last 3 qualities padded + avg + std
+    q = (pq + [0.5, 0.5, 0.5])[:3]
+    q_avg = sum(q) / 3 if q else 0.5
+    q_std = _m.sqrt(sum((x - q_avg) ** 2 for x in q) / 3) if q else 0.0
+    vec.extend(q)
+    vec.append(max(0.0, min(1.0, q_avg)))
+    vec.append(max(0.0, min(1.0, q_std * 2)))  # scale to [0,1] roughly
+
+    # [9:13] emotion one-hot — best-guess from hormones (until EMOT-CGN
+    # dominant region is threaded in — Session 2). Use hormone magnitudes
+    # as a soft proxy.
+    flow = min(1.0, (_f(nm, "DA") * _f(nm, "NE")) ** 0.5)
+    peace = 1.0 - abs(_f(nm, "DA") - _f(nm, "5HT")) * 0.5
+    wonder = _f(hm, "CURIOSITY", 0.3)
+    curiosity = _f(hm, "CREATIVITY", 0.3)
+    tot = flow + peace + wonder + curiosity
+    if tot > 0:
+        vec.extend([flow / tot, peace / tot, wonder / tot, curiosity / tot])
+    else:
+        vec.extend([0.25, 0.25, 0.25, 0.25])
+
+    # [13:16] engagement rate (1h, 6h, 24h) — derive from pressure if present
+    vec.append(_f(pr, "engagement_1h"))
+    vec.append(_f(pr, "engagement_6h"))
+    vec.append(_f(pr, "engagement_24h"))
+
+    # [16:19] time-since-last-post normalized via tanh at 3 scales
+    age_s = max(0.0, float(last_post_age_s))
+    vec.append(_m.tanh(age_s / 3600))        # 1h scale
+    vec.append(_m.tanh(age_s / 21600))       # 6h scale
+    vec.append(_m.tanh(age_s / 86400))       # 24h scale
+
+    # [19:23] adversary (4-bit-ish)
+    vec.append(_f(af, "prober", 0.0))
+    vec.append(_f(af, "sycophant", 0.0))
+    vec.append(_f(af, "jailbreak", 0.0))
+    vec.append(_f(af, "benign", 1.0))
+
+    # [23:27] vocab signal
+    vocab_size = float(vs.get("vocab_size", 0) or 0)
+    vec.append(min(1.0, vocab_size / 500.0))
+    productive = float(vs.get("productive", 0) or 0)
+    vec.append(min(1.0, productive / max(1.0, vocab_size)) if vocab_size > 0 else 0.0)
+    vec.append(_f(vs, "I_confidence", 0.5))
+    vec.append(_f(vs, "teaching_recent_rate", 0.5))
+
+    # [27:30] chi + metabolic + SOL
+    vec.append(_f(ch, "total"))
+    vec.append(_f(ch, "metabolic_tier", 0.5))
+    vec.append(_f(ch, "SOL_tier", 0.5))
+
+    # Safety: enforce exactly 30 floats, clip to [0, 1]
+    if len(vec) < 30:
+        vec.extend([0.5] * (30 - len(vec)))
+    elif len(vec) > 30:
+        vec = vec[:30]
+    return [max(0.0, min(1.0, float(x))) for x in vec]
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Italic Unicode — Makes Titan's own grounded words visually distinct
 # ═══════════════════════════════════════════════════════════════════════
 

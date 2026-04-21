@@ -49,6 +49,23 @@ COMPOSITION_DEFAULTS = {
     "impasse_weight_mul": 2.0,   # impasse α-boost port — 2× observation weight
     "ci_quantile_lo": 0.05,
     "ci_quantile_hi": 0.95,
+    # B.1 (2026-04-21): per-update EMA decay of α,β — replaces batch decay
+    # path at steady state. At γ=1.0, mathematically identical to current
+    # (no decay per update). At γ<1.0, Beta posteriors forget old evidence
+    # at rate 1/(1-γ). Default=1.0 → SHIP NEUTRAL — no behavior change.
+    # Next session activates via parameter flip to e.g. 0.999 after A-phase
+    # observation data informs the tuning choice. See F rFP
+    # (rFP_meta_service_interface.md) + audit doc Section B for design
+    # rationale. The batch `_maybe_apply_decay` path stays alongside for
+    # now — will retire in a later commit once γ<1 is proven stable.
+    # B-phase Step 2 (2026-04-21 afternoon): 0.9999 → 0.999 per audit §B
+    # migration plan. Step 1 (γ=0.9999, ~10k-obs horizon) shipped earlier
+    # 2026-04-21 (commit 3427dfe); 30-min focused soak passed with 0
+    # failsafe trips, V stable, no crashes. Step 2 lowers horizon to
+    # ~1,000 observations — decay now visible within hours rather than
+    # days, which is the production target for actual learning effect.
+    # `_maybe_apply_decay` batch path remains gated off (still < 1.0).
+    "ema_decay_gamma": 0.999,
 }
 
 
@@ -95,12 +112,32 @@ def _normal_approx_beta_ci(a: float, b: float,
 
 
 def _posterior_confidence(a: float, b: float, ref_n: float = 500.0) -> float:
-    """Saturating confidence in [0,1] from (α−1)+(β−1) effective evidence count.
+    """Asymptotic confidence in [0,1) from (α−1)+(β−1) effective evidence count.
 
-    Matches pre-P6 semantics (n_samples/500) but uses Beta evidence count.
+    B.2 (2026-04-21): was a hard-capped `min(1.0, n_eff/ref_n)` which
+    saturated at 1.0 FOREVER once α+β > 500 — every primitive on every
+    Titan reported confidence=1.0 after early bootstrap. Impasse detector
+    reads this for conf_flatline, so metric was LYING about system health.
+
+    Replaced with `n_eff / (n_eff + ref_n)` — asymptotic, never pins:
+      n_eff=0       → 0.0    (prior, unchanged)
+      n_eff=100     → 0.167
+      n_eff=500     → 0.500  (old transition point, reasonable midpoint)
+      n_eff=2000    → 0.800
+      n_eff=190000  → 0.997  (T1 RECALL scale — DIFFERENTIATED from smaller
+                              primitives instead of all pinned at 1.0)
+
+    Pairs with B.1 EMA-decay: once γ<1 activates and α+β actually shrinks,
+    confidence will respond instead of staying pinned. Without B.2, B.1's
+    benefit is invisible downstream.
+
+    Related test updates (B.2): tests asserting `confidence > 0.3` at
+    α+β≈200 (old hard-cap → 0.4; new asymptotic → 0.286) increase
+    iterations to ≥350 so both functions give > 0.3.
     """
     n_eff = max(0.0, (a - BETA_PARAM_FLOOR) + (b - BETA_PARAM_FLOOR))
-    return float(min(1.0, n_eff / max(1.0, ref_n)))
+    ref = max(1.0, ref_n)
+    return float(n_eff / (n_eff + ref))
 
 
 def _gini(values: list) -> float:
@@ -340,6 +377,20 @@ SIGNAL_TO_PRIMITIVE: dict[tuple, dict[str, float]] = {
     # earlier Phase 2 mapping — picked up now that producer is being wired).
     ("meta_wisdom", "crystallized"):    {"SYNTHESIZE": 0.75, "HYPOTHESIZE": 0.65,
                                          "INTROSPECT": 0.55},
+    # Producer #16 (2026-04-20, rFP_soar_repeat_impasse_metacgn Phase 2):
+    # primitive_repeat_impasse emitted when detect_chain_impasse returns
+    # repeat_stuck. OBSERVABILITY-ONLY in Phase 2 — maps FORMULATE→0.5
+    # (exactly-neutral Beta update: a+=w*0.5, b+=w*0.5 keeps posterior mean
+    # unchanged, only tightens confidence marginally). Target is FORMULATE
+    # because it has the largest n_samples (~278k) so the neutral nudge
+    # has negligible V impact. Empty mapping {} was attempted first but
+    # consumer's `if not mapping` check at handle_cross_consumer_signal
+    # treats it as unknown orphan and rejects. Phase 3 (next session) will
+    # replace this with {<repeated_primitive>: quality_nudge < 0.5} that
+    # reads the payload's repeated_primitive for targeted V down-weight.
+    # Rationale: collecting data now lets COMPLETE-9b analyzer show
+    # repeat-signal↔chain-outcome correlation before we design V(s) drift.
+    ("meta", "primitive_repeat_impasse"): {"FORMULATE": 0.5},
     # v3 additions (2026-04-14, rFP_meta_cgn_v3) — paired with producers
     # in Phase D rollout. Mappings determined per principle 3
     # (causation / diversification / monoculture-breaking).
@@ -394,6 +445,29 @@ P10_SIGNAL_DECAY_CADENCE = 500      # chains between decay ticks on signal slice
 
 # Narrative bridge intensity threshold — documented only in v1 (hook stub)
 P10_NARRATIVE_TRIGGER_INTENSITY = 0.8
+
+# ─────────────────────────────────────────────────────────────────
+# META-CGN drift mechanism (§2.6 of rFP_cgn_consolidated; 2026-04-21)
+# ─────────────────────────────────────────────────────────────────
+#
+# `SIGNAL_TO_PRIMITIVE` holds HAND-CRAFTED quality_nudge values. They
+# encode the rFP authors' best-guess "when (consumer, event) fires, which
+# primitive should get nudged and how much." But actual chain outcomes
+# reveal which tuples predict success vs. which are noise. The
+# `scripts/analyze_haov_correlations.py` analyzer (COMPLETE-9b, commit
+# `625cd04`) identifies tuples where observed correlation diverges from
+# the hand-crafted nudge AND sample count is ≥100.
+#
+# `apply_drift_hints()` below accepts analyzer output and applies bounded
+# adjustments to `_drift_overrides`. The overrides are consulted BEFORE
+# the static `SIGNAL_TO_PRIMITIVE` during signal handling — so the
+# lifetime behavior drifts toward empirically-observed value over weeks
+# of accumulated samples, without hand-tuning. Magnitude capped at
+# `DRIFT_MAX_PER_APPLY` (0.05) per call to prevent oscillation.
+DRIFT_MAX_PER_APPLY = 0.05      # per-call magnitude cap
+DRIFT_MIN_SAMPLES = 100          # ignore hints below this N (matches analyzer)
+DRIFT_BOUND_MIN = 0.05            # absolute floor for any quality_nudge (never go full zero)
+DRIFT_BOUND_MAX = 0.95            # absolute ceiling (never go full one)
 
 
 def _rank_hybrid(response: dict, impasse_signal: str,
@@ -681,6 +755,13 @@ class MetaCGNConsumer:
         self._last_graduation_blockers_hash = ""
         self._graduation_blockers_unchanged_chains = 0
 
+        # Drift mechanism state MUST initialize BEFORE _load_state so the
+        # loader (which restores into these attributes) doesn't get overwritten
+        # by later ctor lines. Same pattern as HAOV hypothesis tracking above.
+        self._drift_overrides: dict = {}
+        self._drift_applies_total = 0
+        self._drift_last_applied_ts: float = 0.0
+
         self._load_state()
 
         self._cgn_client = None
@@ -746,6 +827,15 @@ class MetaCGNConsumer:
         self._knowledge_responses_received = 0
         self._knowledge_requests_finalized = 0
         self._knowledge_requests_empty = 0   # window closed with 0 responses
+        # A3 (2026-04-21) observability: distinguish "no response arrived at
+        # spirit_worker" from "arrived but aggregator mismatch" from "fell
+        # through to legacy path." Without these counters, seen-at-handler
+        # ≠ received-by-aggregator gap is invisible.
+        self._kr_resp_seen_by_handler = 0        # incr in spirit_worker top of handler
+        self._kr_aggregator_miss_no_rid = 0      # response arrived, no request_id
+        self._kr_aggregator_miss_rid_unknown = 0  # rid present but not in pending
+        self._kr_aggregator_miss_finalized = 0   # rid matched but window already closed
+        self._kr_legacy_path_taken = 0           # spirit_worker legacy inject path ran
         # D8.5 source credit tracking
         self._knowledge_provided_by_source: dict = {}  # consumer → count
         self._knowledge_helpful_by_source: dict = {}    # consumer → count (injected)
@@ -759,6 +849,8 @@ class MetaCGNConsumer:
         self._narrative_hooks_deferred = 0   # count when intensity ≥ threshold
                                               # but no narrative bridge yet
         self._chains_since_signal_decay = 0
+        # (drift_overrides + applies_total + last_applied_ts initialized
+        # earlier, before _load_state, so loader restoration isn't overwritten)
 
         self._init_cgn_client()
 
@@ -916,18 +1008,35 @@ class MetaCGNConsumer:
             # P7: telemetry — any weight>1 is an accelerated update (EUREKA/impasse)
             if w > 1.0 + 1e-6:
                 self._eureka_accelerated_updates += 1
-            # Beta posterior update
-            p.alpha = max(BETA_PARAM_FLOOR, p.alpha + w * quality)
-            p.beta = max(BETA_PARAM_FLOOR, p.beta + w * (1.0 - quality))
+            # B.1 (2026-04-21) Beta posterior update with per-update EMA decay.
+            # At γ=1.0 (default, SHIPPED NEUTRAL), excess * 1.0 = excess →
+            # formula reduces to: α_new = FLOOR + (α_old - FLOOR) + w·quality
+            # = α_old + w·quality → mathematically identical to pre-B.1 code.
+            # At γ<1.0, Beta posteriors forget old evidence at rate 1/(1-γ)
+            # while still incorporating new observations via w*quality.
+            # See audit doc Section B for derivation + migration plan.
+            ema_gamma = float(
+                COMPOSITION_DEFAULTS.get("ema_decay_gamma", 1.0))
+            excess_a = max(0.0, p.alpha - BETA_PARAM_FLOOR) * ema_gamma
+            excess_b = max(0.0, p.beta - BETA_PARAM_FLOOR) * ema_gamma
+            p.alpha = max(BETA_PARAM_FLOOR,
+                          BETA_PARAM_FLOOR + excess_a + w * quality)
+            p.beta = max(BETA_PARAM_FLOOR,
+                         BETA_PARAM_FLOOR + excess_b + w * (1.0 - quality))
             # I3: per-domain posterior (dynamic enumeration)
+            # Same EMA-decay pattern applied to per-domain slice.
             if domain:
                 d = str(domain)
                 entry = p.by_domain.get(d)
                 if entry is None:
                     entry = [BETA_PARAM_FLOOR, BETA_PARAM_FLOOR, 0]
                 a_d, b_d, n_d = float(entry[0]), float(entry[1]), int(entry[2])
-                a_d = max(BETA_PARAM_FLOOR, a_d + w * quality)
-                b_d = max(BETA_PARAM_FLOOR, b_d + w * (1.0 - quality))
+                excess_a_d = max(0.0, a_d - BETA_PARAM_FLOOR) * ema_gamma
+                excess_b_d = max(0.0, b_d - BETA_PARAM_FLOOR) * ema_gamma
+                a_d = max(BETA_PARAM_FLOOR,
+                          BETA_PARAM_FLOOR + excess_a_d + w * quality)
+                b_d = max(BETA_PARAM_FLOOR,
+                          BETA_PARAM_FLOOR + excess_b_d + w * (1.0 - quality))
                 n_d += 1
                 p.by_domain[d] = [a_d, b_d, n_d]
             # Refresh derived fields + bookkeeping
@@ -948,7 +1057,26 @@ class MetaCGNConsumer:
 
         Decay re-opens confidence (n_eff shrinks), keeps V unchanged, and lets
         stale grounding fade. Called from record_chain_outcome.
+
+        B-phase gate (2026-04-21): when per-update EMA decay is active
+        (`ema_decay_gamma < 1.0`), this batch decay becomes a no-op to
+        prevent compound decay. At γ=1.0 (no EMA) batch decay continues
+        as the sole forgetting mechanism. At γ<1.0 EMA handles forgetting
+        per-update and batch is redundant. Per 2026-04-21 audit §B: "Delete
+        `_maybe_apply_decay` batch path — redundant with per-observation
+        decay." We GATE rather than delete so a later γ rollback to 1.0
+        would re-enable batch decay without a code change, and the
+        cadence counter resets cleanly on gate flip.
         """
+        ema_gamma = float(
+            COMPOSITION_DEFAULTS.get("ema_decay_gamma", 1.0))
+        if ema_gamma < 1.0:
+            # Per-update EMA handles forgetting — batch would compound.
+            # Zero the chains-since-decay counter so the batch doesn't fire
+            # a huge-delta sweep if γ is ever flipped back to 1.0 after
+            # accumulating 500+ chains under EMA.
+            self._chains_since_decay = 0
+            return
         cadence = int(COMPOSITION_DEFAULTS["decay_cadence_chains"])
         gamma = float(COMPOSITION_DEFAULTS["decay_gamma"])
         skip_n_min = int(COMPOSITION_DEFAULTS["decay_skip_n_min"])
@@ -1568,6 +1696,18 @@ class MetaCGNConsumer:
                     p: asdict(c) for p, c in self._primitives.items()
                 },
                 "stats": self.get_stats_compact(),
+                # Drift mechanism §2.6 (2026-04-21) — analyzer-driven overrides
+                # to SIGNAL_TO_PRIMITIVE quality_nudges. JSON-friendly string
+                # keys (tuple → "consumer|event"); restored on _load_state.
+                "drift_overrides": {
+                    f"{c}|{e}": dict(v)
+                    for (c, e), v in (
+                        getattr(self, "_drift_overrides", {}) or {}).items()
+                },
+                "drift_applies_total":
+                    int(getattr(self, "_drift_applies_total", 0)),
+                "drift_last_applied_ts":
+                    float(getattr(self, "_drift_last_applied_ts", 0.0)),
             }
             tmp = self._grounding_path + ".tmp"
             with open(tmp, "w") as f:
@@ -1663,6 +1803,26 @@ class MetaCGNConsumer:
             else:
                 logger.info("[MetaCGN] Loaded %d primitives from %s (v%d)",
                             len(loaded), self._grounding_path, schema_version)
+            # Drift overrides restore (§2.6, 2026-04-21). String keys split
+            # back to tuples; defensive against old files without the field
+            # (returns {}).
+            _saved_overrides = data.get("drift_overrides", {}) or {}
+            if isinstance(_saved_overrides, dict):
+                restored = {}
+                for _key, _pmap in _saved_overrides.items():
+                    if not isinstance(_key, str) or "|" not in _key:
+                        continue
+                    _c, _e = _key.split("|", 1)
+                    if isinstance(_pmap, dict):
+                        restored[(_c, _e)] = {
+                            str(p): float(v) for p, v in _pmap.items()
+                            if isinstance(v, (int, float))}
+                if restored:
+                    self._drift_overrides = restored
+            if data.get("drift_applies_total"):
+                self._drift_applies_total = int(data["drift_applies_total"])
+            if data.get("drift_last_applied_ts"):
+                self._drift_last_applied_ts = float(data["drift_last_applied_ts"])
         except Exception as e:
             logger.warning("[MetaCGN] _load_state failed: %s — starting fresh",
                            e)
@@ -2541,10 +2701,16 @@ class MetaCGNConsumer:
         """
         try:
             rid = str(response_payload.get("request_id", ""))
-            if not rid or rid not in self._pending_knowledge_requests:
+            # A3 observability — distinguish the miss modes.
+            if not rid:
+                self._kr_aggregator_miss_no_rid += 1
+                return None
+            if rid not in self._pending_knowledge_requests:
+                self._kr_aggregator_miss_rid_unknown += 1
                 return None
             req = self._pending_knowledge_requests[rid]
             if req.get("finalized"):
+                self._kr_aggregator_miss_finalized += 1
                 return None
             # Track source credit (D8.5)
             src = str(response_payload.get("source", "unknown"))
@@ -2941,7 +3107,19 @@ class MetaCGNConsumer:
             self._signals_received += 1
             self._signals_by_consumer[consumer] = \
                 self._signals_by_consumer.get(consumer, 0) + 1
-            mapping = SIGNAL_TO_PRIMITIVE.get((consumer, event_type))
+            # Start with static mapping, then overlay drift overrides.
+            # Drift values override per-primitive quality_nudge; any primitive
+            # not in the override dict keeps its static value.
+            _static = SIGNAL_TO_PRIMITIVE.get((consumer, event_type))
+            _over = self._drift_overrides.get((consumer, event_type)) \
+                if hasattr(self, "_drift_overrides") else None
+            if _static and _over:
+                mapping = dict(_static)
+                for _p, _v in _over.items():
+                    if _p in mapping:
+                        mapping[_p] = float(_v)
+            else:
+                mapping = _static
             if not mapping:
                 self._signals_rejected_unknown += 1
                 # Surface the orphan via BusHealthMonitor — logs WARN on
@@ -2956,6 +3134,30 @@ class MetaCGNConsumer:
                 except Exception:
                     pass
                 return False
+            # ── SOAR Phase 3 (2026-04-21): primitive_repeat_impasse uses
+            #    dynamic mapping driven by payload's repeated_primitive ──
+            #
+            # Phase 2 shipped static mapping {"FORMULATE": 0.5} as observability-
+            # only neutral nudge. Phase 3 promotes to LEARNING: when a
+            # repeat_impasse signal arrives with `repeated_primitive` in
+            # narrative_context, nudge THAT specific primitive with quality
+            # < 0.5 so META-CGN's β posterior learns "repetition of this
+            # primitive is lower-value than expected." The magnitude is
+            # capped (P10_SIGNAL_WEIGHT × intensity × 1 signal) so one event
+            # can't swing V; learning is gradual over accumulated samples.
+            # Static mapping preserved as fallback when payload is absent
+            # (never-seen old producer) — backwards-compatible.
+            if (consumer == "meta" and
+                    event_type == "primitive_repeat_impasse" and
+                    isinstance(narrative_context, dict)):
+                _rp = narrative_context.get("repeated_primitive")
+                if isinstance(_rp, str) and _rp in self._primitives:
+                    # Dynamic mapping: nudge the actual repeated primitive
+                    # with quality 0.35 (below 0.5 neutral, above 0 worst —
+                    # "repetition is lower-value than expected, but not
+                    # catastrophically so"). Magnitude-capped via
+                    # P10_SIGNAL_WEIGHT × intensity in the loop below.
+                    mapping = {_rp: 0.35}
             # Apply pseudo-observations
             intensity = max(0.0, min(1.0, float(intensity)))
             effective_weight = P10_SIGNAL_WEIGHT * intensity
@@ -2993,6 +3195,103 @@ class MetaCGNConsumer:
         except Exception as e:
             logger.debug("[MetaCGN] cross-consumer signal failed: %s", e)
             return False
+
+    def apply_drift_hints(self, hints: list) -> dict:
+        """Apply analyzer-derived drift hints to SIGNAL_TO_PRIMITIVE overrides.
+
+        §2.6 of `rFP_cgn_consolidated.md`. Called by
+        `scripts/analyze_haov_correlations.py --apply` or equivalent.
+
+        Args:
+            hints: list of dicts from analyzer, each with keys:
+                - consumer   (str)   — signal source, e.g. "meta_reasoning"
+                - event      (str)   — event_type, e.g. "eureka"
+                - prim       (str)   — primitive name, e.g. "SYNTHESIZE"
+                - N          (int)   — sample count
+                - dir        (str)   — "increase" or "decrease"
+                - hint       (float) — raw magnitude (capped per call)
+
+        Returns:
+            {"applied": int, "skipped_low_n": int, "skipped_unknown": int,
+             "skipped_capped": int, "overrides": {(c,e): {p: v}}}
+
+        Magnitude cap: per-call adjustment capped at DRIFT_MAX_PER_APPLY.
+        Bounds: every override clamped to [DRIFT_BOUND_MIN, DRIFT_BOUND_MAX].
+        Samples below DRIFT_MIN_SAMPLES are silently skipped (noise).
+
+        Persisted via save_all / _load_state so drift survives restart.
+        """
+        applied = 0
+        skipped_low_n = 0
+        skipped_unknown = 0
+        skipped_capped = 0
+        if not isinstance(hints, list):
+            return {"applied": 0, "skipped_low_n": 0, "skipped_unknown": 0,
+                    "skipped_capped": 0,
+                    "overrides": dict(self._drift_overrides)}
+        for h in hints:
+            if not isinstance(h, dict):
+                continue
+            consumer = h.get("consumer")
+            event = h.get("event")
+            prim = h.get("prim")
+            n = int(h.get("N", 0))
+            direction = str(h.get("dir", "")).lower()
+            raw_hint = float(h.get("hint", 0.0))
+            if n < DRIFT_MIN_SAMPLES:
+                skipped_low_n += 1
+                continue
+            tup = (consumer, event)
+            static = SIGNAL_TO_PRIMITIVE.get(tup)
+            if not static or prim not in static:
+                skipped_unknown += 1
+                continue
+            if direction not in ("increase", "decrease"):
+                skipped_unknown += 1
+                continue
+            # Magnitude cap and direction
+            delta = min(abs(raw_hint), DRIFT_MAX_PER_APPLY)
+            if direction == "decrease":
+                delta = -delta
+            # Current value: existing override OR static baseline
+            _override = self._drift_overrides.setdefault(tup, {})
+            current = float(_override.get(prim, static[prim]))
+            new_val = max(DRIFT_BOUND_MIN,
+                          min(DRIFT_BOUND_MAX, current + delta))
+            if abs(new_val - current) < 1e-6:
+                skipped_capped += 1
+                continue
+            _override[prim] = round(new_val, 4)
+            applied += 1
+        if applied > 0:
+            self._drift_applies_total += applied
+            self._drift_last_applied_ts = time.time()
+            logger.info(
+                "[MetaCGN] Drift applied: %d hints (skipped: %d low-N, "
+                "%d unknown, %d capped) — overrides now %d tuples",
+                applied, skipped_low_n, skipped_unknown, skipped_capped,
+                len(self._drift_overrides))
+        return {
+            "applied": applied,
+            "skipped_low_n": skipped_low_n,
+            "skipped_unknown": skipped_unknown,
+            "skipped_capped": skipped_capped,
+            "overrides": {f"{c}|{e}": dict(v)
+                          for (c, e), v in self._drift_overrides.items()},
+        }
+
+    def get_drift_stats(self) -> dict:
+        """Snapshot for `/v4/meta-cgn/drift` endpoint."""
+        return {
+            "overrides_count": len(self._drift_overrides),
+            "applies_total": int(self._drift_applies_total),
+            "last_applied_ts": float(self._drift_last_applied_ts),
+            "last_applied_age_s": (
+                round(time.time() - self._drift_last_applied_ts, 1)
+                if self._drift_last_applied_ts else None),
+            "overrides": {f"{c}|{e}": dict(v)
+                          for (c, e), v in self._drift_overrides.items()},
+        }
 
     def _blend_weights_preview_dict(self) -> dict:
         """P9: expose current-stage blend weights for dashboards."""
@@ -3263,11 +3562,26 @@ class MetaCGNConsumer:
             "knowledge_requests_empty": self._knowledge_requests_empty,
             "knowledge_responses_received": self._knowledge_responses_received,
             "knowledge_responses_sent": self._knowledge_responses_sent,
+            # A3 observability (2026-04-21): knowledge request/response chain
+            # diagnostic — if resp_seen_by_handler > responses_received, the
+            # aggregator is missing matches (probably rid mismatch or already-
+            # finalized). If resp_seen_by_handler == 0 but requests_emitted > 0,
+            # the break is UPSTREAM (knowledge_worker not emitting, or bus
+            # routing dropping CGN_KNOWLEDGE_RESP before it reaches spirit).
+            "kr_resp_seen_by_handler": self._kr_resp_seen_by_handler,
+            "kr_aggregator_miss_no_rid": self._kr_aggregator_miss_no_rid,
+            "kr_aggregator_miss_rid_unknown": self._kr_aggregator_miss_rid_unknown,
+            "kr_aggregator_miss_finalized": self._kr_aggregator_miss_finalized,
+            "kr_legacy_path_taken": self._kr_legacy_path_taken,
             "knowledge_pending": len(self._pending_knowledge_requests),
             "knowledge_provided_by_source": dict(
                 self._knowledge_provided_by_source),
             "knowledge_helpful_by_source": dict(
                 self._knowledge_helpful_by_source),
+            # §2.6 drift mechanism (2026-04-21) — analyzer-driven overrides
+            # to SIGNAL_TO_PRIMITIVE. Surfaced in full META-CGN telemetry
+            # so observatory + /v4/meta-cgn pick it up automatically.
+            "drift": self.get_drift_stats(),
         }
 
     def get_stats_compact(self) -> dict:

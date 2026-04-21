@@ -209,17 +209,16 @@ class GrammarValidator:
 
         # Create new rule
         try:
-            conn = sqlite3.connect(self._db_path, timeout=5.0)
-            conn.execute("PRAGMA journal_mode=WAL")
-            cur = conn.cursor()
-            cur.execute(
+            from titan_plugin.persistence import get_client
+            res = get_client(caller_name="grammar_validator").write(
                 "INSERT INTO grammar_rules (pattern, replacement, context, confidence, source, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (pattern, replacement, "", 0.5, source, time.time()),
+                table="grammar_rules",
             )
-            conn.commit()
-            rule_id = cur.lastrowid
-            conn.close()
+            if not res.ok:
+                raise RuntimeError(res.error or "grammar rule insert failed")
+            rule_id = res.last_row_id or 0
 
             rule = GrammarRule(
                 rule_id=rule_id,

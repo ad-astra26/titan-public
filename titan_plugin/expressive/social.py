@@ -66,7 +66,7 @@ class SocialManager:
             except Exception:
                 pass
 
-    def _record_x_interaction(
+    async def _record_x_interaction(
         self, user_name: str, interaction_type: str, relevance: float,
         mention_text: str = "", sync_topic: str = None,
     ):
@@ -75,17 +75,21 @@ class SocialManager:
         Builds user profiles over time — Titan remembers who he talked to,
         what they discussed, and how meaningful the interaction was.
         This data feeds into meditation consolidation via the experience pipeline.
+
+        rFP_social_graph_async_safety §5.2: async so that calls from
+        monitor_and_engage (spirit_worker event loop) no longer block on
+        three sync sqlite3.connect writes per interaction.
         """
         if not self.social_graph:
             return
         try:
             # Get or create user profile
-            profile = self.social_graph.get_or_create_user(
+            profile = await self.social_graph.get_or_create_user_async(
                 user_name, platform="x", display_name=f"@{user_name}")
 
             # Record interaction quality (reply=high, like=moderate)
             quality = relevance if interaction_type == "reply" else relevance * 0.5
-            self.social_graph.record_interaction(user_name, quality=quality)
+            await self.social_graph.record_interaction_async(user_name, quality=quality)
 
             # Append context to profile notes (rolling, keeps last 3 interactions)
             note_entry = f"[{interaction_type}] {mention_text[:100]}"
@@ -96,7 +100,7 @@ class SocialManager:
             note_lines = [n for n in existing_notes.split("\n") if n.strip()][-2:]
             note_lines.append(note_entry)
             profile.notes = "\n".join(note_lines)
-            self.social_graph._save_profile(profile)
+            await self.social_graph._save_profile_async(profile)
 
             logging.info("[SocialGraph:X] Recorded %s with @%s (quality=%.2f, interactions=%d)",
                          interaction_type, user_name, quality, profile.interaction_count)
@@ -715,9 +719,12 @@ class SocialManager:
             logging.warning("[SocialManager] No SocialGraph — skipping engagement")
             return
 
-        replies_today = ledger.ledger_total_today("reply")
-        likes_today = ledger.ledger_total_today("like")
-        total_today = ledger.ledger_total_today()
+        # rFP_social_graph_async_safety §5.2: async companions for all
+        # ledger_* reads/writes so spirit_worker's event loop stops blocking
+        # on per-call sync sqlite3.connect (~5-50 ms each × many per cycle).
+        replies_today = await ledger.ledger_total_today_async("reply")
+        likes_today = await ledger.ledger_total_today_async("like")
+        total_today = await ledger.ledger_total_today_async()
 
         # Hard stop: daily API call limit
         if total_today >= self.HARD_MAX_API_CALLS_PER_DAY:
@@ -753,7 +760,7 @@ class SocialManager:
             return
 
         # 3. Cleanup old ledger entries (>48h)
-        cleaned = ledger.ledger_cleanup(max_age_seconds=172800)
+        cleaned = await ledger.ledger_cleanup_async(max_age_seconds=172800)
         if cleaned:
             logging.info("[SocialManager] Ledger cleanup: removed %d old entries", cleaned)
 
@@ -783,7 +790,7 @@ class SocialManager:
 
             # PERSISTENT DEDUP: skip tweets we've already REPLIED to (survives restart)
             # (likes don't block — we may still want to reply to a liked tweet)
-            if ledger.ledger_has_tweet(tweet_id, action="reply"):
+            if await ledger.ledger_has_tweet_async(tweet_id, action="reply"):
                 continue
 
             # AGE FILTER: skip mentions older than cutoff (crash-proof safety net)
@@ -803,7 +810,7 @@ class SocialManager:
             relevance = self._score_mention_relevance(mention_text)
 
             # Diminishing relevance for repeated conversations
-            user_reply_count = ledger.ledger_user_reply_count(
+            user_reply_count = await ledger.ledger_user_reply_count_async(
                 mention_user, self.HARD_CONVERSATION_WINDOW)
             if user_reply_count > 0:
                 # Each prior reply reduces relevance: -0.15 per reply
@@ -826,7 +833,7 @@ class SocialManager:
                                      mention_user)
                     else:
                         # Hard stop: min interval between replies to same user
-                        last_reply_time = ledger.ledger_last_reply_to_user(mention_user)
+                        last_reply_time = await ledger.ledger_last_reply_to_user_async(mention_user)
                         if last_reply_time and (now - last_reply_time) < self.HARD_MIN_REPLY_INTERVAL_USER:
                             logging.info("[HARD STOP] Reply cooldown for @%s (%.0fs remaining)",
                                          mention_user,
@@ -845,7 +852,7 @@ class SocialManager:
                                 # Like first
                                 if likes_today < self.HARD_MAX_LIKES_PER_DAY:
                                     if await self.like_tweet(tweet_id):
-                                        ledger.ledger_record(tweet_id, mention_user, "like")
+                                        await ledger.ledger_record_async(tweet_id, mention_user, "like")
                                         likes_today += 1
                                         cycle_new_likes += 1
 
@@ -854,7 +861,7 @@ class SocialManager:
                                 success = await self.create_tweet(
                                     _reply_full, in_reply_to_tweet_id=tweet_id)
                                 if success:
-                                    ledger.ledger_record(tweet_id, mention_user, "reply",
+                                    await ledger.ledger_record_async(tweet_id, mention_user, "reply",
                                                          mention_text[:200])
                                     replies_today += 1
                                     cycle_new_replies += 1
@@ -865,7 +872,7 @@ class SocialManager:
                                                  user_reply_count + 1,
                                                  self.HARD_MAX_REPLIES_PER_USER_WINDOW,
                                                  bool(sync_topic))
-                                    self._record_x_interaction(
+                                    await self._record_x_interaction(
                                         mention_user, "reply", relevance,
                                         mention_text[:200], sync_topic)
                                     engagement_details.append({
@@ -877,13 +884,13 @@ class SocialManager:
 
             # Like-only path (relevance 0.3-0.5, LOW_ENERGY, or reply limits hit)
             if relevance > 0.3 and likes_today < self.HARD_MAX_LIKES_PER_DAY:
-                if not ledger.ledger_has_tweet(tweet_id, action="like"):
+                if not await ledger.ledger_has_tweet_async(tweet_id, action="like"):
                     if await self.like_tweet(tweet_id):
-                        ledger.ledger_record(tweet_id, mention_user, "like",
+                        await ledger.ledger_record_async(tweet_id, mention_user, "like",
                                              mention_text[:200])
                         likes_today += 1
                         cycle_new_likes += 1
-                        self._record_x_interaction(
+                        await self._record_x_interaction(
                             mention_user, "like", relevance, mention_text[:200])
                         engagement_details.append({
                             "type": "like", "user_name": mention_user,

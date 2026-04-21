@@ -884,6 +884,38 @@ async def thread_pool_stats(request: Request):
         return _error(f"thread_pool_stats: {e}")
 
 
+@router.get("/v4/db-contention")
+async def db_contention(request: Request):
+    """SQLite contention diagnostic for BUG-SQLITE-WRITER-CONTENTION triage.
+
+    Added 2026-04-21 as part of BUG-SQLITE-WRITER-CONTENTION Option A fix
+    (sqlite_async.query default timeout 10s → 2s). Surfaces:
+
+      • timeouts_total     — lifetime count of sqlite3 "database is locked"
+                             or "busy" errors caught by async helpers
+      • timeouts_by_op     — breakdown by helper: query / execute /
+                             executemany / with_connection
+      • last_timeout_ts    — Unix timestamp of most recent timeout
+      • last_timeout_age_s — seconds since most recent timeout (None if never)
+      • last_timeout_db    — which DB path was contended
+      • last_timeout_op    — which helper fired
+      • last_timeout_msg   — error message (truncated to 200 chars)
+
+    Use during soak to confirm fast-fail reduces p99 latency without creating
+    a stream of visible timeouts (if `timeouts_total` grows unboundedly post-
+    Option-A, the real fix is Option B application-level retry or Option C
+    DB split — escalate per the BUG fix plan).
+
+    Counters survive the process but NOT restart — they're in-memory only
+    via `sqlite_async._contention_counter`.
+    """
+    try:
+        from titan_plugin.core.sqlite_async import get_contention_stats
+        return _ok(get_contention_stats())
+    except Exception as e:
+        return _error(f"db_contention: {e}")
+
+
 @router.get("/v4/ns-health")
 async def ns_health(request: Request):
     """Neural Nervous System health snapshot — per-program urgency distribution,
@@ -935,6 +967,306 @@ async def ns_health(request: Request):
             return _error(f"snapshot file read failed: {e}")
     except Exception as e:
         return _error(str(e))
+
+
+@router.get("/v4/titan-vm")
+async def titan_vm_diagnostics(request: Request):
+    """TitanVM v2 diagnostics — per-program telemetry + runtime EMA/DT state.
+
+    Returns:
+      - program_count, total_evaluations (from NervousSystem if live)
+      - runtime_state_age_s (seconds since last titan_vm_runtime.json save)
+      - programs: dict of per-program telemetry from runtime state file —
+            {program_key: {"ema_paths": {path: value, ...}, "prev_paths": {path: value, ...}}}
+      - telemetry: per-program fire_count + last_score + avg_score (only
+            populated if NervousSystem is directly accessible)
+
+    Used by:
+      - rFP_titan_vm_v2 §3.6 Phase 1 acceptance (verify runtime state persists)
+      - rFP_titan_vm_v2 §3.10 Phase 2 acceptance (per-program vm_baseline variance)
+      - L5 Phase 0 design inspection (live V4 prior shape)
+      - arch_map services/audit future integrations
+
+    TitanVM lives in spirit_worker subprocess via NervousSystem; dashboard
+    falls back to reading data/neural_nervous_system/titan_vm_runtime.json
+    when direct access isn't possible.
+    """
+    import os, json, time
+    try:
+        plugin = _get_plugin(request)
+        nns = getattr(plugin, "nervous_system", None)
+        telemetry = {}
+        source = "state_file"
+        if nns is not None and hasattr(nns, "vm") and hasattr(nns.vm, "get_telemetry"):
+            telemetry = nns.vm.get_telemetry()
+            source = "direct"
+
+        state_path = "./data/neural_nervous_system/titan_vm_runtime.json"
+        programs: dict = {}
+        runtime_state_age_s = None
+        total_executions = 0
+        if os.path.exists(state_path):
+            try:
+                with open(state_path) as f:
+                    state = json.load(f)
+                runtime_state_age_s = round(time.time() - os.path.getmtime(state_path), 1)
+                total_executions = int(state.get("total_executions", 0))
+                ema = state.get("ema_state", {}) or {}
+                prev = state.get("prev_values", {}) or {}
+                all_keys = set(ema.keys()) | set(prev.keys())
+                for key in all_keys:
+                    programs[key] = {
+                        "ema_paths": {p: round(float(v), 4) for p, v in (ema.get(key, {}) or {}).items()},
+                        "prev_paths": {p: round(float(v), 4) for p, v in (prev.get(key, {}) or {}).items()},
+                    }
+            except Exception as e:
+                return _error(f"runtime state file read failed: {e}")
+
+        if source == "state_file" and not programs and runtime_state_age_s is None:
+            return _error(
+                "titan_vm runtime state file not yet written — wait until first "
+                "runtime_save_every=100 executions accumulate after boot", code=503)
+
+        payload = {
+            "source": source,
+            "runtime_state_age_s": runtime_state_age_s,
+            "total_executions": total_executions,
+            "programs": programs,
+            "telemetry": telemetry,
+        }
+        return _ok(payload)
+    except Exception as e:
+        return _error(str(e))
+
+
+@router.get("/v4/prediction")
+async def prediction_diagnostics(request: Request):
+    """Prediction Engine v2 diagnostics — novelty signal state + calibration.
+
+    Returns:
+      - total_predictions, total_surprises, novelty, novelty_ema, familiarity
+      - surprise_threshold (adaptive top-quartile, floors at 0.1)
+      - error_mean_ema, error_std_ema (z-score calibration state)
+      - recent_errors (last 5 raw cosine distances)
+      - state_file_age_s (seconds since last disk save)
+
+    Used by:
+      - rFP_prediction_engine_v2 §6 soak gate (novelty variance ≥ 0.05 over 24h)
+      - arch_map services/audit post-v2 ship
+      - session-startup health checks
+
+    Prediction engine lives in spirit_worker subprocess; dashboard falls
+    back to the persisted state file at data/prediction/novelty_state.json
+    when direct access isn't possible.
+    """
+    import os, json, time
+    try:
+        # Direct access path (works in integration tests / single-process setups)
+        plugin = _get_plugin(request)
+        pe = getattr(plugin, "prediction_engine", None)
+        if pe is not None and hasattr(pe, "get_stats"):
+            stats = pe.get_stats()
+            stats["source"] = "direct"
+            stats["state_file_age_s"] = 0
+            return _ok(stats)
+
+        # File fallback — read novelty_state.json written every 100 evals
+        state_path = "./data/prediction/novelty_state.json"
+        if not os.path.exists(state_path):
+            return _error(
+                "prediction state file not yet written — wait until first 100 "
+                "compute_error calls accumulate after boot", code=503)
+        try:
+            with open(state_path) as f:
+                state = json.load(f)
+            mtime = os.path.getmtime(state_path)
+            errors = state.get("errors", [])
+            recent = errors[-5:] if isinstance(errors, list) else []
+            payload = {
+                "total_predictions": state.get("total_predictions", 0),
+                "total_surprises": state.get("total_surprises", 0),
+                "novelty_ema": round(float(state.get("novelty_ema", 0.5)), 4),
+                "error_mean_ema": round(float(state.get("error_mean_ema", 0.0)), 4),
+                "error_std_ema": round(float(state.get("error_std_ema", 0.01)), 4),
+                "recent_errors": [round(float(e), 4) for e in recent],
+                "errors_window_size": len(errors) if isinstance(errors, list) else 0,
+                "state_file_age_s": round(time.time() - mtime, 1),
+                "source": "state_file",
+            }
+            return _ok(payload)
+        except Exception as e:
+            return _error(f"state file read failed: {e}")
+    except Exception as e:
+        return _error(str(e))
+
+
+@router.get("/v4/imw-health")
+async def imw_health(request: Request):
+    """Inner Memory Writer (IMW) service health snapshot.
+
+    Reads metrics from data/run/imw_metrics.json (written by the daemon
+    every 10s via its heartbeat thread). No IPC protocol — file-based
+    for simplicity.
+
+    Used by:
+      - Phase 1-3 soak gates (OBSERVABLES.md OBS-imw-*)
+      - arch_map services/audit
+      - Session startup checks post-IMW activation
+    """
+    import json as _json_imw, os as _os_imw, time as _time_imw
+    metrics_path = "data/run/imw_metrics.json"
+    if not _os_imw.path.exists(metrics_path):
+        return _error("imw daemon not running (no metrics file)")
+    try:
+        age_sec = _time_imw.time() - _os_imw.path.getmtime(metrics_path)
+        if age_sec > 60:
+            return _error(f"imw metrics stale ({age_sec:.0f}s old)")
+        with open(metrics_path) as f:
+            snap = _json_imw.load(f)
+        snap["metrics_file_age_sec"] = round(age_sec, 1)
+        return _ok(snap)
+    except Exception as e:
+        return _error(f"imw metrics read: {e}")
+
+
+# ---------------------------------------------------------------------------
+# rFP_knowledge_pipeline_v2 KP-5 — /v4/search-pipeline/* endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/v4/search-pipeline/health")
+async def search_pipeline_health(request: Request):
+    """Combined snapshot of knowledge-pipeline backends + cache.
+
+    Reads data/knowledge_pipeline_health.json (written by knowledge_worker
+    + WebSearchHelper via HealthTracker) and merges cache stats from
+    data/search_cache.db. No live process query — both artefacts are
+    atomic-written so snapshot-at-rest is safe.
+    """
+    import json as _json_sp
+    import os as _os_sp
+    import time as _time_sp
+
+    health_path = "data/knowledge_pipeline_health.json"
+    cache_path = "data/search_cache.db"
+    out = {"ts": _time_sp.time(), "backends": {}, "cache": {},
+           "health_file_age_sec": None, "cache_file_age_sec": None}
+
+    # Backends
+    if _os_sp.path.exists(health_path):
+        try:
+            age = _time_sp.time() - _os_sp.path.getmtime(health_path)
+            out["health_file_age_sec"] = round(age, 1)
+            with open(health_path) as f:
+                data = _json_sp.load(f)
+            out["backends"] = data.get("backends", {}) or {}
+        except Exception as e:
+            out["health_file_error"] = str(e)[:200]
+
+    # Cache — ephemeral read-only instance
+    if _os_sp.path.exists(cache_path):
+        try:
+            out["cache_file_age_sec"] = round(
+                _time_sp.time() - _os_sp.path.getmtime(cache_path), 1)
+            from titan_plugin.logic.knowledge_cache import KnowledgeCache
+            _kc = KnowledgeCache(db_path=cache_path)
+            out["cache"] = _kc.stats()
+        except Exception as e:
+            out["cache_error"] = str(e)[:200]
+
+    return _ok(out)
+
+
+@router.get("/v4/search-pipeline/backend/{name}")
+async def search_pipeline_backend(name: str, request: Request):
+    """Per-backend detail slice — same data as /health, filtered to one."""
+    import json as _json_sp
+    import os as _os_sp
+
+    health_path = "data/knowledge_pipeline_health.json"
+    if not _os_sp.path.exists(health_path):
+        return _error("health file not present (knowledge_worker running?)")
+
+    try:
+        with open(health_path) as f:
+            data = _json_sp.load(f)
+    except Exception as e:
+        return _error(f"health file read: {e}")
+
+    backends = data.get("backends", {}) or {}
+    if name not in backends:
+        known = ", ".join(sorted(backends.keys())) or "(none)"
+        return _error(f"unknown backend: {name} — known: {known}")
+
+    entry = dict(backends[name])
+    # Cache slice — how many entries belong to this backend
+    cache_path = "data/search_cache.db"
+    entry["cache_entries"] = 0
+    if _os_sp.path.exists(cache_path):
+        try:
+            import sqlite3 as _sql_sp
+            conn = _sql_sp.connect(cache_path, timeout=2.0)
+            row = conn.execute(
+                "SELECT COUNT(*) FROM search_cache WHERE backend = ?",
+                (name,)).fetchone()
+            entry["cache_entries"] = int(row[0] or 0)
+            conn.close()
+        except Exception:
+            pass
+
+    return _ok(entry)
+
+
+@router.post("/v4/search-pipeline/budget-reset")
+async def search_pipeline_budget_reset(request: Request):
+    """Maker override — publishes SEARCH_PIPELINE_BUDGET_RESET to knowledge worker.
+
+    Body JSON: {"backend": "wiktionary"} OR {} for all backends.
+    Worker resets its in-memory counter + writes health.json atomically.
+    """
+    plugin = _get_plugin(request)
+    try:
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        backend = (body.get("backend") or "").strip()
+        from ..bus import make_msg
+        plugin.bus.publish(make_msg(
+            "SEARCH_PIPELINE_BUDGET_RESET", "api", "knowledge",
+            {"backend": backend,
+             "requested_at": int(__import__('time').time())},
+        ))
+        logger.info("[Dashboard] /v4/search-pipeline/budget-reset fired "
+                    "(backend=%s)", backend or "ALL")
+        return _ok({"queued": True, "backend": backend or "ALL"})
+    except Exception as e:
+        logger.error("[Dashboard] budget-reset error: %s", e)
+        return _error(str(e))
+
+
+@router.get("/v4/search-pipeline/learning")
+async def search_pipeline_learning(request: Request):
+    """rFP_knowledge_pipeline_v2 KP-8 — routing learner reputation snapshot.
+
+    Returns per (query_type, backend) reputation + n_attempts + success_rate
+    + avg_quality + n_usage. `warm: true` means the sample count has
+    crossed min_samples so reordering can act on this row; `warm: false`
+    means the backend is still in cold-start territory.
+    """
+    import os as _os_sp
+    db_path = "data/knowledge_routing_stats.db"
+    if not _os_sp.path.exists(db_path):
+        return _ok({"cold": True, "note": "no learner stats yet "
+                    "(knowledge_worker hasn't dispatched)",
+                    "by_query_type": {}})
+    try:
+        from titan_plugin.logic.knowledge_routing_learner import RoutingLearner
+        # Ephemeral read-only-ish instance; schema init is idempotent.
+        _rl = RoutingLearner(db_path=db_path, enabled=True)
+        return _ok(_rl.snapshot())
+    except Exception as e:
+        return _error(f"learner snapshot: {e}")
 
 
 @router.get("/v4/bus-health")
@@ -2304,71 +2636,60 @@ async def post_v4_vocabulary_update_learning(request: Request):
         now = __import__("time").time()
         db_path = "./data/inner_memory.db"
 
-        def _do_update(conn):
+        # READ via async connection (WAL, non-blocking)
+        def _do_read(conn):
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=5000")
-            # Check if word exists
-            existing = conn.execute(
+            return conn.execute(
                 "SELECT learning_phase, confidence FROM vocabulary WHERE word = ?",
                 (word,)).fetchone()
 
-            if existing:
-                cur_phase = existing[0] or "unlearned"
-                cur_conf = existing[1] or 0.0
+        existing = await sqlite_async.with_connection(db_path, _do_read)
 
-                # Only advance phase forward, never regress
-                if PHASE_ORDER.get(new_phase, 0) > PHASE_ORDER.get(cur_phase, 0):
-                    final_phase = new_phase
-                else:
-                    final_phase = cur_phase
+        # WRITE via IMW async client (routes per mode, non-blocking direct path)
+        from titan_plugin.persistence import get_client
+        _imw_dash = get_client(caller_name="dashboard.vocabulary")
 
-                # Build update
-                updates = ["learning_phase = ?", "last_encountered = ?"]
-                params = [final_phase, now]
-
-                if felt_tensor:
-                    updates.append("felt_tensor = ?")
-                    params.append(_json.dumps(felt_tensor))
-
-                if conf_delta != 0.0:
-                    updates.append("confidence = MIN(1.0, MAX(0.0, confidence + ?))")
-                    params.append(conf_delta)
-
-                if pass_type in ("feel", "recognize"):
-                    updates.append("times_encountered = times_encountered + 1")
-                if pass_type in ("produce", "self_speak"):
-                    updates.append("times_produced = times_produced + 1")
-
-                params.append(word)
-                conn.execute(
-                    f"UPDATE vocabulary SET {', '.join(updates)} WHERE word = ?",
-                    params)
-
-                new_conf = min(1.0, max(0.0, cur_conf + conf_delta))
-            else:
-                # Auto-create new word
-                conn.execute(
-                    "INSERT INTO vocabulary "
-                    "(word, word_type, stage, felt_tensor, hormone_pattern, "
-                    "confidence, times_encountered, times_produced, "
-                    "learning_phase, created_at, last_encountered) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (word, word_type, stage,
-                     _json.dumps(felt_tensor) if felt_tensor else None,
-                     _json.dumps(hormone_pattern) if hormone_pattern else None,
-                     max(0.0, conf_delta),  # Initial confidence from first pass
-                     1 if pass_type in ("feel", "recognize") else 0,
-                     1 if pass_type in ("produce", "self_speak") else 0,
-                     new_phase, now, now))
-
-                final_phase = new_phase
-                new_conf = max(0.0, conf_delta)
-
-            conn.commit()
-            return final_phase, new_conf, existing is None
-
-        final_phase, new_conf, created = await sqlite_async.with_connection(
-            db_path, _do_update)
+        if existing:
+            cur_phase = existing[0] or "unlearned"
+            cur_conf = existing[1] or 0.0
+            final_phase = (new_phase if PHASE_ORDER.get(new_phase, 0)
+                           > PHASE_ORDER.get(cur_phase, 0) else cur_phase)
+            updates = ["learning_phase = ?", "last_encountered = ?"]
+            params: list = [final_phase, now]
+            if felt_tensor:
+                updates.append("felt_tensor = ?")
+                params.append(_json.dumps(felt_tensor))
+            if conf_delta != 0.0:
+                updates.append("confidence = MIN(1.0, MAX(0.0, confidence + ?))")
+                params.append(conf_delta)
+            if pass_type in ("feel", "recognize"):
+                updates.append("times_encountered = times_encountered + 1")
+            if pass_type in ("produce", "self_speak"):
+                updates.append("times_produced = times_produced + 1")
+            params.append(word)
+            await _imw_dash.awrite(
+                f"UPDATE vocabulary SET {', '.join(updates)} WHERE word = ?",
+                params, table="vocabulary")
+            new_conf = min(1.0, max(0.0, cur_conf + conf_delta))
+        else:
+            await _imw_dash.awrite(
+                "INSERT INTO vocabulary "
+                "(word, word_type, stage, felt_tensor, hormone_pattern, "
+                "confidence, times_encountered, times_produced, "
+                "learning_phase, created_at, last_encountered) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (word, word_type, stage,
+                 _json.dumps(felt_tensor) if felt_tensor else None,
+                 _json.dumps(hormone_pattern) if hormone_pattern else None,
+                 max(0.0, conf_delta),
+                 1 if pass_type in ("feel", "recognize") else 0,
+                 1 if pass_type in ("produce", "self_speak") else 0,
+                 new_phase, now, now),
+                table="vocabulary")
+            final_phase = new_phase
+            new_conf = max(0.0, conf_delta)
+        created = existing is None
         return _ok({
             "word": word,
             "phase": final_phase,
@@ -3042,6 +3363,249 @@ async def get_v4_backup_verify(request: Request, backup_type: str = "personality
     except Exception as e:
         logger.error("[Dashboard] /v4/backup/verify error: %s", e)
         return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# rFP_backup_worker Phase 4 — Manual trigger + status + history
+# ---------------------------------------------------------------------------
+
+@router.post("/v4/backup/trigger")
+async def post_v4_backup_trigger(request: Request):
+    """Maker-forced backup — publishes BACKUP_TRIGGER_MANUAL to backup worker.
+
+    Body JSON: {"type": "personality"|"soul"|"timechain"} (default "personality")
+    """
+    plugin = _get_plugin(request)
+    try:
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        backup_type = (body.get("type") or "personality").lower()
+        if backup_type not in ("personality", "soul", "timechain"):
+            return _error(f"invalid type: {backup_type}")
+        from ..bus import make_msg
+        plugin.bus.publish(make_msg(
+            "BACKUP_TRIGGER_MANUAL", "api", "backup",
+            {"type": backup_type, "requested_at": int(__import__('time').time())},
+        ))
+        logger.info("[Dashboard] /v4/backup/trigger fired type=%s", backup_type)
+        return _ok({"queued": True, "type": backup_type,
+                    "note": "Check /v4/backup/history or logs for result (runs async)"})
+    except Exception as e:
+        logger.error("[Dashboard] /v4/backup/trigger error: %s", e)
+        return _error(str(e))
+
+
+@router.get("/v4/backup/status")
+async def get_v4_backup_status(request: Request):
+    """Backup health summary: last successful per type, master invariant, mode."""
+    plugin = _get_plugin(request)
+    try:
+        import os as _os, time as _time, json as _json
+        from pathlib import Path as _Path
+        backup = getattr(plugin, 'backup', None)
+        cfg_backup = {}
+        try:
+            from titan_plugin.config_loader import load_titan_config
+            _cfg = load_titan_config()
+            cfg_backup = _cfg.get("backup", {}) or {}
+        except Exception:
+            _cfg = {}
+        mode = (cfg_backup.get("mode") or "").strip().lower()
+        if not mode:
+            try:
+                kp = _cfg.get("network", {}).get("wallet_keypair_path", "")
+                budget = _cfg.get("mainnet_budget", {}).get(
+                    "backup_arweave_enabled", False)
+                kp_ok = kp and _os.path.exists(kp)
+                mode = "mainnet_arweave" if (kp_ok and budget) else "local_only"
+            except Exception:
+                mode = "unknown"
+        result = {"mode": mode, "records": {}, "master_invariant_ok": True}
+        now = _time.time()
+        # Read records from disk (subprocess writes here; plugin.backup may be None)
+        rec_dir = _Path("data/backup_records")
+        for btype in ("personality", "soul_package"):
+            rec = None
+            if backup:
+                try:
+                    rec = backup.get_latest_backup_record(btype)
+                except Exception:
+                    rec = None
+            if rec is None and rec_dir.exists():
+                files = sorted(rec_dir.glob(f"{btype}_*.json"), reverse=True)
+                if files:
+                    try:
+                        with open(files[0]) as f:
+                            rec = _json.load(f)
+                    except Exception:
+                        rec = None
+            if rec:
+                age_h = (now - float(rec.get("uploaded_at", now))) / 3600.0
+                result["records"][btype] = {
+                    "arweave_tx": rec.get("arweave_tx"),
+                    "size_mb": rec.get("size_mb"),
+                    "age_hours": round(age_h, 1),
+                }
+                if btype == "personality" and age_h > 30:
+                    result["master_invariant_ok"] = False
+                    result["master_invariant_reason"] = \
+                        f"personality age {age_h:.1f}h > 30h"
+        local_dir = cfg_backup.get("local_dir", "data/backups")
+        result["local_snapshots"] = _count_local_snapshots(local_dir)
+        result["local_dir"] = local_dir
+        dry_path = "data/backup_dry_run_result.json"
+        if _os.path.exists(dry_path):
+            try:
+                with open(dry_path) as f:
+                    result["last_dry_run"] = _json.load(f)
+            except Exception:
+                pass
+        # Phase 9 — offhost mirror status (T1 only: others show disabled)
+        try:
+            from titan_plugin.logic.offhost_mirror import OffhostMirror
+            result["mirror"] = OffhostMirror(_cfg).status()
+        except Exception as e:
+            logger.debug("[Dashboard] mirror status skipped: %s", e)
+        return _ok(result)
+    except Exception as e:
+        logger.error("[Dashboard] /v4/backup/status error: %s", e)
+        return _error(str(e))
+
+
+@router.get("/v4/backup/history")
+async def get_v4_backup_history(request: Request, backup_type: str = "personality",
+                                 limit: int = 50):
+    """Return last N backup records for given type (from data/backup_records/)."""
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        rec_dir = _Path("data/backup_records")
+        if not rec_dir.exists():
+            return _ok({"records": [], "count": 0})
+        files = sorted(rec_dir.glob(f"{backup_type}_*.json"), reverse=True)[:limit]
+        records = []
+        for f in files:
+            try:
+                with open(f) as rf:
+                    records.append(_json.load(rf))
+            except Exception:
+                continue
+        return _ok({"records": records, "count": len(records),
+                    "backup_type": backup_type})
+    except Exception as e:
+        logger.error("[Dashboard] /v4/backup/history error: %s", e)
+        return _error(str(e))
+
+
+@router.get("/v4/backup/wallet-runway")
+async def get_v4_backup_wallet_runway(request: Request):
+    """rFP I6 — Irys deposit + estimated days of runway at current spend rate."""
+    try:
+        import os as _os, subprocess as _sp, json as _json
+        from titan_plugin.config_loader import load_titan_config
+        cfg = load_titan_config()
+        kp = cfg.get("network", {}).get("wallet_keypair_path", "")
+        if not kp or not _os.path.exists(kp):
+            return _ok({"available": False, "reason": "no_keypair"})
+        try:
+            npm_root = _sp.check_output(
+                ["npm", "root", "-g"], timeout=10).decode().strip()
+        except Exception:
+            npm_root = "/usr/lib/node_modules"
+        try:
+            out = _sp.check_output(
+                ["node", "scripts/irys_upload.js", "balance", kp,
+                 "https://api.mainnet-beta.solana.com"],
+                env={**_os.environ, "NODE_PATH": npm_root},
+                timeout=30,
+            )
+            data = _json.loads(out.decode())
+        except Exception as e:
+            return _error(f"irys_balance_failed: {e}")
+        sol = float(data.get("balance_readable", 0))
+        daily_est = 0.015  # shrink-daily applied — ~35MB daily + weekly soul amortized
+        days_runway = sol / daily_est if daily_est > 0 else 9999
+        if days_runway > 30:
+            tier = "green"
+        elif days_runway > 7:
+            tier = "yellow"
+        elif days_runway > 1:
+            tier = "orange"
+        else:
+            tier = "red"
+        return _ok({
+            "available": True,
+            "irys_sol": round(sol, 6),
+            "daily_est_sol": daily_est,
+            "days_runway": round(days_runway, 1),
+            "tier": tier,
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/backup/wallet-runway error: %s", e)
+        return _error(str(e))
+
+
+@router.get("/v4/backup/manifest")
+async def get_v4_backup_manifest(request: Request):
+    """Return per-Titan Arweave manifest (arweave_manifest_{titan_id}.json)."""
+    try:
+        import os as _os, json as _json
+        from titan_plugin.logic.timechain_backup import _manifest_path
+        titan_id = "T1"
+        try:
+            from titan_plugin.config_loader import load_titan_config
+            titan_id = load_titan_config().get("info_banner", {}).get(
+                "titan_id", "T1")
+        except Exception:
+            pass
+        if _os.path.exists("data/titan_identity.json"):
+            with open("data/titan_identity.json") as f:
+                titan_id = _json.load(f).get("titan_id", titan_id)
+        path = _manifest_path(titan_id)
+        if not _os.path.exists(path):
+            return _ok({"manifest": None, "path": path, "exists": False})
+        with open(path) as f:
+            data = _json.load(f)
+        data["_manifest_path"] = path
+        return _ok(data)
+    except Exception as e:
+        logger.error("[Dashboard] /v4/backup/manifest error: %s", e)
+        return _error(str(e))
+
+
+def _count_local_snapshots(local_dir: str) -> dict:
+    """Count local snapshots per type + total size.
+
+    Only files matching our naming convention ({type}_{date}_{hash12}.tar.{gz,zst})
+    are counted. Pre-existing archives from other tools in data/backups/ are
+    ignored by both count and total_mb so the metric reflects rFP-managed state
+    only. Foreign files are surfaced in `foreign_mb` for observability.
+    """
+    from pathlib import Path as _Path
+    counts = {"personality": 0, "soul": 0, "timechain": 0,
+              "total_mb": 0.0, "foreign_mb": 0.0}
+    p = _Path(local_dir)
+    if not p.exists():
+        return counts
+    for f in list(p.glob("*.tar.gz")) + list(p.glob("*.tar.zst")):
+        sz_mb = f.stat().st_size / 1024 / 1024
+        if f.name.startswith("personality_"):
+            counts["personality"] += 1
+            counts["total_mb"] += sz_mb
+        elif f.name.startswith("soul_"):
+            counts["soul"] += 1
+            counts["total_mb"] += sz_mb
+        elif f.name.startswith("timechain_"):
+            counts["timechain"] += 1
+            counts["total_mb"] += sz_mb
+        else:
+            counts["foreign_mb"] += sz_mb
+    counts["total_mb"] = round(counts["total_mb"], 1)
+    counts["foreign_mb"] = round(counts["foreign_mb"], 1)
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -4323,6 +4887,176 @@ async def get_v4_meta_cgn(request: Request):
         return _error(str(e))
 
 
+# ---------------------------------------------------------------------------
+# GET /v4/meta-service — F-phase Meta-Reasoning Consumer Service status
+# ---------------------------------------------------------------------------
+@router.get("/v4/meta-service")
+async def get_v4_meta_service(request: Request):
+    """Meta-reasoning consumer service telemetry (rFP §11.1).
+
+    Exposes queue depth, cache hit rate, rate-limit events, per-consumer
+    request/outcome volumes, signed outcome averages, recruitment catalog
+    health, α-ramp state, and dynamic-reward accumulator stats.
+
+    Session 1 ships with α=0.0 hard-wired (alpha_ramp_enabled=false) and
+    all requests resolve with failure_mode="not_yet_implemented" —
+    requests_dry_run_resolved is the active counter during Session 1 soak.
+    """
+    plugin = _get_plugin(request)
+    try:
+        spirit_proxy = plugin._proxies.get("spirit")
+        if not spirit_proxy:
+            return _ok({"error": "Spirit proxy not available"})
+        coordinator = await _get_cached_coordinator_async(plugin)
+        status = coordinator.get("meta_service", {})
+        if not status:
+            return _ok({"status": "meta_service not initialized "
+                                   "(expected at boot — retry in 5s)"})
+        return _ok(status)
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-service error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# GET /v4/meta-service/queue — live queue state (rFP §11.1)
+# ---------------------------------------------------------------------------
+@router.get("/v4/meta-service/queue")
+async def get_v4_meta_service_queue(request: Request):
+    """Live queue depth + backpressure state — rFP §11.1 endpoint 2."""
+    plugin = _get_plugin(request)
+    try:
+        coordinator = await _get_cached_coordinator_async(plugin)
+        status = coordinator.get("meta_service", {}) or {}
+        return _ok({
+            "queue_depth": status.get("queue_depth", 0),
+            "pending_requests": status.get("pending_requests", 0),
+            "queue_max_depth": status.get("queue_max_depth", 0),
+            "backpressure_threshold": status.get(
+                "backpressure_threshold", 0),
+            "backpressure_events":
+                (status.get("counters") or {}).get("backpressure_events", 0),
+            "queue_overflows":
+                (status.get("counters") or {}).get("queue_overflows", 0),
+            "rate_limited":
+                (status.get("counters") or {}).get("rate_limited", 0),
+            "per_consumer_requests_per_min":
+                status.get("per_consumer_requests_per_min", 0),
+            "global_requests_per_min": status.get("global_requests_per_min", 0),
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-service/queue error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# GET /v4/meta-service/recruitment — recruitment statistics (rFP §11.1)
+# ---------------------------------------------------------------------------
+@router.get("/v4/meta-service/recruitment")
+async def get_v4_meta_service_recruitment(request: Request):
+    """Recruitment Layer catalog health + β-posterior selector stats.
+    Closes rFP §11.1 observability — visibility into which recruiters
+    get selected per (primitive, sub_mode) tuple, their evolving
+    posterior mean, and catalog coverage."""
+    plugin = _get_plugin(request)
+    try:
+        coordinator = await _get_cached_coordinator_async(plugin)
+        status = coordinator.get("meta_service", {}) or {}
+        recruitment = status.get("recruitment") or {}
+        return _ok({
+            "posterior_tuples_tracked": recruitment.get(
+                "posterior_tuples_tracked", 0),
+            "resolvers_registered": recruitment.get(
+                "resolvers_registered", []),
+            "stale_recruiter_count": recruitment.get(
+                "stale_recruiter_count", 0),
+            "top_fired": recruitment.get("top_fired", []),
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-service/recruitment error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# GET /v4/meta-service/rewards — dynamic reward state + α ramp (rFP §11.1)
+# ---------------------------------------------------------------------------
+@router.get("/v4/meta-service/rewards")
+async def get_v4_meta_service_rewards(request: Request):
+    """Signed-outcome accumulator stats + α-ramp progression + per-consumer
+    positive/negative rate. Teaching-signal visibility during Session 2+ soak
+    (negative outcomes teach meta what NOT to do per rFP §4.6)."""
+    plugin = _get_plugin(request)
+    try:
+        coordinator = await _get_cached_coordinator_async(plugin)
+        status = coordinator.get("meta_service", {}) or {}
+        rewards = status.get("rewards") or {}
+        return _ok({
+            "alpha_ramp_enabled": rewards.get("alpha_ramp_enabled", False),
+            "current_alpha": rewards.get("current_alpha", 0.0),
+            "current_phase": rewards.get("current_phase", "disabled"),
+            "phase_boundaries": rewards.get("phase_boundaries", []),
+            "total_outcomes": rewards.get("total_outcomes", 0),
+            "tuples_tracked": rewards.get("tuples_tracked", 0),
+            "cold_start_n": rewards.get("cold_start_n", 10),
+            "top_by_count": rewards.get("top_by_count", []),
+            "per_consumer_negative_rate": rewards.get(
+                "per_consumer_negative_rate", {}),
+            "per_consumer_positive_rate": rewards.get(
+                "per_consumer_positive_rate", {}),
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-service/rewards error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# GET /v4/meta-service/timechain — TimeChain query telemetry (rFP §11.1)
+# ---------------------------------------------------------------------------
+@router.get("/v4/meta-service/timechain")
+async def get_v4_meta_service_timechain(request: Request):
+    """TimeChain query stats — per-primitive volume, avg latency, embedding
+    index freshness, block-hit rate for SIMILAR. rFP §9 Upgrade F telemetry
+    surface. Session 2 ships counters at 0 (chain execution lands Session 3);
+    SIMILAR index freshness + FAISS status still visible."""
+    plugin = _get_plugin(request)
+    try:
+        coordinator = await _get_cached_coordinator_async(plugin)
+        tc = coordinator.get("timechain", {}) or {}
+        meta_status = coordinator.get("meta_service", {}) or {}
+        # Pull per-query-type counters from meta_service stats if exposed;
+        # otherwise default to 0-valued shell so the endpoint is honest about
+        # not-yet-sending state. Session 3 plugs real per-primitive counters.
+        _faiss_path = "data/timechain/embedding_index.faiss"
+        import os as _os
+        _faiss_exists = _os.path.exists(_faiss_path)
+        try:
+            _faiss_mtime = _os.path.getmtime(_faiss_path) if _faiss_exists \
+                           else 0.0
+        except OSError:
+            _faiss_mtime = 0.0
+        return _ok({
+            "per_primitive": {
+                "TIMECHAIN_RECALL":   {"sent": 0, "avg_latency_ms": 0},
+                "TIMECHAIN_CHECK":    {"sent": 0, "avg_latency_ms": 0},
+                "TIMECHAIN_COMPARE":  {"sent": 0, "avg_latency_ms": 0},
+                "TIMECHAIN_AGGREGATE": {"sent": 0, "avg_latency_ms": 0},
+                "TIMECHAIN_SIMILAR":  {"sent": 0, "avg_latency_ms": 0},
+            },
+            "rate_limit_per_min": 200,
+            "block_hit_rate_similar": 0.0,
+            "faiss_index_path": _faiss_path,
+            "faiss_index_exists": _faiss_exists,
+            "faiss_index_mtime": round(_faiss_mtime, 0),
+            "timechain_chain_blocks":
+                (tc.get("blocks") if isinstance(tc, dict) else 0) or 0,
+            "note": ("Session 2 ships telemetry endpoint shell; chain "
+                     "execution + real TimeChain sender lands Session 3."),
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-service/timechain error: %s", e)
+        return _error(str(e))
+
+
 @router.get("/v4/meta-cgn/graduation-readiness")
 async def get_v4_meta_cgn_graduation_readiness(request: Request):
     """Detailed blockers view — what's preventing META-CGN graduation?"""
@@ -4403,6 +5137,395 @@ async def get_v4_meta_cgn_disagreements(request: Request,
         return _ok({"disagreements": events, "count": len(events)})
     except Exception as e:
         logger.error("[Dashboard] /v4/meta-cgn/disagreements error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# EMOT-CGN endpoints (rFP_emot_cgn_v2.md)
+# ---------------------------------------------------------------------------
+def _emot_cgn_data_dir():
+    """Resolve project-root-relative data/emot_cgn/ path."""
+    import os as _os
+    return _os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.dirname(__file__))),
+        "data", "emot_cgn")
+
+
+def _read_json_safe(path):
+    import os as _os
+    import json as _json
+    try:
+        if not _os.path.exists(path):
+            return None
+        with open(path) as f:
+            return _json.load(f)
+    except Exception:
+        return None
+
+
+@router.get("/v4/emot-cgn")
+async def get_v4_emot_cgn(request: Request):
+    """EMOT-CGN current state — grounding + watchdog + cluster summary.
+
+    Phase 1.6f.2: prefer ShmEmotReader (worker-backed, sub-ms-fresh)
+    for hot fields (dominant/V_blended/cluster/total_updates); fall back
+    to disk-JSON reads for fields not in shm (per-primitive grounding,
+    cluster details, graduation config). Both available → shm authoritative.
+    """
+    import os as _os
+    try:
+        d = _emot_cgn_data_dir()
+        grounding = _read_json_safe(_os.path.join(d, "primitive_grounding.json")) or {}
+        watchdog = _read_json_safe(_os.path.join(d, "watchdog_state.json")) or {}
+        clusters = _read_json_safe(_os.path.join(d, "clusters_state.json")) or {}
+        # Try shm for sub-ms-fresh hot-path fields (worker-backed)
+        shm_state = None
+        try:
+            from titan_plugin.logic.emot_shm_protocol import ShmEmotReader
+            from titan_plugin.logic.emotion_cluster import EMOT_PRIMITIVES
+            shm_state = ShmEmotReader().read_state()
+        except Exception:
+            shm_state = None
+        # Compact primitive summary (from disk)
+        prims = grounding.get("primitives", {}) or {}
+        prims_summary = {
+            p_id: {
+                "V": round(float(p.get("V", 0.5)), 3),
+                "confidence": round(float(p.get("confidence", 0.0)), 3),
+                "n_samples": int(p.get("n_samples", 0)),
+            }
+            for p_id, p in prims.items()
+        }
+        cluster_summary = {
+            p_id: {
+                "label": c.get("label", p_id),
+                "n_observations": int(c.get("n_observations", 0)),
+                "emerged": bool(c.get("is_emerged", False)),
+                "mean_assignment_distance": round(
+                    float(c.get("mean_assignment_distance", 0.0)), 4),
+            }
+            for p_id, c in (clusters.get("clusters", {}) or {}).items()
+        }
+        # Hot-path fields: shm if available, else fall back to disk
+        if shm_state:
+            hot = {
+                "status": watchdog.get("status", "shadow_mode"),
+                "is_active": bool(shm_state.get("is_active")),
+                "dominant": EMOT_PRIMITIVES[shm_state["dominant_idx"]],
+                "dominant_V_beta": round(shm_state.get("V_beta", 0.5), 4),
+                "dominant_V_blended": round(shm_state.get("V_blended", 0.5), 4),
+                "cluster_confidence": round(shm_state.get("cluster_confidence", 0.0), 4),
+                "total_updates": int(shm_state.get("total_updates", 0)),
+                "cross_insights_sent": int(shm_state.get("cross_insights_sent", 0)),
+                "cross_insights_received": int(shm_state.get("cross_insights_received", 0)),
+                "source": "shm",
+                "shm_version": int(shm_state.get("version", 0)),
+            }
+        else:
+            hot = {
+                "status": watchdog.get("status", "shadow_mode"),
+                "total_updates": int(grounding.get("total_updates", 0)),
+                "total_observations": int(grounding.get("total_observations", 0)),
+                "source": "disk",
+            }
+        # v3 dual view (rFP §19): expose native-first bundle alongside
+        # legacy primitives. Consumers can read either; Observatory shows
+        # legacy_approximation in the main UI during transition.
+        v3_view = None
+        try:
+            from titan_plugin.logic.emot_bundle_protocol import (
+                read_full_emotion_context)
+            _v3 = read_full_emotion_context()
+            if _v3 is not None:
+                v3_view = {
+                    "region_id": int(_v3["region_id"]),
+                    "region_signature": int(_v3["region_signature"]),
+                    "region_confidence": round(
+                        float(_v3["region_confidence"]), 3),
+                    "region_residence_s": round(
+                        float(_v3["region_residence_s"]), 1),
+                    "regions_emerged": int(_v3["regions_emerged"]),
+                    "valence": round(float(_v3["valence"]), 3),
+                    "arousal": round(float(_v3["arousal"]), 3),
+                    "novelty": round(float(_v3["novelty"]), 3),
+                    "legacy_approximation": _v3["legacy_label"],
+                    "graduation_status": int(_v3["graduation_status"]),
+                    "encoder_id": int(_v3["encoder_id"]),
+                    "version": int(_v3["version"]),
+                    "ts_ms": int(_v3["ts_ms"]),
+                }
+        except Exception:
+            v3_view = None
+        response = {
+            **hot,
+            "graduation_progress": int(watchdog.get("graduation_progress", 0)),
+            "rolled_back_count": int(watchdog.get("rolled_back_count", 0)),
+            "primitives": prims_summary,
+            "clusters": cluster_summary,
+            "recent_assignments": clusters.get("recent_assignments", []),
+            "saved_ts": grounding.get("saved_ts"),
+        }
+        if v3_view is not None:
+            response["v3"] = v3_view
+        return _ok(response)
+    except Exception as e:
+        logger.error("[Dashboard] /v4/emot-cgn error: %s", e)
+        return _error(str(e))
+
+
+@router.get("/v4/emot-cgn/graduation-readiness")
+async def get_v4_emot_cgn_graduation_readiness(request: Request):
+    """Show all 7 graduation criteria + eligibility."""
+    import os as _os
+    try:
+        d = _emot_cgn_data_dir()
+        grounding = _read_json_safe(_os.path.join(d, "primitive_grounding.json")) or {}
+        haov = _read_json_safe(_os.path.join(d, "haov_hypotheses.json")) or {}
+        watchdog = _read_json_safe(_os.path.join(d, "watchdog_state.json")) or {}
+        from titan_plugin.params import get_params as _gp
+        cfg = _gp("emot_cgn") or {}
+        total_updates = int(grounding.get("total_updates", 0))
+        min_updates = int(cfg.get("graduation_min_updates", 4000))
+        hypotheses = haov.get("hypotheses", {}) or {}
+        confirmed = sum(1 for h in hypotheses.values()
+                        if h.get("status") == "confirmed")
+        min_confirmed = int(cfg.get("graduation_min_confirmed_hypotheses", 4))
+        min_confidence = float(cfg.get("graduation_min_confidence", 0.7))
+        min_samples = int(cfg.get("graduation_min_samples_per_primitive", 100))
+        min_mature = int(cfg.get("graduation_min_mature_primitives", 6))
+        prims = grounding.get("primitives", {}) or {}
+        mature = sum(1 for p in prims.values()
+                     if int(p.get("n_samples", 0)) >= min_samples
+                     and float(p.get("confidence", 0.0)) >= min_confidence)
+        v_vals = sorted((float(p.get("V", 0.5)) for p in prims.values()),
+                        reverse=True)
+        contrast = (v_vals[0] - v_vals[-1]) if v_vals else 0.0
+        min_contrast = float(cfg.get("graduation_contrast_v_gap", 0.15))
+        elapsed = (float(grounding.get("saved_ts") or 0)
+                   - float(grounding.get("creation_ts") or 0))
+        min_elapsed = float(cfg.get("graduation_observation_window_s", 1209600))
+        return _ok({
+            "status": watchdog.get("status", "shadow_mode"),
+            "eligible": bool(
+                total_updates >= min_updates
+                and confirmed >= min_confirmed
+                and mature >= min_mature
+                and contrast >= min_contrast
+                and elapsed >= min_elapsed),
+            "criteria": {
+                "updates": {"current": total_updates, "required": min_updates,
+                            "ok": total_updates >= min_updates},
+                "confirmed_hypotheses": {
+                    "current": confirmed, "required": min_confirmed,
+                    "ok": confirmed >= min_confirmed},
+                "mature_primitives": {
+                    "current": mature, "required": min_mature,
+                    "ok": mature >= min_mature},
+                "contrast_v_gap": {
+                    "current": round(contrast, 3), "required": min_contrast,
+                    "ok": contrast >= min_contrast},
+                "observation_window_s": {
+                    "current": round(elapsed, 0), "required": min_elapsed,
+                    "ok": elapsed >= min_elapsed},
+            },
+            "graduation_progress": int(watchdog.get("graduation_progress", 0)),
+            "rolled_back_count": int(watchdog.get("rolled_back_count", 0)),
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/emot-cgn/graduation-readiness error: %s", e)
+        return _error(str(e))
+
+
+def _emot_cgn_bundle_snapshot():
+    """Introspect the current shm bundle and summarize per-field-group.
+
+    Reports nonzero count / mean / std / min / max for each of the 9
+    dimensional field groups + current scalar derived fields. Used by
+    /v4/emot-cgn/audit to diagnose producer-wiring gaps without needing
+    a worker restart (rFP §23.6+ diagnostic endpoint, A3).
+    """
+    import os as _os
+    try:
+        # Resolve titan_id to pick the right shm path.
+        titan_id = "T1"
+        _tid_path = _os.path.join(
+            _os.path.dirname(_os.path.dirname(_os.path.dirname(__file__))),
+            "data", "titan_identity.json")
+        if _os.path.exists(_tid_path):
+            import json as _j
+            with open(_tid_path) as _f:
+                titan_id = _j.load(_f).get("titan_id", "T1")
+        from titan_plugin.logic.emot_bundle_protocol import (
+            BundleReader, default_bundle_path)
+        import numpy as _np
+        reader = BundleReader(default_bundle_path(titan_id))
+        b = reader.read()
+        if b is None:
+            return {"available": False, "titan_id": titan_id}
+        groups = [
+            ("felt_tensor", "felt_tensor"),
+            ("trajectory", "trajectory"),
+            ("space_topology", "space_topology"),
+            ("neuromod_state", "neuromod_state"),
+            ("hormone_levels", "hormone_levels"),
+            ("ns_urgencies", "ns_urgencies"),
+            ("cgn_beta_states", "cgn_beta_states"),
+            ("msl_activations", "msl_activations"),
+            ("pi_phase", "pi_phase"),
+        ]
+        field_groups = {}
+        for name, key in groups:
+            arr = _np.asarray(b.get(key) or [], dtype=_np.float32)
+            if arr.size == 0:
+                field_groups[name] = {"size": 0, "nonzero": 0}
+                continue
+            nz = int((arr != 0).sum())
+            field_groups[name] = {
+                "size": int(arr.size),
+                "nonzero": nz,
+                "nonzero_pct": round(100.0 * nz / arr.size, 1),
+                "mean": round(float(arr.mean()), 4),
+                "std": round(float(arr.std()), 4),
+                "min": round(float(arr.min()), 4),
+                "max": round(float(arr.max()), 4),
+            }
+        # Heuristic: group is "dead" if <10% of dims have nonzero variance
+        # (all-same values look zero-variance; all-zero is the common case).
+        dead_groups = [n for n, g in field_groups.items()
+                       if g.get("std", 0.0) < 1e-6 and g.get("size", 0) > 0]
+        return {
+            "available": True,
+            "titan_id": titan_id,
+            "version": b.get("version"),
+            "schema_version": b.get("schema_version"),
+            "encoder_id": b.get("encoder_id"),
+            "region_id": b.get("region_id"),
+            "regions_emerged": b.get("regions_emerged"),
+            "region_confidence": round(float(b.get("region_confidence", 0.0)), 4),
+            "region_residence_s": round(float(b.get("region_residence_s", 0.0)), 1),
+            "valence": round(float(b.get("valence", 0.0)), 4),
+            "arousal": round(float(b.get("arousal", 0.0)), 4),
+            "novelty": round(float(b.get("novelty", 0.0)), 4),
+            "legacy_label": b.get("legacy_label"),
+            "graduation_status": b.get("graduation_status"),
+            "field_groups": field_groups,
+            "dead_groups": dead_groups,  # zero-variance slots — likely wiring gaps
+        }
+    except Exception as _e:
+        return {"available": False, "error": str(_e)}
+
+
+@router.get("/v4/emot-cgn/audit")
+async def get_v4_emot_cgn_audit(request: Request):
+    """Extended observability — primitives + HAOV + clusters + shadow log tail
+    + live bundle snapshot + region telemetry (rFP §23.6+ diagnostic).
+
+    The bundle_snapshot section diagnoses producer-wiring gaps at a glance:
+    any group in `dead_groups` has zero variance in the current bundle,
+    meaning its producer either hasn't fired yet or isn't wired. Useful
+    for validating Phase A commits and for catching future silent wiring
+    regressions without a worker restart.
+    """
+    import os as _os
+    import json as _json
+    try:
+        d = _emot_cgn_data_dir()
+        grounding = _read_json_safe(_os.path.join(d, "primitive_grounding.json")) or {}
+        haov = _read_json_safe(_os.path.join(d, "haov_hypotheses.json")) or {}
+        clusters = _read_json_safe(_os.path.join(d, "clusters_state.json")) or {}
+        watchdog = _read_json_safe(_os.path.join(d, "watchdog_state.json")) or {}
+        regions_state = _read_json_safe(_os.path.join(d, "regions_state.json")) or {}
+        # Tail of shadow-mode log (last 20 lines)
+        shadow_path = _os.path.join(d, "shadow_mode_log.jsonl")
+        tail = []
+        if _os.path.exists(shadow_path):
+            with open(shadow_path) as f:
+                lines = f.readlines()[-20:]
+            for l in lines:
+                try:
+                    tail.append(_json.loads(l))
+                except Exception:
+                    continue
+        # Recluster telemetry (populated by A4 — empty until worker restart).
+        telemetry_path = _os.path.join(d, "recluster_telemetry.jsonl")
+        recluster_tail = []
+        if _os.path.exists(telemetry_path):
+            with open(telemetry_path) as f:
+                lines = f.readlines()[-5:]
+            for l in lines:
+                try:
+                    recluster_tail.append(_json.loads(l))
+                except Exception:
+                    continue
+        # Summary of persisted regions (shape, core_distance, n_obs).
+        regions_summary = []
+        for rid_str, r in (regions_state.get("regions") or {}).items():
+            regions_summary.append({
+                "region_id": int(rid_str),
+                "signature": r.get("signature"),
+                "core_distance": r.get("core_distance"),
+                "n_observations": r.get("n_observations"),
+                "label": r.get("label") or "",
+                "centroid_dim": len(r.get("centroid") or []),
+            })
+        return _ok({
+            "grounding": grounding,
+            "haov": haov,
+            "clusters": clusters,
+            "watchdog": watchdog,
+            "shadow_tail": tail,
+            # A3 diagnostic additions:
+            "bundle_snapshot": _emot_cgn_bundle_snapshot(),
+            "regions_summary": regions_summary,
+            "recluster_tail": recluster_tail,
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/emot-cgn/audit error: %s", e)
+        return _error(str(e))
+
+
+@router.post("/v4/emot-cgn/force-graduate")
+async def post_v4_emot_cgn_force_graduate(request: Request):
+    """Operator override: force graduation regardless of criteria.
+
+    WARNING: bypasses philosophical-correctness gate. Use only if you
+    understand the risk of prematurely graduated emotion grounding
+    influencing downstream consumers with poorly-differentiated clusters.
+    """
+    try:
+        plugin = _get_plugin(request)
+        coordinator = await _get_cached_coordinator_async(plugin)
+        # For v1 this endpoint records operator intent — next chain
+        # conclude, meta_reasoning._emot_cgn can inspect a pending-
+        # override flag. Minimal v1: write a flag file that
+        # EmotCGNConsumer can pick up on next save_state.
+        import os as _os
+        d = _emot_cgn_data_dir()
+        _os.makedirs(d, exist_ok=True)
+        flag_path = _os.path.join(d, "_pending_force_graduate.flag")
+        with open(flag_path, "w") as f:
+            f.write(str(time.time()))
+        return _ok({"accepted": True,
+                    "note": "force_graduate flag set — will apply on next chain conclude"})
+    except Exception as e:
+        logger.error("[Dashboard] /v4/emot-cgn/force-graduate error: %s", e)
+        return _error(str(e))
+
+
+@router.post("/v4/emot-cgn/force-shadow")
+async def post_v4_emot_cgn_force_shadow(request: Request):
+    """Operator override: force EMOT-CGN back to shadow mode."""
+    try:
+        import os as _os
+        d = _emot_cgn_data_dir()
+        _os.makedirs(d, exist_ok=True)
+        flag_path = _os.path.join(d, "_pending_force_shadow.flag")
+        with open(flag_path, "w") as f:
+            f.write(str(time.time()))
+        return _ok({"accepted": True,
+                    "note": "force_shadow flag set — will apply on next chain conclude"})
+    except Exception as e:
+        logger.error("[Dashboard] /v4/emot-cgn/force-shadow error: %s", e)
         return _error(str(e))
 
 
@@ -4846,6 +5969,63 @@ async def get_v4_arc_status(request: Request):
     return _ok(data)
 
 
+# ---------------------------------------------------------------------------
+# POST /v4/arc/goal-ingest — cross-Titan goal broadcast receiver
+# ---------------------------------------------------------------------------
+# rFP_arc_training_fix Step C (2026-04-20). When a kin Titan captures its first
+# WIN on a game, it POSTs the goal grid here so this Titan's G1 similarity
+# reward activates without needing its own win. Ping-pong guarded by
+# source_titan_id field — if we authored the broadcast, drop it.
+
+@router.post("/v4/arc/goal-ingest")
+async def post_v4_arc_goal_ingest(request: Request):
+    """Accept a goal grid from a kin Titan and write it to local
+    data/arc_agi_3/goal_grids.json. Best-effort; no error surfaces to
+    caller because kin broadcast is fire-and-forget."""
+    try:
+        payload = await request.json()
+    except Exception:
+        return _error("invalid JSON", 400)
+    game_id = payload.get("game_id")
+    grid_data = payload.get("grid")
+    shape = payload.get("shape")
+    source = payload.get("source_titan_id", "unknown")
+    captured_at = payload.get("captured_at_utc")
+    if not game_id or grid_data is None:
+        return _error("missing game_id or grid", 400)
+
+    # Ping-pong guard — reject self-broadcast (we're already the source).
+    self_id = os.environ.get("TITAN_KIN_SOURCE", "")
+    if self_id and source == self_id:
+        return _ok({"ingested": False, "reason": "self_broadcast"})
+
+    try:
+        import numpy as _np
+        from titan_plugin.logic.arc.goal_detector import GoalDetector
+        grid = _np.array(grid_data, dtype=_np.int8)
+        if shape:
+            try:
+                grid = grid.reshape(tuple(shape))
+            except Exception:
+                pass
+        gd = GoalDetector()
+        ok_ingested = gd.ingest_kin_goal(
+            game_id=game_id,
+            grid=grid,
+            source_titan_id=source,
+            captured_at_utc=captured_at,
+        )
+        return _ok({
+            "ingested": bool(ok_ingested),
+            "game_id": game_id,
+            "source": source,
+            "shape": list(grid.shape),
+        })
+    except Exception as e:
+        logger.warning("[ARC] goal-ingest failed: %s", e)
+        return _error(f"ingest failed: {e}", 500)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # KIN DISCOVERY & CONSCIOUSNESS EXCHANGE
 # ═══════════════════════════════════════════════════════════════════
@@ -5004,37 +6184,43 @@ async def kin_exchange(request: Request):
                         encounter_count INTEGER DEFAULT 0, avg_resonance REAL DEFAULT 0.0,
                         great_kin_pulses INTEGER DEFAULT 0, relationship_label TEXT);
                 """)
-                conn.execute(
-                    "INSERT INTO kin_encounters "
-                    "(timestamp, kin_pubkey, resonance, my_emotion, kin_emotion, "
-                    "exchange_type, epoch_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (_rx_now, kin_pubkey, round(resonance_score, 4), my_emotion,
-                     kin_emotion, "received", _rx_epoch))
-                existing = conn.execute(
+                # READ via async (profile lookup)
+                return conn.execute(
                     "SELECT encounter_count, avg_resonance FROM kin_profiles WHERE pubkey=?",
                     (kin_pubkey,)).fetchone()
-                if existing:
-                    count = existing[0] + 1
-                    avg = (existing[1] * existing[0] + resonance_score) / count
-                    label = ("deep_resonance" if avg > 0.8 and count > 5
-                             else "kindred_spirit" if avg > 0.6
-                             else "familiar_presence" if avg > 0.4
-                             else "developing_bond")
-                    conn.execute(
-                        "UPDATE kin_profiles SET last_encounter_ts=?, encounter_count=?, "
-                        "avg_resonance=?, relationship_label=? WHERE pubkey=?",
-                        (_rx_now, count, round(avg, 4), label, kin_pubkey))
-                else:
-                    conn.execute(
-                        "INSERT INTO kin_profiles "
-                        "(pubkey, name, first_encounter_ts, last_encounter_ts, "
-                        "encounter_count, avg_resonance, relationship_label) "
-                        "VALUES (?, ?, ?, ?, 1, ?, ?)",
-                        (kin_pubkey, "Kin", _rx_now, _rx_now,
-                         round(resonance_score, 4), "new_acquaintance"))
-                conn.commit()
 
-            await sqlite_async.with_connection("./data/inner_memory.db", _rx_record)
+            existing = await sqlite_async.with_connection("./data/inner_memory.db", _rx_record)
+            # WRITE via IMW async client
+            from titan_plugin.persistence import get_client
+            _imw_rx = get_client(caller_name="dashboard.kin_rx")
+            await _imw_rx.awrite(
+                "INSERT INTO kin_encounters "
+                "(timestamp, kin_pubkey, resonance, my_emotion, kin_emotion, "
+                "exchange_type, epoch_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (_rx_now, kin_pubkey, round(resonance_score, 4), my_emotion,
+                 kin_emotion, "received", _rx_epoch),
+                table="kin_encounters")
+            if existing:
+                count = existing[0] + 1
+                avg = (existing[1] * existing[0] + resonance_score) / count
+                label = ("deep_resonance" if avg > 0.8 and count > 5
+                         else "kindred_spirit" if avg > 0.6
+                         else "familiar_presence" if avg > 0.4
+                         else "developing_bond")
+                await _imw_rx.awrite(
+                    "UPDATE kin_profiles SET last_encounter_ts=?, encounter_count=?, "
+                    "avg_resonance=?, relationship_label=? WHERE pubkey=?",
+                    (_rx_now, count, round(avg, 4), label, kin_pubkey),
+                    table="kin_profiles")
+            else:
+                await _imw_rx.awrite(
+                    "INSERT INTO kin_profiles "
+                    "(pubkey, name, first_encounter_ts, last_encounter_ts, "
+                    "encounter_count, avg_resonance, relationship_label) "
+                    "VALUES (?, ?, ?, ?, 1, ?, ?)",
+                    (kin_pubkey, "Kin", _rx_now, _rx_now,
+                     round(resonance_score, 4), "new_acquaintance"),
+                    table="kin_profiles")
             logger.info("[KinExchange] Received from %s — resonance=%.3f emotion=%s",
                         kin_pubkey, resonance_score, kin_emotion)
         except Exception as _rx_err:
@@ -6562,8 +7748,14 @@ async def post_v4_timechain_backup_now(request: Request):
         arweave = ArweaveStore(network="devnet")
         backup = TimeChainBackup(
             data_dir="data/timechain", titan_id="T1", arweave_store=arweave)
-        # rFP_backup_worker Phase 0: use tarball (JSON path retired 2026-04-13)
-        tx_id = await backup.snapshot_to_arweave()
+        # rFP_backup_worker Phase 2 cascade: pass full_config for balance
+        # check + local-always save + upload verify + cleanup.
+        try:
+            from titan_plugin.config_loader import load_titan_config
+            _full_cfg = load_titan_config()
+        except Exception:
+            _full_cfg = {}
+        tx_id = await backup.snapshot_to_arweave(full_config=_full_cfg)
         if tx_id:
             return _ok({"tx_id": tx_id, "status": "uploaded"})
         return _error("upload failed")

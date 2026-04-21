@@ -39,17 +39,22 @@ class MeditationEpoch:
     scores memories via LLMs, and migrates them to persistent wisdom.
     """
 
-    def __init__(self, memory_graph, network_client, config: dict = None):
+    def __init__(self, memory_graph, network_client, config: dict = None,
+                 social_graph=None):
         """
         Args:
             memory_graph: TieredMemoryGraph instance containing the mempool.
             network_client: HybridNetworkClient for blockchain fee negotiation.
             config: [inference] section from config.toml.
+            social_graph: Optional SocialGraph — used for periodic ledger
+                cleanup (rFP_social_graph_async_safety §5.3 R4 fix). None
+                is safe for subprocess lightweight-mode callers.
         """
         config = config or {}
         self._config = config
         self.memory = memory_graph
         self.network = network_client
+        self._social_graph = social_graph
 
         # LLM provider config
         self.provider = config.get("inference_provider", "openrouter").lower()
@@ -248,6 +253,24 @@ class MeditationEpoch:
         7. Generate expressive art + social post
         """
         self._epoch_counter += 1
+
+        # rFP_social_graph_async_safety §5.3 (R4 fix): periodic ledger
+        # cleanup failsafe. monitor_and_engage already cleans the 48h window
+        # on every social cycle, but that path is skipped in STARVATION /
+        # no-API-key / no-mentions modes. This 7-day sweep every 100 epochs
+        # ensures the engagement_ledger table stays bounded even when social
+        # engagement is off for extended periods.
+        if self._social_graph is not None and self._epoch_counter % 100 == 0:
+            try:
+                removed = await self._social_graph.ledger_cleanup_async(
+                    max_age_seconds=7 * 86400)
+                if removed:
+                    logger.info(
+                        "[Meditation] Ledger failsafe cleanup: removed %d "
+                        "entries older than 7d (epoch=%d)",
+                        removed, self._epoch_counter)
+            except Exception as e:
+                logger.warning("[Meditation] Ledger cleanup failed: %s", e)
 
         # Step 1: Classify mempool by sigmoid decay weight
         candidates, fading, dead = await self.memory.fetch_mempool_classified()

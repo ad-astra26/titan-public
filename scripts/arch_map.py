@@ -1126,6 +1126,15 @@ def show_audit(graph: dict):
     _KNOWN_HELPER_PUBS = {
         # emit_meta_cgn_signal → META_CGN_SIGNAL (bus.py:415)
         "emit_meta_cgn_signal": "META_CGN_SIGNAL",
+        # emit_emot_cgn_signal → EMOT_CGN_SIGNAL (bus.py, rFP_emot_cgn_v2)
+        "emit_emot_cgn_signal": "EMOT_CGN_SIGNAL",
+        # emit_emot_chain_evidence → EMOT_CHAIN_EVIDENCE (Phase 1.6d ADR)
+        "emit_emot_chain_evidence": "EMOT_CHAIN_EVIDENCE",
+        # emit_felt_cluster_update → FELT_CLUSTER_UPDATE (Phase 1.6d ADR)
+        "emit_felt_cluster_update": "FELT_CLUSTER_UPDATE",
+        # EmotCGNConsumer._maybe_emit_cross_insight → CGN_CROSS_INSIGHT
+        # (class method, not top-level function — scanner needs hint)
+        "_maybe_emit_cross_insight": "CGN_CROSS_INSIGHT",
     }
 
     # Helper publisher discovery: functions whose body wraps make_msg/_send_msg
@@ -3753,6 +3762,18 @@ def run_report():
         tid: _fmt_pct(_t(tid, "coding_explorer", "success_rate")) for tid in tids})
     _row("Concepts tried", {
         tid: _fmt_num(_t(tid, "coding_explorer", "concepts_attempted")) for tid in tids})
+    # Layer B + C — trigger-source attribution + fallback clock
+    _row("Emergent trig", {
+        tid: _fmt_num(
+            (_t(tid, "coding_explorer", "trigger_source_counts", default={}) or {})
+            .get("emergent", 0)) for tid in tids})
+    _row("Fallback trig", {
+        tid: _fmt_num(
+            (_t(tid, "coding_explorer", "trigger_source_counts", default={}) or {})
+            .get("fallback", 0)) for tid in tids})
+    _row("Silence (s)", {
+        tid: _fmt_num(_t(tid, "coding_explorer", "seconds_since_last_exercise",
+                         default=0)) for tid in tids})
 
     # Language
     print()
@@ -4371,6 +4392,104 @@ def run_meditation_health(all_titans: bool = False) -> int:
 
     print()
     return 0
+
+
+def run_voice_diagnostics(all_titans: bool = False, hours: int = 24):
+    """rFP_phase5_narrator_evolution §9.3: surface recent X-post grounding
+    gate decisions from social_x_telemetry.jsonl.
+
+    Shows two tables per Titan:
+      1. Aggregate: total checks | passed | suppressed | enforced-mode?
+      2. Recent suppressions (last N, newest first) with topics + confidence
+    """
+    import json as _json
+    import subprocess
+    import time as _t
+
+    sources = [("T1", "./data/social_x_telemetry.jsonl", "local")]
+    if all_titans:
+        sources.append(("T2", "/home/antigravity/projects/titan/data/"
+                        "social_x_telemetry.jsonl", "ssh"))
+        sources.append(("T3", "/home/antigravity/projects/titan3/data/"
+                        "social_x_telemetry.jsonl", "ssh"))
+
+    cutoff = _t.time() - hours * 3600
+
+    print()
+    print("TITAN VOICE-DIAGNOSTICS — grounded-only X gate")
+    print(f"  (window: last {hours}h — rFP_phase5_narrator_evolution §9)")
+    print("=" * 90)
+
+    for tid, path, mode in sources:
+        print(f"\n  {tid} — {path}")
+        print("  " + "-" * 84)
+
+        if mode == "local":
+            try:
+                with open(path, "r") as f:
+                    raw = f.readlines()
+            except FileNotFoundError:
+                print("    ✗ telemetry file not found (gateway may not have"
+                      " ever posted)")
+                continue
+        else:
+            try:
+                proc = subprocess.run(
+                    f"ssh root@10.135.0.6 'tail -5000 {path}'",
+                    shell=True, capture_output=True, text=True, timeout=20)
+                raw = proc.stdout.splitlines()
+            except Exception as e:
+                print(f"    ✗ SSH read failed: {e}")
+                continue
+
+        checks = 0
+        passed = 0
+        suppressed = 0
+        enforced_seen = False
+        suppression_rows: list[dict] = []
+
+        for line in raw[-5000:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = _json.loads(line)
+            except Exception:
+                continue
+            ts = ev.get("timestamp", 0)
+            if ts < cutoff:
+                continue
+            etype = ev.get("event", "")
+            if etype == "post_grounding_check":
+                checks += 1
+                if ev.get("passed"):
+                    passed += 1
+                if ev.get("enforced"):
+                    enforced_seen = True
+            elif etype == "post_suppressed_ungrounded":
+                suppressed += 1
+                suppression_rows.append(ev)
+                if ev.get("enforced"):
+                    enforced_seen = True
+
+        print(f"    Checks: {checks}   Passed: {passed}   "
+              f"Suppressed: {suppressed}   "
+              f"Mode: {'ENFORCED' if enforced_seen else 'observability-only'}")
+
+        if suppression_rows:
+            print("\n    Recent suppressions (newest first):")
+            suppression_rows.sort(key=lambda e: -e.get("timestamp", 0))
+            for ev in suppression_rows[:10]:
+                age_min = int((_t.time() - ev.get("timestamp", 0)) / 60)
+                topics = ev.get("topics", [])
+                conf = ev.get("confidence", 0)
+                thr = ev.get("threshold", 0)
+                ctype = ev.get("catalyst_type", "")
+                print(f"      {age_min:>4}m ago  conf={conf:.2f}  "
+                      f"thr={thr:.2f}  [{ctype}]  topics={topics}")
+
+    print()
+    print("=" * 90)
 
 
 def run_errors(all_titans: bool = False):
@@ -6987,6 +7106,275 @@ def run_ns_learning(titan: str = "T1", since_hours: int = 24) -> int:
     return 0
 
 
+def run_backup_diagnostics(all_titans: bool = False):
+    """rFP_backup_worker Phase 5 — backup health per Titan.
+
+    Verifies the master invariant (rFP §5.4): full state recoverable from ≤24h
+    of backup artifacts. Reads /v4/backup/status + /v4/backup/wallet-runway.
+    """
+    import requests
+    titans = [
+        ("T1", "http://127.0.0.1:7777"),
+        ("T2", "http://10.135.0.6:7777"),
+        ("T3", "http://10.135.0.6:7778"),
+    ] if all_titans else [("T1", "http://127.0.0.1:7777")]
+
+    print()
+    print("BACKUP HEALTH — rFP_backup_worker master invariant")
+    print("=" * 78)
+
+    overall_ok = True
+    for tid, url in titans:
+        print(f"\n  {tid} ({url.split('//')[1]})")
+        print("  " + "-" * 72)
+        try:
+            r = requests.get(f"{url}/v4/backup/status", timeout=10)
+            if r.status_code != 200:
+                print(f"    ✗ /v4/backup/status HTTP {r.status_code}")
+                overall_ok = False
+                continue
+            d = r.json().get("data", {})
+            mode = d.get("mode", "?")
+            invariant = d.get("master_invariant_ok", False)
+            records = d.get("records", {})
+            local = d.get("local_snapshots", {})
+            dry = d.get("last_dry_run", {})
+
+            inv_mark = "✓" if invariant else "✗"
+            print(f"    {inv_mark} Mode: {mode}  |  Master invariant: "
+                  f"{'OK' if invariant else 'AT RISK'}")
+
+            if records:
+                for btype, rec in records.items():
+                    age_h = rec.get("age_hours", -1)
+                    tx = (rec.get("arweave_tx") or "local")[:16]
+                    sz = rec.get("size_mb", 0)
+                    mark = "✓" if age_h < (30 if btype == "personality"
+                                           else 24 * 8) else "⚠"
+                    print(f"    {mark} Last {btype:12s}: {age_h:>5.1f}h ago"
+                          f"  size={sz:>6.1f} MB  tx={tx}")
+            else:
+                print(f"    ⚠ No backup records found (first boot?)")
+
+            print(f"    ℹ Local snapshots:"
+                  f" personality={local.get('personality', 0)}"
+                  f" soul={local.get('soul', 0)}"
+                  f" timechain={local.get('timechain', 0)}"
+                  f" total={local.get('total_mb', 0):.1f} MB")
+
+            if dry:
+                dry_ok = "✓" if dry.get("ok") else "✗"
+                print(f"    {dry_ok} Last dry-run:"
+                      f" {'OK' if dry.get('ok') else 'FAIL'}"
+                      f"  steps={dry.get('steps', {})}")
+
+            # Runway (T1 only normally — mainnet_arweave mode)
+            if mode == "mainnet_arweave":
+                try:
+                    r2 = requests.get(f"{url}/v4/backup/wallet-runway", timeout=10)
+                    if r2.status_code == 200:
+                        rd = r2.json().get("data", {})
+                        tier = rd.get("tier", "?")
+                        days = rd.get("days_runway", 0)
+                        irys = rd.get("irys_sol", 0)
+                        mark = {"green": "✓", "yellow": "ℹ",
+                                "orange": "⚠", "red": "✗"}.get(tier, "?")
+                        print(f"    {mark} Irys runway: {irys:.4f} SOL"
+                              f" ≈ {days:.1f} days (tier={tier})")
+                        if tier in ("orange", "red"):
+                            overall_ok = False
+                except Exception as e:
+                    print(f"    ⚠ Runway query error: {e}")
+
+            # Phase 8 — chain integrity (local mirror of on-chain anchor sequence)
+            try:
+                from titan_plugin.logic.backup_chain import verify_chain_file
+                chain_result = verify_chain_file(tid)
+                if chain_result["length"] == 0:
+                    print(f"    ℹ Anchor chain: empty (Phase 8 not yet active "
+                          f"or no anchors written)")
+                elif chain_result["ok"]:
+                    print(f"    ✓ Anchor chain: {chain_result['length']} entries, "
+                          f"integrity intact")
+                else:
+                    print(f"    ✗ Anchor chain: BROKEN at index "
+                          f"{chain_result['break_index']} — "
+                          f"{chain_result['break_reason']}")
+                    overall_ok = False
+            except Exception as e:
+                print(f"    ⚠ Chain check error: {e}")
+
+            if not invariant:
+                overall_ok = False
+        except Exception as e:
+            print(f"    ✗ Error: {e}")
+            overall_ok = False
+
+    print()
+    print("=" * 78)
+    print(f"OVERALL: {'ALL GREEN' if overall_ok else 'AT RISK — investigate'}")
+    print()
+
+
+def run_backup_verify_chain(all_titans: bool = False) -> int:
+    """rFP_backup_worker Phase 8.2 — verbose chain walk.
+
+    Reads data/backup_anchor_chain_{titan_id}.json and prints each anchor with
+    per-entry integrity markers. Returns exit code 0 if all chains are intact,
+    1 otherwise — so scripts/CI can gate on this.
+
+    Note: runs LOCALLY on the machine it's invoked on — chain files live on
+    each Titan's disk. With --all, attempts to read T2/T3 chain files via
+    their API (not yet wired); for now recommends running directly on each
+    VPS for multi-Titan audit.
+    """
+    from titan_plugin.logic.backup_chain import read_chain, verify_chain
+
+    titans = ["T1", "T2", "T3"] if all_titans else ["T1"]
+    print()
+    print("BACKUP ANCHOR CHAIN — verify-chain (rFP_backup_worker Phase 8.2)")
+    print("=" * 78)
+    overall = 0
+    for tid in titans:
+        print(f"\n  {tid}")
+        print("  " + "-" * 72)
+        try:
+            anchors = read_chain(tid)
+        except Exception as e:
+            print(f"    ✗ read error: {e}")
+            overall = 1
+            continue
+        if not anchors:
+            print("    ℹ chain file absent/empty — no anchors to verify")
+            continue
+        result = verify_chain(anchors)
+        for i, a in enumerate(anchors):
+            h = a.get("archive_hash", "?")[:16]
+            p = a.get("prev_anchor_hash", "")[:16] or "genesis"
+            t = a.get("backup_type", "?")
+            tx = (a.get("tx") or "?")[:16]
+            mark = "✓"
+            if not result["ok"] and i == result["break_index"]:
+                mark = "✗"
+            print(f"    {mark} [{i:>3d}] {t:<12s} h={h} prev={p:<16} tx={tx}")
+        if result["ok"]:
+            print(f"\n    ✓ Chain INTACT: {result['length']} entries, "
+                  f"all prev-hashes validate")
+        else:
+            print(f"\n    ✗ Chain BROKEN at index {result['break_index']}: "
+                  f"{result['break_reason']}")
+            overall = 1
+    print()
+    print("=" * 78)
+    print(f"OVERALL: {'ALL CHAINS INTACT' if overall == 0 else 'CHAIN BREAK DETECTED'}")
+    print()
+    return overall
+
+
+def run_sovereign_ops(all_titans: bool = False):
+    """rFP_backup_worker §5.7 — single-command operational readout.
+
+    Combines backup + meditation + wallet + TimeChain + identity status for
+    Maker's session-start ritual.
+    """
+    import requests
+    titans = [
+        ("T1", "http://127.0.0.1:7777"),
+        ("T2", "http://10.135.0.6:7777"),
+        ("T3", "http://10.135.0.6:7778"),
+    ] if all_titans else [("T1", "http://127.0.0.1:7777")]
+
+    print()
+    print("SOVEREIGN OPERATIONS — Titan(s) operational health")
+    print("=" * 78)
+
+    for tid, url in titans:
+        print(f"\n  {tid} SOVEREIGN OPS ({url.split('//')[1]})")
+        print("  " + "-" * 72)
+        rows = []
+
+        # Backup
+        try:
+            r = requests.get(f"{url}/v4/backup/status", timeout=8)
+            if r.status_code == 200:
+                d = r.json().get("data", {})
+                inv = d.get("master_invariant_ok", False)
+                mode = d.get("mode", "?")
+                recs = d.get("records", {})
+                pers_age = recs.get("personality", {}).get("age_hours")
+                status = (f"healthy (pers {pers_age:.1f}h ago, {mode})"
+                          if (inv and pers_age is not None)
+                          else f"⚠ master invariant at risk (mode={mode})")
+                rows.append(("Backup", "✓" if inv else "⚠", status))
+            else:
+                rows.append(("Backup", "✗", f"HTTP {r.status_code}"))
+        except Exception as e:
+            rows.append(("Backup", "✗", f"{e}"))
+
+        # Meditation
+        try:
+            r = requests.get(f"{url}/v4/meditation/health", timeout=8)
+            if r.status_code == 200:
+                md = r.json().get("data", {}) or {}
+                last_age = md.get("last_meditation_age_s", 0) / 3600.0
+                ok = md.get("healthy", False) or last_age < 6
+                rows.append(("Meditation", "✓" if ok else "⚠",
+                            f"last {last_age:.1f}h ago"))
+            else:
+                rows.append(("Meditation", "?", "endpoint n/a"))
+        except Exception as e:
+            rows.append(("Meditation", "?", f"{e}"))
+
+        # Wallet + runway
+        try:
+            r = requests.get(f"{url}/v4/backup/wallet-runway", timeout=8)
+            if r.status_code == 200:
+                wd = r.json().get("data", {})
+                if wd.get("available"):
+                    rows.append(("Wallet/Irys",
+                                 {"green": "✓", "yellow": "ℹ",
+                                  "orange": "⚠", "red": "✗"}.get(wd.get("tier"), "?"),
+                                 f"{wd.get('irys_sol', 0):.4f} SOL"
+                                 f" ≈ {wd.get('days_runway', 0):.1f}d"
+                                 f" ({wd.get('tier')})"))
+                else:
+                    rows.append(("Wallet/Irys", "N/A", "devnet / no keypair"))
+        except Exception as e:
+            rows.append(("Wallet/Irys", "?", f"{e}"))
+
+        # TimeChain
+        try:
+            r = requests.get(f"{url}/v4/timechain/status", timeout=10)
+            if r.status_code == 200:
+                td = r.json().get("data", {})
+                blocks = td.get("total_blocks", 0)
+                forks = td.get("total_forks", 0)
+                rows.append(("TimeChain", "✓",
+                            f"{blocks:,} blocks, {forks} forks"))
+        except Exception as e:
+            rows.append(("TimeChain", "?", f"{e}"))
+
+        # Identity
+        try:
+            r = requests.get(f"{url}/v4/identity/profile", timeout=8)
+            if r.status_code == 200:
+                ident = r.json().get("data", {}) or {}
+                tid_live = ident.get("titan_id", tid)
+                rows.append(("Identity", "✓", f"titan_id={tid_live}"))
+            else:
+                rows.append(("Identity", "?", f"HTTP {r.status_code}"))
+        except Exception as e:
+            rows.append(("Identity", "?", f"{e}"))
+
+        for label, mark, detail in rows:
+            print(f"    {mark} {label:<12s}: {detail}")
+
+        all_ok = all(m == "✓" for m, _, _ in [(r[1], r[0], r[2]) for r in rows])
+        print(f"    Status:     {'ALL SYSTEMS GREEN' if all_ok else 'DEGRADED'}")
+
+    print()
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -7140,14 +7528,31 @@ def main():
             print("Usage: python scripts/arch_map.py verify <pipeline>")
             print("Pipelines:")
             print("  cgn-pipeline     — CGN worker + /dev/shm + 6 consumers + HAOV + knowledge flow")
+            print("  search-pipeline  — knowledge router backends + cache + budgets + circuit breakers")
             sys.exit(1)
         pipeline = sys.argv[2].lower()
         if pipeline in ("cgn", "cgn-pipeline"):
             run_verify_cgn_pipeline("--all" in sys.argv)
+        elif pipeline in ("search", "search-pipeline"):
+            run_verify_search_pipeline("--all" in sys.argv)
         else:
             print(f"Unknown pipeline: {pipeline}")
-            print("Available: cgn-pipeline")
+            print("Available: cgn-pipeline, search-pipeline")
             sys.exit(1)
+
+    elif cmd == "analyze-decisions":
+        # KP-8.1: aggregate knowledge_router decision log (rFP §3.3 Essential D)
+        hours = 24
+        path = "data/logs/knowledge_router_decisions.jsonl"
+        for i, a in enumerate(sys.argv[2:], start=2):
+            if a == "--since" and i + 1 < len(sys.argv):
+                try:
+                    hours = int(sys.argv[i + 1])
+                except ValueError:
+                    pass
+            elif a.startswith("--path="):
+                path = a.split("=", 1)[1]
+        run_analyze_decisions(path=path, hours=hours)
 
     elif cmd == "where":
         # 2026-04-12: comprehensive location search — supports "verify before declare" discipline.
@@ -7184,6 +7589,29 @@ def main():
 
     elif cmd == "errors":
         run_errors(all_titans="--all" in sys.argv)
+
+    elif cmd == "voice-diagnostics":
+        # rFP_phase5_narrator_evolution §9: recent grounded-only X-gate decisions.
+        # --hours N overrides default 24h window.
+        _vd_hours = 24
+        for i, a in enumerate(sys.argv):
+            if a == "--hours" and i + 1 < len(sys.argv):
+                try:
+                    _vd_hours = int(sys.argv[i + 1])
+                except ValueError:
+                    pass
+        run_voice_diagnostics(all_titans="--all" in sys.argv, hours=_vd_hours)
+
+    elif cmd == "backup":
+        # rFP_backup_worker Phase 5 — master invariant check per Titan.
+        # Phase 8.2 — --verify-chain flag switches to verbose chain walk.
+        if "--verify-chain" in sys.argv:
+            sys.exit(run_backup_verify_chain(all_titans="--all" in sys.argv))
+        run_backup_diagnostics(all_titans="--all" in sys.argv)
+
+    elif cmd == "sovereign-ops":
+        # rFP_backup_worker §5.7 — single-command op readout.
+        run_sovereign_ops(all_titans="--all" in sys.argv)
 
     elif cmd == "filter-down":
         # 2026-04-14 rFP #2 Phase 7: V4/V5 FILTER_DOWN coexistence monitor.
@@ -9039,6 +9467,243 @@ def run_cognitive_contracts_diagnostics(all_titans: bool = True):
             print(f"    ✗ Error: {e}")
 
     print()
+    print("=" * 78)
+
+
+def run_verify_search_pipeline(all_titans: bool = False):
+    """End-to-end knowledge pipeline health verification (KP-6).
+
+    Pulls /v4/search-pipeline/health from each Titan and renders a
+    structured green/red per-backend table with circuit state, today's
+    request/error counts, bandwidth-vs-budget, avg latency, and cache
+    hit rate. Designed to be the one-command answer to "is knowledge
+    acquisition healthy?" — supports the verify-before-declare discipline.
+    """
+    import requests
+
+    titans = [("T1", "http://127.0.0.1:7777")]
+    if all_titans:
+        titans += [
+            ("T2", "http://10.135.0.6:7777"),
+            ("T3", "http://10.135.0.6:7778"),
+        ]
+
+    # Severity marker helpers
+    def _circuit_glyph(state: str) -> str:
+        return {"closed": "✓", "half_open": "◐", "open": "✗"}.get(state, "?")
+
+    def _fmt_mb(bytes_: int) -> str:
+        if bytes_ <= 0:
+            return "0"
+        return f"{bytes_ / (1024 * 1024):.1f}MB"
+
+    def _fmt_budget(consumed: int, budget: int) -> str:
+        if budget <= 0:
+            return f"{_fmt_mb(consumed)}/unlimited"
+        pct = consumed / budget * 100
+        return f"{_fmt_mb(consumed)}/{_fmt_mb(budget)} ({pct:.0f}%)"
+
+    print()
+    print("SEARCH PIPELINE — KNOWLEDGE ROUTER HEALTH")
+    print("=" * 84)
+
+    for tid, url in titans:
+        print(f"\n  {tid} ({url.split('//')[1]})")
+        print("  " + "-" * 78)
+
+        try:
+            r = requests.get(f"{url}/v4/search-pipeline/health", timeout=5)
+        except Exception as e:
+            print(f"  ✗ API unreachable: {e}")
+            continue
+        if r.status_code != 200:
+            print(f"  ✗ /v4/search-pipeline/health → HTTP {r.status_code}")
+            continue
+
+        try:
+            data = r.json().get("data", {}) or {}
+        except Exception as e:
+            print(f"  ✗ JSON parse error: {e}")
+            continue
+
+        backends = data.get("backends", {}) or {}
+        cache = data.get("cache", {}) or {}
+        health_age = data.get("health_file_age_sec")
+
+        if not backends:
+            print(f"  ⚠ No backends recorded yet (knowledge_worker idle?)")
+
+        # Per-backend rows — sorted by name for stable output
+        overall_ok = True
+        for name in sorted(backends.keys()):
+            h = backends[name]
+            state = h.get("circuit_state", "?")
+            glyph = _circuit_glyph(state)
+            reqs = h.get("requests_today", 0)
+            errs = h.get("errors_today", 0)
+            bytes_today = h.get("bytes_consumed_today", 0)
+            budget = h.get("budget_daily_bytes", 0)
+            avg_lat = h.get("avg_latency_ms", 0.0)
+            last_err = h.get("last_error_type", "") or "-"
+
+            is_degraded = (state != "closed"
+                           or (budget > 0 and bytes_today >= budget))
+            if is_degraded:
+                overall_ok = False
+
+            print(f"    {glyph} {name:<20}  {state:<10}  "
+                  f"{reqs:>4}/{errs:<3}  "
+                  f"{_fmt_budget(bytes_today, budget):<28}  "
+                  f"lat={avg_lat:.0f}ms  last_err={last_err}")
+
+        # Cache row
+        if cache:
+            entries = cache.get("entries", 0)
+            hit_rate = cache.get("hit_rate", 0.0)
+            hits = cache.get("hits_24h", 0)
+            misses = cache.get("misses_24h", 0)
+            saved_mb = cache.get("bytes_saved_24h_estimate", 0) / (1024 * 1024)
+            print(f"    ✓ cache                 — entries={entries}, "
+                  f"hit_rate={hit_rate:.1%} ({hits}/{hits + misses}), "
+                  f"bytes_saved_24h~{saved_mb:.1f}MB")
+
+        # Staleness warning
+        if health_age is not None and health_age > 3600:
+            print(f"    ⚠ health file stale ({health_age:.0f}s old) — "
+                  f"knowledge_worker may not be writing")
+            overall_ok = False
+
+        # KP-8 — routing learner summary (non-blocking; separate endpoint)
+        try:
+            lr = requests.get(f"{url}/v4/search-pipeline/learning", timeout=5)
+            if lr.status_code == 200:
+                ldata = lr.json().get("data", {}) or {}
+                by_qt = ldata.get("by_query_type", {}) or {}
+                n_qt = len(by_qt)
+                warm_rows = sum(
+                    1 for rows in by_qt.values() for r in rows if r.get("warm"))
+                total_rows = sum(len(rows) for rows in by_qt.values())
+                demoted = ldata.get("config", {}).get("demote_threshold", 0.10)
+                below = sum(
+                    1 for rows in by_qt.values()
+                    for r in rows if r.get("warm") and r.get("reputation", 0) < demoted)
+                if total_rows == 0:
+                    print("    ⚪ learner                — cold "
+                          "(no dispatches yet)")
+                else:
+                    print(f"    ✓ learner                — {warm_rows}/{total_rows} warm "
+                          f"across {n_qt} query types, {below} demoted")
+        except Exception:
+            pass  # learning endpoint is optional
+
+        print(f"\n  Overall: {'HEALTHY' if overall_ok else 'DEGRADED'}")
+
+    print()
+    print("=" * 84)
+
+
+def run_analyze_decisions(path: str = "data/logs/knowledge_router_decisions.jsonl",
+                          hours: int = 24) -> None:
+    """Aggregate KP-4 decision log into (query_type, backend) rollups.
+
+    Reads the rolling JSONL + any .1/.2 rotations. For each (qt, backend)
+    tuple it tallies attempts, successes, cache hits, coalesced, rejected,
+    bytes, and latency p50/p95. Filter by --since hours (default 24).
+
+    Usage: python scripts/arch_map.py analyze-decisions [--since 24] [--path=...]
+    """
+    import os as _os
+    import json as _json
+    import time as _time
+    import statistics as _stats
+
+    paths = []
+    for candidate in [path, path + ".1", path + ".2"]:
+        if _os.path.exists(candidate):
+            paths.append(candidate)
+    if not paths:
+        print(f"No decision log found at {path}* — knowledge_worker idle?")
+        return
+
+    cutoff = _time.time() - hours * 3600
+    buckets: dict = {}  # (qt, backend) -> list of entries
+    total_read = 0
+    total_kept = 0
+    rejected = 0
+    coalesced = 0
+    learned = 0
+    for p in paths:
+        try:
+            with open(p, "r") as f:
+                for line in f:
+                    total_read += 1
+                    try:
+                        entry = _json.loads(line)
+                    except Exception:
+                        continue
+                    if float(entry.get("ts", 0)) < cutoff:
+                        continue
+                    total_kept += 1
+                    qt = entry.get("query_type", "?")
+                    bk = entry.get("backend_used") or "(none)"
+                    key = (qt, bk)
+                    buckets.setdefault(key, []).append(entry)
+                    if entry.get("rejected"):
+                        rejected += 1
+                    if entry.get("coalesced"):
+                        coalesced += 1
+                    if entry.get("learned_chain"):
+                        learned += 1
+        except Exception as e:
+            print(f"  WARN: read {p}: {e}")
+
+    print()
+    print("KNOWLEDGE ROUTER — DECISION LOG ANALYSIS")
+    print("=" * 78)
+    print(f"  Window: last {hours}h | read {total_read} lines | kept {total_kept}")
+    print(f"  rejected={rejected}  coalesced={coalesced}  learned_chain={learned}")
+    print()
+
+    if not buckets:
+        print("  (no entries in window)")
+        return
+
+    hdr = f"  {'query_type':<18} {'backend':<24} {'n':>4} {'succ':>4} " \
+          f"{'cache':>5} {'rej':>4} {'p50ms':>6} {'p95ms':>6} {'bytesMB':>8}"
+    print(hdr)
+    print("  " + "-" * 76)
+
+    for (qt, bk), entries in sorted(buckets.items()):
+        n = len(entries)
+        succ = sum(1 for e in entries if e.get("success"))
+        cache = sum(1 for e in entries if e.get("cache_hit"))
+        rej = sum(1 for e in entries if e.get("rejected"))
+        lats = [float(e.get("latency_ms", 0)) for e in entries
+                if e.get("latency_ms")]
+        p50 = _stats.median(lats) if lats else 0
+        if lats and len(lats) >= 20:
+            p95 = _stats.quantiles(lats, n=20)[18]
+        elif lats:
+            p95 = max(lats)
+        else:
+            p95 = 0
+        total_bytes = sum(int(e.get("bytes", 0) or 0) for e in entries)
+        print(f"  {qt:<18} {bk:<24} {n:>4} {succ:>4} {cache:>5} "
+              f"{rej:>4} {p50:>6.0f} {p95:>6.0f} "
+              f"{total_bytes/(1024*1024):>8.2f}")
+
+    print()
+    # Error-type summary across all buckets
+    err_counts: dict = {}
+    for entries in buckets.values():
+        for e in entries:
+            et = e.get("error_type") or ""
+            if et:
+                err_counts[et] = err_counts.get(et, 0) + 1
+    if err_counts:
+        print("  Errors (last {}h):".format(hours))
+        for et in sorted(err_counts, key=lambda k: -err_counts[k]):
+            print(f"    {et:<20} {err_counts[et]:>4}")
     print("=" * 78)
 
 

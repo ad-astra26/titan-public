@@ -283,6 +283,18 @@ def _acquire_pid_lock() -> bool:
     """Prevent multiple titan_main instances via atomic file lock (fcntl.flock).
 
     Returns True if lock acquired, False if another instance holds it.
+
+    2026-04-21 bugfix: previously used `open(pid_path, "w")` which TRUNCATES
+    the file BEFORE attempting flock. When another instance was holding the
+    lock, truncate succeeded but flock failed — leaving the PID file EMPTY
+    and the abort message showing "(PID )" blank. Subsequent restart attempts
+    saw the empty file and couldn't diagnose whether it was stale or live,
+    causing phantom "Another titan_main running" aborts that blocked
+    legitimate restarts until manual PID-file removal.
+
+    Fix: open with os.O_RDWR | os.O_CREAT (NO O_TRUNC), try flock FIRST,
+    truncate+write PID only if lock acquired. This preserves the live PID
+    info in the file when the lock check fails.
     """
     import fcntl
     global _pid_lock_fd
@@ -291,24 +303,42 @@ def _acquire_pid_lock() -> bool:
     pid_path = os.path.normpath(pid_path)
     os.makedirs(os.path.dirname(pid_path), exist_ok=True)
 
+    fd = None
     try:
-        _pid_lock_fd = open(pid_path, "w")
+        # Open WITHOUT truncating — preserves existing PID if lock fails.
+        fd = os.open(pid_path, os.O_RDWR | os.O_CREAT, 0o644)
+        _pid_lock_fd = os.fdopen(fd, "r+")
         fcntl.flock(_pid_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Lock acquired — now safe to truncate and write our PID.
+        _pid_lock_fd.seek(0)
+        _pid_lock_fd.truncate()
         _pid_lock_fd.write(str(os.getpid()))
         _pid_lock_fd.flush()
         return True
     except (IOError, OSError):
-        # Another instance holds the lock
-        try:
-            with open(pid_path) as f:
-                old_pid = f.read().strip()
-        except Exception:
-            old_pid = "?"
+        # Another instance holds the lock — DO NOT TRUNCATE.
+        # Read live PID from the intact file.
+        old_pid = "?"
+        if _pid_lock_fd is not None:
+            try:
+                _pid_lock_fd.seek(0)
+                content = _pid_lock_fd.read().strip()
+                if content:
+                    old_pid = content
+            except Exception:
+                pass
+            try:
+                _pid_lock_fd.close()
+            except Exception:
+                pass
+            _pid_lock_fd = None
+        elif fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
         print(f"\n  *** ABORT: Another titan_main is already running (PID {old_pid}) ***")
         print(f"  If this is stale, remove {pid_path} and retry.\n")
-        if _pid_lock_fd:
-            _pid_lock_fd.close()
-            _pid_lock_fd = None
         return False
 
 

@@ -55,6 +55,14 @@ case "$CMD" in
             echo "Already running! (PID=$(cat "$PIDFILE"))"
             exit 1
         fi
+        # Guard: T3 MUST run on 7778 (T2 owns 7777 on this shared VPS).
+        # `git pull` restores the repo default `port = 7777`, clobbering the
+        # local T3-only override. Idempotent sed here — no-op if already 7778,
+        # fixes it otherwise. Documented in memory/feedback_t3_deploy_port.md.
+        if grep -q '^port = 7777' titan_plugin/config.toml 2>/dev/null; then
+            sed -i 's/^port = 7777/port = 7778/' titan_plugin/config.toml
+            echo "Port fixed 7777 → 7778 (was clobbered by git pull)"
+        fi
         rm -f "$PIDFILE"
         cd "$TITAN_DIR"
         # setsid: ensure the new process becomes its own session leader so
@@ -127,8 +135,8 @@ except: print('unknown')
                     sleep $POLL_S
                     WAITED=$((WAITED + POLL_S))
                     IS_DREAMING=$(check_dreaming)
-                    if [ "$IS_DREAMING" != "True" ]; then
-                        echo "  ✓ T3 woke after ${WAITED}s (is_dreaming=$IS_DREAMING) — proceeding with restart"
+                    if [ "$IS_DREAMING" = "False" ]; then
+                        echo "  ✓ T3 woke after ${WAITED}s (is_dreaming=False) — proceeding with restart"
                         break
                     fi
                     echo "  [t+${WAITED}s] still dreaming..."
@@ -139,8 +147,17 @@ except: print('unknown')
                     echo "Pass --force to override (will wake mid-dream)."
                     exit 1
                 fi
+            elif [ "$IS_DREAMING" = "False" ]; then
+                echo "  ✓ T3 dream check: is_dreaming=False — safe to restart"
             else
-                echo "  ✓ T3 dream check: is_dreaming=$IS_DREAMING — safe to restart"
+                # 2026-04-20 fix: "unknown" = API unreachable or parse error.
+                # Previously this fell through as "safe to restart" which is
+                # wrong — refuse unless --force so operator sees the real state.
+                echo "=== T3 dream state could not be verified (is_dreaming=$IS_DREAMING) ==="
+                echo "  API at localhost:7778/v4/dreaming returned no/bad response."
+                echo "  Refusing to restart without verified awake state."
+                echo "  Pass --force to override (will proceed regardless of dream state)."
+                exit 1
             fi
         fi
         $0 stop

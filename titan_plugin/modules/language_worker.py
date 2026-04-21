@@ -275,6 +275,40 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
     conversation_stats = {"asked": 0, "answered": 0, "timed_out": 0, "avg_score": 0}
     recent_teacher_questions = []
 
+    # ── F-phase (rFP §16.2): Meta-Reasoning Consumer Service wire ────
+    # Session 2 wire-now-gate-later: hook the teacher-path decision
+    # site. Meta returns failure_mode="not_yet_implemented" (Session 1
+    # dry-run remains); language always falls back to existing static
+    # path. Zero behavioral change until Session 3 flips chain execution.
+    _lang_meta_pending: dict = {}   # request_id → (t_sent, context_tag)
+    try:
+        from titan_plugin.logic.meta_service_client import (
+            register_response_handler as _lang_register_mrh,
+        )
+
+        def _lang_meta_response_handler(payload: dict) -> None:
+            req_id = payload.get("request_id", "")
+            failure = payload.get("failure_mode")
+            conf = payload.get("confidence", 0.0)
+            if failure:
+                logger.info(
+                    "[LangMeta] response req_id=%s failure=%s "
+                    "(dry-run expected Session 1-2)", req_id[:8], failure)
+            else:
+                insight = payload.get("insight") or {}
+                logger.info(
+                    "[LangMeta] response req_id=%s conf=%.2f sugg=%s",
+                    req_id[:8], conf,
+                    insight.get("suggested_action") if insight else None)
+            _lang_meta_pending.pop(req_id, None)
+
+        _lang_register_mrh("language", _lang_meta_response_handler)
+        logger.info("[LanguageWorker] F-phase meta response handler registered")
+    except Exception as _lmh_err:
+        logger.warning(
+            "[LanguageWorker] Meta response handler registration: %s",
+            _lmh_err)
+
     # Word grounding state (Phase 4)
     _grounding_last_check = 0.0
     _grounding_interval = 300.0  # Check every 5 minutes
@@ -725,7 +759,8 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                 if (isinstance(_wa_assoc, list) and len(_wa_assoc) >= 2
                                         and _wa_assoc[1] == "CO_OCCURRENCE"):
                                     _wa_target = _wa_assoc[0]
-                                    # Request meta-reasoning to type this association
+                                    # Legacy META_LANGUAGE_REQUEST (staying parallel
+                                    # in Session 2; Session 3 migrates away).
                                     _send_msg(send_queue, "META_LANGUAGE_REQUEST",
                                               name, "spirit", {
                                                   "type": "word_association",
@@ -733,6 +768,53 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                                   "word_b": _wa_target,
                                                   "co_occurrence_type": "CO_OCCURRENCE",
                                               })
+                                    # F-phase (rFP §16.2): unified META_REASON_REQUEST
+                                    # so the new consumer pathway accumulates traffic
+                                    # while existing legacy keeps working.
+                                    try:
+                                        from titan_plugin.logic.meta_service_client import (
+                                            send_meta_request as _lm_send,
+                                            send_meta_outcome as _lm_out,
+                                        )
+                                        from titan_plugin.logic.meta_consumer_contexts import (
+                                            build_language_meta_context_30d as _lm_ctx,
+                                        )
+                                        _lm_req = _lm_send(
+                                            consumer_id="language",
+                                            question_type="recall_context",
+                                            context_vector=_lm_ctx(
+                                                vocab_stats={
+                                                    "vocab_size": len(cached_vocab),
+                                                    "productive":
+                                                        language_stats.get(
+                                                            "productive_count", 0),
+                                                }),
+                                            time_budget_ms=500,
+                                            constraints={
+                                                "confidence_threshold": 0.4,
+                                                "allow_timechain_query": True,
+                                            },
+                                            payload_snippet=(
+                                                f"word_assoc {_wa_w['word']}<->"
+                                                f"{_wa_target}"),
+                                            send_queue=send_queue,
+                                            src=name,
+                                        )
+                                        _lang_meta_pending[_lm_req] = (
+                                            time.time(), "word_assoc")
+                                        # Session 2 outcome: neutral 0.0 —
+                                        # no advice applied (dry-run).
+                                        _lm_out(
+                                            request_id=_lm_req,
+                                            consumer_id="language",
+                                            outcome_reward=0.0,
+                                            actual_primitive_used=None,
+                                            context="session_2_word_assoc_dry",
+                                            send_queue=send_queue, src=name)
+                                        _lang_meta_pending.pop(_lm_req, None)
+                                    except Exception as _lm_err:
+                                        logger.debug(
+                                            "[LangMeta] req skipped: %s", _lm_err)
                                     logger.info("[WORD_ASSOCIATION] Requested typing: "
                                                 "'%s' <-> '%s'",
                                                 _wa_w["word"], _wa_target)
@@ -934,10 +1016,11 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                                         if "associations" not in _mc[-1]:
                                                             _mc[-1]["associations"] = []
                                                         _mc[-1]["associations"].append([_tgt, "CO_OCCURRENCE"])
-                                                        _cooc_db.execute(
+                                                        from titan_plugin.persistence import get_client as _cooc_gc
+                                                        _cooc_gc(caller_name="language_worker.cooc").write(
                                                             "UPDATE vocabulary SET meaning_contexts=? WHERE word=?",
-                                                            (_cooc_json.dumps(_mc[-10:]), _src))
-                                    _cooc_db.commit()
+                                                            (_cooc_json.dumps(_mc[-10:]), _src),
+                                                            table="vocabulary")
                                     _cooc_db.close()
                                 except Exception:
                                     pass
@@ -1256,10 +1339,11 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                                             _mc[-1]["associations"] = []
                                                         _mc[-1]["associations"].append(
                                                             [_tgt, _ml_assoc_type])
-                                                        _ml_db.execute(
+                                                        from titan_plugin.persistence import get_client as _ml_gc
+                                                        _ml_gc(caller_name="language_worker.ml").write(
                                                             "UPDATE vocabulary SET meaning_contexts=? WHERE word=?",
-                                                            (_ml_json.dumps(_mc[-10:]), _src))
-                                    _ml_db.commit()
+                                                            (_ml_json.dumps(_mc[-10:]), _src),
+                                                            table="vocabulary")
                                     _ml_db.close()
                                 except Exception:
                                     pass
@@ -1390,6 +1474,20 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
             _send_msg(send_queue, "CGN_CONSOLIDATE", name, "cgn",
                       {"dream_phase": True})
             logger.info("[CGN] Dream consolidation forwarded to CGN Worker")
+
+        # ── CGN_CROSS_INSIGHT (Plug B, rFP §20) ────────────────────────
+        # Emotional cross-insights from emot_cgn_worker reach us via the
+        # bus's dst="all" broadcast. Forward to each local CGN client so
+        # their EMA of emotional-outcome rewards updates → surfaces in
+        # state_vec slot 18 on next ground() call.
+        elif msg_type == "CGN_CROSS_INSIGHT":
+            try:
+                if cgn is not None:
+                    cgn.note_incoming_cross_insight(msg.get("payload", {}))
+                if cgn_social is not None:
+                    cgn_social.note_incoming_cross_insight(msg.get("payload", {}))
+            except Exception as _ci_err:
+                logger.debug("[CGN] cross-insight note error: %s", _ci_err)
 
         # ── CGN_WEIGHTS_MAJOR — weights updated (client auto-reloads from /dev/shm) ──
         elif msg_type == "CGN_WEIGHTS_MAJOR":
@@ -1610,13 +1708,14 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                                 _mc[-1][
                                                     "associations"].append(
                                                     [_tgt, "SOCIAL_LINKED"])
-                                                _sp_db.execute(
+                                                from titan_plugin.persistence import get_client as _sp_gc
+                                                _sp_gc(caller_name="language_worker.sp").write(
                                                     "UPDATE vocabulary SET "
                                                     "meaning_contexts=? "
                                                     "WHERE word=?",
                                                     (_sp_json.dumps(
-                                                        _mc[-10:]), _src))
-                            _sp_db.commit()
+                                                        _mc[-10:]), _src),
+                                                    table="vocabulary")
                             _sp_db.close()
                         except Exception:
                             pass
@@ -1796,6 +1895,20 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                 _hyp_word, _conf_b, _conf_a, _confirmed)
             except Exception as _haov_err:
                 logger.debug("[HAOV] Verification error: %s", _haov_err)
+
+        # ── META_REASON_RESPONSE (F-phase rFP §4.3) ──────────────────
+        # Consumer="language" responses are routed here (home_worker
+        # mapping in titan_params.toml). Dispatch to the handler
+        # registered via meta_service_client.register_response_handler.
+        elif msg_type == "META_REASON_RESPONSE":
+            try:
+                from titan_plugin.logic.meta_service_client import (
+                    dispatch_meta_response as _lm_dispatch,
+                )
+                _lm_dispatch(msg, logger_obj=logger)
+            except Exception as _lm_disp_err:
+                logger.warning(
+                    "[LangMeta] response dispatch error: %s", _lm_disp_err)
 
         # ── EPOCH_TICK (Phase 2+: teacher scheduling) ────────────────
         elif msg_type == "EPOCH_TICK":
@@ -2011,16 +2124,17 @@ def _handle_teacher_response(
                     conf_delta = min(0.05, dims_applied * 0.01)
                     new_conf = min(1.0, old_conf + conf_delta)
 
-                    # 5. Write back
-                    conn.execute(
+                    # 5. Write back via IMW (reads done, close direct conn first)
+                    conn.close()
+                    from titan_plugin.persistence import get_client as _mf_gc
+                    _mf_gc(caller_name="language_worker.meta_feedback").write(
                         "UPDATE vocabulary SET felt_tensor=?, sensory_context=?, "
                         "meaning_contexts=?, cross_modal_conf=?, confidence=? "
                         "WHERE word=?",
                         (_mf_json.dumps(ft), _mf_json.dumps(existing_contexts),
                          _mf_json.dumps(existing_meanings), new_xm,
-                         new_conf, target_word))
-                    conn.commit()
-                    conn.close()
+                         new_conf, target_word),
+                        table="vocabulary")
 
                     logger.info("[META_FEEDBACK] Grounded '%s': %d dims, %d assocs, "
                                 "conf %.2f→%.2f, xm %.2f→%.2f",
@@ -2110,13 +2224,14 @@ def _handle_teacher_response(
                     new_xm = min(1.0, old_xm + 0.03)  # Higher boost than meta_feedback
                     new_conf = min(1.0, old_conf + 0.02)
 
-                    conn.execute(
+                    conn.close()
+                    from titan_plugin.persistence import get_client as _et_gc
+                    _et_gc(caller_name="language_worker.embodied_teach").write(
                         "UPDATE vocabulary SET felt_tensor=?, meaning_contexts=?, "
                         "cross_modal_conf=?, confidence=? WHERE word=?",
                         (_et_json.dumps(ft), _et_json.dumps(existing_meanings),
-                         new_xm, new_conf, target_word))
-                    conn.commit()
-                    conn.close()
+                         new_xm, new_conf, target_word),
+                        table="vocabulary")
 
                     logger.info("[EMBODIED_TEACHING] Grounded '%s': %d dims shifted, "
                                 "%d groups, xm %.2f→%.2f",
@@ -2278,12 +2393,14 @@ def _handle_teacher_response(
                                 noise = (hash((acq_w, wti)) % 100 - 50) / 500.0
                                 word_tensor[wti] = max(0.0, min(1.0, word_tensor[wti] + noise))
                             acq_phase = "first_word" if mode == "first_words" else "contextual"
-                            conn.execute(
+                            from titan_plugin.persistence import get_client as _acq_gc
+                            _acq_gc(caller_name="language_worker.acquire").write(
                                 "INSERT INTO vocabulary "
                                 "(word, word_type, stage, felt_tensor, confidence, "
                                 "times_encountered, times_produced, learning_phase, created_at) "
                                 "VALUES (?, ?, 1, ?, 0.15, 1, 0, ?, ?)",
-                                (acq_w, acq_type, _json.dumps(word_tensor), acq_phase, time.time()))
+                                (acq_w, acq_type, _json.dumps(word_tensor), acq_phase, time.time()),
+                                table="vocabulary")
                             words_acquired += 1
                             dynamic_recipes.append({
                                 "word": acq_w,
@@ -2618,6 +2735,7 @@ def _persist_word_associations(db_path: str, words_used: list) -> None:
         words = [w.strip(".,!?\"'").lower() for w in words_used if len(w.strip(".,!?\"'")) > 2]
         if len(words) < 2:
             return
+        # DDL direct (one-shot), writes via IMW
         conn = sqlite3.connect(db_path, timeout=5.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
@@ -2629,18 +2747,25 @@ def _persist_word_associations(db_path: str, words_used: list) -> None:
             "avg_state_delta REAL NOT NULL DEFAULT 0.0, "
             "last_epoch INTEGER NOT NULL DEFAULT 0, "
             "PRIMARY KEY (word_a, word_b))")
+        conn.commit()
+        conn.close()
+        from titan_plugin.persistence import get_client
+        client = get_client(caller_name="language_worker.word_assoc")
+        rows = []
         for i in range(len(words)):
             for j in range(i + 1, len(words)):
                 wa, wb = sorted([words[i], words[j]])
-                conn.execute(
-                    "INSERT INTO word_associations "
-                    "(word_a, word_b, co_occurrence, reward_sum, avg_state_delta, last_epoch) "
-                    "VALUES (?, ?, 1, 0, 0, 0) "
-                    "ON CONFLICT(word_a, word_b) DO UPDATE SET "
-                    "co_occurrence = co_occurrence + 1",
-                    (wa, wb))
-        conn.commit()
-        conn.close()
+                rows.append((wa, wb))
+        if rows:
+            client.write_many(
+                "INSERT INTO word_associations "
+                "(word_a, word_b, co_occurrence, reward_sum, avg_state_delta, last_epoch) "
+                "VALUES (?, ?, 1, 0, 0, 0) "
+                "ON CONFLICT(word_a, word_b) DO UPDATE SET "
+                "co_occurrence = co_occurrence + 1",
+                rows,
+                table="word_associations",
+            )
     except Exception as e:
         logger.debug("[LanguageWorker] Word association error: %s", e)
 
@@ -2650,6 +2775,7 @@ def _persist_creative_journal(db_path: str, result: dict, epoch_id: int) -> None
     import sqlite3
     try:
         import json as _json
+        # DDL direct, write via IMW
         conn = sqlite3.connect(db_path, timeout=5.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
@@ -2659,7 +2785,10 @@ def _persist_creative_journal(db_path: str, result: dict, epoch_id: int) -> None
             "timestamp REAL NOT NULL, action_type TEXT NOT NULL, "
             "creation_summary TEXT, score REAL, state_delta REAL, "
             "words_used TEXT, features TEXT, epoch_id INTEGER)")
-        conn.execute(
+        conn.commit()
+        conn.close()
+        from titan_plugin.persistence import get_client
+        get_client(caller_name="language_worker.creative_journal").write(
             "INSERT INTO creative_journal "
             "(timestamp, action_type, creation_summary, score, "
             "state_delta, words_used, features, epoch_id) "
@@ -2670,9 +2799,8 @@ def _persist_creative_journal(db_path: str, result: dict, epoch_id: int) -> None
              result.get("resonance", 0.0),
              _json.dumps(result.get("words_used", [])),
              "{}",
-             epoch_id))
-        conn.commit()
-        conn.close()
+             epoch_id),
+            table="creative_journal")
     except Exception as e:
         logger.debug("[LanguageWorker] Creative journal error: %s", e)
 

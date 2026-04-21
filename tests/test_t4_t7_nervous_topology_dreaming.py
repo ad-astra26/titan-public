@@ -228,30 +228,69 @@ class TestTopologyEngine:
 
 class TestDreamingCycle:
     def test_fatigue_rises_with_depleted_observables(self):
-        """Low outer coherence/magnitude → high fatigue."""
+        """Depleted outer + inner signals → composite fatigue rises.
+
+        Updated 2026-04-20: fatigue formula now combines outer (45%) + inner
+        (55%) weighted composites. Providing only outer observables gives
+        ~0.17 (outer_weight × outer_fatigue alone). Test now exercises the
+        full formula by also passing neurochemical + experience inputs so
+        inner_fatigue contributes meaningfully.
+        """
         from titan_plugin.logic.dreaming import DreamingEngine
         engine = DreamingEngine()
         obs = _make_obs(coherence=0.2, magnitude=0.2, direction=0.3)
-        fatigue = engine.compute_fatigue(obs, {})
+        neuro = {
+            "metabolic_drain": 0.4,     # high drain → i1_gaba = 0.8
+            "neuromod_deviation": 0.3,  # i2 = 0.9
+            "chi_circulation": 0.02,    # i3 chi stagnation high
+        }
+        exp = {"undistilled": 80, "total": 100}  # high pressure
+        fatigue = engine.compute_fatigue(obs, {}, neuro, exp)
         assert fatigue > 0.3
 
-    def test_readiness_rises_with_restored_observables(self):
-        """High inner coherence + stable direction → high readiness."""
+    def test_wake_drive_rises_with_alert_neurochemistry(self):
+        """High NE + DA + low fatigue → high wake_drive.
+
+        Replaces test_readiness_rises_with_restored_observables — the old
+        compute_readiness method was removed; dreaming onset is now
+        governed by sleep_drive vs wake_drive competition (no separate
+        readiness metric). Testing wake_drive directly is the closest
+        semantic replacement.
+        """
         from titan_plugin.logic.dreaming import DreamingEngine
         engine = DreamingEngine()
-        engine._last_transition_ts = time.time() - 600  # 10 min rest
-        obs = _make_obs(coherence=0.95, direction=0.95)
-        readiness = engine.compute_readiness(obs, {"curvature": 0.5})
-        assert readiness > 0.5
+        engine.last_fatigue = 0.1  # well-rested
+        wake = engine.compute_wake_drive(ne_level=0.9, da_level=0.8)
+        assert wake > 0.5
 
     def test_begin_dreaming_transition(self):
-        """Fatigue above threshold triggers BEGIN_DREAMING."""
+        """sleep_drive > wake_drive triggers BEGIN_DREAMING.
+
+        Updated 2026-04-20: onset is no longer fatigue-threshold-based.
+        It's neurochemical competition: sleep_drive (drain × GABA × exp
+        pressure × adenosine) vs wake_drive (NE × DA × fatigue dampening).
+        Test provides high sleep-promoting + low wake-promoting values.
+        """
         from titan_plugin.logic.dreaming import DreamingEngine
         from titan_plugin.logic.inner_state import InnerState
-        engine = DreamingEngine(fatigue_threshold=0.3)
+        engine = DreamingEngine()
         inner = InnerState()
         obs = _make_obs(coherence=0.1, magnitude=0.1, direction=0.1)
-        transition = engine.check_transition(inner, obs, {})
+        # Seed fatigue first so sleep_drive uses it
+        engine.compute_fatigue(obs, {}, {
+            "metabolic_drain": 0.6,
+            "neuromod_deviation": 0.4,
+        }, {"undistilled": 100, "total": 100})
+        neuro = {
+            "metabolic_drain": 0.6,     # high drain
+            "gaba_level": 0.8,           # amplifies sleep_drive
+            "ne_level": 0.1,             # low alertness
+            "da_level": 0.1,             # low engagement
+            "neuromod_deviation": 0.4,
+            "chi_circulation": 0.05,
+        }
+        exp = {"undistilled": 100, "total": 100}
+        transition = engine.check_transition(inner, obs, {}, neuro, exp)
         assert transition == "BEGIN_DREAMING"
 
     def test_end_dreaming_transition(self):

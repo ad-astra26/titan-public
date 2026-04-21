@@ -177,6 +177,45 @@ class CGNConsumerClient:
         from titan_plugin.logic.cgn_shm_protocol import ShmWeightReader
         self._shm_reader = ShmWeightReader(shm_path)
 
+        # Plug B (rFP §20): EMA of recent emotional cross-insight rewards.
+        # Each incoming CGN_CROSS_INSIGHT with origin="emotional" updates
+        # this; consumer ground() exposes it via state_vec slot 18 so the
+        # V(s) learning can associate "what I was doing when emotion
+        # flagged a reward-deviation event." Neutral baseline = 0.5.
+        self._emot_insight_reward_ema: float = 0.5
+        self._emot_insight_count: int = 0
+        self._emot_insight_last_ts: float = 0.0
+
+    def note_incoming_cross_insight(self, payload: dict) -> None:
+        """Process a CGN_CROSS_INSIGHT from another consumer.
+
+        v1: only emotional insights are used (rFP §20 Plug B). The
+        `terminal_reward` becomes an EMA that downstream ground() calls
+        can expose via state_vec slot 18 — giving the consumer's V(s)
+        learning a signal of "what I was doing when emotion marked
+        reward deviation." Neutral baseline 0.5 means no recent event.
+
+        Own-name emissions and unknown origins are silently skipped.
+        Never raises.
+        """
+        try:
+            origin = str(payload.get("origin_consumer", ""))
+            if origin == self._name or origin != "emotional":
+                return
+            r = float(payload.get("terminal_reward", 0.5))
+            r = max(0.0, min(1.0, r))
+            # EMA with α=0.3 — moderately reactive; recent events shift
+            # slot 18 a noticeable but non-dominant amount.
+            self._emot_insight_reward_ema = (
+                0.7 * self._emot_insight_reward_ema + 0.3 * r
+            )
+            self._emot_insight_count += 1
+            self._emot_insight_last_ts = time.time()
+        except Exception as e:
+            logger.debug(
+                "[CGNClient:%s] note_incoming_cross_insight error: %s",
+                self._name, e)
+
     def _ensure_initialized(self) -> None:
         """Lazy initialization — loads numpy weights on first use.
 
@@ -477,8 +516,21 @@ class CGNConsumerClient:
             if len(s) > 65:
                 vec[15] = float(np.mean(s[65:95]))
             vec[16] = float(np.std(s[:65]))
-        vec[17] = 0.5  # trajectory placeholder
-        vec[18] = 0.5  # chi placeholder
+        # Plug A (rFP §20): slot 17 = emotion valence [0,1] from bundle.
+        # 0.5 = neutral / bundle unavailable (matches old placeholder).
+        try:
+            from titan_plugin.logic.emot_bundle_protocol import (
+                read_emotion_valence_normalized)
+            vec[17] = read_emotion_valence_normalized(default=0.5)
+        except Exception:
+            vec[17] = 0.5
+        # Plug B (rFP §20): slot 18 = EMA of recent emotional cross-insight
+        # rewards. 0.5 = neutral / no recent emotion events. Tracks
+        # reactive "what I was doing when EMOT-CGN flagged reward
+        # deviation" — lets V(s) learn to associate current concept
+        # with emotional-anomaly moments. Reverts to 0.5 as events age
+        # out via EMA decay.
+        vec[18] = float(self._emot_insight_reward_ema)
         vec[19] = min(1.0, ctx.get("epoch", 0) / 500000.0)
 
         # Concept summary [20:29]

@@ -250,11 +250,9 @@ class TitanCore:
         # Meditation cycle (memory consolidation, mempool scoring, Cognee cognify)
         asyncio.get_event_loop().create_task(self._meditation_loop())
 
-        # Sovereign backup (rFP_backup_worker Phase 1 — corrected 2026-04-13):
-        # TitanCore IS the production entry point (titan_main.py:204); TitanPlugin
-        # is legacy/unused in the microkernel boot path. So backup MUST live here.
-        # Single loop, correct RebirthBackup signature, ArweaveStore injected once.
-        asyncio.get_event_loop().create_task(self._backup_loop())
+        # rFP_backup_worker Phase 1 (2026-04-20) — _backup_loop DELETED.
+        # Backup runs as a Guardian-supervised subprocess ("backup" module)
+        # subscribing to MEDITATION_COMPLETE via bus. See modules/backup_worker.py.
 
         # V4: Outer Trinity collector loop (computes Outer Trinity tensors, publishes to bus)
         self._boot_outer_trinity()
@@ -291,7 +289,69 @@ class TitanCore:
         from .modules.language_worker import language_worker_main
         from .modules.cgn_worker import cgn_worker_main
         from .modules.knowledge_worker import knowledge_worker_main
+        from .modules.emot_cgn_worker import emot_cgn_worker_main
         from .modules.timechain_worker import timechain_worker_main
+        from .modules.backup_worker import backup_worker_main
+        from .persistence_entry import imw_main
+
+        # IMW — Inner Memory Writer Service. Registered FIRST so other modules
+        # that write to inner_memory.db can connect on startup.
+        # Autostart only when persistence.enabled=true in config.toml.
+        _persistence_cfg = self._full_config.get("persistence", {})
+        _imw_enabled = bool(_persistence_cfg.get("enabled", False))
+        _data_dir_raw = self._full_config.get("memory_and_storage", {}).get("data_dir", "./data")
+        imw_config = {
+            **_persistence_cfg,
+            "db_path": _persistence_cfg.get("db_path") or (_data_dir_raw.rstrip("/") + "/inner_memory.db"),
+        }
+        self.guardian.register(ModuleSpec(
+            name="imw",
+            entry_fn=imw_main,
+            config=imw_config,
+            rss_limit_mb=300,  # asyncio + sqlite3 + msgpack only; stays lean
+            autostart=_imw_enabled,   # Only start when master switch flipped on
+            lazy=False,
+            heartbeat_timeout=60.0,
+            reply_only=True,  # IMW IPC is via unix socket, not bus broadcasts
+        ))
+
+        # Observatory Writer Service — second IMW instance for observatory.db.
+        # Same imw_main entry function, different config: own socket, own WAL,
+        # own metrics file (auto-namespaced by name), own primary+shadow DBs.
+        # Scoped per rFP_observatory_writer_service (drafted 2026-04-21);
+        # microkernel-v2-aligned (L3 DB ownership). Default OFF — Maker flips
+        # `enabled=true` in [persistence_observatory] when ready for Phase 1.
+        _obs_persistence_cfg = self._full_config.get("persistence_observatory", {})
+        _obs_writer_enabled = bool(_obs_persistence_cfg.get("enabled", False))
+        # Per-instance defaults — namespaced so the two writers don't collide
+        # on socket/WAL/journal/metrics paths. Maker can override any of these
+        # in [persistence_observatory] in config.toml.
+        _obs_data_dir = _data_dir_raw.rstrip("/")
+        _obs_writer_config = {
+            # Inherit defaults from main IMW; override the per-instance paths.
+            **_persistence_cfg,
+            **_obs_persistence_cfg,
+            "socket_path": _obs_persistence_cfg.get(
+                "socket_path", "data/run/observatory_writer.sock"),
+            "wal_path": _obs_persistence_cfg.get(
+                "wal_path", "data/run/observatory_writer.wal"),
+            "journal_dir": _obs_persistence_cfg.get(
+                "journal_dir", "data/run"),
+            "db_path": _obs_persistence_cfg.get(
+                "db_path", _obs_data_dir + "/observatory.db"),
+            "shadow_db_path": _obs_persistence_cfg.get(
+                "shadow_db_path", _obs_data_dir + "/observatory_shadow.db"),
+        }
+        self.guardian.register(ModuleSpec(
+            name="observatory_writer",
+            entry_fn=imw_main,                    # reuse same entry — fully parameterized by config
+            config=_obs_writer_config,
+            rss_limit_mb=300,
+            autostart=_obs_writer_enabled,        # default OFF until Maker flips
+            lazy=False,
+            heartbeat_timeout=60.0,
+            reply_only=True,                       # Unix-socket IPC, no bus broadcasts
+        ))
 
         # Memory module (FAISS + Kuzu + DuckDB)
         memory_config = {
@@ -449,6 +509,11 @@ class TitanCore:
 
         # Knowledge Worker (4th CGN consumer — knowledge acquisition + Stealth Sage)
         _data_dir = self._full_config.get("memory_and_storage", {}).get("data_dir", "./data")
+        # KP-v2: flatten [knowledge_pipeline] (router/cache/health paths, circuit-
+        # breaker tuning, near-dup thresholds, telegram_alerts_enabled kill-switch)
+        # plus the nested [knowledge_pipeline.budgets] table (per-backend MB/day).
+        # Without this, the alert cascade wired in knowledge_worker sees budgets=0
+        # (unlimited) and never fires.
         knowledge_config = {
             "db_path": _data_dir + "/inner_memory.db",
             "cgn_state_dir": "data/cgn",
@@ -461,6 +526,8 @@ class TitanCore:
             # Twitter API (for X research path)
             "twitterapi_io_key": self._full_config.get(
                 "twitter_social", {}).get("twitterapi_io_key", ""),
+            # Knowledge Pipeline v2 (router/cache/health/budgets/alerts)
+            **self._full_config.get("knowledge_pipeline", {}),
         }
         self.guardian.register(ModuleSpec(
             name="knowledge",
@@ -489,6 +556,57 @@ class TitanCore:
             lazy=False,
             heartbeat_timeout=120.0,  # Extended: integrity check + healing takes ~60s
             reply_only=False,     # Receives EPOCH_TICK, TIMECHAIN_COMMIT, etc.
+        ))
+
+        # Backup Worker — promoted from TitanCore._backup_loop per
+        # rFP_backup_worker Phase 1 (2026-04-20). Owns RebirthBackup (daily
+        # personality + weekly soul + TimeChain + ZK epoch + MyDay NFT).
+        # Subscribes to MEDITATION_COMPLETE via bus (was trigger-file handoff).
+        self.guardian.register(ModuleSpec(
+            name="backup",
+            entry_fn=backup_worker_main,
+            config=self._full_config,  # full config — reads [backup]/[network]/[info_banner]/[mainnet_budget]/[memory_and_storage]
+            rss_limit_mb=800,     # gzip-9 over ~300MB full-tier personality + Irys subprocess
+            autostart=True,       # Must be ready by 1st meditation of the day
+            lazy=False,
+            heartbeat_timeout=600.0,  # Personality+TimeChain tarball build + upload can take 4-6 min
+            reply_only=False,     # Subscribes to MEDITATION_COMPLETE + BACKUP_TRIGGER_MANUAL broadcasts
+        ))
+
+        # EMOT-CGN Worker (8th CGN consumer — emotional grounding)
+        # rFP_emot_cgn_v2.md §10 ADR: standalone L2 worker, no in-process
+        # fallback. Phase 1.6a scaffold; EmotCGNConsumer migration arrives
+        # Phase 1.6e — until then, existing in-process EMOT-CGN in
+        # meta_reasoning.py continues to own primitive β grounding.
+        # Per-Titan shm paths — T2+T3 share the same VPS filesystem, so
+        # they MUST have separate shm files or they'd clobber each other's
+        # state. titan_id from canonical data/titan_identity.json (same
+        # source language_config + most other per-Titan logic uses).
+        _emot_titan_id = "T1"
+        try:
+            import json as _json_id
+            _id_path = "data/titan_identity.json"
+            if os.path.exists(_id_path):
+                with open(_id_path) as _idf:
+                    _emot_titan_id = _json_id.load(_idf).get("titan_id", "T1")
+        except Exception:
+            pass
+        self.guardian.register(ModuleSpec(
+            name="emot_cgn",
+            entry_fn=emot_cgn_worker_main,
+            config={
+                **self._full_config.get("emot_cgn", {}),
+                "titan_id": _emot_titan_id,
+                "shm_state_path":
+                    f"/dev/shm/titan_{_emot_titan_id}/emot_state.bin",
+                "shm_grounding_path":
+                    f"/dev/shm/titan_{_emot_titan_id}/emot_grounding.bin",
+            },
+            rss_limit_mb=300,    # β-posterior + clusterer + HAOV state fits well under 300MB
+            autostart=True,       # Must be up before meta_reasoning emits EMOT_CHAIN_EVIDENCE
+            lazy=False,
+            heartbeat_timeout=90.0,
+            reply_only=False,    # Subscribes to EMOT_CHAIN_EVIDENCE + FELT_CLUSTER_UPDATE (Phase 1.6d)
         ))
 
         logger.info("[TitanCore] Registered %d supervised modules", len(self.guardian._modules))
@@ -847,9 +965,22 @@ class TitanCore:
             sage_cfg = self._full_config.get("stealth_sage", {})
             searxng_host = sage_cfg.get("searxng_host", "http://localhost:8080")
             firecrawl_key = sage_cfg.get("firecrawl_api_key", "")
+            # BUG-KP-WEBSEARCH-HEALTH-DEFAULTS fix (2026-04-21) — forward
+            # the same [knowledge_pipeline.budgets] MB→bytes dict that
+            # knowledge_worker uses. Without this, WebSearchHelper's
+            # HealthTracker had empty defaults and could clobber shared
+            # data/knowledge_pipeline_health.json with budget=0 entries.
+            _kp_cfg = self._full_config.get("knowledge_pipeline", {}) or {}
+            _kp_budgets_mb = _kp_cfg.get("budgets", {}) or {}
+            _kp_budgets_bytes = {
+                k: int(v) * 1024 * 1024
+                for k, v in _kp_budgets_mb.items()
+                if isinstance(v, (int, float))
+            }
             registry.register(WebSearchHelper(
                 searxng_url=searxng_host,
                 firecrawl_api_key=firecrawl_key,
+                budgets=_kp_budgets_bytes,
             ))
         except Exception as e:
             logger.warning("[TitanCore] WebSearch helper failed: %s", e)
@@ -1710,111 +1841,25 @@ class TitanCore:
                     "MEDITATION_COMPLETE", "core", "timechain",
                     _med_payload,
                 ))
+                # ── Notify backup_worker (rFP_backup_worker Phase 1, 2026-04-20) ──
+                # Replaces prior data/backup_trigger.json file handoff.
+                self.bus.publish(make_msg(
+                    "MEDITATION_COMPLETE", "core", "backup",
+                    _med_payload,
+                ))
 
             except Exception as e:
                 logger.error("[TitanCore] Meditation loop error: %s", e)
                 await asyncio.sleep(60)
 
     # ------------------------------------------------------------------
-    # Sovereign Backup Loop (rFP_backup_worker Phase 1 — 2026-04-13 fix)
+    # Sovereign Backup — PROMOTED 2026-04-20 per rFP_backup_worker Phase 1
     # ------------------------------------------------------------------
-    # AUDIT NOTE: Previous TitanCore._backup_loop had BUG-2 (wrong signature:
-    # `RebirthBackup(self._full_config)` passed config as first positional arg
-    # which is network_client). Previous rFP claimed TitanPlugin.backup_loop
-    # was a parallel loop, but in fact titan_main.py:204 only uses TitanCore
-    # (TitanPlugin is legacy, unreachable from production boot path). So the
-    # real fix is to keep the loop here WITH the correct signature, plus:
-    #   - inject ArweaveStore once at boot (BUG-5)
-    #   - RebirthBackup receives correct (network, config, titan_id, arweave_store, full_config)
-    #   - uses tarball path via backup.py (B0)
-    #   - per-Titan manifest via timechain_backup.py (BUG-4)
-
-    async def _backup_loop(self) -> None:
-        """Poll for meditation trigger files and run RebirthBackup.
-
-        Triggered by spirit_worker writing data/backup_trigger.json on
-        MEDITATION_COMPLETE. Delegates to RebirthBackup for:
-        - Daily personality → Arweave (1st meditation of day)
-        - Weekly soul package → Arweave (every 7th day Sunday)
-        - Vault shadow hash update → Solana (after each backup)
-        - Backup hash memo → Solana (anchor after backup)
-        - MyDay NFT mint → Solana (every 4th meditation)
-        - TimeChain Zstd tarball → Arweave (daily, per B0)
-        """
-        import json as _json
-
-        trigger_path = os.path.join("data", "backup_trigger.json")
-
-        # Construct ArweaveStore ONCE at boot (rFP BUG-5 fix).
-        _arweave_store = None
-        try:
-            _budget = self._full_config.get("mainnet_budget", {})
-            if _budget.get("backup_arweave_enabled", False):
-                _net_cfg = self._full_config.get("network", {})
-                _net = _net_cfg.get("solana_network", "devnet")
-                if _net == "mainnet-beta":
-                    _net = "mainnet"
-                _kp = _net_cfg.get("wallet_keypair_path", "")
-                if _kp:
-                    from titan_plugin.utils.arweave_store import ArweaveStore
-                    _arweave_store = ArweaveStore(keypair_path=_kp, network=_net)
-                    logger.info(
-                        "[TitanCore] ArweaveStore wired for backup (network=%s)", _net)
-        except Exception as _ae:
-            logger.warning("[TitanCore] ArweaveStore init failed: %s", _ae)
-
-        # Initialize RebirthBackup with CORRECT signature (rFP BUG-2 + BUG-5 fix).
-        _titan_id = self._full_config.get("info_banner", {}).get("titan_id", "T1")
-        _backup = None
-        try:
-            from titan_plugin.logic.backup import RebirthBackup
-            _backup = RebirthBackup(
-                network_client=getattr(self, "network", None),
-                config=self._full_config.get("memory_and_storage", {}),
-                titan_id=_titan_id,
-                arweave_store=_arweave_store,
-                full_config=self._full_config,
-            )
-            logger.info(
-                "[TitanCore] RebirthBackup initialized — sovereign backup active "
-                "(titan_id=%s, arweave=%s)",
-                _titan_id, "wired" if _arweave_store is not None else "none")
-        except Exception as e:
-            logger.error(
-                "[TitanCore] RebirthBackup init failed — NO BACKUPS: %s", e, exc_info=True)
-            return
-
-        # Boot check (verify last backup age, alert if stale)
-        try:
-            await _backup.check_on_boot()
-        except Exception as e:
-            logger.warning("[TitanCore] Backup boot check failed: %s", e)
-
-        while True:
-            await asyncio.sleep(30)
-
-            if not os.path.exists(trigger_path):
-                continue
-
-            try:
-                with open(trigger_path) as _tf:
-                    trigger = _json.load(_tf)
-                os.remove(trigger_path)
-
-                payload = trigger.get("payload", {})
-                med_count = trigger.get("meditation_count", 0)
-
-                logger.info("[TitanCore] Processing backup for meditation #%d...", med_count)
-                await _backup.on_meditation_complete(payload)
-
-            except _json.JSONDecodeError as e:
-                logger.warning("[TitanCore] Invalid backup trigger: %s", e)
-                try:
-                    os.remove(trigger_path)
-                except OSError:
-                    pass
-            except Exception as e:
-                logger.error("[TitanCore] Backup loop error: %s", e, exc_info=True)
+    # TitanCore._backup_loop was deleted in the promotion to a Guardian-
+    # supervised subprocess module. See titan_plugin/modules/backup_worker.py
+    # for the live backup pipeline + §5.3 failsafe cascade. The subprocess
+    # subscribes to MEDITATION_COMPLETE via bus (dst="backup"); the
+    # data/backup_trigger.json file handoff is retired.
 
     # ------------------------------------------------------------------
     # V4: Outer Trinity Collector

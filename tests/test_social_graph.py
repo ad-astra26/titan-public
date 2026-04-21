@@ -434,7 +434,9 @@ class TestWebhookTransactionRouting:
         plugin = MagicMock()
         plugin.network.pubkey = "TitanWallet"
         plugin.social_graph = MagicMock()
-        plugin.social_graph.record_inspiration.return_value = None
+        # rFP_social_graph_async_safety §5.2: webhook now calls
+        # record_inspiration_async — must be an AsyncMock to be awaitable.
+        plugin.social_graph.record_inspiration_async = AsyncMock(return_value=None)
         plugin.social_graph.get_donation_mood_boost.return_value = (0.01, 1.5)
         plugin.memory = MagicMock()
         plugin.memory.inject_memory = AsyncMock()
@@ -455,7 +457,7 @@ class TestWebhookTransactionRouting:
         }
         result = await _process_transaction(plugin, tx)
         assert result is True
-        plugin.social_graph.record_inspiration.assert_called_once()
+        plugin.social_graph.record_inspiration_async.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_routes_donation(self):
@@ -464,7 +466,9 @@ class TestWebhookTransactionRouting:
         plugin = MagicMock()
         plugin.network.pubkey = "TitanWallet"
         plugin.social_graph = MagicMock()
-        plugin.social_graph.record_donation.return_value = None
+        # rFP_social_graph_async_safety §5.2: webhook now calls
+        # record_donation_async — must be an AsyncMock to be awaitable.
+        plugin.social_graph.record_donation_async = AsyncMock(return_value=None)
         plugin.social_graph.get_donation_mood_boost.return_value = (0.05, 3.0)
         plugin.event_bus = MagicMock()
         plugin.event_bus.emit = AsyncMock()
@@ -480,7 +484,7 @@ class TestWebhookTransactionRouting:
         }
         result = await _process_transaction(plugin, tx)
         assert result is True
-        plugin.social_graph.record_donation.assert_called_once()
+        plugin.social_graph.record_donation_async.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_ignores_irrelevant_tx(self):

@@ -802,8 +802,13 @@ def scan_bus_publishers_and_subscribers(
     subscribers: dict[str, list[tuple[str, int]]] = defaultdict(list)
 
     # Build a compiled regex union for fast prefilter (avoid AST on files
-    # that definitely don't touch the bus).
-    bus_marker = re.compile(r"\b(make_msg|_send_msg|msg_type|msg\.get\(|message_type)\b")
+    # that definitely don't touch the bus). Also includes canonical publish
+    # helpers (emit_meta_cgn_signal, emit_emot_cgn_signal) so files that use
+    # them indirectly without raw make_msg/msg_type references still get
+    # scanned and credited as publishers.
+    bus_marker = re.compile(
+        r"\b(make_msg|_send_msg|msg_type|msg\.get\(|message_type|"
+        r"emit_meta_cgn_signal|emit_emot_cgn_signal)\b")
 
     for py in root.rglob("*.py"):
         if "__pycache__" in py.parts:

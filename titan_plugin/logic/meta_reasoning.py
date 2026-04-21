@@ -49,9 +49,21 @@ META_PRIMITIVES = [
 NUM_META_ACTIONS = 9
 
 SUB_MODES = {
-    "FORMULATE":   ["define", "refine", "load_wisdom"],
-    "RECALL":      ["chain_archive", "experience", "entity", "wisdom"],
-    "HYPOTHESIZE": ["generate", "refine", "compare"],
+    # F-phase (rFP §6 / Upgrade C): compositional sub-modes added to
+    # FORMULATE, RECALL, HYPOTHESIZE. Other primitives keep current lists —
+    # expand later from usage data. New entries route via the Recruitment
+    # Layer when resolvers land (Session 2); Session 1 falls back to the
+    # nearest existing sub-mode's behavior + compositional metadata tag.
+    "FORMULATE":   ["define", "refine", "load_wisdom",
+                    "compose_intersection", "compose_union",
+                    "compose_difference", "narrow_to_subset",
+                    "generalize_from_instance"],
+    "RECALL":      ["chain_archive", "experience", "entity", "wisdom",
+                    "episodic_specific", "semantic_neighbors",
+                    "procedural_matching", "autobiographical_relevant"],
+    "HYPOTHESIZE": ["generate", "refine", "compare",
+                    "analogize_from", "contrast_with",
+                    "propose_by_inversion", "extend_pattern"],
     "DELEGATE":    ["full_chain", "quick_chain", "biased_chain"],
     "SYNTHESIZE":  ["combine", "abstract", "rank", "distill_save"],
     "EVALUATE":    ["check_progress", "check_strategy", "check_resources"],
@@ -108,6 +120,22 @@ STEP_REWARDS = {
     "INTROSPECT.vocabulary_probe": 0.03,
     "INTROSPECT.architecture_query": 0.04,
     "INTROSPECT.maker_alignment": 0.04,
+    # F-phase (rFP §6 / Upgrade C): compositional sub-modes. Values set to
+    # each primitive's existing average so these aren't preferred or
+    # penalized vs. current modes until emergent rewards ramp in (rFP §7).
+    "FORMULATE.compose_intersection": 0.06,
+    "FORMULATE.compose_union": 0.06,
+    "FORMULATE.compose_difference": 0.06,
+    "FORMULATE.narrow_to_subset": 0.06,
+    "FORMULATE.generalize_from_instance": 0.06,
+    "RECALL.episodic_specific": 0.02,
+    "RECALL.semantic_neighbors": 0.02,
+    "RECALL.procedural_matching": 0.02,
+    "RECALL.autobiographical_relevant": 0.02,
+    "HYPOTHESIZE.analogize_from": 0.04,
+    "HYPOTHESIZE.contrast_with": 0.04,
+    "HYPOTHESIZE.propose_by_inversion": 0.04,
+    "HYPOTHESIZE.extend_pattern": 0.04,
 }
 
 META_POLICY_INPUT_DIM = 80
@@ -914,6 +942,19 @@ class MetaReasoningEngine:
                                _mcgn_err)
                 self._meta_cgn = None
 
+        # ── EMOT-CGN — standalone worker (Phase 1.6h cutover 2026-04-20) ──
+        # EmotCGNConsumer now lives in `titan_plugin/modules/emot_cgn_worker.py`
+        # (standalone Guardian-supervised L2 subprocess) per rFP_emot_cgn_v2
+        # §10 ADR. Meta-reasoning emits EMOT_CHAIN_EVIDENCE +
+        # FELT_CLUSTER_UPDATE bus messages; downstream consumers read
+        # state via ShmEmotReader (`/dev/shm/titan/emot_state.bin`) per
+        # rFP_microkernel_v2 §State Registries.
+        #
+        # `self._emot_cgn = None` kept as sentinel for code paths that
+        # still check truthiness during cutover window; removed entirely
+        # in Phase 1.7+ once all call-sites converted to shm reads.
+        self._emot_cgn = None
+
         # Per-chain task context (set in _start_chain, used in _conclude_chain)
         self._chain_task_emb = None
         self._chain_task_domain = "general"
@@ -986,6 +1027,10 @@ class MetaReasoningEngine:
         self._ema_state = self._ema_alpha * sv_arr + (1 - self._ema_alpha) * self._ema_state
 
         nm = self._normalize_neuromods(neuromods)
+        # Stash for _conclude_chain → _emot_ctx producer wiring (rFP §23.6):
+        # EMOT-CGN's bundle needs real 6D neuromod state, not the 0.5-default
+        # stubs from _subsystem_cache. `nm` is the canonical per-tick reading.
+        self._last_neuromods_dict = nm
 
         # If no active chain, check trigger
         if not self.state.is_active:
@@ -1000,7 +1045,7 @@ class MetaReasoningEngine:
             return self._check_delegate(reasoning_engine)
 
         # Build input + select primitive
-        meta_input = self._build_meta_input(sv, nm, chain_archive)
+        meta_input = self._build_meta_input(sv, nm, chain_archive, meta_autoencoder)
         temperature = self._get_temperature(nm)
 
         # ── TUNING-017: consecutive-repeat decay ──
@@ -1070,8 +1115,14 @@ class MetaReasoningEngine:
         # the template specifies a different primitive, override with
         # probability proportional to (Q - 0.5) * blend_alpha. This lets
         # the chain Q-net steer behavior without fully overriding the policy.
-        if (self._chain_iql and self._suggested_template
-                and self._suggested_template_q > 0.5):
+        # 2026-04-19: explicit `is not None` + `> 0` guards instead of
+        # truthy checks — avoids `ValueError: truth value ambiguous` if
+        # _suggested_template ever becomes a numpy array (same class
+        # of bug as BUG-META-STATS-PERSISTENCE; see
+        # memory/feedback_numpy_truthy_persistence.md).
+        if (self._chain_iql is not None
+                and self._suggested_template is not None
+                and float(self._suggested_template_q or 0.0) > 0.5):
             try:
                 from titan_plugin.logic.task_embedding import template_to_primitive_list
                 tmpl_prims = template_to_primitive_list(self._suggested_template)
@@ -1453,6 +1504,63 @@ class MetaReasoningEngine:
                     "_suggested_template_q"),
                 "subsystem_cache_pending": bool(
                     getattr(self, "_subsystem_cache_pending", False)),
+                # Cognitive-contract handler counters. Before 2026-04-21 these
+                # were in-memory only, so every restart reset them to 0 —
+                # dashboard showed fires=0 even when the CONTRACTS fired
+                # correctly (orchestrator log proves firings, handler log
+                # proves handlers ran). Root cause of BUG-CONTRACT-GATE-
+                # STARVATION's "fires=0" symptom. Counters now persist so
+                # lifetime accounting survives the frequent restarts caused
+                # by other bugs being fixed. Plain lists/dicts are passed
+                # through (json.dumps handles them); _jsonable_default would
+                # repr() them into strings.
+                "cc_strategy_drift_fires": _safe_int("_cc_strategy_drift_fires"),
+                "cc_strategy_drift_last_top": list(
+                    getattr(self, "_cc_strategy_drift_last_top", []) or []),
+                "cc_pattern_emerged_fires": _safe_int("_cc_pattern_emerged_fires"),
+                "cc_pattern_emerged_last": list(
+                    getattr(self, "_cc_pattern_emerged_last", []) or []),
+                "cc_monoculture_fires": _safe_int("_cc_monoculture_fires"),
+                "cc_monoculture_last": dict(
+                    getattr(self, "_cc_monoculture_last", {}) or {}),
+                # --- Audit-driven additions (2026-04-21) ---
+                # Systematic sweep of MetaReasoningEngine lifetime/stateful
+                # attributes not previously persisted. Surfaced during the
+                # BUG-CONTRACT-GATE-STARVATION investigation — `save_all`
+                # had grown incrementally with 20 keys while __init__
+                # carries 30+ stateful attributes, most of them exposed
+                # in get_stats() as "*_lifetime" or mid-decay state. Every
+                # restart silently reset them to 0. Fix parallels cc_*
+                # counters: persist the ones clearly lifetime/stateful,
+                # skip the ones that are recomputable or short-lived.
+                "inengine_mono_total_fires":
+                    _safe_int("_inengine_mono_total_fires"),
+                "inengine_mono_last_fire_chain":
+                    _safe_int("_inengine_mono_last_fire_chain", -1),
+                "mono_adj_fires_count": _safe_int("_mono_adj_fires_count"),
+                "mono_adj_cumulative": _safe_float("_mono_adj_cumulative"),
+                "diversity_pressure_total_applied":
+                    _safe_int("_diversity_pressure_total_applied"),
+                "diversity_pressure_remaining":
+                    _safe_int("_diversity_pressure_remaining"),
+                "diversity_pressure_initial_magnitude":
+                    _safe_float("_diversity_pressure_initial_magnitude"),
+                "diversity_pressure_initial_decay":
+                    _safe_int("_diversity_pressure_initial_decay"),
+                "introspect_executions_lifetime":
+                    _safe_int("_introspect_executions_lifetime"),
+                "introspect_picks_lifetime":
+                    _safe_int("_introspect_picks_lifetime"),
+                "introspect_rerouted_lifetime":
+                    _safe_int("_introspect_rerouted_lifetime"),
+                "next_chain_id": _safe_int("_next_chain_id", 1),
+                "last_concluded_chain_id":
+                    _safe_int("_last_concluded_chain_id"),
+                "repeat_impasse_count": _safe_int("_repeat_impasse_count"),
+                "repeat_impasse_primitives":
+                    _safe_nonempty_dict("_repeat_impasse_primitives"),
+                "soar_last_successful_topic": str(
+                    getattr(self, "_soar_last_successful_topic", "") or ""),
             }
             # Step 1 — pre-flight serialize to string (in-memory, no
             # file touched). default= handles any exotic type.
@@ -1498,6 +1606,20 @@ class MetaReasoningEngine:
             "total_steps": self._total_meta_steps,
             "total_wisdom_saved": self._total_wisdom_saved,
             "total_eurekas": self._total_eurekas,
+            # commit telemetry — additively exposed for self_reasoning Layer A
+            # novelty-gap detection (rFP_coding_explorer_activation.md §4.1)
+            # 2026-04-21 hotfix: `_total_conclusions` lives on reasoning_engine
+            # (see L457), not on MetaReasoningEngine. Use getattr fallback so
+            # get_stats() doesn't AttributeError out — was breaking the entire
+            # meta-reasoning dashboard (META CHAINS/WISDOM/AVG REWARD all
+            # showed 0/empty because every tick raised AttributeError and the
+            # except handler returned {}). 1310 errors on T1 before this fix.
+            # Proper fix: wire reasoning_engine._total_conclusions through to
+            # here, or rename this metric — follow-up, not urgent.
+            "total_commits": getattr(self, "_total_conclusions", 0),
+            "commit_rate": (
+                getattr(self, "_total_conclusions", 0) / self._total_meta_chains
+                if self._total_meta_chains > 0 else 0.0),
             "baseline_confidence": round(self._baseline_confidence, 4),
             "buffer_size": self.buffer.size(),
             "policy_updates": self.meta_policy.total_updates,
@@ -1754,6 +1876,31 @@ class MetaReasoningEngine:
         self.state.chain_id = self._next_chain_id
         self._next_chain_id += 1
         self._total_meta_chains += 1
+
+        # EMOT-CGN: emit FELT_CLUSTER_UPDATE to worker (Phase 1.6h cutover).
+        # Worker's clusterer assigns primitive + updates shm. Meta-reasoning
+        # reads dominant-at-start via ShmEmotReader so H5 drift hypothesis
+        # still works without an in-process EmotCGNConsumer reference.
+        # Failsafe: emit failures don't break chain flow.
+        try:
+            from titan_plugin.bus import emit_felt_cluster_update
+            if self._send_queue is not None and len(state_132d) >= 130:
+                emit_felt_cluster_update(
+                    self._send_queue, src="spirit",
+                    felt_tensor_130d=list(state_132d[:130]))
+        except Exception:
+            pass
+        # Snapshot dominant emotion at chain start from shm (worker-written).
+        # Used by H5 drift hypothesis in EMOT_CHAIN_EVIDENCE ctx at conclude.
+        try:
+            from titan_plugin.logic.emot_shm_protocol import ShmEmotReader
+            from titan_plugin.logic.emotion_cluster import EMOT_PRIMITIVES
+            _st = ShmEmotReader().read_state()
+            self._emot_dom_at_chain_start = (
+                EMOT_PRIMITIVES[_st["dominant_idx"]]
+                if _st is not None else "FLOW")
+        except Exception:
+            self._emot_dom_at_chain_start = "FLOW"
 
         # ── TUNING-012 v2 Sub-phase B: encode task + query best template ──
         # The task domain is unknown until FORMULATE.define runs (it sets
@@ -2442,6 +2589,111 @@ class MetaReasoningEngine:
                 logger.warning("[META] META-CGN hook failed: %s "
                                "(chain continues unaffected)", _mcgn_err)
 
+        # ── EMOT-CGN chain evidence (Phase 1.6h cutover) ──
+        # Emit EMOT_CHAIN_EVIDENCE to worker — it owns β-posterior update,
+        # neuromod EMA, and HAOV accumulation. Worker reads dom_end from
+        # its own clusterer state (we don't need to query it). dom_start
+        # snapshot was taken in _start_chain from shm.
+        # Failsafe: emit errors don't break chain flow.
+        try:
+            def _share(chain_prims, target):
+                if not chain_prims:
+                    return 0.0
+                hits = sum(1 for p in chain_prims if p == target)
+                return float(hits) / float(len(chain_prims))
+
+            # Read worker's current dominant emotion from shm for the
+            # dom_end snapshot (used by H5 strategy_shift flag).
+            dom_end = getattr(self, "_emot_dom_at_chain_start", "FLOW")
+            try:
+                from titan_plugin.logic.emot_shm_protocol import ShmEmotReader
+                from titan_plugin.logic.emotion_cluster import EMOT_PRIMITIVES
+                _st = ShmEmotReader().read_state()
+                if _st is not None:
+                    dom_end = EMOT_PRIMITIVES[_st["dominant_idx"]]
+            except Exception:
+                pass
+
+            # Neuromods: prefer `self._last_neuromods_dict` (real per-tick
+            # reading stashed in tick()) over mcgn_ctx (which pulls from
+            # _subsystem_cache — currently stubbed to 0.5 for all 6). Falls
+            # back to mcgn_ctx / 0.5 if the stash is somehow absent.
+            _nm_live = getattr(self, "_last_neuromods_dict", None) or {}
+            def _nmval(k):
+                return float(_nm_live.get(k, mcgn_ctx.get(k, 0.5)))
+            # Trajectory 2D: per consciousness.py:46, state_132d = Inner 65D +
+            # Outer 65D + curvature + density. [130:132] are the two global
+            # meta-scalars — curvature (rate-of-change of inner-space volume)
+            # and density (compactness). These ARE Titan's phase-space
+            # trajectory signal; feeding real values to HDBSCAN.
+            _traj_2d = (
+                [float(state_132d[130]), float(state_132d[131])]
+                if state_132d is not None and len(state_132d) >= 132
+                else [0.0, 0.0]
+            )
+            _emot_ctx = {
+                # Neuromod levels — worker's update_neuromod_ema is called
+                # internally on EMOT_CHAIN_EVIDENCE payload.
+                "DA": _nmval("DA"),
+                "5HT": _nmval("5HT"),
+                "NE": _nmval("NE"),
+                "ACh": _nmval("ACh"),
+                "Endorphin": _nmval("Endorphin"),
+                "GABA": _nmval("GABA"),
+                # Native trajectory (rFP §19.2 trajectory_2d slot).
+                "trajectory_2d": _traj_2d,
+                # Live 30D digital-body space topology (rFP §19.2
+                # space_topology_30d slot) — outer_lower topology 10D +
+                # inner_lower topology 10D + whole (unified spirit) 10D.
+                # Assembled by spirit_worker._attach_emot_producer_ctx just
+                # before each meta_engine.tick() call; falls back to zeros
+                # if the attr is absent (e.g. tests or boot before first
+                # body tick).
+                "space_topology_30d": (
+                    list(getattr(self, "_last_topology_30d", None) or [])
+                    or [0.0] * 30
+                )[:30],
+                # Live 11D per-NS-program urgencies (rFP §19.2 ns_urgencies
+                # slot) — ordered REFLEX, FOCUS, INTUITION, IMPULSE,
+                # METABOLISM, CREATIVITY, CURIOSITY, EMPATHY, REFLECTION,
+                # INSPIRATION, VIGILANCE per emot_bundle_protocol.NS_PROGRAMS.
+                # Same convention: stashed via _attach_emot_producer_ctx,
+                # zero-fallback if the hook hasn't run yet.
+                "ns_urgencies_11d": (
+                    list(getattr(self, "_last_ns_urgencies_11d", None) or [])
+                    or [0.0] * 11
+                )[:11],
+                # Live 6D sphere-clock phases (rFP §19.2 pi_phase slot,
+                # schema v2 2026-04-21). Order: inner_body, outer_body,
+                # inner_mind, outer_mind, inner_spirit, outer_spirit.
+                # Trinity × Inner/Outer symmetry preserved.
+                "pi_phase_6d": (
+                    list(getattr(self, "_last_pi_phase_6d", None) or [])
+                    or [0.0] * 6
+                )[:6],
+                "monoculture_share": mcgn_ctx.get("monoculture_share", 0.0),
+                "incomplete": float(terminal_reward) < 0.25,
+                "spirit_self_share": _share(prims_in_chain, "SPIRIT_SELF"),
+                "introspect_share": _share(prims_in_chain, "INTROSPECT"),
+                "strategy_shift": (
+                    getattr(self, "_emot_dom_at_chain_start", dom_end)
+                    != dom_end),
+                "knowledge_acq_rate": mcgn_ctx.get("knowledge_acq_rate", 0.0),
+            }
+            from titan_plugin.bus import emit_emot_chain_evidence
+            if self._send_queue is not None:
+                emit_emot_chain_evidence(
+                    self._send_queue, src="spirit",
+                    chain_id=self.state.chain_id,
+                    dominant_at_start=getattr(
+                        self, "_emot_dom_at_chain_start", dom_end),
+                    dominant_at_end=dom_end,
+                    terminal_reward=float(terminal_reward),
+                    ctx=_emot_ctx)
+        except Exception as _emot_err:
+            logger.debug("[META] EMOT_CHAIN_EVIDENCE emit error: %s",
+                         _emot_err)
+
         # Update baseline EMA
         self._baseline_confidence = (
             0.9 * self._baseline_confidence + 0.1 * self.state.confidence)
@@ -2962,6 +3214,50 @@ class MetaReasoningEngine:
             return {"primitive": "FORMULATE", "sub_mode": "load_wisdom",
                     "wisdom_found": wisdom_found, "confidence": 0.6 if wisdom_found else 0.4}
 
+        # ── F-phase compositional sub-modes (rFP §6) ────────────────────
+        # Session 1: each new sub-mode extends `define` (anomaly-based problem
+        # formulation) with a compositional operator tag. Session 2 dispatches
+        # these through the Recruitment Layer to reasoning primitives
+        # (DECOMPOSE / CONTRAST / GENERALIZE) + pattern_primitives.merge/abstract.
+        elif sub in ("compose_intersection", "compose_union",
+                     "compose_difference", "narrow_to_subset",
+                     "generalize_from_instance"):
+            deviation = np.abs(sv_arr - self._ema_state)
+            top_k = 3 if sub == "narrow_to_subset" else 5
+            top_dims = np.argsort(deviation)[-top_k:][::-1].tolist()
+            avg_dim = np.mean(top_dims)
+            if avg_dim < 20:
+                domain = "body_mind"
+            elif avg_dim < 65:
+                domain = "inner_spirit"
+            elif avg_dim < 85:
+                domain = "outer_perception"
+            else:
+                domain = "outer_spirit"
+            difficulty = float(np.mean(deviation[top_dims]))
+            compose_op = {
+                "compose_intersection": "intersection",
+                "compose_union": "union",
+                "compose_difference": "difference",
+                "narrow_to_subset": "narrow",
+                "generalize_from_instance": "generalize",
+            }[sub]
+            template = (f"{domain} anomaly [{compose_op}]: dims {top_dims}, "
+                        f"deviation={difficulty:.3f}")
+            self.state.formulate_output = {
+                "problem_template": template,
+                "domain": domain,
+                "anomalous_dims": top_dims,
+                "difficulty": difficulty,
+                "compose_op": compose_op,
+                "trigger": self.state.trigger_reason,
+            }
+            return {"primitive": "FORMULATE", "sub_mode": sub,
+                    "domain": domain, "difficulty": round(difficulty, 4),
+                    "anomalous_dims": top_dims, "compose_op": compose_op,
+                    "confidence": 0.5, "session_1_stub": True,
+                    "recruitment_resolved": False}
+
     def _prim_recall(self, sub, chain_archive, meta_wisdom, ex_mem):
         """Query memory sources."""
         results = []
@@ -2993,13 +3289,54 @@ class MetaReasoningEngine:
         elif sub == "entity":
             pass  # Future: social_graph query
 
+        # ── F-phase compositional sub-modes (rFP §6) ────────────────────
+        # Session 1: each new sub-mode falls back to the closest existing
+        # retrieval path. Session 2 dispatches through Recruitment Layer
+        # to episodic_memory / semantic_graph / chain_archive / timechain.
+        elif sub == "episodic_specific" and ex_mem:
+            try:
+                domain = self.state.formulate_output.get("domain", "general")
+                results = ex_mem.recall_similar(domain, top_k=5)
+                if results:
+                    best_match = (results[0] if isinstance(results[0], dict)
+                                  else {"score": results[0]})
+            except Exception:
+                pass
+
+        elif sub == "semantic_neighbors":
+            pass  # Session 2: semantic_graph.neighbors resolver
+
+        elif sub == "procedural_matching" and chain_archive:
+            domain = self.state.formulate_output.get("domain", "general")
+            results = chain_archive.query_by_domain(domain, min_outcome=0.3,
+                                                     limit=10)
+            if results:
+                best_match = results[0]
+
+        elif sub == "autobiographical_relevant" and ex_mem:
+            try:
+                domain = self.state.formulate_output.get("domain", "general")
+                results = ex_mem.recall_similar(domain, top_k=10)
+                if results:
+                    best_match = (results[0] if isinstance(results[0], dict)
+                                  else {"score": results[0]})
+            except Exception:
+                pass
+
+        is_new_mode = sub in ("episodic_specific", "semantic_neighbors",
+                               "procedural_matching",
+                               "autobiographical_relevant")
         self.state.recalled_data = {
             "source": sub, "results": results,
             "count": len(results), "best_match": best_match,
         }
-        return {"primitive": "RECALL", "sub_mode": sub,
-                "count": len(results), "best_match": best_match is not None,
-                "confidence": min(0.7, 0.4 + len(results) * 0.03)}
+        out = {"primitive": "RECALL", "sub_mode": sub,
+               "count": len(results), "best_match": best_match is not None,
+               "confidence": min(0.7, 0.4 + len(results) * 0.03)}
+        if is_new_mode:
+            out["session_1_stub"] = True
+            out["recruitment_resolved"] = False
+        return out
 
     def _prim_hypothesize(self, sub, nm):
         """Generate or refine strategy hypotheses."""
@@ -3057,6 +3394,42 @@ class MetaReasoningEngine:
                         "count": len(ranked), "confidence": ranked[0]["predicted_confidence"]}
             return {"primitive": "HYPOTHESIZE", "sub_mode": "compare",
                     "count": len(self.state.hypotheses), "confidence": self.state.confidence}
+
+        # ── F-phase compositional sub-modes (rFP §6) ────────────────────
+        # Session 1: fall back to closest existing mode + tag the hypothesis
+        # with the compositional operator. Session 2 routes via Recruitment
+        # Layer to reasoning.ANALOGIZE / CONTRAST / IF_THEN + CREATIVITY
+        # for richer downstream strategies.
+        elif sub in ("analogize_from", "contrast_with",
+                     "propose_by_inversion", "extend_pattern"):
+            domain = self.state.formulate_output.get("domain", "general")
+            # Strategy template biased by compositional intent
+            if sub == "analogize_from":
+                strategy = ["ASSOCIATE", "COMPARE", "SEQUENCE"]
+            elif sub == "contrast_with":
+                strategy = ["COMPARE", "NEGATE", "IF_THEN"]
+            elif sub == "propose_by_inversion":
+                strategy = ["NEGATE", "IF_THEN", "COMPARE"]
+            else:  # extend_pattern
+                strategy = ["SEQUENCE", "ASSOCIATE", "IF_THEN"]
+            if self.state.recalled_data.get("best_match"):
+                recalled = self.state.recalled_data["best_match"]
+                if isinstance(recalled, dict) and recalled.get("chain_sequence"):
+                    strategy = recalled["chain_sequence"][:5]
+            predicted = 0.5 + random.random() * 0.3
+            hypothesis = {
+                "strategy": strategy,
+                "predicted_confidence": predicted,
+                "domain": domain,
+                "compose_op": sub,
+                "reasoning": (f"[{sub}] "
+                              f"Based on {self.state.recalled_data.get('count', 0)} "
+                              f"recalled chains"),
+            }
+            self.state.hypotheses.append(hypothesis)
+            return {"primitive": "HYPOTHESIZE", "sub_mode": sub,
+                    "hypothesis": hypothesis, "confidence": predicted,
+                    "session_1_stub": True, "recruitment_resolved": False}
 
     def _prim_delegate(self, sub, reasoning_engine):
         """Inject strategy bias into main reasoning."""
@@ -3439,14 +3812,39 @@ class MetaReasoningEngine:
         # 2. Prediction novelty: from the Prediction engine's running EMA
         # The max of both is used so that even when the wisdom store is
         # saturated (novelty→0), the prediction novelty can still drive DA.
+        #
+        # A1 stop-bleed (2026-04-21 audit §A1, shipped afternoon):
+        # Pre-audit every eureka fired with novelty=1.000 because
+        # `query_by_embedding` returned empty (for reasons narrowed to 4
+        # candidates — autoencoder drift, missing problem_embedding on old
+        # rows, JSON encoding, wrong shape — needs live SQL inspection)
+        # AND the permissive `else: wisdom_novelty = 1.0` fallback treated
+        # "no match" as "fully novel." Combined with `pred_novelty=0.0`
+        # (self_prediction_accuracy defaults to 1.0 → surprise=0) and the
+        # permissive `max()` combiner, every eureka got novelty=1.0.
+        # Stop-bleed: change the fallback to 0.5 (neutral — "we don't know
+        # how novel this is") and count the empty-return events so we can
+        # distinguish "wisdom store truly empty" from "query pathway
+        # broken" during investigation. Proper fix to `query_by_embedding`
+        # empty-return needs separate live-SQL work (A1.4).
         wisdom_novelty = 0.5
         if meta_wisdom and autoencoder and autoencoder.is_trained:
-            emb = autoencoder.encode(sv[:132])
-            similar = meta_wisdom.query_by_embedding(emb, min_confidence=0.3, top_k=1)
-            if similar:
-                wisdom_novelty = 1.0 - similar[0].get("similarity", 0.5)
-            else:
-                wisdom_novelty = 1.0
+            try:
+                emb = autoencoder.encode(sv[:132])
+                similar = meta_wisdom.query_by_embedding(
+                    emb, min_confidence=0.3, top_k=1)
+                if similar:
+                    wisdom_novelty = 1.0 - similar[0].get("similarity", 0.5)
+                else:
+                    wisdom_novelty = 0.5  # A1 stop-bleed: was 1.0 permissive
+                    self._wisdom_query_empty_returns = getattr(
+                        self, "_wisdom_query_empty_returns", 0) + 1
+            except Exception as _wn_err:
+                # Defensive — embedding encode or DB query can fail under
+                # autoencoder-not-trained or DB-locked conditions. Stay at
+                # 0.5 neutral + log for investigation.
+                wisdom_novelty = 0.5
+                logger.debug("[META] wisdom_novelty query failed: %s", _wn_err)
         # Prediction-based novelty: 1 - prediction_accuracy from subsystem cache
         # (populated by spirit_worker from prediction_engine._novelty_ema)
         pred_novelty = 0.0
@@ -3502,7 +3900,7 @@ class MetaReasoningEngine:
 
     # ── Private: Input Construction ───────────────────────────────
 
-    def _build_meta_input(self, sv, nm, chain_archive) -> list:
+    def _build_meta_input(self, sv, nm, chain_archive, meta_autoencoder=None) -> list:
         """Build 80D meta-policy input."""
         inp = []
 
@@ -3542,14 +3940,30 @@ class MetaReasoningEngine:
         inp.extend([float(d / 132.0) for d in top5])
         # Total: 20D
 
-        # [20:36] Problem embedding (16D)
-        if self.state.formulate_output:
-            # Hash-based embedding until autoencoder is trained
-            template = self.state.formulate_output.get("problem_template", "")
-            emb = [(hash((template, i)) % 1000) / 1000.0 for i in range(16)]
-            inp.extend(emb)
-        else:
-            inp.extend([0.5] * 16)
+        # [20:36] Problem embedding (16D).
+        # nn_iql_rl audit C1 fix 2026-04-20: prefer trained meta_autoencoder
+        # (Component 14 — 7,968+ training steps on disk) which maps 132D felt
+        # state → 16D contrastive embedding. Fall back to hash stub only if
+        # the autoencoder is unavailable or not yet trained (< 100 steps).
+        # AE output is tanh-bounded [-1, 1]; rescale to [0, 1] to match the
+        # range expected by the rest of the input vector.
+        emb_wired = False
+        if meta_autoencoder is not None and getattr(meta_autoencoder, "is_trained", False):
+            try:
+                ae_emb = meta_autoencoder.encode(sv_arr.tolist())
+                if ae_emb and len(ae_emb) >= 16:
+                    inp.extend([float((v + 1.0) * 0.5) for v in ae_emb[:16]])
+                    emb_wired = True
+            except Exception:
+                emb_wired = False
+        if not emb_wired:
+            if self.state.formulate_output:
+                # Hash-based fallback until autoencoder graduates
+                template = self.state.formulate_output.get("problem_template", "")
+                emb = [(hash((template, i)) % 1000) / 1000.0 for i in range(16)]
+                inp.extend(emb)
+            else:
+                inp.extend([0.5] * 16)
 
         # [36:48] Strategy history EMA (12D)
         inp.extend(self._strategy_history.tolist())
@@ -4131,6 +4545,74 @@ class MetaReasoningEngine:
                     self._suggested_template = s["suggested_template"]
                 if s.get("suggested_template_q") and hasattr(self, '_suggested_template_q'):
                     self._suggested_template_q = float(s["suggested_template_q"])
+                # Cognitive-contract counters (2026-04-21 fix for
+                # BUG-CONTRACT-GATE-STARVATION — handler fires restored
+                # across restarts so dashboard lifetime accounting is honest)
+                if s.get("cc_strategy_drift_fires"):
+                    self._cc_strategy_drift_fires = int(s["cc_strategy_drift_fires"])
+                _saved_sd_top = s.get("cc_strategy_drift_last_top")
+                if isinstance(_saved_sd_top, list):
+                    self._cc_strategy_drift_last_top = _saved_sd_top
+                if s.get("cc_pattern_emerged_fires"):
+                    self._cc_pattern_emerged_fires = int(s["cc_pattern_emerged_fires"])
+                _saved_pe_last = s.get("cc_pattern_emerged_last")
+                if isinstance(_saved_pe_last, list):
+                    self._cc_pattern_emerged_last = _saved_pe_last
+                if s.get("cc_monoculture_fires"):
+                    self._cc_monoculture_fires = int(s["cc_monoculture_fires"])
+                _saved_mono_last = s.get("cc_monoculture_last")
+                if isinstance(_saved_mono_last, dict):
+                    self._cc_monoculture_last = _saved_mono_last
+                # --- Audit-driven additions (2026-04-21): lifetime counters
+                # + mid-decay state that were silently reset on every restart.
+                # Pattern mirrors cc_* restoration — only assign if key
+                # present, with type guards so old meta_stats.json without
+                # these fields loads cleanly (backward compat).
+                if s.get("inengine_mono_total_fires"):
+                    self._inengine_mono_total_fires = int(
+                        s["inengine_mono_total_fires"])
+                if s.get("inengine_mono_last_fire_chain") is not None:
+                    self._inengine_mono_last_fire_chain = int(
+                        s["inengine_mono_last_fire_chain"])
+                if s.get("mono_adj_fires_count"):
+                    self._mono_adj_fires_count = int(s["mono_adj_fires_count"])
+                if s.get("mono_adj_cumulative"):
+                    self._mono_adj_cumulative = float(s["mono_adj_cumulative"])
+                if s.get("diversity_pressure_total_applied"):
+                    self._diversity_pressure_total_applied = int(
+                        s["diversity_pressure_total_applied"])
+                if s.get("diversity_pressure_remaining"):
+                    self._diversity_pressure_remaining = int(
+                        s["diversity_pressure_remaining"])
+                if s.get("diversity_pressure_initial_magnitude"):
+                    self._diversity_pressure_initial_magnitude = float(
+                        s["diversity_pressure_initial_magnitude"])
+                if s.get("diversity_pressure_initial_decay"):
+                    self._diversity_pressure_initial_decay = int(
+                        s["diversity_pressure_initial_decay"])
+                if s.get("introspect_executions_lifetime"):
+                    self._introspect_executions_lifetime = int(
+                        s["introspect_executions_lifetime"])
+                if s.get("introspect_picks_lifetime"):
+                    self._introspect_picks_lifetime = int(
+                        s["introspect_picks_lifetime"])
+                if s.get("introspect_rerouted_lifetime"):
+                    self._introspect_rerouted_lifetime = int(
+                        s["introspect_rerouted_lifetime"])
+                if s.get("next_chain_id"):
+                    self._next_chain_id = int(s["next_chain_id"])
+                if s.get("last_concluded_chain_id"):
+                    self._last_concluded_chain_id = int(
+                        s["last_concluded_chain_id"])
+                if s.get("repeat_impasse_count"):
+                    self._repeat_impasse_count = int(s["repeat_impasse_count"])
+                _saved_rip = s.get("repeat_impasse_primitives")
+                if isinstance(_saved_rip, dict):
+                    self._repeat_impasse_primitives = {
+                        str(k): int(v) for k, v in _saved_rip.items()}
+                _saved_slt = s.get("soar_last_successful_topic")
+                if isinstance(_saved_slt, str) and _saved_slt:
+                    self._soar_last_successful_topic = _saved_slt
             except Exception as _ld_err:
                 # 2026-04-19: surface the parse failure at WARN instead of
                 # silent pass. Prior behavior hid T1's 0-byte file for 2

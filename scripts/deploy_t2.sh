@@ -7,13 +7,20 @@
 #   The --assume-unchanged flag can drift (e.g. after a manual git checkout
 #   or git update-index reset). When that happens, git pull would fail with
 #   a merge conflict on config.toml. This script ALWAYS does the safe dance:
-#     1. backup config.toml to /tmp
+#     1. backup config.toml to /tmp (preserves runtime tokens like auth_session)
 #     2. clear --assume-unchanged so git can take upstream cleanly
 #     3. checkout the HEAD copy of config.toml (drops local edits)
-#     4. git pull --ff-only origin titan-v6
-#     5. restore config.toml from the /tmp backup (preserves runtime tokens)
+#     4. git pull --ff-only origin titan-v6 (pulled config.toml now on disk)
+#     4b. MERGE new sections from pulled into backup — any section that exists
+#         in pulled but NOT in backup is appended to backup, so config
+#         additions like new [voice] or [feature.x] make it onto T2/T3
+#         naturally. Existing sections + credentials in backup are preserved
+#         untouched. (Added 2026-04-20 after Phase 5C deploy missed the new
+#         [voice] section; see rFP_phase5_narrator_evolution §9.)
+#     5. restore config.toml from the /tmp backup (now merged, preserves
+#        credentials AND picks up new upstream sections)
 #     6. re-set --assume-unchanged
-#     7. verify the restored byte size matches the backup
+#     7. verify the restored byte size matches the (possibly-grown) backup
 #
 # This is idempotent and safe even when --assume-unchanged is already lost.
 
@@ -60,7 +67,44 @@ git checkout -- titan_plugin/config.toml 2>/dev/null || true
 git diff --name-only | grep -v "^titan_plugin/config.toml$" | xargs -r git checkout -- 2>/dev/null || true
 git pull --ff-only origin titan-v6 2>&1 | tail -10
 
-# 5. Restore config.toml from the /tmp backup
+# 4b. MERGE new upstream sections into backup (preserves credentials + picks up
+# config additions like a new [voice] or [feature.x] section on next deploy)
+# Section detection: any TOML line starting with [...] — matches top-level
+# ([voice]) AND nested ([voice.sub]) sections uniformly.
+PULLED_CFG="titan_plugin/config.toml"
+NEW_SECTIONS=$(comm -23 \
+    <(grep -oE '^\[[^]]+\]' "${PULLED_CFG}" | sort -u) \
+    <(grep -oE '^\[[^]]+\]' "${BACKUP}" | sort -u))
+if [ -n "${NEW_SECTIONS}" ]; then
+    NEW_COUNT=$(echo "${NEW_SECTIONS}" | grep -c .)
+    echo "  ℹ ${LABEL}: ${NEW_COUNT} new section(s) in upstream config — merging into backup:"
+    echo "${NEW_SECTIONS}" | sed "s/^/      /"
+    {
+        echo ""
+        echo "# ─────────────────────────────────────────────────────────────"
+        echo "# Auto-merged from upstream titan-v6 by deploy_t2.sh"
+        echo "# at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "# ─────────────────────────────────────────────────────────────"
+        while IFS= read -r section; do
+            [ -z "${section}" ] && continue
+            # Extract section block: from ^[section] until next ^[...] or EOF
+            # Normalize each line by stripping inline comments + trailing WS
+            # so `[voice]  # master switch` still matches the section `[voice]`.
+            awk -v sec="${section}" '
+                { line=$0; sub(/[[:space:]]*#.*$/, "", line); gsub(/[[:space:]]+$/, "", line) }
+                line == sec { in_sec=1; print $0; next }
+                in_sec && line ~ /^\[[^]]+\]/ { in_sec=0 }
+                in_sec { print $0 }
+            ' "${PULLED_CFG}"
+        done <<< "${NEW_SECTIONS}"
+    } >> "${BACKUP}"
+    BACKUP_SIZE=$(stat -c%s "${BACKUP}")  # refresh for post-restore size check
+    echo "  ✓ ${LABEL}: merged ${NEW_COUNT} new section(s) — backup now ${BACKUP_SIZE} bytes"
+else
+    echo "  ℹ ${LABEL}: no new upstream sections to merge"
+fi
+
+# 5. Restore config.toml from the /tmp backup (now includes any merged sections)
 cp "${BACKUP}" titan_plugin/config.toml
 RESTORED_SIZE=$(stat -c%s titan_plugin/config.toml)
 

@@ -15,6 +15,8 @@ import sqlite3
 import time
 from typing import Optional
 
+from titan_plugin.persistence import get_client
+
 logger = logging.getLogger("titan.chain_archive")
 
 
@@ -23,6 +25,7 @@ class ChainArchive:
 
     def __init__(self, db_path: str = "./data/inner_memory.db"):
         self._db_path = db_path
+        self._client = get_client(caller_name="chain_archive")
         self._init_tables()
 
     def _get_db(self) -> sqlite3.Connection:
@@ -98,36 +101,32 @@ class ChainArchive:
         chain_results: list = None,
         reasoning_plan: dict = None,
     ) -> int:
-        def _do_insert():
-            db = self._get_db()
-            try:
-                cursor = db.execute(
-                    "INSERT INTO chain_archive "
-                    "(source, chain_sequence, chain_length, confidence, gut_agreement, "
-                    "outcome_score, domain, observation_snapshot, reasoning_plan, "
-                    "epoch_id, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        "main",
-                        json.dumps(chain_sequence),
-                        len(chain_sequence),
-                        confidence,
-                        gut_agreement,
-                        outcome_score,
-                        domain,
-                        json.dumps(observation_snapshot) if observation_snapshot else None,
-                        json.dumps(reasoning_plan) if reasoning_plan else None,
-                        epoch_id,
-                        time.time(),
-                    ),
-                )
-                row_id = cursor.lastrowid
-                db.commit()
-                return row_id
-            finally:
-                db.close()
         try:
-            return self._retry_write(_do_insert)
+            res = self._client.write(
+                "INSERT INTO chain_archive "
+                "(source, chain_sequence, chain_length, confidence, gut_agreement, "
+                "outcome_score, domain, observation_snapshot, reasoning_plan, "
+                "epoch_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "main",
+                    json.dumps(chain_sequence),
+                    len(chain_sequence),
+                    confidence,
+                    gut_agreement,
+                    outcome_score,
+                    domain,
+                    json.dumps(observation_snapshot) if observation_snapshot else None,
+                    json.dumps(reasoning_plan) if reasoning_plan else None,
+                    epoch_id,
+                    time.time(),
+                ),
+                table="chain_archive",
+            )
+            if not res.ok:
+                logger.warning("[ChainArchive] Record main chain error: %s", res.error)
+                return -1
+            return res.last_row_id or -1
         except Exception as e:
             logger.warning("[ChainArchive] Record main chain error: %s", e)
             return -1
@@ -144,37 +143,33 @@ class ChainArchive:
         chain_results: list = None,
         sub_chain_ids: list = None,
     ) -> int:
-        def _do_insert():
-            db = self._get_db()
-            try:
-                cursor = db.execute(
-                    "INSERT INTO chain_archive "
-                    "(source, chain_sequence, chain_length, confidence, "
-                    "outcome_score, domain, strategy_label, problem_type, "
-                    "observation_snapshot, reasoning_plan, epoch_id, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        "meta",
-                        json.dumps(chain_sequence),
-                        len(chain_sequence),
-                        confidence,
-                        outcome_score,
-                        "meta",
-                        strategy_label,
-                        problem_type,
-                        json.dumps(observation_snapshot) if observation_snapshot else None,
-                        json.dumps({"sub_chain_ids": sub_chain_ids}) if sub_chain_ids else None,
-                        epoch_id,
-                        time.time(),
-                    ),
-                )
-                row_id = cursor.lastrowid
-                db.commit()
-                return row_id
-            finally:
-                db.close()
         try:
-            return self._retry_write(_do_insert)
+            res = self._client.write(
+                "INSERT INTO chain_archive "
+                "(source, chain_sequence, chain_length, confidence, "
+                "outcome_score, domain, strategy_label, problem_type, "
+                "observation_snapshot, reasoning_plan, epoch_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "meta",
+                    json.dumps(chain_sequence),
+                    len(chain_sequence),
+                    confidence,
+                    outcome_score,
+                    "meta",
+                    strategy_label,
+                    problem_type,
+                    json.dumps(observation_snapshot) if observation_snapshot else None,
+                    json.dumps({"sub_chain_ids": sub_chain_ids}) if sub_chain_ids else None,
+                    epoch_id,
+                    time.time(),
+                ),
+                table="chain_archive",
+            )
+            if not res.ok:
+                logger.warning("[ChainArchive] Record meta chain error: %s", res.error)
+                return -1
+            return res.last_row_id or -1
         except Exception as e:
             logger.warning("[ChainArchive] Record meta chain error: %s", e)
             return -1
@@ -290,26 +285,24 @@ class ChainArchive:
         if not chain_ids:
             return
         try:
-            db = self._get_db()
             placeholders = ",".join("?" * len(chain_ids))
-            db.execute(
+            res = self._client.write(
                 f"UPDATE chain_archive SET dream_consolidated = 1 WHERE id IN ({placeholders})",
-                chain_ids,
+                list(chain_ids),
+                table="chain_archive",
             )
-            db.commit()
-            db.close()
+            if not res.ok:
+                logger.warning("[ChainArchive] Mark consolidated error: %s", res.error)
         except Exception as e:
             logger.warning("[ChainArchive] Mark consolidated error: %s", e)
 
     def update_embedding(self, chain_id: int, embedding: list) -> None:
         try:
-            db = self._get_db()
-            db.execute(
+            self._client.write(
                 "UPDATE chain_archive SET observation_embedding = ? WHERE id = ?",
                 (json.dumps(embedding), chain_id),
+                table="chain_archive",
             )
-            db.commit()
-            db.close()
         except Exception as e:
             logger.debug("[ChainArchive] Update embedding error: %s", e)
 
@@ -329,21 +322,17 @@ class ChainArchive:
         """
         if not pairs:
             return 0
-
-        def _do_batch():
-            db = self._get_db()
-            try:
-                db.executemany(
-                    "UPDATE chain_archive SET observation_embedding = ? WHERE id = ?",
-                    [(json.dumps(emb), cid) for cid, emb in pairs],
-                )
-                db.commit()
-                return len(pairs)
-            finally:
-                db.close()
-
         try:
-            return self._retry_write(_do_batch)
+            rows = [(json.dumps(emb), cid) for cid, emb in pairs]
+            res = self._client.write_many(
+                "UPDATE chain_archive SET observation_embedding = ? WHERE id = ?",
+                rows,
+                table="chain_archive",
+            )
+            if not res.ok:
+                logger.warning("[ChainArchive] Batch update embeddings error: %s", res.error)
+                return 0
+            return len(pairs)
         except Exception as e:
             logger.warning("[ChainArchive] Batch update embeddings error: %s", e)
             return 0
@@ -371,21 +360,25 @@ class ChainArchive:
 
     def prune_old(self, max_age_days: int = 14, keep_min: int = 100) -> int:
         try:
+            # READ via direct db (count check); WRITE via client
             db = self._get_db()
-            total = db.execute("SELECT COUNT(*) FROM chain_archive").fetchone()[0]
-            if total <= keep_min:
+            try:
+                total = db.execute("SELECT COUNT(*) FROM chain_archive").fetchone()[0]
+                if total <= keep_min:
+                    return 0
+            finally:
                 db.close()
-                return 0
             cutoff = time.time() - (max_age_days * 86400)
-            cursor = db.execute(
+            res = self._client.write(
                 "DELETE FROM chain_archive WHERE created_at < ? AND outcome_score < 0.5 "
                 "AND dream_consolidated = 1",
                 (cutoff,),
+                table="chain_archive",
             )
-            pruned = cursor.rowcount
-            db.commit()
-            db.close()
-            return pruned
+            if not res.ok:
+                logger.warning("[ChainArchive] Prune error: %s", res.error)
+                return 0
+            return res.rowcount or 0
         except Exception as e:
             logger.warning("[ChainArchive] Prune error: %s", e)
             return 0

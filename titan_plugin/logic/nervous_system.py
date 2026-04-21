@@ -497,7 +497,10 @@ class NervousSystem:
 
         for name, program in self.programs.items():
             try:
-                result = self.vm.execute(program, context=context)
+                # v2 (rFP_titan_vm_v2 Phase 1a): pass program_key so LOAD_EMA +
+                # LOAD_DT attribute state per-program (preparation for Phase 2
+                # rewrites that use temporal opcodes). Telemetry also accumulates.
+                result = self.vm.execute(program, context=context, program_key=name)
                 if result.score > 0:
                     signals.append({
                         "system": name,

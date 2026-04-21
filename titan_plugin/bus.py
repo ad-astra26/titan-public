@@ -151,6 +151,27 @@ RESPONSE = "RESPONSE"
 # edge-detected triggers, rate budget, SIGNAL_TO_PRIMITIVE mapping check.
 META_CGN_SIGNAL = "META_CGN_SIGNAL"
 
+# EMOT-CGN cross-consumer signal (rFP_emot_cgn_v2.md).
+# Emitted via emit_emot_cgn_signal() helper below — same invariant
+# guarantees as META-CGN (orphan detection + rate gate). Consumed by
+# handle_cross_consumer_signal in spirit_worker which routes to
+# meta_engine._emot_cgn (pre-Phase-1.6e) OR the emot_cgn worker (post).
+EMOT_CGN_SIGNAL = "EMOT_CGN_SIGNAL"
+
+# EMOT-CGN worker inputs (rFP_emot_cgn_v2.md §10 standalone-worker ADR,
+# Phase 1.6d). Producer → emot_cgn_worker messages for the EVENT channel.
+# STATE queries go through shm-mirror (`emot_shm_protocol.py`), NOT the bus.
+#
+# EMOT_CHAIN_EVIDENCE: meta_reasoning emits per chain conclude.
+#   src="spirit", dst="emot_cgn"
+#   payload: {chain_id, dominant_at_start, dominant_at_end, terminal_reward, ctx}
+# FELT_CLUSTER_UPDATE: spirit_worker emits per felt-tensor emit (or
+#   meta_reasoning._start_chain for the current simpler path).
+#   src="spirit", dst="emot_cgn"
+#   payload: {feature_vec_150d: list[float] OR felt_tensor_130d: list[float]}
+EMOT_CHAIN_EVIDENCE = "EMOT_CHAIN_EVIDENCE"
+FELT_CLUSTER_UPDATE = "FELT_CLUSTER_UPDATE"
+
 # Bus backpressure — edge-detected when worker queue depths cross > 30%
 # (enter) or < 20% (exit) threshold. Published by BusHealthMonitor only on
 # state transitions. Respects bus-clean invariant (discrete events only).
@@ -158,6 +179,33 @@ META_CGN_SIGNAL = "META_CGN_SIGNAL"
 # unused (also surfaced in orphan list). Constant reserved for when the
 # monitor's periodic sample loop is wired.
 BUS_BACKPRESSURE = "BUS_BACKPRESSURE"
+
+# ── Meta-Reasoning Consumer Service Layer (F-phase rFP) ─────────────
+# Bidirectional consumer↔meta request/response/outcome protocol.
+# See `titan-docs/rFP_meta_service_interface.md` §4.
+#
+# Routing invariants (per `feedback_bus_dst_must_have_subscriber.md`):
+#   - META_REASON_REQUEST  : dst="spirit" — meta_service lives in spirit_worker
+#   - META_REASON_RESPONSE : dst=<consumer_home_worker> — usually "spirit"
+#                            (social, emot, dreaming, reflection, self_model live
+#                            there); "language", "knowledge", "cgn" own their
+#                            workers. Client helper resolves the mapping.
+#   - META_REASON_OUTCOME  : dst="spirit" — meta accumulates signed reward per
+#                            (consumer, primitive, sub_mode) tuple.
+#
+# Payload shapes are documented in rFP §4.1. Schema validation lives in
+# `titan_plugin/logic/meta_service_client.py`.
+META_REASON_REQUEST = "META_REASON_REQUEST"
+META_REASON_RESPONSE = "META_REASON_RESPONSE"
+META_REASON_OUTCOME = "META_REASON_OUTCOME"
+
+# ── TimeChain SIMILAR primitive (F-phase §9.2) ──────────────────────
+# Semantic-embedding similarity search over TimeChain blocks. Only genuinely-new
+# TimeChain primitive (RECALL/CHECK/COMPARE/AGGREGATE already ship per rFP
+# §9.1). dst="timechain" (timechain_worker); response type TIMECHAIN_SIMILAR_RESP
+# returned to src.
+TIMECHAIN_SIMILAR = "TIMECHAIN_SIMILAR"
+TIMECHAIN_SIMILAR_RESP = "TIMECHAIN_SIMILAR_RESP"
 
 
 def make_msg(
@@ -543,6 +591,198 @@ def emit_meta_cgn_signal(
         pass
 
     return True
+
+
+# ----------------------------------------------------------------------
+# emit_emot_cgn_signal — EMOT-CGN signal emission helper (rFP_emot_cgn_v2)
+# ----------------------------------------------------------------------
+# Mirrors emit_meta_cgn_signal exactly but uses EMOT_CGN_SIGNAL type +
+# EMOT_SIGNAL_TO_PRIMITIVE mapping. This gives us the same orphan
+# detection guard for free — every producer path goes through this
+# single choke point.
+#
+# dst="spirit": EMOT_CGN_SIGNAL is consumed by handle_cross_consumer_signal
+# in spirit_worker which routes to meta_engine._emot_cgn.
+
+
+def emit_emot_cgn_signal(
+    sender,
+    src: str,
+    consumer: str,
+    event_type: str,
+    intensity: float = 1.0,
+    domain: Optional[str] = None,
+    narrative_context: Optional[dict] = None,
+    reason: Optional[str] = None,
+    min_interval_s: float = 0.5,
+) -> bool:
+    """Emit an EMOT_CGN_SIGNAL with same invariant guards as emit_meta_cgn_signal.
+
+    Returns True if sent, False if dropped (rate gate, orphan, or queue-full).
+    """
+    # 1. Mapping check — refuse orphan emissions.
+    try:
+        from .logic.emot_cgn import EMOT_SIGNAL_TO_PRIMITIVE
+    except ImportError:
+        EMOT_SIGNAL_TO_PRIMITIVE = None
+
+    if EMOT_SIGNAL_TO_PRIMITIVE is not None and (consumer, event_type) not in EMOT_SIGNAL_TO_PRIMITIVE:
+        try:
+            from .core.bus_health import get_global_monitor
+            m = get_global_monitor()
+            if m is not None:
+                m.record_orphan(consumer, event_type)
+        except Exception:
+            pass
+        logger.warning(
+            "[emit_emot_cgn_signal] REFUSED orphan emission from %s: "
+            "(%s, %s) has no EMOT_SIGNAL_TO_PRIMITIVE mapping. reason=%s",
+            src, consumer, event_type, reason,
+        )
+        return False
+
+    # 2. Rate gate.
+    key = ("emot", src, consumer, event_type)
+    now = time.time()
+    with _emit_gate_lock:
+        last = _emit_gate_last_ts.get(key, 0.0)
+        if now - last < min_interval_s:
+            try:
+                from .core.bus_health import get_global_monitor
+                m = get_global_monitor()
+                if m is not None:
+                    m.record_rate_drop(src, consumer, event_type)
+            except Exception:
+                pass
+            return False
+        _emit_gate_last_ts[key] = now
+
+    # 3. Build message.
+    payload = {
+        "consumer": consumer,
+        "event_type": event_type,
+        "intensity": float(max(0.0, min(1.0, intensity))),
+    }
+    if domain is not None:
+        payload["domain"] = str(domain)[:40]
+    if narrative_context is not None:
+        payload["narrative_context"] = narrative_context
+    if reason is not None:
+        payload["reason"] = str(reason)[:120]
+
+    msg = {
+        "type": EMOT_CGN_SIGNAL,
+        "src": src,
+        "dst": "spirit",
+        "ts": now,
+        "rid": None,
+        "payload": payload,
+    }
+
+    # 4. Dispatch.
+    _is_main_bus = False
+    try:
+        if hasattr(sender, "put_nowait"):
+            sender.put_nowait(msg)
+        elif hasattr(sender, "publish"):
+            sender.publish(msg)
+            _is_main_bus = True
+        else:
+            logger.warning(
+                "[emit_emot_cgn_signal] Unknown sender type %s — cannot dispatch "
+                "(%s, %s) from %s",
+                type(sender).__name__, consumer, event_type, src)
+            return False
+    except Exception as _disp_err:
+        logger.debug(
+            "[emit_emot_cgn_signal] dispatch failed (%s, %s) from %s: %s",
+            consumer, event_type, src, _disp_err)
+        return False
+
+    # 5. Record.
+    try:
+        from .core.bus_health import get_global_monitor
+        m = get_global_monitor()
+        if m is not None and _is_main_bus:
+            m.record_emission(src, consumer, event_type, intensity)
+    except Exception:
+        pass
+
+    return True
+
+
+# ----------------------------------------------------------------------
+# EMOT-CGN worker producers (Phase 1.6d — rFP_emot_cgn_v2 §10 ADR)
+# ----------------------------------------------------------------------
+# Simple structured producers for EVENT channel messages to emot_cgn worker.
+# No rate-gate / orphan-detection needed for these (unlike META-CGN's
+# SIGNAL_TO_PRIMITIVE orphan guard): cadence is per-chain (~1 per 2-3 min)
+# and dst="emot_cgn" is a single well-known subscriber, not a mapping table.
+
+
+def emit_emot_chain_evidence(
+    sender, src: str, chain_id: int,
+    dominant_at_start: str, dominant_at_end: str,
+    terminal_reward: float, ctx: Optional[dict] = None,
+) -> bool:
+    """Send EMOT_CHAIN_EVIDENCE to emot_cgn worker. Called from
+    meta_reasoning._conclude_chain per chain. Returns True if sent."""
+    try:
+        msg = {
+            "type": EMOT_CHAIN_EVIDENCE,
+            "src": src, "dst": "emot_cgn", "ts": time.time(), "rid": None,
+            "payload": {
+                "chain_id": int(chain_id),
+                "dominant_at_start": str(dominant_at_start),
+                "dominant_at_end": str(dominant_at_end),
+                "terminal_reward": float(terminal_reward),
+                "ctx": dict(ctx) if ctx else {},
+            },
+        }
+        if hasattr(sender, "put_nowait"):
+            sender.put_nowait(msg)
+        elif hasattr(sender, "publish"):
+            sender.publish(msg)
+        else:
+            return False
+        return True
+    except Exception as e:
+        logger.debug("[emit_emot_chain_evidence] failed: %s", e)
+        return False
+
+
+def emit_felt_cluster_update(
+    sender, src: str, feature_vec_150d: Optional[list] = None,
+    felt_tensor_130d: Optional[list] = None,
+) -> bool:
+    """Send FELT_CLUSTER_UPDATE to emot_cgn worker. Called from spirit
+    (or meta_reasoning._start_chain). Callers can pass EITHER the full
+    150D feature vector OR just the 130D felt tensor — worker builds
+    the 150D from 130D using its own context if only 130D provided.
+    Returns True if sent."""
+    try:
+        payload = {}
+        if feature_vec_150d is not None:
+            payload["feature_vec_150d"] = list(feature_vec_150d)
+        if felt_tensor_130d is not None:
+            payload["felt_tensor_130d"] = list(felt_tensor_130d)
+        if not payload:
+            return False
+        msg = {
+            "type": FELT_CLUSTER_UPDATE,
+            "src": src, "dst": "emot_cgn", "ts": time.time(), "rid": None,
+            "payload": payload,
+        }
+        if hasattr(sender, "put_nowait"):
+            sender.put_nowait(msg)
+        elif hasattr(sender, "publish"):
+            sender.publish(msg)
+        else:
+            return False
+        return True
+    except Exception as e:
+        logger.debug("[emit_felt_cluster_update] failed: %s", e)
+        return False
 
 
 # ----------------------------------------------------------------------

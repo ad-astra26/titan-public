@@ -141,8 +141,8 @@ except: print('unknown')
                     sleep $POLL_S
                     WAITED=$((WAITED + POLL_S))
                     IS_DREAMING=$(check_dreaming)
-                    if [ "$IS_DREAMING" != "True" ]; then
-                        echo "  ✓ T2 woke after ${WAITED}s (is_dreaming=$IS_DREAMING) — proceeding with restart"
+                    if [ "$IS_DREAMING" = "False" ]; then
+                        echo "  ✓ T2 woke after ${WAITED}s (is_dreaming=False) — proceeding with restart"
                         break
                     fi
                     echo "  [t+${WAITED}s] still dreaming..."
@@ -153,8 +153,17 @@ except: print('unknown')
                     echo "Pass --force to override (will wake mid-dream)."
                     exit 1
                 fi
+            elif [ "$IS_DREAMING" = "False" ]; then
+                echo "  ✓ T2 dream check: is_dreaming=False — safe to restart"
             else
-                echo "  ✓ T2 dream check: is_dreaming=$IS_DREAMING — safe to restart"
+                # 2026-04-20 fix: "unknown" = API unreachable or parse error.
+                # Previously this fell through as "safe to restart" which is
+                # wrong — refuse unless --force so operator sees the real state.
+                echo "=== T2 dream state could not be verified (is_dreaming=$IS_DREAMING) ==="
+                echo "  API at localhost:7777/v4/dreaming returned no/bad response."
+                echo "  Refusing to restart without verified awake state."
+                echo "  Pass --force to override (will proceed regardless of dream state)."
+                exit 1
             fi
         fi
         echo "=== Restarting T2 ==="

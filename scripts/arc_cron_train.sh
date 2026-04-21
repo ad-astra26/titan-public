@@ -2,20 +2,54 @@
 # arc_cron_train.sh — Periodic ARC training with game rotation
 # Run via cron every 3 hours on T1:
 #   0 */3 * * * bash /home/antigravity/projects/titan/scripts/arc_cron_train.sh >> /tmp/arc_training.log 2>&1
+#
+# Host-scoped non-overlap guard (2026-04-20): when T2 and T3 share a host, a
+# retry from one Titan could overlap the next cron fire of the other,
+# saturating the 4-CPU box. flock -n ensures only one ARC run per host at a
+# time — the second invocation exits silently, next cron fires in 3h.
 
-TITAN_DIR="/home/antigravity/projects/titan"
+TITAN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOCK_FILE="/tmp/arc_cron_host.lock"
+
+# Re-exec under flock if not already holding the lock.
+if [ "${ARC_CRON_LOCKED:-0}" != "1" ]; then
+    exec env ARC_CRON_LOCKED=1 flock -n "$LOCK_FILE" "$0" "$@" || {
+        NOW=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+        echo "[$NOW] ARC training: another run on this host holds $LOCK_FILE — skipping ($TITAN_DIR)"
+        exit 0
+    }
+fi
+
 cd "$TITAN_DIR" || exit 1
 source test_env/bin/activate
 export OPENROUTER_API_KEY=
 
-# Rotate primary game based on hour (0,3,6... = ls20; 1,4,7... = ft09; 2,5,8... = vc33)
+# Self-identification for cross-Titan goal broadcast (rFP Step C, 2026-04-20).
+# T1=10.135.0.3, T2/T3 share 10.135.0.6 (T3 dir = titan3/). Best-effort — if
+# detection fails, falls back to "unknown" which kin will ignore.
+if [[ "$TITAN_DIR" == */titan3 ]]; then
+    export TITAN_KIN_SOURCE="T3"
+elif hostname -I 2>/dev/null | grep -q "10.135.0.3"; then
+    export TITAN_KIN_SOURCE="T1"
+else
+    export TITAN_KIN_SOURCE="T2"
+fi
+
+# 4/2/2 weighted rotation (2026-04-20): ls20 gets 4 of 8 daily slots, ft09 and
+# vc33 get 2 each. Drop internal --cycle so each run is pure single-game. Slot
+# index from hour (T2/T3/T1 all fire every 3h, different :00/:30). Same
+# slot-to-game mapping across all Titans for consistency.
 HOUR=$(date -u +%H)
-GAME_IDX=$(( (HOUR / 3) % 3 ))
-GAMES=("ls20" "ft09" "vc33")
-GAME="${GAMES[$GAME_IDX]}"
+SLOT=$(( HOUR / 3 ))
+case $SLOT in
+    0|2|4|6) GAME="ls20" ;;
+    1|5)     GAME="ft09" ;;
+    3|7)     GAME="vc33" ;;
+    *)       GAME="ls20" ;;
+esac
 
 NOW=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
-echo "[$NOW] ARC training: game=$GAME (idx=$GAME_IDX from hour=$HOUR)"
+echo "[$NOW] ARC training: game=$GAME (slot=$SLOT from hour=$HOUR)  dir=$TITAN_DIR"
 
 # Check if titan_main is running (use API health check, not just process check)
 API_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://127.0.0.1:7777/health" 2>/dev/null || echo "000")
@@ -24,38 +58,41 @@ if [ "$API_STATUS" != "200" ]; then
     exit 0
 fi
 
-# Run 50 episodes (primary) + cycling breaks, reasoning, save results.
-# 2026-04-15: bumped 10 → 50 after Phase A reward rebalance exposed exploration
-# lift but scorer convergence needs more data — 10 eps/cron × 8 crons/day × ⅓
-# rotation = ~25 ls20/day (too slow). 50 eps/cron gives ~130 ls20/day.
-# Timeout bumped 1800 → 2700 to accommodate larger session (50 eps × 3 games
-# × cycle-break ≈ 150 max-step episodes × ~14s = ~35 min worst case).
-# Retry once on failure after 60s wait
-MAX_RETRIES=1
-RETRY=0
-while [ $RETRY -le $MAX_RETRIES ]; do
-    timeout 2700 python scripts/arc_competition.py \
-        --game "$GAME" \
-        --episodes 50 \
-        --cycle \
-        --cycle-break 2 \
-        --save-results \
-        --force \
-        --reasoning \
-        2>&1
-    EXIT_CODE=$?
+# 2026-04-20: episodes 50 → 200 (give Titans a real chance at first win, per
+# rFP_arc_training_fix.md iter-3). Drop --cycle (was inflating primary to
+# ~94%/secondary ~3%/3% via 2-ep breaks — we now rotate at cron level). Timeout
+# bumped 2700 → 4500 (75min). Expected wall time 200 ls20 eps × ~14s ≈ 47min;
+# 75min timeout gives 60% safety margin. MAX_RETRIES dropped 1 → 0 because
+# flock + timeout already bound things; a retry could push a run past the
+# 90-min T2/T3 gap and flock-skip the next Titan's slot entirely.
+#
+# 2026-04-21: shared-host budget. T2/T3 share a 4-vCPU box; an active
+# arc_competition.py + 2 running Titans pushed load avg to ~14, starving
+# media-module heartbeats and triggering Guardian restart loops every 3 min.
+# T1 keeps full 200 eps + 4500s (own VPS, no contention). Shared-host runs
+# (T2/T3) get half: 100 eps + 2700s. Halves the sustained-CPU window per
+# slot from ~47 min to ~24 min, well inside media's 180s heartbeat tolerance
+# AND inside the 90-min cron gap to the other Titan's next slot.
+if [ "${TITAN_KIN_SOURCE:-}" = "T1" ]; then
+    EPISODES=200
+    TIMEOUT=4500
+else
+    EPISODES=100
+    TIMEOUT=2700
+fi
 
-    if [ $EXIT_CODE -eq 0 ]; then
-        echo "[$NOW] ARC training complete: game=$GAME"
-        exit 0
-    fi
+timeout "$TIMEOUT" python scripts/arc_competition.py \
+    --game "$GAME" \
+    --episodes "$EPISODES" \
+    --save-results \
+    --force \
+    --reasoning \
+    2>&1
+EXIT_CODE=$?
 
-    if [ $RETRY -lt $MAX_RETRIES ]; then
-        echo "[$NOW] ARC training FAILED (exit=$EXIT_CODE) — retrying in 60s (attempt $((RETRY+2))/$((MAX_RETRIES+1)))"
-        sleep 60
-    else
-        echo "[$NOW] ARC training FAILED (exit=$EXIT_CODE) after $((MAX_RETRIES+1)) attempts: game=$GAME"
-    fi
-    RETRY=$((RETRY + 1))
-done
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "[$NOW] ARC training complete: game=$GAME ($EPISODES episodes)"
+    exit 0
+fi
+echo "[$NOW] ARC training FAILED (exit=$EXIT_CODE) game=$GAME — no retry; next cron in 3h"
 exit 1

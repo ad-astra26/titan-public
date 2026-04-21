@@ -117,6 +117,39 @@ backup_arweave_enabled = true         # Real Arweave uploads — Irys funded 202
 priority_fee_strategy = "economy"
 fixed_priority_fee = 1000             # μ₌, only used if strategy="fixed"
 
+[backup]
+# rFP_backup_worker Phase 3 — per-Titan backup mode + cascade knobs.
+# mode: "mainnet_arweave" | "local_only" | "" (auto-detect)
+# T2/T3 devnet should set mode = "local_only"
+mode = ""
+local_dir = "data/backups"
+local_rolling_days = 30
+soul_local_rolling_days = 90
+local_snapshot_always = true
+tarball_validation_enabled = true
+upload_verification_enabled = true
+dry_run_on_boot = true
+personality_cadence = "daily"
+soul_cadence = "weekly"
+timechain_cadence = "daily"
+timechain_mode = "full"
+
+# Phase 7 — opt-in AES-256-GCM encryption of local + Arweave tarballs.
+# Default OFF. See titan-docs/rFP_backup_worker.md §5.8 and RECOVERY.md §Shamir.
+encryption_enabled = false
+encryption_tier = "private"
+
+# Phase 9 — T1-only off-host mirror from T2/T3. See rFP_backup_worker §5.2.
+[backup.mirror]
+enabled = false
+ssh_user = "antigravity"
+t2_host = ""
+t2_backup_path = ""
+t3_host = ""
+t3_backup_path = ""
+retention_days = 7
+local_base = "data/backups/mirror"
+
 [consciousness]
 # Phase B+C: Self-Awareness Substrate
 # Distillation: LLM narrates the numerical state (optional — math stands alone)

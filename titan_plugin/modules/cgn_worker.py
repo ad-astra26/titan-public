@@ -26,6 +26,41 @@ from queue import Empty
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# CODE-AUTHORITATIVE CONSUMER MANIFEST (A5 — 2026-04-21)
+# ─────────────────────────────────────────────────────────────────────
+# The authoritative set of CGN consumers this codebase expects to exist.
+# Named consumers present on disk (cgn_state.pt) but NOT in this set
+# trigger a WARN at load — this is schema drift and the root cause of
+# BUG-CGN-SILENT-UNREGISTERED-CONSUMER (cross-Titan divergence where
+# T1 carried legacy "language"/"social" consumers that T2/T3 never had).
+#
+# Registration paths per consumer:
+#   - Statically pre-registered below: reasoning, self_model, coding,
+#     reasoning_strategy, emotional, language, social
+#   - Dynamically via CGN_REGISTER bus message: knowledge, meta
+#
+# Adding a new consumer MUST be done in this manifest AND in a static
+# pre-registration (or by a CGN_REGISTER from its worker). Adding only
+# to disk (via record_outcome from an unregistered name) is exactly
+# the bug this manifest prevents.
+#
+# See: memory/project_cgn_as_higher_state_registry.md (CGN V-layer role
+# = L2 analog of StateRegistry/TitanVM at L0/L1 — the registry must
+# have code-authoritative schema, not disk-authoritative).
+CODE_AUTHORITATIVE_CONSUMERS = frozenset({
+    "reasoning",
+    "self_model",
+    "coding",
+    "reasoning_strategy",
+    "emotional",
+    "language",
+    "social",
+    "knowledge",
+    "meta",
+})
+
+
 def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the CGN Cognitive Kernel process.
 
@@ -52,20 +87,22 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     db_path = config.get("db_path", "data/inner_memory.db")
     shm_path = config.get("shm_path", "/dev/shm/cgn_live_weights.bin")
 
-    # Load HAOV config with per-Titan profile overrides
-    # NOTE: config dict comes from config.toml via v5_core. HAOV profiles
-    # live in titan_params.toml, so we load directly from there.
+    # Load HAOV config with per-Titan profile overrides.
+    #
+    # 2026-04-21: migrated from direct `tomllib.load(titan_params.toml)` to
+    # `config_loader.load_titan_config()` so that HAOV values go through the
+    # 3-layer merge (titan_params.toml < config.toml < ~/.titan/secrets.toml).
+    # This is the CGN-scoped subset of BUG-CONFIG-LOADER-MERGE-TITAN-PARAMS —
+    # ~15-20 direct tomllib.load call sites exist repo-wide, but only this
+    # one plus a handful in meta_reasoning are CGN/meta-reasoning adjacent.
+    # meta_reasoning.py and meta_cgn.py already take their config via the
+    # `cfg` parameter (no direct load), so this is the only CGN/meta
+    # module that needed the migration.
     haov_config = {}
     try:
         import json as _hc_json
-        try:
-            import tomllib as _hc_toml
-        except ModuleNotFoundError:
-            import toml as _hc_toml  # type: ignore
-        _params_path = os.path.join(
-            os.path.dirname(__file__), "..", "titan_params.toml")
-        with open(_params_path, "rb") as _pf:
-            _params = _hc_toml.load(_pf)
+        from titan_plugin.config_loader import load_titan_config as _hc_load
+        _params = _hc_load()
         _haov_raw = _params.get("cgn", {}).get("haov", {})
         # Base config: all non-dict values from [cgn.haov]
         haov_config = {k: v for k, v in _haov_raw.items()
@@ -148,6 +185,103 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             consolidation_priority=2,
         ))
         logger.info("[CGNWorker] Pre-registered 'reasoning_strategy' consumer for rFP α")
+
+    # ── Pre-register "emotional" consumer (rFP_emot_cgn_v2, 8th CGN consumer) ──
+    # Grounds 8 emotion primitives as CGN concepts so META-CGN HAOV hypotheses
+    # involving emotional states work via the shared V(s) landscape (enables
+    # Abstract Modelling → Abstract Thinking → True Creativity arc per
+    # rFP_cgn_orchestrator_promotion.md §4 + §9).
+    # EmotCGNConsumer also sends CGN_REGISTER dynamically at init (idempotent) —
+    # pre-registration is a safety net against restart-order gaps.
+    if "emotional" not in cgn._consumers:
+        cgn.register_consumer(CGNConsumerConfig(
+            name="emotional",
+            feature_dims=30,
+            action_dims=8,
+            action_names=[
+                "FLOW", "IMPASSE_TENSION", "RESOLUTION",
+                "PEACE", "CURIOSITY", "GRIEF", "WONDER", "LOVE",
+            ],
+            # v1 uses chain terminal_reward as reward signal. True
+            # emotional_coherence metric (e.g., 1 - variance(V_across_primitives))
+            # is TUNING-EMOT-COHERENCE in TUNING_DATABASE.md, v1.6+.
+            reward_source="terminal_reward",
+            max_buffer_size=500,
+            consolidation_priority=2,
+        ))
+        logger.info("[CGNWorker] Pre-registered 'emotional' consumer (rFP_emot_cgn_v2)")
+
+    # ── Pre-register "language" consumer (A5 — 2026-04-21) ──
+    # Shapes match T1's historical registration (feature_dims=30, action_dims=8,
+    # action_names below) — verified by reading T1 cgn_state.pt during audit.
+    # Fixes BUG-CGN-SILENT-UNREGISTERED-CONSUMER — language_worker's
+    # CGN_TRANSITION sends for "language" were silently dropped on T2/T3
+    # because the consumer was never registered there. T1 carried it in
+    # disk state from a prior codebase version.
+    if "language" not in cgn._consumers:
+        cgn.register_consumer(CGNConsumerConfig(
+            name="language",
+            feature_dims=30,
+            action_dims=8,
+            action_names=["reinforce", "explore", "differentiate",
+                          "consolidate", "associate", "dissociate",
+                          "deepen", "stabilize"],
+            reward_source="language_chain_outcome",
+            max_buffer_size=500,
+            consolidation_priority=2,
+        ))
+        logger.info("[CGNWorker] Pre-registered 'language' consumer (A5 cross-Titan symmetry)")
+
+    # ── Pre-register "social" consumer (A5 — 2026-04-21) ──
+    # Shapes match T1's historical registration. Same fix pattern as language.
+    if "social" not in cgn._consumers:
+        cgn.register_consumer(CGNConsumerConfig(
+            name="social",
+            feature_dims=30,
+            action_dims=6,
+            action_names=["engage_warmly", "engage_cautiously",
+                          "respond_briefly", "disengage",
+                          "deepen_bond", "protect"],
+            reward_source="engagement_reciprocity",
+            max_buffer_size=500,
+            consolidation_priority=2,
+        ))
+        logger.info("[CGNWorker] Pre-registered 'social' consumer (A5 cross-Titan symmetry)")
+
+    # ── Audit: disk consumers vs code-authoritative manifest (A5 — 2026-04-21) ──
+    # After all static pre-registrations complete, cross-check: any consumer
+    # loaded from cgn_state.pt that isn't in CODE_AUTHORITATIVE_CONSUMERS
+    # indicates schema drift (code was updated to drop a consumer, but disk
+    # still carries it). Dynamic consumers (knowledge, meta) register via
+    # CGN_REGISTER bus msg later — they're expected-absent here and in manifest.
+    try:
+        disk_consumers = set(cgn._consumers.keys())
+        unexpected = disk_consumers - CODE_AUTHORITATIVE_CONSUMERS
+        missing_static = (
+            CODE_AUTHORITATIVE_CONSUMERS
+            - disk_consumers
+            - {"knowledge", "meta"}  # Dynamic — registered later via CGN_REGISTER
+        )
+        if unexpected:
+            logger.warning(
+                "[CGNWorker] Consumer schema drift — on disk but NOT in "
+                "CODE_AUTHORITATIVE_CONSUMERS manifest: %s. This is the "
+                "BUG-CGN-SILENT-UNREGISTERED-CONSUMER pattern. Decide: "
+                "add to manifest OR purge from disk via controlled reset.",
+                sorted(unexpected))
+        if missing_static:
+            logger.warning(
+                "[CGNWorker] Consumers in manifest expected statically but "
+                "not yet registered: %s. This should not happen post-A5 "
+                "boot — investigate pre-registration block above.",
+                sorted(missing_static))
+        logger.info(
+            "[CGNWorker] Consumer manifest audit: %d registered, "
+            "%d unexpected, %d expected-but-absent-static.",
+            len(disk_consumers), len(unexpected), len(missing_static))
+    except Exception as _audit_err:
+        logger.warning("[CGNWorker] Consumer manifest audit failed: %s",
+                       _audit_err)
 
     # ── Initialize /dev/shm weight writer ──────────────────────────────
     shm_writer = ShmWeightWriter(shm_path)

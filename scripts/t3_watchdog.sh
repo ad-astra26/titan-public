@@ -170,7 +170,14 @@ if [ "$HOUR" = "03" ] && { [ "$MINUTE" = "00" ] || [ "$MINUTE" = "05" ]; }; then
 
         # Keep only last 3 days (was 7 — 7×5.8GB exhausted 154GB disk).
         # 3 × ~1GB (post-exclude) = well within budget.
-        find "$BACKUP_DIR" -name "t3_data_*.tar.gz" -mtime +3 -delete 2>/dev/null
+        # 2026-04-20 fix: was `-mtime +3` which GNU find evaluates as ">3 integer
+        # days" — and cleanup fires at 03:00:02 UTC right after tar creation, so
+        # N-day-old files are always ~95h48m (integer 3 days), failing the `>3`
+        # test. Net: 1 file created/day, 0 deleted → accumulated to 5 files
+        # (9.4 GB on T3). Using `-mtime +2` (>2 integer days) now matches files
+        # that are ≥3 full days old → deletes Apr-N-3 and older at each 03:00
+        # run. Steady state = 3 files as intended.
+        find "$BACKUP_DIR" -name "t3_data_*.tar.gz" -mtime +2 -delete 2>/dev/null
     fi
 fi
 

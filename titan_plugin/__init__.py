@@ -264,6 +264,9 @@ class TitanPlugin:
         self.social_graph = SocialGraph(db_path=social_graph_db)
         self.metabolism._social_graph = self.social_graph  # Wire for social density
         self.social.social_graph = self.social_graph  # Wire for X engagement tracking
+        # rFP_social_graph_async_safety §5.3 (R4): wire to meditation for the
+        # 7-day ledger cleanup failsafe (runs every 100 meditation epochs).
+        self.meditation._social_graph = self.social_graph
         logging.info("[TitanPlugin] SocialGraph initialized: %s", social_graph_db)
 
         # Maker Relationship Engine

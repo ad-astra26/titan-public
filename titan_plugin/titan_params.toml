@@ -599,6 +599,35 @@ focus_boost_threshold = 0.15
 focus_confidence_boost = 1.3
 
 
+# ─── PREDICTION ENGINE (Novelty signal + surprise detection) ──────
+# Predicts next consciousness state, measures surprise. Feeds DA/NE
+# neuromods, META-CGN CURIOSITY producer, and curiosity signal bus.
+# v2 (2026-04-21): persistent EMAs + adaptive threshold + z-score calibration.
+
+[prediction_engine]
+# EMA decay for error mean/std + novelty signal. 0.005 ≈ 200-step window
+# — more stable across dream/wake transitions than 0.01 (~100-step).
+ema_alpha = 0.005
+
+# Novelty signal value emitted on fresh install (no persisted state).
+# 0.5 = neutral "moderate surprise" default; previous 0.0 caused DA/NE
+# to read "zero novelty" on cold boot (incorrect — we just don't know yet).
+neutral_default = 0.5
+
+# Minimum adaptive surprise threshold. Prevents the top-quartile gate
+# from collapsing to 0 on static trajectories.
+surprise_threshold_floor = 0.1
+
+# Bootstrap threshold used until ≥10 errors accumulate post-restart.
+surprise_threshold_bootstrap = 0.3
+
+# Save state to disk every N compute_error calls.
+save_every_evals = 100
+
+# Rolling error window for z-score + percentile threshold.
+error_window = 50
+
+
 # ─── TITAN VM (Sovereign internal computation) ────────────────────
 # Stack-based micro-instruction set for deterministic internal scoring.
 # The "ribosome" — reads StateRegister (DNA), produces reward signals.
@@ -613,13 +642,22 @@ max_instructions = 500
 # Whether to publish REFLEX_REWARD to bus after scoring
 publish_rewards = true
 
-# Minimum reward threshold to bother publishing (noise filter)
+# v2 (rFP_titan_vm_v2 Phase 1) — runtime state persistence cadence for
+# LOAD_EMA / LOAD_DT per-program state. Saved to
+# data/neural_nervous_system/titan_vm_runtime.json.
+runtime_save_every = 100
+
+# v2 (rFP_titan_vm_v2 Phase 1b): now consumed at agno_hooks REFLEX_REWARD
+# publish gate. Skip bus publish when total_reward < threshold — reduces
+# noise emissions without losing meaningful reflex signals.
 min_reward_threshold = 0.01
 
-# Weight of TitanVM reflex reward vs existing FilterDown epoch reward
-# 0.0 = VM reward ignored, 1.0 = VM reward fully replaces epoch reward
-# 0.5 = equal blend. Start conservative — let existing system remain primary.
-reward_blend_weight = 0.3
+# v2 (rFP_titan_vm_v2 Phase 1b): now consumed as the valence-modifier weight
+# in agno_hooks: total_reward = score + reward_blend_weight × valence.
+# Default 1.0 preserves prior (score + valence) sum behavior exactly —
+# deploy brings the key live without changing calibration. Maker can tune
+# to 0.3-0.5 to reduce valence sensitivity if desired post-soak.
+reward_blend_weight = 1.0
 
 # ═══════════════════════════════════════════════════════════════════
 # V5 NEURAL NERVOUS SYSTEM — Learned Reflexes
@@ -1231,6 +1269,15 @@ prediction_horizon_max = 5000       # maximum prediction horizon
 coherence_gap_threshold = 0.15      # neuromod delta to flag as coherence gap
 # Self-profile refresh during dreams
 profile_refresh_during_dream = true
+# Layer A — novelty gap detectors feeding coding_explorer trigger surface
+# (rFP_coding_explorer_activation.md §4.1). These fire on ABSOLUTE-STATE
+# conditions that rarely reach profile-delta thresholds but still indicate
+# cognition needs shaking loose. Each WARNs once on first fire per type.
+commit_rate_low_threshold = 0.15          # commits / total_chains below this
+commit_rate_low_min_chains = 500          # require ≥ chains before applying
+eureka_staleness_epochs = 50000           # no new EUREKA for this many epochs
+vocab_plateau_seconds = 43200             # 12h unchanged vocab_total
+monoculture_pressure_frac = 0.65          # dominant_primitive / total
 
 # ═══════════════════════════════════════════════════════════════════
 # MSL — Multisensory Synthesis Layer (Phase 1: Core Infrastructure)
@@ -1360,6 +1407,12 @@ max_exercises_per_dream = 3   # Max coding exercises per dream cycle
 exercise_templates = true     # Use built-in exercise templates
 research_before_code = true   # Query knowledge worker before coding
 arc_cross_pollinate = true    # Share insights with ARC reasoning consumer
+# Layer B — time-based fallback trigger (rFP_coding_explorer_activation.md §4.2).
+# Synthesizes a "scheduled_novelty" trigger when no emergent trigger has fired
+# for time_fallback_seconds. Budget-safe: ~4/day max (bounded by cooldown +
+# max_exercises_per_dream). Absence of gap triggers for 6h is itself a signal.
+time_fallback_enabled = true
+time_fallback_seconds = 21600  # 6h
 
 [cgn_social_policy]
 # P4: Behavioral wiring — CGN learned social policy into decisions
@@ -1574,10 +1627,20 @@ refractory_reset = 0.0
 # step) SWAMPING character_target_reward (bounded ~0.015 per step at k=0.3
 # with grid-size normalization). Result: scorer learned "make grid interesting"
 # not "reach target". Fix: bump k + cap novelty so task signal dominates.
+#
+# 2026-04-20 iter-3 — iter-2 (k=2.0 + cap=0.15) still left novelty ~40× G2. The
+# three knobs flagged by iter-2 author now applied together (per rFP): bump k
+# to 7, tighten cap to 0.05, remove grid-size normalization in
+# goal_detector.character_target_reward (30×30 grid: was returning
+# delta/60 ≈ 0.017/step, now returns delta ≈ 1.0/step at k=7 → 7.0/step).
+# arc_iter_3_enabled is a feature flag; set to false to revert to iter-2
+# behavior without a redeploy.
 [arc_agi_3.reward_shaping]
+arc_iter_3_enabled = true             # master gate — flip false to revert to iter-2 behavior
 goal_distance_reward_k = 0.5          # G1 coefficient on similarity delta (0 = disabled)
-character_target_reward_k = 2.0       # G2 coefficient (bumped 0.3 → 2.0; was drowned by novelty)
-novelty_reward_cap_per_step = 0.15    # Hard cap on grid/entropy/diff/nav novelty rewards per step (was ~0.41)
+character_target_reward_k = 7.0       # G2 coefficient (iter-3: 2.0 → 7.0)
+novelty_reward_cap_per_step = 0.05    # Hard cap on grid/entropy/diff/nav novelty rewards per step (iter-3: 0.15 → 0.05)
+character_target_normalize_by_grid = false  # iter-3: drop grid-size normalization so reward is per-cell-progress not per-grid-fraction
 episode_diagnostics_enabled = true    # Per-episode JSONL dump with reward breakdown + detection stats
 
 # ── Self-Exploration Outer Interface ──────────────────────────────────
@@ -1681,7 +1744,7 @@ watchdog_min_alert_hours = 3.0     # I3 safety floor — never alert before this
 watchdog_gap_window = 50           # emergent interval window (wide = stability over responsiveness)
 watchdog_stuck_threshold_seconds = 600.0  # F3/F6 threshold for "stuck in_meditation"
 watchdog_backup_lag_threshold = 2  # F4: spirit_count - backup_count >= this triggers alert
-watchdog_zero_promoted_streak = 3  # F7: consecutive meditations with promoted=0
+watchdog_zero_promoted_streak = 20  # F7: consecutive meditations with promoted=0 (raised 3→20 2026-04-20: 3 produced pure log noise on T3 while meditation subsystem structurally healthy post-I-016/I-017; alerts only genuine multi-hour stalls now)
 # Phase 3 Tier-2 escalation (2026-04-15). If Tier-1 (in_med reset) fires
 # repeatedly for same failure_mode in short window, escalate to Tier-2
 # (CRITICAL alert for Maker). Tier-2.1-2.4 cross-process sub-cascade
@@ -2151,6 +2214,50 @@ rollback_reward_sigma_k = 2.0
 rollback_min_std_floor = 0.05
 
 
+# ─── EMOT-CGN (Emotion as 8th CGN Consumer, rFP_emot_cgn_v2) ──────
+# Shadow mode first; graduation deliberately SLOWER than META-CGN per
+# rFP §6 — emotions carry deeper philosophical stakes.
+
+[emot_cgn]
+# Graduation thresholds (~2× META-CGN)
+graduation_min_updates = 4000                   # was 2000 for META-CGN
+graduation_min_confirmed_hypotheses = 4         # out of 8 seeded (50%)
+graduation_min_mature_primitives = 6            # out of 8 total
+graduation_min_samples_per_primitive = 100
+graduation_min_confidence = 0.7
+# Cross-primitive contrast gate: at least 2 primitives with V differing
+# by ≥ this amount (prevents graduation when clusters haven't differentiated)
+graduation_contrast_v_gap = 0.15
+# 14-day observation window (real-time) prevents rushing via synthetic training
+graduation_observation_window_s = 1209600       # 14 days
+
+# Rollback (Option B scale-invariant pattern, inherited from META-CGN 2026-04-19)
+rollback_reward_sigma_k = 2.0
+rollback_min_std_floor = 0.05
+
+# K-means re-cluster cadence (default weekly during dream cycles)
+cluster_recenter_interval_s = 604800            # 7 days
+
+# Persistence cadence — save primitive_grounding.json every N chains.
+# Lower = more granular observability during soak tests; higher = less I/O.
+# v1 default: 5 chains (cheap JSON write, enables real-time V inspection
+# via /v4/emot-cgn during shadow mode). Bump to 100+ once EMOT-CGN graduates
+# if I/O becomes a concern (it likely won't — file is ~6KB).
+save_cadence_chains = 5
+
+# Cluster emergence threshold — N observations before an emergent slot
+# (PEACE/CURIOSITY/GRIEF/WONDER/LOVE) transitions from "unemerged" to
+# "emerged". Higher = more conservative; lower = faster emergence. The
+# three hand-seeded anchors (FLOW, IMPASSE_TENSION, RESOLUTION) start
+# emerged regardless.
+cluster_emergence_threshold = 30
+
+# Cross-Titan priors (disabled by default; off critical path like META-CGN)
+cross_titan_transfer = false
+cross_titan_source = "T1"
+cross_titan_confidence_scale = 0.5
+
+
 # ─── KIN PROTOCOL (Titan-to-Titan communication, P11 → future Manitou) ──
 # Genesis peer list — hardcoded trusted Titans at v1. Future Manitou L2
 # extends via on-chain registry + peer gossip under the same /v1/kin/*
@@ -2179,3 +2286,141 @@ tracemalloc_nframes = 1        # 1=file+line, higher=full traceback (more overhe
 default_top_n = 25             # default top-N allocations in API response
 snapshot_cache_ttl_s = 30.0    # cache tracemalloc snapshots to prevent storm
 cpu_sample_duration_s = 1.0    # seconds to sample for CPU% measurement
+
+# ── KNOWLEDGE PIPELINE v2 (rFP_knowledge_pipeline_v2.md) ──────────
+# Router + cache + health live at data/search_cache.db +
+# data/knowledge_pipeline_health.json. Decision log at
+# data/logs/knowledge_router_decisions.jsonl.
+# Budgets are MB-per-day per backend. 0 = unlimited; knowledge_worker
+# converts to bytes internally. Alert cascade fires at 80% + 100%,
+# plus on circuit-open transition, both Telegram + SEARCH_PIPELINE_*
+# bus events.
+
+[knowledge_pipeline]
+search_cache_path = "data/search_cache.db"
+search_cache_size_cap = 10000
+pipeline_health_path = "data/knowledge_pipeline_health.json"
+pipeline_decision_log_path = "data/logs/knowledge_router_decisions.jsonl"
+# KP-4 circuit breaker tuning
+circuit_fail_threshold = 5         # consecutive failures before open
+circuit_cooldown_seconds = 300     # 5 min before half-open probe
+# KP-4 near-duplicate detection (optional observability)
+near_dup_window = 20               # last N normalized queries tracked
+near_dup_jaccard = 0.8             # Jaccard threshold for flagging
+# KP-7 Maker-alert kill-switch — bus events always fire; this only gates the
+# Telegram hop via maker_notify. Flip to true after the 24h soak gate
+# `OBS-kp-telegram-soak` closes cleanly (no alert-storm patterns observed).
+telegram_alerts_enabled = false
+# KP-8 smart routing learner (rFP §3.4). Learns per (query_type, backend)
+# reputation from a rolling window and reorders the static fallback chain.
+# Cold start: falls back to static route() until min_samples is reached.
+routing_learner_enabled = true
+routing_learner_window_days = 7
+routing_learner_min_samples = 10         # warm threshold per (qt, backend)
+routing_learner_demote_threshold = 0.10  # drop from chain below this rep
+routing_stats_path = "data/knowledge_routing_stats.db"
+
+[knowledge_pipeline.budgets]
+# Direct REST backends (structured APIs, cheap by request)
+wiktionary = 50                    # MB/day — very light
+free_dictionary = 20
+wikipedia_direct = 100
+# SearXNG variants — distillation via Sage OR raw via fetch_searxng_raw
+searxng_ddg_brave_wiki = 200
+searxng_google_bing = 0            # 0 = disabled (no proxy, CAPTCHAs)
+searxng_news = 100
+searxng_ddg_stackoverflow = 100
+searxng_raw = 100                  # used by WebSearchHelper (agency)
+searxng_wikipedia = 50
+# Direct news backend (deferred until news API key wiring)
+news_api = 100
+
+# ═══════════════════════════════════════════════════════════════════
+# META-REASONING CONSUMER SERVICE LAYER (F-phase)
+# ═══════════════════════════════════════════════════════════════════
+# Bidirectional consumer↔meta-reasoning protocol enabling all 8 CGN
+# consumers (social, language, knowledge, reasoning, coding, self_model,
+# emotional, dreaming) to query meta-reasoning as a service.
+#
+# See rFP: titan-docs/rFP_meta_service_interface.md §4.
+# Architectural context: meta-reasoning monoculture root cause is
+# missing consumer→meta invocation pathway — this section configures
+# the fix.
+
+[meta_service_interface]
+# Rate limiting + backpressure (rFP §4.4)
+per_consumer_requests_per_min = 10    # cap any single consumer's traffic
+global_requests_per_min = 60          # total across all consumers
+queue_max_depth = 20                  # drop-oldest overflow
+backpressure_threshold = 15           # above this: advise consumers to back off
+
+# DELEGATE recursion safety (rFP §14.2)
+# How deep meta can recurse into itself via DELEGATE primitive.
+# Default 1 (safe); opt-in 2-3 per Titan after soak validation.
+delegate_recursion_max_depth = 1
+
+# In-process thought-memory cache (rFP §4.5, §8 — Upgrade E)
+cache_enabled = true
+cache_max_entries = 200               # rolling window
+cache_ttl_seconds = 300               # 5 min
+cache_cosine_match_threshold = 0.85   # min context_vector similarity for hit
+
+# Emergent-reward α ramp (rFP §7.3)
+# α blends static STEP_REWARDS with dynamic per-(consumer, primitive, sub_mode)
+# rolling means. Count-based schedule per Maker decision.
+# Session 1 ships HARD-WIRED α=0.0 to validate infra without behavioral change;
+# Session 3 activates the ramp after first 500-outcome threshold.
+alpha_ramp_enabled = false            # Session 1: false; Session 3: flip true
+alpha_phase_0_end = 500               # warm-up → α=0.25
+alpha_phase_1_end = 2000              # → α=0.50
+alpha_phase_2_end = 5000              # → α=0.75
+alpha_phase_3_end = 10000             # → α=1.00 (steady)
+dynamic_cold_start_n = 10             # min observations before dynamic blend kicks in
+
+# Signed outcome rewards (rFP §4.6)
+# All outcome_reward values MUST be in [-1.0, +1.0]. Negative values
+# teach meta what NOT to do — this is load-bearing for escaping monoculture.
+outcome_reward_min = -1.0
+outcome_reward_max = 1.0
+
+# TimeChain query rate limit (rFP §9.5)
+# Prevents meta from saturating timechain_worker.
+timechain_queries_per_min = 200
+
+# FAISS embedding index (rFP §9.3)
+# Rebuilt during dream consolidation; regenerated-from-chain on restart if missing.
+faiss_index_path = "data/timechain/embedding_index.faiss"
+faiss_rebuild_on_restart = true       # if missing at boot, rebuild from blocks
+
+# SIMILAR query defaults (rFP §9.2)
+similar_threshold_default = 0.75
+similar_limit_default = 10
+
+# Per-consumer default time budgets (ms) — consumers may override per-request.
+# Values tuned for typical latency tolerance per rFP §4.7. MANDATORY per
+# request — these are guidance for consumer implementers, not a fallback.
+[meta_service_interface.time_budget_ms_hint]
+social = 300        # real-time conversation
+language = 500      # teaching loop
+knowledge = 3000    # research naturally slow
+self_model = 1500   # reflective
+coding = 800        # loop-tight
+emotional = 200     # neuromod nudge must land fast
+dreaming = 10000    # dream consolidation has all night
+reflection = 2000   # between-chain reflection
+
+# Consumer → home-worker routing (rFP §4.3)
+# META_REASON_RESPONSE dst value for each consumer. Maps logical consumer_id
+# to physical subscriber name (bus.subscribe name). "spirit" hosts
+# social/emotional/dreaming/self_model/reflection/reasoning (they run inside
+# spirit_worker); language/knowledge/cgn have dedicated workers.
+[meta_service_interface.consumer_home_worker]
+social = "spirit"
+language = "language"
+knowledge = "knowledge"
+reasoning = "spirit"       # ARC session logic runs inside spirit
+coding = "spirit"          # coding_explorer runs inside spirit
+self_model = "spirit"
+emotional = "emot_cgn"     # emot_cgn worker (post standalone ship)
+dreaming = "spirit"
+reflection = "spirit"

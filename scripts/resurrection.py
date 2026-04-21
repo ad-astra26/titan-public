@@ -450,9 +450,43 @@ def _query_zk_account(titan_pubkey: str) -> dict | None:
 # ---------------------------------------------------------------------------
 # Phase 3: Re-Hydration — Unpack and configure
 # ---------------------------------------------------------------------------
-def phase_3_rehydrate(archive_path: str, key_bytes: bytes):
-    """Unpack the archive and re-encrypt keypair for new hardware."""
+def phase_3_rehydrate(archive_path: str, key_bytes: bytes,
+                       encryption_manifest: dict = None,
+                       titan_pubkey: str = None,
+                       backup_type: str = "personality"):
+    """Unpack the archive and re-encrypt keypair for new hardware.
+
+    Phase 7 — if encryption_manifest is provided (algorithm=AES-256-GCM), the
+    archive at archive_path is decrypted in-place before extraction. The
+    reconstructed 64-byte keypair (key_bytes) and titan_pubkey are the inputs
+    to HKDF-based key derivation. Without these, tarfile.open on the ciphertext
+    would fail with a gzip/format error.
+    """
     print_phase(3, "Re-Hydration (Brain Unpacking)")
+
+    # Phase 7 decryption (if archive is encrypted per manifest)
+    if encryption_manifest and encryption_manifest.get("algorithm", "none") != "none":
+        print(f"  Encrypted archive detected (algorithm={encryption_manifest['algorithm']})")
+        try:
+            from titan_plugin.logic.backup_crypto import decrypt_from_manifest
+            import hashlib as _hashlib
+            with open(archive_path, "rb") as f:
+                ciphertext = f.read()
+            if not titan_pubkey:
+                # Fallback: derive from last 32B of key_bytes (matches load_keypair_bytes)
+                titan_pubkey = key_bytes[32:64].hex()
+            plaintext = decrypt_from_manifest(
+                ciphertext, encryption_manifest, key_bytes, titan_pubkey, backup_type)
+            expected = encryption_manifest.get("plaintext_sha256")
+            if expected and _hashlib.sha256(plaintext).hexdigest() != expected:
+                print("  [!] Plaintext SHA256 mismatch — manifest may be corrupt. ABORT.")
+                sys.exit(1)
+            with open(archive_path, "wb") as f:
+                f.write(plaintext)
+            print(f"  Decryption OK ({len(ciphertext)}→{len(plaintext)} bytes)")
+        except Exception as e:
+            print(f"  [!] Decryption failed: {e}")
+            sys.exit(1)
 
     cognee_db_path = os.path.join("data", "cognee_db")
 

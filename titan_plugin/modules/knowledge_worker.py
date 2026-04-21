@@ -126,6 +126,138 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         target=_async_loop.run_forever, daemon=True, name="knowledge-async")
     _async_thread.start()
 
+    # ── KP-2 persistent cache + KP-3 dispatcher ─────────────────────────
+    # Replaces Stage A in-memory cache + internal-name filter. All cache
+    # semantics (TTL, LRU, failure-caching) live in KnowledgeCache; all
+    # routing + internal-rejection + backend-chain walking live in
+    # knowledge_dispatcher. Worker's job is now: message dispatch + CGN
+    # policy + internal recall + grounding.
+    from titan_plugin.logic.knowledge_cache import KnowledgeCache
+    from titan_plugin.logic.knowledge_dispatcher import (
+        dispatch_sync, DispatchResult)
+    from titan_plugin.logic.knowledge_health import HealthTracker
+    from titan_plugin.logic.knowledge_router import (
+        QueryType, classify_query)
+    from titan_plugin.logic.knowledge_routing_learner import RoutingLearner
+    _cache_path = config.get("search_cache_path", "data/search_cache.db")
+    _cache_size_cap = int(config.get("search_cache_size_cap", 10_000))
+    _knowledge_cache = KnowledgeCache(
+        db_path=_cache_path, size_cap=_cache_size_cap)
+    # KP-4 — health tracker (circuit breaker + budget + decision log +
+    # near-dup). Budgets come from config's [knowledge_pipeline.budgets];
+    # see KP-7 for the alert cascade. Defaults (0 = unlimited) ship first
+    # so a misconfigured deploy doesn't hard-stop the pipeline.
+    _health_path = config.get(
+        "pipeline_health_path", "data/knowledge_pipeline_health.json")
+    _decision_log_path = config.get(
+        "pipeline_decision_log_path",
+        "data/logs/knowledge_router_decisions.jsonl")
+    _budgets_cfg = dict(config.get("budgets", {})) if config.get("budgets") else {}
+    # budgets are stored as MB in config; HealthTracker wants bytes
+    _budgets_bytes = {k: int(v) * 1024 * 1024 for k, v in _budgets_cfg.items()
+                      if isinstance(v, (int, float))}
+    # KP-7 alert cascade: HealthTracker invokes this whenever a budget
+    # threshold (80% or 100%) is crossed, OR a backend's circuit breaker
+    # transitions to OPEN. We fire a bus event (observability) + a Telegram
+    # notification (Maker awareness). Dedup handled inside HealthTracker
+    # (once per backend per day) and maker_notify (24h cooldown per class).
+    _telegram_alerts_enabled = bool(
+        config.get("telegram_alerts_enabled", True))
+
+    def _kp_alert_callback(_kind: str, _backend: str, _ctx: dict) -> None:
+        # Bus event — routed to "core" so logs / observatory pick it up.
+        # INTENTIONAL_BROADCAST: observability-only, no subscriber handles.
+        # Bus events ALWAYS fire (they drive arch_map + dashboard); the
+        # kill-switch below only gates the Telegram hop.
+        try:
+            _evt_type = {
+                "budget_warning": "SEARCH_PIPELINE_BUDGET_WARNING",
+                "budget_exceeded": "SEARCH_PIPELINE_BUDGET_EXCEEDED",
+                "circuit_open": "SEARCH_PIPELINE_DEGRADED",
+            }.get(_kind, "SEARCH_PIPELINE_ALERT")
+            _send_msg(send_queue, _evt_type, name, "core", {
+                "kind": _kind, "backend": _backend, **_ctx,
+            })
+        except Exception as _bus_err:
+            logger.debug("[KnowledgePipeline] alert bus publish: %s", _bus_err)
+        # Telegram via maker_notify (dedup at-most-daily per class) — KP-7
+        # kill-switch: [knowledge_pipeline].telegram_alerts_enabled = false
+        # mutes Telegram without suppressing the bus event.
+        if not _telegram_alerts_enabled:
+            return
+        try:
+            from titan_plugin.utils.maker_notify import notify_maker
+            _titan_id = config.get("titan_id",
+                                   os.environ.get("TITAN_ID", "T?"))
+            _pct = _ctx.get("pct", 0.0)
+            _bytes_mb = _ctx.get("bytes_consumed", 0) / (1024 * 1024)
+            _budget_mb = _ctx.get("budget_bytes", 0) / (1024 * 1024)
+            if _kind == "budget_warning":
+                _txt = (f"⚠ *Search pipeline* backend `{_backend}` at "
+                        f"{_pct:.0f}% of daily budget "
+                        f"({_bytes_mb:.1f}MB / {_budget_mb:.0f}MB). "
+                        f"Will hard-stop at 100%.")
+                notify_maker(f"search_budget_warn_{_backend}", _titan_id, _txt)
+            elif _kind == "budget_exceeded":
+                _txt = (f"🚨 *Search pipeline* backend `{_backend}` "
+                        f"BUDGET EXCEEDED — {_bytes_mb:.1f}MB used, "
+                        f"pipeline blocked until reset. "
+                        f"POST /v4/search-pipeline/budget-reset to override.")
+                notify_maker(f"search_budget_exceed_{_backend}", _titan_id,
+                             _txt, force=False)
+            elif _kind == "circuit_open":
+                _txt = (f"⚠ *Search pipeline* backend `{_backend}` circuit "
+                        f"OPENED — {_ctx.get('consecutive_errors', 0)} "
+                        f"consecutive errors (last: "
+                        f"`{_ctx.get('last_error_type', '?')}`). "
+                        f"Auto-probe in 5 min.")
+                notify_maker(f"search_circuit_{_backend}", _titan_id, _txt)
+        except Exception as _tg_err:
+            logger.debug(
+                "[KnowledgePipeline] Telegram notify failed: %s", _tg_err)
+
+    _health = HealthTracker(
+        health_path=_health_path,
+        decision_log_path=_decision_log_path,
+        budgets=_budgets_bytes,
+        on_alert=_kp_alert_callback,
+    )
+    # KP-8 routing learner — per (query_type, backend) reputation tracking
+    # with 7-day rolling window. Dispatcher consults learner.learned_chain()
+    # at every dispatch to reorder the static rFP §3.1 chain. Cold-start
+    # (any backend with < min_samples in the window) falls back to static.
+    # KP-8.1 — chain_reordered events → SEARCH_PIPELINE_CHAIN_REORDERED bus
+    # so observatory + arch_map see promotion/demotion decisions.
+    def _kp_routing_event_callback(_kind: str, _ctx: dict) -> None:
+        try:
+            _evt_type = {
+                "chain_reordered": "SEARCH_PIPELINE_CHAIN_REORDERED",
+            }.get(_kind, "SEARCH_PIPELINE_LEARNER_EVENT")
+            # INTENTIONAL_BROADCAST: observability-only; observatory + arch_map
+            # subscribe. Payload includes static/reordered chains + demoted list.
+            _send_msg(send_queue, _evt_type, name, "core", {
+                "kind": _kind, **_ctx,
+            })
+        except Exception as _re_err:
+            logger.debug(
+                "[KnowledgePipeline] routing event publish: %s", _re_err)
+
+    _routing_learner = RoutingLearner(
+        db_path=config.get("routing_stats_path",
+                            "data/knowledge_routing_stats.db"),
+        window_days=int(config.get("routing_learner_window_days", 7)),
+        min_samples=int(config.get("routing_learner_min_samples", 10)),
+        demote_threshold=float(config.get(
+            "routing_learner_demote_threshold", 0.10)),
+        enabled=bool(config.get("routing_learner_enabled", True)),
+        on_event=_kp_routing_event_callback,
+    )
+    # In-flight coalescing dict lives inside the async loop's thread;
+    # sequential message handling means it mostly stays empty but it
+    # protects against overlapping dispatch_sync calls if Sage research
+    # triggers nested dispatches in the future.
+    _dispatch_inflight: dict = {}
+
     # ── Stats ──────────────────────────────────────────────────────────
     _stats = {
         "requests_received": 0,
@@ -134,8 +266,9 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         "concepts_grounded": 0,
         "quality_rejected": 0,
         "deferred": 0,
-        "cache_hits": 0,
-        "rejected_internal_names": 0,
+        "cache_hits": 0,                    # from router cache, not Stage A
+        "rejected_internal_names": 0,       # from router.INTERNAL_REJECTED
+        "backend_attempts": {},             # {backend_name: int} per-session
     }
     _last_heartbeat = time.time()
     _heartbeat_interval = 5.0
@@ -166,12 +299,9 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
             "[META-CGN] Producer #10 EdgeDetector init failed: %s — "
             "knowledge.concept_grounded will not emit", _p10_init_err)
 
-    # Stage A in-memory search cache (2026-04-12). Key: topic.lower().strip().
-    # TTL 1 hour. Max 500 entries (FIFO eviction). Reduces bandwidth burn on
-    # duplicate queries. Persistent SQLite-backed version in rFP v2 Layer 2.
-    _search_cache: dict = {}
-    _SEARCH_CACHE_MAX = 500
-    _SEARCH_CACHE_TTL = 3600
+    # Stage A's in-memory cache + internal-name filter are REMOVED here —
+    # both responsibilities now live in knowledge_cache + knowledge_router.
+    # KP-3 cutover 2026-04-20. See rFP_knowledge_pipeline_v2.md §6.
 
     # ── Background heartbeat thread (keeps Guardian alive during long Sage research) ──
     _hb_stop = threading.Event()
@@ -189,6 +319,39 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
     logger.info("[KnowledgeWorker] Ready in %.0fms (sage=%s, db=%s)",
                 init_ms, "OK" if sage else "DISABLED", db_path)
     _send_msg(send_queue, "MODULE_READY", name, "guardian", {})
+
+    # ── F-phase (rFP §16.3): Meta-Reasoning Consumer Service wire ────
+    # Session 2 wire-now-gate-later: request at action-dispatch time,
+    # outcome after research concludes (neutral 0.0 reward in Session 2
+    # since advice not applied; Session 3 switches to
+    # compute_outcome_knowledge(research_result)).
+    _kn_meta_pending: dict = {}  # request_id → (t_sent, topic, pre_conf)
+    try:
+        from titan_plugin.logic.meta_service_client import (
+            register_response_handler as _kn_register_mrh,
+        )
+
+        def _kn_meta_response_handler(payload: dict) -> None:
+            req_id = payload.get("request_id", "")
+            failure = payload.get("failure_mode")
+            if failure:
+                logger.info(
+                    "[KnMeta] response req_id=%s failure=%s "
+                    "(dry-run expected)", req_id[:8], failure)
+            else:
+                insight = payload.get("insight") or {}
+                logger.info(
+                    "[KnMeta] response req_id=%s sugg=%s",
+                    req_id[:8],
+                    insight.get("suggested_action") if insight else None)
+            _kn_meta_pending.pop(req_id, None)
+
+        _kn_register_mrh("knowledge", _kn_meta_response_handler)
+        logger.info("[KnowledgeWorker] F-phase meta response handler registered")
+    except Exception as _knh_err:
+        logger.warning(
+            "[KnowledgeWorker] Meta response handler registration: %s",
+            _knh_err)
 
     # ── Main loop ──────────────────────────────────────────────────────
     while True:
@@ -227,48 +390,24 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                     logger.debug("[KnowledgeWorker] Empty topic, skipping")
                     continue
 
-                # Stage A filter (2026-04-12): reject Titan-internal-looking
-                # topics that shouldn't reach external search engines. These
-                # leak through from meta-reasoning formulate_output, persona
-                # telemetry, etc. Patterns:
-                #   - single word with underscores (inner_spirit, outer_perception)
-                #   - primitive.submode notation (FORMULATE.load_wisdom)
-                #   - single word < 4 chars
-                # Prevents bandwidth burn on queries SearXNG/Sage can't answer.
-                _is_internal_name = (
-                    ("_" in topic and " " not in topic) or
-                    ("." in topic and len(topic.split()) == 1) or
-                    (len(topic) < 4 and " " not in topic)
-                )
-                if _is_internal_name:
+                # Pre-classification via router — rejects Titan-internal
+                # names upfront (supersedes Stage A's inline filter) and
+                # establishes the query_type used by the dispatcher for
+                # backend selection + cache TTL.
+                _qt = classify_query(topic)
+                if _qt == QueryType.INTERNAL_REJECTED:
                     logger.warning(
                         "[KnowledgeWorker] Rejected internal-name query: '%s' "
                         "(requestor=%s) — Titan-internal names not searchable "
-                        "externally. See rFP_knowledge_pipeline_v2 Layer 4.",
-                        topic[:60], requestor)
+                        "externally.", topic[:60], requestor)
                     _stats["rejected_internal_names"] = (
                         _stats.get("rejected_internal_names", 0) + 1)
                     continue
 
                 _stats["requests_received"] += 1
                 logger.info("[KnowledgeWorker] Request: '%s' from %s "
-                            "(urgency=%.2f)", topic[:60], requestor, urgency)
-
-                # Stage A cache (2026-04-12): check in-memory cache before
-                # external search. TTL + max defined at worker init above.
-                _cache_key = topic.lower().strip()
-                _now_ts = time.time()
-                _cached = _search_cache.get(_cache_key)
-                if _cached and (_now_ts - _cached["ts"]) < _SEARCH_CACHE_TTL:
-                    # Cache hit — distribute cached result without external call
-                    _stats["cache_hits"] += 1
-                    _distribute(send_queue, name, requestor, topic,
-                                _cached["concept"], source="cache",
-                                request_id=_request_id)
-                    logger.info("[KnowledgeWorker] Cache hit: '%s' "
-                                "(age=%.0fs, saves ~2-5MB proxy bandwidth)",
-                                topic[:40], _now_ts - _cached["ts"])
-                    continue
+                            "(urgency=%.2f, type=%s)", topic[:60], requestor,
+                            urgency, _qt.value)
 
                 # Phase 1: Internal recall (always first)
                 internal = _search_internal(db_path, topic)
@@ -307,6 +446,41 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 action_name = action_result.get("action_name", "research_shallow")
                 action_idx = action_result.get("action_index", 1)
 
+                # ── F-phase (rFP §16.3): consult meta on action choice ──
+                # Session 2 dry-run: meta returns not_yet_implemented;
+                # knowledge falls back to CGN policy (above). Accumulates
+                # request traffic for Session 3 chain execution.
+                _kn_req_id = ""
+                try:
+                    from titan_plugin.logic.meta_service_client import (
+                        send_meta_request as _kn_send,
+                    )
+                    from titan_plugin.logic.meta_consumer_contexts import (
+                        build_knowledge_meta_context_30d as _kn_ctx,
+                    )
+                    _kn_pre_conf = (internal[0]["confidence"]
+                                    if internal else 0.0)
+                    _kn_req_id = _kn_send(
+                        consumer_id="knowledge",
+                        question_type="formulate_strategy",
+                        context_vector=_kn_ctx(
+                            topic=topic,
+                            confidence={"internal": _kn_pre_conf},
+                            urgency=urgency,
+                            neuromods=neuromods),
+                        time_budget_ms=3000,
+                        constraints={
+                            "confidence_threshold": 0.3,
+                            "allow_timechain_query": True,
+                        },
+                        payload_snippet=f"topic={topic[:40]} action={action_name}",
+                        send_queue=send_queue, src=name)
+                    _kn_meta_pending[_kn_req_id] = (
+                        time.time(), topic[:40], _kn_pre_conf)
+                except Exception as _kn_err:
+                    logger.debug("[KnMeta] pre-research request skipped: %s",
+                                 _kn_err)
+
                 if action_name == "defer":
                     _stats["deferred"] += 1
                     logger.info("[KnowledgeWorker] Deferred: '%s'",
@@ -315,49 +489,90 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                                      topic, 5, neuromods, reward=0.0)
                     continue
 
-                if action_name in ("research_shallow", "research_deep") and sage:
-                    # External research via Stealth Sage
+                if action_name in ("research_shallow", "research_deep"):
+                    # External research via knowledge_dispatcher — walks the
+                    # router's backend chain for _qt (cache → direct REST →
+                    # Sage delegation). Sage is still the fallback for
+                    # conceptual/technical queries; dictionary/wikipedia
+                    # queries bypass Sage entirely via direct REST backends.
                     _stats["external_researches"] += 1
-                    # Send heartbeat before long research operation
                     _send_heartbeat(send_queue, name)
                     try:
-                        future = asyncio.run_coroutine_threadsafe(
-                            sage.research(topic), _async_loop)
-                        findings = future.result(timeout=45.0)
-                    except Exception as sage_err:
-                        logger.warning("[KnowledgeWorker] Sage error: %s",
-                                       sage_err)
-                        findings = ""
+                        dispatch_res: DispatchResult = dispatch_sync(
+                            topic=topic,
+                            async_loop=_async_loop,
+                            cache=_knowledge_cache,
+                            sage=sage,
+                            timeout=45.0,
+                            timeout_per_backend=10.0,
+                            inflight=_dispatch_inflight,
+                            health=_health,
+                            learner=_routing_learner,
+                            requestor=requestor,
+                        )
+                    except Exception as _disp_err:
+                        logger.warning("[KnowledgeWorker] Dispatch error: %s",
+                                       _disp_err)
+                        dispatch_res = None
+
+                    # Track per-backend attempt telemetry (feeds KP-4 health)
+                    if dispatch_res is not None:
+                        for _bk, _outcome in dispatch_res.attempts:
+                            _stats["backend_attempts"][_bk] = (
+                                _stats["backend_attempts"].get(_bk, 0) + 1)
+                        if dispatch_res.cache_hit:
+                            _stats["cache_hits"] += 1
+
+                    # Translate DispatchResult → legacy (findings, source) form
+                    findings = ""
+                    _source_backend = "dispatcher"
+                    if (dispatch_res is not None
+                            and dispatch_res.result is not None
+                            and dispatch_res.result.success):
+                        findings = dispatch_res.result.raw_text
+                        _source_backend = dispatch_res.backend_used or "dispatcher"
 
                     if findings:
                         # Heartbeat after research completes
                         _send_heartbeat(send_queue, name)
                         _last_heartbeat = time.time()
 
-                        # Strip [SAGE_RESEARCH_FINDINGS]: prefix
-                        summary = findings.replace(
-                            "[SAGE_RESEARCH_FINDINGS]: ", "").strip()
+                        # summary is what the backend gave us. For SearXNG
+                        # backends Sage already stripped the prefix in
+                        # _invoke_sage_backend; direct REST backends return
+                        # plain text.
+                        summary = findings
 
                         # Quality gate
                         quality = _quality_score(topic, summary)
                         if quality < 0.3:
                             _stats["quality_rejected"] += 1
                             logger.info("[KnowledgeWorker] Quality rejected "
-                                        "'%s' (score=%.2f)", topic[:40],
-                                        quality)
+                                        "'%s' (score=%.2f, backend=%s)",
+                                        topic[:40], quality, _source_backend)
                             _send_transition(
                                 send_queue, name, cgn_client,
                                 topic, action_idx, neuromods,
                                 reward=-0.05)
                             continue
 
-                        # Ground as concept
+                        # Ground as concept — `source` field records the
+                        # actual backend used so downstream analytics see
+                        # wiktionary/wikipedia_direct/searxng_* distinctly.
                         concept = _ground_concept(
                             db_path, topic, summary, quality,
-                            source="searxng",
+                            source=_source_backend,
                             requestor=requestor,
                             neuromods=neuromods)
                         _stats["concepts_grounded"] += 1
+                        # KP-8 — feed quality back to routing learner so
+                        # reputation reflects real downstream-usable signal.
+                        if (_source_backend
+                                and _source_backend != "dispatcher"
+                                and dispatch_res is not None):
+                            _routing_learner.record_quality(
+                                dispatch_res.query_type,
+                                _source_backend, quality)
 
                         # ── META-CGN producer #10: knowledge.concept_grounded ──
                         # v3 Phase D rollout (rFP § 12 row 10). Fires exactly
@@ -393,17 +608,9 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                                 "— topic=%s err=%s (signal missed)",
                                 topic, _p10_err)
 
-                        # Stage A cache write: store successful result for
-                        # future hits within TTL. FIFO eviction at max size.
-                        if len(_search_cache) >= _SEARCH_CACHE_MAX:
-                            # Drop oldest entry (simple FIFO)
-                            _oldest = min(_search_cache,
-                                          key=lambda k: _search_cache[k]["ts"])
-                            _search_cache.pop(_oldest, None)
-                        _search_cache[_cache_key] = {
-                            "concept": concept,
-                            "ts": _now_ts,
-                        }
+                        # Cache persistence is owned by knowledge_cache (KP-2),
+                        # populated inside dispatch_sync above. No inline
+                        # cache write needed here.
 
                         # ── CONCEPT RESONANCE CASCADE ──
                         # Immediate cross-consumer effects:
@@ -425,7 +632,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                             "magnitude": quality,
                             "context": {
                                 "type": "knowledge_grounded",
-                                "source": "searxng",
+                                "source": _source_backend,
                                 "summary_len": len(summary),
                                 "requestor": requestor,
                             },
@@ -442,7 +649,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                             "content": {"topic": topic[:100],
                                 "summary_len": len(summary),
                                 "quality": round(quality, 3),
-                                "search_source": "searxng",
+                                "search_source": _source_backend,
                                 "requestor": requestor},
                             "significance": quality,
                             "novelty": 0.9,
@@ -482,71 +689,134 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                                 request_id=_request_id)
 
                 else:
-                    # Fallback: try shallow research if sage available
-                    if sage:
-                        _stats["external_researches"] += 1
-                        _send_heartbeat(send_queue, name)
-                        try:
-                            future = asyncio.run_coroutine_threadsafe(
-                                sage.research(topic), _async_loop)
-                            findings = future.result(timeout=45.0)
-                        except Exception:
-                            findings = ""
-                        if findings:
-                            summary = findings.replace(
-                                "[SAGE_RESEARCH_FINDINGS]: ", "").strip()
-                            quality = _quality_score(topic, summary)
-                            if quality >= 0.3:
-                                concept = _ground_concept(
-                                    db_path, topic, summary, quality,
-                                    source="searxng",
-                                    requestor=requestor,
-                                    neuromods=neuromods)
-                                _stats["concepts_grounded"] += 1
-                                # Resonance cascade (same as primary path)
-                                _distribute(
-                                    send_queue, name, requestor, topic,
-                                    concept, source="external_research",
-                                    request_id=_request_id)
-                                if requestor != "language":
-                                    _distribute(send_queue, name,
-                                                "language", topic, concept,
-                                                source="knowledge_cascade")
-                                _send_msg(send_queue, "CGN_SURPRISE",
-                                          name, "cgn", {
-                                    "consumer": "knowledge",
-                                    "concept_id": topic[:50],
-                                    "magnitude": quality,
-                                    "context": {
-                                        "type": "knowledge_grounded",
-                                        "source": "searxng",
-                                        "requestor": requestor,
-                                    },
-                                })
-                                _log_concept_lifecycle(
-                                    send_queue, name, topic,
-                                    "grounded", quality, requestor)
-                                # TimeChain: fallback research → declarative
-                                send_queue.put({"type": "TIMECHAIN_COMMIT",
-                                    "src": name, "dst": "timechain",
-                                    "ts": time.time(), "payload": {
-                                    "fork": "declarative",
-                                    "thought_type": "declarative",
-                                    "source": "knowledge_research",
-                                    "content": {"topic": topic[:100],
-                                        "quality": round(quality, 3),
-                                        "requestor": requestor},
-                                    "significance": quality,
-                                    "novelty": 0.9, "coherence": 0.5,
-                                    "tags": [t.strip() for t in topic.lower().split()[:3]] + ["knowledge"],
-                                    "db_ref": f"knowledge_concepts:{topic[:50]}",
-                                    "neuromods": neuromods or {},
-                                    "chi_available": 0.5, "attention": 0.5,
-                                    "i_confidence": 0.5, "chi_coherence": 0.3,
-                                }})
+                    # Fallback: try dispatcher (was direct Sage call).
+                    # Same pipeline as the research_shallow/deep path, just
+                    # entered via the CGN fallback branch (consolidate/defer
+                    # didn't apply + no internal hit with conf > 0.4).
+                    _stats["external_researches"] += 1
+                    _send_heartbeat(send_queue, name)
+                    try:
+                        dispatch_res = dispatch_sync(
+                            topic=topic,
+                            async_loop=_async_loop,
+                            cache=_knowledge_cache,
+                            sage=sage,
+                            timeout=45.0,
+                            timeout_per_backend=10.0,
+                            inflight=_dispatch_inflight,
+                            health=_health,
+                            learner=_routing_learner,
+                            requestor=requestor,
+                        )
+                    except Exception:
+                        dispatch_res = None
+
+                    if (dispatch_res is not None
+                            and dispatch_res.result is not None
+                            and dispatch_res.result.success):
+                        # Track per-backend attempts + cache hits here too
+                        for _bk, _outcome in dispatch_res.attempts:
+                            _stats["backend_attempts"][_bk] = (
+                                _stats["backend_attempts"].get(_bk, 0) + 1)
+                        if dispatch_res.cache_hit:
+                            _stats["cache_hits"] += 1
+                        _source_backend = (
+                            dispatch_res.backend_used or "dispatcher")
+                        summary = dispatch_res.result.raw_text
+                        quality = _quality_score(topic, summary)
+                        if quality >= 0.3:
+                            concept = _ground_concept(
+                                db_path, topic, summary, quality,
+                                source=_source_backend,
+                                requestor=requestor,
+                                neuromods=neuromods)
+                            _stats["concepts_grounded"] += 1
+                            # KP-8 — quality feedback into routing learner
+                            if (_source_backend
+                                    and _source_backend != "dispatcher"
+                                    and dispatch_res is not None):
+                                _routing_learner.record_quality(
+                                    dispatch_res.query_type,
+                                    _source_backend, quality)
+                            # Resonance cascade (same as primary path)
+                            _distribute(
+                                send_queue, name, requestor, topic,
+                                concept, source="external_research",
+                                request_id=_request_id)
+                            if requestor != "language":
+                                _distribute(send_queue, name,
+                                            "language", topic, concept,
+                                            source="knowledge_cascade")
+                            _send_msg(send_queue, "CGN_SURPRISE",
+                                      name, "cgn", {
+                                "consumer": "knowledge",
+                                "concept_id": topic[:50],
+                                "magnitude": quality,
+                                "context": {
+                                    "type": "knowledge_grounded",
+                                    "source": _source_backend,
+                                    "requestor": requestor,
+                                },
+                            })
+                            _log_concept_lifecycle(
+                                send_queue, name, topic,
+                                "grounded", quality, requestor)
+                            # TimeChain: fallback research → declarative
+                            send_queue.put({"type": "TIMECHAIN_COMMIT",
+                                "src": name, "dst": "timechain",
+                                "ts": time.time(), "payload": {
+                                "fork": "declarative",
+                                "thought_type": "declarative",
+                                "source": "knowledge_research",
+                                "content": {"topic": topic[:100],
+                                    "quality": round(quality, 3),
+                                    "search_source": _source_backend,
+                                    "requestor": requestor},
+                                "significance": quality,
+                                "novelty": 0.9, "coherence": 0.5,
+                                "tags": [t.strip() for t in topic.lower().split()[:3]] + ["knowledge"],
+                                "db_ref": f"knowledge_concepts:{topic[:50]}",
+                                "neuromods": neuromods or {},
+                                "chi_available": 0.5, "attention": 0.5,
+                                "i_confidence": 0.5, "chi_coherence": 0.3,
+                            }})
+
+                # ── F-phase (rFP §16.3): meta outcome after research ──
+                # Session 2: reward = 0.0 (advice not yet applied).
+                # Session 3: switch to compute_outcome_knowledge with
+                # actual pre/post confidence + bandwidth delta.
+                if _kn_req_id:
+                    try:
+                        from titan_plugin.logic.meta_service_client import (
+                            send_meta_outcome as _kn_out,
+                        )
+                        _kn_out(
+                            request_id=_kn_req_id,
+                            consumer_id="knowledge",
+                            outcome_reward=0.0,
+                            actual_primitive_used=None,
+                            context=f"session_2_dry action={action_name}",
+                            send_queue=send_queue, src=name)
+                        _kn_meta_pending.pop(_kn_req_id, None)
+                    except Exception as _kn_out_err:
+                        logger.debug(
+                            "[KnMeta] outcome skipped: %s", _kn_out_err)
 
             except Exception as e:
                 logger.warning("[KnowledgeWorker] Request error: %s", e)
+
+        # ── META_REASON_RESPONSE (F-phase rFP §4.3) ────────────────
+        # Routed here per [meta_service_interface.consumer_home_worker]
+        # knowledge = "knowledge".
+        elif msg_type == "META_REASON_RESPONSE":
+            try:
+                from titan_plugin.logic.meta_service_client import (
+                    dispatch_meta_response as _kn_dispatch,
+                )
+                _kn_dispatch(msg, logger_obj=logger)
+            except Exception as _kn_disp_err:
+                logger.warning(
+                    "[KnMeta] response dispatch error: %s", _kn_disp_err)
 
         # ── CGN_KNOWLEDGE_USAGE — downstream usage reward ─────────
         # API_STUB: handler ready, awaiting CGN consumers (language/social/
@@ -560,6 +830,28 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                     _record_usage(db_path, topic)
                     _send_transition(send_queue, name, cgn_client,
                                      topic, 4, {}, reward=reward)
+                    # KP-8 — usage is the strongest signal that a routing
+                    # decision landed a useful concept. Look up the source
+                    # backend that grounded this topic + feed the learner.
+                    try:
+                        _usage_source = ""
+                        _usage_conn = sqlite3.connect(db_path, timeout=2.0)
+                        _usage_row = _usage_conn.execute(
+                            "SELECT source FROM knowledge_concepts "
+                            "WHERE topic LIKE ? LIMIT 1",
+                            (f"%{topic}%",)).fetchone()
+                        _usage_conn.close()
+                        if _usage_row and _usage_row[0]:
+                            _usage_source = str(_usage_row[0])
+                        if _usage_source and _usage_source != "dispatcher":
+                            _qt_usage = classify_query(topic)
+                            if _qt_usage != QueryType.INTERNAL_REJECTED:
+                                _routing_learner.record_usage(
+                                    _qt_usage, _usage_source)
+                    except Exception as _lu_err:
+                        logger.debug(
+                            "[KnowledgeWorker] Learner usage update: %s",
+                            _lu_err)
                     logger.info("[KnowledgeWorker] Usage reward: '%s' → %.2f",
                                 topic[:40], reward)
             except Exception as e:
@@ -633,10 +925,36 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 _send_response(send_queue, name, msg.get("src", ""),
                                {"results": results}, msg.get("rid"))
 
+        # ── SEARCH_PIPELINE_BUDGET_RESET — Maker override (KP-5) ──
+        elif msg_type == "SEARCH_PIPELINE_BUDGET_RESET":
+            try:
+                _rb_backend = (payload.get("backend") or "").strip() or None
+                _health.reset_budget(_rb_backend)
+                logger.info(
+                    "[KnowledgeWorker] Budget reset by Maker (backend=%s)",
+                    _rb_backend or "ALL")
+            except Exception as _rb_err:
+                logger.warning(
+                    "[KnowledgeWorker] Budget reset error: %s", _rb_err)
+
         # ── CGN_WEIGHTS_MAJOR — weights updated (client auto-reloads from SHM)
         elif msg_type == "CGN_WEIGHTS_MAJOR":
             logger.debug("[KnowledgeWorker] Weights updated (v=%s)",
                          payload.get("shm_version", "?"))
+
+        # ── CGN_CROSS_INSIGHT (Plug B, rFP §20) ────────────────────
+        # Emotional cross-insights from emot_cgn_worker reach us via
+        # the bus's dst="all" broadcast. Forward to local CGN client
+        # so its EMA of emotional-outcome rewards updates → surfaces
+        # in state_vec slot 18 on next ground() call.
+        elif msg_type == "CGN_CROSS_INSIGHT":
+            try:
+                if cgn_client is not None:
+                    cgn_client.note_incoming_cross_insight(
+                        msg.get("payload", {}))
+            except Exception as _ci_err:
+                logger.debug("[KnowledgeWorker] cross-insight note error: %s",
+                             _ci_err)
 
         # ── MODULE_SHUTDOWN ───────────────────────────────────────
         elif msg_type == "MODULE_SHUTDOWN":
@@ -752,10 +1070,13 @@ def _ground_concept(db_path: str, topic: str, summary: str,
             "WHERE topic = ?", (topic,)
         ).fetchone()
 
+        conn.close()
+        from titan_plugin.persistence import get_client
+        client = get_client(caller_name="knowledge_worker")
         if existing:
             # Update existing — bump encounter, merge summary if better
             new_conf = min(1.0, existing[2] + 0.05)
-            conn.execute(
+            client.write(
                 "UPDATE knowledge_concepts SET "
                 "summary = CASE WHEN length(?) > length(summary) THEN ? "
                 "  ELSE summary END, "
@@ -765,20 +1086,21 @@ def _ground_concept(db_path: str, topic: str, summary: str,
                 "last_used_at = ? "
                 "WHERE topic = ?",
                 (summary, summary, new_conf, quality,
-                 concept["neuromod_at_acquisition"], now, topic))
+                 concept["neuromod_at_acquisition"], now, topic),
+                table="knowledge_concepts",
+            )
             concept["confidence"] = new_conf
         else:
-            conn.execute(
+            client.write(
                 "INSERT INTO knowledge_concepts "
                 "(topic, summary, confidence, source, quality_score, "
                 "requesting_consumer, neuromod_at_acquisition, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (topic, summary, concept["confidence"], source,
                  quality, requestor,
-                 concept["neuromod_at_acquisition"], now))
-
-        conn.commit()
-        conn.close()
+                 concept["neuromod_at_acquisition"], now),
+                table="knowledge_concepts",
+            )
     except Exception as e:
         logger.warning("[KnowledgeWorker] Ground concept error: %s", e)
 
@@ -788,12 +1110,11 @@ def _ground_concept(db_path: str, topic: str, summary: str,
 def _consolidate_existing(db_path: str, topic: str) -> None:
     """Bump encounter count for an existing concept."""
     try:
-        conn = sqlite3.connect(db_path, timeout=2.0)
-        conn.execute(
+        from titan_plugin.persistence import get_client
+        get_client(caller_name="knowledge_worker").write(
             "UPDATE knowledge_concepts SET encounter_count = encounter_count + 1, "
-            "last_used_at = ? WHERE topic = ?", (time.time(), topic))
-        conn.commit()
-        conn.close()
+            "last_used_at = ? WHERE topic = ?", (time.time(), topic),
+            table="knowledge_concepts")
     except Exception:
         pass
 
@@ -801,14 +1122,13 @@ def _consolidate_existing(db_path: str, topic: str) -> None:
 def _record_usage(db_path: str, topic: str) -> None:
     """Record downstream usage of a knowledge concept."""
     try:
-        conn = sqlite3.connect(db_path, timeout=2.0)
-        conn.execute(
+        from titan_plugin.persistence import get_client
+        get_client(caller_name="knowledge_worker").write(
             "UPDATE knowledge_concepts SET times_used = times_used + 1, "
             "confidence = MIN(1.0, confidence + 0.02), "
             "last_used_at = ? WHERE topic LIKE ?",
-            (time.time(), f"%{topic}%"))
-        conn.commit()
-        conn.close()
+            (time.time(), f"%{topic}%"),
+            table="knowledge_concepts")
     except Exception:
         pass
 

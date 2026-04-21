@@ -183,7 +183,7 @@ CREATE INDEX IF NOT EXISTS idx_clock_ts ON clock_history(ts);
 class ObservatoryDB:
     """Thread-safe SQLite wrapper for Observatory long-term storage."""
 
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str = None, writer_client=None):
         if db_path is None:
             base = os.path.join(os.path.dirname(__file__), "..", "..", "data")
             os.makedirs(base, exist_ok=True)
@@ -191,6 +191,38 @@ class ObservatoryDB:
         self._db_path = os.path.normpath(db_path)
         self._lock = threading.Lock()
         self._init_db()
+        # rFP_observatory_writer_service Phase 1: optional writer client.
+        # If [persistence_observatory].enabled = true, we route writes through
+        # a second IMW-pattern daemon to relieve multi-process lock contention
+        # (50+ "database is locked" errors per ~12h on T1 morning of 2026-04-21).
+        # The client itself handles all mode logic (disabled/shadow/dual/canonical
+        # + per-table cutover via tables_canonical list); ObservatoryDB just
+        # calls _route_write() and lets the client decide direct vs writer.
+        # Caller may pass an explicit client; otherwise we auto-construct from
+        # [persistence_observatory] section so existing instantiation sites
+        # don't need code changes.
+        self._writer = writer_client
+        if self._writer is None:
+            try:
+                from titan_plugin.persistence.config import IMWConfig
+                from titan_plugin.persistence.writer_client import (
+                    InnerMemoryWriterClient,
+                )
+                cfg = IMWConfig.from_titan_config_section("persistence_observatory")
+                if cfg.enabled and cfg.mode != "disabled":
+                    self._writer = InnerMemoryWriterClient(
+                        cfg, caller_name="observatory_db")
+                    logger.info(
+                        "[ObservatoryDB] Routed via observatory_writer "
+                        "(mode=%s, canonical=%s)",
+                        cfg.mode, cfg.tables_canonical or "<none>")
+            except Exception as e:
+                # Defensive: never break ObservatoryDB if writer setup fails.
+                # Direct path remains as fallback.
+                logger.warning(
+                    "[ObservatoryDB] writer client unavailable, "
+                    "using direct writes: %s", e)
+                self._writer = None
 
     def _init_db(self):
         """Create tables if they don't exist."""
@@ -218,6 +250,28 @@ class ObservatoryDB:
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
+    def _route_write(self, sql: str, params: tuple, *, table: str) -> None:
+        """Single write helper.
+
+        Phase 4 sunset (2026-04-21, post 30-min canonical soak with zero errors
+        across 25,107 writes): when writer is enabled, it is the SOLE write
+        path. Errors propagate to caller — no silent direct-path fallback.
+        Loud failure beats silent data divergence.
+
+        Direct path remains in place for the writer-disabled deployment case
+        (e.g. someone running ObservatoryDB without the writer service).
+        """
+        if self._writer is not None:
+            self._writer.write(sql, params, table=table)
+            return
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(sql, params)
+                conn.commit()
+            finally:
+                conn.close()
+
     # ------------------------------------------------------------------
     # Vital Snapshots
     # ------------------------------------------------------------------
@@ -236,20 +290,15 @@ class ObservatoryDB:
     ):
         """Record a point-in-time vital snapshot. Called every 15 minutes."""
         ts = int(time.time())
-        with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    "INSERT INTO vital_snapshots "
-                    "(ts, sovereignty_pct, life_force_pct, sol_balance, energy_state, "
-                    "mood_label, mood_score, persistent_count, mempool_size, epoch_counter) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (ts, sovereignty_pct, life_force_pct, sol_balance, energy_state,
-                     mood_label, mood_score, persistent_count, mempool_size, epoch_counter),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+        self._route_write(
+            "INSERT INTO vital_snapshots "
+            "(ts, sovereignty_pct, life_force_pct, sol_balance, energy_state, "
+            "mood_label, mood_score, persistent_count, mempool_size, epoch_counter) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts, sovereignty_pct, life_force_pct, sol_balance, energy_state,
+             mood_label, mood_score, persistent_count, mempool_size, epoch_counter),
+            table="vital_snapshots",
+        )
 
     def get_vital_history(self, days: int = 7, metrics: list = None) -> list[dict]:
         """
@@ -300,21 +349,16 @@ class ObservatoryDB:
     ):
         """Record a Trinity tensor snapshot. Called every trinity_snapshot_interval seconds."""
         ts = int(time.time())
-        with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    "INSERT INTO trinity_snapshots "
-                    "(ts, body_tensor, mind_tensor, spirit_tensor, "
-                    "middle_path_loss, body_center_dist, mind_center_dist) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (ts, json.dumps(body_tensor), json.dumps(mind_tensor),
-                     json.dumps(spirit_tensor), middle_path_loss,
-                     body_center_dist, mind_center_dist),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+        self._route_write(
+            "INSERT INTO trinity_snapshots "
+            "(ts, body_tensor, mind_tensor, spirit_tensor, "
+            "middle_path_loss, body_center_dist, mind_center_dist) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ts, json.dumps(body_tensor), json.dumps(mind_tensor),
+             json.dumps(spirit_tensor), middle_path_loss,
+             body_center_dist, mind_center_dist),
+            table="trinity_snapshots",
+        )
 
     def get_trinity_history(self, hours: int = 24) -> list[dict]:
         """
@@ -362,18 +406,13 @@ class ObservatoryDB:
     ):
         """Record growth metrics. Called alongside Trinity snapshots."""
         ts = int(time.time())
-        with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    "INSERT INTO growth_snapshots "
-                    "(ts, learning_velocity, social_density, metabolic_health, directive_alignment) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (ts, learning_velocity, social_density, metabolic_health, directive_alignment),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+        self._route_write(
+            "INSERT INTO growth_snapshots "
+            "(ts, learning_velocity, social_density, metabolic_health, directive_alignment) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (ts, learning_velocity, social_density, metabolic_health, directive_alignment),
+            table="growth_snapshots",
+        )
 
     def get_growth_history(self, days: int = 7) -> list[dict]:
         """Fetch growth metrics history, ordered chronologically."""
@@ -406,18 +445,13 @@ class ObservatoryDB:
         """Archive an expressive output (art, haiku, audio, x_post)."""
         ts = int(time.time())
         meta_json = json.dumps(metadata) if metadata else "{}"
-        with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    "INSERT INTO expressive_archive "
-                    "(ts, type, title, content, media_path, media_hash, metadata) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (ts, type_, title, content, media_path, media_hash, meta_json),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+        self._route_write(
+            "INSERT INTO expressive_archive "
+            "(ts, type, title, content, media_path, media_hash, metadata) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ts, type_, title, content, media_path, media_hash, meta_json),
+            table="expressive_archive",
+        )
 
     def get_expressive_archive(
         self, type_: str = None, limit: int = 20, offset: int = 0,
@@ -457,19 +491,18 @@ class ObservatoryDB:
     # ------------------------------------------------------------------
 
     def record_event(self, event_type: str, summary: str = "", details: dict = None):
-        """Log a significant event (meditation, guardian_block, memory_commit, etc.)."""
+        """Log a significant event (meditation, guardian_block, memory_commit, etc.).
+
+        rFP_observatory_writer_service: event_log is the **first canary table**
+        for Phase 2 canonical cutover (highest contention → highest payoff).
+        """
         ts = int(time.time())
         details_json = json.dumps(details) if details else "{}"
-        with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    "INSERT INTO event_log (ts, event_type, summary, details) VALUES (?, ?, ?, ?)",
-                    (ts, event_type, summary, details_json),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+        self._route_write(
+            "INSERT INTO event_log (ts, event_type, summary, details) VALUES (?, ?, ?, ?)",
+            (ts, event_type, summary, details_json),
+            table="event_log",
+        )
 
     def get_events(
         self, event_type: str = None, limit: int = 50, offset: int = 0,
@@ -510,16 +543,11 @@ class ObservatoryDB:
     def record_guardian_action(self, tier: str, action: str, category: str = ""):
         """Log a guardian safety intervention (never stores the blocked content)."""
         ts = int(time.time())
-        with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    "INSERT INTO guardian_log (ts, tier, action, category) VALUES (?, ?, ?, ?)",
-                    (ts, tier, action, category),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+        self._route_write(
+            "INSERT INTO guardian_log (ts, tier, action, category) VALUES (?, ?, ?, ?)",
+            (ts, tier, action, category),
+            table="guardian_log",
+        )
 
     def get_guardian_log(self, limit: int = 50) -> list[dict]:
         """Fetch recent guardian actions."""
@@ -555,22 +583,17 @@ class ObservatoryDB:
     ):
         """Record a reflex firing event for observability."""
         ts = int(time.time())
-        with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    "INSERT INTO reflex_log "
-                    "(ts, reflex_type, combined_confidence, body_confidence, mind_confidence, "
-                    "spirit_confidence, fired, succeeded, duration_ms, error, "
-                    "stimulus_topic, stimulus_intensity, vm_reward) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (ts, reflex_type, combined_confidence, body_confidence, mind_confidence,
-                     spirit_confidence, 1 if fired else 0, 1 if succeeded else 0,
-                     duration_ms, error or None, stimulus_topic, stimulus_intensity, vm_reward),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+        self._route_write(
+            "INSERT INTO reflex_log "
+            "(ts, reflex_type, combined_confidence, body_confidence, mind_confidence, "
+            "spirit_confidence, fired, succeeded, duration_ms, error, "
+            "stimulus_topic, stimulus_intensity, vm_reward) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts, reflex_type, combined_confidence, body_confidence, mind_confidence,
+             spirit_confidence, 1 if fired else 0, 1 if succeeded else 0,
+             duration_ms, error or None, stimulus_topic, stimulus_intensity, vm_reward),
+            table="reflex_log",
+        )
 
     def get_reflex_history(self, hours: int = 24, reflex_type: str = None, limit: int = 200) -> list[dict]:
         """
@@ -680,29 +703,24 @@ class ObservatoryDB:
             spirit_velocity = unified_spirit.get("velocity", 1.0)
             spirit_stale = 1 if unified_spirit.get("is_stale", False) else 0
 
-        with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    "INSERT INTO v4_snapshots "
-                    "(ts, sphere_clocks, resonance, unified_spirit, consciousness, "
-                    "impulse_engine, filter_down, middle_path_loss, "
-                    "great_pulse_count, big_pulse_count, spirit_velocity, spirit_stale) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (ts,
-                     json.dumps(sphere_clocks) if sphere_clocks else None,
-                     json.dumps(resonance) if resonance else None,
-                     json.dumps(unified_spirit) if unified_spirit else None,
-                     json.dumps(consciousness) if consciousness else None,
-                     json.dumps(impulse_engine) if impulse_engine else None,
-                     json.dumps(filter_down) if filter_down else None,
-                     middle_path_loss,
-                     great_pulse_count, big_pulse_count,
-                     spirit_velocity, spirit_stale),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+        self._route_write(
+            "INSERT INTO v4_snapshots "
+            "(ts, sphere_clocks, resonance, unified_spirit, consciousness, "
+            "impulse_engine, filter_down, middle_path_loss, "
+            "great_pulse_count, big_pulse_count, spirit_velocity, spirit_stale) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts,
+             json.dumps(sphere_clocks) if sphere_clocks else None,
+             json.dumps(resonance) if resonance else None,
+             json.dumps(unified_spirit) if unified_spirit else None,
+             json.dumps(consciousness) if consciousness else None,
+             json.dumps(impulse_engine) if impulse_engine else None,
+             json.dumps(filter_down) if filter_down else None,
+             middle_path_loss,
+             great_pulse_count, big_pulse_count,
+             spirit_velocity, spirit_stale),
+            table="v4_snapshots",
+        )
 
     def get_v4_history(self, hours: int = 24, scalars_only: bool = False) -> list[dict]:
         """
@@ -752,14 +770,46 @@ class ObservatoryDB:
     # ------------------------------------------------------------------
 
     def prune_old_data(self, max_days: int = 90):
-        """Remove data older than max_days to keep the DB lean."""
+        """Remove data older than max_days to keep the DB lean.
+
+        Two failure modes this guards against (2026-04-21 fix):
+        1. **VACUUM-blocks-writer**: The original implementation ran a
+           DB-wide VACUUM at the end of prune. On a 1.88 GB observatory.db,
+           VACUUM holds an exclusive lock for minutes — fatal for the new
+           observatory_writer service. We skip VACUUM when the writer is
+           enabled (writer service can do maintenance separately).
+        2. **DELETE-races-writer**: With writer active, direct DELETEs
+           contend for the lock. We route DELETEs through the writer so
+           it serializes them with INSERTs.
+
+        Pre-existing observation: spirit_worker calls this method after
+        EVERY dream cycle (~22 min on T1/T2/T3) — far more frequent than
+        necessary. A separate follow-up should cap to once per day.
+        """
         cutoff = int(time.time()) - (max_days * 86400)
+        tables = ["vital_snapshots", "event_log", "guardian_log",
+                  "trinity_snapshots", "growth_snapshots", "v4_snapshots",
+                  "reflex_log"]
+        if self._writer is not None:
+            # Route DELETEs through writer so they serialize with INSERTs.
+            # Skip VACUUM — writer-side maintenance handles it (and a 1.88GB
+            # VACUUM under load is exactly what triggered the T3 degradation
+            # incident on 2026-04-21).
+            for table in tables:
+                self._route_write(
+                    f"DELETE FROM {table} WHERE ts < ?",
+                    (cutoff,),
+                    table=table,
+                )
+            logger.info(
+                "[ObservatoryDB] Pruned data older than %d days (via writer; VACUUM skipped).",
+                max_days)
+            return
+        # Direct path (writer disabled) — original behavior including VACUUM
         with self._lock:
             conn = self._connect()
             try:
-                for table in ["vital_snapshots", "event_log", "guardian_log",
-                              "trinity_snapshots", "growth_snapshots", "v4_snapshots",
-                              "reflex_log"]:
+                for table in tables:
                     conn.execute(f"DELETE FROM {table} WHERE ts < ?", (cutoff,))
                 conn.commit()
                 conn.execute("VACUUM")

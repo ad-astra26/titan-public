@@ -16,20 +16,85 @@ benefit.
 Concurrency notes:
   - SQLite has process-wide write lock; concurrent writers serialize
     via the SQLITE_BUSY/timeout mechanism.
-  - These helpers honor the `timeout=` kwarg passed to `connect()`
-    (default 10s).
+  - These helpers honor the `timeout=` kwarg passed to `connect()`.
   - WAL mode is recommended for read-heavy DBs to allow concurrent
     readers (callers should `PRAGMA journal_mode=WAL` once at init).
+
+2026-04-21 — BUG-SQLITE-WRITER-CONTENTION Option A:
+  Default timeout for `query()` lowered from 10.0s → 2.0s. Rationale: readers
+  under concurrent load (≥5 concurrent chat requests on the public Observatory)
+  were hitting sqlite3's 10-second BUSY wait when a writer held the lock,
+  driving p99 latency to ~15s (httpx client timeout). Fast-fail to 2.0s lets
+  readers degrade to partial results instead of blocking the event loop.
+  `execute()` + `with_connection()` keep default 10.0s since writes need
+  more time and callers that KNOW they're reading can pass `timeout=2.0`.
+  Module-level `_contention_counter` tracks OperationalError events for the
+  new `/v4/db-contention` diagnostic endpoint.
 """
 from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
+from threading import Lock
 from typing import Any, Iterable
 
 
+# ─────────────────────────────────────────────────────────────────
+# Contention telemetry (2026-04-21 BUG-SQLITE Option A diagnostic)
+# ─────────────────────────────────────────────────────────────────
+#
+# Records sqlite3.OperationalError ("database is locked") events across all
+# helper call sites. Readable via a dashboard endpoint for live p99 triage.
+# Lock keeps increment-and-read atomic across asyncio.to_thread() callers.
+
+_contention_lock = Lock()
+_contention_counter: dict[str, Any] = {
+    "timeouts_total": 0,
+    "timeouts_by_op": {"query": 0, "execute": 0,
+                       "executemany": 0, "with_connection": 0},
+    "last_timeout_ts": 0.0,
+    "last_timeout_db": "",
+    "last_timeout_op": "",
+    "last_timeout_msg": "",
+}
+
+
+def _record_contention(op: str, db_path: str, err: Exception) -> None:
+    """Record a sqlite busy/timeout event for diagnostic reporting."""
+    msg = str(err)
+    if "locked" not in msg.lower() and "busy" not in msg.lower():
+        # Only count lock/busy errors — real SQL errors are a different class.
+        return
+    with _contention_lock:
+        _contention_counter["timeouts_total"] += 1
+        by_op = _contention_counter["timeouts_by_op"]
+        by_op[op] = by_op.get(op, 0) + 1
+        _contention_counter["last_timeout_ts"] = time.time()
+        _contention_counter["last_timeout_db"] = db_path
+        _contention_counter["last_timeout_op"] = op
+        _contention_counter["last_timeout_msg"] = msg[:200]
+
+
+def get_contention_stats() -> dict:
+    """Snapshot for `/v4/db-contention` endpoint. Thread-safe shallow copy."""
+    with _contention_lock:
+        return {
+            "timeouts_total": _contention_counter["timeouts_total"],
+            "timeouts_by_op": dict(
+                _contention_counter["timeouts_by_op"]),
+            "last_timeout_ts": _contention_counter["last_timeout_ts"],
+            "last_timeout_db": _contention_counter["last_timeout_db"],
+            "last_timeout_op": _contention_counter["last_timeout_op"],
+            "last_timeout_msg": _contention_counter["last_timeout_msg"],
+            "last_timeout_age_s": (
+                round(time.time() - _contention_counter["last_timeout_ts"], 1)
+                if _contention_counter["last_timeout_ts"] else None),
+        }
+
+
 async def query(db_path: str, sql: str, params: Iterable[Any] = (),
-                timeout: float = 10.0, fetch: str = "all",
+                timeout: float = 2.0, fetch: str = "all",
                 row_factory: Any = None) -> list | tuple | None:
     """Execute a read query off the asyncio event loop.
 
@@ -47,15 +112,19 @@ async def query(db_path: str, sql: str, params: Iterable[Any] = (),
         Per `fetch` mode.
     """
     def _do():
-        with sqlite3.connect(db_path, timeout=timeout) as conn:
-            if row_factory is not None:
-                conn.row_factory = row_factory
-            cur = conn.execute(sql, tuple(params))
-            if fetch == "all":
-                return cur.fetchall()
-            if fetch == "one":
-                return cur.fetchone()
-            return None
+        try:
+            with sqlite3.connect(db_path, timeout=timeout) as conn:
+                if row_factory is not None:
+                    conn.row_factory = row_factory
+                cur = conn.execute(sql, tuple(params))
+                if fetch == "all":
+                    return cur.fetchall()
+                if fetch == "one":
+                    return cur.fetchone()
+                return None
+        except sqlite3.OperationalError as _err:
+            _record_contention("query", db_path, _err)
+            raise
     return await asyncio.to_thread(_do)
 
 
@@ -67,9 +136,13 @@ async def execute(db_path: str, sql: str, params: Iterable[Any] = (),
     Commits the implicit transaction via `with` block.
     """
     def _do():
-        with sqlite3.connect(db_path, timeout=timeout) as conn:
-            cur = conn.execute(sql, tuple(params))
-            return cur.rowcount
+        try:
+            with sqlite3.connect(db_path, timeout=timeout) as conn:
+                cur = conn.execute(sql, tuple(params))
+                return cur.rowcount
+        except sqlite3.OperationalError as _err:
+            _record_contention("execute", db_path, _err)
+            raise
     return await asyncio.to_thread(_do)
 
 
@@ -80,9 +153,13 @@ async def executemany(db_path: str, sql: str, seq_of_params: Iterable[Iterable[A
     Single transaction across all rows for atomicity + speed.
     """
     def _do():
-        with sqlite3.connect(db_path, timeout=timeout) as conn:
-            cur = conn.executemany(sql, [tuple(p) for p in seq_of_params])
-            return cur.rowcount
+        try:
+            with sqlite3.connect(db_path, timeout=timeout) as conn:
+                cur = conn.executemany(sql, [tuple(p) for p in seq_of_params])
+                return cur.rowcount
+        except sqlite3.OperationalError as _err:
+            _record_contention("executemany", db_path, _err)
+            raise
     return await asyncio.to_thread(_do)
 
 
@@ -103,8 +180,12 @@ async def with_connection(db_path: str, fn, timeout: float = 10.0,
             return await with_connection(db_path, _fn, row_factory=sqlite3.Row)
     """
     def _do():
-        with sqlite3.connect(db_path, timeout=timeout) as conn:
-            if row_factory is not None:
-                conn.row_factory = row_factory
-            return fn(conn)
+        try:
+            with sqlite3.connect(db_path, timeout=timeout) as conn:
+                if row_factory is not None:
+                    conn.row_factory = row_factory
+                return fn(conn)
+        except sqlite3.OperationalError as _err:
+            _record_contention("with_connection", db_path, _err)
+            raise
     return await asyncio.to_thread(_do)

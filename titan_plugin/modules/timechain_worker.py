@@ -421,14 +421,16 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         # awaiting HTTP/CLI senders to be wired in TimeChain v2 Phase 4.
         # Tracked as I-003 (intentionally not flagged as deaf-ear).
         elif msg_type in ("TIMECHAIN_RECALL", "TIMECHAIN_CHECK",
-                          "TIMECHAIN_COMPARE", "TIMECHAIN_AGGREGATE"):
+                          "TIMECHAIN_COMPARE", "TIMECHAIN_AGGREGATE",
+                          "TIMECHAIN_SIMILAR"):
             if not orchestrator:
                 _send_msg(msg_type + "_RESP", src,
                           {"error": "v2 not enabled"})
                 continue
             try:
                 from titan_plugin.logic.timechain_v2 import (
-                    RecallQuery, CheckQuery, CompareQuery, AggregateQuery)
+                    RecallQuery, CheckQuery, CompareQuery, AggregateQuery,
+                    SimilarQuery)
                 if msg_type == "TIMECHAIN_RECALL":
                     result = orchestrator.recall(RecallQuery(**payload))
                     _send_msg("TIMECHAIN_RECALL_RESP", src,
@@ -441,11 +443,18 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                     result = orchestrator.compare(CompareQuery(**payload))
                     _send_msg("TIMECHAIN_COMPARE_RESP", src,
                               {"result": result})
-                # API_STUB: TIMECHAIN_AGGREGATE awaits sender — see I-003
                 elif msg_type == "TIMECHAIN_AGGREGATE":
                     result = orchestrator.aggregate(AggregateQuery(**payload))
                     _send_msg("TIMECHAIN_AGGREGATE_RESP", src,
                               {"result": result})
+                # F-phase (rFP §9.2): TIMECHAIN_SIMILAR — semantic embedding
+                # search. Session 1 returns empty list until meta-reasoning
+                # starts sealing blocks with `context_embedding` payload
+                # field in Session 2.
+                elif msg_type == "TIMECHAIN_SIMILAR":
+                    result = orchestrator.similar(SimilarQuery(**payload))
+                    _send_msg("TIMECHAIN_SIMILAR_RESP", src,
+                              {"results": result})
             except Exception as e:
                 logger.warning("[TimeChain] Consumer API error (%s): %s",
                                msg_type, e)

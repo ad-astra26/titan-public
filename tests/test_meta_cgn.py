@@ -97,7 +97,12 @@ def test_encode_state_clips_out_of_range():
 # ── Grounding updates ────────────────────────────────────────────────
 
 def test_update_primitive_V_ema_moves_toward_target():
-    """Repeated quality=1.0 updates must raise V toward 1.0."""
+    """Repeated quality=1.0 updates must raise V toward 1.0.
+
+    2026-04-21 B-phase: under per-update EMA (γ<1.0, see COMPOSITION_DEFAULTS),
+    n_samples reflects geometric-series effective-sample-size not raw count.
+    At γ=0.9999 with 30 updates, n_samples ≈ 29.996 → int = 29 or 30 depending
+    on float rounding. Use range assertion to accept either."""
     from titan_plugin.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
@@ -107,7 +112,9 @@ def test_update_primitive_V_ema_moves_toward_target():
             c.update_primitive_V("FORMULATE", quality=1.0, chain_id=1)
         assert p.V > initial_V
         assert p.V > 0.8          # approaching 1.0
-        assert p.n_samples == 30
+        # EMA at γ close to 1 yields n_samples very close to raw count.
+        # Allow ±2 to survive any γ in (0.99, 1.0] without re-updating.
+        assert 28 <= p.n_samples <= 30
         assert p.confidence > 0.0
 
 
@@ -206,7 +213,10 @@ def test_compose_logs_disagreement_only_when_confident():
         )
         assert c._total_disagreements == 0
         # Ground FORMULATE until confidence > 0.3
-        for _ in range(200):
+        # B.2 (2026-04-21): iterations increased 200 → 500 so assertion holds
+        # under BOTH old hard-cap `min(1.0, n/500)` (gives 1.0 at n=500) AND
+        # new asymptotic `n/(n+500)` (gives 0.5 at n=500). Both >= 0.3.
+        for _ in range(500):
             c.update_primitive_V("FORMULATE", quality=0.1)
         assert c._primitives["FORMULATE"].confidence > 0.3
         # Now disagreement SHOULD log (direct_Q=0.9, composed_V near 0.1)
@@ -1063,11 +1073,17 @@ def test_ucb_composition_flips_at_n_anchor():
         assert ucb_high_n <= 0, ucb_high_n
 
 
-def test_chain_decay_reduces_n_but_preserves_V():
-    """D2: Decay shrinks (α, β) proportionally → n drops, V unchanged,
-    confidence re-opens. Skips primitives under skip_n_min floor."""
+def test_chain_decay_reduces_n_but_preserves_V(monkeypatch):
+    """D2: Batch decay shrinks (α, β) proportionally → n drops, V unchanged,
+    confidence re-opens. Skips primitives under skip_n_min floor.
+
+    2026-04-21 B-phase update: batch decay is now GATED to only fire when
+    `ema_decay_gamma == 1.0` (per-update EMA takes over otherwise). This
+    test forces γ=1.0 to exercise the legacy batch path that remains the
+    active decay mechanism whenever EMA is disabled."""
     from titan_plugin.logic.meta_cgn import (
         MetaCGNConsumer, COMPOSITION_DEFAULTS)
+    monkeypatch.setitem(COMPOSITION_DEFAULTS, "ema_decay_gamma", 1.0)
     cadence = COMPOSITION_DEFAULTS["decay_cadence_chains"]
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
@@ -1086,10 +1102,13 @@ def test_chain_decay_reduces_n_but_preserves_V():
         assert abs(V_after - V_before) < 0.02, (V_before, V_after)
 
 
-def test_chain_decay_skips_low_n_primitives():
-    """D2 skip_n_min: under-sampled primitives must be spared decay."""
+def test_chain_decay_skips_low_n_primitives(monkeypatch):
+    """D2 skip_n_min: under-sampled primitives must be spared decay.
+
+    2026-04-21 B-phase: forces γ=1.0 to exercise the batch-decay path."""
     from titan_plugin.logic.meta_cgn import (
         MetaCGNConsumer, COMPOSITION_DEFAULTS)
+    monkeypatch.setitem(COMPOSITION_DEFAULTS, "ema_decay_gamma", 1.0)
     cadence = COMPOSITION_DEFAULTS["decay_cadence_chains"]
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
@@ -1101,6 +1120,87 @@ def test_chain_decay_skips_low_n_primitives():
         for _ in range(cadence):
             c.record_chain_outcome(1.0)
         assert c._primitives["RECALL"].n_samples == n_before
+
+
+# ══════════════════════════════════════════════════════════════════════
+# B-phase γ activation (2026-04-21 afternoon) — per-update EMA decay
+# replaces batch decay once ema_decay_gamma < 1.0.
+# ══════════════════════════════════════════════════════════════════════
+
+def test_batch_decay_gated_off_when_ema_active(monkeypatch):
+    """B-phase gate: `_maybe_apply_decay` must early-return when
+    `ema_decay_gamma < 1.0`. Prevents compound decay from batch × EMA."""
+    from titan_plugin.logic.meta_cgn import (
+        MetaCGNConsumer, COMPOSITION_DEFAULTS, BETA_PARAM_FLOOR)
+    # Activate EMA — any value < 1.0
+    monkeypatch.setitem(COMPOSITION_DEFAULTS, "ema_decay_gamma", 0.9999)
+    cadence = COMPOSITION_DEFAULTS["decay_cadence_chains"]
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        # Ground heavy, above skip_n_min
+        for _ in range(300):
+            c.update_primitive_V("FORMULATE", quality=0.7)
+        # Snapshot α,β after the last per-update EMA tick (accumulated
+        # already via update_primitive_V)
+        p = c._primitives["FORMULATE"]
+        alpha_before_batch_tick = p.alpha
+        beta_before_batch_tick = p.beta
+        # Now fire the batch trigger (cadence chain outcomes)
+        # record_chain_outcome only updates _chains_since_decay and calls
+        # _maybe_apply_decay; no per-update EMA ticks happen here.
+        for _ in range(cadence):
+            c.record_chain_outcome(1.0)
+        # EMA is active → batch decay must have been gated off. α,β
+        # unchanged from the cadence's record_chain_outcome calls alone.
+        assert p.alpha == alpha_before_batch_tick, \
+            f"α changed during batch-gated cadence: "\
+            f"{alpha_before_batch_tick} → {p.alpha}"
+        assert p.beta == beta_before_batch_tick
+        # Gate should also reset the cadence counter
+        assert c._chains_since_decay == 0
+
+
+def test_ema_decay_shrinks_posterior_when_active(monkeypatch):
+    """B-phase: per-update EMA with γ<1.0 multiplies (α-FLOOR, β-FLOOR)
+    by γ each observation. Demonstrates that the Beta posterior forgets
+    stale evidence at a rate determined by γ — the whole point of B-phase.
+
+    Test setup: at γ=0.9 (extreme value for visibility), 50 identical
+    observations should yield α+β ≈ weight × 1/(1-γ) ≈ 10 (not the 50
+    raw accumulation we'd see at γ=1.0)."""
+    from titan_plugin.logic.meta_cgn import (
+        MetaCGNConsumer, COMPOSITION_DEFAULTS, BETA_PARAM_FLOOR)
+    monkeypatch.setitem(COMPOSITION_DEFAULTS, "ema_decay_gamma", 0.9)
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        # At γ=0.9, steady-state (α-FLOOR) + (β-FLOOR) ≈ 1 × 1/0.1 = 10
+        # (weight=1 per update, geometric series)
+        for _ in range(100):
+            c.update_primitive_V("FORMULATE", quality=0.5)
+        p = c._primitives["FORMULATE"]
+        excess = (p.alpha - BETA_PARAM_FLOOR) + (p.beta - BETA_PARAM_FLOOR)
+        # Steady-state is 1/(1-0.9) = 10. Allow ±20% tolerance (series
+        # converges but isn't exact after finite samples).
+        assert 8 <= excess <= 12, \
+            f"EMA steady-state α+β-2*FLOOR expected ~10; got {excess:.2f}"
+
+
+def test_ema_gamma_one_is_mathematical_identity(monkeypatch):
+    """Regression: γ=1.0 must be the exact no-op identity case. At γ=1.0,
+    α+β grows linearly with the number of observations (no decay). This
+    was the SHIPPED NEUTRAL behavior from B.1 (commit c17ee12)."""
+    from titan_plugin.logic.meta_cgn import (
+        MetaCGNConsumer, COMPOSITION_DEFAULTS, BETA_PARAM_FLOOR)
+    monkeypatch.setitem(COMPOSITION_DEFAULTS, "ema_decay_gamma", 1.0)
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        for _ in range(100):
+            c.update_primitive_V("FORMULATE", quality=0.5)
+        p = c._primitives["FORMULATE"]
+        excess = (p.alpha - BETA_PARAM_FLOOR) + (p.beta - BETA_PARAM_FLOOR)
+        # At γ=1.0, 100 updates with weight=1 → excess should be ~100
+        assert 99 <= excess <= 101, \
+            f"γ=1.0 should be linear: 100 updates → ~100; got {excess:.2f}"
 
 
 def test_per_domain_V_diverges_from_pooled_when_domain_grounded():
@@ -1291,7 +1391,8 @@ def test_advisor_conflict_emits_bus_event():
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=q, save_dir=tmp)
         # Ground FORMULATE well so V_confidence > 0.3
-        for _ in range(200):
+        # B.2 (2026-04-21): 200 → 500 for new asymptotic confidence function
+        for _ in range(500):
             c.update_primitive_V("FORMULATE", quality=0.9)
         # Drain any queue events from registration
         while not q.empty():
@@ -1324,7 +1425,8 @@ def test_advisor_conflict_throttle_suppresses_duplicate_signature():
     q = Queue()
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=q, save_dir=tmp)
-        for _ in range(200):
+        # B.2 (2026-04-21): 200 → 500 for new asymptotic confidence function
+        for _ in range(500):
             c.update_primitive_V("FORMULATE", quality=0.9)
         while not q.empty():
             q.get_nowait()
@@ -1351,7 +1453,8 @@ def test_advisor_conflict_throttle_clears_after_cooldown():
     q = Queue()
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=q, save_dir=tmp)
-        for _ in range(200):
+        # B.2 (2026-04-21): 200 → 500 for new asymptotic confidence function
+        for _ in range(500):
             c.update_primitive_V("FORMULATE", quality=0.9)
         ctx = {"domain": "reasoning", "chain_id": 1}
         c.compose_template_score(
@@ -1768,6 +1871,291 @@ def test_p10_per_consumer_counter_tracked():
         c.handle_cross_consumer_signal("language", "vocab_expanded", 1.0)
         c.handle_cross_consumer_signal("knowledge", "concept_grounded", 1.0)
         assert c._signals_by_consumer == {"language": 2, "knowledge": 1}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SOAR Phase 3 — primitive_repeat_impasse dynamic mapping (2026-04-21)
+# Consolidated tracker §2.3; replaces Phase 2 static {"FORMULATE": 0.5}
+# observability-only mapping with payload-driven learning nudge.
+# ══════════════════════════════════════════════════════════════════════
+
+def test_soar_phase3_dynamic_mapping_nudges_repeated_primitive():
+    """Phase 3: when narrative_context.repeated_primitive is present, the
+    signal nudges THAT primitive (not the static FORMULATE fallback)."""
+    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        # Baseline α+β for RECALL and FORMULATE before signal
+        a0_recall = c._primitives["RECALL"].alpha
+        b0_recall = c._primitives["RECALL"].beta
+        a0_formulate = c._primitives["FORMULATE"].alpha
+        b0_formulate = c._primitives["FORMULATE"].beta
+        # Signal says "RECALL is the one that got stuck"
+        ok = c.handle_cross_consumer_signal(
+            consumer="meta", event_type="primitive_repeat_impasse",
+            intensity=1.0,
+            narrative_context={"repeated_primitive": "RECALL",
+                               "repeat_count": 5, "chain_id": 42})
+        assert ok is True
+        # RECALL's posterior moved (either α or β changed)
+        recall_delta = (c._primitives["RECALL"].alpha - a0_recall
+                        + c._primitives["RECALL"].beta - b0_recall)
+        assert recall_delta > 0, \
+            f"RECALL should have been nudged; delta={recall_delta}"
+        # FORMULATE's posterior did NOT move (Phase 2 static mapping
+        # was overridden by Phase 3 dynamic mapping)
+        formulate_delta = (c._primitives["FORMULATE"].alpha - a0_formulate
+                           + c._primitives["FORMULATE"].beta - b0_formulate)
+        assert abs(formulate_delta) < 1e-6, \
+            f"FORMULATE should NOT be nudged; delta={formulate_delta}"
+
+
+def test_soar_phase3_quality_below_neutral_penalizes_repetition():
+    """Phase 3: dynamic mapping uses quality=0.35 (below 0.5 neutral),
+    shifting the Beta posterior toward penalty (β grows more than α)."""
+    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        a0 = c._primitives["HYPOTHESIZE"].alpha
+        b0 = c._primitives["HYPOTHESIZE"].beta
+        # Fire 20 repeat signals to accumulate enough delta to measure
+        for _ in range(20):
+            c.handle_cross_consumer_signal(
+                consumer="meta", event_type="primitive_repeat_impasse",
+                intensity=1.0,
+                narrative_context={"repeated_primitive": "HYPOTHESIZE"})
+        a1 = c._primitives["HYPOTHESIZE"].alpha
+        b1 = c._primitives["HYPOTHESIZE"].beta
+        # Quality 0.35 < 0.5 means β grows MORE than α (penalty bias)
+        da, db = a1 - a0, b1 - b0
+        assert db > da, f"β should grow more than α (penalty); da={da} db={db}"
+
+
+def test_soar_phase3_fallback_to_static_when_no_payload():
+    """Phase 3 preserves backwards compatibility: if narrative_context is
+    missing or repeated_primitive absent, the static {"FORMULATE": 0.5}
+    fallback from Phase 2 applies (neutral observability nudge)."""
+    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        a0 = c._primitives["FORMULATE"].alpha
+        b0 = c._primitives["FORMULATE"].beta
+        # Signal with NO narrative_context — Phase 2 static mapping applies
+        ok = c.handle_cross_consumer_signal(
+            consumer="meta", event_type="primitive_repeat_impasse",
+            intensity=1.0)
+        assert ok is True
+        # FORMULATE posterior moved (static fallback applied)
+        assert c._primitives["FORMULATE"].alpha != a0 or \
+               c._primitives["FORMULATE"].beta != b0
+
+
+def test_soar_phase3_ignores_invalid_repeated_primitive():
+    """Phase 3: if payload has an unrecognized primitive name, fall back
+    to static mapping rather than silently succeeding with no effect."""
+    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        a0_formulate = c._primitives["FORMULATE"].alpha
+        # Garbage primitive name → falls back to static mapping → FORMULATE nudged
+        ok = c.handle_cross_consumer_signal(
+            consumer="meta", event_type="primitive_repeat_impasse",
+            intensity=1.0,
+            narrative_context={"repeated_primitive": "GARBAGE_PRIM"})
+        assert ok is True
+        assert c._primitives["FORMULATE"].alpha != a0_formulate
+
+
+# ══════════════════════════════════════════════════════════════════════
+# META-CGN drift mechanism (§2.6, 2026-04-21)
+# Magnitude-capped nudge drift from analyzer hints.
+# ══════════════════════════════════════════════════════════════════════
+
+def test_drift_apply_increases_nudge_within_cap():
+    """Positive-direction hint with sample count ≥ DRIFT_MIN_SAMPLES
+    increases the quality_nudge for that (consumer, event, primitive) tuple,
+    capped at DRIFT_MAX_PER_APPLY per call."""
+    from titan_plugin.logic.meta_cgn import (
+        MetaCGNConsumer, SIGNAL_TO_PRIMITIVE, DRIFT_MAX_PER_APPLY)
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        # Pick a real tuple that exists in SIGNAL_TO_PRIMITIVE
+        tup = ("meta_reasoning", "eureka")
+        assert tup in SIGNAL_TO_PRIMITIVE, \
+            "test assumes this tuple exists in static mapping"
+        baseline = SIGNAL_TO_PRIMITIVE[tup]["SYNTHESIZE"]
+        hints = [{
+            "consumer": "meta_reasoning", "event": "eureka",
+            "prim": "SYNTHESIZE", "N": 500, "dir": "increase",
+            "hint": 0.15,  # > cap of 0.05 → gets capped
+        }]
+        result = c.apply_drift_hints(hints)
+        assert result["applied"] == 1
+        assert result["skipped_low_n"] == 0
+        override = c._drift_overrides[tup]["SYNTHESIZE"]
+        # Capped at DRIFT_MAX_PER_APPLY above baseline
+        assert abs(override - (baseline + DRIFT_MAX_PER_APPLY)) < 1e-4
+
+
+def test_drift_apply_decreases_nudge():
+    """Direction=decrease reduces the quality_nudge."""
+    from titan_plugin.logic.meta_cgn import MetaCGNConsumer, SIGNAL_TO_PRIMITIVE
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        tup = ("meta_reasoning", "eureka")
+        baseline = SIGNAL_TO_PRIMITIVE[tup]["SYNTHESIZE"]
+        hints = [{
+            "consumer": "meta_reasoning", "event": "eureka",
+            "prim": "SYNTHESIZE", "N": 150, "dir": "decrease",
+            "hint": 0.02,  # within cap
+        }]
+        c.apply_drift_hints(hints)
+        override = c._drift_overrides[tup]["SYNTHESIZE"]
+        assert override < baseline
+        assert abs(override - (baseline - 0.02)) < 1e-4
+
+
+def test_drift_apply_skips_low_sample_hints():
+    """Hints with N < DRIFT_MIN_SAMPLES are skipped (noise filter)."""
+    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        hints = [{
+            "consumer": "meta_reasoning", "event": "eureka",
+            "prim": "SYNTHESIZE", "N": 50, "dir": "increase", "hint": 0.03,
+        }]
+        result = c.apply_drift_hints(hints)
+        assert result["applied"] == 0
+        assert result["skipped_low_n"] == 1
+        assert len(c._drift_overrides) == 0
+
+
+def test_drift_apply_rejects_unknown_tuples_and_primitives():
+    """Hints referencing tuples/primitives absent from SIGNAL_TO_PRIMITIVE
+    are rejected cleanly (no crash, skipped counter increments)."""
+    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        hints = [
+            # Unknown tuple
+            {"consumer": "unknown", "event": "nonsense", "prim": "FORMULATE",
+             "N": 200, "dir": "increase", "hint": 0.01},
+            # Known tuple, unknown primitive for that tuple
+            {"consumer": "meta_reasoning", "event": "eureka",
+             "prim": "NOT_A_PRIM", "N": 200, "dir": "increase", "hint": 0.01},
+            # Invalid direction
+            {"consumer": "meta_reasoning", "event": "eureka",
+             "prim": "SYNTHESIZE", "N": 200, "dir": "sideways", "hint": 0.01},
+        ]
+        result = c.apply_drift_hints(hints)
+        assert result["applied"] == 0
+        assert result["skipped_unknown"] == 3
+        assert len(c._drift_overrides) == 0
+
+
+def test_drift_overrides_consulted_in_signal_handling():
+    """After apply_drift_hints, subsequent handle_cross_consumer_signal
+    uses the drifted quality_nudge instead of the static one."""
+    from titan_plugin.logic.meta_cgn import (
+        MetaCGNConsumer, SIGNAL_TO_PRIMITIVE, P10_SIGNAL_WEIGHT)
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        # Apply drift: push SYNTHESIZE nudge DOWN by max cap
+        hints = [{"consumer": "meta_reasoning", "event": "eureka",
+                  "prim": "SYNTHESIZE", "N": 200, "dir": "decrease",
+                  "hint": 0.05}]
+        c.apply_drift_hints(hints)
+        drifted_val = c._drift_overrides[("meta_reasoning", "eureka")][
+            "SYNTHESIZE"]
+        original_val = SIGNAL_TO_PRIMITIVE[
+            ("meta_reasoning", "eureka")]["SYNTHESIZE"]
+        assert drifted_val < original_val
+        # Baseline state
+        a0 = c._primitives["SYNTHESIZE"].alpha
+        b0 = c._primitives["SYNTHESIZE"].beta
+        # Fire signal — drifted quality should show in β/α ratio
+        c.handle_cross_consumer_signal(
+            consumer="meta_reasoning", event_type="eureka", intensity=1.0)
+        da = c._primitives["SYNTHESIZE"].alpha - a0
+        db = c._primitives["SYNTHESIZE"].beta - b0
+        # drifted = original - 0.05; so da+db should = P10_SIGNAL_WEIGHT
+        total = da + db
+        expected_total = P10_SIGNAL_WEIGHT
+        assert abs(total - expected_total) < 1e-4
+        # α portion should equal drifted_val × expected_total
+        expected_da = drifted_val * expected_total
+        assert abs(da - expected_da) < 1e-4
+
+
+def test_drift_overrides_persist_across_restart():
+    """drift_overrides + applies_total + last_applied_ts survive
+    save_state → fresh-consumer → _load_state cycle."""
+    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    with tempfile.TemporaryDirectory() as tmp:
+        c1 = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        c1.apply_drift_hints([{
+            "consumer": "language", "event": "concept_grounded",
+            "prim": "FORMULATE", "N": 500, "dir": "increase",
+            "hint": 0.03}])
+        applies_before = c1._drift_applies_total
+        override_before = c1._drift_overrides[
+            ("language", "concept_grounded")]["FORMULATE"]
+        c1.save_state()
+        # Fresh consumer — loads from disk
+        c2 = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        assert c2._drift_applies_total == applies_before
+        assert ("language", "concept_grounded") in c2._drift_overrides
+        override_after = c2._drift_overrides[
+            ("language", "concept_grounded")]["FORMULATE"]
+        assert abs(override_after - override_before) < 1e-4
+
+
+def test_drift_overrides_bounded_at_dmin_dmax():
+    """Overrides clamp to [DRIFT_BOUND_MIN, DRIFT_BOUND_MAX] even under
+    many successive applies pushing same direction."""
+    from titan_plugin.logic.meta_cgn import (
+        MetaCGNConsumer, DRIFT_BOUND_MIN, DRIFT_BOUND_MAX)
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        # Push decrease 50 times at max cap = 2.5 total shift
+        # Starting from wherever static is, should clamp at DRIFT_BOUND_MIN
+        for _ in range(50):
+            c.apply_drift_hints([{
+                "consumer": "meta_reasoning", "event": "eureka",
+                "prim": "SYNTHESIZE", "N": 200, "dir": "decrease",
+                "hint": 0.05}])
+        override = c._drift_overrides[("meta_reasoning", "eureka")][
+            "SYNTHESIZE"]
+        assert override >= DRIFT_BOUND_MIN, \
+            f"override {override} below floor {DRIFT_BOUND_MIN}"
+        # Now push increase 50 times
+        for _ in range(50):
+            c.apply_drift_hints([{
+                "consumer": "meta_reasoning", "event": "eureka",
+                "prim": "SYNTHESIZE", "N": 200, "dir": "increase",
+                "hint": 0.05}])
+        override = c._drift_overrides[("meta_reasoning", "eureka")][
+            "SYNTHESIZE"]
+        assert override <= DRIFT_BOUND_MAX, \
+            f"override {override} above ceiling {DRIFT_BOUND_MAX}"
+
+
+def test_drift_get_stats_snapshot_shape():
+    """get_drift_stats returns JSON-safe snapshot for /v4/meta-cgn/drift."""
+    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    with tempfile.TemporaryDirectory() as tmp:
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        c.apply_drift_hints([{
+            "consumer": "meta_reasoning", "event": "eureka",
+            "prim": "SYNTHESIZE", "N": 200, "dir": "increase",
+            "hint": 0.02}])
+        snap = c.get_drift_stats()
+        assert snap["overrides_count"] == 1
+        assert snap["applies_total"] == 1
+        assert snap["last_applied_ts"] > 0
+        assert "meta_reasoning|eureka" in snap["overrides"]
+        import json
+        json.dumps(snap)  # roundtrip through json to confirm JSON-safe
 
 
 # ══════════════════════════════════════════════════════════════════════

@@ -234,30 +234,51 @@ class TimeChainBackup:
 
     # ── Arweave Upload ────────────────────────────────────────────────
 
-    async def snapshot_to_arweave(self) -> Optional[str]:
-        """Upload TimeChain snapshot to Arweave via Irys.
+    async def snapshot_to_arweave(self,
+                                    full_config: Optional[dict] = None,
+                                    local_dir: str = "data/backups",
+                                    retention_days: int = 30) -> Optional[str]:
+        """Upload TimeChain snapshot through rFP §5.3 10-step failsafe cascade.
 
-        Returns Arweave TX ID on success, None on failure.
+        Runs: S1 build → S2 validate → S3 local-always → S4 balance → S5 upload
+              → S6 verify → S7 manifest → S10 cleanup.
+
+        Returns Arweave TX ID on success, None on failure (local snapshot
+        still saved even on upload failure — S3 is irreducible).
+
+        Args:
+            full_config: merged config (enables [backup] mode detection + Irys
+                balance check). Optional — falls back to arweave-or-local based
+                on `self._arweave` presence.
+            local_dir: override [backup].local_dir (default data/backups).
+            retention_days: S10 cleanup threshold.
         """
-        if not self._arweave:
-            logger.warning("[TimeChainBackup] No ArweaveStore configured")
-            return None
-
         # 2026-04-14 fix: create_snapshot_tarball() does Zstd-level-19
         # compression of the entire TimeChain — synchronous, blocks the
-        # asyncio event loop for seconds. Found via py-spy: backup loop
-        # froze MainThread mid-tarball, hung ALL FastAPI endpoints. Move
-        # CPU-bound work to thread pool so event loop stays responsive.
+        # asyncio event loop for seconds. Move CPU-bound work to thread pool.
         import asyncio
-        result = await asyncio.to_thread(self.create_snapshot_tarball)
-        if not result:
+        build_result = await asyncio.to_thread(self.create_snapshot_tarball)
+        if not build_result:
             return None
-        tarball, metadata = result
+        tarball, metadata = build_result
         if not tarball:
             return None
 
-        # Upload tarball
-        content_type = "application/zstd" if metadata.get("compression", "").startswith("zstd") else "application/gzip"
+        # Use [backup] config override for local_dir if present
+        cfg_backup = (full_config or {}).get("backup", {}) or {}
+        effective_local_dir = cfg_backup.get("local_dir", local_dir)
+
+        from titan_plugin.logic.backup_cascade import BackupCascade
+        cascade = BackupCascade(
+            full_config=full_config or {},
+            arweave_store=self._arweave,
+            local_dir=effective_local_dir,
+        )
+
+        # Upload closure — receives bytes (not path) since tarball is in-memory
+        content_type = ("application/zstd"
+                        if metadata.get("compression", "").startswith("zstd")
+                        else "application/gzip")
         tags = {
             "Content-Type": content_type,
             "App-Name": "Titan-TimeChain",
@@ -269,21 +290,59 @@ class TimeChainBackup:
             "Tarball-SHA256": metadata["tarball_sha256"],
         }
 
-        tx_id = await self._arweave.upload_file_bytes(
-            tarball, tags, "application/gzip"
-        ) if hasattr(self._arweave, 'upload_file_bytes') else (
-            await self._arweave.upload_json(metadata, tags)
+        async def _upload(tarball_bytes: bytes):
+            """S5 — upload tarball via ArweaveStore; record manifest on success."""
+            if not self._arweave:
+                logger.warning("[TimeChainBackup] No ArweaveStore configured (local_only?)")
+                return None
+            tx_id = await self._arweave.upload_file_bytes(
+                tarball_bytes, tags, "application/gzip"
+            ) if hasattr(self._arweave, 'upload_file_bytes') else (
+                await self._arweave.upload_json(metadata, tags)
+            )
+            if not tx_id:
+                logger.error("[TimeChainBackup] Arweave upload FAILED")
+                return None
+            # S7 manifest update
+            self._record_arweave_anchor(tx_id, metadata)
+            logger.info(
+                "[TimeChainBackup] Arweave upload: tx=%s blocks=%d size=%.1fKB",
+                tx_id[:20], metadata["total_blocks"],
+                metadata["tarball_size_bytes"] / 1024)
+            return {
+                "arweave_tx": tx_id,
+                "size_mb": round(metadata["tarball_size_bytes"] / 1024 / 1024, 2),
+                "blocks": metadata["total_blocks"],
+            }
+
+        # Run cascade — uses in-memory bytes variant
+        ext = "tar.zst" if content_type == "application/zstd" else "tar.gz"
+        from titan_plugin.logic.backup_crypto import build_encryption_context_from_config
+        result = await cascade.run_bytes(
+            tarball_bytes=tarball,
+            archive_hash=metadata["tarball_sha256"],
+            backup_type="timechain",
+            upload_fn=_upload,
+            retention_days=retention_days,
+            ext=ext,
+            encryption=build_encryption_context_from_config(full_config or {}),
         )
 
-        if tx_id:
-            self._record_arweave_anchor(tx_id, metadata)
-            logger.info("[TimeChainBackup] Arweave upload: tx=%s blocks=%d size=%.1fKB",
-                        tx_id[:20], metadata["total_blocks"],
-                        metadata["tarball_size_bytes"] / 1024)
-        else:
-            logger.error("[TimeChainBackup] Arweave upload FAILED")
+        if not result:
+            return None
 
-        return tx_id
+        # Preserve legacy return contract — return tx_id str (not dict)
+        if result.get("cascade_fail"):
+            logger.warning("[TimeChainBackup] Cascade failed at %s",
+                           result.get("cascade_fail"))
+            return None
+        tx_id = result.get("arweave_tx")
+        if tx_id:
+            return tx_id
+        # local_only or low_balance — local snapshot saved, no tx
+        logger.info("[TimeChainBackup] Cascade result: mode=%s local=%s "
+                    "(no Arweave tx)", result.get("mode"), result.get("local_path"))
+        return None
 
     # snapshot_to_arweave_json() retired 2026-04-13 — rFP_backup_worker Phase 0.
     # The JSON+base64 upload path silently returned None on mainnet (likely

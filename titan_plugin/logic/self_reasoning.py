@@ -188,6 +188,17 @@ class SelfReasoningEngine:
             "prediction_horizon_max", 5000)
         self._coherence_gap_threshold = self._config.get(
             "coherence_gap_threshold", 0.15)
+        # Layer A — novelty gap thresholds (rFP_coding_explorer_activation.md §4.1)
+        self._commit_rate_low_threshold = float(
+            self._config.get("commit_rate_low_threshold", 0.15))
+        self._commit_rate_low_min_chains = int(
+            self._config.get("commit_rate_low_min_chains", 500))
+        self._eureka_staleness_epochs = int(
+            self._config.get("eureka_staleness_epochs", 50000))
+        self._vocab_plateau_seconds = float(
+            self._config.get("vocab_plateau_seconds", 43200))
+        self._monoculture_pressure_frac = float(
+            self._config.get("monoculture_pressure_frac", 0.65))
 
         # State
         self._cooldown = 0
@@ -206,6 +217,13 @@ class SelfReasoningEngine:
 
         # Coherence gaps detected
         self._coherence_gaps: List[dict] = []
+
+        # Layer A — novelty gap detector state
+        self._last_seen_eureka_count = 0
+        self._last_eureka_epoch: Optional[int] = None  # None = never anchored
+        self._vocab_plateau_anchor_count = 0
+        self._vocab_plateau_anchor_ts = 0.0
+        self._seen_novelty_gaps: set = set()  # WARN-on-first-fire telemetry
 
         # Initialize DB
         self._init_db()
@@ -786,20 +804,48 @@ class SelfReasoningEngine:
 
     def _coherence_check(self, epoch, neuromods, msl_data,
                          reasoning_stats, language_stats) -> dict:
-        """Compare current state against last self-profile.
+        """Compare current state against last self-profile + detect novelty gaps.
 
         Detects coherence gaps: "My profile says X, but I'm now Y."
-        Gaps become triggers for new reasoning chains.
-        """
-        if self._last_profile is None:
-            return {
-                "type": "coherence_check",
-                "action": "no_profile",
-                "confidence": 0.2,
-                "gaps": [],
-            }
+        Layer A adds absolute-state novelty detectors (rFP_coding_explorer_
+        activation.md §4.1) that run even without a self-profile — these
+        catch saturated-stable states where profile drift is too small to
+        flag but cognition still needs shaking loose.
 
-        gaps = []
+        Gaps become triggers for new reasoning chains + coding exercises.
+        """
+        gaps: List[dict] = []
+        p = self._last_profile
+
+        if p is None:
+            # No profile yet — skip profile-based gap detection, but Layer A
+            # still runs below.
+            pass
+        else:
+            gaps.extend(self._profile_drift_gaps(epoch, neuromods, msl_data,
+                                                  reasoning_stats, language_stats))
+
+        # Layer A — absolute-state novelty gap detectors
+        gaps.extend(self._detect_novelty_gaps(
+            epoch, reasoning_stats, language_stats))
+
+        self._coherence_gaps = gaps
+
+        return {
+            "type": "coherence_check",
+            "action": "checked" if p is not None else "no_profile",
+            "profile_epoch": p.epoch if p is not None else 0,
+            "current_epoch": epoch,
+            "epoch_gap": (epoch - p.epoch) if p is not None else 0,
+            "gaps_found": len(gaps),
+            "gaps": gaps,
+            "confidence": round(min(1.0, 0.5 + len(gaps) * 0.1), 4),
+        }
+
+    def _profile_drift_gaps(self, epoch, neuromods, msl_data,
+                             reasoning_stats, language_stats) -> List[dict]:
+        """Profile-comparison gap detectors (original pre-Layer-A logic)."""
+        gaps: List[dict] = []
         p = self._last_profile
 
         # Check neuromods drift
@@ -876,18 +922,116 @@ class SelfReasoningEngine:
                     f"{p.dominant_primitive} → {prim_now}"),
             })
 
-        self._coherence_gaps = gaps
+        return gaps
 
-        return {
-            "type": "coherence_check",
-            "action": "checked",
-            "profile_epoch": p.epoch,
-            "current_epoch": epoch,
-            "epoch_gap": epoch - p.epoch,
-            "gaps_found": len(gaps),
-            "gaps": gaps,
-            "confidence": round(min(1.0, 0.5 + len(gaps) * 0.1), 4),
-        }
+    def _detect_novelty_gaps(self, epoch: int,
+                              reasoning_stats: dict,
+                              language_stats: dict) -> List[dict]:
+        """Layer A — absolute-state novelty gap detectors.
+
+        Complements _profile_drift_gaps (which compares state to profile).
+        These detectors fire on state conditions that rarely reach the
+        profile-delta threshold but still indicate cognition needs shaking
+        loose. Each feeds GAP_EXPLORATION_MAP to drive coding_explorer +
+        self-exploration triggers.
+
+        Uses constant delta=0.5 so urgency = 0.5 × urgency_scale (capped at
+        1.0) — novelty gaps are boolean triggers rather than continuous
+        magnitudes. rFP_coding_explorer_activation.md §4.1.
+        """
+        gaps: List[dict] = []
+
+        # A.1 — commit_rate_low: reasoning planning-stuck
+        total_chains = int(reasoning_stats.get("total_chains", 0))
+        total_commits = int(reasoning_stats.get("total_commits", 0))
+        if total_chains >= self._commit_rate_low_min_chains:
+            commit_rate = total_commits / max(1, total_chains)
+            if commit_rate < self._commit_rate_low_threshold:
+                gaps.append({
+                    "metric": "commit_rate_low",
+                    "profile_value": self._commit_rate_low_threshold,
+                    "current_value": round(commit_rate, 4),
+                    "delta": 0.5,
+                    "interpretation": (
+                        f"Commit rate {commit_rate:.2%} below "
+                        f"{self._commit_rate_low_threshold:.0%} over "
+                        f"{total_chains} chains — planning stuck"),
+                })
+
+        # A.2 — eureka_staleness: no new EUREKA recently
+        eureka_count = int(reasoning_stats.get("total_eurekas", 0))
+        if eureka_count > self._last_seen_eureka_count:
+            self._last_seen_eureka_count = eureka_count
+            self._last_eureka_epoch = epoch
+        elif self._last_eureka_epoch is None:
+            # First observation — anchor here so elapsed measures from this call
+            self._last_eureka_epoch = epoch
+        if self._last_eureka_epoch is not None:
+            epochs_since_eureka = epoch - self._last_eureka_epoch
+            if epochs_since_eureka >= self._eureka_staleness_epochs:
+                gaps.append({
+                    "metric": "eureka_staleness",
+                    "profile_value": self._eureka_staleness_epochs,
+                    "current_value": epochs_since_eureka,
+                    "delta": 0.5,
+                    "interpretation": (
+                        f"No EUREKA for {epochs_since_eureka} epochs "
+                        f"(threshold {self._eureka_staleness_epochs}) — "
+                        f"coding may open fresh insights"),
+                })
+
+        # A.3 — vocab_plateau: vocab_total unchanged for N seconds
+        vocab_now = int(language_stats.get("vocab_total", 0))
+        now_ts = time.time()
+        if vocab_now > 0:
+            if (vocab_now != self._vocab_plateau_anchor_count
+                    or self._vocab_plateau_anchor_ts == 0.0):
+                self._vocab_plateau_anchor_count = vocab_now
+                self._vocab_plateau_anchor_ts = now_ts
+            else:
+                plateau_seconds = now_ts - self._vocab_plateau_anchor_ts
+                if plateau_seconds >= self._vocab_plateau_seconds:
+                    gaps.append({
+                        "metric": "vocab_plateau",
+                        "profile_value": self._vocab_plateau_seconds,
+                        "current_value": round(plateau_seconds, 1),
+                        "delta": 0.5,
+                        "interpretation": (
+                            f"Vocabulary frozen at {vocab_now} for "
+                            f"{plateau_seconds/3600:.1f}h (threshold "
+                            f"{self._vocab_plateau_seconds/3600:.1f}h)"),
+                    })
+
+        # A.4 — monoculture_pressure: dominant primitive above threshold
+        prim_counts = reasoning_stats.get("primitive_counts", {}) or {}
+        total_prims = sum(prim_counts.values()) if prim_counts else 0
+        if total_prims > 0 and prim_counts:
+            dominant_name = max(prim_counts, key=prim_counts.get)
+            dominant_count = prim_counts[dominant_name]
+            dominant_frac = dominant_count / total_prims
+            if dominant_frac >= self._monoculture_pressure_frac:
+                gaps.append({
+                    "metric": "monoculture_pressure",
+                    "profile_value": self._monoculture_pressure_frac,
+                    "current_value": round(dominant_frac, 4),
+                    "delta": 0.5,
+                    "interpretation": (
+                        f"{dominant_name} occupies {dominant_frac:.1%} of "
+                        f"primitives (threshold "
+                        f"{self._monoculture_pressure_frac:.0%}) — "
+                        f"cognition narrowing"),
+                })
+
+        # WARN-on-first-fire telemetry per gap type — lets us tune thresholds
+        for gap in gaps:
+            metric = gap["metric"]
+            if metric not in self._seen_novelty_gaps:
+                self._seen_novelty_gaps.add(metric)
+                logger.warning(
+                    "[SelfReasoning] Novelty-gap FIRST fire: %s — %s",
+                    metric, gap["interpretation"])
+
+        return gaps
 
     def _vocabulary_probe(self, epoch, language_stats) -> dict:
         """Check vocabulary grounding status.
@@ -1073,9 +1217,9 @@ class SelfReasoningEngine:
     def _persist_insight(self, insight: SelfInsight):
         """Store insight in DB."""
         try:
-            conn = sqlite3.connect(self._db_path, timeout=5.0)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute(
+            from titan_plugin.persistence import get_client
+            client = get_client(caller_name="self_reasoning")
+            client.write(
                 "INSERT INTO self_insights "
                 "(sub_mode, epoch, timestamp, data, confidence, "
                 "neuromod_snapshot, mode_trigger) "
@@ -1084,29 +1228,31 @@ class SelfReasoningEngine:
                  json.dumps(insight.data),
                  insight.confidence,
                  json.dumps(insight.neuromod_snapshot),
-                 insight.mode_trigger))
-            conn.commit()
-            conn.close()
+                 insight.mode_trigger),
+                table="self_insights",
+            )
         except Exception as e:
             logger.debug("[SelfReasoning] Persist insight failed: %s", e)
 
     def _persist_prediction(self, pred: SelfPrediction) -> int:
         """Store prediction in DB. Returns row ID."""
         try:
-            conn = sqlite3.connect(self._db_path, timeout=5.0)
-            conn.execute("PRAGMA journal_mode=WAL")
-            cursor = conn.execute(
+            from titan_plugin.persistence import get_client
+            client = get_client(caller_name="self_reasoning")
+            res = client.write(
                 "INSERT INTO self_predictions "
                 "(created_epoch, created_at, target_metric, predicted_value, "
                 "predicted_direction, check_after_epochs, check_epoch) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (pred.created_epoch, pred.created_at, pred.target_metric,
                  pred.predicted_value, pred.predicted_direction,
-                 pred.check_after_epochs, pred.check_epoch))
-            row_id = cursor.lastrowid
-            conn.commit()
-            conn.close()
-            return row_id
+                 pred.check_after_epochs, pred.check_epoch),
+                table="self_predictions",
+            )
+            if not res.ok:
+                logger.debug("[SelfReasoning] Persist prediction failed: %s", res.error)
+                return 0
+            return res.last_row_id or 0
         except Exception as e:
             logger.debug("[SelfReasoning] Persist prediction failed: %s", e)
             return 0
@@ -1114,17 +1260,17 @@ class SelfReasoningEngine:
     def _persist_prediction_verification(self, pred: SelfPrediction):
         """Update prediction with verification results."""
         try:
-            conn = sqlite3.connect(self._db_path, timeout=5.0)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute(
+            from titan_plugin.persistence import get_client
+            client = get_client(caller_name="self_reasoning")
+            client.write(
                 "UPDATE self_predictions SET verified=1, actual_value=?, "
                 "prediction_error=?, confirmed=?, verified_at=? "
                 "WHERE id=?",
                 (pred.actual_value, pred.prediction_error,
                  1 if pred.confirmed else 0, pred.verified_at,
-                 pred.prediction_id))
-            conn.commit()
-            conn.close()
+                 pred.prediction_id),
+                table="self_predictions",
+            )
         except Exception as e:
             logger.debug("[SelfReasoning] Persist verification failed: %s", e)
 
@@ -1144,14 +1290,15 @@ class SelfReasoningEngine:
             if age > 86400 * 7:  # 7 days
                 pruned += 1
                 try:
-                    conn = sqlite3.connect(self._db_path, timeout=5.0)
-                    conn.execute(
+                    from titan_plugin.persistence import get_client
+                    client = get_client(caller_name="self_reasoning")
+                    client.write(
                         "UPDATE self_predictions SET verified=1, "
                         "confirmed=0, prediction_error=-1.0, "
                         "verified_at=? WHERE id=?",
-                        (time.time(), pred.prediction_id))
-                    conn.commit()
-                    conn.close()
+                        (time.time(), pred.prediction_id),
+                        table="self_predictions",
+                    )
                 except Exception:
                     pass
             else:
@@ -1210,6 +1357,16 @@ class SelfReasoningEngine:
                               "reason": "reasoning activity spike worth investigating"},
         "dominant_primitive": {"action": "introspect",     "urgency_scale": 2.5,
                               "reason": "reasoning style shift — significant cognitive change"},
+        # Layer A — novelty gap detectors (rFP_coding_explorer_activation.md §4.1)
+        # delta=0.5 in detector; urgency = 0.5 × urgency_scale (capped at 1.0)
+        "commit_rate_low":     {"action": "seek_novelty",  "urgency_scale": 2.0,
+                                "reason": "commit rate low — reasoning stuck in planning, action may break it"},
+        "eureka_staleness":    {"action": "seek_novelty",  "urgency_scale": 1.5,
+                                "reason": "no EUREKA recently — coding often opens fresh insights"},
+        "vocab_plateau":       {"action": "seek_novelty",  "urgency_scale": 1.5,
+                                "reason": "vocabulary frozen — coding may open new concepts"},
+        "monoculture_pressure": {"action": "introspect",    "urgency_scale": 2.0,
+                                "reason": "dominant primitive saturating — coding forces SYNTHESIZE+EVALUATE diversity"},
     }
 
     def get_exploration_triggers(self) -> List[dict]:

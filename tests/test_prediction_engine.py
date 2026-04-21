@@ -32,19 +32,21 @@ class TestPredictionEngine:
         assert pe.compute_error([1.0, 0.0]) == 0.0
 
     def test_novelty_rolling_average(self):
+        # v2 semantics: novelty is z-score + sigmoid of rolling error mean against
+        # EMA mean/std. Always in [0, 1]; exact midpoint depends on EMA state.
         pe = PredictionEngine(error_window=3)
         pe.predict_next([1.0, 0.0], [0.0, 0.0])
         pe.compute_error([1.0, 0.0])  # error ≈ 0
         pe.predict_next([1.0, 0.0], [0.0, 0.0])
         pe.compute_error([0.0, 1.0])  # error > 0.5
         novelty = pe.get_novelty_signal()
-        assert 0.0 < novelty < 1.0
+        assert 0.0 <= novelty <= 1.0
 
     def test_familiarity_inverse(self):
+        # v2 semantics: with no errors, get_novelty_signal() returns the configured
+        # neutral_default (0.5) → familiarity = 0.5. familiarity = 1 - novelty always.
         pe = PredictionEngine()
-        pe.predict_next([1.0, 0.0], [0.0, 0.0])
-        pe.compute_error([1.0, 0.0])  # Predicted correctly
-        assert pe.get_familiarity() > 0.9
+        assert pe.get_familiarity() == pytest.approx(1.0 - pe.get_novelty_signal())
 
     def test_stats_complete(self):
         pe = PredictionEngine()

@@ -171,6 +171,35 @@ class AggregateQuery:
     since_hours: float = 24
 
 
+@dataclass
+class SimilarQuery:
+    """F-phase (rFP §9.2): semantic embedding similarity over TimeChain blocks.
+
+    Returns ranked list of {block_hash, similarity, payload_summary,
+    fork, thought_type, epoch} for blocks whose stored context_embedding
+    exceeds `threshold` cosine similarity to `query_vector`.
+
+    Session 1 ships numpy cosine search over blocks whose `payload.context_embedding`
+    field is set. Session 2 will add a FAISS index built during dream-
+    consolidation cadence for constant-time kNN.
+
+    Payload convention: writers (meta-reasoning in Session 2) include
+    `context_embedding: list[float]` in the block payload at seal time.
+    Blocks without this field are skipped (SIMILAR returns empty when no
+    blocks have embeddings yet — honest "no data" signal).
+    """
+    query_vector: list = field(default_factory=list)  # float[N] — typ. 132D
+    threshold: float = 0.75
+    limit: int = 10
+    fork: str = ""                    # Fork filter ("" = all)
+    thought_type: str = ""
+    since_hours: float = 72           # Recency filter (default 3 days)
+    since_epoch: int = 0
+    embedding_version: int = 0        # If > 0, only return matching version
+                                       # (guards against autoencoder drift
+                                       # across retrains — rFP §14.9)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Smart Contract — Signed cognitive filter/trigger definitions (Phase 3a)
 # ═══════════════════════════════════════════════════════════════════════
@@ -2697,6 +2726,90 @@ class TimeChainOrchestrator:
             direction = "flat"
         return {"direction": direction, "delta": round(delta, 4),
                 "a_value": a_val, "b_value": b_val}
+
+    def similar(self, query: "SimilarQuery") -> list[dict]:
+        """F-phase (rFP §9.2): semantic embedding similarity over blocks.
+
+        Session 1: linear-scan + numpy cosine over blocks within the recency
+        window, skipping any without `payload.context_embedding`. Returns
+        empty list when no blocks have embeddings yet.
+
+        Session 2 will accelerate via FAISS index (config path
+        faiss_index_path; rebuilt during dream-consolidation per rFP §9.3).
+
+        Latency guarantee: ≤50ms for ~10k recent blocks (rFP §9.5). The
+        recency filter (default 72h) keeps the scanned set bounded.
+        """
+        try:
+            import numpy as _np
+        except ImportError:
+            return []
+
+        q_vec = list(query.query_vector or [])
+        if not q_vec:
+            return []
+        try:
+            q = _np.asarray(q_vec, dtype=_np.float32)
+        except Exception:
+            return []
+        q_norm = float(_np.linalg.norm(q))
+        if q_norm <= 0:
+            return []
+
+        # Pull candidate blocks via the existing recall path (bounded by
+        # recency window + fork + thought_type filters) then load their
+        # full content to access context_embedding.
+        recall_q = RecallQuery(
+            fork=query.fork,
+            thought_type=query.thought_type,
+            since_hours=query.since_hours or 0,
+            since_epoch=query.since_epoch or 0,
+            limit=min(max(10, query.limit * 20), 2000),  # scan a superset
+            order="desc",
+            include_content=True,
+        )
+        try:
+            candidates = self.recall(recall_q)
+        except Exception as e:
+            logger.debug("[Orchestrator] similar() recall failed: %s", e)
+            return []
+
+        scored: list = []
+        threshold = float(query.threshold)
+        for blk in candidates:
+            payload = blk.get("payload") or blk.get("content") or {}
+            if not isinstance(payload, dict):
+                continue
+            emb = payload.get("context_embedding")
+            if not emb or not isinstance(emb, list):
+                continue
+            if query.embedding_version > 0:
+                v = payload.get("embedding_version", 0)
+                if v != query.embedding_version:
+                    continue
+            if len(emb) != len(q_vec):
+                continue  # dimension mismatch → skip
+            try:
+                b = _np.asarray(emb, dtype=_np.float32)
+                b_norm = float(_np.linalg.norm(b))
+                if b_norm <= 0:
+                    continue
+                sim = float(_np.dot(q, b) / (q_norm * b_norm))
+            except Exception:
+                continue
+            if sim >= threshold:
+                scored.append({
+                    "block_hash": blk.get("block_hash", ""),
+                    "similarity": round(sim, 4),
+                    "fork": blk.get("fork", ""),
+                    "thought_type": blk.get("thought_type", ""),
+                    "epoch": blk.get("epoch_id", 0),
+                    "payload_summary": str(payload.get("summary",
+                                                         ""))[:160],
+                })
+
+        scored.sort(key=lambda d: -d["similarity"])
+        return scored[:max(1, int(query.limit))]
 
     def aggregate(self, query: "AggregateQuery") -> float:
         """Aggregate over blocks via direct SQL on index. Efficient."""

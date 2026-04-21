@@ -493,8 +493,10 @@ class GrammarPatternLibrary:
                 # Corrupted: literal {ADJ4} that wasn't filled during composition
                 # We identify corrupted ones by checking if they have high slot indices
                 if re.search(r'\{(ADJ|VERB|NOUN|ADV)[4-9]\d*\}', template):
-                    conn.execute(
-                        "DELETE FROM grammar_patterns WHERE id = ?", (row_id,))
+                    from titan_plugin.persistence import get_client
+                    get_client(caller_name="grammar_patterns").write(
+                        "DELETE FROM grammar_patterns WHERE id = ?", (row_id,),
+                        table="grammar_patterns")
                     stats["deleted_slots"] += 1
 
             # Delete patterns with markdown artifacts
@@ -503,8 +505,10 @@ class GrammarPatternLibrary:
                 "WHERE template LIKE '%**%'"
             )
             for row_id, template in cur2.fetchall():
-                conn.execute(
-                    "DELETE FROM grammar_patterns WHERE id = ?", (row_id,))
+                from titan_plugin.persistence import get_client
+                get_client(caller_name="grammar_patterns").write(
+                    "DELETE FROM grammar_patterns WHERE id = ?", (row_id,),
+                    table="grammar_patterns")
                 stats["deleted_markdown"] += 1
 
             # Reset success_rate for patterns with < 3 uses (fresh exploration)

@@ -234,11 +234,16 @@ class ActionNarrator:
             logger.warning("[ActionNarrator] Failed to save dynamic recipes: %s", e)
             return 0
 
-    def narrate(self, action_type: str, result: dict, features: dict) -> str:
+    def narrate(self, action_type: str, result: dict, features: dict,
+                 emot_cgn=None) -> str:
         """Produce a template-based narration of the action result.
 
         Uses features from ActionDecoder to fill template placeholders.
         Falls back to generic description if no template matches.
+
+        rFP_emot_cgn_v2 integration: if emot_cgn is provided AND active,
+        prefix narration with a mood descriptor. Pre-graduation the gate
+        returns "" so behavior is unchanged.
         """
         templates = TEMPLATES.get(action_type, ["You performed an action"])
         template = random.choice(templates)
@@ -248,6 +253,27 @@ class ActionNarrator:
             narration = template.format_map(_SafeDict(features))
         except Exception:
             narration = template
+
+        # EMOT-CGN gated prefix — no-op pre-graduation.
+        # Phase 1.6f.1: try ShmEmotReader first (worker-backed), fall back
+        # to in-process emot_cgn ref if shm unavailable (during cutover).
+        prefix = ""
+        try:
+            from titan_plugin.logic.emot_shm_protocol import ShmEmotReader
+            from titan_plugin.logic.emotion_cluster import EMOT_PRIMITIVES
+            _reader = ShmEmotReader()
+            _state = _reader.read_state()
+            if _state is not None and _state.get("is_active"):
+                prefix = EMOT_PRIMITIVES[_state["dominant_idx"]]
+        except Exception:
+            pass
+        if not prefix and emot_cgn is not None:
+            try:
+                prefix = emot_cgn.get_emotion_for_narration()
+            except Exception:
+                pass
+        if prefix:
+            narration = f"[{prefix}] {narration}"
 
         self._stats["total_narrations"] += 1
         return narration

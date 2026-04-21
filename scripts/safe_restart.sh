@@ -91,16 +91,68 @@ if echo "$STATE" | grep -q "dreaming=True"; then
         echo "    2. Override: bash scripts/safe_restart.sh ${TARGET} --force"
         exit 1
     fi
-else
+elif echo "$STATE" | grep -q "dreaming=False"; then
     echo "  ✓ Titan is awake — safe to restart"
+else
+    # 2026-04-20 fix: "dreaming=unknown" = API unreachable or state file
+    # parse error. Previously this fell through as "safe to restart" which
+    # is wrong — refuse unless --force so operator sees the real state.
+    echo ""
+    echo "  ⚠  DREAM STATE COULD NOT BE VERIFIED — refusing to restart"
+    echo "     State output: $STATE"
+    if [[ "$FORCE" == "--force" ]]; then
+        echo ""
+        echo "  --force specified, proceeding with restart despite unknown state..."
+    else
+        echo ""
+        echo "  Refusing to restart. Options:"
+        echo "    1. Check API: curl -s localhost:7777/health"
+        echo "    2. Check state file: cat data/dreaming_state.json"
+        echo "    3. Override: bash scripts/safe_restart.sh ${TARGET} --force"
+        exit 1
+    fi
 fi
 
 # Perform the restart
 if [[ "$TARGET" == "t1" ]]; then
     echo ""
     echo "=== Restarting T1 ==="
-    ps aux | grep titan_main | grep python | grep -v grep | awk '{print $2}' | xargs kill -9 2>/dev/null
-    sleep 3
+    # 1. Signal all titan_main processes (parent + Guardian subprocesses).
+    #    Use SIGTERM first (allows clean shutdown, flock release), then SIGKILL
+    #    as fallback. Guardian subprocesses inherit the PID file flock from the
+    #    parent; until they fully exit, _acquire_pid_lock on the new instance
+    #    will fail with "Another titan_main is already running" even though the
+    #    parent is dead. Prior bug (pre-2026-04-21 evening): a bare `kill -9`
+    #    followed by fixed `sleep 3` left a race where Guardian children still
+    #    held the flock when the new python tried to start — triggering PID-lock
+    #    abort → cron auto-restart retry → same race. 3–5 restart attempts per
+    #    incident before flock actually released.
+    ps aux | grep titan_main | grep python | grep -v grep | awk '{print $2}' | xargs kill -TERM 2>/dev/null
+    # 2. Wait for ALL titan_main processes to exit (flock is held by each until
+    #    their FD closes). Poll every 0.3s up to 15s, then escalate to SIGKILL.
+    for i in $(seq 1 50); do
+        if ! pgrep -f "python.*titan_main" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.3
+    done
+    # 3. Escalation: if anything still alive after 15s SIGTERM grace, SIGKILL
+    #    and wait another 5s for kernel to reap + release file locks.
+    if pgrep -f "python.*titan_main" >/dev/null 2>&1; then
+        echo "  ⚠  titan_main processes still alive after 15s SIGTERM — escalating to SIGKILL"
+        ps aux | grep titan_main | grep python | grep -v grep | awk '{print $2}' | xargs kill -9 2>/dev/null
+        for i in $(seq 1 17); do
+            if ! pgrep -f "python.*titan_main" >/dev/null 2>&1; then
+                break
+            fi
+            sleep 0.3
+        done
+    fi
+    # 4. Clean any stale PID file. Even with the 2026-04-21 _acquire_pid_lock
+    #    fix (truncate AFTER flock), removing the stale file here makes the
+    #    abort-message branch's "PID ???" display honest — no more referencing
+    #    a dead parent.
+    rm -f data/titan_main.pid 2>/dev/null
     source test_env/bin/activate
     # Append (>>) so pre-restart forensics are preserved. Size is bounded by
     # t1_watchdog.sh log rotation (>100MB → gz archive).

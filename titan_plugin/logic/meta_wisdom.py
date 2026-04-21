@@ -14,6 +14,8 @@ import sqlite3
 import time
 from typing import Optional
 
+from titan_plugin.persistence import get_client
+
 logger = logging.getLogger("titan.meta_wisdom")
 
 
@@ -30,6 +32,7 @@ class MetaWisdomStore:
         self._crystallize_reuses = crystallize_reuses
         self._crystallize_success = crystallize_success
         self._prune_threshold = prune_threshold
+        self._client = get_client(caller_name="meta_wisdom")
         self._init_tables()
 
     def _get_db(self) -> sqlite3.Connection:
@@ -80,8 +83,7 @@ class MetaWisdomStore:
             confidence = outcome_score
             if source == "kin":
                 confidence *= 0.5
-            db = self._get_db()
-            cursor = db.execute(
+            res = self._client.write(
                 "INSERT INTO meta_wisdom "
                 "(problem_pattern, strategy_sequence, problem_embedding, strategy_embedding, "
                 "outcome_score, confidence, source, source_kin, created_at) "
@@ -97,11 +99,12 @@ class MetaWisdomStore:
                     source_kin,
                     time.time(),
                 ),
+                table="meta_wisdom",
             )
-            row_id = cursor.lastrowid
-            db.commit()
-            db.close()
-            return row_id
+            if not res.ok:
+                logger.warning("[MetaWisdom] Store error: %s", res.error)
+                return -1
+            return res.last_row_id or -1
         except Exception as e:
             logger.warning("[MetaWisdom] Store error: %s", e)
             return -1
@@ -177,81 +180,86 @@ class MetaWisdomStore:
 
     def record_reuse(self, wisdom_id: int, success: bool) -> None:
         try:
-            db = self._get_db()
             if success:
-                db.execute(
+                self._client.write(
                     "UPDATE meta_wisdom SET "
                     "times_reused = times_reused + 1, "
                     "times_successful = times_successful + 1, "
                     "confidence = MIN(1.0, confidence * 1.10), "
                     "last_used = ? WHERE id = ?",
                     (time.time(), wisdom_id),
+                    table="meta_wisdom",
                 )
             else:
-                db.execute(
+                self._client.write(
                     "UPDATE meta_wisdom SET "
                     "times_reused = times_reused + 1, "
                     "confidence = MAX(0.0, confidence * 0.85), "
                     "last_used = ? WHERE id = ?",
                     (time.time(), wisdom_id),
+                    table="meta_wisdom",
                 )
-            # Check crystallization
-            row = db.execute(
-                "SELECT times_reused, times_successful FROM meta_wisdom WHERE id = ?",
-                (wisdom_id,),
-            ).fetchone()
+            # READ for crystallization check (direct, no contention)
+            db = self._get_db()
+            try:
+                row = db.execute(
+                    "SELECT times_reused, times_successful FROM meta_wisdom WHERE id = ?",
+                    (wisdom_id,),
+                ).fetchone()
+            finally:
+                db.close()
             if row and row[0] >= self._crystallize_reuses:
                 success_rate = row[1] / row[0] if row[0] > 0 else 0
                 if success_rate >= self._crystallize_success:
-                    db.execute(
+                    self._client.write(
                         "UPDATE meta_wisdom SET crystallized = 1 WHERE id = ?",
                         (wisdom_id,),
+                        table="meta_wisdom",
                     )
                     logger.info("[MetaWisdom] Strategy %d crystallized (reuses=%d, success=%.0f%%)",
                                 wisdom_id, row[0], success_rate * 100)
-            db.commit()
-            db.close()
         except Exception as e:
             logger.warning("[MetaWisdom] Record reuse error: %s", e)
 
     def force_crystallize(self, wisdom_id: int) -> None:
         """Immediately crystallize a wisdom entry (M9: EUREKA event)."""
         try:
-            db = self._get_db()
-            db.execute(
+            self._client.write(
                 "UPDATE meta_wisdom SET crystallized = 1, "
                 "confidence = MAX(confidence, 0.8) WHERE id = ?",
                 (wisdom_id,),
+                table="meta_wisdom",
             )
-            db.commit()
-            db.close()
             logger.info("[MetaWisdom] Wisdom %d EUREKA-crystallized", wisdom_id)
         except Exception as e:
             logger.warning("[MetaWisdom] Force crystallize error: %s", e)
 
     def dream_decay(self) -> dict:
         try:
-            db = self._get_db()
             # Decay non-crystallized entries
-            db.execute(
+            self._client.write(
                 "UPDATE meta_wisdom SET confidence = confidence * ? "
                 "WHERE crystallized = 0",
                 (self._decay_rate,),
+                table="meta_wisdom",
             )
             # Prune below threshold
-            cursor = db.execute(
+            prune_res = self._client.write(
                 "DELETE FROM meta_wisdom WHERE confidence < ? AND crystallized = 0",
                 (self._prune_threshold,),
+                table="meta_wisdom",
             )
-            pruned = cursor.rowcount
-            # Stats
-            remaining = db.execute("SELECT COUNT(*) FROM meta_wisdom").fetchone()[0]
-            avg_conf = db.execute("SELECT AVG(confidence) FROM meta_wisdom").fetchone()[0]
-            crystallized = db.execute(
-                "SELECT COUNT(*) FROM meta_wisdom WHERE crystallized = 1"
-            ).fetchone()[0]
-            db.commit()
-            db.close()
+            pruned = prune_res.rowcount or 0
+            # READ stats via direct connection
+            db = self._get_db()
+            try:
+                remaining = db.execute("SELECT COUNT(*) FROM meta_wisdom").fetchone()[0]
+                avg_conf = db.execute("SELECT AVG(confidence) FROM meta_wisdom").fetchone()[0]
+                crystallized = db.execute(
+                    "SELECT COUNT(*) FROM meta_wisdom WHERE crystallized = 1"
+                ).fetchone()[0]
+            finally:
+                db.close()
             return {
                 "pruned": pruned,
                 "remaining": remaining,
@@ -303,23 +311,23 @@ class MetaWisdomStore:
         """
         try:
             db = self._get_db()
-            total = db.execute("SELECT COUNT(*) FROM meta_wisdom").fetchone()[0]
-            if total <= max_entries:
+            try:
+                total = db.execute("SELECT COUNT(*) FROM meta_wisdom").fetchone()[0]
+            finally:
                 db.close()
+            if total <= max_entries:
                 return 0
             # Keep highest effective confidence (crystallized get bonus)
             # Use ROWID ordering as tiebreaker to prefer newer entries
-            db.execute("""
+            res = self._client.write("""
                 DELETE FROM meta_wisdom WHERE id NOT IN (
                     SELECT id FROM meta_wisdom
                     ORDER BY (confidence + CASE WHEN crystallized = 1 THEN 0.2 ELSE 0.0 END) DESC,
                              id DESC
                     LIMIT ?
                 )
-            """, (max_entries,))
-            deleted = db.execute("SELECT changes()").fetchone()[0]
-            db.commit()
-            db.close()
+            """, (max_entries,), table="meta_wisdom")
+            deleted = res.rowcount or 0
             if deleted > 0:
                 logger.info("[MetaWisdom] Pruned %d entries (kept top %d by confidence, was %d)",
                             deleted, max_entries, total)

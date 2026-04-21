@@ -48,16 +48,46 @@ _FUNCTION_COUNT = 15
 logger.info("[SpiritLoop] Module loaded v%s — %d helper functions available",
             _MODULE_VERSION, _FUNCTION_COUNT)
 
-# ── Coordinator snapshot cache (2026-04-19 query-backlog fix) ─────
-# get_coordinator builds a heavy stats dict across ALL modules (MSL,
-# meta-engine, self-reasoning, experience memory, …). Under CPU
-# contention (e.g. T2/T3 sharing a VPS), stats-building falls behind
-# incoming query rate → query thread backlog grows → SKIP-stale logic
-# drops queries > 30s old → /v4/meta-reasoning endpoints return "not
-# yet initialized". Observed on T2 with total_skipped=172+ across the
-# day. Cache collapses repeated queries within TTL into one build.
+# ── Heavy snapshot caches — populated by background builder threads ──
+# get_coordinator/get_trinity/get_nervous_system each aggregate state
+# across many subsystems (coordinator alone touches ~15 — MSL, meta-engine,
+# self-reasoning, experience memory, …). Before 2026-04-21: these were
+# built on-demand inside the QueryThread handler, which could take
+# 460-2144ms per coord build on loaded Titans (T1 under dashboard-poll +
+# ARC iter-3 load). That blocked the QueryThread, starved other queries,
+# and aged them past the 30s SKIP threshold → /v4/* endpoints returned
+# stale/empty (T1-COORD-QUERYTHREAD-BACKLOG).
+#
+# After: dedicated daemon threads (`*-snapshot-builder`) rebuild these
+# continuously in the background. QueryThread handlers become trivial
+# cache reads (<1ms). Cache age is bounded by `build_time + interval`
+# per entry below. Atomic swap of `data` pointer under CPython GIL is
+# race-free for readers.
+#
+# Under microkernel v2, these builder threads become the L1 writers that
+# mmap into /dev/shm/titan/*.bin state-registry regions; the
+# `build_*_snapshot()` functions below extract unchanged — they're the
+# writer bodies. Readers (dashboard as separate process) will switch
+# from bus-query-then-cache-read to direct mmap read, eliminating the
+# IPC hop entirely.
 _COORD_SNAPSHOT_CACHE: dict = {"data": None, "ts": 0.0}
-_COORD_SNAPSHOT_TTL = 8.0  # seconds — matches dashboard warmer cadence
+_TRINITY_SNAPSHOT_CACHE: dict = {"data": None, "ts": 0.0}
+_NS_SNAPSHOT_CACHE: dict = {"data": None, "ts": 0.0}
+
+# Builder thread cadence: seconds of sleep BETWEEN builds (cycle ≈ build_time + interval).
+# Coord build is heaviest (~1-1.5s observed on T1), so 2.5s gives ~4s cycle.
+# Trinity + NS builds are fast (<50ms) so 0.25s gives sub-second cycle.
+_COORD_SNAPSHOT_BUILDER_INTERVAL = 2.5
+_TRINITY_SNAPSHOT_BUILDER_INTERVAL = 0.25
+_NS_SNAPSHOT_BUILDER_INTERVAL = 0.25
+_SNAPSHOT_BUILDER_ERROR_BACKOFF = 2.0  # sleep on exception (avoid CPU burn + log flood)
+
+# Legacy TTL kept as compatibility shim for the QueryThread fast-path in
+# spirit_worker.py (still used for cold-boot window before builder populates
+# cache). Effectively unused once builders are running.
+_COORD_SNAPSHOT_TTL = 30.0
+_TRINITY_SNAPSHOT_TTL = 30.0
+_NS_SNAPSHOT_TTL = 30.0
 
 
 def post_reload_cleanup_helpers():
@@ -1360,6 +1390,369 @@ def _collect_spirit_tensor(config: dict, body_state: dict, mind_state: dict,
     return [round(v, 4) for v in [who, why, what, body_scalar, mind_scalar]]
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Background snapshot builders (2026-04-21 — T1-COORD-QUERYTHREAD-BACKLOG fix)
+# ─────────────────────────────────────────────────────────────────────
+#
+# These three functions produce the heavy "what's true now" snapshots
+# consumed by /v4/coordinator, /v4/trinity, /v4/nervous-system (and the
+# many endpoints that read from the coordinator snapshot downstream).
+#
+# They are called from TWO places:
+#   1. The background `*-snapshot-builder` daemon threads (primary caller;
+#      rebuilds every _*_SNAPSHOT_BUILDER_INTERVAL seconds, writes to
+#      `_*_SNAPSHOT_CACHE["data"]` via atomic pointer swap).
+#   2. The `_handle_query` cold-boot fallback path (called synchronously
+#      if cache is still None when a query arrives — i.e., in the first
+#      few seconds after spirit_worker start, before the builder has
+#      completed its first build).
+#
+# Function shape: takes `state_refs` (the same dict spirit_worker builds
+# at boot for the query handler thread, so no new param plumbing) + the
+# `config` dict where needed. Returns the same dict shape the handler
+# produced inline before this refactor — /v4/* endpoints see zero change.
+#
+# Microkernel v2 migration path: these become the L1 writer bodies.
+# The builder thread becomes the writer process thread; instead of
+# writing to an in-process dict it will serialize to a mmapped
+# /dev/shm/titan/*.bin region. Readers (separate dashboard process)
+# mmap and read zero-copy. Everything else stays the same.
+# ─────────────────────────────────────────────────────────────────────
+
+def build_coordinator_snapshot(state_refs: dict) -> dict | None:
+    """Build the coordinator stats dict. Returns None if coordinator unavailable."""
+    coordinator = state_refs.get("coordinator")
+    if not coordinator:
+        return None
+    pi_monitor = state_refs.get("pi_monitor")
+    e_mem = state_refs.get("e_mem")
+    prediction_engine = state_refs.get("prediction_engine")
+    ex_mem = state_refs.get("ex_mem")
+    episodic_mem = state_refs.get("episodic_mem")
+    working_mem = state_refs.get("working_mem")
+    inner_lower_topo = state_refs.get("inner_lower_topo")
+    outer_lower_topo = state_refs.get("outer_lower_topo")
+    ground_up_enricher = state_refs.get("ground_up_enricher")
+    neuromodulator_system = state_refs.get("neuromodulator_system")
+    expression_manager = state_refs.get("expression_manager")
+    life_force_engine = state_refs.get("life_force_engine")
+    meditation_tracker = state_refs.get("meditation_tracker")
+    outer_interface = state_refs.get("outer_interface")
+    reasoning_engine = state_refs.get("reasoning_engine")
+    self_reasoning = state_refs.get("self_reasoning")
+    coding_explorer = state_refs.get("coding_explorer")
+    phase_tracker = state_refs.get("phase_tracker")
+    inner_state = state_refs.get("inner_state")
+    social_pressure_meter = state_refs.get("social_pressure_meter")
+    msl = state_refs.get("msl")
+    language_stats = state_refs.get("language_stats")
+
+    stats = coordinator.get_stats()
+    if pi_monitor:
+        stats["pi_heartbeat"] = pi_monitor.get_stats()
+    if e_mem:
+        stats["experiential_memory"] = e_mem.get_stats()
+    if prediction_engine:
+        stats["prediction"] = prediction_engine.get_stats()
+    if ex_mem:
+        stats["experience_memory"] = ex_mem.get_stats()
+    if episodic_mem:
+        stats["episodic_memory"] = episodic_mem.get_stats()
+    if working_mem:
+        stats["working_memory"] = working_mem.get_stats()
+    if inner_lower_topo:
+        stats["inner_lower_topology"] = inner_lower_topo.get_stats()
+    if outer_lower_topo:
+        stats["outer_lower_topology"] = outer_lower_topo.get_stats()
+    if ground_up_enricher:
+        stats["ground_up"] = ground_up_enricher.get_stats()
+    if neuromodulator_system:
+        stats["neuromodulators"] = neuromodulator_system.get_stats()
+    if expression_manager:
+        stats["expression_composites"] = expression_manager.get_stats()
+    if life_force_engine:
+        stats["chi"] = getattr(life_force_engine, '_latest_chi', {})
+    if meditation_tracker:
+        stats["meditation"] = {
+            "count": meditation_tracker.get("count", 0),
+            "count_since_nft": meditation_tracker.get("count_since_nft", 0),
+            "last_epoch": meditation_tracker.get("last_epoch", 0),
+            "in_meditation": meditation_tracker.get("in_meditation", False),
+        }
+    if outer_interface:
+        stats["outer_interface"] = outer_interface.get_stats()
+    if reasoning_engine:
+        stats["reasoning"] = reasoning_engine.get_stats()
+    # Meta-reasoning block — always emit the key (shape-stable for downstream)
+    stats["meta_reasoning"] = {}
+    _me = getattr(coordinator, '_meta_engine', None)
+    if _me:
+        try:
+            stats["meta_reasoning"] = _me.get_stats()
+        except Exception as _me_err:
+            logger.warning(
+                "[META] get_stats failed: %s — leaving "
+                "meta_reasoning={} for this tick", _me_err)
+            stats["meta_reasoning"] = {}
+        try:
+            stats["meta_reasoning_audit"] = _me.get_audit_stats()
+        except Exception as _au_err:
+            logger.warning("[META] get_audit_stats failed: %s", _au_err)
+    else:
+        logger.debug(
+            "[META] coordinator._meta_engine is None at "
+            "build_coordinator_snapshot — meta_reasoning={}")
+    # F-phase (rFP §11.1): Meta-Reasoning Consumer Service status
+    _ms = getattr(coordinator, '_meta_service', None)
+    if _ms:
+        try:
+            stats["meta_service"] = _ms.get_status()
+        except Exception as _ms_err:
+            logger.warning("[MetaService] get_status failed: %s", _ms_err)
+            stats["meta_service"] = {"error": str(_ms_err)}
+    else:
+        stats["meta_service"] = {}
+    if self_reasoning:
+        stats["self_reasoning"] = self_reasoning.get_stats()
+    if coding_explorer:
+        stats["coding_explorer"] = coding_explorer.get_stats()
+    if phase_tracker:
+        stats["phase_events"] = {
+            "current_phase": phase_tracker.get("current_phase", "idle"),
+            "recent_events": phase_tracker.get("events", [])[-20:],
+            "total_events": len(phase_tracker.get("events", [])),
+        }
+    # Dreaming block (is_dreaming lives on inner_state, not DreamingEngine)
+    if coordinator and hasattr(coordinator, 'dreaming') and coordinator.dreaming:
+        _dr_is = False
+        if inner_state and hasattr(inner_state, 'is_dreaming'):
+            _dr_is = inner_state.is_dreaming
+        _dr_dream_epochs = getattr(
+            coordinator.dreaming, '_dream_epoch_count', 0)
+        _dr_onset = getattr(
+            coordinator.dreaming, '_dream_onset_fatigue', 0)
+        _dr_fatigue = getattr(
+            coordinator.dreaming, '_dream_fatigue', 0)
+        _dr_wake_trans = getattr(
+            coordinator.dreaming, '_wake_transition', False)
+        _dr_recovery_pct = 0.0
+        if _dr_is and _dr_onset > 0:
+            _dr_recovery_pct = round(
+                100.0 * (1.0 - max(0, _dr_fatigue) / _dr_onset), 1)
+        _dr_remaining = max(0, round(_dr_fatigue / 3.0)) if _dr_is else 0
+        stats["dreaming"] = {
+            "is_dreaming": _dr_is,
+            "fatigue": round(getattr(inner_state, 'fatigue', 0), 4)
+                if inner_state else 0,
+            "cycle_count": getattr(
+                coordinator.dreaming, '_cycle_count', 0),
+            "dream_epochs": _dr_dream_epochs,
+            "recovery_pct": _dr_recovery_pct,
+            "wake_transition": _dr_wake_trans,
+            "remaining_epochs": _dr_remaining,
+            "onset_fatigue": round(_dr_onset),
+            "epochs_since_dream": getattr(
+                coordinator.dreaming, '_epochs_since_dream', 0),
+            "last_sleep_drive": round(float(getattr(
+                coordinator.dreaming, 'last_sleep_drive', 0.0)), 4),
+            "last_wake_drive": round(float(getattr(
+                coordinator.dreaming, 'last_wake_drive', 0.0)), 4),
+            "distilled_count": getattr(
+                coordinator.dreaming, '_distilled_count', 0),
+            "distill_threshold": getattr(
+                coordinator.dreaming, '_distill_threshold', 0.02),
+            "distill_attempts": getattr(
+                coordinator.dreaming, '_distill_attempts', 0),
+            "distill_passed": getattr(
+                coordinator.dreaming, '_distill_passed', 0),
+            "variance_samples_count": len(getattr(
+                coordinator.dreaming, '_variance_samples', [])),
+            "experience_buffer_size": len(getattr(
+                coordinator.inner, '_experience_buffer', [])
+                if coordinator.inner else []),
+        }
+    if social_pressure_meter:
+        stats["social_pressure"] = social_pressure_meter.get_stats()
+    if msl:
+        _msl_attn = msl.get_attention_weights_for_kin()
+        _msl_entropy = 0.0
+        if _msl_attn is not None:
+            import numpy as _msl_np
+            _vals = list(_msl_attn.values()) if isinstance(_msl_attn, dict) else _msl_attn
+            _a = _msl_np.array(_vals, dtype=_msl_np.float32)
+            _a_norm = _a / (_a.sum() + 1e-10)
+            _msl_entropy = float(-(_a_norm * _msl_np.log(_a_norm + 1e-10)).sum())
+        _depth_stats = msl.i_depth.get_stats() if hasattr(msl, 'i_depth') else {}
+        _homeo_state = {}
+        if (hasattr(msl, 'policy') and msl.policy
+                and hasattr(msl.policy, 'homeostatic')):
+            try:
+                _homeo_state = msl.policy.homeostatic.get_state()
+            except Exception:
+                _homeo_state = {}
+        stats["msl"] = {
+            "i_confidence": msl.get_i_confidence(),
+            "i_depth": _depth_stats.get("depth", 0.0),
+            "i_depth_components": _depth_stats.get("components", {}),
+            "convergence_count": msl.confidence._convergence_count,
+            "concept_confidences": msl.concept_grounder.get_concept_confidences() if msl.concept_grounder else {},
+            "attention_weights": _msl_attn,
+            "attention_entropy": round(_msl_entropy, 3),
+            "homeostatic": _homeo_state,
+        }
+    if language_stats:
+        stats["language"] = language_stats
+    return stats
+
+
+def build_trinity_snapshot(state_refs: dict, config: dict) -> dict:
+    """Build the trinity stats dict. Always returns a dict (uses defaults if refs missing)."""
+    body_state = state_refs.get("body_state", {})
+    mind_state = state_refs.get("mind_state", {})
+    consciousness = state_refs.get("consciousness")
+    filter_down = state_refs.get("filter_down")
+    intuition = state_refs.get("intuition")
+    impulse_engine = state_refs.get("impulse_engine")
+    sphere_clock = state_refs.get("sphere_clock")
+    resonance = state_refs.get("resonance")
+    unified_spirit = state_refs.get("unified_spirit")
+    inner_state = state_refs.get("inner_state")
+    spirit_state = state_refs.get("spirit_state")
+
+    tensor = _collect_spirit_tensor(config, body_state, mind_state, consciousness)
+    response = {
+        "spirit_tensor": tensor,
+        "body_values": body_state.get("values", [0.5] * 5),
+        "mind_values": mind_state.get("values", [0.5] * 5),
+        "body_center_dist": body_state.get("center_dist", 0),
+        "mind_center_dist": mind_state.get("center_dist", 0),
+    }
+    if consciousness and consciousness.get("latest_epoch"):
+        response["consciousness"] = consciousness["latest_epoch"]
+    try:
+        from titan_plugin.logic.middle_path import middle_path_loss
+        body_vals = body_state.get("values", [0.5] * 5)
+        mind_vals = mind_state.get("values", [0.5] * 5)
+        response["middle_path_loss"] = round(
+            middle_path_loss(body_vals, mind_vals, tensor), 4)
+    except Exception:
+        pass
+    if filter_down:
+        response["filter_down"] = filter_down.get_stats()
+    if intuition:
+        response["intuition"] = intuition.get_stats()
+    if impulse_engine:
+        response["impulse_engine"] = impulse_engine.get_stats()
+    if sphere_clock:
+        response["sphere_clock"] = sphere_clock.get_stats()
+    if resonance:
+        response["resonance"] = resonance.get_stats()
+    if unified_spirit:
+        response["unified_spirit"] = unified_spirit.get_stats()
+    if inner_state:
+        response["observables"] = inner_state.observables
+        response["inner_state"] = inner_state.snapshot()
+    if spirit_state:
+        response["spirit_state"] = spirit_state.snapshot()
+    return response
+
+
+def build_nervous_system_snapshot(state_refs: dict) -> dict | None:
+    """Build the NS stats dict. Returns None if no NS available."""
+    neural_nervous_system = state_refs.get("neural_nervous_system")
+    coordinator = state_refs.get("coordinator")
+    if neural_nervous_system:
+        return neural_nervous_system.get_stats()
+    if coordinator and coordinator.nervous_system:
+        return {
+            "version": "v4_vm",
+            "programs": list(coordinator.nervous_system.programs.keys())
+                if hasattr(coordinator.nervous_system, 'programs') else [],
+        }
+    return None
+
+
+def start_snapshot_builder_threads(state_refs: dict, config: dict) -> None:
+    """Launch 3 daemon threads that keep the heavy snapshot caches fresh.
+
+    Called once from spirit_worker at boot, right after the query handler
+    thread starts. Replaces the on-demand in-handler build pattern that
+    blocked the QueryThread for 460-2144ms per coord build (cause of
+    T1-COORD-QUERYTHREAD-BACKLOG). Each thread is daemon=True so it dies
+    with the process.
+
+    On builder exception: caught, logged rate-limited, cache keeps serving
+    the last successful build. On loop exit (should never happen): FATAL
+    log so investigators can correlate any stale cache with the crash.
+    """
+    import threading
+
+    def _builder_loop(kind: str, build_fn, cache: dict, interval: float):
+        consecutive_errors = 0
+        try:
+            while True:
+                _t0 = time.time()
+                try:
+                    result = build_fn()
+                    if result is not None:
+                        # Atomic pointer swap under GIL — readers see
+                        # either the old dict or the new dict, never a
+                        # partially-built one.
+                        cache["data"] = result
+                        cache["ts"] = time.time()
+                    consecutive_errors = 0
+                except Exception as exc:
+                    consecutive_errors += 1
+                    if consecutive_errors == 1 or consecutive_errors % 10 == 0:
+                        logger.warning(
+                            "[SnapshotBuilder:%s] build failed "
+                            "(#%d consecutive): %s",
+                            kind, consecutive_errors, exc)
+                build_ms = (time.time() - _t0) * 1000
+                logger.debug(
+                    "[SnapshotBuilder:%s] built in %.0fms",
+                    kind, build_ms)
+                sleep_s = (_SNAPSHOT_BUILDER_ERROR_BACKOFF
+                           if consecutive_errors > 0 else interval)
+                time.sleep(sleep_s)
+        except BaseException as fatal:
+            logger.error(
+                "[SnapshotBuilder:%s] loop exited unexpectedly — "
+                "cache will become stale: %s",
+                kind, fatal, exc_info=True)
+
+    threading.Thread(
+        target=_builder_loop,
+        args=("coord",
+              lambda: build_coordinator_snapshot(state_refs),
+              _COORD_SNAPSHOT_CACHE,
+              _COORD_SNAPSHOT_BUILDER_INTERVAL),
+        daemon=True, name="coord-snapshot-builder",
+    ).start()
+    threading.Thread(
+        target=_builder_loop,
+        args=("trinity",
+              lambda: build_trinity_snapshot(state_refs, config),
+              _TRINITY_SNAPSHOT_CACHE,
+              _TRINITY_SNAPSHOT_BUILDER_INTERVAL),
+        daemon=True, name="trinity-snapshot-builder",
+    ).start()
+    threading.Thread(
+        target=_builder_loop,
+        args=("ns",
+              lambda: build_nervous_system_snapshot(state_refs),
+              _NS_SNAPSHOT_CACHE,
+              _NS_SNAPSHOT_BUILDER_INTERVAL),
+        daemon=True, name="ns-snapshot-builder",
+    ).start()
+    logger.info(
+        "[SpiritLoop] Snapshot builder threads started — "
+        "coord/trinity/ns rebuild every %.2f/%.2f/%.2fs",
+        _COORD_SNAPSHOT_BUILDER_INTERVAL,
+        _TRINITY_SNAPSHOT_BUILDER_INTERVAL,
+        _NS_SNAPSHOT_BUILDER_INTERVAL)
+
+
 def _handle_query(msg: dict, config: dict, body_state: dict, mind_state: dict,
                   consciousness: dict | None, filter_down, intuition, impulse_engine,
                   sphere_clock, resonance, unified_spirit,
@@ -1392,50 +1785,27 @@ def _handle_query(msg: dict, config: dict, body_state: dict, mind_state: dict,
             _send_response(send_queue, name, src, {"tensor": tensor}, rid)
 
         elif action == "get_trinity":
-            tensor = _collect_spirit_tensor(config, body_state, mind_state, consciousness)
-            response = {
-                "spirit_tensor": tensor,
-                "body_values": body_state.get("values", [0.5] * 5),
-                "mind_values": mind_state.get("values", [0.5] * 5),
-                "body_center_dist": body_state.get("center_dist", 0),
-                "mind_center_dist": mind_state.get("center_dist", 0),
+            # Primary path: background `trinity-snapshot-builder` thread
+            # keeps _TRINITY_SNAPSHOT_CACHE fresh (~0.5s cycle). Cache read
+            # is atomic (dict[key] pointer deref under GIL).
+            _cached = _TRINITY_SNAPSHOT_CACHE["data"]
+            if _cached is not None:
+                _send_response(send_queue, name, src, _cached, rid)
+                return
+            # Cold-boot fallback: builder hasn't run yet. Build synchronously
+            # and populate cache so subsequent queries fast-path immediately.
+            _state_refs = {
+                "body_state": body_state, "mind_state": mind_state,
+                "consciousness": consciousness,
+                "filter_down": filter_down, "intuition": intuition,
+                "impulse_engine": impulse_engine,
+                "sphere_clock": sphere_clock, "resonance": resonance,
+                "unified_spirit": unified_spirit,
+                "inner_state": inner_state, "spirit_state": spirit_state,
             }
-            # Include consciousness epoch data if available
-            if consciousness and consciousness.get("latest_epoch"):
-                response["consciousness"] = consciousness["latest_epoch"]
-            # Include Middle Path loss
-            try:
-                from titan_plugin.logic.middle_path import middle_path_loss
-                body_vals = body_state.get("values", [0.5] * 5)
-                mind_vals = mind_state.get("values", [0.5] * 5)
-                response["middle_path_loss"] = round(
-                    middle_path_loss(body_vals, mind_vals, tensor), 4)
-            except Exception:
-                pass
-            # Include FILTER_DOWN stats
-            if filter_down:
-                response["filter_down"] = filter_down.get_stats()
-            # Include INTUITION stats
-            if intuition:
-                response["intuition"] = intuition.get_stats()
-            # Include IMPULSE engine stats (Step 7.1)
-            if impulse_engine:
-                response["impulse_engine"] = impulse_engine.get_stats()
-            # Include V4 Sphere Clock stats
-            if sphere_clock:
-                response["sphere_clock"] = sphere_clock.get_stats()
-            # Include V4 Resonance stats
-            if resonance:
-                response["resonance"] = resonance.get_stats()
-            # Include V4 Unified SPIRIT stats
-            if unified_spirit:
-                response["unified_spirit"] = unified_spirit.get_stats()
-            # Include T1 Observables + T2 State Registries
-            if inner_state:
-                response["observables"] = inner_state.observables
-                response["inner_state"] = inner_state.snapshot()
-            if spirit_state:
-                response["spirit_state"] = spirit_state.snapshot()
+            response = build_trinity_snapshot(_state_refs, config)
+            _TRINITY_SNAPSHOT_CACHE["data"] = response
+            _TRINITY_SNAPSHOT_CACHE["ts"] = time.time()
             _send_response(send_queue, name, src, response, rid)
 
         elif action == "get_consciousness":
@@ -1552,217 +1922,54 @@ def _handle_query(msg: dict, config: dict, body_state: dict, mind_state: dict,
                 _send_response(send_queue, name, src, {"error": "SpiritState not available"}, rid)
 
         elif action == "get_coordinator":
-            # Snapshot cache: if we built a snapshot within _COORD_SNAPSHOT_TTL,
-            # return it directly. Multiple endpoints hitting in the same cycle
-            # get one build; prevents the query-thread backlog that drops
-            # 30s+ stale queries without reply (T2/T3 observability loss).
-            _coord_now = time.time()
-            if (_COORD_SNAPSHOT_CACHE["data"] is not None
-                    and _coord_now - _COORD_SNAPSHOT_CACHE["ts"]
-                    < _COORD_SNAPSHOT_TTL):
-                _send_response(send_queue, name, src,
-                               _COORD_SNAPSHOT_CACHE["data"], rid)
+            # Primary path: background `coord-snapshot-builder` thread
+            # keeps _COORD_SNAPSHOT_CACHE fresh (~4s cycle under normal
+            # load; cache age bounded by build_time + interval). Cache
+            # read is atomic (dict[key] pointer deref under GIL). Before
+            # this refactor: the handler built inline on every cache
+            # miss (460-2144ms) blocking the QueryThread and causing
+            # SKIP-stale on queued queries (T1-COORD-QUERYTHREAD-BACKLOG).
+            _cached = _COORD_SNAPSHOT_CACHE["data"]
+            if _cached is not None:
+                _send_response(send_queue, name, src, _cached, rid)
                 return
+            # Cold-boot fallback: builder hasn't populated cache yet
+            # (first few seconds after spirit_worker start). Build
+            # synchronously so the first query still gets an answer,
+            # then populate the cache so the next query fast-paths.
             if coordinator:
-                stats = coordinator.get_stats()
-                if pi_monitor:
-                    stats["pi_heartbeat"] = pi_monitor.get_stats()
-                if e_mem:
-                    stats["experiential_memory"] = e_mem.get_stats()
-                if prediction_engine:
-                    stats["prediction"] = prediction_engine.get_stats()
-                if ex_mem:
-                    stats["experience_memory"] = ex_mem.get_stats()
-                if episodic_mem:
-                    stats["episodic_memory"] = episodic_mem.get_stats()
-                if working_mem:
-                    stats["working_memory"] = working_mem.get_stats()
-                if inner_lower_topo:
-                    stats["inner_lower_topology"] = inner_lower_topo.get_stats()
-                if outer_lower_topo:
-                    stats["outer_lower_topology"] = outer_lower_topo.get_stats()
-                if ground_up_enricher:
-                    stats["ground_up"] = ground_up_enricher.get_stats()
-                if neuromodulator_system:
-                    stats["neuromodulators"] = neuromodulator_system.get_stats()
-                if expression_manager:
-                    stats["expression_composites"] = expression_manager.get_stats()
-                if life_force_engine:
-                    stats["chi"] = getattr(life_force_engine, '_latest_chi', {})
-                if meditation_tracker:
-                    stats["meditation"] = {
-                        "count": meditation_tracker.get("count", 0),
-                        "count_since_nft": meditation_tracker.get("count_since_nft", 0),
-                        "last_epoch": meditation_tracker.get("last_epoch", 0),
-                        "in_meditation": meditation_tracker.get("in_meditation", False),
-                    }
-                if outer_interface:
-                    stats["outer_interface"] = outer_interface.get_stats()
-                if reasoning_engine:
-                    stats["reasoning"] = reasoning_engine.get_stats()
-                # Meta-reasoning stats
-                # Always initialize the key — even if meta_engine is unwired
-                # at this tick — so downstream snapshot consumers
-                # (dashboard.py /v4/meta-reasoning, /v4/inner-trinity,
-                # arch_map audit, test harnesses) see a consistent shape and
-                # can distinguish "transient cache race" (empty dict) from
-                # "missing feature" (key absent). Before 2026-04-19 this was
-                # conditional on `if _me:` → when _me was None the key was
-                # absent from the snapshot → /v4/meta-reasoning returned
-                # "data":{} → test harness sampling couldn't extract the
-                # signals_received counter (see verify_sweep_cross_titan
-                # t=0 / t=900 'cache?' readings).
-                stats["meta_reasoning"] = {}
-                _me = getattr(coordinator, '_meta_engine', None)
-                if _me:
-                    # Defensive try/except: before 2026-04-19, unguarded
-                    # get_stats() would propagate exceptions up and leak
-                    # partial stats, or silently return {} when _me was
-                    # stale-wired, leaving /v4/inner-trinity with
-                    # meta_reasoning={} and the TimeChain orchestrator's
-                    # cognitive-contracts gate blind to meta_chains (read
-                    # as 0 default → gate never trips). Surface failures
-                    # at WARN so class-of-bug doesn't recur silently.
-                    try:
-                        stats["meta_reasoning"] = _me.get_stats()
-                    except Exception as _me_err:
-                        logger.warning(
-                            "[META] get_stats failed: %s — leaving "
-                            "meta_reasoning={} for this tick", _me_err)
-                        stats["meta_reasoning"] = {}
-                    # Task 3: extended observability for /v4/meta-reasoning/audit
-                    try:
-                        stats["meta_reasoning_audit"] = _me.get_audit_stats()
-                    except Exception as _au_err:
-                        logger.warning("[META] get_audit_stats failed: %s", _au_err)
+                _state_refs = {
+                    "coordinator": coordinator, "pi_monitor": pi_monitor,
+                    "e_mem": e_mem, "prediction_engine": prediction_engine,
+                    "ex_mem": ex_mem, "episodic_mem": episodic_mem,
+                    "working_mem": working_mem,
+                    "inner_lower_topo": inner_lower_topo,
+                    "outer_lower_topo": outer_lower_topo,
+                    "ground_up_enricher": ground_up_enricher,
+                    "neuromodulator_system": neuromodulator_system,
+                    "expression_manager": expression_manager,
+                    "life_force_engine": life_force_engine,
+                    "meditation_tracker": meditation_tracker,
+                    "outer_interface": outer_interface,
+                    "reasoning_engine": reasoning_engine,
+                    "self_reasoning": self_reasoning,
+                    "coding_explorer": coding_explorer,
+                    "phase_tracker": phase_tracker,
+                    "inner_state": inner_state,
+                    "social_pressure_meter": social_pressure_meter,
+                    "msl": msl, "language_stats": language_stats,
+                }
+                stats = build_coordinator_snapshot(_state_refs)
+                if stats is not None:
+                    _COORD_SNAPSHOT_CACHE["data"] = stats
+                    _COORD_SNAPSHOT_CACHE["ts"] = time.time()
+                    _send_response(send_queue, name, src, stats, rid)
                 else:
-                    # _meta_engine not yet wired on coordinator — log once
-                    # per tick at DEBUG so investigators can correlate
-                    # with any observed empty snapshots downstream.
-                    logger.debug(
-                        "[META] coordinator._meta_engine is None at "
-                        "get_coordinator — snapshot meta_reasoning={}")
-                # Self-reasoning stats
-                if self_reasoning:
-                    stats["self_reasoning"] = self_reasoning.get_stats()
-                # Coding explorer stats
-                if coding_explorer:
-                    stats["coding_explorer"] = coding_explorer.get_stats()
-                # Phase event log for telemetry
-                if phase_tracker:
-                    stats["phase_events"] = {
-                        "current_phase": phase_tracker.get("current_phase", "idle"),
-                        "recent_events": phase_tracker.get("events", [])[-20:],
-                        "total_events": len(phase_tracker.get("events", [])),
-                    }
-                # Dreaming state (is_dreaming lives on inner_state, not DreamingEngine)
-                if coordinator and hasattr(coordinator, 'dreaming') and coordinator.dreaming:
-                    _dr_is = False
-                    if inner_state and hasattr(inner_state, 'is_dreaming'):
-                        _dr_is = inner_state.is_dreaming
-                    _dr_dream_epochs = getattr(
-                        coordinator.dreaming, '_dream_epoch_count', 0)
-                    _dr_onset = getattr(
-                        coordinator.dreaming, '_dream_onset_fatigue', 0)
-                    _dr_fatigue = getattr(
-                        coordinator.dreaming, '_dream_fatigue', 0)
-                    _dr_wake_trans = getattr(
-                        coordinator.dreaming, '_wake_transition', False)
-                    # Recovery progress: 0% = just fell asleep, 100% = about to wake
-                    _dr_recovery_pct = 0.0
-                    if _dr_is and _dr_onset > 0:
-                        _dr_recovery_pct = round(
-                            100.0 * (1.0 - max(0, _dr_fatigue) / _dr_onset), 1)
-                    # Estimated remaining dream epochs
-                    _dr_remaining = max(0, round(_dr_fatigue / 3.0)) if _dr_is else 0
-                    stats["dreaming"] = {
-                        "is_dreaming": _dr_is,
-                        "fatigue": round(getattr(inner_state, 'fatigue', 0), 4)
-                            if inner_state else 0,
-                        "cycle_count": getattr(
-                            coordinator.dreaming, '_cycle_count', 0),
-                        "dream_epochs": _dr_dream_epochs,
-                        "recovery_pct": _dr_recovery_pct,
-                        "wake_transition": _dr_wake_trans,
-                        "remaining_epochs": _dr_remaining,
-                        "onset_fatigue": round(_dr_onset),
-                        "epochs_since_dream": getattr(
-                            coordinator.dreaming, '_epochs_since_dream', 0),
-                        # Sleep/wake drive competition (emergent dreaming onset)
-                        # arch_map health check #10 reads these to verify the
-                        # sleep_drive vs wake_drive loop is wired end-to-end.
-                        "last_sleep_drive": round(float(getattr(
-                            coordinator.dreaming, 'last_sleep_drive', 0.0)), 4),
-                        "last_wake_drive": round(float(getattr(
-                            coordinator.dreaming, 'last_wake_drive', 0.0)), 4),
-                        # I-017 visibility: how many wisdom insights have been
-                        # extracted across all dream cycles. distilled=0 over
-                        # many cycles indicates broken consolidation.
-                        "distilled_count": getattr(
-                            coordinator.dreaming, '_distilled_count', 0),
-                        # Phase 1 of foundational healing rFP — distillation
-                        # threshold + variance distribution exposed for tuning
-                        "distill_threshold": getattr(
-                            coordinator.dreaming, '_distill_threshold', 0.02),
-                        "distill_attempts": getattr(
-                            coordinator.dreaming, '_distill_attempts', 0),
-                        "distill_passed": getattr(
-                            coordinator.dreaming, '_distill_passed', 0),
-                        "variance_samples_count": len(getattr(
-                            coordinator.dreaming, '_variance_samples', [])),
-                        # Foundational-loop wiring health check (2026-04-13):
-                        # experience_buffer must be > 0 occasionally to prove
-                        # spirit_worker.STATE_SNAPSHOT → coordinator.on_outer_
-                        # snapshot path is alive. Was structurally orphaned
-                        # for 27 days until ff3eb12+today's fix.
-                        "experience_buffer_size": len(getattr(
-                            coordinator.inner, '_experience_buffer', [])
-                            if coordinator.inner else []),
-                    }
-                if social_pressure_meter:
-                    stats["social_pressure"] = social_pressure_meter.get_stats()
-                # MSL data for kin exchange and API
-                if msl:
-                    _msl_attn = msl.get_attention_weights_for_kin()
-                    _msl_entropy = 0.0
-                    if _msl_attn is not None:
-                        import numpy as _msl_np
-                        _vals = list(_msl_attn.values()) if isinstance(_msl_attn, dict) else _msl_attn
-                        _a = _msl_np.array(_vals, dtype=_msl_np.float32)
-                        _a_norm = _a / (_a.sum() + 1e-10)
-                        _msl_entropy = float(-(_a_norm * _msl_np.log(_a_norm + 1e-10)).sum())
-                    _depth_stats = msl.i_depth.get_stats() if hasattr(msl, 'i_depth') else {}
-                    # I-016/HOMEO-REDESIGN visibility: surface homeostatic state
-                    # (setpoints, sensitivity, tonic, setpoint_entropy,
-                    # drift_guard_active_count). Allows arch_map and dashboard
-                    # to detect collapse-toward-clip-boundary BEFORE it
-                    # manifests as live attention_entropy collapse.
-                    _homeo_state = {}
-                    if (hasattr(msl, 'policy') and msl.policy
-                            and hasattr(msl.policy, 'homeostatic')):
-                        try:
-                            _homeo_state = msl.policy.homeostatic.get_state()
-                        except Exception:
-                            _homeo_state = {}
-                    stats["msl"] = {
-                        "i_confidence": msl.get_i_confidence(),
-                        "i_depth": _depth_stats.get("depth", 0.0),
-                        "i_depth_components": _depth_stats.get("components", {}),
-                        "convergence_count": msl.confidence._convergence_count,
-                        "concept_confidences": msl.concept_grounder.get_concept_confidences() if msl.concept_grounder else {},
-                        "attention_weights": _msl_attn,
-                        "attention_entropy": round(_msl_entropy, 3),
-                        "homeostatic": _homeo_state,
-                    }
-                if language_stats:
-                    stats["language"] = language_stats
-                # Populate snapshot cache so subsequent queries within TTL
-                # return immediately without rebuilding the stats dict.
-                _COORD_SNAPSHOT_CACHE["data"] = stats
-                _COORD_SNAPSHOT_CACHE["ts"] = time.time()
-                _send_response(send_queue, name, src, stats, rid)
+                    _send_response(send_queue, name, src,
+                                   {"error": "Coordinator not available"}, rid)
             else:
-                _send_response(send_queue, name, src, {"error": "Coordinator not available"}, rid)
+                _send_response(send_queue, name, src,
+                               {"error": "Coordinator not available"}, rid)
 
         elif action == "reset_msl_homeostasis":
             # Phase 3+ of foundational healing rFP (2026-04-13): MSL
@@ -1826,17 +2033,25 @@ def _handle_query(msg: dict, config: dict, body_state: dict, mind_state: dict,
                                {"ok": False, "error": str(_reset_err)}, rid)
 
         elif action == "get_nervous_system":
-            if neural_nervous_system:
-                _send_response(send_queue, name, src, neural_nervous_system.get_stats(), rid)
-            elif coordinator and coordinator.nervous_system:
-                # Fallback: return V4 VM nervous system info
-                _send_response(send_queue, name, src, {
-                    "version": "v4_vm",
-                    "programs": list(coordinator.nervous_system.programs.keys())
-                        if hasattr(coordinator.nervous_system, 'programs') else [],
-                }, rid)
+            # Primary path: background `ns-snapshot-builder` thread keeps
+            # _NS_SNAPSHOT_CACHE fresh (~0.5s cycle).
+            _cached = _NS_SNAPSHOT_CACHE["data"]
+            if _cached is not None:
+                _send_response(send_queue, name, src, _cached, rid)
+                return
+            # Cold-boot fallback: synchronous build.
+            _state_refs = {
+                "neural_nervous_system": neural_nervous_system,
+                "coordinator": coordinator,
+            }
+            _ns_resp = build_nervous_system_snapshot(_state_refs)
+            if _ns_resp is not None:
+                _NS_SNAPSHOT_CACHE["data"] = _ns_resp
+                _NS_SNAPSHOT_CACHE["ts"] = time.time()
+                _send_response(send_queue, name, src, _ns_resp, rid)
             else:
-                _send_response(send_queue, name, src, {"error": "NervousSystem not available"}, rid)
+                _send_response(send_queue, name, src,
+                               {"error": "NervousSystem not available"}, rid)
 
         elif action == "social_relief":
             inner_payload = payload.get("payload", {})

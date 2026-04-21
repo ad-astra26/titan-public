@@ -10,6 +10,7 @@ Architecture:
   - Per-user Cognee datasets: Heavy semantic memories (sharded, lazy-loaded)
   - Social edges: Relationship strength between users discovered from interactions
 """
+import asyncio
 import json
 import logging
 import os
@@ -96,7 +97,15 @@ class SocialGraph:
         self._db_path = db_path
         self._cache: Dict[str, UserProfile] = {}
         self._edges: Dict[str, float] = {}  # "userA::userB" → strength
+        # rFP_social_graph_async_safety §5.1: per-instance writer lock.
+        # Lazy so instances built before an event loop exists (subprocess boots) still work.
+        self._write_lock: Optional[asyncio.Lock] = None
         self._init_db()
+
+    def _get_write_lock(self) -> asyncio.Lock:
+        if self._write_lock is None:
+            self._write_lock = asyncio.Lock()
+        return self._write_lock
 
     def _init_db(self):
         """Initialize SQLite schema for user profiles and edges."""
@@ -763,3 +772,94 @@ class SocialGraph:
                 "WHERE user_name=?",
                 (tweet_text[:500], time.time(), user_name))
             conn.commit()
+
+    # -------------------------------------------------------------------------
+    # Async companions (rFP_social_graph_async_safety Option A+)
+    # -------------------------------------------------------------------------
+    # Writers acquire self._write_lock before dispatching to_thread to serialize
+    # concurrent mutators on the event-loop side (matches accidental serialization
+    # pre-migration). Readers skip the lock — WAL allows concurrent readers.
+    # The lock is per-instance; cross-process writers (spirit_worker vs titan_main)
+    # are still serialized by SQLite's WAL + busy_timeout (R6 unchanged).
+
+    async def get_or_create_user_async(
+        self, user_id: str, platform: str = "unknown", display_name: str = ""
+    ) -> UserProfile:
+        async with self._get_write_lock():
+            return await asyncio.to_thread(
+                self.get_or_create_user, user_id, platform, display_name)
+
+    async def _save_profile_async(self, profile: UserProfile) -> None:
+        async with self._get_write_lock():
+            await asyncio.to_thread(self._save_profile, profile)
+
+    async def record_interaction_async(
+        self, user_id: str, quality: float = 0.5
+    ) -> None:
+        async with self._get_write_lock():
+            await asyncio.to_thread(self.record_interaction, user_id, quality)
+
+    async def record_edge_async(self, user_a: str, user_b: str) -> None:
+        async with self._get_write_lock():
+            await asyncio.to_thread(self.record_edge, user_a, user_b)
+
+    async def record_donation_async(
+        self, tx_signature: str, sender_address: str, amount_sol: float,
+        memo: str = "",
+    ) -> Optional[UserProfile]:
+        async with self._get_write_lock():
+            return await asyncio.to_thread(
+                self.record_donation, tx_signature, sender_address,
+                amount_sol, memo)
+
+    async def record_inspiration_async(
+        self, tx_signature: str, sender_address: str, message: str,
+        amount_sol: float = 0.0,
+    ) -> Optional[UserProfile]:
+        async with self._get_write_lock():
+            return await asyncio.to_thread(
+                self.record_inspiration, tx_signature, sender_address,
+                message, amount_sol)
+
+    async def should_engage_async(self, user_id: str) -> str:
+        # should_engage calls get_or_create_user internally (writer path on miss),
+        # so take the lock to serialize with other writers.
+        async with self._get_write_lock():
+            return await asyncio.to_thread(self.should_engage, user_id)
+
+    async def get_stats_async(self) -> Dict:
+        # Read-only: WAL permits concurrent readers, skip the lock.
+        return await asyncio.to_thread(self.get_stats)
+
+    async def ledger_record_async(
+        self, tweet_id: str, user_name: str, action: str,
+        mention_text: str = "",
+    ) -> None:
+        async with self._get_write_lock():
+            await asyncio.to_thread(
+                self.ledger_record, tweet_id, user_name, action, mention_text)
+
+    async def ledger_has_tweet_async(
+        self, tweet_id: str, action: Optional[str] = None,
+    ) -> bool:
+        return await asyncio.to_thread(self.ledger_has_tweet, tweet_id, action)
+
+    async def ledger_user_reply_count_async(
+        self, user_name: str, window_seconds: float,
+    ) -> int:
+        return await asyncio.to_thread(
+            self.ledger_user_reply_count, user_name, window_seconds)
+
+    async def ledger_last_reply_to_user_async(self, user_name: str) -> float:
+        return await asyncio.to_thread(self.ledger_last_reply_to_user, user_name)
+
+    async def ledger_total_today_async(
+        self, action: Optional[str] = None,
+    ) -> int:
+        return await asyncio.to_thread(self.ledger_total_today, action)
+
+    async def ledger_cleanup_async(
+        self, max_age_seconds: float = 172800,
+    ) -> int:
+        async with self._get_write_lock():
+            return await asyncio.to_thread(self.ledger_cleanup, max_age_seconds)

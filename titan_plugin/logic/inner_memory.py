@@ -21,6 +21,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from titan_plugin.persistence import get_client
+
 logger = logging.getLogger(__name__)
 
 # Default time returned when no event found (1 hour in seconds)
@@ -34,12 +36,16 @@ class InnerMemoryStore:
         self._db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        # Persistent connection — used for READS only (WAL allows concurrent readers).
+        # Writes route through the IMW client (get_client().write(...)) so that
+        # when persistence.enabled=true, they are serialized through the daemon.
         self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")  # concurrent readers + writer
         self._conn.execute("PRAGMA busy_timeout=5000")  # wait 5s on lock instead of failing
         self._conn.execute("PRAGMA cache_size = -16000")   # 16MB cap (was unbounded on 362MB DB)
         self._conn.execute("PRAGMA synchronous = NORMAL")
+        self._client = get_client(caller_name="inner_memory_store")
         self._init_schema()
         count = self._count_all()
         if count > 0:
@@ -239,16 +245,16 @@ class InnerMemoryStore:
     ) -> None:
         """Record hormone state at a consciousness epoch."""
         now = time.time()
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO hormone_snapshots "
-                "(timestamp, epoch_id, levels, thresholds, refractory, "
-                "fired_programs, stimuli) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (now, epoch_id,
-                 json.dumps(levels), json.dumps(thresholds),
-                 json.dumps(refractory), json.dumps(fired),
-                 json.dumps(stimuli)))
-            self._conn.commit()
+        self._client.write(
+            "INSERT INTO hormone_snapshots "
+            "(timestamp, epoch_id, levels, thresholds, refractory, "
+            "fired_programs, stimuli) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (now, epoch_id,
+             json.dumps(levels), json.dumps(thresholds),
+             json.dumps(refractory), json.dumps(fired),
+             json.dumps(stimuli)),
+            table="hormone_snapshots",
+        )
 
     def record_program_fire(
         self,
@@ -265,20 +271,20 @@ class InnerMemoryStore:
     ) -> None:
         """Record a neural program firing with full context."""
         now = time.time()
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO program_fires "
-                "(timestamp, program, layer, intensity, pressure_at_fire, "
-                "threshold_at_fire, stimulus_value, cross_talk_snapshot, "
-                "trinity_body, trinity_mind, trinity_spirit) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (now, program, layer, intensity, pressure, threshold,
-                 stimulus,
-                 json.dumps(cross_talk) if cross_talk else None,
-                 json.dumps(body) if body else None,
-                 json.dumps(mind) if mind else None,
-                 json.dumps(spirit) if spirit else None))
-            self._conn.commit()
+        self._client.write(
+            "INSERT INTO program_fires "
+            "(timestamp, program, layer, intensity, pressure_at_fire, "
+            "threshold_at_fire, stimulus_value, cross_talk_snapshot, "
+            "trinity_body, trinity_mind, trinity_spirit) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (now, program, layer, intensity, pressure, threshold,
+             stimulus,
+             json.dumps(cross_talk) if cross_talk else None,
+             json.dumps(body) if body else None,
+             json.dumps(mind) if mind else None,
+             json.dumps(spirit) if spirit else None),
+            table="program_fires",
+        )
 
     # ── Outer Layer: Write API ───────────────────────────────────────
 
@@ -299,20 +305,20 @@ class InnerMemoryStore:
     ) -> None:
         """Record a full impulse→intent→action→outcome chain."""
         now = time.time()
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO action_chains "
-                "(timestamp, impulse_id, triggering_program, posture, helper, "
-                "params, success, score, reasoning, trinity_before, "
-                "trinity_after, trinity_delta, epoch_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (now, impulse_id, triggering_program, posture, helper,
-                 json.dumps(params) if params else None,
-                 1 if success else 0, score, reasoning,
-                 json.dumps(trinity_before) if trinity_before else None,
-                 json.dumps(trinity_after) if trinity_after else None,
-                 trinity_delta, epoch_id))
-            self._conn.commit()
+        self._client.write(
+            "INSERT INTO action_chains "
+            "(timestamp, impulse_id, triggering_program, posture, helper, "
+            "params, success, score, reasoning, trinity_before, "
+            "trinity_after, trinity_delta, epoch_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (now, impulse_id, triggering_program, posture, helper,
+             json.dumps(params) if params else None,
+             1 if success else 0, score, reasoning,
+             json.dumps(trinity_before) if trinity_before else None,
+             json.dumps(trinity_after) if trinity_after else None,
+             trinity_delta, epoch_id),
+            table="action_chains",
+        )
 
     def record_creative_work(
         self,
@@ -326,16 +332,16 @@ class InnerMemoryStore:
     ) -> None:
         """Record a creative work with its generative context."""
         now = time.time()
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO creative_works "
-                "(timestamp, work_type, file_path, triggering_program, "
-                "posture, assessment_score, hormone_level_at_creation, "
-                "trinity_snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (now, work_type, file_path, triggering_program, posture,
-                 assessment_score, hormone_level,
-                 json.dumps(trinity_snapshot) if trinity_snapshot else None))
-            self._conn.commit()
+        self._client.write(
+            "INSERT INTO creative_works "
+            "(timestamp, work_type, file_path, triggering_program, "
+            "posture, assessment_score, hormone_level_at_creation, "
+            "trinity_snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (now, work_type, file_path, triggering_program, posture,
+             assessment_score, hormone_level,
+             json.dumps(trinity_snapshot) if trinity_snapshot else None),
+            table="creative_works",
+        )
 
     def record_event(
         self,
@@ -345,14 +351,14 @@ class InnerMemoryStore:
     ) -> None:
         """Record a time-based event marker for temporal queries."""
         now = time.time()
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO event_markers "
-                "(timestamp, event_type, program, details) "
-                "VALUES (?, ?, ?, ?)",
-                (now, event_type, program,
-                 json.dumps(details) if details else None))
-            self._conn.commit()
+        self._client.write(
+            "INSERT INTO event_markers "
+            "(timestamp, event_type, program, details) "
+            "VALUES (?, ?, ?, ?)",
+            (now, event_type, program,
+             json.dumps(details) if details else None),
+            table="event_markers",
+        )
 
     # ── Visual Autobiography ─────────────────────────────────────────
 
@@ -369,19 +375,19 @@ class InnerMemoryStore:
     ) -> None:
         """Record a visual perception snapshot for long-term autobiography."""
         now = time.time()
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO visual_autobiography "
-                "(timestamp, epoch_id, journey_5d, resonance_5d, "
-                "semantic_summary, source, filename, inner_state_hash, "
-                "emotional_context) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (now, epoch_id,
-                 json.dumps(journey_5d),
-                 json.dumps(resonance_5d),
-                 json.dumps(semantic_summary) if semantic_summary else None,
-                 source, filename, inner_state_hash,
-                 json.dumps(emotional_context) if emotional_context else None))
-            self._conn.commit()
+        self._client.write(
+            "INSERT INTO visual_autobiography "
+            "(timestamp, epoch_id, journey_5d, resonance_5d, "
+            "semantic_summary, source, filename, inner_state_hash, "
+            "emotional_context) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (now, epoch_id,
+             json.dumps(journey_5d),
+             json.dumps(resonance_5d),
+             json.dumps(semantic_summary) if semantic_summary else None,
+             source, filename, inner_state_hash,
+             json.dumps(emotional_context) if emotional_context else None),
+            table="visual_autobiography",
+        )
 
     # ── Temporal Query API (Critical for Hormones) ───────────────────
 
@@ -521,28 +527,33 @@ class InnerMemoryStore:
         """Store or update a word in vocabulary with its felt association."""
         now = time.time()
         with self._lock:
+            # READ via persistent connection (WAL concurrent-reader safe)
             existing = self._conn.execute(
                 "SELECT id FROM vocabulary WHERE word = ?", (word,)
             ).fetchone()
-            if existing:
-                self._conn.execute(
-                    "UPDATE vocabulary SET felt_tensor = ?, hormone_pattern = ?, "
-                    "last_encountered = ? WHERE word = ?",
-                    (json.dumps(felt_tensor) if felt_tensor else None,
-                     json.dumps(hormone_pattern) if hormone_pattern else None,
-                     now, word))
-            else:
-                self._conn.execute(
-                    "INSERT INTO vocabulary "
-                    "(word, word_type, stage, felt_tensor, hormone_pattern, "
-                    "confidence, times_encountered, times_produced, "
-                    "learning_phase, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, 0.0, 0, 0, 'unlearned', ?)",
-                    (word, word_type, stage,
-                     json.dumps(felt_tensor) if felt_tensor else None,
-                     json.dumps(hormone_pattern) if hormone_pattern else None,
-                     now))
-            self._conn.commit()
+        # WRITE via IMW client (routes to daemon when enabled, else direct)
+        if existing:
+            self._client.write(
+                "UPDATE vocabulary SET felt_tensor = ?, hormone_pattern = ?, "
+                "last_encountered = ? WHERE word = ?",
+                (json.dumps(felt_tensor) if felt_tensor else None,
+                 json.dumps(hormone_pattern) if hormone_pattern else None,
+                 now, word),
+                table="vocabulary",
+            )
+        else:
+            self._client.write(
+                "INSERT INTO vocabulary "
+                "(word, word_type, stage, felt_tensor, hormone_pattern, "
+                "confidence, times_encountered, times_produced, "
+                "learning_phase, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 0.0, 0, 0, 'unlearned', ?)",
+                (word, word_type, stage,
+                 json.dumps(felt_tensor) if felt_tensor else None,
+                 json.dumps(hormone_pattern) if hormone_pattern else None,
+                 now),
+                table="vocabulary",
+            )
 
     def update_word_learning(
         self,
@@ -555,25 +566,25 @@ class InnerMemoryStore:
     ) -> None:
         """Update a word's learning progress after a training pass."""
         now = time.time()
-        with self._lock:
-            updates = ["learning_phase = ?", "last_encountered = ?"]
-            params = [phase, now]
-            if felt_tensor is not None:
-                updates.append("felt_tensor = ?")
-                params.append(json.dumps(felt_tensor))
-            if confidence_delta != 0.0:
-                updates.append(
-                    "confidence = MIN(1.0, MAX(0.0, confidence + ?))")
-                params.append(float(confidence_delta))
-            if encountered:
-                updates.append("times_encountered = times_encountered + 1")
-            if produced:
-                updates.append("times_produced = times_produced + 1")
-            params.append(word)
-            self._conn.execute(
-                f"UPDATE vocabulary SET {', '.join(updates)} WHERE word = ?",
-                params)
-            self._conn.commit()
+        updates = ["learning_phase = ?", "last_encountered = ?"]
+        params: list = [phase, now]
+        if felt_tensor is not None:
+            updates.append("felt_tensor = ?")
+            params.append(json.dumps(felt_tensor))
+        if confidence_delta != 0.0:
+            updates.append(
+                "confidence = MIN(1.0, MAX(0.0, confidence + ?))")
+            params.append(float(confidence_delta))
+        if encountered:
+            updates.append("times_encountered = times_encountered + 1")
+        if produced:
+            updates.append("times_produced = times_produced + 1")
+        params.append(word)
+        self._client.write(
+            f"UPDATE vocabulary SET {', '.join(updates)} WHERE word = ?",
+            params,
+            table="vocabulary",
+        )
 
     def get_vocabulary(
         self,

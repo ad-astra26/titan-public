@@ -322,12 +322,14 @@ def update_vocabulary_after_speak(
 
             if row:
                 # Advance to producible + increment times_produced
-                conn.execute(
+                from titan_plugin.persistence import get_client
+                get_client(caller_name="language_pipeline").write(
                     "UPDATE vocabulary SET learning_phase='producible', "
                     "times_produced = times_produced + 1, "
                     "confidence = MIN(1.0, confidence + 0.02) "
                     "WHERE word=?",
-                    (word,)
+                    (word,),
+                    table="vocabulary",
                 )
                 updated += 1
                 words_reinforced.append(word)
@@ -490,12 +492,14 @@ def apply_grounding_action_to_db(db_path: str, word: str, action,
             xm_boost = 0.02
         new_xm = min(1.0, old_xm + xm_boost)
 
-        conn.execute(
+        conn.close()
+        from titan_plugin.persistence import get_client
+        get_client(caller_name="language_pipeline").write(
             "UPDATE vocabulary SET confidence=?, felt_tensor=?, "
             "cross_modal_conf=? WHERE word=?",
-            (new_conf, json.dumps(ft), new_xm, word))
-        conn.commit()
-        conn.close()
+            (new_conf, json.dumps(ft), new_xm, word),
+            table="vocabulary",
+        )
         return True
 
     except Exception as e:
@@ -710,20 +714,18 @@ def persist_composition(
     Source: spirit_worker.py lines 4142-4169.
     """
     try:
-        conn = sqlite3.connect(db_path, timeout=5.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute(
+        from titan_plugin.persistence import get_client
+        res = get_client(caller_name="language_pipeline").write(
             "INSERT INTO composition_history "
             "(timestamp, epoch_id, level, template, sentence, words_used, "
             "confidence, slots_filled, slots_total, intent, stage, state_resonance) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (time.time(), epoch_id, level, template, sentence,
              json.dumps(words_used), confidence, slots_filled, slots_total,
-             "", "", state_resonance)
+             "", "", state_resonance),
+            table="composition_history",
         )
-        conn.commit()
-        conn.close()
-        return True
+        return res.ok
     except Exception as e:
         logger.debug("[LanguagePipeline] persist_composition error: %s", e)
         return False
@@ -747,10 +749,9 @@ def persist_teacher_session(
     Source: spirit_worker.py lines 6368-6410.
     """
     try:
+        # Ensure table exists (DDL via direct, one-time)
         conn = sqlite3.connect(db_path, timeout=5.0)
         conn.execute("PRAGMA journal_mode=WAL")
-
-        # Ensure table exists
         conn.execute("""
             CREATE TABLE IF NOT EXISTS teacher_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -760,8 +761,10 @@ def persist_teacher_session(
                 epoch_id INTEGER
             )
         """)
-
-        conn.execute(
+        conn.commit()
+        conn.close()
+        from titan_plugin.persistence import get_client
+        res = get_client(caller_name="language_pipeline").write(
             "INSERT INTO teacher_sessions "
             "(timestamp, mode, original_sentence, teacher_response, "
             "words_recognized, correction, pattern_hash, neuromod_gate, "
@@ -769,11 +772,10 @@ def persist_teacher_session(
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (time.time(), mode, original, teacher_response,
              words_recognized, correction, pattern_hash, neuromod_gate,
-             epoch_id)
+             epoch_id),
+            table="teacher_sessions",
         )
-        conn.commit()
-        conn.close()
-        return True
+        return res.ok
     except Exception as e:
         logger.debug("[LanguagePipeline] persist_teacher_session error: %s", e)
         return False

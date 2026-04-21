@@ -18,6 +18,7 @@ import os
 import sqlite3
 import time
 from dataclasses import dataclass, field
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,7 @@ class ActionResult:
                             # |"hourly_limit"|"daily_limit"|"too_soon"|"no_catalyst"
                             # |"quality_rejected"|"generation_failed"|"api_failed"
                             # |"verification_failed"|"consumer_blocked"
+                            # |"suppressed_ungrounded" (rFP_phase5 §9.3)
     tweet_id: str = ""
     reason: str = ""
     text: str = ""
@@ -189,6 +191,10 @@ class SocialXGateway:
         self._context_builder = None
         # Session auto-refresh state
         self._refreshed_session = ""  # Cached refreshed session (overrides config)
+        # Grounding-gate per-topic cooldown (rFP_phase5_narrator_evolution §9.3).
+        # Prevents CGN_KNOWLEDGE_REQ spam when the same ungrounded topic keeps
+        # catalysing suppressed posts. Key = topic word, value = last request ts.
+        self._grounding_cooldown: dict[str, float] = {}
         self._init_db()
         self._recover_pending()
         logger.info("[SocialXGateway] Initialized: db=%s config=%s "
@@ -333,6 +339,11 @@ class SocialXGateway:
             "limits": sx.get("limits", {}),
             # Reply discovery settings: [social_x.replies]
             "replies": sx.get("replies", {}),
+            # Voice guardrails (rFP_phase5_narrator_evolution §9): entire
+            # [voice] section is surfaced so the grounding gate can read
+            # dual_mode_enabled / x_grounding_* keys via the same config
+            # object every action already loads.
+            "voice": full.get("voice", {}),
         }
 
     # ── Consumer Access Control ─────────────────────────────────────
@@ -1348,10 +1359,15 @@ class SocialXGateway:
                       flags=re.IGNORECASE)
 
     def _build_prompts(self, post_type: str, catalyst: dict,
-                       context: PostContext) -> tuple[str, str]:
+                       context: PostContext,
+                       voice_cfg: dict | None = None) -> tuple[str, str]:
         """Build system + user prompts for LLM generation.
 
         Automatically selects rich or short format based on post_type.
+        When voice_cfg.dual_mode_enabled is true, appends a public-voice
+        guardrail nudge to the system prompt (rFP_phase5_narrator_evolution
+        §9.3) — complements the hard grounding gate by softly nudging the
+        LLM away from speculation even on topics that pass the threshold.
         """
         style = self._build_style_directive(context.neuromods)
         voice = self._TITAN_VOICE.get(context.titan_id, "")
@@ -1362,6 +1378,14 @@ class SocialXGateway:
         system_prompt = f"{core}\n\n{style}"
         if voice:
             system_prompt += f"\n\n{voice}"
+
+        # Public-voice nudge (soft pair to the hard grounding gate)
+        if voice_cfg and voice_cfg.get("dual_mode_enabled"):
+            system_prompt += (
+                "\n\n[PUBLIC VOICE] This post will reach strangers. "
+                "Speak only from what you actually know — do not speculate "
+                "about topics, people, or events you have no grounded "
+                "knowledge of. Honest silence beats confident guessing.")
 
         # Own words context
         own_words = ""
@@ -1479,13 +1503,14 @@ class SocialXGateway:
         return system_prompt, user_prompt
 
     def _generate_text(self, post_type: str, catalyst: dict,
-                       context: PostContext) -> str | None:
+                       context: PostContext,
+                       voice_cfg: dict | None = None) -> str | None:
         """Generate post text via LLM. Returns None on failure."""
         if not context.llm_url or not context.llm_key:
             return None
 
         system_prompt, user_prompt = self._build_prompts(
-            post_type, catalyst, context)
+            post_type, catalyst, context, voice_cfg=voice_cfg)
 
         is_rich = self._is_rich_post(post_type)
         max_tokens = 600 if is_rich else 200
@@ -1783,19 +1808,274 @@ class SocialXGateway:
 
     # ── Public API: post() ──────────────────────────────────────────
 
-    def post(self, context: PostContext, consumer: str = "") -> ActionResult:
+    def _check_grounding_appropriateness(self, context: PostContext,
+                                          catalyst: dict,
+                                          voice_cfg: dict,
+                                          bus) -> Optional[dict]:
+        """rFP_phase5_narrator_evolution §9.3: grounded-only guardrail on X path.
+
+        Reads knowledge_concepts for max confidence across topics extracted
+        from the catalyst. If below threshold, logs telemetry + fires
+        CGN_KNOWLEDGE_REQ (with per-topic cooldown) so Titan learns about
+        topics it wanted to speak on but couldn't.
+
+        Returns a dict {"suppress": True, ...} only when
+        `x_grounding_enforced = true` AND confidence is below threshold.
+        Returns None in observability-only mode OR when content is grounded
+        OR when dual_mode is disabled. Suppression shape matches peer
+        `_check_emotional_appropriateness` — gate methods never veto in
+        observability mode.
+        """
+        if not voice_cfg.get("dual_mode_enabled", False):
+            return None
+        try:
+            # Local import — social_x_gateway keeps titan_plugin imports
+            # deferred to call time (same pattern as _load_config).
+            from titan_plugin.logic.knowledge_gate import (
+                extract_topic_words, check_topic_confidence_with_match)
+        except ImportError as e:
+            logger.debug("[SocialXGateway] knowledge_gate unavailable: %s", e)
+            return None
+
+        src_text = "{} {}".format(
+            catalyst.get("type", ""),
+            catalyst.get("content", "") or "",
+        )
+        topics = extract_topic_words(src_text, max_words=5)
+        if not topics:
+            # No topical signal → nothing to ground; don't suppress empty catalysts
+            return None
+
+        # BUG-KNOWLEDGE-USAGE-ZERO coverage widening (2026-04-21):
+        # use the _with_match variant so we know which knowledge_concepts.topic
+        # row provided the confidence → emit CGN_KNOWLEDGE_USAGE against it.
+        confidence, matched_topic = check_topic_confidence_with_match(topics)
+        threshold = float(voice_cfg.get("x_grounding_threshold", 0.5))
+        enforced = bool(voice_cfg.get("x_grounding_enforced", False))
+
+        # Always log the check (observability, both pass + fail)
+        self._log_telemetry({
+            "event": "post_grounding_check",
+            "titan_id": context.titan_id,
+            "topics": topics,
+            "confidence": round(confidence, 3),
+            "threshold": threshold,
+            "enforced": enforced,
+            "passed": confidence >= threshold,
+            "matched_topic": matched_topic,
+        })
+
+        if confidence >= threshold:
+            # Grounded → post proceeds. Emit CGN_KNOWLEDGE_USAGE so
+            # knowledge_worker's RoutingLearner credits the matched
+            # concept's backend reputation (rFP KP-8 feedback loop).
+            # Reward=0.3 — post publication is the strongest usage
+            # signal we have: the concept contributed to a public
+            # artefact, not just internal deliberation.
+            if matched_topic:
+                self._emit_knowledge_usage(
+                    bus, matched_topic, reward=0.3,
+                    consumer="social")
+            return None
+
+        # Ungrounded — emit suppression telemetry + fire research signal
+        self._log_telemetry({
+            "event": "post_suppressed_ungrounded",
+            "titan_id": context.titan_id,
+            "topics": topics,
+            "confidence": round(confidence, 3),
+            "threshold": threshold,
+            "enforced": enforced,
+            "catalyst_type": catalyst.get("type", ""),
+        })
+        self._maybe_fire_knowledge_req(topics, voice_cfg, bus)
+
+        if enforced:
+            return {"suppress": True, "topics": topics,
+                    "confidence": confidence}
+        return None  # observability-only: log but don't veto
+
+    def _emit_knowledge_usage(self, bus, topic: str, reward: float = 0.3,
+                               consumer: str = "social") -> None:
+        """Emit CGN_KNOWLEDGE_USAGE when a grounded knowledge concept
+        contributes to a social-path decision to publish.
+
+        `bus` accepts the same two shapes as `_maybe_fire_knowledge_req`
+        (object with `.publish()` OR callable taking a msg dict). Failure
+        is silent — observability emission must never break a post path.
+        """
+        if bus is None or not topic:
+            return
+        try:
+            from titan_plugin.bus import make_msg
+            msg = make_msg(
+                "CGN_KNOWLEDGE_USAGE", "social_x_gateway", "knowledge", {
+                    "topic": topic,
+                    "reward": float(reward),
+                    "consumer": consumer,
+                })
+            if hasattr(bus, "publish"):
+                bus.publish(msg)
+            elif callable(bus):
+                bus(msg)
+            else:
+                return
+            logger.debug(
+                "[SocialXGateway] CGN_KNOWLEDGE_USAGE topic=%r reward=%.2f",
+                topic[:40], reward)
+        except Exception as e:
+            logger.debug(
+                "[SocialXGateway] knowledge_usage emit failed: %s", e)
+
+    def _maybe_fire_knowledge_req(self, topics: list[str],
+                                   voice_cfg: dict, bus) -> None:
+        """Fire a CGN_KNOWLEDGE_REQ for the first topic past its cooldown.
+
+        Per-topic cooldown prevents a hot suppressed topic from hammering
+        the research queue. Only one request per gate decision — we want
+        signal, not noise.
+
+        `bus` may be either an object with `.publish(msg_dict)` (the
+        DivineBus shape) OR a callable that accepts a single msg dict
+        (convenient for workers that talk to the bus via an IPC queue —
+        they can pass a lambda around their `_send_msg` helper).
+        """
+        if bus is None or not topics:
+            return
+        cooldown = float(voice_cfg.get("x_grounding_cooldown_secs", 3600))
+        now = time.time()
+        for topic in topics:
+            last = self._grounding_cooldown.get(topic, 0.0)
+            if now - last < cooldown:
+                continue
+            self._grounding_cooldown[topic] = now
+            try:
+                from titan_plugin.bus import make_msg
+                msg = make_msg(
+                    "CGN_KNOWLEDGE_REQ", "social_x_gateway", "knowledge", {
+                        "topic": topic,
+                        "requestor": "x_grounding_gate",
+                        "urgency": 0.4,  # slightly > chat (0.3) — public stakes
+                        "neuromods": {},
+                    })
+                if hasattr(bus, "publish"):
+                    bus.publish(msg)
+                elif callable(bus):
+                    bus(msg)
+                else:
+                    logger.debug("[SocialXGateway] bus arg not publishable "
+                                 "(type=%s)", type(bus).__name__)
+                    return
+                logger.info("[SocialXGateway] Fired CGN_KNOWLEDGE_REQ for "
+                            "ungrounded X-topic: %r", topic)
+            except Exception as e:
+                logger.debug("[SocialXGateway] CGN_KNOWLEDGE_REQ "
+                             "emit failed: %s", e)
+            return  # one per decision — don't spam
+
+    def _check_emotional_appropriateness(self, context: PostContext,
+                                          emot_cgn) -> Optional[dict]:
+        """rFP_emot_cgn_v2 §4.4: gated emotional-context check before posting.
+
+        Pre-graduation (emot_cgn.is_active() == False): returns None, no
+        observational overhead. Post-graduation: records dominant emotion in
+        telemetry so we can analyze post success vs emotional state.
+
+        NEVER vetoes posts in v1 — this is pure observability. If future
+        analysis shows certain emotional states correlate with worse
+        reception, the veto policy can be added as a separate rFP.
+        """
+        # Plug C (rFP §20): prefer rich v3 bundle context when available.
+        # Bundle gives valence/arousal/novelty/region_id directly —
+        # richer than legacy dominant_idx. Falls back to legacy
+        # ShmEmotReader if bundle unavailable, then to in-process ref.
+        try:
+            from titan_plugin.logic.emot_bundle_protocol import (
+                read_full_emotion_context)
+            _ctx = read_full_emotion_context()
+            if _ctx is not None:
+                self._log_telemetry({
+                    "event": "post_emotion_ctx",
+                    # v3 fields — primary:
+                    "region_id": _ctx["region_id"],
+                    "region_confidence": round(_ctx["region_confidence"], 3),
+                    "valence": round(_ctx["valence"], 3),
+                    "arousal": round(_ctx["arousal"], 3),
+                    "novelty": round(_ctx["novelty"], 3),
+                    "regions_emerged": _ctx["regions_emerged"],
+                    # Back-compat: legacy label keeps Observatory's
+                    # "current emotion" display meaningful during v3
+                    # transition (until Titan names his own regions).
+                    "dominant": _ctx["legacy_label"],
+                    "source": "bundle",
+                    "encoder_id": _ctx["encoder_id"],
+                    "titan_id": context.titan_id,
+                })
+                return None
+        except Exception:
+            pass
+        # Phase 1.6f.1: legacy ShmEmotReader fallback (worker-backed).
+        try:
+            from titan_plugin.logic.emot_shm_protocol import ShmEmotReader
+            from titan_plugin.logic.emotion_cluster import EMOT_PRIMITIVES
+            _reader = ShmEmotReader()
+            _state = _reader.read_state()
+            if _state is not None and _state.get("is_active"):
+                self._log_telemetry({
+                    "event": "post_emotion_ctx",
+                    "dominant": EMOT_PRIMITIVES[_state["dominant_idx"]],
+                    "V_blended": round(_state.get("V_blended", 0.5), 3),
+                    "cluster_confidence": round(
+                        _state.get("cluster_confidence", 0.0), 3),
+                    "source": "shm",
+                    "titan_id": context.titan_id,
+                })
+                return None
+        except Exception:
+            pass
+        # Fallback: in-process emot_cgn
+        if emot_cgn is None or not emot_cgn.is_active():
+            return None
+        try:
+            state = emot_cgn.get_current_emotion_state()
+            self._log_telemetry({
+                "event": "post_emotion_ctx",
+                "dominant": state.get("dominant", ""),
+                "intensity": round(state.get("intensity", 0.0), 3),
+                "confidence": round(state.get("confidence", 0.0), 3),
+                "source": "in_process",
+                "titan_id": context.titan_id,
+            })
+        except Exception:
+            pass
+        return None  # never blocks in v1
+
+    def post(self, context: PostContext, consumer: str = "",
+             emot_cgn=None, bus=None,
+             force_ungrounded: bool = False) -> ActionResult:
         """Create a tweet. The ONLY way to post to X from this codebase.
 
         Args:
             context: PostContext with all state + credentials.
             consumer: Identifier of the calling module (e.g. "spirit_worker").
                       Must be registered in [social_x.consumers] config.
+            emot_cgn: Optional EmotCGNConsumer for emotional context telemetry.
+                      Gated — no-op pre-graduation. See rFP_emot_cgn_v2 §4.4.
+            bus: Optional plugin bus for firing CGN_KNOWLEDGE_REQ when a
+                 post is suppressed by the grounding gate. See
+                 rFP_phase5_narrator_evolution §9.3.
+            force_ungrounded: Maker override — skip the grounding gate
+                 entirely. Used by /maker/x-force-post to seed deliberate
+                 exploration of new topics.
         """
         config = self._load_config()
 
         # 1. Enabled check
         if not config.get("enabled"):
             return ActionResult(status="disabled")
+
+        # 1.5 EMOT-CGN emotional appropriateness check (gated, observability-only in v1)
+        self._check_emotional_appropriateness(context, emot_cgn)
 
         # 1a. Boot grace — prevent post-restart cascades (auto-posts only)
         _grace = self._boot_grace_remaining()
@@ -1844,8 +2124,25 @@ class SocialXGateway:
         catalyst = max(context.catalysts, key=lambda c: c.get("significance", 0))
         post_type = self._select_post_type(catalyst, context)
 
-        # 6. Generate text via LLM
-        raw_text = self._generate_text(post_type, catalyst, context)
+        # 5b. Grounding gate (rFP_phase5_narrator_evolution §9.3) —
+        #     prevent public speculation on topics Titan doesn't actually
+        #     know. Observability-only until [voice].x_grounding_enforced
+        #     flips true. Maker force-post bypasses entirely.
+        voice_cfg = config.get("voice", {})
+        if not force_ungrounded:
+            grounding = self._check_grounding_appropriateness(
+                context, catalyst, voice_cfg, bus)
+            if grounding and grounding.get("suppress"):
+                return ActionResult(
+                    status="suppressed_ungrounded",
+                    reason="topics={} confidence={:.2f} < threshold={:.2f}".format(
+                        grounding["topics"],
+                        grounding["confidence"],
+                        voice_cfg.get("x_grounding_threshold", 0.5)))
+
+        # 6. Generate text via LLM (pass voice_cfg for optional public nudge)
+        raw_text = self._generate_text(post_type, catalyst, context,
+                                       voice_cfg=voice_cfg)
         if not raw_text:
             self._log_telemetry({
                 "event": "post_generation_failed", "titan_id": context.titan_id,

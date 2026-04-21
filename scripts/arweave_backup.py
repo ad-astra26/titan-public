@@ -63,9 +63,15 @@ async def run_backup(titan_id: str, dry_run: bool = False):
         logger.info("DRY RUN — skipping upload")
         return True
 
-    # Upload
-    logger.info("Uploading to Arweave via Irys...")
-    tx_id = await backup.snapshot_to_arweave()
+    # Upload through rFP §5.3 10-step failsafe cascade
+    # (validate + local-always + balance check + verify + cleanup)
+    logger.info("Uploading to Arweave via Irys (cascade applied)...")
+    try:
+        from titan_plugin.config_loader import load_titan_config
+        _full_cfg = load_titan_config()
+    except Exception:
+        _full_cfg = {}
+    tx_id = await backup.snapshot_to_arweave(full_config=_full_cfg)
 
     if tx_id:
         logger.info("SUCCESS — Arweave TX: %s", tx_id)

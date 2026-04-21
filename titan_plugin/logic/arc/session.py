@@ -16,6 +16,7 @@ All operations are synchronous (SDK is blocking).
 NS programs are loaded READ-ONLY — never modified during ARC play.
 """
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -417,6 +418,8 @@ class ArcSession:
         self._goal_detector = None
         self.goal_distance_reward_k = 0.0           # coefficient for G1 similarity reward
         self.character_target_reward_k = 0.0        # coefficient for G2 ls20 manhattan reward
+        self.character_target_normalize_by_grid = True   # iter-2 default; set False for iter-3
+        self.arc_iter_3_enabled = False             # feature flag — True activates iter-3 reward rebalance
         self.episode_diagnostics_enabled = False    # T1 diagnostic JSONL dump
         try:
             from titan_plugin.logic.arc.goal_detector import GoalDetector
@@ -445,12 +448,21 @@ class ArcSession:
                 self.episode_diagnostics_enabled = bool(_rs_cfg.get("episode_diagnostics_enabled", False))
                 self.novelty_reward_cap_per_step = float(_rs_cfg.get(
                     "novelty_reward_cap_per_step", self.novelty_reward_cap_per_step))
+                # iter-3 (2026-04-20): master gate + per-cell-reward toggle
+                self.arc_iter_3_enabled = bool(_rs_cfg.get("arc_iter_3_enabled", False))
+                # Default True (iter-2 behavior); TOML override wins. If iter-3 is the gate,
+                # a False value flips the math to unnormalized per-cell progress reward.
+                self.character_target_normalize_by_grid = bool(_rs_cfg.get(
+                    "character_target_normalize_by_grid", True))
                 if self.goal_distance_reward_k > 0 or self.character_target_reward_k > 0:
                     logger.info(
                         "[ArcSession] Reward shaping loaded: goal_k=%.2f char_target_k=%.2f "
-                        "novelty_cap=%.3f diag=%s",
+                        "novelty_cap=%.3f normalize=%s iter_3=%s diag=%s",
                         self.goal_distance_reward_k, self.character_target_reward_k,
-                        self.novelty_reward_cap_per_step, self.episode_diagnostics_enabled,
+                        self.novelty_reward_cap_per_step,
+                        self.character_target_normalize_by_grid,
+                        self.arc_iter_3_enabled,
+                        self.episode_diagnostics_enabled,
                     )
         except Exception as _rs_err:
             logger.debug("[ArcSession] reward_shaping config load skipped: %s", _rs_err)
@@ -700,8 +712,32 @@ class ArcSession:
                     and steps_since_level_change < self.stuck_threshold):
                 _impasse = self._cgn.detect_impasse("reasoning")
                 if _impasse:
+                    _imp_type = _impasse.get("type", "?")
                     logger.info("[ArcSession] SOAR impasse: %s — HAOV will guide next action",
-                                _impasse.get("type", "?"))
+                                _imp_type)
+                    # rFP Step D (2026-04-20): on CGN reasoning impasse, emit
+                    # CGN_KNOWLEDGE_REQ so knowledge_worker scrapes relevant
+                    # concepts. Best-effort; 3s timeout; cooldown 300s per session
+                    # so we don't hammer the endpoint every step during an
+                    # extended impasse.
+                    _now_ts = time.time()
+                    if (_now_ts - getattr(self, "_last_impasse_kreq_ts", 0)) > 300:
+                        try:
+                            import requests as _rq
+                            _topic = f"ARC {game_id} puzzle strategy: {_imp_type}"
+                            _rq.post(
+                                "http://127.0.0.1:7777/v4/knowledge-request",
+                                json={"topic": _topic, "urgency": 0.6},
+                                timeout=3.0,
+                            )
+                            self._last_impasse_kreq_ts = _now_ts
+                            logger.info(
+                                "[ArcSession] Impasse→knowledge request emitted: %s",
+                                _topic)
+                        except Exception as _kr_err:
+                            logger.debug(
+                                "[ArcSession] knowledge-request emit failed: %s",
+                                _kr_err)
                     # Don't reset — let HAOV hypothesis testing guide next steps
 
             # IMPROVEMENT #3: Strategic Reset — when stuck, restart with knowledge
@@ -1078,6 +1114,7 @@ class ArcSession:
                                         curr_grid=_next_grid,
                                         character_color=_char_color,
                                         target=_target,
+                                        normalize_by_grid=self.character_target_normalize_by_grid,
                                     )
                                     _g2_term = self.character_target_reward_k * _ct_delta
                                     reward_shaped += _g2_term
@@ -1201,10 +1238,15 @@ class ArcSession:
         # so we can iterate on reward design from real data (I8 rotation: one file per day).
         if self._goal_detector is not None and frame is not None and frame.grid is not None:
             try:
+                # rFP Step C (2026-04-20): when ArcSession records a local WIN, pass
+                # our titan_id so GoalDetector broadcasts the fresh goal to kin.
+                # On non-WIN outcomes on_episode_end is a no-op anyway.
+                _kin_src = os.environ.get("TITAN_KIN_SOURCE") or None
                 self._goal_detector.on_episode_end(
                     game_id=game_id,
                     final_state=frame.state,
                     final_grid=np.asarray(frame.grid, dtype=np.int8),
+                    source_titan_id=_kin_src,
                 )
             except Exception as _gd_err:
                 logger.warning("[ArcSession] GoalDetector.on_episode_end failed: %s", _gd_err)

@@ -2340,9 +2340,15 @@ class ReasoningEngine:
 
         Only called if _rr_step_snapshots is non-empty.
         Uses _total_chains as chain_id (lifetime counter, monotonic).
+
+        Writes through IMW client when persistence.enabled=true; falls through
+        to direct safe_connect() otherwise (behavior unchanged).
         """
         if not self._rr_step_snapshots:
             return
+        # Ensure schema (idempotent — opens direct conn, closes immediately)
+        with self._rr_step_db_conn() as _conn:
+            pass  # DDL happens inside _rr_step_db_conn
         now = time.time()
         chain_id = self._total_chains  # lifetime counter, unique per chain
         rows = []
@@ -2361,16 +2367,18 @@ class ReasoningEngine:
                 float(snap.get("intermediate_reward", 0.0)),
             ))
         try:
-            with self._rr_step_db_conn() as conn:
-                conn.executemany("""
-                    INSERT INTO action_chains_step (
-                        chain_id, step_idx, created_at, terminal_reward,
-                        outcome_action, confidence, gut_agreement,
-                        chain_prefix, last_primitive, policy_input_json,
-                        intermediate_reward
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, rows)
-                conn.commit()
+            from titan_plugin.persistence import get_client
+            client = get_client(caller_name="reasoning_step_persist")
+            res = client.write_many(
+                "INSERT INTO action_chains_step (chain_id, step_idx, created_at, "
+                "terminal_reward, outcome_action, confidence, gut_agreement, "
+                "chain_prefix, last_primitive, policy_input_json, intermediate_reward) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+                table="action_chains_step",
+            )
+            if not res.ok:
+                raise RuntimeError(f"step_snapshot insert: {res.error}")
         except Exception as e:
             raise RuntimeError(f"step_snapshot insert: {e}") from e
 
@@ -2381,12 +2389,16 @@ class ReasoningEngine:
         """
         cutoff = time.time() - (retention_days * 86400)
         try:
-            with self._rr_step_db_conn() as conn:
-                cur = conn.execute(
-                    "DELETE FROM action_chains_step WHERE created_at < ?",
-                    (cutoff,))
-                deleted = cur.rowcount
-                conn.commit()
+            from titan_plugin.persistence import get_client
+            client = get_client(caller_name="reasoning_step_trim")
+            res = client.write(
+                "DELETE FROM action_chains_step WHERE created_at < ?",
+                (cutoff,),
+                table="action_chains_step",
+            )
+            if not res.ok:
+                return 0
+            deleted = res.rowcount or 0
             if deleted > 0:
                 logger.info("[Reasoning/StepPersist] trimmed %d rows older than %dd",
                             deleted, retention_days)

@@ -417,14 +417,17 @@ def create_pre_hook(plugin):
         social_context = ""
         engagement_level = "minimal"
 
-        # Legacy social graph update (keep for compatibility)
+        # Legacy social graph update (keep for compatibility).
+        # rFP_social_graph_async_safety §5.2: migrated to async companions so
+        # titan_pre_hook (on /chat hot path) stops blocking the event loop on
+        # three sync sqlite3.connect calls.
         social_graph = getattr(plugin, 'social_graph', None)
         if social_graph and user_id != "anonymous":
             try:
-                profile = social_graph.get_or_create_user(user_id)
-                engagement_level = social_graph.should_engage(user_id)
+                profile = await social_graph.get_or_create_user_async(user_id)
+                engagement_level = await social_graph.should_engage_async(user_id)
                 profile.last_seen = __import__('time').time()
-                social_graph._save_profile(profile)
+                await social_graph._save_profile_async(profile)
             except Exception:
                 pass
 
@@ -468,7 +471,7 @@ def create_pre_hook(plugin):
         # Fallback: basic engagement context if resolver didn't produce anything
         if not social_context and social_graph and user_id != "anonymous":
             try:
-                profile = social_graph.get_or_create_user(user_id)
+                profile = await social_graph.get_or_create_user_async(user_id)
                 parts = [f"### User Recognition\nUser: {profile.display_name or user_id} | Engagement: {engagement_level}"]
                 if profile.interaction_count > 0:
                     parts.append(f"Interactions: {profile.interaction_count}")
@@ -512,6 +515,38 @@ def create_pre_hook(plugin):
                             _vcb_context.total_records,
                             _vcb_context.chained_count,
                             _vcb_context.total_ms)
+                # BUG-KNOWLEDGE-USAGE-ZERO coverage widening (2026-04-21):
+                # emit CGN_KNOWLEDGE_USAGE for every knowledge_concepts
+                # record VCB surfaces into the chat context. VCB records
+                # carry db_ref of the form "knowledge_concepts:<topic>"
+                # so we can attribute directly. Reward=0.1 per record (retrieval-
+                # level contribution — less than gate pass, more than raw
+                # lookup-without-use). Emission is best-effort and must
+                # never break the chat path.
+                try:
+                    _vcb_bus = getattr(plugin, 'bus', None)
+                    if _vcb_bus and _vcb_context.records:
+                        from titan_plugin.bus import make_msg as _vcb_make_msg
+                        _seen = set()
+                        for _r in _vcb_context.records:
+                            _ref = getattr(_r, 'db_ref', '') or ''
+                            if not _ref.startswith('knowledge_concepts:'):
+                                continue
+                            _topic = _ref.split(':', 1)[1].strip()
+                            if not _topic or _topic in _seen:
+                                continue
+                            _seen.add(_topic)
+                            _vcb_bus.publish(_vcb_make_msg(
+                                "CGN_KNOWLEDGE_USAGE", "pre_hook", "knowledge",
+                                {
+                                    "topic": _topic,
+                                    "reward": 0.1,
+                                    "consumer": "chat",
+                                }))
+                except Exception as _vcb_usage_err:
+                    logger.debug(
+                        "[PreHook] VCB knowledge_usage emit: %s",
+                        _vcb_usage_err)
                 # Build compatible relevant_memories list for recall perturbation
                 relevant_memories = [
                     {"user_prompt": r.content[:100], "agent_response": "",
@@ -970,6 +1005,10 @@ def create_pre_hook(plugin):
             # Three sqlite reads consolidated into one to_thread hop so the
             # /chat pre_hook stays off the event loop.
             experience_narrative_context = ""
+            # BUG-KNOWLEDGE-USAGE-ZERO coverage widening — collected inside the
+            # thread and flushed after the await so emission happens in the
+            # event-loop context (where plugin.bus.publish() is safe).
+            _en_knowledge_topics: list[str] = []
             try:
                 import sqlite3 as _sql_en
                 import asyncio as _en_asyncio
@@ -1024,6 +1063,22 @@ def create_pre_hook(plugin):
                             parts = [f'"{r["topic"]}" (conf {r["confidence"]:.2f}, via {r["source"]})'
                                      for r in kn_rows]
                             en_lines.append(f"Recently acquired knowledge: {', '.join(parts)}.")
+                            # BUG-KNOWLEDGE-USAGE-ZERO coverage widening:
+                            # experience narrative adds these knowledge
+                            # concepts to the chat prompt — emit
+                            # CGN_KNOWLEDGE_USAGE so the routing learner
+                            # counts the retrieval. Reward=0.1 per concept
+                            # (retrieval-level, matches VCB weighting).
+                            # _read_experience_sources runs in a thread so
+                            # we can't publish directly — stash the topics
+                            # and emit in the caller's event-loop context
+                            # below.
+                            try:
+                                _en_knowledge_topics.extend(
+                                    str(r["topic"]) for r in kn_rows
+                                    if r["topic"])
+                            except Exception:
+                                pass
                     except Exception:
                         pass
 
@@ -1052,6 +1107,31 @@ def create_pre_hook(plugin):
                         "### My Recent Experience (what happened to me)\n"
                         + "\n".join(_en_lines) + "\n\n"
                     )
+                # BUG-KNOWLEDGE-USAGE-ZERO coverage widening — emit one
+                # CGN_KNOWLEDGE_USAGE per knowledge_concepts row the
+                # experience narrative surfaced into the prompt. Guarded
+                # try/except: emission never blocks chat.
+                if _en_knowledge_topics:
+                    try:
+                        _en_bus = getattr(plugin, 'bus', None)
+                        if _en_bus:
+                            from titan_plugin.bus import make_msg as _en_make_msg
+                            _en_seen = set()
+                            for _t in _en_knowledge_topics:
+                                if not _t or _t in _en_seen:
+                                    continue
+                                _en_seen.add(_t)
+                                _en_bus.publish(_en_make_msg(
+                                    "CGN_KNOWLEDGE_USAGE", "pre_hook",
+                                    "knowledge", {
+                                        "topic": _t,
+                                        "reward": 0.1,
+                                        "consumer": "chat_experience",
+                                    }))
+                    except Exception as _en_usage_err:
+                        logger.debug(
+                            "[pre_hook] experience knowledge_usage emit: %s",
+                            _en_usage_err)
             except Exception as _en_err:
                 logger.debug("[pre_hook] experience narrative skipped: %s", _en_err)
 
@@ -1070,42 +1150,26 @@ def create_pre_hook(plugin):
             except Exception:
                 pass
 
-            # [24] Knowledge gap enforcement — detect topics Titan doesn't know
+            # [24] Knowledge gap enforcement — detect topics Titan doesn't know.
+            # Uses shared knowledge_gate utility (rFP_phase5_narrator_evolution
+            # §9.3) so the X-post grounding gate can reuse identical topic
+            # extraction + confidence lookup semantics.
             knowledge_gap_context = ""
             try:
-                import sqlite3 as _kg_sql
                 import asyncio as _kg_asyncio
-                _kg_stops = {"i", "a", "the", "is", "are", "was", "were", "do", "does",
-                             "what", "how", "why", "when", "where", "who", "which",
-                             "can", "could", "would", "should", "will", "to", "of",
-                             "in", "on", "at", "for", "with", "and", "or", "but",
-                             "not", "this", "that", "it", "my", "your", "me", "you",
-                             "be", "have", "has", "had", "been", "being", "am",
-                             "tell", "about", "please", "hi", "hello", "hey", "thanks"}
-                _kg_words = [w for w in prompt_text.lower().split()[:15]
-                             if w.isalpha() and len(w) > 2 and w not in _kg_stops][:5]
+                from titan_plugin.logic.knowledge_gate import (
+                    extract_topic_words, check_topic_confidence_with_match)
+                # First 15 words of prompt is the window (same as prior behavior)
+                _kg_window = " ".join(prompt_text.split()[:15])
+                _kg_words = extract_topic_words(_kg_window, max_words=5)
 
                 if len(_kg_words) >= 2:
                     _kg_topic = " ".join(_kg_words[:3])
-
-                    def _scan_knowledge_gap():
-                        from titan_plugin.utils.db import safe_connect as _sc4
-                        db = _sc4("data/inner_memory.db")
-                        db.row_factory = _kg_sql.Row
-                        try:
-                            best = 0.0
-                            for kw in _kg_words[:3]:
-                                kr = db.execute(
-                                    "SELECT MAX(confidence) as mc FROM knowledge_concepts "
-                                    "WHERE topic LIKE ?", (f"%{kw}%",)
-                                ).fetchone()
-                                if kr and kr["mc"]:
-                                    best = max(best, kr["mc"])
-                            return best
-                        finally:
-                            db.close()
-
-                    _kg_best_conf = await _kg_asyncio.to_thread(_scan_knowledge_gap)
+                    # Use the _with_match variant so we know WHICH concept
+                    # provided the confidence → emit CGN_KNOWLEDGE_USAGE
+                    # against it when the gate passes.
+                    _kg_best_conf, _kg_matched = await _kg_asyncio.to_thread(
+                        check_topic_confidence_with_match, _kg_words[:3])
 
                     if _kg_best_conf < 0.3:
                         knowledge_gap_context = (
@@ -1123,6 +1187,22 @@ def create_pre_hook(plugin):
                                     "requestor": "knowledge_enforcement",
                                     "urgency": 0.3,
                                     "neuromods": {},
+                                }))
+                    elif _kg_matched:
+                        # Grounded path: concept contributed to letting the
+                        # chat proceed without a gap warning. Emit
+                        # CGN_KNOWLEDGE_USAGE so the routing learner
+                        # credits its backend. Reward=0.2 (mid — less than
+                        # a social post but more than a raw lookup).
+                        _kg_bus = getattr(plugin, 'bus', None)
+                        if _kg_bus:
+                            from titan_plugin.bus import make_msg
+                            _kg_bus.publish(make_msg(
+                                "CGN_KNOWLEDGE_USAGE", "pre_hook", "knowledge",
+                                {
+                                    "topic": _kg_matched,
+                                    "reward": 0.2,
+                                    "consumer": "chat",
                                 }))
             except Exception as _kg_err:
                 logger.debug("[pre_hook] knowledge gap check skipped: %s", _kg_err)
@@ -1494,7 +1574,10 @@ def create_post_hook(plugin):
                 elif plugin._last_execution_mode == "STATE_NEED_RESEARCH":
                     quality += 0.05  # research triggered = interesting question
                 quality = min(1.0, quality)
-                social_graph.record_interaction(user_id, quality=quality)
+                # rFP_social_graph_async_safety §5.2: async companion to stop
+                # sync sqlite3.connect from blocking the FastAPI event loop on
+                # the post-hook return path of /chat.
+                await social_graph.record_interaction_async(user_id, quality=quality)
                 logger.debug("[PostHook] Social interaction recorded: user=%s quality=%.2f", user_id, quality)
 
                 # Update Events Teacher user valence from chat interaction.
@@ -1697,10 +1780,20 @@ def create_post_hook(plugin):
                 # Run valence modifier
                 valence_result = vm.execute(get_program("valence_boost"), context=vm_context)
 
-                total_reward = max(0.0, min(1.0, score_result.score + valence_result.score))
+                # v2 (rFP_titan_vm_v2 Phase 1b): reward_blend_weight now lives —
+                # weights the valence modifier contribution to total_reward.
+                # Default 1.0 preserves prior (score + valence) sum behavior.
+                blend_w = vm.get_reward_blend_weight()
+                total_reward = max(0.0, min(1.0,
+                    score_result.score + blend_w * valence_result.score))
+
+                # v2 (Phase 1b): min_reward_threshold gates bus publish — skip
+                # noise emissions when total_reward is near-zero, reducing bus
+                # traffic without losing meaningful reflex signals.
+                publish_gate = vm.get_min_reward_threshold()
 
                 # Feed reward to FilterDown via bus (Spirit worker picks it up)
-                if bus and total_reward > 0:
+                if bus and total_reward > publish_gate:
                     from titan_plugin.bus import make_msg, REFLEX_REWARD
                     reward_msg = make_msg(REFLEX_REWARD, "titan_vm", "spirit", {
                         "reward": total_reward,

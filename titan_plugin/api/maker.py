@@ -137,6 +137,57 @@ async def inject_memory(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# POST /maker/x-force-post — Force an X post even on ungrounded topics
+# ---------------------------------------------------------------------------
+@router.post("/x-force-post")
+async def x_force_post(request: Request):
+    """Maker override for the grounded-only X gate
+    (rFP_phase5_narrator_evolution §9.3 + §9.5 Q4).
+
+    Queues a high-significance catalyst into spirit_worker's X-post flow
+    with the `force_ungrounded` flag set — bypasses the grounding gate so
+    Maker can deliberately seed exploration of new topics Titan hasn't
+    learned yet. The normal rate-limit + quality-gate checks still apply.
+
+    Body JSON:
+      - topic (required): subject of the post, e.g. "aurora borealis"
+      - text_hint (optional): seed content. If empty, Titan composes freely.
+      - catalyst_type (optional, default "maker_force"): catalyst label for
+        telemetry / post_type selection.
+    """
+    plugin = _get_plugin(request)
+    body = await request.json()
+
+    topic = str(body.get("topic", "")).strip()
+    text_hint = str(body.get("text_hint", "")).strip()
+    catalyst_type = str(body.get("catalyst_type", "maker_force")).strip() \
+                    or "maker_force"
+
+    if not topic:
+        return {"status": "error", "detail": "topic is required."}
+
+    bus = getattr(plugin, "bus", None)
+    if bus is None:
+        return {"status": "error", "detail": "plugin bus unavailable"}
+
+    try:
+        from titan_plugin.bus import make_msg
+        bus.publish(make_msg(
+            "X_FORCE_POST", "maker_api", "spirit", {
+                "topic": topic,
+                "text_hint": text_hint,
+                "catalyst_type": catalyst_type,
+            }))
+        logger.info("[Maker] X_FORCE_POST queued: topic=%r type=%s "
+                    "text_hint=%d chars", topic, catalyst_type, len(text_hint))
+        return _ok({"queued": True, "topic": topic,
+                    "catalyst_type": catalyst_type})
+    except Exception as e:
+        logger.error("[Maker] X force-post queue failed: %s", e)
+        return {"status": "error", "detail": str(e)}
+
+
+# ---------------------------------------------------------------------------
 # POST /maker/resurrect — Trigger Resurrection from Limbo State
 # ---------------------------------------------------------------------------
 @router.post("/resurrect")

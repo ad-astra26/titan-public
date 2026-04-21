@@ -104,17 +104,25 @@ class GoalDetector:
 
     def on_episode_end(
         self, game_id: str, final_state: str, final_grid: np.ndarray,
+        source_titan_id: Optional[str] = None,
     ) -> None:
-        """Called by ArcSession at episode end. Captures goal on WIN only."""
+        """Called by ArcSession at episode end. Captures goal on WIN only.
+
+        If `source_titan_id` is provided (meaning: this Titan just won), the
+        new goal is also broadcast to kin Titans via HTTP (rFP Step C). If
+        None (e.g. called from kin-ingest path), skip broadcast to avoid
+        ping-pong loops.
+        """
         if final_state != "WIN":
             return
         if final_grid is None or final_grid.size == 0:
             return
         grid = np.asarray(final_grid, dtype=np.int8)
+        captured_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         # Always update on new win — the latest win state is the "freshest" goal
         self._goals[game_id] = grid.copy()
         self._meta[game_id] = {
-            "captured_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "captured_at_utc": captured_at,
             "shape": tuple(grid.shape),
         }
         self._save()
@@ -122,6 +130,43 @@ class GoalDetector:
             "[GoalDetector] Captured goal for %s (shape=%s, %d non-zero cells)",
             game_id, grid.shape, int((grid != 0).sum()),
         )
+        # rFP Step C: broadcast to kin. Best-effort; failure never blocks local path.
+        if source_titan_id:
+            try:
+                from titan_plugin.logic.arc.kin_broadcast import broadcast_goal
+                broadcast_goal(
+                    game_id=game_id, grid=grid,
+                    source_titan_id=source_titan_id,
+                    captured_at_utc=captured_at,
+                )
+            except Exception as e:
+                logger.debug("[GoalDetector] Kin broadcast skipped: %s", e)
+
+    def ingest_kin_goal(
+        self, game_id: str, grid: np.ndarray, source_titan_id: str,
+        captured_at_utc: Optional[str] = None,
+    ) -> bool:
+        """Receive goal broadcast from kin Titan. Writes locally without
+        triggering another broadcast (ping-pong guard). Returns True if
+        ingested, False if rejected (e.g. self-broadcast)."""
+        if grid is None or grid.size == 0:
+            return False
+        grid_arr = np.asarray(grid, dtype=np.int8)
+        self._goals[game_id] = grid_arr.copy()
+        self._meta[game_id] = {
+            "captured_at_utc": captured_at_utc or time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "shape": tuple(grid_arr.shape),
+            "source_titan": source_titan_id,
+        }
+        self._save()
+        logger.info(
+            "[GoalDetector] Kin-ingested goal for %s from %s "
+            "(shape=%s, %d non-zero cells)",
+            game_id, source_titan_id, grid_arr.shape,
+            int((grid_arr != 0).sum()),
+        )
+        return True
 
     # ── Similarity + goal-distance reward ─────────────────────────────
 
@@ -203,11 +248,18 @@ class GoalDetector:
     def character_target_reward(
         prev_grid: np.ndarray, curr_grid: np.ndarray,
         character_color: int, target: tuple[int, int],
+        normalize_by_grid: bool = False,
     ) -> float:
         """Manhattan-distance reward for ls20-style navigation.
 
         Returns: prev_distance - new_distance (positive = character moved toward target).
         If character color not found in either grid, returns 0 (signal absent).
+
+        `normalize_by_grid` (iter-3, 2026-04-20, default False): dividing by
+        (width+height) shrank the signal to ~0.017/step on 30×30 grids, which
+        novelty reward (~0.15-0.41/step) dominated ~40×. Unnormalized returns
+        ~1.0/step per cell of progress — cleanly larger than iter-3 novelty
+        cap (0.05). Pass True to restore iter-2 normalization for A/B testing.
         """
         prev = np.asarray(prev_grid, dtype=np.int8)
         curr = np.asarray(curr_grid, dtype=np.int8)
@@ -227,6 +279,8 @@ class GoalDetector:
         ty, tx = target
         prev_dist = abs(prev_pos[0] - ty) + abs(prev_pos[1] - tx)
         new_dist = abs(new_pos[0] - ty) + abs(new_pos[1] - tx)
-        # Normalize by grid dimension so reward magnitude is grid-size-independent
-        norm = float(prev.shape[0] + prev.shape[1])
-        return (prev_dist - new_dist) / max(norm, 1.0)
+        delta = float(prev_dist - new_dist)
+        if normalize_by_grid:
+            norm = float(prev.shape[0] + prev.shape[1])
+            return delta / max(norm, 1.0)
+        return delta

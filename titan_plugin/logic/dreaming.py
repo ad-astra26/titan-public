@@ -500,13 +500,31 @@ class DreamingEngine:
             self._onset_drain, self._onset_undistilled,
             inner_state.fatigue)
 
-    def end_dreaming(self, inner_state) -> dict:
-        """Transition back to awake state. Returns dreaming summary."""
+    def end_dreaming(self, inner_state, emot_cgn=None) -> dict:
+        """Transition back to awake state. Returns dreaming summary.
+
+        rFP_emot_cgn_v2 §7.3: if emot_cgn is provided, opportunistically
+        seed emergent cluster slots from dream clusters (gated — active or
+        shadow, both OK since seeding is observability-compatible) +
+        trigger periodic recentering.
+        """
         if not inner_state:
             return {}
 
         buffer = inner_state.drain_experience_buffer()
         distilled = self._distill_experiences(buffer)
+
+        # EMOT-CGN dream-cluster integration (gated — see rFP §7.3)
+        if emot_cgn is not None:
+            try:
+                # Always-safe: seeds emergent slots if they haven't been
+                # populated (idempotent). Also triggers weekly recenter.
+                clusterer = getattr(emot_cgn, "_clusterer", None)
+                if clusterer is not None and distilled:
+                    clusterer.seed_from_dream_clusters(distilled)
+                    clusterer.maybe_recenter(force=False)
+            except Exception as _e:
+                logger.debug("[Dreaming] EMOT-CGN hook error: %s", _e)
 
         inner_state.is_dreaming = False
         inner_state.fatigue = 0.0

@@ -44,6 +44,17 @@ MAX_RESTARTS_IN_WINDOW = 5      # max restarts allowed in the sliding window
 RESTART_WINDOW_SECONDS = 600.0  # 10-minute sliding window for restart tracking
 SUSTAINED_UPTIME_RESET = 300.0  # 5 minutes of uptime before restart count resets
 REENABLE_COOLDOWN_S = 600.0    # 10 minutes before auto-re-enabling a disabled module
+# CPU-aware heartbeat (added 2026-04-21) — when heartbeat times out, sample
+# /proc/<pid>/stat CPU time. If CPU grew ≥ MIN_CPU_DELTA_FOR_ALIVE since last
+# sample, the module is alive-but-CPU-starved (not deadlocked). Defer restart
+# for up to MAX_STARVED_CYCLES wallclock heartbeat windows; then force-restart
+# (bounded grace prevents runaway hang on a truly stuck module).
+MIN_CPU_DELTA_FOR_ALIVE = 1.0   # seconds of CPU time per heartbeat window proves liveness
+MAX_STARVED_CYCLES = 5          # how many consecutive starved-but-alive cycles to tolerate
+# Bumped 3 → 5 on 2026-04-21 after observing both T2+T3 media modules hit
+# grace-exhausted-restart once each during the same 75-min ARC iter-3 slot.
+# 5 cycles ≈ 5 minutes wallclock grace under monitor_tick=5s — should bridge
+# typical ARC tail without leaving truly-stuck modules hanging too long.
 
 
 class ModuleState(Enum):
@@ -86,6 +97,12 @@ class ModuleInfo:
     restart_timestamps: deque = field(default_factory=lambda: deque(maxlen=MAX_RESTARTS_IN_WINDOW + 1))
     ready_time: float = 0.0  # when MODULE_READY was received
     disabled_at: float = 0.0  # when module was disabled (for auto-re-enable cooldown)
+    # CPU-aware heartbeat (added 2026-04-21 after iter-3 ARC load triggered
+    # cascading media-module restart loops on shared T2/T3 VPS — modules
+    # were CPU-starved, not deadlocked, but wallclock heartbeat fired anyway).
+    last_cpu_time: float = 0.0           # /proc/<pid>/stat utime+stime sample (seconds)
+    last_cpu_sample_ts: float = 0.0      # when last_cpu_time was sampled
+    consecutive_starved_cycles: int = 0  # heartbeat misses where CPU grew (alive-but-starved)
 
 
 class Guardian:
@@ -505,17 +522,58 @@ class Guardian:
                             self.restart(name, reason=f"died_exitcode_{exitcode}")
                 continue
 
-            # Heartbeat timeout check — uses per-module timeout
+            # Heartbeat timeout check — CPU-aware (2026-04-21).
+            #
+            # Wallclock heartbeat alone misclassifies CPU-starved modules
+            # as deadlocked. On shared T2/T3 VPS during iter-3 ARC runs,
+            # the media module's heartbeat thread was preempted >180s
+            # repeatedly even though the module itself was making progress.
+            # Restart loops every 3 min added MORE CPU pressure, worsening
+            # the cascade.
+            #
+            # Algorithm: when wallclock timeout fires, sample /proc/<pid>/stat
+            # CPU time. If CPU grew since last sample → module is alive
+            # but starved → log + skip restart + count cycle. After
+            # MAX_STARVED_CYCLES consecutive starved cycles, force restart
+            # anyway (gives up — bounded grace prevents runaway hang).
             if info.state == ModuleState.RUNNING:
                 hb_timeout = info.spec.heartbeat_timeout
                 if now - info.last_heartbeat > hb_timeout:
-                    logger.warning("[Guardian] Module '%s' heartbeat timeout (%.1fs > %.0fs limit)",
-                                   name, now - info.last_heartbeat, hb_timeout)
+                    cpu_now = self._get_cpu_time_seconds(info.pid) if info.pid else 0.0
+                    cpu_grew = (info.last_cpu_time > 0.0
+                                and cpu_now - info.last_cpu_time >= MIN_CPU_DELTA_FOR_ALIVE)
+                    if cpu_grew and info.consecutive_starved_cycles < MAX_STARVED_CYCLES:
+                        info.consecutive_starved_cycles += 1
+                        logger.warning(
+                            "[Guardian] Module '%s' heartbeat timeout (%.1fs > %.0fs) but "
+                            "CPU grew +%.2fs — alive-but-starved cycle %d/%d, deferring restart",
+                            name, now - info.last_heartbeat, hb_timeout,
+                            cpu_now - info.last_cpu_time,
+                            info.consecutive_starved_cycles, MAX_STARVED_CYCLES)
+                        info.last_cpu_time = cpu_now
+                        info.last_cpu_sample_ts = now
+                        continue
+                    # Either CPU didn't grow (truly stuck) or we exhausted grace cycles.
+                    reason = ("heartbeat_timeout_starved_grace_exhausted"
+                              if info.consecutive_starved_cycles >= MAX_STARVED_CYCLES
+                              else "heartbeat_timeout")
+                    logger.warning("[Guardian] Module '%s' heartbeat timeout (%.1fs > %.0fs limit) — restart reason=%s",
+                                   name, now - info.last_heartbeat, hb_timeout, reason)
                     with self._module_lock:
                         info.state = ModuleState.UNHEALTHY
+                        info.consecutive_starved_cycles = 0
                         if info.spec.restart_on_crash:
-                            self.restart(name, reason="heartbeat_timeout")
+                            self.restart(name, reason=reason)
                     continue
+                # Heartbeat fresh — refresh CPU sample so next timeout check
+                # has a recent baseline (window ≈ monitor_tick interval, ~5s).
+                # Without this, last_cpu_time would be sampled only at boot
+                # and at recovery, making the cpu_grew comparison stale.
+                if info.pid:
+                    info.last_cpu_time = self._get_cpu_time_seconds(info.pid)
+                    info.last_cpu_sample_ts = now
+                if info.consecutive_starved_cycles > 0:
+                    info.consecutive_starved_cycles = 0
 
             # Reset restart count after sustained uptime
             if info.state == ModuleState.RUNNING and info.ready_time > 0:
@@ -570,6 +628,31 @@ class Guardian:
                     if line.startswith("VmRSS:"):
                         return int(line.split()[1]) / 1024.0  # kB → MB
         except (FileNotFoundError, ProcessLookupError, PermissionError):
+            pass
+        return 0.0
+
+    @staticmethod
+    def _get_cpu_time_seconds(pid: int) -> float:
+        """Read total CPU time (utime+stime) from /proc/{pid}/stat in seconds.
+
+        Used by CPU-aware heartbeat check: if a module didn't send a
+        heartbeat in time but its CPU time grew, it's alive-but-starved
+        rather than deadlocked.
+        """
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                fields = f.read().split()
+            # Fields per proc(5): utime=14, stime=15 (1-indexed). Account for
+            # the comm field which can contain spaces wrapped in parentheses.
+            # Easier: take last close-paren and slice from there.
+            raw = open(f"/proc/{pid}/stat").read()
+            tail = raw.rsplit(")", 1)[1].split()
+            # After ')' the indices shift: state=0, ppid=1, ..., utime=11, stime=12.
+            utime = int(tail[11])
+            stime = int(tail[12])
+            ticks_per_sec = os.sysconf("SC_CLK_TCK") or 100
+            return (utime + stime) / float(ticks_per_sec)
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, IndexError, OSError):
             pass
         return 0.0
 

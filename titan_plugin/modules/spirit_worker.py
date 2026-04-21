@@ -130,6 +130,86 @@ from titan_plugin.logic.language_pipeline import (
 )
 
 
+def _attach_emot_producer_ctx(meta_engine, inner_lower_topo, outer_lower_topo,
+                              coordinator,
+                              ns_urgencies_dict: dict | None = None,
+                              sphere_clock=None) -> None:
+    """Pre-tick hook: stash live producer signals on meta_engine so that
+    _conclude_chain can route them into EMOT_CHAIN_EVIDENCE ctx for the
+    emot_cgn_worker bundle.
+
+    rFP §23.6+ producer wiring — the bundle schema reserves slots for
+    Titan's actual digital-body + NS state, all of which are already
+    computed at runtime in spirit_worker:
+
+      outer_lower_topo.topology_10d  — dense matter (anchored to TimeChain
+                                        freshness, SOL balance, real-world
+                                        outcomes modulating will-to-act)
+      inner_lower_topo.topology_10d  — ethereal math grounding
+      coordinator._last_whole_10d    — unified spirit topology (volume,
+                                        curvature, density, cross-layer
+                                        mirror, grounding tension, matter/
+                                        spirit ratio, willing coherence,
+                                        field polarity, ...)
+      ns_urgencies_dict              — per-NS-program urgency dict
+                                        (REFLEX, FOCUS, INTUITION, IMPULSE,
+                                        METABOLISM, CREATIVITY, CURIOSITY,
+                                        EMPATHY, REFLECTION, INSPIRATION,
+                                        VIGILANCE) — converted to 11-slot
+                                        ordered list matching the bundle's
+                                        NS_PROGRAMS constant.
+
+    Order of space_topology_30d matches the bundle slot layout.
+    Missing layers fall back to zeros defensively (dead-dim detector in
+    A4 will WARN if any stays zero post-warmup).
+
+    This file runs A2.1 + A2.2 + A2.3; A2.4 (pi_phase) extends again.
+    """
+    try:
+        outer_10 = (list(getattr(outer_lower_topo, "_topology_10d", None) or [])
+                    if outer_lower_topo is not None else [])
+        inner_10 = (list(getattr(inner_lower_topo, "_topology_10d", None) or [])
+                    if inner_lower_topo is not None else [])
+        whole_10 = (list(getattr(coordinator, "_last_whole_10d", None) or [])
+                    if coordinator is not None else [])
+        # Pad each to 10 in case a layer hasn't emitted yet at boot.
+        outer_10 = (outer_10 + [0.0] * 10)[:10]
+        inner_10 = (inner_10 + [0.0] * 10)[:10]
+        whole_10 = (whole_10 + [0.0] * 10)[:10]
+        meta_engine._last_topology_30d = outer_10 + inner_10 + whole_10
+
+        # ── ns_urgencies: dict → ordered 11-slot list (rFP §23.6+). ──
+        if ns_urgencies_dict is not None:
+            try:
+                from titan_plugin.logic.emot_bundle_protocol import NS_PROGRAMS
+                meta_engine._last_ns_urgencies_11d = [
+                    float(ns_urgencies_dict.get(p, 0.0)) for p in NS_PROGRAMS
+                ]
+            except Exception:
+                # Protocol import failures shouldn't block meta.tick().
+                pass
+
+        # ── pi_phase: sphere_clock.get_all_phases() → 6-slot list, bundle ──
+        # schema v2 (2026-04-21) widened to 6D to preserve Trinity symmetry.
+        # Order is fixed in the bundle struct; use the same key order the
+        # clock engine publishes (inner_body, outer_body, inner_mind,
+        # outer_mind, inner_spirit, outer_spirit).
+        if sphere_clock is not None:
+            try:
+                phases = sphere_clock.get_all_phases() or {}
+                order = ("inner_body", "outer_body", "inner_mind",
+                         "outer_mind", "inner_spirit", "outer_spirit")
+                meta_engine._last_pi_phase_6d = [
+                    float(phases.get(k, 0.0)) for k in order
+                ]
+            except Exception:
+                pass
+    except Exception:
+        # Meta-reasoning degrades gracefully — _conclude_chain falls back
+        # to zeros if the attribute is missing or wrong shape.
+        pass
+
+
 def _query_handler_thread(query_queue, handle_fn, state_refs, send_queue, name, config):
     """Dedicated thread for QUERY responses — never blocked by computation.
 
@@ -189,19 +269,30 @@ def _query_handler_thread(query_queue, handle_fn, state_refs, send_queue, name, 
                 _qt0 = time.time()
                 _qt_action = msg.get("payload", {}).get("action", "?")
                 _qt_age = _qt0 - msg.get("ts", _qt0)
-                # Fast-path for get_coordinator: serve from snapshot cache
-                # if fresh. Unlike handler-side caching, this bypasses the
-                # stale-drop below, so even 60s+ stale queries return data
-                # from a recent cached build. Breaks the T2/T3 observability
-                # loss where stale queries drop → dashboard times out →
-                # cache never fills → endpoints return "not initialized".
-                if _qt_action == "get_coordinator":
+                # Fast-path for get_coordinator/get_trinity/get_nervous_system:
+                # serve from snapshot cache if fresh. Unlike handler-side caching,
+                # this bypasses the stale-drop below, so even 60s+ stale queries
+                # return data from a recent cached build. Breaks the T2/T3
+                # observability loss where stale queries drop → dashboard times
+                # out → cache never fills → endpoints return "not initialized".
+                #
+                # 2026-04-21 extension: trinity (250ms) + nervous_system (250ms)
+                # added to drop QueryThread queue depth under dashboard polling
+                # + reasoning-engine ARC load (observed queue ages 1-4s during
+                # iter-3 ARC runs).
+                _CACHE_FAST_PATHS = {
+                    "get_coordinator":     ("_COORD_SNAPSHOT_CACHE",   "_COORD_SNAPSHOT_TTL"),
+                    "get_trinity":         ("_TRINITY_SNAPSHOT_CACHE", "_TRINITY_SNAPSHOT_TTL"),
+                    "get_nervous_system":  ("_NS_SNAPSHOT_CACHE",      "_NS_SNAPSHOT_TTL"),
+                }
+                if _qt_action in _CACHE_FAST_PATHS:
                     try:
                         from titan_plugin.modules import spirit_loop as _sl
-                        _cache = _sl._COORD_SNAPSHOT_CACHE
+                        _cache_attr, _ttl_attr = _CACHE_FAST_PATHS[_qt_action]
+                        _cache = getattr(_sl, _cache_attr)
+                        _ttl = getattr(_sl, _ttl_attr)
                         if (_cache["data"] is not None
-                                and _qt0 - _cache["ts"]
-                                < _sl._COORD_SNAPSHOT_TTL):
+                                and _qt0 - _cache["ts"] < _ttl):
                             _src = msg.get("src", "")
                             _rid = msg.get("rid")
                             _sl._send_response(
@@ -310,6 +401,9 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     _titan_identity.get("titan_id"), _titan_identity.get("delegate_mode"))
     except Exception:
         logger.info("[Identity] No titan_identity.json — defaulting to T1 gateway mode")
+    # Cached titan-id string for log prefixes (canonical source: titan_identity.json).
+    # Use this in any [TX:...] log prefix instead of hardcoding "T1"/"T2"/"T3".
+    _TID = _titan_identity.get("titan_id", "T1")
 
     # Shared dreaming flag — used by experience_orchestrator record calls
     _shared_is_dreaming = False
@@ -499,6 +593,16 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             telemetry_path="./data/social_x_telemetry.jsonl",
         )
         _x_gateway_mtime = os.path.getmtime(_x_gateway_src) if os.path.exists(_x_gateway_src) else 0
+        # Grounding-gate bridge (rFP_phase5_narrator_evolution §9.3):
+        # the gateway is a standalone class with no bus reference; wrap
+        # spirit_worker's _send_msg/send_queue so the gate can emit
+        # CGN_KNOWLEDGE_REQ when suppression fires.
+        def _x_gateway_bus_publish(msg):
+            _send_msg(send_queue,
+                      msg.get("type", ""),
+                      msg.get("src", name),
+                      msg.get("dst", "knowledge"),
+                      msg.get("payload", {}))
         # Inject OutputVerifier for security gating of X posts/replies
         try:
             from titan_plugin.logic.output_verifier import OutputVerifier
@@ -754,6 +858,142 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         _coding_explorer._sandbox.status())
     except Exception as _ce_err:
         logger.warning("[SpiritWorker] Coding explorer init: %s", _ce_err)
+
+    # ── Meta-Reasoning Consumer Service (F-phase, rFP §4) ──
+    # Accepts META_REASON_REQUEST from all 8 CGN consumers; Session 1 runs
+    # in DRY-RUN mode (immediately returns failure_mode="not_yet_implemented"
+    # so routing/schema/cache/rate-limiter can be validated end-to-end before
+    # chain execution lands in Session 2).
+    _meta_recruitment = None
+    _meta_service = None
+    try:
+        from titan_plugin.logic.meta_recruitment import MetaRecruitment
+        _meta_recruitment = MetaRecruitment()
+        # F-phase Session 2: register the 10 graceful-fallback resolvers so
+        # catalog_health_check() reports stale≈0. Session 3 replaces these
+        # shell resolvers with live dispatch to the actual NS/reasoning/bus
+        # callables — for now they return "deferred_to_chain" markers so
+        # chain dispatch never crashes when selectors pick a resolver-backed
+        # recruiter.
+        try:
+            from titan_plugin.logic.meta_resolvers import (
+                register_default_resolvers as _rdr,
+            )
+            _rr = _rdr(_meta_recruitment, reasoning_engine=None,
+                        send_queue=send_queue)
+            logger.info(
+                "[SpiritWorker] Meta-recruitment resolvers bound: %d/%d",
+                sum(1 for v in _rr.values() if v), len(_rr))
+        except Exception as _rdr_err:
+            logger.warning(
+                "[SpiritWorker] Resolver registration failed: %s", _rdr_err)
+        _mr_health = _meta_recruitment.catalog_health_check()
+        logger.info(
+            "[SpiritWorker] Meta-recruitment booted: %d keys, %d recruiters, "
+            "%d stale (expected: Session 2 resolvers cover 10 categories)",
+            _mr_health["catalog_keys"], _mr_health["recruiters_total"],
+            _mr_health["stale_recruiter_count"])
+    except Exception as _mrc_err:
+        logger.warning("[SpiritWorker] Meta-recruitment init: %s", _mrc_err)
+
+    try:
+        from titan_plugin.logic.meta_service import MetaService
+        def _meta_service_emit(_msg):
+            try:
+                send_queue.put_nowait(_msg)
+            except Exception as _mse_err:
+                logger.debug("[MetaService] send_queue put failed: %s",
+                             _mse_err)
+        _meta_service = MetaService(
+            response_emitter=_meta_service_emit,
+            outcome_sink=None,   # accumulator lives inside MetaService now
+            recruitment=_meta_recruitment,
+        )
+        # Attach to coordinator so spirit_loop.get_coordinator snapshot can
+        # expose /v4/meta-service status.
+        if coordinator:
+            coordinator._meta_service = _meta_service
+            coordinator._meta_recruitment = _meta_recruitment
+        logger.info("[SpiritWorker] Meta-service booted (Session 1 dry-run)")
+    except Exception as _ms_err:
+        logger.warning("[SpiritWorker] Meta-service init: %s", _ms_err)
+
+    # ── F-phase (rFP §16.1): Register social meta-response handler ──
+    # Session 1: handler just logs receipt for soak visibility. Session 2
+    # consumes insight.suggested_action and applies it pre-post.
+    _social_meta_pending: dict = {}   # request_id → (t_sent, post_kind)
+    try:
+        from titan_plugin.logic.meta_service_client import (
+            register_response_handler as _register_mrh,
+        )
+
+        def _social_meta_response_handler(payload: dict) -> None:
+            req_id = payload.get("request_id", "")
+            failure = payload.get("failure_mode")
+            conf = payload.get("confidence", 0.0)
+            if failure:
+                logger.info(
+                    "[SocialMeta] response rec'd req_id=%s failure=%s "
+                    "(dry-run expected in Session 1)", req_id[:8], failure)
+            else:
+                insight = payload.get("insight") or {}
+                logger.info(
+                    "[SocialMeta] response rec'd req_id=%s conf=%.2f "
+                    "suggested=%s", req_id[:8], conf,
+                    insight.get("suggested_action") if insight else None)
+            # Pending-map eviction (the post-outcome path evicts when
+            # outcome is sent; this is belt-and-suspenders).
+            _social_meta_pending.pop(req_id, None)
+
+        _register_mrh("social", _social_meta_response_handler)
+    except Exception as _smh_err:
+        logger.warning("[SpiritWorker] Social meta response handler: %s",
+                       _smh_err)
+
+    # ── F-phase Session 2 (rFP §16.4-§16.8): spirit-hosted consumer
+    # response handlers. reasoning / coding / self_model / dreaming all
+    # live inside spirit_worker; their home_worker = "spirit". Shared
+    # pattern: log receipt, evict pending. Session 3 consumes
+    # insight.suggested_action to override fallback logic.
+    _reasoning_meta_pending: dict = {}
+    _coding_meta_pending: dict = {}
+    _self_model_meta_pending: dict = {}
+    _dreaming_meta_pending: dict = {}
+    try:
+        from titan_plugin.logic.meta_service_client import (
+            register_response_handler as _register_mrh2,
+        )
+        def _make_mrh(consumer_tag: str, pending_map: dict):
+            def _handler(payload: dict) -> None:
+                req_id = payload.get("request_id", "")
+                failure = payload.get("failure_mode")
+                if failure:
+                    logger.info(
+                        "[%sMeta] response req_id=%s failure=%s "
+                        "(Session 2 dry-run)", consumer_tag,
+                        req_id[:8], failure)
+                else:
+                    insight = payload.get("insight") or {}
+                    logger.info(
+                        "[%sMeta] response req_id=%s sugg=%s",
+                        consumer_tag, req_id[:8],
+                        insight.get("suggested_action") if insight else None)
+                pending_map.pop(req_id, None)
+            return _handler
+        _register_mrh2("reasoning",
+                        _make_mrh("Reasoning", _reasoning_meta_pending))
+        _register_mrh2("coding",
+                        _make_mrh("Coding", _coding_meta_pending))
+        _register_mrh2("self_model",
+                        _make_mrh("SelfModel", _self_model_meta_pending))
+        _register_mrh2("dreaming",
+                        _make_mrh("Dreaming", _dreaming_meta_pending))
+        logger.info(
+            "[SpiritWorker] F-phase response handlers registered: "
+            "reasoning, coding, self_model, dreaming")
+    except Exception as _mrh2_err:
+        logger.warning(
+            "[SpiritWorker] Spirit-hosted meta handlers: %s", _mrh2_err)
 
     # ── Boot Vertical Intuition Convergence (M11-M13) ──
     _intuition_convergence = None
@@ -1268,6 +1508,21 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         daemon=True, name="spirit-query-handler")
     _qt.start()
     logger.info("[SpiritWorker] Query handler thread started (dedicated QUERY responses)")
+
+    # ── Snapshot builder threads (2026-04-21 T1-COORD-QUERYTHREAD-BACKLOG fix) ──
+    # Dedicated daemon threads rebuild the heavy coord/trinity/nervous-system
+    # snapshots in the background. QueryThread handlers become trivial cache
+    # reads (<1ms) instead of blocking 460-2144ms per coord build. Stepping
+    # stone to microkernel v2 where these threads become L1 writers for
+    # /dev/shm/titan/*.bin state registries.
+    try:
+        from titan_plugin.modules.spirit_loop import start_snapshot_builder_threads
+        start_snapshot_builder_threads(_query_state_refs, config)
+    except Exception as _sb_err:
+        logger.error(
+            "[SpiritWorker] Snapshot builder thread startup failed: %s — "
+            "QueryThread will fall back to synchronous in-handler builds "
+            "(pre-2026-04-21 behavior)", _sb_err, exc_info=True)
 
     # ── Timeseries store (30-day rolling metrics) ──
     _timeseries_store = None
@@ -3179,13 +3434,20 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         if coordinator:
                             coordinator._last_nervous_signals = _nn_signals
                         # Observatory V2: WebSocket events for hormone fires
+                        # Also fan out to emot_cgn so it can feed hormone
+                        # state into the v3 bundle (rFP §19 §4.3 — HORMONE_FIRE
+                        # is a first-class EMOT-CGN producer).
                         for _ns_sig in _nn_signals:
                             if _ns_sig.get("hormonal"):
-                                _send_msg(send_queue, "HORMONE_FIRED", name, "v4_bridge", {
+                                _hf_payload = {
                                     "program": _ns_sig["system"],
                                     "intensity": round(_ns_sig.get("intensity", 0), 3),
                                     "urgency": round(_ns_sig.get("urgency", 0), 3),
-                                })
+                                }
+                                _send_msg(send_queue, "HORMONE_FIRED", name,
+                                          "v4_bridge", _hf_payload)
+                                _send_msg(send_queue, "HORMONE_FIRED", name,
+                                          "emot_cgn", _hf_payload)
                     except Exception as e:
                         logger.warning("[SpiritWorker] NeuralNS evaluate error: %s", e, exc_info=True)
 
@@ -3321,6 +3583,76 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                     logger.warning("[INTUITION] Convergence error: %s", _ic_err)
                                     _reasoning_engine._ic_last_err = now
 
+                        # ── F-phase (rFP §16.4): consult meta before tick ──
+                        # Session 2 dry-run: meta returns
+                        # not_yet_implemented; reasoning's existing
+                        # strategy_bias path (pushed by DELEGATE) is
+                        # unchanged. Low-frequency hook — only every
+                        # 40th chain to avoid rate-limit saturation
+                        # (reasoning ticks every epoch, ~300s, but
+                        # meta per_consumer_rpm=10 = 1 per 6s).
+                        _reasoning_meta_req_id = ""
+                        try:
+                            if (neural_nervous_system is not None
+                                    and hasattr(_reasoning_engine,
+                                                "_total_chains")):
+                                _rchains = getattr(
+                                    _reasoning_engine, "_total_chains", 0)
+                                if _rchains % 40 == 0 and _rchains > 0:
+                                    from titan_plugin.logic.meta_service_client import (
+                                        send_meta_request as _r_send,
+                                    )
+                                    from titan_plugin.logic.meta_consumer_contexts import (
+                                        build_reasoning_meta_context_30d as _r_ctx_fn,
+                                    )
+                                    _r_policy_in = []
+                                    try:
+                                        _r_policy_in = list(
+                                            getattr(_reasoning_engine,
+                                                    "_last_policy_input", [])
+                                            or [])
+                                    except Exception:
+                                        pass
+                                    _reasoning_meta_req_id = _r_send(
+                                        consumer_id="reasoning",
+                                        question_type="formulate_strategy",
+                                        context_vector=_r_ctx_fn(
+                                            policy_input=_r_policy_in,
+                                            chain_state={
+                                                "chain_length": int(
+                                                    getattr(
+                                                        _reasoning_engine,
+                                                        "_chain_depth", 0) or 0),
+                                                "max_chain_length":
+                                                    int(getattr(
+                                                        _reasoning_engine,
+                                                        "_max_chain_length",
+                                                        10) or 10),
+                                            },
+                                            confidence_state={
+                                                "current_confidence":
+                                                    float(getattr(
+                                                        _reasoning_engine,
+                                                        "_last_confidence",
+                                                        0.5) or 0.5),
+                                            },
+                                        ),
+                                        time_budget_ms=400,
+                                        constraints={
+                                            "confidence_threshold": 0.4,
+                                            "allow_timechain_query": False,
+                                        },
+                                        payload_snippet=(
+                                            f"chain#{_rchains}"),
+                                        send_queue=send_queue, src=name)
+                                    _reasoning_meta_pending[
+                                        _reasoning_meta_req_id] = (
+                                        time.time(), "pre_tick")
+                        except Exception as _r_meta_err:
+                            logger.debug(
+                                "[ReasoningMeta] req skipped: %s",
+                                _r_meta_err)
+
                         _reasoning_result = _reasoning_engine.tick(
                             observation=_r_obs,
                             gut_signals=_r_gut,
@@ -3329,6 +3661,29 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                             working_memory_items=_r_wm_items,
                             dt=1.0,
                         )
+
+                        # ── F-phase outcome — Session 2 neutral 0.0 ──
+                        if _reasoning_meta_req_id:
+                            try:
+                                from titan_plugin.logic.meta_service_client import (
+                                    send_meta_outcome as _r_out,
+                                )
+                                _r_out(
+                                    request_id=_reasoning_meta_req_id,
+                                    consumer_id="reasoning",
+                                    outcome_reward=0.0,
+                                    actual_primitive_used=(
+                                        _reasoning_result.get("primitive")
+                                        if isinstance(_reasoning_result,
+                                                      dict) else None),
+                                    context="session_2_dry",
+                                    send_queue=send_queue, src=name)
+                                _reasoning_meta_pending.pop(
+                                    _reasoning_meta_req_id, None)
+                            except Exception as _r_out_err:
+                                logger.debug(
+                                    "[ReasoningMeta] outcome skipped: %s",
+                                    _r_out_err)
 
                         # Log reasoning events
                         if _reasoning_result and _reasoning_result.get("action") == "IDLE":
@@ -3797,8 +4152,8 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                     except Exception:
                                         pass
                         if _tf["composite"] != "SPEAK":
-                            logger.info("[T2:EXPRESSION.%s] FIRED — urge=%.3f, helper=%s",
-                                        _tf["composite"], _tf["urge"], _tf["action_helper"])
+                            logger.info("[%s:EXPRESSION.%s] FIRED — urge=%.3f, helper=%s",
+                                        _TID, _tf["composite"], _tf["urge"], _tf["action_helper"])
                         # Phase 2: Signal internal self-action to MSL convergence detector
                         if msl and _tf["composite"] in ("SPEAK", "ART", "MUSIC"):
                             msl.signal_action("internal")
@@ -3915,7 +4270,8 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                 "ts": time.time(),
                                 "source": "self_exploration",
                             })
-                            logger.info("[T2:SELF_EXPLORE] Queued %s (urge=%.3f) for Agency",
+                            logger.info("[%s:SELF_EXPLORE] Queued %s (urge=%.3f) for Agency",
+                                        _TID,
                                         _explore_action.get("action_helper", "?"),
                                         _explore_action.get("urge", 0))
                     except Exception as _explore_err:
@@ -4356,6 +4712,58 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 _inner_em = getattr(coordinator, 'inner', None)
                 if (_drain > 0.75 and _chi_total < 0.2
                         and _inner_em and not getattr(_inner_em, 'is_dreaming', False)):
+                    # ── F-phase (rFP §16.8): consult meta on
+                    # dream-cycle entry ("what themes to consolidate?") ──
+                    _dr_meta_req_id = ""
+                    try:
+                        from titan_plugin.logic.meta_service_client import (
+                            send_meta_request as _dr_send,
+                            send_meta_outcome as _dr_out,
+                        )
+                        from titan_plugin.logic.meta_consumer_contexts import (
+                            build_dreaming_meta_context_30d as _dr_ctx_fn,
+                        )
+                        _dr_nm = {n: m.level for n, m in
+                                   neuromodulator_system.modulators.items()} \
+                                 if neuromodulator_system else {}
+                        _dr_meta_req_id = _dr_send(
+                            consumer_id="dreaming",
+                            question_type="recall_context",
+                            context_vector=_dr_ctx_fn(
+                                dream_state={
+                                    "is_dreaming": False,
+                                    "fatigue": _drain,
+                                },
+                                neuromods=_dr_nm,
+                                chi_coherence={
+                                    "chi_total": _chi_total,
+                                },
+                            ),
+                            time_budget_ms=10000,
+                            constraints={
+                                "confidence_threshold": 0.3,
+                                "allow_timechain_query": True,
+                            },
+                            payload_snippet=(
+                                f"dream_entry drain={_drain:.2f} "
+                                f"chi={_chi_total:.2f}"),
+                            send_queue=send_queue, src=name)
+                        _dreaming_meta_pending[_dr_meta_req_id] = (
+                            time.time(), "emergency_entry")
+                        _dr_out(
+                            request_id=_dr_meta_req_id,
+                            consumer_id="dreaming",
+                            outcome_reward=0.0,
+                            actual_primitive_used=None,
+                            context=(
+                                f"session_2_dry dream_entry "
+                                f"chi={_chi_total:.2f}"),
+                            send_queue=send_queue, src=name)
+                        _dreaming_meta_pending.pop(_dr_meta_req_id, None)
+                    except Exception as _dr_err:
+                        logger.debug(
+                            "[DreamingMeta] req skipped: %s", _dr_err)
+
                     coordinator.dreaming.begin_dreaming(_inner_em)
                     coordinator.dreaming._epochs_since_dream = 0
                     coordinator.dreaming._dream_epoch_count = 0
@@ -4898,6 +5306,58 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         _sr_lang = {}
                         if _language_stats:
                             _sr_lang = {"vocab_total": _language_stats.get("vocab_total", 0)}
+                        # ── F-phase (rFP §16.6): consult meta on
+                        # introspect sub_mode before prediction check ──
+                        _sm_meta_req_id = ""
+                        try:
+                            from titan_plugin.logic.meta_service_client import (
+                                send_meta_request as _sm_send,
+                                send_meta_outcome as _sm_out,
+                            )
+                            from titan_plugin.logic.meta_consumer_contexts import (
+                                build_self_model_meta_context_30d as _sm_ctx_fn,
+                            )
+                            _sm_meta_req_id = _sm_send(
+                                consumer_id="self_model",
+                                question_type="introspect_state",
+                                context_vector=_sm_ctx_fn(
+                                    self_state={
+                                        "i_confidence":
+                                            _sr_msl.get("i_confidence", 0.5),
+                                        "self_prediction_accuracy": float(
+                                            getattr(_self_reasoning,
+                                                    "_prediction_accuracy_ema",
+                                                    0.5) or 0.5),
+                                    },
+                                    neuromods=_sr_nm,
+                                    language_social={
+                                        "vocab_confidence":
+                                            float(_sr_lang.get(
+                                                "vocab_total", 0)) / 500.0,
+                                    },
+                                ),
+                                time_budget_ms=1500,
+                                constraints={
+                                    "confidence_threshold": 0.4,
+                                    "allow_timechain_query": True,
+                                },
+                                payload_snippet=f"epoch={epoch_id}",
+                                send_queue=send_queue, src=name)
+                            _self_model_meta_pending[_sm_meta_req_id] = (
+                                time.time(), "introspect_check")
+                            _sm_out(
+                                request_id=_sm_meta_req_id,
+                                consumer_id="self_model",
+                                outcome_reward=0.0,
+                                actual_primitive_used=None,
+                                context=(
+                                    f"session_2_dry epoch={epoch_id}"),
+                                send_queue=send_queue, src=name)
+                            _self_model_meta_pending.pop(
+                                _sm_meta_req_id, None)
+                        except Exception as _sm_err:
+                            logger.debug(
+                                "[SelfModelMeta] req skipped: %s", _sm_err)
                         _sr_verifications = _self_reasoning.check_predictions(
                             epoch_id, _sr_nm, _sr_msl, _sr_lang)
                         if _sr_verifications:
@@ -5136,6 +5596,15 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     except Exception as _local_sig_err:
                         if hash(("local_sig", str(type(_local_sig_err)))) % 100 == 0:
                             logger.warning("[META] Local signal feed error: %s", _local_sig_err)
+
+                    # EMOT-CGN producer wiring (rFP §23.6+) — attach live
+                    # 30D space topology to meta_engine so _conclude_chain
+                    # can route it into EMOT_CHAIN_EVIDENCE ctx.
+                    _attach_emot_producer_ctx(
+                        meta_engine, inner_lower_topo, outer_lower_topo,
+                        coordinator,
+                        ns_urgencies_dict=_cached_ns_urgencies,
+                        sphere_clock=sphere_clock)
 
                     _meta_result = meta_engine.tick(
                         state_132d=_meta_sv,
@@ -5430,17 +5899,51 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                     if _impasse:
                                         _imp_topic = _impasse.get("topic", "")
                                         _imp_urgency = _impasse.get("urgency", 0.5)
+                                        _imp_type = _impasse.get("type", "")
                                         _send_msg(send_queue, "CGN_KNOWLEDGE_REQ",
                                                   name, "knowledge", {
                                             "topic": _imp_topic,
                                             "requestor": "meta_reasoning",
                                             "urgency": _imp_urgency,
                                             "chain_id": _impasse.get("chain_id", -1),
-                                            "impasse_type": _impasse.get("type", ""),
+                                            "impasse_type": _imp_type,
                                             "neuromods": dict(_cached_neuromod_state),
                                             "epoch": (consciousness.get("latest_epoch", {}).get(
                                                 "epoch_id", 0) if consciousness else 0),
                                         })
+                                        # rFP_soar_repeat_impasse_metacgn Phase 2
+                                        # (2026-04-20, Producer #16): emit META-CGN
+                                        # signal on repeat_stuck so COMPLETE-9a
+                                        # telemetry can correlate repeat impasses
+                                        # with downstream chain outcomes. Empty
+                                        # SIGNAL_TO_PRIMITIVE mapping → 0 V(s)
+                                        # adjustment in Phase 2 (observability
+                                        # only). Phase 3 wires consumer learning.
+                                        if _imp_type == "repeat_stuck":
+                                            try:
+                                                from ..bus import emit_meta_cgn_signal
+                                                emit_meta_cgn_signal(
+                                                    send_queue, name,
+                                                    consumer="meta",
+                                                    event_type="primitive_repeat_impasse",
+                                                    intensity=float(_imp_urgency),
+                                                    narrative_context={
+                                                        "repeated_primitive":
+                                                            _impasse.get("repeated_primitive"),
+                                                        "repeat_count":
+                                                            _impasse.get("repeat_count"),
+                                                        "chain_id":
+                                                            _impasse.get("chain_id", -1),
+                                                        "chain_step":
+                                                            _impasse.get("chain_step"),
+                                                    },
+                                                    reason="soar_phase2_observability",
+                                                    min_interval_s=1.0,
+                                                )
+                                            except Exception as _e:
+                                                logger.debug(
+                                                    "[META] repeat-impasse signal emit failed: %s",
+                                                    _e)
                                 except Exception as _imp_err:
                                     logger.debug("[META] Impasse detection error: %s", _imp_err)
                             # TimeChain: meta_wisdom distill_save → procedural fork
@@ -5602,6 +6105,46 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                 _ce_nm = {}
                                 if neuromodulator_system:
                                     _ce_nm = {n: m.level for n, m in neuromodulator_system.modulators.items()}
+                                # ── F-phase (rFP §16.5): consult meta on trigger ──
+                                _ce_meta_req_id = ""
+                                try:
+                                    from titan_plugin.logic.meta_service_client import (
+                                        send_meta_request as _ce_send,
+                                    )
+                                    from titan_plugin.logic.meta_consumer_contexts import (
+                                        build_coding_meta_context_30d as _ce_ctx_fn,
+                                    )
+                                    _ce_meta_req_id = _ce_send(
+                                        consumer_id="coding",
+                                        question_type="formulate_strategy",
+                                        context_vector=_ce_ctx_fn(
+                                            success_stats={
+                                                "success_rate": getattr(
+                                                    _coding_explorer,
+                                                    "_total_successes", 0) / max(1, getattr(
+                                                    _coding_explorer,
+                                                    "_total_exercises", 1)),
+                                                "total_successes": getattr(
+                                                    _coding_explorer,
+                                                    "_total_successes", 0),
+                                            },
+                                            trigger=_ce_trigger,
+                                            neuromods=_ce_nm),
+                                        time_budget_ms=800,
+                                        constraints={
+                                            "confidence_threshold": 0.4,
+                                            "allow_timechain_query": False,
+                                        },
+                                        payload_snippet=(
+                                            f"trig={_ce_trigger.get('type','')}"),
+                                        send_queue=send_queue, src=name)
+                                    _coding_meta_pending[_ce_meta_req_id] = (
+                                        time.time(), _ce_trigger.get("type", ""))
+                                except Exception as _ce_mreq_err:
+                                    logger.debug(
+                                        "[CodingMeta] request skipped: %s",
+                                        _ce_mreq_err)
+
                                 try:
                                     _ce_result = _coding_explorer.explore(
                                         trigger=_ce_trigger,
@@ -5617,8 +6160,97 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                 except Exception as _ce_err:
                                     logger.warning("[CodingExplorer] Explore error: %s", _ce_err)
 
+                                # ── F-phase outcome — Session 2 neutral 0.0 ──
+                                if _ce_meta_req_id:
+                                    try:
+                                        from titan_plugin.logic.meta_service_client import (
+                                            send_meta_outcome as _ce_out,
+                                        )
+                                        _ce_out(
+                                            request_id=_ce_meta_req_id,
+                                            consumer_id="coding",
+                                            outcome_reward=0.0,
+                                            actual_primitive_used=None,
+                                            context=(
+                                                f"session_2_dry "
+                                                f"trig={_ce_trigger.get('type','')}"),
+                                            send_queue=send_queue, src=name)
+                                        _coding_meta_pending.pop(
+                                            _ce_meta_req_id, None)
+                                    except Exception as _ce_out_err:
+                                        logger.debug(
+                                            "[CodingMeta] outcome skipped: %s",
+                                            _ce_out_err)
+
             except Exception as _me_err:
                 logger.warning("[META] Tick error: %s", _me_err)
+
+            # ── Coding Explorer — Layer B time-based fallback trigger ──
+            # rFP_coding_explorer_activation.md §4.2. The emergent trigger path
+            # at line ~5622 sits inside `gaps_found > 0`, which rarely fires
+            # on saturated-stable Titans. This fallback runs regardless, and
+            # synthesizes a "scheduled_novelty" trigger when no exercise has
+            # run for time_fallback_seconds (default 6h). Budget-safe: bounded
+            # above by cooldown_epochs × max_exercises_per_dream.
+            try:
+                if (_coding_explorer and _coding_explorer.can_explore
+                        and _coding_explorer.should_fire_fallback(time.time())):
+                    _ce_fb_trigger = _coding_explorer.build_fallback_trigger(time.time())
+                    _ce_fb_ctx = {}
+                    if msl:
+                        try:
+                            _ce_fb_ict = msl._identity_tracker
+                            _ce_fb_ctx["i_confidence"] = (
+                                _ce_fb_ict.confidence if _ce_fb_ict else 0.0)
+                            _ce_fb_ctx["chi_coherence"] = getattr(
+                                msl, '_chi_coherence', 0.0)
+                        except Exception:
+                            pass
+                    if _language_stats:
+                        _ce_fb_ctx["vocab_total"] = _language_stats.get("vocab_total", 0)
+                    if _reasoning_engine:
+                        try:
+                            _ce_fb_rstats = _reasoning_engine.get_stats()
+                            _ce_fb_ctx["total_chains"] = _ce_fb_rstats.get("total_chains", 0)
+                            _ce_fb_ctx["commit_rate"] = _ce_fb_rstats.get("commit_rate", 0.0)
+                        except Exception:
+                            pass
+                    if _self_reasoning:
+                        _ce_fb_ctx["prediction_accuracy"] = (
+                            _self_reasoning._prediction_accuracy_ema)
+                    _ce_fb_nm = {}
+                    if neuromodulator_system:
+                        _ce_fb_nm = {n: m.level for n, m
+                                     in neuromodulator_system.modulators.items()}
+                    logger.info(
+                        "[CodingExplorer] Time fallback fired — %s "
+                        "(silence=%.0fs, threshold=%.0fs)",
+                        _ce_fb_trigger["reason"],
+                        _ce_fb_trigger["gap_delta"],
+                        _coding_explorer._time_fallback_seconds)
+                    try:
+                        _ce_fb_result = _coding_explorer.explore(
+                            trigger=_ce_fb_trigger,
+                            epoch=epoch_id,
+                            neuromods=_ce_fb_nm,
+                            context=_ce_fb_ctx)
+                        if _ce_fb_result:
+                            logger.info(
+                                "[CodingExplorer] Fallback %s/%s → %s "
+                                "reward=%.3f tests=%d/%d",
+                                _ce_fb_result.action, _ce_fb_result.concept,
+                                "PASS" if _ce_fb_result.sandbox_success else "FAIL",
+                                _ce_fb_result.reward,
+                                _ce_fb_result.tests_passed,
+                                _ce_fb_result.tests_total)
+                    except Exception as _ce_fb_err:
+                        logger.warning(
+                            "[CodingExplorer] Fallback explore error: %s",
+                            _ce_fb_err)
+            except Exception as _ce_fb_outer_err:
+                logger.warning(
+                    "[CodingExplorer] Fallback check error: %s",
+                    _ce_fb_outer_err)
 
             # P6.3: Total bio-layer timing (epoch + all post-epoch processing)
             _bio_total_ms = (time.time() - _bio_t0) * 1000
@@ -5992,7 +6624,9 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                                     llm_model=_xg_inf.get("ollama_cloud_chat_model", ""),
                                                     catalysts=_dq_catalysts,
                                                 )
-                                                _dq_result = _x_gateway.post(_dq_ctx, consumer=_dq_consumer)
+                                                _dq_result = _x_gateway.post(
+                                                    _dq_ctx, consumer=_dq_consumer,
+                                                    bus=_x_gateway_bus_publish)
                                                 if _dq_result.status in ("verified", "posted"):
                                                     _dq_queue.pop(0)
                                                     with open(_dq_file, "w") as _dq_fw:
@@ -6017,7 +6651,85 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                     _xg_result = type('R', (), {'status': 'too_soon',
                                                                 'reason': 'delegate posted first'})()
                                 else:
-                                    _xg_result = _x_gateway.post(_xg_ctx, consumer="spirit_worker")
+                                    # Maker-forced catalysts (§9 force-post) skip
+                                    # the grounding gate in the gateway.
+                                    _xg_force_ungrounded = any(
+                                        bool(c.get("force_ungrounded"))
+                                        for c in _x_catalysts)
+
+                                    # ── F-phase (rFP §16.1): consult meta BEFORE post ──
+                                    # Session 1 dry-run: meta returns
+                                    # failure_mode="not_yet_implemented"; social
+                                    # falls back to existing static path (no
+                                    # behavior change). Validates routing/schema/
+                                    # rate-limit end-to-end so Session 2 ships
+                                    # into a warm wire.
+                                    _sm_req_id = ""
+                                    try:
+                                        from titan_plugin.logic.meta_service_client import (
+                                            send_meta_request as _sm_send,
+                                        )
+                                        from titan_plugin.logic.social_narrator import (
+                                            build_social_meta_context_30d as _sm_build_ctx,
+                                        )
+                                        _sm_ctx = _sm_build_ctx(
+                                            neuromods=_cached_neuromod_state,
+                                            hormones=_cached_hormone_state
+                                                if '_cached_hormone_state' in dir() else None,
+                                            chi=_cached_chi_state,
+                                        )
+                                        _sm_catalyst_type = (
+                                            _x_catalysts[0].get("type", "")
+                                            if _x_catalysts else "")
+                                        _sm_req_id = _sm_send(
+                                            consumer_id="social",
+                                            question_type="formulate_strategy",
+                                            context_vector=_sm_ctx,
+                                            time_budget_ms=300,
+                                            constraints={
+                                                "confidence_threshold": 0.4,
+                                                "allow_timechain_query": False,
+                                            },
+                                            payload_snippet=f"post catalyst={_sm_catalyst_type}",
+                                            send_queue=send_queue,
+                                            src=name,
+                                        )
+                                        _social_meta_pending[_sm_req_id] = (
+                                            time.time(), "post")
+                                    except Exception as _sm_err:
+                                        logger.debug(
+                                            "[SocialMeta] pre-post request skipped: %s",
+                                            _sm_err)
+
+                                    _xg_result = _x_gateway.post(
+                                        _xg_ctx, consumer="spirit_worker",
+                                        bus=_x_gateway_bus_publish,
+                                        force_ungrounded=_xg_force_ungrounded)
+
+                                    # ── F-phase: outcome emission ──
+                                    # Session 1: neutral 0.0 reward (no advice
+                                    # was actually applied). Session 2 derives
+                                    # reward from Δ persona_quality over the
+                                    # session per §16.1.
+                                    if _sm_req_id:
+                                        try:
+                                            from titan_plugin.logic.meta_service_client import (
+                                                send_meta_outcome as _sm_sink,
+                                            )
+                                            _sm_sink(
+                                                request_id=_sm_req_id,
+                                                consumer_id="social",
+                                                outcome_reward=0.0,
+                                                actual_primitive_used=None,
+                                                context=f"session_1_dry_run status={_xg_result.status}",
+                                                send_queue=send_queue,
+                                                src=name,
+                                            )
+                                            _social_meta_pending.pop(_sm_req_id, None)
+                                        except Exception as _sm_err:
+                                            logger.debug(
+                                                "[SocialMeta] outcome skipped: %s",
+                                                _sm_err)
                                 logger.info("[SOCIAL] post() → %s (catalysts=%d, delegate_first=%s)",
                                             _xg_result.status, len(_x_catalysts),
                                             _xg_delegate_first)
@@ -6089,7 +6801,9 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                                     llm_model=_xg_inf.get("ollama_cloud_chat_model", ""),
                                                     catalysts=_dq_catalysts,
                                                 )
-                                                _dq_result = _x_gateway.post(_dq_ctx, consumer=_dq_consumer)
+                                                _dq_result = _x_gateway.post(
+                                                    _dq_ctx, consumer=_dq_consumer,
+                                                    bus=_x_gateway_bus_publish)
                                                 if _dq_result.status in ("verified", "posted"):
                                                     logger.info("[DELEGATE] %s posted via gateway: %s",
                                                                 _dq_titan, _dq_result.tweet_id)
@@ -6610,6 +7324,13 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                 "[META] Subsystem cache refresh dispatch failed (site B): %s",
                                 _ssrefresh_err_b)
 
+                        # EMOT-CGN producer wiring (rFP §23.6+) — site B.
+                        _attach_emot_producer_ctx(
+                            meta_engine, inner_lower_topo, outer_lower_topo,
+                            coordinator,
+                            ns_urgencies_dict=_cached_ns_urgencies,
+                            sphere_clock=sphere_clock)
+
                         _meta_result = meta_engine.tick(
                             state_132d=_meta_sv,
                             neuromods=_meta_nm,
@@ -6687,8 +7408,8 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     )
                     # If Tier 2 flagged SPEAK, inject a synthetic fire event
                     # (hormones may be depleted by Tier 2, but SPEAK was viable)
-                    logger.info("[T1:SPEAK-CHECK] pending=%s fired_count=%d",
-                                _t2_speak_pending, len(_expr_fired))
+                    logger.info("[%s:SPEAK-CHECK] pending=%s fired_count=%d",
+                                _TID, _t2_speak_pending, len(_expr_fired))
                     if _t2_speak_pending:
                         _speak_in_fired = any(f["composite"] == "SPEAK" for f in _expr_fired)
                         if not _speak_in_fired:
@@ -6999,6 +7720,32 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     outer_spirit_ext,
                     filter_down_v5=_v5_mults_cache or None,
                 )
+
+        # ── X_FORCE_POST: Maker override injects a high-significance catalyst ──
+        # with force_ungrounded=True. Bypasses the grounding gate in
+        # social_x_gateway for deliberate exploration seeding.
+        # rFP_phase5_narrator_evolution §9.3 + §9.5 Q4.
+        elif msg_type == "X_FORCE_POST":
+            try:
+                _fp = msg.get("payload", {}) or {}
+                _fp_topic = str(_fp.get("topic", "")).strip()
+                _fp_text = str(_fp.get("text_hint", "")).strip()
+                _fp_type = str(_fp.get("catalyst_type", "maker_force")).strip() \
+                           or "maker_force"
+                if _fp_topic:
+                    _x_catalysts.append({
+                        "type": _fp_type,
+                        "content": _fp_text or
+                                   f"Maker requested a post about: {_fp_topic}",
+                        "significance": 1.0,
+                        "force_ungrounded": True,
+                        "data": {"topic": _fp_topic,
+                                 "text_hint": _fp_text},
+                    })
+                    logger.info("[X_FORCE_POST] Maker queued forced catalyst: "
+                                "topic=%r type=%s", _fp_topic, _fp_type)
+            except Exception as _fp_err:
+                logger.warning("[X_FORCE_POST] handler error: %s", _fp_err)
 
         # ── X_POST_DISPATCH: REMOVED — all posting now via SocialXGateway v3 ──
         # (gateway.post() is called synchronously in the main tick loop above)
@@ -7330,7 +8077,7 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                 _os45_k[_ki] = max(0.0, min(1.0, _os45_k[_ki] + _delta))
                             outer_state["outer_spirit_45d"] = _os45_k
 
-                        # Record encounter in inner_memory
+                        # Record encounter in inner_memory (DDL direct, writes via IMW client)
                         _now_k = time.time()  # defined outside try so post-try uses are safe
                         try:
                             import sqlite3
@@ -7356,16 +8103,21 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                 _le = consciousness.get("latest_epoch", {})
                                 _my_emo_k = _le.get("emotion", "neutral") if isinstance(_le, dict) else "neutral"
                                 _epoch_k = _le.get("id", 0) if isinstance(_le, dict) else 0
-                            _kin_db.execute(
+                            # READ via direct connection (then close)
+                            _existing_k = _kin_db.execute(
+                                "SELECT encounter_count, avg_resonance FROM kin_profiles WHERE pubkey=?",
+                                (_kin_pubkey,)).fetchone()
+                            _kin_db.close()
+                            # WRITE via IMW client
+                            from titan_plugin.persistence import get_client
+                            _imw_spirit = get_client(caller_name="spirit_worker.kin")
+                            _imw_spirit.write(
                                 "INSERT INTO kin_encounters "
                                 "(timestamp, kin_pubkey, resonance, my_emotion, kin_emotion, "
                                 "exchange_type, epoch_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
                                 (_now_k, _kin_pubkey, _resonance, _my_emo_k, _kin_emotion,
-                                 "exchange", _epoch_k))
-                            # Upsert kin profile
-                            _existing_k = _kin_db.execute(
-                                "SELECT encounter_count, avg_resonance FROM kin_profiles WHERE pubkey=?",
-                                (_kin_pubkey,)).fetchone()
+                                 "exchange", _epoch_k),
+                                table="kin_encounters")
                             if _existing_k:
                                 _count_k = _existing_k[0] + 1
                                 _avg_k = (_existing_k[1] * _existing_k[0] + _resonance) / _count_k
@@ -7373,20 +8125,20 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                             else "kindred_spirit" if _avg_k > 0.6
                                             else "familiar_presence" if _avg_k > 0.4
                                             else "developing_bond")
-                                _kin_db.execute(
+                                _imw_spirit.write(
                                     "UPDATE kin_profiles SET last_encounter_ts=?, encounter_count=?, "
                                     "avg_resonance=?, relationship_label=? WHERE pubkey=?",
-                                    (_now_k, _count_k, round(_avg_k, 4), _label_k, _kin_pubkey))
+                                    (_now_k, _count_k, round(_avg_k, 4), _label_k, _kin_pubkey),
+                                    table="kin_profiles")
                             else:
-                                _kin_db.execute(
+                                _imw_spirit.write(
                                     "INSERT INTO kin_profiles "
                                     "(pubkey, name, first_encounter_ts, last_encounter_ts, "
                                     "encounter_count, avg_resonance, relationship_label) "
                                     "VALUES (?, ?, ?, ?, 1, ?, ?)",
                                     (_kin_pubkey, _kr.get("kin_name", "Unknown"),
-                                     _now_k, _now_k, round(_resonance, 4), "new_acquaintance"))
-                            _kin_db.commit()
-                            _kin_db.close()
+                                     _now_k, _now_k, round(_resonance, 4), "new_acquaintance"),
+                                    table="kin_profiles")
                         except Exception as _kin_db_err:
                             logger.warning("[KIN_EXCHANGE] DB error: %s", _kin_db_err)
 
@@ -7404,17 +8156,17 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                 "epoch": _epoch_k,
                             })
                             try:
-                                _gkp_db = sqlite3.connect("./data/inner_memory.db", timeout=10.0)
-                                _gkp_db.execute("PRAGMA busy_timeout=5000")
-                                _gkp_db.execute(
+                                from titan_plugin.persistence import get_client
+                                _imw_gkp = get_client(caller_name="spirit_worker.gkp")
+                                _imw_gkp.write(
                                     "UPDATE kin_encounters SET great_kin_pulse=1 "
                                     "WHERE kin_pubkey=? AND timestamp=?",
-                                    (_kin_pubkey, _now_k))
-                                _gkp_db.execute(
+                                    (_kin_pubkey, _now_k),
+                                    table="kin_encounters")
+                                _imw_gkp.write(
                                     "UPDATE kin_profiles SET great_kin_pulses=great_kin_pulses+1 "
-                                    "WHERE pubkey=?", (_kin_pubkey,))
-                                _gkp_db.commit()
-                                _gkp_db.close()
+                                    "WHERE pubkey=?", (_kin_pubkey,),
+                                    table="kin_profiles")
                             except Exception:
                                 pass
                             logger.info("[GREAT_KIN_PULSE] Deep resonance with %s! score=%.3f",
@@ -7723,6 +8475,7 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     if _obs_action_type in ("art_generate", "audio_generate"):
                         try:
                             import sqlite3
+                            # DDL direct (one-shot, no contention), writes via IMW
                             _cj_db2 = sqlite3.connect("./data/inner_memory.db", timeout=10.0)
                             _cj_db2.execute("PRAGMA journal_mode=WAL")
                             _cj_db2.execute("PRAGMA busy_timeout=5000")
@@ -7732,18 +8485,20 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                 "timestamp REAL NOT NULL, action_type TEXT NOT NULL, "
                                 "creation_summary TEXT, score REAL, state_delta REAL, "
                                 "words_used TEXT, features TEXT, epoch_id INTEGER)")
+                            _cj_db2.commit()
+                            _cj_db2.close()
                             _cj_summary = _observation.get("narration", "")[:200]
                             _cj_features = _observation.get("features", {})
-                            _cj_db2.execute(
+                            from titan_plugin.persistence import get_client
+                            get_client(caller_name="spirit_worker.creative_journal").write(
                                 "INSERT INTO creative_journal "
                                 "(timestamp, action_type, creation_summary, score, "
                                 "state_delta, words_used, features, epoch_id) "
                                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                                 (time.time(), _obs_action_type, _cj_summary, 0.0, 0.0,
                                  None, json.dumps(_cj_features) if _cj_features else "{}",
-                                 consciousness.get("latest_epoch", {}).get("id", 0)))
-                            _cj_db2.commit()
-                            _cj_db2.close()
+                                 consciousness.get("latest_epoch", {}).get("id", 0)),
+                                table="creative_journal")
                         except Exception as _cj2_err:
                             logger.warning("[CREATIVE_JOURNAL] art/music write error: %s", _cj2_err)
 
@@ -7832,10 +8587,9 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                       if isinstance(_feat_30d, dict) else [])
                         if _j_journey:
                             try:
-                                from titan_plugin.utils.db import safe_connect as _sc_va
                                 import json as _va_json
-                                _va_db = _sc_va("data/inner_memory.db")
-                                _va_db.execute(
+                                from titan_plugin.persistence import get_client
+                                get_client(caller_name="spirit_worker.visual_auto").write(
                                     "INSERT INTO visual_autobiography "
                                     "(timestamp, epoch_id, journey_5d, resonance_5d, "
                                     "semantic_summary, source, filename) "
@@ -7850,9 +8604,8 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                           "structural_order", "narrative_weight"],
                                          _sem))) if _sem else None,
                                      _source,
-                                     _sense_payload.get("filename")))
-                                _va_db.commit()
-                                _va_db.close()
+                                     _sense_payload.get("filename")),
+                                    table="visual_autobiography")
                             except Exception:
                                 pass
 
@@ -8583,6 +9336,13 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     _kr_source = _kr_p.get("source", "unknown")
                     _kr_rid = str(_kr_p.get("request_id", ""))
                     _mcgn = getattr(meta_engine, "_meta_cgn", None)
+                    # A3 (2026-04-21) observability: count every response that
+                    # reaches the handler. Compare against _knowledge_responses_received
+                    # (aggregator path) and _kr_legacy_path_taken to diagnose
+                    # where knowledge loop drops responses.
+                    if _mcgn is not None:
+                        _mcgn._kr_resp_seen_by_handler = getattr(
+                            _mcgn, "_kr_resp_seen_by_handler", 0) + 1
                     # P8 aggregated path: request_id matches pending META-CGN request
                     _handled_by_aggregator = False
                     if _mcgn is not None and _kr_rid and \
@@ -8597,9 +9357,24 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                             if injected:
                                 _mcgn.mark_helpful(
                                     str(winner.get("source", "unknown")))
+                                # BUG-KNOWLEDGE-USAGE-ZERO-T2T3 root fix
+                                # (2026-04-21): dst MUST be "knowledge"
+                                # (the consumer module name). Previously
+                                # str(winner.source) carried a label like
+                                # "external_research" / "internal_recall" /
+                                # "consolidated" / "knowledge_cascade" —
+                                # NOT a registered bus subscriber → DivineBus
+                                # silently dropped the message per
+                                # feedback_bus_dst_must_have_subscriber.md.
+                                # The P8 aggregator path handles most real
+                                # knowledge responses, so this single
+                                # routing error starved every
+                                # CGN_KNOWLEDGE_USAGE signal on all 3
+                                # Titans (78/47/111 concepts, 0 usage).
+                                # The `consumer` payload field carries
+                                # "meta_reasoning" for attribution.
                                 _send_msg(send_queue, "CGN_KNOWLEDGE_USAGE",
-                                          name, str(winner.get("source",
-                                                              "knowledge")),
+                                          name, "knowledge",
                                           {
                                     "topic": str(winner.get("topic", "")),
                                     "reward": 0.3 if rel > 0.3 else 0.1,
@@ -8613,6 +9388,10 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         _handled_by_aggregator = True
                     # Legacy direct path: no matching request_id → inject directly
                     if not _handled_by_aggregator:
+                        # A3 (2026-04-21) observability counter.
+                        if _mcgn is not None:
+                            _mcgn._kr_legacy_path_taken = getattr(
+                                _mcgn, "_kr_legacy_path_taken", 0) + 1
                         _kr_relevance = min(1.0, _kr_conf * 0.8 + 0.2) \
                             if _kr_summary else 0.0
                         _kr_injected = meta_engine.inject_knowledge(
@@ -8661,6 +9440,43 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     )
             except Exception as _ss_err:
                 logger.debug("[MetaCGN P10] signal handler error: %s", _ss_err)
+
+        # ── EMOT_CGN_SIGNAL — self-emitted by EMOT-CGN on state transitions ──
+        # EMOT-CGN's own telemetry signals (cluster_assignment, cluster_emerged,
+        # graduation_transition, rollback_fired). Currently recorded via
+        # BusHealthMonitor in emit_emot_cgn_signal — this handler is the
+        # future hook for cross-system reflection on emotional state changes.
+        elif msg_type == "EMOT_CGN_SIGNAL":
+            try:
+                _ep = msg.get("payload", {}) or {}
+                _ev = str(_ep.get("event_type", ""))
+                # v1: pure observability — orphan check at emit time prevents
+                # malformed signals from reaching here.
+                logger.debug("[EmotCGN] signal received: event=%s intensity=%.2f",
+                             _ev, float(_ep.get("intensity", 1.0)))
+            except Exception as _es_err:
+                logger.debug("[EmotCGN] signal handler error: %s", _es_err)
+
+        # ── CGN_CROSS_INSIGHT routing (Upgrade III, rFP_emot_cgn_v2) ──
+        # Other CGN consumers (META-CGN, language, social, etc.) emit
+        # CGN_CROSS_INSIGHT with dst="all". Route to EMOT-CGN's incoming
+        # handler so emotional β-posterior can consume learning signals
+        # observed elsewhere in the CGN family. Ignore own emissions.
+        elif msg_type == "CGN_CROSS_INSIGHT":
+            try:
+                _ci_p = msg.get("payload", {}) or {}
+                _ci_origin = str(_ci_p.get("origin_consumer", ""))
+                # Skip our own (EMOT-CGN) emissions bouncing back via dst="all"
+                if _ci_origin == "emotional":
+                    pass
+                else:
+                    _emot = getattr(meta_engine, "_emot_cgn", None) \
+                        if meta_engine is not None else None
+                    if _emot is not None:
+                        _emot.handle_incoming_cross_insight(_ci_p)
+            except Exception as _ci_err:
+                logger.debug("[EmotCGN] cross-insight handler error: %s",
+                             _ci_err)
 
         # ── P8 D8.4: META-CGN as responder to external CGN_KNOWLEDGE_REQ ──
         # When other consumers broadcast CGN_KNOWLEDGE_REQ (dst="all"), route
@@ -8941,13 +9757,14 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                                 break
                                         if _updated:
                                             break
-                                    if _updated:
-                                        _mlr_db2.execute(
-                                            "UPDATE vocabulary SET meaning_contexts=? "
-                                            "WHERE word=?",
-                                            (_mlr_json.dumps(_mlr_mc), _mlr_word_a))
-                                        _mlr_db2.commit()
                                 _mlr_db2.close()
+                                if _updated:
+                                    from titan_plugin.persistence import get_client
+                                    get_client(caller_name="spirit_worker.meta_lang").write(
+                                        "UPDATE vocabulary SET meaning_contexts=? "
+                                        "WHERE word=?",
+                                        (_mlr_json.dumps(_mlr_mc), _mlr_word_a),
+                                        table="vocabulary")
                                 logger.info("[META_LANGUAGE] Typed association: "
                                             "'%s' <-> '%s' = %s (sim=%.2f)",
                                             _mlr_word_a, _mlr_word_b,
@@ -8970,6 +9787,49 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                             pass
             except Exception as _mlr_err:
                 logger.warning("[META_LANGUAGE] Request error: %s", _mlr_err)
+
+        # ── META_REASON_REQUEST (F-phase, rFP §4): consumer → meta_service ──
+        # Session 1 DRY-RUN: meta_service immediately emits a response with
+        # failure_mode="not_yet_implemented" so end-to-end routing/schema/
+        # cache/rate-limiter can be validated before real chain execution
+        # lands in Session 2. See titan-docs/rFP_meta_service_interface.md.
+        elif msg_type == "META_REASON_REQUEST":
+            if _meta_service is not None:
+                try:
+                    _meta_service.handle_request(msg)
+                except Exception as _mrr_err:
+                    logger.warning("[MetaService] request handler error: %s",
+                                   _mrr_err)
+            else:
+                logger.debug("[MetaService] request received but service "
+                             "not initialized (req_id=%s)",
+                             (msg.get("payload") or {}).get("request_id", "?"))
+
+        # ── META_REASON_OUTCOME (F-phase, rFP §4.6): consumer → meta_service ──
+        # Signed [-1, +1] feedback. Session 1 just records; Commit 6 will wire
+        # the dynamic-reward accumulator to consume this stream.
+        elif msg_type == "META_REASON_OUTCOME":
+            if _meta_service is not None:
+                try:
+                    _meta_service.handle_outcome(msg)
+                except Exception as _mro_err:
+                    logger.warning("[MetaService] outcome handler error: %s",
+                                   _mro_err)
+
+        # ── META_REASON_RESPONSE (F-phase, rFP §4.3): delivered back to consumers ──
+        # Response messages whose dst resolves to "spirit" (social, reasoning,
+        # coding, self_model, dreaming, reflection consumers all live inside
+        # spirit_worker). Dispatch to the process-local handler registered
+        # via meta_service_client.register_response_handler.
+        elif msg_type == "META_REASON_RESPONSE":
+            try:
+                from titan_plugin.logic.meta_service_client import (
+                    dispatch_meta_response as _dmr,
+                )
+                _dmr(msg, logger_obj=logger)
+            except Exception as _mrrp_err:
+                logger.warning("[MetaService] response dispatch error: %s",
+                               _mrrp_err)
 
         # ── CGN_HAOV_VERIFY_REQ: Hypothesis verification for social/reasoning/self_model/coding ──
         # CGN Worker asks spirit_worker to verify hypotheses for consumers

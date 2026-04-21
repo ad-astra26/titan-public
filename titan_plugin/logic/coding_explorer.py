@@ -347,6 +347,11 @@ class CodingExplorer:
         self._max_per_dream = self._config.get("max_exercises_per_dream", 3)
         self._research_before = self._config.get("research_before_code", True)
         self._arc_cross = self._config.get("arc_cross_pollinate", True)
+        # Layer B — time-based fallback (rFP_coding_explorer_activation.md §4.2)
+        self._time_fallback_enabled = bool(
+            self._config.get("time_fallback_enabled", True))
+        self._time_fallback_seconds = float(
+            self._config.get("time_fallback_seconds", 21600))  # 6h
 
         # CGN consumer client (loaded lazily — needs /dev/shm from CGN worker)
         self._cgn_client = None
@@ -364,6 +369,17 @@ class CodingExplorer:
         self._total_successes = 0
         self._concept_attempts: Dict[str, int] = {}
         self._concept_successes: Dict[str, int] = {}
+        # Layer B state — wallclock anchors for time-based fallback
+        self._boot_ts: float = time.time()
+        self._last_exercise_ts: float = 0.0  # 0 = never; boot_ts is fallback anchor
+        # Layer C — trigger-source telemetry (emergent vs time_fallback).
+        # Derived from trigger["gap_metric"] at explore() time; "time_fallback"
+        # maps to the fallback bucket, anything else to emergent. Surfaced via
+        # get_stats() so arch_map shows WHICH layer is producing exercises.
+        self._trigger_source_counts: Dict[str, int] = {
+            "emergent": 0,
+            "fallback": 0,
+        }
 
         # Initialize DB table
         self._init_db()
@@ -442,6 +458,41 @@ class CodingExplorer:
         """Reset per-dream counter."""
         self._exercises_this_dream = 0
 
+    # ── Layer B — time-based fallback trigger ────────────────────────
+
+    def should_fire_fallback(self, now: float) -> bool:
+        """True if time-based fallback should synthesize a trigger now.
+
+        Fires when no exercise has run for time_fallback_seconds, measured
+        from last exercise or boot (whichever is more recent). Absence of
+        an emergent trigger for this long is itself a signal that cognition
+        needs shaking loose.
+
+        Caller is responsible for also checking can_explore (cooldown gate).
+        """
+        if not self._time_fallback_enabled:
+            return False
+        reference_ts = max(self._boot_ts, self._last_exercise_ts)
+        return (now - reference_ts) >= self._time_fallback_seconds
+
+    def build_fallback_trigger(self, now: float) -> dict:
+        """Synthesize a scheduled_novelty trigger shaped like _se_triggers[0].
+
+        Uses action=implement (default novelty action), moderate urgency 0.5,
+        and gap_metric='time_fallback' so downstream logs record the source
+        distinctly from emergent triggers.
+        """
+        elapsed = now - max(self._boot_ts, self._last_exercise_ts)
+        return {
+            "action": "implement",
+            "urgency": 0.5,
+            "gap_metric": "time_fallback",
+            "gap_delta": round(elapsed, 1),
+            "gap_interpretation": "no emergent trigger",
+            "reason": f"scheduled_novelty after {int(elapsed)}s silence "
+                      f"(threshold {int(self._time_fallback_seconds)}s)",
+        }
+
     def explore(self, trigger: dict, epoch: int,
                 neuromods: dict, context: dict = None) -> Optional[CodingExerciseResult]:
         """Execute a coding exploration exercise.
@@ -495,6 +546,12 @@ class CodingExplorer:
                 timestamp=time.time(),
                 output="Planning step (no execution)",
             )
+            # Layer C — planning-only still counts as coding activity
+            _source_bucket = ("fallback"
+                              if trigger.get("gap_metric") == "time_fallback"
+                              else "emergent")
+            self._trigger_source_counts[_source_bucket] = (
+                self._trigger_source_counts.get(_source_bucket, 0) + 1)
             self._record_result(result)
             return result
 
@@ -536,6 +593,12 @@ class CodingExplorer:
         self._total_exercises += 1
         if result.sandbox_success and result.tests_passed > 0:
             self._total_successes += 1
+        # Layer C — track trigger source (emergent vs fallback)
+        _source_bucket = ("fallback"
+                          if trigger.get("gap_metric") == "time_fallback"
+                          else "emergent")
+        self._trigger_source_counts[_source_bucket] = (
+            self._trigger_source_counts.get(_source_bucket, 0) + 1)
 
         # Track per-concept stats
         self._concept_attempts[concept] = (
@@ -725,6 +788,9 @@ class CodingExplorer:
 
     def _record_result(self, result: CodingExerciseResult):
         """Persist exercise result to DB and send CGN transition."""
+        # Layer B — anchor time-fallback clock on every recorded exercise
+        # (includes planning-only branch, which also constitutes coding activity)
+        self._last_exercise_ts = time.time()
         # DB
         try:
             conn = sqlite3.connect(self._db_path, timeout=5.0)
@@ -944,6 +1010,8 @@ class CodingExplorer:
         """Return coding explorer statistics for monitoring."""
         success_rate = (self._total_successes /
                         max(1, self._total_exercises))
+        now = time.time()
+        reference_ts = max(self._boot_ts, self._last_exercise_ts)
         return {
             "total_exercises": self._total_exercises,
             "total_successes": self._total_successes,
@@ -960,4 +1028,11 @@ class CodingExplorer:
             },
             "sandbox_available": self._sandbox.status() == "available",
             "cgn_client_ready": self._cgn_client is not None,
+            # Layer B + C telemetry
+            "trigger_source_counts": dict(self._trigger_source_counts),
+            "last_exercise_ts": self._last_exercise_ts,
+            "seconds_since_last_exercise": round(now - reference_ts, 1),
+            "time_fallback_enabled": self._time_fallback_enabled,
+            "time_fallback_seconds": self._time_fallback_seconds,
+            "fallback_due": self.should_fire_fallback(now),
         }
