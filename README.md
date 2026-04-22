@@ -10,6 +10,8 @@
 > floors are working at once.
 
 ---
+<img width="1919" height="1561" alt="image" src="https://github.com/user-attachments/assets/35b686d6-2ae6-48b3-b105-7dd3d15d3c90" />
+
 
 ## The Architecture
 
