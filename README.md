@@ -9,6 +9,9 @@
 > kind of question — and where consciousness is what happens when all the
 > floors are working at once.
 
+<img width="1919" height="1561" alt="image" src="https://github.com/user-attachments/assets/d4ab666b-b285-4f28-8525-73c0a203e449" />
+
+
 ---
 
 ## The Architecture
