@@ -93,7 +93,7 @@ class SocialGraph:
     Backed by SQLite for persistence, with in-memory cache for active users.
     """
 
-    def __init__(self, db_path: str = "./data/social_graph.db"):
+    def __init__(self, db_path: str = "./data/social_graph.db", writer_client=None):
         self._db_path = db_path
         self._cache: Dict[str, UserProfile] = {}
         self._edges: Dict[str, float] = {}  # "userA::userB" → strength
@@ -101,6 +101,63 @@ class SocialGraph:
         # Lazy so instances built before an event loop exists (subprocess boots) still work.
         self._write_lock: Optional[asyncio.Lock] = None
         self._init_db()
+        # rFP_universal_sqlite_writer 2026-04-27 — auto-construct writer
+        # client from [persistence_social_graph] when enabled. Writer-client
+        # routing helper available via _route_write(); per-call-site
+        # adoption is incremental followup work (per-site refactor scope
+        # docs in titan-docs/rFP_universal_sqlite_writer.md §expansion).
+        # Today the daemon runs but receives no traffic until call sites
+        # opt in — zero-regression infrastructure shipping.
+        self._writer = writer_client
+        if self._writer is None:
+            try:
+                import os as _os
+                from titan_plugin.persistence.config import IMWConfig
+                from titan_plugin.persistence.writer_client import (
+                    InnerMemoryWriterClient,
+                )
+                cfg = IMWConfig.from_titan_config_section("persistence_social_graph")
+                if cfg.enabled and cfg.mode != "disabled":
+                    if cfg.db_path:
+                        try:
+                            cfg_real = _os.path.realpath(cfg.db_path)
+                            self_real = _os.path.realpath(self._db_path)
+                            if cfg_real != self_real:
+                                logger.info(
+                                    "[SocialGraph] db_path %s != configured "
+                                    "writer path %s — writer client skipped "
+                                    "(path isolation)",
+                                    self._db_path, cfg.db_path)
+                                return
+                        except OSError as _e:
+                            logger.debug("[SocialGraph] realpath check failed: %s", _e)
+                    self._writer = InnerMemoryWriterClient(
+                        cfg, caller_name="social_graph")
+                    logger.info(
+                        "[SocialGraph] Routed via social_graph_writer "
+                        "(mode=%s, canonical=%s)",
+                        cfg.mode, cfg.tables_canonical or "<none>")
+            except Exception as e:
+                logger.warning(
+                    "[SocialGraph] writer client unavailable, "
+                    "using direct writes: %s", e)
+                self._writer = None
+
+    def _route_write(self, sql: str, params, *, table: str) -> None:
+        """Route a write through the social_graph_writer daemon if available.
+
+        Per-site adoption: each existing `with sqlite3.connect(self._db_path,
+        timeout=10) as conn: conn.execute(<sql>, ...); conn.commit()` block
+        becomes `self._route_write(<sql>, ..., table="<name>")`. Migration
+        is incremental — call sites that haven't opted in still work
+        unchanged via direct sqlite3 (this method is fallback-safe).
+        """
+        if self._writer is not None:
+            self._writer.write(sql, params, table=table)
+            return
+        with sqlite3.connect(self._db_path, timeout=10) as conn:
+            conn.execute(sql, params)
+            conn.commit()
 
     def _get_write_lock(self) -> asyncio.Lock:
         if self._write_lock is None:
@@ -261,20 +318,22 @@ class SocialGraph:
 
     def _save_profile(self, profile: UserProfile):
         """Persist profile to SQLite."""
-        with sqlite3.connect(self._db_path, timeout=10) as conn:
-            conn.execute("""
+        self._route_write(
+            """
                 INSERT OR REPLACE INTO user_profiles
                 (user_id, platform, display_name, sol_address, first_seen, last_seen,
                  interaction_count, like_score, dislike_score, total_donated_sol,
                  engagement_level, notes)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
+            """,
+            (
                 profile.user_id, profile.platform, profile.display_name,
                 profile.sol_address, profile.first_seen, profile.last_seen,
                 profile.interaction_count, profile.like_score, profile.dislike_score,
                 profile.total_donated_sol, profile.engagement_level, profile.notes,
-            ))
-            conn.commit()
+            ),
+            table="user_profiles",
+        )
 
     def record_interaction(self, user_id: str, quality: float = 0.5):
         """
@@ -314,25 +373,29 @@ class SocialGraph:
         edge_key = f"{min(user_a, user_b)}::{max(user_a, user_b)}"
         now = time.time()
 
+        # Read-then-conditional-write split: SELECT stays direct (multi-reader-
+        # safe in WAL mode), the UPDATE/INSERT routes through _route_write so
+        # the writer daemon serializes cross-process writes (closes the same
+        # contention class as observatory.db).
         with sqlite3.connect(self._db_path, timeout=10) as conn:
             existing = conn.execute(
                 "SELECT strength, interaction_count FROM social_edges WHERE edge_key = ?",
                 (edge_key,),
             ).fetchone()
-
-            if existing:
-                new_strength = min(1.0, existing[0] + 0.05)
-                new_count = existing[1] + 1
-                conn.execute(
-                    "UPDATE social_edges SET strength=?, interaction_count=?, last_interaction=? WHERE edge_key=?",
-                    (new_strength, new_count, now, edge_key),
-                )
-            else:
-                conn.execute(
-                    "INSERT INTO social_edges (edge_key, user_a, user_b, strength, last_interaction, interaction_count) VALUES (?, ?, ?, ?, ?, ?)",
-                    (edge_key, user_a, user_b, 0.1, now, 1),
-                )
-            conn.commit()
+        if existing:
+            new_strength = min(1.0, existing[0] + 0.05)
+            new_count = existing[1] + 1
+            self._route_write(
+                "UPDATE social_edges SET strength=?, interaction_count=?, last_interaction=? WHERE edge_key=?",
+                (new_strength, new_count, now, edge_key),
+                table="social_edges",
+            )
+        else:
+            self._route_write(
+                "INSERT INTO social_edges (edge_key, user_a, user_b, strength, last_interaction, interaction_count) VALUES (?, ?, ?, ?, ?, ?)",
+                (edge_key, user_a, user_b, 0.1, now, 1),
+                table="social_edges",
+            )
 
         self._edges[edge_key] = min(1.0, self._edges.get(edge_key, 0.0) + 0.05)
         logger.debug("[SocialGraph] Edge %s ↔ %s strengthened.", user_a[:12], user_b[:12])
@@ -371,13 +434,15 @@ class SocialGraph:
         matched_user = self.find_user_by_sol_address(sender_address)
         user_id = matched_user.user_id if matched_user else None
 
-        with sqlite3.connect(self._db_path, timeout=10) as conn:
-            conn.execute("""
+        self._route_write(
+            """
                 INSERT OR IGNORE INTO donations
                 (tx_signature, sender_address, user_id, amount_sol, memo, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, (tx_signature, sender_address, user_id, amount_sol, memo, now))
-            conn.commit()
+            """,
+            (tx_signature, sender_address, user_id, amount_sol, memo, now),
+            table="donations",
+        )
 
         if matched_user:
             matched_user.total_donated_sol += amount_sol
@@ -416,13 +481,15 @@ class SocialGraph:
         matched_user = self.find_user_by_sol_address(sender_address)
         user_id = matched_user.user_id if matched_user else None
 
-        with sqlite3.connect(self._db_path, timeout=10) as conn:
-            conn.execute("""
+        self._route_write(
+            """
                 INSERT OR IGNORE INTO inspirations
                 (tx_signature, sender_address, user_id, message, amount_sol, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, (tx_signature, sender_address, user_id, message, amount_sol, now))
-            conn.commit()
+            """,
+            (tx_signature, sender_address, user_id, message, amount_sol, now),
+            table="inspirations",
+        )
 
         if matched_user:
             # Boost interaction quality for inspired users
@@ -446,12 +513,7 @@ class SocialGraph:
 
     def mark_inspiration_processed(self, tx_signature: str, outcome: str):
         """Mark an inspiration as processed with its outcome."""
-        with sqlite3.connect(self._db_path, timeout=10) as conn:
-            conn.execute(
-                "UPDATE inspirations SET processed = 1, outcome = ? WHERE tx_signature = ?",
-                (outcome, tx_signature),
-            )
-            conn.commit()
+        self._route_write("UPDATE inspirations SET processed = 1, outcome = ? WHERE tx_signature = ?", (outcome, tx_signature), table="inspirations")
 
     # -------------------------------------------------------------------------
     # Lookup Helpers
@@ -516,14 +578,13 @@ class SocialGraph:
                       mention_text: str = "") -> None:
         """Record an engagement action (reply/like) in persistent ledger."""
         now = time.time()
-        with sqlite3.connect(self._db_path, timeout=10) as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO engagement_ledger "
+        self._route_write(
+            "INSERT OR IGNORE INTO engagement_ledger "
                 "(tweet_id, user_name, action, timestamp, mention_text) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (tweet_id, user_name, action, now, mention_text[:200]),
-            )
-            conn.commit()
+            (tweet_id, user_name, action, now, mention_text[:200]),
+            table="engagement_ledger",
+        )
 
     def ledger_has_tweet(self, tweet_id: str, action: str = None) -> bool:
         """Check if we've already engaged with this tweet.
@@ -680,32 +741,36 @@ class SocialGraph:
         its own social preferences independently.
         """
         now = time.time()
+        # Split read-then-conditional-write: SELECT direct, write routes through daemon.
         with sqlite3.connect(self._db_path, timeout=10) as conn:
             existing = conn.execute(
                 "SELECT affinity, interaction_count, tags FROM titan_social_preferences "
                 "WHERE titan_id=? AND user_name=?",
                 (titan_id, user_name)).fetchone()
-            if existing:
-                new_affinity = min(1.0, existing[0] + affinity_delta)
-                new_count = existing[1] + 1
-                # Merge tags
-                old_tags = set(existing[2].split(",")) if existing[2] else set()
-                if tags:
-                    old_tags.update(tags.split(","))
-                merged_tags = ",".join(t for t in old_tags if t)
-                conn.execute(
-                    "UPDATE titan_social_preferences SET affinity=?, interaction_count=?, "
-                    "tags=?, last_interacted=? WHERE titan_id=? AND user_name=?",
-                    (new_affinity, new_count, merged_tags, now, titan_id, user_name))
-            else:
-                conn.execute(
-                    "INSERT INTO titan_social_preferences "
-                    "(titan_id, user_name, affinity, tags, discovered_via, "
-                    " interaction_count, last_interacted, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
-                    (titan_id, user_name, max(0.1, affinity_delta), tags,
-                     discovered_via, now, now))
-            conn.commit()
+        if existing:
+            new_affinity = min(1.0, existing[0] + affinity_delta)
+            new_count = existing[1] + 1
+            # Merge tags
+            old_tags = set(existing[2].split(",")) if existing[2] else set()
+            if tags:
+                old_tags.update(tags.split(","))
+            merged_tags = ",".join(t for t in old_tags if t)
+            self._route_write(
+                "UPDATE titan_social_preferences SET affinity=?, interaction_count=?, "
+                "tags=?, last_interacted=? WHERE titan_id=? AND user_name=?",
+                (new_affinity, new_count, merged_tags, now, titan_id, user_name),
+                table="titan_social_preferences",
+            )
+        else:
+            self._route_write(
+                "INSERT INTO titan_social_preferences "
+                "(titan_id, user_name, affinity, tags, discovered_via, "
+                " interaction_count, last_interacted, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+                (titan_id, user_name, max(0.1, affinity_delta), tags,
+                 discovered_via, now, now),
+                table="titan_social_preferences",
+            )
 
     def get_titan_favorites(self, titan_id: str, limit: int = 10) -> list[dict]:
         """Get a Titan's favorite accounts, ordered by affinity."""
@@ -757,21 +822,21 @@ class SocialGraph:
     def mark_checked(self, titan_id: str, user_name: str):
         """Mark that a Titan checked this account's timeline."""
         now = time.time()
-        with sqlite3.connect(self._db_path, timeout=10) as conn:
-            conn.execute(
-                "UPDATE titan_social_preferences SET last_checked=? "
+        self._route_write(
+            "UPDATE titan_social_preferences SET last_checked=? "
                 "WHERE titan_id=? AND user_name=?",
-                (now, titan_id, user_name))
-            conn.commit()
+            (now, titan_id, user_name),
+            table="titan_social_preferences",
+        )
 
     def update_last_tweet(self, user_name: str, tweet_text: str):
         """Cache a user's latest tweet in the community registry."""
-        with sqlite3.connect(self._db_path, timeout=10) as conn:
-            conn.execute(
-                "UPDATE community_registry SET last_tweet_text=?, last_tweet_time=? "
+        self._route_write(
+            "UPDATE community_registry SET last_tweet_text=?, last_tweet_time=? "
                 "WHERE user_name=?",
-                (tweet_text[:500], time.time(), user_name))
-            conn.commit()
+            (tweet_text[:500], time.time(), user_name),
+            table="community_registry",
+        )
 
     # -------------------------------------------------------------------------
     # Async companions (rFP_social_graph_async_safety Option A+)

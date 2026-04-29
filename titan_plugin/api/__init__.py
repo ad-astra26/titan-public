@@ -4,26 +4,102 @@ titan_plugin.api — Sovereign Observatory REST API + WebSocket server.
 Factory function creates a FastAPI app wired to the TitanPlugin instance.
 Uvicorn runs as a non-blocking background task inside the plugin's event loop.
 """
+import asyncio
 import logging
+import threading
+import time
 from contextlib import asynccontextmanager
+from queue import Empty
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .events import EventBus
 
 logger = logging.getLogger(__name__)
 
 
-def create_app(plugin, event_bus: EventBus, config: dict | None = None, agent=None) -> FastAPI:
+class _BusPublishShim:
+    """Adapter so BusSubscriber's ``send_queue.put(msg)`` routes through
+    ``DivineBus.publish(msg)`` for the in-process bridge.
+
+    Lets us reuse BusSubscriber unchanged (it expects a queue-like target
+    with a ``.put()`` method — designed around mp.Queue / SocketQueue).
+    The adapter converts that ``.put()`` into ``bus.publish()`` so the
+    bridge can issue STATE_SNAPSHOT_REQUEST without owning a separate
+    send pipe.
+
+    Forward-compat: identical wire shape regardless of bus transport
+    (mp.Queue today, BusSocket post-B.3, Rust bus in Phase C).
+    """
+
+    __slots__ = ("_bus",)
+
+    def __init__(self, bus) -> None:
+        self._bus = bus
+
+    def put(self, msg: dict, block: bool = True, timeout: float | None = None) -> None:  # noqa: ARG002
+        # block/timeout intentionally ignored — DivineBus.publish() is
+        # non-blocking by design. Signature matches Queue.put() contract
+        # so BusSubscriber doesn't need a code path branch.
+        self._bus.publish(msg)
+
+
+def _start_inprocess_bus_listener(recv_q, bus_subscriber) -> threading.Thread:
+    """Spawn a daemon thread that drains ``recv_q`` and dispatches to
+    ``BusSubscriber.handle_message()``.
+
+    Mirrors ``titan_plugin/api/api_subprocess.py:_bus_listener_loop`` but
+    stays in-process (legacy ``api_process_separation_enabled=False``
+    mode). Non-handled messages are discarded — OBSERVATORY_EVENT for
+    websocket bridge already publishes directly to event_bus in the same
+    process, so no rerouting needed here (unlike the subprocess case).
+    """
+    def _loop():
+        while True:
+            try:
+                msg = recv_q.get(timeout=1.0)
+            except Empty:
+                continue
+            except Exception:
+                # Bus closed / queue removed — exit cleanly.
+                return
+            try:
+                bus_subscriber.handle_message(msg)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[InProcessBusListener] dispatch error: %s", e)
+
+    t = threading.Thread(
+        target=_loop,
+        daemon=True,
+        name="api-inprocess-bus-listener",
+    )
+    t.start()
+    return t
+
+
+def create_app(plugin, event_bus: EventBus, config: dict | None = None,
+               agent=None, titan_state=None, chat_bridge_bus=None) -> FastAPI:
     """
     Build the Sovereign Observatory FastAPI application.
 
     Args:
-        plugin: TitanPlugin instance (stored in app.state for endpoint access).
-        event_bus: Shared EventBus for WebSocket broadcasting.
+        plugin: Either a TitanPlugin instance (legacy in-process mode) OR
+            a kernel_rpc._RPCRemoteRef transparent proxy (subprocess mode,
+            api_process_separation_enabled=true). Endpoint code reads
+            ``request.app.state.titan_plugin.X.Y(...)`` and the proxy
+            routes the call over /tmp/titan_kernel_{titan_id}.sock — no
+            endpoint code change needed (Microkernel v2 §A.4 / S5).
+        event_bus: EventBus for WebSocket broadcasting. In subprocess
+            mode this is a fresh EventBus owned by the API subprocess;
+            kernel-side events flow via OBSERVATORY_EVENT bus messages
+            translated by api_subprocess_main's bus listener thread.
         config: Optional [api] config dict with keys: cors_origins, rate_limit.
-        agent: Optional Agno Agent instance for /chat endpoint.
+        agent: Optional Agno Agent instance for /chat endpoint. None when
+            running in api_subprocess (chat endpoints route through proxy
+            to the agent that lives in the main kernel process).
 
     Returns:
         Configured FastAPI app ready for uvicorn.Server.
@@ -33,6 +109,19 @@ def create_app(plugin, event_bus: EventBus, config: dict | None = None, agent=No
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger.info("[Observatory] Starting Sovereign Observatory API...")
+        # 2026-04-27 hardening: eager-start the tc-status-warmer so the
+        # /v4/timechain/* warm cache begins populating at API boot — not
+        # lazily on first request. Reduces the cold-boot window where
+        # /v4/timechain/status falls through to the bounded sync fetch.
+        # Without this, every api_subprocess restart (Guardian-driven
+        # under RSS pressure on T1) re-introduces a 1-15s vulnerable
+        # window. Lifespan placement (vs module-level) keeps test imports
+        # clean — the warmer only fires when the API is actually booting.
+        try:
+            from titan_plugin.api.dashboard import _start_tc_status_warmer
+            _start_tc_status_warmer()
+        except Exception as _eager_err:
+            logger.warning("[TCStatusWarmer] eager-start in lifespan failed: %s", _eager_err)
         yield
         logger.info("[Observatory] Sovereign Observatory shutting down.")
 
@@ -60,10 +149,152 @@ def create_app(plugin, event_bus: EventBus, config: dict | None = None, agent=No
     from starlette.middleware.gzip import GZipMiddleware
     app.add_middleware(GZipMiddleware, minimum_size=500)
 
+    # ── Request-timeout middleware (microkernel v2 architectural guarantee) ──
+    # Microkernel v2's promise is a lightning-fast API: endpoints read
+    # from the CachedState / shm registries that background workers + the
+    # snapshot publisher keep current, NEVER do slow in-line work. This
+    # middleware enforces that promise: any request exceeding
+    # `request_timeout_s` (default 3s) is cancelled and returned as HTTP
+    # 504. Frontend polling stays predictable; one misbehaving endpoint
+    # cannot hang the whole API.
+    #
+    # Endpoints that genuinely need longer (large bulk exports, etc.)
+    # should opt out by reading `request.scope["bypass_request_timeout"] = True`
+    # in the handler before its first await — checked at the outer wrap
+    # via the per-request flag below.
+    request_timeout_s = float(config.get("request_timeout_s", 3.0))
+
+    @app.middleware("http")
+    async def _request_timeout(request: Request, call_next):
+        # Cheap fast-path for health probes — never time them out.
+        path = request.url.path
+        if path in ("/health", "/ws", "/metrics"):
+            return await call_next(request)
+        # Diagnostic admin endpoints (memory-profile, heap-dump) are
+        # intentionally slower than 3s — they walk gc.get_objects() or
+        # do tracemalloc snapshots. They're called rarely + manually,
+        # so the "fast endpoint" architectural guarantee doesn't apply.
+        # Closes the heap-dump-times-out blocker exposed during the
+        # 2026-04-27 worker-stability audit.
+        if path.startswith("/v4/admin/"):
+            return await call_next(request)
+        # /chat + /chat/stream invoke the full agent pipeline (memory
+        # recall + LLM inference + post-hooks) which legitimately takes
+        # 5-30s. They're not "fast cached-state endpoints" — they're
+        # interactive cognitive operations. Bypass the 3s budget;
+        # chat-specific timeouts live inside the agent itself.
+        if path.startswith("/chat"):
+            return await call_next(request)
+        t0 = time.monotonic()
+        try:
+            return await asyncio.wait_for(
+                call_next(request), timeout=request_timeout_s)
+        except asyncio.TimeoutError:
+            elapsed = time.monotonic() - t0
+            logger.warning(
+                "[RequestTimeout] %s %s exceeded %.1fs (elapsed=%.2fs) — "
+                "endpoint should read from cache, not compute in-line",
+                request.method, path, request_timeout_s, elapsed)
+            return JSONResponse(
+                status_code=504,
+                content={
+                    "status": "error",
+                    "error": "request_timeout",
+                    "path": path,
+                    "timeout_s": request_timeout_s,
+                    "hint": ("Endpoint did not return within budget. "
+                             "Likely doing in-line slow work; should "
+                             "read from cached_state/shm instead."),
+                },
+            )
+
     # Store plugin + event bus + agent in app.state for endpoint access
     app.state.titan_plugin = plugin
     app.state.event_bus = event_bus
     app.state.titan_agent = agent
+    # 2026-04-29 — chat bus bridge (BUG-CHAT-AGENT-NOT-INITIALIZED-API-
+    # SUBPROCESS architectural fix). Subprocess mode passes a
+    # ChatBridgeClient with `await request_async("chat_subproc",
+    # "chat_handler", payload, timeout=60)` semantics. chat.py reads
+    # this when agent is None and forwards via bus instead of returning
+    # 503. Legacy in-process mode passes None — chat.py uses the local
+    # plugin.run_chat() directly.
+    app.state.chat_bridge_bus = chat_bridge_bus
+    # S5 amendment (2026-04-25): TitanStateAccessor — primary state-access
+    # object for post-codemod endpoint code (titan_state.X.Y patterns).
+    # Falls back to the plugin proxy when titan_state is None (legacy
+    # in-process mode where api lives in same process as kernel).
+    if titan_state is None:
+        # Microkernel v2 §A.4 amendment 2026-04-28: legacy in-process bridge.
+        #
+        # Pre-fix: this branch built TitanStateAccessor with an empty
+        # CachedState and no BusSubscriber, so every /v4/* endpoint
+        # reading titan_state.X.read_X() returned {} forever (BUG #3
+        # documented in BUGS.md 2026-04-28 PM late). Comment promised
+        # "sourcing values from the plugin" but the wiring wasn't there.
+        #
+        # Post-fix: same TitanStateAccessor is constructed, AND a
+        # BusSubscriber + listener thread are wired against the kernel's
+        # in-process DivineBus via plugin.bus.subscribe("api"). The
+        # kernel's state-snapshot publisher (which now runs unconditionally
+        # — see kernel._start_state_snapshot_publisher) emits dst="api"
+        # snapshots every 2s; per-event *_UPDATED publishers (balance,
+        # dreaming, cgn, language, etc.) emit dst="all"; both reach this
+        # subscriber and populate cached_state via BusSubscriber.handle_
+        # message().
+        #
+        # When api_process_separation flips to true later, this branch
+        # is not taken (titan_state arrives non-None from api_subprocess)
+        # and api_subprocess owns the BusSubscriber via Unix-socket. Same
+        # publisher, transport-equivalent consumers, no behavior divergence.
+        #
+        # Forward-compat with Phase B.3 (mp.Queue retirement) + Phase C
+        # (Rust bus): bridge uses bus.subscribe()/publish() — the public
+        # contract that survives transport swaps.
+        try:
+            from titan_plugin.api.cached_state import CachedState
+            from titan_plugin.api.shm_reader_bank import ShmReaderBank
+            from titan_plugin.api.command_sender import CommandSender
+            from titan_plugin.api.state_accessor import TitanStateAccessor
+            from titan_plugin.api.bus_subscriber import BusSubscriber
+            cached_state = CachedState()
+            titan_state = TitanStateAccessor(
+                shm=ShmReaderBank(),
+                cache=cached_state,
+                commands=CommandSender(send_queue=None),
+                full_config=config or {},
+            )
+            _kernel_bus = getattr(plugin, "bus", None) if plugin else None
+            if _kernel_bus is not None:
+                try:
+                    _api_recv_q = _kernel_bus.subscribe("api")
+                    _bus_sub = BusSubscriber(
+                        cached_state=cached_state,
+                        send_queue=_BusPublishShim(_kernel_bus),
+                    )
+                    _start_inprocess_bus_listener(_api_recv_q, _bus_sub)
+                    _bus_sub.request_snapshot()
+                    logger.info(
+                        "[create_app] in-process BusSubscriber bridge wired "
+                        "(api_process_separation=False legacy mode); "
+                        "observatory endpoints will populate from bus events")
+                except Exception as bridge_err:  # noqa: BLE001
+                    logger.warning(
+                        "[create_app] in-process bus bridge wiring failed: "
+                        "%s — observatory endpoints will return empty data",
+                        bridge_err, exc_info=True)
+            else:
+                logger.warning(
+                    "[create_app] plugin.bus is None — cannot wire "
+                    "in-process BusSubscriber bridge; observatory "
+                    "endpoints will return empty data")
+        except Exception as e:
+            logger.warning(
+                "[create_app] StateAccessor construction failed in legacy "
+                "mode (%s) — endpoints reading titan_state.X will fail",
+                e)
+            titan_state = None
+    app.state.titan_state = titan_state
 
     # ── TitanMaker substrate (R8 + future Maker-Titan dialogic flow) ──
     # The substrate lives in the MAIN process (where dashboard endpoints
@@ -87,36 +318,43 @@ def create_app(plugin, event_bus: EventBus, config: dict | None = None, agent=No
         # Maker pubkey from soul (may be None if soul not yet loaded)
         _maker_pubkey = None
         try:
-            if plugin and plugin.soul and getattr(
-                    plugin.soul, "_maker_pubkey", None):
-                _maker_pubkey = str(plugin.soul._maker_pubkey)
+            if plugin and titan_state.soul and getattr(
+                    titan_state.soul, "_maker_pubkey", None):
+                _maker_pubkey = str(titan_state.soul.maker_pubkey)
         except Exception:
             pass
         _titan_maker = TitanMaker(
             proposal_store=_proposal_store,
             maker_pubkey=_maker_pubkey,
         )
-        # Tier 2 — wire the SomaticChannel via the TitanCore DivineBus.
-        # plugin.bus is the DivineBus instance from v5_core.TitanCore;
-        # spirit_worker subscribes to MAKER_RESPONSE_RECEIVED via its
-        # own subprocess queue and DivineBus routes dst="all" to it.
+        # Tier 2 — wire the SomaticChannel via the bus shim.
+        # Microkernel v2 D5 amendment (2026-04-26): plugin.bus is now a
+        # kernel_rpc proxy ref that doesn't expose .publish() in api_subprocess.
+        # titan_state.bus (_BusShim) routes publish() → CommandSender →
+        # OBSERVATORY_EVENT bus, which spirit_worker still subscribes to via
+        # its own subprocess queue. End result: same wire shape, no plugin
+        # coupling.
+        _bus_target = (titan_state.bus
+                       if titan_state is not None and getattr(titan_state, "bus", None) is not None
+                       else getattr(plugin, "bus", None) if plugin else None)
         try:
-            if plugin and hasattr(plugin, "bus") and plugin.bus is not None:
+            if _bus_target is not None:
                 from titan_plugin.maker.somatic_channel import SomaticChannel
                 _titan_maker.set_somatic_channel(
-                    SomaticChannel(bus=plugin.bus, src_module="titan_maker"))
+                    SomaticChannel(bus=_bus_target, src_module="titan_maker"))
                 logger.info(
-                    "[Observatory] TitanMaker SomaticChannel wired to DivineBus")
+                    "[Observatory] TitanMaker SomaticChannel wired "
+                    "(via %s)", type(_bus_target).__name__)
         except Exception as sc_err:
             logger.warning(
                 "[Observatory] SomaticChannel wiring failed: %s", sc_err)
-        # Tier 3 — wire NarrativeChannel + MakerProfile
+        # Tier 3 — wire NarrativeChannel + MakerProfile (same bus shim).
         try:
-            if plugin and hasattr(plugin, "bus") and plugin.bus is not None:
+            if _bus_target is not None:
                 from titan_plugin.maker.narrative_channel import NarrativeChannel
                 from titan_plugin.maker.maker_profile import MakerProfile
                 _narrative_ch = NarrativeChannel(
-                    bus=plugin.bus, src_module="titan_maker")
+                    bus=_bus_target, src_module="titan_maker")
                 _maker_profile = MakerProfile(db_path=_maker_db_path)
                 _titan_maker.set_narrative_channel(_narrative_ch)
                 _titan_maker._profile = _maker_profile

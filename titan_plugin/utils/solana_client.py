@@ -254,6 +254,16 @@ def derive_vault_pda(
         return None
 
     try:
+        # rFP_observatory_data_loading_v1 §3.3 (2026-04-26): accept both
+        # Pubkey objects and base58 strings. NetworkAccessor.pubkey returns
+        # str (cached from network.info), and bytes(<str>) raises
+        # "string argument without an encoding" — the silent failure that
+        # made vault PDA derivation always return None on api_subprocess
+        # → STATE_ROOT_ZK = STUB / DEGRADED, On-Chain Vault = "No vault data".
+        if isinstance(authority_pubkey, str):
+            if not authority_pubkey:
+                return None
+            authority_pubkey = Pubkey.from_string(authority_pubkey)
         program_id = Pubkey.from_string(program_id_str or VAULT_PROGRAM_ID)
         pda, bump = Pubkey.find_program_address(
             [VAULT_PDA_SEED, bytes(authority_pubkey)],

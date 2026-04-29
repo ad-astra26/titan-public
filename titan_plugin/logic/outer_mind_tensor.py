@@ -24,8 +24,8 @@ OUTER_MIND_DIM_NAMES = [
     "research_effectiveness", "knowledge_retrieval", "situational_awareness",
     "problem_solving", "communication_clarity",
     # Feeling (5-9) — material world-sensing
-    "social_temperature", "community_resonance", "market_awareness",
-    "threat_sensing", "environmental_pressure",
+    "social_temperature", "social_connection", "network_weather",
+    "environmental_rhythm", "external_information_flow",
     # Willing (10-14) — material world-acting
     "action_throughput", "social_initiative", "creative_output",
     "protective_response", "exploration_drive",

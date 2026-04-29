@@ -20,18 +20,22 @@ class TestOuterMindTensor15D:
         assert result[1] > 0.7
         assert result[4] > 0.7
 
-    def test_feeling_threat_sensing(self):
+    def test_willing_protective_response(self):
+        """Guardian-driven protective_response dim (willing[3] = dim 13).
+        Replaces the obsolete `threat_sensing` test: feeling[3] (dim 8) was
+        reframed from threat-driven to `environmental_rhythm` (blockchain
+        /circadian/network), and the guardian-rejection signal moved to
+        willing[3] as `protective_response`."""
         from titan_plugin.logic.outer_mind_tensor import collect_outer_mind_15d
-        # High threats = low comfort
-        result_safe = collect_outer_mind_15d(
+        result_quiet = collect_outer_mind_15d(
             [0.5] * 5,
-            guardian_stats={"threats_detected": 0, "severity_avg": 0.0},
+            guardian_stats={"rejections_per_window": 0},
         )
-        result_danger = collect_outer_mind_15d(
+        result_active = collect_outer_mind_15d(
             [0.5] * 5,
-            guardian_stats={"threats_detected": 10, "severity_avg": 0.8},
+            guardian_stats={"rejections_per_window": 5},
         )
-        assert result_safe[8] > result_danger[8]  # Threat sensing dim
+        assert result_active[13] > result_quiet[13]  # Protective response dim
 
     def test_willing_from_actions(self):
         from titan_plugin.logic.outer_mind_tensor import collect_outer_mind_15d

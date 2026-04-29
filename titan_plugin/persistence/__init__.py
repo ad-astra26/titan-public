@@ -1,13 +1,25 @@
-"""Inner Memory Writer Service (IMW) — single-writer daemon for data/inner_memory.db.
+"""SQLite single-writer service — generic per-DB write-contention pattern.
+
+Originally shipped as Inner Memory Writer (IMW) for `data/inner_memory.db`,
+the engine is path-agnostic and supports any SQLite DB via a per-DB config
+section. See `titan-docs/rFP_universal_sqlite_writer.md` for the adoption
+recipe (config section, ModuleSpec, client wiring, table-by-table cutover).
 
 Public API:
-    from titan_plugin.persistence import get_client, WriteResult
+    from titan_plugin.persistence import SqliteWriterClient, IMWConfig
 
-    client = get_client()
-    result = client.write("INSERT INTO ... VALUES (?, ?)", (a, b))
+    cfg = IMWConfig.from_titan_config_section("persistence_<dbname>")
+    client = SqliteWriterClient(cfg, caller_name="<dbname>")
+    result = client.write("INSERT INTO ... VALUES (?, ?)", (a, b),
+                          table="<tablename>")
     assert result.ok
 
-See titan-docs/PLAN_inner_memory_writer_service.md for design.
+Backwards-compat: `InnerMemoryWriterClient` remains as an alias to
+`SqliteWriterClient` so all existing call sites keep working.
+
+See `titan-docs/finished/PLAN_inner_memory_writer_service.md` for the
+original design + `titan-docs/rFP_universal_sqlite_writer.md` for the
+generalization (2026-04-27).
 """
 
 from .writer_client import (
@@ -19,7 +31,14 @@ from .writer_client import (
     reset_client,
 )
 
+# Generic alias — preferred name for new call sites.
+# Per rFP_universal_sqlite_writer Phase 4 (2026-04-27).
+SqliteWriterClient = InnerMemoryWriterClient
+
 __all__ = [
+    # Generic names (preferred)
+    "SqliteWriterClient",
+    # Backwards-compat names
     "InnerMemoryWriterClient",
     "WriteResult",
     "WriterDisabledError",

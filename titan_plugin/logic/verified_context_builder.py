@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger("VerifiedContextBuilder")
 
@@ -283,7 +284,8 @@ class StoreRouter:
                 return handler(parsed, limit)
             return []
         except Exception as e:
-            logger.debug("[VCB] Store query failed for %s: %s", store_key, e)
+            swallow_warn(f'[VCB] Store query failed for {store_key}', e,
+                         key="logic.verified_context_builder.store_query_failed_for", throttle=100)
             return []
 
     def _connect(self, db_name: str) -> sqlite3.Connection:

@@ -16,16 +16,48 @@ exponential weighting. A velocity component detects sudden changes
   [3] Entropy — disorder + network health (errors, connectivity)
   [4] Thermal — heat synthesis: physical (CPU load) × digital (topology activity)
 
+S7 (microkernel v2 §A.7 / §L1, 2026-04-26): when
+``microkernel.shm_body_fast_enabled`` is true, this worker runs the
+3-layer Trinity Daemon Internal Design pattern: per-sense background
+refresh threads at native cadences populate a SensorCache; the tick
+layer reads cache only and writes the 5D tensor to /dev/shm at the
+Schumann fundamental rate (7.83 Hz, 127.7 ms period). Pre-S7 inline
+sensor calls (524 ms/call worst-case) drop to ~100 μs/tick.
+
+Default flag-OFF preserves byte-identical pre-S7 behavior — no
+threads start, sensor calls happen inline as before.
+
 Entry point: body_worker_main(recv_queue, send_queue, name, config)
 """
 import logging
 import os
 import sys
+import threading
 import time
 from collections import deque
 from enum import IntEnum
+from titan_plugin import bus
 
 logger = logging.getLogger(__name__)
+
+# ── S7 Schumann shm writer cadence (microkernel v2 §A.7 / §L1) ─────
+_BODY_SCHUMANN_HZ = 7.83  # Schumann fundamental
+_BODY_TICK_PERIOD_S = 1.0 / _BODY_SCHUMANN_HZ  # ≈ 0.1277 s
+
+# ── S7 per-sense refresh cadences (matches sensor's natural timescale) ──
+# - interoception:  2 file reads (anchor + balance); 5s captures changes
+# - proprioception: 1 file read (body_topology written by spirit clock);
+#                   2s aligned with spirit clock tick (~1.15s)
+# - somatosensation: psutil.cpu_percent(interval=0.5) — fastest sense; 1Hz
+# - entropy:        4 socket connects (≤8s) + log tail; 10s amortizes cost
+# - thermal:        loadavg + topology read + circadian math; 2s
+_BODY_REFRESH_PERIODS_S = {
+    "interoception": 5.0,
+    "proprioception": 2.0,
+    "somatosensation": 1.0,
+    "entropy": 10.0,
+    "thermal": 2.0,
+}
 
 # ── Category weights (exponential) ──────────────────────────────────
 
@@ -70,14 +102,53 @@ def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     # FOCUS nudges from Spirit PID controller (suggestions, not overrides)
     focus_nudges = [0.0] * 5
 
+    # ── S7: §L1 fast-path setup (flag-gated) ──────────────────────
+    # When microkernel.shm_body_fast_enabled is true, start per-sense
+    # refresh threads + 7.83 Hz shm writer thread. Tick layer reads
+    # from cache (no I/O on hot path).
+    sensor_cache = None
+    refresh_threads = []
+    shm_writer_thread = None
+    shm_bank = None
+    body_5d_writer = None
+    fast_stop_event = threading.Event()
+
+    fast_enabled = _read_flag(config, "microkernel.shm_body_fast_enabled", False)
+    if fast_enabled:
+        try:
+            sensor_cache, refresh_threads, shm_bank, body_5d_writer, shm_writer_thread = (
+                _start_fast_path(thresholds, config, fast_stop_event,
+                                 lambda: (severity_multipliers, focus_nudges))
+            )
+            logger.info(
+                "[BodyWorker] §L1 fast path ON: 5 refresh threads + 7.83 Hz shm writer"
+            )
+        except Exception as exc:
+            logger.warning(
+                "[BodyWorker] §L1 fast-path init failed (%s); falling back to inline senses",
+                exc,
+            )
+            sensor_cache = None
+            refresh_threads = []
+            shm_writer_thread = None
+
     # Signal ready
-    _send_msg(send_queue, "MODULE_READY", name, "guardian", {})
-    logger.info("[BodyWorker] 5DT somatic sensors online")
+    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
+    logger.info("[BodyWorker] 5DT somatic sensors online (fast=%s)", bool(sensor_cache))
 
     last_publish = 0.0
     publish_interval = 3.45   # Body = Schumann/27 (0.29 Hz) — Earth resonance
     last_heartbeat = 0.0
     publish_count = 0  # observability — periodic summary cadence
+
+    # ── Microkernel v2 Phase B.1 §6 — readiness/hibernate reporter ──
+    from titan_plugin.core.readiness_reporter import trivial_reporter
+    def _b1_save_state():
+        return []
+    _b1_reporter = trivial_reporter(
+        worker_name=name, layer="L1", send_queue=send_queue,
+        save_state_cb=_b1_save_state,
+    )
 
     while True:
         # Heartbeat on every iteration (not just Empty timeout)
@@ -93,7 +164,8 @@ def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             now = time.time()
             if now - last_publish >= publish_interval:
                 tensor, details = _collect_body_tensor(history, thresholds,
-                                                       severity_multipliers, focus_nudges)
+                                                       severity_multipliers, focus_nudges,
+                                                       cache=sensor_cache)
                 _publish_body_state(send_queue, name, tensor, details, severity_multipliers)
                 last_publish = now
                 publish_count += 1
@@ -113,12 +185,32 @@ def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
         msg_type = msg.get("type", "")
 
-        if msg_type == "MODULE_SHUTDOWN":
+        # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────
+        if _b1_reporter.handles(msg_type):
+            _b1_reporter.handle(msg)
+            if _b1_reporter.should_exit():
+                break
+            continue
+
+        # ── Microkernel v2 Phase B.2.1 — supervision-transfer dispatch ──
+        from titan_plugin.core import worker_swap_handler as _swap
+        if _swap.maybe_dispatch_swap_msg(msg):
+            continue
+
+        if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[BodyWorker] Shutdown: %s", msg.get("payload", {}).get("reason"))
+            # Stop S7 fast-path threads cleanly so they don't keep
+            # writing shm during/after subprocess teardown.
+            if refresh_threads or shm_writer_thread:
+                from titan_plugin.core.sensor_cache import stop_threads
+                _all = list(refresh_threads)
+                if shm_writer_thread is not None:
+                    _all.append(shm_writer_thread)
+                stop_threads(fast_stop_event, _all, timeout_s=2.0)
             break
 
         # Receive FILTER_DOWN severity multipliers from Spirit
-        if msg_type == "FILTER_DOWN":
+        if msg_type == bus.FILTER_DOWN:
             new_mult = msg.get("payload", {}).get("multipliers")
             if new_mult and len(new_mult) == 5:
                 severity_multipliers = new_mult
@@ -126,7 +218,7 @@ def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                             [round(m, 2) for m in severity_multipliers])
 
         # Receive FOCUS nudges from Spirit PID controller
-        elif msg_type == "FOCUS_NUDGE":
+        elif msg_type == bus.FOCUS_NUDGE:
             new_nudges = msg.get("payload", {}).get("nudges")
             if new_nudges and len(new_nudges) == 5:
                 focus_nudges = new_nudges
@@ -134,15 +226,16 @@ def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                              [round(n, 3) for n in focus_nudges])
 
         # Receive conversation stimulus → compute Body reflex Intuition
-        elif msg_type == "CONVERSATION_STIMULUS":
+        elif msg_type == bus.CONVERSATION_STIMULUS:
             stimulus = msg.get("payload", {})
             tensor, _ = _collect_body_tensor(history, thresholds,
-                                              severity_multipliers, focus_nudges)
+                                              severity_multipliers, focus_nudges,
+                                              cache=sensor_cache)
             signals = _compute_body_reflex_intuition(stimulus, tensor)
             # REFLEX_SIGNAL broadcast removed — no consumer exists (audit 2026-03-26)
 
         # Receive Interface input signals (human conversation → somatic impact)
-        elif msg_type == "INTERFACE_INPUT":
+        elif msg_type == bus.INTERFACE_INPUT:
             iface = msg.get("payload", {})
             # Intensity maps to Thermal (load proxy): conversation energy = social load
             intensity = iface.get("intensity", 0.0)
@@ -152,7 +245,7 @@ def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 focus_nudges[4] = min(0.5, focus_nudges[4])
             logger.debug("[BodyWorker] INTERFACE_INPUT absorbed: intensity=%.2f", intensity)
 
-        elif msg_type == "QUERY":
+        elif msg_type == bus.QUERY:
             from titan_plugin.core.profiler import handle_memory_profile_query
             if handle_memory_profile_query(msg, send_queue, name):
                 continue
@@ -163,14 +256,16 @@ def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
             if action == "get_tensor":
                 tensor, details = _collect_body_tensor(history, thresholds,
-                                                       severity_multipliers, focus_nudges)
+                                                       severity_multipliers, focus_nudges,
+                                                       cache=sensor_cache)
                 _send_response(send_queue, name, src, {
                     "tensor": tensor, "details": details,
                 }, rid)
 
             elif action in ("get_status", "get_details"):
                 tensor, details = _collect_body_tensor(history, thresholds,
-                                                       severity_multipliers, focus_nudges)
+                                                       severity_multipliers, focus_nudges,
+                                                       cache=sensor_cache)
                 _send_response(send_queue, name, src, {
                     "tensor": tensor, "details": details,
                     "history_size": {k: len(v) for k, v in history.items()},
@@ -185,13 +280,20 @@ def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
 def _collect_body_tensor(history: dict, thresholds: dict,
                          severity_multipliers: list | None = None,
-                         focus_nudges: list | None = None) -> tuple[list, dict]:
+                         focus_nudges: list | None = None,
+                         cache=None) -> tuple[list, dict]:
     """
     Collect all 5 body senses, categorize, weight, compute velocity.
 
     FILTER_DOWN multipliers modulate the urgency formula:
       urgency = raw * category * multiplier / CRITICAL + velocity_contrib
     FOCUS nudges apply a gentle bias toward center after scoring.
+
+    cache (S7 §L1):
+      - None  → call _sense_X(thresholds) inline (pre-S7 byte-identical)
+      - SensorCache → read from cache (populated by background refresh
+        threads); fall back to inline call if a sense is missing from
+        the cache (defensive — should only happen pre-warmup)
 
     Returns:
         (tensor, details) where tensor is [5 floats, 0.0-1.0 normalized]
@@ -203,21 +305,31 @@ def _collect_body_tensor(history: dict, thresholds: dict,
         focus_nudges = [0.0] * 5
 
     readings = {}
+    sense_fns = {
+        "interoception": _sense_interoception,
+        "proprioception": _sense_proprioception,
+        "somatosensation": _sense_somatosensation,
+        "entropy": _sense_entropy,
+        "thermal": _sense_thermal,
+    }
 
-    # [0] Interoception — SOL balance / energy
-    readings["interoception"] = _sense_interoception(thresholds)
-
-    # [1] Proprioception — network health
-    readings["proprioception"] = _sense_proprioception(thresholds)
-
-    # [2] Somatosensation — system resources
-    readings["somatosensation"] = _sense_somatosensation(thresholds)
-
-    # [3] Entropy — disorder signals
-    readings["entropy"] = _sense_entropy(thresholds)
-
-    # [4] Thermal — load/temperature
-    readings["thermal"] = _sense_thermal(thresholds)
+    if cache is not None:
+        # §L1 fast path — read from cache populated by per-sense
+        # refresh threads. Fallback to inline call only if cache is
+        # cold for a particular sense (defensive — boot warmup is
+        # done synchronously so this should never fire in steady state).
+        for sense_name, sense_fn in sense_fns.items():
+            cached = cache.get(sense_name)
+            if cached is not None and "value" in cached and "severity" in cached:
+                readings[sense_name] = {
+                    "value": cached["value"], "severity": cached["severity"],
+                }
+            else:
+                readings[sense_name] = sense_fn(thresholds)
+    else:
+        # Pre-S7 inline path — synchronous sense calls.
+        for sense_name, sense_fn in sense_fns.items():
+            readings[sense_name] = sense_fn(thresholds)
 
     # Build tensor with urgency weighting + velocity + FILTER_DOWN + FOCUS
     tensor = []
@@ -559,7 +671,7 @@ def _publish_body_state(send_queue, name: str, tensor: list, details: dict,
     if severity_multipliers:
         payload["filter_down_multipliers"] = [round(m, 4) for m in severity_multipliers]
 
-    _send_msg(send_queue, "BODY_STATE", name, "all", payload)
+    _send_msg(send_queue, bus.BODY_STATE, name, "all", payload)
 
 
 def _send_msg(send_queue, msg_type: str, src: str, dst: str, payload: dict, rid: str = None) -> None:
@@ -574,7 +686,7 @@ def _send_msg(send_queue, msg_type: str, src: str, dst: str, payload: dict, rid:
 
 
 def _send_response(send_queue, src: str, dst: str, payload: dict, rid: str) -> None:
-    _send_msg(send_queue, "RESPONSE", src, dst, payload, rid)
+    _send_msg(send_queue, bus.RESPONSE, src, dst, payload, rid)
 
 
 def _compute_body_reflex_intuition(stimulus: dict, tensor: list) -> list:
@@ -733,4 +845,133 @@ def _send_heartbeat(send_queue, name: str) -> None:
         rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
     except Exception:
         rss_mb = 0
-    _send_msg(send_queue, "MODULE_HEARTBEAT", name, "guardian", {"rss_mb": round(rss_mb, 1)})
+    _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", {"rss_mb": round(rss_mb, 1)})
+
+
+# ── S7 §L1 fast-path helpers ────────────────────────────────────────
+
+
+def _read_flag(config: dict, dotted_path: str, default: bool) -> bool:
+    """
+    Resolve a dotted feature flag path through the worker's config dict.
+
+    Workers receive the section of titan_params they need (config dict
+    is built upstream in plugin.py / legacy_core.py module registration).
+    The body worker config has been observed to contain either:
+      - the [body] section directly (legacy)
+      - the full titan_params (which includes [microkernel])
+
+    We try both forms; default if neither resolves.
+    """
+    parts = dotted_path.split(".")
+    node = config
+    for part in parts:
+        if not isinstance(node, dict):
+            return default
+        if part not in node:
+            return default
+        node = node[part]
+    if isinstance(node, bool):
+        return node
+    return default
+
+
+def _start_fast_path(thresholds: dict, config: dict, stop_event,
+                     get_modulators) -> tuple:
+    """
+    Start the §L1 fast-path threads for body. Returns:
+      (sensor_cache, refresh_threads, shm_bank, body_5d_writer, shm_writer_thread)
+
+    get_modulators: callable returning current (severity_multipliers,
+    focus_nudges) — closure over worker-local mutables so the shm
+    writer always uses the live values.
+
+    Synchronous warmup is run BEFORE refresh threads start, so the
+    cache is fully populated when the writer thread fires its first
+    tick (no chance of cold-cache reads).
+    """
+    from titan_plugin.core.sensor_cache import (
+        RefreshSpec, SensorCache, start_refresh_threads, start_shm_writer_thread,
+    )
+    from titan_plugin.core.state_registry import INNER_BODY_5D, RegistryBank
+
+    # Synchronous warmup so the tick path never reads cold cache.
+    initial = {
+        "interoception": _sense_interoception(thresholds),
+        "proprioception": _sense_proprioception(thresholds),
+        "somatosensation": _sense_somatosensation(thresholds),
+        "entropy": _sense_entropy(thresholds),
+        "thermal": _sense_thermal(thresholds),
+    }
+    cache = SensorCache(initial=initial)
+
+    # Per-sense refresh threads at native cadences.
+    specs = [
+        RefreshSpec(
+            name="interoception",
+            refresh_fn=lambda: _sense_interoception(thresholds),
+            period_s=_BODY_REFRESH_PERIODS_S["interoception"],
+        ),
+        RefreshSpec(
+            name="proprioception",
+            refresh_fn=lambda: _sense_proprioception(thresholds),
+            period_s=_BODY_REFRESH_PERIODS_S["proprioception"],
+        ),
+        RefreshSpec(
+            name="somatosensation",
+            refresh_fn=lambda: _sense_somatosensation(thresholds),
+            period_s=_BODY_REFRESH_PERIODS_S["somatosensation"],
+        ),
+        RefreshSpec(
+            name="entropy",
+            refresh_fn=lambda: _sense_entropy(thresholds),
+            period_s=_BODY_REFRESH_PERIODS_S["entropy"],
+        ),
+        RefreshSpec(
+            name="thermal",
+            refresh_fn=lambda: _sense_thermal(thresholds),
+            period_s=_BODY_REFRESH_PERIODS_S["thermal"],
+        ),
+    ]
+    refresh_threads = start_refresh_threads(
+        specs, cache, stop_event, thread_name_prefix="body_refresh",
+    )
+
+    # Schumann shm writer — RegistryBank reads same flag, no-op when off.
+    shm_bank = RegistryBank(titan_id=None, config=config)
+    body_5d_writer = None
+    shm_writer_thread = None
+    if shm_bank.is_enabled(INNER_BODY_5D):
+        body_5d_writer = shm_bank.writer(INNER_BODY_5D)
+
+        # History deque (separate from main-loop's history) for the
+        # writer's velocity calculation — needs its own state since
+        # the writer runs at 7.83 Hz vs main loop at 0.29 Hz.
+        # Note: velocity contribution is small and bounded; using a
+        # separate deque per-tick is safe (no cross-thread mutation
+        # of the main-loop history).
+        writer_history = {
+            "interoception": deque(maxlen=_HISTORY_SIZE),
+            "proprioception": deque(maxlen=_HISTORY_SIZE),
+            "somatosensation": deque(maxlen=_HISTORY_SIZE),
+            "entropy": deque(maxlen=_HISTORY_SIZE),
+            "thermal": deque(maxlen=_HISTORY_SIZE),
+        }
+
+        def tick():
+            severity_multipliers, focus_nudges = get_modulators()
+            tensor, _ = _collect_body_tensor(
+                writer_history, thresholds,
+                severity_multipliers, focus_nudges,
+                cache=cache,
+            )
+            import numpy as np
+            arr = np.asarray(tensor, dtype=np.float32)
+            if arr.shape == (5,):
+                body_5d_writer.write(arr)
+
+        shm_writer_thread = start_shm_writer_thread(
+            tick, _BODY_TICK_PERIOD_S, stop_event, "body_shm_writer",
+        )
+
+    return cache, refresh_threads, shm_bank, body_5d_writer, shm_writer_thread

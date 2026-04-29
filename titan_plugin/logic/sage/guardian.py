@@ -19,7 +19,7 @@ class SageGuardian:
     It evaluates proposed actions against hardcoded rules (Tier 1), semantic embeddings
     of Prime Directives (Tier 2), and sophisticated LLM oversight (Tier 3).
     """
-    def __init__(self, recorder, config: dict = None):
+    def __init__(self, recorder, config: dict = None, record_transition_callable=None):
         """
         Initializes the Guardian and prepares its 3-tier security infrastructure.
 
@@ -27,9 +27,17 @@ class SageGuardian:
             recorder (SageRecorder): A reference to the central data hub to log Divine Trauma
                                      if an action is blocked.
             config: [inference] section from config.toml.
+            record_transition_callable: Microkernel v2 Layer 2 (2026-04-28) — optional
+                                     async callable with the same signature as
+                                     `recorder.record_transition`. When provided,
+                                     `inject_divine_trauma` uses this instead of
+                                     `self.recorder.record_transition` so trauma
+                                     records can route through the bus to rl_worker.
+                                     Falls back to recorder when None.
         """
         config = config or {}
         self.recorder = recorder
+        self._record_transition_callable = record_transition_callable
         self.directives_cache = {}    # Maps string directives -> their embeddings
         self.directives_tensors = None # PyTorch tensor holding all directive embeddings
         self.directive_texts = []      # List of strings corresponding to tensor indices
@@ -284,11 +292,27 @@ class SageGuardian:
             "guardian_veto_logic": veto_logic 
         }
         
-        if self.recorder is not None:
-             await self.recorder.record_transition(
-                observation_vector=dummy_obs, 
-                action=action_intent, 
-                reward=-5.0, 
+        # Microkernel v2 Layer 2 (2026-04-28): prefer injected callable
+        # (routes via bus to rl_worker subprocess) over direct recorder call.
+        if self._record_transition_callable is not None:
+            try:
+                # Callable may be sync (publishes to bus) or async — handle both.
+                _result = self._record_transition_callable(
+                    observation_vector=dummy_obs,
+                    action=action_intent,
+                    reward=-5.0,
+                    trauma_metadata=metadata,
+                )
+                import inspect
+                if inspect.isawaitable(_result):
+                    await _result
+            except Exception as e:
+                logging.error("[Guardian] Divine Trauma routing failed: %s", e)
+        elif self.recorder is not None:
+            await self.recorder.record_transition(
+                observation_vector=dummy_obs,
+                action=action_intent,
+                reward=-5.0,
                 trauma_metadata=metadata
             )
         else:

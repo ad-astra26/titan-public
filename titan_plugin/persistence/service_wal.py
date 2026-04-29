@@ -31,6 +31,7 @@ from typing import Iterator
 import msgpack
 
 from .wire_format import MAX_FRAME_BYTES, _LEN_HEADER
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger("titan.imw.wal")
 
@@ -193,8 +194,9 @@ class ServiceWAL:
                 try:
                     self._file.flush()
                     os.fsync(self._fd)
-                except OSError:
-                    pass
+                except OSError as _swallow_exc:
+                    swallow_warn('[persistence.service_wal] ServiceWAL.close: self._file.flush()', _swallow_exc,
+                                 key='persistence.service_wal.ServiceWAL.close.line197', throttle=100)
                 self._file.close()
             self._closed = True
 

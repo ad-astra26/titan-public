@@ -51,6 +51,7 @@ TASK_MODEL_MAP: dict[str, str] = {
     "skill_validation": _LIGHT_MODEL,
     "art_title": _LIGHT_MODEL,
     "language_teacher": _LIGHT_MODEL,
+    "meta_teacher": _LIGHT_MODEL,
     # Medium — guardian analysis, social synthesis
     "guardian_veto": _MEDIUM_MODEL,
     "social_synthesis": _MEDIUM_MODEL,

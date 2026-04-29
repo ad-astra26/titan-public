@@ -39,6 +39,7 @@ from titan_plugin.logic.task_embedding import (
     extract_chain_template,
     template_to_primitive_list,
 )
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger("titan.chain_iql")
 
@@ -299,8 +300,9 @@ class ChainIQL:
             self.qnet.template_emb[lru_tid] = (
                 rng.standard_normal(self.qnet.template_emb_dim).astype(np.float32) * 0.1
             )
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn('[logic.chain_iql] ChainIQL.get_or_assign_template_id: rng = np.random.default_rng(lru_tid + int(now))', _swallow_exc,
+                         key='logic.chain_iql.ChainIQL.get_or_assign_template_id.line303', throttle=100)
         self.template_registry[template] = lru_tid
         self._template_last_seen[lru_tid] = now
         self._template_visits[lru_tid] = 0

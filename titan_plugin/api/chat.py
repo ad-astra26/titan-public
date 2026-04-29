@@ -10,6 +10,7 @@ Dream-aware: when Titan is dreaming, messages are queued and
 processed through the full pipeline (Gatekeeper + Prime Directives + LLM)
 on the next /chat call after waking.
 """
+import asyncio
 import logging
 import time
 from typing import Optional
@@ -19,6 +20,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from titan_plugin.api.auth import verify_privy_token
+from titan_plugin import bus
 
 logger = logging.getLogger(__name__)
 
@@ -58,37 +60,122 @@ async def chat(req: ChatRequest, request: Request, claims: dict = Depends(verify
 
     Requires Privy authentication (Bearer token in Authorization header).
 
-    The full cognitive pipeline runs:
+    The full cognitive pipeline runs in TitanPlugin.run_chat() (parent
+    process):
       1. Guardian safety check (blocking)
       2. Memory recall + directive injection + gatekeeper routing (pre-hook)
       3. LLM inference with tools
       4. Memory logging + RL recording (post-hook)
+
+    Three execution modes:
+      - In-process (api_process_separation_enabled=false): app.state has
+        titan_agent → call plugin.run_chat() directly on the api server's
+        event loop (which IS the parent loop).
+      - Subprocess + bridge (api_process_separation_enabled=true): app.state
+        has chat_bridge_bus → forward via CHAT_REQUEST bus to parent's
+        _chat_handler_loop. (Wired in C4-C5 of bus-bridge fix.)
+      - No agent + no bridge: 503 "agent not initialized" (preserves the
+        2026-04-28 quick-fix workaround behavior — kept as last-resort
+        defense; should never hit in normal operation).
+
+    See: BUG-CHAT-AGENT-NOT-INITIALIZED-API-SUBPROCESS-20260428.
     """
     plugin = request.app.state.titan_plugin
     agent = getattr(request.app.state, "titan_agent", None)
+    chat_bridge_bus = getattr(request.app.state, "chat_bridge_bus", None)
 
-    if agent is None:
+    payload = {
+        "message": req.message,
+        "session_id": req.session_id,
+        "user_id": req.user_id,
+    }
+    headers = dict(request.headers)
+    claims_dict = dict(claims) if claims else {}
+
+    # Mode 1 — in-process: call run_chat() on the local plugin directly.
+    # The api server's event loop IS the parent loop; agent + plugin are
+    # all local objects. This is the legacy path (api_process_separation
+    # _enabled=false) and remains the byte-identical pre-bridge behavior.
+    if agent is not None:
+        try:
+            result = await plugin.run_chat(payload, claims_dict, headers)
+        except Exception as e:
+            logger.error("[Chat] run_chat raised: %s", e, exc_info=True)
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"Chat pipeline error: {e}"},
+            )
         return JSONResponse(
-            status_code=503,
-            content={"error": "Titan agent not initialized. Check boot logs."},
+            status_code=int(result.get("status_code", 500)),
+            content=result.get("body") or {"error": "empty body"},
+            headers=result.get("extra_headers") or {},
         )
 
-    if plugin._limbo_mode:
+    # Mode 2 — subprocess + bridge: forward via bus.request_async to
+    # parent's _chat_handler_loop (titan_plugin/core/plugin.py). Parent
+    # calls plugin.run_chat() in its event loop and ships the result
+    # back rid-routed. 60s timeout covers worst-case LLM round-trip
+    # (memory recall + inference + post-hooks; default bus timeout 10s
+    # would be too tight). bus_ipc_pool isolates the reply wait from
+    # the default 64-worker pool so Observatory bursts don't queue
+    # behind it (commit aeec45b2).
+    if chat_bridge_bus is not None:
+        try:
+            bridge_payload = {
+                "action": "chat",
+                "body":    payload,
+                "claims":  claims_dict,
+                "headers": headers,
+            }
+            reply = await chat_bridge_bus.request_async(
+                "chat_subproc", "chat_handler", bridge_payload, timeout=60.0,
+            )
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                status_code=504,
+                content={"error": "Chat handler timeout (parent unreachable or LLM > 60s)"},
+            )
+        except Exception as e:
+            logger.error("[Chat] chat bridge raised: %s", e, exc_info=True)
+            return JSONResponse(
+                status_code=502,
+                content={"error": f"Chat bridge error: {e}"},
+            )
+        if reply is None:
+            return JSONResponse(
+                status_code=504,
+                content={"error": "Chat handler did not respond within timeout"},
+            )
+        # bus.request_async returns the full reply envelope (the
+        # {type, src, dst, rid, payload, ts} dict). Our run_chat result
+        # was placed in payload by _handle_chat_request.
+        result = reply.get("payload") if isinstance(reply, dict) else reply
+        if not isinstance(result, dict):
+            return JSONResponse(
+                status_code=502,
+                content={"error": f"Malformed chat handler reply: {type(result).__name__}"},
+            )
         return JSONResponse(
-            status_code=503,
-            content={"error": "Titan is in Limbo state — awaiting resurrection."},
+            status_code=int(result.get("status_code", 500)),
+            content=result.get("body") or {"error": "empty body"},
+            headers=result.get("extra_headers") or {},
         )
 
-    if not req.message or not req.message.strip():
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Message cannot be empty."},
-        )
+    # Mode 3 — no agent + no bridge. Should never happen in normal
+    # operation; preserves the 2026-04-28 quick-fix workaround behavior
+    # as a last-resort defense.
+    return JSONResponse(
+        status_code=503,
+        content={"error": "Titan agent not initialized. Check boot logs."},
+    )
 
-    # ── Dream-aware message handling ──────────────────────────────
-    # When Titan is dreaming, queue the message and return a canned
-    # response. Maker messages trigger gentle wake. Queued messages
-    # are processed through the FULL pipeline on next /chat call.
+    # ── Legacy chat() body retained below (UNREACHABLE) for diff context.
+    # Will be deleted after C4-C7 ship + soak. The full pipeline now lives
+    # in TitanPlugin.run_chat() at titan_plugin/core/plugin.py.
+    # ──────────────────────────────────────────────────────────────────
+    plugin = request.app.state.titan_plugin
+    agent = getattr(request.app.state, "titan_agent", None)
+    titan_state = getattr(request.app.state, "titan_state", None)
     try:
         if getattr(plugin, '_dream_state', {}).get("is_dreaming", False):
             _dinbox = getattr(plugin, '_dream_inbox', [])
@@ -172,7 +259,12 @@ async def chat(req: ChatRequest, request: Request, claims: dict = Depends(verify
                             _sorted = sorted(_di, key=lambda m: (
                                 m.get("priority", 1), m.get("timestamp", 0)))
                             _batch = _sorted[:3]
-                            plugin._dream_inbox = _sorted[3:]
+                            # L3 Phase A.8.1: preserve deque(maxlen=256) set in
+                            # plugin.__init__ via clear+extend instead of slice
+                            # assignment (which would replace the bounded deque
+                            # with an unbounded list).
+                            plugin._dream_inbox.clear()
+                            plugin._dream_inbox.extend(_sorted[3:])
                             if _batch:
                                 _lines = []
                                 for _bi, _bm in enumerate(_batch, 1):
@@ -193,7 +285,10 @@ async def chat(req: ChatRequest, request: Request, claims: dict = Depends(verify
                                 )
                                 logger.info(
                                     "[Chat] Processing %d queued dream messages, "
-                                    "%d remaining", len(_batch), len(plugin._dream_inbox))
+                                    "%d remaining", len(_batch), len(
+                                        titan_state.cache.get("plugin._dream_inbox", [])
+                                        if titan_state is not None
+                                        else getattr(plugin, "_dream_inbox", []) or []))
                     finally:
                         _lock.release()
         except Exception as _inbox_err:
@@ -217,10 +312,16 @@ async def chat(req: ChatRequest, request: Request, claims: dict = Depends(verify
                     _chat_memo.memo_type, user_id[:12], _chat_is_maker,
                     _chat_memo.content[:40], {k: f"{v:.2f}" for k, v in _cm_boost.items() if isinstance(v, float)})
                 # Publish as INTERFACE_INPUT so spirit_worker can apply boosts
-                bus = getattr(plugin, 'bus', None)
-                if bus and _cm_boost:
+                # NOTE: variable named `_pbus` not `bus` — a local `bus = ...`
+                # in this function would shadow the module-level `bus` import
+                # (line 22) FOR THE WHOLE FUNCTION, raising NameError on later
+                # `bus.X` references in code paths where this conditional did
+                # not run. Pre-existing bug surfaced 2026-04-29 in [Chat:OVG]
+                # block at line 369 (`bus.TIMECHAIN_COMMIT`).
+                _pbus = getattr(plugin, 'bus', None)
+                if _pbus and _cm_boost:
                     from titan_plugin.bus import make_msg
-                    bus.publish(make_msg("INTERFACE_INPUT", "chat_api", "all", {
+                    _pbus.publish(make_msg(bus.INTERFACE_INPUT, "chat_api", "all", {
                         "source": "chat_memo",
                         "user_id": user_id,
                         "text": _chat_memo.content,
@@ -350,7 +451,7 @@ async def chat(req: ChatRequest, request: Request, claims: dict = Depends(verify
                 _bus = getattr(plugin, 'bus', None)
                 if _bus:
                     from titan_plugin.bus import make_msg
-                    _bus.publish(make_msg("TIMECHAIN_COMMIT", "ovg", "timechain", _tc_payload))
+                    _bus.publish(make_msg(bus.TIMECHAIN_COMMIT, "ovg", "timechain", _tc_payload))
             except Exception as _ovg_err:
                 logger.warning("[Chat:OVG] Check failed: %s", _ovg_err)
 
@@ -364,7 +465,21 @@ async def chat(req: ChatRequest, request: Request, claims: dict = Depends(verify
             ).strip()
             response_text = re.sub(r'\n{3,}', '\n\n', response_text)
 
-        mood_label = plugin.mood_engine.get_mood_label() if plugin.mood_engine else "Unknown"
+        mood_label = "Unknown"
+        try:
+            if titan_state is not None and getattr(titan_state, "mood_engine", None):
+                _ml = titan_state.mood_engine.get_mood_label()
+            elif getattr(plugin, "mood_engine", None):
+                _ml = plugin.mood_engine.get_mood_label()
+            else:
+                _ml = None
+            # Coerce to string: cached-state proxies may return {} when
+            # the cache hasn't been populated yet (legacy in-process mode
+            # where MoodEngine is a real instance returns str directly).
+            if isinstance(_ml, str) and _ml:
+                mood_label = _ml
+        except Exception:
+            pass
 
         # State narration for the chat UI sidebar
         _narration_text = None
@@ -406,7 +521,9 @@ async def chat(req: ChatRequest, request: Request, claims: dict = Depends(verify
         _resp = ChatResponse(
             response=response_text,
             session_id=req.session_id or "default",
-            mode=plugin._last_execution_mode,
+            mode=(titan_state.cache.get("plugin._last_execution_mode", "")
+                  if titan_state is not None
+                  else getattr(plugin, "_last_execution_mode", "")),
             mood=mood_label,
             state_narration=_narration_text,
             state_snapshot=_state_snap,
@@ -448,6 +565,7 @@ async def chat_stream(req: ChatRequest, request: Request, claims: dict = Depends
     """
     plugin = request.app.state.titan_plugin
     agent = getattr(request.app.state, "titan_agent", None)
+    titan_state = getattr(request.app.state, "titan_state", None)
 
     if agent is None:
         return JSONResponse(
@@ -455,7 +573,10 @@ async def chat_stream(req: ChatRequest, request: Request, claims: dict = Depends
             content={"error": "Titan agent not initialized."},
         )
 
-    if plugin._limbo_mode:
+    _limbo = (titan_state.cache.get("plugin._limbo_mode", False)
+              if titan_state is not None
+              else getattr(plugin, "_limbo_mode", False))
+    if _limbo:
         return JSONResponse(
             status_code=503,
             content={"error": "Titan is in Limbo state."},

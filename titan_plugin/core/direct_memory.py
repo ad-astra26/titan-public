@@ -15,6 +15,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -425,7 +426,8 @@ class TitanKnowledgeGraph:
                     {"name": name, "st": subtype, "sn": source_node, "ts": now},
                 )
         except Exception as e:
-            logger.debug("[KnowledgeGraph] Entity insert error for '%s': %s", name, e)
+            swallow_warn(f"[KnowledgeGraph] Entity insert error for '{name}'", e,
+                         key="core.direct_memory.entity_insert_error_for", throttle=100)
 
     def add_relationship(
         self, src_name: str, src_type: str, dst_name: str, dst_type: str,

@@ -148,31 +148,21 @@ class ReflexCollector:
         """Reset session cooldowns (new conversation)."""
         self._cooldowns.clear()
 
-    async def collect_and_fire(
+    def _aggregate_inline(
         self,
         signals: list[dict],
         stimulus_features: dict,
-        focus_magnitude: float = 0.0,
-        trinity_state: dict = None,
-    ) -> PerceptualField:
+        focus_magnitude: float,
+    ) -> list[tuple]:
+        """Steps 1-4: group → guardian-shield → combine → threshold + cooldown
+        filter → top-N selection. Returns list of (ReflexType, combined_conf,
+        signal_dicts).
+
+        A.8.5 — Extracted as an overridable hook so ReflexProxy can replace
+        aggregation with a bus.request round-trip to reflex_worker while
+        inheriting executor registration + cooldown bookkeeping + the
+        execute step from this base class.
         """
-        Process Intuition signals from Trinity workers, fire selected reflexes.
-
-        Args:
-            signals: List of ReflexSignal dicts from workers
-            stimulus_features: InputExtractor features for the message
-            focus_magnitude: Current FOCUS nudge magnitude (for boost)
-            trinity_state: Current Trinity tensor summary
-
-        Returns:
-            PerceptualField with fired reflex results and notices.
-        """
-        start = time.time()
-        field = PerceptualField(
-            stimulus_features=stimulus_features,
-            trinity_summary=trinity_state or {},
-        )
-
         # ── Step 1: Group signals by reflex type ──
         grouped: dict[str, list[dict]] = {}
         for sig in signals:
@@ -265,15 +255,26 @@ class ReflexCollector:
         selected.sort(key=lambda x: x[1], reverse=True)
         selected = selected[:self.max_parallel]
 
-        if not selected:
-            field.total_duration_ms = (time.time() - start) * 1000
-            return field
+        return selected
 
-        logger.info("[ReflexCollector] Firing %d reflexes: %s",
-                     len(selected),
-                     ", ".join(f"{rt.value}({conf:.3f})" for rt, conf, _ in selected))
+    async def _execute_selected(
+        self,
+        selected: list[tuple],
+        field: PerceptualField,
+        stimulus_features: dict,
+        start: float,
+    ) -> PerceptualField:
+        """Step 5: execute selected reflexes in parallel via asyncio.gather.
 
-        # ── Step 5: Execute reflexes in parallel ──
+        Modifies `field` in place (fired_reflexes + reflex_notices +
+        total_duration_ms) and returns it. Updates `self._cooldowns`
+        on successful executor completion. Per `feedback_architectural_
+        decisions_no_drift.md`, this step stays in the base class so
+        ReflexProxy can inherit it unchanged — executors are parent-
+        resident (they reference plugin.soul / plugin.metabolism /
+        plugin.memory_proxy etc.) and must run where they were
+        registered.
+        """
         async def execute_one(rt: ReflexType, confidence: float, sigs: list) -> FiredReflex:
             fired = FiredReflex(
                 reflex_type=rt,
@@ -324,6 +325,43 @@ class ReflexCollector:
                      field.total_duration_ms)
 
         return field
+
+    async def collect_and_fire(
+        self,
+        signals: list[dict],
+        stimulus_features: dict,
+        focus_magnitude: float = 0.0,
+        trinity_state: dict = None,
+    ) -> PerceptualField:
+        """
+        Process Intuition signals from Trinity workers, fire selected reflexes.
+
+        Args:
+            signals: List of ReflexSignal dicts from workers
+            stimulus_features: InputExtractor features for the message
+            focus_magnitude: Current FOCUS nudge magnitude (for boost)
+            trinity_state: Current Trinity tensor summary
+
+        Returns:
+            PerceptualField with fired reflex results and notices.
+        """
+        start = time.time()
+        field = PerceptualField(
+            stimulus_features=stimulus_features,
+            trinity_summary=trinity_state or {},
+        )
+
+        selected = self._aggregate_inline(signals, stimulus_features, focus_magnitude)
+
+        if not selected:
+            field.total_duration_ms = (time.time() - start) * 1000
+            return field
+
+        logger.info("[ReflexCollector] Firing %d reflexes: %s",
+                     len(selected),
+                     ", ".join(f"{rt.value}({conf:.3f})" for rt, conf, _ in selected))
+
+        return await self._execute_selected(selected, field, stimulus_features, start)
 
 
 # ── Perceptual Field Formatter ────────────────────────────────────

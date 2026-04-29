@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 
 from .wire_format import _LEN_HEADER, MAX_FRAME_BYTES, WireFormatError
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger("titan.imw.transport")
 
@@ -59,8 +60,9 @@ class UnixSocketTransport:
             try:
                 self._writer.close()
                 await self._writer.wait_closed()
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn('[persistence.transport] UnixSocketTransport.close: self._writer.close()', _swallow_exc,
+                             key='persistence.transport.UnixSocketTransport.close.line63', throttle=100)
             self._writer = None
             self._reader = None
 

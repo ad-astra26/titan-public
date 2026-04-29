@@ -89,9 +89,12 @@ def test_cli_subprocess_intact_exit_0(tmp_path):
          "tx": "sig1", "ts": 1, "backup_type": "personality", "size_mb": 25.0},
     ]
     _write_chain_file("T1", anchors, cwd=str(tmp_path))
-    venv_python = os.path.join(REPO_ROOT, "test_env", "bin", "python")
+    # Use sys.executable (the python running pytest) rather than a hardcoded
+    # test_env path. Worktrees don't have their own test_env, but they do
+    # inherit the venv python via sys.executable when pytest is launched
+    # from the activated venv.
     proc = subprocess.run(
-        [venv_python, os.path.join(REPO_ROOT, "scripts", "arch_map.py"),
+        [sys.executable, os.path.join(REPO_ROOT, "scripts", "arch_map.py"),
          "backup", "--verify-chain"],
         cwd=str(tmp_path),
         capture_output=True, text=True, timeout=30,
@@ -108,9 +111,8 @@ def test_cli_subprocess_broken_exit_1(tmp_path):
          "tx": "sig2", "ts": 2, "backup_type": "personality", "size_mb": 25.0},
     ]
     _write_chain_file("T1", anchors, cwd=str(tmp_path))
-    venv_python = os.path.join(REPO_ROOT, "test_env", "bin", "python")
     proc = subprocess.run(
-        [venv_python, os.path.join(REPO_ROOT, "scripts", "arch_map.py"),
+        [sys.executable, os.path.join(REPO_ROOT, "scripts", "arch_map.py"),
          "backup", "--verify-chain"],
         cwd=str(tmp_path),
         capture_output=True, text=True, timeout=30,

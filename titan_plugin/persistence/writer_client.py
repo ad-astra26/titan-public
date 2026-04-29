@@ -37,6 +37,7 @@ from .wire_format import (
     decode_length,
     encode_frame,
 )
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger("titan.imw.client")
 
@@ -118,12 +119,27 @@ class InnerMemoryWriterClient:
         finally:
             try:
                 self._loop.close()
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn('[persistence.writer_client] InnerMemoryWriterClient._loop_main: self._loop.close()', _swallow_exc,
+                             key='persistence.writer_client.InnerMemoryWriterClient._loop_main.line123', throttle=100)
 
     async def _init_and_run(self) -> None:
-        # Open journal + replay any unacked tail before signaling ready
-        journal_path = Path(self._cfg.journal_dir) / f"imw_{os.getpid()}.jrn"
+        # Open journal + replay any unacked tail before signaling ready.
+        #
+        # Journal file is named after the writer instance (derived from
+        # cfg.socket_path stem) so multiple writer instances in the same
+        # process don't share a journal file. Pre-fix bug: both
+        # inner_memory_client (`imw.sock`) and observatory_writer_client
+        # (`observatory_writer.sock`) used the literal `imw_<pid>.jrn`,
+        # which made each daemon's `scan_orphan_journals(glob="imw_*.jrn")`
+        # pick up the OTHER instance's journal on orphan replay → the
+        # inner_memory daemon would try to replay observatory writes
+        # against `inner_memory.db` and fail with "no such table:
+        # vital_snapshots/trinity_snapshots/growth_snapshots". Fixed by
+        # prefixing the journal filename with the socket basename so each
+        # instance's journals are visible only to its own daemon.
+        instance = Path(self._cfg.socket_path).stem or "imw"
+        journal_path = Path(self._cfg.journal_dir) / f"{instance}_{os.getpid()}.jrn"
         self._journal = CallerJournal(str(journal_path), pid=os.getpid())
         await self._connect_with_retry()
         # Replay unacked records from this PID's journal (if any survived from a previous crash)
@@ -191,8 +207,9 @@ class InnerMemoryWriterClient:
         self._pending.clear()
         try:
             await self._transport.close()
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn('[persistence.writer_client] InnerMemoryWriterClient._handle_disconnect: await self._transport.close()', _swallow_exc,
+                         key='persistence.writer_client.InnerMemoryWriterClient._handle_disconnect.line196', throttle=100)
         self._transport = None
         # Reconnect in background
         asyncio.create_task(self._reconnect_and_replay())
@@ -246,6 +263,10 @@ class InnerMemoryWriterClient:
         - mode=shadow      → direct write (canonical) + fire-and-forget IMW to shadow DB
         - mode=dual        → direct write + IMW to primary (caller sees direct result)
         - mode=canonical   → IMW if table in tables_canonical, else direct
+        - mode=hybrid      → IMW if table in tables_canonical, else direct + shadow IMW
+                             (the per-table cutover analog of canonical, but keeps
+                             the Phase-1 shadow safety net for non-listed tables —
+                             added 2026-04-26 for OBS-imw-phase3-self-insights canary)
         """
         if self._closed:
             raise WriterError("client closed")
@@ -268,6 +289,18 @@ class InnerMemoryWriterClient:
                 self._fire_and_forget_imw(sql, params, target_db="primary")
             except Exception as e:
                 logger.warning("[imw.client] dual fire-and-forget failed: %s", e)
+            return res
+
+        if self._cfg.mode == "hybrid":
+            if table_name and self._cfg.is_table_canonical(table_name):
+                return self._route_imw(sql, params, target_db="primary",
+                                         sync=sync, timeout=timeout)
+            # non-canonical table: direct + shadow safety net
+            res = self._route_direct(sql, params)
+            try:
+                self._fire_and_forget_imw(sql, params, target_db="shadow")
+            except Exception as e:
+                logger.warning("[imw.client] hybrid shadow fire-and-forget failed: %s", e)
             return res
 
         # canonical mode: per-table decision
@@ -294,6 +327,17 @@ class InnerMemoryWriterClient:
             except Exception as e:
                 logger.warning("[imw.client] %s many fire-and-forget failed: %s",
                                   self._cfg.mode, e)
+            return res
+
+        if self._cfg.mode == "hybrid":
+            if table_name and self._cfg.is_table_canonical(table_name):
+                return self._route_imw_many(sql, rows, target_db="primary",
+                                              sync=sync, timeout=timeout)
+            res = self._route_direct_many(sql, rows)
+            try:
+                self._fire_and_forget_imw_many(sql, rows, target_db="shadow")
+            except Exception as e:
+                logger.warning("[imw.client] hybrid many shadow fire-and-forget failed: %s", e)
             return res
 
         if table_name and self._cfg.is_table_canonical(table_name):
@@ -332,6 +376,19 @@ class InnerMemoryWriterClient:
                 logger.warning("[imw.client] dual fire-and-forget failed: %s", e)
             return res
 
+        if self._cfg.mode == "hybrid":
+            if table_name and self._cfg.is_table_canonical(table_name):
+                return await asyncio.to_thread(
+                    self._route_imw, sql, params,
+                    target_db="primary", sync=sync, timeout=timeout,
+                )
+            res = await asyncio.to_thread(self._route_direct, sql, params)
+            try:
+                self._fire_and_forget_imw(sql, params, target_db="shadow")
+            except Exception as e:
+                logger.warning("[imw.client] hybrid shadow fire-and-forget failed: %s", e)
+            return res
+
         # canonical mode: per-table decision
         if table_name and self._cfg.is_table_canonical(table_name):
             return await asyncio.to_thread(
@@ -357,6 +414,19 @@ class InnerMemoryWriterClient:
             except Exception as e:
                 logger.warning("[imw.client] %s many fire-and-forget failed: %s",
                                   self._cfg.mode, e)
+            return res
+
+        if self._cfg.mode == "hybrid":
+            if table_name and self._cfg.is_table_canonical(table_name):
+                return await asyncio.to_thread(
+                    self._route_imw_many, sql, rows,
+                    target_db="primary", sync=sync, timeout=timeout,
+                )
+            res = await asyncio.to_thread(self._route_direct_many, sql, rows)
+            try:
+                self._fire_and_forget_imw_many(sql, rows, target_db="shadow")
+            except Exception as e:
+                logger.warning("[imw.client] hybrid many shadow fire-and-forget failed: %s", e)
             return res
 
         if table_name and self._cfg.is_table_canonical(table_name):
@@ -481,7 +551,8 @@ class InnerMemoryWriterClient:
                 await self._transport.send_frame(req.to_msgpack())
                 # drop the future — we don't await it. The reader will still drain.
             except Exception as e:
-                logger.debug("[imw.client] fire-and-forget send failed: %s", e)
+                swallow_warn('[imw.client] fire-and-forget send failed', e,
+                             key="persistence.writer_client.fire_and_forget_send_failed", throttle=100)
                 self._pending.pop(req.req_id, None)
         asyncio.run_coroutine_threadsafe(_send(), self._loop)
 
@@ -519,8 +590,9 @@ class InnerMemoryWriterClient:
             fut = asyncio.run_coroutine_threadsafe(_stop(), self._loop)
             try:
                 fut.result(timeout=3.0)
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn('[persistence.writer_client] InnerMemoryWriterClient.close: fut.result(timeout=3.0)', _swallow_exc,
+                             key='persistence.writer_client.InnerMemoryWriterClient.close.line525', throttle=100)
             self._loop.call_soon_threadsafe(self._loop.stop)
 
 
@@ -547,8 +619,9 @@ def reset_client() -> None:
         if _client is not None:
             try:
                 _client.close()
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn('[persistence.writer_client] reset_client: _client.close()', _swallow_exc,
+                             key='persistence.writer_client.reset_client.line553', throttle=100)
             _client = None
 
 
@@ -557,5 +630,6 @@ def _atexit_close() -> None:
     if _client is not None:
         try:
             _client.close()
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn('[persistence.writer_client] _atexit_close: _client.close()', _swallow_exc,
+                         key='persistence.writer_client._atexit_close.line563', throttle=100)

@@ -8,7 +8,7 @@ from typing import Optional
 
 DEFAULTS = {
     "enabled": False,               # master switch; False = direct writes (pre-IMW behavior)
-    "mode": "disabled",             # "shadow" | "dual" | "canonical" | "disabled"
+    "mode": "disabled",             # "shadow" | "dual" | "canonical" | "hybrid" | "disabled"
     "transport": "unix_socket",     # "unix_socket" | "bus"
     "socket_path": "data/run/imw.sock",
     "wal_path": "data/run/imw.wal",
@@ -60,6 +60,13 @@ class IMWConfig:
             for k, v in section.items():
                 if k in d:
                     d[k] = v
+        # BUG-B1-SHARED-LOCKS: redirect lock-protected paths through
+        # TITAN_DATA_DIR when shadow kernel sets it. Original kernel
+        # (env unset) sees default `data/...` paths unchanged.
+        from titan_plugin.core.shadow_data_dir import resolve_data_path
+        for path_field in ("socket_path", "wal_path", "journal_dir",
+                           "db_path", "shadow_db_path"):
+            d[path_field] = resolve_data_path(d[path_field])
         return cls(**d)
 
     @classmethod

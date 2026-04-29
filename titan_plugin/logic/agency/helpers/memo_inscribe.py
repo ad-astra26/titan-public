@@ -22,7 +22,8 @@ logger = logging.getLogger(__name__)
 class MemoInscribeHelper:
     """Inscribe Titan's consciousness state on Solana blockchain."""
 
-    def __init__(self, rpc_url: str = None, keypair_path: str = None):
+    def __init__(self, rpc_url: str = None, keypair_path: str = None,
+                 metabolism=None):
         # Read from merged config (config.toml + ~/.titan/secrets.toml) if not explicitly provided
         if rpc_url is None or keypair_path is None:
             try:
@@ -39,6 +40,10 @@ class MemoInscribeHelper:
         self._rpc_url = rpc_url
         self._keypair_path = keypair_path
         self._inscription_count = 0
+        # Mainnet Lifecycle Wiring rFP (2026-04-20): metabolism reference for
+        # memo gate + governance reserve protection. Optional (fail-open when
+        # not injected, keeping helper independently testable).
+        self._metabolism = metabolism
 
     @property
     def name(self) -> str:
@@ -79,6 +84,30 @@ class MemoInscribeHelper:
 
         Returns standard helper result dict with balance feedback.
         """
+        # Mainnet Lifecycle Wiring rFP (2026-04-20): metabolism gate +
+        # governance reserve guard. can_afford is async and protects the
+        # 0.05 SOL governance reserve regardless of gates_enforced flag
+        # (reserve is a hard floor, not a soft gate).
+        if self._metabolism is not None:
+            try:
+                proceed, _ = self._metabolism.evaluate_gate("memos", "MemoInscribe")
+                if not proceed:
+                    return {
+                        "success": False, "result": "",
+                        "enrichment_data": {},
+                        "error": "metabolism_gate: memos disabled at current tier",
+                    }
+                # Pre-spend reserve guard (memo ~0.000005 SOL, but the check
+                # is the canonical on-chain spend protection).
+                can_spend = await self._metabolism.can_afford(0.000005)
+                if not can_spend:
+                    return {
+                        "success": False, "result": "",
+                        "enrichment_data": {},
+                        "error": "governance_reserve_guard: would breach 0.05 SOL reserve",
+                    }
+            except Exception as _mge:
+                logger.debug("[MemoInscribe] Gate check failed (fail-open): %s", _mge)
         try:
             from titan_plugin.utils.solana_client import (
                 build_memo_instruction, load_keypair_from_json,

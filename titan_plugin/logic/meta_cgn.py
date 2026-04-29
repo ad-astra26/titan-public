@@ -22,6 +22,8 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 import numpy as np
+from titan_plugin.utils.silent_swallow import swallow_warn
+from titan_plugin import bus
 
 try:
     from scipy.stats import beta as _scipy_beta  # type: ignore
@@ -673,12 +675,16 @@ class MetaCGNConsumer:
     def __init__(self, send_queue=None, titan_id: str = "T1",
                  save_dir: str = "data/meta_cgn",
                  module_name: str = "spirit",
-                 shm_path: str = "/dev/shm/cgn_live_weights.bin"):
+                 shm_path: str = "/dev/shm/cgn_live_weights.bin",
+                 cgn_config: dict | None = None):
         self._send_queue = send_queue
         self._titan_id = titan_id
         self._save_dir = save_dir
         self._module_name = module_name
         self._shm_path = shm_path
+        # Microkernel v2 §A.2 part 2 (S4): config passed through to
+        # CGNConsumerClient → ShmWeightReader for dual-mode resolution.
+        self._cgn_config = cgn_config
 
         os.makedirs(save_dir, exist_ok=True)
         self._grounding_path = os.path.join(save_dir, "primitive_grounding.json")
@@ -874,6 +880,8 @@ class MetaCGNConsumer:
                 send_queue=self._send_queue,
                 module_name=self._module_name,
                 shm_path=self._shm_path,
+                titan_id=self._titan_id,
+                config=self._cgn_config,
             )
             logger.info("[MetaCGN] CGNConsumerClient initialized (consumer=%s, "
                         "module=%s, shm=%s)",
@@ -1645,7 +1653,8 @@ class MetaCGNConsumer:
             with open(self._shadow_log_path, "a") as f:
                 f.write(json.dumps(record) + "\n")
         except Exception as e:
-            logger.debug("[MetaCGN] disagreement log failed: %s", e)
+            swallow_warn('[MetaCGN] disagreement log failed', e,
+                         key="logic.meta_cgn.disagreement_log_failed", throttle=100)
         # P7: bus event emission with per-signature throttle
         try:
             sig = (template_id, domain)
@@ -1677,7 +1686,8 @@ class MetaCGNConsumer:
                 })
             self._conflict_bus_events_emitted += 1
         except Exception as e:
-            logger.debug("[MetaCGN] conflict bus emit failed: %s", e)
+            swallow_warn('[MetaCGN] conflict bus emit failed', e,
+                         key="logic.meta_cgn.conflict_bus_emit_failed", throttle=100)
 
     # ── Persistence ─────────────────────────────────────────────────
 
@@ -1892,12 +1902,23 @@ class MetaCGNConsumer:
         sets _status = 'disabled_boot_selftest_failed'.
 
         State-safe: snapshots/restores primitives + hypothesis observations
-        so selftest doesn't pollute counters. Skipped if already in a
-        disabled_* state (e.g., reloaded from watchdog) — a prior failsafe
-        trip is authoritative.
+        so selftest doesn't pollute counters.
+
+        Self-healing behavior (2026-04-22): retry on boot when status loaded
+        from disk is `disabled_boot_selftest_failed` — this lets a code fix
+        clear a stale stuck state without manual file edits. If the retry
+        passes, status flips back to `shadow_mode` and the consumer registers.
+        `disabled_failsafe` (recent failsafe trip) remains authoritative —
+        don't retry that one, let the cooldown machinery handle it.
         """
-        if self._status.startswith("disabled_"):
+        if self._status == "disabled_failsafe":
             return False
+        retrying_after_stale_disable = (
+            self._status == "disabled_boot_selftest_failed")
+        if retrying_after_stale_disable:
+            # Temporarily flip so selftest's own disabled-state gate on
+            # update_primitive_V doesn't short-circuit step 2.
+            self._status = "shadow_mode"
         # Snapshot state for restoration after selftest
         # P6: include α, β, by_domain — boot selftest must be fully side-effect-free
         _r = self._primitives["RECALL"]
@@ -1917,9 +1938,22 @@ class MetaCGNConsumer:
             # 1. Encoding works
             vec = self.encode_state("FORMULATE", {"chain_len": 1})
             assert vec.shape == (FEATURE_DIMS,), "encode_state shape wrong"
-            # 2. Grounding update works (uses RECALL to not touch FORMULATE)
+            # 2. Grounding update works (uses RECALL to not touch FORMULATE).
+            # 2026-04-22 fix: checking α/β directly instead of derived n_samples.
+            # When ema_decay_gamma<1.0 (shipped 2026-04-21, commit 64a92be),
+            # n_samples = int((α+β-2·FLOOR)) can DECREASE on update for large
+            # posteriors — the decay term (1-γ)·n dominates the +1 evidence for
+            # n > 1/(1-γ). The original `n_samples == pre+1` assertion became
+            # mathematically impossible and persistently failed boot, leaving
+            # all 3 Titans in disabled_boot_selftest_failed for 8 days. Verify
+            # α AND β moved instead — a strictly weaker but correct check that
+            # update_primitive_V ran to completion.
+            _alpha_pre, _beta_pre = _r.alpha, _r.beta
             self.update_primitive_V("RECALL", 0.5, chain_id=-1)
-            assert self._primitives["RECALL"].n_samples == pre_recall[1] + 1
+            assert self._primitives["RECALL"].alpha != _alpha_pre, \
+                "update_primitive_V did not modify α"
+            assert self._primitives["RECALL"].beta != _beta_pre, \
+                "update_primitive_V did not modify β"
             # 3. HAOV observation ingestion works — verify by domain marker
             #    (deque-maxlen-safe: works whether deque was full or not)
             self.observe_chain_evidence({
@@ -1951,10 +1985,20 @@ class MetaCGNConsumer:
             self._total_updates_applied = pre_updates
             self._evidence_since_last_test = max(
                 0, self._evidence_since_last_test - 1)
-            logger.info("[MetaCGN] Boot self-test PASSED (4/4 checks)")
+            if retrying_after_stale_disable:
+                # Self-heal path: persist the cleared status + clean failure
+                # counters so subsequent boots don't reload stale disabled.
+                self._disabled_reason = ""
+                self._save_watchdog_state()
+                logger.info("[MetaCGN] Boot self-test PASSED (4/4 checks) — "
+                            "self-healed from stale disabled_boot_selftest_"
+                            "failed state. Consumer re-enabled.")
+            else:
+                logger.info("[MetaCGN] Boot self-test PASSED (4/4 checks)")
             return True
         except Exception as e:
             self._status = "disabled_boot_selftest_failed"
+            self._save_watchdog_state()
             import traceback
             logger.error("[MetaCGN] Boot self-test FAILED: %r\n%s",
                          e, traceback.format_exc())
@@ -2001,9 +2045,10 @@ class MetaCGNConsumer:
                            f"{self._severity_trip_threshold}",
                     window_signatures=list(severity_by_sig.keys()),
                 )
-        except Exception:
+        except Exception as _swallow_exc:
             # Recording a failure must never itself fail
-            pass
+            swallow_warn('[logic.meta_cgn] MetaCGNConsumer._record_failure: self._total_failures += 1', _swallow_exc,
+                         key='logic.meta_cgn.MetaCGNConsumer._record_failure.line2049', throttle=100)
 
     def _append_failure_log(self, record: dict, exc: Exception) -> None:
         """P5 I-7: append to data/meta_cgn/failure_log.jsonl (FIFO bounded)."""
@@ -2021,8 +2066,9 @@ class MetaCGNConsumer:
                         f.writelines(lines)
             with open(self._failure_log_path, "a") as f:
                 f.write(json.dumps(record) + "\n")
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn("[logic.meta_cgn] MetaCGNConsumer._append_failure_log: record = {**record, 'exception_type': type(exc).__name__,...", _swallow_exc,
+                         key='logic.meta_cgn.MetaCGNConsumer._append_failure_log.line2068', throttle=100)
 
     def _trip_failsafe(self, reason: str,
                        window_signatures: list) -> None:
@@ -2050,8 +2096,9 @@ class MetaCGNConsumer:
                         "cooldown_chains": self._cooldown_remaining,
                     },
                 })
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn("[logic.meta_cgn] MetaCGNConsumer._trip_failsafe: self._send_queue.put({'type': 'META_CGN_FAILED', 'src': s...", _swallow_exc,
+                             key='logic.meta_cgn.MetaCGNConsumer._trip_failsafe.line2097', throttle=100)
         self._save_watchdog_state()
 
     def _maybe_recover_from_failsafe(self) -> None:
@@ -2105,8 +2152,9 @@ class MetaCGNConsumer:
             with open(tmp, "w") as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp, self._watchdog_path)
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn("[logic.meta_cgn] MetaCGNConsumer._save_watchdog_state: data = {'version': 1, 'saved_ts': time.time(), 'status': ...", _swallow_exc,
+                         key='logic.meta_cgn.MetaCGNConsumer._save_watchdog_state.line2152', throttle=100)
 
     def _load_watchdog_state(self) -> None:
         """P5 I-9: restore watchdog state — failsafe survives reboots."""
@@ -2203,8 +2251,9 @@ class MetaCGNConsumer:
                         "baseline": self._pre_graduation_baseline,
                     },
                 })
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn("[logic.meta_cgn] MetaCGNConsumer._enter_graduating: self._send_queue.put({'type': 'META_CGN_GRADUATING', 'src...", _swallow_exc,
+                             key='logic.meta_cgn.MetaCGNConsumer._enter_graduating.line2250', throttle=100)
         self._save_watchdog_state()
 
     def _enter_active(self) -> None:
@@ -2228,7 +2277,7 @@ class MetaCGNConsumer:
                 })
                 # TimeChain: permanent marker of graduation
                 self._send_queue.put({
-                    "type": "TIMECHAIN_COMMIT",
+                    "type": bus.TIMECHAIN_COMMIT,
                     "src": self._module_name,
                     "dst": "timechain",
                     "ts": time.time(),
@@ -2249,8 +2298,9 @@ class MetaCGNConsumer:
                         },
                     },
                 })
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn("[logic.meta_cgn] MetaCGNConsumer._enter_active: self._send_queue.put({'type': 'META_CGN_ACTIVE', 'src': s...", _swallow_exc,
+                             key='logic.meta_cgn.MetaCGNConsumer._enter_active.line2296', throttle=100)
         self._save_watchdog_state()
 
     def _compute_recent_reward_stats(self) -> tuple[float, float, int]:
@@ -2337,8 +2387,9 @@ class MetaCGNConsumer:
                     "payload": {"reason": reason,
                                 "count": self._rolled_back_count},
                 })
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn("[logic.meta_cgn] MetaCGNConsumer._rollback_to_shadow: self._send_queue.put({'type': 'META_CGN_ROLLED_BACK', 'sr...", _swallow_exc,
+                             key='logic.meta_cgn.MetaCGNConsumer._rollback_to_shadow.line2384', throttle=100)
         # Return to shadow_mode after brief latched rolled_back state
         self._status = "shadow_mode"
         self._save_watchdog_state()
@@ -2520,8 +2571,9 @@ class MetaCGNConsumer:
                     "chain_iql_top_Q": round(chain_iql_top_q, 4),
                     "ramp": round(ramp, 3),
                 }) + "\n")
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn("[logic.meta_cgn] MetaCGNConsumer._log_active_rerank: with open(self._disagreements_log_path, 'a') as f: f.writ...", _swallow_exc,
+                         key='logic.meta_cgn.MetaCGNConsumer._log_active_rerank.line2567', throttle=100)
 
     # ── P4 Chain-outcome tracker (feeds rollback detector) ─────────
 
@@ -2672,7 +2724,7 @@ class MetaCGNConsumer:
                     }
                     self._knowledge_requests_emitted += 1
                     self._send_queue.put({
-                        "type": "CGN_KNOWLEDGE_REQ",
+                        "type": bus.CGN_KNOWLEDGE_REQ,
                         "src": self._module_name,
                         "dst": "all",       # D8.1 broadcast
                         "ts": time.time(),
@@ -2688,7 +2740,8 @@ class MetaCGNConsumer:
                         },
                     })
             except Exception as e:
-                logger.debug("[MetaCGN] impasse emit failed: %s", e)
+                swallow_warn('[MetaCGN] impasse emit failed', e,
+                             key="logic.meta_cgn.impasse_emit_failed", throttle=100)
         return signal
 
     # ── P8: SOAR-via-CGN handlers ──────────────────────────────────────
@@ -2723,7 +2776,8 @@ class MetaCGNConsumer:
                 return self._finalize_knowledge_request(rid)
             return None
         except Exception as e:
-            logger.debug("[MetaCGN] handle_knowledge_response failed: %s", e)
+            swallow_warn('[MetaCGN] handle_knowledge_response failed', e,
+                         key="logic.meta_cgn.handle_knowledge_response_failed", throttle=100)
             return None
 
     def finalize_expired_requests(self) -> list:
@@ -2847,7 +2901,8 @@ class MetaCGNConsumer:
             r_grounded = max(0.0, min(1.0, r_grounded))
             return float(r_grounded), rows
         except Exception as e:
-            logger.debug("[MetaCGN] compute_grounded_reward failed: %s", e)
+            swallow_warn('[MetaCGN] compute_grounded_reward failed', e,
+                         key="logic.meta_cgn.compute_grounded_reward_failed", throttle=100)
             return 0.5, []
 
     def compute_blend_weights(self, current_domain: str = "general"
@@ -3059,8 +3114,9 @@ class MetaCGNConsumer:
             with open(self._haov_log_path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
             self._haov_log_lines += 1
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn('[logic.meta_cgn] MetaCGNConsumer._log_haov_entry: if self._haov_log_lines >= self._haov_log_max_lines: if o...', _swallow_exc,
+                         key='logic.meta_cgn.MetaCGNConsumer._log_haov_entry.line3109', throttle=100)
 
     def log_haov_chain(self, chain_id: int, primitives: list,
                        dominant: Optional[str], terminal_reward: float,
@@ -3131,8 +3187,9 @@ class MetaCGNConsumer:
                     _m = get_global_monitor()
                     if _m is not None:
                         _m.record_orphan(consumer, event_type)
-                except Exception:
-                    pass
+                except Exception as _swallow_exc:
+                    swallow_warn('[logic.meta_cgn] MetaCGNConsumer.handle_cross_consumer_signal: from ..core.bus_health import get_global_monitor', _swallow_exc,
+                                 key='logic.meta_cgn.MetaCGNConsumer.handle_cross_consumer_signal.line3181', throttle=100)
                 return False
             # ── SOAR Phase 3 (2026-04-21): primitive_repeat_impasse uses
             #    dynamic mapping driven by payload's repeated_primitive ──
@@ -3193,7 +3250,8 @@ class MetaCGNConsumer:
                              consumer, event_type, intensity)
             return True
         except Exception as e:
-            logger.debug("[MetaCGN] cross-consumer signal failed: %s", e)
+            swallow_warn('[MetaCGN] cross-consumer signal failed', e,
+                         key="logic.meta_cgn.cross_consumer_signal_failed", throttle=100)
             return False
 
     def apply_drift_hints(self, hints: list) -> dict:
@@ -3336,8 +3394,9 @@ class MetaCGNConsumer:
                     "terminal": round(terminal, 4),
                     "beta_dispersion_ema": round(self._beta_dispersion_ema, 4),
                 }) + "\n")
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn("[logic.meta_cgn] MetaCGNConsumer.log_blend_weights: path = os.path.join(self._save_dir, 'blend_weights_histor...", _swallow_exc,
+                         key='logic.meta_cgn.MetaCGNConsumer.log_blend_weights.line3387', throttle=100)
 
     def handle_knowledge_request(self, request_payload: dict) -> Optional[dict]:
         """D8.4: META-CGN as responder. Called when another consumer emits
@@ -3385,7 +3444,8 @@ class MetaCGNConsumer:
             self._knowledge_responses_sent += 1
             return response
         except Exception as e:
-            logger.debug("[MetaCGN] handle_knowledge_request failed: %s", e)
+            swallow_warn('[MetaCGN] handle_knowledge_request failed', e,
+                         key="logic.meta_cgn.handle_knowledge_request_failed", throttle=100)
             return None
 
     def maybe_exit_impasse(self) -> None:
@@ -3457,6 +3517,51 @@ class MetaCGNConsumer:
             return [json.loads(l) for l in lines if l.strip()]
         except Exception:
             return []
+
+    def handle_teacher_grounding(self, payload: dict) -> None:
+        """Meta-Teacher β-posterior nudge (rFP_titan_meta_reasoning_teacher §5.2).
+
+        Teacher labels primitive usage quality per chain; this applies a
+        Beta(α,β) update with grounding_weight smaller than regular chain
+        evidence so teacher never dominates real outcomes.
+
+        payload: {chain_id, primitive_id, label_quality, ctx_fingerprint,
+                  grounding_weight}
+
+        Mirrors update_primitive_V (w·q / w·(1-q) with same EMA-decay
+        handling), but does NOT update per-domain slices or SharedValueNet
+        — teacher grounding is purely a global α,β nudge.
+        """
+        if self._status in ("disabled_failsafe",
+                            "disabled_boot_selftest_failed"):
+            return
+        try:
+            primitive_id = str(payload.get("primitive_id", ""))
+            if primitive_id not in self._primitives:
+                return
+            quality = max(0.0, min(1.0, float(payload.get("label_quality", 0.5))))
+            weight = max(0.0, float(payload.get("grounding_weight", 0.15)))
+            if weight <= 0.0:
+                return
+            p = self._primitives[primitive_id]
+            ema_gamma = float(
+                COMPOSITION_DEFAULTS.get("ema_decay_gamma", 1.0))
+            excess_a = max(0.0, p.alpha - BETA_PARAM_FLOOR) * ema_gamma
+            excess_b = max(0.0, p.beta - BETA_PARAM_FLOOR) * ema_gamma
+            p.alpha = max(BETA_PARAM_FLOOR,
+                          BETA_PARAM_FLOOR + excess_a + weight * quality)
+            p.beta = max(BETA_PARAM_FLOOR,
+                         BETA_PARAM_FLOOR + excess_b + weight * (1.0 - quality))
+            p.recompute_derived()
+            p.last_updated_ts = time.time()
+            p.last_updated_chain = int(payload.get("chain_id", 0))
+            self._total_updates_applied += 1
+            if not hasattr(self, "_teacher_groundings_applied"):
+                self._teacher_groundings_applied = 0
+            self._teacher_groundings_applied += 1
+        except Exception as e:
+            logger.warning(
+                "[MetaCGN] handle_teacher_grounding failed: %s", e)
 
     # ── Telemetry ──────────────────────────────────────────────────
 

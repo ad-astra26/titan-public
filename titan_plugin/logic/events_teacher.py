@@ -94,9 +94,66 @@ class EventsTeacherDB:
     events_teacher.db. All other DBs are read-only.
     """
 
-    def __init__(self, db_path: str = DEFAULT_DB_PATH):
+    def __init__(self, db_path: str = DEFAULT_DB_PATH, writer_client=None):
         self._db_path = db_path
         self._init_db()
+        # rFP_universal_sqlite_writer 2026-04-27 — auto-construct writer
+        # client from [persistence_events_teacher] when enabled. Per-call-site
+        # adoption is incremental followup; daemon runs idle until callers
+        # opt into _route_write() — zero-regression infrastructure shipping.
+        self._writer = writer_client
+        if self._writer is None:
+            try:
+                import os as _os
+                from titan_plugin.persistence.config import IMWConfig
+                from titan_plugin.persistence.writer_client import (
+                    InnerMemoryWriterClient,
+                )
+                cfg = IMWConfig.from_titan_config_section("persistence_events_teacher")
+                if cfg.enabled and cfg.mode != "disabled":
+                    if cfg.db_path:
+                        try:
+                            cfg_real = _os.path.realpath(cfg.db_path)
+                            self_real = _os.path.realpath(self._db_path)
+                            if cfg_real != self_real:
+                                logger.info(
+                                    "[EventsTeacherDB] db_path %s != configured "
+                                    "writer path %s — writer client skipped "
+                                    "(path isolation)",
+                                    self._db_path, cfg.db_path)
+                                return
+                        except OSError as _e:
+                            logger.debug("[EventsTeacherDB] realpath check failed: %s", _e)
+                    self._writer = InnerMemoryWriterClient(
+                        cfg, caller_name="events_teacher")
+                    logger.info(
+                        "[EventsTeacherDB] Routed via events_teacher_writer "
+                        "(mode=%s, canonical=%s)",
+                        cfg.mode, cfg.tables_canonical or "<none>")
+            except Exception as e:
+                logger.warning(
+                    "[EventsTeacherDB] writer client unavailable, "
+                    "using direct writes: %s", e)
+                self._writer = None
+
+    def _route_write(self, sql: str, params, *, table: str):
+        """Route a write through the events_teacher_writer daemon if available.
+
+        Returns the inserted row's `lastrowid` (int) for INSERT statements,
+        or `None` for UPDATE/DELETE — matching the cursor.lastrowid contract
+        callers used to read pre-refactor (e.g., window_start returns the
+        new window_log.id). Fallback-safe: direct sqlite3 if writer is None.
+        """
+        if self._writer is not None:
+            result = self._writer.write(sql, params, table=table)
+            return getattr(result, "last_row_id", None)
+        conn = self._connect()
+        try:
+            cur = conn.execute(sql, params)
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, timeout=10)
@@ -218,42 +275,32 @@ class EventsTeacherDB:
     # ── Window lifecycle (crash recovery) ──
 
     def window_start(self, titan_id: str, window_number: int) -> int:
-        conn = self._connect()
-        try:
-            cur = conn.execute(
-                "INSERT INTO window_log (titan_id, window_number, status, started_at) "
+        return self._route_write(
+            "INSERT INTO window_log (titan_id, window_number, status, started_at) "
                 "VALUES (?, ?, 'running', ?)",
-                (titan_id, window_number, time.time()))
-            conn.commit()
-            return cur.lastrowid
-        finally:
-            conn.close()
+            (titan_id, window_number, time.time()),
+            table="window_log",
+        )
 
     def window_complete(self, window_id: int, result: WindowResult):
-        conn = self._connect()
-        try:
-            conn.execute(
-                "UPDATE window_log SET status='complete', mode=?, "
+        self._route_write(
+            "UPDATE window_log SET status='complete', mode=?, "
                 "mentions_new=?, follower_tweets_new=?, items_distilled=?, "
                 "events_stored=?, api_calls_used=?, llm_latency_ms=?, "
                 "completed_at=? WHERE id=?",
-                (result.llm_model, result.mentions_new, result.follower_tweets_new,
+            (result.llm_model, result.mentions_new, result.follower_tweets_new,
                  result.items_distilled, result.events_stored, result.api_calls_used,
-                 result.llm_latency_ms, time.time(), window_id))
-            conn.commit()
-        finally:
-            conn.close()
+                 result.llm_latency_ms, time.time(), window_id),
+            table="window_log",
+        )
 
     def window_failed(self, window_id: int, error: str):
-        conn = self._connect()
-        try:
-            conn.execute(
-                "UPDATE window_log SET status='failed', error_message=?, "
+        self._route_write(
+            "UPDATE window_log SET status='failed', error_message=?, "
                 "completed_at=? WHERE id=?",
-                (error[:500], time.time(), window_id))
-            conn.commit()
-        finally:
-            conn.close()
+            (error[:500], time.time(), window_id),
+            table="window_log",
+        )
 
     def recover_incomplete_windows(self, titan_id: str):
         """Crash recovery — mark stale 'running' windows as failed."""
@@ -280,72 +327,71 @@ class EventsTeacherDB:
 
     def store_felt_experience(self, titan_id: str, event: DistilledEvent,
                               mode: str, window_id: int):
-        conn = self._connect()
-        try:
-            conn.execute(
-                "INSERT INTO felt_experiences "
+        self._route_write(
+            "INSERT INTO felt_experiences "
                 "(titan_id, source, author, topic, sentiment, arousal, relevance, "
                 "concept_signals, felt_summary, contagion_type, mode, window_id, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (titan_id, event.source, event.author, event.topic,
+            (titan_id, event.source, event.author, event.topic,
                  event.sentiment, event.arousal, event.relevance,
                  json.dumps(event.concept_signals), event.felt_summary,
-                 event.contagion_type, mode, window_id, time.time()))
-            conn.commit()
-        finally:
-            conn.close()
+                 event.contagion_type, mode, window_id, time.time()),
+            table="felt_experiences",
+        )
 
     def update_follower_interaction(self, titan_id: str, handle: str,
                                     topic: str, relevance: float,
                                     sentiment: float):
+        # Split read-then-conditional-write: SELECT direct (WAL multi-reader),
+        # UPDATE/INSERT routes through events_teacher_writer daemon.
         conn = self._connect()
         try:
             existing = conn.execute(
                 "SELECT id, topics_seen FROM follower_interactions "
                 "WHERE titan_id=? AND handle=?",
                 (titan_id, handle)).fetchone()
-
-            now = time.time()
-            if existing:
-                topics = json.loads(existing["topics_seen"] or "[]")
-                if topic and topic not in topics:
-                    topics.append(topic)
-                    topics = topics[-20:]
-                conn.execute(
-                    "UPDATE follower_interactions SET "
-                    "times_checked=times_checked+1, topics_seen=?, "
-                    "accumulated_relevance=accumulated_relevance+?, "
-                    "last_sentiment=?, last_checked_at=? WHERE id=?",
-                    (json.dumps(topics), relevance, sentiment, now,
-                     existing["id"]))
-            else:
-                conn.execute(
-                    "INSERT INTO follower_interactions "
-                    "(titan_id, handle, times_checked, topics_seen, "
-                    "accumulated_relevance, last_sentiment, last_checked_at, created_at) "
-                    "VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
-                    (titan_id, handle, json.dumps([topic] if topic else []),
-                     relevance, sentiment, now, now))
-            conn.commit()
         finally:
             conn.close()
+
+        now = time.time()
+        if existing:
+            topics = json.loads(existing["topics_seen"] or "[]")
+            if topic and topic not in topics:
+                topics.append(topic)
+                topics = topics[-20:]
+            self._route_write(
+                "UPDATE follower_interactions SET "
+                "times_checked=times_checked+1, topics_seen=?, "
+                "accumulated_relevance=accumulated_relevance+?, "
+                "last_sentiment=?, last_checked_at=? WHERE id=?",
+                (json.dumps(topics), relevance, sentiment, now,
+                 existing["id"]),
+                table="follower_interactions",
+            )
+        else:
+            self._route_write(
+                "INSERT INTO follower_interactions "
+                "(titan_id, handle, times_checked, topics_seen, "
+                "accumulated_relevance, last_sentiment, last_checked_at, created_at) "
+                "VALUES (?, ?, 1, ?, ?, ?, ?, ?)",
+                (titan_id, handle, json.dumps([topic] if topic else []),
+                 relevance, sentiment, now, now),
+                table="follower_interactions",
+            )
 
     def store_engagement_snapshot(self, titan_id: str, tweet_id: str,
                                   likes: int, replies: int, quotes: int,
                                   delta_likes: int, delta_replies: int,
                                   delta_quotes: int):
-        conn = self._connect()
-        try:
-            conn.execute(
-                "INSERT INTO engagement_snapshots "
+        self._route_write(
+            "INSERT INTO engagement_snapshots "
                 "(titan_id, tweet_id, likes, replies, quotes, "
                 "delta_likes, delta_replies, delta_quotes, checked_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (titan_id, tweet_id, likes, replies, quotes,
-                 delta_likes, delta_replies, delta_quotes, time.time()))
-            conn.commit()
-        finally:
-            conn.close()
+            (titan_id, tweet_id, likes, replies, quotes,
+                 delta_likes, delta_replies, delta_quotes, time.time()),
+            table="engagement_snapshots",
+        )
 
     # ── P4: Engagement reciprocity tracking ──────────────────────────
 
@@ -353,30 +399,29 @@ class EventsTeacherDB:
                                       post_type: str, target_user: str,
                                       likes: int, replies: int, quotes: int):
         """Store engagement reciprocity for a post we made."""
-        conn = self._connect()
-        try:
-            # Compute reward: weighted engagement signal
-            reward = (
-                0.5 * min(1.0, likes / 5.0) +
-                0.3 * min(1.0, replies / 3.0) +
-                0.2 * min(1.0, quotes / 2.0)
-            )
-            now = time.time()
-            conn.execute(
-                "INSERT INTO engagement_reciprocity "
-                "(titan_id, our_tweet_id, our_post_type, target_user, "
-                "likes, replies, quotes, reward_computed, posted_at, "
-                "first_checked_at, last_checked_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(titan_id, our_tweet_id) DO UPDATE SET "
-                "likes=excluded.likes, replies=excluded.replies, "
-                "quotes=excluded.quotes, reward_computed=excluded.reward_computed, "
-                "last_checked_at=excluded.last_checked_at",
-                (titan_id, tweet_id, post_type, target_user,
-                 likes, replies, quotes, round(reward, 5), now, now, now))
-            conn.commit()
-        finally:
-            conn.close()
+        # Compute reward: weighted engagement signal
+        reward = (
+            0.5 * min(1.0, likes / 5.0) +
+            0.3 * min(1.0, replies / 3.0) +
+            0.2 * min(1.0, quotes / 2.0)
+        )
+        now = time.time()
+        # Single INSERT with ON CONFLICT — atomic upsert via ON CONFLICT clause,
+        # routed through events_teacher_writer daemon.
+        self._route_write(
+            "INSERT INTO engagement_reciprocity "
+            "(titan_id, our_tweet_id, our_post_type, target_user, "
+            "likes, replies, quotes, reward_computed, posted_at, "
+            "first_checked_at, last_checked_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(titan_id, our_tweet_id) DO UPDATE SET "
+            "likes=excluded.likes, replies=excluded.replies, "
+            "quotes=excluded.quotes, reward_computed=excluded.reward_computed, "
+            "last_checked_at=excluded.last_checked_at",
+            (titan_id, tweet_id, post_type, target_user,
+             likes, replies, quotes, round(reward, 5), now, now, now),
+            table="engagement_reciprocity",
+        )
 
     def get_unsent_engagement_rewards(self, titan_id: str,
                                        min_reward: float = 0.01) -> list:
@@ -395,14 +440,7 @@ class EventsTeacherDB:
 
     def mark_engagement_reward_sent(self, row_id: int):
         """Mark an engagement reward as sent to CGN."""
-        conn = self._connect()
-        try:
-            conn.execute(
-                "UPDATE engagement_reciprocity SET reward_sent=1 WHERE id=?",
-                (row_id,))
-            conn.commit()
-        finally:
-            conn.close()
+        self._route_write("UPDATE engagement_reciprocity SET reward_sent=1 WHERE id=?", (row_id,), table="engagement_reciprocity")
 
     def get_post_type_engagement_stats(self, titan_id: str,
                                         since_hours: float = 48.0) -> dict:
@@ -1152,6 +1190,29 @@ class EventsTeacher:
                         self._window_count, reason)
             self._log_telemetry(result)
             return result
+
+        # Mainnet Lifecycle Wiring rFP (2026-04-20): metabolism gate check.
+        # /v4/metabolism/evaluate-gate records the decision in the unified
+        # ring buffer regardless of gates_enforced. When enforced=True and
+        # feature is closed at the current tier, we skip the window.
+        try:
+            gresp = httpx.get(
+                f"{api_base}/v4/metabolism/evaluate-gate",
+                params={"feature": "research", "caller": "EventsTeacher"},
+                timeout=5,
+            )
+            if gresp.status_code == 200:
+                gdata = gresp.json().get("data", {})
+                if not gdata.get("should_proceed", True):
+                    reason = f"metabolism_gate:{gdata.get('reason', 'closed')}"
+                    result.skipped_reason = reason
+                    logger.info("[EventsTeacher] Window #%d gated: %s",
+                                self._window_count, reason)
+                    self._log_telemetry(result)
+                    return result
+        except Exception as e:
+            # Gate check failure is non-fatal (observation-only mode is default).
+            logger.debug("[EventsTeacher] Gate check failed: %s", e)
 
         # Crash recovery
         if self._db:

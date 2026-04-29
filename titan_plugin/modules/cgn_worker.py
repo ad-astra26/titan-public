@@ -22,6 +22,8 @@ import os
 import sys
 import time
 from queue import Empty
+from titan_plugin.utils.silent_swallow import swallow_warn
+from titan_plugin import bus
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,78 @@ CODE_AUTHORITATIVE_CONSUMERS = frozenset({
 })
 
 
+# H.2/H.3 (2026-04-28): module-level dest map shared between the
+# CGN_TRANSITION outcome handler and the periodic test pump (_run_haov_pump).
+# Routes CGN_HAOV_VERIFY_REQ to the worker that owns the consumer's
+# verifier branch. All 9 registered consumers covered (zero silent drops).
+_HAOV_DEST_MAP = {
+    "language": "language",
+    "social": "spirit",
+    "reasoning": "spirit",
+    "knowledge": "knowledge",
+    "coding": "spirit",
+    "self_model": "spirit",
+    "emotional": "emot_cgn",
+    "meta": "spirit",
+    "reasoning_strategy": "spirit",
+    "dreaming": "spirit",
+}
+
+
+def _run_haov_pump(cgn, send_queue, name, stuck_timeout_s):
+    """H.3 periodic HAOV test pump.
+
+    Walks all registered HAOV trackers and:
+      1. Expires _active_test entries older than stuck_timeout_s
+         (recovery from lost CGN_HAOV_VERIFY_RSP — pre-H.2 routing
+         silently dropped messages, leaving trackers permanently
+         unable to test).
+      2. Calls select_test() to attempt a new test (decoupled from
+         per-consumer outcome events — fixes Defect 4).
+      3. Routes successful selects via _HAOV_DEST_MAP and emits
+         CGN_HAOV_VERIFY_REQ.
+
+    Returns count of (expired, attempted, sent) for telemetry.
+    """
+    expired = 0
+    attempted = 0
+    sent = 0
+    now = time.time()
+    for consumer_name, tracker in cgn._haov_trackers.items():
+        try:
+            # 1. Expire stuck active_test
+            at = tracker._active_test
+            if at and isinstance(at, dict) and at.get("ts"):
+                if now - float(at["ts"]) > stuck_timeout_s:
+                    tracker._active_test = None
+                    expired += 1
+
+            # 2. Attempt a new test
+            attempted += 1
+            test_ctx = tracker.select_test({"available_actions": []})
+            if not test_ctx:
+                continue
+
+            # 3. Stamp + route + emit
+            if tracker._active_test is not None:
+                tracker._active_test["ts"] = now
+            dest = _HAOV_DEST_MAP.get(consumer_name, consumer_name)
+            _send_msg(send_queue, bus.CGN_HAOV_VERIFY_REQ, name, dest, {
+                "consumer": consumer_name,
+                "test_ctx": test_ctx,
+                "obs_before": {},  # no outcome context — pump-driven
+                "hypothesis": (
+                    tracker._active_test["hypothesis"].rule
+                    if tracker._active_test else ""),
+            })
+            sent += 1
+        except Exception as _pump_err:
+            logger.debug(
+                "[CGNWorker] HAOV pump error for '%s': %s",
+                consumer_name, _pump_err)
+    return (expired, attempted, sent)
+
+
 def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the CGN Cognitive Kernel process.
 
@@ -85,6 +159,10 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
     state_dir = config.get("state_dir", "data/cgn")
     db_path = config.get("db_path", "data/inner_memory.db")
+    # Microkernel v2 §A.2 part 2 (S4): shm_path retained for explicit-literal
+    # escape hatch. When config supplies the canonical default path, we let
+    # the dual-mode resolver pick legacy vs StateRegistry per the
+    # shm_cgn_format_alignment_enabled flag.
     shm_path = config.get("shm_path", "/dev/shm/cgn_live_weights.bin")
 
     # Load HAOV config with per-Titan profile overrides.
@@ -121,8 +199,39 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     except Exception as _hc_err:
         logger.info("[CGNWorker] Using default HAOV config: %s", _hc_err)
 
+    # H.4 Phase 1 (v1) — causal generator config from titan_params.
+    # Flag-default-false; enables per-consumer pattern miner that proposes
+    # causal hypotheses to the existing HAOV machinery.  Design lock:
+    # titan-docs/rFP_cgn_consolidated.md §2.9.
+    causal_generator_config: dict = {}
+    try:
+        _cg_cfg = config.get("causal_generator", {}) or {}
+        causal_generator_config = {
+            "enabled": bool(_cg_cfg.get("enabled", False)),
+            "defaults": {
+                "window_size": int(_cg_cfg.get("window_size", 30)),
+                "min_n": int(_cg_cfg.get("min_n", 5)),
+                "magnitude_threshold": float(_cg_cfg.get("magnitude_threshold", 0.05)),
+                "anti_pattern_enabled": bool(_cg_cfg.get("anti_pattern_enabled", True)),
+                "staleness_decay_per_tick": float(
+                    _cg_cfg.get("staleness_decay_per_tick", 0.999)),
+            },
+            "per_consumer": dict(_cg_cfg.get("per_consumer", {}) or {}),
+        }
+        logger.info(
+            "[CGNWorker] Causal generator config: enabled=%s, defaults=%s, "
+            "per_consumer=%s",
+            causal_generator_config["enabled"],
+            causal_generator_config["defaults"],
+            sorted(causal_generator_config["per_consumer"].keys()),
+        )
+    except Exception as _cg_err:
+        logger.info("[CGNWorker] Using default causal_generator config: %s", _cg_err)
+        causal_generator_config = {"enabled": False}
+
     cgn = ConceptGroundingNetwork(
-        db_path=db_path, state_dir=state_dir, haov_config=haov_config)
+        db_path=db_path, state_dir=state_dir, haov_config=haov_config,
+        causal_generator_config=causal_generator_config)
     # _load_state() called in __init__
 
     # ── Pre-register "reasoning" consumer for ARC (runs as standalone script) ──
@@ -283,11 +392,19 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         logger.warning("[CGNWorker] Consumer manifest audit failed: %s",
                        _audit_err)
 
-    # ── Initialize /dev/shm weight writer ──────────────────────────────
-    shm_writer = ShmWeightWriter(shm_path)
+    # ── Initialize /dev/shm weight writer (S4 dual-mode) ───────────────
+    # Pass titan_id + full config so the dual-mode resolver can pick
+    # legacy (16B header, global path) vs StateRegistry (24B header,
+    # per-titan path) based on shm_cgn_format_alignment_enabled flag.
+    # Explicit non-default shm_path (test override) still honored.
+    _cgn_titan_id = _titan_id  # resolved above from data/titan_identity.json
+    _shm_arg = shm_path if shm_path != "/dev/shm/cgn_live_weights.bin" else None
+    shm_writer = ShmWeightWriter(
+        shm_path=_shm_arg, titan_id=_cgn_titan_id, config=config)
     _write_full_shm(cgn, shm_writer)
-    logger.info("[CGNWorker] SHM weights written to %s (v=%d)",
-                shm_path, shm_writer.get_version())
+    logger.info("[CGNWorker] SHM weights written to %s (v=%d, sr=%s)",
+                shm_writer._path, shm_writer.get_version(),
+                shm_writer._use_stateregistry)
 
     # ── Stats ──────────────────────────────────────────────────────────
     _stats = {
@@ -304,15 +421,85 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     _online_consolidation_threshold = config.get(
         "online_consolidation_every", 50)
 
+    # H.3 (2026-04-28): periodic HAOV test pump. Defect 4 — test gate
+    # was coupled to per-consumer CGN_TRANSITION outcome; consumers that
+    # form hypotheses but rarely emit outcomes (meta=184 formed/0 tested
+    # in live telemetry) couldn't ever test. The pump walks all trackers
+    # at fixed cadence and forces select_test independent of inbound
+    # message. Also expires stuck _active_test entries (when verifier
+    # response was lost — pre-H.2 this happened constantly because of
+    # the silent-drop dest map).
+    HAOV_TEST_PUMP_INTERVAL_S = float(
+        config.get("haov_test_pump_interval_s", 30.0))
+    HAOV_ACTIVE_TEST_TIMEOUT_S = float(
+        config.get("haov_active_test_timeout_s", 300.0))  # 5 min
+    _last_haov_pump_ts = 0.0
+
+    # H.4 Phase 1 (v1) — staleness-decay tick for causal-generator candidates.
+    # Slower cadence than the HAOV test pump; once per minute is plenty for
+    # multiplicative slow-bleed (factor ~0.999/tick → 1000 ticks ≈ 16-17 hours
+    # before a stale candidate decays below 1 and evicts).  No-op when
+    # cgn.causal_generator.enabled = false.
+    CAUSAL_DECAY_INTERVAL_S = float(
+        config.get("causal_decay_interval_s", 60.0))
+    _last_causal_decay_ts = 0.0
+
+    # rFP_titan_vm_v2 Phase 2 §3.8: emit CGN_STATE_SNAPSHOT every
+    # snapshot_interval CGN_TRANSITION events. spirit_worker subscribes
+    # and writes payload into state_register.cgn_state; TitanVM bytecode
+    # reads the cgn.* observable namespace from there.
+    _snapshot_counter = 0
+    _snapshot_interval = int(config.get("vm_snapshot_every_n_transitions", 10))
+
     init_ms = (time.time() - init_start) * 1000
     logger.info("[CGNWorker] Ready in %.0fms (consumers=%s, buffer=%d, "
                 "shm=%s)", init_ms,
                 list(cgn._consumers.keys()),
                 cgn._buffer.size(), shm_path)
-    _send_msg(send_queue, "MODULE_READY", name, "guardian", {})
+    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
 
     # ── Main loop ──────────────────────────────────────────────────────
+    # ── Microkernel v2 Phase B.1 §6 — readiness/hibernate reporter ──
+    from titan_plugin.core.readiness_reporter import trivial_reporter
+    def _b1_save_state():
+        return []
+    _b1_reporter = trivial_reporter(
+        worker_name=name, layer="L2", send_queue=send_queue,
+        save_state_cb=_b1_save_state,
+    )
+
     while True:
+        # H.3 (2026-04-28): periodic HAOV test pump. Runs at fixed cadence
+        # regardless of inbound message activity. Decouples test-trigger
+        # from per-consumer CGN_TRANSITION outcome events (Defect 4).
+        _now_pump = time.time()
+        if _now_pump - _last_haov_pump_ts >= HAOV_TEST_PUMP_INTERVAL_S:
+            _last_haov_pump_ts = _now_pump
+            try:
+                _exp, _att, _snt = _run_haov_pump(
+                    cgn, send_queue, name, HAOV_ACTIVE_TEST_TIMEOUT_S)
+                if _exp or _snt:
+                    logger.info(
+                        "[CGNWorker] HAOV pump: expired=%d attempted=%d sent=%d",
+                        _exp, _att, _snt)
+            except Exception as _pump_outer_err:
+                logger.warning(
+                    "[CGNWorker] HAOV pump outer error: %s", _pump_outer_err)
+
+        # H.4 Phase 1 (v1) — staleness decay for causal-generator candidates.
+        # No-op when cgn.causal_generator.enabled = false (cgn returns 0).
+        if _now_pump - _last_causal_decay_ts >= CAUSAL_DECAY_INTERVAL_S:
+            _last_causal_decay_ts = _now_pump
+            try:
+                _evicted = cgn.decay_stale_haov()
+                if _evicted:
+                    logger.info(
+                        "[CGNWorker] causal decay: evicted=%d stale candidates",
+                        _evicted)
+            except Exception as _decay_err:
+                logger.warning(
+                    "[CGNWorker] causal decay outer error: %s", _decay_err)
+
         try:
             msg = recv_queue.get(timeout=_heartbeat_interval)
         except Empty:
@@ -362,13 +549,15 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         })
                         if _test_ctx:
                             # Route to correct bus module (consumer→module mapping)
-                            _haov_dest = {"language": "language",
-                                          "social": "spirit",
-                                          "reasoning": "spirit",
-                                          "knowledge": "knowledge",
-                                          "coding": "spirit"}.get(
+                            # H.2 (2026-04-28): added 5 missing dest entries
+                            # for consumers that had silent test routing.
+                            _haov_dest = _HAOV_DEST_MAP.get(
                                 _haov_consumer, _haov_consumer)
-                            _send_msg(send_queue, "CGN_HAOV_VERIFY_REQ",
+                            # H.3 (2026-04-28): timestamp active_test for
+                            # stuck-test expiry by pump.
+                            if _haov_tracker._active_test is not None:
+                                _haov_tracker._active_test["ts"] = time.time()
+                            _send_msg(send_queue, bus.CGN_HAOV_VERIFY_REQ,
                                       name, _haov_dest, {
                                 "consumer": _haov_consumer,
                                 "test_ctx": _test_ctx,
@@ -406,6 +595,41 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         cgn.consolidate(dream_phase=False)
                         _write_incremental_shm(cgn, shm_writer)
                         _stats["shm_writes"] += 1
+
+                # rFP_titan_vm_v2 Phase 2 §3.8: emit CGN_STATE_SNAPSHOT
+                # every N transitions (both outcome and new-transition
+                # branches tick the counter — snapshot reflects real
+                # activity cadence). Failure here is non-fatal (best-effort
+                # observability to TitanVM).
+                _snapshot_counter += 1
+                if _snapshot_counter >= _snapshot_interval:
+                    _snapshot_counter = 0
+                    try:
+                        _snap = cgn.get_vm_snapshot()
+                        _send_msg(send_queue, bus.CGN_STATE_SNAPSHOT,
+                                  name, "spirit", _snap)
+                    except Exception as _e:
+                        swallow_warn('[CGNWorker] snapshot emit failed', _e,
+                                     key="modules.cgn_worker.snapshot_emit_failed", throttle=100)
+                    # rFP_emot_cgn_v2 §23.6a (shipped 2026-04-24): emit
+                    # CGN_BETA_SNAPSHOT for emot_cgn_worker → populates
+                    # previously-dead cgn_beta_states_8d (8/210 dims of
+                    # HDBSCAN input). Reuses _snap's per-consumer reward_ema
+                    # as a dominant-V proxy. Missing consumers default to
+                    # 0.5 (neutral).
+                    try:
+                        from titan_plugin.logic.emot_bundle_protocol import (
+                            CGN_CONSUMERS as _CGN_CONSUMERS)
+                        _v_by_consumer = {
+                            c: float(_snap.get(f"{c}_reward_ema", 0.5))
+                            for c in _CGN_CONSUMERS
+                        }
+                        _send_msg(send_queue, bus.CGN_BETA_SNAPSHOT,
+                                  name, "emot_cgn",
+                                  {"values_by_consumer": _v_by_consumer})
+                    except Exception as _e:
+                        swallow_warn('[CGNWorker] beta snapshot emit failed', _e,
+                                     key="modules.cgn_worker.beta_snapshot_emit_failed", throttle=100)
 
             except Exception as e:
                 logger.warning("[CGNWorker] CGN_TRANSITION error: %s", e)
@@ -453,7 +677,7 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                             len(affinity))
 
                 # Broadcast to all consumers: weights updated
-                _send_msg(send_queue, "CGN_WEIGHTS_MAJOR", name, "all", {
+                _send_msg(send_queue, bus.CGN_WEIGHTS_MAJOR, name, "all", {
                     "consolidation": _stats["consolidations"],
                     "v_loss": stats.get("v_loss", 0),
                     "consumers": {
@@ -464,7 +688,7 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     "affinity_matrix": affinity,
                 })
                 # TimeChain: dream consolidation → procedural fork
-                send_queue.put({"type": "TIMECHAIN_COMMIT", "src": name,
+                send_queue.put({"type": bus.TIMECHAIN_COMMIT, "src": name,
                     "dst": "timechain", "ts": time.time(), "payload": {
                     "fork": "procedural", "thought_type": "procedural",
                     "source": "cgn_dream_consolidation",
@@ -494,10 +718,11 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     magnitude=payload.get("magnitude", 0.0),
                     context=payload.get("context"))
             except Exception as e:
-                logger.debug("[CGNWorker] Surprise error: %s", e)
+                swallow_warn('[CGNWorker] Surprise error', e,
+                             key="modules.cgn_worker.surprise_error", throttle=100)
 
         # ── CGN_HAOV_VERIFY_RSP — verification from consumer ─────
-        elif msg_type == "CGN_HAOV_VERIFY_RSP":
+        elif msg_type == bus.CGN_HAOV_VERIFY_RSP:
             try:
                 consumer = payload["consumer"]
                 tracker = cgn._haov_trackers.get(consumer)
@@ -513,7 +738,7 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     _tc_hypothesis = payload.get("hypothesis", "")
                     _tc_reward = payload.get("reward", 0.0)
                     _tc_confirmed = _tc_reward > 0
-                    send_queue.put({"type": "TIMECHAIN_COMMIT", "src": name,
+                    send_queue.put({"type": bus.TIMECHAIN_COMMIT, "src": name,
                         "dst": "timechain", "ts": time.time(), "payload": {
                         "fork": "procedural", "thought_type": "procedural",
                         "source": "haov_verification",
@@ -531,12 +756,13 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         "i_confidence": 0.5, "chi_coherence": 0.3,
                     }})
             except Exception as e:
-                logger.debug("[CGNWorker] HAOV verify error: %s", e)
+                swallow_warn('[CGNWorker] HAOV verify error', e,
+                             key="modules.cgn_worker.haov_verify_error", throttle=100)
 
         # ── CGN_INFERENCE_REQ — policy inference for remote processes ─
         # API_STUB: handler ready, awaits remote process senders (T2/T3
         # delegate path). Tracked I-003.
-        elif msg_type == "CGN_INFERENCE_REQ":
+        elif msg_type == bus.CGN_INFERENCE_REQ:
             try:
                 result = cgn.infer_social_action(
                     __import__("titan_plugin.logic.cgn",
@@ -547,16 +773,17 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 _send_response(send_queue, name, msg.get("src", ""),
                                result, msg.get("rid"))
             except Exception as e:
-                logger.debug("[CGNWorker] Inference error: %s", e)
+                swallow_warn('[CGNWorker] Inference error', e,
+                             key="modules.cgn_worker.inference_error", throttle=100)
 
         # ── CGN_KNOWLEDGE_REQ — route to knowledge worker ─────────
-        elif msg_type == "CGN_KNOWLEDGE_REQ":
+        elif msg_type == bus.CGN_KNOWLEDGE_REQ:
             # Forward to knowledge worker (when it exists)
-            _send_msg(send_queue, "CGN_KNOWLEDGE_REQ", name,
+            _send_msg(send_queue, bus.CGN_KNOWLEDGE_REQ, name,
                       "knowledge", payload)
 
         # ── QUERY — stats and diagnostics ─────────────────────────
-        elif msg_type == "QUERY":
+        elif msg_type == bus.QUERY:
             from titan_plugin.core.profiler import handle_memory_profile_query
             if handle_memory_profile_query(msg, send_queue, name):
                 continue
@@ -575,7 +802,19 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                {"insights": insights}, msg.get("rid"))
 
         # ── MODULE_SHUTDOWN ───────────────────────────────────────
-        elif msg_type == "MODULE_SHUTDOWN":
+        # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────
+        if _b1_reporter.handles(msg_type):
+            _b1_reporter.handle(msg)
+            if _b1_reporter.should_exit():
+                break
+            continue
+
+        # ── Microkernel v2 Phase B.2.1 — supervision-transfer dispatch ──
+        from titan_plugin.core import worker_swap_handler as _swap
+        if _swap.maybe_dispatch_swap_msg(msg):
+            continue
+
+        elif msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[CGNWorker] Shutdown requested: %s",
                         payload.get("reason", "?"))
             # Final save before exit
@@ -583,8 +822,9 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 cgn._save_state()
                 _write_full_shm(cgn, shm_writer)
                 logger.info("[CGNWorker] Final state saved")
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn('[modules.cgn_worker] cgn_worker_main: cgn._save_state()', _swallow_exc,
+                             key='modules.cgn_worker.cgn_worker_main.line645', throttle=100)
             break
 
 
@@ -601,7 +841,8 @@ def _write_full_shm(cgn, shm_writer):
             cgn._value_net.state_dict(),
             consumer_nets)
     except Exception as e:
-        logger.debug("[CGNWorker] SHM write failed: %s", e)
+        swallow_warn('[CGNWorker] SHM write failed', e,
+                     key="modules.cgn_worker.shm_write_failed", throttle=100)
 
 
 def _write_incremental_shm(cgn, shm_writer):
@@ -672,8 +913,9 @@ def _compute_affinity_matrix(cgn) -> dict:
             }
             with open("./data/cgn/affinity_history.jsonl", "a") as f:
                 f.write(json.dumps(entry) + "\n")
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn('[modules.cgn_worker] _compute_affinity_matrix: import json', _swallow_exc,
+                         key='modules.cgn_worker._compute_affinity_matrix.line735', throttle=100)
 
     return affinity
 
@@ -726,8 +968,9 @@ def _check_impasses(cgn, send_queue, name):
                             "[META-CGN] Producer #9 knowledge.impasse_resolved emit FAILED "
                             "— type=%s err=%s (signal missed)",
                             impasse.get("type", "?"), _p9_err)
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn('[modules.cgn_worker] _check_impasses: impasse = cgn.detect_impasse(consumer_name)', _swallow_exc,
+                         key='modules.cgn_worker._check_impasses.line789', throttle=100)
 
 
 def _send_msg(send_queue, msg_type, src, dst, payload, rid=None):
@@ -742,7 +985,7 @@ def _send_msg(send_queue, msg_type, src, dst, payload, rid=None):
 
 
 def _send_response(send_queue, src, dst, payload, rid):
-    _send_msg(send_queue, "RESPONSE", src, dst, payload, rid)
+    _send_msg(send_queue, bus.RESPONSE, src, dst, payload, rid)
 
 
 # Heartbeat throttle (Phase E Fix 2): 3s min interval per process.
@@ -760,5 +1003,5 @@ def _send_heartbeat(send_queue, name):
         rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
     except Exception:
         rss_mb = 0
-    _send_msg(send_queue, "MODULE_HEARTBEAT", name, "guardian",
+    _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian",
               {"rss_mb": round(rss_mb, 1)})

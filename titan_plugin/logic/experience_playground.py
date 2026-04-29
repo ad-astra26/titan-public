@@ -28,6 +28,7 @@ import json
 import logging
 import time
 from typing import Any, Callable, Optional
+from titan_plugin import bus
 
 logger = logging.getLogger(__name__)
 
@@ -274,7 +275,7 @@ class ExperiencePlayground:
             try:
                 from titan_plugin.bus import make_msg
                 self._bus.publish(make_msg(
-                    "EXPERIENCE_STIMULUS", "playground", "all", {
+                    bus.EXPERIENCE_STIMULUS, "playground", "all", {
                         "experience": plugin.name,
                         "stimulus": stimulus,
                         "perturbation": perturbation,

@@ -27,6 +27,7 @@ import time
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +61,13 @@ class TieredMemoryGraph:
         config = config or {}
         self._config = config
 
-        # Data directory
-        data_dir = config.get("data_dir", "./data")
+        # Data directory. BUG-B1-SHARED-LOCKS: shadow kernels set
+        # TITAN_DATA_DIR pointing at data_shadow_<port>/ so they don't
+        # contend on the original kernel's DuckDB/FAISS exclusive locks.
+        # Original kernel (env unset) sees default `./data` unchanged.
+        data_dir = os.environ.get(
+            "TITAN_DATA_DIR", config.get("data_dir", "./data"),
+        )
 
         # Local metadata index — all node metadata lives here (in-memory cache)
         self._node_store: Dict = {}
@@ -830,7 +836,8 @@ class TieredMemoryGraph:
             with open(self._zk_queue_path, "w") as f:
                 json.dump([h.hex() for h in self._zk_queue], f)
         except Exception as e:
-            logger.debug("[Memory] ZK queue persist failed: %s", e)
+            swallow_warn('[Memory] ZK queue persist failed', e,
+                         key="core.memory.zk_queue_persist_failed", throttle=100)
 
     def _load_zk_queue(self):
         """Load the ZK queue from disk on boot."""

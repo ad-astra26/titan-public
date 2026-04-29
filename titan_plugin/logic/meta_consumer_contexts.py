@@ -562,3 +562,58 @@ def compute_outcome_dreaming(pre_sleep: dict, post_wake: dict) -> float:
     var_d_norm = math.tanh(var_d / 100.0)
     score = 0.4 * pr_d + 0.3 * var_d_norm + 0.3 * cr_d
     return _clamp(math.tanh(score * 5.0))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# rFP_titan_meta_outer_layer — outer-summary signal helper
+# ═══════════════════════════════════════════════════════════════════════
+# Per rFP §9 Implementation Checklist — adds meta's situational awareness
+# of its own outer-wiredness. Returns a 3-float summary that can be:
+#   (a) supplied separately in META_REASON_REQUEST payload (no dim change
+#       to the 30D context_vector — backward compatible with trained policies)
+#   (b) spliced into a future 33D vector after coordinated policy retrain
+#       (tracked in DEFERRED_ITEMS.md as rFP_meta_outer_33d_policy_retrain)
+#
+# Three fields (all in [0,1]):
+#   [0] outer_fetched      — 0.0 if no fetch issued, 1.0 if fetch completed
+#   [1] sources_completed  — fraction of sources that returned before budget
+#   [2] fetch_ms_norm      — fetch latency normalized by budget (0=fast, 1=maxed)
+#
+# When is_active=False OR no outer_context was fetched: returns [0.0, 0.0, 0.0]
+# (zero-padding semantics — preserves neutral meaning for inactive state).
+
+def build_outer_summary_for_context_vec(outer_context: dict = None,
+                                         budget_ms: float = 200.0) -> list:
+    """3-float outer-context summary for meta-reasoning consumers.
+
+    Safe additive signal — callers choose whether/how to integrate into
+    their context payload. Returns zeros when no outer data was fetched.
+
+    Args:
+      outer_context: dict from OuterContextReader.compose_recall_query(),
+                     or None if no fetch occurred for this request
+      budget_ms:    fetch budget used (for latency normalization)
+
+    Returns a list of 3 floats in [0,1].
+    """
+    if not outer_context or not isinstance(outer_context, dict):
+        return [0.0, 0.0, 0.0]
+    # [0] outer_fetched — binary
+    outer_fetched = 1.0
+    # [1] sources_completed — 1.0 means all queried returned; lower = partial
+    queried = outer_context.get("sources_queried") or []
+    timed_out = outer_context.get("sources_timed_out") or []
+    failed = outer_context.get("sources_failed") or []
+    n_q = len(queried)
+    if n_q <= 0:
+        sources_completed = 0.0
+    else:
+        completed = n_q - len(timed_out) - len(failed)
+        sources_completed = max(0.0, min(1.0, completed / n_q))
+    # [2] fetch_ms_norm
+    fetch_ms = float(outer_context.get("fetch_ms", 0.0) or 0.0)
+    budget = float(budget_ms) if budget_ms > 0 else 200.0
+    fetch_ms_norm = max(0.0, min(1.0, fetch_ms / budget))
+    return [round(outer_fetched, 4),
+            round(sources_completed, 4),
+            round(fetch_ms_norm, 4)]

@@ -14,6 +14,7 @@ memory space, communicating exclusively through the Divine Bus.
 """
 import logging
 import os
+import signal
 import threading
 import time
 from collections import deque
@@ -24,6 +25,8 @@ from typing import Callable, Optional
 
 from .bus import (
     AnyQueue,
+    BUS_WORKER_ADOPT_ACK,
+    BUS_WORKER_ADOPT_REQUEST,
     DivineBus,
     MODULE_CRASHED,
     MODULE_HEARTBEAT,
@@ -31,6 +34,7 @@ from .bus import (
     MODULE_SHUTDOWN,
     make_msg,
 )
+from titan_plugin import bus
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +82,31 @@ class ModuleSpec:
     restart_on_crash: bool = True
     heartbeat_timeout: float = HEARTBEAT_TIMEOUT  # per-module override
     reply_only: bool = False     # if True, skip dst="all" broadcasts (only receive targeted msgs)
+    # Microkernel v2 Phase A §A.5 (2026-04-24): layer assignment.
+    # Canonical values in titan_plugin._layer_canon.LAYER_CANON.
+    # Validated in Guardian.register(). Used by arch_map, dashboard,
+    # and layer-aware crash logging.
+    layer: str = "L3"
+    # Microkernel v2 Phase A §A.3 (2026-04-25, S6): spawn vs fork
+    # start method. Default "fork" preserves Guardian's current
+    # byte-identical behavior. When set to "spawn", Guardian boots
+    # the worker via multiprocessing.get_context("spawn") — fresh
+    # interpreter, no parent COW inheritance. Saves ~200 MB RSS per
+    # worker (fork baseline ~265 MB → spawn baseline ~50-80 MB).
+    # Unknown values fall back to "fork" with a WARNING (Guardian
+    # never crashes boot on a misconfigured ModuleSpec).
+    start_method: str = "fork"
+    # Microkernel v2 Phase B.2.1 §M5 (2026-04-27 PM): adoption criticality.
+    # When True (default): worker MUST adopt for shadow swap to succeed —
+    # holds heavy in-process state (FAISS, DuckDB, audit chain, neural
+    # nets, vocabulary) that would be expensive to re-load. When False:
+    # nice-to-adopt — orchestrator declares swap successful regardless;
+    # if this worker doesn't adopt by timeout, it's left to self-SIGTERM
+    # via supervision daemon's bus-as-supervision check, and shadow's
+    # Guardian respawns it fresh post-swap (light-state workers like
+    # autonomous writers, observability aggregators, periodic backup
+    # daemons).
+    b2_1_swap_critical: bool = True
 
 
 @dataclass
@@ -103,6 +132,13 @@ class ModuleInfo:
     last_cpu_time: float = 0.0           # /proc/<pid>/stat utime+stime sample (seconds)
     last_cpu_sample_ts: float = 0.0      # when last_cpu_time was sampled
     consecutive_starved_cycles: int = 0  # heartbeat misses where CPU grew (alive-but-starved)
+    # Microkernel v2 Phase B.2.1 (2026-04-27): worker supervision-transfer.
+    # When True, this ModuleInfo refers to an externally-spawned worker
+    # (adopted from a prior kernel via BUS_WORKER_ADOPT_REQUEST). We do NOT
+    # own info.process (it stays None); cleanup uses os.kill instead of
+    # process.kill(). First heartbeat after adoption resets clocks fresh.
+    adopted: bool = False
+    adopt_ts: float = 0.0                # when adoption completed (for telemetry)
 
 
 class Guardian:
@@ -129,9 +165,36 @@ class Guardian:
         self.bus = bus
         self._modules: dict[str, ModuleInfo] = {}
         self._module_recv_queues: dict[str, AnyQueue] = {}  # name → recv queue (for bus routing)
-        self._guardian_queue = bus.subscribe("guardian")
+        # Option B (2026-04-29): declare the msg_types Guardian actually
+        # consumes via this queue. All four are typically sent with
+        # dst="guardian" (targeted) and therefore bypass the broadcast
+        # filter regardless — but we still declare them so the contract is
+        # explicit and arch_map can verify it. The real win: every other
+        # broadcast (~150 msg types — SPHERE_PULSE, *_UPDATED, EXPRESSION_*,
+        # etc.) is now dropped at publish, freeing the guardian queue from
+        # the dst="all" flood that was causing 87 MODULE_HEARTBEAT drops
+        # per ~500-line window on T1 (false-restart risk).
+        self._guardian_queue = bus.subscribe(
+            "guardian",
+            types=[
+                MODULE_HEARTBEAT,
+                MODULE_READY,
+                MODULE_SHUTDOWN,
+                BUS_WORKER_ADOPT_REQUEST,
+                # SAVE_DONE is targeted (dst="guardian") so it bypasses the
+                # filter regardless, but list it explicitly so arch_map can
+                # see the contract.
+            ],
+        )
         self._stop_requested = False
         self._module_lock = threading.RLock()  # serialize start/stop/restart to prevent duplicate spawns
+        # Microkernel v2 Phase A retrofit (2026-04-27): swap-aware kernel ref.
+        # Kernel sets `self.guardian._kernel_ref = self` after Guardian
+        # construction. start()/restart() consult kernel.is_shadow_swap_active()
+        # to block lazy-starts during swap (prevents proxy-driven mid-swap
+        # worker resurrection that holds DB locks). None in legacy mode
+        # (in-process; no kernel split) → swap interlock degrades to no-op.
+        self._kernel_ref = None
 
         # [guardian] toml plumbing — 2026-04-16. Previously Guardian(bus)
         # was constructed with no config, so the module-level constants
@@ -147,14 +210,120 @@ class Guardian:
 
     def register(self, spec: ModuleSpec) -> None:
         """Register a module specification. Does not start the module."""
+        # Microkernel v2 Phase A §A.5 — validate layer before registering.
+        from ._layer_canon import validate_layer
+        validate_layer(spec.layer)
         if spec.name in self._modules:
             logger.warning("[Guardian] Module '%s' already registered, updating spec", spec.name)
         self._modules[spec.name] = ModuleInfo(spec=spec)
-        logger.info("[Guardian] Registered module '%s' (autostart=%s, lazy=%s, rss_limit=%dMB, hb_timeout=%.0fs)",
-                     spec.name, spec.autostart, spec.lazy, spec.rss_limit_mb, spec.heartbeat_timeout)
+        logger.info("[Guardian] Registered module '%s' [%s] (autostart=%s, lazy=%s, rss_limit=%dMB, hb_timeout=%.0fs)",
+                     spec.name, spec.layer, spec.autostart, spec.lazy, spec.rss_limit_mb, spec.heartbeat_timeout)
+
+    # ── Microkernel v2 Phase B.2.1 — worker supervision transfer ──────────
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        """Check liveness without sending a signal (signal 0 = existence check)."""
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # PID exists but we don't own it (different uid). For our purposes,
+            # alive — we still tracked an externally-spawned worker.
+            return True
+
+    def adopt_worker(self, name: str, pid: int,
+                     spec: Optional[ModuleSpec] = None) -> bool:
+        """Phase B.2.1 — register an externally-spawned worker without spawning.
+
+        Used during shadow swap when a worker migrates from the old kernel to
+        this (shadow) kernel. The worker process already exists at `pid`; we:
+          - Verify the PID is alive
+          - Verify a ModuleSpec is registered (either passed in or pre-registered
+            via Guardian.register at boot)
+          - Register a ModuleInfo with adopted=True (changes _cleanup behavior;
+            queue-cleanup path uses os.kill instead of mp.Process.kill)
+          - Start heartbeat tracking fresh from now (no clock continuity from
+            the prior kernel — first heartbeat from the adopted worker resets
+            our wall-clock view)
+
+        Args:
+            name:  Module name; must match the key registered via .register()
+                   on this kernel, or the spec passed in.
+            pid:   PID of the live worker process.
+            spec:  Optional override spec. If None, uses self._modules[name].spec.
+
+        Returns:
+            True on successful adoption.
+            False on: unknown name (and no spec passed), dead PID, or already-
+            running module (state=RUNNING and adopted=False — fresh worker
+            already spawned for this slot, can't double-claim).
+
+        Thread-safe via _module_lock.
+        """
+        with self._module_lock:
+            existing = self._modules.get(name)
+            if spec is None and existing is None:
+                logger.warning("[Guardian] adopt_worker: unknown name '%s'", name)
+                return False
+            if not self._pid_alive(pid):
+                logger.warning("[Guardian] adopt_worker: pid %d not alive", pid)
+                return False
+            # If a fresh worker is already running here, reject — double-claim
+            # would corrupt _modules state.
+            if existing is not None and existing.state == ModuleState.RUNNING \
+                    and not existing.adopted:
+                logger.warning(
+                    "[Guardian] adopt_worker: '%s' already running fresh "
+                    "(pid=%s, state=%s) — rejecting adoption of pid=%d",
+                    name, existing.pid, existing.state.value, pid,
+                )
+                return False
+            now = time.time()
+            actual_spec = spec or existing.spec
+            info = ModuleInfo(spec=actual_spec)
+            info.pid = pid
+            info.process = None  # we don't own a multiprocessing.Process
+            info.state = ModuleState.RUNNING
+            info.start_time = now
+            info.last_heartbeat = now
+            info.ready_time = now  # adopted = ready by definition
+            info.adopted = True
+            info.adopt_ts = now
+            self._modules[name] = info
+            logger.info(
+                "[Guardian] Adopted worker '%s' (pid=%d) from prior kernel "
+                "[layer=%s, start_method=%s]",
+                name, pid, actual_spec.layer, actual_spec.start_method,
+            )
+            return True
 
     def start(self, name: str) -> bool:
         """Start a specific module process. Thread-safe via _module_lock."""
+        # Microkernel v2 Phase A retrofit (2026-04-27): autonomous swap
+        # interlock. If a shadow swap is in flight, block the calling
+        # thread until the swap completes — prevents proxy lazy-starts
+        # from resurrecting workers mid-swap (which re-acquire DB locks
+        # and fail shadow_boot on locks_not_released). No exception
+        # thrown; caller (proxy thread) waits up to 60s, then proceeds
+        # against whichever kernel won the swap. Caller is guaranteed
+        # eventual completion; no user-visible retry needed.
+        if (self._kernel_ref is not None
+                and hasattr(self._kernel_ref, "is_shadow_swap_active")
+                and self._kernel_ref.is_shadow_swap_active()):
+            logger.info(
+                "[Guardian] start('%s') deferred — shadow swap in flight; "
+                "waiting for completion (max 60s)", name,
+            )
+            try:
+                self._kernel_ref.wait_for_swap_completion(timeout=60.0)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[Guardian] start('%s') swap-wait failed: %s; "
+                    "proceeding anyway", name, e,
+                )
         with self._module_lock:
             info = self._modules.get(name)
             if not info:
@@ -195,9 +364,20 @@ class Guardian:
             if name in self._module_recv_queues:
                 del self._module_recv_queues[name]
 
-            # Create module's bus queues (bidirectional)
+            # Create module's bus queues (bidirectional).
+            # Microkernel v2 Phase A §A.3 (S6): spec.start_method selects
+            # fork (default, byte-identical) vs spawn (fresh interpreter,
+            # ~200 MB RSS savings per worker). Unknown values fall back
+            # to fork with a WARNING — Guardian never crashes on a
+            # misconfigured spec.
             import multiprocessing
-            ctx = multiprocessing.get_context("fork")
+            method = info.spec.start_method
+            if method not in ("fork", "spawn"):
+                logger.warning(
+                    "[Guardian] Module '%s' has unknown start_method=%r — "
+                    "falling back to 'fork'", name, method)
+                method = "fork"
+            ctx = multiprocessing.get_context(method)
             info.queue = ctx.Queue(maxsize=10000)
             info.send_queue = ctx.Queue(maxsize=10000)
 
@@ -214,7 +394,14 @@ class Guardian:
             try:
                 proc = ctx.Process(
                     target=_module_wrapper,
-                    args=(info.spec.entry_fn, name, info.queue, info.send_queue, info.spec.config),
+                    args=(
+                        info.spec.entry_fn,
+                        name,
+                        info.queue,
+                        info.send_queue,
+                        info.spec.config,
+                        info.spec.start_method,
+                    ),
                     name=f"titan-{name}",
                     daemon=True,
                 )
@@ -236,17 +423,58 @@ class Guardian:
         info = self._modules.get(name)
         if not info:
             return
-        # Force-kill any surviving child processes of the worker.
-        # CRITICAL: must NOT killpg if the worker shares our process group
-        # (which it does today — no setpgrp in worker startup). A naive
-        # killpg(worker_pgid) when worker_pgid == our_pgid is parent-suicide:
-        # titan_main dies and the API goes dark until watchdog reboot.
-        # Observed 2026-04-14 on T1 when spirit worker didn't respond to
-        # SIGTERM in 15s — killpg fired and took titan_main with it.
-        # Safe pattern: only killpg if worker is in a DIFFERENT group.
+
+        # Microkernel v2 Phase B.2.1 — adopted workers don't own .process.
+        # Use os.kill SIGTERM → 2s grace → os.kill SIGKILL. Gentler than the
+        # pgid-based path below; gives the worker's graceful SIGTERM handlers
+        # (flush WAL / release locks) a chance to run. We then fall through
+        # to the queue + state cleanup at the end (same path for both).
+        if getattr(info, 'adopted', False):
+            self._kill_adopted_process(info, name)
+        else:
+            self._kill_owned_process(info, name)
+        self._finalize_module_cleanup(info, name)
+
+    def _kill_adopted_process(self, info: ModuleInfo, name: str) -> None:
+        """Phase B.2.1 — gentle SIGTERM → 2s grace → SIGKILL for adopted workers."""
+        if info.pid is None:
+            return
+        try:
+            os.kill(info.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return  # already gone
+        except OSError as e:
+            logger.warning("[Guardian] adopted '%s' SIGTERM failed: %s", name, e)
+            return
+        # 2s graceful grace
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            try:
+                os.kill(info.pid, 0)
+            except ProcessLookupError:
+                return  # exited cleanly
+            time.sleep(0.1)
+        # Still alive — force
+        try:
+            os.kill(info.pid, signal.SIGKILL)
+            logger.info("[Guardian] adopted '%s' (pid=%s) SIGKILL after grace", name, info.pid)
+        except ProcessLookupError:
+            pass
+
+    def _kill_owned_process(self, info: ModuleInfo, name: str) -> None:
+        """Pre-B.2.1 cleanup path — extracted from _cleanup_module 2026-04-27.
+
+        Force-kill any surviving child processes of the worker.
+        CRITICAL: must NOT killpg if the worker shares our process group
+        (which it does today — no setpgrp in worker startup). A naive
+        killpg(worker_pgid) when worker_pgid == our_pgid is parent-suicide:
+        titan_main dies and the API goes dark until watchdog reboot.
+        Observed 2026-04-14 on T1 when spirit worker didn't respond to
+        SIGTERM in 15s — killpg fired and took titan_main with it.
+        Safe pattern: only killpg if worker is in a DIFFERENT group.
+        """
         if info.pid is not None:
             try:
-                import signal
                 worker_pgid = os.getpgid(info.pid)
                 my_pgid = os.getpgid(0)
                 if worker_pgid != my_pgid:
@@ -268,16 +496,21 @@ class Guardian:
                 info.process.close()
             except Exception:
                 pass
-        # Queue cleanup — use cancel_join_thread() instead of join_thread().
-        # Why: the consumer child was SIGKILL'd above, but forked siblings
-        # may still hold inherited read-end FDs on the pipe (phantom FDs),
-        # keeping the pipe open. A pending os.write() inside the queue's
-        # feeder thread then blocks indefinitely on a full pipe instead of
-        # receiving EPIPE, deadlocking Guardian's asyncio loop (observed
-        # 2026-04-14 on T1, cascading API hang; matches I-018 on T2).
-        # cancel_join_thread() is the documented Python fix for exactly
-        # this case — we accept the loss of any unflushed bytes, which
-        # were destined for a SIGKILL'd process anyway.
+
+    def _finalize_module_cleanup(self, info: ModuleInfo, name: str) -> None:
+        """Queue + state cleanup — runs after both adopted-kill and owned-kill paths.
+
+        Queue cleanup uses cancel_join_thread() instead of join_thread().
+        Why: the consumer child was SIGKILL'd above, but forked siblings
+        may still hold inherited read-end FDs on the pipe (phantom FDs),
+        keeping the pipe open. A pending os.write() inside the queue's
+        feeder thread then blocks indefinitely on a full pipe instead of
+        receiving EPIPE, deadlocking Guardian's asyncio loop (observed
+        2026-04-14 on T1, cascading API hang; matches I-018 on T2).
+        cancel_join_thread() is the documented Python fix for exactly
+        this case — we accept the loss of any unflushed bytes, which
+        were destined for a SIGKILL'd process anyway.
+        """
         if info.queue:
             self.bus.unsubscribe(name, info.queue)
             try:
@@ -298,6 +531,10 @@ class Guardian:
         info.pid = None
         info.queue = None
         info.send_queue = None
+        # B.2.1 — clear adoption sentinel on cleanup (next start_module
+        # via spawn would set adopted=False fresh anyway, but be explicit).
+        info.adopted = False
+        info.adopt_ts = 0.0
 
     def stop(self, name: str, reason: str = "requested",
              save_first: bool = True, save_timeout: float = 30.0) -> None:
@@ -332,7 +569,7 @@ class Guardian:
                 save_rid = _uuid.uuid4().hex[:8]
                 try:
                     self.bus.publish(make_msg(
-                        "SAVE_NOW", "guardian", name,
+                        bus.SAVE_NOW, "guardian", name,
                         {"module": name, "request_id": save_rid,
                          "reason": reason}))
                 except Exception as _pub_err:
@@ -347,7 +584,7 @@ class Guardian:
                         m = self._guardian_queue.get(timeout=0.5)
                     except Exception:
                         continue
-                    if (m.get("type") == "SAVE_DONE"
+                    if (m.get("type") == bus.SAVE_DONE
                             and m.get("payload", {}).get("module") == name
                             and m.get("payload", {}).get("request_id") == save_rid):
                         _p = m.get("payload", {})
@@ -426,8 +663,8 @@ class Guardian:
                 info.restart_timestamps.popleft()
 
             if len(info.restart_timestamps) >= self._max_restarts_in_window:
-                logger.error("[Guardian] Module '%s' exceeded %d restarts in %.0fs window — disabling (auto-re-enable in %.0fs)",
-                             name, self._max_restarts_in_window, self._restart_window_seconds, REENABLE_COOLDOWN_S)
+                logger.error("[Guardian] Module '%s' [%s] exceeded %d restarts in %.0fs window — disabling (auto-re-enable in %.0fs)",
+                             name, info.spec.layer, self._max_restarts_in_window, self._restart_window_seconds, REENABLE_COOLDOWN_S)
                 self.stop(name, reason="max_restarts_disabled")
                 info.state = ModuleState.DISABLED
                 info.disabled_at = time.time()
@@ -470,10 +707,43 @@ class Guardian:
             return self.start(name)
 
     def start_all(self) -> None:
-        """Start all modules that have autostart=True."""
+        """Start all modules that have autostart=True.
+
+        Microkernel v2 Phase B.2.1 (2026-04-27 PM): when env var
+        TITAN_B2_1_ADOPTION_PENDING=1 is set (passed by the shadow_swap
+        orchestrator to a freshly-spawned shadow kernel), spawn-mode
+        autostart modules are SKIPPED here. Those workers are the ones
+        that survived the kernel swap; they reconnect to shadow's broker
+        and register via BUS_WORKER_ADOPT_REQUEST → Guardian.adopt_worker.
+        Spawning fresh copies would create duplicates fighting for
+        shm/locks/sockets.
+
+        Fork-mode workers + non-graduated specials (imw, observatory_writer,
+        api_subprocess) still start normally — they died with the old
+        kernel and need the shadow Guardian to respawn them. Once the
+        adoption window closes (orchestrator times out or accepts), any
+        spawn-mode worker that DIDN'T get adopted can be started via
+        explicit start(name) calls — that fallback isn't automatic here
+        to keep the boot-time logic simple.
+        """
+        adoption_pending = (
+            os.environ.get("TITAN_B2_1_ADOPTION_PENDING", "") == "1"
+        )
+        skipped: list[str] = []
         for name, info in self._modules.items():
-            if info.spec.autostart:
-                self.start(name)
+            if not info.spec.autostart:
+                continue
+            if adoption_pending and info.spec.start_method == "spawn":
+                skipped.append(name)
+                continue
+            self.start(name)
+        if skipped:
+            logger.info(
+                "[Guardian] B.2.1 adoption-pending: skipped autostart for "
+                "spawn-mode workers (%d): %s — awaiting "
+                "BUS_WORKER_ADOPT_REQUEST",
+                len(skipped), sorted(skipped),
+            )
 
     def stop_all(self, reason: str = "shutdown") -> None:
         """Gracefully stop all running modules."""
@@ -481,6 +751,89 @@ class Guardian:
         for name, info in self._modules.items():
             if info.state in (ModuleState.RUNNING, ModuleState.STARTING, ModuleState.UNHEALTHY):
                 self.stop(name, reason=reason)
+
+    def fast_kill(self, name: str) -> bool:
+        """Fast SIGTERM-then-SIGKILL on a module — NO SAVE_NOW dance.
+
+        Used by shadow_orchestrator AFTER pause() to clean up stragglers:
+        workers that didn't ack HIBERNATE within the layer timeout but
+        are still alive holding DB locks. Without this, locks_not_released
+        would block shadow_boot indefinitely (workers don't auto-exit).
+
+        Skips stop()'s SAVE_NOW + 30s wait. Goes straight to:
+          _kill_owned_process: pgid-based killpg + .process.kill (~2s)
+          _finalize_module_cleanup: queue cleanup + state reset
+
+        Returns True if module was killed (or already dead). False on
+        unknown name.
+        """
+        info = self._modules.get(name)
+        if info is None:
+            logger.warning("[Guardian] fast_kill: unknown module '%s'", name)
+            return False
+        if info.process is None or not info.process.is_alive():
+            # Already exited via HIBERNATE — make sure state is clean
+            self._finalize_module_cleanup(info, name)
+            return True
+        logger.info("[Guardian] fast_kill('%s') — straggler cleanup post-HIBERNATE", name)
+        if getattr(info, 'adopted', False):
+            self._kill_adopted_process(info, name)
+        else:
+            self._kill_owned_process(info, name)
+        self._finalize_module_cleanup(info, name)
+        return True
+
+    def pause(self) -> None:
+        """Mute monitor_tick + auto-restart WITHOUT iterating modules.
+
+        Microkernel v2 Phase B fast-hibernate (2026-04-27): the original
+        _phase_hibernate called stop_all() which iterated every module +
+        published SAVE_NOW + waited up to 30s per module for SAVE_DONE
+        from already-dead workers. That cost ~8.5 minutes per swap on a
+        17-module fleet — with no benefit, since workers had already
+        exited via HIBERNATE_ACK.
+
+        pause() just sets _stop_requested=True (the kill switch). Workers
+        are unchanged: those that exited via HIBERNATE stay exited;
+        those still running keep running. Auto-restart is muted so dead
+        workers don't get respawned by monitor_tick mid-swap.
+
+        Symmetric counterpart: resume() (which clears the flag) must be
+        called from rollback paths so workers respawn after a failed swap.
+
+        Saves ~8.5 minutes per swap. The HIBERNATE_ACK collection that
+        runs BEFORE pause() already gives workers their chance to save
+        state cleanly; SAVE_NOW-then-30s-wait was redundant after that.
+        """
+        if self._stop_requested:
+            logger.debug("[Guardian] pause() — already paused, no-op")
+            return
+        self._stop_requested = True
+        logger.info("[Guardian] paused — monitor_tick muted, auto-restart "
+                    "disabled (resume() to restore)")
+
+    def resume(self) -> None:
+        """Re-enable monitor_tick + auto-restart after a stop_all() pause.
+
+        2026-04-27 Phase B.1 unwind-path bug fix: shadow_orchestrator's
+        _phase_hibernate calls stop_all() to prevent Guardian from auto-
+        respawning workers while the shadow kernel boots. Without a
+        symmetric resume() call, _stop_requested stays True forever after
+        a rollback, so monitor_tick becomes a permanent no-op and workers
+        that exited (via HIBERNATE) are never restarted — Titan goes dark.
+
+        Called from every shadow_orchestrator rollback path AFTER publishing
+        HIBERNATE_CANCEL. After resume(), the caller should also invoke
+        start_all() to actually respawn the autostart modules that exited.
+
+        Idempotent: calling on an already-running Guardian is a no-op log.
+        """
+        if not self._stop_requested:
+            logger.info("[Guardian] resume() called but already running — no-op")
+            return
+        self._stop_requested = False
+        logger.info("[Guardian] resumed — monitor_tick re-enabled, "
+                    "auto-restart back online")
 
     def monitor_tick(self) -> None:
         """
@@ -557,8 +910,13 @@ class Guardian:
                     reason = ("heartbeat_timeout_starved_grace_exhausted"
                               if info.consecutive_starved_cycles >= MAX_STARVED_CYCLES
                               else "heartbeat_timeout")
-                    logger.warning("[Guardian] Module '%s' heartbeat timeout (%.1fs > %.0fs limit) — restart reason=%s",
-                                   name, now - info.last_heartbeat, hb_timeout, reason)
+                    # Microkernel v2 Phase A §A.5 — L1 crashes are architecturally
+                    # unexpected (Trinity daemons should be rock-solid); log at
+                    # ERROR level so they surface distinctly from L2/L3 restarts.
+                    lvl = logging.ERROR if info.spec.layer == "L1" else logging.WARNING
+                    logger.log(lvl,
+                               "[Guardian] Module '%s' [%s] heartbeat timeout (%.1fs > %.0fs limit) — restart reason=%s",
+                               name, info.spec.layer, now - info.last_heartbeat, hb_timeout, reason)
                     with self._module_lock:
                         info.state = ModuleState.UNHEALTHY
                         info.consecutive_starved_cycles = 0
@@ -619,6 +977,45 @@ class Guardian:
                     if rss:
                         info.rss_mb = rss
 
+            elif msg_type == BUS_WORKER_ADOPT_REQUEST:
+                # Microkernel v2 Phase B.2.1 — worker requesting adoption
+                # by this (shadow) Guardian. Validate + register without
+                # spawning + reply with BUS_WORKER_ADOPT_ACK (rid-matched).
+                payload = msg.get("payload", {}) or {}
+                worker_name = payload.get("name")
+                worker_pid = payload.get("pid")
+                rid = msg.get("rid")
+                if not worker_name or not isinstance(worker_pid, int):
+                    logger.warning(
+                        "[Guardian] BUS_WORKER_ADOPT_REQUEST malformed: %r", payload,
+                    )
+                    continue
+                ok = self.adopt_worker(worker_name, worker_pid)
+                ack_payload = {
+                    "name": worker_name,
+                    "pid": worker_pid,
+                    "shadow_pid": os.getpid(),
+                }
+                if ok:
+                    ack_payload["status"] = "adopted"
+                    ack_payload["reason"] = None
+                else:
+                    ack_payload["status"] = "rejected"
+                    # Best-effort distinguishability for logs/tests:
+                    if not self._pid_alive(worker_pid):
+                        ack_payload["reason"] = "pid_not_alive"
+                    elif worker_name not in self._modules:
+                        ack_payload["reason"] = "unknown_name"
+                    else:
+                        ack_payload["reason"] = "already_running"
+                self.bus.publish(make_msg(
+                    BUS_WORKER_ADOPT_ACK,
+                    "guardian",
+                    worker_name,
+                    ack_payload,
+                    rid=rid,
+                ))
+
     @staticmethod
     def _get_rss_mb(pid: int) -> float:
         """Read RSS from /proc/{pid}/status (Linux only)."""
@@ -668,8 +1065,52 @@ class Guardian:
                 "restart_count": info.restart_count,
                 "restarts_in_window": len(info.restart_timestamps),
                 "last_heartbeat_age": round(time.time() - info.last_heartbeat, 1) if info.last_heartbeat else -1,
+                # Microkernel v2 Phase A §A.5 — layer exposed per module.
+                "layer": info.spec.layer,
+                # Microkernel v2 Phase A §A.3 (S6) — start method for hybrid policy.
+                "start_method": info.spec.start_method,
+                # Microkernel v2 Phase B.2.1 — adoption sentinel + timestamp.
+                "adopted": info.adopted,
+                "adopt_ts": info.adopt_ts if info.adopted else 0.0,
             }
         return result
+
+    # ── Microkernel v2 Phase A §A.5 — layer queries ─────────────────────
+
+    def get_layer(self, name: str) -> str | None:
+        """Return the layer tag for a registered module, or None."""
+        info = self._modules.get(name)
+        return info.spec.layer if info else None
+
+    def get_modules_by_layer(self, layer: str) -> list[str]:
+        """Return sorted list of module names registered at the given layer."""
+        return sorted(
+            n for n, info in self._modules.items() if info.spec.layer == layer
+        )
+
+    def layer_stats(self) -> dict:
+        """
+        Return per-layer counters (total + per-state) for dashboard exposure.
+        Used by /v4/guardian-status and arch_map layers.
+        """
+        stats: dict[str, dict[str, int]] = {
+            "L0": {"total": 0, "running": 0, "crashed": 0, "disabled": 0},
+            "L1": {"total": 0, "running": 0, "crashed": 0, "disabled": 0},
+            "L2": {"total": 0, "running": 0, "crashed": 0, "disabled": 0},
+            "L3": {"total": 0, "running": 0, "crashed": 0, "disabled": 0},
+        }
+        for info in self._modules.values():
+            bucket = stats.get(info.spec.layer)
+            if bucket is None:
+                continue  # unknown layer — shouldn't happen after register() validation
+            bucket["total"] += 1
+            if info.state == ModuleState.RUNNING:
+                bucket["running"] += 1
+            elif info.state == ModuleState.CRASHED:
+                bucket["crashed"] += 1
+            elif info.state == ModuleState.DISABLED:
+                bucket["disabled"] += 1
+        return stats
 
     def is_running(self, name: str) -> bool:
         info = self._modules.get(name)
@@ -826,10 +1267,19 @@ def _append_meta_cgn_emission_log(msg: dict, payload: dict) -> None:
         f.write(json.dumps(event, separators=(",", ":")) + "\n")
 
 
-def _module_wrapper(entry_fn: Callable, name: str, recv_queue, send_queue, config: dict) -> None:
+def _module_wrapper(entry_fn: Callable, name: str, recv_queue, send_queue,
+                    config: dict, start_method: str = "fork") -> None:
     """
     Wrapper that runs in the child process.
-    Sets up logging, calls the entry function, handles crashes.
+    Sets up logging, lifecycle protection, B.2 bus bootstrap, B.2.1 swap-
+    handler bootstrap, then calls the entry function and handles crashes.
+
+    Phase B.2.1 (2026-04-27): centralizes setup_worker_bus + SwapHandlerState
+    + supervision daemon here so per-worker change reduces to 3 elif branches
+    in the main loop (chunk C2). `start_method` is passed by Guardian's
+    spawn site from ModuleSpec.start_method; controls whether this worker
+    takes the spawn-mode "true outlive" path or the fork-mode improved-B.1
+    fallback (worker dies with old kernel, shadow's Guardian respawns it).
     """
     # Configure logging for child process
     logging.basicConfig(
@@ -840,6 +1290,78 @@ def _module_wrapper(entry_fn: Callable, name: str, recv_queue, send_queue, confi
     logger = logging.getLogger(name)
     logger.info("Module '%s' process started (pid=%d)", name, os.getpid())
 
+    # Orphan prevention: when titan_main is SIGKILL'd (OOM, kernel panic),
+    # its signal handlers don't run and child workers reparent to systemd,
+    # accumulate state, and become memory leaks until OOM-killed themselves
+    # (see 2026-04-27 cascade incident: T2 IMW orphan grew to 11.4 GB).
+    # PR_SET_PDEATHSIG asks the kernel to deliver SIGTERM the moment our
+    # parent dies — survives parent SIGKILL because the kernel is the
+    # messenger. Combined with a getppid()-poll watcher as backup defense.
+    # Worker entry_fns install their own SIGTERM handlers afterward, which
+    # catch this signal and perform graceful shutdown (flush WAL, etc.).
+    from titan_plugin.core.worker_lifecycle import install_full_protection
+    _wl = install_full_protection()
+    logger.info(
+        "Module '%s' lifecycle protection: pdeathsig=%s watcher=%s",
+        name, _wl["pdeathsig_installed"], _wl["watcher_started"],
+    )
+
+    # Phase B.2.1 — bus bootstrap + swap-handler bootstrap. setup_worker_bus
+    # rebinds (recv_queue, send_queue) to SocketQueue when env vars indicate
+    # bus_ipc_socket_enabled mode; otherwise returns the original mp.Queue
+    # handles unchanged (legacy behavior, no socket overhead).
+    #
+    # A.8.2 §3.5 (2026-04-28): the supervision daemon thread is only needed by
+    # spawn-mode (graduated) workers — they take the "true outlive" path during
+    # shadow swap and require BUS_HANDOFF / ADOPT_ACK / CANCELED dispatch.
+    # Fork-mode workers die-with-parent (PR_SET_PDEATHSIG) and get respawned
+    # by the shadow's Guardian, so they never participate in adoption — the
+    # supervision tick is dead code for them. Skip start_supervision_thread()
+    # for fork-mode entirely (saves the redundant no-op Thread object that
+    # worker_swap_handler.start_supervision_thread() returns for fork-mode).
+    # The SwapHandlerState is still registered process-globally so other
+    # adoption-protocol entrypoints (HANDOFF dispatch from the bus message
+    # path) remain reachable via get_active_swap_state(); they'll early-return
+    # for fork-mode at their own dispatch sites.
+    bus_client = None
+    try:
+        from titan_plugin.core.worker_bus_bootstrap import setup_worker_bus
+        recv_queue, send_queue, bus_client = setup_worker_bus(
+            name, recv_queue, send_queue,
+        )
+        if bus_client is not None:
+            from titan_plugin.core.worker_swap_handler import (
+                SwapHandlerState,
+                set_active_swap_state,
+                start_supervision_thread,
+            )
+            swap_state = SwapHandlerState(
+                name=name,
+                start_method=start_method,
+                watcher_state=_wl["watcher_state"],
+                bus_client=bus_client,
+            )
+            set_active_swap_state(swap_state)
+            if start_method == "spawn":
+                start_supervision_thread(swap_state)
+                logger.info(
+                    "Module '%s' B.2.1 wiring active (start_method=%s, "
+                    "supervision daemon ticking)",
+                    name, start_method,
+                )
+            else:
+                logger.info(
+                    "Module '%s' B.2.1 wiring active (start_method=%s, "
+                    "supervision skipped — fork-mode dies with parent, "
+                    "adoption not applicable; A.8.2 §3.5)",
+                    name, start_method,
+                )
+    except Exception as e:  # noqa: BLE001 — never crash worker boot on wiring
+        logger.warning(
+            "Module '%s' B.2.1 wiring init failed: %s — continuing in legacy mode",
+            name, e, exc_info=True,
+        )
+
     try:
         entry_fn(recv_queue, send_queue, name, config)
     except KeyboardInterrupt:
@@ -848,4 +1370,14 @@ def _module_wrapper(entry_fn: Callable, name: str, recv_queue, send_queue, confi
         logger.error("Module '%s' crashed: %s", name, e, exc_info=True)
         raise
     finally:
+        if bus_client is not None:
+            try:
+                bus_client.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            from titan_plugin.core.worker_swap_handler import set_active_swap_state
+            set_active_swap_state(None)
+        except Exception:  # noqa: BLE001
+            pass
         logger.info("Module '%s' process exiting", name)

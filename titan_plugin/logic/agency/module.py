@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -84,7 +85,9 @@ class AgencyModule:
         self._llm_calls_this_hour = 0
         self._hour_start = time.time()
         self._pending_action: Optional[dict] = None
-        self._history: list[dict] = []  # Last N action results
+        # L3 Phase A.8.1: deque(maxlen=50) replaces manual `[-50:]` trim —
+        # auto-eviction at data-structure level, no per-append slicing.
+        self._history: deque = deque(maxlen=50)  # Last 50 action results
         # V5: Expression dispatch cooldowns (loaded from titan_params.toml)
         self._dispatch_cooldowns: dict[str, float] = {}
         self._last_dispatch_ts: dict[str, float] = {}
@@ -373,9 +376,8 @@ class AgencyModule:
             "ts": time.time(),
         }
 
+        # deque(maxlen=50) handles eviction automatically (L3 Phase A.8.1).
         self._history.append(action_result)
-        if len(self._history) > 50:
-            self._history = self._history[-50:]
 
         return action_result
 

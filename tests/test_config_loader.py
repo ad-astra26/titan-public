@@ -332,3 +332,68 @@ port = 7777
     assert cfg["growth_metrics"]["node_saturation_24h"] == 30
     assert cfg["growth_metrics"]["edge_rate_max"] == 100
     assert cfg["api"]["port"] == 7777
+
+
+# ---------------------------------------------------------------------------
+# titan_plugin.params delegates to config_loader (BUG-CONFIG-LOADER-MERGE-TITAN-PARAMS)
+# ---------------------------------------------------------------------------
+
+def test_params_get_params_returns_merged_layers(tmp_path):
+    """``params.get_params(section)`` must return the merged config view.
+
+    Pre-fix, ``params.py`` read ``titan_params.toml`` directly and skipped
+    Layers 2-4. After the fix it delegates to ``config_loader.load_titan_config``
+    so a section value written in config.toml (Layer 2) overrides
+    titan_params.toml (Layer 1) and is visible to ``get_params``.
+    """
+    titan_params = tmp_path / "titan_params.toml"
+    base = tmp_path / "config.toml"
+    _write_toml(
+        titan_params,
+        """\
+[reflexes]
+fire_threshold = 0.10
+cooldown_ms = 250
+""",
+    )
+    _write_toml(
+        base,
+        """\
+[reflexes]
+fire_threshold = 0.20
+""",
+    )
+
+    from titan_plugin import config_loader, params as params_mod
+
+    config_loader.clear_cache()
+    with mock.patch.object(config_loader, "TITAN_PARAMS_PATH", titan_params), mock.patch.object(
+        config_loader, "BASE_CONFIG_PATH", base
+    ):
+        section = params_mod.get_params("reflexes")
+
+    # Layer 2 (config.toml) overrides Layer 1 (titan_params.toml) — fire_threshold
+    assert section["fire_threshold"] == 0.20
+    # Layer 1 keys not overridden in Layer 2 must still be visible
+    assert section["cooldown_ms"] == 250
+    # Returned dict is a copy — mutation does not affect cache
+    section["fire_threshold"] = 99.0
+    section_again = params_mod.get_params("reflexes")
+    assert section_again["fire_threshold"] == 0.20
+
+
+def test_params_get_params_unknown_section_returns_empty_dict(tmp_path):
+    """Unknown section returns ``{}`` (preserves pre-fix behavior)."""
+    titan_params = tmp_path / "titan_params.toml"
+    base = tmp_path / "config.toml"
+    _write_toml(titan_params, "[reflexes]\nfire_threshold = 0.10\n")
+    _write_toml(base, "[api]\nport = 7777\n")
+
+    from titan_plugin import config_loader, params as params_mod
+
+    config_loader.clear_cache()
+    with mock.patch.object(config_loader, "TITAN_PARAMS_PATH", titan_params), mock.patch.object(
+        config_loader, "BASE_CONFIG_PATH", base
+    ):
+        section = params_mod.get_params("nonexistent_section")
+    assert section == {}

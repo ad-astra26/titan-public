@@ -403,6 +403,96 @@ def handle_memory_profile_query(msg: dict, send_queue, name: str) -> bool:
     return True
 
 
+# ── Heap snapshot — gc.get_objects() aggregator ───────────────────────
+
+
+def take_heap_snapshot(top_types: int = 30,
+                        top_containers: int = 20,
+                        container_min_len: int = 10) -> dict:
+    """Aggregate-only snapshot of the calling process's Python heap.
+
+    Walks `gc.get_objects()` and groups by type. Returns top types by
+    total byte size and the largest containers (list/dict/set/tuple)
+    by `len()` — the latter surfaces unbounded-accumulator patterns.
+
+    Returns ONLY counts and sizes. Never object content. Safe to expose
+    via diagnostic endpoint.
+
+    Args:
+      top_types:        max types to include in by-size ranking
+      top_containers:   max containers to include in by-len ranking
+      container_min_len: ignore containers below this length (filters noise)
+
+    Cost: O(n) where n = number of tracked Python objects (~0.5-2M typical).
+    Wall-clock: ~1-5 s on a 2 GB heap. Run in `asyncio.to_thread` from
+    coroutines.
+    """
+    import gc as _gc
+    import sys as _sys
+    from collections import defaultdict as _defaultdict
+
+    t0 = time.monotonic()
+    objs = _gc.get_objects()
+
+    by_type: dict = _defaultdict(lambda: {"count": 0, "total": 0, "max": 0})
+    container_candidates: list[tuple] = []
+
+    for o in objs:
+        try:
+            tname = f"{type(o).__module__}.{type(o).__qualname__}"
+            sz = _sys.getsizeof(o)
+        except Exception:
+            # Some C-level objects (frames, generators, weakrefs) can raise.
+            # Skip them; they're rarely the leak source anyway.
+            continue
+        rec = by_type[tname]
+        rec["count"] += 1
+        rec["total"] += sz
+        if sz > rec["max"]:
+            rec["max"] = sz
+        if isinstance(o, (list, dict, set, tuple)):
+            try:
+                ln = len(o)
+            except Exception:
+                continue
+            if ln >= container_min_len:
+                container_candidates.append((tname, ln, sz, id(o)))
+
+    top_types_list = sorted(
+        by_type.items(), key=lambda x: x[1]["total"], reverse=True
+    )[:top_types]
+    top_containers_list = sorted(
+        container_candidates, key=lambda x: x[1], reverse=True
+    )[:top_containers]
+
+    total_bytes = sum(r["total"] for r in by_type.values())
+
+    return {
+        "object_count": len(objs),
+        "type_count": len(by_type),
+        "total_size_mb": round(total_bytes / 1048576, 1),
+        "duration_s": round(time.monotonic() - t0, 2),
+        "top_types": [
+            {
+                "type": t,
+                "count": r["count"],
+                "total_mb": round(r["total"] / 1048576, 2),
+                "max_kb": round(r["max"] / 1024, 1),
+            }
+            for t, r in top_types_list
+        ],
+        "top_containers": [
+            {
+                "type": t,
+                "len": ln,
+                "size_kb": round(sz / 1024, 1),
+                "id": oid,
+            }
+            for t, ln, sz, oid in top_containers_list
+        ],
+    }
+
+
 # ── Helpers ───────────────────────────────────────────────────────────
 
 def _kb_to_mb_dict(d: dict) -> dict:

@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 from queue import Empty
+from titan_plugin import bus
 
 logger = logging.getLogger(__name__)
 
@@ -318,7 +319,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
     init_ms = (time.time() - init_start) * 1000
     logger.info("[KnowledgeWorker] Ready in %.0fms (sage=%s, db=%s)",
                 init_ms, "OK" if sage else "DISABLED", db_path)
-    _send_msg(send_queue, "MODULE_READY", name, "guardian", {})
+    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
 
     # ── F-phase (rFP §16.3): Meta-Reasoning Consumer Service wire ────
     # Session 2 wire-now-gate-later: request at action-dispatch time,
@@ -354,6 +355,15 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
             _knh_err)
 
     # ── Main loop ──────────────────────────────────────────────────────
+    # ── Microkernel v2 Phase B.1 §6 — readiness/hibernate reporter ──
+    from titan_plugin.core.readiness_reporter import trivial_reporter
+    def _b1_save_state():
+        return []
+    _b1_reporter = trivial_reporter(
+        worker_name=name, layer="L3", send_queue=send_queue,
+        save_state_cb=_b1_save_state,
+    )
+
     while True:
         try:
             msg = recv_queue.get(timeout=_heartbeat_interval)
@@ -372,7 +382,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
             _last_heartbeat = now
 
         # ── CGN_KNOWLEDGE_REQ — knowledge gap request ─────────────
-        if msg_type == "CGN_KNOWLEDGE_REQ":
+        if msg_type == bus.CGN_KNOWLEDGE_REQ:
             # Heartbeat immediately — this handler can take 30s+
             _send_heartbeat(send_queue, name)
             _last_heartbeat = time.time()
@@ -642,7 +652,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                             send_queue, name, topic,
                             "grounded", quality, requestor)
                         # 5. TimeChain: knowledge acquired → declarative fork
-                        send_queue.put({"type": "TIMECHAIN_COMMIT", "src": name,
+                        send_queue.put({"type": bus.TIMECHAIN_COMMIT, "src": name,
                             "dst": "timechain", "ts": time.time(), "payload": {
                             "fork": "declarative", "thought_type": "declarative",
                             "source": "knowledge_research",
@@ -762,7 +772,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                                 send_queue, name, topic,
                                 "grounded", quality, requestor)
                             # TimeChain: fallback research → declarative
-                            send_queue.put({"type": "TIMECHAIN_COMMIT",
+                            send_queue.put({"type": bus.TIMECHAIN_COMMIT,
                                 "src": name, "dst": "timechain",
                                 "ts": time.time(), "payload": {
                                 "fork": "declarative",
@@ -808,7 +818,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         # ── META_REASON_RESPONSE (F-phase rFP §4.3) ────────────────
         # Routed here per [meta_service_interface.consumer_home_worker]
         # knowledge = "knowledge".
-        elif msg_type == "META_REASON_RESPONSE":
+        elif msg_type == bus.META_REASON_RESPONSE:
             try:
                 from titan_plugin.logic.meta_service_client import (
                     dispatch_meta_response as _kn_dispatch,
@@ -822,7 +832,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         # API_STUB: handler ready, awaiting CGN consumers (language/social/
         # reasoning) to send back usage events when they reference knowledge
         # concepts. Wired in CGN-EXTRACT (next session). Tracked as I-003.
-        elif msg_type == "CGN_KNOWLEDGE_USAGE":
+        elif msg_type == bus.CGN_KNOWLEDGE_USAGE:
             try:
                 topic = payload.get("topic", "")
                 reward = float(payload.get("reward", 0.1))
@@ -861,7 +871,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         # CGN Worker asks knowledge_worker to verify a knowledge hypothesis.
         # Verifier: did the knowledge concept gain downstream usage or
         # confidence since the hypothesis was formed?
-        elif msg_type == "CGN_HAOV_VERIFY_REQ":
+        elif msg_type == bus.CGN_HAOV_VERIFY_REQ:
             try:
                 _haov_p = msg.get("payload", {})
                 _haov_consumer = _haov_p.get("consumer", "")
@@ -894,7 +904,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
 
                     _confirmed = (_conf_a > _conf_b + 0.05) or (_usage_a > _usage_b)
                     _error = abs(_conf_a - _conf_b)
-                    _send_msg(send_queue, "CGN_HAOV_VERIFY_RSP", name, "cgn", {
+                    _send_msg(send_queue, bus.CGN_HAOV_VERIFY_RSP, name, "cgn", {
                         "consumer": "knowledge",
                         "test_ctx": _haov_p.get("test_ctx"),
                         "obs_after": {"confidence": _conf_a, "usage": _usage_a},
@@ -910,7 +920,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 logger.debug("[HAOV] Knowledge verification error: %s", _haov_err)
 
         # ── QUERY — stats and diagnostics ─────────────────────────
-        elif msg_type == "QUERY":
+        elif msg_type == bus.QUERY:
             from titan_plugin.core.profiler import handle_memory_profile_query
             if handle_memory_profile_query(msg, send_queue, name):
                 continue
@@ -926,7 +936,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                                {"results": results}, msg.get("rid"))
 
         # ── SEARCH_PIPELINE_BUDGET_RESET — Maker override (KP-5) ──
-        elif msg_type == "SEARCH_PIPELINE_BUDGET_RESET":
+        elif msg_type == bus.SEARCH_PIPELINE_BUDGET_RESET:
             try:
                 _rb_backend = (payload.get("backend") or "").strip() or None
                 _health.reset_budget(_rb_backend)
@@ -938,7 +948,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                     "[KnowledgeWorker] Budget reset error: %s", _rb_err)
 
         # ── CGN_WEIGHTS_MAJOR — weights updated (client auto-reloads from SHM)
-        elif msg_type == "CGN_WEIGHTS_MAJOR":
+        elif msg_type == bus.CGN_WEIGHTS_MAJOR:
             logger.debug("[KnowledgeWorker] Weights updated (v=%s)",
                          payload.get("shm_version", "?"))
 
@@ -947,7 +957,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         # the bus's dst="all" broadcast. Forward to local CGN client
         # so its EMA of emotional-outcome rewards updates → surfaces
         # in state_vec slot 18 on next ground() call.
-        elif msg_type == "CGN_CROSS_INSIGHT":
+        elif msg_type == bus.CGN_CROSS_INSIGHT:
             try:
                 if cgn_client is not None:
                     cgn_client.note_incoming_cross_insight(
@@ -956,8 +966,94 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 logger.debug("[KnowledgeWorker] cross-insight note error: %s",
                              _ci_err)
 
+        # ── rFP_titan_meta_outer_layer — bus-RPC handlers for meta-outer ──
+        # Meta-reasoning queries knowledge_worker (which owns the Kuzu DB
+        # connection; single-process lock) via these 3 handlers. Read-only,
+        # rate-limited by existing search infra, small response payloads.
+        elif msg_type == bus.KNOWLEDGE_QUERY_CONCEPT:
+            try:
+                topic = payload.get("topic", "")
+                rid = msg.get("rid") or payload.get("rid", "")
+                requestor = msg.get("src", "unknown")
+                if topic:
+                    rows = _search_internal(db_path, str(topic), max_results=1)
+                    concept = rows[0] if rows else None
+                else:
+                    concept = None
+                _send_response(send_queue, name, requestor,
+                               {"concept": concept,
+                                "confidence": (concept or {}).get(
+                                    "confidence", 0.0) if concept else 0.0},
+                               rid)
+            except Exception as _kq_err:
+                logger.debug("[KnowledgeWorker] KNOWLEDGE_QUERY_CONCEPT err: %s",
+                             _kq_err)
+        elif msg_type == bus.KNOWLEDGE_SEARCH:
+            try:
+                query = payload.get("query", "")
+                rid = msg.get("rid") or payload.get("rid", "")
+                requestor = msg.get("src", "unknown")
+                max_r = int(payload.get("max_results", 5))
+                rows = _search_internal(db_path, str(query),
+                                         max_results=max(1, min(max_r, 20)))
+                _send_response(send_queue, name, requestor,
+                               {"results": rows}, rid)
+            except Exception as _ks_err:
+                logger.debug("[KnowledgeWorker] KNOWLEDGE_SEARCH err: %s",
+                             _ks_err)
+        elif msg_type == bus.KNOWLEDGE_CONCEPTS_FOR_PERSON:
+            try:
+                person_id = payload.get("person_id", "")
+                rid = msg.get("rid") or payload.get("rid", "")
+                requestor = msg.get("src", "unknown")
+                limit = int(payload.get("limit", 5))
+                # v1 heuristic: find concepts whose topic appears in the
+                # person's felt_experiences. Walk events_teacher.db then
+                # intersect with knowledge_concepts. Bounded to limit rows.
+                concepts: list = []
+                try:
+                    ev_db = "data/events_teacher.db"
+                    if os.path.exists(ev_db):
+                        ev_conn = sqlite3.connect(
+                            f"file:{ev_db}?mode=ro", uri=True, timeout=2.0)
+                        ev_conn.row_factory = sqlite3.Row
+                        topics = [r[0] for r in ev_conn.execute(
+                            "SELECT DISTINCT topic FROM felt_experiences "
+                            "WHERE author = ? ORDER BY created_at DESC LIMIT ?",
+                            (person_id, max(1, min(limit * 3, 30)))
+                        ).fetchall()]
+                        ev_conn.close()
+                        for t in topics:
+                            rows = _search_internal(db_path, str(t),
+                                                     max_results=1)
+                            if rows:
+                                concepts.append(rows[0])
+                                if len(concepts) >= limit:
+                                    break
+                except Exception as _cfp_err:
+                    logger.debug("[KnowledgeWorker] CFP probe err: %s",
+                                 _cfp_err)
+                _send_response(send_queue, name, requestor,
+                               {"concepts": concepts}, rid)
+            except Exception as _cfp_err:
+                logger.debug(
+                    "[KnowledgeWorker] KNOWLEDGE_CONCEPTS_FOR_PERSON err: %s",
+                    _cfp_err)
+
         # ── MODULE_SHUTDOWN ───────────────────────────────────────
-        elif msg_type == "MODULE_SHUTDOWN":
+        # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────
+        if _b1_reporter.handles(msg_type):
+            _b1_reporter.handle(msg)
+            if _b1_reporter.should_exit():
+                break
+            continue
+
+        # ── Microkernel v2 Phase B.2.1 — supervision-transfer dispatch ──
+        from titan_plugin.core import worker_swap_handler as _swap
+        if _swap.maybe_dispatch_swap_msg(msg):
+            continue
+
+        elif msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[KnowledgeWorker] Shutdown: %s",
                         payload.get("reason", "?"))
             _async_loop.call_soon_threadsafe(_async_loop.stop)
@@ -1190,7 +1286,7 @@ def _distribute(send_queue, name: str, requestor: str, topic: str,
     }
     if request_id:
         payload["request_id"] = request_id
-    _send_msg(send_queue, "CGN_KNOWLEDGE_RESP", name, requestor, payload)
+    _send_msg(send_queue, bus.CGN_KNOWLEDGE_RESP, name, requestor, payload)
 
 
 # ── Concept Lifecycle Telemetry ────────────────────────────────────────
@@ -1246,6 +1342,17 @@ def _send_transition(send_queue, name: str, cgn_client,
             "epoch": 0,
             "metadata": {"topic": topic[:100]},
         })
+        # Upgrade III peer publishing (audit 2026-04-23 Q2) — broadcast
+        # knowledge chain-outcome so emot_cgn + other peer consumers can
+        # learn from it. Rate-gated + informative filter inside.
+        try:
+            from titan_plugin.logic.cgn_consumer_client import (
+                emit_chain_outcome_insight)
+            emit_chain_outcome_insight(
+                send_queue, name, "knowledge", float(reward),
+                ctx={"topic": topic[:60]})
+        except Exception:
+            pass
     except Exception as e:
         logger.debug("[KnowledgeWorker] Transition error: %s", e)
 
@@ -1376,7 +1483,7 @@ def _send_heartbeat(send_queue, name: str) -> None:
         rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
     except Exception:
         rss_mb = 0
-    _send_msg(send_queue, "MODULE_HEARTBEAT", name, "guardian", {"rss_mb": round(rss_mb, 1)})
+    _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", {"rss_mb": round(rss_mb, 1)})
 
 
 def _send_response(send_queue, name: str, dst: str,

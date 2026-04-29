@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger("consciousness")
 
@@ -167,16 +168,68 @@ class EpochRecord:
 # ─── Storage ────────────────────────────────────────────────────────────────
 
 class ConsciousnessDB:
-    """SQLite storage for consciousness epochs — the mathematical memory of self."""
+    """SQLite storage for consciousness epochs — the mathematical memory of self.
 
-    def __init__(self, db_path: str):
+    rFP_universal_sqlite_writer 2026-04-27: writes route through the
+    `consciousness_writer` daemon when `[persistence_consciousness].enabled =
+    true`. Reads stay direct (WAL-mode SELECT is multi-reader-safe).
+    """
+
+    def __init__(self, db_path: str, writer_client=None):
+        import os as _os
         self.db_path = db_path
+        self._db_path_norm = _os.path.normpath(db_path)
         self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA cache_size = -16000")   # 16MB page cache cap (was unbounded on 2.9GB DB)
         self._conn.execute("PRAGMA synchronous = NORMAL")  # WAL handles durability
         self._create_tables()
+        # rFP_universal_sqlite_writer Phase 2 — auto-construct writer client
+        # from [persistence_consciousness] when enabled. Path-isolation guard
+        # uses realpath comparison + only fires on genuine mismatch (test
+        # tmpfiles), per the observatory_db hot-fix pattern.
+        self._writer = writer_client
+        if self._writer is None:
+            try:
+                from titan_plugin.persistence.config import IMWConfig
+                from titan_plugin.persistence.writer_client import (
+                    InnerMemoryWriterClient,
+                )
+                cfg = IMWConfig.from_titan_config_section("persistence_consciousness")
+                if cfg.enabled and cfg.mode != "disabled":
+                    if cfg.db_path:
+                        try:
+                            cfg_real = _os.path.realpath(cfg.db_path)
+                            self_real = _os.path.realpath(self._db_path_norm)
+                            if cfg_real != self_real:
+                                logger.info(
+                                    "[ConsciousnessDB] db_path %s != "
+                                    "configured writer path %s — writer "
+                                    "client skipped (path isolation)",
+                                    self._db_path_norm, cfg.db_path)
+                                return
+                        except OSError as _e:
+                            logger.debug("[ConsciousnessDB] realpath check failed: %s", _e)
+                    self._writer = InnerMemoryWriterClient(
+                        cfg, caller_name="consciousness_db")
+                    logger.info(
+                        "[ConsciousnessDB] Routed via consciousness_writer "
+                        "(mode=%s, canonical=%s)",
+                        cfg.mode, cfg.tables_canonical or "<none>")
+            except Exception as e:
+                logger.warning(
+                    "[ConsciousnessDB] writer client unavailable, "
+                    "using direct writes: %s", e)
+                self._writer = None
+
+    def _route_write(self, sql: str, params, *, table: str) -> None:
+        """Route a write through the writer daemon if available, else direct."""
+        if self._writer is not None:
+            self._writer.write(sql, params, table=table)
+            return
+        self._conn.execute(sql, params)
+        self._conn.commit()
 
     def _create_tables(self):
         self._conn.execute("""
@@ -203,7 +256,7 @@ class ConsciousnessDB:
         return (row[0] or 0) if row else 0
 
     def insert_epoch(self, rec: EpochRecord):
-        self._conn.execute(
+        self._route_write(
             """INSERT OR REPLACE INTO epochs
                (epoch_id, timestamp, block_hash, state_vector, drift_vector,
                 trajectory_vector, journey_x, journey_y, journey_z,
@@ -216,8 +269,8 @@ class ConsciousnessDB:
                 rec.journey_point[0], rec.journey_point[1], rec.journey_point[2],
                 rec.curvature, rec.density, rec.distillation, rec.anchored_tx,
             ),
+            table="epochs",
         )
-        self._conn.commit()
 
     def get_recent_epochs(self, n: int = TRAJECTORY_WINDOW) -> List[EpochRecord]:
         rows = self._conn.execute(
@@ -257,8 +310,9 @@ class ConsciousnessDB:
     def close(self):
         try:
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn("[logic.consciousness] ConsciousnessDB.close: self._conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')", _swallow_exc,
+                         key='logic.consciousness.ConsciousnessDB.close.line262', throttle=100)
         self._conn.close()
 
 
@@ -596,7 +650,8 @@ class ConsciousnessLoop:
                         },
                     ))
                 except Exception as _pub_err:
-                    logger.debug("[TITAN_SELF] publish error: %s", _pub_err)
+                    swallow_warn('[TITAN_SELF] publish error', _pub_err,
+                                 key="logic.consciousness.publish_error", throttle=100)
         except Exception as _ts_err:
             logger.warning("[TITAN_SELF] composition error: %s", _ts_err)
 
@@ -623,7 +678,8 @@ class ConsciousnessLoop:
                 resp = await client.get_latest_blockhash()
                 return str(resp.value.blockhash)
         except Exception as e:
-            logger.debug("[Consciousness] Could not fetch block hash: %s", e)
+            swallow_warn('[Consciousness] Could not fetch block hash', e,
+                         key="logic.consciousness.could_not_fetch_block_hash", throttle=100)
         return ""
 
     def _should_anchor(self, curvature: float, density: float, epoch_id: int) -> bool:

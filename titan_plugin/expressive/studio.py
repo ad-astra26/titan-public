@@ -18,6 +18,7 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +107,8 @@ class StudioCoordinator:
             with open(sidecar_path, "w") as f:
                 json.dump(metadata, f, indent=2)
         except Exception as e:
-            logger.debug("[Studio] Sidecar write failed: %s", e)
+            swallow_warn('[Studio] Sidecar write failed', e,
+                         key="expressive.studio.sidecar_write_failed", throttle=100)
 
     # -------------------------------------------------------------------------
     # Meditation Art (Small Epoch — every 6 hours)

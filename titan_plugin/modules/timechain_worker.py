@@ -25,6 +25,7 @@ import logging
 import os
 import sys
 import time
+from titan_plugin import bus
 
 logger = logging.getLogger("TimeChainWorker")
 
@@ -50,7 +51,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
             rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
         except Exception:
             rss_mb = 0
-        send_queue.put({"type": "MODULE_HEARTBEAT", "src": name, "dst": "guardian",
+        send_queue.put({"type": bus.MODULE_HEARTBEAT, "src": name, "dst": "guardian",
                         "payload": {"rss_mb": round(rss_mb, 1)}, "ts": time.time()})
 
     def _send_msg(msg_type, dst, payload):
@@ -207,7 +208,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 enabled, orchestrator is not None, heartbeat_interval, checkpoint_time_interval)
 
     # Tell Guardian we're ready
-    send_queue.put({"type": "MODULE_READY", "src": name, "dst": "guardian",
+    send_queue.put({"type": bus.MODULE_READY, "src": name, "dst": "guardian",
                     "payload": {}, "ts": time.time()})
 
     # ── Startup integrity check ──
@@ -238,6 +239,15 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
 
     # ── Main loop ──
     logger.info("[TimeChain] Entering main loop...")
+    # ── Microkernel v2 Phase B.1 §6 — readiness/hibernate reporter ──
+    from titan_plugin.core.readiness_reporter import trivial_reporter
+    def _b1_save_state():
+        return []
+    _b1_reporter = trivial_reporter(
+        worker_name=name, layer="L2", send_queue=send_queue,
+        save_state_cb=_b1_save_state,
+    )
+
     while True:
         # Heartbeat every iteration (not just on Empty). Broadcasts arriving
         # within the 5s get() timeout starve the Empty path; heartbeat at top
@@ -284,15 +294,105 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         payload = msg.get("payload", {})
         src = msg.get("src", "")
 
-        if msg_type == "MODULE_SHUTDOWN":
+        # ── Microkernel v2 Phase B.1 §10 — substrate dual-fork writes ──
+        # System events (4 types) → FORK_SYSTEM blocks
+        # Self-aware thoughts → FORK_EPISODIC blocks (linked by event_id)
+        # Both writes are best-effort: chain-commit failure is logged
+        # but doesn't break the worker (the orchestrator's
+        # shadow_swap_history.jsonl is the authoritative audit anyway).
+        if msg_type in (bus.SYSTEM_UPGRADE_QUEUED, bus.SYSTEM_UPGRADE_STARTING,
+                        bus.SYSTEM_RESUMED, bus.SYSTEM_UPGRADE_PENDING_DEFERRED):
+            try:
+                from titan_plugin.logic.timechain import (
+                    BlockPayload as _BP, FORK_SYSTEM as _FORK_SYSTEM,
+                )
+                payload_b1 = msg.get("payload", {}) or {}
+                event_id = payload_b1.get("event_id", "")
+                content = {
+                    "event_id": event_id,
+                    "event_type": msg_type,
+                    "kernel_version_from": payload_b1.get("kernel_version_from"),
+                    "kernel_version_to": payload_b1.get("kernel_version_to"),
+                    "gap_seconds": payload_b1.get("gap_seconds"),
+                    "blockers": payload_b1.get("blockers", []),
+                    "reason": payload_b1.get("reason", ""),
+                    "elapsed_seconds": payload_b1.get("elapsed_seconds", 0.0),
+                }
+                tc.commit_block(
+                    fork_id=_FORK_SYSTEM, epoch_id=_current_epoch,
+                    payload=_BP(thought_type="system",
+                                source="shadow_swap",
+                                content=content,
+                                tags=["b1", "shadow_swap", msg_type.lower()],
+                                significance=1.0,
+                                confidence=1.0),
+                    pot_nonce=0, chi_spent=0.0,
+                    neuromod_state=_last_neuromods or {},
+                )
+                logger.info("[TimeChain] system-fork commit: %s event_id=%s",
+                            msg_type, event_id[:8] if event_id else "?")
+            except Exception as _e:
+                logger.warning("[TimeChain] system-fork commit failed: %s", _e)
+            # Also let the §6 reporter ack/process the lifecycle event
+            # (trivial reporter no-ops them, but stays consistent).
+            if _b1_reporter.handles(msg_type):
+                _b1_reporter.handle(msg)
+            continue
+
+        if msg_type == bus.SYSTEM_UPGRADE_THOUGHT:
+            try:
+                from titan_plugin.logic.timechain import (
+                    BlockPayload as _BP, FORK_EPISODIC as _FORK_EPISODIC,
+                )
+                payload_b1 = msg.get("payload", {}) or {}
+                event_id = payload_b1.get("event_id", "")
+                content = {
+                    "event_id": event_id,            # link to system fork block
+                    "system_event_type": payload_b1.get("phase", ""),
+                    "self_thought": payload_b1.get("text", ""),
+                    "kernel_version_from": payload_b1.get("kernel_version_from"),
+                    "kernel_version_to": payload_b1.get("kernel_version_to"),
+                    "gap_seconds": payload_b1.get("gap_seconds"),
+                }
+                tc.commit_block(
+                    fork_id=_FORK_EPISODIC, epoch_id=_current_epoch,
+                    payload=_BP(thought_type="episodic",
+                                source="spirit",
+                                content=content,
+                                tags=["b1", "self_thought", "shadow_swap"],
+                                significance=1.0,
+                                confidence=1.0),
+                    pot_nonce=0, chi_spent=0.0,
+                    neuromod_state=_last_neuromods or {},
+                )
+                logger.info("[TimeChain] episodic-fork self-thought: event_id=%s phase=%s",
+                            event_id[:8] if event_id else "?",
+                            payload_b1.get("phase", "?"))
+            except Exception as _e:
+                logger.warning("[TimeChain] episodic-fork commit failed: %s", _e)
+            continue
+
+        # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────
+        if _b1_reporter.handles(msg_type):
+            _b1_reporter.handle(msg)
+            if _b1_reporter.should_exit():
+                break
+            continue
+
+        # ── Microkernel v2 Phase B.2.1 — supervision-transfer dispatch ──
+        from titan_plugin.core import worker_swap_handler as _swap
+        if _swap.maybe_dispatch_swap_msg(msg):
+            continue
+
+        if msg_type == bus.MODULE_SHUTDOWN:
             if orchestrator:
                 orchestrator.shutdown()
             logger.info("[TimeChain] Shutdown received — %d blocks total",
                         tc.total_blocks)
             break
 
-        if not enabled and msg_type not in ("QUERY", "MODULE_SHUTDOWN",
-                                             "TIMECHAIN_STATUS"):
+        if not enabled and msg_type not in (bus.QUERY, bus.MODULE_SHUTDOWN,
+                                             bus.TIMECHAIN_STATUS):
             continue
 
         _send_heartbeat()
@@ -306,7 +406,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 logger.error("[TimeChain] v2 tick error: %s", e, exc_info=True)
 
         # ── TIMECHAIN_COMMIT — main write path ──
-        if msg_type == "TIMECHAIN_COMMIT":
+        if msg_type == bus.TIMECHAIN_COMMIT:
             try:
                 if orchestrator:
                     # v2: route through mempool → batched sealing
@@ -337,7 +437,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 logger.error("[TimeChain] COMMIT error from %s: %s", src, e)
 
         # ── EPOCH_TICK — heartbeat on main chain ──
-        elif msg_type == "EPOCH_TICK":
+        elif msg_type == bus.EPOCH_TICK:
             _current_epoch = payload.get("epoch_id", _current_epoch)
             _last_neuromods = payload.get("neuromods", _last_neuromods)
             _is_dreaming = payload.get("is_dreaming", _is_dreaming)
@@ -355,7 +455,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 orchestrator.on_emotion_shift(_current_epoch, _emotion)
 
         # ── DREAMING_START/END — episodic lifecycle + dream compaction ──
-        elif msg_type == "DREAM_STATE_CHANGED":
+        elif msg_type == bus.DREAM_STATE_CHANGED:
             is_dreaming = payload.get("is_dreaming", False)
             _is_dreaming = is_dreaming
 
@@ -369,12 +469,12 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 _do_dream_compaction(tc, _current_epoch, send_queue, name)
 
         # ── MEDITATION_COMPLETE — seal all + genesis (v2) ──
-        elif msg_type == "MEDITATION_COMPLETE":
+        elif msg_type == bus.MEDITATION_COMPLETE:
             if orchestrator:
                 orchestrator.on_meditation_complete(_current_epoch)
 
         # ── EXPRESSION_FIRED — creative expression events ──
-        elif msg_type == "EXPRESSION_FIRED":
+        elif msg_type == bus.EXPRESSION_FIRED:
             composite = payload.get("composite", "")
             if composite in ("ART", "MUSIC"):  # SPEAK handled by language_worker
                 if orchestrator:
@@ -394,7 +494,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
 
         # ── TIMECHAIN_STATUS — status query ── API_STUB: handler ready,
         # awaiting CLI/HTTP senders. Tracked I-003.
-        elif msg_type == "TIMECHAIN_STATUS":
+        elif msg_type == bus.TIMECHAIN_STATUS:
             status = tc.get_chain_status()
             status["pot_stats"] = pot_validator.stats
             if orchestrator:
@@ -403,7 +503,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
 
         # ── TIMECHAIN_QUERY — block query ── API_STUB: handler ready,
         # awaiting CLI/HTTP senders. Tracked I-003.
-        elif msg_type == "TIMECHAIN_QUERY":
+        elif msg_type == bus.TIMECHAIN_QUERY:
             try:
                 results = tc.query_blocks(
                     thought_type=payload.get("thought_type"),
@@ -420,9 +520,9 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         # ── Consumer API (v2 Phase 2) ── API_STUB: handlers ready,
         # awaiting HTTP/CLI senders to be wired in TimeChain v2 Phase 4.
         # Tracked as I-003 (intentionally not flagged as deaf-ear).
-        elif msg_type in ("TIMECHAIN_RECALL", "TIMECHAIN_CHECK",
-                          "TIMECHAIN_COMPARE", "TIMECHAIN_AGGREGATE",
-                          "TIMECHAIN_SIMILAR"):
+        elif msg_type in (bus.TIMECHAIN_RECALL, bus.TIMECHAIN_CHECK,
+                          bus.TIMECHAIN_COMPARE, bus.TIMECHAIN_AGGREGATE,
+                          bus.TIMECHAIN_SIMILAR):
             if not orchestrator:
                 _send_msg(msg_type + "_RESP", src,
                           {"error": "v2 not enabled"})
@@ -431,19 +531,19 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 from titan_plugin.logic.timechain_v2 import (
                     RecallQuery, CheckQuery, CompareQuery, AggregateQuery,
                     SimilarQuery)
-                if msg_type == "TIMECHAIN_RECALL":
+                if msg_type == bus.TIMECHAIN_RECALL:
                     result = orchestrator.recall(RecallQuery(**payload))
                     _send_msg("TIMECHAIN_RECALL_RESP", src,
                               {"results": result})
-                elif msg_type == "TIMECHAIN_CHECK":
+                elif msg_type == bus.TIMECHAIN_CHECK:
                     result = orchestrator.check(CheckQuery(**payload))
                     _send_msg("TIMECHAIN_CHECK_RESP", src,
                               {"result": result})
-                elif msg_type == "TIMECHAIN_COMPARE":
+                elif msg_type == bus.TIMECHAIN_COMPARE:
                     result = orchestrator.compare(CompareQuery(**payload))
                     _send_msg("TIMECHAIN_COMPARE_RESP", src,
                               {"result": result})
-                elif msg_type == "TIMECHAIN_AGGREGATE":
+                elif msg_type == bus.TIMECHAIN_AGGREGATE:
                     result = orchestrator.aggregate(AggregateQuery(**payload))
                     _send_msg("TIMECHAIN_AGGREGATE_RESP", src,
                               {"result": result})
@@ -451,7 +551,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 # search. Session 1 returns empty list until meta-reasoning
                 # starts sealing blocks with `context_embedding` payload
                 # field in Session 2.
-                elif msg_type == "TIMECHAIN_SIMILAR":
+                elif msg_type == bus.TIMECHAIN_SIMILAR:
                     result = orchestrator.similar(SimilarQuery(**payload))
                     _send_msg("TIMECHAIN_SIMILAR_RESP", src,
                               {"results": result})
@@ -462,7 +562,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
 
         # ── Contract Engine (v2 Phase 3a) ── API_STUB: contract handlers
         # ready, awaiting REST API + CLI senders. Tracked as I-003.
-        elif msg_type == "CONTRACT_DEPLOY":
+        elif msg_type == bus.CONTRACT_DEPLOY:
             if not orchestrator:
                 _send_msg("CONTRACT_DEPLOY_RESP", src, {"error": "v2 not enabled"})
                 continue
@@ -473,7 +573,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
             except Exception as e:
                 _send_msg("CONTRACT_DEPLOY_RESP", src, {"error": str(e)})
 
-        elif msg_type == "CONTRACT_LIST":
+        elif msg_type == bus.CONTRACT_LIST:
             if not orchestrator:
                 _send_msg("CONTRACT_LIST_RESP", src, {"contracts": []})
                 continue
@@ -483,7 +583,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
             _send_msg("CONTRACT_LIST_RESP", src, {"contracts": contracts})
 
         # API_STUB: CONTRACT_STATUS awaits REST API. Tracked I-003.
-        elif msg_type == "CONTRACT_STATUS":
+        elif msg_type == bus.CONTRACT_STATUS:
             if not orchestrator:
                 _send_msg("CONTRACT_STATUS_RESP", src, {"error": "v2 not enabled"})
                 continue
@@ -494,7 +594,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         # ── P3d: Titan-Authored Contract Proposal ── API_STUB: awaits
         # senders (Titan reasoning chains will eventually propose contracts).
         # Tracked I-003.
-        elif msg_type == "CONTRACT_PROPOSE":
+        elif msg_type == bus.CONTRACT_PROPOSE:
             if not orchestrator or not orchestrator._contract_store:
                 _send_msg("CONTRACT_PROPOSE_RESP", src,
                           {"error": "contract store not available"})
@@ -537,7 +637,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
 
         # ── P3d: Contract Approval/Veto (from Maker via API) ── API_STUB:
         # awaits Maker REST API senders. Tracked I-003.
-        elif msg_type == "CONTRACT_APPROVE":
+        elif msg_type == bus.CONTRACT_APPROVE:
             if not orchestrator or not orchestrator._contract_store:
                 _send_msg("CONTRACT_APPROVE_RESP", src, {"error": "not available"})
                 continue
@@ -560,7 +660,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 _send_msg("CONTRACT_APPROVE_RESP", src, {"error": str(e)})
 
         # API_STUB: CONTRACT_VETO awaits Maker REST API. Tracked I-003.
-        elif msg_type == "CONTRACT_VETO":
+        elif msg_type == bus.CONTRACT_VETO:
             if not orchestrator or not orchestrator._contract_store:
                 _send_msg("CONTRACT_VETO_RESP", src, {"error": "not available"})
                 continue
@@ -574,7 +674,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 # telemetry. Originally designed for meta-reasoning feedback
                 # but consumer never wired; broadcast retained for dashboard.
                 send_queue.put({
-                    "type": "CONTRACT_REJECTED",
+                    "type": bus.CONTRACT_REJECTED,
                     "src": name, "dst": "all",
                     "ts": time.time(),
                     "payload": {
@@ -584,7 +684,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 })
 
         # ── QUERY — standard arch_map query handler ──
-        elif msg_type == "QUERY":
+        elif msg_type == bus.QUERY:
             from titan_plugin.core.profiler import handle_memory_profile_query
             if handle_memory_profile_query(msg, send_queue, name):
                 continue
@@ -594,7 +694,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 status = tc.get_chain_status()
                 status["pot_stats"] = pot_validator.stats
                 send_queue.put({
-                    "type": "QUERY_RESPONSE", "src": name,
+                    "type": bus.QUERY_RESPONSE, "src": name,
                     "dst": src, "rid": rid,
                     "payload": status, "ts": time.time(),
                 })
@@ -617,13 +717,13 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                         result = {"result": orchestrator.aggregate(
                             AggregateQuery(**query_payload))}
                     send_queue.put({
-                        "type": "RESPONSE", "src": name,
+                        "type": bus.RESPONSE, "src": name,
                         "dst": src, "rid": rid,
                         "payload": result, "ts": time.time(),
                     })
                 except Exception as e:
                     send_queue.put({
-                        "type": "RESPONSE", "src": name,
+                        "type": bus.RESPONSE, "src": name,
                         "dst": src, "rid": rid,
                         "payload": {"error": str(e)}, "ts": time.time(),
                     })
@@ -684,7 +784,7 @@ def _handle_commit(tc, pot_validator, payload, src, current_epoch,
         # module (dst=src dynamic routing). Callers subscribe via their own
         # queue and filter by msg_type; audit can't trace dst=src statically.
         send_queue.put({
-            "type": "TIMECHAIN_REJECTED", "src": name, "dst": src,
+            "type": bus.TIMECHAIN_REJECTED, "src": name, "dst": src,
             "payload": {
                 "reason": pot.rejection_reason,
                 "score": pot.pot_score,
@@ -736,7 +836,7 @@ def _handle_commit(tc, pot_validator, payload, src, current_epoch,
         # INTENTIONAL_BROADCAST: reply-pattern response back to requesting
         # module (dst=src dynamic routing).
         send_queue.put({
-            "type": "TIMECHAIN_COMMITTED", "src": name, "dst": src,
+            "type": bus.TIMECHAIN_COMMITTED, "src": name, "dst": src,
             "payload": {
                 "block_hash": block.block_hash_hex,
                 "fork_id": fork_id,
@@ -821,7 +921,7 @@ def _do_checkpoint(tc, current_epoch, send_queue, name):
     cp = tc.create_checkpoint(epoch_id=current_epoch)
     # INTENTIONAL_BROADCAST: observability-only checkpoint telemetry.
     send_queue.put({
-        "type": "TIMECHAIN_CHECKPOINT", "src": name, "dst": "all",
+        "type": bus.TIMECHAIN_CHECKPOINT, "src": name, "dst": "all",
         "payload": cp, "ts": time.time(),
     })
     logger.info("[TimeChain] Merkle checkpoint — root=%s blocks=%d epoch=%d",

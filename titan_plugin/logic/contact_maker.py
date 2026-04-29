@@ -18,6 +18,7 @@ import os
 import time
 from pathlib import Path
 from typing import Optional
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,8 @@ class ContactMakerProtocol:
                 json.dump(data, f, indent=2)
             os.replace(tmp, PERSISTENCE_FILE)
         except Exception as e:
-            logger.debug("[ContactMaker] Save error: %s", e)
+            swallow_warn('[ContactMaker] Save error', e,
+                         key="logic.contact_maker.save_error", throttle=100)
 
     def evaluate(self, metabolic_tier: str, sol_balance: float,
                  chi_total: float = 0.5) -> dict:

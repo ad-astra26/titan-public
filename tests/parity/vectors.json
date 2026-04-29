@@ -1,0 +1,116 @@
+{
+  "_comment": "Cross-language parity vectors for Phase C Rust ↔ Python byte-identical guarantee. Per SPEC §7.4 + §8.10 + §11.6. Loaded by both pytest (titan_plugin tests) and cargo test (titan-rust crates). DO NOT EDIT manually after a vector ships — bump spec_version + parity vector set together.",
+  "spec_version": "0.1.0",
+  "frame": {
+    "_comment": "HMAC-SHA256 vectors for the connection-handshake response. Per SPEC §8 + B.2 + RFC 4231. Used by titan-core::frame::compute_hmac AND titan_plugin/core/_frame.compute_hmac — must produce byte-identical output.",
+    "rfc4231": [
+      {
+        "name": "test_case_1",
+        "rfc_section": "RFC 4231 § Test Case 1",
+        "key_hex": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+        "data_hex": "4869205468657265",
+        "data_ascii": "Hi There",
+        "expected_hmac_hex": "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+      },
+      {
+        "name": "test_case_2",
+        "rfc_section": "RFC 4231 § Test Case 2",
+        "key_hex": "4a656665",
+        "key_ascii": "Jefe",
+        "data_hex": "7768617420646f2079612077616e7420666f72206e6f7468696e673f",
+        "data_ascii": "what do ya want for nothing?",
+        "expected_hmac_hex": "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+      }
+    ],
+    "titan_canonical": [
+      {
+        "name": "kernel_authkey_handshake_t1",
+        "context": "Simulates a kernel-rs sending challenge to api_subprocess, who responds with HMAC(authkey, challenge). Authkey here is a known fixed value for vector reproducibility — production authkeys are HKDF-derived per Titan. Expected hex computed by titan-core::frame::compute_hmac() at first run + locked here; pytest must produce same bytes.",
+        "key_hex": "f0e1d2c3b4a5968778695a4b3c2d1e0fa1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "challenge_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "expected_hmac_hex": "584b3f59744498cf3a7c5a0241679fb03be4711a3dac17f87aa093cafd2aa5cc"
+      }
+    ]
+  },
+  "authkey": {
+    "_comment": "HKDF-SHA256 vectors for bus authkey derivation per SPEC §3.1 D06. Used by titan-core::authkey::derive_bus_authkey AND titan_plugin/core/bus_authkey.derive_bus_authkey — byte-identical.",
+    "rfc5869": [
+      {
+        "name": "rfc_test_case_1",
+        "rfc_section": "RFC 5869 § Appendix A.1",
+        "ikm_hex": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+        "salt_hex": "000102030405060708090a0b0c",
+        "info_hex": "f0f1f2f3f4f5f6f7f8f9",
+        "L": 42,
+        "expected_okm_hex": "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+      }
+    ],
+    "titan_canonical": [
+      {
+        "name": "T1_authkey_derivation",
+        "context": "Derive bus authkey from a fixed identity_secret + titan_id='titan_T1' using AUTHKEY_HKDF_SALT=b'titan-bus-v1' + AUTHKEY_BYTES=32. Verifies Rust + Python produce same 32-byte key.",
+        "identity_secret_bytes_hex": "6964656e746974792d7365637265742d33322d62797465732d6578616374ffaa",
+        "titan_id": "titan_T1",
+        "salt_ascii": "titan-bus-v1",
+        "expected_authkey_bytes": 32,
+        "expected_authkey_hex_to_be_filled_by_first_implementation": "8b872d20649baedafe3b0d64f26e46cfdb1786dd4021750fe608b370ca109965"
+      }
+    ]
+  },
+  "shm_layout": {
+    "_comment": "Slot byte layouts per SPEC §7.0 (24-byte SeqLock header) + §7.1 (per-slot payload sizes). Header struct format = '<IIQII' (Python struct format = LE u32 u32 u64 u32 u32 = 24 bytes). Verified by titan-core::shm::SlotHeader::encode().",
+    "header_struct": "<IIQII",
+    "header_bytes": 24,
+    "slots": {
+      "self_162d.bin": { "payload_bytes": 648, "total_bytes": 672, "schema_version": 1 },
+      "inner_body_5d.bin": { "payload_bytes": 20, "total_bytes": 44, "schema_version": 1 },
+      "inner_mind_15d.bin": { "payload_bytes": 60, "total_bytes": 84, "schema_version": 1 },
+      "inner_spirit_45d.bin": { "payload_bytes": 180, "total_bytes": 204, "schema_version": 1 },
+      "outer_body_5d.bin": { "payload_bytes": 20, "total_bytes": 44, "schema_version": 1 },
+      "outer_mind_15d.bin": { "payload_bytes": 60, "total_bytes": 84, "schema_version": 1 },
+      "outer_spirit_45d.bin": { "payload_bytes": 180, "total_bytes": 204, "schema_version": 1 },
+      "topology_30d.bin": { "payload_bytes": 120, "total_bytes": 144, "schema_version": 1 },
+      "unified_spirit_132d.bin": { "payload_bytes": 528, "total_bytes": 552, "schema_version": 1 },
+      "neuromod_state.bin": { "payload_bytes": 24, "total_bytes": 48, "schema_version": 1 },
+      "epoch_counter.bin": { "payload_bytes": 8, "total_bytes": 32, "schema_version": 1 },
+      "circadian.bin": { "payload_bytes": 12, "total_bytes": 36, "schema_version": 1 },
+      "pi_heartbeat.bin": { "payload_bytes": 12, "total_bytes": 36, "schema_version": 1 },
+      "sphere_clocks.bin": { "payload_bytes": 168, "total_bytes": 192, "schema_version": 1 },
+      "chi_state.bin": { "payload_bytes": 24, "total_bytes": 48, "schema_version": 1 },
+      "titanvm_registers.bin": { "payload_bytes": 176, "total_bytes": 200, "schema_version": 1 },
+      "identity.bin": { "payload_bytes": 96, "total_bytes": 120, "schema_version": 1 },
+      "fastbus.bin": { "payload_bytes": 262208, "total_bytes": 262232, "schema_version": 1 }
+    },
+    "crc32_known_vectors": [
+      { "input_ascii": "123456789", "expected_crc32_hex": "cbf43926", "comment": "RFC 3720 standard vector" },
+      { "input_ascii": "hello", "expected_crc32_hex": "3610a686", "comment": "Python zlib.crc32(b'hello')" },
+      { "input_ascii": "", "expected_crc32_hex": "00000000", "comment": "Empty input" }
+    ]
+  },
+  "bus_specs": {
+    "_comment": "Subset of SPEC §8 catalog for parity check. Full 47-message catalog populates in C2-2. Verifies Rust phf::Map<&str, BusMsgSpec> agrees with Python bus_specs.py for priority + coalesce_by + catalog category.",
+    "messages": {
+      "KERNEL_EPOCH_TICK":            { "priority": "P0", "coalesce_by": null, "catalog": "KernelSupervision" },
+      "KERNEL_BOOT_GENERATION_CHANGED":{ "priority": "P0", "coalesce_by": null, "catalog": "KernelSupervision" },
+      "KERNEL_SHUTDOWN_ANNOUNCE":     { "priority": "P0", "coalesce_by": null, "catalog": "KernelSupervision" },
+      "MODULE_HEARTBEAT":             { "priority": "P0", "coalesce_by": null, "catalog": "KernelSupervision" },
+      "SUPERVISION_CHILD_DOWN":       { "priority": "P0", "coalesce_by": null, "catalog": "KernelSupervision" },
+      "SUPERVISION_ESCALATION":       { "priority": "P0", "coalesce_by": null, "catalog": "KernelSupervision" },
+      "BUS_PING":                     { "priority": "P0", "coalesce_by": null, "catalog": "BusProtocol" },
+      "BUS_PONG":                     { "priority": "P0", "coalesce_by": null, "catalog": "BusProtocol" },
+      "SWAP_HANDOFF":                 { "priority": "P0", "coalesce_by": null, "catalog": "SwapProtocol" },
+      "ADOPTION_REQUEST":             { "priority": "P0", "coalesce_by": null, "catalog": "Adoption" },
+      "BODY_STATE":                   { "priority": "P1", "coalesce_by": ["src","type"], "catalog": "TrinityTensor" },
+      "MIND_STATE":                   { "priority": "P1", "coalesce_by": ["src","type"], "catalog": "TrinityTensor" },
+      "SPIRIT_STATE":                 { "priority": "P1", "coalesce_by": ["src","type"], "catalog": "TrinityTensor" },
+      "UNIFIED_SPIRIT_FILTER_DOWN":   { "priority": "P1", "coalesce_by": null, "catalog": "FilterDownCascade" },
+      "OBSERVATORY_EVENT":            { "priority": "P3", "coalesce_by": null, "catalog": "Observatory" }
+    }
+  },
+  "adoption_payload": {
+    "_comment": "B.2.1 supervision-transfer: ADOPTION_REQUEST locked at 79-byte msgpack vector per SPEC §8.4 + §8.10. Full impl in C-S3 (orchestrator) — vector reserved here for future cargo test once payload writer lands.",
+    "field_schema": "{rid: uuid, name: str, pid: int, start_method: 'spawn'|'fork', boot_ts: float}",
+    "expected_total_bytes": 79,
+    "vector_to_be_added_in_c_s3": "deferred"
+  }
+}

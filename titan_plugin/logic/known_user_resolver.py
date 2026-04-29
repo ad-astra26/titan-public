@@ -17,6 +17,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -353,7 +354,8 @@ class KnownUserResolver:
             return new_tensor
 
         except Exception as e:
-            logger.debug("[KnownUserResolver] update_social_felt_tensor failed: %s", e)
+            swallow_warn('[KnownUserResolver] update_social_felt_tensor failed', e,
+                         key="logic.known_user_resolver.update_social_felt_tensor_failed", throttle=100)
             return list(current_state_30d[:dims])
 
     def invalidate(self, user_id: str = None):

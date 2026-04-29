@@ -4,6 +4,12 @@ Observatory SQLite Database — long-term metrics, expressive archive, and event
 Lightweight persistent storage for the Observatory Dashboard.
 All writes happen via background calls; reads are lazy-loaded on user request.
 Zero new dependencies — uses Python stdlib sqlite3.
+
+Per-process singleton (`get_observatory_db()`): collapses any in-process
+duplicate constructions to one instance. Cross-process coherence is handled
+by the canonical-mode writer daemon (see rFP_universal_sqlite_writer.md);
+the singleton is defense-in-depth against accidental N-instance bugs in the
+same process.
 """
 import json
 import logging
@@ -11,6 +17,8 @@ import os
 import sqlite3
 import threading
 import time
+from typing import Optional
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +192,17 @@ class ObservatoryDB:
     """Thread-safe SQLite wrapper for Observatory long-term storage."""
 
     def __init__(self, db_path: str = None, writer_client=None):
+        # Track whether the caller passed an explicit db_path. Production
+        # callers leave it None; test callers pass a tmp file. Only the
+        # explicit case needs the path-isolation guard against silently
+        # diverging from the writer's configured DB. (rFP_universal_sqlite_
+        # writer 2026-04-27 hot-fix: the previous guard fired in production
+        # too because cfg.db_path is relative `data/observatory.db` while
+        # self._db_path resolves to absolute via __file__, so the comparison
+        # always failed → writer client silently skipped → all writes went
+        # direct-to-disk → multi-process lock contention. This is what
+        # caused BUG-TRINITY-SNAPSHOT-DB-LOCKED to keep firing post-Phase-2.)
+        explicit_db_path = db_path is not None
         if db_path is None:
             base = os.path.join(os.path.dirname(__file__), "..", "..", "data")
             os.makedirs(base, exist_ok=True)
@@ -193,11 +212,10 @@ class ObservatoryDB:
         self._init_db()
         # rFP_observatory_writer_service Phase 1: optional writer client.
         # If [persistence_observatory].enabled = true, we route writes through
-        # a second IMW-pattern daemon to relieve multi-process lock contention
-        # (50+ "database is locked" errors per ~12h on T1 morning of 2026-04-21).
-        # The client itself handles all mode logic (disabled/shadow/dual/canonical
-        # + per-table cutover via tables_canonical list); ObservatoryDB just
-        # calls _route_write() and lets the client decide direct vs writer.
+        # a second IMW-pattern daemon to relieve multi-process lock contention.
+        # The client handles all mode logic (disabled/shadow/dual/canonical/
+        # hybrid + per-table cutover via tables_canonical); ObservatoryDB
+        # just calls _route_write() and lets the client decide direct vs writer.
         # Caller may pass an explicit client; otherwise we auto-construct from
         # [persistence_observatory] section so existing instantiation sites
         # don't need code changes.
@@ -209,6 +227,25 @@ class ObservatoryDB:
                     InnerMemoryWriterClient,
                 )
                 cfg = IMWConfig.from_titan_config_section("persistence_observatory")
+                # Path-isolation safety — only checked when caller passed an
+                # explicit db_path. The check uses realpath to handle
+                # absolute-vs-relative + symlinks; tested against the
+                # writer's configured DB (also realpath'd from cwd). Two
+                # paths that resolve to the same file are equivalent — only
+                # genuinely different files (e.g., tmp test files) trip the
+                # guard. Production case (db_path=None) skips the guard
+                # entirely because the constructor's default IS the writer's
+                # configured DB by construction.
+                if explicit_db_path and cfg.db_path:
+                    self_real = os.path.realpath(self._db_path)
+                    cfg_real = os.path.realpath(cfg.db_path)
+                    if self_real != cfg_real:
+                        logger.info(
+                            "[ObservatoryDB] db_path %s != configured "
+                            "writer path %s — writer client skipped "
+                            "(using direct writes for path isolation)",
+                            self._db_path, cfg.db_path)
+                        return
                 if cfg.enabled and cfg.mode != "disabled":
                     self._writer = InnerMemoryWriterClient(
                         cfg, caller_name="observatory_db")
@@ -386,8 +423,9 @@ class ObservatoryDB:
                         if d.get(key) and isinstance(d[key], str):
                             try:
                                 d[key] = json.loads(d[key])
-                            except (json.JSONDecodeError, TypeError):
-                                pass
+                            except (json.JSONDecodeError, TypeError) as _swallow_exc:
+                                swallow_warn('[utils.observatory_db] ObservatoryDB.get_trinity_history: d[key] = json.loads(d[key])', _swallow_exc,
+                                             key='utils.observatory_db.ObservatoryDB.get_trinity_history.line390', throttle=100)
                     rows.append(d)
                 return rows
             finally:
@@ -479,8 +517,9 @@ class ObservatoryDB:
                     if d.get("metadata"):
                         try:
                             d["metadata"] = json.loads(d["metadata"])
-                        except (json.JSONDecodeError, TypeError):
-                            pass
+                        except (json.JSONDecodeError, TypeError) as _swallow_exc:
+                            swallow_warn("[utils.observatory_db] ObservatoryDB.get_expressive_archive: d['metadata'] = json.loads(d['metadata'])", _swallow_exc,
+                                         key='utils.observatory_db.ObservatoryDB.get_expressive_archive.line483', throttle=100)
                     rows.append(d)
                 return rows
             finally:
@@ -529,8 +568,9 @@ class ObservatoryDB:
                     if d.get("details"):
                         try:
                             d["details"] = json.loads(d["details"])
-                        except (json.JSONDecodeError, TypeError):
-                            pass
+                        except (json.JSONDecodeError, TypeError) as _swallow_exc:
+                            swallow_warn("[utils.observatory_db] ObservatoryDB.get_events: d['details'] = json.loads(d['details'])", _swallow_exc,
+                                         key='utils.observatory_db.ObservatoryDB.get_events.line533', throttle=100)
                     rows.append(d)
                 return rows
             finally:
@@ -758,8 +798,9 @@ class ObservatoryDB:
                             if d.get(key) and isinstance(d[key], str):
                                 try:
                                     d[key] = json.loads(d[key])
-                                except (json.JSONDecodeError, TypeError):
-                                    pass
+                                except (json.JSONDecodeError, TypeError) as _swallow_exc:
+                                    swallow_warn('[utils.observatory_db] ObservatoryDB.get_v4_history: d[key] = json.loads(d[key])', _swallow_exc,
+                                                 key='utils.observatory_db.ObservatoryDB.get_v4_history.line762', throttle=100)
                     rows.append(d)
                 return rows
             finally:
@@ -816,3 +857,61 @@ class ObservatoryDB:
             finally:
                 conn.close()
         logger.info("[ObservatoryDB] Pruned data older than %d days.", max_days)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Per-process singleton accessor — rFP_universal_sqlite_writer Phase 2
+# ──────────────────────────────────────────────────────────────────────
+
+_singleton_lock = threading.Lock()
+_singleton_instance: Optional["ObservatoryDB"] = None
+
+
+def get_observatory_db(db_path: Optional[str] = None) -> "ObservatoryDB":
+    """Return the per-process ObservatoryDB singleton.
+
+    Multiple call sites historically constructed `ObservatoryDB()` directly,
+    producing N parallel SQLite connections + N writer-clients per process.
+    Closing `BUG-TRINITY-SNAPSHOT-DB-LOCKED` requires a single instance per
+    process (cross-process coherence is then provided by the canonical-mode
+    writer daemon — see [persistence_observatory] in config.toml).
+
+    `db_path`: if specified AND differs from the existing singleton's path,
+    a new instance is constructed and returned WITHOUT replacing the
+    singleton (test isolation: temp files stay isolated from production).
+    Pass None in production code.
+    """
+    global _singleton_instance
+    if db_path is not None:
+        # Test/explicit-path branch: never poison the singleton.
+        # If the existing singleton happens to be at the same path, reuse it.
+        existing = _singleton_instance
+        if existing is not None:
+            try:
+                if os.path.normpath(db_path) == existing._db_path:
+                    return existing
+            except AttributeError as _swallow_exc:
+                swallow_warn(
+                    "[utils.observatory_db] get_observatory_db: existing._db_path",
+                    _swallow_exc,
+                    key="utils.observatory_db.get_observatory_db.existing_db_path",
+                    throttle=100,
+                )
+        return ObservatoryDB(db_path=db_path)
+    # Production path: lazy-init the per-process singleton.
+    if _singleton_instance is None:
+        with _singleton_lock:
+            if _singleton_instance is None:
+                _singleton_instance = ObservatoryDB()
+    return _singleton_instance
+
+
+def reset_observatory_db_singleton_for_tests() -> None:
+    """Reset the singleton so a test can get a fresh instance.
+
+    DO NOT call from production code — only from pytest fixtures that need
+    to verify the singleton's lazy init or swap in a new db_path.
+    """
+    global _singleton_instance
+    with _singleton_lock:
+        _singleton_instance = None

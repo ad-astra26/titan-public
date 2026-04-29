@@ -46,6 +46,7 @@ from .emotion_cluster import (
     NUM_PRIMITIVES,
     EmotionClusterer,
 )
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger("titan.emot_cgn")
 
@@ -381,7 +382,8 @@ class EmotCGNConsumer:
         try:
             self.save_state()
         except Exception as _save_err:
-            logger.debug("[EmotCGN] save-on-init failed: %s", _save_err)
+            swallow_warn('[EmotCGN] save-on-init failed', _save_err,
+                         key="logic.emot_cgn.save_on_init_failed", throttle=100)
 
         logger.info("[EmotCGN] Initialized (titan=%s, status=%s, "
                     "primitives=%d, hypotheses=%d)",
@@ -503,7 +505,8 @@ class EmotCGNConsumer:
 
             return vec
         except Exception as e:
-            logger.debug("[EmotCGN] encode_state_30d failed: %s", e)
+            swallow_warn('[EmotCGN] encode_state_30d failed', e,
+                         key="logic.emot_cgn.encode_state_30d_failed", throttle=100)
             return np.zeros(FEATURE_DIMS, dtype=np.float32)
 
     def _init_cgn_client(self) -> None:
@@ -615,7 +618,9 @@ class EmotCGNConsumer:
             self._last_cross_insight_ts = now
             self._cgn_cross_insights_sent += 1
         except Exception as e:
-            logger.debug("[EmotCGN] _maybe_emit_cross_insight failed: %s", e)
+            from titan_plugin.utils.silent_swallow import swallow_warn
+            swallow_warn("[EmotCGN] _maybe_emit_cross_insight failed", e,
+                         key="emot_cgn.maybe_emit_cross_insight")
 
     def handle_incoming_cross_insight(self, payload: dict) -> None:
         """Handle CGN_CROSS_INSIGHT from OTHER consumers (META-CGN,
@@ -643,13 +648,25 @@ class EmotCGNConsumer:
                 return
             p = self._primitives[dom]
             outcome_01 = _clip01(reward)
-            w = 0.25  # indirect evidence — 1/4 of direct observation weight
+            # §11 Q3 Option B (2026-04-24) — anti-dominance correction.
+            # Previous static w=0.25 compounded monoculture: WONDER dominant
+            # 74% of time → 74% of positive peer outcomes hit WONDER, further
+            # reinforcing its β posterior. Audit 2026-04-23 §11 Q3 flagged
+            # this semantic issue. Fix: scale w by (1 - current_V) so a
+            # dominant primitive gets small updates, while an edge-case
+            # primitive (briefly dominant during its moment) gets larger
+            # updates. Preserves peer-outcome learning but de-biases toward
+            # diversity when monoculture is active. Base weight kept at
+            # 0.25 (1/4 of direct observation) — only scaling is new.
+            base_w = 0.25
+            w = base_w * max(0.05, 1.0 - float(p.V))  # floor 0.05 prevents zero-update
             p.alpha += w * outcome_01
             p.beta += w * (1.0 - outcome_01)
             p.recompute_derived()
             self._cgn_cross_insights_received += 1
         except Exception as e:
-            logger.debug("[EmotCGN] handle_incoming_cross_insight failed: %s", e)
+            swallow_warn('[EmotCGN] handle_incoming_cross_insight failed', e,
+                         key="logic.emot_cgn.handle_incoming_cross_insight_failed", throttle=100)
 
     # ── Dual-authority V (Upgrade I) ──────────────────────────────
 
@@ -679,7 +696,8 @@ class EmotCGNConsumer:
             return (self._v_blend_alpha * beta_v
                     + (1.0 - self._v_blend_alpha) * shm_v)
         except Exception as e:
-            logger.debug("[EmotCGN] get_blended_V fallback to β_V: %s", e)
+            swallow_warn('[EmotCGN] get_blended_V fallback to β_V', e,
+                         key="logic.emot_cgn.get_blended_v_fallback_to_β_v", throttle=100)
             return beta_v
 
     # ── Gate (THE wire-now-gate-later API) ─────────────────────────
@@ -732,7 +750,8 @@ class EmotCGNConsumer:
                 "cgn_registered": bool(self._cgn_registered),
             }
         except Exception as e:
-            logger.debug("[EmotCGN] get_current_emotion_state failed: %s", e)
+            swallow_warn('[EmotCGN] get_current_emotion_state failed', e,
+                         key="logic.emot_cgn.get_current_emotion_state_failed", throttle=100)
             return {
                 "one_hot": [0.0] * NUM_PRIMITIVES,
                 "intensity": 0.0, "confidence": 0.0,
@@ -793,7 +812,8 @@ class EmotCGNConsumer:
 
             return {"primitive": p_id, "distance": dist, "confidence": conf}
         except Exception as e:
-            logger.debug("[EmotCGN] handle_felt_tensor failed: %s", e)
+            swallow_warn('[EmotCGN] handle_felt_tensor failed', e,
+                         key="logic.emot_cgn.handle_felt_tensor_failed", throttle=100)
             return {"primitive": "FLOW", "distance": 0.0, "confidence": 0.0}
 
     def update_neuromod_ema(self, neuromods: dict) -> None:
@@ -817,7 +837,8 @@ class EmotCGNConsumer:
             if self._neuromod_sample_count % 100 == 0:
                 self._neuromod_prev_ema = dict(self._neuromod_ema)
         except Exception as e:
-            logger.debug("[EmotCGN] update_neuromod_ema failed: %s", e)
+            swallow_warn('[EmotCGN] update_neuromod_ema failed', e,
+                         key="logic.emot_cgn.update_neuromod_ema_failed", throttle=100)
 
     def get_neuromod_deltas(self) -> dict:
         """Return {name: delta} EMA(current) − EMA(100 epochs ago)."""
@@ -833,8 +854,9 @@ class EmotCGNConsumer:
         try:
             self._last_kin_resonance = _clip01(float(resonance) * 0.5 + 0.5)
             # store as clipped 0..1 (from -1..1 range)
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn('[logic.emot_cgn] EmotCGNConsumer.set_kin_resonance: self._last_kin_resonance = _clip01(float(resonance) * 0.5...', _swallow_exc,
+                         key='logic.emot_cgn.EmotCGNConsumer.set_kin_resonance.line858', throttle=100)
 
     # ── Feature vector builder (for callers — builds the 150D input) ──
 
@@ -877,7 +899,8 @@ class EmotCGNConsumer:
             v[149] = float(self._last_kin_resonance)
             return v
         except Exception as e:
-            logger.debug("[EmotCGN] build_feature_vec failed: %s", e)
+            swallow_warn('[EmotCGN] build_feature_vec failed', e,
+                         key="logic.emot_cgn.build_feature_vec_failed", throttle=100)
             return np.full(CLUSTER_FEATURE_DIM, 0.5, dtype=np.float32)
 
     # ── Chain-level evidence (terminal reward → V update) ──────────
@@ -962,8 +985,8 @@ class EmotCGNConsumer:
                         self._cgn_client.send_transition(transition)
                         self._cgn_transitions_sent += 1
                     except Exception as _cgn_err:
-                        logger.debug("[EmotCGN] send_transition failed: %s",
-                                     _cgn_err)
+                        swallow_warn('[EmotCGN] send_transition failed', _cgn_err,
+                                     key="logic.emot_cgn.send_transition_failed", throttle=100)
 
             # Track emotional dynamics for 30D encoding
             if dominant_at_end != self._dominant_emotion:
@@ -1064,7 +1087,8 @@ class EmotCGNConsumer:
                         ctx.get("knowledge_growth_ahead", False)),
                 })
         except Exception as e:
-            logger.debug("[EmotCGN] _accumulate_haov failed: %s", e)
+            swallow_warn('[EmotCGN] _accumulate_haov failed', e,
+                         key="logic.emot_cgn.accumulate_haov_failed", throttle=100)
 
     def _test_hypotheses(self) -> None:
         """Run each hypothesis test if min_samples met. Update status."""
@@ -1094,7 +1118,8 @@ class EmotCGNConsumer:
                     else:
                         h.status = "testing"
                 except Exception as _e:
-                    logger.debug("[EmotCGN] test '%s' error: %s", h_id, _e)
+                    swallow_warn(f"[EmotCGN] test '{h_id}' error", _e,
+                                 key="logic.emot_cgn.test_error", throttle=100)
         except Exception as e:
             logger.warning("[EmotCGN] _test_hypotheses failed: %s", e)
 
@@ -1299,7 +1324,8 @@ class EmotCGNConsumer:
                 "graduation_progress": self._graduation_progress,
             }
         except Exception as e:
-            logger.debug("[EmotCGN] graduation_readiness failed: %s", e)
+            swallow_warn('[EmotCGN] graduation_readiness failed', e,
+                         key="logic.emot_cgn.graduation_readiness_failed", throttle=100)
             return {"eligible": False, "status": self._status}
 
     def _check_override_flags(self) -> None:
@@ -1318,16 +1344,19 @@ class EmotCGNConsumer:
                 self.force_graduate()
                 try:
                     os.remove(grad_flag)
-                except Exception:
-                    pass
+                except Exception as _swallow_exc:
+                    swallow_warn('[logic.emot_cgn] EmotCGNConsumer._check_override_flags: os.remove(grad_flag)', _swallow_exc,
+                                 key='logic.emot_cgn.EmotCGNConsumer._check_override_flags.line1347', throttle=100)
             if os.path.exists(shadow_flag):
                 self.force_shadow()
                 try:
                     os.remove(shadow_flag)
-                except Exception:
-                    pass
+                except Exception as _swallow_exc:
+                    swallow_warn('[logic.emot_cgn] EmotCGNConsumer._check_override_flags: os.remove(shadow_flag)', _swallow_exc,
+                                 key='logic.emot_cgn.EmotCGNConsumer._check_override_flags.line1353', throttle=100)
         except Exception as e:
-            logger.debug("[EmotCGN] _check_override_flags failed: %s", e)
+            swallow_warn('[EmotCGN] _check_override_flags failed', e,
+                         key="logic.emot_cgn.check_override_flags_failed", throttle=100)
 
     def force_graduate(self) -> bool:
         """Operator override: force graduation regardless of criteria.
@@ -1389,7 +1418,9 @@ class EmotCGNConsumer:
                 min_interval_s=0.5,
             )
         except Exception as e:
-            logger.debug("[EmotCGN] _emit_signal failed: %s", e)
+            from titan_plugin.utils.silent_swallow import swallow_warn
+            swallow_warn("[EmotCGN] _emit_signal failed", e,
+                         key="emot_cgn.emit_signal")
             return False
 
     # ── Shadow-mode log (pre-graduation observability) ────────────
@@ -1408,7 +1439,8 @@ class EmotCGNConsumer:
             with open(self._shadow_log_path, "a") as f:
                 f.write(json.dumps(line) + "\n")
         except Exception as e:
-            logger.debug("[EmotCGN] shadow_log failed: %s", e)
+            swallow_warn('[EmotCGN] shadow_log failed', e,
+                         key="logic.emot_cgn.shadow_log_failed", throttle=100)
 
     # ── Kin Protocol export / import ───────────────────────────────
 
@@ -1602,7 +1634,8 @@ class EmotCGNConsumer:
                     h.observations = deque(saved_obs,
                                            maxlen=h.observations.maxlen)
         except Exception as e:
-            logger.debug("[EmotCGN] HAOV _load_state failed: %s", e)
+            swallow_warn('[EmotCGN] HAOV _load_state failed', e,
+                         key="logic.emot_cgn.haov_load_state_failed", throttle=100)
 
     def _load_watchdog_state(self) -> None:
         try:
@@ -1635,7 +1668,8 @@ class EmotCGNConsumer:
             self._chains_since_save = int(
                 data.get("chains_since_save", 0))
         except Exception as e:
-            logger.debug("[EmotCGN] _load_watchdog_state failed: %s", e)
+            swallow_warn('[EmotCGN] _load_watchdog_state failed', e,
+                         key="logic.emot_cgn.load_watchdog_state_failed", throttle=100)
 
     # ── Introspection ──────────────────────────────────────────────
 

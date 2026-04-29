@@ -128,13 +128,31 @@ async def verify_maker_auth(request: Request):
     """
     FastAPI dependency that enforces Maker Ed25519 authentication.
 
-    Required headers:
-        X-Titan-Signature: Base58-encoded Ed25519 signature of "{timestamp}:{body}"
-        X-Titan-Timestamp: Unix timestamp (float) of when the request was signed
+    Required headers (one of):
+        - Ed25519 path:
+            X-Titan-Signature: Base58-encoded Ed25519 signature of "{timestamp}:{body}"
+            X-Titan-Timestamp: Unix timestamp (float) of when the request was signed
+        - Internal-key path (CLI / scripts / MCP bridge):
+            X-Titan-Internal-Key: matches config api.internal_key
+
+    Internal-key bypass mirrors verify_privy_token's pattern — used by
+    scripts/shadow_swap.py and other operator tools that don't have
+    direct access to the maker keypair.
 
     Raises:
-        HTTPException 401 on missing/invalid/expired signatures.
+        HTTPException 401 on missing/invalid/expired credentials.
     """
+    # Internal-key bypass (CLI scripts, MCP bridge, shadow_swap.py)
+    internal_key = request.headers.get("X-Titan-Internal-Key", "")
+    if internal_key:
+        plugin = getattr(request.app.state, "titan_plugin", None)
+        if plugin is not None:
+            expected_key = getattr(plugin, "_full_config", {}).get("api", {}).get("internal_key", "")
+            if expected_key and internal_key == expected_key:
+                logger.debug("[Auth] Maker internal-key verified")
+                return
+        raise HTTPException(status_code=401, detail="Invalid internal key.")
+
     sig = request.headers.get("X-Titan-Signature")
     ts_str = request.headers.get("X-Titan-Timestamp")
 
@@ -166,8 +184,8 @@ async def verify_maker_auth(request: Request):
         raise HTTPException(status_code=503, detail="Titan plugin not initialized.")
 
     maker_pubkey_str = ""
-    if hasattr(plugin, "soul") and plugin.soul:
-        mk = getattr(plugin.soul, "_maker_pubkey", None)
+    if hasattr(plugin, "soul") and titan_state.soul:
+        mk = getattr(titan_state.soul, "_maker_pubkey", None)
         if mk:
             maker_pubkey_str = str(mk)
 

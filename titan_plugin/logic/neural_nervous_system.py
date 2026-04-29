@@ -26,6 +26,7 @@ from .neural_reflex_net import NeuralReflexNet, NervousTransitionBuffer
 from .observation_space import ObservationSpace
 from .hormonal_pressure import HormonalSystem, extract_stimuli
 from .inner_memory import InnerMemoryStore
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +168,51 @@ class NeuralNervousSystem:
         # Eligibility params from Stage 0.5 empirical analysis (or defaults)
         self._eligibility_params = self._load_eligibility_params()
 
+        # rFP_titan_vm_v2 Phase 3 §3.11 — cross-program coupling. When
+        # coupling_enabled, pairs of biologically-related programs nudge
+        # each other's warmup target when both fired on the same tick.
+        # Default off — flip via config after Phase 2 consolidation passes.
+        coupling_cfg = config.get("coupling", {}) if isinstance(config, dict) else {}
+        self._coupling_enabled: bool = bool(coupling_cfg.get("enabled", False))
+        self._coupling_strength: float = float(coupling_cfg.get("strength", 0.1))
+        self._coupling_fire_threshold: float = float(
+            coupling_cfg.get("fire_threshold", 0.3)
+        )
+        # Six biological pairs per rFP §3.11. Stored as set of frozensets
+        # so membership checks are order-independent.
+        default_pairs = [
+            ("EMPATHY", "REFLECTION"),     # post-social processing
+            ("CURIOSITY", "INSPIRATION"),  # seeking → eureka
+            ("CREATIVITY", "INSPIRATION"), # composition → insight
+            ("FOCUS", "INTUITION"),        # sustained attention → leap
+            ("METABOLISM", "VIGILANCE"),   # homeostatic stress → arousal
+            ("IMPULSE", "REFLEX"),         # ready-to-act → reflex trigger
+        ]
+        raw_pairs = coupling_cfg.get("pairs", default_pairs)
+        self._coupling_pairs: list[tuple[str, str]] = [
+            tuple(p) for p in raw_pairs if len(p) == 2
+        ]
+        # Build per-program partner-map for O(1) lookup during coupling.
+        self._coupling_partners: dict[str, list[str]] = {}
+        for a, b in self._coupling_pairs:
+            self._coupling_partners.setdefault(a, []).append(b)
+            self._coupling_partners.setdefault(b, []).append(a)
+        # Latest VM-baseline dict cached from _train_all for coupling
+        # computation. Populated at training time and read within
+        # _compute_targets. Empty until first training batch.
+        self._latest_vm_baselines: dict[str, float] = {}
+
+        # rFP_titan_vm_v2 Phase 3 §3.12 — eligibility traces. rFP β Stage 2
+        # already implements eligibility via _load_eligibility_params +
+        # buf.update_recent_rewards(k, decay). This flag surface gates the
+        # existing behavior so it can be toggled cleanly (default true —
+        # preserves calibration). Setting false disables eligibility +
+        # reverts to single-fire credit.
+        elig_cfg = config.get("eligibility", {}) if isinstance(config, dict) else {}
+        self._eligibility_traces_enabled: bool = bool(
+            elig_cfg.get("enabled", True)
+        )
+
         # Load persisted state
         self._load_all()
 
@@ -280,7 +326,8 @@ class NeuralNervousSystem:
                 env_stimuli = extract_stimuli(
                     obs_data, topo_data, dream_data, self._hormonal_events)
             except Exception as e:
-                logger.debug("[NeuralNS] Stimulus extraction error: %s", e)
+                swallow_warn('[NeuralNS] Stimulus extraction error', e,
+                             key="logic.neural_nervous_system.stimulus_extraction_error", throttle=100)
 
             # Update maturity from Titan's emergent time signals
             total_fires = sum(h.fire_count for h in self._hormonal._hormones.values())
@@ -389,10 +436,12 @@ class NeuralNervousSystem:
                             body=body_vals, mind=mind_vals, spirit=spirit_vals,
                         )
                     except Exception as e:
-                        logger.debug("[NeuralNS] Inner memory fire record error: %s", e)
+                        swallow_warn('[NeuralNS] Inner memory fire record error', e,
+                                     key="logic.neural_nervous_system.inner_memory_fire_record_error", throttle=100)
 
             except Exception as e:
-                logger.debug("[NeuralNS] %s eval error: %s", name, e)
+                swallow_warn(f'[NeuralNS] {name} eval error', e,
+                             key="logic.neural_nervous_system.eval_error", throttle=100)
                 # Fallback to VM signal
                 vm_urg = vm_signals.get(name, 0.0)
                 if vm_urg > 0:
@@ -448,8 +497,8 @@ class NeuralNervousSystem:
                 # Debug level — snapshot failures are non-critical; the
                 # per-fire record_program_fire path already captures
                 # the main signal for EMOT-CGN.
-                logger.debug(
-                    "[NeuralNS] Hormone snapshot failed: %s", _hs_err)
+                swallow_warn('[NeuralNS] Hormone snapshot failed', _hs_err,
+                             key="logic.neural_nervous_system.hormone_snapshot_failed", throttle=100)
 
         return signals
 
@@ -705,7 +754,8 @@ class NeuralNervousSystem:
                 json.dump(snap, f, default=str)
             os.replace(tmp, snap_path)
         except Exception as e:
-            logger.debug("[NeuralNS] health snapshot persist failed: %s", e)
+            swallow_warn('[NeuralNS] health snapshot persist failed', e,
+                         key="logic.neural_nervous_system.health_snapshot_persist_failed", throttle=100)
 
     def _load_eligibility_params(self) -> dict:
         """rFP β Stage 2: load per-program eligibility params from Stage 0.5 output.
@@ -783,7 +833,8 @@ class NeuralNervousSystem:
             if self._reward_log_lines % 1000 == 0:
                 self._truncate_reward_log()
         except Exception as e:
-            logger.debug("[NeuralNS] reward log append failed: %s", e)
+            swallow_warn('[NeuralNS] reward log append failed', e,
+                         key="logic.neural_nervous_system.reward_log_append_failed", throttle=100)
 
     def _truncate_reward_log(self) -> None:
         """Keep only the last `_reward_log_max_lines` lines of the audit log."""
@@ -800,7 +851,8 @@ class NeuralNervousSystem:
                 os.replace(tmp, self._reward_log_path)
                 self._reward_log_lines = len(kept)
         except Exception as e:
-            logger.debug("[NeuralNS] reward log truncate failed: %s", e)
+            swallow_warn('[NeuralNS] reward log truncate failed', e,
+                         key="logic.neural_nervous_system.reward_log_truncate_failed", throttle=100)
 
     def record_outcome(self, reward: float, program: str | None = None,
                        k: int | None = None, decay: float | None = None,
@@ -853,9 +905,17 @@ class NeuralNervousSystem:
             z = self._z_normalize_reward(name, reward)
 
             # 2/3. Apply with eligibility traces or soft-fire
+            # rFP_titan_vm_v2 Phase 3 §3.12 — eligibility flag. When
+            # disabled, credit only the single most-recent fire (K=1,
+            # decay=1.0). When enabled (default), use the empirical
+            # per-program (K, decay) from Stage 0.5.
             eparams = self._eligibility_params.get(name, {})
-            eK = k if k is not None else int(eparams.get("K", 1))
-            eDecay = decay if decay is not None else float(eparams.get("decay", 0.5))
+            if self._eligibility_traces_enabled:
+                eK = k if k is not None else int(eparams.get("K", 1))
+                eDecay = decay if decay is not None else float(eparams.get("decay", 0.5))
+            else:
+                eK = 1
+                eDecay = 1.0
 
             applied_fired = False
             if buf.last_fired:
@@ -886,6 +946,18 @@ class NeuralNervousSystem:
         sup_weight = self._get_supervision_weight()
         _lr_gain = self._modulation.get("learning_rate_gain", 1.0)
 
+        # rFP_titan_vm_v2 Phase 3 §3.11 — cache latest VM baselines across
+        # programs before we compute targets. This lets coupling look up
+        # partners at the batch level with 1-tick lag (documented — see
+        # feedback_architectural_decisions_no_drift.md §couplet-lag
+        # choice during 2026-04-22 design discussion).
+        if self._coupling_enabled:
+            for _name, _buf in self.buffers.items():
+                if hasattr(_buf, "_vm_baselines") and _buf._vm_baselines:
+                    self._latest_vm_baselines[_name] = float(
+                        _buf._vm_baselines[-1]
+                    )
+
         for name, net in self.programs.items():
             buf = self.buffers[name]
             if len(buf) < self._batch_size:
@@ -903,6 +975,14 @@ class NeuralNervousSystem:
             targets = self._compute_targets(
                 vm_baselines, rewards, fired, urgencies, sup_weight)
 
+            # rFP_titan_vm_v2 Phase 3 §3.11 — apply coupling bonus (0 when
+            # disabled). Bonus is added to targets pre-clip; coupling
+            # strength already scales by sup_weight inside the helper so
+            # it decays with warmup exit.
+            coupling_bonus = self._compute_coupling_bonus(name, sup_weight)
+            if coupling_bonus > 0:
+                targets = np.clip(targets + coupling_bonus, 0.0, 1.0)
+
             # Apply neuromodulator learning rate modulation (DA)
             original_lr = net.lr
             net.lr = original_lr * max(0.3, min(3.0, _lr_gain))
@@ -911,6 +991,32 @@ class NeuralNervousSystem:
             self._total_train_steps += 1
 
         self._last_train_ts = time.time()
+
+    def _compute_coupling_bonus(
+        self, program: str, supervision_weight: float,
+    ) -> float:
+        """rFP_titan_vm_v2 Phase 3 §3.11 — cross-program coupling bonus.
+
+        Returns a scalar to add to a program's warmup target when its
+        biologically-related partner is also firing above threshold.
+        Bonus = coupling_strength × partner_score × supervision_weight
+        so coupling decays linearly to zero as the NN exits warmup.
+
+        Returns 0.0 when coupling disabled, no partner, or partner not
+        firing — zero-cost fast path for the 99% case.
+        """
+        if not self._coupling_enabled or supervision_weight <= 0:
+            return 0.0
+        partners = self._coupling_partners.get(program)
+        if not partners:
+            return 0.0
+        total = 0.0
+        for partner in partners:
+            partner_score = self._latest_vm_baselines.get(partner, 0.0)
+            if partner_score > self._coupling_fire_threshold:
+                total += self._coupling_strength * partner_score
+        # Cap by supervision_weight so coupling decays with warmup exit.
+        return total * supervision_weight
 
     def _compute_targets(
         self, vm_baselines: np.ndarray, rewards: np.ndarray,
@@ -1318,8 +1424,9 @@ class NeuralNervousSystem:
                 self._total_train_steps = state.get("total_train_steps", 0)
                 self._last_train_ts = state.get("last_train_ts", 0.0)
                 self._steps_at_last_save = self._total_train_steps
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn('[logic.neural_nervous_system] NeuralNervousSystem._load_all: with open(state_path) as f: state = json.load(f)', _swallow_exc,
+                             key='logic.neural_nervous_system.NeuralNervousSystem._load_all.line1428', throttle=100)
 
         # Load per-program weights + buffers (with dimension migration support)
         loaded = 0
@@ -1335,8 +1442,9 @@ class NeuralNervousSystem:
                     with open(w_path) as f:
                         _saved = json.load(f)
                     _needs_migration = _saved.get("input_dim", 55) != net.input_dim
-                except Exception:
-                    pass
+                except Exception as _swallow_exc:
+                    swallow_warn('[logic.neural_nervous_system] NeuralNervousSystem._load_all: with open(w_path) as f: _saved = json.load(f)', _swallow_exc,
+                                 key='logic.neural_nervous_system.NeuralNervousSystem._load_all.line1445', throttle=100)
 
             _cfg_feature_set = net._feature_set  # Config-defined (from _register_program)
             if net.load(w_path):
@@ -1461,8 +1569,8 @@ class NeuralNervousSystem:
                     net.b3 = np.zeros(1, dtype=np.float64)
                     shallow.append(f"{name}(b3 was {b3_val:.2f})")
             except Exception as e:
-                logger.debug(
-                    "[NeuralNS] %s liberation check error: %s", name, e)
+                swallow_warn(f'[NeuralNS] {name} liberation check error', e,
+                             key="logic.neural_nervous_system.liberation_check_error", throttle=100)
 
         if shallow:
             logger.warning(
@@ -1542,8 +1650,9 @@ class NeuralNervousSystem:
                         "helpers": net._action_helpers,
                         "layer": "outer",
                     })
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn('[logic.neural_nervous_system] NeuralNervousSystem.get_outer_dispatch_signals: input_vec = self.observation_space.build_input(net._featu...', _swallow_exc,
+                             key='logic.neural_nervous_system.NeuralNervousSystem.get_outer_dispatch_signals.line1652', throttle=100)
         return signals
 
     def get_inner_signals_summary(self) -> dict[str, float]:

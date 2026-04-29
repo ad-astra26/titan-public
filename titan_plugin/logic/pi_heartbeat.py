@@ -20,6 +20,7 @@ import math
 import os
 import time
 from typing import Optional
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -251,7 +252,8 @@ class PiHeartbeatMonitor:
             with open(self._state_path, "w") as f:
                 json.dump(state, f, indent=2)
         except Exception as e:
-            logger.debug("[π-Heartbeat] Save state error: %s", e)
+            swallow_warn('[π-Heartbeat] Save state error', e,
+                         key="logic.pi_heartbeat.save_state_error", throttle=100)
 
     def _load_state(self) -> None:
         """Load persisted state from disk."""

@@ -45,6 +45,7 @@ from .meta_service_client import (
     OUTCOME_REWARD_MAX,
     OUTCOME_REWARD_MIN,
 )
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -275,12 +276,14 @@ class MetaService:
                 try:
                     self._rewards.ingest_outcome_record(record)
                 except Exception as e:
-                    logger.debug("[MetaService] accumulator ingest: %s", e)
+                    swallow_warn('[MetaService] accumulator ingest', e,
+                                 key="logic.meta_service.accumulator_ingest", throttle=100)
             if _external_sink is not None:
                 try:
                     _external_sink(record)
                 except Exception as e:
-                    logger.debug("[MetaService] external outcome sink: %s", e)
+                    swallow_warn('[MetaService] external outcome sink', e,
+                                 key="logic.meta_service.external_outcome_sink", throttle=100)
         self._outcome_sink = _internal_and_chain
 
         # Telemetry (rFP §11.1)
@@ -437,8 +440,9 @@ class MetaService:
             entry = self._pending.pop(request_id, None)
             try:
                 self._queue.remove(request_id)
-            except ValueError:
-                pass
+            except ValueError as _swallow_exc:
+                swallow_warn('[logic.meta_service] MetaService._resolve_dry_run: self._queue.remove(request_id)', _swallow_exc,
+                             key='logic.meta_service.MetaService._resolve_dry_run.line444', throttle=100)
         if entry is None:
             return
         self._emit_response(
@@ -584,16 +588,16 @@ class MetaService:
             try:
                 recruitment_stats = self._recruitment.get_stats()
             except Exception as e:
-                logger.debug(
-                    "[MetaService] recruitment stats error: %s", e)
+                swallow_warn('[MetaService] recruitment stats error', e,
+                             key="logic.meta_service.recruitment_stats_error", throttle=100)
 
         rewards_stats = None
         if self._rewards is not None:
             try:
                 rewards_stats = self._rewards.get_stats()
             except Exception as e:
-                logger.debug(
-                    "[MetaService] rewards stats error: %s", e)
+                swallow_warn('[MetaService] rewards stats error', e,
+                             key="logic.meta_service.rewards_stats_error", throttle=100)
 
         return {
             "session_phase": "session_1_dry_run",

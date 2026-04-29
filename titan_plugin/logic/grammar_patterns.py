@@ -20,6 +20,7 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Optional
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +257,8 @@ class GrammarPatternLibrary:
                 return template
             return None  # Already exists
         except Exception as e:
-            logger.debug("[GrammarPatterns] Store error: %s", e)
+            swallow_warn('[GrammarPatterns] Store error', e,
+                         key="logic.grammar_patterns.store_error", throttle=100)
             return None
 
     def record_usage(self, template: str, success: bool = True,

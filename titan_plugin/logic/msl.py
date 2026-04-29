@@ -28,6 +28,7 @@ import time
 from collections import deque
 
 import numpy as np
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -2601,8 +2602,9 @@ class MultisensorySynthesisLayer:
                                     self.iam_detector.total_events,
                                     self.chi_tracker.chi,
                                     self.iam_detector.sustained_count)
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn('[logic.msl] MultisensorySynthesisLayer.load_all: with open(stats_path) as f: stats = json.load(f)', _swallow_exc,
+                             key='logic.msl.MultisensorySynthesisLayer.load_all.line2605', throttle=100)
         # Phase 3: Concept Grounder state
         if self.concept_grounder:
             self.concept_grounder.load(

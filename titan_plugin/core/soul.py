@@ -118,6 +118,12 @@ class SovereignSoul:
         self._state_file = Path("./data/soul_state.json")
         self._load_local_state()
 
+        # Mainnet Lifecycle Wiring rFP (2026-04-20): metabolism gate reference
+        # for NFT mint paths. Injected via set_metabolism() after TitanCore
+        # wires MetabolismController. Soul is constructed earlier than the
+        # metabolism controller, so setter injection is the pattern.
+        self._metabolism = None
+
         # ── M1: Constitution verification + titan.md merge on boot ──
         self._verify_constitution_on_boot()
         regenerate_soul_md()
@@ -326,6 +332,29 @@ class SovereignSoul:
             return None
 
     # -------------------------------------------------------------------------
+    # Mainnet Lifecycle Wiring rFP — metabolism gate injection + helper
+    # -------------------------------------------------------------------------
+    def set_metabolism(self, metabolism) -> None:
+        """Inject MetabolismController for NFT mint gating (rFP 2026-04-20)."""
+        self._metabolism = metabolism
+
+    def _check_nft_gate(self, op_name: str) -> Optional[str]:
+        """Return None if mint is allowed, or an error string if gated.
+
+        At SURVIVAL/EMERGENCY/HIBERNATION tiers `can_use_feature('nfts')`
+        is False; when gates_enforced=true the mint must abort.
+        """
+        if self._metabolism is None:
+            return None  # fail-open when not wired
+        try:
+            proceed, _ = self._metabolism.evaluate_gate("nfts", f"Soul.{op_name}")
+            if not proceed:
+                return "metabolism_gate: nfts disabled at current tier"
+        except Exception as e:
+            logger.debug("[Soul] NFT gate check failed (fail-open): %s", e)
+        return None
+
+    # -------------------------------------------------------------------------
     # NFT Minting — Metaplex Core
     # -------------------------------------------------------------------------
     async def mint_genesis_nft(
@@ -346,6 +375,12 @@ class SovereignSoul:
         """
         if self.network.keypair is None:
             logger.error("[Soul] Cannot mint Genesis NFT — no wallet keypair.")
+            return None
+
+        # Mainnet Lifecycle Wiring rFP (2026-04-20): NFT mint gate.
+        gate_err = self._check_nft_gate("mint_genesis_nft")
+        if gate_err:
+            logger.warning("[Soul] Genesis NFT mint gated: %s", gate_err)
             return None
 
         try:
@@ -422,6 +457,12 @@ class SovereignSoul:
         """
         if self.network.keypair is None:
             logger.error("[Soul] Cannot mint NextGen NFT — no wallet keypair.")
+            return None
+
+        # Mainnet Lifecycle Wiring rFP (2026-04-20): NFT mint gate.
+        gate_err = self._check_nft_gate("mint_nextgen_nft")
+        if gate_err:
+            logger.warning("[Soul] NextGen NFT mint gated: %s", gate_err)
             return None
 
         gen = generation or (self.current_gen + 1)

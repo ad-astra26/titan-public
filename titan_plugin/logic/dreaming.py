@@ -514,11 +514,24 @@ class DreamingEngine:
         buffer = inner_state.drain_experience_buffer()
         distilled = self._distill_experiences(buffer)
 
-        # EMOT-CGN dream-cluster integration (gated — see rFP §7.3)
-        if emot_cgn is not None:
+        # EMOT-CGN dream-cluster integration (gated — see rFP §7.3).
+        #
+        # ⚠ DEAD PATH since Phase 1.6h cutover (2026-04-20): EMOT-CGN
+        # moved from in-process (meta_reasoning._emot_cgn) to standalone
+        # subprocess (modules/emot_cgn_worker.py). Neither
+        # inner_coordinator.py call site (:201, :296) passes emot_cgn to
+        # this method, and meta_reasoning.py:978 keeps _emot_cgn = None
+        # as sentinel. This `if emot_cgn is not None:` branch is
+        # therefore never entered in production.
+        #
+        # BUG #10 fix (2026-04-24): k-means recenter invocation relocated
+        # to emot_cgn_worker main loop with matching K_RECENTER_CHECK_
+        # INTERVAL_S tick. Dream-cluster seeding (seed_from_dream_clusters)
+        # remains here for reference but is dead; reviving it requires a
+        # new DREAM_CYCLE_END bus message + subscription in the worker —
+        # not scoped now per Q3 audit TRANSITIONAL directive.
+        if emot_cgn is not None:  # always False in production — kept for reference
             try:
-                # Always-safe: seeds emergent slots if they haven't been
-                # populated (idempotent). Also triggers weekly recenter.
                 clusterer = getattr(emot_cgn, "_clusterer", None)
                 if clusterer is not None and distilled:
                     clusterer.seed_from_dream_clusters(distilled)

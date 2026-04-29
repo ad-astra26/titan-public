@@ -37,6 +37,13 @@ class JournalError(RuntimeError):
     """Raised on journal integrity / serialization failures."""
 
 
+# PERSISTENCE_BY_DESIGN: CallerJournal._fd / _file are kernel-level file
+# resources (file descriptor + file object). They MUST be recreated by
+# _open_or_create() on every fresh CallerJournal() instantiation — kernel
+# fds are process-local and not portable across restarts. The on-disk
+# journal FILE itself is what persists; the python-side handles are
+# transient by definition. Suppresses dead-wiring "written N×, never
+# persisted" finding for these fields.
 class CallerJournal:
     """Append-only, fsync-safe per-caller journal file.
 
@@ -234,20 +241,37 @@ class CallerJournal:
         self.close()
 
 
-def scan_orphan_journals(journal_dir: str, exclude_pid: Optional[int] = None) -> list:
+def scan_orphan_journals(
+    journal_dir: str,
+    instance_prefix: str = "imw",
+    exclude_pid: Optional[int] = None,
+) -> list:
     """Return a list of (path, pid) for journal files whose owner is dead/absent.
 
-    The IMW service daemon calls this on startup to find orphan journals to replay.
+    The IMW service daemon calls this on startup to find orphan journals
+    to replay.
+
+    `instance_prefix` MUST match the prefix the writer client used when
+    creating the journal file (derived from `Path(cfg.socket_path).stem`).
+    Pre-fix bug: this function globbed `imw_*.jrn` regardless of which
+    daemon called it, so the inner_memory daemon would pick up the
+    observatory_writer client's journal (which also used the literal
+    `imw_<pid>.jrn` naming) and try to replay observatory-table writes
+    against `inner_memory.db` → "no such table" errors. Each daemon now
+    only sees journals belonging to its own writer instance.
     """
     out = []
     exclude_pid = exclude_pid if exclude_pid is not None else os.getpid()
     p = Path(journal_dir)
     if not p.exists():
         return out
-    for f in p.glob("imw_*.jrn"):
-        # Extract pid from filename: imw_<pid>.jrn
+    for f in p.glob(f"{instance_prefix}_*.jrn"):
+        # Extract pid from filename: <instance_prefix>_<pid>.jrn
         try:
-            pid_str = f.stem.split("_", 1)[1]
+            # rsplit so the prefix can itself contain underscores (e.g.
+            # "observatory_writer_<pid>.jrn" — pid is always the trailing
+            # numeric segment).
+            pid_str = f.stem.rsplit("_", 1)[1]
             pid = int(pid_str)
         except (IndexError, ValueError):
             logger.warning("[imw.journal] unparseable journal filename: %s", f.name)

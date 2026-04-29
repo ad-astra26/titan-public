@@ -512,8 +512,13 @@ class TestWebhookTransactionRouting:
         plugin.network.pubkey = "TitanWallet"
         plugin.soul = MagicMock()
         plugin.soul._maker_pubkey = "MakerPubKey123"
-        plugin.soul.evolve_soul = AsyncMock(return_value={"gen": 2})
         plugin.soul.current_gen = 2
+        # webhook calls `titan_state.commands.evolve_soul(...)` (microkernel
+        # s5-amendment) — soul.evolve_soul is the underlying implementation,
+        # not the awaited entry point. Mock the awaitable on the commands
+        # surface, not on soul.
+        plugin.commands = MagicMock()
+        plugin.commands.evolve_soul = AsyncMock(return_value={"gen": 2})
         plugin.event_bus = MagicMock()
         plugin.event_bus.emit = AsyncMock()
 
@@ -532,7 +537,7 @@ class TestWebhookTransactionRouting:
             }
             result = await _process_transaction(plugin, tx)
             assert result is True
-            plugin.soul.evolve_soul.assert_called_once()
+            plugin.commands.evolve_soul.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ import os
 import time
 from collections import deque
 from typing import Optional
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +31,6 @@ COLLAPSE_THRESHOLD = 0.05
 VIOLATION_DURATION = 100  # consecutive epochs at extreme = violation
 
 
-# DEFERRED_CLASS_WIRING: SovereigntyTracker is fully implemented but has
-# zero spawn sites in the codebase — entire class is awaiting wiring per
-# DEFERRED: SOVEREIGNTY-TRACKER-WIRING. All public methods (record_epoch,
-# transition_to_advisory, confirm_maker, increment_great_cycle, etc.) are
-# orphans by design until that rFP ships; suppress orphan-detection here.
 class SovereigntyTracker:
     """Track sovereignty transition criteria and convergence metrics."""
 
@@ -71,6 +67,8 @@ class SovereigntyTracker:
                 self._saturation_violations = data.get("saturation_violations", 0)
                 self._collapse_violations = data.get("collapse_violations", 0)
                 self._transition_epoch = data.get("transition_epoch")
+                self._maker_confirmed = data.get("maker_confirmed", False)
+                self._developmental_age = data.get("developmental_age", 0)
         except Exception:
             pass
 
@@ -84,6 +82,8 @@ class SovereigntyTracker:
                 "saturation_violations": self._saturation_violations,
                 "collapse_violations": self._collapse_violations,
                 "transition_epoch": self._transition_epoch,
+                "maker_confirmed": self._maker_confirmed,
+                "developmental_age": self._developmental_age,
                 "updated_at": time.time(),
             }
             tmp = PERSISTENCE_FILE + ".tmp"
@@ -91,7 +91,8 @@ class SovereigntyTracker:
                 json.dump(data, f, indent=2)
             os.replace(tmp, PERSISTENCE_FILE)
         except Exception as e:
-            logger.debug("[Sovereignty] Save error: %s", e)
+            swallow_warn('[Sovereignty] Save error', e,
+                         key="logic.sovereignty.save_error", throttle=100)
 
     def record_epoch(
         self,

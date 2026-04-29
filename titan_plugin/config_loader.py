@@ -35,6 +35,42 @@ TITAN_PARAMS_PATH = Path(__file__).parent / "titan_params.toml"
 BASE_CONFIG_PATH = Path(__file__).parent / "config.toml"
 SECRETS_PATH = Path(os.path.expanduser("~/.titan/secrets.toml"))
 
+
+def _per_titan_override_path() -> Path:
+    """Path to the per-Titan microkernel override file.
+
+    Resolved per the same precedence as resolve_titan_id (state_registry.py):
+      1. TITAN_ID env var
+      2. data/titan_identity.json
+      3. fallback "T1"
+
+    File location: ~/.titan/microkernel_<TITAN_ID>.toml
+    Format: TOML with [microkernel] section overriding flags from
+            titan_params.toml's [microkernel].
+
+    Use case: stage flag flips per-Titan. e.g. T2/T3 run on full
+    microkernel v2 while T1 runs on legacy by setting in
+    ~/.titan/microkernel_T1.toml:
+
+        [microkernel]
+        api_process_separation_enabled = false
+    """
+    titan_id = os.environ.get("TITAN_ID", "")
+    if not titan_id:
+        try:
+            import json
+            proj_root = Path(__file__).parent.parent
+            id_path = proj_root / "data" / "titan_identity.json"
+            if id_path.exists():
+                with open(id_path) as f:
+                    titan_id = json.load(f).get("titan_id", "T1")
+        except Exception:
+            titan_id = "T1"
+    if not titan_id:
+        titan_id = "T1"
+    return Path(os.path.expanduser(f"~/.titan/microkernel_{titan_id}.toml"))
+
+
 _cache: dict | None = None
 _warned_missing_secrets = False
 
@@ -119,18 +155,13 @@ def load_titan_config(force_reload: bool = False) -> dict:
                 SECRETS_PATH,
                 sorted(secrets.keys()),
             )
-            _cache = merged
-            return _cache
         except Exception as e:
             _LOG.warning(
                 "[config_loader] Failed to merge %s: %s — using base config only",
                 SECRETS_PATH,
                 e,
             )
-            _cache = merged
-            return _cache
-
-    if not _warned_missing_secrets:
+    elif not _warned_missing_secrets:
         _LOG.warning(
             "[config_loader] %s not found — secret-dependent features will be disabled. "
             "Create it with: mkdir -p ~/.titan && chmod 700 ~/.titan && "
@@ -138,6 +169,28 @@ def load_titan_config(force_reload: bool = False) -> dict:
             SECRETS_PATH,
         )
         _warned_missing_secrets = True
+
+    # Layer 4 (top): per-Titan microkernel override — staged flag flips.
+    # Optional. Highest precedence — applied AFTER secrets so it can override
+    # anything. Use case: T1 stays on legacy while T2/T3 run on microkernel v2.
+    override_path = _per_titan_override_path()
+    if override_path.exists():
+        try:
+            with open(override_path, "rb") as f:
+                override = tomllib.load(f)
+            merged = _deep_merge(merged, override)
+            _LOG.info(
+                "[config_loader] Per-Titan override applied from %s "
+                "(sections: %s)",
+                override_path,
+                sorted(override.keys()),
+            )
+        except Exception as e:
+            _LOG.warning(
+                "[config_loader] Failed to merge %s: %s — using upstream config",
+                override_path, e,
+            )
+
     _cache = merged
     return _cache
 

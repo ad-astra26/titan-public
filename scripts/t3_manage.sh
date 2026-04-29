@@ -15,8 +15,14 @@ PIDFILE="/tmp/titan3.pid"
 cd "$TITAN_DIR" || { echo "ERROR: Cannot cd to $TITAN_DIR"; exit 1; }
 source "$VENV" 2>/dev/null || { echo "ERROR: Cannot activate venv at $VENV"; exit 1; }
 export OPENROUTER_API_KEY=
-# Match T1's ulimit (VS Code raises it; SSH/cron default is 1024 which causes fd exhaustion)
-ulimit -n 1048576 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+# Raise FD limit (cron default 1024 causes fd exhaustion ~2h into uptime,
+# 2026-04-22 T2 incident). `ulimit -n N` can return 0 in cron/env-i context
+# WITHOUT actually raising the soft limit, so the old `|| fallback` chain
+# short-circuited silently. Verify after setting + fall back explicitly.
+ulimit -n 1048576 2>/dev/null
+if [ "$(ulimit -n)" -lt 65536 ]; then
+    ulimit -n 65536 2>/dev/null || true
+fi
 # T3 can sense T2 as kin on localhost
 export TITAN_KIN_ADDRESSES="http://localhost:7777"
 
@@ -68,7 +74,9 @@ case "$CMD" in
         # setsid: ensure the new process becomes its own session leader so
         # the PGID-based kill in `stop` works correctly when called from
         # SSH/cron without a controlling terminal. Matches t2_manage.sh.
-        setsid nohup python -u scripts/titan_main.py --server >> "$BRAIN_LOG" 2>&1 &
+        # MALLOC_ARENA_MAX=2 — limits glibc malloc arenas (see safe_restart.sh
+        # for full rationale). Closes C-level RssAnon fragmentation 2026-04-27.
+        MALLOC_ARENA_MAX=2 setsid nohup python -u scripts/titan_main.py --server >> "$BRAIN_LOG" 2>&1 &
         echo "$!" > "$PIDFILE"
         echo "PID: $!"
         echo "Waiting 15s for boot..."
@@ -79,28 +87,62 @@ case "$CMD" in
 
     stop)
         echo "=== Stopping T3 ==="
-        # 1. Kill process group via PID file (catches main + all children)
+        # Phase C C-S2 (PLAN §17.3 / BUG-DUPLICATE-KERNELS-FRAGMENT-BUS-20260428):
+        # `stop` kills ALL titan_main process groups whose cwd matches T3's
+        # project dir, NOT just the PIDFILE PID. See t2_manage.sh stop for
+        # the algorithm + rationale (cwd-exact-match per
+        # feedback_shared_vps_pkill_trap.md).
+
+        TITAN_PIDS=""
         if [ -f "$PIDFILE" ]; then
-            PID=$(cat "$PIDFILE")
-            PGID=$(ps -o pgid= -p "$PID" 2>/dev/null | tr -d ' ')
-            if [ -n "$PGID" ] && [ "$PGID" != "0" ] && [ "$PGID" != "1" ]; then
-                kill -- -"$PGID" 2>/dev/null
-                sleep 2
-                kill -9 -- -"$PGID" 2>/dev/null
-            else
-                kill "$PID" 2>/dev/null
-                sleep 2
-                kill -9 "$PID" 2>/dev/null
+            PFPID=$(cat "$PIDFILE" 2>/dev/null | tr -d '[:space:]')
+            if [ -n "$PFPID" ] && kill -0 "$PFPID" 2>/dev/null; then
+                TITAN_PIDS="$PFPID"
             fi
             rm -f "$PIDFILE"
         fi
-        # 2. Kill any process with titan3 in its cwd (catches orphans from manual starts)
-        for p in $(pgrep -f "titan_main.*--server"); do
-            PCWD=$(readlink -f /proc/$p/cwd 2>/dev/null)
-            if echo "$PCWD" | grep -q "titan3"; then
-                kill -9 "$p" 2>/dev/null
+        for p in $(pgrep -f "titan_main.*--server" 2>/dev/null); do
+            PCWD=$(readlink -f "/proc/$p/cwd" 2>/dev/null)
+            if [ "$PCWD" = "$TITAN_DIR" ]; then
+                TITAN_PIDS="$TITAN_PIDS $p"
             fi
         done
+        TITAN_PIDS=$(echo "$TITAN_PIDS" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
+
+        if [ -n "$TITAN_PIDS" ]; then
+            TITAN_PGIDS=""
+            for p in $TITAN_PIDS; do
+                PGID=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')
+                if [ -n "$PGID" ] && [ "$PGID" != "0" ] && [ "$PGID" != "1" ]; then
+                    TITAN_PGIDS="$TITAN_PGIDS $PGID"
+                fi
+            done
+            TITAN_PGIDS=$(echo "$TITAN_PGIDS" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
+
+            for pgid in $TITAN_PGIDS; do
+                kill -- -"$pgid" 2>/dev/null
+            done
+            for _ in 1 2 3 4 5 6; do
+                ALIVE=0
+                for p in $TITAN_PIDS; do
+                    if [ -e "/proc/$p" ]; then ALIVE=$((ALIVE+1)); fi
+                done
+                [ "$ALIVE" -eq 0 ] && break
+                sleep 1
+            done
+            for pgid in $TITAN_PGIDS; do
+                kill -9 -- -"$pgid" 2>/dev/null
+            done
+            for _ in 1 2 3; do
+                ALIVE=0
+                for p in $TITAN_PIDS; do
+                    if [ -e "/proc/$p" ]; then ALIVE=$((ALIVE+1)); fi
+                done
+                [ "$ALIVE" -eq 0 ] && break
+                sleep 1
+            done
+        fi
+
         # 3. Kill anything still on port 7778
         sleep 1
         fuser -k 7778/tcp 2>/dev/null
@@ -114,13 +156,35 @@ case "$CMD" in
         # giving up. Pass --force as second arg to skip the check entirely.
         if [ "$1" != "--force" ]; then
             check_dreaming() {
+                # 2026-04-23 fix: longer curl timeout (5s → 10s) + file-based
+                # epochs_since_dream fallback when API fails. Prevents
+                # false-negatives under Observatory API latency conditions.
                 local dj
-                dj=$(curl -s --max-time 5 http://localhost:7778/v4/dreaming 2>/dev/null)
-                echo "$dj" | python3 -c "
+                dj=$(curl -s --max-time 10 http://localhost:7778/v4/dreaming 2>/dev/null)
+                local api_result
+                api_result=$(echo "$dj" | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin).get('data', {})
-    print(d.get('is_dreaming', 'unknown'))
+    v = d.get('is_dreaming')
+    if v is None:
+        print('unknown')
+    else:
+        print(v)
+except: print('unknown')
+" 2>/dev/null)
+                if [ "$api_result" = "True" ] || [ "$api_result" = "False" ]; then
+                    echo "$api_result"
+                    return
+                fi
+                # API failed — fall back to T3's local state file
+                python3 -c "
+import json
+try:
+    with open('/home/antigravity/projects/titan3/data/dreaming_state.json') as f:
+        d = json.load(f)
+    epochs = d.get('epochs_since_dream', 0)
+    print('False' if epochs > 5 else 'unknown')
 except: print('unknown')
 " 2>/dev/null
             }
@@ -160,6 +224,12 @@ except: print('unknown')
                 exit 1
             fi
         fi
+        # Acquire restart-coordination lockfile so services_watchdog.sh skips
+        # its zombie/duplicate-group check during the kill-then-spawn window.
+        # Closes BUG-RESTART-WATCHDOG-RACE (2026-04-27).
+        RESTART_LOCK="/tmp/titan3_restart.lock"
+        date +%s > "$RESTART_LOCK"
+        trap 'rm -f "$RESTART_LOCK"' INT TERM
         $0 stop
         sleep 2
         $0 start

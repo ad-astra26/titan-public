@@ -14,7 +14,7 @@ Functions moved here (Phase 1, 2026-03-23):
   - _run_focus                 — PID nudges for Body/Mind
   - _compute_spirit_reflex_intuition — Compute reflex from stimulus
   - _run_impulse               — Check action impulse
-  - _post_epoch_v4_filter_down — Record + train V4 FilterDown
+  - _post_epoch_v5_filter_down — Record + train V5 FilterDown (V4 retired 2026-04-25)
   - _tick_clock_pair           — Tick Sphere Clock pair
   - _maybe_anchor_trinity      — On-chain anchoring
   - _run_consciousness_epoch   — Execute consciousness epoch
@@ -35,6 +35,7 @@ import math
 import os
 import time
 from pathlib import Path
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 # GREAT PULSE transition tracking (resonance OFF→ON detector)
 # Resets to False on hot-reload → one spurious detection (harmless, documented)
@@ -133,11 +134,11 @@ def _post_epoch_learning(
             body_mult, mind_mult = filter_down.compute_multipliers(
                 curr_body, curr_mind, curr_spirit,
             )
-            _send_msg(send_queue, "FILTER_DOWN", name, "body", {
+            _send_msg(send_queue, bus.FILTER_DOWN, name, "body", {
                 "multipliers": body_mult,
                 "train_steps": filter_down._total_train_steps,
             })
-            _send_msg(send_queue, "FILTER_DOWN", name, "mind", {
+            _send_msg(send_queue, bus.FILTER_DOWN, name, "mind", {
                 "multipliers": mind_mult,
                 "train_steps": filter_down._total_train_steps,
             })
@@ -178,10 +179,12 @@ def _post_epoch_learning(
                                     reward=reward,
                                     program="INTUITION",
                                     source="intuition.outcome")
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                        except Exception as _swallow_exc:
+                            swallow_warn('[modules.spirit_loop] _post_epoch_learning: loss_delta = float(prev_loss) - float(curr_loss)', _swallow_exc,
+                                         key='modules.spirit_loop._post_epoch_learning.line183', throttle=100)
+                except Exception as _swallow_exc:
+                    swallow_warn('[modules.spirit_loop] _post_epoch_learning: from titan_plugin.logic.middle_path import middle_path_loss', _swallow_exc,
+                                 key='modules.spirit_loop._post_epoch_learning.line185', throttle=100)
 
         except Exception as e:
             logger.error("[SpiritWorker] Intuition error: %s", e, exc_info=True)
@@ -211,13 +214,14 @@ def _run_focus(send_queue, name: str, focus_body, focus_mind, body_state, mind_s
             if cascade_mult != 1.0:
                 nudges = [n * cascade_mult for n in nudges]
             if focus_body.should_publish(nudges):
-                _send_msg(send_queue, "FOCUS_NUDGE", name, "body", {
+                _send_msg(send_queue, bus.FOCUS_NUDGE, name, "body", {
                     "nudges": nudges,
                     "layer": "body",
                     "cascade_multiplier": round(cascade_mult, 3),
                 })
         except Exception as e:
-            logger.debug("[SpiritWorker] Focus body error: %s", e)
+            swallow_warn('[SpiritWorker] Focus body error', e,
+                         key="modules.spirit_loop.focus_body_error", throttle=100)
 
     if focus_mind:
         try:
@@ -227,13 +231,14 @@ def _run_focus(send_queue, name: str, focus_body, focus_mind, body_state, mind_s
             if cascade_mult != 1.0:
                 nudges = [n * cascade_mult for n in nudges]
             if focus_mind.should_publish(nudges):
-                _send_msg(send_queue, "FOCUS_NUDGE", name, "mind", {
+                _send_msg(send_queue, bus.FOCUS_NUDGE, name, "mind", {
                     "nudges": nudges,
                     "layer": "mind",
                     "cascade_multiplier": round(cascade_mult, 3),
                 })
         except Exception as e:
-            logger.debug("[SpiritWorker] Focus mind error: %s", e)
+            swallow_warn('[SpiritWorker] Focus mind error', e,
+                         key="modules.spirit_loop.focus_mind_error", throttle=100)
 
 
 # ── Reflex Intuition (Spirit layer) ────────────────────────────────────
@@ -281,8 +286,9 @@ def _compute_spirit_reflex_intuition(stimulus: dict, spirit_tensor: list,
         try:
             spirit_velocity = unified_spirit.velocity
             is_stale = unified_spirit.is_stale
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn('[modules.spirit_loop] _compute_spirit_reflex_intuition: spirit_velocity = unified_spirit.velocity', _swallow_exc,
+                         key='modules.spirit_loop._compute_spirit_reflex_intuition.line288', throttle=100)
 
     # ── guardian_shield: Spirit's sovereign boundary defense ──
     guardian_conf = 0.0
@@ -345,8 +351,9 @@ def _compute_spirit_reflex_intuition(stimulus: dict, spirit_tensor: list,
             total_pulses = sum(c.pulse_count for c in sphere_clock.clocks.values())
             if total_pulses > 0:
                 time_conf += 0.1
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn('[modules.spirit_loop] _compute_spirit_reflex_intuition: total_pulses = sum((c.pulse_count for c in sphere_clock.c...', _swallow_exc,
+                         key='modules.spirit_loop._compute_spirit_reflex_intuition.line352', throttle=100)
     if time_conf > 0.05:
         signals.append({
             "reflex": "time_awareness",
@@ -457,52 +464,33 @@ def _run_impulse(send_queue, name: str, impulse_engine, body_state, mind_state,
 
         impulse = impulse_engine.observe(body_values, mind_values, spirit_tensor, intuition_suggestion)
         if impulse:
-            _send_msg(send_queue, "IMPULSE", name, "all", impulse)
+            _send_msg(send_queue, bus.IMPULSE, name, "all", impulse)
     except Exception as e:
-        logger.debug("[SpiritWorker] Impulse error: %s", e)
+        swallow_warn('[SpiritWorker] Impulse error', e,
+                     key="modules.spirit_loop.impulse_error", throttle=100)
 
 
-# ── V4 FilterDown 30-dim Learning ─────────────────────────────────────
-
-# Track previous 30DT tensor for V4 transition recording
-_prev_spirit_30dt = [0.5] * 30
-
-
-def _post_epoch_v4_filter_down(send_queue, name: str, filter_down_v4, unified_spirit,
-                               v5_publishing: bool = False) -> None:
-    """Record 30-dim transition and train V4 FilterDown after consciousness epoch.
-
-    rFP #2: if V5 is publishing, V4 continues training silently but does NOT
-    republish (multiplier broadcast is removed already; V4's own publishes
-    remain out of the primary FILTER_DOWN stream while V5 owns it).
-    """
-    global _prev_spirit_30dt
-    if not filter_down_v4 or not unified_spirit:
-        return
-    try:
-        current_30dt = unified_spirit.tensor
-        filter_down_v4.record_transition(_prev_spirit_30dt, current_30dt)
-
-        loss = filter_down_v4.maybe_train()
-        if loss is not None:
-            logger.info(
-                "[SpiritWorker] FilterDownV4 trained: loss=%.6f%s",
-                loss, " (silent — V5 publishing)" if v5_publishing else "",
-            )
-
-        if not v5_publishing:
-            # V4 still computes multipliers for local state even when silent;
-            # publish path for V4 multipliers stays behind the V5 flag.
-            filter_down_v4.compute_multipliers(current_30dt)
-
-        _prev_spirit_30dt = list(current_30dt)
-    except Exception as e:
-        logger.debug("[SpiritWorker] V4 FilterDown error: %s", e)
+# ── V4 FilterDown — RETIRED 2026-04-25 ────────────────────────────────
+#
+# V4 was a 30-dim FilterDown engine paired with the original 30D
+# unified_spirit.tensor. When unified_spirit was upgraded to 130D in
+# commit 5d2774b8 (DQ6+DQ7), V4's record_transition + compute_multipliers
+# kept being called with the new 130D tensor — every call failed with a
+# matmul ValueError ("size 30 is different from 130"), silently swallowed
+# at DEBUG level. V5 (TITAN_SELF 162D) is the active learner now.
+#
+# Bug surfaced 2026-04-25 when Pattern C migration upgraded the swallow
+# to a WARNING — see BUGS.md V4-FILTER-DOWN-DEAD entry. Decision:
+# retire V4 entirely (Maker greenlight 2026-04-25).
+#
+# State files data/filter_down_v4_{weights,buffer}.json preserved on disk
+# per directive_memory_preservation.md but no longer read or written.
 
 
 # ── rFP #2: TITAN_SELF composition + FILTER_DOWN V5 ──────────────────
 
 from collections import deque as _deque
+from titan_plugin import bus
 
 # Topology buffer: accumulates full_30d_topology snapshots from STATE_SNAPSHOT
 # messages between consciousness epochs. Element-wise mean at epoch-close
@@ -611,9 +599,10 @@ def compose_and_emit_titan_self(send_queue, name: str, consciousness: dict,
         # via _post_epoch_v5_filter_down below; the bus broadcast is retained for
         # future kin-protocol emission and external observability per
         # DEFERRED: TITAN_SELF_STATE-CONSUMER-DECISION (Option C).
-        _send_msg(send_queue, "TITAN_SELF_STATE", name, "all", payload)
+        _send_msg(send_queue, bus.TITAN_SELF_STATE, name, "all", payload)
     except Exception as e:
-        logger.debug("[SpiritWorker] TITAN_SELF_STATE emit error: %s", e)
+        swallow_warn('[SpiritWorker] TITAN_SELF_STATE emit error', e,
+                     key="modules.spirit_loop.titan_self_state_emit_error", throttle=100)
     return ts
 
 
@@ -621,9 +610,9 @@ def _post_epoch_v5_filter_down(send_queue, name: str, filter_down_v5,
                                titan_self: "dict | None", config: dict) -> None:
     """Record V5 transition, train, publish FILTER_DOWN_V5 if enabled.
 
-    Mirrors _post_epoch_v4_filter_down shape — called immediately after
-    compose_and_emit_titan_self(). If V5 isn't initialized or composition
-    failed, this is a safe no-op.
+    Called immediately after compose_and_emit_titan_self(). If V5 isn't
+    initialized or composition failed, this is a safe no-op. (V4 retired
+    2026-04-25 — see BUGS V4-FILTER-DOWN-DEAD.)
 
     Feature-flag coexistence: publish path gated on publish_enabled from
     config (config is read at boot; restart required for flip).
@@ -657,7 +646,8 @@ def _post_epoch_v5_filter_down(send_queue, name: str, filter_down_v5,
         try:
             mults = filter_down_v5.compute_multipliers(ts_curr)
         except Exception as _v5_compute_fail:
-            logger.debug("[SpiritWorker] V5 compute failed: %s", _v5_compute_fail)
+            swallow_warn('[SpiritWorker] V5 compute failed', _v5_compute_fail,
+                         key="modules.spirit_loop.v5_compute_failed", throttle=100)
 
         # Publish path — only if V5 is the active publisher (Phase 8 flag flip).
         # Fail-soft: on publish error, log WARNING so operators can see;
@@ -665,7 +655,7 @@ def _post_epoch_v5_filter_down(send_queue, name: str, filter_down_v5,
         v5_cfg = (config or {}).get("filter_down_v5", {}) if config else {}
         if mults is not None and bool(v5_cfg.get("publish_enabled", False)):
             try:
-                _send_msg(send_queue, "FILTER_DOWN_V5", name, "all", {
+                _send_msg(send_queue, bus.FILTER_DOWN_V5, name, "all", {
                     "multipliers": mults,
                     "epoch_id":    titan_self.get("epoch_id", 0),
                     "stats": {
@@ -683,7 +673,8 @@ def _post_epoch_v5_filter_down(send_queue, name: str, filter_down_v5,
                     "publish_enabled", _v5_fail,
                 )
     except Exception as e:
-        logger.debug("[SpiritWorker] V5 FilterDown error: %s", e)
+        swallow_warn('[SpiritWorker] V5 FilterDown error', e,
+                     key="modules.spirit_loop.v5_filterdown_error", throttle=100)
 
 
 # ── V4 Sphere Clock Ticking ───────────────────────────────────────────
@@ -717,7 +708,7 @@ def _tick_clock_pair(send_queue, name: str, sphere_clock, resonance,
                 coh = layer_coherence(inner_tensor) if inner_tensor else 0.5
             pulse = inner_clock.tick(coh)
             if pulse:
-                _send_msg(send_queue, "SPHERE_PULSE", name, "all", pulse)
+                _send_msg(send_queue, bus.SPHERE_PULSE, name, "all", pulse)
                 _check_resonance(send_queue, name, resonance, sphere_clock,
                                  unified_spirit, pulse)
 
@@ -730,12 +721,13 @@ def _tick_clock_pair(send_queue, name: str, sphere_clock, resonance,
                 coh = layer_coherence(outer_tensor) if outer_tensor else 0.5
             pulse = outer_clock.tick(coh)
             if pulse:
-                _send_msg(send_queue, "SPHERE_PULSE", name, "all", pulse)
+                _send_msg(send_queue, bus.SPHERE_PULSE, name, "all", pulse)
                 _check_resonance(send_queue, name, resonance, sphere_clock,
                                  unified_spirit, pulse)
 
     except Exception as e:
-        logger.debug("[SpiritWorker] Clock pair %s tick error: %s", layer, e)
+        swallow_warn(f'[SpiritWorker] Clock pair {layer} tick error', e,
+                     key="modules.spirit_loop.clock_pair_tick_error", throttle=100)
 
 
 # Legacy wrappers (kept for any external references)
@@ -777,7 +769,7 @@ def _check_resonance(send_queue, name: str, resonance, sphere_clock,
             big_pulse = resonance.record_pulse(pulse)
 
         if big_pulse:
-            _send_msg(send_queue, "BIG_PULSE", name, "all", big_pulse)
+            _send_msg(send_queue, bus.BIG_PULSE, name, "all", big_pulse)
 
             # GREAT PULSE fires on resonance TRANSITION (OFF→ON):
             # When ALL 3 pairs achieve resonance simultaneously for the first time
@@ -795,7 +787,7 @@ def _check_resonance(send_queue, name: str, resonance, sphere_clock,
                 if great_epoch:
                     enrichment = unified_spirit.compute_enrichment()
 
-                _send_msg(send_queue, "GREAT_PULSE", name, "all", {
+                _send_msg(send_queue, bus.GREAT_PULSE, name, "all", {
                     "great_pulse_count": great_epoch.epoch_id if great_epoch else 0,
                     "trigger": "resonance_transition",
                     "epoch_id": great_epoch.epoch_id if great_epoch else 0,
@@ -825,7 +817,8 @@ def _check_resonance(send_queue, name: str, resonance, sphere_clock,
 
             _great_pulse_resonance_prev = _all_resonant_now
     except Exception as e:
-        logger.debug("[SpiritWorker] Resonance check error: %s", e)
+        swallow_warn('[SpiritWorker] Resonance check error', e,
+                     key="modules.spirit_loop.resonance_check_error", throttle=100)
 
 
 # ── On-Chain Trinity Anchoring ─────────────────────────────────────────
@@ -864,8 +857,9 @@ def _maybe_anchor_trinity(
     try:
         with open(_anchor_path) as _af:
             _prev_anchor = json.load(_af)
-    except Exception:
-        pass
+    except Exception as _swallow_exc:
+        swallow_warn('[modules.spirit_loop] _maybe_anchor_trinity: with open(_anchor_path) as _af: _prev_anchor = json.load(...', _swallow_exc,
+                     key='modules.spirit_loop._maybe_anchor_trinity.line878', throttle=100)
 
     # Update curvature EMA (exponential moving average, α=0.02 for smooth tracking)
     _curvature_ema = _prev_anchor.get("curvature_ema", 2.0)
@@ -895,8 +889,9 @@ def _maybe_anchor_trinity(
             _ema_state["curvature_ema"] = _curvature_ema
             with open(_anchor_path, "w") as _af:
                 json.dump(_ema_state, _af, indent=2)
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn('[modules.spirit_loop] _maybe_anchor_trinity: _ema_state = _prev_anchor.copy()', _swallow_exc,
+                         key='modules.spirit_loop._maybe_anchor_trinity.line909', throttle=100)
 
     should_anchor = False
     reason = ""
@@ -952,8 +947,9 @@ def _maybe_anchor_trinity(
                         with open(_tc_gen_path, "rb") as _tc_f:
                             _tc_merkle = _tc_hl.sha256(_tc_f.read(128)).hexdigest()[:16]
                     _tc_idx.close()
-                except Exception:
-                    pass
+                except Exception as _swallow_exc:
+                    swallow_warn('[modules.spirit_loop] _maybe_anchor_trinity: from titan_plugin.logic.timechain import TimeChain', _swallow_exc,
+                                 key='modules.spirit_loop._maybe_anchor_trinity.line966', throttle=100)
                 memo_text = f"TITAN|e={epoch_id}|h={state_hash}|r={reason}"
                 if _tc_merkle:
                     memo_text += f"|tc={_tc_merkle}|tb={_tc_height}"
@@ -976,7 +972,17 @@ def _maybe_anchor_trinity(
                     tx = Transaction.new_unsigned(msg)
                     tx.sign([keypair], blockhash)
 
+                    # Phase 1 sensory wiring: instrument TX latency for
+                    # outer_body[2] somatosensation composite. Try/except
+                    # wrapper — instrumentation MUST NOT break anchor path.
+                    _tx_t0 = time.monotonic()
                     result = sol_client.send_transaction(tx)
+                    try:
+                        from titan_plugin.logic.timechain_v2 import record_tx_latency
+                        record_tx_latency(time.monotonic() - _tx_t0)
+                    except Exception as _swallow_exc:
+                        swallow_warn('[modules.spirit_loop] _maybe_anchor_trinity: from titan_plugin.logic.timechain_v2 import record_tx_lat...', _swallow_exc,
+                                     key='modules.spirit_loop._maybe_anchor_trinity.line998', throttle=100)
                     tx_sig = str(result.value) if result.value else "?"
 
                     # Read back balance for body feedback
@@ -1026,8 +1032,9 @@ def _maybe_anchor_trinity(
                     with open(_anchor_path) as _af:
                         _prev = json.load(_af)
                     _fail_count = _prev.get("consecutive_failures", 0)
-                except Exception:
-                    pass
+                except Exception as _swallow_exc:
+                    swallow_warn('[modules.spirit_loop] _maybe_anchor_trinity: with open(_anchor_path) as _af: _prev = json.load(_af)', _swallow_exc,
+                                 key='modules.spirit_loop._maybe_anchor_trinity.line1049', throttle=100)
                 _fail_count += 1
                 _fail_state = {
                     "last_anchor_time": time.time(), "success": False,
@@ -1042,8 +1049,9 @@ def _maybe_anchor_trinity(
                 elif _fail_count == 6:
                     logger.warning("[Anchor] Circuit breaker ENGAGED after 5 failures — "
                                    "pausing anchoring for 1 hour. Last error: %s", _ae)
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn('[modules.spirit_loop] _maybe_anchor_trinity: _fail_count = 0', _swallow_exc,
+                             key='modules.spirit_loop._maybe_anchor_trinity.line1065', throttle=100)
 
 
 # ── Consciousness Integration ───────────────────────────────────────
@@ -1110,6 +1118,23 @@ def _run_consciousness_epoch(consciousness: dict, body_state: dict, mind_state: 
             ostate.get("outer_spirit_45d") is not None
         )
         total_dims = EXTENDED_NUM_DIMS if has_outer_extended else 67
+        if not has_outer_extended:
+            # Trinity-symmetry invariant violation — the consciousness
+            # epoch is collapsing to 67D because outer_state lacks
+            # extended fields. Should be impossible after spirit_worker
+            # init pre-populates [0.5]*15/45 defaults; if it fires,
+            # something is actively setting those keys back to None.
+            # See BUG-T1-CONSCIOUSNESS-67D-STATE-VECTOR + directive_
+            # error_visibility.md.
+            logger.warning(
+                "[SpiritWorker] Consciousness epoch %d collapsing to 67D — "
+                "outer_state missing outer_mind_15d=%s outer_spirit_45d=%s. "
+                "Investigate: arch_map symmetries --titan <T> + grep "
+                "OUTER_TRINITY producer.",
+                epoch_id,
+                ostate.get("outer_mind_15d") is not None,
+                ostate.get("outer_spirit_45d") is not None,
+            )
         logger.info("[SpiritWorker] Consciousness epoch %d — %dD self-observation...",
                     epoch_id, total_dims)
 
@@ -1146,7 +1171,8 @@ def _run_consciousness_epoch(consciousness: dict, body_state: dict, mind_state: 
             for i, v in enumerate(spirit_45d[:45]):
                 sv[20 + i] = v
         except Exception as e:
-            logger.debug("[SpiritWorker] Spirit 45D computation for consciousness: %s", e)
+            swallow_warn('[SpiritWorker] Spirit 45D computation for consciousness', e,
+                         key="modules.spirit_loop.spirit_45d_computation_for_consciousness", throttle=100)
             spirit_5d = _collect_spirit_tensor(config, body_state, mind_state, consciousness)
             for i, v in enumerate(spirit_5d[:5]):
                 sv[20 + i] = v
@@ -1420,10 +1446,33 @@ def _collect_spirit_tensor(config: dict, body_state: dict, mind_state: dict,
 # ─────────────────────────────────────────────────────────────────────
 
 def build_coordinator_snapshot(state_refs: dict) -> dict | None:
-    """Build the coordinator stats dict. Returns None if coordinator unavailable."""
+    """Build the coordinator stats dict. Returns None if coordinator unavailable.
+
+    Every subsystem's contribution is isolated via _safe_set below so a
+    single buggy get_stats() (e.g. a tuple index mistake) can't blank
+    the entire snapshot. Without this isolation, one subsystem's bug
+    used to starve /v4/inner-trinity and every other coordinator-backed
+    endpoint simultaneously, and made safe_restart.sh's dreaming-state
+    check return `unknown` — blocking Titan restarts for unrelated
+    reasons. See 2026-04-22 investigation session.
+    """
     coordinator = state_refs.get("coordinator")
     if not coordinator:
         return None
+
+    def _safe_set(stats_dict: dict, key: str, fn, default=None):
+        """Call fn() and store in stats_dict[key]. On failure, store
+        `{"error": str(exc)}` (or `default` if provided) and log WARN
+        once so the snapshot still builds for other subsystems."""
+        try:
+            stats_dict[key] = fn()
+        except Exception as _ss_err:
+            stats_dict[key] = (default if default is not None
+                               else {"error": str(_ss_err)})
+            logger.warning(
+                "[CoordSnapshot] %s.get_stats() failed: %s — "
+                "partial snapshot continues", key, _ss_err)
+
     pi_monitor = state_refs.get("pi_monitor")
     e_mem = state_refs.get("e_mem")
     prediction_engine = state_refs.get("prediction_engine")
@@ -1447,29 +1496,39 @@ def build_coordinator_snapshot(state_refs: dict) -> dict | None:
     msl = state_refs.get("msl")
     language_stats = state_refs.get("language_stats")
 
-    stats = coordinator.get_stats()
+    # coordinator.get_stats() is the core — if IT fails, snapshot can't
+    # be built meaningfully. Isolate it too so the error surfaces in the
+    # snapshot rather than blanking everything.
+    stats = {}
+    try:
+        stats = coordinator.get_stats() or {}
+    except Exception as _cs_err:
+        logger.warning(
+            "[CoordSnapshot] coordinator.get_stats() failed: %s — "
+            "building stats from isolated subsystems only", _cs_err)
+        stats = {"coordinator_error": str(_cs_err)}
     if pi_monitor:
-        stats["pi_heartbeat"] = pi_monitor.get_stats()
+        _safe_set(stats, "pi_heartbeat", pi_monitor.get_stats)
     if e_mem:
-        stats["experiential_memory"] = e_mem.get_stats()
+        _safe_set(stats, "experiential_memory", e_mem.get_stats)
     if prediction_engine:
-        stats["prediction"] = prediction_engine.get_stats()
+        _safe_set(stats, "prediction", prediction_engine.get_stats)
     if ex_mem:
-        stats["experience_memory"] = ex_mem.get_stats()
+        _safe_set(stats, "experience_memory", ex_mem.get_stats)
     if episodic_mem:
-        stats["episodic_memory"] = episodic_mem.get_stats()
+        _safe_set(stats, "episodic_memory", episodic_mem.get_stats)
     if working_mem:
-        stats["working_memory"] = working_mem.get_stats()
+        _safe_set(stats, "working_memory", working_mem.get_stats)
     if inner_lower_topo:
-        stats["inner_lower_topology"] = inner_lower_topo.get_stats()
+        _safe_set(stats, "inner_lower_topology", inner_lower_topo.get_stats)
     if outer_lower_topo:
-        stats["outer_lower_topology"] = outer_lower_topo.get_stats()
+        _safe_set(stats, "outer_lower_topology", outer_lower_topo.get_stats)
     if ground_up_enricher:
-        stats["ground_up"] = ground_up_enricher.get_stats()
+        _safe_set(stats, "ground_up", ground_up_enricher.get_stats)
     if neuromodulator_system:
-        stats["neuromodulators"] = neuromodulator_system.get_stats()
+        _safe_set(stats, "neuromodulators", neuromodulator_system.get_stats)
     if expression_manager:
-        stats["expression_composites"] = expression_manager.get_stats()
+        _safe_set(stats, "expression_composites", expression_manager.get_stats)
     if life_force_engine:
         stats["chi"] = getattr(life_force_engine, '_latest_chi', {})
     if meditation_tracker:
@@ -1480,9 +1539,9 @@ def build_coordinator_snapshot(state_refs: dict) -> dict | None:
             "in_meditation": meditation_tracker.get("in_meditation", False),
         }
     if outer_interface:
-        stats["outer_interface"] = outer_interface.get_stats()
+        _safe_set(stats, "outer_interface", outer_interface.get_stats)
     if reasoning_engine:
-        stats["reasoning"] = reasoning_engine.get_stats()
+        _safe_set(stats, "reasoning", reasoning_engine.get_stats)
     # Meta-reasoning block — always emit the key (shape-stable for downstream)
     stats["meta_reasoning"] = {}
     _me = getattr(coordinator, '_meta_engine', None)
@@ -1513,9 +1572,9 @@ def build_coordinator_snapshot(state_refs: dict) -> dict | None:
     else:
         stats["meta_service"] = {}
     if self_reasoning:
-        stats["self_reasoning"] = self_reasoning.get_stats()
+        _safe_set(stats, "self_reasoning", self_reasoning.get_stats)
     if coding_explorer:
-        stats["coding_explorer"] = coding_explorer.get_stats()
+        _safe_set(stats, "coding_explorer", coding_explorer.get_stats)
     if phase_tracker:
         stats["phase_events"] = {
             "current_phase": phase_tracker.get("current_phase", "idle"),
@@ -1572,7 +1631,66 @@ def build_coordinator_snapshot(state_refs: dict) -> dict | None:
                 if coordinator.inner else []),
         }
     if social_pressure_meter:
-        stats["social_pressure"] = social_pressure_meter.get_stats()
+        _safe_set(stats, "social_pressure", social_pressure_meter.get_stats)
+    # rFP_observatory_data_loading_v1 §3.2 (2026-04-26): topology block
+    # for the Trinity Architecture TopologyPanel.
+    #
+    # Batch D — legacy 3 fields (volume / curvature / cluster_count) from
+    # TopologyEngine for backwards compatibility with the existing widget.
+    #
+    # Batch E (2026-04-26 follow-up, Maker-greenlit): the panel was
+    # designed before the 30D space topology shipped. Now also expose
+    # the rich state_register observables_30d (6 layers × 5 metrics —
+    # coherence / magnitude / velocity / direction / polarity per
+    # inner|outer × body|mind|spirit) so the frontend can render the
+    # full space-topology view alongside the legacy summary.
+    _topo_block = {
+        "volume": 0.0, "curvature": 0.0,
+        "cluster_count": 0, "cluster_threshold": 0.0,
+        "observables_30d": [],
+        "observables_dict": {},
+    }
+    if coordinator and hasattr(coordinator, "topology") and coordinator.topology:
+        try:
+            _topo_stats = coordinator.topology.get_stats() or {}
+            _topo_block["volume"] = float(_topo_stats.get("current_volume", 0.0) or 0.0)
+            _topo_block["curvature"] = float(_topo_stats.get("current_curvature", 0.0) or 0.0)
+            _topo_block["cluster_count"] = int(_topo_stats.get("volume_history_size", 0) or 0)
+            _topo_block["cluster_threshold"] = float(_topo_stats.get("cluster_threshold", 0.0) or 0.0)
+        except Exception as _topo_err:
+            logger.debug("[CoordSnapshot] topology read failed: %s", _topo_err)
+    # Batch E — observables_dict is 6 layers × 5 metrics
+    # (inner|outer × body|mind|spirit, each {coherence, magnitude,
+    # velocity, direction, polarity}) = 30 metrics. InnerState.observables
+    # carries the labelled dict; flatten it deterministically into a 30D
+    # vector so the frontend can render either form.
+    if inner_state is not None:
+        try:
+            _obs_dict = inner_state.observables if hasattr(inner_state, "observables") else None
+            if isinstance(_obs_dict, dict) and _obs_dict:
+                _topo_block["observables_dict"] = _obs_dict
+                # Deterministic flatten: layer order matches state_register
+                # observables_30d (inner_body, inner_mind, inner_spirit,
+                # outer_body, outer_mind, outer_spirit), metric order:
+                # coherence, magnitude, velocity, direction, polarity.
+                _LAYERS = ("inner_body", "inner_mind", "inner_spirit",
+                           "outer_body", "outer_mind", "outer_spirit")
+                _METRICS = ("coherence", "magnitude", "velocity",
+                            "direction", "polarity")
+                _vec: list[float] = []
+                for _l in _LAYERS:
+                    _layer_vals = _obs_dict.get(_l, {}) if isinstance(
+                        _obs_dict.get(_l), dict) else {}
+                    for _m in _METRICS:
+                        _v = _layer_vals.get(_m, 0.0)
+                        _vec.append(round(float(_v), 4) if isinstance(
+                            _v, (int, float)) else 0.0)
+                if len(_vec) == 30:
+                    _topo_block["observables_30d"] = _vec
+        except Exception as _obs_err:
+            logger.debug("[CoordSnapshot] observables read failed: %s", _obs_err)
+    stats["topology"] = _topo_block
+
     if msl:
         _msl_attn = msl.get_attention_weights_for_kin()
         _msl_entropy = 0.0
@@ -1635,8 +1753,9 @@ def build_trinity_snapshot(state_refs: dict, config: dict) -> dict:
         mind_vals = mind_state.get("values", [0.5] * 5)
         response["middle_path_loss"] = round(
             middle_path_loss(body_vals, mind_vals, tensor), 4)
-    except Exception:
-        pass
+    except Exception as _swallow_exc:
+        swallow_warn('[modules.spirit_loop] build_trinity_snapshot: from titan_plugin.logic.middle_path import middle_path_loss', _swallow_exc,
+                     key='modules.spirit_loop.build_trinity_snapshot.line1709', throttle=100)
     if filter_down:
         response["filter_down"] = filter_down.get_stats()
     if intuition:
@@ -1672,7 +1791,8 @@ def build_nervous_system_snapshot(state_refs: dict) -> dict | None:
     return None
 
 
-def start_snapshot_builder_threads(state_refs: dict, config: dict) -> None:
+def start_snapshot_builder_threads(state_refs: dict, config: dict,
+                                    send_queue=None, name: str = "spirit") -> None:
     """Launch 3 daemon threads that keep the heavy snapshot caches fresh.
 
     Called once from spirit_worker at boot, right after the query handler
@@ -1684,8 +1804,87 @@ def start_snapshot_builder_threads(state_refs: dict, config: dict) -> None:
     On builder exception: caught, logged rate-limited, cache keeps serving
     the last successful build. On loop exit (should never happen): FATAL
     log so investigators can correlate any stale cache with the crash.
+
+    M1 phase C-E: when send_queue is provided, the coord-snapshot-builder
+    additionally fans out per-domain *_UPDATED events for the
+    api_subprocess BusSubscriber → CachedState pathway (pi_heartbeat,
+    dreaming, meta_reasoning). chi has its own immediate publisher in
+    spirit_worker (Phase B); this path covers domains whose only producer
+    is the periodic snapshot.
     """
     import threading
+
+    def _publish_coord_subdomains(snapshot: dict) -> None:
+        """Fan out per-domain UPDATED events for api cache wiring."""
+        if send_queue is None or not isinstance(snapshot, dict):
+            return
+        from titan_plugin.bus import (
+            PI_HEARTBEAT_UPDATED, DREAMING_STATE_UPDATED,
+            META_REASONING_STATS_UPDATED, REASONING_STATS_UPDATED,
+            EXPRESSION_COMPOSITES_UPDATED, NEUROMOD_STATS_UPDATED,
+            MSL_STATE_UPDATED, LANGUAGE_STATS_UPDATED,
+            TOPOLOGY_STATE_UPDATED,
+        )
+        try:
+            pi = snapshot.get("pi_heartbeat")
+            if pi:
+                _send_msg(send_queue, PI_HEARTBEAT_UPDATED, name, "all", pi)
+            # Dreaming payload composed to match /v4/dreaming response
+            # shape (is_dreaming + dreaming sub-dict + developmental_age
+            # from pi_heartbeat). Frontend useDreaming hook reads these.
+            dreaming = snapshot.get("dreaming") or {}
+            dream_payload = dict(dreaming)
+            dream_payload["is_dreaming"] = snapshot.get("is_dreaming", False)
+            dream_payload["developmental_age"] = (
+                (pi or {}).get("developmental_age", 0))
+            _send_msg(send_queue, DREAMING_STATE_UPDATED, name, "all",
+                      dream_payload)
+            meta = snapshot.get("meta_reasoning")
+            if meta:
+                _send_msg(send_queue, META_REASONING_STATS_UPDATED, name,
+                          "all", meta)
+            # Reasoning engine stats (chains, commits, abandons, commit_rate)
+            # — observed empty on /v4/reasoning until this publish was added
+            # (2026-04-26 sweep). Endpoint reads from reasoning.state cache key.
+            reasoning = snapshot.get("reasoning")
+            if reasoning:
+                _send_msg(send_queue, REASONING_STATS_UPDATED, name, "all",
+                          reasoning)
+            expr = snapshot.get("expression_composites")
+            if expr:
+                _send_msg(send_queue, EXPRESSION_COMPOSITES_UPDATED, name,
+                          "all", expr)
+            nm = snapshot.get("neuromodulators")
+            if nm:
+                _send_msg(send_queue, NEUROMOD_STATS_UPDATED, name, "all", nm)
+            # rFP_observatory_data_loading_v1 Phase 4 — MSL state fan-out.
+            # I-Depth tab consumes msl.state cache key for i_confidence /
+            # i_depth / components / convergence_count / concept_confidences /
+            # attention_weights. Coord snapshot already builds this at
+            # build_coordinator_snapshot:1651 — fan it out here.
+            msl_state = snapshot.get("msl")
+            if msl_state:
+                _send_msg(send_queue, MSL_STATE_UPDATED, name, "all", msl_state)
+            # Language teacher periodic stats — vocab / prod / level / conf
+            # / last_teach_at. Coord snapshot includes stats["language"] when
+            # the worker passes language_stats; fan out so /v4/vocabulary +
+            # related tabs render.
+            lang = snapshot.get("language")
+            if lang:
+                _send_msg(send_queue, LANGUAGE_STATS_UPDATED, name, "all", lang)
+            # Batch E (rFP §3.2 follow-up): topology block — legacy
+            # volume/curvature/cluster_count + 30D space-topology
+            # observables_dict (6 layers × 5 metrics). Frontend
+            # TopologyPanel renders both forms. SpiritAccessor.get_coordinator()
+            # overlay reads topology.state and merges into coord["topology"].
+            topo = snapshot.get("topology")
+            if topo:
+                _send_msg(send_queue, TOPOLOGY_STATE_UPDATED, name, "all", topo)
+        except Exception as pub_err:
+            # Never let a publish glitch break the snapshot builder loop.
+            logger.warning(
+                "[SnapshotBuilder:coord] subdomain publish failed: %s",
+                pub_err)
 
     def _builder_loop(kind: str, build_fn, cache: dict, interval: float):
         consecutive_errors = 0
@@ -1704,10 +1903,15 @@ def start_snapshot_builder_threads(state_refs: dict, config: dict) -> None:
                 except Exception as exc:
                     consecutive_errors += 1
                     if consecutive_errors == 1 or consecutive_errors % 10 == 0:
+                        # Include traceback so the dead-coordinator
+                        # class of bugs (e.g. 2026-04-22 "tuple index
+                        # out of range" that silently starved /v4/inner-
+                        # trinity) diagnoses in one log line next time.
                         logger.warning(
                             "[SnapshotBuilder:%s] build failed "
                             "(#%d consecutive): %s",
-                            kind, consecutive_errors, exc)
+                            kind, consecutive_errors, exc,
+                            exc_info=True)
                 build_ms = (time.time() - _t0) * 1000
                 logger.debug(
                     "[SnapshotBuilder:%s] built in %.0fms",
@@ -1721,10 +1925,16 @@ def start_snapshot_builder_threads(state_refs: dict, config: dict) -> None:
                 "cache will become stale: %s",
                 kind, fatal, exc_info=True)
 
+    def _coord_build_and_publish():
+        snap = build_coordinator_snapshot(state_refs)
+        if snap is not None:
+            _publish_coord_subdomains(snap)
+        return snap
+
     threading.Thread(
         target=_builder_loop,
         args=("coord",
-              lambda: build_coordinator_snapshot(state_refs),
+              _coord_build_and_publish,
               _COORD_SNAPSHOT_CACHE,
               _COORD_SNAPSHOT_BUILDER_INTERVAL),
         daemon=True, name="coord-snapshot-builder",
@@ -1771,7 +1981,7 @@ def _handle_query(msg: dict, config: dict, body_state: dict, mind_state: dict,
                   msl=None, social_pressure_meter=None,
                   language_stats=None, self_reasoning=None,
                   coding_explorer=None,
-                  filter_down_v4=None, filter_down_v5=None,
+                  filter_down_v5=None,
                   med_watchdog=None) -> None:
     """Handle Spirit queries."""
     payload = msg.get("payload", {})
@@ -1851,18 +2061,16 @@ def _handle_query(msg: dict, config: dict, body_state: dict, mind_state: dict,
                 _send_response(send_queue, name, src, {"error": "UnifiedSpirit not available"}, rid)
 
         elif action == "get_filter_down_status":
-            # rFP #2 Phase 7: V4 vs V5 side-by-side for coexistence monitoring
-            _v4_stats = filter_down_v4.get_stats() if filter_down_v4 else None
+            # V4 retired 2026-04-25 (Pattern C surfaced silent dim mismatch
+            # since 130D upgrade). V5 is the sole FILTER_DOWN learner now.
             _v5_stats = filter_down_v5.get_stats() if filter_down_v5 else None
             v5_publishing = bool(
                 (config or {}).get("filter_down_v5", {}).get("publish_enabled", False)
             )
             _send_response(send_queue, name, src, {
-                "v4": _v4_stats,
                 "v5": _v5_stats,
                 "v5_publishing": v5_publishing,
-                "v4_publishing": not v5_publishing and filter_down_v4 is not None,
-                "coexistence_phase": "v5_publisher" if v5_publishing else "v5_silent",
+                "coexistence_phase": "v5_only",
             }, rid)
 
         elif action == "get_meditation_health":
@@ -2148,8 +2356,28 @@ def _handle_query(msg: dict, config: dict, body_state: dict, mind_state: dict,
 
 
 def _publish_spirit_state(send_queue, name: str, tensor: list, consciousness: dict | None,
-                          filter_down=None, body_state=None, mind_state=None) -> None:
-    """Publish SPIRIT_STATE to the bus with Middle Path loss and counterpart stats."""
+                          filter_down=None, body_state=None, mind_state=None,
+                          neural_nervous_system=None, sphere_clock=None,
+                          unified_spirit=None, e_mem=None,
+                          neuromodulator_system=None, expression_manager=None,
+                          resonance=None, meta_sink: dict | None = None) -> None:
+    """Publish SPIRIT_STATE to the bus with Middle Path loss and counterpart stats.
+
+    BUG #11 fix (2026-04-24): neural_nervous_system, sphere_clock, unified_spirit,
+    e_mem added as optional params to populate hormone_levels / hormone_fires /
+    sphere_clocks / unified_spirit_stats / memory_stats into collect_spirit_45d().
+    Pre-fix, 19 of 45 inner_spirit dims were dead because these inputs were
+    passed as None (with TODO comment "Populated when hormonal system wired").
+
+    Microkernel v2 amendment (2026-04-26): payload["v4"] block now carries
+    sphere_clocks / unified_spirit / resonance / neuromodulators /
+    expression_composites / nervous_system summaries. state_register reads
+    these into its in-process slots, which the kernel snapshot publisher
+    forwards to api_subprocess CachedState. This closes the empty-cache
+    class for /v4/sphere-clocks, /v4/neuromodulators, /v4/expression-composites,
+    /v4/nervous-system without adding new bus message types — Phase B/C-safe
+    (same wire shape, transport-agnostic).
+    """
     center = [0.5] * 5
     center_dist = sum((t - c) ** 2 for t, c in zip(tensor, center)) ** 0.5
 
@@ -2163,12 +2391,26 @@ def _publish_spirit_state(send_queue, name: str, tensor: list, consciousness: di
     # Include consciousness summary in broadcast
     if consciousness and consciousness.get("latest_epoch"):
         epoch = consciousness["latest_epoch"]
-        payload["consciousness"] = {
+        cons_payload = {
             "epoch_id": epoch.get("epoch_id", 0),
+            "epoch_number": epoch.get("epoch_id", 0),
             "curvature": epoch.get("curvature", 0),
             "density": epoch.get("density", 0),
             "drift_magnitude": epoch.get("drift_magnitude", 0),
+            "drift": epoch.get("drift_magnitude", 0),
+            "trajectory": epoch.get("trajectory_magnitude", 0),
         }
+        # rFP_observatory_data_loading_v1 §3.2 fix (2026-04-26):
+        # state_vector (130D when available) carries the full Trinity
+        # composition — iB(5)+iM(15)+iS(45)+oB(5)+oM(15)+oS(45)+meta(2).
+        # /v3/trinity uses sv[20:65] for the inner Spirit 45D heatmap and
+        # sv[5:20] for inner Mind 15D. Pre-fix: this payload stripped sv,
+        # so the heatmap fell back to "awaiting full tensor" forever.
+        # ~528 bytes per epoch tick — negligible bus traffic.
+        sv = epoch.get("state_vector")
+        if isinstance(sv, list) and sv:
+            cons_payload["state_vector"] = list(sv)
+        payload["consciousness"] = cons_payload
 
     # Include Middle Path loss
     if body_state and mind_state:
@@ -2178,8 +2420,9 @@ def _publish_spirit_state(send_queue, name: str, tensor: list, consciousness: di
             mind_vals = mind_state.get("values", [0.5] * 5)
             payload["middle_path_loss"] = round(
                 middle_path_loss(body_vals, mind_vals, tensor), 4)
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn('[modules.spirit_loop] _publish_spirit_state: from titan_plugin.logic.middle_path import middle_path_loss', _swallow_exc,
+                         key='modules.spirit_loop._publish_spirit_state.line2266', throttle=100)
 
     # Include FILTER_DOWN summary
     if filter_down:
@@ -2190,16 +2433,113 @@ def _publish_spirit_state(send_queue, name: str, tensor: list, consciousness: di
                 "last_loss": stats["last_loss"],
                 "buffer_size": stats["buffer_size"],
             }
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn('[modules.spirit_loop] _publish_spirit_state: stats = filter_down.get_stats()', _swallow_exc,
+                         key='modules.spirit_loop._publish_spirit_state.line2278', throttle=100)
 
     # DQ3: Extended 45D Spirit tensor (Sat + Chit + Ananda)
+    # BUG #11 fix (2026-04-24): populate hormone_levels / hormone_fires /
+    # sphere_clocks / unified_spirit_stats / memory_stats. Pre-fix, 19 of 45
+    # inner_spirit dims were dead because these inputs were None.
     try:
         from titan_plugin.logic.spirit_tensor import collect_spirit_45d
         body_vals = body_state.get("values", [0.5] * 5) if body_state else [0.5] * 5
         mind_vals = mind_state.get("values", [0.5] * 5) if mind_state else [0.5] * 5
-        # Extend mind to 15D if available
         mind_15d = mind_state.get("values_15d", mind_vals) if mind_state else mind_vals
+
+        # ── BUG #11 input gathering — defensive: every source may be None
+        # 2026-04-24 follow-up: removed `_hormonal_enabled` gate since it
+        # was causing silent skip (live observation showed dead dims still
+        # at 0 on all 3 Titans post-first-fix). Just try get_levels()
+        # directly — if _hormonal exists with the method, use it.
+        _hlvl = None
+        _hfires = None
+        if neural_nervous_system is not None:
+            _horm = getattr(neural_nervous_system, "_hormonal", None)
+            if _horm is not None:
+                try:
+                    _hlvl = _horm.get_levels() if hasattr(_horm, "get_levels") else None
+                except Exception:
+                    _hlvl = None
+                try:
+                    _hfires = {
+                        n: int(getattr(h, "fire_count", 0))
+                        for n, h in getattr(_horm, "_hormones", {}).items()
+                    }
+                except Exception:
+                    _hfires = None
+                # Once-per-worker-boot debug confirmation (throttled to first 5 calls
+                # via module-level counter). Lets us verify the fix path activates.
+                global _BUG11_BOOT_CONFIRMED_COUNT
+                try:
+                    _BUG11_BOOT_CONFIRMED_COUNT
+                except NameError:
+                    _BUG11_BOOT_CONFIRMED_COUNT = 0
+                if _BUG11_BOOT_CONFIRMED_COUNT < 5 and (_hlvl or _hfires):
+                    _BUG11_BOOT_CONFIRMED_COUNT += 1
+                    logger.info(
+                        "[SpiritWorker] BUG #11 fix active — "
+                        "hormone_levels=%s, hormone_fires=%s (call #%d of first-5)",
+                        "populated" if _hlvl else "None",
+                        "populated" if _hfires else "None",
+                        _BUG11_BOOT_CONFIRMED_COUNT)
+
+        _clocks = None
+        if sphere_clock is not None:
+            try:
+                _clocks_src = getattr(sphere_clock, "clocks", None) or \
+                              getattr(sphere_clock, "_clocks", None) or {}
+                # SphereClock attribute is `phase` (∈ [0, 2π], advanced in
+                # tick() at sphere_clock.py:121). The legacy `current_phase`
+                # name was never on the class — getattr fell back to 0.5
+                # default forever, so all 6 UI bars showed 0.50. Fixed
+                # 2026-04-26 per rFP_observatory_data_loading_v1 §3.2.
+                #
+                # Batch F (2026-04-26): include `radius` + `consecutive_balanced`
+                # — frontend SphereClocks reads radius.toFixed(2) (defaults to 0.5
+                # when missing) and consecutive_balanced for the resonance bar.
+                # Without them all 6 clocks displayed "0.50" in the UI.
+                _clocks = {
+                    cname: {
+                        "pulse_count": int(getattr(c, "pulse_count", 0)),
+                        "phase": float(getattr(c, "phase", 0.0)),
+                        "scalar_position": float(getattr(c, "scalar_position", 1.0)),
+                        "contraction_velocity": float(getattr(c, "contraction_velocity", 0.0)),
+                        "radius": float(getattr(c, "radius", 1.0)),
+                        "consecutive_balanced": int(getattr(c, "_consecutive_balanced", 0)),
+                        "total_ticks": int(getattr(c, "_total_ticks", 0)),
+                    }
+                    for cname, c in _clocks_src.items()
+                }
+            except Exception:
+                _clocks = None
+
+        _us = None
+        if unified_spirit is not None:
+            try:
+                _us = unified_spirit.get_stats() if hasattr(unified_spirit, "get_stats") else None
+            except Exception:
+                _us = None
+
+        _mem = None
+        if e_mem is not None:
+            try:
+                _mem = e_mem.get_stats() if hasattr(e_mem, "get_stats") else None
+            except Exception:
+                _mem = None
+
+        # Composite-level expression activity for spirit_tensor's chit[13]
+        # (causal_understanding) + ananda[8] (expression_quality). The
+        # ExpressionTranslator's `sovereignty_ratio` lives only in the main
+        # plugin process — see spirit_tensor._expression_intensity for the
+        # composite-side proxy that activates when only this dict is available.
+        _expr_stats = None
+        if expression_manager is not None:
+            try:
+                _expr_stats = expression_manager.get_stats() if hasattr(
+                    expression_manager, "get_stats") else None
+            except Exception:
+                _expr_stats = None
 
         spirit_45d = collect_spirit_45d(
             current_5d=tensor,
@@ -2207,17 +2547,85 @@ def _publish_spirit_state(send_queue, name: str, tensor: list, consciousness: di
             mind_tensor=mind_15d,
             consciousness=consciousness.get("latest_epoch") if consciousness else None,
             topology=body_state.get("topology") if body_state else None,
-            hormone_levels=None,  # Populated when hormonal system wired
-            hormone_fires=None,
-            unified_spirit_stats=None,
-            sphere_clocks=None,
+            hormone_levels=_hlvl,
+            hormone_fires=_hfires,
+            unified_spirit_stats=_us,
+            sphere_clocks=_clocks,
+            memory_stats=_mem,
+            expression_stats=_expr_stats,
         )
         payload["values_45d"] = [round(v, 4) for v in spirit_45d]
         payload["dims_extended"] = 45
+        # BUG-EMOT-CGN-FELT-FROM-CONSCIOUSNESS-SPARSE fix (2026-04-26):
+        # stash the freshly-computed spirit_45d into the optional meta_sink
+        # dict so the META → EMOT-CGN bridge in spirit_worker can assemble a
+        # live full-130D felt tensor (instead of the sparse consciousness
+        # state_vector which only populates slots 0-6 + tail).
+        if isinstance(meta_sink, dict):
+            meta_sink["_last_spirit_45d"] = list(spirit_45d)
+    except Exception as _swallow_exc:
+        swallow_warn('[modules.spirit_loop] _publish_spirit_state: from titan_plugin.logic.spirit_tensor import collect_spir...', _swallow_exc,
+                     key='modules.spirit_loop._publish_spirit_state.line2371', throttle=100)
+
+    # ── v4 block — microkernel v2 amendment 2026-04-26 ──
+    # Carries the spirit_worker-owned aggregates that state_register's
+    # SPIRIT_STATE handler extracts. Each field guarded by isinstance to
+    # survive partial-init states (early boot, post-reload).
+    v4_block: dict = {}
+    try:
+        if _clocks:
+            v4_block["sphere_clocks"] = _clocks
+        if _us:
+            v4_block["unified_spirit"] = _us
+        if resonance is not None:
+            try:
+                rstats = resonance.get_stats() if hasattr(resonance, "get_stats") else None
+                if isinstance(rstats, dict):
+                    v4_block["resonance"] = rstats
+            except Exception:
+                pass
+        if neuromodulator_system is not None:
+            try:
+                nstate = neuromodulator_system.get_state() if hasattr(
+                    neuromodulator_system, "get_state") else None
+                if isinstance(nstate, dict):
+                    v4_block["neuromodulators"] = nstate
+            except Exception:
+                pass
+        if expression_manager is not None:
+            try:
+                # ExpressionManager carries per-composite urge / threshold /
+                # fire_count / consumption_rate. Survives spirit_worker
+                # restart (state managed by manager itself).
+                ecomps = {}
+                for c_name, comp in getattr(
+                        expression_manager, "_composites",
+                        getattr(expression_manager, "composites", {}) or {}).items():
+                    ecomps[c_name] = {
+                        "urge": float(getattr(comp, "urge", 0.0) or 0.0),
+                        "threshold": float(getattr(comp, "threshold", 0.0) or 0.0),
+                        "fire_count": int(getattr(comp, "fire_count", 0) or 0),
+                        "consumption_rate": float(
+                            getattr(comp, "consumption_rate", 0.0) or 0.0),
+                    }
+                if ecomps:
+                    v4_block["expression_composites"] = ecomps
+            except Exception:
+                pass
+        if neural_nervous_system is not None:
+            try:
+                nnstats = neural_nervous_system.get_stats() if hasattr(
+                    neural_nervous_system, "get_stats") else None
+                if isinstance(nnstats, dict):
+                    v4_block["neural_nervous_system"] = nnstats
+            except Exception:
+                pass
     except Exception:
         pass
+    if v4_block:
+        payload["v4"] = v4_block
 
-    _send_msg(send_queue, "SPIRIT_STATE", name, "all", payload)
+    _send_msg(send_queue, bus.SPIRIT_STATE, name, "all", payload)
 
 
 def _send_msg(send_queue, msg_type: str, src: str, dst: str, payload: dict, rid: str = None) -> None:
@@ -2231,7 +2639,7 @@ def _send_msg(send_queue, msg_type: str, src: str, dst: str, payload: dict, rid:
 
 
 def _send_response(send_queue, src: str, dst: str, payload: dict, rid: str) -> None:
-    _send_msg(send_queue, "RESPONSE", src, dst, payload, rid)
+    _send_msg(send_queue, bus.RESPONSE, src, dst, payload, rid)
 
 
 # Heartbeat throttle (Phase E Fix 2): 3s minimum interval per process.
@@ -2252,7 +2660,7 @@ def _send_heartbeat(send_queue, name: str) -> None:
         rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
     except Exception:
         rss_mb = 0
-    _send_msg(send_queue, "MODULE_HEARTBEAT", name, "guardian", {"rss_mb": round(rss_mb, 1)})
+    _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", {"rss_mb": round(rss_mb, 1)})
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2301,8 +2709,9 @@ def _save_bridge_dedup(dedup: dict):
     try:
         with open(_BRIDGE_DEDUP_PATH, "w") as f:
             _dj.dump(dedup, f)
-    except Exception:
-        pass
+    except Exception as _swallow_exc:
+        swallow_warn("[modules.spirit_loop] _save_bridge_dedup: with open(_BRIDGE_DEDUP_PATH, 'w') as f: _dj.dump(dedup, f)", _swallow_exc,
+                     key='modules.spirit_loop._save_bridge_dedup.line2458', throttle=100)
 
 
 def _build_self_profile(
@@ -2467,7 +2876,8 @@ def _harvest_dream_memories(
                     "category": "wisdom",
                 })
         except Exception as e:
-            logger.debug("[DreamBridge] Meta-wisdom harvest failed: %s", e)
+            swallow_warn('[DreamBridge] Meta-wisdom harvest failed', e,
+                         key="modules.spirit_loop.meta_wisdom_harvest_failed", throttle=100)
 
     # 2. High-scoring unconsolidated reasoning chains (max 2)
     if chain_archive:
@@ -2490,7 +2900,8 @@ def _harvest_dream_memories(
                     "category": "eureka",
                 })
         except Exception as e:
-            logger.debug("[DreamBridge] Chain harvest failed: %s", e)
+            swallow_warn('[DreamBridge] Chain harvest failed', e,
+                         key="modules.spirit_loop.chain_harvest_failed", throttle=100)
 
     # 3. CGN grounding milestones (max 2)
     try:
@@ -2518,7 +2929,8 @@ def _harvest_dream_memories(
                 "category": "cgn_milestone",
             })
     except Exception as e:
-        logger.debug("[DreamBridge] CGN milestone harvest failed: %s", e)
+        swallow_warn('[DreamBridge] CGN milestone harvest failed', e,
+                     key="modules.spirit_loop.cgn_milestone_harvest_failed", throttle=100)
 
     # 4. High-quality compositions (max 1)
     try:
@@ -2540,7 +2952,8 @@ def _harvest_dream_memories(
                 "category": "composition",
             })
     except Exception as e:
-        logger.debug("[DreamBridge] Composition harvest failed: %s", e)
+        swallow_warn('[DreamBridge] Composition harvest failed', e,
+                     key="modules.spirit_loop.composition_harvest_failed", throttle=100)
 
     # 5. P4: Recent significant social interactions (max 2)
     try:
@@ -2576,7 +2989,8 @@ def _harvest_dream_memories(
                 })
                 _soc_count += 1
     except Exception as e:
-        logger.debug("[DreamBridge] Social interaction harvest failed: %s", e)
+        swallow_warn('[DreamBridge] Social interaction harvest failed', e,
+                     key="modules.spirit_loop.social_interaction_harvest_failed", throttle=100)
 
     # Cap total + save dedup state
     memories = memories[:max_total]

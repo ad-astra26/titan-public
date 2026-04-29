@@ -16,6 +16,27 @@
 # ═══════════════════════════════════════════════════════════════════
 
 
+# ─── RUNTIME POOLS (asyncio thread executors) ─────────────────────
+# 2026-04-29 RCA: T1 default asyncio pool hit 250% saturation (64 busy
+# + 192 queued) under Observatory poll bursts. Bus IPC reply waits got
+# queued behind heavy snapshot work, exceeding the 3s timeout and
+# cascading into BUG-DIVINEBUS-SPIRIT-PROXY-TIMEOUTS +
+# BUG-DASHBOARD-BUS-ATTR-ERRORS + Observatory data-loading issues.
+#
+# Architectural invariant: bus IPC is LATENCY-SENSITIVE; isolate from
+# default pool so Observatory bursts can't starve it.
+[runtime.pools]
+# bus_ipc — dedicated pool for `bus.request_async()` reply waits.
+# Saturation of THIS pool is a CRITICAL alert (real bus contention).
+# Sized small so that hitting the cap is a meaningful signal, not noise.
+bus_ipc_workers = 8
+
+# default asyncio executor size — bumped from asyncio default ~36 to 64
+# in scripts/titan_main.py:197 for ~151 to_thread sites under
+# Observatory load.
+default_workers = 64
+
+
 # ─── CONSCIOUSNESS (Spirit's self-awareness cycle) ────────────────
 # These control how often and how deeply Titan reflects on himself.
 # Key ratio: consciousness_tick / sphere_clock_tick = reflection-to-pulse ratio
@@ -659,6 +680,47 @@ min_reward_threshold = 0.01
 # to 0.3-0.5 to reduce valence sensitivity if desired post-soak.
 reward_blend_weight = 1.0
 
+# ── Per-program v2 config (rFP_titan_vm_v2 Phase 2) ─────────────────
+# Every program supports v2_enabled=false → v1 bytecode (legacy); v2
+# unlocks smooth-threshold + rich-observable variants. Flips are
+# per-program and can be done live without code edits. Leave false
+# until Phase 2 soak opens; then flip one program at a time on Maker
+# greenlight. See titan-docs/rFP_titan_vm_v2.md §4 for per-program
+# observable design rationale. All threshold/weight keys have safe
+# defaults baked into the factory — TOML overrides only when set.
+[titan_vm.programs.reflex]
+v2_enabled = true    # Canary batch 5 — 2026-04-23 06:55 UTC (motor pair with IMPULSE)
+
+[titan_vm.programs.focus]
+v2_enabled = true    # Canary batch 4 — 2026-04-23 05:55 UTC (with VIGILANCE)
+
+[titan_vm.programs.intuition]
+v2_enabled = true    # Canary batch 3 — 2026-04-22 22:03 UTC (with EMPATHY + INSPIRATION)
+
+[titan_vm.programs.impulse]
+v2_enabled = true    # Canary batch 5 — 2026-04-23 06:55 UTC (motor pair with REFLEX)
+
+[titan_vm.programs.inspiration]
+v2_enabled = true    # Canary batch 3 — 2026-04-22 22:03 UTC (with EMPATHY + INTUITION)
+
+[titan_vm.programs.metabolism]
+v2_enabled = true    # Canary batch 6 SOLO — 2026-04-23 07:07 UTC (final Phase 2 program; mainnet-SOL observable)
+
+[titan_vm.programs.creativity]
+v2_enabled = true    # Canary batch 2 — 2026-04-22 21:21 UTC (with REFLECTION)
+
+[titan_vm.programs.curiosity]
+v2_enabled = true    # Canary flip 2026-04-22 20:43 UTC — first Phase 2 v2 program on all 3 Titans
+
+[titan_vm.programs.empathy]
+v2_enabled = true    # Canary batch 3 — 2026-04-22 22:03 UTC (with INSPIRATION + INTUITION)
+
+[titan_vm.programs.reflection]
+v2_enabled = true    # Canary batch 2 — 2026-04-22 21:21 UTC (with CREATIVITY)
+
+[titan_vm.programs.vigilance]
+v2_enabled = true    # Canary batch 4 — 2026-04-23 05:55 UTC (with FOCUS)
+
 # ═══════════════════════════════════════════════════════════════════
 # V5 NEURAL NERVOUS SYSTEM — Learned Reflexes
 # ═══════════════════════════════════════════════════════════════════
@@ -701,6 +763,32 @@ maturity_consciousness_epochs_target = 5000  # Self-reflection depth
 maturity_total_fires_target = 500      # Lived hormone experience
 maturity_infant_cap = 2.0              # Excitation cap at maturity=0 (×threshold)
 maturity_mature_cap = 5.0              # Excitation cap at maturity=1 (×threshold)
+
+# ── rFP_titan_vm_v2 Phase 3 §3.11 — cross-program coupling ──────────
+# When enabled, co-firing biological pairs nudge each other's warmup
+# target by coupling_strength × partner_score (scaled by sup_weight so
+# coupling decays with warmup exit). 0 effect post-warmup. Six pairs
+# are hardcoded at class-init (EMPATHY↔REFLECTION, CURIOSITY↔INSPIRATION,
+# CREATIVITY↔INSPIRATION, FOCUS↔INTUITION, METABOLISM↔VIGILANCE,
+# IMPULSE↔REFLEX) but can be overridden with `pairs` array.
+# Default false — flip after Phase 2 consolidation soak passes, and
+# only on explicit Maker greenlight (Phase 3 = CRITICAL gate; NN
+# weights persist across restart, so a bad coupling weight bakes
+# supervision corruption into the learned model with no clean rollback).
+[neural_nervous_system.coupling]
+enabled = false
+strength = 0.1
+fire_threshold = 0.3
+
+# ── rFP_titan_vm_v2 Phase 3 §3.12 — eligibility traces ──────────────
+# Toggles the Stage-0.5 empirical eligibility windows (K, decay) from
+# data/neural_nervous_system/eligibility_params.json applied in
+# NeuralNervousSystem.record_outcome(). Already running in production
+# via rFP β Stage 2; the flag surface was added in Phase 3 so it can
+# be toggled atomically with coupling. Default true preserves current
+# behavior.
+[neural_nervous_system.eligibility]
+enabled = true
 
 # ─── INNER (AUTONOMIC) PROGRAMS ─────────────────────────────────
 # These run continuously in the subconscious. They generate signals
@@ -1396,6 +1484,34 @@ max_hypotheses = 20
 test_probability = 0.25
 confirmation_boost = 0.15
 falsification_decay = 0.60
+
+# H.4 Phase 1 (v1) — causal hypothesis generator (DESIGN-LOCKED 2026-04-28 PM).
+# Per-consumer pattern miner that watches CGN transitions and proposes causal
+# hypotheses ("if action X is taken, effect Y follows") into the existing HAOV
+# machinery.  Flag-default-false until the v1 OBS gate green-lights flip.
+# See: titan-docs/rFP_cgn_consolidated.md §2.9
+[cgn.causal_generator]
+enabled = false                       # flag-default-false (v1)
+window_size = 30                      # rolling transitions per consumer
+min_n = 5                             # promotion threshold
+magnitude_threshold = 0.05            # below this = noise, no candidate formed
+anti_pattern_enabled = true           # enable "negative effect" hypotheses
+staleness_decay_per_tick = 0.999      # multiplicative decay per cgn_worker tick
+
+[cgn.causal_generator.per_consumer]
+# Per-consumer overrides — language has dense transitions, social is sparse +
+# noisy, coding is rare but high-signal, emotional is very dense.  Tune from
+# 24h soak data once v1 flag is flipped.
+language = { min_n = 5, window_size = 30 }
+social = { min_n = 3, window_size = 20 }
+coding = { min_n = 4, window_size = 15 }
+emotional = { min_n = 6, window_size = 40 }
+knowledge = { min_n = 5, window_size = 30 }
+dreaming = { min_n = 3, window_size = 15 }
+reasoning = { min_n = 5, window_size = 30 }
+reasoning_strategy = { min_n = 5, window_size = 30 }
+self_model = { min_n = 4, window_size = 20 }
+meta = { min_n = 5, window_size = 30 }
 
 [cgn.coding]
 # Coding consumer — self-directed cognitive development via sandbox execution
@@ -2146,6 +2262,15 @@ backup_retention_hours = 24           # Keep full TX data locally for N hours
 #   [metabolism.features.CONSERVING]
 #   social = true         # keep social active even when conserving
 
+[metabolism]
+# Kill-switch for Mainnet Lifecycle Wiring (rFP 2026-04-20). When false,
+# gate call sites compute the decision and LOG it (observability-only);
+# services proceed unchanged. When true, gate decisions are ENFORCED —
+# services stop / throttle at low SOL tiers per TIER_FEATURES table.
+# Rollout plan: flip true on T3 → T2 → T1 (mainnet) after 30-min focused
+# observation each. Rollback = set back to false + restart.
+gates_enforced = false
+
 [metabolism.tiers.THRIVING]
 min_sol = 1.0
 chi_factor = 1.0
@@ -2219,24 +2344,56 @@ rollback_min_std_floor = 0.05
 # rFP §6 — emotions carry deeper philosophical stakes.
 
 [emot_cgn]
-# Graduation thresholds (~2× META-CGN)
-graduation_min_updates = 4000                   # was 2000 for META-CGN
-graduation_min_confirmed_hypotheses = 4         # out of 8 seeded (50%)
-graduation_min_mature_primitives = 6            # out of 8 total
-graduation_min_samples_per_primitive = 100
-graduation_min_confidence = 0.7
+# Graduation thresholds (retuned 2026-04-24 — see rationale below)
+graduation_min_updates = 4000                   # was 2000 for META-CGN — keep
+graduation_min_confirmed_hypotheses = 4         # out of 8 seeded (50%) — keep (already pass)
+graduation_min_mature_primitives = 4            # was 6 (75%) — dropped to 4 (50%) 2026-04-24:
+                                                # `mature = (n_samples>=100 AND confidence>=0.7)`. With 0.7 confidence
+                                                # threshold, only the monoculture-dominant primitive reaches maturity
+                                                # (confidence-as-margin metric architecturally favors dominance).
+                                                # 50% threshold matches confirmed_hypotheses pattern.
+graduation_min_samples_per_primitive = 100      # keep — below 100 stats aren't reliable
+graduation_min_confidence = 0.5                 # was 0.7 2026-04-24 — the previous threshold
+                                                # was reachable only by monoculture-dominant primitive. 0.5 captures
+                                                # "primitive I can consistently identify from its cluster margin"
+                                                # without requiring dominance — allows multiple primitives to mature.
 # Cross-primitive contrast gate: at least 2 primitives with V differing
 # by ≥ this amount (prevents graduation when clusters haven't differentiated)
-graduation_contrast_v_gap = 0.15
-# 14-day observation window (real-time) prevents rushing via synthetic training
-graduation_observation_window_s = 1209600       # 14 days
+graduation_contrast_v_gap = 0.15                # keep (already pass on all 3 Titans)
+# Observation window — production-grade real-time sample collection
+graduation_observation_window_s = 604800        # was 1209600 (14d) 2026-04-24 — dropped to 7d:
+                                                # original 14d comment said "prevents rushing via synthetic training";
+                                                # no synthetic training in production, just calendar delay. 7 days
+                                                # captures full weekly emotional cycle in real-world operation.
 
 # Rollback (Option B scale-invariant pattern, inherited from META-CGN 2026-04-19)
 rollback_reward_sigma_k = 2.0
 rollback_min_std_floor = 0.05
 
-# K-means re-cluster cadence (default weekly during dream cycles)
-cluster_recenter_interval_s = 604800            # 7 days
+# F-phase EmotMeta routine pulse — fires every N seconds regardless of
+# cluster ambiguity. Closes EmotMeta silence found in OBS-meta-service-
+# session2-soak. Maker decision 2026-04-28: 120s cadence (max acceptable
+# revaluate frequency for emotional state). Per-consumer rpm budget
+# = 60/120 = 0.5/min, well under the 10/min meta_service_interface cap.
+emot_meta_pulse_interval_s = 120.0
+
+# Prior comment (2026-04-23 Q3) called the 8-primitive k-means layer
+# "transitional pending replacement by emotional body rFP". Superseded
+# 2026-04-24: emotional body rFP is weeks-to-months from implementation;
+# EMOT-CGN v2 is Titan's active emotional system NOW and for the
+# foreseeable future. Legacy-primitive tuning is legitimate quality
+# work, not discouraged investment.
+#
+# BUG #10 fix context (2026-04-24): maybe_recenter() invocation wire was
+# dead post-Phase-1.6h cutover. Fixed in emot_cgn_worker main loop. With
+# the wire restored, the interval below is the REAL throttle — 7 days
+# was set when recenter was (thought to be) firing weekly as a safety;
+# now we know it had never fired at all. Dropped to 1 day for daily
+# centroid drift toward actual observation distribution. Active fix to
+# the RNG-lottery-locks-WONDER-monoculture + T1-LOVE-cold problem.
+
+# K-means re-cluster cadence — DAILY (was 7d pre-2026-04-24)
+cluster_recenter_interval_s = 86400             # 1 day (was 604800 = 7 days)
 
 # Persistence cadence — save primitive_grounding.json every N chains.
 # Lower = more granular observability during soak tests; higher = less I/O.
@@ -2281,11 +2438,42 @@ base_url = "http://10.135.0.6:7778"
 # CLI: python scripts/arch_map.py profile [--all] [--diff] [--cpu]
 
 [profiling]
-tracemalloc_enabled = false    # DISABLED 2026-04-18: parent CPU 76% with it on. Re-enable for spot profiling only.
-tracemalloc_nframes = 1        # 1=file+line, higher=full traceback (more overhead)
+# tracemalloc DISABLED 2026-04-18: parent CPU 76% with nframes=1.
+# Re-enable attempt 2026-04-27 with nframes=5 was abandoned — boot times
+# went from ~30s to 4-5 min, and /v4/admin/heap-dump endpoint timed out
+# because parent process was too busy tracking allocations to respond
+# to RPC. At our scale (millions of tracked allocations), tracemalloc
+# overhead is non-viable for production. Stay disabled. Future leak
+# investigation should use:
+#   1. /v4/admin/heap-dump (gc.get_objects, ~17MB Python heap visibility)
+#   2. /v4/admin/memory-profile (per-module RSS, cheap, always available)
+#   3. Targeted code review of high-allocation paths (sage, meta, bus)
+#   4. Lighter alternatives: pympler, py-spy attach, /proc smaps analysis
+tracemalloc_enabled = false    # too costly at our scale — see comment above
+tracemalloc_nframes = 1        # if re-enabled, start with 1 (5 is non-viable)
 default_top_n = 25             # default top-N allocations in API response
 snapshot_cache_ttl_s = 30.0    # cache tracemalloc snapshots to prevent storm
 cpu_sample_duration_s = 1.0    # seconds to sample for CPU% measurement
+
+# ── SAGE RECORDER (research replay buffer) ────────────────────────
+# SageRecorder maintains a torchrl ReplayBuffer for stealth-research
+# transitions. The buffer is pre-allocated at boot — every record slot
+# reserves observation/action/trauma tensors as memory-mapped files.
+#
+# 2026-04-27 ARCHITECTURAL audit: previous default 1_000_000 records
+# pre-allocated 2GB on disk + ~500MB Python heap (RssAnon) on T1, but
+# the buffer held 1671 records (0.17% utilization). Lowered default to
+# 50_000 — 30× headroom over current usage and ~95% smaller working set.
+# On boot SageRecorder auto-migrates oversized on-disk buffers down to
+# this capacity, preserving recorded transitions.
+#
+# Closes BUG-SAGE-INSTANTIATED-IN-PARENT (partial — addresses the
+# over-allocation; does not yet move SageRecorder to its own subprocess).
+
+[sage_memory]
+buffer_size = 50000            # was 1_000_000 default; 30× headroom over T1's current 1671 records
+embedding_dim = 3072           # OpenAI/nomic embedding width before projection to 128
+storage_path = "./data/sage_memory/"
 
 # ── KNOWLEDGE PIPELINE v2 (rFP_knowledge_pipeline_v2.md) ──────────
 # Router + cache + health live at data/search_cache.db +
@@ -2424,3 +2612,451 @@ self_model = "spirit"
 emotional = "emot_cgn"     # emot_cgn worker (post standalone ship)
 dreaming = "spirit"
 reflection = "spirit"
+
+# ──────────────────────────────────────────────────────────────────────
+# Meta-Reasoning Teacher (rFP_titan_meta_reasoning_teacher.md)
+# Philosopher-critic LLM observer for meta-reasoning chains.
+# Uses same Ollama Cloud light-tier model as Language Teacher (gemma4:31b).
+# ──────────────────────────────────────────────────────────────────────
+[meta_teacher]
+# ACTIVE on T1 since 2026-04-23 19:34 UTC (rFP §11 step 2-3).
+# Prompt v2 shipped 2026-04-24 addressing v1 diversity failure observed in
+# T1 soak data (suggested_primitives was ~constant across 31 critiques in
+# 10h; v2 constrains to MISSING-primitives-only). Maker explicitly
+# greenlit T2/T3 activation alongside v2 — teacher ships enabled on all 3.
+# OBS-meta-teacher-boot-soak reset to +72h on v2 deploy.
+enabled = true                            # All 3 Titans enabled on v2 deploy 2026-04-24
+sample_mode = "uncertainty_plus_random"   # "uncertainty_only" | "random_only" | "uncertainty_plus_random"
+uncertainty_threshold = 0.4               # critique chains with chain_iql_confidence < this
+random_sample_rate = 0.15                 # 15% of chains randomly regardless of uncertainty
+max_critiques_per_hour = 30               # hard rate cap (~1 every 2 min)
+domain_balance_floor = 0.05               # each domain ≥5% of critiques/hr
+reward_weight = 0.05                      # IQL reward blend α — starts low, schedules up (§5.1)
+reward_weight_cap = 0.30                  # hard cap in code — never above
+grounding_weight = 0.15                   # β-posterior nudge magnitude (mirrors cross_insight)
+ramp_phase1_critiques = 1000              # after N critiques, ramp reward_weight phase 1 → 0.15
+ramp_phase2_critiques = 1500              # after N critiques, stable at 0.15
+llm_timeout_s = 30.0                      # per-critique LLM call timeout
+critique_log_retention_days = 7           # critiques.jsonl rolling retention
+task_key = "meta_teacher"                 # Ollama Cloud task key → gemma4:31b (light tier)
+
+# ── rFP_meta_teacher_v2 Phase A (2026-04-24) — Content Awareness ──
+# Surfaces outer_context (composed by rFP_titan_meta_outer_layer) to the
+# teacher so critiques can see WHAT each primitive was reasoning about, not
+# just WHICH primitives ran. Ships on-by-default with no prompt-version bump
+# (payload enrichment only); graceful fallback when outer-layer is off or
+# chain had no entity_refs.
+content_awareness_enabled = true          # gate for outer_summary/step_arguments injection
+outer_summary_max_tokens = 300            # budget cap for distilled outer context
+step_arguments_max_tokens = 80            # budget cap for per-step arg summary
+
+# ── rFP_meta_teacher_v2 Phase B (2026-04-24) — Teaching Memory ──
+# Two-tier memory — hot deque of recent critiques with embedding index +
+# cold-tier per-topic_key journal. Hybrid similarity×importance retrieval
+# surfaces prior critiques in the teacher's user prompt so it can notice
+# patterns across sessions ("same topic stuck 5x").
+#
+# Default OFF originally: shipped dark, Maker-flipped per-Titan when ready.
+# Bumping SYSTEM_PROMPT_VERSION 2→3 resets OBS-meta-teacher-diversity-v2 —
+# the new "Similar past critiques" prompt section changes teacher
+# semantics, and v2/v3 EMAs are incomparable (adoption_metrics version-
+# stamped).
+#
+# 2026-04-24 ~13:15 UTC: flipped TRUE on all 3 Titans per Maker greenlight.
+# Test suite (29 memory + 5 worker integration) validated the path; every
+# memory helper is try/excepted at worker level so a memory bug can't
+# block IQL. Sentence-transformer model lazy-loads on first embed call
+# (~3-5s, one-time). Flip back to false is instant if anything looks off.
+teaching_memory_enabled = true            # active on all 3 Titans 2026-04-24
+memory_buffer_hot_size = 1000             # in-memory deque per Titan
+cold_tier_archival_days = 90              # topics inactive ≥ N days → compressed archive
+retrieval_top_k = 3                       # max hot-tier hits surfaced to prompt
+retrieval_similarity_threshold = 0.6      # cosine floor for hot-tier inclusion
+still_needs_push_critique_threshold = 3   # critiques/topic before still_needs_push fires
+still_needs_push_quality_delta_epsilon = 0.05  # quality_delta ≤ this + ≥N critiques → stuck
+still_needs_push_info_cadence_seconds = 86400  # 24h throttle on Maker INFO emits
+
+# ── rFP_meta_teacher_v2 Phase C (2026-04-25) — Autonomous Voice-Tuning ──
+# Periodic self-assessment LLM call evaluates recent adoption + quality delta
+# patterns and proposes ONE small adjustment to per-domain biases / style
+# hints / topic suppressions. Updates pass through a hard-coded principles
+# window (six teacher values from SYSTEM_PROMPT) — any inversion auto-rejects.
+# Applied + rejected updates land in tamper-evident voice_journal.jsonl
+# (sha256-hashed before/after states) so Maker can audit + revert via
+# POST /v4/meta-teacher/voice/revert?to_timestamp=<ISO8601>.
+#
+# Default OFF — ships dark, Maker flips per-Titan after Phase B 72h gate
+# clears (OBS-meta-teacher-phase-c-voice-tuning-safety opens at flip).
+voice_tuning_enabled = false              # hard gate; default OFF for ship-dark
+voice_eval_interval_critiques = 50        # run self-assess every N critiques
+min_critiques_between_voice_changes = 100 # rate limit; per-Titan override OK
+voice_change_info_cadence_seconds = 86400 # 24h Maker INFO throttle on apply
+
+# ── rFP_meta_teacher_v2 Phase D.1 (2026-04-25) — Cross-Titan Teaching Exchange ──
+# Teachers consult each other on stuck topics — stats-only, no stylistic
+# prescription. Outbound queries pipe through OVG (envelope validation +
+# rate limit + redaction). Inbound responses pipe through Guardian (whitelist
+# match + size budget + content sanity). HTTP transport between Titans
+# (DivineBus is in-process only); intra-Titan bus messages
+# META_TEACHER_PEER_QUERY / _RESPONSE land for observability + telemetry
+# only. Trigger: still_needs_push fires + last peer query for similar
+# topic > 24h ago.
+#
+# Default OFF — ships dark, Maker flips per-Titan after Phase C stable.
+peer_exchange_enabled = false             # hard gate; default OFF for ship-dark
+peer_query_rate_limit_per_hour = 10       # per-Titan outbound cap
+peer_query_min_still_needs_push_count = 3 # min critiques on a topic before peer query
+peer_query_topic_cooldown_seconds = 86400 # 24h per-topic cooldown
+peer_query_http_timeout_seconds = 10.0    # outbound HTTP timeout
+peer_query_log_retention_days = 30        # peer_query_log.jsonl rolling window
+
+# ── rFP_meta_teacher_v2 Phase D.2 (2026-04-25) — IQL-Learned Peer-Query Policy ──
+# Per-domain learned policy that gates whether a peer query fires. Two flags
+# split observation from learning so Phase D.1 soak collects feature data
+# safely:
+#
+#   peer_query_feature_logging   (default true) — every peer query gets
+#       logged to peer_query_log.jsonl + a marker on the next critique's
+#       chain_id in chain_iql buffer. Pure observation; harmless.
+#
+#   peer_query_reward_learning_enabled (default false) — applies +0.05 on
+#       adopted suggestions following a peer-queried critique, -0.03 on
+#       unadopted with quality_delta ≤ 0. EMA-tracks per-domain "peer
+#       query payoff" so should_peer_query() can soft-gate when enabled.
+#
+# Maker flips reward_learning AFTER D.1 mechanism shows 72h clean (no OVG/
+# Guardian rejection storms, rate limit respected, no stampede). Feature
+# logging is safe-on by default — the EMA accumulates shadow data which the
+# gate then uses once flipped.
+peer_query_feature_logging = true         # safe observational; logs marker per peer query
+peer_query_reward_learning_enabled = false # gates EMA → should_peer_query
+peer_query_reward_adopted = 0.05          # reward bonus when adopted
+peer_query_reward_unadopted = -0.03       # reward penalty when not adopted + quality_delta ≤ 0
+peer_query_ema_alpha = 0.2                # EMA smoothing on per-domain payoff
+peer_query_min_ema_to_query = 0.3         # below this, gate suppresses; above, allows
+
+# Cross-Titan endpoint matrix. Per-Titan config.toml MAY override (e.g., T2/T3
+# share a host so use port differentiation; T1 is on a different host). The
+# self entry is filtered out at boot using config["titan_id"].
+[meta_teacher.peers]
+t1 = "http://10.135.0.3:7777"
+t2 = "http://10.135.0.6:7777"
+t3 = "http://10.135.0.6:7778"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# [meta_outer] — rFP_titan_meta_outer_layer
+# ═══════════════════════════════════════════════════════════════════════════
+# Bridge Titan's inner and outer cognitive memory for grounded meta-reasoning.
+# Code ships with enabled=false by default. Runtime activation via flag file
+# /dev/shm/meta_outer_enabled.flag — controlled by POST /v4/meta-outer/enable
+# and /disable endpoints. Gate flip does NOT require restart.
+#
+# When inactive, every outer-layer code path short-circuits and chain
+# behavior is byte-identical to pre-rFP. When active, meta-reasoning chains
+# can reason about specific people (social_graph.db), topics (knowledge_graph
+# via bus-RPC to knowledge_worker), felt experiences (events_teacher.db),
+# and peer CGN consumers' β/α state (lock-free tail of save files).
+#
+# See titan-docs/rFP_titan_meta_outer_layer.md for full architecture.
+[meta_outer]
+enabled = false                       # default OFF; activation via flag file
+social_graph_path = "data/social_graph.db"
+events_teacher_path = "data/events_teacher.db"
+inner_memory_path = "data/inner_memory.db"
+fetch_budget_ms = 200                 # overall composed-recall deadline
+per_read_timeout_ms = 50              # per-source fan-out timeout
+cache_ttl_s = 60                      # LRU-TTL per entry
+cache_max_size = 500
+max_workers = 4                       # dedicated ThreadPoolExecutor; isolated from FastAPI pool
+active_search_knowledge = true        # bus-RPC to knowledge_worker (Kuzu owner)
+active_search_x = false               # social_x_gateway.search — rate-limited, opt-in
+active_search_events = false          # events_teacher window poll — opt-in
+peer_cgn_enabled = true               # tail peer save files for β/α lookups
+reward_weight = 0.0                   # chain_iql outer-use shaping (0 = observe only)
+
+# Peer CGN save-file paths. Each consumer already persists its β/α state on
+# normal save cadence. PeerCGNReader tails these lock-free with mtime-based
+# cache invalidation. Consumers that don't yet write a snapshot return None
+# gracefully (no error). Follow-up work in DEFERRED_ITEMS.md closes those gaps.
+[meta_outer.peer_cgn_paths]
+meta      = "data/meta_cgn/primitive_grounding.json"
+emot      = "data/emot_cgn/emot_cgn_snapshot_v1.json"
+language  = "data/language_cgn/state_snapshot.json"
+social    = "data/social_cgn/state_snapshot.json"
+knowledge = "data/knowledge_cgn/state_snapshot.json"
+coding    = "data/coding_cgn/state_snapshot.json"
+reasoning = "data/reasoning_cgn/state_snapshot.json"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MICROKERNEL v2 — Phase A feature flags (2026-04-24)
+# ═══════════════════════════════════════════════════════════════════
+#
+# Spec: titan-docs/rFP_microkernel_v2_shadow_core.md
+# Plan: titan-docs/PLAN_microkernel_phase_a.md
+#
+# All flags default FALSE except layer_tagging_enabled. Code lands
+# byte-identical to pre-microkernel behavior until Maker flips a flag.
+# Flag flips are done per-Titan (T2 first, T3, T1 last per meta_teacher
+# soak) via CONFIG_RELOAD (no restart needed for most flags).
+#
+# Rollback at any time: flip flag back to false + CONFIG_RELOAD.
+# ═══════════════════════════════════════════════════════════════════
+
+[microkernel]
+
+# ── Phase A §A.5 — layer tagging (S1, TODAY) ───────────────────────
+# Validates ModuleSpec.layer in Guardian.register(). No runtime effect
+# beyond validation + exposure in /v4/guardian-status + arch_map.
+layer_tagging_enabled = true
+
+# ── Phase A §A.2 — state registries to /dev/shm (S2 TODAY + S4) ───
+# When enabled, Trinity snapshot-builder / spirit_worker / neuromod
+# update writes also land in shm; dashboard readers prefer shm first.
+# Fallback to legacy OuterState path is automatic when flag=false OR
+# shm file missing/torn/schema-mismatch.
+# ACTIVATED 2026-04-24 on T1/T2/T3 — Maker greenlight #2.
+shm_trinity_enabled     = true
+shm_neuromod_enabled    = true
+shm_epoch_enabled       = true
+
+# S4 registries (not wired yet — flags reserved):
+shm_cgn_format_alignment_enabled = false
+shm_titanvm_enabled     = false
+shm_sphere_clocks_enabled = false
+shm_chi_enabled         = false
+shm_identity_enabled    = false
+
+# ── Phase A §A.1 — TitanCore → TitanKernel split (S3) ──────────────
+# When enabled, titan_main.py boots via TitanKernel + TitanPlugin split
+# instead of monolithic TitanCore. Default OFF — flipped in separate
+# deploy session per PLAN §8.2 (T2 → T3 → T1, 24h soak between).
+# FLIPPED 2026-04-25 — Maker greenlight Plan A — T2 canary first.
+kernel_plugin_split_enabled = true
+
+# ── Phase A §A.7 — Spirit-fast shm writer (S3b) ───────────────────
+# When enabled, spirit_worker writes the 45D inner spirit tensor
+# (SAT + CHIT + ANANDA) to /dev/shm/titan_{id}/inner_spirit_45d.bin
+# at Schumann × 9 = 70.47 Hz (14.2 ms period). Validates
+# §L1 Trinity Daemon Internal Design — spirit tick already has no
+# I/O on hot path (benchmarked 46μs pure compute 2026-04-24), so
+# Schumann-rate shm write is architecturally trivial at ~0.3% of 1 core.
+# Default OFF — flipped in separate deploy session after 48h S3a soak
+# per PLAN §8.2 (isolated from split cutover to diagnose regressions).
+# FLIPPED 2026-04-25 — Maker greenlight Plan A — bundled with S3 since
+# spirit pure-compute is the reference impl for S7 §L1 pattern.
+shm_spirit_fast_enabled = true
+
+# ── Phase A §A.4 — API process separation (S5) ────────────────────
+# When enabled, Uvicorn spawns as a Guardian-supervised L3 subprocess
+# communicating with kernel via /dev/shm + bus + Unix socket.
+# Solves the 2026-04-17 T2 16-minute unresponsive-boot incident.
+# FLIPPED 2026-04-25 — Maker greenlight Plan A — also addresses live
+# T1 /health blocking observed 2026-04-25 10:47 UTC during 3+ second
+# bio-layer ticks (legacy in-process uvicorn shares event loop).
+# REVERTED 2026-04-28 PM (T1 quick-fix) — chat broken in subprocess mode
+# (BUG-CHAT-AGENT-NOT-INITIALIZED-API-SUBPROCESS-20260428): api_subprocess
+# hardcodes agent=None and there's no bus-bridge to parent's agent.
+# RE-FLIPPED 2026-04-29 — bus-bridge proper fix shipped (commits
+# 03a0a6be → 7e61c91a). chat.py forwards to parent's chat_handler via
+# bus.request_async when agent is None; ChatBridgeClient routes
+# RESPONSE rid-routed back over the worker IPC pipe. /chat now works
+# in subprocess mode + /health stays fast (uvicorn isolated from
+# bio-layer event loop) + /ws handshake completes (uvicorn-thread
+# unblocked). 24 isolation tests + live verification on T1 (Mode 1
+# in-process) before flag flip; full Mode 2 verification post-flip.
+api_process_separation_enabled = true
+
+# ── rFP_observatory_data_loading_v1 §3.5 — H4 SOL balance publisher ──
+# When enabled, kernel spawns a daemon thread that fetches SOL balance
+# every 60s and publishes SOLANA_BALANCE_UPDATED on the bus. api_subprocess
+# BusSubscriber maps it to network.balance cache key, which feeds /health
+# + /status + the home page Metabolic Energy bar.
+#
+# First-deploy crash mitigation (2026-04-26):
+#   balance_publisher_first_delay_s — wait this many seconds after kernel
+#   boot before the first publish. Lets api_subprocess uvicorn fully come
+#   up so the kernel→api bus traffic doesn't race with subprocess startup
+#   (the original crash class). Default 30s gives Guardian ~10-15s to
+#   heartbeat the api module + safety margin.
+#
+# ENABLED 2026-04-26 with delayed-first-publish fix in place. T1 first.
+balance_publisher_enabled = true
+balance_publisher_first_delay_s = 30.0
+balance_publisher_interval_s = 60.0
+
+# ── Phase A §A.3 — spawn migration (S6) ───────────────────────────
+# When enabled, the reference worker (backup — S6 PLAN §3 D1) boots
+# via multiprocessing.get_context("spawn") instead of fork. Fresh
+# Python interpreter; no parent COW inheritance; ~200 MB RSS savings
+# per migrated worker. Default fork preserves byte-identical pre-S6
+# behavior. After backup soaks clean for 7 days post-flip, fleet
+# migration of additional workers follows session-by-session.
+# FLIPPED 2026-04-25 — Maker greenlight Plan A — backup is L3 leaf
+# (~64 MB RSS), low risk; validates spawn capability for fleet expansion.
+spawn_reference_worker_enabled = true
+
+# ── Phase A §A.7 / §L1 — Body+Mind sensor decoupling (S7) ─────────
+# When enabled, body_worker / mind_worker run with the §L1 Trinity
+# Daemon Internal Design 3-layer pattern: per-sense background refresh
+# threads (at native cadences — 1s CPU, 5s files, 10s network probes,
+# 30s external HTTP) populate a per-sense cache; the tick layer reads
+# cache only and writes the Trinity tensor to shm at Schumann rate.
+#
+# Beautiful Schumann-symmetric Trinity:
+#   Body:   5D × 7.83 Hz  (1× Schumann, fundamental)
+#   Mind:  15D × 23.49 Hz (3× Schumann)
+#   Spirit: 45D × 70.47 Hz (9× Schumann)  ← shipped S3b
+# Each tensor's dimensionality matches its frequency multiplier.
+#
+# Pre-S7 baseline: body 524 ms/call (95% I/O), mind 73 ms/call.
+# Post-S7 tick path: ~100 μs (cache read + math + shm write).
+# Enables shm consumers (StateAccessor body/mind paths from S5
+# amendment) to read at Schumann rate without forcing the tick to
+# block on socket connects or external HTTP.
+#
+# Default OFF — byte-identical to pre-S7 with flags off (no threads
+# start, sensors called inline, no shm writes). Per-flag independent
+# (body and mind can flip separately).
+shm_body_fast_enabled = true    # FLIPPED 2026-04-26 — Step 2 of S7 cascade on T1 (verified body fast path live + stable)
+shm_mind_fast_enabled = true    # FLIPPED 2026-04-26 — Step 3 of S7 cascade on T1 (completes Schumann-symmetric Trinity)
+
+# ── Phase B.1 — Shadow Core Swap (rFP §347-357) ────────────────────
+# Enables /v4/maker/shadow-swap endpoint + kernel.shadow_swap_orchestrate.
+# Default OFF — endpoint refuses with "shadow_swap_enabled_flag_off" until
+# Maker flips to true (per-Titan, T2 first soak per cautious deploy plan).
+# CONFIG_RELOAD honors this flag (kernel reads on each orchestrator call).
+shadow_swap_enabled = true    # FLIPPED 2026-04-26 — B.1 first deploy test on T1
+
+# ── Phase B.2 — Bus IPC Migration (workers outlive kernel swap) ────
+# When true, kernel boots a Unix-domain pub/sub broker at
+# /tmp/titan_bus_<id>.sock and DivineBus.publish() additionally fans out
+# to broker subscribers. Workers (Phase B.2 C7) connect via BusSocketClient
+# instead of receiving an mp.Queue handle from Guardian. Workers reconnect
+# automatically across kernel swaps; their Schumann ticks at 7.83/23.49/
+# 70.47 Hz never pause. Identity-derived authkey via HKDF-SHA256 (no static
+# secret on disk; resurrection-safe). See PLAN_microkernel_phase_b2_ipc.md.
+# Default OFF until C7 ships worker integration + first-deploy on T1.
+# FLIPPED 2026-04-27 PM (Path B'): shadow Guardian skip-spawn + relaxed
+# health gate now ship — re-flipping to test true-outlive E2E swap on T1.
+bus_ipc_socket_enabled = false
+
+# ── Phase B.2.1 — Spawn graduation for import-stable workers ───────────
+# When true, 9 workers boot via multiprocessing.get_context("spawn") so
+# they can outlive a coordinated kernel swap (Phase B.2.1 supervision-
+# transfer):  warning_monitor, llm, body, mind, media, language,
+# meta_teacher, cgn, knowledge.  Each of these has been classified import-
+# stable (no parent-process state required at boot, deterministic init
+# under fresh interpreter).  Workers that stay fork-mode under this flag:
+#   - spirit, memory, timechain, rl, emot_cgn  (heavy parent COW state)
+#   - imw, observatory_writer  (autonomous writer daemons; separate path)
+#   - api_subprocess  (its own start_method handling)
+# Backup runs under its own pre-existing flag (S6 reference, line 2830).
+# Default OFF — no behavioural change vs pre-B.2.1 until Maker flips it
+# on a Titan-by-Titan basis after the bus_ipc_socket_enabled flag has
+# soaked clean.  Combined with bus_ipc_socket_enabled=true, this flag is
+# what enables true zero-downtime swaps (workers literally outlive).
+# FLIPPED 2026-04-27 PM (Path B') — paired with bus_ipc_socket_enabled
+# for second true-outlive E2E swap test on T1 with skip-spawn live.
+spawn_graduated_workers_enabled = false
+
+# ── Phase A.8.3 — Output Verifier subprocess (rFP_microkernel_phase_a8) ──
+# When true, output_verifier runs as a Guardian-supervised L2 subprocess
+# (output_verifier_worker.py) and parent's _output_verifier becomes an
+# OutputVerifierProxy that routes verify_and_sign / build_timechain_payload
+# / stats calls via bus.request(QUERY/RESPONSE). Removes the ~5-15ms
+# Ed25519 sign + regex pattern blocking work from the parent event loop,
+# keeping the parent responsive during shadow-swap adoption + general
+# bus-traffic spikes. Default false → byte-identical pre-A.8.3 (parent
+# retains local OutputVerifier instance).
+a8_output_verifier_subprocess_enabled = true
+
+# ── Phase A.8.4 — Outer Trinity subprocess (rFP_microkernel_phase_a8) ──
+# When true, outer_trinity runs as a Guardian-supervised L1 subprocess
+# (outer_trinity_worker.py) sister to body/mind/spirit. Parent's
+# _outer_trinity_loop continues to gather sources (which need parent-only
+# state like agency, observatory_db reader, soul) and publishes
+# OUTER_TRINITY_COLLECT_REQUEST every interval; the worker hosts
+# OuterTrinityCollector and publishes OUTER_TRINITY_STATE. Removes the
+# 132D collector math + extended-tensor computation from the parent
+# event loop. Default false → in-parent compute (legacy, byte-identical).
+a8_outer_trinity_subprocess_enabled = true
+
+# ── Phase A.8.5 — Reflex aggregation subprocess (rFP_microkernel_phase_a8) ──
+# When true, reflex aggregation (group → guardian-shield → combine →
+# threshold + cooldown filter → top-N selection) runs in a Guardian-
+# supervised L3 subprocess (reflex_worker.py). Parent's reflex_collector
+# becomes a ReflexProxy(ReflexCollector) that delegates aggregation via
+# bus.request(QUERY action="aggregate"), then runs the registered
+# executors locally — executors stay parent-resident because they
+# reference plugin.soul / plugin.metabolism / plugin.memory_proxy /
+# plugin.knowledge_proxy / plugin.social_proxy / plugin.agency and
+# cannot trivially move to a subprocess. Removes the threshold/grouping
+# CPU work from parent on every reflex arc invocation. Default false →
+# in-parent collector (legacy, byte-identical).
+a8_reflex_subprocess_enabled = true
+
+# ── Phase A.8.6 — Agency subprocess (rFP_microkernel_phase_a8) ──
+# When true, agency runs as a Guardian-supervised L3 subprocess
+# (agency_worker.py) hosting AgencyModule + SelfAssessment +
+# HelperRegistry + 8 helpers + LLM fn. Parent's _agency / _agency_assessment
+# become AgencyProxy + AssessmentProxy that bus.request(...) into the
+# worker — async-friendly via asyncio.to_thread so the parent event loop
+# is NEVER blocked during the LLM round-trip (which can take 1-30s).
+# This is the architectural unblock that lets shadow-swap adoption +
+# general bus traffic flow even while agency is mid-LLM-call. Default
+# false → byte-identical pre-A.8.6 (parent retains local AgencyModule +
+# SelfAssessment + 8 helpers). InterfaceAdvisor + ExpressionTranslator
+# stay in parent regardless (cheap local rate check + helper-name read).
+a8_agency_subprocess_enabled = true
+# 2026-04-28 PM: Flipped default false → true after T1+T2+T3 deploy verified
+# (PIDs T1=299836 / T2=897834 / T3=898702, agency_worker READY on all 3,
+# AGENCY_READY proxy seed confirmed, AUTONOMY ACTION art/audio/code success
+# fleet-wide, bus queue-full count: hundreds/min pre-restart → 0 post-restart).
+# Mirrors the A.8.3/A.8.4/A.8.5 pattern of committing flag-on as the new
+# canonical default after at-deploy validation. New T1/T2/T3 boots inherit
+# subprocess mode automatically — no per-Titan SSH edit needed for fresh installs.
+
+# ── Phase A.8.7 — Sage Scholar/Gatekeeper consolidation (2026-04-28) ──
+# Tier 1.6 of rFP_microkernel_phase_a8_l2_l3_residency_completion.md.
+# Final L3 extraction completing rFP A.8: the parent stops instantiating
+# SageRecorder (~2GB LazyMemmapStorage) + SageScholar + SageGatekeeper.
+# When ON:
+#   - V6 path (core/plugin.py) — RLProxy gains dream() + decide_execution_mode()
+#     + sovereignty_score, all bus-routed to rl_worker. Restores
+#     Sovereign/Collaborative routing that's been silently disabled by
+#     agno_hooks.py:633 hasattr guard since RLProxy first shipped.
+#   - Legacy path (__init__.py) — SageEncoder substitutes for SageRecorder
+#     (parent-safe encoding path: action_embedder + projection_layer);
+#     Scholar + Gatekeeper become None (chat → Shadow mode, meditation
+#     skips IQL). LazyMemmapStorage + torch + torchrl stay out of parent.
+# rl_worker subprocess owns the LazyMemmapStorage + IQL networks +
+# Gatekeeper KNN-decode. Bus contracts: SAGE_GATE_DECIDE,
+# SAGE_IQL_TRAIN_STEP, SAGE_STATS, SAGE_READY.
+# Default false → byte-identical pre-A.8.7 (parent retains SageRecorder +
+# SageScholar + SageGatekeeper).
+a8_sage_scholar_gatekeeper_subprocess_enabled = true
+
+# ── 🛑 SHADOW-SWAP MAKER FULL-STOP (2026-04-28 PM late) ─────────────
+# After BUG-T1-INNER-MEMORY-CORRUPTION (T1's inner_memory.db + observatory.db
+# were corrupted during the 2026-04-28 15:00:34 swap attempt), Maker issued
+# a full stop on shadow_swap. The defense-in-depth fix for hardlink-break
+# has shipped, but full-stop remains until end-to-end verification confirms
+# no future swap can corrupt any DB or file.
+#
+# When maker_full_stop = true, the API endpoint POST /maker/shadow-swap
+# returns { outcome: "refused" } with exit code 6 from the CLI. There is
+# NO automated path to shadow_swap — only this Maker-authed endpoint. So
+# this single flag = 100% block.
+#
+# To re-enable (Maker only): flip to false on the target Titan, restart.
+#
+# IMPORTANT — TOML SUBSECTION MUST STAY AT END OF [microkernel] BLOCK.
+# This subsection header `[microkernel.shadow_swap]` makes every
+# subsequent key belong to `microkernel.shadow_swap`. If this header is
+# placed BEFORE the Phase A/B flags, those flags accidentally nest under
+# `shadow_swap` and silently fail to activate (consumers read them at
+# top-level `microkernel.X`). 2026-04-29 incident — see git log of this
+# file. New flags must be ADDED ABOVE this subsection header, never below.
+[microkernel.shadow_swap]
+maker_full_stop = true

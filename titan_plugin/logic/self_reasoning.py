@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger("titan.self_reasoning")
 
@@ -1232,7 +1233,8 @@ class SelfReasoningEngine:
                 table="self_insights",
             )
         except Exception as e:
-            logger.debug("[SelfReasoning] Persist insight failed: %s", e)
+            swallow_warn('[SelfReasoning] Persist insight failed', e,
+                         key="logic.self_reasoning.persist_insight_failed", throttle=100)
 
     def _persist_prediction(self, pred: SelfPrediction) -> int:
         """Store prediction in DB. Returns row ID."""
@@ -1254,7 +1256,8 @@ class SelfReasoningEngine:
                 return 0
             return res.last_row_id or 0
         except Exception as e:
-            logger.debug("[SelfReasoning] Persist prediction failed: %s", e)
+            swallow_warn('[SelfReasoning] Persist prediction failed', e,
+                         key="logic.self_reasoning.persist_prediction_failed", throttle=100)
             return 0
 
     def _persist_prediction_verification(self, pred: SelfPrediction):
@@ -1272,7 +1275,8 @@ class SelfReasoningEngine:
                 table="self_predictions",
             )
         except Exception as e:
-            logger.debug("[SelfReasoning] Persist verification failed: %s", e)
+            swallow_warn('[SelfReasoning] Persist verification failed', e,
+                         key="logic.self_reasoning.persist_verification_failed", throttle=100)
 
     # ── Dream Consolidation ──────────────────────────────────────────
 

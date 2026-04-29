@@ -15,6 +15,7 @@ import logging
 import random
 import re
 import asyncio
+from titan_plugin import bus
 
 logger = logging.getLogger(__name__)
 
@@ -583,7 +584,7 @@ def create_pre_hook(plugin):
                 if bus:
                     from titan_plugin.bus import make_msg
                     bus.publish(make_msg(
-                        "MEMORY_RECALL_PERTURBATION", "interface", "spirit", {
+                        bus.MEMORY_RECALL_PERTURBATION, "interface", "spirit", {
                             "nudge_map": nudge_map,
                             "max_delta": 0.02,
                             "source": "memory_recall",
@@ -628,11 +629,17 @@ def create_pre_hook(plugin):
             plugin._last_observation_vector = None
 
         # 4. Gatekeeper routing decision
-        # V3: gatekeeper is RLProxy (no decide_execution_mode — that's SageGatekeeper)
+        # ── §A.8.7 (2026-04-28): RLProxy now provides decide_execution_mode,
+        # bus-routed to rl_worker's SageGatekeeper. The pre-A.8.7 `hasattr`
+        # guard silently skipped routing in V6 — restored unconditionally
+        # here. None-guard preserves graceful behavior for legacy parent
+        # path with `a8_sage_scholar_gatekeeper_subprocess_enabled=true`
+        # (where gatekeeper is None — chat falls through to Shadow/LLM).
         mode, adv, text = "direct", 0.5, ""
-        if hasattr(plugin.gatekeeper, 'decide_execution_mode'):
+        if plugin.gatekeeper is not None:
             try:
-                mode, adv, text = plugin.gatekeeper.decide_execution_mode(state_tensor, raw_prompt=prompt_text)
+                mode, adv, text = plugin.gatekeeper.decide_execution_mode(
+                    state_tensor, raw_prompt=prompt_text)
             except Exception as _gk_err:
                 logger.warning("[PreHook] decide_execution_mode failed: %s", _gk_err)
         plugin._last_execution_mode = mode
@@ -1182,7 +1189,7 @@ def create_pre_hook(plugin):
                         if _kg_bus:
                             from titan_plugin.bus import make_msg
                             _kg_bus.publish(make_msg(
-                                "CGN_KNOWLEDGE_REQ", "pre_hook", "knowledge", {
+                                bus.CGN_KNOWLEDGE_REQ, "pre_hook", "knowledge", {
                                     "topic": _kg_topic,
                                     "requestor": "knowledge_enforcement",
                                     "urgency": 0.3,
@@ -1198,7 +1205,7 @@ def create_pre_hook(plugin):
                         if _kg_bus:
                             from titan_plugin.bus import make_msg
                             _kg_bus.publish(make_msg(
-                                "CGN_KNOWLEDGE_USAGE", "pre_hook", "knowledge",
+                                bus.CGN_KNOWLEDGE_USAGE, "pre_hook", "knowledge",
                                 {
                                     "topic": _kg_matched,
                                     "reward": 0.2,
@@ -1549,7 +1556,7 @@ def create_post_hook(plugin):
                 _bus = getattr(plugin, 'bus', None)
                 if _bus:
                     from titan_plugin.bus import make_msg
-                    _bus.publish(make_msg("TIMECHAIN_COMMIT", "ovg", "timechain", _tc_payload))
+                    _bus.publish(make_msg(bus.TIMECHAIN_COMMIT, "ovg", "timechain", _tc_payload))
             except Exception as _ovg_err:
                 logger.debug("[PostHook:OVG] Check failed (non-blocking): %s", _ovg_err)
 
@@ -1637,7 +1644,7 @@ def create_post_hook(plugin):
                     else:
                         _ku = None
                     bus.publish(make_msg(
-                        "CGN_SOCIAL_TRANSITION", "interface", "language", {
+                        bus.CGN_SOCIAL_TRANSITION, "interface", "language", {
                             "user_id": user_id,
                             "reward": round(_social_reward, 5),
                             "neuromod_before": _pre_nm,

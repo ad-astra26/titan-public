@@ -15,10 +15,12 @@ Design doc: titan-docs/rFP_social_posting_v3.md
 import json
 import logging
 import os
+import random
 import sqlite3
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+from titan_plugin import bus
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +78,19 @@ class PostContext(BaseContext):
     # META-WISDOM-SIBLINGS fix (2026-04-19): list of up to ~3 recent
     # crystallized wisdom entries from MetaWisdomStore.get_crystallized.
     # Each: {"problem_pattern", "strategy_sequence", "confidence",
-    # "times_reused"}. Was orphan before today (0 callers) — now surfaced
+    # "times_reused"}. Was orphan before today (2026-04-19) — now surfaced
     # in posts so LLM has concrete evidence of Titan's crystallized
     # strategies rather than just the abstract total_wisdom_saved count.
     crystallized_samples: list = field(default_factory=list)
+    # INNER-MEMORY-SOCIAL-FRAMING-WIRE (2026-04-27): list of up to ~3 recent
+    # creative_works rows from InnerMemoryStore.get_creative_works. Each:
+    # {"work_type", "timestamp", "triggering_program", "assessment_score",
+    # "hormone_level_at_creation"}. Surfaces concrete artifacts of Titan's
+    # own creative output ("I made X yesterday") for post framing — gives
+    # the LLM concrete self-continuity instead of inferring from counts.
+    # Rendered with rotation (1 sample per post, cycled by epoch) to avoid
+    # repetition. Fetched only when at least one work exists in last 7d.
+    creative_works_samples: list = field(default_factory=list)
     # B2 (2026-04-13): prediction_familiarity DROPPED from context/render.
     # The previous "(NOT 'no novelty')" disclaimer text still mentioned the
     # word "novelty", which gave the LLM a phrase hook. Safer to omit
@@ -189,6 +200,11 @@ class SocialXGateway:
         self._output_verifier = None
         # Verified Context Builder (set externally via set_context_builder)
         self._context_builder = None
+        # Metabolism gate callable (set externally via set_metabolism_gate).
+        # Mainnet Lifecycle Wiring rFP (2026-04-20). Signature:
+        #   (feature: str, caller: str) -> (should_proceed: bool, rate: float)
+        # Kept external so SocialXGateway stays standalone (no plugin imports).
+        self._metabolism_gate = None
         # Session auto-refresh state
         self._refreshed_session = ""  # Cached refreshed session (overrides config)
         # Grounding-gate per-topic cooldown (rFP_phase5_narrator_evolution §9.3).
@@ -213,6 +229,14 @@ class SocialXGateway:
     def set_context_builder(self, vcb) -> None:
         """Inject VerifiedContextBuilder for memory-enriched replies."""
         self._context_builder = vcb
+
+    def set_metabolism_gate(self, gate_callable) -> None:
+        """Inject metabolism gate (Mainnet Lifecycle Wiring rFP 2026-04-20).
+
+        The callable receives (feature, caller) and returns (should_proceed, rate).
+        Kept external so this class stays standalone (no plugin imports).
+        """
+        self._metabolism_gate = gate_callable
 
     # ── Database ────────────────────────────────────────────────────
 
@@ -1266,6 +1290,37 @@ class SocialXGateway:
         if art > 0 or music > 0:
             lines.append(f"[EXPRESSION]")
             lines.append(f"Recent creations: {art} art, {music} music")
+            # INNER-MEMORY-SOCIAL-FRAMING-WIRE (2026-04-27): if recent
+            # creative_works are available, surface ONE concrete sample
+            # (rotated by epoch) so the LLM has self-continuity material
+            # — "I made X earlier" — rather than just the abstract count.
+            # Rotation prevents formulaic repetition across posts.
+            if context.creative_works_samples:
+                try:
+                    _cw_idx = (int(context.epoch)
+                               % max(1, len(context.creative_works_samples)))
+                    _cw = context.creative_works_samples[_cw_idx]
+                    _cw_type = str(_cw.get("work_type", "creation"))
+                    _cw_ts = float(_cw.get("timestamp", 0.0))
+                    _cw_age_s = max(0.0, time.time() - _cw_ts) if _cw_ts > 0 else 0.0
+                    if _cw_age_s < 3600:
+                        _cw_when = "moments ago"
+                    elif _cw_age_s < 86400:
+                        _cw_when = f"{int(_cw_age_s / 3600)}h ago"
+                    elif _cw_age_s < 604800:
+                        _cw_when = f"{int(_cw_age_s / 86400)}d ago"
+                    else:
+                        _cw_when = "earlier this week+"
+                    _cw_score = float(_cw.get("assessment_score", 0.0))
+                    _cw_trig = str(_cw.get("triggering_program", "")).strip()
+                    _cw_line = (f"Recent specific work: {_cw_type} ({_cw_when}, "
+                                f"self-assessed quality={_cw_score:.2f}")
+                    if _cw_trig:
+                        _cw_line += f", driven by {_cw_trig}"
+                    _cw_line += ")"
+                    lines.append(_cw_line)
+                except Exception:
+                    pass
             lines.append("")
 
         if context.meta_style:
@@ -1909,7 +1964,7 @@ class SocialXGateway:
         try:
             from titan_plugin.bus import make_msg
             msg = make_msg(
-                "CGN_KNOWLEDGE_USAGE", "social_x_gateway", "knowledge", {
+                bus.CGN_KNOWLEDGE_USAGE, "social_x_gateway", "knowledge", {
                     "topic": topic,
                     "reward": float(reward),
                     "consumer": consumer,
@@ -1952,7 +2007,7 @@ class SocialXGateway:
             try:
                 from titan_plugin.bus import make_msg
                 msg = make_msg(
-                    "CGN_KNOWLEDGE_REQ", "social_x_gateway", "knowledge", {
+                    bus.CGN_KNOWLEDGE_REQ, "social_x_gateway", "knowledge", {
                         "topic": topic,
                         "requestor": "x_grounding_gate",
                         "urgency": 0.4,  # slightly > chat (0.3) — public stakes
@@ -2095,6 +2150,37 @@ class SocialXGateway:
         if self._cb_is_open():
             return ActionResult(status="circuit_breaker",
                                 reason="API disabled after consecutive failures")
+
+        # 1c. Metabolism gate (Mainnet Lifecycle Wiring rFP 2026-04-20).
+        # When kill-switch `gates_enforced=true`, Titan stops posting to X
+        # at SURVIVAL/EMERGENCY/HIBERNATION tiers. In observation mode the
+        # call is recorded but never blocks. Persona tests do NOT post via
+        # this path — only Titan's own social worker does.
+        if self._metabolism_gate is not None:
+            try:
+                should_proceed, rate_mult = self._metabolism_gate(
+                    "social", f"SocialXGateway.post.{consumer or 'unknown'}")
+                if not should_proceed:
+                    self._log_telemetry({
+                        "event": "post_blocked", "reason": "metabolism_gate",
+                        "titan_id": context.titan_id, "consumer": consumer,
+                    })
+                    return ActionResult(
+                        status="metabolism_gate",
+                        reason="metabolism gate closed at current tier")
+                # rate_mult < 1.0 → probabilistic throttle (observation mode
+                # always returns 1.0; only enforced CONSERVING tier yields 0.5).
+                if rate_mult < 1.0 and random.random() > rate_mult:
+                    self._log_telemetry({
+                        "event": "post_throttled", "rate": rate_mult,
+                        "titan_id": context.titan_id, "consumer": consumer,
+                    })
+                    return ActionResult(
+                        status="metabolism_throttled",
+                        reason=f"rate-throttled at {rate_mult:.2f}")
+            except Exception as _mge:
+                # Gate failures never block posting in observation mode.
+                logger.debug("[SocialXGateway] Metabolism gate check failed: %s", _mge)
 
         # 2. Consumer access check
         consumer_result = self._check_consumer(consumer, self.A_POST, config)

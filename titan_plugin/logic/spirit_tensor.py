@@ -130,7 +130,10 @@ def _collect_sat(spirit, body, mind, cons, topo, us, hlvl, hfires,
     sat[3] = _clamp((body_coh + mind_coh) / 2.0)
 
     # [4] Temporal continuity: consciousness epoch auto-correlation
-    epoch_count = cons.get("epoch_count", 0)
+    # Producer (`spirit_loop._run_consciousness_epoch`) writes the epoch
+    # counter as `epoch_id`, not `epoch_count` — fall back to `epoch_id`
+    # so this dim activates organically instead of staying at 0.
+    epoch_count = cons.get("epoch_count", cons.get("epoch_id", 0))
     sat[4] = _clamp(min(1.0, epoch_count / 3000.0))  # More epochs = stronger continuity
 
     # [5] Origin connection: distance from birth state
@@ -183,7 +186,8 @@ def _collect_chit(spirit, body, mind, cons, topo, hlvl, hfires, clocks, mem, exp
     chit = [_DEFAULT] * 15
 
     # [0] Self-awareness depth: consciousness epoch maturity
-    epoch_count = cons.get("epoch_count", 0)
+    # See sat[4] — producer dict carries `epoch_id`; fall back accordingly.
+    epoch_count = cons.get("epoch_count", cons.get("epoch_id", 0))
     chit[0] = _clamp(min(1.0, epoch_count / 5000.0))
 
     # [1] Observation clarity: signal-to-noise in observations
@@ -233,11 +237,14 @@ def _collect_chit(spirit, body, mind, cons, topo, hlvl, hfires, clocks, mem, exp
     curvature = abs(topo.get("curvature", 0.0))
     chit[12] = _clamp((volume / 5.0 + curvature) / 2.0)
 
-    # [13] Causal understanding: expression translator accuracy
-    chit[13] = _clamp(expr.get("sovereignty_ratio", 0.0))
+    # [13] Causal understanding: expression sovereignty / activity
+    chit[13] = _clamp(_expression_intensity(expr))
 
     # [14] Meta-cognition: trajectory magnitude (consciousness observing itself changing)
-    chit[14] = _clamp(cons.get("trajectory", 0.0))
+    # Producer (`spirit_loop._run_consciousness_epoch`) writes the field as
+    # `trajectory_magnitude`; fall back to that key for the same reason as
+    # the epoch_count/epoch_id fix in sat[4]/chit[0].
+    chit[14] = _clamp(cons.get("trajectory", cons.get("trajectory_magnitude", 0.0)))
 
     return chit
 
@@ -277,7 +284,7 @@ def _collect_ananda(spirit, body, mind, cons, topo, hlvl, hfires, us, expr,
     ananda[7] = _clamp(us.get("velocity", 0.5))
 
     # [8] Expression quality: sovereignty ratio + action quality
-    ananda[8] = _clamp(expr.get("sovereignty_ratio", 0.0) * 0.5 + 0.3)
+    ananda[8] = _clamp(_expression_intensity(expr) * 0.5 + 0.3)
 
     # [9] Exploration joy: CURIOSITY satisfaction
     curiosity_fires = hfires.get("CURIOSITY", 0)
@@ -336,3 +343,46 @@ def _cosine_sim(a: list, b: list) -> float:
     if norm_a < 1e-10 or norm_b < 1e-10:
         return 0.0
     return dot / (norm_a * norm_b)
+
+
+def _expression_intensity(expr: dict) -> float:
+    """Derive 0..1 expression intensity from an ExpressionManager stats dict.
+
+    `ExpressionTranslator.sovereignty_ratio` lives in the main plugin process
+    and is not available to the spirit_worker subprocess. The composite-level
+    `urge`/`threshold`/`fire_count` data IS available via
+    `expression_manager.get_stats()` and gives a proxy for the same notion:
+    a high mean urge-vs-threshold ratio across composites means many
+    pathways are primed to fire, which is the spirit_worker-visible analog
+    of "sovereign expression activity".
+
+    Falls back to the legacy `sovereignty_ratio` key when present so callers
+    that DO have access to the translator (tests, future cross-process
+    plumbing) keep working unchanged.
+    """
+    if "sovereignty_ratio" in expr:
+        try:
+            return max(0.0, min(1.0, float(expr["sovereignty_ratio"])))
+        except (TypeError, ValueError):
+            pass
+    composites = expr.get("composites") or {}
+    if not isinstance(composites, dict) or not composites:
+        return 0.0
+    ratios: list[float] = []
+    for c in composites.values():
+        if not isinstance(c, dict):
+            continue
+        try:
+            # ExpressionManager.get_stats() emits `last_urge` (most recent
+            # tick's evaluation) — not `urge`. Fall back accordingly so
+            # composite-shape stats activate chit[13] organically. Same
+            # producer/consumer name-mismatch class as BUG #11 dims 24/35
+            # (epoch_count → epoch_id) and dim 49 (trajectory →
+            # trajectory_magnitude). Found 2026-04-27.
+            urge = float(c.get("urge", c.get("last_urge", 0.0)) or 0.0)
+            thr = float(c.get("threshold", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if thr > 0:
+            ratios.append(min(1.0, urge / thr))
+    return sum(ratios) / len(ratios) if ratios else 0.0

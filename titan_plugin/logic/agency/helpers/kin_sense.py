@@ -132,6 +132,23 @@ class KinSenseHelper:
                     self._daily_count += 1
                     self._last_exchange_ts = now
 
+                    # EMOT-CGN v3 (rFP §23.3): opportunistically pull peer's
+                    # current KIN_EMOT_STATE payload on the same exchange tick.
+                    # Shares the 48/kin/day cap with the consciousness exchange
+                    # so we don't double-count. Best-effort — peer on older
+                    # schema or endpoint unavailable → kin_emot_state stays None.
+                    kin_emot_state = None
+                    try:
+                        async with session.get(
+                                f"{addr}/v4/kin/emot") as e_resp:
+                            if e_resp.status == 200:
+                                e_data = (await e_resp.json()).get("data", {})
+                                if e_data.get("available"):
+                                    kin_emot_state = e_data.get("kin_emot_state")
+                    except Exception as _ke:
+                        logger.debug("[KinSense] %s /v4/kin/emot skipped: %s",
+                                     addr, _ke)
+
                     results.append({
                         "address": addr,
                         "alive": True,
@@ -151,6 +168,10 @@ class KinSenseHelper:
                         "kin_msl_attention": ex_data.get("msl_attention"),
                         # A6: ARC knowledge from kin
                         "kin_arc_knowledge": ex_data.get("arc_knowledge"),
+                        # rFP_emot_cgn_v2 §23.3: peer's emotional state payload.
+                        # spirit_worker ingests this and emits KIN_EMOT_STATE
+                        # onto the local bus for emot_cgn_worker to bind via MSL.
+                        "kin_emot_state": kin_emot_state,
                     })
                     logger.info("[KinSense] Exchanged with %s — resonance=%.3f emotion=%s",
                                 sig_data.get("name", addr),

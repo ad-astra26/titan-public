@@ -46,8 +46,15 @@ from typing import Optional
 # ── Configuration ──────────────────────────────────────────────────────
 
 ENABLED = os.environ.get("TITAN_BUS_CENSUS", "0") == "1"
+# Phase C C-S2 (D11): per-Titan census log path. Default resolves the active
+# Titan ID from canonical TITAN_KERNEL_TITAN_ID env var (with legacy TITAN_ID
+# fallback) so T1/T2/T3 each get a distinct path. Per SPEC §3 D11 +
+# PLAN_microkernel_phase_c_s2_kernel.md §12.5.
+_TITAN_ID_FOR_CENSUS = (
+    os.environ.get("TITAN_KERNEL_TITAN_ID") or os.environ.get("TITAN_ID", "T1")
+)
 CENSUS_LOG_PATH = os.environ.get(
-    "TITAN_BUS_CENSUS_LOG", "/tmp/titan_bus_census.log")
+    "TITAN_BUS_CENSUS_LOG", f"/tmp/titan_{_TITAN_ID_FOR_CENSUS}_bus_census.log")
 CENSUS_FLUSH_S = float(os.environ.get("TITAN_BUS_CENSUS_FLUSH_S", "10"))
 
 

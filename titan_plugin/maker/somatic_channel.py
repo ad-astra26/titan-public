@@ -18,6 +18,7 @@ routes the message to all subscribers via dst="all".
 import logging
 
 from .schemas import ProposalRecord, ProposalType
+from titan_plugin import bus
 
 logger = logging.getLogger("SomaticChannel")
 
@@ -46,7 +47,7 @@ class SomaticChannel:
         try:
             from titan_plugin.bus import make_msg
             self._bus.publish(make_msg(
-                "MAKER_PROPOSAL_CREATED", self._src, "all",
+                bus.MAKER_PROPOSAL_CREATED, self._src, "all",
                 {
                     "proposal_id": record.proposal_id,
                     "proposal_type": record.proposal_type.value,
@@ -72,7 +73,7 @@ class SomaticChannel:
         try:
             from titan_plugin.bus import make_msg
             self._bus.publish(make_msg(
-                "MAKER_RESPONSE_RECEIVED", self._src, "all",
+                bus.MAKER_RESPONSE_RECEIVED, self._src, "all",
                 {
                     "proposal_id": proposal_id,
                     "proposal_type": proposal_type.value,

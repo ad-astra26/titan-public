@@ -15,6 +15,7 @@ Starvation Table (configurable via titan_params.toml [metabolism.tiers.*]):
 import logging
 import math
 import time
+from collections import deque
 
 try:
     import tomllib
@@ -23,6 +24,10 @@ except ImportError:
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Ring buffer cap for gate decisions (exposed via /v4/metabolism/gate-status).
+# ~500 decisions ≈ 10 min at 1 Hz aggregate emission across all call sites.
+_GATE_DECISION_RING_SIZE = 500
 
 # ── Default Metabolic Tiers ──────────────────────────────────────────
 # Overridable via [metabolism] in titan_params.toml
@@ -46,10 +51,11 @@ _DEFAULT_FEATURES = {
 }
 
 
-def _load_metabolic_config() -> tuple[dict, dict]:
-    """Load tier thresholds from titan_params.toml [metabolism] if present."""
+def _load_metabolic_config() -> tuple[dict, dict, bool]:
+    """Load tier thresholds + gate kill-switch from titan_params.toml [metabolism]."""
     tiers = {k: dict(v) for k, v in _DEFAULT_TIERS.items()}
     features = {k: dict(v) for k, v in _DEFAULT_FEATURES.items()}
+    gates_enforced = False
 
     params_path = Path(__file__).parent.parent / "titan_params.toml"
     if params_path.exists():
@@ -57,6 +63,9 @@ def _load_metabolic_config() -> tuple[dict, dict]:
             with open(params_path, "rb") as f:
                 params = tomllib.load(f)
             mcfg = params.get("metabolism", {})
+
+            # Kill-switch: [metabolism] gates_enforced = true
+            gates_enforced = bool(mcfg.get("gates_enforced", False))
 
             # Override tier thresholds: [metabolism.tiers.THRIVING] min_sol = 1.5
             for tier_name, overrides in mcfg.get("tiers", {}).items():
@@ -75,11 +84,11 @@ def _load_metabolic_config() -> tuple[dict, dict]:
         except Exception as e:
             logger.warning("[Metabolism] Failed to load titan_params.toml overrides: %s", e)
 
-    return tiers, features
+    return tiers, features, gates_enforced
 
 
 # Module-level tables (loaded once, reloaded by controller on config change)
-METABOLIC_TIERS, TIER_FEATURES = _load_metabolic_config()
+METABOLIC_TIERS, TIER_FEATURES, _GATES_ENFORCED = _load_metabolic_config()
 
 
 class MetabolismController:
@@ -120,6 +129,12 @@ class MetabolismController:
 
         # Cached balance for banner (updated by get_current_state)
         self._last_balance: float | None = None
+
+        # Mainnet Lifecycle Wiring rFP (2026-04-20): gate kill-switch +
+        # ring buffer of recent gate decisions for observability.
+        self._gates_enforced = _GATES_ENFORCED
+        self._gate_decisions: deque = deque(maxlen=_GATE_DECISION_RING_SIZE)
+        self._gate_decision_counts: dict[str, int] = {}  # caller → total evaluations
 
     @property
     def _last_balance_pct(self) -> float:
@@ -180,18 +195,10 @@ class MetabolismController:
 
         return self._current_tier
 
-    # UNUSED_PUBLIC_API: gate method awaiting METABOLISM-GATE-WIRING rFP.
     def get_metabolic_tier(self) -> str:
         """Get the current 6-tier metabolic state."""
         return self._current_tier
 
-    # UNUSED_PUBLIC_API: gate method awaiting METABOLISM-GATE-WIRING rFP.
-    def get_chi_factor(self) -> float:
-        """Get Chi multiplier for current tier. Used by life_force_engine."""
-        tier_info = METABOLIC_TIERS.get(self._current_tier, {})
-        return tier_info.get("chi_factor", 1.0)
-
-    # UNUSED_PUBLIC_API: gate method awaiting METABOLISM-GATE-WIRING rFP.
     def can_use_feature(self, feature: str) -> bool:
         """Check if a feature is available at the current metabolic tier.
 
@@ -200,13 +207,6 @@ class MetabolismController:
         tier_features = TIER_FEATURES.get(self._current_tier, {})
         return tier_features.get(feature, False)
 
-    # UNUSED_PUBLIC_API: gate method awaiting METABOLISM-GATE-WIRING rFP.
-    def get_rate_factor(self) -> float:
-        """Activity rate multiplier for current tier. 1.0 = full, 0.5 = half, 0.0 = stopped."""
-        tier_info = METABOLIC_TIERS.get(self._current_tier, {})
-        return tier_info.get("rate_factor", 1.0)
-
-    # UNUSED_PUBLIC_API: gate method awaiting METABOLISM-GATE-WIRING rFP.
     def get_service_gate(self, feature: str) -> tuple[bool, float, str]:
         """Check if a service should run and at what rate.
 
@@ -227,6 +227,98 @@ class MetabolismController:
             return False, 0.0, f"tier_{tier.lower()}_rate_zero"
 
         return True, rate, f"tier_{tier.lower()}_rate_{rate}"
+
+    @property
+    def gates_enforced(self) -> bool:
+        """Kill-switch flag for Mainnet Lifecycle Wiring. False = observability-only."""
+        return self._gates_enforced
+
+    def evaluate_gate(self, feature: str, caller: str = "") -> tuple[bool, float]:
+        """Universal call-site entry point for metabolism gates.
+
+        Decides whether a service/call should proceed at the current tier, and
+        records the decision in a ring buffer for observability.
+
+        Semantics:
+          - `gates_enforced = False` (observation-only): always returns (True, 1.0).
+            The underlying decision is still logged + ringed so 24h soaks can
+            confirm decisions match expectations before flipping enforcement.
+          - `gates_enforced = True`: returns the real decision. If the gate is
+            closed, the caller MUST skip the work. `rate_multiplier < 1.0` means
+            the caller should probabilistically skip (random() > rate → skip).
+
+        Args:
+            feature: One of TIER_FEATURES keys (memos, nfts, expression, research, social).
+            caller: Human-readable call-site name for log + ring buffer. Optional.
+
+        Returns:
+            (should_proceed, rate_multiplier)
+        """
+        allowed, rate, reason = self.get_service_gate(feature)
+        tier = self._current_tier
+        enforced = self._gates_enforced
+
+        decision = {
+            "ts": time.time(),
+            "feature": feature,
+            "caller": caller or feature,
+            "tier": tier,
+            "allowed": allowed,
+            "rate": rate,
+            "reason": reason,
+            "enforced": enforced,
+        }
+        self._gate_decisions.append(decision)
+        key = caller or feature
+        self._gate_decision_counts[key] = self._gate_decision_counts.get(key, 0) + 1
+
+        if not enforced:
+            if not allowed:
+                logger.info(
+                    "[Metabolism-Gate] %s would-close: %s (observation-only, gates_enforced=False)",
+                    caller or feature, reason)
+            return (True, 1.0)
+
+        if not allowed:
+            logger.info("[Metabolism-Gate] %s CLOSED: %s", caller or feature, reason)
+        return (allowed, rate)
+
+    def get_gate_decision_summary(self) -> dict:
+        """Aggregate summary of gate decisions for /v4/metabolism/gate-status."""
+        decisions = list(self._gate_decisions)
+        total = len(decisions)
+        if total == 0:
+            return {
+                "gates_enforced": self._gates_enforced,
+                "current_tier": self._current_tier,
+                "total_evaluations": 0,
+                "decisions_buffered": 0,
+                "by_caller": {},
+                "recent_closures": [],
+            }
+
+        now = time.time()
+        window_10m = [d for d in decisions if now - d["ts"] <= 600]
+        closures = [d for d in window_10m if not d["allowed"]]
+        by_caller: dict[str, dict] = {}
+        for d in window_10m:
+            key = d["caller"]
+            bucket = by_caller.setdefault(key, {"total": 0, "closed": 0, "feature": d["feature"]})
+            bucket["total"] += 1
+            if not d["allowed"]:
+                bucket["closed"] += 1
+
+        return {
+            "gates_enforced": self._gates_enforced,
+            "current_tier": self._current_tier,
+            "sol_balance": self._last_balance,
+            "total_evaluations": sum(self._gate_decision_counts.values()),
+            "decisions_buffered": total,
+            "window_10min_count": len(window_10m),
+            "window_10min_closures": len(closures),
+            "by_caller": by_caller,
+            "recent_closures": closures[-20:],
+        }
 
     def get_emergency_duration(self) -> float:
         """How long (seconds) Titan has been in EMERGENCY tier. 0 if not in emergency."""
@@ -249,8 +341,6 @@ class MetabolismController:
             "features": features,
         }
 
-    # UNUSED_PUBLIC_API: governance reserve protection — awaiting
-    # METABOLISM-GATE-WIRING rFP (should gate every on-chain spend).
     async def can_afford(self, cost: float) -> bool:
         """Check if a transaction is affordable without breaching governance reserve."""
         balance = await self.network.get_balance()

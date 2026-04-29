@@ -28,6 +28,8 @@ import threading
 import time
 
 import numpy as np
+from titan_plugin.utils.silent_swallow import swallow_warn
+from titan_plugin import bus
 
 logger = logging.getLogger(__name__)
 
@@ -248,7 +250,8 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                            "last_fire_time": last_fire}, f)
             os.replace(tmp, teacher_state_path)  # Atomic
         except Exception as e:
-            logger.debug("[LanguageWorker] teacher_state save failed: %s", e)
+            swallow_warn('[LanguageWorker] teacher_state save failed', e,
+                         key="modules.language_worker.teacher_state_save_failed", throttle=100)
 
     teacher_queue = []
     teacher_pending_since = 0.0
@@ -348,14 +351,21 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
     _cgn_local_groundings = 0
     try:
         from titan_plugin.logic.cgn_consumer_client import CGNConsumerClient
+        # Microkernel v2 §A.2 part 2 (S4): pass titan_id + config so the
+        # dual-mode resolver picks per-titan path + 24B header when the
+        # shm_cgn_format_alignment_enabled flag flips. shm_path=None tells
+        # the resolver to use canonical default (legacy global path off,
+        # per-titan on).
         cgn = CGNConsumerClient(
             "language", send_queue=send_queue, module_name=name,
             state_dir=os.path.join(data_dir, "cgn"),
-            shm_path="/dev/shm/cgn_live_weights.bin")
+            shm_path="/dev/shm/cgn_live_weights.bin",
+            titan_id=titan_id, config=config)
         cgn_social = CGNConsumerClient(
             "social", send_queue=send_queue, module_name=name,
             state_dir=os.path.join(data_dir, "cgn"),
-            shm_path="/dev/shm/cgn_live_weights.bin")
+            shm_path="/dev/shm/cgn_live_weights.bin",
+            titan_id=titan_id, config=config)
         logger.info("[LanguageWorker] CGN ConsumerClients loaded "
                     "(language + social, from /dev/shm)")
     except Exception as _cgn_err:
@@ -368,7 +378,14 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
     )
 
     def _cgn_forward_outcome(consumer, concept_id, reward, outcome_context=None):
-        """Forward a delayed reward to CGN Worker via bus."""
+        """Forward a delayed reward to CGN Worker via bus.
+
+        Also broadcasts a CGN_CROSS_INSIGHT peer-publisher event (Upgrade III,
+        audit 2026-04-23 Q2) so emot_cgn + other peer consumers can learn
+        from this consumer's chain outcomes. Rate-gated + informative-only
+        filter inside emit_chain_outcome_insight. Covers both "language"
+        and "social" consumers (same outcome helper).
+        """
         try:
             _send_msg(send_queue, "CGN_TRANSITION", name, "cgn", {
                 "type": "outcome",
@@ -377,6 +394,14 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                 "reward": reward,
                 "outcome_context": outcome_context or {},
             })
+        except Exception:
+            pass
+        try:
+            from titan_plugin.logic.cgn_consumer_client import (
+                emit_chain_outcome_insight)
+            emit_chain_outcome_insight(
+                send_queue, name, consumer, float(reward),
+                ctx={"concept_id": str(concept_id)})
         except Exception:
             pass
 
@@ -390,7 +415,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                 "ON" if cgn else "OFF")
 
     # ── Signal ready to Guardian ─────────────────────────────────────
-    _send_msg(send_queue, "MODULE_READY", name, "guardian", {})
+    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
 
     # ── Background heartbeat thread (prevents Guardian timeout) ──────
     _hb_stop = threading.Event()
@@ -409,6 +434,15 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
     stats_broadcast_interval = 30.0  # Match spirit_worker's 30s update cycle
 
     # ── Main loop ────────────────────────────────────────────────────
+    # ── Microkernel v2 Phase B.1 §6 — readiness/hibernate reporter ──
+    from titan_plugin.core.readiness_reporter import trivial_reporter
+    def _b1_save_state():
+        return []
+    _b1_reporter = trivial_reporter(
+        worker_name=name, layer="L2", send_queue=send_queue,
+        save_state_cb=_b1_save_state,
+    )
+
     while True:
         # Heartbeat every iteration (throttled to 3s min in helper).
         # MUST be at top, NOT only in Empty or per-msg-type, because broadcast
@@ -428,7 +462,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
             if now - last_stats_broadcast >= stats_broadcast_interval:
                 try:
                     language_stats = update_language_stats(db_path, cached_vocab)
-                    _send_msg(send_queue, "LANGUAGE_STATS_UPDATE", name, "all", language_stats)
+                    _send_msg(send_queue, bus.LANGUAGE_STATS_UPDATE, name, "all", language_stats)
                 except Exception as e:
                     logger.debug("[LanguageWorker] Stats broadcast error: %s", e)
                 last_stats_broadcast = now
@@ -493,7 +527,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                         from titan_plugin.logic.language_teacher import BOOTSTRAP_MODE
                         _bt_prompt = persistent_teacher.build_prompt(
                             BOOTSTRAP_MODE, [], [], patterns_to_avoid=[])
-                        _send_msg(send_queue, "LLM_TEACHER_REQUEST", name, "llm", {
+                        _send_msg(send_queue, bus.LLM_TEACHER_REQUEST, name, "llm", {
                             "prompt": _bt_prompt["prompt"],
                             "system": _bt_prompt["system"],
                             "mode": BOOTSTRAP_MODE,
@@ -649,7 +683,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                         from titan_plugin.logic.language_teacher import META_FEEDBACK_MODE
                         _gnd_prompt = persistent_teacher.build_prompt(
                             META_FEEDBACK_MODE, [_gnd_target], cached_vocab)
-                        _send_msg(send_queue, "LLM_TEACHER_REQUEST", name, "llm", {
+                        _send_msg(send_queue, bus.LLM_TEACHER_REQUEST, name, "llm", {
                             "prompt": _gnd_prompt["prompt"],
                             "system": _gnd_prompt["system"],
                             "mode": META_FEEDBACK_MODE,
@@ -710,7 +744,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                             from titan_plugin.logic.language_teacher import EMBODIED_TEACHING_MODE
                             _et_prompt = persistent_teacher.build_prompt(
                                 EMBODIED_TEACHING_MODE, [_et_target], cached_vocab)
-                            _send_msg(send_queue, "LLM_TEACHER_REQUEST", name, "llm", {
+                            _send_msg(send_queue, bus.LLM_TEACHER_REQUEST, name, "llm", {
                                 "prompt": _et_prompt["prompt"],
                                 "system": _et_prompt["system"],
                                 "mode": EMBODIED_TEACHING_MODE,
@@ -761,7 +795,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                     _wa_target = _wa_assoc[0]
                                     # Legacy META_LANGUAGE_REQUEST (staying parallel
                                     # in Session 2; Session 3 migrates away).
-                                    _send_msg(send_queue, "META_LANGUAGE_REQUEST",
+                                    _send_msg(send_queue, bus.META_LANGUAGE_REQUEST,
                                               name, "spirit", {
                                                   "type": "word_association",
                                                   "word_a": _wa_w["word"],
@@ -876,7 +910,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                             _ext = _measure_meta_lang_reward(
                                 _vdelta, _gdelta,
                                 _pending.get("primitives", []))
-                            _send_msg(send_queue, "META_LANGUAGE_REWARD",
+                            _send_msg(send_queue, bus.META_LANGUAGE_REWARD,
                                       name, "spirit", {
                                           "chain_id": _cid,
                                           "reward": _ext,
@@ -905,13 +939,25 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
         msg_type = msg.get("type", "")
 
         # ── Control messages ─────────────────────────────────────────
-        if msg_type == "MODULE_SHUTDOWN":
+        # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────
+        if _b1_reporter.handles(msg_type):
+            _b1_reporter.handle(msg)
+            if _b1_reporter.should_exit():
+                break
+            continue
+
+        # ── Microkernel v2 Phase B.2.1 — supervision-transfer dispatch ──
+        from titan_plugin.core import worker_swap_handler as _swap
+        if _swap.maybe_dispatch_swap_msg(msg):
+            continue
+
+        if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[LanguageWorker] Shutdown requested: %s",
                         msg.get("payload", {}).get("reason", ""))
             break
 
         # ── QUERY handler (API → language stats) ─────────────────────
-        elif msg_type == "QUERY":
+        elif msg_type == bus.QUERY:
             from titan_plugin.core.profiler import handle_memory_profile_query
             if handle_memory_profile_query(msg, send_queue, name):
                 continue
@@ -921,7 +967,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                           bootstrap_speak_attempts, conversation_stats)
 
         # ── SPEAK_REQUEST (Phase 2: full composition pipeline) ────────
-        elif msg_type == "SPEAK_REQUEST":
+        elif msg_type == bus.SPEAK_REQUEST:
             _send_heartbeat(send_queue, name)
             _sr_payload = msg.get("payload", {})
             _sr_src = msg.get("src", "spirit")
@@ -1060,7 +1106,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                     # Trigger if: < 3 unique templates in last 5 compositions
                     # (heavy repetition) or all have same template
                     if _unique_templates < 3:
-                        _send_msg(send_queue, "META_LANGUAGE_REQUEST",
+                        _send_msg(send_queue, bus.META_LANGUAGE_REQUEST,
                                   name, "spirit", {
                                       "type": "language_learning",
                                       "trigger": "repetitive_patterns",
@@ -1072,11 +1118,11 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                     _unique_templates)
             except Exception as _sr_err:
                 logger.error("[LanguageWorker] SPEAK_REQUEST error: %s", _sr_err, exc_info=True)
-                _send_msg(send_queue, "SPEAK_RESULT", name, _sr_src, {
+                _send_msg(send_queue, bus.SPEAK_RESULT, name, _sr_src, {
                     "sentence": "", "error": str(_sr_err)})
 
         # ── LLM_TEACHER_RESPONSE (Phase 3: full teacher pipeline) ────
-        elif msg_type == "LLM_TEACHER_RESPONSE":
+        elif msg_type == bus.LLM_TEACHER_RESPONSE:
             _send_heartbeat(send_queue, name)
             _tr_payload = msg.get("payload", {})
             # Tier 3: maker narration response — handle separately from teacher
@@ -1090,7 +1136,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                         "[MAKER] Narration LLM response: proposal=%s len=%d",
                         _mn_pid[:8], len(_mn_narration))
                     # Emit MAKER_NARRATION_RESULT to spirit_worker
-                    _send_msg(send_queue, "MAKER_NARRATION_RESULT",
+                    _send_msg(send_queue, bus.MAKER_NARRATION_RESULT,
                               name, "spirit", {
                                   "proposal_id": _mn_pid,
                                   "narration": _mn_narration,
@@ -1264,7 +1310,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                 teacher_pending_since = 0.0
 
         # ── META_LANGUAGE_RESULT (Phase 4c: meta-reasoning → CGN) ────
-        elif msg_type == "META_LANGUAGE_RESULT":
+        elif msg_type == bus.META_LANGUAGE_RESULT:
             if cgn:
                 try:
                     _ml_payload = msg.get("payload", {})
@@ -1396,7 +1442,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
         #   1. Ground Maker's words somatically (CGN MAKER_RESPONSE_LINKED)
         #   2. Queue LLM narration via teacher request
         #   3. On LLM response, emit MAKER_NARRATION_RESULT to spirit_worker
-        elif msg_type == "MAKER_NARRATION_REQUEST":
+        elif msg_type == bus.MAKER_NARRATION_REQUEST:
             try:
                 _mnr_p = msg.get("payload", {}) or {}
                 _mnr_proposal_id = _mnr_p.get("proposal_id", "")
@@ -1447,7 +1493,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                     f"proposals of type '{_mnr_type}'. Speak as Titan — "
                     f"use I, not we. Be genuine and reflective."
                 )
-                _send_msg(send_queue, "LLM_TEACHER_REQUEST", name, "llm", {
+                _send_msg(send_queue, bus.LLM_TEACHER_REQUEST, name, "llm", {
                     "mode": "maker_narration",
                     "prompt": _mnr_prompt,
                     "context": {
@@ -1469,7 +1515,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
         # ── CGN_DREAM_CONSOLIDATE — forward to CGN Worker ───────────
         # Training is delegated to CGN Worker. Language worker only handles
         # cross-insight extraction for teaching queue AFTER consolidation.
-        elif msg_type == "CGN_DREAM_CONSOLIDATE":
+        elif msg_type == bus.CGN_DREAM_CONSOLIDATE:
             # Forward consolidation request to CGN Worker
             _send_msg(send_queue, "CGN_CONSOLIDATE", name, "cgn",
                       {"dream_phase": True})
@@ -1480,7 +1526,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
         # bus's dst="all" broadcast. Forward to each local CGN client so
         # their EMA of emotional-outcome rewards updates → surfaces in
         # state_vec slot 18 on next ground() call.
-        elif msg_type == "CGN_CROSS_INSIGHT":
+        elif msg_type == bus.CGN_CROSS_INSIGHT:
             try:
                 if cgn is not None:
                     cgn.note_incoming_cross_insight(msg.get("payload", {}))
@@ -1490,7 +1536,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                 logger.debug("[CGN] cross-insight note error: %s", _ci_err)
 
         # ── CGN_WEIGHTS_MAJOR — weights updated (client auto-reloads from /dev/shm) ──
-        elif msg_type == "CGN_WEIGHTS_MAJOR":
+        elif msg_type == bus.CGN_WEIGHTS_MAJOR:
             if cgn:
                 try:
                     # CGNConsumerClient auto-reloads from /dev/shm on next ground() call.
@@ -1506,7 +1552,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                         from titan_plugin.logic.language_teacher import ARC_VOCABULARY_MAP
                         _dream_priority = []
                         # Use bus query to CGN Worker (authoritative source)
-                        _send_msg(send_queue, "QUERY", name, "cgn",
+                        _send_msg(send_queue, bus.QUERY, name, "cgn",
                                   {"action": "get_cross_insights",
                                    "consumer": "language"})
                         # Cross-insights arrive asynchronously via QUERY_RESPONSE
@@ -1520,7 +1566,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
         # ── CGN_KNOWLEDGE_RESP — knowledge cascade → teaching queue ──
         # Real-time: Knowledge Worker grounded a concept, queue topic
         # words for priority teaching (doesn't wait for dream cycle).
-        elif msg_type == "CGN_KNOWLEDGE_RESP":
+        elif msg_type == bus.CGN_KNOWLEDGE_RESP:
             try:
                 _kr_topic = payload.get("topic", "")
                 _kr_source = payload.get("source", "")
@@ -1545,7 +1591,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                     _kr_conf)
                     # G4: Send usage feedback to knowledge worker so it
                     # learns which research topics are useful for language
-                    _send_msg(send_queue, "CGN_KNOWLEDGE_USAGE",
+                    _send_msg(send_queue, bus.CGN_KNOWLEDGE_USAGE,
                               name, "knowledge", {
                         "topic": _kr_topic,
                         "reward": min(1.0, _kr_conf * 0.5 + 0.1 * len(_kr_new)),
@@ -1574,7 +1620,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
         # After CGN_WEIGHTS_MAJOR triggers a QUERY for cross-insights,
         # cgn_worker replies here with high-value concepts from other consumers
         # (reasoning, social, coding) that language hasn't grounded yet.
-        elif msg_type == "QUERY_RESPONSE":
+        elif msg_type == bus.QUERY_RESPONSE:
             try:
                 _qr_data = payload.get("result", payload)
                 _qr_action = payload.get("action", "")
@@ -1614,7 +1660,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
         # Events Teacher → perturbation gate → API → bus → here.
         # Ground vocabulary words from felt_summary with SOCIAL_LINKED
         # associations. This creates emergent social-semantic connections.
-        elif msg_type == "SOCIAL_PERCEPTION":
+        elif msg_type == bus.SOCIAL_PERCEPTION:
             if cgn:
                 try:
                     import re as _sp_re
@@ -1744,7 +1790,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
 
                     # Wire concept signals to MSL via bus (I, YOU, WE, etc.)
                     if _sp_concepts:
-                        _send_msg(send_queue, "QUERY", name, "spirit", {
+                        _send_msg(send_queue, bus.QUERY, name, "spirit", {
                             "action": "signal_concept",
                             "payload": {
                                 "concepts": _sp_concepts,
@@ -1792,7 +1838,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
         # Record social interaction as CGN transition for the social consumer.
         # Reward = neuromod delta (felt state improvement from interaction).
         # Dream consolidation trains V(s) + Q(s,a) → emergent social wisdom.
-        elif msg_type == "CGN_SOCIAL_TRANSITION":
+        elif msg_type == bus.CGN_SOCIAL_TRANSITION:
             if cgn_social:
                 try:
                     import numpy as _soc_np
@@ -1844,7 +1890,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
         # ── CGN_HAOV_VERIFY_REQ — HAOV verification request from CGN Worker ──
         # CGN Worker detected impasse or has hypothesis to test.
         # Language worker runs domain-specific verification using LIVE state.
-        elif msg_type == "CGN_HAOV_VERIFY_REQ":
+        elif msg_type == bus.CGN_HAOV_VERIFY_REQ:
             _haov_p = msg.get("payload", {})
             _haov_consumer = _haov_p.get("consumer", "")
             try:
@@ -1881,9 +1927,18 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                     except Exception:
                         pass
 
-                    _confirmed = (_conf_a > _conf_b + 0.01) or _prod_ok or _qual > 0.5
+                    # H.1.a (2026-04-28): removed `or _qual > 0.5` OR-cheat.
+                    # `_qual` is overall vocabulary average confidence, a
+                    # system-wide stat with no relation to whether the
+                    # hypothesis is true. T1 vocab avg ~0.7 → was confirming
+                    # every hypothesis regardless. Honest delta only:
+                    # per-word confidence delta OR production-stage progression.
+                    # Impasse hypotheses (where _hyp_word="") will correctly
+                    # falsify until H.4 ships a cause-effect hypothesis
+                    # generator that produces verifiable rules.
+                    _confirmed = (_conf_a > _conf_b + 0.01) or _prod_ok
                     _error = abs(_conf_a - _conf_b)
-                    _send_msg(send_queue, "CGN_HAOV_VERIFY_RSP", name, "cgn", {
+                    _send_msg(send_queue, bus.CGN_HAOV_VERIFY_RSP, name, "cgn", {
                         "consumer": "language",
                         "test_ctx": _haov_p.get("test_ctx"),
                         "obs_after": {"confidence": _conf_a, "production_success": _prod_ok, "quality": _qual},
@@ -1900,7 +1955,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
         # Consumer="language" responses are routed here (home_worker
         # mapping in titan_params.toml). Dispatch to the handler
         # registered via meta_service_client.register_response_handler.
-        elif msg_type == "META_REASON_RESPONSE":
+        elif msg_type == bus.META_REASON_RESPONSE:
             try:
                 from titan_plugin.logic.meta_service_client import (
                     dispatch_meta_response as _lm_dispatch,
@@ -1911,14 +1966,14 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                     "[LangMeta] response dispatch error: %s", _lm_disp_err)
 
         # ── EPOCH_TICK (Phase 2+: teacher scheduling) ────────────────
-        elif msg_type == "EPOCH_TICK":
+        elif msg_type == bus.EPOCH_TICK:
             # Phase 1: refresh vocab cache periodically
             now = time.time()
             if now - last_stats_broadcast >= stats_broadcast_interval:
                 try:
                     cached_vocab = load_vocabulary(db_path)
                     language_stats = update_language_stats(db_path, cached_vocab)
-                    _send_msg(send_queue, "LANGUAGE_STATS_UPDATE", name, "all",
+                    _send_msg(send_queue, bus.LANGUAGE_STATS_UPDATE, name, "all",
                               language_stats)
                 except Exception:
                     pass
@@ -1955,7 +2010,7 @@ def _check_teacher_trigger(
         recent_questions=recent_questions,
     )
     if req:
-        _send_msg(send_queue, "LLM_TEACHER_REQUEST", name, "llm", req)
+        _send_msg(send_queue, bus.LLM_TEACHER_REQUEST, name, "llm", req)
         logger.info("[LanguageWorker] Teacher request sent: mode=%s", req.get("mode", "?"))
 
 
@@ -2043,7 +2098,7 @@ def _handle_teacher_response(
             logger.debug("[CONVERSATION] Eval error: %s", e)
 
         # Send TEACHER_SIGNALS with eval data (skip comprehension for eval)
-        _send_msg(send_queue, "TEACHER_SIGNALS", name, "spirit", {
+        _send_msg(send_queue, bus.TEACHER_SIGNALS, name, "spirit", {
             "perturbation_deltas": [],
             "msl_signals": msl_signals,
             "dynamic_recipes": [],
@@ -2152,7 +2207,7 @@ def _handle_teacher_response(
             logger.warning("[META_FEEDBACK] Processing error: %s", e)
 
         # Send signals and return (skip normal comprehension)
-        _send_msg(send_queue, "TEACHER_SIGNALS", name, "spirit", {
+        _send_msg(send_queue, bus.TEACHER_SIGNALS, name, "spirit", {
             "perturbation_deltas": perturbation_deltas,
             "msl_signals": msl_signals,
             "dynamic_recipes": [],
@@ -2244,7 +2299,7 @@ def _handle_teacher_response(
         except Exception as e:
             logger.warning("[EMBODIED_TEACHING] Processing error: %s", e)
 
-        _send_msg(send_queue, "TEACHER_SIGNALS", name, "spirit", {
+        _send_msg(send_queue, bus.TEACHER_SIGNALS, name, "spirit", {
             "perturbation_deltas": perturbation_deltas,
             "msl_signals": msl_signals,
             "dynamic_recipes": [],
@@ -2412,7 +2467,7 @@ def _handle_teacher_response(
                                         acq_w, acq_type,
                                         "bootstrap" if mode == "first_words" else "context")
                             # TimeChain: word learned → declarative fork
-                            send_queue.put({"type": "TIMECHAIN_COMMIT", "src": name,
+                            send_queue.put({"type": bus.TIMECHAIN_COMMIT, "src": name,
                                 "dst": "timechain", "ts": time.time(), "payload": {
                                 "fork": "declarative", "thought_type": "declarative",
                                 "source": "language_teacher",
@@ -2474,7 +2529,7 @@ def _handle_teacher_response(
                             if len(_kr_word) <= 6 else _kr_word
                         )
                         try:
-                            _send_msg(send_queue, "CGN_KNOWLEDGE_REQ", name,
+                            _send_msg(send_queue, bus.CGN_KNOWLEDGE_REQ, name,
                                       "knowledge", {
                                 "topic": _kr_query,
                                 "original_word": _kr_word,  # preserve for attribution
@@ -2529,7 +2584,7 @@ def _handle_teacher_response(
             logger.warning("[TEACHER] Response processing error: %s", e)
 
     # ── Send TEACHER_SIGNALS to spirit_worker ────────────────────────
-    _send_msg(send_queue, "TEACHER_SIGNALS", name, "spirit", {
+    _send_msg(send_queue, bus.TEACHER_SIGNALS, name, "spirit", {
         "perturbation_deltas": perturbation_deltas,
         "msl_signals": msl_signals,
         "dynamic_recipes": dynamic_recipes,
@@ -2572,14 +2627,14 @@ def _handle_speak_request(
 
     if len(state_132d) < 65:
         logger.warning("[LanguageWorker] SPEAK_REQUEST: state_vector too short (%d)", len(state_132d))
-        _send_msg(send_queue, "SPEAK_RESULT", name, dst, {"sentence": ""})
+        _send_msg(send_queue, bus.SPEAK_RESULT, name, dst, {"sentence": ""})
         return
 
     # 1. Load vocabulary from DB (fresh each time)
     vocab = load_vocabulary(db_path)
     if not vocab:
         logger.info("[LanguageWorker] SPEAK: no vocabulary — returning empty")
-        _send_msg(send_queue, "SPEAK_RESULT", name, dst, {
+        _send_msg(send_queue, bus.SPEAK_RESULT, name, dst, {
             "sentence": "", "bootstrap_needed": True})
         return
 
@@ -2637,7 +2692,7 @@ def _handle_speak_request(
 
     if not result.get("sentence"):
         logger.debug("[LanguageWorker] SPEAK: compose returned empty")
-        _send_msg(send_queue, "SPEAK_RESULT", name, dst, {"sentence": ""})
+        _send_msg(send_queue, bus.SPEAK_RESULT, name, dst, {"sentence": ""})
         return
 
     sentence = result["sentence"]
@@ -2707,11 +2762,11 @@ def _handle_speak_request(
     }
     if _social_ctx:
         _speak_result["social_contagion"] = _social_ctx
-    _send_msg(send_queue, "SPEAK_RESULT", name, dst, _speak_result)
+    _send_msg(send_queue, bus.SPEAK_RESULT, name, dst, _speak_result)
 
     # TimeChain: SPEAK composition → episodic fork (creative expression)
     if sentence and level >= 3:  # Only L3+ compositions (non-trivial)
-        send_queue.put({"type": "TIMECHAIN_COMMIT", "src": name,
+        send_queue.put({"type": bus.TIMECHAIN_COMMIT, "src": name,
             "dst": "timechain", "ts": time.time(), "payload": {
             "fork": "episodic", "thought_type": "episodic",
             "source": "expression_speak",
@@ -2867,7 +2922,7 @@ def _send_msg(send_queue, msg_type: str, src: str, dst: str,
 def _send_response(send_queue, src: str, dst: str,
                    payload: dict, rid: str) -> None:
     """Send a RESPONSE message back."""
-    _send_msg(send_queue, "RESPONSE", src, dst, payload, rid)
+    _send_msg(send_queue, bus.RESPONSE, src, dst, payload, rid)
 
 
 # Heartbeat throttle (Phase E Fix 2): 3s min interval per process.
@@ -2886,5 +2941,5 @@ def _send_heartbeat(send_queue, name: str) -> None:
         rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
     except Exception:
         rss_mb = 0
-    _send_msg(send_queue, "MODULE_HEARTBEAT", name, "guardian",
+    _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian",
               {"rss_mb": round(rss_mb, 1)})

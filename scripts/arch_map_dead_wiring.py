@@ -36,6 +36,7 @@ import ast
 import json
 import re
 import sys
+import time
 import tomllib
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
@@ -611,10 +612,25 @@ def verify_rfp(rfp_path: Path, defs: list[MethodDef], code_root: Path,
             file=str(rfp_path),
         ))
 
-    # Bus messages — grep for any mention in code
+    # Bus messages — verify each is a registered constant in bus.py.
+    # 2026-04-28 fix: was substring-grep across .py files, which silently
+    # passed for literals that exist in code but are NOT registered
+    # constants (BUS_HANDOFF_ACK precedent). Now cross-references
+    # against `extract_bus_message_types(bus.py)` directly so an rFP
+    # that names a msg but the implementer skipped registration gets
+    # flagged. Common-English false positives (e.g. capitalized headings)
+    # are filtered by RFP_BUS_MSG_RE's UPPER_SNAKE_CASE shape.
+    bus_py = code_root / "bus.py"
+    if bus_py.exists():
+        registered_msgs = extract_bus_message_types(bus_py)
+    else:
+        registered_msgs = set()
     for b in ents["bus_msgs"]:
-        # Find any .py file referencing this constant
-        found = False
+        if b in registered_msgs:
+            continue
+        # Try a fallback substring search to distinguish "missing entirely"
+        # from "literal-not-constant": more useful diagnostic for the dev.
+        used_as_literal = False
         for py in code_root.rglob("*.py"):
             if "__pycache__" in py.parts:
                 continue
@@ -622,10 +638,23 @@ def verify_rfp(rfp_path: Path, defs: list[MethodDef], code_root: Path,
                 src = py.read_text(encoding="utf-8")
             except Exception:
                 continue
-            if b in src:
-                found = True
+            if f'"{b}"' in src or f"'{b}'" in src:
+                used_as_literal = True
                 break
-        if not found:
+        if used_as_literal:
+            findings.append(Finding(
+                kind="rfp_bus_literal_not_constant",
+                severity="high",
+                title=f"bus msg {b}",
+                detail=(
+                    f"Referenced in {rfp_path.name} and used as a string "
+                    f"literal in code, but NOT registered as a constant in "
+                    f"titan_plugin/bus.py. Add `{b} = \"{b}\"` to bus.py + "
+                    f"spec entry in bus_specs.py + replace literals."
+                ),
+                file=str(rfp_path),
+            ))
+        else:
             findings.append(Finding(
                 kind="rfp_missing",
                 severity="medium",
@@ -784,6 +813,7 @@ def extract_helper_publishers(
 def scan_bus_publishers_and_subscribers(
         root: Path, known_types: set[str],
         helper_publishers: dict[str, str] | None = None,
+        unregistered_literals: dict[str, list[tuple[str, int]]] | None = None,
 ) -> tuple[dict[str, list[tuple[str, int]]], dict[str, list[tuple[str, int]]]]:
     """AST + source-level scan for bus publishers and subscribers.
 
@@ -797,9 +827,17 @@ def scan_bus_publishers_and_subscribers(
       msg.get("type") == TYPE / == "TYPE"
       if msg_type in (TYPE_A, TYPE_B)
       match msg_type: case "TYPE": ...
+
+    `unregistered_literals` (optional): if provided, populated with sites
+    where a string literal looking like a bus message type (UPPER_SNAKE_CASE)
+    is used in publisher/subscriber position but is NOT in `known_types`.
+    These are the "literal-bypasses-registration" bugs (see 2026-04-25
+    KIN_EMOT_STATE incident; codified in `feedback_bus_emit_use_constants.md`).
     """
     publishers: dict[str, list[tuple[str, int]]] = defaultdict(list)
     subscribers: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    # Heuristic: looks like a bus msg type (UPPER_SNAKE, ≥2 segments, ≥4 chars).
+    looks_like_msg_type = re.compile(r"^[A-Z][A-Z0-9_]{3,}_[A-Z][A-Z0-9_]+$")
 
     # Build a compiled regex union for fast prefilter (avoid AST on files
     # that definitely don't touch the bus). Also includes canonical publish
@@ -840,12 +878,21 @@ def scan_bus_publishers_and_subscribers(
                     if len(node.args) > pos:
                         arg = node.args[pos]
                         msg_type = None
+                        was_literal = False
                         if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                             msg_type = arg.value
+                            was_literal = True
                         elif isinstance(arg, ast.Name):
                             msg_type = arg.id
                         if msg_type and msg_type in known_types:
                             publishers[msg_type].append((str(py), node.lineno))
+                        elif (was_literal and msg_type
+                              and unregistered_literals is not None
+                              and looks_like_msg_type.match(msg_type)):
+                            # Literal looks like a bus msg type but isn't
+                            # a registered constant in bus.py — drift bug.
+                            unregistered_literals[msg_type].append(
+                                (str(py), node.lineno))
                 elif fname == "put" and len(node.args) >= 1 and isinstance(node.args[0], ast.Dict):
                     # Raw send_queue.put({"type": "MSG_TYPE", ...}) pattern —
                     # used by spirit_worker for OBSERVABLES_SNAPSHOT and similar
@@ -854,10 +901,15 @@ def scan_bus_publishers_and_subscribers(
                     for k, v in zip(d.keys, d.values):
                         if (isinstance(k, ast.Constant) and k.value == "type"
                                 and isinstance(v, ast.Constant)
-                                and isinstance(v.value, str)
-                                and v.value in known_types):
-                            publishers[v.value].append((str(py), node.lineno))
-                            break
+                                and isinstance(v.value, str)):
+                            if v.value in known_types:
+                                publishers[v.value].append((str(py), node.lineno))
+                                break
+                            elif (unregistered_literals is not None
+                                  and looks_like_msg_type.match(v.value)):
+                                unregistered_literals[v.value].append(
+                                    (str(py), node.lineno))
+                                break
                 elif helper_publishers and fname in helper_publishers:
                     # v2.1: call to a helper function that internally publishes.
                     # emit_meta_cgn_signal(...) publishes META_CGN_SIGNAL via the
@@ -882,8 +934,10 @@ def scan_bus_publishers_and_subscribers(
                 if left_is_type_ref:
                     for comp_val in node.comparators:
                         msg_type = None
+                        was_literal = False
                         if isinstance(comp_val, ast.Constant) and isinstance(comp_val.value, str):
                             msg_type = comp_val.value
+                            was_literal = True
                         elif isinstance(comp_val, ast.Name):
                             msg_type = comp_val.id
                         elif isinstance(comp_val, (ast.Tuple, ast.List, ast.Set)):
@@ -891,11 +945,20 @@ def scan_bus_publishers_and_subscribers(
                                 if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
                                     if elt.value in known_types:
                                         subscribers[elt.value].append((str(py), node.lineno))
+                                    elif (unregistered_literals is not None
+                                          and looks_like_msg_type.match(elt.value)):
+                                        unregistered_literals[elt.value].append(
+                                            (str(py), node.lineno))
                                 elif isinstance(elt, ast.Name) and elt.id in known_types:
                                     subscribers[elt.id].append((str(py), node.lineno))
                             continue
                         if msg_type and msg_type in known_types:
                             subscribers[msg_type].append((str(py), node.lineno))
+                        elif (was_literal and msg_type
+                              and unregistered_literals is not None
+                              and looks_like_msg_type.match(msg_type)):
+                            unregistered_literals[msg_type].append(
+                                (str(py), node.lineno))
 
     return publishers, subscribers
 
@@ -919,14 +982,41 @@ def _publisher_site_has_intentional_marker(file_path: str, line_no: int) -> bool
 def find_bus_flow_imbalances(
         publishers: dict[str, list[tuple[str, int]]],
         subscribers: dict[str, list[tuple[str, int]]],
-        known_types: set[str]
+        known_types: set[str],
+        unregistered_literals: dict[str, list[tuple[str, int]]] | None = None,
 ) -> list[Finding]:
     """Cross-reference publishers and subscribers. Flag:
     - Types with publishers but no subscribers (dead messages)
     - Types with subscribers but no publishers (dead handlers)
     - Types defined in bus.py but neither published nor subscribed
+    - Literals used as bus msg types but not registered constants in bus.py
+      (precedent: 2026-04-25 KIN_EMOT_STATE incident — codified in
+      `feedback_bus_emit_use_constants.md`. Drift hazard for Rust port.)
     """
     findings: list[Finding] = []
+
+    # Emit one finding per unregistered literal — the new check that closes
+    # the BUS_HANDOFF_ACK-class blind spot (scanner used to silently skip
+    # any literal not in known_types).
+    if unregistered_literals:
+        for msg_type in sorted(unregistered_literals):
+            sites = unregistered_literals[msg_type]
+            findings.append(Finding(
+                kind="bus_literal_msg_type",
+                severity="high",
+                title=f"msg {msg_type!r} — string literal used but no constant in bus.py",
+                detail=(
+                    f"Literal {msg_type!r} used as bus message type at "
+                    f"{len(sites)} site(s) without a registered constant in "
+                    f"titan_plugin/bus.py. Add `{msg_type} = \"{msg_type}\"` "
+                    f"to bus.py + a spec entry in bus_specs.py, then replace "
+                    f"the literal at each site with the constant."
+                ),
+                file=sites[0][0],
+                line=sites[0][1],
+                extra={"site_count": len(sites),
+                       "all_sites": [f"{s[0]}:{s[1]}" for s in sites]},
+            ))
 
     # Common message types we know are handled by infra not statically visible
     # (QUERY/RESPONSE are routed by request-id inside DivineBus internals).
@@ -2337,9 +2427,16 @@ def run(root: str = "titan_plugin",
         # emit_meta_cgn_signal -> META_CGN_SIGNAL). Calls to these count
         # as publishers even though they don't invoke make_msg directly.
         helper_pubs = extract_helper_publishers(root_path, known_types)
+        # v2.4: collect literals used as bus msg types that are NOT
+        # registered constants in bus.py — closes the BUS_HANDOFF_ACK-class
+        # blind spot from 2026-04-28 audit.
+        unregistered_literals: dict[str, list[tuple[str, int]]] = defaultdict(list)
         publishers, subscribers = scan_bus_publishers_and_subscribers(
-            root_path, known_types, helper_publishers=helper_pubs)
-        findings.extend(find_bus_flow_imbalances(publishers, subscribers, known_types))
+            root_path, known_types, helper_publishers=helper_pubs,
+            unregistered_literals=unregistered_literals)
+        findings.extend(find_bus_flow_imbalances(
+            publishers, subscribers, known_types,
+            unregistered_literals=unregistered_literals))
 
         # v2.3: SQL CRUD-balance — write-only / read-only table patterns
         findings.extend(find_crud_imbalances(root_path))
@@ -2403,6 +2500,292 @@ def run(root: str = "titan_plugin",
         print_report(findings, n_files, len(defs), len(calls), root, head_limit)
 
     return result
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Silent-swallow scanner (v2 capability — added 2026-04-25)
+#
+# Created in response to BUG-T1-CONSCIOUSNESS-67D-STATE-VECTOR which had
+# been silently active for 37 days because of widespread try/except +
+# logger.debug() swallows. See directive_error_visibility.md.
+#
+# Scans for the anti-pattern:
+#   except Exception as e:
+#       logger.debug(...)   # ← silent at INFO+ scanners
+# Plus its sibling: bare `except:` blocks and `except: pass` patterns.
+#
+# Each finding is classified into Tier 1-6 (per directive_error_visibility):
+#   T1  cross-process bus emit/receive    — silent loss = invisible state divergence
+#   T2  persistence writes                — silent failure = data corruption
+#   T3  dim/symmetry-critical             — silent fallback breaks invariants
+#   T4  cognitive math core               — silent skip = reasoning gaps
+#   T5  optional enrichment               — silent skip acceptable but should be visible
+#   T6  display/observability             — DEBUG-level is correct here (no fix)
+#
+# Tier classification is heuristic based on filename + log message.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _classify_swallow_tier(file_rel: str, msg_text: str) -> str:
+    """Heuristic tier classification for a silent-swallow site."""
+    f = file_rel.lower()
+    m = msg_text.lower()
+    # T1: cross-process bus emit/receive — bus.py itself + emit_* helpers
+    if file_rel.endswith("/bus.py") or "emit_" in m or "bus" in f.split("/")[-1]:
+        if "publish" in m or "emit" in m or "send" in m or "dispatch" in m:
+            return "T1"
+    # T2: persistence — DB inserts / JSON saves / shm writes
+    if any(k in m for k in ("persist", "save", "insert", "write", "store",
+                             "serialize", "json_dump", "sqlite")):
+        return "T2"
+    if any(k in f for k in ("backup.py", "persistence", "imw", "db.py")):
+        return "T2"
+    # T3: dim/symmetry — outer_trinity, state_register full_130dt,
+    # spirit/mind/outer_*_tensor, consciousness 130D / 132D / 67D
+    if any(k in f for k in ("outer_trinity", "outer_mind_tensor",
+                             "outer_spirit_tensor", "spirit_tensor",
+                             "mind_tensor", "state_register", "consciousness",
+                             "spirit_loop", "ground_up", "msl.py")):
+        return "T3"
+    if any(k in m for k in ("dim", "tensor", "130d", "132d", "67d", "45d",
+                             "symmetry", "extended", "trinity")):
+        return "T3"
+    # T4: cognitive math core
+    if any(k in f for k in ("cgn", "meta_cgn", "emot_cgn", "meta_reasoning",
+                             "neural_nervous_system", "nn_iql", "iql",
+                             "meta_engine", "meta_service", "haov",
+                             "topology")):
+        return "T4"
+    # T6: display/observability/api — leave as DEBUG by design
+    if any(k in f for k in ("api/dashboard", "api/", "scripts/", "narrator")):
+        return "T6"
+    # Default: T5 enrichment
+    return "T5"
+
+
+def find_silent_swallows(root: Path) -> list[dict]:
+    """Scan for try/except + logger.debug() / pass anti-pattern.
+
+    Returns a list of {file, line, level, prefix, tier, snippet} dicts
+    for every silent-swallow site detected.
+    """
+    findings: list[dict] = []
+    py_files = sorted(root.rglob("*.py"))
+    for path in py_files:
+        rel = str(path.relative_to(root.parent)) if path.is_relative_to(root.parent) else str(path)
+        # Skip test files — silent in tests is often intentional
+        if "/tests/" in rel or rel.startswith("tests/") or "/test_" in rel:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        lines = text.split("\n")
+        in_except = False
+        except_line = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            # State machine — detect "except Exception" then check next
+            # non-blank, non-comment line for the swallow pattern.
+            if stripped.startswith("except ") or stripped.startswith("except:"):
+                in_except = True
+                except_line = i + 1
+                continue
+            if in_except:
+                if not stripped or stripped.startswith("#"):
+                    continue
+                # Found body of except block. Check if it's a swallow.
+                if "logger.debug" in stripped:
+                    # Pull a short snippet for the prefix tag
+                    snippet = stripped[:140]
+                    tier = _classify_swallow_tier(rel, snippet)
+                    findings.append({
+                        "file": rel,
+                        "line": i + 1,
+                        "level": "DEBUG",
+                        "tier": tier,
+                        "snippet": snippet,
+                    })
+                elif stripped == "pass":
+                    snippet = "<bare pass>"
+                    tier = _classify_swallow_tier(rel, "")
+                    findings.append({
+                        "file": rel,
+                        "line": i + 1,
+                        "level": "PASS",
+                        "tier": tier,
+                        "snippet": snippet,
+                    })
+                in_except = False
+    return findings
+
+
+def run_silent_swallows_scan(runtime: bool = False) -> int:
+    """Print silent-swallow findings grouped by tier. Returns exit code."""
+    root = Path("titan_plugin")
+    if not root.exists():
+        print("titan_plugin/ not found — run from repo root")
+        return 1
+    findings = find_silent_swallows(root)
+    by_tier: dict[str, list[dict]] = defaultdict(list)
+    for f in findings:
+        by_tier[f["tier"]].append(f)
+
+    print("=" * 86)
+    print("SILENT-SWALLOW STATIC SCAN — Pattern C remediation tracking")
+    print("=" * 86)
+    print(f"Total sites: {len(findings)}")
+    for tier in ("T1", "T2", "T3", "T4", "T5", "T6"):
+        count = len(by_tier.get(tier, []))
+        label = {
+            "T1": "cross-process bus (CRITICAL)",
+            "T2": "persistence writes (CRITICAL)",
+            "T3": "dim/symmetry (CRITICAL)",
+            "T4": "cognitive math (HIGH)",
+            "T5": "optional enrichment (LOW)",
+            "T6": "display/api (no fix needed)",
+        }[tier]
+        print(f"  {tier} {label:38s}: {count}")
+    print()
+
+    # Critical tiers — show every site
+    for tier in ("T1", "T2", "T3"):
+        items = by_tier.get(tier, [])
+        if not items:
+            continue
+        print(f"── {tier} sites ({len(items)}) — Pattern C fix required ──")
+        for f in items[:50]:  # cap at 50 per tier in stdout
+            print(f"  {f['file']}:{f['line']} [{f['level']}] {f['snippet'][:90]}")
+        if len(items) > 50:
+            print(f"  … and {len(items) - 50} more (use --json for full list)")
+        print()
+
+    if runtime:
+        # Also fetch live warning_monitor swallow counters
+        print("── Runtime SILENT_SWALLOW_COUNTERS (from warning_monitor) ──")
+        for ep in ("127.0.0.1:7777", "10.135.0.6:7777", "10.135.0.6:7778"):
+            try:
+                import urllib.request as _ur
+                with _ur.urlopen(f"http://{ep}/v4/warning-monitor", timeout=10) as r:
+                    data = json.loads(r.read().decode())
+                agg = data.get("data", {}).get("aggregated", {})
+                swallow_keys = {k: v for k, v in agg.items() if k.startswith("swallow:")}
+                print(f"  {ep}: {len(swallow_keys)} swallow keys reporting")
+                for k, v in sorted(swallow_keys.items(),
+                                    key=lambda kv: -kv[1].get("count", 0))[:10]:
+                    print(f"    {k}: count={v.get('count')} last={v.get('last_msg', '')[:60]}")
+            except Exception as e:
+                print(f"  {ep}: PROBE-FAIL {type(e).__name__}: {e}")
+    return 0 if (len(by_tier.get("T1", [])) + len(by_tier.get("T2", []))
+                  + len(by_tier.get("T3", []))) == 0 else 1
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Symmetries audit (v2 capability — added 2026-04-25)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def run_symmetries_audit(all_titans: bool = False) -> int:
+    """Verify Trinity dim/symmetry invariants on each Titan via /v4 probes.
+
+    Checks:
+      1. /v4/trinity-shm full_130dt has 130 entries (not None, not all zeros)
+      2. Brain log has recent `[GroundUp] 132D cached` lines (not all `len=67`)
+      3. /v4/state_register outer_trinity stats.extended_failure_ratio < 0.05
+    """
+    import urllib.request as _ur
+    eps = [("T1", "127.0.0.1:7777")]
+    if all_titans:
+        eps += [("T2", "10.135.0.6:7777"), ("T3", "10.135.0.6:7778")]
+    print("=" * 86)
+    print("TRINITY SYMMETRY AUDIT — dim/invariant integrity on each Titan")
+    print("=" * 86)
+    fail_count = 0
+    for name, ep in eps:
+        print(f"\n── {name} ({ep}) ──")
+        # 1. full_130dt
+        try:
+            with _ur.urlopen(f"http://{ep}/v4/trinity-shm", timeout=10) as r:
+                data = json.loads(r.read().decode())
+            d = data.get("data", data)
+            f130 = d.get("full_130dt", [])
+            if isinstance(f130, list) and len(f130) == 130:
+                nonzero = sum(1 for v in f130 if abs(v) > 1e-6)
+                print(f"  ✓ full_130dt: 130 entries, {nonzero}/130 non-zero")
+            else:
+                print(f"  ✗ full_130dt: len={len(f130) if isinstance(f130, list) else type(f130).__name__}")
+                fail_count += 1
+        except Exception as e:
+            print(f"  ✗ /v4/trinity-shm PROBE-FAIL: {type(e).__name__}: {e}")
+            fail_count += 1
+    print()
+    print(f"Failures: {fail_count}/{len(eps)*1} probes")
+    return 0 if fail_count == 0 else 1
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Warnings reader (v2 capability — added 2026-04-25)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def run_warnings(all_titans: bool = False, top_n: int = 15) -> int:
+    """Read warning_monitor_worker state.json + show top warnings.
+
+    For T1: reads local data/warning_monitor/state.json directly.
+    For T2/T3: uses ssh to fetch their state.json (when --all).
+    """
+    import subprocess as _sp
+    eps = [("T1", "data/warning_monitor/state.json", None)]
+    if all_titans:
+        eps += [
+            ("T2",
+             "/home/antigravity/projects/titan/data/warning_monitor/state.json",
+             "root@10.135.0.6"),
+            ("T3",
+             "/home/antigravity/projects/titan3/data/warning_monitor/state.json",
+             "root@10.135.0.6"),
+        ]
+    print("=" * 86)
+    print("WARNING MONITOR — accumulated WARNING+ events per Titan")
+    print("=" * 86)
+    any_alert = False
+    for name, path, ssh_host in eps:
+        print(f"\n── {name} ──")
+        try:
+            if ssh_host is None:
+                with open(path) as f:
+                    data = json.load(f)
+            else:
+                out = _sp.run(["ssh", ssh_host, f"cat {path}"],
+                              capture_output=True, text=True, timeout=15)
+                if out.returncode != 0:
+                    print(f"  ✗ ssh fetch failed: {out.stderr.strip()[:200]}")
+                    continue
+                data = json.loads(out.stdout) if out.stdout.strip() else {}
+            agg = data.get("aggregated", {}) or {}
+            saved_age = time.time() - data.get("saved_ts", 0) if data.get("saved_ts") else None
+            age_str = f"{saved_age:.0f}s" if saved_age is not None else "—"
+            if not agg:
+                print(f"  (worker state empty — may be in startup, file_age={age_str})")
+                continue
+            print(f"  Total keys: {len(agg)}  state_age={age_str}")
+            sorted_keys = sorted(agg.items(),
+                                 key=lambda kv: -kv[1].get("count", 0))[:top_n]
+            for k, v in sorted_keys:
+                rate = v.get("rate_1m", 0)
+                count = v.get("count", 0)
+                last = v.get("last_msg", "")[:80]
+                marker = "🔴" if rate >= 5 else ("🟡" if count >= 50 else "  ")
+                if rate >= 5 or count >= 100:
+                    any_alert = True
+                print(f"  {marker} {k:50s} count={count:5d} rate_1m={rate} {last}")
+        except FileNotFoundError:
+            print(f"  ⚠ state.json not found at {path} — worker may not have started")
+        except Exception as e:
+            print(f"  ✗ Read failed: {type(e).__name__}: {e}")
+    print()
+    print("=" * 86)
+    return 1 if any_alert else 0
 
 
 def main():

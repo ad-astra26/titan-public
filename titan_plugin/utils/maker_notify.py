@@ -18,6 +18,7 @@ import os
 import time
 from pathlib import Path
 from typing import Optional
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,8 @@ def _save_dedup(state: dict) -> None:
             json.dump(state, f, indent=2)
         os.replace(tmp, _DEDUP_STATE_PATH)
     except Exception as e:
-        logger.debug("[MakerNotify] Dedup save failed: %s", e)
+        swallow_warn('[MakerNotify] Dedup save failed', e,
+                     key="utils.maker_notify.dedup_save_failed", throttle=100)
 
 
 def notify_maker(alert_class: str, titan_id: str, text: str,

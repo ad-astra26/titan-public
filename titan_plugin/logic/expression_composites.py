@@ -366,6 +366,16 @@ class ExpressionManager:
 
     def __init__(self):
         self.composites: dict[str, ExpressionComposite] = {}
+        # Mainnet Lifecycle Wiring rFP (2026-04-20): metabolism gate callable.
+        # Spirit_worker injects a callable (feature, caller) -> (proceed, rate)
+        # that hits /v4/metabolism/evaluate-gate over HTTP. When gates_enforced
+        # and the 'expression' feature is disabled at current tier, fire is
+        # suppressed. Keeps ExpressionManager standalone (no plugin imports).
+        self._metabolism_gate = None
+
+    def set_metabolism_gate(self, gate_callable) -> None:
+        """Inject metabolism gate (Mainnet Lifecycle Wiring rFP 2026-04-20)."""
+        self._metabolism_gate = gate_callable
 
     def register(self, composite: ExpressionComposite) -> None:
         self.composites[composite.name] = composite
@@ -391,6 +401,23 @@ class ExpressionManager:
                      where composition engine isn't available).
         """
         fired = []
+        # Mainnet Lifecycle Wiring rFP (2026-04-20): evaluate metabolism gate
+        # ONCE per batch (not per composite) to avoid log-storm + ring-buffer
+        # flooding. Gate closed → suppress entire batch. Observation mode
+        # returns (True, 1.0) so no behavior change until flip.
+        gate_open = True
+        if self._metabolism_gate is not None:
+            try:
+                proceed, _rate = self._metabolism_gate(
+                    "expression", "ExpressionManager.evaluate_all")
+                gate_open = bool(proceed)
+            except Exception as _mge:
+                logger.debug("[ExpressionManager] Gate check failed: %s", _mge)
+                gate_open = True  # fail-open
+        if not gate_open:
+            logger.info("[ExpressionManager] Batch suppressed by metabolism gate")
+            return fired
+
         for name, comp in self.composites.items():
             if exclude and name in exclude:
                 continue

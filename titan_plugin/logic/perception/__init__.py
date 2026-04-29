@@ -13,9 +13,13 @@ Usage in spirit_worker:
 """
 import importlib
 import logging
+import math
 import os
+import threading
 import time
 from dataclasses import dataclass, field
+from typing import Optional
+from titan_plugin import bus
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,62 @@ MAX_SELF_STRENGTH = 0.05
 MAX_EXTERNAL_STRENGTH = 0.035
 MAX_CLAMP = 0.08
 MAX_FEATURES_PER_MODALITY = 50
+
+# rFP_phase1_sensory_wiring (2026-04-23): creation_nudge was unbounded
+# accumulator — every SENSE event pushed outer_body[2] by +0.03 with no
+# decay, so it saturated to 1.0 permanently on any creating Titan. Fix:
+# exponential mean-revert toward 0.5 with ~5min half-life BEFORE each
+# new nudge. Lets sensory activity show up as real signal, but idle
+# periods return the dim to baseline.
+_CREATION_NUDGE_HALF_LIFE_S = 300.0  # 5 minutes
+_CREATION_NUDGE_BASELINE = 0.5
+_creation_nudge_last_ts = 0.0
+_creation_nudge_lock = threading.Lock()
+
+
+def _apply_creation_nudge_with_decay(
+        current: float, nudge: float, now: Optional[float] = None) -> float:
+    """Exponential mean-revert toward baseline (0.5) + new nudge.
+
+    Prevents permanent saturation of outer_body[2] somatosensation from
+    accumulating creation_nudges across thousands of perception events.
+
+    Args:
+        current: current outer_body[2] value
+        nudge: the new event's creation_nudge magnitude
+        now: wall-clock time (injectable for testing)
+    Returns:
+        new outer_body[2] value, clamped [0, 1]
+    """
+    global _creation_nudge_last_ts
+    if now is None:
+        now = time.time()
+
+    with _creation_nudge_lock:
+        last_ts = _creation_nudge_last_ts
+        _creation_nudge_last_ts = now
+
+    # Decay toward baseline based on time since last event.
+    # decay_factor: 1.0 at dt=0 (no decay), → 0.0 as dt → inf
+    if last_ts > 0 and now > last_ts:
+        dt = now - last_ts
+        # Use half-life-based exponential: decay_factor = 2^(-dt/half_life)
+        decay_factor = math.pow(2.0, -dt / _CREATION_NUDGE_HALF_LIFE_S)
+    else:
+        decay_factor = 1.0  # First event, no prior timestamp
+
+    # Mean-revert current toward baseline
+    decayed = _CREATION_NUDGE_BASELINE + (current - _CREATION_NUDGE_BASELINE) * decay_factor
+
+    # Apply new event nudge
+    return max(0.0, min(1.0, decayed + nudge))
+
+
+def _reset_creation_nudge_for_testing() -> None:
+    """Test helper — clears decay timer state."""
+    global _creation_nudge_last_ts
+    with _creation_nudge_lock:
+        _creation_nudge_last_ts = 0.0
 
 
 # ── Data classes ─────────────────────────────────────────────────────
@@ -312,12 +372,12 @@ class SensoryHub:
             delta = max(-mod.clamp, min(mod.clamp, delta))
             target_array[mod.target_idx] = max(0.0, min(1.0, target_array[mod.target_idx] + delta))
 
-        # Creation nudge (somatosensation)
+        # Creation nudge (somatosensation) — decay-aware (rFP Phase 1)
         nudge = modality.creation_nudge_self if source == "self" else modality.creation_nudge_external
         if nudge > 0:
             ob = _get_target("outer_body")
             if ob and len(ob) > 2:
-                ob[2] = min(1.0, ob[2] + nudge)
+                ob[2] = _apply_creation_nudge_with_decay(ob[2], nudge)
 
         # Write back all modified targets (once per target)
         for target_name, arr in targets_modified.items():
@@ -350,7 +410,7 @@ class SensoryHub:
         remap = {
             0: features[4],  # interoception ← harmony
             1: features[1],  # proprioception ← structure
-            3: features[2] if msg_type == "SENSE_AUDIO" else features[3],  # entropy
+            3: features[2] if msg_type == bus.SENSE_AUDIO else features[3],  # entropy
             4: features[0],  # thermal ← warmth
         }
         for dim, target in remap.items():

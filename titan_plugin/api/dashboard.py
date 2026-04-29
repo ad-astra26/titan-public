@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 # `def _query(): conn = sqlite3.connect(...); await asyncio.to_thread(_query)`
 # to `await sqlite_async.query(...)` / `sqlite_async.with_connection(...)`.
 from titan_plugin.core import sqlite_async
+from titan_plugin import bus
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,29 @@ def _is_internal_injection(prompt: str) -> bool:
     return bool(prompt) and _INTERNAL_INJECTION_RE.match(prompt) is not None
 
 
+# rFP_observatory_data_loading_v1 §3.3 fix (2026-04-26): ObservatoryDB lives
+# in titan_main process (TitanPlugin._observatory_db). api_subprocess can't
+# reach it via attribute access — but the SQLite file is shared on disk, so
+# we open a read-only connection here. Affects /v4/history (Circadian Timeline)
+# + /status/history (Sovereignty Horizon 7d) — both showed empty before.
+#
+# rFP_universal_sqlite_writer Phase 2: thin wrapper around the global
+# per-process singleton in observatory_db. Keeps the existing call signature
+# `_get_observatory_db()` untouched at every call site below; under the hood
+# we now share one instance with the rest of the api_subprocess process.
+
+
+def _get_observatory_db():
+    """Per-process ObservatoryDB singleton for api_subprocess endpoints.
+    SQLite is multi-reader-safe; titan_main keeps the writer instance."""
+    try:
+        from titan_plugin.utils.observatory_db import get_observatory_db
+        return get_observatory_db()
+    except Exception as e:
+        logger.warning("[Dashboard] ObservatoryDB lazy init failed: %s", e)
+        return None
+
+
 def _content_hash(prompt: str, response: str = "") -> str:
     """Stable 16-char SHA-256 prefix for a memory's content (display only)."""
     payload = (prompt or "") + "\x1f" + (response or "")
@@ -130,7 +154,18 @@ def _content_hash(prompt: str, response: str = "") -> str:
 # Helpers
 # ---------------------------------------------------------------------------
 def _get_plugin(request: Request):
-    return request.app.state.titan_plugin
+    """Returns the TitanStateAccessor (post-S5-amendment).
+
+    Name preserved for backward-compat with existing endpoint callsites;
+    the value returned is now the StateAccessor exposing
+    titan_state.<sub>.<attr> instead of the legacy plugin object.
+    """
+    return request.app.state.titan_state
+
+
+def _get_state(request: Request):
+    """Canonical accessor — preferred over _get_plugin in new code."""
+    return request.app.state.titan_state
 
 
 def _ok(data: dict) -> JSONResponse:
@@ -163,16 +198,17 @@ def _start_coordinator_warmer(plugin) -> None:
     cache every (TTL - 2)s in a daemon thread, so endpoints always see
     fresh data instantly. No-op if already started or no spirit_proxy.
     """
+    titan_state = plugin  # S5 amendment alias for codemod-rewritten refs
     global _coordinator_warmer_started
     if _coordinator_warmer_started:
         return
-    spirit_proxy = plugin._proxies.get("spirit") if hasattr(plugin, "_proxies") else None
+    spirit_proxy = titan_state.spirit if hasattr(plugin, "_proxies") else None
     if not spirit_proxy:
         return
     _coordinator_warmer_started = True
 
-    body_proxy = plugin._proxies.get("body") if hasattr(plugin, "_proxies") else None
-    mind_proxy = plugin._proxies.get("mind") if hasattr(plugin, "_proxies") else None
+    body_proxy = titan_state.body if hasattr(plugin, "_proxies") else None
+    mind_proxy = titan_state.mind if hasattr(plugin, "_proxies") else None
 
     def _warmer_loop():
         import time as _t
@@ -220,53 +256,142 @@ def _get_cached_coordinator(plugin) -> dict:
     IMPORTANT: The proxy call is synchronous and blocks the asyncio event loop
     for ~300-500ms. Use the async version (_get_cached_coordinator_async) from
     async endpoints to avoid blocking.
+
+    Error-response contract mirrors the async version: proxy returning the
+    `{"error": "Coordinator not available"}` sentinel (e.g. during a dream
+    cycle's query-backlog timeout) does NOT displace last-known-good cache.
     """
+    titan_state = plugin  # S5 amendment alias for codemod-rewritten refs
     now = time.time()
     if (now - _coordinator_cache["ts"] < _COORDINATOR_CACHE_TTL
-            and _coordinator_cache["data"]):
+            and _coordinator_cache["data"]
+            and not _is_coordinator_error_response(
+                _coordinator_cache["data"])):
         return _coordinator_cache["data"]
-    spirit_proxy = plugin._proxies.get("spirit")
+    spirit_proxy = titan_state.spirit
     if not spirit_proxy:
-        return _coordinator_cache.get("data") or {}
+        stale = _coordinator_cache.get("data") or {}
+        return {} if _is_coordinator_error_response(stale) else \
+            _stale_stamp(stale, _coordinator_cache.get("ts", 0))
     try:
         result = spirit_proxy.get_coordinator()
-        _coordinator_cache["data"] = result
-        _coordinator_cache["ts"] = now
-        return result
+        if not _is_coordinator_error_response(result):
+            _coordinator_cache["data"] = result
+            _coordinator_cache["ts"] = now
+            return result
+        # Error sentinel — serve last good if available
+        stale = _coordinator_cache.get("data") or {}
+        if _is_coordinator_error_response(stale) or not stale:
+            return result
+        return _stale_stamp(stale, _coordinator_cache.get("ts", 0))
     except Exception:
-        return _coordinator_cache.get("data") or {}
+        stale = _coordinator_cache.get("data") or {}
+        if _is_coordinator_error_response(stale):
+            return {}
+        return _stale_stamp(stale, _coordinator_cache.get("ts", 0))
+
+
+def _is_coordinator_error_response(result) -> bool:
+    """True when a spirit_proxy.get_coordinator() result is the sentinel
+    error response instead of real coordinator data.
+
+    During dream cycles, GIL-heavy numpy/torch compute starves the
+    background snapshot-builder thread, so the query handler's
+    synchronous fallback times out → proxy returns `{"error":
+    "Coordinator not available"}`. We don't want to cache that and
+    serve it for the next 5 seconds — we want to serve the last
+    successful snapshot instead, plus a `stale_seconds` marker so
+    callers can see how old it is.
+    """
+    return (isinstance(result, dict) and len(result) == 1
+            and "error" in result)
+
+
+def _stale_stamp(data: dict, ts: float) -> dict:
+    """Return a shallow copy of cached data with `cache_stale_seconds`
+    appended so consumers (operators, dashboards, safe_restart.sh) can
+    see how old this snapshot is. Zero perf cost when already fresh."""
+    if not isinstance(data, dict):
+        return data
+    stale_s = max(0.0, time.time() - ts)
+    # Only stamp on non-fresh data (TTL expired) to avoid cluttering
+    # normal responses. Threshold: 2× TTL = "really stale, caller may
+    # want to retry later."
+    if stale_s > _COORDINATOR_CACHE_TTL * 2:
+        return {**data, "cache_stale_seconds": round(stale_s, 1)}
+    return data
 
 
 async def _get_cached_coordinator_async(plugin) -> dict:
-    """Non-blocking coordinator cache: runs proxy call in thread pool."""
+    """Non-blocking coordinator cache: runs proxy call in thread pool.
+
+    Resilience contract (rev 2026-04-22):
+      - Fresh successful data (within TTL): return directly
+      - Stale successful data + concurrent refresh in flight: return
+        stale with cache_stale_seconds stamp
+      - Fresh fetch succeeds: cache + return
+      - Fresh fetch returns ERROR sentinel (dream-cycle query-backlog
+        timeout, etc.): DO NOT cache. Return last-known-good cached
+        data instead, stamped with cache_stale_seconds.
+      - Fresh fetch raises: same last-known-good fallback.
+      - No cached data ever + fetch failed: return empty dict (preserves
+        pre-fix behavior for cold-boot edge case).
+
+    This eliminates the "dream cycle blocks every coordinator endpoint"
+    class of outage that used to require waiting for the dream to
+    finish before safe_restart.sh could verify Titan state.
+    """
+    titan_state = plugin  # S5 amendment alias for codemod-rewritten refs
     import asyncio
     global _coordinator_refreshing
     # Lazy-start the background warmer on first use (idempotent).
     _start_coordinator_warmer(plugin)
     now = time.time()
     if (now - _coordinator_cache["ts"] < _COORDINATOR_CACHE_TTL
-            and _coordinator_cache["data"]):
+            and _coordinator_cache["data"]
+            and not _is_coordinator_error_response(
+                _coordinator_cache["data"])):
         return _coordinator_cache["data"]
-    # If another coroutine is already refreshing, return stale data
+    # If another coroutine is already refreshing, return stale data.
     if _coordinator_refreshing:
-        return _coordinator_cache.get("data") or {}
-    spirit_proxy = plugin._proxies.get("spirit")
+        stale = _coordinator_cache.get("data") or {}
+        if _is_coordinator_error_response(stale):
+            return {}
+        return _stale_stamp(stale, _coordinator_cache.get("ts", 0))
+    spirit_proxy = titan_state.spirit
     if not spirit_proxy:
-        return _coordinator_cache.get("data") or {}
+        stale = _coordinator_cache.get("data") or {}
+        return {} if _is_coordinator_error_response(stale) else \
+            _stale_stamp(stale, _coordinator_cache.get("ts", 0))
     try:
         _coordinator_refreshing = True
         result = await asyncio.to_thread(spirit_proxy.get_coordinator)
-        _coordinator_cache["data"] = result
-        _coordinator_cache["ts"] = time.time()
-        return result
+        # Only cache successful reads. Error sentinels don't displace
+        # last-known-good snapshot.
+        if not _is_coordinator_error_response(result):
+            _coordinator_cache["data"] = result
+            _coordinator_cache["ts"] = time.time()
+            return result
+        # Proxy returned error (dream-time timeout, etc.) — serve
+        # previous good snapshot with stale marker instead.
+        stale = _coordinator_cache.get("data") or {}
+        if _is_coordinator_error_response(stale) or not stale:
+            # No prior good data ever seen → return the error so the
+            # caller can surface it; preserves cold-boot behavior.
+            return result
+        return _stale_stamp(stale, _coordinator_cache.get("ts", 0))
     except Exception:
-        return _coordinator_cache.get("data") or {}
+        stale = _coordinator_cache.get("data") or {}
+        if _is_coordinator_error_response(stale):
+            return {}
+        return _stale_stamp(stale, _coordinator_cache.get("ts", 0))
     finally:
         _coordinator_refreshing = False
 
 
 def _get_consciousness_summary(plugin) -> dict | None:
     """Extract latest consciousness epoch for status response."""
+    titan_state = plugin  # S5 amendment alias for codemod-rewritten refs
     try:
         consciousness = getattr(plugin, 'consciousness', None)
         if not consciousness:
@@ -302,21 +427,22 @@ def _error(msg: str, code: int = 500) -> JSONResponse:
 
 async def _fetch_vault_info(plugin) -> dict | None:
     """Fetch and decode vault state from on-chain PDA. Returns VaultInfo dict or None."""
-    vault_program_id = plugin._full_config.get("network", {}).get("vault_program_id", "")
+    titan_state = plugin  # S5 amendment alias for codemod-rewritten refs
+    vault_program_id = titan_state.config.get("network", {}).get("vault_program_id", "")
     if not vault_program_id:
         return None
     try:
         from titan_plugin.utils.solana_client import (
             is_available as solana_ok, derive_vault_pda, decode_vault_state,
         )
-        if not solana_ok() or plugin.network.pubkey is None:
+        if not solana_ok() or titan_state.network.pubkey is None:
             return None
-        pda_result = derive_vault_pda(plugin.network.pubkey, vault_program_id)
+        pda_result = derive_vault_pda(titan_state.network.pubkey, vault_program_id)
         if not pda_result:
             return None
         vault_pda, _ = pda_result
         from solana.rpc.async_api import AsyncClient
-        rpc_url = plugin.network.rpc_urls[0] if plugin.network.rpc_urls else "https://api.mainnet-beta.solana.com"
+        rpc_url = titan_state.network.rpc_urls[0] if titan_state.network.rpc_urls else "https://api.mainnet-beta.solana.com"
         async with AsyncClient(rpc_url) as client:
             resp = await client.get_account_info(vault_pda)
         if resp.value is None:
@@ -348,7 +474,8 @@ async def _fetch_vault_info(plugin) -> dict | None:
 @router.get("/status")
 async def get_status(request: Request):
     """Real-time Bio-State: mood, energy, node count, sovereignty, uptime."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     is_v3 = hasattr(plugin, "get_v3_status")
 
     try:
@@ -358,60 +485,68 @@ async def get_status(request: Request):
         # blocking the event loop under concurrent /status load (5s cluster
         # observed in tests/test_dashboard_concurrency.py). Wrap in
         # asyncio.to_thread — same pattern as /status/mood:403.
-        mood_engine = plugin.mood_engine
+        mood_engine = titan_state.mood_engine
         if mood_engine and hasattr(mood_engine, "get_mood_label"):
             if callable(getattr(mood_engine, "get_mood_valence", None)):
-                mood_label, mood_valence = await asyncio.to_thread(
+                mood_label_raw, mood_valence_raw = await asyncio.to_thread(
                     lambda: (mood_engine.get_mood_label(),
                              mood_engine.get_mood_valence()))
+                mood_label = mood_label_raw if isinstance(mood_label_raw, str) else "Unknown"
+                mood_valence = float(mood_valence_raw) if isinstance(mood_valence_raw, (int, float)) else 0.5
                 mood_score = mood_valence * 100  # V3 proxy returns 0-1
             else:
-                mood_label = await asyncio.to_thread(mood_engine.get_mood_label)
-                mood_score = getattr(mood_engine, "previous_mood", 50.0)
+                label_raw = await asyncio.to_thread(mood_engine.get_mood_label)
+                mood_label = label_raw if isinstance(label_raw, str) else "Unknown"
+                prev = getattr(mood_engine, "previous_mood", 50.0)
+                mood_score = float(prev) if isinstance(prev, (int, float)) else 50.0
         else:
             mood_label = "Unknown"
             mood_score = 50.0
 
-        # Energy — V2 only (metabolism not a V3 module yet)
-        metabolism = plugin.metabolism
-        if metabolism and hasattr(metabolism, "get_current_state"):
-            energy_state = await metabolism.get_current_state()
-            life_force = round(max(0, getattr(metabolism, "_last_balance_pct", 1.0)), 2)
-        else:
-            energy_state = "UNKNOWN"
-            life_force = 1.0
+        # Energy — read metabolic dict from cache (microkernel v2 §A.4
+        # canonical path). 2026-04-26 sweep: previous code went through
+        # the synthesized CacheGetter which returned None for method calls,
+        # producing energy_state=None in /health regardless of metabolism
+        # state. Direct cache read returns the dict; extract the string.
+        metab_dict = titan_state.cache.get("metabolism.state", {}) or {}
+        if not isinstance(metab_dict, dict):
+            metab_dict = {}
+        energy_state = str(metab_dict.get("energy_state") or "UNKNOWN")
+        life_force = float(metab_dict.get("balance_pct") or 1.0)
 
         # Memory node count — MemoryProxy.get_persistent_count is sync IPC;
         # wrap to avoid event-loop serialization under concurrent /status load.
-        memory = plugin.memory
+        memory = titan_state.memory
         if memory and hasattr(memory, "get_persistent_count"):
             node_count = await asyncio.to_thread(memory.get_persistent_count)
         else:
             node_count = 0
 
-        # SOL balance
+        # SOL balance — bus-cached property (post-S5, no IPC, no await)
         sol_balance = 0.0
-        if plugin.network and hasattr(plugin.network, "get_balance"):
-            sol_balance = await plugin.network.get_balance()
+        if titan_state.network and hasattr(titan_state.network, "balance"):
+            sol_balance = float(titan_state.network.balance) or 0.0
 
-        # Mempool — V2 only
+        # Mempool — sync via MemoryAccessor (post-S5, bus-cached)
         mempool_size = 0
         if memory and hasattr(memory, "fetch_mempool"):
-            mempool = await memory.fetch_mempool()
+            mempool = memory.fetch_mempool()
             mempool_size = len(mempool)
 
         # Vault — works in both V2 and V3 (requires network client)
         vault_info = None
-        if hasattr(plugin, "network") and plugin.network:
+        if hasattr(plugin, "network") and titan_state.network:
             vault_info = await _fetch_vault_info(plugin)
 
-        uptime = time.time() - plugin._start_time if hasattr(plugin, "_start_time") else 0
+        uptime = time.time() - titan_state.cache.get("plugin._start_time", 0.0) if hasattr(plugin, "_start_time") else 0
 
-        # Sovereignty
-        gatekeeper = plugin.gatekeeper
+        # Sovereignty — cached fallback can return _CacheGetter; type-guard.
+        from titan_plugin.api.state_accessor import _CacheGetter, _CallableValue
+        gatekeeper = titan_state.gatekeeper
         sovereignty = 0.0
         if gatekeeper:
-            sovereignty = getattr(gatekeeper, "sovereignty_score", 0)
+            _sov_raw = getattr(gatekeeper, "sovereignty_score", 0)
+            sovereignty = float(_sov_raw) if isinstance(_sov_raw, (int, float)) else 0.0
 
         data = {
             "sovereign_name": "Titan",
@@ -429,9 +564,9 @@ async def get_status(request: Request):
             "memory_count": node_count,
             "mempool_size": mempool_size,
             "current_directive": getattr(plugin, "_current_directive", ""),
-            "soul_gen": plugin.soul.current_gen if plugin.soul else 0,
-            "is_meditating": plugin._is_meditating,
-            "ws_subscribers": plugin.event_bus.subscriber_count if hasattr(plugin, "event_bus") else 0,
+            "soul_gen": _safe_int(getattr(titan_state.soul, "current_gen", 0) if titan_state.soul else 0),
+            "is_meditating": titan_state.cache.get("plugin._is_meditating", False),
+            "ws_subscribers": _safe_int(getattr(getattr(plugin, "event_bus", None), "subscriber_count", 0)),
             "vault": vault_info,
             "epoch": None,
             "consciousness": _get_consciousness_summary(plugin),
@@ -468,7 +603,7 @@ async def get_status(request: Request):
 
         # V3: include Trinity summary
         if is_v3:
-            data["v3"] = plugin.get_v3_status()
+            data["v3"] = titan_state.cache.get("v3.status", {})
 
         return _ok(data)
     except Exception as e:
@@ -483,24 +618,28 @@ async def get_status(request: Request):
 async def get_mood_detail(request: Request):
     """Detailed mood: internal score, addon modifier, Social Gravity, history."""
     import asyncio
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         # V3: use MindProxy via bus to MoodEngine in Mind worker.
         # rFP v3 § 15: wrap serial sync proxy calls in to_thread to avoid
         # blocking event loop for 5s + 5s = 10s on cold path.
-        mood_label, mood_valence = await asyncio.to_thread(
-            lambda: (plugin.mood_engine.get_mood_label(),
-                     plugin.mood_engine.get_mood_valence())
+        label_raw, valence_raw = await asyncio.to_thread(
+            lambda: (titan_state.mood_engine.get_mood_label(),
+                     titan_state.mood_engine.get_mood_valence())
         )
+        mood_label = label_raw if isinstance(label_raw, str) else "Unknown"
+        mood_valence = float(valence_raw) if isinstance(valence_raw, (int, float)) else 0.5
 
         # Neuromod emotion provides richer mood context if available
         neuromod_emotion = "unknown"
         neuromod_confidence = 0.0
         try:
             coord_data = await _get_cached_coordinator_async(plugin)
-            nm = coord_data.get("neuromodulators", {})
+            nm = coord_data.get("neuromodulators", {}) if isinstance(coord_data, dict) else {}
             neuromod_emotion = nm.get("current_emotion", nm.get("emotion", "unknown"))
-            neuromod_confidence = nm.get("emotion_confidence", 0.0)
+            nc_raw = nm.get("emotion_confidence", 0.0)
+            neuromod_confidence = float(nc_raw) if isinstance(nc_raw, (int, float)) else 0.0
         except Exception:
             pass
 
@@ -528,14 +667,15 @@ async def get_mood_detail(request: Request):
 @router.get("/status/memory")
 async def get_memory_status(request: Request):
     """Memory overview: counts, top memories (redacted), decay stats."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         # Use proxy methods (route through Divine Bus to memory worker)
-        mem_status = plugin.memory.get_memory_status()
+        mem_status = titan_state.memory.get_memory_status()
         persistent_count = mem_status.get("persistent_count", 0)
         cognee_ready = mem_status.get("cognee_ready", False)
 
-        mempool = await plugin.memory.fetch_mempool()
+        mempool = titan_state.memory.fetch_mempool()
         # Fetch the FULL persistent set so internal-injection memories
         # (e.g. [SELF_PROFILE_INJECTION], weight=10.31) can be filtered out
         # while real conversation memories are guaranteed to surface.
@@ -548,7 +688,7 @@ async def get_memory_status(request: Request):
         # window. Fetching the whole set + filtering is still cheap (~3.5k
         # dicts, <1 MB) and runs behind the 5s coordinator cache anyway.
         fetch_n = max(persistent_count + 100, 1000)
-        raw_top = plugin.memory.get_top_memories(n=fetch_n)
+        raw_top = titan_state.memory.get_top_memories(n=fetch_n)
         top_mems = [
             m for m in raw_top
             if not _is_internal_injection(m.get("user_prompt", ""))
@@ -627,10 +767,13 @@ _TOPIC_KEYWORDS = {
 @router.get("/status/memory/topology")
 async def get_memory_topology(request: Request):
     """Cognitive Heatmap: cluster distribution of what the Titan is focused on."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         # Delegate classification to memory worker (runs in separate process)
-        result = plugin.memory.get_topology(_TOPIC_KEYWORDS)
+        # Microkernel: MemoryAccessor.get_topology() reads cached classifier
+        # output (no args). Endpoint-side classification arg dropped.
+        result = titan_state.memory.get_topology()
         return _ok(result)
     except Exception as e:
         return _error(str(e))
@@ -650,9 +793,10 @@ async def get_knowledge_graph(
     Returns Trinity-typed entities (Person, Topic, Body, Mind, Spirit, Media)
     with relationship edges. Designed for force-directed graph rendering.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        result = plugin.memory.get_knowledge_graph(limit=limit)
+        result = titan_state.memory.get_knowledge_graph(limit=limit)
         return _ok(result)
     except Exception as e:
         logger.warning("[Dashboard] /status/memory/knowledge-graph: %s", e)
@@ -665,7 +809,8 @@ async def get_knowledge_graph(
 @router.get("/status/social")
 async def get_social_status(request: Request):
     """Social metrics: engagement stats, recent post history."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         # V3: social subsystem not yet wired — return empty metrics gracefully
         # Social posting helper exists but lacks API keys
@@ -690,14 +835,19 @@ async def get_social_status(request: Request):
 @router.get("/status/epochs")
 async def get_epoch_status(request: Request):
     """Circadian rhythm: meditation/rebirth timing, sovereignty index."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         from datetime import datetime, timezone
 
         now = time.time()
 
         # V3: backup module not instantiated — use available data
-        snapshot_hash = getattr(getattr(plugin, 'backup', None), 'current_snapshot_hash', None) or "N/A"
+        # Microkernel: getattr on _CacheGetter returns another wrapper, not
+        # None — explicitly type-check before serializing.
+        _backup = getattr(plugin, 'backup', None)
+        _hash = getattr(_backup, 'current_snapshot_hash', None) if _backup else None
+        snapshot_hash = _hash if isinstance(_hash, str) else "N/A"
 
         # Dreaming/consciousness data from spirit proxy
         dreaming_data = {}
@@ -707,7 +857,7 @@ async def get_epoch_status(request: Request):
             if coord:
                 coord_data = coord.get_coordinator()
                 dreaming_data = coord_data.get("dreaming", {})
-            soul_gen = getattr(plugin.soul, 'current_gen', 1)
+            soul_gen = getattr(titan_state.soul, 'current_gen', 1)
         except Exception:
             pass
 
@@ -721,7 +871,7 @@ async def get_epoch_status(request: Request):
             "last_snapshot_hash": snapshot_hash,
             "soul_generation": soul_gen,
             "execution_mode": getattr(plugin, "_last_execution_mode", "v3"),
-            "vault_program_id": plugin._full_config.get("network", {}).get("vault_program_id", ""),
+            "vault_program_id": titan_state.config.get("network", {}).get("vault_program_id", ""),
             "small_epoch_interval_hours": round(meditation_interval / 3600, 2),
             "greater_epoch_interval_hours": round(rebirth_interval / 3600, 2),
             "last_small_epoch": None,
@@ -733,8 +883,8 @@ async def get_epoch_status(request: Request):
             "dreaming": dreaming_data,
         }
 
-        if hasattr(plugin, "_last_commit_signature") and plugin._last_commit_signature:
-            epoch_data["last_commit_signature"] = plugin._last_commit_signature
+        if hasattr(plugin, "_last_commit_signature") and titan_state.cache.get("plugin._last_commit_signature", ""):
+            epoch_data["last_commit_signature"] = titan_state.cache.get("plugin._last_commit_signature", "")
 
         return _ok(epoch_data)
     except Exception as e:
@@ -747,7 +897,8 @@ async def get_epoch_status(request: Request):
 @router.get("/status/research")
 async def get_research_status(request: Request):
     """Recent research topics and sources used."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         recent_topics = []
         last_sources = getattr(plugin, "_last_research_sources", {})
@@ -842,35 +993,28 @@ async def thread_pool_stats(request: Request):
     attrs are renamed.
     """
     import asyncio
-    try:
-        loop = asyncio.get_running_loop()
-        executor = getattr(loop, "_default_executor", None)
-        if executor is None:
-            return _error("no default executor on this loop")
 
+    def _executor_stats(executor):
+        if executor is None:
+            return None
         max_workers = getattr(executor, "_max_workers", None)
         threads = getattr(executor, "_threads", None)
         work_queue = getattr(executor, "_work_queue", None)
         idle_semaphore = getattr(executor, "_idle_semaphore", None)
-
         live = len(threads) if threads is not None else None
         queued = work_queue.qsize() if work_queue is not None else None
-        # _idle_semaphore._value approximates idle workers (3.8+)
         idle = getattr(idle_semaphore, "_value", None) if idle_semaphore else None
         busy = (live - idle) if (live is not None and idle is not None) else None
-
         saturation = None
         if max_workers and busy is not None and queued is not None:
             saturation = round(((busy + queued * 0.5) / max_workers) * 100, 1)
-
         state = "healthy"
         if saturation is not None:
             if saturation >= 90:
                 state = "critical"
             elif saturation >= 60:
                 state = "warning"
-
-        return _ok({
+        return {
             "state": state,
             "max_workers": max_workers,
             "live_workers": live,
@@ -879,7 +1023,36 @@ async def thread_pool_stats(request: Request):
             "queued_tasks": queued,
             "saturation_pct": saturation,
             "executor_class": type(executor).__name__,
-        })
+        }
+
+    try:
+        loop = asyncio.get_running_loop()
+        default_executor = getattr(loop, "_default_executor", None)
+        if default_executor is None:
+            return _error("no default executor on this loop")
+
+        # 2026-04-29 — multi-pool: report bus_ipc dedicated pool too if
+        # initialized (lazy). Saturation of bus_ipc is a CRITICAL alert
+        # distinct from default-pool warning (Observatory load).
+        bus_ipc_executor = None
+        try:
+            from titan_plugin.bus import _bus_ipc_pool as _bip
+            bus_ipc_executor = _bip
+        except Exception:
+            pass
+
+        default_stats = _executor_stats(default_executor)
+        bus_ipc_stats = _executor_stats(bus_ipc_executor)
+
+        # Back-compat top-level keys mirror default-pool stats so existing
+        # consumers (watchdog, dashboard widgets) keep working unchanged.
+        out = dict(default_stats) if default_stats else {}
+        out["pools"] = {
+            "default": default_stats,
+            "bus_ipc": bus_ipc_stats or {"state": "uninitialized",
+                                          "note": "lazy-init on first bus.request_async()"},
+        }
+        return _ok(out)
     except Exception as e:
         return _error(f"thread_pool_stats: {e}")
 
@@ -942,7 +1115,8 @@ async def ns_health(request: Request):
     try:
         # Try direct access first (works if NeuralNS happens to be in same
         # process — e.g., during integration tests)
-        plugin = _get_plugin(request)
+        titan_state = _get_plugin(request)
+        plugin = titan_state  # backward-compat alias for Category C callsites
         nns = getattr(plugin, "neural_nervous_system", None)
         if nns is not None and hasattr(nns, "get_health_snapshot"):
             snap = nns.get_health_snapshot()
@@ -993,7 +1167,8 @@ async def titan_vm_diagnostics(request: Request):
     """
     import os, json, time
     try:
-        plugin = _get_plugin(request)
+        titan_state = _get_plugin(request)
+        plugin = titan_state  # backward-compat alias for Category C callsites
         nns = getattr(plugin, "nervous_system", None)
         telemetry = {}
         source = "state_file"
@@ -1039,6 +1214,120 @@ async def titan_vm_diagnostics(request: Request):
         return _error(str(e))
 
 
+@router.get("/v4/metabolism/evaluate-gate")
+async def metabolism_evaluate_gate(
+    request: Request,
+    feature: str,
+    caller: str = "",
+):
+    """Mainnet Lifecycle Wiring rFP (2026-04-20) — evaluate a gate over HTTP.
+
+    Out-of-process call sites (events_teacher_run cron, etc.) hit this endpoint
+    instead of importing metabolism. Decision is recorded in the same ring
+    buffer as in-process calls so observability is unified.
+
+    Args:
+      - feature: one of memos, nfts, expression, research, social
+      - caller: human-readable call-site name (optional)
+
+    Returns:
+      - should_proceed (bool): caller must skip work if False
+      - rate_multiplier (float): probabilistic throttle, 1.0 = full rate
+      - enforced (bool): whether kill-switch is on
+      - tier (str): current metabolic tier
+      - reason (str): underlying gate reason (even when not enforced)
+    """
+    try:
+        # Microkernel v2 §A.4 amendment 2026-04-28: this endpoint calls the
+        # real metabolism.evaluate_gate() method (logs + ring-buffer writes
+        # + returns a decision tuple). titan_state's _CacheGetter fallback
+        # for "metabolism" returns empty values that crash the tuple unpack
+        # with "not enough values to unpack" (BUG #4 documented today).
+        # For real method calls we need app.state.titan_plugin — the
+        # TitanPlugin instance in legacy mode, or the kernel_rpc proxy in
+        # api_process_separation=true mode (transparent over Unix socket).
+        # Same wire shape across B.3 + Phase C (kernel_rpc layer stable).
+        plugin = request.app.state.titan_plugin
+        met = getattr(plugin, "metabolism", None)
+        if met is None:
+            return _error("metabolism controller not wired", code=503)
+        # evaluate_gate logs + adds decision to the ring buffer.
+        should_proceed, rate_mult = met.evaluate_gate(feature, caller=caller or feature)
+        # Pull the underlying reason from the last-appended decision.
+        reason = met._gate_decisions[-1]["reason"] if met._gate_decisions else ""
+        return _ok({
+            "should_proceed": should_proceed,
+            "rate_multiplier": rate_mult,
+            "enforced": met.gates_enforced,
+            "tier": met.get_metabolic_tier(),
+            "feature": feature,
+            "caller": caller or feature,
+            "reason": reason,
+        })
+    except Exception as e:
+        return _error(str(e))
+
+
+@router.get("/v4/metabolism/gate-status")
+async def metabolism_gate_status(request: Request):
+    """Mainnet Lifecycle Wiring rFP (2026-04-20) — live metabolism gate decisions.
+
+    Returns:
+      - gates_enforced (bool): kill-switch state from titan_params.toml
+      - current_tier, sol_balance: current metabolic state
+      - total_evaluations: lifetime count of gate calls
+      - decisions_buffered: ring-buffer depth (500 cap)
+      - window_10min_count, window_10min_closures: recent activity
+      - by_caller: {caller: {total, closed, feature}} for last 10 min
+      - recent_closures: last 20 closed decisions (ts, feature, caller, reason)
+
+    Used by:
+      - scripts/arch_map.py metabolism-gates — 10-min decision summary
+      - 30-min focused observation + soak verification pre-enforcement flip
+    """
+    try:
+        # Same Microkernel v2 §A.4 fix as /v4/metabolism/evaluate-gate above:
+        # method call (get_gate_decision_summary) goes via app.state.titan_plugin
+        # (TitanPlugin instance / kernel_rpc proxy), not titan_state's cache.
+        plugin = request.app.state.titan_plugin
+        met = getattr(plugin, "metabolism", None)
+        if met is None:
+            return _error("metabolism controller not wired", code=503)
+        summary = met.get_gate_decision_summary()
+        return _ok(summary)
+    except Exception as e:
+        return _error(str(e))
+
+
+@router.get("/v4/sovereignty/status")
+async def sovereignty_status(request: Request):
+    """Mainnet Lifecycle Wiring rFP (2026-04-20) — SovereigntyTracker live state.
+
+    Returns get_stats() + check_transition_criteria() snapshot:
+      - sovereignty_mode: ENFORCING | ADVISORY
+      - great_cycle, developmental_age, total_great_pulses
+      - saturation_violations, collapse_violations, convergence_window
+      - transition_epoch, maker_confirmed
+      - criteria: {great_cycle_met, developmental_age_met, convergence_met,
+                   great_pulses_met, all_met}
+
+    Used by:
+      - arch_map convergence audits
+      - GREAT CYCLE transition ceremony observability
+    """
+    try:
+        titan_state = _get_plugin(request)
+        plugin = titan_state  # backward-compat alias for Category C callsites
+        sov = getattr(plugin, "sovereignty", None)
+        if sov is None:
+            return _error("sovereignty tracker not wired", code=503)
+        stats = sov.get_stats()
+        criteria = sov.check_transition_criteria()
+        return _ok({"stats": stats, "criteria": criteria})
+    except Exception as e:
+        return _error(str(e))
+
+
 @router.get("/v4/prediction")
 async def prediction_diagnostics(request: Request):
     """Prediction Engine v2 diagnostics — novelty signal state + calibration.
@@ -1062,7 +1351,8 @@ async def prediction_diagnostics(request: Request):
     import os, json, time
     try:
         # Direct access path (works in integration tests / single-process setups)
-        plugin = _get_plugin(request)
+        titan_state = _get_plugin(request)
+        plugin = titan_state  # backward-compat alias for Category C callsites
         pe = getattr(plugin, "prediction_engine", None)
         if pe is not None and hasattr(pe, "get_stats"):
             stats = pe.get_stats()
@@ -1098,6 +1388,48 @@ async def prediction_diagnostics(request: Request):
             return _error(f"state file read failed: {e}")
     except Exception as e:
         return _error(str(e))
+
+
+@router.get("/v4/warning-monitor")
+async def warning_monitor(request: Request):
+    """Warning monitor snapshot — WARNING+ events + silent-swallow counters.
+
+    Reads `data/warning_monitor/state.json` (written by warning_monitor_worker
+    every 60s) via the worker's own `get_state_snapshot()` helper so the
+    on-disk format stays canonically owned by the worker. Used by:
+      - arch_map silent-swallows --runtime (cross-Titan WARN+ surface)
+      - arch_map warnings (per-Titan recent events)
+      - Session startup checks for silent-swallow regressions
+
+    Response shape mirrors the on-disk state file:
+      {"saved_ts": <epoch>, "aggregated": {<key>: {<count, by_level, ...>}, ...}}
+    Plus `state_file_age_sec` so callers can detect stale data.
+    """
+    import os as _os_wm
+    import time as _time_wm
+
+    from titan_plugin.modules.warning_monitor_worker import (
+        get_state_snapshot,
+        DEFAULT_STATE_PATH,
+    )
+
+    state_path = DEFAULT_STATE_PATH
+    if not _os_wm.path.exists(state_path):
+        return _error(
+            "warning_monitor state not found "
+            "(worker may not have started — check Guardian)"
+        )
+    snap = get_state_snapshot(state_path)
+    if "error" in snap:
+        return _error(f"warning_monitor read: {snap['error']}")
+    age_sec = _time_wm.time() - _os_wm.path.getmtime(state_path)
+    snap["state_file_age_sec"] = round(age_sec, 1)
+    if age_sec > 300:
+        snap["stale_warning"] = (
+            f"state.json is {age_sec:.0f}s old; "
+            "warning_monitor_worker should write every 60s"
+        )
+    return _ok(snap)
 
 
 @router.get("/v4/imw-health")
@@ -1223,7 +1555,8 @@ async def search_pipeline_budget_reset(request: Request):
     Body JSON: {"backend": "wiktionary"} OR {} for all backends.
     Worker resets its in-memory counter + writes health.json atomically.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         body = {}
         try:
@@ -1232,8 +1565,8 @@ async def search_pipeline_budget_reset(request: Request):
             body = {}
         backend = (body.get("backend") or "").strip()
         from ..bus import make_msg
-        plugin.bus.publish(make_msg(
-            "SEARCH_PIPELINE_BUDGET_RESET", "api", "knowledge",
+        titan_state.bus.publish(make_msg(
+            bus.SEARCH_PIPELINE_BUDGET_RESET, "api", "knowledge",
             {"backend": backend,
              "requested_at": int(__import__('time').time())},
         ))
@@ -1282,7 +1615,8 @@ async def bus_health(request: Request):
       - per-producer 10-15 min observation window during v3 Phase D rollout
     """
     try:
-        plugin = _get_plugin(request)
+        titan_state = _get_plugin(request)
+        plugin = titan_state  # backward-compat alias for Category C callsites
         mon = getattr(plugin, "bus_health", None)
         if mon is None:
             return _error("bus_health monitor not wired")
@@ -1305,7 +1639,8 @@ async def health_check(request: Request):
       STUB    — interface present, backend not yet deployed
       ABSENT  — dependency missing
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     is_v3 = hasattr(plugin, "get_v3_status")
 
     try:
@@ -1313,22 +1648,28 @@ async def health_check(request: Request):
 
         sdk_available = solana_ok()
 
-        # Network/wallet — available in both V2 and V3
+        # Network/wallet — available in both V2 and V3.
+        # Microkernel v2 amendment 2026-04-26: NetworkAccessor exposes
+        # `balance` as @property (not method) and reads pubkey from cache.
+        # Old `hasattr(network, "get_balance")` was always False under the
+        # new accessor → entire block skipped → RPC_CONNECTIVITY stuck on
+        # DEGRADED. Detect availability via `is_available` instead.
         sol_balance = 0.0
         rpc_connected = False
         wallet_loaded = False
-        if plugin.network and hasattr(plugin.network, "get_balance"):
-            import asyncio
-            # Phase E Fix 3: tight 300ms timeout. Watchdog cron has 10s
-            # deadline; old 5s timeout cumulated with vault (4s) + memory
-            # (3s) = 12s worst case → spurious force-restarts. Tight per-
-            # call budget keeps total /health <1s even when degraded.
+        if titan_state.network and getattr(
+                titan_state.network, "is_available", False):
             try:
-                sol_balance = await asyncio.wait_for(plugin.network.get_balance(), timeout=0.3)
-            except (asyncio.TimeoutError, Exception):
+                sol_balance = float(titan_state.network.balance) or 0.0
+            except Exception:
                 sol_balance = 0.0
-            rpc_connected = sol_balance > 0 or getattr(plugin.network, "_rpc_client", None) is not None
-            wallet_loaded = getattr(plugin.network, "pubkey", None) is not None
+            _pubkey = getattr(titan_state.network, "pubkey", "")
+            wallet_loaded = bool(_pubkey)
+            # rpc_connected: pubkey known + at least one RPC URL configured.
+            # In legacy mode this also tested for an _rpc_client object;
+            # under microkernel that lives in kernel process, not API.
+            rpc_connected = wallet_loaded and bool(
+                getattr(titan_state.network, "rpc_urls", []) or [])
 
         # Vault status — V2 only (skip in V3 to avoid complex V2 method calls)
         # 2026-04-09 fix: get_raw_account_data() previously had NO timeout. When
@@ -1337,36 +1678,44 @@ async def health_check(request: Request):
         # process group. /tmp/titan1_watchdog.log showed 11 force-restarts in
         # 24h purely from this path. Cap the whole vault check at 4s — well
         # below the watchdog's 10s deadline — and degrade gracefully on timeout.
-        vault_program_id = plugin._full_config.get("network", {}).get("vault_program_id", "")
+        vault_program_id = titan_state.config.get("network", {}).get("vault_program_id", "")
         vault_status = "STUB"
         vault_data = None
-        if not is_v3 and vault_program_id and sdk_available and wallet_loaded:
+        # rFP_observatory_data_loading_v1 §3.3 (2026-04-26): vault check
+        # was gated `not is_v3` AND read from cache key network.account.{pda}
+        # which is never populated in microkernel mode (no producer wires
+        # SOLANA_ACCOUNT_REFRESH_REQUEST → response back to the cache).
+        # Use _fetch_vault_info instead — it does the inline async RPC
+        # read that /status already uses successfully. Same 4s timeout
+        # via wait_for. STATE_ROOT_ZK + On-Chain Vault widget +
+        # Integrity Verification all consume vault_data downstream.
+        if vault_program_id and sdk_available and wallet_loaded:
             try:
-                from titan_plugin.utils.solana_client import derive_vault_pda
-                pda_result = derive_vault_pda(plugin.network.pubkey, vault_program_id)
-                if pda_result:
-                    vault_pda, _ = pda_result
-                    # Phase E Fix 3: tight 300ms (was 4.0s). DEGRADED on timeout.
-                    raw_data = await asyncio.wait_for(
-                        plugin.network.get_raw_account_data(str(vault_pda)),
-                        timeout=0.3,
-                    )
-                    if raw_data:
-                        from titan_plugin.utils.solana_client import decode_vault_state
-                        vault_data = decode_vault_state(raw_data)
-                        vault_status = "ACTIVE" if vault_data and vault_data.get("commit_count", 0) > 0 else "DEGRADED"
-                    else:
-                        vault_status = "DEGRADED"
+                vault_data = await asyncio.wait_for(
+                    _fetch_vault_info(plugin), timeout=4.0)
+                if vault_data and vault_data.get("commit_count", 0) > 0:
+                    vault_status = "ACTIVE"
+                elif vault_data is not None:
+                    vault_status = "DEGRADED"
+                else:
+                    vault_status = "DEGRADED"
             except asyncio.TimeoutError:
                 logger.warning("[Health] vault data fetch exceeded 4s — degraded")
                 vault_status = "DEGRADED"
-            except Exception:
+            except Exception as _vault_err:
+                logger.debug("[Health] vault check failed: %s", _vault_err)
                 vault_status = "DEGRADED"
 
-        # Maker auth
-        maker_pubkey = ""
-        if plugin.soul and hasattr(plugin.soul, "_maker_pubkey"):
-            maker_pubkey = str(plugin.soul._maker_pubkey) if plugin.soul._maker_pubkey else ""
+        # Maker auth — read from soul.state cache (kernel snapshot publishes
+        # str(soul._maker_pubkey) here every 2s). Pre-2026-04-26 the code
+        # read titan_state.soul._maker_pubkey via the proxy AND had an
+        # attribute-name mismatch (hasattr "_maker_pubkey" but read
+        # "maker_pubkey"), which silently produced empty string regardless
+        # of soul state — MAKER_AUTH always DEGRADED. Cache read is the
+        # microkernel-v2 canonical path and matches the soul.state shape
+        # built in kernel._build_state_snapshot.
+        soul_state = titan_state.cache.get("soul.state", {})
+        maker_pubkey = str(soul_state.get("maker_pubkey", "") if isinstance(soul_state, dict) else "")
 
         # Per-feature Solana capabilities
         solana_capabilities = {
@@ -1387,9 +1736,9 @@ async def health_check(request: Request):
 
         # Subsystem health — V3 uses Guardian module states
         if is_v3:
-            guardian_status = plugin.guardian.get_status()
+            guardian_status = titan_state.guardian.get_status()
             subsystems = {
-                "soul": "ACTIVE" if plugin.soul else "DEGRADED",
+                "soul": "ACTIVE" if titan_state.soul else "DEGRADED",
                 "bus": "ACTIVE",
                 "guardian": "ACTIVE",
                 "observatory": "ACTIVE",
@@ -1401,20 +1750,26 @@ async def health_check(request: Request):
                     "DEGRADED" if state in ("starting", "unhealthy") else "ABSENT"
                 )
             # Add Core-hosted subsystems (not Guardian-supervised)
-            subsystems["metabolism"] = "ACTIVE" if plugin.metabolism else "ABSENT"
+            subsystems["metabolism"] = "ACTIVE" if titan_state.metabolism else "ABSENT"
             subsystems["studio"] = "ACTIVE" if getattr(plugin, "studio", None) else "ABSENT"
-            subsystems["social"] = "ACTIVE" if plugin.social else "ABSENT"
+            subsystems["social"] = "ACTIVE" if titan_state.social else "ABSENT"
+            # Gatekeeper — sovereignty/output-verifier. Microkernel v2 amendment
+            # 2026-04-26: was missing from V3 subsystems list. Reads cached
+            # gatekeeper.status if published; otherwise reports ABSENT until
+            # the kernel snapshot publisher includes it.
+            _gk_cached = bool(titan_state.cache.get("gatekeeper.status", None))
+            subsystems["gatekeeper"] = "ACTIVE" if _gk_cached else "ABSENT"
         else:
             ollama_cloud = getattr(plugin, "_ollama_cloud", None)
             subsystems = {
-                "memory": "ACTIVE" if plugin.memory else "ABSENT",
-                "metabolism": "ACTIVE" if plugin.metabolism else "ABSENT",
-                "soul": "ACTIVE" if plugin.soul else "ABSENT",
-                "guardian": "ACTIVE" if plugin.guardian else "ABSENT",
-                "gatekeeper": "ACTIVE" if plugin.gatekeeper else "ABSENT",
+                "memory": "ACTIVE" if titan_state.memory else "ABSENT",
+                "metabolism": "ACTIVE" if titan_state.metabolism else "ABSENT",
+                "soul": "ACTIVE" if titan_state.soul else "ABSENT",
+                "guardian": "ACTIVE" if titan_state.guardian else "ABSENT",
+                "gatekeeper": "ACTIVE" if titan_state.gatekeeper else "ABSENT",
                 "studio": "ACTIVE" if getattr(plugin, "studio", None) else "ABSENT",
-                "social": "ACTIVE" if plugin.social else "ABSENT",
-                "memory_backend": "ACTIVE" if (plugin.memory and getattr(plugin.memory, "_cognee_ready", False)) else "DEGRADED",
+                "social": "ACTIVE" if titan_state.social else "ABSENT",
+                "memory_backend": "ACTIVE" if (titan_state.memory and getattr(titan_state.memory, "_cognee_ready", False)) else "DEGRADED",
                 "observatory": "ACTIVE",
                 "ollama_cloud": "ACTIVE" if ollama_cloud else "ABSENT",
             }
@@ -1425,14 +1780,14 @@ async def health_check(request: Request):
         # watchdog force-restarts. cognee_ready=False on timeout = DEGRADED
         # signal in response, no blocking.
         cognee_ready = False
-        if plugin.memory:
+        if titan_state.memory:
             try:
                 mem_status = await asyncio.wait_for(
-                    asyncio.to_thread(plugin.memory.get_memory_status), timeout=0.3)
+                    asyncio.to_thread(titan_state.memory.get_memory_status), timeout=0.3)
                 cognee_ready = mem_status.get("cognee_ready", False) if mem_status else False
             except Exception:
                 pass
-        recorder_ready = hasattr(plugin, "recorder") and plugin.recorder is not None
+        recorder_ready = hasattr(plugin, "recorder") and titan_state.recorder is not None
 
         # Capabilities array for frontend
         capabilities = [
@@ -1445,7 +1800,7 @@ async def health_check(request: Request):
         overall_status = "ACTIVE" if active_count >= 6 else ("DEGRADED" if active_count >= 3 else "OFFLINE")
 
         # Privacy filter
-        privacy_cfg = plugin._full_config.get("privacy", {})
+        privacy_cfg = titan_state.config.get("privacy", {})
         privacy_redactions = getattr(plugin, "_privacy_redaction_count", 0)
 
         # Bus-health summary (canonical indicator — see rFP_meta_cgn_v3 § 1)
@@ -1483,9 +1838,9 @@ async def health_check(request: Request):
             "cognee_ready": cognee_ready,  # kept for API compat
             "memory_backend_ready": cognee_ready,
             "recorder_ready": recorder_ready,
-            "limbo_mode": plugin._limbo_mode,
-            "network": getattr(plugin.network, "_network_name", "unknown") if plugin.network else "none",
-            "rpc_endpoint": (plugin.network.rpc_urls[0] if plugin.network and hasattr(plugin.network, "rpc_urls") and plugin.network.rpc_urls else None),
+            "limbo_mode": titan_state.cache.get("plugin._limbo_mode", False),
+            "network": getattr(titan_state.network, "_network_name", "unknown") if titan_state.network else "none",
+            "rpc_endpoint": (titan_state.network.rpc_urls[0] if titan_state.network and hasattr(titan_state.network, "rpc_urls") and titan_state.network.rpc_urls else None),
         }
 
         # Vault
@@ -1496,7 +1851,7 @@ async def health_check(request: Request):
 
         # V3: include guardian module details
         if is_v3:
-            response["v3"] = plugin.get_v3_status()
+            response["v3"] = titan_state.cache.get("v3.status", {})
 
         # Ollama Cloud (V2 only)
         if not is_v3:
@@ -1520,7 +1875,8 @@ async def get_art(request: Request, live: bool = Query(False)):
     ?live=false (default): Serve the most recent generated flow field PNG.
     ?live=true: Generate a real-time mood flow field based on current state.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
 
     if live:
         # Dynamic render based on current mood
@@ -1528,8 +1884,8 @@ async def get_art(request: Request, live: bool = Query(False)):
             from titan_plugin.expressive.art import ProceduralArtGen
 
             art_gen = ProceduralArtGen()
-            mood_score = plugin.mood_engine.previous_mood
-            node_count = plugin.memory.get_persistent_count()
+            mood_score = titan_state.mood_engine.previous_mood
+            node_count = titan_state.memory.get_persistent_count()
             intensity = max(1, int(mood_score * 10))
 
             state_root = f"live_{int(time.time())}"
@@ -1546,7 +1902,7 @@ async def get_art(request: Request, live: bool = Query(False)):
 
     # Static: serve most recent file from Studio output
     try:
-        studio = plugin.studio
+        studio = titan_state.studio
         gallery = studio.get_gallery(category="meditation", limit=1)
         if gallery:
             art_path = Path(gallery[0]["path"])
@@ -1576,11 +1932,12 @@ async def get_art(request: Request, live: bool = Query(False)):
 @router.get("/status/audio")
 async def get_audio(request: Request):
     """Serve the most recent blockchain sonification WAV."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
 
     # Try Studio gallery first
     try:
-        studio = plugin.studio
+        studio = titan_state.studio
         gallery = studio.get_gallery(category="epoch", limit=10)
         for item in gallery:
             if item["filename"].endswith(".wav"):
@@ -1612,16 +1969,17 @@ async def get_nft_timeline(request: Request):
     Fetch Titan's minted NFTs from on-chain (Metaplex DAS API).
     Returns a timeline of Soul evolution NFTs with metadata and art URIs.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        pubkey = plugin.network.pubkey
+        pubkey = titan_state.network.pubkey
         if pubkey is None:
             return _ok({"nfts": [], "note": "No wallet loaded."})
 
         import httpx
 
         # Use DAS (Digital Asset Standard) API — available on Helius and public RPCs
-        rpc_url = plugin.network.premium_rpc or plugin.network.rpc_urls[0]
+        rpc_url = titan_state.network.premium_rpc or titan_state.network.rpc_urls[0]
 
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
@@ -1704,9 +2062,10 @@ async def get_vital_history(
     Fetch historical vital snapshots for charting (Sovereignty Horizon, etc.).
     Lazy-loaded — only fetched when the user navigates to a history view.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        obs_db = getattr(plugin, "_observatory_db", None)
+        obs_db = getattr(plugin, "_observatory_db", None) or _get_observatory_db()
         if obs_db is None:
             return _ok({"snapshots": [], "note": "Observatory DB not initialized."})
 
@@ -1742,9 +2101,10 @@ async def get_expressive_archive(
     """
     Fetch archived expressive outputs. Lazy-loaded for the Soul Mosaic and history views.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        obs_db = getattr(plugin, "_observatory_db", None)
+        obs_db = getattr(plugin, "_observatory_db", None) or _get_observatory_db()
         if obs_db is None:
             return _ok({"items": [], "note": "Observatory DB not initialized."})
 
@@ -1782,9 +2142,10 @@ async def get_event_history(
     """
     Fetch event log history. Supports filtering by event type.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        obs_db = getattr(plugin, "_observatory_db", None)
+        obs_db = getattr(plugin, "_observatory_db", None) or _get_observatory_db()
         if obs_db is None:
             return _ok({"events": [], "note": "Observatory DB not initialized."})
 
@@ -1814,9 +2175,10 @@ async def get_guardian_log(
     Fetch recent guardian safety actions (never exposes blocked content).
     Shows tier, action, and category only.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        obs_db = getattr(plugin, "_observatory_db", None)
+        obs_db = getattr(plugin, "_observatory_db", None) or _get_observatory_db()
         if obs_db is None:
             return _ok({"actions": [], "note": "Observatory DB not initialized."})
 
@@ -1853,9 +2215,10 @@ async def get_trinity_history(
     Fetch historical Trinity tensor snapshots for trend visualization.
     Returns Body/Mind/Spirit tensors, Middle Path loss, and center distances.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        obs_db = getattr(plugin, "_observatory_db", None)
+        obs_db = getattr(plugin, "_observatory_db", None) or _get_observatory_db()
         if obs_db is None:
             return _ok({"snapshots": [], "note": "Observatory DB not initialized."})
 
@@ -1886,7 +2249,8 @@ async def get_consciousness_history(
     curvature, density, drift, trajectory, and distillation text.
     """
     import json as _json
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         # ConsciousnessDB stores all epochs — read directly (WAL mode supports concurrent reads)
         consciousness_db_path = os.path.join(
@@ -1949,9 +2313,10 @@ async def get_growth_history(
     Fetch historical growth metrics (learning velocity, social density,
     metabolic health, directive alignment) for trend visualization.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        obs_db = getattr(plugin, "_observatory_db", None)
+        obs_db = getattr(plugin, "_observatory_db", None) or _get_observatory_db()
         if obs_db is None:
             return _ok({"snapshots": [], "note": "Observatory DB not initialized."})
 
@@ -1978,29 +2343,57 @@ async def get_v3_trinity(request: Request):
     Only available when running in V3 microkernel mode.
     """
     import asyncio  # 2026-04-14 fix: missing import (introduced by § 15 b3ea2f0)
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         # Check if this is a V3 core (has get_v3_status)
         if not hasattr(plugin, "get_v3_status"):
             return _ok({"error": "Not running in V3 mode", "v3": False})
 
-        v3_status = plugin.get_v3_status()
+        v3_status = titan_state.cache.get("v3.status", {})
 
         # Query Trinity tensors via proxies
-        body_proxy = plugin._proxies.get("body")
-        mind_proxy = plugin._proxies.get("mind")
-        spirit_proxy = plugin._proxies.get("spirit")
+        body_proxy = titan_state.body
+        mind_proxy = titan_state.mind
+        spirit_proxy = titan_state.spirit
 
-        # 2026-04-14 final fix: read from tensor cache (refreshed every 8s
-        # by the warmer daemon thread). Zero proxy calls on the hot path.
-        # /v3/trinity now returns in <10ms regardless of spirit worker load.
-        # Trade-off: data is up to 8s stale, which is fine for Observatory
-        # (tensors don't change dramatically sub-second, and the warmer is
-        # always catching up).
-        _start_coordinator_warmer(plugin)  # lazy-start (also warms tensors)
-        body_tensor = _trinity_tensor_cache["body_tensor"]
-        mind_tensor = _trinity_tensor_cache["mind_tensor"]
-        spirit_data = _trinity_tensor_cache["spirit_data"]
+        # 2026-04-14: read from in-process tensor cache (warmer-refreshed
+        # every 8s in legacy mode).
+        # 2026-04-26 microkernel v2: warmer doesn't start (no _proxies on
+        # TitanStateAccessor) — read directly from the bus-published cache
+        # keys instead. body/mind/spirit are dicts under D1 publisher;
+        # extract `tensor` from each. Falls back to warmer cache if both
+        # are empty (legacy in-process mode).
+        _start_coordinator_warmer(plugin)  # no-op in microkernel
+        _body_cache = titan_state.cache.get("body.tensor", {}) or {}
+        _mind_cache = titan_state.cache.get("mind.tensor", {}) or {}
+        _spirit_tensor_cache = titan_state.cache.get("spirit.tensor", []) or []
+        body_tensor = (
+            _body_cache.get("tensor", []) if isinstance(_body_cache, dict) and _body_cache.get("tensor")
+            else _trinity_tensor_cache["body_tensor"]
+        )
+        mind_tensor = (
+            _mind_cache.get("tensor", []) if isinstance(_mind_cache, dict) and _mind_cache.get("tensor")
+            else _trinity_tensor_cache["mind_tensor"]
+        )
+        # Defensive: ensure list-of-floats shape (str-float TypeError prevention)
+        if not (isinstance(body_tensor, list) and all(isinstance(x, (int, float)) for x in body_tensor)):
+            body_tensor = [0.5] * 5
+        if not (isinstance(mind_tensor, list) and all(isinstance(x, (int, float)) for x in mind_tensor)):
+            mind_tensor = [0.5] * 5
+        # spirit_data combines tensor + consciousness/sphere_clocks/etc
+        spirit_data = dict(_trinity_tensor_cache["spirit_data"]) if _trinity_tensor_cache["spirit_data"] else {}
+        if isinstance(_spirit_tensor_cache, list) and _spirit_tensor_cache:
+            spirit_data["spirit_tensor"] = _spirit_tensor_cache
+        if isinstance(_body_cache, dict):
+            spirit_data["body_center_dist"] = _body_cache.get("center_dist", 0)
+        if isinstance(_mind_cache, dict):
+            spirit_data["mind_center_dist"] = _mind_cache.get("center_dist", 0)
+        # Pull v4 sub-blocks from cache for spirit_data enrichment
+        for k in ("sphere_clocks", "unified_spirit", "resonance", "consciousness"):
+            v = titan_state.cache.get(f"spirit.{k}", None)
+            if v and not spirit_data.get(k):
+                spirit_data[k] = v
 
         # Body dimension labels
         body_dims = ["interoception", "proprioception", "somatosensation", "entropy", "thermal"]
@@ -2052,6 +2445,7 @@ async def get_v3_trinity(request: Request):
         inner_mind_15d = list(mind_tensor) + [0.5] * 10  # extend basic 5D to 15D
         inner_spirit_45d = list(spirit_data.get("spirit_tensor", [0.5] * 5)) + [0.5] * 40
         observables = {}
+        state_vector_available = False
         try:
             coord = await _get_cached_coordinator_async(plugin)
             # Full 132D state vector: iB(5)+iM(15)+iS(45)+oB(5)+oM(15)+oS(45)+meta(2)
@@ -2068,6 +2462,7 @@ async def get_v3_trinity(request: Request):
                     outer_body_vals = sv[65:70]     # dims 65-69: outer body 5D
                     outer_mind_vals = sv[70:85]     # dims 70-84: outer mind 15D
                     outer_spirit_vals = sv[85:130]  # dims 85-129: outer spirit 45D
+                    state_vector_available = True
                     # Update inner trinity with full tensors
                     trinity["mind"]["values"] = inner_mind_15d
                     trinity["mind"]["dims"] = mind_dims + [f"m{i}" for i in range(5, 15)]
@@ -2087,6 +2482,40 @@ async def get_v3_trinity(request: Request):
         except Exception:
             pass
 
+        # 2026-04-23 (Phase 1 sensory wiring closeout): fall back to
+        # state_register directly when the coordinator-cache 130D
+        # state_vector path didn't land. This happens transiently whenever
+        # build_trinity_snapshot's background builder runs in a window
+        # where consciousness.get("latest_epoch") is briefly empty — the
+        # snapshot then omits the "consciousness" key, the 130D slice is
+        # unavailable, and outer_body would otherwise stay at [0.5]*5
+        # defaults even though state_register has rich V6 composite values
+        # published by OuterTrinityCollector every 60s.
+        # Pre-existing cache flakiness, not introduced by Phase 1; became
+        # visible only once outer_body producers started publishing rich
+        # (non-default) values. /v4/sensors already reads state_register
+        # directly and so stays reliable — this patch makes /v3/trinity
+        # equally reliable without touching the shared cache.
+        if not state_vector_available:
+            try:
+                outer_state = getattr(plugin, "outer_state", None)
+                if outer_state is None:
+                    outer_state = getattr(plugin, "state_register", None)
+                if outer_state is not None:
+                    _ob = getattr(outer_state, "outer_body", None)
+                    if isinstance(_ob, list) and len(_ob) == 5:
+                        outer_body_vals = list(_ob)
+                    _om_15d = outer_state.get("outer_mind_15d") if hasattr(
+                        outer_state, "get") else None
+                    if isinstance(_om_15d, list) and len(_om_15d) == 15:
+                        outer_mind_vals = list(_om_15d)
+                    _os_45d = outer_state.get("outer_spirit_45d") if hasattr(
+                        outer_state, "get") else None
+                    if isinstance(_os_45d, list) and len(_os_45d) == 45:
+                        outer_spirit_vals = list(_os_45d)
+            except Exception:
+                pass
+
         return _ok({
             "v3": True,
             **v3_status,
@@ -2104,16 +2533,120 @@ async def get_v3_trinity(request: Request):
 
 @router.get("/v3/guardian")
 async def get_v3_guardian(request: Request):
-    """V3 Guardian module status — states, PIDs, RSS, heartbeats."""
-    plugin = _get_plugin(request)
+    """V3 Guardian module status — states, PIDs, RSS, heartbeats, layer."""
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        if not hasattr(plugin, "guardian") or not hasattr(plugin.guardian, "get_status"):
+        if not hasattr(plugin, "guardian") or not hasattr(titan_state.guardian, "get_status"):
             return _ok({"error": "Not running in V3 mode", "v3": False})
+
+        # Microkernel v2 Phase A §A.5 — include layer_stats summary.
+        # Bug fix 2026-04-26: was calling get_status() instead of
+        # layer_stats() — populated `layer_stats` field with module-keyed
+        # data instead of layer-keyed totals/running/crashed counts.
+        layer_stats = titan_state.guardian.layer_stats() if hasattr(
+            titan_state.guardian, "layer_stats") else {}
 
         return _ok({
             "v3": True,
-            "modules": plugin.guardian.get_status(),
+            "modules": titan_state.guardian.get_status(),
+            "layer_stats": layer_stats,
             "bus_stats": plugin.bus.stats if hasattr(plugin, "bus") else {},
+        })
+    except Exception as e:
+        return _error(str(e))
+
+
+@router.get("/v4/trinity-shm")
+async def get_v4_trinity_shm(request: Request):
+    """
+    Microkernel v2 Phase A §A.2 — Trinity 162D state, shm-first path.
+
+    Returns the canonical 162D TITAN_SELF = 130D felt + 30D topology +
+    2D journey. When `microkernel.shm_trinity_enabled=true` and the
+    shm file is healthy, serves from /dev/shm/titan_{id}/trinity_state.bin
+    via persistent mmap + SeqLock (zero-copy, <5μs). Otherwise falls
+    back to the legacy in-memory state_register path (source="legacy").
+
+    Both paths produce the same 162D vector — numerical equivalence is
+    locked by tests/test_trinity_shm_equivalence.py.
+
+    Used by the equivalence-gate test before flipping
+    shm_trinity_enabled=true on any Titan.
+    """
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
+    try:
+        # ── Shm-first read path ──────────────────────────────────────
+        bank = getattr(plugin, "_registry_bank", None)
+        if bank is not None:
+            from titan_plugin.core.state_registry import TRINITY_STATE
+            if bank.is_enabled(TRINITY_STATE):
+                arr = bank.reader(TRINITY_STATE).read()
+                meta = bank.reader(TRINITY_STATE).read_meta()
+                if arr is not None and len(arr) == 162:
+                    return _ok({
+                        "source": "shm",
+                        "full_130dt": arr[:130].tolist(),
+                        "full_30d_topology": arr[130:160].tolist(),
+                        "journey": arr[160:162].tolist(),
+                        "seq": meta.get("seq") if meta else None,
+                        "age_seconds": meta.get("age_seconds") if meta else None,
+                    })
+
+        # ── Legacy fallback: assemble from state_register ────────────
+        reg = getattr(plugin, "state_register", None)
+        if reg is None:
+            return _error("state_register not available")
+        felt_130 = list(reg.get_full_130dt())[:130]
+        topo_30 = list(reg.get_full_30d_topology())[:30]
+        snap = reg.snapshot()
+        consciousness = snap.get("consciousness", {}) or {}
+        journey_2 = [
+            float(consciousness.get("curvature", 0.0)),
+            float(consciousness.get("density", 0.0)),
+        ]
+        # Pad defensively (should never trigger — contracts guarantee lengths).
+        felt_130 += [0.5] * max(0, 130 - len(felt_130))
+        topo_30 += [0.0] * max(0, 30 - len(topo_30))
+        return _ok({
+            "source": "legacy",
+            "full_130dt": felt_130,
+            "full_30d_topology": topo_30,
+            "journey": journey_2,
+            "seq": None,
+            "age_seconds": reg.age_seconds(),
+        })
+    except Exception as e:
+        return _error(f"trinity-shm read failed: {e}")
+
+
+@router.get("/v4/layers")
+async def get_v4_layers(request: Request):
+    """
+    Microkernel v2 Phase A §A.5 — per-layer module summary.
+
+    Returns the 4-layer breakdown (L0/L1/L2/L3) with total + running +
+    crashed + disabled counts, plus the list of modules per layer.
+    Used by `arch_map layers` subcommand and human dashboards.
+    """
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
+    try:
+        if not hasattr(plugin, "guardian") or not hasattr(titan_state.guardian, "layer_stats"):
+            return _error("Guardian layer_stats not available")
+
+        # Bug fix 2026-04-26: same regression as /v3/guardian — was
+        # populating layer_stats with module-keyed get_status() output
+        # instead of layer-keyed totals/running/crashed counts.
+        stats = titan_state.guardian.layer_stats()
+        modules_by_layer = {
+            layer: titan_state.guardian.get_modules_by_layer(layer)
+            for layer in ("L0", "L1", "L2", "L3")
+        }
+        return _ok({
+            "layer_stats": stats,
+            "modules_by_layer": modules_by_layer,
         })
     except Exception as e:
         return _error(str(e))
@@ -2122,11 +2655,12 @@ async def get_v3_guardian(request: Request):
 @router.post("/v3/guardian/start/{module_name}")
 async def start_v3_module(module_name: str, request: Request):
     """Start a V3 Guardian-supervised module by name."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         if not hasattr(plugin, "guardian"):
             return _error("Not running in V3 mode")
-        ok = plugin.guardian.start(module_name)
+        ok = titan_state.commands.guardian_start(module_name)
         if ok:
             return _ok({"started": module_name})
         else:
@@ -2138,11 +2672,12 @@ async def start_v3_module(module_name: str, request: Request):
 @router.post("/v3/guardian/enable/{module_name}")
 async def enable_v3_module(module_name: str, request: Request):
     """Re-enable a disabled Guardian module, reset restart counters, and start it."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         if not hasattr(plugin, "guardian"):
             return _error("Not running in V3 mode")
-        ok = plugin.guardian.enable(module_name)
+        ok = titan_state.commands.guardian_start(module_name)
         if ok:
             return _ok({"enabled": module_name})
         else:
@@ -2161,23 +2696,24 @@ async def get_v3_agency(request: Request):
 
     Returns rolling assessment reflections suitable for dashboard display.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        if not hasattr(plugin, "_agency") or not plugin._agency:
+        if not hasattr(plugin, "_agency") or not titan_state.agency:
             return _ok({
                 "enabled": False,
                 "actions": [],
                 "stats": {},
             })
 
-        stats = plugin._agency.get_stats()
+        stats = titan_state.agency.get_stats()
         assessment_stats = {}
-        if hasattr(plugin, "_agency_assessment") and plugin._agency_assessment:
-            assessment_stats = plugin._agency_assessment.get_stats()
+        if hasattr(plugin, "_agency_assessment") and titan_state.agency:
+            assessment_stats = titan_state.agency.get_stats()
 
         advisor_stats = {}
-        if hasattr(plugin, "_interface_advisor") and plugin._interface_advisor:
-            advisor_stats = plugin._interface_advisor.get_stats()
+        if hasattr(plugin, "_interface_advisor") and titan_state.cache.get("interface_advisor", {}):
+            advisor_stats = titan_state.cache.get("interface_advisor", {}).get_stats()
 
         return _ok({
             "enabled": True,
@@ -2199,27 +2735,159 @@ async def get_v4_state(request: Request):
     V4 Time Awareness state — sphere clocks, resonance, unified spirit,
     consciousness, impulse engine, filter_down, intuition.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         if not hasattr(plugin, "get_v3_status"):
             return _ok({"error": "Not running in V3/V4 mode", "v4": False})
 
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _ok({"error": "Spirit proxy not available", "v4": False})
 
         v4_state = spirit_proxy.get_v4_state()
 
         # Add Guardian module health for context
-        guardian_status = plugin.guardian.get_status() if hasattr(plugin, "guardian") else {}
+        guardian_status = titan_state.guardian.get_status() if hasattr(plugin, "guardian") else {}
+
+        # Microkernel v2 Phase B.2.1 — expose bus_broker stats so the
+        # shadow_orchestrator's multi-criterion gate (which polls /v4/state
+        # via HTTP from a separate process) can verify subscriber-count +
+        # drop-rate without an internal Python attribute hop. None when
+        # microkernel.bus_ipc_socket_enabled=false or the kernel hasn't
+        # bound a broker yet.
+        #
+        # In api_subprocess mode, kernel methods are reached via the
+        # kernel_rpc proxy at app.state.titan_plugin (NOT titan_state,
+        # which is the StateAccessor with typed sub-accessors only).
+        # Hot-fix 2026-04-27 — initial wiring used titan_state.kernel
+        # which fell through __getattr__ to a CacheGetterAccessor that
+        # returned an empty dict on every call.
+        bus_broker_stats = None
+        try:
+            kernel_proxy = getattr(request.app.state, "titan_plugin", None)
+            if kernel_proxy is not None and hasattr(kernel_proxy, "kernel"):
+                kernel_obj = kernel_proxy.kernel
+                if hasattr(kernel_obj, "bus_broker_stats"):
+                    bus_broker_stats = kernel_obj.bus_broker_stats()
+        except Exception as ee:  # noqa: BLE001
+            logger.debug("[Dashboard] bus_broker_stats unavailable: %s", ee)
 
         return _ok({
             "v4": True,
             **v4_state,
             "guardian": guardian_status,
+            "bus_broker": bus_broker_stats,
         })
     except Exception as e:
         logger.error("[Dashboard] /v4/state error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# GET /v4/state-snapshot — Full state_register snapshot (rich, fast, single fetch)
+# ---------------------------------------------------------------------------
+# Microkernel v2 amendment (2026-04-26): the kernel publishes state_register
+# data on every snapshot tick (~2s). This endpoint surfaces the full snapshot
+# in ONE request, so the frontend can poll a single fast endpoint instead of
+# dispatching 20+ separate fetches per panel. Each panel derives its slice
+# client-side from the unified payload.
+#
+# Payload shape (top-level keys, all bus-cached):
+#   - state_register: full OuterState dict (body/mind/spirit tensors, outer
+#     trinity, consciousness, sphere_clocks, unified_spirit, resonance,
+#     observables, metabolic, neuromods, cgn, focus, filter_down, ...)
+#   - age_seconds: how stale the state_register is (0.0 = fresh tick)
+#   - snapshot_age_seconds: how stale the api_subprocess cache is
+@router.get("/v4/state-snapshot")
+async def get_v4_state_snapshot(request: Request):
+    """Full state_register snapshot — single fetch for the frontend."""
+    titan_state = _get_plugin(request)
+    try:
+        cache = getattr(titan_state, "cache", None)
+        if cache is None:
+            return _ok({"state_register": {}, "age_seconds": None,
+                        "snapshot_age_seconds": None,
+                        "note": "cache not available (legacy mode?)"})
+        # snapshot age: how long since the kernel last published the snapshot.
+        full, snap_age = cache.get_with_age("state_register.full", {})
+        if not full:
+            full = {}
+        age, _ = cache.get_with_age("state_register.age_seconds", None)
+        return _ok({
+            "state_register": full,
+            "age_seconds": age,
+            "snapshot_age_seconds": round(snap_age, 3) if snap_age is not None else None,
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/state-snapshot error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# GET /v4/cache-staleness — Per-key age of api_subprocess CachedState
+# ---------------------------------------------------------------------------
+# Microkernel v2 amendment OBS-mkernel-s5-amendment-cache-staleness gate.
+# Reports per-cache-key age in seconds. ObservatoryDB writer can pull this
+# every 60s for retention; arch_map api-status uses it for the live audit.
+def _safe_int(x, default: int = 0) -> int:
+    """Coerce x to int, returning default if not numerically coercible.
+    Microkernel v2: cache-fallback paths return _CacheGetter / _CallableValue
+    wrappers; arithmetic on those raises TypeError. Use this at every
+    callsite that does math/round/serialize on accessor results."""
+    try:
+        if isinstance(x, (int, float)):
+            return int(x)
+        if isinstance(x, str) and x.strip().lstrip("-").isdigit():
+            return int(x)
+    except Exception:
+        pass
+    return default
+
+
+def _safe_float(x, default: float = 0.0) -> float:
+    """Float-flavored counterpart of _safe_int."""
+    try:
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, str):
+            return float(x)
+    except Exception:
+        pass
+    return default
+
+
+@router.get("/v4/cache-staleness")
+async def get_v4_cache_staleness(request: Request):
+    """Per-key cache age (seconds). Diagnostic for kernel-snapshot health."""
+    titan_state = _get_plugin(request)
+    try:
+        cache = getattr(titan_state, "cache", None)
+        if cache is None:
+            return _ok({"available": False, "note": "cache not available"})
+        report = cache.staleness_report() if hasattr(cache, "staleness_report") else {}
+        # Also bucket: fresh (<5s), warm (5-30s), stale (30-300s), cold (>300s)
+        buckets = {"fresh": 0, "warm": 0, "stale": 0, "cold": 0}
+        for age in report.values():
+            if age < 5:
+                buckets["fresh"] += 1
+            elif age < 30:
+                buckets["warm"] += 1
+            elif age < 300:
+                buckets["stale"] += 1
+            else:
+                buckets["cold"] += 1
+        max_age = max(report.values()) if report else 0.0
+        return _ok({
+            "available": True,
+            "bootstrap_done": getattr(cache, "bootstrap_done", False),
+            "key_count": len(report),
+            "max_age_seconds": round(max_age, 3),
+            "buckets": buckets,
+            "ages": {k: round(v, 3) for k, v in sorted(report.items(), key=lambda kv: -kv[1])[:50]},
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/cache-staleness error: %s", e)
         return _error(str(e))
 
 
@@ -2230,9 +2898,10 @@ async def get_v4_state(request: Request):
 async def get_v4_sphere_clocks(request: Request):
     """V4 SphereClockEngine: 6 inner clocks, phases, radii, pulse counts."""
     import asyncio
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _ok({"error": "Spirit proxy not available"})
         return _ok(await asyncio.to_thread(spirit_proxy.get_sphere_clocks))
@@ -2248,9 +2917,10 @@ async def get_v4_sphere_clocks(request: Request):
 async def get_v4_resonance(request: Request):
     """V4 ResonanceDetector: pair alignments, BIG/GREAT pulse counts."""
     import asyncio
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _ok({"error": "Spirit proxy not available"})
         return _ok(await asyncio.to_thread(spirit_proxy.get_resonance))
@@ -2266,9 +2936,10 @@ async def get_v4_resonance(request: Request):
 async def get_v4_unified_spirit(request: Request):
     """V4 UnifiedSpirit: 30DT tensor, velocity, stale status, focus multiplier."""
     import asyncio
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _ok({"error": "Spirit proxy not available"})
         return _ok(await asyncio.to_thread(spirit_proxy.get_unified_spirit))
@@ -2284,9 +2955,10 @@ async def get_v4_unified_spirit(request: Request):
 async def get_v4_filter_down_status(request: Request):
     """FILTER_DOWN V4/V5 side-by-side state for rFP #2 coexistence monitoring."""
     import asyncio
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _ok({"error": "Spirit proxy not available"})
         return _ok(await asyncio.to_thread(spirit_proxy.get_filter_down_status))
@@ -2306,9 +2978,10 @@ async def get_v4_meditation_health(request: Request):
     self_healing_meditation_cadence I2) + observatory UI.
     """
     import asyncio
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _ok({"error": "Spirit proxy not available"})
         return _ok(await asyncio.to_thread(spirit_proxy.get_meditation_health))
@@ -2327,12 +3000,13 @@ async def post_v4_meditation_force_trigger(request: Request):
     Publishes a force-trigger with source="maker_manual" so downstream can
     distinguish from watchdog-automatic and emergent triggers.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         if not plugin.bus:
             return _error("Bus not available")
         from ..bus import make_msg
-        plugin.bus.publish(make_msg("MEDITATION_REQUEST", "dashboard", "meditation", {
+        titan_state.bus.publish(make_msg(bus.MEDITATION_REQUEST, "dashboard", "meditation", {
             "source": "maker_manual",
             "reason": "manual_force_trigger",
         }))
@@ -2350,9 +3024,10 @@ async def post_v4_meditation_force_trigger(request: Request):
 async def get_v4_nervous_system(request: Request):
     """V5 Neural NervousSystem: per-program learning metrics, training phase, buffer sizes."""
     import asyncio
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _ok({"error": "Spirit proxy not available"})
         return _ok(await asyncio.to_thread(spirit_proxy.get_nervous_system))
@@ -2716,7 +3391,8 @@ async def post_v4_reload(request: Request):
       Reload specific modules:
         POST /v4/reload  {"modules": ["neuromodulator", "expression_composites"]}
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         body = await request.json()
         modules = body.get("modules", [])
@@ -2728,7 +3404,7 @@ async def post_v4_reload(request: Request):
             return _error("Specify {\"all\": true} or {\"modules\": [\"neuromodulator\", ...]}")
 
         from ..bus import make_msg
-        plugin.bus.publish(make_msg("RELOAD", "core", worker, {
+        titan_state.bus.publish(make_msg(bus.RELOAD, "core", worker, {
             "modules": modules,
             "all": reload_all,
             "reason": reason,
@@ -2750,9 +3426,10 @@ async def post_v4_reload_api(request: Request):
     Reimports route modules, rebuilds FastAPI app, swaps into running uvicorn.
     Zero downtime — existing connections continue, new requests use new routes.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        result = plugin.reload_api()
+        result = titan_state.commands.reload_api()
         return _ok(result)
     except Exception as e:
         logger.error("[Dashboard] /v4/reload-api error: %s", e)
@@ -2765,13 +3442,14 @@ async def post_v4_reload_api(request: Request):
 @router.post("/v4/reload-config")
 async def post_v4_reload_config(request: Request):
     """Reload titan_params.toml into running spirit worker. No consciousness gap."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         import tomllib
         with open("titan_plugin/titan_params.toml", "rb") as f:
             new_params = tomllib.load(f)
         from ..bus import make_msg
-        plugin.bus.publish(make_msg("CONFIG_RELOAD", "api", "spirit", new_params))
+        titan_state.bus.publish(make_msg(bus.CONFIG_RELOAD, "api", "spirit", new_params))
         return _ok({"status": "config_reloaded", "sections": list(new_params.keys())})
     except Exception as e:
         logger.error("[Dashboard] /v4/reload-config error: %s", e)
@@ -2800,6 +3478,8 @@ _RESTART_MODULE_ALLOWLIST = {
     "language",     # No save handler yet — restart still works, state in DB
     "memory",       # State in DuckDB/FAISS — survives without explicit save
     "knowledge",    # State in DB
+    "emot_cgn",     # Has MODULE_SHUTDOWN handler + save_state (2026-04-23)
+    "timechain",    # 2026-04-27 — needed for index.db corruption recovery; chain_*.bin are source of truth, index is rebuildable
 }
 
 
@@ -2818,7 +3498,8 @@ async def post_v4_restart_module(name: str, request: Request):
 
     Body (optional): {"reason": "free-form text for audit log"}
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         if name not in _RESTART_MODULE_ALLOWLIST:
             return _error(
@@ -2907,7 +3588,8 @@ async def post_v4_msl_reset_homeostasis(request: Request):
 
     Returns previous values for audit trail.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         try:
             body = await request.json()
@@ -2939,7 +3621,7 @@ async def post_v4_msl_reset_homeostasis(request: Request):
 
         # Use the existing bus QUERY → RESPONSE pattern to ask spirit
         # to perform the reset. Reuses the established proxy pattern.
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if spirit_proxy is None:
             return _error("spirit_proxy not available")
         try:
@@ -2983,7 +3665,8 @@ async def post_v4_msl_reset_homeostasis(request: Request):
 @router.get("/v4/inner-trinity")
 async def get_v4_inner_trinity(request: Request):
     """T3 InnerTrinityCoordinator: topology, dreaming state, nervous system signals, observables."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         return _ok(await _get_cached_coordinator_async(plugin))
     except Exception as e:
@@ -2992,12 +3675,130 @@ async def get_v4_inner_trinity(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# GET /v4/sensors — Raw Phase 1 sensory producer outputs (2026-04-23)
+# ---------------------------------------------------------------------------
+# Exposes each independent rich-signal producer feeding outer_body's V6 5DT
+# composites — so the arch_map sensors diagnostic (and any future dashboard
+# widget) can show per-producer detail alongside the blended result rather
+# than just the 5 composite values.
+#
+# Related: rFP_phase1_sensory_wiring.md §3 (optional endpoint).
+# Producers exposed:
+#   - system_sensor     : cpu_load, cpu_thermal, circadian_phase, cpu_spike_rate
+#   - network_monitor   : peer_entropy, ping_variance, bus_drop_rate, bus_module_diversity
+#   - tx_latency_stats  : samples, median_s, p95_s, normalized [0,1]
+#   - block_delta_stats : samples, latest_height, blocks_per_min, normalized [0,1]
+# Plus:
+#   - outer_body        : current blended 5D composite (from state_register)
+#   - outer_body_dims   : V6 semantic dim labels
+#
+# Each producer is wrapped in try/except so a single failing sensor never
+# poisons the whole response. Failed producers return null and an error
+# field instead of crashing the endpoint.
+# ---------------------------------------------------------------------------
+@router.get("/v4/sensors")
+async def get_v4_sensors(request: Request):
+    """Raw Phase 1 sensor producer outputs + current composite outer_body."""
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
+
+    result: dict = {
+        "outer_body_dims": [
+            "interoception",    # SOL + block_delta + anchor_freshness
+            "proprioception",   # peer_entropy + helper_health + bus_module_diversity
+            "somatosensation",  # TX_latency + creation_nudge + cpu_spike_rate
+            "entropy",          # ping_variance + bus_drop_rate + error_rate
+            "thermal",          # cpu_thermal + circadian + llm_latency
+        ],
+    }
+
+    # Producer: system_sensor (CPU load / thermal / circadian / spike rate)
+    try:
+        from titan_plugin.utils import system_sensor as _ss
+        result["system_sensor"] = _ss.get_all_stats()
+    except Exception as e:
+        result["system_sensor"] = None
+        result["system_sensor_error"] = str(e)
+
+    # Producer: network_monitor (peer entropy, ping variance, bus drops)
+    try:
+        from titan_plugin.utils import network_monitor as _nm
+        _rpc_url = None
+        if hasattr(plugin, "network") and titan_state.network is not None:
+            _rpc_urls = getattr(titan_state.network, "rpc_urls", None) or []
+            _rpc_url = _rpc_urls[0] if _rpc_urls else None
+        _bus_stats = None
+        if hasattr(plugin, "bus") and plugin.bus is not None:
+            _bus_stats = getattr(plugin.bus, "stats", None)
+        result["network_monitor"] = _nm.get_all_stats(
+            rpc_url=_rpc_url, bus_stats=_bus_stats,
+        )
+    except Exception as e:
+        result["network_monitor"] = None
+        result["network_monitor_error"] = str(e)
+
+    # Producer: timechain_v2 TX latency + block delta
+    try:
+        from titan_plugin.logic.timechain_v2 import (
+            get_tx_latency_stats, get_block_delta_stats,
+        )
+        result["tx_latency"] = get_tx_latency_stats()
+        result["block_delta"] = get_block_delta_stats()
+    except Exception as e:
+        result["tx_latency"] = None
+        result["block_delta"] = None
+        result["timechain_stats_error"] = str(e)
+
+    # Blended composite: current outer_body 5D.
+    # Primary: coordinator-cache 130D state_vector slice (dims 65:70) — same
+    # authoritative source as /v3/trinity. State_register's own outer_body
+    # attribute drains from a bus queue with measurable lag, so reading it
+    # directly can return its [0.5]*5 default even when /v3/trinity shows
+    # rich composites. Fallback: state_register direct-read (handles the
+    # transient window where build_trinity_snapshot omits the consciousness
+    # key). Mirrors the /v3/trinity fallback pattern landed 2026-04-23.
+    outer_body_source = None
+    try:
+        coord = await _get_cached_coordinator_async(plugin)
+        consciousness = coord.get("consciousness", {})
+        if isinstance(consciousness, dict):
+            sv = consciousness.get("state_vector", [])
+            if isinstance(sv, list) and len(sv) >= 70:
+                result["outer_body"] = list(sv[65:70])
+                outer_body_source = "coordinator_state_vector"
+    except Exception as e:
+        result["outer_body_coord_error"] = str(e)
+
+    if outer_body_source is None:
+        try:
+            outer_state = getattr(plugin, "outer_state", None)
+            if outer_state is None:
+                outer_state = getattr(plugin, "state_register", None)
+            if outer_state is not None and hasattr(outer_state, "outer_body"):
+                _ob = getattr(outer_state, "outer_body", None)
+                if isinstance(_ob, (list, tuple)) and len(_ob) == 5:
+                    result["outer_body"] = list(_ob)
+                    outer_body_source = "state_register_fallback"
+        except Exception as e:
+            result["outer_body_state_register_error"] = str(e)
+
+    if outer_body_source is None:
+        result["outer_body"] = [0.5] * 5
+        outer_body_source = "default_fallback"
+
+    result["outer_body_source"] = outer_body_source
+
+    return _ok(result)
+
+
+# ---------------------------------------------------------------------------
 # GET /v4/neuromodulators — Lightweight neuromod state (uses coordinator cache)
 # ---------------------------------------------------------------------------
 @router.get("/v4/neuromodulators")
 async def get_v4_neuromodulators(request: Request):
     """6 neuromodulator levels, emotion, confidence. Cached (5s TTL)."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         coordinator = await _get_cached_coordinator_async(plugin)
         nm = coordinator.get("neuromodulators", {})
@@ -3013,7 +3814,8 @@ async def get_v4_neuromodulators(request: Request):
 @router.get("/v4/hormonal-system")
 async def get_v4_hormonal_system(request: Request):
     """10 hormonal programs: levels, thresholds, refractory, fire counts, maturity."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         coordinator = await _get_cached_coordinator_async(plugin)
         ns = coordinator.get("neural_nervous_system", {})
@@ -3034,7 +3836,8 @@ async def get_v4_hormonal_system(request: Request):
 @router.get("/v4/expression-composites")
 async def get_v4_expression_composites(request: Request):
     """5 expression composites: urge, threshold, fire count, consumption rate."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         coordinator = await _get_cached_coordinator_async(plugin)
         return _ok(coordinator.get("expression_composites", {}))
@@ -3048,9 +3851,18 @@ async def get_v4_expression_composites(request: Request):
 # ---------------------------------------------------------------------------
 @router.get("/v4/dreaming")
 async def get_v4_dreaming(request: Request):
-    """Dreaming: fatigue, cycle count, recovery progress, developmental age."""
-    plugin = _get_plugin(request)
+    """Dreaming: fatigue, cycle count, recovery progress, developmental age.
+
+    Read order: dreaming.state cache (live, populated by snapshot builder
+    DREAMING_STATE_UPDATED — payload pre-composed to match this response
+    shape) → coordinator fallback for cold-boot window.
+    """
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
+        live = titan_state.cache.get("dreaming.state", None)
+        if live:
+            return _ok(live)
         coordinator = await _get_cached_coordinator_async(plugin)
         dreaming = coordinator.get("dreaming", {})
         pi = coordinator.get("pi_heartbeat", {})
@@ -3088,7 +3900,8 @@ async def get_v4_cognitive_contracts(request: Request):
     handler 1:1). last_executed is approximated from the handler's last fire
     data when available.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         coordinator = await _get_cached_coordinator_async(plugin)
 
@@ -3148,7 +3961,8 @@ async def get_v4_cognitive_contracts(request: Request):
 @router.get("/v4/dream-inbox")
 async def get_dream_inbox(request: Request):
     """Dream inbox: queued messages during sleep, dream state, inbox count."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     inbox = getattr(plugin, '_dream_inbox', [])
     dream_state = getattr(plugin, '_dream_state', {})
     sorted_inbox = sorted(inbox, key=lambda x: (
@@ -3183,9 +3997,10 @@ async def get_v4_history(
     V4 Time Awareness time-series from ObservatoryDB.
     Use scalars_only=true for lightweight graph data (spirit velocity, pulse counts, loss).
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        obs_db = getattr(plugin, "_observatory_db", None)
+        obs_db = getattr(plugin, "_observatory_db", None) or _get_observatory_db()
         if not obs_db:
             return _ok({"error": "ObservatoryDB not available", "snapshots": []})
 
@@ -3204,15 +4019,22 @@ async def get_v4_reflexes(request: Request):
     """
     Current reflex arc state: collector config, recent firings, TitanVM scoring.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        v3_core = getattr(plugin, 'v3_core', None) or plugin
-        collector = getattr(v3_core, 'reflex_collector', None)
-        state_register = getattr(v3_core, 'state_register', None)
+        # Microkernel: reflex_collector + state_register live in spirit_worker,
+        # not on the api-side accessor. Endpoint reads cached snapshot if
+        # spirit_worker publishes one; until then, return graceful empty
+        # collector/state_register sections (frontend handles missing keys).
+        from titan_plugin.api.state_accessor import _CacheGetter, _CallableValue
+        v3_core = getattr(plugin, 'v3_core', None)
+        collector = getattr(v3_core, 'reflex_collector', None) if v3_core else None
+        state_register = getattr(v3_core, 'state_register', None) if v3_core else None
+        _is_real = lambda x: x is not None and not isinstance(x, (_CacheGetter, _CallableValue))
 
         result = {"v4": True, "reflex_arc": True}
 
-        if collector:
+        if _is_real(collector):
             result["collector"] = {
                 "fire_threshold": collector.fire_threshold,
                 "action_threshold": collector.action_threshold,
@@ -3223,7 +4045,7 @@ async def get_v4_reflexes(request: Request):
                 "registered_executors": [rt.value for rt in collector._executors.keys()],
             }
 
-        if state_register:
+        if _is_real(state_register):
             result["state_register"] = {
                 "age_seconds": round(state_register.age_seconds(), 1),
                 "body_avg": round(sum(state_register.body_tensor) / 5, 3),
@@ -3242,7 +4064,7 @@ async def get_v4_reflexes(request: Request):
             }
 
         # Stats from ObservatoryDB
-        obs_db = getattr(plugin, "_observatory_db", None)
+        obs_db = getattr(plugin, "_observatory_db", None) or _get_observatory_db()
         if obs_db:
             try:
                 result["stats_24h"] = obs_db.get_reflex_stats(hours=24)
@@ -3269,9 +4091,10 @@ async def get_v4_reflex_history(
     Reflex firing history from ObservatoryDB.
     Filter by reflex_type (e.g. 'memory_recall', 'guardian_shield').
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        obs_db = getattr(plugin, "_observatory_db", None)
+        obs_db = getattr(plugin, "_observatory_db", None) or _get_observatory_db()
         if not obs_db:
             return _ok({"error": "ObservatoryDB not available", "entries": []})
 
@@ -3297,14 +4120,22 @@ async def get_v4_reflex_history(
 # ---------------------------------------------------------------------------
 @router.get("/v4/pi-heartbeat")
 async def get_v4_pi_heartbeat(request: Request):
-    """π-Heartbeat: emergent self-integration rhythm from consciousness curvature."""
-    plugin = _get_plugin(request)
+    """π-Heartbeat: emergent self-integration rhythm from consciousness curvature.
+
+    Read order: pi_heartbeat.state cache (live, populated by snapshot
+    builder PI_HEARTBEAT_UPDATED publish) → coordinator.pi_heartbeat
+    → spirit_proxy.get_v4_state fallback → "not yet wired" stub.
+    """
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        coordinator = await _get_cached_coordinator_async(plugin)
-        pi_stats = coordinator.get("pi_heartbeat", {})
+        pi_stats = titan_state.cache.get("pi_heartbeat.state", None)
+        if not pi_stats:
+            coordinator = await _get_cached_coordinator_async(plugin)
+            pi_stats = coordinator.get("pi_heartbeat", {})
         if not pi_stats:
             import asyncio
-            spirit_proxy = plugin._proxies.get("spirit")
+            spirit_proxy = titan_state.spirit
             if spirit_proxy:
                 v4_state = await asyncio.to_thread(spirit_proxy.get_v4_state)
                 pi_stats = v4_state.get("pi_heartbeat", {"status": "not yet wired to API"})
@@ -3319,11 +4150,21 @@ async def get_v4_pi_heartbeat(request: Request):
 # ---------------------------------------------------------------------------
 @router.get("/v4/chi")
 async def get_v4_chi(request: Request):
-    """Chi Life Force: 3×3 Trinity-mapped vitality metric with circulation and contemplation."""
-    plugin = _get_plugin(request)
+    """Chi Life Force: 3×3 Trinity-mapped vitality metric with circulation and contemplation.
+
+    Read order: chi.state (live, populated by spirit_worker CHI_UPDATED publish)
+    → coordinator.chi (bootstrap placeholder, kernel snapshot default).
+    """
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        coordinator = await _get_cached_coordinator_async(plugin)
-        chi = coordinator.get("chi", {})
+        # Live chi from spirit_worker → BusSubscriber → cache.
+        chi = titan_state.cache.get("chi.state", None)
+        if not chi:
+            # Bootstrap placeholder (kernel snapshot, full-shape per
+            # life_force.py L369-373). Avoids NaN% on cold boot.
+            coordinator = await _get_cached_coordinator_async(plugin)
+            chi = coordinator.get("chi", {})
         if not chi:
             return _ok({"status": "Chi not yet evaluated — waiting for first 132D epoch"})
         return _ok(chi)
@@ -3353,12 +4194,13 @@ async def get_v4_meditations(request: Request, limit: int = 10):
 @router.get("/v4/backup/verify")
 async def get_v4_backup_verify(request: Request, backup_type: str = "personality"):
     """Verify latest backup: compare current state hash to stored Arweave record."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         backup = getattr(plugin, 'backup', None)
         if not backup:
             return _ok({"verified": False, "error": "Backup module not initialized"})
-        result = await backup.verify_backup(backup_type)
+        result = backup.verify_backup(backup_type)
         return _ok(result)
     except Exception as e:
         logger.error("[Dashboard] /v4/backup/verify error: %s", e)
@@ -3375,7 +4217,8 @@ async def post_v4_backup_trigger(request: Request):
 
     Body JSON: {"type": "personality"|"soul"|"timechain"} (default "personality")
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         body = {}
         try:
@@ -3386,8 +4229,8 @@ async def post_v4_backup_trigger(request: Request):
         if backup_type not in ("personality", "soul", "timechain"):
             return _error(f"invalid type: {backup_type}")
         from ..bus import make_msg
-        plugin.bus.publish(make_msg(
-            "BACKUP_TRIGGER_MANUAL", "api", "backup",
+        titan_state.bus.publish(make_msg(
+            bus.BACKUP_TRIGGER_MANUAL, "api", "backup",
             {"type": backup_type, "requested_at": int(__import__('time').time())},
         ))
         logger.info("[Dashboard] /v4/backup/trigger fired type=%s", backup_type)
@@ -3401,7 +4244,8 @@ async def post_v4_backup_trigger(request: Request):
 @router.get("/v4/backup/status")
 async def get_v4_backup_status(request: Request):
     """Backup health summary: last successful per type, master invariant, mode."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         import os as _os, time as _time, json as _json
         from pathlib import Path as _Path
@@ -3425,7 +4269,7 @@ async def get_v4_backup_status(request: Request):
                 mode = "unknown"
         result = {"mode": mode, "records": {}, "master_invariant_ok": True}
         now = _time.time()
-        # Read records from disk (subprocess writes here; plugin.backup may be None)
+        # Read records from disk (subprocess writes here; titan_state.backup may be None)
         rec_dir = _Path("data/backup_records")
         for btype in ("personality", "soul_package"):
             rec = None
@@ -3614,13 +4458,14 @@ def _count_local_snapshots(local_dir: str) -> dict:
 @router.get("/v4/metabolic-state")
 async def get_v4_metabolic_state(request: Request):
     """Metabolic state: 6-tier SOL starvation table with feature gating."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         metabolism = getattr(plugin, 'metabolism', None)
         if not metabolism:
             return _ok({"tier": "UNKNOWN", "error": "Metabolism not initialized"})
         # Refresh balance
-        await metabolism.get_current_state()
+        metabolism.get_current_state()
         return _ok(metabolism.get_tier_info())
     except Exception as e:
         logger.error("[Dashboard] /v4/metabolic-state error: %s", e)
@@ -3633,9 +4478,10 @@ async def get_v4_metabolic_state(request: Request):
 @router.get("/v4/self-exploration")
 async def get_v4_self_exploration(request: Request):
     """Self-Exploration Outer Interface: mode, stats, decoder, narrator, advisor."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _ok({"error": "Spirit proxy not available"})
         coordinator = await _get_cached_coordinator_async(plugin)
@@ -3672,7 +4518,8 @@ async def post_experience_stimulus(request: Request):
         "pass_type": "feel"
     }
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         body = await request.json()
         perturbation = body.get("perturbation", {})
@@ -3693,8 +4540,8 @@ async def post_experience_stimulus(request: Request):
 
         # Publish EXPERIENCE_STIMULUS to bus
         from ..bus import make_msg
-        plugin.bus.publish(make_msg(
-            "EXPERIENCE_STIMULUS", "playground", "all", {
+        titan_state.bus.publish(make_msg(
+            bus.EXPERIENCE_STIMULUS, "playground", "all", {
                 "experience": experience,
                 "word": word,
                 "pass_type": pass_type,
@@ -3703,7 +4550,7 @@ async def post_experience_stimulus(request: Request):
             }))
 
         # Also inject hormones directly via spirit proxy if available
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         hormones_applied = {}
         if spirit_proxy and hormone_stimuli:
             try:
@@ -3820,7 +4667,8 @@ async def mood_narrative(request: Request):
     if _mood_narrative_cache["text"] and now - _mood_narrative_cache["ts"] < 60:
         return _ok({"narrative": _mood_narrative_cache["text"], "cached": True})
 
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         ollama = _get_ollama()
         if not ollama:
@@ -3829,7 +4677,7 @@ async def mood_narrative(request: Request):
         # Gather current state
         coord_data = {}
         try:
-            spirit_proxy = plugin._proxies.get("spirit")
+            spirit_proxy = titan_state.spirit
             if spirit_proxy:
                 coord_data = await asyncio.to_thread(spirit_proxy.get_coordinator_snapshot) or {}
         except Exception:
@@ -3895,7 +4743,8 @@ async def state_narration(
     Consumers: Chat sidebar, Soul Mosaic, X post headers, Observatory homepage.
     """
     global _state_narrator
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
 
     # Lazy-init narrator
     if _state_narrator is None:
@@ -3909,7 +4758,7 @@ async def state_narration(
 
         # Neuromodulators
         try:
-            neuromod_data = plugin.memory.get_neuromod_state() if plugin.memory else None
+            neuromod_data = titan_state.memory.get_neuromod_state() if titan_state.memory else None
             if neuromod_data and isinstance(neuromod_data, dict):
                 state["neuromod"] = {
                     "DA": neuromod_data.get("DA", 0.5),
@@ -3928,7 +4777,7 @@ async def state_narration(
 
         # Chi and dreaming from coordinator/inner-trinity
         try:
-            coordinator = plugin.memory.get_coordinator() if plugin.memory else None
+            coordinator = titan_state.memory.get_coordinator() if titan_state.memory else None
             if coordinator and isinstance(coordinator, dict):
                 state["chi"] = coordinator.get("chi", {}).get("total", 0.5) if isinstance(coordinator.get("chi"), dict) else 0.5
                 dreaming = coordinator.get("dreaming", {})
@@ -3943,7 +4792,7 @@ async def state_narration(
 
         # Active programs from NS
         try:
-            ns_data = plugin.memory.get_ns_state() if plugin.memory else None
+            ns_data = titan_state.memory.get_ns_state() if titan_state.memory else None
             if ns_data and isinstance(ns_data, dict):
                 programs = ns_data.get("programs", {})
                 if isinstance(programs, dict):
@@ -3963,7 +4812,7 @@ async def state_narration(
 
         # Reasoning commit rate
         try:
-            reasoning = plugin.memory.get_reasoning_state() if plugin.memory else None
+            reasoning = titan_state.memory.get_reasoning_state() if titan_state.memory else None
             if reasoning and isinstance(reasoning, dict):
                 chains = reasoning.get("total_chains", 1)
                 commits = reasoning.get("total_commits", 0)
@@ -4024,7 +4873,8 @@ async def narrate_art(
     file_path: str = Query(..., description="Relative path to art file"),
 ):
     """Generate poetic description for an art piece. Cached permanently in SQLite."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         cache_db = "./data/observatory.db"
 
@@ -4237,8 +5087,9 @@ async def narrated_feed(
             logger.debug("[NarratedFeed] program fires error: %s", e)
 
         # 6. Observatory events — pulses, dreams, expression fires
-        plugin = _get_plugin(request)
-        obs_db = getattr(plugin, "_observatory_db", None)
+        titan_state = _get_plugin(request)
+        plugin = titan_state  # backward-compat alias for Category C callsites
+        obs_db = getattr(plugin, "_observatory_db", None) or _get_observatory_db()
         if obs_db:
             try:
                 # Dream transitions
@@ -4419,7 +5270,8 @@ async def activity_feed(
     Unified activity feed combining multiple event sources into a
     single chronological stream for the Observatory homepage.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         feed_items = []
         now = time.time()
@@ -4511,7 +5363,7 @@ async def activity_feed(
             logger.debug("[ActivityFeed] consciousness query error: %s", e)
 
         # 3. Observatory events — limited per type to avoid flooding
-        obs_db = getattr(plugin, "_observatory_db", None)
+        obs_db = getattr(plugin, "_observatory_db", None) or _get_observatory_db()
         if obs_db:
             try:
                 event_limits = {
@@ -4560,7 +5412,8 @@ async def debug_memory(request: Request):
     Inspect the direct memory backend status via proxy.
     Returns counts and backup state. No auth required (read-only).
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
 
     result = {
         "backend": "direct_memory (DuckDB + FAISS + Kuzu)",
@@ -4568,7 +5421,7 @@ async def debug_memory(request: Request):
 
     # Get memory status via proxy (runs in memory_worker process)
     try:
-        mem_status = plugin.memory.get_memory_status()
+        mem_status = titan_state.memory.get_memory_status()
         if mem_status:
             result["backend_ready"] = mem_status.get("cognee_ready", False)
             result["persistent_count"] = mem_status.get("persistent_count", 0)
@@ -4582,15 +5435,15 @@ async def debug_memory(request: Request):
 
     # Backup state (lives in main process — direct access OK)
     try:
-        if plugin.backup:
-            latest_personality = plugin.backup.get_latest_backup_record("personality")
-            latest_soul = plugin.backup.get_latest_backup_record("soul_package")
+        if titan_state.backup:
+            latest_personality = titan_state.backup.get_latest_backup_record("personality")
+            latest_soul = titan_state.backup.get_latest_backup_record("soul_package")
             result["backup"] = {
                 "last_personality": latest_personality.get("uploaded_at") if latest_personality else None,
                 "last_soul_package": latest_soul.get("uploaded_at") if latest_soul else None,
-                "meditation_count": plugin.backup._meditation_count,
-                "last_personality_date": plugin.backup._last_personality_date,
-                "last_soul_date": plugin.backup._last_soul_date,
+                "meditation_count": titan_state.backup._meditation_count,
+                "last_personality_date": titan_state.backup._last_personality_date,
+                "last_soul_date": titan_state.backup._last_soul_date,
             }
     except Exception:
         pass
@@ -4603,12 +5456,21 @@ async def debug_memory(request: Request):
 # ---------------------------------------------------------------------------
 @router.get("/v4/reasoning")
 async def get_v4_reasoning(request: Request):
-    """Reasoning engine stats: chains, commits, abandons, commit rate."""
-    plugin = _get_plugin(request)
+    """Reasoning engine stats: chains, commits, abandons, commit rate.
+
+    Read order: reasoning.state cache (live, populated by snapshot
+    builder REASONING_STATS_UPDATED) → coordinator.reasoning fallback.
+    """
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _ok({"error": "Spirit proxy not available"})
+        # Live cache first (M1+sweep 2026-04-26).
+        live = titan_state.cache.get("reasoning.state", None)
+        if live:
+            return _ok(live)
         coordinator = await _get_cached_coordinator_async(plugin)
         reasoning = coordinator.get("reasoning", {})
         if not reasoning:
@@ -4801,11 +5663,18 @@ async def get_v4_meta_reasoning(request: Request):
     case, pass through the empty dict — the 1.5s cache will serve
     fresh data next call, and callers can retry rather than misread.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _ok({"error": "Spirit proxy not available"})
+        # M1 Phase E: read meta_reasoning.state cache first (populated by
+        # snapshot builder's META_REASONING_STATS_UPDATED publish). Falls
+        # back to coordinator.meta_reasoning for the cold-boot window.
+        live = titan_state.cache.get("meta_reasoning.state", None)
+        if live:
+            return _ok(live)
         coordinator = await _get_cached_coordinator_async(plugin)
         meta = coordinator.get("meta_reasoning", {})
         # meta is always a dict (defensive try/except in spirit_loop ensures
@@ -4840,7 +5709,8 @@ async def post_v4_meta_event_reward(request: Request):
       titan_id:       str (optional) — for telemetry
     """
     try:
-        plugin = _get_plugin(request)
+        titan_state = _get_plugin(request)
+        plugin = titan_state  # backward-compat alias for Category C callsites
         body = await request.json()
         quality = float(body.get("quality", 0.0))
         window_number = int(body.get("window_number", -1))
@@ -4849,8 +5719,8 @@ async def post_v4_meta_event_reward(request: Request):
         quality = max(0.0, min(1.0, quality))
 
         from titan_plugin.bus import make_msg
-        plugin.bus.publish(make_msg(
-            "META_EVENT_REWARD", "events_teacher", "spirit", {
+        titan_state.bus.publish(make_msg(
+            bus.META_EVENT_REWARD, "events_teacher", "spirit", {
                 "quality": quality,
                 "window_number": window_number,
                 "titan_id": titan_id,
@@ -4871,9 +5741,10 @@ async def post_v4_meta_event_reward(request: Request):
 @router.get("/v4/meta-cgn")
 async def get_v4_meta_cgn(request: Request):
     """Full META-CGN telemetry — status, graduation, failsafe, impasse, HAOV."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _ok({"error": "Spirit proxy not available"})
         coordinator = await _get_cached_coordinator_async(plugin)
@@ -4902,9 +5773,10 @@ async def get_v4_meta_service(request: Request):
     all requests resolve with failure_mode="not_yet_implemented" —
     requests_dry_run_resolved is the active counter during Session 1 soak.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _ok({"error": "Spirit proxy not available"})
         coordinator = await _get_cached_coordinator_async(plugin)
@@ -4924,7 +5796,8 @@ async def get_v4_meta_service(request: Request):
 @router.get("/v4/meta-service/queue")
 async def get_v4_meta_service_queue(request: Request):
     """Live queue depth + backpressure state — rFP §11.1 endpoint 2."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         coordinator = await _get_cached_coordinator_async(plugin)
         status = coordinator.get("meta_service", {}) or {}
@@ -4958,7 +5831,8 @@ async def get_v4_meta_service_recruitment(request: Request):
     Closes rFP §11.1 observability — visibility into which recruiters
     get selected per (primitive, sub_mode) tuple, their evolving
     posterior mean, and catalog coverage."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         coordinator = await _get_cached_coordinator_async(plugin)
         status = coordinator.get("meta_service", {}) or {}
@@ -4985,7 +5859,8 @@ async def get_v4_meta_service_rewards(request: Request):
     """Signed-outcome accumulator stats + α-ramp progression + per-consumer
     positive/negative rate. Teaching-signal visibility during Session 2+ soak
     (negative outcomes teach meta what NOT to do per rFP §4.6)."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         coordinator = await _get_cached_coordinator_async(plugin)
         status = coordinator.get("meta_service", {}) or {}
@@ -5018,7 +5893,8 @@ async def get_v4_meta_service_timechain(request: Request):
     index freshness, block-hit rate for SIMILAR. rFP §9 Upgrade F telemetry
     surface. Session 2 ships counters at 0 (chain execution lands Session 3);
     SIMILAR index freshness + FAISS status still visible."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         coordinator = await _get_cached_coordinator_async(plugin)
         tc = coordinator.get("timechain", {}) or {}
@@ -5060,9 +5936,10 @@ async def get_v4_meta_service_timechain(request: Request):
 @router.get("/v4/meta-cgn/graduation-readiness")
 async def get_v4_meta_cgn_graduation_readiness(request: Request):
     """Detailed blockers view — what's preventing META-CGN graduation?"""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _ok({"error": "Spirit proxy not available"})
         coordinator = await _get_cached_coordinator_async(plugin)
@@ -5085,12 +5962,726 @@ async def get_v4_meta_cgn_graduation_readiness(request: Request):
         return _error(str(e))
 
 
+# ---------------------------------------------------------------------------
+# GET /v4/meta-teacher/status — Meta-Reasoning Teacher overview
+# GET /v4/meta-teacher/critiques — paginated recent critiques
+# rFP: titan-docs/rFP_titan_meta_reasoning_teacher.md §7.3
+# ---------------------------------------------------------------------------
+@router.get("/v4/meta-teacher/status")
+async def get_v4_meta_teacher_status(request: Request):
+    """Meta-Teacher lifetime + 24h telemetry. Reads directly from
+    data/meta_teacher/{critiques.YYYYMMDD.jsonl, adoption_metrics.json} +
+    [meta_teacher] config — no bus round-trip."""
+    import glob as _glob
+    import json as _json
+    import os as _os
+    import time as _time
+
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
+    try:
+        cfg = (titan_state.config.full or {}).get("meta_teacher", {})
+        data_dir = (titan_state.config.full or {}).get(
+            "memory_and_storage", {}).get("data_dir", "./data")
+        mt_dir = _os.path.join(data_dir, "meta_teacher")
+
+        # Aggregate recent critiques (last 24h)
+        now = _time.time()
+        cutoff = now - 86400.0
+        cat_counts: dict[str, int] = {}
+        scores_24h: list[float] = []
+        critiques_24h = 0
+        ok_24h = 0
+        failed_24h = 0
+        if _os.path.isdir(mt_dir):
+            for fpath in sorted(_glob.glob(
+                    _os.path.join(mt_dir, "critiques.*.jsonl"))):
+                try:
+                    with open(fpath) as f:
+                        for line in f:
+                            try:
+                                e = _json.loads(line)
+                            except Exception:
+                                continue
+                            if float(e.get("ts", 0)) < cutoff:
+                                continue
+                            critiques_24h += 1
+                            if e.get("llm_ok"):
+                                ok_24h += 1
+                            else:
+                                failed_24h += 1
+                            scores_24h.append(
+                                float(e.get("quality_score", 0.5)))
+                            for cat in (e.get("critique_categories") or []):
+                                cat_counts[cat] = cat_counts.get(cat, 0) + 1
+                except Exception:
+                    continue
+
+        avg_q_24h = (sum(scores_24h) / len(scores_24h)) if scores_24h else 0.0
+        top_cats = sorted(cat_counts.items(), key=lambda x: -x[1])[:5]
+
+        # Adoption metrics — handles both legacy flat format
+        # ({"domain": score}) and v2 versioned format
+        # ({"_prompt_version": 2, "by_domain": {...}}).
+        adoption: dict[str, float] = {}
+        prompt_version_on_disk: int = 1
+        adoption_path = _os.path.join(mt_dir, "adoption_metrics.json")
+        if _os.path.exists(adoption_path):
+            try:
+                with open(adoption_path) as f:
+                    raw = _json.load(f) or {}
+                if isinstance(raw, dict) and "_prompt_version" in raw:
+                    prompt_version_on_disk = int(raw.get("_prompt_version", 1))
+                    by_domain = raw.get("by_domain", {})
+                    if isinstance(by_domain, dict):
+                        adoption = {
+                            str(k): float(v)
+                            for k, v in by_domain.items()
+                            if isinstance(v, (int, float))
+                        }
+                elif isinstance(raw, dict):
+                    # Legacy flat format
+                    adoption = {
+                        str(k): float(v)
+                        for k, v in raw.items()
+                        if isinstance(v, (int, float))
+                    }
+            except Exception:
+                pass
+        adoption_overall = (
+            sum(adoption.values()) / len(adoption)) if adoption else 0.0
+
+        # rFP_meta_teacher_v2 Phase B: teaching memory cold-tier counts.
+        # Read the journal directly — the worker persists last-state per
+        # topic_key on every upsert, so file-based view is authoritative.
+        journal_path = _os.path.join(mt_dir, "teaching_journal.jsonl")
+        cold_topics = 0
+        still_needs_push_count = 0
+        cold_last_seen: dict[str, float] = {}
+        if _os.path.exists(journal_path):
+            try:
+                with open(journal_path) as f:
+                    for line in f:
+                        try:
+                            r = _json.loads(line)
+                        except Exception:
+                            continue
+                        tk = r.get("topic_key")
+                        if not isinstance(tk, str):
+                            continue
+                        # Journal is append-only; later row wins.
+                        cold_last_seen[tk] = float(r.get("last_seen") or 0.0)
+                cold_topics = len(cold_last_seen)
+                # Count still_needs_push from last row per topic
+                last_rows: dict[str, dict] = {}
+                with open(journal_path) as f:
+                    for line in f:
+                        try:
+                            r = _json.loads(line)
+                        except Exception:
+                            continue
+                        tk = r.get("topic_key")
+                        if not isinstance(tk, str):
+                            continue
+                        last_rows[tk] = r
+                still_needs_push_count = sum(
+                    1 for r in last_rows.values() if r.get("still_needs_push"))
+            except Exception:
+                pass
+
+        return _ok({
+            "enabled": bool(cfg.get("enabled", False)),
+            "sample_mode": cfg.get("sample_mode", "uncertainty_plus_random"),
+            "task_key": cfg.get("task_key", "meta_teacher"),
+            "max_critiques_per_hour": int(cfg.get("max_critiques_per_hour", 30)),
+            "reward_weight_config": float(cfg.get("reward_weight", 0.05)),
+            "reward_weight_cap": float(cfg.get("reward_weight_cap", 0.30)),
+            "grounding_weight": float(cfg.get("grounding_weight", 0.15)),
+            "critiques_24h": critiques_24h,
+            "llm_ok_24h": ok_24h,
+            "llm_failed_24h": failed_24h,
+            "avg_quality_score_24h": round(avg_q_24h, 3),
+            "top_critique_categories": top_cats,
+            "adoption_prompt_version": prompt_version_on_disk,
+            "adoption_rate_by_domain": {
+                k: round(float(v), 3) for k, v in adoption.items()},
+            "adoption_rate_overall": round(adoption_overall, 3),
+            "critiques_dir": mt_dir,
+            # Phase A/B feature flags + memory counts
+            "content_awareness_enabled": bool(
+                cfg.get("content_awareness_enabled", True)),
+            "teaching_memory_enabled": bool(
+                cfg.get("teaching_memory_enabled", False)),
+            "memory_cold_tier_topics": cold_topics,
+            "memory_still_needs_push_count": still_needs_push_count,
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-teacher/status error: %s", e)
+        return _error(str(e))
+
+
+@router.get("/v4/meta-teacher/critiques")
+async def get_v4_meta_teacher_critiques(request: Request):
+    """Recent critiques (paginated). ?limit=N (default 50, max 500).
+    Returns newest-first from data/meta_teacher/critiques.YYYYMMDD.jsonl."""
+    import glob as _glob
+    import json as _json
+    import os as _os
+
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
+    try:
+        limit = max(1, min(500, int(request.query_params.get("limit", 50))))
+        data_dir = (titan_state.config.full or {}).get(
+            "memory_and_storage", {}).get("data_dir", "./data")
+        mt_dir = _os.path.join(data_dir, "meta_teacher")
+
+        # Read newest jsonl first, walk back
+        critiques: list[dict] = []
+        if _os.path.isdir(mt_dir):
+            files = sorted(
+                _glob.glob(_os.path.join(mt_dir, "critiques.*.jsonl")),
+                reverse=True)
+            for fpath in files:
+                if len(critiques) >= limit:
+                    break
+                try:
+                    with open(fpath) as f:
+                        lines = f.readlines()
+                    for line in reversed(lines):
+                        try:
+                            e = _json.loads(line)
+                        except Exception:
+                            continue
+                        critiques.append(e)
+                        if len(critiques) >= limit:
+                            break
+                except Exception:
+                    continue
+
+        return _ok({
+            "critiques": critiques[:limit],
+            "count": len(critiques[:limit]),
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-teacher/critiques error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# rFP_meta_teacher_v2 Phase B — Teaching Memory endpoints
+# ---------------------------------------------------------------------------
+# Each reads directly from the cold-tier journal (teaching_journal.jsonl) and
+# daily INFO logs. The worker's in-memory hot tier is not exposed through
+# the API — too volatile, and the journal captures the durable state.
+# ---------------------------------------------------------------------------
+
+def _mt_read_journal_latest(journal_path: str) -> dict:
+    """Return {topic_key: latest_row} from the append-only journal."""
+    import json as _json
+    import os as _os
+    latest: dict[str, dict] = {}
+    if not _os.path.exists(journal_path):
+        return latest
+    try:
+        with open(journal_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = _json.loads(line)
+                except Exception:
+                    continue
+                tk = row.get("topic_key")
+                if isinstance(tk, str):
+                    latest[tk] = row
+    except Exception:
+        pass
+    return latest
+
+
+@router.get("/v4/meta-teacher/memory")
+async def get_v4_meta_teacher_memory(request: Request):
+    """Phase B: teaching memory overview.
+
+    Reads data/meta_teacher/teaching_journal.jsonl directly. Returns cold
+    tier counts, still_needs_push count, recent-activity window. Does NOT
+    expose the hot tier (worker-local, volatile).
+    """
+    import os as _os
+
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
+    try:
+        cfg = (titan_state.config.full or {}).get("meta_teacher", {})
+        data_dir = (titan_state.config.full or {}).get(
+            "memory_and_storage", {}).get("data_dir", "./data")
+        mt_dir = _os.path.join(data_dir, "meta_teacher")
+        journal_path = _os.path.join(mt_dir, "teaching_journal.jsonl")
+        archive_path = _os.path.join(
+            mt_dir, "teaching_journal.archive.jsonl.gz")
+
+        latest = _mt_read_journal_latest(journal_path)
+        total_topics = len(latest)
+        snp_count = sum(1 for r in latest.values() if r.get("still_needs_push"))
+        total_critiques = sum(
+            int(r.get("critique_count", 0)) for r in latest.values())
+        avg_critiques = (
+            total_critiques / total_topics) if total_topics else 0.0
+        # Recent activity: count topics with last_seen in last 24h
+        import time as _time
+        cutoff = _time.time() - 86400.0
+        active_24h = sum(
+            1 for r in latest.values()
+            if float(r.get("last_seen") or 0.0) >= cutoff)
+
+        archive_size = 0
+        if _os.path.exists(archive_path):
+            try:
+                archive_size = _os.path.getsize(archive_path)
+            except OSError:
+                pass
+
+        return _ok({
+            "teaching_memory_enabled": bool(
+                cfg.get("teaching_memory_enabled", False)),
+            "cold_tier_topics": total_topics,
+            "cold_tier_critiques_total": total_critiques,
+            "avg_critiques_per_topic": round(avg_critiques, 2),
+            "still_needs_push_count": snp_count,
+            "active_topics_24h": active_24h,
+            "archival_days": int(cfg.get("cold_tier_archival_days", 90)),
+            "archive_bytes": int(archive_size),
+            "journal_path": journal_path,
+            "memory_buffer_hot_size": int(
+                cfg.get("memory_buffer_hot_size", 1000)),
+            "retrieval_top_k": int(cfg.get("retrieval_top_k", 3)),
+            "retrieval_similarity_threshold": float(
+                cfg.get("retrieval_similarity_threshold", 0.6)),
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-teacher/memory error: %s", e)
+        return _error(str(e))
+
+
+@router.get("/v4/meta-teacher/memory/still-needs-push")
+async def get_v4_meta_teacher_still_needs_push(request: Request):
+    """Phase B: list of topic_keys currently flagged still_needs_push.
+
+    Ordered by critique_count desc. ?limit=N (default 20, max 100).
+    """
+    import os as _os
+
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
+    try:
+        limit = max(1, min(100, int(request.query_params.get("limit", 20))))
+        data_dir = (titan_state.config.full or {}).get(
+            "memory_and_storage", {}).get("data_dir", "./data")
+        journal_path = _os.path.join(
+            data_dir, "meta_teacher", "teaching_journal.jsonl")
+        latest = _mt_read_journal_latest(journal_path)
+        stuck = [r for r in latest.values() if r.get("still_needs_push")]
+        stuck.sort(key=lambda r: -int(r.get("critique_count", 0)))
+        out = []
+        for r in stuck[:limit]:
+            out.append({
+                "topic_key": r.get("topic_key"),
+                "critique_count": int(r.get("critique_count", 0)),
+                "quality_delta": round(float(r.get("quality_delta", 0.0)), 4),
+                "first_seen": float(r.get("first_seen") or 0.0),
+                "last_seen": float(r.get("last_seen") or 0.0),
+                "summary_cache": r.get("summary_cache") or "",
+            })
+        return _ok({"topics": out, "count": len(out)})
+    except Exception as e:
+        logger.error(
+            "[Dashboard] /v4/meta-teacher/still-needs-push error: %s", e)
+        return _error(str(e))
+
+
+@router.get("/v4/meta-teacher/maker-info")
+async def get_v4_meta_teacher_maker_info(request: Request):
+    """Phase B: recent INFO entries for Maker (non-actionable notifications).
+
+    Scrolls newest-first through data/meta_teacher/maker_info_log.*.jsonl.
+    ?limit=N (default 50, max 500).
+    """
+    import glob as _glob
+    import json as _json
+    import os as _os
+
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
+    try:
+        limit = max(1, min(500, int(request.query_params.get("limit", 50))))
+        data_dir = (titan_state.config.full or {}).get(
+            "memory_and_storage", {}).get("data_dir", "./data")
+        mt_dir = _os.path.join(data_dir, "meta_teacher")
+
+        entries: list[dict] = []
+        if _os.path.isdir(mt_dir):
+            files = sorted(
+                _glob.glob(_os.path.join(mt_dir, "maker_info_log.*.jsonl")),
+                reverse=True)
+            for fpath in files:
+                if len(entries) >= limit:
+                    break
+                try:
+                    with open(fpath) as f:
+                        lines = f.readlines()
+                    for line in reversed(lines):
+                        try:
+                            e = _json.loads(line)
+                        except Exception:
+                            continue
+                        entries.append(e)
+                        if len(entries) >= limit:
+                            break
+                except Exception:
+                    continue
+
+        return _ok({
+            "info_entries": entries[:limit],
+            "count": len(entries[:limit]),
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-teacher/maker-info error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# rFP_meta_teacher_v2 Phase C — Autonomous Voice-Tuning endpoints
+# ---------------------------------------------------------------------------
+# Read directly from data/meta_teacher/voice_state.json + voice_journal.jsonl.
+# The teacher worker is the sole writer; dashboard is read + revert only.
+# ---------------------------------------------------------------------------
+
+@router.get("/v4/meta-teacher/voice")
+async def get_v4_meta_teacher_voice(request: Request):
+    """Phase C: current voice_state — biases, hints, suppressions, hash.
+
+    Reads data/meta_teacher/voice_state.json. Returns default neutral voice
+    when the file is absent (voice never applied or freshly disabled).
+    """
+    import json as _json
+    import os as _os
+
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
+    try:
+        cfg = (titan_state.config.full or {}).get("meta_teacher", {})
+        data_dir = (titan_state.config.full or {}).get(
+            "memory_and_storage", {}).get("data_dir", "./data")
+        state_path = _os.path.join(
+            data_dir, "meta_teacher", "voice_state.json")
+        journal_path = _os.path.join(
+            data_dir, "meta_teacher", "voice_journal.jsonl")
+        state: dict = {
+            "version": 1,
+            "applied_count": 0,
+            "domain_biases": {},
+            "domain_style_hints": {},
+            "topic_suppressions": [],
+            "last_updated_ts": 0.0,
+            "critiques_since_change": 0,
+        }
+        if _os.path.exists(state_path):
+            try:
+                with open(state_path) as f:
+                    raw = _json.load(f)
+                if isinstance(raw, dict):
+                    state.update({
+                        k: raw.get(k, state.get(k))
+                        for k in (
+                            "version", "applied_count", "domain_biases",
+                            "domain_style_hints", "topic_suppressions",
+                            "last_updated_ts", "critiques_since_change")
+                    })
+            except Exception:
+                pass
+        # Read state hash via the same canonicalization the worker uses.
+        try:
+            from titan_plugin.logic.meta_teacher_voice import _hash_state
+            state_hash = _hash_state(state)
+        except Exception:
+            state_hash = ""
+        return _ok({
+            "voice_tuning_enabled": bool(
+                cfg.get("voice_tuning_enabled", False)),
+            "eval_interval_critiques": int(
+                cfg.get("voice_eval_interval_critiques", 50)),
+            "min_critiques_between_changes": int(
+                cfg.get("min_critiques_between_voice_changes", 100)),
+            "applied_count": int(state.get("applied_count", 0)),
+            "critiques_since_change": int(
+                state.get("critiques_since_change", 0)),
+            "last_updated_ts": float(state.get("last_updated_ts", 0.0)),
+            "domain_biases": dict(state.get("domain_biases", {})),
+            "domain_style_hints": dict(state.get("domain_style_hints", {})),
+            "topic_suppressions": list(state.get("topic_suppressions", [])),
+            "current_state_hash": state_hash,
+            "state_path": state_path,
+            "journal_path": journal_path,
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-teacher/voice error: %s", e)
+        return _error(str(e))
+
+
+@router.get("/v4/meta-teacher/voice/log")
+async def get_v4_meta_teacher_voice_log(request: Request):
+    """Phase C: signed-diff journal tail. ?limit=N (default 50, max 500).
+
+    Returns newest-first. Each row carries before_hash + after_hash so a
+    Maker auditor can verify the chain integrity locally.
+    """
+    import json as _json
+    import os as _os
+
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
+    try:
+        limit = max(1, min(500, int(request.query_params.get("limit", 50))))
+        data_dir = (titan_state.config.full or {}).get(
+            "memory_and_storage", {}).get("data_dir", "./data")
+        journal_path = _os.path.join(
+            data_dir, "meta_teacher", "voice_journal.jsonl")
+        rows: list[dict] = []
+        if _os.path.exists(journal_path):
+            try:
+                with open(journal_path) as f:
+                    lines = f.readlines()
+                for line in reversed(lines):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(_json.loads(line))
+                    except Exception:
+                        continue
+                    if len(rows) >= limit:
+                        break
+            except Exception:
+                pass
+        return _ok({
+            "rows": rows,
+            "count": len(rows),
+            "journal_path": journal_path,
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-teacher/voice/log error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# rFP_meta_teacher_v2 Phase D.1 + D.2 — Peer Exchange endpoints
+# ---------------------------------------------------------------------------
+# /v4/meta-teacher/peer        — telemetry (recent log + policy snapshot)
+# /v4/meta-teacher/peer/query  — INBOUND from another Titan; validates
+#                                  envelope via PeerExchangeClient and
+#                                  answers from on-disk teaching_journal +
+#                                  voice_state. Always accepts requests
+#                                  even when peer_exchange_enabled=False —
+#                                  the gate only governs OUTBOUND. Inbound
+#                                  is a passive endpoint (we don't refuse
+#                                  to share stats with peers just because
+#                                  we don't initiate ourselves).
+# ---------------------------------------------------------------------------
+
+@router.get("/v4/meta-teacher/peer")
+async def get_v4_meta_teacher_peer(request: Request):
+    """Phase D.1 + D.2: peer-exchange telemetry.
+
+    Returns:
+      - peer_exchange_enabled flag, rate-limit, cooldown, retention
+      - last 50 entries from peer_query_log.jsonl (newest-first)
+      - PeerQueryPolicy snapshot (per-domain EMA + counters)
+    """
+    import json as _json
+    import os as _os
+
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
+    try:
+        cfg = (titan_state.config.full or {}).get("meta_teacher", {})
+        data_dir = (titan_state.config.full or {}).get(
+            "memory_and_storage", {}).get("data_dir", "./data")
+        mt_dir = _os.path.join(data_dir, "meta_teacher")
+        log_path = _os.path.join(mt_dir, "peer_query_log.jsonl")
+        recent: list[dict] = []
+        if _os.path.exists(log_path):
+            try:
+                with open(log_path) as f:
+                    lines = f.readlines()
+                for line in reversed(lines):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        recent.append(_json.loads(line))
+                    except Exception:
+                        continue
+                    if len(recent) >= 50:
+                        break
+            except Exception:
+                pass
+        # Policy snapshot — read sidecar JSON directly.
+        policy_path = _os.path.join(
+            data_dir, "reasoning", "peer_query_policy.json")
+        policy: dict = {
+            "feature_logging_enabled": bool(
+                cfg.get("peer_query_feature_logging", True)),
+            "reward_learning_enabled": bool(
+                cfg.get("peer_query_reward_learning_enabled", False)),
+            "domain_ema": {},
+            "queries_logged": 0,
+            "outcomes_applied": 0,
+            "gate_allow": 0,
+            "gate_block": 0,
+        }
+        if _os.path.exists(policy_path):
+            try:
+                with open(policy_path) as f:
+                    raw = _json.load(f)
+                if isinstance(raw, dict):
+                    policy.update({
+                        k: raw.get(k, policy.get(k)) for k in (
+                            "domain_ema", "queries_logged", "outcomes_applied",
+                            "gate_allow", "gate_block",
+                            "feature_logging_enabled", "reward_learning_enabled",
+                        )
+                    })
+            except Exception:
+                pass
+        return _ok({
+            "peer_exchange_enabled": bool(
+                cfg.get("peer_exchange_enabled", False)),
+            "rate_limit_per_hour": int(
+                cfg.get("peer_query_rate_limit_per_hour", 10)),
+            "topic_cooldown_seconds": float(
+                cfg.get("peer_query_topic_cooldown_seconds", 86400.0)),
+            "min_still_needs_push_count": int(
+                cfg.get("peer_query_min_still_needs_push_count", 3)),
+            "log_retention_days": int(
+                cfg.get("peer_query_log_retention_days", 30)),
+            "log_path": log_path,
+            "recent_queries": recent,
+            "policy": policy,
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-teacher/peer error: %s", e)
+        return _error(str(e))
+
+
+@router.post("/v4/meta-teacher/peer/query")
+async def post_v4_meta_teacher_peer_query(request: Request):
+    """Phase D.1 INBOUND endpoint — another Titan asks us about a topic.
+
+    Stateless on Titan-side; we validate the envelope, build a stats-only
+    response from on-disk teaching_journal.jsonl + voice_state.json, and
+    return it. Inbound is allowed even when peer_exchange_enabled=False
+    (passive sharing — we won't initiate, but we will answer). The
+    `target_titan` field in the envelope must match THIS Titan's id.
+    """
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
+    try:
+        envelope = await request.json()
+        if not isinstance(envelope, dict):
+            return _error("body must be a JSON object", code=400)
+        cfg = (titan_state.config.full or {}).get("meta_teacher", {})
+        data_dir = (titan_state.config.full or {}).get(
+            "memory_and_storage", {}).get("data_dir", "./data")
+        my_titan_id = str(
+            (titan_state.config.full or {}).get("titan_id")
+            or _os_environ_titan_id() or "t1").lower()
+        peers_cfg = cfg.get("peers", {}) or {}
+        from titan_plugin.logic.meta_teacher_peer import PeerExchangeClient
+        client = PeerExchangeClient(
+            cfg, data_dir=data_dir, my_titan_id=my_titan_id,
+            peer_endpoints=peers_cfg)
+        client.load()
+        ok, response, reason = client.handle_inbound_query(envelope, data_dir)
+        if not ok:
+            return _error(f"inbound rejected: {reason}", code=400)
+        return _ok(response)
+    except Exception as e:
+        logger.error(
+            "[Dashboard] /v4/meta-teacher/peer/query error: %s", e)
+        return _error(str(e))
+
+
+def _os_environ_titan_id() -> str:
+    """Helper for resolving titan_id from the environment if config absent."""
+    import os as _os
+    return _os.environ.get("TITAN_ID", "")
+
+
+@router.post("/v4/meta-teacher/voice/revert")
+async def post_v4_meta_teacher_voice_revert(request: Request):
+    """Phase C: replay voice_journal up to a point and rebuild voice_state.
+
+    Body: {"to_timestamp": <unix-seconds float>} OR {"to_iso": "YYYY-MM-DDTHH:MM:SS"}.
+    Returns the new state_hash + applied_count after revert. Maker-callable;
+    the worker picks up the rewritten voice_state.json on next prompt build
+    (no restart needed — load() runs at every notify_critique() if state file
+    mtime changed since the last in-memory state).
+
+    Rebuild semantics: reads voice_journal.jsonl forward, replays only
+    `kind="applied"` rows up to `target_ts`, ignores rejected/reverted rows.
+    Appends a fresh `kind="reverted"` row to the journal with target_ts in
+    the diff body. Subsequent reverts converge correctly.
+    """
+    import datetime as _dt
+    import json as _json
+    import os as _os
+
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            return _error("body must be a JSON object")
+        target_ts: float
+        if "to_timestamp" in body:
+            target_ts = float(body["to_timestamp"])
+        elif "to_iso" in body:
+            target_ts = _dt.datetime.fromisoformat(
+                str(body["to_iso"])).timestamp()
+        else:
+            return _error("body must include to_timestamp or to_iso")
+        cfg = (titan_state.config.full or {}).get("meta_teacher", {})
+        data_dir = (titan_state.config.full or {}).get(
+            "memory_and_storage", {}).get("data_dir", "./data")
+        from titan_plugin.logic.meta_teacher_voice import TeacherVoice
+        voice = TeacherVoice(cfg, data_dir=data_dir)
+        voice.load()
+        ok, reason = voice.revert_to_ts(target_ts)
+        if not ok:
+            return _error(f"revert failed: {reason}", code=400)
+        snap = voice.snapshot()
+        return _ok({
+            "reverted_to_ts": float(target_ts),
+            "applied_count": int(snap.get("applied_count", 0)),
+            "current_state_hash": snap.get("current_state_hash"),
+            "domain_biases": dict(snap.get("domain_biases", {})),
+            "domain_style_hints": dict(snap.get("domain_style_hints", {})),
+            "topic_suppressions": list(snap.get("topic_suppressions", [])),
+        })
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-teacher/voice/revert error: %s", e)
+        return _error(str(e))
+
+
 @router.get("/v4/meta-cgn/failsafe-status")
 async def get_v4_meta_cgn_failsafe_status(request: Request):
     """Failsafe watchdog telemetry — status, failures, cooldown."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _ok({"error": "Spirit proxy not available"})
         coordinator = await _get_cached_coordinator_async(plugin)
@@ -5105,9 +6696,10 @@ async def get_v4_meta_cgn_failsafe_status(request: Request):
 @router.get("/v4/meta-cgn/impasse-status")
 async def get_v4_meta_cgn_impasse_status(request: Request):
     """F8 cognitive impasse detection status."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _ok({"error": "Spirit proxy not available"})
         coordinator = await _get_cached_coordinator_async(plugin)
@@ -5161,6 +6753,168 @@ def _read_json_safe(path):
             return _json.load(f)
     except Exception:
         return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# rFP_titan_meta_outer_layer — activation control + diagnostics
+# ═══════════════════════════════════════════════════════════════════════════
+# Flag file /dev/shm/meta_outer_enabled.flag controls runtime activation.
+# Per rFP §8.2 activation plan — no restart needed for enable/disable flip.
+
+@router.post("/v4/meta-outer/enable")
+async def post_v4_meta_outer_enable(request: Request):
+    """Activate meta-outer-layer outer-context fetching for meta-reasoning.
+
+    Touches /dev/shm/meta_outer_enabled.flag. Meta-reasoning's is_active()
+    check picks this up within 1s (internal cache TTL). Does NOT require
+    restart — intended for focused-test activation windows.
+    """
+    try:
+        from titan_plugin.logic.meta_outer_context import set_active
+        new_state = set_active(True)
+        return _ok({"active": new_state, "flag": "/dev/shm/meta_outer_enabled.flag"})
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-outer/enable error: %s", e)
+        return _error(str(e))
+
+
+@router.post("/v4/meta-outer/disable")
+async def post_v4_meta_outer_disable(request: Request):
+    """Deactivate meta-outer-layer. Removes flag file; chain behavior returns
+    to pre-activation within 1s.
+    """
+    try:
+        from titan_plugin.logic.meta_outer_context import set_active
+        new_state = set_active(False)
+        return _ok({"active": new_state, "flag": "/dev/shm/meta_outer_enabled.flag"})
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-outer/disable error: %s", e)
+        return _error(str(e))
+
+
+@router.get("/v4/meta-outer/status")
+async def get_v4_meta_outer_status(request: Request):
+    """Meta-outer-layer status — flag state + per-store reachability.
+
+    BUG-META-OUTER-STATUS-READER-VISIBILITY (2026-04-27): The live
+    `OuterContextReader` instance lives in the `spirit_worker`
+    subprocess; the FastAPI dashboard runs in `api_subprocess` and
+    cannot reach `spirit_worker._coordinator._meta_engine._outer_reader`
+    via attribute access (different process address space). The
+    pre-fix handler unconditionally reported `reader_wired: false`
+    even when the reader was correctly wired in spirit_worker.
+
+    Fix (Option A simplified, per DEFERRED_ITEMS.md DEFERRED-META-OUTER-3):
+    return honest cross-process state — flag-file state + per-store
+    path reachability + canonical config — and direct callers to
+    spirit_worker's brain-log entries (`[MetaOuter] reader initialized`)
+    + spirit_proxy bus-RPC for live cache-hit-rate stats. Construction
+    of a transient diagnostic OuterContextReader was rejected as too
+    heavy (ThreadPoolExecutor + 7 sub-readers per request).
+    """
+    import os
+    try:
+        from titan_plugin.logic.meta_outer_context import (
+            is_active, OuterContextConfig, _FLAG_PATH)
+        cfg = OuterContextConfig()
+        # Per-store path reachability — fast `os.path.exists` only;
+        # does NOT open or query the dbs.
+        stores_reachable = {
+            "social_graph": os.path.exists(cfg.social_graph_path),
+            "events_teacher": os.path.exists(cfg.events_teacher_path),
+            "inner_memory": os.path.exists(cfg.inner_memory_path),
+        }
+        resp = {
+            "active": is_active(),
+            "reader_location": "spirit_worker_subprocess",
+            "flag_path": _FLAG_PATH,
+            "stores_reachable": stores_reachable,
+            "config": {
+                "fetch_budget_ms": cfg.fetch_budget_ms,
+                "per_read_timeout_ms": cfg.per_read_timeout_ms,
+                "cache_ttl_s": cfg.cache_ttl_s,
+                "cache_max_size": cfg.cache_max_size,
+                "max_workers": cfg.max_workers,
+                "peer_cgn_enabled": cfg.peer_cgn_enabled,
+            },
+            "note": (
+                "Reader lives in spirit_worker subprocess; live reader "
+                "stats (cache hit rate, per-source calls) are not "
+                "visible here. Check spirit_worker brain log for "
+                "[MetaOuter] entries; for in-flight stats consider "
+                "the bus-RPC option (DEFERRED-META-OUTER-3 Option B)."
+            ),
+        }
+        return _ok(resp)
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-outer/status error: %s", e)
+        return _error(str(e))
+
+
+@router.get("/v4/meta-outer/recall-test")
+async def get_v4_meta_outer_recall_test(request: Request,
+                                          person_id: str = "",
+                                          topic: str = ""):
+    """Diagnostic: issue a compose_recall_query via the active reader and
+    return timings + composed shape. Useful for smoke-testing wiring
+    without needing a live meta-reasoning chain.
+
+    Either person_id or topic must be supplied (or both).
+    """
+    import asyncio
+    try:
+        if not person_id and not topic:
+            return _error("person_id or topic required")
+        titan_state = _get_plugin(request)
+        plugin = titan_state  # backward-compat alias for Category C callsites
+        reader = None
+        try:
+            meta_engine = getattr(
+                getattr(plugin, "_coordinator", None), "_meta_engine", None)
+            if meta_engine is not None:
+                reader = getattr(meta_engine, "_outer_reader", None)
+        except Exception:
+            reader = None
+        if reader is None:
+            return _error("outer reader not wired")
+        refs: dict = {}
+        if person_id:
+            refs["primary_person"] = person_id
+        if topic:
+            refs["current_topic"] = topic
+
+        def _blocking_compose():
+            fut = reader.compose_recall_query(refs)
+            try:
+                return fut.result(timeout=0.4)
+            except Exception as _fe:
+                return {"error": str(_fe)}
+        composed = await asyncio.to_thread(_blocking_compose)
+        return _ok({"entity_refs": refs, "composed": composed})
+    except Exception as e:
+        logger.error("[Dashboard] /v4/meta-outer/recall-test error: %s", e)
+        return _error(str(e))
+
+
+@router.get("/v4/meta-outer/stats")
+async def get_v4_meta_outer_stats(request: Request):
+    """Reader stats: fetch counts, timeouts, cache hit rate, per-source calls.
+
+    BUG-META-OUTER-STATUS-READER-VISIBILITY (2026-04-27): live reader
+    instance lives in spirit_worker subprocess; main-process FastAPI
+    cannot read its in-memory `_stats` via attribute access. Returns a
+    structured 503 pointing the caller at the data source. To get
+    in-flight stats, either tail spirit_worker brain log for
+    `[MetaOuter]` lines, or implement DEFERRED-META-OUTER-3 Option B
+    (META_OUTER_STATS_QUERY bus-RPC).
+    """
+    return _error(
+        "live reader stats not exposed via main-process API — reader "
+        "lives in spirit_worker subprocess. Check spirit_worker brain "
+        "log for [MetaOuter] entries (initialized + cache + per-source "
+        "calls). See /v4/meta-outer/status for flag/reachability/config.",
+        code=503,
+    )
 
 
 @router.get("/v4/emot-cgn")
@@ -5457,9 +7211,16 @@ async def get_v4_emot_cgn_audit(request: Request):
                     recluster_tail.append(_json.loads(l))
                 except Exception:
                     continue
-        # Summary of persisted regions (shape, core_distance, n_obs).
+        # Summary of persisted regions (shape, core_distance, n_obs,
+        # graduation-persistence bookkeeping for Phase B / rFP §23.5).
         regions_summary = []
+        current_recluster = int(regions_state.get("recluster_count", 0))
         for rid_str, r in (regions_state.get("regions") or {}).items():
+            first_seen = int(r.get("first_seen_recluster", 0))
+            last_seen = int(r.get("last_seen_recluster", 0))
+            persistent_count = max(0, last_seen - first_seen + 1) \
+                if last_seen > 0 else 0
+            alive_now = (last_seen == current_recluster) and (last_seen > 0)
             regions_summary.append({
                 "region_id": int(rid_str),
                 "signature": r.get("signature"),
@@ -5467,7 +7228,63 @@ async def get_v4_emot_cgn_audit(request: Request):
                 "n_observations": r.get("n_observations"),
                 "label": r.get("label") or "",
                 "centroid_dim": len(r.get("centroid") or []),
+                # Phase B graduation fields:
+                "first_seen_recluster": first_seen,
+                "last_seen_recluster": last_seen,
+                "consecutive_reclusters": persistent_count,
+                "alive_on_current_recluster": alive_now,
             })
+
+        # Phase B graduation snapshot derived from persisted state — same
+        # calculation RegionClusterer.graduation_status() would do on a live
+        # boot, but computed from regions_state.json so the dashboard
+        # reflects authoritative disk state even between reclusters.
+        import time as _t
+        _PERSISTENCE_THRESHOLD = 4
+        _MIN_PERSISTENT_REGIONS = 3
+        _MIN_AGE_S = 14 * 86400
+        _first_boot_ts = float(regions_state.get("first_boot_ts",
+                                                  _t.time()))
+        _age_s = _t.time() - _first_boot_ts
+        _persistent_regions = [
+            rs for rs in regions_summary
+            if rs["alive_on_current_recluster"]
+            and rs["consecutive_reclusters"] >= _PERSISTENCE_THRESHOLD
+        ]
+        _named_persistent = [r for r in _persistent_regions if r["label"]]
+        if not _persistent_regions:
+            _grad_status = 0  # GRAD_SHADOW
+        elif (len(_persistent_regions) >= _MIN_PERSISTENT_REGIONS
+                and _age_s >= _MIN_AGE_S and _named_persistent):
+            _grad_status = 2  # GRAD_GRADUATED
+        else:
+            _grad_status = 1  # GRAD_OBSERVING
+        _blockers = []
+        if len(_persistent_regions) < _MIN_PERSISTENT_REGIONS:
+            _blockers.append(
+                f"need {_MIN_PERSISTENT_REGIONS} persistent regions "
+                f"(have {len(_persistent_regions)})")
+        if _age_s < _MIN_AGE_S:
+            _blockers.append(
+                f"observation window: "
+                f"{(_MIN_AGE_S - _age_s) / 86400:.1f} days remaining")
+        if not _named_persistent:
+            _blockers.append("need ≥1 Titan-named region (§23.4 LLM naming)")
+        graduation = {
+            "status": _grad_status,
+            "recluster_count": current_recluster,
+            "age_seconds": round(_age_s, 1),
+            "age_days": round(_age_s / 86400, 2),
+            "persistent_regions": len(_persistent_regions),
+            "total_regions": len(regions_summary),
+            "named_regions": len(_named_persistent),
+            "gates": {
+                "persistent_min": _MIN_PERSISTENT_REGIONS,
+                "persistence_threshold_reclusters": _PERSISTENCE_THRESHOLD,
+                "age_gate_s": _MIN_AGE_S,
+            },
+            "blocking": _blockers,
+        }
         return _ok({
             "grounding": grounding,
             "haov": haov,
@@ -5478,6 +7295,8 @@ async def get_v4_emot_cgn_audit(request: Request):
             "bundle_snapshot": _emot_cgn_bundle_snapshot(),
             "regions_summary": regions_summary,
             "recluster_tail": recluster_tail,
+            # Phase B (rFP §23.5) graduation state:
+            "graduation": graduation,
         })
     except Exception as e:
         logger.error("[Dashboard] /v4/emot-cgn/audit error: %s", e)
@@ -5493,7 +7312,8 @@ async def post_v4_emot_cgn_force_graduate(request: Request):
     influencing downstream consumers with poorly-differentiated clusters.
     """
     try:
-        plugin = _get_plugin(request)
+        titan_state = _get_plugin(request)
+        plugin = titan_state  # backward-compat alias for Category C callsites
         coordinator = await _get_cached_coordinator_async(plugin)
         # For v1 this endpoint records operator intent — next chain
         # conclude, meta_reasoning._emot_cgn can inspect a pending-
@@ -5540,8 +7360,9 @@ async def get_v4_meta_cgn_audit(request: Request):
     try:
         import os as _os
         import json as _json
-        plugin = _get_plugin(request)
-        spirit_proxy = plugin._proxies.get("spirit")
+        titan_state = _get_plugin(request)
+        plugin = titan_state  # backward-compat alias for Category C callsites
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _ok({"error": "Spirit proxy not available"})
         coordinator = await _get_cached_coordinator_async(plugin)
@@ -5666,6 +7487,63 @@ async def get_v4_meta_cgn_by_domain(request: Request):
 # HTTPS + peer gossip + on-chain registry. Every response body is signed
 # with the Titan's Solana Ed25519 keypair; importers verify against a
 # genesis peer list in titan_params.toml.
+
+@router.get("/v4/kin/emot")
+async def get_v4_kin_emot(request: Request):
+    """P11 extension (rFP_emot_cgn_v2 §23.3): expose this Titan's most recent
+    KIN_EMOT_STATE payload for peer pull. Returns the payload built from the
+    current shm bundle (read_full_emotion_context + build_kin_emot_state_payload).
+
+    Unlike the consciousness-exchange endpoints (/v4/kin-exchange), this is a
+    simple GET — the peer pulls our latest emotional snapshot at their own
+    cadence (matched to consciousness-exchange daily cap = 48/kin/day).
+
+    Failure modes (all return {available: false, reason: ...} with HTTP 200
+    so the peer can cleanly skip):
+      - Bundle not yet written (pre-first-chain)
+      - Schema mismatch (peer on v1 reader, us on v2 writer)
+      - Titan identity unreadable
+    """
+    import os as _os
+    import json as _json
+    try:
+        titan_id = "T1"
+        _tid_path = _os.path.join(
+            _os.path.dirname(_os.path.dirname(_os.path.dirname(__file__))),
+            "data", "titan_identity.json")
+        if _os.path.exists(_tid_path):
+            with open(_tid_path) as _f:
+                titan_id = _json.load(_f).get("titan_id", "T1")
+        from titan_plugin.logic.emot_bundle_protocol import (
+            read_full_emotion_context)
+        ctx = read_full_emotion_context(titan_id=titan_id)
+        if ctx is None:
+            return _ok({"available": False, "reason": "bundle_unreadable",
+                        "titan_id": titan_id})
+        from titan_plugin.logic.emot_kin_protocol import (
+            build_kin_emot_state_payload)
+        payload = build_kin_emot_state_payload(
+            titan_src=titan_id,
+            region_id=int(ctx.get("region_id", -2)),
+            region_signature=int(ctx.get("region_signature", 0)),
+            region_confidence=float(ctx.get("region_confidence", 0.0)),
+            region_residence_s=float(ctx.get("region_residence_s", 0.0)),
+            regions_emerged=int(ctx.get("regions_emerged", 0)),
+            valence=float(ctx.get("valence", 0.0)),
+            arousal=float(ctx.get("arousal", 0.0)),
+            novelty=float(ctx.get("novelty", 0.5)),
+            legacy_idx=int(ctx.get("legacy_idx", 0)),
+            encoder_id=int(ctx.get("encoder_id", 0)),
+        )
+        return _ok({
+            "available": True,
+            "kin_emot_state": payload,
+            "legacy_label": ctx.get("legacy_label", ""),
+        })
+    except Exception as e:
+        logger.warning("[Dashboard] /v4/kin/emot error: %s", e)
+        return _ok({"available": False, "reason": f"error: {e}"})
+
 
 @router.get("/v1/kin/identity")
 async def get_v1_kin_identity(request: Request):
@@ -5880,9 +7758,10 @@ async def get_v4_meta_cgn_advisor_conflicts(request: Request,
 async def get_v4_meta_reasoning_audit(request: Request):
     """Observability snapshot: diversity, monoculture pressure, contract
     fires, per-primitive reward components, INTROSPECT health, META-CGN stub."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _ok({"error": "Spirit proxy not available"})
         coordinator = await _get_cached_coordinator_async(plugin)
@@ -6034,7 +7913,8 @@ async def post_v4_arc_goal_ingest(request: Request):
 async def get_kin_signature(request: Request):
     """Titan's soul-level identity for kin discovery."""
     try:
-        plugin = _get_plugin(request)
+        titan_state = _get_plugin(request)
+        plugin = titan_state  # backward-compat alias for Category C callsites
         coordinator = await _get_cached_coordinator_async(plugin)
         if not coordinator:
             return _error("No coordinator", 503)
@@ -6097,7 +7977,8 @@ async def kin_exchange(request: Request):
     """
     try:
         payload = await request.json()
-        plugin = _get_plugin(request)
+        titan_state = _get_plugin(request)
+        plugin = titan_state  # backward-compat alias for Category C callsites
         coordinator = await _get_cached_coordinator_async(plugin)
         if not coordinator:
             return _error("No coordinator", 503)
@@ -6510,7 +8391,8 @@ async def get_v4_persona_profiles(request: Request):
 @router.get("/v4/social-pressure")
 async def get_v4_social_pressure(request: Request):
     """Social pressure meter state for persona system."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         coordinator = await _get_cached_coordinator_async(plugin)
         sp = coordinator.get("social_pressure", {})
@@ -6526,7 +8408,8 @@ async def get_v4_social_pressure(request: Request):
 @router.post("/v4/social-relief")
 async def post_v4_social_relief(request: Request):
     """Relieve social pressure from persona conversation."""
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         body = await request.json()
         relief = float(body.get("relief", 0.0))
@@ -6534,7 +8417,7 @@ async def post_v4_social_relief(request: Request):
             return _error("relief must be positive")
 
         # Route via spirit proxy QUERY → _handle_query → social_relief action
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _error("spirit proxy not available")
         result = spirit_proxy._bus.request(
@@ -6560,7 +8443,8 @@ async def post_v4_signal_concept(request: Request):
     Body: {"concept": "YES"|"NO"|"YOU"|"WE"|"THEY", "quality": 0.0-1.0,
            "extra": {...optional context...}}
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         body = await request.json()
         concept = body.get("concept", "").upper()
@@ -6574,7 +8458,7 @@ async def post_v4_signal_concept(request: Request):
             return _error("quality must be 0.0-1.0", code=400)
 
         # Route via spirit proxy QUERY → _handle_query → signal_concept action
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _error("spirit proxy not available")
         result = spirit_proxy._bus.request(
@@ -6604,14 +8488,15 @@ async def post_v4_signal_co_occurrence(request: Request):
     Body: {"concepts": ["I", "YOU", "YES", ...]}
     Reinforces interaction matrix for all concept pairs.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         body = await request.json()
         concepts = body.get("concepts", [])
         if not concepts or len(concepts) < 2:
             return _error("need at least 2 concepts")
 
-        spirit_proxy = plugin._proxies.get("spirit")
+        spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _error("spirit proxy not available")
         result = spirit_proxy._bus.request(
@@ -6642,7 +8527,8 @@ async def post_v4_social_perception(request: Request):
     social grounding), and body_worker (outer_mind enrichment).
     """
     try:
-        plugin = _get_plugin(request)
+        titan_state = _get_plugin(request)
+        plugin = titan_state  # backward-compat alias for Category C callsites
         body = await request.json()
         events = body.get("events", [])
         titan_id = body.get("titan_id", "T1")
@@ -6659,7 +8545,7 @@ async def post_v4_social_perception(request: Request):
             # (persona_social, arc_play send transitions through this endpoint)
             cgn_t = evt.get("cgn_transition")
             if cgn_t:
-                plugin.bus.publish(make_msg(
+                titan_state.bus.publish(make_msg(
                     "CGN_TRANSITION", "api", "cgn", {
                         "type": "outcome",
                         "consumer": cgn_t.get("consumer", "social"),
@@ -6736,8 +8622,8 @@ async def post_v4_social_perception(request: Request):
                         # chain_id omitted — handler resolves via
                         # meta_engine.get_last_chain_id(); quality is in [0,1].
                         try:
-                            plugin.bus.publish(make_msg(
-                                "META_PERSONA_REWARD", "persona", "spirit", {
+                            titan_state.bus.publish(make_msg(
+                                bus.META_PERSONA_REWARD, "persona", "spirit", {
                                     "quality": float(_p11p12_quality),
                                     "session_id": _p11p12_sid,
                                 }))
@@ -6756,8 +8642,8 @@ async def post_v4_social_perception(request: Request):
             if not evt.get("contagion_type") or not evt.get("felt_summary"):
                 continue
 
-            plugin.bus.publish(make_msg(
-                "SOCIAL_PERCEPTION", "events_teacher", "all", {
+            titan_state.bus.publish(make_msg(
+                bus.SOCIAL_PERCEPTION, "events_teacher", "all", {
                     "titan_id": titan_id,
                     "topic": evt.get("topic", ""),
                     "sentiment": float(evt.get("sentiment", 0.0)),
@@ -6816,7 +8702,8 @@ async def post_v4_social_delegate(request: Request):
     import time as _time
 
     QUEUE_FILE = "./data/social_delegate_queue.json"
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         body = await request.json()
         titan_id = body.get("titan_id", "")
@@ -6967,7 +8854,8 @@ async def post_v4_knowledge_request(request: Request):
     Body: {"topic": "quantum entanglement", "urgency": 0.7}
     Routes CGN_KNOWLEDGE_REQ to the Knowledge Worker via bus.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         body = await request.json()
         topic = body.get("topic", "").strip()
@@ -6977,7 +8865,7 @@ async def post_v4_knowledge_request(request: Request):
 
         # Send via bus to knowledge worker
         from ..bus import make_msg
-        plugin.bus.publish(make_msg("CGN_KNOWLEDGE_REQ", "api", "knowledge", {
+        titan_state.bus.publish(make_msg(bus.CGN_KNOWLEDGE_REQ, "api", "knowledge", {
             "topic": topic,
             "requestor": "api",
             "urgency": urgency,
@@ -7209,16 +9097,90 @@ def _get_cached_tc():
     return _tc_cache["instance"]
 
 
+# ─── tc.get_chain_status() warmer (Layer 2 H1 — 2026-04-26) ───────────
+# get_chain_status() does Merkle root compute + file I/O across all fork
+# tips (~4s sync). Background thread refreshes the result every 8s so
+# /v4/timechain/status + /v4/timechain/pot-stats can return instantly
+# from cache instead of triggering the 504 timeout. Microkernel v2
+# pattern: heavy work runs out-of-band, endpoints are fast cache reads.
+_tc_status_cache: dict = {"data": None, "updated_at": 0.0}
+_TC_STATUS_WARMER_INTERVAL_S = 8.0
+_tc_status_warmer_started = {"flag": False}
+
+
+def _start_tc_status_warmer() -> None:
+    """Start the background tc.get_chain_status warmer. Idempotent."""
+    if _tc_status_warmer_started["flag"]:
+        return
+    _tc_status_warmer_started["flag"] = True
+
+    import threading
+    import time as _time
+
+    def _warmer_loop():
+        # First refresh immediately so the cache populates ASAP.
+        while True:
+            try:
+                tc = _get_cached_tc()
+                data = tc.get_chain_status()
+                _tc_status_cache["data"] = data
+                _tc_status_cache["updated_at"] = _time.time()
+            except Exception as e:
+                logger.warning(
+                    "[TCStatusWarmer] refresh failed: %s", e)
+            _time.sleep(_TC_STATUS_WARMER_INTERVAL_S)
+
+    t = threading.Thread(
+        target=_warmer_loop, daemon=True, name="tc-status-warmer")
+    t.start()
+    logger.info(
+        "[TCStatusWarmer] started — refresh every %.1fs",
+        _TC_STATUS_WARMER_INTERVAL_S)
+
+
+def _get_tc_status_cached() -> dict | None:
+    """Return cached chain_status; lazily start the warmer on first call.
+    Returns None only on cold-boot before the first warmer refresh
+    completes. Endpoints fall back to a sync fetch in that window so the
+    very first request still gets data (with the 3s middleware budget).
+    """
+    _start_tc_status_warmer()
+    return _tc_status_cache["data"]
+
+
 # GET /v4/timechain/status — Chain status, fork stats, PoT acceptance rate
 @router.get("/v4/timechain/status")
 async def get_v4_timechain_status(request: Request):
-    """Get TimeChain status: genesis, forks, blocks, Merkle root, PoT stats."""
+    """Get TimeChain status: genesis, forks, blocks, Merkle root, PoT stats.
+
+    Read order: warm in-process cache (refreshed every 8s by the
+    tc-status-warmer thread) → sync fetch fallback for cold-boot window
+    before the first warmer tick. Microkernel v2 pattern: heavy work
+    out-of-band, endpoints are O(1) reads.
+
+    2026-04-27 hardening: bound the cold-boot sync fallback with
+    `asyncio.wait_for(2.5s)` so it returns a fast 503-warming JSON instead
+    of letting tc.get_chain_status() run beyond nginx's 3s budget into a
+    504 timeout. T1 was hitting this every api_subprocess restart (api
+    worker is being killed-and-restarted by Guardian on RSS pressure;
+    each restart wipes the in-memory cache).
+    """
+    cached = _get_tc_status_cached()
+    if cached is not None:
+        return _ok(cached)
+    # Cold path — only the very first request after process boot hits
+    # this branch. Subsequent calls always hit the warm cache.
     import asyncio
     try:
         tc = _get_cached_tc()
-        # Phase E.2 perf: merkle compute + file I/O — wrap to_thread.
-        status = await asyncio.to_thread(tc.get_chain_status)
+        status = await asyncio.wait_for(
+            asyncio.to_thread(tc.get_chain_status), timeout=2.5)
         return _ok(status)
+    except asyncio.TimeoutError:
+        # Cache not yet warm AND sync fetch exceeded budget — return a
+        # structured "warming" response within nginx's window so the
+        # client sees a fast 200 with a sentinel rather than a 504.
+        return _ok({"warming": True, "cache_age_s": None})
     except Exception as e:
         logger.error("[Dashboard] /v4/timechain/status error: %s", e)
         return _error(str(e))
@@ -7258,22 +9220,40 @@ async def get_v4_timechain_verify(request: Request):
 # GET /v4/timechain/pot-stats — Proof of Thought validation statistics
 @router.get("/v4/timechain/pot-stats")
 async def get_v4_timechain_pot_stats(request: Request):
-    """Get PoT acceptance rate, chi spent, rejection reasons from running worker."""
+    """Get PoT acceptance rate, chi spent, rejection reasons from running worker.
+
+    Reads tc.get_chain_status() from the warm cache (refreshed every 8s by
+    tc-status-warmer); falls back to sync fetch only on cold-boot window.
+    """
     try:
-        plugin = _get_plugin(request)
+        titan_state = _get_plugin(request)
+        plugin = titan_state  # backward-compat alias for Category C callsites
         from titan_plugin.bus import make_msg
         import asyncio
-        # Query the running timechain worker for live PoT stats
+        # Query the running timechain worker for live PoT stats.
+        # Use _BusShim.publish (accepts make_msg-shaped dict) instead of
+        # CommandSender.publish (positional msg_type/dst/payload). Codemod
+        # left this site with the wrong signature.
         rid = f"pot_stats_{time.time()}"
-        plugin.bus.publish(make_msg(
-            "QUERY", "dashboard", "timechain",
+        titan_state.bus.publish(make_msg(
+            bus.QUERY, "dashboard", "timechain",
             {"action": "timechain_status", "rid": rid}
         ))
-        # Read from chain files directly as fallback.
-        # Phase E.2 perf: tc.get_chain_status() does merkle root compute
-        # across all fork tips + file I/O — sync, blocks event loop ~4s.
-        tc = _get_cached_tc()
-        status = await asyncio.to_thread(tc.get_chain_status)
+        # Layer 2 H1: warm cache first, sync fallback only on cold boot.
+        # 2026-04-27 hardening: bound cold-boot sync fetch (mirror of
+        # /v4/timechain/status fix). Same nginx 3s budget concern.
+        status = _get_tc_status_cached()
+        if status is None:
+            tc = _get_cached_tc()
+            try:
+                status = await asyncio.wait_for(
+                    asyncio.to_thread(tc.get_chain_status), timeout=2.5)
+            except asyncio.TimeoutError:
+                return _ok({"warming": True, "total_blocks": 0,
+                            "total_chi_spent": 0,
+                            "avg_chi_per_block": 0,
+                            "blocks_by_source": {},
+                            "forks_active": 0, "forks_total": 0})
         # Compute derived PoT stats from block data
         total = status.get("total_blocks", 0)
         chi = status.get("total_chi_spent", 0)
@@ -7542,7 +9522,7 @@ async def post_v4_contracts_approve(request: Request):
         if not plugin or not hasattr(plugin, "bus"):
             return _error("plugin not available")
 
-        reply = plugin.bus.request(
+        reply = titan_state.commands.publish(
             "api", "timechain",
             {"action": "approve", "contract_id": contract_id},
             msg_type="CONTRACT_APPROVE",
@@ -7571,7 +9551,7 @@ async def post_v4_contracts_veto(request: Request):
         if not plugin or not hasattr(plugin, "bus"):
             return _error("plugin not available")
 
-        reply = plugin.bus.request(
+        reply = titan_state.commands.publish(
             "api", "timechain",
             {"action": "veto", "contract_id": contract_id, "reason": reason},
             msg_type="CONTRACT_VETO",
@@ -7679,10 +9659,11 @@ async def post_v4_timechain_test_commit(request: Request):
         content = body.get("content", {"test": True})
         tags = body.get("tags", ["test"])
 
-        plugin = _get_plugin(request)
+        titan_state = _get_plugin(request)
+        plugin = titan_state  # backward-compat alias for Category C callsites
         from titan_plugin.bus import make_msg
-        plugin.bus.publish(make_msg(
-            "TIMECHAIN_COMMIT", "dashboard", "timechain", {
+        titan_state.bus.publish(make_msg(
+            bus.TIMECHAIN_COMMIT, "dashboard", "timechain", {
                 "fork": fork,
                 "thought_type": fork if fork in ("declarative", "procedural", "episodic", "meta") else "declarative",
                 "source": "test_api",
@@ -7755,7 +9736,7 @@ async def post_v4_timechain_backup_now(request: Request):
             _full_cfg = load_titan_config()
         except Exception:
             _full_cfg = {}
-        tx_id = await backup.snapshot_to_arweave(full_config=_full_cfg)
+        tx_id = backup.snapshot_to_arweave(full_config=_full_cfg)
         if tx_id:
             return _ok({"tx_id": tx_id, "status": "uploaded"})
         return _error("upload failed")
@@ -7983,9 +9964,12 @@ async def get_v4_admin_memory_profile(request: Request,
     """Live memory and CPU profiling for the Titan process tree."""
     import asyncio
     try:
-        plugin = _get_plugin(request)
+        titan_state = _get_plugin(request)
+        plugin = titan_state  # backward-compat alias for Category C callsites
 
-        # plugin IS TitanCore in production (v5_core passes self to create_app)
+        # plugin IS TitanCore OR TitanPlugin in production (both pass self to
+        # create_app). TitanPlugin is duck-type-identical to TitanCore via its
+        # compat @property facade — see titan_plugin/core/plugin.py + PLAN D9.
         collector = getattr(plugin, '_profiling_collector', None)
         guardian = getattr(plugin, 'guardian', None)
 
@@ -8024,4 +10008,162 @@ async def get_v4_admin_memory_profile(request: Request,
         return _ok(report)
     except Exception as e:
         logger.error("[Dashboard] /v4/admin/memory-profile error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# GET /v4/admin/heap-dump — gc.get_objects() aggregator for parent + api
+# ---------------------------------------------------------------------------
+# Counts and sizes Python objects in BOTH the parent (kernel) process via
+# kernel_rpc AND the api_subprocess locally. Returns aggregate stats only —
+# top types by total bytes + largest list/dict/set/tuple containers by len()
+# (the latter directly surfaces unbounded-accumulator leaks).
+#
+# Diagnostic-only — cost ~1-5 s wall-clock per process; runs in to_thread.
+# Not for high-frequency polling.
+#
+# Query params:
+#   top_types       (int, default 30) — number of top types by size
+#   top_containers  (int, default 20) — number of largest containers by len
+# ---------------------------------------------------------------------------
+@router.get("/v4/admin/heap-dump")
+async def get_v4_admin_heap_dump(request: Request,
+                                  top_types: int = 30,
+                                  top_containers: int = 20,
+                                  tracemalloc_top_n: int = 30,
+                                  tracemalloc_diff: bool = True):
+    """Live heap-dump diagnostic — parent + api_subprocess heaps + tracemalloc."""
+    import asyncio
+    try:
+        # `titan_state` (StateAccessor) is for cache-backed reads; its
+        # __getattr__ fallback returns a _CacheGetter for unknown names,
+        # which silently swallows method calls. For cross-process kernel
+        # method calls we need the RPC proxy on app.state.titan_plugin —
+        # either the in-process plugin (legacy monolith) or the
+        # kernel_rpc._RPCRemoteRef proxy (microkernel mode). Either way,
+        # `plugin.kernel.dump_heap()` resolves correctly via RPC dispatch.
+        plugin = getattr(request.app.state, "titan_plugin", None)
+        from titan_plugin.core.profiler import take_heap_snapshot
+
+        # Parent (kernel) — via kernel_rpc when split is on; same process
+        # in legacy monolith mode.
+        parent_dump: dict
+        kernel = getattr(plugin, "kernel", None) if plugin is not None else None
+        if kernel is not None:
+            try:
+                parent_dump = await asyncio.to_thread(
+                    kernel.dump_heap, top_types, top_containers)
+                if not isinstance(parent_dump, dict) or not parent_dump:
+                    parent_dump = {
+                        "error": "kernel.dump_heap returned empty/non-dict",
+                        "raw_type": type(parent_dump).__name__,
+                    }
+            except Exception as e:
+                parent_dump = {"error": f"kernel.dump_heap RPC failed: {e}"}
+            # Also fetch parent's tracemalloc data (if enabled at boot).
+            # gc.get_objects() misses C-level allocations (numpy/torch/libc);
+            # tracemalloc captures them. If tracemalloc is off this is a no-op.
+            try:
+                tm_dump = await asyncio.to_thread(
+                    kernel.dump_tracemalloc,
+                    tracemalloc_top_n, "filename", tracemalloc_diff)
+                if isinstance(tm_dump, dict) and tm_dump:
+                    parent_dump["tracemalloc"] = tm_dump
+            except Exception as e:
+                parent_dump["tracemalloc_error"] = (
+                    f"kernel.dump_tracemalloc RPC failed: {e}")
+        elif plugin is not None and hasattr(plugin, "guardian"):
+            # Legacy monolith — endpoint runs in same process as plugin,
+            # so a local heap snapshot dumps the plugin's heap.
+            parent_dump = await asyncio.to_thread(
+                take_heap_snapshot, top_types, top_containers)
+            parent_dump["pid"] = os.getpid()
+            parent_dump["process"] = "legacy_monolith"
+        else:
+            parent_dump = {"error": "no plugin/kernel reachable on app.state"}
+
+        # api_subprocess (this process) — always local
+        api_dump = await asyncio.to_thread(
+            take_heap_snapshot, top_types, top_containers)
+        api_dump["pid"] = os.getpid()
+        api_dump["process"] = "api_subprocess"
+
+        return _ok({"parent": parent_dump, "api_subprocess": api_dump})
+    except Exception as e:
+        logger.error("[Dashboard] /v4/admin/heap-dump error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# GET /v4/admin/parent-threads — Microkernel A.8 §6 thread-residency audit
+# ---------------------------------------------------------------------------
+# Returns the parent (kernel) process's `threading.enumerate()` inventory plus
+# the api_subprocess's local inventory, so `arch_map thread-pool --parent`
+# can show which subsystems own threads in the kernel residency layer.
+#
+# Used by tests/test_a8_thread_count.py as the regression baseline (rFP A.8
+# §3 "parent thread count" target). Cheap (<1ms per process); safe for live
+# polling.
+# ---------------------------------------------------------------------------
+@router.get("/v4/admin/parent-threads")
+async def get_v4_admin_parent_threads(request: Request):
+    """Live thread inventory — parent (kernel) + api_subprocess."""
+    import asyncio
+    import threading as _threading
+    try:
+        plugin = getattr(request.app.state, "titan_plugin", None)
+        kernel = getattr(plugin, "kernel", None) if plugin is not None else None
+
+        # Parent (kernel) — via kernel_rpc when split is on; same process
+        # in legacy monolith mode.
+        parent_dump: dict
+        if kernel is not None:
+            try:
+                parent_dump = await asyncio.to_thread(
+                    kernel.dump_thread_inventory)
+                if not isinstance(parent_dump, dict) or not parent_dump:
+                    parent_dump = {
+                        "error": "kernel.dump_thread_inventory returned empty",
+                        "raw_type": type(parent_dump).__name__,
+                    }
+            except Exception as e:
+                parent_dump = {
+                    "error": f"kernel.dump_thread_inventory RPC failed: {e}",
+                }
+        else:
+            parent_dump = {"error": "no kernel reachable on app.state"}
+
+        # api_subprocess (this process) — always local
+        api_threads = list(_threading.enumerate())
+        api_rows = []
+        api_by_prefix: dict = {}
+        for t in api_threads:
+            name = t.name or "<unnamed>"
+            api_rows.append({
+                "name": name,
+                "ident": t.ident,
+                "daemon": bool(t.daemon),
+                "alive": t.is_alive(),
+            })
+            prefix = name
+            for sep in ("-", ":", "_"):
+                if sep in prefix:
+                    head, _, tail = prefix.rpartition(sep)
+                    if len(tail) >= 6 and all(
+                            c in "0123456789abcdef" for c in tail.lower()):
+                        prefix = head
+                    break
+            api_by_prefix[prefix] = api_by_prefix.get(prefix, 0) + 1
+        api_dump = {
+            "pid": os.getpid(),
+            "process": "api_subprocess",
+            "total": len(api_rows),
+            "threads": api_rows,
+            "by_prefix": dict(sorted(
+                api_by_prefix.items(), key=lambda kv: -kv[1])),
+        }
+
+        return _ok({"parent": parent_dump, "api_subprocess": api_dump})
+    except Exception as e:
+        logger.error("[Dashboard] /v4/admin/parent-threads error: %s", e)
         return _error(str(e))

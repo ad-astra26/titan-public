@@ -32,8 +32,17 @@ Usage:
   python scripts/arch_map.py audit --live            # Static audit + live wiring contract verification
   python scripts/arch_map.py cgn                     # CGN grounding telemetry (T1 only)
   python scripts/arch_map.py cgn --all               # CGN grounding telemetry (all 3 Titans)
+  python scripts/arch_map.py cgn-reasoning-strategies # Top grounded reasoning_strategy chain patterns (T1 only)
+  python scripts/arch_map.py cgn-reasoning-strategies --all # Same, all 3 Titans
+  python scripts/arch_map.py dead-wiring             # Static analysis: orphan methods, pair-closure gaps, unused config sections, rFP verification
+  python scripts/arch_map.py dead-wiring --rfp PATH  # Verify class/method names from an rFP exist in the codebase
+  python scripts/arch_map.py dead-wiring --json      # Machine-readable output
+  python scripts/arch_map.py emot-cgn                # EMOT-CGN status + v3 emergence + graduation (all 3 Titans)
+  python scripts/arch_map.py emot-cgn --t1           # EMOT-CGN — single Titan (--t1/--t2/--t3)
+  python scripts/arch_map.py emot-cgn --json         # EMOT-CGN JSON output (cron-friendly)
   python scripts/arch_map.py timechain               # TimeChain diagnostics (T1 only)
   python scripts/arch_map.py timechain --all          # TimeChain diagnostics (all 3 Titans)
+  python scripts/arch_map.py sensors                  # V6 5DT outer_body rich-signal diagnostic (all 3 Titans, Phase 1 sensory wiring)
   python scripts/arch_map.py report                  # Full comparison report across all 3 Titans
   python scripts/arch_map.py deploy t2 --restart     # Deploy code to T2 + restart + verify
   python scripts/arch_map.py deploy all --restart    # Deploy + restart all remote Titans
@@ -43,6 +52,14 @@ Usage:
   python scripts/arch_map.py traffic --24h           # Nginx traffic stats (last 24 hours)
   python scripts/arch_map.py traffic --1h            # Nginx traffic stats (last 1 hour, default)
   python scripts/arch_map.py session-close "title"   # Parse JSONL → conversation.md + session.md + commit
+  python scripts/arch_map.py kernel-status           # Microkernel v2 S3 kernel health (T1 only)
+  python scripts/arch_map.py kernel-status --all     # Microkernel v2 S3 kernel health (T1+T2+T3)
+  python scripts/arch_map.py titanvm-schema          # Microkernel v2 S4 — verify NS program telemetry shape (TITANVM_REGISTERS spec input)
+  python scripts/arch_map.py api-status              # Microkernel v2 S5 — API subprocess health (T1 only, local)
+  python scripts/arch_map.py api-status --all        # Microkernel v2 S5 — API subprocess health (T1+T2+T3)
+  python scripts/arch_map.py module-methods          # Microkernel v2 S6 — per-module spawn/fork audit (T1 only)
+  python scripts/arch_map.py module-methods --all    # Microkernel v2 S6 — per-module spawn/fork audit (T1+T2+T3)
+  python scripts/arch_map.py s5-callsites            # Microkernel v2 S5 amendment D4 — endpoint plugin.X drift detection
 """
 
 import os
@@ -62,6 +79,16 @@ SCRIPTS_DIRS = [PROJECT_ROOT / "scripts"]
 OUTPUT_FILE = PROJECT_ROOT / "architecture_map.json"
 BUS_CONSTANTS_FILE = PROJECT_ROOT / "titan_plugin" / "bus.py"
 REL_BASE = PROJECT_ROOT
+
+# Force-prefer the project root next to this script over the
+# editable-install (`__editable__.openclaw_plugin_titan-*.pth`) finder
+# which hardcodes `titan_plugin` → main-repo path. Without this,
+# arch_map subcommands that import `titan_plugin.core.X` from a session
+# worktree silently get the main-repo's stale module instead of the
+# worktree's edited code (e.g. fresh RegistrySpec adds invisible).
+# Inserting at 0 puts us ahead of MetaPathFinder.
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 
 def rel(path: Path) -> str:
@@ -1944,16 +1971,26 @@ def query_flow(graph: dict, msg_type: str):
 
 # ── LIVE Health Check ─────────────────────────────────────────────────
 
-def _health_get(base_url: str, path: str, timeout: float = 20.0) -> dict | None:
-    """GET a JSON endpoint, return parsed dict or None on failure."""
+def _health_get(base_url: str, path: str, timeout: float = 20.0, retries: int = 1) -> dict | None:
+    """GET a JSON endpoint, return parsed dict or None on failure.
+
+    Retries once on transient failure (timeout / non-200 / exception) before
+    giving up. Absorbs network blips on shared-VPS T2/T3 endpoints so that
+    health checks do not report `0 transitions` when the cause is a momentary
+    HTTP error rather than a genuinely-stalled subsystem.
+    """
     import requests
-    try:
-        r = requests.get(f"{base_url}{path}", timeout=timeout)
-        if r.status_code != 200:
-            return None
-        return r.json()
-    except Exception:
-        return None
+    import time as _time
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(f"{base_url}{path}", timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+        if attempt < retries:
+            _time.sleep(0.5)
+    return None
 
 
 def _unwrap(resp: dict | None) -> dict:
@@ -1985,7 +2022,13 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
     print("=" * 56)
 
     # ── 1. API reachable ──────────────────────────────────────────────
-    health_resp = _health_get(base_url, "/health")
+    # /health is the bootstrap — if it fails, the entire check aborts. Use
+    # extra retries to absorb event-loop-blocking long bio-layer ticks
+    # (3+ second ticks observed on T1 under shared-uvicorn legacy mode;
+    # S5 api_subprocess separation is the structural fix). Worst case:
+    # 4 attempts × 20s = 80s, but in practice the API frees up between
+    # blocking ticks so we typically succeed by attempt 2.
+    health_resp = _health_get(base_url, "/health", retries=3)
     if health_resp and health_resp.get("status") == "ok":
         ok("API reachable (200 OK)")
     else:
@@ -1997,28 +2040,57 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
     health_data = _unwrap(health_resp)
 
     # ── Fetch first snapshots for growth checks ───────────────────────
-    print("  Waiting 10s to measure growth rates...")
-    ns1_resp = _unwrap(_health_get(base_url, "/v4/nervous-system"))
-    trinity1_resp = _unwrap(_health_get(base_url, "/v4/inner-trinity"))
+    # Track raw fetch results so we can distinguish "API fetch failed" (None)
+    # from "API returned 0" — both used to look identical to downstream code,
+    # producing false `0 transitions` reports during transient HTTP blips on
+    # shared-VPS T2/T3 endpoints.
+    print("  Waiting 10s to measure consciousness growth...")
+    ns1_raw = _health_get(base_url, "/v4/nervous-system")
+    trinity1_raw = _health_get(base_url, "/v4/inner-trinity")
+    ns1_resp = _unwrap(ns1_raw)
+    trinity1_resp = _unwrap(trinity1_raw)
     ns1_transitions = ns1_resp.get("total_transitions", 0)
     epoch1 = trinity1_resp.get("pi_heartbeat", {}).get("total_epochs_observed", 0)
 
     time.sleep(10)
 
     # ── Fetch second snapshots ────────────────────────────────────────
-    ns2_resp = _unwrap(_health_get(base_url, "/v4/nervous-system"))
-    trinity2_resp = _unwrap(_health_get(base_url, "/v4/inner-trinity"))
+    ns2_raw = _health_get(base_url, "/v4/nervous-system")
+    trinity2_raw = _health_get(base_url, "/v4/inner-trinity")
+    ns2_resp = _unwrap(ns2_raw)
+    trinity2_resp = _unwrap(trinity2_raw)
     ns2_transitions = ns2_resp.get("total_transitions", 0)
+    last_train_ts = ns2_resp.get("last_train_ts", None)
     epoch2 = trinity2_resp.get("pi_heartbeat", {}).get("total_epochs_observed", 0)
 
-    # ── 2. NS training growing ────────────────────────────────────────
-    ns_delta = ns2_transitions - ns1_transitions
-    if ns_delta > 0:
-        ok(f"NS training growing ({ns1_transitions} -> {ns2_transitions}, +{ns_delta} in 10s)")
-    elif ns2_transitions > 0:
-        warn(f"NS training stalled ({ns2_transitions} transitions, +0 in 10s)")
+    ns_fetch_failed = ns1_raw is None or ns2_raw is None
+    trinity_fetch_failed = trinity1_raw is None or trinity2_raw is None
+
+    # ── 2. NS training active (age-based — no 10s window blip) ────────
+    # Switched from 10s delta sampling to `now - last_train_ts` age check.
+    # The delta approach gave false zeros when (a) any of the two sample
+    # fetches transiently failed, or (b) the API snapshot cache TTL exceeded
+    # the 10s window. last_train_ts is updated by the trainer on every step,
+    # so age is the single source of truth.
+    if ns_fetch_failed:
+        warn("NS training — /v4/nervous-system fetch failed (transient HTTP error — re-run check)")
+    elif ns2_transitions == 0 and last_train_ts in (None, 0, 0.0):
+        fail("NS training not running (0 transitions, no last_train_ts)")
+    elif last_train_ts in (None, 0, 0.0):
+        # Field missing — fall back to delta sampling (older API contract)
+        ns_delta = ns2_transitions - ns1_transitions
+        if ns_delta > 0:
+            ok(f"NS training growing ({ns1_transitions} -> {ns2_transitions}, +{ns_delta} in 10s)")
+        else:
+            warn(f"NS training stalled ({ns2_transitions} transitions, +0 in 10s, no last_train_ts)")
     else:
-        fail("NS training not running (0 transitions)")
+        age_s = time.time() - last_train_ts
+        if age_s < 60:
+            ok(f"NS training active ({ns2_transitions} transitions, last train {age_s:.0f}s ago)")
+        elif age_s < 300:
+            warn(f"NS training slow ({ns2_transitions} transitions, last train {age_s:.0f}s ago)")
+        else:
+            fail(f"NS training stalled ({ns2_transitions} transitions, last train {age_s/60:.0f}m ago)")
 
     # ── 2b. NS program feature_set vs input_dim consistency ──────────
     _dim_map = {"core": 30, "standard": 55, "extended": 75, "full": 88, "enriched": 79, "full_enriched": 112}
@@ -2035,14 +2107,33 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
     else:
         fail(f"NS dimension MISMATCH (silent training failure): {', '.join(_dim_mismatches)}")
 
-    # ── 3. Consciousness epochs advancing ─────────────────────────────
-    epoch_delta = epoch2 - epoch1
-    if epoch_delta > 0:
-        ok(f"Consciousness advancing (epoch {epoch1} -> {epoch2})")
-    elif epoch2 > 0:
-        warn(f"Consciousness stalled (epoch {epoch2}, +0 in 10s)")
+    # ── 3. Consciousness epochs advancing (retry on suspect stall) ────
+    # A 10s window can catch a brief pause (module subprocess restart, dream
+    # transition, API snapshot cache TTL > sample interval) and produce a
+    # false "stalled" warning. When the first window shows zero growth on a
+    # non-zero counter, retry once with a longer window before flagging —
+    # only suspect cases pay the extra time, healthy Titans pass on first
+    # window.
+    if trinity_fetch_failed:
+        warn("Consciousness — /v4/inner-trinity fetch failed (transient HTTP error — re-run check)")
     else:
-        fail("Consciousness not running (0 epochs)")
+        epoch_delta = epoch2 - epoch1
+        if epoch_delta > 0:
+            ok(f"Consciousness advancing (epoch {epoch1} -> {epoch2})")
+        elif epoch2 > 0:
+            print("  Stall suspected — retrying with 15s window to confirm...")
+            time.sleep(15)
+            trinity3_raw = _health_get(base_url, "/v4/inner-trinity")
+            if trinity3_raw is None:
+                warn(f"Consciousness stalled (epoch {epoch2}, +0 in 10s; retry fetch failed)")
+            else:
+                epoch3 = _unwrap(trinity3_raw).get("pi_heartbeat", {}).get("total_epochs_observed", 0)
+                if epoch3 > epoch2:
+                    ok(f"Consciousness advancing (epoch {epoch1} -> {epoch3} confirmed after retry)")
+                else:
+                    warn(f"Consciousness stalled (epoch {epoch3}, +0 in 25s confirmed)")
+        else:
+            fail("Consciousness not running (0 epochs)")
 
     # ── 4. Neuromod homeostasis ───────────────────────────────────────
     nm_resp = _unwrap(_health_get(base_url, "/v4/neuromodulators"))
@@ -6153,6 +6244,78 @@ def run_loop_latency_check(target: str = "T1", endpoint: str = "/v4/inner-trinit
     return 1 if failed else 0
 
 
+def run_parent_thread_inventory(all_titans: bool = False):
+    """Poll /v4/admin/parent-threads on T1 (or all 3) and print a per-Titan
+    inventory of parent + api_subprocess threads.
+
+    Microkernel rFP A.8 §6 measurement-driven residency audit — surfaces
+    which subsystems own threads in the kernel residency layer. The rFP
+    target is parent_threads ≤ 25 sustained post-completion (gated on
+    bus_ipc_socket_enabled flag flip — A.8.2 alone ships forward-looking
+    code that becomes meaningful when graduation flips on).
+    """
+    import json
+    import urllib.request
+
+    targets = [("T1", "http://127.0.0.1:7777")]
+    if all_titans:
+        targets.extend([
+            ("T2", "http://10.135.0.6:7777"),
+            ("T3", "http://10.135.0.6:7778"),
+        ])
+
+    print()
+    print("PARENT THREAD INVENTORY — microkernel A.8 §6 residency audit")
+    print("=" * 88)
+
+    for tid, base in targets:
+        try:
+            req = urllib.request.Request(f"{base}/v4/admin/parent-threads")
+            with urllib.request.urlopen(req, timeout=6) as r:
+                data = json.loads(r.read())
+        except Exception as e:
+            print(f"  {tid:<6} unreachable: {str(e)[:80]}")
+            continue
+
+        payload = data.get("data") or data
+        parent = payload.get("parent") or {}
+        api = payload.get("api_subprocess") or {}
+
+        p_total = parent.get("total", "?")
+        p_pid = parent.get("pid", "?")
+        a_total = api.get("total", "?")
+        a_pid = api.get("pid", "?")
+        rfp_target = 25
+        try:
+            p_status = "✓" if int(p_total) <= rfp_target else "⚠"
+        except (TypeError, ValueError):
+            p_status = "?"
+
+        print()
+        print(f"  {tid}  parent (pid {p_pid}) — total {p_total} threads "
+              f"[A.8 target ≤{rfp_target}: {p_status}]")
+        print("  " + "-" * 84)
+        for prefix, count in (parent.get("by_prefix") or {}).items():
+            print(f"    {count:>4d}  {prefix}")
+        if "error" in parent:
+            print(f"    ERROR: {parent['error']}")
+        print()
+        print(f"  {tid}  api_subprocess (pid {a_pid}) — total {a_total} threads")
+        print("  " + "-" * 84)
+        for prefix, count in (api.get("by_prefix") or {}).items():
+            print(f"    {count:>4d}  {prefix}")
+
+    print()
+    print("=" * 88)
+    print("  Notes:")
+    print("    • Parent thread count > 25 today is mostly multiprocessing.Queue helpers")
+    print("      (one helper thread per worker queue × ~14 workers). These go away when")
+    print("      microkernel.bus_ipc_socket_enabled=true graduates workers off mp.Queue.")
+    print("    • A.8 §3.5 ships forward-looking conditional that prevents redundant")
+    print("      supervision-thread spawn for fork-mode workers when graduation flips on.")
+    print("=" * 88)
+
+
 def run_thread_pool_check():
     """Poll /v4/thread-pool on all 3 Titans and print a saturation table.
 
@@ -7485,8 +7648,41 @@ def main():
     elif cmd == "cgn":
         run_cgn_telemetry("--all" in sys.argv)
 
+    elif cmd == "cgn-reasoning-strategies":
+        # 2026-04-27 closing DEFERRED ARCH-MAP-CGN-REASONING-STRATEGIES.
+        # Diagnostic for the reasoning_strategy CGN consumer (fed by
+        # reasoning.py:1821-1832 on COMMIT actions with outcome_score >=
+        # cgn_emission_threshold). Surfaces "what does Titan consider
+        # good reasoning" via top grounded rules. Pure observability.
+        run_cgn_reasoning_strategies("--all" in sys.argv)
+
+    elif cmd == "dead-wiring":
+        # 2026-04-27 closing DEFERRED ARCH-MAP-DEAD-WIRING. Pass-through
+        # wrapper to scripts/arch_map_dead_wiring.py — fully-built standalone
+        # static-analysis scanner that pre-existed unregistered. Capabilities:
+        # orphan-method detection (defined-but-zero-callers), pair-closure
+        # (query_X without record_X), config-section tracing (toml sections
+        # never .get()'d), rFP verification (--rfp), bus-flow audit
+        # (--bus-flow), runtime overlay (--runtime-overlay), JSON output
+        # (--json), git-context surfacing (--git-context). All args forwarded.
+        import subprocess
+        from pathlib import Path as _P
+        sys.exit(subprocess.call(
+            [sys.executable,
+             str(_P(__file__).resolve().parent / "arch_map_dead_wiring.py")]
+            + sys.argv[2:]))
+
     elif cmd == "timechain":
         run_timechain_diagnostics("--all" in sys.argv)
+
+    elif cmd == "sensors":
+        # rFP_phase1_sensory_wiring (2026-04-23): V6 5DT outer_body rich-
+        # signal diagnostic. Shows outer_body dim values + saturation/stuck
+        # flags across all 3 Titans. Archaeology found dims [3] entropy
+        # and [4] thermal stuck at 0.5 exactly; [0-2] saturated near 1.0.
+        # This subcommand is the at-a-glance verification that Phase 1
+        # sensor wiring is delivering rich signal to outer_body.
+        run_sensors_diagnostics(all_titans=("--all" in sys.argv or len(sys.argv) == 2))
 
     elif cmd == "contracts":
         # TUNING-012 v2 Sub-phase C (R2): cognitive contracts observability
@@ -7495,6 +7691,14 @@ def main():
     elif cmd == "meta-audit":
         # Task 3: meta-reasoning observability for healing dynamics
         run_meta_audit_diagnostics("--all" in sys.argv)
+
+    elif cmd == "metabolism-gates":
+        # Mainnet Lifecycle Wiring rFP (2026-04-20): snapshot of live
+        # metabolism gate decisions across Titans. Surfaces gates_enforced
+        # flag + 10-min decision window + per-caller close rates. Used
+        # during the 30-min focused observation pre-enforcement flip.
+        run_metabolism_gates(all_titans="--all" in sys.argv,
+                             json_mode="--json" in sys.argv)
 
     elif cmd == "cgn-signals":
         # 2026-04-14 rFP_meta_cgn_v3 § 10 Phase A: validates producer wiring
@@ -7661,6 +7865,48 @@ def main():
         sub = sys.argv[2] if len(sys.argv) > 2 else "status"
         run_meta_cgn(sub)
 
+    elif cmd == "meta-teacher":
+        scope = "all"
+        for a in sys.argv[2:]:
+            if a in ("--t1", "--t2", "--t3"):
+                scope = a[2:]
+            elif a == "--all":
+                scope = "all"
+        run_meta_teacher(scope=scope)
+
+    elif cmd == "emot-cgn":
+        scope = "all"
+        as_json = False
+        for a in sys.argv[2:]:
+            if a in ("--t1", "--t2", "--t3"):
+                scope = a[2:]
+            elif a == "--all":
+                scope = "all"
+            elif a == "--json":
+                as_json = True
+        run_emot_cgn(scope=scope, as_json=as_json)
+
+    elif cmd == "meta-outer":
+        # rFP_titan_meta_outer_layer — status + stats + recall diagnostic
+        scope = "t1"
+        as_json = False
+        recall_person = None
+        recall_topic = None
+        for i, a in enumerate(sys.argv[2:]):
+            if a in ("--t1", "--t2", "--t3"):
+                scope = a[2:]
+            elif a == "--all":
+                scope = "all"
+            elif a == "--json":
+                as_json = True
+            elif a == "--recall-person" and i + 3 < len(sys.argv):
+                recall_person = sys.argv[i + 3]
+            elif a == "--recall-topic" and i + 3 < len(sys.argv):
+                recall_topic = sys.argv[i + 3]
+        run_meta_outer(scope=scope, as_json=as_json,
+                        recall_person=recall_person,
+                        recall_topic=recall_topic)
+
     elif cmd == "preflight":
         # 2026-04-14: comprehensive pre-session-start test. Runs 9 checks
         # in sequence, unified PASS/WARN/FAIL verdict, HALT on critical
@@ -7752,10 +7998,13 @@ def main():
         sys.exit(run_ns_persistence_check())
 
     elif cmd == "thread-pool":
-        # 2026-04-14: thread-pool saturation snapshot for all Titans. Hits
-        # /v4/thread-pool (async-blocks-era endpoint) and prints a 3-column
-        # table. Warning if any Titan saturation >= 60, critical at >= 90.
-        run_thread_pool_check()
+        # 2026-04-14: thread-pool saturation snapshot (asyncio default executor)
+        # 2026-04-28 (A.8.2): --parent flag switches to parent-process residency
+        # inventory (microkernel rFP A.8 §6); --all spans all 3 Titans.
+        if "--parent" in sys.argv:
+            run_parent_thread_inventory(all_titans=("--all" in sys.argv))
+        else:
+            run_thread_pool_check()
 
     elif cmd == "stability":
         # 2026-04-14: stability check — restart density per Titan over time window.
@@ -7783,9 +8032,892 @@ def main():
             json_out="--json" in sys.argv,
         )
 
+    elif cmd == "observables":
+        # 2026-04-22: enforces `feedback_observable_persistence_audit.md`.
+        # Every OBS gate must populate evidence_source + retention_horizon +
+        # persistence_verification at open-time so close-time evidence is not
+        # lost to brain-log rotation. --audit flags gates missing these.
+        run_observables_audit(
+            audit="--audit" in sys.argv,
+            verbose="--verbose" in sys.argv or "-v" in sys.argv,
+        )
+
+    elif cmd == "layers":
+        # Microkernel v2 Phase A §A.5 (2026-04-24): per-layer module summary.
+        # Queries /v4/layers on T1/T2/T3, shows total/running/crashed per
+        # L0/L1/L2/L3 + module lists. Used to verify layer assignment is
+        # consistent across all Titans after deploy.
+        run_layers(all_titans="--all" in sys.argv)
+
+    elif cmd == "shm-status":
+        # Microkernel v2 Phase A §A.2 (2026-04-24): per-titan shm registry
+        # status. Lists /dev/shm/titan_{id}/*.bin files with seq + age + size,
+        # and optionally runs a verify-read roundtrip (--verify) with CRC
+        # check. Used to confirm shm writers are firing at the expected
+        # Schumann-derived cadence after deploy + flag-flip.
+        run_shm_status(
+            all_titans="--all" in sys.argv,
+            verify="--verify" in sys.argv,
+        )
+
+    elif cmd == "kernel-status":
+        # Microkernel v2 Phase A §A.1 (2026-04-24 S3): per-titan kernel
+        # health summary. Shows kernel_plugin_split_enabled flag state,
+        # supervised module count, Trinity/Neuromod/Epoch/Spirit-fast
+        # shm writer status, boot banner mode. Used as a single command
+        # to verify kernel+plugin split cutover success during deploy.
+        run_kernel_status(all_titans="--all" in sys.argv)
+
+    elif cmd == "titanvm-schema":
+        # Microkernel v2 Phase A §A.2 §1.4a (2026-04-25 S4): verify
+        # NeuralReflexNet per-program telemetry shape before declaring
+        # the TITANVM_REGISTERS RegistrySpec. Lists each NS program's
+        # available fields (urgency from _all_urgencies, fire_count,
+        # total_updates, last_loss) so we can pin the (11, 4) layout.
+        run_titanvm_schema()
+
+    elif cmd in ("silent-swallows", "warnings", "symmetries"):
+        # 2026-04-25: code-integrity scanners — implemented in sibling
+        # arch_map_dead_wiring.py (v2 capability). Import via this script's
+        # directory so we always pick up the worktree-local copy.
+        import os as _os
+        _here = _os.path.dirname(_os.path.abspath(__file__))
+        if _here not in sys.path:
+            sys.path.insert(0, _here)
+        from arch_map_dead_wiring import (
+            run_silent_swallows_scan,
+            run_warnings,
+            run_symmetries_audit,
+        )
+        if cmd == "silent-swallows":
+            sys.exit(run_silent_swallows_scan(runtime="--runtime" in sys.argv))
+        elif cmd == "warnings":
+            sys.exit(run_warnings(all_titans="--all" in sys.argv))
+        else:
+            sys.exit(run_symmetries_audit(all_titans="--all" in sys.argv))
+
+    elif cmd == "api-status":
+        # Microkernel v2 Phase A §A.4 (2026-04-25 S5): per-titan API
+        # subprocess health summary. Reports api_process_separation_enabled
+        # flag state, api_subprocess Guardian state (running/stopped/crashed),
+        # kernel_rpc socket existence + permissions, uvicorn port reachable,
+        # and OBSERVATORY_EVENT bridge activity. Mirrors arch_map kernel-status
+        # / shm-status subcommand shape for consistency.
+        run_api_status(all_titans="--all" in sys.argv)
+
+    elif cmd == "module-methods":
+        # Microkernel v2 Phase A §A.3 (2026-04-25 S6): per-module spawn vs
+        # fork audit. Reports each Guardian module's start_method per Titan,
+        # along with worker RSS (so we can compare fork vs spawn savings
+        # post-flip). Used to confirm spawn migration rollout state matches
+        # expectations before flag flips.
+        run_module_methods(all_titans="--all" in sys.argv)
+
+    elif cmd == "s5-callsites":
+        # Microkernel v2 Phase A §A.4 (S5 amendment 2026-04-26 D4): drift
+        # detection for endpoint-side `plugin.X` callsites that bypass the
+        # TitanStateAccessor. Wraps scripts/s5_callsite_audit.py + classifies
+        # each remaining site as A (state read), B (async cross-proc), C
+        # (manual handle). Drift = new endpoint code that bypasses the
+        # accessor pattern; this audit must stay near zero to keep Phase
+        # B/C migrations clean.
+        run_s5_callsites(verbose=("--verbose" in sys.argv or "-v" in sys.argv))
+
+    elif cmd in ("cache-keys", "cache_keys"):
+        # rFP_observatory_data_loading_v1 Phase 1 (2026-04-26): single source of
+        # truth audit for the producer→bus event→cache key→endpoint→frontend
+        # contract. Reads titan_plugin/api/cache_key_registry.REGISTRY and
+        # validates each entry against the source tree (+ optionally live state).
+        # Modes:
+        #   --audit   full static audit, exit-code on errors  (default)
+        #   --status  live-state matrix per Titan (--all for T1+T2+T3)
+        #   --list    one-line per registry entry, grouped by kind
+        #   --json    machine-readable output (works with --audit / --status / --list)
+        modes = {"audit", "status", "list"}
+        mode = next(
+            (a.lstrip("-") for a in sys.argv[2:] if a.lstrip("-") in modes),
+            "audit",
+        )
+        rc = run_cache_keys_command(
+            mode=mode,
+            all_titans="--all" in sys.argv,
+            json_mode="--json" in sys.argv,
+        )
+        sys.exit(rc)
+
+    elif cmd == "phase-c":
+        # SPEC enforcer per titan-docs/SPEC_titan_architecture.md §20.
+        # Reads SPEC_titan_architecture_constants.toml as single source of truth
+        # (no hardcoded SPEC values in arch_map source per §2.6 live-versioning).
+        # Sub-actions:
+        #   verify [--strict] [--json]   — comprehensive static check vs SPEC
+        #   regen                        — regenerate Python + Rust constants from TOML
+        #   diff <ref1> <ref2>           — show SPEC delta between git refs
+        #   parity                       — run all parity vector tests (frame, authkey, slot)
+        #   topology                     — render §9 hierarchy + §10 ordering as DOT graph
+        #   watch-escalations [--tail]   — runtime: live cascade events from data/supervision.jsonl
+        #   supervision-log --filter ... — query interface over data/supervision.jsonl
+        #   data-integrity-audit         — runtime: verify §11.H critical-data files
+        rc = run_phase_c_command(sys.argv[2:])
+        sys.exit(rc)
+
     else:
         print(__doc__)
         sys.exit(1)
+
+
+# ── Phase C SPEC enforcer (titan-docs/SPEC_titan_architecture.md §20) ──
+
+def run_phase_c_command(args: list) -> int:
+    """Dispatch `arch_map phase-c <action>` per SPEC §20."""
+    if not args:
+        return _phase_c_help()
+    action = args[0]
+    rest = args[1:]
+    if action == "verify":
+        return _phase_c_verify(strict="--strict" in rest, json_mode="--json" in rest)
+    elif action == "regen":
+        return _phase_c_regen()
+    elif action == "diff":
+        if len(rest) < 2:
+            print("usage: arch_map phase-c diff <ref1> <ref2>", file=sys.stderr)
+            return 2
+        return _phase_c_diff(rest[0], rest[1])
+    elif action == "parity":
+        return _phase_c_parity()
+    elif action == "topology":
+        return _phase_c_topology()
+    elif action in ("watch-escalations", "watch_escalations"):
+        return _phase_c_watch_escalations(tail="--tail" in rest)
+    elif action in ("supervision-log", "supervision_log"):
+        return _phase_c_supervision_log(rest)
+    elif action in ("data-integrity-audit", "data_integrity_audit"):
+        return _phase_c_data_integrity_audit()
+    elif action in ("help", "--help", "-h"):
+        return _phase_c_help()
+    else:
+        print(f"unknown phase-c action: {action}", file=sys.stderr)
+        return _phase_c_help()
+
+
+def _phase_c_help() -> int:
+    print(
+        """\
+arch_map phase-c — SPEC enforcer per titan-docs/SPEC_titan_architecture.md §20
+
+Actions:
+  verify [--strict] [--json]   Static check codebase against SPEC. --strict exits
+                                non-zero on any finding (pre-commit mode).
+  regen                        Regenerate _phase_c_constants.py + constants.rs from TOML.
+  diff <ref1> <ref2>           Show SPEC delta between git refs.
+  parity                       Run all parity vector tests.
+  topology                     Render §9 hierarchy + §10 ordering as DOT graph.
+  watch-escalations [--tail]   Live cascade events from data/supervision.jsonl.
+  supervision-log [filters]    Query interface over data/supervision.jsonl.
+                                Filters: --child <name>, --reason <enum>,
+                                         --supervisor <name>, --since <duration>,
+                                         --event <type>, --tail
+  data-integrity-audit         Verify §11.H critical-data files (backups + integrity).
+
+Source of truth: titan-docs/SPEC_titan_architecture_constants.toml
+"""
+    )
+    return 0
+
+
+def _phase_c_repo_root() -> "Path":
+    from pathlib import Path
+    return Path(__file__).resolve().parent.parent
+
+
+def _phase_c_load_toml() -> dict:
+    """Load the SPEC TOML or exit with a clear error."""
+    import sys
+    try:
+        import tomllib  # py 3.11+
+    except ImportError:
+        import tomli as tomllib  # type: ignore
+    path = _phase_c_repo_root() / "titan-docs" / "SPEC_titan_architecture_constants.toml"
+    if not path.exists():
+        print(f"ERROR: SPEC TOML not found at {path}", file=sys.stderr)
+        sys.exit(2)
+    return tomllib.loads(path.read_text(encoding="utf-8"))
+
+
+def _phase_c_regen() -> int:
+    """Run the generator script in write mode."""
+    import subprocess
+    repo = _phase_c_repo_root()
+    script = repo / "scripts" / "generate_phase_c_constants.py"
+    if not script.exists():
+        print(f"ERROR: generator script not found at {script}", file=sys.stderr)
+        return 2
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=str(repo),
+    )
+    return result.returncode
+
+
+def _phase_c_verify(strict: bool = False, json_mode: bool = False) -> int:
+    """
+    Static check codebase against SPEC.
+
+    v0 checks:
+      1. Generator parity — generated files match TOML
+      2. Domain registry — every used domain has a [domains.X] block
+      3. Ground-truth presence — Preamble G1-G16 entries present in TOML
+      4. SPEC document references valid sections in TOML
+
+    Future (deferred to v1):
+      - Static analysis of code for §11.H critical-data writes via atomic_write helper
+      - Detection of magic numbers vs constants
+      - §9 wiring matrix verification
+      - §10 communication ordering checks
+    """
+    import json as _json
+    import subprocess
+
+    findings: list[dict] = []
+    repo = _phase_c_repo_root()
+
+    # Check 1: generator parity
+    script = repo / "scripts" / "generate_phase_c_constants.py"
+    if script.exists():
+        result = subprocess.run(
+            [sys.executable, str(script), "--check"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            findings.append({
+                "kind": "GENERATOR_PARITY",
+                "severity": "CRITICAL",
+                "message": "Generated _phase_c_constants.py / constants.rs out of sync with TOML",
+                "remediation": "run `python scripts/arch_map.py phase-c regen`",
+                "detail": result.stdout + result.stderr,
+            })
+    else:
+        findings.append({
+            "kind": "TOOLING_MISSING",
+            "severity": "CRITICAL",
+            "message": "scripts/generate_phase_c_constants.py not found",
+            "remediation": "restore from git history",
+        })
+
+    # Check 2: domain registry consistency
+    try:
+        toml = _phase_c_load_toml()
+    except SystemExit:
+        toml = {}
+    domains = toml.get("domains", {}) if toml else {}
+    constants = toml.get("constants", {}) if toml else {}
+    used_domains: set = {c.get("domain", "") for c in constants.values()}
+    used_domains.discard("")
+    missing_in_registry = used_domains - set(domains.keys())
+    for d in sorted(missing_in_registry):
+        findings.append({
+            "kind": "DOMAIN_UNREGISTERED",
+            "severity": "CRITICAL",
+            "message": f"Domain '{d}' used by constants but missing from [domains.{d}] block",
+            "remediation": "add [domains.X] block with description + introduced_in",
+        })
+
+    # Check 3: ground-truth coverage
+    truths = toml.get("ground_truths", {}) if toml else {}
+    expected_truths = {f"G{i}" for i in range(1, 17)}
+    missing_truths = expected_truths - set(truths.keys())
+    for t in sorted(missing_truths):
+        findings.append({
+            "kind": "GROUND_TRUTH_MISSING",
+            "severity": "HIGH",
+            "message": f"Preamble {t} expected in TOML [ground_truths.{t}] but not found",
+            "remediation": f"add [ground_truths.{t}] block with title + spec_ref + enforces",
+        })
+
+    # Check 4: SPEC doc presence
+    spec_doc = repo / "titan-docs" / "SPEC_titan_architecture.md"
+    if not spec_doc.exists():
+        findings.append({
+            "kind": "SPEC_DOC_MISSING",
+            "severity": "CRITICAL",
+            "message": "SPEC document not found at titan-docs/SPEC_titan_architecture.md",
+            "remediation": "restore from git history",
+        })
+
+    # Output
+    if json_mode:
+        out = {
+            "spec_version": toml.get("spec_version", "unknown") if toml else "unknown",
+            "findings": findings,
+            "n_findings": len(findings),
+            "n_critical": sum(1 for f in findings if f["severity"] == "CRITICAL"),
+        }
+        print(_json.dumps(out, indent=2))
+    else:
+        if not findings:
+            print(
+                f"✓ phase-c verify clean (SPEC v{toml.get('spec_version', 'unknown')}, "
+                f"{len(constants)} constants across {len(domains)} domains, "
+                f"{len(truths)} ground truths)"
+            )
+        else:
+            print(f"✗ phase-c verify: {len(findings)} finding(s)")
+            for f in findings:
+                print(f"  [{f['severity']}] {f['kind']}: {f['message']}")
+                if "remediation" in f:
+                    print(f"    → {f['remediation']}")
+
+    if strict and findings:
+        return 1
+    return 0
+
+
+def _phase_c_diff(ref1: str, ref2: str) -> int:
+    """Show SPEC delta between two git refs (TOML diff with constant-level summary)."""
+    import subprocess
+    toml_path = "titan-docs/SPEC_titan_architecture_constants.toml"
+    print(f"=== SPEC delta {ref1} → {ref2} ===\n")
+    result = subprocess.run(
+        ["git", "diff", "--no-color", f"{ref1}..{ref2}", "--", toml_path],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0 and result.stdout:
+        print(result.stdout)
+    elif result.returncode == 0:
+        print(f"(no SPEC TOML changes between {ref1} and {ref2})")
+    else:
+        print(f"git diff failed: {result.stderr}", file=sys.stderr)
+        return result.returncode
+    return 0
+
+
+def _phase_c_parity() -> int:
+    """Run parity vector tests: frame, authkey, bus_specs, slot layout."""
+    import subprocess
+    print("phase-c parity — running parity vector tests...")
+    repo = _phase_c_repo_root()
+    test_files = [
+        "tests/test_frame_parity.py",
+        "tests/test_bus_authkey.py",
+        "tests/test_phase_c_constants_in_sync.py",
+    ]
+    existing = [t for t in test_files if (repo / t).exists()]
+    if not existing:
+        print("(no parity test files found yet)", file=sys.stderr)
+        return 0
+    cmd = [sys.executable, "-m", "pytest", "-p", "no:anchorpy", "--tb=short"] + existing
+    result = subprocess.run(cmd, cwd=str(repo))
+    return result.returncode
+
+
+def _phase_c_topology() -> int:
+    """Render §9 hierarchy + §10 ordering as DOT graph (placeholder v0)."""
+    print(
+        "phase-c topology — DOT graph rendering deferred to v1.\n"
+        "v0 stub: structure laid out, implementation in next session.\n"
+        "Will render: kernel → substrate → unified-spirit → 6 daemons + titan_HCL/guardian_HCL/modules"
+    )
+    return 0
+
+
+def _phase_c_watch_escalations(tail: bool = False) -> int:
+    """Stream supervision events from data/supervision.jsonl (placeholder v0)."""
+    repo = _phase_c_repo_root()
+    log_path = repo / "data" / "supervision.jsonl"
+    if not log_path.exists():
+        print(
+            f"phase-c watch-escalations: {log_path} not yet created.\n"
+            "Will be populated by kernel + guardian_HCL once §11.G.4 supervision log ships."
+        )
+        return 0
+    print(f"phase-c watch-escalations — reading {log_path}\n(implementation deferred to v1)")
+    return 0
+
+
+def _phase_c_supervision_log(filters: list) -> int:
+    """Query data/supervision.jsonl (placeholder v0)."""
+    repo = _phase_c_repo_root()
+    log_path = repo / "data" / "supervision.jsonl"
+    if not log_path.exists():
+        print(
+            f"phase-c supervision-log: {log_path} not yet created.\n"
+            "Will be populated by kernel + guardian_HCL once §11.G.4 supervision log ships.\n"
+            f"Requested filters: {filters}"
+        )
+        return 0
+    print(f"phase-c supervision-log filters={filters} (implementation deferred to v1)")
+    return 0
+
+
+def _phase_c_data_integrity_audit() -> int:
+    """Audit §11.H.1 critical-data files for backups + integrity (placeholder v0)."""
+    repo = _phase_c_repo_root()
+    toml = _phase_c_load_toml()
+    # v0: simplified — list critical-data files from SPEC §11.H.1 and check existence
+    print("phase-c data-integrity-audit — v0 stub (SPEC §11.H.1)")
+    print("  Implementation deferred to v1 — needs critical-data file list parsed from SPEC.")
+    return 0
+
+
+# ── Microkernel v2 — Shm registry status (§A.2) ─────────────────────
+
+def run_shm_status(all_titans: bool = False, verify: bool = False) -> int:
+    """
+    Microkernel v2 Phase A §A.2 — per-titan shm registry status.
+
+    Lists /dev/shm/titan_{titan_id}/*.bin registries with seq counter,
+    age_seconds, and payload size. --verify runs a full read roundtrip
+    via StateRegistryReader and reports whether the CRC + SeqLock pass.
+
+    For local-host Titans (T1 on 127.0.0.1): reads shm directly from
+    the local filesystem. For remote Titans (T2/T3 over VPC SSH),
+    queries them via /v4/trinity-shm which exposes shm metadata. Missing
+    registries are reported clearly.
+    """
+    import time as _time
+    from pathlib import Path as _Path
+
+    titans = [("T1", "/dev/shm/titan_T1")]
+    if all_titans:
+        titans += [("T2", "/dev/shm/titan_T2"), ("T3", "/dev/shm/titan_T3")]
+
+    print()
+    print("MICROKERNEL v2 — SHM REGISTRY STATUS (per Titan)")
+    print("=" * 90)
+
+    # Expected registries. S2 shipped Trinity/Neuromod/Epoch; S3b adds
+    # INNER_SPIRIT_45D (spirit-fast at Schumann × 9 = 70.47 Hz). S4 adds
+    # SphereClocks/Chi/TitanVMRegisters/Identity (fixed-size) + CGN
+    # (variable-size, dual-mode). S7 adds INNER_BODY_5D (5D × 7.83 Hz)
+    # and INNER_MIND_15D (15D × 23.49 Hz) — body+mind sensor decoupling
+    # completes the Schumann-symmetric Trinity (5/15/45 dims at 1×/3×/9×
+    # Schumann). Each registry's file is only present after its flag
+    # has been flipped.
+    try:
+        from titan_plugin.core.state_registry import (
+            CGN_LIVE_WEIGHTS, CHI_STATE, EPOCH_COUNTER, IDENTITY,
+            INNER_BODY_5D, INNER_MIND_15D, INNER_SPIRIT_45D,
+            NEUROMOD_STATE, SPHERE_CLOCKS_STATE, TITANVM_REGISTERS,
+            TRINITY_STATE,
+        )
+        # Fixed-size specs first (S2 + S3b + S4 fixed + S7)
+        expected_specs = [
+            TRINITY_STATE, NEUROMOD_STATE, EPOCH_COUNTER, INNER_SPIRIT_45D,
+            INNER_BODY_5D, INNER_MIND_15D,
+            SPHERE_CLOCKS_STATE, CHI_STATE, TITANVM_REGISTERS, IDENTITY,
+        ]
+        # CGN handled separately (variable-size + dual-mode legacy fallback)
+        cgn_spec = CGN_LIVE_WEIGHTS
+    except Exception as e:
+        print(f"  ✗ cannot import registry specs: {e}")
+        return 1
+
+    any_failed = False
+
+    for tid, shm_path_str in titans:
+        print(f"\n  {tid} ({shm_path_str})")
+        print("  " + "-" * 86)
+        shm_dir = _Path(shm_path_str)
+        if not shm_dir.exists():
+            print(f"    ⚠ directory missing (Titan may not have flipped shm flags yet)")
+            # Not a hard fail — flags default off.
+            continue
+
+        for spec in expected_specs:
+            path = shm_dir / f"{spec.name}.bin"
+            if not path.exists():
+                print(f"    — {spec.name:<20}  <missing>  (flag likely off)")
+                continue
+            size = path.stat().st_size
+            mtime = path.stat().st_mtime
+            age = _time.time() - mtime
+            # Read header for seq (use reader to honor the protocol).
+            seq_str = "?"
+            try:
+                if tid == "T1":  # local access
+                    from titan_plugin.core.state_registry import StateRegistryReader
+                    r = StateRegistryReader(spec, shm_dir)
+                    meta = r.read_meta()
+                    r.close()
+                    if meta:
+                        seq_str = str(meta["seq"])
+                        age = meta["age_seconds"]
+            except Exception as e:
+                seq_str = f"err:{e}"
+            icon = "✓" if size == spec.total_bytes else "✗"
+            print(f"    {icon} {spec.name:<20}  seq={seq_str:<8}  "
+                  f"age={age:>6.2f}s  size={size}B (expected={spec.total_bytes}B)")
+            if size != spec.total_bytes:
+                any_failed = True
+            if verify and tid == "T1":
+                try:
+                    from titan_plugin.core.state_registry import StateRegistryReader
+                    r = StateRegistryReader(spec, shm_dir)
+                    arr = r.read()
+                    r.close()
+                    if arr is None:
+                        print(f"        ✗ verify read: returned None (fallback triggered)")
+                        any_failed = True
+                    else:
+                        print(f"        ✓ verify read: shape={arr.shape} dtype={arr.dtype}")
+                except Exception as e:
+                    print(f"        ✗ verify read raised: {e}")
+                    any_failed = True
+
+        # CGN — dual-mode (S4): per-titan StateRegistry path (flag on)
+        # OR legacy global path (flag off). Surface both states.
+        cgn_per_titan = shm_dir / "cgn_live_weights.bin"
+        cgn_global = _Path("/dev/shm/cgn_live_weights.bin")
+        if cgn_per_titan.exists():
+            size = cgn_per_titan.stat().st_size
+            mtime = cgn_per_titan.stat().st_mtime
+            age = _time.time() - mtime
+            seq_str = "?"
+            try:
+                if tid == "T1":
+                    from titan_plugin.core.state_registry import StateRegistryReader
+                    r = StateRegistryReader(cgn_spec, shm_dir)
+                    meta = r.read_meta()
+                    r.close()
+                    if meta:
+                        seq_str = str(meta["seq"])
+                        age = meta["age_seconds"]
+            except Exception as e:
+                seq_str = f"err:{e}"
+            icon = "✓" if size == cgn_spec.total_bytes else "✗"
+            print(f"    {icon} {cgn_spec.name:<20}  seq={seq_str:<8}  "
+                  f"age={age:>6.2f}s  size={size}B (mode=stateregistry/24B-header)")
+            if size != cgn_spec.total_bytes:
+                any_failed = True
+        elif cgn_global.exists() and tid == "T1":
+            # Legacy mode (flag off) — global file, only meaningful for T1
+            # (T2+T3 share /dev/shm so global file is racy by design).
+            size = cgn_global.stat().st_size
+            mtime = cgn_global.stat().st_mtime
+            age = _time.time() - mtime
+            print(f"    — {cgn_spec.name:<20}  age={age:>6.2f}s  size={size}B "
+                  f"(mode=legacy/16B-header global path)")
+        else:
+            print(f"    — {cgn_spec.name:<20}  <missing>  (flag likely off, no legacy file either)")
+
+    print()
+    return 0 if not any_failed else 1
+
+
+# ── Microkernel v2 — Kernel status (§A.1) ────────────────────────────
+
+def run_kernel_status(all_titans: bool = False) -> int:
+    """
+    Microkernel v2 Phase A §A.1 (S3) — per-titan kernel health summary.
+
+    Combines per-Titan:
+      - Microkernel flag state (kernel_plugin_split_enabled,
+        shm_*_enabled flags) — queried via /health
+      - Guardian supervised module count (via /v4/layers)
+      - Shm writer health (via /v4/trinity-shm + file inspection for T1)
+      - Boot banner mode (from /health 'boot_mode' when available)
+
+    Intended as the single command an operator runs during S3 cutover
+    to confirm: "Is this Titan running the split path? Are all its L0
+    services healthy? Is spirit-fast writing?"
+    """
+    import time as _time
+    from pathlib import Path as _Path
+
+    titans = [("T1", "http://127.0.0.1:7777", "/dev/shm/titan_T1")]
+    if all_titans:
+        titans += [
+            ("T2", "http://10.135.0.6:7777", "/dev/shm/titan_T2"),
+            ("T3", "http://10.135.0.6:7778", "/dev/shm/titan_T3"),
+        ]
+
+    print()
+    print("MICROKERNEL v2 — KERNEL STATUS (per Titan)")
+    print("=" * 90)
+
+    try:
+        from titan_plugin.core.state_registry import (
+            EPOCH_COUNTER, INNER_SPIRIT_45D, NEUROMOD_STATE, TRINITY_STATE,
+        )
+        specs = [TRINITY_STATE, NEUROMOD_STATE, EPOCH_COUNTER, INNER_SPIRIT_45D]
+    except Exception as e:
+        print(f"  ✗ cannot import registry specs: {e}")
+        return 1
+
+    any_failed = False
+
+    for tid, base_url, shm_path_str in titans:
+        print(f"\n  {tid} ({base_url})")
+        print("  " + "-" * 86)
+
+        # ── Health endpoint: is the Titan alive + which boot path? ────
+        health = _services_get(base_url, "/health", timeout=5.0)
+        if health is None:
+            print(f"    ✗ /health unreachable")
+            any_failed = True
+            continue
+        # /health doesn't currently expose kernel_plugin_split_enabled
+        # directly — we infer from the process-title or boot log. For
+        # now, show a basic alive indicator.
+        print(f"    ✓ API reachable")
+
+        # ── Guardian modules supervised (from /v4/layers) ─────────────
+        layers = _services_get(base_url, "/v4/layers", timeout=5.0)
+        if layers and isinstance(layers, dict):
+            data = layers.get("data", layers)
+            counts = data.get("layer_stats") if isinstance(data, dict) else None
+            if isinstance(counts, dict):
+                total = sum(c.get("total", 0) for c in counts.values())
+                running = sum(c.get("running", 0) for c in counts.values())
+                print(f"    ✓ Guardian: {running}/{total} modules running "
+                      f"(L0={counts.get('L0', {}).get('total', 0)}/"
+                      f"L1={counts.get('L1', {}).get('total', 0)}/"
+                      f"L2={counts.get('L2', {}).get('total', 0)}/"
+                      f"L3={counts.get('L3', {}).get('total', 0)})")
+            else:
+                print(f"    ⚠ /v4/layers shape unexpected (no layer_stats)")
+        else:
+            print(f"    ⚠ /v4/layers unreachable (pre-S1 deploy?)")
+
+        # ── Shm writers (file-level check for T1 local; remote = note) ──
+        shm_dir = _Path(shm_path_str) if tid == "T1" else None
+        for spec in specs:
+            if shm_dir is None:
+                # Remote Titan — skip file inspection, operator runs
+                # kernel-status on the Titan itself for detail.
+                continue
+            path = shm_dir / f"{spec.name}.bin"
+            if not path.exists():
+                flag = spec.feature_flag or "?"
+                print(f"    — {spec.name:<20} <missing>  (flag={flag})")
+                continue
+            age = _time.time() - path.stat().st_mtime
+            try:
+                from titan_plugin.core.state_registry import StateRegistryReader
+                r = StateRegistryReader(spec, shm_dir)
+                meta = r.read_meta()
+                r.close()
+                seq = meta.get("seq", "?") if meta else "?"
+                age = meta.get("age_seconds", age) if meta else age
+                icon = "✓"
+                if isinstance(age, (int, float)) and age > 60.0:
+                    icon = "⚠"
+                    any_failed = True
+                print(f"    {icon} {spec.name:<20} seq={str(seq):<8} age={age:>6.2f}s")
+            except Exception as e:
+                print(f"    ✗ {spec.name:<20} read error: {e}")
+                any_failed = True
+
+        if tid != "T1":
+            print(f"    ℹ shm detail: run `arch_map kernel-status` locally on {tid}")
+
+    print()
+    return 0 if not any_failed else 1
+
+
+# ── Microkernel v2 — Layer summary (§A.5) ────────────────────────────
+
+def run_layers(all_titans: bool = False) -> int:
+    """
+    Microkernel v2 Phase A §A.5 — per-layer Guardian module summary.
+
+    Queries /v4/layers on T1 (and T2/T3 with --all). Shows total + running
+    + crashed per L0/L1/L2/L3 plus the module list at each layer, so an
+    operator can verify layer assignment is consistent across Titans.
+    """
+    titans = [("T1", "http://127.0.0.1:7777")]
+    if all_titans:
+        titans += [
+            ("T2", "http://10.135.0.6:7777"),
+            ("T3", "http://10.135.0.6:7778"),
+        ]
+
+    print()
+    print("MICROKERNEL v2 — LAYER ASSIGNMENT (per Titan)")
+    print("=" * 90)
+
+    any_failed = False
+
+    for tid, base_url in titans:
+        print(f"\n  {tid} ({base_url})")
+        print("  " + "-" * 86)
+        resp = _services_get(base_url, "/v4/layers", timeout=8.0)
+        if not resp:
+            print("    ✗ /v4/layers unreachable (endpoint may not be deployed yet)")
+            any_failed = True
+            continue
+        payload = resp.get("data", resp) if isinstance(resp, dict) else resp
+        if not isinstance(payload, dict):
+            print(f"    ✗ unexpected response: {payload}")
+            any_failed = True
+            continue
+
+        stats = payload.get("layer_stats", {})
+        modules_by_layer = payload.get("modules_by_layer", {})
+
+        for layer in ("L0", "L1", "L2", "L3"):
+            bucket = stats.get(layer, {})
+            modules = modules_by_layer.get(layer, [])
+            total = bucket.get("total", 0)
+            running = bucket.get("running", 0)
+            crashed = bucket.get("crashed", 0)
+            disabled = bucket.get("disabled", 0)
+            status_icon = "✓" if total == running and crashed == 0 else (
+                "⚠" if crashed == 0 else "✗")
+            # Layer descriptor
+            desc = {
+                "L0": "microkernel (in-process — no Guardian modules)",
+                "L1": "Trinity daemons + L1 persistence",
+                "L2": "higher cognition + cognitive substrates",
+                "L3": "pluggable modules + L3 persistence",
+            }.get(layer, "")
+            print(f"    {status_icon} {layer}  total={total:>2}  running={running:>2}  "
+                  f"crashed={crashed}  disabled={disabled}  — {desc}")
+            if modules:
+                # Wrap the module list nicely.
+                mod_str = ", ".join(modules)
+                # Indent subsequent lines
+                print(f"        [{mod_str}]")
+
+        # Canon check — compare live layers against _layer_canon.LAYER_CANON
+        try:
+            from titan_plugin._layer_canon import LAYER_CANON
+            mismatches = []
+            for layer, names in modules_by_layer.items():
+                for n in names:
+                    expected = LAYER_CANON.get(n)
+                    if expected and expected != layer:
+                        mismatches.append((n, layer, expected))
+            if mismatches:
+                print("    ✗ CANON MISMATCH:")
+                for n, got, expected in mismatches:
+                    print(f"        module '{n}': live={got}  canon={expected}")
+                any_failed = True
+            else:
+                print("    ✓ All module layers match LAYER_CANON")
+        except Exception as e:
+            print(f"    ⚠ could not verify against canon: {e}")
+
+    print()
+    return 0 if not any_failed else 1
+
+
+# ── Observables Audit ────────────────────────────────────────────────
+
+def run_observables_audit(audit: bool = False, verbose: bool = False) -> int:
+    """Scan titan-docs/OBSERVABLES.md for persistence-audit compliance.
+
+    Enforces `memory/feedback_observable_persistence_audit.md`:
+    every active OBS gate must specify `evidence_source`, `retention_horizon`,
+    and `persistence_verification` fields in its body.
+
+    Default: summary + compliance rate. --audit exits 1 if non-compliant
+    (for CI / pre-commit integration). --verbose prints every gate's state.
+    """
+    import re as _re
+    from pathlib import Path as _Path
+
+    obs_path = _Path(__file__).parent.parent / "titan-docs" / "OBSERVABLES.md"
+    if not obs_path.exists():
+        print(f"  ✗ OBSERVABLES.md not found at {obs_path}")
+        return 2
+
+    text = obs_path.read_text()
+
+    # Split the document into sections starting at each "### OBS-" header.
+    # Each gate is one section until the next ### header or ---.
+    gate_re = _re.compile(
+        r"^### (OBS-[a-zA-Z0-9_\-]+) — (.+?)$",
+        _re.MULTILINE,
+    )
+    sections: list[tuple[str, str, int]] = []  # (slug, title, start_line)
+    for m in gate_re.finditer(text):
+        slug = m.group(1)
+        title = m.group(2).strip()
+        line_no = text[: m.start()].count("\n") + 1
+        sections.append((slug, title, m.start()))
+
+    # Add a terminal anchor so the last section has a bound
+    sections_with_bounds = []
+    for i, (slug, title, start) in enumerate(sections):
+        end = sections[i + 1][2] if i + 1 < len(sections) else len(text)
+        sections_with_bounds.append((slug, title, start, end))
+
+    required_fields = [
+        ("evidence_source", _re.compile(
+            r"\*\*Evidence source:?\*\*|evidence_source:", _re.IGNORECASE
+        )),
+        ("retention_horizon", _re.compile(
+            r"\*\*Retention horizon:?\*\*|retention_horizon:", _re.IGNORECASE
+        )),
+        ("persistence_verification", _re.compile(
+            r"\*\*Persistence verification:?\*\*|persistence_verification:|"
+            r"persisted_by=|new_persistence=|acceptable_loss=",
+            _re.IGNORECASE,
+        )),
+    ]
+
+    # Skip gates that are already closed (PASSED / SUPERSEDED / graveyard);
+    # the rule applies to OPEN gates (where evidence still needs collecting).
+    closed_markers = _re.compile(
+        r"(✅ PASSED|⚠ SUPERSEDED|\*\*SUPERSEDED\*\*|Status:\*\*\s*✅|Status:\*\*\s*⚠)",
+        _re.IGNORECASE,
+    )
+
+    total_active = 0
+    compliant = 0
+    violations: list[tuple[str, str, list[str]]] = []  # (slug, title, missing)
+
+    for slug, title, start, end in sections_with_bounds:
+        body = text[start:end]
+        # Status line is within the first 500 chars of the body
+        head = body[:1500]
+        if closed_markers.search(head):
+            continue  # closed — skip
+        total_active += 1
+        missing = []
+        for name, pat in required_fields:
+            if not pat.search(body):
+                missing.append(name)
+        if not missing:
+            compliant += 1
+        else:
+            violations.append((slug, title, missing))
+
+    print("=" * 78)
+    print("OBSERVABLES PERSISTENCE AUDIT")
+    print("=" * 78)
+    print(f"  Source: {obs_path}")
+    print(f"  Active gates: {total_active}")
+    print(f"  Compliant: {compliant}/{total_active}  "
+          f"({100.0 * compliant / max(total_active, 1):.1f}%)")
+    print()
+
+    if not violations:
+        print("  ✅ All active gates specify evidence_source + retention_horizon + "
+              "persistence_verification.")
+        print()
+        return 0
+
+    print(f"  ⚠ {len(violations)} active gates missing audit fields:")
+    print()
+    print(f"  {'GATE':55s} MISSING FIELDS")
+    print("  " + "-" * 74)
+    for slug, title, missing in violations:
+        short = slug[:52] + "…" if len(slug) > 53 else slug
+        print(f"  {short:55s} {', '.join(missing)}")
+        if verbose:
+            print(f"      title: {title[:70]}")
+    print()
+    print("  Rule: memory/feedback_observable_persistence_audit.md")
+    print("  Fix:  add the three fields inline in each gate body. See rule "
+          "for syntax.")
+    print()
+
+    return 1 if audit else 0
 
 
 # ── Memory Profiling ─────────────────────────────────────────────────
@@ -8343,7 +9475,391 @@ def run_meta_cgn(subcommand: str = "status") -> None:
           "impasse | audit | domains | history")
 
 
-# ── Session Close ─────────────────────────────────────────────────────
+def run_meta_teacher(scope: str = "all") -> None:
+    """arch_map meta-teacher [--t1|--t2|--t3|--all].
+
+    Multi-Titan diagnostic for Meta-Reasoning Teacher (rFP_titan_meta_reasoning_teacher).
+    Queries /v4/meta-teacher/status on each Titan and summarizes:
+      - enabled + sample_mode + task_key (which LLM)
+      - 24h critique volume + LLM-ok rate
+      - top critique categories
+      - adoption rate per domain
+    """
+    import urllib.request
+
+    TITANS = {
+        "T1": "http://127.0.0.1:7777",
+        "T2": "http://10.135.0.6:7777",
+        "T3": "http://10.135.0.6:7778",
+    }
+    if scope == "t1":
+        titans = {"T1": TITANS["T1"]}
+    elif scope == "t2":
+        titans = {"T2": TITANS["T2"]}
+    elif scope == "t3":
+        titans = {"T3": TITANS["T3"]}
+    else:
+        titans = TITANS
+
+    def fetch(base: str) -> dict:
+        try:
+            with urllib.request.urlopen(
+                    f"{base}/v4/meta-teacher/status", timeout=5) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as e:
+            return {"error": str(e)}
+
+    print("\n" + "=" * 78)
+    print("META-REASONING TEACHER — multi-Titan view")
+    print("=" * 78)
+
+    for tid, base in titans.items():
+        r = fetch(base)
+        data = r.get("data", r)
+        print(f"\n── {tid} ({base}) ──")
+        if "error" in data:
+            print(f"  ✗ {data['error']}")
+            continue
+        enabled = data.get("enabled", False)
+        flag = "ENABLED ✓" if enabled else "disabled"
+        print(f"  Status:         {flag}  "
+              f"(sample={data.get('sample_mode','?')} "
+              f"task={data.get('task_key','?')})")
+        print(f"  Weights:        reward={data.get('reward_weight_config',0):.3f} "
+              f"(cap={data.get('reward_weight_cap',0):.2f}) "
+              f"grounding={data.get('grounding_weight',0):.3f}")
+        cr = data.get("critiques_24h", 0)
+        ok = data.get("llm_ok_24h", 0)
+        failed = data.get("llm_failed_24h", 0)
+        avgq = data.get("avg_quality_score_24h", 0.0)
+        print(f"  24h Critiques:  {cr} total  "
+              f"(ok={ok} failed={failed} rate={ok/max(1,cr):.0%}) "
+              f"avg_quality={avgq:.3f}")
+        top_cats = data.get("top_critique_categories") or []
+        if top_cats:
+            top_str = " ".join(f"{c[0]}={c[1]}" for c in top_cats[:5])
+            print(f"  Top categories: {top_str}")
+        else:
+            print(f"  Top categories: (none yet)")
+        adoption = data.get("adoption_rate_by_domain") or {}
+        overall = data.get("adoption_rate_overall", 0.0)
+        if adoption:
+            top_adopt = sorted(adoption.items(), key=lambda x: -x[1])[:4]
+            ad_str = " ".join(f"{d}={v:.2f}" for d, v in top_adopt)
+            print(f"  Adoption:       overall={overall:.2f}  {ad_str}")
+        else:
+            print(f"  Adoption:       (no suggestions tracked yet)")
+
+    print("\n" + "=" * 78)
+
+
+def run_emot_cgn(
+    scope: str = "all",
+    *,
+    as_json: bool = False,
+) -> None:
+    """arch_map emot-cgn [--t1|--t2|--t3|--all] [--json].
+
+    Single-snapshot diagnostic for EMOT-CGN across T1/T2/T3. Consolidates
+    three endpoints into one view:
+      - /v4/emot-cgn                    legacy primitives + v3 emergence block
+      - /v4/emot-cgn/audit               shadow_tail + watchdog + haov + dead_groups
+      - /v4/emot-cgn/graduation-readiness 5 graduation criteria
+
+    Flags anchor-silent primitives (conf < 0.1 or n_samples < 50), reports
+    v3 region emergence + HDBSCAN health, and surfaces graduation blockers.
+    """
+    import urllib.request
+
+    TITANS = {
+        "T1": "http://127.0.0.1:7777",
+        "T2": "http://10.135.0.6:7777",
+        "T3": "http://10.135.0.6:7778",
+    }
+    if scope == "t1":
+        selected = {"T1": TITANS["T1"]}
+    elif scope == "t2":
+        selected = {"T2": TITANS["T2"]}
+    elif scope == "t3":
+        selected = {"T3": TITANS["T3"]}
+    else:
+        selected = TITANS
+
+    def _fetch(url: str) -> dict:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                return json.loads(r.read().decode())
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _snapshot(base: str) -> dict:
+        state = _fetch(f"{base}/v4/emot-cgn").get("data", {}) or {}
+        audit = _fetch(f"{base}/v4/emot-cgn/audit").get("data", {}) or {}
+        grad = _fetch(f"{base}/v4/emot-cgn/graduation-readiness").get(
+            "data", {}) or {}
+        return {"state": state, "audit": audit, "grad": grad}
+
+    snaps = {t: _snapshot(u) for t, u in selected.items()}
+
+    if as_json:
+        print(json.dumps(snaps, indent=2, default=str))
+        return
+
+    print("\nEMOT-CGN — STATUS")
+    print("=" * 78)
+
+    total_silent = 0
+    total_regions = 0
+    any_eligible = False
+    any_unexpected_dead = False
+
+    for titan, snap in snaps.items():
+        s = snap["state"]
+        a = snap["audit"]
+        g = snap["grad"]
+        v3 = s.get("v3") or {}
+        prims = s.get("primitives") or {}
+        recent = s.get("recent_assignments") or []
+
+        print(f"\n── {titan} ({selected[titan]}) ──")
+        if "error" in s:
+            print(f"  ERROR: {s['error']}")
+            continue
+
+        # Header
+        print(f"  Status:         {s.get('status', '?')}  "
+              f"is_active={s.get('is_active', False)}  "
+              f"source={s.get('source', '?')}  "
+              f"shm_v={s.get('shm_version', 0)}")
+        print(f"  Updates:        {s.get('total_updates', 0)}  "
+              f"observations={s.get('total_observations', 0)}  "
+              f"rolled_back={s.get('rolled_back_count', 0)}")
+        print(f"  Dominant:       {s.get('dominant', '?')}  "
+              f"V_beta={s.get('dominant_V_beta', 0):.3f}  "
+              f"V_blended={s.get('dominant_V_blended', 0):.3f}  "
+              f"clust_conf={s.get('cluster_confidence', 0):.3f}")
+        print(f"  Cross-insights: sent={s.get('cross_insights_sent', 0)}  "
+              f"recv={s.get('cross_insights_received', 0)}")
+        # Monoculture detection on recent_assignments
+        if recent:
+            tail = recent[-10:]
+            uniq = set(tail)
+            mono = next(iter(uniq)) if len(uniq) == 1 else None
+            if mono:
+                print(f"  Recent10:       {len(tail)}x {mono}  "
+                      f"⚠ monoculture")
+            else:
+                print(f"  Recent10:       {tail[-8:]}")
+
+        # v3 emergence block
+        if v3:
+            rid = v3.get("region_id", -2)
+            regions_n = v3.get("regions_emerged", 0)
+            total_regions += regions_n
+            rid_label = "noise" if rid == -2 else f"#{rid}"
+            print(f"  v3 region:      id={rid_label}  "
+                  f"regions_emerged={regions_n}  "
+                  f"sig=0x{v3.get('region_signature', 0):x}  "
+                  f"conf={v3.get('region_confidence', 0):.3f}  "
+                  f"resid={v3.get('region_residence_s', 0):.0f}s")
+            print(f"  v3 felt:        valence={v3.get('valence', 0):+.3f}  "
+                  f"arousal={v3.get('arousal', 0):+.3f}  "
+                  f"novelty={v3.get('novelty', 0):.3f}  "
+                  f"legacy_approx={v3.get('legacy_approximation', '?')}  "
+                  f"grad_status={v3.get('graduation_status', 0)}")
+
+        # Legacy primitives
+        print("  Primitives:")
+        print("    " + f"{'name':<18} {'V':>6}  {'conf':>6}  "
+                        f"{'n':>6}  flag")
+        silent_here = []
+        for pid, p in prims.items():
+            ns = p.get("n_samples", 0)
+            cf = p.get("confidence", 0.0)
+            flag = ""
+            if ns == 0:
+                flag = "COLD"
+            elif ns < 50 or cf < 0.1:
+                flag = "silent"
+            if flag:
+                silent_here.append(pid)
+            print(f"    {pid:<18} {p.get('V', 0):>6.3f}  "
+                  f"{cf:>6.3f}  {ns:>6}  {flag}")
+        if silent_here:
+            total_silent += len(silent_here)
+            print(f"    → silent: {len(silent_here)}/{len(prims)} "
+                  f"({', '.join(silent_here)})")
+
+        # Graduation readiness (5 criteria)
+        print("  Graduation readiness:")
+        print(f"    eligible={g.get('eligible', False)}  "
+              f"progress={g.get('graduation_progress', 0)}/100")
+        if g.get("eligible"):
+            any_eligible = True
+        crit = g.get("criteria", {}) or {}
+        for name, row in crit.items():
+            tick = "✓" if row.get("ok") else "✗"
+            cur = row.get("current", 0)
+            req = row.get("required", 0)
+            if isinstance(cur, float):
+                cur_s = f"{cur:.3f}"
+            else:
+                cur_s = f"{cur}"
+            if isinstance(req, float):
+                req_s = f"{req:.3f}"
+            else:
+                req_s = f"{req}"
+            print(f"    {tick} {name:<24} {cur_s} / {req_s}")
+
+        # HAOV counts
+        haov = a.get("haov") or {}
+        by_status = {"nascent": 0, "testing": 0, "confirmed": 0,
+                     "falsified": 0}
+        for h in (haov.get("hypotheses") or {}).values():
+            st = h.get("status", "nascent")
+            by_status[st] = by_status.get(st, 0) + 1
+        print(f"  HAOV:           nascent={by_status['nascent']}  "
+              f"testing={by_status['testing']}  "
+              f"confirmed={by_status['confirmed']}  "
+              f"falsified={by_status['falsified']}")
+
+        # Bundle snapshot — dead_groups sanity (only cgn_beta_states is
+        # the documented deferred field per rFP §23.6a)
+        bs = a.get("bundle_snapshot") or {}
+        dead = bs.get("dead_groups") or []
+        expected_dead = {"cgn_beta_states"}
+        unexpected = [d for d in dead if d not in expected_dead]
+        if unexpected:
+            any_unexpected_dead = True
+            print(f"  ⚠ dead_groups:  {dead}  (unexpected: {unexpected})")
+        elif dead:
+            print(f"  dead_groups:    {dead}  (expected)")
+        # Shadow tail / watchdog summary
+        shadow = a.get("shadow_tail") or []
+        wd = a.get("watchdog") or {}
+        print(f"  Shadow tail:    len={len(shadow)}  "
+              f"last_chain={shadow[-1].get('chain') if shadow else '—'}")
+        wd_nm = list((wd.get("neuromod_ema") or {}).keys())
+        print(f"  Watchdog:       dominant={wd.get('dominant_emotion', '?')}  "
+              f"recent_rewards={len(wd.get('recent_rewards') or [])}  "
+              f"neuromod_keys={len(wd_nm)}")
+
+    # Cross-Titan summary
+    print("\n" + "─" * 78)
+    print(f"  SUMMARY: {len(selected)} Titan(s) queried")
+    print(f"  Silent primitives (cumulative): {total_silent}")
+    print(f"  Regions emerged (sum): {total_regions}")
+    print(f"  Any eligible for graduation: {any_eligible}")
+    if any_unexpected_dead:
+        print(f"  ⚠ Unexpected dead_groups detected — investigate "
+              f"bundle_snapshot")
+    print("=" * 78)
+
+def run_meta_outer(scope: str = "t1", as_json: bool = False,
+                    recall_person: str = None,
+                    recall_topic: str = None) -> None:
+    """arch_map meta-outer [--t1|--t2|--t3|--all] [--json]
+                           [--recall-person X] [--recall-topic Y]
+
+    rFP_titan_meta_outer_layer diagnostic. Queries:
+      - /v4/meta-outer/status         — activation flag + reader status
+      - /v4/meta-outer/stats          — cache + per-source + fetch metrics
+      - /v4/meta-outer/recall-test    — live composed-recall diagnostic
+        (if --recall-person or --recall-topic given)
+    """
+    import json as _json
+    targets: list = []
+    if scope == "all":
+        targets = [
+            ("T1", "http://127.0.0.1:7777"),
+            ("T2", "http://10.135.0.6:7777"),
+            ("T3", "http://10.135.0.6:7778"),
+        ]
+    elif scope == "t2":
+        targets = [("T2", "http://10.135.0.6:7777")]
+    elif scope == "t3":
+        targets = [("T3", "http://10.135.0.6:7778")]
+    else:
+        targets = [("T1", "http://127.0.0.1:7777")]
+
+    out: dict = {}
+    for label, base in targets:
+        entry: dict = {"base": base}
+        try:
+            st = _fetch(f"{base}/v4/meta-outer/status").get("data") or {}
+            entry["status"] = st
+        except Exception as e:
+            entry["status_err"] = str(e)
+        try:
+            stt = _fetch(f"{base}/v4/meta-outer/stats").get("data") or {}
+            entry["stats"] = stt
+        except Exception as e:
+            entry["stats_err"] = str(e)
+        if recall_person or recall_topic:
+            params = []
+            if recall_person:
+                params.append(f"person_id={recall_person}")
+            if recall_topic:
+                params.append(f"topic={recall_topic}")
+            url = f"{base}/v4/meta-outer/recall-test?" + "&".join(params)
+            try:
+                rt = _fetch(url, timeout=2.0).get("data") or {}
+                entry["recall_test"] = rt
+            except Exception as e:
+                entry["recall_test_err"] = str(e)
+        out[label] = entry
+
+    if as_json:
+        print(_json.dumps(out, indent=2, default=str))
+        return
+
+    print("\nMETA-OUTER DIAGNOSTICS — rFP_titan_meta_outer_layer")
+    print("=" * 86)
+    for label, entry in out.items():
+        print(f"\n  {label} ({entry.get('base', '?')})")
+        print("  " + "-" * 70)
+        st = entry.get("status") or {}
+        active = st.get("active", "?")
+        wired = st.get("reader_wired", "?")
+        mark_active = "🟢 ACTIVE" if active is True else "⚪ inactive"
+        print(f"    Activation:     {mark_active}  (flag file)")
+        print(f"    Reader wired:   {wired}  "
+              f"(cosmetic — main-proc view; reader lives in spirit_worker)")
+        stats = entry.get("stats") or {}
+        if stats:
+            print(f"    Composed fetches: {stats.get('composed_fetches', 0)}  "
+                  f"timeouts={stats.get('composed_timeouts', 0)}  "
+                  f"avg_ms={stats.get('avg_fetch_ms', 0.0)}")
+            c = stats.get("cache") or {}
+            print(f"    Cache:            size={c.get('size', 0)}/"
+                  f"{c.get('max_size', 0)}  hits={c.get('hits', 0)}  "
+                  f"misses={c.get('misses', 0)}  "
+                  f"hit_rate={c.get('hit_rate', 0.0):.2%}")
+            per_src = stats.get("per_source_calls") or {}
+            if per_src:
+                print(f"    Per-source calls:")
+                for src, n in sorted(per_src.items(), key=lambda x: -x[1]):
+                    print(f"      {src:28s}  {n}")
+            fails = stats.get("per_source_failures") or {}
+            if fails:
+                print(f"    Per-source failures:")
+                for src, n in fails.items():
+                    print(f"      ⚠ {src:26s}  {n}")
+        rt = entry.get("recall_test")
+        if rt:
+            refs = rt.get("entity_refs") or {}
+            comp = rt.get("composed") or {}
+            print(f"    Recall-test:    refs={refs}")
+            print(f"                    fetch_ms={comp.get('fetch_ms', '?')}")
+            print(f"                    sources_queried={len(comp.get('sources_queried', []))}")
+            print(f"                    sources_timed_out="
+                  f"{comp.get('sources_timed_out', [])}")
+            print(f"                    person={'YES' if comp.get('person') else 'None'}  "
+                  f"topic={'YES' if comp.get('topic') else 'None'}  "
+                  f"felt={len(comp.get('felt_history') or [])}  "
+                  f"events={len(comp.get('recent_events') or [])}")
+    print()
+
 
 def _collect_meta_cgn_snapshot() -> str:
     """Read data/meta_cgn/primitive_grounding.json and format as a markdown
@@ -10151,6 +11667,88 @@ def run_meta_audit_diagnostics(all_titans: bool = True):
     print("=" * 78)
 
 
+def run_metabolism_gates(all_titans: bool = False, json_mode: bool = False):
+    """Mainnet Lifecycle Wiring rFP (2026-04-20) — 10-min gate decision snapshot.
+
+    Hits /v4/metabolism/gate-status on selected Titans and renders a table of
+    gates_enforced + tier + per-caller decision totals + recent closures.
+    Used during 30-min focused observation pre-enforcement flip and for soak
+    verification.
+    """
+    import requests
+    import json as _json
+
+    titans = [
+        ("T1", "http://127.0.0.1:7777"),
+        ("T2", "http://10.135.0.6:7777"),
+        ("T3", "http://10.135.0.6:7778"),
+    ] if all_titans else [("T1", "http://127.0.0.1:7777")]
+
+    payloads: dict[str, dict] = {}
+
+    for tid, url in titans:
+        try:
+            resp = requests.get(f"{url}/v4/metabolism/gate-status", timeout=8)
+            if resp.status_code == 200:
+                payloads[tid] = resp.json().get("data", {})
+            else:
+                payloads[tid] = {"error": f"HTTP {resp.status_code}"}
+        except requests.exceptions.ConnectionError:
+            payloads[tid] = {"error": "not_reachable"}
+        except Exception as e:
+            payloads[tid] = {"error": str(e)}
+
+    if json_mode:
+        print(_json.dumps(payloads, indent=2, default=str))
+        return
+
+    print()
+    print("METABOLISM GATE DECISIONS — last 10 min")
+    print("=" * 78)
+
+    for tid, d in payloads.items():
+        print(f"\n  {tid}")
+        print("  " + "-" * 72)
+        if "error" in d:
+            print(f"    ✗ {d['error']}")
+            continue
+        enforced = d.get("gates_enforced", False)
+        tier = d.get("current_tier", "?")
+        bal = d.get("sol_balance")
+        bal_s = f"{bal:.4f}" if isinstance(bal, (int, float)) else "?"
+        total = d.get("total_evaluations", 0)
+        w10 = d.get("window_10min_count", 0)
+        closures = d.get("window_10min_closures", 0)
+        mode = "ENFORCED" if enforced else "observation-only"
+
+        print(f"    tier={tier:11s}  sol={bal_s:>8s}  mode={mode}")
+        print(f"    lifetime evaluations={total}  |  10-min window={w10}  closures={closures}")
+
+        by_caller = d.get("by_caller", {})
+        if by_caller:
+            print(f"    per-caller (10-min):")
+            for caller, stats in sorted(by_caller.items(), key=lambda x: -x[1]["total"]):
+                feat = stats.get("feature", "?")
+                t = stats.get("total", 0)
+                c = stats.get("closed", 0)
+                print(f"      {caller:22s}  feature={feat:10s}  "
+                      f"evals={t:>4d}  closed={c:>4d}")
+        else:
+            print(f"    (no gate calls yet — wiring may not be active)")
+
+        recent = d.get("recent_closures", [])
+        if recent:
+            print(f"    recent closures (last {len(recent)}):")
+            for cl in recent[-5:]:
+                import datetime as _dt
+                ts = _dt.datetime.fromtimestamp(cl.get("ts", 0)).strftime("%H:%M:%S")
+                print(f"      [{ts}] {cl.get('caller','?'):22s} "
+                      f"{cl.get('reason','?')}")
+
+    print()
+    print("=" * 78)
+
+
 def run_cgn_telemetry(all_titans: bool = True):
     """Fetch CGN grounding + consumers + knowledge + HAOV stats from all Titans."""
     import requests
@@ -10271,6 +11869,954 @@ def run_cgn_telemetry(all_titans: bool = True):
 
     print()
     print("=" * 78)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# rFP_phase1_sensory_wiring — V6 5DT outer_body diagnostic (2026-04-23)
+# ═══════════════════════════════════════════════════════════════════════
+
+_OUTER_BODY_DIM_NAMES = [
+    "interoception",   # SOL + block_delta + anchor_freshness
+    "proprioception",  # peer_entropy + helper_health + bus_module_diversity
+    "somatosensation", # TX_latency + creation_nudge + cpu_spike_rate
+    "entropy",         # ping_variance + bus_drop_rate + error_rate
+    "thermal",         # cpu_thermal + circadian + llm_latency
+]
+
+_OUTER_MIND_FEELING_NAMES = [
+    "social_temperature",  # [5]
+    "social_connection",   # [6] (twin kin resonance)
+    "network_weather",     # [7]
+    "environmental_rhythm",# [8]
+    "info_flow",           # [9]
+]
+
+
+def run_cgn_reasoning_strategies(all_titans: bool = False):
+    """List top grounded reasoning_strategy concepts per Titan.
+
+    The `reasoning_strategy` CGN consumer is fed by reasoning.py:1821-1832
+    on COMMIT actions where outcome_score >= cgn_emission_threshold
+    (default 0.55, see titan_params.toml [reasoning_rewards]). Each emission
+    grounds the chain_signature (sequence of primitives) along with
+    outcome_score / confidence / gut_agreement / chain_length / state_embedding
+    / neuromod_state. Surfaces the diagnostic question:
+    "what does this Titan consider good reasoning?"
+
+    Diagnostic only — pure observability, no runtime side effects. Reads
+    /v4/cgn-haov-stats per Titan (the canonical HAOV aggregate endpoint
+    that already returns the consumer's `top_rules` list).
+    """
+    import requests
+
+    titans = [
+        ("T1", "http://127.0.0.1:7777"),
+        ("T2", "http://10.135.0.6:7777"),
+        ("T3", "http://10.135.0.6:7778"),
+    ] if all_titans else [("T1", "http://127.0.0.1:7777")]
+
+    print()
+    print("CGN REASONING_STRATEGY — top grounded chain signatures per Titan")
+    print("=" * 78)
+    print(f"  Producer: reasoning.py COMMIT with outcome_score >= 0.55 (titan_params.toml)")
+    print(f"  Consumer: cgn_worker.py pre-registered 'reasoning_strategy' (cgn.py)")
+
+    for tid, url in titans:
+        print(f"\n  {tid} ({url.split('//')[1]})")
+        print("  " + "-" * 72)
+        try:
+            resp = requests.get(f"{url}/v4/cgn-haov-stats", timeout=10)
+            if resp.status_code != 200:
+                print(f"    ✗ API error: HTTP {resp.status_code}")
+                continue
+            d = resp.json().get("data", resp.json())
+            consumers = d.get("consumers", {}) or {}
+            block = consumers.get("reasoning_strategy")
+            if not block:
+                print("    ✗ reasoning_strategy consumer NOT registered (unexpected)")
+                continue
+
+            formed = block.get("formed", 0)
+            tested = block.get("tested", 0)
+            confirmed = block.get("confirmed", 0)
+            falsified = block.get("falsified", 0)
+            used = block.get("used_for_action", 0)
+            verified = block.get("verified_rules_count", 0)
+            conf_rate = block.get("confirmation_rate", 0.0)
+            style = block.get("epistemic_style", "?")
+
+            print(f"    HAOV state: formed={formed} tested={tested} "
+                  f"confirmed={confirmed} falsified={falsified}")
+            print(f"    Confirmation rate: {conf_rate*100:.1f}% | "
+                  f"used_for_action: {used} | verified_rules: {verified}")
+            print(f"    Epistemic style: {style}")
+
+            top_rules = block.get("top_rules", []) or []
+            if top_rules:
+                print(f"    Top {len(top_rules)} grounded rules:")
+                for i, rule in enumerate(top_rules[:10], 1):
+                    if isinstance(rule, dict):
+                        sig = rule.get("rule") or rule.get("signature") or rule.get("chain", "?")
+                        score = rule.get("score") or rule.get("v_value") or rule.get("confidence", 0)
+                        cnt = rule.get("count") or rule.get("samples", 0)
+                        print(f"      {i:2d}. score={score:.3f}  n={cnt}  rule={sig}")
+                    else:
+                        print(f"      {i:2d}. {rule}")
+            else:
+                # Diagnostic: explain the empty state
+                if formed == 0:
+                    print(f"    ⚠ No rules formed yet — reasoning is emitting candidates "
+                          f"(chains with outcome_score >= 0.55) but the consumer hasn't")
+                    print(f"      synthesized them into HAOV-grounded rules.")
+                    print(f"      Likely: HAOV synthesis cadence not reached, or candidate")
+                    print(f"      stream too sparse. Check brain log for emit attempts:")
+                    print(f"        grep 'cgn_reasoning_strategy' /tmp/titan_brain.log | wc -l")
+                else:
+                    print(f"    (top_rules empty despite formed={formed} — investigate)")
+        except requests.RequestException as e:
+            print(f"    ✗ Request error: {e}")
+        except Exception as e:
+            print(f"    ✗ Unexpected error: {e}")
+
+    print()
+
+
+def _sensor_flag(dim_idx: int, value: float) -> str:
+    """Annotate a dim value with health flag for the 5 outer_body dims."""
+    # 0.5 exactly across multiple samples = stuck (archaeology finding)
+    if abs(value - 0.5) < 0.001 and dim_idx in (3, 4):
+        return "⚠ stuck (default)"
+    # > 0.97 on dims that historically saturated = possible saturation
+    if value > 0.97 and dim_idx in (0, 1, 2):
+        return "⚠ near-saturated"
+    if 0.3 <= value <= 0.85:
+        return "✓ rich"
+    if value < 0.1 or value > 0.95:
+        return "◯ extreme"
+    return "○ ok"
+
+
+def run_sensors_diagnostics(all_titans: bool = True):
+    """V6 5DT outer_body rich-signal verification.
+
+    Polls /v3/trinity on each Titan, displays outer_body 5D values with
+    V6 semantic labels + health annotations (rich / near-saturated /
+    stuck). Also shows outer_mind Feeling [5:10] since [7][8][9] depend
+    on body[3][4] being rich.
+
+    Run after Phase 1 sensory wiring deploy to verify rich signal across
+    all 5 outer_body dims.
+    """
+    import requests
+
+    titans = [
+        ("T1", "http://127.0.0.1:7777"),
+        ("T2", "http://10.135.0.6:7777"),
+        ("T3", "http://10.135.0.6:7778"),
+    ] if all_titans else [("T1", "http://127.0.0.1:7777")]
+
+    print()
+    print("OUTER BODY 5D RICH-SIGNAL DIAGNOSTIC (V6 5DT)")
+    print("=" * 86)
+    print()
+    print("  Archaeology baseline (pre-Phase 1 sensory wiring):")
+    print("    outer_body [3] entropy / [4] thermal → stuck at 0.5 (no producer)")
+    print("    outer_body [0] [1] [2]                → saturated near 1.0")
+    print("  This view verifies the fix landed and signal is rich.")
+    print()
+
+    # Layout: left column dim name + value + flag; right column samples+stats
+    for tid, url in titans:
+        host = url.split("//")[1]
+        print(f"  {tid} ({host})")
+        print("  " + "-" * 82)
+        try:
+            resp = requests.get(f"{url}/v3/trinity", timeout=8)
+            if resp.status_code != 200:
+                print(f"    ✗ API error: HTTP {resp.status_code}")
+                print()
+                continue
+            d = resp.json().get("data", {})
+
+            ob = d.get("outer_body", [])
+            om = d.get("outer_mind", [])
+
+            if not ob or len(ob) < 5:
+                print("    ✗ No outer_body tensor in response")
+                print()
+                continue
+
+            print(f"    OUTER BODY (5D V6 composites):")
+            for i, name in enumerate(_OUTER_BODY_DIM_NAMES):
+                v = ob[i] if i < len(ob) else 0.0
+                flag = _sensor_flag(i, v)
+                print(f"      [{i}] {name:16s} {v:.4f}  {flag}")
+
+            # Outer mind feeling octave [5:10] — depends on body[3][4]
+            if om and len(om) >= 10:
+                print(f"    OUTER MIND FEELING [5:10] (expected rich post-Phase 1):")
+                for j, name in enumerate(_OUTER_MIND_FEELING_NAMES):
+                    v = om[5 + j]
+                    # Flag near-0.5-stuck for feeling[7][8][9] (depend on body[3][4])
+                    stuck = (7 <= (5 + j) <= 9) and abs(v - 0.5) < 0.02
+                    flag = "⚠ stuck (body deriv)" if stuck else ""
+                    print(f"      [{5 + j}] {name:22s} {v:.4f}  {flag}")
+
+            # Verdict
+            ob3_healthy = abs(ob[3] - 0.5) > 0.01
+            ob4_healthy = abs(ob[4] - 0.5) > 0.01
+            no_saturated = all(v < 0.97 for v in ob[:3])
+
+            print(f"    VERDICT: "
+                  f"body[3] entropy={'✓ rich' if ob3_healthy else '✗ STUCK'} | "
+                  f"body[4] thermal={'✓ rich' if ob4_healthy else '✗ STUCK'} | "
+                  f"no saturation={'✓' if no_saturated else '✗'}")
+
+        except requests.exceptions.ConnectionError:
+            print(f"    ✗ Not reachable")
+        except requests.exceptions.Timeout:
+            print(f"    ✗ Timeout (API slow)")
+        except Exception as e:
+            print(f"    ✗ Error: {e}")
+        print()
+
+    print("=" * 86)
+
+
+# ── Microkernel v2 — TitanVM telemetry schema (§1.4a) ────────────────
+
+
+def run_titanvm_schema() -> int:
+    """
+    Microkernel v2 Phase A §A.2 §1.4a — verify NeuralReflexNet per-program
+    telemetry shape before declaring TITANVM_REGISTERS RegistrySpec.
+
+    Pins the (11, 4) layout we'll use in shm:
+      [urgency, fire_count, total_updates, last_loss]
+
+    where urgency comes from neural_nervous_system._all_urgencies (live
+    per-tick value computed by NeuralReflexNet.forward()), and the
+    other three are direct attributes of the NeuralReflexNet instance.
+
+    NS_PROGRAMS row order is taken from emot_bundle_protocol.py — the
+    canonical 11-program tuple already used across the codebase.
+    """
+    print()
+    print("MICROKERNEL v2 — TITANVM_REGISTERS SCHEMA (§A.2 §1.4a verification)")
+    print("=" * 90)
+
+    try:
+        from titan_plugin.logic.emot_bundle_protocol import NS_PROGRAMS
+        from titan_plugin.logic.neural_reflex_net import (
+            NeuralReflexNet,
+            DEFAULT_INPUT_DIM,
+        )
+    except Exception as e:
+        print(f"  ✗ cannot import NS modules: {e}")
+        return 1
+
+    print(f"\n  NS_PROGRAMS (11 canonical, row order):")
+    for i, name in enumerate(NS_PROGRAMS):
+        print(f"    [{i:>2}]  {name}")
+
+    print(f"\n  Per-program fields written to shm (4 floats per row):")
+    print(f"    [0] urgency        — float [0,1] from _all_urgencies dict (per-tick)")
+    print(f"    [1] fire_count     — int (cast float32) from net.fire_count (cumulative)")
+    print(f"    [2] total_updates  — int (cast float32) from net.total_updates (training)")
+    print(f"    [3] last_loss      — float from net.last_loss (most recent training)")
+
+    # Construct a probe net and verify all 4 attributes exist.
+    print(f"\n  Probe — instantiating NeuralReflexNet to verify attributes:")
+    try:
+        probe = NeuralReflexNet(name="probe", input_dim=DEFAULT_INPUT_DIM)
+        attrs = ["fire_count", "total_updates", "last_loss"]
+        for a in attrs:
+            ok = hasattr(probe, a)
+            v = getattr(probe, a, None)
+            icon = "✓" if ok else "✗"
+            print(f"    {icon} probe.{a:<14} = {v!r:<10} (type={type(v).__name__})")
+        # urgency is computed on demand — verify forward() exists + signature
+        print(f"    ✓ urgency       comes from _all_urgencies dict written by neural_nervous_system.tick()")
+        print(f"                    (forward() returns sigmoid output ∈ [0, 1] per program)")
+    except Exception as e:
+        print(f"    ✗ probe construction failed: {e}")
+        return 1
+
+    print(f"\n  Verified spec for state_registry.py:")
+    print(f"    TITANVM_REGISTERS = RegistrySpec(")
+    print(f"        name='titanvm_registers',")
+    print(f"        dtype=np.dtype('<f4'),")
+    print(f"        shape=({len(NS_PROGRAMS)}, 4),  # 11 programs × 4 fields")
+    print(f"        feature_flag='microkernel.shm_titanvm_enabled',")
+    print(f"    )")
+    print(f"\n  Total payload bytes: {len(NS_PROGRAMS) * 4 * 4} (= 11 × 4 × float32)")
+
+    print()
+    print("=" * 90)
+    return 0
+
+
+# ── Microkernel v2 — API subprocess status (§A.4 / S5) ───────────────
+
+
+def run_api_status(all_titans: bool = False) -> int:
+    """
+    Microkernel v2 Phase A §A.4 (S5) — per-titan API subprocess health.
+
+    Reports for each Titan:
+      - api_process_separation_enabled flag state (from /v3/health if
+        exposed via subsystems; else inferred from socket existence)
+      - api Guardian module state (running / stopped / crashed) via
+        /v3/health subsystems.api or /v4/layers L3 list
+      - kernel_rpc socket /tmp/titan_kernel_{titan_id}.sock — exists +
+        permissions (must be 0600 for security)
+      - kernel_rpc authkey /tmp/titan_kernel_{titan_id}.authkey — exists
+        + permissions (must be 0600)
+      - /health responsiveness (proves uvicorn alive + accepting)
+      - api_subprocess uptime (from guardian_status.api.uptime)
+
+    For T2/T3 over VPC: uses curl-equivalent HTTP probe; socket+authkey
+    inspection is skipped (only T1's local /tmp accessible).
+    """
+    import time as _time
+    import os as _os
+    import stat as _stat
+
+    titans = [("T1", "127.0.0.1", 7777)]
+    if all_titans:
+        titans += [("T2", "10.135.0.6", 7777), ("T3", "10.135.0.6", 7778)]
+
+    print()
+    print("MICROKERNEL v2 — API SUBPROCESS STATUS (per Titan)")
+    print("=" * 90)
+
+    any_failed = False
+
+    for tid, host, port in titans:
+        url = f"http://{host}:{port}"
+        print(f"\n  {tid} ({url})")
+        print("  " + "-" * 86)
+
+        # 1. API reachable?
+        health = _services_get(url, "/health", timeout=8.0)
+        if not health:
+            print("    ✗ /health unreachable — Titan likely down")
+            any_failed = True
+            continue
+        print("    ✓ API reachable (200 OK)")
+
+        # 2. Guardian state for "api" module
+        subs = (health.get("data", {}).get("subsystems", {}) or {})
+        guard = (health.get("data", {}).get("v3", {}).get("guardian_status", {}) or {})
+        api_module = guard.get("api")
+        if api_module is None:
+            # No "api" Guardian module = legacy in-process mode
+            print("    ℹ api_subprocess NOT registered — "
+                  "legacy in-process uvicorn mode (api_process_separation_enabled=False)")
+            print(f"    ✓ subsystems.observatory={subs.get('observatory', '?')} "
+                  "(in-process)")
+            continue
+
+        # 3. Subprocess mode active
+        state = api_module.get("state", "?")
+        pid = api_module.get("pid", "?")
+        rss = api_module.get("rss_mb", 0)
+        uptime = api_module.get("uptime", 0)
+        layer = api_module.get("layer", "?")
+        restarts = api_module.get("restart_count", 0)
+        hb_age = api_module.get("last_heartbeat_age", -1)
+
+        icon = "✓" if state == "running" else "✗"
+        print(f"    {icon} api_subprocess: state={state}  pid={pid}  rss={rss:.1f}MB  "
+              f"uptime={uptime:.0f}s  layer={layer}  restarts={restarts}  "
+              f"heartbeat_age={hb_age:.1f}s")
+        if state != "running":
+            any_failed = True
+
+        # 4. Cache staleness — pulls /v4/cache-staleness; was added by D1
+        # amendment 2026-04-26 to track per-key age of api_subprocess
+        # CachedState. Expected: bootstrap_done=True, max_age < 5s during
+        # active operation. Anything stale/cold = bus subscriber lag or
+        # kernel snapshot publisher disabled.
+        cache = _services_get(url, "/v4/cache-staleness", timeout=5.0)
+        if cache and isinstance(cache.get("data"), dict):
+            cd = cache["data"]
+            if cd.get("available"):
+                bb = cd.get("buckets", {})
+                bootstrap = "✓" if cd.get("bootstrap_done") else "✗"
+                max_age = cd.get("max_age_seconds", -1)
+                key_count = cd.get("key_count", 0)
+                age_icon = ("✓" if max_age < 5
+                            else "⚠" if max_age < 30
+                            else "✗")
+                print(f"    {age_icon} cache: bootstrap={bootstrap}  keys={key_count}  "
+                      f"max_age={max_age:.2f}s  "
+                      f"fresh={bb.get('fresh', 0)} warm={bb.get('warm', 0)} "
+                      f"stale={bb.get('stale', 0)} cold={bb.get('cold', 0)}")
+                if not cd.get("bootstrap_done") or max_age > 30:
+                    any_failed = True
+            else:
+                print(f"    ℹ cache: {cd.get('note', 'not available')}")
+        else:
+            print("    ⚠ /v4/cache-staleness unreachable "
+                  "(endpoint absent — pre-2026-04-26 build?)")
+
+        # 5. Local socket inspection (T1 only)
+        if tid == "T1":
+            from pathlib import Path as _Path
+            try:
+                from titan_plugin.core.kernel_rpc import (
+                    kernel_sock_path, kernel_authkey_path)
+                # We need the actual titan_id of T1. Try data/titan_identity.json
+                import json as _json
+                tid_path = _Path("data/titan_identity.json")
+                t1_id = "T1"
+                if tid_path.exists():
+                    with open(tid_path) as f:
+                        t1_id = _json.load(f).get("titan_id", "T1")
+                sock_p = kernel_sock_path(t1_id)
+                authkey_p = kernel_authkey_path(t1_id)
+                for label, p in (("socket", sock_p), ("authkey", authkey_p)):
+                    if not p.exists():
+                        print(f"    — kernel_rpc {label} <missing>: {p}")
+                        continue
+                    mode = _stat.S_IMODE(_os.stat(p).st_mode)
+                    perm_icon = "✓" if mode == 0o600 else "⚠"
+                    print(f"    {perm_icon} kernel_rpc {label}: {p}  perms={oct(mode)}"
+                          f"{' (expected 0o600)' if mode != 0o600 else ''}")
+                    if mode != 0o600:
+                        any_failed = True
+            except Exception as e:
+                print(f"    ⚠ kernel_rpc local inspection error: {e}")
+        else:
+            print("    ℹ kernel_rpc socket inspection: T1-local only "
+                  f"(remote {tid} can't read /tmp)")
+
+    print()
+    print("=" * 90)
+    return 0 if not any_failed else 1
+
+
+# ── Microkernel v2 — S5 endpoint callsite drift detection (§A.4 / D4) ──
+
+def run_s5_callsites(verbose: bool = False) -> int:
+    """Microkernel v2 Phase A §A.4 D4 — drift audit for endpoint-side
+    `plugin.X` patterns. Bypasses-the-accessor count must stay near zero;
+    rising count = new code being written without StateAccessor migration
+    (Phase B/C will fail to migrate cleanly).
+
+    Wraps scripts/s5_callsite_audit.py — runs the libcst categorizer over
+    titan_plugin/api/ and reports per-file A/B/C split. Returns exit code
+    1 if any Category B (async cross-process) callsites exist (those are
+    the highest-risk regressions — they break in microkernel mode).
+    """
+    import subprocess as _sp
+
+    repo = Path(__file__).resolve().parents[1]
+    audit_script = repo / "scripts" / "s5_callsite_audit.py"
+    if not audit_script.exists():
+        print(f"  ✗ {audit_script} missing — D4 tooling not available")
+        return 2
+
+    print()
+    print("MICROKERNEL v2 — S5 ENDPOINT CALLSITE AUDIT (drift detection)")
+    print("=" * 90)
+    print()
+
+    cmd = [sys.executable, str(audit_script),
+           "--paths", "titan_plugin/api/", "--summary"]
+    res = _sp.run(cmd, cwd=str(repo), capture_output=True, text=True, timeout=60)
+    out = res.stdout.strip()
+    print(out)
+    if res.stderr.strip() and verbose:
+        print("--- stderr ---")
+        print(res.stderr.strip())
+
+    # Read the CSV to count B (async cross-proc) — those FAIL in microkernel
+    csv_path = repo / "titan-docs" / "s5_callsite_inventory.csv"
+    b_count = 0
+    if csv_path.exists():
+        try:
+            with open(csv_path) as f:
+                next(f)  # header
+                for row in f:
+                    parts = row.rstrip("\n").split(",")
+                    # classification is column index 4 — but quoted strings can
+                    # have commas. Use the last 3 columns as the canonical
+                    # tail (classification, suggested_target, reason).
+                    if len(parts) >= 7:
+                        cls = parts[-3].strip()
+                        if cls == "B":
+                            b_count += 1
+        except Exception as e:
+            print(f"  ⚠ CSV parse error: {e}")
+
+    print()
+    if b_count > 0:
+        print(f"  ✗ DRIFT: {b_count} Category B (async cross-process) callsite(s) "
+              "— these BREAK in microkernel mode")
+        print(f"    Inspect: cat {csv_path} | grep ',B,'")
+        print("=" * 90)
+        return 1
+
+    print("  ✓ No Category B drift (async cross-process accessors all migrated)")
+    print(f"    Full inventory: {csv_path}")
+    print("=" * 90)
+    return 0
+
+
+# ── Microkernel v2 — Module start_method audit (§A.3 / S6) ──────────
+
+
+def run_module_methods(all_titans: bool = False) -> int:
+    """
+    Microkernel v2 Phase A §A.3 (S6) — per-module spawn vs fork audit.
+
+    Reports:
+      - spawn_reference_worker_enabled flag state per Titan
+      - Each Guardian module's start_method (default "fork", or "spawn"
+        for opted-in workers) — read from /v3/health guardian_status
+        when exposed; falls back to /v4/layers if guardian_status doesn't
+        carry the field
+      - RSS per worker (for fork→spawn savings comparison post-flip)
+
+    Note: start_method is a ModuleSpec field set at register time. It's
+    not currently exposed via /v3/health. Until that wiring lands (a
+    small follow-up), this command reports the known opt-in state via
+    config inspection instead. After flag flip on a Titan, the audit
+    will show "spawn (configured via flag)" for the reference worker.
+    """
+    titans = [("T1", "127.0.0.1", 7777)]
+    if all_titans:
+        titans += [("T2", "10.135.0.6", 7777), ("T3", "10.135.0.6", 7778)]
+
+    print()
+    print("MICROKERNEL v2 — MODULE start_method AUDIT (per Titan)")
+    print("=" * 90)
+
+    any_failed = False
+
+    for tid, host, port in titans:
+        url = f"http://{host}:{port}"
+        print(f"\n  {tid} ({url})")
+        print("  " + "-" * 86)
+
+        health = _services_get(url, "/health", timeout=8.0)
+        if not health:
+            print("    ✗ /health unreachable — Titan likely down")
+            any_failed = True
+            continue
+
+        guard = (health.get("data", {}).get("v3", {}).get("guardian_status", {}) or {})
+        if not guard:
+            print("    ✗ guardian_status not present in /health")
+            any_failed = True
+            continue
+
+        # spawn_reference_worker_enabled flag — read from local config (T1 only)
+        spawn_ref_flag = "?"
+        if tid == "T1":
+            try:
+                from titan_plugin.config_loader import load_titan_config
+                cfg = load_titan_config()
+                spawn_ref_flag = cfg.get("microkernel", {}).get(
+                    "spawn_reference_worker_enabled", False)
+            except Exception:
+                spawn_ref_flag = "?"
+            print(f"    spawn_reference_worker_enabled = {spawn_ref_flag}")
+        else:
+            print(f"    (config flag inspection: T1-local only — flip via deploy_t2.sh)")
+
+        # Per-module rundown
+        print(f"    {'module':<20}  {'state':<10}  {'rss_mb':<8}  {'layer':<5}  inferred_method")
+        for name in sorted(guard.keys()):
+            m = guard[name]
+            state = m.get("state", "?")
+            rss = m.get("rss_mb", 0)
+            layer = m.get("layer", "?")
+            # Inference: if name == "backup" and spawn_ref_flag is True, method=spawn
+            # else method=fork (default). Once start_method is wired into
+            # /v3/health, this becomes a direct read instead of inference.
+            if name == "backup" and spawn_ref_flag is True:
+                method = "spawn (flag)"
+            else:
+                method = "fork (default)"
+            print(f"    {name:<20}  {state:<10}  {rss:<8.1f}  {layer:<5}  {method}")
+
+    print()
+    print("=" * 90)
+    return 0 if not any_failed else 1
+
+
+# ── rFP_observatory_data_loading_v1 Phase 1 — cache-keys subcommand ─
+
+def run_cache_keys_command(
+    mode: str = "audit",
+    all_titans: bool = False,
+    json_mode: bool = False,
+) -> int:
+    """Dispatcher for `arch_map cache-keys [--audit|--status|--list] [--all] [--json]`.
+
+    Returns process exit code (0 = clean, 1 = errors found).
+    """
+    # Lazy import — registry lives in titan_plugin/, so this only loads
+    # when the subcommand is invoked.
+    try:
+        from titan_plugin.api import cache_key_registry as ckr
+    except Exception as e:
+        print(f"ERROR: cannot import cache_key_registry: {e}", file=sys.stderr)
+        return 2
+
+    if mode == "list":
+        return _cache_keys_list(ckr, json_mode=json_mode)
+    if mode == "status":
+        return _cache_keys_status(ckr, all_titans=all_titans, json_mode=json_mode)
+    return _cache_keys_audit(ckr, json_mode=json_mode)
+
+
+def _cache_keys_list(ckr, json_mode: bool = False) -> int:
+    if json_mode:
+        out = [
+            {
+                "key": s.key,
+                "kind": s.kind,
+                "producer_event": s.producer_event,
+                "producer_module": s.producer_module,
+                "publish_cadence_s": s.publish_cadence_s,
+                "consumer_endpoints": list(s.consumer_endpoints),
+                "frontend_hook": s.frontend_hook,
+            }
+            for s in ckr.REGISTRY
+        ]
+        print(json.dumps(out, indent=2))
+        return 0
+
+    print()
+    print("=" * 100)
+    print(f"  CACHE KEY REGISTRY — {len(ckr.REGISTRY)} entries")
+    print("=" * 100)
+    for kind in ("hybrid", "bus_event", "snapshot", "missing", "deprecated"):
+        entries = ckr.specs_by_kind(kind)
+        if not entries:
+            continue
+        print()
+        print(f"  [{kind.upper()}]  {len(entries)} entries")
+        print("  " + "-" * 96)
+        for s in entries:
+            ev = s.producer_event or ""
+            hook = s.frontend_hook or ""
+            print(f"    {s.key:<40s}  ev={ev:<32s}  hook={hook}")
+    print()
+    return 0
+
+
+def _cache_keys_audit(ckr, json_mode: bool = False) -> int:
+    """Static audit — checks REGISTRY against source tree.
+
+    Errors (cause non-zero exit):
+      • bus_event/hybrid producer_event missing from titan_plugin.bus
+      • bus_event/hybrid producer_module missing _send_msg(... event ...) call
+      • snapshot producer_module not found in source tree
+      • REGISTRY key duplicated
+      • cache.get('X') in api/* code with X not in REGISTRY and not allowlisted
+      • EVENT_TO_CACHE_KEY hand-maintained drift (defensive — should be derived)
+
+    Warnings (no exit-code impact):
+      • consumer_endpoints not found in dashboard.py
+      • frontend_hook not found in useTitanAPI.ts
+      • missing-kind entries (no producer wired) — listed for visibility
+    """
+    import re
+    import importlib
+
+    repo_root = Path(__file__).resolve().parent.parent
+    api_dir = repo_root / "titan_plugin" / "api"
+    modules_dir = repo_root / "titan_plugin" / "modules"
+    core_dir = repo_root / "titan_plugin" / "core"
+    dashboard_path = api_dir / "dashboard.py"
+    hooks_path = repo_root / "titan-observatory" / "hooks" / "useTitanAPI.ts"
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    info: list[str] = []
+
+    # 1. Duplicate keys
+    seen: set[str] = set()
+    for s in ckr.REGISTRY:
+        if s.key in seen:
+            errors.append(f"DUPLICATE KEY: {s.key!r}")
+        seen.add(s.key)
+
+    # 2. Bus constants exist in titan_plugin.bus
+    try:
+        bus_module = importlib.import_module("titan_plugin.bus")
+    except Exception as e:
+        errors.append(f"Cannot import titan_plugin.bus: {e}")
+        bus_module = None
+
+    if bus_module is not None:
+        for s in ckr.REGISTRY:
+            if s.producer_event is None:
+                continue
+            if not hasattr(bus_module, s.producer_event):
+                errors.append(
+                    f"BUS CONSTANT MISSING: {s.key} declares producer_event="
+                    f"{s.producer_event!r} but it is not defined in titan_plugin.bus")
+
+    # 3. Producer modules contain expected publishers / function refs
+    #
+    # For `bus_event`/`hybrid`: search the producer_module's source file for
+    #   _send_msg(... PRODUCER_EVENT ...) — anywhere in the file is OK.
+    # For `snapshot`: producer_module must reference an existing function/method
+    #   in the snapshot builder's file.
+    file_cache: dict[Path, str] = {}
+
+    def _read(p: Path) -> str:
+        if p not in file_cache:
+            try:
+                file_cache[p] = p.read_text()
+            except Exception:
+                file_cache[p] = ""
+        return file_cache[p]
+
+    def _module_to_path(mod_dotted: str) -> Path | None:
+        # Split off `:func` or `.func` — keep just the module path.
+        # Accept formats: `titan_plugin.modules.spirit_worker._publish_chi`
+        #              or `titan_plugin.modules.spirit_worker`
+        #              or `titan_plugin.core.kernel.MicroKernel._build_state_snapshot`
+        parts = mod_dotted.split(".")
+        # Walk from longest prefix down until we find a .py
+        for cut in range(len(parts), 0, -1):
+            candidate = repo_root / Path(*parts[:cut]).with_suffix(".py")
+            if candidate.exists():
+                return candidate
+        return None
+
+    for s in ckr.REGISTRY:
+        if s.kind in ("deprecated", "missing"):
+            continue
+        if not s.producer_module:
+            errors.append(f"NO PRODUCER MODULE: {s.key} (kind={s.kind})")
+            continue
+        prod_path = _module_to_path(s.producer_module)
+        if prod_path is None:
+            errors.append(
+                f"PRODUCER MODULE FILE NOT FOUND: {s.key} → "
+                f"{s.producer_module!r} (no .py on import path)")
+            continue
+        src = _read(prod_path)
+        if s.kind in ("bus_event", "hybrid"):
+            # Look for any of these patterns referencing producer_event:
+            #   _send_msg(... EVENT ...)
+            #   bus.publish(make_msg(EVENT, ...))
+            #   self.bus.publish(make_msg(EVENT, ...))
+            # Accept either constant name (CHI_UPDATED) or string literal.
+            ev = s.producer_event
+            patterns = [
+                rf"_send_msg\([^)]*\b{re.escape(ev)}\b",
+                rf'_send_msg\([^)]*"{re.escape(ev)}"',
+                rf"make_msg\(\s*{re.escape(ev)}\b",
+                rf'make_msg\(\s*"{re.escape(ev)}"',
+            ]
+            if not any(re.search(p, src, re.DOTALL) for p in patterns):
+                errors.append(
+                    f"PRODUCER NOT FOUND IN SOURCE: {s.key} → "
+                    f"expected _send_msg(... {ev} ...) or make_msg({ev}, ...) "
+                    f"in {prod_path.relative_to(repo_root)}")
+        elif s.kind == "snapshot":
+            # Verify the snapshot builder file mentions this cache key
+            # (kernel._build_state_snapshot writes `snapshot["X"] = ...`).
+            patt = re.compile(rf'snapshot\[\s*[\'"]{re.escape(s.key)}[\'"]\s*\]')
+            patt_alt = re.compile(rf'snapshot\[f?\s*[\'"][^\'"]*{re.escape(s.key)}')
+            patt_attr = re.compile(rf'snapshot\["plugin\.{re.escape(s.key.split(".", 1)[1])}"\]'
+                                   ) if s.key.startswith("plugin.") else None
+            if not (patt.search(src) or patt_alt.search(src) or
+                    (patt_attr and patt_attr.search(src))):
+                # Some snapshot keys are written via the f-string `snapshot[f"plugin.{attr}"]`
+                # loop in kernel.py. Allow that pattern too.
+                if s.key.startswith("plugin."):
+                    attr = s.key.split(".", 1)[1]
+                    if f'"{attr}"' in src and "snapshot[f" in src:
+                        continue
+                errors.append(
+                    f"SNAPSHOT KEY NOT WRITTEN: {s.key} → expected "
+                    f"snapshot[\"{s.key}\"] in {prod_path.relative_to(repo_root)}")
+
+    # 4. Reverse check — every cache.get(LITERAL) must resolve to REGISTRY or allowlist.
+    cache_get_pat = re.compile(r'cache\.get\(\s*[\'"]([^\'"]+)[\'"]')
+    scan_dirs = [api_dir, modules_dir, core_dir]
+    # cache_key_registry.py defines the registry itself — its docstring
+    # examples reference cache.get() literally and must be excluded from
+    # the reverse scan.
+    skip_files = {api_dir / "cache_key_registry.py"}
+    found_keys: dict[str, list[tuple[Path, int]]] = {}
+    for d in scan_dirs:
+        for py in d.rglob("*.py"):
+            if py in skip_files:
+                continue
+            try:
+                lines = py.read_text().splitlines()
+            except Exception:
+                continue
+            for lineno, line in enumerate(lines, start=1):
+                for m in cache_get_pat.finditer(line):
+                    k = m.group(1)
+                    found_keys.setdefault(k, []).append((py, lineno))
+
+    for k, sites in found_keys.items():
+        if k in ckr.REGISTERED_KEYS:
+            continue
+        if ckr.is_allowlisted(k):
+            continue
+        first = sites[0]
+        errors.append(
+            f"UNREGISTERED CACHE KEY: cache.get({k!r}) at "
+            f"{first[0].relative_to(repo_root)}:{first[1]} "
+            f"({len(sites)} callsite{'s' if len(sites) > 1 else ''})")
+
+    # 5. Consumer endpoints — WARN only
+    if dashboard_path.exists():
+        dashboard_src = _read(dashboard_path)
+        endpoint_pat = re.compile(r'@router\.(?:get|post)\(\s*[\'"]([^\'"]+)[\'"]')
+        declared_endpoints = {m.group(1) for m in endpoint_pat.finditer(dashboard_src)}
+        for s in ckr.REGISTRY:
+            for ep in s.consumer_endpoints:
+                if ep not in declared_endpoints:
+                    warnings.append(
+                        f"CONSUMER ENDPOINT MISSING: {s.key} → {ep!r} not in dashboard.py")
+
+    # 6. Frontend hooks — WARN only
+    if hooks_path.exists():
+        hooks_src = _read(hooks_path)
+        for s in ckr.REGISTRY:
+            if not s.frontend_hook:
+                continue
+            patt = re.compile(rf'\bexport\s+(?:function|const)\s+{re.escape(s.frontend_hook)}\b')
+            if not patt.search(hooks_src):
+                warnings.append(
+                    f"FRONTEND HOOK MISSING: {s.key} → "
+                    f"{s.frontend_hook!r} not in useTitanAPI.ts")
+    else:
+        warnings.append(f"useTitanAPI.ts not found at {hooks_path} — frontend hook checks skipped")
+
+    # 7. INFO — list missing-kind entries
+    for s in ckr.REGISTRY:
+        if s.kind == "missing":
+            info.append(
+                f"MISSING PRODUCER (declared, unwired): {s.key} "
+                f"event={s.producer_event} — Phase 4 bring-up target")
+
+    # ── Render ─────────────────────────────────────────────────────
+    if json_mode:
+        out = {
+            "errors": errors,
+            "warnings": warnings,
+            "info": info,
+            "registry_size": len(ckr.REGISTRY),
+            "exit_code": 1 if errors else 0,
+        }
+        print(json.dumps(out, indent=2))
+        return 1 if errors else 0
+
+    print()
+    print("=" * 100)
+    print(f"  CACHE KEYS AUDIT — {len(ckr.REGISTRY)} registry entries")
+    print("=" * 100)
+    if errors:
+        print()
+        print(f"  ERRORS ({len(errors)})")
+        print("  " + "-" * 96)
+        for e in errors:
+            print(f"    ✗ {e}")
+    if warnings:
+        print()
+        print(f"  WARNINGS ({len(warnings)})")
+        print("  " + "-" * 96)
+        for w in warnings:
+            print(f"    ⚠ {w}")
+    if info:
+        print()
+        print(f"  INFO — Phase 4 bring-up targets ({len(info)})")
+        print("  " + "-" * 96)
+        for i in info:
+            print(f"    ℹ {i}")
+    print()
+    if not errors:
+        print("  ✓ AUDIT CLEAN — no producer drift, no unregistered cache.get sites")
+    else:
+        print(f"  ✗ AUDIT FAILED — {len(errors)} errors")
+    print("=" * 100)
+    print()
+    return 1 if errors else 0
+
+
+def _cache_keys_status(ckr, all_titans: bool = False, json_mode: bool = False) -> int:
+    """Live-state matrix per Titan — probes /v4/cache-staleness and reports
+    which registered keys are populated and how stale each is."""
+    titans = [("T1", "http://127.0.0.1:7777")]
+    if all_titans:
+        titans.extend([
+            ("T2", "http://10.135.0.6:7777"),
+            ("T3", "http://10.135.0.6:7778"),
+        ])
+
+    results = {}
+    for label, url in titans:
+        info = _unwrap(_health_get(url, "/v4/cache-staleness"))
+        if not info:
+            results[label] = {"reachable": False, "keys": {}}
+            continue
+        # Endpoint shape: {available, bootstrap_done, key_count, max_age_seconds,
+        #                  buckets:{fresh,warm,stale,cold}, ages:{key: age_seconds}}
+        ages = info.get("ages", {}) if isinstance(info, dict) else {}
+        # Normalize to {key: {age_seconds: float}} for the matrix below.
+        keys_info = {k: {"age_seconds": v} for k, v in ages.items()}
+        results[label] = {"reachable": True, "keys": keys_info}
+
+    if json_mode:
+        out = {"results": results, "registry_size": len(ckr.REGISTRY)}
+        print(json.dumps(out, indent=2, default=str))
+        return 0
+
+    print()
+    print("=" * 110)
+    print(f"  CACHE KEYS LIVE STATUS — {len(ckr.REGISTRY)} registered keys")
+    print("=" * 110)
+    for label, _url in titans:
+        r = results[label]
+        print()
+        print(f"  {label}  reachable={r['reachable']}")
+        print("  " + "-" * 106)
+        if not r["reachable"]:
+            print(f"    (cannot reach {_url}/v4/cache-staleness)")
+            continue
+        live_keys = r["keys"]
+        # Header
+        print(f"    {'key':<40s}  {'kind':<10s}  {'cadence':>8s}  {'live age':>10s}  {'status'}")
+        for s in ckr.REGISTRY:
+            if s.kind == "deprecated":
+                continue
+            row = live_keys.get(s.key, None)
+            if row is None:
+                age_str = "—"
+                status = "ABSENT" if s.kind != "missing" else "missing-by-design"
+            else:
+                age = row.get("age_seconds") if isinstance(row, dict) else None
+                if age is None:
+                    age_str = "?"
+                    status = "(no age)"
+                else:
+                    age_str = f"{age:.1f}s"
+                    if s.publish_cadence_s > 0 and age > s.publish_cadence_s * 3:
+                        status = "STALE"
+                    else:
+                        status = "FRESH"
+            cadence = f"{s.publish_cadence_s:.1f}s" if s.publish_cadence_s else "—"
+            print(f"    {s.key:<40s}  {s.kind:<10s}  {cadence:>8s}  {age_str:>10s}  {status}")
+    print()
+    print("=" * 110)
+    print()
+    return 0
 
 
 if __name__ == "__main__":

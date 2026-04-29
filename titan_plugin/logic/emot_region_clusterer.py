@@ -51,7 +51,9 @@ from .emot_bundle_protocol import (
     REGION_NOISE, REGION_UNCLUSTERED,
     FELT_TENSOR_DIM, TRAJECTORY_DIM, SPACE_TOPOLOGY_DIM, NEUROMOD_DIM,
     HORMONE_DIM, NS_URGENCY_DIM, CGN_BETA_DIM, MSL_ACT_DIM, PI_PHASE_DIM,
+    GRAD_SHADOW, GRAD_OBSERVING, GRAD_GRADUATED,
 )
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger("titan.emot_region_clusterer")
 
@@ -132,12 +134,18 @@ class Region:
     """A discovered density region in emotional state space."""
     region_id: int                          # local ID (arbitrary int, stable across reclusters via sig)
     signature: int                          # 64-bit fingerprint of centroid
-    centroid: np.ndarray                    # 208D mean of assigned observations
+    centroid: np.ndarray                    # 210D mean of assigned observations (schema v2)
     core_distance: float                    # typical intra-region distance
     n_observations: int = 0                 # lifetime observation count
     first_seen_ts: float = field(default_factory=time.time)
     last_seen_ts: float = field(default_factory=time.time)
     label: str = ""                         # Titan/LLM-assigned name (empty until named)
+    # Phase B graduation bookkeeping (rFP §23.5): track across-recluster
+    # persistence so a region that appears AND PERSISTS in ≥4 consecutive
+    # reclusterings graduates the whole state machine. Reset if the region's
+    # signature doesn't match for a cycle — dissolution counts as reset.
+    first_seen_recluster: int = 0           # recluster counter when signature first seen
+    last_seen_recluster: int = 0            # most recent recluster where signature matched
 
 
 class RegionClusterer:
@@ -147,7 +155,22 @@ class RegionClusterer:
       - observe(state_vec)  → (region_id, confidence, residence_s, signature)
       - recluster()         → full HDBSCAN pass + signature re-mapping
       - save_state() / _load_state()
+
+    Persistence (2026-04-22, rFP §23.6+):
+      - regions_state.json  — discovered regions + graduation counters
+      - regions_buffer.npy  — rolling trajectory buffer (STATE_DIM × N floats)
+                              survives restarts so dev cycles don't wipe 50 min
+                              of HDBSCAN warmup each time. Shape-validated on
+                              load (schema v1→v2 drops cleanly). Age-capped at
+                              BUFFER_MAX_AGE_S (7 days) — if Titan was down
+                              longer, buffer may not reflect current state.
+      - recluster_telemetry.jsonl — append-only (A4 dead-dim detector)
     """
+
+    # Max age of a persisted buffer before we consider it stale on restart.
+    # 7 days balances "continuity across upgrade cycles" against "don't restore
+    # ancient trajectory that no longer reflects Titan's current being."
+    BUFFER_MAX_AGE_S = 7 * 86400
 
     def __init__(self,
                  save_dir: str = "data/emot_cgn",
@@ -162,9 +185,16 @@ class RegionClusterer:
         self._next_region_id: int = 0
         self._current_region_id: int = REGION_UNCLUSTERED
         self._current_region_entered_ts: float = time.time()
+        # Phase B graduation state machine (rFP §23.5). Counters persist
+        # across reboots via regions_state.json so a restart doesn't reset
+        # Titan's developmental clock.
+        self._recluster_count: int = 0      # monotonic recluster index
+        self._first_boot_ts: float = time.time()  # first-ever boot (14-day gate)
         os.makedirs(save_dir, exist_ok=True)
         self._state_path = os.path.join(save_dir, "regions_state.json")
+        self._buffer_path = os.path.join(save_dir, "regions_buffer.npy")
         self._load_state()
+        self._restore_buffer()
 
     # ── Assignment path (hot, per-bundle-write) ─────────────────────
 
@@ -250,6 +280,10 @@ class RegionClusterer:
             clusterer = HDBSCAN(**kwargs)
             labels = clusterer.fit_predict(X)
 
+            # Increment recluster counter BEFORE processing so persistence
+            # bookkeeping uses the current-pass index.
+            self._recluster_count += 1
+
             # Build new region set from labels (-1 = HDBSCAN noise, skip).
             new_regions: dict[int, Region] = {}
             existing_sigs = {r.signature: rid
@@ -278,6 +312,13 @@ class RegionClusterer:
                         first_seen_ts=old.first_seen_ts,
                         last_seen_ts=time.time(),
                         label=old.label,
+                        # Persistence bookkeeping (Phase B, rFP §23.5):
+                        # signature matched prior pass → region persists.
+                        # Keep original first_seen_recluster; update last_seen.
+                        first_seen_recluster=old.first_seen_recluster
+                            if old.first_seen_recluster > 0
+                            else self._recluster_count,
+                        last_seen_recluster=self._recluster_count,
                     )
                 else:
                     rid = self._next_region_id
@@ -286,6 +327,8 @@ class RegionClusterer:
                         region_id=rid, signature=sig,
                         centroid=centroid, core_distance=core_dist,
                         n_observations=int(mask.sum()),
+                        first_seen_recluster=self._recluster_count,
+                        last_seen_recluster=self._recluster_count,
                     )
 
             self._regions = new_regions
@@ -333,7 +376,10 @@ class RegionClusterer:
     # Appearing here does NOT suppress the WARN — it just adds an
     # explanatory annotation so a human reading the telemetry knows
     # the dead-dim is expected (not a regression).
-    _KNOWN_DEFERRED_GROUPS = frozenset(["cgn_beta_states"])
+    # §23.6a shipped 2026-04-24: cgn_beta_states removed from deferred set.
+    # CGN_BETA_SNAPSHOT bus message now populates cgn_beta_states_8d via
+    # cgn_worker → emot_cgn_worker. Any future dead groups go here.
+    _KNOWN_DEFERRED_GROUPS = frozenset()
 
     def _emit_recluster_telemetry(self, X: np.ndarray, labels: np.ndarray,
                                   new_regions: dict, n_noise: int) -> None:
@@ -409,17 +455,125 @@ class RegionClusterer:
     def regions_count(self) -> int:
         return len(self._regions)
 
-    def get_region(self, region_id: int) -> Optional[Region]:
-        return self._regions.get(region_id)
+    # ── Phase B graduation state machine (rFP §23.5) ────────────────
+
+    # How many CONSECUTIVE reclusters a region's signature must persist
+    # to count as "persistent" for graduation. 4 = appear in 4+ reclusters.
+    # Accounts for HDBSCAN's inherent density-threshold noise —
+    # genuine emotional attractors should survive ≥4 cycles of rebuilding.
+    PERSISTENCE_THRESHOLD_RECLUSTERS = 4
+
+    # Minimum regions that must be persistent AND at least one named
+    # before full graduation (GRAD_GRADUATED).
+    GRADUATION_MIN_PERSISTENT_REGIONS = 3
+
+    # Observation window — emotional architecture is philosophically
+    # sensitive; don't let it graduate purely from synthetic training.
+    GRADUATION_MIN_AGE_S = 14 * 86400  # 14 days
+
+    def persistent_regions(self) -> list[Region]:
+        """Regions whose signature has appeared in ≥PERSISTENCE_THRESHOLD
+        consecutive reclusters AND was last seen in the most recent pass
+        (i.e. hasn't dissolved). Basis for the graduation state machine.
+
+        Note: `last_seen_recluster == self._recluster_count` means the
+        signature survived the latest HDBSCAN run. A region that appeared
+        once then dissolved (like T1's 2026-04-22 05:05 first emergence)
+        will drop out of this list on the next pass.
+        """
+        out = []
+        for r in self._regions.values():
+            if r.last_seen_recluster != self._recluster_count:
+                continue
+            consecutive = (r.last_seen_recluster - r.first_seen_recluster + 1)
+            if consecutive >= self.PERSISTENCE_THRESHOLD_RECLUSTERS:
+                out.append(r)
+        return out
+
+    def graduation_status(self) -> int:
+        """Compute the emotional graduation status per rFP §23.5.
+
+        Returns one of:
+          GRAD_SHADOW (0)    — no persistent regions yet; observations only
+          GRAD_OBSERVING (1) — ≥1 persistent region; state attractors
+                               confirmed but not yet granted consumer authority
+          GRAD_GRADUATED (2) — ≥3 persistent regions AND observation window
+                               ≥14 days AND at least one region has a
+                               Titan/LLM-assigned name (empty label blocks
+                               graduation — §23.4 prerequisite)
+
+        The state can regress: if a region dissolves and drops the persistent
+        count below the threshold, status falls back to a lower stage on the
+        next recluster. No hysteresis in v1; add if observed thrashing.
+        """
+        persistent = self.persistent_regions()
+        if not persistent:
+            return GRAD_SHADOW
+
+        enough_regions = (len(persistent) >=
+                          self.GRADUATION_MIN_PERSISTENT_REGIONS)
+        age_s = time.time() - self._first_boot_ts
+        old_enough = age_s >= self.GRADUATION_MIN_AGE_S
+        any_named = any(bool(r.label) for r in persistent)
+
+        if enough_regions and old_enough and any_named:
+            return GRAD_GRADUATED
+        return GRAD_OBSERVING
+
+    def graduation_snapshot(self) -> dict:
+        """Full graduation telemetry for /v4/emot-cgn/audit. Captures the
+        exact gate state so UIs and operators can see why we haven't
+        graduated yet ("2/3 persistent, age 9/14d, 0/1 named")."""
+        persistent = self.persistent_regions()
+        age_s = time.time() - self._first_boot_ts
+        return {
+            "status": self.graduation_status(),
+            "recluster_count": self._recluster_count,
+            "age_seconds": round(age_s, 1),
+            "age_days": round(age_s / 86400, 2),
+            "persistent_regions": len(persistent),
+            "total_regions": len(self._regions),
+            "named_regions": sum(1 for r in persistent if r.label),
+            "gates": {
+                "persistent_min": self.GRADUATION_MIN_PERSISTENT_REGIONS,
+                "persistence_threshold_reclusters":
+                    self.PERSISTENCE_THRESHOLD_RECLUSTERS,
+                "age_gate_s": self.GRADUATION_MIN_AGE_S,
+            },
+            "blocking": self._graduation_blockers(persistent, age_s),
+        }
+
+    def _graduation_blockers(
+        self, persistent: list[Region], age_s: float) -> list[str]:
+        """Human-readable list of what's still blocking GRAD_GRADUATED.
+        Empty list means nothing — ready to graduate."""
+        blockers = []
+        if len(persistent) < self.GRADUATION_MIN_PERSISTENT_REGIONS:
+            blockers.append(
+                f"need {self.GRADUATION_MIN_PERSISTENT_REGIONS} "
+                f"persistent regions (have {len(persistent)})")
+        if age_s < self.GRADUATION_MIN_AGE_S:
+            days_short = (self.GRADUATION_MIN_AGE_S - age_s) / 86400
+            blockers.append(f"observation window: {days_short:.1f} days remaining")
+        if not any(bool(r.label) for r in persistent):
+            blockers.append("need ≥1 Titan-named region (§23.4 LLM naming)")
+        return blockers
 
     # ── Persistence ─────────────────────────────────────────────────
 
     def save_state(self) -> None:
         try:
             data = {
-                "version": 1,
+                # Bumped to 3 for _current_region_id + _current_region_entered_ts
+                # persistence (audit 2026-04-23 BUG #7). v1/v2 state loads
+                # compatibly (missing fields → REGION_UNCLUSTERED defaults).
+                "version": 3,
                 "saved_ts": time.time(),
                 "next_region_id": self._next_region_id,
+                "recluster_count": self._recluster_count,
+                "first_boot_ts": self._first_boot_ts,
+                "current_region_id": self._current_region_id,
+                "current_region_entered_ts": self._current_region_entered_ts,
                 "regions": {
                     str(rid): {
                         "signature": r.signature,
@@ -429,6 +583,8 @@ class RegionClusterer:
                         "first_seen_ts": r.first_seen_ts,
                         "last_seen_ts": r.last_seen_ts,
                         "label": r.label,
+                        "first_seen_recluster": r.first_seen_recluster,
+                        "last_seen_recluster": r.last_seen_recluster,
                     }
                     for rid, r in self._regions.items()
                 },
@@ -437,8 +593,75 @@ class RegionClusterer:
             with open(tmp, "w") as f:
                 json.dump(data, f)
             os.replace(tmp, self._state_path)
+            # Persist the rolling trajectory buffer alongside regions so
+            # restarts don't wipe ~50 min of HDBSCAN warmup (rFP §23.6+,
+            # 2026-04-22). Non-fatal — buffer save failure doesn't block
+            # the JSON write which is the authoritative state.
+            self._save_buffer()
         except Exception as e:
             logger.warning("[RegionClusterer] save_state failed: %s", e)
+
+    def _save_buffer(self) -> None:
+        """Persist the rolling 210D trajectory buffer as .npy alongside
+        regions_state.json. Atomic write via .tmp + os.replace. Called
+        from save_state() on every recluster + shutdown save.
+        """
+        if not self._buffer:
+            # Empty buffer — remove any stale file so we don't accidentally
+            # restore outdated data on next boot.
+            try:
+                if os.path.exists(self._buffer_path):
+                    os.remove(self._buffer_path)
+            except Exception:
+                pass
+            return
+        try:
+            arr = np.stack(list(self._buffer)).astype(np.float32)
+            tmp = self._buffer_path + ".tmp"
+            np.save(tmp, arr, allow_pickle=False)
+            # np.save adds .npy suffix if not present — account for that.
+            if not tmp.endswith(".npy"):
+                actual_tmp = tmp + ".npy"
+            else:
+                actual_tmp = tmp
+            os.replace(actual_tmp, self._buffer_path)
+        except Exception as e:
+            swallow_warn('[RegionClusterer] _save_buffer failed', e,
+                         key="logic.emot_region_clusterer.save_buffer_failed", throttle=100)
+
+    def _restore_buffer(self) -> None:
+        """Load persisted trajectory buffer if present and valid. Three
+        safety checks: file exists, age ≤ BUFFER_MAX_AGE_S, shape matches
+        current STATE_DIM. On any failure, start with empty buffer — the
+        system degrades to pre-persistence behavior cleanly.
+        """
+        try:
+            if not os.path.exists(self._buffer_path):
+                return
+            age_s = time.time() - os.path.getmtime(self._buffer_path)
+            if age_s > self.BUFFER_MAX_AGE_S:
+                logger.info(
+                    "[RegionClusterer] buffer file is %.1f days old — "
+                    "discarding (>%.1f-day max age)",
+                    age_s / 86400, self.BUFFER_MAX_AGE_S / 86400)
+                return
+            arr = np.load(self._buffer_path, allow_pickle=False)
+            if arr.ndim != 2 or arr.shape[1] != STATE_DIM:
+                logger.info(
+                    "[RegionClusterer] buffer shape mismatch %s vs "
+                    "STATE_DIM=%d — discarding (likely schema change, e.g. "
+                    "v1→v2 pi_phase 4D→6D expansion)",
+                    arr.shape, STATE_DIM)
+                return
+            for row in arr:
+                self._buffer.append(row.astype(np.float32).copy())
+            logger.info(
+                "[RegionClusterer] restored %d buffer observations "
+                "(age=%.1f min, avoids ~%.0f min of HDBSCAN warmup)",
+                len(self._buffer), age_s / 60,
+                min(len(self._buffer), 50) * 1.0)  # ~1 obs/min cadence
+        except Exception as e:
+            logger.warning("[RegionClusterer] _restore_buffer failed: %s", e)
 
     def _load_state(self) -> None:
         try:
@@ -447,6 +670,18 @@ class RegionClusterer:
             with open(self._state_path) as f:
                 data = json.load(f)
             self._next_region_id = int(data.get("next_region_id", 0))
+            # Phase B graduation fields (missing on pre-v2 state → keep
+            # sane defaults so fresh installs don't "skip" their clock).
+            self._recluster_count = int(data.get("recluster_count", 0))
+            self._first_boot_ts = float(data.get("first_boot_ts", time.time()))
+            # Current-region residence restore (audit 2026-04-23 BUG #7).
+            # Pre-v3 state files won't have these keys → defaults preserve
+            # pre-fix behavior (residence counter resets). Region id is
+            # validated against loaded regions below.
+            _restored_current_rid = int(
+                data.get("current_region_id", REGION_UNCLUSTERED))
+            _restored_entered_ts = float(
+                data.get("current_region_entered_ts", time.time()))
             for rid_str, rd in data.get("regions", {}).items():
                 rid = int(rid_str)
                 centroid = np.asarray(rd.get("centroid"), dtype=np.float32)
@@ -461,8 +696,25 @@ class RegionClusterer:
                     first_seen_ts=float(rd.get("first_seen_ts", time.time())),
                     last_seen_ts=float(rd.get("last_seen_ts", time.time())),
                     label=str(rd.get("label", "")),
+                    first_seen_recluster=int(rd.get("first_seen_recluster", 0)),
+                    last_seen_recluster=int(rd.get("last_seen_recluster", 0)),
                 )
-            logger.info("[RegionClusterer] loaded %d regions from %s",
-                        len(self._regions), self._state_path)
+            # Restore current-region residence ONLY if the saved region
+            # still exists post-load. Otherwise fall back to UNCLUSTERED —
+            # prevents claiming residence in a region that was dissolved
+            # by HDBSCAN between save and load. Sentinel values (NOISE,
+            # UNCLUSTERED) restore unchanged.
+            if (_restored_current_rid in self._regions
+                    or _restored_current_rid in (REGION_NOISE,
+                                                 REGION_UNCLUSTERED)):
+                self._current_region_id = _restored_current_rid
+                self._current_region_entered_ts = _restored_entered_ts
+            logger.info("[RegionClusterer] loaded %d regions from %s "
+                        "(recluster_count=%d, age=%.1fh, "
+                        "current_region=%d)",
+                        len(self._regions), self._state_path,
+                        self._recluster_count,
+                        (time.time() - self._first_boot_ts) / 3600,
+                        self._current_region_id)
         except Exception as e:
             logger.warning("[RegionClusterer] _load_state failed: %s", e)

@@ -91,11 +91,14 @@ def _encrypt_tarball(tmp_path):
 
 
 def _run_cli(*args, cwd=None):
-    """Run decrypt_backup.py, returning (returncode, stdout, stderr)."""
+    """Run decrypt_backup.py, returning (returncode, stdout, stderr).
+
+    Uses sys.executable so the test works in any worktree (worktrees
+    don't have their own test_env directory but inherit the venv python).
+    """
     env = dict(os.environ)
-    venv_python = os.path.join(REPO_ROOT, "test_env", "bin", "python")
     proc = subprocess.run(
-        [venv_python, CLI, *args],
+        [sys.executable, CLI, *args],
         cwd=cwd or REPO_ROOT,
         capture_output=True, text=True, env=env, timeout=60)
     return proc.returncode, proc.stdout, proc.stderr

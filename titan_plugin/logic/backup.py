@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from titan_plugin.utils.crypto import hash_file
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +87,8 @@ class RebirthBackup:
                 logger.info("[Backup] Loaded state: personality=%s, soul=%s, meditations=%d",
                             self._last_personality_date, self._last_soul_date, self._meditation_count)
         except Exception as e:
-            logger.debug("[Backup] No backup state loaded: %s", e)
+            swallow_warn('[Backup] No backup state loaded', e,
+                         key="logic.backup.no_backup_state_loaded", throttle=100)
 
     def _save_backup_state(self):
         """Persist backup tracking state to disk."""
@@ -235,7 +237,8 @@ class RebirthBackup:
                                 from titan_plugin.utils.arweave_store import ArweaveStore
                                 _tc_arweave = ArweaveStore(keypair_path=_tc_kp, network=_tc_net)
                     except Exception as _ae:
-                        logger.debug("[Backup] TimeChain ArweaveStore fallback init: %s", _ae)
+                        swallow_warn('[Backup] TimeChain ArweaveStore fallback init', _ae,
+                                     key="logic.backup.timechain_arweavestore_fallback_init", throttle=100)
 
                 tc_backup = TimeChainBackup(
                     data_dir="data/timechain",
@@ -286,7 +289,8 @@ class RebirthBackup:
                 if nft_addr:
                     logger.info("[Backup] MyDay NFT minted: %s", nft_addr)
             except Exception as e:
-                logger.debug("[Backup] MyDay NFT skipped: %s", e)
+                swallow_warn('[Backup] MyDay NFT skipped', e,
+                             key="logic.backup.myday_nft_skipped", throttle=100)
 
         # Save state after all operations
         self._save_backup_state()
@@ -352,7 +356,8 @@ class RebirthBackup:
             elif not latest:
                 logger.info("[Backup] Boot: no prior personality record (first run?)")
         except Exception as e:
-            logger.debug("[Backup] Boot catch-up check error: %s", e)
+            swallow_warn('[Backup] Boot catch-up check error', e,
+                         key="logic.backup.boot_catch_up_check_error", throttle=100)
         return summary
 
     # -------------------------------------------------------------------------
@@ -444,7 +449,8 @@ class RebirthBackup:
                     logger.info("[Backup] Vault shadow hash updated: %s (tx=%s)",
                                 archive_hash[:12], sig[:16] if len(sig) > 16 else sig)
         except Exception as e:
-            logger.debug("[Backup] Vault shadow hash update failed (non-critical): %s", e)
+            swallow_warn('[Backup] Vault shadow hash update failed (non-critical)', e,
+                         key="logic.backup.vault_shadow_hash_update_failed_non_crit", throttle=100)
 
     # -------------------------------------------------------------------------
     # ZK Epoch Snapshot (Solana — every meditation)
@@ -490,7 +496,8 @@ class RebirthBackup:
                         total_nodes, sovereignty_bp,
                     )
         except Exception as e:
-            logger.debug("[Backup] ZK epoch snapshot skipped: %s", e)
+            swallow_warn('[Backup] ZK epoch snapshot skipped', e,
+                         key="logic.backup.zk_epoch_snapshot_skipped", throttle=100)
 
     # -------------------------------------------------------------------------
     # MyDay NFT (Solana — every 4th meditation)
@@ -554,7 +561,8 @@ class RebirthBackup:
                 return addr
 
         except Exception as e:
-            logger.debug("[Backup] Epoch NFT mint failed: %s", e)
+            swallow_warn('[Backup] Epoch NFT mint failed', e,
+                         key="logic.backup.epoch_nft_mint_failed", throttle=100)
 
         return None
 
@@ -1079,7 +1087,8 @@ class RebirthBackup:
                     "parse_mode": "Markdown",
                 }, timeout=10)
             except Exception as e:
-                logger.debug("[Backup] Telegram alert failed (non-critical): %s", e)
+                swallow_warn('[Backup] Telegram alert failed (non-critical)', e,
+                             key="logic.backup.telegram_alert_failed_non_critical", throttle=100)
         import threading
         threading.Thread(target=_post, daemon=True,
                          name="telegram-alert").start()

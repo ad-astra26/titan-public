@@ -51,6 +51,8 @@ import os
 import sys
 import threading
 import time
+from titan_plugin.utils.silent_swallow import swallow_warn
+from titan_plugin import bus
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +122,32 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
         cfg.get("emot_recluster_interval_s", 900.0))  # 15 min default
     _last_recluster_ts = time.time()
 
+    # BUG #10 fix (2026-04-24): legacy 8-primitive k-means recenter
+    # invocation tick. Pre-Phase-1.6h, dreaming.py::end_dreaming() invoked
+    # emot_cgn._clusterer.maybe_recenter(force=False) at dream-cycle end.
+    # The Phase 1.6h cutover moved EMOT-CGN into this subprocess; the
+    # dreaming.py wire still exists but `emot_cgn` param is always None
+    # at both inner_coordinator.py call sites (:201, :296), so the inner
+    # invocation is dead code. Consequence pre-fix: last_recenter_ts=0 on
+    # all 3 Titans since v3 shipped 2026-04-20 → RNG-seeded legacy
+    # primitive centroids NEVER drifted → WONDER monoculture locked in +
+    # LOVE never fires. Fix: invoke maybe_recenter() periodically here
+    # (internal 7-day gate in maybe_recenter() provides real throttling
+    # per Q3 audit TRANSITIONAL directive — DO NOT tune the interval,
+    # only restore as-designed invocation cadence).
+    K_RECENTER_CHECK_INTERVAL_S = float(
+        cfg.get("emot_k_recenter_check_interval_s", 3600.0))  # hourly check
+    _last_k_recenter_check_ts = 0.0
+
+    # F-phase routine emotional pulse — fires regardless of cluster
+    # ambiguity so EmotMeta meets OBS-meta-service-session2-soak coverage
+    # (≥1 META_REASON_REQUEST per consumer per 24h). Complementary to the
+    # ambig-anchor branch in FELT_CLUSTER_UPDATE which only fires when
+    # cluster_conf < 0.5. Maker decision 2026-04-28: 120s cadence.
+    EMOT_META_PULSE_INTERVAL_S = float(
+        cfg.get("emot_meta_pulse_interval_s", 120.0))
+    _last_emot_meta_pulse_ts = 0.0
+
     # v3 kin protocol — Titan↔Titan emotion transmission (rFP §21).
     # Worker emits KIN_EMOT_STATE on region change (throttled) and
     # caches incoming peer states for MSL binding.
@@ -184,7 +212,8 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
             kin_state["last_emit_ts"] = now
             kin_state["last_emitted_signature"] = region_sig
         except Exception as _ke:
-            logger.debug("[EmotCGNWorker] KIN_EMOT_STATE emit failed: %s", _ke)
+            swallow_warn('[EmotCGNWorker] KIN_EMOT_STATE emit failed', _ke,
+                         key="modules.emot_cgn_worker.kin_emot_state_emit_failed", throttle=100)
 
     def _prime_hormone_levels_from_history():
         """Warm-start hormone_levels EMA from the latest inner_memory
@@ -221,7 +250,8 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
                         "inner_memory snapshot (%d/%d programs non-zero)",
                         n_nonzero, len(primed))
         except Exception as _e:
-            logger.debug("[EmotCGNWorker] hormone prime skipped: %s", _e)
+            swallow_warn('[EmotCGNWorker] hormone prime skipped', _e,
+                         key="modules.emot_cgn_worker.hormone_prime_skipped", throttle=100)
 
     # Per-worker closure state — caches of most recent inputs so
     # _write_state_to_bundle can assemble a full snapshot on any event.
@@ -273,7 +303,8 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
                 cross_insights_received=int(emot_cgn._cgn_cross_insights_received),
             )
         except Exception as e:
-            logger.debug("[EmotCGNWorker] shm write_state failed: %s", e)
+            swallow_warn('[EmotCGNWorker] shm write_state failed', e,
+                         key="modules.emot_cgn_worker.shm_write_state_failed", throttle=100)
             dom_idx = 0  # fall through to bundle write with neutral idx
 
         # ── v3 bundle — native Titan state + derived emergence fields.
@@ -297,7 +328,8 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
                 )
                 worker_state["last_msl_activations_6d"] = msl_vec
             except Exception as _msl_err:
-                logger.debug("[EmotCGNWorker] MSL binding error: %s", _msl_err)
+                swallow_warn('[EmotCGNWorker] MSL binding error', _msl_err,
+                             key="modules.emot_cgn_worker.msl_binding_error", throttle=100)
 
             encoded = thin_encoder.encode(
                 felt_tensor_130d=worker_state["last_felt_tensor_130d"],
@@ -333,7 +365,14 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
                 # L5 slots zero until Phase 0 encoder ships.
                 region_id=region_id,
                 legacy_idx=dom_idx,  # matches legacy state.bin dominant_idx
-                graduation_status=GRAD_SHADOW,
+                # Phase B (rFP §23.5): graduation state machine driven by
+                # region persistence across reclusters + observation age +
+                # named-region gate. Falls back to GRAD_SHADOW if clusterer
+                # query fails (defensive: never block a bundle write).
+                graduation_status=(
+                    region_clusterer.graduation_status()
+                    if hasattr(region_clusterer, "graduation_status")
+                    else GRAD_SHADOW),
                 regions_emerged=region_clusterer.regions_count(),
                 valence=encoded["valence"],
                 arousal=encoded["arousal"],
@@ -353,7 +392,8 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
                 regions_emerged=region_clusterer.regions_count(),
             )
         except Exception as e:
-            logger.debug("[EmotCGNWorker] bundle write failed: %s", e)
+            swallow_warn('[EmotCGNWorker] bundle write failed', e,
+                         key="modules.emot_cgn_worker.bundle_write_failed", throttle=100)
 
     _write_state_to_shm()  # initial snapshot so consumers see valid data immediately
 
@@ -363,7 +403,7 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
                 init_ms, titan_id, emot_cgn._status,
                 len(emot_cgn._primitives), shm_state_path, shm_bundle_path)
 
-    _send_msg(send_queue, "MODULE_READY", name, "guardian", {})
+    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
 
     # ── F-phase (rFP §16.7): Meta-Reasoning Consumer Service wire ────
     # Session 2 wire-now-gate-later. Meta returns not_yet_implemented;
@@ -409,6 +449,15 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
     hb_thread.start()
 
     # ── Main loop ────────────────────────────────────────────────────
+    # ── Microkernel v2 Phase B.1 §6 — readiness/hibernate reporter ──
+    from titan_plugin.core.readiness_reporter import trivial_reporter
+    def _b1_save_state():
+        return []
+    _b1_reporter = trivial_reporter(
+        worker_name=name, layer="L2", send_queue=send_queue,
+        save_state_cb=_b1_save_state,
+    )
+
     while True:
         _send_heartbeat(send_queue, name)
 
@@ -421,7 +470,84 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
             try:
                 region_clusterer.recluster()
             except Exception as _re:
-                logger.debug("[EmotCGNWorker] recluster error: %s", _re)
+                swallow_warn('[EmotCGNWorker] recluster error', _re,
+                             key="modules.emot_cgn_worker.recluster_error", throttle=100)
+
+        # BUG #10 fix: legacy 8-primitive k-means recenter — check hourly,
+        # internal 7-day gate in maybe_recenter() handles real throttling.
+        # Restores as-designed cadence lost in Phase 1.6h cutover.
+        if now - _last_k_recenter_check_ts >= K_RECENTER_CHECK_INTERVAL_S:
+            _last_k_recenter_check_ts = now
+            try:
+                fired = emot_cgn._clusterer.maybe_recenter(force=False)
+                if fired:
+                    logger.info(
+                        "[EmotCGNWorker] legacy k-means recenter fired "
+                        "(BUG #10 fix path)")
+            except Exception as _ke:
+                swallow_warn('[EmotCGNWorker] k-recenter error', _ke,
+                             key="modules.emot_cgn_worker.k_recenter_error", throttle=100)
+
+        # ── F-phase routine emotional pulse (rFP §16.7, Maker 2026-04-28) ──
+        # Fires every EMOT_META_PULSE_INTERVAL_S regardless of cluster
+        # ambiguity. Closes the EmotMeta silence found in OBS-meta-service-
+        # session2-soak. Dry-run pattern (Session 2): outcome closed
+        # immediately with neutral 0.0 reward — Session 3 will swap to
+        # real chain execution.
+        if now - _last_emot_meta_pulse_ts >= EMOT_META_PULSE_INTERVAL_S:
+            _last_emot_meta_pulse_ts = now
+            try:
+                from titan_plugin.logic.meta_service_client import (
+                    send_meta_request as _em_p_send,
+                    send_meta_outcome as _em_p_out,
+                )
+                from titan_plugin.logic.meta_consumer_contexts import (
+                    build_emotional_meta_context_30d as _em_p_ctx_fn,
+                )
+                _em_p_anchors = {}
+                try:
+                    for _an_name, _an_blk in emot_cgn._primitives.items():
+                        _em_p_anchors[_an_name] = {
+                            "V": float(getattr(_an_blk, "V", 0.3)),
+                        }
+                except Exception as _swallow_exc:
+                    swallow_warn(
+                        '[EmotMeta] pulse anchors snapshot', _swallow_exc,
+                        key="modules.emot_cgn_worker.pulse_anchors", throttle=100)
+                _em_p_cluster_p, _em_p_cluster_d, _em_p_cluster_conf = (
+                    emot_cgn._last_cluster_assignment)
+                _em_p_req_id = _em_p_send(
+                    consumer_id="emotional",
+                    question_type="evaluate_trajectory",
+                    context_vector=_em_p_ctx_fn(
+                        anchors=_em_p_anchors,
+                        cluster_stats={
+                            "variance_1h": float(_em_p_cluster_d),
+                        }),
+                    time_budget_ms=200,
+                    constraints={
+                        "confidence_threshold": 0.4,
+                        "allow_timechain_query": False,
+                    },
+                    payload_snippet=(
+                        f"routine_pulse dom={_em_p_cluster_p} "
+                        f"conf={_em_p_cluster_conf:.2f}"),
+                    send_queue=send_queue, src=name)
+                _emot_meta_pending[_em_p_req_id] = (now, "routine_pulse")
+                _em_p_out(
+                    request_id=_em_p_req_id,
+                    consumer_id="emotional",
+                    outcome_reward=0.0,
+                    actual_primitive_used=None,
+                    context=(
+                        f"session_2_dry routine_pulse "
+                        f"dom={_em_p_cluster_p}"),
+                    send_queue=send_queue, src=name)
+                _emot_meta_pending.pop(_em_p_req_id, None)
+            except Exception as _em_p_err:
+                swallow_warn('[EmotMeta] routine pulse skipped', _em_p_err,
+                             key="modules.emot_cgn_worker.routine_pulse_skipped",
+                             throttle=100)
 
         try:
             msg = recv_queue.get(timeout=5.0)
@@ -431,7 +557,19 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
         msg_type = msg.get("type", "")
         payload = msg.get("payload", {}) or {}
 
-        if msg_type == "MODULE_SHUTDOWN":
+        # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────
+        if _b1_reporter.handles(msg_type):
+            _b1_reporter.handle(msg)
+            if _b1_reporter.should_exit():
+                break
+            continue
+
+        # ── Microkernel v2 Phase B.2.1 — supervision-transfer dispatch ──
+        from titan_plugin.core import worker_swap_handler as _swap
+        if _swap.maybe_dispatch_swap_msg(msg):
+            continue
+
+        if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[EmotCGNWorker] Received MODULE_SHUTDOWN — "
                         "saving state + stopping heartbeat + exiting")
             try:
@@ -442,7 +580,7 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
             return
 
         # ── EMOT_CHAIN_EVIDENCE (meta_reasoning → emot_cgn) ────
-        elif msg_type == "EMOT_CHAIN_EVIDENCE":
+        elif msg_type == bus.EMOT_CHAIN_EVIDENCE:
             try:
                 emot_cgn.observe_chain_evidence(
                     chain_id=int(payload.get("chain_id", 0)),
@@ -484,7 +622,7 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
                 logger.warning("[EmotCGNWorker] EMOT_CHAIN_EVIDENCE error: %s", _e)
 
         # ── FELT_CLUSTER_UPDATE (spirit → emot_cgn) ────────────
-        elif msg_type == "FELT_CLUSTER_UPDATE":
+        elif msg_type == bus.FELT_CLUSTER_UPDATE:
             try:
                 fv = payload.get("feature_vec_150d")
                 if fv is None and "felt_tensor_130d" in payload:
@@ -520,8 +658,9 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
                                 _em_anchors[_an_name] = {
                                     "V": float(getattr(_an_blk, "V", 0.3)),
                                 }
-                        except Exception:
-                            pass
+                        except Exception as _swallow_exc:
+                            swallow_warn('[modules.emot_cgn_worker] emot_cgn_worker_main: for _an_name, _an_blk in emot_cgn._primitives.items(): _e...', _swallow_exc,
+                                         key='modules.emot_cgn_worker.emot_cgn_worker_main.line570', throttle=100)
                         _em_req_id = _em_send(
                             consumer_id="emotional",
                             question_type="spirit_self_nudge",
@@ -551,14 +690,15 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
                             send_queue=send_queue, src=name)
                         _emot_meta_pending.pop(_em_req_id, None)
                 except Exception as _em_err:
-                    logger.debug("[EmotMeta] req skipped: %s", _em_err)
+                    swallow_warn('[EmotMeta] req skipped', _em_err,
+                                 key="modules.emot_cgn_worker.req_skipped", throttle=100)
             except Exception as _e:
                 logger.warning("[EmotCGNWorker] FELT_CLUSTER_UPDATE error: %s", _e)
 
         # ── META_REASON_RESPONSE (F-phase rFP §4.3) ────────────
         # Routed here per [meta_service_interface.consumer_home_worker]
         # emotional = "emot_cgn".
-        elif msg_type == "META_REASON_RESPONSE":
+        elif msg_type == bus.META_REASON_RESPONSE:
             try:
                 from titan_plugin.logic.meta_service_client import (
                     dispatch_meta_response as _em_dispatch,
@@ -568,15 +708,69 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
                 logger.warning(
                     "[EmotMeta] response dispatch error: %s", _em_disp_err)
 
+        # ── CGN_HAOV_VERIFY_REQ (H.2 2026-04-28): emotional verifier ──
+        # CGN Worker asks emot_cgn to verify hypotheses on the emotional
+        # consumer (e.g., "emotional_impasse_stuck"). Delta check on
+        # cluster_conf and dominant primitive's V — confirmed if
+        # emotional state has moved since hypothesis was formed.
+        elif msg_type == bus.CGN_HAOV_VERIFY_REQ:
+            try:
+                _haov_p = msg.get("payload", {})
+                _haov_consumer = _haov_p.get("consumer", "")
+                if _haov_consumer == "emotional":
+                    _obs_b = _haov_p.get("obs_before", {})
+                    if not isinstance(_obs_b, dict):
+                        _obs_b = {}
+                    _conf_b = float(_obs_b.get("cluster_conf", 0.5))
+                    _v_dom_b = float(_obs_b.get("v_dominant", 0.3))
+                    _conf_a = _conf_b
+                    _v_dom_a = _v_dom_b
+                    _dom_p = "FLOW"
+                    try:
+                        _, _, _conf_a = emot_cgn._last_cluster_assignment
+                        _conf_a = float(_conf_a)
+                        _dom_p = str(emot_cgn._last_cluster_assignment[0])
+                        _dom_blk = emot_cgn._primitives.get(_dom_p)
+                        if _dom_blk is not None:
+                            _v_dom_a = float(getattr(_dom_blk, "V", _v_dom_b))
+                    except Exception:
+                        pass
+                    # Confirmed if cluster moved (state diversified) OR
+                    # dominant V shifted (rebalancing happening).
+                    _confirmed = (abs(_conf_a - _conf_b) > 0.05) or (abs(_v_dom_a - _v_dom_b) > 0.02)
+                    _error = abs(_conf_a - _conf_b) + abs(_v_dom_a - _v_dom_b)
+                    _send_msg(send_queue, bus.CGN_HAOV_VERIFY_RSP, name, "cgn", {
+                        "consumer": "emotional",
+                        "test_ctx": _haov_p.get("test_ctx"),
+                        "obs_after": {"cluster_conf": _conf_a,
+                                      "v_dominant": _v_dom_a,
+                                      "dominant_primitive": _dom_p},
+                        "reward": _v_dom_a if _confirmed else 0.0,
+                        "confirmed": _confirmed,
+                        "error": _error,
+                    })
+                    logger.info(
+                        "[HAOV] Emotional verify: conf %.3f→%.3f V_dom %.3f→%.3f confirmed=%s",
+                        _conf_b, _conf_a, _v_dom_b, _v_dom_a, _confirmed)
+                else:
+                    logger.debug(
+                        "[HAOV] emot_cgn received non-emotional consumer '%s'",
+                        _haov_consumer)
+            except Exception as _haov_err:
+                swallow_warn('[EmotCGNWorker] HAOV verify error', _haov_err,
+                             key="modules.emot_cgn_worker.haov_verify_error",
+                             throttle=100)
+
         # ── CGN_CROSS_INSIGHT (incoming from META-CGN / others) ────
-        elif msg_type == "CGN_CROSS_INSIGHT":
+        elif msg_type == bus.CGN_CROSS_INSIGHT:
             try:
                 origin = str(payload.get("origin_consumer", ""))
                 if origin != "emotional":  # skip own emissions bouncing back
                     emot_cgn.handle_incoming_cross_insight(payload)
                     _write_state_to_shm()
             except Exception as _e:
-                logger.debug("[EmotCGNWorker] CGN_CROSS_INSIGHT error: %s", _e)
+                swallow_warn('[EmotCGNWorker] CGN_CROSS_INSIGHT error', _e,
+                             key="modules.emot_cgn_worker.cgn_cross_insight_error", throttle=100)
 
         # ── KIN_EMOT_STATE (peer Titan → emot_cgn) — rFP §21 ───────
         # Peer Titan's emotional region + valence/arousal/novelty.
@@ -596,7 +790,8 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
                         parsed["titan_src"], parsed["region_id"],
                         parsed["valence"], parsed["age_s"])
             except Exception as _ke:
-                logger.debug("[EmotCGNWorker] KIN_EMOT_STATE error: %s", _ke)
+                swallow_warn('[EmotCGNWorker] KIN_EMOT_STATE error', _ke,
+                             key="modules.emot_cgn_worker.kin_emot_state_error", throttle=100)
 
         # ── HORMONE_FIRED (spirit → emot_cgn) — rFP §4.3, §19 ──────
         # Per-fire event carrying (program, intensity, urgency). We
@@ -604,7 +799,7 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
         # worker_state and feed it into the bundle on each write so the
         # clusterer + HDBSCAN see hormonal regime as part of Titan's
         # native state. Rate is low (few fires/sec typical), no throttle.
-        elif msg_type == "HORMONE_FIRED":
+        elif msg_type == bus.HORMONE_FIRED:
             try:
                 from titan_plugin.logic.emot_bundle_protocol import (
                     NS_PROGRAM_INDEX, HORMONE_DIM)
@@ -626,7 +821,25 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
                 # No _write_state_to_shm() here — fires are frequent; the
                 # next chain-evidence / felt-update tick will emit a bundle.
             except Exception as _e:
-                logger.debug("[EmotCGNWorker] HORMONE_FIRED error: %s", _e)
+                swallow_warn('[EmotCGNWorker] HORMONE_FIRED error', _e,
+                             key="modules.emot_cgn_worker.hormone_fired_error", throttle=100)
+
+        # ── CGN_BETA_SNAPSHOT (cgn_worker → emot_cgn, §23.6a) ────────
+        elif msg_type == bus.CGN_BETA_SNAPSHOT:
+            try:
+                from titan_plugin.logic.emot_bundle_protocol import (
+                    CGN_CONSUMERS)
+                v_by = payload.get("values_by_consumer", {}) or {}
+                # Ordered array following CGN_CONSUMERS layout
+                beta_8d = [
+                    float(v_by.get(c, 0.5)) for c in CGN_CONSUMERS
+                ]
+                worker_state["last_cgn_beta_states_8d"] = beta_8d
+                # No _write_state_to_shm() here — bundle-snapshot refresh
+                # at next chain-evidence / felt-update tick pulls this in.
+            except Exception as _e:
+                swallow_warn('[EmotCGNWorker] CGN_BETA_SNAPSHOT error', _e,
+                             key="modules.emot_cgn_worker.cgn_beta_snapshot_error", throttle=100)
 
         else:
             logger.debug("[EmotCGNWorker] unhandled msg_type=%s", msg_type)
@@ -669,5 +882,6 @@ def _send_heartbeat(send_queue, name: str) -> None:
             "ts": now, "rid": None,
             "payload": {"rss_mb": round(rss_mb, 1)},
         })
-    except Exception:
-        pass
+    except Exception as _swallow_exc:
+        swallow_warn("[modules.emot_cgn_worker] _send_heartbeat: send_queue.put_nowait({'type': 'MODULE_HEARTBEAT', 'src':...", _swallow_exc,
+                     key='modules.emot_cgn_worker._send_heartbeat.line740', throttle=100)

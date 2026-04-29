@@ -86,14 +86,53 @@ class SpiritState:
         return getattr(self, key, default)
 
     def snapshot(self) -> dict:
-        """Full Spirit view snapshot."""
+        """Full Spirit view snapshot.
+
+        Sanitizes nested dicts so the result round-trips through msgpack
+        with `strict_map_key=True`. The `topology["distance_matrix"]` payload
+        from `inner_coordinator` historically uses `(a, b)` tuple keys —
+        msgpack serializes tuples as arrays, and arrays-as-map-keys are
+        rejected by `strict_map_key=True` on unpack. This produces the
+        "list is not allowed for map key" malformed-frame errors caught
+        by Fix B's hex-dump diagnostic on 2026-04-28.
+        """
         return {
             "full_30dt": list(self.full_30dt),
-            "observables": dict(self.observables),
-            "topology": dict(self.topology),
+            "observables": _sanitize_dict_keys(dict(self.observables)),
+            "topology": _sanitize_dict_keys(dict(self.topology)),
             "enrichment_quality": self.enrichment_quality,
             "micro_tick_count": self.micro_tick_count,
             "middle_path_loss": self.middle_path_loss,
             "mean_coherence": round(self.mean_coherence, 6),
             "assembly_count": self._assembly_count,
         }
+
+
+def _sanitize_dict_keys(obj):
+    """Recursively coerce all dict keys to strings.
+
+    msgpack with `strict_map_key=True` (the broker default) accepts ONLY
+    str/bytes keys — int, tuple, list, frozenset, and other non-scalar
+    keys all raise on unpack. We coerce every key to its string form so
+    the snapshot is always safely round-trippable.
+
+    Tuple keys use the same shape as inner_coordinator.get_stats():
+      `(a, b)` → `"a:b"` (matches existing convention for distance_matrix).
+    """
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if isinstance(k, str):
+                out[k] = _sanitize_dict_keys(v)
+            elif isinstance(k, tuple):
+                if len(k) == 2:
+                    out[f"{k[0]}:{k[1]}"] = _sanitize_dict_keys(v)
+                else:
+                    out[":".join(str(p) for p in k)] = _sanitize_dict_keys(v)
+            else:
+                # int / float / frozenset / any other type → str()
+                out[str(k)] = _sanitize_dict_keys(v)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_dict_keys(x) for x in obj]
+    return obj

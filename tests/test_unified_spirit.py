@@ -68,47 +68,59 @@ class TestUnifiedSpirit:
             assert spirit.latest_epoch is None
 
     def test_update_subconscious(self):
-        """Subconscious layer updates Inner Trinity slice of 30DT."""
+        """Subconscious layer updates Inner Trinity slice (5D body + 15D mind + 45D spirit = 65D)."""
         from titan_plugin.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
+            inner_body = [0.1, 0.2, 0.3, 0.4, 0.5]
+            inner_mind = [0.05 * i for i in range(15)]      # 15D
+            inner_spirit = [0.01 * i for i in range(45)]    # 45D
             spirit.update_subconscious(
-                inner_body=[0.1, 0.2, 0.3, 0.4, 0.5],
-                inner_mind=[0.6, 0.7, 0.8, 0.9, 1.0],
-                inner_spirit=[0.3, 0.4, 0.5, 0.6, 0.7],
+                inner_body=inner_body,
+                inner_mind=inner_mind,
+                inner_spirit=inner_spirit,
             )
             t = spirit.tensor
-            assert t[0:5] == [0.1, 0.2, 0.3, 0.4, 0.5]
-            assert t[5:10] == [0.6, 0.7, 0.8, 0.9, 1.0]
-            assert t[10:15] == [0.3, 0.4, 0.5, 0.6, 0.7]
+            assert t[0:5] == inner_body
+            assert t[5:20] == inner_mind
+            assert t[20:65] == inner_spirit
 
     def test_update_conscious(self):
-        """Conscious layer updates Outer Trinity slice of 30DT."""
+        """Conscious layer updates Outer Trinity slice (5D body + 15D mind + 45D spirit = 65D)."""
         from titan_plugin.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
+            outer_body = [0.8, 0.7, 0.6, 0.5, 0.4]
+            outer_mind = [0.05 * i for i in range(15)]      # 15D
+            outer_spirit = [0.02 * i for i in range(45)]    # 45D
             spirit.update_conscious(
-                outer_body=[0.8, 0.7, 0.6, 0.5, 0.4],
-                outer_mind=[0.3, 0.2, 0.1, 0.0, 0.5],
-                outer_spirit=[0.9, 0.8, 0.7, 0.6, 0.5],
+                outer_body=outer_body,
+                outer_mind=outer_mind,
+                outer_spirit=outer_spirit,
             )
             t = spirit.tensor
-            assert t[15:20] == [0.8, 0.7, 0.6, 0.5, 0.4]
-            assert t[20:25] == [0.3, 0.2, 0.1, 0.0, 0.5]
-            assert t[25:30] == [0.9, 0.8, 0.7, 0.6, 0.5]
+            assert t[65:70] == outer_body
+            assert t[70:85] == outer_mind
+            assert t[85:130] == outer_spirit
 
     def test_inner_outer_tensors(self):
-        """inner_tensor and outer_tensor properties return correct slices."""
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        """inner_tensor and outer_tensor properties return correct 65D slices."""
+        from titan_plugin.logic.unified_spirit import (
+            UnifiedSpirit, INNER_DIMS, OUTER_DIMS,
+        )
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
-            spirit.update_subconscious([0.1]*5, [0.2]*5, [0.3]*5)
-            spirit.update_conscious([0.7]*5, [0.8]*5, [0.9]*5)
+            spirit.update_subconscious([0.1]*5, [0.2]*15, [0.3]*45)
+            spirit.update_conscious([0.7]*5, [0.8]*15, [0.9]*45)
 
-            assert len(spirit.inner_tensor) == 15
-            assert len(spirit.outer_tensor) == 15
-            assert spirit.inner_tensor[0] == 0.1
-            assert spirit.outer_tensor[0] == 0.7
+            assert len(spirit.inner_tensor) == INNER_DIMS == 65
+            assert len(spirit.outer_tensor) == OUTER_DIMS == 65
+            assert spirit.inner_tensor[0] == 0.1   # inner_body[0]
+            assert spirit.inner_tensor[5] == 0.2   # inner_mind[0]
+            assert spirit.inner_tensor[20] == 0.3  # inner_spirit[0]
+            assert spirit.outer_tensor[0] == 0.7   # outer_body[0]
+            assert spirit.outer_tensor[5] == 0.8   # outer_mind[0]
+            assert spirit.outer_tensor[20] == 0.9  # outer_spirit[0]
 
     def test_tensor_padding(self):
         """Short tensors are padded with 0.5."""
@@ -128,17 +140,17 @@ class TestGreatPulseAdvancement:
     """Tests for SPIRIT advancement via GREAT PULSE."""
 
     def test_advance_creates_epoch(self):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_plugin.logic.unified_spirit import UnifiedSpirit, SPIRIT_DIMS
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
-            spirit.update_subconscious([0.6]*5, [0.5]*5, [0.7]*5)
-            spirit.update_conscious([0.4]*5, [0.5]*5, [0.6]*5)
+            spirit.update_subconscious([0.6]*5, [0.5]*15, [0.7]*45)
+            spirit.update_conscious([0.4]*5, [0.5]*15, [0.6]*45)
 
             epoch = spirit.advance({"body": True, "mind": True, "spirit": True})
 
             assert epoch is not None
             assert epoch.epoch_id == 1
-            assert len(epoch.spirit_tensor) == 30
+            assert len(epoch.spirit_tensor) == SPIRIT_DIMS == 130
             assert spirit.epoch_count == 1
 
     def test_advance_increments_epoch_id(self):

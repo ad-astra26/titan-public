@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
+from titan_plugin.utils.silent_swallow import swallow_warn
+from titan_plugin import bus
 
 logger = logging.getLogger("titan.meta_reasoning")
 
@@ -60,13 +62,16 @@ SUB_MODES = {
                     "generalize_from_instance"],
     "RECALL":      ["chain_archive", "experience", "entity", "wisdom",
                     "episodic_specific", "semantic_neighbors",
-                    "procedural_matching", "autobiographical_relevant"],
+                    "procedural_matching", "autobiographical_relevant",
+                    "topic"],
     "HYPOTHESIZE": ["generate", "refine", "compare",
                     "analogize_from", "contrast_with",
                     "propose_by_inversion", "extend_pattern"],
-    "DELEGATE":    ["full_chain", "quick_chain", "biased_chain"],
+    "DELEGATE":    ["full_chain", "quick_chain", "biased_chain",
+                    "gap_fill"],
     "SYNTHESIZE":  ["combine", "abstract", "rank", "distill_save"],
-    "EVALUATE":    ["check_progress", "check_strategy", "check_resources"],
+    "EVALUATE":    ["check_progress", "check_strategy", "check_resources",
+                    "peer_cgn"],
     "BREAK":       ["rewind_last", "rewind_to_checkpoint", "restart_fresh"],
     "SPIRIT_SELF": ["boost_curiosity", "boost_focus", "boost_calm",
                     "boost_energy", "release_tension"],
@@ -195,6 +200,25 @@ class MetaChainState:
     impasse_detected: bool = False
     impasse_topic: str = ""
     knowledge_injected: bool = False
+    # ── rFP_titan_meta_outer_layer — Bridges 1/2/3 ──────────────────────
+    # entity_refs maps symbolic names ("primary_person", "current_topic",
+    # "current_event") to concrete IDs. Set by FORMULATE when the intent
+    # references a known entity. Read by RECALL.entity / .topic,
+    # HYPOTHESIZE / EVALUATE / SYNTHESIZE — making chains carry specific
+    # entity references end-to-end (not just abstract context).
+    entity_refs: dict = field(default_factory=dict)
+    # needs_outer is the hint FORMULATE emits to trigger async composed
+    # recall in spirit_worker. When non-empty, spirit_worker dispatches
+    # OuterContextReader.compose_recall_query() and stashes the future
+    # on the chain state for later primitives to read.
+    needs_outer: dict = field(default_factory=dict)
+    # outer_context is populated by spirit_worker once the composed
+    # recall future resolves (at first primitive that needs it, or at
+    # budget deadline). See rFP §5 for shape.
+    outer_context: dict = field(default_factory=dict)
+    # outer_context_used flips True on first primitive that reads a
+    # non-empty outer_context. Drives META_OUTER_REWARD at conclude.
+    outer_context_used: bool = False
 
 
 # ── Policy Networks ───────────────────────────────────────────────
@@ -469,8 +493,9 @@ class MetaTransitionBuffer:
             self._sub_actions = d.get("sub_actions", [])
             self._rewards = d.get("rewards", [])
             self._dones = d.get("dones", [])
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn('[logic.meta_reasoning] MetaTransitionBuffer.load: with open(path) as f: d = json.load(f)', _swallow_exc,
+                         key='logic.meta_reasoning.MetaTransitionBuffer.load.line496', throttle=100)
 
 
 # ── Trigger Evaluation ────────────────────────────────────────────
@@ -547,8 +572,9 @@ def _detect_resource_budget():
             vram = torch.cuda.get_device_properties(0).total_mem / (1024**3)
             if vram >= 8:
                 budget = int(budget * 1.5)
-    except Exception:
-        pass
+    except Exception as _swallow_exc:
+        swallow_warn('[logic.meta_reasoning] _detect_resource_budget: import torch', _swallow_exc,
+                     key='logic.meta_reasoning._detect_resource_budget.line574', throttle=100)
     budget = min(budget, 100)
     max_parallel = 1
     if ram_gb >= 8 and cpu >= 4:   max_parallel = 2
@@ -928,6 +954,9 @@ class MetaReasoningEngine:
                     titan_id=self._titan_id,
                     save_dir=cfg.get("meta_cgn_save_dir", "data/meta_cgn"),
                     module_name="spirit",
+                    # Microkernel v2 §A.2 part 2 (S4): pass cgn_config so
+                    # CGNConsumerClient.ShmWeightReader picks correct mode.
+                    cgn_config=cfg,
                 )
                 _stats = self._meta_cgn.get_stats()
                 logger.info(
@@ -962,6 +991,16 @@ class MetaReasoningEngine:
         # Used for primitive selection bias during the chain.
         self._suggested_template = None
         self._suggested_template_q = 0.0
+
+        # ── rFP_titan_meta_outer_layer — Bridges 1-5 ───────────────────
+        # OuterContextReader is wired by spirit_worker at its own init time
+        # via set_outer_reader(). Engine stays constructible in standalone
+        # test contexts (no reader → outer-layer paths return early).
+        self._outer_reader = None
+        # In-flight composed-recall future per active chain. Written by
+        # _start_chain/FORMULATE when needs_outer fires; consumed by the
+        # first primitive that reads outer_context (e.g. RECALL.entity).
+        self._outer_future = None
 
         # EMA tracking
         self._baseline_confidence = 0.5
@@ -1062,13 +1101,22 @@ class MetaReasoningEngine:
                 else:
                     break
             if _consec >= 1:
+                # Chain entries are compound "PRIMITIVE.subtype" names
+                # (FORMULATE.define, RECALL.episodic_specific, etc.) but
+                # META_PRIMITIVES only holds the 9 base primitives — strip
+                # the sub-mode before lookup. Without this strip, every
+                # compound-chain repeat penalty silently failed (1000+
+                # ValueErrors logged once Pattern C migration surfaced
+                # them 2026-04-25).
+                _last_base = _last.split(".", 1)[0]
                 try:
-                    _last_idx = META_PRIMITIVES.index(_last)
+                    _last_idx = META_PRIMITIVES.index(_last_base)
                     _penalty = min(self._repeat_decay_per_step * _consec,
                                    self._repeat_decay_max)
                     _repeat_bias[_last_idx] = -_penalty
-                except ValueError:
-                    pass
+                except ValueError as _swallow_exc:
+                    swallow_warn('[logic.meta_reasoning] MetaReasoningEngine.tick: META_PRIMITIVES.index(_last_base)', _swallow_exc,
+                                 key='logic.meta_reasoning.MetaReasoningEngine.tick.line1107', throttle=100)
 
         # TUNING-012 v2 Sub-phase C (R3): apply diversity pressure if active.
         # When monoculture_detector contract has fired and the handler called
@@ -1142,7 +1190,8 @@ class MetaReasoningEngine:
                             )
             except Exception as _tb_err:
                 # Soft fail — template bias is a non-critical optimization
-                pass
+                swallow_warn('[logic.meta_reasoning] MetaReasoningEngine.tick: from titan_plugin.logic.task_embedding import template_to...', _tb_err,
+                             key='logic.meta_reasoning.MetaReasoningEngine.tick.line1181', throttle=100)
 
         # Audit telemetry: if ε-greedy picked INTROSPECT but template-bias
         # just rerouted to something else, count as rerouted. Preserves the
@@ -1420,18 +1469,21 @@ class MetaReasoningEngine:
             try:
                 if hasattr(x, "tolist"):
                     return x.tolist()
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn("[logic.meta_reasoning] MetaReasoningEngine._jsonable_default: if hasattr(x, 'tolist'): return x.tolist()", _swallow_exc,
+                             key='logic.meta_reasoning.MetaReasoningEngine._jsonable_default.line1460', throttle=100)
             try:
                 if hasattr(x, "item"):
                     return x.item()
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn("[logic.meta_reasoning] MetaReasoningEngine._jsonable_default: if hasattr(x, 'item'): return x.item()", _swallow_exc,
+                             key='logic.meta_reasoning.MetaReasoningEngine._jsonable_default.line1465', throttle=100)
             try:
                 if hasattr(x, "to_dict"):
                     return x.to_dict()
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn("[logic.meta_reasoning] MetaReasoningEngine._jsonable_default: if hasattr(x, 'to_dict'): return x.to_dict()", _swallow_exc,
+                             key='logic.meta_reasoning.MetaReasoningEngine._jsonable_default.line1470', throttle=100)
             try:
                 return repr(x)[:200]
             except Exception:
@@ -1591,8 +1643,9 @@ class MetaReasoningEngine:
             try:
                 if os.path.exists(tmp_stats):
                     os.remove(tmp_stats)
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn('[logic.meta_reasoning] MetaReasoningEngine.save_all: if os.path.exists(tmp_stats): os.remove(tmp_stats)', _swallow_exc,
+                             key='logic.meta_reasoning.MetaReasoningEngine.save_all.line1631', throttle=100)
 
     def get_stats(self) -> dict:
         prim_counts = {}
@@ -1876,6 +1929,8 @@ class MetaReasoningEngine:
         self.state.chain_id = self._next_chain_id
         self._next_chain_id += 1
         self._total_meta_chains += 1
+        # rFP_titan_meta_outer_layer — clear in-flight outer future from prior chain.
+        self._reset_outer_state()
 
         # EMOT-CGN: emit FELT_CLUSTER_UPDATE to worker (Phase 1.6h cutover).
         # Worker's clusterer assigns primitive + updates shm. Meta-reasoning
@@ -1888,8 +1943,9 @@ class MetaReasoningEngine:
                 emit_felt_cluster_update(
                     self._send_queue, src="spirit",
                     felt_tensor_130d=list(state_132d[:130]))
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn('[logic.meta_reasoning] MetaReasoningEngine._start_chain: from titan_plugin.bus import emit_felt_cluster_update', _swallow_exc,
+                         key='logic.meta_reasoning.MetaReasoningEngine._start_chain.line1930', throttle=100)
         # Snapshot dominant emotion at chain start from shm (worker-written).
         # Used by H5 drift hypothesis in EMOT_CHAIN_EVIDENCE ctx at conclude.
         try:
@@ -2343,6 +2399,169 @@ class MetaReasoningEngine:
                 self._inengine_mono_total_fires,
             )
 
+    # ── rFP_titan_meta_outer_layer wiring ─────────────────────────
+
+    def set_outer_reader(self, reader) -> None:
+        """Wire the OuterContextReader. Called by spirit_worker at boot.
+
+        reader may be None — engine continues with outer paths inert.
+        """
+        self._outer_reader = reader
+
+    def _outer_enabled(self) -> bool:
+        """True iff reader is wired AND runtime flag is set."""
+        if self._outer_reader is None:
+            return False
+        try:
+            return bool(self._outer_reader.is_active())
+        except Exception:
+            return False
+
+    def _dispatch_outer_fetch(self) -> None:
+        """Submit compose_recall_query if needs_outer is populated + flag on.
+
+        Called at chain start (after FORMULATE populates needs_outer).
+        No-op if already dispatched or gate off.
+        """
+        if self._outer_future is not None:
+            return
+        if not self._outer_enabled():
+            return
+        if not self.state.needs_outer:
+            return
+        try:
+            self._outer_future = self._outer_reader.compose_recall_query(
+                dict(self.state.entity_refs))
+        except Exception as e:
+            swallow_warn('[MetaOuter] dispatch err', e,
+                         key="logic.meta_reasoning.dispatch_err", throttle=100)
+            self._outer_future = None
+
+    def _await_outer_context(self, timeout_s: float = 0.2) -> Optional[dict]:
+        """Block up to timeout_s on the in-flight composed-recall future.
+
+        Returns the composed outer_context dict (also stashed onto
+        self.state.outer_context), or None if unavailable.
+        """
+        if not self._outer_enabled():
+            return None
+        if self.state.outer_context:
+            return self.state.outer_context
+        if self._outer_future is None:
+            # Lazy dispatch if a primitive asked for outer context but
+            # FORMULATE didn't emit needs_outer. Use whatever entity_refs
+            # we have; safe no-op if empty.
+            if self.state.entity_refs:
+                self.state.needs_outer = dict(self.state.entity_refs)
+                self._dispatch_outer_fetch()
+            if self._outer_future is None:
+                return None
+        try:
+            ctx = self._outer_future.result(timeout=float(timeout_s))
+        except Exception:
+            return None
+        if isinstance(ctx, dict):
+            self.state.outer_context = ctx
+            return ctx
+        return None
+
+    def _reset_outer_state(self) -> None:
+        """Called at chain start/conclude to drop in-flight future."""
+        self._outer_future = None
+
+    def _post_formulate_detect_entities(self) -> None:
+        """After FORMULATE, detect entity/topic references in the formulated
+        intent. Populate state.entity_refs + state.needs_outer; dispatch
+        composed-recall future if gate on.
+
+        Sources scanned (most-specific first):
+          - state.formulate_output["participant_person_id"] (direct set by
+            upstream formulate paths that already know the person)
+          - state.impasse_topic (set by SOAR impasse detection at §D.2)
+          - state.trigger_reason (free-text; contains @handle or topic hints)
+          - state.formulate_output["problem_template"] (fallback)
+
+        Conservative: only populate entity_refs if a pattern confidently
+        matches (starts with '@' → person; explicit "topic:" prefix → topic).
+        No false positives on pure anomaly-dim formulations.
+        """
+        if not self._outer_enabled():
+            return
+        if self.state.entity_refs or self.state.needs_outer:
+            return  # already set — don't clobber
+        refs: dict = {}
+        # 1. Direct participant (if upstream set it)
+        fo = self.state.formulate_output or {}
+        pid = fo.get("participant_person_id")
+        if isinstance(pid, str) and pid:
+            refs["primary_person"] = pid
+        # 2. Impasse topic
+        topic = self.state.impasse_topic or fo.get("impasse_topic")
+        if isinstance(topic, str) and topic:
+            refs["current_topic"] = topic
+        # 3. Trigger-reason scan — look for '@handle' or 'person:XYZ' or 'topic:XYZ'
+        trig = self.state.trigger_reason or ""
+        if isinstance(trig, str) and "primary_person" not in refs:
+            for tok in trig.split():
+                if tok.startswith("@") and len(tok) > 1:
+                    refs["primary_person"] = tok
+                    break
+                if tok.startswith("person:") and len(tok) > 7:
+                    refs["primary_person"] = tok[7:]
+                    break
+        if isinstance(trig, str) and "current_topic" not in refs:
+            low = trig.lower()
+            marker = "topic:"
+            if marker in low:
+                i = low.index(marker) + len(marker)
+                tail = trig[i:].strip().split()[0] if i < len(trig) else ""
+                if tail:
+                    refs["current_topic"] = tail
+        # No entity/topic detected → skip dispatch (cheap path for inner chains)
+        if not refs:
+            return
+        self.state.entity_refs = refs
+        self.state.needs_outer = dict(refs)
+        self._dispatch_outer_fetch()
+
+    def _emit_meta_outer_reward(self) -> None:
+        """Emit META_OUTER_REWARD bus msg at chain conclude if outer was used.
+
+        Reward shape: +config.reward_weight on successful use, -0.5*weight
+        on hint-emitted-but-timeout (debit for wasted fetch). Wrapped in
+        try/except — reward emission never breaks chain conclude.
+        """
+        try:
+            if self._send_queue is None:
+                return
+            if not self._outer_enabled():
+                return
+            cid = self.state.chain_id
+            if cid is None or cid < 0:
+                return
+            used = bool(self.state.outer_context_used)
+            had_hint = bool(self.state.needs_outer)
+            if not used and not had_hint:
+                return  # no signal to emit
+            cfg_w = 0.0
+            try:
+                cfg_w = float(self._outer_reader.config.reward_weight)
+            except Exception as _swallow_exc:
+                swallow_warn('[logic.meta_reasoning] MetaReasoningEngine._emit_meta_outer_reward: cfg_w = float(self._outer_reader.config.reward_weight)', _swallow_exc,
+                             key='logic.meta_reasoning.MetaReasoningEngine._emit_meta_outer_reward.line2532', throttle=100)
+            if cfg_w <= 0.0:
+                return  # observe-only mode
+            delta = cfg_w if used else (-0.5 * cfg_w)
+            reason = "outer_used" if used else "outer_hint_no_data"
+            from titan_plugin.bus import make_msg
+            self._send_queue.put(make_msg(
+                bus.META_OUTER_REWARD, "spirit", "chain_iql",
+                {"chain_id": cid, "reward_delta": delta, "reason": reason}
+            ))
+        except Exception as e:
+            swallow_warn('[MetaOuter] reward emit err', e,
+                         key="logic.meta_reasoning.reward_emit_err", throttle=100)
+
     def _conclude_chain(self, state_132d, chain_archive, meta_wisdom, autoencoder):
         """Conclude meta-chain: compute reward, archive, possibly save wisdom."""
         # Track unique-prim count for adaptive epsilon-greedy escape mechanism
@@ -2530,6 +2749,23 @@ class MetaReasoningEngine:
                             "chain_length": len(prims_in_chain),
                         },
                     )
+                    # Upgrade III peer publishing (audit 2026-04-23 Q2) —
+                    # broadcast meta chain-outcome so emot_cgn + other peer
+                    # consumers can learn from it. Rate-gated + informative
+                    # filter inside emit_cross_insight.
+                    if getattr(self._meta_cgn, "_cgn_client", None):
+                        try:
+                            self._meta_cgn._cgn_client.emit_cross_insight(
+                                terminal_reward=task_success_mcgn,
+                                ctx={
+                                    "domain": final_domain_mcgn,
+                                    "chain_length": len(prims_in_chain),
+                                    "primitive": prim_id,
+                                },
+                            )
+                        except Exception as _ci_err:
+                            swallow_warn('[MetaReasoning] meta cross-insight emit failed', _ci_err,
+                                         key="logic.meta_reasoning.meta_cross_insight_emit_failed", throttle=100)
                 # Phase 2 — HAOV evidence per chain (one record, not per-prim)
                 self._meta_cgn.observe_chain_evidence({
                     "ts": time.time(),
@@ -2583,8 +2819,8 @@ class MetaReasoningEngine:
                             self._meta_cgn.mark_helpful(
                                 str(winner.get("source", "unknown")))
                 except Exception as _p8_err:
-                    logger.debug("[META] P8 knowledge finalize error: %s",
-                                 _p8_err)
+                    swallow_warn('[META] P8 knowledge finalize error', _p8_err,
+                                 key="logic.meta_reasoning.p8_knowledge_finalize_error", throttle=100)
             except Exception as _mcgn_err:
                 logger.warning("[META] META-CGN hook failed: %s "
                                "(chain continues unaffected)", _mcgn_err)
@@ -2611,8 +2847,9 @@ class MetaReasoningEngine:
                 _st = ShmEmotReader().read_state()
                 if _st is not None:
                     dom_end = EMOT_PRIMITIVES[_st["dominant_idx"]]
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn('[logic.meta_reasoning] MetaReasoningEngine._conclude_chain: from titan_plugin.logic.emot_shm_protocol import ShmEmotR...', _swallow_exc,
+                             key='logic.meta_reasoning.MetaReasoningEngine._conclude_chain.line2832', throttle=100)
 
             # Neuromods: prefer `self._last_neuromods_dict` (real per-tick
             # reading stashed in tick()) over mcgn_ctx (which pulls from
@@ -2691,8 +2928,8 @@ class MetaReasoningEngine:
                     terminal_reward=float(terminal_reward),
                     ctx=_emot_ctx)
         except Exception as _emot_err:
-            logger.debug("[META] EMOT_CHAIN_EVIDENCE emit error: %s",
-                         _emot_err)
+            swallow_warn('[META] EMOT_CHAIN_EVIDENCE emit error', _emot_err,
+                         key="logic.meta_reasoning.emot_chain_evidence_emit_error", throttle=100)
 
         # Update baseline EMA
         self._baseline_confidence = (
@@ -2821,7 +3058,94 @@ class MetaReasoningEngine:
         # lower the impasse threshold for the next window (emergent curiosity).
         self.record_curiosity_success(terminal_reward)
 
+        # ── Meta-Reasoning Teacher: META_CHAIN_COMPLETE emission ──
+        # Per rFP_titan_meta_reasoning_teacher §3.3. Emitted unconditionally
+        # after all existing chain-conclude hooks — teacher worker decides
+        # whether to critique (sampling + rate cap). dst="all". No subscriber
+        # when teacher is disabled → silent drop per documented behavior.
+        #
+        # rFP_meta_teacher_v2 Phase A (2026-04-24): outer_summary +
+        # step_arguments now ride along so the teacher sees what each step
+        # was reasoning ABOUT, not just which primitives were used. Both
+        # optional in the payload; graceful fallback when absent.
+        try:
+            from titan_plugin.bus import emit_meta_chain_complete
+            from titan_plugin.logic.meta_teacher_content import (
+                build_teacher_outer_summary, build_step_arguments,
+            )
+            if self._send_queue is not None and prims_in_chain:
+                transitions = [
+                    (prims_in_chain[i], prims_in_chain[i + 1])
+                    for i in range(len(prims_in_chain) - 1)
+                ]
+                haov_hid = None
+                try:
+                    if self._meta_cgn is not None and hasattr(
+                            self._meta_cgn, "_last_haov_hypothesis_id"):
+                        haov_hid = getattr(
+                            self._meta_cgn, "_last_haov_hypothesis_id", None)
+                except Exception as _swallow_exc:
+                    swallow_warn('[logic.meta_reasoning] MetaReasoningEngine._conclude_chain: if self._meta_cgn is not None and hasattr(self._meta_cgn,...', _swallow_exc,
+                                 key='logic.meta_reasoning.MetaReasoningEngine._conclude_chain.line3068', throttle=100)
+                _mcgn_ctx_local = locals().get("mcgn_ctx") or {}
+                # Phase A: build content helpers — defensive try/except so
+                # a helper bug never blocks teacher emission.
+                try:
+                    outer_summary = build_teacher_outer_summary(self.state)
+                except Exception as _os_err:
+                    swallow_warn('[META] build_teacher_outer_summary failed', _os_err,
+                                 key="logic.meta_reasoning.build_teacher_outer_summary_failed", throttle=100)
+                    outer_summary = None
+                try:
+                    step_arguments = build_step_arguments(self.state)
+                except Exception as _sa_err:
+                    swallow_warn('[META] build_step_arguments failed', _sa_err,
+                                 key="logic.meta_reasoning.build_step_arguments_failed", throttle=100)
+                    step_arguments = []
+                emit_meta_chain_complete(
+                    self._send_queue, src="spirit",
+                    chain_id=self.state.chain_id,
+                    primitives_used=list(prims_in_chain),
+                    primitive_transitions=transitions,
+                    chain_length=len(self.state.chain),
+                    domain=chain_domain,
+                    task_success=chain_task_success,
+                    chain_iql_confidence=float(self.state.confidence),
+                    start_epoch=int(self.state.start_epoch),
+                    conclude_epoch=int(time.time()),
+                    context_summary={
+                        "dominant_emotion": str(
+                            getattr(self, "_emot_dom_at_chain_start", "FLOW")),
+                        "chi_remaining": float(
+                            _mcgn_ctx_local.get("chi_remaining", 0.0)),
+                        "impasse_state": (
+                            "detected" if self.state.impasse_detected else "none"),
+                        "trigger_reason": str(self.state.trigger_reason or ""),
+                        "knowledge_injected": bool(self.state.knowledge_injected),
+                    },
+                    haov_hypothesis_id=haov_hid,
+                    final_observation={
+                        "chain_template": chain_template,
+                        "unique_primitives": unique_in_chain,
+                    },
+                    outer_summary=outer_summary,
+                    step_arguments=step_arguments,
+                )
+        except Exception as _mtc_err:
+            swallow_warn('[META] META_CHAIN_COMPLETE emit failed', _mtc_err,
+                         key="logic.meta_reasoning.meta_chain_complete_emit_failed", throttle=100)
+
+        # rFP_titan_meta_outer_layer — emit META_OUTER_REWARD before reset
+        # so chain_id + outer_context_used are still on self.state.
+        self._emit_meta_outer_reward()
+        # Observability — include outer-layer stats in the returned result
+        # so spirit_worker's brain-log line surfaces them to the user.
+        result["outer_context_used"] = bool(self.state.outer_context_used)
+        if self.state.needs_outer:
+            result["outer_hint_entities"] = list(self.state.entity_refs.keys())
+
         self.state = MetaChainState()  # Reset
+        self._reset_outer_state()
         return result
 
     # ── Phase D.1 — External reward injection (META_LANGUAGE loop) ────
@@ -3136,7 +3460,12 @@ class MetaReasoningEngine:
     def _execute(self, prim, sub, sv, nm, reasoning_engine,
                  chain_archive, meta_wisdom, ex_mem, autoencoder):
         if prim == "FORMULATE":
-            return self._prim_formulate(sub, sv, nm, meta_wisdom, autoencoder)
+            result = self._prim_formulate(sub, sv, nm, meta_wisdom, autoencoder)
+            # rFP_titan_meta_outer_layer Bridge 2 — detect entity/topic refs
+            # from the formulated intent; populate entity_refs + needs_outer;
+            # dispatch composed-recall future so later primitives can read it.
+            self._post_formulate_detect_entities()
+            return result
         elif prim == "RECALL":
             return self._prim_recall(sub, chain_archive, meta_wisdom, ex_mem)
         elif prim == "HYPOTHESIZE":
@@ -3277,8 +3606,9 @@ class MetaReasoningEngine:
                 results = ex_mem.recall_similar(domain, top_k=5)
                 if results:
                     best_match = results[0] if isinstance(results[0], dict) else {"score": results[0]}
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn("[logic.meta_reasoning] MetaReasoningEngine._prim_recall: domain = self.state.formulate_output.get('domain', 'gener...", _swallow_exc,
+                             key='logic.meta_reasoning.MetaReasoningEngine._prim_recall.line3589', throttle=100)
 
         elif sub == "wisdom" and meta_wisdom:
             template = self.state.formulate_output.get("problem_template", "")
@@ -3287,7 +3617,48 @@ class MetaReasoningEngine:
                 best_match = results[0]
 
         elif sub == "entity":
-            pass  # Future: social_graph query
+            # rFP_titan_meta_outer_layer Bridge 1+2 — composed RECALL across
+            # heterogeneous stores keyed by entity_refs["primary_person"].
+            # Blocks up to 200ms on the async composed-recall future that
+            # FORMULATE dispatched. Falls back to inner-only gracefully if
+            # outer_reader not wired or is_active() is False.
+            outer = self._await_outer_context(timeout_s=0.2)
+            if outer:
+                person = (outer.get("person") or {})
+                felt = outer.get("felt_history") or []
+                events = outer.get("recent_events") or []
+                if person or felt or events:
+                    results = []
+                    if person:
+                        results.append({"kind": "person", "data": person})
+                    for f in felt[:5]:
+                        results.append({"kind": "felt", "data": f})
+                    for e in events[:3]:
+                        results.append({"kind": "event", "data": e})
+                    if results:
+                        best_match = results[0]
+                        self.state.outer_context_used = True
+
+        elif sub == "topic":
+            # rFP_titan_meta_outer_layer Bridge 1 — topic-scoped composed recall.
+            # Pulls concept (via knowledge_worker bus-RPC) + felt_experiences
+            # mentioning the topic + inner narrative snippets.
+            outer = self._await_outer_context(timeout_s=0.2)
+            if outer:
+                concept = outer.get("topic")
+                felt = outer.get("felt_history") or []
+                inner = outer.get("inner_narrative") or []
+                if concept or felt or inner:
+                    results = []
+                    if concept:
+                        results.append({"kind": "concept", "data": concept})
+                    for f in felt[:5]:
+                        results.append({"kind": "felt", "data": f})
+                    for n in inner[:5]:
+                        results.append({"kind": "inner", "data": n})
+                    if results:
+                        best_match = results[0]
+                        self.state.outer_context_used = True
 
         # ── F-phase compositional sub-modes (rFP §6) ────────────────────
         # Session 1: each new sub-mode falls back to the closest existing
@@ -3300,8 +3671,9 @@ class MetaReasoningEngine:
                 if results:
                     best_match = (results[0] if isinstance(results[0], dict)
                                   else {"score": results[0]})
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn("[logic.meta_reasoning] MetaReasoningEngine._prim_recall: domain = self.state.formulate_output.get('domain', 'gener...", _swallow_exc,
+                             key='logic.meta_reasoning.MetaReasoningEngine._prim_recall.line3653', throttle=100)
 
         elif sub == "semantic_neighbors":
             pass  # Session 2: semantic_graph.neighbors resolver
@@ -3320,8 +3692,9 @@ class MetaReasoningEngine:
                 if results:
                     best_match = (results[0] if isinstance(results[0], dict)
                                   else {"score": results[0]})
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn("[logic.meta_reasoning] MetaReasoningEngine._prim_recall: domain = self.state.formulate_output.get('domain', 'gener...", _swallow_exc,
+                             key='logic.meta_reasoning.MetaReasoningEngine._prim_recall.line3673', throttle=100)
 
         is_new_mode = sub in ("episodic_specific", "semantic_neighbors",
                                "procedural_matching",
@@ -3433,6 +3806,13 @@ class MetaReasoningEngine:
 
     def _prim_delegate(self, sub, reasoning_engine):
         """Inject strategy bias into main reasoning."""
+        # rFP_titan_meta_outer_layer Bridge 3 — active search / gap-fill.
+        # When chain hit impasse OR composed recall returned thin, DELEGATE
+        # can invoke external fetchers: knowledge_search, X timeline,
+        # events_window_poll. Result flows into outer_context.gap_fill.
+        if sub == "gap_fill":
+            return self._prim_delegate_gap_fill()
+
         if not reasoning_engine or not self.state.hypotheses:
             return {"primitive": "DELEGATE", "sub_mode": sub,
                     "delegated": False, "reason": "no_hypothesis"}
@@ -3462,6 +3842,60 @@ class MetaReasoningEngine:
         return {"primitive": "DELEGATE", "sub_mode": sub,
                 "delegated": True, "bias": bias.tolist(),
                 "strategy": strategy, "confidence": self.state.confidence}
+
+    def _prim_delegate_gap_fill(self):
+        """DELEGATE.gap_fill — pull fresh external data when chain is thin.
+
+        Invokes knowledge_search, X timeline search, or events window poll
+        based on what the chain seems to need. Config-gated per source:
+          - active_search_knowledge (default True)
+          - active_search_x (default False)
+          - active_search_events (default False)
+
+        Result stored in outer_context["gap_fill"] for subsequent primitives.
+        """
+        if not self._outer_enabled():
+            return {"primitive": "DELEGATE", "sub_mode": "gap_fill",
+                    "gap_filled": False, "reason": "outer_inactive"}
+        reader = self._outer_reader
+        topic = self.state.entity_refs.get("current_topic") or ""
+        person = self.state.entity_refs.get("primary_person") or ""
+        if not topic and not person and not self.state.impasse_topic:
+            return {"primitive": "DELEGATE", "sub_mode": "gap_fill",
+                    "gap_filled": False, "reason": "no_handle"}
+        gap: dict = {"sources": []}
+        try:
+            if topic or self.state.impasse_topic:
+                t = topic or self.state.impasse_topic
+                kn = reader.knowledge_search(t, max_results=5)
+                if kn:
+                    gap["knowledge"] = kn
+                    gap["sources"].append("knowledge")
+                if reader.config.active_search_x:
+                    x_q = (f"@{person[1:]} {t}".strip()
+                           if person.startswith("@") else t)
+                    x_hits = reader.x_timeline_search(x_q, count=10)
+                    if x_hits:
+                        gap["x_timeline"] = x_hits
+                        gap["sources"].append("x_timeline")
+            if reader.config.active_search_events:
+                ev = reader.events_window_poll()
+                if ev:
+                    gap["events_window"] = ev
+                    gap["sources"].append("events_window")
+        except Exception as e:
+            swallow_warn('[MetaOuter] gap_fill err', e,
+                         key="logic.meta_reasoning.gap_fill_err", throttle=100)
+        if not gap["sources"]:
+            return {"primitive": "DELEGATE", "sub_mode": "gap_fill",
+                    "gap_filled": False, "reason": "all_sources_empty"}
+        # Stash onto outer_context so downstream primitives can read
+        self.state.outer_context.setdefault("gap_fill", {})
+        self.state.outer_context["gap_fill"] = gap
+        self.state.outer_context_used = True
+        return {"primitive": "DELEGATE", "sub_mode": "gap_fill",
+                "gap_filled": True, "sources": gap["sources"],
+                "confidence": self.state.confidence}
 
     def _check_delegate(self, reasoning_engine):
         """Check if delegated main reasoning has completed."""
@@ -3588,6 +4022,47 @@ class MetaReasoningEngine:
                     "recommendation": "continue" if has_energy else "conclude",
                     "confidence": self.state.confidence}
 
+        elif sub == "peer_cgn":
+            # rFP_titan_meta_outer_layer Bridge 4 — weight meta confidence
+            # by peer CGN consumers' β-posterior on current topic. When
+            # peers are well-grounded on the topic, meta should be more
+            # confident; when peers are uncertain, meta tempers down.
+            if not self._outer_enabled():
+                return {"primitive": "EVALUATE", "sub_mode": "peer_cgn",
+                        "grounded": False, "reason": "outer_inactive",
+                        "confidence": self.state.confidence}
+            reader = self._outer_reader
+            topic = (self.state.entity_refs.get("current_topic")
+                     or self.state.impasse_topic or "")
+            if not topic:
+                return {"primitive": "EVALUATE", "sub_mode": "peer_cgn",
+                        "grounded": False, "reason": "no_topic",
+                        "confidence": self.state.confidence}
+            betas = []
+            for consumer in ("knowledge", "language", "social", "reasoning"):
+                b = reader.peer_cgn_beta(consumer, topic)
+                if b is not None:
+                    betas.append((consumer, b))
+            if not betas:
+                return {"primitive": "EVALUATE", "sub_mode": "peer_cgn",
+                        "grounded": False, "reason": "no_peer_data",
+                        "peers_queried": ["knowledge", "language", "social",
+                                           "reasoning"],
+                        "confidence": self.state.confidence}
+            avg_beta = sum(b for _, b in betas) / len(betas)
+            # Soft-modulate confidence (±10% max) — peer β is informative
+            # but cannot override meta's own estimate.
+            weight_nudge = (avg_beta - 0.5) * 0.2
+            new_conf = float(np.clip(self.state.confidence + weight_nudge,
+                                      0.0, 1.0))
+            self.state.confidence = new_conf
+            self.state.outer_context_used = True
+            return {"primitive": "EVALUATE", "sub_mode": "peer_cgn",
+                    "grounded": True, "peers": dict(betas),
+                    "avg_beta": round(avg_beta, 4),
+                    "confidence_nudge": round(weight_nudge, 4),
+                    "confidence": round(new_conf, 4)}
+
     # ── M7: BREAK Primitive ────────────────────────────────────────
 
     def _save_checkpoint(self):
@@ -3712,7 +4187,8 @@ class MetaReasoningEngine:
                         bond_health.get("agreement_trajectory", 0))
                     return result
             except Exception as _ma_err:
-                logger.debug("[META] maker_alignment error: %s", _ma_err)
+                swallow_warn('[META] maker_alignment error', _ma_err,
+                             key="logic.meta_reasoning.maker_alignment_error", throttle=100)
             return {
                 "primitive": "INTROSPECT", "sub_mode": "maker_alignment",
                 "alignment_score": 0.5, "confidence": 0.2,
@@ -4497,8 +4973,9 @@ class MetaReasoningEngine:
                 for prim, data in sub_data.items():
                     if prim in self.sub_mode_policies:
                         self.sub_mode_policies[prim].from_dict(data)
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn('[logic.meta_reasoning] MetaReasoningEngine._load: with open(sub_path) as f: sub_data = json.load(f)', _swallow_exc,
+                             key='logic.meta_reasoning.MetaReasoningEngine._load.line4953', throttle=100)
         self.buffer.load(os.path.join(self.save_dir, "meta_buffer.json"))
         # Stats
         stats_path = os.path.join(self.save_dir, "meta_stats.json")

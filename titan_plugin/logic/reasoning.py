@@ -1222,6 +1222,15 @@ class ReasoningEngine:
     def __init__(self, config: dict = None):
         cfg = config or {}
 
+        # BUG-I-007-REASON-COUNTER-RESET: every ReasoningEngine instantiation
+        # logs a WARN-level breadcrumb so an unexpected counter reset
+        # (4→0 with no parent restart) leaves a clear audit trail. Pair with
+        # `_load_totals` log which distinguishes fresh-boot vs restored.
+        logger.warning(
+            "[Reasoning] ReasoningEngine.__init__ called (PID=%d) — "
+            "counters will be loaded from disk if reasoning_totals.json exists",
+            os.getpid())
+
         # Core parameters
         self.max_chain_length = cfg.get("max_chain_length", 10)
         self.min_chain_length = cfg.get("min_chain_length", 3)  # Must think before concluding
@@ -2259,6 +2268,13 @@ class ReasoningEngine:
         try:
             path = os.path.join(self.save_dir, "reasoning_totals.json")
             if not os.path.exists(path):
+                # BUG-I-007-REASON-COUNTER-RESET: fresh-boot path produces a
+                # WARN so an unexpected counter reset (file gone but parent
+                # process still alive) is visible in brain logs.
+                logger.warning(
+                    "[Reasoning] _load_totals: no totals file at %s — "
+                    "fresh boot or state was reset (counters start at 0)",
+                    path)
                 return
             with open(path) as f:
                 data = json.load(f)

@@ -23,6 +23,7 @@ import math
 import os
 import time
 from typing import Optional
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -552,7 +553,8 @@ class NeuromodulatorSystem:
                 logger.info("[NeuromodulatorSystem] Rolling snapshot saved: eval=%d emotion=%s",
                             self._total_evaluations, self._current_emotion)
         except Exception as e:
-            logger.debug("[NeuromodulatorSystem] Save error: %s", e)
+            swallow_warn('[NeuromodulatorSystem] Save error', e,
+                         key="logic.neuromodulator.save_error", throttle=100)
 
     def _load_state(self) -> None:
         """Load neuromod state from primary file, fall back to latest snapshot."""

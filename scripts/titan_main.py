@@ -179,7 +179,8 @@ async def _print_health(plugin):
     print()
 
 
-async def run(health_only: bool = False, server_only: bool = False):
+async def run(health_only: bool = False, server_only: bool = False,
+              restore_from: str | None = None, shadow_port: int | None = None):
     """Boot the Titan and enter the main loop.
 
     Guardian microkernel is the sole boot path (V2 monolith removed 2026-04-03).
@@ -214,17 +215,88 @@ async def run(health_only: bool = False, server_only: bool = False):
         cfg = {}
 
     # ── Guardian Microkernel Boot ────────────────────────────────────
-    from titan_plugin.v5_core import TitanCore
+    # Microkernel v2 Phase A S3 — flag-branched boot path per
+    # titan-docs/PLAN_microkernel_phase_a_s3.md §3 D3 + §4.4.
+    # Default false → legacy TitanCore monolith (byte-identical to
+    # pre-S3 behavior). Flip on for kernel+plugin split; per-Titan
+    # cutover (T2 → T3 → T1) with 24h soak gates per PLAN §8.
+    _split_enabled = bool(
+        cfg.get("microkernel", {}).get("kernel_plugin_split_enabled", False)
+    )
 
     print()
     print("=" * 60)
-    print("  TITAN — Microkernel Mode")
+    if _split_enabled:
+        print("  TITAN — Microkernel Mode (kernel/plugin split)")
+    else:
+        print("  TITAN — Microkernel Mode (legacy monolith)")
     print("=" * 60)
     print()
 
-    logging.info("Booting Titan microkernel...")
-    core = TitanCore(wallet_path)
-    await core.boot()
+    if _split_enabled:
+        from titan_plugin.core.kernel import TitanKernel
+        from titan_plugin.core.plugin import TitanPlugin
+        logging.info("Booting Titan microkernel v2 (kernel+plugin split)...")
+        kernel = TitanKernel(wallet_path)
+
+        # Microkernel v2 Phase B.1 §4 — Shadow Core Swap restore hook.
+        # When orchestrator (scripts/shadow_swap.py) boots a shadow kernel
+        # via `--restore-from PATH`, verify the snapshot's compatibility
+        # with this kernel BEFORE workers spawn. On verify failure we log
+        # + continue clean boot — refusing to boot would leave the system
+        # without a kernel; orchestrator's HIBERNATE_CANCEL rollback path
+        # restores the old kernel instead.
+        _restore_result = None
+        if restore_from:
+            _restore_result = kernel.restore_from_snapshot(restore_from)
+            if _restore_result.get("verified"):
+                logging.info(
+                    "[B.1] Shadow restore VERIFIED — event_id=%s gap=%.1fs",
+                    _restore_result["event_id"][:8],
+                    _restore_result.get("age_seconds", 0.0),
+                )
+            else:
+                logging.warning(
+                    "[B.1] Shadow restore REFUSED — reason=%s — clean boot",
+                    _restore_result.get("reason", "?"),
+                )
+
+        # Microkernel v2 Phase B.1 §4 — shadow port override.
+        # Orchestrator passes --shadow-port N when booting a shadow kernel
+        # on the alternate ping-pong port (7777 ↔ 7779). The API subprocess
+        # reads TITAN_API_PORT from env if set, otherwise config.toml [api].
+        if shadow_port:
+            os.environ["TITAN_API_PORT"] = str(shadow_port)
+            logging.info("[B.1] Shadow port set: API will listen on %d", shadow_port)
+
+        core = TitanPlugin(kernel)
+        await core.boot()
+
+        # After workers spawn + are ready, surface the restore event_id
+        # to the bus so SystemForkBlock can be written by timechain_worker
+        # and SYSTEM_RESUMED can be published by spirit_worker.
+        if _restore_result and _restore_result.get("verified"):
+            from titan_plugin.bus import make_msg, SYSTEM_RESUMED
+            kernel.bus.publish(make_msg(
+                SYSTEM_RESUMED, src="kernel", dst="all",
+                payload={
+                    "event_id": _restore_result["event_id"],
+                    "kernel_version_from": _restore_result.get("kernel_version_from"),
+                    "kernel_version_to": kernel.kernel_version,
+                    "gap_seconds": _restore_result.get("age_seconds", 0.0),
+                },
+            ))
+    else:
+        from titan_plugin.legacy_core import TitanCore
+        logging.info("Booting Titan microkernel (legacy monolith)...")
+        core = TitanCore(wallet_path)
+        await core.boot()
+
+    # Downstream code (profiling baseline, agent creation, observatory
+    # access, prompt loop, shutdown) uses `core` as the plugin root.
+    # TitanPlugin's compat @property facade (bus, guardian, soul,
+    # _limbo_mode, _observatory_app, etc.) makes it duck-type-identical
+    # to TitanCore — zero further changes needed in this file.
 
     # ── Profiling baseline snapshot (after all boot allocations) ──
     if _tracemalloc_started:
@@ -244,6 +316,11 @@ async def run(health_only: bool = False, server_only: bool = False):
         logging.info("Titan Core online. Modules load on demand.")
 
     agent = core.create_agent()
+    # Cache on plugin so plugin.run_chat() can reach it without going
+    # through app.state — needed for the chat bus bridge (parent-side
+    # _chat_handler_loop calls self._agent.arun() with no FastAPI Request
+    # in scope). See BUG-CHAT-AGENT-NOT-INITIALIZED-API-SUBPROCESS.
+    core._agent = agent
     if hasattr(core, '_observatory_app') and core._observatory_app:
         core._observatory_app.state.titan_agent = agent
 
@@ -369,6 +446,13 @@ def main():
     parser = argparse.ArgumentParser(description="Titan Sovereign Agent Launcher")
     parser.add_argument("--health-only", action="store_true", help="Boot, run health check, and exit")
     parser.add_argument("--server", action="store_true", help="API-only mode (no interactive prompt loop)")
+    # ── Microkernel v2 Phase B.1 — Shadow Core Swap (rFP §347-357) ─────
+    parser.add_argument("--shadow-port", type=int, default=None,
+        help="Boot kernel on a shadow API port (e.g. 7779) for shadow swap. "
+             "Used by scripts/shadow_swap.py. Sets TITAN_API_PORT env var.")
+    parser.add_argument("--restore-from", type=str, default=None,
+        help="Path to runtime.msgpack from a hibernated kernel. Triggers "
+             "compatibility verification + SYSTEM_RESUMED publish on bus.")
     # --v3 kept for backwards compatibility (ignored — Guardian is always used)
     parser.add_argument("--v3", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -376,10 +460,37 @@ def main():
     # Auto-detect non-interactive stdin (cron, nohup, systemd) → server mode
     server_only = args.server or not os.isatty(sys.stdin.fileno())
 
-    # Prevent duplicate instances (except health-only checks)
+    # Prevent duplicate instances (except health-only checks + shadow boots).
+    # B.1 §7 — shadow boots (`--shadow-port`) MUST run alongside the
+    # original kernel; the PID lock would block the swap. Use a
+    # port-suffixed lock so two kernels (original + shadow) can coexist.
     if not args.health_only:
-        if not _acquire_pid_lock():
-            sys.exit(1)
+        if args.shadow_port:
+            # Shadow kernel — use port-suffixed lock for parallel running.
+            global _pid_lock_path  # type: ignore
+            _pid_lock_path = os.path.join(
+                os.path.dirname(__file__), "..", "data",
+                f"titan_main.shadow_{args.shadow_port}.pid",
+            )
+            _pid_lock_path = os.path.normpath(_pid_lock_path)
+            # Inline equivalent of _acquire_pid_lock but using the shadow path.
+            try:
+                import fcntl
+                fd = os.open(_pid_lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+                lock_fp = os.fdopen(fd, "r+")
+                fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_fp.seek(0); lock_fp.truncate()
+                lock_fp.write(str(os.getpid())); lock_fp.flush()
+                # Stash for cleanup at shutdown
+                global _pid_lock_fd  # type: ignore
+                _pid_lock_fd = lock_fp
+                logging.info("[B.1] Shadow PID lock acquired: %s", _pid_lock_path)
+            except (IOError, OSError) as e:
+                print(f"\n  *** ABORT: Shadow PID lock {_pid_lock_path} held by another shadow ({e})\n")
+                sys.exit(1)
+        else:
+            if not _acquire_pid_lock():
+                sys.exit(1)
 
     # ── Process group: ensure kill of parent cascades to all children ──
     # Become process group leader. All child processes (Guardian modules)
@@ -429,7 +540,8 @@ def main():
     atexit.register(_kill_stragglers)
 
     try:
-        asyncio.run(run(health_only=args.health_only, server_only=server_only))
+        asyncio.run(run(health_only=args.health_only, server_only=server_only,
+                        restore_from=args.restore_from, shadow_port=args.shadow_port))
     except KeyboardInterrupt:
         print("\n  Titan shutdown complete.")
     except SystemExit:

@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger("titan.coding_explorer")
 
@@ -810,7 +811,8 @@ class CodingExplorer:
             conn.commit()
             conn.close()
         except Exception as e:
-            logger.debug("[CodingExplorer] DB insert failed: %s", e)
+            swallow_warn('[CodingExplorer] DB insert failed', e,
+                         key="logic.coding_explorer.db_insert_failed", throttle=100)
 
         # CGN transition (outcome)
         if self._send_queue:
@@ -837,6 +839,25 @@ class CodingExplorer:
                 })
             except Exception as e:
                 logger.debug("[CodingExplorer] CGN transition send failed: %s", e)
+
+            # Upgrade III peer publishing (audit 2026-04-23 Q2) — broadcast
+            # coding chain-outcome so emot_cgn + other peer consumers can
+            # learn from it. Rate-gated + informative filter inside.
+            try:
+                from titan_plugin.logic.cgn_consumer_client import (
+                    emit_chain_outcome_insight)
+                emit_chain_outcome_insight(
+                    self._send_queue, "spirit", "coding",
+                    float(result.reward),
+                    ctx={
+                        "action": result.action,
+                        "sandbox_success": bool(result.sandbox_success),
+                        "difficulty": result.difficulty,
+                    })
+            except Exception as _ci_err:
+                logger.debug(
+                    "[CodingExplorer] cross-insight emit failed: %s",
+                    _ci_err)
 
         # ── META-CGN producers #5 + #6: coding.problem_solved / coding.test_failed ──
         # v3 Phase D rollout (rFP_meta_cgn_v3 § 12 rows 5+6). Paired emission at the

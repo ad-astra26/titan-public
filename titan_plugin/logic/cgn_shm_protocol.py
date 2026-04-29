@@ -4,15 +4,28 @@ CGN Shared Memory Weight Propagation Protocol.
 Writes/reads V(s) and Q(s,a) weights via /dev/shm for near-real-time
 propagation (<1ms). Used by CGN Worker (writer) and CGNConsumerClient (reader).
 
-Binary format:
-  [0:4]    uint32 version_counter
-  [4:8]    uint32 num_consumers
-  [8:12]   uint32 value_net_bytes
-  [12:16]  uint32 total_payload_bytes
-  [16:V]   V(s) weights (contiguous float32)
-  [V:V+C]  Consumer entries: [4B name_len][name][4B weights_len][weights]
+Two operating modes (selected by feature flag at runtime):
 
-No external dependencies (struct + mmap only).
+LEGACY MODE (default — flag off, byte-identical pre-S4 behavior):
+  Single global file ``/dev/shm/cgn_live_weights.bin``.
+  Atomic write via tmp-file + rename.
+  Header: 16B [version:4][num_consumers:4][vnet_bytes:4][total_payload:4]
+
+STATEREGISTRY MODE (flag on — Microkernel v2 S4 alignment):
+  Per-titan path ``/dev/shm/titan_{id}/cgn_live_weights.bin``.
+  StateRegistry framework (mmap + SeqLock + 24B header).
+  Inner payload preserves the legacy 16B-header-prefixed format
+  verbatim — readers parse identically once they have the bytes.
+
+Per the 2026-04-17 Maker invariant + 2026-04-21 codification
+(memory/project_cgn_as_higher_state_registry.md), CGN is the higher-
+cognitive-level state registry that MUST share the same shm+version
+protocol as Trinity. STATEREGISTRY MODE closes the keystone gap.
+
+Authority preserved: cgn_worker remains sole writer in both modes.
+
+No external dependencies in legacy mode (struct + mmap only). Adds
+StateRegistry import in stateregistry mode (titan_plugin.core.state_registry).
 """
 
 import logging
@@ -23,20 +36,92 @@ import tempfile
 import time
 
 import numpy as np
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
-HEADER_SIZE = 16  # version(4) + num_consumers(4) + vnet_bytes(4) + total(4)
+HEADER_SIZE = 16  # legacy header: version(4) + num_consumers(4) + vnet_bytes(4) + total(4)
 DEFAULT_SHM_PATH = "/dev/shm/cgn_live_weights.bin"
 MAX_SHM_SIZE = 256 * 1024  # 256KB — generous ceiling for 10 consumers
 
 
-class ShmWeightWriter:
-    """Write CGN weights to /dev/shm. Used by CGN Worker only."""
+# ── S4: flag-aware mode resolution ─────────────────────────────────
 
-    def __init__(self, shm_path: str = DEFAULT_SHM_PATH):
-        self._path = shm_path
+def _resolve_cgn_mode(
+    shm_path: str | None,
+    titan_id: str | None,
+    config: dict | None,
+) -> tuple[str, bool]:
+    """Resolve (path, use_stateregistry_format) for CGN shm I/O.
+
+    Mode selection (PLAN §2.5 D10):
+      1. Explicit non-default shm_path literal: legacy mode at that path
+         (escape hatch for tests + custom deployments).
+      2. Flag ``microkernel.shm_cgn_format_alignment_enabled = true``:
+         STATEREGISTRY mode at per-titan path.
+      3. Otherwise: LEGACY mode at DEFAULT_SHM_PATH (current behavior).
+
+    Returns (resolved_path, use_stateregistry_format).
+    """
+    # Explicit literal escape hatch
+    if shm_path and shm_path != DEFAULT_SHM_PATH:
+        return (shm_path, False)
+
+    cfg = config or {}
+    enabled = cfg.get("microkernel", {}).get(
+        "shm_cgn_format_alignment_enabled", False)
+
+    if enabled:
+        try:
+            from titan_plugin.core.state_registry import resolve_shm_root
+            root = resolve_shm_root(titan_id)
+            root.mkdir(parents=True, exist_ok=True)
+            return (str(root / "cgn_live_weights.bin"), True)
+        except Exception as e:
+            logger.warning(
+                "[cgn_shm_protocol] StateRegistry mode resolution failed "
+                "(falling back to legacy): %s", e)
+            return (DEFAULT_SHM_PATH, False)
+
+    return (DEFAULT_SHM_PATH, False)
+
+
+class ShmWeightWriter:
+    """Write CGN weights to /dev/shm. Used by CGN Worker only.
+
+    Dual-mode (S4): legacy 16B-header + global path OR 24B StateRegistry
+    header + per-titan path. Mode selected at construction via flag.
+    """
+
+    def __init__(self, shm_path: str | None = None,
+                 titan_id: str | None = None,
+                 config: dict | None = None):
+        self._path, self._use_stateregistry = _resolve_cgn_mode(
+            shm_path, titan_id, config)
         self._version = 0
+        self._sr_writer = None  # lazy: only init in stateregistry mode
+        if self._use_stateregistry:
+            try:
+                from titan_plugin.core.state_registry import (
+                    CGN_LIVE_WEIGHTS, StateRegistryWriter, resolve_shm_root,
+                )
+                self._sr_writer = StateRegistryWriter(
+                    CGN_LIVE_WEIGHTS, resolve_shm_root(titan_id))
+                # Initialize with empty payload — preserves legacy semantics
+                # for check_version() (returns -1 when no real write yet).
+                # Without this, the preallocated mmap region would expose
+                # MAX-sized zero-filled payload as version=0, causing readers
+                # to treat init state as a stale write.
+                self._sr_writer.write_variable(b"")
+                logger.info(
+                    "[ShmWriter] StateRegistry mode active (path=%s)",
+                    self._path)
+            except Exception as e:
+                logger.warning(
+                    "[ShmWriter] StateRegistry init failed (falling back to "
+                    "legacy): %s", e)
+                self._use_stateregistry = False
+                self._path = DEFAULT_SHM_PATH
 
     def write_full(self, value_net_state: dict,
                    consumer_nets: dict[str, dict],
@@ -68,7 +153,10 @@ class ShmWeightWriter:
 
         consumers_blob = b"".join(consumer_entries)
 
-        # Build full payload
+        # Build full payload (16B inner header + V-bytes + consumers + extra).
+        # This payload format is preserved verbatim in BOTH modes — readers
+        # parse it identically once they have the bytes (the 24B SeqLock
+        # header in stateregistry mode wraps but does not alter it).
         total_payload = len(v_bytes) + len(consumers_blob) + len(extra)
         header = struct.pack("<IIII",
                              self._version,
@@ -77,7 +165,18 @@ class ShmWeightWriter:
                              total_payload)
         payload = header + v_bytes + consumers_blob + extra
 
-        # Atomic write: write to tmp, rename
+        if self._use_stateregistry:
+            # S4 STATEREGISTRY MODE: write through StateRegistry framework.
+            # 24B outer header (SeqLock + per-titan path); inner format
+            # unchanged (16B legacy header + V-bytes + consumers + extra).
+            try:
+                self._sr_writer.write_variable(payload)
+            except Exception as e:
+                logger.warning(
+                    "[ShmWriter] StateRegistry write_variable failed: %s", e)
+            return self._version
+
+        # LEGACY MODE: atomic tmp-file + rename (byte-identical pre-S4).
         tmp_path = self._path + ".tmp"
         try:
             with open(tmp_path, "wb") as f:
@@ -89,8 +188,9 @@ class ShmWeightWriter:
             logger.warning("[ShmWriter] Write failed: %s", e)
             try:
                 os.remove(tmp_path)
-            except OSError:
-                pass
+            except OSError as _swallow_exc:
+                swallow_warn('[logic.cgn_shm_protocol] ShmWeightWriter.write_full: os.remove(tmp_path)', _swallow_exc,
+                             key='logic.cgn_shm_protocol.ShmWeightWriter.write_full.line191', throttle=100)
 
         return self._version
 
@@ -99,22 +199,73 @@ class ShmWeightWriter:
 
 
 class ShmWeightReader:
-    """Read CGN weights from /dev/shm. Used by CGNConsumerClient."""
+    """Read CGN weights from /dev/shm. Used by CGNConsumerClient.
 
-    def __init__(self, shm_path: str = DEFAULT_SHM_PATH):
-        self._path = shm_path
+    Dual-mode (S4): legacy 16B-header file read OR 24B StateRegistry
+    SeqLock read. Mode selected at construction via flag.
+    """
+
+    def __init__(self, shm_path: str | None = None,
+                 titan_id: str | None = None,
+                 config: dict | None = None):
+        self._path, self._use_stateregistry = _resolve_cgn_mode(
+            shm_path, titan_id, config)
         self._last_version = -1
         self._cache = None  # Cached parsed result
+        self._sr_reader = None  # lazy: only init in stateregistry mode
+        if self._use_stateregistry:
+            try:
+                from titan_plugin.core.state_registry import (
+                    CGN_LIVE_WEIGHTS, StateRegistryReader, resolve_shm_root,
+                )
+                self._sr_reader = StateRegistryReader(
+                    CGN_LIVE_WEIGHTS, resolve_shm_root(titan_id))
+                logger.info(
+                    "[ShmReader] StateRegistry mode active (path=%s)",
+                    self._path)
+            except Exception as e:
+                logger.warning(
+                    "[ShmReader] StateRegistry init failed (falling back to "
+                    "legacy): %s", e)
+                self._use_stateregistry = False
+                self._path = DEFAULT_SHM_PATH
+
+    def _read_payload(self) -> bytes | None:
+        """Mode-aware payload fetch — returns the inner [16B header +
+        V-bytes + consumers + extra] payload regardless of mode, so the
+        downstream parser is identical."""
+        if self._use_stateregistry and self._sr_reader is not None:
+            try:
+                return self._sr_reader.read_variable()
+            except Exception as e:
+                logger.warning(
+                    "[ShmReader] StateRegistry read_variable failed: %s", e)
+                return None
+        # Legacy mode
+        try:
+            with open(self._path, "rb") as f:
+                return f.read()
+        except (FileNotFoundError, OSError):
+            return None
 
     def check_version(self) -> int:
-        """Read version counter only (4 bytes). Very cheap."""
+        """Read version counter only (first 4 bytes of inner header).
+        Very cheap in legacy mode (4-byte file read); in StateRegistry
+        mode requires a full mmap read since SeqLock validates header
+        before exposing payload."""
+        if self._use_stateregistry:
+            payload = self._read_payload()
+            if payload is None or len(payload) < 4:
+                return -1
+            return struct.unpack("<I", payload[:4])[0]
         try:
             with open(self._path, "rb") as f:
                 raw = f.read(4)
                 if len(raw) == 4:
                     return struct.unpack("<I", raw)[0]
-        except (FileNotFoundError, OSError):
-            pass
+        except (FileNotFoundError, OSError) as _swallow_exc:
+            swallow_warn("[logic.cgn_shm_protocol] ShmWeightReader.check_version: with open(self._path, 'rb') as f: raw = f.read(4) if len(...", _swallow_exc,
+                         key='logic.cgn_shm_protocol.ShmWeightReader.check_version.line265', throttle=100)
         return -1
 
     def has_new_version(self) -> bool:
@@ -136,13 +287,8 @@ class ShmWeightReader:
         if current_version <= self._last_version:
             return None  # No change
 
-        try:
-            with open(self._path, "rb") as f:
-                data = f.read()
-        except (FileNotFoundError, OSError):
-            return None
-
-        if len(data) < HEADER_SIZE:
+        data = self._read_payload()
+        if data is None or len(data) < HEADER_SIZE:
             return None
 
         version, num_consumers, v_bytes_len, total_payload = struct.unpack(
@@ -194,13 +340,8 @@ class ShmWeightReader:
         if current_version <= self._last_version:
             return None
 
-        try:
-            with open(self._path, "rb") as f:
-                data = f.read()
-        except (FileNotFoundError, OSError):
-            return None
-
-        if len(data) < HEADER_SIZE:
+        data = self._read_payload()
+        if data is None or len(data) < HEADER_SIZE:
             return None
 
         version, num_consumers, v_bytes_len, total_payload = struct.unpack(

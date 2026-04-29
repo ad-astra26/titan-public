@@ -1,5 +1,24 @@
 """Emotion Cluster — k-means clustering of felt-state vectors for EMOT-CGN.
 
+⚠ TRANSITIONAL (audit 2026-04-23 Q3): The 8 hand-seeded primitive slots
+below are transitional display labels pending the v3 attractor model
+(`rFP_titan_emotion_attractor_model.md`, in draft). Root cause of the
+WONDER monoculture + LOVE-never-fires symptoms observed in audit:
+
+  - FLOW / IMPASSE_TENSION / RESOLUTION have meaningful centroid
+    perturbations (inner_mind +0.12, DA +0.10, etc.)
+  - PEACE / CURIOSITY / GRIEF / WONDER / LOVE are initialized with pure
+    rng.normal(0, 0.02, 150D) — the RNG lottery (seed 20260420) happens
+    to place WONDER nearest to typical neutral observations, so WONDER
+    wins ~all non-anchored assignments (70-95% in 3-day archaeology).
+    LOVE's random position is never the nearest for any observation.
+
+DO NOT TUNE individual primitive seeds or add new ones. The legacy
+design (hardcoded categories + nearest-centroid assignment) is being
+replaced by the v3 attractor-state model (emotion as multi-level
+equilibrium over composite state, named after stable recurrence).
+§16 Options A-D in rFP_emot_cgn_v2.md are superseded by that work.
+
 Each cluster is a candidate emotion primitive. Seeded from hand-crafted
 anchors (FLOW, IMPASSE_TENSION, RESOLUTION) + 5 emergent slots (PEACE,
 CURIOSITY, GRIEF, WONDER, LOVE). Centroids drift as experience
@@ -18,6 +37,7 @@ Feature vector layout (150D total):
               present so post-kin-maturation we don't need a schema change)
 
 See: titan-docs/rFP_emot_cgn_v2.md §4.1
+See: titan-docs/rFP_emot_cgn_wiring_audit_20260423.md (audit finding)
 """
 from __future__ import annotations
 
@@ -256,7 +276,16 @@ class EmotionClusterer:
             now = time.time()
             if not force and (now - self._last_recenter_ts) < self._recenter_interval_s:
                 return False
-            if len(self._observation_buffer) < 50:
+            # BUG #10 follow-up (2026-04-24): observation_buffer is in-memory
+            # only (not persisted across restarts). Post-restart, it fills at
+            # ~1/5 of the observation rate — at typical T1 chain-conclude rate
+            # (~2/3min), reaching the normal 50-obs threshold takes ~6 hours.
+            # For the FIRST recenter after a fresh start (last_recenter_ts
+            # still at legacy 0.0 sentinel), lower the threshold to 10 so the
+            # initial centroid unfreeze happens within ~1 hour. After that,
+            # the full 50-obs threshold applies per the original design.
+            min_buffer = 10 if self._last_recenter_ts == 0.0 else 50
+            if len(self._observation_buffer) < min_buffer:
                 return False
             by_cluster: dict[str, list] = {p: [] for p in EMOT_PRIMITIVES}
             for p_id, vec in self._observation_buffer:

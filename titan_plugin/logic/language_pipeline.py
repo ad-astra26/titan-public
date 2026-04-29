@@ -18,6 +18,7 @@ import re
 import sqlite3
 import time
 from typing import Optional
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -727,7 +728,8 @@ def persist_composition(
         )
         return res.ok
     except Exception as e:
-        logger.debug("[LanguagePipeline] persist_composition error: %s", e)
+        swallow_warn('[LanguagePipeline] persist_composition error', e,
+                     key="logic.language_pipeline.persist_composition_error", throttle=100)
         return False
 
 
@@ -777,5 +779,6 @@ def persist_teacher_session(
         )
         return res.ok
     except Exception as e:
-        logger.debug("[LanguagePipeline] persist_teacher_session error: %s", e)
+        swallow_warn('[LanguagePipeline] persist_teacher_session error', e,
+                     key="logic.language_pipeline.persist_teacher_session_error", throttle=100)
         return False

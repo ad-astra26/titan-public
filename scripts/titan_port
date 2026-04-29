@@ -1,0 +1,21 @@
+#!/bin/bash
+# B.1 §9 — print Titan's currently-active API port.
+#
+# Useful when the orchestrator is mid-ping-pong-swap and you need to
+# curl directly without going through nginx:
+#
+#   curl http://127.0.0.1:$(scripts/titan_port)/v4/health
+#
+# Reads data/active_api_port (single int, atomic-rename written by the
+# shadow_swap orchestrator). Falls back to 7777 if file missing/empty
+# (default state pre-shadow-swap).
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+F="$DIR/data/active_api_port"
+if [ -f "$F" ]; then
+    PORT=$(cat "$F" 2>/dev/null | tr -d '[:space:]')
+    if [ -n "$PORT" ]; then
+        echo "$PORT"
+        exit 0
+    fi
+fi
+echo "7777"

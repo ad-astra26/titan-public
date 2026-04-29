@@ -30,6 +30,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+from titan_plugin.utils.silent_swallow import swallow_warn
+from titan_plugin.logic.haov_causal_generator import CausalGeneratorRegistry
 
 logger = logging.getLogger("titan.cgn")
 
@@ -465,11 +467,15 @@ class ConceptGroundingNetwork:
                  value_lr: float = 1e-4,
                  policy_lr: float = 3e-4,
                  gamma: float = 0.99,
-                 haov_config: dict = None):
+                 haov_config: dict = None,
+                 causal_generator_config: dict = None):
         self._db_path = db_path
         self._state_dir = state_dir
         self._gamma = gamma
         self._haov_config = haov_config or {}
+        # H.4 Phase 1 (v1) — causal hypothesis generator config.
+        # Default: enabled=False (flag-default-false per design lock).
+        self._causal_cfg = causal_generator_config or {}
 
         # Consumer registry
         self._consumers: Dict[str, CGNConsumerConfig] = {}
@@ -517,6 +523,17 @@ class ConceptGroundingNetwork:
 
         # Generalized HAOV: per-consumer hypothesis trackers
         self._haov_trackers: Dict[str, GeneralizedHAOVTracker] = {}
+
+        # H.4 Phase 1 (v1) — causal hypothesis generator.
+        # Per-consumer pattern miner that proposes causal hypotheses
+        # ("if I do X, Y follows") and feeds them to _haov_trackers
+        # via tracker.hypothesize().  Flag-default-false; record_outcome
+        # checks self._causal_enabled() before routing transitions.
+        # Design lock: titan-docs/rFP_cgn_consolidated.md §2.9.
+        self._causal_generators: CausalGeneratorRegistry = CausalGeneratorRegistry(
+            defaults=self._causal_cfg.get("defaults", {}),
+            per_consumer=self._causal_cfg.get("per_consumer", {}),
+        )
 
         # Telemetry log (persistent, append-only)
         self._telemetry_path = os.path.join(state_dir, "cgn_telemetry.jsonl")
@@ -730,6 +747,30 @@ class ConceptGroundingNetwork:
                 except Exception:
                     pass  # Non-critical — don't break reward recording
 
+                # H.4 Phase 1 (v1) — causal hypothesis generator hook.
+                # Feed the now-complete transition (action + reward) to the
+                # consumer's pattern miner.  On promotion (≥ min_n same
+                # action+effect inside window), miner returns an observation
+                # dict; we feed it straight to the existing HAOV tracker via
+                # tracker.hypothesize() — same data shape as impasse path.
+                # Flag-default-false: hook is a no-op when enabled=False.
+                # Anti-pattern path is selected by reward sign inside the
+                # registry's observe_for() — single call site for both.
+                if self._causal_enabled():
+                    try:
+                        promoted = self._causal_generators.observe_for(
+                            consumer, t, reward)
+                        if promoted is not None and consumer in self._haov_trackers:
+                            self._haov_trackers[consumer].hypothesize(
+                                action_context={"action": int(t.action),
+                                                "source": "causal_pattern"},
+                                observation=promoted,
+                            )
+                    except Exception as _causal_err:  # never break reward path
+                        logger.debug(
+                            "[CGN] causal_generator hook error for '%s': %s",
+                            consumer, _causal_err)
+
                 return
         # Loop exited without a match: registered consumer, but no pending
         # transition for this concept (already rewarded, evicted from buffer,
@@ -753,6 +794,39 @@ class ConceptGroundingNetwork:
             "registered": sorted(self._consumers.keys()),
             "consumer_freq": dict(self._consumer_freq),
         }
+
+    # ── H.4 Phase 1 (v1) — causal generator helpers ──────────────────────
+
+    def _causal_enabled(self) -> bool:
+        """Flag-default-false gate for the causal hypothesis generator.
+
+        Read from self._causal_cfg['enabled'] each call so config flips at
+        runtime are honored without a kernel restart.
+        """
+        return bool(self._causal_cfg.get("enabled", False))
+
+    def decay_stale_haov(self) -> int:
+        """Apply per-tick staleness decay to causal-generator candidates.
+
+        Called from cgn_worker's main loop on a fixed cadence (slower than
+        the HAOV test pump).  Returns the number of candidates that decayed
+        below 1 and were evicted across all consumers.  No-op when the
+        causal generator is disabled.
+        """
+        if not self._causal_enabled():
+            return 0
+        try:
+            return self._causal_generators.decay_stale_all()
+        except Exception as _err:  # never break worker tick
+            logger.debug("[CGN] decay_stale_haov error: %s", _err)
+            return 0
+
+    def get_causal_generator_stats(self) -> dict:
+        """Per-consumer causal-generator telemetry — surfaced via arch_map."""
+        try:
+            return self._causal_generators.get_stats()
+        except Exception:
+            return {}
 
     # ── Dream Consolidation ─────────────────────────────────────��───────
 
@@ -836,7 +910,8 @@ class ConceptGroundingNetwork:
                 logger.info("[CGN] Cross-consumer transfer: %s",
                             {k: len(v) for k, v in cross_insights.items()})
         except Exception as _xc_err:
-            logger.debug("[CGN] Cross-consumer transfer error: %s", _xc_err)
+            swallow_warn('[CGN] Cross-consumer transfer error', _xc_err,
+                         key="logic.cgn.cross_consumer_transfer_error", throttle=100)
 
         stats["cross_insights"] = {k: len(v) for k, v in cross_insights.items()}
 
@@ -903,7 +978,8 @@ class ConceptGroundingNetwork:
             self._buffer.add(transition)
             count += 1
           except Exception as _boot_err:
-            logger.debug("[CGN] Bootstrap skip '%s': %s", concept.concept_id, _boot_err)
+            swallow_warn(f"[CGN] Bootstrap skip '{concept.concept_id}'", _boot_err,
+                         key="logic.cgn.bootstrap_skip", throttle=100)
 
         if count > 0:
             logger.info("[CGN] Bootstrapped %d concepts for '%s'", count, consumer)
@@ -946,8 +1022,9 @@ class ConceptGroundingNetwork:
             event["buffer_size"] = self._buffer.size()
             with open(self._telemetry_path, "a") as f:
                 f.write(json.dumps(event) + "\n")
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn("[logic.cgn] ConceptGroundingNetwork._log_telemetry: event['timestamp'] = time.time()", _swallow_exc,
+                         key='logic.cgn.ConceptGroundingNetwork._log_telemetry.line953', throttle=100)
 
     def get_stats(self) -> dict:
         """Return CGN statistics for monitoring/API."""
@@ -961,6 +1038,52 @@ class ConceptGroundingNetwork:
             "consolidations": self._consolidation_count,
             "uptime_hours": round((time.time() - self._boot_time) / 3600, 2),
         }
+
+    def get_vm_snapshot(self) -> dict:
+        """Lightweight CGN state snapshot for TitanVM's cgn.* observable
+        namespace (rFP_titan_vm_v2 Phase 2 §3.8).
+
+        Cheap fields — no neural forward pass. Per-consumer reward proxy
+        is a windowed average over the last 64 transitions in the shared
+        replay buffer (not a V-estimate forward pass, but a robust enough
+        signal for smooth-gated priors).
+
+        Returns dict with keys readable by VM programs as cgn.<key>:
+          - grounded_density : total_groundings / minute (global)
+          - active_haovs     : count of HAOV trackers across consumers
+          - consolidations   : cumulative dream-consolidation count
+          - consumers_registered : count of registered CGN consumers
+          - <consumer>_reward_ema : 64-window reward average per consumer
+            (e.g. reasoning_reward_ema). Missing consumer → resolves to 0.0
+            via context default.
+        """
+        uptime_s = max(1.0, time.time() - self._boot_time)
+        out: dict[str, float] = {
+            "grounded_density": self._total_groundings / (uptime_s / 60.0),
+            "active_haovs": float(len(self._haov_trackers)),
+            "consolidations": float(self._consolidation_count),
+            "consumers_registered": float(len(self._consumers)),
+        }
+        # Per-consumer reward proxy — cheap sliding-window mean over the
+        # last 64 transitions in the shared replay buffer. Falls back to
+        # 0.0 for consumers with no recent activity.
+        try:
+            recent = self._buffer.get_all(64)  # returns list of CGNTransition
+            by_consumer: dict[str, list[float]] = {}
+            for tr in recent or []:
+                consumer = getattr(tr, "consumer", None)
+                if not consumer:
+                    continue
+                reward = float(getattr(tr, "reward", 0.0) or 0.0)
+                by_consumer.setdefault(consumer, []).append(reward)
+            for consumer, rewards in by_consumer.items():
+                if rewards:
+                    out[f"{consumer}_reward_ema"] = sum(rewards) / len(rewards)
+        except Exception as _swallow_exc:
+            # Buffer method surface may vary; snapshot is best-effort.
+            swallow_warn('[logic.cgn] ConceptGroundingNetwork.get_vm_snapshot: recent = self._buffer.get_all(64)', _swallow_exc,
+                         key='logic.cgn.ConceptGroundingNetwork.get_vm_snapshot.line1010', throttle=100)
+        return out
 
     # ── Generalized HAOV API ────────────────────────────────────────────
 
@@ -1118,7 +1241,8 @@ class ConceptGroundingNetwork:
                 "q_values": q_values,
             }
         except Exception as e:
-            logger.debug("[CGN] infer_social_action failed: %s", e)
+            swallow_warn('[CGN] infer_social_action failed', e,
+                         key="logic.cgn.infer_social_action_failed", throttle=100)
             return fallback
 
     # ── Language Consumer Helpers ────────────────────────────────────────
@@ -1191,7 +1315,8 @@ class ConceptGroundingNetwork:
                 extra={"learning_phase": row[5]},
             )
         except Exception as e:
-            logger.debug("[CGN] load_concept('%s') failed: %s", word, e)
+            swallow_warn(f"[CGN] load_concept('{word}') failed", e,
+                         key="logic.cgn.load_concept_failed", throttle=100)
             return None
 
     # DEPRECATED: use language_pipeline.apply_grounding_action_to_db(
@@ -1261,7 +1386,8 @@ class ConceptGroundingNetwork:
             return True
 
         except Exception as e:
-            logger.debug("[CGN] apply_grounding_action('%s') failed: %s", word, e)
+            swallow_warn(f"[CGN] apply_grounding_action('{word}') failed", e,
+                         key="logic.cgn.apply_grounding_action_failed", throttle=100)
             return False
 
     # ── Internal: Feature Building ─────────────────────────────���────────
@@ -1458,7 +1584,8 @@ class ConceptGroundingNetwork:
             conn.commit()
             conn.close()
         except Exception as e:
-            logger.debug("[CGN] Decay failed: %s", e)
+            swallow_warn('[CGN] Decay failed', e,
+                         key="logic.cgn.decay_failed", throttle=100)
 
     # ── Sigma / SOAR / Surprise Primitives ────────────────────────────
 

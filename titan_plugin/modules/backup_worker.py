@@ -39,6 +39,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty
 from typing import Optional
+from titan_plugin.utils.silent_swallow import swallow_warn
+from titan_plugin import bus
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +69,14 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     # Unwrap config — arrives as the full config dict from v5_core
     full_config = config or {}
     backup_cfg = full_config.get("backup", {}) or {}
-    titan_id = full_config.get("info_banner", {}).get("titan_id", "T1")
+    # BUG-BACKUP-WORKER-HARDCODED-TITAN-ID-T1: previous fallback to literal
+    # "T1" caused T2/T3 to log themselves as T1 whenever info_banner.titan_id
+    # was missing/empty in their config. resolve_titan_id() walks the canonical
+    # precedence chain (explicit → data/titan_identity.json → TITAN_ID env →
+    # "T1"), matching every other per-Titan resolver in the codebase.
+    from titan_plugin.core.state_registry import resolve_titan_id
+    explicit_id = (full_config.get("info_banner", {}) or {}).get("titan_id") or None
+    titan_id = resolve_titan_id(explicit_id)
 
     # Per-Titan mode (rFP Phase 3). Default: infer from keypair_path presence
     # (mainnet_arweave if keypair exists + arweave_enabled, local_only otherwise).
@@ -191,6 +200,15 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     runway_check_interval = 3600.0  # once per hour (rFP I6 is separate daily cron; this is in-loop light check)
 
     # ── Main loop ──────────────────────────────────────────────────────
+    # ── Microkernel v2 Phase B.1 §6 — readiness/hibernate reporter ──
+    from titan_plugin.core.readiness_reporter import trivial_reporter
+    def _b1_save_state():
+        return []
+    _b1_reporter = trivial_reporter(
+        worker_name=name, layer="L3", send_queue=send_queue,
+        save_state_cb=_b1_save_state,
+    )
+
     while True:
         try:
             msg = recv_queue.get(timeout=5.0)
@@ -210,17 +228,29 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
         msg_type = msg.get("type", "")
 
-        if msg_type == "MODULE_SHUTDOWN":
+        # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────
+        if _b1_reporter.handles(msg_type):
+            _b1_reporter.handle(msg)
+            if _b1_reporter.should_exit():
+                break
+            continue
+
+        # ── Microkernel v2 Phase B.2.1 — supervision-transfer dispatch ──
+        from titan_plugin.core import worker_swap_handler as _swap
+        if _swap.maybe_dispatch_swap_msg(msg):
+            continue
+
+        if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[BackupWorker] Shutdown: %s",
                         msg.get("payload", {}).get("reason"))
             break
 
         try:
-            if msg_type == "MEDITATION_COMPLETE":
+            if msg_type == bus.MEDITATION_COMPLETE:
                 _send_heartbeat(send_queue, name)  # keep alive during backup
                 _handle_meditation(state, msg)
                 last_heartbeat = time.time()
-            elif msg_type == "BACKUP_TRIGGER_MANUAL":
+            elif msg_type == bus.BACKUP_TRIGGER_MANUAL:
                 _send_heartbeat(send_queue, name)
                 _handle_manual(state, msg)
                 last_heartbeat = time.time()
@@ -421,7 +451,8 @@ def _write_i7_telemetry(titan_id: str, backup, mode: str, event: str,
             json.dump(state, f, indent=2)
         os.replace(tmp, path)
     except Exception as e:
-        logger.debug("[BackupWorker] I7 telemetry write failed: %s", e)
+        swallow_warn('[BackupWorker] I7 telemetry write failed', e,
+                     key="modules.backup_worker.i7_telemetry_write_failed", throttle=100)
 
 
 def _notify_maker_success(titan_id: str, backup, duration_s: float, mode: str) -> None:

@@ -4,12 +4,20 @@ titan_plugin/logic/outer_trinity.py — V4 Time Awareness: Outer Trinity Collect
 Computes 3×5DT Outer Trinity tensors from real live data sources.
 The Outer Trinity represents Titan's acting/communicating/creating surface:
 
-  Outer Body (5DT) — actionable operational levers:
-    [0] action_energy      — Agency budget remaining (can influence via helper usage)
-    [1] helper_health      — Helper availability % (can diagnose via code_knowledge)
-    [2] bus_throughput      — Messages processed/s (can manage via InterfaceAdvisor)
-    [3] error_rate          — Inverted: 1.0 = no errors (can fix via infra_inspect/coding_sandbox)
-    [4] response_latency    — Inverted: 1.0 = fast (can choose lighter models)
+  Outer Body (5DT) — V6 5DT body-felt semantics (refactored 2026-04-23 per
+                      rFP_phase1_sensory_wiring.md). Each dim blends 3
+                      independent rich sources with no single saturating
+                      input:
+    [0] interoception   — SOL balance (0.4) + block_delta (0.3) + anchor_fresh (0.3)
+                          "my metabolic + blockchain-heartbeat body"
+    [1] proprioception  — peer_entropy (0.5) + helper_health (0.3) + bus_module_div (0.2)
+                          "how many entities around me, ecosystem width"
+    [2] somatosensation — TX latency (0.4) + creation_nudge (0.3) + CPU spike rate (0.3)
+                          "pressure of what I'm touching / reaching for"
+    [3] entropy         — ping variance (0.4) + bus drop rate (0.3) + error rate (0.3)
+                          "chaos in my world right now"
+    [4] thermal         — CPU thermal (0.4) + circadian (0.3) + LLM latency EMA (0.3)
+                          "my body temperature / time-of-day"
 
   Outer Mind (5DT) — creative/social levers:
     [0] creative_output     — Art generation rate (can influence via art_generate)
@@ -31,9 +39,11 @@ Values closer to 0.5 contribute to faster sphere clock contraction (balanced).
 Called from TitanCore._outer_trinity_loop() at configurable interval.
 """
 import logging
+import math
 import os
 import time
 from typing import Optional
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +73,16 @@ class OuterTrinityCollector:
         self._last_outer_mind: list[float] = [0.5] * 5
         self._last_outer_spirit: list[float] = [0.5] * 5
         self._collect_count = 0
+
+        # Extended-tensor health counters — exposed via get_last_tensors()
+        # so warning_monitor + arch_map symmetries can detect silent failure.
+        # Pre-2026-04-25 this site swallowed exceptions at logger.debug, hiding
+        # 67D/132D state-vector collapse on T1 for 37+ days. See BUG-T1-
+        # CONSCIOUSNESS-67D-STATE-VECTOR.
+        self._extended_success_count = 0
+        self._extended_failure_count = 0
+        self._extended_last_failure_ts: float = 0.0
+        self._extended_last_failure_msg: str = ""
 
     def collect(self, sources: dict) -> dict:
         """
@@ -101,84 +121,194 @@ class OuterTrinityCollector:
             "outer_spirit": outer_spirit,
         }
 
-        # OT3: Compute extended 15D mind + 45D spirit for dimensional symmetry
+        # OT3: Compute extended 15D mind + 45D spirit for dimensional symmetry.
+        # Pattern C (WARN + counter + safe fallback) per directive_error_visibility.md
+        # — silent fallback to 67D consciousness epoch is a Trinity-symmetry
+        # invariant violation (see BUG-T1-CONSCIOUSNESS-67D-STATE-VECTOR for
+        # the 37-day silent regression that motivated this rewrite).
         try:
             outer_mind_15d, outer_spirit_45d = self._collect_extended(
                 outer_body, outer_mind, outer_spirit, sources)
             result["outer_mind_15d"] = outer_mind_15d
             result["outer_spirit_45d"] = outer_spirit_45d
+            self._extended_success_count += 1
         except Exception as e:
-            logger.debug("[OuterTrinity] Extended tensor computation failed: %s", e)
+            self._extended_failure_count += 1
+            self._extended_last_failure_ts = time.time()
+            self._extended_last_failure_msg = f"{type(e).__name__}: {e}"
+            # Throttle WARNING log to first failure + every 100th to avoid
+            # log flood while still emitting diagnostic on first occurrence.
+            if (self._extended_failure_count == 1
+                    or self._extended_failure_count % 100 == 0):
+                logger.warning(
+                    "[OuterTrinity] _collect_extended failed (count=%d, "
+                    "ratio=%.3f): %s — falling back to neutral 0.5-padded "
+                    "extended tensors to preserve 132D Trinity symmetry. "
+                    "Investigate via arch_map symmetries --titan <T> + "
+                    "warning_monitor.",
+                    self._extended_failure_count,
+                    self._extended_failure_count / max(1, self._collect_count),
+                    self._extended_last_failure_msg,
+                    exc_info=True,
+                )
+            # Safe fallback: 0.5-padded extended tensors. This preserves
+            # 132D consciousness epoch dimensionality (and the GroundUp
+            # body↔mind enrichment loop) even when the full computation
+            # fails. Without this, has_outer_extended flips False and
+            # the entire epoch downgrades to 67D, breaking inner↔outer
+            # symmetry per fundamental_symmetry_requirements.md.
+            result["outer_mind_15d"] = [0.5] * 15
+            result["outer_spirit_45d"] = [0.5] * 45
 
         return result
 
     def _collect_outer_body(self, sources: dict) -> list[float]:
-        """Outer Body 5DT — operational levers."""
+        """Outer Body 5DT — V6 body-felt semantics (rFP_phase1_sensory_wiring).
+
+        Each dim is a weighted blend of 3 independent rich sources.
+        No single saturating input can pin a dim — if any input is
+        unavailable, it contributes 0.5 neutral and other inputs dominate.
+        """
+        # ── Gather inputs (all with safe defaults) ────────────────
         agency = sources.get("agency_stats") or {}
         helper_statuses = sources.get("helper_statuses") or {}
         bus = sources.get("bus_stats") or {}
+        sys_stats = sources.get("system_sensor_stats") or {}
+        net_stats = sources.get("network_monitor_stats") or {}
+        tx_lat = sources.get("tx_latency_stats") or {}
+        blk_delta = sources.get("block_delta_stats") or {}
+        anchor = sources.get("anchor_state") or {}
 
-        # [0] action_energy: budget remaining
-        budget = agency.get("budget_per_hour", EXPECTED_ACTIONS_PER_HOUR)
-        used = agency.get("actions_this_hour", 0)
-        action_energy = _safe_clamp(1.0 - (used / max(1, budget)))
+        # ── [0] interoception: energetic body-state ──────────────
+        # SOL balance (log-scaled around typical 0.5 SOL mean) +
+        # block_delta normalized (chain pulse / tempo) +
+        # anchor freshness (how recently we touched the chain)
+        sol_balance = sources.get("sol_balance")
+        if isinstance(sol_balance, (int, float)) and sol_balance >= 0:
+            # 0 SOL = 0.0, 0.1 SOL = ~0.3, 0.5 SOL = 0.5, 2.0 SOL = 0.8, 10+ SOL = ~1.0
+            sol_norm = _safe_clamp(math.log1p(sol_balance) / math.log1p(10.0))
+        else:
+            sol_norm = 0.5
 
-        # [1] helper_health: available / total
+        block_rate_norm = blk_delta.get("normalized", 0.5)
+
+        # Anchor freshness: 0s=1.0, 300s=0.5, 600s=~0.33, 1800s=~0.14
+        anchor_fresh = 0.5
+        if anchor.get("success") and anchor.get("last_anchor_time"):
+            since = time.time() - anchor.get("last_anchor_time", time.time())
+            anchor_fresh = max(0.05, 1.0 / (1.0 + since / 300.0))
+
+        interoception = _safe_clamp(
+            0.4 * sol_norm + 0.3 * block_rate_norm + 0.3 * anchor_fresh
+        )
+
+        # ── [1] proprioception: body-in-network-space ────────────
+        peer_entropy = net_stats.get("peer_entropy", 0.5)
+
         total_helpers = max(1, len(helper_statuses))
         available = sum(1 for s in helper_statuses.values() if s == "available")
-        helper_health = _safe_clamp(available / total_helpers)
+        helper_health = available / total_helpers if total_helpers > 0 else 0.5
 
-        # [2] bus_throughput: routed messages (normalized by uptime)
-        uptime = max(1.0, sources.get("uptime_seconds", 1.0))
-        routed = bus.get("routed", 0)
-        # Expect ~1 msg/s on average during active periods
-        expected_total = uptime * 1.0
-        bus_throughput = _safe_clamp(min(1.0, routed / max(1.0, expected_total)))
+        bus_module_diversity = net_stats.get("bus_module_diversity", 0.5)
 
-        # [3] error_rate: inverted (1.0 = no errors)
+        proprioception = _safe_clamp(
+            0.5 * peer_entropy + 0.3 * helper_health + 0.2 * bus_module_diversity
+        )
+
+        # ── [2] somatosensation: touch + pressure ─────────────────
+        # TX latency normalized (chain congestion felt as reach-friction) +
+        # current outer_body[2] as creation_nudge proxy (with decay fix
+        # shipping in next commit; until then, saturates — but blend
+        # limits its influence to 30%) +
+        # CPU spike rate (bursts of internal load)
+        tx_lat_norm = tx_lat.get("normalized", 0.5)
+
+        current_ob2 = 0.5
+        if (isinstance(self._last_outer_body, list)
+                and len(self._last_outer_body) > 2):
+            current_ob2 = float(self._last_outer_body[2])
+
+        cpu_spikes = sys_stats.get("cpu_spike_rate", 0.0)
+
+        somatosensation = _safe_clamp(
+            0.4 * tx_lat_norm + 0.3 * current_ob2 + 0.3 * cpu_spikes
+        )
+
+        # ── [3] entropy: disorder / unpredictability ─────────────
+        # ping variance (network jitter) + bus drop rate + action error rate
+        ping_var = net_stats.get("ping_variance", 0.5)
+        bus_drop_rate = net_stats.get("bus_drop_rate", 0.0)
+
         total_actions = agency.get("total_actions", 0)
         failed_actions = agency.get("failed_actions", 0)
         if total_actions > 0:
-            error_rate = _safe_clamp(1.0 - (failed_actions / total_actions))
+            error_rate = failed_actions / total_actions  # actual error rate (more = more disorder)
         else:
-            error_rate = 0.5  # Neutral — no data yet
+            error_rate = 0.0  # No actions yet → no errors recorded
 
-        # [4] response_latency: inverted (1.0 = fast)
+        entropy = _safe_clamp(
+            0.4 * ping_var + 0.3 * bus_drop_rate + 0.3 * error_rate
+        )
+
+        # ── [4] thermal: arousal / temperature ────────────────────
+        # CPU thermal + circadian phase + LLM latency EMA
+        cpu_thermal = sys_stats.get("cpu_thermal", 0.5)
+        circadian = sys_stats.get("circadian_phase", 0.5)
+
         avg_latency = sources.get("llm_avg_latency", 0.0)
         if avg_latency > 0:
-            response_latency = _safe_clamp(1.0 - min(1.0, avg_latency / MAX_LATENCY_SECONDS))
+            # Higher latency → higher "thermal pressure" (slow LLM = heavy system)
+            llm_latency_norm = _safe_clamp(avg_latency / MAX_LATENCY_SECONDS)
         else:
-            response_latency = 0.5  # Neutral — no data yet
+            llm_latency_norm = 0.5  # Neutral — producer not wired yet
+
+        thermal = _safe_clamp(
+            0.4 * cpu_thermal + 0.3 * circadian + 0.3 * llm_latency_norm
+        )
 
         return [round(v, 4) for v in [
-            action_energy, helper_health, bus_throughput, error_rate, response_latency
+            interoception, proprioception, somatosensation, entropy, thermal
         ]]
 
     def _collect_outer_mind(self, sources: dict) -> list[float]:
-        """Outer Mind 5DT — creative/social levers."""
+        """Outer Mind 5DT — creative/social levers.
+
+        A.8.4: prefers `art_count_100` / `audio_count_100` from sources
+        (parent pre-extracts these so the worker can run without a
+        observatory_db handle). Falls back to direct obs_db query when
+        sources came from legacy in-parent gather without pre-extraction.
+        """
         obs_db = sources.get("observatory_db")
         memory_status = sources.get("memory_status") or {}
         uptime = max(1.0, sources.get("uptime_seconds", 1.0))
         uptime_days = max(0.01, uptime / 86400.0)
 
         # [0] creative_output: art generation rate
-        art_count = 0
-        if obs_db:
-            try:
-                archive = obs_db.get_expressive_archive(type_="art", limit=100)
-                art_count = len(archive)
-            except Exception:
-                pass
+        art_count = sources.get("art_count_100")
+        if art_count is None:
+            art_count = 0
+            if obs_db:
+                try:
+                    archive = obs_db.get_expressive_archive(type_="art", limit=100)
+                    art_count = len(archive)
+                except Exception as _swallow_exc:
+                    swallow_warn("[logic.outer_trinity] OuterTrinityCollector._collect_outer_mind: archive = obs_db.get_expressive_archive(type_='art', limi...", _swallow_exc,
+                                 key='logic.outer_trinity.OuterTrinityCollector._collect_outer_mind.line286', throttle=100)
+        art_count = int(art_count or 0)
         creative_output = _safe_clamp(min(1.0, art_count / max(1.0, EXPECTED_ART_PER_DAY * uptime_days)))
 
         # [1] sonic_expression: audio generation rate
-        audio_count = 0
-        if obs_db:
-            try:
-                archive = obs_db.get_expressive_archive(type_="audio", limit=100)
-                audio_count = len(archive)
-            except Exception:
-                pass
+        audio_count = sources.get("audio_count_100")
+        if audio_count is None:
+            audio_count = 0
+            if obs_db:
+                try:
+                    archive = obs_db.get_expressive_archive(type_="audio", limit=100)
+                    audio_count = len(archive)
+                except Exception as _swallow_exc:
+                    swallow_warn("[logic.outer_trinity] OuterTrinityCollector._collect_outer_mind: archive = obs_db.get_expressive_archive(type_='audio', li...", _swallow_exc,
+                                 key='logic.outer_trinity.OuterTrinityCollector._collect_outer_mind.line296', throttle=100)
+        audio_count = int(audio_count or 0)
         sonic_expression = _safe_clamp(min(1.0, audio_count / max(1.0, EXPECTED_AUDIO_PER_DAY * uptime_days)))
 
         # [2] memory_quality: persistent / total nodes ratio
@@ -273,15 +403,27 @@ class OuterTrinityCollector:
         }
 
         # Creative stats
+        # A.8.4: prefers pre-extracted counts when present (worker mode);
+        # falls back to direct obs_db query for legacy in-parent gather.
         obs_db = sources.get("observatory_db")
-        art_count = 0
-        audio_count = 0
-        if obs_db:
-            try:
-                art_count = len(obs_db.get_expressive_archive(type_="art", limit=500))
-                audio_count = len(obs_db.get_expressive_archive(type_="audio", limit=500))
-            except Exception:
-                pass
+        art_count = sources.get("art_count_500")
+        audio_count = sources.get("audio_count_500")
+        if art_count is None or audio_count is None:
+            if art_count is None:
+                art_count = 0
+            if audio_count is None:
+                audio_count = 0
+            if obs_db:
+                try:
+                    if sources.get("art_count_500") is None:
+                        art_count = len(obs_db.get_expressive_archive(type_="art", limit=500))
+                    if sources.get("audio_count_500") is None:
+                        audio_count = len(obs_db.get_expressive_archive(type_="audio", limit=500))
+                except Exception as _swallow_exc:
+                    swallow_warn("[logic.outer_trinity] OuterTrinityCollector._collect_extended: art_count = len(obs_db.get_expressive_archive(type_='art'...", _swallow_exc,
+                                 key='logic.outer_trinity.OuterTrinityCollector._collect_extended.line399', throttle=100)
+        art_count = int(art_count or 0)
+        audio_count = int(audio_count or 0)
         creative_stats = {
             "total": art_count + audio_count,
             "art_count": art_count,
@@ -386,6 +528,14 @@ class OuterTrinityCollector:
             "outer_body": list(self._last_outer_body),
             "outer_mind": list(self._last_outer_mind),
             "outer_spirit": list(self._last_outer_spirit),
+            # Extended-tensor health (Pattern C per directive_error_visibility.md)
+            "extended_success_count": self._extended_success_count,
+            "extended_failure_count": self._extended_failure_count,
+            "extended_failure_ratio": (
+                self._extended_failure_count / max(1, self._collect_count)
+            ),
+            "extended_last_failure_ts": self._extended_last_failure_ts,
+            "extended_last_failure_msg": self._extended_last_failure_msg,
         }
 
 

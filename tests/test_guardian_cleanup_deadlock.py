@@ -20,36 +20,53 @@ import inspect
 
 
 def test_guardian_cleanup_uses_cancel_join_thread():
-    """Static check: guardian._cleanup_module must use cancel_join_thread()
+    """Static check: Guardian's cleanup chain must use cancel_join_thread()
     and must NOT call plain join_thread(). Guards against accidental revert
-    of the T1-2026-04-14 / I-018 deadlock fix."""
+    of the T1-2026-04-14 / I-018 deadlock fix.
+
+    Microkernel v2 Phase B.2.1 (2026-04-27) refactored _cleanup_module to
+    dispatch into _kill_adopted_process / _kill_owned_process, then call
+    _finalize_module_cleanup which holds the queue-cleanup invariant. The
+    cleanup invariant is preserved by the chain — we now verify the chain
+    by inspecting both functions.
+    """
     from titan_plugin import guardian
 
-    src = inspect.getsource(guardian.Guardian._cleanup_module)
+    src_cleanup = inspect.getsource(guardian.Guardian._cleanup_module)
+    src_finalize = inspect.getsource(guardian.Guardian._finalize_module_cleanup)
 
-    # Strip line comments before checking so references to 'join_thread()'
-    # in docstrings/comments don't create false positives.
-    code_only = "\n".join(
-        line.split("#", 1)[0] for line in src.splitlines()
+    # _cleanup_module must call _finalize_module_cleanup in every code path
+    # (one call site is sufficient since both branches fall through to it)
+    cleanup_code_only = "\n".join(
+        line.split("#", 1)[0] for line in src_cleanup.splitlines()
+    )
+    assert "self._finalize_module_cleanup(info, name)" in cleanup_code_only, (
+        "_cleanup_module must call _finalize_module_cleanup — otherwise the "
+        "queue-cleanup invariant (cancel_join_thread + state reset) is bypassed"
     )
 
-    # Must call cancel_join_thread on BOTH queues (info.queue, info.send_queue)
-    assert "info.queue.cancel_join_thread()" in code_only, (
-        "_cleanup_module must call info.queue.cancel_join_thread() — "
+    # _finalize_module_cleanup must call cancel_join_thread on BOTH queues
+    finalize_code_only = "\n".join(
+        line.split("#", 1)[0] for line in src_finalize.splitlines()
+    )
+    assert "info.queue.cancel_join_thread()" in finalize_code_only, (
+        "_finalize_module_cleanup must call info.queue.cancel_join_thread() — "
         "otherwise T1-2026-04-14 / I-018 deadlock returns"
     )
-    assert "info.send_queue.cancel_join_thread()" in code_only, (
-        "_cleanup_module must call info.send_queue.cancel_join_thread() — "
+    assert "info.send_queue.cancel_join_thread()" in finalize_code_only, (
+        "_finalize_module_cleanup must call info.send_queue.cancel_join_thread() — "
         "otherwise T1-2026-04-14 / I-018 deadlock returns"
     )
 
-    # Must NOT call plain .join_thread() anywhere (only cancel_join_thread)
-    residual = code_only.replace("cancel_join_thread()", "")
-    assert ".join_thread()" not in residual, (
-        "_cleanup_module must NOT call plain .join_thread() — it deadlocks "
-        "indefinitely when consumer is SIGKILL'd with phantom-FD pipes. "
-        "Use cancel_join_thread() instead."
-    )
+    # Must NOT call plain .join_thread() anywhere in the cleanup chain
+    for src_name, code_only in (("_cleanup_module", cleanup_code_only),
+                                 ("_finalize_module_cleanup", finalize_code_only)):
+        residual = code_only.replace("cancel_join_thread()", "")
+        assert ".join_thread()" not in residual, (
+            f"{src_name} must NOT call plain .join_thread() — it deadlocks "
+            "indefinitely when consumer is SIGKILL'd with phantom-FD pipes. "
+            "Use cancel_join_thread() instead."
+        )
 
 
 if __name__ == "__main__":

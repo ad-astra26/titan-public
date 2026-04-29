@@ -79,6 +79,16 @@ class TitanPlugin:
             self._enter_limbo()
             return
 
+        # ── Microkernel v2 Layer 2 (2026-04-28) — bus handle for Sage subprocess routing ──
+        # Set by TitanCore / TitanKernel post-construction via `attach_bus(bus)`.
+        # When attached, `_publish_sage_record_transition` routes transitions
+        # to rl_worker via SAGE_RECORD_TRANSITION bus message instead of the
+        # in-parent SageRecorder buffer. When None (e.g. MCP integration with
+        # no bus), falls back to direct local call. See PLAN
+        # `titan-docs/PLAN_layer_2_sage_subprocess_migration.md`.
+        self.bus = None
+        self._sage_transition_counter = 0
+
         # ── Recovery Mode Detection ──
         self._recovery_mode = False
         recovery_flag = os.path.join(os.path.dirname(__file__), "..", "data", "recovery_flag.json")
@@ -119,10 +129,52 @@ class TitanPlugin:
         )
 
         self.mood_engine = MoodEngine(self.metabolism)
-        self.recorder = SageRecorder()
+        # ── §A.8.7 (2026-04-28) — Sage Scholar/Gatekeeper consolidation ──
+        # When `microkernel.a8_sage_scholar_gatekeeper_subprocess_enabled=true`,
+        # the legacy parent path (this `__init__.py` — used for MCP integration,
+        # tests, and pre-V6 fallback) does NOT instantiate the heavy SageRecorder
+        # (~2GB LazyMemmapStorage) nor SageScholar (torch + torchrl + IQLLoss).
+        # Instead:
+        #   - `self.recorder = SageEncoder()` provides the synchronous
+        #     parent-side encoding path (action_embedder + projection_layer)
+        #     used by gatekeeper routing — parent-safe, no LazyMemmapStorage.
+        #   - `self.scholar = None` / `self.gatekeeper = None` — IQL training
+        #     and Sovereign/Collaborative routing are disabled in this path.
+        #     Chat falls through to Shadow mode (LLM); meditation skips IQL.
+        #     Production V6 (`core/plugin.py`) uses RLProxy which DOES bus-route
+        #     dream + decide_execution_mode to rl_worker.
+        # Flag-off (default) preserves the legacy SageRecorder + SageScholar +
+        # SageGatekeeper stack byte-identically.
+        a8_sage_subproc = self._full_config.get("microkernel", {}).get(
+            "a8_sage_scholar_gatekeeper_subprocess_enabled", False)
+        # Local imports for sage subsystem: PEP 562 module-level __getattr__
+        # lazy-load only fires for *external* attribute access (e.g.
+        # `titan_plugin.SageRecorder`). Direct references inside this module
+        # bypass __getattr__ and would raise NameError. Local imports keep
+        # heavy torch/triton loading deferred to TitanPlugin instantiation
+        # (i.e. only when this code path actually runs) while ensuring the
+        # symbols are resolvable.
+        from .logic.sage.guardian import SageGuardian
+        if a8_sage_subproc:
+            from .core.sage.recorder import SageEncoder
+            self.recorder = SageEncoder()
+            logging.info(
+                "[TitanPlugin] §A.8.7 flag ON — SageEncoder substitutes for "
+                "SageRecorder; LazyMemmapStorage stays out of parent process."
+            )
+        else:
+            from .core.sage.recorder import SageRecorder
+            self.recorder = SageRecorder()
 
         # Step 2: Boot the Pre-Frontal Cortex (Guardian)
-        self.guardian = SageGuardian(self.recorder, config=inference_cfg)
+        # Microkernel v2 Layer 2 (2026-04-28): inject the bus-publish callable
+        # so divine-trauma transitions route to rl_worker subprocess when bus
+        # is attached. SageGuardian falls back to local recorder otherwise.
+        self.guardian = SageGuardian(
+            self.recorder,
+            config=inference_cfg,
+            record_transition_callable=self._publish_sage_record_transition,
+        )
         if self._ollama_cloud:
             self.guardian._ollama_cloud = self._ollama_cloud
         logging.info("[TitanPlugin] Booting SageGuardian and syncing Prime Directives...")
@@ -200,12 +252,25 @@ class TitanPlugin:
         # (synthesize_social_post removed — all posts go through social_narrator gateway)
         
         # Step 3: Boot The Scholar (IQL Offline RL)
-        from .logic.sage.scholar import SageScholar
-        from .logic.sage.gatekeeper import SageGatekeeper
-        self.scholar = SageScholar(self.recorder)
-        
-        # Step 4: Boot The Gatekeeper (Ego)
-        self.gatekeeper = SageGatekeeper(self.scholar, self.recorder)
+        # ── §A.8.7 — flag-aware skip ──
+        # When subprocess mode is on, Scholar + Gatekeeper are not instantiated
+        # in the legacy parent. Heavy torch + torchrl + IQLLoss imports are
+        # avoided. Callsites for `self.scholar.dream` / `self.gatekeeper.X`
+        # are guarded with `if self.X is not None` checks.
+        if a8_sage_subproc:
+            self.scholar = None
+            self.gatekeeper = None
+            logging.info(
+                "[TitanPlugin] §A.8.7 flag ON — SageScholar + SageGatekeeper "
+                "disabled in legacy parent. Chat → Shadow mode (LLM); "
+                "meditation IQL skipped. Use V6 microkernel path for routing."
+            )
+        else:
+            from .logic.sage.scholar import SageScholar
+            from .logic.sage.gatekeeper import SageGatekeeper
+            self.scholar = SageScholar(self.recorder)
+            # Step 4: Boot The Gatekeeper (Ego)
+            self.gatekeeper = SageGatekeeper(self.scholar, self.recorder)
         self._last_execution_mode = "Shadow"
         self._is_meditating = False
         self._last_meditation_ts = 0.0
@@ -216,6 +281,7 @@ class TitanPlugin:
         self._stealth_sage_config = self._load_stealth_sage_config()
         # Inject inference config so researcher can use cloud distillation
         self._stealth_sage_config["_inference"] = self._full_config.get("inference", {})
+        from .logic.sage.researcher import StealthSageResearcher
         self.sage_researcher = StealthSageResearcher(self._stealth_sage_config)
         if self._ollama_cloud:
             self.sage_researcher._ollama_cloud = self._ollama_cloud
@@ -243,8 +309,11 @@ class TitanPlugin:
             )
 
         # Boot the ObservatoryDB for long-term metrics storage
-        from .utils.observatory_db import ObservatoryDB
-        self._observatory_db = ObservatoryDB()
+        # rFP_universal_sqlite_writer Phase 2: route through per-process
+        # singleton so any other in-process site that imports ObservatoryDB
+        # reuses this same instance (closes BUG-TRINITY-SNAPSHOT-DB-LOCKED).
+        from .utils.observatory_db import get_observatory_db
+        self._observatory_db = get_observatory_db()
         # Wire observatory DB to meditation for expressive archiving
         self.meditation._observatory_db = self._observatory_db
 
@@ -350,6 +419,83 @@ class TitanPlugin:
     # ------------------------------------------------------------------
     # Background Task Management
     # ------------------------------------------------------------------
+
+    def attach_bus(self, bus):
+        """Microkernel v2 Layer 2 (2026-04-28) — wire DivineBus into TitanPlugin.
+
+        Called by TitanCore/TitanKernel after both bus and plugin exist. Once
+        attached, `_publish_sage_record_transition` routes new transition
+        records to rl_worker via SAGE_RECORD_TRANSITION instead of the
+        in-parent SageRecorder. Idempotent — safe to call once at boot.
+        """
+        self.bus = bus
+
+    def _publish_sage_record_transition(
+        self,
+        *,
+        observation_vector,
+        action,
+        reward,
+        trauma_metadata=None,
+        research_metadata=None,
+        session_id="default_session",
+    ) -> int:
+        """Publish a transition record to rl_worker's SageRecorder via bus.
+
+        Returns the local transition counter (for audit-log tagging only —
+        does NOT match rl_worker's actual buffer index, which is fine since
+        the counter's only consumer tags `_last_transition_id` for research-
+        session linkage). When bus is not attached (MCP integration, tests
+        without bus, or pre-attach boot ordering), falls back to direct
+        local recorder call (original behavior).
+        """
+        self._sage_transition_counter += 1
+        if self.bus is None:
+            # Fallback: bus not attached — use local recorder directly.
+            # ── §A.8.7 — when flag-on, self.recorder is SageEncoder which
+            # has no record_transition method. The bus is the canonical
+            # destination for transitions; if bus is unavailable AND we're
+            # in subprocess mode, the transition is dropped (with WARNING).
+            if not hasattr(self.recorder, "record_transition"):
+                logging.warning(
+                    "[TitanPlugin] SAGE_RECORD_TRANSITION dropped — bus not "
+                    "attached and self.recorder is SageEncoder (§A.8.7 mode). "
+                    "Transition lost: action=%s reward=%s",
+                    str(action)[:50], reward,
+                )
+                return self._sage_transition_counter
+            try:
+                import asyncio
+                asyncio.create_task(self.recorder.record_transition(
+                    observation_vector=observation_vector,
+                    action=action,
+                    reward=float(reward),
+                    trauma_metadata=trauma_metadata,
+                    research_metadata=research_metadata,
+                    session_id=session_id,
+                ))
+            except Exception as e:
+                logging.error(
+                    "[TitanPlugin] Local record_transition failed: %s", e)
+            return self._sage_transition_counter
+
+        from .bus import make_msg, SAGE_RECORD_TRANSITION
+        try:
+            self.bus.publish(make_msg(
+                SAGE_RECORD_TRANSITION, "titan_plugin", "rl",
+                {
+                    "observation_vector": observation_vector,
+                    "action": action,
+                    "reward": float(reward),
+                    "trauma_metadata": trauma_metadata,
+                    "research_metadata": research_metadata,
+                    "session_id": session_id,
+                },
+            ))
+        except Exception as e:
+            logging.error(
+                "[TitanPlugin] SAGE_RECORD_TRANSITION publish failed: %s", e)
+        return self._sage_transition_counter
 
     def _launch_background_tasks(self, loop, api_cfg: dict):
         """Create all background asyncio tasks on the given loop."""
@@ -614,7 +760,11 @@ class TitanPlugin:
             self._last_observation_vector = None
 
         # 5. Gatekeeper: Hybrid Execution Routing (now passes raw_prompt for Step 5)
-        mode, adv, text = self.gatekeeper.decide_execution_mode(state_tensor, raw_prompt=user_prompt)
+        # ── §A.8.7 — None-guard for flag-on legacy mode ──
+        if self.gatekeeper is not None:
+            mode, adv, text = self.gatekeeper.decide_execution_mode(state_tensor, raw_prompt=user_prompt)
+        else:
+            mode, adv, text = "Shadow", 0.0, ""
         self._last_execution_mode = mode
 
         if mode == "Sovereign":
@@ -826,18 +976,17 @@ class TitanPlugin:
                     f"transition_id={self._last_transition_id}, sources={self._last_research_sources}"
                 )
 
-            # Fire-and-forget: record without blocking the OpenClaw response pipeline
-            asyncio.create_task(
-                self.recorder.record_transition(
-                    observation_vector=observation_vector,
-                    action=agent_response,
-                    reward=reward,
-                    trauma_metadata=metadata,
-                    research_metadata=research_md,
-                    session_id="openclaw_session",
-                )
+            # Microkernel v2 Layer 2 (2026-04-28): route via bus when attached;
+            # falls back to local recorder when bus is None (MCP/test paths).
+            self._publish_sage_record_transition(
+                observation_vector=observation_vector,
+                action=agent_response,
+                reward=reward,
+                trauma_metadata=metadata,
+                research_metadata=research_md,
+                session_id="openclaw_session",
             )
-            logging.info("[TitanPlugin] Dispatched SageRecorder background task.")
+            logging.info("[TitanPlugin] Dispatched SageRecorder transition (bus=%s).", "attached" if self.bus else "local")
         except Exception as e:
             logging.error(f"[TitanPlugin] Failed to dispatch SageRecorder task: {e}")
 
@@ -879,17 +1028,24 @@ class TitanPlugin:
                 logging.error(f"[TitanPlugin] Memory Consolidation Failed: {e}")
                 
             # Phase B: Scholar Dreams over the optimized ReplayBuffer
-            try:
-                logging.info("[TitanPlugin] Commencing The Scholar's Dream (IQL)...")
-                dream_results = await self.scholar.dream(epochs=50, batch_size=256)
-                # Only write to Chronicle if IQL actually trained (non-zero losses)
-                total_loss = sum(dream_results.get(k, 0.0) for k in ("loss_actor", "loss_qvalue", "loss_value"))
-                if total_loss > 0.0:
-                    self._append_to_chronicle(dream_results)
-                else:
-                    logging.info("[TitanPlugin] Scholar Dream produced no training — skipping Chronicle entry.")
-            except Exception as e:
-                logging.error(f"[TitanPlugin] Scholar Training Failed: {e}")
+            # ── §A.8.7 — None-guard for flag-on legacy mode ──
+            if self.scholar is None:
+                logging.info(
+                    "[TitanPlugin] §A.8.7 flag ON — SageScholar disabled in "
+                    "legacy parent; meditation IQL training skipped."
+                )
+            else:
+                try:
+                    logging.info("[TitanPlugin] Commencing The Scholar's Dream (IQL)...")
+                    dream_results = await self.scholar.dream(epochs=50, batch_size=256)
+                    # Only write to Chronicle if IQL actually trained (non-zero losses)
+                    total_loss = sum(dream_results.get(k, 0.0) for k in ("loss_actor", "loss_qvalue", "loss_value"))
+                    if total_loss > 0.0:
+                        self._append_to_chronicle(dream_results)
+                    else:
+                        logging.info("[TitanPlugin] Scholar Dream produced no training — skipping Chronicle entry.")
+                except Exception as e:
+                    logging.error(f"[TitanPlugin] Scholar Training Failed: {e}")
             
             # Phase C: Maker Relationship Engine (post-meditation idle task)
             try:

@@ -23,6 +23,22 @@ CHECK_KIN="${2:-}"
 NOW=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
 TIMESTAMP=$(date +%s)
 
+# ── Host memory-pressure thresholds (Layer 1 safety net 2026-04-28) ──
+# Triggered by 2026-04-28 04:53 host OOM crash: parent-resident state owners
+# (Sage, L2 caches, bus history) accumulated until host RAM exhausted, swap
+# thrashed, DigitalOcean hypervisor force-rebooted the VM. Without a
+# system-level pre-OOM trigger, ANY future leak in the parent process kills
+# the host. This watchdog fires safe_restart.sh BEFORE OOM lands, capping
+# blast radius at one Titan restart vs whole-host reboot + filesystem damage.
+#
+# Trigger: MemAvailable% < threshold OR Swap% > threshold, sustained for the
+# grace window (3 consecutive 5-min cron ticks). Sustained-only — single
+# spike from a one-shot tool (npm build, pytest) won't fire.
+HOST_MEM_AVAILABLE_PCT_FLOOR=10   # MemAvailable < 10% of MemTotal = pre-OOM
+HOST_SWAP_USED_PCT_CEIL=80        # Swap usage > 80% = thrashing imminent
+HOST_PRESSURE_GRACE_S=900         # 15 min sustained (3 cron ticks @ 5min)
+HOST_PRESSURE_FLAG_FILE="/tmp/titan_host_memory_pressure.flag"
+
 # ── Configuration per Titan ──
 case "$TITAN_ID" in
     T1)
@@ -93,6 +109,104 @@ log_telemetry() {
     local extra="$*"
     echo "{\"ts\":${TIMESTAMP},\"titan\":\"${TITAN_ID}\",\"service\":\"${service}\",\"event\":\"${event}\"${extra:+,$extra}}" >> "$TELEMETRY_OUT" 2>/dev/null || true
 }
+
+# ═══════════════════════════════════════════════════════════════════════
+# CHECK 0: Host memory pressure pre-OOM safety net (Layer 1, 2026-04-28)
+# ═══════════════════════════════════════════════════════════════════════
+# Reads /proc/meminfo, evaluates two pre-OOM conditions, requires sustained
+# pressure across the grace window before firing safe_restart. Acts only
+# on T1 (the Titan running on this host). T2/T3 cron paths skip — they run
+# on a different host, and that host has its own watchdog instance.
+check_host_memory_pressure() {
+    if [ "$TITAN_ID" != "T1" ]; then
+        # T2/T3 watchdog runs on a different host; trigger logic applies
+        # locally only. Skip silently — no per-Titan flag noise.
+        return 0
+    fi
+
+    local mem_total mem_available swap_total swap_free
+    mem_total=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+    mem_available=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+    swap_total=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
+    swap_free=$(awk '/^SwapFree:/ {print $2}' /proc/meminfo)
+
+    if [ -z "$mem_total" ] || [ "$mem_total" = "0" ]; then
+        return 0  # /proc/meminfo unreadable; skip silently
+    fi
+
+    local mem_avail_pct=$((mem_available * 100 / mem_total))
+    local swap_used_pct=0
+    if [ -n "$swap_total" ] && [ "$swap_total" != "0" ]; then
+        swap_used_pct=$(((swap_total - swap_free) * 100 / swap_total))
+    fi
+
+    CURR_STATE[host_mem]="ok"
+    local pressure_reason=""
+
+    if [ "$mem_avail_pct" -lt "$HOST_MEM_AVAILABLE_PCT_FLOOR" ]; then
+        pressure_reason="MemAvailable=${mem_avail_pct}% < ${HOST_MEM_AVAILABLE_PCT_FLOOR}% floor"
+    fi
+    if [ "$swap_used_pct" -gt "$HOST_SWAP_USED_PCT_CEIL" ]; then
+        if [ -n "$pressure_reason" ]; then
+            pressure_reason="${pressure_reason}; Swap=${swap_used_pct}% > ${HOST_SWAP_USED_PCT_CEIL}% ceiling"
+        else
+            pressure_reason="Swap=${swap_used_pct}% > ${HOST_SWAP_USED_PCT_CEIL}% ceiling"
+        fi
+    fi
+
+    if [ -z "$pressure_reason" ]; then
+        if [ -f "$HOST_PRESSURE_FLAG_FILE" ]; then
+            rm -f "$HOST_PRESSURE_FLAG_FILE"
+            log_telemetry "host_mem" "pressure_cleared" "\"mem_avail_pct\":${mem_avail_pct},\"swap_used_pct\":${swap_used_pct}"
+        fi
+        return 0
+    fi
+
+    CURR_STATE[host_mem]="pressure"
+    log_telemetry "host_mem" "pressure_detected" "\"mem_avail_pct\":${mem_avail_pct},\"swap_used_pct\":${swap_used_pct},\"reason\":\"${pressure_reason}\""
+
+    local first_seen sustained_s
+    if [ -f "$HOST_PRESSURE_FLAG_FILE" ]; then
+        first_seen=$(cat "$HOST_PRESSURE_FLAG_FILE" 2>/dev/null || echo "$TIMESTAMP")
+    else
+        first_seen="$TIMESTAMP"
+        echo "$first_seen" > "$HOST_PRESSURE_FLAG_FILE"
+        send_telegram "🟡 *T1 HOST MEMORY PRESSURE*
+${pressure_reason}
+Sustained-trigger countdown started (need ${HOST_PRESSURE_GRACE_S}s sustained → safe_restart).
+_${NOW}_"
+        return 0
+    fi
+
+    sustained_s=$((TIMESTAMP - first_seen))
+    if [ "$sustained_s" -lt "$HOST_PRESSURE_GRACE_S" ]; then
+        # Pressure still on but grace window not exhausted.
+        return 0
+    fi
+
+    # Sustained pressure exhausted grace — fire safe_restart.sh BEFORE host OOMs.
+    # Check restart lockfile first (set by safe_restart while running).
+    if [ -f "/tmp/titan1_restart.lock" ]; then
+        local lock_age=$(( TIMESTAMP - $(stat -c %Y /tmp/titan1_restart.lock 2>/dev/null || echo $TIMESTAMP) ))
+        if [ "$lock_age" -lt 90 ]; then
+            return 0  # restart already in flight
+        fi
+    fi
+
+    send_telegram "🔴 *T1 HOST MEMORY — FIRING PRE-OOM RESTART*
+${pressure_reason} sustained ${sustained_s}s (grace=${HOST_PRESSURE_GRACE_S}s).
+Triggering safe_restart.sh t1 BEFORE host OOM.
+_${NOW}_"
+    log_telemetry "host_mem" "pre_oom_restart_fired" "\"sustained_s\":${sustained_s},\"reason\":\"${pressure_reason}\""
+
+    rm -f "$HOST_PRESSURE_FLAG_FILE"
+    cd "$PROJECT_DIR" 2>/dev/null
+    nohup bash "${PROJECT_DIR}/scripts/safe_restart.sh" t1 --force \
+        >> /tmp/titan_pre_oom_restart.log 2>&1 &
+    return 0
+}
+
+check_host_memory_pressure
 
 # ═══════════════════════════════════════════════════════════════════════
 # CHECK 1: Core API health
@@ -297,6 +411,50 @@ fi
 # ═══════════════════════════════════════════════════════════════════════
 # CHECK 6: Zombie + duplicate process detection (auto-kill)
 # ═══════════════════════════════════════════════════════════════════════
+# Skip this check if a coordinated restart is in flight. Two writers
+# may produce this file:
+#   1. safe_restart.sh / t{2,3}_manage.sh restart — write a plain epoch
+#      seconds integer; honor it for 90s.
+#   2. shadow_orchestrator (Phase C C-S2 PLAN §17.1) — writes JSON
+#      payload with structured `started_at` + `expected_end_at` +
+#      `heartbeat_at` + `swap_id` + heartbeats every 10s during swap.
+#      Honor while now < expected_end_at; if expired, force-clean both
+#      PIDs (orchestrator crashed mid-swap).
+# Closes BUG-RESTART-WATCHDOG-RACE (2026-04-27) +
+# BUG-SERVICES-WATCHDOG-SHADOW-SWAP-RACE-20260428.
+RESTART_LOCK_FILE="/tmp/titan$(echo "$TITAN_ID" | tr 'A-Z' 'a-z' | sed 's/t//')_restart.lock"
+RESTART_IN_FLIGHT=false
+LOCK_EXPIRED=false
+if [ -f "$RESTART_LOCK_FILE" ]; then
+    LOCK_RAW=$(cat "$RESTART_LOCK_FILE" 2>/dev/null || echo "")
+    NOW_TS=$(date +%s)
+    if [ -n "$LOCK_RAW" ] && [ "${LOCK_RAW:0:1}" = "{" ]; then
+        # JSON form (shadow_orchestrator). Parse expected_end_at.
+        EXPECTED_END=$(echo "$LOCK_RAW" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(int(float(d.get('expected_end_at', 0))))
+except Exception:
+    print(0)
+" 2>/dev/null || echo 0)
+        if [ "$NOW_TS" -lt "$EXPECTED_END" ]; then
+            RESTART_IN_FLIGHT=true
+        else
+            LOCK_EXPIRED=true
+        fi
+    else
+        # Plain-epoch form (safe_restart.sh / *_manage.sh) — 90s window
+        LOCK_TS=${LOCK_RAW:-0}
+        LOCK_AGE=$((NOW_TS - LOCK_TS))
+        if [ "$LOCK_AGE" -lt 90 ]; then
+            RESTART_IN_FLIGHT=true
+        else
+            LOCK_EXPIRED=true
+        fi
+    fi
+fi
+
 ZOMBIES=$(ps aux 2>/dev/null | grep -c ' Z ') || ZOMBIES=0
 ZOMBIES=$((ZOMBIES > 0 ? ZOMBIES : 0))
 
@@ -316,7 +474,22 @@ TITAN_PARENTS=$(_own_pids | while read pid; do
     ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' '
 done | sort -u | wc -l)
 
-if [ "$TITAN_PARENTS" -gt 1 ]; then
+if [ "$TITAN_PARENTS" -gt 1 ] && [ "$RESTART_IN_FLIGHT" = "true" ]; then
+    # Coordinated restart in flight — duplicates are expected (old children
+    # still in graceful shutdown). Don't intervene; just note and move on.
+    CURR_STATE[zombies]="ok"
+elif [ "$TITAN_PARENTS" -gt 1 ] && [ "$LOCK_EXPIRED" = "true" ]; then
+    # Phase C C-S2 (PLAN §17.1): orchestrator wrote a lock and then
+    # crashed (heartbeat stopped, expected_end_at passed). Force-clean
+    # ALL titan_main groups + the stale lock so the next watchdog cycle
+    # restarts cleanly via the dead-titan branch.
+    CURR_STATE[zombies]="orchestrator_crashed"
+    ERRORS="${ERRORS}Zombies: stale shadow-swap lock + ${TITAN_PARENTS} duplicate titan_main groups — force-cleaning\n"
+    _own_pids | while read pid; do
+        kill -9 "$pid" 2>/dev/null
+    done
+    rm -f "$RESTART_LOCK_FILE"
+elif [ "$TITAN_PARENTS" -gt 1 ]; then
     CURR_STATE[zombies]="duplicates"
     ERRORS="${ERRORS}Zombies: ${TITAN_PARENTS} duplicate titan_main groups detected — killing extras\n"
     # Keep the process group matching the PID file (the legitimate instance).

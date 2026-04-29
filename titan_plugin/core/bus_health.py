@@ -33,6 +33,7 @@ import logging
 import threading
 import time
 from typing import Callable, Optional
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +188,9 @@ class BusHealthMonitor:
                     },
                 )
             except Exception as e:
-                logger.debug("[BusHealth] publish_fn error: %s", e)
+                from titan_plugin.utils.silent_swallow import swallow_warn
+                swallow_warn("[BusHealth] publish_fn error", e,
+                             key="bus_health.publish_fn")
 
     # ------------------------------------------------------------------
     # Snapshot — read-only summary for /v4/bus-health endpoint

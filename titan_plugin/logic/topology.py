@@ -16,6 +16,7 @@ These metrics feed:
 import logging
 import math
 from typing import Sequence
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -296,8 +297,9 @@ class TopologyEngine:
                 _since = _time.time() - _anc.get("last_anchor_time", _time.time())
                 # Fresh anchor reduces tension: 0s=0.5x, 300s=0.75x, 600s=~1.0x
                 anchor_factor = 0.5 + 0.5 * min(1.0, _since / 600.0)
-        except Exception:
-            pass
+        except Exception as _swallow_exc:
+            swallow_warn('[logic.topology] TopologyEngine.compute_whole_10d: import json as _json, os as _os', _swallow_exc,
+                         key='logic.topology.TopologyEngine.compute_whole_10d.line300', throttle=100)
         grounding_tension = base_tension * anchor_factor
 
         # [7] Matter-spirit ratio: balance between material and spiritual poles

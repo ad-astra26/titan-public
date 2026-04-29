@@ -11,6 +11,7 @@ import os
 import sys
 import threading
 import time
+from titan_plugin import bus
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ def llm_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     logger.info("[LLMWorker] Inference subsystem ready in %.0fms", init_ms)
 
     # Signal ready
-    _send_msg(send_queue, "MODULE_READY", name, "guardian", {})
+    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
 
     import asyncio
     loop = asyncio.new_event_loop()
@@ -68,6 +69,15 @@ def llm_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     hb_thread.start()
     logger.info("[LLMWorker] Background heartbeat thread started (30s interval)")
 
+    # ── Microkernel v2 Phase B.1 §6 — readiness/hibernate reporter ──
+    from titan_plugin.core.readiness_reporter import trivial_reporter
+    def _b1_save_state():
+        return []
+    _b1_reporter = trivial_reporter(
+        worker_name=name, layer="L3", send_queue=send_queue,
+        save_state_cb=_b1_save_state,
+    )
+
     while True:
         try:
             msg = recv_queue.get(timeout=5.0)
@@ -78,16 +88,28 @@ def llm_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
         msg_type = msg.get("type", "")
 
-        if msg_type == "MODULE_SHUTDOWN":
+        # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────
+        if _b1_reporter.handles(msg_type):
+            _b1_reporter.handle(msg)
+            if _b1_reporter.should_exit():
+                break
+            continue
+
+        # ── Microkernel v2 Phase B.2.1 — supervision-transfer dispatch ──
+        from titan_plugin.core import worker_swap_handler as _swap
+        if _swap.maybe_dispatch_swap_msg(msg):
+            continue
+
+        if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[LLMWorker] Shutdown requested")
             break
 
-        if msg_type == "QUERY":
+        if msg_type == bus.QUERY:
             _send_heartbeat(send_queue, name)  # Prevent starvation during long LLM calls
             last_heartbeat = time.time()
             _handle_query(msg, ollama_cloud, send_queue, name, loop)
 
-        elif msg_type == "LLM_TEACHER_REQUEST":
+        elif msg_type == bus.LLM_TEACHER_REQUEST:
             _send_heartbeat(send_queue, name)  # Prevent starvation during long LLM calls
             last_heartbeat = time.time()
             _handle_teacher(msg, ollama_cloud, send_queue, name, loop)
@@ -163,7 +185,7 @@ def _handle_teacher(msg: dict, ollama_cloud, send_queue, name: str, loop) -> Non
             response = ""
             logger.warning("[LLMWorker] No inference provider for teacher request")
 
-        _send_msg(send_queue, "LLM_TEACHER_RESPONSE", name, src, {
+        _send_msg(send_queue, bus.LLM_TEACHER_RESPONSE, name, src, {
             "response": response,
             "mode": mode,
             "original": payload.get("original", ""),
@@ -174,7 +196,7 @@ def _handle_teacher(msg: dict, ollama_cloud, send_queue, name: str, loop) -> Non
 
     except Exception as e:
         logger.error("[LLMWorker] Teacher error: %s", e, exc_info=True)
-        _send_msg(send_queue, "LLM_TEACHER_RESPONSE", name, src, {
+        _send_msg(send_queue, bus.LLM_TEACHER_RESPONSE, name, src, {
             "response": "",
             "mode": mode,
             "error": str(e),
@@ -193,7 +215,7 @@ def _send_msg(send_queue, msg_type: str, src: str, dst: str, payload: dict, rid:
 
 
 def _send_response(send_queue, src: str, dst: str, payload: dict, rid: str) -> None:
-    _send_msg(send_queue, "RESPONSE", src, dst, payload, rid)
+    _send_msg(send_queue, bus.RESPONSE, src, dst, payload, rid)
 
 
 # Heartbeat throttle (Phase E Fix 2): 3s min interval per process.
@@ -211,4 +233,4 @@ def _send_heartbeat(send_queue, name: str) -> None:
         rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
     except Exception:
         rss_mb = 0
-    _send_msg(send_queue, "MODULE_HEARTBEAT", name, "guardian", {"rss_mb": round(rss_mb, 1)})
+    _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", {"rss_mb": round(rss_mb, 1)})

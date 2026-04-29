@@ -244,6 +244,75 @@ class TestThinEncoder:
         out = enc.encode(felt_tensor_130d=[0.5] * 130)
         assert out["novelty"] == 0.5
 
+    def test_novelty_tier1_dynamic_range(self):
+        """Tier-1 fix (2026-04-22): novelty must produce real dynamic range
+        during the pre-emergence phase. Prior cosine-on-cumulative-mean
+        implementation flat-lined near 0 (<0.01) regardless of input,
+        starving observers of signal during the 14-day soak window."""
+        import numpy as np
+        enc = ThinEmotEncoder(titan_id="T1")
+        rng = np.random.default_rng(42)
+
+        # Warm up with ~30 stable-ish observations near 0.5 mean
+        for _ in range(30):
+            felt = list(rng.normal(0.5, 0.05, 130).astype(np.float32))
+            enc.encode(felt_tensor_130d=felt)
+
+        # Baseline state — novelty should be in moderate range, NOT pinned near 0
+        baseline_samples = []
+        for _ in range(20):
+            felt = list(rng.normal(0.5, 0.05, 130).astype(np.float32))
+            out = enc.encode(felt_tensor_130d=felt)
+            baseline_samples.append(out["novelty"])
+        baseline_mean = sum(baseline_samples) / len(baseline_samples)
+
+        # Novelty shouldn't flatline — baseline variability should register
+        # SOMEWHERE in [0.1, 0.9] rather than stuck at ~0.
+        assert 0.05 < baseline_mean < 0.95, (
+            f"baseline novelty flatlined at {baseline_mean:.4f} — "
+            f"Tier-1 EMA approach should produce real variation")
+
+        # Big deviation should SPIKE novelty
+        spike_felt = list(rng.normal(0.9, 0.05, 130).astype(np.float32))
+        out_spike = enc.encode(felt_tensor_130d=spike_felt)
+        spike_novelty = out_spike["novelty"]
+        assert spike_novelty > baseline_mean + 0.15, (
+            f"unusual state should spike novelty above baseline "
+            f"({baseline_mean:.3f}); got {spike_novelty:.3f}")
+
+    def test_novelty_bounded(self):
+        """Novelty must always stay in [0, 1]. Extreme input shouldn't overflow."""
+        import numpy as np
+        enc = ThinEmotEncoder(titan_id="T1")
+        # Warm up
+        for _ in range(15):
+            enc.encode(felt_tensor_130d=[0.5] * 130)
+        # Extreme inputs — very high and very low
+        for v in [0.0, 1.0, 0.999, 0.001]:
+            out = enc.encode(felt_tensor_130d=[v] * 130)
+            assert 0.0 <= out["novelty"] <= 1.0, (
+                f"novelty {out['novelty']} out of [0,1] for input {v}")
+
+    def test_novelty_still_state_low(self):
+        """Titan in a very stable trajectory should converge to low novelty,
+        not hover at 0.5 forever."""
+        import numpy as np
+        enc = ThinEmotEncoder(titan_id="T1")
+        rng = np.random.default_rng(7)
+        felt_stable = [0.5] * 130  # exactly baseline, no noise
+
+        novelties = []
+        for _ in range(50):
+            out = enc.encode(felt_tensor_130d=felt_stable)
+            novelties.append(out["novelty"])
+
+        # After many identical observations, novelty should drop below
+        # warmup neutral. 0.3 is a reasonable "settled-quiet" threshold.
+        late_avg = sum(novelties[-10:]) / 10
+        assert late_avg < 0.4, (
+            f"static state should produce low novelty after warmup; "
+            f"got late avg {late_avg:.3f}")
+
 
 # ── Region clusterer ──────────────────────────────────────────────────
 

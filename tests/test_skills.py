@@ -307,12 +307,18 @@ class TestSkillValidator:
 
     @pytest.mark.asyncio
     async def test_llm_analysis_graceful_fallback(self, sample_skill_content):
-        """LLM analysis should fail gracefully if Ollama is not running."""
+        """LLM analysis should fail gracefully when no Ollama Cloud client
+        is wired. SkillValidator was migrated from local-Ollama-host string
+        to OllamaCloudClient object — this test now exercises the
+        `_ollama_cloud=None` branch (validator.py:237-239), which logs the
+        skip and returns None so static + Guardian layers still produce a
+        complete ValidationResult."""
         from titan_plugin.skills.validator import SkillValidator
-        validator = SkillValidator(ollama_host="http://localhost:99999")
+        validator = SkillValidator()  # ollama_cloud=None, no LLM layer
         result = await validator.validate(sample_skill_content)
         # Should still produce a result (static analysis only)
         assert result.risk_level in ("ALLOW", "WARN", "BLOCK")
+        assert result.llm_analysis is None  # confirms graceful skip
 
     @pytest.mark.asyncio
     async def test_guardian_integration(self, sample_skill_content):

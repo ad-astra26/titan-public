@@ -85,6 +85,8 @@ import math
 import threading
 import time
 from typing import Any, Optional
+from titan_plugin.utils.silent_swallow import swallow_warn
+from titan_plugin import bus
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +198,24 @@ class OuterState:
 
         # T2: Active flag — when False, bus updates are ignored (dreaming state)
         self.is_active: bool = True
+
+        # rFP_titan_vm_v2 Phase 2: snapshots that feed TitanVM's "neuromod.*"
+        # and "cgn.*" observable namespaces. Both are dicts populated by
+        # other systems; TitanVM programs read via dotted paths like
+        # "neuromod.DA" or "cgn.grounded_density" (resolved via context
+        # injection in InnerTrinityCoordinator.tick()).
+        #   - neuromod_state: filled by InnerTrinityCoordinator from
+        #     self._neuromod_system.modulators every tick (no bus trip).
+        #   - cgn_state: filled by spirit_worker's CGN_STATE_SNAPSHOT bus
+        #     subscriber — cgn_worker emits a snapshot every 10 cgn ticks.
+        self.neuromod_state: dict = {}
+        self.cgn_state: dict = {}
+        # Microkernel v2 amendment 2026-04-26: aggregates pulled from
+        # SPIRIT_STATE.payload["v4"] when spirit_worker is a subprocess.
+        # Forward-compatible with Phase B (workers persist) and Phase C
+        # (Rust L0 reads same dict shape from msgpack).
+        self.expression_composites: dict = {}
+        self.neural_nervous_system_stats: dict = {}
 
     # ── Read API (thread-safe, instant) ──────────────────────────────
 
@@ -386,7 +406,32 @@ class OuterState:
             return
 
         self._bus = bus
-        self._bus_queue = bus.subscribe("state_register")
+        # Option B (2026-04-29): explicit broadcast filter matching the
+        # `if msg_type == bus.X` elif chain in _process_bus_message().
+        # Auto-extracted via scripts/migrate_bus_filters.py and verified
+        # against bus.py constants. Targeted dst="state_register" msgs
+        # bypass the filter (none currently used; path stays open).
+        # NOTE: the `bus` parameter shadows the module-level `bus` import
+        # in this method, so we import the constants by name directly.
+        from titan_plugin.bus import (
+            BODY_STATE,
+            FILTER_DOWN,
+            FOCUS_NUDGE,
+            IMPULSE,
+            MIND_STATE,
+            OBSERVABLES_SNAPSHOT,
+            OUTER_TRINITY_STATE,
+            SPHERE_PULSE,
+            SPIRIT_STATE,
+        )
+        self._bus_queue = bus.subscribe(
+            "state_register",
+            types=[
+                BODY_STATE, FILTER_DOWN, FOCUS_NUDGE, IMPULSE, MIND_STATE,
+                OBSERVABLES_SNAPSHOT, OUTER_TRINITY_STATE, SPHERE_PULSE,
+                SPIRIT_STATE,
+            ],
+        )
         self._running = True
         self._snapshot_interval = snapshot_interval
         self._thread = threading.Thread(
@@ -450,7 +495,7 @@ class OuterState:
                     + extended["inner_mind"]      # 15D (or 5D fallback)
                     + extended["inner_spirit"]    # 45D (or 5D fallback)
                 )
-                msg = make_msg("STATE_SNAPSHOT", "state_register", "spirit", {
+                msg = make_msg(bus.STATE_SNAPSHOT, "state_register", "spirit", {
                     "full_30dt":         snapshot_30dt,                  # legacy 30D
                     "full_65dt":         full_65dt,                      # inner 65D
                     "full_130dt":        self.get_full_130dt(),          # rFP #1: full felt 130D
@@ -460,7 +505,8 @@ class OuterState:
                 })
                 self._bus.publish(msg)
             except Exception as e:
-                logger.debug("[StateRegister] Snapshot publish error: %s", e)
+                swallow_warn('[StateRegister] Snapshot publish error', e,
+                             key="logic.state_register.snapshot_publish_error", throttle=100)
 
     def _bus_listener_loop(self) -> None:
         """Background thread: drain bus messages and update state."""
@@ -477,7 +523,8 @@ class OuterState:
             try:
                 self._process_bus_message(msg)
             except Exception as e:
-                logger.debug("[StateRegister] Error processing message: %s", e)
+                swallow_warn('[StateRegister] Error processing message', e,
+                             key="logic.state_register.error_processing_message", throttle=100)
 
     def _process_bus_message(self, msg: dict) -> None:
         """Route bus message to appropriate state update.
@@ -489,7 +536,7 @@ class OuterState:
         msg_type = msg.get("type", "")
         payload = msg.get("payload", {})
 
-        if msg_type == "BODY_STATE":
+        if msg_type == bus.BODY_STATE:
             values = payload.get("values", [0.5] * 5)
             updates = {
                 "body_tensor": values,
@@ -502,7 +549,7 @@ class OuterState:
                 updates["filter_down_body"] = mult
             self._update_many(updates)
 
-        elif msg_type == "MIND_STATE":
+        elif msg_type == bus.MIND_STATE:
             values = payload.get("values", [0.5] * 5)
             updates = {
                 "mind_tensor": values,
@@ -518,7 +565,7 @@ class OuterState:
                 updates["filter_down_mind"] = mult
             self._update_many(updates)
 
-        elif msg_type == "SPIRIT_STATE":
+        elif msg_type == bus.SPIRIT_STATE:
             values = payload.get("values", [0.5] * 5)
             updates = {
                 "spirit_tensor": values,
@@ -531,13 +578,23 @@ class OuterState:
             # Consciousness data comes embedded in SPIRIT_STATE
             consciousness = payload.get("consciousness")
             if consciousness:
-                updates["consciousness"] = {
+                cons_update = {
                     "epoch_number": consciousness.get("epoch_number", 0),
                     "drift": consciousness.get("drift", 0.0),
                     "trajectory": consciousness.get("trajectory", 0.0),
                     "curvature": consciousness.get("curvature", 0.0),
                     "density": consciousness.get("density", 0.0),
                 }
+                # rFP_observatory_data_loading_v1 §3.2 (2026-04-26):
+                # preserve state_vector when present so api_subprocess
+                # endpoints (/v3/trinity inner Spirit 45D heatmap,
+                # /v4/inner-trinity coord.consciousness.state_vector) can
+                # extract the per-tier slices: sv[5:20]=mind15D,
+                # sv[20:65]=spirit45D, sv[85:130]=outer_spirit45D.
+                sv = consciousness.get("state_vector")
+                if isinstance(sv, list) and sv:
+                    cons_update["state_vector"] = list(sv)
+                updates["consciousness"] = cons_update
             # V4 data if present
             v4 = payload.get("v4", {})
             if v4.get("sphere_clocks"):
@@ -547,8 +604,20 @@ class OuterState:
             if v4.get("unified_spirit"):
                 updates["unified_spirit"] = v4["unified_spirit"]
             self._update_many(updates)
+            # Microkernel v2 amendment 2026-04-26: in legacy mode,
+            # InnerTrinityCoordinator wrote neuromod_state directly via
+            # attribute access. In microkernel + spirit_worker subprocess,
+            # that doesn't cross the process boundary — pull from v4 block
+            # instead. Same forward-compatibility note applies for Phase B/C.
+            if isinstance(v4.get("neuromodulators"), dict):
+                self.neuromod_state = dict(v4["neuromodulators"])
+            if isinstance(v4.get("expression_composites"), dict):
+                # Stash on a dedicated attribute so kernel snapshot can find it.
+                self.expression_composites = dict(v4["expression_composites"])
+            if isinstance(v4.get("neural_nervous_system"), dict):
+                self.neural_nervous_system_stats = dict(v4["neural_nervous_system"])
 
-        elif msg_type == "FOCUS_NUDGE":
+        elif msg_type == bus.FOCUS_NUDGE:
             dst = msg.get("dst", "")
             nudges = payload.get("nudges", [])
             if "body" in dst and nudges:
@@ -556,7 +625,7 @@ class OuterState:
             elif "mind" in dst and nudges:
                 self._update("focus_mind", nudges)
 
-        elif msg_type == "FILTER_DOWN":
+        elif msg_type == bus.FILTER_DOWN:
             dst = msg.get("dst", "")
             mult = payload.get("multipliers", [])
             if "body" in dst and mult:
@@ -564,7 +633,7 @@ class OuterState:
             elif "mind" in dst and mult:
                 self._update("filter_down_mind", mult)
 
-        elif msg_type == "SPHERE_PULSE":
+        elif msg_type == bus.SPHERE_PULSE:
             with self._lock:
                 clocks = self._state.get("sphere_clocks", {})
                 clock_name = payload.get("clock_name", "")
@@ -576,7 +645,7 @@ class OuterState:
                     self._state["sphere_clocks"] = clocks
                     self._state["last_update_ts"] = time.time()
 
-        elif msg_type == "OBSERVABLES_SNAPSHOT":
+        elif msg_type == bus.OBSERVABLES_SNAPSHOT:
             # rFP #1 Phase 2: space-topology observables pushed by spirit_worker
             # after coordinator.tick_inner_only / tick_outer_only computes them.
             flat = payload.get("observables_30d")
@@ -589,7 +658,7 @@ class OuterState:
             if updates:
                 self._update_many(updates)
 
-        elif msg_type == "OUTER_TRINITY_STATE":
+        elif msg_type == bus.OUTER_TRINITY_STATE:
             updates = {
                 "outer_body": payload.get("outer_body", [0.5] * 5),
                 "outer_mind": payload.get("outer_mind", [0.5] * 5),
@@ -604,7 +673,7 @@ class OuterState:
                 updates["outer_spirit_45d"] = outer_spirit_45d
             self._update_many(updates)
 
-        elif msg_type == "IMPULSE":
+        elif msg_type == bus.IMPULSE:
             self._update("last_impulse_ts", time.time())
 
     # ── Minimal State Summary (for fallback) ─────────────────────────

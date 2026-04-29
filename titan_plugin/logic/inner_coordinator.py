@@ -70,6 +70,14 @@ class InnerTrinityCoordinator:
         self._e_mem = None
         self._neuromod_system = None
 
+        # rFP_titan_vm_v2 Phase 2 §3.8: locally-cached CGN state snapshot.
+        # cgn_worker emits CGN_STATE_SNAPSHOT every 10 CGN_TRANSITIONS;
+        # spirit_worker's bus handler forwards payload here via
+        # update_cgn_snapshot(). On each tick() we thread the latest
+        # snapshot into NS.evaluate() so TitanVM's cgn.* observable
+        # namespace stays fresh. Empty dict = safe cold-start.
+        self._cgn_snapshot: dict = {}
+
     def set_dream_subsystems(self, exp_orchestrator=None, life_force=None,
                              e_mem=None, neuromod_system=None):
         """Wire subsystems needed for dream side-effects."""
@@ -77,6 +85,16 @@ class InnerTrinityCoordinator:
         self._life_force = life_force
         self._e_mem = e_mem
         self._neuromod_system = neuromod_system
+
+    def update_cgn_snapshot(self, snapshot: dict) -> None:
+        """Receive a CGN_STATE_SNAPSHOT payload from the bus handler.
+
+        The snapshot comes from cgn_worker (separate subprocess) via
+        DivineBus; spirit_worker's bus dispatcher calls this helper so
+        the next coordinator.tick() sees fresh cgn.* observables.
+        """
+        if isinstance(snapshot, dict):
+            self._cgn_snapshot = dict(snapshot)
 
     def tick(
         self,
@@ -120,7 +138,24 @@ class InnerTrinityCoordinator:
         # 4. Run nervous system micro-programs (T4)
         if self.nervous_system:
             try:
-                self._last_nervous_signals = self.nervous_system.evaluate(all_obs)
+                # rFP_titan_vm_v2 Phase 2: assemble neuromod + cgn context
+                # dicts for injection into TitanVM observable space.
+                # Neuromod comes from the local NeuromodulatorSystem (main
+                # process, zero-copy dict construction).
+                # CGN comes from state_register, populated by the
+                # CGN_STATE_SNAPSHOT bus subscriber in spirit_worker.
+                _nm_state: dict = {}
+                if self._neuromod_system is not None:
+                    try:
+                        for _name, _mod in self._neuromod_system.modulators.items():
+                            _nm_state[_name] = float(_mod.level)
+                    except Exception:
+                        _nm_state = {}
+                self._last_nervous_signals = self.nervous_system.evaluate(
+                    all_obs,
+                    neuromod_state=_nm_state,
+                    cgn_state=self._cgn_snapshot,
+                )
             except Exception as e:
                 logger.debug("[Coordinator] NervousSystem error: %s", e)
 

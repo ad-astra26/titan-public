@@ -89,6 +89,68 @@ def test_scan_orphan_journals_skips_live_pid(tmp_path):
     assert str(p_alive) not in names
 
 
+def test_scan_orphan_journals_filters_by_instance_prefix(tmp_path):
+    """Per-instance journal naming: each daemon's scan only picks up
+    journals belonging to its own writer instance.
+
+    Pre-fix bug: both inner_memory_client and observatory_writer_client
+    wrote to `imw_<pid>.jrn` and the inner_memory daemon's
+    `scan_orphan_journals` globbed `imw_*.jrn`, so observatory writes
+    were replayed against `inner_memory.db` → "no such table" failures.
+    Fixed by deriving the prefix from `Path(cfg.socket_path).stem`.
+    """
+    own_pid = os.getpid()
+    # Create journals from BOTH writer instances for a guaranteed-dead pid.
+    # 999999 is well above the pid_max on Linux (typically 32768 or 4194304)
+    # but `os.kill(pid, 0)` will reliably raise ProcessLookupError for it.
+    DEAD_PID = 999999
+    inner_journal = tmp_path / f"imw_{DEAD_PID}.jrn"
+    obs_journal = tmp_path / f"observatory_writer_{DEAD_PID}.jrn"
+    CallerJournal(str(inner_journal), pid=DEAD_PID).close()
+    CallerJournal(str(obs_journal), pid=DEAD_PID).close()
+
+    # inner_memory daemon (default prefix "imw") sees ONLY its own
+    inner_orphans = scan_orphan_journals(
+        str(tmp_path), instance_prefix="imw", exclude_pid=own_pid)
+    inner_names = [str(o[0]) for o in inner_orphans]
+    assert str(inner_journal) in inner_names, "inner_memory daemon must see imw_*.jrn"
+    assert str(obs_journal) not in inner_names, \
+        "inner_memory daemon must NOT see observatory_writer_*.jrn"
+
+    # observatory_writer daemon sees ONLY its own
+    obs_orphans = scan_orphan_journals(
+        str(tmp_path), instance_prefix="observatory_writer", exclude_pid=own_pid)
+    obs_names = [str(o[0]) for o in obs_orphans]
+    assert str(obs_journal) in obs_names, \
+        "observatory_writer daemon must see observatory_writer_*.jrn"
+    assert str(inner_journal) not in obs_names, \
+        "observatory_writer daemon must NOT see imw_*.jrn"
+
+
+def test_scan_orphan_journals_default_prefix_is_backward_compat(tmp_path):
+    """Existing callers (none in-repo, but to avoid surprises) that don't
+    pass instance_prefix get the legacy "imw" default — same behavior as
+    before the multi-instance fix."""
+    own_pid = os.getpid()
+    DEAD_PID = 999998
+    p = tmp_path / f"imw_{DEAD_PID}.jrn"
+    CallerJournal(str(p), pid=DEAD_PID).close()
+    orphans = scan_orphan_journals(str(tmp_path), exclude_pid=own_pid)
+    assert str(p) in [str(o[0]) for o in orphans]
+
+
+def test_scan_orphan_journals_parses_pid_from_multiword_prefix(tmp_path):
+    """Underscore-containing instance prefixes (e.g. observatory_writer)
+    must still parse the trailing pid correctly — uses rsplit(_,1)."""
+    own_pid = os.getpid()
+    p = tmp_path / "observatory_writer_42.jrn"
+    CallerJournal(str(p), pid=42).close()
+    orphans = scan_orphan_journals(
+        str(tmp_path), instance_prefix="observatory_writer", exclude_pid=own_pid)
+    assert len(orphans) == 1
+    assert orphans[0][1] == 42, f"expected pid=42, got {orphans[0][1]}"
+
+
 def test_rotate_on_size_cap(tmp_path):
     p = tmp_path / "imw_7.jrn"
     # Use a very tiny cap to force rotation

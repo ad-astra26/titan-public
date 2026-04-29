@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import numpy as np
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,65 @@ def _np_multinomial(probs: np.ndarray) -> int:
 # ── Main client ──────────────────────────────────────────────────────────
 
 # SHM_SOURCED: all weights + config loaded from /dev/shm via ShmWeightReader.
+# Upgrade III peer publishing — module-level rate state (audit 2026-04-23 Q2).
+# Workers that emit CGN_CROSS_INSIGHT without a CGNConsumerClient instance
+# (language_worker, knowledge_worker emit via raw _send_msg) share this
+# per-consumer rate gate. Keyed by consumer_name so each peer has its own
+# 5s rate window.
+_PEER_CROSS_INSIGHT_RATE_STATE: Dict[str, float] = {}
+
+
+def emit_chain_outcome_insight(send_queue, src_module: str,
+                                consumer_name: str,
+                                terminal_reward: float,
+                                ctx: Optional[dict] = None) -> bool:
+    """Module-level CGN_CROSS_INSIGHT emitter for Upgrade III peer
+    publishing (rFP §17 + audit 2026-04-23 Q2).
+
+    Use from worker code that emits CGN_TRANSITION via raw _send_msg and
+    doesn't have a CGNConsumerClient instance at the emit site. Keeps the
+    same filter semantics as emot_cgn's own publisher and as the
+    CGNConsumerClient.emit_cross_insight method.
+
+      - 5-second rate gate per `consumer_name`
+      - Informative-only: |reward - 0.5| > 0.3
+
+    Returns True if emitted.
+    """
+    if send_queue is None:
+        return False
+    now = time.time()
+    last = _PEER_CROSS_INSIGHT_RATE_STATE.get(consumer_name, 0.0)
+    if now - last < 5.0:
+        return False
+    try:
+        if abs(float(terminal_reward) - 0.5) <= 0.3:
+            return False
+        send_queue.put_nowait({
+            "type": "CGN_CROSS_INSIGHT",
+            "src": src_module,
+            "dst": "all",
+            "ts": now,
+            "payload": {
+                "origin_consumer": consumer_name,
+                "insight_type": "chain_outcome",
+                "terminal_reward": float(terminal_reward),
+                "ctx_summary": {
+                    k: ctx[k] for k in (ctx or {})
+                    if isinstance(ctx[k], (int, float, str, bool))
+                },
+            },
+        })
+        _PEER_CROSS_INSIGHT_RATE_STATE[consumer_name] = now
+        return True
+    except Exception as e:
+        from titan_plugin.utils.silent_swallow import swallow_warn
+        swallow_warn(
+            f"[emit_chain_outcome_insight:{consumer_name}] failed", e,
+            key=f"cgn_consumer_client.emit_chain_outcome_insight.{consumer_name}")
+        return False
+
+
 class CGNConsumerClient:
     """Local inference client for a single CGN consumer.
 
@@ -159,12 +219,16 @@ class CGNConsumerClient:
     def __init__(self, consumer_name: str,
                  send_queue=None, module_name: str = "",
                  state_dir: str = "data/cgn",
-                 shm_path: str = "/dev/shm/cgn_live_weights.bin"):
+                 shm_path: str = "/dev/shm/cgn_live_weights.bin",
+                 titan_id: str | None = None,
+                 config: dict | None = None):
         self._name = consumer_name
         self._send_queue = send_queue
         self._module_name = module_name or consumer_name
         self._state_dir = state_dir
         self._shm_path = shm_path
+        self._titan_id = titan_id
+        self._cgn_config = config
 
         # Lazy-init state — weight loading deferred to first use.
         self._initialized = False
@@ -173,9 +237,14 @@ class CGNConsumerClient:
         self._action_names: List[str] = []
         self._config_loaded = False
 
-        # SHM reader — torch-free (just mmap'd bytes + numpy)
+        # SHM reader — torch-free (just mmap'd bytes + numpy).
+        # Microkernel v2 §A.2 part 2 (S4): pass titan_id + config so the
+        # dual-mode resolver picks per-titan + 24B header when flag on.
+        # Explicit non-default shm_path (test override) still honored.
         from titan_plugin.logic.cgn_shm_protocol import ShmWeightReader
-        self._shm_reader = ShmWeightReader(shm_path)
+        _shm_arg = shm_path if shm_path != "/dev/shm/cgn_live_weights.bin" else None
+        self._shm_reader = ShmWeightReader(
+            shm_path=_shm_arg, titan_id=titan_id, config=config)
 
         # Plug B (rFP §20): EMA of recent emotional cross-insight rewards.
         # Each incoming CGN_CROSS_INSIGHT with origin="emotional" updates
@@ -185,6 +254,12 @@ class CGNConsumerClient:
         self._emot_insight_reward_ema: float = 0.5
         self._emot_insight_count: int = 0
         self._emot_insight_last_ts: float = 0.0
+
+        # Upgrade III peer publishing (audit 2026-04-23 Q2) — rate gate +
+        # counter for outgoing CGN_CROSS_INSIGHT. Mirrors emot_cgn's
+        # existing publisher state (emot_cgn.py:331-333).
+        self._last_cross_insight_ts: float = 0.0
+        self._cross_insights_sent: int = 0
 
     def note_incoming_cross_insight(self, payload: dict) -> None:
         """Process a CGN_CROSS_INSIGHT from another consumer.
@@ -212,9 +287,8 @@ class CGNConsumerClient:
             self._emot_insight_count += 1
             self._emot_insight_last_ts = time.time()
         except Exception as e:
-            logger.debug(
-                "[CGNClient:%s] note_incoming_cross_insight error: %s",
-                self._name, e)
+            swallow_warn(f'[CGNClient:{self._name}] note_incoming_cross_insight error', e,
+                         key="logic.cgn_consumer_client.note_incoming_cross_insight_error", throttle=100)
 
     def _ensure_initialized(self) -> None:
         """Lazy initialization — loads numpy weights on first use.
@@ -259,8 +333,8 @@ class CGNConsumerClient:
                     self._config_loaded = True
                 return True
         except Exception as e:
-            logger.debug("[CGNClient:%s] SHM load failed: %s",
-                         self._name, e)
+            swallow_warn(f'[CGNClient:{self._name}] SHM load failed', e,
+                         key="logic.cgn_consumer_client.shm_load_failed", throttle=100)
         return False
 
     def _check_and_reload(self):
@@ -342,7 +416,8 @@ class CGNConsumerClient:
                 transition=transition,
             )
         except Exception as e:
-            logger.debug("[CGNClient:%s] ground() failed: %s", self._name, e)
+            swallow_warn(f'[CGNClient:{self._name}] ground() failed', e,
+                         key="logic.cgn_consumer_client.ground_failed", throttle=100)
             return LocalGroundingResult()
 
     def infer_action(self, sensory_ctx: dict,
@@ -407,8 +482,8 @@ class CGNConsumerClient:
                 "q_values": q_values,
             }
         except Exception as e:
-            logger.debug("[CGNClient:%s] infer_action() failed: %s",
-                         self._name, e)
+            swallow_warn(f'[CGNClient:{self._name}] infer_action() failed', e,
+                         key="logic.cgn_consumer_client.infer_action_failed", throttle=100)
             return fallback
 
     def send_transition(self, transition: dict):
@@ -425,8 +500,24 @@ class CGNConsumerClient:
                 "payload": transition,
             })
         except Exception as e:
-            logger.debug("[CGNClient:%s] send_transition failed: %s",
-                         self._name, e)
+            swallow_warn(f'[CGNClient:{self._name}] send_transition failed', e,
+                         key="logic.cgn_consumer_client.send_transition_failed", throttle=100)
+
+    def emit_cross_insight(self, terminal_reward: float,
+                           ctx: Optional[dict] = None) -> bool:
+        """Emit CGN_CROSS_INSIGHT for this consumer's chain outcome.
+
+        Thin wrapper over module-level `emit_chain_outcome_insight` for
+        consumers that have a CGNConsumerClient instance. Returns True
+        if emitted. Audit 2026-04-23 Q2 (Upgrade III peer publishing).
+        """
+        emitted = emit_chain_outcome_insight(
+            self._send_queue, self._module_name, self._name,
+            terminal_reward, ctx)
+        if emitted:
+            self._last_cross_insight_ts = time.time()
+            self._cross_insights_sent += 1
+        return emitted
 
     def record_outcome(self, concept_id: str, reward: float,
                        outcome_context: dict = None):
@@ -449,8 +540,8 @@ class CGNConsumerClient:
                 },
             })
         except Exception as e:
-            logger.debug("[CGNClient:%s] record_outcome failed: %s",
-                         self._name, e)
+            swallow_warn(f'[CGNClient:{self._name}] record_outcome failed', e,
+                         key="logic.cgn_consumer_client.record_outcome_failed", throttle=100)
 
     # ── State vector building (copied from cgn.py _build_state_vector) ──
 

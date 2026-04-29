@@ -19,8 +19,11 @@ import logging
 import math
 import os
 import sqlite3
+import statistics
 import struct
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -3108,3 +3111,217 @@ class TimeChainOrchestrator:
             logger.warning("[Orchestrator] inner-trinity enrichment FAILED: %s", e)
 
         return snapshot
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Rich-signal stats — Phase 1 sensory wiring rFP (2026-04-23)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Exposes blockchain-derived signals for outer_body V6 5DT composites:
+#
+#   get_tx_latency_stats()    — rolling median + p95 of on-chain TX wall
+#                               latency (e.g. sol_client.send_transaction).
+#                               Feeds outer_body[2] somatosensation (pressure
+#                               of reaching out to chain).
+#   get_block_delta_stats()   — rate of local TimeChain block accumulation
+#                               (blocks/min, normalized). Feeds outer_body[0]
+#                               interoception (energetic chain pulse).
+#
+# Module-level state, thread-safe. No background thread — sample-on-demand
+# with rolling buffers populated by explicit record_*() calls (TX latency)
+# or DB sampling (block height).
+# ═══════════════════════════════════════════════════════════════════════
+
+# TX latency ring buffer — last 20 wall-clock durations (seconds) for
+# recorded on-chain submissions. Populated by record_tx_latency() from
+# spirit_loop.py after each sol_client.send_transaction() call.
+_TX_LATENCY_BUFFER_MAX = 20
+_tx_latency_buffer: deque = deque(maxlen=_TX_LATENCY_BUFFER_MAX)
+_tx_latency_lock = threading.Lock()
+
+# Block-height sampling: (ts, block_count) tuples, up to 10 samples = ~10min
+# history at 60s poll cadence. Populated lazily by get_block_delta_stats()
+# reading the main-fork index.db.
+_BLOCK_HEIGHT_BUFFER_MAX = 10
+_BLOCK_HEIGHT_TTL_S = 55.0  # slightly under 60s outer_trinity tick
+_block_height_buffer: deque = deque(maxlen=_BLOCK_HEIGHT_BUFFER_MAX)
+_block_height_lock = threading.Lock()
+_last_block_sample_ts = 0.0
+
+# Normalization: typical Solana TX latency is 1-5s healthy, 10s+ congested.
+_TX_LATENCY_HEALTHY_S = 2.0
+_TX_LATENCY_CONGESTED_S = 15.0
+
+# Normalization for block rate: typical healthy Titan produces ~20K
+# TimeChain blocks/day ≈ 14 blocks/minute. Report as normalized [0, 1]
+# where 0 = stalled, 0.5 = neutral (half expected), 1.0 = peak rate.
+_BLOCK_RATE_EXPECTED_PER_MIN = 14.0
+
+# Default path for the main TimeChain fork index DB (overridable per-Titan)
+_DEFAULT_INDEX_DB = "data/timechain/index.db"
+
+
+def record_tx_latency(duration_s: float) -> None:
+    """Called after an on-chain submission. Appends wall-clock latency (s)
+    to the rolling buffer for `get_tx_latency_stats()` consumption.
+
+    Intended call site: spirit_loop.py around each `sol_client.send_transaction`.
+    Robust to NaN/negative inputs — silently discards invalid values.
+    """
+    try:
+        d = float(duration_s)
+    except (TypeError, ValueError):
+        return
+    if d != d or d < 0:  # NaN guard
+        return
+    with _tx_latency_lock:
+        _tx_latency_buffer.append(d)
+
+
+def get_tx_latency_stats() -> dict:
+    """Rolling stats over recent on-chain TX latencies.
+
+    Returns:
+        {
+            "samples":        int — how many latency samples in buffer
+            "median_s":       float — p50 (seconds), NaN-safe
+            "p95_s":          float — p95 (seconds)
+            "normalized":     float in [0,1] where
+                              0 = healthy/fast (<= 2s)
+                              1 = congested (>= 15s)
+                              0.5 = mid-pressure (~8s)
+                              0.5 = neutral when buffer empty
+        }
+
+    Used by outer_trinity._collect_outer_body dim [2] somatosensation
+    as one of three weighted inputs (weight 0.4).
+    """
+    with _tx_latency_lock:
+        samples = list(_tx_latency_buffer)
+
+    if not samples:
+        return {"samples": 0, "median_s": 0.0, "p95_s": 0.0, "normalized": 0.5}
+
+    median = statistics.median(samples)
+    if len(samples) >= 2:
+        sorted_samples = sorted(samples)
+        p95_idx = min(len(sorted_samples) - 1, int(len(sorted_samples) * 0.95))
+        p95 = sorted_samples[p95_idx]
+    else:
+        p95 = median
+
+    # Linearly normalize median between healthy/congested
+    if median <= _TX_LATENCY_HEALTHY_S:
+        normalized = 0.0
+    elif median >= _TX_LATENCY_CONGESTED_S:
+        normalized = 1.0
+    else:
+        span = _TX_LATENCY_CONGESTED_S - _TX_LATENCY_HEALTHY_S
+        normalized = (median - _TX_LATENCY_HEALTHY_S) / span
+
+    return {
+        "samples": len(samples),
+        "median_s": round(median, 4),
+        "p95_s": round(p95, 4),
+        "normalized": round(max(0.0, min(1.0, normalized)), 4),
+    }
+
+
+def _sample_block_height(index_db_path: str) -> Optional[int]:
+    """Read current main-fork block count. None on failure."""
+    try:
+        conn = sqlite3.connect(index_db_path, timeout=1.0)
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM block_index WHERE fork_id = ?",
+                (FORK_IDS["main"],),
+            ).fetchone()
+            return int(row[0]) if row else None
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError):
+        return None
+
+
+def get_block_delta_stats(index_db_path: Optional[str] = None) -> dict:
+    """Rate of local TimeChain main-fork block accumulation.
+
+    Samples the index.db lazily (once per ~55s TTL). Computes rate from
+    oldest vs newest buffered sample.
+
+    Args:
+        index_db_path: path to TimeChain main-fork index DB. Defaults to
+                       `data/timechain/index.db` relative to CWD.
+
+    Returns:
+        {
+            "samples":         int — how many height samples in buffer
+            "latest_height":   int — current block count
+            "blocks_per_min":  float — recent rate (from oldest → newest)
+            "normalized":      float in [0,1] where
+                               0 = stalled
+                               0.5 = half expected rate
+                               1.0 = peak expected rate
+                               0.5 neutral when insufficient samples
+        }
+    """
+    global _last_block_sample_ts
+
+    path = index_db_path or _DEFAULT_INDEX_DB
+    now = time.time()
+
+    do_sample = False
+    with _block_height_lock:
+        if now - _last_block_sample_ts > _BLOCK_HEIGHT_TTL_S:
+            _last_block_sample_ts = now
+            do_sample = True
+
+    if do_sample:
+        height = _sample_block_height(path)
+        if height is not None:
+            with _block_height_lock:
+                _block_height_buffer.append((now, height))
+
+    with _block_height_lock:
+        samples = list(_block_height_buffer)
+
+    if not samples:
+        return {
+            "samples": 0, "latest_height": 0,
+            "blocks_per_min": 0.0, "normalized": 0.5,
+        }
+
+    latest_ts, latest_h = samples[-1]
+    if len(samples) < 2:
+        return {
+            "samples": 1, "latest_height": int(latest_h),
+            "blocks_per_min": 0.0, "normalized": 0.5,
+        }
+
+    oldest_ts, oldest_h = samples[0]
+    time_span_min = max(1e-6, (latest_ts - oldest_ts) / 60.0)
+    blocks_per_min = (latest_h - oldest_h) / time_span_min
+
+    # Negative rate (DB rebuild or error) → treat as stalled
+    if blocks_per_min < 0:
+        blocks_per_min = 0.0
+
+    normalized = blocks_per_min / _BLOCK_RATE_EXPECTED_PER_MIN
+    normalized = max(0.0, min(1.0, normalized))
+
+    return {
+        "samples": len(samples),
+        "latest_height": int(latest_h),
+        "blocks_per_min": round(blocks_per_min, 3),
+        "normalized": round(normalized, 4),
+    }
+
+
+def _reset_rich_signal_state_for_testing() -> None:
+    """Test-only: clear TX latency and block-height buffers + timers."""
+    global _last_block_sample_ts
+    with _tx_latency_lock:
+        _tx_latency_buffer.clear()
+    with _block_height_lock:
+        _block_height_buffer.clear()
+        _last_block_sample_ts = 0.0

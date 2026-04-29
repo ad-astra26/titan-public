@@ -207,18 +207,22 @@ class GrammarValidator:
                 r.confidence = min(1.0, r.confidence + 0.1)
                 return r
 
-        # Create new rule
+        # Create new rule — write directly to grammar_rules.db (mirrors _init_db
+        # pattern). This table lives in its own SQLite file, NOT in inner_memory.db,
+        # so it must NOT be routed through the IMW persistence client (which would
+        # misroute the write to the shadow DB and fail with "no such table").
         try:
-            from titan_plugin.persistence import get_client
-            res = get_client(caller_name="grammar_validator").write(
+            conn = sqlite3.connect(self._db_path, timeout=5.0)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            cur = conn.execute(
                 "INSERT INTO grammar_rules (pattern, replacement, context, confidence, source, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (pattern, replacement, "", 0.5, source, time.time()),
-                table="grammar_rules",
             )
-            if not res.ok:
-                raise RuntimeError(res.error or "grammar rule insert failed")
-            rule_id = res.last_row_id or 0
+            rule_id = cur.lastrowid or 0
+            conn.commit()
+            conn.close()
 
             rule = GrammarRule(
                 rule_id=rule_id,

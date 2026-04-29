@@ -23,6 +23,7 @@ import httpx
 
 from .registry import SkillRegistry, Skill
 from .validator import SkillValidator, ValidationResult
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger(__name__)
 
@@ -385,4 +386,5 @@ class SkillInstaller:
             self.memory.add_research_topic(f"skill:{skill.name}")
             logger.debug("[Installer] Skill memory stored for %s", skill.name)
         except Exception as e:
-            logger.debug("[Installer] Failed to store skill memory: %s", e)
+            swallow_warn('[Installer] Failed to store skill memory', e,
+                         key="skills.installer.failed_to_store_skill_memory", throttle=100)

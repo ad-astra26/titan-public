@@ -30,6 +30,7 @@ from .wire_format import (
     _LEN_HEADER,
     encode_frame,
 )
+from titan_plugin.utils.silent_swallow import swallow_warn
 
 logger = logging.getLogger("titan.imw.service")
 
@@ -75,10 +76,15 @@ class IMWDaemon:
     async def start(self) -> None:
         self._wal = ServiceWAL(self._cfg.wal_path, max_mb=self._cfg.service_wal_max_mb)
         self._conn = self._open_db(self._cfg.db_path)
-        # Optional shadow connection (for Phase 1 shadow mode)
-        if self._cfg.mode == "shadow" and self._cfg.shadow_db_path:
+        # Optional shadow connection — needed by any mode that fires shadow
+        # writes (Phase 1 shadow mode + Phase 3 hybrid mode for non-canonical
+        # tables). Without this, target_db="shadow" requests silently fall
+        # back to the primary connection in _get_conn(), corrupting primary
+        # with duplicate rows.
+        if self._cfg.mode in ("shadow", "hybrid") and self._cfg.shadow_db_path:
             self._shadow_conn = self._open_db(self._cfg.shadow_db_path)
-            logger.info("[imw] shadow mode: secondary DB at %s", self._cfg.shadow_db_path)
+            logger.info("[imw] %s mode: secondary DB at %s",
+                        self._cfg.mode, self._cfg.shadow_db_path)
             # Replicate primary schema → shadow so shadow writes land against
             # the right tables. Without this, every shadow INSERT fails with
             # "no such table: X" until someone runs the DDL manually.
@@ -96,8 +102,9 @@ class IMWDaemon:
         )
         try:
             os.chmod(self._cfg.socket_path, 0o660)
-        except OSError:
-            pass
+        except OSError as _swallow_exc:
+            swallow_warn('[persistence.writer_service] IMWDaemon.start: os.chmod(self._cfg.socket_path, 432)', _swallow_exc,
+                         key='persistence.writer_service.IMWDaemon.start.line101', throttle=100)
         self._commit_task = asyncio.create_task(self._commit_loop(), name="imw.commit_loop")
         logger.info(
             "[imw] booted: socket=%s wal=%s db=%s batch=%dms/%d",
@@ -133,7 +140,8 @@ class IMWDaemon:
                 self._shadow_conn.execute(sql_safe)
                 created += 1
             except sqlite3.Error as e:
-                logger.debug("[imw] shadow schema skip %s %s: %s", _type, name, e)
+                swallow_warn(f'[imw] shadow schema skip {_type} {name}', e,
+                             key="persistence.writer_service.shadow_schema_skip", throttle=100)
                 skipped += 1
         logger.info("[imw] shadow schema sync: %d objects created, %d skipped",
                       created, skipped)
@@ -152,16 +160,18 @@ class IMWDaemon:
             if c is not None:
                 try:
                     c.close()
-                except Exception:
-                    pass
+                except Exception as _swallow_exc:
+                    swallow_warn('[persistence.writer_service] IMWDaemon.stop: c.close()', _swallow_exc,
+                                 key='persistence.writer_service.IMWDaemon.stop.line158', throttle=100)
         if self._wal is not None:
             self._wal.close()
         try:
             sp = Path(self._cfg.socket_path)
             if sp.exists():
                 sp.unlink()
-        except OSError:
-            pass
+        except OSError as _swallow_exc:
+            swallow_warn('[persistence.writer_service] IMWDaemon.stop: sp = Path(self._cfg.socket_path)', _swallow_exc,
+                         key='persistence.writer_service.IMWDaemon.stop.line166', throttle=100)
 
     async def serve_forever(self) -> None:
         await self._stop_event.wait()
@@ -217,8 +227,9 @@ class IMWDaemon:
             except sqlite3.Error as e:
                 try:
                     conn.execute("ROLLBACK")
-                except Exception:
-                    pass
+                except Exception as _swallow_exc:
+                    swallow_warn("[persistence.writer_service] IMWDaemon._replay_service_wal: conn.execute('ROLLBACK')", _swallow_exc,
+                                 key='persistence.writer_service.IMWDaemon._replay_service_wal.line223', throttle=100)
                 logger.warning("[imw] WAL replay of %s failed: %s", req_id, e)
         if count:
             logger.info("[imw] service-WAL replay applied %d uncommitted writes", count)
@@ -227,7 +238,13 @@ class IMWDaemon:
     async def _replay_orphan_caller_journals(self) -> None:
         if self._conn is None:
             return
-        for path, pid in scan_orphan_journals(self._cfg.journal_dir):
+        # Match the writer client's per-instance journal naming: each daemon
+        # only scans journals owned by its own writer client (derived from
+        # the same cfg.socket_path stem). See journal.scan_orphan_journals
+        # for the rationale.
+        instance = Path(self._cfg.socket_path).stem or "imw"
+        for path, pid in scan_orphan_journals(
+            self._cfg.journal_dir, instance_prefix=instance):
             try:
                 jnl = CallerJournal(str(path), pid=pid)
                 replayed = 0
@@ -248,8 +265,9 @@ class IMWDaemon:
                     except sqlite3.Error as e:
                         try:
                             self._conn.execute("ROLLBACK")
-                        except Exception:
-                            pass
+                        except Exception as _swallow_exc:
+                            swallow_warn("[persistence.writer_service] IMWDaemon._replay_orphan_caller_journals: self._conn.execute('ROLLBACK')", _swallow_exc,
+                                         key='persistence.writer_service.IMWDaemon._replay_orphan_caller_journals.line254', throttle=100)
                         logger.warning("[imw] orphan %s replay %s failed: %s", path.name, req_id, e)
                 jnl.close()
                 if replayed:
@@ -307,8 +325,9 @@ class IMWDaemon:
             try:
                 writer.close()
                 await writer.wait_closed()
-            except Exception:
-                pass
+            except Exception as _swallow_exc:
+                swallow_warn('[persistence.writer_service] IMWDaemon._handle_connection: writer.close()', _swallow_exc,
+                             key='persistence.writer_service.IMWDaemon._handle_connection.line313', throttle=100)
             self._metrics.decr_connections()
 
     async def _send_responses(
@@ -325,7 +344,8 @@ class IMWDaemon:
                     writer.write(encode_frame(resp.to_msgpack()))
                     await writer.drain()
                 except (ConnectionError, OSError) as e:
-                    logger.debug("[imw] send_responses write failed: %s", e)
+                    swallow_warn('[imw] send_responses write failed', e,
+                                 key="persistence.writer_service.send_responses_write_failed", throttle=100)
                     return
         except asyncio.CancelledError:
             raise
@@ -466,8 +486,9 @@ class IMWDaemon:
                 if c is not None:
                     try:
                         c.execute("ROLLBACK")
-                    except Exception:
-                        pass
+                    except Exception as _swallow_exc:
+                        swallow_warn("[persistence.writer_service] IMWDaemon._commit_batch: c.execute('ROLLBACK')", _swallow_exc,
+                                     key='persistence.writer_service.IMWDaemon._commit_batch.line473', throttle=100)
             self._metrics.incr_per_write_fallback()
             logger.warning("[imw] batch failed; per-write fallback for %d requests", len(fresh))
             await self._commit_per_write(fresh)
@@ -477,8 +498,9 @@ class IMWDaemon:
                 if c is not None:
                     try:
                         c.execute("ROLLBACK")
-                    except Exception:
-                        pass
+                    except Exception as _swallow_exc:
+                        swallow_warn("[persistence.writer_service] IMWDaemon._commit_batch: c.execute('ROLLBACK')", _swallow_exc,
+                                     key='persistence.writer_service.IMWDaemon._commit_batch.line484', throttle=100)
             logger.error("[imw] batch outer error: %s", e)
             self._metrics.incr_errors(f"batch_outer: {e}")
             for p in fresh:
@@ -508,8 +530,9 @@ class IMWDaemon:
             except sqlite3.Error as e:
                 try:
                     conn.execute("ROLLBACK")
-                except Exception:
-                    pass
+                except Exception as _swallow_exc:
+                    swallow_warn("[persistence.writer_service] IMWDaemon._commit_per_write: conn.execute('ROLLBACK')", _swallow_exc,
+                                 key='persistence.writer_service.IMWDaemon._commit_per_write.line515', throttle=100)
                 self._metrics.incr_errors(f"per_write: {e}")
                 await p.ack_queue.put(WriteResponse(
                     req_id=p.req.req_id, ok=False,
@@ -537,6 +560,11 @@ class _BatchError(Exception):
         self.err = err
 
 
+# Generic alias — preferred name for new code.
+# Per rFP_universal_sqlite_writer Phase 4 (2026-04-27).
+SqliteWriterDaemon = IMWDaemon
+
+
 async def _run_daemon(cfg: IMWConfig, stop_event: asyncio.Event) -> None:
     daemon = IMWDaemon(cfg)
     await daemon.start()
@@ -560,8 +588,9 @@ def run_service(cfg: IMWConfig) -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             signal.signal(sig, _signal_stop)
-        except (ValueError, OSError):
-            pass
+        except (ValueError, OSError) as _swallow_exc:
+            swallow_warn('[persistence.writer_service] run_service: signal.signal(sig, _signal_stop)', _swallow_exc,
+                         key='persistence.writer_service.run_service.line567', throttle=100)
 
     try:
         loop.run_until_complete(_run_daemon(cfg, stop_event))

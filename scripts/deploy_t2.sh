@@ -30,6 +30,22 @@ T2_HOST="root@10.135.0.6"
 TITAN_DIR="/home/antigravity/projects/titan"
 T3_DIR="/home/antigravity/projects/titan3"
 
+# ── Phase C C-S2 (PLAN §15.2): --include-rust-binaries flag ─────────
+# When set, scp titan-rust musl static binaries (titan-kernel-rs +
+# titan-trinity-rs-placeholder) to T2 and T3's bin/ directory after the
+# git pull, with SHA verification. Build first if local musl binaries
+# are missing. Filter out the flag so positional management commands
+# ($1) like --restart still work for the rest of the script.
+INCLUDE_RUST=0
+FILTERED_ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --include-rust-binaries) INCLUDE_RUST=1 ;;
+        *) FILTERED_ARGS+=("$arg") ;;
+    esac
+done
+set -- "${FILTERED_ARGS[@]}"
+
 # ── Helper: deploy one Titan dir on the VPS ───────────────────────
 # Uses a single SSH session per Titan so the backup→pull→restore is atomic.
 # Args: $1=ssh-host  $2=remote-titan-dir  $3=label
@@ -62,9 +78,28 @@ git update-index --no-assume-unchanged titan_plugin/config.toml 2>/dev/null || t
 # 3. Drop any local config.toml edits (we'll restore from backup after pull)
 git checkout -- titan_plugin/config.toml 2>/dev/null || true
 
-# 4. Reset any other local code edits, then fast-forward pull
-# (filter out config.toml from the reset list as a belt-and-suspenders measure)
-git diff --name-only | grep -v "^titan_plugin/config.toml$" | xargs -r git checkout -- 2>/dev/null || true
+# Phase C C-S2 (PLAN §17.2 / BUG-DEPLOY-T3-WIPES-LOCAL-EDITS-20260428):
+# protect titan_params.toml + config.toml from being wiped by deploy.
+# `--skip-worktree` tells git to ignore worktree changes; both `git
+# checkout --` and `git pull` will leave the file alone. Idempotent —
+# safe to re-run on every deploy.
+git update-index --skip-worktree titan_plugin/titan_params.toml 2>/dev/null || true
+
+# 4. Reset any other local code edits, then fast-forward pull. Files
+# marked --skip-worktree (or --assume-unchanged "h") are filtered out so
+# legitimate Maker edits (titan_params.toml flag flips, etc.) survive
+# deploys. config.toml is also filtered (already handled by step 5
+# backup→restore).
+SKIP_WORKTREE_FILES=$(git ls-files -v 2>/dev/null \
+    | awk '$1 == "S" || $1 == "h" {sub(/^[a-zA-Z] /,""); print}')
+{
+    echo "titan_plugin/config.toml"
+    [ -n "$SKIP_WORKTREE_FILES" ] && echo "$SKIP_WORKTREE_FILES"
+} | sort -u > /tmp/${LABEL}_skip_reset.lst
+git diff --name-only \
+    | grep -vxFf /tmp/${LABEL}_skip_reset.lst \
+    | xargs -r git checkout -- 2>/dev/null || true
+rm -f /tmp/${LABEL}_skip_reset.lst
 git pull --ff-only origin titan-v6 2>&1 | tail -10
 
 # 4b. MERGE new upstream sections into backup (preserves credentials + picks up
@@ -144,6 +179,47 @@ git push origin titan-v6 2>/dev/null && echo "✓ Pushed to titan-dev" || echo "
 deploy_one "${T2_HOST}" "${TITAN_DIR}" "T2"
 deploy_one "${T2_HOST}" "${T3_DIR}" "T3"
 
+# ── Optional: ship Phase C Rust binaries (PLAN §15.2) ─────────────
+deploy_rust_binaries() {
+    local host="$1"
+    local remote_dir="$2"
+    local label="$3"
+    local bins_local
+    bins_local="$(dirname "$0")/../titan-rust/target/x86_64-unknown-linux-musl/release"
+
+    # Build first if needed
+    if [ ! -x "${bins_local}/titan-kernel-rs" ] || [ ! -x "${bins_local}/titan-trinity-rs-placeholder" ]; then
+        echo "  [${label}] building Rust binaries (musl static)..."
+        bash "$(dirname "$0")/build_titan_rust.sh" musl
+    fi
+
+    echo "  [${label}] copying Rust binaries to ${host}:${remote_dir}/bin/"
+    ssh "${host}" "mkdir -p \"${remote_dir}/bin\""
+    scp -q \
+        "${bins_local}/titan-kernel-rs" \
+        "${bins_local}/titan-trinity-rs-placeholder" \
+        "${host}:${remote_dir}/bin/"
+
+    # SHA verification — proves no in-flight tamper + correct file landed
+    for bin_name in titan-kernel-rs titan-trinity-rs-placeholder; do
+        local local_sha remote_sha
+        local_sha=$(sha256sum "${bins_local}/${bin_name}" | awk '{print $1}')
+        remote_sha=$(ssh "${host}" "sha256sum \"${remote_dir}/bin/${bin_name}\"" 2>/dev/null | awk '{print $1}')
+        if [ "${local_sha}" != "${remote_sha}" ]; then
+            echo "  ✗ ${label}: ${bin_name} SHA MISMATCH (local=${local_sha:0:12} remote=${remote_sha:0:12})" >&2
+            exit 1
+        fi
+        echo "  ✓ ${label}: ${bin_name} sha256=${local_sha:0:12}…"
+    done
+}
+
+if [ "$INCLUDE_RUST" -eq 1 ]; then
+    echo ""
+    echo "=== Shipping Rust binaries (--include-rust-binaries) ==="
+    deploy_rust_binaries "${T2_HOST}" "${TITAN_DIR}" "T2"
+    deploy_rust_binaries "${T2_HOST}" "${T3_DIR}" "T3"
+fi
+
 # ── Post-deploy: verify remote commits match local ────────────────
 echo ""
 echo "=== Verifying commit alignment ==="
@@ -210,4 +286,8 @@ else
     echo "  bash scripts/deploy_t2.sh --start        Start T2+T3"
     echo "  bash scripts/deploy_t2.sh --status       Status of T2+T3"
     echo "  bash scripts/deploy_t2.sh --log [N]      Last N log lines"
+    echo "  bash scripts/deploy_t2.sh --include-rust-binaries"
+    echo "                                            Combine with any cmd above to ship"
+    echo "                                            titan-kernel-rs + titan-trinity-rs-placeholder"
+    echo "                                            (musl static) to T2/T3 bin/ post-pull (Phase C C-S2)"
 fi

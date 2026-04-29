@@ -69,15 +69,26 @@ class ThinEmotEncoder:
     unchanged.
     """
 
+    # Novelty tier-1 constants (rFP §19.3 novelty proxy, v2 formulation 2026-04-22):
+    # the original cosine-to-running-mean flat-lined near 0 because the running
+    # mean had no decay and cosine on mostly-positive vectors is compressed to
+    # 0.98-1.00. Tier-1 replaces it with an EMA-based rescaled deviation that
+    # self-calibrates to Titan's observed variability. Tier-2 (future) replaces
+    # this with HDBSCAN-membership distance once ≥1 region is persistent.
+    NOVELTY_EMA_MEAN_ALPHA = 0.05    # ~20-observation half-life for trajectory baseline
+    NOVELTY_EMA_DEV_ALPHA = 0.02     # ~50-observation half-life for deviation baseline
+    NOVELTY_WARMUP_OBS = 10          # first N observations return 0.5 (neutral)
+    NOVELTY_FLOOR_DEV = 0.01         # prevent tiny-variance amplification when state is very still
+
     def __init__(self, titan_id: str = "T1"):
         self._titan_id = str(titan_id)
 
-        # Running centroid for novelty proxy — cosine distance from mean
-        # of recent native felt state. Cheap, gives sane values before
-        # HDBSCAN produces membership probabilities. Replaced by HDBSCAN
-        # membership once the region consumer is running.
-        self._running_mean: Optional[np.ndarray] = None
-        self._running_count: int = 0
+        # Novelty proxy — EMA-based rescaled deviation. Cheap, self-calibrating,
+        # produces real dynamic range (0.0-1.0) even before HDBSCAN regions
+        # graduate. Replaced by region-membership distance at Tier-2.
+        self._ema_mean: Optional[np.ndarray] = None    # exponential moving average of core 168D state
+        self._ema_dev: float = 0.1                      # EMA of |core - ema_mean| (scalar, normalized by sqrt(dim))
+        self._running_count: int = 0                    # observation count (for warmup gate)
 
         # EMA of recent terminal rewards → valence proxy.
         self._reward_ema: float = 0.5
@@ -162,24 +173,66 @@ class ThinEmotEncoder:
         }
 
     def _update_novelty(self, core: np.ndarray) -> float:
+        """EMA-based rescaled-deviation novelty (rFP §19.3, Tier-1 2026-04-22).
+
+        Returns a value in [0, 1] where:
+          - 0.0  Titan's current state exactly matches his recent trajectory
+                (static state, low interest)
+          - 0.5  current deviation ≈ typical deviation (baseline variability)
+          - 1.0  deviation is ≥2× the typical magnitude (a genuinely surprising
+                moment — a persona session firing, a kin exchange landing, an
+                ARC puzzle shifting Titan into novel state space)
+
+        Why EMA and not cumulative mean:
+        Original v1 implementation averaged ALL past observations without
+        decay. After ~100 observations the mean went rigid and cosine
+        similarity on mostly-positive 168D vectors stayed >0.99 → novelty
+        compressed to <0.01 regardless of actual state variation. Tier-1
+        uses two EMAs — one for the trajectory baseline (α=0.05, ~20-obs
+        half-life), one for typical deviation (α=0.02, ~50-obs half-life
+        so single events still pop through). This yields a self-calibrating
+        novelty that responds to genuine state shifts.
+
+        Tier-2 (future, once HDBSCAN regions persist): replace with
+        distance-to-nearest-centroid normalized by core_distance. Until
+        then, this proxy provides real dynamic range during the soak.
+        """
         try:
-            if self._running_mean is None:
-                self._running_mean = core.copy()
+            import math as _m
+
+            # First call — initialize and return neutral 0.5.
+            if self._ema_mean is None:
+                self._ema_mean = core.copy()
                 self._running_count = 1
                 return 0.5
-            c = self._running_count
-            self._running_mean = (
-                (c * self._running_mean + core) / (c + 1)
+
+            # Step 1: compute current deviation from EMA baseline BEFORE updating.
+            # Normalize by sqrt(dim) so the magnitude is comparable across
+            # different core sizes (if we ever change the schema).
+            delta = core - self._ema_mean
+            current_dev = float(np.linalg.norm(delta)) / _m.sqrt(max(1, len(core)))
+
+            # Step 2: compute novelty using the OLD dev baseline. Floor the
+            # baseline so a genuinely still state doesn't amplify tiny
+            # numerical noise into fake novelty.
+            self._running_count += 1
+            if self._running_count < self.NOVELTY_WARMUP_OBS:
+                novelty = 0.5
+            else:
+                typical_dev = max(self._ema_dev, self.NOVELTY_FLOOR_DEV)
+                # current ≈ typical → novelty ≈ 0.5
+                # current ≈ 2×typical → novelty ≈ 1.0 (saturates)
+                # current ≈ 0 → novelty ≈ 0.0 (state matches baseline exactly)
+                novelty = float(min(1.0, current_dev / (2.0 * typical_dev)))
+
+            # Step 3: update both EMAs for next call.
+            a_mean = self.NOVELTY_EMA_MEAN_ALPHA
+            a_dev = self.NOVELTY_EMA_DEV_ALPHA
+            self._ema_mean = (
+                (1.0 - a_mean) * self._ema_mean + a_mean * core
             ).astype(np.float32)
-            self._running_count = c + 1
-            if c < 10:
-                return 0.5
-            n1 = float(np.linalg.norm(core))
-            n2 = float(np.linalg.norm(self._running_mean))
-            if n1 < 1e-9 or n2 < 1e-9:
-                return 0.5
-            cos = float(np.dot(core, self._running_mean) / (n1 * n2))
-            nov = 0.5 * (1.0 - cos)
-            return float(max(0.0, min(1.0, nov)))
+            self._ema_dev = (1.0 - a_dev) * self._ema_dev + a_dev * current_dev
+
+            return float(max(0.0, min(1.0, novelty)))
         except Exception:
             return 0.5

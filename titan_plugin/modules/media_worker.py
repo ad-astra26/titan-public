@@ -27,6 +27,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from titan_plugin import bus
 
 logger = logging.getLogger(__name__)
 
@@ -74,10 +75,19 @@ def media_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     logger.info("[MediaWorker] Pure math perception engine online, queue: %s", queue_dir)
 
     # Signal ready
-    _send_msg(send_queue, "MODULE_READY", name, "guardian", {})
+    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
 
     last_scan = 0.0
     scan_interval = 10.0  # Check queue every 10s
+
+    # ── Microkernel v2 Phase B.1 §6 — readiness/hibernate reporter ──
+    from titan_plugin.core.readiness_reporter import trivial_reporter
+    def _b1_save_state():
+        return []
+    _b1_reporter = trivial_reporter(
+        worker_name=name, layer="L3", send_queue=send_queue,
+        save_state_cb=_b1_save_state,
+    )
 
     while True:
         # Heartbeat fires every iteration (throttled to 3s min inside the helper).
@@ -101,11 +111,23 @@ def media_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
         msg_type = msg.get("type", "")
 
-        if msg_type == "MODULE_SHUTDOWN":
+        # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────
+        if _b1_reporter.handles(msg_type):
+            _b1_reporter.handle(msg)
+            if _b1_reporter.should_exit():
+                break
+            continue
+
+        # ── Microkernel v2 Phase B.2.1 — supervision-transfer dispatch ──
+        from titan_plugin.core import worker_swap_handler as _swap
+        if _swap.maybe_dispatch_swap_msg(msg):
+            continue
+
+        if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[MediaWorker] Shutdown requested")
             break
 
-        if msg_type == "QUERY":
+        if msg_type == bus.QUERY:
             from titan_plugin.core.profiler import handle_memory_profile_query
             if handle_memory_profile_query(msg, send_queue, name):
                 continue
@@ -170,9 +192,9 @@ def _scan_and_digest(queue_dir: str, send_queue, name: str) -> int:
                         "filename": fpath.name,
                         "digest_ts": time.time(),
                     }
-                    _send_msg(send_queue, "SENSE_VISUAL", name, "mind", _payload)
+                    _send_msg(send_queue, bus.SENSE_VISUAL, name, "mind", _payload)
                     # G1: Also send to spirit for creative perception loop
-                    _send_msg(send_queue, "SENSE_VISUAL", name, "spirit", _payload)
+                    _send_msg(send_queue, bus.SENSE_VISUAL, name, "spirit", _payload)
                     logger.info("[MediaWorker] Digested image: %s → %s (src=%s, harmony=%.3f)",
                                fpath.name, "30D" if features_30d else "5D",
                                source, features[4])
@@ -189,9 +211,9 @@ def _scan_and_digest(queue_dir: str, send_queue, name: str) -> int:
                         "filename": fpath.name,
                         "digest_ts": time.time(),
                     }
-                    _send_msg(send_queue, "SENSE_AUDIO", name, "mind", _a_payload)
+                    _send_msg(send_queue, bus.SENSE_AUDIO, name, "mind", _a_payload)
                     # G1: Also send to spirit for creative perception loop
-                    _send_msg(send_queue, "SENSE_AUDIO", name, "spirit", _a_payload)
+                    _send_msg(send_queue, bus.SENSE_AUDIO, name, "spirit", _a_payload)
                     logger.info("[MediaWorker] Digested audio: %s → %s (src=%s, harmony=%.3f)",
                                fpath.name, "15D" if features_15d else "5D",
                                source, features[4])
@@ -558,7 +580,7 @@ def _send_msg(send_queue, msg_type: str, src: str, dst: str, payload: dict, rid:
 
 
 def _send_response(send_queue, src: str, dst: str, payload: dict, rid: str) -> None:
-    _send_msg(send_queue, "RESPONSE", src, dst, payload, rid)
+    _send_msg(send_queue, bus.RESPONSE, src, dst, payload, rid)
 
 
 # Heartbeat throttle (Phase E Fix 2): 3s min interval per process.
@@ -576,4 +598,4 @@ def _send_heartbeat(send_queue, name: str) -> None:
         rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
     except Exception:
         rss_mb = 0
-    _send_msg(send_queue, "MODULE_HEARTBEAT", name, "guardian", {"rss_mb": round(rss_mb, 1)})
+    _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", {"rss_mb": round(rss_mb, 1)})

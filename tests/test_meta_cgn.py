@@ -571,6 +571,114 @@ def test_boot_selftest_passes_on_fresh_consumer():
         assert c._status == "shadow_mode"
 
 
+def test_boot_selftest_self_heals_from_stale_disabled_state():
+    """2026-04-22: when watchdog state loads from disk as
+    `disabled_boot_selftest_failed` (e.g. stuck from a prior code bug),
+    boot selftest must RETRY and, if passing, flip status to `shadow_mode`
+    and persist. `disabled_failsafe` (recent failsafe trip) remains sticky.
+    """
+    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    import json
+    import os
+    with tempfile.TemporaryDirectory() as tmp:
+        # Seed a stale disabled_boot_selftest_failed watchdog state — as if
+        # a prior titan_main left behind the stuck flag before code fix.
+        watchdog = {
+            "version": 1, "saved_ts": 0,
+            "status": "disabled_boot_selftest_failed",
+            "cooldown_remaining": 0, "disabled_reason": "",
+            "total_failures": 0, "failsafe_trip_count": 0,
+            "last_failure_ts": 0.0, "window": [],
+            "graduation_progress": 0, "graduation_ts": 0,
+            "rolled_back_count": 0, "total_updates_applied": 0,
+            "pre_graduation_baseline": {},
+        }
+        with open(os.path.join(tmp, "watchdog_state.json"), "w") as f:
+            json.dump(watchdog, f)
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        # Self-heal: selftest retried on boot, passed, flipped to shadow_mode.
+        assert c._status == "shadow_mode", (
+            f"Self-healing retry expected, got status={c._status!r}. Check "
+            f"meta_cgn.py disabled_boot_selftest_failed branch.")
+        # Persisted state also cleared (next boot reloads shadow_mode clean).
+        with open(os.path.join(tmp, "watchdog_state.json")) as f:
+            persisted = json.load(f)
+        assert persisted["status"] == "shadow_mode", (
+            f"Self-heal must persist the cleared status to disk. "
+            f"Got {persisted['status']!r}.")
+
+
+def test_boot_selftest_failsafe_state_stays_sticky():
+    """Complement to self-heal test: disabled_failsafe (recent failsafe trip)
+    must NOT retry on boot — cooldown machinery handles clearing it."""
+    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    import json
+    import os
+    with tempfile.TemporaryDirectory() as tmp:
+        watchdog = {
+            "version": 1, "saved_ts": 0,
+            "status": "disabled_failsafe",
+            "cooldown_remaining": 500, "disabled_reason": "v_flatline",
+            "total_failures": 5, "failsafe_trip_count": 1,
+            "last_failure_ts": 0.0, "window": [],
+            "graduation_progress": 0, "graduation_ts": 0,
+            "rolled_back_count": 0, "total_updates_applied": 0,
+            "pre_graduation_baseline": {},
+        }
+        with open(os.path.join(tmp, "watchdog_state.json"), "w") as f:
+            json.dump(watchdog, f)
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        assert c._status == "disabled_failsafe"
+
+
+def test_boot_selftest_passes_with_gamma_decay_on_saturated_posterior():
+    """2026-04-22 regression: selftest must pass for persistence_loaded
+    consumers even when γ<1.0 and n_samples is so large that the decay
+    term (1-γ)·n dominates the +1 evidence → n_samples can DECREASE on
+    update. Previous `n_samples == pre+1` check was mathematically
+    impossible for saturated primitives and persistently failed boot
+    after γ=0.9999/0.999 activation (commits 3427dfe, 64a92be).
+    """
+    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    import json
+    import os
+    with tempfile.TemporaryDirectory() as tmp:
+        # Pre-seed a saturated RECALL posterior — α+β ≫ 1/(1-γ) = 1000.
+        # At these values, one update with w·q=0.5, w·(1-q)=0.5 yields
+        # new (α+β) ≈ γ·(α+β) + 1 < α+β, and n_samples derived from
+        # int(α+β-2·FLOOR) drops by ~(1-γ)·n_pre − 1 ≈ 5.
+        grounding = {
+            "version": 3,
+            "titan_id": "T1",
+            "saved_ts": 0,
+            "primitives": {
+                "RECALL": {
+                    "primitive_id": "RECALL", "alpha": 2000.0, "beta": 4000.0,
+                    "V": 0.333, "confidence": 0.98, "n_samples": 5998,
+                    "variance": 0.0, "last_updated_ts": 0.0,
+                    "last_updated_chain": 0, "haov_rules": [], "by_domain": {},
+                },
+                "FORMULATE": {
+                    "primitive_id": "FORMULATE", "alpha": 1.0, "beta": 1.0,
+                    "V": 0.5, "confidence": 0.0, "n_samples": 0,
+                    "variance": 0.25, "last_updated_ts": 0.0,
+                    "last_updated_chain": 0, "haov_rules": [], "by_domain": {},
+                },
+            },
+        }
+        with open(os.path.join(tmp, "primitive_grounding.json"), "w") as f:
+            json.dump(grounding, f)
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        # Fresh save_dir → no watchdog state → selftest runs fresh.
+        # With saturated RECALL + γ=0.999, this must still PASS, meaning
+        # `c._status` stays "shadow_mode" (not flipped to disabled_*).
+        assert c._status == "shadow_mode", (
+            f"Boot selftest failed on saturated posterior with γ<1.0 — "
+            f"status={c._status!r}. Fix (meta_cgn.py:1918-1930) checks α/β "
+            f"change directly instead of derived n_samples."
+        )
+
+
 def test_force_graduate_transitions_to_graduating():
     """force_graduate() must flip status shadow → graduating."""
     from titan_plugin.logic.meta_cgn import MetaCGNConsumer
@@ -945,21 +1053,27 @@ def test_rollback_detector_fires_on_real_regression():
 # ══════════════════════════════════════════════════════════════════════
 
 def test_beta_posterior_update_accumulates_alpha_beta():
-    """Beta update: α += quality; β += (1 − quality). n_eff grows with samples."""
+    """Beta update: α += quality; β += (1 − quality). n_eff grows with samples.
+
+    With γ=0.999 (shipped 2026-04-21, commit 64a92be), each update also decays
+    existing excess by 0.1%. At 100 updates the γ-loss is ~5% of accumulated
+    n, so n_samples converges below the nominal 100.
+    """
     from titan_plugin.logic.meta_cgn import MetaCGNConsumer, BETA_PARAM_FLOOR
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
-        # 100 high-quality updates → α grows ~90, β grows ~10
+        # 100 high-quality updates → α grows ~85, β grows ~10 under γ=0.999
         for _ in range(100):
             c.update_primitive_V("FORMULATE", quality=0.9)
         p = c._primitives["FORMULATE"]
-        # α started at BETA_PARAM_FLOOR=1; each step adds ~0.9
+        # α started at BETA_PARAM_FLOOR=1; each step adds ~0.9 (minus γ decay)
         assert p.alpha > BETA_PARAM_FLOOR + 80
         assert p.beta > BETA_PARAM_FLOOR + 5
         # Posterior mean ≈ quality
         assert 0.85 < p.V < 0.95
-        # n_samples (derived from α+β - 2*floor) ≈ 100
-        assert 95 < p.n_samples < 105
+        # n_samples (derived from α+β - 2*floor). At γ=0.999, 100 updates
+        # land in the 90–100 band (γ-decay shaves ~5 off the raw 100).
+        assert 90 <= p.n_samples <= 100
 
 
 def test_beta_ci_narrows_with_more_samples():

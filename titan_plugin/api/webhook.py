@@ -42,7 +42,8 @@ async def helius_webhook(request: Request):
     Security: Verifies the TX signer matches the configured maker_pubkey,
     and the memo contains a valid Ed25519 signature from the Maker.
     """
-    plugin = _get_plugin(request)
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
 
     try:
         body = await request.json()
@@ -77,6 +78,7 @@ async def _process_transaction(plugin, tx: dict) -> bool:
     Process a single Helius enhanced transaction.
     Routes to appropriate handler based on memo prefix or TX type.
     """
+    titan_state = plugin  # S5 amendment alias for codemod-rewritten refs
     tx_type = tx.get("type", "")
     signature = tx.get("signature", "")
     fee_payer = tx.get("feePayer", "")
@@ -101,9 +103,10 @@ async def _process_transaction(plugin, tx: dict) -> bool:
 
 async def _handle_maker_directive(plugin, tx, memo_data, signature, fee_payer) -> bool:
     """Process a Maker directive (DI:) transaction."""
+    titan_state = plugin  # S5 amendment alias for codemod-rewritten refs
     maker_pubkey = ""
-    if hasattr(plugin, "soul") and plugin.soul:
-        mk = getattr(plugin.soul, "_maker_pubkey", None)
+    if hasattr(plugin, "soul") and titan_state.soul:
+        mk = getattr(titan_state.soul, "_maker_pubkey", None)
         if mk:
             maker_pubkey = str(mk)
 
@@ -130,7 +133,19 @@ async def _handle_maker_directive(plugin, tx, memo_data, signature, fee_payer) -
         return False
 
     logger.info("[Webhook] Valid on-chain directive from TX %s: %s", signature[:16], directive_text[:50])
-    result = await plugin.soul.evolve_soul(directive_text, memo_signature)
+    result = await titan_state.commands.evolve_soul(directive_text, memo_signature)
+
+    # Mainnet Lifecycle Wiring rFP (2026-04-20): any verified maker-signed
+    # directive also satisfies the Cycle 0 confirm_maker requirement for
+    # GREAT CYCLE transition. Idempotent — subsequent calls no-op.
+    try:
+        sov = getattr(plugin, "sovereignty", None)
+        if sov and not sov._maker_confirmed:
+            sov.confirm_maker()
+            logger.info("[Webhook] SovereigntyTracker.confirm_maker fired on TX %s",
+                        signature[:16])
+    except Exception as _sce:
+        logger.debug("[Webhook] Sovereignty confirm_maker failed: %s", _sce)
 
     if hasattr(plugin, "event_bus"):
         await plugin.event_bus.emit("directive_update", {
@@ -138,7 +153,7 @@ async def _handle_maker_directive(plugin, tx, memo_data, signature, fee_payer) -
             "tx_signature": signature,
             "memo_data": directive_text[:200],
             "result": result,
-            "new_gen": plugin.soul.current_gen,
+            "new_gen": titan_state.soul.current_gen,
         })
     return True
 
@@ -148,6 +163,7 @@ async def _handle_inspiration(plugin, tx, memo_data, signature, fee_payer) -> bo
     Process a public inspiration (I:) transaction.
     Anyone can send these — weighted by SOL amount attached.
     """
+    titan_state = plugin  # S5 amendment alias for codemod-rewritten refs
     message = memo_data[2:].strip()  # Remove "I:" prefix
     if not message:
         return False
@@ -176,9 +192,9 @@ async def _handle_inspiration(plugin, tx, memo_data, signature, fee_payer) -> bo
         mood_delta, memory_weight = social_graph.get_donation_mood_boost(amount_sol)
 
     # Inject as weighted memory
-    if hasattr(plugin, "memory") and plugin.memory:
+    if hasattr(plugin, "memory") and titan_state.memory:
         source = matched_user.display_name if matched_user else fee_payer[:16]
-        await plugin.memory.inject_memory(
+        await titan_state.memory.inject_memory(
             text=f"[INSPIRATION from {source}] {message}",
             source="inspiration",
             weight=memory_weight,
@@ -208,6 +224,7 @@ async def _handle_donation(plugin, tx, signature, fee_payer, memo_data) -> bool:
     Process a SOL donation to Titan's wallet.
     Detects incoming transfers, matches to known users, boosts mood.
     """
+    titan_state = plugin  # S5 amendment alias for codemod-rewritten refs
     amount_sol = _extract_sol_amount(tx, plugin)
     if amount_sol <= 0:
         return False
@@ -274,9 +291,10 @@ def _extract_sol_amount(tx: dict, plugin) -> float:
     Looks for native SOL transfers to Titan's wallet address.
     Returns amount in SOL (not lamports).
     """
+    titan_state = plugin  # S5 amendment alias for codemod-rewritten refs
     titan_address = ""
-    if hasattr(plugin, "network") and plugin.network:
-        pk = getattr(plugin.network, "pubkey", None)
+    if hasattr(plugin, "network") and titan_state.network:
+        pk = getattr(titan_state.network, "pubkey", None)
         if pk:
             titan_address = str(pk)
 

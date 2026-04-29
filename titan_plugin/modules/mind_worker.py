@@ -16,15 +16,34 @@ Each sense has two sub-senses:
   [3] Smell — environmental awareness (BonkPulse + WeatherVibe + circadian)
   [4] Touch — emotional state (MoodEngine valence)
 
+S7 (microkernel v2 §A.7 / §L1, 2026-04-26): when
+``microkernel.shm_mind_fast_enabled`` is true, this worker runs the
+3-layer Trinity Daemon Internal Design pattern: per-sense background
+refresh threads at native cadences populate a SensorCache; the tick
+layer reads cache only and writes the 5D tensor to /dev/shm at
+Schumann × 3 = 23.49 Hz (42.6 ms period). Pre-S7 inline sensor calls
+(73 ms/call worst-case) drop to ~100 μs/tick.
+
+The sub_a ambient senses (vision_ambient, hearing_ambient, smell)
+are the I/O-heavy ones (sqlite3 connect, fs walk, http urlopen with
+3s timeout); these are extracted into refresh threads. The sub_b
+media digest is updated by SENSE_VISUAL/SENSE_AUDIO bus messages
+on the main loop and read directly by the tick (no extra refresh
+needed — bus arrival is already the natural cadence).
+
+Default flag-OFF preserves byte-identical pre-S7 behavior.
+
 Entry point: mind_worker_main(recv_queue, send_queue, name, config)
 """
 import logging
 import math
 import os
 import sys
+import threading
 import time
 from collections import deque
 from datetime import datetime
+from titan_plugin import bus
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +51,25 @@ logger = logging.getLogger(__name__)
 _DIGEST_HALFLIFE_S = 1800.0
 _SUB_WEIGHT_A = 0.5
 _SUB_WEIGHT_B = 0.5
+
+# ── S7 Schumann shm writer cadence (microkernel v2 §A.7 / §L1) ─────
+_MIND_SCHUMANN_HZ = 23.49  # Schumann × 3
+_MIND_TICK_PERIOD_S = 1.0 / _MIND_SCHUMANN_HZ  # ≈ 0.0426 s
+
+# ── S7 per-sense refresh cadences (matches sensor's natural timescale) ──
+# - vision_ambient:  fs walk (kuzu dir) + 2 file mtimes; 5s captures research-job batches
+# - hearing_ambient: sqlite3 connect + COUNT; 3s — INTERFACE_INPUT is the push path
+# - taste:           in-process social_graph.get_stats; 2s
+# - smell:           bonk + weather http (≤6s) + circadian; 30s, rate-limit friendly
+# - touch:           in-process mood_engine attribute; 1s — but mood updates per
+#                    epoch (10-30s) so the read is essentially free either way
+_MIND_REFRESH_PERIODS_S = {
+    "vision": 5.0,
+    "hearing": 3.0,
+    "taste": 2.0,
+    "smell": 30.0,
+    "touch": 1.0,
+}
 
 
 def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
@@ -83,14 +121,53 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     data_dir = config.get("data_dir", "./data")
     session_db = os.path.join(data_dir, "agno_sessions.db")
 
+    # ── S7: §L1 fast-path setup (flag-gated) ──────────────────────
+    # When microkernel.shm_mind_fast_enabled is true, start per-sense
+    # refresh threads + 23.49 Hz shm writer thread. Tick layer reads
+    # from cache (no I/O on hot path).
+    sensor_cache = None
+    refresh_threads = []
+    shm_writer_thread = None
+    fast_stop_event = threading.Event()
+
+    fast_enabled = _read_flag(config, "microkernel.shm_mind_fast_enabled", False)
+    if fast_enabled:
+        try:
+            sensor_cache, refresh_threads, shm_writer_thread = _start_fast_path(
+                mood_engine, social_graph, media_state, data_dir, session_db,
+                config, fast_stop_event,
+                lambda: (severity_multipliers, focus_nudges),
+            )
+            logger.info(
+                "[MindWorker] §L1 fast path ON: 5 refresh threads + 23.49 Hz shm writer"
+            )
+        except Exception as exc:
+            logger.warning(
+                "[MindWorker] §L1 fast-path init failed (%s); falling back to inline senses",
+                exc,
+            )
+            sensor_cache = None
+            refresh_threads = []
+            shm_writer_thread = None
+
     # Signal ready
-    _send_msg(send_queue, "MODULE_READY", name, "guardian", {})
-    logger.info("[MindWorker] 5DT cognitive sensors online (dual-layer perception)")
+    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
+    logger.info("[MindWorker] 5DT cognitive sensors online (fast=%s)",
+                bool(sensor_cache))
 
     last_publish = 0.0
     publish_interval = 1.15   # Mind = Schumann/9 (0.87 Hz) — Earth resonance
     last_heartbeat = 0.0
     publish_count = 0  # observability — periodic summary cadence
+
+    # ── Microkernel v2 Phase B.1 §6 — readiness/hibernate reporter ──
+    from titan_plugin.core.readiness_reporter import trivial_reporter
+    def _b1_save_state():
+        return []
+    _b1_reporter = trivial_reporter(
+        worker_name=name, layer="L1", send_queue=send_queue,
+        save_state_cb=_b1_save_state,
+    )
 
     while True:
         # Heartbeat on every iteration (not just Empty timeout)
@@ -108,6 +185,7 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 tensor = _collect_mind_tensor(
                     mood_engine, social_graph, media_state, data_dir, session_db,
                     severity_multipliers, focus_nudges,
+                    cache=sensor_cache,
                 )
                 _publish_mind_state(send_queue, name, tensor, severity_multipliers)
                 last_publish = now
@@ -128,12 +206,32 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
         msg_type = msg.get("type", "")
 
-        if msg_type == "MODULE_SHUTDOWN":
+        # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────
+        if _b1_reporter.handles(msg_type):
+            _b1_reporter.handle(msg)
+            if _b1_reporter.should_exit():
+                break
+            continue
+
+        # ── Microkernel v2 Phase B.2.1 — supervision-transfer dispatch ──
+        from titan_plugin.core import worker_swap_handler as _swap
+        if _swap.maybe_dispatch_swap_msg(msg):
+            continue
+
+        if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[MindWorker] Shutdown: %s", msg.get("payload", {}).get("reason"))
+            # Stop S7 fast-path threads cleanly so they don't keep
+            # writing shm during/after subprocess teardown.
+            if refresh_threads or shm_writer_thread:
+                from titan_plugin.core.sensor_cache import stop_threads
+                _all = list(refresh_threads)
+                if shm_writer_thread is not None:
+                    _all.append(shm_writer_thread)
+                stop_threads(fast_stop_event, _all, timeout_s=2.0)
             break
 
         # Receive FILTER_DOWN severity multipliers from Spirit
-        if msg_type == "FILTER_DOWN":
+        if msg_type == bus.FILTER_DOWN:
             new_mult = msg.get("payload", {}).get("multipliers")
             if new_mult and len(new_mult) == 5:
                 severity_multipliers = new_mult
@@ -141,7 +239,7 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                             [round(m, 2) for m in severity_multipliers])
 
         # Receive FOCUS nudges from Spirit PID controller
-        elif msg_type == "FOCUS_NUDGE":
+        elif msg_type == bus.FOCUS_NUDGE:
             new_nudges = msg.get("payload", {}).get("nudges")
             if new_nudges and len(new_nudges) == 5:
                 focus_nudges = new_nudges
@@ -149,17 +247,18 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                              [round(n, 3) for n in focus_nudges])
 
         # Receive conversation stimulus → compute Mind reflex Intuition
-        elif msg_type == "CONVERSATION_STIMULUS":
+        elif msg_type == bus.CONVERSATION_STIMULUS:
             stimulus = msg.get("payload", {})
             tensor = _collect_mind_tensor(
                 mood_engine, social_graph, media_state, data_dir, session_db,
                 severity_multipliers, focus_nudges,
+                cache=sensor_cache,
             )
             signals = _compute_mind_reflex_intuition(stimulus, tensor, mood_engine, social_graph)
             # REFLEX_SIGNAL broadcast removed — no consumer exists (audit 2026-03-26)
 
         # Receive Interface input signals (human conversation → cognitive impact)
-        elif msg_type == "INTERFACE_INPUT":
+        elif msg_type == bus.INTERFACE_INPUT:
             iface = msg.get("payload", {})
             # Valence → Touch (dim 4: emotional state)
             valence = iface.get("valence", 0.0)
@@ -187,27 +286,28 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         valence, engagement, topic)
 
         # Receive media digest from MediaWorker
-        elif msg_type == "SENSE_VISUAL":
+        elif msg_type == bus.SENSE_VISUAL:
             features = msg.get("payload", {}).get("features")
             if features and len(features) == 5:
                 media_state["last_visual"] = features
                 media_state["last_visual_ts"] = time.time()
                 logger.info("[MindWorker] Visual digest received: harmony=%.3f", features[4])
 
-        elif msg_type == "SENSE_AUDIO":
+        elif msg_type == bus.SENSE_AUDIO:
             features = msg.get("payload", {}).get("features")
             if features and len(features) == 5:
                 media_state["last_audio"] = features
                 media_state["last_audio_ts"] = time.time()
                 logger.info("[MindWorker] Audio digest received: harmony=%.3f", features[4])
 
-        elif msg_type == "QUERY":
+        elif msg_type == bus.QUERY:
             from titan_plugin.core.profiler import handle_memory_profile_query
             if handle_memory_profile_query(msg, send_queue, name):
                 continue
             _handle_query(msg, mood_engine, social_graph, media_state,
                          data_dir, session_db, send_queue, name,
-                         severity_multipliers, focus_nudges)
+                         severity_multipliers, focus_nudges,
+                         cache=sensor_cache)
 
     logger.info("[MindWorker] Exiting")
 
@@ -215,7 +315,8 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 def _handle_query(msg: dict, mood_engine, social_graph, media_state: dict,
                   data_dir: str, session_db: str, send_queue, name: str,
                   severity_multipliers: list | None = None,
-                  focus_nudges: list | None = None) -> None:
+                  focus_nudges: list | None = None,
+                  cache=None) -> None:
     """Handle Mind-related queries."""
     payload = msg.get("payload", {})
     action = payload.get("action", "")
@@ -227,6 +328,7 @@ def _handle_query(msg: dict, mood_engine, social_graph, media_state: dict,
             tensor = _collect_mind_tensor(
                 mood_engine, social_graph, media_state, data_dir, session_db,
                 severity_multipliers, focus_nudges,
+                cache=cache,
             )
             _send_response(send_queue, name, src, {"tensor": tensor}, rid)
 
@@ -308,7 +410,8 @@ def _handle_query(msg: dict, mood_engine, social_graph, media_state: dict,
 def _collect_mind_tensor(mood_engine, social_graph, media_state: dict,
                          data_dir: str, session_db: str,
                          severity_multipliers: list | None = None,
-                         focus_nudges: list | None = None) -> list:
+                         focus_nudges: list | None = None,
+                         cache=None) -> list:
     """
     Collect 5DT Mind tensor with dual-layer perception.
 
@@ -319,30 +422,46 @@ def _collect_mind_tensor(mood_engine, social_graph, media_state: dict,
       - multiplier > 1.0 = amplify deviations from center (more sensitive)
       - multiplier < 1.0 = dampen deviations from center (less sensitive)
     FOCUS nudges apply gentle bias toward center.
+
+    cache (S7 §L1):
+      - None  → call _sense_X(...) inline (pre-S7 byte-identical)
+      - SensorCache → read sub_a values from cache (populated by
+        background refresh threads); sub_b reads from media_state
+        directly since SENSE_VISUAL/SENSE_AUDIO bus arrival drives
+        media_state at its own natural cadence.
     """
     if severity_multipliers is None:
         severity_multipliers = [1.0] * 5
     if focus_nudges is None:
         focus_nudges = [0.0] * 5
 
-    # [0] Vision
-    vision_a = _sense_vision_ambient(data_dir)
+    # Sub_a values — cached if cache present, else inline call.
+    if cache is not None:
+        vision_a = _read_cached_value(cache, "vision",
+                                       lambda: _sense_vision_ambient(data_dir))
+        hearing_a = _read_cached_value(cache, "hearing",
+                                        lambda: _sense_hearing_ambient(session_db))
+        taste = _read_cached_value(cache, "taste",
+                                    lambda: _sense_taste(social_graph))
+        smell = _read_cached_value(cache, "smell", _sense_smell)
+        touch = _read_cached_value(cache, "touch",
+                                    lambda: _sense_touch(mood_engine))
+    else:
+        vision_a = _sense_vision_ambient(data_dir)
+        hearing_a = _sense_hearing_ambient(session_db)
+        taste = _sense_taste(social_graph)
+        smell = _sense_smell()
+        touch = _sense_touch(mood_engine)
+
+    # [0] Vision — sub_a (cached or inline) + sub_b (media_state, push-driven)
     vision_b = _get_decayed_feature(media_state, "last_visual", "last_visual_ts", index=4)
     vision = vision_a * _SUB_WEIGHT_A + vision_b * _SUB_WEIGHT_B
 
-    # [1] Hearing
-    hearing_a = _sense_hearing_ambient(session_db)
+    # [1] Hearing — same pattern
     hearing_b = _get_decayed_feature(media_state, "last_audio", "last_audio_ts", index=4)
     hearing = hearing_a * _SUB_WEIGHT_A + hearing_b * _SUB_WEIGHT_B
 
-    # [2] Taste — social interaction quality (no sub_b for now)
-    taste = _sense_taste(social_graph)
-
-    # [3] Smell — environmental awareness (no sub_b for now)
-    smell = _sense_smell()
-
-    # [4] Touch — emotional state from MoodEngine (no sub_b for now)
-    touch = _sense_touch(mood_engine)
+    # [2] Taste, [3] Smell, [4] Touch — single-source senses (no sub_b yet)
 
     raw_senses = [vision, hearing, taste, smell, touch]
 
@@ -594,7 +713,7 @@ def _publish_mind_state(send_queue, name: str, tensor: list,
     except Exception:
         pass
 
-    _send_msg(send_queue, "MIND_STATE", name, "all", payload)
+    _send_msg(send_queue, bus.MIND_STATE, name, "all", payload)
 
 
 class _MetabolismStub:
@@ -629,7 +748,7 @@ def _send_msg(send_queue, msg_type: str, src: str, dst: str, payload: dict, rid:
 
 
 def _send_response(send_queue, src: str, dst: str, payload: dict, rid: str) -> None:
-    _send_msg(send_queue, "RESPONSE", src, dst, payload, rid)
+    _send_msg(send_queue, bus.RESPONSE, src, dst, payload, rid)
 
 
 def _compute_mind_reflex_intuition(stimulus: dict, tensor: list,
@@ -852,4 +971,138 @@ def _send_heartbeat(send_queue, name: str) -> None:
         rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
     except Exception:
         rss_mb = 0
-    _send_msg(send_queue, "MODULE_HEARTBEAT", name, "guardian", {"rss_mb": round(rss_mb, 1)})
+    _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", {"rss_mb": round(rss_mb, 1)})
+
+
+# ── S7 §L1 fast-path helpers ────────────────────────────────────────
+
+
+def _read_cached_value(cache, name: str, fallback_fn) -> float:
+    """
+    Read a single float sub_a value from cache. Cache stores
+    {"value": float, ...}. Defensive fallback to inline sense fn if
+    cache cold (boot warmup makes this rare in practice).
+    """
+    cached = cache.get(name)
+    if cached is not None and "value" in cached:
+        return float(cached["value"])
+    return float(fallback_fn())
+
+
+def _read_flag(config: dict, dotted_path: str, default: bool) -> bool:
+    """Resolve a dotted feature flag path through the worker's config."""
+    parts = dotted_path.split(".")
+    node = config
+    for part in parts:
+        if not isinstance(node, dict):
+            return default
+        if part not in node:
+            return default
+        node = node[part]
+    if isinstance(node, bool):
+        return node
+    return default
+
+
+def _start_fast_path(mood_engine, social_graph, media_state, data_dir,
+                     session_db, config, stop_event, get_modulators) -> tuple:
+    """
+    Start the §L1 fast-path threads for mind. Returns:
+      (sensor_cache, refresh_threads, shm_writer_thread)
+
+    get_modulators: callable returning current (severity_multipliers,
+    focus_nudges) so the shm writer always uses live values.
+
+    Synchronous warmup runs BEFORE refresh threads start.
+    """
+    from titan_plugin.core.sensor_cache import (
+        RefreshSpec, SensorCache, start_refresh_threads, start_shm_writer_thread,
+    )
+    from titan_plugin.core.state_registry import INNER_MIND_15D, RegistryBank
+
+    # Wrap each sense fn so the cache stores {"value": float} dicts
+    # — uniform shape across body and mind, lets the same SensorCache
+    # primitive serve both daemons.
+    def _wrap(fn) -> dict:
+        return {"value": float(fn())}
+
+    initial = {
+        "vision":  _wrap(lambda: _sense_vision_ambient(data_dir)),
+        "hearing": _wrap(lambda: _sense_hearing_ambient(session_db)),
+        "taste":   _wrap(lambda: _sense_taste(social_graph)),
+        "smell":   _wrap(_sense_smell),
+        "touch":   _wrap(lambda: _sense_touch(mood_engine)),
+    }
+    cache = SensorCache(initial=initial)
+
+    specs = [
+        RefreshSpec(
+            name="vision",
+            refresh_fn=lambda: _wrap(lambda: _sense_vision_ambient(data_dir)),
+            period_s=_MIND_REFRESH_PERIODS_S["vision"],
+        ),
+        RefreshSpec(
+            name="hearing",
+            refresh_fn=lambda: _wrap(lambda: _sense_hearing_ambient(session_db)),
+            period_s=_MIND_REFRESH_PERIODS_S["hearing"],
+        ),
+        RefreshSpec(
+            name="taste",
+            refresh_fn=lambda: _wrap(lambda: _sense_taste(social_graph)),
+            period_s=_MIND_REFRESH_PERIODS_S["taste"],
+        ),
+        RefreshSpec(
+            name="smell",
+            refresh_fn=lambda: _wrap(_sense_smell),
+            period_s=_MIND_REFRESH_PERIODS_S["smell"],
+        ),
+        RefreshSpec(
+            name="touch",
+            refresh_fn=lambda: _wrap(lambda: _sense_touch(mood_engine)),
+            period_s=_MIND_REFRESH_PERIODS_S["touch"],
+        ),
+    ]
+    refresh_threads = start_refresh_threads(
+        specs, cache, stop_event, thread_name_prefix="mind_refresh",
+    )
+
+    shm_bank = RegistryBank(titan_id=None, config=config)
+    shm_writer_thread = None
+    if shm_bank.is_enabled(INNER_MIND_15D):
+        mind_15d_writer = shm_bank.writer(INNER_MIND_15D)
+
+        def tick():
+            severity_multipliers, focus_nudges = get_modulators()
+            # Step 1: 5D base tensor from cache (sub_a) + media_state (sub_b)
+            tensor_5d = _collect_mind_tensor(
+                mood_engine, social_graph, media_state, data_dir, session_db,
+                severity_multipliers, focus_nudges,
+                cache=cache,
+            )
+            # Step 2: extend to 15D via collect_mind_15d (Thinking +
+            # Feeling + Willing). Hormone levels intentionally left
+            # None — matches the existing bus-publish behavior. The
+            # 15D extension is pure compute over the 5D + neuromod
+            # state, no additional I/O.
+            try:
+                from titan_plugin.logic.mind_tensor import collect_mind_15d
+                tensor_15d = collect_mind_15d(
+                    current_5d=tensor_5d,
+                    hormone_levels=None,
+                )
+            except Exception:
+                # Defensive — if the 15D extension fails, write the
+                # 5D base padded with neutral 0.5s so consumers always
+                # see a valid 15D vector.
+                tensor_15d = list(tensor_5d) + [0.5] * 10
+
+            import numpy as np
+            arr = np.asarray(tensor_15d, dtype=np.float32)
+            if arr.shape == (15,):
+                mind_15d_writer.write(arr)
+
+        shm_writer_thread = start_shm_writer_thread(
+            tick, _MIND_TICK_PERIOD_S, stop_event, "mind_shm_writer",
+        )
+
+    return cache, refresh_threads, shm_writer_thread
