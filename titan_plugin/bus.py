@@ -37,6 +37,69 @@ logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Kernel-internal subscriber discriminator (Microkernel v2 Phase B.2 §D12)
+# ──────────────────────────────────────────────────────────────────────
+# Per PLAN_microkernel_phase_b2_ipc.md §D12: under socket mode, kernel-internal
+# subscribers (Guardian, kernel control loops, proxy reply queues, etc.) get
+# an in-process ThreadQueue (faster, no broker hop). Worker subscribers (in
+# separate processes) SHOULD use `setup_worker_bus` → BusSocketClient instead
+# of calling `bus.subscribe()` directly.
+#
+# This explicit allowlist + suffix rules is the single source of truth for
+# the discrimination. Update it in lockstep with new kernel-side subscribers.
+#
+# Audited 2026-05-02 against every `bus.subscribe(...)` call site in
+# titan_plugin/. Workers do NOT call subscribe — they receive via
+# `setup_worker_bus` / SocketQueue path. So in steady state, every reachable
+# subscribe() call is kernel-internal; the discriminator returns True for all
+# of them. The check exists to surface contract violations LOUD if a future
+# caller (or accidental worker-side use) trips it.
+
+_KERNEL_INTERNAL_NAMES: frozenset[str] = frozenset({
+    # Guardian self
+    "guardian",
+    # Kernel control loops (titan_plugin/core/kernel.py:267-279,690 +
+    # legacy_core.py:55,59,67 — same logical bus names in both code paths)
+    "core", "meditation", "sovereignty", "kernel",
+    # Plugin control loops (titan_plugin/core/plugin.py:1470,2099,2640 +
+    # legacy_core.py:1193,1386,1848). NOTE: "agency" (NOT "agency_queue" —
+    # the Python attr is `_agency_queue` but the bus name is "agency").
+    "agency", "chat_handler", "v4_bridge",
+    # State register (titan_plugin/logic/state_register.py:430)
+    "state_register",
+    # RLProxy stats subscription (titan_plugin/proxies/rl_proxy.py:79).
+    # Doesn't match the _proxy suffix because it's a SECOND subscription
+    # made by rl_proxy.py for SAGE_STATS broadcasts, with a distinct queue
+    # name from the proxy's reply queue. Kernel-side, broadcasts from the
+    # rl worker's spawn process.
+    "rl_proxy_stats",
+    # Legacy in-process API (api_process_separation_enabled=false path)
+    "api",
+})
+
+# Suffixes that mark a subscriber as kernel-internal:
+# - "_proxy"  → kernel-side proxy reply queue (12 proxies in titan_plugin/proxies/)
+# - "_query"  → reflex_executors.py query reply queues
+_KERNEL_INTERNAL_SUFFIXES: tuple[str, ...] = ("_proxy", "_query")
+
+
+def _is_kernel_internal(module_name: str) -> bool:
+    """Phase B.2 §D12 discriminator — True if subscriber is kernel-side.
+
+    Kernel-internal subscribers get an in-process Queue (legacy ThreadQueue
+    path). Non-kernel-internal callers under socket mode are a contract
+    violation — workers should use setup_worker_bus, not bus.subscribe.
+
+    See `_KERNEL_INTERNAL_NAMES` and `_KERNEL_INTERNAL_SUFFIXES` for the
+    canonical allowlist. Update those in lockstep with new kernel-side
+    subscribers.
+    """
+    if module_name in _KERNEL_INTERNAL_NAMES:
+        return True
+    return module_name.endswith(_KERNEL_INTERNAL_SUFFIXES)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Bus IPC dedicated thread pool
 # ──────────────────────────────────────────────────────────────────────
 # 2026-04-29 — RCA of T1 thread-pool saturation (250% peak: 64 busy + 192
@@ -143,6 +206,23 @@ MODULE_HEARTBEAT = "MODULE_HEARTBEAT"
 MODULE_SHUTDOWN = "MODULE_SHUTDOWN"
 MODULE_CRASHED = "MODULE_CRASHED"
 EPOCH_TICK = "EPOCH_TICK"
+
+# Microkernel v2 Phase B.2 §D9 (2026-05-02) — broker peer-process death
+# signal. Published by BusSocketServer when its smart-liveness algorithm
+# (Tier 1-4) detects that a subscriber's peer PID is dead via os.kill(pid, 0).
+# Authoritative + faster than Guardian's process.is_alive() polling
+# (which runs every 1s); broker often catches the death within tens of ms.
+#
+# Payload schema:
+#     {"name": str,          # "memory" / "cgn" / etc, OR "anon-N" if pre-subscribe
+#      "pid": int,           # peer PID from SO_PEERCRED at accept time
+#      "was_anon": bool,     # True if connection died before sending BUS_SUBSCRIBE
+#      "silent_for_s": float} # seconds since last_pong_ts at purge time
+#
+# dst="guardian"; consumed by Guardian._process_guardian_messages →
+# triggers self.restart(name) for named workers (idempotent with the
+# polling-path restart via Guardian._module_lock).
+BUS_PEER_DIED = "BUS_PEER_DIED"
 
 # Mainnet Lifecycle Wiring rFP (2026-04-20): SovereigntyTracker wiring.
 # Spirit_worker publishes SOVEREIGNTY_EPOCH every 10 consciousness epochs
@@ -309,6 +389,14 @@ ADOPTION_ACK = "ADOPTION_ACK"                          # canonical for BUS_WORKE
 KERNEL_EPOCH_TICK = "KERNEL_EPOCH_TICK"                # canonical for EPOCH_TICK (D15)
 
 # V4 Time Awareness messages
+# Phase A.S8 (2026-04-30) — outer trinity 3 separate STATE messages
+# (mirror inner BODY/MIND/SPIRIT_STATE; explicit OUTER_ prefix for code readability).
+OUTER_BODY_STATE = "OUTER_BODY_STATE"
+OUTER_MIND_STATE = "OUTER_MIND_STATE"
+OUTER_SPIRIT_STATE = "OUTER_SPIRIT_STATE"
+OUTER_SOURCES_SNAPSHOT = "OUTER_SOURCES_SNAPSHOT"  # plugin → 3 outer workers every 10s
+# DEPRECATED — kept for legacy_core.py import compat (legacy boot fallback path).
+# Active microkernel v2 path uses the 3 separate STATE messages above.
 OUTER_TRINITY_STATE = "OUTER_TRINITY_STATE"
 # A.8.4 — parent → outer_trinity worker (fire-and-forget; sources payload pre-flattened by parent)
 OUTER_TRINITY_COLLECT_REQUEST = "OUTER_TRINITY_COLLECT_REQUEST"
@@ -534,6 +622,7 @@ class DivineBus:
     # State message types → routed to blackboard (latest-value, no queue pressure)
     STATE_MSG_TYPES = {
         BODY_STATE, MIND_STATE, SPIRIT_STATE,
+        OUTER_BODY_STATE, OUTER_MIND_STATE, OUTER_SPIRIT_STATE,
         OUTER_TRINITY_STATE, SPHERE_PULSE, FILTER_DOWN_V4,
     }
 
@@ -584,6 +673,11 @@ class DivineBus:
             # type filter — zero queue cost, separate from "dropped" (which
             # counts queue-full drops).
             "filtered_broadcasts": 0,
+            # Phase B.2 §D12 (2026-05-02): non-kernel-internal subscribe()
+            # calls under socket mode. Should be 0 in steady state — workers
+            # use setup_worker_bus, kernel components are kernel-internal.
+            # Non-zero = contract violation; surfaces in arch_map.
+            "non_kernel_internal_subscribe_under_socket": 0,
         }
         # Optional callback called during request() polling to drain worker send queues.
         # Set by TitanCore to guardian.drain_send_queues so responses flow back.
@@ -602,6 +696,17 @@ class DivineBus:
     def subscribe(self, module_name: str, reply_only: bool = False,
                   types: Optional[Iterable[str]] = None) -> AnyQueue:
         """Register a module and return its dedicated receive queue.
+
+        Microkernel v2 Phase B.2 §D7+§D12 dual-mode contract (2026-05-02):
+        Under socket mode (broker attached), kernel-internal subscribers
+        receive an in-process Queue (existing behavior). External (worker-
+        process) subscribers SHOULD NOT call this method directly — they
+        attach to the broker via `setup_worker_bus`. If a non-kernel-internal
+        name calls subscribe() while a broker is attached, that is a contract
+        violation: we log a loud warning, increment a stat counter, and still
+        return a regular Queue (defensive — avoid crashing legitimate kernel
+        components). Once the field counter shows zero hits across the fleet
+        for a soak window, we can graduate the violation to a hard raise.
 
         Args:
             module_name: Unique name for this subscriber.
@@ -625,6 +730,22 @@ class DivineBus:
                    in types receives that msg_type). reply_only union also
                    applies — once a name is reply_only, it stays that way.
         """
+        # Phase B.2 §D12 (2026-05-02): contract check — under socket mode,
+        # non-kernel-internal callers should not call subscribe() directly.
+        # Workers must use setup_worker_bus → BusSocketClient. Hitting this
+        # branch is a contract violation; log loud + count for visibility.
+        if self._broker is not None and not _is_kernel_internal(module_name):
+            with self._lock:
+                self._stats["non_kernel_internal_subscribe_under_socket"] += 1
+            logger.warning(
+                "[DivineBus] CONTRACT VIOLATION: bus.subscribe('%s', reply_only=%s) "
+                "called under socket mode for a non-kernel-internal name. "
+                "Workers must use setup_worker_bus → BusSocketClient. "
+                "Returning in-process Queue defensively, but this caller is "
+                "off-contract per PLAN_microkernel_phase_b2_ipc.md §D12. "
+                "Update _KERNEL_INTERNAL_NAMES if this name IS kernel-internal.",
+                module_name, reply_only,
+            )
         if self._multiprocess:
             q: AnyQueue = MPQueue(maxsize=self._maxsize)
         else:
@@ -1550,6 +1671,12 @@ QUERY_RESPONSE = "QUERY_RESPONSE"
 
 # Reflex worker ready
 REFLEX_READY = "REFLEX_READY"
+
+# C-S5 Python L2 worker boot signals — peers know the slot writers are
+# live (sibling triad with REFLEX_READY pattern).
+HORMONAL_READY = "HORMONAL_READY"
+NEUROMOD_READY = "NEUROMOD_READY"
+NS_READY = "NS_READY"
 
 # Save lifecycle
 SAVE_DONE = "SAVE_DONE"

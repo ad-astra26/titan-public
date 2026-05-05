@@ -721,6 +721,101 @@ def _write_sphere_clocks_shm(_clock_engine, _registry_bank, _last_hash):
         return _last_hash
 
 
+def _spirit_worker_shim_loop(recv_queue, send_queue, name: str, config: dict) -> None:
+    """Thin-shim mode: spirit_worker is no-op when l0_rust_enabled = true.
+
+    Per master plan §10.5 chunk C5-8 + C-S5 PLAN §0.5 — when the
+    microkernel.l0_rust_enabled flag flips:
+      - NS programs ×11 → handled by ns_module (C5-5)
+      - Neuromod cascade (DA/5HT/NE/ACh/Endorphin/GABA) → neuromod_module (C5-6)
+      - Hormonal cascade (11 hormones) → hormonal_module (C5-7)
+      - Inner-spirit 45D Schumann tick (70.47 Hz) → titan-inner-spirit-rs (C5-4)
+      - Sphere clocks + topology + filter_down/ground_up → titan-trinity-rs
+        (C-S3 SHIPPED)
+      - 162D TITAN_SELF assembly → titan-unified-spirit-rs (C-S4)
+
+    This shim only:
+      - Sends MODULE_READY on boot
+      - Sends MODULE_HEARTBEAT periodically
+      - Handles MODULE_SHUTDOWN cleanly
+      - Routes B.2.1 SWAP_HANDOFF / ADOPTION_REQUEST through
+        worker_swap_handler so spawn-mode supervision transfer works
+        unchanged
+
+    Full deletion of spirit_worker.py is C-S8 cleanup. Until then this
+    shim keeps the module REGISTRABLE so guardian_HCL's startup path is
+    byte-identical (the same module name + Spec definition stays in
+    the registry; only behavior degenerates to no-op when the flag flips).
+    """
+    import time
+    from queue import Empty
+    from titan_plugin import bus
+
+    HEARTBEAT_INTERVAL_S = 30.0
+    POLL_INTERVAL_S = 0.2
+
+    titan_id = (config.get("info_banner", {}) or {}).get("titan_id") or "T1"
+    boot_ts = time.time()
+
+    logger.info(
+        "[SpiritWorker] SHIM mode active (microkernel.l0_rust_enabled=true) — "
+        "NS / neuromod / hormonal / inner-spirit logic moved to dedicated "
+        "Python L2 workers (ns_module / neuromod_module / hormonal_module) + "
+        "Rust trinity daemons (titan-trinity-rs / titan-inner-spirit-rs). "
+        "Full retirement scheduled for C-S8 cleanup."
+    )
+
+    try:
+        send_queue.put({
+            "type": bus.MODULE_READY, "src": name, "dst": "guardian",
+            "payload": {
+                "titan_id": titan_id, "ts": boot_ts, "shim_mode": True,
+            },
+            "ts": boot_ts,
+        })
+    except Exception:
+        pass
+
+    last_heartbeat_ts = 0.0
+    while True:
+        now = time.time()
+        if now - last_heartbeat_ts >= HEARTBEAT_INTERVAL_S:
+            try:
+                send_queue.put({
+                    "type": bus.MODULE_HEARTBEAT, "src": name, "dst": "guardian",
+                    "payload": {
+                        "alive": True, "ts": now, "shim_mode": True,
+                    },
+                    "ts": now,
+                })
+            except Exception:
+                pass
+            last_heartbeat_ts = now
+
+        try:
+            msg = recv_queue.get(timeout=POLL_INTERVAL_S)
+        except Empty:
+            continue
+        except Exception:
+            continue
+
+        msg_type = msg.get("type")
+
+        # B.2.1 supervision-transfer dispatch — preserves spawn-mode adoption.
+        try:
+            from titan_plugin.core import worker_swap_handler as _swap
+            if _swap.maybe_dispatch_swap_msg(msg):
+                continue
+        except Exception:
+            pass
+
+        if msg_type == bus.MODULE_SHUTDOWN:
+            logger.info("[SpiritWorker] Shim shutdown received — exiting")
+            return
+
+        # Every other message is intentionally ignored in shim mode.
+
+
 def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the Spirit module process."""
     from queue import Empty
@@ -728,6 +823,19 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     project_root = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
+
+    # ── C-S5 §10 D22 thin-shim flag gate ─────────────────────────────────
+    # When microkernel.l0_rust_enabled = true, spirit_worker becomes a
+    # no-op shim — see `_spirit_worker_shim_loop` above for the full
+    # rationale. Flag-off (default) falls through to the legacy path
+    # below, BYTE-IDENTICAL to today (per directive_memory_preservation.md
+    # + SPEC §3.0 Running-Titans Safety Rule).
+    flag_on = bool(
+        (config or {}).get("microkernel", {}).get("l0_rust_enabled", False))
+    if flag_on:
+        _spirit_worker_shim_loop(recv_queue, send_queue, name, config)
+        return
+    # ── Legacy path below — unchanged from pre-C-S5 ─────────────────────
 
     # ── Import reloadable helper functions from spirit_loop ──────────────
     # Phase 1 of spirit_loop extraction (2026-03-23).
@@ -7885,15 +7993,29 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                             logger.warning("[DELEGATE] Queue error: %s", _dq_err)
 
                                 # ── 3. MENTION DISCOVERY + REPLY ──
-                                # Decoupled from posting window — runs every 10th
-                                # social cycle (~15 min) OR when posting window opens.
-                                # Mentions must be checked independently so Titans can
-                                # see and reply even when not actively posting.
+                                # 2026-04-30 — TIGHTENED CADENCE (Maker directive
+                                # "roughly 30 mins window"). Pre-fix: triggered on
+                                # `_xg_social_window OR _msl_tick_count % 300` →
+                                # ~24-90s actual cadence → 170 paid user/mentions
+                                # calls in 67 min. Removed the OR fallback +
+                                # added explicit cooldown gate (default 1800s =
+                                # 30 min, configurable via
+                                # [social_x.replies].mention_check_cooldown_seconds).
+                                # Combined with [social_x.cache].ttl_user_mentions
+                                # = 300s, max 1 paid mention call per 30 min.
+                                _xg_replies_cfg_mc = _xg_full.get("social_x", {}).get("replies", {})
+                                _xg_mention_cooldown = float(_xg_replies_cfg_mc.get(
+                                    "mention_check_cooldown_seconds", 1800.0))
+                                _xg_now = time.time()
+                                if not hasattr(_x_gateway, "_last_mention_check_ts"):
+                                    _x_gateway._last_mention_check_ts = 0.0
                                 _xg_check_mentions = (
-                                    _xg_social_window or
-                                    _msl_tick_count % 300 == 0  # every ~300 ticks
+                                    _xg_social_window
+                                    and (_xg_now - _x_gateway._last_mention_check_ts
+                                         > _xg_mention_cooldown)
                                 )
                                 if _xg_check_mentions:
+                                    _x_gateway._last_mention_check_ts = _xg_now
                                     try:
                                         # Gateway mode: empty titan_id → discover
                                         # mentions for ALL Titans (T1/T2/T3).
@@ -8768,25 +8890,53 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                                   meta_sink=outer_state)
             last_publish = time.time()
 
-        elif msg_type == bus.OUTER_TRINITY_STATE:
-            # V4: Cache outer state — clocks now tick at Schumann frequency.
-            # 2026-04-23 (Phase 1): merge logic extracted to
-            # _merge_outer_trinity_payload to preserve prior extended state
-            # when collect_outer_mind_15d / collect_outer_spirit_45d silently
-            # fail that tick (prevents 132D↔67D state_vector flip-flop).
+        elif msg_type == bus.OUTER_BODY_STATE:
+            # Phase A.S8: outer_body_worker → cache outer_body. No downstream cascade.
             payload = msg.get("payload", {})
-            _merge_outer_trinity_payload(outer_state, payload)
-            # T3: Coordinator computes outer observables + merges into InnerState
+            _ob = payload.get("outer_body", payload.get("values", [0.5] * 5))
+            outer_state["outer_body"] = _ob
+
+        elif msg_type == bus.OUTER_MIND_STATE:
+            # Phase A.S8: outer_mind_worker → cache outer_mind + 15D.
+            # Preserves Willing [10:15] from GROUND_UP enrichment.
+            payload = msg.get("payload", {})
+            outer_state["outer_mind"] = payload.get("outer_mind",
+                                          payload.get("values", [0.5] * 5))
+            _incoming_om15 = (payload.get("outer_mind_15d")
+                               or payload.get("values_15d"))
+            if _incoming_om15:
+                _existing_om15 = outer_state.get("outer_mind_15d")
+                if (_existing_om15 and len(_existing_om15) >= 15):
+                    for _ti in range(10):  # Thinking[0:5] + Feeling[5:10]
+                        if _ti < len(_incoming_om15):
+                            _existing_om15[_ti] = _incoming_om15[_ti]
+                    # Willing [10:15] preserved from GROUND_UP
+                    outer_state["outer_mind_15d"] = _existing_om15
+                else:
+                    outer_state["outer_mind_15d"] = _incoming_om15
+
+        elif msg_type == bus.OUTER_SPIRIT_STATE:
+            # Phase A.S8: outer_spirit_worker → cache spirit, then fire downstream
+            # cascade using latest cached body+mind alongside just-arrived spirit.
+            # This is the natural end-of-outer-cycle trigger.
+            payload = msg.get("payload", {})
+            outer_state["outer_spirit"] = payload.get("outer_spirit",
+                                             payload.get("values", [0.5] * 5))
+            _incoming_os45 = (payload.get("outer_spirit_45d")
+                               or payload.get("values_45d"))
+            if _incoming_os45:
+                outer_state["outer_spirit_45d"] = _incoming_os45
+
+            # Fire coordinator with latest cached outer_body + outer_mind + new spirit
+            _ob_for_tick = outer_state.get("outer_body", [0.5] * 5)
+            _om_for_tick = outer_state.get("outer_mind", [0.5] * 5)
+            _os_for_tick = outer_state["outer_spirit"]
+
             outer_coherences = None
             if coordinator:
                 _outer_obs, outer_coherences = coordinator.tick_outer_only(
-                    payload.get("outer_body", [0.5] * 5),
-                    payload.get("outer_mind", [0.5] * 5),
-                    payload.get("outer_spirit", [0.5] * 5),
+                    _ob_for_tick, _om_for_tick, _os_for_tick,
                 )
-
-                # rFP #1 Phase 2: publish OBSERVABLES_SNAPSHOT after outer-obs
-                # update so state_register sees the freshest full 6-part dict.
                 if observable_engine and inner_state and inner_state.observables:
                     try:
                         _obs_dict = dict(inner_state.observables)
@@ -8803,10 +8953,49 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         })
                     except Exception as _obs_err:
                         logger.debug("[Observables] outer snapshot publish error: %s", _obs_err)
-            # NOTE: Outer sphere clocks now tick at Schumann frequency
-            # (same as inner) in the main loop, using this cached state.
-            # No more _tick_outer_sphere_clocks here — symmetry restored.
-            # V4: Update Unified SPIRIT conscious layer (DQ6: extended tensors)
+
+            if unified_spirit:
+                outer_mind_ext = (outer_state.get("outer_mind_15d")
+                                  or _om_for_tick)
+                outer_spirit_ext = (outer_state.get("outer_spirit_45d")
+                                    or _os_for_tick)
+                unified_spirit.update_conscious(
+                    _ob_for_tick,
+                    outer_mind_ext,
+                    outer_spirit_ext,
+                    filter_down_v5=_v5_mults_cache or None,
+                )
+
+        elif msg_type == bus.OUTER_TRINITY_STATE:
+            # Legacy delegate: legacy_core.py fallback boot path sends this.
+            # Applies the full combined payload via _merge_outer_trinity_payload,
+            # then fires the same cascade as OUTER_SPIRIT_STATE so legacy path
+            # remains functionally equivalent.
+            payload = msg.get("payload", {})
+            _merge_outer_trinity_payload(outer_state, payload)
+            outer_coherences = None
+            if coordinator:
+                _outer_obs, outer_coherences = coordinator.tick_outer_only(
+                    payload.get("outer_body", [0.5] * 5),
+                    payload.get("outer_mind", [0.5] * 5),
+                    payload.get("outer_spirit", [0.5] * 5),
+                )
+                if observable_engine and inner_state and inner_state.observables:
+                    try:
+                        _obs_dict = dict(inner_state.observables)
+                        _obs_30d = observable_engine.get_observations_30d(_obs_dict)
+                        send_queue.put({
+                            "type": bus.OBSERVABLES_SNAPSHOT,
+                            "src": name,
+                            "dst": "state_register",
+                            "ts": time.time(),
+                            "payload": {
+                                "observables_dict": _obs_dict,
+                                "observables_30d":  _obs_30d,
+                            },
+                        })
+                    except Exception as _obs_err:
+                        logger.debug("[Observables] outer snapshot publish error: %s", _obs_err)
             if unified_spirit:
                 outer_mind_ext = payload.get("outer_mind_15d",
                                              payload.get("outer_mind", [0.5] * 5))

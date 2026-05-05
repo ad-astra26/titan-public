@@ -1720,7 +1720,8 @@ def build_coordinator_snapshot(state_refs: dict) -> dict | None:
         }
     if language_stats:
         stats["language"] = language_stats
-    return stats
+    from titan_plugin.logic.spirit_state import _sanitize_dict_keys
+    return _sanitize_dict_keys(stats)
 
 
 def build_trinity_snapshot(state_refs: dict, config: dict) -> dict:
@@ -1773,15 +1774,24 @@ def build_trinity_snapshot(state_refs: dict, config: dict) -> dict:
         response["inner_state"] = inner_state.snapshot()
     if spirit_state:
         response["spirit_state"] = spirit_state.snapshot()
-    return response
+    # Sanitize the whole trinity payload before it crosses the bus broker —
+    # subsystem get_stats() (filter_down, intuition, sphere_clock, resonance,
+    # unified_spirit) and inner_state.observables can contain tuple/int dict
+    # keys that msgpack strict_map_key=True rejects on unpack. Yesterday's
+    # 885570d4 only covered build_coordinator_snapshot; trinity + NS were
+    # sibling paths that still leaked. Closes BUG-BUS-IPC-SPIRIT-MALFORMED-
+    # FRAME-20260428 third occurrence (trinity path).
+    from titan_plugin.logic.spirit_state import _sanitize_dict_keys
+    return _sanitize_dict_keys(response)
 
 
 def build_nervous_system_snapshot(state_refs: dict) -> dict | None:
     """Build the NS stats dict. Returns None if no NS available."""
     neural_nervous_system = state_refs.get("neural_nervous_system")
     coordinator = state_refs.get("coordinator")
+    from titan_plugin.logic.spirit_state import _sanitize_dict_keys
     if neural_nervous_system:
-        return neural_nervous_system.get_stats()
+        return _sanitize_dict_keys(neural_nervous_system.get_stats())
     if coordinator and coordinator.nervous_system:
         return {
             "version": "v4_vm",

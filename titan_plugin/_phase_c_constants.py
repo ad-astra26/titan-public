@@ -4,8 +4,8 @@ _phase_c_constants.py — AUTO-GENERATED from titan-docs/SPEC_titan_architecture
 DO NOT EDIT BY HAND. Edit the TOML, then run:
     python scripts/generate_phase_c_constants.py
 
-SPEC version: 0.1.2
-Source SHA-256: bdbd30e94aea257eff8c1d7f51207464d67770e61685d43f5de62e48dceb6e0e
+SPEC version: 0.1.7
+Source SHA-256: e752dbcabc35867bf7731f5bab108256cf7c6e7b11b03332550691d5221fbf55
 
 Per SPEC §19 + §2.6: hand-editing this file is a SPEC violation flagged by
 `arch_map phase-c verify`.
@@ -14,8 +14,8 @@ from __future__ import annotations
 from typing import Final
 
 # ── SPEC version metadata ──────────────────────────────────────────────
-SPEC_VERSION: Final[str] = "0.1.2"
-SPEC_SOURCE_SHA256: Final[str] = "bdbd30e94aea257eff8c1d7f51207464d67770e61685d43f5de62e48dceb6e0e"
+SPEC_VERSION: Final[str] = "0.1.7"
+SPEC_SOURCE_SHA256: Final[str] = "e752dbcabc35867bf7731f5bab108256cf7c6e7b11b03332550691d5221fbf55"
 
 
 # ── KERNEL ────────────────────────────────────────────────────────────────
@@ -33,6 +33,86 @@ KERNEL_CIRCADIAN_TICK_INTERVAL_S: Final[float] = 1.0
 KERNEL_CIRCADIAN_PERIOD_S: Final[float] = 86400.0
 # Pi-heartbeat tick cadence (~3 Hz target) — drives KERNEL_EPOCH_TICK publish per SPEC §10.H + §8.1
 KERNEL_PI_HEARTBEAT_INTERVAL_S: Final[float] = 0.333333333
+
+
+# ── TRINITY_SUBSTRATE ─────────────────────────────────────────────────────
+# titan-trinity-rs internals (Schumann generators, fast bus, topology)
+
+# Single-linkage clustering distance threshold for body-part observable vectors
+TOPOLOGY_CLUSTER_THRESHOLD: Final[float] = 0.3
+# Rolling window length for topology curvature computation (delta-volume across history)
+TOPOLOGY_VOLUME_HISTORY_SIZE: Final[int] = 20
+# topology_30d.bin payload size: 30 × float32 LE = 120 bytes (header excluded)
+TOPOLOGY_30D_PAYLOAD_BYTES: Final[int] = 120
+# Conservative grounding force magnitude — daemons multiply nudge by this per body cycle (G5 + G10 invariants)
+GROUND_UP_DEFAULT_STRENGTH: Final[float] = 0.1
+# Damping factor preventing nudge oscillation overshoot (smoothing of prev_nudge with raw signal)
+GROUND_UP_DEFAULT_DAMPING: Final[float] = 0.95
+# Per-tick safety clamp on absolute nudge magnitude per dimension — prevents runaway grounding
+GROUND_UP_MAX_NUDGE: Final[float] = 0.05
+# Number of spirit Schumann ticks per substrate body cycle (= SCHUMANN_SPIRIT_HZ / SCHUMANN_BODY_HZ ratio)
+SUBSTRATE_BODY_CYCLE_SCHUMANN_TICKS: Final[int] = 9
+# Substrate body cycle period (1.0 / SCHUMANN_BODY_HZ × 9 / 9 = 1/7.83 × 9 ≈ 1.149425287 s; exposes derived value for telemetry)
+SUBSTRATE_BODY_CYCLE_S: Final[float] = 1.149425287
+# chi_state.bin field count (total, spirit, mind, body, coherence, urgency)
+CHI_STATE_FIELD_COUNT: Final[int] = 6
+# chi_state.bin payload size: 6 × float32 LE = 24 bytes (header excluded)
+CHI_STATE_PAYLOAD_BYTES: Final[int] = 24
+
+
+# ── UNIFIED_SPIRIT ────────────────────────────────────────────────────────
+# titan-unified-spirit-rs internals (162D SELF assembly, filter_down origination)
+
+# Lower clamp for FILTER_DOWN V5 multipliers applied by daemons (Preamble G7 LOCKED)
+FILTER_DOWN_MULTIPLIER_FLOOR: Final[float] = 0.3
+# Upper clamp for FILTER_DOWN V5 multipliers (Preamble G7 LOCKED)
+FILTER_DOWN_MULTIPLIER_CEIL: Final[float] = 3.0
+# Gentle-filter multiplier applied to spirit content multipliers — 'Spirit modulates slowly' (Preamble G9)
+FILTER_DOWN_SPIRIT_STRENGTH_MULT: Final[float] = 0.3
+# Until reached, V5 publishes all-1.0 multipliers (no modulation); network needs ~2000 epochs of TD(0) training before producing meaningful gradients
+FILTER_DOWN_COLD_START_FLOOR_EPOCHS: Final[int] = 2000
+# Lower clamp for filter_down multipliers (UNIFIED_SPIRIT_FILTER_DOWN + INNER_SPIRIT_FILTER_DOWN + OUTER_SPIRIT_FILTER_DOWN payloads); applied at consume site per G7 + filter_down.py:464-498
+UNIFIED_SPIRIT_MULTIPLIER_FLOOR: Final[float] = 0.3
+# Upper clamp for filter_down multipliers
+UNIFIED_SPIRIT_MULTIPLIER_CEIL: Final[float] = 3.0
+# TrinityValueNet input dim — 130D felt + 30D topology + 2D journey
+FILTER_DOWN_INPUT_DIM: Final[int] = 162
+# TrinityValueNet hidden layer 1 width
+FILTER_DOWN_HIDDEN_1: Final[int] = 128
+# TrinityValueNet hidden layer 2 width
+FILTER_DOWN_HIDDEN_2: Final[int] = 64
+# Multiplier output dim — 5+15+40+5+15+40 (observer 10 dims masked per G8)
+FILTER_DOWN_OUTPUT_DIM: Final[int] = 120
+# TD(0) learning rate
+FILTER_DOWN_LR: Final[float] = 0.001
+# TD(0) discount factor — target = r + GAMMA × V(s')
+FILTER_DOWN_GAMMA: Final[float] = 0.95
+# TD(0) mini-batch size
+FILTER_DOWN_BATCH_SIZE: Final[int] = 16
+# TransitionBuffer ring capacity
+FILTER_DOWN_BUFFER_MAX: Final[int] = 2000
+# Minimum transitions buffered before training begins
+FILTER_DOWN_MIN_TRANSITIONS: Final[int] = 32
+# Train every N new transitions
+FILTER_DOWN_TRAIN_EVERY_N: Final[int] = 5
+# Rolling-window size (epochs) for SPIRIT velocity computation
+UNIFIED_SPIRIT_VELOCITY_WINDOW: Final[int] = 10
+# Velocity below this = SPIRIT IS_STALE (not growing enough)
+UNIFIED_SPIRIT_STALE_THRESHOLD: Final[float] = 0.8
+# Base FOCUS cascade multiplier when SPIRIT IS_STALE; escalates by 0.2 × consecutive_stale, capped at 3.0
+UNIFIED_SPIRIT_STALE_FOCUS_MULTIPLIER: Final[float] = 1.5
+# Max GreatEpoch records held in-memory before rotation to archive file (Rust port — Python had no cap)
+UNIFIED_SPIRIT_EPOCHS_HISTORY_CAP: Final[int] = 4096
+# Max phase difference for resonance (π/6 = 30°) — Proof of Harmony
+RESONANCE_PHASE_THRESHOLD_RAD: Final[float] = 0.5235987755982988
+# Consecutive resonant cycles required for BIG PULSE per pair
+RESONANCE_CYCLES_REQUIRED: Final[int] = 3
+# Max time between counterpart sphere pulses for resonance candidacy
+RESONANCE_PULSE_WINDOW_S: Final[float] = 120.0
+# Body publish rate ≈ Schumann/9 — unified-spirit body_cycle_loop tick interval
+BODY_CYCLE_INTERVAL_MS: Final[int] = 1150
+# Min interval between consecutive body_cycle_loop ticks (debounce TRINITY_SUBSTRATE_TOPOLOGY_UPDATED early-wakes)
+BODY_CYCLE_DEBOUNCE_MS: Final[int] = 200
 
 
 # ── DAEMON ────────────────────────────────────────────────────────────────
@@ -109,8 +189,12 @@ BUS_API_HTTP_PORT_DEFAULT: Final[int] = 7777
 FASTBUS_RING_CAPACITY_SLOTS: Final[int] = 1024
 # Per-slot byte size in fastbus ring
 FASTBUS_SLOT_BYTES: Final[int] = 256
-# Fast bus ring header layout: magic[8] + version[4] + read_idx[8] + write_idx[8] + mask[4] + reserved[32] = 64 bytes
+# Fast bus ring header layout (v0.1.4): magic[8] + read_idx[8] + write_idx[8] + version[4] + mask[4] + reserved[32] = 64 bytes. AtomicU64 fields at 8-byte aligned offsets (read_idx@8, write_idx@16) for portable lock-free atomics.
 FASTBUS_HEADER_BYTES: Final[int] = 64
+# Ring header version field — bumped on layout changes; substrate refuses to attach if version > current
+FASTBUS_RING_VERSION: Final[int] = 1
+# 8-byte magic identifier at offset 0 of fastbus ring header — substrate verifies on attach (8 ASCII bytes; UTF-8 byte length must equal 8)
+FASTBUS_MAGIC_BYTES: Final[bytes] = b"TITANFB1"
 
 
 # ── FRAME ─────────────────────────────────────────────────────────────────
@@ -172,6 +256,8 @@ SPHERE_CLOCKS_SCHEMA_VERSION: Final[int] = 1
 CHI_STATE_SCHEMA_VERSION: Final[int] = 1
 # Schema version for titanvm_registers.bin slot (11 NS programs × 4 fields)
 TITANVM_REGISTERS_SCHEMA_VERSION: Final[int] = 1
+# Schema version for hormonal_state.bin slot (11 hormones × 4 fields × float32 = 176 bytes payload). Canonical hormone order matches NS_PROGRAMS in emot_bundle_protocol.py (REFLEX, FOCUS, INTUITION, IMPULSE, METABOLISM, CREATIVITY, CURIOSITY, EMPATHY, REFLECTION, INSPIRATION, VIGILANCE). Per-hormone fields: level, threshold, refractory, peak_level (read-mostly state surfaced from HormonalPressure class in titan_plugin/logic/hormonal_pressure.py).
+HORMONAL_STATE_SCHEMA_VERSION: Final[int] = 1
 # Schema version for identity.bin slot (kernel identity + per-boot nonce)
 IDENTITY_SCHEMA_VERSION: Final[int] = 1
 # Schema version for cgn_live_weights.bin slot (variable-size, ≤256 KB)
@@ -193,6 +279,21 @@ SCHUMANN_BODY_HZ: Final[float] = 7.83
 SCHUMANN_MIND_HZ: Final[float] = 23.49
 # Schumann × 9 — spirit tick frequency (period 14 ms). LOCKED BY BIOLOGY.
 SCHUMANN_SPIRIT_HZ: Final[float] = 70.47
+# Substrate Schumann generator drift target over 24h — OBS-c-s3-schumann-precision pass criteria (drift < 0.1%)
+SCHUMANN_DRIFT_TARGET_PCT: Final[float] = 0.1
+# Substrate Schumann generator per-tick jitter p99 target — OBS-c-s3-schumann-precision pass criteria
+SCHUMANN_JITTER_P99_MS: Final[float] = 1.0
+
+
+# ── CLOCK ─────────────────────────────────────────────────────────────────
+# Circadian + π-heartbeat + sphere clocks
+
+# Per-clock field count: radius, scalar_position, phase, contraction_velocity, pulse_count, consecutive_balanced, last_pulse_age_s
+SPHERE_CLOCK_FIELD_COUNT: Final[int] = 7
+# Sphere clock count (3 inner + 3 outer = 6 trinity components)
+SPHERE_CLOCK_COUNT: Final[int] = 6
+# sphere_clocks.bin payload size: 6 clocks × 7 fields × float32 LE = 168 bytes (header excluded)
+SPHERE_CLOCKS_PAYLOAD_BYTES: Final[int] = 168
 
 
 # ── SWAP ──────────────────────────────────────────────────────────────────
@@ -288,3 +389,28 @@ OUTER_MIND_TICK_JITTER_PCT: Final[int] = 20
 OUTER_SPIRIT_TICK_BASE_S: Final[float] = 30.0
 # Outer-spirit cadence jitter (±)
 OUTER_SPIRIT_TICK_JITTER_PCT: Final[int] = 10
+# Start dim of outer_mind willing range (ground_up applies here per G10 ground_up_mind_range=10:15)
+OUTER_MIND_WILLING_DIM_START: Final[int] = 10
+# End dim (exclusive) of outer_mind willing range
+OUTER_MIND_WILLING_DIM_END: Final[int] = 15
+# Sensor cache staleness threshold = N × daemon's natural cadence (wall_ns < now − N×cadence → cache stale, daemon writes last-known with confidence=0.0 log)
+OUTER_CACHE_STALE_CADENCE_MULTIPLIER: Final[int] = 3
+# Max payload bytes for sensor_cache_outer_body.bin (msgpack source dict per O4 lock — agency_stats/helper_statuses/bus_stats/system_sensor_stats/network_monitor_stats/tx_latency_stats/block_delta_stats/anchor_state/sol_balance)
+OUTER_SENSOR_CACHE_BODY_MAX_BYTES: Final[int] = 8192
+# Max payload bytes for sensor_cache_outer_mind.bin (msgpack source dict — persona narrative + social context + creative_stats + memory_stats + agency_stats)
+OUTER_SENSOR_CACHE_MIND_MAX_BYTES: Final[int] = 8192
+# Max payload bytes for sensor_cache_outer_spirit.bin (msgpack pre-aggregated outer-state — action_stats/sovereignty_ratio/uptime_ratio/social_stats/solana_stats/hormone_levels/recovery_stats/creative_stats/memory_stats/assessment_stats/history)
+OUTER_SENSOR_CACHE_SPIRIT_MAX_BYTES: Final[int] = 8192
+
+
+# ── OUTER_SPIRIT ──────────────────────────────────────────────────────────
+# Outer-spirit local filter_down (Phase C 3-level cascade addition)
+
+# Start dim of outer_spirit_45d local-frame observer range (= TITAN_SELF absolute [85:90] per G8 outer_spirit_observer_dims_masked=85:90); MASKED from filter_down output only — slot itself contains all 45D
+OUTER_SPIRIT_OBSERVER_DIM_START: Final[int] = 0
+# End dim (exclusive) of outer_spirit_45d local-frame observer range
+OUTER_SPIRIT_OBSERVER_DIM_END: Final[int] = 5
+# Start dim of outer_spirit_45d local-frame content range (= TITAN_SELF absolute [90:130] per G9 outer_spirit_content_range=90:130); 40 dims [5:45] = SAT[5:15]+CHIT[15:30]+ANANDA[30:45] minus observer; this is the slice published in OUTER_SPIRIT_FILTER_DOWN.outer_spirit_content[40]
+OUTER_SPIRIT_CONTENT_DIM_START: Final[int] = 5
+# End dim (exclusive) of outer_spirit_45d local-frame content range
+OUTER_SPIRIT_CONTENT_DIM_END: Final[int] = 45

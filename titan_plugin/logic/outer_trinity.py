@@ -64,7 +64,8 @@ class OuterTrinityCollector:
     subsystem stats via proxies and direct references.
     """
 
-    def __init__(self):
+    def __init__(self, l0_rust_enabled: bool = False,
+                 titan_id: Optional[str] = None):
         # Rolling counters (reset at configurable windows)
         self._last_collect_ts = time.time()
 
@@ -72,6 +73,8 @@ class OuterTrinityCollector:
         self._last_outer_body: list[float] = [0.5] * 5
         self._last_outer_mind: list[float] = [0.5] * 5
         self._last_outer_spirit: list[float] = [0.5] * 5
+        self._last_outer_mind_15d: list[float] = [0.5] * 15
+        self._last_outer_spirit_45d: list[float] = [0.5] * 45
         self._collect_count = 0
 
         # Extended-tensor health counters — exposed via get_last_tensors()
@@ -83,6 +86,24 @@ class OuterTrinityCollector:
         self._extended_failure_count = 0
         self._extended_last_failure_ts: float = 0.0
         self._extended_last_failure_msg: str = ""
+
+        # Phase C C-S6: when l0_rust_enabled=true, the 3 outer Rust trinity
+        # daemons (titan-outer-{body,mind,spirit}-rs) own the canonical
+        # 5D / 15D / 45D extended tensors via /dev/shm slots. This collector
+        # becomes a SHIM that reads those slots instead of computing —
+        # preserves the return-shape contract for downstream callers (no
+        # caller migration required pre-C-S8 cleanup).
+        #
+        # When false (default): today's compute path runs unchanged
+        # byte-identical. Per SPEC §3.0 Running-Titans Safety Rule.
+        self._l0_rust_enabled: bool = bool(l0_rust_enabled)
+        self._titan_id = titan_id
+
+        # Lazy-built shm slot readers (built on first flag=true collect()).
+        # Per SPEC §18.1 stale-check: 3 × natural cadence per slot.
+        self._shm_readers: dict = {}
+        self._shm_reader_failure_count: int = 0
+        self._shm_stale_count: int = 0
 
     def collect(self, sources: dict) -> dict:
         """
@@ -105,6 +126,11 @@ class OuterTrinityCollector:
             {"outer_body": [5 floats], "outer_mind": [5 floats], "outer_spirit": [5 floats]}
         """
         self._collect_count += 1
+
+        # Phase C C-S6: shim path when Rust outer trinity daemons own the slots.
+        # Read /dev/shm/titan_<id>/outer_*_*d.bin instead of computing locally.
+        if self._l0_rust_enabled:
+            return self._collect_from_shm(sources)
 
         outer_body = self._collect_outer_body(sources)
         outer_mind = self._collect_outer_mind(sources)
@@ -161,6 +187,167 @@ class OuterTrinityCollector:
             result["outer_spirit_45d"] = [0.5] * 45
 
         return result
+
+    # ── Phase C C-S6: shm-shim read path ───────────────────────────
+
+    def _collect_from_shm(self, sources: dict) -> dict:
+        """
+        Phase C C-S6 shim path: read the 5D / 15D / 45D outer tensors
+        directly from the /dev/shm slots written by the Rust outer
+        trinity daemons (titan-outer-body-rs / -mind-rs / -spirit-rs).
+
+        Per SPEC §18.1 stale check (3 × natural cadence per slot):
+          - outer_body_5d  stale at  30s (3 × 10s)
+          - outer_mind_15d stale at  15s (3 ×  5s)
+          - outer_spirit_45d stale at 90s (3 × 30s)
+
+        On stale or read failure, fall back to last-known cached values
+        (in-process ``self._last_*``). On cold boot with no cache, fall
+        back to 0.5-padded neutral — same fallback semantics as today's
+        ``_collect_extended`` failure path (line 160-161).
+
+        The 5D ``outer_mind`` / ``outer_spirit`` legacy V4 base tensors
+        are NOT written by Rust daemons (only the 15D/45D extended
+        slots exist per SPEC §7.1). The shim returns last-known cached
+        5D values for backward compat with V4 callers; per the C-S8
+        cleanup roadmap, V4 callers will migrate to 15D/45D, after
+        which this 5D fallback is removed entirely.
+
+        Returns the same shape as the compute path:
+          {"outer_body":      [5 floats],   ← read from outer_body_5d.bin
+           "outer_mind":      [5 floats],   ← last-known cached (V4 legacy)
+           "outer_spirit":    [5 floats],   ← last-known cached (V4 legacy)
+           "outer_mind_15d":  [15 floats],  ← read from outer_mind_15d.bin
+           "outer_spirit_45d":[45 floats]}  ← read from outer_spirit_45d.bin
+        """
+        # Read the 3 Rust-owned slots. Each helper returns either the
+        # fresh slot values or last-known cached fallback.
+        outer_body_5d = self._read_outer_slot(
+            slot_name="outer_body_5d", dim=5,
+            stale_threshold_s=30.0,  # 3 × OUTER_BODY_TICK_BASE_S
+            last_known=self._last_outer_body,
+        )
+        outer_mind_15d = self._read_outer_slot(
+            slot_name="outer_mind_15d", dim=15,
+            stale_threshold_s=15.0,  # 3 × OUTER_MIND_TICK_BASE_S
+            last_known=self._last_outer_mind_15d,
+        )
+        outer_spirit_45d = self._read_outer_slot(
+            slot_name="outer_spirit_45d", dim=45,
+            stale_threshold_s=90.0,  # 3 × OUTER_SPIRIT_TICK_BASE_S
+            last_known=self._last_outer_spirit_45d,
+        )
+
+        # Cache freshly-read values for next-tick fallback + downstream
+        # introspection (get_last_tensors).
+        self._last_outer_body = outer_body_5d
+        self._last_outer_mind_15d = outer_mind_15d
+        self._last_outer_spirit_45d = outer_spirit_45d
+        self._last_collect_ts = time.time()
+
+        return {
+            "outer_body": outer_body_5d,
+            # V4 5D legacy: last-known cached (Rust daemons don't write these
+            # 5D base slots; per C-S8 cleanup, V4 callers migrate to 15D/45D).
+            "outer_mind": list(self._last_outer_mind),
+            "outer_spirit": list(self._last_outer_spirit),
+            "outer_mind_15d": outer_mind_15d,
+            "outer_spirit_45d": outer_spirit_45d,
+        }
+
+    def _read_outer_slot(
+        self, slot_name: str, dim: int,
+        stale_threshold_s: float, last_known: list[float],
+    ) -> list[float]:
+        """
+        SeqLock-protected raw read of one outer slot's 24B header +
+        N × float32 LE payload. On any failure (no slot, stale,
+        SeqLock retry exhaustion, schema mismatch, CRC mismatch),
+        return ``last_known`` copy.
+
+        Bypasses ``StateRegistryReader`` to avoid per-slot reader
+        caching (the daemons rewrite the slot file on every tick;
+        keeping a long-lived mmap handle is unnecessary at the shim's
+        ~1-3s callsite cadence) and to inspect ``wall_ns`` cleanly
+        without private-attr access.
+
+        WARN-throttled: first failure + every 100th. Counters
+        ``_shm_reader_failure_count`` and ``_shm_stale_count`` exposed
+        via get_last_tensors() for arch_map observability.
+        """
+        from titan_plugin.core.state_registry import (
+            HEADER_SIZE, HEADER_STRUCT, MAX_READ_RETRIES,
+            resolve_shm_root,
+        )
+        import struct
+        import zlib
+
+        payload_bytes_expected = dim * 4  # float32 LE = 4 bytes per dim
+        total_bytes = HEADER_SIZE + payload_bytes_expected
+
+        try:
+            shm_root = resolve_shm_root(self._titan_id)
+            slot_path = shm_root / f"{slot_name}.bin"
+            if not slot_path.exists():
+                # Cold boot: Rust daemon hasn't run yet. Last-known.
+                return list(last_known)
+
+            for _ in range(MAX_READ_RETRIES):
+                with open(slot_path, "rb") as f:
+                    raw = f.read(total_bytes)
+                if len(raw) < total_bytes:
+                    return list(last_known)  # truncated; retry next tick
+
+                seq, schema, wall_ns, payload_bytes, crc = struct.unpack(
+                    HEADER_STRUCT, raw[:HEADER_SIZE],
+                )
+                if seq & 1:
+                    continue  # writer active — retry
+                if schema != 1:
+                    self._shm_reader_failure_count += 1
+                    return list(last_known)
+                if payload_bytes != payload_bytes_expected:
+                    self._shm_reader_failure_count += 1
+                    return list(last_known)
+                expected_crc = zlib.crc32(raw[:20])
+                if crc != expected_crc:
+                    continue  # torn read — retry
+
+                # Stale check per SPEC §18.1
+                age_s = (time.time_ns() - wall_ns) / 1e9
+                if age_s > stale_threshold_s:
+                    self._shm_stale_count += 1
+                    if (self._shm_stale_count == 1
+                            or self._shm_stale_count % 100 == 0):
+                        logger.warning(
+                            "[OuterTrinity shim] slot %s stale "
+                            "(age=%.1fs > %.1fs threshold; "
+                            "stale_count=%d) — using last-known",
+                            slot_name, age_s, stale_threshold_s,
+                            self._shm_stale_count,
+                        )
+                    return list(last_known)
+
+                # Parse payload as N × float32 LE
+                values = list(struct.unpack(
+                    f"<{dim}f", raw[HEADER_SIZE:HEADER_SIZE + payload_bytes],
+                ))
+                return values
+
+            # Retries exhausted (writer in progress for too long, or
+            # repeated CRC mismatches). Use last-known.
+            return list(last_known)
+
+        except Exception as exc:
+            self._shm_reader_failure_count += 1
+            if (self._shm_reader_failure_count == 1
+                    or self._shm_reader_failure_count % 100 == 0):
+                logger.warning(
+                    "[OuterTrinity shim] slot %s read failed "
+                    "(failure_count=%d): %s — using last-known",
+                    slot_name, self._shm_reader_failure_count, exc,
+                )
+            return list(last_known)
 
     def _collect_outer_body(self, sources: dict) -> list[float]:
         """Outer Body 5DT — V6 body-felt semantics (rFP_phase1_sensory_wiring).

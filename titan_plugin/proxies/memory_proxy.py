@@ -108,6 +108,60 @@ class MemoryProxy:
             return reply.get("payload", {}).get("memories", [])
         return []
 
+    def get_top_memories_for_observatory(self, n: int = 200) -> list:
+        """Get top N persistent memories with embeddings stripped — bus-safe shape.
+
+        rFP_bus_payload_contracts §3.1 (2026-05-01): /status/memory endpoint
+        path. Worker handler `top_memories_observatory` returns lightweight
+        items (id, prompt, response, weight, intensity, reinforcements,
+        created_at) — no embeddings, no embedding_id, no raw vectors. This
+        replaces the broken cache path where MEMORY_TOP_UPDATED carried
+        bulk data that failed msgpack UTF-8 decode at broker boundary.
+
+        Tight 10s timeout: endpoint UX expects <10s. With 6250+ persistent
+        memories the decay+sort loop on the worker takes ~3-5s + bus contention.
+        If memory worker is mid-meditation, return [] and log; endpoint still
+        serves status counts gracefully.
+        """
+        self._ensure_started()
+        reply = self._bus.request(
+            "memory_proxy", "memory",
+            {"action": "top_memories_observatory", "n": n},
+            timeout=10.0,
+            reply_queue=self._reply_queue,
+        )
+        if reply:
+            payload = reply.get("payload", {})
+            mems = payload.get("memories", [])
+            logger.info(
+                "[MemoryProxy] get_top_memories_for_observatory: reply received "
+                "with %d memories (count=%s, error=%s)",
+                len(mems) if isinstance(mems, list) else 0,
+                payload.get("count"),
+                payload.get("error", "none"),
+            )
+            return mems
+        logger.warning(
+            "[MemoryProxy] get_top_memories_for_observatory: NO REPLY (timeout 10s)")
+        return []
+
+    def fetch_mempool_for_observatory(self) -> list:
+        """Get mempool with embeddings stripped — bus-safe shape.
+
+        rFP_bus_payload_contracts §3.1 sibling of get_top_memories_for_observatory.
+        Tight 3s timeout (mempool is small + always recent).
+        """
+        self._ensure_started()
+        reply = self._bus.request(
+            "memory_proxy", "memory",
+            {"action": "fetch_mempool_observatory"},
+            timeout=3.0,
+            reply_queue=self._reply_queue,
+        )
+        if reply:
+            return reply.get("payload", {}).get("mempool", [])
+        return []
+
     def get_memory_status(self) -> dict:
         """Get memory subsystem status (cognee_ready, counts)."""
         self._ensure_started()

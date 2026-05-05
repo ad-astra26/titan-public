@@ -1,6 +1,6 @@
 {
   "_comment": "Cross-language parity vectors for Phase C Rust ↔ Python byte-identical guarantee. Per SPEC §7.4 + §8.10 + §11.6. Loaded by both pytest (titan_plugin tests) and cargo test (titan-rust crates). DO NOT EDIT manually after a vector ships — bump spec_version + parity vector set together.",
-  "spec_version": "0.1.0",
+  "spec_version": "0.1.4",
   "frame": {
     "_comment": "HMAC-SHA256 vectors for the connection-handshake response. Per SPEC §8 + B.2 + RFC 4231. Used by titan-core::frame::compute_hmac AND titan_plugin/core/_frame.compute_hmac — must produce byte-identical output.",
     "rfc4231": [
@@ -108,9 +108,138 @@
     }
   },
   "adoption_payload": {
-    "_comment": "B.2.1 supervision-transfer: ADOPTION_REQUEST locked at 79-byte msgpack vector per SPEC §8.4 + §8.10. Full impl in C-S3 (orchestrator) — vector reserved here for future cargo test once payload writer lands.",
-    "field_schema": "{rid: uuid, name: str, pid: int, start_method: 'spawn'|'fork', boot_ts: float}",
-    "expected_total_bytes": 79,
-    "vector_to_be_added_in_c_s3": "deferred"
+    "_comment": "B.2.1 supervision-transfer ADOPTION_REQUEST + ADOPTION_ACK byte-locked vectors per SPEC §8.4 + §8.4.1 (LOCKED in v0.1.5 — earlier 79-byte target was an unvalidated estimate; canonical Python ground truth at worker_swap_handler.py:206-216 produces 60 bytes for the request payload). Loaded by both Python pytest (tests/parity/test_adoption_payload.py) and cargo test (titan-trinity-daemon::adoption::tests).",
+    "schema_correction_v0_1_5": "Earlier SPEC §8.4 row claimed payload includes rid (5 fields). Python ground truth puts rid in the bus envelope (top-level msg dict, set by bus.make_msg(rid=...)), NOT inside the payload. Payload itself has 4 fields. SPEC §8.4 row + §8.4.1 corrected in v0.1.5; Decision Log D-SPEC-31 entry.",
+    "canonical_v1": {
+      "request": {
+        "input": {
+          "name": "inner-body",
+          "pid": 12345,
+          "start_method": "spawn",
+          "boot_ts": 1730000000.5
+        },
+        "msgpack_bytes": 60,
+        "msgpack_hex": "84a46e616d65aa696e6e65722d626f6479a3706964cd3039ac73746172745f6d6574686f64a5737061776ea7626f6f745f7473cb41d9c76d20200000",
+        "encoder_options": "msgpack.packb(payload, use_bin_type=False) — Python; rmpv::encode::write_value with insertion-order Vec<(Value, Value)> — Rust",
+        "field_order": ["name", "pid", "start_method", "boot_ts"]
+      },
+      "ack_accepted": {
+        "input": {
+          "rid": "00000000-0000-0000-0000-000000000000",
+          "accepted": true,
+          "reason": null
+        },
+        "msgpack_bytes": 61,
+        "msgpack_hex": "83a3726964d92430303030303030302d303030302d303030302d303030302d303030303030303030303030a86163636570746564c3a6726561736f6ec0",
+        "field_order": ["rid", "accepted", "reason"],
+        "encoder_options_clarification": "msgpack default use_bin_type=True (Python ≥ 1.0 default; matches Rust rmpv default). 36-char UUID encodes as str8 marker `d9` + 1-byte length, NOT the older str16 `da` + 2-byte length used by use_bin_type=False legacy mode. Verified against Python wire output 2026-04-30."
+      }
+    }
+  },
+  "outer_body_5d": {
+    "_comment": "C-S6 outer-body parity vectors. Each vector: input msgpack source dict (sensor_cache_outer_body payload) + topology[0:10] outer_lower bytes + UNIFIED_SPIRIT_FILTER_DOWN.outer_body[5] multipliers + OUTER_SPIRIT_FILTER_DOWN.outer_body[5] multipliers -> expected outer_body_5d.bin payload bytes (5 x float32 LE = 20). Logic-source: titan_plugin/logic/outer_trinity.py:_collect_outer_body. Populated in C6-3 by tests/parity/gen_outer_body_vectors.py.",
+    "vectors_target_count": 20,
+    "logic_source": "titan_plugin/logic/outer_trinity.py:_collect_outer_body",
+    "vectors": []
+  },
+  "outer_mind_15d": {
+    "_comment": "C-S6 outer-mind parity vectors. Same shape as outer_body_5d but 15 dims; ground_up applies to willing[10:15] ONLY per G10. Logic-source: titan_plugin/logic/outer_mind_tensor.py:collect_outer_mind_15d + outer_trinity._collect_outer_mind. Populated in C6-4.",
+    "vectors_target_count": 20,
+    "logic_source": "titan_plugin/logic/outer_mind_tensor.py:collect_outer_mind_15d",
+    "vectors": []
+  },
+  "outer_spirit_45d": {
+    "_comment": "C-S6 outer-spirit parity vectors. Inputs: outer_body_5d slot bytes + outer_mind_15d slot bytes (Observer Principle reads) + sensor_cache_outer_spirit msgpack pre-aggregated outer-state. Output: outer_spirit_45d.bin payload (45 x float32 LE = 180; SAT[0:15]+CHIT[15:30]+ANANDA[30:45]; Material aspects). Observer dims [0:5] present in slot but masked at filter_down emit per G8. Logic-source: titan_plugin/logic/outer_spirit_tensor.py:collect_outer_spirit_45d. Populated in C6-5.",
+    "vectors_target_count": 30,
+    "logic_source": "titan_plugin/logic/outer_spirit_tensor.py:collect_outer_spirit_45d",
+    "vectors": []
+  },
+  "outer_spirit_filter_down_msg": {
+    "_comment": "C-S6 OUTER_SPIRIT_FILTER_DOWN msgpack payload parity vectors. Input: outer_spirit_45d slot bytes (the full 45D). Output: msgpack-encoded {multipliers: {outer_body[5], outer_mind[15], outer_spirit_content[40]}, ts}. Asserts outer_spirit_content is exactly outer_spirit_45d[5:45] byte-identical (length 40, observer dims [0:5] EXCLUDED per G8 + §10.F step 3). Populated in C6-5.",
+    "vectors_target_count": 10,
+    "logic_source": "titan_plugin/logic/filter_down.py:478-482 + outer_spirit_tensor.py observer-mask doctrine",
+    "vectors": []
+  },
+  "fastbus_layout": {
+    "_comment": "Lock-free SPSC ring header byte layout per SPEC §7.1 fastbus.bin (v0.1.4) + PLAN_microkernel_phase_c_s3_substrate.md §9. Loaded by titan-fastbus tests (Rust) AND optional Python attach-as-validator (C-S3 chunk C3-7 e2e).",
+    "magic_bytes_ascii": "TITANFB1",
+    "magic_bytes_hex": "5449 5441 4e46 4231",
+    "ring_version": 1,
+    "ring_capacity_slots": 1024,
+    "slot_bytes": 256,
+    "ring_header_total_bytes": 64,
+    "slot_array_total_bytes": 262144,
+    "universal_seqlock_header_bytes": 24,
+    "file_total_bytes": 262232,
+    "field_offsets_within_ring_header_v0_1_4": {
+      "magic": [0, 8],
+      "read_idx": [8, 16],
+      "write_idx": [16, 24],
+      "version": [24, 28],
+      "mask": [28, 32],
+      "reserved": [32, 64]
+    },
+    "_offsets_comment": "v0.1.4 reordered AtomicU64 fields (read_idx, write_idx) to 8-byte aligned offsets. Same 64-byte total + same field set as v0.1.3, just reordered for portable lock-free atomics."
+  },
+  "schumann_periods_ns": {
+    "_comment": "Schumann frequency periods in nanoseconds per Preamble G13 LOCKED (NOT tunable). Loaded by titan-schumann tests (Rust) — verifies generator computes period_ns = 1e9 / hz to integer truncation. Tolerance ±1ns for IEEE 754 round-trip.",
+    "body_7_83_hz_ns": 127713921,
+    "mind_23_49_hz_ns": 42571307,
+    "spirit_70_47_hz_ns": 14190435,
+    "tolerance_ns": 1,
+    "_relations_comment": "spirit_period × 9 ≈ body_period (relative phase ratio ≈ 1.000003); mind_period × 3 ≈ body_period (≈ 0.99996). All 3 generators share a common epoch_t0; phase synchrony preserved within ~1µs over short windows."
+  },
+  "ground_up_nudge": {
+    "_comment": "Byte-identical port verification for ground_up.py compute_nudge (lines 51-101) per Preamble G5 + G10. Reference values computed by Python ground_up.py with these inputs. Loaded by both pytest (Python self-verify) AND titan-trinity-rs::ground_up tests. Tolerance abs=1e-6 for f32 IEEE 754 + Python round(_, 6) on total_magnitude.",
+    "max_nudge": 0.05,
+    "default_strength": 0.1,
+    "default_damping": 0.95,
+    "cases": [
+      {
+        "name": "zero_signal",
+        "_comment": "Zero grounding signal → zero nudge everywhere",
+        "input": {
+          "grounding_signal_10d": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+          "prev_nudge_body": [0.0, 0.0, 0.0, 0.0, 0.0],
+          "prev_nudge_mind": [0.0, 0.0, 0.0, 0.0, 0.0],
+          "damping": 0.95
+        },
+        "expected": {
+          "body_nudge": [0.0, 0.0, 0.0, 0.0, 0.0],
+          "mind_nudge": [0.0, 0.0, 0.0, 0.0, 0.0],
+          "total_magnitude": 0.0
+        }
+      },
+      {
+        "name": "saturated_signal",
+        "_comment": "Signal=1.0 + prev=0.0 + damping=0.95 → damped = 0.05*1.0 = 0.05 (within ±0.05 clamp). total_mag = sqrt(10 × 0.0025) = 0.158113883...",
+        "input": {
+          "grounding_signal_10d": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+          "prev_nudge_body": [0.0, 0.0, 0.0, 0.0, 0.0],
+          "prev_nudge_mind": [0.0, 0.0, 0.0, 0.0, 0.0],
+          "damping": 0.95
+        },
+        "expected": {
+          "body_nudge": [0.05, 0.05, 0.05, 0.05, 0.05],
+          "mind_nudge": [0.05, 0.05, 0.05, 0.05, 0.05],
+          "total_magnitude": 0.158114
+        }
+      },
+      {
+        "name": "with_prev_damping_clamps_to_max",
+        "_comment": "prev=0.04, signal=0.5, damping=0.95: damped = 0.95×0.04 + 0.05×0.5 = 0.038+0.025 = 0.063 → CLAMPED to 0.05. total_mag = sqrt(10 × 0.0025) = 0.158113883...",
+        "input": {
+          "grounding_signal_10d": [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+          "prev_nudge_body": [0.04, 0.04, 0.04, 0.04, 0.04],
+          "prev_nudge_mind": [0.04, 0.04, 0.04, 0.04, 0.04],
+          "damping": 0.95
+        },
+        "expected": {
+          "body_nudge": [0.05, 0.05, 0.05, 0.05, 0.05],
+          "mind_nudge": [0.05, 0.05, 0.05, 0.05, 0.05],
+          "total_magnitude": 0.158114
+        }
+      }
+    ]
   }
 }

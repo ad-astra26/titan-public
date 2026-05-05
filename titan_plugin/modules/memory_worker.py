@@ -154,16 +154,29 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                            exc_info=True)
             top_items = []
         try:
+            now = time.time()
+            # rFP_bus_payload_contracts §3.1 — bus events are NOTIFICATIONS,
+            # bulk data via memory_proxy RPC. Pre-rFP: MEMORY_TOP_UPDATED
+            # carried 250 items × ~8KB embeddings = 2.1 MB, broker rejected
+            # with utf-8 decode error → cache empty → memory tab broken on
+            # T2/T3. Post-rFP: events are <8 KB; api endpoints fetch bulk
+            # via RPC on demand.
             _send_msg(send_queue, bus.MEMORY_STATUS_UPDATED, name, "all", {
                 "persistent_count": pcount,
                 "mempool_size": len(mempool_items),
                 "cognee_ready": True,
                 "memory_backend_ready": True,
+                "updated_at": now,
             })
-            _send_msg(send_queue, bus.MEMORY_MEMPOOL_UPDATED, name, "all",
-                      {"items": mempool_items, "count": len(mempool_items)})
-            _send_msg(send_queue, bus.MEMORY_TOP_UPDATED, name, "all",
-                      {"items": top_items, "count": len(top_items)})
+            _send_msg(send_queue, bus.MEMORY_MEMPOOL_UPDATED, name, "all", {
+                "updated_at": now,
+                "count": len(mempool_items),
+            })
+            _send_msg(send_queue, bus.MEMORY_TOP_UPDATED, name, "all", {
+                "updated_at": now,
+                "count": len(top_items),
+                "last_id": str(top_items[0].get("id", "")) if top_items else None,
+            })
         except Exception as _pub_err:
             logger.warning(
                 "[MemoryWorker] memory.status publish failed: %s", _pub_err)
@@ -194,83 +207,57 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         return clusters
 
     def _publish_memory_topology() -> None:
-        """Periodic publish — populates memory.topology + memory.knowledge_graph.
-        Called every TOPOLOGY_PUBLISH_INTERVAL_S (heavier than status because
-        of Kuzu queries). rFP_observatory_data_loading_v1 Phase 4."""
-        # Topology: topic-cluster heatmap from top memories
+        """Periodic publish — emits NOTIFICATION events for topology + knowledge
+        graph state changes. Bulk data fetched on demand via memory_proxy RPC.
+
+        rFP_bus_payload_contracts §3.1 (2026-05-01): bus events are light
+        notifications + summary metrics; bulk data (per-cluster sample texts,
+        Kuzu node/edge dumps) goes through RPC, not the bus. Pre-rFP these
+        carried bulk payloads — `MEMORY_KNOWLEDGE_GRAPH_UPDATED` could
+        approach msgpack 2 MB limit on dense graphs.
+        """
+        # Topology event — cluster counts only
         try:
             top_items = memory.get_top_memories(n=200) or []
             clusters = _classify_topology(top_items)
-            kg_stats: dict = {}
-            try:
-                if getattr(memory, "_graph", None) is not None:
-                    kg_stats = memory._graph.get_stats() or {}
-            except Exception:
-                kg_stats = {}
+            cluster_counts = {
+                name: int(data.get("count", 0))
+                for name, data in clusters.items()
+            }
             _send_msg(send_queue, bus.MEMORY_TOPOLOGY_UPDATED, name, "all", {
-                "by_topic_cluster": clusters,
-                "by_entity_type": kg_stats,
-                "total_classified": sum(c["count"] for c in clusters.values()),
+                "updated_at": time.time(),
+                "total_classified": sum(cluster_counts.values()),
+                "cluster_counts": cluster_counts,
             })
         except Exception as _topo_err:
             logger.warning(
                 "[MemoryWorker] memory.topology publish failed: %s", _topo_err)
-        # Knowledge graph: entity counts + sample edges from Kuzu
+
+        # Knowledge graph event — node/edge counts + entity-type histogram
         try:
-            kg_payload: dict = {"available": False, "nodes": [], "edges": [],
-                                 "stats": {}}
             graph = getattr(memory, "_graph", None)
+            node_count = 0
+            edge_count = 0
+            entity_types: dict[str, int] = {}
             if graph is not None:
-                stats = graph.get_stats() or {}
-                kg_payload["stats"] = stats
-                # Sample up to 50 nodes per entity type for force-directed viz
-                node_tables = ["Person", "Topic", "BodyEntity", "MindEntity",
-                               "SpiritEntity", "Media"]
-                nodes: list[dict] = []
-                for table in node_tables:
-                    try:
-                        df = graph._conn.execute(
-                            f"MATCH (e:{table}) RETURN e.name LIMIT 50"
-                        ).get_as_df()
-                        for _, row in df.iterrows():
-                            nodes.append({
-                                "id": f"{table}:{row.iloc[0]}",
-                                "label": str(row.iloc[0]),
-                                "type": table,
-                            })
-                    except Exception:
-                        continue
-                # Sample up to 100 edges for visualization
-                edges: list[dict] = []
-                edge_quota = 100
-                for src_t in node_tables:
-                    if edge_quota <= 0:
-                        break
-                    for dst_t in node_tables:
-                        if edge_quota <= 0:
-                            break
-                        rel = f"REL_{src_t}_{dst_t}"
-                        try:
-                            df = graph._conn.execute(
-                                f"MATCH (a:{src_t})-[r:{rel}]->(b:{dst_t}) "
-                                f"RETURN a.name, r.rel_type, b.name LIMIT 20"
-                            ).get_as_df()
-                            for _, row in df.iterrows():
-                                if edge_quota <= 0:
-                                    break
-                                edges.append({
-                                    "source": f"{src_t}:{row.iloc[0]}",
-                                    "type": str(row.iloc[1]) if row.iloc[1] else "rel",
-                                    "target": f"{dst_t}:{row.iloc[2]}",
-                                })
-                                edge_quota -= 1
-                        except Exception:
-                            continue
-                kg_payload["nodes"] = nodes
-                kg_payload["edges"] = edges
-                kg_payload["available"] = True
-            _send_msg(send_queue, bus.MEMORY_KNOWLEDGE_GRAPH_UPDATED, name, "all",
-                      kg_payload)
+                try:
+                    stats = graph.get_stats() or {}
+                    # stats may have shape: {"node_count": N, "edge_count": N,
+                    # "by_entity_type": {...}} or similar — defensive lookup.
+                    node_count = int(stats.get("node_count", 0) or 0)
+                    edge_count = int(stats.get("edge_count", 0) or 0)
+                    bt = stats.get("by_entity_type") or stats.get("entity_types") or {}
+                    if isinstance(bt, dict):
+                        entity_types = {str(k): int(v) for k, v in bt.items()
+                                        if isinstance(v, (int, float))}
+                except Exception:
+                    pass
+            _send_msg(send_queue, bus.MEMORY_KNOWLEDGE_GRAPH_UPDATED, name, "all", {
+                "updated_at": time.time(),
+                "node_count": node_count,
+                "edge_count": edge_count,
+                "entity_types": entity_types,
+            })
         except Exception as _kg_err:
             logger.warning(
                 "[MemoryWorker] memory.knowledge_graph publish failed: %s",
@@ -285,25 +272,58 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         save_state_cb=_b1_save_state,
     )
 
+    # 2026-05-01 (rFP_bus_payload_contracts §3.1) — periodic publishes run
+    # in a SEPARATE THREAD so the main recv loop stays responsive to RPC
+    # queries. Pre-fix: publishes ran inline in the recv loop, blocking
+    # recv_queue.get for several seconds during topology classification
+    # (200 items × keyword match + graph stats). RPC requests piled up +
+    # timed out (worker eventually processed them but caller already gave
+    # up). Mirrors spirit_loop's snapshot-builder thread pattern.
+    import threading
+
+    _periodic_stop = threading.Event()
+
+    def _periodic_publish_loop():
+        last_status = 0.0
+        last_topology = 0.0
+        while not _periodic_stop.is_set():
+            try:
+                now = time.time()
+                if now - last_status > STATUS_PUBLISH_INTERVAL_S:
+                    _publish_memory_status()
+                    last_status = now
+                if now - last_topology > TOPOLOGY_PUBLISH_INTERVAL_S:
+                    _publish_memory_topology()
+                    last_topology = now
+            except Exception as _per_err:
+                logger.warning(
+                    "[MemoryWorker] periodic publish thread error: %s",
+                    _per_err)
+            # Sleep ~1s but wake early if stop event set (clean shutdown).
+            _periodic_stop.wait(1.0)
+
+    _periodic_thread = threading.Thread(
+        target=_periodic_publish_loop,
+        daemon=True,
+        name="memory-periodic-publish",
+    )
+    _periodic_thread.start()
+
     while True:
+        # Heartbeat stays on main loop (cheap; needs to fire even during
+        # recv_queue idle). Bulk periodic publishes happen in dedicated
+        # thread above so RPC response latency stays bounded.
+        now = time.time()
+        if now - last_heartbeat > 10.0:
+            _send_heartbeat(send_queue, name)
+            last_heartbeat = now
+
         try:
-            msg = recv_queue.get(timeout=5.0)
+            msg = recv_queue.get(timeout=1.0)
         except Empty:
-            # Send heartbeat every 10s
-            if time.time() - last_heartbeat > 10.0:
-                _send_heartbeat(send_queue, name)
-                last_heartbeat = time.time()
-            # Periodic memory.status publish (5s cadence) — keeps api cache warm.
-            if time.time() - last_status_publish > STATUS_PUBLISH_INTERVAL_S:
-                _publish_memory_status()
-                last_status_publish = time.time()
-            # Periodic memory.topology + memory.knowledge_graph (30s cadence;
-            # heavier Kuzu queries). rFP_observatory_data_loading_v1 Phase 4.
-            if time.time() - last_topology_publish > TOPOLOGY_PUBLISH_INTERVAL_S:
-                _publish_memory_topology()
-                last_topology_publish = time.time()
             continue
         except (KeyboardInterrupt, SystemExit):
+            _periodic_stop.set()
             break
 
         msg_type = msg.get("type", "")
@@ -417,6 +437,100 @@ def _handle_query(msg: dict, memory, send_queue, name: str, loop, config: dict =
             n = payload.get("n", 5)
             top = memory.get_top_memories(n=n)
             _send_response(send_queue, name, src, {"memories": top}, rid)
+
+        elif action == "top_memories_observatory":
+            # rFP_bus_payload_contracts §3.1 — observatory-safe shape:
+            # strip embeddings, embedding_ids, and any binary-typed fields
+            # so the response round-trips cleanly through msgpack.
+            #
+            # Internal-injection filter applied here (NOT at endpoint), matching
+            # pre-rFP _publish_memory_status logic at memory_worker.py:147-151:
+            #   fetch_n = max(persistent_count + 100, 1000)
+            #   raw_top = memory.get_top_memories(n=fetch_n)
+            #   filtered = [m for m in raw_top if not is_internal_injection(...)]
+            #   return filtered[:n_requested]
+            # Without this, top-by-weight is dominated by [SELF_PROFILE_INJECTION]
+            # rows (weight ~10) and the endpoint's defense-in-depth filter strips
+            # all 200 → empty list. Original pcount-aware fetch matters because
+            # injection memories accumulate over days (each dream cycle adds one).
+            try:
+                import re as _re
+                _INJECTION_RE = _re.compile(r"^\[[A-Z_]+_INJECTION\]")
+
+                def _is_injection(prompt: str) -> bool:
+                    return bool(prompt) and _INJECTION_RE.match(prompt) is not None
+
+                n = int(payload.get("n", 200))
+                _t0 = time.time()
+                # Fetch enough rows that n user-facing memories survive the
+                # injection filter even when injections dominate the top.
+                pcount = memory.get_persistent_count()
+                fetch_n = max(pcount + 100, n * 10, 1000)
+                raw_top = memory.get_top_memories(n=fetch_n) or []
+                _t1 = time.time()
+                # Filter internal injections + cap at n
+                filtered = [
+                    m for m in raw_top
+                    if isinstance(m, dict)
+                    and not _is_injection(m.get("user_prompt", ""))
+                ][:n]
+                _t2 = time.time()
+                observatory_items = []
+                for m in filtered:
+                    # Whitelist: only fields the dashboard endpoint actually
+                    # consumes. Embeddings + raw vectors + internal counters
+                    # explicitly excluded.
+                    observatory_items.append({
+                        "id": str(m.get("id", "")),
+                        "user_prompt": str(m.get("user_prompt", "")),
+                        "agent_response": str(m.get("agent_response", "")),
+                        "effective_weight": float(m.get("effective_weight", 1.0) or 1.0),
+                        "emotional_intensity": int(m.get("emotional_intensity", 0) or 0),
+                        "reinforcement_count": int(m.get("reinforcement_count", 0) or 0),
+                        "created_at": float(m.get("created_at", 0) or 0),
+                    })
+                logger.info(
+                    "[MemoryWorker] top_memories_observatory: fetched %d in %.0fms, "
+                    "filtered_injections→%d in %.0fms, stripped→%d in %.0fms "
+                    "(n_request=%d, fetch_n=%d, pcount=%d)",
+                    len(raw_top), (_t1 - _t0) * 1000,
+                    len(filtered), (_t2 - _t1) * 1000,
+                    len(observatory_items), (time.time() - _t2) * 1000,
+                    n, fetch_n, pcount)
+                _send_response(send_queue, name, src,
+                               {"memories": observatory_items,
+                                "count": len(observatory_items)}, rid)
+            except Exception as e:
+                logger.warning(
+                    "[MemoryWorker] top_memories_observatory failed: %s", e,
+                    exc_info=True)
+                _send_response(send_queue, name, src,
+                               {"memories": [], "count": 0,
+                                "error": str(e)}, rid)
+
+        elif action == "fetch_mempool_observatory":
+            # rFP_bus_payload_contracts §3.1 — observatory-safe shape for
+            # the mempool list (same stripping rationale as top_memories).
+            full = loop.run_until_complete(memory.fetch_mempool()) or []
+            for node in full:
+                if isinstance(node, dict):
+                    memory._apply_mempool_decay(node)
+            observatory_items = []
+            for m in full:
+                if not isinstance(m, dict):
+                    continue
+                observatory_items.append({
+                    "id": str(m.get("id", "")),
+                    "user_prompt": str(m.get("user_prompt", "")),
+                    "agent_response": str(m.get("agent_response", "")),
+                    "mempool_weight": float(m.get("mempool_weight", 1.0) or 1.0),
+                    "mempool_reinforcements": int(
+                        m.get("mempool_reinforcements", 0) or 0),
+                    "created_at": float(m.get("created_at", 0) or 0),
+                })
+            _send_response(send_queue, name, src,
+                           {"mempool": observatory_items,
+                            "count": len(observatory_items)}, rid)
 
         elif action == "status":
             _send_response(send_queue, name, src, {

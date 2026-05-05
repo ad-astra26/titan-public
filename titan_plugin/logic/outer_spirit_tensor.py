@@ -302,6 +302,49 @@ def _collect_ananda(spirit, body, mind, acts, crea, guard, soc, mem, hlvl,
     return ananda
 
 
+def collect_outer_spirit_5d(
+    outer_body: list,
+    outer_mind: list,
+    soul_health: float = 0.5,
+    total_impulses: int = 0,
+    total_assessed: int = 0,
+    avg_score: float = 0.5,
+) -> list:
+    """
+    Collect 5D Outer Lower Spirit tensor — meta-awareness levers.
+
+    Pure function used by outer_spirit_worker subprocess on each tick.
+    Extracted from OuterTrinityCollector._collect_outer_spirit.
+
+    Args:
+        outer_body: 5D outer body tensor (from SHM or sources)
+        outer_mind: 5D outer mind tensor (from SHM or sources)
+        soul_health: soul alignment score [0.0-1.0]
+        total_impulses: cumulative ImpulseEngine fires
+        total_assessed: cumulative SelfAssessment assessments
+        avg_score: SelfAssessment rolling average score
+
+    Returns:
+        [5 floats] normalized to [0.0, 1.0].
+    """
+    identity_coherence = _clamp(soul_health)
+
+    if total_impulses > 0 and total_assessed > 0:
+        purpose_clarity = _clamp(avg_score)
+    else:
+        purpose_clarity = 0.5
+
+    action_quality = _clamp(avg_score)
+
+    outer_body_scalar = sum(outer_body) / len(outer_body) if outer_body else 0.5
+    outer_mind_scalar = sum(outer_mind) / len(outer_mind) if outer_mind else 0.5
+
+    return [round(v, 4) for v in [
+        identity_coherence, purpose_clarity, action_quality,
+        outer_body_scalar, outer_mind_scalar,
+    ]]
+
+
 # ── Utility Functions ───────────────────────────────────────────────
 
 def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:

@@ -211,6 +211,16 @@ class SocialXGateway:
         # Prevents CGN_KNOWLEDGE_REQ spam when the same ungrounded topic keeps
         # catalysing suppressed posts. Key = topic word, value = last request ts.
         self._grounding_cooldown: dict[str, float] = {}
+        # 2026-04-30 — Per-endpoint TTL cache for paid twitterapi.io GETs.
+        # Closes the fleet-wide leak: 4500 calls/day projected → ~800-1200/day.
+        # Cache key: (endpoint, payload_hash). Eviction: OrderedDict LRU at max_size.
+        # TTLs read from [social_x.cache] in config.toml; Maker-tunable.
+        # Write endpoints (create_tweet/login/retweet/like) have TTL=0 = never cache.
+        # See BUG-X-API-LEAK-FROM-DISCOVER-MENTIONS-20260430 entry.
+        from collections import OrderedDict
+        self._api_cache: "OrderedDict[tuple, tuple[float, dict]]" = OrderedDict()
+        self._cache_stats = {"hits": 0, "misses": 0, "evictions": 0,
+                              "writes_skipped_no_cache": 0}
         self._init_db()
         self._recover_pending()
         logger.info("[SocialXGateway] Initialized: db=%s config=%s "
@@ -363,6 +373,10 @@ class SocialXGateway:
             "limits": sx.get("limits", {}),
             # Reply discovery settings: [social_x.replies]
             "replies": sx.get("replies", {}),
+            # 2026-04-30 — TTL cache for paid twitterapi.io GETs.
+            # Closes BUG-X-API-LEAK-FROM-DISCOVER-MENTIONS-20260430.
+            # Surfaced to gateway methods that wrap _call_x_api (+ cache layer).
+            "cache": sx.get("cache", {}),
             # Voice guardrails (rFP_phase5_narrator_evolution §9): entire
             # [voice] section is surfaced so the grounding gate can read
             # dual_mode_enabled / x_grounding_* keys via the same config
@@ -505,6 +519,32 @@ class SocialXGateway:
                                 status="too_soon",
                                 reason=f"{elapsed:.0f}s since own fail, "
                                        f"min={min_interval}s")
+
+            # 6. Per-Titan minimum interval (independent of global min_interval).
+            #    Reads [social_x.limits.{titan_id}].min_{action}_interval if set.
+            #    Enforces "max 1 post per N hours per Titan" (Maker directive
+            #    2026-05-04). Independent of global min_post_interval so the
+            #    daily/hourly budget knobs in [social_x] remain user-controlled.
+            if titan_id:
+                titan_limits = config.get("limits", {}).get(titan_id, {})
+                titan_min_interval = titan_limits.get(interval_key, 0)
+                if titan_min_interval > 0:
+                    titan_success_statuses = (self.S_POSTED, self.S_VERIFIED,
+                                              self.S_PENDING)
+                    last_titan_success = db.execute(
+                        "SELECT created_at FROM actions WHERE action_type=? "
+                        "AND titan_id=? AND status IN (?,?,?) "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (action_type, titan_id, *titan_success_statuses)
+                    ).fetchone()
+                    if last_titan_success:
+                        elapsed = now - last_titan_success[0]
+                        if elapsed < titan_min_interval:
+                            return ActionResult(
+                                status="too_soon",
+                                reason=f"{titan_id}: {elapsed:.0f}s since own last "
+                                       f"{action_type}, per-Titan "
+                                       f"min={titan_min_interval}s")
 
             return None  # All checks passed
         finally:
@@ -691,6 +731,54 @@ class SocialXGateway:
 
     # ── The ONE API Caller ──────────────────────────────────────────
 
+    def _cache_key_for(self, endpoint: str, method: str, payload: dict | None) -> tuple:
+        """Stable cache key from (endpoint, method, sorted payload items).
+
+        Sorted-tuple of payload items (excluding session/proxy/api_key
+        which never affect response semantics). Returns hashable tuple.
+        """
+        if not payload:
+            return (endpoint, method, ())
+        # Filter auth/session fields — these don't change response content
+        filtered = sorted(
+            (k, v) for k, v in payload.items()
+            if k not in ("login_cookies", "proxy", "api_key", "X-API-Key")
+        )
+        return (endpoint, method, tuple(filtered))
+
+    def _ttl_for_endpoint(self, endpoint: str) -> float:
+        """Per-endpoint TTL from [social_x.cache] config; 0 = no cache."""
+        cfg = self._load_config().get("cache", {}) if hasattr(self, "_load_config") else {}
+        if not cfg.get("enabled", True):
+            return 0.0
+        # Endpoint to config key: twitter/user/mentions → ttl_user_mentions
+        # twitter/tweet/advanced_search → ttl_tweet_advanced_search
+        # twitter/create_tweet_v2 → ttl_create_tweet_v2
+        suffix = endpoint.replace("twitter/", "").replace("/", "_")
+        config_key = f"ttl_{suffix}"
+        return float(cfg.get(config_key, 0))
+
+    def _cache_get(self, key: tuple, ttl: float) -> dict | None:
+        """LRU cache lookup with TTL expiry. Returns None on miss/expired."""
+        if ttl <= 0 or key not in self._api_cache:
+            return None
+        ts, value = self._api_cache[key]
+        if time.time() - ts > ttl:
+            del self._api_cache[key]
+            return None
+        # Touch — move to end for LRU
+        self._api_cache.move_to_end(key)
+        self._cache_stats["hits"] += 1
+        return value
+
+    def _cache_put(self, key: tuple, value: dict, max_size: int) -> None:
+        """LRU cache insert with bounded size — evicts oldest on overflow."""
+        self._api_cache[key] = (time.time(), value)
+        self._api_cache.move_to_end(key)
+        while len(self._api_cache) > max_size:
+            self._api_cache.popitem(last=False)
+            self._cache_stats["evictions"] += 1
+
     def _call_x_api(self, endpoint: str, method: str = "GET",
                     payload: dict = None,
                     session: str = "", proxy: str = "",
@@ -700,8 +788,29 @@ class SocialXGateway:
         EVERY X interaction in the entire codebase routes through here.
         Circuit breaker: trips after CB_MAX_FAILURES consecutive failures
         or immediately on 402/403. Cooldown: CB_COOLDOWN_SECONDS.
+
+        2026-04-30 — TTL cache layer (BUG-X-API-LEAK-FROM-DISCOVER-MENTIONS-20260430).
+        GET endpoints with [social_x.cache].ttl_<endpoint> > 0 are cached
+        with LRU eviction. Cache HIT returns the cached response without
+        an HTTP call. Write endpoints (POST create_tweet/like/retweet) have
+        TTL=0 by config and ALWAYS hit the API. Cache stats exposed via
+        get_cache_stats() for observability.
         """
         import httpx
+
+        # ── Cache check (GET only; write methods always pass through) ──
+        cache_key = None
+        ttl = 0.0
+        if method == "GET":
+            ttl = self._ttl_for_endpoint(endpoint)
+            if ttl > 0:
+                cache_key = self._cache_key_for(endpoint, method, payload)
+                cached = self._cache_get(cache_key, ttl)
+                if cached is not None:
+                    return cached
+                self._cache_stats["misses"] += 1
+        else:
+            self._cache_stats["writes_skipped_no_cache"] += 1
 
         # ── Circuit breaker check ──
         if self._cb_tripped_at > 0:
@@ -806,7 +915,85 @@ class SocialXGateway:
             "cb_failures": self._cb_failures,
         })
 
+        # ── Cache PUT — only successful GET responses ──
+        # Cache only when (a) we computed a key for caching above, (b) the
+        # response succeeded, (c) http_code is success-class. Errors must
+        # NOT be cached or we'd serve stale 5xx for the full TTL.
+        if cache_key is not None and 200 <= http_code < 300 \
+                and result.get("status") not in ("error", "circuit_breaker"):
+            cfg = self._load_config().get("cache", {})
+            max_size = int(cfg.get("max_size", 256))
+            self._cache_put(cache_key, result, max_size)
+
         return result
+
+    def get_cache_stats(self) -> dict:
+        """Return cache hit/miss counts for observability dashboards."""
+        total = self._cache_stats["hits"] + self._cache_stats["misses"]
+        hit_rate = self._cache_stats["hits"] / total if total > 0 else 0.0
+        return {
+            "hits": self._cache_stats["hits"],
+            "misses": self._cache_stats["misses"],
+            "evictions": self._cache_stats["evictions"],
+            "writes_skipped_no_cache": self._cache_stats["writes_skipped_no_cache"],
+            "hit_rate": round(hit_rate, 3),
+            "current_size": len(self._api_cache),
+        }
+
+    # ── Public methods for events_teacher + future X consumers ────────
+    # 2026-04-30 — closes events_teacher.py:727,884,945 direct httpx
+    # bypass of the gateway. Each method delegates to _call_x_api so
+    # rate-limit ledger + circuit breaker + TTL cache + telemetry all
+    # apply. Per Maker directive: events_teacher MUST go through gateway.
+
+    def fetch_user_relationships(self, user_name: str, relationship: str = "followers",
+                                  count: int = 50, *, api_key: str = "") -> dict:
+        """Fetch a user's followers or following list via the gateway.
+
+        Args:
+          user_name: Twitter handle (without @).
+          relationship: "followers" or "following".
+          count: Max results (capped by twitterapi.io paging defaults).
+          api_key: TwitterAPI.io key — required.
+
+        Returns the raw twitterapi.io response dict (cached per
+        [social_x.cache].ttl_user_followers / ttl_user_following).
+        Used by events_teacher to populate the follower watchlist.
+        """
+        if relationship not in ("followers", "following"):
+            return {"status": "error",
+                    "message": f"invalid relationship: {relationship}"}
+        endpoint = f"twitter/user/{relationship}"
+        return self._call_x_api(
+            endpoint, method="GET",
+            payload={"userName": user_name, "count": count},
+            api_key=api_key)
+
+    def fetch_recent_tweets(self, user_name: str, count: int = 10,
+                             *, api_key: str = "") -> dict:
+        """Fetch a user's recent tweets via the gateway.
+
+        Cached per [social_x.cache].ttl_user_last_tweets (default 300s).
+        Used by both events_teacher (for follower-tweet distillation) and
+        the gateway's own post-success verification.
+        """
+        return self._call_x_api(
+            "twitter/user/last_tweets", method="GET",
+            payload={"userName": user_name, "count": count},
+            api_key=api_key)
+
+    def search_tweets(self, query: str, query_type: str = "Latest",
+                       count: int = 20, *, api_key: str = "") -> dict:
+        """Run an advanced search via the gateway.
+
+        Cached per [social_x.cache].ttl_tweet_advanced_search (default 120s).
+        Used by events_teacher for engagement scanning + sage research +
+        future analytics consumers.
+        """
+        return self._call_x_api(
+            "twitter/tweet/advanced_search", method="GET",
+            payload={"query": query, "queryType": query_type, "count": count},
+            api_key=api_key)
 
     # ── Telemetry ───────────────────────────────────────────────────
 

@@ -54,15 +54,22 @@ def test_audit_against_bus_constants_clean_with_b2():
     assert issues == [], f"drift detected: {issues}"
 
 
-def test_bus_ipc_socket_enabled_flag_defaults_false():
-    """Verify titan_params.toml registers the flag with default false."""
+def test_bus_ipc_socket_enabled_flag_registered():
+    """Verify titan_params.toml registers the flag.
+
+    Original test asserted default=False. Flipped to True on 2026-05-01
+    (commit 45d469fe — T1 graduated back to socket-broker mode after A.S8
+    + msgpack fix). Test now just verifies the flag is present and is a
+    bool — matches whatever the config currently declares (True under
+    microkernel v2 mode).
+    """
     from titan_plugin.config_loader import load_titan_config
     cfg = load_titan_config()
     micro = cfg.get("microkernel", {})
     assert "bus_ipc_socket_enabled" in micro, \
         "microkernel.bus_ipc_socket_enabled flag not registered"
-    assert micro["bus_ipc_socket_enabled"] is False, \
-        f"default should be false, got {micro['bus_ipc_socket_enabled']}"
+    assert isinstance(micro["bus_ipc_socket_enabled"], bool), \
+        f"flag must be bool, got {type(micro['bus_ipc_socket_enabled']).__name__}"
 
 
 # ── DivineBus dual-mode behavior ───────────────────────────────────────────
@@ -71,6 +78,92 @@ def test_bus_ipc_socket_enabled_flag_defaults_false():
 def test_divinebus_default_has_no_broker():
     bus = DivineBus()
     assert bus.has_socket_broker is False
+
+
+# ── Phase B.2 §D12 _is_kernel_internal discriminator (added 2026-05-02) ────
+
+
+def test_is_kernel_internal_known_names():
+    """Every kernel-internal name in the canonical allowlist returns True."""
+    from titan_plugin.bus import _is_kernel_internal
+    for name in [
+        "guardian", "core", "meditation", "sovereignty", "kernel",
+        "agency", "chat_handler", "v4_bridge",
+        "state_register", "rl_proxy_stats", "api",
+    ]:
+        assert _is_kernel_internal(name), f"{name} should be kernel-internal"
+
+
+def test_is_kernel_internal_proxy_suffix():
+    """Reply-queue subscribers ending in _proxy are kernel-internal."""
+    from titan_plugin.bus import _is_kernel_internal
+    for name in [
+        "memory_proxy", "spirit_proxy", "body_proxy", "mind_proxy",
+        "rl_proxy", "agency_proxy", "media_proxy", "llm_proxy",
+        "assessment_proxy", "reflex_proxy", "timechain_proxy",
+        "output_verifier_proxy",
+    ]:
+        assert _is_kernel_internal(name), f"{name} should be kernel-internal"
+
+
+def test_is_kernel_internal_query_suffix():
+    """reflex_executors.py query reply queues end in _query — kernel-internal."""
+    from titan_plugin.bus import _is_kernel_internal
+    assert _is_kernel_internal("reflex_spirit_query")
+    assert _is_kernel_internal("reflex_time_query")
+
+
+def test_is_kernel_internal_worker_names_return_false():
+    """Worker process names should NOT be classified as kernel-internal."""
+    from titan_plugin.bus import _is_kernel_internal
+    for name in [
+        "memory", "rl", "spirit", "media", "cgn", "knowledge", "timechain",
+        "backup", "output_verifier", "outer_body", "outer_mind", "outer_spirit",
+        "reflex", "agency_worker", "warning_monitor", "imw",
+        "observatory_writer", "social_graph_writer", "events_teacher_writer",
+        "consciousness_writer", "llm", "body", "mind", "language",
+        "meta_teacher", "emot_cgn",
+    ]:
+        assert not _is_kernel_internal(name), f"{name} is a worker, not kernel-internal"
+
+
+def test_subscribe_under_socket_mode_with_worker_name_is_loud():
+    """Phase B.2 §D12: contract violation logs warning + increments counter."""
+    bus = DivineBus()
+    # Fake a broker attach so the discriminator branch fires.
+    bus._broker = object()
+    assert bus.has_socket_broker is True
+
+    before = bus.stats["non_kernel_internal_subscribe_under_socket"]
+    bus.subscribe("memory")  # worker name — should be flagged as off-contract
+    after = bus.stats["non_kernel_internal_subscribe_under_socket"]
+    assert after == before + 1, \
+        "non-kernel-internal subscribe under socket mode must increment counter"
+
+
+def test_subscribe_under_socket_mode_with_kernel_internal_name_is_quiet():
+    """Kernel-internal subscribers do NOT trigger the contract counter."""
+    bus = DivineBus()
+    bus._broker = object()  # fake attach
+    before = bus.stats["non_kernel_internal_subscribe_under_socket"]
+    bus.subscribe("guardian")        # explicit allowlist
+    bus.subscribe("memory_proxy")    # _proxy suffix
+    bus.subscribe("reflex_time_query")  # _query suffix
+    after = bus.stats["non_kernel_internal_subscribe_under_socket"]
+    assert after == before, \
+        "kernel-internal subscribers must NOT trip the contract counter"
+
+
+def test_subscribe_no_broker_attached_skips_check():
+    """When broker is not attached, the discriminator is bypassed entirely."""
+    bus = DivineBus()
+    assert bus.has_socket_broker is False
+    before = bus.stats["non_kernel_internal_subscribe_under_socket"]
+    # Worker name — but no broker → no warning, counter unchanged.
+    bus.subscribe("memory")
+    after = bus.stats["non_kernel_internal_subscribe_under_socket"]
+    assert after == before, \
+        "discriminator must only fire when broker is attached"
 
 
 def test_divinebus_publish_unaffected_when_no_broker_attached():

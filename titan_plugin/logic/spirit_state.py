@@ -96,16 +96,19 @@ class SpiritState:
         "list is not allowed for map key" malformed-frame errors caught
         by Fix B's hex-dump diagnostic on 2026-04-28.
         """
-        return {
+        # Sanitize the whole snapshot defensively — subsystem dicts evolve
+        # over time and any new tuple/int-keyed sub-dict would otherwise
+        # silently break msgpack strict_map_key=True on the broker.
+        return _sanitize_dict_keys({
             "full_30dt": list(self.full_30dt),
-            "observables": _sanitize_dict_keys(dict(self.observables)),
-            "topology": _sanitize_dict_keys(dict(self.topology)),
+            "observables": dict(self.observables),
+            "topology": dict(self.topology),
             "enrichment_quality": self.enrichment_quality,
             "micro_tick_count": self.micro_tick_count,
             "middle_path_loss": self.middle_path_loss,
             "mean_coherence": round(self.mean_coherence, 6),
             "assembly_count": self._assembly_count,
-        }
+        })
 
 
 def _sanitize_dict_keys(obj):

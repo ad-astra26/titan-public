@@ -626,6 +626,23 @@ NEUROMOD_STATE = RegistrySpec(
     feature_flag="microkernel.shm_neuromod_enabled",
 )
 
+# 11-hormone state — Python L2 owned, written by hormonal_worker (NEW in
+# C-S5 per master plan §10 D22 + SPEC v0.1.4 §7.1).
+# Sibling-symmetric with titanvm_registers (same byte count, same NS_PROGRAMS
+# row order). Layout: shape=(11, 4) — 11 hormones (axis 0) × 4 fields
+# (axis 1: 0=level, 1=threshold, 2=refractory, 3=peak_level).
+# Hormone canonical order matches NS_PROGRAMS in
+# titan_plugin/logic/emot_bundle_protocol.py:164-168:
+#   inner: REFLEX, FOCUS, INTUITION, IMPULSE, METABOLISM
+#   outer: CREATIVITY, CURIOSITY, EMPATHY, REFLECTION, INSPIRATION, VIGILANCE
+# Natural cadence: consciousness epoch (10-31s, matches neuromod cadence).
+HORMONAL_STATE = RegistrySpec(
+    name="hormonal_state",
+    dtype=np.dtype("<f4"),
+    shape=(11, 4),
+    feature_flag="microkernel.shm_hormonal_enabled",
+)
+
 # Consciousness epoch counter — L1 owned, monotonic uint64.
 # Written by spirit_worker per epoch; readers use this as a cheap
 # "has anything changed" signal.
@@ -839,4 +856,66 @@ INNER_MIND_15D = RegistrySpec(
     dtype=np.dtype("<f4"),
     shape=(15,),
     feature_flag="microkernel.shm_mind_fast_enabled",
+)
+
+
+# ── Phase A.S8 outer trinity slots (2026-04-30) ──────────────────────
+#
+# 3 outer trinity subprocess workers own these slots (mirror of inner
+# trinity 5D/15D/45D shape + Schumann clock cadence × 13 outer scaling).
+# No feature_flag — always-enabled (mirrors inner worker convention).
+#
+# Schumann symmetry (outer = inner × 13 environmental-tempo scaling):
+#   - Outer Body:   5D × 7.83 Hz  (Schumann ×1, publish 45s)
+#   - Outer Mind:  15D × 23.49 Hz (Schumann ×3, publish 15s)
+#   - Outer Spirit: 45D × 70.47 Hz (Schumann ×9, publish  5s)
+#
+# Body-slowest invariant G13 preserved: outer_body is slowest,
+# outer_spirit is fastest — exact mirror of inner trinity order.
+
+# 5D outer body tensor — L1 owned, written by outer_body_worker subprocess
+# at 7.83 Hz. Layout mirrors inner_body_5d V6 body-felt semantics:
+#   [0] interoception   (SOL balance + block_delta + anchor_fresh)
+#   [1] proprioception  (peer_entropy + helper_health + bus_module_diversity)
+#   [2] somatosensation (TX latency + creation_nudge + CPU spike rate)
+#   [3] entropy         (ping_variance + bus_drop_rate + error_rate)
+#   [4] thermal         (CPU thermal + circadian + LLM latency EMA)
+OUTER_BODY_5D = RegistrySpec(
+    name="outer_body_5d",
+    dtype=np.dtype("<f4"),
+    shape=(5,),
+)
+
+# 15D outer mind tensor — L1 owned, written by outer_mind_worker subprocess
+# at 23.49 Hz. Extends the 5D outer mind with Thinking/Feeling/Willing layers.
+#   [0:5]   Thinking 5D — creative/research/social cognition
+#   [5:10]  Feeling 5D  — emotional valence of outer expression
+#   [10:15] Willing 5D  — volitional/intentional outer layer
+OUTER_MIND_15D = RegistrySpec(
+    name="outer_mind_15d",
+    dtype=np.dtype("<f4"),
+    shape=(15,),
+)
+
+# 45D outer spirit tensor — L1 owned, written by outer_spirit_worker
+# subprocess at 70.47 Hz (Schumann ×9). Extends the 5D outer spirit
+# with SAT/CHIT/ANANDA layers (mirror of inner_spirit_45d).
+#   [0:15]  SAT    (identity / sovereignty — 15D)
+#   [15:30] CHIT   (purpose / action quality — 15D)
+#   [30:45] ANANDA (resonance / bliss — 15D)
+OUTER_SPIRIT_45D = RegistrySpec(
+    name="outer_spirit_45d",
+    dtype=np.dtype("<f4"),
+    shape=(45,),
+)
+
+# 30D topology slot — kernel-side writer, mirrors state_register.observables_30d.
+# Written by kernel._start_topology_shm_writer() at 0.5s poll, content-hash
+# gated. Provides a fast SHM-readable snapshot of the 30D topology state
+# for Rust C-S* daemons and any future SHM-reading subscriber.
+#   Layout: 30 float32 values matching StateRegister.get_full_30d_topology()
+TOPOLOGY_30D = RegistrySpec(
+    name="topology_30d",
+    dtype=np.dtype("<f4"),
+    shape=(30,),
 )

@@ -205,6 +205,40 @@ BANNER
             tail -40 /tmp/precommit_phase_c.log >&2
             exit 1
         fi
+        # G17 ownership scanner — closes DEFERRED CRATE-OWNERSHIP-PRECOMMIT-INTEGRATION
+        # per C-S6 chunk C6-12. Verifies each architectural concept lives in
+        # EXACTLY ONE crate per master plan §7 + SPEC Preamble G17. Soaked
+        # through C-S6 (no false positives surfaced) before mandatory activation.
+        if ! "$REPO_ROOT/test_env/bin/python" "$REPO_ROOT/scripts/arch_map.py" \
+                phase-c crate-ownership --strict > /tmp/precommit_phase_c_ownership.log 2>&1; then
+            cat >&2 <<BANNER
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  ⛔  phase-c crate-ownership --strict failed (G17 violation).        │
+│                                                                      │
+│  An architectural concept is defined in MULTIPLE crates — duplicate  │
+│  ownership violates SPEC Preamble G17 + master plan §7. The sibling  │
+│  byte-layout / wiring scanners CANNOT catch this; it's exactly the   │
+│  C-S5 SchumannTicker duplication incident that motivated this gate.  │
+│                                                                      │
+│  See full output:                                                    │
+│      cat /tmp/precommit_phase_c_ownership.log                        │
+│                                                                      │
+│  Re-run manually:                                                    │
+│      python scripts/arch_map.py phase-c crate-ownership              │
+│                                                                      │
+│  Fix: move the duplicate into the canonical crate listed in          │
+│  scripts/arch_map.py::_ARCH_OWNERSHIP_REGISTRY, or update the        │
+│  registry IF the concept genuinely moved (rare — needs SPEC bump).   │
+│                                                                      │
+│  Bypass (only after Maker greenlight):                               │
+│      git commit --no-verify                                          │
+└──────────────────────────────────────────────────────────────────────┘
+
+BANNER
+            tail -40 /tmp/precommit_phase_c_ownership.log >&2
+            exit 1
+        fi
     fi
 fi
 

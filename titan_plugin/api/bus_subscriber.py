@@ -155,6 +155,15 @@ class BusSubscriber:
         elsewhere — e.g. OBSERVATORY_EVENT for websocket bridge).
 
         Called from the api_subprocess _bus_listener_loop.
+
+        rFP §4 Chunk 5 — RECEIVE-time bus contract validation. Fail-safe:
+        on schema mismatch, log WARN + drop the message (return True so it's
+        marked "consumed" and not re-dispatched). Cache stays clean rather
+        than corrupted by an unschematized or drift-shape payload.
+
+        Producer-side validation (in `_packb_safe`) is fail-loud at SEND;
+        this side is fail-safe at RECEIVE. Both sides need it because
+        receivers can't trust producers in a microkernel architecture.
         """
         if not isinstance(msg, dict):
             return False
@@ -162,6 +171,27 @@ class BusSubscriber:
         if msg_type not in self._handlers:
             return False
         payload = msg.get("payload", {})
+
+        # Layer 1 — contract validation (best-effort import; allow legacy
+        # un-contracted messages through unchanged for migration window).
+        try:
+            from titan_plugin.api.bus_contracts import get_contract
+            contract = get_contract(msg_type)
+        except Exception:  # noqa: BLE001
+            contract = None
+        if contract is not None:
+            try:
+                # Validate + use the parsed (and coerced) payload downstream
+                # so any field-level coercion (e.g. None → default) is honored.
+                validated = contract.schema.model_validate(payload)
+                payload = validated.model_dump()
+            except Exception as schema_err:  # noqa: BLE001
+                logger.warning(
+                    "[BusSubscriber] %s payload schema mismatch — DROPPING "
+                    "(producer=%s, err=%s)",
+                    msg_type, contract.producer_module, schema_err)
+                return True  # consumed — better to drop than corrupt cache
+
         try:
             self._handlers[msg_type](payload)
         except Exception as e:

@@ -72,8 +72,35 @@ logger = logging.getLogger(__name__)
 DEFAULT_RING_CAPACITY = 1024
 DEFAULT_P0_RESERVE = 64
 PING_INTERVAL_S = 5.0
-PING_TIMEOUT_S = 15.0           # 3 missed pings → close
+PING_TIMEOUT_S = 15.0           # 3 missed pings → escalate to PID check (NOT instant purge anymore)
 ACCEPT_RATE_LIMIT_PER_S = 50
+
+# Microkernel v2 Phase B.2 §D9 (2026-05-02) — smart-liveness tunables.
+# See `BUG-BUS-PING-PONG-TIGHT-TIMEOUT-VS-HEAVY-WORKER-INIT-20260502`
+# for full context. Replaces the tight 15s purge that killed heavy-init
+# workers (rl=19.7s, cgn=31s, memory=52s, backup=184s) during their boot
+# phase.
+#
+# Algorithm (in _ping_loop):
+#   Tier 1: silent_for ≤ PING_TIMEOUT_S          → alive, send ping
+#   Tier 2: PID dead (os.kill(pid, 0) raised)    → purge instant + publish
+#                                                  BUS_PEER_DIED so Guardian
+#                                                  restarts (faster than
+#                                                  Guardian's 1Hz polling)
+#   Tier 3: anon AND silent > ANON_GRACE_S       → purge "anon_subscribe_timeout"
+#                                                  (60s ceiling on a code-path
+#                                                  duration; never user work)
+#   Tier 4: named, silent, PID alive             → KEEP (busy worker; trust
+#                                                  Guardian's CPU-grew check
+#                                                  to detect deadlock)
+ANON_SUBSCRIBE_GRACE_S = 120.0  # tier-3 ceiling — bound on _send_subscribe_frame latency.
+                                # Bumped 60s→120s 2026-05-02 after Stage 1 fixed the
+                                # fork-at-locked-mp.Queue bug — `llm` was the lone
+                                # remaining stuck worker (anon-purged at 60s); 120s
+                                # absorbs boot-time GIL variance for any heavy worker
+                                # whose connection_loop thread contended for scheduling.
+                                # Still bounded (kills truly-stuck connections), still
+                                # well-tested at unit level, no user-controlled work.
 
 
 # ── Msgpack default-encoder for non-native payload types ──────────────────
@@ -160,14 +187,116 @@ def _pack_default(obj):
     return repr(obj)
 
 
-def _packb_safe(msg) -> bytes:
-    """msgpack.packb wrapper using _pack_default.
+def _coerce_keys_to_str(obj):
+    """Recursively coerce all dict keys to strings.
 
-    All bus_socket producer sites should call this rather than
-    msgpack.packb directly. Defense-in-depth against malformed-frame
-    cascades (BUG-BUS-IPC-SPIRIT-MALFORMED-FRAME-20260428).
+    msgpack with `strict_map_key=True` (the broker-side default) rejects
+    int/tuple/list/frozenset keys at unpack time even though packb accepts
+    them. Per-publisher sanitization is brittle — every worker that
+    constructs a dict with a non-str key (subsystem.get_stats() returning
+    {(a,b): v}, np.int64 keys, etc.) silently produces malformed frames.
+
+    Sanitizing at the broker boundary closes the whole class of bugs at
+    once: every frame that crosses the Unix socket has guaranteed-str
+    keys. Mirrors the convention used by spirit_state._sanitize_dict_keys
+    (tuple → "a:b" / "a:b:c", others → str(k)).
+
+    Closes BUG-BUS-IPC-SPIRIT-MALFORMED-FRAME-20260428 (third+ occurrence)
+    at the architectural level instead of per-publisher.
     """
-    return msgpack.packb(msg, default=_pack_default)
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if isinstance(k, str):
+                out[k] = _coerce_keys_to_str(v)
+            elif isinstance(k, tuple):
+                if len(k) == 2:
+                    out[f"{k[0]}:{k[1]}"] = _coerce_keys_to_str(v)
+                else:
+                    out[":".join(str(p) for p in k)] = _coerce_keys_to_str(v)
+            else:
+                out[str(k)] = _coerce_keys_to_str(v)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_coerce_keys_to_str(x) for x in obj]
+    return obj
+
+
+class BusContractViolation(Exception):
+    """Raised when a bus message fails its declared contract at SEND time.
+
+    Per `rFP_bus_payload_contracts.md` (2026-05-01): SEND-time validation
+    fail-loud — log ERROR + don't pack. Bug surfaces immediately at the
+    producer instead of producing a malformed frame somewhere down the line.
+    """
+
+
+def _packb_safe(msg) -> bytes:
+    """msgpack.packb wrapper — broker-boundary safety pass.
+
+    Layered defenses:
+      1. **Bus contract validation** (rFP §4 Chunk 4) — when msg["type"] has
+         a contract in `bus_contracts.REGISTRY`, validate payload against
+         the declared Pydantic schema + check size against max_payload_bytes.
+         Fail-loud on violation — log ERROR + raise BusContractViolation.
+         Producer caller MUST handle (see _raw_send / broker fanout — they
+         catch + drop the frame so bus stays alive).
+      2. `_coerce_keys_to_str` recursively rewrites every dict key as str
+         so strict_map_key=True consumers always unpack cleanly.
+      3. `default=_pack_default` handles non-standard VALUES (numpy,
+         torch, dataclass, Path, datetime, repr fallback).
+
+    All bus_socket producer sites must call this (workers via
+    BusSocketClient, broker fanout, drift bridge). Per-publisher
+    sanitization remains as belt-and-suspenders defense-in-depth.
+    """
+    # Layer 1 — contract validation (best-effort import to avoid hard
+    # dependency cycle in environments where api package may not be loaded
+    # — e.g., minimal kernel boot before plugin attaches).
+    msg_type = msg.get("type", "") if isinstance(msg, dict) else ""
+    if msg_type:
+        try:
+            from titan_plugin.api.bus_contracts import get_contract
+            contract = get_contract(msg_type)
+        except Exception:  # noqa: BLE001
+            contract = None
+        if contract is not None:
+            payload = msg.get("payload", {}) if isinstance(msg, dict) else {}
+            try:
+                contract.schema.model_validate(payload)
+            except Exception as schema_err:  # noqa: BLE001 — pydantic ValidationError or anything else
+                logger.error(
+                    "[BusContract] %s payload schema violation — DROPPING frame "
+                    "(producer=%s, error=%s)",
+                    msg_type, contract.producer_module, schema_err)
+                raise BusContractViolation(
+                    f"{msg_type} payload schema violation: {schema_err}"
+                ) from schema_err
+
+    # Layer 2+3 — pack with key coercion + value defaults
+    packed = msgpack.packb(_coerce_keys_to_str(msg), default=_pack_default)
+
+    # Layer 1 (size check) — runs after pack so we measure actual wire size.
+    # Done after pack rather than estimated before so we catch packed-form
+    # bloat (e.g., float-list expansion). Cheap because we already have bytes.
+    if msg_type:
+        try:
+            from titan_plugin.api.bus_contracts import get_contract
+            contract = get_contract(msg_type)
+        except Exception:  # noqa: BLE001
+            contract = None
+        if contract is not None and len(packed) > contract.max_payload_bytes:
+            logger.error(
+                "[BusContract] %s payload exceeds max_payload_bytes — "
+                "DROPPING frame (size=%d, limit=%d, producer=%s). "
+                "Bulk data belongs in SHM or RPC, not the bus.",
+                msg_type, len(packed), contract.max_payload_bytes,
+                contract.producer_module)
+            raise BusContractViolation(
+                f"{msg_type} payload {len(packed)}B exceeds limit "
+                f"{contract.max_payload_bytes}B"
+            )
+    return packed
 SEND_BATCH_THRESHOLD = 5        # batch this many or more msgs into one frame
 SEND_FLUSH_TIMEOUT_S = 0.05     # wait at most this long for batching to fill
 SLOW_CONSUMER_WARN_INTERVAL_S = 60.0
@@ -271,6 +400,7 @@ class BrokerSubscriber:
     coalesce_index: dict[tuple, dict] = field(default_factory=dict)
     subscribed_topics: set[str] = field(default_factory=set)  # bus.publish dst targets
     last_pong_ts: float = field(default_factory=time.time)
+    last_recv_ts: float = field(default_factory=time.time)  # any frame, not just PONG
     drop_count_60s: int = 0
     recv_count_60s: int = 0
     last_warning_ts: float = 0.0
@@ -280,6 +410,12 @@ class BrokerSubscriber:
     closed: bool = False
     recv_thread: Optional[threading.Thread] = None
     send_thread: Optional[threading.Thread] = None
+    # Microkernel v2 Phase B.2 §D9 (2026-05-02) — peer process identity from
+    # SO_PEERCRED at accept time. Enables tier-2 PID liveness check in
+    # _ping_loop without coupling to Guardian (broker uses OS as oracle).
+    # None on platforms without SO_PEERCRED (degrades to time-based heuristic).
+    peer_pid: Optional[int] = None
+    accept_ts: float = field(default_factory=time.time)  # for anon-grace bound
 
 
 # ── BusSocketServer ─────────────────────────────────────────────────────────
@@ -318,6 +454,14 @@ class BusSocketServer:
         # subsequently purged within 10s, log a TRANSIENT_HANDOFF_DROP
         # warning so we can correlate worker drops with the swap protocol.
         self._last_handoff_publish_ts: float = 0.0
+
+        # Phase B.2 §D9 (2026-05-02) — broker stats counters. Split by cause
+        # so arch_map can distinguish "worker process actually died" from
+        # "soft pong timeout (rare under smart-liveness)". Initial values 0.
+        self._stats: dict[str, int] = {
+            "peer_dead_purges_total": 0,
+            "pong_timeout_purges_total": 0,
+        }
 
         self._server_sock: Optional[socket.socket] = None
         self._subscribers: dict[str, BrokerSubscriber] = {}  # name → sub
@@ -441,8 +585,22 @@ class BusSocketServer:
                 pass
             return
 
+        # Phase B.2 §D9 (2026-05-02) — capture peer PID via SO_PEERCRED for
+        # smart-liveness tier-2 PID-alive check. Linux-only; degrades to None
+        # on platforms without SO_PEERCRED (algo falls back to time-based).
+        peer_pid: Optional[int] = None
+        try:
+            import struct
+            # struct ucred = {pid_t pid; uid_t uid; gid_t gid;} = 12 bytes (iII)
+            cred = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+            peer_pid, _peer_uid, _peer_gid = struct.unpack("iII", cred)
+        except (OSError, AttributeError):
+            # SO_PEERCRED missing (non-Linux) or socket already closed
+            peer_pid = None
+
         sub = BrokerSubscriber(name=addr, conn=conn, addr=addr,
-                               ring=BoundedRing(self._ring_capacity, self._p0_reserve))
+                               ring=BoundedRing(self._ring_capacity, self._p0_reserve),
+                               peer_pid=peer_pid)
         # Send + recv threads
         sub.send_thread = threading.Thread(
             target=self._send_loop, args=(sub,),
@@ -493,6 +651,10 @@ class BusSocketServer:
                                    "(got type=%s, repr=%.200r)",
                                    sub.name, type(msg).__name__, msg)
                     break
+                # Phase B.2 §D9 (2026-05-02) — track any-frame recency for
+                # tier-1 of smart-liveness. PONG timestamps update via
+                # _handle_inbound; this captures the broader signal.
+                sub.last_recv_ts = time.time()
                 self._handle_inbound(sub, msg)
         finally:
             self._purge_subscriber(sub, log_reason="recv_loop_end")
@@ -560,15 +722,38 @@ class BusSocketServer:
         "KERNEL_EPOCH_TICK": "EPOCH_TICK",
     }
 
+    # 2026-04-30 — High-rate broadcast types that flood unmigrated subscribers
+    # (legacy "subscribe-all" mode = empty subscribed_topics). These types fire
+    # at rates that overwhelm subscriber queues if delivered without explicit
+    # opt-in. Workers that genuinely need them MUST set ModuleSpec.broadcast_topics
+    # to include the relevant types (per-worker filter).
+    #
+    # Stopgap until rFP_bus_broadcast_filter_migration ships per-worker filters
+    # for all 17 spawn_graduated workers. See BUGS.md
+    # BUG-BUS-PER-WORKER-BROADCAST-FILTER-MIGRATION-INCOMPLETE-20260430.
+    _HIGH_RATE_BROADCAST_TYPES = frozenset({
+        bus.SPHERE_PULSE,         # 6 clocks × ~12 Hz Schumann pulses
+        bus.PI_HEARTBEAT_UPDATED, # ~10 Hz π-heartbeat
+        bus.BIG_PULSE,            # frequent state aggregation
+        bus.SPIRIT_STATE,         # fires every Schumann × 9 = 70.47 Hz
+        bus.TOPOLOGY_STATE_UPDATED, # frequent topology snapshots
+    })
+
     def publish(self, msg: dict, *, _from_subscriber: Optional[BrokerSubscriber] = None) -> None:
         """Route a message to every matching subscriber.
 
         Routing rules (mirror existing DivineBus):
           - If msg["dst"] == "all" or empty: deliver to every subscriber that
-            either subscribed_topics is empty (legacy "subscribe-all") or has
-            msg["type"] in subscribed_topics
-          - Otherwise: deliver to the subscriber whose name == msg["dst"]
-            (if any). Optional msg["type"] check still applies for safety.
+            either (a) explicitly subscribed to msg["type"] via subscribed_topics,
+            or (b) has empty subscribed_topics (legacy "subscribe-all" mode) AND
+            msg["type"] is NOT in _HIGH_RATE_BROADCAST_TYPES. High-rate types
+            require explicit opt-in to prevent queue saturation on unmigrated
+            workers — see 2026-04-30 fleet-wide flood incident
+            (BUG-BUS-PER-WORKER-BROADCAST-FILTER-MIGRATION-INCOMPLETE-20260430).
+          - Otherwise (targeted): deliver to the subscriber whose name == msg["dst"]
+            (if any). subscribed_topics filter does NOT apply to targeted
+            messages — those are intentional name-based routing (RESPONSE,
+            SAVE_NOW, MODULE_SHUTDOWN, etc.).
 
         Phase C C-S2 (per SPEC §3 D13/D14/D15 + PLAN §12.7): drift-bridge
         dual-emit. After fanout to the original `msg["type"]`, if the type
@@ -581,13 +766,28 @@ class BusSocketServer:
         if msg.get("type") == bus.BUS_HANDOFF:
             self._last_handoff_publish_ts = time.time()
         dst = msg.get("dst") or "all"
+        msg_type = msg.get("type", "")
         with self._subs_lock:
             subs = list(self._subscribers.values())
         for sub in subs:
             if sub is _from_subscriber:
                 continue  # don't echo to publisher
-            if dst != "all" and sub.name != dst:
-                continue
+            if dst != "all":
+                # Targeted: name-based routing, skip subscribed_topics filter
+                if sub.name != dst:
+                    continue
+            else:
+                # Broadcast: apply subscribed_topics filter
+                if sub.subscribed_topics:
+                    # Worker has explicit topic list — opt-in only
+                    if msg_type not in sub.subscribed_topics:
+                        continue
+                else:
+                    # Legacy subscribe-all — block high-rate types to prevent
+                    # queue saturation. Workers wanting these MUST opt in via
+                    # ModuleSpec.broadcast_topics.
+                    if msg_type in self._HIGH_RATE_BROADCAST_TYPES:
+                        continue
             self._enqueue_to(sub, msg)
 
         # Phase C drift-bridge dual-emit. Only re-fans-out for the bridged
@@ -599,8 +799,17 @@ class BusSocketServer:
             for sub in subs:
                 if sub is _from_subscriber:
                     continue
-                if dst != "all" and sub.name != dst:
-                    continue
+                if dst != "all":
+                    if sub.name != dst:
+                        continue
+                else:
+                    # Same broadcast filter logic as primary fanout above.
+                    if sub.subscribed_topics:
+                        if bridged_type not in sub.subscribed_topics:
+                            continue
+                    else:
+                        if bridged_type in self._HIGH_RATE_BROADCAST_TYPES:
+                            continue
                 self._enqueue_to(sub, bridged)
 
     def _enqueue_to(self, sub: BrokerSubscriber, msg: dict) -> None:
@@ -692,7 +901,16 @@ class BusSocketServer:
                 if not batch:
                     continue
                 if len(batch) >= SEND_BATCH_THRESHOLD:
-                    payload = _packb_safe({"type": "BUS_BATCH", "msgs": batch})
+                    try:
+                        payload = _packb_safe({"type": "BUS_BATCH", "msgs": batch})
+                    except BusContractViolation as cv:
+                        # rFP §4 Chunk 4 — fail-loud at packer layer; drop the
+                        # whole batch defensively (producer side should have
+                        # caught earlier; broker is last line of defense).
+                        logger.error(
+                            "[bus_socket] BUS_BATCH contract violation — "
+                            "dropping batch for %s: %s", sub.name, cv)
+                        continue
                 else:
                     # Send each individually for low-load latency
                     for m in batch:
@@ -701,6 +919,16 @@ class BusSocketServer:
                         except (ConnectionError, OSError):
                             sub.closed = True
                             return
+                        except BusContractViolation as cv:
+                            # rFP §4 Chunk 4 — drop the offending frame, keep
+                            # the connection alive for other messages.
+                            logger.error(
+                                "[bus_socket] frame contract violation for "
+                                "%s — dropping (type=%s): %s",
+                                sub.name,
+                                m.get("type") if isinstance(m, dict) else "?",
+                                cv)
+                            continue
                     continue
                 try:
                     send_frame(sub.conn, payload)
@@ -714,7 +942,36 @@ class BusSocketServer:
 
     # ── Ping loop ─────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _pid_alive(pid: Optional[int]) -> bool:
+        """Tier-2 PID liveness check — uses OS as oracle.
+
+        Returns True if pid is alive, False otherwise. None pid → True
+        (degrades to time-based check; safer to assume alive than to
+        falsely declare dead). Mirrors Guardian._pid_alive — same pattern,
+        same syscall.
+        """
+        if pid is None:
+            return True
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+
     def _ping_loop(self) -> None:
+        """Phase B.2 §D9 — smart-liveness tier 1-4.
+
+        See ANON_SUBSCRIBE_GRACE_S comment block for the full design.
+        Replaces the original 15s-or-die purge that killed heavy-init
+        workers (rl=19.7s, cgn=31s, memory=52s, backup=184s) during boot.
+        Now the broker:
+          - kills DEAD processes instantly (PID check, no waiting)
+          - keeps BUSY processes alive (Guardian's CPU-grew check owns
+            deadlock detection)
+          - enforces a 60s ceiling on anonymous (pre-BUS_SUBSCRIBE)
+            connections — that's a code-path duration, not user work.
+        """
         while not self._stop_event.wait(PING_INTERVAL_S):
             now = time.time()
             with self._subs_lock:
@@ -724,17 +981,66 @@ class BusSocketServer:
             for sub in subs:
                 if sub.closed:
                     continue
-                if (now - sub.last_pong_ts) > PING_TIMEOUT_S:
-                    logger.warning("[bus_socket] BUS_PONG timeout for %s; closing",
-                                   sub.name)
-                    self._purge_subscriber(sub, log_reason="pong_timeout")
+
+                # Silence horizon = newest of (last PONG, any-frame recv).
+                silent_for = now - max(sub.last_pong_ts, sub.last_recv_ts)
+
+                # Tier 1 — recent activity → alive, send ping, done.
+                if silent_for <= PING_TIMEOUT_S:
+                    self._enqueue_to(sub, ping_msg)
                     continue
-                # Enqueue ping into sub's ring
+
+                # Tier 2 — silent → ask the OS. If PID is dead, instant purge
+                # + publish BUS_PEER_DIED so Guardian restarts faster than
+                # its own polling would discover (typically ms vs ~1s).
+                if not self._pid_alive(sub.peer_pid):
+                    logger.error(
+                        "[bus_socket] %s (pid=%s) peer process is DEAD — "
+                        "purging connection (silent=%.1fs); publishing "
+                        "BUS_PEER_DIED for Guardian restart",
+                        sub.name, sub.peer_pid, silent_for,
+                    )
+                    self._purge_subscriber(sub, log_reason="peer_dead",
+                                           silent_for=silent_for)
+                    continue
+
+                # Tier 3 — PID alive but anon (pre-BUS_SUBSCRIBE) for too long.
+                # Bound: ANON_SUBSCRIBE_GRACE_S (60s). Past this is a worker
+                # bug (setup_worker_bus didn't fire BUS_SUBSCRIBE), not init.
+                if sub.name.startswith("anon-"):
+                    if silent_for > ANON_SUBSCRIBE_GRACE_S:
+                        logger.warning(
+                            "[bus_socket] anon connection (pid=%s) silent "
+                            "%.1fs > %.0fs grace and never sent BUS_SUBSCRIBE "
+                            "— purging",
+                            sub.peer_pid, silent_for, ANON_SUBSCRIBE_GRACE_S,
+                        )
+                        self._purge_subscriber(sub, log_reason="anon_subscribe_timeout",
+                                               silent_for=silent_for)
+                    # else: still within anon grace; skip ping (worker not
+                    # ready to receive yet) and let connection_loop's
+                    # BUS_SUBSCRIBE arrive when it's ready.
+                    continue
+
+                # Tier 4 — named worker, silent, PID alive. Worker is busy
+                # (heavy CPU/IO work). Don't purge. Guardian's heartbeat-
+                # timeout + CPU-grew check owns deadlock detection. Keep
+                # pinging; once worker drains its inbox it'll PONG.
                 self._enqueue_to(sub, ping_msg)
 
     # ── Subscriber teardown ───────────────────────────────────────────────
 
-    def _purge_subscriber(self, sub: BrokerSubscriber, *, log_reason: str) -> None:
+    def _purge_subscriber(self, sub: BrokerSubscriber, *, log_reason: str,
+                          silent_for: float = 0.0) -> None:
+        """Tear down a subscriber connection.
+
+        Phase B.2 §D9 (2026-05-02): on log_reason="peer_dead", publishes a
+        BUS_PEER_DIED bus message into the kernel's in-process bus so
+        Guardian can trigger an immediate restart (faster than its 1Hz
+        polling). The signal is only published for peer-death — not for
+        soft pong-timeouts or explicit handoff disconnects (those don't
+        signal a process crash).
+        """
         if sub.closed:
             return
         sub.closed = True
@@ -749,6 +1055,14 @@ class BusSocketServer:
             pass
         with self._subs_lock:
             self._subscribers.pop(sub.name, None)
+        # Stats counter split (Phase B.2 §D9) — distinguishes the cause for
+        # arch_map kernel-status visibility.
+        if log_reason == "peer_dead":
+            self._stats["peer_dead_purges_total"] = (
+                self._stats.get("peer_dead_purges_total", 0) + 1)
+        elif log_reason == "pong_timeout":
+            self._stats["pong_timeout_purges_total"] = (
+                self._stats.get("pong_timeout_purges_total", 0) + 1)
         # M-investigate (2026-04-27 PM): if the purge happens within 10s of
         # the last BUS_HANDOFF publish AND the reason isn't an explicit
         # B.2.1 disconnect, this is the transient-drop-at-handoff bug we
@@ -764,6 +1078,31 @@ class BusSocketServer:
                 )
                 return  # avoid duplicate purge log
         logger.info("[bus_socket] subscriber %s purged (%s)", sub.name, log_reason)
+
+        # Phase B.2 §D9 — peer-death signal to Guardian. Publishes via the
+        # in-process callback (same path as cb in _handle_inbound), so it
+        # reaches Guardian's _guardian_queue without needing a worker on
+        # the wire. Idempotent w.r.t. Guardian's polling-path restart via
+        # Guardian._module_lock — second restart() call becomes a no-op.
+        if log_reason == "peer_dead" and self._on_inbound_publish is not None:
+            try:
+                self._on_inbound_publish({
+                    "type": "BUS_PEER_DIED",
+                    "src":  "broker",
+                    "dst":  "guardian",
+                    "ts":   time.time(),
+                    "payload": {
+                        "name":         sub.name,
+                        "pid":          sub.peer_pid,
+                        "was_anon":     sub.name.startswith("anon-"),
+                        "silent_for_s": round(silent_for, 1),
+                    },
+                })
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "[bus_socket] BUS_PEER_DIED publish failed for %s; "
+                    "Guardian's polling path will still discover the death "
+                    "within ~1s", sub.name)
 
     def disconnect_subscribers(self, names: list[str], *, reason: str = "kernel_handoff") -> list[str]:
         """Phase B.2.1 (2026-04-27 PM) — proactively disconnect specific subscribers.
@@ -812,6 +1151,13 @@ class BusSocketServer:
             return {
                 "sock_path": str(self.sock_path),
                 "subscriber_count": len(self._subscribers),
+                # Phase B.2 §D9 (2026-05-02) — purge cause counters. Non-zero
+                # peer_dead = real worker crashes (visible in arch_map);
+                # non-zero pong_timeout under smart-liveness should be ~0
+                # (only fires for processes that defy both Tier-2 PID check
+                # and Tier-3/4 logic — should not happen in practice).
+                "peer_dead_purges_total": self._stats.get("peer_dead_purges_total", 0),
+                "pong_timeout_purges_total": self._stats.get("pong_timeout_purges_total", 0),
                 "subscribers": [
                     {
                         "name": s.name,
@@ -820,6 +1166,8 @@ class BusSocketServer:
                         "recv_count_60s": s.recv_count_60s,
                         "topics": sorted(s.subscribed_topics),
                         "last_pong_age_s": time.time() - s.last_pong_ts,
+                        # Phase B.2 §D9 — peer PID for diagnostics + arch_map.
+                        "peer_pid": s.peer_pid,
                     }
                     for s in self._subscribers.values()
                 ],
@@ -878,6 +1226,23 @@ class BusSocketClient:
         self._topics: set[str] = set(self._initial_topics)
         self._topics_lock = threading.Lock()
         self._reconnect_count = 0
+        # Phase B.2 IPC §D8 outbound buffer (added 2026-04-30 after
+        # BUG-BUS-IPC-WORKER-READY-RACE-20260430). When publish() is
+        # called before the connection thread has finished the initial
+        # handshake (50-150ms jitter window), the message goes into this
+        # buffer and is flushed on connect. Survives kernel-swap reconnects
+        # too: any publish during the ~50ms reconnect window enters the
+        # buffer rather than dropping.
+        #
+        # Sized to absorb a worker's full boot burst — MODULE_READY +
+        # OUTER_TRINITY_READY + first heartbeat + a few state publishes
+        # are well under 256. Older messages drop on overflow (deque maxlen)
+        # rather than blocking the worker.
+        #
+        # B.3 cleanup §11.4.a does NOT delete this — kernel swaps still
+        # need it. Only the legacy mp.Queue fallback path retires.
+        self._outbound_buffer: deque = deque(maxlen=256)
+        self._outbound_lock = threading.Lock()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -957,12 +1322,26 @@ class BusSocketClient:
         with self._sock_lock:
             sock = self._sock
         if sock is None:
-            return False
+            # Phase B.2 IPC §D8 outbound buffer (closes BUG-BUS-IPC-WORKER-
+            # READY-RACE-20260430). Connection thread hasn't completed
+            # handshake yet (initial-connect jitter window ~50-150ms) OR
+            # we're mid-reconnect after kernel swap. Either way, buffer
+            # the message; _connection_loop flushes on _connected_event.set().
+            # Returns True because the message WILL be sent (eventually);
+            # publishers treat this as success — same fire-and-forget
+            # semantics as in-process bus.publish().
+            with self._outbound_lock:
+                self._outbound_buffer.append(msg)
+            return True
         try:
             send_frame(sock, _packb_safe(msg))
             return True
         except (ConnectionError, OSError):
-            return False
+            # Connection broke mid-send — buffer for next reconnect cycle.
+            # Same as the sock-is-None path above.
+            with self._outbound_lock:
+                self._outbound_buffer.append(msg)
+            return True
         except Exception:  # noqa: BLE001
             # Defensive: if _packb_safe itself raises (e.g., a type its
             # default-callback can't coerce that also breaks repr()), don't
@@ -977,6 +1356,57 @@ class BusSocketClient:
                 msg.get("type") if isinstance(msg, dict) else "?",
                 list(msg.keys())[:10] if isinstance(msg, dict) else "?")
             return False
+
+    def _flush_outbound_buffer(self) -> None:
+        """Phase B.2 IPC §D8 — drain outbound buffer after (re)connect.
+
+        Called from _connection_loop right after _connected_event.set().
+        Frames buffered by _raw_send during the connect window are sent
+        in FIFO order over the now-live socket. On send failure, the
+        message is re-buffered and the loop exits — next reconnect retries.
+
+        Per-message exceptions are caught locally so one bad frame doesn't
+        prevent flushing the rest. The flush is bounded by buffer size
+        (maxlen=256), so this stays fast under any realistic boot burst.
+        """
+        with self._sock_lock:
+            sock = self._sock
+        if sock is None:
+            return
+        # Snapshot the buffer under lock; release before sending so
+        # publish() doesn't block during the flush.
+        with self._outbound_lock:
+            pending = list(self._outbound_buffer)
+            self._outbound_buffer.clear()
+        if not pending:
+            return
+        flushed = 0
+        for msg in pending:
+            try:
+                send_frame(sock, _packb_safe(msg))
+                flushed += 1
+            except (ConnectionError, OSError):
+                # Connection broke mid-flush. Re-buffer the unsent tail
+                # (current msg + remainder) so next reconnect picks up.
+                idx = pending.index(msg)
+                with self._outbound_lock:
+                    # Prepend remaining to the front of the buffer
+                    self._outbound_buffer.extendleft(reversed(pending[idx:]))
+                logger.debug(
+                    "[bus_client] flush interrupted at msg %d/%d for '%s' "
+                    "— re-buffered %d, reconnect will retry",
+                    idx, len(pending), self.name, len(pending) - idx)
+                return
+            except Exception:  # noqa: BLE001
+                # Bad frame — drop it (matches _raw_send semantics) and
+                # continue flushing the rest.
+                logger.exception(
+                    "[bus_client] flush dropped frame (type=%s) for '%s'",
+                    msg.get("type") if isinstance(msg, dict) else "?", self.name)
+        if flushed:
+            logger.info(
+                "[bus_client] worker '%s' flushed %d buffered frame(s) "
+                "post-connect", self.name, flushed)
 
     # ── Inbound queue (SocketQueue API) ───────────────────────────────────
 
@@ -1014,6 +1444,13 @@ class BusSocketClient:
                 self._connected_event.set()
                 if backoff_attempt > 0:
                     self._reconnect_count += 1
+                # Phase B.2 IPC §D8 outbound buffer flush (closes
+                # BUG-BUS-IPC-WORKER-READY-RACE-20260430). Drain any
+                # messages publish() buffered while the socket was
+                # establishing — preserves first-publish (MODULE_READY,
+                # initial state, etc.) for light-init workers that race
+                # past the connection thread.
+                self._flush_outbound_buffer()
                 # Recv loop blocks here until EOF/error
                 self._recv_loop(sock)
             except (ConnectionError, OSError, ValueError) as e:

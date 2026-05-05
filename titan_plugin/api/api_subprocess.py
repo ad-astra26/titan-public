@@ -158,6 +158,56 @@ def api_subprocess_main(recv_queue, send_queue, name: str, config: dict) -> None
         target=_heartbeat_loop, daemon=True, name="api-heartbeat")
     hb_thread.start()
 
+    # 4b. Memory hygiene daemon — periodic gc.collect() + glibc malloc_trim(0).
+    # Keeps api subprocess RSS bounded. Mirrors kernel._memory_hygiene_loop().
+    # 2026-05-01 — interim measure ahead of Phase C C-S7 Rust kernel swap.
+    # Configurable via [microkernel] memory_hygiene_interval_s (set 0 = off).
+    _mh_stop = threading.Event()
+    _mh_interval_s = float(config.get("microkernel", {}).get(
+        "memory_hygiene_interval_s", 60.0))
+
+    def _memory_hygiene_loop():
+        if _mh_interval_s <= 0:
+            logger.info("[MemHygiene:api] disabled (interval_s=%s)",
+                        _mh_interval_s)
+            return
+        logger.info("[MemHygiene:api] starting (interval_s=%.1f)",
+                    _mh_interval_s)
+        libc = None
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        except OSError as e:
+            logger.warning("[MemHygiene:api] libc.so.6 unavailable (%s) — "
+                           "running gc.collect() only", e)
+        import gc
+        while not _mh_stop.is_set():
+            if _mh_stop.wait(_mh_interval_s):
+                return
+            try:
+                t0 = time.time()
+                n_collected = gc.collect()
+                t1 = time.time()
+                trim_result = -1
+                if libc is not None:
+                    try:
+                        trim_result = libc.malloc_trim(0)
+                    except Exception as trim_err:  # noqa: BLE001
+                        logger.debug(
+                            "[MemHygiene:api] malloc_trim failed: %s",
+                            trim_err)
+                t2 = time.time()
+                logger.info(
+                    "[MemHygiene:api] gc=%d freed (%.1fms) trim=%d (%.1fms)",
+                    n_collected, (t1 - t0) * 1000,
+                    trim_result, (t2 - t1) * 1000)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[MemHygiene:api] cycle failed: %s", e)
+
+    mh_thread = threading.Thread(
+        target=_memory_hygiene_loop, daemon=True, name="api-mem-hygiene")
+    mh_thread.start()
+
     # 5. Bus listener thread — translate OBSERVATORY_EVENT → event_bus.emit()
     _bus_stop = threading.Event()
     _ws_loop_holder: dict[str, Any] = {"loop": None}

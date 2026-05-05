@@ -148,6 +148,8 @@ KERNEL_RPC_EXPOSED_METHODS: frozenset[str] = frozenset({
     "_pending_self_composed",
     "_pending_self_composed_confidence",
     "_dream_inbox",
+    "_dream_inbox.clear",
+    "_dream_inbox.extend",
     "_proxies",
     "_proxies.get",
     "_agency",
@@ -162,6 +164,7 @@ KERNEL_RPC_EXPOSED_METHODS: frozenset[str] = frozenset({
     "reload_api",
     "get",
     "get_v3_status",
+    "run_chat",
     # Plugin module-attribute references
     "maker",
     "backup",
@@ -174,6 +177,18 @@ KERNEL_RPC_EXPOSED_METHODS: frozenset[str] = frozenset({
     "metabolism.get_learning_velocity",
     "metabolism.get_metabolic_health",
     "metabolism.get_social_density",
+    # 2026-04-30 — closes ASGI 500 errors on /v4/metabolism/evaluate-gate
+    # observed at ~1.7/min post bus_ipc_socket+spawn_graduated flip. The
+    # endpoint at dashboard.py:1217 was added 2026-04-28 (BUG-METABOLISM-
+    # EVALUATE-GATE-500) but never registered the methods it calls in the
+    # kernel_rpc EXPOSED_METHODS set. Worked in legacy in-process api mode
+    # (direct attribute access on TitanPlugin); fails through kernel_rpc
+    # proxy when api_process_separation_enabled=true (production path).
+    "metabolism.evaluate_gate",
+    "metabolism.get_metabolic_tier",
+    "metabolism.get_gates_enforced",
+    "metabolism.get_last_gate_decision_reason",
+    "metabolism.get_gate_decision_summary",
     "studio",
     "config_loader",
     "params",
@@ -188,6 +203,7 @@ KERNEL_RPC_EXPOSED_METHODS: frozenset[str] = frozenset({
     "memory._node_store",
     "memory._node_store.items",
     "memory.fetch_mempool",
+    "memory.fetch_mempool_for_observatory",  # rFP_bus_payload_contracts §3.1
     "memory.fetch_social_metrics",
     "memory.get_coordinator",
     "memory.get_knowledge_graph",
@@ -197,6 +213,7 @@ KERNEL_RPC_EXPOSED_METHODS: frozenset[str] = frozenset({
     "memory.get_persistent_count",
     "memory.get_reasoning_state",
     "memory.get_top_memories",
+    "memory.get_top_memories_for_observatory",  # rFP_bus_payload_contracts §3.1
     "memory.get_topology",
     "memory.inject_memory",
     "mood_engine",
@@ -431,8 +448,15 @@ class TitanKernel:
         # Kernel heartbeat publisher (every 10s)
         loop.create_task(self._heartbeat_loop())
 
+        # Memory hygiene daemon (every 60s by default; gates on titan_params
+        # [microkernel] memory_hygiene_interval_s — set to 0 to disable).
+        loop.create_task(self._memory_hygiene_loop())
+
         # Microkernel v2 Phase A §A.2 — Trinity shm writer (daemon thread).
         self._start_trinity_shm_writer()
+
+        # Phase A.S8 — Topology shm writer (30D standalone slot, daemon thread).
+        self._start_topology_shm_writer()
 
         # Microkernel v2 Phase A §A.7 — spirit-fast writer hook.
         # Actual 70.47 Hz writes happen inside spirit_worker subprocess
@@ -584,6 +608,60 @@ class TitanKernel:
                 {"rss_mb": round(rss_mb, 1), "uptime": round(time.time() - self._start_time, 1)},
             ))
             await asyncio.sleep(10.0)
+
+    async def _memory_hygiene_loop(self) -> None:
+        """Periodic gc.collect() + glibc malloc_trim(0) — keeps process RSS
+        bounded by reclaiming allocator memory back to the OS.
+
+        2026-05-01 — interim measure ahead of Phase C C-S7 (Rust kernel
+        ownership swap, expected to deliver order-of-magnitude RSS reduction).
+        Python's allocator + glibc arenas (even with MALLOC_ARENA_MAX=2) tend
+        to hold freed memory in process address space rather than returning
+        it to the OS. Under sustained request load this manifests as RSS
+        appearing to "leak" — actually transient spikes that don't decay back
+        to baseline cleanly. `gc.collect()` runs cyclic GC; `malloc_trim(0)`
+        forces glibc to release fully-freed arena pages.
+
+        Runs every `[microkernel] memory_hygiene_interval_s` seconds (default
+        60s). Set to 0 in titan_params.toml to disable. Per-cycle cost: ~10-50ms
+        depending on heap size.
+        """
+        interval_s = float(self._config.get("microkernel", {}).get(
+            "memory_hygiene_interval_s", 60.0))
+        if interval_s <= 0:
+            logger.info("[MemHygiene] disabled (interval_s=%s)", interval_s)
+            return
+        logger.info("[MemHygiene] starting (interval_s=%.1f)", interval_s)
+        # Lazy-load libc so the kernel boot path does not pay the cost on
+        # systems where libc.so.6 is absent (containers, alpine, tests).
+        libc = None
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        except OSError as e:
+            logger.warning("[MemHygiene] libc.so.6 unavailable (%s) — "
+                           "running gc.collect() only", e)
+        while True:
+            await asyncio.sleep(interval_s)
+            try:
+                import gc
+                t0 = time.time()
+                n_collected = gc.collect()
+                t1 = time.time()
+                trim_result = -1
+                if libc is not None:
+                    try:
+                        trim_result = libc.malloc_trim(0)
+                    except Exception as trim_err:  # noqa: BLE001
+                        logger.debug(
+                            "[MemHygiene] malloc_trim failed: %s", trim_err)
+                t2 = time.time()
+                logger.info(
+                    "[MemHygiene] gc=%d freed (%.1fms) trim=%d (%.1fms)",
+                    n_collected, (t1 - t0) * 1000,
+                    trim_result, (t2 - t1) * 1000)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[MemHygiene] cycle failed: %s", e)
 
     # ------------------------------------------------------------------
     # Vault anchor bus-bridge (BUG-VAULT-COMMITS-NOT-LANDING — 2026-04-29)
@@ -856,6 +934,61 @@ class TitanKernel:
             "(poll=%.2fs, gate=microkernel.shm_trinity_enabled)",
             poll_interval_s,
         )
+
+    def _start_topology_shm_writer(self) -> None:
+        """Phase A.S8 — Topology shm writer (daemon thread).
+
+        Reads state_register.get_full_30d_topology() at 0.5s poll and writes
+        the 30D topology slice to /dev/shm/titan_{id}/topology_30d.bin via
+        TOPOLOGY_30D RegistrySpec. Content-hash gated — no write when unchanged.
+
+        Mirror of _start_trinity_shm_writer for the standalone topology slot.
+        Always-enabled (no feature flag — outer workers never need flag-off path
+        for this slot; it only provides a fast SHM-readable snapshot for Rust C-S*
+        and any future external reader).
+        """
+        import numpy as _np
+        from titan_plugin.core.state_registry import TOPOLOGY_30D
+
+        poll_interval_s = 0.5
+        stop_evt = self._shm_writer_stop_evt
+        if stop_evt is None:
+            stop_evt = threading.Event()
+            self._shm_writer_stop_evt = stop_evt
+
+        def _writer_loop() -> None:
+            import hashlib as _hashlib
+            last_hash = None
+            consecutive_errors = 0
+            stop_evt.wait(2.0)
+            while not stop_evt.is_set():
+                try:
+                    topo_30 = self.state_register.get_full_30d_topology()
+                    arr = _np.asarray(list(topo_30)[:30], dtype=_np.float32)
+                    if arr.shape != (30,):
+                        stop_evt.wait(poll_interval_s)
+                        continue
+                    payload_bytes = arr.tobytes(order="C")
+                    h = _hashlib.blake2b(payload_bytes, digest_size=16).digest()
+                    if h != last_hash:
+                        self.registry_bank.writer(TOPOLOGY_30D).write(arr)
+                        last_hash = h
+                    consecutive_errors = 0
+                except Exception as e:
+                    consecutive_errors += 1
+                    if consecutive_errors == 1 or consecutive_errors % 20 == 0:
+                        logger.warning(
+                            "[TopologyShmWrite] iteration failed (#%d): %s",
+                            consecutive_errors, e)
+                stop_evt.wait(poll_interval_s)
+
+        t = threading.Thread(
+            target=_writer_loop,
+            daemon=True,
+            name="topology-shm-writer",
+        )
+        t.start()
+        logger.info("[TitanKernel] Topology shm writer thread started (poll=0.5s)")
 
     def _start_spirit_shm_writer(self) -> None:
         """Microkernel v2 Phase A §A.7 — spirit-fast shm writer hook (S3b).

@@ -2805,6 +2805,16 @@ reasoning = "data/reasoning_cgn/state_snapshot.json"
 
 [microkernel]
 
+# ── Memory hygiene daemon (2026-05-01) ─────────────────────────────
+# Periodic gc.collect() + glibc malloc_trim(0). Keeps process RSS bounded
+# by reclaiming allocator memory back to the OS. Runs in:
+#   - kernel parent (TitanKernel._memory_hygiene_loop)
+#   - api subprocess (api_subprocess.py:_memory_hygiene_loop)
+# Set to 0 to disable. Per-cycle cost: ~10-50ms depending on heap size.
+# Interim measure ahead of Phase C C-S7 (Rust kernel ownership swap, expected
+# to deliver order-of-magnitude RSS reduction).
+memory_hygiene_interval_s = 60.0
+
 # ── Phase A §A.5 — layer tagging (S1, TODAY) ───────────────────────
 # Validates ModuleSpec.layer in Guardian.register(). No runtime effect
 # beyond validation + exposure in /v4/guardian-status + arch_map.
@@ -2820,12 +2830,18 @@ shm_trinity_enabled     = true
 shm_neuromod_enabled    = true
 shm_epoch_enabled       = true
 
-# S4 registries (not wired yet — flags reserved):
-shm_cgn_format_alignment_enabled = false
-shm_titanvm_enabled     = false
-shm_sphere_clocks_enabled = false
-shm_chi_enabled         = false
-shm_identity_enabled    = false
+# S4 registries — SHIPPED 2026-04-25 (merge 4361454d, 14 commits, 46 tests).
+# Wiring complete: RegistrySpec defs at state_registry.py:704-790, writer
+# hooks in spirit_worker.py (sphere_clocks 2615+, chi 608+) and kernel.py:902+
+# (identity), readers in shm_reader_bank.py:211/235/251/274. Per the master
+# rFP §A.7: "Default OFF — flag-on after 24h soak between Titans" — Maker
+# greenlit fleet-wide flip 2026-04-30 after architectural audit confirmed
+# wiring complete.
+shm_cgn_format_alignment_enabled = true   # FLIPPED 2026-04-30 — closes T2↔T3 path race + 24B header alignment
+shm_titanvm_enabled     = true            # FLIPPED 2026-04-30 — 11 NS program register states populated
+shm_sphere_clocks_enabled = true          # FLIPPED 2026-04-30 — 6 sphere clocks (inner+outer Body/Mind/Spirit) populated
+shm_chi_enabled         = true            # FLIPPED 2026-04-30 — Chi circulation state populated
+shm_identity_enabled    = true            # FLIPPED 2026-04-30 — titan_id/maker_pubkey/keypair_fingerprint at boot
 
 # ── Phase A §A.1 — TitanCore → TitanKernel split (S3) ──────────────
 # When enabled, titan_main.py boots via TitanKernel + TitanPlugin split
@@ -2866,6 +2882,21 @@ shm_spirit_fast_enabled = true
 # unblocked). 24 isolation tests + live verification on T1 (Mode 1
 # in-process) before flag flip; full Mode 2 verification post-flip.
 api_process_separation_enabled = true
+
+# ── Asyncio default-executor pool sizing (rFP_microkernel_phase_a8 §3.4) ──
+# Pre-V6 (legacy monolith): scripts/titan_main.py hardcoded max_workers=64
+# to handle 122 FastAPI endpoints in-parent under peak Observatory load.
+# Post-V6 (api_process_separation_enabled=true): FastAPI moved to
+# api_subprocess; parent services only bus + background coroutines + ~140
+# `asyncio.to_thread` call sites in worker proxies. Each pool thread
+# reserves ~8 MB of VmData stack — bounding at 16 saves ~400 MB of address
+# space vs the old 64 (load-bearing contributor to
+# BUG-PARENT-MEMORY-LEAK-HOST-OOM-20260428).
+#
+# bounded_enabled=false → legacy 64 (escape hatch)
+# bounded_enabled=true + max_workers=N → bounded size (default 16)
+asyncio_pool_bounded_enabled = true
+asyncio_pool_max_workers = 16
 
 # ── rFP_observatory_data_loading_v1 §3.5 — H4 SOL balance publisher ──
 # When enabled, kernel spawns a daemon thread that fetches SOL balance
@@ -2939,7 +2970,13 @@ shadow_swap_enabled = true    # FLIPPED 2026-04-26 — B.1 first deploy test on 
 # Default OFF until C7 ships worker integration + first-deploy on T1.
 # FLIPPED 2026-04-27 PM (Path B'): shadow Guardian skip-spawn + relaxed
 # health gate now ship — re-flipping to test true-outlive E2E swap on T1.
-bus_ipc_socket_enabled = false
+# REVERTED 2026-04-27 PM as workaround for BUG-BUS-IPC-SPIRIT-MALFORMED-FRAME-20260428
+# (msgpack rejected dict-with-tuple-keys in spirit_state.snapshot()).
+# RE-FLIPPED 2026-04-30: bug ✅ FIXED 2026-04-28 PM (commit b81a1b2d, merge f4c6ccac)
+# via _sanitize_dict_keys() — fix verified live in spirit_state.py:101-129.
+# Closes the second of two unaddressed levers from rFP_microkernel_phase_a8 §3.4
+# (eliminates ~20 QueueFeederThread per Titan = ~160 MB VmData reservation).
+bus_ipc_socket_enabled = true  # 2026-05-01 — restored to true after A.S8 (outer trinity symmetric workers) shipped + broker-boundary msgpack fix (commit 0ebd9e7b) verified 0 sustained drops fleet-wide + api ModuleSpec broadcast_topics filter (commit ec58c003). T1 graduated from legacy mode back to socket-broker. spawn_graduated_workers_enabled stays false per BUG-MICROKERNEL-V2-SPAWN-GRADUATED-HEARTBEAT-CRASHLOOP-20260501.
 
 # ── Phase B.2.1 — Spawn graduation for import-stable workers ───────────
 # When true, 9 workers boot via multiprocessing.get_context("spawn") so
@@ -2958,7 +2995,36 @@ bus_ipc_socket_enabled = false
 # what enables true zero-downtime swaps (workers literally outlive).
 # FLIPPED 2026-04-27 PM (Path B') — paired with bus_ipc_socket_enabled
 # for second true-outlive E2E swap test on T1 with skip-spawn live.
-spawn_graduated_workers_enabled = false
+# REVERTED 2026-04-27 PM alongside bus_ipc_socket_enabled as workaround for
+# BUG-BUS-IPC-SPIRIT-MALFORMED-FRAME-20260428.
+# RE-FLIPPED 2026-04-30 fleet-wide: bug FIXED 2026-04-28; bus_ipc verified
+# active fleet-wide today; flipping spawn-graduated to eliminate fork-mode
+# COW-inheritance memory bloat (~400MB per worker × 9 workers per
+# core/plugin.py:628/647/698 fork-inherited comments) — the actual structural
+# fix for the parent memory leak from BUG-PARENT-MEMORY-LEAK-HOST-OOM-20260428.
+# 2026-05-04 UPDATE — earlier "DO NOT trigger /v4/maker/shadow-swap" warning
+# RESOLVED. M1 (split-by-start_method ack collection) + M2 (15→30s adoption
+# timeout) both shipped 2026-04-27 PM (B.2.1 commit set). T1 shadow swap E2E
+# SUCCESS at 2026-04-27 18:38 UTC (49s, 13/13 graduated workers adopted, workers
+# truly outlived). The 2026-04-28 attempt rolled back cleanly at
+# `shadow_health_multi_criterion_failed` because shadow's `api` module never
+# reached READY in shadow_boot — root-cause was `api_process_separation_enabled`
+# being OFF at that moment (api ran in-process, not as a Guardian module).
+# Resolved via three layers since:
+#   (1) shadow_orchestrator.py:1483-1493 conditionally drops `api` from
+#       critical_modules when separation=false (defence-in-depth).
+#   (2) api_process_separation_enabled re-flipped 2026-04-29 fleet-wide with
+#       chat bus-bridge fix (commits 03a0a6be → 7e61c91a) — api now properly
+#       registers with Guardian as a subprocess + reaches READY via
+#       api_subprocess.py:286.
+#   (3) MODULE_READY race fixes 2026-04-30 → 2026-05-01: smart-liveness algo
+#       (bc1e23be), BusSocketClient outbound buffer (26705515), Guardian inline
+#       MODULE_READY processing during SAVE_NOW wait (af858510), api ModuleSpec
+#       broadcast_topics (ec58c003).
+# Shadow swap is now operationally green for T1. T2 still has subscriber-
+# registration race from 2026-04-27 19:04 — DEFER T2/T3 until T1 swap is
+# soaked clean for 24h+.
+spawn_graduated_workers_enabled = true  # 2026-05-02 — committed after T1 spawn-mode + Option A+B verified 27/27 RUNNING in 5 min, 0 cascade events, 0 anon purges. Full microkernel v2 (Phase A+B) is now active by default. Phase C C-S7 (Rust L0/L1) activation tracked in PLAN_microkernel_phase_c_s7_activation_prep.md.
 
 # ── Phase A.8.3 — Output Verifier subprocess (rFP_microkernel_phase_a8) ──
 # When true, output_verifier runs as a Guardian-supervised L2 subprocess
@@ -2971,16 +3037,8 @@ spawn_graduated_workers_enabled = false
 # retains local OutputVerifier instance).
 a8_output_verifier_subprocess_enabled = true
 
-# ── Phase A.8.4 — Outer Trinity subprocess (rFP_microkernel_phase_a8) ──
-# When true, outer_trinity runs as a Guardian-supervised L1 subprocess
-# (outer_trinity_worker.py) sister to body/mind/spirit. Parent's
-# _outer_trinity_loop continues to gather sources (which need parent-only
-# state like agency, observatory_db reader, soul) and publishes
-# OUTER_TRINITY_COLLECT_REQUEST every interval; the worker hosts
-# OuterTrinityCollector and publishes OUTER_TRINITY_STATE. Removes the
-# 132D collector math + extended-tensor computation from the parent
-# event loop. Default false → in-parent compute (legacy, byte-identical).
-a8_outer_trinity_subprocess_enabled = true
+# Phase A.8.4 flag REMOVED — superseded by Phase A.S8 symmetric workers.
+# outer_body / outer_mind / outer_spirit are always-on (autostart=True ModuleSpecs).
 
 # ── Phase A.8.5 — Reflex aggregation subprocess (rFP_microkernel_phase_a8) ──
 # When true, reflex aggregation (group → guardian-shield → combine →
@@ -3059,4 +3117,18 @@ a8_sage_scholar_gatekeeper_subprocess_enabled = true
 # top-level `microkernel.X`). 2026-04-29 incident — see git log of this
 # file. New flags must be ADDED ABOVE this subsection header, never below.
 [microkernel.shadow_swap]
-maker_full_stop = true
+# 2026-05-04 — flipped to false. Pre-conditions verified clean:
+#   • M1+M2 ack-collection split shipped 2026-04-27 (B.2.1 commit set)
+#   • api READY in shadow_boot resolved by 3-layer fix (orchestrator
+#     fallback + api_process_separation re-flip + 4 MODULE_READY race
+#     fixes shipped 2026-04-30 → 2026-05-01)
+#   • Kuzu hardlink-break for the 04-28 inner_memory.db corruption
+#     shipped commit f1db75a6 (T3 verified)
+#   • Watchdog 5-min cron race closed by Phase C C-S2 swap-lock
+#     write+heartbeat+cleanup in shadow_orchestrator.py:1645-1647 +
+#     1904-1911 (verified by tests/test_services_watchdog_shadow_swap_race.py)
+#   • maker.py:481 broken import fixed in same session (was silently
+#     locking full_stop=True regardless of this flag)
+#   • Pre-swap data backup taken — data.backup.20260504_080108/ (9.7G)
+# T1-only validation pass; T2/T3 stay deferred until T1 soaks 24h+ clean.
+maker_full_stop = false

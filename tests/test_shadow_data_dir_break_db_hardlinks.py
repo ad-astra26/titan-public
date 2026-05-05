@@ -200,6 +200,78 @@ class TestBreakDbHardlinks(unittest.TestCase):
             "Defense-in-depth: any top-level hardlink is broken regardless "
             "of extension — covers future DB types we don't know about yet")
 
+    def test_skips_old_mtime_files(self):
+        """mtime-gated fix (2026-05-04 PM): files whose mtime is older than
+        the recency threshold are NOT real-copied. They aren't concurrently
+        written so their hardlink is safe.
+
+        Closes the disk-fill mode discovered 2026-05-04 (T1 shadow swap
+        consumed ~12 GB instead of ~1.5 GB because the prior break-everything
+        loop real-copied hundreds of immutable telemetry archives).
+        """
+        # Recent files (will be broken)
+        (self.src / "consciousness.db").write_bytes(b"x" * 100)
+        (self.src / "inner_memory.db").write_bytes(b"x" * 200)
+        # Old archive files (mtime 2 hours ago — should be SKIPPED)
+        old_files = [
+            "twin_telemetry_20260501_1200.json",
+            "child_dev_telemetry_20260321.json",
+            "developmental_day_20260320.json",
+        ]
+        import time as _time
+        two_hours_ago = _time.time() - 7200
+        for name in old_files:
+            p = self.src / name
+            p.write_bytes(b"old-archive")
+            os.utime(p, (two_hours_ago, two_hours_ago))
+
+        self._hardlink_dst()
+        # cp -al preserves mtime, so dst files inherit old mtime for archives.
+
+        broken = sdd._break_db_hardlinks(self.dst)
+        # Only the 2 recent files should break; 3 archives skipped
+        self.assertEqual(broken, 2,
+            "Only recently-modified files (active DBs) should be real-copied; "
+            "old archives stay hardlinked (no concurrent-write risk)")
+
+        # Verify recent files DID break
+        for name in ("consciousness.db", "inner_memory.db"):
+            self.assertNotEqual(
+                (self.src / name).stat().st_ino,
+                (self.dst / name).stat().st_ino,
+                f"{name} (recent mtime) should have broken hardlink")
+        # Verify old archives DID NOT break
+        for name in old_files:
+            self.assertEqual(
+                (self.src / name).stat().st_ino,
+                (self.dst / name).stat().st_ino,
+                f"{name} (old mtime) should remain hardlinked — saves disk")
+
+    def test_recency_threshold_is_tunable(self):
+        """The threshold is parametric — caller can tighten or loosen."""
+        # Two files: one 60s old, one 600s old
+        import time as _time
+        now = _time.time()
+        (self.src / "recent.db").write_bytes(b"x" * 50)
+        os.utime(self.src / "recent.db", (now - 60, now - 60))
+        (self.src / "older.db").write_bytes(b"x" * 50)
+        os.utime(self.src / "older.db", (now - 600, now - 600))
+        self._hardlink_dst()
+
+        # With default 300s threshold: only `recent` breaks
+        broken = sdd._break_db_hardlinks(self.dst)
+        self.assertEqual(broken, 1)
+
+        # Re-link `older` for the second check (the first call broke `recent`)
+        # Actually: we want a fresh shadow to test the loose threshold:
+        import shutil as _sh
+        _sh.rmtree(self.dst)
+        self._hardlink_dst()
+
+        # With a 1200s (20 min) threshold: both `recent` and `older` break
+        broken = sdd._break_db_hardlinks(self.dst, recency_threshold_s=1200)
+        self.assertEqual(broken, 2)
+
 
 class TestCopyDataDirIntegratesBreak(unittest.TestCase):
     """End-to-end: copy_data_dir on the hardlink path now calls _break_db_hardlinks."""

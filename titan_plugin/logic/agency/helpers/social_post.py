@@ -10,9 +10,30 @@ logger = logging.getLogger(__name__)
 
 
 class SocialPostHelper:
-    """Social media interaction helper using TwitterApi.io."""
+    """Social media interaction helper — DEPRECATED 2026-04-30.
 
-    def __init__(self, api_key: str = "", proxy: Optional[str] = None):
+    All X API calls MUST go through SocialXGateway
+    (titan_plugin/logic/social_x_gateway.py). This helper is no longer
+    registered in production paths (TitanPlugin._register_helpers and
+    agency_worker._register_agency_helpers both explicitly skip it).
+    All 3 internal HTTP methods point at "DISABLED://use-social-x-gateway-instead"
+    and will fail-fast on any actual call attempt.
+
+    Per Maker directive 2026-04-30: instantiation is blocked by default
+    via the init-time guard below. Defense-in-depth against accidental
+    re-introduction. To explicitly opt in (testing only), pass
+    `_explicit_opt_in=True`.
+    """
+
+    def __init__(self, api_key: str = "", proxy: Optional[str] = None,
+                 *, _explicit_opt_in: bool = False):
+        if not _explicit_opt_in:
+            raise ValueError(
+                "SocialPostHelper is DISABLED 2026-04-30. All X API calls "
+                "must go through titan_plugin.logic.social_x_gateway.SocialXGateway. "
+                "If you genuinely need this helper for testing, pass "
+                "_explicit_opt_in=True at construction."
+            )
         self._api_key = api_key
         self._proxy = proxy
 

@@ -179,6 +179,42 @@ async def _print_health(plugin):
     print()
 
 
+def _resolve_asyncio_pool_size(config: dict | None = None) -> int:
+    """Resolve the asyncio default-executor pool size from config.
+
+    Pre-V6 (legacy monolith): hardcoded max_workers=64 to handle 122
+    FastAPI endpoints in-parent under peak Observatory load.
+
+    Post-V6 (microkernel.api_process_separation_enabled=true): FastAPI
+    moved to `api_subprocess`; parent services only bus + background
+    coroutines + ~140 `asyncio.to_thread` call sites in worker proxies.
+    Each pool thread reserves ~8 MB of VmData stack; bounding at 16 saves
+    ~400 MB of address space vs the old 64. See rFP_microkernel_phase_a8
+    §A.8.2 §3.4 (parent thread-count target ≤25).
+
+    Config knobs (`[microkernel]`):
+      `asyncio_pool_bounded_enabled` (default true) — flag-on bounding
+      `asyncio_pool_max_workers`     (default 16)   — bounded size
+
+    Returns the effective max_workers integer.
+    """
+    if config is None:
+        try:
+            from titan_plugin.config_loader import load_titan_config
+            config = load_titan_config()
+        except Exception:
+            config = {}
+    mk = config.get("microkernel", {}) if isinstance(config, dict) else {}
+    if not isinstance(mk, dict):
+        mk = {}
+    if not mk.get("asyncio_pool_bounded_enabled", True):
+        return 64  # legacy escape hatch
+    try:
+        return int(mk.get("asyncio_pool_max_workers", 16))
+    except (TypeError, ValueError):
+        return 16
+
+
 async def run(health_only: bool = False, server_only: bool = False,
               restore_from: str | None = None, shadow_port: int | None = None):
     """Boot the Titan and enter the main loop.
@@ -187,15 +223,19 @@ async def run(health_only: bool = False, server_only: bool = False,
     """
     setup_logging()
 
-    # ── Bump asyncio default thread pool ─────────────────────────────
-    # Default is min(32, cpu_count+4) ≈ 36. After Phase E.2 wraps 90+
-    # sync I/O sites in asyncio.to_thread, concurrent endpoints can
-    # exhaust the pool and serialize. 64 workers gives ample headroom
-    # for our 122 FastAPI endpoints under peak Observatory load.
+    # ── Bound asyncio default thread pool ────────────────────────────
+    # See `_resolve_asyncio_pool_size` for sizing rationale (V6 microkernel
+    # mode → 16 workers vs legacy hardcoded 64). Closes a load-bearing
+    # contributor to BUG-PARENT-MEMORY-LEAK-HOST-OOM-20260428: 64 thread
+    # stacks × 8 MB ≈ 512 MB VmData reservation, dominant share of the
+    # parent's pre-fix 2.78 GB VmData watermark.
     import concurrent.futures
+    _max_workers = _resolve_asyncio_pool_size()
     _executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=64, thread_name_prefix="asyncio")
+        max_workers=_max_workers, thread_name_prefix="asyncio")
     asyncio.get_running_loop().set_default_executor(_executor)
+    logging.getLogger(__name__).info(
+        "[asyncio] default executor bounded: max_workers=%d", _max_workers)
 
     # ── Disk sanity check (Layer 3) ──────────────────────────────────
     # Refuse to boot if the working disk is critically full. Writing to a

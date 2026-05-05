@@ -58,7 +58,15 @@ def ensure_started_async_safe(
         start (module not guaranteed ready yet; caller should tolerate
         a default/empty response and retry).
     """
-    if guardian.is_running(module):
+    # Use is_started (RUNNING ∪ STARTING) rather than is_running. A worker
+    # in STARTING has its process spawned and bus QUERY handling active —
+    # calling guardian.start() again is redundant and produces spurious
+    # "First use" log spam during heavy-boot warmup (memory takes ~9 min
+    # to transition STARTING→RUNNING due to FAISS+Kuzu+DuckDB indexing on
+    # T1's 6256-memory store). Falls back to is_running on legacy Guardian
+    # builds that lack is_started.
+    is_alive = getattr(guardian, "is_started", guardian.is_running)
+    if is_alive(module):
         return True
     try:
         asyncio.get_running_loop()

@@ -264,6 +264,226 @@ class BackupCascade:
         except Exception as e:
             return False, 0.0, f"balance_query_failed: {e}"
 
+    # ── Auto-fund (rFP_backup_worker §5.5 gap fix, 2026-04-30) ──────────
+    #
+    # Closes the architectural gap exposed 2026-04-30: silent runway
+    # depletion → cascade falling to local_only for 30+ min before Maker
+    # noticed (147h since last successful upload). Existing rFP design was
+    # "alerts only — Maker decides funding"; practical result was missed
+    # alerts, silent degradation. Auto-fund within strict bounds removes
+    # the failure mode while preserving Maker control via daily caps +
+    # meditation reserve floor.
+
+    def _get_auto_fund_today_total(self) -> tuple[str, float, int]:
+        """Read today's auto-fund accumulator from data/backups/.auto_fund_daily.json."""
+        state_path = os.path.join(self.local_dir, ".auto_fund_daily.json")
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        try:
+            with open(state_path) as f:
+                state = json.load(f)
+            if state.get("date") != today:
+                return today, 0.0, 0
+            return today, float(state.get("total_sol", 0.0)), int(state.get("tx_count", 0))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return today, 0.0, 0
+
+    def _record_auto_fund_event(self, amount_sol: float, tx_id: str,
+                                 runway_before_days: float) -> None:
+        """Persist daily counter + append to auto_fund_audit.jsonl."""
+        state_path = os.path.join(self.local_dir, ".auto_fund_daily.json")
+        audit_path = os.path.join(self.local_dir, "auto_fund_audit.jsonl")
+        today, today_total, today_count = self._get_auto_fund_today_total()
+        try:
+            os.makedirs(self.local_dir, exist_ok=True)
+            new_state = {
+                "date": today,
+                "total_sol": today_total + amount_sol,
+                "tx_count": today_count + 1,
+                "last_tx_id": tx_id,
+                "last_ts": time.time(),
+            }
+            tmp_path = state_path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(new_state, f)
+            os.replace(tmp_path, state_path)
+            with open(audit_path, "a") as f:
+                f.write(json.dumps({
+                    "ts": time.time(),
+                    "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "amount_sol": round(amount_sol, 6),
+                    "tx_id": tx_id,
+                    "runway_before_days": round(runway_before_days, 2),
+                    "today_total_sol": round(new_state["total_sol"], 6),
+                }) + "\n")
+        except Exception as e:
+            logger.warning("[Cascade] auto-fund record failed: %s", e)
+
+    def auto_fund_irys_if_needed(
+        self,
+        size_mb: float,
+        notifier: Optional[Callable[[str], None]] = None,
+    ) -> dict:
+        """Auto-fund Irys deposit when runway is short AND wallet has surplus.
+
+        Called at the start of the backup cascade tick to top up before any
+        specific upload's S4 balance check. Logic gated by [backup].auto_fund_enabled
+        (default false — wire-now-gate-later per feedback_wire_now_gate_later.md).
+
+        Config knobs in [backup]:
+          auto_fund_enabled                     bool   (default false)
+          auto_fund_min_runway_days             float  (default 3.0)  trigger threshold
+          auto_fund_target_runway_days          float  (default 14.0) top-up target
+          auto_fund_meditation_reserve_sol      float  (default 0.01) wallet floor
+          auto_fund_daily_cap_sol               float  (default 0.05) per-day spending cap
+          auto_fund_avg_uploads_per_day         float  (default 3.0)  runway estimator
+
+        Returns dict describing action: {"action": "funded"|"no_action"|"skipped"|"failed", ...}
+        """
+        bcfg = self.full_config.get("backup", {})
+        if not bcfg.get("auto_fund_enabled", False):
+            return {"action": "skipped", "reason": "disabled"}
+
+        keypair = self.full_config.get("network", {}).get(
+            "wallet_keypair_path", "")
+        if not keypair or not os.path.exists(keypair):
+            return {"action": "skipped", "reason": "no_keypair"}
+
+        meditation_reserve = float(bcfg.get(
+            "auto_fund_meditation_reserve_sol", 0.01))
+        min_runway_days = float(bcfg.get(
+            "auto_fund_min_runway_days", 3.0))
+        target_runway_days = float(bcfg.get(
+            "auto_fund_target_runway_days", 14.0))
+        daily_cap = float(bcfg.get(
+            "auto_fund_daily_cap_sol", 0.05))
+        avg_uploads_per_day = float(bcfg.get(
+            "auto_fund_avg_uploads_per_day", 3.0))
+
+        # Step 1 — query current Irys balance
+        try:
+            out = subprocess.check_output(
+                ["node", "scripts/irys_upload.js", "balance", keypair,
+                 "https://api.mainnet-beta.solana.com"],
+                env={**os.environ, "NODE_PATH": _node_path()},
+                timeout=30,
+            )
+            data = json.loads(out.decode())
+            if data.get("status") != "ok":
+                return {"action": "skipped",
+                        "reason": f"balance_query_failed: {data.get('message')}"}
+            irys_sol = float(data.get("balance_readable", 0))
+        except Exception as e:
+            return {"action": "skipped", "reason": f"balance_query_error: {e}"}
+
+        # Step 2 — estimate runway
+        avg_cost_per_upload = max(size_mb, 1.0) * 0.0002 * 2.0  # match S4 margin
+        daily_burn = avg_cost_per_upload * avg_uploads_per_day
+        runway_days = irys_sol / daily_burn if daily_burn > 0 else 1e9
+
+        if runway_days >= min_runway_days:
+            return {
+                "action": "no_action",
+                "reason": "runway_sufficient",
+                "runway_days": round(runway_days, 2),
+                "irys_sol": round(irys_sol, 6),
+                "min_runway_days": min_runway_days,
+            }
+
+        # Step 3 — apply daily cap (cheap check; skip wallet RPC if already capped)
+        today, today_total, today_count = self._get_auto_fund_today_total()
+        available_today = max(0.0, daily_cap - today_total)
+        if available_today <= 0.0:
+            return {
+                "action": "skipped",
+                "reason": "daily_cap_reached",
+                "today_total_sol": round(today_total, 6),
+                "today_tx_count": today_count,
+                "daily_cap": daily_cap,
+            }
+
+        # Step 4 — query wallet (T1 mainnet runtime keypair)
+        try:
+            wallet_out = subprocess.check_output(
+                ["solana", "balance", "-k", keypair, "-u", "mainnet-beta"],
+                timeout=30,
+            )
+            # Format: "0.148356701 SOL"
+            wallet_sol = float(wallet_out.decode().strip().split()[0])
+        except Exception as e:
+            return {"action": "skipped", "reason": f"wallet_query_error: {e}"}
+
+        # Step 5 — compute desired top-up
+        target_sol = target_runway_days * daily_burn
+        top_up_needed = max(0.0, target_sol - irys_sol)
+        top_up = min(top_up_needed, available_today)
+
+        # Step 6 — respect meditation reserve floor
+        max_spendable = max(0.0, wallet_sol - meditation_reserve)
+        top_up = min(top_up, max_spendable)
+        if top_up < 0.001:  # 0.001 SOL minimum to bother executing TX
+            return {
+                "action": "skipped",
+                "reason": "wallet_below_reserve",
+                "wallet_sol": round(wallet_sol, 6),
+                "meditation_reserve": meditation_reserve,
+                "would_have_funded": round(top_up_needed, 6),
+            }
+
+        # Step 7 — execute fund tx
+        lamports = int(top_up * 1e9)
+        try:
+            fund_out = subprocess.check_output(
+                ["node", "scripts/irys_upload.js", "fund", str(lamports),
+                 keypair, "https://api.mainnet-beta.solana.com"],
+                env={**os.environ, "NODE_PATH": _node_path()},
+                timeout=120,
+            )
+            fund_data = json.loads(fund_out.decode())
+            if fund_data.get("status") != "ok":
+                return {"action": "failed",
+                        "reason": fund_data.get("message", "unknown"),
+                        "lamports": lamports}
+            tx_id = fund_data.get("tx_id", "")
+        except Exception as e:
+            return {"action": "failed",
+                    "reason": f"fund_call_error: {e}",
+                    "lamports": lamports}
+
+        # Step 8 — persist + alert
+        self._record_auto_fund_event(top_up, tx_id, runway_days)
+
+        msg = (
+            f"💰 *Titan Auto-Fund Irys*\n"
+            f"Runway: {runway_days:.1f}d → ~{target_runway_days:.0f}d\n"
+            f"Funded: {top_up:.4f} SOL (lamports={lamports})\n"
+            f"Wallet remaining: {wallet_sol - top_up:.4f} SOL "
+            f"(reserve floor {meditation_reserve} SOL)\n"
+            f"Today total: {today_total + top_up:.4f}/{daily_cap} SOL daily cap\n"
+            f"TX: `{tx_id[:24]}...`"
+        )
+        logger.info(
+            "[Cascade] S4-AutoFund SUCCESS funded=%.4f SOL tx=%s "
+            "runway %.1fd→target %.0fd today_total=%.4f/%.4f",
+            top_up, tx_id[:16], runway_days, target_runway_days,
+            today_total + top_up, daily_cap)
+        if notifier is not None:
+            try:
+                notifier(msg)
+            except Exception as e:
+                logger.warning("[Cascade] auto-fund notifier failed: %s", e)
+
+        return {
+            "action": "funded",
+            "amount_sol": round(top_up, 6),
+            "tx_id": tx_id,
+            "lamports": lamports,
+            "irys_sol_before": round(irys_sol, 6),
+            "wallet_sol_after": round(wallet_sol - top_up, 6),
+            "runway_days_before": round(runway_days, 2),
+            "today_total_sol": round(today_total + top_up, 6),
+            "today_tx_count": today_count + 1,
+        }
+
     @staticmethod
     def verify_upload(tx_id: str, expected_sha256: str, size_mb: float) -> bool:
         """S6 — propagation-tolerant HEAD verify (retry for Arweave mining)."""
@@ -434,6 +654,17 @@ class BackupCascade:
                 **({"encryption": encryption_manifest} if encryption_manifest else {}),
                 **({"diff_alert": diff_alert} if diff_alert else {}),
             }
+
+        # S4-pre — Auto-fund hook (rFP §5.5 gap fix). No-op when
+        # [backup].auto_fund_enabled=false (default). When enabled, tops up
+        # Irys deposit if runway < threshold AND wallet has surplus above
+        # the meditation_reserve floor.
+        af_result = self.auto_fund_irys_if_needed(
+            size_mb, notifier=getattr(self, "_telegram_notifier", None))
+        if af_result.get("action") == "funded":
+            # Brief settle delay — Irys credits the deposit ~immediately on
+            # solana confirmation; re-query S4 will see the new balance.
+            time.sleep(2)
 
         # S4 balance
         sufficient, irys_sol, reason = self.check_irys_balance(size_mb)

@@ -233,6 +233,14 @@ class MetabolismController:
         """Kill-switch flag for Mainnet Lifecycle Wiring. False = observability-only."""
         return self._gates_enforced
 
+    def get_gates_enforced(self) -> bool:
+        return self._gates_enforced
+
+    def get_last_gate_decision_reason(self) -> str:
+        if not self._gate_decisions:
+            return ""
+        return self._gate_decisions[-1].get("reason", "")
+
     def evaluate_gate(self, feature: str, caller: str = "") -> tuple[bool, float]:
         """Universal call-site entry point for metabolism gates.
 

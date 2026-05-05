@@ -666,33 +666,58 @@ async def get_mood_detail(request: Request):
 # ---------------------------------------------------------------------------
 @router.get("/status/memory")
 async def get_memory_status(request: Request):
-    """Memory overview: counts, top memories (redacted), decay stats."""
+    """Memory overview: counts, top memories (redacted), decay stats.
+
+    rFP_bus_payload_contracts §3.1 (2026-05-01): bulk data (top memories,
+    mempool items) fetched via RPC through real plugin.memory proxy
+    (request.app.state.titan_plugin), NOT via cache reads. Cache only
+    carries lightweight notification events (counts, updated_at).
+    Pre-rFP this endpoint read titan_state.memory.X() which read cache
+    populated by MEMORY_*_UPDATED bulk publishes — that path was broken
+    on T2/T3 because 2.1 MB embedding payloads failed msgpack UTF-8
+    decode at broker boundary.
+    """
     titan_state = _get_plugin(request)
-    plugin = titan_state  # backward-compat alias for Category C callsites
+    plugin_proxy = request.app.state.titan_plugin  # real plugin (or kernel_rpc proxy)
     try:
-        # Use proxy methods (route through Divine Bus to memory worker)
+        # Status comes from cache (light event, populates correctly).
         mem_status = titan_state.memory.get_memory_status()
         persistent_count = mem_status.get("persistent_count", 0)
         cognee_ready = mem_status.get("cognee_ready", False)
 
-        mempool = titan_state.memory.fetch_mempool()
-        # Fetch the FULL persistent set so internal-injection memories
-        # (e.g. [SELF_PROFILE_INJECTION], weight=10.31) can be filtered out
-        # while real conversation memories are guaranteed to surface.
-        # See core/memory.py:755 — inject_memory() wraps user_prompt with
-        # f"[{source.upper()}_INJECTION] ..." for every internal injection.
-        # These are intentional self-knowledge rows, not user-facing memories,
-        # so they belong in Titan's cognition but not the public Observatory.
-        # Each dream cycle adds another self-profile row, so over days the
-        # injection rows accumulate to thousands and dominate any small top-N
-        # window. Fetching the whole set + filtering is still cheap (~3.5k
-        # dicts, <1 MB) and runs behind the 5s coordinator cache anyway.
-        fetch_n = max(persistent_count + 100, 1000)
-        raw_top = titan_state.memory.get_top_memories(n=fetch_n)
-        top_mems = [
-            m for m in raw_top
-            if not _is_internal_injection(m.get("user_prompt", ""))
-        ][:200]
+        # Bulk data via RPC — observatory-shaped (no embeddings, lightweight
+        # items). Empty list on RPC failure (timeout / proxy unavailable);
+        # endpoint still serves status + counts gracefully.
+        # asyncio.to_thread offloads the blocking bus.request so the FastAPI
+        # event loop stays responsive even if memory worker is mid-meditation.
+        import asyncio
+        mempool = []
+        top_mems = []
+        memory_proxy = getattr(plugin_proxy, "memory", None)
+        if memory_proxy is not None:
+            try:
+                mempool = await asyncio.to_thread(
+                    memory_proxy.fetch_mempool_for_observatory) or []
+            except Exception as _mp_err:
+                logger.warning(
+                    "[Dashboard] memory.fetch_mempool_for_observatory failed: %s",
+                    _mp_err)
+            try:
+                # Worker handler already strips internal injections + applies
+                # 200-cap, so we don't repeat that work endpoint-side.
+                top_mems = await asyncio.to_thread(
+                    memory_proxy.get_top_memories_for_observatory, 200) or []
+                # Endpoint-side injection filter retained as defense in depth
+                # (worker may not have the same _is_internal_injection rule
+                # in legacy code paths during migration).
+                top_mems = [
+                    m for m in top_mems
+                    if not _is_internal_injection(m.get("user_prompt", ""))
+                ][:200]
+            except Exception as _tm_err:
+                logger.warning(
+                    "[Dashboard] memory.get_top_memories_for_observatory failed: %s",
+                    _tm_err)
 
         # Redacted summaries — never expose raw prompts
         top_summaries = []
@@ -766,17 +791,28 @@ _TOPIC_KEYWORDS = {
 
 @router.get("/status/memory/topology")
 async def get_memory_topology(request: Request):
-    """Cognitive Heatmap: cluster distribution of what the Titan is focused on."""
-    titan_state = _get_plugin(request)
-    plugin = titan_state  # backward-compat alias for Category C callsites
+    """Cognitive Heatmap: cluster distribution of what the Titan is focused on.
+
+    rFP_bus_payload_contracts §3.1 (2026-05-01): bulk topology data (per-cluster
+    sample texts) fetched via RPC; cache only carries lightweight cluster-counts
+    notification (MEMORY_TOPOLOGY_UPDATED schema = {updated_at, total_classified,
+    cluster_counts}). Frontend heatmap rendered from RPC output for full fidelity.
+    """
+    plugin_proxy = request.app.state.titan_plugin
     try:
-        # Delegate classification to memory worker (runs in separate process)
-        # Microkernel: MemoryAccessor.get_topology() reads cached classifier
-        # output (no args). Endpoint-side classification arg dropped.
-        result = titan_state.memory.get_topology()
-        return _ok(result)
+        memory_proxy = getattr(plugin_proxy, "memory", None)
+        if memory_proxy is not None:
+            import asyncio
+            # Worker handler computes topology with sample texts per cluster.
+            # _TOPIC_KEYWORDS defined at module scope (see line 757).
+            topic_kws = {k: list(v) for k, v in _TOPIC_KEYWORDS.items()}
+            result = await asyncio.to_thread(
+                memory_proxy.get_topology, topic_kws) or {}
+            return _ok(result)
+        return _ok({"total_persistent": 0, "clusters": {}})
     except Exception as e:
-        return _error(str(e))
+        logger.warning("[Dashboard] /status/memory/topology RPC failed: %s", e)
+        return _ok({"total_persistent": 0, "clusters": {}, "error": str(e)})
 
 
 # ---------------------------------------------------------------------------
@@ -789,17 +825,23 @@ async def get_knowledge_graph(
 ):
     """Return Kuzu knowledge graph entities and relationships for 3D visualization.
 
-    Routes through memory worker proxy (Kuzu connection lives in worker process).
-    Returns Trinity-typed entities (Person, Topic, Body, Mind, Spirit, Media)
-    with relationship edges. Designed for force-directed graph rendering.
+    rFP_bus_payload_contracts §3.1 (2026-05-01): bulk graph data (nodes + edges)
+    fetched via RPC; cache only carries lightweight count notification
+    (MEMORY_KNOWLEDGE_GRAPH_UPDATED schema = {updated_at, node_count, edge_count,
+    entity_types}). Frontend force-directed viz consumes RPC payload directly.
+    Routes through memory_proxy → memory_worker (Kuzu connection lives in worker).
     """
-    titan_state = _get_plugin(request)
-    plugin = titan_state  # backward-compat alias for Category C callsites
+    plugin_proxy = request.app.state.titan_plugin
     try:
-        result = titan_state.memory.get_knowledge_graph(limit=limit)
-        return _ok(result)
+        memory_proxy = getattr(plugin_proxy, "memory", None)
+        if memory_proxy is not None:
+            import asyncio
+            result = await asyncio.to_thread(
+                memory_proxy.get_knowledge_graph, limit) or {}
+            return _ok(result)
+        return _ok({"nodes": [], "edges": [], "stats": {}, "available": False})
     except Exception as e:
-        logger.warning("[Dashboard] /status/memory/knowledge-graph: %s", e)
+        logger.warning("[Dashboard] /status/memory/knowledge-graph RPC failed: %s", e)
         return _ok({"nodes": [], "edges": [], "stats": {}, "available": False, "error": str(e)})
 
 
@@ -1251,18 +1293,19 @@ async def metabolism_evaluate_gate(
         met = getattr(plugin, "metabolism", None)
         if met is None:
             return _error("metabolism controller not wired", code=503)
-        # evaluate_gate logs + adds decision to the ring buffer.
+        # evaluate_gate logs + adds decision to the ring buffer. Subsequent
+        # reads use callable-shaped getters so the kernel_rpc proxy fires real
+        # RPC roundtrips (attribute access alone returns an unresolved
+        # _RPCRemoteRef which is not JSON-serializable).
         should_proceed, rate_mult = met.evaluate_gate(feature, caller=caller or feature)
-        # Pull the underlying reason from the last-appended decision.
-        reason = met._gate_decisions[-1]["reason"] if met._gate_decisions else ""
         return _ok({
             "should_proceed": should_proceed,
             "rate_multiplier": rate_mult,
-            "enforced": met.gates_enforced,
+            "enforced": met.get_gates_enforced(),
             "tier": met.get_metabolic_tier(),
             "feature": feature,
             "caller": caller or feature,
-            "reason": reason,
+            "reason": met.get_last_gate_decision_reason(),
         })
     except Exception as e:
         return _error(str(e))
@@ -3963,9 +4006,13 @@ async def get_dream_inbox(request: Request):
     """Dream inbox: queued messages during sleep, dream state, inbox count."""
     titan_state = _get_plugin(request)
     plugin = titan_state  # backward-compat alias for Category C callsites
-    inbox = getattr(plugin, '_dream_inbox', [])
-    dream_state = getattr(plugin, '_dream_state', {})
-    sorted_inbox = sorted(inbox, key=lambda x: (
+    inbox = getattr(plugin, '_dream_inbox', []) or []
+    dream_state = getattr(plugin, '_dream_state', {}) or {}
+    # Filter to dict items only — cache or legacy persistence can leak
+    # str items (msgpack/JSON roundtrip serialized form). Sorting/.get on
+    # str raises AttributeError; ignoring non-dicts keeps the endpoint live.
+    dict_inbox = [m for m in inbox if isinstance(m, dict)]
+    sorted_inbox = sorted(dict_inbox, key=lambda x: (
         x.get("priority", 1), x.get("timestamp", 0)))
     return _ok({
         "inbox_count": len(inbox),

@@ -28,10 +28,12 @@ PLAN: titan-docs/PLAN_microkernel_phase_b1_shadow_swap.md §7
 from __future__ import annotations
 
 import dataclasses
+import glob
 import json
 import logging
 import os
 import queue
+import shutil
 import signal
 import socket
 import subprocess
@@ -732,6 +734,114 @@ class _SwapLockHeartbeat:
     def _run(self) -> None:
         while not self._stop.wait(SHADOW_SWAP_LOCK_HEARTBEAT_S):
             heartbeat_swap_lock(self.path)
+
+
+# ── Pre-flight disk capacity check ──────────────────────────────────
+#
+# Closes BUG-SHADOW-SWAP-NO-PRE-FLIGHT-DISK-CHECK-20260504. The
+# shadow_data_dir hardlink-break step (titan_plugin/core/shadow_data_dir.py
+# `_break_hardlinks`) real-copies every `*.db / *.duckdb / *.kuzu / *.kuzu.wal`
+# in `data/` into `data_shadow_<port>/`. On Titans with large active DBs
+# (T1 had ~8.5GB of these on 2026-05-04) this can fill `/dev/vda1` before
+# the shadow's own `core/disk_health.py` BOOT ABORT fires — and the
+# disk-full state then breaks the orchestrator's audit-append + watchdog
+# brain-log rotation. Refusing in preflight keeps the failure mode
+# in-memory and rollback-clean.
+
+#: Safety margin on top of computed real-copy bytes. Covers shadow's own
+#: writes during boot (uvicorn log, worker boot logs, cache_state, audit
+#: append, swap lock JSON, transient temp files), plus headroom for DBs
+#: that grow during the swap window itself.
+#:
+#: 2 GB chosen 2026-05-04 after the root-cause fix (mtime-gated
+#: hardlink-break in shadow_data_dir.py). Pre-fix, every top-level
+#: hardlink in data/ was real-copied including hours/days-old telemetry
+#: archives — that needed 6 GB margin. With the fix, only files written
+#: in the last 5 min are real-copied (active DBs), so the predicted
+#: bytes actually match consumption + 2 GB covers shadow's own boot
+#: writes + safety.
+SHADOW_SWAP_DISK_SAFETY_MARGIN_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _compute_real_copy_bytes(data_dir: Path,
+                              recency_threshold_s: int = 300) -> int:
+    """Sum sizes of files that hardlink-break will real-copy.
+
+    Mirrors `shadow_data_dir._break_db_hardlinks` predicate: top-level
+    files in `data_dir` with `nlink > 1` AND `mtime > now - recency`
+    will be real-copied during the swap. mtime-gating eliminates archive
+    files (twin_telemetry_*.json etc) that aren't concurrently written.
+
+    Best-effort: stat failures are silently skipped. The threshold here
+    must match shadow_data_dir.HARDLINK_BREAK_RECENCY_THRESHOLD_S to
+    keep preflight prediction aligned with actual swap behavior.
+    """
+    total = 0
+    if not data_dir.is_dir():
+        return 0
+    cutoff = time.time() - recency_threshold_s
+    for f in data_dir.iterdir():
+        if not f.is_file():
+            continue
+        try:
+            st = f.stat()
+            # nlink check is conservative: at preflight time the source
+            # data dir's files all have nlink=1 (no shadow yet), but they
+            # WILL gain nlink=2 after cp -al, then need to be broken if
+            # mtime is recent. Predict: every recently-modified top-level
+            # file will be real-copied.
+            if st.st_mtime < cutoff:
+                continue  # immutable archive — won't be real-copied
+            total += st.st_size
+        except OSError:
+            pass
+    return total
+
+
+def preflight_disk_check(data_dir: Path) -> Optional[dict[str, Any]]:
+    """Verify the swap has enough disk to run.
+
+    Returns None if disk is sufficient, else a structured rejection dict
+    (status, failure_reason, detail with computed sizes) ready to merge
+    into a SwapResult.
+
+    Computation:
+      required = sum(real-copy globs in data_dir) + SAFETY_MARGIN
+      free     = shutil.disk_usage(data_dir).free
+      ok       = free >= required
+    """
+    try:
+        free_bytes = shutil.disk_usage(str(data_dir)).free
+    except OSError as e:
+        # If we can't even stat the filesystem, refuse — fail safe.
+        return {
+            "outcome": "refused",
+            "phase": "preflight",
+            "failure_reason": "preflight_disk_stat_failed",
+            "detail": f"disk_usage({data_dir}) failed: {e!r}",
+        }
+    real_copy_bytes = _compute_real_copy_bytes(data_dir)
+    required_bytes = real_copy_bytes + SHADOW_SWAP_DISK_SAFETY_MARGIN_BYTES
+    if free_bytes >= required_bytes:
+        return None
+    gb = lambda b: round(b / (1024 ** 3), 2)
+    return {
+        "outcome": "refused",
+        "phase": "preflight",
+        "failure_reason": "insufficient_disk",
+        "detail": (
+            f"shadow_swap requires {gb(required_bytes)} GB free "
+            f"({gb(real_copy_bytes)} GB real-copy + "
+            f"{gb(SHADOW_SWAP_DISK_SAFETY_MARGIN_BYTES)} GB safety margin); "
+            f"only {gb(free_bytes)} GB available on {data_dir}. "
+            f"Free disk and retry. See "
+            f"BUG-SHADOW-SWAP-NO-PRE-FLIGHT-DISK-CHECK-20260504."
+        ),
+        "real_copy_bytes": real_copy_bytes,
+        "required_bytes": required_bytes,
+        "free_bytes": free_bytes,
+        "safety_margin_bytes": SHADOW_SWAP_DISK_SAFETY_MARGIN_BYTES,
+    }
 
 
 # ── Active-port file helpers ────────────────────────────────────────
@@ -1649,6 +1759,30 @@ def orchestrate_shadow_swap(
     try:
         # Phase 0 — preflight
         result.event("preflight_begin")
+
+        # Pre-flight disk capacity check — closes
+        # BUG-SHADOW-SWAP-NO-PRE-FLIGHT-DISK-CHECK-20260504. Refusing here
+        # keeps the failure mode in-memory and rollback-clean (vs running
+        # out of disk mid-shadow-boot which breaks audit/watchdog/rollback).
+        _data_dir = Path(__file__).resolve().parents[2] / "data"
+        _disk_reject = preflight_disk_check(_data_dir)
+        if _disk_reject is not None:
+            result.outcome = _disk_reject["outcome"]
+            result.phase = _disk_reject["phase"]
+            result.failure_reason = _disk_reject["failure_reason"]
+            result.event(
+                "preflight_disk_refused",
+                detail=_disk_reject["detail"],
+                real_copy_bytes=_disk_reject["real_copy_bytes"],
+                required_bytes=_disk_reject["required_bytes"],
+                free_bytes=_disk_reject["free_bytes"],
+            )
+            logger.warning(
+                "[shadow_swap] preflight REFUSED: %s",
+                _disk_reject["detail"],
+            )
+            return result.to_dict()
+
         bus_obj.publish(make_msg(
             bus.SYSTEM_UPGRADE_QUEUED,
             src="shadow_swap", dst="all",

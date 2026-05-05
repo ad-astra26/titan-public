@@ -478,13 +478,17 @@ async def trigger_shadow_swap(request: Request):
     #     maker_full_stop = true   # default — set false to re-enable
     full_stop = True
     try:
-        from titan_plugin.utils.config_loader import get_config
-        cfg = get_config() or {}
+        # 2026-05-04 — fix broken import (was titan_plugin.utils.config_loader.get_config
+        # which never existed; ModuleNotFoundError silently locked full_stop=True).
+        # Real loader is titan_plugin.config_loader.load_titan_config.
+        from titan_plugin.config_loader import load_titan_config
+        cfg = load_titan_config() or {}
         full_stop = bool(cfg.get("microkernel", {})
                          .get("shadow_swap", {})
                          .get("maker_full_stop", True))
-    except Exception:
-        pass  # if config can't load, default to STOPPED — safe-by-default
+    except Exception as cfg_err:
+        logger.warning("[Maker] config load failed reading maker_full_stop: %s "
+                       "— defaulting full_stop=True (safe).", cfg_err)
     if full_stop:
         logger.warning(
             "[Maker] shadow-swap REFUSED — maker_full_stop=true "

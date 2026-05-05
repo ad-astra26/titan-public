@@ -838,6 +838,10 @@ class RebirthBackup:
             "local_dir", self._LOCAL_BACKUP_DIR)
         cascade = BackupCascade(full_config=self._full_config,
                                  arweave_store=store, local_dir=local_dir)
+        # 2026-04-30 — wire Telegram notifier for auto-fund alerts (closes
+        # rFP §5.5 silent-depletion gap). BackupCascade.auto_fund_irys_if_needed
+        # invokes this callback on every successful auto-fund event.
+        cascade._telegram_notifier = self._send_telegram_alert
         cascade_result = await cascade.run(
             archive_path, "personality", _upload_personality,
             get_latest_record_fn=self.get_latest_backup_record,
@@ -966,6 +970,8 @@ class RebirthBackup:
             "local_dir", self._LOCAL_BACKUP_DIR)
         cascade = BackupCascade(full_config=self._full_config,
                                  arweave_store=store, local_dir=local_dir)
+        # 2026-04-30 — wire Telegram notifier for auto-fund alerts (soul path).
+        cascade._telegram_notifier = self._send_telegram_alert
         cascade_result = await cascade.run(
             archive_path, "soul", _upload_soul,
             get_latest_record_fn=self.get_latest_backup_record,

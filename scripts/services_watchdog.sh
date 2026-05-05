@@ -305,12 +305,12 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════
-# CHECK 4b: Events Teacher (cron job, every 15 minutes)
+# CHECK 4b: Events Teacher (cron job: T1 every 15 min, T2/T3 every 30 min)
 # ═══════════════════════════════════════════════════════════════════════
 EVENTS_LOG="/tmp/events_teacher_$(echo "$TITAN_ID" | tr '[:upper:]' '[:lower:]').log"
 if [ -f "$EVENTS_LOG" ]; then
     EVENTS_AGE=$(( TIMESTAMP - $(stat -c %Y "$EVENTS_LOG" 2>/dev/null || echo 0) ))
-    if [ "$EVENTS_AGE" -lt 1800 ]; then  # Updated in last 30 minutes
+    if [ "$EVENTS_AGE" -lt 2700 ]; then  # Updated in last 45 minutes (covers 30-min cadence + slack)
         CURR_STATE[events_teacher]="ok"
         log_telemetry "events_teacher" "check_ok" "\"age_sec\":${EVENTS_AGE}"
     elif [ "$EVENTS_AGE" -lt 7200 ]; then

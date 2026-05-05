@@ -78,6 +78,10 @@ MSG_SPECS: dict[str, BusMsgSpec] = {
     "BUS_WORKER_ADOPT_REQUEST": BusMsgSpec("BUS_WORKER_ADOPT_REQUEST", priority=0),
     "BUS_WORKER_ADOPT_ACK":     BusMsgSpec("BUS_WORKER_ADOPT_ACK",     priority=0),
     "BUS_HANDOFF_CANCELED":     BusMsgSpec("BUS_HANDOFF_CANCELED",     priority=0),
+    # Microkernel v2 Phase B.2 §D9 (2026-05-02) — peer-process death signal
+    # from broker to Guardian. Kernel-critical: must never drop, since it
+    # triggers immediate restart for crashed workers.
+    "BUS_PEER_DIED":            BusMsgSpec("BUS_PEER_DIED",            priority=0),
 
     # ── P1 — Trinity state updates (coalesce by source+type) ───────────────
     # Body/Mind/Spirit emit at Schumann rate (7.83/23.49/70.47 Hz). Under

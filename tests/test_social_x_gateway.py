@@ -206,6 +206,57 @@ class TestRateLimits:
         result = gateway._check_rate_limits("post", config)
         assert result is None  # All clear
 
+    def test_per_titan_min_interval_blocks(self, gateway):
+        # Per-Titan min_post_interval = 7200 (2hrs); T1 posted 1hr ago → blocked
+        config = gateway._load_config()
+        config["limits"] = {"T1": {"min_post_interval": 7200}}
+        config["min_post_interval"] = 0  # Disable global to isolate per-Titan check
+        db = gateway._db()
+        db.execute(
+            "INSERT INTO actions (action_type, status, titan_id, created_at) "
+            "VALUES ('post', 'verified', 'T1', ?)", (time.time() - 3600,))
+        db.commit()
+        db.close()
+
+        result = gateway._check_rate_limits("post", config, titan_id="T1")
+        assert result is not None
+        assert result.status == "too_soon"
+        assert "T1" in result.reason
+        assert "per-Titan" in result.reason
+
+    def test_per_titan_min_interval_independent_per_titan(self, gateway):
+        # T1 posted recently; T2 should NOT be blocked by T1's post
+        config = gateway._load_config()
+        config["limits"] = {
+            "T1": {"min_post_interval": 7200},
+            "T2": {"min_post_interval": 7200},
+        }
+        config["min_post_interval"] = 0  # Disable global
+        db = gateway._db()
+        db.execute(
+            "INSERT INTO actions (action_type, status, titan_id, created_at) "
+            "VALUES ('post', 'verified', 'T1', ?)", (time.time() - 60,))
+        db.commit()
+        db.close()
+
+        result = gateway._check_rate_limits("post", config, titan_id="T2")
+        assert result is None  # T2 not blocked by T1's recent post
+
+    def test_per_titan_min_interval_old_post_passes(self, gateway):
+        # T1 last posted >2hrs ago, with 2hr min_interval → should pass
+        config = gateway._load_config()
+        config["limits"] = {"T1": {"min_post_interval": 7200}}
+        config["min_post_interval"] = 0
+        db = gateway._db()
+        db.execute(
+            "INSERT INTO actions (action_type, status, titan_id, created_at) "
+            "VALUES ('post', 'verified', 'T1', ?)", (time.time() - 7300,))
+        db.commit()
+        db.close()
+
+        result = gateway._check_rate_limits("post", config, titan_id="T1")
+        assert result is None  # Cooldown elapsed
+
     def test_pending_blocks(self, gateway):
         config = gateway._load_config()
         # Insert a pending row

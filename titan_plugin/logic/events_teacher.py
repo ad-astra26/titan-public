@@ -256,6 +256,26 @@ class EventsTeacherDB:
                 UNIQUE(titan_id, our_tweet_id)
             );
 
+            -- 2026-04-30 — Adaptive cycle scoring (Maker design).
+            -- Per-cycle outcome record: did this source's content "land"
+            -- (≥1 event passed perturbation gate)? Score +1 = landed,
+            -- -1 = empty/rejected. Priority for next cycle = sum over last
+            -- N rows per source_type (N = events_teacher_cycle_window).
+            -- See _get_source_priorities + _record_source_outcome.
+            CREATE TABLE IF NOT EXISTS source_cycle_scores (
+                cycle_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                titan_id TEXT NOT NULL,
+                source_type TEXT NOT NULL,           -- "follower" | "vocab" | "wide"
+                score INTEGER NOT NULL,              -- +1 (landed) or -1 (empty)
+                items_fetched INTEGER NOT NULL,
+                items_stored INTEGER NOT NULL,
+                api_calls_used INTEGER NOT NULL,
+                query_text TEXT                      -- the actual query string (for audit)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cycle_recent
+                ON source_cycle_scores(source_type, timestamp DESC);
+
             CREATE INDEX IF NOT EXISTS idx_felt_titan_time
                 ON felt_experiences(titan_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_follower_titan
@@ -442,6 +462,42 @@ class EventsTeacherDB:
         """Mark an engagement reward as sent to CGN."""
         self._route_write("UPDATE engagement_reciprocity SET reward_sent=1 WHERE id=?", (row_id,), table="engagement_reciprocity")
 
+    # ── Adaptive cycle scoring (2026-04-30 Maker design) ──────────────
+
+    def record_source_outcome(self, titan_id: str, source_type: str,
+                               score: int, items_fetched: int,
+                               items_stored: int, api_calls_used: int,
+                               query_text: str = "") -> None:
+        """Persist one cycle's outcome for a source. Score is +1 (landed) or -1."""
+        self._route_write(
+            "INSERT INTO source_cycle_scores "
+            "(timestamp, titan_id, source_type, score, items_fetched, "
+            "items_stored, api_calls_used, query_text) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), titan_id, source_type, score, items_fetched,
+             items_stored, api_calls_used, query_text[:500]),
+            table="source_cycle_scores")
+
+    def get_source_priority_scores(self, titan_id: str, window: int = 10) -> dict:
+        """Return {source_type: sum_score} over last `window` cycles per source.
+
+        Source types absent from history get score=0 (cold start neutral).
+        Priority sort = descending by score; tie-break lexically by source_type.
+        """
+        conn = self._connect()
+        try:
+            scores = {"follower": 0, "vocab": 0, "wide": 0}
+            for source in scores:
+                rows = conn.execute(
+                    "SELECT score FROM source_cycle_scores "
+                    "WHERE titan_id=? AND source_type=? "
+                    "ORDER BY timestamp DESC LIMIT ?",
+                    (titan_id, source, window)).fetchall()
+                scores[source] = sum(r["score"] for r in rows)
+            return scores
+        finally:
+            conn.close()
+
     def get_post_type_engagement_stats(self, titan_id: str,
                                         since_hours: float = 48.0) -> dict:
         """Aggregate engagement by post_type for _select_rich_layers() bias."""
@@ -587,6 +643,30 @@ class EventsTeacher:
         self._titan_id: str = ""
         self._api_base: str = ""
 
+        # 2026-04-30 — Lazy SocialXGateway instance for X API calls.
+        # Maker directive: events_teacher MUST go through gateway (closes
+        # BUG-X-API-LEAK-FROM-DISCOVER-MENTIONS-20260430). Constructed on
+        # first use; reused across all 3 X-API call sites within a single
+        # cron run so the cache is shared.
+        self._x_gateway = None
+
+    def _get_x_gateway(self):
+        """Lazy gateway accessor. One instance per EventsTeacher run.
+
+        Cron runs `EventsTeacher.from_state()` then `run_window()` which
+        spawns up to 3 X API call paths. Sharing the gateway across all 3
+        means cache hits within a single window are free + circuit-breaker
+        state coheres + all telemetry lands in the same audit trail.
+        """
+        if self._x_gateway is None:
+            from titan_plugin.logic.social_x_gateway import SocialXGateway
+            self._x_gateway = SocialXGateway(
+                db_path="./data/social_x.db",
+                config_path="./titan_plugin/config.toml",
+                telemetry_path="./data/social_x_telemetry.jsonl",
+            )
+        return self._x_gateway
+
     # ── Persistence ──────────────────────────────────────────────────
 
     @classmethod
@@ -715,27 +795,23 @@ class EventsTeacher:
         if not api_key:
             return 0
 
-        import httpx
+        gateway = self._get_x_gateway()
         synced = 0
         now = time.time()
 
         for relationship in ["followers", "following"]:
             try:
-                endpoint = (f"https://api.twitterapi.io/twitter/user/{relationship}"
-                            if relationship == "followers" else
-                            f"https://api.twitterapi.io/twitter/user/{relationship}")
-                resp = httpx.get(
-                    endpoint,
-                    params={"userName": handle, "count": 100},
-                    headers={"X-API-Key": api_key},
-                    timeout=20.0,
-                )
-                if resp.status_code != 200:
-                    logger.warning("[EventsTeacher] %s sync HTTP %d",
-                                   relationship, resp.status_code)
+                # 2026-04-30 — route through SocialXGateway (Maker directive
+                # "events_teacher must go through gateway"). Gateway applies
+                # circuit breaker + TTL cache (ttl_user_followers/following)
+                # + telemetry. Returns same dict shape as old direct httpx call.
+                data = gateway.fetch_user_relationships(
+                    user_name=handle, relationship=relationship,
+                    count=100, api_key=api_key)
+                if data.get("status") == "error" or data.get("status") == "circuit_breaker":
+                    logger.warning("[EventsTeacher] %s sync via gateway: %s",
+                                   relationship, data.get("message", "?"))
                     continue
-
-                data = resp.json()
                 # twitterapi.io: {"followers": [...]} or {"following": [...]}
                 users = (data.get("followers") or data.get("following")
                          or data.get("users") or data.get("data") or [])
@@ -881,16 +957,16 @@ class EventsTeacher:
             if not handle:
                 continue
             try:
-                resp = httpx.get(
-                    "https://api.twitterapi.io/twitter/tweet/advanced_search",
-                    params={"query": f"from:{handle}", "queryType": "Latest",
-                            "count": 5},
-                    headers={"X-API-Key": api_key},
-                    timeout=15.0,
-                )
+                # 2026-04-30 — route through SocialXGateway (Maker directive).
+                # search_tweets caches per [social_x.cache].ttl_tweet_advanced_search
+                # (default 120s) — duplicate searches within window return cached
+                # response without burning a paid API call.
+                gateway = self._get_x_gateway()
+                data = gateway.search_tweets(
+                    query=f"from:{handle}", query_type="Latest", count=5,
+                    api_key=api_key)
                 api_calls += 1
-                if resp.status_code == 200:
-                    data = resp.json()
+                if data.get("status") not in ("error", "circuit_breaker"):
                     tweets = data.get("tweets", data.get("data", []))
                     if isinstance(tweets, list):
                         for tw in tweets:
@@ -906,6 +982,298 @@ class EventsTeacher:
                 logger.warning("[EventsTeacher] Timeline fetch failed for %s: %s",
                                handle, e)
 
+        return items, api_calls
+
+    # ── Data Source 2 (NEW 2026-04-30): Vocab-driven topic search ────
+    # Per Maker design: query X using Titan's frontier vocab (most-grounded
+    # + most-recent words) + last-spoken-sentence keyword. Closes the
+    # follower-timeline-stale problem by pulling content thematically
+    # aligned with what Titan is actively learning. Cached via gateway's
+    # ttl_tweet_advanced_search (default 120s).
+
+    def _get_grounded_vocab_terms(self, top_n: int = 2) -> list[str]:
+        """Top-N most-grounded vocabulary words from CGN consumer state.
+
+        Reads via CGNConsumerClient against /dev/shm/cgn_live_weights.bin.
+        Falls back to language teacher state on read error. Filters
+        single-letter / stop-word noise.
+        """
+        try:
+            from titan_plugin.logic.cgn_consumer_client import CGNConsumerClient
+            cgn = CGNConsumerClient("language", state_dir="data/cgn")
+            # CGNConsumerClient may not have get_top_grounded_words; fall back
+            # to scanning grounded_words via language vocabulary.
+            if hasattr(cgn, "get_top_grounded_words"):
+                terms = cgn.get_top_grounded_words(n=top_n) or []
+            else:
+                terms = []
+        except Exception as e:
+            logger.debug("[EventsTeacher] CGN vocab fetch failed: %s", e)
+            terms = []
+        # Fallback: language teacher state on disk
+        if not terms:
+            try:
+                state_path = Path("data/language_teacher_state.json")
+                if state_path.exists():
+                    state = json.loads(state_path.read_text())
+                    grounded = state.get("grounded_words", {})
+                    if isinstance(grounded, dict):
+                        # Sort by confidence desc, take top N
+                        sorted_words = sorted(
+                            grounded.items(),
+                            key=lambda kv: -float(kv[1].get("confidence", 0)
+                                                  if isinstance(kv[1], dict) else kv[1]))
+                        terms = [w for w, _ in sorted_words[:top_n]]
+            except Exception as e:
+                logger.debug("[EventsTeacher] Language state fallback failed: %s", e)
+        # Filter: alpha words only, length >= 4 (skip "a", "the", "is", etc.)
+        return [t for t in terms if t.isalpha() and len(t) >= 4][:top_n]
+
+    def _get_recent_vocab_terms(self, top_n: int = 1) -> list[str]:
+        """Most-recently-learned vocabulary words from language teacher state."""
+        try:
+            state_path = Path("data/language_teacher_state.json")
+            if not state_path.exists():
+                return []
+            state = json.loads(state_path.read_text())
+            recent = state.get("recent_acquisitions", [])
+            if not isinstance(recent, list):
+                return []
+            terms = []
+            for item in recent[-top_n * 4:]:  # scan last 4×N for filter headroom
+                w = item.get("word") if isinstance(item, dict) else item
+                if w and isinstance(w, str) and w.isalpha() and len(w) >= 4:
+                    terms.append(w)
+            return terms[-top_n:]
+        except Exception as e:
+            logger.debug("[EventsTeacher] Recent vocab fetch failed: %s", e)
+            return []
+
+    def _get_last_sentence_keyword(self) -> str:
+        """Extract the most-salient noun from Titan's most-recent spoken sentence.
+
+        Uses self-narration logs (creative_journal / SOCIAL post composition).
+        Returns the longest content-word (heuristic — no NLP dep added).
+        """
+        try:
+            # Recent narration logged in social_x.db actions table (post text)
+            if Path(DEFAULT_SOCIAL_DB).exists():
+                conn = sqlite3.connect(DEFAULT_SOCIAL_DB, timeout=3)
+                row = conn.execute(
+                    "SELECT text FROM actions "
+                    "WHERE action_type='post' AND status IN ('posted','verified') "
+                    "AND text IS NOT NULL AND text != '' "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()
+                conn.close()
+                if row and row[0]:
+                    text = row[0]
+                    # Heuristic: longest alpha word ≥ 6 chars
+                    candidates = [w.strip(".,!?;:'\"") for w in text.split()
+                                  if w.isalpha() or all(c.isalpha() or c in ".,!?;:'\"" for c in w)]
+                    candidates = [c.lower() for c in candidates
+                                  if c.isalpha() and len(c) >= 6]
+                    if candidates:
+                        return max(candidates, key=len)
+        except Exception as e:
+            logger.debug("[EventsTeacher] Last sentence keyword fetch failed: %s", e)
+        return ""
+
+    def _compose_dynamic_query(self, config: dict) -> str:
+        """Build vocab-driven search query.
+
+        OR-joins (top_grounded + most_recent + sentence_keyword). Adds
+        quality filters: lang:en, -is:retweet. Returns empty string if
+        no terms available (caller skips fetch).
+        """
+        et_cfg = config.get("events_teacher", {})
+        gn = int(et_cfg.get("dynamic_grounded_top_n", 2))
+        rn = int(et_cfg.get("dynamic_recent_top_n", 1))
+        use_sent = bool(et_cfg.get("dynamic_sentence_keyword", True))
+        terms: set[str] = set()
+        for t in self._get_grounded_vocab_terms(gn):
+            terms.add(t.lower())
+        for t in self._get_recent_vocab_terms(rn):
+            terms.add(t.lower())
+        if use_sent:
+            sk = self._get_last_sentence_keyword()
+            if sk:
+                terms.add(sk)
+        if not terms:
+            return ""
+        # OR-join (cap 5 terms to keep query under twitterapi.io URL limits)
+        ordered = sorted(terms)[:5]
+        query = " OR ".join(ordered)
+        return f"{query} lang:en -is:retweet"
+
+    def _compose_wide_query(self, config: dict) -> str:
+        """Build wide-net keyword search from Maker-curated [events_teacher]
+        wide_topic_keywords (comma-separated)."""
+        et_cfg = config.get("events_teacher", {})
+        raw = et_cfg.get(
+            "wide_topic_keywords",
+            "#AI,#consciousness,#spiritual,#blockchain,#solana")
+        if isinstance(raw, list):
+            keywords = [str(k).strip() for k in raw if str(k).strip()]
+        else:
+            keywords = [k.strip() for k in str(raw).split(",") if k.strip()]
+        if not keywords:
+            return ""
+        # Cap 6 keywords (URL length safety)
+        query = " OR ".join(keywords[:6])
+        return f"{query} lang:en -is:retweet"
+
+    # ── Adaptive cycle orchestration (2026-04-30 Maker design) ─────────
+
+    _CYCLE_SOURCES = ("follower", "vocab", "wide")
+
+    def _run_adaptive_cycle_fetch(self, titan_id: str,
+                                    config: dict) -> tuple[list[dict], dict]:
+        """Fetch all 3 cycle sources in priority order from last N cycles' scores.
+
+        Returns (items, results) where:
+          items: combined list with each item having `source` field set
+                  ("follower_timeline" / "topic_vocab" / "topic_wide")
+          results: {source: {items_fetched, api_calls, query}} for telemetry
+                  + post-distillation scoring.
+
+        Cost ceiling: 3 X API calls (1 per source). LLM is single batched
+        downstream so 1 LLM call regardless. Some calls may hit the
+        gateway TTL cache (no paid API).
+        """
+        et_cfg = config.get("events_teacher", {})
+        window = int(et_cfg.get("cycle_window_size", 10))
+        scores = {"follower": 0, "vocab": 0, "wide": 0}
+        if self._db:
+            scores = self._db.get_source_priority_scores(titan_id, window=window)
+        # Sort sources desc by score; tie-break lex (deterministic)
+        priority = sorted(
+            self._CYCLE_SOURCES,
+            key=lambda s: (-scores.get(s, 0), s))
+        all_items: list[dict] = []
+        results: dict = {}
+        for source in priority:
+            try:
+                if source == "follower":
+                    items, api_calls = self._fetch_follower_timelines(config)
+                    query = "follower_timelines:top_affinity"
+                elif source == "vocab":
+                    query = self._compose_dynamic_query(config)
+                    items, api_calls = self._fetch_topic_search(
+                        query, config, "topic_vocab")
+                elif source == "wide":
+                    query = self._compose_wide_query(config)
+                    items, api_calls = self._fetch_topic_search(
+                        query, config, "topic_wide")
+                else:
+                    continue
+            except Exception as e:
+                logger.warning("[EventsTeacher] Adaptive cycle source '%s' "
+                               "fetch crashed: %s", source, e)
+                items, api_calls, query = [], 0, ""
+            all_items.extend(items)
+            results[source] = {
+                "items_fetched": len(items),
+                "api_calls": api_calls,
+                "query": (query or "")[:200],
+                "priority_score_at_start": scores.get(source, 0),
+            }
+        # Log telemetry: cycle attempt with priorities
+        try:
+            self._log_telemetry({
+                "event": "adaptive_cycle_fetch",
+                "titan_id": titan_id,
+                "priority_order": list(priority),
+                "scores_at_start": scores,
+                "results": results,
+            })
+        except Exception:
+            pass
+        return all_items, results
+
+    def _record_adaptive_cycle_outcomes(self, titan_id: str,
+                                         events: list,
+                                         cycle_results: dict,
+                                         et_cfg: dict) -> None:
+        """Score each source +1 if ≥land_threshold events landed, else -1.
+
+        Persists to source_cycle_scores table — drives next cycle's
+        priority order.
+        """
+        land_threshold = int(et_cfg.get("land_threshold_events", 1))
+        # Map DistilledEvent.source values back to cycle source labels
+        source_to_label = {
+            "follower": "follower_timeline",
+            "vocab": "topic_vocab",
+            "wide": "topic_wide",
+        }
+        for source, info in cycle_results.items():
+            label = source_to_label.get(source, source)
+            stored_count = sum(
+                1 for e in events
+                if e.source == label and e.relevance >= 0.3)
+            score = +1 if stored_count >= land_threshold else -1
+            try:
+                self._db.record_source_outcome(
+                    titan_id=titan_id, source_type=source, score=score,
+                    items_fetched=info.get("items_fetched", 0),
+                    items_stored=stored_count,
+                    api_calls_used=info.get("api_calls", 0),
+                    query_text=info.get("query", ""))
+            except Exception as e:
+                logger.warning("[EventsTeacher] record_source_outcome "
+                               "failed for %s: %s", source, e)
+            info["items_stored"] = stored_count
+            info["score"] = score
+        # Final cycle telemetry with outcomes
+        try:
+            self._log_telemetry({
+                "event": "adaptive_cycle_outcome",
+                "titan_id": titan_id,
+                "results": cycle_results,
+            })
+        except Exception:
+            pass
+
+    def _fetch_topic_search(self, query: str, config: dict,
+                             source_label: str) -> tuple[list[dict], int]:
+        """Run a single topic search via SocialXGateway. Returns
+        (items_list, api_calls_used).
+
+        Items tagged with `source` field so adaptive cycle scoring can
+        attribute downstream landed/empty outcomes.
+        """
+        if not query:
+            return [], 0
+        api_key = self._get_api_key(config)
+        if not api_key:
+            return [], 0
+        gateway = self._get_x_gateway()
+        items: list[dict] = []
+        api_calls = 1  # one gateway.search_tweets call (may hit cache, still count budget)
+        try:
+            data = gateway.search_tweets(
+                query=query, query_type="Latest", count=20, api_key=api_key)
+            if data.get("status") in ("error", "circuit_breaker"):
+                logger.warning("[EventsTeacher] Topic search '%s' failed: %s",
+                               query[:60], data.get("message", "?")[:120])
+                return [], api_calls
+            tweets = data.get("tweets", data.get("data", []))
+            if not isinstance(tweets, list):
+                return [], api_calls
+            for tw in tweets:
+                text = tw.get("text", "")
+                author = tw.get("author", {})
+                handle = author.get("userName") if isinstance(author, dict) else ""
+                if text and self._is_new_content(text, handle or source_label):
+                    items.append({
+                        "source": source_label,
+                        "author": handle or source_label,
+                        "text": text,
+                        "tweet_id": tw.get("id", ""),
+                    })
+        except Exception as e:
+            logger.warning("[EventsTeacher] Topic search exception: %s", e)
         return items, api_calls
 
     # ── Data Source 3: Own Engagement (1 API call) ───────────────────
@@ -941,15 +1309,16 @@ class EventsTeacher:
         items = []
         api_calls = 0
         try:
-            resp = httpx.get(
-                "https://api.twitterapi.io/twitter/user/last_tweets",
-                params={"userName": handle, "count": 5},
-                headers={"X-API-Key": api_key},
-                timeout=15.0,
-            )
+            # 2026-04-30 — route through SocialXGateway (Maker directive).
+            # fetch_recent_tweets shares cache with gateway's own post-success
+            # verification (ttl_user_last_tweets default 300s) — within the
+            # cooldown window only ONE API call is paid even if events_teacher
+            # cron AND a gateway internal check both fire.
+            gateway = self._get_x_gateway()
+            data = gateway.fetch_recent_tweets(
+                user_name=handle, count=5, api_key=api_key)
             api_calls += 1
-            if resp.status_code == 200:
-                data = resp.json()
+            if data.get("status") not in ("error", "circuit_breaker"):
                 tweets = data.get("tweets", data.get("data", []))
                 if isinstance(tweets, list):
                     for tw in tweets:
@@ -1069,7 +1438,7 @@ class EventsTeacher:
                     "temperature": 0.3,
                     "max_tokens": 800,
                 },
-                timeout=30.0,
+                timeout=45.0,
             )
             latency_ms = int((time.time() - start) * 1000)
             data = resp.json()
@@ -1253,26 +1622,56 @@ class EventsTeacher:
             mode = self._select_mode(vocab_size, nm_flat)
             self._mode_stats[mode] = self._mode_stats.get(mode, 0) + 1
 
-            # ── Source 1: Mentions (FREE) ──
+            # ── Source A: Mentions (FREE; not scored) ──
             mentions = self._fetch_mentions()
             result.mentions_fetched = len(mentions)
             result.mentions_new = len(mentions)
 
-            # ── Source 2: Follower Timelines (1-2 API calls) ──
-            follower_items, follower_calls = self._fetch_follower_timelines(config)
-            result.follower_accounts_checked = min(2, len(self._get_top_followers()))
-            result.follower_tweets_new = len(follower_items)
-            result.api_calls_used += follower_calls
+            # ── Adaptive 3-source cycle (2026-04-30 Maker design) ──
+            # Sources tried in priority order from last N cycles' scores.
+            # Each source fetched (3 X API calls). Single LLM distillation
+            # downstream batches all items + tags by source so scoring
+            # post-gate attributes events to their source. See
+            # _record_adaptive_cycle_outcomes() below.
+            et_cfg = config.get("events_teacher", {})
+            adaptive_enabled = bool(et_cfg.get("adaptive_cycle_enabled", True))
+            cycle_results: dict = {}
 
-            # ── Source 3: Own Engagement (1 API call) ──
+            if adaptive_enabled:
+                cycle_items, cycle_results = self._run_adaptive_cycle_fetch(
+                    titan_id, config)
+                # Source-stored counts will be filled after distillation
+                follower_items = [i for i in cycle_items
+                                  if i.get("source") == "follower_timeline"]
+                vocab_items = [i for i in cycle_items
+                               if i.get("source") == "topic_vocab"]
+                wide_items = [i for i in cycle_items
+                              if i.get("source") == "topic_wide"]
+                result.follower_accounts_checked = min(
+                    2, len(self._get_top_followers()))
+                result.follower_tweets_new = len(follower_items)
+                result.api_calls_used += sum(
+                    r.get("api_calls", 0) for r in cycle_results.values())
+            else:
+                # Legacy path: follower timelines only (no vocab/wide search)
+                follower_items, follower_calls = self._fetch_follower_timelines(config)
+                vocab_items = []
+                wide_items = []
+                result.follower_accounts_checked = min(
+                    2, len(self._get_top_followers()))
+                result.follower_tweets_new = len(follower_items)
+                result.api_calls_used += follower_calls
+
+            # ── Own Engagement (always runs; not scored — self-monitoring) ──
             engagement_items, engagement_calls = self._fetch_own_engagement(config)
             result.own_posts_checked = 3
             result.api_calls_used += engagement_calls
             if engagement_items:
                 result.engagement_delta = engagement_items[0].get("delta", {})
 
-            # ── Combine ──
-            all_items = mentions + follower_items + engagement_items
+            # ── Combine all items for single distillation pass ──
+            all_items = (mentions + follower_items + vocab_items
+                         + wide_items + engagement_items)
             if not all_items:
                 logger.info("[EventsTeacher] Window #%d: no new content",
                             self._window_count)
@@ -1295,6 +1694,14 @@ class EventsTeacher:
             result.events_stored = len([e for e in events if e.relevance >= 0.3])
             result.llm_model = llm_model
             result.llm_latency_ms = latency
+
+            # ── Adaptive cycle: score per source based on gate-pass count ──
+            # Maker design 2026-04-30: each source +1 if its items produced
+            # ≥ land_threshold_events stored; -1 otherwise. Persisted to
+            # source_cycle_scores table — drives next cycle's priority order.
+            if adaptive_enabled and cycle_results and self._db:
+                self._record_adaptive_cycle_outcomes(
+                    titan_id, events, cycle_results, et_cfg)
 
             # ── Store developmental data in SQLite ──
             if self._db:

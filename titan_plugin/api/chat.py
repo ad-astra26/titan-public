@@ -260,7 +260,7 @@ async def chat(req: ChatRequest, request: Request, claims: dict = Depends(verify
                                 m.get("priority", 1), m.get("timestamp", 0)))
                             _batch = _sorted[:3]
                             # L3 Phase A.8.1: preserve deque(maxlen=256) set in
-                            # plugin.__init__ via clear+extend instead of slice
+                            # TitanPlugin __init__ via clear+extend instead of slice
                             # assignment (which would replace the bounded deque
                             # with an unbounded list).
                             plugin._dream_inbox.clear()

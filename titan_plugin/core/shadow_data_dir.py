@@ -76,59 +76,84 @@ def shadow_data_dir_for_port(port: int, root: Path | str = ".") -> Path:
     return Path(root) / f"data_shadow_{int(port)}"
 
 
-def _break_db_hardlinks(dst: Path) -> int:
-    """Replace EVERY hardlinked top-level file in `dst` with a real copy.
+# mtime-based recency threshold for hardlink-break filtering. Files
+# whose mtime is older than (now - threshold) have not been written to
+# in that window, and therefore cannot be in mid-write during the swap.
+# Set generously above the longest expected concurrent-writer cadence:
+#
+#   - SQLite WAL checkpoints: every few seconds
+#   - DuckDB WAL: every few seconds
+#   - consciousness.db: every epoch (~0.5s)
+#   - observatory.db: every observation tick (~few seconds)
+#   - twin_telemetry archive files: written once, then immutable for hours/days
+#   - daily snapshots: every 24h
+#
+# 300s (5 min) cleanly separates active writers from immutable archives
+# while giving healthy headroom over any normal-cadence checkpoint.
+HARDLINK_BREAK_RECENCY_THRESHOLD_S = 300
 
-    Defense-in-depth (2026-04-28 PM late, BUG-T1-INNER-MEMORY-CORRUPTION):
-      Earlier versions of this function used pattern-matching to decide
-      which files to un-hardlink (`*.db`, `*.duckdb`, `*.kuzu`, `*.kuzu.wal`).
-      That left a corruption hole for SQLite auxiliary files (`*.db-wal`,
-      `*.db-shm`) which are NOT a separate `.db` file but share an inode
-      with the canonical's WAL state. When the shadow process opened its
-      copied `inner_memory.db` and ran SQLite WAL recovery, recovery wrote
-      to the (still hardlinked) `-wal` file — corrupting both kernels'
-      view of the database. This is exactly what happened to T1's
-      `inner_memory.db` and `observatory.db` during the 2026-04-28 15:00:34
-      shadow_swap attempt.
 
-    Root-cause-fix: walk ALL top-level files in `dst` and break any
-    hardlink (`nlink > 1`) regardless of extension. The pattern-match
-    safety floor was leaky; this removes the extension dependency.
-    Auxiliary files SQLite/DuckDB/Kuzu may use without us knowing
-    (`-journal`, `-wal`, `-shm`, `.tmp`, `.lock`, etc.) are now all
-    covered by construction. So are append-only logs, FAISS indices,
-    and anything else a future contributor adds at the top level.
+def _break_db_hardlinks(dst: Path,
+                         recency_threshold_s: int = HARDLINK_BREAK_RECENCY_THRESHOLD_S) -> int:
+    """Replace recently-modified hardlinked top-level files in `dst` with real copies.
 
-    Background — original (T2 swap, 2026-04-27 PM):
-      `cp -al` (hardlink) shares inodes between src and dst. The earlier
-      docstring claimed "SQLite/DuckDB break the hardlink on first write"
-      — FALSE for SQLite WAL mode: writes go to a separate `-wal` file,
-      leaving the main `.db` inode untouched until checkpoint, so the
-      hardlink persists. Two kernels with the same `.db` inode open can
-      race during checkpoint, corrupting pages.
+    This walks every top-level file in `dst`, and for each file with
+    `nlink > 1` AND `mtime > now - recency_threshold_s`, replaces the
+    hardlink with a real copy via copy2 + atomic rename.
 
-    Top-level only — subdirs (backups/, history/, meta_teacher/, etc.)
-    stay hardlinked because they aren't concurrently written during the
-    swap window. Append-only files in subdirs (`.jsonl` logs) would be
-    a corruption risk if they are concurrently written during a swap;
-    none are today, but a future audit should re-check before adding
-    any concurrently-written subdir.
+    Why mtime-gated instead of breaking ALL hardlinks (the prior 2026-04-28
+    behavior):
 
-    Trade-off: breaking every top-level hardlink costs disk I/O during
-    swap (each file becomes a real copy). On T1 this is ~5–10 GB of
-    SQLite/DuckDB DBs plus ~50 MB of small files. Acceptable. The cost
-    of pattern-leak corruption is *all of inner_memory.db's history*,
-    which is incomparably worse.
+      The prior `break-everything` implementation was defense-in-depth
+      against BUG-T1-INNER-MEMORY-CORRUPTION (2026-04-28 PM): SQLite WAL
+      pages on the shadow's `*-wal` were written to the (still hardlinked)
+      original-kernel inode, corrupting `inner_memory.db` and
+      `observatory.db`. Correct fix.
+
+      But "break every hardlink" has a side effect: it real-copies hundreds
+      of immutable archive files too — `twin_telemetry_*.json`,
+      `child_dev_telemetry_*.json`, `developmental_day_*.json`, old state
+      snapshots — which have ZERO concurrent-write risk because they
+      haven't been written in hours/days. On T1 (2026-05-04) this caused
+      the shadow data dir to consume ~12GB instead of the ~8.5GB of actual
+      active DBs, filling /dev/vda1 to 100% and triggering kernel
+      DiskHealth EMERGENCY shutdown.
+
+      Root-cause-correct fix: only real-copy files that COULD be in
+      mid-write during the swap. mtime is the proxy. Files with
+      `mtime < now - 300s` have not been written in 5+ minutes and
+      therefore cannot have a writer racing with the shadow's first
+      open. Their hardlink is safe.
+
+      Coverage:
+        - All active DBs (consciousness, observatory, inner_memory,
+          memory, IMW, etc) write at every tick → mtime within last
+          second → break hardlink ✓
+        - SQLite -wal/-shm sidecars: written every few seconds → break ✓
+        - Kuzu .kuzu/.kuzu.wal: write-active → break ✓
+        - DuckDB .duckdb/.duckdb.wal: write-active → break ✓
+        - twin_telemetry_*.json: written once at script run, then
+          immutable for hours → mtime old → skip (correct — no writer) ✓
+        - Soul keypair, identity files: rarely written → skip (read-only
+          for shadow) ✓
+
+      Future-proof: any new file type added to data/ that is concurrently
+      written will have recent mtime and be covered. No allowlist
+      maintenance.
 
     Returns the number of files that had their hardlink broken.
     """
     broken = 0
+    cutoff = time.time() - recency_threshold_s
     for f in dst.iterdir():
         if not f.is_file():
             continue
         try:
-            if f.stat().st_nlink <= 1:
+            st = f.stat()
+            if st.st_nlink <= 1:
                 continue  # already a separate inode
+            if st.st_mtime < cutoff:
+                continue  # mtime too old — not concurrently written, safe to keep hardlinked
             tmp = f.with_suffix(f.suffix + ".unlink.tmp")
             shutil.copy2(f, tmp)
             os.replace(tmp, f)
@@ -140,7 +165,8 @@ def _break_db_hardlinks(dst: Path) -> int:
     return broken
 
 
-def break_canonical_db_hardlinks(canonical: Path | str) -> int:
+def break_canonical_db_hardlinks(canonical: Path | str,
+                                   recency_threshold_s: int = HARDLINK_BREAK_RECENCY_THRESHOLD_S) -> int:
     """Phase B.3 Layer 3 — break leftover hardlinks on canonical data dir's
     SQLite/DuckDB DBs before a swap.
 
@@ -179,17 +205,21 @@ def break_canonical_db_hardlinks(canonical: Path | str) -> int:
     if not canonical.exists():
         return 0
     broken = 0
-    # Defense-in-depth (2026-04-28 PM late, BUG-T1-INNER-MEMORY-CORRUPTION) —
-    # break ALL top-level hardlinks regardless of extension. Pattern-match
-    # previously missed *.db-wal / *.db-shm and corrupted T1's inner_memory.db.
-    # Symmetric to _break_db_hardlinks(dst); see that function's docstring
-    # for full incident analysis.
+    cutoff = time.time() - recency_threshold_s
+    # mtime-gated (2026-05-04 fix): only break hardlinks on files modified
+    # in the last `recency_threshold_s` seconds. Old archive files (e.g.
+    # twin_telemetry_*.json from previous sessions) have no concurrent
+    # writer and don't need real-copying. See _break_db_hardlinks docstring
+    # for incident history (2026-04-28 corruption + 2026-05-04 disk-fill).
     for f in canonical.iterdir():
         if not f.is_file():
             continue
         try:
-            if f.stat().st_nlink <= 1:
+            st = f.stat()
+            if st.st_nlink <= 1:
                 continue
+            if st.st_mtime < cutoff:
+                continue  # not concurrently written — safe to keep hardlinked
             tmp = f.with_suffix(f.suffix + ".unlink.tmp")
             shutil.copy2(f, tmp)
             os.replace(tmp, f)
@@ -200,11 +230,12 @@ def break_canonical_db_hardlinks(canonical: Path | str) -> int:
                 "%s: %s — file remains link>1 (corruption surface "
                 "until next successful break)", f, e)
     # Also handle the timechain/index.db (subdir, but critical — it's the
-    # one that actually corrupted on 2026-04-26).
+    # one that actually corrupted on 2026-04-26). Apply the same mtime gate.
     tc_index = canonical / "timechain" / "index.db"
     if tc_index.exists() and tc_index.is_file():
         try:
-            if tc_index.stat().st_nlink > 1:
+            st = tc_index.stat()
+            if st.st_nlink > 1 and st.st_mtime >= cutoff:
                 tmp = tc_index.with_suffix(".db.unlink.tmp")
                 shutil.copy2(tc_index, tmp)
                 os.replace(tmp, tc_index)

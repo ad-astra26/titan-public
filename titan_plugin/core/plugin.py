@@ -47,8 +47,7 @@ from titan_plugin.bus import (
     EPOCH_TICK,
     IMPULSE,
     OUTER_OBSERVATION,
-    OUTER_TRINITY_COLLECT_REQUEST,
-    OUTER_TRINITY_STATE,
+    OUTER_SOURCES_SNAPSHOT,
     SAGE_STATS,
     SOVEREIGNTY_EPOCH,
     make_msg,
@@ -90,9 +89,6 @@ class TitanPlugin:
         self._agency = None
         self._agency_assessment = None
         self._interface_advisor = None
-
-        # ── V4 Outer Trinity Collector ────────────────────────────────
-        self._outer_trinity_collector = None
 
         # ── Output Verification Gate (security for all external outputs) ──
         # L3 §A.8.3: when microkernel.a8_output_verifier_subprocess_enabled
@@ -365,32 +361,52 @@ class TitanPlugin:
             b2_1_swap_critical=False,  # not on hot ARC path; respawn-OK
         ))
 
-        # Outer Trinity Worker — L1 §A.8.4 subprocess extraction.
-        # Hosts the OuterTrinityCollector instance + computes 132D
-        # outer trinity tensors on each OUTER_TRINITY_COLLECT_REQUEST
-        # from parent. Publishes OUTER_TRINITY_STATE for downstream
-        # consumers (state_register, dashboard, spirit_worker). Default
-        # OFF — when flag flips, parent's _outer_trinity_loop publishes
-        # COLLECT_REQUEST instead of computing locally (see plugin.py:
-        # _outer_trinity_loop).
-        from titan_plugin.modules.outer_trinity_worker import (
-            outer_trinity_worker_main,
-        )
-        _ot_subproc_enabled = bool(
-            self._full_config.get("microkernel", {}).get(
-                "a8_outer_trinity_subprocess_enabled", False))
+        # Phase A.S8 — 3 symmetric outer trinity subprocess workers.
+        # Each worker owns its own Schumann-clocked SHM write + rate-gated
+        # bus publish. Publishes OUTER_BODY/MIND/SPIRIT_STATE (3 separate
+        # messages, mirror of inner BODY/MIND/SPIRIT_STATE pattern).
+        from titan_plugin.modules.outer_body_worker import outer_body_worker_main
+        from titan_plugin.modules.outer_mind_worker import outer_mind_worker_main
+        from titan_plugin.modules.outer_spirit_worker import outer_spirit_worker_main
+
         self.guardian.register(ModuleSpec(
-            name="outer_trinity",
-            layer="L1",  # outer-trinity sister to body/mind/spirit per rFP §A.5
-            entry_fn=outer_trinity_worker_main,
+            name="outer_body",
+            layer="L1",
+            entry_fn=outer_body_worker_main,
             config=self._full_config,
-            rss_limit_mb=300,    # pure compute; no DB / model state
-            autostart=_ot_subproc_enabled,  # Only when flag flipped
+            rss_limit_mb=200,
+            autostart=True,
             lazy=False,
             heartbeat_timeout=60.0,
             reply_only=False,
             start_method="spawn" if _spawn_grad else "fork",
-            b2_1_swap_critical=False,  # 60s cadence — respawn-OK
+            b2_1_swap_critical=False,
+        ))
+        self.guardian.register(ModuleSpec(
+            name="outer_mind",
+            layer="L1",
+            entry_fn=outer_mind_worker_main,
+            config=self._full_config,
+            rss_limit_mb=200,
+            autostart=True,
+            lazy=False,
+            heartbeat_timeout=60.0,
+            reply_only=False,
+            start_method="spawn" if _spawn_grad else "fork",
+            b2_1_swap_critical=False,
+        ))
+        self.guardian.register(ModuleSpec(
+            name="outer_spirit",
+            layer="L1",
+            entry_fn=outer_spirit_worker_main,
+            config=self._full_config,
+            rss_limit_mb=200,
+            autostart=True,
+            lazy=False,
+            heartbeat_timeout=60.0,
+            reply_only=False,
+            start_method="spawn" if _spawn_grad else "fork",
+            b2_1_swap_critical=False,
         ))
 
         # Reflex Worker — L3 §A.8.5 subprocess extraction.
@@ -863,6 +879,16 @@ class TitanPlugin:
             reply_only=False,     # Subscribes to MEDITATION_COMPLETE + BACKUP_TRIGGER_MANUAL broadcasts
             start_method="spawn" if _spawn_ref else "fork",  # S6 (§A.3)
             b2_1_swap_critical=False,  # M5: light-state worker; respawn-OK
+            # 2026-04-30 — broadcast topic filter (closes 09:55 backup-queue
+            # flood regression from spawn_graduated activation: SPHERE_PULSE/
+            # SPIRIT_STATE/SAGE_STATS broadcasts saturating queue capacity).
+            # Only these 2 broadcast types reach backup; targeted dst="backup"
+            # messages (SAVE_NOW, MODULE_SHUTDOWN, RESUME) are unaffected by
+            # broadcast filter — broker routes them by name match.
+            broadcast_topics=[
+                bus.MEDITATION_COMPLETE,
+                bus.BACKUP_TRIGGER_MANUAL,
+            ],
         ))
 
         # EMOT-CGN Worker (8th CGN consumer — emotional grounding)
@@ -967,11 +993,51 @@ class TitanPlugin:
             name="api",
             entry_fn=api_subprocess_main,
             config=sub_config,
-            rss_limit_mb=300,
+            # 2026-05-01: bumped 300 → 800MB. Original 300 assumed
+            # "asyncio + sqlite3 + msgpack only; stays lean" but the
+            # api subprocess actually loads full FastAPI + dashboard
+            # (60+ endpoints) + chat + maker + webhook + RPC client +
+            # uvicorn = 600-700MB baseline observed today. 300 caused
+            # crash-loop disable (5 restarts in 600s → Guardian disable
+            # for 600s → T1 API offline cycle). Bump is a tourniquet —
+            # the underlying baseline-too-high investigation is part
+            # of the multi-week RSS battle (BUG-PARENT-MEMORY-LEAK-
+            # HOST-OOM thread). Real fix needs heap-dump on stable
+            # api process to identify allocator hotspots.
+            rss_limit_mb=800,
             autostart=True,
             lazy=False,
             heartbeat_timeout=60.0,
             layer="L3",
+            # 2026-05-01: broadcast_topics filter — matches what api_subprocess
+            # actually consumes per cache_key_registry.py producer_event entries
+            # (16 *_UPDATED broadcasts that populate observatory CachedState).
+            # Pre-fix: empty broadcast_topics → broker used _HIGH_RATE_BROADCAST_
+            # TYPES stopgap which silently DROPPED PI_HEARTBEAT_UPDATED + TOPOLOGY_
+            # STATE_UPDATED (both events api NEEDS!) → /v4/pi-heartbeat + /v4/topology
+            # returned empty data on T2/T3 under microkernel v2 socket-broker mode.
+            # Targeted dst="api" messages (STATE_SNAPSHOT_RESPONSE, OBSERVATORY_
+            # EVENT, RESPONSE for chat bridge) bypass broadcast filter automatically
+            # via name-based routing — not listed here.
+            # Mirrors the `backup` ModuleSpec migration pattern (1 of 17 → 2 of 17).
+            broadcast_topics=[
+                bus.CHI_UPDATED,
+                bus.DREAMING_STATE_UPDATED,
+                bus.EXPRESSION_COMPOSITES_UPDATED,
+                bus.LANGUAGE_STATS_UPDATED,
+                bus.MEMORY_KNOWLEDGE_GRAPH_UPDATED,
+                bus.MEMORY_MEMPOOL_UPDATED,
+                bus.MEMORY_STATUS_UPDATED,
+                bus.MEMORY_TOPOLOGY_UPDATED,
+                bus.MEMORY_TOP_UPDATED,
+                bus.META_REASONING_STATS_UPDATED,
+                bus.MSL_STATE_UPDATED,
+                bus.NEUROMOD_STATS_UPDATED,
+                bus.PI_HEARTBEAT_UPDATED,
+                bus.REASONING_STATS_UPDATED,
+                bus.SOLANA_BALANCE_UPDATED,
+                bus.TOPOLOGY_STATE_UPDATED,
+            ],
         ))
         logger.info(
             "[TitanPlugin] api_subprocess registered as L3 module "
@@ -2970,123 +3036,50 @@ class TitanPlugin:
                 await asyncio.sleep(60)
 
     # ------------------------------------------------------------------
-    # V4: Outer Trinity Collector
+    # Phase A.S8: Outer Sources publisher (plugin-only sources → 3 workers)
     # ------------------------------------------------------------------
 
-    def _boot_outer_trinity(self) -> None:
-        """Initialize the Outer Trinity collector for V4 Time Awareness.
+    async def _publish_outer_sources_loop(self) -> None:
+        """Every 10s, gather plugin-only outer sources and publish OUTER_SOURCES_SNAPSHOT.
 
-        Lifted verbatim from v5_core.py:2142-2149.
+        The 3 outer trinity workers (outer_body/mind/spirit) self-fetch all
+        sources accessible without a plugin reference (file reads, utility modules,
+        httpx). Plugin-only sources that require live proxy or module references
+        are gathered here and broadcast via OUTER_SOURCES_SNAPSHOT so workers
+        can cache them at tick time.
         """
-        try:
-            from titan_plugin.logic.outer_trinity import OuterTrinityCollector
-            self._outer_trinity_collector = OuterTrinityCollector()
-            logger.info("[TitanPlugin] OuterTrinityCollector booted")
-        except Exception as e:
-            logger.warning("[TitanPlugin] OuterTrinityCollector boot failed: %s", e)
-
-    async def _outer_trinity_loop(self) -> None:
-        """Periodically collect Outer Trinity tensors and publish to bus.
-
-        Spirit worker receives OUTER_TRINITY_STATE and ticks outer sphere clocks.
-        Interval from [epochs].outer_trinity_interval (default: 60s).
-
-        A.8.4 — flag-aware:
-          flag-off (default): gather sources + collector.collect() locally,
-            publish OUTER_TRINITY_STATE (legacy behavior, byte-identical).
-          flag-on: gather sources, drop unserializable handles, publish
-            OUTER_TRINITY_COLLECT_REQUEST → outer_trinity_worker computes
-            and publishes OUTER_TRINITY_STATE itself.
-        """
-        epochs_cfg = self._full_config.get("epochs", {})
-        interval = int(epochs_cfg.get("outer_trinity_interval", 60))
-
-        # Read flag once at startup — runtime flips require a restart anyway
-        # (Guardian only autostarts the worker at boot per ModuleSpec).
-        _ot_subproc_enabled = bool(
-            self._full_config.get("microkernel", {}).get(
-                "a8_outer_trinity_subprocess_enabled", False))
-
-        # Wait for subsystems to come online
-        await asyncio.sleep(min(interval, 30))
-
-        logger.info(
-            "[TitanPlugin] Outer Trinity loop started (interval=%ds, subprocess=%s)",
-            interval, _ot_subproc_enabled,
-        )
-
+        await asyncio.sleep(15)  # Let workers boot before first snapshot
+        logger.info("[TitanPlugin] Outer sources loop started (10s interval)")
         while True:
             try:
-                # Gather live sources for the collector. The method is sync
-                # and does a 3s-timeout httpx.get to the twin Titan — wrap
-                # in to_thread so this async loop doesn't block the event
-                # loop during twin polling. Found by async-blocks v2
-                # scanner (2026-04-14).
-                sources = await asyncio.to_thread(self._gather_outer_trinity_sources)
+                snap = await asyncio.to_thread(self._gather_outer_sources)
+                self.bus.publish(make_msg(
+                    OUTER_SOURCES_SNAPSHOT, "core", "all", snap,
+                ))
+            except Exception as _e:
+                logger.debug("[TitanPlugin] outer_sources_loop error: %s", _e)
+            await asyncio.sleep(10)
 
-                if _ot_subproc_enabled:
-                    # Subprocess mode (A.8.4): worker hosts the collector.
-                    # Strip the observatory_db handle (unserializable);
-                    # pre-extracted counts (art_count_100/500 etc.) are
-                    # already in `sources` and the collector reads those
-                    # in preference. Worker publishes OUTER_TRINITY_STATE.
-                    sources.pop("observatory_db", None)
-                    self.bus.publish(make_msg(
-                        OUTER_TRINITY_COLLECT_REQUEST, "core", "outer_trinity",
-                        {"sources": sources},
-                    ))
-                    logger.debug(
-                        "[TitanPlugin] Outer Trinity COLLECT_REQUEST sent to worker")
-                elif self._outer_trinity_collector:
-                    # In-parent mode (default): compute locally + publish.
-                    result = self._outer_trinity_collector.collect(sources)
-                    # Publish to bus → Spirit worker receives and ticks
-                    # outer sphere clocks; state_register also subscribes
-                    # (broadcast) and routes outer_body/outer_mind/
-                    # outer_spirit into its _state dict, which kernel
-                    # snapshot reads to populate the spirit.coordinator.
-                    # outer_trinity cache key (otherwise /v4/inner-trinity
-                    # returns 0.5 defaults — observed 2026-04-26 sweep).
-                    self.bus.publish(make_msg(
-                        OUTER_TRINITY_STATE, "core", "all", result,
-                    ))
-                    logger.debug(
-                        "[TitanPlugin] Outer Trinity published: body=%s mind=%s spirit=%s",
-                        [round(v, 2) for v in result["outer_body"]],
-                        [round(v, 2) for v in result["outer_mind"]],
-                        [round(v, 2) for v in result["outer_spirit"]],
-                    )
+    def _gather_outer_sources(self) -> dict:
+        """Gather plugin-only outer sources for OUTER_SOURCES_SNAPSHOT.
 
-            except Exception as e:
-                logger.warning("[TitanPlugin] Outer Trinity loop error: %s", e)
-
-            await asyncio.sleep(interval)
-
-    def _gather_outer_trinity_sources(self) -> dict:
-        """Gather live data sources for OuterTrinityCollector.
-
-        Lifted verbatim from v5_core.py:2199-2342. Path adjustment:
-        plugin.py is in titan_plugin/core/ so data/ resolves via
-        "..", ".." rather than ".." in v5_core.py.
+        Returns a flat dict of all plugin-owned values that outer workers
+        cannot self-fetch. Self-fetched sources (sol_balance, anchor_state,
+        system_sensor_stats, etc.) are NOT duplicated here — workers own them.
         """
         sources: dict = {
             "uptime_seconds": time.time() - self._start_time,
         }
 
-        # Agency stats
         if self._agency:
             sources["agency_stats"] = self._agency.get_stats()
         if self._agency_assessment:
             sources["assessment_stats"] = self._agency_assessment.get_stats()
-
-        # Helper statuses
         if self._agency and hasattr(self._agency, '_registry'):
             sources["helper_statuses"] = self._agency._registry.get_all_statuses()
 
-        # Bus stats
         sources["bus_stats"] = self.bus.stats
 
-        # Impulse engine stats (via spirit proxy query)
         try:
             spirit_proxy = self._proxies.get("spirit")
             if spirit_proxy:
@@ -3096,19 +3089,8 @@ class TitanPlugin:
         except Exception:
             pass
 
-        # Observatory DB
-        sources["observatory_db"] = getattr(self, "_observatory_db", None)
-
-        # A.8.4: pre-extract expressive archive counts so the worker can
-        # compute without an observatory_db handle (the handle isn't
-        # serializable across the bus). The collector reads these
-        # pre-extracted scalars in preference to direct obs_db queries
-        # — see logic/outer_trinity.py:_collect_outer_mind/_collect_extended.
-        # Pre-extracting here (always, not flag-gated) keeps flag-off
-        # path identical (collector uses pre-extracted = obs_db query
-        # = same value) and avoids a DB round-trip per dim.
         try:
-            _obs = sources["observatory_db"]
+            _obs = getattr(self, "_observatory_db", None)
             if _obs is not None:
                 sources["art_count_100"] = len(
                     _obs.get_expressive_archive(type_="art", limit=100))
@@ -3119,11 +3101,9 @@ class TitanPlugin:
                 sources["audio_count_500"] = len(
                     _obs.get_expressive_archive(type_="audio", limit=500))
         except Exception as _exc:
-            swallow_warn(
-                '[OuterTrinity] expressive count pre-extract failed', _exc,
-                key="core.plugin.expressive_pre_extract", throttle=100)
+            swallow_warn('[OuterSources] expressive count pre-extract failed', _exc,
+                         key="core.plugin.outer_sources_expressive", throttle=100)
 
-        # Memory status
         try:
             memory_proxy = self._proxies.get("memory")
             if memory_proxy:
@@ -3131,31 +3111,16 @@ class TitanPlugin:
         except Exception:
             pass
 
-        # Soul health
         if self.soul:
             sources["soul_health"] = 0.9 if not self._limbo_mode else 0.2
         else:
             sources["soul_health"] = 0.2
 
-        # LLM latency (from Ollama Cloud stats if available)
-        sources["llm_avg_latency"] = 0.0  # Will be enriched when LLM proxy exposes latency
+        sources["llm_avg_latency"] = 0.0
 
-        # Anchor state (from spirit_worker memo inscriptions)
-        try:
-            import json as _json
-            _anchor_path = os.path.join(
-                os.path.dirname(__file__), "..", "..", "data", "anchor_state.json")
-            if os.path.exists(_anchor_path):
-                with open(_anchor_path) as _af:
-                    sources["anchor_state"] = _json.load(_af)
-        except Exception:
-            pass
-
-        # Social perception stats (from spirit_worker SOCIAL_PERCEPTION handler)
         try:
             spirit_proxy = self._proxies.get("spirit")
             if spirit_proxy and hasattr(spirit_proxy, '_bus'):
-                # Query coordinator for accumulated social stats
                 _sp_result = spirit_proxy._bus.request(
                     make_msg(bus.QUERY, "core", "spirit",
                              {"action": "get_social_perception_stats"}),
@@ -3165,71 +3130,12 @@ class TitanPlugin:
         except Exception:
             pass
 
-        # Twin awareness: poll the other Titan's state for twin_resonance
-        try:
-            import httpx
-            twin_api = "http://10.135.0.6:7777"  # T2 via VPC
-            r = httpx.get(f"{twin_api}/v4/inner-trinity", timeout=3)
-            if r.status_code == 200:
-                twin_data = r.json().get("data", {})
-                twin_nm = twin_data.get("neuromodulators", {})
-                twin_mods = twin_nm.get("modulators", {})
-                sources["twin_state"] = {
-                    "reachable": True,
-                    "emotion": twin_nm.get("current_emotion", "?"),
-                    "DA": twin_mods.get("DA", {}).get("level", 0.5),
-                    "NE": twin_mods.get("NE", {}).get("level", 0.5),
-                    "GABA": twin_mods.get("GABA", {}).get("level", 0.5),
-                    "tick_count": twin_data.get("tick_count", 0),
-                }
-            else:
-                sources["twin_state"] = {"reachable": False}
-        except Exception:
-            sources["twin_state"] = {"reachable": False}
-
-        # ── Phase 1 sensory wiring (rFP_phase1_sensory_wiring) ─────────
-        try:
-            from titan_plugin.utils import system_sensor as _sys_sensor
-            sources["system_sensor_stats"] = _sys_sensor.get_all_stats()
-        except Exception as _se:
-            swallow_warn('[OuterTrinity] system_sensor unavailable', _se,
-                         key="core.plugin.system_sensor_unavailable", throttle=100)
-
-        try:
-            from titan_plugin.utils import network_monitor as _net_mon
-            _rpc_url = None
-            if hasattr(self, "network") and self.network is not None:
-                _rpc_urls = getattr(self.network, "rpc_urls", None) or []
-                _rpc_url = _rpc_urls[0] if _rpc_urls else None
-            sources["network_monitor_stats"] = _net_mon.get_all_stats(
-                rpc_url=_rpc_url,
-                bus_stats=sources.get("bus_stats"),
-            )
-        except Exception as _ne:
-            swallow_warn('[OuterTrinity] network_monitor unavailable', _ne,
-                         key="core.plugin.network_monitor_unavailable", throttle=100)
-
-        try:
-            from titan_plugin.logic.timechain_v2 import (
-                get_tx_latency_stats, get_block_delta_stats,
-            )
-            sources["tx_latency_stats"] = get_tx_latency_stats()
-            sources["block_delta_stats"] = get_block_delta_stats()
-        except Exception as _te:
-            swallow_warn('[OuterTrinity] timechain_v2 stats unavailable', _te,
-                         key="core.plugin.timechain_v2_stats_unavailable", throttle=100)
-
-        # SOL balance (from data/last_balance.txt, written by metabolism)
-        try:
-            _bal_path = os.path.join(
-                os.path.dirname(__file__), "..", "..", "data", "last_balance.txt")
-            if os.path.exists(_bal_path):
-                with open(_bal_path) as _bf:
-                    sources["sol_balance"] = float(_bf.read().strip())
-        except Exception:
-            pass
-
         return sources
+
+    # DELETED: _boot_outer_trinity (replaced by 3 autostart ModuleSpecs in _register_modules)
+    # DELETED: _outer_trinity_loop (replaced by _publish_outer_sources_loop)
+    # DELETED: _gather_outer_trinity_sources (replaced by _gather_outer_sources above)
+
 
     # ------------------------------------------------------------------
     # Agent (Agno) — delegates to LLM module
@@ -3369,10 +3275,54 @@ class TitanPlugin:
         # Meditation cycle (memory consolidation, mempool scoring, Cognee cognify)
         asyncio.get_event_loop().create_task(self._meditation_loop())
 
-        # V4: Outer Trinity collector loop (computes Outer Trinity tensors, publishes to bus)
-        self._boot_outer_trinity()
-        if self._outer_trinity_collector:
-            asyncio.get_event_loop().create_task(self._outer_trinity_loop())
+        # Phase A.S8: Outer sources publisher loop (plugin-only sources → 3 workers)
+        asyncio.get_event_loop().create_task(self._publish_outer_sources_loop())
+
+        # Phase C C-S6: outer sensor refresh sidecars (SPEC §9.D).
+        # These are in-process asyncio tasks that snapshot the canonical
+        # `sources` dict (per `_gather_outer_trinity_sources`) into msgpack-
+        # encoded sensor_cache_outer_*.bin shm slots that titan-outer-
+        # {body,mind,spirit}-rs Rust daemons read. Sidecars run
+        # UNCONDITIONALLY (not flag-gated per PLAN §1.1 item 9 + SPEC §9.D
+        # + §11.B line 1236) — writing to a slot Rust daemons don't yet
+        # read is zero-cost and gives a soak window before C-S7 first
+        # flag-flip. Each sidecar has its own in-process restart loop
+        # (in-process exception handler per SPEC §11.B line 1236).
+        try:
+            from titan_plugin.logic.outer_body_sensor_refresh import (
+                OuterBodySensorRefresh)
+            from titan_plugin.logic.outer_mind_sensor_refresh import (
+                OuterMindSensorRefresh)
+            from titan_plugin.logic.outer_spirit_sensor_refresh import (
+                OuterSpiritSensorRefresh)
+            # Each sidecar reuses the parent's in-process source-gathering
+            # so RPC traffic is unchanged (sidecar reads in-process registry
+            # only — no new Solana RPC, no new observatory queries beyond
+            # what _gather_outer_sources already does).
+            sources_provider = self._gather_outer_sources
+            self._outer_body_sensor_sidecar = OuterBodySensorRefresh(
+                sources_provider=sources_provider)
+            self._outer_mind_sensor_sidecar = OuterMindSensorRefresh(
+                sources_provider=sources_provider)
+            self._outer_spirit_sensor_sidecar = OuterSpiritSensorRefresh(
+                sources_provider=sources_provider)
+            asyncio.get_event_loop().create_task(
+                self._outer_body_sensor_sidecar.run())
+            asyncio.get_event_loop().create_task(
+                self._outer_mind_sensor_sidecar.run())
+            asyncio.get_event_loop().create_task(
+                self._outer_spirit_sensor_sidecar.run())
+            logger.info(
+                "[TitanPlugin] outer sensor refresh sidecars started "
+                "(body=%.1fs / mind=%.1fs / spirit=%.1fs cadence)",
+                self._outer_body_sensor_sidecar._refresh_period_s,
+                self._outer_mind_sensor_sidecar._refresh_period_s,
+                self._outer_spirit_sensor_sidecar._refresh_period_s,
+            )
+        except Exception as e:
+            logger.warning(
+                "[TitanPlugin] outer sensor refresh sidecar boot failed "
+                "(non-fatal — Rust outer daemons read last-known): %s", e)
 
         # V4: DivineBus → EventBus bridge (forwards V4 events to WebSocket clients)
         asyncio.get_event_loop().create_task(self._v4_event_bridge_loop())

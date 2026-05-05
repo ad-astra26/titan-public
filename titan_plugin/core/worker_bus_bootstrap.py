@@ -70,7 +70,8 @@ def _try_load_identity_secret(keypair_path: str) -> Optional[bytes]:
 
 
 def setup_worker_bus(name: str, recv_q, send_q,
-                     *, env=None) -> Tuple[object, object, Optional[object]]:
+                     *, env=None,
+                     topics: Optional[list] = None) -> Tuple[object, object, Optional[object]]:
     """Resolve the worker's bus transport.
 
     Args:
@@ -79,6 +80,12 @@ def setup_worker_bus(name: str, recv_q, send_q,
                  (Guardian still allocates these; they're harmless if unused).
         send_q:  The mp.Queue for outbound publishes.
         env:     Optional env dict for testing; defaults to os.environ.
+        topics:  Per-worker broadcast filter list (e.g. ["MEDITATION_COMPLETE",
+                 "BACKUP_TRIGGER_MANUAL"]). When non-empty + bus_ipc_socket
+                 mode: broker filters `dst="all"` broadcasts at publish time
+                 so only `type ∈ topics` reaches this subscriber. None / empty
+                 list = legacy "subscribe-all" (every broadcast delivered).
+                 Closes per-subscriber flood class identified 2026-04-30.
 
     Returns:
         (recv_queue, send_queue, client)
@@ -100,13 +107,69 @@ def setup_worker_bus(name: str, recv_q, send_q,
     titan_id = env.get(ENV_BUS_TITAN_ID)
     keypair_path = env.get(ENV_BUS_KEYPAIR_PATH)
     if not sock_path or not titan_id or not keypair_path:
+        # Phase B.2 §D12 audit (2026-05-02) — make the legacy-fallback path
+        # LOUD. Silent fallback masks regressions: if env wiring breaks (e.g.
+        # kernel forgets to set vars), worker silently runs in legacy mp.Queue
+        # mode while the rest of the fleet expects socket mode → hard-to-debug
+        # split-brain. Log WARNING with which env var(s) are missing so the
+        # field operator can see it immediately.
+        missing = []
+        if not sock_path:
+            missing.append(ENV_BUS_SOCKET_PATH)
+        if not titan_id:
+            missing.append(ENV_BUS_TITAN_ID)
+        if not keypair_path:
+            missing.append(ENV_BUS_KEYPAIR_PATH)
+        logger.warning(
+            "[worker_bus_bootstrap] worker '%s' falling back to mp.Queue "
+            "LEGACY MODE — missing env var(s): %s. Under microkernel v2 "
+            "with bus_ipc_socket_enabled=true, this means the worker is "
+            "off-contract: kernel-side dst='%s' messages will deliver via "
+            "in-process Queue (only works if forked from same parent), and "
+            "worker publishes go to mp.Queue (drained by Guardian.drain_send_queues, "
+            "which is being retired). Fix: ensure kernel sets all 3 env vars "
+            "before spawning this worker.",
+            name, ",".join(missing), name)
+        # B.3 Stage 1 (2026-05-02): if Guardian passed None for the queues
+        # (because broker is attached and fork-at-locked-mp.Queue avoidance
+        # is active), there's nothing to fall back to — the worker can't
+        # function without queues. Raise so Guardian sees the crash and
+        # restarts (with backoff) rather than the worker silently
+        # AttributeError-ing on `None.get(...)` deep in entry_fn.
+        if recv_q is None or send_q is None:
+            raise RuntimeError(
+                f"setup_worker_bus for '{name}' must succeed in socket mode — "
+                f"Guardian set queues to None (broker attached) but socket "
+                f"setup failed (see prior WARNING/ERROR for cause). Worker "
+                f"cannot run without queues."
+            )
         return recv_q, send_q, None
     secret = _try_load_identity_secret(keypair_path)
     if secret is None:
+        # Same loud-fallback rationale as above — but for the keypair branch.
+        # Stat counter equivalent in DivineBus.stats is
+        # `non_kernel_internal_subscribe_under_socket` (a different signal —
+        # this branch is "env vars set but keypair unreadable"). Log captures
+        # the path so the field operator can chmod / restore it.
         logger.warning(
-            "[worker_bus_bootstrap] keypair not readable at %s; "
-            "falling back to mp.Queue legacy mode for worker '%s'",
-            keypair_path, name)
+            "[worker_bus_bootstrap] worker '%s' falling back to mp.Queue "
+            "LEGACY MODE — keypair at '%s' not readable (file missing, "
+            "malformed, or chmod 0600 violated). Worker will be off-contract "
+            "until keypair is restored AND kernel restarts.",
+            name, keypair_path)
+        # B.3 Stage 1 (2026-05-02): if Guardian passed None for the queues
+        # (because broker is attached and fork-at-locked-mp.Queue avoidance
+        # is active), there's nothing to fall back to — the worker can't
+        # function without queues. Raise so Guardian sees the crash and
+        # restarts (with backoff) rather than the worker silently
+        # AttributeError-ing on `None.get(...)` deep in entry_fn.
+        if recv_q is None or send_q is None:
+            raise RuntimeError(
+                f"setup_worker_bus for '{name}' must succeed in socket mode — "
+                f"Guardian set queues to None (broker attached) but socket "
+                f"setup failed (see prior WARNING/ERROR for cause). Worker "
+                f"cannot run without queues."
+            )
         return recv_q, send_q, None
     # All systems go for socket mode
     try:
@@ -118,18 +181,50 @@ def setup_worker_bus(name: str, recv_q, send_q,
             authkey=authkey,
             name=name,
             sock_path=Path(sock_path),
+            topics=list(topics) if topics else None,
         )
         client.start()
+        # Phase B.2 IPC §D8 — BusSocketClient.publish buffers outbound
+        # messages while the connection thread is still establishing the
+        # initial socket (~50-150ms jitter + handshake). No wait here:
+        # workers boot at full speed; the buffer flushes on connect. Same
+        # mechanism survives kernel-swap reconnects (the original §D8
+        # intent). Closes BUG-BUS-IPC-WORKER-READY-RACE-20260430 without
+        # adding boot latency. See bus_socket.py:_outbound_buffer.
         # The same client backs both the inbound queue (for recv) and the
         # publish path (for send). SocketQueue.put_nowait routes to broker.
         sq = client.inbound_queue()
-        logger.info(
-            "[worker_bus_bootstrap] worker '%s' attached to bus broker at %s",
-            name, sock_path)
+        if topics:
+            logger.info(
+                "[worker_bus_bootstrap] worker '%s' attached to bus broker at %s "
+                "(topics=%s)", name, sock_path, list(topics))
+        else:
+            logger.info(
+                "[worker_bus_bootstrap] worker '%s' attached to bus broker at %s "
+                "(subscribe-all — no topic filter)", name, sock_path)
         return sq, sq, client
     except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "[worker_bus_bootstrap] socket mode failed for worker '%s': %s; "
-            "falling back to mp.Queue legacy mode",
+        # 2026-05-02 — make this LOUD too (was already exc_info=True but the
+        # log level was the same as success-case INFOs nearby). Worker is
+        # off-contract; field operator must see this immediately. If we ever
+        # graduate to "no fallback allowed", this branch becomes a re-raise.
+        logger.error(
+            "[worker_bus_bootstrap] worker '%s' SOCKET MODE INIT FAILED: %s — "
+            "falling back to mp.Queue LEGACY MODE. Worker is off-contract; "
+            "rest of fleet expects socket mode. Investigate the exception "
+            "trace below + restore socket mode for this worker.",
             name, e, exc_info=True)
+        # B.3 Stage 1 (2026-05-02): if Guardian passed None for the queues
+        # (because broker is attached and fork-at-locked-mp.Queue avoidance
+        # is active), there's nothing to fall back to — the worker can't
+        # function without queues. Raise so Guardian sees the crash and
+        # restarts (with backoff) rather than the worker silently
+        # AttributeError-ing on `None.get(...)` deep in entry_fn.
+        if recv_q is None or send_q is None:
+            raise RuntimeError(
+                f"setup_worker_bus for '{name}' must succeed in socket mode — "
+                f"Guardian set queues to None (broker attached) but socket "
+                f"setup failed (see prior WARNING/ERROR for cause). Worker "
+                f"cannot run without queues."
+            )
         return recv_q, send_q, None

@@ -173,6 +173,54 @@ def collect_outer_mind_15d(
     return thinking + feeling + willing
 
 
+def collect_outer_mind_5d(
+    art_count: int = 0,
+    audio_count: int = 0,
+    memory_status: Optional[dict] = None,
+    uptime_seconds: float = 1.0,
+) -> list:
+    """
+    Collect 5D Outer Mind tensor — creative/social levers.
+
+    Pure function used by outer_mind_worker subprocess on each tick.
+    Extracted from OuterTrinityCollector._collect_outer_mind.
+
+    Args:
+        art_count: recent art archive count (last 100)
+        audio_count: recent audio archive count (last 100)
+        memory_status: dict with persistent_count, total_nodes, research_nodes,
+            unique_interactors
+        uptime_seconds: process uptime in seconds
+
+    Returns:
+        [5 floats] normalized to [0.0, 1.0].
+    """
+    EXPECTED_ART_PER_DAY = 5
+    EXPECTED_AUDIO_PER_DAY = 3
+    EXPECTED_RESEARCH_PER_DAY = 5
+    EXPECTED_INTERACTIONS_PER_DAY = 20
+
+    mem = memory_status or {}
+    uptime_days = max(0.01, max(1.0, uptime_seconds) / 86400.0)
+
+    creative_output = _clamp(min(1.0, art_count / max(1.0, EXPECTED_ART_PER_DAY * uptime_days)))
+    sonic_expression = _clamp(min(1.0, audio_count / max(1.0, EXPECTED_AUDIO_PER_DAY * uptime_days)))
+
+    persistent = mem.get("persistent_count", 0)
+    total_nodes = mem.get("total_nodes", 0)
+    memory_quality = _clamp(persistent / total_nodes) if total_nodes > 0 else 0.5
+
+    research_findings = mem.get("research_nodes", 0)
+    research_depth = _clamp(min(1.0, research_findings / max(1.0, EXPECTED_RESEARCH_PER_DAY * uptime_days)))
+
+    interactions = mem.get("unique_interactors", 0)
+    social_engagement = _clamp(min(1.0, interactions / max(1.0, EXPECTED_INTERACTIONS_PER_DAY * uptime_days)))
+
+    return [round(v, 4) for v in [
+        creative_output, sonic_expression, memory_quality, research_depth, social_engagement
+    ]]
+
+
 def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
     """Clamp value to [lo, hi]."""
     return max(lo, min(hi, float(v) if v == v else 0.5))  # NaN check

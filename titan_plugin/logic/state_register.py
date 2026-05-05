@@ -420,6 +420,9 @@ class OuterState:
             IMPULSE,
             MIND_STATE,
             OBSERVABLES_SNAPSHOT,
+            OUTER_BODY_STATE,
+            OUTER_MIND_STATE,
+            OUTER_SPIRIT_STATE,
             OUTER_TRINITY_STATE,
             SPHERE_PULSE,
             SPIRIT_STATE,
@@ -428,8 +431,10 @@ class OuterState:
             "state_register",
             types=[
                 BODY_STATE, FILTER_DOWN, FOCUS_NUDGE, IMPULSE, MIND_STATE,
-                OBSERVABLES_SNAPSHOT, OUTER_TRINITY_STATE, SPHERE_PULSE,
-                SPIRIT_STATE,
+                OBSERVABLES_SNAPSHOT,
+                OUTER_BODY_STATE, OUTER_MIND_STATE, OUTER_SPIRIT_STATE,
+                OUTER_TRINITY_STATE,  # legacy_core fallback compat
+                SPHERE_PULSE, SPIRIT_STATE,
             ],
         )
         self._running = True
@@ -658,13 +663,52 @@ class OuterState:
             if updates:
                 self._update_many(updates)
 
+        elif msg_type == bus.OUTER_BODY_STATE:
+            # Phase A.S8: outer_body_worker publishes 5D body tensor
+            updates = {
+                "outer_body": payload.get("outer_body",
+                              payload.get("values", [0.5] * 5)),
+            }
+            self._update_many(updates)
+
+        elif msg_type == bus.OUTER_MIND_STATE:
+            # Phase A.S8: outer_mind_worker publishes 5D + 15D mind tensors.
+            # Willing-slice GROUND_UP merge logic preserved from legacy handler.
+            updates = {
+                "outer_mind": payload.get("outer_mind",
+                              payload.get("values", [0.5] * 5)),
+            }
+            incoming_om15 = payload.get("outer_mind_15d") or payload.get("values_15d")
+            existing_om15 = self._state.get("outer_mind_15d")
+            if incoming_om15:
+                if (existing_om15 and len(existing_om15) == 15
+                        and any(v != 0.5 for v in existing_om15[10:15])):
+                    merged = list(incoming_om15[:10]) + list(existing_om15[10:15])
+                    updates["outer_mind_15d"] = merged
+                else:
+                    updates["outer_mind_15d"] = incoming_om15
+            self._update_many(updates)
+
+        elif msg_type == bus.OUTER_SPIRIT_STATE:
+            # Phase A.S8: outer_spirit_worker publishes 5D + 45D spirit tensors.
+            updates = {
+                "outer_spirit": payload.get("outer_spirit",
+                                payload.get("values", [0.5] * 5)),
+            }
+            incoming_os45 = payload.get("outer_spirit_45d") or payload.get("values_45d")
+            if incoming_os45:
+                updates["outer_spirit_45d"] = incoming_os45
+            self._update_many(updates)
+
         elif msg_type == bus.OUTER_TRINITY_STATE:
+            # Thin delegate for legacy_core.py fallback boot path.
+            # Synthesizes the 3 OUTER_*_STATE-equivalent updates from the
+            # combined legacy payload so the legacy path keeps working.
             updates = {
                 "outer_body": payload.get("outer_body", [0.5] * 5),
                 "outer_mind": payload.get("outer_mind", [0.5] * 5),
                 "outer_spirit": payload.get("outer_spirit", [0.5] * 5),
             }
-            # OT3: Store extended 15D mind + 45D spirit if available
             outer_mind_15d = payload.get("outer_mind_15d")
             if outer_mind_15d:
                 updates["outer_mind_15d"] = outer_mind_15d

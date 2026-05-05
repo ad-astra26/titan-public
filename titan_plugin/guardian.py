@@ -21,10 +21,12 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from multiprocessing import Process
+from queue import Empty
 from typing import Callable, Optional
 
 from .bus import (
     AnyQueue,
+    BUS_PEER_DIED,
     BUS_WORKER_ADOPT_ACK,
     BUS_WORKER_ADOPT_REQUEST,
     DivineBus,
@@ -96,6 +98,16 @@ class ModuleSpec:
     # Unknown values fall back to "fork" with a WARNING (Guardian
     # never crashes boot on a misconfigured ModuleSpec).
     start_method: str = "fork"
+    # Microkernel v2 Phase B.2 (2026-04-30): broadcast topic filter.
+    # When non-empty + bus_ipc_socket_enabled=true, the broker filters
+    # `dst="all"` broadcasts at publish time so only messages with
+    # `type` in this list reach the subscriber. Empty list = legacy
+    # "subscribe-all" (every broadcast delivered) — preserved for
+    # backward compatibility with workers not yet migrated.
+    # Closes the per-subscriber flood class identified 2026-04-30
+    # (backup queue receiving SPHERE_PULSE/SPIRIT_STATE/etc. it never
+    # consumes). See bus_socket.py:563 BrokerSubscriber.publish docs.
+    broadcast_topics: list = field(default_factory=list)
     # Microkernel v2 Phase B.2.1 §M5 (2026-04-27 PM): adoption criticality.
     # When True (default): worker MUST adopt for shadow swap to succeed —
     # holds heavy in-process state (FAISS, DuckDB, audit chain, neural
@@ -181,6 +193,11 @@ class Guardian:
                 MODULE_READY,
                 MODULE_SHUTDOWN,
                 BUS_WORKER_ADOPT_REQUEST,
+                # Phase B.2 §D9 (2026-05-02) — broker → Guardian peer-death
+                # signal. Broker detects peer PID dead via os.kill(pid, 0)
+                # and publishes BUS_PEER_DIED. Guardian triggers immediate
+                # restart for named workers (faster than 1Hz polling).
+                BUS_PEER_DIED,
                 # SAVE_DONE is targeted (dst="guardian") so it bypasses the
                 # filter regardless, but list it explicitly so arch_map can
                 # see the contract.
@@ -188,6 +205,26 @@ class Guardian:
         )
         self._stop_requested = False
         self._module_lock = threading.RLock()  # serialize start/stop/restart to prevent duplicate spawns
+
+        # Option B (2026-05-02) — restart executor offload.
+        # Pre-fix: monitor_tick called self.restart() synchronously, which
+        # blocks for up to 30s (SAVE_NOW wait) PER worker. Multi-restart
+        # bursts (e.g. cascade after a stall) blocked monitor_tick for
+        # 6×30s ≈ 180s, starving heartbeat processing → MORE timeouts →
+        # cascade. Option A processes heartbeats inline during the wait
+        # (mitigation); Option B moves restart() off monitor_tick entirely
+        # so the queue keeps draining at 50/sec even during a long
+        # SAVE_NOW wait.
+        # max_workers=4 → up to 4 concurrent restarts, more than enough for
+        # any realistic burst; module_lock in restart() serializes per-name.
+        # See BUG-GUARDIAN-STOP-SAVE-NOW-HEARTBEAT-CASCADE-20260502.
+        import concurrent.futures
+        self._restart_executor: concurrent.futures.ThreadPoolExecutor = (
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="guardian-restart")
+        )
+        self._restarts_in_flight: set[str] = set()
+        self._restart_lock = threading.Lock()
         # Microkernel v2 Phase A retrofit (2026-04-27): swap-aware kernel ref.
         # Kernel sets `self.guardian._kernel_ref = self` after Guardian
         # construction. start()/restart() consult kernel.is_shadow_swap_active()
@@ -378,12 +415,40 @@ class Guardian:
                     "falling back to 'fork'", name, method)
                 method = "fork"
             ctx = multiprocessing.get_context(method)
-            info.queue = ctx.Queue(maxsize=10000)
-            info.send_queue = ctx.Queue(maxsize=10000)
+            # B.3 Stage 1 (2026-05-02) — fork-at-locked-mp.Queue avoidance.
+            # Under socket mode, workers rebind to SocketQueue via
+            # `setup_worker_bus`. The mp.Queues we used to allocate here
+            # were never used in the worker, but they introduced a hazard:
+            # mp.Queue's internal feeder thread holds a Condition lock; if
+            # parent's feeder owned that lock at fork moment, the child
+            # inherited a phantom-locked Lock with no thread to release it.
+            # Any code path in worker that transitively touched the
+            # inherited Queue (libraries holding closure refs, exception
+            # paths, etc.) would block forever — exactly the symptom we saw
+            # for spirit/media/language hanging post-init, never sending
+            # BUS_SUBSCRIBE. Skipping allocation when broker is attached
+            # eliminates the hazard entirely.
+            #
+            # Legacy fallback (no broker, unit tests, or legacy mode) still
+            # gets the mp.Queues — the bug only manifests under fork with
+            # the broker active.
+            #
+            # See: titan-docs/PLAN_microkernel_phase_b3_legacy_path_cleanup.md §1
+            if self.bus.has_socket_broker:
+                info.queue = None
+                info.send_queue = None
+            else:
+                info.queue = ctx.Queue(maxsize=10000)
+                info.send_queue = ctx.Queue(maxsize=10000)
 
-            # Subscribe in the bus so targeted messages get routed
-            self._module_recv_queues[name] = info.queue
-            self.bus._subscribers.setdefault(name, []).append(info.queue)
+            # Subscribe in the bus so targeted messages get routed.
+            # When broker is attached, info.queue is None → skip both the
+            # `_module_recv_queues` bookkeeping and the in-process subscriber
+            # registration. Workers receive via SocketQueue (broker-routed).
+            if info.queue is not None:
+                self._module_recv_queues[name] = info.queue
+                if not self.bus.has_socket_broker:
+                    self.bus._subscribers.setdefault(name, []).append(info.queue)
             self.bus._modules.add(name)
             # reply_only modules skip dst="all" broadcasts — they only receive
             # targeted messages (QUERY dst=name, MODULE_SHUTDOWN, etc.)
@@ -401,6 +466,7 @@ class Guardian:
                         info.send_queue,
                         info.spec.config,
                         info.spec.start_method,
+                        info.spec.broadcast_topics,
                     ),
                     name=f"titan-{name}",
                     daemon=True,
@@ -575,16 +641,37 @@ class Guardian:
                 except Exception as _pub_err:
                     logger.warning("[Guardian] SAVE_NOW publish failed: %s",
                                    _pub_err)
-                # Drain guardian queue waiting for SAVE_DONE matching rid
+                # Drain guardian queue waiting for SAVE_DONE matching rid.
+                #
+                # 2026-05-02 (Option A) — process MODULE_HEARTBEAT and
+                # MODULE_READY INLINE so OTHER modules don't appear stale
+                # while we're blocked here. Pre-fix behavior was to stash
+                # all non-matching messages in `drained_msgs` and
+                # re-publish them at the end (40+ seconds later under
+                # multi-restart cascade). During those seconds,
+                # `info.last_heartbeat` for other modules wasn't being
+                # updated → Guardian falsely concluded they had timed out
+                # → triggered MORE restarts → cascade.
+                #
+                # Heartbeats and READYs are idempotent state updates;
+                # processing them inline here is safe and prevents the
+                # cascade. Other message types (SAVE_DONE for OTHER
+                # modules, BUS_PEER_DIED, BUS_WORKER_ADOPT_REQUEST) are
+                # rare during SAVE_NOW wait and still re-published at the
+                # end for the main `_process_guardian_messages` to handle.
+                #
+                # See BUG-GUARDIAN-STOP-SAVE-NOW-HEARTBEAT-CASCADE-20260502.
                 save_deadline = time.time() + save_timeout
                 save_done_seen = False
-                drained_msgs: list = []  # re-enqueue non-matching messages
+                drained_msgs: list = []  # re-enqueue non-heartbeat-class msgs
+                inline_processed = 0
                 while time.time() < save_deadline:
                     try:
                         m = self._guardian_queue.get(timeout=0.5)
                     except Exception:
                         continue
-                    if (m.get("type") == bus.SAVE_DONE
+                    _mt = m.get("type")
+                    if (_mt == bus.SAVE_DONE
                             and m.get("payload", {}).get("module") == name
                             and m.get("payload", {}).get("request_id") == save_rid):
                         _p = m.get("payload", {})
@@ -594,13 +681,45 @@ class Guardian:
                                     _p.get("duration_ms", 0))
                         save_done_seen = True
                         break
+                    # Inline heartbeat/ready handler (Option A) — no need
+                    # to round-trip through the queue + monitor_tick later.
+                    if _mt == MODULE_HEARTBEAT:
+                        _src = m.get("src", "")
+                        _info = self._modules.get(_src)
+                        if _info is not None:
+                            _info.last_heartbeat = time.time()
+                            _rss = m.get("payload", {}).get("rss_mb", 0)
+                            if _rss:
+                                _info.rss_mb = _rss
+                            inline_processed += 1
+                        continue  # don't stash; consumed inline
+                    if _mt == MODULE_READY:
+                        _src = m.get("src", "")
+                        _info = self._modules.get(_src)
+                        if _info is not None:
+                            _info.state = ModuleState.RUNNING
+                            _info.last_heartbeat = time.time()
+                            _info.ready_time = time.time()
+                            logger.info(
+                                "[Guardian] Module '%s' is READY (pid=%s, "
+                                "restarts=%d) [inline-during-SAVE_NOW]",
+                                _src, _info.pid, _info.restart_count)
+                            inline_processed += 1
+                        continue  # don't stash; consumed inline
+                    # Other types (rare during SAVE_NOW): stash for re-publish
                     drained_msgs.append(m)
-                # Re-publish drained messages so we don't lose them
+                # Re-publish remaining drained messages so we don't lose them
                 for _dm in drained_msgs:
                     try:
                         self.bus.publish(_dm)
                     except Exception:
                         pass
+                if inline_processed:
+                    logger.info(
+                        "[Guardian] processed %d inline heartbeat/ready msg(s) "
+                        "during '%s' SAVE_NOW wait (Option A — prevents "
+                        "cascade-restart starvation)",
+                        inline_processed, name)
                 if not save_done_seen:
                     logger.info("[Guardian] No SAVE_DONE from '%s' within "
                                 "%.1fs — module may not handle SAVE_NOW; "
@@ -647,6 +766,38 @@ class Guardian:
 
             # Cleanup
             self._cleanup_module(name)
+
+    def restart_async(self, name: str, reason: str = "requested"):
+        """Option B (2026-05-02) — schedule restart() on a separate executor
+        thread so monitor_tick doesn't block.
+
+        Idempotent: if a restart for this module is already in flight,
+        returns the existing Future (does NOT submit a duplicate). This
+        prevents monitor_tick from queueing the same restart twice while
+        the first is still mid-stop().
+
+        Returns Future for the restart task, or None if this module is
+        already restarting (caller should treat None as "in flight, fine").
+
+        See BUG-GUARDIAN-STOP-SAVE-NOW-HEARTBEAT-CASCADE-20260502 +
+        Guardian.__init__ comment block on _restart_executor for context.
+        """
+        with self._restart_lock:
+            if name in self._restarts_in_flight:
+                logger.debug(
+                    "[Guardian] restart_async('%s', reason=%s) skipped — "
+                    "already in flight", name, reason)
+                return None
+            self._restarts_in_flight.add(name)
+
+        def _run() -> bool:
+            try:
+                return self.restart(name, reason=reason)
+            finally:
+                with self._restart_lock:
+                    self._restarts_in_flight.discard(name)
+
+        return self._restart_executor.submit(_run)
 
     def restart(self, name: str, reason: str = "requested") -> bool:
         """Stop then start a module, with sliding-window restart limit. Thread-safe via _module_lock."""
@@ -748,6 +899,14 @@ class Guardian:
     def stop_all(self, reason: str = "shutdown") -> None:
         """Gracefully stop all running modules."""
         self._stop_requested = True
+        # Option B (2026-05-02) — shut down restart executor cleanly so
+        # in-flight async restart tasks finish before we shut down modules.
+        # wait=False because we're about to forcibly stop all modules anyway;
+        # no point waiting for a SAVE_NOW that's racing with shutdown.
+        try:
+            self._restart_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:  # noqa: BLE001
+            pass
         for name, info in self._modules.items():
             if info.state in (ModuleState.RUNNING, ModuleState.STARTING, ModuleState.UNHEALTHY):
                 self.stop(name, reason=reason)
@@ -872,7 +1031,8 @@ class Guardian:
                             "module": name, "exitcode": exitcode,
                         }))
                         if info.spec.restart_on_crash:
-                            self.restart(name, reason=f"died_exitcode_{exitcode}")
+                            # Option B (2026-05-02) — async to keep monitor_tick responsive
+                            self.restart_async(name, reason=f"died_exitcode_{exitcode}")
                 continue
 
             # Heartbeat timeout check — CPU-aware (2026-04-21).
@@ -920,8 +1080,12 @@ class Guardian:
                     with self._module_lock:
                         info.state = ModuleState.UNHEALTHY
                         info.consecutive_starved_cycles = 0
-                        if info.spec.restart_on_crash:
-                            self.restart(name, reason=reason)
+                    if info.spec.restart_on_crash:
+                        # Option B (2026-05-02) — async; restart() acquires
+                        # _module_lock itself, so leaving the lock here is
+                        # safe (in fact it lets monitor_tick continue while
+                        # the restart waits for SAVE_DONE).
+                        self.restart_async(name, reason=reason)
                     continue
                 # Heartbeat fresh — refresh CPU sample so next timeout check
                 # has a recent baseline (window ≈ monitor_tick interval, ~5s).
@@ -949,7 +1113,8 @@ class Guardian:
                     logger.warning("[Guardian] Module '%s' RSS %.0fMB > limit %dMB",
                                    name, rss, info.spec.rss_limit_mb)
                     if info.spec.restart_on_crash:
-                        self.restart(name, reason=f"rss_{rss:.0f}mb")
+                        # Option B (2026-05-02) — async restart
+                        self.restart_async(name, reason=f"rss_{rss:.0f}mb")
 
     def _process_guardian_messages(self) -> None:
         """Drain guardian queue and process control messages."""
@@ -976,6 +1141,55 @@ class Guardian:
                     rss = msg.get("payload", {}).get("rss_mb", 0)
                     if rss:
                         info.rss_mb = rss
+
+            elif msg_type == BUS_PEER_DIED:
+                # Phase B.2 §D9 (2026-05-02) — broker detected peer process
+                # is dead via os.kill(pid, 0) (authoritative OS signal).
+                # Faster than Guardian's 1Hz process.is_alive() polling.
+                # Idempotent w.r.t. polling-path restart via _module_lock.
+                payload = msg.get("payload", {}) or {}
+                name = payload.get("name", "")
+                peer_pid = payload.get("pid")
+                was_anon = bool(payload.get("was_anon", False))
+                silent_for_s = float(payload.get("silent_for_s", 0.0))
+                if was_anon:
+                    # Pre-BUS_SUBSCRIBE death — broker can't tell which module
+                    # was on this connection. Guardian's polling will discover
+                    # via info.process.is_alive() within ~1s; nothing to do
+                    # here besides logging. Useful for forensics if a worker
+                    # crashes during init before sending BUS_SUBSCRIBE.
+                    logger.warning(
+                        "[Guardian] anon connection died pre-subscribe "
+                        "(pid=%s, silent=%.1fs); polling-path will discover "
+                        "the actual module within ~1s", peer_pid, silent_for_s)
+                    continue
+                # Named worker died. Trigger restart now (faster than polling).
+                info = self._modules.get(name)
+                if info is None:
+                    logger.warning(
+                        "[Guardian] BUS_PEER_DIED for unknown module '%s' "
+                        "(pid=%s) — ignoring", name, peer_pid)
+                    continue
+                if not info.spec.restart_on_crash:
+                    logger.info(
+                        "[Guardian] '%s' (pid=%s) died but restart_on_crash="
+                        "False — leaving stopped", name, peer_pid)
+                    continue
+                logger.error(
+                    "[Guardian] '%s' (pid=%s) DIED — broker peer-dead signal "
+                    "(silent=%.1fs); restart triggered (idempotent w.r.t. "
+                    "polling path)", name, peer_pid, silent_for_s)
+                # Mark crashed + restart. restart() acquires _module_lock,
+                # so a concurrent polling-path restart becomes a no-op.
+                # Option B (2026-05-02) — async so this code path (which
+                # runs INSIDE _process_guardian_messages → monitor_tick)
+                # doesn't block the queue drain.
+                info.state = ModuleState.CRASHED
+                self.bus.publish(make_msg(MODULE_CRASHED, "guardian", "core", {
+                    "module": name, "exitcode": None,
+                    "source": "broker_peer_dead",
+                }))
+                self.restart_async(name, reason="broker_peer_dead")
 
             elif msg_type == BUS_WORKER_ADOPT_REQUEST:
                 # Microkernel v2 Phase B.2.1 — worker requesting adoption
@@ -1116,16 +1330,81 @@ class Guardian:
         info = self._modules.get(name)
         return info is not None and info.state == ModuleState.RUNNING
 
+    def is_started(self, name: str) -> bool:
+        """True if the module's worker process is spawned (RUNNING or STARTING).
+
+        Distinct from is_running which requires state==RUNNING. A worker in
+        STARTING state has its process spawned and bus QUERY handling active
+        — calling guardian.start() again is redundant. This predicate is the
+        correct gate for proxy._ensure_started's "do we need to spawn?" check
+        (see _start_safe.py). Avoids spurious "First use" log spam + extra
+        guardian.start() calls during heavy-boot warmup (memory's 9-min
+        FAISS+Kuzu+DuckDB load on T1).
+        """
+        info = self._modules.get(name)
+        return info is not None and info.state in (
+            ModuleState.RUNNING, ModuleState.STARTING)
+
     def query_module(self, name: str, action: str, payload: dict | None = None,
                      timeout: float = 5.0) -> dict | None:
         """Send a QUERY to a running module and wait for its RESPONSE.
 
         Returns the response payload dict, or None on timeout/error.
         Used by the profiling endpoint to collect child-process tracemalloc data.
+
+        Phase B.2 §D12 audit (2026-05-02): under socket mode, info.queue +
+        info.send_queue are inert (worker reads/writes via SocketQueue, not
+        these mp.Queues). The legacy code path put a QUERY on info.queue
+        that the worker never reads, then waited on info.send_queue that
+        the worker never writes to → silent timeout, return None.
+
+        Fix: under socket mode, route via bus.request() with a transient
+        reply queue (the same path proxies use). Legacy mp.Queue path
+        retained for the rare case Guardian runs without a broker (tests,
+        legacy fallback) — gated on `self.bus.has_socket_broker`.
         """
         import uuid
         info = self._modules.get(name)
-        if info is None or info.state != ModuleState.RUNNING or info.queue is None:
+        if info is None or info.state != ModuleState.RUNNING:
+            return None
+
+        # Socket-mode path: route via bus.request (broker delivers QUERY,
+        # worker publishes RESPONSE back to "guardian_query_<rid>", we
+        # consume one message off that reply queue).
+        if self.bus.has_socket_broker:
+            rid = str(uuid.uuid4())
+            reply_name = f"guardian_query_{rid[:8]}"
+            reply_q = self.bus.subscribe(reply_name, reply_only=True)
+            try:
+                req_msg = {
+                    "type": "QUERY",
+                    "src": reply_name,  # worker echoes RESPONSE back to here
+                    "dst": name,
+                    "rid": rid,
+                    "payload": {"action": action, **(payload or {})},
+                    "ts": time.time(),
+                }
+                self.bus.publish(req_msg)
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    try:
+                        resp = reply_q.get(timeout=min(0.2, max(0.01, deadline - time.time())))
+                    except Empty:
+                        continue
+                    except Exception:
+                        return None
+                    if resp.get("rid") == rid:
+                        return resp.get("payload")
+                return None
+            finally:
+                # Always tear down the transient reply subscription.
+                try:
+                    self.bus.unsubscribe(reply_name, reply_q)
+                except Exception:
+                    pass
+
+        # Legacy (no-broker) path — kept for tests + legacy fallback only.
+        if info.queue is None:
             return None
         rid = str(uuid.uuid4())
         msg = {
@@ -1140,7 +1419,6 @@ class Guardian:
             info.queue.put_nowait(msg)
         except Exception:
             return None
-        # Poll send_queue for the response (interleaved with other messages)
         deadline = time.time() + timeout
         stashed: list = []
         result = None
@@ -1153,7 +1431,6 @@ class Guardian:
                 stashed.append(resp)
             except Exception:
                 continue
-        # Put back any messages we consumed that weren't our response
         for m in stashed:
             try:
                 info.send_queue.put_nowait(m)
@@ -1180,6 +1457,15 @@ class Guardian:
         Deque in BusHealthMonitor is in-memory only (maxlen=2000, resets
         on restart). At current rate budget ~0.05 Hz the file grows ~4.3
         KB/Titan/day — negligible.
+
+        B.3 Stage 1 (2026-05-02): under socket mode, info.send_queue is
+        None for all modules (mp.Queue allocation skipped to avoid
+        fork-at-locked-Queue hazard). The for-loop body is gated on
+        `info.send_queue is None` already; this comment explains that the
+        function becomes a no-op iteration in socket mode rather than
+        being short-circuited at entry — kept as no-op to preserve the
+        BusHealthMonitor singleton init + simplify the eventual full
+        deletion in Stage 3.
         """
         from queue import Empty
         from .bus import META_CGN_SIGNAL
@@ -1268,7 +1554,8 @@ def _append_meta_cgn_emission_log(msg: dict, payload: dict) -> None:
 
 
 def _module_wrapper(entry_fn: Callable, name: str, recv_queue, send_queue,
-                    config: dict, start_method: str = "fork") -> None:
+                    config: dict, start_method: str = "fork",
+                    broadcast_topics: Optional[list] = None) -> None:
     """
     Wrapper that runs in the child process.
     Sets up logging, lifecycle protection, B.2 bus bootstrap, B.2.1 swap-
@@ -1328,6 +1615,7 @@ def _module_wrapper(entry_fn: Callable, name: str, recv_queue, send_queue,
         from titan_plugin.core.worker_bus_bootstrap import setup_worker_bus
         recv_queue, send_queue, bus_client = setup_worker_bus(
             name, recv_queue, send_queue,
+            topics=broadcast_topics,
         )
         if bus_client is not None:
             from titan_plugin.core.worker_swap_handler import (

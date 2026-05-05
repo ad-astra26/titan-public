@@ -195,9 +195,14 @@ class TitanASTVisitor(ast.NodeVisitor):
         func_name = self._call_name(node)
         if func_name:
             # ── _send_msg detection ──
+            # Use _resolve_value (not _str_value) so ``bus.X`` attribute access
+            # and bare bus constants resolve to their string values. Without this,
+            # outer trinity workers (A.S8) that call
+            # ``_send_msg(send_queue, bus.OUTER_BODY_STATE, ...)`` were silently
+            # skipped — arch_map indexed 55 of 58 bus types until 2026-05-01.
             if func_name == "_send_msg" and len(node.args) >= 4:
-                msg_type = self._str_value(node.args[1])
-                dst = self._str_value(node.args[3])
+                msg_type = self._resolve_value(node.args[1])
+                dst = self._resolve_value(node.args[3])
                 if msg_type:
                     self.send_msgs.append({
                         "line": node.lineno,
@@ -422,7 +427,10 @@ class TitanASTVisitor(ast.NodeVisitor):
         return ""
 
     def _resolve_value(self, node) -> str:
-        """Resolve a value node to string — handles constants AND bus constant names."""
+        """Resolve a value node to string — handles constants, bus constant names,
+        and ``bus.X`` attribute access (used by spawn-mode workers that import
+        the ``bus`` module rather than individual constants).
+        """
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return node.value
         if isinstance(node, ast.Name):
@@ -432,6 +440,15 @@ class TitanASTVisitor(ast.NodeVisitor):
             # Return the variable name as-is for identifiable constants
             if node.id.isupper():
                 return node.id
+        if isinstance(node, ast.Attribute):
+            # ``bus.OUTER_BODY_STATE`` / ``bus.MODULE_HEARTBEAT`` style.
+            # Outer trinity workers (A.S8) + heartbeat publishers use this form.
+            # Pre-fix the parser silently dropped these → arch_map saw 55 of 58
+            # bus types and missed OUTER_BODY/MIND/SPIRIT_STATE entirely.
+            if node.attr in self.bus_constants:
+                return self.bus_constants[node.attr]
+            if node.attr.isupper():
+                return node.attr
         return ""
 
     def visit_Compare(self, node):
@@ -6907,6 +6924,106 @@ def run_state_dims():
     print("=" * 90)
 
 
+def run_bus_contracts_audit():
+    """Audit bus contract registry vs static analysis of bus wiring.
+
+    rFP_bus_payload_contracts §4 Chunk 9 (2026-05-01).
+
+    Surfaces:
+      - msg types with contracts (✓ schema declared, max_size set)
+      - msg types in code WITHOUT contracts (migration backlog)
+      - contract producer mismatch vs AST publish detection
+      - contract consumer mismatch vs AST consume detection
+      - over-permissive contracts (max_payload_bytes > 100 KB recommended cap)
+    """
+    print()
+    print("=" * 90)
+    print("  BUS CONTRACTS AUDIT — rFP_bus_payload_contracts §4 Chunk 9")
+    print("=" * 90)
+
+    # Import contracts (best-effort — bus_contracts may not exist in older
+    # checkouts; degrade gracefully).
+    try:
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from titan_plugin.api.bus_contracts import REGISTRY
+        from titan_plugin.api.cache_schemas import EVENT_SCHEMAS
+    except ImportError as e:
+        print(f"\n  ✗ bus_contracts module not loadable: {e}")
+        print(f"  rFP_bus_payload_contracts may not be deployed yet.")
+        return
+
+    graph = load_graph()
+    wiring = graph.get("bus_wiring", {})
+    # Strip _SUB:* synthetic keys (subscriber registrations, not msg types)
+    indexed_msg_types = {
+        k for k in wiring.keys() if not k.startswith("_SUB:")
+    }
+
+    contract_msg_types = {c.msg_type for c in REGISTRY}
+
+    # Section 1 — contracts ✓
+    print(f"\n  ✓ {len(REGISTRY)} CONTRACTS REGISTERED")
+    print("  " + "-" * 88)
+    for c in sorted(REGISTRY, key=lambda c: c.msg_type):
+        size_warn = " ⚠️" if c.max_payload_bytes > 100_000 else ""
+        print(f"    {c.msg_type:38s}  schema={c.schema.__name__:25s}  "
+              f"max={c.max_payload_bytes:>7,d}B{size_warn}  "
+              f"prod={c.producer_module}")
+
+    # Section 2 — coverage
+    no_contract = sorted(indexed_msg_types - contract_msg_types)
+    print(f"\n  📋 {len(no_contract)} MSG TYPES IN CODE WITHOUT CONTRACT (migration backlog)")
+    print("  " + "-" * 88)
+    if not no_contract:
+        print("    (none — full coverage)")
+    else:
+        for m in no_contract[:30]:
+            print(f"    {m}")
+        if len(no_contract) > 30:
+            print(f"    ... +{len(no_contract) - 30} more (run with --json for full list)")
+
+    # Section 3 — producer/consumer cross-check (best-effort vs AST)
+    print(f"\n  🔍 PRODUCER / CONSUMER CROSS-CHECK")
+    print("  " + "-" * 88)
+    mismatches = 0
+    for c in REGISTRY:
+        ast_wiring = wiring.get(c.msg_type, {})
+        ast_pubs = ast_wiring.get("publishers", []) + ast_wiring.get("send_msgs", [])
+        ast_consumers = ast_wiring.get("consumers", [])
+        if not ast_pubs:
+            print(f"    ⚠ {c.msg_type}: contract producer={c.producer_module} "
+                  f"but NO ast publish detected (parser blind spot or "
+                  f"producer not yet implemented)")
+            mismatches += 1
+        if not ast_consumers and c.delivery in ("broadcast", "both"):
+            print(f"    ⚠ {c.msg_type}: contract delivery={c.delivery} "
+                  f"but NO ast consumer detected for any of: "
+                  f"{c.consumer_modules}")
+            mismatches += 1
+    if mismatches == 0:
+        print("    ✓ all contracts have matching ast publishers + consumers")
+
+    # Section 4 — schema consistency check
+    print(f"\n  🧪 SCHEMA CONSISTENCY")
+    print("  " + "-" * 88)
+    schema_inconsistencies = 0
+    for c in REGISTRY:
+        if EVENT_SCHEMAS.get(c.msg_type) is not c.schema:
+            print(f"    ✗ {c.msg_type}: REGISTRY schema={c.schema.__name__} "
+                  f"but EVENT_SCHEMAS has "
+                  f"{getattr(EVENT_SCHEMAS.get(c.msg_type), '__name__', 'NONE')}")
+            schema_inconsistencies += 1
+    if schema_inconsistencies == 0:
+        print("    ✓ all REGISTRY schemas match EVENT_SCHEMAS dict")
+
+    # Section 5 — summary
+    print()
+    print("  " + "=" * 88)
+    print(f"  SUMMARY: {len(REGISTRY)} contracted | {len(no_contract)} pending | "
+          f"{mismatches} ast mismatches | {schema_inconsistencies} schema inconsistencies")
+    print("  " + "=" * 88)
+
+
 def run_bus_consumers(msg_type: str):
     """Per-message bus contract: publishers, subscribers, keys accessed."""
     msg_type = msg_type.strip().upper()
@@ -7856,6 +7973,15 @@ def main():
             sys.exit(1)
         run_bus_consumers(sys.argv[2])
 
+    elif cmd == "bus-contracts":
+        # rFP_bus_payload_contracts §4 Chunk 9 (2026-05-01): audit
+        # bus_contracts.REGISTRY against arch_map AST-derived publish/consume
+        # wiring. Reports:
+        #   - msg types with contracts (✓)
+        #   - msg types in code without contracts (migration backlog)
+        #   - contract producer/consumer mismatches vs static analysis
+        run_bus_contracts_audit()
+
     elif cmd == "session-close":
         _sc_args = [a for a in sys.argv[2:] if not a.startswith("--")]
         title = " ".join(_sc_args).strip()
@@ -8193,6 +8319,8 @@ def run_phase_c_command(args: list) -> int:
         return _phase_c_supervision_log(rest)
     elif action in ("data-integrity-audit", "data_integrity_audit"):
         return _phase_c_data_integrity_audit()
+    elif action in ("crate-ownership", "crate_ownership"):
+        return _phase_c_crate_ownership(strict="--strict" in rest)
     elif action in ("help", "--help", "-h"):
         return _phase_c_help()
     else:
@@ -8218,11 +8346,196 @@ Actions:
                                          --supervisor <name>, --since <duration>,
                                          --event <type>, --tail
   data-integrity-audit         Verify §11.H critical-data files (backups + integrity).
+  crate-ownership [--strict]   Enforce SPEC G17 + master plan §7 architectural-ownership
+                                rule: each named architectural concept lives in EXACTLY ONE
+                                crate. Scans titan-rust/crates/*/src/**.rs for `pub struct`
+                                / `pub enum` definitions of registered concepts and emits
+                                HIGH findings for duplicates outside the canonical crate.
+                                --strict exits non-zero on any finding (pre-commit mode).
 
-Source of truth: titan-docs/SPEC_titan_architecture_constants.toml
+Source of truth: titan-docs/SPEC_titan_architecture_constants.toml +
+                 titan-docs/SPEC_titan_architecture.md (Preamble G17 +
+                 master plan §7 Cargo Workspace Structure for ownership map)
 """
     )
     return 0
+
+
+# ─── G17: Architectural Ownership Registry per master plan §7 ─────────
+# Each tuple: (concept_name, canonical_crate, definition_pattern_regex,
+#              human_explanation_for_finding).
+# Pattern matches the *definition* line (`pub struct X` / `pub enum X` /
+# `pub fn X` for free functions). Imports + instantiations are not
+# definitions and don't count. Tests directories (`tests/` + `#[cfg(test)]`
+# blocks via simple suffix-check below) are scanned too — duplicate
+# implementations in test code are still violations.
+#
+# To add a new concept: add a tuple here AND record the ownership
+# decision in master plan §7 (Cargo Workspace Structure) + bump SPEC
+# PATCH version + Decision Log entry.
+_ARCH_OWNERSHIP_REGISTRY = [
+    # Schumann timer wheels (master plan §7 + C-S3 PLAN §1.1 #2)
+    ("SchumannGenerator", "titan-schumann",
+        r"^pub struct SchumannGenerator\b",
+        "Schumann timer-wheel struct lives ONLY in titan-schumann"),
+    ("SchumannRole", "titan-schumann",
+        r"^pub enum SchumannRole\b",
+        "Schumann role enum (Body/Mind/Spirit) lives ONLY in titan-schumann"),
+    # Fast bus producer/consumer (master plan §7 + SPEC §9.2)
+    ("fastbus Producer", "titan-fastbus",
+        r"^pub struct Producer\b",
+        "fastbus Producer ring handle lives ONLY in titan-fastbus"),
+    ("fastbus Consumer", "titan-fastbus",
+        r"^pub struct Consumer\b",
+        "fastbus Consumer ring handle lives ONLY in titan-fastbus"),
+    # Bus broker + client (titan-bus owns both server + client side)
+    ("BusBroker", "titan-bus",
+        r"^pub struct BusBroker\b",
+        "Main bus broker lives ONLY in titan-bus"),
+    ("BusClient", "titan-bus",
+        r"^pub struct BusClient\b",
+        "Main bus client lives ONLY in titan-bus (used by substrate, unified-spirit, daemons)"),
+    # State registry + slot primitives (master plan §7)
+    ("Slot", "titan-state",
+        r"^pub struct Slot\b",
+        "Shm slot handle lives ONLY in titan-state"),
+    ("SlotRegistry", "titan-state",
+        r"^pub struct SlotRegistry\b",
+        "Slot registry lives ONLY in titan-state"),
+    # Core primitives (titan-core)
+    ("SlotHeader", "titan-core",
+        r"^pub struct SlotHeader\b",
+        "Universal SeqLock header struct lives ONLY in titan-core::shm"),
+    ("Identity", "titan-core",
+        r"^pub struct Identity\b",
+        "Identity holder lives ONLY in titan-core::identity"),
+    # Clocks (master plan §7)
+    ("CircadianClock", "titan-clocks",
+        r"^pub struct CircadianClock\b",
+        "Circadian 1Hz clock lives ONLY in titan-clocks"),
+    ("PiHeartbeat", "titan-clocks",
+        r"^pub struct PiHeartbeat\b",
+        "π-heartbeat ~3Hz clock lives ONLY in titan-clocks"),
+    # Filter_down V5 + UnifiedSpirit + Resonance (titan-unified-spirit-rs from C-S4)
+    ("FilterDownV5Engine", "titan-unified-spirit-rs",
+        r"^pub struct FilterDownV5Engine\b",
+        "V5 filter_down engine lives ONLY in titan-unified-spirit-rs"),
+    ("TrinityValueNet", "titan-unified-spirit-rs",
+        r"^pub struct TrinityValueNet\b",
+        "V5 162→128→64→1 value network lives ONLY in titan-unified-spirit-rs"),
+    ("ResonancePair", "titan-unified-spirit-rs",
+        r"^pub struct ResonancePair\b",
+        "Inner↔outer resonance pair detector lives ONLY in titan-unified-spirit-rs"),
+    ("ResonanceDetector", "titan-unified-spirit-rs",
+        r"^pub struct ResonanceDetector\b",
+        "GREAT PULSE detector orchestrating 3 ResonancePairs lives ONLY in titan-unified-spirit-rs"),
+    ("UnifiedSpirit", "titan-unified-spirit-rs",
+        r"^pub struct UnifiedSpirit\b",
+        "162D SELF orchestrator lives ONLY in titan-unified-spirit-rs"),
+    # Trinity substrate + topology
+    ("TopologyEngine", "titan-trinity-rs",
+        r"^pub struct TopologyEngine\b",
+        "30D topology computation lives ONLY in titan-trinity-rs"),
+    ("SphereClock", "titan-trinity-rs",
+        r"^pub struct SphereClock\b",
+        "6 sphere clocks live ONLY in titan-trinity-rs"),
+    # ── C-S6 outer-side additions (closes DEFERRED CRATE-OWNERSHIP-PRECOMMIT-INTEGRATION) ──
+    # Outer trinity is NOT Schumann-locked per SPEC §18.1 — outer cadence
+    # primitives live alongside the rest of the daemon shared lib in
+    # titan-trinity-daemon (NOT in titan-schumann which is Schumann-only).
+    ("JitteredTicker", "titan-trinity-daemon",
+        r"^pub struct JitteredTicker\b",
+        "Outer-trinity jittered cadence ticker (10s ±20% / 5s ±20% / 30s ±10% per SPEC §18.1) lives ONLY in titan-trinity-daemon::jittered_tick"),
+    ("SensorCacheRead", "titan-trinity-daemon",
+        r"^pub enum SensorCacheRead\b",
+        "Outer-trinity sensor cache read result (Fresh/Stale/Missing per SPEC §18.1 stale check) lives ONLY in titan-trinity-daemon::sensor_cache_read"),
+]
+
+
+def _phase_c_crate_ownership(strict: bool = False) -> int:
+    """G17 enforcer — verify each architectural concept defined in EXACTLY one crate.
+
+    Per SPEC Preamble G17 + master plan §7 Cargo Workspace Structure: each
+    named architectural primitive (Schumann timer wheel, fast bus P/C,
+    FilterDownV5Engine, etc.) lives in EXACTLY ONE crate. Duplicating an
+    implementation in a different crate — even byte-identically — is a
+    SPEC violation that contracts/byte-layout/wiring scanners cannot catch.
+
+    Returns 0 if clean, 1 if findings in --strict mode (pre-commit gate).
+    """
+    import re
+    import sys
+    from pathlib import Path
+
+    repo = _phase_c_repo_root()
+    crates_dir = repo / "titan-rust" / "crates"
+    if not crates_dir.exists():
+        print(f"ERROR: titan-rust/crates not found at {crates_dir}", file=sys.stderr)
+        return 2
+
+    findings: list[dict] = []
+
+    # Pre-compile patterns
+    compiled = [
+        (concept, canonical_crate, re.compile(pattern), explanation)
+        for concept, canonical_crate, pattern, explanation in _ARCH_OWNERSHIP_REGISTRY
+    ]
+
+    # Walk all .rs files in titan-rust/crates/
+    for crate_dir in sorted(crates_dir.iterdir()):
+        if not crate_dir.is_dir():
+            continue
+        crate_name = crate_dir.name
+        for rs_file in crate_dir.rglob("*.rs"):
+            # Skip target/ build artifacts
+            if "target" in rs_file.parts:
+                continue
+            try:
+                lines = rs_file.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeDecodeError):
+                continue
+            for lineno, line in enumerate(lines, start=1):
+                for concept, canonical_crate, pattern, explanation in compiled:
+                    if pattern.match(line.strip()):
+                        # Definition site found — check it's in the canonical crate
+                        if crate_name != canonical_crate:
+                            findings.append({
+                                "concept": concept,
+                                "violation_crate": crate_name,
+                                "violation_path": str(rs_file.relative_to(repo)),
+                                "violation_line": lineno,
+                                "violation_text": line.strip(),
+                                "canonical_crate": canonical_crate,
+                                "explanation": explanation,
+                            })
+
+    if not findings:
+        print(
+            f"✓ phase-c crate-ownership clean ({len(_ARCH_OWNERSHIP_REGISTRY)} "
+            f"architectural concepts checked across "
+            f"{len(list(crates_dir.iterdir()))} crates)"
+        )
+        return 0
+
+    print(
+        f"✗ phase-c crate-ownership: {len(findings)} VIOLATION(S) "
+        f"of SPEC G17 + master plan §7 architectural-ownership rule:",
+        file=sys.stderr,
+    )
+    for f in findings:
+        print(
+            f"  [{f['concept']}] {f['violation_path']}:{f['violation_line']}\n"
+            f"    found in: {f['violation_crate']!r}\n"
+            f"    canonical: {f['canonical_crate']!r}\n"
+            f"    rule: {f['explanation']}\n"
+            f"    line: {f['violation_text']}",
+            file=sys.stderr,
+        )
+
+    if strict:
+        return 1
+    return 0
+
 
 
 def _phase_c_repo_root() -> "Path":
@@ -8713,6 +9026,33 @@ def run_kernel_status(all_titans: bool = False) -> int:
 
         if tid != "T1":
             print(f"    ℹ shm detail: run `arch_map kernel-status` locally on {tid}")
+
+        # ── Phase B.2 §D9 (2026-05-02) — broker peer-death + pong-timeout
+        # purge counters (smart-liveness diagnostics). Surfaces:
+        #   peer_dead_purges_total = N   real worker process deaths (expected
+        #                                on planned restart; growth rate over
+        #                                time is the watch signal)
+        #   pong_timeout_purges_total = N  soft pong timeouts (under smart-
+        #                                liveness should stay 0; non-zero
+        #                                means a worker is alive but not
+        #                                replying — investigate)
+        try:
+            state = _services_get(base_url, "/v4/state", timeout=3.0)
+            if state and isinstance(state, dict):
+                data = state.get("data", state)
+                broker = data.get("bus_broker") if isinstance(data, dict) else None
+                if isinstance(broker, dict):
+                    pd = broker.get("peer_dead_purges_total", 0)
+                    pt = broker.get("pong_timeout_purges_total", 0)
+                    pd_icon = "✓" if pd == 0 else "⚠"
+                    pt_icon = "✓" if pt == 0 else "⚠"
+                    if pd > 0 or pt > 0:
+                        any_failed = True
+                    print(f"    {pd_icon} broker peer_dead_purges:    {pd}")
+                    print(f"    {pt_icon} broker pong_timeout_purges: {pt}  (smart-liveness expects 0)")
+        except Exception:
+            # Endpoint may not be deployed yet on older kernels — skip silently
+            pass
 
     print()
     return 0 if not any_failed else 1
