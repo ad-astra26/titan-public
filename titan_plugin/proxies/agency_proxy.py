@@ -34,9 +34,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any, Optional
 
+import msgpack
+
 from ..bus import DivineBus
+from ..core.state_registry import (
+    StateRegistryReader,
+    ensure_shm_root,
+    resolve_titan_id,
+)
+from ..logic.session3_state_specs import AGENCY_STATE_SPEC
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +91,14 @@ class AgencyProxy:
         }
         # Compat shim — see _registry property below.
         self._registry = _RegistryFacade(self)
+
+        # Phase C Session 4 (rFP §4.C.12) — SHM-direct reader for
+        # agency_state.bin (Session 3 publisher in agency_worker).
+        self._titan_id = resolve_titan_id()
+        self._shm_root: Path = ensure_shm_root(self._titan_id)
+        self._r_agency_state = StateRegistryReader(
+            AGENCY_STATE_SPEC, self._shm_root)
+        self._fallback_counts: dict[str, int] = {}
 
     # ── Hot path (async) ───────────────────────────────────────────
 
@@ -133,12 +150,40 @@ class AgencyProxy:
         return dict(self._stats_cache)
 
     def refresh_stats(self) -> dict:
-        """Force-fetch fresh stats via synchronous bus.request. NOT for
-        hot-path use — only diagnostics / explicit refresh."""
-        body = self._sync_request({"action": "agency_stats"}, timeout=10.0)
-        if body and "stats" in body:
-            self._stats_cache = dict(body["stats"])
+        """Force-fetch fresh stats via SHM read of agency_state.bin
+        (Session 3 publisher). Preamble G18 — state transport is SHM,
+        never bus. Replaces prior sync bus.request("agency_stats") path."""
+        try:
+            raw = self._r_agency_state.read_variable()
+        except Exception as e:
+            self._track_fallback("agency_state",
+                                 f"read_raised:{type(e).__name__}")
+            return dict(self._stats_cache)
+        if raw is None:
+            self._track_fallback("agency_state", "shm_unavailable")
+            return dict(self._stats_cache)
+        try:
+            decoded = msgpack.unpackb(raw, raw=False)
+        except Exception as e:
+            self._track_fallback("agency_state",
+                                 f"decode_raised:{type(e).__name__}")
+            return dict(self._stats_cache)
+        if isinstance(decoded, dict):
+            # SHM payload uses total_actions; cache uses action_count
+            # for legacy callers. Map both keys for compatibility.
+            mapped = dict(decoded)
+            if "total_actions" in mapped and "action_count" not in mapped:
+                mapped["action_count"] = mapped["total_actions"]
+            self._stats_cache = mapped
         return dict(self._stats_cache)
+
+    def _track_fallback(self, slot_name: str, reason: str) -> None:
+        prev = self._fallback_counts.get(slot_name, 0)
+        self._fallback_counts[slot_name] = prev + 1
+        if prev == 0:
+            logger.info(
+                "[AgencyProxy] FIRST FALLBACK slot=%s reason=%s",
+                slot_name, reason)
 
     def update_cached_stats(self, payload: dict) -> None:
         """Called by parent's _agency_loop when AGENCY_STATS arrives."""

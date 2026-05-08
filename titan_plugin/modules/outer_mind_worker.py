@@ -212,11 +212,26 @@ def _collect_tick(
         "unique_types": min(2, (1 if art_count > 0 else 0) + (1 if audio_count > 0 else 0)),
         "mean_assessment": assessment.get("average_score", 0.5),
     }
+    # Rejections + threats — Phase 1 (rFP §12.1, SPEC §23.8 willing[13]):
+    # read from REAL producers (output_verifier + jailbreak_alerts), NOT
+    # ghost agency keys. Sources:
+    #   - output_verifier_stats.rejected_count (Titan rejecting own outputs)
+    #   - jailbreak_alerts_stats.blocked_24h (Titan defending against attacks)
+    #   - jailbreak_alerts_stats.threats_detected_24h (attacks faced)
+    ov = snap.get("output_verifier_stats") or {}
+    jb = snap.get("jailbreak_alerts_stats") or {}
+    ov_rejected = int(ov.get("rejected_count", 0) or 0)
+    jb_blocked_24h = int(jb.get("blocked_24h", 0) or 0)
+    jb_threats_24h = int(jb.get("threats_detected_24h", 0) or 0)
+    # Per-hour rate (rejections feed willing[13] protective_response).
+    # output_verifier reports cumulative; subtract a 1h ago checkpoint
+    # would require state — for Phase 1 use jb 24h / 24 + ov delta proxy.
+    rejections_per_hour = (jb_blocked_24h / 24.0)  # smoothed 24h rate
     guardian_stats = {
-        "threats_detected": agency.get("threats_detected", 0),
-        "rejections": agency.get("rejections", 0),
-        "severity_avg": agency.get("threat_severity_avg", 0.0),
-        "rejections_per_window": agency.get("rejections_this_hour", 0),
+        "threats_detected": jb_threats_24h,
+        "rejections": ov_rejected + jb_blocked_24h,
+        "severity_avg": float(jb.get("severity_avg_24h", 0.0) or 0.0),
+        "rejections_per_window": rejections_per_hour,
     }
     _sp = snap.get("social_perception_stats") or {}
     mem_status = snap.get("memory_status") or {}
@@ -228,11 +243,20 @@ def _collect_tick(
         "last_contagion": _sp.get("last_contagion"),
         "mean_conversation_quality": assessment.get("average_score", 0.5),
     }
+    # Phase 1 (rFP_trinity_130d_awakening §12.4): research_stats now uses
+    # real seconds_since_last from events_teacher / language teacher
+    # activity. Old hardcoded 300s/0.5 are gone — situational_awareness
+    # reads events_teacher_stats directly via the new kwargs path.
+    events = snap.get("events_teacher_stats") or {}
+    last_event_seconds = (
+        float(events.get("last_event_age_s", 3600.0))
+        if isinstance(events, dict) and events.get("last_event_age_s") is not None
+        else 3600.0
+    )
     research_stats = {
         "queries": mem_status.get("research_nodes", 0),
-        "usage_rate": 0.5,
-        "seconds_since_last": 300.0,
-        "queries_per_window": 0,
+        "seconds_since_last": last_event_seconds,
+        "queries_per_window": 0,  # legacy — replaced by exploration_drive redesign
     }
     assessment_ext = {
         "mean_score": assessment.get("average_score", 0.5),
@@ -253,6 +277,15 @@ def _collect_tick(
         twin_state=snap.get("twin_state"),
         anchor_state=snap.get("anchor_state"),
         bus_stats=snap.get("bus_stats"),
+        # rFP §12.4 / SPEC §23.8 — rich producer kwargs
+        cgn_stats=snap.get("cgn_stats"),
+        meta_cgn_stats=snap.get("meta_cgn_stats"),
+        language_stats=snap.get("language_stats"),
+        memory_growth_metrics=snap.get("memory_growth_metrics"),
+        events_teacher_stats=events if isinstance(events, dict) else None,
+        knowledge_graph_stats=snap.get("knowledge_graph_stats"),
+        social_x_gateway_stats=snap.get("social_x_gateway_stats"),
+        uptime_seconds=float(snap.get("uptime_seconds") or 1.0),
     )
 
     return tensor_15d, tensor_5d

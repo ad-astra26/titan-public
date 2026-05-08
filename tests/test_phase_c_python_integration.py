@@ -213,6 +213,11 @@ class TestSupervisionLogReader:
             assert list(r.iter_supervision_log(p)) == []
 
     def test_iter_filters_by_kind(self):
+        """Filter by either top-level `event` field OR nested `payload.kind`.
+
+        Test fixture mirrors the actual Rust wire format per
+        `titan-kernel-rs::supervision_log::LogLine` + `SupervisionEvent` enum.
+        """
         _add_scripts_dir()
         import _supervision_log_reader as r
 
@@ -222,9 +227,15 @@ class TestSupervisionLogReader:
                 f.write(
                     json.dumps(
                         {
-                            "kind": "CHILD_STARTED",
-                            "child": "trinity-substrate",
                             "ts": "2026-04-29T12:00:00.000000000Z",
+                            "boot_generation": 1,
+                            "event": "SUPERVISION_CHILD_RESTARTED",
+                            "payload": {
+                                "kind": "CHILD_RESTARTED",
+                                "child_name": "trinity-substrate",
+                                "supervisor": "kernel",
+                                "restart_count": 1,
+                            },
                         }
                     )
                     + "\n"
@@ -232,20 +243,34 @@ class TestSupervisionLogReader:
                 f.write(
                     json.dumps(
                         {
-                            "kind": "CHILD_EXITED",
-                            "child": "trinity-substrate",
-                            "reason": "sigterm",
                             "ts": "2026-04-29T12:00:01.000000000Z",
+                            "boot_generation": 1,
+                            "event": "SUPERVISION_CHILD_DOWN",
+                            "payload": {
+                                "kind": "CHILD_DOWN",
+                                "child_name": "trinity-substrate",
+                                "supervisor": "kernel",
+                                "reason": "EXIT",
+                                "reason_detail": "sigterm",
+                                "restart_count": 0,
+                            },
                         }
                     )
                     + "\n"
                 )
 
-            events = list(r.iter_supervision_log(p, kind="CHILD_EXITED"))
+            # Filter by top-level event name
+            events = list(r.iter_supervision_log(p, kind="SUPERVISION_CHILD_DOWN"))
             assert len(events) == 1
-            assert events[0]["reason"] == "sigterm"
+            assert events[0]["payload"]["reason_detail"] == "sigterm"
+
+            # Filter by nested payload.kind enum-tag
+            events = list(r.iter_supervision_log(p, kind="CHILD_DOWN"))
+            assert len(events) == 1
+            assert events[0]["payload"]["child_name"] == "trinity-substrate"
 
     def test_iter_filters_by_child_and_skips_malformed(self):
+        """`child` filter matches `payload.child_name` (Rust snake_case)."""
         _add_scripts_dir()
         import _supervision_log_reader as r
 
@@ -253,15 +278,28 @@ class TestSupervisionLogReader:
             p = Path(td) / "supervision.jsonl"
             with p.open("w", encoding="utf-8") as f:
                 f.write(
-                    json.dumps({"kind": "CHILD_STARTED", "child": "alpha"}) + "\n"
+                    json.dumps(
+                        {
+                            "event": "SUPERVISION_CHILD_RESTARTED",
+                            "payload": {"kind": "CHILD_RESTARTED", "child_name": "alpha"},
+                        }
+                    )
+                    + "\n"
                 )
                 f.write("{ malformed json\n")
                 f.write(
-                    json.dumps({"kind": "CHILD_STARTED", "child": "beta"}) + "\n"
+                    json.dumps(
+                        {
+                            "event": "SUPERVISION_CHILD_RESTARTED",
+                            "payload": {"kind": "CHILD_RESTARTED", "child_name": "beta"},
+                        }
+                    )
+                    + "\n"
                 )
 
             events = list(r.iter_supervision_log(p, child="alpha"))
             assert len(events) == 1
+            assert events[0]["payload"]["child_name"] == "alpha"
 
     def test_iter_walks_archives_in_chronological_order(self):
         _add_scripts_dir()
@@ -271,17 +309,47 @@ class TestSupervisionLogReader:
             base = Path(td) / "supervision.jsonl"
             # .jsonl.2 (oldest), .jsonl.1, .jsonl (newest)
             (base.parent / "supervision.jsonl.2").write_text(
-                json.dumps({"kind": "X", "i": 0}) + "\n", encoding="utf-8"
+                json.dumps({"event": "SUPERVISION_CHILD_DOWN", "i": 0}) + "\n",
+                encoding="utf-8",
             )
             (base.parent / "supervision.jsonl.1").write_text(
-                json.dumps({"kind": "X", "i": 1}) + "\n", encoding="utf-8"
+                json.dumps({"event": "SUPERVISION_CHILD_DOWN", "i": 1}) + "\n",
+                encoding="utf-8",
             )
             base.write_text(
-                json.dumps({"kind": "X", "i": 2}) + "\n", encoding="utf-8"
+                json.dumps({"event": "SUPERVISION_CHILD_DOWN", "i": 2}) + "\n",
+                encoding="utf-8",
             )
 
             events = list(r.iter_supervision_log(base))
             assert [e["i"] for e in events] == [0, 1, 2]
+
+    def test_iter_filters_by_reason_via_payload(self):
+        """`reason` filter matches `payload.reason` (nested per Rust schema)."""
+        _add_scripts_dir()
+        import _supervision_log_reader as r
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "supervision.jsonl"
+            with p.open("w", encoding="utf-8") as f:
+                for i, reason in enumerate(["PANIC", "EXIT", "PANIC", "KILLED"]):
+                    f.write(
+                        json.dumps(
+                            {
+                                "event": "SUPERVISION_CHILD_DOWN",
+                                "payload": {
+                                    "kind": "CHILD_DOWN",
+                                    "child_name": f"c{i}",
+                                    "reason": reason,
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+
+            events = list(r.iter_supervision_log(p, reason="PANIC"))
+            assert len(events) == 2
+            assert all(e["payload"]["reason"] == "PANIC" for e in events)
 
     def test_parse_iso8601_handles_nanoseconds(self):
         _add_scripts_dir()

@@ -34,28 +34,48 @@ class LLMProxy:
             self._started = True
 
     async def chat(self, prompt: str, context: Optional[dict] = None) -> str:
-        """Send a chat prompt to the Agno agent in the LLM module."""
+        """Send a chat prompt to the Agno agent in the LLM module.
+
+        Phase C Session 4 (rFP §4.C.6): true work-RPC (LLM inference) —
+        migrated from sync bus.request to async bus.request_async per
+        Preamble G19. Timeout 120s exceeds the §1.B 5s default for state
+        lookup; explicitly allowlisted as LLM work-RPC in
+        phase_c_rpc_exemptions.yaml.
+        """
         self._ensure_started()
-        reply = self._bus.request(
-            "llm_proxy", "llm",
-            {"action": "chat", "prompt": prompt, "context": context or {}},
-            timeout=120.0,  # LLM calls can be slow
-            reply_queue=self._reply_queue,
-        )
+        try:
+            reply = await self._bus.request_async(
+                "llm_proxy", "llm",
+                {"action": "chat", "prompt": prompt,
+                 "context": context or {}},
+                120.0, self._reply_queue,
+            )
+        except Exception as e:
+            logger.warning("[LLMProxy] chat bus.request_async raised: %s", e)
+            return ""
         if reply:
             return reply.get("payload", {}).get("response", "")
         logger.warning("[LLMProxy] chat timed out")
         return ""
 
     async def distill(self, text: str, instruction: str = "Summarize concisely") -> str:
-        """Distill/summarize text using the lightweight model."""
+        """Distill/summarize text using the lightweight model.
+
+        Phase C Session 4 (rFP §4.C.6): true work-RPC (small LLM
+        inference) — migrated from sync to async per G19. Timeout 30s
+        — allowlisted as LLM work-RPC.
+        """
         self._ensure_started()
-        reply = self._bus.request(
-            "llm_proxy", "llm",
-            {"action": "distill", "text": text, "instruction": instruction},
-            timeout=30.0,
-            reply_queue=self._reply_queue,
-        )
+        try:
+            reply = await self._bus.request_async(
+                "llm_proxy", "llm",
+                {"action": "distill", "text": text,
+                 "instruction": instruction},
+                30.0, self._reply_queue,
+            )
+        except Exception as e:
+            logger.warning("[LLMProxy] distill bus.request_async raised: %s", e)
+            return ""
         if reply:
             return reply.get("payload", {}).get("result", "")
         return ""

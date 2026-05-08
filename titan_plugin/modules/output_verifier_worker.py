@@ -93,6 +93,29 @@ def output_verifier_worker_main(recv_queue, send_queue, name: str, config: dict)
     last_stats_publish = 0.0
     poll_interval_s = 0.2
 
+    # Phase C Session 3 (rFP §4.B.11) — SHM-direct output_verifier_state.bin
+    # publisher. Replaces the deadlock-prone sync bus.request path for
+    # verifier stats. Cadence: 1 Hz.
+    try:
+        from titan_plugin.core.state_registry import resolve_titan_id
+        from titan_plugin.logic.output_verifier_state_publisher import (
+            OutputVerifierStatePublisher)
+        from titan_plugin.logic.worker_publisher_runner import (
+            run_worker_publisher)
+        _ov_state_publisher = OutputVerifierStatePublisher(
+            titan_id=resolve_titan_id())
+        run_worker_publisher(
+            publisher=_ov_state_publisher,
+            state_fetcher=lambda: verifier,
+            worker_name="output_verifier_worker",
+            cadence_s=1.0,
+        )
+    except Exception as _pub_init_err:
+        logger.error(
+            "[OutputVerifierWorker] SHM publisher BOOT FAILED — "
+            "consumers fall back to sync bus.request path: %s",
+            _pub_init_err, exc_info=True)
+
     while True:
         # Periodic heartbeat (Guardian liveness)
         now = time.time()
@@ -172,12 +195,9 @@ def output_verifier_worker_main(recv_queue, send_queue, name: str, config: dict)
                     _result, **payload.get("kwargs", {}),
                 )
                 response_payload = {"timechain_payload": tc_payload}
-            elif action == "stats":
-                response_payload = {
-                    "sovereignty_score": float(getattr(verifier, "sovereignty_score", 0.0) or 0.0),
-                    "verified_count": int(getattr(verifier, "verified_count", 0) or 0),
-                    "rejected_count": int(getattr(verifier, "rejected_count", 0) or 0),
-                }
+            # Phase C Session 5 (rFP §4.D.4): "stats" handler RETIRED —
+            # output_verifier_proxy.get_stats now SHM-direct via
+            # output_verifier_state.bin (Session 3 §4.B.11 publisher).
             else:
                 response_payload = {"error": f"unknown action: {action}"}
         except Exception as e:

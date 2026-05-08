@@ -46,7 +46,12 @@ LAYER_CANON: Final[dict[str, str]] = {
     "mind": "L1",
     "spirit": "L1",
     "imw": "L1",
-    "outer_trinity": "L1",  # outer-trinity sister to body/mind/spirit (A.8.4)
+    # A.S8 (2026-04-30) — outer_trinity split into 3 symmetric workers
+    # mirroring inner body/mind/spirit. See
+    # memory/feedback_outer_trinity_symmetric_workers.md.
+    "outer_body": "L1",
+    "outer_mind": "L1",
+    "outer_spirit": "L1",
     # L2 — Higher cognition + cognitive substrates + L2 state registry (cgn)
     "memory": "L2",
     "rl": "L2",

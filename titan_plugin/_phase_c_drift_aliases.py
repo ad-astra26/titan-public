@@ -46,9 +46,11 @@ from titan_plugin._phase_c_constants import (
     MODULE_DEFAULT_RSS_LIMIT_MB,
     MODULE_HEARTBEAT_INTERVAL_S,
     MODULE_HEARTBEAT_TIMEOUT_S,
-    REGISTRY_HEADER_BYTES,
-    REGISTRY_HEADER_STRUCT,
-    REGISTRY_MAX_READ_RETRIES,
+    SHM_BUFFER_COUNT,
+    SHM_BUFFER_META_BYTES,
+    SHM_BUFFER_META_STRUCT,
+    SHM_HEADER_BYTES,
+    SHM_HEADER_STRUCT,
     SUPERVISION_INTENSITY_WINDOW_S,
     SUPERVISION_MAX_RESTARTS,
     SUPERVISION_RESTART_BACKOFF_MAX_S,
@@ -100,10 +102,18 @@ SLOW_CONSUMER_DROP_RATE_THRESHOLD = BUS_SLOW_CONSUMER_DROP_RATE_RATIO
 LENGTH_PREFIX_SIZE = FRAME_LENGTH_PREFIX_BYTES
 MAX_FRAME_SIZE = FRAME_MAX_FRAME_BYTES
 
-# D24: state_registry.py — header layout
-HEADER_SIZE = REGISTRY_HEADER_BYTES
-HEADER_STRUCT = REGISTRY_HEADER_STRUCT
-MAX_READ_RETRIES = REGISTRY_MAX_READ_RETRIES
+# D24: state_registry.py — header layout (REWRITTEN under SPEC v1.0.0
+# D-SPEC-35: legacy 24-byte SeqLock replaced by 16-byte fixed header +
+# 16-byte per-buffer metadata × 3 buffers triple-buffer wire format).
+# Aliases retained for legacy importers, now pointing at new constants.
+HEADER_SIZE = SHM_HEADER_BYTES                  # 16 (was 24)
+HEADER_STRUCT = SHM_HEADER_STRUCT               # "<QII" (was "<IIQII")
+BUFFER_META_SIZE = SHM_BUFFER_META_BYTES        # NEW — per-buffer metadata block
+BUFFER_META_STRUCT = SHM_BUFFER_META_STRUCT     # NEW
+BUFFER_COUNT = SHM_BUFFER_COUNT                 # NEW — triple-buffer count
+# MAX_READ_RETRIES removed under D-SPEC-35 — new protocol has zero retries
+# by construction. Legacy callers should migrate to direct StateRegistryReader
+# usage (returns None on any error class — caller falls back to legacy path).
 
 # D25: worker_lifecycle.py — adoption supervision timeout
 B2_1_DEFAULT_SUPERVISION_TIMEOUT_S = ADOPTION_TIMEOUT_S
@@ -129,6 +139,9 @@ __all__ = [
     "CHALLENGE_SIZE",
     "DEFAULT_API_PORT",
     "DEFAULT_RING_CAPACITY",
+    "BUFFER_COUNT",
+    "BUFFER_META_SIZE",
+    "BUFFER_META_STRUCT",
     "DEFAULT_RSS_LIMIT_MB",
     "HEADER_SIZE",
     "HEADER_STRUCT",
@@ -136,7 +149,6 @@ __all__ = [
     "HEARTBEAT_TIMEOUT",
     "LENGTH_PREFIX_SIZE",
     "MAX_FRAME_SIZE",
-    "MAX_READ_RETRIES",
     "MAX_RESTARTS_IN_WINDOW",
     "MAX_STARVED_CYCLES",
     "MIN_CPU_DELTA_FOR_ALIVE",

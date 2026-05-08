@@ -62,6 +62,29 @@ def rl_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     last_heartbeat = time.time()
     last_stats_broadcast = time.time()
 
+    # Phase C Session 3 (rFP §4.B.5) — SHM-direct rl_state.bin publisher.
+    # Replaces the deadlock-prone sync bus.request(action="stats") path.
+    # Mirrors the existing SAGE_STATS broadcast schema so consumers see
+    # the same fields via SHM. Cadence: 1 Hz.
+    try:
+        from titan_plugin.core.state_registry import resolve_titan_id
+        from titan_plugin.logic.rl_state_publisher import RLStatePublisher
+        from titan_plugin.logic.worker_publisher_runner import (
+            run_worker_publisher)
+        _rl_state_publisher = RLStatePublisher(titan_id=resolve_titan_id())
+        run_worker_publisher(
+            publisher=_rl_state_publisher,
+            state_fetcher=lambda: (recorder, gatekeeper),
+            worker_name="rl_worker",
+            cadence_s=1.0,
+            publish_args=lambda s: s,  # state is the (recorder, gatekeeper) tuple
+        )
+    except Exception as _pub_init_err:
+        logger.error(
+            "[RLWorker] SHM publisher BOOT FAILED — "
+            "consumers fall back to sync bus.request path: %s",
+            _pub_init_err, exc_info=True)
+
     # ── Microkernel v2 Phase B.1 §6 — readiness/hibernate reporter ──
     from titan_plugin.core.readiness_reporter import trivial_reporter
     def _b1_save_state():
@@ -194,9 +217,10 @@ def _handle_query(msg: dict, recorder, scholar, gatekeeper, send_queue, name: st
             tid = recorder.record_transition(obs, action_idx, reward, next_obs, done)
             _send_response(send_queue, name, src, {"transition_id": tid}, rid)
 
-        elif action == "stats":
-            stats = _build_sage_stats(recorder, gatekeeper)
-            _send_response(send_queue, name, src, stats, rid)
+        # Phase C Session 5 (rFP §4.D.4): "stats" handler RETIRED —
+        # rl_proxy.refresh_stats now SHM-direct via rl_state.bin
+        # (Session 3 §4.B.5 publisher; _build_sage_stats still used
+        # internally by the publisher + the SAGE_STATS bus broadcast).
 
         else:
             logger.warning("[RLWorker] Unknown action: %s", action)

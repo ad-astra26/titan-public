@@ -45,11 +45,15 @@ def collect_mind_15d(
 
     Args:
         current_5d: Existing 5D mind tensor [memory, social, media, mood, knowledge]
-        audio_state: Audio/music processing state
+        audio_state: dict with keys ``creates_recent`` (int, count of audio/music
+            creates in rolling 1h window) and ``ambient`` (float, sense_hearing_ambient
+            from mind_worker._sense_hearing_ambient). SPEC §23.5 formula.
         interaction_quality: Quality of recent interactions [0-1]
-        visual_state: Visual/image processing state
+        visual_state: dict with keys ``creates_recent`` (int, art creates last 1h)
+            and ``ambient`` (float, sense_vision_ambient). SPEC §23.5 formula.
         assessment_quality: Mean assessment score of recent actions [0-1]
-        ambient_change: Rate of environmental change [0-1]
+        ambient_change: Rolling stddev of (cpu_thermal + circadian) over 60s,
+            clipped [0,1]. Produced by ``InnerPerceptionState.ambient`` (SPEC §23.5).
         hormone_levels: Current hormone pressure levels from HormonalSystem
 
     Returns:
@@ -62,27 +66,38 @@ def collect_mind_15d(
     # ── FEELING (5D) — subtle sense dimensions ──
     feeling = [0.5] * 5
 
-    # [5] Inner hearing — audio/vibration sensitivity
+    # [5] Inner hearing — SPEC §23.5: 0.5*min(1,audio_creates_recent/5) + 0.5*sense_hearing_ambient
     if audio_state:
-        feeling[0] = _clamp(audio_state.get("sensitivity", 0.5))
+        # NB: don't use `... or 0.5` — 0.0 is falsy in Python and would
+        # mask a true zero-ambient signal. Explicit None check.
+        _creates = audio_state.get("creates_recent", 0)
+        creates = float(_creates if _creates is not None else 0)
+        _ambient = audio_state.get("ambient", 0.5)
+        ambient = float(_ambient if _ambient is not None else 0.5)
+        feeling[0] = _clamp(0.5 * min(1.0, creates / 5.0) + 0.5 * ambient)
     else:
-        # Baseline hearing: gentle ambient awareness
+        # No state provided: pure ambient baseline used (mid-range).
         feeling[0] = 0.4
 
     # [6] Inner touch — interaction responsiveness
     feeling[1] = _clamp(interaction_quality)
 
-    # [7] Inner sight — visual pattern sensitivity
+    # [7] Inner sight — SPEC §23.5: 0.5*min(1,art_creates_recent/5) + 0.5*sense_vision_ambient
     if visual_state:
-        feeling[2] = _clamp(visual_state.get("sensitivity", 0.5))
+        _creates = visual_state.get("creates_recent", 0)
+        creates = float(_creates if _creates is not None else 0)
+        _ambient = visual_state.get("ambient", 0.5)
+        ambient = float(_ambient if _ambient is not None else 0.5)
+        feeling[2] = _clamp(0.5 * min(1.0, creates / 5.0) + 0.5 * ambient)
     else:
         feeling[2] = 0.4
 
     # [8] Inner taste — quality discrimination (beauty/ugliness)
     feeling[3] = _clamp(assessment_quality)
 
-    # [9] Inner smell — ambient awareness (environmental change)
-    feeling[4] = _clamp(0.3 + ambient_change * 0.7)
+    # [9] Inner smell — SPEC §23.5: rolling stddev of (cpu_thermal + circadian) over 60s, clipped [0,1].
+    # ``ambient_change`` is the producer's already-clipped stddev value.
+    feeling[4] = _clamp(ambient_change)
 
     # ── WILLING (5D) — from hormonal pressure levels ──
     # Mind's WILL creates the PRESSURE that drives ACTION

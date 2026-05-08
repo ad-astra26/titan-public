@@ -8,8 +8,10 @@
 #   release — production, glibc-dynamic, target/release/
 #   musl    — production, musl-static, target/x86_64-unknown-linux-musl/release/
 #
-# C-S2 ships only 2 binaries: titan-kernel-rs + titan-trinity-rs-placeholder.
-# Subsequent sessions add others (titan-mind-rs / titan-body-rs / etc.).
+# Phase C C-S7 (2026-05-05): builds the full 9-binary Rust fleet —
+# titan-kernel-rs, titan-trinity-rs, titan-unified-spirit-rs, plus 6
+# trinity daemons (titan-{inner,outer}-{body,mind,spirit}-rs). All
+# compiled by `cargo build --workspace` regardless of mode.
 #
 # Usage: bash scripts/build_titan_rust.sh [debug|release|musl]
 

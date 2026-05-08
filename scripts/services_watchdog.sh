@@ -211,11 +211,22 @@ check_host_memory_pressure
 # ═══════════════════════════════════════════════════════════════════════
 # CHECK 1: Core API health
 # ═══════════════════════════════════════════════════════════════════════
-API_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://${API_HOST}:${API_PORT}/health" 2>/dev/null || echo "000")
+# 2026-05-05: liveness probe split — /health/light is O(1) (no subsystem
+# checks, no vault RPC, no bus calls). The original /health bundled vault
+# RPC + memory bus + Guardian enumeration synchronously which on cold-boot
+# could exceed this watchdog's 10s deadline and cause force-kills of
+# otherwise-healthy Titans (root cause of 11 force-restarts/24h incident
+# 2026-04-09). The watchdog now uses /health/light for liveness and only
+# calls /health for the rich JSON if liveness already proven.
+API_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://${API_HOST}:${API_PORT}/health/light" 2>/dev/null || echo "000")
 if [ "$API_STATUS" = "200" ]; then
     CURR_STATE[api]="ok"
-    # Get guardian details for worker health
-    HEALTH_JSON=$(curl -s --max-time 10 "http://${API_HOST}:${API_PORT}/health" 2>/dev/null || echo "{}")
+    # Liveness proven; now fetch rich /health JSON for subsystem details.
+    # /health is warm-cached (refreshed every 5s by health-warmer thread)
+    # so this is also O(1) post-cold-boot. Cap aggressive timeout — if it
+    # exceeds, we've already proven liveness via /health/light so a slow
+    # /health response is non-fatal.
+    HEALTH_JSON=$(curl -s --max-time 5 "http://${API_HOST}:${API_PORT}/health" 2>/dev/null || echo "{}")
 else
     CURR_STATE[api]="down"
     ERRORS="${ERRORS}API: HTTP ${API_STATUS}\n"
@@ -605,8 +616,9 @@ fi
 if [ "$CHECK_KIN" = "--check-kin" ] && [ "$TITAN_ID" = "T1" ]; then
     KIN_VPS="10.135.0.6"
 
-    # Check T2 API
-    T2_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://${KIN_VPS}:7777/health" 2>/dev/null || echo "000")
+    # Check T2 API — use /health/light (zero-subsystem liveness probe; see
+    # check 1 above for rationale).
+    T2_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://${KIN_VPS}:7777/health/light" 2>/dev/null || echo "000")
     if [ "$T2_STATUS" != "200" ]; then
         # Check if T2 watchdog process exists
         T2_WD_RUNNING=$(ssh -o ConnectTimeout=5 root@${KIN_VPS} 'pgrep -f "t2_watchdog" | head -1' 2>/dev/null || echo "")
@@ -625,8 +637,8 @@ _${NOW}_"
         fi
     fi
 
-    # Check T3 API
-    T3_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://${KIN_VPS}:7778/health" 2>/dev/null || echo "000")
+    # Check T3 API — use /health/light (zero-subsystem liveness probe).
+    T3_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://${KIN_VPS}:7778/health/light" 2>/dev/null || echo "000")
     if [ "$T3_STATUS" != "200" ]; then
         T3_WD_RUNNING=$(ssh -o ConnectTimeout=5 root@${KIN_VPS} 'pgrep -f "t3_watchdog\|t3_manage" | head -1' 2>/dev/null || echo "")
         if [ -z "$T3_WD_RUNNING" ]; then

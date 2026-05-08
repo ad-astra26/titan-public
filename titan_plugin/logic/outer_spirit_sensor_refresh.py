@@ -22,11 +22,16 @@ semantics / Flag-gating sections. This module differs only in:
     narrative ~30s, presence ~60s")
   - SLOT_NAME = "sensor_cache_outer_spirit"
   - MAX_PAYLOAD_BYTES = OUTER_SENSOR_CACHE_SPIRIT_MAX_BYTES (8192)
-  - SOURCE_KEYS = canonical msgpack-friendly key set consumed by
-    ``outer_spirit_tensor.collect_outer_spirit_45d``: action_stats /
-    creative_stats / guardian_stats / sovereignty_ratio / uptime_ratio /
-    recovery_stats / social_stats / memory_stats / hormone_levels /
-    solana_stats / assessment_stats / history.
+  - SOURCE_KEYS = canonical RAW upstream key set provided by
+    ``TitanPlugin._gather_outer_sources``. The Rust outer-spirit daemon
+    runs the ``_collect_extended`` preprocessing internally (port at
+    ``titan-outer-spirit-rs/src/tick_loop.rs::project_outer_spirit_45d``
+    closes rFP D1 / GAP-CS6-001), so the sidecar writes raw upstream
+    stats (mirroring ``outer_mind_sensor_refresh.py`` and
+    ``outer_body_sensor_refresh.py``). Keys: agency_stats /
+    assessment_stats / memory_status / social_perception_stats /
+    art_count_500 / audio_count_500 / uptime_seconds / hormone_levels /
+    solana_stats / recovery_stats / history / soul_health.
 
 Per SPEC §9.A line 944, ``titan-outer-spirit-rs`` reads ONLY this cache
 + ``outer_body_5d.bin`` + ``outer_mind_15d.bin`` (Observer Principle).
@@ -85,22 +90,24 @@ SCHEMA_VERSION: int = 1
 _WARN_THROTTLE_EVERY: int = 60
 _RESTART_BACKOFF_S: float = 5.0
 
-#: Canonical source-dict key set for outer_spirit. Consumed by
-#: ``outer_spirit_tensor.collect_outer_spirit_45d`` keyword args
-#: (lines 53-69). All keys are msgpack-friendly plain types.
+#: Canonical RAW upstream source-dict key set provided by
+#: ``TitanPlugin._gather_outer_sources``. The Rust daemon
+#: (``project_outer_spirit_45d``) does the ``_collect_extended``
+#: preprocessing internally — sidecar writes RAW stats only.
+#: All keys are msgpack-friendly plain types.
 SOURCE_KEYS: tuple[str, ...] = (
-    "action_stats",        # SAT/CHIT/ANANDA — derived from agency_stats
-    "creative_stats",      # SAT/ANANDA — derived from art/audio counts
-    "guardian_stats",      # SAT — derived from helper_statuses + bus_stats
-    "sovereignty_ratio",   # SAT [2] — float (parent-derived from agency)
-    "uptime_ratio",        # SAT — float (parent-derived from uptime_seconds)
-    "recovery_stats",      # SAT — derived from network_monitor / restarts
-    "social_stats",        # CHIT/ANANDA — derived from social_perception
-    "memory_stats",        # CHIT — derived from memory_status
-    "hormone_levels",      # ANANDA — neuromod / hormonal cascade state
-    "solana_stats",        # ANANDA — derived from sol_balance + anchor_state
-    "assessment_stats",    # CHIT — assessment self-evaluation
-    "history",             # ANANDA — rolling outer_spirit recent state
+    "agency_stats",            # → action_stats / guardian_stats / sovereignty_ratio
+    "assessment_stats",        # → assessment_ext (mean_score / trend / score_variance)
+    "memory_status",           # → memory_stats / social_stats.interactions
+    "social_perception_stats", # → social_stats.sentiment / connection
+    "art_count_500",           # → creative_stats.art_count
+    "audio_count_500",         # → creative_stats.audio_count
+    "uptime_seconds",          # → uptime_ratio
+    "hormone_levels",          # → ANANDA[11] creative_tension (currently unset by provider)
+    "solana_stats",            # → SAT[0,5,7,13] (currently unset by provider)
+    "recovery_stats",          # → SAT[10] (currently unset by provider)
+    "history",                 # → CHIT[10,11,14] + ANANDA[10,11,13] (currently unset)
+    "soul_health",             # → outer_lower_spirit 5D (sidecar pass-through)
 )
 
 

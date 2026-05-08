@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import time
 
 import httpx
 
@@ -611,11 +612,26 @@ class MeditationEpoch:
 
         vault_program_id = getattr(self, "_vault_program_id", None)
         if vault_program_id:
+            # rFP_meditation_worker_latency Option 1 instrumentation:
+            # log the per-phase cost of the three sync helpers that share
+            # the to_thread executor — this nails the kernel-side gap.
+            _t0 = time.time()
+
             # Step 1: Get TimeChain merkle root (all fork tips → single 32-byte hash)
             tc_merkle = self._get_timechain_merkle()
+            _t1 = time.time()
+            logger.info(
+                "[Meditation] [LAT] phase1_tc_merkle: %.3fs (TimeChain init+merkle)",
+                _t1 - _t0,
+            )
 
             # Step 2: Hash-chain linking — include previous vault root
             prev_root = self._get_vault_latest_root(vault_program_id)
+            _t2 = time.time()
+            logger.info(
+                "[Meditation] [LAT] phase2_vault_root: %.3fs (sync httpx getAccountInfo)",
+                _t2 - _t1,
+            )
             if tc_merkle and prev_root:
                 # Linked: SHA256(tc_merkle + prev_vault_root) → tamper-proof chain
                 chained_root = hashlib.sha256(tc_merkle + prev_root).digest()
@@ -628,6 +644,12 @@ class MeditationEpoch:
 
             # Step 3: Compute real sovereignty score
             sovereignty_bp = self._compute_sovereignty_bp()
+            _t3 = time.time()
+            logger.info(
+                "[Meditation] [LAT] phase3_sovereignty_bp: %.3fs "
+                "(3 sqlite reads + msl json) | build_total=%.3fs",
+                _t3 - _t2, _t3 - _t0,
+            )
 
             vault_ix = build_vault_commit_instruction(
                 self.network.pubkey, chained_root, sovereignty_bp, vault_program_id,
@@ -647,10 +669,45 @@ class MeditationEpoch:
         return instructions
 
     def _get_timechain_merkle(self) -> bytes | None:
-        """Get TimeChain merkle root from local TimeChain instance."""
+        """Get TimeChain merkle root from local TimeChain instance.
+
+        rFP_meditation_worker_latency Fix #D (2026-05-07): cache the
+        TimeChain instance on `self._tc_cached` instead of constructing
+        a fresh one every anchor cycle. Offline benchmark 2026-05-07
+        measured TimeChain init at 5.6-7.5s consistently (load_fork_state
+        + idempotent system-fork registration + sqlite schema check on
+        a 195K-200K-block index DB). Reused instance returns merkle in
+        ~0.1ms (just walks self._fork_tips). Saves 6s per cycle in the
+        kernel's _build_commit_instructions path; with multiple
+        meditations per day this compounds.
+
+        Note: TimeChain mutates over time as new blocks are appended.
+        Reusing a cached instance is safe because `compute_merkle_root`
+        reads `self._fork_tips` which is updated by the same TimeChain
+        instance's `append_block` calls — but here we only read; the
+        actual block writing happens in titan_plugin/modules/timechain.py
+        which uses its OWN TimeChain instance with the same on-disk
+        index DB. The fork_tips on disk are authoritative; cached
+        in-memory tips on this anchor-helper instance can drift, so
+        we re-load the fork state from the index DB before each merkle
+        compute to stay current with the writer process.
+        """
         try:
-            from titan_plugin.logic.timechain import TimeChain
-            tc = TimeChain(data_dir="data/timechain")
+            tc = getattr(self, "_tc_cached", None)
+            if tc is None:
+                from titan_plugin.logic.timechain import TimeChain
+                tc = TimeChain(data_dir="data/timechain")
+                self._tc_cached = tc
+            else:
+                # Refresh fork tips from the index DB so we don't anchor a
+                # stale merkle when the timechain worker has appended
+                # blocks since the last cycle.
+                try:
+                    tc._load_fork_state()
+                except Exception as _refresh_err:
+                    logger.debug(
+                        "[Meditation] TimeChain fork-tip refresh failed "
+                        "(using cached state): %s", _refresh_err)
             if tc.has_genesis:
                 return tc.compute_merkle_root()
         except Exception as e:

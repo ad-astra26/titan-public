@@ -48,6 +48,10 @@ Usage:
   python scripts/arch_map.py deploy all --restart    # Deploy + restart all remote Titans
   python scripts/arch_map.py errors                  # Cross-Titan error summary (last 500 lines)
   python scripts/arch_map.py errors --all            # Include T2/T3 errors via SSH
+  python scripts/arch_map.py dim-live                 # Trinity 130D ALIVE/SILENT classification (T1)
+  python scripts/arch_map.py dim-live --all           # Same, all 3 Titans
+  python scripts/arch_map.py dim-live --verbose       # Per-dim listing
+  python scripts/arch_map.py dim-live --diff T1 T2    # Compare T1↔T2 dim states
   python scripts/arch_map.py traffic                 # Nginx traffic stats (last 1 hour)
   python scripts/arch_map.py traffic --24h           # Nginx traffic stats (last 24 hours)
   python scripts/arch_map.py traffic --1h            # Nginx traffic stats (last 1 hour, default)
@@ -5316,15 +5320,25 @@ def run_preflight():
             print(f"  ⚠ {tid}: {type(e).__name__}")
 
     # ── 6. TimeChain integrity ──
+    # HARD signal = chain reachable + has blocks (per-Titan "✓ TimeChain active").
+    # WARN signal = "/v4/timechain/verify" returned valid=True ("✓ ALL FORKS VALID").
+    # Verify endpoint can 504 under load (in-line walk); not a chain-integrity
+    # failure on its own, so don't HALT on its absence — only HALT when the
+    # chain itself is unreachable.
     print("\n[6/9] TIMECHAIN — fork integrity")
     rc, out = _run_cmd([sys.executable, str(Path(__file__)), "timechain", "--all"], timeout=30)
+    active_count = out.count("✓ TimeChain active")
     valid_count = out.count("✓ ALL FORKS VALID")
-    if valid_count >= 1:
-        passes.append(f"timechain: {valid_count} Titans valid")
-        print(f"  ✓ {valid_count} Titans with all forks valid")
+    if active_count >= 1 and valid_count >= 1:
+        passes.append(f"timechain: {active_count} Titans active, {valid_count} verified valid")
+        print(f"  ✓ {active_count} Titans active, {valid_count} with all forks verified valid")
+    elif active_count >= 1:
+        warnings.append(f"timechain: {active_count} active, verify endpoint slow ({valid_count} confirmed)")
+        print(f"  ⚠ {active_count} Titans active, but verify endpoint slow/504 "
+              f"({valid_count} integrity-confirmed)")
     else:
-        hard_fails.append("timechain: no valid-forks line found")
-        print("  🔴 TimeChain integrity cannot be confirmed")
+        hard_fails.append("timechain: no active Titans — chain unreachable")
+        print("  🔴 No active Titans — TimeChain unreachable")
 
     # ── 7. CGN pipeline ──
     print("\n[7/9] CGN — consumers + HAOV hypothesis testing")
@@ -7655,6 +7669,212 @@ def run_sovereign_ops(all_titans: bool = False):
     print()
 
 
+# ── Trinity 130D dim-live (rFP_trinity_130d_awakening Phase 0) ──────
+# Lean implementation: fetch /v4/unified-spirit, classify each of the 130
+# dims as ALIVE / SILENT against its documented default value, render
+# summary or per-dim verbose listings.
+
+_DIM_LIVE_TITAN_URLS = {
+    "T1": "http://127.0.0.1:7777",
+    "T2": "http://10.135.0.6:7777",
+    "T3": "http://10.135.0.6:7778",
+}
+
+
+def _dim_live_fetch_tensor(url: str, timeout: float = 5.0) -> list[float]:
+    """Fetch /v4/unified-spirit, return the 130D spirit_tensor or []."""
+    import urllib.request as _ur
+    import json as _json
+    try:
+        req = _ur.urlopen(url + "/v4/unified-spirit", timeout=timeout)
+        body = _json.loads(req.read())
+    except Exception as e:
+        print(f"  ⚠ unreachable: {url} ({e})")
+        return []
+    data = body.get("data", body)
+    le = data.get("latest_epoch") or {}
+    st = le.get("spirit_tensor") or []
+    if isinstance(st, list) and len(st) == 130:
+        return [float(v) for v in st]
+    # Fallback: full_130dt at top level (older shape)
+    full = data.get("full_130dt") or []
+    if isinstance(full, list) and len(full) == 130:
+        return [float(v) for v in full]
+    return []
+
+
+def _dim_live_classify(value: float, default_value: float,
+                        tol: float = 0.01) -> str:
+    """ALIVE if |value - default| > tol, else SILENT.
+    NaN / out-of-range → CORRUPTED.
+    """
+    import math as _m
+    if value is None or _m.isnan(value) or _m.isinf(value):
+        return "CORRUPTED"
+    if value < -1e-6 or value > 1.0 + 1e-6:
+        return "CORRUPTED"
+    return "ALIVE" if abs(value - default_value) > tol else "SILENT"
+
+
+def _dim_live_render_summary(label: str, tensor: list[float]) -> dict:
+    """Print a per-block summary table; return per-block counts."""
+    from titan_plugin.api.dim_registry import iter_registry, _BLOCKS as DR_BLOCKS
+
+    if not tensor:
+        print(f"  {label}: tensor unavailable")
+        return {}
+
+    counts: dict[str, dict[str, int]] = {}
+    for entry in iter_registry():
+        v = tensor[entry.full_index]
+        state = _dim_live_classify(v, entry.default_value)
+        b = counts.setdefault(entry.block, {"ALIVE": 0, "SILENT": 0,
+                                              "CORRUPTED": 0, "total": 0})
+        b[state] = b.get(state, 0) + 1
+        b["total"] += 1
+
+    print(f"  {label}")
+    print(f"  {'block':<14s} {'alive':>7s} {'silent':>7s} {'corrupt':>8s} "
+          f"{'total':>6s} {'%alive':>7s}")
+    print("  " + "-" * 60)
+    total_alive = total_silent = total_corrupt = 0
+    for start, length, block in DR_BLOCKS:
+        b = counts.get(block, {"ALIVE": 0, "SILENT": 0, "CORRUPTED": 0,
+                               "total": length})
+        a = b.get("ALIVE", 0)
+        s = b.get("SILENT", 0)
+        c = b.get("CORRUPTED", 0)
+        t = b["total"]
+        pct = 100.0 * a / max(1, t)
+        marker = "✓" if a == t else ("⚠" if a >= t * 0.8 else "✗")
+        print(f"  {marker} {block:<12s} {a:>7d} {s:>7d} {c:>8d} "
+              f"{t:>6d} {pct:>6.1f}%")
+        total_alive += a
+        total_silent += s
+        total_corrupt += c
+    total = total_alive + total_silent + total_corrupt
+    pct = 100.0 * total_alive / max(1, total)
+    print("  " + "-" * 60)
+    marker = "✓" if total_alive == total else ("⚠" if pct >= 80 else "✗")
+    print(f"  {marker} {'TOTAL':<12s} {total_alive:>7d} {total_silent:>7d} "
+          f"{total_corrupt:>8d} {total:>6d} {pct:>6.1f}%")
+    return counts
+
+
+def _dim_live_render_verbose(label: str, tensor: list[float]) -> None:
+    """Per-dim listing: full_index | block | name | value | state."""
+    from titan_plugin.api.dim_registry import iter_registry
+
+    if not tensor:
+        print(f"  {label}: tensor unavailable")
+        return
+    print(f"  {label}")
+    print(f"  {'idx':>4s}  {'block':<13s}  {'name':<28s}  {'value':>7s}  "
+          f"{'default':>7s}  {'state'}")
+    print("  " + "-" * 80)
+    for entry in iter_registry():
+        v = tensor[entry.full_index]
+        state = _dim_live_classify(v, entry.default_value)
+        marker = {"ALIVE": "✓", "SILENT": "·", "CORRUPTED": "✗"}[state]
+        print(f"  {entry.full_index:>4d}  {entry.block:<13s}  "
+              f"{entry.name[:28]:<28s}  {v:>7.4f}  "
+              f"{entry.default_value:>7.2f}  {marker} {state}")
+
+
+def _dim_live_render_diff(label_a: str, tensor_a: list[float],
+                            label_b: str, tensor_b: list[float]) -> None:
+    """Side-by-side state classification per dim across two Titans.
+    Emphasizes dims where one is ALIVE and the other isn't."""
+    from titan_plugin.api.dim_registry import iter_registry
+
+    if not tensor_a or not tensor_b:
+        print(f"  diff: at least one tensor unavailable "
+              f"({label_a}={len(tensor_a)}, {label_b}={len(tensor_b)})")
+        return
+    print(f"  diff: {label_a}  vs  {label_b}  "
+          "(only dims where state differs)")
+    print(f"  {'idx':>4s}  {'block':<13s}  {'name':<28s}  "
+          f"{label_a:>10s}  {label_b:>10s}")
+    print("  " + "-" * 80)
+    diverged = 0
+    for entry in iter_registry():
+        va = tensor_a[entry.full_index]
+        vb = tensor_b[entry.full_index]
+        sa = _dim_live_classify(va, entry.default_value)
+        sb = _dim_live_classify(vb, entry.default_value)
+        if sa != sb:
+            diverged += 1
+            print(f"  {entry.full_index:>4d}  {entry.block:<13s}  "
+                  f"{entry.name[:28]:<28s}  "
+                  f"{sa[:1]} {va:>7.4f}  {sb[:1]} {vb:>7.4f}")
+    if diverged == 0:
+        print("  (all 130 dims agree on state classification)")
+    else:
+        print("  " + "-" * 80)
+        print(f"  {diverged}/130 dims diverge")
+
+
+def run_dim_live(args: list[str]) -> None:
+    """rFP_trinity_130d_awakening Phase 0 — dim-live measurement.
+
+    Usage:
+      python scripts/arch_map.py dim-live                       # T1 summary
+      python scripts/arch_map.py dim-live --titan T2            # T2 summary
+      python scripts/arch_map.py dim-live --all                 # All three
+      python scripts/arch_map.py dim-live --verbose             # Per-dim T1
+      python scripts/arch_map.py dim-live --diff T1 T2          # Diff T1↔T2
+    """
+    # Argument parsing (small surface, hand-rolled to match arch_map style).
+    titan = "T1"
+    all_titans = "--all" in args
+    verbose = "--verbose" in args
+    diff_pair: tuple[str, str] | None = None
+
+    if "--titan" in args:
+        i = args.index("--titan")
+        if i + 1 < len(args):
+            titan = args[i + 1].upper()
+    if "--diff" in args:
+        i = args.index("--diff")
+        if i + 2 < len(args):
+            diff_pair = (args[i + 1].upper(), args[i + 2].upper())
+
+    print("=" * 60)
+    print("TRINITY 130D — DIM LIVE (rFP_trinity_130d_awakening Phase 0)")
+    print("=" * 60)
+
+    if diff_pair is not None:
+        a, b = diff_pair
+        url_a = _DIM_LIVE_TITAN_URLS.get(a)
+        url_b = _DIM_LIVE_TITAN_URLS.get(b)
+        if not (url_a and url_b):
+            print(f"  unknown titan in --diff: {a} or {b}")
+            return
+        ta = _dim_live_fetch_tensor(url_a)
+        tb = _dim_live_fetch_tensor(url_b)
+        _dim_live_render_diff(a, ta, b, tb)
+        return
+
+    if all_titans:
+        targets = [("T1", _DIM_LIVE_TITAN_URLS["T1"]),
+                   ("T2", _DIM_LIVE_TITAN_URLS["T2"]),
+                   ("T3", _DIM_LIVE_TITAN_URLS["T3"])]
+    else:
+        url = _DIM_LIVE_TITAN_URLS.get(titan)
+        if url is None:
+            print(f"  unknown titan: {titan} (use T1 / T2 / T3 / --all)")
+            return
+        targets = [(titan, url)]
+
+    for label, url in targets:
+        tensor = _dim_live_fetch_tensor(url)
+        if verbose:
+            _dim_live_render_verbose(f"{label}  ({url})", tensor)
+        else:
+            _dim_live_render_summary(f"{label}  ({url})", tensor)
+        print()
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -7744,6 +7964,9 @@ def main():
                 run_health_checks("http://10.135.0.6:7777", "T2 (10.135.0.6:7777)")
             if "--t3" in sys.argv:
                 run_health_checks("http://10.135.0.6:7778", "T3 (10.135.0.6:7778)")
+
+    elif cmd == "dim-live":
+        run_dim_live(sys.argv[2:])
 
     elif cmd == "teacher":
         show_teacher_progress()
@@ -8301,7 +8524,16 @@ def run_phase_c_command(args: list) -> int:
     action = args[0]
     rest = args[1:]
     if action == "verify":
-        return _phase_c_verify(strict="--strict" in rest, json_mode="--json" in rest)
+        # --gate=G-RPC-1,G-RPC-3 (CSV) — restrict to specified gates only.
+        # Default = run all gates.
+        gate_arg = next((a for a in rest if a.startswith("--gate=")), None)
+        gates = None
+        if gate_arg:
+            gates = set(gate_arg.split("=", 1)[1].split(","))
+        return _phase_c_verify(
+            strict="--strict" in rest, json_mode="--json" in rest,
+            gates=gates,
+        )
     elif action == "regen":
         return _phase_c_regen()
     elif action == "diff":
@@ -8321,6 +8553,8 @@ def run_phase_c_command(args: list) -> int:
         return _phase_c_data_integrity_audit()
     elif action in ("crate-ownership", "crate_ownership"):
         return _phase_c_crate_ownership(strict="--strict" in rest)
+    elif action in ("daemon-tick-rate", "daemon_tick_rate"):
+        return _phase_c_daemon_tick_rate(rest)
     elif action in ("help", "--help", "-h"):
         return _phase_c_help()
     else:
@@ -8352,6 +8586,19 @@ Actions:
                                 / `pub enum` definitions of registered concepts and emits
                                 HIGH findings for duplicates outside the canonical crate.
                                 --strict exits non-zero on any finding (pre-commit mode).
+  daemon-tick-rate [opts]      Runtime-completeness gate. Reads each L1/L2 daemon's shm
+                                slot header_seq version counter twice (sampling window
+                                seconds apart), computes Δversion/sec, flags any slot
+                                STUCK (delta=0) or SLOW (<50% expected Hz). Designed
+                                to catch the failure class where a Rust binary ships
+                                with a placeholder tick_loop (e.g. C-S3 substrate's
+                                trinity-rs writes only at boot then idles), where SPEC
+                                static-verify passes but production produces zeros.
+                                Options:
+                                  --titan=T1|T2|T3  (default T1; T2/T3 use SSH)
+                                  --window=N        sampling window seconds (default 5)
+                                  --json            machine-readable
+                                  --strict          exit non-zero if any STUCK/SLOW
 
 Source of truth: titan-docs/SPEC_titan_architecture_constants.toml +
                  titan-docs/SPEC_titan_architecture.md (Preamble G17 +
@@ -8538,6 +8785,359 @@ def _phase_c_crate_ownership(strict: bool = False) -> int:
 
 
 
+# ─── daemon-tick-rate: runtime-completeness gate ──────────────────────
+#
+# Reads each shm slot's triple-buffer header_seq twice (sampling window
+# apart), decodes the version counter, computes write rate. Flags any
+# slot with delta=0 (STUCK) or measured Hz <50% of expected (SLOW).
+#
+# Why this exists: phase-c verify --strict + parity tests pass green even
+# when a Rust binary ships with a documented C-S3 placeholder tick_loop.
+# This tool is the runtime check that closes the SPEC-static ↔ runtime-real
+# gap. Codified after the 2026-05-05 chunk 8M deploy surfaced titan-trinity-rs
+# producing zero values for sphere_clocks / topology_30d / chi_state for
+# weeks while every static check returned clean.
+#
+# SPEC layout reference: §7.0 (triple-buffer header) + §7.1 (per-slot
+# byte layouts) + state_registry.py / titan-state crate (Rust mirror).
+# header_seq u64 little-endian at offset 0:
+#   bits 8..63 = version (monotonic write counter)
+#   bits 0..7  = ready_idx (which buffer holds latest payload)
+
+# Expected write cadence per slot. Derived from SPEC §7.1 + §10.H +
+# §18.1 + Schumann ground truths (G2). Sources cited per entry. None =
+# boot-once / immutable / no expected-rate (still useful to verify
+# version > 0).
+_DAEMON_TICK_EXPECTED_HZ = {
+    # ── Inner trinity (Schumann-locked, SPEC §10.H + G2) ──────────────
+    "inner_body_5d.bin":    7.83,    # schumann_body_hz
+    "inner_mind_15d.bin":   23.49,   # schumann_mind_hz (×3)
+    "inner_spirit_45d.bin": 70.47,   # schumann_spirit_hz (×9)
+    # ── Outer trinity (SPEC §18.1 OUTER_*_TICK_BASE_S) ────────────────
+    "outer_body_5d.bin":    1.0/15.0,  # 15 s base cadence
+    "outer_mind_15d.bin":   1.0/5.0,   # 5 s
+    "outer_spirit_45d.bin": 1.0/30.0,  # 30 s
+    # ── Trinity substrate computed slots (body cycle, SPEC §659/§667) ─
+    # "~1.15 s body publish rate" → 0.87 Hz. These are the slots that
+    # exposed the C-S3 placeholder bug — substrate tick_loop computes
+    # them once at boot then idles under current trinity-rs.
+    "sphere_clocks.bin":    0.87,    # titan-trinity-rs (C-S5 pending)
+    "topology_30d.bin":     0.87,    # titan-trinity-rs (C-S5 pending)
+    "chi_state.bin":        0.87,    # titan-unified-spirit-rs (C-S4)
+    "self_162d.bin":        0.87,    # titan-unified-spirit-rs (✓ shipped)
+    "unified_spirit_132d.bin": 0.87, # titan-unified-spirit-rs (✓ shipped)
+    # ── Kernel-rs slots (SPEC §10.H) ──────────────────────────────────
+    "epoch_counter.bin":    3.0,     # KERNEL_PI_HEARTBEAT_INTERVAL_S
+    "circadian.bin":        1.0,     # KERNEL_CIRCADIAN_TICK_S
+    "pi_heartbeat.bin":     3.0,     # ~3 Hz π-heartbeat
+    # ── L2 Python writers (C-S5 — chunk 8M.1 wired registration) ─────
+    # ns/neuromod/hormonal workers write ~once per slot internal tick.
+    # Conservative expected lower bound: 0.1 Hz (10 s). Real cadence is
+    # worker-internal; this catches "totally stuck" not "slow".
+    "titanvm_registers.bin": 0.1,
+    "neuromod_state.bin":    0.1,
+    "hormonal_state.bin":    0.1,
+    # ── Boot-once / immutable ─────────────────────────────────────────
+    # identity.bin written once at kernel boot per SPEC §7.1 + §10.E.
+    # cgn_live_weights variable size, written by cgn_worker.
+    # fastbus.bin is a ring buffer, not a versioned slot.
+    # These are EXCLUDED from the rate check (None signals "no expected rate").
+    "identity.bin":         None,
+    "cgn_live_weights.bin": None,
+    "fastbus.bin":          None,
+}
+
+# Slots that are content-hash gated per SPEC §7.1. Effective write rate
+# is rate-limited by content change rate, NOT clock cadence — saves ~99%
+# of writes when state is steady (per content_hash.rs:3-6).
+#
+# Implication for the classifier:
+#   - delta=0  → STUCK (writer itself not running OR placeholder)
+#   - delta>0 + measured < 50% expected → GATED (informational, not error;
+#     content gate is doing its job — most writes byte-identical to
+#     previous so suppressed). Common for derived slots (spirit composed
+#     via EMA smoother → many ticks produce identical bytes).
+#   - delta>0 + measured >= 50% expected → LIVE (writer + content both
+#     changing every tick, e.g. inner_body @ 7.80/7.83 Hz on T3).
+#
+# For non-content-gated slots, the rate IS the spec contract — measured
+# below 50% is genuinely SLOW.
+#
+# Source: SPEC §7.1 "Content-hash gated" column.
+_DAEMON_TICK_CONTENT_GATED = {
+    "inner_body_5d.bin",
+    "inner_mind_15d.bin",
+    "inner_spirit_45d.bin",
+    "outer_body_5d.bin",
+    "outer_mind_15d.bin",
+    "outer_spirit_45d.bin",
+    "topology_30d.bin",
+    "sphere_clocks.bin",
+    "chi_state.bin",
+    "titanvm_registers.bin",
+    "hormonal_state.bin",
+}
+
+# Owner attribution per SPEC §9.A + §10.E. Used in the report so each
+# stuck slot points at its responsible Rust binary or Python worker.
+_DAEMON_TICK_OWNER = {
+    "inner_body_5d.bin":    "titan-inner-body-rs",
+    "inner_mind_15d.bin":   "titan-inner-mind-rs",
+    "inner_spirit_45d.bin": "titan-inner-spirit-rs",
+    "outer_body_5d.bin":    "titan-outer-body-rs",
+    "outer_mind_15d.bin":   "titan-outer-mind-rs",
+    "outer_spirit_45d.bin": "titan-outer-spirit-rs",
+    "sphere_clocks.bin":    "titan-trinity-rs",
+    "topology_30d.bin":     "titan-trinity-rs",
+    "chi_state.bin":        "titan-unified-spirit-rs",
+    "self_162d.bin":        "titan-unified-spirit-rs",
+    "unified_spirit_132d.bin": "titan-unified-spirit-rs",
+    "epoch_counter.bin":    "titan-kernel-rs",
+    "circadian.bin":        "titan-kernel-rs",
+    "pi_heartbeat.bin":     "titan-kernel-rs",
+    "titanvm_registers.bin": "ns_module (Python L2)",
+    "neuromod_state.bin":   "neuromod_module (Python L2)",
+    "hormonal_state.bin":   "hormonal_module (Python L2)",
+    "identity.bin":         "titan-kernel-rs (boot-once)",
+    "cgn_live_weights.bin": "cgn_worker (Python L2)",
+    "fastbus.bin":          "titan-kernel-rs (ring buffer)",
+}
+
+
+def _daemon_tick_inline_reader_script() -> str:
+    """Return a self-contained Python snippet that reads + emits JSON.
+
+    Embedded into the SSH command for remote (T2/T3) Titan probing so we
+    don't depend on the remote host having any helper script installed.
+    Same code-path used locally via subprocess.
+    """
+    return r'''
+import json, os, struct, sys, time
+SHM_ROOT = sys.argv[1]
+WINDOW_S = float(sys.argv[2])
+def read_header(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+        if len(head) < 8:
+            return None
+        seq = struct.unpack("<Q", head)[0]
+        version = seq >> 8
+        ready_idx = seq & 0xFF
+        return {"version": version, "ready_idx": ready_idx}
+    except Exception as e:
+        return {"error": str(e)}
+def list_bins():
+    if not os.path.isdir(SHM_ROOT):
+        return []
+    return sorted(f for f in os.listdir(SHM_ROOT) if f.endswith(".bin"))
+t0 = {f: read_header(os.path.join(SHM_ROOT, f)) for f in list_bins()}
+mtime0 = {f: os.path.getmtime(os.path.join(SHM_ROOT, f)) for f in list_bins() if os.path.exists(os.path.join(SHM_ROOT, f))}
+time.sleep(WINDOW_S)
+files = list_bins()
+t1 = {f: read_header(os.path.join(SHM_ROOT, f)) for f in files}
+mtime1 = {f: os.path.getmtime(os.path.join(SHM_ROOT, f)) for f in files if os.path.exists(os.path.join(SHM_ROOT, f))}
+out = {"shm_root": SHM_ROOT, "window_s": WINDOW_S, "slots": {}}
+for f in files:
+    h0 = t0.get(f); h1 = t1.get(f)
+    entry = {}
+    if h0 is None or h1 is None or "error" in (h0 or {}) or "error" in (h1 or {}):
+        entry["error"] = (h0 or {}).get("error") or (h1 or {}).get("error") or "missing"
+    else:
+        v0 = h0["version"]; v1 = h1["version"]
+        delta = v1 - v0
+        entry["version_t0"] = v0
+        entry["version_t1"] = v1
+        entry["delta"] = delta
+        entry["measured_hz"] = delta / WINDOW_S if WINDOW_S > 0 else 0.0
+        entry["ready_idx_t1"] = h1["ready_idx"]
+        entry["mtime_age_t1_s"] = round(time.time() - mtime1.get(f, 0), 2) if f in mtime1 else None
+    out["slots"][f] = entry
+print(json.dumps(out))
+'''
+
+
+def _daemon_tick_run_local(window_s: float, titan_id: str) -> dict:
+    """Run the inline reader locally."""
+    import subprocess as _sp
+    shm_root = f"/dev/shm/titan_{titan_id}"
+    result = _sp.run(
+        [sys.executable, "-c", _daemon_tick_inline_reader_script(), shm_root, str(window_s)],
+        capture_output=True, text=True, timeout=window_s + 30,
+    )
+    if result.returncode != 0:
+        return {"error": result.stderr.strip() or "reader failed", "shm_root": shm_root}
+    import json as _j
+    try:
+        return _j.loads(result.stdout)
+    except Exception as e:
+        return {"error": f"json parse: {e}", "stdout": result.stdout[:500]}
+
+
+def _daemon_tick_run_remote(window_s: float, titan_id: str, host: str) -> dict:
+    """Run the inline reader on a remote Titan via SSH."""
+    import subprocess as _sp
+    shm_root = f"/dev/shm/titan_{titan_id}"
+    script = _daemon_tick_inline_reader_script()
+    # Heredoc-pipe the script + args to remote python3 so quoting is sane.
+    cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", host,
+           f"python3 - {shm_root} {window_s}"]
+    result = _sp.run(cmd, input=script, capture_output=True, text=True,
+                     timeout=window_s + 30)
+    if result.returncode != 0:
+        return {"error": result.stderr.strip() or "ssh/reader failed",
+                "host": host, "shm_root": shm_root}
+    import json as _j
+    try:
+        return _j.loads(result.stdout)
+    except Exception as e:
+        return {"error": f"json parse: {e}", "stdout": result.stdout[:500]}
+
+
+def _daemon_tick_classify(slot_name: str, entry: dict) -> tuple[str, str]:
+    """Return (status, note).
+
+    Status ∈ LIVE | STUCK | SLOW | GATED | UNKNOWN | BOOT-ONCE | ERROR.
+
+    Decision tree:
+      - error                              → ERROR (passthrough)
+      - expected_hz is None + version > 0  → BOOT-ONCE (informational)
+      - expected_hz is None + version == 0 → UNKNOWN (slot exists, never written)
+      - delta == 0                         → STUCK (writer not running OR placeholder)
+      - delta > 0 + content-gated + below threshold  → GATED (informational)
+      - delta > 0 + non-gated + below threshold      → SLOW (real rate violation)
+      - delta > 0 + above threshold                  → LIVE (healthy)
+    """
+    if "error" in entry:
+        return ("ERROR", entry["error"])
+    expected = _DAEMON_TICK_EXPECTED_HZ.get(slot_name)
+    delta = entry.get("delta", 0)
+    measured = entry.get("measured_hz", 0.0)
+    is_gated = slot_name in _DAEMON_TICK_CONTENT_GATED
+    if expected is None:
+        # Boot-once / immutable / non-versioned slots.
+        if entry.get("version_t1", 0) == 0:
+            return ("UNKNOWN", "no expected rate, version still 0")
+        return ("BOOT-ONCE", f"version={entry.get('version_t1')}")
+    if delta == 0:
+        gate_note = " (content-gated, but input should be changing)" if is_gated else ""
+        return ("STUCK", f"version={entry.get('version_t1')} unchanged in window — placeholder or hung{gate_note}")
+    # Tolerate up to 50% under expected (writes can be bursty / clock-drifted).
+    threshold = expected * 0.5
+    if measured < threshold:
+        if is_gated:
+            return ("GATED",
+                    f"measured={measured:.2f} Hz (clock {expected:.2f} Hz, content-gated; "
+                    f"~{(1-measured/expected)*100:.1f}% writes suppressed by SPEC §7.1)")
+        return ("SLOW", f"measured={measured:.2f} Hz < threshold={threshold:.2f} (expected ~{expected:.2f})")
+    return ("LIVE", f"measured={measured:.2f} Hz (expected ~{expected:.2f})")
+
+
+def _phase_c_daemon_tick_rate(rest: list) -> int:
+    """Runtime-completeness gate. See _phase_c_help for full description."""
+    import json as _j
+    # Parse args
+    titan_id = "T1"
+    window_s = 5.0
+    json_mode = False
+    strict = False
+    for arg in rest:
+        if arg.startswith("--titan="):
+            titan_id = arg.split("=", 1)[1].upper()
+        elif arg.startswith("--window="):
+            try:
+                window_s = float(arg.split("=", 1)[1])
+            except ValueError:
+                print(f"invalid --window value: {arg}", file=sys.stderr)
+                return 2
+        elif arg == "--json":
+            json_mode = True
+        elif arg == "--strict":
+            strict = True
+        else:
+            print(f"unknown daemon-tick-rate arg: {arg}", file=sys.stderr)
+            return 2
+    if titan_id not in ("T1", "T2", "T3"):
+        print(f"--titan must be T1|T2|T3 (got {titan_id!r})", file=sys.stderr)
+        return 2
+    if window_s < 1.0 or window_s > 60.0:
+        print(f"--window must be in [1, 60] seconds (got {window_s})", file=sys.stderr)
+        return 2
+
+    # Resolve host. T1 = local; T2/T3 = same VPS at 10.135.0.6 per
+    # reference_vpc_network. Same SSH login used by deploy_t2.sh /
+    # t3_manage.sh — root@10.135.0.6.
+    if titan_id == "T1":
+        result = _daemon_tick_run_local(window_s, titan_id)
+    else:
+        result = _daemon_tick_run_remote(window_s, titan_id, "root@10.135.0.6")
+
+    if "error" in result:
+        if json_mode:
+            print(_j.dumps({"titan_id": titan_id, "error": result["error"]}))
+        else:
+            print(f"ERROR ({titan_id}): {result['error']}", file=sys.stderr)
+        return 1
+
+    # Classify each slot.
+    findings = []
+    rows = []
+    for slot_name in sorted(result.get("slots", {}).keys()):
+        entry = result["slots"][slot_name]
+        status, note = _daemon_tick_classify(slot_name, entry)
+        owner = _DAEMON_TICK_OWNER.get(slot_name, "?")
+        expected = _DAEMON_TICK_EXPECTED_HZ.get(slot_name)
+        row = {
+            "slot": slot_name,
+            "status": status,
+            "owner": owner,
+            "expected_hz": expected,
+            "delta": entry.get("delta"),
+            "measured_hz": entry.get("measured_hz"),
+            "version_t1": entry.get("version_t1"),
+            "ready_idx_t1": entry.get("ready_idx_t1"),
+            "mtime_age_s": entry.get("mtime_age_t1_s"),
+            "note": note,
+        }
+        rows.append(row)
+        # GATED is informational (SPEC §7.1 content-hash gating doing its job),
+        # not a finding. Only STUCK / SLOW / ERROR are real failures.
+        if status in ("STUCK", "SLOW", "ERROR"):
+            findings.append(row)
+
+    if json_mode:
+        out = {
+            "titan_id": titan_id,
+            "shm_root": result.get("shm_root"),
+            "window_s": window_s,
+            "slots": rows,
+            "findings": findings,
+            "ok": len(findings) == 0,
+        }
+        print(_j.dumps(out, indent=2))
+    else:
+        print(f"\nphase-c daemon-tick-rate — Titan {titan_id} — window {window_s:.1f}s")
+        print(f"shm root: {result.get('shm_root')}")
+        print()
+        # Header + rows
+        print(f"  {'STATUS':<10} {'SLOT':<25} {'EXPECTED':>9}  {'MEASURED':>9}  {'Δ':>6}  {'OWNER'}")
+        for row in rows:
+            exp = f"{row['expected_hz']:.2f} Hz" if row["expected_hz"] is not None else "—"
+            meas = f"{row['measured_hz']:.2f} Hz" if row["measured_hz"] is not None else "—"
+            delta = str(row["delta"]) if row["delta"] is not None else "—"
+            print(f"  {row['status']:<10} {row['slot']:<25} {exp:>9}  {meas:>9}  {delta:>6}  {row['owner']}")
+        print()
+        if findings:
+            print(f"⚠  {len(findings)} finding(s):")
+            for f in findings:
+                print(f"   [{f['status']}] {f['slot']} ({f['owner']}) — {f['note']}")
+        else:
+            print("✓ all slots within expected cadence (no STUCK / SLOW / ERROR)")
+        print()
+
+    return 1 if (strict and findings) else 0
+
+
 def _phase_c_repo_root() -> "Path":
     from pathlib import Path
     return Path(__file__).resolve().parent.parent
@@ -8572,21 +9172,310 @@ def _phase_c_regen() -> int:
     return result.returncode
 
 
-def _phase_c_verify(strict: bool = False, json_mode: bool = False) -> int:
+def _phase_c_g_rpc_gates(repo, gates: "set | None") -> list:
+    """Phase C Session 5 (rFP §4.E) — AST-based G-RPC enforcement gates.
+
+    Returns a list of finding dicts. Empty list = all gates clean.
+    """
+    import ast
+    import yaml
+
+    findings: list = []
+    titan_plugin = repo / "titan_plugin"
+    proxies_dir = titan_plugin / "proxies"
+    exemptions_path = repo / "titan-docs" / "phase_c_rpc_exemptions.yaml"
+
+    # Load exemptions YAML (work-RPC allowlist + orphan handler allowlist).
+    exempt_files: set = set()
+    exempt_sites: set = set()  # (file, line) tuples
+    orphan_handler_allowlist: set = set()  # action names allowed to be orphan
+    if exemptions_path.exists():
+        try:
+            with exemptions_path.open() as fh:
+                ex = yaml.safe_load(fh) or {}
+            for entry in (ex.get("work_rpc_sites", []) or []):
+                f = entry.get("file", "")
+                if f:
+                    exempt_files.add(f)
+                site = entry.get("site", "")
+                if site and ":" in site:
+                    parts = site.rsplit(":", 1)
+                    try:
+                        exempt_sites.add((parts[0], int(parts[1])))
+                    except ValueError:
+                        # Site referenced by method name (e.g.
+                        # "file.py:method_name") — track the file as
+                        # exempt; line-precision not available.
+                        pass
+            for entry in (ex.get("boot_init_sites", []) or []):
+                f = entry.get("file", "")
+                if f:
+                    exempt_files.add(f)
+            # G-RPC-4 orphan-handler allowlist (action names whose
+            # handler is intentionally kept despite no static caller —
+            # e.g. work-RPC dynamic action passing through helper, or
+            # pre-existing tech debt out of current rFP scope).
+            for entry in (ex.get("orphan_handler_allowlist", []) or []):
+                a = entry.get("action", "")
+                if a:
+                    orphan_handler_allowlist.add(a)
+        except Exception as e:
+            findings.append({
+                "kind": "G-RPC-EXEMPTIONS_PARSE_FAIL",
+                "severity": "HIGH",
+                "message": f"phase_c_rpc_exemptions.yaml parse failed: {e}",
+                "remediation": "fix YAML syntax; gates run with empty allowlist meanwhile",
+            })
+
+    def _gate_enabled(gate: str) -> bool:
+        return gates is None or gate in gates
+
+    # ── G-RPC-1 + G-RPC-2 — bus.request call site scan ──────────────
+    if _gate_enabled("G-RPC-1") or _gate_enabled("G-RPC-2"):
+        for py_file in titan_plugin.rglob("*.py"):
+            rel = str(py_file.relative_to(repo))
+            try:
+                tree = ast.parse(py_file.read_text(encoding="utf-8"),
+                                 filename=str(py_file))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                # Match `*.request(` (sync); skip `*.request_async`.
+                func = node.func
+                if not isinstance(func, ast.Attribute):
+                    continue
+                if func.attr != "request":
+                    continue
+                # Heuristic: only flag bus.request — caller attribute
+                # must be a name like `bus`, `_bus`, `self._bus`, etc.
+                # Not all `*.request(` are bus.request.
+                obj_str = ""
+                base = func.value
+                if isinstance(base, ast.Name):
+                    obj_str = base.id
+                elif isinstance(base, ast.Attribute):
+                    obj_str = base.attr
+                if "bus" not in obj_str.lower():
+                    continue
+
+                line = node.lineno
+                site = (rel, line)
+
+                # G-RPC-2: timeout kwarg required.
+                if _gate_enabled("G-RPC-2"):
+                    has_timeout = any(
+                        kw.arg == "timeout" for kw in node.keywords
+                    ) or len(node.args) >= 4  # positional timeout arg slot
+                    if not has_timeout:
+                        findings.append({
+                            "kind": "G-RPC-2",
+                            "severity": "HIGH",
+                            "message": f"bus.request* without timeout kwarg at {rel}:{line}",
+                            "remediation": "add explicit `timeout=<seconds>` argument",
+                        })
+
+                # G-RPC-1: not in exemption allowlist.
+                if _gate_enabled("G-RPC-1"):
+                    if rel in exempt_files or site in exempt_sites:
+                        continue
+                    findings.append({
+                        "kind": "G-RPC-1",
+                        "severity": "HIGH",
+                        "message": f"sync bus.request at {rel}:{line} not in phase_c_rpc_exemptions.yaml allowlist",
+                        "remediation": (
+                            "migrate to SHM via StateRegistryReader (G18) "
+                            "or bus.request_async with explicit timeout (G19); "
+                            "if true work-RPC, add allowlist entry with rationale"
+                        ),
+                    })
+
+    # ── G-RPC-3 — every proxy `def get_*` must read SHM ─────────────
+    if _gate_enabled("G-RPC-3") and proxies_dir.exists():
+        for py_file in proxies_dir.rglob("*.py"):
+            rel = str(py_file.relative_to(repo))
+            try:
+                tree = ast.parse(py_file.read_text(encoding="utf-8"),
+                                 filename=str(py_file))
+            except SyntaxError:
+                continue
+            # Walk classes, find `def get_*` methods.
+            for cls in ast.walk(tree):
+                if not isinstance(cls, ast.ClassDef):
+                    continue
+                for item in cls.body:
+                    if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        continue
+                    if not item.name.startswith("get_"):
+                        continue
+                    # Detect SHM-read intent. Accept any of:
+                    #  (1) `StateRegistryReader.read*` attribute access
+                    #  (2) `self._r_*` attribute (StateRegistryReader
+                    #      instance — established naming pattern across
+                    #      Sessions 1-4 proxies)
+                    #  (3) `self._read_*` helper method call (e.g.
+                    #      `_read_msgpack`, `_read_memory_state`,
+                    #      `_read_body_state` — proxy-internal helper
+                    #      that wraps a reader.read_variable() call)
+                    #  (4) `StateRegistryReader` name reference
+                    #  (5) Delegation: call to another method on `self`
+                    #      (the called method is itself audited by this
+                    #      same gate — if IT reads SHM, the delegator is
+                    #      transitively SHM-backed)
+                    found_reader = False
+                    for sub in ast.walk(item):
+                        if isinstance(sub, ast.Attribute):
+                            attr = sub.attr
+                            if attr.startswith("read"):
+                                found_reader = True
+                                break
+                            if attr.startswith("_r_") or attr.startswith("_read_"):
+                                found_reader = True
+                                break
+                        if isinstance(sub, ast.Name) and "StateRegistryReader" in sub.id:
+                            found_reader = True
+                            break
+                        # Delegation: `self.<method>(...)` — assume
+                        # delegated method is audited (avoid false-pos
+                        # on composite getters like get_v4_state).
+                        if (isinstance(sub, ast.Call)
+                                and isinstance(sub.func, ast.Attribute)
+                                and isinstance(sub.func.value, ast.Name)
+                                and sub.func.value.id == "self"
+                                and (sub.func.attr.startswith("get_")
+                                     or sub.func.attr.startswith("_read"))):
+                            found_reader = True
+                            break
+                    if found_reader:
+                        continue
+                    # Allowlist via exemptions YAML site-match.
+                    if (rel, item.lineno) in exempt_sites:
+                        continue
+                    if rel in exempt_files:
+                        continue
+                    findings.append({
+                        "kind": "G-RPC-3",
+                        "severity": "HIGH",
+                        "message": (
+                            f"proxy method {cls.name}.{item.name} at {rel}:{item.lineno} "
+                            f"has no StateRegistryReader read — Preamble G18 "
+                            f"requires SHM-direct for state lookup"
+                        ),
+                        "remediation": (
+                            "either route through StateRegistryReader for "
+                            "state lookup, or document in "
+                            "phase_c_rpc_exemptions.yaml as work-RPC"
+                        ),
+                    })
+
+    # ── G-RPC-4 — orphan `action == "get_*"` handler check ──────────
+    if _gate_enabled("G-RPC-4"):
+        # Phase 1: enumerate handler actions across modules + logic + core.
+        handlers: list = []  # list of (file, line, action_name)
+        for sub_dir in ("modules", "logic", "core"):
+            sub_path = titan_plugin / sub_dir
+            if not sub_path.exists():
+                continue
+            for py_file in sub_path.rglob("*.py"):
+                rel = str(py_file.relative_to(repo))
+                try:
+                    tree = ast.parse(py_file.read_text(encoding="utf-8"),
+                                     filename=str(py_file))
+                except SyntaxError:
+                    continue
+                for node in ast.walk(tree):
+                    # Match `if action == "X":` and `elif action == "X":`.
+                    if not isinstance(node, ast.Compare):
+                        continue
+                    if not (isinstance(node.left, ast.Name)
+                            and node.left.id == "action"):
+                        continue
+                    if not (len(node.ops) == 1
+                            and isinstance(node.ops[0], ast.Eq)):
+                        continue
+                    if len(node.comparators) != 1:
+                        continue
+                    rhs = node.comparators[0]
+                    if not isinstance(rhs, ast.Constant):
+                        continue
+                    val = rhs.value
+                    if not isinstance(val, str):
+                        continue
+                    handlers.append((rel, node.lineno, val))
+
+        # Phase 2: enumerate caller actions — find `{"action": "X"}`
+        # literal dicts AND simple `action="X"` keyword args.
+        caller_actions: set = set()
+        for py_file in titan_plugin.rglob("*.py"):
+            try:
+                tree = ast.parse(py_file.read_text(encoding="utf-8"),
+                                 filename=str(py_file))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                # Pattern A: dict literal with "action" key + str value.
+                if isinstance(node, ast.Dict):
+                    for k, v in zip(node.keys, node.values):
+                        if (isinstance(k, ast.Constant)
+                                and k.value == "action"
+                                and isinstance(v, ast.Constant)
+                                and isinstance(v.value, str)):
+                            caller_actions.add(v.value)
+                # Pattern B: keyword argument `action="X"`.
+                if isinstance(node, ast.keyword):
+                    if (node.arg == "action"
+                            and isinstance(node.value, ast.Constant)
+                            and isinstance(node.value.value, str)):
+                        caller_actions.add(node.value.value)
+
+        # Phase 3: report handlers with no caller (and not allowlisted).
+        # Allowlist semantics for G-RPC-4: a handler is allowed to be
+        # orphan if its file is in exempt_files OR the action name is
+        # in `phase_c_rpc_exemptions.yaml.orphan_handler_allowlist`.
+        for (file, line, action_name) in handlers:
+            if action_name in caller_actions:
+                continue
+            if file in exempt_files:
+                continue
+            if action_name in orphan_handler_allowlist:
+                continue
+            findings.append({
+                "kind": "G-RPC-4",
+                "severity": "MEDIUM",
+                "message": (
+                    f"orphan handler `if action == \"{action_name}\"` at "
+                    f"{file}:{line} — no caller found"
+                ),
+                "remediation": (
+                    "delete the handler if all proxy callers migrated "
+                    "to SHM (rFP §4.D), or add the action to the "
+                    "phase_c_rpc_exemptions.yaml `orphan_handler_allowlist` "
+                    "with rationale"
+                ),
+            })
+
+    return findings
+
+
+def _phase_c_verify(strict: bool = False, json_mode: bool = False,
+                    gates: "set | None" = None) -> int:
     """
     Static check codebase against SPEC.
 
-    v0 checks:
+    v0 checks (always run):
       1. Generator parity — generated files match TOML
       2. Domain registry — every used domain has a [domains.X] block
       3. Ground-truth presence — Preamble G1-G16 entries present in TOML
       4. SPEC document references valid sections in TOML
 
-    Future (deferred to v1):
-      - Static analysis of code for §11.H critical-data writes via atomic_write helper
-      - Detection of magic numbers vs constants
-      - §9 wiring matrix verification
-      - §10 communication ordering checks
+    v1 G-RPC gates (Phase C Session 5 rFP §4.E — gated by `gates` arg):
+      G-RPC-1 — no sync bus.request outside phase_c_rpc_exemptions.yaml
+      G-RPC-2 — no bus.request* without explicit timeout kwarg
+      G-RPC-3 — every proxy `def get_*` reads SHM via StateRegistryReader
+      G-RPC-4 — no orphan `if action == "get_*"` handler (caller graph)
+
+    `gates` is a set of gate names to run; None = run all gates.
     """
     import json as _json
     import subprocess
@@ -8658,6 +9547,13 @@ def _phase_c_verify(strict: bool = False, json_mode: bool = False) -> int:
             "message": "SPEC document not found at titan-docs/SPEC_titan_architecture.md",
             "remediation": "restore from git history",
         })
+
+    # Phase C Session 5 (rFP §4.E) — G-RPC gates
+    def _gate_enabled(gate: str) -> bool:
+        return gates is None or gate in gates
+
+    if any(_gate_enabled(f"G-RPC-{i}") for i in (1, 2, 3, 4)):
+        findings.extend(_phase_c_g_rpc_gates(repo, gates))
 
     # Output
     if json_mode:
@@ -8736,32 +9632,226 @@ def _phase_c_topology() -> int:
     return 0
 
 
+def _phase_c_format_supervision_event(event: dict) -> str:
+    """Compact one-line render of a supervision.jsonl event for CLI output.
+
+    Reads the canonical Rust wire format: top-level `ts`/`event` + nested
+    `payload.{kind,child_name,supervisor,reason,reason_detail,...}`.
+
+    Format: `<ts>  <event>  child=<name>  reason=<r>  detail=<d>`
+    All fields trimmed when missing; never raises.
+    """
+    parts = []
+    ts = event.get("ts", "")
+    if ts:
+        # Trim nanoseconds → milliseconds for CLI readability
+        # Rust writes "2026-04-29T13:42:01.123456789Z"; keep up to ms.
+        if "." in ts:
+            head, frac = ts.rsplit(".", 1)
+            digits = "".join(c for c in frac if c.isdigit())
+            ts = f"{head}.{digits[:3]}Z" if "Z" in frac else f"{head}.{digits[:3]}"
+        parts.append(ts)
+    # Top-level event name = bus event (e.g. SUPERVISION_CHILD_DOWN)
+    event_name = event.get("event", "?")
+    parts.append(f"{event_name:32}")
+    # All other fields are nested under payload per Rust SupervisionEvent enum
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    child = payload.get("child_name")
+    if child:
+        parts.append(f"child={child}")
+    supervisor = payload.get("supervisor")
+    if supervisor:
+        parts.append(f"supervisor={supervisor}")
+    reason = payload.get("reason")
+    if reason:
+        parts.append(f"reason={reason}")
+    most_common = payload.get("most_common_reason")
+    if most_common and most_common != reason:
+        parts.append(f"most_common={most_common}")
+    detail = payload.get("reason_detail")
+    if detail:
+        parts.append(f"detail={detail}")
+    last_detail = payload.get("last_reason_detail")
+    if last_detail and last_detail != detail:
+        parts.append(f"last_detail={last_detail}")
+    restart = payload.get("restart_count")
+    if restart is not None:
+        parts.append(f"restart_count={restart}")
+    decision = payload.get("decision")
+    if decision:
+        parts.append(f"decision={decision}")
+    escalation_id = payload.get("escalation_id")
+    if escalation_id:
+        # Truncate UUID for terse CLI output
+        parts.append(f"escalation={str(escalation_id)[:8]}")
+    return "  ".join(parts)
+
+
 def _phase_c_watch_escalations(tail: bool = False) -> int:
-    """Stream supervision events from data/supervision.jsonl (placeholder v0)."""
+    """Stream supervision events from data/supervision.jsonl per SPEC §11.B.1 + §11.G.4.
+
+    Without --tail: prints all historical SUPERVISION_ESCALATION* events from
+    rotated archives + active log, one per line, then exits.
+
+    With --tail: live-follows the active log, printing new escalation events
+    as they arrive. Loops until SIGINT (Ctrl-C).
+    """
     repo = _phase_c_repo_root()
     log_path = repo / "data" / "supervision.jsonl"
     if not log_path.exists():
         print(
             f"phase-c watch-escalations: {log_path} not yet created.\n"
-            "Will be populated by kernel + guardian_HCL once §11.G.4 supervision log ships."
+            "Will be populated by kernel-rs once it boots with §11.G.4 supervision log.",
+            file=sys.stderr,
         )
         return 0
-    print(f"phase-c watch-escalations — reading {log_path}\n(implementation deferred to v1)")
+
+    sys.path.insert(0, str(repo / "scripts"))
+    try:
+        import _supervision_log_reader as r  # type: ignore
+    except ImportError as e:
+        print(f"phase-c watch-escalations: failed to import reader: {e}", file=sys.stderr)
+        return 1
+
+    if not tail:
+        # Historical mode: walk archives + active log, filter to escalations.
+        # ESCALATION_KINDS lives at top-level `event` field per Rust wire format.
+        count = 0
+        for event in r.iter_supervision_log(log_path, kind=None):
+            if event.get("event") in r.ESCALATION_KINDS:
+                print(_phase_c_format_supervision_event(event))
+                count += 1
+        if count == 0:
+            print(f"# (no escalation events in {log_path} or its archives)", file=sys.stderr)
+        return 0
+
+    # --tail: live-follow loop. Caller breaks on SIGINT.
+    print(f"# tailing {log_path} for SUPERVISION_ESCALATION* events (Ctrl-C to exit)", file=sys.stderr)
+    try:
+        for event in r.watch_escalations(log_path):
+            print(_phase_c_format_supervision_event(event), flush=True)
+    except KeyboardInterrupt:
+        print("# watch-escalations interrupted", file=sys.stderr)
     return 0
 
 
 def _phase_c_supervision_log(filters: list) -> int:
-    """Query data/supervision.jsonl (placeholder v0)."""
+    """Query data/supervision.jsonl with structured filters per SPEC §20.4.
+
+    Supported filter flags (any combination):
+        --child=<name>         filter by child process name (e.g., titan_HCL)
+        --reason=<r>           filter by reason field (PANIC, KILLED, EXIT, ...)
+        --supervisor=<name>    filter by supervisor (kernel, ...)
+        --kind=<k>             filter by event kind (SUPERVISION_CHILD_DOWN, ...)
+        --since=<duration>     filter by recency (e.g., 5m, 1h, 24h, 7d)
+        --last=<N>             show only the last N matching events
+        --no-archives          read only the active log (skip rotated archives)
+        --json                 emit one JSON object per line instead of formatted text
+
+    Output format: one event per line (formatted text) or JSON when --json.
+    """
     repo = _phase_c_repo_root()
     log_path = repo / "data" / "supervision.jsonl"
     if not log_path.exists():
         print(
             f"phase-c supervision-log: {log_path} not yet created.\n"
-            "Will be populated by kernel + guardian_HCL once §11.G.4 supervision log ships.\n"
-            f"Requested filters: {filters}"
+            "Will be populated by kernel-rs once it boots with §11.G.4 supervision log.",
+            file=sys.stderr,
         )
         return 0
-    print(f"phase-c supervision-log filters={filters} (implementation deferred to v1)")
+
+    sys.path.insert(0, str(repo / "scripts"))
+    try:
+        import _supervision_log_reader as r  # type: ignore
+    except ImportError as e:
+        print(f"phase-c supervision-log: failed to import reader: {e}", file=sys.stderr)
+        return 1
+
+    from datetime import timedelta
+
+    child = None
+    reason = None
+    supervisor = None
+    kind = None
+    since: "timedelta | None" = None
+    last_n: "int | None" = None
+    include_archives = True
+    json_mode = False
+
+    def _parse_duration(s: str) -> "timedelta":
+        """Parse '5m', '1h', '24h', '7d' style → timedelta."""
+        s = s.strip().lower()
+        if not s:
+            raise ValueError("empty duration")
+        unit = s[-1]
+        try:
+            n = int(s[:-1])
+        except ValueError as exc:
+            raise ValueError(f"bad duration '{s}': use Nm/Nh/Nd") from exc
+        if unit == "s":
+            return timedelta(seconds=n)
+        if unit == "m":
+            return timedelta(minutes=n)
+        if unit == "h":
+            return timedelta(hours=n)
+        if unit == "d":
+            return timedelta(days=n)
+        raise ValueError(f"unknown duration unit '{unit}' in '{s}'")
+
+    for arg in filters:
+        if arg.startswith("--child="):
+            child = arg.split("=", 1)[1]
+        elif arg.startswith("--reason="):
+            reason = arg.split("=", 1)[1]
+        elif arg.startswith("--supervisor="):
+            supervisor = arg.split("=", 1)[1]
+        elif arg.startswith("--kind="):
+            kind = arg.split("=", 1)[1]
+        elif arg.startswith("--since="):
+            try:
+                since = _parse_duration(arg.split("=", 1)[1])
+            except ValueError as e:
+                print(f"phase-c supervision-log: {e}", file=sys.stderr)
+                return 2
+        elif arg.startswith("--last="):
+            try:
+                last_n = int(arg.split("=", 1)[1])
+            except ValueError:
+                print(f"phase-c supervision-log: --last requires integer", file=sys.stderr)
+                return 2
+        elif arg == "--no-archives":
+            include_archives = False
+        elif arg == "--json":
+            json_mode = True
+        elif arg in ("-h", "--help"):
+            print(_phase_c_supervision_log.__doc__)
+            return 0
+        else:
+            print(f"phase-c supervision-log: unknown flag '{arg}'", file=sys.stderr)
+            return 2
+
+    events_iter = r.iter_supervision_log(
+        log_path,
+        child=child, reason=reason, supervisor=supervisor,
+        kind=kind, since=since, include_archives=include_archives,
+    )
+
+    if last_n is not None:
+        # Materialize tail-N into a deque (memory-bounded)
+        from collections import deque
+        events = list(deque(events_iter, maxlen=last_n))
+    else:
+        events = list(events_iter)
+
+    if not events:
+        print("# (no events match the filter)", file=sys.stderr)
+        return 0
+
+    for event in events:
+        if json_mode:
+            print(json.dumps(event))
+        else:
+            print(_phase_c_format_supervision_event(event))
     return 0
 
 

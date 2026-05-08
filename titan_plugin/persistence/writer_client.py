@@ -24,7 +24,7 @@ import time
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, ClassVar, Optional
 
 from .config import IMWConfig
 from .journal import CallerJournal
@@ -80,7 +80,53 @@ class InnerMemoryWriterClient:
     loop running in a daemon thread.
     """
 
-    def __init__(self, cfg: IMWConfig, caller_name: str = "") -> None:
+    # Tracks one-shot deprecation warnings per (file, line) call site, so
+    # a misbehaving caller emits exactly ONE warning over the process
+    # lifetime even if it hits this constructor in a per-write loop
+    # (which is exactly the bug we want to surface, not log-spam over).
+    _DIRECT_CONSTRUCT_WARNED: ClassVar[set[tuple[str, int]]] = set()
+
+    def __init__(
+        self,
+        cfg: IMWConfig,
+        caller_name: str = "",
+        *,
+        _from_get_client: bool = False,
+    ) -> None:
+        # rFP_imw_writerclient_singleton (2026-05-07 PM) defense-in-depth:
+        # warn (one-shot per call site) when the constructor is called
+        # outside the `get_client()` helper. Each direct construction
+        # spawns a daemon `imw.client_loop` thread that never cleans up,
+        # AND races with sibling instances on the per-caller_name journal
+        # file (CallerJournal contract assumes one writer per caller).
+        # Fix is to migrate the caller to `get_client(caller_name)`. The
+        # `_from_get_client` kwarg is the sanctioned bypass — only
+        # `get_client()` itself sets it.
+        if not _from_get_client:
+            try:
+                import inspect
+                import warnings as _warnings
+                frame = inspect.currentframe()
+                if frame is not None and frame.f_back is not None:
+                    caller_frame = frame.f_back
+                    site = (caller_frame.f_code.co_filename,
+                            caller_frame.f_lineno)
+                    if site not in InnerMemoryWriterClient._DIRECT_CONSTRUCT_WARNED:
+                        InnerMemoryWriterClient._DIRECT_CONSTRUCT_WARNED.add(site)
+                        _warnings.warn(
+                            f"InnerMemoryWriterClient(cfg, caller_name={caller_name!r}) "
+                            f"called directly at {site[0]}:{site[1]}. Use "
+                            f"`get_client(caller_name)` instead — direct "
+                            f"construction leaks `imw.client_loop` threads "
+                            f"AND races on the per-caller-name journal file. "
+                            f"See rFP_imw_writerclient_singleton "
+                            f"(2026-05-07 PM).",
+                            DeprecationWarning, stacklevel=2,
+                        )
+            except Exception:
+                # Never let deprecation telemetry break the construction
+                # path itself — IMW writes are mission-critical.
+                pass
         self._cfg = cfg
         self._caller = f"{caller_name or 'main'}:{os.getpid()}"
         self._journal: Optional[CallerJournal] = None
@@ -596,40 +642,114 @@ class InnerMemoryWriterClient:
             self._loop.call_soon_threadsafe(self._loop.stop)
 
 
-# ── module-level singleton ───────────────────────────────────────────
+# ── module-level per-(caller_name) singleton ────────────────────────
+#
+# rFP_imw_writerclient_singleton (2026-05-07 PM): EVERY caller of
+# `InnerMemoryWriterClient(cfg, caller_name=...)` spawns a daemon
+# `imw.client_loop` thread that NEVER cleans up (no __del__ /
+# context-manager). Pre-fix, three known callers (events_teacher.py:127,
+# consciousness.py:214, social_graph.py:134) constructed a fresh client
+# PER USE — events_teacher in particular hit this on every events DB
+# write. Live evidence T1 2026-05-07 PM: language_worker subprocess
+# accumulated **2,627 leaked `imw.client_loop` threads** in 36 minutes,
+# pushing T1 host load to 273 (vmstat r=1729 runnable threads, 51%
+# system-time on context switches at 173k/sec).
+#
+# CRITICAL CORRECTNESS implication: the journal is per-caller-name.
+# Multiple `WriterClient` instances with SAME caller_name race on the
+# same on-disk journal file (CallerJournal). The contract assumes ONE
+# writer per caller_name. Pre-fix had 2627 racers; this fix restores
+# the invariant by construction.
+#
+# Pre-fix `_client` was a single-slot module variable that ignored
+# `caller_name` after the first call (returned the FIRST caller's
+# client to ALL subsequent callers — wrong journal/metrics for
+# downstream callers). That's why the 3 leak callers all bypassed
+# `get_client()`. Post-fix: per-caller-name dict; same caller_name
+# returns the same instance; different caller_name gets its own
+# correctly-isolated client.
 
-_client: Optional[InnerMemoryWriterClient] = None
-_client_lock = threading.Lock()
+_clients: dict[str, InnerMemoryWriterClient] = {}
+_clients_lock = threading.Lock()
+_atexit_registered = False
 
 
-def get_client(caller_name: str = "") -> InnerMemoryWriterClient:
-    global _client
-    with _client_lock:
-        if _client is None:
+def get_client(
+    caller_name: str = "",
+    cfg: Optional[IMWConfig] = None,
+) -> InnerMemoryWriterClient:
+    """Get-or-create the WriterClient for ``caller_name``.
+
+    Thread-safe per-caller-name singleton. Each unique caller_name
+    gets exactly ONE client (correct journal + metrics isolation per
+    the IMW contract). Repeated calls with the same caller_name
+    return the same instance — no leaked `imw.client_loop` threads.
+
+    Args:
+      caller_name: identifier used for the journal path + metrics
+        labels. Each unique caller_name gets its own client.
+      cfg: optional IMWConfig override. Callers with a per-section
+        config (e.g. `persistence_events_teacher`,
+        `persistence_consciousness`, `persistence_social_graph`) MUST
+        pass their resolved cfg here on FIRST call. None falls back
+        to `IMWConfig.from_titan_config()` (the global default).
+        Subsequent calls with the same caller_name return the cached
+        client regardless of cfg argument (first-call wins).
+
+    All IMW callers SHOULD route through this helper. Direct
+    `InnerMemoryWriterClient(cfg, caller_name=...)` construction emits
+    a one-shot DeprecationWarning (defense-in-depth — see __init__).
+    """
+    global _atexit_registered
+    with _clients_lock:
+        existing = _clients.get(caller_name)
+        if existing is not None:
+            return existing
+        if cfg is None:
             cfg = IMWConfig.from_titan_config()
-            _client = InnerMemoryWriterClient(cfg, caller_name=caller_name)
+        # Pass _from_get_client=True to suppress the deprecation
+        # warning — this IS the sanctioned construction site.
+        client = InnerMemoryWriterClient(
+            cfg, caller_name=caller_name, _from_get_client=True,
+        )
+        _clients[caller_name] = client
+        if not _atexit_registered:
             atexit.register(_atexit_close)
-        return _client
+            _atexit_registered = True
+        return client
 
 
 def reset_client() -> None:
-    """Testing hook: tear down the singleton so a new one can be built."""
-    global _client
-    with _client_lock:
-        if _client is not None:
+    """Testing hook: tear down ALL per-caller-name singletons.
+
+    Mirrors the pre-fix `reset_client()` API so existing tests using
+    this hook keep working — they just clear all clients now instead
+    of one.
+    """
+    with _clients_lock:
+        for caller_name, client in list(_clients.items()):
             try:
-                _client.close()
+                client.close()
             except Exception as _swallow_exc:
-                swallow_warn('[persistence.writer_client] reset_client: _client.close()', _swallow_exc,
-                             key='persistence.writer_client.reset_client.line553', throttle=100)
-            _client = None
+                swallow_warn(
+                    '[persistence.writer_client] reset_client: client.close()',
+                    _swallow_exc,
+                    key=f'persistence.writer_client.reset_client.{caller_name}',
+                    throttle=100)
+        _clients.clear()
 
 
 def _atexit_close() -> None:
-    global _client
-    if _client is not None:
+    """Close all per-caller-name singletons at process shutdown."""
+    with _clients_lock:
+        clients_snapshot = list(_clients.values())
+        _clients.clear()
+    for client in clients_snapshot:
         try:
-            _client.close()
+            client.close()
         except Exception as _swallow_exc:
-            swallow_warn('[persistence.writer_client] _atexit_close: _client.close()', _swallow_exc,
-                         key='persistence.writer_client._atexit_close.line563', throttle=100)
+            swallow_warn(
+                '[persistence.writer_client] _atexit_close: client.close()',
+                _swallow_exc,
+                key='persistence.writer_client._atexit_close',
+                throttle=100)

@@ -44,11 +44,20 @@ def collect_outer_mind_15d(
     twin_state: Optional[dict] = None,
     anchor_state: Optional[dict] = None,
     bus_stats: Optional[dict] = None,
+    # rFP_trinity_130d_awakening §12 / SPEC §23.8 — rich producer kwargs
+    cgn_stats: Optional[dict] = None,
+    meta_cgn_stats: Optional[dict] = None,
+    language_stats: Optional[dict] = None,
+    memory_growth_metrics: Optional[dict] = None,
+    events_teacher_stats: Optional[dict] = None,
+    knowledge_graph_stats: Optional[dict] = None,
+    social_x_gateway_stats: Optional[dict] = None,
+    uptime_seconds: float = 1.0,
 ) -> list:
     """
     Collect 15D Outer Mind tensor from world-facing sources.
 
-    Args:
+    Args (legacy):
         current_5d: Existing 5D outer mind tensor
         action_stats: {total, success_count, success_rate, per_window}
         creative_stats: {total, art_count, audio_count, per_window}
@@ -57,6 +66,20 @@ def collect_outer_mind_15d(
         research_stats: {queries, useful_results, usage_rate}
         assessment_stats: {mean_score, trend, count}
         body_state: Outer body values for infrastructure strain
+
+    Args (Phase 1 rich producers — SPEC §23.1 numbered):
+        cgn_stats (#7): {avg_reward, grounded_density (per_min), consolidations, ...}
+        meta_cgn_stats (#8): {knowledge_helpful_by_source, knowledge_responses_received,
+                              usage_gini, primitives_grounded, primitives_total,
+                              eureka_accelerated_updates, knowledge_requests_emitted,
+                              knowledge_requests_finalized, ...}
+        language_stats (#10): {vocab_total, vocab_producible, avg_confidence,
+                               teacher_sessions_last_hour, composition_level, ...}
+        memory_growth_metrics (#6): {learning_velocity, directive_alignment, ...}
+        events_teacher_stats (#9): {felt_experiences, windows_completed, ...}
+        knowledge_graph_stats (#6): {node_count, edge_count, ...}
+        social_x_gateway_stats (#12): {posts_last_hour, posts_last_day, ...}
+        uptime_seconds: process uptime, used for per-hour rate normalization
 
     Returns:
         15D tensor [thinking(5) + feeling(5) + willing(5)]
@@ -68,26 +91,68 @@ def collect_outer_mind_15d(
     res = research_stats or {}
     assess = assessment_stats or {}
     body = body_state or {}
+    cgn_s = cgn_stats or {}
+    mcgn = meta_cgn_stats or {}
+    lang = language_stats or {}
+    mem_growth = memory_growth_metrics or {}
+    events = events_teacher_stats or {}
+    sx = social_x_gateway_stats or {}
+
+    # Helpers (Phase 1 — SPEC §23.1)
+    def _knowledge_helpful_ratio() -> float:
+        """meta_cgn.knowledge_helpful_by_source aggregated → response ratio."""
+        helpful_by = mcgn.get("knowledge_helpful_by_source") or {}
+        helpful = sum(helpful_by.values()) if isinstance(helpful_by, dict) else 0
+        responses = mcgn.get("knowledge_responses_received", 0) or 0
+        return _clamp(helpful / max(1, responses))
+
+    def _cgn_avg_reward_norm() -> float:
+        """CGN avg_reward normalized to [0, 1]. CGN rewards typically near 0;
+        positive = useful grounding, negative = penalty. Map [-1,1]→[0,1]."""
+        r = float(cgn_s.get("avg_reward", 0.0) or 0.0)
+        return _clamp((r + 1.0) / 2.0)
 
     # ── THINKING (5D) — practical world-knowledge ──
     thinking = [0.5] * 5
 
-    # [0] Research effectiveness: did searches return useful data?
-    if res.get("queries", 0) > 0:
-        thinking[0] = _clamp(res.get("usage_rate", 0.5))
-    else:
-        thinking[0] = 0.3  # No research yet — low awareness
+    # [0] Research effectiveness — REDESIGNED (SPEC §23.8 / rFP §12.1).
+    # Old formula read res.usage_rate which no producer wrote. New: weighted
+    # blend of meta-CGN knowledge helpfulness, CGN reward signal, and
+    # memory directive alignment.
+    thinking[0] = _clamp(
+        0.4 * _knowledge_helpful_ratio()
+        + 0.3 * _cgn_avg_reward_norm()
+        + 0.3 * _clamp(mem_growth.get("directive_alignment", 0.5))
+    )
 
-    # [1] Knowledge retrieval: memory recall relevance
-    # Approximate from assessment quality (good assessments = good retrieval)
-    thinking[1] = _clamp(assess.get("mean_score", 0.5))
+    # [1] Knowledge retrieval — REDESIGNED. Retrieval QUALITY (not depth):
+    # how good are we at finding the right thing when we look.
+    vocab_avg_conf = _clamp(lang.get("avg_confidence", 0.5))
+    usage_gini = _clamp(mcgn.get("usage_gini", 0.5))  # higher gini = more concentrated retrieval
+    thinking[1] = _clamp(
+        0.35 * _clamp(mem_growth.get("directive_alignment", 0.5))
+        + 0.25 * _knowledge_helpful_ratio()
+        + 0.20 * vocab_avg_conf
+        + 0.20 * (1.0 - usage_gini)
+    )
 
-    # [2] Situational awareness: world model freshness
-    # Use research recency + social interaction recency
-    last_research_age = res.get("seconds_since_last", 3600.0)
-    thinking[2] = _clamp(1.0 / (1.0 + last_research_age / 1800.0))  # Half-life 30 min
+    # [2] Situational awareness — REDESIGNED. World-model freshness across
+    # multiple awareness streams. NOTE: do NOT use `or` for default —
+    # 0.0 is a valid (perfectly fresh) value, and `0.0 or 3600.0` would
+    # silently demote it to "stale" via Python falsiness. Pinned by
+    # test_situational_awareness_combines_event_freshness_and_velocity
+    # (rFP_trinity_130d_awakening §3.7).
+    _v_age = res.get("seconds_since_last")
+    last_event_age = 3600.0 if _v_age is None else float(_v_age)
+    _v_felt = events.get("felt_experiences")
+    felt_experiences = 0.0 if _v_felt is None else float(_v_felt)
+    thinking[2] = _clamp(
+        0.5 * (1.0 / (1.0 + last_event_age / 1800.0))
+        + 0.3 * min(1.0, felt_experiences / 20.0)
+        + 0.2 * _clamp(mem_growth.get("learning_velocity", 0.5))
+    )
 
-    # [3] Problem-solving: tool execution success rate
+    # [3] Problem-solving: tool execution success rate (schema bridge §3.1)
     thinking[3] = _clamp(acts.get("success_rate", 0.5))
 
     # [4] Communication clarity: response assessment scores
@@ -154,21 +219,40 @@ def collect_outer_mind_15d(
     actions_per_window = acts.get("per_window", 0)
     willing[0] = _clamp(min(1.0, actions_per_window / 10.0))
 
-    # [11] Social initiative: social outputs per window
-    social_outputs = soc.get("outputs_per_window", 0)
-    willing[1] = _clamp(min(1.0, social_outputs / 5.0))
+    # [11] Social initiative — REDESIGNED. Real X-platform outputs (posts +
+    # replies in last hour) replace ghost soc.outputs_per_window.
+    sx_per_hour = (
+        float(sx.get("posts_last_hour", 0) or 0)
+        + 0.0  # replies: gateway only tracks posts at hour granularity today
+    )
+    willing[1] = _clamp(min(1.0, sx_per_hour / 5.0))
 
-    # [12] Creative output: art/audio per window
+    # [12] Creative output: art/audio per window (now from agency.creative_this_hour
+    # via worker-side action_stats; saturation at 5/hour)
     creative_per_window = crea.get("per_window", 0)
     willing[2] = _clamp(min(1.0, creative_per_window / 5.0))
 
-    # [13] Protective response: guardian interventions per window
+    # [13] Protective response: rejections-per-hour aggregated from real
+    # producers (output_verifier, jailbreak_alerts.json, reflex boundary
+    # blocks). Worker-side aggregation populates guard.rejections_per_window.
+    # Saturation raised to /5.0 (was /3.0) since we now count more sources.
     rejections = guard.get("rejections_per_window", 0)
-    willing[3] = _clamp(min(1.0, rejections / 3.0))
+    willing[3] = _clamp(min(1.0, rejections / 5.0))
 
-    # [14] Exploration drive: research queries per window
-    queries_per_window = res.get("queries_per_window", 0)
-    willing[4] = _clamp(min(1.0, queries_per_window / 5.0))
+    # [14] Exploration drive — REDESIGNED. Three real exploration signals:
+    # CGN grounding density (active concept exploration), language teacher
+    # sessions (active learning), meta-CGN eureka acceleration (insight
+    # bursts).
+    grounded_density = float(cgn_s.get("grounded_density", 0.0) or 0.0)
+    teacher_sessions_lh = float(lang.get("teacher_sessions_last_hour", 0) or 0)
+    eureka_total = float(mcgn.get("eureka_accelerated_updates", 0) or 0)
+    uptime_h = max(1.0, uptime_seconds / 3600.0)
+    eureka_per_hour = eureka_total / uptime_h
+    willing[4] = _clamp(
+        0.40 * min(1.0, grounded_density / 2.0)
+        + 0.30 * min(1.0, teacher_sessions_lh / 3.0)
+        + 0.30 * min(1.0, eureka_per_hour / 5.0)
+    )
 
     return thinking + feeling + willing
 

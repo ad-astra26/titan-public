@@ -55,6 +55,40 @@ from titan_plugin.guardian import Guardian
 logger = logging.getLogger(__name__)
 
 
+# ── Microkernel v2 Phase C C-S7 — in-process subscriber names ───────
+#
+# When microkernel.l0_rust_enabled=true, titan-kernel-rs owns the bus
+# broker and the Python plugin connects as a client. The Rust broker
+# routes targeted messages (dst != "all") by name — workers publishing
+# `{"dst": "guardian", ...}` are delivered ONLY to the subscriber
+# registered under name="guardian".
+#
+# The plugin's in-process subscribers (Guardian, Core, Meditation,
+# Sovereignty, Kernel, Plugin) are NOT separate processes — they are
+# objects inside the plugin process. For them to receive targeted
+# messages from remote workers under l0_rust=true, the plugin must
+# register one BusSocketClient per name that workers address. Each
+# client is a separate broker connection but lives in the same Python
+# process; an inbound dispatcher thread per client drains its inbound
+# queue and re-injects messages into the in-process bus via
+# publish_in_process.
+#
+# Without this list, MODULE_HEARTBEAT / MODULE_READY (always
+# dst="guardian") would never reach the Guardian and worker liveness
+# detection breaks immediately under l0_rust mode.
+#
+# "titan_HCL" is the canonical plugin identity (also the outbound
+# publisher attached to bus.publish() routing).
+IN_PROCESS_SUBSCRIBER_NAMES: tuple[str, ...] = (
+    "titan_HCL",     # canonical plugin identity + outbound publisher
+    "guardian",      # MODULE_HEARTBEAT, MODULE_READY, SAVE_DONE, etc.
+    "core",          # core-loop messages
+    "meditation",    # meditation cadence + state messages
+    "sovereignty",   # sovereignty / metabolism messages
+    "kernel",        # kernel-internal RPC + broadcasts
+)
+
+
 # ── Microkernel v2 §A.4 (S5) — kernel RPC exposed methods ───────────
 #
 # Canonical list of dotted method paths the API subprocess can call via
@@ -122,6 +156,14 @@ KERNEL_RPC_EXPOSED_METHODS: frozenset[str] = frozenset({
     # + orchestrator's adoption-wait check + arch_map bus-status.
     "bus_broker_stats",
     "kernel.bus_broker_stats",
+    # Phase C C-S7 Component 2 (2026-05-05) — bus_health monitor read access
+    # for /v4/bus-health and /health.bus_health under l0_rust_enabled=true.
+    # Without these, the kernel_rpc proxy refuses bus_health attribute lookup
+    # and Component 1's kernel_rpc fallback returns empty dict instead of the
+    # real BusHealthMonitor.snapshot() data.
+    "bus_health",
+    "bus_health.snapshot",
+    "bus_health.update_queue_depths",
     # Phase A retrofit (2026-04-27) — swap-aware proxy interlock.
     # Guardian.start() inside the kernel calls these directly (no RPC),
     # but api_subprocess endpoints / arch_map may also probe via RPC.
@@ -453,15 +495,31 @@ class TitanKernel:
         loop.create_task(self._memory_hygiene_loop())
 
         # Microkernel v2 Phase A §A.2 — Trinity shm writer (daemon thread).
-        self._start_trinity_shm_writer()
+        # Phase C C-S7 Gap 4: under l0_rust_enabled=true, titan-unified-spirit-rs
+        # owns trinity_state.bin. Skip the Python writer to avoid SeqLock
+        # double-writer race per PLAN_microkernel_phase_c_s7_activation_prep.md §2.
+        if self._config.get("microkernel", {}).get("l0_rust_enabled", False):
+            logger.info(
+                "[TitanKernel] trinity_shm_writer skipped — "
+                "Rust unified-spirit-rs owns trinity_state.bin (l0_rust_enabled=true)")
+        else:
+            self._start_trinity_shm_writer()
 
         # Phase A.S8 — Topology shm writer (30D standalone slot, daemon thread).
-        self._start_topology_shm_writer()
+        # Phase C C-S7 Gap 5: under l0_rust_enabled=true, Rust outer-spirit-rs
+        # (or unified-spirit-rs) owns topology_30d.bin. Skip Python writer.
+        if self._config.get("microkernel", {}).get("l0_rust_enabled", False):
+            logger.info(
+                "[TitanKernel] topology_shm_writer skipped — "
+                "Rust trinity-rs owns topology_30d.bin (l0_rust_enabled=true)")
+        else:
+            self._start_topology_shm_writer()
 
-        # Microkernel v2 Phase A §A.7 — spirit-fast writer hook.
-        # Actual 70.47 Hz writes happen inside spirit_worker subprocess
-        # (D7 — 70 Hz bus traffic would flood the bus). This call is
-        # architectural symmetry + boot-log visibility.
+        # Microkernel v2 Phase A §A.7 — spirit-fast writer hook (no-op placeholder).
+        # Actual 70.47 Hz writes happen inside spirit_worker subprocess (D7).
+        # Under l0_rust_enabled=true, spirit_worker enters SHIM mode (no writes)
+        # and titan-inner-spirit-rs owns inner_spirit_45d.bin. The hook itself
+        # is just an INFO-log breadcrumb so we leave it called either way.
         self._start_spirit_shm_writer()
 
         # Microkernel v2 Phase A §A.2 part 2 (S4) — immutable identity
@@ -553,6 +611,8 @@ class TitanKernel:
         self._stop_kernel_rpc()
         # Microkernel v2 Phase B.2 — stop bus_socket broker (idempotent).
         self._stop_bus_socket_broker()
+        # Phase C C-S7 — stop bus_socket clients (idempotent).
+        self._stop_bus_socket_clients()
         # Microkernel v2 §A.4 S5 amendment — stop state snapshot publisher.
         self._stop_state_snapshot_publisher()
         # M1-H4 — stop balance publisher.
@@ -721,12 +781,23 @@ class TitanKernel:
 
     async def _handle_anchor_request(self, msg: dict) -> None:
         """Build vault commit instructions, submit TX, reply with signature."""
+        # rFP_meditation_worker_latency Option 1 instrumentation:
+        # capture per-phase timing to pinpoint the kernel-side gap between
+        # ANCHOR_REQUEST emit (worker) and "[Network] Sending tx" (kernel).
+        _t_entry = time.time()
+        _ts_emit = float(msg.get("ts", 0.0) or (msg.get("payload", {}) or {}).get("ts", _t_entry))
+        _bus_dispatch_ms = (_t_entry - _ts_emit) * 1000.0 if _ts_emit > 0 else -1.0
         payload = msg.get("payload", {}) or {}
         src = msg.get("src", "memory")
         rid = msg.get("rid")
         state_root = payload.get("state_root", "") or ""
         payload_json = payload.get("payload", "") or ""
         promoted_count = int(payload.get("promoted_count", 0) or 0)
+        logger.info(
+            "[TitanKernel] [LAT] anchor_handler entry: rid=%s bus_dispatch=%.1fms "
+            "promoted=%d state_root=%s",
+            (rid or "")[:8], _bus_dispatch_ms, promoted_count, state_root[:16],
+        )
 
         # Limbo / no-keypair guard. Reply with explicit error so
         # memory_worker falls back to MEDITATION_LOCAL.
@@ -766,6 +837,14 @@ class TitanKernel:
             self._anchor_helper = helper
 
         # Build instructions off the event loop — sync DB reads + sync httpx.
+        # rFP_meditation_worker_latency Option 1: time the to_thread queue +
+        # build phase separately, so we know whether the gap is executor
+        # saturation vs. _build_commit_instructions itself.
+        _t_pre_build = time.time()
+        logger.info(
+            "[TitanKernel] [LAT] anchor pre-build: rid=%s pre_build_setup=%.3fs",
+            (rid or "")[:8], _t_pre_build - _t_entry,
+        )
         try:
             instructions = await asyncio.to_thread(
                 helper._build_commit_instructions, state_root, payload_json,
@@ -778,6 +857,12 @@ class TitanKernel:
                 src, rid, None, f"build_failed: {type(e).__name__}",
             )
             return
+        _t_post_build = time.time()
+        logger.info(
+            "[TitanKernel] [LAT] anchor post-build: rid=%s build_total=%.3fs "
+            "(includes to_thread queue + _build_commit_instructions)",
+            (rid or "")[:8], _t_post_build - _t_pre_build,
+        )
 
         if not instructions:
             logger.info(
@@ -1013,11 +1098,21 @@ class TitanKernel:
         flag = (
             self._config.get("microkernel", {}).get("shm_spirit_fast_enabled", False)
         )
-        logger.info(
-            "[TitanKernel] Spirit-fast shm writer: owned by spirit_worker "
-            "(config microkernel.shm_spirit_fast_enabled=%s)",
-            flag,
+        l0_rust = (
+            self._config.get("microkernel", {}).get("l0_rust_enabled", False)
         )
+        if l0_rust:
+            logger.info(
+                "[TitanKernel] Spirit-fast shm writer: SHIM mode "
+                "(spirit_worker no-ops; Rust titan-inner-spirit-rs owns "
+                "inner_spirit_45d.bin) — l0_rust_enabled=true"
+            )
+        else:
+            logger.info(
+                "[TitanKernel] Spirit-fast shm writer: owned by spirit_worker "
+                "(config microkernel.shm_spirit_fast_enabled=%s)",
+                flag,
+            )
 
     def _write_identity_shm(self) -> None:
         """Microkernel v2 Phase A §A.2 part 2 (S4) — immutable identity shm.
@@ -1169,15 +1264,16 @@ class TitanKernel:
         Sets self._bus_broker (for stop) and attaches it to self.bus so
         DivineBus.publish() fans out to cross-process subscribers.
         """
-        # Phase C C-S2: when l0_rust_enabled=true, titan-kernel-rs owns the
-        # bus broker. Python skips its own BusSocketServer and connects as a
-        # bus client only. Per PLAN_microkernel_phase_c_s2_kernel.md §12.3 +
+        # Phase C C-S2 + C-S7: when l0_rust_enabled=true, titan-kernel-rs owns
+        # the bus broker. Python skips its own BusSocketServer and connects
+        # as one BusSocketClient per IN_PROCESS_SUBSCRIBER_NAMES entry so
+        # that targeted messages (dst="guardian" etc.) delivered by the Rust
+        # broker by name reach the plugin's in-process subscribers via the
+        # per-client inbound dispatcher. Per
+        # PLAN_microkernel_phase_c_s7_activation_prep.md §2 Gap 1+2+3 +
         # SPEC §3.0 (default-false → byte-identical to today).
         if self._config.get("microkernel", {}).get("l0_rust_enabled", False):
-            logger.info(
-                "[TitanKernel] microkernel.l0_rust_enabled=true → skipping "
-                "Python BusSocketServer; connecting as bus client to "
-                "kernel-rs-bound socket")
+            self._start_bus_socket_clients()
             return
 
         if not self._config.get("microkernel", {}).get(
@@ -1204,7 +1300,8 @@ class TitanKernel:
             ENV_BUS_TITAN_ID,
         )
         try:
-            authkey = derive_bus_authkey(identity_secret, self.titan_id)
+            # rFP_phase_c_bus_authkey_contract_fix.md — info is constant b"titan-bus"
+            authkey = derive_bus_authkey(identity_secret)
             # Phase B.2.1 fix (2026-04-27): pass in-process delivery callback
             # so worker → kernel messages reach in-process subscribers
             # (shadow_swap orchestrator etc.). publish_in_process skips the
@@ -1311,12 +1408,211 @@ class TitanKernel:
             for k in (ENV_BUS_SOCKET_PATH, ENV_BUS_TITAN_ID, ENV_BUS_KEYPAIR_PATH):
                 os.environ.pop(k, None)
 
+    # ── Phase C C-S7 — outbound clients (l0_rust_enabled=true mode) ─────
+
+    def _start_bus_socket_clients(self) -> None:
+        """Phase C C-S7: connect plugin to Rust broker as multiple clients.
+
+        Spawns one BusSocketClient per IN_PROCESS_SUBSCRIBER_NAMES entry
+        plus one inbound-dispatcher thread per client. The "titan_HCL"
+        client is attached to bus for outbound publishes; the others
+        exist purely so the Rust broker can route targeted messages
+        (dst="guardian" etc.) to the right in-process subscriber via
+        the dispatcher.
+
+        Closes Phase C C-S7 PLAN gaps 1, 2, 3 (plugin → broker outbound
+        + worker → plugin inbound for both broadcast and targeted dst).
+
+        Default-off path is unaffected (this method is only called when
+        l0_rust_enabled=true). Identity authkey derivation mirrors the
+        legacy broker path so both modes use the same HKDF chain.
+        """
+        try:
+            identity_secret = self._load_identity_secret_for_bus()
+        except Exception as e:
+            logger.warning(
+                "[TitanKernel] bus_socket clients cannot start — "
+                "identity secret unavailable: %s", e, exc_info=True)
+            return
+
+        from titan_plugin.core.bus_authkey import derive_bus_authkey
+        from titan_plugin.core.bus_socket import BusSocketClient, bus_sock_path
+        from titan_plugin.core.worker_bus_bootstrap import (
+            ENV_BUS_KEYPAIR_PATH,
+            ENV_BUS_SOCKET_PATH,
+            ENV_BUS_TITAN_ID,
+        )
+
+        try:
+            # rFP_phase_c_bus_authkey_contract_fix.md — info is constant b"titan-bus"
+            authkey = derive_bus_authkey(identity_secret)
+        except Exception as e:
+            logger.warning(
+                "[TitanKernel] bus_socket clients cannot start — "
+                "authkey derivation failed: %s", e, exc_info=True)
+            return
+
+        sock_path = bus_sock_path(self.titan_id)
+        self._bus_clients: dict[str, "BusSocketClient"] = {}
+        # Stop event shared by all dispatcher threads — set on shutdown.
+        self._bus_clients_stop_event = threading.Event()
+        self._bus_client_dispatchers: list[threading.Thread] = []
+
+        for name in IN_PROCESS_SUBSCRIBER_NAMES:
+            try:
+                client = BusSocketClient(
+                    titan_id=self.titan_id,
+                    authkey=authkey,
+                    name=name,
+                    sock_path=sock_path,
+                    topics=None,  # subscribe-all (broadcast catch-all)
+                )
+                client.start()
+                self._bus_clients[name] = client
+                # Dispatcher thread: drains client.inbound_queue() and
+                # re-injects into in-process bus via publish_in_process.
+                t = threading.Thread(
+                    target=self._bus_client_inbound_dispatcher,
+                    args=(client, name),
+                    daemon=True,
+                    name=f"bus-inbound-{name}",
+                )
+                t.start()
+                self._bus_client_dispatchers.append(t)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[TitanKernel] bus client '%s' start failed: %s",
+                    name, e, exc_info=True)
+
+        if "titan_HCL" not in self._bus_clients:
+            logger.error(
+                "[TitanKernel] primary bus client 'titan_HCL' failed to "
+                "start; outbound publishes will not reach Rust broker")
+            return
+
+        # Attach the canonical client for outbound publishes from plugin code.
+        self.bus.attach_client(self._bus_clients["titan_HCL"])
+
+        # Set env vars so Guardian-spawned workers connect to the same
+        # Rust broker socket (kept identical to legacy broker path).
+        os.environ[ENV_BUS_SOCKET_PATH] = str(sock_path)
+        os.environ[ENV_BUS_TITAN_ID] = self.titan_id
+        os.environ[ENV_BUS_KEYPAIR_PATH] = str(self.soul.wallet_path)
+
+        logger.info(
+            "[TitanKernel] bus_socket clients started "
+            "(l0_rust_enabled=true, %d clients on %s: %s)",
+            len(self._bus_clients), sock_path,
+            ", ".join(sorted(self._bus_clients.keys())),
+        )
+
+    def _bus_client_inbound_dispatcher(
+        self, client, client_name: str,
+    ) -> None:
+        """Drain a BusSocketClient's inbound queue → inject into in-process bus.
+
+        Echo prevention: messages whose `src` is one of
+        IN_PROCESS_SUBSCRIBER_NAMES are dropped — they originated in this
+        process (we published them outbound and the Rust broker echoed
+        them back to other plugin clients).
+
+        Broadcast deduplication: when dst is "all" or empty (broadcast),
+        only the "titan_HCL" dispatcher relays. Workers' broadcasts are
+        delivered to ALL plugin clients (subscribe-all mode); without
+        this gate, every in-process subscriber would receive the message
+        N=len(IN_PROCESS_SUBSCRIBER_NAMES) times.
+
+        Targeted messages (dst != "all" / "") were filtered by the broker
+        to this client (broker delivers to sub with name == dst). Re-inject
+        and let publish_in_process resolve the dst against in-process
+        _subscribers.
+        """
+        from queue import Empty as QueueEmpty
+
+        sq = client.inbound_queue()
+        plugin_names = frozenset(IN_PROCESS_SUBSCRIBER_NAMES)
+        stop_evt = self._bus_clients_stop_event
+        is_broadcast_relay = (client_name == "titan_HCL")
+
+        while not stop_evt.is_set():
+            try:
+                msg = sq.get(timeout=0.5)
+            except QueueEmpty:
+                continue
+            except Exception:  # noqa: BLE001
+                # Client closed mid-get; loop checks stop_evt next iteration.
+                continue
+
+            if not isinstance(msg, dict):
+                continue
+
+            # Echo prevention — drop self-published messages.
+            src = msg.get("src", "")
+            if src in plugin_names:
+                continue
+
+            # Broadcast dedup — only one dispatcher relays dst=all/empty.
+            dst = msg.get("dst", "")
+            if dst in ("", "all") and not is_broadcast_relay:
+                continue
+
+            try:
+                self.bus.publish_in_process(msg)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "[TitanKernel] bus client '%s' dispatcher: "
+                    "publish_in_process raised", client_name)
+
+    def _stop_bus_socket_clients(self) -> None:
+        """Graceful client shutdown — called from kernel.shutdown.
+
+        Mirrors _stop_bus_socket_broker. Sets the dispatcher stop event,
+        detaches the bus client, calls .stop() on each client (idempotent),
+        joins dispatchers with a small timeout, clears env vars.
+        """
+        clients = getattr(self, "_bus_clients", None)
+        if not clients:
+            return
+        stop_evt = getattr(self, "_bus_clients_stop_event", None)
+        if stop_evt is not None:
+            stop_evt.set()
+        try:
+            self.bus.detach_client()
+        except Exception:  # noqa: BLE001
+            pass
+        for name, client in clients.items():
+            try:
+                client.stop(timeout=2.0)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[TitanKernel] bus client '%s' stop error: %s", name, e)
+        # Join dispatchers (daemons; short join to avoid shutdown stall)
+        for t in getattr(self, "_bus_client_dispatchers", []):
+            try:
+                t.join(timeout=0.5)
+            except Exception:  # noqa: BLE001
+                pass
+        self._bus_clients = {}
+        self._bus_client_dispatchers = []
+        from titan_plugin.core.worker_bus_bootstrap import (
+            ENV_BUS_KEYPAIR_PATH,
+            ENV_BUS_SOCKET_PATH,
+            ENV_BUS_TITAN_ID,
+        )
+        for k in (ENV_BUS_SOCKET_PATH, ENV_BUS_TITAN_ID, ENV_BUS_KEYPAIR_PATH):
+            os.environ.pop(k, None)
+        logger.info("[TitanKernel] bus_socket clients stopped")
+
     def _load_identity_secret_for_bus(self) -> bytes:
-        """Read the identity keypair file and return raw secret bytes for
-        HKDF input. Solana keypair JSON is an array of 64 ints (full
-        secret_bytes); we use the full 64-byte content as IKM (HKDF accepts
-        arbitrary length and the additional public-key half adds defense
-        against any future representation change).
+        """Read the identity keypair file and return the 32-byte Ed25519
+        secret_seed for HKDF input.
+
+        Per `PLAN_microkernel_phase_c_s2_kernel.md §7.3` +
+        `rFP_phase_c_bus_authkey_contract_fix.md`: HKDF IKM is the 32-byte
+        secret_seed — NOT the full 64-byte Solana keypair. Solana CLI
+        byte-array format is 64 bytes (seed[0..32] + pub_key[32..64]); we
+        slice the first 32 to match Rust kernel's
+        `Identity::load_from_disk_with_hint` (titan-rust/crates/titan-core/src/identity.rs:327).
 
         Raises if soul / wallet_path is missing — caller should handle.
         """
@@ -1330,7 +1626,14 @@ class TitanKernel:
         data = _json.loads(path.read_text())
         if not isinstance(data, list) or len(data) == 0:
             raise ValueError(f"identity keypair file shape unexpected: {path}")
-        return bytes(int(b) & 0xFF for b in data)
+        full = bytes(int(b) & 0xFF for b in data)
+        if len(full) == 32:
+            return full
+        if len(full) == 64:
+            return full[:32]
+        raise ValueError(
+            f"identity keypair length {len(full)} unrecognized "
+            f"(expected 32-byte seed or 64-byte Solana keypair)")
 
     # ── Microkernel v2 §A.4 S5 amendment — state snapshot publisher ──
     # The api_subprocess subscribes to STATE_SNAPSHOT_RESPONSE bus messages
@@ -1370,19 +1673,27 @@ class TitanKernel:
             logger.warning("[StateSnapshot] network.info error: %s", e)
 
         # soul state — maker_pubkey, nft_address, current_gen, directives.
-        # NOTE: get_active_directives may be a coroutine on some Soul impls;
-        # if so we skip it (cache returns empty list — endpoint code that
+        #
+        # Phase C C-S7 Component 2 (2026-05-05): check iscoroutinefunction
+        # BEFORE calling. The previous pattern called get_active_directives()
+        # then checked iscoroutine on the result — but the call itself
+        # creates a never-awaited coroutine that triggers `RuntimeWarning:
+        # coroutine '...' was never awaited` every snapshot tick. Worse,
+        # it wakes asyncio to GC the coroutine, slowing the publisher.
+        # Async impls fall through to empty list (endpoint code that
         # needs directives can publish a refresh request via commands).
         try:
             soul = getattr(plugin, "soul", None)
             if soul is not None:
                 directives: list = []
-                try:
-                    raw = getattr(soul, "get_active_directives", lambda: [])()
-                    if not inspect.iscoroutine(raw):
-                        directives = list(raw or [])
-                except Exception:
-                    pass
+                fn = getattr(soul, "get_active_directives", None)
+                if fn is not None and not inspect.iscoroutinefunction(fn):
+                    try:
+                        raw = fn()
+                        if not inspect.iscoroutine(raw):
+                            directives = list(raw or [])
+                    except Exception:
+                        pass
                 snapshot["soul.state"] = {
                     "maker_pubkey": str(getattr(soul, "_maker_pubkey", "") or ""),
                     "nft_address": str(getattr(soul, "_nft_address", "") or ""),
@@ -1408,6 +1719,21 @@ class TitanKernel:
                 snapshot["bus.stats"] = dict(bus._stats)
         except Exception as e:
             logger.warning("[StateSnapshot] bus.stats error: %s", e)
+
+        # bus_health snapshot — backs `plugin.bus_health.snapshot()` reads
+        # from api_subprocess (BusHealthMonitor lives in kernel/parent only).
+        # Without this, /v4/bus-health and /health's bus_health field both
+        # resolved to empty `{}` because TitanStateAccessor's __getattr__
+        # synthesized a no-op _CacheGetter when no cache key was published.
+        # 2026-05-05 fix: publish the live snapshot at every snapshot tick
+        # (~2s) so api_subprocess can return real per-producer rates,
+        # orphan signals, and overall_state ∈ {healthy, warning, critical}.
+        try:
+            bh = getattr(plugin, "bus_health", None)
+            if bh is not None and hasattr(bh, "snapshot"):
+                snapshot["bus_health.snapshot"] = bh.snapshot() or {}
+        except Exception as e:
+            logger.warning("[StateSnapshot] bus_health.snapshot error: %s", e)
 
         # gatekeeper status — sovereignty / output-verifier subsystem.
         # Microkernel v2 amendment 2026-04-26: previously absent from
@@ -2215,6 +2541,26 @@ class TitanKernel:
         Refuses if microkernel.shadow_swap_enabled=false OR if another
         swap is currently active.
         """
+        # Phase C C-S7 Gap 8: shadow swap is unsupported under l0_rust=true.
+        # Rust kernel-rs has no BUS_HANDOFF / shadow_swap_orchestrate /
+        # hibernate symbols yet; B.1 + B.2.1 protocol cannot complete.
+        # Per PLAN_microkernel_phase_c_s7_activation_prep.md §2 Gap 8 —
+        # block here, defer Rust BUS_HANDOFF implementation to C-S8 / Phase D.
+        # Operators can still upgrade via systemd restart in l0_rust mode.
+        if self._config.get("microkernel", {}).get("l0_rust_enabled", False):
+            logger.warning(
+                "[TitanKernel] shadow_swap_orchestrate refused — "
+                "l0_rust_enabled=true (Rust kernel has no BUS_HANDOFF "
+                "yet; use systemd restart instead). Per Phase C C-S7 "
+                "PLAN §2 Gap 8.")
+            return {
+                "outcome": "error",
+                "failure_reason": "l0_rust_enabled_shadow_swap_unsupported",
+                "phase": "preflight",
+                "event_id": "",
+                "elapsed_seconds": 0.0,
+            }
+
         # Flag check — refuse if shadow_swap_enabled is false (default)
         flag = (self._config.get("microkernel", {})
                             .get("shadow_swap_enabled", False))

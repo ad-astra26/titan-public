@@ -19,10 +19,20 @@ See: titan-docs/rFP_microkernel_phase_a8_l2_l3_residency_completion.md §A.8.3
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+from pathlib import Path
 from typing import Optional
 
+import msgpack
+
 from ..bus import DivineBus
+from ..core.state_registry import (
+    StateRegistryReader,
+    ensure_shm_root,
+    resolve_titan_id,
+)
+from ..logic.session3_state_specs import OUTPUT_VERIFIER_STATE_SPEC
 
 logger = logging.getLogger(__name__)
 
@@ -30,29 +40,89 @@ logger = logging.getLogger(__name__)
 class OutputVerifierProxy:
     """Bus-routed proxy that mirrors OutputVerifier's public surface.
 
-    Methods:
-        verify_and_sign(...)          → bus QUERY action="verify_and_sign"
-        build_timechain_payload(...)  → bus QUERY action="build_timechain_payload"
-        get_stats()                   → bus QUERY action="stats"
+    Phase C Session 4 (rFP §4.C.14):
+      - verify_and_sign / build_timechain_payload — true work-RPC
+        (signing, hashing, timechain payload assembly). Migrated from
+        sync bus.request to async bus.request_async per Preamble G19
+        with explicit ≤5s timeout. Allowlist entry in
+        phase_c_rpc_exemptions.yaml.
+      - get_stats — state lookup, migrated to SHM read of
+        output_verifier_state.bin (Session 3 publisher).
 
     Attributes (cached, updated by OUTPUT_VERIFIER_STATS broadcast):
         sovereignty_score, verified_count, rejected_count
     """
 
-    def __init__(self, bus: DivineBus, request_timeout_s: float = 10.0):
+    def __init__(self, bus: DivineBus, request_timeout_s: float = 5.0):
         self._bus = bus
-        self._timeout = float(request_timeout_s)
+        # G19 §1.B: timeout ≤ 5s for work-RPC.
+        self._timeout = min(float(request_timeout_s), 5.0)
         self._reply_queue = bus.subscribe("output_verifier_proxy", reply_only=True)
         # Cached stats — updated from OUTPUT_VERIFIER_STATS broadcasts.
         self.sovereignty_score: float = 0.0
         self.verified_count: int = 0
         self.rejected_count: int = 0
 
+        # Phase C Session 4 (rFP §4.C.14) — SHM-direct reader for
+        # output_verifier_state.bin (Session 3 publisher).
+        self._titan_id = resolve_titan_id()
+        self._shm_root: Path = ensure_shm_root(self._titan_id)
+        self._r_ovg_state = StateRegistryReader(
+            OUTPUT_VERIFIER_STATE_SPEC, self._shm_root)
+        self._fallback_counts: dict[str, int] = {}
+
+    async def _request_async(self, payload: dict) -> Optional[dict]:
+        """Single async work-RPC primitive."""
+        try:
+            reply = await self._bus.request_async(
+                "output_verifier_proxy", "output_verifier",
+                payload, self._timeout, self._reply_queue,
+            )
+        except Exception as e:
+            logger.warning("[OutputVerifierProxy] bus.request_async raised: %s", e)
+            return None
+        return reply
+
+    def _request_sync_fallback(self, payload: dict) -> Optional[dict]:
+        """Sync wrapper around the async path. Used when caller is not
+        async-aware (most legacy verify_and_sign call sites). When inside
+        a running event loop we degrade to the legacy sync request path
+        with the same bounded timeout (G19 work-RPC exemption — explicit
+        timeout, not state lookup)."""
+        try:
+            asyncio.get_running_loop()
+            in_loop = True
+        except RuntimeError:
+            in_loop = False
+
+        if not in_loop:
+            try:
+                return asyncio.run(self._request_async(payload))
+            except Exception as e:
+                logger.warning("[OutputVerifierProxy] asyncio.run failed: %s — "
+                               "falling back to bounded sync bus.request", e)
+        # Loop-running fallback — bounded sync (work-RPC exemption).
+        return self._bus.request(
+            src="output_verifier_proxy", dst="output_verifier",
+            payload=payload, timeout=self._timeout,
+            reply_queue=self._reply_queue,
+        )
+
+    def _track_fallback(self, slot_name: str, reason: str) -> None:
+        prev = self._fallback_counts.get(slot_name, 0)
+        self._fallback_counts[slot_name] = prev + 1
+        if prev == 0:
+            logger.info(
+                "[OutputVerifierProxy] FIRST FALLBACK slot=%s reason=%s",
+                slot_name, reason)
+
     def verify_and_sign(self, output_text: str, channel: str,
                         injected_context: str = "",
                         prompt_text: str = "",
                         chain_state: Optional[dict] = None):
-        """Mirror of OutputVerifier.verify_and_sign — returns OVGResult."""
+        """Mirror of OutputVerifier.verify_and_sign — returns OVGResult.
+
+        Sync entry point — uses async work-RPC underneath."""
         # Avoid circular import at module load — OutputVerifier ships here only
         # so callers needing OVGResult parsing can deserialize the dict response.
         from ..logic.output_verifier import OVGResult
@@ -64,13 +134,7 @@ class OutputVerifierProxy:
             "prompt_text": prompt_text,
             "chain_state": chain_state,
         }
-        reply = self._bus.request(
-            src="output_verifier_proxy",
-            dst="output_verifier",
-            payload=payload,
-            timeout=self._timeout,
-            reply_queue=self._reply_queue,
-        )
+        reply = self._request_sync_fallback(payload)
         if reply is None:
             # Worker unavailable / timeout. Return a hard-fail OVGResult so
             # callers' downstream "if passed:" branches behave correctly.
@@ -109,7 +173,9 @@ class OutputVerifierProxy:
             )
 
     def build_timechain_payload(self, result, **kwargs) -> dict:
-        """Mirror of OutputVerifier.build_timechain_payload."""
+        """Mirror of OutputVerifier.build_timechain_payload.
+
+        Sync entry point — uses async work-RPC underneath."""
         import dataclasses
         result_dict = dataclasses.asdict(result) if dataclasses.is_dataclass(result) else dict(result)
         payload = {
@@ -117,34 +183,35 @@ class OutputVerifierProxy:
             "result_dict": result_dict,
             "kwargs": kwargs,
         }
-        reply = self._bus.request(
-            src="output_verifier_proxy",
-            dst="output_verifier",
-            payload=payload,
-            timeout=self._timeout,
-            reply_queue=self._reply_queue,
-        )
+        reply = self._request_sync_fallback(payload)
         if reply is None:
             return {}
         body = reply.get("payload") or {}
         return body.get("timechain_payload") or {}
 
     def get_stats(self) -> dict:
-        """Force-fetch fresh stats (synchronous round-trip).
+        """SHM read of output_verifier_state.bin (Session 3 publisher).
+        Preamble G18 — state transport is SHM, never bus.
 
         Most callers should use the cached attribute access (sovereignty_score
         etc.) which refreshes via OUTPUT_VERIFIER_STATS broadcasts.
         """
-        reply = self._bus.request(
-            src="output_verifier_proxy",
-            dst="output_verifier",
-            payload={"action": "stats"},
-            timeout=self._timeout,
-            reply_queue=self._reply_queue,
-        )
-        if reply is None:
+        try:
+            raw = self._r_ovg_state.read_variable()
+        except Exception as e:
+            self._track_fallback("output_verifier_state",
+                                 f"read_raised:{type(e).__name__}")
             return {}
-        return reply.get("payload") or {}
+        if raw is None:
+            self._track_fallback("output_verifier_state", "shm_unavailable")
+            return {}
+        try:
+            decoded = msgpack.unpackb(raw, raw=False)
+        except Exception as e:
+            self._track_fallback("output_verifier_state",
+                                 f"decode_raised:{type(e).__name__}")
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
 
     def update_cached_stats(self, payload: dict) -> None:
         """Called by parent's bus subscription when OUTPUT_VERIFIER_STATS arrives."""

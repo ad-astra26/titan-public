@@ -273,10 +273,25 @@ def _handle_meditation(state: dict, msg: dict) -> None:
     RebirthBackup.on_meditation_complete for the dedup + scheduling decisions
     (daily personality / weekly soul / TimeChain) but wraps the whole call
     with per-type cascade observability.
+
+    rFP_meditation_worker_latency Fix #B1 (2026-05-07): no longer gate on
+    `payload["success"]`. The success flag historically reflected whether
+    plugin.bus.request returned in time, NOT whether memory ops landed. With
+    Fix #A eliminating the asyncio deadlock, success is reliable — but as
+    defense in depth we run the cascade whenever promoted+pruned signal real
+    memory work happened. This closes the 26-day Arweave outage on T1
+    mainnet (last upload May 4, prior cutoff Apr 29) caused by every cycle
+    timing out at 120s/300s and emitting success=False even though the
+    worker had completed all node migrations + FAISS/Kuzu writes.
     """
     payload = msg.get("payload", {}) or {}
-    if not payload.get("success", False):
-        logger.debug("[BackupWorker] Meditation not successful — skipping")
+    promoted = int(payload.get("promoted", 0) or 0)
+    pruned = int(payload.get("pruned", 0) or 0)
+    if not payload.get("success", False) and promoted == 0 and pruned == 0:
+        logger.debug(
+            "[BackupWorker] Meditation produced no memory work "
+            "(success=%s, promoted=0, pruned=0) — skipping",
+            payload.get("success", False))
         return
 
     backup = state["backup"]

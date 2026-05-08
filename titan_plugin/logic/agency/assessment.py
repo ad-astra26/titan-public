@@ -274,13 +274,50 @@ class SelfAssessment:
         return 0.0
 
     def get_stats(self) -> dict:
-        """Return assessment statistics."""
+        """Return assessment statistics.
+
+        Schema bridge for Trinity 130D consumers (rFP_trinity_130d_awakening §3.2):
+        outer_mind[1,4], outer_spirit SAT[6,8,9], CHIT[22,24], ANANDA[30,32,34,35,44]
+        read average_score / trend / score_variance / total_assessed from this dict.
+        """
         if not self._assessments:
-            return {"total": 0, "avg_score": 0.0, "recent": []}
+            return {
+                # Original keys (preserved)
+                "total": 0, "avg_score": 0.0, "recent": [],
+                # Phase 1 schema bridge — empty-state mid-points
+                "average_score": 0.5,  # alias of avg_score, default 0.5 (mid-point)
+                "trend": 0.0,
+                "score_variance": 0.0,
+                "total_assessed": 0,
+            }
 
         scores = [a["score"] for a in self._assessments]
+        avg = sum(scores) / len(scores)
+
+        # Trend: linear-regression slope over the last 10 scores (per SPEC §23.9 SAT[6])
+        recent = scores[-10:] if len(scores) >= 10 else scores
+        if len(recent) >= 2:
+            n = len(recent)
+            xs = list(range(n))
+            x_mean = sum(xs) / n
+            y_mean = sum(recent) / n
+            num = sum((xs[i] - x_mean) * (recent[i] - y_mean) for i in range(n))
+            den = sum((xs[i] - x_mean) ** 2 for i in range(n))
+            trend = num / den if den > 0 else 0.0
+        else:
+            trend = 0.0
+
+        # Score variance over all assessments
+        variance = sum((s - avg) ** 2 for s in scores) / len(scores)
+
         return {
+            # Original keys (preserved for dashboard contract)
             "total": len(self._assessments),
-            "avg_score": round(sum(scores) / len(scores), 3),
+            "avg_score": round(avg, 3),
             "recent": self._assessments[-5:],
+            # Phase 1 schema bridge (rFP_trinity_130d_awakening §3.2)
+            "average_score": round(avg, 3),  # alias of avg_score (different consumers use different names)
+            "trend": round(trend, 4),
+            "score_variance": round(variance, 4),
+            "total_assessed": len(self._assessments),
         }

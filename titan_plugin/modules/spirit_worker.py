@@ -721,31 +721,32 @@ def _write_sphere_clocks_shm(_clock_engine, _registry_bank, _last_hash):
         return _last_hash
 
 
-def _spirit_worker_shim_loop(recv_queue, send_queue, name: str, config: dict) -> None:
-    """Thin-shim mode: spirit_worker is no-op when l0_rust_enabled = true.
+def _spirit_worker_heartbeat_stub(recv_queue, send_queue, name: str, config: dict) -> None:
+    """Lightweight heartbeat-only stub — replaces the C-S7 slim-shim 4A.
 
-    Per master plan §10.5 chunk C5-8 + C-S5 PLAN §0.5 — when the
-    microkernel.l0_rust_enabled flag flips:
-      - NS programs ×11 → handled by ns_module (C5-5)
-      - Neuromod cascade (DA/5HT/NE/ACh/Endorphin/GABA) → neuromod_module (C5-6)
-      - Hormonal cascade (11 hormones) → hormonal_module (C5-7)
-      - Inner-spirit 45D Schumann tick (70.47 Hz) → titan-inner-spirit-rs (C5-4)
-      - Sphere clocks + topology + filter_down/ground_up → titan-trinity-rs
-        (C-S3 SHIPPED)
-      - 162D TITAN_SELF assembly → titan-unified-spirit-rs (C-S4)
+    Per chunk 8I of PLAN_microkernel_phase_c_s8_cognitive_worker_extraction.md:
+    under microkernel.l0_rust_enabled = true the L3 cognitive engines now
+    live in cognitive_worker.py (registered as a separate L2 ModuleSpec
+    in legacy_core.py — see chunk 8E). spirit_worker.py becomes a no-op
+    in this mode; this stub keeps the registered ModuleSpec alive
+    (MODULE_HEARTBEAT for guardian liveness) without doing any
+    cognitive work.
 
-    This shim only:
-      - Sends MODULE_READY on boot
-      - Sends MODULE_HEARTBEAT periodically
+    What this function does:
+      - Sends MODULE_READY on boot (cognitive_offloaded=True payload)
+      - Sends MODULE_HEARTBEAT periodically (30s cadence — guardian's
+        heartbeat_timeout=120.0 for spirit gives plenty of slack)
       - Handles MODULE_SHUTDOWN cleanly
       - Routes B.2.1 SWAP_HANDOFF / ADOPTION_REQUEST through
         worker_swap_handler so spawn-mode supervision transfer works
         unchanged
+      - Skips ALL cognitive engine work (cognitive_worker owns it)
+      - Skips ALL Rust-owned tensor / shm / sphere-clock / 162D work
 
-    Full deletion of spirit_worker.py is C-S8 cleanup. Until then this
-    shim keeps the module REGISTRABLE so guardian_HCL's startup path is
-    byte-identical (the same module name + Spec definition stays in
-    the registry; only behavior degenerates to no-op when the flag flips).
+    Full deletion of spirit_worker.py is the C-S8 cleanup task that
+    follows once cognitive_worker is parity-verified on T3+T2+T1. The
+    legacy spirit_worker_main path below this function (l0_rust=false)
+    is preserved per Maker D3 (b) so flag-flip rollback stays viable.
     """
     import time
     from queue import Empty
@@ -758,18 +759,21 @@ def _spirit_worker_shim_loop(recv_queue, send_queue, name: str, config: dict) ->
     boot_ts = time.time()
 
     logger.info(
-        "[SpiritWorker] SHIM mode active (microkernel.l0_rust_enabled=true) — "
-        "NS / neuromod / hormonal / inner-spirit logic moved to dedicated "
-        "Python L2 workers (ns_module / neuromod_module / hormonal_module) + "
-        "Rust trinity daemons (titan-trinity-rs / titan-inner-spirit-rs). "
-        "Full retirement scheduled for C-S8 cleanup."
+        "[SpiritWorker] HEARTBEAT-ONLY STUB active "
+        "(microkernel.l0_rust_enabled=true) — cognitive engines moved to "
+        "cognitive_worker (L2 ModuleSpec, chunk 8E). Spirit-tensor work "
+        "owned by Rust unified-spirit-rs / inner-spirit-rs / outer-spirit-rs. "
+        "Full deletion of spirit_worker.py is C-S8 cleanup."
     )
 
     try:
         send_queue.put({
             "type": bus.MODULE_READY, "src": name, "dst": "guardian",
             "payload": {
-                "titan_id": titan_id, "ts": boot_ts, "shim_mode": True,
+                "titan_id": titan_id, "ts": boot_ts,
+                "cognitive_offloaded": True,
+                "shim_mode": True,  # back-compat marker for monitoring scripts
+                "stub_4b": True,    # chunk 8I marker
             },
             "ts": boot_ts,
         })
@@ -784,7 +788,8 @@ def _spirit_worker_shim_loop(recv_queue, send_queue, name: str, config: dict) ->
                 send_queue.put({
                     "type": bus.MODULE_HEARTBEAT, "src": name, "dst": "guardian",
                     "payload": {
-                        "alive": True, "ts": now, "shim_mode": True,
+                        "alive": True, "ts": now, "cognitive_offloaded": True,
+                        "shim_mode": True, "stub_4b": True,
                     },
                     "ts": now,
                 })
@@ -810,10 +815,12 @@ def _spirit_worker_shim_loop(recv_queue, send_queue, name: str, config: dict) ->
             pass
 
         if msg_type == bus.MODULE_SHUTDOWN:
-            logger.info("[SpiritWorker] Shim shutdown received — exiting")
+            logger.info("[SpiritWorker] Heartbeat-only stub shutdown — exiting")
             return
 
-        # Every other message is intentionally ignored in shim mode.
+        # Every other message is intentionally ignored — cognitive_worker
+        # owns the dispatch under l0_rust_enabled=true.
+
 
 
 def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
@@ -824,16 +831,18 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-    # ── C-S5 §10 D22 thin-shim flag gate ─────────────────────────────────
-    # When microkernel.l0_rust_enabled = true, spirit_worker becomes a
-    # no-op shim — see `_spirit_worker_shim_loop` above for the full
-    # rationale. Flag-off (default) falls through to the legacy path
-    # below, BYTE-IDENTICAL to today (per directive_memory_preservation.md
-    # + SPEC §3.0 Running-Titans Safety Rule).
+    # ── Phase C C-S8 chunk 8I flag gate ─────────────────────────────────
+    # When microkernel.l0_rust_enabled = true, spirit_worker is a heartbeat-only
+    # stub — cognitive engines moved to cognitive_worker (separate L2 ModuleSpec
+    # registered in legacy_core.py per chunk 8E). See `_spirit_worker_heartbeat_stub`
+    # above. Flag-off (default) falls through to the legacy path below, BYTE-
+    # IDENTICAL to pre-C-S5 (per directive_memory_preservation.md + SPEC §3.0
+    # Running-Titans Safety Rule). Maker D3 (b) keeps the legacy path so flag-flip
+    # rollback stays viable until full mainnet validation of cognitive_worker.
     flag_on = bool(
         (config or {}).get("microkernel", {}).get("l0_rust_enabled", False))
     if flag_on:
-        _spirit_worker_shim_loop(recv_queue, send_queue, name, config)
+        _spirit_worker_heartbeat_stub(recv_queue, send_queue, name, config)
         return
     # ── Legacy path below — unchanged from pre-C-S5 ─────────────────────
 
@@ -1994,6 +2003,33 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         target=_spirit_heartbeat_loop, daemon=True, name="spirit-heartbeat")
     _hb_thread.start()
     logger.info("[SpiritWorker] Background heartbeat thread started (30s interval)")
+
+    # ── Periodic SOCIAL_PERCEPTION_STATS_UPDATED publisher ────────────
+    # G19 hardening (2026-05-07): replaces sync bus.request("get_social_perception_stats")
+    # in plugin._gather_outer_sources. Mirrors CGN_STATS_UPDATED periodic
+    # publish pattern (cgn_worker.py:521). Cadence 30s — outer_mind /
+    # outer_spirit dim formulas read social_perception_stats from
+    # plugin._stats_cache. coordinator._social_perception_stats is updated
+    # in-process on every SOCIAL_PERCEPTION event (line ~10250).
+    _sps_stop = _threading_hb.Event()
+
+    def _spirit_sps_publish_loop():
+        while not _sps_stop.is_set():
+            try:
+                _sps_payload = getattr(coordinator, '_social_perception_stats', None)
+                if isinstance(_sps_payload, dict) and _sps_payload:
+                    _send_msg(send_queue,
+                              bus.SOCIAL_PERCEPTION_STATS_UPDATED,
+                              name, "all", dict(_sps_payload))
+            except Exception as _sps_err:
+                logger.debug("[SpiritWorker] SPS publish error (non-critical): %s",
+                             _sps_err)
+            _sps_stop.wait(30.0)
+
+    _sps_thread = _threading_hb.Thread(
+        target=_spirit_sps_publish_loop, daemon=True, name="spirit-sps-publish")
+    _sps_thread.start()
+    logger.info("[SpiritWorker] SOCIAL_PERCEPTION_STATS_UPDATED publisher started (30s interval)")
     neural_ns_status = "disabled"
     if neural_nervous_system:
         neural_ns_status = "V5 %s (%d programs, phase=%s)" % (
@@ -12358,131 +12394,15 @@ def _init_impulse_engine(config: dict | None = None):
         return None
 
 
-def _init_observable_engine():
-    """Initialize T1 Observable Engine (5 observables × 6 body parts)."""
-    try:
-        from titan_plugin.logic.observables import ObservableEngine
-        return ObservableEngine()
-    except Exception as e:
-        logger.warning("[SpiritWorker] ObservableEngine init failed: %s", e)
-        return None
-
-
-def _init_neural_nervous_system(config: dict):
-    """Initialize V5 Neural Nervous System (config-driven, learned reflexes)."""
-    try:
-        # Load neural NS config from titan_params.toml
-        params_config = {}
-        try:
-            import tomllib
-            params_path = os.path.join(os.path.dirname(__file__), "..", "titan_params.toml")
-            if os.path.exists(params_path):
-                with open(params_path, "rb") as f:
-                    all_params = tomllib.load(f)
-                params_config = all_params.get("neural_nervous_system", {})
-        except Exception:
-            pass
-
-        if not params_config.get("enabled", False):
-            return None
-
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
-        # V4 VM NervousSystem as fallback
-        vm_ns = None
-        try:
-            from titan_plugin.logic.nervous_system import NervousSystem
-            vm_ns = NervousSystem(config=config.get("titan_vm", {}))
-        except Exception:
-            pass
-
-        data_dir = config.get("data_dir", "./data")
-        if not data_dir:
-            data_dir = "./data"
-        nn_data_dir = os.path.join(data_dir, "neural_nervous_system")
-
-        return NeuralNervousSystem(
-            config=params_config,
-            data_dir=nn_data_dir,
-            vm_nervous_system=vm_ns,
-        )
-    except Exception as e:
-        logger.warning("[SpiritWorker] NeuralNervousSystem init failed: %s", e)
-        return None
-
-
-def _init_coordinator(inner_state, spirit_state, observable_engine,
-                      neural_nervous_system=None, config: dict | None = None):
-    """Initialize T3 Inner Trinity Coordinator with T4/V5 Nervous System.
-
-    ``config`` (the full spirit worker config dict) is threaded through so
-    the [titan_vm] toml section reaches the lightweight T4 VM. Added
-    2026-04-16 with the [titan_vm] plumb fix.
-    """
-    try:
-        from titan_plugin.logic.inner_coordinator import InnerTrinityCoordinator
-        # T4: Create NervousSystem with lightweight TitanVM (context-only)
-        nervous_system = None
-        try:
-            from titan_plugin.logic.nervous_system import NervousSystem
-            vm_cfg = (config or {}).get("titan_vm", {})
-            nervous_system = NervousSystem(config=vm_cfg)
-        except Exception as e:
-            logger.warning("[SpiritWorker] NervousSystem init failed: %s", e)
-        # T5: Create TopologyEngine
-        topology_engine = None
-        try:
-            from titan_plugin.logic.topology import TopologyEngine
-            topology_engine = TopologyEngine()
-        except Exception as e:
-            logger.warning("[SpiritWorker] TopologyEngine init failed: %s", e)
-        # T6: Create DreamingEngine
-        dreaming_engine = None
-        try:
-            from titan_plugin.logic.dreaming import DreamingEngine
-            _dreaming_state_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-                "data", "dreaming_state.json")
-            # Load DNA weights from titan_params.toml [dreaming]
-            _dreaming_dna = {}
-            try:
-                import tomllib as _tl
-                _tp = os.path.join(
-                    os.path.dirname(os.path.dirname(__file__)), "titan_params.toml")
-                if os.path.exists(_tp):
-                    with open(_tp, "rb") as _tf:
-                        _dreaming_dna = _tl.load(_tf).get("dreaming", {})
-            except Exception:
-                pass
-            dreaming_engine = DreamingEngine(
-                state_path=_dreaming_state_path, dna=_dreaming_dna)
-        except Exception as e:
-            logger.warning("[SpiritWorker] DreamingEngine init failed: %s", e)
-        return InnerTrinityCoordinator(
-            inner_state=inner_state,
-            spirit_state=spirit_state,
-            observable_engine=observable_engine,
-            vm=None,
-            nervous_system=nervous_system,
-            topology_engine=topology_engine,
-            dreaming_engine=dreaming_engine,
-            neural_nervous_system=neural_nervous_system,
-        )
-    except Exception as e:
-        logger.warning("[SpiritWorker] InnerTrinityCoordinator init failed: %s", e)
-        return None
-
-
-def _init_t2_state_registries():
-    """Initialize T2 InnerState + SpiritState registries."""
-    inner, spirit = None, None
-    try:
-        from titan_plugin.logic.inner_state import InnerState
-        inner = InnerState()
-    except Exception as e:
-        logger.warning("[SpiritWorker] InnerState init failed: %s", e)
-    try:
-        from titan_plugin.logic.spirit_state import SpiritState
-        spirit = SpiritState()
-    except Exception as e:
-        logger.warning("[SpiritWorker] SpiritState init failed: %s", e)
-    return inner, spirit
+# Cognitive engine init helpers extracted to titan_plugin/modules/_cognitive_init.py
+# in chunk 8C of PLAN_microkernel_phase_c_s8_cognitive_worker_extraction.md.
+# Both spirit_worker.py (legacy l0_rust_enabled=false path) and
+# cognitive_worker.py (chunk 8E, l0_rust_enabled=true path) share the same
+# helpers from there. Re-imported at module scope so existing call sites
+# (lines 817 / 1187) resolve unchanged.
+from titan_plugin.modules._cognitive_init import (  # noqa: E402,F401
+    _init_observable_engine,
+    _init_neural_nervous_system,
+    _init_coordinator,
+    _init_t2_state_registries,
+)

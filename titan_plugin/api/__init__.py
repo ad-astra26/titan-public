@@ -109,19 +109,34 @@ def create_app(plugin, event_bus: EventBus, config: dict | None = None,
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger.info("[Observatory] Starting Sovereign Observatory API...")
-        # 2026-04-27 hardening: eager-start the tc-status-warmer so the
-        # /v4/timechain/* warm cache begins populating at API boot — not
-        # lazily on first request. Reduces the cold-boot window where
-        # /v4/timechain/status falls through to the bounded sync fetch.
+        # Eager-start of warm-cache builders so heavy /v4/* endpoints
+        # are warm by the time the frontend hits them on first connect.
         # Without this, every api_subprocess restart (Guardian-driven
         # under RSS pressure on T1) re-introduces a 1-15s vulnerable
-        # window. Lifespan placement (vs module-level) keeps test imports
-        # clean — the warmer only fires when the API is actually booting.
-        try:
-            from titan_plugin.api.dashboard import _start_tc_status_warmer
-            _start_tc_status_warmer()
-        except Exception as _eager_err:
-            logger.warning("[TCStatusWarmer] eager-start in lifespan failed: %s", _eager_err)
+        # window where the first request falls through to the bounded
+        # sync fetch. Lifespan placement (vs module-level) keeps test
+        # imports clean — warmers only fire when the API is actually
+        # booting.
+        #
+        # 2026-04-27: tc-status-warmer (BUG-TIMECHAIN-STATUS-INLINE-COMPUTE)
+        # 2026-05-05: vocabulary + tc-verify + v4-history warmers
+        #             (OBSERVATORY-API-LATENCY-AUDIT closure +
+        #              BUG-TIMECHAIN-VERIFY-INLINE-COMPUTE-20260505)
+        for warmer_attr in (
+            "_start_tc_status_warmer",
+            "_start_tc_verify_warmer",
+            "_start_vocabulary_warmer",
+            "_start_v4_history_warmer",
+        ):
+            try:
+                from titan_plugin.api import dashboard as _dash
+                fn = getattr(_dash, warmer_attr, None)
+                if fn is not None:
+                    fn()
+            except Exception as _eager_err:
+                logger.warning(
+                    "[Observatory] %s eager-start failed: %s",
+                    warmer_attr, _eager_err)
         yield
         logger.info("[Observatory] Sovereign Observatory shutting down.")
 

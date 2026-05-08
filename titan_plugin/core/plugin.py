@@ -149,6 +149,19 @@ class TitanPlugin:
         self.event_bus = None
         self._observatory_db = None
 
+        # rFP_trinity_130d_awakening Phase 2 — inner perception state owns
+        # the AudioPerception / VisualPerception / AmbientChangeMonitor
+        # trackers + _last_create_ts. Producers feed inner_mind[5,7,9] +
+        # outer_spirit ANANDA[41]. Lazily started by boot() once
+        # system_sensor is available.
+        self._inner_perception = None
+
+        # rFP_trinity_130d_awakening Phase 2 — outer spirit history aggregator.
+        # Owns env_adapt + graceful_rest + circadian_alignment +
+        # dream_recall trackers (SPEC §23.9 SAT[11], CHIT[25,26], ANANDA[40]).
+        # CHIT[29] self_trajectory is worker-local in outer_spirit_worker.
+        self._outer_spirit_history = None
+
         logger.info(
             "[TitanPlugin] Coordinator constructed (kernel_id=%s, limbo=%s)",
             kernel.titan_id, kernel.limbo_mode,
@@ -365,49 +378,63 @@ class TitanPlugin:
         # Each worker owns its own Schumann-clocked SHM write + rate-gated
         # bus publish. Publishes OUTER_BODY/MIND/SPIRIT_STATE (3 separate
         # messages, mirror of inner BODY/MIND/SPIRIT_STATE pattern).
-        from titan_plugin.modules.outer_body_worker import outer_body_worker_main
-        from titan_plugin.modules.outer_mind_worker import outer_mind_worker_main
-        from titan_plugin.modules.outer_spirit_worker import outer_spirit_worker_main
+        #
+        # Phase C C-S7 Gap 7+11: under l0_rust_enabled=true, the Rust
+        # outer-{body,mind,spirit}-rs daemons own these slots. Don't register
+        # the Python A.S8 workers in that mode — Rust supervisor manages them.
+        # Per PLAN_microkernel_phase_c_s7_activation_prep.md §2 Gap 7
+        # (Option b — ModuleSpec gate).
+        _l0_rust = self._full_config.get("microkernel", {}).get(
+            "l0_rust_enabled", False)
+        if not _l0_rust:
+            from titan_plugin.modules.outer_body_worker import outer_body_worker_main
+            from titan_plugin.modules.outer_mind_worker import outer_mind_worker_main
+            from titan_plugin.modules.outer_spirit_worker import outer_spirit_worker_main
 
-        self.guardian.register(ModuleSpec(
-            name="outer_body",
-            layer="L1",
-            entry_fn=outer_body_worker_main,
-            config=self._full_config,
-            rss_limit_mb=200,
-            autostart=True,
-            lazy=False,
-            heartbeat_timeout=60.0,
-            reply_only=False,
-            start_method="spawn" if _spawn_grad else "fork",
-            b2_1_swap_critical=False,
-        ))
-        self.guardian.register(ModuleSpec(
-            name="outer_mind",
-            layer="L1",
-            entry_fn=outer_mind_worker_main,
-            config=self._full_config,
-            rss_limit_mb=200,
-            autostart=True,
-            lazy=False,
-            heartbeat_timeout=60.0,
-            reply_only=False,
-            start_method="spawn" if _spawn_grad else "fork",
-            b2_1_swap_critical=False,
-        ))
-        self.guardian.register(ModuleSpec(
-            name="outer_spirit",
-            layer="L1",
-            entry_fn=outer_spirit_worker_main,
-            config=self._full_config,
-            rss_limit_mb=200,
-            autostart=True,
-            lazy=False,
-            heartbeat_timeout=60.0,
-            reply_only=False,
-            start_method="spawn" if _spawn_grad else "fork",
-            b2_1_swap_critical=False,
-        ))
+            self.guardian.register(ModuleSpec(
+                name="outer_body",
+                layer="L1",
+                entry_fn=outer_body_worker_main,
+                config=self._full_config,
+                rss_limit_mb=200,
+                autostart=True,
+                lazy=False,
+                heartbeat_timeout=60.0,
+                reply_only=False,
+                start_method="spawn" if _spawn_grad else "fork",
+                b2_1_swap_critical=False,
+            ))
+            self.guardian.register(ModuleSpec(
+                name="outer_mind",
+                layer="L1",
+                entry_fn=outer_mind_worker_main,
+                config=self._full_config,
+                rss_limit_mb=200,
+                autostart=True,
+                lazy=False,
+                heartbeat_timeout=60.0,
+                reply_only=False,
+                start_method="spawn" if _spawn_grad else "fork",
+                b2_1_swap_critical=False,
+            ))
+            self.guardian.register(ModuleSpec(
+                name="outer_spirit",
+                layer="L1",
+                entry_fn=outer_spirit_worker_main,
+                config=self._full_config,
+                rss_limit_mb=200,
+                autostart=True,
+                lazy=False,
+                heartbeat_timeout=60.0,
+                reply_only=False,
+                start_method="spawn" if _spawn_grad else "fork",
+                b2_1_swap_critical=False,
+            ))
+        else:
+            logger.info(
+                "[TitanPlugin] outer_{body,mind,spirit} workers skipped — "
+                "Rust outer-{body,mind,spirit}-rs daemons own these slots "
+                "(microkernel.l0_rust_enabled=true)")
 
         # Reflex Worker — L3 §A.8.5 subprocess extraction.
         # Hosts a stateless ReflexCollector (no executors registered)
@@ -437,13 +464,15 @@ class TitanPlugin:
 
         # Agency Worker — L3 §A.8.6 subprocess extraction.
         # Hosts AgencyModule + SelfAssessment + HelperRegistry + 8 helpers
-        # + LLM fn. Handles QUERY(action="handle_intent"|
-        # "dispatch_from_nervous_signals"|"assess"|"agency_stats"|
-        # "assessment_stats") via bus.request — async-friendly proxies in
-        # parent (asyncio.to_thread) keep the parent event loop unblocked
-        # during the worker's LLM round-trip. Default OFF — when flag flips,
-        # parent's _agency / _agency_assessment become AgencyProxy +
-        # AssessmentProxy (see core/plugin.py:_boot_agency).
+        # + LLM fn. Handles work-RPC QUERY(action="handle_intent" |
+        # "dispatch_from_nervous_signals" | "assess") via bus.request_async
+        # with bounded timeout — async-friendly proxies in parent keep the
+        # event loop unblocked during the worker's LLM round-trip.
+        # State queries (agency_stats, assessment_stats) migrated to SHM
+        # via agency_state.bin + assessment_state.bin (Phase C Session 3
+        # §4.B.2/§4.B.3 publishers + Session 5 §4.D.4 handler retirement).
+        # Default OFF — when flag flips, parent's _agency / _agency_assessment
+        # become AgencyProxy + AssessmentProxy (see core/plugin.py:_boot_agency).
         from titan_plugin.modules.agency_worker import agency_worker_main
         _ag_subproc_enabled = bool(
             self._full_config.get("microkernel", {}).get(
@@ -699,6 +728,125 @@ class TitanPlugin:
             lazy=False,
             heartbeat_timeout=120.0,  # Spirit does heavy V4 work (LLM, on-chain)
         ))
+
+        # cognitive_worker (L2) — Phase C C-S8 4B (chunk 8E skeleton, 2026-05-05).
+        # Hosts the L3 cognitive engines (Reasoning, MetaReasoning, Dreaming,
+        # InnerTrinityCoordinator, PiHeartbeat, NeuralNervousSystem,
+        # ObservableEngine, ExpressionManager). Active under l0_rust_enabled=true
+        # ONLY — the legacy spirit_worker_main path owns these engines under
+        # l0_rust_enabled=false per Maker D3 (b). Registration is gated on the
+        # flag so guardian_HCL never spawns cognitive_worker in the legacy mode.
+        # Boot order: registered after spirit so guardian autostart sequence
+        # boots body → mind → spirit → cognitive_worker (cognitive_worker reads
+        # the trinity tensors body/mind/spirit publish).
+        # See SPEC §1 glossary + §9.B Python tree (NEW v0.1.8) +
+        # PLAN_microkernel_phase_c_s8_cognitive_worker_extraction.md §2.2.
+        if self._full_config.get("microkernel", {}).get("l0_rust_enabled", False):
+            cognitive_worker_config = {
+                "data_dir": self._full_config.get("memory_and_storage", {}).get("data_dir", "./data"),
+                # Microkernel flag passthrough — cognitive_worker_main checks it
+                # defensively even though registration is already gated.
+                "microkernel": self._full_config.get("microkernel", {}),
+                # Banner config for titan_id resolution.
+                "info_banner": self._full_config.get("info_banner", {}),
+                # Engine configs read from titan_params.toml inside the worker
+                # via _load_toml_section helper — no need to thread them here.
+                # titan_vm config kept here for InnerTrinityCoordinator's
+                # internal NervousSystem (lightweight VM context).
+                "titan_vm": self._full_config.get("titan_vm", {}),
+            }
+            from titan_plugin.modules.cognitive_worker import (
+                cognitive_worker_main,
+                _COGNITIVE_WORKER_SUBSCRIBE_TOPICS,
+            )
+            self.guardian.register(ModuleSpec(
+                name="cognitive_worker",
+                layer="L2",  # Microkernel v2 §A.5 — L2 (cognitive engine host)
+                entry_fn=cognitive_worker_main,
+                config=cognitive_worker_config,
+                rss_limit_mb=2000,  # ReasoningEngine + MetaReasoningEngine + V5 NS net
+                autostart=True,     # Required for /v4/* cognitive routes to populate
+                lazy=False,
+                heartbeat_timeout=120.0,  # Cognitive epoch can include LLM calls
+                start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
+                # chunk 8M.3 (2026-05-05): broadcast_topics filter — closes the
+                # 8-min-stale-heartbeat backpressure class identified in
+                # rFP_phase_c_observatory_data_pipeline.md §2.4 / §1.4. Without
+                # this filter, broker fanned-out every dst="all" event (incl.
+                # high-rate trinity tensors / filter_down cascades) into
+                # cognitive_worker's queue, blocking guardian_HCL heartbeat
+                # delivery in the reverse direction → 10/25 modules stuck in
+                # state=starting. Mirrors the worker-side topics= passed to
+                # setup_worker_bus inside cognitive_worker_main.
+                broadcast_topics=_COGNITIVE_WORKER_SUBSCRIBE_TOPICS,
+            ))
+
+            # chunk 8M.1 (2026-05-05): register C-S5 Python workers that own
+            # the 3 RegistrySpec shm slots missing from the live T3 inventory
+            # (titanvm_registers.bin / neuromod_state.bin / hormonal_state.bin).
+            # Workers exist as standalone files (ns_worker.py:205,
+            # neuromod_worker.py:159, hormonal_worker.py:177) but were never
+            # wired into _register_modules() — chunk 8M closes that gap.
+            # SPEC §9.B Python tree + §9.C contract.
+            #
+            # Boot order: AFTER cognitive_worker so the cognitive epoch driver
+            # can read fresh shm values written by these workers.
+            #
+            # broadcast_topics minimal — these workers only consume
+            # MODULE_SHUTDOWN from the bus (their state advances on internal
+            # tick from neuromodulator/hormonal/NS systems; bus integration is
+            # future work). Filtering to MODULE_SHUTDOWN avoids the same
+            # broker fan-out backpressure class as cognitive_worker.
+            from titan_plugin.modules.ns_worker import ns_worker_main
+            from titan_plugin.modules.neuromod_worker import neuromod_worker_main
+            from titan_plugin.modules.hormonal_worker import hormonal_worker_main
+
+            _cs5_worker_config = {
+                # Pass-through full config — workers read their own
+                # [neuromodulators] / [hormonal_pressure] / [neural_nervous_system]
+                # sections + microkernel.shm_*_enabled flags via _build_*_system.
+                **self._full_config,
+                # data_dir helper used by hormonal_worker to load/save persisted state.
+                "data_dir": self._full_config.get("memory_and_storage", {}).get(
+                    "data_dir", "./data"),
+            }
+
+            self.guardian.register(ModuleSpec(
+                name="ns_module",
+                layer="L2",  # NeuralNervousSystem owner — L2 cognitive support
+                entry_fn=ns_worker_main,
+                config=_cs5_worker_config,
+                rss_limit_mb=400,   # NeuralReflexNet + 11 program registers; lean
+                autostart=True,     # Required for /v4/nervous-system + titanvm_registers slot
+                lazy=False,
+                heartbeat_timeout=60.0,
+                start_method="spawn" if _spawn_grad else "fork",
+                broadcast_topics=[bus.MODULE_SHUTDOWN],
+            ))
+            self.guardian.register(ModuleSpec(
+                name="neuromod_module",
+                layer="L2",  # NeuromodulatorSystem owner
+                entry_fn=neuromod_worker_main,
+                config=_cs5_worker_config,
+                rss_limit_mb=400,
+                autostart=True,     # Required for neuromod_state.bin slot freshness
+                lazy=False,
+                heartbeat_timeout=60.0,
+                start_method="spawn" if _spawn_grad else "fork",
+                broadcast_topics=[bus.MODULE_SHUTDOWN],
+            ))
+            self.guardian.register(ModuleSpec(
+                name="hormonal_module",
+                layer="L2",  # HormonalSystem owner
+                entry_fn=hormonal_worker_main,
+                config=_cs5_worker_config,
+                rss_limit_mb=400,
+                autostart=True,     # Required for hormonal_state.bin slot freshness
+                lazy=False,
+                heartbeat_timeout=60.0,
+                start_method="spawn" if _spawn_grad else "fork",
+                broadcast_topics=[bus.MODULE_SHUTDOWN],
+            ))
 
         # Media module (image/audio perception — lazy, starts on first media)
         media_config = {
@@ -2486,6 +2634,9 @@ class TitanPlugin:
                                 "score": result.get("score", 0.0),
                             },
                         )
+                        # Inner perception fan-out happens via observatory_db
+                        # hook (utils/observatory_db.record_expressive). One
+                        # hook on the canonical write site covers all callers.
                 elif helper_name == "infra_inspect":
                     mem.record_event("inspect", program="VIGILANCE")
                 elif helper_name == "kin_sense":
@@ -2911,8 +3062,82 @@ class TitanPlugin:
         # Use pre-subscribed queue (created in kernel __init__ before Guardian boots modules)
         _meditation_queue = self._meditation_queue
 
-        # Wait for memory module to be ready before first meditation
-        await asyncio.sleep(min(interval, 120))
+        # rFP_meditation_worker_latency Fix #C (2026-05-07): wait for memory
+        # worker to be FULLY attached to the bus broker before firing the
+        # first cycle. The legacy `await asyncio.sleep(120)` raced with the
+        # worker's bus-attach which takes 122s+ on spawn-mode (TieredMemoryGraph
+        # + FAISS + Kuzu cold init). Live evidence: T1 2026-05-07 17:29:20
+        # plugin epoch #1 fires → 17:29:22 worker attaches (2s late) → message
+        # silently dropped → 300s timeout. We poll guardian's heartbeat-age
+        # for the memory module — once heartbeat <30s the worker is alive,
+        # bus-attached, and processing messages. Cap at 300s (covers
+        # cold-boot of Kuzu graph + FAISS index load on slow disks).
+        #
+        # Fix-C amendment (2026-05-07 T2 deploy): the memory module is
+        # registered as `autostart=False, lazy=True` — it stays STOPPED
+        # until something calls `_ensure_started()` to trigger the spawn.
+        # Verified live on T2 18:36:50: `[Guardian] Registered module
+        # 'memory' [L2] (autostart=False, lazy=True ...)`. Without
+        # ensure_started, the probe waits the full 300s for a worker
+        # that will never start on its own. So FIRST trigger the lazy
+        # spawn, THEN wait for readiness.
+        memory_proxy_pre = self._proxies.get("memory")
+        if memory_proxy_pre is not None:
+            try:
+                memory_proxy_pre._ensure_started()
+                logger.info(
+                    "[TitanPlugin] Meditation: memory_proxy._ensure_started() "
+                    "called — lazy spawn triggered, now waiting for worker "
+                    "to become ready")
+            except Exception as _ens_err:
+                logger.warning(
+                    "[TitanPlugin] Meditation: _ensure_started() raised: %s — "
+                    "proceeding to readiness probe regardless", _ens_err)
+        guardian = getattr(self.kernel, "guardian", None) or getattr(self, "_guardian", None)
+        if guardian is not None:
+            _wait_deadline = time.time() + 300.0
+            _last_log = 0.0
+            while time.time() < _wait_deadline:
+                try:
+                    info = guardian._modules.get("memory")
+                    if info is not None:
+                        # Guardian.ModuleInfo.state is a ModuleState enum;
+                        # its `.value` is the lowercase string ("running"
+                        # / "starting" / "stopped" / etc).
+                        state_val = getattr(getattr(info, "state", None), "value", None)
+                        hb_age = time.time() - getattr(info, "last_heartbeat", 0.0)
+                        if state_val == "running" and hb_age < 30.0:
+                            logger.info(
+                                "[TitanPlugin] Meditation: memory worker ready "
+                                "(state=running, hb_age=%.1fs) after %.1fs wait",
+                                hb_age, time.time() - (_wait_deadline - 300.0))
+                            break
+                    if time.time() - _last_log > 30.0:
+                        state_repr = getattr(
+                            getattr(info, "state", None), "value", "absent",
+                        ) if info else "absent"
+                        logger.info(
+                            "[TitanPlugin] Meditation: waiting for memory worker "
+                            "(state=%s, %.0fs elapsed)", state_repr,
+                            time.time() - (_wait_deadline - 300.0))
+                        _last_log = time.time()
+                except Exception as _wait_err:
+                    logger.debug(
+                        "[TitanPlugin] Meditation readiness probe error: %s",
+                        _wait_err)
+                await asyncio.sleep(2.0)
+            else:
+                logger.warning(
+                    "[TitanPlugin] Meditation: memory worker did not become "
+                    "ready within 300s — proceeding anyway (cycles will likely "
+                    "time out until worker recovers)")
+        else:
+            # Defensive fallback: no guardian reference available — fall back
+            # to the legacy fixed sleep. Should never happen in production.
+            logger.warning(
+                "[TitanPlugin] Meditation: no guardian reference for readiness "
+                "probe — falling back to legacy 120s fixed sleep")
+            await asyncio.sleep(min(interval, 120))
 
         logger.info("[TitanPlugin] Meditation loop started (interval=%ds, dual-trigger)", interval)
 
@@ -2957,18 +3182,27 @@ class TitanPlugin:
                     epoch_count, trigger_source,
                     emergent_ctx.get("drain", 0), emergent_ctx.get("gaba", 0))
 
-                result = memory_proxy.run_meditation()
+                # rFP_meditation_worker_latency Fix #A (2026-05-07): use
+                # `run_meditation_async` to avoid the 156s event-loop deadlock
+                # that gated 8-day expressive_archive + 26-day Arweave outage.
+                result = await memory_proxy.run_meditation_async()
 
-                promoted = 0
-                pruned = 0
+                promoted = result.get("promoted", 0)
+                pruned = result.get("pruned", 0)
                 if result.get("success"):
-                    promoted = result.get("promoted", 0)
-                    pruned = result.get("pruned", 0)
                     logger.info(
                         "[TitanPlugin] Meditation epoch #%d complete: promoted=%d pruned=%d",
                         epoch_count, promoted, pruned,
                     )
-
+                # rFP_meditation_worker_latency Fix #B2 (2026-05-07): art
+                # generation now keys on `promoted > 0`, NOT `result["success"]`.
+                # The worker handler may have completed all migration work
+                # successfully but the bus.request return arrived late
+                # (success=False on timeout) — gating art on `success` caused
+                # the 8-day expressive_archive cutoff. Memory ops are persisted
+                # by the worker regardless of bus.request timing; art belongs
+                # alongside the persisted promotions.
+                if promoted > 0 or result.get("success"):
                     # Generate meditation art via Studio if available
                     studio = self._proxies.get("studio")
                     if studio and promoted > 0:
@@ -2993,6 +3227,8 @@ class TitanPlugin:
                                         "",
                                         {"epoch": epoch_count, "promoted": promoted},
                                     )
+                                    # Inner perception fan-out: see observatory_db
+                                    # record_expressive hook.
                         except Exception as e:
                             logger.warning("[TitanPlugin] Meditation art failed: %s", e)
 
@@ -3050,27 +3286,107 @@ class TitanPlugin:
         """
         await asyncio.sleep(15)  # Let workers boot before first snapshot
         logger.info("[TitanPlugin] Outer sources loop started (10s interval)")
+        _osl_n = 0
         while True:
             try:
                 snap = await asyncio.to_thread(self._gather_outer_sources)
+                _osl_n += 1
+                if _osl_n in (1, 5, 25, 100):
+                    logger.info(
+                        "[TitanPlugin] OUTER_SOURCES_SNAPSHOT publish #%d "
+                        "keys=%d sample=%s",
+                        _osl_n, len(snap),
+                        sorted(list(snap.keys())[:8]))
                 self.bus.publish(make_msg(
                     OUTER_SOURCES_SNAPSHOT, "core", "all", snap,
                 ))
             except Exception as _e:
-                logger.debug("[TitanPlugin] outer_sources_loop error: %s", _e)
+                logger.warning("[TitanPlugin] outer_sources_loop error: %s",
+                                _e, exc_info=True)
             await asyncio.sleep(10)
+
+    # rFP_trinity_130d_awakening §12.4 — bus events whose latest payload we
+    # cache for the 130D dim consumers. See SPEC §23.1 for which producers
+    # publish each event. Lazy-subscribed on first _gather_outer_sources call.
+    _STATS_CACHE_EVENT_TYPES = (
+        "META_REASONING_STATS_UPDATED",  # contains meta_cgn block
+        "LANGUAGE_STATS_UPDATED",        # vocab_total / composition_level / ...
+        "OUTPUT_VERIFIER_STATS",         # verified_count / rejected_count
+        "MEMORY_STATUS_UPDATED",         # persistent_count / mempool_size
+        "MEMORY_KNOWLEDGE_GRAPH_UPDATED",  # KG node_count / edge_count
+        "SOLANA_BALANCE_UPDATED",        # balance updates
+        "SOCIAL_STATS_UPDATED",          # persona social stats
+        "NEUROMOD_STATS_UPDATED",        # full neuromod state (incl hormones)
+        "CGN_STATS_UPDATED",             # cgn worker periodic publish
+        "SOCIAL_PERCEPTION_STATS_UPDATED",  # spirit worker periodic publish (G19, 2026-05-07)
+    )
+
+    def _ensure_stats_cache_subscription(self) -> None:
+        """Lazy-init the stats cache subscriber. Idempotent."""
+        if getattr(self, "_stats_cache_queue", None) is not None:
+            return
+        try:
+            self._stats_cache: dict = {}
+            self._stats_cache_queue = self.bus.subscribe(
+                "trinity_dim_stats_cache",
+                types=list(self._STATS_CACHE_EVENT_TYPES),
+            )
+            logger.info(
+                "[TitanPlugin] Trinity 130D stats cache subscriber initialized "
+                "(types=%d)", len(self._STATS_CACHE_EVENT_TYPES))
+        except Exception as _e:
+            logger.warning(
+                "[TitanPlugin] stats cache subscribe failed: %s "
+                "— rich producers will be unavailable to dim formulas", _e)
+            self._stats_cache_queue = None
+
+    def _drain_stats_cache(self) -> None:
+        """Drain pending stats events and overwrite cache with latest payload per type."""
+        if getattr(self, "_stats_cache_queue", None) is None:
+            return
+        try:
+            msgs = self.bus.drain(self._stats_cache_queue, max_msgs=200)
+            for m in msgs:
+                t = m.get("type")
+                p = m.get("payload")
+                if t and isinstance(p, dict):
+                    self._stats_cache[t] = p
+        except Exception as _e:
+            swallow_warn('[OuterSources] stats cache drain', _e,
+                         key="core.plugin.stats_cache_drain", throttle=100)
 
     def _gather_outer_sources(self) -> dict:
         """Gather plugin-only outer sources for OUTER_SOURCES_SNAPSHOT.
 
-        Returns a flat dict of all plugin-owned values that outer workers
-        cannot self-fetch. Self-fetched sources (sol_balance, anchor_state,
-        system_sensor_stats, etc.) are NOT duplicated here — workers own them.
+        Phase 1 wiring (rFP_trinity_130d_awakening §12.4 + SPEC §23):
+        every rich producer required by the 130D dim formulas is exposed
+        here. Workers receive this dict via OUTER_SOURCES_SNAPSHOT and
+        feed it into their tensor formulas at tick time.
+
+        Producer sources (per SPEC §23.1):
+          - In-process: agency, assessment, expression_translator, soul,
+                        observatory_db, bus, helper_registry
+          - Proxy / bus query: spirit_proxy (trinity, social_perception),
+                              memory_proxy (memory_status)
+          - Bus event cache (see _STATS_CACHE_EVENT_TYPES): meta_cgn,
+                              language, output_verifier, kg, neuromod,
+                              social, sol_balance, cgn
+          - Utility modules: system_sensor, network_monitor, timechain_v2
+          - File reads (mtime-cached): anchor_state.json,
+                              jailbreak_alerts.json, genesis_record.json,
+                              data/arweave_devnet/, data/meditation_memos/
         """
+        # Drain bus events into cache before reading
+        self._ensure_stats_cache_subscription()
+        self._ensure_heavy_stats_refresher()
+        self._drain_stats_cache()
+        cache = getattr(self, "_stats_cache", {})
+
         sources: dict = {
             "uptime_seconds": time.time() - self._start_time,
         }
 
+        # ── In-process producers (always available) ─────────────────
         if self._agency:
             sources["agency_stats"] = self._agency.get_stats()
         if self._agency_assessment:
@@ -3080,15 +3396,71 @@ class TitanPlugin:
 
         sources["bus_stats"] = self.bus.stats
 
+        # Expression translator — sovereignty + learned action stats (in-process).
+        try:
+            if self._expression_translator is not None:
+                sources["expression_translator_stats"] = self._expression_translator.get_stats()
+        except Exception as _e:
+            swallow_warn('[OuterSources] expression_translator', _e,
+                         key="core.plugin.outer_sources.expr", throttle=100)
+
+        # ── Spirit proxy: hormones + impulse + social_perception ────
         try:
             spirit_proxy = self._proxies.get("spirit")
             if spirit_proxy:
                 trinity_data = spirit_proxy.get_trinity()
-                if trinity_data and "impulse_engine" in trinity_data:
-                    sources["impulse_stats"] = trinity_data["impulse_engine"]
+                if isinstance(trinity_data, dict):
+                    if "impulse_engine" in trinity_data:
+                        sources["impulse_stats"] = trinity_data["impulse_engine"]
+                    if "hormone_levels" in trinity_data:
+                        sources["hormone_levels"] = trinity_data["hormone_levels"]
+                    if "hormone_fires" in trinity_data:
+                        sources["hormone_fires"] = trinity_data["hormone_fires"]
+        except Exception as _e:
+            swallow_warn('[OuterSources] spirit_proxy hormones', _e,
+                         key="core.plugin.outer_sources.hormones", throttle=100)
+
+        # social_perception_stats via SHM-direct read of
+        # social_perception_state.bin (Session 3 producer in spirit_worker).
+        # Phase C Session 4 (rFP §4.C.7) — full G18 compliance: state
+        # transport is SHM, never bus (was bus-cache-mediated G19
+        # hardening; now SHM-direct).
+        try:
+            from titan_plugin.core.state_registry import (
+                StateRegistryReader, ensure_shm_root, resolve_titan_id)
+            from titan_plugin.logic.session3_state_specs import (
+                SOCIAL_PERCEPTION_STATE_SPEC)
+            import msgpack
+            if not hasattr(self, "_r_social_perception"):
+                self._r_social_perception = StateRegistryReader(
+                    SOCIAL_PERCEPTION_STATE_SPEC,
+                    ensure_shm_root(resolve_titan_id()))
+            _sp_raw = self._r_social_perception.read_variable()
+            if _sp_raw:
+                _sp_payload = msgpack.unpackb(_sp_raw, raw=False)
+                if isinstance(_sp_payload, dict) and _sp_payload:
+                    sources["social_perception_stats"] = _sp_payload
+        except Exception as _e:
+            swallow_warn(
+                '[OuterSources] social_perception SHM read', _e,
+                key="core.plugin.outer_sources.social_perception",
+                throttle=100)
+
+        # ── Memory proxy: status + KG (KG cached via bus event) ─────
+        try:
+            memory_proxy = self._proxies.get("memory")
+            if memory_proxy:
+                sources["memory_status"] = memory_proxy.get_memory_status()
+                # Growth metrics (Trinity 130D consumers: knowledge_growth,
+                # research_effectiveness, knowledge_retrieval).
+                try:
+                    sources["memory_growth_metrics"] = memory_proxy.get_growth_metrics()
+                except Exception:
+                    pass
         except Exception:
             pass
 
+        # ── Observatory expressive archive ──────────────────────────
         try:
             _obs = getattr(self, "_observatory_db", None)
             if _obs is not None:
@@ -3100,37 +3472,423 @@ class TitanPlugin:
                     _obs.get_expressive_archive(type_="art", limit=500))
                 sources["audio_count_500"] = len(
                     _obs.get_expressive_archive(type_="audio", limit=500))
+                # text/sentence count for world_footprint (SPEC §23.3)
+                try:
+                    sources["text_count_500"] = len(
+                        _obs.get_expressive_archive(type_="text", limit=500))
+                except Exception:
+                    sources["text_count_500"] = 0
         except Exception as _exc:
             swallow_warn('[OuterSources] expressive count pre-extract failed', _exc,
                          key="core.plugin.outer_sources_expressive", throttle=100)
 
-        try:
-            memory_proxy = self._proxies.get("memory")
-            if memory_proxy:
-                sources["memory_status"] = memory_proxy.get_memory_status()
-        except Exception:
-            pass
-
+        # ── Soul / Solana local-stats (SPEC §23.9 SAT[0,5,13]) ──────
         if self.soul:
             sources["soul_health"] = 0.9 if not self._limbo_mode else 0.2
         else:
             sources["soul_health"] = 0.2
 
-        sources["llm_avg_latency"] = 0.0
-
+        # solana_local_stats — derived from local files + soul state, no RPC.
         try:
-            spirit_proxy = self._proxies.get("spirit")
-            if spirit_proxy and hasattr(spirit_proxy, '_bus'):
-                _sp_result = spirit_proxy._bus.request(
-                    make_msg(bus.QUERY, "core", "spirit",
-                             {"action": "get_social_perception_stats"}),
-                    timeout=2.0)
-                if _sp_result and _sp_result.get("payload"):
-                    sources["social_perception_stats"] = _sp_result["payload"]
+            _data_dir = os.path.join(os.path.dirname(__file__), "..", "..", "data")
+            _genesis_path = os.path.join(_data_dir, "genesis_record.json")
+            sources["solana_local_stats"] = {
+                "identity_verified": (
+                    1.0 if (self.soul and not self._limbo_mode) else 0.0),
+                "genesis_nft_exists": (
+                    1.0 if os.path.exists(_genesis_path) else 0.0),
+            }
         except Exception:
             pass
 
+        # ── File-based state (anchor + jailbreak alerts) ─────────────
+        try:
+            import json as _json
+            _data_dir = os.path.join(os.path.dirname(__file__), "..", "..", "data")
+            _anchor_path = os.path.join(_data_dir, "anchor_state.json")
+            if os.path.exists(_anchor_path):
+                with open(_anchor_path) as _af:
+                    sources["anchor_state"] = _json.load(_af)
+                # Convenience top-level (used by outer_body[0] interoception)
+                _sb = sources["anchor_state"].get("sol_balance")
+                if isinstance(_sb, (int, float)):
+                    sources["sol_balance"] = float(_sb)
+        except Exception:
+            pass
+
+        # jailbreak_alerts: count + 24h windows for boundary_enforcement /
+        # threat_discernment (SPEC §23.9 SAT[3], CHIT[17]).
+        try:
+            sources["jailbreak_alerts_stats"] = self._compute_jailbreak_stats()
+        except Exception as _e:
+            swallow_warn('[OuterSources] jailbreak stats', _e,
+                         key="core.plugin.outer_sources.jailbreak", throttle=100)
+
+        # arweave + meditation_memos counts (world_footprint, SPEC §23.3)
+        try:
+            sources["world_footprint_extra_counts"] = self._count_artifact_dirs()
+        except Exception:
+            pass
+
+        # ── Utility modules (system_sensor, network_monitor, timechain) ──
+        try:
+            from titan_plugin.utils import system_sensor as _sys_sensor
+            sources["system_sensor_stats"] = _sys_sensor.get_all_stats()
+        except Exception as _e:
+            swallow_warn('[OuterSources] system_sensor', _e,
+                         key="core.plugin.outer_sources.sysensor", throttle=100)
+
+        # ── InnerPerceptionState (rFP_trinity_130d_awakening Phase 2) ──
+        # Feeds inner_mind[5] inner_hearing, [7] inner_sight, [9] inner_smell
+        # via the audio_state / visual_state / ambient_change keys. The
+        # last_create_ts also feeds outer_spirit ANANDA[41] creative_tension.
+        try:
+            ip = getattr(self, "_inner_perception", None)
+            if ip is not None:
+                sources["inner_perception_stats"] = ip.get_stats()
+        except Exception as _e:
+            swallow_warn('[OuterSources] inner_perception', _e,
+                         key="core.plugin.outer_sources.innerperc", throttle=100)
+
+        # ── OuterSpiritHistory (rFP_trinity_130d_awakening Phase 2) ──
+        # SAT[11] env_adapt + ANANDA[40] graceful_rest fed from assessment.recent
+        # gated on system_sensor (cpu_thermal / cpu_spike_rate / circadian).
+        # CHIT[26] circadian_alignment fed from agency.recent_actions_detail.
+        # CHIT[25] dream_recall already populated by heavy-stats refresher.
+        try:
+            osh = getattr(self, "_outer_spirit_history", None)
+            if osh is not None:
+                _sys_stats = sources.get("system_sensor_stats") or {}
+                _cpu_thermal = float(_sys_stats.get("cpu_thermal", 0.0) or 0.0)
+                _cpu_spike = float(_sys_stats.get("cpu_spike_rate", 0.0) or 0.0)
+                _circadian = float(_sys_stats.get("circadian_phase", 0.5) or 0.5)
+                _assess_block = sources.get("assessment_stats") or {}
+                _recent_assessments = _assess_block.get("recent") or []
+                osh.ingest_assessments(
+                    _recent_assessments, _cpu_thermal, _cpu_spike, _circadian)
+                _agency_block = sources.get("agency_stats") or {}
+                _recent_acts = _agency_block.get("recent_actions_detail") or []
+                osh.ingest_action_timestamps(
+                    a.get("ts") for a in _recent_acts if a.get("ts"))
+                sources["outer_spirit_history_stats"] = osh.get_stats()
+        except Exception as _e:
+            swallow_warn('[OuterSources] outer_spirit_history', _e,
+                         key="core.plugin.outer_sources.osh", throttle=100)
+
+        try:
+            from titan_plugin.utils import network_monitor as _net_mon
+            _rpc_url = None
+            if hasattr(self, "network") and self.network is not None:
+                _rpc_urls = getattr(self.network, "rpc_urls", None) or []
+                _rpc_url = _rpc_urls[0] if _rpc_urls else None
+            sources["network_monitor_stats"] = _net_mon.get_all_stats(
+                rpc_url=_rpc_url,
+                bus_stats=sources.get("bus_stats"),
+            )
+        except Exception as _e:
+            swallow_warn('[OuterSources] network_monitor', _e,
+                         key="core.plugin.outer_sources.netmon", throttle=100)
+
+        try:
+            from titan_plugin.logic.timechain_v2 import (
+                get_tx_latency_stats, get_block_delta_stats,
+            )
+            sources["tx_latency_stats"] = get_tx_latency_stats()
+            sources["block_delta_stats"] = get_block_delta_stats()
+        except Exception as _e:
+            swallow_warn('[OuterSources] timechain_v2 stats', _e,
+                         key="core.plugin.outer_sources.timechain", throttle=100)
+
+        # llm_avg_latency: fetched from spirit_proxy (LLM module exposes via
+        # NEUROMOD_STATS or as part of meta_reasoning telemetry). Plugin
+        # holds 0.0 sentinel — outer_body[4] thermal no longer reads this
+        # (replaced by hormonal_heat per SPEC §23.7). Preserved for any
+        # legacy consumer.
+        sources["llm_avg_latency"] = 0.0
+
+        # ── Bus-event cached stats (rich producers) ──────────────────
+        # MetaReasoning stats include the meta_cgn sub-block (per
+        # spirit_loop publish at META_REASONING_STATS_UPDATED).
+        meta_payload = cache.get("META_REASONING_STATS_UPDATED")
+        if isinstance(meta_payload, dict):
+            sources["meta_reasoning_stats"] = meta_payload
+            if isinstance(meta_payload.get("meta_cgn"), dict):
+                sources["meta_cgn_stats"] = meta_payload["meta_cgn"]
+
+        # Language stats (vocab, composition_level, teacher_sessions, ...).
+        lang_payload = cache.get("LANGUAGE_STATS_UPDATED")
+        if isinstance(lang_payload, dict):
+            sources["language_stats"] = lang_payload
+
+        # Output verifier (verified_count / rejected_count).
+        ov_payload = cache.get("OUTPUT_VERIFIER_STATS")
+        if isinstance(ov_payload, dict):
+            sources["output_verifier_stats"] = ov_payload
+
+        # CGN stats (groundings, avg_reward, consolidations, ...).
+        cgn_payload = cache.get("CGN_STATS_UPDATED")
+        if isinstance(cgn_payload, dict):
+            sources["cgn_stats"] = cgn_payload
+
+        # Knowledge graph (Kuzu) node + edge counts.
+        kg_payload = cache.get("MEMORY_KNOWLEDGE_GRAPH_UPDATED")
+        if isinstance(kg_payload, dict):
+            sources["knowledge_graph_stats"] = {
+                "node_count": kg_payload.get("node_count", 0),
+                "edge_count": kg_payload.get("edge_count", 0),
+                "total_entities": kg_payload.get("total_entities", 0),
+                "total_edges": kg_payload.get("total_edges", 0),
+            }
+
+        # Persona social stats (jailbreak_score / identity_score aggregates).
+        soc_stats_payload = cache.get("SOCIAL_STATS_UPDATED")
+        if isinstance(soc_stats_payload, dict):
+            sources["persona_social_stats"] = soc_stats_payload
+
+        # Heavy DB/file producer stats (inner_memory + social_x_gateway +
+        # events_teacher) are loaded asynchronously via _refresh_heavy_stats
+        # — see ensure_heavy_stats_refresher(). Reading from cache here is
+        # O(1) and never blocks the 10s gather hot path.
+        heavy = getattr(self, "_heavy_stats_cache", {})
+        if heavy:
+            for _k in ("inner_memory_stats", "social_x_gateway_stats",
+                        "events_teacher_stats",
+                        # Phase 2 (SPEC §23.9 ANANDA[36,38]).
+                        "community_engagement_stats"):
+                v = heavy.get(_k)
+                if isinstance(v, dict):
+                    sources[_k] = v
+
         return sources
+
+    # ── Heavy stats async refresher (rFP §12 close-out fix 2026-05-06) ──
+    # Reading inner_memory.db (262K rows) + social_x_gateway DB +
+    # events_teacher DB inside _gather_outer_sources blocks the 10s
+    # publish loop. The fix: run these in a separate background thread
+    # at 60s cadence; gather reads from the cache.
+
+    def _ensure_heavy_stats_refresher(self) -> None:
+        """Lazy-start the heavy-stats refresh thread (idempotent)."""
+        if getattr(self, "_heavy_stats_thread_started", False):
+            return
+        self._heavy_stats_thread_started = True
+        self._heavy_stats_cache: dict = {}
+        import threading
+
+        def _refresh_loop() -> None:
+            # First refresh deferred until plugin has booted producers.
+            time.sleep(20)
+            while True:
+                try:
+                    self._heavy_stats_cache["inner_memory_stats"] = (
+                        self._read_inner_memory_stats())
+                except Exception as _e:
+                    logger.debug("[HeavyStats] inner_memory refresh: %s", _e)
+                try:
+                    self._heavy_stats_cache["social_x_gateway_stats"] = (
+                        self._read_social_x_gateway_stats())
+                except Exception as _e:
+                    logger.debug("[HeavyStats] social_x refresh: %s", _e)
+                try:
+                    self._heavy_stats_cache["events_teacher_stats"] = (
+                        self._read_events_teacher_stats())
+                except Exception as _e:
+                    logger.debug("[HeavyStats] events_teacher refresh: %s", _e)
+                # rFP_trinity_130d_awakening Phase 2 — DreamRecallProducer
+                # SQL COUNT against experiential_memory; G19/G20 says NEVER
+                # inline in gather hot path. Refresh here.
+                try:
+                    osh = getattr(self, "_outer_spirit_history", None)
+                    if osh is not None:
+                        osh.refresh_dream_recall()
+                except Exception as _e:
+                    logger.debug("[HeavyStats] dream_recall refresh: %s", _e)
+                # Phase 2 (SPEC §23.9 ANANDA[36,38]) — community_connection
+                # + expression_reach producer. SQL COUNT(DISTINCT) +
+                # AVG against mention_tracking + engagement_snapshots.
+                # Reuses the persistent _social_x_gateway_reader instance
+                # initialized lazily by _read_social_x_gateway_stats above.
+                #
+                # Fleet topology: T1 is the SOLE X gateway. T2/T3 post
+                # via T1's SocialXGateway over kin RPC and do NOT maintain
+                # their own local mention_tracking / engagement_snapshots
+                # tables (the .db files exist but stay empty / schema-less).
+                # ``is_x_gateway`` flag tells the producer to short-circuit
+                # to a delegation marker on T2/T3 — honestly reflecting
+                # that ANANDA[36, 38] are T1-canonical dims by design.
+                try:
+                    sxg = getattr(self, "_social_x_gateway_reader", None)
+                    if sxg is not None and hasattr(sxg, "get_community_engagement_stats"):
+                        _tid = (self.kernel.titan_id
+                                if hasattr(self, "kernel") and self.kernel
+                                else (self._titan_id
+                                      if hasattr(self, "_titan_id") else "T1"))
+                        _is_x_gateway = (str(_tid).upper() == "T1")
+                        self._heavy_stats_cache["community_engagement_stats"] = (
+                            sxg.get_community_engagement_stats(
+                                is_x_gateway=_is_x_gateway))
+                except Exception as _e:
+                    logger.debug("[HeavyStats] community_engagement refresh: %s", _e)
+                time.sleep(60)
+
+        t = threading.Thread(target=_refresh_loop, name="heavy_stats_refresher",
+                              daemon=True)
+        t.start()
+        logger.info("[TitanPlugin] Heavy stats refresher thread started (60s cadence)")
+
+    # ── File / DB readers — mtime-cached helpers (rFP §12.4) ─────────
+
+    def _compute_jailbreak_stats(self) -> dict:
+        """Read data/jailbreak_alerts.json and produce 24h aggregates.
+
+        SPEC §23.9 SAT[3] boundary_enforcement + CHIT[17] threat_discernment
+        consumers read these fields directly. Cached by file mtime.
+        """
+        import json as _json
+        path = os.path.join(os.path.dirname(__file__), "..", "..",
+                             "data", "jailbreak_alerts.json")
+        if not os.path.exists(path):
+            return {"threats_detected_24h": 0, "blocked_24h": 0,
+                    "confirmed_threats_24h": 0, "total_alerts": 0}
+
+        cache = getattr(self, "_jailbreak_cache", None)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0
+        if cache and cache.get("_mtime") == mtime:
+            return cache["stats"]
+
+        with open(path) as f:
+            alerts = _json.load(f)
+        if not isinstance(alerts, list):
+            alerts = []
+
+        now = time.time()
+        cutoff = now - 86400
+        recent = [a for a in alerts if isinstance(a, dict)
+                  and a.get("timestamp", 0) > cutoff]
+        threats_24h = len(recent)
+        blocked = sum(1 for a in recent if a.get("score", 0) >= 0.9)
+        # confirmed = score < 1.0 AND adversary_type set (real attempted attack)
+        confirmed = sum(1 for a in recent
+                        if a.get("score", 1.0) < 1.0 and a.get("adversary_type"))
+        # severity_avg over 24h (1.0 - score = severity)
+        if recent:
+            severity_avg = sum(max(0, 1.0 - float(a.get("score", 1.0)))
+                                for a in recent) / len(recent)
+        else:
+            severity_avg = 0.0
+
+        # All-time defended count for world_footprint
+        defended_all_time = sum(1 for a in alerts if isinstance(a, dict)
+                                 and a.get("score", 0) >= 0.9)
+
+        stats = {
+            "threats_detected_24h": threats_24h,
+            "blocked_24h": blocked,
+            "confirmed_threats_24h": confirmed,
+            "severity_avg_24h": round(severity_avg, 4),
+            "total_alerts": len(alerts),
+            "defended_all_time": defended_all_time,
+        }
+        self._jailbreak_cache = {"_mtime": mtime, "stats": stats}
+        return stats
+
+    def _count_artifact_dirs(self) -> dict:
+        """Counts of arweave inscriptions + meditation memos for world_footprint."""
+        cache = getattr(self, "_artifact_dirs_cache", {})
+        now = time.time()
+        if cache.get("_ts", 0) > now - 60:  # 60s cache
+            return cache["counts"]
+        data_dir = os.path.join(os.path.dirname(__file__), "..", "..", "data")
+        counts = {}
+        try:
+            arw_dir = os.path.join(data_dir, "arweave_devnet")
+            counts["arweave_inscriptions"] = (
+                sum(1 for f in os.listdir(arw_dir) if f.endswith(".tags.json"))
+                if os.path.isdir(arw_dir) else 0)
+        except Exception:
+            counts["arweave_inscriptions"] = 0
+        try:
+            med_dir = os.path.join(data_dir, "meditation_memos")
+            counts["meditation_memos"] = (
+                sum(1 for _ in os.listdir(med_dir))
+                if os.path.isdir(med_dir) else 0)
+        except Exception:
+            counts["meditation_memos"] = 0
+        self._artifact_dirs_cache = {"_ts": now, "counts": counts}
+        return counts
+
+    def _read_inner_memory_stats(self) -> dict:
+        """Read inner_memory.db stats (action_chains, vocabulary, creative_works).
+
+        Cached for 30s — SQLite COUNT(*) queries are cheap but not free, and
+        the dim formulas don't need sub-30s freshness. The InnerMemoryStore
+        instance is held persistently to avoid connection churn (WAL allows
+        concurrent readers).
+        """
+        cache = getattr(self, "_inner_memory_stats_cache", {})
+        now = time.time()
+        if cache.get("_ts", 0) > now - 30:
+            return cache["stats"]
+        try:
+            store = getattr(self, "_inner_memory_reader", None)
+            if store is None:
+                from titan_plugin.logic.inner_memory import InnerMemoryStore
+                db_path = os.path.join(os.path.dirname(__file__), "..", "..",
+                                        "data", "inner_memory.db")
+                if not os.path.exists(db_path):
+                    return {}
+                self._inner_memory_reader = InnerMemoryStore(db_path)
+                store = self._inner_memory_reader
+            stats = store.get_stats()
+        except Exception:
+            stats = {}
+        self._inner_memory_stats_cache = {"_ts": now, "stats": stats}
+        return stats
+
+    def _read_social_x_gateway_stats(self) -> dict:
+        """Read social_x_gateway DB stats (posts/replies last hour + day).
+
+        Cached for 60s. The SocialXGateway instance is held persistently
+        to avoid the per-call _init_db + _recover_pending overhead which
+        was blocking the gather hot path.
+        """
+        cache = getattr(self, "_social_x_stats_cache", {})
+        now = time.time()
+        if cache.get("_ts", 0) > now - 60:
+            return cache["stats"]
+        try:
+            gw = getattr(self, "_social_x_gateway_reader", None)
+            if gw is None:
+                from titan_plugin.logic.social_x_gateway import SocialXGateway
+                self._social_x_gateway_reader = SocialXGateway()
+                gw = self._social_x_gateway_reader
+            stats = gw.get_stats()
+        except Exception:
+            stats = {}
+        self._social_x_stats_cache = {"_ts": now, "stats": stats}
+        return stats
+
+    def _read_events_teacher_stats(self) -> dict:
+        """Same pattern: persistent EventsTeacherDB reader, 60s cache."""
+        cache = getattr(self, "_events_teacher_stats_cache", {})
+        now = time.time()
+        if cache.get("_ts", 0) > now - 60:
+            return cache["stats"]
+        try:
+            db = getattr(self, "_events_teacher_reader", None)
+            if db is None:
+                from titan_plugin.logic.events_teacher import EventsTeacherDB
+                self._events_teacher_reader = EventsTeacherDB()
+                db = self._events_teacher_reader
+            titan_id = self._titan_id if hasattr(self, "_titan_id") else "T1"
+            stats = db.get_stats(titan_id)
+        except Exception:
+            stats = {}
+        self._events_teacher_stats_cache = {"_ts": now, "stats": stats}
+        return stats
 
     # DELETED: _boot_outer_trinity (replaced by 3 autostart ModuleSpecs in _register_modules)
     # DELETED: _outer_trinity_loop (replaced by _publish_outer_sources_loop)
@@ -3224,6 +3982,66 @@ class TitanPlugin:
         self._observatory_db = get_observatory_db()
         self.event_bus.attach_db(self._observatory_db)
 
+        # rFP_trinity_130d_awakening Phase 2 — start InnerPerceptionState.
+        # AmbientChangeMonitor samples (cpu_thermal, circadian) at 1Hz on
+        # a daemon thread; AudioPerception / VisualPerception are populated
+        # by ``_notify_expressive_create`` at every record_expressive site.
+        try:
+            from titan_plugin.logic.inner_perception import InnerPerceptionState
+            from titan_plugin.utils import system_sensor as _sys_sensor
+
+            def _ambient_sampler():
+                # Both producers already exist on system_sensor (utils/system_sensor.py).
+                # cpu_thermal ∈ [0,1], circadian_phase ∈ [0,1]; sum ∈ [0,2].
+                return (
+                    _sys_sensor.get_cpu_thermal(),
+                    _sys_sensor.get_circadian_phase(),
+                )
+
+            self._inner_perception = InnerPerceptionState(_ambient_sampler)
+            self._inner_perception.start()
+            # Register the obs_db record_expressive hook ONCE — every art /
+            # audio / music / text emission flows through record_expressive,
+            # so this single registration covers all callers (helpers,
+            # meditation, future writers). Best-effort; hook errors do NOT
+            # propagate into archival.
+            try:
+                self._observatory_db._on_expressive_create_hook = (
+                    self._inner_perception.notify_create)
+            except Exception:
+                pass
+            logger.info("[TitanPlugin] InnerPerceptionState started "
+                        "(ambient=1Hz; audio/visual via obs_db hook)")
+        except Exception as _ip_err:
+            logger.warning("[TitanPlugin] InnerPerceptionState start failed: %s",
+                           _ip_err, exc_info=True)
+            self._inner_perception = None
+
+        # rFP_trinity_130d_awakening Phase 2 — outer-spirit history aggregator.
+        # ExperientialMemory access via spirit module's coordinator (lazy
+        # lookup so we don't fail boot if spirit isn't up yet).
+        try:
+            from titan_plugin.logic.outer_spirit_history import OuterSpiritHistory
+
+            def _e_mem_lookup():
+                spirit_proxy = self._proxies.get("spirit") if hasattr(self, "_proxies") else None
+                if spirit_proxy is None:
+                    return None
+                # The proxy may expose the coordinator's e_mem via a
+                # convenience attribute; fall back to None if not bound.
+                coord = getattr(spirit_proxy, "_coordinator", None) or getattr(spirit_proxy, "coordinator", None)
+                if coord is None:
+                    return None
+                return getattr(coord, "_experiential_memory", None) or getattr(coord, "e_mem", None)
+
+            self._outer_spirit_history = OuterSpiritHistory(_e_mem_lookup)
+            logger.info("[TitanPlugin] OuterSpiritHistory started "
+                        "(env_adapt + graceful_rest + circadian + dream_recall)")
+        except Exception as _osh_err:
+            logger.warning("[TitanPlugin] OuterSpiritHistory start failed: %s",
+                           _osh_err, exc_info=True)
+            self._outer_spirit_history = None
+
         # Microkernel v2 §A.4 (S5) — flag-aware API path:
         #   flag on  → api_subprocess (Guardian-spawned in Phase 3 above)
         #              owns uvicorn; SKIP legacy in-process path here.
@@ -3289,6 +4107,8 @@ class TitanPlugin:
         # flag-flip. Each sidecar has its own in-process restart loop
         # (in-process exception handler per SPEC §11.B line 1236).
         try:
+            import threading
+            import traceback as _tb_mod
             from titan_plugin.logic.outer_body_sensor_refresh import (
                 OuterBodySensorRefresh)
             from titan_plugin.logic.outer_mind_sensor_refresh import (
@@ -3306,15 +4126,43 @@ class TitanPlugin:
                 sources_provider=sources_provider)
             self._outer_spirit_sensor_sidecar = OuterSpiritSensorRefresh(
                 sources_provider=sources_provider)
-            asyncio.get_event_loop().create_task(
-                self._outer_body_sensor_sidecar.run())
-            asyncio.get_event_loop().create_task(
-                self._outer_mind_sensor_sidecar.run())
-            asyncio.get_event_loop().create_task(
-                self._outer_spirit_sensor_sidecar.run())
+
+            # rFP_phase_c_close_all_runtime_gaps chunk 9H: each sidecar
+            # runs in its own daemon thread with its own asyncio loop.
+            # The previous architecture (3 × `asyncio.create_task` on the
+            # shared main loop) deterministically reproduced a scheduling
+            # bug under titan-kernel-rs where ONLY outer_body's run()
+            # entered (verified live on T3 2026-05-06: body's "starting"
+            # log fired 57s after task creation; mind+spirit "starting"
+            # logs never appeared, no traceback). Per-thread isolation
+            # sidesteps any main-loop scheduling drama. Threads are
+            # `daemon=True` so they exit cleanly with the parent.
+            # `_gather_outer_sources` is synchronous + reads in-process
+            # state already designed for cross-thread access (proxy
+            # registry uses parking_lot/threading.Lock locks).
+            def _run_sidecar_thread(_sidecar, _name):
+                try:
+                    asyncio.run(_sidecar.run())
+                except Exception:
+                    logger.critical(
+                        "[TitanPlugin] sidecar thread %s crashed:\n%s",
+                        _name, _tb_mod.format_exc(),
+                    )
+            for _sidecar, _name in (
+                (self._outer_body_sensor_sidecar, "body"),
+                (self._outer_mind_sensor_sidecar, "mind"),
+                (self._outer_spirit_sensor_sidecar, "spirit"),
+            ):
+                _t = threading.Thread(
+                    target=_run_sidecar_thread,
+                    args=(_sidecar, _name),
+                    name=f"outer_{_name}_sensor_refresh",
+                    daemon=True,
+                )
+                _t.start()
             logger.info(
-                "[TitanPlugin] outer sensor refresh sidecars started "
-                "(body=%.1fs / mind=%.1fs / spirit=%.1fs cadence)",
+                "[TitanPlugin] outer sensor refresh sidecars started in "
+                "dedicated threads (body=%.1fs / mind=%.1fs / spirit=%.1fs cadence)",
                 self._outer_body_sensor_sidecar._refresh_period_s,
                 self._outer_mind_sensor_sidecar._refresh_period_s,
                 self._outer_spirit_sensor_sidecar._refresh_period_s,

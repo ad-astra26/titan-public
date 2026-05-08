@@ -106,8 +106,15 @@ class EventsTeacherDB:
             try:
                 import os as _os
                 from titan_plugin.persistence.config import IMWConfig
+                # rFP_imw_writerclient_singleton (2026-05-07 PM): use
+                # `get_client(caller_name, cfg)` instead of direct
+                # constructor to avoid leaking `imw.client_loop` threads
+                # AND racing with sibling instances on the per-caller
+                # journal file. EventsTeacherDB is constructed per-route
+                # in worker hot paths — pre-fix this caller alone leaked
+                # 2,627 threads in 36 minutes on T1 (live evidence).
                 from titan_plugin.persistence.writer_client import (
-                    InnerMemoryWriterClient,
+                    get_client,
                 )
                 cfg = IMWConfig.from_titan_config_section("persistence_events_teacher")
                 if cfg.enabled and cfg.mode != "disabled":
@@ -124,8 +131,7 @@ class EventsTeacherDB:
                                 return
                         except OSError as _e:
                             logger.debug("[EventsTeacherDB] realpath check failed: %s", _e)
-                    self._writer = InnerMemoryWriterClient(
-                        cfg, caller_name="events_teacher")
+                    self._writer = get_client("events_teacher", cfg=cfg)
                     logger.info(
                         "[EventsTeacherDB] Routed via events_teacher_writer "
                         "(mode=%s, canonical=%s)",
@@ -810,11 +816,15 @@ class EventsTeacher:
                     count=100, api_key=api_key)
                 if data.get("status") == "error" or data.get("status") == "circuit_breaker":
                     logger.warning("[EventsTeacher] %s sync via gateway: %s",
-                                   relationship, data.get("message", "?"))
+                                   relationship, data.get("message",
+                                                          data.get("msg", "?")))
                     continue
-                # twitterapi.io: {"followers": [...]} or {"following": [...]}
-                users = (data.get("followers") or data.get("following")
-                         or data.get("users") or data.get("data") or [])
+                # 2026-05-07 — twitterapi.io shapes:
+                #   followers → {"followers":  [...]}
+                #   following → {"followings": [...]}  (note plural)
+                users = (data.get("followers") or data.get("followings")
+                         or data.get("following") or data.get("users")
+                         or data.get("data") or [])
                 if not isinstance(users, list):
                     continue
 
@@ -853,10 +863,29 @@ class EventsTeacher:
                 logger.warning("[EventsTeacher] %s sync failed: %s",
                                relationship, e)
 
-        # Seed initial affinity for followers (base 0.1)
+        # Seed initial affinity. Maker-curated FOLLOWING list outranks random
+        # followers — those are the AI/NN/RL voices Maker chose for Titan to
+        # listen to. Followers get a smaller seed so positive engagement can
+        # promote them later, but they don't dominate the timeline budget.
         if synced > 0:
             try:
                 conn = sqlite3.connect(DEFAULT_SOCIAL_GRAPH_DB, timeout=10)
+                # Curated following: affinity 0.5
+                conn.execute("""
+                    INSERT INTO titan_social_preferences
+                        (titan_id, user_name, affinity, tags, discovered_via,
+                         interaction_count, last_interacted, created_at)
+                    SELECT ?, user_name, 0.5, 'curated', 'following_sync', 0, ?, ?
+                    FROM community_registry
+                    WHERE is_following=1
+                    ON CONFLICT(titan_id, user_name) DO UPDATE SET
+                        affinity = MAX(affinity, 0.5),
+                        tags = CASE WHEN tags='' THEN 'curated' ELSE tags END,
+                        discovered_via = CASE WHEN discovered_via='follower_sync'
+                                              THEN 'following_sync'
+                                              ELSE discovered_via END
+                """, (self._titan_id, now, now))
+                # Random followers: affinity 0.1 (existing behavior)
                 conn.execute("""
                     INSERT INTO titan_social_preferences
                         (titan_id, user_name, affinity, tags, discovered_via,
@@ -870,9 +899,14 @@ class EventsTeacher:
                 seeded = conn.execute(
                     "SELECT COUNT(*) FROM titan_social_preferences WHERE titan_id=?",
                     (self._titan_id,)).fetchone()[0]
+                curated = conn.execute(
+                    "SELECT COUNT(*) FROM titan_social_preferences "
+                    "WHERE titan_id=? AND discovered_via='following_sync'",
+                    (self._titan_id,)).fetchone()[0]
                 conn.close()
-                logger.info("[EventsTeacher] Seeded %d follower preferences for %s",
-                            seeded, self._titan_id)
+                logger.info("[EventsTeacher] Seeded %d preferences for %s "
+                            "(%d curated/following, rest follower-derived)",
+                            seeded, self._titan_id, curated)
             except Exception as e:
                 logger.warning("[EventsTeacher] Preference seeding failed: %s", e)
 
@@ -912,18 +946,52 @@ class EventsTeacher:
     # ── Data Source 2: Follower Timelines (1-2 API calls) ────────────
 
     def _get_top_followers(self, count: int = 10) -> list[dict]:
+        """Top accounts to pull timelines from.
+
+        Maker-curated FOLLOWING accounts (`discovered_via='following_sync'`)
+        ALWAYS rank ahead of organic followers, regardless of accumulated
+        affinity. This is the single most important diversity signal:
+        Maker hand-picked AI/NN/RL voices specifically so Titan would hear
+        them. Followers can still surface but only after the curated set.
+
+        Within each tier, order by affinity DESC.
+
+        2026-05-08 — community_registry fallback: if this titan_id has no
+        affinity rows yet (typical for T2/T3 which haven't accumulated
+        engagement-driven affinity), fall back to community_registry
+        rows where is_following=1. All three Titans post from the SAME
+        @iamtitanai account, so the local community_registry on each VPS
+        is populated daily via _ensure_community_synced with the same
+        Maker-curated following list. This lets T2/T3 immediately see the
+        same curated AI/NN/RL voices T1 sees, instead of returning empty.
+        """
         if not Path(DEFAULT_SOCIAL_GRAPH_DB).exists():
             return []
         try:
             conn = sqlite3.connect(DEFAULT_SOCIAL_GRAPH_DB, timeout=10)
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT user_name as handle, affinity, tags "
+                "SELECT user_name as handle, affinity, tags, discovered_via "
                 "FROM titan_social_preferences "
                 "WHERE titan_id=? AND affinity > 0 "
-                "ORDER BY affinity DESC LIMIT ?",
+                "ORDER BY (discovered_via='following_sync') DESC, "
+                "         affinity DESC "
+                "LIMIT ?",
                 (self._titan_id, count)
             ).fetchall()
+            if not rows:
+                # Fallback: community_registry following list (shared via @iamtitanai)
+                rows = conn.execute(
+                    "SELECT user_name as handle, "
+                    "       1.0 as affinity, "
+                    "       '' as tags, "
+                    "       'community_registry_following' as discovered_via "
+                    "FROM community_registry "
+                    "WHERE is_following=1 "
+                    "ORDER BY last_tweet_time DESC, last_synced DESC "
+                    "LIMIT ?",
+                    (count,)
+                ).fetchall()
             conn.close()
             return [dict(r) for r in rows]
         except Exception as e:
@@ -931,14 +999,24 @@ class EventsTeacher:
             return []
 
     def _fetch_follower_timelines(self, config: dict) -> tuple[list[dict], int]:
-        """Fetch recent posts from top-affinity followers."""
-        import httpx
+        """Fetch recent posts from top-affinity follow targets.
+
+        Maker-tunable cost knobs (config.toml [events_teacher]):
+            follower_timeline_n_to_check (default 1) — accounts pulled per cycle
+            follower_timeline_count       (default 3) — tweets requested per account
+
+        twitterapi.io bills per-result on search; tightening these is the
+        biggest lever after cron cadence.
+        """
+        et_cfg = config.get("events_teacher", {})
+        n_default = int(et_cfg.get("follower_timeline_n_to_check", 1))
+        per_count = int(et_cfg.get("follower_timeline_count", 3))
 
         top_followers = self._get_top_followers(count=10)
         if not top_followers:
             return [], 0
 
-        n_to_check = min(2, len(top_followers))
+        n_to_check = min(n_default, len(top_followers))
         selected = []
         for i in range(n_to_check):
             idx = (self._follower_rotation_idx + i) % len(top_followers)
@@ -963,7 +1041,7 @@ class EventsTeacher:
                 # response without burning a paid API call.
                 gateway = self._get_x_gateway()
                 data = gateway.search_tweets(
-                    query=f"from:{handle}", query_type="Latest", count=5,
+                    query=f"from:{handle}", query_type="Latest", count=per_count,
                     api_key=api_key)
                 api_calls += 1
                 if data.get("status") not in ("error", "circuit_breaker"):
@@ -1251,9 +1329,13 @@ class EventsTeacher:
         gateway = self._get_x_gateway()
         items: list[dict] = []
         api_calls = 1  # one gateway.search_tweets call (may hit cache, still count budget)
+        # Maker-tunable: topic_search_count (default 10). twitterapi.io bills
+        # per result on search — halving count halves cost on this endpoint.
+        et_cfg = config.get("events_teacher", {})
+        topic_count = int(et_cfg.get("topic_search_count", 10))
         try:
             data = gateway.search_tweets(
-                query=query, query_type="Latest", count=20, api_key=api_key)
+                query=query, query_type="Latest", count=topic_count, api_key=api_key)
             if data.get("status") in ("error", "circuit_breaker"):
                 logger.warning("[EventsTeacher] Topic search '%s' failed: %s",
                                query[:60], data.get("message", "?")[:120])
@@ -1662,12 +1744,19 @@ class EventsTeacher:
                 result.follower_tweets_new = len(follower_items)
                 result.api_calls_used += follower_calls
 
-            # ── Own Engagement (always runs; not scored — self-monitoring) ──
-            engagement_items, engagement_calls = self._fetch_own_engagement(config)
-            result.own_posts_checked = 3
-            result.api_calls_used += engagement_calls
-            if engagement_items:
-                result.engagement_delta = engagement_items[0].get("delta", {})
+            # ── Own Engagement (self-monitoring; not scored) ──
+            # 2026-05-08 — throttle to every Nth cycle. Engagement deltas
+            # do not need 15-min granularity; hourly is sufficient. Cuts
+            # ~72 calls/day on T1 (96-cycle agent).
+            engagement_n = max(1, int(et_cfg.get(
+                "engagement_check_every_n_cycles", 1)))
+            engagement_items: list[dict] = []
+            if (self._window_count % engagement_n) == 0:
+                engagement_items, engagement_calls = self._fetch_own_engagement(config)
+                result.own_posts_checked = 3
+                result.api_calls_used += engagement_calls
+                if engagement_items:
+                    result.engagement_delta = engagement_items[0].get("delta", {})
 
             # ── Combine all items for single distillation pass ──
             all_items = (mentions + follower_items + vocab_items

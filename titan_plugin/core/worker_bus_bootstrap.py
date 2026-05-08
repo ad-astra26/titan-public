@@ -51,11 +51,24 @@ ENV_BUS_KEYPAIR_PATH = "TITAN_BUS_KEYPAIR_PATH"
 
 
 def _try_load_identity_secret(keypair_path: str) -> Optional[bytes]:
-    """Read a Solana keypair JSON file and return its full secret bytes.
+    """Read a Solana keypair JSON file and return its 32-byte Ed25519 secret_seed.
 
-    Returns None on any failure (file missing, malformed, unreadable). The
-    caller treats None as "fall back to legacy mp.Queue mode" rather than
-    crashing — workers must boot resiliently even if env wiring is partial.
+    Per `PLAN_microkernel_phase_c_s2_kernel.md §7.3` + `rFP_phase_c_bus_authkey_contract_fix.md`:
+    HKDF IKM is the 32-byte Ed25519 secret_seed — NOT the full 64-byte
+    Solana keypair. Solana CLI byte-array format is 64 bytes
+    (seed[0..32] + pub_key[32..64]); we slice the first 32 to match Rust
+    `Identity::load_from_disk_with_hint` which extracts `bytes[0..32]`
+    (titan-rust/crates/titan-core/src/identity.rs:327).
+
+    Pre-fix Python returned all 64 bytes → different IKM than Rust →
+    different authkeys → handshake mismatch under l0_rust_enabled=true.
+    This was the SECOND drift bug surfaced by 2026-05-05 diagnostic
+    (the first being titan_id used as HKDF info instead of constant).
+
+    Returns None on any failure (file missing, malformed, unreadable,
+    unrecognized length). Caller treats None as "fall back to legacy
+    mp.Queue mode" rather than crashing — workers must boot resiliently
+    even if env wiring is partial.
     """
     try:
         path = Path(keypair_path)
@@ -64,7 +77,14 @@ def _try_load_identity_secret(keypair_path: str) -> Optional[bytes]:
         data = json.loads(path.read_text())
         if not isinstance(data, list) or len(data) == 0:
             return None
-        return bytes(int(b) & 0xFF for b in data)
+        full = bytes(int(b) & 0xFF for b in data)
+        # 32-byte raw seed → use as-is. 64-byte Solana keypair → take first 32.
+        # Other lengths → reject (not a recognized format).
+        if len(full) == 32:
+            return full
+        if len(full) == 64:
+            return full[:32]
+        return None
     except (OSError, ValueError, TypeError):
         return None
 
@@ -175,7 +195,13 @@ def setup_worker_bus(name: str, recv_q, send_q,
     try:
         from titan_plugin.core.bus_authkey import derive_bus_authkey
         from titan_plugin.core.bus_socket import BusSocketClient
-        authkey = derive_bus_authkey(secret, titan_id)
+        # Per rFP_phase_c_bus_authkey_contract_fix.md (2026-05-05): authkey
+        # derivation no longer takes titan_id (HKDF info is the constant
+        # b"titan-bus"). Per-Titan isolation comes from the per-Titan identity
+        # secret (different IKM → different authkey). titan_id is still used
+        # below as the BusSocketClient identity (subscriber name) — that's
+        # orthogonal to authkey derivation.
+        authkey = derive_bus_authkey(secret)
         client = BusSocketClient(
             titan_id=titan_id,
             authkey=authkey,

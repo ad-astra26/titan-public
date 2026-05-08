@@ -83,6 +83,18 @@ MSG_SPECS: dict[str, BusMsgSpec] = {
     # triggers immediate restart for crashed workers.
     "BUS_PEER_DIED":            BusMsgSpec("BUS_PEER_DIED",            priority=0),
 
+    # Phase C C-S7 (2026-05-05) — supervision messages emitted by Python
+    # guardian + Rust supervisors. Per SPEC §8.1: P0 (never drop) for the
+    # state-changing events; SUPERVISION_DEPENDENCY_DEGRADED is P1 (informational
+    # only — soft dep failed but respawn continued).
+    "SUPERVISION_CHILD_DOWN":          BusMsgSpec("SUPERVISION_CHILD_DOWN",          priority=0),
+    "SUPERVISION_CHILD_RESTARTED":     BusMsgSpec("SUPERVISION_CHILD_RESTARTED",     priority=0),
+    "SUPERVISION_ESCALATION":          BusMsgSpec("SUPERVISION_ESCALATION",          priority=0),
+    "SUPERVISION_ESCALATION_RESPONSE": BusMsgSpec("SUPERVISION_ESCALATION_RESPONSE", priority=0),
+    "SUPERVISION_DEPENDENCY_BLOCKED":  BusMsgSpec("SUPERVISION_DEPENDENCY_BLOCKED",  priority=0),
+    "SUPERVISION_DEPENDENCY_RECOVERED": BusMsgSpec("SUPERVISION_DEPENDENCY_RECOVERED", priority=0),
+    "SUPERVISION_DEPENDENCY_DEGRADED": BusMsgSpec("SUPERVISION_DEPENDENCY_DEGRADED", priority=1),
+
     # ── P1 — Trinity state updates (coalesce by source+type) ───────────────
     # Body/Mind/Spirit emit at Schumann rate (7.83/23.49/70.47 Hz). Under
     # backpressure, freshest tensor wins; older same-type messages are

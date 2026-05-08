@@ -38,6 +38,33 @@ AVAILABLE HELPERS:
 Respond with JSON only: {{"helper": "name", "params": {{}}, "reasoning": "..."}}
 If no suitable helper exists, respond: {{"helper": "none", "reasoning": "..."}}"""
 
+# Helper-name → action_type mapping (rFP_trinity_130d_awakening §3.1).
+# Used by `_build_result` to tag every action_result with a stable
+# action_type so downstream consumers (creative_this_hour filter,
+# expressive_authenticity coherence check) don't have to re-derive.
+_HELPER_ACTION_TYPES = {
+    "art_generate": "art",
+    "audio_generate": "audio",
+    "web_search": "research",
+    "code_knowledge": "research",
+    "coding_sandbox": "compute",
+    "infra_inspect": "infra",
+    "memo_inscribe": "inscription",
+}
+
+
+def _derive_action_type(helper_name, posture: str) -> str:
+    """Map helper_name to a stable action_type for history dicts.
+
+    Falls back to posture when helper is None or unmapped — e.g. a
+    "no_suitable_helper" outcome still gets action_type='meditate' (or
+    whichever posture). Returns lowercase string.
+    """
+    if helper_name and helper_name in _HELPER_ACTION_TYPES:
+        return _HELPER_ACTION_TYPES[helper_name]
+    return (posture or "unknown").lower()
+
+
 # Posture-to-reason mapping (natural language descriptions)
 _POSTURE_REASONS = {
     "research": "Knowledge is stale — need to explore and learn something new",
@@ -88,6 +115,18 @@ class AgencyModule:
         # L3 Phase A.8.1: deque(maxlen=50) replaces manual `[-50:]` trim —
         # auto-eviction at data-structure level, no per-append slicing.
         self._history: deque = deque(maxlen=50)  # Last 50 action results
+        # rFP_trinity_130d_awakening Phase 2 (SPEC §23.9 ANANDA[42] surrender_capacity).
+        # Heuristic-detected retries: a new action sharing (helper, posture)
+        # with a FAILED action in the prior 30s counts as a retry. Track
+        # only retry outcomes here (deque of (ts, success)) so failed_retry_rate
+        # is fraction-of-retries-that-failed, not fraction-of-all-actions.
+        self._retry_history: deque = deque(maxlen=50)
+        # Inter-action timestamps for burst_frequency (coefficient of
+        # variation of deltas; high CV → bursty → low surrender_capacity).
+        self._action_timestamps: deque = deque(maxlen=100)
+        # Retry-detection window: same (helper, posture) within this many
+        # seconds after a failure → treat as retry.
+        self._retry_window_s: float = 30.0
         # V5: Expression dispatch cooldowns (loaded from titan_params.toml)
         self._dispatch_cooldowns: dict[str, float] = {}
         self._last_dispatch_ts: dict[str, float] = {}
@@ -367,6 +406,7 @@ class AgencyModule:
             "impulse_id": impulse_id,
             "posture": posture,
             "helper": helper_name,
+            "action_type": _derive_action_type(helper_name, posture),
             "success": success,
             "result": result_text[:500],  # Truncate for bus
             "enrichment_data": enrichment,
@@ -378,6 +418,23 @@ class AgencyModule:
 
         # deque(maxlen=50) handles eviction automatically (L3 Phase A.8.1).
         self._history.append(action_result)
+
+        # rFP_trinity_130d_awakening Phase 2 — heuristic retry detection +
+        # burst-pattern timestamp tracking (SPEC §23.9 ANANDA[42,44]).
+        now_ts = action_result["ts"]
+        self._action_timestamps.append(now_ts)
+        # Look back through history (excluding the current append) for a
+        # FAILED action with same (helper, posture) within retry_window_s.
+        for prior in reversed(list(self._history)[:-1]):
+            dt = now_ts - prior.get("ts", 0.0)
+            if dt > self._retry_window_s:
+                break
+            if prior.get("success"):
+                continue
+            if (prior.get("helper") == helper_name
+                    and prior.get("posture") == posture):
+                self._retry_history.append((now_ts, success))
+                break
 
         return action_result
 
@@ -487,9 +544,29 @@ class AgencyModule:
         return results
 
     def get_stats(self) -> dict:
-        """Return agency statistics."""
+        """Return agency statistics.
+
+        Schema bridge for Trinity 130D consumers (rFP_trinity_130d_awakening §3.1):
+        outer_body[3], outer_mind[3,10,12,13], outer_spirit SAT[7,9,14],
+        ANANDA[30,33,42,44] read total_actions / failed_actions /
+        actions_this_hour / creative_this_hour from this dict.
+        """
         self._check_budget_reset()
+
+        now = time.time()
+        hist = list(self._history)
+        last_hour = [h for h in hist if h.get("ts", 0) > now - 3600]
+        total_actions = self._action_counter
+        # failed_actions: derive from full history window (deque maxlen=50 caps memory)
+        failed_in_window = sum(1 for h in hist if not h.get("success"))
+        # Scale to total_actions: fraction of window that failed × total
+        if hist:
+            failed_actions = int(round(total_actions * failed_in_window / len(hist)))
+        else:
+            failed_actions = 0
+
         return {
+            # Original keys (preserved for dashboard contract — DO NOT REMOVE)
             "action_count": self._action_counter,
             "llm_calls_this_hour": self._llm_calls_this_hour,
             "budget_per_hour": self._budget_per_hour,
@@ -497,4 +574,65 @@ class AgencyModule:
             "registered_helpers": self._registry.list_all_names(),
             "helper_statuses": self._registry.get_all_statuses(),
             "recent_actions": len(self._history),
+            # Phase 1 schema bridge (rFP_trinity_130d_awakening §3.1)
+            "total_actions": total_actions,
+            "failed_actions": failed_actions,
+            "actions_this_hour": len(last_hour),
+            "creative_this_hour": sum(
+                1 for h in last_hour
+                if h.get("action_type") in ("art", "audio", "music")
+            ),
+            # SPEC §23.9 SAT[1] expressive_authenticity — exposes the 30
+            # most recent action_results with the posture + dominant hormone
+            # at action time so outer_spirit_worker can compute the
+            # inner-outer coherence ratio. Trinity_before is trimmed to
+            # just hormone_levels to keep the broadcast small.
+            "recent_actions_detail": [
+                {
+                    "posture": h.get("posture"),
+                    "action_type": h.get("action_type"),
+                    "success": h.get("success"),
+                    "ts": h.get("ts"),
+                    "hormones": (
+                        (h.get("trinity_before") or {}).get("hormone_levels") or {}
+                    ),
+                }
+                for h in hist[-30:]
+            ],
+            # Phase 2 schema bridge (SPEC §23.9 ANANDA[42] surrender_capacity).
+            "failed_retry_rate": self._compute_failed_retry_rate(),
+            "burst_frequency": self._compute_burst_frequency(),
         }
+
+    def _compute_failed_retry_rate(self) -> float:
+        """Fraction of retries that failed.
+
+        SPEC §23.9 ANANDA[42] surrender_capacity input. Cold-start (no
+        retries observed) → 0.0 — the SPEC-correct value: with no retries
+        there is no struggle, so no contribution to gripping.
+        """
+        recent = list(self._retry_history)
+        if not recent:
+            return 0.0
+        return sum(1 for _, ok in recent if not ok) / len(recent)
+
+    def _compute_burst_frequency(self) -> float:
+        """Burst score from coefficient of variation of inter-action deltas.
+
+        High CV → bursty (many actions clustered in time, then long gaps)
+        → high score (gripping pattern). Low CV → regular cadence → low
+        score (releasing pattern). Cold-start (n<10 timestamps) → 0.0.
+        Returned in [0, 1] via min(1.0, CV) — CV>1 saturates.
+
+        SPEC §23.9 ANANDA[42] surrender_capacity input.
+        """
+        ts = list(self._action_timestamps)
+        if len(ts) < 10:
+            return 0.0
+        deltas = [ts[i + 1] - ts[i] for i in range(len(ts) - 1)]
+        mean_delta = sum(deltas) / len(deltas)
+        if mean_delta <= 0.0:
+            return 1.0
+        var = sum((d - mean_delta) ** 2 for d in deltas) / len(deltas)
+        cv = (var ** 0.5) / mean_delta
+        return min(1.0, cv)

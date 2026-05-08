@@ -932,17 +932,29 @@ def create_pre_hook(plugin):
             social_perception_context = ""
             try:
                 _sp = _v5.get("social_perception", {})
-                # Also try coordinator buffer via spirit proxy
+                # Also try coordinator buffer via SHM-direct read of
+                # social_perception_state.bin (Session 3 §4.B.4 publisher).
+                # Phase C Session 5 (rFP §4.C.10): migrated from sync
+                # bus.request("get_social_perception_stats") to SHM-direct
+                # per Preamble G18 (state transport is SHM, never bus).
                 if not _sp:
-                    _sp_proxy = getattr(plugin, '_proxies', {}).get("spirit")
-                    if _sp_proxy and hasattr(_sp_proxy, '_bus'):
-                        from titan_plugin.bus import make_msg as _sp_make_msg
-                        _sp_result = _sp_proxy._bus.request(
-                            _sp_make_msg("QUERY", "core", "spirit",
-                                         {"action": "get_social_perception_stats"}),
-                            timeout=2.0)
-                        if _sp_result and _sp_result.get("payload"):
-                            _sp = _sp_result["payload"]
+                    try:
+                        from titan_plugin.core.state_registry import (
+                            StateRegistryReader, ensure_shm_root,
+                            resolve_titan_id)
+                        from titan_plugin.logic.session3_state_specs import (
+                            SOCIAL_PERCEPTION_STATE_SPEC)
+                        import msgpack as _msgpack
+                        _sp_reader = StateRegistryReader(
+                            SOCIAL_PERCEPTION_STATE_SPEC,
+                            ensure_shm_root(resolve_titan_id()))
+                        _sp_raw = _sp_reader.read_variable()
+                        if _sp_raw:
+                            _sp_decoded = _msgpack.unpackb(_sp_raw, raw=False)
+                            if isinstance(_sp_decoded, dict):
+                                _sp = _sp_decoded
+                    except Exception:
+                        pass
                 if _sp and _sp.get("events_count", 0) > 0:
                     _splines = ["### My Social Awareness"]
                     _sent = _sp.get("sentiment_ema", 0.5)

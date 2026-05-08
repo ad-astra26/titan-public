@@ -1577,16 +1577,20 @@ async def search_pipeline_backend(name: str, request: Request):
     cache_path = "data/search_cache.db"
     entry["cache_entries"] = 0
     if _os_sp.path.exists(cache_path):
-        try:
+        def _count_cache_entries() -> int:
             import sqlite3 as _sql_sp
-            conn = _sql_sp.connect(cache_path, timeout=2.0)
-            row = conn.execute(
-                "SELECT COUNT(*) FROM search_cache WHERE backend = ?",
-                (name,)).fetchone()
-            entry["cache_entries"] = int(row[0] or 0)
-            conn.close()
-        except Exception:
-            pass
+            try:
+                conn = _sql_sp.connect(cache_path, timeout=2.0)
+                try:
+                    row = conn.execute(
+                        "SELECT COUNT(*) FROM search_cache WHERE backend = ?",
+                        (name,)).fetchone()
+                    return int(row[0] or 0)
+                finally:
+                    conn.close()
+            except Exception:
+                return 0
+        entry["cache_entries"] = await asyncio.to_thread(_count_cache_entries)
 
     return _ok(entry)
 
@@ -1660,7 +1664,20 @@ async def bus_health(request: Request):
     try:
         titan_state = _get_plugin(request)
         plugin = titan_state  # backward-compat alias for Category C callsites
-        mon = getattr(plugin, "bus_health", None)
+        # Phase C C-S7 Component 1 fix (2026-05-05): same as /v4/state — the
+        # bus_health monitor lives on the live plugin (in the kernel-spawned
+        # Python process), not on the api_subprocess's StateAccessor. Reach
+        # it via the kernel_rpc proxy. Falls back to plugin.bus_health for
+        # legacy in-process mode where titan_state IS the TitanPlugin.
+        mon = None
+        try:
+            kernel_proxy = getattr(request.app.state, "titan_plugin", None)
+            if kernel_proxy is not None and hasattr(kernel_proxy, "bus_health"):
+                mon = kernel_proxy.bus_health
+        except Exception as ee:  # noqa: BLE001
+            logger.debug("[Dashboard] kernel_rpc bus_health unavailable: %s", ee)
+        if mon is None:
+            mon = getattr(plugin, "bus_health", None)
         if mon is None:
             return _error("bus_health monitor not wired")
         return _ok(mon.snapshot())
@@ -1671,6 +1688,400 @@ async def bus_health(request: Request):
 # ---------------------------------------------------------------------------
 # GET /health — System Health Check
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# /health warm-cache infrastructure (2026-05-05 closure session)
+# ---------------------------------------------------------------------------
+# Pre-warmer cold-boot path could take 4s+ (vault RPC 4s timeout +
+# memory.get_memory_status 300ms timeout + bus_health snapshot + Guardian
+# enumeration) on the FIRST /health request after api_subprocess restart.
+# This drove false-positive watchdog kills (per 2026-04-09 audit: 11
+# force-restarts in 24h purely from the 4s vault timeout exceeding the
+# watchdog's 10s deadline under combined RPC+startup stress).
+#
+# Architecture:
+#   - _vault_status_warmer runs every 30s, captures vault PDA state
+#     async via asyncio.run() in the daemon thread. Vault RPC stays
+#     OUT of the request path entirely.
+#   - _health_summary_warmer runs every 5s, builds the full /health
+#     response from cached vault + cached subsystem status. /health
+#     handler is O(1) cache read with 1.5s cold-boot bound returning
+#     a `warming: true` sentinel within nginx's 3s budget.
+#   - /health/light is a separate ultra-thin endpoint that returns
+#     {status: ok} with zero subsystem checks. The watchdog uses this
+#     instead of /health, eliminating the false-kill class entirely.
+_vault_status_cache: dict = {"data": None, "updated_at": 0.0}
+_VAULT_WARMER_INTERVAL_S = 30.0
+_vault_warmer_started = {"flag": False}
+
+_health_summary_cache: dict = {"data": None, "updated_at": 0.0}
+_HEALTH_WARMER_INTERVAL_S = 5.0
+_health_warmer_started = {"flag": False}
+
+
+def _build_vault_status_sync(plugin) -> dict | None:
+    """Synchronous-with-internal-async-loop vault status fetcher.
+
+    Runs `_fetch_vault_info` in a fresh asyncio loop bound to this
+    thread (the warmer's daemon thread). Returns the vault info dict
+    on success, None on RPC failure / timeout.
+    """
+    import asyncio as _aio
+    titan_state = plugin
+    vault_program_id = titan_state.config.get(
+        "network", {}).get("vault_program_id", "")
+    if not vault_program_id:
+        return None
+    try:
+        from titan_plugin.utils.solana_client import is_available
+        if not is_available():
+            return None
+    except Exception:
+        return None
+    if not (titan_state.network and getattr(
+            titan_state.network, "is_available", False)):
+        return None
+    try:
+        loop = _aio.new_event_loop()
+        try:
+            return loop.run_until_complete(_aio.wait_for(
+                _fetch_vault_info(plugin), timeout=4.0))
+        finally:
+            loop.close()
+    except Exception:
+        return None
+
+
+def _start_vault_warmer(plugin) -> None:
+    """Background daemon refreshing vault status every 30s.
+
+    Vault state changes only on meditation cycles (~5-15min apart),
+    so 30s refresh is plenty fresh. Idempotent.
+    """
+    if _vault_warmer_started["flag"]:
+        return
+    _vault_warmer_started["flag"] = True
+
+    import threading
+    import time as _time
+
+    def _warmer_loop():
+        while True:
+            try:
+                data = _build_vault_status_sync(plugin)
+                _vault_status_cache["data"] = data
+                _vault_status_cache["updated_at"] = _time.time()
+            except Exception as e:
+                logger.warning("[VaultWarmer] refresh failed: %s", e)
+            _time.sleep(_VAULT_WARMER_INTERVAL_S)
+
+    t = threading.Thread(
+        target=_warmer_loop, daemon=True, name="vault-status-warmer")
+    t.start()
+    logger.info(
+        "[VaultWarmer] started — refresh every %.1fs",
+        _VAULT_WARMER_INTERVAL_S)
+
+
+def _get_vault_status_cached() -> dict | None:
+    """Return cached vault status. Returns None until warmer's first
+    successful tick (or on persistent RPC failure)."""
+    return _vault_status_cache["data"]
+
+
+def _build_health_snapshot_sync(plugin, kernel_proxy=None) -> dict:
+    """Synchronous builder — extracted body of /health handler.
+
+    Called by the health-warmer daemon every 5s + by the cold-boot
+    fallback path on the very first request before warmer has ticked.
+    Reads vault from `_get_vault_status_cached()` (warmed separately
+    by vault-status-warmer at 30s cadence) so the heavy RPC stays
+    out of the request path entirely.
+
+    Phase C C-S7 Component 2 (2026-05-05): `kernel_proxy` is an optional
+    kernel_rpc proxy ref (typically `request.app.state.titan_plugin` in
+    api_subprocess mode). When supplied, guardian.get_status() flows
+    through it (live data) instead of `titan_state.guardian` which
+    returns empty under l0_rust_enabled=true (StateAccessor's cached_state
+    path). When None, falls back to the legacy in-process plugin path.
+    """
+    titan_state = plugin
+    is_v3 = hasattr(plugin, "get_v3_status")
+
+    from titan_plugin.utils.solana_client import is_available as solana_ok
+    sdk_available = solana_ok()
+
+    sol_balance = 0.0
+    rpc_connected = False
+    wallet_loaded = False
+    if titan_state.network and getattr(
+            titan_state.network, "is_available", False):
+        try:
+            sol_balance = float(titan_state.network.balance) or 0.0
+        except Exception:
+            sol_balance = 0.0
+        _pubkey = getattr(titan_state.network, "pubkey", "")
+        wallet_loaded = bool(_pubkey)
+        rpc_connected = wallet_loaded and bool(
+            getattr(titan_state.network, "rpc_urls", []) or [])
+
+    # Vault status — read from warm cache (vault-status-warmer @ 30s).
+    # Pre-2026-05-05: this was an inline `await asyncio.wait_for(
+    # _fetch_vault_info, 4.0)` that drove the 11 force-restarts/24h
+    # incident in 2026-04-09. Vault RPC now stays out of request path.
+    vault_program_id = titan_state.config.get(
+        "network", {}).get("vault_program_id", "")
+    vault_status = "STUB"
+    vault_data = _get_vault_status_cached()
+    if vault_program_id and sdk_available and wallet_loaded:
+        if vault_data is not None and vault_data.get("commit_count", 0) > 0:
+            vault_status = "ACTIVE"
+        elif vault_data is not None:
+            vault_status = "DEGRADED"
+        else:
+            vault_status = "DEGRADED"  # warmer hasn't ticked yet OR RPC failure
+
+    soul_state = titan_state.cache.get("soul.state", {})
+    maker_pubkey = str(soul_state.get("maker_pubkey", "") if isinstance(soul_state, dict) else "")
+
+    solana_capabilities = {
+        "SOLANA_SDK": "ACTIVE" if sdk_available else "ABSENT",
+        "MEMO_INSCRIPTION": "ACTIVE" if sdk_available else "ABSENT",
+        "STATE_ROOT_ZK": vault_status,
+        "SHADOW_DRIVE_SYNC": "ACTIVE",
+        "RPC_CONNECTIVITY": "ACTIVE" if rpc_connected else ("DEGRADED" if sdk_available else "ABSENT"),
+        "WALLET": "ACTIVE" if wallet_loaded else "DEGRADED",
+        "MAKER_AUTH": "ACTIVE" if maker_pubkey else "DEGRADED",
+    }
+    if not is_v3:
+        solana_capabilities["ZK_COMPRESSION"] = (
+            "ACTIVE" if (getattr(getattr(plugin, "meditation", None), "_photon", None) is not None)
+            else "STUB" if sdk_available
+            else "ABSENT"
+        )
+
+    if is_v3:
+        # Phase C C-S7 Component 2 (2026-05-05): same kernel_rpc proxy
+        # pattern Component 1 applied to /v4/state. Under l0_rust_enabled=true
+        # `titan_state.guardian.get_status()` returns empty (cached_state path);
+        # use the kernel_rpc proxy passed in by the warmer / request handler.
+        # Falls back to titan_state.guardian for legacy in-process mode where
+        # plugin IS the TitanPlugin (no separation).
+        guardian_status = {}
+        try:
+            if kernel_proxy is not None and hasattr(kernel_proxy, "guardian"):
+                guardian_obj = kernel_proxy.guardian
+                if hasattr(guardian_obj, "get_status"):
+                    guardian_status = guardian_obj.get_status() or {}
+        except Exception as ee:  # noqa: BLE001
+            logger.debug("[Dashboard.health] kernel_rpc guardian unavailable: %s", ee)
+        if not guardian_status:
+            try:
+                guardian_status = titan_state.guardian.get_status() or {}
+            except Exception:
+                pass
+        subsystems = {
+            "soul": "ACTIVE" if titan_state.soul else "DEGRADED",
+            "bus": "ACTIVE",
+            "guardian": "ACTIVE",
+            "observatory": "ACTIVE",
+        }
+        for mod_name, mod_info in guardian_status.items():
+            state = mod_info.get("state", "stopped")
+            subsystems[mod_name] = "ACTIVE" if state == "running" else (
+                "DEGRADED" if state in ("starting", "unhealthy") else "ABSENT"
+            )
+        subsystems["metabolism"] = "ACTIVE" if titan_state.metabolism else "ABSENT"
+        subsystems["studio"] = "ACTIVE" if getattr(plugin, "studio", None) else "ABSENT"
+        subsystems["social"] = "ACTIVE" if titan_state.social else "ABSENT"
+        _gk_cached = bool(titan_state.cache.get("gatekeeper.status", None))
+        subsystems["gatekeeper"] = "ACTIVE" if _gk_cached else "ABSENT"
+    else:
+        ollama_cloud = getattr(plugin, "_ollama_cloud", None)
+        subsystems = {
+            "memory": "ACTIVE" if titan_state.memory else "ABSENT",
+            "metabolism": "ACTIVE" if titan_state.metabolism else "ABSENT",
+            "soul": "ACTIVE" if titan_state.soul else "ABSENT",
+            "guardian": "ACTIVE" if titan_state.guardian else "ABSENT",
+            "gatekeeper": "ACTIVE" if titan_state.gatekeeper else "ABSENT",
+            "studio": "ACTIVE" if getattr(plugin, "studio", None) else "ABSENT",
+            "social": "ACTIVE" if titan_state.social else "ABSENT",
+            "memory_backend": "ACTIVE" if (titan_state.memory and getattr(titan_state.memory, "_cognee_ready", False)) else "DEGRADED",
+            "observatory": "ACTIVE",
+            "ollama_cloud": "ACTIVE" if ollama_cloud else "ABSENT",
+        }
+
+    # Cognee readiness — read from cache. Pre-warmer this was an
+    # `await asyncio.wait_for(asyncio.to_thread(...), timeout=0.3)`.
+    # We now read it from titan_state.cache (kernel publishes
+    # memory.status periodically); falls back to direct call only if
+    # cache is empty.
+    cognee_ready = False
+    _mem_status_cached = titan_state.cache.get("memory.status", None)
+    if isinstance(_mem_status_cached, dict):
+        cognee_ready = bool(_mem_status_cached.get("cognee_ready", False))
+    elif titan_state.memory:
+        try:
+            mem_status = titan_state.memory.get_memory_status()
+            cognee_ready = mem_status.get("cognee_ready", False) if mem_status else False
+        except Exception:
+            pass
+    recorder_ready = hasattr(plugin, "recorder") and titan_state.recorder is not None
+
+    capabilities = [
+        {"name": name, "status": status}
+        for name, status in solana_capabilities.items()
+    ]
+
+    active_count = sum(1 for v in subsystems.values() if v == "ACTIVE")
+    overall_status = "ACTIVE" if active_count >= 6 else ("DEGRADED" if active_count >= 3 else "OFFLINE")
+
+    privacy_cfg = titan_state.config.get("privacy", {})
+    privacy_redactions = getattr(plugin, "_privacy_redaction_count", 0)
+
+    # Phase C C-S7 Component 3 (2026-05-05): bus_health monitor lives in
+    # the live plugin process. Under l0_rust_enabled=true, `plugin` here is
+    # the StateAccessor whose .bus_health is a CacheGetterAccessor returning
+    # empty (so .snapshot() returns {} and .overall_state defaults to
+    # 'unknown'). Use kernel_proxy when available; falls back to plugin.
+    bus_health_summary = None
+    bus_monitor = None
+    if kernel_proxy is not None:
+        try:
+            if hasattr(kernel_proxy, "bus_health"):
+                bus_monitor = kernel_proxy.bus_health
+        except Exception:
+            bus_monitor = None
+    if bus_monitor is None:
+        bus_monitor = getattr(plugin, "bus_health", None)
+    if bus_monitor is not None:
+        try:
+            _snap = bus_monitor.snapshot()
+            bus_health_summary = {
+                "state": _snap.get("overall_state", "unknown"),
+                "total_emission_rate_hz": _snap.get("total_emission_rate_1min_hz", 0),
+                "rate_budget_hz": _snap.get("rate_budget_hz", 0.5),
+                "max_queue_fraction": _snap.get("max_queue_fraction", 0),
+                "backpressure": _snap.get("backpressure_active", False),
+                "orphan_count": _snap.get("orphans", {}).get("total_count", 0),
+                "orphan_tuples": len(_snap.get("orphans", {}).get("unique_tuples", [])),
+            }
+        except Exception:
+            pass
+
+    response = {
+        "version": "v6.0" if is_v3 else "v2.1",
+        "status": overall_status,
+        "maker_pubkey": maker_pubkey,
+        "sol_balance": round(sol_balance, 6),
+        "capabilities": capabilities,
+        "solana_capabilities": solana_capabilities,
+        "subsystems": subsystems,
+        "bus_health": bus_health_summary,
+        "privacy_filter": {
+            "enabled": privacy_cfg.get("sanitize_pii", True),
+            "redactions": privacy_redactions,
+        },
+        "cognee_ready": cognee_ready,
+        "memory_backend_ready": cognee_ready,
+        "recorder_ready": recorder_ready,
+        "limbo_mode": titan_state.cache.get("plugin._limbo_mode", False),
+        "network": getattr(titan_state.network, "_network_name", "unknown") if titan_state.network else "none",
+        "rpc_endpoint": (titan_state.network.rpc_urls[0] if titan_state.network and hasattr(titan_state.network, "rpc_urls") and titan_state.network.rpc_urls else None),
+    }
+
+    if vault_data:
+        response["vault"] = vault_data
+    elif vault_program_id:
+        response["vault"] = {"program_id": vault_program_id, "status": "not_initialized"}
+
+    if is_v3:
+        # Phase C C-S7 Component 3 (2026-05-05): under l0_rust_enabled=true
+        # cached_state is empty (snapshot pipeline issue). Read live via
+        # kernel_proxy.get_v3_status(); falls back to cached_state for
+        # legacy in-process mode. Same pattern as Components 1+2.
+        v3_status = {}
+        if kernel_proxy is not None:
+            try:
+                if hasattr(kernel_proxy, "get_v3_status"):
+                    v3_status = kernel_proxy.get_v3_status() or {}
+            except Exception as ee:  # noqa: BLE001
+                logger.debug("[Dashboard.health] kernel_rpc get_v3_status: %s", ee)
+        if not v3_status:
+            v3_status = titan_state.cache.get("v3.status", {})
+        response["v3"] = v3_status
+
+    if not is_v3:
+        ollama_cloud = getattr(plugin, "_ollama_cloud", None)
+        if ollama_cloud:
+            response["ollama_cloud"] = ollama_cloud.get_stats()
+
+    return response
+
+
+def _start_health_warmer(plugin, kernel_proxy=None) -> None:
+    """Background daemon refreshing /health response every 5s. Idempotent.
+
+    Phase C C-S7 Component 2 (2026-05-05): accepts `kernel_proxy` so
+    the warmer's per-tick `_build_health_snapshot_sync` can read live
+    plugin state via kernel_rpc instead of the StateAccessor's empty
+    cached_state under l0_rust_enabled=true. Captured in the closure
+    so the daemon thread reuses it forever (proxy is stable across
+    api_subprocess lifetime; rebound on api restart).
+    """
+    if _health_warmer_started["flag"]:
+        return
+    _health_warmer_started["flag"] = True
+    # Vault warmer is a dependency — kick it off in lockstep.
+    _start_vault_warmer(plugin)
+
+    import threading
+    import time as _time
+
+    _captured_proxy = kernel_proxy
+
+    def _warmer_loop():
+        while True:
+            try:
+                data = _build_health_snapshot_sync(plugin, _captured_proxy)
+                _health_summary_cache["data"] = data
+                _health_summary_cache["updated_at"] = _time.time()
+            except Exception as e:
+                logger.warning("[HealthWarmer] refresh failed: %s", e)
+            _time.sleep(_HEALTH_WARMER_INTERVAL_S)
+
+    t = threading.Thread(
+        target=_warmer_loop, daemon=True, name="health-warmer")
+    t.start()
+    logger.info(
+        "[HealthWarmer] started — refresh every %.1fs",
+        _HEALTH_WARMER_INTERVAL_S)
+
+
+def _get_health_summary_cached() -> dict | None:
+    """Return cached /health response."""
+    return _health_summary_cache["data"]
+
+
+# GET /health/light — Watchdog liveness probe (zero subsystem checks)
+@router.get("/health/light")
+async def health_light(request: Request):
+    """Ultra-thin liveness probe for watchdog use.
+
+    Returns `{status: "ok", ts: <unix>}` with NO subsystem checks. Always
+    O(1) regardless of plugin state — never hits the bus, never touches
+    SQLite, never makes RPC calls. If the api_subprocess is alive enough
+    to route this request, /health/light returns 200.
+
+    This eliminates the BUG-API-WORKER-CRASH-LOOP-CIRCUIT-BREAKER class
+    where `/health` exceeded the watchdog's 10s deadline due to one slow
+    subsystem (vault RPC, memory bus call, etc.) and triggered force-kills
+    of an otherwise-healthy Titan.
+
+    Dashboard / observers should still use `/health` for the rich response.
+    """
+    return _ok({"status": "ok", "ts": time.time()})
+
+
 @router.get("/health")
 async def health_check(request: Request):
     """
@@ -1681,7 +2092,54 @@ async def health_check(request: Request):
       DEGRADED — operational with limitations
       STUB    — interface present, backend not yet deployed
       ABSENT  — dependency missing
+
+    Read order: warm in-process cache (refreshed every 5s by health-warmer
+    thread) → bounded sync fallback for cold-boot window. Vault RPC is
+    handled by a separate vault-status-warmer @ 30s, so it's never in
+    the request path.
     """
+    titan_state = _get_plugin(request)
+    plugin = titan_state
+    # Phase C C-S7 Component 2: kernel_rpc proxy (api_subprocess mode) or
+    # plugin itself (legacy in-process mode where they're the same object).
+    kernel_proxy = getattr(request.app.state, "titan_plugin", plugin)
+
+    # Fast path: warm cache hit — sub-millisecond.
+    cached = _get_health_summary_cached()
+    if cached is not None:
+        # Lazy-start the warmers if not already running. Idempotent.
+        _start_health_warmer(plugin, kernel_proxy)
+        return _ok(cached)
+
+    # Cold path — only the very first /health request after process boot
+    # hits this branch. Subsequent calls always hit the warm cache.
+    # Bounded by 1.5s asyncio.wait_for so even cold-boot returns within
+    # nginx's 3s budget. Kicks off warmers in parallel.
+    _start_health_warmer(plugin, kernel_proxy)
+
+    try:
+        data = await asyncio.wait_for(
+            asyncio.to_thread(_build_health_snapshot_sync, plugin, kernel_proxy),
+            timeout=1.5)
+        return _ok(data)
+    except asyncio.TimeoutError:
+        # Cold-boot exceeded budget — return a `warming: true` sentinel.
+        # Watchdog should be using /health/light anyway; this is for
+        # human observers refreshing the dashboard during a restart.
+        return _ok({
+            "warming": True, "status": "STARTING",
+            "subsystems": {}, "capabilities": [],
+            "version": "v6.0",
+        })
+    except Exception as e:
+        return _error(str(e))
+
+
+# Legacy inline /health body — preserved as `_legacy_health_inline` for
+# rollback safety. NOT registered as a route. Will be removed after
+# 7-day soak proves the warmer pattern is stable.
+async def _legacy_health_inline(request: Request):
+    """LEGACY pre-2026-05-05 /health handler. Kept for rollback only."""
     titan_state = _get_plugin(request)
     plugin = titan_state  # backward-compat alias for Category C callsites
     is_v3 = hasattr(plugin, "get_v3_status")
@@ -2790,8 +3248,28 @@ async def get_v4_state(request: Request):
 
         v4_state = spirit_proxy.get_v4_state()
 
-        # Add Guardian module health for context
-        guardian_status = titan_state.guardian.get_status() if hasattr(plugin, "guardian") else {}
+        # Phase C C-S7 Component 1 fix (2026-05-05): under l0_rust_enabled=true,
+        # `titan_state.guardian` resolves to the StateAccessor's CacheGetterAccessor
+        # which reads cached_state populated by snapshot pushes from the kernel.
+        # That snapshot pipeline is currently rate-broken under l0_rust=true (see
+        # PLAN §2B Gap E). Use the kernel_rpc proxy at app.state.titan_plugin
+        # directly — same pattern as bus_broker_stats below; the proxy IS
+        # connected (verified via lsof on /tmp/titan_kernel_<id>.sock during
+        # T3 activation) and routes the call to the live plugin's guardian.
+        # This makes /v4/state work identically across legacy + l0_rust modes.
+        guardian_status = {}
+        try:
+            kernel_proxy = getattr(request.app.state, "titan_plugin", None)
+            if kernel_proxy is not None and hasattr(kernel_proxy, "guardian"):
+                guardian_obj = kernel_proxy.guardian
+                if hasattr(guardian_obj, "get_status"):
+                    guardian_status = guardian_obj.get_status() or {}
+            elif hasattr(plugin, "guardian"):
+                # Fallback (legacy in-process mode where plugin == titan_state
+                # AND titan_state has a real guardian, not just an accessor).
+                guardian_status = titan_state.guardian.get_status() or {}
+        except Exception as ee:  # noqa: BLE001
+            logger.debug("[Dashboard] guardian.get_status unavailable: %s", ee)
 
         # Microkernel v2 Phase B.2.1 — expose bus_broker stats so the
         # shadow_orchestrator's multi-criterion gate (which polls /v4/state
@@ -2939,15 +3417,56 @@ async def get_v4_cache_staleness(request: Request):
 # ---------------------------------------------------------------------------
 @router.get("/v4/sphere-clocks")
 async def get_v4_sphere_clocks(request: Request):
-    """V4 SphereClockEngine: 6 inner clocks, phases, radii, pulse counts."""
+    """V4 SphereClockEngine: 6 inner clocks, phases, radii, pulse counts.
+
+    chunk 8M.9 (2026-05-05) — defense in depth per
+    rFP_phase_c_observatory_data_pipeline.md §3.9: when the spirit_proxy
+    returns empty/missing values (e.g. coordinator engine stale under
+    l0_rust_enabled=true), fall back to direct shm read via
+    titan_state.shm.read_sphere_clocks(). Closes the
+    /v4/sphere-clocks-zero-values acceptance gate item #6.
+    """
     import asyncio
     titan_state = _get_plugin(request)
     plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         spirit_proxy = titan_state.spirit
-        if not spirit_proxy:
-            return _ok({"error": "Spirit proxy not available"})
-        return _ok(await asyncio.to_thread(spirit_proxy.get_sphere_clocks))
+        primary: dict | None = None
+        if spirit_proxy:
+            try:
+                primary = await asyncio.to_thread(spirit_proxy.get_sphere_clocks)
+            except Exception as _proxy_err:
+                logger.debug(
+                    "[Dashboard] /v4/sphere-clocks proxy read failed: %s",
+                    _proxy_err)
+                primary = None
+        # Detect "empty/sparse" — proxy may return {} or a dict where every
+        # clock has all-zero numeric fields (cold-boot placeholder).
+        def _is_sparse(payload: dict | None) -> bool:
+            if not payload:
+                return True
+            clocks = payload.get("clocks") if isinstance(payload, dict) else None
+            if not clocks or not isinstance(clocks, dict):
+                return True
+            # Sparse if every numeric value is exactly 0.0.
+            for clk in clocks.values():
+                if not isinstance(clk, dict):
+                    return False
+                for v in clk.values():
+                    if isinstance(v, (int, float)) and abs(float(v)) > 1e-9:
+                        return False
+            return True
+
+        if _is_sparse(primary):
+            shm_snap = await asyncio.to_thread(
+                titan_state.shm.read_sphere_clocks)
+            if shm_snap is not None:
+                shm_snap.setdefault("source", "shm")
+                return _ok(shm_snap)
+        if primary is not None:
+            primary.setdefault("source", "spirit_proxy")
+            return _ok(primary)
+        return _ok({"error": "Spirit proxy unavailable + shm read failed"})
     except Exception as e:
         logger.error("[Dashboard] /v4/sphere-clocks error: %s", e)
         return _error(str(e))
@@ -3082,64 +3601,139 @@ async def get_v4_nervous_system(request: Request):
 # ---------------------------------------------------------------------------
 # GET /v4/vocabulary — Vocabulary from inner_memory.db
 # ---------------------------------------------------------------------------
-@router.get("/v4/vocabulary")
-async def get_v4_vocabulary(request: Request):
-    """Return Titan's learned vocabulary from inner_memory.db."""
-    # Phase E.2.3 fix: sqlite3 in async endpoint blocks event loop
-    import asyncio
+# ---------------------------------------------------------------------------
+# /v4/vocabulary warm-cache (BUG-OBSERVATORY-API-LATENCY-AUDIT closure 2026-05-05)
+# ---------------------------------------------------------------------------
+# Pre-warmer: synchronous full-table SELECT on inner_memory.db.vocabulary in
+# the request handler routinely exceeded 8s under SQLite reader-vs-writer
+# contention with the IMW daemon's bulk inserts. This was the worst /v4/*
+# UX drag on the dashboard.
+#
+# Pattern: same as tc-status-warmer (33af5ea6/499fb10d). Daemon thread
+# refreshes the cache every 30s (vocabulary changes slowly — new words
+# enter at language-acquisition cadence ~minutes/hour); handler is an O(1)
+# cache read with bounded cold-boot fallback.
+_vocabulary_cache: dict = {"data": None, "updated_at": 0.0}
+_VOCABULARY_WARMER_INTERVAL_S = 30.0
+_vocabulary_warmer_started = {"flag": False}
+
+
+def _build_vocabulary_snapshot_sync() -> dict:
+    """Synchronous builder — full vocabulary table read with formatting.
+    Called by the warmer thread + by the cold-boot fallback path.
+    Extracted so warmer + handler share exact same shape contract.
+    """
     import sqlite3
     import json as _json
+
+    db_path = "./data/inner_memory.db"
+    conn = sqlite3.connect(db_path, timeout=5.0)
     try:
-        db_path = "./data/inner_memory.db"
+        conn.execute("PRAGMA journal_mode=WAL")
+        rows = conn.execute(
+            "SELECT word, word_type, confidence, felt_tensor, hormone_pattern, "
+            "times_encountered, times_produced, learning_phase, "
+            "COALESCE(sensory_context, '[]'), "
+            "COALESCE(meaning_contexts, '[]'), "
+            "COALESCE(cross_modal_conf, 0.0) "
+            "FROM vocabulary ORDER BY confidence DESC"
+        ).fetchall()
+    finally:
+        conn.close()
 
-        def _vocab_rows(conn):
-            conn.execute("PRAGMA journal_mode=WAL")
-            return conn.execute(
-                "SELECT word, word_type, confidence, felt_tensor, hormone_pattern, "
-                "times_encountered, times_produced, learning_phase, "
-                "COALESCE(sensory_context, '[]'), "
-                "COALESCE(meaning_contexts, '[]'), "
-                "COALESCE(cross_modal_conf, 0.0) "
-                "FROM vocabulary ORDER BY confidence DESC"
-            ).fetchall()
+    def _safe_float(v, default=0.0):
+        if isinstance(v, bytes):
+            import struct as _st
+            try: return _st.unpack('<f', v)[0]
+            except Exception: return default
+        try: return float(v) if v is not None else default
+        except Exception: return default
 
-        rows = await sqlite_async.with_connection(db_path, _vocab_rows)
-        words = []
-        grounded_count = 0
-        def _safe_float(v, default=0.0):
-            if isinstance(v, bytes):
-                import struct as _st
-                try: return _st.unpack('<f', v)[0]
-                except Exception: return default
-            try: return float(v) if v is not None else default
-            except Exception: return default
-        def _safe_json(v, default=None):
-            if default is None: default = []
-            if isinstance(v, bytes): return default
-            if not v: return default
-            try: return _json.loads(v)
-            except Exception: return default
-        for row in rows:
-            xm = _safe_float(row[10] if len(row) > 10 else 0.0)
-            if xm > 0:
-                grounded_count += 1
-            words.append({
-                "word": row[0] if not isinstance(row[0], bytes) else row[0].decode(errors="replace"),
-                "word_type": row[1] if not isinstance(row[1], bytes) else str(row[1]),
-                "confidence": _safe_float(row[2]),
-                "felt_tensor": _safe_json(row[3]),
-                "hormone_pattern": _safe_json(row[4], {}),
-                "times_encountered": int(_safe_float(row[5])),
-                "times_produced": int(_safe_float(row[6])),
-                "learning_phase": row[7] if not isinstance(row[7], bytes) else str(row[7]),
-                "sensory_context": _safe_json(row[8]),
-                "meaning_contexts": _safe_json(row[9]),
-                "cross_modal_conf": xm,
-            })
-        return _ok({
-            "words": words, "total": len(words),
-            "grounded": grounded_count,
+    def _safe_json(v, default=None):
+        if default is None: default = []
+        if isinstance(v, bytes): return default
+        if not v: return default
+        try: return _json.loads(v)
+        except Exception: return default
+
+    words = []
+    grounded_count = 0
+    for row in rows:
+        xm = _safe_float(row[10] if len(row) > 10 else 0.0)
+        if xm > 0:
+            grounded_count += 1
+        words.append({
+            "word": row[0] if not isinstance(row[0], bytes) else row[0].decode(errors="replace"),
+            "word_type": row[1] if not isinstance(row[1], bytes) else str(row[1]),
+            "confidence": _safe_float(row[2]),
+            "felt_tensor": _safe_json(row[3]),
+            "hormone_pattern": _safe_json(row[4], {}),
+            "times_encountered": int(_safe_float(row[5])),
+            "times_produced": int(_safe_float(row[6])),
+            "learning_phase": row[7] if not isinstance(row[7], bytes) else str(row[7]),
+            "sensory_context": _safe_json(row[8]),
+            "meaning_contexts": _safe_json(row[9]),
+            "cross_modal_conf": xm,
         })
+    return {"words": words, "total": len(words), "grounded": grounded_count}
+
+
+def _start_vocabulary_warmer() -> None:
+    """Start the background vocabulary cache warmer. Idempotent."""
+    if _vocabulary_warmer_started["flag"]:
+        return
+    _vocabulary_warmer_started["flag"] = True
+
+    import threading
+    import time as _time
+
+    def _warmer_loop():
+        while True:
+            try:
+                data = _build_vocabulary_snapshot_sync()
+                _vocabulary_cache["data"] = data
+                _vocabulary_cache["updated_at"] = _time.time()
+            except Exception as e:
+                logger.warning(
+                    "[VocabularyWarmer] refresh failed: %s", e)
+            _time.sleep(_VOCABULARY_WARMER_INTERVAL_S)
+
+    t = threading.Thread(
+        target=_warmer_loop, daemon=True, name="vocabulary-warmer")
+    t.start()
+    logger.info(
+        "[VocabularyWarmer] started — refresh every %.1fs",
+        _VOCABULARY_WARMER_INTERVAL_S)
+
+
+def _get_vocabulary_cached() -> dict | None:
+    """Return cached vocabulary snapshot; lazily start the warmer."""
+    _start_vocabulary_warmer()
+    return _vocabulary_cache["data"]
+
+
+@router.get("/v4/vocabulary")
+async def get_v4_vocabulary(request: Request):
+    """Return Titan's learned vocabulary from inner_memory.db.
+
+    Read order: warm in-process cache (refreshed every 30s by
+    vocabulary-warmer thread) → bounded sync fallback for cold-boot
+    window. 2026-05-05: pre-warmer SQLite read routinely exceeded 8s
+    under writer contention; warm-cache + cold-boot bound mirror the
+    tc-status-warmer pattern (33af5ea6/499fb10d).
+    """
+    cached = _get_vocabulary_cached()
+    if cached is not None:
+        return _ok(cached)
+    # Cold path — only the very first request after process boot hits
+    # this branch. Subsequent calls always hit the warm cache.
+    import asyncio
+    try:
+        data = await asyncio.wait_for(
+            asyncio.to_thread(_build_vocabulary_snapshot_sync), timeout=2.5)
+        return _ok(data)
+    except asyncio.TimeoutError:
+        return _ok({"warming": True, "words": [], "total": 0, "grounded": 0})
     except Exception as e:
         logger.error("[Dashboard] /v4/vocabulary error: %s", e)
         return _error(str(e))
@@ -3667,12 +4261,13 @@ async def post_v4_msl_reset_homeostasis(request: Request):
         spirit_proxy = titan_state.spirit
         if spirit_proxy is None:
             return _error("spirit_proxy not available")
+        # Phase C Session 4 (rFP §4.C.21): work-RPC migrated sync→async
+        # per Preamble G19. Reset is mutation work in spirit_worker.
         try:
-            reply = spirit_proxy._bus.request(
+            reply = await spirit_proxy._bus.request_async(
                 "spirit_proxy", "spirit",
                 {"action": "reset_msl_homeostasis", "reason": reason},
-                timeout=15.0,
-                reply_queue=spirit_proxy._reply_queue,
+                15.0, spirit_proxy._reply_queue,
             )
         except Exception as _rpc_err:
             return _error(f"spirit RPC failed: {_rpc_err}")
@@ -3707,11 +4302,113 @@ async def post_v4_msl_reset_homeostasis(request: Request):
 # ---------------------------------------------------------------------------
 @router.get("/v4/inner-trinity")
 async def get_v4_inner_trinity(request: Request):
-    """T3 InnerTrinityCoordinator: topology, dreaming state, nervous system signals, observables."""
+    """T3 InnerTrinityCoordinator: topology, dreaming state, nervous system signals, observables.
+
+    chunk 8M.9 (2026-05-05) — defense in depth per
+    rFP_phase_c_observatory_data_pipeline.md §3.9: enrich the cached
+    coordinator snapshot with shm direct-reads for any subfields whose
+    cached value is empty/missing. Closes acceptance gate item #5
+    (subfields populated: sphere_clocks, unified_spirit, hormonal,
+    titanvm_registers, chi).
+    """
+    import asyncio
     titan_state = _get_plugin(request)
     plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        return _ok(await _get_cached_coordinator_async(plugin))
+        snapshot = await _get_cached_coordinator_async(plugin) or {}
+        # Subfield-level enrichment — only fill from shm when the cached
+        # value is missing or empty. Snapshot-builder (chunk 8M.5) is the
+        # authoritative path under l0_rust=true; this is the api_subprocess
+        # last-mile fallback for when the snapshot publisher hasn't fired
+        # yet (cold boot / publisher backpressure).
+        def _empty(v):
+            return v is None or v == {} or v == [] or v == ""
+
+        if _empty(snapshot.get("sphere_clocks")):
+            shm = await asyncio.to_thread(titan_state.shm.read_sphere_clocks)
+            if shm is not None:
+                snapshot["sphere_clocks"] = shm
+        if _empty(snapshot.get("chi")):
+            shm = await asyncio.to_thread(titan_state.shm.read_chi)
+            if shm is not None:
+                snapshot["chi"] = shm
+        if _empty(snapshot.get("unified_spirit")) and _empty(snapshot.get("self_162d")):
+            shm = await asyncio.to_thread(titan_state.shm.read_trinity)
+            if shm is not None:
+                snapshot["unified_spirit"] = shm
+                snapshot["self_162d"] = shm
+        if _empty(snapshot.get("hormonal")):
+            shm = await asyncio.to_thread(titan_state.shm.read_hormonal)
+            if shm is not None:
+                snapshot["hormonal"] = shm
+        if _empty(snapshot.get("titanvm_registers")):
+            shm = await asyncio.to_thread(titan_state.shm.read_titanvm_registers)
+            if shm is not None:
+                snapshot["titanvm_registers"] = shm
+        if _empty(snapshot.get("neuromodulators")):
+            shm = await asyncio.to_thread(titan_state.shm.read_neuromod)
+            if shm is not None:
+                snapshot["neuromodulators"] = shm
+
+        # D4 (rFP §4.4): SPEC §10.G + G15 canonical state lives in shm
+        # slots. Always prefer shm-direct-read for the 6 trinity tensors —
+        # state_register.snapshot() is a Python L2 cache that lags behind
+        # the Rust daemon writes by up to OUTER_*_BUS_PUBLISH_INTERVAL_S.
+        # shm holds the latest tick under content-hash gating.
+        # Falls back to snapshot's existing value (or default) when shm
+        # read fails (cold boot, daemon not yet started).
+        def _shm_trinity(side: str, slice_: str, dim: int) -> list[float]:
+            method_name = f"read_{side}_{slice_}_{dim}d"
+            try:
+                reader = getattr(titan_state.shm, method_name, None)
+                if reader is None:
+                    return []
+                result = reader()
+                if result and isinstance(result.get("values"), list):
+                    return list(result["values"])
+            except Exception as _e:
+                logger.debug(
+                    "[Dashboard] shm-direct-read %s_%s_%dd failed: %s",
+                    side, slice_, dim, _e,
+                )
+            return []
+
+        # Read all 6 trinity slots in parallel via to_thread (each is a
+        # single shm slot read — bounded latency).
+        outer_body, outer_mind, outer_spirit, inner_body, inner_mind, inner_spirit = (
+            await asyncio.gather(
+                asyncio.to_thread(_shm_trinity, "outer", "body", 5),
+                asyncio.to_thread(_shm_trinity, "outer", "mind", 15),
+                asyncio.to_thread(_shm_trinity, "outer", "spirit", 45),
+                asyncio.to_thread(_shm_trinity, "inner", "body", 5),
+                asyncio.to_thread(_shm_trinity, "inner", "mind", 15),
+                asyncio.to_thread(_shm_trinity, "inner", "spirit", 45),
+            )
+        )
+
+        snap_outer = snapshot.get("outer_trinity") or {}
+        snap_trinity = snapshot.get("trinity") or {}
+
+        def _pick(shm_v: list[float], fallback: list, default_dim: int) -> list[float]:
+            """shm > cached fallback > default 0.5*dim."""
+            if shm_v:
+                return shm_v
+            if fallback:
+                return list(fallback)
+            return [0.5] * default_dim
+
+        snapshot["outer_trinity"] = {
+            "body": _pick(outer_body, snap_outer.get("body", []), 5),
+            "mind": _pick(outer_mind, snap_outer.get("mind", []), 15),
+            "spirit": _pick(outer_spirit, snap_outer.get("spirit", []), 45),
+        }
+        snapshot["trinity"] = {
+            "body": _pick(inner_body, snap_trinity.get("body", []), 5),
+            "mind": _pick(inner_mind, snap_trinity.get("mind", []), 15),
+            "spirit": _pick(inner_spirit, snap_trinity.get("spirit", []), 45),
+        }
+
+        return _ok(snapshot)
     except Exception as e:
         logger.error("[Dashboard] /v4/inner-trinity error: %s", e)
         return _error(str(e))
@@ -4034,25 +4731,105 @@ async def get_dream_inbox(request: Request):
 # ---------------------------------------------------------------------------
 # GET /v4/history — V4 Time Awareness Historical Data
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# /v4/history warm-cache (BUG-OBSERVATORY-API-LATENCY-AUDIT closure 2026-05-05)
+# ---------------------------------------------------------------------------
+# get_v4_history reads observatory.db (a 1.88 GB DB under writer contention
+# from observatory_writer subprocess). Pre-warmer typical 1.4-3s, p99 hit
+# 4.28s. Frontend's most common pattern is hours=24 with both scalars_only
+# variants — cache both. Non-default hours fall through to bounded sync
+# fetch (rare path).
+_v4_history_cache: dict = {
+    "default_full": {"data": None, "updated_at": 0.0},   # hours=24, scalars_only=False
+    "default_scalars": {"data": None, "updated_at": 0.0},  # hours=24, scalars_only=True
+}
+_V4_HISTORY_WARMER_INTERVAL_S = 60.0  # 24h history changes slowly
+_v4_history_warmer_started = {"flag": False}
+
+
+def _build_v4_history_snapshot_sync(hours: int = 24, scalars_only: bool = False) -> dict:
+    """Synchronous builder — observatory_db.get_v4_history wrapper."""
+    obs_db = _get_observatory_db()
+    if not obs_db:
+        return {"error": "ObservatoryDB not available", "snapshots": [], "count": 0}
+    snapshots = obs_db.get_v4_history(hours=hours, scalars_only=scalars_only)
+    return {"snapshots": snapshots, "count": len(snapshots)}
+
+
+def _start_v4_history_warmer() -> None:
+    """Start the background v4_history warmer. Idempotent.
+
+    Refreshes both common variants (default_full + default_scalars) so the
+    frontend's two main hits are always warm. Other (hours, scalars_only)
+    combos use the cold-boot fallback path.
+    """
+    if _v4_history_warmer_started["flag"]:
+        return
+    _v4_history_warmer_started["flag"] = True
+
+    import threading
+    import time as _time
+
+    def _warmer_loop():
+        while True:
+            for variant_key, scalars_only in (
+                ("default_full", False), ("default_scalars", True)):
+                try:
+                    data = _build_v4_history_snapshot_sync(hours=24, scalars_only=scalars_only)
+                    _v4_history_cache[variant_key]["data"] = data
+                    _v4_history_cache[variant_key]["updated_at"] = _time.time()
+                except Exception as e:
+                    logger.warning(
+                        "[V4HistoryWarmer] %s refresh failed: %s",
+                        variant_key, e)
+            _time.sleep(_V4_HISTORY_WARMER_INTERVAL_S)
+
+    t = threading.Thread(
+        target=_warmer_loop, daemon=True, name="v4-history-warmer")
+    t.start()
+    logger.info(
+        "[V4HistoryWarmer] started — refresh every %.1fs (default 24h, both scalars variants)",
+        _V4_HISTORY_WARMER_INTERVAL_S)
+
+
+def _get_v4_history_cached(hours: int, scalars_only: bool) -> dict | None:
+    """Return cached v4_history snapshot for default 24h variants.
+    Returns None for non-default `hours` (forces fallback path)."""
+    _start_v4_history_warmer()
+    if hours != 24:
+        return None
+    variant_key = "default_scalars" if scalars_only else "default_full"
+    return _v4_history_cache[variant_key]["data"]
+
+
 @router.get("/v4/history")
 async def get_v4_history(
     request: Request,
     hours: int = 24,
     scalars_only: bool = False,
 ):
-    """
-    V4 Time Awareness time-series from ObservatoryDB.
-    Use scalars_only=true for lightweight graph data (spirit velocity, pulse counts, loss).
-    """
-    titan_state = _get_plugin(request)
-    plugin = titan_state  # backward-compat alias for Category C callsites
-    try:
-        obs_db = getattr(plugin, "_observatory_db", None) or _get_observatory_db()
-        if not obs_db:
-            return _ok({"error": "ObservatoryDB not available", "snapshots": []})
+    """V4 Time Awareness time-series from ObservatoryDB.
 
-        snapshots = obs_db.get_v4_history(hours=hours, scalars_only=scalars_only)
-        return _ok({"snapshots": snapshots, "count": len(snapshots)})
+    Read order: warm in-process cache for the two default-24h variants
+    (refreshed every 60s by v4-history-warmer thread) → bounded sync
+    fallback for cold-boot window or non-default `hours` query.
+
+    Use scalars_only=true for lightweight graph data (spirit velocity,
+    pulse counts, loss).
+    """
+    cached = _get_v4_history_cached(hours, scalars_only)
+    if cached is not None:
+        return _ok(cached)
+    # Cold path: cold-boot OR non-default hours param.
+    import asyncio
+    try:
+        data = await asyncio.wait_for(
+            asyncio.to_thread(
+                _build_v4_history_snapshot_sync, hours, scalars_only),
+            timeout=2.5)
+        return _ok(data)
+    except asyncio.TimeoutError:
+        return _ok({"warming": True, "snapshots": [], "count": 0})
     except Exception as e:
         logger.error("[Dashboard] /v4/history error: %s", e)
         return _error(str(e))
@@ -4199,19 +4976,31 @@ async def get_v4_pi_heartbeat(request: Request):
 async def get_v4_chi(request: Request):
     """Chi Life Force: 3×3 Trinity-mapped vitality metric with circulation and contemplation.
 
-    Read order: chi.state (live, populated by spirit_worker CHI_UPDATED publish)
-    → coordinator.chi (bootstrap placeholder, kernel snapshot default).
+    Read order: chi.state cache (live, populated by spirit_worker / cognitive_worker
+    CHI_UPDATED publish) → coordinator.chi (bootstrap placeholder, kernel
+    snapshot default) → shm direct-read of chi_state.bin (chunk 8M.9
+    defense-in-depth, rFP §3.9).
     """
+    import asyncio
     titan_state = _get_plugin(request)
     plugin = titan_state  # backward-compat alias for Category C callsites
     try:
-        # Live chi from spirit_worker → BusSubscriber → cache.
+        # Live chi from spirit_worker / cognitive_worker → BusSubscriber → cache.
         chi = titan_state.cache.get("chi.state", None)
         if not chi:
             # Bootstrap placeholder (kernel snapshot, full-shape per
             # life_force.py L369-373). Avoids NaN% on cold boot.
             coordinator = await _get_cached_coordinator_async(plugin)
             chi = coordinator.get("chi", {})
+        # chunk 8M.9 — shm direct-read fallback. Under l0_rust_enabled=true
+        # neither spirit_worker nor cognitive_worker may have published
+        # chi.state yet (Rust kernel-rs writes chi_state.bin authoritatively
+        # via SeqLock). Read directly from shm for endpoint resilience.
+        if not chi:
+            shm_snap = await asyncio.to_thread(titan_state.shm.read_chi)
+            if shm_snap is not None:
+                shm_snap.setdefault("source", "shm")
+                return _ok(shm_snap)
         if not chi:
             return _ok({"status": "Chi not yet evaluated — waiting for first 132D epoch"})
         return _ok(chi)
@@ -4402,12 +5191,14 @@ async def get_v4_backup_wallet_runway(request: Request):
         if not kp or not _os.path.exists(kp):
             return _ok({"available": False, "reason": "no_keypair"})
         try:
-            npm_root = _sp.check_output(
-                ["npm", "root", "-g"], timeout=10).decode().strip()
+            npm_root_raw = await asyncio.to_thread(
+                _sp.check_output, ["npm", "root", "-g"], timeout=10)
+            npm_root = npm_root_raw.decode().strip()
         except Exception:
             npm_root = "/usr/lib/node_modules"
         try:
-            out = _sp.check_output(
+            out = await asyncio.to_thread(
+                _sp.check_output,
                 ["node", "scripts/irys_upload.js", "balance", kp,
                  "https://api.mainnet-beta.solana.com"],
                 env={**_os.environ, "NODE_PATH": npm_root},
@@ -8467,11 +9258,11 @@ async def post_v4_social_relief(request: Request):
         spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _error("spirit proxy not available")
-        result = spirit_proxy._bus.request(
+        # Phase C Session 4 (rFP §4.C.21): work-RPC sync→async per G19.
+        result = await spirit_proxy._bus.request_async(
             "spirit_proxy", "spirit",
             {"action": "social_relief", "payload": {"relief": relief}},
-            timeout=5.0,
-            reply_queue=spirit_proxy._reply_queue,
+            5.0, spirit_proxy._reply_queue,
         )
         payload = result.get("payload", {}) if result else {}
         return _ok({"relief_applied": relief, "result": payload})
@@ -8508,12 +9299,12 @@ async def post_v4_signal_concept(request: Request):
         spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _error("spirit proxy not available")
-        result = spirit_proxy._bus.request(
+        # Phase C Session 4 (rFP §4.C.21): work-RPC sync→async per G19.
+        result = await spirit_proxy._bus.request_async(
             "spirit_proxy", "spirit",
             {"action": "signal_concept", "payload": {
                 "concept": concept, "quality": quality, "extra": extra}},
-            timeout=5.0,
-            reply_queue=spirit_proxy._reply_queue,
+            5.0, spirit_proxy._reply_queue,
         )
         if result:
             payload = result.get("payload", {})
@@ -8546,12 +9337,12 @@ async def post_v4_signal_co_occurrence(request: Request):
         spirit_proxy = titan_state.spirit
         if not spirit_proxy:
             return _error("spirit proxy not available")
-        result = spirit_proxy._bus.request(
+        # Phase C Session 4 (rFP §4.C.21): work-RPC sync→async per G19.
+        result = await spirit_proxy._bus.request_async(
             "spirit_proxy", "spirit",
             {"action": "signal_co_occurrence", "payload": {
                 "concepts": concepts}},
-            timeout=5.0,
-            reply_queue=spirit_proxy._reply_queue,
+            5.0, spirit_proxy._reply_queue,
         )
         if result:
             return _ok(result.get("payload", {}))
@@ -9249,16 +10040,82 @@ async def get_v4_timechain_blocks(request: Request, fork: int = 0,
         return _error(str(e))
 
 
+# ---------------------------------------------------------------------------
+# /v4/timechain/verify warm-cache (closes BUG-TIMECHAIN-VERIFY-INLINE-COMPUTE-20260505)
+# ---------------------------------------------------------------------------
+# tc.verify_all walks entire hash chain across 6+ forks (tens of thousands
+# of blocks). Synchronous fetch consistently exceeded the 3s nginx budget
+# → endpoint returned `request_timeout` even though chain itself is healthy.
+# Same fix template as /v4/timechain/status: separate warmer thread (verify
+# is more expensive than status, so longer interval — 60s) + bounded
+# cold-boot fallback.
+_tc_verify_cache: dict = {"data": None, "updated_at": 0.0}
+_TC_VERIFY_WARMER_INTERVAL_S = 60.0
+_tc_verify_warmer_started = {"flag": False}
+
+
+def _build_tc_verify_snapshot_sync() -> dict:
+    """Synchronous builder — chain integrity verification."""
+    tc = _get_cached_tc()
+    valid, results = tc.verify_all()
+    return {"valid": valid, "results": results}
+
+
+def _start_tc_verify_warmer() -> None:
+    """Start the background tc-verify warmer. Idempotent."""
+    if _tc_verify_warmer_started["flag"]:
+        return
+    _tc_verify_warmer_started["flag"] = True
+
+    import threading
+    import time as _time
+
+    def _warmer_loop():
+        while True:
+            try:
+                data = _build_tc_verify_snapshot_sync()
+                _tc_verify_cache["data"] = data
+                _tc_verify_cache["updated_at"] = _time.time()
+            except Exception as e:
+                logger.warning(
+                    "[TCVerifyWarmer] refresh failed: %s", e)
+            _time.sleep(_TC_VERIFY_WARMER_INTERVAL_S)
+
+    t = threading.Thread(
+        target=_warmer_loop, daemon=True, name="tc-verify-warmer")
+    t.start()
+    logger.info(
+        "[TCVerifyWarmer] started — refresh every %.1fs",
+        _TC_VERIFY_WARMER_INTERVAL_S)
+
+
+def _get_tc_verify_cached() -> dict | None:
+    """Return cached chain verification; lazily start the warmer."""
+    _start_tc_verify_warmer()
+    return _tc_verify_cache["data"]
+
+
 # GET /v4/timechain/verify — Chain integrity check
 @router.get("/v4/timechain/verify")
 async def get_v4_timechain_verify(request: Request):
-    """Verify hash chain integrity across all forks."""
+    """Verify hash chain integrity across all forks.
+
+    Read order: warm in-process cache (refreshed every 60s by the
+    tc-verify-warmer thread) → bounded sync fallback for cold-boot
+    window. Closes BUG-TIMECHAIN-VERIFY-INLINE-COMPUTE-20260505 by
+    moving heavy verify_all walk out of the request path.
+    """
+    cached = _get_tc_verify_cached()
+    if cached is not None:
+        return _ok(cached)
+    # Cold path — first request after boot only.
     import asyncio
     try:
-        tc = _get_cached_tc()
-        # Phase E.2 perf: verify_all walks entire chain — wrap to_thread.
-        valid, results = await asyncio.to_thread(tc.verify_all)
-        return _ok({"valid": valid, "results": results})
+        data = await asyncio.wait_for(
+            asyncio.to_thread(_build_tc_verify_snapshot_sync), timeout=2.5)
+        return _ok(data)
+    except asyncio.TimeoutError:
+        return _ok({"warming": True, "valid": None, "results": {}})
     except Exception as e:
         logger.error("[Dashboard] /v4/timechain/verify error: %s", e)
         return _error(str(e))

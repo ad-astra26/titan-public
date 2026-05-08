@@ -2829,6 +2829,15 @@ layer_tagging_enabled = true
 shm_trinity_enabled     = true
 shm_neuromod_enabled    = true
 shm_epoch_enabled       = true
+# chunk 8M.1 (2026-05-05): ns_worker / hormonal_worker check distinct flags;
+# add them here so the writers actually fire when the workers boot under the
+# l0_rust_enabled cognitive cluster. shm_ns_enabled controls the
+# titanvm_registers writer (ns_worker.py:200, ns_worker.py:237);
+# shm_hormonal_enabled controls the hormonal_state writer (hormonal_worker.py:220).
+# Both slots are part of the 16-slot RegistrySpec catalog (state_registry.py)
+# and are required-fresh by chunk 8M acceptance gate item #1.
+shm_ns_enabled          = true
+shm_hormonal_enabled    = true
 
 # S4 registries — SHIPPED 2026-04-25 (merge 4361454d, 14 commits, 46 tests).
 # Wiring complete: RegistrySpec defs at state_registry.py:704-790, writer

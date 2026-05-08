@@ -207,6 +207,21 @@ MODULE_SHUTDOWN = "MODULE_SHUTDOWN"
 MODULE_CRASHED = "MODULE_CRASHED"
 EPOCH_TICK = "EPOCH_TICK"
 
+# Phase C C-S7 (2026-05-05) — supervision messages per SPEC §8.1 +
+# §11.B + §11.G.6. Emitted by guardian_HCL when Python L2/L3 modules
+# crash, restart, escalate, or hit dependency-blocked respawn states.
+# Cross-language unified with Rust supervisors (titan-kernel-rs's
+# KernelChildSupervisor + titan-trinity-rs's UnifiedSpiritSupervisor +
+# titan-unified-spirit-rs's DaemonSupervisor) — same wire format,
+# same JSONL log destination (`data/supervision.jsonl`).
+SUPERVISION_CHILD_DOWN = "SUPERVISION_CHILD_DOWN"
+SUPERVISION_CHILD_RESTARTED = "SUPERVISION_CHILD_RESTARTED"
+SUPERVISION_ESCALATION = "SUPERVISION_ESCALATION"
+SUPERVISION_ESCALATION_RESPONSE = "SUPERVISION_ESCALATION_RESPONSE"
+SUPERVISION_DEPENDENCY_BLOCKED = "SUPERVISION_DEPENDENCY_BLOCKED"
+SUPERVISION_DEPENDENCY_RECOVERED = "SUPERVISION_DEPENDENCY_RECOVERED"
+SUPERVISION_DEPENDENCY_DEGRADED = "SUPERVISION_DEPENDENCY_DEGRADED"
+
 # Microkernel v2 Phase B.2 §D9 (2026-05-02) — broker peer-process death
 # signal. Published by BusSocketServer when its smart-liveness algorithm
 # (Tier 1-4) detects that a subscriber's peer PID is dead via os.kill(pid, 0).
@@ -452,6 +467,7 @@ SOCIAL_STATS_UPDATED = "SOCIAL_STATS_UPDATED"                  # persona → all
 LANGUAGE_STATS_UPDATED = "LANGUAGE_STATS_UPDATED"              # language teacher → all (language.stats)
 META_TEACHER_STATS_UPDATED = "META_TEACHER_STATS_UPDATED"      # meta-teacher → all (meta_teacher.stats)
 CGN_STATS_UPDATED = "CGN_STATS_UPDATED"                        # cgn → all (cgn.stats)
+SOCIAL_PERCEPTION_STATS_UPDATED = "SOCIAL_PERCEPTION_STATS_UPDATED"  # spirit → all (social_perception.stats) — replaces sync bus.request lookup (G19, 2026-05-07)
 
 # M8: External Intent (wallet observer → spirit → neuromod boost)
 # RESERVED: EXTERNAL_INTENT — WalletObserver helper class exists but
@@ -637,6 +653,14 @@ class DivineBus:
         # (in-process kernel components) still get the message via ThreadQueue
         # in the legacy code path. None = legacy mode (no socket bus).
         self._broker = None
+        # Microkernel v2 Phase C C-S7 — optional outbound BusSocketClient.
+        # Set via attach_client() when microkernel.l0_rust_enabled=true: the
+        # Rust kernel-rs binary owns the broker socket, so the Python plugin
+        # connects as a client instead of running its own broker. publish()
+        # routes to the client (and Rust broker fans out to remote workers)
+        # whenever _broker is None and _client is not None. Mutually exclusive
+        # with _broker — only one path is active per kernel.
+        self._client = None
         # module_name → list[Queue]  (a module may have multiple subscribers)
         self._subscribers: dict[str, list[AnyQueue]] = {}
         # All registered module names (for broadcast)
@@ -882,12 +906,24 @@ class DivineBus:
         # broker handles its own subscriber list (workers in separate
         # processes) without us tracking them here. Failures are logged but
         # do not affect the in-process delivery count.
+        #
+        # Phase C C-S7: under l0_rust_enabled=true the broker is owned by
+        # titan-kernel-rs and we have a client attached instead. Both modes
+        # are mutually exclusive — only one of (_broker, _client) is set.
         broker = self._broker
         if broker is not None:
             try:
                 broker.publish(msg)
             except Exception:  # noqa: BLE001
                 logger.exception("[DivineBus] broker.publish raised; in-process delivery unaffected")
+        else:
+            client = self._client
+            if client is not None:
+                try:
+                    client.publish(msg)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "[DivineBus] client.publish raised; in-process delivery unaffected")
 
         self._stats["routed"] += delivered
         return delivered
@@ -969,6 +1005,36 @@ class DivineBus:
         """True if a Unix-socket broker is attached (Phase B.2 mode)."""
         return self._broker is not None
 
+    # ── Microkernel v2 Phase C C-S7 — outbound client attach/detach ─────
+
+    def attach_client(self, client) -> None:
+        """Attach an outbound BusSocketClient (Phase C C-S7 / l0_rust mode).
+
+        Used when microkernel.l0_rust_enabled=true: titan-kernel-rs owns
+        the broker socket; the Python plugin connects as a client instead
+        of starting its own broker. publish() will route via the client
+        when _broker is None.
+
+        Mutually exclusive with attach_broker — only one of the two paths
+        is active per kernel. Idempotent (re-attach replaces).
+        """
+        self._client = client
+        logger.info(
+            "[DivineBus] outbound bus client attached (name=%s, sock=%s)",
+            getattr(client, "name", "?"),
+            getattr(client, "sock_path", "?"))
+
+    def detach_client(self) -> None:
+        """Detach the outbound client (kernel shutdown). Idempotent."""
+        if self._client is not None:
+            logger.info("[DivineBus] outbound bus client detached")
+            self._client = None
+
+    @property
+    def has_socket_client(self) -> bool:
+        """True if an outbound client is attached (Phase C C-S7 mode)."""
+        return self._client is not None
+
     def _try_put(self, q: AnyQueue, msg: dict, subscriber: str = "?") -> bool:
         """Non-blocking put. Returns True on success, False if queue full."""
         try:
@@ -1005,15 +1071,59 @@ class DivineBus:
             snapshot = {k: list(v) for k, v in self._subscribers.items()}
         _census.sample_queue_depths(snapshot)
 
+    # Phase C Session 5 (rFP §4.D.7) — DivineBus.request() is DEPRECATED.
+    # State lookup MUST go via SHM (Preamble G18). Work-RPC MUST go via
+    # bus.request_async with explicit timeout (Preamble G19). The list of
+    # legitimate sync bus.request call sites is enumerated in
+    # titan-docs/phase_c_rpc_exemptions.yaml — every call site there has
+    # documented rationale + bounded timeout. NEW use of bus.request()
+    # is a SPEC violation (G22 — no new sync-RPC patterns post-Phase-C).
+    #
+    # Implementation: emit a one-shot DeprecationWarning per (file, line)
+    # call site so existing exempted sites can keep working without log
+    # flood, while NEW calls get an immediate, visible warning.
+    _DEPRECATION_WARNED: "set[tuple[str, int]]" = set()
+
     def request(
         self, src: str, dst: str, payload: dict, timeout: float = 10.0, reply_queue: Optional[AnyQueue] = None
     ) -> Optional[dict]:
         """
         Synchronous request/response over the bus.
 
+        **DEPRECATED (Phase C Session 5, rFP §4.D.7).** Use SHM-direct
+        read via StateRegistryReader for state lookup (Preamble G18) or
+        bus.request_async with explicit timeout for work-RPC
+        (Preamble G19). New use is a SPEC violation per G22.
+        Existing legitimate call sites are enumerated in
+        titan-docs/phase_c_rpc_exemptions.yaml.
+
         Publishes a QUERY, waits for a matching RESPONSE on the reply_queue.
         Caller must provide their own reply_queue (from subscribe()).
         """
+        # One-shot deprecation warning per call site (file, line).
+        try:
+            import inspect
+            import warnings as _warnings
+            frame = inspect.currentframe()
+            if frame is not None and frame.f_back is not None:
+                caller = frame.f_back
+                site = (caller.f_code.co_filename, caller.f_lineno)
+                if site not in DivineBus._DEPRECATION_WARNED:
+                    DivineBus._DEPRECATION_WARNED.add(site)
+                    _warnings.warn(
+                        f"DivineBus.request() is deprecated (Phase C Session 5 "
+                        f"rFP §4.D.7). Caller: {site[0]}:{site[1]}. Use SHM "
+                        f"via StateRegistryReader for state lookup (G18) or "
+                        f"bus.request_async with explicit timeout for "
+                        f"work-RPC (G19). See "
+                        f"titan-docs/phase_c_rpc_exemptions.yaml for the "
+                        f"allowlist of legitimate sync sites.",
+                        DeprecationWarning, stacklevel=2,
+                    )
+        except Exception:
+            # Never let deprecation telemetry break the call path itself.
+            pass
+
         msg = make_request(src, dst, payload)
         rid = msg["rid"]
         if reply_queue is None:

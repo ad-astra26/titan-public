@@ -19,11 +19,18 @@ T2_HOST="root@10.135.0.6"
 T3_DIR="/home/antigravity/projects/titan3"
 T1_DIR="/home/antigravity/projects/titan"
 
-# ── Phase C C-S2 (PLAN §15.2): --include-rust-binaries flag ─────────
-# When set, scp titan-rust musl static binaries (titan-kernel-rs +
-# titan-trinity-rs-placeholder) to T3's bin/ directory after the git
-# pull, with SHA verification. Filter out the flag so positional
-# commands ($1) like --restart still work for the rest of the script.
+# ── Phase C C-S7 (2026-05-05): --include-rust-binaries flag ─────────
+# When set, scp ALL 9 titan-rust musl static binaries to T3's bin/
+# directory after the git pull, with per-binary SHA verification.
+#
+# Pre-2026-05-05: only shipped 2 binaries (kernel-rs +
+# trinity-rs-placeholder) per the C-S2 era when the daemon binaries
+# didn't exist yet. C-S5 + C-S6 + Phase C activation surfaced that
+# unified-spirit + 6 trinity daemons (inner/outer × body/mind/spirit)
+# also need to reach T3. Now ships the full fleet.
+#
+# Filter out the flag so positional commands ($1) like --restart still
+# work for the rest of the script.
 INCLUDE_RUST=0
 FILTERED_ARGS=()
 for arg in "$@"; do
@@ -34,23 +41,50 @@ for arg in "$@"; do
 done
 set -- "${FILTERED_ARGS[@]}"
 
+# Phase C C-S7 fleet — 9 binaries shipped to each Titan's bin/.
+# Per SPEC §9.A naming. titan-trinity-rs replaces the C-S2-era
+# titan-trinity-rs-placeholder (real substrate ships in C-S3+).
+TITAN_RUST_FLEET=(
+    titan-kernel-rs
+    titan-trinity-rs
+    titan-unified-spirit-rs
+    titan-inner-body-rs
+    titan-inner-mind-rs
+    titan-inner-spirit-rs
+    titan-outer-body-rs
+    titan-outer-mind-rs
+    titan-outer-spirit-rs
+)
+
 deploy_rust_binaries_t3() {
     local bins_local
     bins_local="$(dirname "$0")/../titan-rust/target/x86_64-unknown-linux-musl/release"
 
-    if [ ! -x "${bins_local}/titan-kernel-rs" ] || [ ! -x "${bins_local}/titan-trinity-rs-placeholder" ]; then
-        echo "  [T3] building Rust binaries (musl static)..."
+    # Verify every binary present locally. If any missing, build the
+    # whole workspace (cheap incremental — cached crates are skipped).
+    local missing=0
+    for bin_name in "${TITAN_RUST_FLEET[@]}"; do
+        if [ ! -x "${bins_local}/${bin_name}" ]; then
+            missing=1
+            break
+        fi
+    done
+    if [ "${missing}" = "1" ]; then
+        echo "  [T3] building Rust binaries (musl static, full workspace)..."
         bash "$(dirname "$0")/build_titan_rust.sh" musl
     fi
 
-    echo "  [T3] copying Rust binaries to ${T2_HOST}:${T3_DIR}/bin/"
+    echo "  [T3] copying ${#TITAN_RUST_FLEET[@]} Rust binaries to ${T2_HOST}:${T3_DIR}/bin/"
     ssh "${T2_HOST}" "mkdir -p \"${T3_DIR}/bin\""
-    scp -q \
-        "${bins_local}/titan-kernel-rs" \
-        "${bins_local}/titan-trinity-rs-placeholder" \
-        "${T2_HOST}:${T3_DIR}/bin/"
+    # Single scp invocation for all binaries (one TCP setup, faster).
+    local scp_args=()
+    for bin_name in "${TITAN_RUST_FLEET[@]}"; do
+        scp_args+=("${bins_local}/${bin_name}")
+    done
+    scp -q "${scp_args[@]}" "${T2_HOST}:${T3_DIR}/bin/"
 
-    for bin_name in titan-kernel-rs titan-trinity-rs-placeholder; do
+    # Per-binary SHA verify — bail loud on any mismatch.
+    for bin_name in "${TITAN_RUST_FLEET[@]}"; do
         local local_sha remote_sha
         local_sha=$(sha256sum "${bins_local}/${bin_name}" | awk '{print $1}')
         remote_sha=$(ssh "${T2_HOST}" "sha256sum \"${T3_DIR}/bin/${bin_name}\"" 2>/dev/null | awk '{print $1}')
@@ -60,6 +94,12 @@ deploy_rust_binaries_t3() {
         fi
         echo "  ✓ T3: ${bin_name} sha256=${local_sha:0:12}…"
     done
+
+    # Permissions: bin owned by antigravity:antigravity (matches T1 convention).
+    # Under l0_rust=true T3 systemd unit currently runs as User=root per Gap F
+    # operational fix (PLAN §2B); root can read regardless. Future Phase D
+    # cleanup standardizes on User=antigravity fleet-wide.
+    ssh "${T2_HOST}" "chown antigravity:antigravity \"${T3_DIR}/bin/\"titan-*-rs 2>/dev/null || true"
 }
 
 # ── Helper: T3 git-based code update with config.toml safety dance ──
@@ -137,6 +177,24 @@ REMOTE_SCRIPT
     echo "✓ T3 code updated"
 }
 
+# ── Phase C T3 detection (2026-05-06) ──
+# When titan-t3.service is installed AND kernel-rs binary is present,
+# T3 runs under systemd-managed kernel-rs (NOT legacy `python titan_main`).
+# In that mode, `t3_manage.sh start/restart` is harmful — it would launch
+# a SECOND, non-supervised legacy Python that holds data/titan_main.pid,
+# causing the kernel-rs-spawned titan_main to abort with "Another
+# titan_main is already running". Use `systemctl restart titan-t3` instead;
+# the unit's ExecStopPost+ExecStartPre cleanup hooks handle pid/shm/socket
+# hygiene. See feedback_phase_c_crash_diagnosis_chain.md for the failure
+# mode this guards against.
+is_t3_phase_c() {
+    ssh "${T2_HOST}" '
+        systemctl list-unit-files titan-t3.service 2>/dev/null | \
+            grep -q "titan-t3.service" && \
+        [ -x /home/antigravity/projects/titan3/bin/titan-kernel-rs ]
+    ' >/dev/null 2>&1
+}
+
 # ── --restart: T3-only update + restart ──
 if [[ "$1" == "--restart" ]]; then
     deploy_t3_update
@@ -146,8 +204,16 @@ if [[ "$1" == "--restart" ]]; then
         deploy_rust_binaries_t3
     fi
     echo ""
-    echo "=== Restarting T3 ==="
-    ssh "${T2_HOST}" "bash ${T3_DIR}/scripts/t3_manage.sh restart"
+    if is_t3_phase_c; then
+        echo "=== Restarting T3 (Phase C — systemctl + kernel-rs) ==="
+        # `systemctl restart` runs ExecStop → ExecStopPost (cleanup) →
+        # ExecStartPre (cleanup again, defensive) → ExecStart (kernel-rs).
+        # No legacy Python involvement; kernel-rs spawns titan_main itself.
+        ssh "${T2_HOST}" 'systemctl restart titan-t3.service && sleep 8 && systemctl is-active titan-t3.service'
+    else
+        echo "=== Restarting T3 (legacy — t3_manage.sh) ==="
+        ssh "${T2_HOST}" "bash ${T3_DIR}/scripts/t3_manage.sh restart"
+    fi
     exit 0
 fi
 

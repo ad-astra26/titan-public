@@ -16,15 +16,20 @@
 #      if no titan_plugin/*.py files staged. ~5s wall when active.
 #      Reason: a single eager torch import in a hot-path file costs
 #      ~860MB × 9 workers ≈ 2.3GB at boot (per commit 7f01125 history).
-#   5. arch_map phase-c verify --strict — blocks SPEC drift per
-#      titan-docs/SPEC_titan_architecture.md §20 + Rule 2 of
-#      feedback_phase_c_spec_enforcement.md. Runs when SPEC TOML, generated
-#      constants files, generator script, arch_map.py, or any titan_plugin/
-#      / titan-rust/ source is staged. Catches:
+#   5. arch_map phase-c verify --strict — blocks SPEC drift + G-RPC
+#      violations per titan-docs/SPEC_titan_architecture.md §20 + Rule
+#      2 of feedback_phase_c_spec_enforcement.md. Runs when SPEC TOML,
+#      generated constants files, generator script, arch_map.py, or any
+#      titan_plugin/ / titan-rust/ source is staged. Catches:
 #        • Hand-edits to _phase_c_constants.py / constants.rs (regen drift)
 #        • TOML constant added without regen
 #        • Domain used by constant but missing from [domains.X] block
 #        • Missing G1-G16 ground truth entry
+#        • G-RPC-1 sync bus.request outside phase_c_rpc_exemptions.yaml
+#        • G-RPC-2 bus.request* without explicit timeout kwarg
+#        • G-RPC-3 proxy `def get_*` not reading SHM (Preamble G18)
+#        • G-RPC-4 orphan `if action == "get_*"` handler (caller graph)
+#      G-RPC-1..4 added 2026-05-07 by Phase C Session 5 rFP §4.E.
 #   6. cargo fmt --check + cargo clippy -D warnings on titan-rust/ —
 #      blocks Rust formatting drift + clippy warnings per Phase C C-S8
 #      PLAN §15.4. Skipped if no titan-rust/ files staged.

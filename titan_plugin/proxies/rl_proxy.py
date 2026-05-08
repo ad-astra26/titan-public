@@ -26,10 +26,19 @@ This proxy alone saves ~2GB RSS by keeping TorchRL mmap out of Core.
 """
 import asyncio
 import logging
+from pathlib import Path
 from typing import Optional
 
+import msgpack
+
 from ..bus import DivineBus
+from ..core.state_registry import (
+    StateRegistryReader,
+    ensure_shm_root,
+    resolve_titan_id,
+)
 from ..guardian import Guardian
+from ..logic.session3_state_specs import RL_STATE_SPEC
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +96,14 @@ class RLProxy:
         # Replaces parent's SageRecorder for the gatekeeper-routing path
         # (decide_execution_mode is bus-routed; only encoding stays parent-local).
         self._encoder = None
+
+        # Phase C Session 4 (rFP §4.C.4) — SHM-direct reader for
+        # rl_state.bin (Session 3 publisher). Replaces refresh_stats()
+        # sync bus.request path with SHM read (Preamble G18).
+        self._titan_id = resolve_titan_id()
+        self._shm_root: Path = ensure_shm_root(self._titan_id)
+        self._r_rl_state = StateRegistryReader(RL_STATE_SPEC, self._shm_root)
+        self._fallback_counts: dict[str, int] = {}
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
@@ -228,19 +245,37 @@ class RLProxy:
         return dict(self._stats_cache)
 
     def refresh_stats(self) -> dict:
-        """Force-fetch fresh stats via synchronous bus.request. NOT for
-        hot-path use — diagnostics / explicit refresh only."""
-        self._ensure_started()
-        reply = self._bus.request(
-            "rl_proxy", "rl",
-            {"action": "stats"},
-            timeout=self._STATS_TIMEOUT_S,
-            reply_queue=self._reply_queue,
-        )
-        if reply:
-            body = reply.get("payload", {}) or {}
-            self._stats_cache.update(body)
+        """Force-fetch fresh stats via SHM read of rl_state.bin (Session 3
+        publisher). Preamble G18 — state transport is SHM, never bus.
+
+        NOT for hot-path use — diagnostics / explicit refresh only.
+        Replaces the prior sync bus.request("stats") path."""
+        try:
+            raw = self._r_rl_state.read_variable()
+        except Exception as e:
+            self._track_fallback("rl_state",
+                                 f"read_raised:{type(e).__name__}")
+            raw = None
+        if raw is None:
+            self._track_fallback("rl_state", "shm_unavailable")
+            return dict(self._stats_cache)
+        try:
+            decoded = msgpack.unpackb(raw, raw=False)
+        except Exception as e:
+            self._track_fallback("rl_state",
+                                 f"decode_raised:{type(e).__name__}")
+            return dict(self._stats_cache)
+        if isinstance(decoded, dict):
+            self._stats_cache.update(decoded)
         return dict(self._stats_cache)
+
+    def _track_fallback(self, slot_name: str, reason: str) -> None:
+        prev = self._fallback_counts.get(slot_name, 0)
+        self._fallback_counts[slot_name] = prev + 1
+        if prev == 0:
+            logger.info(
+                "[RLProxy] FIRST FALLBACK slot=%s reason=%s",
+                slot_name, reason)
 
     # ── Layer-2 record_transition (back-compat dict path) ─────────
 

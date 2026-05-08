@@ -417,6 +417,7 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     }
     _last_heartbeat = time.time()
     _heartbeat_interval = 5.0
+    _last_cgn_stats_pub = 0.0  # rFP §12 / SPEC §23.1 — periodic publisher
     _online_consolidation_counter = 0
     _online_consolidation_threshold = config.get(
         "online_consolidation_every", 50)
@@ -516,6 +517,28 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         if now - _last_heartbeat > _heartbeat_interval:
             _send_heartbeat(send_queue, name)
             _last_heartbeat = now
+
+        # ── CGN_STATS_UPDATED periodic publish (every 30s) ────────────
+        # rFP_trinity_130d_awakening §12 / SPEC §23.1 #7 — outer_mind +
+        # outer_spirit dim formulas read cgn_stats from this broadcast
+        # via plugin._stats_cache. Cadence 30s matches other periodic
+        # stats publishers (LANGUAGE_STATS_UPDATED, OUTPUT_VERIFIER_STATS).
+        if now - _last_cgn_stats_pub >= 30.0:
+            try:
+                _cs = cgn.get_stats()
+                _cs["worker"] = _stats
+                try:
+                    _vm = cgn.get_vm_snapshot()
+                    if isinstance(_vm, dict):
+                        _cs.setdefault("grounded_density",
+                                        _vm.get("grounded_density", 0.0))
+                except Exception:
+                    pass
+                _send_msg(send_queue, bus.CGN_STATS_UPDATED, name, "all", _cs)
+                _last_cgn_stats_pub = now
+            except Exception as _csp_err:
+                logger.debug("[CGNWorker] CGN_STATS_UPDATED publish: %s",
+                             _csp_err)
 
         # ── CGN_TRANSITION — experience from any consumer ──────────
         if msg_type == "CGN_TRANSITION":

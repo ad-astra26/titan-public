@@ -45,7 +45,7 @@ case "$CMD" in
         fi
         echo ""
         echo "=== API Health ==="
-        HTTP=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:7778/health 2>/dev/null)
+        HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:7778/health/light 2>/dev/null)
         echo "HTTP: $HTTP"
         echo ""
         echo "=== Connections on 7778 ==="
@@ -81,7 +81,7 @@ case "$CMD" in
         echo "PID: $!"
         echo "Waiting 15s for boot..."
         sleep 15
-        HTTP=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:7778/health 2>/dev/null)
+        HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:7778/health/light 2>/dev/null)
         echo "Health: ${HTTP:-PENDING}"
         ;;
 

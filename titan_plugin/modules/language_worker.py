@@ -140,6 +140,25 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
     except Exception as e:
         logger.warning("[LanguageWorker] GrammarValidator init failed: %s", e)
 
+    # ── ActionNarrator (rFP_meditation_worker_latency follow-up 2026-05-07): ──
+    # cache one instance per worker. Pre-fix: every _handle_teacher_response
+    # and _handle_speak_request call constructed a fresh ActionNarrator
+    # INSIDE per-word loops, reloading 371 word recipes from JSON each time.
+    # Live evidence T1 19:00-19:01: "[ActionNarrator] Loaded 371 word recipes"
+    # logged 6× in 11s. PID 2414807 burning 105% CPU for 81 min sustained,
+    # contributed to T1 host load avg=539 + 7.8GB swap thrashing. Now:
+    # one instance, reused across handler calls. Stats accumulate correctly
+    # (instead of being reset to zero every call).
+    narrator = None
+    try:
+        from titan_plugin.logic.action_narrator import ActionNarrator
+        narrator = ActionNarrator(word_recipe_dir=data_dir, config=config)
+        logger.info("[LanguageWorker] ActionNarrator ready (cached per worker)")
+    except Exception as e:
+        logger.warning(
+            "[LanguageWorker] ActionNarrator init failed: %s — handlers will "
+            "fall back to per-call construction (slow path)", e)
+
     # ── Initialize vocabulary cache from DB ──────────────────────────
     from titan_plugin.logic.language_pipeline import (
         load_vocabulary, update_language_stats,
@@ -416,6 +435,41 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
 
     # ── Signal ready to Guardian ─────────────────────────────────────
     _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
+
+    # Phase C Session 4 (rFP §4.B.7) — SHM-direct language_state.bin +
+    # events_teacher_state.bin publishers. Closes the LANGUAGE_STATS_UPDATE
+    # bus-event RPC path (mirrors update_language_stats() output) + the
+    # events_teacher RPC path (reads JSON state + DB.get_stats).
+    try:
+        from titan_plugin.core.state_registry import resolve_titan_id
+        from titan_plugin.logic.events_teacher_state_publisher import (
+            EventsTeacherStatePublisher)
+        from titan_plugin.logic.language_pipeline import update_language_stats
+        from titan_plugin.logic.language_state_publisher import (
+            LanguageStatePublisher)
+        from titan_plugin.logic.worker_publisher_runner import (
+            run_worker_publisher)
+        _titan_id = resolve_titan_id()
+        _language_state_publisher = LanguageStatePublisher(titan_id=_titan_id)
+        run_worker_publisher(
+            publisher=_language_state_publisher,
+            state_fetcher=lambda: update_language_stats(db_path, None),
+            worker_name="language_worker",
+            cadence_s=1.0,
+        )
+        _events_teacher_state_publisher = EventsTeacherStatePublisher(
+            titan_id=_titan_id)
+        run_worker_publisher(
+            publisher=_events_teacher_state_publisher,
+            state_fetcher=lambda: _titan_id,
+            worker_name="language_worker",
+            cadence_s=1.0,
+        )
+    except Exception as _pub_init_err:
+        logger.error(
+            "[LanguageWorker] language_state + events_teacher_state SHM "
+            "publishers BOOT FAILED — consumers fall back to sync "
+            "bus.request: %s", _pub_init_err, exc_info=True)
 
     # ── Background heartbeat thread (prevents Guardian timeout) ──────
     _hb_stop = threading.Event()
@@ -975,7 +1029,8 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                 _handle_speak_request(
                     _sr_payload, send_queue, name, _sr_src,
                     composition_engine, grammar_validator, pattern_library,
-                    lang_config, db_path, cached_vocab, teacher_queue)
+                    lang_config, db_path, cached_vocab, teacher_queue,
+                    narrator=narrator)
                 # Refresh vocab cache after speak
                 cached_vocab = load_vocabulary(db_path)
                 # Track compositions for teacher trigger — I-010 fix: persist
@@ -1156,7 +1211,8 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                     persistent_teacher, grammar_validator, pattern_library,
                     lang_config, db_path, cached_vocab,
                     teacher_queue, conversation_pending, conversation_stats,
-                    recent_teacher_questions)
+                    recent_teacher_questions,
+                    narrator=narrator)
                 # Clear state after teaching session
                 teacher_pending_since = 0.0
                 teacher_no_response_count = 0
@@ -2022,6 +2078,7 @@ def _handle_teacher_response(
     lang_config: dict, db_path: str, cached_vocab: list,
     teacher_queue: list, conversation_pending, conversation_stats: dict,
     recent_questions: list,
+    narrator=None,
 ) -> None:
     """Handle teacher response: comprehension bridge, word acquisition, MSL signals.
 
@@ -2370,11 +2427,19 @@ def _handle_teacher_response(
                         words_recognized += 1
                         if known_ft:
                             known_tensors.append(known_ft)
-                        # Compute perturbation for this known word
+                        # Compute perturbation for this known word.
+                        # rFP_meditation_worker_latency follow-up 2026-05-07:
+                        # use the worker-cached narrator instead of constructing
+                        # a fresh one PER WORD. Pre-fix: per-word loop loaded
+                        # 371 recipes from JSON for every known word in every
+                        # teacher response → 105% CPU sustained, T1 host swap
+                        # thrashing. Fallback construction kept for the
+                        # narrator=None safety net (boot-init failure path).
                         try:
-                            from titan_plugin.logic.action_narrator import ActionNarrator
-                            _narrator = ActionNarrator()
-                            _perturb = _narrator.get_word_perturbation(w)
+                            if narrator is None:
+                                from titan_plugin.logic.action_narrator import ActionNarrator
+                                narrator = ActionNarrator()
+                            _perturb = narrator.get_word_perturbation(w)
                             if _perturb:
                                 perturbation_deltas.append({
                                     "word": w,
@@ -2604,6 +2669,7 @@ def _handle_speak_request(
     composition_engine, grammar_validator, pattern_library,
     lang_config: dict, db_path: str, cached_vocab: list,
     teacher_queue: list | None = None,
+    narrator=None,
 ) -> None:
     """Handle SPEAK_REQUEST: compose sentence from felt-state.
 
@@ -2702,11 +2768,15 @@ def _handle_speak_request(
     logger.info('[LanguageWorker] SPEAK: "%s" (L%d, conf=%.2f)',
                 sentence, level, confidence)
 
-    # 4. Compute self-hearing perturbation deltas (NOT applied — spirit does that)
+    # 4. Compute self-hearing perturbation deltas (NOT applied — spirit does that).
+    # rFP_meditation_worker_latency follow-up 2026-05-07: use the
+    # worker-cached narrator from `language_worker_main`. Fallback
+    # construction kept for the narrator=None safety net.
     perturbation_deltas = []
     try:
-        from titan_plugin.logic.action_narrator import ActionNarrator
-        narrator = ActionNarrator()
+        if narrator is None:
+            from titan_plugin.logic.action_narrator import ActionNarrator
+            narrator = ActionNarrator()
         perturbation_deltas = compute_perturbation_deltas(narrator, sentence)
     except Exception as e:
         logger.debug("[LanguageWorker] Perturbation delta error: %s", e)
@@ -2723,9 +2793,13 @@ def _handle_speak_request(
         result.get("resonance", 0.0),
     )
 
-    # 6. Update vocabulary after speak (advance to producible + confidence boost)
+    # 6. Update vocabulary after speak (advance to producible + confidence boost).
+    # Pass neuromods + emotion so producible-transition rows record felt-state
+    # at the grounding moment (rFP_x_voice_enrichment §4.5, GROUNDED_TODAY Pool A).
     vocab_updated, words_reinforced = update_vocabulary_after_speak(
-        db_path, None, sentence)  # narrator=None here, spirit has the real narrator
+        db_path, None, sentence,
+        neuromods=neuromods, emotion=payload.get("emotion", ""),
+    )  # narrator=None here, spirit has the real narrator
 
     # 7. Word association tracking
     _persist_word_associations(db_path, result.get("words_used", []))
@@ -2872,18 +2946,13 @@ def _handle_query(msg, send_queue, name, language_stats, lang_config,
     src = msg.get("src", "")
 
     try:
-        if action == "get_language_stats":
-            stats = dict(language_stats)
-            stats["teacher_queue_depth"] = len(teacher_queue)
-            stats["teacher_interval"] = lang_config.get("teacher_interval_compositions", 5)
-            stats["bootstrap_attempts"] = bootstrap_attempts
-            stats["compositions_since_teach"] = compositions_since
-            stats["conversation_stats"] = conversation_stats
-            stats["titan_id"] = lang_config.get("titan_id", "T1")
-            stats["vocab_cache_size"] = len(cached_vocab)
-            _send_response(send_queue, name, src, stats, rid)
-
-        elif action == "get_status":
+        # Phase C Session 5 (rFP §4.D.4): get_language_stats handler
+        # RETIRED — language consumers read SHM-direct via
+        # language_state.bin (Session 4 §4.B.7 publisher). The
+        # publisher's _state_fetcher calls update_language_stats(...)
+        # at 1Hz, mirroring this handler's payload. get_status
+        # remains as a pre-existing path (allowlisted as orphan).
+        if action == "get_status":
             _send_response(send_queue, name, src, {
                 "ready": True,
                 "titan_id": lang_config.get("titan_id", "T1"),

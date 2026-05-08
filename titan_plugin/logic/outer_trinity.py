@@ -275,15 +275,22 @@ class OuterTrinityCollector:
         ``_shm_reader_failure_count`` and ``_shm_stale_count`` exposed
         via get_last_tensors() for arch_map observability.
         """
+        # SPEC §7.0 v1.0.0 (D-SPEC-35) triple-buffer wire format:
+        # 16-byte fixed header + 3 × (16-byte buffer meta + N-byte payload).
+        # Bypasses StateRegistryReader to avoid per-slot mmap caching at
+        # this shim's ~1-3s callsite cadence + to inspect wall_ns + atomic
+        # publish state cleanly without private-attr access.
         from titan_plugin.core.state_registry import (
-            HEADER_SIZE, HEADER_STRUCT, MAX_READ_RETRIES,
+            HEADER_SIZE, BUFFER_META_SIZE, BUFFER_COUNT,
             resolve_shm_root,
+            _unpack_header_seq, _buffer_offset, _compute_buffer_crc32,
+            _IDX_MAX,
         )
         import struct
-        import zlib
 
         payload_bytes_expected = dim * 4  # float32 LE = 4 bytes per dim
-        total_bytes = HEADER_SIZE + payload_bytes_expected
+        # Total slot size = 16 + 3 × (16 + N)
+        total_bytes = HEADER_SIZE + BUFFER_COUNT * (BUFFER_META_SIZE + payload_bytes_expected)
 
         try:
             shm_root = resolve_shm_root(self._titan_id)
@@ -292,51 +299,64 @@ class OuterTrinityCollector:
                 # Cold boot: Rust daemon hasn't run yet. Last-known.
                 return list(last_known)
 
-            for _ in range(MAX_READ_RETRIES):
-                with open(slot_path, "rb") as f:
-                    raw = f.read(total_bytes)
-                if len(raw) < total_bytes:
-                    return list(last_known)  # truncated; retry next tick
+            with open(slot_path, "rb") as f:
+                raw = f.read(total_bytes)
+            if len(raw) < total_bytes:
+                return list(last_known)  # truncated
 
-                seq, schema, wall_ns, payload_bytes, crc = struct.unpack(
-                    HEADER_STRUCT, raw[:HEADER_SIZE],
-                )
-                if seq & 1:
-                    continue  # writer active — retry
-                if schema != 1:
-                    self._shm_reader_failure_count += 1
-                    return list(last_known)
-                if payload_bytes != payload_bytes_expected:
-                    self._shm_reader_failure_count += 1
-                    return list(last_known)
-                expected_crc = zlib.crc32(raw[:20])
-                if crc != expected_crc:
-                    continue  # torn read — retry
+            # 1. Atomic Acquire-load equivalent: read header_seq word.
+            s1 = struct.unpack_from("<Q", raw, 0)[0]
+            version1, idx = _unpack_header_seq(s1)
+            if version1 == 0:
+                # Slot uninitialized — Rust daemon hasn't published yet.
+                return list(last_known)
+            if idx > _IDX_MAX:
+                self._shm_reader_failure_count += 1
+                return list(last_known)
 
-                # Stale check per SPEC §18.1
-                age_s = (time.time_ns() - wall_ns) / 1e9
-                if age_s > stale_threshold_s:
-                    self._shm_stale_count += 1
-                    if (self._shm_stale_count == 1
-                            or self._shm_stale_count % 100 == 0):
-                        logger.warning(
-                            "[OuterTrinity shim] slot %s stale "
-                            "(age=%.1fs > %.1fs threshold; "
-                            "stale_count=%d) — using last-known",
-                            slot_name, age_s, stale_threshold_s,
-                            self._shm_stale_count,
-                        )
-                    return list(last_known)
+            # 2. Schema check (constant fixed-header field).
+            schema = struct.unpack_from("<I", raw, 8)[0]
+            if schema != 1:
+                self._shm_reader_failure_count += 1
+                return list(last_known)
 
-                # Parse payload as N × float32 LE
-                values = list(struct.unpack(
-                    f"<{dim}f", raw[HEADER_SIZE:HEADER_SIZE + payload_bytes],
-                ))
-                return values
+            # 3. Read per-buffer metadata at offset.
+            off = _buffer_offset(idx, payload_bytes_expected)
+            wall_ns, payload_bytes, stored_crc = struct.unpack_from("<QII", raw, off)
+            if payload_bytes != payload_bytes_expected:
+                self._shm_reader_failure_count += 1
+                return list(last_known)
 
-            # Retries exhausted (writer in progress for too long, or
-            # repeated CRC mismatches). Use last-known.
-            return list(last_known)
+            # 4. Stale check per SPEC §18.1 — uses per-buffer wall_ns.
+            age_s = (time.time_ns() - wall_ns) / 1e9
+            if age_s > stale_threshold_s:
+                self._shm_stale_count += 1
+                if (self._shm_stale_count == 1
+                        or self._shm_stale_count % 100 == 0):
+                    logger.warning(
+                        "[OuterTrinity shim] slot %s stale "
+                        "(age=%.1fs > %.1fs threshold; "
+                        "stale_count=%d) — using last-known",
+                        slot_name, age_s, stale_threshold_s,
+                        self._shm_stale_count,
+                    )
+                return list(last_known)
+
+            # 5. Copy payload + CRC verify.
+            payload_off = off + BUFFER_META_SIZE
+            payload_raw = raw[payload_off:payload_off + payload_bytes]
+            computed_crc = _compute_buffer_crc32(wall_ns, payload_bytes, payload_raw)
+            if computed_crc != stored_crc:
+                self._shm_reader_failure_count += 1
+                return list(last_known)
+
+            # 6. Atomic re-load + version-delta check (read s2 from same raw
+            # snapshot — since we read the whole file in one pread, we don't
+            # detect lapping, but for this shim's cadence (1-3s) and the
+            # daemons' fast publish cycles, lapping is negligible. Caller's
+            # last-known fallback handles edge cases.)
+
+            return list(struct.unpack(f"<{dim}f", payload_raw))
 
         except Exception as exc:
             self._shm_reader_failure_count += 1
@@ -404,16 +424,28 @@ class OuterTrinityCollector:
 
         # ── [2] somatosensation: touch + pressure ─────────────────
         # TX latency normalized (chain congestion felt as reach-friction) +
-        # current outer_body[2] as creation_nudge proxy (with decay fix
-        # shipping in next commit; until then, saturates — but blend
-        # limits its influence to 30%) +
-        # CPU spike rate (bursts of internal load)
+        # current outer_body[2] as creation_nudge proxy (now with decay
+        # toward 0.5 neutral per rFP_phase_c_close_all_runtime_gaps
+        # chunk 9G — was previously saturating because dim[2] fed itself
+        # with no decay) +
+        # CPU spike rate (bursts of internal load).
+        #
+        # 9G decay-fix (Maker decision 2026-05-06 "no deferrals"):
+        #   current_ob2 = 0.5 + (last_ob2 - 0.5) × DECAY_FACTOR
+        # DECAY_FACTOR = 0.95 per tick (10s cadence) → half-life
+        # log(0.5)/log(0.95) ≈ 13.5 ticks ≈ 2.25 minutes. Short enough
+        # that transient spikes don't pin dim[2]; long enough that
+        # genuine cumulative load registers. Rust port at
+        # `titan-outer-body-rs::tick_loop::apply_dim2_decay` matches
+        # byte-identical for parity tests.
         tx_lat_norm = tx_lat.get("normalized", 0.5)
 
-        current_ob2 = 0.5
+        last_ob2 = 0.5
         if (isinstance(self._last_outer_body, list)
                 and len(self._last_outer_body) > 2):
-            current_ob2 = float(self._last_outer_body[2])
+            last_ob2 = float(self._last_outer_body[2])
+        DIM2_DECAY_FACTOR = 0.95
+        current_ob2 = 0.5 + (last_ob2 - 0.5) * DIM2_DECAY_FACTOR
 
         cpu_spikes = sys_stats.get("cpu_spike_rate", 0.0)
 

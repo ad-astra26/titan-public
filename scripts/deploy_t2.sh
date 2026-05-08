@@ -1,7 +1,16 @@
 #!/bin/bash
-# deploy_t2.sh — Git-based code deployment to T2/T3 VPS
-# T2 and T3 are git clones of titan-dev with config.toml --assume-unchanged
-# data/ is gitignored — never touched by git pull
+# deploy_t2.sh — Git-based code deployment to T2 VPS (T2-only).
+#
+# T2 is a git clone of titan-dev with config.toml --assume-unchanged.
+# data/ is gitignored — never touched by git pull.
+#
+# IMPORTANT: This script targets T2 ONLY. T3 has moved to a Rust kernel
+# under systemd (titan-t3.service) and has its own deploy/manage scripts
+# at /home/antigravity/projects/titan3/scripts/. Touching T3 from this
+# script would Python-restart only the plugin child, leaving the Rust
+# kernel orchestrating from a stale module-registration state — which is
+# exactly the regression we hit on 2026-05-06. T3 ops live in T3's own
+# scripts now.
 #
 # Robust config.toml handling:
 #   The --assume-unchanged flag can drift (e.g. after a manual git checkout
@@ -13,7 +22,7 @@
 #     4. git pull --ff-only origin titan-v6 (pulled config.toml now on disk)
 #     4b. MERGE new sections from pulled into backup — any section that exists
 #         in pulled but NOT in backup is appended to backup, so config
-#         additions like new [voice] or [feature.x] make it onto T2/T3
+#         additions like new [voice] or [feature.x] make it onto T2
 #         naturally. Existing sections + credentials in backup are preserved
 #         untouched. (Added 2026-04-20 after Phase 5C deploy missed the new
 #         [voice] section; see rFP_phase5_narrator_evolution §9.)
@@ -28,14 +37,12 @@ set -e
 
 T2_HOST="root@10.135.0.6"
 TITAN_DIR="/home/antigravity/projects/titan"
-T3_DIR="/home/antigravity/projects/titan3"
 
 # ── Phase C C-S2 (PLAN §15.2): --include-rust-binaries flag ─────────
-# When set, scp titan-rust musl static binaries (titan-kernel-rs +
-# titan-trinity-rs-placeholder) to T2 and T3's bin/ directory after the
-# git pull, with SHA verification. Build first if local musl binaries
-# are missing. Filter out the flag so positional management commands
-# ($1) like --restart still work for the rest of the script.
+# When set, scp titan-rust musl static binaries to T2's bin/ directory
+# after the git pull, with SHA verification. Build first if local musl
+# binaries are missing. Filter out the flag so positional management
+# commands ($1) like --restart still work for the rest of the script.
 INCLUDE_RUST=0
 FILTERED_ARGS=()
 for arg in "$@"; do
@@ -46,9 +53,8 @@ for arg in "$@"; do
 done
 set -- "${FILTERED_ARGS[@]}"
 
-# ── Helper: deploy one Titan dir on the VPS ───────────────────────
-# Uses a single SSH session per Titan so the backup→pull→restore is atomic.
-# Args: $1=ssh-host  $2=remote-titan-dir  $3=label
+# ── Helper: deploy T2 dir on the VPS ──────────────────────────────
+# Uses a single SSH session so the backup→pull→restore is atomic.
 deploy_one() {
     local host="$1"
     local dir="$2"
@@ -78,11 +84,8 @@ git update-index --no-assume-unchanged titan_plugin/config.toml 2>/dev/null || t
 # 3. Drop any local config.toml edits (we'll restore from backup after pull)
 git checkout -- titan_plugin/config.toml 2>/dev/null || true
 
-# Phase C C-S2 (PLAN §17.2 / BUG-DEPLOY-T3-WIPES-LOCAL-EDITS-20260428):
-# protect titan_params.toml + config.toml from being wiped by deploy.
-# `--skip-worktree` tells git to ignore worktree changes; both `git
-# checkout --` and `git pull` will leave the file alone. Idempotent —
-# safe to re-run on every deploy.
+# Phase C C-S2 (PLAN §17.2): protect titan_params.toml from being wiped
+# by deploy. `--skip-worktree` tells git to ignore worktree changes.
 git update-index --skip-worktree titan_plugin/titan_params.toml 2>/dev/null || true
 
 # 4. Reset any other local code edits, then fast-forward pull. Files
@@ -104,8 +107,6 @@ git pull --ff-only origin titan-v6 2>&1 | tail -10
 
 # 4b. MERGE new upstream sections into backup (preserves credentials + picks up
 # config additions like a new [voice] or [feature.x] section on next deploy)
-# Section detection: any TOML line starting with [...] — matches top-level
-# ([voice]) AND nested ([voice.sub]) sections uniformly.
 PULLED_CFG="titan_plugin/config.toml"
 NEW_SECTIONS=$(comm -23 \
     <(grep -oE '^\[[^]]+\]' "${PULLED_CFG}" | sort -u) \
@@ -122,9 +123,6 @@ if [ -n "${NEW_SECTIONS}" ]; then
         echo "# ─────────────────────────────────────────────────────────────"
         while IFS= read -r section; do
             [ -z "${section}" ] && continue
-            # Extract section block: from ^[section] until next ^[...] or EOF
-            # Normalize each line by stripping inline comments + trailing WS
-            # so `[voice]  # master switch` still matches the section `[voice]`.
             awk -v sec="${section}" '
                 { line=$0; sub(/[[:space:]]*#.*$/, "", line); gsub(/[[:space:]]+$/, "", line) }
                 line == sec { in_sec=1; print $0; next }
@@ -133,7 +131,7 @@ if [ -n "${NEW_SECTIONS}" ]; then
             ' "${PULLED_CFG}"
         done <<< "${NEW_SECTIONS}"
     } >> "${BACKUP}"
-    BACKUP_SIZE=$(stat -c%s "${BACKUP}")  # refresh for post-restore size check
+    BACKUP_SIZE=$(stat -c%s "${BACKUP}")
     echo "  ✓ ${LABEL}: merged ${NEW_COUNT} new section(s) — backup now ${BACKUP_SIZE} bytes"
 else
     echo "  ℹ ${LABEL}: no new upstream sections to merge"
@@ -167,7 +165,7 @@ STAGED=$(git diff --cached --name-only | wc -l)
 
 if [ "$UNCOMMITTED" -gt 0 ] || [ "$STAGED" -gt 0 ]; then
     echo "⚠ WARNING: ${UNCOMMITTED} uncommitted + ${STAGED} staged changes (excluding data/)"
-    echo "  T2/T3 will NOT get these changes. Commit first!"
+    echo "  T2 will NOT get these changes. Commit first!"
     echo "  Proceeding with deploy of committed code only..."
     echo ""
 fi
@@ -175,11 +173,22 @@ fi
 echo "=== Pushing local changes to titan-dev ==="
 git push origin titan-v6 2>/dev/null && echo "✓ Pushed to titan-dev" || echo "⚠ Push failed or nothing to push"
 
-# ── Deploy ────────────────────────────────────────────────────────
+# ── Deploy to T2 ──────────────────────────────────────────────────
 deploy_one "${T2_HOST}" "${TITAN_DIR}" "T2"
-deploy_one "${T2_HOST}" "${T3_DIR}" "T3"
 
-# ── Optional: ship Phase C Rust binaries (PLAN §15.2) ─────────────
+# ── Phase C C-S7 (2026-05-05): ship the full 9-binary fleet to T2 ──
+TITAN_RUST_FLEET=(
+    titan-kernel-rs
+    titan-trinity-rs
+    titan-unified-spirit-rs
+    titan-inner-body-rs
+    titan-inner-mind-rs
+    titan-inner-spirit-rs
+    titan-outer-body-rs
+    titan-outer-mind-rs
+    titan-outer-spirit-rs
+)
+
 deploy_rust_binaries() {
     local host="$1"
     local remote_dir="$2"
@@ -187,21 +196,30 @@ deploy_rust_binaries() {
     local bins_local
     bins_local="$(dirname "$0")/../titan-rust/target/x86_64-unknown-linux-musl/release"
 
-    # Build first if needed
-    if [ ! -x "${bins_local}/titan-kernel-rs" ] || [ ! -x "${bins_local}/titan-trinity-rs-placeholder" ]; then
-        echo "  [${label}] building Rust binaries (musl static)..."
+    # Verify every fleet binary is present locally; build the workspace
+    # if any is missing (cheap incremental — cached crates skipped).
+    local missing=0
+    for bin_name in "${TITAN_RUST_FLEET[@]}"; do
+        if [ ! -x "${bins_local}/${bin_name}" ]; then
+            missing=1
+            break
+        fi
+    done
+    if [ "${missing}" = "1" ]; then
+        echo "  [${label}] building Rust binaries (musl static, full workspace)..."
         bash "$(dirname "$0")/build_titan_rust.sh" musl
     fi
 
-    echo "  [${label}] copying Rust binaries to ${host}:${remote_dir}/bin/"
+    echo "  [${label}] copying ${#TITAN_RUST_FLEET[@]} Rust binaries to ${host}:${remote_dir}/bin/"
     ssh "${host}" "mkdir -p \"${remote_dir}/bin\""
-    scp -q \
-        "${bins_local}/titan-kernel-rs" \
-        "${bins_local}/titan-trinity-rs-placeholder" \
-        "${host}:${remote_dir}/bin/"
+    local scp_args=()
+    for bin_name in "${TITAN_RUST_FLEET[@]}"; do
+        scp_args+=("${bins_local}/${bin_name}")
+    done
+    scp -q "${scp_args[@]}" "${host}:${remote_dir}/bin/"
 
-    # SHA verification — proves no in-flight tamper + correct file landed
-    for bin_name in titan-kernel-rs titan-trinity-rs-placeholder; do
+    # Per-binary SHA verification — bail loud on any mismatch.
+    for bin_name in "${TITAN_RUST_FLEET[@]}"; do
         local local_sha remote_sha
         local_sha=$(sha256sum "${bins_local}/${bin_name}" | awk '{print $1}')
         remote_sha=$(ssh "${host}" "sha256sum \"${remote_dir}/bin/${bin_name}\"" 2>/dev/null | awk '{print $1}')
@@ -211,83 +229,64 @@ deploy_rust_binaries() {
         fi
         echo "  ✓ ${label}: ${bin_name} sha256=${local_sha:0:12}…"
     done
+
+    ssh "${host}" "chown antigravity:antigravity \"${remote_dir}/bin/\"titan-*-rs 2>/dev/null || true"
 }
 
 if [ "$INCLUDE_RUST" -eq 1 ]; then
     echo ""
-    echo "=== Shipping Rust binaries (--include-rust-binaries) ==="
+    echo "=== Shipping Rust binaries to T2 (--include-rust-binaries) ==="
     deploy_rust_binaries "${T2_HOST}" "${TITAN_DIR}" "T2"
-    deploy_rust_binaries "${T2_HOST}" "${T3_DIR}" "T3"
 fi
 
-# ── Post-deploy: verify remote commits match local ────────────────
+# ── Post-deploy: verify T2 commit matches local ────────────────
 echo ""
 echo "=== Verifying commit alignment ==="
 T2_COMMIT=$(ssh "${T2_HOST}" "cd ${TITAN_DIR} && git rev-parse HEAD" 2>/dev/null)
-T3_COMMIT=$(ssh "${T2_HOST}" "cd ${T3_DIR} && git rev-parse HEAD" 2>/dev/null)
 T2_SHORT=$(echo "$T2_COMMIT" | cut -c1-7)
-T3_SHORT=$(echo "$T3_COMMIT" | cut -c1-7)
 
-ALL_MATCH=true
 if [ "$T2_COMMIT" = "$LOCAL_COMMIT" ]; then
     echo "  ✓ T2 at ${T2_SHORT} — matches local"
 else
     echo "  ✗ T2 at ${T2_SHORT} — LOCAL is ${LOCAL_SHORT} (MISMATCH!)"
-    ALL_MATCH=false
-fi
-if [ "$T3_COMMIT" = "$LOCAL_COMMIT" ]; then
-    echo "  ✓ T3 at ${T3_SHORT} — matches local"
-else
-    echo "  ✗ T3 at ${T3_SHORT} — LOCAL is ${LOCAL_SHORT} (MISMATCH!)"
-    ALL_MATCH=false
-fi
-
-if [ "$ALL_MATCH" = false ] && [[ "$1" == "--restart"* ]]; then
-    echo ""
-    echo "  ⚠ COMMIT MISMATCH — restarting anyway, but T2/T3 may run stale code."
-    echo "  ⚠ Did you forget to commit? Check: git status"
+    if [[ "$1" == "--restart"* ]]; then
+        echo "  ⚠ COMMIT MISMATCH — restarting anyway, but T2 may run stale code."
+        echo "  ⚠ Did you forget to commit? Check: git status"
+    fi
 fi
 
 echo ""
 echo "=== Deploy complete (config.toml preserved via backup→pull→restore) ==="
 
-# ── T2/T3 Management ──────────────────────────────────────────────
+# ── T2 Management ────────────────────────────────────────────────
 T2_MANAGE="${TITAN_DIR}/scripts/t2_manage.sh"
-T3_MANAGE="${T3_DIR}/scripts/t3_manage.sh"
 
 if [[ "$1" == "--restart" ]]; then
     echo "Restarting T2..."
     ssh ${T2_HOST} "bash ${T2_MANAGE} restart"
-    echo "Restarting T3..."
-    ssh ${T2_HOST} "bash ${T3_MANAGE} restart"
-elif [[ "$1" == "--restart-t2" ]]; then
-    ssh ${T2_HOST} "bash ${T2_MANAGE} restart"
-elif [[ "$1" == "--restart-t3" ]]; then
-    ssh ${T2_HOST} "bash ${T3_MANAGE} restart"
 elif [[ "$1" == "--stop" ]]; then
     ssh ${T2_HOST} "bash ${T2_MANAGE} stop"
-    ssh ${T2_HOST} "bash ${T3_MANAGE} stop"
 elif [[ "$1" == "--start" ]]; then
     ssh ${T2_HOST} "bash ${T2_MANAGE} start"
-    ssh ${T2_HOST} "bash ${T3_MANAGE} start"
 elif [[ "$1" == "--status" ]]; then
     echo "=== T2 ===" && ssh ${T2_HOST} "bash ${T2_MANAGE} status"
-    echo "=== T3 ===" && ssh ${T2_HOST} "bash ${T3_MANAGE} status"
 elif [[ "$1" == "--log" ]]; then
     echo "=== T2 ===" && ssh ${T2_HOST} "bash ${T2_MANAGE} log ${2:-30}"
-    echo "=== T3 ===" && ssh ${T2_HOST} "bash ${T3_MANAGE} log ${2:-30}"
 else
-    echo "Deploy + management commands:"
-    echo "  bash scripts/deploy_t2.sh               Deploy code to T2+T3 (git pull)"
-    echo "  bash scripts/deploy_t2.sh --restart      Deploy + restart T2+T3"
-    echo "  bash scripts/deploy_t2.sh --restart-t2   Deploy + restart T2 only"
-    echo "  bash scripts/deploy_t2.sh --restart-t3   Deploy + restart T3 only"
-    echo "  bash scripts/deploy_t2.sh --stop         Stop T2+T3"
-    echo "  bash scripts/deploy_t2.sh --start        Start T2+T3"
-    echo "  bash scripts/deploy_t2.sh --status       Status of T2+T3"
+    echo "Deploy + management commands (T2 ONLY — T3 has its own scripts):"
+    echo "  bash scripts/deploy_t2.sh                Deploy code to T2 (git pull)"
+    echo "  bash scripts/deploy_t2.sh --restart      Deploy + restart T2"
+    echo "  bash scripts/deploy_t2.sh --stop         Stop T2"
+    echo "  bash scripts/deploy_t2.sh --start        Start T2"
+    echo "  bash scripts/deploy_t2.sh --status       Status of T2"
     echo "  bash scripts/deploy_t2.sh --log [N]      Last N log lines"
     echo "  bash scripts/deploy_t2.sh --include-rust-binaries"
     echo "                                            Combine with any cmd above to ship"
-    echo "                                            titan-kernel-rs + titan-trinity-rs-placeholder"
-    echo "                                            (musl static) to T2/T3 bin/ post-pull (Phase C C-S2)"
+    echo "                                            the 9-binary Rust fleet (musl static)"
+    echo "                                            to T2 bin/ post-pull (Phase C C-S2/C-S7)"
+    echo ""
+    echo "  T3 ops live in T3's own scripts on the VPS:"
+    echo "    /home/antigravity/projects/titan3/scripts/deploy_t3.sh"
+    echo "    /home/antigravity/projects/titan3/scripts/t3_manage.sh"
+    echo "  T3 must restart via systemctl (titan-t3.service) — NOT pkill."
 fi

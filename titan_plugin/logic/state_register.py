@@ -91,6 +91,52 @@ from titan_plugin import bus
 logger = logging.getLogger(__name__)
 
 
+def _decode_msg(msg):
+    """Normalize a bus message envelope to a dict.
+
+    Phase B.2 §C7 socket-mode broker may forward raw msgpack wire frames
+    (bytes) into subscriber queues; legacy mp.Queue mode delivers dicts
+    directly. StateRegister must accept both — same pattern as
+    cognitive_worker `_decode_payload` (commit d0468f0e) and
+    `bus_socket.py:633` / `kernel_rpc.py:312`.
+
+    Returns {} for None / undecodable input so the caller can short-circuit
+    without raising AttributeError on `.get(...)`.
+
+    Closes BUG-STATE-REGISTER-BYTES-NO-GET-ATTR-20260505.
+    """
+    if msg is None:
+        return {}
+    if isinstance(msg, dict):
+        return msg
+    if isinstance(msg, (bytes, bytearray, memoryview)):
+        try:
+            import msgpack
+            decoded = msgpack.unpackb(msg, raw=False)
+            return decoded if isinstance(decoded, dict) else {}
+        except Exception as _err:
+            logger.debug("[StateRegister] msg msgpack decode failed: %s", _err)
+            return {}
+    return {}
+
+
+def _decode_payload(payload):
+    """Normalize a msg payload to a dict (see `_decode_msg` for rationale)."""
+    if payload is None:
+        return {}
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, (bytes, bytearray, memoryview)):
+        try:
+            import msgpack
+            decoded = msgpack.unpackb(payload, raw=False)
+            return decoded if isinstance(decoded, dict) else {"_raw": decoded}
+        except Exception as _err:
+            logger.debug("[StateRegister] payload msgpack decode failed: %s", _err)
+            return {}
+    return {}
+
+
 def _pad_to(values, target_dim: int, pad_val: float = 0.5) -> list[float]:
     """Return exactly target_dim floats.
 
@@ -489,7 +535,7 @@ class OuterState:
                     ]:
                         data, ts = bb.read(src_type)
                         if data and self.is_active:
-                            self._process_bus_message(data)
+                            self._process_bus_message(_decode_msg(data))
 
                 from titan_plugin.bus import make_msg
                 snapshot_30dt = self.get_full_30dt()
@@ -526,52 +572,124 @@ class OuterState:
                 continue
 
             try:
-                self._process_bus_message(msg)
+                self._process_bus_message(_decode_msg(msg))
             except Exception as e:
                 swallow_warn('[StateRegister] Error processing message', e,
                              key="logic.state_register.error_processing_message", throttle=100)
 
-    def _process_bus_message(self, msg: dict) -> None:
+    def _process_bus_message(self, msg) -> None:
         """Route bus message to appropriate state update.
 
         When is_active=False (dreaming), all updates are silently skipped.
+
+        Accepts dict, bytes (msgpack wire frame), bytearray, memoryview,
+        or None — defensively decoded via `_decode_msg`. Phase B.2 §C7
+        socket-mode bus may forward raw wire frames into subscriber queues
+        (closes BUG-STATE-REGISTER-BYTES-NO-GET-ATTR-20260505).
         """
         if not self.is_active:
             return
+        if not isinstance(msg, dict):
+            msg = _decode_msg(msg)
+            if not msg:
+                return
         msg_type = msg.get("type", "")
-        payload = msg.get("payload", {})
+        payload = _decode_payload(msg.get("payload"))
 
         if msg_type == bus.BODY_STATE:
+            # SPEC §8.5 (post-D3 2026-05-06): src ∈ {inner, outer} routes
+            # the canonical BODY_STATE event to the correct field set.
+            # Default "inner" preserves Phase A+B behavior. Rust outer-body-rs
+            # daemon publishes with src="outer" + values=[5 floats].
+            src = payload.get("src", "inner")
             values = payload.get("values", [0.5] * 5)
-            updates = {
-                "body_tensor": values,
-                "body_center_dist": payload.get("center_dist", 0.0),
-                "body_details": payload.get("details", {}),
-                "body_ts": time.time(),
-            }
-            mult = payload.get("filter_down_multipliers")
-            if mult:
-                updates["filter_down_body"] = mult
+            if src == "outer":
+                updates = {
+                    "outer_body": values[:5] if len(values) >= 5 else values,
+                    "body_ts": time.time(),
+                }
+            else:
+                updates = {
+                    "body_tensor": values,
+                    "body_center_dist": payload.get("center_dist", 0.0),
+                    "body_details": payload.get("details", {}),
+                    "body_ts": time.time(),
+                }
+                mult = payload.get("filter_down_multipliers")
+                if mult:
+                    updates["filter_down_body"] = mult
             self._update_many(updates)
 
         elif msg_type == bus.MIND_STATE:
+            # SPEC §8.5 (post-D3 2026-05-06): src ∈ {inner, outer} routing.
+            # Inner: values=[5] + optional values_15d=[15] → mind_tensor + mind_tensor_15d.
+            # Outer: values=[15] (Rust outer-mind-rs canonical) → outer_mind (values[:5])
+            # + outer_mind_15d. Preserves the willing-slice GROUND_UP merge logic
+            # from the legacy OUTER_MIND_STATE handler at line 729.
+            src = payload.get("src", "inner")
             values = payload.get("values", [0.5] * 5)
-            updates = {
-                "mind_tensor": values,
-                "mind_center_dist": payload.get("center_dist", 0.0),
-                "mind_ts": time.time(),
-            }
-            # DQ2: Store extended 15D mind tensor if available
-            values_15d = payload.get("values_15d")
-            if values_15d:
-                updates["mind_tensor_15d"] = values_15d
-            mult = payload.get("filter_down_multipliers")
-            if mult:
-                updates["filter_down_mind"] = mult
+            if src == "outer":
+                # Rust outer-mind-rs sends 15D in values; legacy fallback to 5D.
+                if len(values) == 15:
+                    incoming_om15 = values
+                    om5 = values[:5]
+                else:
+                    incoming_om15 = payload.get("values_15d") or payload.get("outer_mind_15d")
+                    om5 = values[:5] if len(values) >= 5 else (values + [0.5] * (5 - len(values)))
+                updates = {
+                    "outer_mind": om5,
+                    "mind_ts": time.time(),
+                }
+                if incoming_om15 and len(incoming_om15) == 15:
+                    # Preserve willing-slice [10:15] from existing state when set
+                    # (mirrors legacy OUTER_MIND_STATE merge at line 736-744).
+                    existing_om15 = self._state.get("outer_mind_15d")
+                    if (existing_om15 and len(existing_om15) == 15
+                            and any(v != 0.5 for v in existing_om15[10:15])):
+                        merged = list(incoming_om15[:10]) + list(existing_om15[10:15])
+                        updates["outer_mind_15d"] = merged
+                    else:
+                        updates["outer_mind_15d"] = list(incoming_om15)
+            else:
+                updates = {
+                    "mind_tensor": values,
+                    "mind_center_dist": payload.get("center_dist", 0.0),
+                    "mind_ts": time.time(),
+                }
+                # DQ2: Store extended 15D mind tensor if available
+                values_15d = payload.get("values_15d")
+                if values_15d:
+                    updates["mind_tensor_15d"] = values_15d
+                mult = payload.get("filter_down_multipliers")
+                if mult:
+                    updates["filter_down_mind"] = mult
             self._update_many(updates)
 
         elif msg_type == bus.SPIRIT_STATE:
+            # SPEC §8.5 (post-D3 2026-05-06): src ∈ {inner, outer} routing.
+            # Inner: values=[5] + optional values_45d=[45] + consciousness +
+            # v4 fields → spirit_tensor + spirit_tensor_45d + consciousness.
+            # Outer: values=[45] (Rust outer-spirit-rs canonical) → outer_spirit
+            # (values[:5]) + outer_spirit_45d. Consciousness/V4 only meaningful
+            # for inner src.
+            src = payload.get("src", "inner")
             values = payload.get("values", [0.5] * 5)
+            if src == "outer":
+                # Rust outer-spirit-rs sends 45D unmasked; legacy fallback to 5D.
+                if len(values) == 45:
+                    incoming_os45 = values
+                    os5 = values[:5]
+                else:
+                    incoming_os45 = payload.get("values_45d") or payload.get("outer_spirit_45d")
+                    os5 = values[:5] if len(values) >= 5 else (values + [0.5] * (5 - len(values)))
+                updates = {
+                    "outer_spirit": os5,
+                    "spirit_ts": time.time(),
+                }
+                if incoming_os45 and len(incoming_os45) == 45:
+                    updates["outer_spirit_45d"] = list(incoming_os45)
+                self._update_many(updates)
+                return
             updates = {
                 "spirit_tensor": values,
                 "spirit_ts": time.time(),

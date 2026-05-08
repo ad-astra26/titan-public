@@ -4,8 +4,8 @@ _phase_c_constants.py — AUTO-GENERATED from titan-docs/SPEC_titan_architecture
 DO NOT EDIT BY HAND. Edit the TOML, then run:
     python scripts/generate_phase_c_constants.py
 
-SPEC version: 0.1.7
-Source SHA-256: e752dbcabc35867bf7731f5bab108256cf7c6e7b11b03332550691d5221fbf55
+SPEC version: 1.1.0
+Source SHA-256: 4eca93f144819ca39de4944d4fa9e9a10f80541fd3f45464c0d031b5400d2eb6
 
 Per SPEC §19 + §2.6: hand-editing this file is a SPEC violation flagged by
 `arch_map phase-c verify`.
@@ -14,8 +14,8 @@ from __future__ import annotations
 from typing import Final
 
 # ── SPEC version metadata ──────────────────────────────────────────────
-SPEC_VERSION: Final[str] = "0.1.7"
-SPEC_SOURCE_SHA256: Final[str] = "e752dbcabc35867bf7731f5bab108256cf7c6e7b11b03332550691d5221fbf55"
+SPEC_VERSION: Final[str] = "1.1.0"
+SPEC_SOURCE_SHA256: Final[str] = "4eca93f144819ca39de4944d4fa9e9a10f80541fd3f45464c0d031b5400d2eb6"
 
 
 # ── KERNEL ────────────────────────────────────────────────────────────────
@@ -217,6 +217,23 @@ FRAME_AUTH_TAG_BYTES: Final[int] = 32
 AUTHKEY_BYTES: Final[int] = 32
 # Version-bumpable HKDF salt (interpreted as UTF-8 bytes)
 AUTHKEY_HKDF_SALT: Final[bytes] = b"titan-bus-v1"
+# HKDF info field — domain separation constant (NOT titan_id-derived; per-Titan isolation comes from per-Titan identity keypair → different IKM → different authkey). Constant prevents the runtime call-site drift class that broke Phase C C-S7 on 2026-05-05 (Rust kernel passed 'titan_T3' while Python worker passed 'T3' → different authkeys → 100% handshake failure). See titan-docs/rFP_phase_c_bus_authkey_contract_fix.md.
+AUTHKEY_HKDF_INFO: Final[bytes] = b"titan-bus"
+
+
+# ── SHM ───────────────────────────────────────────────────────────────────
+# Shared-memory triple-buffer slot wire format (universal §7.0 header v1.0.0)
+
+# Fixed slot header size (§7.0 v1.0.0): header_seq(8 atomic) + schema_version(4 constant) + payload_capacity(4 constant). Schema + capacity are set at Slot::create and never updated by writer.
+SHM_HEADER_BYTES: Final[int] = 16
+# Per-buffer metadata size (§7.0 v1.0.0): wall_ns(8) + payload_bytes(4) + buffer_crc32(4). One block per buffer — co-located with payload so the entire buffer state (metadata + payload + CRC) is published atomically by the header_seq Release-store.
+SHM_BUFFER_META_BYTES: Final[int] = 16
+# Triple-buffer count per slot — writer rotates 0→1→2, reader picks ready_idx; race-elimination requires N+1 buffers where N=max writer publishes during reader memcpy = 2
+SHM_BUFFER_COUNT: Final[int] = 3
+# Python struct format for §7.0 v1.0.0 fixed header (LE: u64 header_seq, u32 schema_version, u32 payload_capacity)
+SHM_HEADER_STRUCT: Final[str] = "<QII"
+# Python struct format for §7.0 v1.0.0 per-buffer metadata (LE: u64 wall_ns, u32 payload_bytes, u32 buffer_crc32)
+SHM_BUFFER_META_STRUCT: Final[str] = "<QII"
 
 
 # ── REGISTRY ──────────────────────────────────────────────────────────────
@@ -224,12 +241,6 @@ AUTHKEY_HKDF_SALT: Final[bytes] = b"titan-bus-v1"
 
 # unified_spirit_132d.bin slot schema version (Trinity 130D + Journey 2D intermediate before SELF assembly)
 UNIFIED_SPIRIT_132D_SCHEMA_VERSION: Final[int] = 1
-# SeqLock header size: seq(4) + schema(4) + wall_ns(8) + payload(4) + crc(4)
-REGISTRY_HEADER_BYTES: Final[int] = 24
-# Python struct format for header (LE: uint32, uint32, uint64, uint32, uint32)
-REGISTRY_HEADER_STRUCT: Final[str] = "<IIQII"
-# SeqLock reader retry budget on torn read
-REGISTRY_MAX_READ_RETRIES: Final[int] = 3
 # Schema version for self_162d.bin slot (162D TITAN_SELF tensor)
 SELF_162D_SCHEMA_VERSION: Final[int] = 1
 # Schema version for inner_body_5d.bin slot
@@ -248,6 +259,10 @@ OUTER_SPIRIT_45D_SCHEMA_VERSION: Final[int] = 1
 TOPOLOGY_30D_SCHEMA_VERSION: Final[int] = 1
 # Schema version for neuromod_state.bin slot (DA, 5HT, NE, ACh, Endorphin, GABA)
 NEUROMOD_SCHEMA_VERSION: Final[int] = 1
+# Number of neuromodulator fields persisted in neuromod_state.bin (DA, 5HT, NE, ACh, Endorphin, GABA)
+NEUROMOD_FIELD_COUNT: Final[int] = 6
+# Total payload bytes for neuromod_state.bin = NEUROMOD_FIELD_COUNT × 4 (f32 LE) = 6 × 4 = 24 bytes
+NEUROMOD_PAYLOAD_BYTES: Final[int] = 24
 # Schema version for epoch_counter.bin slot
 EPOCH_COUNTER_SCHEMA_VERSION: Final[int] = 1
 # Schema version for sphere_clocks.bin slot (6 × 7 fields)
@@ -268,6 +283,78 @@ CIRCADIAN_SCHEMA_VERSION: Final[int] = 1
 PI_HEARTBEAT_SCHEMA_VERSION: Final[int] = 1
 # Schema version for fastbus.bin lock-free shm ring
 FASTBUS_SCHEMA_VERSION: Final[int] = 1
+# Schema version for hormone_fires.bin slot — variable msgpack {hormone_name → fire_count} for 8 canonical hormones + ts. Owned by spirit_worker (titan_HCL). Closes spirit_proxy.get_trinity sync-RPC deadlock (rFP §4.B.1).
+HORMONE_FIRES_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for hormone_fires.bin (8 hormones × small int + ts → ~150B typical, 1024B cap).
+HORMONE_FIRES_MAX_BYTES: Final[int] = 1024
+# Schema version for impulse_engine_state.bin slot — variable msgpack {hormones: {name → {impulse_value, last_fire_ts, threshold}}, total_fires, last_observe_ts, ts}. Owned by spirit_worker (ImpulseEngine.get_stats output).
+IMPULSE_ENGINE_STATE_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for impulse_engine_state.bin (~600B typical, 2048B cap).
+IMPULSE_ENGINE_STATE_MAX_BYTES: Final[int] = 2048
+# Schema version for consciousness_state.bin slot — variable msgpack {epoch_id, density, curvature, dream_quality, fatigue, trajectory_magnitude, latest_epoch, ts}. Extracts from consciousness['latest_epoch'] per _run_consciousness_epoch output. Owned by spirit_worker.
+CONSCIOUSNESS_STATE_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for consciousness_state.bin (latest_epoch dict can include nested state vector ~2KB, 4096B cap).
+CONSCIOUSNESS_STATE_MAX_BYTES: Final[int] = 4096
+# Schema version for assessment_state.bin slot — variable msgpack {average_score, total, recent[10], trend, score_variance, research_avg_score, ts}. Owned by Python assessment module. (Producer ships Session 2; slot declared now per rFP §4.A.1.)
+ASSESSMENT_STATE_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for assessment_state.bin.
+ASSESSMENT_STATE_MAX_BYTES: Final[int] = 4096
+# Schema version for agency_state.bin slot — variable msgpack {total_actions, actions_this_hour, success_rate, llm_calls_this_hour, helper_statuses, last_action_ts, posture_history_digest, ts}. Owned by agency_module. (Session 2.)
+AGENCY_STATE_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for agency_state.bin (helper_statuses dict can be large).
+AGENCY_STATE_MAX_BYTES: Final[int] = 8192
+# Schema version for social_perception_state.bin slot — variable msgpack {sentiment_ema, interaction_rate, social_activity, last_interaction_ts, ts}. Owned by spirit_worker. (Session 2.)
+SOCIAL_PERCEPTION_STATE_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for social_perception_state.bin.
+SOCIAL_PERCEPTION_STATE_MAX_BYTES: Final[int] = 2048
+# Schema version for rl_state.bin slot — variable msgpack {programs[], current_program_id, dream_quality, training_loss_ema, transitions, last_train_ts, ts}. Owned by rl_worker. (Session 2.)
+RL_STATE_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for rl_state.bin.
+RL_STATE_MAX_BYTES: Final[int] = 4096
+# Schema version for memory_state.bin slot — variable msgpack {persistent_count, mempool_size, learning_velocity, directive_alignment, effective_nodes_24h, high_quality_count, kg_node_count, kg_edge_count, topology_clusters_summary, ts}. Owned by memory_worker. (Session 2.)
+MEMORY_STATE_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for memory_state.bin (topology_clusters_summary can include cluster digests).
+MEMORY_STATE_MAX_BYTES: Final[int] = 8192
+# Schema version for timechain_state.bin slot — variable msgpack {tx_latency_norm, block_delta_norm, recent_anchor_age_s, fork_summary[7], integrity_status, total_blocks, chi_spent_total, ts}. Owned by timechain_worker. (Session 2.)
+TIMECHAIN_STATE_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for timechain_state.bin.
+TIMECHAIN_STATE_MAX_BYTES: Final[int] = 4096
+# Schema version for reflex_state.bin slot — variable msgpack {reflex_name → {fire_count, total_updates, last_loss, fire_threshold}} + ts. Owned by reflex_worker. (Session 2.)
+REFLEX_STATE_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for reflex_state.bin.
+REFLEX_STATE_MAX_BYTES: Final[int] = 2048
+# Schema version for output_verifier_state.bin slot — variable msgpack {verified_count, rejected_count, sovereignty_score, threats_24h{directive,injection,consistency,identity,qualia}, recent_rejections_digest, ts}. Owned by output_verifier_worker. (Session 2.)
+OUTPUT_VERIFIER_STATE_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for output_verifier_state.bin.
+OUTPUT_VERIFIER_STATE_MAX_BYTES: Final[int] = 4096
+# Schema version for resonance_state.bin slot — variable msgpack {pairs, resonant_count, all_resonant, great_pulse_count, last_great_pulse_ts, config, ts}. Direct ResonanceDetector.get_stats() output. Owned by spirit_worker (titan_HCL). Added 2026-05-07 to complete rFP_phase_c_async_shm_consumer_migration §4.C.1 spirit_proxy.get_resonance migration (Session 1).
+RESONANCE_STATE_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for resonance_state.bin (3 pairs × per-pair stats + counters + config — typical ~1KB, 4096B cap).
+RESONANCE_STATE_MAX_BYTES: Final[int] = 4096
+# Schema version for unified_spirit_metadata.bin slot — variable msgpack UnifiedSpirit.get_stats() output (epoch_count, current_epoch_id, velocity, is_stale, consecutive_stale, stale_focus_multiplier, tensor_magnitude, tensor_sum, latest_epoch, cumulative_quality, micro_tick_count, last_alignment, enrichment_rate, full_130dt[130], config, ts). Pairs with existing unified_spirit_132d.bin (raw tensor) — metadata slot carries every queryable field. Owned by spirit_worker (titan_HCL). Added 2026-05-07 to complete rFP §4.C.1 spirit_proxy.get_unified_spirit migration (Session 1).
+UNIFIED_SPIRIT_METADATA_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for unified_spirit_metadata.bin (full_130dt 130 floats + latest_epoch with 130D state vector + scalars — typical ~4-6KB, 8192B cap).
+UNIFIED_SPIRIT_METADATA_MAX_BYTES: Final[int] = 8192
+# Schema version for mind_state.bin slot — variable msgpack {mood_label, mood_valence, mood_intensity, current_reward, info_gain_ema, mood_history_digest, ts}. Owned by mind_worker (MoodEngine + reward telemetry). Supplements Rust-owned inner_mind_15d.bin tensor slot. Closes mind_proxy.get_mood_label/get_mood_valence/get_current_reward sync-RPC (rFP §4.B.6 + §4.C.2).
+MIND_STATE_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for mind_state.bin (mood scalars + small history digest, typical ~500B, 4096B cap).
+MIND_STATE_MAX_BYTES: Final[int] = 4096
+# Schema version for body_state.bin slot — variable msgpack {interoception, proprioception, somatosensation, entropy, thermal, sol_balance, sol_norm, block_delta_norm, anchor_fresh, body_health, body_details, ts}. Owned by body_worker. Supplements Rust-owned inner_body_5d.bin tensor slot with queryable body-detail metadata. Closes body_proxy.get_body_details sync-RPC (rFP §4.B.6 + §4.C.3).
+BODY_STATE_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for body_state.bin (body_details dict + scalars, typical ~1KB, 4096B cap).
+BODY_STATE_MAX_BYTES: Final[int] = 4096
+# Schema version for language_state.bin slot — variable msgpack {vocab_total, vocab_producible, vocab_contextual, avg_confidence, max_confidence, recent_words[], teacher_sessions_last_hour, composition_level, teacher_compositions_since, teacher_last_fire_time, ts}. Mirrors language_pipeline.update_language_stats() output (the same payload as LANGUAGE_STATS_UPDATE bus event). Owned by language_worker. Closes LANGUAGE_STATS_UPDATE RPC path (rFP §4.B.7 + §23.13 row 10).
+LANGUAGE_STATE_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for language_state.bin (small scalar set, 4096B cap).
+LANGUAGE_STATE_MAX_BYTES: Final[int] = 4096
+# Schema version for events_teacher_state.bin slot — variable msgpack {fingerprints_count, last_run_time, window_count, perception_buffer_size, follower_rotation_idx, mode_stats, felt_experiences, followers_tracked, windows_completed, ts}. Owned by language_worker (1Hz polling thread reads EventsTeacher JSON state + DB.get_stats — EventsTeacher itself is cron-based). Separate slot from cgn_live_weights.bin per G21. Closes events_teacher RPC path (rFP §4.B.7 + §23.13 row 9).
+EVENTS_TEACHER_STATE_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for events_teacher_state.bin (curated-signal scalar telemetry, 4096B cap).
+EVENTS_TEACHER_STATE_MAX_BYTES: Final[int] = 4096
+# Schema version for spirit_supplemental_state.bin slot — variable msgpack {filter_down_status, meditation_health, coordinator, nervous_system, ts}. Owned by spirit_worker. Covers the 4 spirit_loop handlers Session 1 retained sync (filter_down_status / meditation_health / coordinator / nervous_system) until producer migrated. Closes spirit_proxy fully (rFP §4.C.1 expansion — Session 4 greenlight 2026-05-07).
+SPIRIT_SUPPLEMENTAL_STATE_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for spirit_supplemental_state.bin. Bumped 8192→65536 2026-05-07 after T3 deploy showed live payload at 58106B (coordinator section carries every spirit subsystem snapshot). 64KB cap covers production worst-case + 10% margin.
+SPIRIT_SUPPLEMENTAL_STATE_MAX_BYTES: Final[int] = 65536
 
 
 # ── SCHUMANN ──────────────────────────────────────────────────────────────
@@ -377,17 +464,23 @@ WORKER_SHUTDOWN_GRACE_S: Final[float] = 5.0
 # ── OUTER ─────────────────────────────────────────────────────────────────
 # Outer trinity daemon cadences (NOT Schumann-locked; per SPEC §18.1)
 
-# Outer-body daemon base tick cadence (Solana RPC + slow files)
+# Outer-body Python sensor sidecar refresh period; stale-threshold = 3× this. Post-A.S8 the Rust daemon ticks at SCHUMANN_BODY_HZ (7.83 Hz) — this constant defines sidecar cadence + sensor staleness, NOT daemon tick rate.
 OUTER_BODY_TICK_BASE_S: Final[float] = 10.0
-# Outer-body cadence jitter (±)
+# Outer-body sensor sidecar jitter (±). DEPRECATED for daemon tick — daemon now uses SchumannGenerator (no jitter).
 OUTER_BODY_TICK_JITTER_PCT: Final[int] = 20
-# Outer-mind daemon base tick cadence (persona, social — moderately fresh)
+# Outer-body daemon bus publish throttle interval. Daemon ticks at Schumann body (7.83 Hz) but throttles MIND_STATE/SPIRIT_STATE bus publishes to this cadence. Body-slowest G13 invariant: this > OUTER_MIND_BUS_PUBLISH_INTERVAL_S > OUTER_SPIRIT_BUS_PUBLISH_INTERVAL_S.
+OUTER_BODY_BUS_PUBLISH_INTERVAL_S: Final[float] = 45.0
+# Outer-mind Python sensor sidecar refresh period; stale-threshold = 3× this. Post-A.S8 the Rust daemon ticks at SCHUMANN_MIND_HZ (23.49 Hz) — this constant defines sidecar cadence + sensor staleness, NOT daemon tick rate.
 OUTER_MIND_TICK_BASE_S: Final[float] = 5.0
-# Outer-mind cadence jitter (±)
+# Outer-mind sensor sidecar jitter (±). DEPRECATED for daemon tick.
 OUTER_MIND_TICK_JITTER_PCT: Final[int] = 20
-# Outer-spirit daemon base tick cadence (narrative — slow-changing)
+# Outer-mind daemon bus publish throttle interval. Daemon ticks at Schumann mind (23.49 Hz) but throttles MIND_STATE bus publishes to this cadence.
+OUTER_MIND_BUS_PUBLISH_INTERVAL_S: Final[float] = 15.0
+# Outer-spirit daemon bus publish throttle interval. Daemon ticks at Schumann spirit (70.47 Hz) but throttles SPIRIT_STATE / OUTER_SPIRIT_FILTER_DOWN bus publishes to this cadence. Spirit-fastest at bus layer (mirrors inner spirit publish rate).
+OUTER_SPIRIT_BUS_PUBLISH_INTERVAL_S: Final[float] = 5.0
+# Outer-spirit Python sensor sidecar refresh period; stale-threshold = 3× this. Post-A.S8 the Rust daemon ticks at SCHUMANN_SPIRIT_HZ (70.47 Hz) — this constant defines sidecar cadence + sensor staleness, NOT daemon tick rate.
 OUTER_SPIRIT_TICK_BASE_S: Final[float] = 30.0
-# Outer-spirit cadence jitter (±)
+# Outer-spirit sensor sidecar jitter (±). DEPRECATED for daemon tick.
 OUTER_SPIRIT_TICK_JITTER_PCT: Final[int] = 10
 # Start dim of outer_mind willing range (ground_up applies here per G10 ground_up_mind_range=10:15)
 OUTER_MIND_WILLING_DIM_START: Final[int] = 10
@@ -414,3 +507,16 @@ OUTER_SPIRIT_OBSERVER_DIM_END: Final[int] = 5
 OUTER_SPIRIT_CONTENT_DIM_START: Final[int] = 5
 # End dim (exclusive) of outer_spirit_45d local-frame content range
 OUTER_SPIRIT_CONTENT_DIM_END: Final[int] = 45
+
+
+# ── COGNITIVE ─────────────────────────────────────────────────────────────
+# L3 cognitive engine cluster owned by cognitive_worker L2 module (NEW in v0.2.0 per PLAN_microkernel_phase_c_s8_cognitive_worker_extraction.md). Adaptive consciousness epoch driver constants — 1-30s tick interval bounded by Schumann body period. NOT coupled to Rust trinity-rs Schumann publish rates per Maker D4 (a) — cognitive_worker has its own adaptive timer that fires on max-interval, resonance transition, or hormonal urgency.
+
+# Cognitive epoch tick floor — never tick faster than 1× Schumann body period (1.15s). Prevents over-driving reasoning_engine + meta_engine in pathological resonance cascades.
+COGNITIVE_EPOCH_MIN_INTERVAL_S: Final[float] = 1.15
+# Cognitive epoch tick default cadence — 9× Schumann body (10.35s). Matches legacy spirit_loop._run_consciousness_epoch cadence so chain commit / dream insert / π-heartbeat observation rates stay constant across the 4A→4B cutover.
+COGNITIVE_EPOCH_DEFAULT_INTERVAL_S: Final[float] = 10.35
+# Cognitive epoch tick ceiling — 27× Schumann body (31.05s). Force epoch fire if no resonance transition / hormonal urgency / max-interval trigger arrived. Bounds the worst-case staleness of /v4/reasoning + /v4/dreaming + /v4/pi-heartbeat under low-arousal idle.
+COGNITIVE_EPOCH_MAX_INTERVAL_S: Final[float] = 31.05
+# Engine state persistence cadence — every 100 epochs (≈10–30 min wall time at default 10.35s, max 51 min at 31.05s ceiling). Persists reasoning_totals.json + dreaming_state.json + pi_heartbeat_state.json + neural_ns/* + msl/* atomically per G16 invariants. Intermediate crash recovers from last checkpoint without losing chain history.
+COGNITIVE_PERSIST_EVERY_N_EPOCHS: Final[int] = 100

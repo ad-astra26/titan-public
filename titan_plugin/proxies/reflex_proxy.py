@@ -73,15 +73,17 @@ class ReflexProxy(ReflexCollector):
             "cooldowns": dict(self._cooldowns),
         }
         try:
-            reply = self._bus.request(
-                src="reflex_proxy",
-                dst="reflex",
-                payload=payload,
-                timeout=self._timeout,
-                reply_queue=self._reply_queue,
+            # Phase C Session 4 (rFP §4.C.15) — work-RPC migrated from
+            # sync bus.request to async bus.request_async per Preamble G19
+            # (≤5s timeout). reflex aggregation is true work (per-signal
+            # group-by-type + guardian-shield + combine + threshold) — NOT
+            # state lookup. Allowlist entry in phase_c_rpc_exemptions.yaml.
+            reply = await self._bus.request_async(
+                "reflex_proxy", "reflex", payload,
+                self._timeout, self._reply_queue,
             )
         except Exception as e:
-            logger.warning("[ReflexProxy] bus.request raised: %s", e)
+            logger.warning("[ReflexProxy] bus.request_async raised: %s", e)
             reply = None
 
         if reply is None:

@@ -28,9 +28,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 from typing import Optional
 
+import msgpack
+
 from ..bus import DivineBus
+from ..core.state_registry import (
+    StateRegistryReader,
+    ensure_shm_root,
+    resolve_titan_id,
+)
+from ..logic.session3_state_specs import ASSESSMENT_STATE_SPEC
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +78,13 @@ class AssessmentProxy:
             "avg_score": 0.0,
             "recent": [],
         }
+        # Phase C Session 4 (rFP §4.C.5) — SHM-direct reader for
+        # assessment_state.bin (Session 3 publisher in agency_worker).
+        self._titan_id = resolve_titan_id()
+        self._shm_root: Path = ensure_shm_root(self._titan_id)
+        self._r_assessment_state = StateRegistryReader(
+            ASSESSMENT_STATE_SPEC, self._shm_root)
+        self._fallback_counts: dict[str, int] = {}
 
     async def assess(self, action_result: dict) -> dict:
         """Bus IPC reply via dedicated bus_ipc_pool — isolated from the
@@ -100,22 +116,42 @@ class AssessmentProxy:
         return dict(self._stats_cache)
 
     def refresh_stats(self) -> dict:
-        """Force-fetch via synchronous bus.request — diagnostics only."""
+        """Force-fetch via SHM read of assessment_state.bin (Session 3
+        publisher). Preamble G18 — state transport is SHM, never bus.
+        Replaces prior sync bus.request("assessment_stats") path.
+        Diagnostics only."""
         try:
-            reply = self._bus.request(
-                src="assessment_proxy", dst="agency_worker",
-                payload={"action": "assessment_stats"},
-                timeout=10.0, reply_queue=self._reply_queue,
-            )
+            raw = self._r_assessment_state.read_variable()
         except Exception as e:
-            logger.warning("[AssessmentProxy] sync request raised: %s", e)
+            self._track_fallback("assessment_state",
+                                 f"read_raised:{type(e).__name__}")
             return dict(self._stats_cache)
-        if reply is None:
+        if raw is None:
+            self._track_fallback("assessment_state", "shm_unavailable")
             return dict(self._stats_cache)
-        body = reply.get("payload") or {}
-        if "stats" in body and isinstance(body["stats"], dict):
-            self._stats_cache = dict(body["stats"])
+        try:
+            decoded = msgpack.unpackb(raw, raw=False)
+        except Exception as e:
+            self._track_fallback("assessment_state",
+                                 f"decode_raised:{type(e).__name__}")
+            return dict(self._stats_cache)
+        if isinstance(decoded, dict):
+            # SHM payload uses average_score (matches assessment_state schema);
+            # cache uses avg_score (legacy ASSESSMENT_STATS broadcast key).
+            # Preserve cache-key conventions for downstream callers.
+            mapped = dict(decoded)
+            if "average_score" in mapped and "avg_score" not in mapped:
+                mapped["avg_score"] = mapped["average_score"]
+            self._stats_cache = mapped
         return dict(self._stats_cache)
+
+    def _track_fallback(self, slot_name: str, reason: str) -> None:
+        prev = self._fallback_counts.get(slot_name, 0)
+        self._fallback_counts[slot_name] = prev + 1
+        if prev == 0:
+            logger.info(
+                "[AssessmentProxy] FIRST FALLBACK slot=%s reason=%s",
+                slot_name, reason)
 
     def update_cached_stats(self, payload: dict) -> None:
         """Called by parent's _agency_loop when ASSESSMENT_STATS arrives."""

@@ -117,6 +117,13 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     # FOCUS nudges from Spirit PID controller
     focus_nudges = [0.0] * 5
 
+    # rFP_trinity_130d_awakening §12.4 / SPEC §23.5 — outer-sources cache
+    # populated from OUTER_SOURCES_SNAPSHOT broadcasts (every 10s). Feeds
+    # collect_mind_15d's hormone_levels / interaction_quality / assessment_quality
+    # arguments so inner_mind feeling[6] inner_touch and feeling[8] inner_taste
+    # get real upstream signal instead of the 0.5 default.
+    plugin_cache: dict = {}
+
     # Paths for ambient sensors
     data_dir = config.get("data_dir", "./data")
     session_db = os.path.join(data_dir, "agno_sessions.db")
@@ -137,6 +144,7 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 mood_engine, social_graph, media_state, data_dir, session_db,
                 config, fast_stop_event,
                 lambda: (severity_multipliers, focus_nudges),
+                plugin_cache=plugin_cache,
             )
             logger.info(
                 "[MindWorker] §L1 fast path ON: 5 refresh threads + 23.49 Hz shm writer"
@@ -154,6 +162,27 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
     logger.info("[MindWorker] 5DT cognitive sensors online (fast=%s)",
                 bool(sensor_cache))
+
+    # Phase C Session 4 (rFP §4.B.6) — SHM-direct mind_state.bin publisher.
+    # Closes the deadlock-prone sync bus.request paths for mind_proxy
+    # methods get_mood_label/get_mood_valence/get_current_reward.
+    try:
+        from titan_plugin.core.state_registry import resolve_titan_id
+        from titan_plugin.logic.mind_state_publisher import MindStatePublisher
+        from titan_plugin.logic.worker_publisher_runner import (
+            run_worker_publisher)
+        _mind_state_publisher = MindStatePublisher(titan_id=resolve_titan_id())
+        run_worker_publisher(
+            publisher=_mind_state_publisher,
+            state_fetcher=lambda: mood_engine,
+            worker_name="mind_worker",
+            cadence_s=1.0,
+        )
+    except Exception as _pub_init_err:
+        logger.error(
+            "[MindWorker] mind_state SHM publisher BOOT FAILED — "
+            "consumers fall back to sync bus.request: %s",
+            _pub_init_err, exc_info=True)
 
     last_publish = 0.0
     publish_interval = 1.15   # Mind = Schumann/9 (0.87 Hz) — Earth resonance
@@ -187,7 +216,11 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     severity_multipliers, focus_nudges,
                     cache=sensor_cache,
                 )
-                _publish_mind_state(send_queue, name, tensor, severity_multipliers)
+                _publish_mind_state(
+                    send_queue, name, tensor, severity_multipliers,
+                    plugin_cache=plugin_cache,
+                    data_dir=data_dir, session_db=session_db,
+                )
                 last_publish = now
                 publish_count += 1
                 if publish_count % 200 == 0:  # ~3.8 min at 1.15s interval
@@ -229,6 +262,13 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     _all.append(shm_writer_thread)
                 stop_threads(fast_stop_event, _all, timeout_s=2.0)
             break
+
+        # rFP_trinity_130d_awakening §12.4 — outer-sources cache update
+        if msg_type == bus.OUTER_SOURCES_SNAPSHOT:
+            payload = msg.get("payload")
+            if isinstance(payload, dict):
+                plugin_cache.update(payload)
+            continue
 
         # Receive FILTER_DOWN severity multipliers from Spirit
         if msg_type == bus.FILTER_DOWN:
@@ -324,23 +364,17 @@ def _handle_query(msg: dict, mood_engine, social_graph, media_state: dict,
     src = msg.get("src", "")
 
     try:
-        if action == "get_tensor":
-            tensor = _collect_mind_tensor(
-                mood_engine, social_graph, media_state, data_dir, session_db,
-                severity_multipliers, focus_nudges,
-                cache=cache,
-            )
-            _send_response(send_queue, name, src, {"tensor": tensor}, rid)
-
-        elif action == "get_mood":
-            label = mood_engine.get_mood_label() if mood_engine else "Unknown"
-            _send_response(send_queue, name, src, {"mood": label}, rid)
-
-        elif action == "get_valence":
-            val = mood_engine.previous_mood if mood_engine else 0.5
-            _send_response(send_queue, name, src, {"valence": val}, rid)
-
-        elif action == "record_interaction":
+        # Phase C Session 5 (rFP §4.D.2): get_tensor / get_mood /
+        # get_valence / get_current_reward handlers RETIRED — proxy
+        # consumers migrated to SHM-direct via mind_state.bin (Session 4
+        # §4.C.2). Static caller graph (G-RPC-4) confirms zero remaining
+        # callers. record_interaction / save_profile remain (fire-and-
+        # forget publishes — no QUERY round-trip). get_or_create_user /
+        # should_engage remain (work-RPC, allowlisted in
+        # phase_c_rpc_exemptions.yaml — proxy calls them via dynamic
+        # action through _work_rpc_sync helper, not detected by static
+        # caller scan).
+        if action == "record_interaction":
             if social_graph:
                 user_id = payload.get("user_id", "")
                 quality = float(payload.get("quality", 0.5))
@@ -376,14 +410,6 @@ def _handle_query(msg: dict, mood_engine, social_graph, media_state: dict,
         elif action == "save_profile":
             # Fire-and-forget profile update
             pass
-
-        elif action == "get_current_reward":
-            if mood_engine:
-                info_gain = payload.get("info_gain", 0.0)
-                reward = mood_engine.get_current_reward(info_gain=info_gain)
-                _send_response(send_queue, name, src, {"reward": reward}, rid)
-            else:
-                _send_response(send_queue, name, src, {"reward": 0.5}, rid)
 
         elif action == "get_social_stats":
             stats = social_graph.get_stats() if social_graph else {}
@@ -687,8 +713,19 @@ def _get_circadian_rhythm() -> float:
 
 def _publish_mind_state(send_queue, name: str, tensor: list,
                         severity_multipliers: list | None = None,
-                        hormone_levels: dict | None = None) -> None:
-    """Publish MIND_STATE to the bus with 5D legacy + 15D extended."""
+                        hormone_levels: dict | None = None,
+                        plugin_cache: dict | None = None,
+                        data_dir: str | None = None,
+                        session_db: str | None = None) -> None:
+    """Publish MIND_STATE to the bus with 5D legacy + 15D extended.
+
+    rFP_trinity_130d_awakening §12.4 / SPEC §23.5 — pulls
+    interaction_quality and assessment_quality from plugin_cache (populated
+    by OUTER_SOURCES_SNAPSHOT) so inner_mind feeling[6] inner_touch and
+    feeling[8] inner_taste read real upstream values instead of defaulting
+    to 0.5. hormone_levels for willing[10-14] also pulled from cache when
+    not passed directly.
+    """
     center = [0.5] * 5
     center_dist = sum((t - c) ** 2 for t, c in zip(tensor, center)) ** 0.5
 
@@ -704,9 +741,51 @@ def _publish_mind_state(send_queue, name: str, tensor: list,
     # DQ2: Extended 15D Mind tensor (Thinking + Feeling + Willing)
     try:
         from titan_plugin.logic.mind_tensor import collect_mind_15d
+
+        # Pull rich-producer values from plugin_cache (Phase 1 wiring).
+        cache = plugin_cache or {}
+        # interaction_quality ← social_perception_stats.sentiment_ema
+        soc_perc = cache.get("social_perception_stats") or {}
+        interaction_quality = float(soc_perc.get("sentiment_ema", 0.5))
+        # assessment_quality ← assessment_stats.average_score
+        assess = cache.get("assessment_stats") or {}
+        assessment_quality = float(assess.get("average_score", 0.5))
+        # hormones: prefer explicit kwarg, fall back to cache (broadcast by
+        # plugin every 10s via OUTER_SOURCES_SNAPSHOT.hormone_levels).
+        hormones = hormone_levels if hormone_levels else cache.get("hormone_levels")
+
+        # Phase 2 (rFP_trinity_130d_awakening §4.4 + SPEC §23.5):
+        # Build audio_state / visual_state / ambient_change. Per SPEC:
+        #   inner_hearing = 0.5*min(1,audio_creates_recent/5) + 0.5*sense_hearing_ambient
+        #   inner_sight   = 0.5*min(1,art_creates_recent/5)   + 0.5*sense_vision_ambient
+        #   inner_smell   = ambient_change (rolling stddev cpu+circ)
+        # creates_recent + ambient_change come from plugin-side
+        # InnerPerceptionState (broadcast via inner_perception_stats);
+        # the *_ambient sub-signals come from mind_worker's own producers
+        # since data_dir / session_db live in this worker's scope.
+        ip_stats = cache.get("inner_perception_stats") or {}
+        audio_state = {
+            "creates_recent": int(
+                (ip_stats.get("audio_state") or {}).get("creates_recent", 0)),
+            "ambient": (
+                _sense_hearing_ambient(session_db) if session_db else 0.5),
+        }
+        visual_state = {
+            "creates_recent": int(
+                (ip_stats.get("visual_state") or {}).get("creates_recent", 0)),
+            "ambient": (
+                _sense_vision_ambient(data_dir) if data_dir else 0.5),
+        }
+        ambient_change = float(ip_stats.get("ambient_change", 0.0) or 0.0)
+
         mind_15d = collect_mind_15d(
             current_5d=tensor,
-            hormone_levels=hormone_levels,
+            audio_state=audio_state,
+            interaction_quality=interaction_quality,
+            visual_state=visual_state,
+            assessment_quality=assessment_quality,
+            ambient_change=ambient_change,
+            hormone_levels=hormones,
         )
         payload["values_15d"] = [round(v, 4) for v in mind_15d]
         payload["dims_extended"] = 15
@@ -1005,7 +1084,8 @@ def _read_flag(config: dict, dotted_path: str, default: bool) -> bool:
 
 
 def _start_fast_path(mood_engine, social_graph, media_state, data_dir,
-                     session_db, config, stop_event, get_modulators) -> tuple:
+                     session_db, config, stop_event, get_modulators,
+                     plugin_cache: dict | None = None) -> tuple:
     """
     Start the §L1 fast-path threads for mind. Returns:
       (sensor_cache, refresh_threads, shm_writer_thread)
@@ -1080,15 +1160,36 @@ def _start_fast_path(mood_engine, social_graph, media_state, data_dir,
                 cache=cache,
             )
             # Step 2: extend to 15D via collect_mind_15d (Thinking +
-            # Feeling + Willing). Hormone levels intentionally left
-            # None — matches the existing bus-publish behavior. The
-            # 15D extension is pure compute over the 5D + neuromod
-            # state, no additional I/O.
+            # Feeling + Willing). Reads the same plugin_cache that the
+            # bus-publish path uses (rFP_trinity_130d_awakening Phase 2),
+            # so SHM-fed consumers see the SPEC §23.5 formulas instead of
+            # 0.5 padding.
             try:
                 from titan_plugin.logic.mind_tensor import collect_mind_15d
+                pc = plugin_cache or {}
+                ip_stats = pc.get("inner_perception_stats") or {}
+                soc_perc = pc.get("social_perception_stats") or {}
+                assess = pc.get("assessment_stats") or {}
+                _audio_state = {
+                    "creates_recent": int(
+                        (ip_stats.get("audio_state") or {}).get("creates_recent", 0)),
+                    "ambient": (
+                        _sense_hearing_ambient(session_db) if session_db else 0.5),
+                }
+                _visual_state = {
+                    "creates_recent": int(
+                        (ip_stats.get("visual_state") or {}).get("creates_recent", 0)),
+                    "ambient": (
+                        _sense_vision_ambient(data_dir) if data_dir else 0.5),
+                }
                 tensor_15d = collect_mind_15d(
                     current_5d=tensor_5d,
-                    hormone_levels=None,
+                    audio_state=_audio_state,
+                    interaction_quality=float(soc_perc.get("sentiment_ema", 0.5)),
+                    visual_state=_visual_state,
+                    assessment_quality=float(assess.get("average_score", 0.5)),
+                    ambient_change=float(ip_stats.get("ambient_change", 0.0) or 0.0),
+                    hormone_levels=pc.get("hormone_levels"),
                 )
             except Exception:
                 # Defensive — if the 15D extension fails, write the

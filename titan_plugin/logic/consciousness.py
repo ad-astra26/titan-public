@@ -193,8 +193,11 @@ class ConsciousnessDB:
         if self._writer is None:
             try:
                 from titan_plugin.persistence.config import IMWConfig
+                # rFP_imw_writerclient_singleton (2026-05-07 PM): see
+                # events_teacher.py:109 — same migration to per-caller
+                # singleton via `get_client()`.
                 from titan_plugin.persistence.writer_client import (
-                    InnerMemoryWriterClient,
+                    get_client,
                 )
                 cfg = IMWConfig.from_titan_config_section("persistence_consciousness")
                 if cfg.enabled and cfg.mode != "disabled":
@@ -211,8 +214,7 @@ class ConsciousnessDB:
                                 return
                         except OSError as _e:
                             logger.debug("[ConsciousnessDB] realpath check failed: %s", _e)
-                    self._writer = InnerMemoryWriterClient(
-                        cfg, caller_name="consciousness_db")
+                    self._writer = get_client("consciousness_db", cfg=cfg)
                     logger.info(
                         "[ConsciousnessDB] Routed via consciousness_writer "
                         "(mode=%s, canonical=%s)",

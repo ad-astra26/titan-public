@@ -62,6 +62,7 @@ class RebirthBackup:
         # Backup state tracking (calendar-day based)
         self._last_personality_date = ""  # "YYYY-MM-DD"
         self._last_soul_date = ""         # "YYYY-MM-DD"
+        self._last_timechain_date = ""    # "YYYY-MM-DD" — added 2026-05-06
         self._meditation_count = 0
         self._meditation_count_since_nft = 0
 
@@ -82,6 +83,12 @@ class RebirthBackup:
                     state = json.load(f)
                 self._last_personality_date = state.get("last_personality_date", "")
                 self._last_soul_date = state.get("last_soul_date", "")
+                # 2026-05-06 fix: timechain backup date now persisted across
+                # restarts. Pre-fix it was in-memory only → every restart
+                # re-triggered timechain on next meditation. Caused 160-backup
+                # bloat on T3 (10/day vs target 1/day) — see BUG-TIMECHAIN-
+                # BACKUP-RESTART-LEAK-20260506.
+                self._last_timechain_date = state.get("last_timechain_date", "")
                 self._meditation_count = state.get("meditation_count", 0)
                 self._meditation_count_since_nft = state.get("meditation_count_since_nft", 0)
                 logger.info("[Backup] Loaded state: personality=%s, soul=%s, meditations=%d",
@@ -99,6 +106,7 @@ class RebirthBackup:
                 json.dump({
                     "last_personality_date": self._last_personality_date,
                     "last_soul_date": self._last_soul_date,
+                    "last_timechain_date": self._last_timechain_date,
                     "meditation_count": self._meditation_count,
                     "meditation_count_since_nft": self._meditation_count_since_nft,
                     "updated_at": time.time(),
@@ -216,8 +224,12 @@ class RebirthBackup:
                 self._save_backup_state()
 
         # 5. TimeChain backup (daily, alongside personality)
-        if today != getattr(self, '_last_timechain_date', ''):
+        if today != self._last_timechain_date:
             self._last_timechain_date = today
+            # 2026-05-06 fix: persist timechain date so restarts don't re-trigger.
+            # Pre-fix this line was missing → T3 with frequent restarts produced
+            # 160 backups in 16 days (~10/day vs target 1/day), filling 14GB.
+            self._save_backup_state()
             try:
                 from titan_plugin.logic.timechain_backup import TimeChainBackup
                 # rFP Phase 1 BUG-5: use injected ArweaveStore (constructed once at
@@ -495,9 +507,71 @@ class RebirthBackup:
                         "[Backup] ZK epoch snapshot: memories=%d, sovereignty=%dbp",
                         total_nodes, sovereignty_bp,
                     )
+                    # rFP_x_voice_enrichment §4.3.1 — PROOF_DAY needs the
+                    # ZK Vault snapshot signature to render the "Seal" URL
+                    # (iamtitan.tech/tx/{sig}). Persist alongside the
+                    # backup_anchor_chain so the archetype can read the
+                    # most-recent vault commit on demand.
+                    self._persist_vault_snapshot(
+                        tx_sig=tx_sig,
+                        archive_hash=archive_hash,
+                        memory_count=total_nodes,
+                        sovereignty_bp=sovereignty_bp,
+                        arweave_url=arweave_url or "",
+                    )
         except Exception as e:
             swallow_warn('[Backup] ZK epoch snapshot skipped', e,
                          key="logic.backup.zk_epoch_snapshot_skipped", throttle=100)
+
+    def _vault_snapshots_path(self) -> str:
+        """Per-Titan ZK Vault snapshot history file (rFP_x_voice_enrichment §4.3.1)."""
+        return f"data/zk_vault_snapshots_{self._titan_id}.json"
+
+    def _persist_vault_snapshot(self, *, tx_sig: str, archive_hash: str,
+                                 memory_count: int, sovereignty_bp: int,
+                                 arweave_url: str = "") -> None:
+        """Append a successful ZK Vault snapshot to the per-Titan history file.
+
+        Atomic write via tmp+rename. Bounded to last 200 entries (~6 months
+        at one meditation per ~daily). Failures are non-critical — the
+        on-chain TX succeeded; this file is purely a queryable mirror.
+        """
+        import json as _json
+        try:
+            p = self._vault_snapshots_path()
+            os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+            existing: list = []
+            if os.path.exists(p):
+                try:
+                    with open(p) as f:
+                        loaded = _json.load(f)
+                    if isinstance(loaded, dict):
+                        existing = loaded.get("snapshots", []) or []
+                    elif isinstance(loaded, list):
+                        existing = loaded
+                except Exception:
+                    existing = []
+            existing.append({
+                "tx_sig": tx_sig,
+                "archive_hash": archive_hash,
+                "memory_count": int(memory_count),
+                "sovereignty_bp": int(sovereignty_bp),
+                "arweave_url": arweave_url,
+                "ts": int(time.time()),
+            })
+            existing = existing[-200:]
+            payload = {
+                "version": 1,
+                "titan_id": self._titan_id,
+                "snapshots": existing,
+            }
+            tmp = p + ".tmp"
+            with open(tmp, "w") as f:
+                _json.dump(payload, f, indent=2)
+            os.replace(tmp, p)
+        except Exception as e:
+            swallow_warn('[Backup] vault snapshot persist failed', e,
+                         key="logic.backup.vault_snapshot_persist_failed", throttle=100)
 
     # -------------------------------------------------------------------------
     # MyDay NFT (Solana — every 4th meditation)

@@ -94,8 +94,8 @@ def test_socket_mode_when_env_complete(tmp_path):
     sock = tmp_path / "bus.sock"
     # Need broker for client to actually connect
     from titan_plugin.core.bus_authkey import derive_bus_authkey
-    secret = bytes(range(64))
-    authkey = derive_bus_authkey(secret, "testT")
+    secret = bytes(range(64))[:32]  # match production loader (secret_seed = first 32 bytes)
+    authkey = derive_bus_authkey(secret)
     broker = BusSocketServer(titan_id="testT", authkey=authkey, sock_path=sock)
     broker.start()
     env = {
@@ -182,8 +182,8 @@ def test_real_fork_worker_connects_and_exchanges(tmp_path):
     titan_id = "testT"
     # Boot broker
     from titan_plugin.core.bus_authkey import derive_bus_authkey
-    secret = bytes(range(64))
-    authkey = derive_bus_authkey(secret, titan_id)
+    secret = bytes(range(64))[:32]  # match production loader (secret_seed = first 32 bytes)
+    authkey = derive_bus_authkey(secret)
     broker = BusSocketServer(titan_id=titan_id, authkey=authkey, sock_path=sock)
     broker.start()
 
@@ -320,8 +320,8 @@ def test_real_fork_worker_survives_broker_swap(tmp_path):
     shutdown = tmp_path / "shutdown.flag"
     titan_id = "testT"
     from titan_plugin.core.bus_authkey import derive_bus_authkey
-    secret = bytes(range(64))
-    authkey = derive_bus_authkey(secret, titan_id)
+    secret = bytes(range(64))[:32]  # match production loader (secret_seed = first 32 bytes)
+    authkey = derive_bus_authkey(secret)
 
     s1 = BusSocketServer(titan_id=titan_id, authkey=authkey, sock_path=sock)
     s1.start()

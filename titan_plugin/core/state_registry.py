@@ -1,40 +1,67 @@
 """
-StateRegistry — L0 shared-memory state registries.
+StateRegistry — L0 shared-memory state registries (§7.0 v1.0.0 triple-buffer).
 
-Microkernel v2 Phase A §A.2 (2026-04-24). Persistent mmap + SeqLock —
-zero-copy, no-syscall hot path. Matches Maker's 2026-04-17 directive
-("fast and probably memory-based; file reads would be too slow") and
-the rFP: "zero-copy, non-blocking, no bus message needed".
-
-Extends the proven pattern from ``titan_plugin.logic.cgn_shm_protocol``
-(live since 2026-04 on all 3 Titans for emot_grounding + emot_state +
-emot_latent_bundle + cgn_live_weights).
-
-Protocol reference: ``titan-docs/PLAN_microkernel_phase_a.md`` §5.
+Microkernel v2 Phase A §A.2 (2026-04-24); upgraded to triple-buffer wire
+format per D-SPEC-35 (2026-05-05) — closes
+``titan-docs/rFP_rust_seqlock_retry_exhaustion.md``.
 
 ──────────────────────────────────────────────────────────────────────
-Header format (24 bytes, little-endian):
-    [0:4]    uint32  seq              SeqLock counter (odd = write in progress)
-    [4:8]    uint32  schema_version   Registry format revision
-    [8:16]   uint64  wall_ns          time.time_ns() of last write
-    [16:20]  uint32  payload_bytes    Size of payload that follows
-    [20:24]  uint32  header_crc       CRC32 of bytes [0:20]
+Wire format (SPEC §7.0 v1.0.0)
 
-Payload: contiguous bytes of the registered ndarray (row-major).
+Slot file layout:
 
-Writer protocol (SeqLock):
-    1. seq := seq + 1  → odd (write in progress)
-    2. write payload in-place
-    3. seq := seq + 1  → even (write complete)
+    [0  : 16]                    fixed header  (atomic publish word + constants)
+    [16 : 16 + (16+N)]           buffer 0      (16-byte meta + N-byte payload)
+    [16+(16+N) : 16+2(16+N)]     buffer 1
+    [16+2(16+N) : 16+3(16+N)]    buffer 2
 
-Reader protocol (SeqLock):
-    loop:
-        seq1 := read seq
-        if seq1 odd → retry (writer active)
-        copy payload
-        seq2 := read seq
-        if seq1 == seq2 → return copy
-        else → retry
+Total slot size = 16 + 3·(16+N) = 64 + 3N bytes.
+
+Fixed header (16 bytes, ``<QII``):
+
+    [0:8]    uint64 LE  header_seq        atomic publish word — bits[63:8]=version (monotonic), bits[7:0]=ready_idx ∈ {0,1,2}
+    [8:12]   uint32 LE  schema_version    set at create, never updated
+    [12:16]  uint32 LE  payload_capacity  per-buffer max payload bytes (= N); set at create
+
+Per-buffer block (16 metadata bytes + N payload bytes, ``<QII`` + payload):
+
+    [0:8]    uint64 LE  wall_ns          time.time_ns() at this buffer's publish
+    [8:12]   uint32 LE  payload_bytes    actual payload size in this buffer
+    [12:16]  uint32 LE  buffer_crc32     CRC32 over [0:12] || payload[0:payload_bytes]
+    [16:16+N]            payload bytes
+
+──────────────────────────────────────────────────────────────────────
+Writer protocol (single writer per slot)
+
+Writer holds local ``last_published_idx`` (init 2 ⇒ first publish lands on
+idx 0) and ``version`` (init 0 ⇒ first publish bumps to 1):
+
+    1. next_idx ← (last_published_idx + 1) mod 3
+    2. off ← 16 + next_idx · (16+N)
+    3. write meta prefix: mmap[off:off+8]   ← wall_ns
+                          mmap[off+8:off+12] ← len(payload)
+    4. memcpy mmap[off+16 : off+16+len(payload)] ← payload
+    5. crc ← CRC32(mmap[off:off+12] || payload)
+       write mmap[off+12:off+16] ← crc
+    6. ATOMIC STORE mmap[0:8] ← (version+1) << 8 | next_idx
+       (Python: aligned 8-byte struct.pack_into is single-instruction store
+        on x86_64 + aarch64, matching Rust AtomicU64::store(Release))
+    7. local: last_published_idx ← next_idx; version ← version + 1
+
+Reader protocol — zero retries, zero spinning:
+
+    1. s1 ← ATOMIC LOAD mmap[0:8] (Acquire on x86_64/aarch64 via aligned read)
+    2. version1 ← s1 >> 8;  idx ← s1 & 0xFF
+    3. if version1 == 0:                      return None  (uninitialized)
+    4. if idx > 2:                            return None  (corrupt sentinel)
+    5. off ← 16 + idx · (16+N)
+    6. read wall_ns, payload_bytes, stored_crc from mmap[off:off+16]
+    7. memcpy payload from mmap[off+16:off+16+payload_bytes]
+    8. compute_crc ← CRC32(mmap[off:off+12] || payload)
+    9. if compute_crc ≠ stored_crc:           return None  (extraordinarily rare)
+    10. s2 ← ATOMIC LOAD mmap[0:8]
+    11. if (s2 >> 8) - version1 ≤ 2:          return Ok(payload)
+    12. else:                                 return None  (lapped — reader preempted ≥3 cycles)
 
 Per-titan shm root: ``/dev/shm/titan_{titan_id}/``. Matches the live
 EMOT-CGN convention. See PLAN §5.1 D1 for the full rationale
@@ -54,15 +81,29 @@ from typing import Optional
 
 import numpy as np
 
+from titan_plugin._phase_c_constants import (
+    SHM_BUFFER_COUNT,
+    SHM_BUFFER_META_BYTES,
+    SHM_BUFFER_META_STRUCT,
+    SHM_HEADER_BYTES,
+    SHM_HEADER_STRUCT,
+)
+
 logger = logging.getLogger(__name__)
 
-# ── Constants ───────────────────────────────────────────────────────
+# ── Constants (re-exported from auto-generated SPEC-driven module) ────
 
-HEADER_SIZE = 24
-# [seq:4] [schema:4] [wall_ns:8] [payload_bytes:4] [header_crc:4]
-HEADER_STRUCT = "<IIQII"
-SCHEMA_VERSION = 1
-MAX_READ_RETRIES = 3
+HEADER_SIZE = SHM_HEADER_BYTES  # 16
+HEADER_STRUCT = SHM_HEADER_STRUCT  # "<QII"
+BUFFER_META_SIZE = SHM_BUFFER_META_BYTES  # 16
+BUFFER_META_STRUCT = SHM_BUFFER_META_STRUCT  # "<QII"
+BUFFER_COUNT = SHM_BUFFER_COUNT  # 3
+SCHEMA_VERSION = 1  # default per-spec; overridden per-slot
+
+# Bit positions for header_seq atomic word
+_VERSION_SHIFT = 8
+_IDX_MASK = 0xFF
+_IDX_MAX = BUFFER_COUNT - 1  # 2
 
 
 # ── Declarative spec ────────────────────────────────────────────────
@@ -82,10 +123,9 @@ class RegistrySpec:
                     writes should be published to shm. Empty = always enabled.
     schema_version: bump to invalidate old readers when layout changes.
     variable_size:  if True (S4 D11), payload is variable up to ``shape``
-                    max bytes; actual size encoded in header's payload_bytes
-                    field on each write. Use ``write_variable(bytes)`` and
+                    max bytes; actual size encoded in per-buffer metadata
+                    on each write. Use ``write_variable(bytes)`` and
                     ``read_variable() -> bytes`` instead of write/read.
-                    Enables CGN + future variable-payload consumers.
     """
 
     name: str
@@ -102,8 +142,8 @@ class RegistrySpec:
 
     @property
     def total_bytes(self) -> int:
-        """Total bytes preallocated (header + max payload)."""
-        return HEADER_SIZE + self.payload_bytes
+        """Total bytes preallocated: header + 3 × (buffer_meta + max payload)."""
+        return HEADER_SIZE + BUFFER_COUNT * (BUFFER_META_SIZE + self.payload_bytes)
 
 
 # ── Path resolution ─────────────────────────────────────────────────
@@ -114,23 +154,11 @@ def resolve_titan_id(explicit: str | None = None) -> str:
     Resolve the Titan ID using the canonical precedence chain. Matches
     `titan_plugin.logic.emot_shm_protocol._resolve_titan_id` so all
     per-Titan shm paths share a single source of truth.
-
-    Precedence:
-      1. explicit `titan_id` arg (kwarg from caller)
-      2. data/titan_identity.json (canonical — same source as emot,
-         language_config, meta_outer; each Titan's repo has its own file)
-      3. TITAN_ID env var (rare fallback)
-      4. "T1" hardcoded fallback
-
-    Critical for T2+T3 which share /dev/shm on the same VPS — without
-    the canonical resolver, both would default to "T1" and stomp each
-    other's trinity_state.bin.
     """
     if explicit:
         return str(explicit)
     try:
         import json
-        # Project root: titan_plugin/core/<file> → ../../
         proj_root = os.path.dirname(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         identity_path = os.path.join(proj_root, "data", "titan_identity.json")
@@ -148,14 +176,7 @@ def resolve_titan_id(explicit: str | None = None) -> str:
 
 
 def resolve_shm_root(titan_id: str | None = None) -> Path:
-    """
-    Return the shm root directory. Honors TITAN_SHM_ROOT env override
-    (used by tests). Per-titan convention: /dev/shm/titan_{titan_id}/.
-
-    When titan_id is None, uses resolve_titan_id() to follow the
-    canonical precedence chain (data/titan_identity.json → TITAN_ID
-    env → "T1"). Explicit titan_id always wins.
-    """
+    """Return the shm root directory."""
     env = os.environ.get("TITAN_SHM_ROOT")
     if env:
         return Path(env)
@@ -177,16 +198,32 @@ def _preallocate_file(path: Path, total_bytes: int) -> None:
     """
     if path.exists() and path.stat().st_size == total_bytes:
         return
-    # Create or resize.
     with open(path, "wb") as f:
         f.write(b"\x00" * total_bytes)
 
 
-def _pack_header(seq: int, schema: int, wall_ns: int, payload_bytes: int) -> bytes:
-    """Pack the 20-byte header prefix and append its CRC32 → 24 bytes."""
-    prefix = struct.pack("<IIQI", seq, schema, wall_ns, payload_bytes)
-    crc = zlib.crc32(prefix)
-    return prefix + struct.pack("<I", crc)
+# ── Header pack/unpack helpers ──────────────────────────────────────
+
+
+def _pack_header_seq(version: int, ready_idx: int) -> int:
+    """Compose header_seq u64 from version + ready_idx."""
+    return ((version & ((1 << 56) - 1)) << _VERSION_SHIFT) | (ready_idx & _IDX_MASK)
+
+
+def _unpack_header_seq(seq: int) -> tuple[int, int]:
+    """Extract (version, ready_idx) from header_seq u64."""
+    return (seq >> _VERSION_SHIFT, seq & _IDX_MASK)
+
+
+def _buffer_offset(idx: int, payload_capacity: int) -> int:
+    """Byte offset of buffer ``idx`` within the slot mmap."""
+    return HEADER_SIZE + idx * (BUFFER_META_SIZE + payload_capacity)
+
+
+def _compute_buffer_crc32(wall_ns: int, payload_bytes: int, payload: bytes) -> int:
+    """CRC32 over the buffer's [0:12] meta prefix (wall_ns + payload_bytes) + payload."""
+    prefix = struct.pack("<QI", wall_ns, payload_bytes)
+    return zlib.crc32(prefix + payload) & 0xFFFFFFFF
 
 
 # ── Writer ──────────────────────────────────────────────────────────
@@ -194,19 +231,22 @@ def _pack_header(seq: int, schema: int, wall_ns: int, payload_bytes: int) -> byt
 
 class StateRegistryWriter:
     """
-    Single-writer persistent-mmap registry writer.
+    Single-writer triple-buffer registry writer.
 
-    Concurrency: one writer per registry (Phase A design). If multiple
-    writers were ever needed, an external lock would be required.
+    Concurrency: one writer per registry (Phase A design). Multi-writer
+    requires external lock.
 
-    Hot path: 1 memcpy into shared memory + 2 struct.pack_into for
-    SeqLock bookends. Zero syscalls.
+    Hot path: 1 memcpy into shared memory (per-buffer payload) + 16-byte
+    metadata prefix + CRC32 + atomic 8-byte store. Zero syscalls.
     """
 
     def __init__(self, spec: RegistrySpec, shm_root: Path):
         self.spec = spec
         self.path = shm_root / f"{spec.name}.bin"
-        self._seq = 0
+        # Writer state: version starts at 0, last_idx at IDX_MAX so
+        # first publish lands on idx 0.
+        self._version = 0
+        self._last_idx = _IDX_MAX
 
         _preallocate_file(self.path, spec.total_bytes)
         self._fd = os.open(self.path, os.O_RDWR)
@@ -216,23 +256,55 @@ class StateRegistryWriter:
             flags=mmap.MAP_SHARED,
             prot=mmap.PROT_READ | mmap.PROT_WRITE,
         )
-        # Initialize header with seq=0 (even, no write in progress).
-        header = _pack_header(
-            seq=0,
-            schema=spec.schema_version,
-            wall_ns=time.time_ns(),
-            payload_bytes=spec.payload_bytes,
+        # Write fixed header (constants); header_seq starts 0 = uninitialized.
+        struct.pack_into(
+            HEADER_STRUCT, self._mm, 0,
+            0,                       # header_seq
+            spec.schema_version,
+            spec.payload_bytes,      # payload_capacity (= N)
         )
-        self._mm[:HEADER_SIZE] = header
+        # Initial publish: zero-fill capacity payload at version=1 so the
+        # slot is immediately readable at the declared byte size. Matches
+        # the Rust Slot::create initialization + the legacy SeqLock
+        # semantics where seq=0 (stable) was a readable zero-payload
+        # snapshot of declared size.
+        self._publish(b"\x00" * spec.payload_bytes)
+
+    # -- internal --------------------------------------------------------
+
+    def _publish(self, payload: bytes) -> int:
+        """Triple-buffer publish — used by write/write_variable + create init."""
+        next_idx = (self._last_idx + 1) % BUFFER_COUNT
+        off = _buffer_offset(next_idx, self.spec.payload_bytes)
+
+        wall_ns = time.time_ns()
+        payload_len = len(payload)
+
+        # Step 1: write metadata prefix (wall_ns + payload_bytes) at [off:off+12].
+        struct.pack_into("<QI", self._mm, off, wall_ns, payload_len)
+        # Step 2: write payload at [off+16 : off+16+payload_len].
+        self._mm[off + BUFFER_META_SIZE : off + BUFFER_META_SIZE + payload_len] = payload
+        # Step 3: compute CRC and write at [off+12:off+16].
+        crc = _compute_buffer_crc32(wall_ns, payload_len, payload)
+        struct.pack_into("<I", self._mm, off + 12, crc)
+        # Step 4: atomic publish — single 8-byte aligned store at offset 0
+        # (synchronizes-with reader Acquire-load on x86_64 via TSO; on
+        # aarch64 Python's struct.pack_into compiles to a single STR which
+        # is also atomic at aligned 8-byte offset).
+        new_version = self._version + 1
+        new_seq = _pack_header_seq(new_version, next_idx)
+        struct.pack_into("<Q", self._mm, 0, new_seq)
+        # Step 5: update local state.
+        self._last_idx = next_idx
+        self._version = new_version
+        return new_version
 
     # -- hot path ----------------------------------------------------
 
     def write(self, array: np.ndarray) -> int:
         """
-        SeqLock-protected in-place write.
-
-        Returns the new even seq number. Raises ValueError on
-        shape/dtype mismatch.
+        Triple-buffer publish of a fixed-size ndarray. Returns the new version.
+        Raises ValueError on shape/dtype mismatch.
         """
         if array.dtype != self.spec.dtype or array.shape != self.spec.shape:
             raise ValueError(
@@ -242,90 +314,38 @@ class StateRegistryWriter:
             )
         if not array.flags["C_CONTIGUOUS"]:
             array = np.ascontiguousarray(array)
-
-        # Stage 1: bump to odd (writer active).
-        self._seq += 1
-        wall_ns = time.time_ns()
-        self._mm[:HEADER_SIZE] = _pack_header(
-            seq=self._seq,
-            schema=self.spec.schema_version,
-            wall_ns=wall_ns,
-            payload_bytes=self.spec.payload_bytes,
-        )
-
-        # Stage 2: write payload in-place via numpy zero-copy view.
-        view = np.frombuffer(
-            self._mm,
-            dtype=self.spec.dtype,
-            count=int(np.prod(self.spec.shape)),
-            offset=HEADER_SIZE,
-        ).reshape(self.spec.shape)
-        view[...] = array
-
-        # Stage 3: bump to even (write complete).
-        self._seq += 1
-        self._mm[:HEADER_SIZE] = _pack_header(
-            seq=self._seq,
-            schema=self.spec.schema_version,
-            wall_ns=wall_ns,
-            payload_bytes=self.spec.payload_bytes,
-        )
-        return self._seq
+        return self._publish(array.tobytes())
 
     # -- variable-size hot path (D11) --------------------------------
 
     def write_variable(self, payload: bytes) -> int:
         """
-        SeqLock-protected variable-size in-place write (S4 D11).
-
-        Writes ``payload`` directly as raw bytes. Header's ``payload_bytes``
-        field records the actual size; readers use ``read_variable()`` to
-        get only the actual slice. Total payload must fit within the
-        spec's preallocated max (``spec.payload_bytes``).
-
-        Returns the new even seq number. Raises ValueError if payload
-        exceeds max or spec is not declared as variable_size.
+        Triple-buffer publish of a variable-size payload (S4 D11).
+        Total payload must fit within ``spec.payload_bytes`` (the per-buffer
+        capacity). Returns the new version.
         """
         if not self.spec.variable_size:
             raise ValueError(
                 f"Registry {self.spec.name}: write_variable() requires "
                 f"variable_size=True; use write(ndarray) for fixed specs"
             )
-        actual_bytes = len(payload)
-        if actual_bytes > self.spec.payload_bytes:
+        if len(payload) > self.spec.payload_bytes:
             raise ValueError(
-                f"Registry {self.spec.name}: payload {actual_bytes}B "
+                f"Registry {self.spec.name}: payload {len(payload)}B "
                 f"exceeds preallocated max {self.spec.payload_bytes}B"
             )
-
-        # Stage 1: bump to odd (writer active).
-        self._seq += 1
-        wall_ns = time.time_ns()
-        self._mm[:HEADER_SIZE] = _pack_header(
-            seq=self._seq,
-            schema=self.spec.schema_version,
-            wall_ns=wall_ns,
-            payload_bytes=actual_bytes,  # ACTUAL, not max
-        )
-
-        # Stage 2: write payload bytes directly.
-        self._mm[HEADER_SIZE:HEADER_SIZE + actual_bytes] = payload
-
-        # Stage 3: bump to even (write complete).
-        self._seq += 1
-        self._mm[:HEADER_SIZE] = _pack_header(
-            seq=self._seq,
-            schema=self.spec.schema_version,
-            wall_ns=wall_ns,
-            payload_bytes=actual_bytes,
-        )
-        return self._seq
+        return self._publish(payload)
 
     # -- introspection ----------------------------------------------
 
     @property
+    def version(self) -> int:
+        return self._version
+
+    @property
     def seq(self) -> int:
-        return self._seq
+        """Backward-compat alias (legacy callers expected SeqLock counter)."""
+        return self._version
 
     def close(self) -> None:
         """Called at process shutdown only; not on hot path."""
@@ -340,15 +360,14 @@ class StateRegistryWriter:
 
 class StateRegistryReader:
     """
-    Persistent-mmap registry reader. Stateless aside from the open mmap
-    handle. Safe to use from any layer/process.
+    Persistent-mmap triple-buffer registry reader. Stateless aside from
+    the open mmap handle. Safe to use from any layer/process.
 
     Hot path: zero syscalls, zero allocations except the defensive
-    ``.copy()`` of the returned ndarray.
+    ``.copy()`` of the returned ndarray. Zero retries. Zero spinning.
 
-    Fallback behavior: ``read()`` returns ``None`` on any error — caller
-    MUST fall back to the legacy path. Fallback-reason is logged at
-    INFO level ONCE per reader lifetime to avoid log spam.
+    Fallback: ``read()`` returns ``None`` on any error — caller MUST fall
+    back to legacy path. Reasons logged at INFO once per reader lifetime.
     """
 
     def __init__(self, spec: RegistrySpec, shm_root: Path):
@@ -358,8 +377,6 @@ class StateRegistryReader:
         self._fd: int | None = None
         self._elem_count = int(np.prod(spec.shape))
         self._fallback_logged = False
-        # Defer attach — the file may not exist yet at construction time
-        # (writer boots later). attach() is called lazily on first read.
 
     # -- internal --------------------------------------------------
 
@@ -379,7 +396,7 @@ class StateRegistryReader:
                 prot=mmap.PROT_READ,
             )
             return True
-        except Exception as e:  # pragma: no cover — defensive
+        except Exception as e:
             logger.debug(
                 "[StateRegistryReader] attach failed for %s: %s",
                 self.spec.name, e,
@@ -399,78 +416,94 @@ class StateRegistryReader:
 
     def read(self) -> Optional[np.ndarray]:
         """
-        SeqLock-protected zero-copy read + defensive copy.
-
-        Returns a fresh ndarray (owned by caller) or ``None`` on any
-        error/mismatch/torn-read. Caller must handle None by falling
-        back to the legacy state path.
+        Triple-buffer read. Returns a fresh ndarray (owned by caller) or
+        ``None`` on uninitialized/corrupt/lapped. Zero retries.
         """
         if self._mm is None and not self._attach():
             return self._fallback("not_attached")
 
-        mm = self._mm  # local alias
+        mm = self._mm
+        N = self.spec.payload_bytes  # per-buffer capacity
 
-        for _ in range(MAX_READ_RETRIES):
-            seq1 = struct.unpack_from("<I", mm, 0)[0]
-            if seq1 & 1:
-                continue  # writer active — retry
+        # Step 1: atomic Acquire-load of header_seq.
+        s1 = struct.unpack_from("<Q", mm, 0)[0]
+        version1, idx = _unpack_header_seq(s1)
 
-            # Cheap header validation before paying for payload copy.
-            schema_ver = struct.unpack_from("<I", mm, 4)[0]
-            if schema_ver != self.spec.schema_version:
-                return self._fallback(f"schema_mismatch({schema_ver})")
-            payload_bytes = struct.unpack_from("<I", mm, 16)[0]
-            if payload_bytes != self.spec.payload_bytes:
-                return self._fallback(f"size_mismatch({payload_bytes})")
-            crc = struct.unpack_from("<I", mm, 20)[0]
-            expected = zlib.crc32(bytes(mm[0:20]))
-            if crc != expected:
-                return self._fallback("header_crc_mismatch")
+        if version1 == 0:
+            return self._fallback("uninitialized")
+        if idx > _IDX_MAX:
+            return self._fallback(f"ready_idx_out_of_range({idx})")
 
-            # Zero-copy view, then defensive copy.
-            view = np.frombuffer(
-                mm,
-                dtype=self.spec.dtype,
-                count=self._elem_count,
-                offset=HEADER_SIZE,
-            ).reshape(self.spec.shape)
-            snapshot = view.copy()
+        # Step 2: schema check (constant — never updated by writer).
+        schema_ver = struct.unpack_from("<I", mm, 8)[0]
+        if schema_ver != self.spec.schema_version:
+            return self._fallback(f"schema_mismatch({schema_ver})")
 
-            seq2 = struct.unpack_from("<I", mm, 0)[0]
-            if seq1 == seq2:
-                return snapshot
-            # else: torn read — retry
-        return self._fallback("torn_read_after_retries")
+        # Step 3: read per-buffer metadata.
+        off = _buffer_offset(idx, N)
+        wall_ns, payload_bytes, stored_crc = struct.unpack_from(BUFFER_META_STRUCT, mm, off)
+
+        # Fixed-size sanity: actual must match expected.
+        if payload_bytes != N:
+            return self._fallback(f"size_mismatch({payload_bytes}!={N})")
+
+        # Step 4: copy payload via numpy zero-copy view + defensive .copy()
+        view = np.frombuffer(
+            mm,
+            dtype=self.spec.dtype,
+            count=self._elem_count,
+            offset=off + BUFFER_META_SIZE,
+        ).reshape(self.spec.shape)
+        snapshot = view.copy()
+
+        # Step 5: verify CRC32 over (meta prefix + payload).
+        computed = _compute_buffer_crc32(wall_ns, payload_bytes, snapshot.tobytes())
+        if computed != stored_crc:
+            return self._fallback("buffer_crc_mismatch")
+
+        # Step 6: atomic Acquire-load of header_seq again — version-delta check.
+        s2 = struct.unpack_from("<Q", mm, 0)[0]
+        version2 = s2 >> _VERSION_SHIFT
+        delta = (version2 - version1) & ((1 << 56) - 1)
+        if delta > _IDX_MAX:
+            return self._fallback(f"reader_lapped(delta={delta})")
+
+        return snapshot
 
     def read_meta(self) -> Optional[dict]:
-        """Cheap header-only read. No payload copy. Returns None if unattached."""
+        """Cheap header-only read — returns publish state + age. Returns None if unattached or uninitialized."""
         if self._mm is None and not self._attach():
             return None
-        seq, schema, wall_ns, pbytes, crc = struct.unpack_from(
-            HEADER_STRUCT, self._mm, 0,
-        )
+        mm = self._mm
+        s = struct.unpack_from("<Q", mm, 0)[0]
+        version, idx = _unpack_header_seq(s)
+        if version == 0:
+            return None
+        if idx > _IDX_MAX:
+            return None
+        schema_version, payload_capacity = struct.unpack_from("<II", mm, 8)
+        off = _buffer_offset(idx, payload_capacity)
+        wall_ns, payload_bytes, crc = struct.unpack_from(BUFFER_META_STRUCT, mm, off)
         return {
-            "seq": seq,
-            "schema_version": schema,
+            "version": version,
+            "ready_idx": idx,
+            "seq": version,  # backward-compat alias
+            "schema_version": schema_version,
+            "payload_capacity": payload_capacity,
+            "payload_bytes": payload_bytes,
             "wall_ns": wall_ns,
-            "payload_bytes": pbytes,
-            "header_crc": crc,
+            "buffer_crc32": crc,
             "age_seconds": (time.time_ns() - wall_ns) / 1e9,
-            "write_in_progress": bool(seq & 1),
+            "write_in_progress": False,  # always False post-D-SPEC-35 — atomic publish
         }
 
     # -- variable-size hot path (D11) --------------------------------
 
     def read_variable(self) -> Optional[bytes]:
         """
-        SeqLock-protected variable-size read (S4 D11).
-
-        Returns the actual payload as raw bytes (size = header's
-        payload_bytes field, may be less than the preallocated max).
-        Returns None on torn-read/error/spec-mismatch (caller falls back
-        to legacy path).
-
-        Requires the spec to have variable_size=True.
+        Triple-buffer variable-size read (S4 D11). Returns actual payload
+        bytes (size = per-buffer payload_bytes from metadata; may be less
+        than capacity). Zero retries.
         """
         if not self.spec.variable_size:
             return self._fallback("not_variable_spec")
@@ -478,44 +511,48 @@ class StateRegistryReader:
         if self._mm is None and not self._attach_variable():
             return self._fallback("not_attached")
 
-        mm = self._mm  # local alias
+        mm = self._mm
+        N = self.spec.payload_bytes  # per-buffer capacity
 
-        for _ in range(MAX_READ_RETRIES):
-            seq1 = struct.unpack_from("<I", mm, 0)[0]
-            if seq1 & 1:
-                continue  # writer active — retry
+        s1 = struct.unpack_from("<Q", mm, 0)[0]
+        version1, idx = _unpack_header_seq(s1)
 
-            schema_ver = struct.unpack_from("<I", mm, 4)[0]
-            if schema_ver != self.spec.schema_version:
-                return self._fallback(f"schema_mismatch({schema_ver})")
-            payload_bytes = struct.unpack_from("<I", mm, 16)[0]
-            if payload_bytes > self.spec.payload_bytes:
-                return self._fallback(
-                    f"size_overflow({payload_bytes}>{self.spec.payload_bytes})")
-            crc = struct.unpack_from("<I", mm, 20)[0]
-            expected = zlib.crc32(bytes(mm[0:20]))
-            if crc != expected:
-                return self._fallback("header_crc_mismatch")
+        if version1 == 0:
+            return self._fallback("uninitialized")
+        if idx > _IDX_MAX:
+            return self._fallback(f"ready_idx_out_of_range({idx})")
 
-            # Defensive copy of actual payload slice.
-            snapshot = bytes(mm[HEADER_SIZE:HEADER_SIZE + payload_bytes])
+        schema_ver = struct.unpack_from("<I", mm, 8)[0]
+        if schema_ver != self.spec.schema_version:
+            return self._fallback(f"schema_mismatch({schema_ver})")
 
-            seq2 = struct.unpack_from("<I", mm, 0)[0]
-            if seq1 == seq2:
-                return snapshot
-            # else: torn read — retry
-        return self._fallback("torn_read_after_retries")
+        off = _buffer_offset(idx, N)
+        wall_ns, payload_bytes, stored_crc = struct.unpack_from(BUFFER_META_STRUCT, mm, off)
+
+        if payload_bytes > N:
+            return self._fallback(f"size_overflow({payload_bytes}>{N})")
+
+        snapshot = bytes(mm[off + BUFFER_META_SIZE : off + BUFFER_META_SIZE + payload_bytes])
+
+        computed = _compute_buffer_crc32(wall_ns, payload_bytes, snapshot)
+        if computed != stored_crc:
+            return self._fallback("buffer_crc_mismatch")
+
+        s2 = struct.unpack_from("<Q", mm, 0)[0]
+        version2 = s2 >> _VERSION_SHIFT
+        delta = (version2 - version1) & ((1 << 56) - 1)
+        if delta > _IDX_MAX:
+            return self._fallback(f"reader_lapped(delta={delta})")
+
+        return snapshot
 
     def _attach_variable(self) -> bool:
-        """Variant of _attach that allows file size == total_bytes (max)
-        regardless of header's actual payload_bytes (which is variable)."""
+        """Variant of _attach for variable-size specs — file size still matches total_bytes (preallocated to capacity)."""
         if self._mm is not None:
             return True
         try:
             if not self.path.exists():
                 return False
-            # For variable-size specs the file is preallocated at total_bytes;
-            # we don't validate exact match because header carries actual size.
             if self.path.stat().st_size != self.spec.total_bytes:
                 return False
             self._fd = os.open(self.path, os.O_RDONLY)
@@ -526,7 +563,7 @@ class StateRegistryReader:
                 prot=mmap.PROT_READ,
             )
             return True
-        except Exception as e:  # pragma: no cover — defensive
+        except Exception as e:
             logger.debug(
                 "[StateRegistryReader] attach_variable failed for %s: %s",
                 self.spec.name, e,
@@ -541,7 +578,7 @@ class StateRegistryReader:
             if self._fd is not None:
                 os.close(self._fd)
                 self._fd = None
-        except Exception:  # pragma: no cover
+        except Exception:
             pass
 
 
@@ -551,13 +588,6 @@ class StateRegistryReader:
 class RegistryBank:
     """
     Lazy-instantiated writers + readers keyed by RegistrySpec.name.
-
-    Same bank can be used by both writer-side and reader-side code
-    within the same process; writers and readers are separate objects
-    but share the spec + shm_root. A writer-side bank instance creates
-    writers; a reader-side bank instance creates readers. In practice
-    the spirit-worker process has a writer bank and the dashboard
-    process has a reader bank, each resolving to the same shm files.
     """
 
     def __init__(self, titan_id: str | None = None, config: dict | None = None):
@@ -599,15 +629,10 @@ class RegistryBank:
         self._readers.clear()
 
 
-# ── Canonical registry declarations (S2 — three Phase-A initial) ───
+# ── Canonical registry declarations ────────────────────────────────
 
 # 162D Trinity state — L1 owned, written by spirit_loop's snapshot-builder
-# thread. Layout matches rFP #2 TITAN_SELF composition already used by
-# V5 FilterDown and the "I AM" kin-protocol:
-#   [0:130]   full_130dt         (rFP #1 Canonical Atomic Signals)
-#   [130:160] full_30d_topology  (rFP #1)
-#   [160:162] journey (curvature, density)  per [titan_self] weight_journey=0.5
-# Natural cadence: body/mind STATE bus events ≈ 1.15s (Schumann/9).
+# thread. Layout matches rFP #2 TITAN_SELF composition.
 TRINITY_STATE = RegistrySpec(
     name="trinity_state",
     dtype=np.dtype("<f4"),
@@ -615,10 +640,7 @@ TRINITY_STATE = RegistrySpec(
     feature_flag="microkernel.shm_trinity_enabled",
 )
 
-# 6-neuromod state — L1 owned, written by spirit_worker post-epoch
-# neuromod update. Field order: DA, 5HT, NE, ACh, Endorphin, GABA
-# (matches neuromodulator.py field order).
-# Natural cadence: consciousness epoch (dynamic 10-31s, Schumann-derived).
+# 6-neuromod state — L1 owned, written by spirit_worker post-epoch.
 NEUROMOD_STATE = RegistrySpec(
     name="neuromod_state",
     dtype=np.dtype("<f4"),
@@ -626,16 +648,7 @@ NEUROMOD_STATE = RegistrySpec(
     feature_flag="microkernel.shm_neuromod_enabled",
 )
 
-# 11-hormone state — Python L2 owned, written by hormonal_worker (NEW in
-# C-S5 per master plan §10 D22 + SPEC v0.1.4 §7.1).
-# Sibling-symmetric with titanvm_registers (same byte count, same NS_PROGRAMS
-# row order). Layout: shape=(11, 4) — 11 hormones (axis 0) × 4 fields
-# (axis 1: 0=level, 1=threshold, 2=refractory, 3=peak_level).
-# Hormone canonical order matches NS_PROGRAMS in
-# titan_plugin/logic/emot_bundle_protocol.py:164-168:
-#   inner: REFLEX, FOCUS, INTUITION, IMPULSE, METABOLISM
-#   outer: CREATIVITY, CURIOSITY, EMPATHY, REFLECTION, INSPIRATION, VIGILANCE
-# Natural cadence: consciousness epoch (10-31s, matches neuromod cadence).
+# 11-hormone state — Python L2 owned (NEW in C-S5).
 HORMONAL_STATE = RegistrySpec(
     name="hormonal_state",
     dtype=np.dtype("<f4"),
@@ -644,8 +657,6 @@ HORMONAL_STATE = RegistrySpec(
 )
 
 # Consciousness epoch counter — L1 owned, monotonic uint64.
-# Written by spirit_worker per epoch; readers use this as a cheap
-# "has anything changed" signal.
 EPOCH_COUNTER = RegistrySpec(
     name="epoch_counter",
     dtype=np.dtype("<u8"),
@@ -653,25 +664,7 @@ EPOCH_COUNTER = RegistrySpec(
     feature_flag="microkernel.shm_epoch_enabled",
 )
 
-# 45D inner spirit tensor (SAT-15 + CHIT-15 + ANANDA-15) — L1 owned,
-# written by spirit_worker at Schumann × 9 = 70.47 Hz (14.2 ms period).
-# Validates §L1 Trinity Daemon Internal Design pattern (rFP
-# rFP_microkernel_v2_shadow_core.md §L1 + §A.7): spirit tick has zero
-# I/O on hot path (benchmarked 46μs/call 2026-04-24 — see
-# SESSION_20260424_microkernel_phase_a_s1_s2_shipped.md post-soak
-# follow-up §3), so Schumann-rate shm write is trivial at ~0.3% of
-# 1 core.
-#
-# Content-hash gated by the same pattern as Trinity/Neuromod/Epoch:
-# writer only bumps seq counter when the 45D vector actually changes.
-# Readers check age_seconds for freshness; writer never blocks.
-#
-# Layout (matches logic.spirit_tensor.collect_spirit_45d output):
-#   [0:15]   SAT     (existence / presence — 15D)
-#   [15:30]  CHIT    (consciousness / knowing — 15D)
-#   [30:45]  ANANDA  (bliss / resonance — 15D)
-#
-# Natural cadence: spirit_worker tick @ 70.47 Hz (Schumann × 9).
+# 45D inner spirit tensor (SAT-15 + CHIT-15 + ANANDA-15) — L1 owned.
 INNER_SPIRIT_45D = RegistrySpec(
     name="inner_spirit_45d",
     dtype=np.dtype("<f4"),
@@ -679,28 +672,7 @@ INNER_SPIRIT_45D = RegistrySpec(
     feature_flag="microkernel.shm_spirit_fast_enabled",
 )
 
-
-# ── S4 registries (Phase A §A.2 part 2 — 2026-04-25) ───────────────
-
-# Sphere clocks state — L1 owned, written by spirit_worker subprocess
-# (SphereClockEngine lives there at spirit_worker.py:11297). 6 clocks
-# (inner+outer Body/Mind/Spirit) × 7 fields per clock.
-#
-# Row order (canonical, matches SphereClockEngine._clock_names):
-#   [0] inner_body, [1] inner_mind, [2] inner_spirit,
-#   [3] outer_body, [4] outer_mind, [5] outer_spirit
-#
-# Per-clock field order (4 floats per clock):
-#   [0] radius                — current contraction radius
-#   [1] scalar_position       — phase position scalar
-#   [2] phase                 — clock phase (radians)
-#   [3] contraction_velocity  — current contraction speed
-#   [4] pulse_count           — cumulative pulses (cast float32)
-#   [5] consecutive_balanced  — consecutive balanced ticks (cast float32)
-#   [6] last_pulse_age_s      — derived: time.time() - last_pulse_ts
-#
-# Natural cadence: tick rate of SphereClockEngine (Schumann-derived,
-# ~1.15s body / 3.45s spirit). Content-hash gated.
+# Sphere clocks state — L1 owned.
 SPHERE_CLOCKS_STATE = RegistrySpec(
     name="sphere_clocks",
     dtype=np.dtype("<f4"),
@@ -708,14 +680,7 @@ SPHERE_CLOCKS_STATE = RegistrySpec(
     feature_flag="microkernel.shm_sphere_clocks_enabled",
 )
 
-# Chi circulation state — L1 owned, written by spirit_worker subprocess
-# (_cached_chi_state dict lives there at spirit_worker.py:1668, updated
-# at line 5362 after life_force_engine tick).
-#
-# Field order: [total, spirit, mind, body, coherence, urgency]
-#
-# Natural cadence: every spirit tick (~Schumann/9 = 1.15s).
-# Content-hash gated.
+# Chi circulation state — L1 owned.
 CHI_STATE = RegistrySpec(
     name="chi_state",
     dtype=np.dtype("<f4"),
@@ -723,25 +688,7 @@ CHI_STATE = RegistrySpec(
     feature_flag="microkernel.shm_chi_enabled",
 )
 
-# TitanVM NS program registers — L1 owned, written by spirit_worker
-# subprocess (NervousSystem.programs lives there via
-# nervous_system.py:891). 11 NS programs × 4 fields per program.
-#
-# Spec verified by `arch_map titanvm-schema` (commit 19023d7d).
-#
-# Row order (canonical, matches emot_bundle_protocol.NS_PROGRAMS):
-#   [0] REFLEX, [1] FOCUS, [2] INTUITION, [3] IMPULSE, [4] METABOLISM,
-#   [5] CREATIVITY, [6] CURIOSITY, [7] EMPATHY, [8] REFLECTION,
-#   [9] INSPIRATION, [10] VIGILANCE
-#
-# Per-program field order (4 floats per program):
-#   [0] urgency        — current urgency from neural_nervous_system
-#                        ._all_urgencies dict (per-tick computed)
-#   [1] fire_count     — cumulative fires (cast float32)
-#   [2] total_updates  — training iterations (cast float32)
-#   [3] last_loss      — most recent training loss
-#
-# Natural cadence: NS tick rate (~Schumann/9). Content-hash gated.
+# TitanVM NS program registers — L1 owned.
 TITANVM_REGISTERS = RegistrySpec(
     name="titanvm_registers",
     dtype=np.dtype("<f4"),
@@ -749,16 +696,7 @@ TITANVM_REGISTERS = RegistrySpec(
     feature_flag="microkernel.shm_titanvm_enabled",
 )
 
-# Identity — L0 owned, written once by TitanKernel.boot() after Soul
-# is initialized. titan_id + maker_pubkey are stable across reboots;
-# kernel_instance_nonce is random per boot — enables worker reattach
-# detection for Phase B shadow-core swap and external kernel-instance
-# monitoring (PLAN §2.4 D11+rationale).
-#
-# Byte layout (96 bytes, uint8 — mixed content):
-#   [0:32]   titan_id              (UTF-8, NUL-padded)
-#   [32:64]  maker_pubkey          (raw 32-byte Ed25519, zero if absent)
-#   [64:96]  kernel_instance_nonce (secrets.token_bytes(32) per boot)
+# Identity — L0 owned.
 IDENTITY = RegistrySpec(
     name="identity",
     dtype=np.dtype("u1"),
@@ -766,23 +704,7 @@ IDENTITY = RegistrySpec(
     feature_flag="microkernel.shm_identity_enabled",
 )
 
-# CGN live weights — L2 owned (cgn_worker remains sole writer per
-# project_cgn_as_higher_state_registry.md invariant 2026-04-21).
-# First variable-size StateRegistry consumer.
-#
-# Per the 2026-04-17 Maker invariant ("Stateregistries(trinity + CGN)"
-# at L0) and the 2026-04-21 codification: CGN is the higher-cognitive-
-# level state registry and MUST share the same shm+version protocol as
-# Trinity. S4 closes the keystone gap — same 24B header, same
-# per-titan path convention, same SeqLock semantics.
-#
-# Payload wraps the existing CGN domain serialization unchanged
-# (V-weights + consumer state_dicts + extras). cgn_shm_protocol.py
-# becomes a thin format-aware wrapper that delegates to
-# StateRegistry when this flag is on.
-#
-# 256 KB max payload (matches legacy MAX_SHM_SIZE ceiling). Typical
-# size 40-50 KB.
+# CGN live weights — L2 owned (variable size).
 CGN_LIVE_WEIGHTS = RegistrySpec(
     name="cgn_live_weights",
     dtype=np.dtype("u1"),
@@ -791,31 +713,7 @@ CGN_LIVE_WEIGHTS = RegistrySpec(
     variable_size=True,
 )
 
-
-# ── S7 registries (Phase A §A.7 / §L1 — 2026-04-26) ────────────────
-
-# 5D inner body tensor — L1 owned, written by body_worker at Schumann
-# fundamental rate (7.83 Hz, 127.7 ms period). Validates §L1 Trinity
-# Daemon Internal Design end-to-end for body (rFP §L1 + §A.7):
-# body_worker tick reads from per-sense cache substrate (populated by
-# background refresh threads at native cadences) — zero I/O on hot path.
-# Pre-S7 body_worker did all 5 sensor calls inline at 524ms/call worst
-# case (psutil.cpu_percent interval=0.5 + 4 socket connects @ 2s
-# timeout); S7 brings that to ~100μs.
-#
-# Content-hash gated by RegistryWriter (same pattern as
-# Trinity / Neuromod / Epoch / Inner-Spirit). Readers check
-# age_seconds for freshness; writer never blocks.
-#
-# Layout (matches body_worker.BODY_STATE bus payload `values` exactly,
-# post-FILTER_DOWN-multiplier + post-FOCUS-nudge):
-#   [0] interoception   (SOL balance + anchor freshness)
-#   [1] proprioception  (body topology self-sensing)
-#   [2] somatosensation (CPU/RAM/swap/disk)
-#   [3] entropy         (log errors + multi-endpoint network)
-#   [4] thermal         (CPU load × topology activity × circadian)
-#
-# Natural cadence: body_worker shm-writer thread at 7.83 Hz.
+# 5D inner body tensor — L1 owned.
 INNER_BODY_5D = RegistrySpec(
     name="inner_body_5d",
     dtype=np.dtype("<f4"),
@@ -823,34 +721,7 @@ INNER_BODY_5D = RegistrySpec(
     feature_flag="microkernel.shm_body_fast_enabled",
 )
 
-# 15D inner mind tensor — L1 owned, written by mind_worker at Schumann
-# × 3 = 23.49 Hz (42.6 ms period). Validates §L1 Trinity Daemon
-# Internal Design end-to-end for mind (rFP §L1 + §A.7).
-#
-# Beautiful Schumann symmetry across Trinity tensors:
-#   - Body:   5D × 7.83 Hz  (1× Schumann)
-#   - Mind:  15D × 23.49 Hz (3× Schumann)
-#   - Spirit: 45D × 70.47 Hz (9× Schumann)
-# Each tensor's dimensionality matches its frequency multiplier —
-# higher harmonics = richer state space.
-#
-# mind_worker tick reads sub_a sensor values from cache substrate
-# (populated by background refresh threads at native cadences) +
-# sub_b media-digest values from media_state (push-driven by
-# SENSE_VISUAL/SENSE_AUDIO bus messages) and computes the 15D
-# extended tensor (Thinking 5D + Feeling 5D + Willing 5D) via
-# `titan_plugin.logic.mind_tensor.collect_mind_15d`. Zero I/O on
-# hot path. Pre-S7 baseline was 73ms/call (sqlite3 + 2× http);
-# S7 brings tick to ~100μs.
-#
-# Content-hash gated by RegistryWriter.
-#
-# Layout (matches mind_worker.MIND_STATE bus payload `values_15d`):
-#   [0:5]   Thinking 5D — vision/hearing/taste/smell/touch (cognition layer)
-#   [5:10]  Feeling 5D  — emotional valence breakdown
-#   [10:15] Willing 5D  — volitional/intentional layer
-#
-# Natural cadence: mind_worker shm-writer thread at 23.49 Hz.
+# 15D inner mind tensor — L1 owned.
 INNER_MIND_15D = RegistrySpec(
     name="inner_mind_15d",
     dtype=np.dtype("<f4"),
@@ -860,60 +731,26 @@ INNER_MIND_15D = RegistrySpec(
 
 
 # ── Phase A.S8 outer trinity slots (2026-04-30) ──────────────────────
-#
-# 3 outer trinity subprocess workers own these slots (mirror of inner
-# trinity 5D/15D/45D shape + Schumann clock cadence × 13 outer scaling).
-# No feature_flag — always-enabled (mirrors inner worker convention).
-#
-# Schumann symmetry (outer = inner × 13 environmental-tempo scaling):
-#   - Outer Body:   5D × 7.83 Hz  (Schumann ×1, publish 45s)
-#   - Outer Mind:  15D × 23.49 Hz (Schumann ×3, publish 15s)
-#   - Outer Spirit: 45D × 70.47 Hz (Schumann ×9, publish  5s)
-#
-# Body-slowest invariant G13 preserved: outer_body is slowest,
-# outer_spirit is fastest — exact mirror of inner trinity order.
 
-# 5D outer body tensor — L1 owned, written by outer_body_worker subprocess
-# at 7.83 Hz. Layout mirrors inner_body_5d V6 body-felt semantics:
-#   [0] interoception   (SOL balance + block_delta + anchor_fresh)
-#   [1] proprioception  (peer_entropy + helper_health + bus_module_diversity)
-#   [2] somatosensation (TX latency + creation_nudge + CPU spike rate)
-#   [3] entropy         (ping_variance + bus_drop_rate + error_rate)
-#   [4] thermal         (CPU thermal + circadian + LLM latency EMA)
 OUTER_BODY_5D = RegistrySpec(
     name="outer_body_5d",
     dtype=np.dtype("<f4"),
     shape=(5,),
 )
 
-# 15D outer mind tensor — L1 owned, written by outer_mind_worker subprocess
-# at 23.49 Hz. Extends the 5D outer mind with Thinking/Feeling/Willing layers.
-#   [0:5]   Thinking 5D — creative/research/social cognition
-#   [5:10]  Feeling 5D  — emotional valence of outer expression
-#   [10:15] Willing 5D  — volitional/intentional outer layer
 OUTER_MIND_15D = RegistrySpec(
     name="outer_mind_15d",
     dtype=np.dtype("<f4"),
     shape=(15,),
 )
 
-# 45D outer spirit tensor — L1 owned, written by outer_spirit_worker
-# subprocess at 70.47 Hz (Schumann ×9). Extends the 5D outer spirit
-# with SAT/CHIT/ANANDA layers (mirror of inner_spirit_45d).
-#   [0:15]  SAT    (identity / sovereignty — 15D)
-#   [15:30] CHIT   (purpose / action quality — 15D)
-#   [30:45] ANANDA (resonance / bliss — 15D)
 OUTER_SPIRIT_45D = RegistrySpec(
     name="outer_spirit_45d",
     dtype=np.dtype("<f4"),
     shape=(45,),
 )
 
-# 30D topology slot — kernel-side writer, mirrors state_register.observables_30d.
-# Written by kernel._start_topology_shm_writer() at 0.5s poll, content-hash
-# gated. Provides a fast SHM-readable snapshot of the 30D topology state
-# for Rust C-S* daemons and any future SHM-reading subscriber.
-#   Layout: 30 float32 values matching StateRegister.get_full_30d_topology()
+# 30D topology slot — kernel-side writer.
 TOPOLOGY_30D = RegistrySpec(
     name="topology_30d",
     dtype=np.dtype("<f4"),

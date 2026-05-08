@@ -8,6 +8,7 @@ import hashlib
 import logging
 import os
 import random
+import time
 
 from PIL import Image, ImageDraw
 
@@ -98,7 +99,24 @@ class ProceduralArtGen:
         if return_image:
             return img
 
-        filepath = os.path.join(self.output_dir, f"flow_meditation_{state_root[:8]}.jpg")
+        # rFP_meditation_worker_latency Fix #F (2026-05-07): include enough
+        # of state_root + a timestamp suffix to guarantee per-cycle
+        # uniqueness. Pre-fix used `state_root[:8]` which collided to the
+        # literal "MEDITATI" prefix on every cycle (plugin passes
+        # `f"MEDITATION_V3_E{epoch}"`), so all 556 entries on T2 and 704
+        # on T3 pointed to the same file `flow_meditation_MEDITATI.jpg` —
+        # each new cycle overwrote the previous render. Real Solana
+        # signatures (used by the rebirth tree path) survive this fix
+        # because their first 16 chars are unique hex; only the synthetic
+        # MEDITATION_V3_* prefix needed disambiguation. Adding the epoch
+        # timestamp suffix also ensures uniqueness even if two different
+        # callers happened to pass the same state_root.
+        import re as _re
+        _safe_root = _re.sub(r"[^A-Za-z0-9_-]", "_", state_root)[:24]
+        filepath = os.path.join(
+            self.output_dir,
+            f"flow_meditation_{_safe_root}_{int(time.time())}.jpg",
+        )
         img.save(filepath, quality=90)
         logger.info("Generated emotional Flow Field: %s", filepath)
         return filepath

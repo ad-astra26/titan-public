@@ -75,7 +75,19 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     last_status_publish = 0.0
     last_topology_publish = 0.0
     STATUS_PUBLISH_INTERVAL_S = 5.0
-    TOPOLOGY_PUBLISH_INTERVAL_S = 30.0  # heavier query — slower cadence
+    # chunk 8M.8 (2026-05-05): tightened from 30.0 → 10.0 per
+    # rFP_phase_c_observatory_data_pipeline.md §3.8 + Gap E (§2.5).
+    # Observed cache age 23-27s (acceptance gate target <10s). Topology
+    # classification + knowledge-graph stats run in a dedicated thread
+    # (see _periodic_publish_loop below — 2026-05-01 rFP_bus_payload_contracts
+    # §3.1) so cadence tightening doesn't block the recv loop.
+    # Bus events carry only summary metrics (cluster_counts /
+    # node_count / edge_count / entity_types); bulk payloads go via
+    # RPC. Cost estimate: get_top_memories(n=200) is dict scan + 6
+    # keyword-substring matches per item ≈ <50 ms; graph.get_stats() is
+    # cached + lazy ≈ <10 ms — total ~60 ms per cycle, well under 10 s
+    # cadence headroom.
+    TOPOLOGY_PUBLISH_INTERVAL_S = 10.0
 
     # Topic clusters for the Cognitive Heatmap (mirrors dashboard.py keywords;
     # kept in sync — the worker now owns the classification so the endpoint
@@ -136,10 +148,16 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         except Exception as _pc_err:
             logger.warning("[MemoryWorker] get_persistent_count failed: %s", _pc_err)
             pcount = 0
+        # rFP_meditation_worker_latency Fix #E (2026-05-07): use the
+        # sync sibling. Calling the async fetch_mempool via
+        # loop.run_until_complete from this dedicated publisher thread
+        # races the main message-handler thread (also driving the same
+        # loop) — produced ~5/min "This event loop is already running"
+        # warnings + "coroutine was never awaited" RuntimeWarnings on T1.
         try:
-            mempool_items = loop.run_until_complete(memory.fetch_mempool()) or []
+            mempool_items = memory.fetch_mempool_sync() or []
         except Exception as _mp_err:
-            logger.warning("[MemoryWorker] fetch_mempool failed: %s", _mp_err)
+            logger.warning("[MemoryWorker] fetch_mempool_sync failed: %s", _mp_err)
             mempool_items = []
         try:
             # Fetch enough rows that 250 user-facing memories survive the
@@ -283,6 +301,29 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
     _periodic_stop = threading.Event()
 
+    # Phase C Session 2 (rFP_phase_c_async_shm_consumer_migration §4.B.8) —
+    # SHM-direct memory_state.bin publisher. Replaces the deadlock-prone
+    # sync bus.request(action="growth_metrics" / "status") path that
+    # wedged T3 outer-sensor sidecars on 2026-05-07 (py-spy
+    # post-Session-1 caught sidecars stuck inside
+    # memory_proxy.get_growth_metrics → bus.request after spirit_proxy
+    # unblocked). Cadence: 1 Hz (matches periodic loop's natural tick).
+    _memory_state_pub = None
+    try:
+        from titan_plugin.core.state_registry import resolve_titan_id
+        from titan_plugin.logic.memory_state_publisher import (
+            MemoryStatePublisher)
+        _memory_state_pub = MemoryStatePublisher(titan_id=resolve_titan_id())
+    except Exception as _pub_init_err:
+        # Boot-time failure is non-fatal: existing bus.request RPC paths
+        # still serve memory_proxy callers (with deadlock surface intact)
+        # while we recover. Log loudly so health checks surface it.
+        logger.error(
+            "[MemoryWorker] MemoryStatePublisher BOOT FAILED — "
+            "consumers fall back to sync bus.request path (deadlock "
+            "surface remains until publisher recovers): %s",
+            _pub_init_err, exc_info=True)
+
     def _periodic_publish_loop():
         last_status = 0.0
         last_topology = 0.0
@@ -295,6 +336,20 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 if now - last_topology > TOPOLOGY_PUBLISH_INTERVAL_S:
                     _publish_memory_topology()
                     last_topology = now
+                # SHM-direct memory_state.bin — every loop tick (~1 Hz).
+                # Failure isolated per-publish; never blocks the legacy
+                # bus-publish paths above.
+                if _memory_state_pub is not None:
+                    try:
+                        _memory_state_pub.publish(memory)
+                    except Exception as _shm_err:
+                        # Already logged with exc_info inside publisher;
+                        # this top-level catch only prevents the
+                        # periodic loop from dying on a publisher bug.
+                        logger.warning(
+                            "[MemoryWorker] memory_state SHM publish "
+                            "raised at top level: %s",
+                            _shm_err, exc_info=True)
             except Exception as _per_err:
                 logger.warning(
                     "[MemoryWorker] periodic publish thread error: %s",
@@ -634,40 +689,19 @@ def _handle_query(msg: dict, memory, send_queue, name: str, loop, config: dict =
                     "available": False, "error": str(e),
                 }, rid)
 
-        elif action == "growth_metrics":
-            # Compute growth metrics inside worker (has _node_store access)
-            import math as _math
-            now = time.time()
-            cutoff = now - 86400  # 24h
-
-            # Learning velocity: weighted count of recently active persistent nodes
-            effective_nodes = 0.0
-            total_persistent = 0
-            high_quality = 0
-            for v in memory._node_store.values():
-                if v.get("type") != "MemoryNode" or v.get("status") != "persistent":
-                    continue
-                total_persistent += 1
-                if v.get("effective_weight", 1.0) >= 1.15:
-                    high_quality += 1
-                if v.get("created_at", 0) >= cutoff or v.get("last_accessed", 0) >= cutoff:
-                    effective_nodes += v.get("effective_weight", 1.0)
-
-            node_sat = payload.get("node_saturation_24h", 30)
-            learning_vel = min(1.0, _math.log(effective_nodes + 1) / _math.log(node_sat + 1))
-            directive_align = min(1.0, (high_quality / max(1, total_persistent)) * 1.2)
-
-            _send_response(send_queue, name, src, {
-                "learning_velocity": round(learning_vel, 4),
-                "directive_alignment": round(directive_align, 4),
-                "effective_nodes_24h": round(effective_nodes, 1),
-                "total_persistent": total_persistent,
-                "high_quality_count": high_quality,
-            }, rid)
-
+        # Phase C Session 5 (rFP §4.D.4): growth_metrics handler RETIRED
+        # — memory_proxy.get_growth_metrics now SHM-direct via
+        # memory_state.bin (Session 2 §4.C.13). The publisher
+        # pre-computes learning_velocity/directive_alignment at the
+        # default node_saturation_24h=30 and exposes raw counts for
+        # the rare non-default-saturation caller to recompute locally.
         elif action == "run_meditation":
             # Simplified meditation: classify mempool, score, prune, promote, consolidate
-            logger.info("[MemoryWorker] Running meditation cycle...")
+            # rFP_meditation_worker_latency Option 1 instrumentation:
+            # per-phase t+X.XXXs logs to pinpoint silent-hang patterns and
+            # per-step costs (fetch / score / anchor / migrate / consolidate).
+            _t_med_start = time.time()
+            logger.info("[MemoryWorker] [LAT] meditation t+0.000s: handler entered, running cycle...")
             # BUG-VAULT-COMMITS-NOT-LANDING fix (2026-04-29): on-chain vault
             # commit is now bus-bridged to the kernel. memory_worker still
             # runs MeditationEpoch with network_client=None (deployer keypair
@@ -696,25 +730,57 @@ def _handle_query(msg: dict, memory, send_queue, name: str, loop, config: dict =
                 # Run simplified epoch (no TX submission inline; no studio, no social)
                 candidates, fading, dead = loop.run_until_complete(memory.fetch_mempool_classified())
                 total = len(candidates) + len(fading) + len(dead)
+                logger.info(
+                    "[MemoryWorker] [LAT] meditation t+%.3fs: fetch_mempool_classified done "
+                    "(candidates=%d fading=%d dead=%d total=%d)",
+                    time.time() - _t_med_start, len(candidates), len(fading), len(dead), total,
+                )
 
                 # Prune dead
+                _t_prune = time.time()
                 pruned = 0
                 for node in dead:
                     loop.run_until_complete(memory.prune_mempool_node(node["id"]))
                     pruned += 1
+                if dead:
+                    logger.info(
+                        "[MemoryWorker] [LAT] meditation t+%.3fs: pruned %d dead nodes in %.3fs",
+                        time.time() - _t_med_start, pruned, time.time() - _t_prune,
+                    )
 
                 # Score candidates — collect promotion decisions WITHOUT
                 # migrating yet, so the on-chain anchor TX (next step) can
                 # cover the full set with a single state_root commit.
+                _t_score_loop = time.time()
                 promoted_nodes: list = []
-                for node in candidates:
+                for _i, node in enumerate(candidates):
                     _send_heartbeat(send_queue, name)  # keep alive during long scoring loop
                     last_heartbeat = time.time()
-                    score, intensity = loop.run_until_complete(
-                        asyncio.wait_for(med.get_hippocampus_score([node]), timeout=30.0)
-                    )
+                    _t_score_one = time.time()
+                    try:
+                        score, intensity = loop.run_until_complete(
+                            asyncio.wait_for(med.get_hippocampus_score([node]), timeout=30.0)
+                        )
+                        logger.info(
+                            "[MemoryWorker] [LAT] meditation t+%.3fs: scored node #%d in %.3fs "
+                            "(score=%.2f, will_promote=%s)",
+                            time.time() - _t_med_start, _i,
+                            time.time() - _t_score_one, score, score >= 40.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "[MemoryWorker] [LAT] meditation t+%.3fs: SCORE TIMEOUT node #%d (30s)",
+                            time.time() - _t_med_start, _i,
+                        )
+                        continue
                     if score >= 40.0:
                         promoted_nodes.append((node, intensity))
+                logger.info(
+                    "[MemoryWorker] [LAT] meditation t+%.3fs: scoring loop done (%.3fs total, "
+                    "promoted=%d/%d)",
+                    time.time() - _t_med_start, time.time() - _t_score_loop,
+                    len(promoted_nodes), len(candidates),
+                )
 
                 # On-chain anchor (BUG-VAULT-COMMITS-NOT-LANDING fix). Build
                 # state_root + payload from the promoted set, ask kernel to
@@ -739,14 +805,23 @@ def _handle_query(msg: dict, memory, send_queue, name: str, loop, config: dict =
                             state_root = f"MEDITATION_{int(time.time())}"
 
                         logger.info(
-                            "[MemoryWorker] Requesting on-chain anchor: "
-                            "promoted=%d, root=%s",
+                            "[MemoryWorker] [LAT] meditation t+%.3fs: requesting on-chain anchor "
+                            "(promoted=%d, root=%s, inner_timeout=120s)",
+                            time.time() - _t_med_start,
                             len(promoted_nodes), state_root[:24],
                         )
+                        _t_anchor = time.time()
                         anchor_result = _request_anchor_via_kernel(
                             send_queue, recv_queue, name,
                             state_root, payload_json, len(promoted_nodes),
                             timeout=120.0,
+                        )
+                        logger.info(
+                            "[MemoryWorker] [LAT] meditation t+%.3fs: anchor RPC returned in %.3fs "
+                            "(tx_signature=%s, error=%s)",
+                            time.time() - _t_med_start, time.time() - _t_anchor,
+                            (anchor_result.get("tx_signature") or "")[:16],
+                            anchor_result.get("error") or "",
                         )
                         tx_signature = anchor_result.get("tx_signature")
                         anchor_error = anchor_result.get("error")
@@ -775,21 +850,39 @@ def _handle_query(msg: dict, memory, send_queue, name: str, loop, config: dict =
                     )
 
                 # Migrate all promoted nodes with the resolved signature.
+                _t_migrate_loop = time.time()
                 sig_for_migration = tx_signature or "MEDITATION_LOCAL"
-                for node, intensity in promoted_nodes:
+                for _i, (node, intensity) in enumerate(promoted_nodes):
+                    _t_mig_one = time.time()
                     loop.run_until_complete(
                         memory.migrate_to_persistent(
                             node["id"], sig_for_migration, intensity,
                         )
                     )
+                    logger.info(
+                        "[MemoryWorker] [LAT] meditation t+%.3fs: migrated node #%d in %.3fs "
+                        "(FAISS embed + Kuzu cognify)",
+                        time.time() - _t_med_start, _i, time.time() - _t_mig_one,
+                    )
                 promoted = len(promoted_nodes)
+                if promoted_nodes:
+                    logger.info(
+                        "[MemoryWorker] [LAT] meditation t+%.3fs: migration loop done in %.3fs",
+                        time.time() - _t_med_start, time.time() - _t_migrate_loop,
+                    )
 
                 # Consolidate Cognee (can be very slow — 120s timeout)
                 _send_heartbeat(send_queue, name)
                 last_heartbeat = time.time()
+                _t_consolidate = time.time()
                 try:
                     consolidated = loop.run_until_complete(
                         asyncio.wait_for(memory.consolidate(), timeout=120.0)
+                    )
+                    logger.info(
+                        "[MemoryWorker] [LAT] meditation t+%.3fs: consolidate done in %.3fs "
+                        "(now no-op = FAISS save only)",
+                        time.time() - _t_med_start, time.time() - _t_consolidate,
                     )
                 except asyncio.TimeoutError:
                     logger.warning("[MemoryWorker] Cognee consolidation timed out (120s)")
@@ -804,7 +897,9 @@ def _handle_query(msg: dict, memory, send_queue, name: str, loop, config: dict =
                     "consolidated": consolidated,
                 }
                 logger.info(
-                    "[MemoryWorker] Meditation complete: promoted=%d pruned=%d fading=%d consolidated=%s",
+                    "[MemoryWorker] [LAT] meditation t+%.3fs: HANDLER COMPLETE — "
+                    "promoted=%d pruned=%d fading=%d consolidated=%s",
+                    time.time() - _t_med_start,
                     promoted, pruned, len(fading), consolidated,
                 )
 
@@ -942,16 +1037,22 @@ def _request_anchor_via_kernel(
     from queue import Empty
 
     rid = uuid.uuid4().hex
+    _t_emit = time.time()
     _send_msg(send_queue, bus.ANCHOR_REQUEST, name, "kernel", {
         "state_root": state_root,
         "payload": payload_json,
         "promoted_count": promoted_count,
-        "ts": time.time(),
+        "ts": _t_emit,
     }, rid=rid)
+    logger.info(
+        "[MemoryWorker] [LAT] anchor_request emitted: rid=%s ts=%.6f (waiting up to %.0fs)",
+        rid[:8], _t_emit, timeout,
+    )
 
     deadline = time.time() + timeout
     deferred: list = []
     last_hb = 0.0
+    _deferred_count = 0
 
     try:
         while time.time() < deadline:
@@ -966,11 +1067,17 @@ def _request_anchor_via_kernel(
 
             # Found our response?
             if msg.get("type") == bus.RESPONSE and msg.get("rid") == rid:
+                logger.info(
+                    "[MemoryWorker] [LAT] anchor_response received: rid=%s "
+                    "round_trip=%.3fs (deferred_msgs=%d)",
+                    rid[:8], time.time() - _t_emit, _deferred_count,
+                )
                 return msg.get("payload", {}) or {}
 
             # Defer for re-injection — preserves order so the main loop
             # sees these in arrival order after meditation returns.
             deferred.append(msg)
+            _deferred_count += 1
     finally:
         for dmsg in deferred:
             try:

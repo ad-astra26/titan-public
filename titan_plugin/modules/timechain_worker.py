@@ -248,6 +248,29 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         save_state_cb=_b1_save_state,
     )
 
+    # Phase C Session 3 (rFP §4.B.9) — SHM-direct timechain_state.bin
+    # publisher. Replaces the deadlock-prone sync bus.request path for
+    # chain stats. Cadence: 1 Hz.
+    try:
+        from titan_plugin.core.state_registry import resolve_titan_id
+        from titan_plugin.logic.timechain_state_publisher import (
+            TimechainStatePublisher)
+        from titan_plugin.logic.worker_publisher_runner import (
+            run_worker_publisher)
+        _timechain_state_publisher = TimechainStatePublisher(
+            titan_id=resolve_titan_id())
+        run_worker_publisher(
+            publisher=_timechain_state_publisher,
+            state_fetcher=lambda: tc,
+            worker_name="timechain_worker",
+            cadence_s=1.0,
+        )
+    except Exception as _pub_init_err:
+        logger.error(
+            "[TimechainWorker] SHM publisher BOOT FAILED — "
+            "consumers fall back to sync bus.request path: %s",
+            _pub_init_err, exc_info=True)
+
     while True:
         # Heartbeat every iteration (not just on Empty). Broadcasts arriving
         # within the 5s get() timeout starve the Empty path; heartbeat at top

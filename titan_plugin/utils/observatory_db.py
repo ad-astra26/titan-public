@@ -490,6 +490,17 @@ class ObservatoryDB:
             (ts, type_, title, content, media_path, media_hash, meta_json),
             table="expressive_archive",
         )
+        # rFP_trinity_130d_awakening Phase 2 — fan out to inner perception
+        # tracker. Plugin sets ``self._on_expressive_create_hook`` at boot;
+        # all record_expressive sites (helpers, meditation, etc.) notify
+        # InnerPerceptionState through this single point. Best-effort —
+        # hook errors must NEVER break archival.
+        hook = getattr(self, "_on_expressive_create_hook", None)
+        if hook is not None:
+            try:
+                hook(type_, ts)
+            except Exception:
+                pass
 
     def get_expressive_archive(
         self, type_: str = None, limit: int = 20, offset: int = 0,

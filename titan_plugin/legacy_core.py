@@ -597,6 +597,45 @@ class TitanCore:
             heartbeat_timeout=120.0,  # Spirit does heavy V4 work (LLM, on-chain)
         ))
 
+        # cognitive_worker (L2) — Phase C C-S8 4B (chunk 8E skeleton, 2026-05-05).
+        # Hosts the L3 cognitive engines (Reasoning, MetaReasoning, Dreaming,
+        # InnerTrinityCoordinator, PiHeartbeat, NeuralNervousSystem,
+        # ObservableEngine, ExpressionManager). Active under l0_rust_enabled=true
+        # ONLY — the legacy spirit_worker_main path owns these engines under
+        # l0_rust_enabled=false per Maker D3 (b). Registration is gated on the
+        # flag so guardian_HCL never spawns cognitive_worker in the legacy mode.
+        # Boot order: registered after spirit so guardian autostart sequence
+        # boots body → mind → spirit → cognitive_worker (cognitive_worker reads
+        # the trinity tensors body/mind/spirit publish).
+        # See SPEC §1 glossary + §9.B Python tree (NEW v0.1.8) +
+        # PLAN_microkernel_phase_c_s8_cognitive_worker_extraction.md §2.2.
+        if self._full_config.get("microkernel", {}).get("l0_rust_enabled", False):
+            cognitive_worker_config = {
+                "data_dir": self._full_config.get("memory_and_storage", {}).get("data_dir", "./data"),
+                # Microkernel flag passthrough — cognitive_worker_main checks it
+                # defensively even though registration is already gated.
+                "microkernel": self._full_config.get("microkernel", {}),
+                # Banner config for titan_id resolution.
+                "info_banner": self._full_config.get("info_banner", {}),
+                # Engine configs read from titan_params.toml inside the worker
+                # via _load_toml_section helper — no need to thread them here.
+                # titan_vm config kept here for InnerTrinityCoordinator's
+                # internal NervousSystem (lightweight VM context).
+                "titan_vm": self._full_config.get("titan_vm", {}),
+            }
+            from titan_plugin.modules.cognitive_worker import cognitive_worker_main
+            self.guardian.register(ModuleSpec(
+                name="cognitive_worker",
+                layer="L2",  # Microkernel v2 §A.5 — L2 (cognitive engine host)
+                entry_fn=cognitive_worker_main,
+                config=cognitive_worker_config,
+                rss_limit_mb=2000,  # ReasoningEngine + MetaReasoningEngine + V5 NS net
+                autostart=True,     # Required for /v4/* cognitive routes to populate
+                lazy=False,
+                heartbeat_timeout=120.0,  # Cognitive epoch can include LLM calls
+                start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
+            ))
+
         # Media module (image/audio perception — lazy, starts on first media)
         media_config = {
             "queue_dir": os.path.join(
@@ -2279,13 +2318,17 @@ class TitanCore:
                     epoch_count, trigger_source,
                     emergent_ctx.get("drain", 0), emergent_ctx.get("gaba", 0))
 
-                result = memory_proxy.run_meditation()
+                # rFP_meditation_worker_latency Fix #A (2026-05-07): mirror
+                # plugin.py change — use run_meditation_async to avoid the
+                # 156s asyncio event-loop deadlock. legacy_core is the v5
+                # fallback path; under Microkernel v2 (production today)
+                # plugin.py owns the active loop. Keeping both in sync so
+                # toggling back to legacy mode doesn't reintroduce the bug.
+                result = await memory_proxy.run_meditation_async()
 
-                promoted = 0
-                pruned = 0
+                promoted = result.get("promoted", 0)
+                pruned = result.get("pruned", 0)
                 if result.get("success"):
-                    promoted = result.get("promoted", 0)
-                    pruned = result.get("pruned", 0)
                     logger.info(
                         "[TitanCore] Meditation epoch #%d complete: promoted=%d pruned=%d",
                         epoch_count, promoted, pruned,
@@ -2491,18 +2534,25 @@ class TitanCore:
         except Exception:
             pass
 
-        # Social perception stats (from spirit_worker SOCIAL_PERCEPTION handler)
+        # Social perception stats — Phase C Session 4 (rFP §4.C.10):
+        # SHM-direct read of social_perception_state.bin (Session 3 producer
+        # in spirit_worker). Replaces sync bus.request("get_social_perception_stats")
+        # path that violated G18 (state transport must be SHM, never bus).
         try:
-            spirit_proxy = self._proxies.get("spirit")
-            if spirit_proxy and hasattr(spirit_proxy, '_bus'):
-                # Query coordinator for accumulated social stats
-                from .bus import make_msg
-                _sp_result = spirit_proxy._bus.request(
-                    make_msg(bus.QUERY, "core", "spirit",
-                             {"action": "get_social_perception_stats"}),
-                    timeout=2.0)
-                if _sp_result and _sp_result.get("payload"):
-                    sources["social_perception_stats"] = _sp_result["payload"]
+            from titan_plugin.core.state_registry import (
+                StateRegistryReader, ensure_shm_root, resolve_titan_id)
+            from titan_plugin.logic.session3_state_specs import (
+                SOCIAL_PERCEPTION_STATE_SPEC)
+            import msgpack
+            if not hasattr(self, "_r_social_perception_legacy"):
+                self._r_social_perception_legacy = StateRegistryReader(
+                    SOCIAL_PERCEPTION_STATE_SPEC,
+                    ensure_shm_root(resolve_titan_id()))
+            _sp_raw = self._r_social_perception_legacy.read_variable()
+            if _sp_raw:
+                _sp_payload = msgpack.unpackb(_sp_raw, raw=False)
+                if isinstance(_sp_payload, dict) and _sp_payload:
+                    sources["social_perception_stats"] = _sp_payload
         except Exception:
             pass
 

@@ -37,6 +37,54 @@ import time
 from pathlib import Path
 from titan_plugin.utils.silent_swallow import swallow_warn
 
+# rFP_trinity_130d_awakening §12 / SPEC §23.6 SAT[0,5] — birth_state
+# always-on cache. Loaded once on first call from data/birth_dna_snapshot.json
+# (or birth_state.json if present). Required for inner_spirit
+# self_recognition + origin_connection dims.
+_BIRTH_STATE_CACHE: list | None = None
+_BIRTH_STATE_LOADED: bool = False
+
+
+def _load_birth_state() -> list | None:
+    """Load Titan's birth-DNA vector. Cached after first call.
+
+    Returns None only on first-load failure; once loaded, the cached value
+    is reused for the lifetime of the process.
+    """
+    global _BIRTH_STATE_CACHE, _BIRTH_STATE_LOADED
+    if _BIRTH_STATE_LOADED:
+        return _BIRTH_STATE_CACHE
+    _BIRTH_STATE_LOADED = True  # set even on failure to avoid re-trying
+    try:
+        # Worker runs from project root; prefer birth_dna_snapshot.json which
+        # is the active artifact in data/, fall back to birth_state.json.
+        candidates = [
+            os.path.join(os.path.dirname(__file__), "..", "..",
+                          "data", "birth_dna_snapshot.json"),
+            os.path.join(os.path.dirname(__file__), "..", "..",
+                          "data", "birth_state.json"),
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                with open(path) as f:
+                    data = json.load(f)
+                # Schema may be {"vector": [...]} or {"birth_state": [...]}
+                # or a bare list — accept all forms.
+                if isinstance(data, list):
+                    _BIRTH_STATE_CACHE = data
+                elif isinstance(data, dict):
+                    for key in ("birth_state", "vector", "state", "dna"):
+                        v = data.get(key)
+                        if isinstance(v, list):
+                            _BIRTH_STATE_CACHE = v
+                            break
+                if _BIRTH_STATE_CACHE:
+                    break
+    except Exception as _e:
+        swallow_warn('[SpiritLoop] birth_state load', _e,
+                     key="modules.spirit_loop.birth_state_load", throttle=1)
+    return _BIRTH_STATE_CACHE
+
 # GREAT PULSE transition tracking (resonance OFF→ON detector)
 # Resets to False on hot-reload → one spurious detection (harmless, documented)
 _great_pulse_resonance_prev = False
@@ -81,6 +129,7 @@ _NS_SNAPSHOT_CACHE: dict = {"data": None, "ts": 0.0}
 _COORD_SNAPSHOT_BUILDER_INTERVAL = 2.5
 _TRINITY_SNAPSHOT_BUILDER_INTERVAL = 0.25
 _NS_SNAPSHOT_BUILDER_INTERVAL = 0.25
+_SPIRIT_STATE_PUBLISHER_INTERVAL = 1.0  # SPEC §7.1 — 1 Hz for hormone_fires/impulse_engine_state/consciousness_state slots (rFP_phase_c_async_shm_consumer_migration §4.B.1)
 _SNAPSHOT_BUILDER_ERROR_BACKOFF = 2.0  # sleep on exception (avoid CPU burn + log flood)
 
 # Legacy TTL kept as compatibility shim for the QueryThread fast-path in
@@ -1460,10 +1509,25 @@ def build_coordinator_snapshot(state_refs: dict) -> dict | None:
     if not coordinator:
         return None
 
-    def _safe_set(stats_dict: dict, key: str, fn, default=None):
+    def _safe_set(stats_dict: dict, key: str, fn, default=None,
+                  shm_snapshot_attr: str | None = None):
         """Call fn() and store in stats_dict[key]. On failure, store
         `{"error": str(exc)}` (or `default` if provided) and log WARN
-        once so the snapshot still builds for other subsystems."""
+        once so the snapshot still builds for other subsystems.
+
+        chunk 8M.5 (2026-05-05): when ``shm_snapshot_attr`` is provided,
+        first check ``coordinator.<shm_snapshot_attr>`` — if cognitive_worker
+        injected a non-None shm-read snapshot (chunk 8M.4 step 1.6), use it
+        directly instead of calling fn(). Closes
+        rFP_phase_c_observatory_data_pipeline.md Gap H (§2.8): under
+        l0_rust_enabled=true, the in-process Python engines that fn() would
+        call have moved to Rust daemons; the only live data source is shm.
+        """
+        if shm_snapshot_attr:
+            snap = getattr(coordinator, shm_snapshot_attr, None)
+            if snap is not None:
+                stats_dict[key] = snap
+                return
         try:
             stats_dict[key] = fn()
         except Exception as _ss_err:
@@ -1527,9 +1591,24 @@ def build_coordinator_snapshot(state_refs: dict) -> dict | None:
         _safe_set(stats, "ground_up", ground_up_enricher.get_stats)
     if neuromodulator_system:
         _safe_set(stats, "neuromodulators", neuromodulator_system.get_stats)
+    elif getattr(coordinator, "_shm_neuromod_snapshot", None) is None:
+        # chunk 8M.5 fallback when neither legacy engine nor shm snapshot
+        # provided a value — emit empty dict so downstream key always exists.
+        # cognitive_worker doesn't currently inject _shm_neuromod_snapshot
+        # (it uses the `_neuromod_reader` callback at the coordinator-tick
+        # boundary instead — see cognitive_worker._drive_one_epoch step 3),
+        # but the key kept defensive in case future wiring lands.
+        stats.setdefault("neuromodulators", {})
     if expression_manager:
         _safe_set(stats, "expression_composites", expression_manager.get_stats)
-    if life_force_engine:
+    # chunk 8M.5 — chi block prefers the cognitive_worker shm snapshot
+    # (rFP §3.4). Under l0_rust_enabled=true `life_force_engine` is None and
+    # `_chi_snapshot` carries the canonical Rust-owned chi_state.bin payload
+    # injected by cognitive_worker._drive_one_epoch step 1.6.
+    _chi_shm = getattr(coordinator, "_chi_snapshot", None)
+    if _chi_shm is not None:
+        stats["chi"] = _chi_shm
+    elif life_force_engine:
         stats["chi"] = getattr(life_force_engine, '_latest_chi', {})
     if meditation_tracker:
         stats["meditation"] = {
@@ -1691,6 +1770,47 @@ def build_coordinator_snapshot(state_refs: dict) -> dict | None:
             logger.debug("[CoordSnapshot] observables read failed: %s", _obs_err)
     stats["topology"] = _topo_block
 
+    # chunk 8M.5 — sphere_clocks / unified_spirit / hormonal / titanvm /
+    # self_162d blocks. Under l0_rust_enabled=true these subsystems live in
+    # Rust daemons (titan-trinity-rs / titan-unified-spirit-rs / hormonal-
+    # rs); cognitive_worker._drive_one_epoch step 1.6 injects shm-read
+    # snapshots onto the coordinator. Always emit the key (shape-stable
+    # for downstream / JSON serialization) — `{}` when shm read failed or
+    # legacy mode w/o legacy engine.
+    _sc_shm = getattr(coordinator, "_sphere_clocks_snapshot", None)
+    if _sc_shm is not None:
+        stats["sphere_clocks"] = _sc_shm
+    _us_shm = getattr(coordinator, "_self_162d_snapshot", None)
+    if _us_shm is not None:
+        # self_162d carries unified_spirit (130D) + topology (30D) + journey (2D);
+        # expose under both `unified_spirit` and `self_162d` for downstream
+        # consumers with different key conventions.
+        stats["unified_spirit"] = _us_shm
+        stats["self_162d"] = _us_shm
+    _horm_shm = getattr(coordinator, "_hormonal_snapshot", None)
+    if _horm_shm is not None:
+        stats["hormonal"] = _horm_shm
+    _tvm_shm = getattr(coordinator, "_titanvm_snapshot", None)
+    if _tvm_shm is not None:
+        stats["titanvm_registers"] = _tvm_shm
+
+    # chunk 8M.5 — topology block can also pull from shm snapshot when
+    # coordinator.topology engine is None (l0_rust mode). The legacy block
+    # above already populated _topo_block.observables_30d from inner_state;
+    # add labelled per-part view from shm topology_30d when available.
+    _topo_shm = getattr(coordinator, "_topology_snapshot", None)
+    if _topo_shm is not None:
+        # _topo_shm = {"values": [30 floats], "parts": {...}, "age_seconds", "seq"}
+        if not _topo_block.get("observables_30d") and _topo_shm.get("values"):
+            _topo_block["observables_30d"] = _topo_shm["values"]
+        if not _topo_block.get("observables_dict") and _topo_shm.get("parts"):
+            _topo_block["observables_dict"] = _topo_shm["parts"]
+        # Reflect freshness so frontend can show staleness if needed.
+        _topo_block["age_seconds"] = _topo_shm.get("age_seconds")
+        # Re-emit topology since the shm enrichment landed after the
+        # _topo_block insertion at stats["topology"] above.
+        stats["topology"] = _topo_block
+
     if msl:
         _msl_attn = msl.get_attention_weights_for_kin()
         _msl_entropy = 0.0
@@ -1769,6 +1889,23 @@ def build_trinity_snapshot(state_refs: dict, config: dict) -> dict:
         response["resonance"] = resonance.get_stats()
     if unified_spirit:
         response["unified_spirit"] = unified_spirit.get_stats()
+    # chunk 8M.5 — shm-fallback path under l0_rust_enabled=true. Engines
+    # above are None in that mode (titan-trinity-rs / titan-unified-spirit-rs
+    # own the truth); cognitive_worker has injected shm-read snapshots
+    # onto the coordinator. Apply when the legacy block didn't populate.
+    coordinator = state_refs.get("coordinator")
+    if coordinator is not None:
+        if "sphere_clock" not in response:
+            _sc = getattr(coordinator, "_sphere_clocks_snapshot", None)
+            if _sc is not None:
+                response["sphere_clock"] = _sc
+        if "unified_spirit" not in response:
+            _us = getattr(coordinator, "_self_162d_snapshot", None)
+            if _us is not None:
+                response["unified_spirit"] = _us
+                response["self_162d"] = _us
+        # resonance has no Rust shm slot today (per SPEC §1096 list);
+        # legacy engine remains the only producer. Leave key absent.
     if inner_state:
         response["observables"] = inner_state.observables
         response["inner_state"] = inner_state.snapshot()
@@ -1965,6 +2102,87 @@ def start_snapshot_builder_threads(state_refs: dict, config: dict,
               _NS_SNAPSHOT_BUILDER_INTERVAL),
         daemon=True, name="ns-snapshot-builder",
     ).start()
+
+    # Phase C Session 1 (rFP_phase_c_async_shm_consumer_migration §4.B.1) —
+    # SHM-direct state publisher. Owns hormone_fires.bin +
+    # impulse_engine_state.bin + consciousness_state.bin per SPEC §7.1.
+    # Cadence: 1 Hz (SPEC-canonical). Replaces the deadlock-prone sync
+    # bus.request(get_trinity) path that wedged T3 outer-sensor sidecars
+    # 2026-05-07 — proven via py-spy. Consumers (spirit_proxy, sidecars,
+    # gather loops) now read these slots via StateRegistryReader on the
+    # next session chunk (§4.C.1) shipping with this same Session 1.
+    try:
+        from titan_plugin.core.state_registry import resolve_titan_id
+        from titan_plugin.logic.spirit_state_publisher import SpiritStatePublisher
+        # Phase C Session 3 (rFP §4.B.10 + §4.B.4) — 2 additional
+        # publishers running alongside SpiritStatePublisher in the same
+        # snapshot-builder thread. Both source state from spirit_worker's
+        # in-process state_refs (NeuralNervousSystem for reflex,
+        # inner_state.observables for social_perception). Per G21 each
+        # is the SOLE writer of its slot.
+        from titan_plugin.logic.reflex_state_publisher import (
+            ReflexStatePublisher)
+        from titan_plugin.logic.social_perception_state_publisher import (
+            SocialPerceptionStatePublisher)
+        # Phase C Session 4 (rFP §4.C.1 expansion) — closes spirit_proxy
+        # 4 retained-sync methods (filter_down/meditation_health/coordinator/
+        # nervous_system).
+        from titan_plugin.logic.spirit_supplemental_state_publisher import (
+            SpiritSupplementalStatePublisher)
+
+        _titan_id_resolved = resolve_titan_id()
+        _spirit_state_publisher = SpiritStatePublisher(
+            titan_id=_titan_id_resolved)
+        _reflex_state_publisher = ReflexStatePublisher(
+            titan_id=_titan_id_resolved)
+        _social_perception_publisher = SocialPerceptionStatePublisher(
+            titan_id=_titan_id_resolved)
+        _spirit_supplemental_publisher = SpiritSupplementalStatePublisher(
+            titan_id=_titan_id_resolved)
+
+        def _spirit_state_publish_tick():
+            # 4 independent publishers — each per-publish failure is
+            # isolated by BaseStatePublisher's internal try/except.
+            _spirit_state_publisher.publish(state_refs)
+            _reflex_state_publisher.publish(
+                state_refs.get("neural_nervous_system"))
+            _social_perception_publisher.publish(state_refs)
+            _spirit_supplemental_publisher.publish({
+                "filter_down_v5": state_refs.get("filter_down_v5"),
+                "config": config,
+                "meditation_tracker": state_refs.get("meditation_tracker"),
+                "med_watchdog": state_refs.get("med_watchdog"),
+                "coord_snapshot_cache": _COORD_SNAPSHOT_CACHE,
+                "ns_snapshot_cache": _NS_SNAPSHOT_CACHE,
+            })
+            return None  # no cache; SHM is the canonical store
+
+        threading.Thread(
+            target=_builder_loop,
+            args=("spirit_state_publisher",
+                  _spirit_state_publish_tick,
+                  {"data": None, "ts": 0.0},  # no-op cache (SHM is canonical)
+                  _SPIRIT_STATE_PUBLISHER_INTERVAL),
+            daemon=True, name="spirit-state-publisher",
+        ).start()
+        logger.info(
+            "[SpiritLoop] Spirit state SHM publishers started — "
+            "5 spirit slots (Session 1) + reflex_state (Session 3 §4.B.10) "
+            "+ social_perception_state (Session 3 §4.B.4) "
+            "+ spirit_supplemental_state (Session 4 §4.C.1 expansion) "
+            "@ %.2fs cadence (SPEC §7.1 / Preamble G18)",
+            _SPIRIT_STATE_PUBLISHER_INTERVAL)
+    except Exception as _publisher_boot_err:
+        # Boot-time failure is non-fatal: existing snapshot-builder threads
+        # remain functional, sync bus.request paths still work as fallback
+        # while Session 1 is rolling out. Log loudly so it surfaces in any
+        # health check.
+        logger.error(
+            "[SpiritLoop] Spirit state SHM publisher BOOT FAILED — "
+            "consumers will fall back to sync bus.request path (deadlock "
+            "surface remains until publisher recovers): %s",
+            _publisher_boot_err, exc_info=True)
+
     logger.info(
         "[SpiritLoop] Snapshot builder threads started — "
         "coord/trinity/ns rebuild every %.2f/%.2f/%.2fs",
@@ -2000,128 +2218,19 @@ def _handle_query(msg: dict, config: dict, body_state: dict, mind_state: dict,
     src = msg.get("src", "")
 
     try:
-        if action == "get_tensor":
-            tensor = _collect_spirit_tensor(config, body_state, mind_state, consciousness)
-            _send_response(send_queue, name, src, {"tensor": tensor}, rid)
-
-        elif action == "get_trinity":
-            # Primary path: background `trinity-snapshot-builder` thread
-            # keeps _TRINITY_SNAPSHOT_CACHE fresh (~0.5s cycle). Cache read
-            # is atomic (dict[key] pointer deref under GIL).
-            _cached = _TRINITY_SNAPSHOT_CACHE["data"]
-            if _cached is not None:
-                _send_response(send_queue, name, src, _cached, rid)
-                return
-            # Cold-boot fallback: builder hasn't run yet. Build synchronously
-            # and populate cache so subsequent queries fast-path immediately.
-            _state_refs = {
-                "body_state": body_state, "mind_state": mind_state,
-                "consciousness": consciousness,
-                "filter_down": filter_down, "intuition": intuition,
-                "impulse_engine": impulse_engine,
-                "sphere_clock": sphere_clock, "resonance": resonance,
-                "unified_spirit": unified_spirit,
-                "inner_state": inner_state, "spirit_state": spirit_state,
-            }
-            response = build_trinity_snapshot(_state_refs, config)
-            _TRINITY_SNAPSHOT_CACHE["data"] = response
-            _TRINITY_SNAPSHOT_CACHE["ts"] = time.time()
-            _send_response(send_queue, name, src, response, rid)
-
-        elif action == "get_consciousness":
-            if consciousness and consciousness.get("latest_epoch"):
-                _send_response(send_queue, name, src, consciousness["latest_epoch"], rid)
-            else:
-                _send_response(send_queue, name, src, {"error": "No consciousness epochs yet"}, rid)
-
-        elif action == "get_filter_down":
-            if filter_down:
-                _send_response(send_queue, name, src, filter_down.get_stats(), rid)
-            else:
-                _send_response(send_queue, name, src, {"error": "FilterDown not available"}, rid)
-
-        elif action == "get_intuition":
-            if intuition:
-                _send_response(send_queue, name, src, intuition.get_stats(), rid)
-            else:
-                _send_response(send_queue, name, src, {"error": "Intuition not available"}, rid)
-
-        elif action == "get_impulse_engine":
-            if impulse_engine:
-                _send_response(send_queue, name, src, impulse_engine.get_stats(), rid)
-            else:
-                _send_response(send_queue, name, src, {"error": "ImpulseEngine not available"}, rid)
-
-        elif action == "get_sphere_clock":
-            if sphere_clock:
-                _send_response(send_queue, name, src, sphere_clock.get_stats(), rid)
-            else:
-                _send_response(send_queue, name, src, {"error": "SphereClockEngine not available"}, rid)
-
-        elif action == "get_resonance":
-            if resonance:
-                _send_response(send_queue, name, src, resonance.get_stats(), rid)
-            else:
-                _send_response(send_queue, name, src, {"error": "ResonanceDetector not available"}, rid)
-
-        elif action == "get_unified_spirit":
-            if unified_spirit:
-                _send_response(send_queue, name, src, unified_spirit.get_stats(), rid)
-            else:
-                _send_response(send_queue, name, src, {"error": "UnifiedSpirit not available"}, rid)
-
-        elif action == "get_filter_down_status":
-            # V4 retired 2026-04-25 (Pattern C surfaced silent dim mismatch
-            # since 130D upgrade). V5 is the sole FILTER_DOWN learner now.
-            _v5_stats = filter_down_v5.get_stats() if filter_down_v5 else None
-            v5_publishing = bool(
-                (config or {}).get("filter_down_v5", {}).get("publish_enabled", False)
-            )
-            _send_response(send_queue, name, src, {
-                "v5": _v5_stats,
-                "v5_publishing": v5_publishing,
-                "coexistence_phase": "v5_only",
-            }, rid)
-
-        elif action == "get_meditation_health":
-            # rFP_self_healing_meditation_cadence.md Phase 1+2:
-            # watchdog state + tracker + config for /v4/meditation/health.
-            _mh: dict = {}
-            if meditation_tracker:
-                _mh["tracker"] = {
-                    "count": meditation_tracker.get("count", 0),
-                    "count_since_nft": meditation_tracker.get("count_since_nft", 0),
-                    "last_epoch": meditation_tracker.get("last_epoch", 0),
-                    "last_ts": meditation_tracker.get("last_ts", 0),
-                    "in_meditation": bool(meditation_tracker.get("in_meditation", False)),
-                }
-            else:
-                _mh["tracker"] = {"error": "tracker not available"}
-            if med_watchdog is not None:
-                try:
-                    _mh["watchdog"] = med_watchdog.health_snapshot()
-                except Exception as _mh_err:
-                    _mh["watchdog"] = {"error": f"snapshot error: {_mh_err}"}
-            else:
-                _mh["watchdog"] = {"error": "watchdog not initialized"}
-            # Overdue flag (cross-Titan correlation uses this at central aggregator)
-            _mh["overdue"] = False
-            if meditation_tracker and med_watchdog is not None:
-                _last_ts = float(meditation_tracker.get("last_ts", 0) or 0)
-                if _last_ts > 0:
-                    import time as _t
-                    _now = _t.time()
-                    _elapsed = _now - _last_ts
-                    _expected = med_watchdog.expected_interval()
-                    _floor = med_watchdog.min_alert_hours * 3600.0
-                    _threshold = max(_floor, _expected)
-                    if _elapsed > _threshold:
-                        _mh["overdue"] = True
-                        _mh["overdue_since_ts"] = _last_ts + _threshold
-                        _mh["overdue_elapsed_hours"] = round(_elapsed / 3600, 2)
-            _send_response(send_queue, name, src, _mh, rid)
-
-        elif action == "get_observables":
+        # Phase C Session 5 (rFP §4.D.1): the following 11 handlers
+        # RETIRED — proxy consumers migrated to SHM-direct (Sessions 1+4):
+        #   get_tensor / get_trinity / get_consciousness / get_filter_down
+        #   / get_intuition / get_impulse_engine / get_sphere_clock /
+        #   get_resonance / get_unified_spirit (Session 1 §4.C.1 — read
+        #   spirit_state slots: hormone_fires, impulse_engine_state,
+        #   consciousness_state, resonance_state, unified_spirit_metadata
+        #   + sphere_clocks/topology_30d/inner_*_*d.bin)
+        #   get_filter_down_status / get_meditation_health / get_coordinator
+        #   / get_nervous_system (Session 4 §4.C.1 expansion — read
+        #   spirit_supplemental_state.bin)
+        # G-RPC-4 caller graph: zero callers for all 11 actions.
+        if action == "get_observables":
             if inner_state and inner_state.observables:
                 _send_response(send_queue, name, src, inner_state.observables, rid)
             else:
@@ -2139,56 +2248,11 @@ def _handle_query(msg: dict, config: dict, body_state: dict, mind_state: dict,
             else:
                 _send_response(send_queue, name, src, {"error": "SpiritState not available"}, rid)
 
-        elif action == "get_coordinator":
-            # Primary path: background `coord-snapshot-builder` thread
-            # keeps _COORD_SNAPSHOT_CACHE fresh (~4s cycle under normal
-            # load; cache age bounded by build_time + interval). Cache
-            # read is atomic (dict[key] pointer deref under GIL). Before
-            # this refactor: the handler built inline on every cache
-            # miss (460-2144ms) blocking the QueryThread and causing
-            # SKIP-stale on queued queries (T1-COORD-QUERYTHREAD-BACKLOG).
-            _cached = _COORD_SNAPSHOT_CACHE["data"]
-            if _cached is not None:
-                _send_response(send_queue, name, src, _cached, rid)
-                return
-            # Cold-boot fallback: builder hasn't populated cache yet
-            # (first few seconds after spirit_worker start). Build
-            # synchronously so the first query still gets an answer,
-            # then populate the cache so the next query fast-paths.
-            if coordinator:
-                _state_refs = {
-                    "coordinator": coordinator, "pi_monitor": pi_monitor,
-                    "e_mem": e_mem, "prediction_engine": prediction_engine,
-                    "ex_mem": ex_mem, "episodic_mem": episodic_mem,
-                    "working_mem": working_mem,
-                    "inner_lower_topo": inner_lower_topo,
-                    "outer_lower_topo": outer_lower_topo,
-                    "ground_up_enricher": ground_up_enricher,
-                    "neuromodulator_system": neuromodulator_system,
-                    "expression_manager": expression_manager,
-                    "life_force_engine": life_force_engine,
-                    "meditation_tracker": meditation_tracker,
-                    "outer_interface": outer_interface,
-                    "reasoning_engine": reasoning_engine,
-                    "self_reasoning": self_reasoning,
-                    "coding_explorer": coding_explorer,
-                    "phase_tracker": phase_tracker,
-                    "inner_state": inner_state,
-                    "social_pressure_meter": social_pressure_meter,
-                    "msl": msl, "language_stats": language_stats,
-                }
-                stats = build_coordinator_snapshot(_state_refs)
-                if stats is not None:
-                    _COORD_SNAPSHOT_CACHE["data"] = stats
-                    _COORD_SNAPSHOT_CACHE["ts"] = time.time()
-                    _send_response(send_queue, name, src, stats, rid)
-                else:
-                    _send_response(send_queue, name, src,
-                                   {"error": "Coordinator not available"}, rid)
-            else:
-                _send_response(send_queue, name, src,
-                               {"error": "Coordinator not available"}, rid)
-
+        # Phase C Session 5 (rFP §4.D.1): get_coordinator handler RETIRED
+        # — spirit_proxy.get_coordinator now SHM-direct via
+        # spirit_supplemental_state.bin (Session 4 §4.C.1 expansion).
+        # Background snapshot-builder thread continues to maintain
+        # _COORD_SNAPSHOT_CACHE; the SHM publisher reads from that cache.
         elif action == "reset_msl_homeostasis":
             # Phase 3+ of foundational healing rFP (2026-04-13): MSL
             # homeostatic reset to baseline. After 27+ days of accumulated
@@ -2250,26 +2314,11 @@ def _handle_query(msg: dict, config: dict, body_state: dict, mind_state: dict,
                 _send_response(send_queue, name, src,
                                {"ok": False, "error": str(_reset_err)}, rid)
 
-        elif action == "get_nervous_system":
-            # Primary path: background `ns-snapshot-builder` thread keeps
-            # _NS_SNAPSHOT_CACHE fresh (~0.5s cycle).
-            _cached = _NS_SNAPSHOT_CACHE["data"]
-            if _cached is not None:
-                _send_response(send_queue, name, src, _cached, rid)
-                return
-            # Cold-boot fallback: synchronous build.
-            _state_refs = {
-                "neural_nervous_system": neural_nervous_system,
-                "coordinator": coordinator,
-            }
-            _ns_resp = build_nervous_system_snapshot(_state_refs)
-            if _ns_resp is not None:
-                _NS_SNAPSHOT_CACHE["data"] = _ns_resp
-                _NS_SNAPSHOT_CACHE["ts"] = time.time()
-                _send_response(send_queue, name, src, _ns_resp, rid)
-            else:
-                _send_response(send_queue, name, src,
-                               {"error": "NervousSystem not available"}, rid)
+        # Phase C Session 5 (rFP §4.D.1): get_nervous_system handler
+        # RETIRED — spirit_proxy.get_nervous_system now SHM-direct via
+        # spirit_supplemental_state.bin (Session 4 §4.C.1 expansion).
+        # ns-snapshot-builder thread continues to keep _NS_SNAPSHOT_CACHE
+        # fresh; the SHM publisher reads from that cache.
 
         elif action == "social_relief":
             inner_payload = payload.get("payload", {})
@@ -2347,15 +2396,11 @@ def _handle_query(msg: dict, config: dict, body_state: dict, mind_state: dict,
                     "reinforced": False, "reason": "not available",
                 }, rid)
 
-        elif action == "get_social_perception_stats":
-            # Return accumulated social perception stats for outer_mind enrichment
-            stats = getattr(coordinator, '_social_perception_stats', {
-                "sentiment_ema": 0.5,
-                "connection_ema": 0.0,
-                "events_count": 0,
-                "last_contagion": None,
-            }) if coordinator else {}
-            _send_response(send_queue, name, src, stats, rid)
+        # Phase C Session 5 (rFP §4.D.1): get_social_perception_stats
+        # handler RETIRED — all callers (plugin.py:_gather_outer_sources,
+        # legacy_core.py mirror, agno_hooks.py outer_mind enrichment)
+        # migrated to SHM-direct read of social_perception_state.bin
+        # (Session 3 §4.B.4 publisher).
 
         else:
             logger.warning("[SpiritWorker] Unknown action: %s", action)
@@ -2551,6 +2596,36 @@ def _publish_spirit_state(send_queue, name: str, tensor: list, consciousness: di
             except Exception:
                 _expr_stats = None
 
+        # rFP_trinity_130d_awakening §12 / SPEC §23.6 — Phase 1 wiring:
+        # SAT[0,5] need birth_state always-on (load once, cache module-level).
+        # SAT[2] sovereignty reads history.expression.sovereignty_ratio.
+        # CHIT[17] discernment reads mem.action_chains.
+        _birth_state = _load_birth_state()
+        # sovereignty_ratio: prefer expression_translator (in-plugin) via
+        # _expr_stats, fall back to legacy 0.0 (worker has no direct
+        # ExpressionTranslator handle — _expr_stats from expression_manager
+        # carries sovereignty_ratio when available per spirit_tensor's
+        # _expression_intensity helper).
+        _sov_ratio = 0.0
+        if isinstance(_expr_stats, dict):
+            _sov_ratio = float(_expr_stats.get("sovereignty_ratio", 0.0) or 0.0)
+        _history_dict = {
+            "expression": {"sovereignty_ratio": _sov_ratio},
+        }
+        # Ensure memory_stats carries action_chains for CHIT[17].
+        if isinstance(_mem, dict) and "action_chains" not in _mem:
+            try:
+                from titan_plugin.logic.inner_memory import InnerMemoryStore
+                # Worker may already hold an InnerMemoryStore — try the
+                # closure-bound `e_mem` first; otherwise fall back to a
+                # cheap stats-only read.
+                if hasattr(e_mem, "get_stats"):
+                    _imem_stats = e_mem.get_stats()
+                    if isinstance(_imem_stats, dict):
+                        _mem["action_chains"] = _imem_stats.get("action_chains", 0)
+            except Exception:
+                pass
+
         spirit_45d = collect_spirit_45d(
             current_5d=tensor,
             body_tensor=body_vals,
@@ -2563,6 +2638,8 @@ def _publish_spirit_state(send_queue, name: str, tensor: list, consciousness: di
             sphere_clocks=_clocks,
             memory_stats=_mem,
             expression_stats=_expr_stats,
+            birth_state=_birth_state,
+            history=_history_dict,
         )
         payload["values_45d"] = [round(v, 4) for v in spirit_45d]
         payload["dims_extended"] = 45

@@ -113,8 +113,11 @@ class SocialGraph:
             try:
                 import os as _os
                 from titan_plugin.persistence.config import IMWConfig
+                # rFP_imw_writerclient_singleton (2026-05-07 PM): see
+                # events_teacher.py:109 — same migration to per-caller
+                # singleton via `get_client()`.
                 from titan_plugin.persistence.writer_client import (
-                    InnerMemoryWriterClient,
+                    get_client,
                 )
                 cfg = IMWConfig.from_titan_config_section("persistence_social_graph")
                 if cfg.enabled and cfg.mode != "disabled":
@@ -131,8 +134,7 @@ class SocialGraph:
                                 return
                         except OSError as _e:
                             logger.debug("[SocialGraph] realpath check failed: %s", _e)
-                    self._writer = InnerMemoryWriterClient(
-                        cfg, caller_name="social_graph")
+                    self._writer = get_client("social_graph", cfg=cfg)
                     logger.info(
                         "[SocialGraph] Routed via social_graph_writer "
                         "(mode=%s, canonical=%s)",

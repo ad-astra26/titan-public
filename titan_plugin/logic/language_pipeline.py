@@ -284,10 +284,17 @@ def update_vocabulary_after_speak(
     db_path: str,
     narrator,
     sentence: str,
+    neuromods: dict | None = None,
+    emotion: str = "",
 ) -> tuple[int, list[str]]:
     """Update vocabulary for words Titan just spoke (advance to producible).
 
     Source: spirit_worker.py lines 4305-4347.
+
+    When a word's `learning_phase` transitions from non-producible to
+    'producible' for the first time, capture the felt-state at that moment
+    via `grounded_at` + `grounded_felt_summary` (rFP_x_voice_enrichment §4.5,
+    Phase 1 GROUNDED_TODAY Pool A source).
 
     Returns:
         (words_updated, list_of_words_reinforced)
@@ -297,6 +304,14 @@ def update_vocabulary_after_speak(
 
     if not sentence:
         return updated, words_reinforced
+
+    grounded_summary = ""
+    if neuromods or emotion:
+        try:
+            from titan_plugin.logic.social_x.felt_state import compact_felt_summary
+            grounded_summary = compact_felt_summary(neuromods, emotion)
+        except Exception:
+            grounded_summary = ""
 
     try:
         conn = sqlite3.connect(db_path, timeout=5.0)
@@ -322,27 +337,45 @@ def update_vocabulary_after_speak(
             ).fetchone()
 
             if row:
-                # Advance to producible + increment times_produced
+                # Advance to producible + increment times_produced.
+                # Capture felt-state at the producible-transition moment if
+                # this is the first time crossing into 'producible'.
+                first_producible = (row[2] != "producible")
                 from titan_plugin.persistence import get_client
-                get_client(caller_name="language_pipeline").write(
-                    "UPDATE vocabulary SET learning_phase='producible', "
-                    "times_produced = times_produced + 1, "
-                    "confidence = MIN(1.0, confidence + 0.02) "
-                    "WHERE word=?",
-                    (word,),
-                    table="vocabulary",
-                )
+                if first_producible and grounded_summary:
+                    get_client(caller_name="language_pipeline").write(
+                        "UPDATE vocabulary SET learning_phase='producible', "
+                        "times_produced = times_produced + 1, "
+                        "confidence = MIN(1.0, confidence + 0.02), "
+                        "grounded_at = ?, grounded_felt_summary = ? "
+                        "WHERE word=?",
+                        (time.time(), grounded_summary, word),
+                        table="vocabulary",
+                    )
+                else:
+                    get_client(caller_name="language_pipeline").write(
+                        "UPDATE vocabulary SET learning_phase='producible', "
+                        "times_produced = times_produced + 1, "
+                        "confidence = MIN(1.0, confidence + 0.02) "
+                        "WHERE word=?",
+                        (word,),
+                        table="vocabulary",
+                    )
                 updated += 1
                 words_reinforced.append(word)
             else:
                 # Auto-create word not in vocabulary
                 w_type = classify_word_type(word)
+                now_ts = time.time()
                 conn.execute(
                     "INSERT OR IGNORE INTO vocabulary "
                     "(word, word_type, confidence, learning_phase, "
-                    "times_encountered, times_produced, created_at) "
-                    "VALUES (?, ?, 0.05, 'producible', 1, 1, ?)",
-                    (word, w_type, time.time())
+                    "times_encountered, times_produced, created_at, "
+                    "grounded_at, grounded_felt_summary) "
+                    "VALUES (?, ?, 0.05, 'producible', 1, 1, ?, ?, ?)",
+                    (word, w_type, now_ts,
+                     now_ts if grounded_summary else 0,
+                     grounded_summary)
                 )
                 updated += 1
                 words_reinforced.append(word)

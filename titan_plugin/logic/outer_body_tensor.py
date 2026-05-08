@@ -4,12 +4,18 @@ titan_plugin/logic/outer_body_tensor.py — 5D Outer Body Tensor (pure function)
 Extracted from OuterTrinityCollector._collect_outer_body (outer_trinity.py)
 as a module-level pure function for use by outer_body_worker subprocess.
 
-Outer Body 5DT — V6 body-felt semantics (rFP_phase1_sensory_wiring):
+Outer Body 5DT — V6 body-felt semantics:
   [0] interoception   — SOL balance (0.4) + block_delta (0.3) + anchor_fresh (0.3)
   [1] proprioception  — peer_entropy (0.5) + helper_health (0.3) + bus_module_div (0.2)
   [2] somatosensation — TX latency (0.4) + creation_nudge (0.3) + CPU spike rate (0.3)
   [3] entropy         — ping variance (0.4) + bus drop rate (0.3) + error rate (0.3)
-  [4] thermal         — CPU thermal (0.4) + circadian (0.3) + LLM latency EMA (0.3)
+  [4] thermal         — CPU thermal (0.35) + circadian (0.25) + hormonal_heat (0.40)
+                        where hormonal_heat = mean(IMPULSE, VIGILANCE)
+
+Thermal REDESIGNED 2026-05-06 per rFP_trinity_130d_awakening §12.1 + SPEC §23.7:
+LLM-latency was the wrong signal (network/inference performance, not body
+warmth). Hormonal heat (sympathetic-arousal — fight/flight pressure +
+alertness) is the natural body-felt analog of warmth/cold.
 
 All values normalized to [0.0, 1.0] where 0.5 = center (Middle Path).
 """
@@ -90,15 +96,18 @@ def collect_outer_body_5d(
     error_rate = failed_actions / total_actions if total_actions > 0 else 0.0
     entropy = _clamp(0.4 * ping_var + 0.3 * bus_drop_rate + 0.3 * error_rate)
 
-    # ── [4] thermal: arousal / temperature ───────────────────────────
+    # ── [4] thermal: arousal / temperature (REDESIGNED 2026-05-06) ──
+    # SPEC §23.7 — hormonal_heat = mean(IMPULSE, VIGILANCE). Pure
+    # sympathetic-arousal signal. FOCUS intentionally excluded (deep
+    # concentration is more cool-sustained than hot). LLM latency
+    # dropped (it's not thermal — it's inference performance).
     cpu_thermal = sys_stats.get("cpu_thermal", 0.5)
     circadian = sys_stats.get("circadian_phase", 0.5)
-    avg_latency = sources.get("llm_avg_latency", 0.0)
-    if avg_latency and avg_latency > 0:
-        llm_latency_norm = _clamp(avg_latency / MAX_LATENCY_SECONDS)
-    else:
-        llm_latency_norm = 0.5
-    thermal = _clamp(0.4 * cpu_thermal + 0.3 * circadian + 0.3 * llm_latency_norm)
+    hormones = sources.get("hormone_levels") or {}
+    impulse = float(hormones.get("IMPULSE", 0.5))
+    vigilance = float(hormones.get("VIGILANCE", 0.5))
+    hormonal_heat = (impulse + vigilance) / 2.0
+    thermal = _clamp(0.35 * cpu_thermal + 0.25 * circadian + 0.40 * hormonal_heat)
 
     return [round(v, 4) for v in [
         interoception, proprioception, somatosensation, entropy, thermal

@@ -6,13 +6,44 @@ PLAN_microkernel_phase_c_s2_kernel.md §12.8.
 
 The titan-kernel-rs binary writes JSONL events with rotating archives
 `supervision.jsonl`, `supervision.jsonl.1`, ..., `supervision.jsonl.10`.
-Each line is a single JSON object whose `kind` field is one of:
-  CHILD_STARTED, CHILD_EXITED, CHILD_RESTART, CHILD_DEPENDENCY_BLOCKED,
-  CHILD_DEPENDENCY_UNBLOCKED, SUPERVISION_ESCALATION,
-  SUPERVISION_ESCALATION_RESPONSE.
+
+Wire format (per `titan-kernel-rs::supervision_log::LogLine` +
+`titan-core::supervisor::event::SupervisionEvent`):
+
+    {
+        "ts": "2026-04-29T13:42:01.123456789Z",       # top-level ISO 8601
+        "boot_generation": 51,                         # top-level u64
+        "event": "SUPERVISION_CHILD_DOWN",             # top-level: bus event name
+        "payload": {                                   # nested SupervisionEvent enum
+            "kind": "CHILD_DOWN",                      # serde tag (variant name SCREAMING_SNAKE_CASE)
+            "child_name": "titan_HCL",
+            "supervisor": "kernel",
+            "reason": "PANIC",
+            "reason_detail": "exit_code=Some(1)",
+            "restart_count": 0,
+            "ts": {"secs_since_epoch": ..., "nanos_since_epoch": ...}
+        }
+    }
+
+Top-level `event` field values (the bus event name):
+  SUPERVISION_CHILD_DOWN, SUPERVISION_CHILD_RESTARTED, SUPERVISION_ESCALATION,
+  SUPERVISION_ESCALATION_RESPONSE, SUPERVISION_DEPENDENCY_BLOCKED,
+  SUPERVISION_DEPENDENCY_RECOVERED, SUPERVISION_DEPENDENCY_DEGRADED,
+  SUPERVISION_DATA_RESTORE, SUPERVISION_DATA_LOST, SUPERVISION_FORCED_KILL.
+
+Inner `payload.kind` values (the SupervisionEvent enum variant tag):
+  CHILD_DOWN, CHILD_RESTARTED, ESCALATION, ESCALATION_RESPONSE,
+  DEPENDENCY_BLOCKED, DEPENDENCY_RECOVERED, DEPENDENCY_DEGRADED,
+  DATA_RESTORE, DATA_LOST, FORCED_KILL.
 
 This reader is read-only — never writes the file. The kernel-rs binary is
 the sole writer per SPEC §11.E.
+
+Schema fix 2026-05-06 (C-S2 audit GAP-CS2-002): pre-existing reader filtered on
+flat `event["kind"]` / `event["child"]` / `event["reason"]` which never matched
+the actual nested Rust output, so all production queries returned empty. Now
+honors the nested wire format documented above. Tests updated to use real wire
+format (synthetic flat events removed).
 """
 
 from __future__ import annotations
@@ -27,14 +58,36 @@ from typing import Iterable, Iterator, Optional
 
 DEFAULT_LOG_PATH = Path("data/supervision.jsonl")
 DEFAULT_TAIL_POLL_INTERVAL_S = 0.5
+
+#: Top-level `event` field values that constitute escalation activity.
+#: Used by `watch_escalations()` to filter the live stream.
 ESCALATION_KINDS = frozenset(
     {"SUPERVISION_ESCALATION", "SUPERVISION_ESCALATION_RESPONSE"}
 )
 
 
+def _payload(event: dict) -> dict:
+    """Return the nested payload dict, defensively (empty if missing/wrong type)."""
+    p = event.get("payload")
+    return p if isinstance(p, dict) else {}
+
+
 @dataclass(frozen=True)
 class SupervisionFilter:
-    """Filter criteria for `iter_supervision_log`."""
+    """Filter criteria for `iter_supervision_log`.
+
+    Field semantics — params match the user-facing CLI flags but resolve to
+    the actual Rust wire-format positions:
+
+    - `child` matches `event["payload"]["child_name"]`
+    - `reason` matches `event["payload"]["reason"]`
+    - `supervisor` matches `event["payload"]["supervisor"]`
+    - `kind` is overloaded and accepts EITHER:
+       * a top-level bus-event name (e.g. `SUPERVISION_CHILD_DOWN`) → matches `event["event"]`
+       * an enum-variant tag (e.g. `CHILD_DOWN`) → matches `event["payload"]["kind"]`
+       Whichever side matches first wins. This lets ops users say either form.
+    - `since` filters on top-level `event["ts"]` (ISO 8601 from the Rust writer).
+    """
 
     child: Optional[str] = None
     reason: Optional[str] = None
@@ -43,13 +96,17 @@ class SupervisionFilter:
     since: Optional[timedelta] = None
 
     def matches(self, event: dict) -> bool:
-        if self.kind is not None and event.get("kind") != self.kind:
+        payload = _payload(event)
+        if self.kind is not None:
+            top_event = event.get("event")
+            inner_kind = payload.get("kind")
+            if top_event != self.kind and inner_kind != self.kind:
+                return False
+        if self.child is not None and payload.get("child_name") != self.child:
             return False
-        if self.child is not None and event.get("child") != self.child:
+        if self.reason is not None and payload.get("reason") != self.reason:
             return False
-        if self.reason is not None and event.get("reason") != self.reason:
-            return False
-        if self.supervisor is not None and event.get("supervisor") != self.supervisor:
+        if self.supervisor is not None and payload.get("supervisor") != self.supervisor:
             return False
         if self.since is not None:
             ts_str = event.get("ts")
@@ -186,7 +243,9 @@ def watch_escalations(
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if event.get("kind") in ESCALATION_KINDS:
+                    # Top-level `event` field is the bus event name; that's
+                    # where ESCALATION_KINDS lives in the Rust wire format.
+                    if event.get("event") in ESCALATION_KINDS:
                         yield event
                 last_pos = fh.tell()
         except OSError:

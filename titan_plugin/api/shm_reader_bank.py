@@ -32,12 +32,19 @@ import numpy as np
 from titan_plugin.core.state_registry import (
     CHI_STATE,
     EPOCH_COUNTER,
+    HORMONAL_STATE,
     IDENTITY,
+    INNER_BODY_5D,
+    INNER_MIND_15D,
     INNER_SPIRIT_45D,
     NEUROMOD_STATE,
+    OUTER_BODY_5D,
+    OUTER_MIND_15D,
+    OUTER_SPIRIT_45D,
     SPHERE_CLOCKS_STATE,
     StateRegistryReader,
     TITANVM_REGISTERS,
+    TOPOLOGY_30D,
     TRINITY_STATE,
     resolve_shm_root,
     resolve_titan_id,
@@ -69,6 +76,23 @@ NS_PROGRAM_NAMES = [
     "INSPIRATION", "VIGILANCE",
 ]
 NS_PROGRAM_FIELDS = ["urgency", "fire_count", "total_updates", "last_loss"]
+
+# 11-hormone schema (HormonalSystem per C-S5). Each row = (level, target,
+# acceleration, decay) per hormone. Names mirror HormonalSystem.hormone_names.
+HORMONE_NAMES = [
+    "cortisol", "adrenaline", "oxytocin", "dopamine", "serotonin",
+    "endorphin", "melatonin", "growth_hormone", "insulin",
+    "thyroid", "estrogen",
+]
+HORMONE_FIELDS = ["level", "target", "acceleration", "decay"]
+
+# 30D space-topology layout (per state_register.py docstring §rFP #1).
+# Currently published as a flat 30D vector by the writer; consumers can
+# reshape (6 parts × 5 observables) post-read if they need labelled access.
+TOPOLOGY_PART_NAMES = [
+    "head", "torso", "left_arm", "right_arm", "left_leg", "right_leg",
+]
+TOPOLOGY_FIELDS = ["coherence", "magnitude", "velocity", "direction", "polarity"]
 
 # 45D inner spirit slot labels (per spirit_tensor.collect_spirit_45d).
 INNER_SPIRIT_GROUPS = {
@@ -118,6 +142,12 @@ class ShmReaderBank:
         "titan_id", "shm_root",
         "_trinity", "_neuromod", "_epoch", "_inner_spirit",
         "_sphere_clocks", "_chi", "_titanvm", "_identity",
+        # chunk 8M.4 (2026-05-05): cognitive_worker shm-direct-read bank
+        # extended to all SPEC §1096 slots so the cognitive epoch driver
+        # can populate /v4/inner-trinity / /v4/sphere-clocks / etc.
+        "_topology_30d", "_hormonal",
+        "_inner_body", "_inner_mind",
+        "_outer_body", "_outer_mind", "_outer_spirit",
     )
 
     def __init__(self, titan_id: str | None = None) -> None:
@@ -132,6 +162,14 @@ class ShmReaderBank:
         self._chi = StateRegistryReader(CHI_STATE, self.shm_root)
         self._titanvm = StateRegistryReader(TITANVM_REGISTERS, self.shm_root)
         self._identity = StateRegistryReader(IDENTITY, self.shm_root)
+        # chunk 8M.4 — additional SPEC §1096 cognitive_worker readers.
+        self._topology_30d = StateRegistryReader(TOPOLOGY_30D, self.shm_root)
+        self._hormonal = StateRegistryReader(HORMONAL_STATE, self.shm_root)
+        self._inner_body = StateRegistryReader(INNER_BODY_5D, self.shm_root)
+        self._inner_mind = StateRegistryReader(INNER_MIND_15D, self.shm_root)
+        self._outer_body = StateRegistryReader(OUTER_BODY_5D, self.shm_root)
+        self._outer_mind = StateRegistryReader(OUTER_MIND_15D, self.shm_root)
+        self._outer_spirit = StateRegistryReader(OUTER_SPIRIT_45D, self.shm_root)
         logger.info(
             "[ShmReaderBank] initialized for titan_id=%s root=%s",
             self.titan_id, self.shm_root,
@@ -293,6 +331,95 @@ class ShmReaderBank:
             "seq": seq,
         }
 
+    # -- Topology 30D (chunk 8M.4) ------------------------------------
+
+    def read_topology_30d(self) -> dict[str, Any] | None:
+        """Return 30D space-topology vector + structured 6×5 view + meta.
+
+        Written by titan-trinity-rs per SPEC §9.A. Cognitive_worker reads
+        per epoch and injects into coordinator.topology snapshot.
+        """
+        payload, age, seq = _payload_with_meta(self._topology_30d, "topology_30d")
+        if payload is None:
+            return None
+        flat = payload.tolist()
+        parts: dict[str, dict[str, float]] = {}
+        for i, name in enumerate(TOPOLOGY_PART_NAMES):
+            base = i * 5
+            parts[name] = {
+                field: float(flat[base + j])
+                for j, field in enumerate(TOPOLOGY_FIELDS)
+            }
+        return {
+            "values": flat,
+            "parts": parts,
+            "age_seconds": age,
+            "seq": seq,
+        }
+
+    # -- Hormonal (11×4) (chunk 8M.4) ----------------------------------
+
+    def read_hormonal(self) -> dict[str, Any] | None:
+        """Return per-hormone 4-field state by name + metadata, or None.
+
+        Written by hormonal_worker (registered in chunk 8M.1) via
+        HORMONAL_STATE shm slot. Read by cognitive_worker per epoch +
+        injected into coordinator.hormonal snapshot.
+        """
+        payload, age, seq = _payload_with_meta(self._hormonal, "hormonal_state")
+        if payload is None:
+            return None
+        hormones = {}
+        for i, name in enumerate(HORMONE_NAMES):
+            row = payload[i]
+            hormones[name] = {
+                field: float(row[j])
+                for j, field in enumerate(HORMONE_FIELDS)
+            }
+        return {
+            "hormones": hormones,
+            "age_seconds": age,
+            "seq": seq,
+        }
+
+    # -- Inner / Outer trinity tensors (5/15/45) (chunk 8M.4) ---------
+
+    def read_inner_body_5d(self) -> dict[str, Any] | None:
+        """5D inner-body tensor — written by titan-inner-body-rs."""
+        payload, age, seq = _payload_with_meta(self._inner_body, "inner_body_5d")
+        if payload is None:
+            return None
+        return {"values": payload.tolist(), "age_seconds": age, "seq": seq}
+
+    def read_inner_mind_15d(self) -> dict[str, Any] | None:
+        """15D inner-mind tensor — written by titan-inner-mind-rs."""
+        payload, age, seq = _payload_with_meta(self._inner_mind, "inner_mind_15d")
+        if payload is None:
+            return None
+        return {"values": payload.tolist(), "age_seconds": age, "seq": seq}
+
+    def read_outer_body_5d(self) -> dict[str, Any] | None:
+        """5D outer-body tensor — written by titan-outer-body-rs."""
+        payload, age, seq = _payload_with_meta(self._outer_body, "outer_body_5d")
+        if payload is None:
+            return None
+        return {"values": payload.tolist(), "age_seconds": age, "seq": seq}
+
+    def read_outer_mind_15d(self) -> dict[str, Any] | None:
+        """15D outer-mind tensor — written by titan-outer-mind-rs."""
+        payload, age, seq = _payload_with_meta(self._outer_mind, "outer_mind_15d")
+        if payload is None:
+            return None
+        return {"values": payload.tolist(), "age_seconds": age, "seq": seq}
+
+    def read_outer_spirit_45d(self) -> dict[str, Any] | None:
+        """45D outer-spirit tensor — written by titan-outer-spirit-rs."""
+        payload, age, seq = _payload_with_meta(
+            self._outer_spirit, "outer_spirit_45d")
+        if payload is None:
+            return None
+        return {"values": payload.tolist(), "age_seconds": age, "seq": seq}
+
     # -- Diagnostic ----------------------------------------------------
 
     def availability_report(self) -> dict[str, bool]:
@@ -307,6 +434,14 @@ class ShmReaderBank:
             ("chi", self._chi),
             ("titanvm_registers", self._titanvm),
             ("identity", self._identity),
+            # chunk 8M.4 additions
+            ("topology_30d", self._topology_30d),
+            ("hormonal", self._hormonal),
+            ("inner_body_5d", self._inner_body),
+            ("inner_mind_15d", self._inner_mind),
+            ("outer_body_5d", self._outer_body),
+            ("outer_mind_15d", self._outer_mind),
+            ("outer_spirit_45d", self._outer_spirit),
         ]:
             meta = reader.read_meta()
             report[name] = meta is not None

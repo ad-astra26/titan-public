@@ -1,18 +1,29 @@
-"""Tests for the C-S5 chunk C5-8 spirit_worker.py reduction.
+"""Tests for the Phase C C-S8 chunk 8I spirit_worker.py reduction.
 
-Verifies the flag-gated dispatch:
-  - microkernel.l0_rust_enabled = false (default) → legacy path below
-    runs unchanged (byte-identical to today per SPEC §3.0).
-  - microkernel.l0_rust_enabled = true → spirit_worker becomes a thin
-    shim that only handles lifecycle messages.
+History:
+  - C-S5 chunk C5-8 (2026-04-29): introduced flag-gated dispatch — under
+    microkernel.l0_rust_enabled=true spirit_worker became a thin shim
+    that handled lifecycle messages only.
+  - Phase C C-S7 (2026-05-05): slim-shim 4A interim added L3 cognitive
+    engine init + snapshot publishers inside the shim
+    (`_spirit_worker_shim_loop` then ~240 LOC).
+  - Phase C C-S8 chunk 8I (2026-05-05): cognitive engines extracted to
+    cognitive_worker.py (separate L2 ModuleSpec, registered in
+    legacy_core.py). spirit_worker shim replaced with a heartbeat-only
+    stub (`_spirit_worker_heartbeat_stub`) — ~50 LOC.
 
-These tests do NOT spawn a real subprocess — they exercise the shim
+The flag-gate semantics are unchanged:
+  - microkernel.l0_rust_enabled = false (default) → legacy path runs
+    unchanged (byte-identical to pre-C-S5 per SPEC §3.0).
+  - microkernel.l0_rust_enabled = true → spirit_worker is a heartbeat-only
+    stub; cognitive_worker owns the cognitive engines.
+
+These tests do NOT spawn a real subprocess — they exercise the stub
 helper function directly with in-memory queue.Queue() instances.
 Subprocess integration (under guardian_HCL) is covered by the broader
 session-close gate per PLAN §6.
 
-See: titan-docs/PLAN_microkernel_phase_c_l0_l1_rust.md §10.5 chunk C5-8 +
-     titan-docs/PLAN_microkernel_phase_c_s5_inner_trinity.md §4.8.
+See: titan-docs/PLAN_microkernel_phase_c_s8_cognitive_worker_extraction.md §8I.
 """
 from __future__ import annotations
 
@@ -38,17 +49,29 @@ def _drain(q: Queue, max_msgs: int = 100) -> list[dict]:
     return out
 
 
-def test_shim_loop_function_is_callable():
-    """The C5-8 shim entry point exists with the expected signature."""
-    assert hasattr(spirit_worker, "_spirit_worker_shim_loop")
-    assert callable(spirit_worker._spirit_worker_shim_loop)
+def test_stub_function_is_callable():
+    """The chunk 8I heartbeat stub entry point exists with the expected signature."""
+    assert hasattr(spirit_worker, "_spirit_worker_heartbeat_stub")
+    assert callable(spirit_worker._spirit_worker_heartbeat_stub)
 
 
-def test_flag_off_skips_shim_legacy_path_runs():
+def test_no_old_shim_loop_remains():
+    """Chunk 8I deletes _spirit_worker_shim_loop. Regression guard: the
+    old name MUST NOT exist on the module — that would mean the deletion
+    silently regressed and cognitive_worker is duplicating engine work."""
+    assert not hasattr(spirit_worker, "_spirit_worker_shim_loop"), (
+        "Chunk 8I should have deleted _spirit_worker_shim_loop. If this "
+        "fails, cognitive_worker and spirit_worker are both running L3 "
+        "cognitive engines under l0_rust_enabled=true — double-publish + "
+        "double-init bug. Investigate spirit_worker.py before deploying."
+    )
+
+
+def test_flag_off_skips_stub_legacy_path_runs():
     """When config.microkernel.l0_rust_enabled is false (default), the
-    spirit_worker_main entry must NOT call _spirit_worker_shim_loop.
-    Verified by patching the shim, running spirit_worker_main in a
-    background thread, and confirming the shim is not entered before
+    spirit_worker_main entry must NOT call _spirit_worker_heartbeat_stub.
+    Verified by patching the stub, running spirit_worker_main in a
+    background thread, and confirming the stub is not entered before
     we shut the worker down."""
     config = {
         "microkernel": {"l0_rust_enabled": False},
@@ -56,14 +79,14 @@ def test_flag_off_skips_shim_legacy_path_runs():
     }
     recv_q: Queue = Queue()
     send_q: Queue = Queue()
-    shim_called = {"yes": False}
+    stub_called = {"yes": False}
 
-    def fake_shim(*args, **kwargs):
-        shim_called["yes"] = True
+    def fake_stub(*args, **kwargs):
+        stub_called["yes"] = True
 
-    with patch.object(spirit_worker, "_spirit_worker_shim_loop", side_effect=fake_shim):
+    with patch.object(spirit_worker, "_spirit_worker_heartbeat_stub", side_effect=fake_stub):
         # Legacy path may crash on heavy imports OR enter its main loop;
-        # either way, the shim should NOT have been called. Run in a thread
+        # either way, the stub should NOT have been called. Run in a thread
         # so a hung loop doesn't hang the test.
         # Pre-load MODULE_SHUTDOWN so if the legacy main loop is reached
         # it exits cleanly.
@@ -78,20 +101,15 @@ def test_flag_off_skips_shim_legacy_path_runs():
         th = threading.Thread(target=_run, daemon=True)
         th.start()
         th.join(timeout=3.0)
-        # Whether the legacy path crashed or completed cleanly, the shim
-        # must NOT have been entered. (We don't assert on whether the
-        # thread is alive since the legacy path may legitimately be
-        # blocked on heavy initialization that won't complete in CI —
-        # the daemon=True flag ensures it dies with the test process.)
 
-    assert shim_called["yes"] is False, (
-        "Legacy path should NOT call the shim when flag is off"
+    assert stub_called["yes"] is False, (
+        "Legacy path should NOT call the stub when flag is off"
     )
 
 
-def test_flag_on_dispatches_to_shim():
+def test_flag_on_dispatches_to_stub():
     """When config.microkernel.l0_rust_enabled is true, spirit_worker_main
-    must early-return after calling _spirit_worker_shim_loop and not
+    must early-return after calling _spirit_worker_heartbeat_stub and not
     touch any of the heavy init below."""
     config = {
         "microkernel": {"l0_rust_enabled": True},
@@ -99,26 +117,29 @@ def test_flag_on_dispatches_to_shim():
     }
     recv_q: Queue = Queue()
     send_q: Queue = Queue()
-    shim_called = {"yes": False, "args": None}
+    stub_called = {"yes": False, "args": None}
 
-    def fake_shim(rq, sq, n, c):
-        shim_called["yes"] = True
-        shim_called["args"] = (rq, sq, n, c)
+    def fake_stub(rq, sq, n, c):
+        stub_called["yes"] = True
+        stub_called["args"] = (rq, sq, n, c)
 
-    with patch.object(spirit_worker, "_spirit_worker_shim_loop", side_effect=fake_shim):
+    with patch.object(spirit_worker, "_spirit_worker_heartbeat_stub", side_effect=fake_stub):
         spirit_worker.spirit_worker_main(recv_q, send_q, "spirit", config)
 
-    assert shim_called["yes"] is True
-    rq, sq, n, c = shim_called["args"]
+    assert stub_called["yes"] is True
+    rq, sq, n, c = stub_called["args"]
     assert rq is recv_q
     assert sq is send_q
     assert n == "spirit"
     assert c is config
 
 
-def test_shim_sends_module_ready_with_shim_mode_flag():
-    """The shim sends MODULE_READY on boot with shim_mode=True payload —
-    distinguishes itself from legacy MODULE_READY for observability."""
+def test_stub_sends_module_ready_with_offload_flag():
+    """The stub sends MODULE_READY on boot with cognitive_offloaded=True
+    payload — distinguishes itself from legacy MODULE_READY for
+    observability + monitoring scripts. Also includes shim_mode=True
+    for back-compat with monitoring scripts that key on the old shim
+    marker."""
     config = {
         "microkernel": {"l0_rust_enabled": True},
         "info_banner": {"titan_id": "T1"},
@@ -126,9 +147,8 @@ def test_shim_sends_module_ready_with_shim_mode_flag():
     recv_q: Queue = Queue()
     send_q: Queue = Queue()
 
-    # Run shim in background; signal shutdown after small delay.
     th = threading.Thread(
-        target=spirit_worker._spirit_worker_shim_loop,
+        target=spirit_worker._spirit_worker_heartbeat_stub,
         args=(recv_q, send_q, "spirit", config),
         daemon=True,
     )
@@ -136,25 +156,28 @@ def test_shim_sends_module_ready_with_shim_mode_flag():
     time.sleep(0.3)
     recv_q.put({"type": bus.MODULE_SHUTDOWN, "src": "guardian", "ts": time.time()})
     th.join(timeout=2.0)
-    assert not th.is_alive(), "Shim must exit cleanly on MODULE_SHUTDOWN"
+    assert not th.is_alive(), "Stub must exit cleanly on MODULE_SHUTDOWN"
 
     msgs = _drain(send_q)
     ready = [m for m in msgs if m.get("type") == bus.MODULE_READY]
     assert len(ready) >= 1
     assert ready[0]["src"] == "spirit"
     assert ready[0]["dst"] == "guardian"
+    assert ready[0]["payload"]["cognitive_offloaded"] is True
+    assert ready[0]["payload"]["stub_4b"] is True
+    # Back-compat marker for monitoring scripts that key on shim_mode.
     assert ready[0]["payload"]["shim_mode"] is True
     assert ready[0]["payload"]["titan_id"] == "T1"
 
 
-def test_shim_handles_module_shutdown_cleanly():
-    """MODULE_SHUTDOWN must cause the shim loop to return promptly."""
+def test_stub_handles_module_shutdown_cleanly():
+    """MODULE_SHUTDOWN must cause the stub loop to return promptly."""
     config = {"microkernel": {"l0_rust_enabled": True}}
     recv_q: Queue = Queue()
     send_q: Queue = Queue()
 
     th = threading.Thread(
-        target=spirit_worker._spirit_worker_shim_loop,
+        target=spirit_worker._spirit_worker_heartbeat_stub,
         args=(recv_q, send_q, "spirit", config),
         daemon=True,
     )
@@ -165,23 +188,27 @@ def test_shim_handles_module_shutdown_cleanly():
     assert not th.is_alive()
 
 
-def test_shim_ignores_other_message_types():
-    """The shim must IGNORE every message except MODULE_SHUTDOWN +
+def test_stub_ignores_other_message_types():
+    """The stub must IGNORE every message except MODULE_SHUTDOWN +
     SWAP_HANDOFF / ADOPTION_REQUEST. Verified by feeding diverse traffic
-    + confirming the shim doesn't echo anything except heartbeats / ready."""
+    + confirming the stub doesn't echo anything except heartbeats / ready.
+    Critical regression guard: cognitive_worker now owns the trinity
+    dispatch under l0_rust=true; if the stub starts responding to
+    BODY_STATE / MIND_STATE / KERNEL_EPOCH_TICK we'd have double-dispatch
+    + the engines would double-update."""
     config = {"microkernel": {"l0_rust_enabled": True}}
     recv_q: Queue = Queue()
     send_q: Queue = Queue()
 
     th = threading.Thread(
-        target=spirit_worker._spirit_worker_shim_loop,
+        target=spirit_worker._spirit_worker_heartbeat_stub,
         args=(recv_q, send_q, "spirit", config),
         daemon=True,
     )
     th.start()
     time.sleep(0.1)
     # Feed messages that the legacy path would have responded to —
-    # the shim must ignore them all.
+    # the stub must ignore them all.
     for msg_type in (
         getattr(bus, "QUERY", "QUERY"),
         getattr(bus, "BODY_STATE", "BODY_STATE"),
@@ -199,18 +226,20 @@ def test_shim_ignores_other_message_types():
     allowed_types = {bus.MODULE_READY, bus.MODULE_HEARTBEAT}
     for m in msgs:
         assert m.get("type") in allowed_types, (
-            f"Shim leaked a non-lifecycle message: {m.get('type')}"
+            f"Stub leaked a non-lifecycle message: {m.get('type')}"
         )
     # MODULE_READY must be present at boot
     assert any(m.get("type") == bus.MODULE_READY for m in msgs)
 
 
-def test_shim_no_legacy_imports_required():
-    """The shim must not import any of the heavy legacy modules
-    (spirit_loop, NeuralNervousSystem, HormonalSystem, etc.). This is a
-    structural check: the shim helper must be importable and runnable
-    even if those legacy imports would fail. Done by patching the legacy
-    spirit_loop import to raise + confirming the shim still works."""
+def test_stub_no_legacy_imports_required():
+    """The stub must not import any of the heavy legacy modules
+    (spirit_loop, NeuralNervousSystem, HormonalSystem, etc.) — those
+    now live in cognitive_worker.py via _cognitive_init helpers (chunk
+    8C). This is a structural check: the stub helper must be importable
+    and runnable even if those legacy imports would fail. Done by
+    patching the legacy spirit_loop import to raise + confirming the
+    stub still works."""
     import sys
     config = {"microkernel": {"l0_rust_enabled": True}}
     recv_q: Queue = Queue()
@@ -222,11 +251,11 @@ def test_shim_no_legacy_imports_required():
 
     class _BlowUpOnImport:
         def __getattr__(self, name):
-            raise ImportError("spirit_loop must not be imported by shim")
+            raise ImportError("spirit_loop must not be imported by stub")
     sys.modules["titan_plugin.modules.spirit_loop"] = _BlowUpOnImport()
     try:
         th = threading.Thread(
-            target=spirit_worker._spirit_worker_shim_loop,
+            target=spirit_worker._spirit_worker_heartbeat_stub,
             args=(recv_q, send_q, "spirit", config),
             daemon=True,
         )
@@ -234,7 +263,7 @@ def test_shim_no_legacy_imports_required():
         time.sleep(0.1)
         recv_q.put({"type": bus.MODULE_SHUTDOWN, "src": "guardian", "ts": time.time()})
         th.join(timeout=1.5)
-        assert not th.is_alive(), "Shim must work without spirit_loop importable"
+        assert not th.is_alive(), "Stub must work without spirit_loop importable"
     finally:
         # Restore
         if cached_spirit_loop is not None:

@@ -514,14 +514,14 @@ class TestPluginFlagRouting(unittest.TestCase):
         self.assertIn("AGENCY_READY", src)
         self.assertIn("update_cached_stats", src)
 
-    def test_config_flag_default_false(self):
-        """titan_params.toml has the flag, default false, with docstring."""
+    def test_config_flag_present(self):
+        """titan_params.toml has the flag with docstring. Original ship default
+        was false; flag flipped to true 2026-04-28 PM after fleet validation
+        (see rFP_microkernel_phase_a8 + ROADMAP flag-state table)."""
         params_path = os.path.join(_ROOT, "titan_plugin", "titan_params.toml")
         with open(params_path) as f:
             content = f.read()
         self.assertIn("a8_agency_subprocess_enabled", content)
-        # Default OFF
-        self.assertIn("a8_agency_subprocess_enabled = false", content)
         # Has explanatory docstring
         self.assertIn("Phase A.8.6", content)
 

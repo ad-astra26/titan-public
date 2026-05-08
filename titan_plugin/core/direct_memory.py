@@ -343,6 +343,16 @@ class TitanKnowledgeGraph:
             except Exception:
                 pass  # Table already exists
 
+        try:
+            from titan_plugin.logic.social_x.schema_migrations import (
+                apply_kuzu_person_migrations,
+            )
+            apply_kuzu_person_migrations(self)
+        except Exception as exc:
+            logger.warning(
+                "[KnowledgeGraph] X-voice Person migration skipped: %s", exc
+            )
+
         # Relationship tables — we use a generic rel table per node-type pair
         # to keep schema manageable. Kuzu requires explicit FROM/TO types.
         all_tables = list(node_tables.keys())
@@ -394,14 +404,38 @@ class TitanKnowledgeGraph:
 
         try:
             if table == "Person":
-                user_id = (attributes or {}).get("user_id", "")
+                attrs = attributes or {}
+                user_id = attrs.get("user_id", "")
+                # rFP_x_voice_enrichment §4.5: capture felt-state-at-last-interaction
+                # for OUTER_RUMINATION Pool B prompt template.
+                neuromods = attrs.get("neuromods")
+                emotion = attrs.get("emotion", "")
+                last_felt_summary = ""
+                last_felt_neuromods_json = "{}"
+                if neuromods or emotion:
+                    try:
+                        from titan_plugin.logic.social_x.felt_state import (
+                            compact_felt_summary, neuromods_to_json,
+                        )
+                        last_felt_summary = compact_felt_summary(neuromods, emotion)
+                        last_felt_neuromods_json = neuromods_to_json(neuromods)
+                    except Exception:
+                        pass
                 self._conn.execute(
                     f"MERGE (p:{table} {{name: $name}}) "
                     f"ON CREATE SET p.user_id = $uid, p.first_seen = $ts, "
-                    f"p.last_seen = $ts, p.interaction_count = 1 "
+                    f"p.last_seen = $ts, p.interaction_count = 1, "
+                    f"p.last_felt_emotion = $emo, "
+                    f"p.last_felt_summary = $sum, "
+                    f"p.last_felt_neuromods_json = $njs "
                     f"ON MATCH SET p.last_seen = $ts, "
-                    f"p.interaction_count = p.interaction_count + 1",
-                    {"name": name, "uid": user_id, "ts": now},
+                    f"p.interaction_count = p.interaction_count + 1, "
+                    f"p.last_felt_emotion = $emo, "
+                    f"p.last_felt_summary = $sum, "
+                    f"p.last_felt_neuromods_json = $njs",
+                    {"name": name, "uid": user_id, "ts": now,
+                     "emo": emotion, "sum": last_felt_summary,
+                     "njs": last_felt_neuromods_json},
                 )
             elif table == "Topic":
                 domain = subtype if subtype in ("organization", "location") else "general"

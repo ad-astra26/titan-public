@@ -155,8 +155,9 @@ def test_spec_payload_bytes(trinity_spec):
 
 
 def test_spec_total_bytes(trinity_spec):
-    # 24 header + 648 payload = 672
-    assert trinity_spec.total_bytes == 672
+    # SPEC §7.0 v1.0.0 (D-SPEC-35): 16 fixed header + 3 × (16 buffer meta + 648 payload) = 2008
+    assert trinity_spec.total_bytes == 16 + 3 * (16 + 648)
+    assert trinity_spec.total_bytes == 2008
 
 
 def test_canonical_trinity_spec_162d():
@@ -201,17 +202,24 @@ def test_writer_roundtrip(shm_root, trinity_spec):
     r.close()
 
 
-def test_writer_seq_increments(shm_root, trinity_spec):
+def test_writer_version_increments(shm_root, trinity_spec):
+    """SPEC v1.0.0 (D-SPEC-35): version increments by 1 per publish.
+    StateRegistryWriter.__init__ does an initial zero-fill publish so the
+    slot is readable at declared byte size — that counts as version 1.
+    Subsequent user writes bump to version 2, 3, 4, ..."""
     w = StateRegistryWriter(trinity_spec, shm_root)
+    # After __init__, version=1 (initial zero publish).
+    assert w.seq == 1
     arr = np.zeros(162, dtype=np.float32)
     s1 = w.write(arr)
     s2 = w.write(arr)
     s3 = w.write(arr)
-    # Each write advances seq by 2 (odd bump + even bump).
-    assert s2 == s1 + 2
-    assert s3 == s2 + 2
-    # Final seq is even (write complete).
-    assert s3 % 2 == 0
+    assert s1 == 2
+    assert s2 == 3
+    assert s3 == 4
+    # Each write advances by exactly 1 — no odd/even SeqLock dance.
+    assert s2 == s1 + 1
+    assert s3 == s2 + 1
     w.close()
 
 
@@ -313,13 +321,25 @@ def test_reader_detects_schema_mismatch(shm_root, trinity_spec):
 
 
 def test_reader_detects_crc_corruption(shm_root, trinity_spec):
+    """SPEC v1.0.0 (D-SPEC-35): CRC32 lives in per-buffer metadata at
+    offset (16 + ready_idx*(16+N) + 12). Corrupting that field makes
+    read() return None."""
+    from titan_plugin.core.state_registry import (
+        _buffer_offset, _unpack_header_seq, HEADER_SIZE,
+    )
     w = StateRegistryWriter(trinity_spec, shm_root)
     w.write(np.zeros(162, dtype=np.float32))
     w.close()
-    # Corrupt the CRC field directly on disk.
     path = shm_root / "test_trinity.bin"
+    # Read header to find active buffer's CRC offset.
     with open(path, "r+b") as f:
-        f.seek(20)  # CRC offset
+        f.seek(0)
+        seq_bytes = f.read(8)
+        import struct
+        seq = struct.unpack("<Q", seq_bytes)[0]
+        _version, idx = _unpack_header_seq(seq)
+        crc_offset = _buffer_offset(idx, trinity_spec.payload_bytes) + 12
+        f.seek(crc_offset)
         f.write(b"\xDE\xAD\xBE\xEF")
     r = StateRegistryReader(trinity_spec, shm_root)
     assert r.read() is None  # CRC mismatch → fallback
@@ -425,26 +445,30 @@ def test_concurrent_writer_reader_no_torn_data(shm_root):
             )
 
 
-def test_odd_seq_during_active_write(shm_root):
+def test_writer_version_monotonic(shm_root):
     """
-    Between stages of a write, the seq field must be odd. We exploit
-    this by interrupting a write (we can't really interrupt, so we
-    manually check the header after a write completes → seq is even,
-    but we verify the odd/even invariant via the writer's seq property).
+    SPEC v1.0.0 (D-SPEC-35): the legacy SeqLock odd/even invariant is
+    GONE. The writer holds a monotonic version counter (starts at 0)
+    and increments by exactly 1 per publish. The atomic publish word
+    is a single 8-byte store at offset 0 — readers never observe a
+    "writing in progress" state because there's no mid-write window
+    they can read in (the inactive buffer is being filled, but readers
+    only ever access the published `ready_idx` buffer).
     """
     spec = RegistrySpec(
-        name="test_odd_even",
+        name="test_version_monotonic",
         dtype=np.dtype("<f4"),
         shape=(4,),
         feature_flag="",
     )
     w = StateRegistryWriter(spec, shm_root)
-    # After init, seq is 0 (even).
-    assert w.seq == 0
+    # After __init__, an initial zero-fill publish has happened (version=1).
+    assert w.seq == 1  # `seq` aliases `version` for backward compat
+    assert w.version == 1
     w.write(np.zeros(4, dtype=np.float32))
-    # After one write, seq is 2 (even, write complete).
-    assert w.seq == 2
-    assert w.seq % 2 == 0
+    assert w.version == 2  # +1 per publish, no odd/even dance
+    w.write(np.zeros(4, dtype=np.float32))
+    assert w.version == 3
     w.close()
 
 

@@ -136,6 +136,44 @@ def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
     logger.info("[BodyWorker] 5DT somatic sensors online (fast=%s)", bool(sensor_cache))
 
+    # Phase C Session 4 (rFP §4.B.6) — SHM-direct body_state.bin publisher.
+    # Closes the deadlock-prone sync bus.request path for body_proxy
+    # method get_body_details. The Rust-owned inner_body_5d.bin slot
+    # carries the bare 5D tensor; this slot carries the queryable
+    # details/urgency/focus_nudges metadata.
+    def _body_state_fetcher():
+        # Cheap recompute on each tick — uses the same cache the QUERY
+        # path uses; no new I/O on hot path beyond what _collect_body_tensor
+        # already does (cache-backed when sensor_cache is populated).
+        tensor, details = _collect_body_tensor(
+            history, thresholds, severity_multipliers, focus_nudges,
+            cache=sensor_cache)
+        return {
+            "tensor": tensor,
+            "details": details,
+            "history_size": {k: len(v) for k, v in history.items()},
+            "severity_multipliers": list(severity_multipliers),
+            "focus_nudges": list(focus_nudges),
+        }
+
+    try:
+        from titan_plugin.core.state_registry import resolve_titan_id
+        from titan_plugin.logic.body_state_publisher import BodyStatePublisher
+        from titan_plugin.logic.worker_publisher_runner import (
+            run_worker_publisher)
+        _body_state_publisher = BodyStatePublisher(titan_id=resolve_titan_id())
+        run_worker_publisher(
+            publisher=_body_state_publisher,
+            state_fetcher=_body_state_fetcher,
+            worker_name="body_worker",
+            cadence_s=1.0,
+        )
+    except Exception as _pub_init_err:
+        logger.error(
+            "[BodyWorker] body_state SHM publisher BOOT FAILED — "
+            "consumers fall back to sync bus.request: %s",
+            _pub_init_err, exc_info=True)
+
     last_publish = 0.0
     publish_interval = 3.45   # Body = Schumann/27 (0.29 Hz) — Earth resonance
     last_heartbeat = 0.0
@@ -254,24 +292,12 @@ def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             rid = msg.get("rid")
             src = msg.get("src", "")
 
-            if action == "get_tensor":
-                tensor, details = _collect_body_tensor(history, thresholds,
-                                                       severity_multipliers, focus_nudges,
-                                                       cache=sensor_cache)
-                _send_response(send_queue, name, src, {
-                    "tensor": tensor, "details": details,
-                }, rid)
-
-            elif action in ("get_status", "get_details"):
-                tensor, details = _collect_body_tensor(history, thresholds,
-                                                       severity_multipliers, focus_nudges,
-                                                       cache=sensor_cache)
-                _send_response(send_queue, name, src, {
-                    "tensor": tensor, "details": details,
-                    "history_size": {k: len(v) for k, v in history.items()},
-                    "severity_multipliers": severity_multipliers,
-                    "focus_nudges": focus_nudges,
-                }, rid)
+            # Phase C Session 5 (rFP §4.D.3): get_tensor / get_status /
+            # get_details handlers RETIRED. Proxy consumers migrated to
+            # SHM-direct via inner_body_5d.bin (Rust) + body_state.bin
+            # (Session 4 §4.C.3). Static caller graph confirms zero
+            # remaining callers.
+            pass
 
     logger.info("[BodyWorker] Exiting")
 

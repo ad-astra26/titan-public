@@ -638,6 +638,22 @@ class TieredMemoryGraph:
         """Retrieves all memory nodes currently residing in the mempool."""
         return [v for v in self._node_store.values() if v.get("status") == "mempool"]
 
+    def fetch_mempool_sync(self) -> List[Dict]:
+        """Synchronous mempool fetch — safe to call from non-asyncio threads.
+
+        rFP_meditation_worker_latency Fix #E (2026-05-07): the legacy
+        `fetch_mempool` is `async` only because it shares a method-name
+        convention with truly-async siblings — internally it's a pure
+        in-memory dict comprehension with no I/O or await. The periodic
+        publisher thread in memory_worker calls it via
+        `loop.run_until_complete()` while the main message-handler thread
+        also drives the same asyncio loop, racing on
+        "This event loop is already running" RuntimeError ~5×/min and
+        emitting "coroutine was never awaited" warnings. This sync sibling
+        lets the publisher thread skip asyncio entirely.
+        """
+        return [v for v in self._node_store.values() if v.get("status") == "mempool"]
+
     async def fetch_mempool_classified(self) -> Tuple[List[Dict], List[Dict], List[Dict]]:
         """
         Classify mempool nodes by sigmoid weight into three buckets:

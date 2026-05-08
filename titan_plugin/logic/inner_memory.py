@@ -219,6 +219,14 @@ class InnerMemoryStore:
             """)
             self._conn.commit()
 
+            try:
+                from titan_plugin.logic.social_x.schema_migrations import (
+                    apply_inner_memory_migrations,
+                )
+                apply_inner_memory_migrations(self._db_path)
+            except Exception as exc:
+                logger.warning("[InnerMemory] X-voice schema migration skipped: %s", exc)
+
     def _count_all(self) -> int:
         with self._lock:
             c = self._conn.cursor()

@@ -27,7 +27,10 @@ from pathlib import Path
 
 import pytest
 
-from titan_plugin.core.state_registry import HEADER_SIZE, HEADER_STRUCT
+from titan_plugin.core.state_registry import (
+    HEADER_SIZE, HEADER_STRUCT, BUFFER_META_SIZE, BUFFER_COUNT,
+    _pack_header_seq, _buffer_offset, _compute_buffer_crc32,
+)
 from titan_plugin.logic.outer_trinity import OuterTrinityCollector
 
 
@@ -42,21 +45,36 @@ def shm_root(tmp_path, monkeypatch):
 
 def _write_slot(shm_root: Path, slot_name: str, values: list[float],
                 wall_ns: int | None = None, schema: int = 1) -> None:
-    """Write a synthetic outer slot file (24B header + N × float32 LE)."""
+    """Write a synthetic outer slot file using SPEC §7.0 v1.0.0 wire format
+    (16-byte fixed header + 3 × (16-byte buffer meta + N × float32)).
+
+    Publishes the payload at buffer idx=0 with version=1, leaving bufs 1+2 zeroed.
+    """
     if wall_ns is None:
         wall_ns = time.time_ns()
     n = len(values)
     payload = struct.pack(f"<{n}f", *values)
     payload_bytes = len(payload)
+    capacity = payload_bytes  # fixed-size slot — capacity == payload_bytes
 
-    # Pack header: seq=2 (even, write complete) + schema + wall_ns + payload + crc
-    seq = 2
-    header_prefix = struct.pack("<IIQI", seq, schema, wall_ns, payload_bytes)
-    crc = zlib.crc32(header_prefix)
-    header = header_prefix + struct.pack("<I", crc)
-    assert len(header) == HEADER_SIZE
+    # Build fixed header (16 bytes): header_seq + schema + capacity
+    header_seq = _pack_header_seq(version=1, ready_idx=0)
+    fixed_header = struct.pack(HEADER_STRUCT, header_seq, schema, capacity)
+    assert len(fixed_header) == HEADER_SIZE
 
-    (shm_root / f"{slot_name}.bin").write_bytes(header + payload)
+    # Buffer 0 (active): meta(16) + payload(N)
+    crc = _compute_buffer_crc32(wall_ns, payload_bytes, payload)
+    buf0_meta = struct.pack("<QII", wall_ns, payload_bytes, crc)
+    buf0 = buf0_meta + payload
+
+    # Bufs 1 + 2: zero-filled (meta + payload).
+    buf_size = BUFFER_META_SIZE + capacity
+    bufs_12 = b"\x00" * (2 * buf_size)
+
+    file_bytes = fixed_header + buf0 + bufs_12
+    expected_total = HEADER_SIZE + BUFFER_COUNT * buf_size
+    assert len(file_bytes) == expected_total, f"{len(file_bytes)} vs {expected_total}"
+    (shm_root / f"{slot_name}.bin").write_bytes(file_bytes)
 
 
 def _make_sources() -> dict:

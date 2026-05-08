@@ -53,7 +53,8 @@ def test_variable_size_spec_construction():
     assert spec.variable_size is True
     assert spec.shape == (256,)
     assert spec.payload_bytes == 256
-    assert spec.total_bytes == HEADER_SIZE + 256
+    # SPEC §7.0 v1.0.0: total = 16 fixed header + 3 × (16 buffer meta + 256 payload)
+    assert spec.total_bytes == 16 + 3 * (16 + 256)
 
 
 def test_default_spec_variable_size_false():
@@ -66,10 +67,12 @@ def test_default_spec_variable_size_false():
 
 
 def test_write_variable_empty_payload(shm_root):
+    """SPEC v1.0.0: __init__ does an initial zero-fill publish (version=1);
+    first user write_variable bumps to version=2."""
     spec = _make_var_spec("v_empty", 1024)
     w = StateRegistryWriter(spec, shm_root)
     seq = w.write_variable(b"")
-    assert seq == 2  # 0 → 1 (odd) → 2 (even)
+    assert seq == 2
 
 
 def test_write_variable_small_payload(shm_root):
@@ -150,13 +153,15 @@ def test_read_variable_rejects_fixed_spec(shm_root):
 # ── SeqLock + header CRC under variable-size writes ────────────────
 
 
-def test_seqlock_advances_per_variable_write(shm_root):
+def test_version_advances_per_variable_write(shm_root):
+    """SPEC v1.0.0 (D-SPEC-35): version increments by exactly 1 per publish.
+    __init__ publishes once (version=1); user writes bump 2, 3, 4."""
     spec = _make_var_spec("seq_test", 1024)
     w = StateRegistryWriter(spec, shm_root)
     seq1 = w.write_variable(b"a")
     seq2 = w.write_variable(b"bb")
     seq3 = w.write_variable(b"ccc")
-    assert seq1 == 2 and seq2 == 4 and seq3 == 6
+    assert seq1 == 2 and seq2 == 3 and seq3 == 4
     assert seq1 < seq2 < seq3
 
 

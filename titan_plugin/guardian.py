@@ -34,9 +34,25 @@ from .bus import (
     MODULE_HEARTBEAT,
     MODULE_READY,
     MODULE_SHUTDOWN,
+    SUPERVISION_CHILD_DOWN,
+    SUPERVISION_CHILD_RESTARTED,
+    SUPERVISION_DEPENDENCY_BLOCKED,
+    SUPERVISION_DEPENDENCY_DEGRADED,
+    SUPERVISION_DEPENDENCY_RECOVERED,
+    SUPERVISION_ESCALATION,
     make_msg,
 )
 from titan_plugin import bus
+from titan_plugin.supervision import (
+    Dependency,
+    DependencySeverity,
+    EscalationDecision,
+    ReasonRecord,
+    SupervisionReason,
+    classify_exit_code,
+    kernel_default_decision,
+    most_common_reason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +135,11 @@ class ModuleSpec:
     # autonomous writers, observability aggregators, periodic backup
     # daemons).
     b2_1_swap_critical: bool = True
+    # Phase C C-S7 (2026-05-05) — declarative dependencies per SPEC §11.G.1.
+    # Default empty → no pre-respawn dep check (legacy behavior). Future
+    # commits populate per-module (e.g., social_module.dependencies =
+    # [Dependency("x_api_reachable", EXTERNAL_SVC, SOFT, ...)]).
+    dependencies: list[Dependency] = field(default_factory=list)
 
 
 @dataclass
@@ -151,6 +172,14 @@ class ModuleInfo:
     # process.kill(). First heartbeat after adoption resets clocks fresh.
     adopted: bool = False
     adopt_ts: float = 0.0                # when adoption completed (for telemetry)
+    # Phase C C-S7 (2026-05-05) — rolling reason buffer (last 16) per
+    # SPEC §11.B step 3, used to compute most_common_reason for
+    # SUPERVISION_ESCALATION payloads (§11.B.1 step 1).
+    reason_buffer: deque = field(default_factory=lambda: deque(maxlen=16))
+    # Phase C C-S7 — track in-flight escalations + dependency-blocked state.
+    last_escalation_id: Optional[str] = None
+    blocked_dependency: Optional[str] = None
+    blocked_since: float = 0.0
 
 
 class Guardian:
@@ -800,7 +829,15 @@ class Guardian:
         return self._restart_executor.submit(_run)
 
     def restart(self, name: str, reason: str = "requested") -> bool:
-        """Stop then start a module, with sliding-window restart limit. Thread-safe via _module_lock."""
+        """Stop then start a module, with sliding-window restart limit. Thread-safe via _module_lock.
+
+        Phase C C-S7 (2026-05-05) cross-language unification: emits
+        SUPERVISION_CHILD_DOWN before stop + SUPERVISION_CHILD_RESTARTED
+        after successful start. When max_restarts_in_window is exceeded,
+        runs the SPEC §11.B.1 escalation handshake (in-process via
+        kernel_default_decision — same simplification as the Rust kernel
+        applies for kernel-self escalations).
+        """
         with self._module_lock:
             info = self._modules.get(name)
             if not info:
@@ -808,23 +845,69 @@ class Guardian:
 
             now = time.time()
 
+            # Phase C C-S7 — pre-respawn dependency check (§11.G.2). Only
+            # runs when the module declares dependencies; default-empty
+            # path is byte-identical to today.
+            if info.spec.dependencies:
+                blocked_dep = self._check_critical_dependencies(name, info)
+                if blocked_dep is not None:
+                    info.blocked_dependency = blocked_dep
+                    if info.blocked_since == 0.0:
+                        info.blocked_since = now
+                    self.bus.publish(make_msg(
+                        SUPERVISION_DEPENDENCY_BLOCKED, "guardian", "kernel", {
+                            "child_name": name,
+                            "supervisor": "guardian_HCL",
+                            "blocked_dependency": blocked_dep,
+                            "since_ts": info.blocked_since,
+                            "since_s": now - info.blocked_since,
+                        }))
+                    logger.warning(
+                        "[Guardian] Module '%s' respawn blocked on critical "
+                        "dependency '%s' (since %.0fs ago)",
+                        name, blocked_dep, now - info.blocked_since)
+                    return False
+                # All critical deps OK — clear blocked state if previously set.
+                if info.blocked_dependency is not None:
+                    self.bus.publish(make_msg(
+                        SUPERVISION_DEPENDENCY_RECOVERED, "guardian", "kernel", {
+                            "child_name": name,
+                            "supervisor": "guardian_HCL",
+                            "dependency_name": info.blocked_dependency,
+                            "total_blocked_s": now - info.blocked_since,
+                        }))
+                    info.blocked_dependency = None
+                    info.blocked_since = 0.0
+
             # Sliding window: count restarts in the last _restart_window_seconds
             # Prune old timestamps
             while info.restart_timestamps and (now - info.restart_timestamps[0]) > self._restart_window_seconds:
                 info.restart_timestamps.popleft()
 
             if len(info.restart_timestamps) >= self._max_restarts_in_window:
-                logger.error("[Guardian] Module '%s' [%s] exceeded %d restarts in %.0fs window — disabling (auto-re-enable in %.0fs)",
-                             name, info.spec.layer, self._max_restarts_in_window, self._restart_window_seconds, REENABLE_COOLDOWN_S)
-                self.stop(name, reason="max_restarts_disabled")
-                info.state = ModuleState.DISABLED
-                info.disabled_at = time.time()
-                self.bus.publish(make_msg(MODULE_CRASHED, "guardian", "core", {
-                    "module": name, "reason": "max_restarts_in_window",
-                    "restarts": len(info.restart_timestamps),
-                    "window_seconds": self._restart_window_seconds,
-                }))
+                # Phase C C-S7 — escalation handshake per SPEC §11.B.1.
+                # In-process short-circuit via kernel_default_decision (same
+                # approach the Rust kernel takes for its own children).
+                self._handle_escalation(name, info, reason, now)
                 return False
+
+            # Phase C C-S7 — emit SUPERVISION_CHILD_DOWN BEFORE stop.
+            # Reason classified from the `reason` string (which today is
+            # things like "heartbeat_timeout", "rss_400mb", etc.). Best-effort
+            # mapping to canonical SupervisionReason — exit-code-based mapping
+            # happens in monitor_tick where exitcode is observable.
+            sup_reason = self._reason_string_to_canonical(reason)
+            info.reason_buffer.append(ReasonRecord.make(
+                sup_reason, detail=f"reason={reason}", exit_code=None))
+            self.bus.publish(make_msg(
+                SUPERVISION_CHILD_DOWN, "guardian", "kernel", {
+                    "child_name": name,
+                    "supervisor": "guardian_HCL",
+                    "reason": sup_reason.value,
+                    "reason_detail": reason,
+                    "restart_count": len(info.restart_timestamps),
+                    "ts": now,
+                }))
 
             # Exponential backoff based on recent restart count
             recent_count = len(info.restart_timestamps)
@@ -839,7 +922,172 @@ class Guardian:
             info.restart_timestamps.append(now)
             info.restart_count += 1
             info.last_restart = now
-            return self.start(name)
+            ok = self.start(name)
+            if ok:
+                # Phase C C-S7 — emit SUPERVISION_CHILD_RESTARTED on success.
+                self.bus.publish(make_msg(
+                    SUPERVISION_CHILD_RESTARTED, "guardian", "kernel", {
+                        "child_name": name,
+                        "supervisor": "guardian_HCL",
+                        "restart_count": info.restart_count,
+                        "reason": sup_reason.value,
+                        "ts": time.time(),
+                    }))
+            return ok
+
+    # Phase C C-S7 — supervision helpers (cross-language unification).
+
+    def _reason_string_to_canonical(self, reason: str) -> SupervisionReason:
+        """Map Guardian's free-form reason strings to canonical
+        SupervisionReason enum values per SPEC §11.B step 2.
+
+        Best-effort heuristic — exit-code-based classification (used by
+        monitor_tick when an exitcode is observable) is more accurate.
+        """
+        r = reason.lower()
+        if "heartbeat" in r or "starved" in r or "stall" in r:
+            return SupervisionReason.HANG
+        if "rss" in r or "oom" in r or "memory" in r:
+            return SupervisionReason.OOM
+        if "exitcode" in r:
+            # Try to extract trailing integer
+            import re as _re
+            m = _re.search(r"(\d+)", reason)
+            if m:
+                return classify_exit_code(int(m.group(1)))
+            return SupervisionReason.PANIC
+        if "config" in r:
+            return SupervisionReason.CONFIG_ERROR
+        if "boot" in r:
+            return SupervisionReason.BOOT_FAILURE
+        if "killed" in r or "sigkill" in r:
+            return SupervisionReason.KILLED
+        if "broker_peer_dead" in r or "peer_died" in r:
+            return SupervisionReason.PANIC  # broker observed peer death
+        if "dependency" in r:
+            return SupervisionReason.DEPENDENCY_BLOCKED
+        return SupervisionReason.OTHER
+
+    def _check_critical_dependencies(
+        self, name: str, info: "ModuleInfo",
+    ) -> Optional[str]:
+        """Run pre-respawn dep check per SPEC §11.G.2. Returns the name of
+        the first blocking critical dependency, or None if all are healthy.
+
+        Soft deps that fail emit SUPERVISION_DEPENDENCY_DEGRADED (informational)
+        but don't block. Custom check callables that raise are treated as
+        "down" — fail closed for safety."""
+        for dep in info.spec.dependencies:
+            if dep.check is None:
+                continue  # framework declared but no probe wired yet
+            try:
+                healthy = bool(dep.check())
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[Guardian] dep probe '%s' for module '%s' raised %s — "
+                    "treating as down (fail-closed)", dep.name, name, e)
+                healthy = False
+            if not healthy:
+                if dep.severity == DependencySeverity.CRITICAL:
+                    return dep.name
+                # Soft dep failed — emit degraded event + continue.
+                self.bus.publish(make_msg(
+                    SUPERVISION_DEPENDENCY_DEGRADED, "guardian", "kernel", {
+                        "child_name": name,
+                        "supervisor": "guardian_HCL",
+                        "dependency_name": dep.name,
+                        "kind": dep.kind.value,
+                        "severity": dep.severity.value,
+                    }))
+        return None
+
+    def _handle_escalation(
+        self, name: str, info: "ModuleInfo", reason: str, now: float,
+    ) -> None:
+        """SPEC §11.B.1 escalation handshake. In-process short-circuit via
+        kernel_default_decision (same as Rust kernel's kernel-self path).
+
+        Emits SUPERVISION_ESCALATION (audit record) then applies the policy
+        decision directly:
+          - CONTINUE → reset counter; module retries on next monitor_tick
+          - TERMINATE → exit the entire Python plugin with code 64; Rust
+            kernel cascades a fresh plugin per SPEC §11.B.1 step 6b
+          - HALT → disable module; Maker must intervene
+        """
+        import uuid
+        escalation_id = str(uuid.uuid4())
+        info.last_escalation_id = escalation_id
+        # Compute most_common_reason from per-child rolling buffer.
+        common_reason = most_common_reason(info.reason_buffer)
+        last_detail = (
+            info.reason_buffer[-1].detail
+            if info.reason_buffer else f"reason={reason}"
+        )
+        reasons_observed = [r.reason.value for r in info.reason_buffer]
+
+        # Audit emit — kernel writes this to supervision.jsonl when it
+        # subscribes to SUPERVISION_ESCALATION (today: live observability).
+        self.bus.publish(make_msg(
+            SUPERVISION_ESCALATION, "guardian", "kernel", {
+                "escalation_id": escalation_id,
+                "child_name": name,
+                "supervisor_name": "guardian_HCL",
+                "restart_count": len(info.restart_timestamps),
+                "window_s": self._restart_window_seconds,
+                "reasons_observed": reasons_observed,
+                "most_common_reason": common_reason.value,
+                "last_reason_detail": last_detail,
+                "ts": now,
+            }))
+
+        # Apply default policy in-process (Maker-confirmed simplification —
+        # bus round-trip would time out anyway since Rust kernel doesn't
+        # implement an escalation-response server yet).
+        decision = kernel_default_decision(common_reason)
+        logger.error(
+            "[Guardian] Module '%s' [%s] hit max_restarts (%d in %.0fs) — "
+            "escalation %s most_common_reason=%s decision=%s",
+            name, info.spec.layer, len(info.restart_timestamps),
+            self._restart_window_seconds, escalation_id,
+            common_reason.value, decision.value,
+        )
+
+        if decision == EscalationDecision.CONTINUE:
+            # Reset counter so module gets fresh restart budget. Keep state
+            # RUNNING/CRASHED depending on current; Guardian's monitor_tick
+            # will respawn naturally.
+            info.restart_timestamps.clear()
+            info.reason_buffer.clear()
+            logger.warning(
+                "[Guardian] Continue policy — resetting restart counter "
+                "for '%s'; will retry on next monitor_tick", name)
+        elif decision == EscalationDecision.TERMINATE:
+            # SPEC §11.B.1 step 6b: supervisor terminates self with exit 64.
+            # For Python guardian, "self" = the entire Python plugin process.
+            # Rust kernel will see the plugin exit and cascade a fresh
+            # respawn per its own SPEC §11.0 row 4.
+            logger.critical(
+                "[Guardian] Terminate policy — Python plugin will exit "
+                "with code 64 (escalation cascade per SPEC §11.B.1 step 6b)")
+            self.stop(name, reason="escalation_terminate")
+            # os._exit bypasses atexit handlers; sys.exit raises SystemExit
+            # which can be caught. Use os._exit to ensure deterministic
+            # cascade behavior.
+            os._exit(64)
+        else:  # HALT
+            self.stop(name, reason="escalation_halt")
+            info.state = ModuleState.DISABLED
+            info.disabled_at = now
+            self.bus.publish(make_msg(MODULE_CRASHED, "guardian", "core", {
+                "module": name, "reason": "escalation_halt",
+                "restarts": len(info.restart_timestamps),
+                "window_seconds": self._restart_window_seconds,
+                "escalation_id": escalation_id,
+            }))
+            logger.warning(
+                "[Guardian] Halt policy — '%s' disabled; Maker must "
+                "intervene (auto-re-enable in %.0fs)",
+                name, REENABLE_COOLDOWN_S)
 
     def enable(self, name: str) -> bool:
         """Re-enable a disabled module, reset restart counters, and start it. Thread-safe via _module_lock."""

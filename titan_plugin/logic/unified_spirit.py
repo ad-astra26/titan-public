@@ -573,6 +573,12 @@ class UnifiedSpirit:
             "micro_tick_count": self._micro_tick_count,
             "last_alignment": round(self._last_alignment, 4),
             "enrichment_rate": self._enrichment_rate,
+            # rFP_trinity_130d_awakening §12 close-out: expose the live 130D
+            # tensor so the Observatory Trinity-architecture tab heatmap
+            # (which reads /v4/inner-trinity.unified_spirit.full_130dt) gets
+            # populated. Pre-rFP this was missing and the heatmap stayed
+            # blank even when the spirit_tensor in latest_epoch had data.
+            "full_130dt": [round(float(v), 6) for v in self._tensor],
             "config": {
                 "stale_threshold": self._stale_threshold,
                 "enrichment_base": self._enrichment_base,

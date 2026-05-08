@@ -40,6 +40,12 @@ import hmac
 # ── Locked constants — change only with simultaneous Rust + parity test bump ─
 
 BUS_AUTHKEY_SALT = b"titan-bus-v1"   # version-bumpable for rotation without identity touch
+BUS_AUTHKEY_INFO = b"titan-bus"      # HKDF info — domain separation constant per
+                                      # PLAN_microkernel_phase_c_s2_kernel.md §7.3.
+                                      # MUST match Rust AUTHKEY_HKDF_INFO in
+                                      # titan-rust/crates/titan-core/src/constants.rs.
+                                      # NOT titan_id-derived — per-Titan isolation
+                                      # comes from per-Titan identity secrets.
 BUS_AUTHKEY_LEN = 32                 # 256-bit HMAC key (matches AUTH_TAG_SIZE in _frame)
 
 
@@ -75,20 +81,30 @@ def _hkdf_sha256_expand(prk: bytes, info: bytes, length: int) -> bytes:
 # ── Public API ─────────────────────────────────────────────────────────────
 
 
-def derive_bus_authkey(identity_secret_bytes: bytes, titan_id: str) -> bytes:
-    """Derive the bus HMAC authkey from Titan's identity keypair via HKDF-SHA256.
+def derive_bus_authkey(identity_secret_bytes: bytes) -> bytes:
+    """Derive the bus HMAC authkey from Titan's identity secret via HKDF-SHA256.
 
     Inputs:
       identity_secret_bytes — Ed25519 secret_bytes (typically 32 or 64 bytes
         depending on how the keypair is stored; HKDF accepts arbitrary length).
         Must be the IKM, not a public key.
-      titan_id — string identity ("titan_T1", "titan_T2", "titan_T3"...) used
-        as HKDF info. Encoded UTF-8 NFC; canonical form is plain ASCII so
-        no normalization issue.
 
-    Returns BUS_AUTHKEY_LEN bytes (32). Deterministic for fixed inputs +
-    fixed BUS_AUTHKEY_SALT. Recoverable across kernel swaps. Survives Shamir
-    restore as long as the identity keypair is recovered.
+    Returns BUS_AUTHKEY_LEN bytes (32). Deterministic for fixed input +
+    fixed BUS_AUTHKEY_SALT + fixed BUS_AUTHKEY_INFO. Recoverable across
+    kernel swaps. Survives Shamir restore as long as the identity keypair
+    is recovered.
+
+    Per `PLAN_microkernel_phase_c_s2_kernel.md §7.3` (canonical design):
+    HKDF info is the CONSTANT b"titan-bus", NOT titan_id. Per-Titan
+    isolation comes from per-Titan identity secrets (different IKM →
+    different authkey), NOT from info.
+
+    Restored 2026-05-05 after rFP_phase_c_bus_authkey_contract_fix.md
+    diagnosed the call-site drift that broke Phase C C-S7: Rust kernel
+    passed "titan_T3" while Python worker passed "T3" (env var set without
+    prefix) → different authkeys → 100% handshake failure under
+    l0_rust_enabled=true. The titan_id parameter was removed from this
+    function so the drift class is structurally impossible.
     """
     if not isinstance(identity_secret_bytes, (bytes, bytearray)):
         raise TypeError(
@@ -96,8 +112,5 @@ def derive_bus_authkey(identity_secret_bytes: bytes, titan_id: str) -> bytes:
         )
     if len(identity_secret_bytes) == 0:
         raise ValueError("identity_secret_bytes is empty — cannot derive authkey")
-    if not titan_id:
-        raise ValueError("titan_id must be non-empty")
-    info = titan_id.encode("utf-8")
     prk = _hkdf_sha256_extract(salt=BUS_AUTHKEY_SALT, ikm=bytes(identity_secret_bytes))
-    return _hkdf_sha256_expand(prk=prk, info=info, length=BUS_AUTHKEY_LEN)
+    return _hkdf_sha256_expand(prk=prk, info=BUS_AUTHKEY_INFO, length=BUS_AUTHKEY_LEN)

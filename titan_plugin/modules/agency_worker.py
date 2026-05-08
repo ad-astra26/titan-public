@@ -341,6 +341,52 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     last_stats_publish = 0.0
     poll_interval_s = 0.2
 
+    # Phase C Session 3 (rFP §4.B.2 + §4.B.3) — SHM-direct state publishers
+    # for agency_state.bin + assessment_state.bin. Replaces the deadlock-
+    # prone sync bus.request(action="get_agency_stats" / "get_assessment_stats")
+    # path (Session 4 proxy migration §4.C.5 + §4.C.12 will read these slots).
+    # Cadence: 1 Hz. Single thread fans out to both publishers via
+    # MultiSlotStatePublisher (G21 single-writer per slot — agency_state
+    # written ONLY here, assessment_state written ONLY here).
+    try:
+        from titan_plugin.core.state_registry import resolve_titan_id
+        from titan_plugin.logic.agency_state_publisher import (
+            AgencyStatePublisher)
+        from titan_plugin.logic.assessment_state_publisher import (
+            AssessmentStatePublisher)
+        from titan_plugin.logic.worker_publisher_runner import (
+            run_multi_slot_worker_publisher)
+        _titan_id_resolved = resolve_titan_id()
+        _agency_state_publisher = AgencyStatePublisher(
+            titan_id=_titan_id_resolved)
+        _assessment_state_publisher = AssessmentStatePublisher(
+            titan_id=_titan_id_resolved)
+        # Each publisher takes a different positional arg — agency takes
+        # the AgencyModule, assessment takes the SelfAssessment. Solution:
+        # publish_args returns (state,) where state is a 2-tuple, and
+        # each publisher's _compute_payload extracts what it needs. But
+        # simpler: 2 separate publisher threads, one per publisher.
+        from titan_plugin.logic.worker_publisher_runner import (
+            run_worker_publisher)
+        run_worker_publisher(
+            publisher=_agency_state_publisher,
+            state_fetcher=lambda: agency,
+            worker_name="agency_worker",
+            cadence_s=1.0,
+        )
+        run_worker_publisher(
+            publisher=_assessment_state_publisher,
+            state_fetcher=lambda: assessment,
+            worker_name="agency_worker",
+            cadence_s=1.0,
+        )
+    except Exception as _pub_init_err:
+        logger.error(
+            "[AgencyWorker] SHM publisher BOOT FAILED — "
+            "consumers fall back to sync bus.request path (deadlock "
+            "surface remains until publisher recovers): %s",
+            _pub_init_err, exc_info=True)
+
     while True:
         now = time.time()
 
@@ -433,11 +479,11 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                     assessment_dict = _neutral_assessment(action_result, str(ae))
                 response_payload = {"assessment": assessment_dict}
 
-            elif action == "agency_stats":
-                response_payload = {"stats": agency.get_stats()}
-
-            elif action == "assessment_stats":
-                response_payload = {"stats": assessment.get_stats()}
+            # Phase C Session 5 (rFP §4.D.4): agency_stats + assessment_stats
+            # handlers RETIRED — agency_proxy.refresh_stats +
+            # assessment_proxy.refresh_stats now SHM-direct via
+            # agency_state.bin + assessment_state.bin (Session 3
+            # §4.B.2/§4.B.3 publishers).
 
             else:
                 response_payload = {"error": f"unknown action: {action}"}

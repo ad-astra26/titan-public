@@ -108,10 +108,10 @@ def test_plugin_register_modules_populates_guardian(plugin):
         "cgn", "knowledge", "emot_cgn",
         "timechain", "backup",
         "warning_monitor",
-        "output_verifier",  # A.8.3
-        "outer_trinity",    # A.8.4
-        "reflex",           # A.8.5
-        "agency_worker",    # A.8.6
+        "output_verifier",                       # A.8.3
+        "outer_body", "outer_mind", "outer_spirit",  # A.S8 symmetric split
+        "reflex",                                # A.8.5
+        "agency_worker",                         # A.8.6
     }
     assert set(modules.keys()) == expected, f"diff: {expected ^ set(modules.keys())}"
 
@@ -162,7 +162,11 @@ def test_plugin_method_signatures_match_titancore_surface():
         "_register_modules", "_create_proxies",
         "_wire_metabolism", "_wire_sovereignty", "_wire_studio", "_wire_social",
         "_boot_agency", "_boot_reflex_collector",
-        "_boot_outer_trinity", "_outer_trinity_loop",
+        # A.S8: _boot_outer_trinity + _outer_trinity_loop deleted; replaced
+        # by 3 autostart ModuleSpecs (outer_body/mind/spirit) in
+        # _register_modules + _publish_outer_sources_loop. See
+        # memory/feedback_outer_trinity_symmetric_workers.md.
+        "_publish_outer_sources_loop",
         "_meditation_loop", "_agency_loop", "_sovereignty_loop",
         "_trinity_snapshot_loop", "_v4_event_bridge_loop",
         "_handle_impulse", "_handle_outer_dispatch", "_handle_agency_query",
