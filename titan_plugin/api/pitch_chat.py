@@ -216,35 +216,91 @@ async def _check_and_record_rate(token: str, now: float) -> Optional[dict]:
 # ── Internal-time snapshot ────────────────────────────────────────────
 
 
-def _snapshot_internal_time(plugin) -> InternalTime:
+def _snapshot_internal_time(plugin, result_body: Optional[dict] = None) -> InternalTime:
     """Best-effort read of the Titan's current epoch + phase + fatigue +
     emotion. Failures yield empty fields rather than breaking the reply.
+
+    Reads (in order, first non-empty wins per field):
+      1. `result_body` from a successful run_chat — has mood + state_snapshot
+         already populated by the pipeline.
+      2. plugin._gather_current_state() if available — same source the
+         pipeline uses internally.
+      3. plugin._dream_state for fatigue / is_dreaming.
+      4. epoch from plugin.kernel / plugin._epoch counter.
     """
     epoch = None
     phase = None
     fatigue = None
     emotion = None
-    try:
-        st = getattr(plugin, "_titan_state", None)
-        if st is not None:
-            ep = getattr(st, "epoch", None) or getattr(st, "epoch_count", None)
-            if isinstance(ep, (int, float)):
-                epoch = int(ep)
-        dream = getattr(plugin, "_dream_state", {}) or {}
-        if dream.get("is_dreaming"):
+
+    body = result_body or {}
+    snap = body.get("state_snapshot") if isinstance(body, dict) else None
+    if isinstance(snap, dict):
+        if snap.get("is_dreaming"):
             phase = "dreaming"
-        elif dream.get("is_meditating"):
+        elif snap.get("emotion") in ("meditating", "meditation"):
             phase = "meditating"
         else:
             phase = "awake"
-        f = dream.get("fatigue")
-        if isinstance(f, (int, float)):
-            fatigue = float(max(0.0, min(1.0, f)))
-        mood = getattr(plugin, "_current_emotion", None) or getattr(plugin, "current_emotion", None)
-        if isinstance(mood, str):
+        em = snap.get("emotion")
+        if isinstance(em, str) and em:
+            emotion = em
+    if isinstance(body, dict) and not emotion:
+        mood = body.get("mood")
+        if isinstance(mood, str) and mood:
             emotion = mood
+
+    try:
+        gather = getattr(plugin, "_gather_current_state", None)
+        if callable(gather):
+            state = gather()
+            if phase is None:
+                if state.get("is_dreaming"):
+                    phase = "dreaming"
+                else:
+                    phase = "awake"
+            if not emotion:
+                em = state.get("emotion")
+                if isinstance(em, str):
+                    emotion = em
+            f = state.get("fatigue")
+            if isinstance(f, (int, float)):
+                fatigue = float(max(0.0, min(1.0, f)))
     except Exception:
-        logger.debug("[PitchChat] internal-time snapshot partial", exc_info=True)
+        logger.debug("[PitchChat] gather_current_state partial", exc_info=True)
+
+    try:
+        dream = getattr(plugin, "_dream_state", {}) or {}
+        if fatigue is None:
+            f = dream.get("fatigue")
+            if isinstance(f, (int, float)):
+                fatigue = float(max(0.0, min(1.0, f)))
+        if phase is None:
+            phase = "dreaming" if dream.get("is_dreaming") else "awake"
+    except Exception:
+        logger.debug("[PitchChat] dream_state partial", exc_info=True)
+
+    try:
+        for attr in ("_current_epoch", "_epoch", "epoch", "epoch_count"):
+            v = getattr(plugin, attr, None)
+            if callable(v):
+                v = v()
+            if isinstance(v, (int, float)):
+                epoch = int(v)
+                break
+        if epoch is None:
+            kernel = getattr(plugin, "kernel", None) or getattr(plugin, "_kernel", None)
+            if kernel is not None:
+                for attr in ("epoch", "current_epoch", "epoch_count"):
+                    v = getattr(kernel, attr, None)
+                    if callable(v):
+                        v = v()
+                    if isinstance(v, (int, float)):
+                        epoch = int(v)
+                        break
+    except Exception:
+        logger.debug("[PitchChat] epoch read partial", exc_info=True)
+
     return InternalTime(epoch=epoch, phase=phase, fatigue=fatigue, emotion=emotion)
 
 
@@ -354,27 +410,19 @@ async def pitch_chat(
         raise HTTPException(status_code=503, detail="plugin not initialized")
 
     try:
-        if agent is not None:
-            result = await plugin.run_chat(payload, claims, headers={"X-Titan-Channel": "web"})
-        elif chat_bridge_bus is not None:
-            bridge_payload = {
-                "action": "chat",
-                "body": payload,
-                "claims": claims,
-                "headers": {"X-Titan-Channel": "web"},
-            }
-            # Bridge timeout 180s — covers worst-case LLM round-trip after a
-            # fresh restart (the persona pipeline cold-start + memory recall +
-            # 671B-parameter inference can stretch past 60s on the first
-            # request before caches warm). Mirrored on the frontend proxy.
-            reply = await chat_bridge_bus.request_async(
-                "chat_subproc", "chat_handler", bridge_payload, timeout=180.0,
-            )
-            if not isinstance(reply, dict):
-                raise RuntimeError(f"bridge returned non-dict: {type(reply).__name__}")
-            result = reply.get("payload") if isinstance(reply.get("payload"), dict) else reply
-        else:
-            raise HTTPException(status_code=503, detail="agent not initialized")
+        # plugin.run_chat is exposed via KERNEL_RPC_EXPOSED_METHODS (commit
+        # 52ae3607) so this call works under api_process_separation_enabled
+        # in BOTH modes:
+        #   - In-process (legacy): direct Python call.
+        #   - Subprocess (current): kernel_rpc proxy executes run_chat in the
+        #     parent process where the AGNO agent + memory pipeline live.
+        # We deliberately bypass the chat_bridge_bus QUERY/RESPONSE path —
+        # under socket mode the api_subprocess is not BUS_SUBSCRIBE'd to its
+        # own name, so RESPONSE-rid routed replies never deliver and every
+        # request times out (regression vs the bridge's design intent;
+        # diagnosed 2026-05-11 via /v4/pitch-chat smoke tests + cross-checked
+        # against /chat which exhibits the identical symptom).
+        result = await plugin.run_chat(payload, claims, headers={"X-Titan-Channel": "web"})
     except asyncio.TimeoutError:
         explanation = "Titan's reply did not arrive within 60 seconds. Try again, or rephrase."
         _append_recording(thread_id, "system", {"event": "timeout"})
@@ -409,7 +457,10 @@ async def pitch_chat(
     if decline is None:
         reply_text = body_inner.get("response") or ""
 
-    internal = _snapshot_internal_time(plugin)
+    # state_snapshot lives at result["body"]["state_snapshot"] (chat_pipeline
+    # composes the dict at chat_pipeline.py:402). Pass body_inner so the
+    # snapshot helper can read mood + emotion + is_dreaming directly.
+    internal = _snapshot_internal_time(plugin, body_inner if isinstance(body_inner, dict) else None)
 
     # ── Recording: outbound ───────────────────────────────────────
     _append_recording(thread_id, "out", {

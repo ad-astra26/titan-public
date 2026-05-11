@@ -2890,6 +2890,7 @@ shm_spirit_fast_enabled = true
 # bio-layer event loop) + /ws handshake completes (uvicorn-thread
 # unblocked). 24 isolation tests + live verification on T1 (Mode 1
 # in-process) before flag flip; full Mode 2 verification post-flip.
+#
 api_process_separation_enabled = true
 
 # ── Asyncio default-executor pool sizing (rFP_microkernel_phase_a8 §3.4) ──

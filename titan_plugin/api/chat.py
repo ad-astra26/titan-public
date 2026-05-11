@@ -92,10 +92,36 @@ async def chat(req: ChatRequest, request: Request, claims: dict = Depends(verify
     headers = dict(request.headers)
     claims_dict = dict(claims) if claims else {}
 
-    # Mode 1 — in-process: call run_chat() on the local plugin directly.
-    # The api server's event loop IS the parent loop; agent + plugin are
-    # all local objects. This is the legacy path (api_process_separation
-    # _enabled=false) and remains the byte-identical pre-bridge behavior.
+    # 2026-05-11 — Call plugin.run_chat() DIRECTLY in BOTH modes. Under
+    # api_process_separation_enabled=true the plugin is a kernel_rpc proxy
+    # and the call executes in the parent process (run_chat is exposed via
+    # KERNEL_RPC_EXPOSED_METHODS per commit 52ae3607). This bypasses the
+    # chat_bridge_bus QUERY/RESPONSE path, which has a routing regression:
+    # the api_subprocess is not BUS_SUBSCRIBE'd to its own name under socket-
+    # broker mode, so RESPONSE rid-routed replies addressed to dst="chat_
+    # subproc" (or dst="api") never deliver and the bridge times out. Same
+    # symptom on /v4/pitch-chat — fix mirrors both endpoints.
+    # Mode 1 (in-process) and Mode 2 (subprocess via kernel_rpc) are now
+    # transport-identical from chat.py's perspective. chat_bridge_bus stays
+    # in app.state but is unused until the bridge transport regression is
+    # repaired (tracked for post-Colosseum investigation).
+    try:
+        result = await plugin.run_chat(payload, claims_dict, headers)
+    except Exception as e:
+        logger.error("[Chat] run_chat raised: %s", e, exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Chat pipeline error: {e}"},
+        )
+    return JSONResponse(
+        status_code=int(result.get("status_code", 500)),
+        content=result.get("body") or {"error": "empty body"},
+        headers=result.get("extra_headers") or {},
+    )
+
+    # ── Legacy bridge fallback path retained below for reference; the
+    # active path above always wins (the `return` makes this unreachable).
+    # ──────────────────────────────────────────────────────────────────
     if agent is not None:
         try:
             result = await plugin.run_chat(payload, claims_dict, headers)
@@ -127,8 +153,15 @@ async def chat(req: ChatRequest, request: Request, claims: dict = Depends(verify
                 "claims":  claims_dict,
                 "headers": headers,
             }
+            # IMPORTANT: src must be "api" — the bus broker routes by module
+            # name and api_subprocess is registered as name="api" (see plugin.py
+            # 1308-1361). Earlier code passed "chat_subproc" but no module is
+            # registered under that name, so the parent's chat_handler published
+            # RESPONSE rid-routed to dst="chat_subproc" and the broker had
+            # nowhere to send it → request_async always timed out. Fixed
+            # 2026-05-11 after diagnosing /v4/pitch-chat failures.
             reply = await chat_bridge_bus.request_async(
-                "chat_subproc", "chat_handler", bridge_payload, timeout=60.0,
+                "api", "chat_handler", bridge_payload, timeout=60.0,
             )
         except asyncio.TimeoutError:
             return JSONResponse(
