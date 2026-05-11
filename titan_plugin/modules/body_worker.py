@@ -114,18 +114,35 @@ def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     fast_stop_event = threading.Event()
 
     fast_enabled = _read_flag(config, "microkernel.shm_body_fast_enabled", False)
-    if fast_enabled:
+    l0_rust_enabled = _read_flag(config, "microkernel.l0_rust_enabled", False)
+    # Phase C C-S5 closure 2026-05-08: under l0_rust_enabled=true the
+    # Rust titan-inner-body-rs daemon owns inner_body_5d.bin output but
+    # NEEDS sensor_cache_inner_body.bin as input. body_worker still
+    # provides the sensor compute + 7.83 Hz cadence; _start_fast_path's
+    # internal if/elif redirects the write target from inner_body_5d.bin
+    # (Phase A+B) to sensor_cache_inner_body.bin (Phase C). Either flag
+    # enables _start_fast_path; the slot identity is decided inside.
+    if fast_enabled or l0_rust_enabled:
         try:
             sensor_cache, refresh_threads, shm_bank, body_5d_writer, shm_writer_thread = (
                 _start_fast_path(thresholds, config, fast_stop_event,
                                  lambda: (severity_multipliers, focus_nudges))
             )
-            logger.info(
-                "[BodyWorker] §L1 fast path ON: 5 refresh threads + 7.83 Hz shm writer"
-            )
+            if fast_enabled:
+                logger.info(
+                    "[BodyWorker] §L1 fast path ON: 5 refresh threads + "
+                    "7.83 Hz inner_body_5d.bin writer (Phase A+B)"
+                )
+            else:
+                logger.info(
+                    "[BodyWorker] Phase C path ON: 5 refresh threads + "
+                    "7.83 Hz sensor_cache_inner_body.bin writer "
+                    "(l0_rust_enabled=true; Rust titan-inner-body-rs owns "
+                    "inner_body_5d.bin output)"
+                )
         except Exception as exc:
             logger.warning(
-                "[BodyWorker] §L1 fast-path init failed (%s); falling back to inline senses",
+                "[BodyWorker] fast-path init failed (%s); falling back to inline senses",
                 exc,
             )
             sensor_cache = None
@@ -398,6 +415,16 @@ def _collect_body_tensor(history: dict, thresholds: dict,
             "filter_down_multiplier": round(multiplier, 4),
         }
 
+    # Phase 2.5.A — record firing for /v4/debug/dim-sources diagnostics.
+    try:
+        from titan_plugin.api.dim_registry import get_firing_tracker
+        get_firing_tracker().record_block(
+            "inner_body",
+            tensor,
+            {"body_state": history if history else None},
+        )
+    except Exception:
+        pass
     return tensor, details
 
 
@@ -963,26 +990,40 @@ def _start_fast_path(thresholds: dict, config: dict, stop_event,
         specs, cache, stop_event, thread_name_prefix="body_refresh",
     )
 
-    # Schumann shm writer — RegistryBank reads same flag, no-op when off.
+    # Schumann shm writer — two modes depending on Phase A+B vs Phase C:
+    #
+    # Phase A+B (microkernel.l0_rust_enabled = false):
+    #   shm_body_fast_enabled gates body_worker's direct write to
+    #   inner_body_5d.bin (the FINAL OUTPUT slot). No Rust daemon involved.
+    #
+    # Phase C (microkernel.l0_rust_enabled = true):
+    #   shm_body_fast_enabled is false (per /root/.titan/microkernel_T<id>.toml
+    #   override). Instead body_worker writes the SAME 5D tensor to
+    #   sensor_cache_inner_body.bin (sensor INPUT slot for the Rust daemon).
+    #   The Rust binary titan-inner-body-rs reads sensor_cache_inner_body.bin
+    #   every Schumann tick, applies UNIFIED + LOCAL filter_down +
+    #   GROUND_UP, and writes the FINAL OUTPUT to inner_body_5d.bin.
+    #   See inner_body_sensor_refresh.py for the canonical writer class.
+    #   SPEC §G1 + §23.4 + §9.A line 1014.
     shm_bank = RegistryBank(titan_id=None, config=config)
     body_5d_writer = None
     shm_writer_thread = None
-    if shm_bank.is_enabled(INNER_BODY_5D):
-        body_5d_writer = shm_bank.writer(INNER_BODY_5D)
 
-        # History deque (separate from main-loop's history) for the
-        # writer's velocity calculation — needs its own state since
-        # the writer runs at 7.83 Hz vs main loop at 0.29 Hz.
-        # Note: velocity contribution is small and bounded; using a
-        # separate deque per-tick is safe (no cross-thread mutation
-        # of the main-loop history).
-        writer_history = {
-            "interoception": deque(maxlen=_HISTORY_SIZE),
-            "proprioception": deque(maxlen=_HISTORY_SIZE),
-            "somatosensation": deque(maxlen=_HISTORY_SIZE),
-            "entropy": deque(maxlen=_HISTORY_SIZE),
-            "thermal": deque(maxlen=_HISTORY_SIZE),
-        }
+    # History deque (separate from main-loop's history) for the writer's
+    # velocity calculation — needs its own state since the writer runs at
+    # 7.83 Hz vs main loop at 0.29 Hz. Used by both Phase A+B legacy
+    # writer + Phase C sensor cache writer.
+    writer_history = {
+        "interoception": deque(maxlen=_HISTORY_SIZE),
+        "proprioception": deque(maxlen=_HISTORY_SIZE),
+        "somatosensation": deque(maxlen=_HISTORY_SIZE),
+        "entropy": deque(maxlen=_HISTORY_SIZE),
+        "thermal": deque(maxlen=_HISTORY_SIZE),
+    }
+
+    if shm_bank.is_enabled(INNER_BODY_5D):
+        # Phase A+B path — direct write to inner_body_5d.bin.
+        body_5d_writer = shm_bank.writer(INNER_BODY_5D)
 
         def tick():
             severity_multipliers, focus_nudges = get_modulators()
@@ -999,5 +1040,80 @@ def _start_fast_path(thresholds: dict, config: dict, stop_event,
         shm_writer_thread = start_shm_writer_thread(
             tick, _BODY_TICK_PERIOD_S, stop_event, "body_shm_writer",
         )
+    elif (config or {}).get("microkernel", {}).get("l0_rust_enabled", False):
+        # Phase C path — Step 7 §4.4 schema migration v1→v2:
+        # Publish msgpack source dict (per-sense {value, severity, velocity})
+        # to sensor_cache_inner_body.bin instead of pre-computed 5D tensor.
+        # titan-inner-body-rs decodes msgpack + executes per-dim urgency-
+        # weighted health-score formula in Rust L1 per SPEC §23.4 + G1.
+        try:
+            from titan_plugin.logic.inner_body_sensor_refresh import (
+                InnerBodySensorRefresh)
+            import msgpack as _msgpack
+
+            def _provide_body_source_dict() -> bytes:
+                # Per-sense raw readings (value + severity + velocity from
+                # rolling history). Rust applies urgency formula:
+                #   urgency = raw * sev_value * mult / CRITICAL + |vel| * 0.3
+                #   health = max(0, 1 - urgency)
+                # The sense interpretation (_sense_*) stays Python because
+                # OS reads (procfs etc.) are platform-specific.
+                from titan_plugin.modules.body_worker import (
+                    _sense_interoception, _sense_proprioception,
+                    _sense_somatosensation, _sense_entropy, _sense_thermal,
+                    _calculate_velocity, Severity,
+                )
+                sense_fns = [
+                    ("interoception", _sense_interoception),
+                    ("proprioception", _sense_proprioception),
+                    ("somatosensation", _sense_somatosensation),
+                    ("entropy", _sense_entropy),
+                    ("thermal", _sense_thermal),
+                ]
+                senses = {}
+                for name, fn in sense_fns:
+                    try:
+                        reading = fn(thresholds)
+                    except Exception:
+                        # Sense raise → publish neutral defaults so Rust
+                        # daemon doesn't starve on missing dim.
+                        senses[name] = {
+                            "value": 0.5, "severity": 1.0, "velocity": 0.0,
+                        }
+                        continue
+                    history_dq = writer_history.get(name, deque())
+                    history_dq.append({
+                        "ts": time.time(),
+                        "value": reading["value"],
+                        "severity": reading["severity"],
+                    })
+                    velocity = _calculate_velocity(history_dq)
+                    senses[name] = {
+                        "value": float(reading["value"]),
+                        "severity": float(reading["severity"].value),
+                        "velocity": float(velocity),
+                    }
+                payload = {
+                    "senses": senses,
+                    "critical_threshold": float(Severity.CRITICAL.value),
+                }
+                return _msgpack.packb(payload, use_bin_type=True)
+
+            sensor_cache_writer = InnerBodySensorRefresh(
+                tensor_provider=_provide_body_source_dict,
+                titan_id=None,
+            )
+            shm_writer_thread = sensor_cache_writer.start_thread(stop_event)
+            logger.info(
+                "[BodyWorker] sensor_cache_inner_body.bin source-dict writer "
+                "started (l0_rust_enabled=true; schema v2 msgpack; Rust "
+                "titan-inner-body-rs computes 5D urgency/health formulas + "
+                "owns inner_body_5d.bin output)")
+        except Exception:
+            logger.critical(
+                "[BodyWorker] failed to start inner_body sensor cache writer — "
+                "Rust inner-body-rs will starve on constant-zero input. "
+                "Investigate before relying on inner_body_5d.bin downstream.",
+                exc_info=True)
 
     return cache, refresh_threads, shm_bank, body_5d_writer, shm_writer_thread

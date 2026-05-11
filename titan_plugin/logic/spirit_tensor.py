@@ -103,7 +103,29 @@ def collect_spirit_45d(
                              hlvl, hfires, us, expr,
                              body_coherence, mind_coherence, combined_coherence)
 
-    return sat + chit + ananda
+    tensor_45d = sat + chit + ananda
+    # Phase 2.5.A — record firing for /v4/debug/dim-sources diagnostics.
+    try:
+        from titan_plugin.api.dim_registry import get_firing_tracker
+        get_firing_tracker().record_block(
+            "inner_spirit",
+            tensor_45d,
+            {
+                "consciousness": consciousness,
+                "topology": topology,
+                "hormone_levels": hormone_levels,
+                "hormone_fires": hormone_fires,
+                "unified_spirit_stats": unified_spirit_stats,
+                "sphere_clocks": sphere_clocks,
+                "memory_stats": memory_stats,
+                "expression_stats": expression_stats,
+                "birth_state": birth_state,
+                "history": history,
+            },
+        )
+    except Exception:
+        pass
+    return tensor_45d
 
 
 def _collect_sat(spirit, body, mind, cons, topo, us, hlvl, hfires,

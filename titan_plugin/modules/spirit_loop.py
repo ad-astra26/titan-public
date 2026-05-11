@@ -50,11 +50,34 @@ def _load_birth_state() -> list | None:
 
     Returns None only on first-load failure; once loaded, the cached value
     is reused for the lifetime of the process.
+
+    rFP_trinity_130d_phase2_5_closure §4 (2026-05-08): updated to handle
+    the rich birth_dna_snapshot.json schema where the top-level ``dna``
+    key is a dict (neuromodulator_dna / expression_composites /
+    sphere_clock / consciousness / neural_nervous_system / _meta) rather
+    than a flat list. We now derive a stable 45-element birth vector
+    deterministically from the file's ``hash`` field — same hash → same
+    birth vector across restarts. Accepts the legacy flat-list schemas
+    too (birth_state.json, ``birth_state``/``vector``/``state``/``dna`` as list).
     """
     global _BIRTH_STATE_CACHE, _BIRTH_STATE_LOADED
     if _BIRTH_STATE_LOADED:
         return _BIRTH_STATE_CACHE
     _BIRTH_STATE_LOADED = True  # set even on failure to avoid re-trying
+    # rFP_trinity_130d_phase2_5_closure §4 (2026-05-08, T2 deploy fix):
+    # T2/T3 deployments may not have birth_dna_snapshot.json at all
+    # (the file is T1-canonical from initial setup, not git-synced per
+    # directive_t2_deployment_safety.md). When no file exists, derive
+    # a deterministic birth vector from the Titan's ID — so each Titan
+    # has a STABLE-PER-TITAN birth identity, and SPEC §23.6 SAT[0]
+    # self_recognition (cosine_sim(spirit[:3], birth[:3])) computes
+    # against a constant reference vector unique to that Titan.
+    _titan_id_for_seed = "T1"
+    try:
+        from titan_plugin.core.state_registry import resolve_titan_id
+        _titan_id_for_seed = resolve_titan_id()
+    except Exception:
+        pass
     try:
         # Worker runs from project root; prefer birth_dna_snapshot.json which
         # is the active artifact in data/, fall back to birth_state.json.
@@ -68,21 +91,74 @@ def _load_birth_state() -> list | None:
             if os.path.exists(path):
                 with open(path) as f:
                     data = json.load(f)
-                # Schema may be {"vector": [...]} or {"birth_state": [...]}
-                # or a bare list — accept all forms.
+                # Schema A — bare list
                 if isinstance(data, list):
                     _BIRTH_STATE_CACHE = data
                 elif isinstance(data, dict):
-                    for key in ("birth_state", "vector", "state", "dna"):
+                    # Schema B — flat list under known key
+                    for key in ("birth_state", "vector", "state"):
                         v = data.get(key)
                         if isinstance(v, list):
                             _BIRTH_STATE_CACHE = v
                             break
+                    # Schema C — current birth_dna_snapshot.json: ``dna``
+                    # is a nested dict. Derive a deterministic 45-element
+                    # vector from the file's ``hash`` field. The hash is
+                    # stable across the Titan's lifetime so birth[:3]
+                    # used by SPEC §23.6 SAT[0] self_recognition stays
+                    # constant. Distribution is uniform [0, 1].
+                    if not _BIRTH_STATE_CACHE:
+                        h = data.get("hash") or ""
+                        if isinstance(h, str) and len(h) >= 64:
+                            # Use SHA-256 hex (64 chars) as 32 bytes; expand
+                            # to 45 floats by hashing again with a counter
+                            # suffix until we have enough bytes.
+                            import hashlib as _hl
+                            seed_bytes = bytes.fromhex(h)
+                            need_bytes = 45 * 4  # 4 bytes per float (uint32)
+                            buf = bytearray()
+                            counter = 0
+                            while len(buf) < need_bytes:
+                                round_in = seed_bytes + counter.to_bytes(4, "little")
+                                buf.extend(_hl.sha256(round_in).digest())
+                                counter += 1
+                            vec = []
+                            for i in range(45):
+                                u32 = int.from_bytes(buf[i * 4:i * 4 + 4],
+                                                     "little")
+                                vec.append((u32 % 10000) / 10000.0)
+                            _BIRTH_STATE_CACHE = vec
                 if _BIRTH_STATE_CACHE:
                     break
     except Exception as _e:
         swallow_warn('[SpiritLoop] birth_state load', _e,
                      key="modules.spirit_loop.birth_state_load", throttle=1)
+    # No file — derive deterministic 45D vector from titan_id (T2/T3
+    # deploys without birth_dna_snapshot.json land here). Stable across
+    # restarts; unique per Titan.
+    if not _BIRTH_STATE_CACHE:
+        try:
+            import hashlib as _hl
+            seed_bytes = _hl.sha256(
+                f"titan-birth-{_titan_id_for_seed}".encode()).digest()
+            need_bytes = 45 * 4
+            buf = bytearray()
+            counter = 0
+            while len(buf) < need_bytes:
+                round_in = seed_bytes + counter.to_bytes(4, "little")
+                buf.extend(_hl.sha256(round_in).digest())
+                counter += 1
+            vec = []
+            for i in range(45):
+                u32 = int.from_bytes(buf[i * 4:i * 4 + 4], "little")
+                vec.append((u32 % 10000) / 10000.0)
+            _BIRTH_STATE_CACHE = vec
+            logger.info(
+                "[SpiritLoop] No birth_dna_snapshot.json found — "
+                "derived deterministic 45D birth vector from "
+                "titan_id=%s", _titan_id_for_seed)
+        except Exception:
+            _BIRTH_STATE_CACHE = [0.5] * 45
     return _BIRTH_STATE_CACHE
 
 # GREAT PULSE transition tracking (resonance OFF→ON detector)
@@ -1211,12 +1287,34 @@ def _run_consciousness_epoch(consciousness: dict, body_state: dict, mind_state: 
         try:
             from titan_plugin.logic.spirit_tensor import collect_spirit_45d
             spirit_5d = _collect_spirit_tensor(config, body_state, mind_state, consciousness)
-            spirit_45d = collect_spirit_45d(
-                current_5d=spirit_5d,
-                body_tensor=body_values,
-                mind_tensor=mind_15d if mind_15d else mind_state.get("values", [0.5] * 5),
-                consciousness=consciousness.get("latest_epoch"),
-            )
+            # rFP_trinity_130d_phase2_5_closure §4 Chunk 2.5.D — prefer
+            # the FULL 45D from _publish_spirit_state's meta_sink stash
+            # if fresh (≤30s old). _publish_spirit_state computes with
+            # all 9 producers (hormone_levels/fires, unified_spirit_stats,
+            # sphere_clocks, memory_stats, expression_stats, birth_state,
+            # history, topology) — those handles aren't available in this
+            # function's scope. Without this preference, calling
+            # collect_spirit_45d here with only 4 args yields PARTIAL on
+            # ~7 dims (sovereignty, self_recognition, etc.) — the bug
+            # surfaced by the 2026-05-08 four-state classifier diagnostic.
+            spirit_45d = None
+            if isinstance(ostate, dict):
+                last_45d = ostate.get("_last_spirit_45d")
+                last_ts = ostate.get("_last_spirit_45d_ts", 0)
+                if (isinstance(last_45d, list) and len(last_45d) == 45
+                        and time.time() - float(last_ts or 0) <= 30.0):
+                    spirit_45d = list(last_45d)
+            if spirit_45d is None:
+                # Fallback: minimal compute when stash absent or stale.
+                # Still firing record_block + writing SHM via the tensor
+                # function (Phase 2.5.A.2), so the diagnostic remains
+                # accurate — partial-input dims will classify as PARTIAL.
+                spirit_45d = collect_spirit_45d(
+                    current_5d=spirit_5d,
+                    body_tensor=body_values,
+                    mind_tensor=mind_15d if mind_15d else mind_state.get("values", [0.5] * 5),
+                    consciousness=consciousness.get("latest_epoch"),
+                )
             for i, v in enumerate(spirit_45d[:45]):
                 sv[20 + i] = v
         except Exception as e:
@@ -2650,6 +2748,13 @@ def _publish_spirit_state(send_queue, name: str, tensor: list, consciousness: di
         # state_vector which only populates slots 0-6 + tail).
         if isinstance(meta_sink, dict):
             meta_sink["_last_spirit_45d"] = list(spirit_45d)
+            # rFP_trinity_130d_phase2_5_closure §4 (Chunk 2.5.D) — also
+            # stash a timestamp so callers (e.g. _run_consciousness_epoch
+            # at line ~1214) can prefer this rich 45D over their own
+            # minimal collect_spirit_45d call when the stash is fresh.
+            # Closes the inner_spirit PARTIAL classification (9 inputs
+            # ABSENT) revealed by the 2026-05-08 dim-sources diagnostic.
+            meta_sink["_last_spirit_45d_ts"] = time.time()
     except Exception as _swallow_exc:
         swallow_warn('[modules.spirit_loop] _publish_spirit_state: from titan_plugin.logic.spirit_tensor import collect_spir...', _swallow_exc,
                      key='modules.spirit_loop._publish_spirit_state.line2371', throttle=100)

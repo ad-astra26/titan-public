@@ -200,6 +200,12 @@ def create_app(plugin, event_bus: EventBus, config: dict | None = None,
         # chat-specific timeouts live inside the agent itself.
         if path.startswith("/chat"):
             return await call_next(request)
+        # /v4/pitch-chat invokes the same agent pipeline as /chat (via a
+        # wallet-less route for the VC + hackathon pitch tour, per
+        # rFP_observatory_pitch_route.md §5). Same 3s-bypass rationale —
+        # an internal 60s timeout lives inside pitch_chat.run_chat().
+        if path.startswith("/v4/pitch-chat"):
+            return await call_next(request)
         t0 = time.monotonic()
         try:
             return await asyncio.wait_for(
@@ -415,12 +421,14 @@ def create_app(plugin, event_bus: EventBus, config: dict | None = None,
     from .webhook import router as webhook_router
     from .websocket import router as ws_router
     from .chat import router as chat_router
+    from .pitch_chat import router as pitch_chat_router
 
     app.include_router(dashboard_router)
     app.include_router(maker_router)
     app.include_router(webhook_router)
     app.include_router(ws_router)
     app.include_router(chat_router)
+    app.include_router(pitch_chat_router)
 
     # Store factory args for API hot-reload
     app.state._api_factory_args = {
@@ -437,11 +445,11 @@ def reload_api_app(current_app: FastAPI) -> FastAPI:
     this into the running uvicorn server.
     """
     import importlib
-    from . import dashboard, maker, webhook, websocket, chat
+    from . import dashboard, maker, webhook, websocket, chat, pitch_chat
 
     # Reload all API route modules
     reloaded = []
-    for mod in [dashboard, maker, webhook, websocket, chat]:
+    for mod in [dashboard, maker, webhook, websocket, chat, pitch_chat]:
         try:
             importlib.reload(mod)
             reloaded.append(mod.__name__.split(".")[-1])

@@ -369,7 +369,13 @@ class TitanPlugin:
             autostart=_ov_subproc_enabled,  # Only when flag flipped
             lazy=False,
             heartbeat_timeout=60.0,
-            reply_only=False,
+            # rFP_worker_broadcast_topics_completion §4.A Batch 1 (2026-05-10):
+            # output_verifier consumes ONLY targeted QUERY messages (RPC
+            # pattern: callers publish dst="output_verifier"). Drain at
+            # output_verifier_worker.py:168-171 explicitly drops anything
+            # that isn't QUERY. reply_only=True excludes broadcasts at the
+            # broker, removing fan-out cost for high-rate Phase C types.
+            reply_only=True,
             start_method="spawn" if _spawn_grad else "fork",
             b2_1_swap_critical=False,  # not on hot ARC path; respawn-OK
         ))
@@ -391,6 +397,16 @@ class TitanPlugin:
             from titan_plugin.modules.outer_mind_worker import outer_mind_worker_main
             from titan_plugin.modules.outer_spirit_worker import outer_spirit_worker_main
 
+            # rFP_worker_broadcast_topics_completion §4.A Batch 1 (2026-05-10):
+            # outer_{body,mind,spirit} drains at modules/outer_*_worker.py
+            # consume exactly two broadcast types (OUTER_SOURCES_SNAPSHOT +
+            # FILTER_DOWN) plus targeted SHUTDOWN + QUERY (which bypass the
+            # broadcast filter regardless). Producer-side filter at
+            # bus_socket.publish() drops everything else before enqueue.
+            _OUTER_TRINITY_BROADCAST_TOPICS = [
+                bus.OUTER_SOURCES_SNAPSHOT,
+                bus.FILTER_DOWN,
+            ]
             self.guardian.register(ModuleSpec(
                 name="outer_body",
                 layer="L1",
@@ -401,6 +417,7 @@ class TitanPlugin:
                 lazy=False,
                 heartbeat_timeout=60.0,
                 reply_only=False,
+                broadcast_topics=_OUTER_TRINITY_BROADCAST_TOPICS,
                 start_method="spawn" if _spawn_grad else "fork",
                 b2_1_swap_critical=False,
             ))
@@ -414,6 +431,7 @@ class TitanPlugin:
                 lazy=False,
                 heartbeat_timeout=60.0,
                 reply_only=False,
+                broadcast_topics=_OUTER_TRINITY_BROADCAST_TOPICS,
                 start_method="spawn" if _spawn_grad else "fork",
                 b2_1_swap_critical=False,
             ))
@@ -427,6 +445,7 @@ class TitanPlugin:
                 lazy=False,
                 heartbeat_timeout=60.0,
                 reply_only=False,
+                broadcast_topics=_OUTER_TRINITY_BROADCAST_TOPICS,
                 start_method="spawn" if _spawn_grad else "fork",
                 b2_1_swap_critical=False,
             ))
@@ -457,7 +476,11 @@ class TitanPlugin:
             autostart=_reflex_subproc_enabled,  # Only when flag flipped
             lazy=False,
             heartbeat_timeout=60.0,
-            reply_only=False,
+            # rFP_worker_broadcast_topics_completion §4.A Batch 1 (2026-05-10):
+            # reflex drain at reflex_worker.py:134-137 explicitly drops
+            # anything that isn't SHUTDOWN or QUERY (both targeted). Pure
+            # RPC pattern — reply_only=True is the canonical declaration.
+            reply_only=True,
             start_method="spawn" if _spawn_grad else "fork",
             b2_1_swap_critical=False,  # per-call processor; respawn-OK
         ))
@@ -489,7 +512,13 @@ class TitanPlugin:
             autostart=_ag_subproc_enabled,  # Only when flag flipped
             lazy=False,
             heartbeat_timeout=120.0,  # LLM call can take 60s legitimately
-            reply_only=False,         # needs broadcasts (none currently consumed)
+            # rFP_worker_broadcast_topics_completion §4.A Batch 1 (2026-05-10):
+            # agency_worker drain at agency_worker.py:442-445 explicitly
+            # drops anything that isn't SHUTDOWN or QUERY (both targeted).
+            # Pre-existing comment "needs broadcasts (none currently consumed)"
+            # was a categorization gap — none ARE consumed. Pure RPC pattern;
+            # reply_only=True is canonical.
+            reply_only=True,
             start_method="spawn" if _spawn_grad else "fork",
             b2_1_swap_critical=False,  # impulse decoder is not on swap critical path
         ))
@@ -505,6 +534,9 @@ class TitanPlugin:
             warning_monitor_worker_main,
         )
         _wm_cfg = self._full_config.get("warning_monitor", {})
+        # rFP_worker_broadcast_topics_completion §4.A.3 (Batch 3):
+        # warning_monitor drain at modules/warning_monitor_worker.py:209
+        # consumes one broadcast type (SILENT_SWALLOW_REPORT).
         self.guardian.register(ModuleSpec(
             name="warning_monitor",
             layer="L3",  # observability service — same tier as observatory
@@ -515,6 +547,7 @@ class TitanPlugin:
             lazy=False,
             heartbeat_timeout=120.0,
             reply_only=False,
+            broadcast_topics=[bus.SILENT_SWALLOW_REPORT],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
             b2_1_swap_critical=False,  # M5: light-state worker; respawn-OK
         ))
@@ -626,6 +659,9 @@ class TitanPlugin:
         _a8_sage_subproc_enabled = bool(
             self._full_config.get("microkernel", {}).get(
                 "a8_sage_scholar_gatekeeper_subprocess_enabled", False))
+        # rFP_worker_broadcast_topics_completion §4.A.2 (Batch 2):
+        # rl drain at modules/rl_worker.py:136-147 consumes one broadcast
+        # type (SAGE_RECORD_TRANSITION); MODULE_SHUTDOWN + QUERY are targeted.
         self.guardian.register(ModuleSpec(
             name="rl",
             layer="L2",  # Microkernel v2 §A.5 — L2 higher cognition (IQL chain learning)
@@ -634,10 +670,14 @@ class TitanPlugin:
             rss_limit_mb=3000,
             autostart=_a8_sage_subproc_enabled,  # §A.8.7: autostart when flag-on
             lazy=not _a8_sage_subproc_enabled,   # §A.8.7: eager when flag-on
+            broadcast_topics=[bus.SAGE_RECORD_TRANSITION],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
         # LLM/Inference module (Agno agent — ~500MB)
+        # rFP_worker_broadcast_topics_completion §4.A.2 (Batch 2):
+        # llm drain at modules/llm_worker.py:103-112 consumes one broadcast
+        # type (LLM_TEACHER_REQUEST); MODULE_SHUTDOWN + QUERY are targeted.
         self.guardian.register(ModuleSpec(
             name="llm",
             layer="L3",  # Microkernel v2 §A.5 — L3 pluggable (Agno inference, human-time)
@@ -647,6 +687,7 @@ class TitanPlugin:
             autostart=True,  # Changed: Language Teacher needs llm at boot
             lazy=False,
             heartbeat_timeout=120.0,  # LLM calls can block 30s+; match Spirit/Memory timeout
+            broadcast_topics=[bus.LLM_TEACHER_REQUEST],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
@@ -665,6 +706,10 @@ class TitanPlugin:
             # flag flipped true in titan_params.toml.
             "microkernel": self._full_config.get("microkernel", {}),
         }
+        # rFP_worker_broadcast_topics_completion §4.A.2 (Batch 2):
+        # body drain at modules/body_worker.py:255-303 consumes 4 broadcasts
+        # (FILTER_DOWN, FOCUS_NUDGE, CONVERSATION_STIMULUS, INTERFACE_INPUT);
+        # MODULE_SHUTDOWN + QUERY are targeted.
         self.guardian.register(ModuleSpec(
             name="body",
             layer="L1",  # Microkernel v2 §A.5 — L1 Trinity daemon (5DT somatic)
@@ -673,6 +718,10 @@ class TitanPlugin:
             rss_limit_mb=800,   # was 500; fork-inherited parent memory grew from ~250MB to ~400MB+ (2026-04-17)
             autostart=True,  # Body senses must always be active
             lazy=False,
+            broadcast_topics=[
+                bus.FILTER_DOWN, bus.FOCUS_NUDGE,
+                bus.CONVERSATION_STIMULUS, bus.INTERFACE_INPUT,
+            ],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
@@ -684,6 +733,11 @@ class TitanPlugin:
             # mind shm fast-path is silently no-op).
             "microkernel": self._full_config.get("microkernel", {}),
         }
+        # rFP_worker_broadcast_topics_completion §4.A.2 (Batch 2):
+        # mind drain at modules/mind_worker.py:271-360 consumes 7 broadcasts
+        # (OUTER_SOURCES_SNAPSHOT, FILTER_DOWN, FOCUS_NUDGE,
+        # CONVERSATION_STIMULUS, INTERFACE_INPUT, SENSE_VISUAL, SENSE_AUDIO);
+        # MODULE_SHUTDOWN + QUERY are targeted.
         self.guardian.register(ModuleSpec(
             name="mind",
             layer="L1",  # Microkernel v2 §A.5 — L1 Trinity daemon (5DT cognitive)
@@ -692,6 +746,11 @@ class TitanPlugin:
             rss_limit_mb=700,   # was 500; fork-inherited parent RSS ~400MB left only 100MB headroom — caused T3 cascade (2026-04-17). Memory profiling tool (DEFERRED TOP) will identify real optimization targets.
             autostart=True,  # Mind senses should always be active
             lazy=False,
+            broadcast_topics=[
+                bus.OUTER_SOURCES_SNAPSHOT, bus.FILTER_DOWN, bus.FOCUS_NUDGE,
+                bus.CONVERSATION_STIMULUS, bus.INTERFACE_INPUT,
+                bus.SENSE_VISUAL, bus.SENSE_AUDIO,
+            ],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
@@ -718,6 +777,41 @@ class TitanPlugin:
             # even when the flags were flipped true in titan_params.toml.
             "microkernel": self._full_config.get("microkernel", {}),
         }
+        # rFP_worker_broadcast_topics_completion §4.A.5 (Batch 5):
+        # See legacy_core.py for full 57-type list; mirror exactly here.
+        # spirit_worker.py is queued for retirement in
+        # rFP_microkernel_v2_definitive_closure §4.D8-3.
+        _SPIRIT_BROADCAST_TOPICS = [
+            bus.ACTION_RESULT, bus.BODY_STATE,
+            bus.CGN_CROSS_INSIGHT, bus.CGN_HAOV_VERIFY_REQ,
+            bus.CGN_KNOWLEDGE_REQ, bus.CGN_KNOWLEDGE_RESP,
+            bus.CGN_STATE_SNAPSHOT, bus.CONFIG_RELOAD,
+            bus.CONTRACT_LIST_RESP, bus.CONVERSATION_STIMULUS,
+            bus.DREAM_WAKE_REQUEST, bus.EMOT_CGN_SIGNAL,
+            bus.EPOCH_TICK, bus.EXPERIENCE_STIMULUS,
+            bus.FILTER_DOWN_V5, bus.LANGUAGE_STATS_UPDATE,
+            bus.LLM_TEACHER_RESPONSE, bus.MAKER_DIALOGUE_COMPLETE,
+            bus.MAKER_NARRATION_RESULT, bus.MAKER_PROPOSAL_CREATED,
+            bus.MAKER_RESPONSE_RECEIVED, bus.MEDITATION_COMPLETE,
+            bus.MEMORY_RECALL_PERTURBATION, bus.META_CGN_SIGNAL,
+            bus.META_DIVERSITY_PRESSURE, bus.META_EUREKA,
+            bus.META_EVENT_REWARD, bus.META_LANGUAGE_REQUEST,
+            bus.META_LANGUAGE_REWARD, bus.META_OUTER_REWARD,
+            bus.META_PATTERN_EMERGED, bus.META_PERSONA_REWARD,
+            bus.META_REASON_OUTCOME, bus.META_REASON_REQUEST,
+            bus.META_REASON_RESPONSE, bus.META_STRATEGY_DRIFT,
+            bus.META_TEACHER_FEEDBACK, bus.META_TEACHER_GROUNDING,
+            bus.MIND_STATE, bus.MODULE_CRASHED,
+            bus.OUTER_BODY_STATE, bus.OUTER_MIND_STATE,
+            bus.OUTER_OBSERVATION, bus.OUTER_SPIRIT_STATE,
+            bus.OUTER_TRINITY_STATE, bus.RATE_LIMIT,
+            bus.REFLEX_REWARD, bus.RELOAD,
+            bus.SAVE_NOW, bus.SENSE_AUDIO,
+            bus.SOCIAL_PERCEPTION, bus.SPEAK_RESULT,
+            bus.STATE_SNAPSHOT, bus.TEACHER_SIGNALS,
+            bus.TIMECHAIN_QUERY_RESP, bus.X_FORCE_POST,
+            bus.X_POST_DISPATCH,
+        ]
         self.guardian.register(ModuleSpec(
             name="spirit",
             layer="L1",  # Microkernel v2 §A.5 — L1 Trinity daemon (consciousness core)
@@ -727,6 +821,7 @@ class TitanPlugin:
             autostart=True,  # Spirit awareness should always be active
             lazy=False,
             heartbeat_timeout=120.0,  # Spirit does heavy V4 work (LLM, on-chain)
+            broadcast_topics=_SPIRIT_BROADCAST_TOPICS,
         ))
 
         # cognitive_worker (L2) — Phase C C-S8 4B (chunk 8E skeleton, 2026-05-05).
@@ -781,41 +876,47 @@ class TitanPlugin:
                 broadcast_topics=_COGNITIVE_WORKER_SUBSCRIBE_TOPICS,
             ))
 
-            # chunk 8M.1 (2026-05-05): register C-S5 Python workers that own
-            # the 3 RegistrySpec shm slots missing from the live T3 inventory
-            # (titanvm_registers.bin / neuromod_state.bin / hormonal_state.bin).
-            # Workers exist as standalone files (ns_worker.py:205,
-            # neuromod_worker.py:159, hormonal_worker.py:177) but were never
-            # wired into _register_modules() — chunk 8M closes that gap.
-            # SPEC §9.B Python tree + §9.C contract.
-            #
-            # Boot order: AFTER cognitive_worker so the cognitive epoch driver
-            # can read fresh shm values written by these workers.
-            #
-            # broadcast_topics minimal — these workers only consume
-            # MODULE_SHUTDOWN from the bus (their state advances on internal
-            # tick from neuromodulator/hormonal/NS systems; bus integration is
-            # future work). Filtering to MODULE_SHUTDOWN avoids the same
-            # broker fan-out backpressure class as cognitive_worker.
-            from titan_plugin.modules.ns_worker import ns_worker_main
-            from titan_plugin.modules.neuromod_worker import neuromod_worker_main
-            from titan_plugin.modules.hormonal_worker import hormonal_worker_main
+        # Phase A+B compatibility (2026-05-08, rFP_trinity_130d_phase2_5_closure):
+        # The original chunk 8M.1 registration block was nested inside the
+        # `l0_rust_enabled` gate, which left T1+T2 (Phase A+B Python only,
+        # l0_rust_enabled=false) with hormonal_state.bin / neuromod_state.bin
+        # / titanvm_registers.bin slots EMPTY. spirit_proxy.get_trinity()
+        # post-Phase-C-Session-1 is SHM-direct — it reads those slots — so
+        # hormone_levels was being returned as zeros, cascading through
+        # outer_sources broadcast → mind_worker / outer_*_worker plugin_cache
+        # → 16+ inner_mind/outer_spirit dims classified PARTIAL.
+        #
+        # The workers themselves gate on `shm_*_enabled` (their own per-worker
+        # flag, all default true in titan_params.toml). So they're safe to
+        # register independent of l0_rust_enabled — that flag is about the
+        # Rust kernel-rs binary, not the Python state writers.
+        #
+        # SPEC §9.B Python tree + §9.C contract. Boot order: workers spawn
+        # alongside others; the SHM-direct producers don't depend on
+        # cognitive_worker boot order (they tick independently).
+        # broadcast_topics minimal — these workers only consume MODULE_SHUTDOWN
+        # from the bus.
+        from titan_plugin.modules.ns_worker import ns_worker_main
+        from titan_plugin.modules.neuromod_worker import neuromod_worker_main
+        from titan_plugin.modules.hormonal_worker import hormonal_worker_main
 
-            _cs5_worker_config = {
-                # Pass-through full config — workers read their own
-                # [neuromodulators] / [hormonal_pressure] / [neural_nervous_system]
-                # sections + microkernel.shm_*_enabled flags via _build_*_system.
-                **self._full_config,
-                # data_dir helper used by hormonal_worker to load/save persisted state.
-                "data_dir": self._full_config.get("memory_and_storage", {}).get(
-                    "data_dir", "./data"),
-            }
+        _state_worker_config = {
+            # Pass-through full config — workers read their own
+            # [neuromodulators] / [hormonal_pressure] / [neural_nervous_system]
+            # sections + microkernel.shm_*_enabled flags via _build_*_system.
+            **self._full_config,
+            # data_dir helper used by hormonal_worker to load/save persisted state.
+            "data_dir": self._full_config.get("memory_and_storage", {}).get(
+                "data_dir", "./data"),
+        }
+        _mk = self._full_config.get("microkernel", {}) or {}
 
+        if _mk.get("shm_ns_enabled", True):
             self.guardian.register(ModuleSpec(
                 name="ns_module",
                 layer="L2",  # NeuralNervousSystem owner — L2 cognitive support
                 entry_fn=ns_worker_main,
-                config=_cs5_worker_config,
+                config=_state_worker_config,
                 rss_limit_mb=400,   # NeuralReflexNet + 11 program registers; lean
                 autostart=True,     # Required for /v4/nervous-system + titanvm_registers slot
                 lazy=False,
@@ -823,11 +924,12 @@ class TitanPlugin:
                 start_method="spawn" if _spawn_grad else "fork",
                 broadcast_topics=[bus.MODULE_SHUTDOWN],
             ))
+        if _mk.get("shm_neuromod_enabled", True):
             self.guardian.register(ModuleSpec(
                 name="neuromod_module",
                 layer="L2",  # NeuromodulatorSystem owner
                 entry_fn=neuromod_worker_main,
-                config=_cs5_worker_config,
+                config=_state_worker_config,
                 rss_limit_mb=400,
                 autostart=True,     # Required for neuromod_state.bin slot freshness
                 lazy=False,
@@ -835,11 +937,12 @@ class TitanPlugin:
                 start_method="spawn" if _spawn_grad else "fork",
                 broadcast_topics=[bus.MODULE_SHUTDOWN],
             ))
+        if _mk.get("shm_hormonal_enabled", True):
             self.guardian.register(ModuleSpec(
                 name="hormonal_module",
                 layer="L2",  # HormonalSystem owner
                 entry_fn=hormonal_worker_main,
-                config=_cs5_worker_config,
+                config=_state_worker_config,
                 rss_limit_mb=400,
                 autostart=True,     # Required for hormonal_state.bin slot freshness
                 lazy=False,
@@ -854,6 +957,10 @@ class TitanPlugin:
                 os.path.dirname(__file__), "..", "..", "data", "media_queue"
             ),
         }
+        # rFP_worker_broadcast_topics_completion §4.A.2 (Batch 2):
+        # media drain at modules/media_worker.py:126-130 explicitly drops
+        # anything that isn't SHUTDOWN or QUERY (both targeted). Pure
+        # RPC-reply pattern — reply_only=True is canonical.
         self.guardian.register(ModuleSpec(
             name="media",
             layer="L3",  # Microkernel v2 §A.5 — L3 pluggable (expression: speech/art/music)
@@ -863,6 +970,7 @@ class TitanPlugin:
             autostart=True,   # Always on — art/audio generated frequently
             lazy=False,
             heartbeat_timeout=180.0,  # Image/audio digest can block 30-90s
+            reply_only=True,
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
             b2_1_swap_critical=False,  # M5: light-state worker; respawn-OK
         ))
@@ -872,6 +980,8 @@ class TitanPlugin:
             **self._full_config.get("language", {}),
             "data_dir": self._full_config.get("memory_and_storage", {}).get("data_dir", "./data"),
         }
+        # rFP_worker_broadcast_topics_completion §4.A.3 (Batch 3):
+        # See legacy_core.py for full type list; mirror exactly here.
         self.guardian.register(ModuleSpec(
             name="language",
             layer="L2",  # Microkernel v2 §A.5 — L2 higher cognition (Language Teacher)
@@ -886,6 +996,15 @@ class TitanPlugin:
             autostart=True,   # Language must be ready for SPEAK_REQUEST
             lazy=False,
             heartbeat_timeout=120.0,  # Teacher LLM calls can take 30s+
+            broadcast_topics=[
+                bus.SPEAK_REQUEST, bus.LLM_TEACHER_RESPONSE,
+                bus.META_LANGUAGE_RESULT, bus.MAKER_NARRATION_REQUEST,
+                bus.CGN_DREAM_CONSOLIDATE, bus.CGN_CROSS_INSIGHT,
+                bus.CGN_WEIGHTS_MAJOR, bus.CGN_KNOWLEDGE_RESP,
+                bus.QUERY_RESPONSE, bus.SOCIAL_PERCEPTION,
+                bus.CGN_SOCIAL_TRANSITION, bus.CGN_HAOV_VERIFY_REQ,
+                bus.META_REASON_RESPONSE, bus.EPOCH_TICK,
+            ],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
@@ -919,6 +1038,9 @@ class TitanPlugin:
                                       # timeout during Phase B memory warmup).
                                       # Teaching memory retrieval + LLM chain can
                                       # take ~60-120s under load; 180s = 2x margin.
+            # rFP_worker_broadcast_topics_completion §4.A.3 (Batch 3):
+            # one broadcast type (META_CHAIN_COMPLETE).
+            broadcast_topics=[bus.META_CHAIN_COMPLETE],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
@@ -931,6 +1053,8 @@ class TitanPlugin:
             "shm_write_on_every_outcome": True,
             **self._full_config.get("cgn", {}),
         }
+        # rFP_worker_broadcast_topics_completion §4.A.4 (Batch 4):
+        # See legacy_core.py for full type list; mirror exactly here.
         self.guardian.register(ModuleSpec(
             name="cgn",
             layer="L2",  # Microkernel v2 §A.5 — L2 concept-value state registry (per project_cgn_as_higher_state_registry.md)
@@ -946,6 +1070,12 @@ class TitanPlugin:
             lazy=False,
             heartbeat_timeout=60.0,
             reply_only=False,  # Receives broadcasts (CGN_CONSOLIDATE from spirit)
+            broadcast_topics=[
+                "CGN_TRANSITION", "CGN_REGISTER",
+                "CGN_CONSOLIDATE", "CGN_SURPRISE",
+                bus.CGN_HAOV_VERIFY_RSP, bus.CGN_INFERENCE_REQ,
+                bus.CGN_KNOWLEDGE_REQ,
+            ],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
@@ -971,6 +1101,8 @@ class TitanPlugin:
             # Knowledge Pipeline v2 (router/cache/health/budgets/alerts)
             **self._full_config.get("knowledge_pipeline", {}),
         }
+        # rFP_worker_broadcast_topics_completion §4.A.4 (Batch 4):
+        # See legacy_core.py for full type list; mirror exactly here.
         self.guardian.register(ModuleSpec(
             name="knowledge",
             layer="L3",  # Microkernel v2 §A.5 — L3 pluggable (rFP L3 "Knowledge search")
@@ -984,6 +1116,13 @@ class TitanPlugin:
             lazy=False,
             heartbeat_timeout=180.0,  # Research takes 10-45s + queue wait time
             reply_only=False,    # Receives CGN_KNOWLEDGE_REQ broadcasts
+            broadcast_topics=[
+                bus.CGN_KNOWLEDGE_REQ, bus.META_REASON_RESPONSE,
+                bus.CGN_KNOWLEDGE_USAGE, bus.CGN_HAOV_VERIFY_REQ,
+                bus.SEARCH_PIPELINE_BUDGET_RESET, bus.CGN_WEIGHTS_MAJOR,
+                bus.CGN_CROSS_INSIGHT, bus.KNOWLEDGE_QUERY_CONCEPT,
+                bus.KNOWLEDGE_SEARCH, bus.KNOWLEDGE_CONCEPTS_FOR_PERSON,
+            ],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
@@ -991,6 +1130,8 @@ class TitanPlugin:
         timechain_config = {
             **self._full_config.get("timechain", {}),
         }
+        # rFP_worker_broadcast_topics_completion §4.A.4 (Batch 4 — heaviest):
+        # See legacy_core.py for full 23-type list; mirror exactly here.
         self.guardian.register(ModuleSpec(
             name="timechain",
             layer="L2",  # Microkernel v2 §A.5 — L2 cognitive substrate (episodic/declarative/procedural forks)
@@ -1001,6 +1142,23 @@ class TitanPlugin:
             lazy=False,
             heartbeat_timeout=120.0,  # Extended: integrity check + healing takes ~60s
             reply_only=False,     # Receives EPOCH_TICK, TIMECHAIN_COMMIT, etc.
+            broadcast_topics=[
+                # System-upgrade events (5)
+                bus.SYSTEM_UPGRADE_QUEUED, bus.SYSTEM_UPGRADE_STARTING,
+                bus.SYSTEM_RESUMED, bus.SYSTEM_UPGRADE_PENDING_DEFERRED,
+                bus.SYSTEM_UPGRADE_THOUGHT,
+                # Core timechain events (7)
+                bus.TIMECHAIN_COMMIT, bus.EPOCH_TICK, bus.DREAM_STATE_CHANGED,
+                bus.MEDITATION_COMPLETE, bus.EXPRESSION_FIRED,
+                bus.TIMECHAIN_STATUS, bus.TIMECHAIN_QUERY,
+                # Timechain query ops (5)
+                bus.TIMECHAIN_RECALL, bus.TIMECHAIN_CHECK,
+                bus.TIMECHAIN_COMPARE, bus.TIMECHAIN_AGGREGATE,
+                bus.TIMECHAIN_SIMILAR,
+                # Contract events (6)
+                bus.CONTRACT_DEPLOY, bus.CONTRACT_LIST, bus.CONTRACT_STATUS,
+                bus.CONTRACT_PROPOSE, bus.CONTRACT_APPROVE, bus.CONTRACT_VETO,
+            ],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
@@ -1057,6 +1215,10 @@ class TitanPlugin:
                     _emot_titan_id = _json_id.load(_idf).get("titan_id", "T1")
         except Exception:
             pass
+        # rFP_worker_broadcast_topics_completion §4.A.3 (Batch 3):
+        # See legacy_core.py for full type list; mirror exactly here.
+        from titan_plugin.logic.emot_kin_protocol import (
+            KIN_EMOT_STATE_MSG_TYPE)
         self.guardian.register(ModuleSpec(
             name="emot_cgn",
             layer="L2",  # Microkernel v2 §A.5 — L2 CGN consumer (emotional grounding)
@@ -1074,6 +1236,12 @@ class TitanPlugin:
             lazy=False,
             heartbeat_timeout=90.0,
             reply_only=False,    # Subscribes to EMOT_CHAIN_EVIDENCE + FELT_CLUSTER_UPDATE (Phase 1.6d)
+            broadcast_topics=[
+                bus.EMOT_CHAIN_EVIDENCE, bus.FELT_CLUSTER_UPDATE,
+                bus.META_REASON_RESPONSE, bus.CGN_HAOV_VERIFY_REQ,
+                bus.CGN_CROSS_INSIGHT, KIN_EMOT_STATE_MSG_TYPE,
+                bus.HORMONE_FIRED, bus.CGN_BETA_SNAPSHOT,
+            ],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
@@ -3513,6 +3681,19 @@ class TitanPlugin:
                 _sb = sources["anchor_state"].get("sol_balance")
                 if isinstance(_sb, (int, float)):
                     sources["sol_balance"] = float(_sb)
+                # rFP_trinity_130d_phase2_5_closure §4 (chunk 2.5.D) —
+                # SPEC §23.9 SAT[10] recovery_speed reads
+                # `recovery_stats.consecutive_failures`. Derive from
+                # anchor_state's consecutive_failures (single source of
+                # truth) so the dim is no longer ABSENT-classified on T1.
+                _cf = sources["anchor_state"].get("consecutive_failures", 0)
+                sources["recovery_stats"] = {
+                    "consecutive_failures": int(_cf or 0),
+                    "last_anchor_time": sources["anchor_state"].get(
+                        "last_anchor_time", 0.0),
+                    "anchor_count": int(
+                        sources["anchor_state"].get("anchor_count", 0) or 0),
+                }
         except Exception:
             pass
 
@@ -3616,9 +3797,36 @@ class TitanPlugin:
                 sources["meta_cgn_stats"] = meta_payload["meta_cgn"]
 
         # Language stats (vocab, composition_level, teacher_sessions, ...).
+        # Bus event LANGUAGE_STATS_UPDATED fires only on teacher activity
+        # (irregular cadence — minutes between bursts). For dim formulas
+        # that need always-fresh language state we fall back to the
+        # language_state.bin SHM slot (Phase C Session 4 publisher).
         lang_payload = cache.get("LANGUAGE_STATS_UPDATED")
         if isinstance(lang_payload, dict):
             sources["language_stats"] = lang_payload
+        else:
+            # rFP_trinity_130d_phase2_5_closure §4 Chunk 2.5.D — SHM
+            # fallback so language_stats input is never ABSENT-classified.
+            try:
+                if not hasattr(self, "_r_language_state"):
+                    from titan_plugin.core.state_registry import (
+                        StateRegistryReader, ensure_shm_root, resolve_titan_id,
+                    )
+                    from titan_plugin.logic.language_state_publisher import (
+                        LANGUAGE_STATE_SPEC,
+                    )
+                    self._r_language_state = StateRegistryReader(
+                        LANGUAGE_STATE_SPEC,
+                        ensure_shm_root(resolve_titan_id()),
+                    )
+                blob = self._r_language_state.read_variable()
+                if blob:
+                    import msgpack as _mp
+                    payload = _mp.unpackb(blob, raw=False)
+                    if isinstance(payload, dict) and payload:
+                        sources["language_stats"] = payload
+            except Exception:
+                pass
 
         # Output verifier (verified_count / rejected_count).
         ov_payload = cache.get("OUTPUT_VERIFIER_STATS")
@@ -3717,16 +3925,43 @@ class TitanPlugin:
                 # to a delegation marker on T2/T3 — honestly reflecting
                 # that ANANDA[36, 38] are T1-canonical dims by design.
                 try:
-                    sxg = getattr(self, "_social_x_gateway_reader", None)
-                    if sxg is not None and hasattr(sxg, "get_community_engagement_stats"):
-                        _tid = (self.kernel.titan_id
-                                if hasattr(self, "kernel") and self.kernel
-                                else (self._titan_id
-                                      if hasattr(self, "_titan_id") else "T1"))
-                        _is_x_gateway = (str(_tid).upper() == "T1")
-                        self._heavy_stats_cache["community_engagement_stats"] = (
-                            sxg.get_community_engagement_stats(
-                                is_x_gateway=_is_x_gateway))
+                    _tid = (self.kernel.titan_id
+                            if hasattr(self, "kernel") and self.kernel
+                            else (self._titan_id
+                                  if hasattr(self, "_titan_id") else "T1"))
+                    _tid_str = str(_tid).upper()
+                    if _tid_str == "T1":
+                        # T1 owns social_x.db + events_teacher.db locally.
+                        sxg = getattr(self, "_social_x_gateway_reader", None)
+                        if (sxg is not None
+                                and hasattr(sxg, "get_community_engagement_stats")):
+                            self._heavy_stats_cache["community_engagement_stats"] = (
+                                sxg.get_community_engagement_stats(
+                                    is_x_gateway=True, titan_id="T1"))
+                    else:
+                        # Phase 2.5.E (rFP_trinity_130d_phase2_5_closure §5) —
+                        # T2/T3 reach T1 over HTTP for their own per-Titan
+                        # author-attributed slice of mention_tracking +
+                        # engagement_snapshots. Cached at 60s cadence
+                        # (G19/G20 — no per-tick HTTP).
+                        try:
+                            import urllib.request as _ur
+                            import json as _json
+                            _t1_addr = "http://10.135.0.3:7777"
+                            _url = (f"{_t1_addr}/v4/community-engagement-stats"
+                                    f"?titan_id={_tid_str}")
+                            _resp = _ur.urlopen(_url, timeout=8.0)
+                            _body = _json.loads(_resp.read())
+                            if _body.get("status") == "ok":
+                                stats = _body.get("data") or {}
+                                stats["gateway_role"] = "kin-rpc"
+                                stats["titan_id"] = _tid_str
+                                self._heavy_stats_cache[
+                                    "community_engagement_stats"] = stats
+                        except Exception as _http_e:
+                            logger.debug(
+                                "[HeavyStats] community_engagement HTTP-to-T1: %s",
+                                _http_e)
                 except Exception as _e:
                     logger.debug("[HeavyStats] community_engagement refresh: %s", _e)
                 time.sleep(60)
@@ -3823,28 +4058,49 @@ class TitanPlugin:
     def _read_inner_memory_stats(self) -> dict:
         """Read inner_memory.db stats (action_chains, vocabulary, creative_works).
 
-        Cached for 30s — SQLite COUNT(*) queries are cheap but not free, and
-        the dim formulas don't need sub-30s freshness. The InnerMemoryStore
-        instance is held persistently to avoid connection churn (WAL allows
-        concurrent readers).
+        Cached for 30s — direct read-only sqlite COUNT(*) queries via a
+        thin connection (no full InnerMemoryStore init — that init runs
+        schema migrations + IMW client setup which deadlocks against
+        the live store on the same DB file when called from heavy_stats
+        refresher thread).
+
+        rFP_trinity_130d_phase2_5_closure §4 Chunk 2.5.D (2026-05-08):
+        switched from InnerMemoryStore.get_stats() to direct sqlite
+        connection because the full Store init takes >30s on the 1.1GB
+        DB and lock-contends with the existing reader instance from
+        memory_worker. The dim formulas only need raw counts — the
+        thin path is sufficient.
         """
         cache = getattr(self, "_inner_memory_stats_cache", {})
         now = time.time()
         if cache.get("_ts", 0) > now - 30:
             return cache["stats"]
+        stats: dict = {}
         try:
-            store = getattr(self, "_inner_memory_reader", None)
-            if store is None:
-                from titan_plugin.logic.inner_memory import InnerMemoryStore
-                db_path = os.path.join(os.path.dirname(__file__), "..", "..",
-                                        "data", "inner_memory.db")
-                if not os.path.exists(db_path):
-                    return {}
-                self._inner_memory_reader = InnerMemoryStore(db_path)
-                store = self._inner_memory_reader
-            stats = store.get_stats()
+            import sqlite3 as _sql
+            db_path = os.path.join(os.path.dirname(__file__), "..", "..",
+                                    "data", "inner_memory.db")
+            if not os.path.exists(db_path):
+                return stats
+            # Read-only URI mode + busy_timeout 2s. Avoids Store-init churn.
+            conn = _sql.connect(
+                f"file:{db_path}?mode=ro&immutable=0",
+                uri=True, timeout=2.0,
+            )
+            try:
+                conn.execute("PRAGMA busy_timeout=2000")
+                for table in ("hormone_snapshots", "program_fires",
+                               "action_chains", "creative_works",
+                               "event_markers", "vocabulary"):
+                    try:
+                        c = conn.execute(f"SELECT COUNT(*) FROM {table}")
+                        stats[table] = int(c.fetchone()[0])
+                    except Exception:
+                        stats[table] = 0
+            finally:
+                conn.close()
         except Exception:
-            stats = {}
+            stats = {"_error": "thin_read_failed"}
         self._inner_memory_stats_cache = {"_ts": now, "stats": stats}
         return stats
 

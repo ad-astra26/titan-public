@@ -1,0 +1,45 @@
+[package]
+name = "titan-trinity-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Trinity substrate L1a binary — Schumann clocks + fast bus + topology + sphere clocks. Supervised by titan-kernel-rs."
+build = "build.rs"
+
+[lib]
+name = "titan_trinity_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "titan-trinity-rs"
+path = "src/main.rs"
+
+[dependencies]
+titan-core = { path = "../titan-core" }
+titan-bus = { path = "../titan-bus" }
+titan-fastbus = { path = "../titan-fastbus" }
+titan-schumann = { path = "../titan-schumann" }
+titan-state = { path = "../titan-state" }
+nix = { workspace = true, features = ["signal", "process"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "time", "macros", "sync", "process"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+hex.workspace = true
+once_cell.workspace = true
+rmpv.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "signal", "time", "macros", "sync", "process"] }
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+
+[lints]
+workspace = true

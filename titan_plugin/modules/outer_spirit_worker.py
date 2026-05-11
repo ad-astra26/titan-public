@@ -378,6 +378,14 @@ def _collect_tick(
         world_footprint_inputs=world_footprint_inputs,
         deltas_24h=deltas_24h,
         llm_calls_this_hour=int(agency.get("llm_calls_this_hour", 0) or 0),
+        # rFP_trinity_130d_phase2_5_closure §4 (chunk 2.5.D) — pass
+        # recovery_stats explicitly. SPEC §23.9 SAT[10] recovery_speed
+        # reads recovery_stats.consecutive_failures. Plugin populates
+        # this from anchor_state in _gather_outer_sources (commit
+        # 3d992464). Pre-2.5.D this kwarg was missing entirely from the
+        # call site, so the formula always saw None → input ABSENT in
+        # four-state classifier.
+        recovery_stats=snap.get("recovery_stats"),
     )
 
     # rFP_trinity_130d_awakening Phase 2 (CHIT[29] self_trajectory).

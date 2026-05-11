@@ -136,7 +136,44 @@ def collect_outer_spirit_45d(
                              outer_body_coh, outer_mind_coh, combined_coh,
                              bus_s, mcgn, cgn_s, lang, mem_growth, llm_calls_this_hour, dlt)
 
-    return sat + chit + ananda
+    tensor_45d = sat + chit + ananda
+    # Phase 2.5.A — record firing for /v4/debug/dim-sources diagnostics.
+    try:
+        from titan_plugin.api.dim_registry import get_firing_tracker
+        get_firing_tracker().record_block(
+            "outer_spirit",
+            tensor_45d,
+            {
+                "action_stats": action_stats,
+                "creative_stats": creative_stats,
+                "guardian_stats": guardian_stats,
+                "sovereignty_ratio": sovereignty_ratio,
+                "uptime_ratio": uptime_ratio,
+                "recovery_stats": recovery_stats,
+                "social_stats": social_stats,
+                "memory_stats": memory_stats,
+                "hormone_levels": hormone_levels,
+                "solana_stats": solana_stats,
+                "assessment_stats": assessment_stats,
+                "history": history,
+                "anchor_state": anchor_state,
+                "bus_stats": bus_stats,
+                "cgn_stats": cgn_stats,
+                "meta_cgn_stats": meta_cgn_stats,
+                "language_stats": language_stats,
+                "memory_growth_metrics": memory_growth_metrics,
+                "knowledge_graph_stats": knowledge_graph_stats,
+                "inner_memory_stats": inner_memory_stats,
+                "jailbreak_alerts_stats": jailbreak_alerts_stats,
+                "output_verifier_stats": output_verifier_stats,
+                "world_footprint_inputs": world_footprint_inputs,
+                "deltas_24h": deltas_24h,
+                "llm_calls_this_hour": llm_calls_this_hour,
+            },
+        )
+    except Exception:
+        pass
+    return tensor_45d
 
 
 def _collect_sat(spirit, body, mind, acts, crea, guard, sovereignty,

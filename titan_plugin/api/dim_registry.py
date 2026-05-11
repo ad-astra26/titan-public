@@ -29,7 +29,10 @@ Layout (matches SPEC §23 + UnifiedSpirit.full_130dt order):
 """
 from __future__ import annotations
 
-from typing import Iterator, NamedTuple
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Iterator, NamedTuple, Optional
 
 # Block layout (start_index, length, block_name).
 _BLOCKS: list[tuple[int, int, str]] = [
@@ -210,3 +213,452 @@ def get_block_for_full_index(full_index: int) -> tuple[str, int]:
 assert sum(L for _, L, _ in _BLOCKS) == 130, (
     "registry block layout does not sum to 130 dims"
 )
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Phase 2.5.A — Producer-firing tracker
+# rFP_trinity_130d_phase2_5_closure §2.1, §2.2
+# ────────────────────────────────────────────────────────────────────────────
+#
+# Tracks per-tensor-block firing (last_call_ts + calls_total + inputs state)
+# and per-dim values, so the Phase 2.5.B four-state classifier can decide
+# whether a dim sitting at its SPEC default is ALIVE_AT_DEFAULT (producer
+# firing) vs SILENT (producer dead). Process-local; no SHM (G18-G22 says
+# state transport is SHM, but this is purely diagnostic in the API process,
+# not load-bearing for any consumer).
+
+# Per-block input-arg names (the keyword args each tensor function takes).
+# Used by /v4/debug/dim-sources to render per-input state. Order is from
+# the tensor function signature; only the "producer-bearing" args are listed
+# (current_*d / body_tensor / mind_tensor are intra-trinity, not producers).
+#
+# These names MUST match the keys passed by each tensor function's
+# `record_block(...)` call. Adding a name here without a matching key in
+# the call site → that input will always show as "absent" in the endpoint.
+_BLOCK_INPUT_NAMES: dict[str, list[str]] = {
+    "inner_body": [
+        # body_worker._collect_body_tensor — single composite "body_state"
+        "body_state",
+    ],
+    "inner_mind": [
+        "audio_state", "interaction_quality", "visual_state",
+        "assessment_quality", "ambient_change", "hormone_levels",
+    ],
+    "inner_spirit": [
+        "consciousness", "topology", "hormone_levels", "hormone_fires",
+        "unified_spirit_stats", "sphere_clocks", "memory_stats",
+        "expression_stats", "birth_state", "history",
+    ],
+    "outer_body": [
+        "anchor_state", "timechain_v2_stats", "network_monitor",
+        "system_sensor", "agency_stats", "hormone_levels", "circadian_stats",
+    ],
+    "outer_mind": [
+        "meta_cgn_stats", "cgn_stats", "memory_stats", "agency_stats",
+        "events_teacher_stats", "social_x_gateway_stats", "language_stats",
+        "vocab_stats", "knowledge_graph_stats", "verifier_stats",
+        "reflex_stats", "jailbreak_stats",
+    ],
+    "outer_spirit": [
+        "action_stats", "creative_stats", "guardian_stats",
+        "sovereignty_ratio", "uptime_ratio", "recovery_stats", "social_stats",
+        "memory_stats", "hormone_levels", "solana_stats", "assessment_stats",
+        "history", "anchor_state", "bus_stats", "cgn_stats",
+        "meta_cgn_stats", "language_stats", "memory_growth_metrics",
+        "knowledge_graph_stats", "inner_memory_stats", "jailbreak_alerts_stats",
+        "output_verifier_stats", "world_footprint_inputs", "deltas_24h",
+        "llm_calls_this_hour",
+    ],
+}
+
+
+@dataclass
+class DimFiringRecord:
+    """Per-dim firing snapshot. Updated every time a tensor block fires.
+
+    The four-state classifier (Chunk 2.5.B) consumes this to decide:
+        ALIVE              ← |last_value − spec_default| ≥ EPSILON
+        ALIVE_AT_DEFAULT   ← within EPSILON, block fired ≤ firing_window_s ago,
+                             no inputs ABSENT
+        PARTIAL            ← within EPSILON, block fired recently, ≥1 input ABSENT
+        SILENT             ← within EPSILON, block has not fired in firing_window_s
+        GHOST              ← producer not registered (should never happen post-Phase-2)
+    """
+    full_index: int
+    name: str
+    block: str
+    block_index: int
+    spec_default: float
+    spec_section: str
+    last_value: Optional[float] = None
+    last_value_ts: Optional[float] = None  # epoch when block last produced
+
+
+@dataclass
+class BlockFiringRecord:
+    """Per-block firing metadata. One per tensor block (6 total)."""
+    block: str
+    last_call_ts: Optional[float] = None
+    calls_total: int = 0
+    last_inputs_state: dict[str, str] = field(default_factory=dict)
+    # last_inputs_state values: "real" (non-None, has content) | "default"
+    # (passed but matches a SPEC default like 0.5/1.0/empty-dict) | "absent"
+    # (None or not passed).
+
+
+def _classify_input(name: str, value: Any) -> str:
+    """Classify an input arg value as 'real' | 'default' | 'absent'.
+
+    rFP §2.2 three-state classification. Conservative heuristics here; the
+    four-state classifier (2.5.B) can refine per-input as needed.
+    """
+    if value is None:
+        return "absent"
+    # Empty dict / list = absent (producer didn't populate)
+    if isinstance(value, (dict, list)) and not value:
+        return "absent"
+    # Numeric defaults (the "neutral" values from rFP §2.2):
+    #   0.5 = mid-range default, 0.0 = cold-start zero, 1.0 = full-presence
+    if isinstance(value, (int, float)):
+        # Specific neutral values that producers return when their underlying
+        # data source is absent. Treat these as DEFAULT (not REAL).
+        if value in (0.5, 0.0, 1.0) and name in {
+            "interaction_quality", "assessment_quality", "ambient_change",
+            "sovereignty_ratio", "uptime_ratio",
+        }:
+            return "default"
+        return "real"
+    # Dict/list with content = real
+    return "real"
+
+
+class DimFiringTracker:
+    """Process-local tracker + SHM publisher. Phase 2.5.A.2 closes the
+    ``api_process_separation_enabled=true`` blind-spot where the API
+    process couldn't see in-memory tracker state from worker subprocesses.
+
+    Each tensor block has a dedicated SHM slot (``<block>_firing.bin``);
+    the tracker writes the block's slot every time ``record_block`` runs
+    in the worker that owns that block. Single-writer per G21 — each
+    block's tensor function lives in exactly one worker process.
+
+    Thread-safe: tensor producers may call ``record_block`` from multiple
+    worker threads (body, mind, spirit each tick on their own loops).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._dims: dict[int, DimFiringRecord] = {}
+        self._blocks: dict[str, BlockFiringRecord] = {}
+        # Initialize all 130 dim records + 6 block records from the
+        # canonical registry — guarantees the endpoint always returns
+        # the full 130 even before any tensor has fired.
+        for entry in iter_registry():
+            self._dims[entry.full_index] = DimFiringRecord(
+                full_index=entry.full_index,
+                name=entry.name,
+                block=entry.block,
+                block_index=entry.block_index,
+                spec_default=entry.default_value,
+                spec_section=entry.spec_section,
+            )
+        for _, _, block_name in _BLOCKS:
+            self._blocks[block_name] = BlockFiringRecord(block=block_name)
+        # Per-block SHM writer state. Lazy-init on first record_block call
+        # in each worker process (so each block's writer is created in
+        # the worker that owns the tensor — single-writer per slot).
+        # Per-block: None = unattempted, False = init failed (don't retry),
+        # writer instance = ready.
+        self._shm_writers: dict[str, Any] = {}
+        self._shm_init_failed: set[str] = set()
+        # Stats for tests + diagnostics.
+        self._shm_writes_total = 0
+        self._shm_write_failures = 0
+
+    def record_block(
+        self,
+        block: str,
+        values: list[float],
+        inputs: dict[str, Any],
+        ts: Optional[float] = None,
+    ) -> None:
+        """Called by each tensor producer immediately after computing values.
+
+        Args:
+            block: 'inner_body' | 'inner_mind' | 'inner_spirit' |
+                   'outer_body' | 'outer_mind' | 'outer_spirit'
+            values: Tensor values for the block (length matches block size).
+            inputs: Map of input_arg_name → value passed to the tensor function.
+                    Args not in _BLOCK_INPUT_NAMES[block] are ignored;
+                    args in the list but missing from this dict are 'absent'.
+            ts: Override timestamp (default time.time()). Used by tests.
+        """
+        if block not in self._blocks:
+            return  # unknown block — ignore (defensive)
+        ts = ts if ts is not None else time.time()
+        # Classify each input
+        expected = _BLOCK_INPUT_NAMES.get(block, [])
+        inputs_state: dict[str, str] = {}
+        for name in expected:
+            if name not in inputs:
+                inputs_state[name] = "absent"
+            else:
+                inputs_state[name] = _classify_input(name, inputs[name])
+        # Find block layout
+        block_start = None
+        block_len = None
+        for start, length, name in _BLOCKS:
+            if name == block:
+                block_start = start
+                block_len = length
+                break
+        if block_start is None or block_len is None:
+            return
+        with self._lock:
+            br = self._blocks[block]
+            br.last_call_ts = ts
+            br.calls_total += 1
+            br.last_inputs_state = inputs_state
+            # Update per-dim values
+            for i in range(min(block_len, len(values))):
+                full_idx = block_start + i
+                rec = self._dims.get(full_idx)
+                if rec is None:
+                    continue
+                try:
+                    rec.last_value = float(values[i])
+                except (TypeError, ValueError):
+                    rec.last_value = None
+                rec.last_value_ts = ts
+            # Snapshot block payload while still holding the lock so the
+            # SHM write reflects this tick's state atomically.
+            payload = self._block_payload_locked(block, ts)
+        # Phase 2.5.A.2 — write block's SHM slot. Outside the lock to
+        # avoid holding it during mmap I/O. Diagnostic-only — never
+        # raise back to the tensor producer.
+        try:
+            self._publish_block_shm(block, payload)
+        except Exception:
+            self._shm_write_failures += 1
+
+    def _block_payload_locked(self, block: str, ts: float) -> dict:
+        """Build the msgpack-encodable payload for a block's SHM slot.
+        Caller must hold ``self._lock``.
+        """
+        block_start = None
+        block_len = None
+        for start, length, name in _BLOCKS:
+            if name == block:
+                block_start = start
+                block_len = length
+                break
+        if block_start is None or block_len is None:
+            return {}
+        br = self._blocks.get(block)
+        dims_payload = []
+        for i in range(block_len):
+            rec = self._dims.get(block_start + i)
+            if rec is None:
+                dims_payload.append({"v": None, "ts": None})
+            else:
+                dims_payload.append({
+                    "v": rec.last_value,
+                    "ts": rec.last_value_ts,
+                })
+        return {
+            "block": block,
+            "block_calls_total": br.calls_total if br else 0,
+            "block_last_call_ts": br.last_call_ts if br else None,
+            "inputs_state": dict(br.last_inputs_state) if br else {},
+            "dims": dims_payload,
+            "ts": ts,
+        }
+
+    def _publish_block_shm(self, block: str, payload: dict) -> None:
+        """Encode + write block payload to its SHM slot. Lazy-inits the
+        writer on first call in this process. Single-writer per block
+        per G21 (each block's tensor runs in exactly one worker).
+
+        Phase C (microkernel.l0_rust_enabled=true): Rust trinity daemons
+        own the firing slot writes via titan_trinity_daemon::FiringSlotWriter
+        (rFP_phase_c_130d_rust_l1_port.md §4.7). Python tracker no-ops the
+        SHM write to preserve single-writer-per-slot G21 invariant. The
+        Python tracker's in-memory state still updates for diagnostics
+        (record_block path is unchanged) — only the SHM publish is gated.
+
+        Under l0_rust_enabled=false (Phase A+B / T1+T2 today), Python
+        remains the sole writer of *_firing.bin slots.
+        """
+        if _l0_rust_enabled():
+            # Phase C: Rust trinity daemon owns the slot per G21. No-op.
+            return
+        if block in self._shm_init_failed:
+            return
+        writer = self._shm_writers.get(block)
+        if writer is None:
+            try:
+                from titan_plugin.core.state_registry import (
+                    StateRegistryWriter, ensure_shm_root, resolve_titan_id,
+                )
+                from titan_plugin.logic.dim_firing_state_specs import (
+                    DIM_FIRING_SPEC_BY_BLOCK,
+                )
+                spec = DIM_FIRING_SPEC_BY_BLOCK.get(block)
+                if spec is None:
+                    self._shm_init_failed.add(block)
+                    return
+                titan_id = resolve_titan_id()
+                shm_root = ensure_shm_root(titan_id)
+                writer = StateRegistryWriter(spec, shm_root)
+                self._shm_writers[block] = writer
+            except Exception:
+                self._shm_init_failed.add(block)
+                return
+        try:
+            import msgpack
+            blob = msgpack.packb(payload, use_bin_type=True)
+            spec = writer.spec
+            if len(blob) > spec.payload_bytes:
+                # Truncate dims_payload to fit if oversized — diagnostic
+                # only, never block tensor production. Should not happen
+                # at sane block sizes (constants chosen with 4× headroom).
+                self._shm_write_failures += 1
+                return
+            writer.write_variable(blob)
+            self._shm_writes_total += 1
+        except Exception:
+            self._shm_write_failures += 1
+
+    def get_dim_record(self, full_index: int) -> Optional[DimFiringRecord]:
+        with self._lock:
+            return self._dims.get(full_index)
+
+    def get_all_dim_records(self) -> list[DimFiringRecord]:
+        with self._lock:
+            return [self._dims[i] for i in range(130) if i in self._dims]
+
+    def get_block_record(self, block: str) -> Optional[BlockFiringRecord]:
+        with self._lock:
+            return self._blocks.get(block)
+
+    def get_all_block_records(self) -> dict[str, BlockFiringRecord]:
+        with self._lock:
+            return dict(self._blocks)
+
+    def reset(self) -> None:
+        """Reset the tracker (test hook)."""
+        with self._lock:
+            self.__init__()
+
+
+# Phase C gate — read once per process, cached. The microkernel.l0_rust_enabled
+# flag is set at deployment via ~/.titan/microkernel_<TITAN_ID>.toml; it never
+# flips at runtime within a process. Cache avoids load_titan_config() overhead
+# in the per-tick record_block hot path.
+_L0_RUST_ENABLED_CACHE: Optional[bool] = None
+
+
+def _l0_rust_enabled() -> bool:
+    """Read microkernel.l0_rust_enabled from titan config; cached.
+
+    Used by DimFiringTracker._publish_block_shm to gate Phase C single-writer
+    invariant per G21: under l0_rust_enabled=true, the Rust trinity daemons
+    own the *_firing.bin slot writes via titan_trinity_daemon::FiringSlotWriter
+    (rFP_phase_c_130d_rust_l1_port.md §4.7); Python tracker no-ops the SHM
+    publish to avoid double-writing the slot.
+
+    Returns False on config-load failure (defensive — Phase A+B fallback path
+    keeps Python writing the slot).
+    """
+    global _L0_RUST_ENABLED_CACHE
+    if _L0_RUST_ENABLED_CACHE is not None:
+        return _L0_RUST_ENABLED_CACHE
+    try:
+        from titan_plugin.config_loader import load_titan_config
+        config = load_titan_config()
+        _L0_RUST_ENABLED_CACHE = bool(
+            config.get("microkernel", {}).get("l0_rust_enabled", False)
+        )
+    except Exception:
+        _L0_RUST_ENABLED_CACHE = False
+    return _L0_RUST_ENABLED_CACHE
+
+
+# Process-singleton accessor.
+_TRACKER: Optional[DimFiringTracker] = None
+_TRACKER_LOCK = threading.Lock()
+
+
+def get_firing_tracker() -> DimFiringTracker:
+    """Return the process-local singleton tracker. Lazy-initialized."""
+    global _TRACKER
+    if _TRACKER is None:
+        with _TRACKER_LOCK:
+            if _TRACKER is None:
+                _TRACKER = DimFiringTracker()
+    return _TRACKER
+
+
+def reset_firing_tracker() -> None:
+    """Reset the singleton (test hook)."""
+    global _TRACKER
+    with _TRACKER_LOCK:
+        _TRACKER = None
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# SHM reader — used by /v4/debug/dim-sources endpoint in the api_subprocess.
+# Reads the per-block firing slots written by tensor producers in their
+# respective worker processes. Returns the same shape as the in-process
+# tracker would produce, so the endpoint code can stay block-agnostic.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+_SHM_READERS: dict[str, Any] = {}
+
+
+def read_all_blocks_from_shm() -> dict[str, dict]:
+    """Read every block's firing slot via StateRegistryReader.
+
+    Returns dict keyed by block name; each value is the msgpack-decoded
+    payload as written by ``DimFiringTracker._publish_block_shm``.
+    Blocks whose slot is unavailable/empty return an empty dict for that
+    block — callers should fall back to spec defaults for those dims.
+
+    Lazy-inits readers on first call in the calling process; readers are
+    multi-reader-safe (G21 contract). Cached for the process lifetime.
+    """
+    try:
+        from titan_plugin.core.state_registry import (
+            StateRegistryReader, ensure_shm_root, resolve_titan_id,
+        )
+        from titan_plugin.logic.dim_firing_state_specs import (
+            DIM_FIRING_SPEC_BY_BLOCK,
+        )
+    except Exception:
+        return {}
+    out: dict[str, dict] = {}
+    try:
+        titan_id = resolve_titan_id()
+        shm_root = ensure_shm_root(titan_id)
+    except Exception:
+        return {}
+    import msgpack
+    for block, spec in DIM_FIRING_SPEC_BY_BLOCK.items():
+        reader = _SHM_READERS.get(block)
+        if reader is None:
+            try:
+                reader = StateRegistryReader(spec, shm_root)
+                _SHM_READERS[block] = reader
+            except Exception:
+                continue
+        try:
+            blob = reader.read_variable()
+            if blob is None or len(blob) == 0:
+                continue
+            payload = msgpack.unpackb(blob, raw=False)
+            if isinstance(payload, dict):
+                out[block] = payload
+        except Exception:
+            continue
+    return out

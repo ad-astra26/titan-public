@@ -234,6 +234,45 @@ class SpiritAccessor(_SubAccessorBase):
             real = self._cache.get(cache_key, None)
             if isinstance(real, dict) and real:
                 coord[coord_key] = real
+
+        # rFP_worker_broadcast_topics_completion §4.D abstraction-completion
+        # (2026-05-10): SHM overlay for neural_nervous_system + resonance +
+        # unified_spirit. These don't have *_UPDATED bus events on T3 under
+        # l0_rust_enabled=true (spirit_worker is heartbeat-only) so the
+        # cache-only overlay map can't catch them. Read the same source the
+        # publisher writes (spirit_supplemental_state.bin nervous_system
+        # section + resonance_state.bin + unified_spirit_metadata.bin) —
+        # mirrors get_sphere_clocks SHM-first pattern. Fixes /status
+        # `lifetime.neural_maturity` + `lifetime.neural_train_steps` which
+        # read `_coord.get("neural_nervous_system", {})` and were 0 on T3.
+        try:
+            supplemental = self._shm.read_spirit_supplemental()
+            if supplemental is not None:
+                ns_section = supplemental.get("nervous_system")
+                if isinstance(ns_section, dict) and ns_section:
+                    coord["neural_nervous_system"] = ns_section
+                # The supplemental's "coordinator" section has 27 keys
+                # mirroring InnerTrinityCoordinator state — merge it ONLY
+                # for fields not already populated by per-event overlays.
+                supp_coord = supplemental.get("coordinator")
+                if isinstance(supp_coord, dict):
+                    for k, v in supp_coord.items():
+                        coord.setdefault(k, v)
+            res = self._shm.read_resonance_state()
+            if isinstance(res, dict) and res:
+                coord["resonance"] = res
+            us = self._shm.read_unified_spirit_metadata()
+            if isinstance(us, dict) and us:
+                coord["unified_spirit"] = us
+        except Exception as _shm_err:
+            # SHM overlay is defensive; if any reader fails, keep the
+            # cache-only path. Log once at INFO so it's visible without
+            # spamming on persistent SHM unavailability.
+            import logging
+            logging.getLogger(__name__).debug(
+                "[SpiritAccessor.get_coordinator] SHM overlay failed: %s",
+                _shm_err)
+
         return coord
 
     def get_v4_state(self) -> dict:
@@ -247,8 +286,23 @@ class SpiritAccessor(_SubAccessorBase):
         return self._cache.get("spirit.sphere_clocks", {}) or {}
 
     def get_nervous_system(self) -> dict:
-        """Microkernel v2 amendment: read the spirit_worker-published
-        neural_nervous_system stats from the api cache."""
+        """V5 Neural NervousSystem stats. SHM-first per the abstraction
+        contract get_sphere_clocks established (chunk 8M.4): try SHM
+        (spirit_supplemental_state.bin's nervous_system section, written
+        by SpiritSupplementalStatePublisher in spirit_loop), fall back to
+        bus-cached value (Phase A+B path: spirit_worker → bus event → cache).
+
+        Closes 2026-05-10 gap surfaced after rFP_worker_broadcast_topics_completion
+        deploy: T3 returned `{}` because cache key is never populated under
+        l0_rust_enabled=true (spirit_worker heartbeat-only) — but SHM has
+        the data (53,934-byte payload with 10-key nervous_system section).
+        Pre-fix accessor read cache only; this completes the abstraction.
+        """
+        supplemental = self._shm.read_spirit_supplemental()
+        if supplemental is not None:
+            section = supplemental.get("nervous_system")
+            if isinstance(section, dict) and section:
+                return section
         return self._cache.get("spirit.neural_nervous_system", {}) or {}
 
     def get_expression_composites(self) -> dict:
@@ -257,13 +311,27 @@ class SpiritAccessor(_SubAccessorBase):
         return self._cache.get("spirit.expression_composites", {}) or {}
 
     def get_resonance(self) -> dict:
-        """Microkernel v2 amendment: read spirit_worker-published
-        resonance detector stats."""
+        """ResonanceDetector stats. SHM-first per get_sphere_clocks pattern.
+        SHM source: resonance_state.bin written by SpiritStatePublisher
+        ._publish_resonance_state (Session 1 §4.B.1)."""
+        shm_data = self._shm.read_resonance_state()
+        if shm_data is not None:
+            return shm_data
         return self._cache.get("spirit.resonance", {}) or {}
 
     def get_unified_spirit(self) -> dict:
-        """Microkernel v2 amendment: read spirit_worker-published
-        unified spirit stats."""
+        """UnifiedSpirit stats (velocity, stale, focus_multiplier, etc.).
+        SHM-first per get_sphere_clocks pattern. SHM source:
+        unified_spirit_metadata.bin written by SpiritStatePublisher
+        ._publish_unified_spirit_metadata (Session 1 §4.B.1).
+
+        Note: this is the *metadata* layer (Python-computed stats over the
+        132D vector). The raw 132D vector itself lives in unified_spirit_132d.bin
+        written by titan-unified-spirit-rs (Rust); consumers needing the
+        vector use a separate reader."""
+        shm_data = self._shm.read_unified_spirit_metadata()
+        if shm_data is not None:
+            return shm_data
         return self._cache.get("spirit.unified_spirit", {}) or {}
 
 

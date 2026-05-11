@@ -3763,7 +3763,8 @@ class SocialXGateway:
         finally:
             db.close()
 
-    def get_community_engagement_stats(self, is_x_gateway: bool = True) -> dict:
+    def get_community_engagement_stats(self, is_x_gateway: bool = True,
+                                         titan_id: str = "T1") -> dict:
         """Phase 2 (rFP_trinity_130d_awakening + SPEC §23.9 ANANDA[36,38]):
         producer for community_connection + expression_reach dims.
 
@@ -3780,35 +3781,41 @@ class SocialXGateway:
         gather hot path. Caller must invoke this from the heavy-stats
         refresher thread (60s cadence).
 
-        ``is_x_gateway``: T1 is the SOLE X gateway (T2/T3 post via T1's
-        SocialXGateway over kin RPC, they don't maintain their own
-        ``mention_tracking`` / ``engagement_snapshots`` data). When False,
-        return a delegation marker with zero values + ``gateway_role:
-        non-canonical`` so observability tools can distinguish "no data
-        because no X presence locally" from "data missing due to bug".
-        Caller (plugin._refresh_loop) passes ``titan_id == 'T1'``.
+        ``is_x_gateway``: True = this Titan owns the social_x.db /
+        events_teacher.db files (T1 in the @iamtitanai shared-account
+        topology). False = this Titan must reach T1 over HTTP — that path
+        is now handled in ``plugin._refresh_loop``, NOT here.
+
+        ``titan_id`` (Phase 2.5.E, rFP_trinity_130d_phase2_5_closure §5):
+        Filter mention_tracking + engagement_snapshots rows by which
+        Titan handled / authored each row. Each Titan's value reflects
+        ITS individual social footprint inside the shared X account
+        (overrides §14.5 T1-canonical decision). Defaults to ``"T1"`` for
+        back-compat with pre-Phase-2.5 callers.
         """
         out = {
             "distinct_handles_24h": 0,
             "mean_engagement_per_post_7d": 0.0,
             "expression_reach_norm": 0.0,
             "gateway_role": "canonical" if is_x_gateway else "non-canonical",
+            "titan_id": titan_id,
         }
         if not is_x_gateway:
-            # Delegation: T2/T3 don't have local X data. Return zero values.
-            # ANANDA[36, 38] on T2/T3 = 0.0 BY DESIGN — these dims measure
-            # individual X presence, which is centralized on T1. T2/T3 do
-            # not have their own X account or community.
+            # Legacy zero-stub — kept for back-compat. Phase 2.5.E moves
+            # T2/T3 to HTTP-via-T1 in plugin._refresh_loop, so this path
+            # should not be reached on healthy T2/T3 runs.
             return out
-        # ANANDA[36] — distinct handles in mention_tracking last 24h.
+        # ANANDA[36] — distinct handles in mention_tracking, filtered by
+        # the requesting Titan's titan_id (which Titan handled the mention).
         try:
             db = self._db()
             try:
                 cutoff = time.time() - 86400.0
                 row = db.execute(
                     "SELECT COUNT(DISTINCT author_handle) FROM mention_tracking "
-                    "WHERE discovered_at > ? AND author_handle != ''",
-                    (cutoff,),
+                    "WHERE discovered_at > ? AND author_handle != '' "
+                    "AND titan_id = ?",
+                    (cutoff, titan_id),
                 ).fetchone()
                 out["distinct_handles_24h"] = int(row[0] if row else 0)
             finally:
@@ -3816,7 +3823,8 @@ class SocialXGateway:
         except Exception as e:
             logger.debug("[SocialXGateway] community_handles query: %s", e)
 
-        # ANANDA[38] — events_teacher.db engagement_snapshots last 7d.
+        # ANANDA[38] — events_teacher.db engagement_snapshots last 7d,
+        # filtered by which Titan authored the post.
         try:
             import sqlite3 as _sql
             _eng_db = _sql.connect("data/events_teacher.db", timeout=3)
@@ -3824,8 +3832,9 @@ class SocialXGateway:
                 cutoff = time.time() - 604800.0
                 row = _eng_db.execute(
                     "SELECT AVG(delta_likes + delta_replies + delta_quotes) "
-                    "FROM engagement_snapshots WHERE checked_at > ?",
-                    (cutoff,),
+                    "FROM engagement_snapshots WHERE checked_at > ? "
+                    "AND titan_id = ?",
+                    (cutoff, titan_id),
                 ).fetchone()
                 mean_eng = float(row[0] or 0.0) if row else 0.0
             finally:

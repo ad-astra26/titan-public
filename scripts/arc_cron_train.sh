@@ -1,5 +1,17 @@
 #!/bin/bash
 # arc_cron_train.sh — Periodic ARC training with game rotation
+#
+# ⚠️  DISABLED FLEET-WIDE since 2026-04-26 (CPU starvation).
+#     See memory/project_arc_disabled_cpu.md.
+#     Cron entries on T1 + T2 + T3 are commented out and the auto-trigger
+#     in services_watchdog.sh CHECK 4 was removed 2026-05-09 (commit
+#     e1611d81) after a stale-log auto-launch on T2 drove VPS swap to
+#     100% and hung T3's Python child for 22h.
+#     Do NOT manually invoke without confirming CPU/swap budget on the
+#     target host. ARC training will be revived in a dedicated rFP once
+#     the CPU budget is resolved.
+#
+# Original docstring (kept for reference):
 # Run via cron every 3 hours on T1:
 #   0 */3 * * * bash /home/antigravity/projects/titan/scripts/arc_cron_train.sh >> /tmp/arc_training.log 2>&1
 #
@@ -7,6 +19,14 @@
 # retry from one Titan could overlap the next cron fire of the other,
 # saturating the 4-CPU box. flock -n ensures only one ARC run per host at a
 # time — the second invocation exits silently, next cron fires in 3h.
+
+# Hard exit guard — refuse to run silently if accidentally invoked.
+if [ "${ARC_FORCE_RUN:-0}" != "1" ]; then
+    echo "ERROR: ARC training is disabled fleet-wide since 2026-04-26."
+    echo "       To force a manual run after confirming CPU/swap budget:"
+    echo "         ARC_FORCE_RUN=1 bash $0 $@"
+    exit 1
+fi
 
 TITAN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOCK_FILE="/tmp/arc_cron_host.lock"

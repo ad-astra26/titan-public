@@ -1,0 +1,35 @@
+[package]
+name = "titan-inner-spirit-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Inner-spirit trinity daemon — 70.47 Hz Schumann tick (×9 body, the full Schumann spectrum), reads inner_body_5d + inner_mind_15d (Observer Principle G8), reads sensor_cache_inner_spirit, writes inner_spirit_45d.bin (SAT/CHIT/ANANDA), publishes SPIRIT_STATE + INNER_SPIRIT_FILTER_DOWN (LOCAL cascade with observer-dim masking per G8). C-S5 §10.5 chunk C5-4 + SPEC §9.A."
+
+[[bin]]
+name = "titan-inner-spirit-rs"
+path = "src/main.rs"
+
+[dependencies]
+titan-core = { path = "../titan-core" }
+titan-state = { path = "../titan-state" }
+titan-bus = { path = "../titan-bus" }
+titan-schumann = { path = "../titan-schumann" }
+titan-trinity-daemon = { path = "../titan-trinity-daemon" }
+
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+nix.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+anyhow.workspace = true
+rmpv.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

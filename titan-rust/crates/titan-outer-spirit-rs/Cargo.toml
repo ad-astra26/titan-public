@@ -1,0 +1,41 @@
+[package]
+name = "titan-outer-spirit-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Outer-spirit trinity daemon — jittered ~30s ±10% tick, reads outer_body_5d + outer_mind_15d (Observer Principle G8) + sensor_cache_outer_spirit (msgpack), computes 45D Sat-Chit-Ananda Material, writes outer_spirit_45d.bin, publishes SPIRIT_STATE (src=outer, full 45D) + OUTER_SPIRIT_FILTER_DOWN (P1, observer-masked outer_spirit_content[40] per G8 + §10.F step 3). C-S6 §10.6 chunk C6-5 + SPEC §9.A + §18.1."
+
+[lib]
+name = "titan_outer_spirit_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "titan-outer-spirit-rs"
+path = "src/main.rs"
+
+[dependencies]
+titan-core = { path = "../titan-core" }
+titan-state = { path = "../titan-state" }
+titan-bus = { path = "../titan-bus" }
+titan-trinity-daemon = { path = "../titan-trinity-daemon" }
+titan-schumann = { path = "../titan-schumann" }
+
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+nix.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+anyhow.workspace = true
+rmpv.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

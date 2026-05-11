@@ -1,0 +1,23 @@
+[package]
+name = "titan-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shm slot registry for Titan microkernel v2 Phase C — SeqLock writer/reader + 18 spec'd slots + D04 symlink"
+
+[dependencies]
+titan-core = { path = "../titan-core" }
+memmap2.workspace = true
+nix.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+once_cell.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -244,23 +244,36 @@ class NeuromodRewardObserver:
     """rFP β Stage 2 Phase 2b — emits per-program reward from neuromod state.
 
     Lifecycle:
-      __init__(neural_nervous_system, neuromodulator_system, tick_interval=10)
-      tick() — call once per spirit_worker tick; observer decides whether
-               to emit (every N ticks, or on neuromod state change)
+      __init__(neural_nervous_system, levels_provider=None,
+               neuromodulator_system=None, tick_interval=10)
+      tick() — call once per worker tick; observer decides whether to
+               emit (every N ticks, or on neuromod state change)
 
     The observer maintains rolling EMAs of each neuromod level and
     converts level dynamics into per-program reward signals via
     PROGRAM_REWARD_FUNCS. Every tick_interval ticks, it emits to
     record_outcome(reward, program=, source="neuromod.X") for each
     program with a non-zero reward.
+
+    Cross-process levels source (2026-05-10): under l0_rust_enabled=true
+    the NeuromodulatorSystem instance lives in neuromod_worker (separate
+    process) while NS lives in cognitive_worker. To avoid cross-process
+    Python attr access, prefer the `levels_provider` callable (typically
+    cognitive_worker's `neuromod_reader` which reads NEUROMOD_STATE shm).
+    `neuromodulator_system` argument retained for the legacy
+    l0_rust=false path (T1/T2 spirit_worker_main) — pass the in-process
+    instance and the wrapper extracts modulators[name].level on each
+    tick. When both are passed, `levels_provider` wins.
     """
 
     NEUROMOD_NAMES = ("DA", "5-HT", "NE", "ACh", "Endorphin", "GABA")
 
-    def __init__(self, neural_nervous_system, neuromodulator_system,
+    def __init__(self, neural_nervous_system, levels_provider=None,
+                 neuromodulator_system=None,
                  tick_interval: int = 10, ema_alpha: float = 0.05,
                  enabled: bool = True):
         self.nns = neural_nervous_system
+        self.levels_provider = levels_provider
         self.neuromods = neuromodulator_system
         self.tick_interval = max(1, tick_interval)
         self.ema_alpha = ema_alpha
@@ -277,8 +290,35 @@ class NeuromodRewardObserver:
         self._vigilance_recent_fires = deque(maxlen=20)
 
     def _read_neuromod_levels(self) -> dict:
-        """Extract current neuromod levels from the neuromodulator_system.
+        """Extract current neuromod levels.
+
+        Source priority:
+          1. ``self.levels_provider()`` — preferred (SHM-backed callable
+             under l0_rust_enabled=true; in-process under l0_rust=false
+             when caller wraps neuromodulator_system).
+          2. ``self.neuromods.modulators[name].level`` — legacy in-process
+             access for backward compatibility.
+
         Returns dict {name: level}. Resilient to missing attributes."""
+        # Preferred: callable provider (SHM-backed under l0_rust=true).
+        if self.levels_provider is not None:
+            try:
+                provided = self.levels_provider() or {}
+            except Exception as e:
+                logger.debug("[NeuromodRewardObserver] levels_provider raised: %s", e)
+                provided = {}
+            if provided:
+                out = {}
+                for name in self.NEUROMOD_NAMES:
+                    if name in provided:
+                        try:
+                            out[name] = float(provided[name])
+                        except (TypeError, ValueError):
+                            continue
+                if out:
+                    return out
+
+        # Legacy in-process access.
         out = {}
         if not self.neuromods:
             return out

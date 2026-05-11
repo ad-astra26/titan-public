@@ -103,11 +103,26 @@ SOURCE_KEYS: tuple[str, ...] = (
     "art_count_500",           # → creative_stats.art_count
     "audio_count_500",         # → creative_stats.audio_count
     "uptime_seconds",          # → uptime_ratio
-    "hormone_levels",          # → ANANDA[11] creative_tension (currently unset by provider)
-    "solana_stats",            # → SAT[0,5,7,13] (currently unset by provider)
-    "recovery_stats",          # → SAT[10] (currently unset by provider)
-    "history",                 # → CHIT[10,11,14] + ANANDA[10,11,13] (currently unset)
+    "hormone_levels",          # → ANANDA[11] creative_tension
+    "solana_stats",            # → SAT[0,5,7,13]
+    "recovery_stats",          # → SAT[10]
+    "history",                 # → CHIT[10,11,14] + ANANDA[10,11,13]
     "soul_health",             # → outer_lower_spirit 5D (sidecar pass-through)
+    # Step 3 §3.1 additions for §4.3 P3 outer_spirit redesigned dims
+    # (Phase 1/2 §23.9 ports — ~32 stale dims need new inputs).
+    "meta_cgn_stats",          # CHIT[0,3,5,6,7,13] + ANANDA[5,7,9]
+    "cgn_stats",               # CHIT[5,6] + ANANDA[9]
+    "memory_stats",            # CHIT[6] + ANANDA[5]
+    "knowledge_graph_stats",   # CHIT[0] world_model_depth (KG node/edge counts)
+    "events_teacher_stats",    # ANANDA[9] discovery_value (felt_experiences_to_action_rate)
+    "jailbreak_alerts_stats",  # SAT[3] boundary_enforcement + CHIT[2] threat_discernment
+    "output_verifier_stats",   # SAT[3] + CHIT[2] (rejected_24h, violation_events_24h, high_severity)
+    "anchor_state",            # SAT[10,13] (consecutive_failures, anchor_count)
+    "bus_stats",               # ANANDA[3] system_harmony (1 - dropped/published)
+    "expression_translator_stats", # SAT[2] action_sovereignty + CHIT[28] causal_understanding
+    "outer_spirit_history_stats",  # SAT[11] env_adapt + CHIT[10/14] + ANANDA[10/11/13]
+    "community_engagement_stats",  # ANANDA[6] community_connection + ANANDA[8] expression_reach (Phase 2.5.E per-Titan)
+    "inner_memory_stats",      # for inner_spirit cross-block (deferred to Step 9 but kept here for symmetry)
 )
 
 
@@ -179,12 +194,8 @@ class OuterSpiritSensorRefresh:
                     "restarting after %.1fs backoff:\n%s",
                     _RESTART_BACKOFF_S, traceback.format_exc(),
                 )
-                try:
-                    await asyncio.wait_for(
-                        self._stop.wait(), timeout=_RESTART_BACKOFF_S,
-                    )
-                except asyncio.TimeoutError:
-                    pass
+                # Plain asyncio.sleep — see _refresh_loop comment.
+                await asyncio.sleep(_RESTART_BACKOFF_S)
 
         if self._writer is not None:
             try:
@@ -238,6 +249,11 @@ class OuterSpiritSensorRefresh:
         return StateRegistryWriter(spec, shm_root)
 
     async def _refresh_loop(self) -> None:
+        # Plain asyncio.sleep instead of wait_for(stop.wait()): self._stop
+        # is an asyncio.Event constructed in main thread context but awaited
+        # in this sidecar's dedicated daemon thread (own asyncio.run loop)
+        # — silent cross-event-loop binding hangs the await forever
+        # (verified 2026-05-10 T3 py-spy). is_set() is cross-thread-safe.
         while not self._stop.is_set():
             tick_start = time.monotonic()
             self._refresh_and_write()
@@ -246,12 +262,7 @@ class OuterSpiritSensorRefresh:
             elapsed = time.monotonic() - tick_start
             sleep_for = max(0.0, self._refresh_period_s - elapsed)
             if sleep_for > 0:
-                try:
-                    await asyncio.wait_for(
-                        self._stop.wait(), timeout=sleep_for,
-                    )
-                except asyncio.TimeoutError:
-                    pass
+                await asyncio.sleep(sleep_for)
 
     def _refresh_and_write(self) -> None:
         try:

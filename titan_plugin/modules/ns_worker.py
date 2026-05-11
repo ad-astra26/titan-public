@@ -223,7 +223,13 @@ def ns_worker_main(
         sys.path.insert(0, project_root)
 
     full_config = config or {}
-    titan_id = (full_config.get("info_banner", {}) or {}).get("titan_id") or "T1"
+    # rFP_trinity_130d_phase2_5_closure §4 (2026-05-08): use canonical
+    # resolve_titan_id() — see hormonal_worker.py for full rationale.
+    from titan_plugin.core.state_registry import resolve_titan_id
+    titan_id = (
+        (full_config.get("info_banner", {}) or {}).get("titan_id")
+        or resolve_titan_id()
+    )
 
     logger.info("[NSWorker] Booting — titan_id=%s, name=%s", titan_id, name)
 

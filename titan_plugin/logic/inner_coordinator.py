@@ -157,7 +157,19 @@ class InnerTrinityCoordinator:
                     cgn_state=self._cgn_snapshot,
                 )
             except Exception as e:
-                logger.debug("[Coordinator] NervousSystem error: %s", e)
+                # 2026-05-10 — promoted from logger.debug per
+                # directive_error_visibility.md. Was silent for the entire
+                # rFP_titan_vm_v2 Phase 2 lifetime (TypeError from the
+                # neuromod_state/cgn_state kwargs hitting an unextended
+                # signature) and kept inner_coordinator's NS branch dead.
+                # First fail + every 100th repeat (flood-safe; never silent).
+                _err_count_attr = "_ns_eval_err_count"
+                _count = getattr(self, _err_count_attr, 0) + 1
+                setattr(self, _err_count_attr, _count)
+                if _count == 1 or _count % 100 == 0:
+                    logger.error(
+                        "[Coordinator] NervousSystem.evaluate failed (count=%d): %s",
+                        _count, e, exc_info=True)
 
         # 5. Compute space topology (T5)
         if self.topology:

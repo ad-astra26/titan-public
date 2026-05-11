@@ -1,0 +1,59 @@
+[package]
+name = "titan-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared primitives for Titan microkernel v2 Phase C — frame, authkey, identity, supervisor, atomic-write, shm SeqLock, bus specs"
+
+[dependencies]
+# Sync I/O + concurrency primitives (kept minimal; binaries add tokio)
+parking_lot.workspace = true
+memmap2.workspace = true
+zeroize.workspace = true
+
+# Crypto (RustCrypto pure-Rust per SPEC §6.3)
+hmac.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+ed25519-dalek.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_bytes.workspace = true
+serde_json.workspace = true
+rmp-serde.workspace = true
+
+# Unix
+nix.workspace = true
+libc.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Misc
+bytes.workspace = true
+once_cell.workspace = true
+hex.workspace = true
+uuid.workspace = true
+
+# Compile-time perfect hash for bus_specs (skeleton in C-S2; populated in C2-2)
+phf.workspace = true
+
+# RNG for jittered restart backoff (per SPEC §11.B step 5 — ±25% jitter)
+rand.workspace = true
+
+[dev-dependencies]
+# Cross-language parity vectors loaded from tests/parity/vectors.json at repo root
+serde_json.workspace = true
+# Test helpers
+tempfile = "3"
+rand = "0.8"
+
+[lints]
+workspace = true

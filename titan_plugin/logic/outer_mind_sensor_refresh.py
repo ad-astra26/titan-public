@@ -106,6 +106,16 @@ SOURCE_KEYS: tuple[str, ...] = (
     "bus_stats",              # 15D (guardian_stats derives)
     "helper_statuses",        # 15D supplementary
     "llm_avg_latency",        # 15D research_stats input
+    # Step 3 §3.1 additions for §4.2 P2 outer_mind redesigned dims
+    # (Phase 1 §23.8 ports — 4 redesigned thinking dims + wiring fixes).
+    "meta_cgn_stats",         # thinking[0,1,14] (knowledge_helpful_ratio, usage_gini, eureka_accelerated_per_hour)
+    "cgn_stats",              # thinking[0,14] (avg_reward_norm, grounded_density)
+    "memory_stats",           # thinking[0,1,2] (directive_alignment, learning_velocity)
+    "language_stats",         # willing[14] (teacher_sessions_last_hour)
+    "events_teacher_stats",   # thinking[2] (felt_experiences_24h)
+    "social_x_gateway_stats", # willing[11] (posts_last_hour, replies_last_hour, t_since_last_event)
+    "output_verifier_stats",  # willing[13] (rejected_per_hour)
+    "jailbreak_alerts_stats", # willing[13] (defended_per_hour)
 )
 
 
@@ -178,12 +188,8 @@ class OuterMindSensorRefresh:
                     "restarting after %.1fs backoff:\n%s",
                     _RESTART_BACKOFF_S, traceback.format_exc(),
                 )
-                try:
-                    await asyncio.wait_for(
-                        self._stop.wait(), timeout=_RESTART_BACKOFF_S,
-                    )
-                except asyncio.TimeoutError:
-                    pass
+                # Plain asyncio.sleep — see _refresh_loop comment.
+                await asyncio.sleep(_RESTART_BACKOFF_S)
 
         if self._writer is not None:
             try:
@@ -238,6 +244,11 @@ class OuterMindSensorRefresh:
         return StateRegistryWriter(spec, shm_root)
 
     async def _refresh_loop(self) -> None:
+        # Plain asyncio.sleep instead of wait_for(stop.wait()): self._stop
+        # is an asyncio.Event constructed in main thread context but awaited
+        # in this sidecar's dedicated daemon thread (own asyncio.run loop)
+        # — silent cross-event-loop binding hangs the await forever
+        # (verified 2026-05-10 T3 py-spy). is_set() is cross-thread-safe.
         while not self._stop.is_set():
             tick_start = time.monotonic()
             self._refresh_and_write()
@@ -246,12 +257,7 @@ class OuterMindSensorRefresh:
             elapsed = time.monotonic() - tick_start
             sleep_for = max(0.0, self._refresh_period_s - elapsed)
             if sleep_for > 0:
-                try:
-                    await asyncio.wait_for(
-                        self._stop.wait(), timeout=sleep_for,
-                    )
-                except asyncio.TimeoutError:
-                    pass
+                await asyncio.sleep(sleep_for)
 
     def _refresh_and_write(self) -> None:
         # Stage 1: snapshot

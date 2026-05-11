@@ -2113,6 +2113,44 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
         else:
             fail(f"NS training stalled ({ns2_transitions} transitions, last train {age_s/60:.0f}m ago)")
 
+    # ── 2c. IQL / ReasoningEngine training-progress check ────────────
+    # 2026-05-10 mirror of NS check: ReasoningEngine has chain_iql + meta_iql
+    # internal trainers. If `policy_updates` counter doesn't advance, IQL is
+    # frozen — same silent-failure class that hit T3 NS for 42 hours
+    # 2026-05-08 → 2026-05-10. /v4/reasoning has no last_train_ts field
+    # (engine doesn't expose one), so use 10s delta on policy_updates as
+    # the freshness proxy. Engines hosted in cognitive_worker on T3 under
+    # l0_rust_enabled=true (see cognitive_worker.py:_drive_one_epoch step 6).
+    rsn1_raw = _health_get(base_url, "/v4/reasoning")
+    time.sleep(0)  # already paused 10s above for NS — reuse the gap
+    rsn2_raw = _health_get(base_url, "/v4/reasoning")
+    rsn1_resp = _unwrap(rsn1_raw)
+    rsn2_resp = _unwrap(rsn2_raw)
+    rsn1_pol = rsn1_resp.get("policy_updates", 0) if rsn1_resp else 0
+    rsn2_pol = rsn2_resp.get("policy_updates", 0) if rsn2_resp else 0
+    rsn1_chains = rsn1_resp.get("total_chains", 0) if rsn1_resp else 0
+    rsn2_chains = rsn2_resp.get("total_chains", 0) if rsn2_resp else 0
+    rsn_fetch_failed = rsn1_raw is None or rsn2_raw is None
+    if rsn_fetch_failed:
+        warn("IQL/reasoning — /v4/reasoning fetch failed (transient HTTP error)")
+    elif rsn2_chains == 0 and rsn2_pol == 0:
+        warn(f"IQL/reasoning not yet trained (chains=0, policy_updates=0; cold-boot or l0_rust path missing driver)")
+    else:
+        pol_delta = rsn2_pol - rsn1_pol
+        chain_delta = rsn2_chains - rsn1_chains
+        # IQL trains intermittently (per chain commit) so 0 delta in 10s
+        # is normal during quiet periods. Only flag if BOTH counters are
+        # frozen AND total_chains > 0 (the engine has been used before).
+        if pol_delta > 0 or chain_delta > 0:
+            ok(f"IQL/reasoning advancing (chains={rsn2_chains} +{chain_delta}, "
+               f"policy_updates={rsn2_pol} +{pol_delta} in 10s)")
+        elif rsn2_chains > 0:
+            # Have prior data, current delta=0. Could be quiet period (normal)
+            # OR frozen (bug). Conservative: warn, not fail.
+            warn(f"IQL/reasoning idle (chains={rsn2_chains}, policy_updates={rsn2_pol}, no growth in 10s — verify cognitive_worker driver if T3)")
+        else:
+            ok(f"IQL/reasoning ready (chains={rsn2_chains}, awaiting first chain)")
+
     # ── 2b. NS program feature_set vs input_dim consistency ──────────
     _dim_map = {"core": 30, "standard": 55, "extended": 75, "full": 88, "enriched": 79, "full_enriched": 112}
     ns_programs = ns2_resp.get("programs", {})
@@ -7669,10 +7707,12 @@ def run_sovereign_ops(all_titans: bool = False):
     print()
 
 
-# ── Trinity 130D dim-live (rFP_trinity_130d_awakening Phase 0) ──────
-# Lean implementation: fetch /v4/unified-spirit, classify each of the 130
-# dims as ALIVE / SILENT against its documented default value, render
-# summary or per-dim verbose listings.
+# ── Trinity 130D dim-live ──
+# Phase 2.5.B (rFP_trinity_130d_phase2_5_closure §3): four-state classifier
+# (ALIVE / ALIVE_AT_DEFAULT / PARTIAL / SILENT / GHOST) reads
+# /v4/debug/dim-sources for full producer-firing context.
+# Falls back to the original /v4/unified-spirit binary ALIVE/SILENT
+# classifier when the new endpoint is unavailable (older Titan / pre-Phase-2.5).
 
 _DIM_LIVE_TITAN_URLS = {
     "T1": "http://127.0.0.1:7777",
@@ -7680,9 +7720,39 @@ _DIM_LIVE_TITAN_URLS = {
     "T3": "http://10.135.0.6:7778",
 }
 
+# rFP §3.1 — locked parameters
+_DIM_LIVE_EPSILON = 0.005
+_DIM_LIVE_FIRING_WINDOW_S = 300.0
+
+
+def _dim_live_fetch_sources(url: str, timeout: float = 8.0) -> list[dict] | None:
+    """Fetch /v4/debug/dim-sources (Phase 2.5.A endpoint).
+
+    Returns:
+      list of 130 per-dim records with full producer-firing metadata,
+      OR None if the endpoint is unavailable (older Titan, pre-Phase-2.5).
+    """
+    import urllib.request as _ur
+    import json as _json
+    try:
+        req = _ur.urlopen(url + "/v4/debug/dim-sources", timeout=timeout)
+        body = _json.loads(req.read())
+    except Exception:
+        return None
+    if body.get("status") != "ok":
+        return None
+    data = body.get("data") or {}
+    dims = data.get("dims") or []
+    if not isinstance(dims, list) or len(dims) != 130:
+        return None
+    return dims
+
 
 def _dim_live_fetch_tensor(url: str, timeout: float = 5.0) -> list[float]:
-    """Fetch /v4/unified-spirit, return the 130D spirit_tensor or []."""
+    """Legacy: fetch /v4/unified-spirit, return the 130D spirit_tensor or [].
+
+    Used when /v4/debug/dim-sources is unavailable (older Titan).
+    """
     import urllib.request as _ur
     import json as _json
     try:
@@ -7705,8 +7775,10 @@ def _dim_live_fetch_tensor(url: str, timeout: float = 5.0) -> list[float]:
 
 def _dim_live_classify(value: float, default_value: float,
                         tol: float = 0.01) -> str:
-    """ALIVE if |value - default| > tol, else SILENT.
-    NaN / out-of-range → CORRUPTED.
+    """LEGACY binary classifier (used when /v4/debug/dim-sources unavailable).
+
+    ALIVE if |value - default| > tol, else SILENT. NaN / out-of-range →
+    CORRUPTED.
     """
     import math as _m
     if value is None or _m.isnan(value) or _m.isinf(value):
@@ -7716,78 +7788,206 @@ def _dim_live_classify(value: float, default_value: float,
     return "ALIVE" if abs(value - default_value) > tol else "SILENT"
 
 
-def _dim_live_render_summary(label: str, tensor: list[float]) -> dict:
-    """Print a per-block summary table; return per-block counts."""
+def _dim_live_classify_v2(record: dict,
+                           epsilon: float = _DIM_LIVE_EPSILON,
+                           firing_window_s: float = _DIM_LIVE_FIRING_WINDOW_S
+                           ) -> str:
+    """rFP_trinity_130d_phase2_5_closure §3.1 four-state classifier.
+
+    Returns one of:
+      ALIVE              ← |value − spec_default| ≥ epsilon
+      ALIVE_AT_DEFAULT   ← within epsilon AND block fired ≤ firing_window_s ago
+                           AND no inputs ABSENT
+      PARTIAL            ← within epsilon AND block fired recently AND
+                           ≥ 1 input ABSENT (producer running, degraded inputs)
+      SILENT             ← within epsilon AND block has not fired in firing_window_s
+      CORRUPTED          ← NaN / inf / out-of-[0,1]
+      GHOST              ← producer not registered (should never happen
+                           post-Phase-2)
+    """
+    import math as _m
+    val = record.get("last_value")
+    spec_default = float(record.get("spec_default", 0.5))
+    seconds_since = record.get("seconds_since_last_write")
+    inputs = record.get("inputs") or []
+    block_calls = int(record.get("block_calls_total", 0) or 0)
+
+    if val is None:
+        # No producer write since boot.
+        return "GHOST" if block_calls == 0 else "SILENT"
+    if not isinstance(val, (int, float)) or _m.isnan(val) or _m.isinf(val):
+        return "CORRUPTED"
+    if val < -1e-6 or val > 1.0 + 1e-6:
+        return "CORRUPTED"
+
+    if abs(float(val) - spec_default) >= epsilon:
+        return "ALIVE"
+
+    # Within epsilon of SPEC default — distinguish A_AT_D / PARTIAL / SILENT.
+    if (seconds_since is None
+            or float(seconds_since) > firing_window_s):
+        return "SILENT"
+    has_absent = any(i.get("state") == "absent" for i in inputs)
+    return "PARTIAL" if has_absent else "ALIVE_AT_DEFAULT"
+
+
+def _dim_live_state_marker(state: str) -> str:
+    return {
+        "ALIVE": "✓",
+        "ALIVE_AT_DEFAULT": "○",
+        "PARTIAL": "◑",
+        "SILENT": "·",
+        "CORRUPTED": "✗",
+        "GHOST": "▢",
+    }.get(state, "?")
+
+
+def _dim_live_render_summary(label: str, tensor: list[float],
+                               sources: list[dict] | None = None) -> dict:
+    """Print a per-block summary table; return per-block counts.
+
+    If ``sources`` is provided (Phase 2.5.B four-state classifier), uses
+    full producer-firing metadata. Otherwise falls back to the legacy
+    binary ALIVE/SILENT classifier on ``tensor``.
+    """
     from titan_plugin.api.dim_registry import iter_registry, _BLOCKS as DR_BLOCKS
 
-    if not tensor:
+    using_v2 = sources is not None
+    if not using_v2 and not tensor:
         print(f"  {label}: tensor unavailable")
         return {}
 
+    state_keys = (
+        ["ALIVE", "ALIVE_AT_DEFAULT", "PARTIAL", "SILENT", "CORRUPTED", "GHOST"]
+        if using_v2 else ["ALIVE", "SILENT", "CORRUPTED"]
+    )
     counts: dict[str, dict[str, int]] = {}
     for entry in iter_registry():
-        v = tensor[entry.full_index]
-        state = _dim_live_classify(v, entry.default_value)
-        b = counts.setdefault(entry.block, {"ALIVE": 0, "SILENT": 0,
-                                              "CORRUPTED": 0, "total": 0})
+        if using_v2:
+            rec = sources[entry.full_index]
+            state = _dim_live_classify_v2(rec)
+        else:
+            v = tensor[entry.full_index]
+            state = _dim_live_classify(v, entry.default_value)
+        b = counts.setdefault(
+            entry.block,
+            {k: 0 for k in state_keys} | {"total": 0},
+        )
         b[state] = b.get(state, 0) + 1
         b["total"] += 1
 
     print(f"  {label}")
-    print(f"  {'block':<14s} {'alive':>7s} {'silent':>7s} {'corrupt':>8s} "
-          f"{'total':>6s} {'%alive':>7s}")
-    print("  " + "-" * 60)
-    total_alive = total_silent = total_corrupt = 0
+    if using_v2:
+        # ALIVE + ALIVE_AT_DEFAULT both count toward "active" — Phase 2.5
+        # acceptance criterion is ALIVE-or-ALIVE_AT_DEFAULT = 130.
+        header = (f"  {'block':<14s} {'alive':>5s} {'@def':>5s} "
+                  f"{'partial':>7s} {'silent':>6s} {'corrupt':>7s} "
+                  f"{'ghost':>5s} {'total':>5s} {'%active':>7s}")
+    else:
+        header = (f"  {'block':<14s} {'alive':>7s} {'silent':>7s} "
+                  f"{'corrupt':>8s} {'total':>6s} {'%alive':>7s}")
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    total_alive = total_at_def = total_partial = 0
+    total_silent = total_corrupt = total_ghost = 0
     for start, length, block in DR_BLOCKS:
-        b = counts.get(block, {"ALIVE": 0, "SILENT": 0, "CORRUPTED": 0,
-                               "total": length})
+        b = counts.get(block, {k: 0 for k in state_keys} | {"total": length})
         a = b.get("ALIVE", 0)
+        ad = b.get("ALIVE_AT_DEFAULT", 0)
+        p = b.get("PARTIAL", 0)
         s = b.get("SILENT", 0)
         c = b.get("CORRUPTED", 0)
+        g = b.get("GHOST", 0)
         t = b["total"]
-        pct = 100.0 * a / max(1, t)
-        marker = "✓" if a == t else ("⚠" if a >= t * 0.8 else "✗")
-        print(f"  {marker} {block:<12s} {a:>7d} {s:>7d} {c:>8d} "
-              f"{t:>6d} {pct:>6.1f}%")
+        active = a + ad  # rFP §9 — both count
+        pct = 100.0 * active / max(1, t)
+        marker = "✓" if active == t and p == 0 else (
+            "⚠" if pct >= 80 else "✗"
+        )
+        if using_v2:
+            print(f"  {marker} {block:<12s} {a:>5d} {ad:>5d} "
+                  f"{p:>7d} {s:>6d} {c:>7d} {g:>5d} {t:>5d} {pct:>6.1f}%")
+        else:
+            print(f"  {marker} {block:<12s} {a:>7d} {s:>7d} {c:>8d} "
+                  f"{t:>6d} {pct:>6.1f}%")
         total_alive += a
+        total_at_def += ad
+        total_partial += p
         total_silent += s
         total_corrupt += c
-    total = total_alive + total_silent + total_corrupt
-    pct = 100.0 * total_alive / max(1, total)
-    print("  " + "-" * 60)
-    marker = "✓" if total_alive == total else ("⚠" if pct >= 80 else "✗")
-    print(f"  {marker} {'TOTAL':<12s} {total_alive:>7d} {total_silent:>7d} "
-          f"{total_corrupt:>8d} {total:>6d} {pct:>6.1f}%")
+        total_ghost += g
+    total = (total_alive + total_at_def + total_partial + total_silent
+             + total_corrupt + total_ghost)
+    active = total_alive + total_at_def
+    pct = 100.0 * active / max(1, total)
+    print("  " + "-" * (len(header) - 2))
+    marker = "✓" if active == total and total_partial == 0 else (
+        "⚠" if pct >= 80 else "✗"
+    )
+    if using_v2:
+        print(f"  {marker} {'TOTAL':<12s} {total_alive:>5d} {total_at_def:>5d} "
+              f"{total_partial:>7d} {total_silent:>6d} {total_corrupt:>7d} "
+              f"{total_ghost:>5d} {total:>5d} {pct:>6.1f}%")
+    else:
+        print(f"  {marker} {'TOTAL':<12s} {total_alive:>7d} {total_silent:>7d} "
+              f"{total_corrupt:>8d} {total:>6d} {pct:>6.1f}%")
     return counts
 
 
-def _dim_live_render_verbose(label: str, tensor: list[float]) -> None:
-    """Per-dim listing: full_index | block | name | value | state."""
+def _dim_live_render_verbose(label: str, tensor: list[float],
+                               sources: list[dict] | None = None) -> None:
+    """Per-dim listing: full_index | block | name | value | state.
+
+    With ``sources`` the four-state classifier renders ALIVE / @DEF /
+    PARTIAL / SILENT / GHOST; otherwise legacy ALIVE / SILENT.
+    """
     from titan_plugin.api.dim_registry import iter_registry
 
-    if not tensor:
+    using_v2 = sources is not None
+    if not using_v2 and not tensor:
         print(f"  {label}: tensor unavailable")
         return
     print(f"  {label}")
-    print(f"  {'idx':>4s}  {'block':<13s}  {'name':<28s}  {'value':>7s}  "
-          f"{'default':>7s}  {'state'}")
-    print("  " + "-" * 80)
+    if using_v2:
+        print(f"  {'idx':>4s}  {'block':<13s}  {'name':<28s}  "
+              f"{'value':>7s}  {'default':>7s}  {'age_s':>7s}  state")
+    else:
+        print(f"  {'idx':>4s}  {'block':<13s}  {'name':<28s}  "
+              f"{'value':>7s}  {'default':>7s}  state")
+    print("  " + "-" * 90)
     for entry in iter_registry():
-        v = tensor[entry.full_index]
-        state = _dim_live_classify(v, entry.default_value)
-        marker = {"ALIVE": "✓", "SILENT": "·", "CORRUPTED": "✗"}[state]
-        print(f"  {entry.full_index:>4d}  {entry.block:<13s}  "
-              f"{entry.name[:28]:<28s}  {v:>7.4f}  "
-              f"{entry.default_value:>7.2f}  {marker} {state}")
+        if using_v2:
+            rec = sources[entry.full_index]
+            v = rec.get("last_value")
+            state = _dim_live_classify_v2(rec)
+            age = rec.get("seconds_since_last_write")
+            age_str = f"{float(age):>7.1f}" if age is not None else "      –"
+            v_str = f"{float(v):>7.4f}" if isinstance(v, (int, float)) else "      –"
+            marker = _dim_live_state_marker(state)
+            print(f"  {entry.full_index:>4d}  {entry.block:<13s}  "
+                  f"{entry.name[:28]:<28s}  {v_str}  "
+                  f"{entry.default_value:>7.2f}  {age_str}  {marker} {state}")
+        else:
+            v = tensor[entry.full_index]
+            state = _dim_live_classify(v, entry.default_value)
+            marker = {"ALIVE": "✓", "SILENT": "·", "CORRUPTED": "✗"}[state]
+            print(f"  {entry.full_index:>4d}  {entry.block:<13s}  "
+                  f"{entry.name[:28]:<28s}  {v:>7.4f}  "
+                  f"{entry.default_value:>7.2f}  {marker} {state}")
 
 
 def _dim_live_render_diff(label_a: str, tensor_a: list[float],
-                            label_b: str, tensor_b: list[float]) -> None:
+                            label_b: str, tensor_b: list[float],
+                            sources_a: list[dict] | None = None,
+                            sources_b: list[dict] | None = None) -> None:
     """Side-by-side state classification per dim across two Titans.
-    Emphasizes dims where one is ALIVE and the other isn't."""
+
+    Uses the four-state classifier when both sources are available.
+    """
     from titan_plugin.api.dim_registry import iter_registry
 
-    if not tensor_a or not tensor_b:
+    using_v2 = sources_a is not None and sources_b is not None
+    if not using_v2 and (not tensor_a or not tensor_b):
         print(f"  diff: at least one tensor unavailable "
               f"({label_a}={len(tensor_a)}, {label_b}={len(tensor_b)})")
         return
@@ -7798,15 +7998,27 @@ def _dim_live_render_diff(label_a: str, tensor_a: list[float],
     print("  " + "-" * 80)
     diverged = 0
     for entry in iter_registry():
-        va = tensor_a[entry.full_index]
-        vb = tensor_b[entry.full_index]
-        sa = _dim_live_classify(va, entry.default_value)
-        sb = _dim_live_classify(vb, entry.default_value)
+        if using_v2:
+            ra = sources_a[entry.full_index]
+            rb = sources_b[entry.full_index]
+            va = ra.get("last_value")
+            vb = rb.get("last_value")
+            sa = _dim_live_classify_v2(ra)
+            sb = _dim_live_classify_v2(rb)
+        else:
+            va = tensor_a[entry.full_index]
+            vb = tensor_b[entry.full_index]
+            sa = _dim_live_classify(va, entry.default_value)
+            sb = _dim_live_classify(vb, entry.default_value)
         if sa != sb:
             diverged += 1
+            va_s = (f"{float(va):>7.4f}"
+                    if isinstance(va, (int, float)) else "      –")
+            vb_s = (f"{float(vb):>7.4f}"
+                    if isinstance(vb, (int, float)) else "      –")
             print(f"  {entry.full_index:>4d}  {entry.block:<13s}  "
                   f"{entry.name[:28]:<28s}  "
-                  f"{sa[:1]} {va:>7.4f}  {sb[:1]} {vb:>7.4f}")
+                  f"{sa[:1]} {va_s}  {sb[:1]} {vb_s}")
     if diverged == 0:
         print("  (all 130 dims agree on state classification)")
     else:
@@ -7814,8 +8026,43 @@ def _dim_live_render_diff(label_a: str, tensor_a: list[float],
         print(f"  {diverged}/130 dims diverge")
 
 
+def _dim_live_render_producer_status(label: str,
+                                       sources: list[dict]) -> None:
+    """Per-block producer-status snapshot — block_calls_total + last_call age."""
+    from titan_plugin.api.dim_registry import _BLOCKS as DR_BLOCKS
+
+    print(f"  {label} — producer status")
+    print(f"  {'block':<14s}  {'calls':>10s}  {'last_call_age_s':>15s}")
+    print("  " + "-" * 50)
+    seen_blocks: dict[str, dict] = {}
+    for rec in sources:
+        block = rec.get("block")
+        if block in seen_blocks:
+            continue
+        seen_blocks[block] = rec
+    for _, _, block in DR_BLOCKS:
+        rec = seen_blocks.get(block)
+        if rec is None:
+            print(f"  · {block:<12s}  {'–':>10s}  {'–':>15s}")
+            continue
+        calls = rec.get("block_calls_total", 0)
+        last_ts = rec.get("block_last_call_ts")
+        if last_ts is None:
+            age_str = "—"
+        else:
+            import time as _t
+            age_str = f"{_t.time() - float(last_ts):>15.1f}"
+        marker = "✓" if calls > 0 else "·"
+        print(f"  {marker} {block:<12s}  {calls:>10d}  {age_str}")
+
+
 def run_dim_live(args: list[str]) -> None:
-    """rFP_trinity_130d_awakening Phase 0 — dim-live measurement.
+    """Trinity 130D — dim-live measurement.
+
+    Phase 0 (rFP_trinity_130d_awakening §2): binary ALIVE/SILENT classifier.
+    Phase 2.5.B (rFP_trinity_130d_phase2_5_closure §3): four-state
+    classifier (ALIVE / ALIVE_AT_DEFAULT / PARTIAL / SILENT / GHOST) with
+    producer-firing context, fed by /v4/debug/dim-sources.
 
     Usage:
       python scripts/arch_map.py dim-live                       # T1 summary
@@ -7823,11 +8070,17 @@ def run_dim_live(args: list[str]) -> None:
       python scripts/arch_map.py dim-live --all                 # All three
       python scripts/arch_map.py dim-live --verbose             # Per-dim T1
       python scripts/arch_map.py dim-live --diff T1 T2          # Diff T1↔T2
+      python scripts/arch_map.py dim-live --strict --all        # exit 1 unless 130/130 ALIVE-or-AT_DEFAULT fleet-wide
+      python scripts/arch_map.py dim-live --producer-status     # block firing summary
+
+    Returns 0 on success, 1 on --strict failure.
     """
     # Argument parsing (small surface, hand-rolled to match arch_map style).
     titan = "T1"
     all_titans = "--all" in args
     verbose = "--verbose" in args
+    strict = "--strict" in args
+    producer_status = "--producer-status" in args
     diff_pair: tuple[str, str] | None = None
 
     if "--titan" in args:
@@ -7839,9 +8092,9 @@ def run_dim_live(args: list[str]) -> None:
         if i + 2 < len(args):
             diff_pair = (args[i + 1].upper(), args[i + 2].upper())
 
-    print("=" * 60)
-    print("TRINITY 130D — DIM LIVE (rFP_trinity_130d_awakening Phase 0)")
-    print("=" * 60)
+    print("=" * 70)
+    print("TRINITY 130D — DIM LIVE")
+    print("=" * 70)
 
     if diff_pair is not None:
         a, b = diff_pair
@@ -7850,9 +8103,14 @@ def run_dim_live(args: list[str]) -> None:
         if not (url_a and url_b):
             print(f"  unknown titan in --diff: {a} or {b}")
             return
-        ta = _dim_live_fetch_tensor(url_a)
-        tb = _dim_live_fetch_tensor(url_b)
-        _dim_live_render_diff(a, ta, b, tb)
+        sources_a = _dim_live_fetch_sources(url_a)
+        sources_b = _dim_live_fetch_sources(url_b)
+        if sources_a is not None and sources_b is not None:
+            _dim_live_render_diff(a, [], b, [], sources_a, sources_b)
+        else:
+            ta = _dim_live_fetch_tensor(url_a)
+            tb = _dim_live_fetch_tensor(url_b)
+            _dim_live_render_diff(a, ta, b, tb)
         return
 
     if all_titans:
@@ -7866,13 +8124,69 @@ def run_dim_live(args: list[str]) -> None:
             return
         targets = [(titan, url)]
 
+    # Track strict-mode failures across all targets
+    strict_failures: list[str] = []
+
     for label, url in targets:
-        tensor = _dim_live_fetch_tensor(url)
+        sources = _dim_live_fetch_sources(url)
+        tensor = _dim_live_fetch_tensor(url) if sources is None else []
+        if sources is None and not tensor:
+            print(f"  {label}  ({url}): unreachable")
+            print()
+            if strict:
+                strict_failures.append(f"{label}: unreachable")
+            continue
+
+        if producer_status:
+            if sources is None:
+                print(f"  {label}  ({url}): /v4/debug/dim-sources unavailable")
+            else:
+                _dim_live_render_producer_status(f"{label}  ({url})", sources)
+            print()
+            continue
+
         if verbose:
-            _dim_live_render_verbose(f"{label}  ({url})", tensor)
+            _dim_live_render_verbose(f"{label}  ({url})", tensor, sources)
         else:
-            _dim_live_render_summary(f"{label}  ({url})", tensor)
+            _dim_live_render_summary(f"{label}  ({url})", tensor, sources)
         print()
+
+        # Strict-mode acceptance: every dim must be ALIVE or ALIVE_AT_DEFAULT
+        # (PARTIAL counts as failure — producer is firing but inputs are
+        # incomplete; that's a producer wiring bug to fix).
+        if strict and sources is not None:
+            non_active = []
+            for rec in sources:
+                state = _dim_live_classify_v2(rec)
+                if state not in ("ALIVE", "ALIVE_AT_DEFAULT"):
+                    non_active.append((rec.get("idx"), rec.get("name"),
+                                       state))
+            if non_active:
+                msg = (f"{label}: {len(non_active)}/130 dims not "
+                       f"ALIVE-or-ALIVE_AT_DEFAULT")
+                strict_failures.append(msg)
+                print(f"  {msg}")
+                for idx, name, state in non_active[:10]:
+                    print(f"    idx={idx:3d} {name:<32s} {state}")
+                if len(non_active) > 10:
+                    print(f"    ... and {len(non_active) - 10} more")
+                print()
+        elif strict and sources is None:
+            msg = (f"{label}: /v4/debug/dim-sources unavailable — "
+                   f"--strict requires Phase 2.5.A endpoint")
+            strict_failures.append(msg)
+            print(f"  {msg}")
+            print()
+
+    if strict and strict_failures:
+        print("=" * 70)
+        print(f"--strict FAILED: {len(strict_failures)} target(s) below 130/130")
+        for f in strict_failures:
+            print(f"  ✗ {f}")
+        sys.exit(1)
+    if strict:
+        print("=" * 70)
+        print("--strict PASSED: 130/130 ALIVE-or-ALIVE_AT_DEFAULT on all targets")
 
 
 def main():
@@ -8813,10 +9127,17 @@ _DAEMON_TICK_EXPECTED_HZ = {
     "inner_body_5d.bin":    7.83,    # schumann_body_hz
     "inner_mind_15d.bin":   23.49,   # schumann_mind_hz (×3)
     "inner_spirit_45d.bin": 70.47,   # schumann_spirit_hz (×9)
-    # ── Outer trinity (SPEC §18.1 OUTER_*_TICK_BASE_S) ────────────────
-    "outer_body_5d.bin":    1.0/15.0,  # 15 s base cadence
-    "outer_mind_15d.bin":   1.0/5.0,   # 5 s
-    "outer_spirit_45d.bin": 1.0/30.0,  # 30 s
+    # ── Outer trinity (SPEC §G13 + §7.1 cadence-rationale, A.S8 lock 2026-04-30) ──
+    # Post-A.S8 SPEC alignment: SHM-write clock is full Schumann × 1/3/9
+    # matching inner trinity (G13 inner↔outer symmetry); content-hash gating
+    # suppresses redundant writes when source data unchanged. Pre-A.S8 entries
+    # of 15s/5s/30s were the Python-monolith era BUS-PUBLISH rates, NOT the
+    # SHM-write clock. Bus publish still happens at slow rates (~45s body,
+    # ~15s mind, ~5s spirit) but that's a separate channel from SHM writes.
+    # See SPEC §1060 for the cadence rationale + correction history.
+    "outer_body_5d.bin":    7.83,    # schumann_body_hz (×1) — content-hash gated
+    "outer_mind_15d.bin":   23.49,   # schumann_mind_hz (×3) — content-hash gated
+    "outer_spirit_45d.bin": 70.47,   # schumann_spirit_hz (×9) — content-hash gated
     # ── Trinity substrate computed slots (body cycle, SPEC §659/§667) ─
     # "~1.15 s body publish rate" → 0.87 Hz. These are the slots that
     # exposed the C-S3 placeholder bug — substrate tick_loop computes

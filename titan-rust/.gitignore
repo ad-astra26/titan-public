@@ -1,0 +1,13 @@
+# Cargo build artifacts (per SPEC §13.1: `target/` regenerated, never committed)
+target/
+
+# Editor cruft
+*.rs.bk
+*.swp
+*.orig
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# NOT gitignored: Cargo.lock (committed for reproducible builds across T1/T2/T3 per PLAN §4.4)

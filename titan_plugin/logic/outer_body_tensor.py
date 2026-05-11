@@ -109,9 +109,28 @@ def collect_outer_body_5d(
     hormonal_heat = (impulse + vigilance) / 2.0
     thermal = _clamp(0.35 * cpu_thermal + 0.25 * circadian + 0.40 * hormonal_heat)
 
-    return [round(v, 4) for v in [
+    tensor_5d = [round(v, 4) for v in [
         interoception, proprioception, somatosensation, entropy, thermal
     ]]
+    # Phase 2.5.A — record firing for /v4/debug/dim-sources diagnostics.
+    try:
+        from titan_plugin.api.dim_registry import get_firing_tracker
+        get_firing_tracker().record_block(
+            "outer_body",
+            tensor_5d,
+            {
+                "anchor_state": anchor,
+                "timechain_v2_stats": blk_delta,
+                "network_monitor": net_stats,
+                "system_sensor": sys_stats,
+                "agency_stats": agency,
+                "hormone_levels": sources.get("hormone_levels"),
+                "circadian_stats": {"phase": sys_stats.get("circadian_phase")} if "circadian_phase" in sys_stats else None,
+            },
+        )
+    except Exception:
+        pass
+    return tensor_5d
 
 
 def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:

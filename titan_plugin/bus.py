@@ -642,6 +642,37 @@ class DivineBus:
         OUTER_TRINITY_STATE, SPHERE_PULSE, FILTER_DOWN_V4,
     }
 
+    # 2026-05-09 — High-rate broadcast types that flood unmigrated subscribers
+    # (legacy wildcard mode = no broadcast_filter registered). Mirrors the
+    # bus_socket.py:_HIGH_RATE_BROADCAST_TYPES stopgap to also cover the
+    # Phase C path: Rust kernel-rs broker → Python `_client` (attach_client) →
+    # DivineBus.publish() → in-process subscribers. Without this stopgap,
+    # Phase C T3 (l0_rust_enabled=true) bypasses the bus_socket filter entirely
+    # because messages enter via _client.publish callback, not via the socket
+    # broker that owns _HIGH_RATE_BROADCAST_TYPES. Result on T3 2026-05-09:
+    # 125k SPIRIT_STATE drops/10min, STATE_SNAPSHOT_RESPONSE dropped to api
+    # subscriber, /v4/chi + /v4/nervous-system + /v4/neuromodulators stuck on
+    # bootstrap defaults. Phase A+B Python publishers (T1+T2) are below
+    # Schumann rate so this stopgap is a no-op for them.
+    #
+    # Stopgap until rFP_bus_broadcast_filter_migration ships per-worker
+    # ModuleSpec.broadcast_topics for every spawn_graduated worker. See BUGS.md
+    # BUG-BUS-PER-WORKER-BROADCAST-FILTER-MIGRATION-INCOMPLETE-20260430.
+    _HIGH_RATE_BROADCAST_TYPES = frozenset({
+        SPHERE_PULSE,                           # 6 clocks × ~12 Hz Schumann pulses
+        "PI_HEARTBEAT_UPDATED",                 # ~10 Hz π-heartbeat
+        "BIG_PULSE",                            # frequent state aggregation
+        BODY_STATE,                             # Schumann body 7.83 Hz
+        MIND_STATE,                             # Schumann mind 23.49 Hz
+        SPIRIT_STATE,                           # Schumann spirit × 9 = 70.47 Hz
+        "TOPOLOGY_STATE_UPDATED",               # frequent topology snapshots
+        # Phase C Rust types (no Python module constants — Rust-only publishers)
+        "INNER_SPIRIT_FILTER_DOWN",             # 70.47 Hz from inner-spirit-rs
+        "UNIFIED_SPIRIT_FILTER_DOWN",           # GLOBAL filter at Schumann
+        "UNIFIED_SPIRIT_SELF_ASSEMBLED",        # 70.47 Hz from unified-spirit-rs
+        "TRINITY_SUBSTRATE_TOPOLOGY_UPDATED",   # high-freq from trinity-rs
+    })
+
     def __init__(self, maxsize: int = 1000, multiprocess: bool = False):
         self._maxsize = maxsize
         self._multiprocess = multiprocess
@@ -871,6 +902,9 @@ class DivineBus:
             # and filtered drops never touch the queue → zero backpressure.
             src = msg.get("src", "")
             filtered_count = 0
+            high_rate_skip = (
+                msg_type in self._HIGH_RATE_BROADCAST_TYPES
+            )
             with self._lock:
                 snapshot = []
                 for mod_name, queues in self._subscribers.items():
@@ -879,6 +913,14 @@ class DivineBus:
                     if mod_name in self._reply_only:
                         continue
                     flt = self._broadcast_filters.get(mod_name)
+                    # 2026-05-09 stopgap: high-rate types only deliver to
+                    # subscribers that EXPLICITLY opted in via broadcast_filter.
+                    # Wildcard subscribers (flt is None) skip these to prevent
+                    # Phase C T3-style queue overflow. See class-level
+                    # _HIGH_RATE_BROADCAST_TYPES comment for full context.
+                    if high_rate_skip and flt is None:
+                        filtered_count += 1
+                        continue
                     if flt is not None and msg_type not in flt:
                         filtered_count += 1
                         continue
@@ -953,6 +995,9 @@ class DivineBus:
             # Option B filter applied here too — broker-callback path is
             # the v2 mode's hot route from worker → kernel-side subscribers.
             filtered_count = 0
+            high_rate_skip = (
+                msg_type in self._HIGH_RATE_BROADCAST_TYPES
+            )
             with self._lock:
                 snapshot = []
                 for mod_name, queues in self._subscribers.items():
@@ -961,6 +1006,10 @@ class DivineBus:
                     if mod_name in self._reply_only:
                         continue
                     flt = self._broadcast_filters.get(mod_name)
+                    # 2026-05-09 stopgap mirror — same as publish().
+                    if high_rate_skip and flt is None:
+                        filtered_count += 1
+                        continue
                     if flt is not None and msg_type not in flt:
                         filtered_count += 1
                         continue

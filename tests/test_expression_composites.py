@@ -34,13 +34,35 @@ class TestExpressionComposite:
             vocabulary_confidence=0.1)
         assert result["should_fire"] is False
 
-    def test_cooldown(self):
+    def test_hormonal_depletion_eventually_pauses(self):
+        """Per design (expression_composites.py:124-127): no fixed cooldown.
+        Timing is emergent from hormonal rebuild rate — repeated fires
+        deplete hormones until urge drops below threshold (natural pause).
+
+        2026-05-10: replaced obsolete `test_cooldown` (which assumed a
+        post-fire timer that no longer exists; failing on titan-v6 baseline
+        before this session's pre-D8 audit closure work). The new test
+        exercises the actual depletion-driven semantics."""
         speak = create_speak()
-        speak.evaluate({"CREATIVITY": 2.0, "REFLECTION": 2.0, "EMPATHY": 2.0})
-        speak.fire()
-        # Immediately after fire → cooldown blocks
-        result = speak.evaluate({"CREATIVITY": 2.0, "REFLECTION": 2.0, "EMPATHY": 2.0})
-        assert result["should_fire"] is False
+        # Start near threshold so depletion measurably moves urge below it.
+        hormones = {"CREATIVITY": 1.0, "REFLECTION": 1.0, "EMPATHY": 1.0}
+        fires = 0
+        for _ in range(20):
+            result = speak.evaluate(hormones)
+            if not result["should_fire"]:
+                break
+            # Caller is responsible for applying consumption per the fire()
+            # docstring: "consumption dict tells the caller which hormones
+            # to deplete and by how much."
+            consumption = speak.fire()["consumption"]
+            for h, c in consumption.items():
+                hormones[h] = max(0.0, hormones[h] - c)
+            fires += 1
+        # Final evaluate confirms the natural pause kicked in.
+        assert speak.evaluate(hormones)["should_fire"] is False
+        # Sanity: at least one fire happened and the loop terminated by
+        # depletion rather than running out of iterations.
+        assert 0 < fires < 20
 
     def test_fire_increments_count(self):
         speak = create_speak()

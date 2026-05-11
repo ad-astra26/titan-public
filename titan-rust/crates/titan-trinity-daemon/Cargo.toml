@@ -1,0 +1,42 @@
+[package]
+name = "titan-trinity-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared library for the 6 trinity daemons (Phase C C-S5 + C-S6) — tick scheduler, slot I/O, content-hash gating, filter_apply + ground_up primitives, adoption msgpack vectors"
+
+[dependencies]
+titan-core = { path = "../titan-core" }
+titan-state = { path = "../titan-state" }
+titan-bus = { path = "../titan-bus" }
+rmpv.workspace = true
+
+# Async runtime — daemons are tokio-driven (Schumann-rate ticks via tokio::time::interval)
+tokio.workspace = true
+
+# Content-hash gating per SPEC §7.1 (xxh3_64; ~1.7 GB/s on x86_64; non-cryptographic)
+xxhash-rust.workspace = true
+
+# Tracing (SPEC §16 structured-JSON logging)
+tracing.workspace = true
+
+# Error types
+thiserror.workspace = true
+
+# msgpack (B.2.1 ADOPTION_REQUEST 79-byte vector parity per SPEC D14 + D18)
+rmp-serde.workspace = true
+serde.workspace = true
+
+# Jittered cadence RNG for outer trinity daemons (C-S6 jittered_tick.rs).
+# Outer cadences are NOT Schumann-locked per SPEC §18.1 — uniform jitter
+# decorrelates per-daemon firings (no Schumann discipline applies).
+rand.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+serde_json.workspace = true
+
+[lints]
+workspace = true

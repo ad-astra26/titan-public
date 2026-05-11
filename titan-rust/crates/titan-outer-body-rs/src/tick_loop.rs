@@ -1,0 +1,1206 @@
+//! tick_loop — outer-body jittered ~10s tick + state machine.
+//!
+//! Per SPEC §9.A `titan-outer-body-rs` row + §18.1 outer cadence
+//! resolution + master plan §10.6 chunk C6-3. Logic flow per tick:
+//!
+//! 1. Read `sensor_cache_outer_body.bin` → msgpack-decode source dict
+//!    written by Python sidecar `outer_body_sensor_refresh.py`. Project
+//!    to a 5D base body vector via the V6 body-felt formula
+//!    (interoception / proprioception / somatosensation / entropy /
+//!    thermal — port of `outer_trinity.py:_collect_outer_body`). On
+//!    cache miss / stale (per SPEC §18.1 `wall_ns < now − 3 × cadence`),
+//!    fall back to last-known + emit confidence=0.0 log.
+//! 2. Read `topology_30d.bin[0:10]` → outer_lower 10D (when last
+//!    TRINITY_SUBSTRATE_TOPOLOGY_UPDATED was received).
+//! 3. Apply UNIFIED + LOCAL filter_down (multipliers from
+//!    UNIFIED_SPIRIT_FILTER_DOWN.outer_body[5] +
+//!    OUTER_SPIRIT_FILTER_DOWN.body[5] bus events; G7 [0.3, 3.0] clamp).
+//! 4. Apply ground_up nudge to all 5D per G10 (body all dims grounded).
+//! 5. Content-hash gate: if payload differs from previous tick, write
+//!    `outer_body_5d.bin` via SeqLock + publish BODY_STATE (src=outer).
+
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{anyhow, Context, Result};
+use tokio::sync::Notify;
+use tracing::{debug, info, warn};
+
+use titan_bus::{BusClient, InboundEvent};
+use titan_core::constants::{
+    OUTER_BODY_BUS_PUBLISH_INTERVAL_S, OUTER_BODY_FIRING_MAX_BYTES,
+    OUTER_BODY_FIRING_SCHEMA_VERSION, OUTER_BODY_TICK_BASE_S,
+};
+use titan_schumann::{SchumannGenerator, SchumannRole};
+use titan_state::Slot;
+use titan_trinity_daemon::{
+    apply_multipliers, compose_multipliers_default, decode_local_filter_down_payload,
+    encode_floats, read_sensor_cache, read_topology_outer_lower, ContentGate, FiringSlotWriter,
+    GroundUpEnricher, PublishThrottle, SensorCacheRead, Side, OUTER_BODY_TOPICS,
+};
+
+/// Boot the daemon's runtime + drive the tick loop until SIGTERM /
+/// disconnect.
+pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()> {
+    let client = BusClient::connect(bus_socket, authkey, "outer-body")
+        .await
+        .with_context(|| format!("bus connect to {}", bus_socket.display()))?;
+    client
+        .subscribe(OUTER_BODY_TOPICS)
+        .await
+        .context("bus subscribe")?;
+    info!(event = "BUS_SUBSCRIBED", topics = ?OUTER_BODY_TOPICS);
+
+    let outer_body_slot = open_slot(shm_dir, "outer_body_5d.bin")?;
+    let topology_slot = open_slot(shm_dir, "topology_30d.bin")?;
+    let sensor_cache_path = shm_dir.join("sensor_cache_outer_body.bin");
+    info!(
+        event = "SHM_OPENED",
+        topology_present = topology_slot.path().exists(),
+        sensor_cache_path = ?sensor_cache_path,
+    );
+
+    // Phase C 130D dim-live tracker bridge (rFP §4.7).
+    let firing_writer = FiringSlotWriter::new(
+        "outer_body",
+        shm_dir,
+        OUTER_BODY_FIRING_SCHEMA_VERSION as u32,
+        OUTER_BODY_FIRING_MAX_BYTES as u32,
+    );
+
+    client
+        .publish("MODULE_READY", Some("guardian"), None)
+        .await
+        .context("publish MODULE_READY")?;
+    info!(event = "MODULE_READY_SENT");
+
+    let state = Arc::new(Mutex::new(DaemonState::default()));
+    let shutdown = Arc::new(Notify::new());
+
+    let dispatcher_state = state.clone();
+    let dispatcher_shutdown = shutdown.clone();
+    let bus = Arc::new(client);
+    let bus_for_dispatcher = bus.clone();
+    let dispatcher = tokio::spawn(async move {
+        run_event_dispatcher(bus_for_dispatcher, dispatcher_state, dispatcher_shutdown).await;
+    });
+
+    let tick_result = run_tick_loop(
+        bus.clone(),
+        state.clone(),
+        shutdown.clone(),
+        outer_body_slot,
+        topology_slot,
+        sensor_cache_path,
+        firing_writer,
+    )
+    .await;
+
+    shutdown.notify_waiters();
+    let _ = dispatcher.await;
+    bus.shutdown().await;
+
+    tick_result
+}
+
+/// Per-daemon mutable state — protected by Mutex; tick loop + dispatcher
+/// both touch it.
+#[derive(Debug, Default)]
+struct DaemonState {
+    /// Most recent UNIFIED_SPIRIT_FILTER_DOWN.outer_body multipliers.
+    unified: Option<[f32; 5]>,
+    /// Most recent OUTER_SPIRIT_FILTER_DOWN.body multipliers (LOCAL).
+    local: Option<[f32; 5]>,
+    /// Most recent topology_lower from TRINITY_SUBSTRATE_TOPOLOGY_UPDATED.
+    topology_signaled: bool,
+    /// Set true when KERNEL_SHUTDOWN_ANNOUNCE arrives.
+    shutdown_requested: bool,
+    /// Last successfully-computed 5D body vector — fall-back when sensor
+    /// cache is stale per SPEC §18.1.
+    last_body: [f32; 5],
+}
+
+async fn run_event_dispatcher(
+    bus: Arc<BusClient>,
+    state: Arc<Mutex<DaemonState>>,
+    shutdown: Arc<Notify>,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => {
+                debug!(event = "DISPATCHER_SHUTDOWN_NOTIFIED");
+                break;
+            }
+            event = bus.recv() => match event {
+                Some(InboundEvent::Message { msg_type, raw_bytes, .. }) => {
+                    handle_bus_message(&msg_type, &raw_bytes, &state);
+                    if msg_type == "KERNEL_SHUTDOWN_ANNOUNCE" {
+                        if let Ok(mut s) = state.lock() {
+                            s.shutdown_requested = true;
+                        }
+                        shutdown.notify_waiters();
+                        break;
+                    }
+                }
+                Some(InboundEvent::Disconnected { reason }) => {
+                    warn!(event = "BUS_DISCONNECTED", reason = %reason);
+                    break;
+                }
+                None => {
+                    warn!(event = "BUS_EVENT_CHANNEL_CLOSED");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn handle_bus_message(msg_type: &str, raw_bytes: &[u8], state: &Arc<Mutex<DaemonState>>) {
+    match msg_type {
+        "UNIFIED_SPIRIT_FILTER_DOWN" => {
+            let payload = match titan_bus::client::extract_payload(raw_bytes) {
+                Some(p) => p,
+                None => return,
+            };
+            match decode_unified_outer_body(&payload) {
+                Ok(mults) => {
+                    if let Ok(mut s) = state.lock() {
+                        s.unified = Some(mults);
+                    }
+                }
+                Err(e) => warn!(err = ?e, "decode UNIFIED_SPIRIT_FILTER_DOWN.outer_body failed"),
+            }
+        }
+        "OUTER_SPIRIT_FILTER_DOWN" => {
+            let payload = match titan_bus::client::extract_payload(raw_bytes) {
+                Some(p) => p,
+                None => return,
+            };
+            match decode_local_filter_down_payload(&payload) {
+                Ok(p) => {
+                    if let Ok(mut s) = state.lock() {
+                        s.local = Some(p.body);
+                    }
+                }
+                Err(e) => warn!(err = ?e, "decode OUTER_SPIRIT_FILTER_DOWN failed"),
+            }
+        }
+        "TRINITY_SUBSTRATE_TOPOLOGY_UPDATED" => {
+            if let Ok(mut s) = state.lock() {
+                s.topology_signaled = true;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Decode `UNIFIED_SPIRIT_FILTER_DOWN.multipliers.outer_body[5]` from the
+/// msgpack envelope. Sibling of `decode_filter_down_payload` in
+/// titan-trinity-daemon::subscriptions which only extracts inner fields;
+/// outer daemons need the outer slice from the same message.
+fn decode_unified_outer_body(payload: &[u8]) -> Result<[f32; 5]> {
+    use rmpv::Value;
+    let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(payload))
+        .map_err(|e| anyhow!("payload root: {e}"))?;
+    let map = match &v {
+        Value::Map(items) => items,
+        _ => return Err(anyhow!("payload not a map")),
+    };
+    let mut multipliers: Option<&Value> = None;
+    for (k, val) in map.iter() {
+        if let Value::String(s) = k {
+            if s.as_str() == Some("multipliers") {
+                multipliers = Some(val);
+                break;
+            }
+        }
+    }
+    let mults_map = match multipliers {
+        Some(Value::Map(items)) => items,
+        _ => return Err(anyhow!("multipliers field missing or not a map")),
+    };
+    let mut outer_body = [1.0_f32; 5];
+    let mut found = false;
+    for (k, val) in mults_map.iter() {
+        if let Value::String(s) = k {
+            if s.as_str() == Some("outer_body") {
+                decode_float_array_into(val, &mut outer_body)?;
+                found = true;
+                break;
+            }
+        }
+    }
+    if !found {
+        return Err(anyhow!("multipliers.outer_body missing"));
+    }
+    Ok(outer_body)
+}
+
+fn decode_float_array_into(val: &rmpv::Value, out: &mut [f32]) -> Result<()> {
+    use rmpv::Value;
+    let arr = match val {
+        Value::Array(a) => a,
+        _ => return Err(anyhow!("not an array")),
+    };
+    if arr.len() != out.len() {
+        return Err(anyhow!(
+            "expected {} elements, got {}",
+            out.len(),
+            arr.len()
+        ));
+    }
+    for (i, v) in arr.iter().enumerate() {
+        out[i] = v
+            .as_f64()
+            .ok_or_else(|| anyhow!("element {i} not numeric"))? as f32;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_tick_loop(
+    bus: Arc<BusClient>,
+    state: Arc<Mutex<DaemonState>>,
+    shutdown: Arc<Notify>,
+    mut outer_body_slot: Slot,
+    topology_slot: Slot,
+    sensor_cache_path: std::path::PathBuf,
+    mut firing_writer: FiringSlotWriter,
+) -> Result<()> {
+    // Post-A.S8 D2 cadence migration (rFP §4.2): Schumann body (7.83 Hz)
+    // tick + bus publish throttled to OUTER_BODY_BUS_PUBLISH_INTERVAL_S.
+    // Body-slowest G13 invariant: this throttle (45s) > mind (15s) > spirit (5s).
+    let epoch_t0 = tokio::time::Instant::now();
+    let generator = SchumannGenerator::new(SchumannRole::Body, epoch_t0);
+    let period_ns = generator.period_ns();
+    let mut tick_rx = generator.spawn(shutdown.clone());
+
+    let mut content_gate = ContentGate::new();
+    let mut ground_up = GroundUpEnricher::new(Side::Body);
+    let mut publish_throttle = PublishThrottle::new(OUTER_BODY_BUS_PUBLISH_INTERVAL_S);
+
+    info!(
+        event = "TICK_LOOP_START",
+        role = "outer-body",
+        period_ns,
+        publish_interval_s = OUTER_BODY_BUS_PUBLISH_INTERVAL_S,
+    );
+
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => {
+                info!(event = "TICK_LOOP_SHUTDOWN_REQUESTED");
+                break;
+            }
+            maybe_tick = tick_rx.recv() => match maybe_tick {
+                Some(tick_event) => {
+                    debug!(
+                        event = "OUTER_BODY_TICK",
+                        epoch = tick_event.epoch,
+                        period_ns = tick_event.period_ns,
+                    );
+                    if let Err(e) = run_one_tick(
+                        &bus, &state, &mut content_gate, &mut ground_up, &mut publish_throttle,
+                        &mut outer_body_slot, &topology_slot, &sensor_cache_path,
+                        &mut firing_writer,
+                    ).await {
+                        warn!(err = ?e, "tick failed (continuing)");
+                    }
+                    if let Ok(s) = state.lock() {
+                        if s.shutdown_requested {
+                            info!(event = "SHUTDOWN_REQUESTED_VIA_BUS");
+                            break;
+                        }
+                    }
+                }
+                None => {
+                    info!(event = "TICK_CHANNEL_CLOSED");
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stale threshold per SPEC §18.1 = 3 × natural_cadence (= 30s for outer-body).
+fn outer_body_stale_threshold_s() -> f64 {
+    OUTER_BODY_TICK_BASE_S * 3.0
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_one_tick(
+    bus: &Arc<BusClient>,
+    state: &Arc<Mutex<DaemonState>>,
+    content_gate: &mut ContentGate,
+    ground_up: &mut GroundUpEnricher,
+    publish_throttle: &mut PublishThrottle,
+    outer_body_slot: &mut Slot,
+    topology_slot: &Slot,
+    sensor_cache_path: &Path,
+    firing_writer: &mut FiringSlotWriter,
+) -> Result<()> {
+    // 1. Read sensor cache (msgpack source dict from Python sidecar) +
+    //    project to 5D body vector. On stale or missing, use last-known.
+    let last_body = {
+        let s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
+        s.last_body
+    };
+    let mut body = read_outer_body_from_cache(sensor_cache_path, last_body);
+
+    // 2. Snapshot bus state.
+    let (unified_mult, local_mult, topology_fresh) = {
+        let s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
+        (s.unified, s.local, s.topology_signaled)
+    };
+
+    // 3. Compose multipliers (UNIFIED ⊗ LOCAL when both present).
+    let composed = match (unified_mult, local_mult) {
+        (Some(u), Some(l)) => compose_multipliers_default(&u, &l),
+        (Some(u), None) => u.to_vec(),
+        (None, Some(l)) => l.to_vec(),
+        (None, None) => vec![1.0_f32; 5],
+    };
+
+    // 4. Apply filter_down multipliers (G7 clamp [0.3, 3.0] enforced by lib).
+    apply_multipliers(&mut body, &composed);
+
+    // 5. Apply ground_up if topology has been signaled at least once.
+    //    Per G10 ground_up_body_range=0:5 — body all 5D grounded.
+    if topology_fresh {
+        if let Ok(topology_lower) = read_topology_outer_lower(topology_slot) {
+            ground_up.apply_to_body(&mut body, &topology_lower, 1.0)?;
+        }
+    }
+
+    // 6. Cache fresh body for next-tick fallback.
+    if let Ok(mut s) = state.lock() {
+        s.last_body = body;
+    }
+
+    // 7. Encode + content-hash gate the slot write.
+    let bytes = encode_floats::<5>(&body);
+    if content_gate.should_write(&bytes) {
+        outer_body_slot
+            .write(&bytes)
+            .map_err(|e| anyhow!("slot write: {e}"))?;
+    }
+
+    // 7b. Phase C dim-live tracker bridge (rFP §4.7) — record per tick
+    //     at full Schumann body cadence (independent of bus publish
+    //     throttle). dim-live needs the per-tick firing signal even
+    //     though BODY_STATE bus publish is throttled to every ~45s.
+    firing_writer.record_tick(&body, &[], now_secs());
+
+    // 8. Bus publish throttled per OUTER_BODY_BUS_PUBLISH_INTERVAL_S (post-A.S8
+    //    D2 — rFP §4.2). Tick fires at Schumann body (7.83 Hz) but
+    //    BODY_STATE publishes only every ~45s. Slot writes (above) remain
+    //    at full tick cadence under content-hash gating.
+    if publish_throttle.should_publish() {
+        let payload = encode_body_state_payload(&body);
+        bus.publish("BODY_STATE", Some("all"), Some(&payload))
+            .await
+            .map_err(|e| anyhow!("publish BODY_STATE: {e}"))?;
+    }
+
+    Ok(())
+}
+
+/// Read the outer_body sensor cache + project msgpack source dict to 5D.
+///
+/// Cold boot / stale fallback: returns `last_body` (last successful
+/// compute). On Python sidecar source-dict shape parsing failure,
+/// returns `last_body` and logs WARN (rate-limited by tracing).
+fn read_outer_body_from_cache(path: &Path, last_body: [f32; 5]) -> [f32; 5] {
+    match read_sensor_cache(path, outer_body_stale_threshold_s()) {
+        Ok(SensorCacheRead::Fresh { payload, .. }) => {
+            match project_outer_body_5d(&payload, last_body) {
+                Ok(body) => body,
+                Err(e) => {
+                    warn!(err = ?e, "outer_body source-dict project failed; using last-known");
+                    last_body
+                }
+            }
+        }
+        Ok(SensorCacheRead::Stale { age_s, .. }) => {
+            warn!(
+                event = "SENSOR_CACHE_STALE",
+                age_s,
+                threshold_s = outer_body_stale_threshold_s(),
+                confidence = 0.0,
+                "outer_body sensor cache stale; using last-known body",
+            );
+            last_body
+        }
+        Ok(SensorCacheRead::Missing) => last_body,
+        Err(e) => {
+            warn!(err = ?e, "sensor_cache read errored; using last-known");
+            last_body
+        }
+    }
+}
+
+// ── V6 outer_body_5d full port ─────────────────────────────────────
+//
+// Byte-identical port of `titan_plugin/logic/outer_trinity.py::_collect_outer_body`
+// (lines 372–478). 5DT V6 body-felt semantics with weighted blends + clamp.
+//
+// Parity bar: |Δ| < 1e-4 (the Python output is `round(v, 4)`, so f32 cast
+// preserves all 4-decimal-place values within 1e-4 of f64).
+//
+// Closes rFP_phase_c_close_all_runtime_gaps chunk 9G — supersedes the
+// stub-port that read only `sol_balance` for dim[0]. Per Prime Directive #1
+// "if a function exists, it MUST do the work its name claims".
+
+/// V6 5DT body-felt projection. Pure compute — caller passes the
+/// msgpack-encoded source dict from the Python sidecar plus the
+/// previous-tick `last_body` (used by dim[2] somatosensation per
+/// `outer_trinity.py:434` `current_ob2 = self._last_outer_body[2]`,
+/// with the 9G decay-fix applied — see [`apply_dim2_decay`]).
+///
+/// Returns `Err` only when the msgpack envelope is fundamentally malformed
+/// (not a map). Missing individual fields contribute their documented
+/// neutral defaults (0.5 for ratios / scalars, 0.0 for rates).
+fn project_outer_body_5d(payload: &[u8], last_body: [f32; 5]) -> Result<[f32; 5]> {
+    use rmpv::Value;
+    let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(payload))
+        .map_err(|e| anyhow!("decode source dict: {e}"))?;
+    let map = match &v {
+        Value::Map(items) => items,
+        _ => return Err(anyhow!("source dict not a map")),
+    };
+
+    // ── Top-level field lookups (each may be Nil/missing → None). ──
+    let agency = lookup_map(map, "agency_stats");
+    let helper_statuses = lookup_map(map, "helper_statuses");
+    let sys_stats = lookup_map(map, "system_sensor_stats");
+    let net_stats = lookup_map(map, "network_monitor_stats");
+    let tx_lat = lookup_map(map, "tx_latency_stats");
+    let blk_delta = lookup_map(map, "block_delta_stats");
+    let anchor = lookup_map(map, "anchor_state");
+    let sol_balance = lookup_field(map, "sol_balance");
+
+    // ── [0] interoception ─────────────────────────────────────────
+    // Python lines 393-410.
+    let sol_norm: f64 = match sol_balance.and_then(value_as_f64_nonneg) {
+        Some(s) => safe_clamp(s.ln_1p() / 10.0_f64.ln_1p()),
+        None => 0.5,
+    };
+    let block_rate_norm: f64 = field_or_default(blk_delta.as_ref(), "normalized", 0.5);
+    let anchor_fresh: f64 = anchor_freshness(anchor.as_ref());
+    let interoception: f64 =
+        safe_clamp(0.4 * sol_norm + 0.3 * block_rate_norm + 0.3 * anchor_fresh);
+
+    // ── [1] proprioception ────────────────────────────────────────
+    // Python lines 412-423.
+    let peer_entropy: f64 = field_or_default(net_stats.as_ref(), "peer_entropy", 0.5);
+    let helper_health: f64 = compute_helper_health(helper_statuses.as_ref());
+    let bus_module_diversity: f64 =
+        field_or_default(net_stats.as_ref(), "bus_module_diversity", 0.5);
+    let proprioception: f64 =
+        safe_clamp(0.5 * peer_entropy + 0.3 * helper_health + 0.2 * bus_module_diversity);
+
+    // ── [2] somatosensation ───────────────────────────────────────
+    // Python lines 425-442. dim[2] reads previous-tick value (`current_ob2`).
+    // 9G decay-fix: apply exponential decay toward 0.5 per tick to
+    // prevent saturation. See `apply_dim2_decay` rationale.
+    let tx_lat_norm: f64 = field_or_default(tx_lat.as_ref(), "normalized", 0.5);
+    let current_ob2: f64 = apply_dim2_decay(last_body[2] as f64);
+    let cpu_spikes: f64 = field_or_default(sys_stats.as_ref(), "cpu_spike_rate", 0.0);
+    let somatosensation: f64 =
+        safe_clamp(0.4 * tx_lat_norm + 0.3 * current_ob2 + 0.3 * cpu_spikes);
+
+    // ── [3] entropy ───────────────────────────────────────────────
+    // Python lines 444-458.
+    let ping_var: f64 = field_or_default(net_stats.as_ref(), "ping_variance", 0.5);
+    let bus_drop_rate: f64 = field_or_default(net_stats.as_ref(), "bus_drop_rate", 0.0);
+    let error_rate: f64 = compute_error_rate(agency.as_ref());
+    let entropy: f64 = safe_clamp(0.4 * ping_var + 0.3 * bus_drop_rate + 0.3 * error_rate);
+
+    // ── [4] thermal ───────────────────────────────────────────────
+    // SPEC §23.7 dim 4 thermal REDESIGNED 2026-05-07 (rFP §4.1 P1):
+    //   `0.35 * cpu_thermal + 0.25 * circadian + 0.40 * hormonal_heat`
+    // where `hormonal_heat = mean(IMPULSE, VIGILANCE)` from spirit_proxy
+    // hormones. Replaces pre-redesign `0.4*cpu_thermal + 0.3*circadian +
+    // 0.3*llm_latency_norm` (with llm_latency_norm always 0.5 because
+    // llm_avg_latency was never in outer_body SOURCE_KEYS — was a
+    // misconfigured stub). hormone_levels added to outer_body
+    // SOURCE_KEYS Step 3 commit ea70d3d9.
+    let cpu_thermal: f64 = field_or_default(sys_stats.as_ref(), "cpu_thermal", 0.5);
+    let circadian: f64 = field_or_default(sys_stats.as_ref(), "circadian_phase", 0.5);
+    let hormone_levels = lookup_map(map, "hormone_levels");
+    let impulse: f64 = field_or_default(hormone_levels.as_ref(), "IMPULSE", 0.5);
+    let vigilance: f64 = field_or_default(hormone_levels.as_ref(), "VIGILANCE", 0.5);
+    let hormonal_heat: f64 = (impulse + vigilance) / 2.0;
+    let thermal: f64 =
+        safe_clamp(0.35 * cpu_thermal + 0.25 * circadian + 0.40 * hormonal_heat);
+
+    // ── Final: round to 4 decimals + cast to f32 (matches Python
+    // `round(v, 4)` output then f32 slot write). ─────────────────────
+    Ok([
+        round4_f32(interoception),
+        round4_f32(proprioception),
+        round4_f32(somatosensation),
+        round4_f32(entropy),
+        round4_f32(thermal),
+    ])
+}
+
+// ── V6 helpers (named to mirror Python semantics) ─────────────────
+
+/// `_safe_clamp(value, lo=0.0, hi=1.0)` from `outer_trinity.py:749-756`.
+/// Defaults to 0.5 on NaN/Inf; otherwise clamps to [0, 1].
+fn safe_clamp(v: f64) -> f64 {
+    if v.is_nan() || v.is_infinite() {
+        return 0.5;
+    }
+    v.clamp(0.0, 1.0)
+}
+
+/// Round to 4 decimal places (Python `round(v, 4)`) and return as f32.
+/// Python 3 uses banker's rounding (half-to-even); for f32-precision
+/// values the difference vs round-half-away-from-zero is below f32 ε
+/// for nearly all inputs. Tolerance check in parity tests = 1e-4.
+fn round4_f32(v: f64) -> f32 {
+    let scaled = v * 10_000.0;
+    let rounded = scaled.round_ties_even();
+    (rounded / 10_000.0) as f32
+}
+
+/// Look up a top-level key; if value is a map, return its entries.
+/// Missing or non-map values return None — callers treat that as
+/// "field absent → use defaults" (matches Python `sources.get("k") or {}`).
+fn lookup_map<'a>(
+    map: &'a [(rmpv::Value, rmpv::Value)],
+    key: &str,
+) -> Option<Vec<(rmpv::Value, rmpv::Value)>> {
+    use rmpv::Value;
+    for (k, v) in map.iter() {
+        if let Value::String(s) = k {
+            if s.as_str() == Some(key) {
+                if let Value::Map(items) = v {
+                    return Some(items.clone());
+                }
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// Look up a top-level field as a raw rmpv::Value (no type check).
+fn lookup_field<'a>(
+    map: &'a [(rmpv::Value, rmpv::Value)],
+    key: &str,
+) -> Option<rmpv::Value> {
+    use rmpv::Value;
+    for (k, v) in map.iter() {
+        if let Value::String(s) = k {
+            if s.as_str() == Some(key) {
+                return Some(v.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Look up a numeric field within a sub-map; default if missing/non-numeric.
+fn field_or_default(
+    map: Option<&Vec<(rmpv::Value, rmpv::Value)>>,
+    key: &str,
+    default: f64,
+) -> f64 {
+    let map = match map {
+        Some(m) => m,
+        None => return default,
+    };
+    use rmpv::Value;
+    for (k, v) in map.iter() {
+        if let Value::String(s) = k {
+            if s.as_str() == Some(key) {
+                return v.as_f64().unwrap_or(default);
+            }
+        }
+    }
+    default
+}
+
+/// Convert an rmpv::Value to f64 if it's a non-negative numeric. Used
+/// for `sol_balance` per Python's `isinstance(sol_balance, (int, float))
+/// and sol_balance >= 0` guard.
+fn value_as_f64_nonneg(v: rmpv::Value) -> Option<f64> {
+    let f = v.as_f64()?;
+    if f >= 0.0 {
+        Some(f)
+    } else {
+        None
+    }
+}
+
+/// Compute anchor freshness per Python lines 402-406:
+///   anchor_fresh = 0.5
+///   if anchor.success and anchor.last_anchor_time:
+///     since = time.time() - anchor.last_anchor_time
+///     anchor_fresh = max(0.05, 1.0 / (1.0 + since / 300.0))
+fn anchor_freshness(anchor: Option<&Vec<(rmpv::Value, rmpv::Value)>>) -> f64 {
+    let anchor = match anchor {
+        Some(a) => a,
+        None => return 0.5,
+    };
+    use rmpv::Value;
+    let mut success = false;
+    let mut last_ts: Option<f64> = None;
+    for (k, v) in anchor.iter() {
+        if let Value::String(s) = k {
+            match s.as_str() {
+                Some("success") => {
+                    success = matches!(v, Value::Boolean(true));
+                }
+                Some("last_anchor_time") => {
+                    last_ts = v.as_f64();
+                }
+                _ => {}
+            }
+        }
+    }
+    if !success {
+        return 0.5;
+    }
+    let last_ts = match last_ts {
+        Some(t) if t > 0.0 => t,
+        _ => return 0.5,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let since = (now - last_ts).max(0.0);
+    let raw = 1.0 / (1.0 + since / 300.0);
+    raw.max(0.05)
+}
+
+/// Compute helper_health = (count "available") / total per Python lines 415-417.
+/// total_helpers = max(1, len(helper_statuses)); empty/None → 0.5 neutral.
+fn compute_helper_health(
+    helper_statuses: Option<&Vec<(rmpv::Value, rmpv::Value)>>,
+) -> f64 {
+    let helpers = match helper_statuses {
+        Some(h) => h,
+        None => return 0.5,
+    };
+    use rmpv::Value;
+    let total = helpers.len();
+    if total == 0 {
+        return 0.5;
+    }
+    let mut available = 0_usize;
+    for (_k, v) in helpers.iter() {
+        if let Value::String(s) = v {
+            if s.as_str() == Some("available") {
+                available += 1;
+            }
+        }
+    }
+    available as f64 / total as f64
+}
+
+/// Compute error_rate = failed_actions / total_actions per Python lines 449-454.
+/// total_actions == 0 → error_rate = 0.0 (no actions → no errors).
+fn compute_error_rate(agency: Option<&Vec<(rmpv::Value, rmpv::Value)>>) -> f64 {
+    let agency = match agency {
+        Some(a) => a,
+        None => return 0.0,
+    };
+    let total: f64 = field_or_default(Some(agency), "total_actions", 0.0);
+    let failed: f64 = field_or_default(Some(agency), "failed_actions", 0.0);
+    if total > 0.0 {
+        (failed / total).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// 9G decay-fix: dim[2] (somatosensation) reads its own previous-tick
+/// value (`current_ob2`) which without decay creates a self-reinforcing
+/// loop that saturates upward — Python's `_collect_outer_body` line
+/// 427 explicitly flagged this as "decay fix shipping in next commit;
+/// until then, saturates". Per rFP §4 + Maker decision 2026-05-06
+/// "no deferrals", the fix lands here:
+///
+///   `current_ob2 = 0.5 + (last_ob2 - 0.5) × DECAY_FACTOR`
+///
+/// `DECAY_FACTOR = 0.95` per tick (10s cadence) gives a half-life of
+/// log(0.5)/log(0.95) ≈ 13.5 ticks ≈ 2.25 minutes — long enough that
+/// genuine cumulative load still registers, short enough that
+/// transient spikes don't pin the dim. Both Python `outer_trinity.py`
+/// and Rust port apply identical decay so parity tests stay green.
+fn apply_dim2_decay(last_ob2: f64) -> f64 {
+    const DECAY_FACTOR: f64 = 0.95;
+    0.5 + (last_ob2 - 0.5) * DECAY_FACTOR
+}
+
+fn open_slot(shm_dir: &Path, name: &str) -> Result<Slot> {
+    let path = shm_dir.join(name);
+    Slot::open(&path).with_context(|| format!("open slot {}", path.display()))
+}
+
+fn encode_body_state_payload(body: &[f32; 5]) -> Vec<u8> {
+    use rmpv::Value;
+    let values = Value::Array(body.iter().map(|f| Value::F64(*f as f64)).collect());
+    let map = Value::Map(vec![
+        (Value::String("src".into()), Value::String("outer".into())),
+        (
+            Value::String("type".into()),
+            Value::String("BODY_STATE".into()),
+        ),
+        (Value::String("values".into()), values),
+        (Value::String("ts".into()), Value::F64(now_secs())),
+    ]);
+    let mut out = Vec::with_capacity(96);
+    rmpv::encode::write_value(&mut out, &map)
+        .expect("rmpv encode never fails on well-formed Value");
+    out
+}
+
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use titan_core::constants::OUTER_BODY_5D_SCHEMA_VERSION;
+
+    /// Helper: pure-compute "what does run_one_tick produce given inputs"
+    /// — extracted so unit tests exercise the transformation pipeline
+    /// without spinning up tokio + bus + slots.
+    fn pure_compute(
+        raw_body: [f32; 5],
+        unified: Option<[f32; 5]>,
+        local: Option<[f32; 5]>,
+        topology_lower: Option<[f32; 10]>,
+        ground_up: &mut GroundUpEnricher,
+    ) -> [f32; 5] {
+        let mut body = raw_body;
+        let composed = match (unified, local) {
+            (Some(u), Some(l)) => compose_multipliers_default(&u, &l),
+            (Some(u), None) => u.to_vec(),
+            (None, Some(l)) => l.to_vec(),
+            (None, None) => vec![1.0_f32; 5],
+        };
+        apply_multipliers(&mut body, &composed);
+        if let Some(topo) = topology_lower {
+            ground_up.apply_to_body(&mut body, &topo, 1.0).unwrap();
+        }
+        body
+    }
+
+    #[test]
+    fn neutral_inputs_preserve_body() {
+        let mut g = GroundUpEnricher::new(Side::Body);
+        let raw = [0.5, 0.5, 0.5, 0.5, 0.5];
+        let out = pure_compute(raw, None, None, None, &mut g);
+        for i in 0..5 {
+            assert!((out[i] - raw[i]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn unified_only_applies_multipliers() {
+        let mut g = GroundUpEnricher::new(Side::Body);
+        let raw = [0.5; 5];
+        let unified = [2.0, 0.5, 1.0, 1.5, 0.3];
+        let out = pure_compute(raw, Some(unified), None, None, &mut g);
+        // 0.5 * 2.0 = 1.0 (clipped at TENSOR_MAX), 0.5 * 0.5 = 0.25
+        assert!((out[0] - 1.0).abs() < 1e-6);
+        assert!((out[1] - 0.25).abs() < 1e-6);
+        assert!((out[2] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn local_only_applies_multipliers() {
+        let mut g = GroundUpEnricher::new(Side::Body);
+        let raw = [0.5; 5];
+        let local = [1.0, 1.0, 2.0, 1.0, 1.0];
+        let out = pure_compute(raw, None, Some(local), None, &mut g);
+        assert!((out[2] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn unified_and_local_compose_with_g7_clamp() {
+        let mut g = GroundUpEnricher::new(Side::Body);
+        let raw = [0.5; 5];
+        // 2.0 (unified) * 1.5 (local) = 3.0 → at MULTIPLIER_CEIL=3.0
+        let unified = [2.0, 1.0, 1.0, 1.0, 1.0];
+        let local = [1.5, 1.0, 1.0, 1.0, 1.0];
+        let out = pure_compute(raw, Some(unified), Some(local), None, &mut g);
+        // body[0] = 0.5 * 3.0 = 1.5 → clipped at TENSOR_MAX=1.0
+        assert!((out[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ground_up_applied_to_all_5d_per_g10() {
+        let mut g = GroundUpEnricher::new(Side::Body);
+        let raw = [0.5; 5];
+        let topo: [f32; 10] = [0.04, 0.04, 0.04, 0.04, 0.04, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let out = pure_compute(raw, None, None, Some(topo), &mut g);
+        // Body all 5D nudged: delta = 0.002 * 0.1 * 1.0 = 0.0002 each
+        // (matches inner-body test pattern from C-S5; G10 ground_up_body_range=0:5)
+        for (i, val) in out.iter().enumerate() {
+            assert!(
+                (val - 0.5002).abs() < 1e-5,
+                "dim {} should be nudged ~0.0002",
+                i,
+            );
+        }
+    }
+
+    #[test]
+    fn ground_up_skipped_without_topology() {
+        let mut g = GroundUpEnricher::new(Side::Body);
+        let raw = [0.5; 5];
+        let out = pure_compute(raw, None, None, None, &mut g);
+        for v in out.iter() {
+            assert!((v - 0.5).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn body_payload_msgpack_shape() {
+        let body = [0.1, 0.2, 0.3, 0.4, 0.5];
+        let bytes = encode_body_state_payload(&body);
+        use rmpv::Value;
+        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let map = match v {
+            Value::Map(items) => items,
+            _ => panic!("not a map"),
+        };
+        let keys: Vec<String> = map
+            .iter()
+            .filter_map(|(k, _)| {
+                if let Value::String(s) = k {
+                    s.as_str().map(String::from)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(keys.contains(&"src".to_string()));
+        assert!(keys.contains(&"type".to_string()));
+        assert!(keys.contains(&"values".to_string()));
+        assert!(keys.contains(&"ts".to_string()));
+    }
+
+    #[test]
+    fn body_payload_src_is_outer() {
+        let body = [0.0; 5];
+        let bytes = encode_body_state_payload(&body);
+        use rmpv::Value;
+        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
+        if let Value::Map(items) = v {
+            for (k, val) in items {
+                if let Value::String(s) = k {
+                    if s.as_str() == Some("src") {
+                        assert_eq!(val, Value::String("outer".into()));
+                        return;
+                    }
+                }
+            }
+        }
+        panic!("src field missing");
+    }
+
+    #[test]
+    fn slot_write_5d_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("outer_body_5d.bin");
+        let mut slot = Slot::create(&path, OUTER_BODY_5D_SCHEMA_VERSION as u32, 20).unwrap();
+        let body: [f32; 5] = [0.1, 0.2, 0.3, 0.4, 0.5];
+        let bytes = encode_floats::<5>(&body);
+        slot.write(&bytes).unwrap();
+        let read = slot.read().unwrap();
+        assert_eq!(read, bytes);
+    }
+
+    #[test]
+    fn project_outer_body_returns_neutral_on_empty_dict() {
+        // Empty msgpack map → defaults dominate. Expected per Python:
+        // dim[0] = 0.4·0.5 + 0.3·0.5 + 0.3·0.5 = 0.5
+        // dim[1] = 0.5·0.5 + 0.3·0.5 + 0.2·0.5 = 0.5
+        // dim[2] = 0.4·0.5 + 0.3·apply_dim2_decay(0.5) + 0.3·0.0
+        //        = 0.20 + 0.3·0.5 + 0.0 = 0.35  (last_body[2]=0.5 → decayed=0.5)
+        // dim[3] = 0.4·0.5 + 0.3·0.0 + 0.3·0.0 = 0.20
+        // dim[4] = 0.4·0.5 + 0.3·0.5 + 0.3·0.5 = 0.5
+        use rmpv::Value;
+        let mut payload = Vec::new();
+        rmpv::encode::write_value(&mut payload, &Value::Map(vec![])).unwrap();
+        let last_body = [0.5_f32; 5];
+        let body = project_outer_body_5d(&payload, last_body).unwrap();
+        assert!((body[0] - 0.5).abs() < 1e-4);
+        assert!((body[1] - 0.5).abs() < 1e-4);
+        assert!((body[2] - 0.35).abs() < 1e-4);
+        assert!((body[3] - 0.20).abs() < 1e-4);
+        assert!((body[4] - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn project_outer_body_uses_sol_balance_for_interoception() {
+        // sol_balance=0.5 only: dim[0] interoception
+        // = 0.4·sol_norm + 0.3·0.5 (block_rate default) + 0.3·0.5 (anchor default)
+        // sol_norm = log1p(0.5)/log1p(10) ≈ 0.169
+        // dim[0] = 0.4·0.169 + 0.3·0.5 + 0.3·0.5 ≈ 0.368
+        use rmpv::Value;
+        let mut payload = Vec::new();
+        let map = Value::Map(vec![(Value::String("sol_balance".into()), Value::F64(0.5))]);
+        rmpv::encode::write_value(&mut payload, &map).unwrap();
+        let body = project_outer_body_5d(&payload, [0.5_f32; 5]).unwrap();
+        let sol_norm = 0.5_f64.ln_1p() / 10.0_f64.ln_1p();
+        let expected_d0 = (0.4 * sol_norm + 0.3 * 0.5 + 0.3 * 0.5) as f32;
+        assert!(
+            (body[0] - expected_d0).abs() < 1e-3,
+            "interoception got {} expected {}",
+            body[0],
+            expected_d0
+        );
+    }
+
+    #[test]
+    fn project_outer_body_dim2_decay_pulls_toward_neutral() {
+        // last_body[2] = 1.0 → decayed = 0.5 + (1.0 - 0.5) × 0.95 = 0.975
+        // Empty map → tx_lat=0.5, cpu_spikes=0.0
+        // dim[2] = 0.4·0.5 + 0.3·0.975 + 0.3·0.0 = 0.2 + 0.2925 = 0.4925
+        use rmpv::Value;
+        let mut payload = Vec::new();
+        rmpv::encode::write_value(&mut payload, &Value::Map(vec![])).unwrap();
+        let last_body = [0.0_f32, 0.0, 1.0, 0.0, 0.0];
+        let body = project_outer_body_5d(&payload, last_body).unwrap();
+        assert!(
+            (body[2] - 0.4925).abs() < 1e-4,
+            "dim[2] with last_ob2=1.0 should be ~0.4925; got {}",
+            body[2]
+        );
+    }
+
+    #[test]
+    fn project_outer_body_full_formula_matches_python_reference() {
+        // Construct realistic source dict with values for all 5 dims;
+        // verify the output matches the Python formula computed manually.
+        use rmpv::Value;
+
+        let payload = Value::Map(vec![
+            (Value::String("sol_balance".into()), Value::F64(2.0)),
+            (
+                Value::String("block_delta_stats".into()),
+                Value::Map(vec![(
+                    Value::String("normalized".into()),
+                    Value::F64(0.7),
+                )]),
+            ),
+            (
+                Value::String("anchor_state".into()),
+                Value::Map(vec![
+                    (Value::String("success".into()), Value::Boolean(true)),
+                    // last_anchor_time = now → since = 0 → fresh = 1.0
+                    (
+                        Value::String("last_anchor_time".into()),
+                        Value::F64(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs_f64(),
+                        ),
+                    ),
+                ]),
+            ),
+            (
+                Value::String("network_monitor_stats".into()),
+                Value::Map(vec![
+                    (Value::String("peer_entropy".into()), Value::F64(0.8)),
+                    (
+                        Value::String("bus_module_diversity".into()),
+                        Value::F64(0.6),
+                    ),
+                    (Value::String("ping_variance".into()), Value::F64(0.3)),
+                    (Value::String("bus_drop_rate".into()), Value::F64(0.1)),
+                ]),
+            ),
+            (
+                Value::String("helper_statuses".into()),
+                Value::Map(vec![
+                    (
+                        Value::String("a".into()),
+                        Value::String("available".into()),
+                    ),
+                    (
+                        Value::String("b".into()),
+                        Value::String("available".into()),
+                    ),
+                    (
+                        Value::String("c".into()),
+                        Value::String("offline".into()),
+                    ),
+                ]),
+            ),
+            (
+                Value::String("tx_latency_stats".into()),
+                Value::Map(vec![(
+                    Value::String("normalized".into()),
+                    Value::F64(0.4),
+                )]),
+            ),
+            (
+                Value::String("system_sensor_stats".into()),
+                Value::Map(vec![
+                    (Value::String("cpu_spike_rate".into()), Value::F64(0.2)),
+                    (Value::String("cpu_thermal".into()), Value::F64(0.6)),
+                    (Value::String("circadian_phase".into()), Value::F64(0.4)),
+                ]),
+            ),
+            (
+                Value::String("agency_stats".into()),
+                Value::Map(vec![
+                    (Value::String("total_actions".into()), Value::Integer(100.into())),
+                    (Value::String("failed_actions".into()), Value::Integer(15.into())),
+                ]),
+            ),
+        ]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &payload).unwrap();
+        let last_body = [0.0_f32, 0.0, 0.6, 0.0, 0.0]; // dim[2] tracks
+        let body = project_outer_body_5d(&bytes, last_body).unwrap();
+
+        // Hand-computed expected (Python-faithful):
+        //   sol_norm = log1p(2.0)/log1p(10) ≈ 0.4581
+        //   d0 = 0.4·0.4581 + 0.3·0.7 + 0.3·1.0 = 0.6932
+        //   helper_health = 2/3 ≈ 0.6667
+        //   d1 = 0.5·0.8 + 0.3·0.6667 + 0.2·0.6 = 0.72
+        //   ob2_decayed = 0.5 + (0.6 - 0.5)*0.95 = 0.595
+        //   d2 = 0.4·0.4 + 0.3·0.595 + 0.3·0.2 = 0.3985
+        //   error_rate = 15/100 = 0.15
+        //   d3 = 0.4·0.3 + 0.3·0.1 + 0.3·0.15 = 0.195
+        //   d4 = 0.4·0.6 + 0.3·0.4 + 0.3·0.5 = 0.51
+        let expected = [0.6932_f32, 0.72_f32, 0.3985_f32, 0.195_f32, 0.51_f32];
+        for i in 0..5 {
+            assert!(
+                (body[i] - expected[i]).abs() < 1e-3,
+                "dim[{i}] got {} expected {}",
+                body[i],
+                expected[i]
+            );
+        }
+    }
+
+    #[test]
+    fn safe_clamp_handles_nan_and_inf() {
+        assert_eq!(safe_clamp(f64::NAN), 0.5);
+        assert_eq!(safe_clamp(f64::INFINITY), 0.5);
+        assert_eq!(safe_clamp(f64::NEG_INFINITY), 0.5);
+        assert_eq!(safe_clamp(2.0), 1.0);
+        assert_eq!(safe_clamp(-1.0), 0.0);
+        assert_eq!(safe_clamp(0.5), 0.5);
+    }
+
+    #[test]
+    fn round4_f32_matches_python_round() {
+        assert_eq!(round4_f32(0.123456), 0.1235);
+        assert_eq!(round4_f32(0.5), 0.5);
+        assert_eq!(round4_f32(0.0), 0.0);
+        assert_eq!(round4_f32(1.0), 1.0);
+    }
+
+    #[test]
+    fn apply_dim2_decay_pulls_toward_half() {
+        // From neutral: stays at 0.5
+        assert!((apply_dim2_decay(0.5) - 0.5).abs() < 1e-9);
+        // From 1.0: decays toward 0.5: 0.5 + 0.5*0.95 = 0.975
+        assert!((apply_dim2_decay(1.0) - 0.975).abs() < 1e-9);
+        // From 0.0: 0.5 + (-0.5)*0.95 = 0.025
+        assert!((apply_dim2_decay(0.0) - 0.025).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decode_unified_outer_body_extracts_field() {
+        use rmpv::Value;
+        let payload = Value::Map(vec![
+            (
+                Value::String("multipliers".into()),
+                Value::Map(vec![(
+                    Value::String("outer_body".into()),
+                    Value::Array(vec![
+                        Value::F64(1.5),
+                        Value::F64(0.8),
+                        Value::F64(2.0),
+                        Value::F64(1.0),
+                        Value::F64(0.5),
+                    ]),
+                )]),
+            ),
+            (Value::String("epoch_id".into()), Value::Integer(42.into())),
+            (Value::String("ts".into()), Value::F64(1714400000.0)),
+        ]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &payload).unwrap();
+        let mults = decode_unified_outer_body(&bytes).unwrap();
+        let expected: [f32; 5] = [1.5, 0.8, 2.0, 1.0, 0.5];
+        for i in 0..5 {
+            assert!((mults[i] - expected[i]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn decode_unified_outer_body_errors_on_missing_field() {
+        // multipliers map without outer_body key
+        use rmpv::Value;
+        let payload = Value::Map(vec![(
+            Value::String("multipliers".into()),
+            Value::Map(vec![]),
+        )]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &payload).unwrap();
+        let result = decode_unified_outer_body(&bytes);
+        assert!(result.is_err(), "missing outer_body should error");
+    }
+
+    #[test]
+    fn content_hash_gates_redundant_writes() {
+        let mut gate = ContentGate::new();
+        let body: [f32; 5] = [0.1, 0.2, 0.3, 0.4, 0.5];
+        let bytes = encode_floats::<5>(&body);
+        assert!(gate.should_write(&bytes));
+        assert!(!gate.should_write(&bytes));
+        assert!(!gate.should_write(&bytes));
+        assert_eq!(gate.write_count(), 1);
+        assert_eq!(gate.suppress_count(), 2);
+    }
+
+    #[test]
+    fn stale_threshold_is_3x_cadence() {
+        // SPEC §18.1: outer_body cadence 10s × 3 = 30s
+        assert_eq!(outer_body_stale_threshold_s(), 30.0);
+    }
+
+    #[test]
+    fn cadence_constants_match_spec() {
+        // Sensor sidecar refresh cadence (post-A.S8 D2: stale threshold source).
+        assert_eq!(OUTER_BODY_TICK_BASE_S, 10.0);
+        // Bus publish throttle (post-A.S8 D2 — Schumann body × 39 ≈ 45s).
+        // Body-slowest G13 invariant: 45 > 15 (mind) > 5 (spirit).
+        assert_eq!(OUTER_BODY_BUS_PUBLISH_INTERVAL_S, 45.0);
+    }
+
+    #[test]
+    fn schumann_body_period_is_canonical() {
+        // Daemon ticks at SCHUMANN_BODY_HZ (7.83 Hz, ~127.7ms) per
+        // post-A.S8 D2 cadence migration.
+        let g = SchumannGenerator::new(SchumannRole::Body, tokio::time::Instant::now());
+        let period_ns = g.period_ns();
+        assert!(
+            (period_ns as i64 - 127_713_921).abs() <= 1,
+            "body period_ns = {period_ns}, expected 127713921 ± 1"
+        );
+    }
+}

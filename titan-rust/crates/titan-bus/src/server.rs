@@ -1,0 +1,321 @@
+//! server — Unix socket accept loop + HMAC challenge handshake +
+//! per-connection async tasks.
+//!
+//! Byte-identical port of Python `BusSocketServer._accept_loop` +
+//! `_handle_client` + `_handshake` + `_recv_loop` + `_send_loop`.
+//!
+//! # Handshake (SPEC §8 + B.2)
+//!
+//! 1. Server sends 32 random bytes (`FRAME_CHALLENGE_BYTES`) RAW (no length
+//!    prefix; this is pre-frame).
+//! 2. Client sends back `HMAC-SHA256(authkey, challenge)` (32 bytes raw).
+//! 3. Server verifies with `constant_time_eq`. On mismatch → close.
+//! 4. Both sides switch to length-prefix + msgpack framing.
+//!
+//! # Per-connection tasks
+//!
+//! After a successful handshake, the broker spawns:
+//! - **recv task**: `read_frame()` loop; decodes msgpack header; routes to
+//!   control handlers (BUS_SUBSCRIBE/UNSUBSCRIBE/PONG) or to the broker's
+//!   fanout path.
+//! - **send task**: waits on a `Notify`; drains the subscriber's ring;
+//!   writes batched frames out the socket.
+//!
+//! Both tasks die when the connection closes; broker purges the subscriber
+//! from the map.
+
+use std::sync::Arc;
+
+use rand::RngCore;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+use tokio::sync::{mpsc, Mutex, Notify};
+use tracing::{debug, warn};
+
+use titan_core::constants::{FRAME_AUTH_TAG_BYTES, FRAME_CHALLENGE_BYTES};
+use titan_core::frame::{
+    compute_hmac, constant_time_eq, decode_length_prefix, encode_frame, FRAME_LENGTH_PREFIX_BYTES,
+    FRAME_MAX_FRAME_BYTES,
+};
+
+use crate::message::{decode_header, MsgHeader};
+use crate::subscriber::BrokerSubscriber;
+
+/// Errors during connection handling.
+#[derive(Debug, thiserror::Error)]
+pub enum ServerError {
+    /// I/O failure during handshake or framing.
+    #[error("I/O: {0}")]
+    Io(#[from] std::io::Error),
+    /// Handshake HMAC mismatch — closes the connection.
+    #[error("handshake HMAC mismatch")]
+    HandshakeMismatch,
+    /// Frame too large (peer announced size > FRAME_MAX_FRAME_BYTES).
+    #[error("frame size exceeds maximum: {actual}B > {max}B")]
+    FrameTooLarge {
+        /// Announced bytes.
+        actual: u64,
+        /// Configured maximum.
+        max: u64,
+    },
+}
+
+/// Server-side handshake (challenge + verify response).
+///
+/// Returns `Ok(())` on success; otherwise closes the connection (caller
+/// drops the stream).
+pub async fn perform_handshake(stream: &mut UnixStream, authkey: &[u8]) -> Result<(), ServerError> {
+    // 1. Generate + send challenge (raw, no length prefix)
+    let mut challenge = [0u8; FRAME_CHALLENGE_BYTES as usize];
+    rand::rngs::OsRng.fill_bytes(&mut challenge);
+    stream.write_all(&challenge).await?;
+
+    // 2. Read client's response (raw, fixed length)
+    let mut response = [0u8; FRAME_AUTH_TAG_BYTES as usize];
+    stream.read_exact(&mut response).await?;
+
+    // 3. Verify with constant_time_eq
+    let expected = compute_hmac(authkey, &challenge);
+    if !constant_time_eq(&response, &expected) {
+        return Err(ServerError::HandshakeMismatch);
+    }
+    Ok(())
+}
+
+/// Read one length-prefixed frame from the stream. Returns the payload bytes.
+pub async fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, ServerError> {
+    let mut prefix = [0u8; 4];
+    stream.read_exact(&mut prefix).await?;
+    let n = decode_length_prefix(&prefix).map_err(|_| ServerError::FrameTooLarge {
+        actual: u32::from_le_bytes(prefix) as u64,
+        max: FRAME_MAX_FRAME_BYTES,
+    })? as usize;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let mut payload = vec![0u8; n];
+    stream.read_exact(&mut payload).await?;
+    Ok(payload)
+}
+
+/// Write a length-prefixed frame to the stream.
+pub async fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> Result<(), ServerError> {
+    let bytes = encode_frame(payload).map_err(|_| ServerError::FrameTooLarge {
+        actual: payload.len() as u64,
+        max: FRAME_MAX_FRAME_BYTES,
+    })?;
+    stream.write_all(&bytes).await?;
+    Ok(())
+}
+
+// Suppress unused warning for the constant; it documents the protocol shape.
+#[allow(dead_code)]
+const _LENGTH_PREFIX_REMINDER: u64 = FRAME_LENGTH_PREFIX_BYTES;
+
+// ─────────────────────────────────────────────────────────────────────────
+// Per-connection recv + send tasks
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Inbound control event detected by the recv task. The broker dispatches
+/// these to per-subscriber state updates without going through the ring.
+#[derive(Debug, Clone)]
+pub enum InboundEvent {
+    /// Client identified itself + subscribed to topics.
+    Subscribe {
+        /// Real subscriber name (replaces anonymous initial name).
+        name: String,
+        /// Topics to add to subscribed set.
+        topics: Vec<String>,
+    },
+    /// Client unsubscribed from topics.
+    Unsubscribe {
+        /// Topics to remove from subscribed set.
+        topics: Vec<String>,
+    },
+    /// Heartbeat reply.
+    Pong,
+    /// Generic message published by the client — broker fanouts to other
+    /// subscribers.
+    Publish {
+        /// Decoded header (msg_type, src, dst).
+        header: MsgHeader,
+        /// Original raw msgpack bytes — broker forwards unchanged for
+        /// byte-identical fanout.
+        raw_bytes: Vec<u8>,
+    },
+}
+
+/// Run the per-connection recv loop until EOF or error.
+///
+/// Sends events to the broker via `inbound_tx`. Broker holds the receiver
+/// + dispatches to per-subscriber state.
+pub async fn run_recv_loop(
+    mut read_half: tokio::net::unix::OwnedReadHalf,
+    sub_name: String,
+    inbound_tx: mpsc::UnboundedSender<(String, InboundEvent)>,
+) {
+    // We re-create a UnixStream-like read API on the half. tokio's
+    // OwnedReadHalf supports AsyncRead but not the full UnixStream API
+    // expected by `read_frame`. Cleaner fix: have `read_frame` take any
+    // AsyncRead — generic. For C2-2.b we use a small helper.
+    use tokio::io::AsyncReadExt;
+    loop {
+        // Read length prefix (4 bytes)
+        let mut prefix = [0u8; 4];
+        if read_half.read_exact(&mut prefix).await.is_err() {
+            debug!(name = %sub_name, "recv loop: peer closed");
+            break;
+        }
+        let n = match decode_length_prefix(&prefix) {
+            Ok(n) => n as usize,
+            Err(e) => {
+                warn!(name = %sub_name, err = ?e, "recv loop: invalid length prefix; closing");
+                break;
+            }
+        };
+        let mut payload = vec![0u8; n];
+        if n > 0 && read_half.read_exact(&mut payload).await.is_err() {
+            debug!(name = %sub_name, "recv loop: peer closed mid-frame");
+            break;
+        }
+
+        // Decode header + classify
+        let header = match decode_header(&payload) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(name = %sub_name, err = ?e, len = payload.len(), "recv loop: malformed frame; closing");
+                break;
+            }
+        };
+
+        let event = match header.msg_type.as_deref() {
+            Some("BUS_SUBSCRIBE") => InboundEvent::Subscribe {
+                name: header.src.clone().unwrap_or_default(),
+                topics: Vec::new(),
+            },
+            Some("BUS_UNSUBSCRIBE") => InboundEvent::Unsubscribe { topics: Vec::new() },
+            Some("BUS_PONG") => InboundEvent::Pong,
+            Some(_) => InboundEvent::Publish {
+                header,
+                raw_bytes: payload,
+            },
+            None => {
+                warn!(name = %sub_name, "recv loop: missing type; closing");
+                break;
+            }
+        };
+
+        if inbound_tx.send((sub_name.clone(), event)).is_err() {
+            debug!(name = %sub_name, "recv loop: broker dropped inbound channel");
+            break;
+        }
+    }
+}
+
+// Send loop lives in `broker::run_send_loop_via_map` since it reads via the
+// shared subscriber map (matches Python `BusSocketServer._send_loop` design).
+
+// Suppress unused-import warning when this module is built without a broker
+// driving it (tests etc.).
+#[allow(dead_code)]
+const _UNUSED: Option<(Arc<Mutex<BrokerSubscriber>>, Arc<Notify>)> = None;
+
+// ─────────────────────────────────────────────────────────────────────────
+// Tests (handshake-level only; integration test in tests/integration.rs)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn handshake_succeeds_with_correct_authkey() {
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let authkey = b"shared-secret-32-bytes-exactly!!".to_vec();
+
+        // Spawn server side
+        let authkey_srv = authkey.clone();
+        let server_task = tokio::spawn(async move {
+            let mut server = server;
+            perform_handshake(&mut server, &authkey_srv).await
+        });
+
+        // Client side: read challenge, send HMAC response
+        let authkey_cli = authkey.clone();
+        let client_task = tokio::spawn(async move {
+            let mut client = client;
+            let mut challenge = [0u8; FRAME_CHALLENGE_BYTES as usize];
+            client.read_exact(&mut challenge).await.unwrap();
+            let response = compute_hmac(&authkey_cli, &challenge);
+            client.write_all(&response).await.unwrap();
+            // Hold the stream open while server side completes
+            let mut buf = [0u8; 1];
+            let _ = tokio::time::timeout(Duration::from_millis(100), client.read(&mut buf)).await;
+        });
+
+        let result = server_task.await.unwrap();
+        let _ = client_task.await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn handshake_fails_with_wrong_authkey() {
+        let (server, client) = tokio::net::UnixStream::pair().unwrap();
+        let server_key = b"server-key-32-bytes-exactlyXXXXX".to_vec();
+        let client_key = b"WRONG-KEY-32-bytes-exactly!!ABCD".to_vec();
+
+        let server_task = tokio::spawn(async move {
+            let mut server = server;
+            perform_handshake(&mut server, &server_key).await
+        });
+
+        let client_task = tokio::spawn(async move {
+            let mut client = client;
+            let mut challenge = [0u8; FRAME_CHALLENGE_BYTES as usize];
+            client.read_exact(&mut challenge).await.unwrap();
+            let response = compute_hmac(&client_key, &challenge);
+            client.write_all(&response).await.unwrap();
+            let mut buf = [0u8; 1];
+            let _ = tokio::time::timeout(Duration::from_millis(100), client.read(&mut buf)).await;
+        });
+
+        let result = server_task.await.unwrap();
+        let _ = client_task.await;
+        assert!(matches!(result, Err(ServerError::HandshakeMismatch)));
+    }
+
+    #[tokio::test]
+    async fn frame_round_trip_via_pair() {
+        let (mut server, mut client) = tokio::net::UnixStream::pair().unwrap();
+        let payload = b"hello, world";
+
+        // Client writes
+        let payload_clone = payload.to_vec();
+        let writer = tokio::spawn(async move {
+            write_frame(&mut client, &payload_clone).await.unwrap();
+        });
+
+        // Server reads
+        let received = read_frame(&mut server).await.unwrap();
+        assert_eq!(received, payload);
+        writer.await.unwrap();
+    }
+
+    #[test]
+    fn inbound_event_variants_are_constructible() {
+        // Smoke: ensure the enum variants can be built with realistic data
+        let _ = InboundEvent::Subscribe {
+            name: "test".into(),
+            topics: vec!["BODY_STATE".into()],
+        };
+        let _ = InboundEvent::Unsubscribe {
+            topics: vec!["BODY_STATE".into()],
+        };
+        let _ = InboundEvent::Pong;
+        let _ = InboundEvent::Publish {
+            header: MsgHeader::default(),
+            raw_bytes: vec![0; 16],
+        };
+    }
+}

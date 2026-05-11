@@ -138,7 +138,15 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     fast_stop_event = threading.Event()
 
     fast_enabled = _read_flag(config, "microkernel.shm_mind_fast_enabled", False)
-    if fast_enabled:
+    l0_rust_enabled = _read_flag(config, "microkernel.l0_rust_enabled", False)
+    # Phase C C-S5 closure 2026-05-08: under l0_rust_enabled=true the
+    # Rust titan-inner-mind-rs daemon owns inner_mind_15d.bin output but
+    # NEEDS sensor_cache_inner_mind.bin as input. mind_worker still
+    # provides the sensor compute + 23.49 Hz cadence; _start_fast_path's
+    # internal if/elif redirects the write target from inner_mind_15d.bin
+    # (Phase A+B) to sensor_cache_inner_mind.bin (Phase C). Either flag
+    # enables _start_fast_path; the slot identity is decided inside.
+    if fast_enabled or l0_rust_enabled:
         try:
             sensor_cache, refresh_threads, shm_writer_thread = _start_fast_path(
                 mood_engine, social_graph, media_state, data_dir, session_db,
@@ -146,12 +154,21 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 lambda: (severity_multipliers, focus_nudges),
                 plugin_cache=plugin_cache,
             )
-            logger.info(
-                "[MindWorker] §L1 fast path ON: 5 refresh threads + 23.49 Hz shm writer"
-            )
+            if fast_enabled:
+                logger.info(
+                    "[MindWorker] §L1 fast path ON: 5 refresh threads + "
+                    "23.49 Hz inner_mind_15d.bin writer (Phase A+B)"
+                )
+            else:
+                logger.info(
+                    "[MindWorker] Phase C path ON: 5 refresh threads + "
+                    "23.49 Hz sensor_cache_inner_mind.bin writer "
+                    "(l0_rust_enabled=true; Rust titan-inner-mind-rs owns "
+                    "inner_mind_15d.bin output)"
+                )
         except Exception as exc:
             logger.warning(
-                "[MindWorker] §L1 fast-path init failed (%s); falling back to inline senses",
+                "[MindWorker] fast-path init failed (%s); falling back to inline senses",
                 exc,
             )
             sensor_cache = None
@@ -1146,64 +1163,111 @@ def _start_fast_path(mood_engine, social_graph, media_state, data_dir,
         specs, cache, stop_event, thread_name_prefix="mind_refresh",
     )
 
+    # Two modes per Phase A+B vs Phase C — same architecture as body_worker
+    # post-l0_rust flag flip. See body_worker.py inline comment for context.
+    # SPEC §G1 + §23.5 + §9.A line 1034.
     shm_bank = RegistryBank(titan_id=None, config=config)
     shm_writer_thread = None
+
+    def _compute_mind_15d(
+        severity_multipliers: list, focus_nudges: list,
+    ) -> "np.ndarray":
+        """Single canonical compute fn — used by both Phase A+B writer +
+        Phase C sensor cache writer so they produce byte-identical output.
+        Reuses the SPEC §23.5 collect_mind_15d formula.
+        """
+        import numpy as np
+        tensor_5d = _collect_mind_tensor(
+            mood_engine, social_graph, media_state, data_dir, session_db,
+            severity_multipliers, focus_nudges,
+            cache=cache,
+        )
+        try:
+            from titan_plugin.logic.mind_tensor import collect_mind_15d
+            pc = plugin_cache or {}
+            ip_stats = pc.get("inner_perception_stats") or {}
+            soc_perc = pc.get("social_perception_stats") or {}
+            assess = pc.get("assessment_stats") or {}
+            _audio_state = {
+                "creates_recent": int(
+                    (ip_stats.get("audio_state") or {}).get("creates_recent", 0)),
+                "ambient": (
+                    _sense_hearing_ambient(session_db) if session_db else 0.5),
+            }
+            _visual_state = {
+                "creates_recent": int(
+                    (ip_stats.get("visual_state") or {}).get("creates_recent", 0)),
+                "ambient": (
+                    _sense_vision_ambient(data_dir) if data_dir else 0.5),
+            }
+            tensor_15d = collect_mind_15d(
+                current_5d=tensor_5d,
+                audio_state=_audio_state,
+                interaction_quality=float(soc_perc.get("sentiment_ema", 0.5)),
+                visual_state=_visual_state,
+                assessment_quality=float(assess.get("average_score", 0.5)),
+                ambient_change=float(ip_stats.get("ambient_change", 0.0) or 0.0),
+                hormone_levels=pc.get("hormone_levels"),
+            )
+        except Exception:
+            # Defensive — if the 15D extension fails, write the 5D base
+            # padded with neutral 0.5s so consumers always see a valid
+            # 15D vector.
+            tensor_15d = list(tensor_5d) + [0.5] * 10
+        return np.asarray(tensor_15d, dtype="<f4")
+
     if shm_bank.is_enabled(INNER_MIND_15D):
+        # Phase A+B path — direct write to inner_mind_15d.bin.
         mind_15d_writer = shm_bank.writer(INNER_MIND_15D)
 
         def tick():
             severity_multipliers, focus_nudges = get_modulators()
-            # Step 1: 5D base tensor from cache (sub_a) + media_state (sub_b)
-            tensor_5d = _collect_mind_tensor(
-                mood_engine, social_graph, media_state, data_dir, session_db,
-                severity_multipliers, focus_nudges,
-                cache=cache,
-            )
-            # Step 2: extend to 15D via collect_mind_15d (Thinking +
-            # Feeling + Willing). Reads the same plugin_cache that the
-            # bus-publish path uses (rFP_trinity_130d_awakening Phase 2),
-            # so SHM-fed consumers see the SPEC §23.5 formulas instead of
-            # 0.5 padding.
-            try:
-                from titan_plugin.logic.mind_tensor import collect_mind_15d
-                pc = plugin_cache or {}
-                ip_stats = pc.get("inner_perception_stats") or {}
-                soc_perc = pc.get("social_perception_stats") or {}
-                assess = pc.get("assessment_stats") or {}
-                _audio_state = {
-                    "creates_recent": int(
-                        (ip_stats.get("audio_state") or {}).get("creates_recent", 0)),
-                    "ambient": (
-                        _sense_hearing_ambient(session_db) if session_db else 0.5),
-                }
-                _visual_state = {
-                    "creates_recent": int(
-                        (ip_stats.get("visual_state") or {}).get("creates_recent", 0)),
-                    "ambient": (
-                        _sense_vision_ambient(data_dir) if data_dir else 0.5),
-                }
-                tensor_15d = collect_mind_15d(
-                    current_5d=tensor_5d,
-                    audio_state=_audio_state,
-                    interaction_quality=float(soc_perc.get("sentiment_ema", 0.5)),
-                    visual_state=_visual_state,
-                    assessment_quality=float(assess.get("average_score", 0.5)),
-                    ambient_change=float(ip_stats.get("ambient_change", 0.0) or 0.0),
-                    hormone_levels=pc.get("hormone_levels"),
-                )
-            except Exception:
-                # Defensive — if the 15D extension fails, write the
-                # 5D base padded with neutral 0.5s so consumers always
-                # see a valid 15D vector.
-                tensor_15d = list(tensor_5d) + [0.5] * 10
-
-            import numpy as np
-            arr = np.asarray(tensor_15d, dtype=np.float32)
+            arr = _compute_mind_15d(severity_multipliers, focus_nudges)
             if arr.shape == (15,):
                 mind_15d_writer.write(arr)
 
         shm_writer_thread = start_shm_writer_thread(
             tick, _MIND_TICK_PERIOD_S, stop_event, "mind_shm_writer",
         )
+    elif (config or {}).get("microkernel", {}).get("l0_rust_enabled", False):
+        # Phase C path — Step 8 §4.5 schema migration v1→v2:
+        # Publish msgpack source dict (currently {"tensor": <15D>} carrying
+        # Python-computed values; full Rust per-dim formula port deferred
+        # to follow-up — formula needs 9+ L3 stat sources plumbed via SHM
+        # which is a larger effort than fits in this session).
+        try:
+            from titan_plugin.logic.inner_mind_sensor_refresh import (
+                InnerMindSensorRefresh)
+            import msgpack as _msgpack
+
+            def _provide_mind_source_dict() -> bytes:
+                # Use neutral modulators so the cache contains the
+                # pre-filter_down raw 15D. Rust applies filter_down +
+                # ground_up (willing only per SPEC §G10) downstream.
+                tensor = _compute_mind_15d(
+                    severity_multipliers=[1.0] * 15,
+                    focus_nudges=[0.0] * 15,
+                )
+                # Convert to plain list of floats for msgpack-friendly encoding.
+                values = [float(v) for v in tensor]
+                payload = {"tensor": values}
+                return _msgpack.packb(payload, use_bin_type=True)
+
+            sensor_cache_writer = InnerMindSensorRefresh(
+                tensor_provider=_provide_mind_source_dict,
+                titan_id=None,
+            )
+            shm_writer_thread = sensor_cache_writer.start_thread(stop_event)
+            logger.info(
+                "[MindWorker] sensor_cache_inner_mind.bin source-dict writer "
+                "started (l0_rust_enabled=true; schema v2 msgpack {tensor:15D}; "
+                "Rust titan-inner-mind-rs owns substrate processing + "
+                "inner_mind_15d.bin output)")
+        except Exception:
+            logger.critical(
+                "[MindWorker] failed to start inner_mind sensor cache writer — "
+                "Rust inner-mind-rs will starve on constant-zero input. "
+                "Investigate before relying on inner_mind_15d.bin downstream.",
+                exc_info=True)
 
     return cache, refresh_threads, shm_writer_thread

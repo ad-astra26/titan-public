@@ -4298,6 +4298,185 @@ async def post_v4_msl_reset_homeostasis(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# GET /v4/community-engagement-stats — Phase 2.5.E fleet-wide author-attribution
+# rFP_trinity_130d_phase2_5_closure §5.3
+# ---------------------------------------------------------------------------
+@router.get("/v4/community-engagement-stats")
+async def get_v4_community_engagement_stats(request: Request,
+                                              titan_id: str = "T1"):
+    """T1-side endpoint that T2/T3 hit to fetch their per-Titan
+    author-attributed slice of mention_tracking + engagement_snapshots.
+
+    Phase 2.5.E (option α from the rFP) overrides §14.5's "T1-canonical
+    only" decision: each Titan's ANANDA[36] community_connection +
+    ANANDA[38] expression_reach reflects ITS individual social footprint
+    inside the shared @iamtitanai X account. T1 is still the SOLE X
+    gateway (only T1 holds the social_x.db + events_teacher.db files);
+    T2 and T3 attribute their portions via the existing ``titan_id``
+    columns in those tables.
+
+    Query param:
+      ?titan_id=T1 | T2 | T3   (defaults to T1)
+
+    Returns the same shape as ``SocialXGateway.get_community_engagement_stats``:
+      distinct_handles_24h, mean_engagement_per_post_7d,
+      expression_reach_norm, gateway_role, titan_id.
+    """
+    try:
+        plugin = getattr(request.app.state, "titan_plugin", None)
+        if plugin is None:
+            return _error("plugin not bound to app state", code=503)
+        sxg = getattr(plugin, "_social_x_gateway_reader", None)
+        if sxg is None or not hasattr(sxg, "get_community_engagement_stats"):
+            return _error("social_x_gateway not available", code=503)
+        # Validate titan_id
+        tid = (titan_id or "T1").upper()
+        if tid not in ("T1", "T2", "T3"):
+            return _error(f"invalid titan_id: {titan_id!r}")
+        stats = sxg.get_community_engagement_stats(
+            is_x_gateway=True, titan_id=tid)
+        return _ok(stats)
+    except Exception as e:
+        logger.error("[Dashboard] /v4/community-engagement-stats error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
+# GET /v4/debug/dim-sources — Phase 2.5.A producer-firing diagnostic
+# rFP_trinity_130d_phase2_5_closure §2.3
+# ---------------------------------------------------------------------------
+@router.get("/v4/debug/dim-sources")
+async def get_v4_debug_dim_sources(request: Request, dim: str = ""):
+    """Per-dim producer-firing diagnostic for the 130D Trinity tensor.
+
+    Query params:
+      ?dim=<comma-separated full-tensor indices>  (e.g. dim=20,22,86,126)
+      No param = return all 130 dims.
+
+    Returns a list of records, each with:
+      idx, name, block, block_index, spec_section
+      spec_default
+      last_value, last_value_ts, seconds_since_last_write
+      block_calls_total, block_last_call_ts
+      inputs[]: list of {name, state} where state ∈ {real, default, absent}
+
+    The four-state classifier (Chunk 2.5.B) consumes this output to render
+    ALIVE / ALIVE_AT_DEFAULT / PARTIAL / SILENT / GHOST per dim.
+    """
+    try:
+        from titan_plugin.api.dim_registry import (
+            _BLOCKS as DR_BLOCKS,
+            get_firing_tracker,
+            iter_registry,
+            read_all_blocks_from_shm,
+        )
+        # Parse dim filter
+        idx_filter = None
+        if dim:
+            try:
+                idx_filter = {int(s) for s in dim.split(",") if s.strip()}
+            except ValueError:
+                return _error(f"invalid dim filter: {dim!r}")
+        # Phase 2.5.A.2 — read from per-block SHM slots (cross-process).
+        # Each tensor producer's worker writes its block's slot every
+        # tick; we aggregate here for the unified payload. Falls back to
+        # in-process tracker for any block whose slot is unreadable
+        # (test environments, pre-restart, slot init failed).
+        shm_blocks = read_all_blocks_from_shm()
+        local_tracker = get_firing_tracker()
+        local_block_records = local_tracker.get_all_block_records()
+        now = time.time()
+        # Build per-block-index dim values + block metadata. Prefer SHM;
+        # fall back to in-process tracker if SHM block missing.
+        block_meta: dict[str, dict] = {}
+        block_dim_values: dict[str, list] = {}  # block → [{v, ts}, ...]
+        for start, length, block_name in DR_BLOCKS:
+            shm_payload = shm_blocks.get(block_name)
+            if shm_payload:
+                block_meta[block_name] = {
+                    "block_calls_total": int(
+                        shm_payload.get("block_calls_total", 0) or 0),
+                    "block_last_call_ts": shm_payload.get(
+                        "block_last_call_ts"),
+                    "inputs_state": shm_payload.get("inputs_state") or {},
+                    "source": "shm",
+                }
+                shm_dims = shm_payload.get("dims") or []
+                normalized = []
+                for i in range(length):
+                    if i < len(shm_dims) and isinstance(shm_dims[i], dict):
+                        normalized.append({
+                            "v": shm_dims[i].get("v"),
+                            "ts": shm_dims[i].get("ts"),
+                        })
+                    else:
+                        normalized.append({"v": None, "ts": None})
+                block_dim_values[block_name] = normalized
+            else:
+                # Fall back to in-process tracker (works in single-process
+                # mode + tests where SHM is disabled).
+                br = local_block_records.get(block_name)
+                block_meta[block_name] = {
+                    "block_calls_total": br.calls_total if br else 0,
+                    "block_last_call_ts": br.last_call_ts if br else None,
+                    "inputs_state": (
+                        dict(br.last_inputs_state) if br else {}),
+                    "source": "in_process",
+                }
+                normalized = []
+                for i in range(length):
+                    rec = local_tracker.get_dim_record(start + i)
+                    if rec is not None:
+                        normalized.append({
+                            "v": rec.last_value,
+                            "ts": rec.last_value_ts,
+                        })
+                    else:
+                        normalized.append({"v": None, "ts": None})
+                block_dim_values[block_name] = normalized
+
+        out = []
+        for entry in iter_registry():
+            if idx_filter is not None and entry.full_index not in idx_filter:
+                continue
+            blk_start = next(s for s, L, name in DR_BLOCKS
+                             if name == entry.block)
+            within_idx = entry.full_index - blk_start
+            dims_arr = block_dim_values.get(entry.block) or []
+            v_obj = (dims_arr[within_idx]
+                     if 0 <= within_idx < len(dims_arr) else None)
+            last_value = v_obj.get("v") if v_obj else None
+            last_value_ts = v_obj.get("ts") if v_obj else None
+            seconds_since = (
+                round(now - float(last_value_ts), 3)
+                if isinstance(last_value_ts, (int, float)) else None
+            )
+            meta = block_meta.get(entry.block) or {}
+            inputs_payload = []
+            for input_name, state in (meta.get("inputs_state") or {}).items():
+                inputs_payload.append({"name": input_name, "state": state})
+            out.append({
+                "idx": entry.full_index,
+                "name": entry.name,
+                "block": entry.block,
+                "block_index": entry.block_index,
+                "spec_section": entry.spec_section,
+                "spec_default": entry.default_value,
+                "last_value": last_value,
+                "last_value_ts": last_value_ts,
+                "seconds_since_last_write": seconds_since,
+                "block_calls_total": meta.get("block_calls_total", 0),
+                "block_last_call_ts": meta.get("block_last_call_ts"),
+                "block_source": meta.get("source", "unknown"),
+                "inputs": inputs_payload,
+            })
+        return _ok({"dims": out, "total": len(out)})
+    except Exception as e:
+        logger.error("[Dashboard] /v4/debug/dim-sources error: %s", e)
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
 # GET /v4/inner-trinity — Inner Trinity Coordinator state (topology, dreaming, nervous system)
 # ---------------------------------------------------------------------------
 @router.get("/v4/inner-trinity")
@@ -4976,34 +5155,59 @@ async def get_v4_pi_heartbeat(request: Request):
 async def get_v4_chi(request: Request):
     """Chi Life Force: 3×3 Trinity-mapped vitality metric with circulation and contemplation.
 
-    Read order: chi.state cache (live, populated by spirit_worker / cognitive_worker
-    CHI_UPDATED publish) → coordinator.chi (bootstrap placeholder, kernel
-    snapshot default) → shm direct-read of chi_state.bin (chunk 8M.9
-    defense-in-depth, rFP §3.9).
+    Read order (corrected 2026-05-10): cache (chi.state, BusSubscriber-populated
+    from CHI_UPDATED — has the full composed shape with state/developmental_phase/
+    weights/components/contemplation from LifeForceEngine.compute()) → SHM
+    direct-read of chi_state.bin (Rust kernel-rs raw 6 numerics: total, spirit,
+    mind, body, coherence, urgency) → coordinator bootstrap placeholder
+    (cold-boot only, full-shape with state="BOOTSTRAP" per life_force.py
+    L369-373).
+
+    Why this order: cache holds the COMPOSED shape (rich, with developmental
+    phase + contemplation state + per-block components). SHM holds only the
+    RAW 6-float projection. Bootstrap is the cold-boot stand-in. The previous
+    order (cache → bootstrap → SHM-fallback-if-falsy) had a truthiness bug:
+    coordinator bootstrap is a non-empty dict, so `if not chi` after the
+    coordinator step was always False, and the SHM read NEVER fired. Result
+    on T3: served BOOTSTRAP zeros despite SHM holding live data. The first
+    attempted fix (SHM-first, 2026-05-10 morning) overcorrected and degraded
+    T1+T2 to the flat 6-float shape — observatory expects rich shape from
+    cache when available.
+
+    On T3 (Phase C, cognitive_worker not yet publishing CHI_UPDATED to cache),
+    cache is empty → falls through to SHM (real numerics, flat shape) → never
+    reaches bootstrap. On T1+T2 (Phase A+B), cache is always populated by
+    spirit_worker → returned directly with full composed shape.
     """
     import asyncio
     titan_state = _get_plugin(request)
     plugin = titan_state  # backward-compat alias for Category C callsites
     try:
         # Live chi from spirit_worker / cognitive_worker → BusSubscriber → cache.
+        # Holds the full composed shape (state, developmental_phase, weights,
+        # components, contemplation) from LifeForceEngine.compute().
         chi = titan_state.cache.get("chi.state", None)
-        if not chi:
-            # Bootstrap placeholder (kernel snapshot, full-shape per
-            # life_force.py L369-373). Avoids NaN% on cold boot.
-            coordinator = await _get_cached_coordinator_async(plugin)
-            chi = coordinator.get("chi", {})
-        # chunk 8M.9 — shm direct-read fallback. Under l0_rust_enabled=true
-        # neither spirit_worker nor cognitive_worker may have published
-        # chi.state yet (Rust kernel-rs writes chi_state.bin authoritatively
-        # via SeqLock). Read directly from shm for endpoint resilience.
-        if not chi:
-            shm_snap = await asyncio.to_thread(titan_state.shm.read_chi)
-            if shm_snap is not None:
-                shm_snap.setdefault("source", "shm")
-                return _ok(shm_snap)
-        if not chi:
-            return _ok({"status": "Chi not yet evaluated — waiting for first 132D epoch"})
-        return _ok(chi)
+        if chi:
+            chi.setdefault("source", "cache")
+            return _ok(chi)
+        # Cache empty — try SHM (Phase C path: Rust kernel-rs writes
+        # chi_state.bin authoritatively; cognitive_worker may not have
+        # published CHI_UPDATED yet). SHM payload is the raw 6-float
+        # projection (CHI_FIELD_NAMES); consumers that need the composed
+        # shape should also gracefully accept the flat shape per Phase C.
+        shm_snap = await asyncio.to_thread(titan_state.shm.read_chi)
+        if shm_snap is not None:
+            shm_snap.setdefault("source", "shm")
+            return _ok(shm_snap)
+        # Bootstrap placeholder (kernel snapshot, full-shape per
+        # life_force.py L369-373). Cold-boot only — avoids NaN% before
+        # first 132D epoch + before SHM/cache populate.
+        coordinator = await _get_cached_coordinator_async(plugin)
+        chi = coordinator.get("chi", {})
+        if chi:
+            chi.setdefault("source", "bootstrap")
+            return _ok(chi)
+        return _ok({"status": "Chi not yet evaluated — waiting for first 132D epoch"})
     except Exception as e:
         logger.error("[Dashboard] /v4/chi error: %s", e)
         return _error(str(e))

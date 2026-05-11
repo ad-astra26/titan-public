@@ -4,8 +4,8 @@ _phase_c_constants.py — AUTO-GENERATED from titan-docs/SPEC_titan_architecture
 DO NOT EDIT BY HAND. Edit the TOML, then run:
     python scripts/generate_phase_c_constants.py
 
-SPEC version: 1.1.0
-Source SHA-256: 4eca93f144819ca39de4944d4fa9e9a10f80541fd3f45464c0d031b5400d2eb6
+SPEC version: 1.2.0
+Source SHA-256: dfb308daa1f0d8794d2bd7f1eac0297b638adbdd96046af6594c1687cc8c505d
 
 Per SPEC §19 + §2.6: hand-editing this file is a SPEC violation flagged by
 `arch_map phase-c verify`.
@@ -14,8 +14,8 @@ from __future__ import annotations
 from typing import Final
 
 # ── SPEC version metadata ──────────────────────────────────────────────
-SPEC_VERSION: Final[str] = "1.1.0"
-SPEC_SOURCE_SHA256: Final[str] = "4eca93f144819ca39de4944d4fa9e9a10f80541fd3f45464c0d031b5400d2eb6"
+SPEC_VERSION: Final[str] = "1.2.0"
+SPEC_SOURCE_SHA256: Final[str] = "dfb308daa1f0d8794d2bd7f1eac0297b638adbdd96046af6594c1687cc8c505d"
 
 
 # ── KERNEL ────────────────────────────────────────────────────────────────
@@ -355,6 +355,30 @@ EVENTS_TEACHER_STATE_MAX_BYTES: Final[int] = 4096
 SPIRIT_SUPPLEMENTAL_STATE_SCHEMA_VERSION: Final[int] = 1
 # Max msgpack payload bytes for spirit_supplemental_state.bin. Bumped 8192→65536 2026-05-07 after T3 deploy showed live payload at 58106B (coordinator section carries every spirit subsystem snapshot). 64KB cap covers production worst-case + 10% margin.
 SPIRIT_SUPPLEMENTAL_STATE_MAX_BYTES: Final[int] = 65536
+# Schema version for inner_body_firing.bin dim-firing diagnostic slot. Producer: body_worker via DimFiringTracker.record_block. Reader: api_subprocess /v4/debug/dim-sources endpoint.
+INNER_BODY_FIRING_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for inner_body_firing.bin (5 dims × per-dim {v, ts} + block metadata + inputs_state).
+INNER_BODY_FIRING_MAX_BYTES: Final[int] = 1024
+# Schema version for inner_mind_firing.bin dim-firing diagnostic slot. Producer: mind_worker via DimFiringTracker.record_block.
+INNER_MIND_FIRING_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for inner_mind_firing.bin (15 dims × per-dim {v, ts} + block metadata + 6 inputs_state).
+INNER_MIND_FIRING_MAX_BYTES: Final[int] = 2048
+# Schema version for inner_spirit_firing.bin dim-firing diagnostic slot. Producer: spirit_worker via DimFiringTracker.record_block.
+INNER_SPIRIT_FIRING_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for inner_spirit_firing.bin (45 dims × per-dim {v, ts} + block metadata + 10 inputs_state).
+INNER_SPIRIT_FIRING_MAX_BYTES: Final[int] = 4096
+# Schema version for outer_body_firing.bin dim-firing diagnostic slot. Producer: outer_body_worker via DimFiringTracker.record_block.
+OUTER_BODY_FIRING_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for outer_body_firing.bin (5 dims × per-dim {v, ts} + block metadata + 7 inputs_state).
+OUTER_BODY_FIRING_MAX_BYTES: Final[int] = 1024
+# Schema version for outer_mind_firing.bin dim-firing diagnostic slot. Producer: outer_mind_worker via DimFiringTracker.record_block.
+OUTER_MIND_FIRING_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for outer_mind_firing.bin (15 dims × per-dim {v, ts} + block metadata + 12 inputs_state).
+OUTER_MIND_FIRING_MAX_BYTES: Final[int] = 2048
+# Schema version for outer_spirit_firing.bin dim-firing diagnostic slot. Producer: outer_spirit_worker via DimFiringTracker.record_block.
+OUTER_SPIRIT_FIRING_SCHEMA_VERSION: Final[int] = 1
+# Max msgpack payload bytes for outer_spirit_firing.bin (45 dims × per-dim {v, ts} + block metadata + 25 inputs_state).
+OUTER_SPIRIT_FIRING_MAX_BYTES: Final[int] = 4096
 
 
 # ── SCHUMANN ──────────────────────────────────────────────────────────────
@@ -488,12 +512,12 @@ OUTER_MIND_WILLING_DIM_START: Final[int] = 10
 OUTER_MIND_WILLING_DIM_END: Final[int] = 15
 # Sensor cache staleness threshold = N × daemon's natural cadence (wall_ns < now − N×cadence → cache stale, daemon writes last-known with confidence=0.0 log)
 OUTER_CACHE_STALE_CADENCE_MULTIPLIER: Final[int] = 3
-# Max payload bytes for sensor_cache_outer_body.bin (msgpack source dict per O4 lock — agency_stats/helper_statuses/bus_stats/system_sensor_stats/network_monitor_stats/tx_latency_stats/block_delta_stats/anchor_state/sol_balance)
-OUTER_SENSOR_CACHE_BODY_MAX_BYTES: Final[int] = 8192
-# Max payload bytes for sensor_cache_outer_mind.bin (msgpack source dict — persona narrative + social context + creative_stats + memory_stats + agency_stats)
-OUTER_SENSOR_CACHE_MIND_MAX_BYTES: Final[int] = 8192
-# Max payload bytes for sensor_cache_outer_spirit.bin (msgpack pre-aggregated outer-state — action_stats/sovereignty_ratio/uptime_ratio/social_stats/solana_stats/hormone_levels/recovery_stats/creative_stats/memory_stats/assessment_stats/history)
-OUTER_SENSOR_CACHE_SPIRIT_MAX_BYTES: Final[int] = 8192
+# Max payload bytes for sensor_cache_outer_body.bin (msgpack source dict per O4 lock — agency_stats/helper_statuses/bus_stats/system_sensor_stats/network_monitor_stats/tx_latency_stats/block_delta_stats/anchor_state/sol_balance + Step 3 hormone_levels). Bumped 8192→65536 2026-05-10 after Step 3 §3.1 SOURCE_KEYS extension pushed observed payloads past 8KB on T3 (live max ~33KB pre-cap).
+OUTER_SENSOR_CACHE_BODY_MAX_BYTES: Final[int] = 65536
+# Max payload bytes for sensor_cache_outer_mind.bin (msgpack source dict — persona narrative + social context + creative_stats + memory_stats + agency_stats + Step 3 meta_cgn/cgn/memory/language/events_teacher/social_x/output_verifier/jailbreak). Bumped 8192→65536 2026-05-10 (live oversize observed at 32970B).
+OUTER_SENSOR_CACHE_MIND_MAX_BYTES: Final[int] = 65536
+# Max payload bytes for sensor_cache_outer_spirit.bin (msgpack pre-aggregated outer-state — action_stats/sovereignty_ratio/uptime_ratio/social_stats/solana_stats/hormone_levels/recovery_stats/creative_stats/memory_stats/assessment_stats/history + Step 3 meta_cgn/cgn/memory/KG/events_teacher/jailbreak/output_verifier/anchor/bus/expression/osh/community_engagement/inner_memory). Bumped 8192→65536 2026-05-10 (live oversize observed at 32994B).
+OUTER_SENSOR_CACHE_SPIRIT_MAX_BYTES: Final[int] = 65536
 
 
 # ── OUTER_SPIRIT ──────────────────────────────────────────────────────────

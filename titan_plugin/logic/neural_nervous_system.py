@@ -264,7 +264,8 @@ class NeuralNervousSystem:
 
     # ── Evaluate (Drop-In Replacement) ────────────────────────────
 
-    def evaluate(self, observables: dict, temporal: dict = None) -> list[dict]:
+    def evaluate(self, observables: dict, temporal: dict = None,
+                 neuromod_state: dict = None, cgn_state: dict = None) -> list[dict]:
         """
         Evaluate all registered programs. DROP-IN replacement for
         NervousSystem.evaluate() — same input, same output format.
@@ -282,7 +283,31 @@ class NeuralNervousSystem:
             temporal: Optional dict with circadian features from π-heartbeat:
                 pi_phase, cluster_progress, developmental_age_norm,
                 time_since_dream, heartbeat_ratio
+            neuromod_state: Optional dict {neuromod_name: level} from the
+                live NeuromodulatorSystem. Folded into observables under
+                the ``neuromod.<name>`` namespace per rFP_titan_vm_v2 Phase 2
+                so NS programs can react to current neurotransmitter state.
+            cgn_state: Optional CGN snapshot dict (from the
+                CGN_STATE_SNAPSHOT bus subscriber). Folded into observables
+                under the ``cgn.<key>`` namespace per the same rFP. Both
+                kwargs were passed by inner_coordinator.tick before the
+                receiving signature was extended; previously raised a
+                silent TypeError that froze NS evaluation.
         """
+        # rFP_titan_vm_v2 Phase 2: fold extras into observable namespace.
+        if neuromod_state or cgn_state:
+            observables = dict(observables) if observables else {}
+            if neuromod_state:
+                for _nm_name, _nm_level in neuromod_state.items():
+                    try:
+                        observables[f"neuromod.{_nm_name}"] = float(_nm_level)
+                    except (TypeError, ValueError):
+                        continue
+            if cgn_state:
+                for _cg_key, _cg_val in cgn_state.items():
+                    if isinstance(_cg_val, (int, float)):
+                        observables[f"cgn.{_cg_key}"] = float(_cg_val)
+
         # B1: Build temporal feature vector for appending to NN input
         self._temporal_vec = None
         if temporal:

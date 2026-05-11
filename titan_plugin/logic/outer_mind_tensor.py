@@ -254,7 +254,31 @@ def collect_outer_mind_15d(
         + 0.30 * min(1.0, eureka_per_hour / 5.0)
     )
 
-    return thinking + feeling + willing
+    tensor_15d = thinking + feeling + willing
+    # Phase 2.5.A — record firing for /v4/debug/dim-sources diagnostics.
+    try:
+        from titan_plugin.api.dim_registry import get_firing_tracker
+        get_firing_tracker().record_block(
+            "outer_mind",
+            tensor_15d,
+            {
+                "meta_cgn_stats": meta_cgn_stats,
+                "cgn_stats": cgn_stats,
+                "memory_stats": memory_growth_metrics,
+                "agency_stats": action_stats,
+                "events_teacher_stats": events_teacher_stats,
+                "social_x_gateway_stats": social_x_gateway_stats,
+                "language_stats": language_stats,
+                "vocab_stats": language_stats,  # vocab is part of language_stats
+                "knowledge_graph_stats": knowledge_graph_stats,
+                "verifier_stats": guardian_stats,
+                "reflex_stats": guardian_stats,
+                "jailbreak_stats": guardian_stats,
+            },
+        )
+    except Exception:
+        pass
+    return tensor_15d
 
 
 def collect_outer_mind_5d(

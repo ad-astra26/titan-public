@@ -195,7 +195,19 @@ def hormonal_worker_main(
         sys.path.insert(0, project_root)
 
     full_config = config or {}
-    titan_id = (full_config.get("info_banner", {}) or {}).get("titan_id") or "T1"
+    # rFP_trinity_130d_phase2_5_closure §4 (2026-05-08): use canonical
+    # resolve_titan_id() instead of hardcoding "T1" fallback. Pre-fix,
+    # T2/T3 deployments had no `info_banner.titan_id` in their config
+    # (deploy_t2.sh preserves T2's config.toml across pulls but the
+    # banner key isn't always populated) → workers wrote SHM to
+    # /dev/shm/titan_T1/ on the wrong machine, leaving the canonical
+    # /dev/shm/titan_T2/hormonal_state.bin (etc.) empty → cascading
+    # PARTIAL classifications on T2's outer_spirit + inner_mind blocks.
+    from titan_plugin.core.state_registry import resolve_titan_id
+    titan_id = (
+        (full_config.get("info_banner", {}) or {}).get("titan_id")
+        or resolve_titan_id()
+    )
 
     logger.info("[HormonalWorker] Booting — titan_id=%s, name=%s", titan_id, name)
 

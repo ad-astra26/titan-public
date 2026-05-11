@@ -289,31 +289,14 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════
-# CHECK 4: ARC-AGI training (cron job, every 3 hours)
+# CHECK 4: ARC-AGI training — DISABLED fleet-wide since 2026-04-26
+# (CPU starvation; see memory/project_arc_disabled_cpu.md). Auto-trigger
+# removed 2026-05-09 because it resurrected ARC on T2 and the resulting
+# VPS swap exhaustion hung T3's Python child for 22h. Stale ARC log is
+# now EXPECTED state. Do not re-enable without first reviving ARC training.
 # ═══════════════════════════════════════════════════════════════════════
-if [ -f "$ARC_LOG" ]; then
-    ARC_AGE=$(( TIMESTAMP - $(stat -c %Y "$ARC_LOG" 2>/dev/null || echo 0) ))
-    if [ "$ARC_AGE" -lt 14400 ]; then  # Updated in last 4 hours
-        CURR_STATE[arc]="ok"
-        log_telemetry "arc" "check_ok" "\"age_sec\":${ARC_AGE}"
-    else
-        CURR_STATE[arc]="stale"
-        ERRORS="${ERRORS}ARC: training log stale (${ARC_AGE}s old)\n"
-        # Auto-trigger ARC if stale > 5 hours and API is up
-        if [ "$ARC_AGE" -gt 18000 ] && [ "$API_STATUS" = "200" ]; then
-            cd "$PROJECT_DIR" 2>/dev/null
-            if [ -f "test_env/bin/activate" ]; then
-                . test_env/bin/activate 2>/dev/null
-                nohup bash scripts/arc_cron_train.sh >> "$ARC_LOG" 2>&1 &
-                log_telemetry "arc" "auto_triggered" "\"reason\":\"stale_log\""
-                echo "[$NOW] ARC auto-triggered (log ${ARC_AGE}s old)"
-            fi
-        fi
-    fi
-else
-    CURR_STATE[arc]="no_log"
-    # Not critical on first check
-fi
+CURR_STATE[arc]="disabled"
+log_telemetry "arc" "check_disabled" "\"note\":\"fleet_wide_off_since_20260426\""
 
 # ═══════════════════════════════════════════════════════════════════════
 # CHECK 4b: Events Teacher (cron job: T1 every 15 min, T2/T3 every 30 min)

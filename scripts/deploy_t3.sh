@@ -76,6 +76,18 @@ deploy_rust_binaries_t3() {
 
     echo "  [T3] copying ${#TITAN_RUST_FLEET[@]} Rust binaries to ${T2_HOST}:${T3_DIR}/bin/"
     ssh "${T2_HOST}" "mkdir -p \"${T3_DIR}/bin\""
+
+    # Pre-clear ETXTBSY: when titan-t3.service is running, the kernel
+    # holds the binaries' text segments mmapped, and `scp` opens with
+    # O_TRUNC which Linux refuses on busy text files (silent "dest open
+    # Failure"). `rm -f` works regardless — Linux unlinks busy text
+    # files cleanly via inode refcount: the running process keeps the
+    # OLD binary via its open file descriptor; scp creates the new file
+    # at a new inode, ready for the next exec.
+    # Codified after 2026-05-08 deploy hit ETXTBSY on all 9 binaries
+    # (feedback_deploy_t3_orphan_files_and_etxtbsy.md).
+    ssh "${T2_HOST}" "rm -f \"${T3_DIR}/bin/\"titan-*-rs 2>/dev/null || true"
+
     # Single scp invocation for all binaries (one TCP setup, faster).
     local scp_args=()
     for bin_name in "${TITAN_RUST_FLEET[@]}"; do
@@ -154,6 +166,43 @@ SKIP_WORKTREE_FILES=$(git ls-files -v 2>/dev/null \
 git diff --name-only \
     | grep -vxFf /tmp/${LABEL}_skip_reset.lst \
     | xargs -r git checkout -- 2>/dev/null || true
+
+# 4b. Discard STAGED-BUT-NOT-COMMITTED changes (M/A in index) that would
+# block ff-pull. These accumulate when prior deploys crashed mid-stream
+# or were interrupted. `git checkout origin/titan-v6 --` forces both
+# index and working tree to match upstream for these paths. Filter the
+# skip list (config.toml + skip-worktree files) so we don't fight that
+# dance. Codified after 2026-05-08 deploy hit ROADMAP.md +
+# rFP_x_voice_enrichment.md staged blockers.
+STAGED_BLOCKERS=$(git diff --name-only --cached 2>/dev/null \
+    | grep -vxFf /tmp/${LABEL}_skip_reset.lst 2>/dev/null || true)
+if [ -n "${STAGED_BLOCKERS}" ]; then
+    echo "  ${LABEL}: discarding ${LABEL} stale staged changes (forcing to upstream titan-v6):"
+    echo "${STAGED_BLOCKERS}" | sed 's/^/    /'
+    git fetch origin titan-v6 2>/dev/null || true
+    echo "${STAGED_BLOCKERS}" | xargs -r git checkout origin/titan-v6 -- 2>/dev/null || true
+fi
+
+# 4c. Auto-clean UNTRACKED files that duplicate incoming tracked paths
+# (would block pull with "untracked working tree files would be
+# overwritten by merge"). Only safe when the local content is
+# byte-identical to upstream. Codified after 2026-05-08 hit untracked
+# social_x/ duplicates from a prior partial deploy.
+git fetch origin titan-v6 2>/dev/null || true
+INCOMING=$(git diff --name-only --diff-filter=A HEAD..origin/titan-v6 2>/dev/null || true)
+for f in ${INCOMING}; do
+    [ -f "$f" ] || continue
+    if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+        continue  # already tracked, handled by other steps
+    fi
+    # Untracked-but-incoming. Compare byte-for-byte against upstream.
+    if git show "origin/titan-v6:$f" 2>/dev/null | cmp -s - "$f" 2>/dev/null; then
+        rm -f "$f"
+    fi
+done
+# After cleaning byte-identical dupes, drop any leftover empty dirs.
+find titan_plugin titan-docs scripts data -type d -empty -delete 2>/dev/null || true
+
 rm -f /tmp/${LABEL}_skip_reset.lst
 git pull --ff-only origin titan-v6 2>&1 | tail -10
 
@@ -230,109 +279,32 @@ if [[ "$1" == "--update-only" ]]; then
     exit 0
 fi
 
-# ── Default: birth experiment bootstrap ──
-echo "════════════════════════════════════════"
-echo "  T3 BIRTH EXPERIMENT DEPLOYMENT"
-echo "════════════════════════════════════════"
+# ── Default mode: same as --update-only ──
+#
+# 2026-05-10 cleanup: the legacy rsync-based "BIRTH BOOTSTRAP" path was
+# removed. Per `feedback_t2t3_deployment_via_git_pull.md` (memory): T2/T3
+# deploy via git pull, NEVER rsync/scp. The bootstrap path was a one-time
+# fresh-T3 setup from the T3 birth experiment (Mar 2026); it has been dead
+# code since T3 separated into its own repo. Worse, it overwrote
+# config.toml + sed-patched the port back to 7778 which fought with the
+# update_code_t3() backup→pull→restore dance, AND it kept references to
+# t3_watchdog.sh which was retired 2026-05-09 (commit 9f4b5389) — so any
+# bare `bash scripts/deploy_t3.sh` invocation was rsync-erroring out
+# halfway through and silently leaving T3's port reset to 7777.
+#
+# Default behaviour now == `--update-only`: safe git-pull update + leave
+# restart to the operator. Use `--restart` for atomic update+restart.
 echo ""
-echo "ℹ This is the BIRTH bootstrap path (rsync, fresh state)."
-echo "ℹ For day-to-day code updates use: bash scripts/deploy_t3.sh --restart"
+echo "ℹ No flag given — defaulting to --update-only (safe git-pull mode)."
+echo "ℹ Use `--restart` for atomic update+restart, or `--update-only` to be explicit."
 echo ""
-
-# ── 1. Create T3 directory structure on T2 VPS ──
-echo "=== Creating T3 directory structure ==="
-ssh $T2_HOST "mkdir -p ${T3_DIR}/{data,scripts}"
-
-# ── 2. Sync code (plugin + scripts, NO data) ──
-echo "=== Syncing code ==="
-rsync -avz --delete \
-    --exclude='data/' \
-    --exclude='__pycache__/' \
-    --exclude='*.pyc' \
-    --exclude='cognee_data/' \
-    --exclude='node_modules/' \
-    --exclude='test_env/' \
-    --exclude='.git/' \
-    --exclude='.next/' \
-    --exclude='titan-docs/' \
-    --exclude='titan-observatory/' \
-    --exclude='titan-docs-site/' \
-    --exclude='programs/' \
-    --exclude='*.jpg' \
-    --exclude='*.png' \
-    "${T1_DIR}/titan_plugin/" \
-    "${T2_HOST}:${T3_DIR}/titan_plugin/"
-
-rsync -avz \
-    --exclude='__pycache__/' \
-    "${T1_DIR}/scripts/titan_main.py" \
-    "${T2_HOST}:${T3_DIR}/scripts/"
-
-rsync -avz \
-    "${T1_DIR}/scripts/t3_manage.sh" \
-    "${T1_DIR}/scripts/t3_watchdog.sh" \
-    "${T2_HOST}:${T3_DIR}/scripts/"
-
-# ── 3. Create T3-specific config (port 7778) ──
-echo "=== Creating T3 config (port 7778) ==="
-# Copy config and modify port
-scp "${T1_DIR}/titan_plugin/config.toml" "${T2_HOST}:${T3_DIR}/titan_plugin/config.toml"
-ssh $T2_HOST "sed -i 's/^port = 7777/port = 7778/' ${T3_DIR}/titan_plugin/config.toml"
-
-# Copy titan_params.toml (this IS the DNA — identical architecture, fresh start)
-scp "${T1_DIR}/titan_plugin/titan_params.toml" "${T2_HOST}:${T3_DIR}/titan_plugin/titan_params.toml"
-
-# ── 4. Create minimal empty data directories ──
-echo "=== Creating clean data directories ==="
-ssh $T2_HOST "mkdir -p ${T3_DIR}/data/{neural_nervous_system,neuromodulator,mini_reasoning,reasoning,interpreter,logs,telemetry,backups,media_queue,neural_nervous_system}"
-
-# ── 5. Create empty state files that spirit_worker expects ──
-echo "=== Creating birth state files ==="
-ssh $T2_HOST "cat > ${T3_DIR}/data/dreaming_state.json << 'EOF'
-{\"is_dreaming\": false, \"metabolic_drain\": 0.0, \"dream_cycle\": 0}
-EOF"
-
-ssh $T2_HOST "cat > ${T3_DIR}/data/neuromodulator/neuromodulator_state.json << 'EOF'
-{}
-EOF"
-
-ssh $T2_HOST "cat > ${T3_DIR}/data/neural_nervous_system/hormonal_state.json << 'EOF'
-{}
-EOF"
-
-ssh $T2_HOST "cat > ${T3_DIR}/data/pi_heartbeat_state.json << 'EOF'
-{\"total_epochs\": 0, \"pi_events\": 0, \"clusters\": 0}
-EOF"
-
-ssh $T2_HOST "cat > ${T3_DIR}/data/anchor_state.json << 'EOF'
-{\"total_anchors\": 0}
-EOF"
-
-# ── 6. Set up watchdog cron ──
-echo "=== Setting up watchdog cron ==="
-ssh $T2_HOST "
-# Add T3 watchdog cron if not already present
-if ! crontab -l 2>/dev/null | grep -q 't3_watchdog'; then
-    (crontab -l 2>/dev/null; echo '*/5 * * * * bash ${T3_DIR}/scripts/t3_watchdog.sh >> /tmp/titan3_watchdog.log 2>&1') | crontab -
-    echo 'Watchdog cron installed'
-else
-    echo 'Watchdog cron already exists'
+deploy_t3_update
+if [ "$INCLUDE_RUST" -eq 1 ]; then
+    echo ""
+    echo "=== Shipping Rust binaries (--include-rust-binaries) ==="
+    deploy_rust_binaries_t3
 fi
-"
-
 echo ""
-echo "════════════════════════════════════════"
-echo "  T3 DEPLOYMENT COMPLETE"
-echo "════════════════════════════════════════"
-echo ""
-echo "T3 Location: ${T3_DIR}"
-echo "T3 Port:     7778"
-echo "T3 Log:      /tmp/titan3_brain.log"
-echo "T3 Kin:      T2 on localhost:7777"
-echo "Watchdog:    Every 5 min (auto-restart + telemetry)"
-echo ""
-
-if [[ "$1" == "--start" ]]; then
-    echo "=== Starting T3 ==="
-    ssh $T2_HOST "bash ${T3_DIR}/scripts/t3_manage.sh start"
-fi
+echo "ℹ Code updated but NOT restarted — new code takes effect on next restart."
+echo "ℹ Restart with: ssh root@10.135.0.6 'systemctl restart titan-t3.service'"
+exit 0

@@ -1,0 +1,23 @@
+[package]
+name = "titan-clocks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Circadian + π-heartbeat clocks for Titan microkernel v2 Phase C — kernel-owned timekeeping per SPEC §10.H + §8.1"
+
+[dependencies]
+titan-core = { path = "../titan-core" }
+titan-state = { path = "../titan-state" }
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "sync", "macros"] }
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util", "macros", "time"] }
+parking_lot.workspace = true
+
+[lints]
+workspace = true

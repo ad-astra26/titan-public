@@ -2,6 +2,16 @@
 """
 ARC-AGI-3 Competition Runner for Titan1.
 
+⚠️  DISABLED FLEET-WIDE since 2026-04-26 (CPU starvation).
+    See memory/project_arc_disabled_cpu.md.
+    Cron entries are commented out and the auto-trigger in
+    services_watchdog.sh CHECK 4 was removed 2026-05-09 (commit
+    e1611d81) after a stale-log auto-launch on T2 drove VPS swap to
+    100% and hung T3's Python child for 22h.
+    Do NOT manually invoke without confirming CPU/swap budget on the
+    target host. ARC training will be revived in a dedicated rFP once
+    the CPU budget is resolved.
+
 Standalone script — does NOT connect to the live consciousness loop.
 Loads NS weights as read-only copies for personality signals.
 Trains action-scorer NN from ARC rewards during play.

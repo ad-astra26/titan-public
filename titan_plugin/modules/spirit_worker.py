@@ -63,51 +63,15 @@ EPOCH_URGENCY_THRESHOLD = 5    # hormonal fires since last epoch to trigger urge
 # 26 sphere emissions vs 16-per-lifetime budget across 4 restarts).
 # Single canonical JSON keyed by detector name. Saves on 5-min checkpoint
 # alongside NS SQLite backup. Loaded on detector init.
-_EDGE_DETECTOR_STATE_PATH = "./data/edge_detector_state.json"
-
-
-def _load_edge_detector_state() -> dict:
-    """Read the persisted EdgeDetector state file. Returns {} on any error
-    (fresh state) — fail-open is safe because missing state just means the
-    producer will re-emit on first observation post-restart."""
-    try:
-        import json
-        with open(_EDGE_DETECTOR_STATE_PATH) as f:
-            data = json.load(f)
-        if data.get("schema_version") != 1:
-            logger.warning(
-                "[SpiritWorker] Unknown EdgeDetector schema version %s; ignoring",
-                data.get("schema_version"))
-            return {}
-        return data.get("detectors", {}) or {}
-    except FileNotFoundError:
-        return {}
-    except Exception as e:
-        logger.warning("[SpiritWorker] EdgeDetector state load failed: %s", e)
-        return {}
-
-
-def _save_edge_detector_state(detectors: dict) -> None:
-    """Atomically write EdgeDetector state (tmpfile + os.replace). Best-effort:
-    WARN on failure because silent failure would hide a persistence gap.
-    `detectors` is {name: EdgeDetector-instance}."""
-    import json, os, tempfile
-    payload = {
-        "schema_version": 1,
-        "saved_at": time.time(),
-        "detectors": {name: det.to_dict() for name, det in detectors.items()
-                      if det is not None and hasattr(det, "to_dict")},
-    }
-    try:
-        _dir = os.path.dirname(_EDGE_DETECTOR_STATE_PATH) or "."
-        if not os.path.isdir(_dir):
-            os.makedirs(_dir, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=_dir, prefix="edge_detector_state.", suffix=".tmp")
-        with os.fdopen(fd, "w") as f:
-            json.dump(payload, f, separators=(",", ":"))
-        os.replace(tmp, _EDGE_DETECTOR_STATE_PATH)
-    except Exception as e:
-        logger.warning("[SpiritWorker] EdgeDetector state save failed: %s", e)
+# EdgeDetector persistence helpers hoisted to titan_plugin/logic/edge_detector_persistence.py
+# (2026-05-10) so cognitive_worker can share the same canonical JSON
+# checkpoint when the composite META-CGN + P14 EdgeDetectors migrate to
+# cognitive_worker under l0_rust_enabled=true.
+from titan_plugin.logic.edge_detector_persistence import (
+    EDGE_DETECTOR_STATE_PATH as _EDGE_DETECTOR_STATE_PATH,
+    load_edge_detector_state as _load_edge_detector_state,
+    save_edge_detector_state as _save_edge_detector_state,
+)
 
 # FILTER_DOWN publish interval (after each consciousness epoch that triggers training)
 # FOCUS PID runs every spirit publish cycle (60s)
@@ -749,6 +713,7 @@ def _spirit_worker_heartbeat_stub(recv_queue, send_queue, name: str, config: dic
     is preserved per Maker D3 (b) so flag-flip rollback stays viable.
     """
     import time
+    import threading
     from queue import Empty
     from titan_plugin import bus
 
@@ -759,12 +724,107 @@ def _spirit_worker_heartbeat_stub(recv_queue, send_queue, name: str, config: dic
     boot_ts = time.time()
 
     logger.info(
-        "[SpiritWorker] HEARTBEAT-ONLY STUB active "
+        "[SpiritWorker] HEARTBEAT-ONLY STUB + inner-spirit sensor cache writer "
         "(microkernel.l0_rust_enabled=true) — cognitive engines moved to "
-        "cognitive_worker (L2 ModuleSpec, chunk 8E). Spirit-tensor work "
-        "owned by Rust unified-spirit-rs / inner-spirit-rs / outer-spirit-rs. "
-        "Full deletion of spirit_worker.py is C-S8 cleanup."
+        "cognitive_worker (L2 ModuleSpec, chunk 8E). spirit_tensor compute "
+        "runs HERE feeding sensor_cache_inner_spirit.bin so titan-inner-spirit-rs "
+        "has 45D input (C-S5 closure 2026-05-08; SPEC §G1 + §23.6)."
     )
+
+    # ── Inner-spirit sensor cache writer (C-S5 closure 2026-05-08) ──────
+    # Under l0_rust_enabled=true, titan-inner-spirit-rs reads
+    # sensor_cache_inner_spirit.bin (45 × f32 LE per SPEC §G1) every
+    # Schumann tick, applies UNIFIED filter_down to content[5:45], and
+    # writes inner_spirit_45d.bin. Without this writer, the slot doesn't
+    # exist → Rust read fails → constant-zero fallback → ContentGate
+    # suppresses every output write → inner_spirit_45d.bin STUCK at v=2.
+    #
+    # Inputs to collect_spirit_45d are gathered from SHM + bus where
+    # accessible. Optional inputs default to None per the function
+    # signature; the canonical compute handles None gracefully and
+    # produces the SPEC §23.6 formula output regardless. As more L2
+    # state becomes accessible (memory_proxy, expression_translator,
+    # etc. via SHM reads), this provider can be extended without
+    # changing the writer architecture.
+    _spirit_stop_event = threading.Event()
+    _spirit_sensor_thread = None
+    try:
+        from titan_plugin.logic.inner_spirit_sensor_refresh import (
+            InnerSpiritSensorRefresh)
+        from titan_plugin.logic.spirit_tensor import collect_spirit_45d
+        from titan_plugin.core.state_registry import (
+            INNER_BODY_5D, INNER_MIND_15D, RegistryBank)
+        import numpy as np
+
+        _shm_bank_for_spirit = RegistryBank(titan_id=None, config=config)
+        _body_reader = _shm_bank_for_spirit.reader(INNER_BODY_5D)
+        _mind_reader = _shm_bank_for_spirit.reader(INNER_MIND_15D)
+        _last_spirit_45d: list = [0.5] * 45  # current_5d input bootstraps from prior
+
+        def _provide_spirit_45d():
+            """tensor_provider for InnerSpiritSensorRefresh.
+
+            Step 9 §4.6 schema migration v1→v2: returns msgpack source-dict
+            bytes {"tensor": [v0..v44]} (Phase C); falls back to legacy
+            np.array if msgpack unavailable. Python computes the 45D via
+            spirit_tensor.collect_spirit_45d (canonical SPEC §23.6); full
+            Rust per-dim formula port deferred to follow-up dedicated work
+            (45 SAT/CHIT/ANANDA formulas with 12+ L3 stat sources to
+            plumb — substantially bigger than fits in this session).
+            """
+            nonlocal _last_spirit_45d
+            try:
+                body_arr = _body_reader.read()
+                body_tensor = body_arr.tolist() if body_arr is not None else [0.5] * 5
+            except Exception:
+                body_tensor = [0.5] * 5
+            try:
+                mind_arr = _mind_reader.read()
+                mind_tensor = mind_arr.tolist() if mind_arr is not None else [0.5] * 15
+            except Exception:
+                mind_tensor = [0.5] * 15
+
+            current_5d = list(_last_spirit_45d[:5])
+
+            tensor_45d = collect_spirit_45d(
+                current_5d=current_5d,
+                body_tensor=body_tensor,
+                mind_tensor=mind_tensor,
+                consciousness=None,
+                topology=None,
+                hormone_levels=None,
+                hormone_fires=None,
+                unified_spirit_stats=None,
+                sphere_clocks=None,
+                memory_stats=None,
+                expression_stats=None,
+                birth_state=None,
+                history=None,
+            )
+            _last_spirit_45d = tensor_45d
+            try:
+                import msgpack as _msgpack
+                values = [float(v) for v in tensor_45d]
+                payload = {"tensor": values}
+                return _msgpack.packb(payload, use_bin_type=True)
+            except Exception:
+                return np.asarray(tensor_45d, dtype="<f4")
+
+        _spirit_sensor_writer = InnerSpiritSensorRefresh(
+            tensor_provider=_provide_spirit_45d,
+            titan_id=None,
+        )
+        _spirit_sensor_thread = _spirit_sensor_writer.start_thread(
+            _spirit_stop_event)
+        logger.info(
+            "[SpiritWorker] sensor_cache_inner_spirit.bin writer started "
+            "(45×f32 @ Schumann spirit rate; SPEC §G1 + §23.6)")
+    except Exception:
+        logger.critical(
+            "[SpiritWorker] failed to start inner_spirit sensor cache writer — "
+            "Rust inner-spirit-rs will starve on constant-zero input. "
+            "Investigate before relying on inner_spirit_45d.bin downstream.",
+            exc_info=True)
 
     try:
         send_queue.put({
@@ -816,6 +876,13 @@ def _spirit_worker_heartbeat_stub(recv_queue, send_queue, name: str, config: dic
 
         if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[SpiritWorker] Heartbeat-only stub shutdown — exiting")
+            # Signal the inner_spirit sensor cache writer to stop cleanly.
+            try:
+                _spirit_stop_event.set()
+                if _spirit_sensor_thread is not None:
+                    _spirit_sensor_thread.join(timeout=2.0)
+            except Exception:
+                pass
             return
 
         # Every other message is intentionally ignored — cognitive_worker
@@ -2659,16 +2726,35 @@ def spirit_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 try:
                     _d5_mind = mind_state.get("values_15d", mind_state.get("values", [0.5] * 5))
                     _d5_spirit = tensor if 'tensor' in dir() else [0.5] * 5
-                    try:
-                        from titan_plugin.logic.spirit_tensor import collect_spirit_45d
-                        _d5_cons = dict(consciousness.get("latest_epoch") or {})
-                        if e_mem:
-                            _d5_cons["dream_quality"] = e_mem.get_dream_quality(last_n_cycles=5)
-                        _d5_spirit = collect_spirit_45d(
-                            current_5d=_d5_spirit, body_tensor=body_state.get("values", [0.5] * 5),
-                            mind_tensor=_d5_mind, consciousness=_d5_cons)
-                    except Exception:
-                        pass
+                    # rFP_trinity_130d_phase2_5_closure §4 Chunk 2.5.D —
+                    # prefer the FULL 45D from _publish_spirit_state's
+                    # meta_sink stash (computed with all 9 producers) over
+                    # the minimal 4-arg compute below. Without this, the
+                    # 70.47 Hz writer feeds unified_spirit's tensor[20:65]
+                    # with PARTIAL values where 9 producer kwargs are
+                    # absent — surfaced by 2026-05-08 four-state classifier.
+                    _used_meta_sink = False
+                    if isinstance(outer_state, dict):
+                        _stash_45d = outer_state.get("_last_spirit_45d")
+                        _stash_ts = outer_state.get("_last_spirit_45d_ts", 0)
+                        if (isinstance(_stash_45d, list)
+                                and len(_stash_45d) == 45
+                                and time.time() - float(_stash_ts or 0) <= 30.0):
+                            _d5_spirit = list(_stash_45d)
+                            _used_meta_sink = True
+                    if not _used_meta_sink:
+                        # Fallback: minimal compute. Tracker still records
+                        # SHM with PARTIAL classification; visible in dim-live.
+                        try:
+                            from titan_plugin.logic.spirit_tensor import collect_spirit_45d
+                            _d5_cons = dict(consciousness.get("latest_epoch") or {})
+                            if e_mem:
+                                _d5_cons["dream_quality"] = e_mem.get_dream_quality(last_n_cycles=5)
+                            _d5_spirit = collect_spirit_45d(
+                                current_5d=_d5_spirit, body_tensor=body_state.get("values", [0.5] * 5),
+                                mind_tensor=_d5_mind, consciousness=_d5_cons)
+                        except Exception:
+                            pass
                     # ── Microkernel v2 §A.7 / §L1 (S3b.2) — feed the
                     # dedicated 70.47 Hz writer thread (started at boot
                     # above). Pre-S3b.2 this site directly wrote shm at

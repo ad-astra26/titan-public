@@ -150,6 +150,10 @@ SOURCE_KEYS: tuple[str, ...] = (
     "block_delta_stats",
     "anchor_state",
     "sol_balance",
+    # Step 3 §3.1 additions for §4.1 P1 outer_body thermal port:
+    # SPEC §23.7 dim 4 thermal REDESIGNED → 0.40 * hormonal_heat where
+    # hormonal_heat = mean(IMPULSE, VIGILANCE) per spirit_proxy hormones.
+    "hormone_levels",
 )
 
 
@@ -238,12 +242,9 @@ class OuterBodySensorRefresh:
                     "restarting after %.1fs backoff:\n%s",
                     _RESTART_BACKOFF_S, traceback.format_exc(),
                 )
-                try:
-                    await asyncio.wait_for(
-                        self._stop.wait(), timeout=_RESTART_BACKOFF_S,
-                    )
-                except asyncio.TimeoutError:
-                    pass  # backoff elapsed; loop again
+                # Plain asyncio.sleep — see _refresh_loop docstring re:
+                # cross-event-loop Event binding hazard.
+                await asyncio.sleep(_RESTART_BACKOFF_S)
 
         # Graceful exit
         if self._writer is not None:
@@ -300,7 +301,19 @@ class OuterBodySensorRefresh:
         return StateRegistryWriter(spec, shm_root)
 
     async def _refresh_loop(self) -> None:
-        """Run refresh ticks until ``stop_event`` is set."""
+        """Run refresh ticks until ``stop_event`` is set.
+
+        Uses plain ``asyncio.sleep`` instead of ``wait_for(stop.wait())``
+        to avoid asyncio.Event cross-event-loop binding hazard: this
+        sidecar runs in a dedicated daemon thread with its own
+        ``asyncio.run()`` event loop, but ``self._stop`` was constructed
+        in ``__init__`` from the main thread's context. Awaiting that
+        Event from the new loop silently never wakes (verified 2026-05-10
+        T3 py-spy: each sidecar ticked exactly once then hung in select
+        forever). ``stop.is_set()`` is a cross-thread-safe atomic flag
+        read; checking it at loop top is sufficient for stop responsiveness
+        (worst case: 1 period of latency on shutdown).
+        """
         while not self._stop.is_set():
             tick_start = time.monotonic()
 
@@ -310,12 +323,7 @@ class OuterBodySensorRefresh:
             elapsed = time.monotonic() - tick_start
             sleep_for = max(0.0, self._refresh_period_s - elapsed)
             if sleep_for > 0:
-                try:
-                    await asyncio.wait_for(
-                        self._stop.wait(), timeout=sleep_for,
-                    )
-                except asyncio.TimeoutError:
-                    pass  # period elapsed without stop — continue
+                await asyncio.sleep(sleep_for)
 
     def _refresh_and_write(self) -> None:
         """

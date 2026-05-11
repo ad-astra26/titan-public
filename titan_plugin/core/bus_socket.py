@@ -731,12 +731,31 @@ class BusSocketServer:
     # Stopgap until rFP_bus_broadcast_filter_migration ships per-worker filters
     # for all 17 spawn_graduated workers. See BUGS.md
     # BUG-BUS-PER-WORKER-BROADCAST-FILTER-MIGRATION-INCOMPLETE-20260430.
+    #
+    # 2026-05-09 expansion: added MIND_STATE / BODY_STATE / INNER_SPIRIT_FILTER_DOWN
+    # / UNIFIED_SPIRIT_FILTER_DOWN / UNIFIED_SPIRIT_SELF_ASSEMBLED /
+    # TRINITY_SUBSTRATE_TOPOLOGY_UPDATED. Originally omitted because their Python
+    # publishers (Phase A+B spirit_loop) emitted at sub-Hertz rates and never
+    # triggered overflow. After C-S5 fix unstuck the Phase C inner trinity Rust
+    # daemons (commit 271f7ef2 / 2026-05-08), these types started firing at
+    # Schumann rates per SPEC §8.5 (7.83/23.49/70.47 Hz) → 22 spawn_graduated
+    # workers' queues filled → /v4 STATE_SNAPSHOT_RESPONSE drops → T3 chi/NS/
+    # neuromods endpoints stuck on bootstrap defaults. Phase C-only failure
+    # mode (T3 only); Phase A+B Python publishers are below Schumann rate.
+    # Phase C types are Rust-only string literals (not Python module constants).
     _HIGH_RATE_BROADCAST_TYPES = frozenset({
-        bus.SPHERE_PULSE,         # 6 clocks × ~12 Hz Schumann pulses
-        bus.PI_HEARTBEAT_UPDATED, # ~10 Hz π-heartbeat
-        bus.BIG_PULSE,            # frequent state aggregation
-        bus.SPIRIT_STATE,         # fires every Schumann × 9 = 70.47 Hz
-        bus.TOPOLOGY_STATE_UPDATED, # frequent topology snapshots
+        bus.SPHERE_PULSE,                       # 6 clocks × ~12 Hz Schumann pulses
+        bus.PI_HEARTBEAT_UPDATED,               # ~10 Hz π-heartbeat
+        bus.BIG_PULSE,                          # frequent state aggregation
+        bus.BODY_STATE,                         # Schumann body 7.83 Hz
+        bus.MIND_STATE,                         # Schumann mind 23.49 Hz
+        bus.SPIRIT_STATE,                       # Schumann spirit × 9 = 70.47 Hz
+        bus.TOPOLOGY_STATE_UPDATED,             # frequent topology snapshots
+        # Phase C Rust types (no Python constants — Rust-only publishers)
+        "INNER_SPIRIT_FILTER_DOWN",             # 70.47 Hz from inner-spirit-rs
+        "UNIFIED_SPIRIT_FILTER_DOWN",           # GLOBAL filter at Schumann
+        "UNIFIED_SPIRIT_SELF_ASSEMBLED",        # 70.47 Hz from unified-spirit-rs
+        "TRINITY_SUBSTRATE_TOPOLOGY_UPDATED",   # high-freq from trinity-rs
     })
 
     def publish(self, msg: dict, *, _from_subscriber: Optional[BrokerSubscriber] = None) -> None:

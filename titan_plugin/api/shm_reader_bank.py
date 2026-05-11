@@ -49,6 +49,13 @@ from titan_plugin.core.state_registry import (
     resolve_shm_root,
     resolve_titan_id,
 )
+from titan_plugin.logic.session4_state_specs import (
+    SPIRIT_SUPPLEMENTAL_STATE_SPEC,
+)
+from titan_plugin.logic.spirit_state_specs import (
+    RESONANCE_STATE_SPEC,
+    UNIFIED_SPIRIT_METADATA_SPEC,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +155,12 @@ class ShmReaderBank:
         "_topology_30d", "_hormonal",
         "_inner_body", "_inner_mind",
         "_outer_body", "_outer_mind", "_outer_spirit",
+        # rFP_worker_broadcast_topics_completion §4.D abstraction-completion
+        # (2026-05-10): variable-size msgpack-encoded composite slots that
+        # SpiritAccessor's get_nervous_system / get_resonance /
+        # get_unified_spirit need for SHM-first migration (matching the
+        # get_sphere_clocks pattern at state_accessor.py:242-247).
+        "_spirit_supplemental", "_resonance_state", "_unified_spirit_metadata",
     )
 
     def __init__(self, titan_id: str | None = None) -> None:
@@ -170,6 +183,17 @@ class ShmReaderBank:
         self._outer_body = StateRegistryReader(OUTER_BODY_5D, self.shm_root)
         self._outer_mind = StateRegistryReader(OUTER_MIND_15D, self.shm_root)
         self._outer_spirit = StateRegistryReader(OUTER_SPIRIT_45D, self.shm_root)
+        # rFP_worker_broadcast_topics_completion §4.D — variable-size
+        # msgpack-encoded composite slots (SHM-first migration for
+        # SpiritAccessor.get_nervous_system / get_resonance /
+        # get_unified_spirit, completing the abstraction get_sphere_clocks
+        # has used since chunk 8M.4).
+        self._spirit_supplemental = StateRegistryReader(
+            SPIRIT_SUPPLEMENTAL_STATE_SPEC, self.shm_root)
+        self._resonance_state = StateRegistryReader(
+            RESONANCE_STATE_SPEC, self.shm_root)
+        self._unified_spirit_metadata = StateRegistryReader(
+            UNIFIED_SPIRIT_METADATA_SPEC, self.shm_root)
         logger.info(
             "[ShmReaderBank] initialized for titan_id=%s root=%s",
             self.titan_id, self.shm_root,
@@ -419,6 +443,84 @@ class ShmReaderBank:
         if payload is None:
             return None
         return {"values": payload.tolist(), "age_seconds": age, "seq": seq}
+
+    # -- Variable-size composite slots (rFP_worker_broadcast_topics §4.D) ---
+    #
+    # spirit_supplemental_state.bin / resonance_state.bin /
+    # unified_spirit_metadata.bin are msgpack-encoded variable-size slots
+    # produced by SpiritStatePublisher + SpiritSupplementalStatePublisher
+    # in spirit_loop's snapshot-builder threads. Read via reader.read_variable()
+    # (NOT read() which is fixed-size), then msgpack-decode.
+    #
+    # Closes the bug surfaced 2026-05-10: SpiritAccessor.get_nervous_system /
+    # get_resonance / get_unified_spirit returned `{}` because they read
+    # bus-cache only (`self._cache.get("spirit.X", {}) or {}`) — and on T3
+    # under l0_rust_enabled=true, spirit_worker is heartbeat-only so the
+    # cache key is never populated. The publisher writes SHM correctly
+    # (verified: spirit_supplemental_state.bin has 53,934-byte payload with
+    # 4 sections including nervous_system with 10 keys); the api_subprocess
+    # accessor just wasn't reading SHM. This completes the abstraction
+    # get_sphere_clocks has used since chunk 8M.4 (state_accessor.py:242-247).
+
+    def _read_msgpack_variable(
+        self,
+        reader: StateRegistryReader,
+        slot_name: str,
+    ) -> dict[str, Any] | None:
+        """Read variable-size SHM slot, msgpack-decode, return dict.
+
+        Returns None on cold-boot / missing / torn / decode-failure.
+        Mirrors the proven pattern in titan_plugin/proxies/spirit_proxy.py:
+        _read_msgpack — same byte-format contract, same failure modes.
+        """
+        try:
+            raw = reader.read_variable()
+        except Exception as e:
+            logger.warning(
+                "[ShmReaderBank] %s read_variable raised: %s",
+                slot_name, e, exc_info=True)
+            return None
+        if raw is None:
+            return None
+        try:
+            import msgpack
+            decoded = msgpack.unpackb(raw, raw=False)
+        except Exception as e:
+            logger.warning(
+                "[ShmReaderBank] %s msgpack decode failed: %s",
+                slot_name, e)
+            return None
+        if not isinstance(decoded, dict):
+            logger.warning(
+                "[ShmReaderBank] %s decoded to non-dict: %s",
+                slot_name, type(decoded).__name__)
+            return None
+        return decoded
+
+    def read_spirit_supplemental(self) -> dict[str, Any] | None:
+        """Return full spirit_supplemental_state dict (4 sections:
+        filter_down_status / meditation_health / coordinator / nervous_system
+        + ts), or None if SHM unavailable. Per Session 4 §4.C.1 expansion
+        producer in spirit_loop snapshot-builder.
+
+        Caller extracts the section it needs (e.g., for /v4/nervous-system,
+        SpiritAccessor.get_nervous_system reads `dict["nervous_system"]`).
+        """
+        return self._read_msgpack_variable(
+            self._spirit_supplemental, "spirit_supplemental_state")
+
+    def read_resonance_state(self) -> dict[str, Any] | None:
+        """Return ResonanceDetector.get_stats() output as dict, or None
+        if SHM unavailable. Producer: SpiritStatePublisher._publish_resonance_state."""
+        return self._read_msgpack_variable(
+            self._resonance_state, "resonance_state")
+
+    def read_unified_spirit_metadata(self) -> dict[str, Any] | None:
+        """Return UnifiedSpirit.get_stats() output as dict (velocity,
+        stale, focus_multiplier, etc.), or None if SHM unavailable.
+        Producer: SpiritStatePublisher._publish_unified_spirit_metadata."""
+        return self._read_msgpack_variable(
+            self._unified_spirit_metadata, "unified_spirit_metadata")
 
     # -- Diagnostic ----------------------------------------------------
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from titan_plugin.bus import (
     BODY_STATE,
+    BUS_PEER_DIED,
     BUS_WORKER_ADOPT_REQUEST,
     DivineBus,
     DREAM_STATE_CHANGED,
@@ -29,6 +30,9 @@ from titan_plugin.bus import (
     MODULE_READY,
     MODULE_SHUTDOWN,
     OBSERVABLES_SNAPSHOT,
+    OUTER_BODY_STATE,
+    OUTER_MIND_STATE,
+    OUTER_SPIRIT_STATE,
     OUTER_TRINITY_STATE,
     QUERY,
     SAGE_STATS,
@@ -108,23 +112,28 @@ def test_v4_bridge_filter_matches_V4_EVENT_TYPES_constant():
 
 def test_guardian_filter_matches_lifecycle_msg_handlers():
     """Guardian declares types=[MODULE_HEARTBEAT, MODULE_READY,
-    MODULE_SHUTDOWN, BUS_WORKER_ADOPT_REQUEST] at subscribe time. These
-    are the 4 msg_types its `_process_guardian_messages` consumer
-    handles + targeted (lifecycle) — listed explicitly so the contract
-    is self-documenting."""
+    MODULE_SHUTDOWN, BUS_WORKER_ADOPT_REQUEST, BUS_PEER_DIED] at subscribe
+    time. These are the 5 msg_types its `_process_guardian_messages`
+    consumer handles + targeted (lifecycle) — listed explicitly so the
+    contract is self-documenting.
+
+    BUS_PEER_DIED added 2026-05-02 (commit bc1e23be / Phase B.2 §D9):
+    broker detects peer PID dead via os.kill(pid, 0) and publishes
+    BUS_PEER_DIED → Guardian triggers immediate restart for named workers
+    (faster than 1Hz polling)."""
     bus = DivineBus()
     from titan_plugin.guardian import Guardian
     guardian = Guardian(bus)
     flt = bus.get_broadcast_filter("guardian")
     expected = frozenset({
         MODULE_HEARTBEAT, MODULE_READY, MODULE_SHUTDOWN,
-        BUS_WORKER_ADOPT_REQUEST,
+        BUS_WORKER_ADOPT_REQUEST, BUS_PEER_DIED,
     })
     assert flt == expected, (
         f"guardian filter drift: expected {expected}, got {flt}. "
         f"If you added/removed an elif branch in "
         f"_process_guardian_messages, update the types= list at "
-        f"guardian.py:~168.")
+        f"guardian.py:~218.")
 
 
 def test_guardian_module_heartbeat_targeted_msgs_bypass_filter():
@@ -229,9 +238,18 @@ def test_agency_filter_matches_loop_elif_chain():
 
 def test_state_register_filter_matches_process_bus_message_chain():
     """StateRegister.start() declares types matching the elif chain in
-    _process_bus_message() — captured 9 types via auto-extraction:
-    BODY_STATE, FILTER_DOWN, FOCUS_NUDGE, IMPULSE, MIND_STATE,
-    OBSERVABLES_SNAPSHOT, OUTER_TRINITY_STATE, SPHERE_PULSE, SPIRIT_STATE."""
+    _process_bus_message() — 12 types per current production
+    (state_register.py:476-485):
+
+      BODY_STATE, MIND_STATE, SPIRIT_STATE — inner trinity tensor states
+      OUTER_BODY_STATE, OUTER_MIND_STATE, OUTER_SPIRIT_STATE — outer trinity
+        (added Phase A.S8 2026-04-30 alongside legacy OUTER_TRINITY_STATE
+         compat path)
+      OUTER_TRINITY_STATE — legacy_core fallback compat (pre-A.S8 publishers)
+      FILTER_DOWN, FOCUS_NUDGE — modulation events
+      IMPULSE — drive events
+      OBSERVABLES_SNAPSHOT — periodic snapshot
+      SPHERE_PULSE — Schumann clock"""
     bus = DivineBus()
     from titan_plugin.logic.state_register import StateRegister
     sr = StateRegister()
@@ -240,7 +258,10 @@ def test_state_register_filter_matches_process_bus_message_chain():
         flt = bus.get_broadcast_filter("state_register")
         expected = frozenset({
             BODY_STATE, FILTER_DOWN, FOCUS_NUDGE, IMPULSE, MIND_STATE,
-            OBSERVABLES_SNAPSHOT, OUTER_TRINITY_STATE, SPHERE_PULSE, SPIRIT_STATE,
+            OBSERVABLES_SNAPSHOT,
+            OUTER_BODY_STATE, OUTER_MIND_STATE, OUTER_SPIRIT_STATE,
+            OUTER_TRINITY_STATE,
+            SPHERE_PULSE, SPIRIT_STATE,
         })
         assert flt == expected, (
             f"state_register filter drift: expected {expected}, got {flt}. "

@@ -1,0 +1,55 @@
+# titan@.service — systemd unit template for the Phase C Rust microkernel.
+#
+# Per PLAN_microkernel_phase_c_s2_kernel.md §15.3 + SPEC §18.4
+# (shutdown grace: kernel 10s + daemon 3s + worker 5s + TimeoutStopSec=30).
+#
+# %i = T1 / T2 / T3 (templated; e.g. `systemctl start titan@T1.service`).
+#
+# C-S2 status: SHIPPED IN REPO BUT NOT INSTALLED. The Python boot path
+# (titan_main.py via titan_watchdog.sh cron) remains the runtime until
+# C-S7 graduation. C-S7 (after Maker greenlight) is the only chunk that
+# copies this file to /etc/systemd/system/ and enables it.
+#
+# Manual install (C-S7 only):
+#   sudo cp titan-rust/systemd/titan@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable titan@T1.service   # (per Titan)
+#   sudo systemctl start  titan@T1.service
+
+[Unit]
+Description=Titan Microkernel v2 (Phase C — Rust L0) — Titan %i
+After=network.target
+ConditionPathExists=/home/antigravity/projects/titan/data/titan_identity_keypair.json
+
+[Service]
+Type=simple
+User=antigravity
+WorkingDirectory=/home/antigravity/projects/titan
+EnvironmentFile=-/home/antigravity/projects/titan/.titan_env
+Environment=MALLOC_ARENA_MAX=2
+Environment=TITAN_KERNEL_LOG_LEVEL=info
+
+# The kernel binary ships to bin/ via deploy_t2.sh --include-rust-binaries.
+# Kernel locates the substrate placeholder as a sibling of its own exe.
+ExecStart=/home/antigravity/projects/titan/bin/titan-kernel-rs --titan-id %i
+
+# Graceful: kernel SIGTERM → 10s window per SPEC §18.4 +
+# KERNEL_SHUTDOWN_GRACE_S; daemons + workers cascade (3s + 5s); systemd
+# upper bound = 30s before SIGKILL.
+ExecStop=/bin/kill -TERM $MAINPID
+TimeoutStopSec=30
+
+# Restart on crash, but never on intentional exit codes (SPEC §15:
+# 2=identity, 3=shm, 4=bus, 5=clock, 6=spawn — these need human
+# diagnosis, not blind respawn).
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+RestartPreventExitStatus=2 3 4 5 6
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

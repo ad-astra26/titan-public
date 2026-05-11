@@ -1,0 +1,20 @@
+[package]
+name = "titan-schumann"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Schumann frequency generators (7.83 / 23.49 / 70.47 Hz) per Preamble G13 LOCKED. Substrate-side."
+
+[dependencies]
+titan-core = { path = "../titan-core" }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "sync", "macros"] }
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "rt", "rt-multi-thread", "time", "sync", "macros"] }
+
+[lints]
+workspace = true

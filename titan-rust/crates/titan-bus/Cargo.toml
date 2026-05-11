@@ -1,0 +1,47 @@
+[package]
+name = "titan-bus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Main bus broker for Titan microkernel v2 Phase C — B.2 protocol byte-identical port of Python BusSocketServer"
+
+[dependencies]
+titan-core = { path = "../titan-core" }
+
+# Async runtime — broker is async-by-default
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros", "signal"] }
+
+# Serialization (msgpack — same wire format as B.2)
+rmp-serde.workspace = true
+rmpv.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+
+# Random for HMAC challenge nonces
+rand.workspace = true
+
+# Concurrency primitives
+parking_lot.workspace = true
+arc-swap.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Misc
+once_cell.workspace = true
+bytes.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+serde_json.workspace = true
+tempfile = "3"
+
+[lints]
+workspace = true

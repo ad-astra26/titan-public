@@ -392,6 +392,9 @@ class TitanCore:
         # See core/plugin.py:_register_modules for design rationale.
         from .modules.warning_monitor_worker import warning_monitor_worker_main
         _wm_cfg = self._full_config.get("warning_monitor", {})
+        # rFP_worker_broadcast_topics_completion §4.A.3 (Batch 3):
+        # warning_monitor drain at modules/warning_monitor_worker.py:209
+        # consumes one broadcast type (SILENT_SWALLOW_REPORT).
         self.guardian.register(ModuleSpec(
             name="warning_monitor",
             layer="L3",
@@ -402,6 +405,7 @@ class TitanCore:
             lazy=False,
             heartbeat_timeout=120.0,
             reply_only=False,
+            broadcast_topics=[bus.SILENT_SWALLOW_REPORT],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
             b2_1_swap_critical=False,  # M5: light-state worker; respawn-OK
         ))
@@ -499,6 +503,9 @@ class TitanCore:
         ))
 
         # RL/Sage module (TorchRL — ~2500MB with mmap)
+        # rFP_worker_broadcast_topics_completion §4.A.2 (Batch 2):
+        # rl drain at modules/rl_worker.py:136-147 consumes one broadcast
+        # type (SAGE_RECORD_TRANSITION); MODULE_SHUTDOWN + QUERY are targeted.
         self.guardian.register(ModuleSpec(
             name="rl",
             layer="L2",  # Microkernel v2 §A.5 — L2 higher cognition (IQL chain learning)
@@ -507,10 +514,14 @@ class TitanCore:
             rss_limit_mb=3000,
             autostart=False,
             lazy=True,
+            broadcast_topics=[bus.SAGE_RECORD_TRANSITION],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
         # LLM/Inference module (Agno agent — ~500MB)
+        # rFP_worker_broadcast_topics_completion §4.A.2 (Batch 2):
+        # llm drain at modules/llm_worker.py:103-112 consumes one broadcast
+        # type (LLM_TEACHER_REQUEST); MODULE_SHUTDOWN + QUERY are targeted.
         self.guardian.register(ModuleSpec(
             name="llm",
             layer="L3",  # Microkernel v2 §A.5 — L3 pluggable (Agno inference, human-time)
@@ -520,6 +531,7 @@ class TitanCore:
             autostart=True,  # Changed: Language Teacher needs llm at boot
             lazy=False,
             heartbeat_timeout=120.0,  # LLM calls can block 30s+; match Spirit/Memory timeout
+            broadcast_topics=[bus.LLM_TEACHER_REQUEST],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
@@ -534,6 +546,10 @@ class TitanCore:
             # body shm fast-path is silently no-op).
             "microkernel": self._full_config.get("microkernel", {}),
         }
+        # rFP_worker_broadcast_topics_completion §4.A.2 (Batch 2):
+        # body drain at modules/body_worker.py:255-303 consumes 4 broadcasts
+        # (FILTER_DOWN, FOCUS_NUDGE, CONVERSATION_STIMULUS, INTERFACE_INPUT);
+        # MODULE_SHUTDOWN + QUERY are targeted.
         self.guardian.register(ModuleSpec(
             name="body",
             layer="L1",  # Microkernel v2 §A.5 — L1 Trinity daemon (5DT somatic)
@@ -542,6 +558,10 @@ class TitanCore:
             rss_limit_mb=800,   # was 500; fork-inherited parent memory grew from ~250MB to ~400MB+ (2026-04-17)
             autostart=True,  # Body senses must always be active
             lazy=False,
+            broadcast_topics=[
+                bus.FILTER_DOWN, bus.FOCUS_NUDGE,
+                bus.CONVERSATION_STIMULUS, bus.INTERFACE_INPUT,
+            ],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
@@ -552,6 +572,11 @@ class TitanCore:
             # passthrough (mirrors plugin.py).
             "microkernel": self._full_config.get("microkernel", {}),
         }
+        # rFP_worker_broadcast_topics_completion §4.A.2 (Batch 2):
+        # mind drain at modules/mind_worker.py:271-360 consumes 7 broadcasts
+        # (OUTER_SOURCES_SNAPSHOT, FILTER_DOWN, FOCUS_NUDGE,
+        # CONVERSATION_STIMULUS, INTERFACE_INPUT, SENSE_VISUAL, SENSE_AUDIO);
+        # MODULE_SHUTDOWN + QUERY are targeted.
         self.guardian.register(ModuleSpec(
             name="mind",
             layer="L1",  # Microkernel v2 §A.5 — L1 Trinity daemon (5DT cognitive)
@@ -560,6 +585,11 @@ class TitanCore:
             rss_limit_mb=700,   # was 500; fork-inherited parent RSS ~400MB left only 100MB headroom — caused T3 cascade (2026-04-17). Memory profiling tool (DEFERRED TOP) will identify real optimization targets.
             autostart=True,  # Mind senses should always be active
             lazy=False,
+            broadcast_topics=[
+                bus.OUTER_SOURCES_SNAPSHOT, bus.FILTER_DOWN, bus.FOCUS_NUDGE,
+                bus.CONVERSATION_STIMULUS, bus.INTERFACE_INPUT,
+                bus.SENSE_VISUAL, bus.SENSE_AUDIO,
+            ],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
@@ -586,6 +616,47 @@ class TitanCore:
             # even when the flags were flipped true in titan_params.toml.
             "microkernel": self._full_config.get("microkernel", {}),
         }
+        # rFP_worker_broadcast_topics_completion §4.A.5 (Batch 5 — heaviest):
+        # spirit drain at modules/spirit_worker.py consumes 57 broadcast types
+        # (kitchen-sink central worker — handles consciousness, sphere clocks,
+        # NeuralNervousSystem, ExperienceOrchestrator, expression dispatch,
+        # CGN ground-up, meta-reasoning chains, Maker dialog, X-voice posting).
+        # Extracted via grep -E "if msg_type|elif msg_type" + bus.* deduplication.
+        # NOTE: spirit_worker.py is queued for retirement in
+        # rFP_microkernel_v2_definitive_closure §4.D8-3 (after Sessions 6-7
+        # land). This declaration is therefore short-lived; gives clean filter
+        # contract for the soak window between this rFP and D8-3 landing.
+        _SPIRIT_BROADCAST_TOPICS = [
+            bus.ACTION_RESULT, bus.BODY_STATE,
+            bus.CGN_CROSS_INSIGHT, bus.CGN_HAOV_VERIFY_REQ,
+            bus.CGN_KNOWLEDGE_REQ, bus.CGN_KNOWLEDGE_RESP,
+            bus.CGN_STATE_SNAPSHOT, bus.CONFIG_RELOAD,
+            bus.CONTRACT_LIST_RESP, bus.CONVERSATION_STIMULUS,
+            bus.DREAM_WAKE_REQUEST, bus.EMOT_CGN_SIGNAL,
+            bus.EPOCH_TICK, bus.EXPERIENCE_STIMULUS,
+            bus.FILTER_DOWN_V5, bus.LANGUAGE_STATS_UPDATE,
+            bus.LLM_TEACHER_RESPONSE, bus.MAKER_DIALOGUE_COMPLETE,
+            bus.MAKER_NARRATION_RESULT, bus.MAKER_PROPOSAL_CREATED,
+            bus.MAKER_RESPONSE_RECEIVED, bus.MEDITATION_COMPLETE,
+            bus.MEMORY_RECALL_PERTURBATION, bus.META_CGN_SIGNAL,
+            bus.META_DIVERSITY_PRESSURE, bus.META_EUREKA,
+            bus.META_EVENT_REWARD, bus.META_LANGUAGE_REQUEST,
+            bus.META_LANGUAGE_REWARD, bus.META_OUTER_REWARD,
+            bus.META_PATTERN_EMERGED, bus.META_PERSONA_REWARD,
+            bus.META_REASON_OUTCOME, bus.META_REASON_REQUEST,
+            bus.META_REASON_RESPONSE, bus.META_STRATEGY_DRIFT,
+            bus.META_TEACHER_FEEDBACK, bus.META_TEACHER_GROUNDING,
+            bus.MIND_STATE, bus.MODULE_CRASHED,
+            bus.OUTER_BODY_STATE, bus.OUTER_MIND_STATE,
+            bus.OUTER_OBSERVATION, bus.OUTER_SPIRIT_STATE,
+            bus.OUTER_TRINITY_STATE, bus.RATE_LIMIT,
+            bus.REFLEX_REWARD, bus.RELOAD,
+            bus.SAVE_NOW, bus.SENSE_AUDIO,
+            bus.SOCIAL_PERCEPTION, bus.SPEAK_RESULT,
+            bus.STATE_SNAPSHOT, bus.TEACHER_SIGNALS,
+            bus.TIMECHAIN_QUERY_RESP, bus.X_FORCE_POST,
+            bus.X_POST_DISPATCH,
+        ]
         self.guardian.register(ModuleSpec(
             name="spirit",
             layer="L1",  # Microkernel v2 §A.5 — L1 Trinity daemon (consciousness core)
@@ -595,6 +666,7 @@ class TitanCore:
             autostart=True,  # Spirit awareness should always be active
             lazy=False,
             heartbeat_timeout=120.0,  # Spirit does heavy V4 work (LLM, on-chain)
+            broadcast_topics=_SPIRIT_BROADCAST_TOPICS,
         ))
 
         # cognitive_worker (L2) — Phase C C-S8 4B (chunk 8E skeleton, 2026-05-05).
@@ -624,6 +696,10 @@ class TitanCore:
                 "titan_vm": self._full_config.get("titan_vm", {}),
             }
             from titan_plugin.modules.cognitive_worker import cognitive_worker_main
+            # rFP_worker_broadcast_topics_completion §4.A.5 (Batch 5):
+            # cognitive_worker drain at modules/cognitive_worker.py:393-450
+            # consumes 8 broadcast types. SAVE_NOW + MODULE_SHUTDOWN are
+            # targeted (dst="cognitive_worker") and bypass broadcast filter.
             self.guardian.register(ModuleSpec(
                 name="cognitive_worker",
                 layer="L2",  # Microkernel v2 §A.5 — L2 (cognitive engine host)
@@ -633,6 +709,12 @@ class TitanCore:
                 autostart=True,     # Required for /v4/* cognitive routes to populate
                 lazy=False,
                 heartbeat_timeout=120.0,  # Cognitive epoch can include LLM calls
+                broadcast_topics=[
+                    bus.BODY_STATE, bus.MIND_STATE, bus.SPIRIT_STATE,
+                    bus.KERNEL_EPOCH_TICK, bus.CGN_DREAM_CONSOLIDATE,
+                    bus.CONVERSATION_STIMULUS, bus.EXPERIENCE_STIMULUS,
+                    bus.MEDITATION_COMPLETE,
+                ],
                 start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
             ))
 
@@ -642,6 +724,10 @@ class TitanCore:
                 os.path.dirname(__file__), "..", "data", "media_queue"
             ),
         }
+        # rFP_worker_broadcast_topics_completion §4.A.2 (Batch 2):
+        # media drain at modules/media_worker.py:126-130 explicitly drops
+        # anything that isn't SHUTDOWN or QUERY (both targeted). Pure
+        # RPC-reply pattern — reply_only=True is canonical.
         self.guardian.register(ModuleSpec(
             name="media",
             layer="L3",  # Microkernel v2 §A.5 — L3 pluggable (expression: speech/art/music)
@@ -651,6 +737,7 @@ class TitanCore:
             autostart=True,   # Always on — art/audio generated frequently
             lazy=False,
             heartbeat_timeout=180.0,  # Image/audio digest can block 30-90s
+            reply_only=True,
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
             b2_1_swap_critical=False,  # M5: light-state worker; respawn-OK
         ))
@@ -660,6 +747,14 @@ class TitanCore:
             **self._full_config.get("language", {}),
             "data_dir": self._full_config.get("memory_and_storage", {}).get("data_dir", "./data"),
         }
+        # rFP_worker_broadcast_topics_completion §4.A.3 (Batch 3):
+        # language drain at modules/language_worker.py:1008-2025 consumes
+        # 14 broadcast types (SPEAK_REQUEST, LLM_TEACHER_RESPONSE,
+        # META_LANGUAGE_RESULT, MAKER_NARRATION_REQUEST,
+        # CGN_DREAM_CONSOLIDATE, CGN_CROSS_INSIGHT, CGN_WEIGHTS_MAJOR,
+        # CGN_KNOWLEDGE_RESP, QUERY_RESPONSE, SOCIAL_PERCEPTION,
+        # CGN_SOCIAL_TRANSITION, CGN_HAOV_VERIFY_REQ, META_REASON_RESPONSE,
+        # EPOCH_TICK); MODULE_SHUTDOWN + QUERY are targeted.
         self.guardian.register(ModuleSpec(
             name="language",
             layer="L2",  # Microkernel v2 §A.5 — L2 higher cognition (Language Teacher)
@@ -674,6 +769,15 @@ class TitanCore:
             autostart=True,   # Language must be ready for SPEAK_REQUEST
             lazy=False,
             heartbeat_timeout=120.0,  # Teacher LLM calls can take 30s+
+            broadcast_topics=[
+                bus.SPEAK_REQUEST, bus.LLM_TEACHER_RESPONSE,
+                bus.META_LANGUAGE_RESULT, bus.MAKER_NARRATION_REQUEST,
+                bus.CGN_DREAM_CONSOLIDATE, bus.CGN_CROSS_INSIGHT,
+                bus.CGN_WEIGHTS_MAJOR, bus.CGN_KNOWLEDGE_RESP,
+                bus.QUERY_RESPONSE, bus.SOCIAL_PERCEPTION,
+                bus.CGN_SOCIAL_TRANSITION, bus.CGN_HAOV_VERIFY_REQ,
+                bus.META_REASON_RESPONSE, bus.EPOCH_TICK,
+            ],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
@@ -689,6 +793,10 @@ class TitanCore:
             "data_dir": self._full_config.get("memory_and_storage", {}).get(
                 "data_dir", "./data"),
         }
+        # rFP_worker_broadcast_topics_completion §4.A.3 (Batch 3):
+        # meta_teacher drain at modules/meta_teacher_worker.py:624-648 consumes
+        # one broadcast type (META_CHAIN_COMPLETE); MODULE_SHUTDOWN + QUERY
+        # are targeted.
         self.guardian.register(ModuleSpec(
             name="meta_teacher",
             layer="L2",  # Microkernel v2 §A.5 — L2 higher cognition (philosopher-critic)
@@ -707,6 +815,7 @@ class TitanCore:
                                       # timeout during Phase B memory warmup).
                                       # Teaching memory retrieval + LLM chain can
                                       # take ~60-120s under load; 180s = 2x margin.
+            broadcast_topics=[bus.META_CHAIN_COMPLETE],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
@@ -719,6 +828,11 @@ class TitanCore:
             "shm_write_on_every_outcome": True,
             **self._full_config.get("cgn", {}),
         }
+        # rFP_worker_broadcast_topics_completion §4.A.4 (Batch 4 — CGN cluster):
+        # cgn drain at modules/cgn_worker.py:544-840 consumes 7 broadcast types.
+        # Note: CGN_TRANSITION/REGISTER/CONSOLIDATE/SURPRISE checked as string
+        # literals in the worker source (not bus.* constants); declared as
+        # strings here for byte-identical wire match.
         self.guardian.register(ModuleSpec(
             name="cgn",
             layer="L2",  # Microkernel v2 §A.5 — L2 concept-value state registry (per project_cgn_as_higher_state_registry.md)
@@ -734,6 +848,12 @@ class TitanCore:
             lazy=False,
             heartbeat_timeout=60.0,
             reply_only=False,  # Receives broadcasts (CGN_CONSOLIDATE from spirit)
+            broadcast_topics=[
+                "CGN_TRANSITION", "CGN_REGISTER",
+                "CGN_CONSOLIDATE", "CGN_SURPRISE",
+                bus.CGN_HAOV_VERIFY_RSP, bus.CGN_INFERENCE_REQ,
+                bus.CGN_KNOWLEDGE_REQ,
+            ],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
@@ -759,6 +879,9 @@ class TitanCore:
             # Knowledge Pipeline v2 (router/cache/health/budgets/alerts)
             **self._full_config.get("knowledge_pipeline", {}),
         }
+        # rFP_worker_broadcast_topics_completion §4.A.4 (Batch 4):
+        # knowledge drain at modules/knowledge_worker.py:385-1056 consumes
+        # 10 broadcast types.
         self.guardian.register(ModuleSpec(
             name="knowledge",
             layer="L3",  # Microkernel v2 §A.5 — L3 pluggable (rFP L3 "Knowledge search")
@@ -772,6 +895,13 @@ class TitanCore:
             lazy=False,
             heartbeat_timeout=180.0,  # Research takes 10-45s + queue wait time
             reply_only=False,    # Receives CGN_KNOWLEDGE_REQ broadcasts
+            broadcast_topics=[
+                bus.CGN_KNOWLEDGE_REQ, bus.META_REASON_RESPONSE,
+                bus.CGN_KNOWLEDGE_USAGE, bus.CGN_HAOV_VERIFY_REQ,
+                bus.SEARCH_PIPELINE_BUDGET_RESET, bus.CGN_WEIGHTS_MAJOR,
+                bus.CGN_CROSS_INSIGHT, bus.KNOWLEDGE_QUERY_CONCEPT,
+                bus.KNOWLEDGE_SEARCH, bus.KNOWLEDGE_CONCEPTS_FOR_PERSON,
+            ],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
@@ -779,6 +909,10 @@ class TitanCore:
         timechain_config = {
             **self._full_config.get("timechain", {}),
         }
+        # rFP_worker_broadcast_topics_completion §4.A.4 (Batch 4 — heaviest):
+        # timechain drain at modules/timechain_worker.py:326-710 consumes 23
+        # broadcast types: 4 system upgrade events, SYSTEM_UPGRADE_THOUGHT,
+        # 7 timechain ops/state, 5 timechain query types, 6 contract types.
         self.guardian.register(ModuleSpec(
             name="timechain",
             layer="L2",  # Microkernel v2 §A.5 — L2 cognitive substrate (episodic/declarative/procedural forks)
@@ -789,6 +923,23 @@ class TitanCore:
             lazy=False,
             heartbeat_timeout=120.0,  # Extended: integrity check + healing takes ~60s
             reply_only=False,     # Receives EPOCH_TICK, TIMECHAIN_COMMIT, etc.
+            broadcast_topics=[
+                # System-upgrade events (4)
+                bus.SYSTEM_UPGRADE_QUEUED, bus.SYSTEM_UPGRADE_STARTING,
+                bus.SYSTEM_RESUMED, bus.SYSTEM_UPGRADE_PENDING_DEFERRED,
+                bus.SYSTEM_UPGRADE_THOUGHT,
+                # Core timechain events (7)
+                bus.TIMECHAIN_COMMIT, bus.EPOCH_TICK, bus.DREAM_STATE_CHANGED,
+                bus.MEDITATION_COMPLETE, bus.EXPRESSION_FIRED,
+                bus.TIMECHAIN_STATUS, bus.TIMECHAIN_QUERY,
+                # Timechain query ops (5)
+                bus.TIMECHAIN_RECALL, bus.TIMECHAIN_CHECK,
+                bus.TIMECHAIN_COMPARE, bus.TIMECHAIN_AGGREGATE,
+                bus.TIMECHAIN_SIMILAR,
+                # Contract events (6)
+                bus.CONTRACT_DEPLOY, bus.CONTRACT_LIST, bus.CONTRACT_STATUS,
+                bus.CONTRACT_PROPOSE, bus.CONTRACT_APPROVE, bus.CONTRACT_VETO,
+            ],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 
@@ -803,6 +954,13 @@ class TitanCore:
         # split-kernel path behave identically wrt spawn migration.
         _spawn_ref_legacy = self._full_config.get("microkernel", {}).get(
             "spawn_reference_worker_enabled", False)
+        # rFP_worker_broadcast_topics_completion §4.A.6 (Batch 6 — dual sync):
+        # core/plugin.py already declares broadcast_topics for backup
+        # (chunk 8M.3 / 2026-04-30 closure). Per filter-union semantics in
+        # feedback_bus_dst_all_publish_filter.md ("the broader of the two
+        # filters wins. Pre-narrowing one site does NOT narrow the other
+        # unless both are updated"), legacy_core.py needed mirror declaration
+        # for the filter to actually fire under both registration paths.
         self.guardian.register(ModuleSpec(
             name="backup",
             layer="L3",  # Microkernel v2 §A.5 — L3 pluggable (on-chain anchoring + 3-2-1 cold storage)
@@ -813,6 +971,10 @@ class TitanCore:
             lazy=False,
             heartbeat_timeout=600.0,  # Personality+TimeChain tarball build + upload can take 4-6 min
             reply_only=False,     # Subscribes to MEDITATION_COMPLETE + BACKUP_TRIGGER_MANUAL broadcasts
+            broadcast_topics=[
+                bus.MEDITATION_COMPLETE,
+                bus.BACKUP_TRIGGER_MANUAL,
+            ],
             start_method="spawn" if _spawn_ref_legacy else "fork",  # S6 (§A.3)
             b2_1_swap_critical=False,  # M5: light-state worker; respawn-OK
         ))
@@ -835,6 +997,15 @@ class TitanCore:
                     _emot_titan_id = _json_id.load(_idf).get("titan_id", "T1")
         except Exception:
             pass
+        # rFP_worker_broadcast_topics_completion §4.A.3 (Batch 3):
+        # emot_cgn drain at modules/emot_cgn_worker.py:572-828 consumes 8
+        # broadcast types (EMOT_CHAIN_EVIDENCE, FELT_CLUSTER_UPDATE,
+        # META_REASON_RESPONSE, CGN_HAOV_VERIFY_REQ, CGN_CROSS_INSIGHT,
+        # KIN_EMOT_STATE, HORMONE_FIRED, CGN_BETA_SNAPSHOT); MODULE_SHUTDOWN
+        # is targeted. KIN_EMOT_STATE is a string literal from
+        # logic/emot_kin_protocol.py (not a bus.* constant — same value).
+        from titan_plugin.logic.emot_kin_protocol import (
+            KIN_EMOT_STATE_MSG_TYPE)
         self.guardian.register(ModuleSpec(
             name="emot_cgn",
             layer="L2",  # Microkernel v2 §A.5 — L2 CGN consumer (emotional grounding)
@@ -852,6 +1023,12 @@ class TitanCore:
             lazy=False,
             heartbeat_timeout=90.0,
             reply_only=False,    # Subscribes to EMOT_CHAIN_EVIDENCE + FELT_CLUSTER_UPDATE (Phase 1.6d)
+            broadcast_topics=[
+                bus.EMOT_CHAIN_EVIDENCE, bus.FELT_CLUSTER_UPDATE,
+                bus.META_REASON_RESPONSE, bus.CGN_HAOV_VERIFY_REQ,
+                bus.CGN_CROSS_INSIGHT, KIN_EMOT_STATE_MSG_TYPE,
+                bus.HORMONE_FIRED, bus.CGN_BETA_SNAPSHOT,
+            ],
             start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         ))
 

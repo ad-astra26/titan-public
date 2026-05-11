@@ -114,7 +114,25 @@ def collect_mind_15d(
         # [14] Growth will — CURIOSITY hormone level
         willing[4] = _clamp(hormone_levels.get("CURIOSITY", 0.0))
 
-    return thinking + feeling + willing
+    tensor_15d = thinking + feeling + willing
+    # Phase 2.5.A — record firing for /v4/debug/dim-sources diagnostics.
+    try:
+        from titan_plugin.api.dim_registry import get_firing_tracker
+        get_firing_tracker().record_block(
+            "inner_mind",
+            tensor_15d,
+            {
+                "audio_state": audio_state,
+                "interaction_quality": interaction_quality,
+                "visual_state": visual_state,
+                "assessment_quality": assessment_quality,
+                "ambient_change": ambient_change,
+                "hormone_levels": hormone_levels,
+            },
+        )
+    except Exception:
+        pass  # diagnostic-only; never break tensor production
+    return tensor_15d
 
 
 def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
