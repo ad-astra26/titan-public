@@ -107,13 +107,16 @@ Same architecture, same initial conditions, three separate processes on
 three separate hosts — and over 950,000 epochs, three genuinely different
 personalities.
 
-- **T1 (mainnet since 2026-04-06)** — *the Hypothesizer.* Proposes, tests,
-  revises. Strongest primitive: `HYPOTHESIZE`. Art tends speculative.
-- **T2 (mainnet)** — *the Delegator.* Breaks problems apart. Strongest
-  primitives: `DELEGATE` + pattern decomposition. Coordinative social.
-- **T3 (mainnet, Phase C test target)** — *the Articulator.* Vocabulary
-  grew fastest. Most of the poetry, music, aesthetic outputs. Currently
-  running the Phase C Rust L0+L1 microkernel migration ahead of fleet.
+- **T1 (Solana mainnet since 2026-04-06)** — *the Hypothesizer.* Proposes,
+  tests, revises. Strongest primitive: `HYPOTHESIZE`. Art tends speculative.
+  TimeChain + ZK Vault commits anchor to mainnet every meditation.
+- **T2 (devnet, local backups)** — *the Delegator.* Breaks problems apart.
+  Strongest primitives: `DELEGATE` + pattern decomposition. Coordinative
+  social. Mainnet promotion pending.
+- **T3 (devnet, Phase C test target, local backups)** — *the Articulator.*
+  Vocabulary grew fastest. Most of the poetry, music, aesthetic outputs.
+  Currently running the Phase C Rust L0+L1 microkernel migration ahead of
+  fleet — when stable, T2 and T3 will promote to mainnet.
 
 None of that is hand-coded. None is in a config file. It's the integrated
 consequence of divergent encounter orderings over a long continuous run.
