@@ -14,7 +14,7 @@ import os
 
 import pytest
 
-from titan_plugin.logic.prediction_engine import PredictionEngine
+from titan_hcl.logic.prediction_engine import PredictionEngine
 
 
 def _seed_errors(pe: PredictionEngine, errors: list) -> None:
@@ -64,7 +64,7 @@ class TestPredictionEngineV2:
         with open(state_path, "w") as f:
             f.write("{not valid json at all")  # garbage
 
-        with caplog.at_level(logging.WARNING, logger="titan_plugin.logic.prediction_engine"):
+        with caplog.at_level(logging.WARNING, logger="titan_hcl.logic.prediction_engine"):
             pe = PredictionEngine(data_dir=data_dir, load_state=True)
 
         # Loaded defaults; no crash

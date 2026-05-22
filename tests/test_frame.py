@@ -1,5 +1,5 @@
 """
-Tests for titan_plugin/core/_frame.py — shared framing + HMAC primitives.
+Tests for titan_hcl/core/_frame.py — shared framing + HMAC primitives.
 
 Covers:
 - Length-prefixed frame roundtrip (empty, small, MAX_FRAME_SIZE-1, malformed)
@@ -16,7 +16,7 @@ import threading
 
 import pytest
 
-from titan_plugin.core._frame import (
+from titan_hcl.core._frame import (
     AUTH_TAG_SIZE,
     CHALLENGE_SIZE,
     LENGTH_PREFIX_SIZE,

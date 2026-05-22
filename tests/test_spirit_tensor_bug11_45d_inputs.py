@@ -18,7 +18,7 @@ def test_collect_spirit_45d_with_full_inputs_activates_chit_dims():
     the CHIT segment (dims 15-29 within 45D inner_spirit) shows non-zero
     variance across the expected dims (pattern_recognition, truth_seeking,
     attention_depth, reflective_capacity, temporal_awareness, etc)."""
-    from titan_plugin.logic.spirit_tensor import collect_spirit_45d
+    from titan_hcl.logic.spirit_tensor import collect_spirit_45d
 
     # Realistic inputs that mimic what spirit_worker NOW passes
     hormone_levels = {
@@ -71,7 +71,7 @@ def test_collect_spirit_45d_with_full_inputs_activates_chit_dims():
 
 def test_collect_spirit_45d_ananda_dims_activate():
     """ANANDA dims depending on hormone_fires / levels should activate."""
-    from titan_plugin.logic.spirit_tensor import collect_spirit_45d
+    from titan_hcl.logic.spirit_tensor import collect_spirit_45d
 
     hormone_fires = {"CREATIVITY": 20, "INTUITION": 15, "EMPATHY": 18, "CURIOSITY": 25}
     hormone_levels = {"INSPIRATION": 0.8, "IMPULSE": 0.3, "VIGILANCE": 0.3}
@@ -106,7 +106,7 @@ def test_collect_spirit_45d_ananda_dims_activate():
 def test_collect_spirit_45d_with_none_inputs_matches_pre_bug11_behavior():
     """Backwards compat: if the new optional args are None (like pre-fix),
     the affected dims return 0 as before. Pre-existing behavior preserved."""
-    from titan_plugin.logic.spirit_tensor import collect_spirit_45d
+    from titan_hcl.logic.spirit_tensor import collect_spirit_45d
 
     result = collect_spirit_45d(
         current_5d=[0.5] * 5,
@@ -129,7 +129,7 @@ def test_publish_spirit_state_signature_accepts_hormonal_kwargs():
     unified_spirit, e_mem kwargs. Signature check ensures callers don't
     break when passing these."""
     import inspect
-    from titan_plugin.modules.spirit_loop import _publish_spirit_state
+    from titan_hcl.modules.spirit_loop import _publish_spirit_state
 
     sig = inspect.signature(_publish_spirit_state)
     params = sig.parameters
@@ -153,7 +153,7 @@ def test_publish_spirit_state_harvests_hormonal_state():
     collect_spirit_45d. Verified by inspecting the SPIRIT_STATE payload's
     values_45d — CHIT[7] (truth_seeking) should be non-zero after the fix."""
     import queue
-    from titan_plugin.modules.spirit_loop import _publish_spirit_state
+    from titan_hcl.modules.spirit_loop import _publish_spirit_state
 
     # Mock hormonal system
     mock_hormone = MagicMock()
@@ -205,7 +205,7 @@ def test_expression_intensity_falls_back_to_composites():
     legacy ExpressionTranslator key is present, but fall back to a
     composite-level proxy (mean urge/threshold ratio) when only the
     spirit_worker-visible ExpressionManager stats are available."""
-    from titan_plugin.logic.spirit_tensor import _expression_intensity
+    from titan_hcl.logic.spirit_tensor import _expression_intensity
 
     # 1. Legacy translator-style stats — sovereignty_ratio wins
     assert _expression_intensity({"sovereignty_ratio": 0.7}) == pytest.approx(0.7)
@@ -239,7 +239,7 @@ def test_collect_spirit_45d_chit13_ananda8_activate_from_composites():
     """dim 48 (chit[13] causal_understanding) + dim 28+30=58 (ananda[8]
     expression_quality) must activate when expression_stats carries the
     ExpressionManager composite shape (no `sovereignty_ratio` field)."""
-    from titan_plugin.logic.spirit_tensor import collect_spirit_45d
+    from titan_hcl.logic.spirit_tensor import collect_spirit_45d
 
     expression_stats = {
         "total_composites": 6,
@@ -272,7 +272,7 @@ def test_collect_spirit_45d_reads_trajectory_magnitude_when_trajectory_missing()
     `_run_consciousness_epoch` writes `trajectory_magnitude` but
     `chit[14]` was reading `trajectory`. Defensive fallback to the
     producer key."""
-    from titan_plugin.logic.spirit_tensor import collect_spirit_45d
+    from titan_hcl.logic.spirit_tensor import collect_spirit_45d
 
     result = collect_spirit_45d(
         current_5d=[0.5] * 5,
@@ -306,7 +306,7 @@ def test_collect_spirit_45d_reads_epoch_id_when_epoch_count_missing():
     at 0 across all 3 Titans even with millions of epochs accumulated.
     Fix is a defensive fallback to `epoch_id` so both producer keys work.
     """
-    from titan_plugin.logic.spirit_tensor import collect_spirit_45d
+    from titan_hcl.logic.spirit_tensor import collect_spirit_45d
 
     # Realistic latest_epoch dict — exact shape produced by spirit_loop:1266
     latest_epoch = {
@@ -358,7 +358,7 @@ def test_expression_intensity_accepts_last_urge_from_live_em_stats():
     `last_urge` (most recent eval) — NOT `urge`. The 611fda0f helper read
     `urge` only, so dim 48 stayed dead post-fix on all 3 Titans.
     Regression: helper must accept both keys."""
-    from titan_plugin.logic.spirit_tensor import _expression_intensity
+    from titan_hcl.logic.spirit_tensor import _expression_intensity
 
     # Live shape from /v4/inner-trinity expression_composites on T1
     live_em_stats = {
@@ -394,7 +394,7 @@ def test_collect_spirit_45d_chit10_activates_with_dream_quality_and_fatigue():
     + `fatigue` (0.3 weight) from consciousness epoch. Both producer-side
     sources exist (e_mem.get_dream_quality + coordinator.dreaming.last_fatigue)
     but were never enriched into the dict that flows into `_publish_spirit_state`."""
-    from titan_plugin.logic.spirit_tensor import collect_spirit_45d
+    from titan_hcl.logic.spirit_tensor import collect_spirit_45d
 
     cons = {
         "epoch_id": 1000,
@@ -427,7 +427,7 @@ def test_collect_spirit_45d_chit12_activates_with_topology_block():
     from the `topology` arg. Live values exist on coordinator
     (`_last_extended_topology`) but the call site was reading
     `body_state.get("topology")` — body_state never had that key."""
-    from titan_plugin.logic.spirit_tensor import collect_spirit_45d
+    from titan_hcl.logic.spirit_tensor import collect_spirit_45d
 
     # Live shape from /v4/inner-trinity topology on T1
     topology = {
@@ -457,53 +457,13 @@ def test_collect_spirit_45d_chit12_activates_with_topology_block():
     assert result_no_topo[15 + 12] == 0.0
 
 
-def test_enrich_spirit_inputs_for_bug11_routes_dream_fatigue_topology():
-    """The spirit_worker enrichment helper bridges the call-site gap by
-    pulling `dream_quality` (e_mem) + `fatigue` (coordinator.dreaming) into
-    consciousness.latest_epoch and `topology` (coordinator) into body_state,
-    in-place. Mutation must be idempotent."""
-    from titan_plugin.modules.spirit_worker import _enrich_spirit_inputs_for_bug11
-
-    class _FakeEMem:
-        def get_dream_quality(self, last_n_cycles=5):
-            return 0.75
-
-    class _FakeDreaming:
-        last_fatigue = 0.42
-
-    class _FakeCoordinator:
-        dreaming = _FakeDreaming()
-        _last_topology_volcurv = {"volume": 4.5, "curvature": 0.1}
-
-    consciousness = {"latest_epoch": {"epoch_id": 100, "density": 0.5}}
-    body_state = {"values": [0.5] * 5}
-
-    _enrich_spirit_inputs_for_bug11(consciousness, body_state, _FakeEMem(), _FakeCoordinator())
-
-    # consciousness.latest_epoch enriched
-    le = consciousness["latest_epoch"]
-    assert le["dream_quality"] == pytest.approx(0.75)
-    assert le["fatigue"] == pytest.approx(0.42)
-    # body_state gains topology key
-    assert body_state["topology"] == {"volume": 4.5, "curvature": 0.1}
-
-    # Idempotent — repeat call mutates same values, no errors
-    _enrich_spirit_inputs_for_bug11(consciousness, body_state, _FakeEMem(), _FakeCoordinator())
-    assert le["dream_quality"] == pytest.approx(0.75)
-    assert body_state["topology"] == {"volume": 4.5, "curvature": 0.1}
-
-    # Defensive — None coordinator/e_mem doesn't raise
-    consciousness2 = {"latest_epoch": {"epoch_id": 200}}
-    body_state2 = {"values": [0.5] * 5}
-    _enrich_spirit_inputs_for_bug11(consciousness2, body_state2, None, None)
-    assert "dream_quality" not in consciousness2["latest_epoch"]
-    assert "topology" not in body_state2
-
-    # Pre-existing topology not overwritten (allows test injection / explicit override)
-    body_state3 = {"topology": {"volume": 99.9, "curvature": 0.9}}
-    consciousness3 = {"latest_epoch": {}}
-    _enrich_spirit_inputs_for_bug11(consciousness3, body_state3, None, _FakeCoordinator())
-    assert body_state3["topology"]["volume"] == 99.9  # not overwritten
+# NOTE: test_enrich_spirit_inputs_for_bug11_routes_dream_fatigue_topology
+# RETIRED 2026-05-21 — _enrich_spirit_inputs_for_bug11 deleted with the dead
+# spirit_worker helper block (Phase C; spirit_worker is a heartbeat stub). The
+# invariant it guarded (dream_quality/fatigue/topology routing into the 45D
+# tensor) is preserved by the live collect_spirit_45d tests above
+# (chit10 dream/fatigue @ test_collect_spirit_45d_chit10_*, chit12 topology @
+# test_collect_spirit_45d_chit12_*).
 
 
 if __name__ == "__main__":

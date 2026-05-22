@@ -14,7 +14,7 @@ import threading
 
 import pytest
 
-from titan_plugin.utils.observatory_db import (
+from titan_hcl.utils.observatory_db import (
     ObservatoryDB,
     get_observatory_db,
     reset_observatory_db_singleton_for_tests,
@@ -111,8 +111,8 @@ def test_production_construct_does_not_skip_writer_due_to_relative_path(
     them as equivalent and proceed with writer construction.
     """
     # Arrange: a fake cfg whose db_path is RELATIVE (production reality).
-    from titan_plugin.persistence import config as cfg_mod
-    from titan_plugin.persistence import writer_client as wc_mod
+    from titan_hcl.persistence import config as cfg_mod
+    from titan_hcl.persistence import writer_client as wc_mod
     from unittest.mock import MagicMock
 
     # Create the relative + absolute pair that resolves to the same file.

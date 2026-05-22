@@ -17,8 +17,8 @@ import time
 
 import pytest
 
-from titan_plugin.logic.meta_teacher import MetaTeacher
-from titan_plugin.modules import meta_teacher_worker as mtw
+from titan_hcl.logic.meta_teacher import MetaTeacher
+from titan_hcl.modules import meta_teacher_worker as mtw
 
 
 def make_config(tmp_dir, **overrides):
@@ -238,23 +238,33 @@ class TestMockedLLMFullPath:
     """With a mocked LLM client, full feedback + grounding flow."""
 
     def test_feedback_and_grounding_emitted(self, monkeypatch):
-        # Mock the ollama loader to return a fake client.
+        # Mock the LLM-ctx loader + the http-distill helper to return a
+        # fake JSON payload.
         # v2 (2026-04-24): suggested_primitives must come from NOT-USED set.
         # The test chain uses {FORMULATE, RECALL, HYPOTHESIZE, EVALUATE}, so
         # we suggest SYNTHESIZE + BREAK — both absent from the chain — which
         # is valid under v2's "MISSING primitives only" rule.
-        class FakeClient:
-            async def complete(self, prompt, model, system, temperature,
-                               max_tokens, timeout):
-                return ('{"quality_score": 0.8, "critique_categories": ["depth"], '
-                        '"critique_text": "Good decomposition.", '
-                        '"suggested_primitives": ["SYNTHESIZE", "BREAK"], '
-                        '"confidence": 0.9, "principles_invoked": ["depth"]}')
+        # Phase 3 Chunk ψ (D-SPEC-88, 2026-05-18) — `_load_ollama_client`
+        # renamed to `_load_meta_teacher_llm_ctx` returning the
+        # (api_base, internal_key, model) tuple consumed by
+        # `_call_llm` → `distill_via_http_async`.
+        FAKE_PAYLOAD = (
+            '{"quality_score": 0.8, "critique_categories": ["depth"], '
+            '"critique_text": "Good decomposition.", '
+            '"suggested_primitives": ["SYNTHESIZE", "BREAK"], '
+            '"confidence": 0.9, "principles_invoked": ["depth"]}'
+        )
 
-        def fake_loader(inf_cfg):
-            return FakeClient(), "fake-model"
+        def fake_loader(full_config):
+            return ("http://127.0.0.1:7777", "fake-key", "fake-model")
 
-        monkeypatch.setattr(mtw, "_load_ollama_client", fake_loader)
+        async def fake_distill(**kwargs):
+            return FAKE_PAYLOAD
+
+        monkeypatch.setattr(mtw, "_load_meta_teacher_llm_ctx", fake_loader)
+        # Patch at the import site inside meta_teacher_worker._call_llm.
+        import titan_hcl.logic.llm_distill_client as _ldc
+        monkeypatch.setattr(_ldc, "distill_via_http_async", fake_distill)
 
         with tempfile.TemporaryDirectory() as tmp:
             config = make_config(tmp)

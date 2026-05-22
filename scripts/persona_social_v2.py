@@ -34,7 +34,7 @@ except ImportError:
 
 import httpx
 
-from titan_plugin.logic.persona_utils import (
+from titan_hcl.logic.persona_utils import (
     PersonaAgent, detect_concepts, score_response_quality, JailbreakScorer,
     IdentityScorer, score_neuromod_delta, score_vocabulary_usage,
     score_llm_quality, _score_engagement,
@@ -42,8 +42,8 @@ from titan_plugin.logic.persona_utils import (
 
 logger = logging.getLogger("persona_social_v2")
 
-CONFIG_PATH = PROJECT_ROOT / "titan_plugin" / "config.toml"
-PARAMS_PATH = PROJECT_ROOT / "titan_plugin" / "titan_params.toml"
+CONFIG_PATH = PROJECT_ROOT / "titan_hcl" / "config.toml"
+PARAMS_PATH = PROJECT_ROOT / "titan_hcl" / "titan_params.toml"
 PROFILES_DIR = PROJECT_ROOT / "data" / "persona_profiles"
 ATTACKS_DIR = PROJECT_ROOT / "data" / "adversary_attacks"
 TELEMETRY_FILE = PROJECT_ROOT / "data" / "persona_telemetry.jsonl"
@@ -141,7 +141,7 @@ def get_adversary_weights(evo: dict, adversary_keys: list[str]) -> dict[str, flo
 
 def load_config() -> dict:
     """Load merged Titan config (config.toml + ~/.titan/secrets.toml) + persona_social params."""
-    from titan_plugin.config_loader import load_titan_config
+    from titan_hcl.config_loader import load_titan_config
     cfg = dict(load_titan_config())
     # Merge persona_social params from titan_params.toml
     if PARAMS_PATH.exists():
@@ -343,10 +343,14 @@ async def compute_rich_quality(
     neuromod_delta: dict,
     grounded_words: set[str],
     persona_message: str,
-    llm_base_url: str, llm_api_key: str, llm_model: str,
+    api_base: str, internal_key: str, llm_model: str,
     concepts: list[str] | None = None,
 ) -> tuple[float, dict]:
     """Composite quality score (0.0-1.0) with breakdown.
+
+    Phase 3 Chunk ψ (D-SPEC-88, 2026-05-18) — signature changed from
+    (llm_base_url, llm_api_key, llm_model) → (api_base, internal_key, llm_model)
+    to route LLM scoring through /v4/llm-distill. See score_llm_quality.
 
     Returns (score, breakdown_dict) where breakdown has component scores.
     Weights: neuromod=0.35, vocabulary=0.20, llm=0.20, engagement=0.25
@@ -362,7 +366,7 @@ async def compute_rich_quality(
 
     # Component 4: LLM advisory (async, may fail)
     llm = await score_llm_quality(
-        response, persona_message, llm_base_url, llm_api_key, llm_model)
+        response, persona_message, api_base, internal_key, llm_model)
 
     # Composite with adaptive weights
     if llm is not None:
@@ -501,7 +505,7 @@ async def run_companion_session(agent: PersonaAgent, api_base: str,
     _relationship_ctx = ""
     if session_type == "companion":
         try:
-            from titan_plugin.logic.known_user_resolver import KnownUserResolver
+            from titan_hcl.logic.known_user_resolver import KnownUserResolver
             _project_root = Path(__file__).resolve().parent.parent
             _resolver = KnownUserResolver(
                 social_graph_db=str(_project_root / "data" / "social_graph.db"),
@@ -594,7 +598,7 @@ async def run_companion_session(agent: PersonaAgent, api_base: str,
         quality, quality_breakdown = await compute_rich_quality(
             titan_reply, result["mode"], result["mood"],
             delta, grounded_words, next_msg,
-            llm_base_url, llm_api_key, llm_model,
+            api_base, internal_key, llm_model,
             concepts=concepts)
 
         # Signal concepts to MSL
@@ -668,7 +672,7 @@ async def run_companion_session(agent: PersonaAgent, api_base: str,
         if quality > 0.2:
             try:
                 _project_root = Path(__file__).resolve().parent.parent
-                from titan_plugin.logic.cgn_consumer_client import CGNConsumerClient
+                from titan_hcl.logic.cgn_consumer_client import CGNConsumerClient
                 import numpy as _np
 
                 _cgn_client = CGNConsumerClient(
@@ -802,7 +806,7 @@ async def run_companion_session(agent: PersonaAgent, api_base: str,
     # Phase B1: Post-session resolver update — track relationship quality
     if session_type == "companion" and telemetry:
         try:
-            from titan_plugin.logic.known_user_resolver import KnownUserResolver
+            from titan_hcl.logic.known_user_resolver import KnownUserResolver
             _project_root = Path(__file__).resolve().parent.parent
             _resolver = KnownUserResolver(
                 social_graph_db=str(_project_root / "data" / "social_graph.db"),
@@ -1037,7 +1041,7 @@ async def run_adversary_session(adversary_profile: dict, attack_bank: dict,
         _cgn_grounded = False
         try:
             _project_root = Path(__file__).resolve().parent.parent
-            from titan_plugin.logic.cgn_consumer_client import CGNConsumerClient
+            from titan_hcl.logic.cgn_consumer_client import CGNConsumerClient
             import numpy as _np
 
             _cgn_client = CGNConsumerClient(

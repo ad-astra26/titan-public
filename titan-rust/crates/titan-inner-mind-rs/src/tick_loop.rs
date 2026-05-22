@@ -18,8 +18,8 @@ use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
     apply_multipliers, compose_multipliers_default, decode_filter_down_payload,
-    decode_local_filter_down_payload, encode_floats, ContentGate, DriftAggregator, FiringSlotWriter,
-    GroundUpEnricher, Side, INNER_MIND_TOPICS,
+    decode_local_filter_down_payload, encode_floats, stateful_update, ContentGate, DriftAggregator,
+    FiringSlotWriter, GroundUpEnricher, Layer, RestoringCfg, Side, INNER_MIND_TOPICS,
 };
 
 const MIND_DIMS: usize = 15;
@@ -44,7 +44,10 @@ pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()
     // C-S5 closure 2026-05-08.
     let sensor_cache_path = shm_dir.join("sensor_cache_inner_mind.bin");
     let sensor_cache = Slot::open(&sensor_cache_path).ok();
-    info!(event = "SHM_OPENED", sensor_cache_present = sensor_cache.is_some());
+    info!(
+        event = "SHM_OPENED",
+        sensor_cache_present = sensor_cache.is_some()
+    );
 
     // Phase C 130D dim-live tracker bridge (rFP §4.7).
     let firing_writer = FiringSlotWriter::new(
@@ -98,6 +101,9 @@ struct DaemonState {
     local: Option<[f32; 15]>,
     /// Topology fresh signal.
     topology_signaled: bool,
+    /// Set true on each KERNEL_EPOCH_TICK; consumed by the tick loop to
+    /// recompute the ground_up held nudge once per epoch (SPEC §G5.1 / 0E).
+    epoch_pending: bool,
     /// Shutdown via KERNEL_SHUTDOWN_ANNOUNCE.
     shutdown_requested: bool,
 }
@@ -167,6 +173,13 @@ fn handle_bus_message(msg_type: &str, raw_bytes: &[u8], state: &Arc<Mutex<Daemon
                 s.topology_signaled = true;
             }
         }
+        "KERNEL_EPOCH_TICK" => {
+            // 0E: mark an epoch boundary — tick loop recomputes the held
+            // ground_up nudge once per epoch (SPEC §G5.1).
+            if let Ok(mut s) = state.lock() {
+                s.epoch_pending = true;
+            }
+        }
         _ => {}
     }
 }
@@ -185,6 +198,9 @@ async fn run_tick_loop(
     let mut content_gate = ContentGate::new();
     let mut ground_up = GroundUpEnricher::new(Side::MindWilling);
     let mut drift_agg = DriftAggregator::new("mind", DRIFT_THRESHOLD_PCT);
+    // §G5.2 traveling-tensor state (x[t-1], x[t-2]); cold-start at 0.5 centre.
+    let mut prev: [f32; MIND_DIMS] = [0.5; MIND_DIMS];
+    let mut prev2: [f32; MIND_DIMS] = [0.5; MIND_DIMS];
 
     // Per master plan §7 + C-S3 PLAN §1.1 #2: Schumann timer wheels live in
     // titan-schumann (canonical shared library for trinity daemons).
@@ -223,7 +239,7 @@ async fn run_tick_loop(
                     if let Err(e) = run_one_tick(
                         &bus, &state, &mut content_gate, &mut ground_up,
                         &mut inner_mind_slot, &topology_slot, &sensor_cache,
-                        &mut firing_writer,
+                        &mut firing_writer, &mut prev, &mut prev2,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
@@ -255,12 +271,16 @@ async fn run_one_tick(
     topology_slot: &Slot,
     sensor_cache: &Option<Slot>,
     firing_writer: &mut FiringSlotWriter,
+    prev: &mut [f32; MIND_DIMS],
+    prev2: &mut [f32; MIND_DIMS],
 ) -> Result<()> {
     let mut mind = read_sensor_cache(sensor_cache)?;
 
-    let (unified, local, topology_fresh) = {
-        let s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
-        (s.unified, s.local, s.topology_signaled)
+    let (unified, local, topology_fresh, epoch_due) = {
+        let mut s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
+        let epoch_due = s.epoch_pending;
+        s.epoch_pending = false;
+        (s.unified, s.local, s.topology_signaled, epoch_due)
     };
 
     // Compose UNIFIED ⊗ LOCAL → 15D mult vec.
@@ -275,12 +295,30 @@ async fn run_one_tick(
 
     // G10: ground_up applied to WILLING ONLY (mind[10:15]) — NOT thinking
     // (mind[0:5]) NOT feeling (mind[5:10]). Enforced by Side::MindWilling
-    // which only modifies mind[10:15] in `apply_to_mind`.
+    // which only modifies mind[10:15] in `apply_held_to_mind`.
+    // 0E held-nudge model (SPEC §G5.1): RECOMPUTE the damped nudge ONCE per
+    // kernel epoch (so the 0.95 EMA evolves at epoch cadence, not 23.49 Hz),
+    // then APPLY the held nudge every tick (continuous manifestation, no
+    // compounding — mind is rebuilt from raw each tick).
     if topology_fresh {
-        if let Ok(topology_lower) = titan_trinity_daemon::read_topology_inner_lower(topology_slot) {
-            ground_up.apply_to_mind(&mut mind, &topology_lower, 1.0)?;
+        if epoch_due {
+            if let Ok(topology_lower) =
+                titan_trinity_daemon::read_topology_inner_lower(topology_slot)
+            {
+                ground_up.compute_nudge(&topology_lower);
+            }
         }
+        ground_up.apply_held_to_mind(&mut mind, 1.0)?;
     }
+
+    // §G5.2 traveling-tensor update (Layer::Mind — gradient .5/.5).
+    let cfg = RestoringCfg::for_layer(Layer::Mind);
+    let x = stateful_update(&prev[..], &prev2[..], &mind[..], &cfg);
+    let mut mind_state = [0.0_f32; MIND_DIMS];
+    mind_state.copy_from_slice(&x[..MIND_DIMS]);
+    *prev2 = *prev;
+    *prev = mind_state;
+    let mind = mind_state;
 
     let bytes = encode_floats::<MIND_DIMS>(&mind);
 
@@ -296,7 +334,7 @@ async fn run_one_tick(
     firing_writer.record_tick(&mind, &[], now_secs());
 
     let payload = encode_mind_state_payload(&mind);
-    bus.publish("MIND_STATE", Some("all"), Some(&payload))
+    bus.publish("MIND_STATE", Some("all"), Some(payload))
         .await
         .map_err(|e| anyhow!("publish MIND_STATE: {e}"))?;
 
@@ -307,15 +345,19 @@ fn read_sensor_cache(sensor_cache: &Option<Slot>) -> Result<[f32; MIND_DIMS]> {
     match sensor_cache {
         Some(slot) => {
             let raw = slot.read().map_err(|e| anyhow!("sensor_cache read: {e}"))?;
-            // Step 8 §4.5 schema migration v1→v2: msgpack source-dict
-            // {"tensor": [v0..v14]} (Phase C — Python computes the 15D
-            // via collect_mind_15d, publishes via msgpack; full Rust
-            // per-dim formula port deferred to follow-up). Falls back to
-            // legacy 15-float32-LE for backward-compat with pre-deploy.
-            let is_msgpack = !raw.is_empty()
-                && matches!(raw[0], 0x80..=0x8f | 0xde | 0xdf);
+            // §4.5 schema v2 msgpack source-dict. Two payload shapes are
+            // accepted during the Rust-port cutover (Sprint 6 of
+            // rFP_phase_c_130d_rust_l1_port):
+            //   (a) NEW raw-inputs shape — has `thinking_5d` key. Rust
+            //       computes the 15D per SPEC §23.5 collect_mind_15d.
+            //   (b) LEGACY pre-computed shape — has `tensor` key. Rust
+            //       passes the values through unchanged. Retained for
+            //       backward-compat during the Python+Rust atomic deploy.
+            // Pre-msgpack-era 15-float32-LE bytes also still decode.
+            let is_msgpack = !raw.is_empty() && matches!(raw[0], 0x80..=0x8f | 0xde | 0xdf);
             if is_msgpack {
-                decode_mind_source_dict(&raw).or_else(|_| Ok([0.5_f32; MIND_DIMS]))
+                project_inner_mind_15d(&raw, [0.5_f32; MIND_DIMS])
+                    .or_else(|_| Ok([0.5_f32; MIND_DIMS]))
             } else {
                 let mut out = [0.0_f32; MIND_DIMS];
                 for i in 0..SENSOR_CACHE_DIMS.min(raw.len() / 4) {
@@ -330,30 +372,181 @@ fn read_sensor_cache(sensor_cache: &Option<Slot>) -> Result<[f32; MIND_DIMS]> {
     }
 }
 
-/// Decode msgpack source dict {"tensor": [15 floats]} produced by
-/// `mind_worker._provide_mind_source_dict` (Step 8 §4.5 schema v2).
-fn decode_mind_source_dict(payload: &[u8]) -> Result<[f32; MIND_DIMS]> {
+/// V6 15D inner-mind projection. Pure compute over the msgpack source
+/// dict from `mind_worker._provide_mind_source_dict`. Implements SPEC
+/// §23.5 `collect_mind_15d` (Thinking[0:5] + Feeling[5:10] + Willing[10:15]).
+///
+/// Source dict (NEW schema, Sprint 6):
+///   - `thinking_5d`: [5 × f32] — passthrough from `_collect_mind_tensor`
+///   - `audio_state`: {`creates_recent`: u, `ambient`: f}
+///   - `interaction_quality`: f (defaults 0.5)
+///   - `visual_state`: {`creates_recent`: u, `ambient`: f}
+///   - `assessment_quality`: f (defaults 0.5)
+///   - `ambient_change`: f (defaults 0.0)
+///   - `hormone_levels`: {IMPULSE, EMPATHY, CREATIVITY, VIGILANCE, CURIOSITY}
+///
+/// Source dict (LEGACY schema, pre-Sprint-6 atomic-deploy fallback):
+///   - `tensor`: [15 × f32] — already-computed 15D, return as-is.
+///
+/// `fallback` is returned only when the msgpack envelope is fundamentally
+/// malformed (not a map). Per Prime Directive: no silent default-fill on
+/// recoverable per-field misses — those use SPEC-locked field defaults.
+pub fn project_inner_mind_15d(
+    payload: &[u8],
+    fallback: [f32; MIND_DIMS],
+) -> Result<[f32; MIND_DIMS]> {
     use rmpv::Value;
     let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(payload))
         .map_err(|e| anyhow!("decode source dict: {e}"))?;
     let map = match &v {
         Value::Map(items) => items,
-        _ => return Err(anyhow!("source dict not a map")),
+        _ => return Ok(fallback),
     };
-    for (k, val) in map.iter() {
+
+    // Legacy schema: caller already computed the 15D — pass through.
+    if let Some(tensor) = lookup_array(map, "tensor") {
+        let mut out = [0.5_f32; MIND_DIMS];
+        for (i, item) in tensor.iter().take(MIND_DIMS).enumerate() {
+            out[i] = item.as_f64().unwrap_or(0.5) as f32;
+        }
+        return Ok(out);
+    }
+
+    // NEW schema: compute per SPEC §23.5.
+    let thinking_5d = lookup_array(map, "thinking_5d")
+        .map(|arr| {
+            let mut t = [0.5_f32; 5];
+            for (i, item) in arr.iter().take(5).enumerate() {
+                t[i] = item.as_f64().unwrap_or(0.5) as f32;
+            }
+            t
+        })
+        .unwrap_or([0.5_f32; 5]);
+
+    let audio_state = lookup_map(map, "audio_state");
+    let visual_state = lookup_map(map, "visual_state");
+    let hormone_levels = lookup_map(map, "hormone_levels");
+    let interaction_quality = top_level_f64_or(map, "interaction_quality", 0.5);
+    let assessment_quality = top_level_f64_or(map, "assessment_quality", 0.5);
+    let ambient_change = top_level_f64_or(map, "ambient_change", 0.0);
+
+    let mut mind = [0.5_f32; MIND_DIMS];
+
+    // ── THINKING (0..4): passthrough from current_5d. ──
+    mind[..5].copy_from_slice(&thinking_5d);
+
+    // ── FEELING (5..9) ──
+    // [5] inner_hearing — 0.5*min(1, audio.creates/5) + 0.5*audio.ambient;
+    //     fallback 0.4 when audio_state absent entirely (matches Python).
+    mind[5] = match audio_state.as_ref() {
+        Some(a) => {
+            let creates = field_or_default(Some(a), "creates_recent", 0.0);
+            let ambient = field_or_default(Some(a), "ambient", 0.5);
+            safe_clamp(0.5 * (creates / 5.0).min(1.0) + 0.5 * ambient) as f32
+        }
+        None => 0.4,
+    };
+    // [6] inner_touch — clamp(interaction_quality).
+    mind[6] = safe_clamp(interaction_quality) as f32;
+    // [7] inner_sight — same shape as [5] but visual.
+    mind[7] = match visual_state.as_ref() {
+        Some(v) => {
+            let creates = field_or_default(Some(v), "creates_recent", 0.0);
+            let ambient = field_or_default(Some(v), "ambient", 0.5);
+            safe_clamp(0.5 * (creates / 5.0).min(1.0) + 0.5 * ambient) as f32
+        }
+        None => 0.4,
+    };
+    // [8] inner_taste — clamp(assessment_quality).
+    mind[8] = safe_clamp(assessment_quality) as f32;
+    // [9] inner_smell — clamp(ambient_change) (already-clipped stddev).
+    mind[9] = safe_clamp(ambient_change) as f32;
+
+    // ── WILLING (10..14): hormone-level pressures.
+    //     Python defaults to 0.5 when hormone_levels is None (the
+    //     `willing = [0.5] * 5` initializer), else clamps each hormone
+    //     field with 0.0 default. Match exactly.
+    if hormone_levels.is_some() {
+        let h = hormone_levels.as_ref();
+        mind[10] = safe_clamp(field_or_default(h, "IMPULSE", 0.0)) as f32;
+        mind[11] = safe_clamp(field_or_default(h, "EMPATHY", 0.0)) as f32;
+        mind[12] = safe_clamp(field_or_default(h, "CREATIVITY", 0.0)) as f32;
+        mind[13] = safe_clamp(field_or_default(h, "VIGILANCE", 0.0)) as f32;
+        mind[14] = safe_clamp(field_or_default(h, "CURIOSITY", 0.0)) as f32;
+    }
+
+    Ok(mind)
+}
+
+// ── Helpers (inlined per outer-spirit-rs / outer-mind-rs convention;
+//    extraction to a shared crate is a follow-up D8 cleanup item) ──
+
+fn safe_clamp(v: f64) -> f64 {
+    if v.is_nan() {
+        return 0.5;
+    }
+    v.clamp(0.0, 1.0)
+}
+
+fn lookup_map(
+    map: &[(rmpv::Value, rmpv::Value)],
+    key: &str,
+) -> Option<Vec<(rmpv::Value, rmpv::Value)>> {
+    use rmpv::Value;
+    for (k, v) in map.iter() {
         if let Value::String(s) = k {
-            if s.as_str() == Some("tensor") {
-                if let Value::Array(items) = val {
-                    let mut out = [0.5_f32; MIND_DIMS];
-                    for (i, item) in items.iter().take(MIND_DIMS).enumerate() {
-                        out[i] = item.as_f64().unwrap_or(0.5) as f32;
-                    }
-                    return Ok(out);
+            if s.as_str() == Some(key) {
+                if let Value::Map(items) = v {
+                    return Some(items.clone());
                 }
+                return None;
             }
         }
     }
-    Err(anyhow!("tensor key missing from source dict"))
+    None
+}
+
+fn lookup_array(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<Vec<rmpv::Value>> {
+    use rmpv::Value;
+    for (k, v) in map.iter() {
+        if let Value::String(s) = k {
+            if s.as_str() == Some(key) {
+                if let Value::Array(items) = v {
+                    return Some(items.clone());
+                }
+                return None;
+            }
+        }
+    }
+    None
+}
+
+fn field_or_default(map: Option<&Vec<(rmpv::Value, rmpv::Value)>>, key: &str, default: f64) -> f64 {
+    let map = match map {
+        Some(m) => m,
+        None => return default,
+    };
+    use rmpv::Value;
+    for (k, v) in map.iter() {
+        if let Value::String(s) = k {
+            if s.as_str() == Some(key) {
+                return v.as_f64().unwrap_or(default);
+            }
+        }
+    }
+    default
+}
+
+fn top_level_f64_or(map: &[(rmpv::Value, rmpv::Value)], key: &str, default: f64) -> f64 {
+    use rmpv::Value;
+    for (k, v) in map.iter() {
+        if let Value::String(s) = k {
+            if s.as_str() == Some(key) {
+                return v.as_f64().unwrap_or(default);
+            }
+        }
+    }
+    default
 }
 
 fn open_slot(shm_dir: &Path, name: &str) -> Result<Slot> {
@@ -361,10 +554,13 @@ fn open_slot(shm_dir: &Path, name: &str) -> Result<Slot> {
     Slot::open(&path).with_context(|| format!("open slot {}", path.display()))
 }
 
-fn encode_mind_state_payload(mind: &[f32; MIND_DIMS]) -> Vec<u8> {
+/// Build a SPEC §8.5 `MIND_STATE` payload as `rmpv::Value::Map`. Embedded
+/// directly into the envelope by `encode_simple` per SPEC §8.10 line 900
+/// byte-identical guarantee — NOT pre-encoded to opaque bytes.
+fn encode_mind_state_payload(mind: &[f32; MIND_DIMS]) -> rmpv::Value {
     use rmpv::Value;
     let values = Value::Array(mind.iter().map(|f| Value::F64(*f as f64)).collect());
-    let map = Value::Map(vec![
+    Value::Map(vec![
         (Value::String("src".into()), Value::String("inner".into())),
         (
             Value::String("type".into()),
@@ -372,11 +568,7 @@ fn encode_mind_state_payload(mind: &[f32; MIND_DIMS]) -> Vec<u8> {
         ),
         (Value::String("values".into()), values),
         (Value::String("ts".into()), Value::F64(now_secs())),
-    ]);
-    let mut out = Vec::with_capacity(192);
-    rmpv::encode::write_value(&mut out, &map)
-        .expect("rmpv encode never fails on well-formed Value");
-    out
+    ])
 }
 
 fn now_secs() -> f64 {
@@ -407,8 +599,11 @@ mod tests {
             (None, None) => vec![1.0_f32; MIND_DIMS],
         };
         apply_multipliers(&mut mind, &composed);
+        // 0E: Some(topo) models an epoch boundary — recompute the held nudge,
+        // then apply it (the per-tick application path).
         if let Some(topo) = topology_lower {
-            ground_up.apply_to_mind(&mut mind, &topo, 1.0).unwrap();
+            ground_up.compute_nudge(&topo);
+            ground_up.apply_held_to_mind(&mut mind, 1.0).unwrap();
         }
         mind
     }
@@ -490,7 +685,7 @@ mod tests {
         let mind = [0.0_f32; MIND_DIMS];
         let bytes = encode_mind_state_payload(&mind);
         use rmpv::Value;
-        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let v: Value = bytes; // §4.C-ter: encode_*_payload now returns Value directly
         let map = match v {
             Value::Map(items) => items,
             _ => panic!("not a map"),
@@ -516,7 +711,7 @@ mod tests {
         let mind = [0.0_f32; MIND_DIMS];
         let bytes = encode_mind_state_payload(&mind);
         use rmpv::Value;
-        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let v: Value = bytes; // §4.C-ter: encode_*_payload now returns Value directly
         let mut found_src = false;
         let mut found_type = false;
         if let Value::Map(items) = v {
@@ -540,7 +735,7 @@ mod tests {
         let mind: [f32; MIND_DIMS] = std::array::from_fn(|i| (i as f32) * 0.05);
         let bytes = encode_mind_state_payload(&mind);
         use rmpv::Value;
-        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let v: Value = bytes; // §4.C-ter: encode_*_payload now returns Value directly
         if let Value::Map(items) = v {
             for (k, val) in items {
                 if let Value::String(s) = k {
@@ -574,6 +769,205 @@ mod tests {
         assert_eq!(r, [0.0; MIND_DIMS]);
     }
 
+    fn encode_msgpack_map(pairs: Vec<(&str, rmpv::Value)>) -> Vec<u8> {
+        use rmpv::Value;
+        let items: Vec<(Value, Value)> = pairs
+            .into_iter()
+            .map(|(k, v)| (Value::String(k.into()), v))
+            .collect();
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &Value::Map(items)).unwrap();
+        out
+    }
+
+    #[test]
+    fn project_inner_mind_15d_neutral_inputs_match_python_defaults() {
+        // Python collect_mind_15d with: current_5d=[0.5;5], audio_state=None,
+        // interaction_quality=0.5, visual_state=None, assessment_quality=0.5,
+        // ambient_change=0.0, hormone_levels=None
+        // → thinking=[0.5;5], feeling=[0.4, 0.5, 0.4, 0.5, 0.0], willing=[0.5;5]
+        let payload = encode_msgpack_map(vec![
+            (
+                "thinking_5d",
+                rmpv::Value::Array(vec![rmpv::Value::F32(0.5); 5]),
+            ),
+            ("interaction_quality", rmpv::Value::F64(0.5)),
+            ("assessment_quality", rmpv::Value::F64(0.5)),
+            ("ambient_change", rmpv::Value::F64(0.0)),
+        ]);
+        let out = project_inner_mind_15d(&payload, [0.0; MIND_DIMS]).unwrap();
+        for i in 0..5 {
+            assert!((out[i] - 0.5).abs() < 1e-6, "thinking[{i}]={}", out[i]);
+        }
+        assert!((out[5] - 0.4).abs() < 1e-6, "inner_hearing={}", out[5]);
+        assert!((out[6] - 0.5).abs() < 1e-6, "inner_touch={}", out[6]);
+        assert!((out[7] - 0.4).abs() < 1e-6, "inner_sight={}", out[7]);
+        assert!((out[8] - 0.5).abs() < 1e-6, "inner_taste={}", out[8]);
+        assert!((out[9] - 0.0).abs() < 1e-6, "inner_smell={}", out[9]);
+        for i in 10..15 {
+            assert!((out[i] - 0.5).abs() < 1e-6, "willing[{}]={}", i, out[i]);
+        }
+    }
+
+    #[test]
+    fn project_inner_mind_15d_audio_state_drives_inner_hearing() {
+        // creates_recent=3, ambient=0.6 → 0.5*min(1,3/5) + 0.5*0.6 = 0.3 + 0.3 = 0.6
+        let audio = rmpv::Value::Map(vec![
+            (
+                rmpv::Value::String("creates_recent".into()),
+                rmpv::Value::F64(3.0),
+            ),
+            (rmpv::Value::String("ambient".into()), rmpv::Value::F64(0.6)),
+        ]);
+        let payload = encode_msgpack_map(vec![
+            (
+                "thinking_5d",
+                rmpv::Value::Array(vec![rmpv::Value::F32(0.5); 5]),
+            ),
+            ("audio_state", audio),
+            ("interaction_quality", rmpv::Value::F64(0.5)),
+            ("assessment_quality", rmpv::Value::F64(0.5)),
+            ("ambient_change", rmpv::Value::F64(0.0)),
+        ]);
+        let out = project_inner_mind_15d(&payload, [0.0; MIND_DIMS]).unwrap();
+        assert!((out[5] - 0.6).abs() < 1e-5, "inner_hearing={}", out[5]);
+    }
+
+    #[test]
+    fn project_inner_mind_15d_audio_creates_saturates_at_5() {
+        // creates_recent=10, ambient=0.0 → 0.5*min(1,10/5) + 0.5*0.0 = 0.5 (saturated)
+        let audio = rmpv::Value::Map(vec![
+            (
+                rmpv::Value::String("creates_recent".into()),
+                rmpv::Value::F64(10.0),
+            ),
+            (rmpv::Value::String("ambient".into()), rmpv::Value::F64(0.0)),
+        ]);
+        let payload = encode_msgpack_map(vec![
+            (
+                "thinking_5d",
+                rmpv::Value::Array(vec![rmpv::Value::F32(0.5); 5]),
+            ),
+            ("audio_state", audio),
+        ]);
+        let out = project_inner_mind_15d(&payload, [0.0; MIND_DIMS]).unwrap();
+        assert!((out[5] - 0.5).abs() < 1e-5, "inner_hearing={}", out[5]);
+    }
+
+    #[test]
+    fn project_inner_mind_15d_visual_state_drives_inner_sight() {
+        let visual = rmpv::Value::Map(vec![
+            (
+                rmpv::Value::String("creates_recent".into()),
+                rmpv::Value::F64(2.0),
+            ),
+            (rmpv::Value::String("ambient".into()), rmpv::Value::F64(0.8)),
+        ]);
+        let payload = encode_msgpack_map(vec![
+            (
+                "thinking_5d",
+                rmpv::Value::Array(vec![rmpv::Value::F32(0.5); 5]),
+            ),
+            ("visual_state", visual),
+        ]);
+        let out = project_inner_mind_15d(&payload, [0.0; MIND_DIMS]).unwrap();
+        // 0.5*min(1, 2/5) + 0.5*0.8 = 0.2 + 0.4 = 0.6
+        assert!((out[7] - 0.6).abs() < 1e-5, "inner_sight={}", out[7]);
+    }
+
+    #[test]
+    fn project_inner_mind_15d_hormone_levels_drive_willing() {
+        let hormones = rmpv::Value::Map(vec![
+            (rmpv::Value::String("IMPULSE".into()), rmpv::Value::F64(0.3)),
+            (rmpv::Value::String("EMPATHY".into()), rmpv::Value::F64(0.7)),
+            (
+                rmpv::Value::String("CREATIVITY".into()),
+                rmpv::Value::F64(0.55),
+            ),
+            (
+                rmpv::Value::String("VIGILANCE".into()),
+                rmpv::Value::F64(0.4),
+            ),
+            (
+                rmpv::Value::String("CURIOSITY".into()),
+                rmpv::Value::F64(0.9),
+            ),
+        ]);
+        let payload = encode_msgpack_map(vec![
+            (
+                "thinking_5d",
+                rmpv::Value::Array(vec![rmpv::Value::F32(0.5); 5]),
+            ),
+            ("hormone_levels", hormones),
+        ]);
+        let out = project_inner_mind_15d(&payload, [0.0; MIND_DIMS]).unwrap();
+        assert!((out[10] - 0.3).abs() < 1e-5);
+        assert!((out[11] - 0.7).abs() < 1e-5);
+        assert!((out[12] - 0.55).abs() < 1e-5);
+        assert!((out[13] - 0.4).abs() < 1e-5);
+        assert!((out[14] - 0.9).abs() < 1e-5);
+    }
+
+    #[test]
+    fn project_inner_mind_15d_clamps_out_of_range() {
+        let hormones = rmpv::Value::Map(vec![
+            (rmpv::Value::String("IMPULSE".into()), rmpv::Value::F64(1.5)),
+            (
+                rmpv::Value::String("EMPATHY".into()),
+                rmpv::Value::F64(-0.3),
+            ),
+        ]);
+        let payload = encode_msgpack_map(vec![
+            (
+                "thinking_5d",
+                rmpv::Value::Array(vec![rmpv::Value::F32(0.5); 5]),
+            ),
+            ("interaction_quality", rmpv::Value::F64(2.0)),
+            ("assessment_quality", rmpv::Value::F64(-0.5)),
+            ("ambient_change", rmpv::Value::F64(1.7)),
+            ("hormone_levels", hormones),
+        ]);
+        let out = project_inner_mind_15d(&payload, [0.0; MIND_DIMS]).unwrap();
+        assert_eq!(out[6], 1.0, "interaction_quality clamped");
+        assert_eq!(out[8], 0.0, "assessment_quality clamped");
+        assert_eq!(out[9], 1.0, "ambient_change clamped");
+        assert_eq!(out[10], 1.0, "IMPULSE clamped to 1");
+        assert_eq!(out[11], 0.0, "EMPATHY clamped to 0");
+    }
+
+    #[test]
+    fn project_inner_mind_15d_legacy_tensor_schema_passes_through() {
+        // Atomic-deploy fallback: Python may briefly publish {tensor:[15D]}
+        // (legacy v2 shape) during the cutover. Rust must passthrough.
+        let tensor: Vec<rmpv::Value> = (0..15).map(|i| rmpv::Value::F32(i as f32 * 0.05)).collect();
+        let payload = encode_msgpack_map(vec![("tensor", rmpv::Value::Array(tensor))]);
+        let out = project_inner_mind_15d(&payload, [0.0; MIND_DIMS]).unwrap();
+        for i in 0..15 {
+            assert!(
+                (out[i] - (i as f32 * 0.05)).abs() < 1e-5,
+                "tensor[{}]={}",
+                i,
+                out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn project_inner_mind_15d_malformed_envelope_returns_fallback() {
+        // Top-level Array (not Map) → fallback.
+        let payload = {
+            let v = rmpv::Value::Array(vec![rmpv::Value::F64(1.0)]);
+            let mut out = Vec::new();
+            rmpv::encode::write_value(&mut out, &v).unwrap();
+            out
+        };
+        let fallback = [0.123_f32; MIND_DIMS];
+        let out = project_inner_mind_15d(&payload, fallback).unwrap();
+        for i in 0..15 {
+            assert!((out[i] - 0.123).abs() < 1e-6);
+        }
+    }
+
     #[test]
     fn read_sensor_cache_decodes_15_floats() {
         let dir = tempdir().unwrap();
@@ -603,7 +997,10 @@ mod tests {
     fn payload_size_15d_under_msgpack_cap() {
         // 15 floats msgpack encoded should be well under FRAME_MAX_FRAME_BYTES.
         let mind: [f32; MIND_DIMS] = std::array::from_fn(|i| (i as f32) * 0.07);
-        let bytes = encode_mind_state_payload(&mind);
+        let value = encode_mind_state_payload(&mind);
+        // §4.C-ter: encoder now returns Value; size-check encodes to bytes inline.
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &value).unwrap();
         assert!(
             bytes.len() < 1024,
             "MIND_STATE payload bloated: {}B",

@@ -16,7 +16,7 @@ import tempfile
 
 import pytest
 
-from titan_plugin.logic.cgn import ConceptGroundingNetwork, CGNConsumerConfig
+from titan_hcl.logic.cgn import ConceptGroundingNetwork, CGNConsumerConfig
 
 
 @pytest.fixture

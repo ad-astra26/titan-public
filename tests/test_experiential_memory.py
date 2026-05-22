@@ -3,7 +3,7 @@ import math
 import os
 import pytest
 
-from titan_plugin.logic.experiential_memory import ExperientialMemory, _cosine_sim
+from titan_hcl.logic.experiential_memory import ExperientialMemory, _cosine_sim
 
 
 def _fresh(tmp_path, name, dev_age=100):
@@ -213,7 +213,7 @@ class TestDefensiveGuards:
         """Scalar felt_tensor → stored as empty list, WARNING logged."""
         import logging
         mem = _fresh(tmp_path, "guard1")
-        with caplog.at_level(logging.WARNING, logger="titan_plugin.logic.experiential_memory"):
+        with caplog.at_level(logging.WARNING, logger="titan_hcl.logic.experiential_memory"):
             row_id = mem.store_insight(
                 {"significance": 0.3, "felt_tensor": 0.3656, "epoch_id": 1},
                 dream_cycle=1,
@@ -225,7 +225,7 @@ class TestDefensiveGuards:
         """List of dim != 65 or 130 → stored, but WARNING emitted."""
         import logging
         mem = _fresh(tmp_path, "guard2")
-        with caplog.at_level(logging.WARNING, logger="titan_plugin.logic.experiential_memory"):
+        with caplog.at_level(logging.WARNING, logger="titan_hcl.logic.experiential_memory"):
             mem.store_insight(
                 {"significance": 0.3, "felt_tensor": [0.1] * 42, "epoch_id": 1},
                 dream_cycle=1,
@@ -272,7 +272,7 @@ class TestE2EDreamCycleRoundtrip:
     def test_e2e_dream_cycle_to_recall_roundtrip_130d(self, tmp_path):
         """Full pipeline at 130D: distill → store → recall round-trip."""
         import random
-        from titan_plugin.logic.dreaming import DreamingEngine
+        from titan_hcl.logic.dreaming import DreamingEngine
 
         random.seed(42)
         eng = DreamingEngine(dna={"cluster_merge_threshold": 0.5})

@@ -12,11 +12,32 @@ import numpy as np
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _pin_test_ema_gamma(monkeypatch):
+    """Isolate META-CGN unit tests from the production [meta_cgn].ema_decay_gamma
+    tuning. These tests validate the decay *mechanism/math* at the historical
+    default γ=0.999; production lowered it to 0.99 (2026-05-20 K1, V-saturation
+    lever) which would otherwise shift every decay-magnitude assertion. Tests
+    that need a different γ set ``c._ema_decay_gamma`` on the instance (wins over
+    this config pin). Patches the config getter the consumer reads at __init__.
+    """
+    import titan_hcl.params as _params
+    _orig = _params.get_params
+
+    def _patched(section, *a, **k):
+        cfg = dict(_orig(section, *a, **k) or {})
+        if section == "meta_cgn":
+            cfg["ema_decay_gamma"] = 0.999
+        return cfg
+
+    monkeypatch.setattr(_params, "get_params", _patched)
+
+
 # ── Basic construction + registration ─────────────────────────────────
 
 def test_construction_without_send_queue():
     """Consumer must init safely with no bus (test / standalone mode)."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer, PRIMITIVES
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer, PRIMITIVES
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp, titan_id="T1")
         # No crash, all primitives present, none registered (no bus)
@@ -30,7 +51,7 @@ def test_construction_without_send_queue():
 
 def test_register_sends_bus_message():
     """With a send_queue, consumer must emit exactly one CGN_REGISTER."""
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, PRIMITIVES, FEATURE_DIMS, ACTION_DIMS)
     q = Queue()
     with tempfile.TemporaryDirectory() as tmp:
@@ -52,7 +73,7 @@ def test_register_sends_bus_message():
 
 def test_encode_state_shape_and_one_hot():
     """encode_state must return 30D float32 with one-hot primitive index."""
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, FEATURE_DIMS, PRIMITIVE_INDEX)
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
@@ -68,7 +89,7 @@ def test_encode_state_shape_and_one_hot():
 
 def test_encode_state_unknown_primitive_no_crash():
     """Unknown primitive name must return zero vector (no one-hot set)."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer, FEATURE_DIMS
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer, FEATURE_DIMS
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         vec = c.encode_state("NONEXISTENT_PRIMITIVE", {})
@@ -79,7 +100,7 @@ def test_encode_state_unknown_primitive_no_crash():
 
 def test_encode_state_clips_out_of_range():
     """encode_state must clip extreme values to [0, 1]."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         ctx = {
@@ -103,7 +124,7 @@ def test_update_primitive_V_ema_moves_toward_target():
     n_samples reflects geometric-series effective-sample-size not raw count.
     At γ=0.9999 with 30 updates, n_samples ≈ 29.996 → int = 29 or 30 depending
     on float rounding. Use range assertion to accept either."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         p = c._primitives["FORMULATE"]
@@ -120,7 +141,7 @@ def test_update_primitive_V_ema_moves_toward_target():
 
 def test_update_primitive_V_confidence_grows_with_samples():
     """Confidence must grow as samples accumulate."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         conf_at = []
@@ -134,7 +155,7 @@ def test_update_primitive_V_confidence_grows_with_samples():
 
 def test_update_unknown_primitive_is_no_op():
     """Unknown primitive ID must not raise, must not mutate any concept."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         before = {p: c._primitives[p].V for p in c._primitives}
@@ -147,7 +168,7 @@ def test_update_unknown_primitive_is_no_op():
 
 def test_send_transition_bus_payload():
     """send_transition must enqueue CGN_TRANSITION with correct schema."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer, PRIMITIVE_INDEX
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer, PRIMITIVE_INDEX
     q = Queue()
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=q, save_dir=tmp)
@@ -170,7 +191,7 @@ def test_send_transition_bus_payload():
 
 def test_send_transition_no_queue_is_silent():
     """Without a bus, send_transition must not raise."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         c.send_transition("BREAK", np.zeros(30), 0.5)
@@ -180,7 +201,7 @@ def test_send_transition_no_queue_is_silent():
 
 def test_compose_template_score_returns_shadow_only():
     """Phase 1 composition must mark shadow_only=True and never raise."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         result = c.compose_template_score(
@@ -200,7 +221,7 @@ def test_compose_template_score_returns_shadow_only():
 
 def test_compose_logs_disagreement_only_when_confident():
     """Disagreements should only log when V_confidence is sufficient."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # First call — primitives have 0 confidence, disagreement should NOT log
@@ -234,7 +255,7 @@ def test_compose_logs_disagreement_only_when_confident():
 
 def test_save_and_reload_roundtrip():
     """save_state -> new consumer -> _load_state must preserve primitive state."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c1 = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         for _ in range(25):
@@ -251,7 +272,7 @@ def test_save_and_reload_roundtrip():
 
 def test_save_file_is_valid_json_with_expected_shape():
     """Persistence file must be well-formed JSON with all 9 primitives."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer, PRIMITIVES
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer, PRIMITIVES
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         c.update_primitive_V("FORMULATE", 1.0)
@@ -269,7 +290,7 @@ def test_save_file_is_valid_json_with_expected_shape():
 
 def test_get_stats_schema():
     """get_stats must return all documented fields (contract for audit endpoint)."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         stats = c.get_stats()
@@ -287,7 +308,7 @@ def test_get_stats_schema():
 
 def test_not_ready_to_graduate_at_init():
     """Fresh consumer must not be ready to graduate."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         assert c.get_stats()["ready_to_graduate"] is False
@@ -297,7 +318,7 @@ def test_not_ready_to_graduate_at_init():
 
 def test_seed_hypotheses_loaded_at_init():
     """5 seed hypotheses must be registered at construction."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         assert len(c._hypotheses) == 6   # P7: added H6_advisor_disagreement
@@ -310,7 +331,7 @@ def test_seed_hypotheses_loaded_at_init():
 
 def test_observe_chain_evidence_populates_hypotheses():
     """observe_chain_evidence must fan evidence out to all 5 hypotheses."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         c.observe_chain_evidence({
@@ -337,7 +358,7 @@ def test_observe_chain_evidence_populates_hypotheses():
 
 def test_h1_monoculture_confirms_when_dominant_V_is_low():
     """H1 must confirm when dominant primitive V is meaningfully below pop avg."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Push 35 observations where dominant V is 0.3 but pop avg is 0.5
@@ -363,7 +384,7 @@ def test_h1_monoculture_confirms_when_dominant_V_is_low():
 
 def test_h5_impasse_confirms_when_break_helps_in_impasse():
     """H5 must confirm when BREAK V in impasse > non-impasse."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # 10 impasse BREAK observations at quality 0.7
@@ -396,7 +417,7 @@ def test_h5_impasse_confirms_when_break_helps_in_impasse():
 
 def test_hypothesis_nascent_when_below_min_samples():
     """Hypothesis must stay nascent if it doesn't have min_samples."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Only 5 observations — H1 needs 30
@@ -413,7 +434,7 @@ def test_hypothesis_nascent_when_below_min_samples():
 
 def test_haov_state_persists_across_reload():
     """save_state + reload must preserve hypothesis status + effect_size."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c1 = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         for _ in range(35):
@@ -436,7 +457,7 @@ def test_haov_state_persists_across_reload():
 
 def test_get_haov_stats_schema():
     """get_haov_stats must return expected structure."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         stats = c.get_haov_stats()
@@ -449,7 +470,7 @@ def test_get_haov_stats_schema():
 
 def test_confirmed_hypothesis_raises_confidence_multiplier():
     """Confirmed hypothesis must set confidence_multiplier > 1."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         for _ in range(35):
@@ -477,7 +498,7 @@ def test_composition_confidence_weighted_arithmetic_mean():
     Arithmetic mean ≈ 0.5 pre-shift → ≈ 0.35 shifted. Assertion: arithmetic-
     distinctive range, clearly above geometric post-shift floor.
     """
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         for _ in range(200):
@@ -498,7 +519,7 @@ def test_composition_confidence_weighted_arithmetic_mean():
 
 def test_composition_skips_ungrounded_primitives_gracefully():
     """Primitives with confidence 0 should contribute minimally."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Only ground FORMULATE
@@ -521,7 +542,7 @@ def test_composition_skips_ungrounded_primitives_gracefully():
 
 def test_confirmed_haov_boosts_composition_weight():
     """Confirmed HAOV rule on a primitive should raise its composition weight."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Ground two primitives to equal V + confidence
@@ -547,7 +568,7 @@ def test_confirmed_haov_boosts_composition_weight():
 
 def test_graduation_requires_hypothesis_confirmations():
     """Phase 2-tightened graduation requires ≥3 confirmed hypotheses."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer, PRIMITIVES
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer, PRIMITIVES
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Force all primitives to have many samples but no confirmed hypotheses
@@ -565,7 +586,7 @@ def test_graduation_requires_hypothesis_confirmations():
 
 def test_boot_selftest_passes_on_fresh_consumer():
     """P5 I-8: fresh consumer must pass boot self-test."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         assert c._status == "shadow_mode"
@@ -577,12 +598,12 @@ def test_boot_selftest_self_heals_from_stale_disabled_state():
     boot selftest must RETRY and, if passing, flip status to `shadow_mode`
     and persist. `disabled_failsafe` (recent failsafe trip) remains sticky.
     """
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     import json
     import os
     with tempfile.TemporaryDirectory() as tmp:
         # Seed a stale disabled_boot_selftest_failed watchdog state — as if
-        # a prior titan_main left behind the stuck flag before code fix.
+        # a prior titan_hcl left behind the stuck flag before code fix.
         watchdog = {
             "version": 1, "saved_ts": 0,
             "status": "disabled_boot_selftest_failed",
@@ -611,7 +632,7 @@ def test_boot_selftest_self_heals_from_stale_disabled_state():
 def test_boot_selftest_failsafe_state_stays_sticky():
     """Complement to self-heal test: disabled_failsafe (recent failsafe trip)
     must NOT retry on boot — cooldown machinery handles clearing it."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     import json
     import os
     with tempfile.TemporaryDirectory() as tmp:
@@ -639,7 +660,7 @@ def test_boot_selftest_passes_with_gamma_decay_on_saturated_posterior():
     impossible for saturated primitives and persistently failed boot
     after γ=0.9999/0.999 activation (commits 3427dfe, 64a92be).
     """
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     import json
     import os
     with tempfile.TemporaryDirectory() as tmp:
@@ -681,7 +702,7 @@ def test_boot_selftest_passes_with_gamma_decay_on_saturated_posterior():
 
 def test_force_graduate_transitions_to_graduating():
     """force_graduate() must flip status shadow → graduating."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         assert c._status == "shadow_mode"
@@ -695,7 +716,7 @@ def test_force_graduate_transitions_to_graduating():
 
 def test_evaluate_graduation_ramps_progress():
     """After force_graduate, each evaluate_graduation call advances ramp."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         c.force_graduate()
@@ -707,7 +728,7 @@ def test_evaluate_graduation_ramps_progress():
 
 def test_ramp_completes_at_100_chains():
     """Graduating → active after 100 evaluate_graduation calls."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         c.force_graduate()
@@ -719,7 +740,7 @@ def test_ramp_completes_at_100_chains():
 
 def test_force_shadow_rollback():
     """force_shadow must revert from any state to shadow_mode."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         c.force_graduate()
@@ -735,7 +756,7 @@ def test_force_shadow_rollback():
 
 def test_rerank_templates_in_shadow_preserves_top1():
     """In shadow mode, rerank MUST return chain_iql's top pick unchanged."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Ground RECALL high, FORMULATE low
@@ -755,7 +776,7 @@ def test_rerank_templates_in_shadow_preserves_top1():
 
 def test_rerank_templates_in_active_can_reorder():
     """In active mode with full ramp, β CAN pick different from chain_iql top."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Ground primitives strongly so composition confidence is high
@@ -780,7 +801,7 @@ def test_rerank_templates_in_active_can_reorder():
 
 def test_rerank_templates_disabled_bypasses():
     """Disabled consumer must bypass rerank, return top-1."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         c._status = "disabled_failsafe"
@@ -792,7 +813,7 @@ def test_rerank_templates_disabled_bypasses():
 
 def test_graduation_readiness_exposes_blockers():
     """get_graduation_readiness shows specific blockers."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         r = c.get_graduation_readiness()
@@ -804,7 +825,7 @@ def test_graduation_readiness_exposes_blockers():
 
 def test_shadow_quality_metric_reports_health():
     """shadow_quality_metric classifies disagreement rate."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         assert c.shadow_quality_metric()["health"] == "no_data"
@@ -819,7 +840,7 @@ def test_shadow_quality_metric_reports_health():
 
 def test_failsafe_trips_on_severity_9():
     """P5 I-5: 3 composition_errors (severity 3 each) → severity_sum=9 → trip."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Feed 3 DISTINCT composition errors (dedup counts unique signatures)
@@ -833,7 +854,7 @@ def test_failsafe_trips_on_severity_9():
 
 def test_failsafe_dedup_prevents_false_trip():
     """P5 I-6: 100 identical failures should count once — no trip."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Same error 50 times — should dedup to 1 signature = severity 3
@@ -846,7 +867,7 @@ def test_failsafe_dedup_prevents_false_trip():
 
 def test_failsafe_benign_noise_does_not_trip():
     """8 encoding_errors (severity 1 each, 8 unique) → severity=8 → below threshold."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         for i in range(8):
@@ -859,7 +880,7 @@ def test_failsafe_benign_noise_does_not_trip():
 
 def test_failsafe_disabled_short_circuits_operations():
     """Disabled consumer must no-op all public operations."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         c._status = "disabled_failsafe"
@@ -877,7 +898,7 @@ def test_failsafe_disabled_short_circuits_operations():
 
 def test_reset_watchdog_recovers_from_failsafe():
     """reset_watchdog() must return to shadow from disabled."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Trip failsafe
@@ -893,7 +914,7 @@ def test_reset_watchdog_recovers_from_failsafe():
 
 def test_watchdog_state_persists_across_reload():
     """P5 I-9: watchdog state (failure count, status) survives reboot."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c1 = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         for i in range(3):
@@ -909,7 +930,7 @@ def test_watchdog_state_persists_across_reload():
 
 def test_failure_log_written():
     """P5 I-7: failures append to failure_log.jsonl."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         c._record_failure("encoding_error", ValueError("test"), 42)
@@ -926,7 +947,7 @@ def test_failure_log_written():
 
 def test_impasse_v_flatline_triggers():
     """F8: V values unchanging for 500 chains → v_flatline."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Populate 500 chains of constant V
@@ -939,7 +960,7 @@ def test_impasse_v_flatline_triggers():
 
 def test_impasse_status_healthy_when_V_moves():
     """F8: active V changes AND HAOV evidence prevent all impasse signals."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Populate 500 chains where V is moving AND HAOV observations grow
@@ -963,7 +984,7 @@ def test_impasse_status_healthy_when_V_moves():
 
 def test_get_failsafe_status_schema():
     """Failsafe status endpoint data shape."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         s = c.get_failsafe_status()
@@ -976,7 +997,7 @@ def test_get_failsafe_status_schema():
 def test_record_chain_outcome_feeds_rollback_detector():
     """record_chain_outcome splits raw reward floats into pre-grad vs post-grad
     deques. Scale-invariant after Option B refactor (2026-04-19)."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Pre-graduation
@@ -998,7 +1019,7 @@ def test_rollback_detector_scale_invariant_no_drop():
     pre-grad (no actual drop), rollback must NOT fire — even if the absolute
     reward level is well below 0.5. Bug: pre-Option-B the hardcoded 0.5
     threshold would rollback any scale < 0.5."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Populate pre-grad baseline with low-scale rewards (post-COMPLETE-5
@@ -1027,7 +1048,7 @@ def test_rollback_detector_scale_invariant_no_drop():
 def test_rollback_detector_fires_on_real_regression():
     """Positive case: if post-grad rewards really drop below baseline − k·σ,
     rollback DOES fire. Prevents over-loosening the detector."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Baseline ~0.60 with std ~0.05
@@ -1059,7 +1080,7 @@ def test_beta_posterior_update_accumulates_alpha_beta():
     existing excess by 0.1%. At 100 updates the γ-loss is ~5% of accumulated
     n, so n_samples converges below the nominal 100.
     """
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer, BETA_PARAM_FLOOR
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer, BETA_PARAM_FLOOR
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # 100 high-quality updates → α grows ~85, β grows ~10 under γ=0.999
@@ -1078,7 +1099,7 @@ def test_beta_posterior_update_accumulates_alpha_beta():
 
 def test_beta_ci_narrows_with_more_samples():
     """CI width shrinks as evidence accumulates — confidence becomes 'tight'."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer, _beta_ci_width
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer, _beta_ci_width
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Early CI (wide)
@@ -1097,7 +1118,7 @@ def test_migration_v2_to_v3_preserves_v_ordering_and_caps_n_eff():
     """Converted bootstrap: α=V·n_eff+1, β=(1−V)·n_eff+1, n_eff≤200.
     Preserves V ordering but caps FORMULATE's prior strength so it stays
     learning-responsive (no α≈0.01 lock-in)."""
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, MIGRATION_N_EFF_CAP)
     import json, os
     with tempfile.TemporaryDirectory() as tmp:
@@ -1144,7 +1165,7 @@ def test_f_novelty_bounded_by_kappa_explore():
     """F anti-monoculture bonus uses tanh, so magnitude is bounded by κ.
     Even a primitive with n=10000 vs pool n_mean=0 can't drag the score more
     than κ_explore below the V_effective + UCB shift."""
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, COMPOSITION_DEFAULTS)
     kappa = COMPOSITION_DEFAULTS["kappa_explore"]
     with tempfile.TemporaryDirectory() as tmp:
@@ -1165,7 +1186,7 @@ def test_f_novelty_bounded_by_kappa_explore():
 def test_ucb_composition_flips_at_n_anchor():
     """D4: under-sampled primitives get optimistic shift (+κ·(hi−V)),
     over-sampled get pessimistic shift (−κ·(V−lo)). Flip happens at N_ANCHOR."""
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, COMPOSITION_DEFAULTS)
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
@@ -1195,12 +1216,12 @@ def test_chain_decay_reduces_n_but_preserves_V(monkeypatch):
     `ema_decay_gamma == 1.0` (per-update EMA takes over otherwise). This
     test forces γ=1.0 to exercise the legacy batch path that remains the
     active decay mechanism whenever EMA is disabled."""
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, COMPOSITION_DEFAULTS)
-    monkeypatch.setitem(COMPOSITION_DEFAULTS, "ema_decay_gamma", 1.0)
+    # γ pinned via ctor arg below (config now overrides COMPOSITION_DEFAULTS — 2026-05-20 K1)
     cadence = COMPOSITION_DEFAULTS["decay_cadence_chains"]
     with tempfile.TemporaryDirectory() as tmp:
-        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp, ema_decay_gamma=1.0)
         # Accumulate heavy evidence on FORMULATE
         for _ in range(300):
             c.update_primitive_V("FORMULATE", quality=0.7)
@@ -1220,12 +1241,12 @@ def test_chain_decay_skips_low_n_primitives(monkeypatch):
     """D2 skip_n_min: under-sampled primitives must be spared decay.
 
     2026-04-21 B-phase: forces γ=1.0 to exercise the batch-decay path."""
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, COMPOSITION_DEFAULTS)
-    monkeypatch.setitem(COMPOSITION_DEFAULTS, "ema_decay_gamma", 1.0)
+    # γ pinned via ctor arg below (config now overrides COMPOSITION_DEFAULTS — 2026-05-20 K1)
     cadence = COMPOSITION_DEFAULTS["decay_cadence_chains"]
     with tempfile.TemporaryDirectory() as tmp:
-        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp, ema_decay_gamma=1.0)
         # Ground only lightly — should remain below skip_n_min
         for _ in range(5):
             c.update_primitive_V("RECALL", quality=0.5)
@@ -1244,13 +1265,13 @@ def test_chain_decay_skips_low_n_primitives(monkeypatch):
 def test_batch_decay_gated_off_when_ema_active(monkeypatch):
     """B-phase gate: `_maybe_apply_decay` must early-return when
     `ema_decay_gamma < 1.0`. Prevents compound decay from batch × EMA."""
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, COMPOSITION_DEFAULTS, BETA_PARAM_FLOOR)
     # Activate EMA — any value < 1.0
-    monkeypatch.setitem(COMPOSITION_DEFAULTS, "ema_decay_gamma", 0.9999)
+    # γ pinned via ctor arg below (config now overrides COMPOSITION_DEFAULTS — 2026-05-20 K1)
     cadence = COMPOSITION_DEFAULTS["decay_cadence_chains"]
     with tempfile.TemporaryDirectory() as tmp:
-        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp, ema_decay_gamma=0.9999)
         # Ground heavy, above skip_n_min
         for _ in range(300):
             c.update_primitive_V("FORMULATE", quality=0.7)
@@ -1282,11 +1303,11 @@ def test_ema_decay_shrinks_posterior_when_active(monkeypatch):
     Test setup: at γ=0.9 (extreme value for visibility), 50 identical
     observations should yield α+β ≈ weight × 1/(1-γ) ≈ 10 (not the 50
     raw accumulation we'd see at γ=1.0)."""
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, COMPOSITION_DEFAULTS, BETA_PARAM_FLOOR)
-    monkeypatch.setitem(COMPOSITION_DEFAULTS, "ema_decay_gamma", 0.9)
+    # γ pinned via ctor arg below (config now overrides COMPOSITION_DEFAULTS — 2026-05-20 K1)
     with tempfile.TemporaryDirectory() as tmp:
-        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp, ema_decay_gamma=0.9)
         # At γ=0.9, steady-state (α-FLOOR) + (β-FLOOR) ≈ 1 × 1/0.1 = 10
         # (weight=1 per update, geometric series)
         for _ in range(100):
@@ -1303,11 +1324,11 @@ def test_ema_gamma_one_is_mathematical_identity(monkeypatch):
     """Regression: γ=1.0 must be the exact no-op identity case. At γ=1.0,
     α+β grows linearly with the number of observations (no decay). This
     was the SHIPPED NEUTRAL behavior from B.1 (commit c17ee12)."""
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, COMPOSITION_DEFAULTS, BETA_PARAM_FLOOR)
-    monkeypatch.setitem(COMPOSITION_DEFAULTS, "ema_decay_gamma", 1.0)
+    # γ pinned via ctor arg below (config now overrides COMPOSITION_DEFAULTS — 2026-05-20 K1)
     with tempfile.TemporaryDirectory() as tmp:
-        c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
+        c = MetaCGNConsumer(send_queue=None, save_dir=tmp, ema_decay_gamma=1.0)
         for _ in range(100):
             c.update_primitive_V("FORMULATE", quality=0.5)
         p = c._primitives["FORMULATE"]
@@ -1320,7 +1341,7 @@ def test_ema_gamma_one_is_mathematical_identity(monkeypatch):
 def test_per_domain_V_diverges_from_pooled_when_domain_grounded():
     """I3: when a domain has ≥ threshold observations, composition uses its
     specific V posterior. Verifies the domain routing is effective."""
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, COMPOSITION_DEFAULTS)
     threshold = COMPOSITION_DEFAULTS["domain_obs_threshold"]
     with tempfile.TemporaryDirectory() as tmp:
@@ -1350,7 +1371,7 @@ def test_per_domain_V_diverges_from_pooled_when_domain_grounded():
 
 def test_per_domain_fallback_below_threshold():
     """I3: below threshold, composition falls back to pooled V."""
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, COMPOSITION_DEFAULTS)
     threshold = COMPOSITION_DEFAULTS["domain_obs_threshold"]
     with tempfile.TemporaryDirectory() as tmp:
@@ -1368,7 +1389,7 @@ def test_per_domain_fallback_below_threshold():
 def test_impasse_2x_weighting_accelerates_convergence():
     """Impasse α-boost port: during impasse_alpha_boost_remaining, Beta
     updates use 2× observation weight → posterior moves twice as fast."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Normal update: +1 weight each
@@ -1390,7 +1411,7 @@ def test_impasse_2x_weighting_accelerates_convergence():
 def test_beta_dispersion_ema_moves_when_templates_differ():
     """I1: β-dispersion EMA should rise when top-K candidates produce
     meaningfully different composed_V scores."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Ground primitives with divergent V
@@ -1409,7 +1430,7 @@ def test_beta_dispersion_ema_moves_when_templates_differ():
 
 def test_usage_gini_signals_monoculture():
     """I2 Gini: 0 when usage uniform, ≈ 1 when one primitive dominates."""
-    from titan_plugin.logic.meta_cgn import _gini
+    from titan_hcl.logic.meta_cgn import _gini
     uniform = [100] * 9
     assert _gini(uniform) < 0.05
     monoc = [1000] + [10] * 8
@@ -1418,7 +1439,7 @@ def test_usage_gini_signals_monoculture():
 
 def test_schema_v3_round_trip_persists_alpha_beta_and_by_domain():
     """v3 save/load preserves α, β, and per-domain dict."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     import json
     with tempfile.TemporaryDirectory() as tmp:
         c1 = MetaCGNConsumer(send_queue=None, save_dir=tmp)
@@ -1446,7 +1467,7 @@ def test_schema_v3_round_trip_persists_alpha_beta_and_by_domain():
 def test_eureka_weight_amplifies_beta_posterior():
     """EUREKA chain with trigger primitive applies 5× weight — α/β deltas
     grow 5× vs baseline chain."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Baseline: 1× weight on FORMULATE with quality=1.0 → α += 1
@@ -1465,7 +1486,7 @@ def test_eureka_weight_amplifies_beta_posterior():
 
 def test_non_eureka_chain_does_not_increment_accelerated_counter():
     """Regression: when weight=1, no accelerated updates are counted."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         for _ in range(10):
@@ -1475,7 +1496,7 @@ def test_non_eureka_chain_does_not_increment_accelerated_counter():
 
 def test_eureka_trigger_counts_tracked_per_primitive():
     """observe_chain_evidence counts per-trigger primitive via chain_info."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         base_chain = {
@@ -1499,7 +1520,7 @@ def test_eureka_trigger_counts_tracked_per_primitive():
 
 def test_advisor_conflict_emits_bus_event():
     """Strong disagreement → META_CGN_ADVISOR_CONFLICT on the send_queue."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     from queue import Queue
     q = Queue()
     with tempfile.TemporaryDirectory() as tmp:
@@ -1534,7 +1555,7 @@ def test_advisor_conflict_emits_bus_event():
 
 def test_advisor_conflict_throttle_suppresses_duplicate_signature():
     """Two identical-signature conflicts within 100 chains → only one bus emission."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     from queue import Queue
     q = Queue()
     with tempfile.TemporaryDirectory() as tmp:
@@ -1562,7 +1583,7 @@ def test_advisor_conflict_throttle_suppresses_duplicate_signature():
 
 def test_advisor_conflict_throttle_clears_after_cooldown():
     """After 100 chain ticks, the same signature can emit again."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     from queue import Queue
     q = Queue()
     with tempfile.TemporaryDirectory() as tmp:
@@ -1590,7 +1611,7 @@ def test_advisor_conflict_throttle_clears_after_cooldown():
 def test_h6_advisor_disagreement_observation_and_test():
     """H6 accumulates disagreement→quality pairs; confirms when high-disagree
     chains under-perform low-disagree chains by ≥ threshold."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         h = c._hypotheses["H6_advisor_disagreement"]
@@ -1620,7 +1641,7 @@ def _force_impasse(c, signal="v_flatline", diagnostic="test"):
 
 def test_p8_impasse_emits_knowledge_req_with_request_id_and_broadcast():
     """D8.1 + I-P8.2: impasse → CGN_KNOWLEDGE_REQ with dst='all' + request_id."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     from queue import Queue
     q = Queue()
     with tempfile.TemporaryDirectory() as tmp:
@@ -1643,7 +1664,7 @@ def test_p8_impasse_emits_knowledge_req_with_request_id_and_broadcast():
 
 def test_p8_request_deduplication_same_signature():
     """I-P8.1: second impasse entry with same signature does NOT re-emit request."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     from queue import Queue
     q = Queue()
     with tempfile.TemporaryDirectory() as tmp:
@@ -1658,7 +1679,7 @@ def test_p8_request_deduplication_same_signature():
 
 def test_p8_aggregation_window_finalizes_after_timeout():
     """D8.2: after 2s window closes, pending request is finalized."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     from queue import Queue
     q = Queue()
     with tempfile.TemporaryDirectory() as tmp:
@@ -1683,7 +1704,7 @@ def test_p8_b_hybrid_ranks_source_affinity_wins_over_confidence():
     """D8.3: B-hybrid uses source affinity as primary. A high-confidence
     response from the wrong source loses to a modestly-confident response
     from the canonical source for the impasse signal."""
-    from titan_plugin.logic.meta_cgn import _rank_hybrid
+    from titan_hcl.logic.meta_cgn import _rank_hybrid
     # v_flatline canonical source = knowledge (affinity 1.0)
     # social has affinity 0.3 — lower
     resp_knowledge = {"source": "knowledge", "confidence": 0.5,
@@ -1700,7 +1721,7 @@ def test_p8_b_hybrid_ranks_source_affinity_wins_over_confidence():
 
 def test_p8_response_aggregation_picks_highest_ranked():
     """D8.3: winner of a multi-response aggregation is the highest-ranked."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     from queue import Queue
     q = Queue()
     with tempfile.TemporaryDirectory() as tmp:
@@ -1729,7 +1750,7 @@ def test_p8_response_aggregation_picks_highest_ranked():
 def test_p8_meta_cgn_responds_to_external_knowledge_request():
     """D8.4: META-CGN responds with primitive grounding summary when another
     consumer broadcasts CGN_KNOWLEDGE_REQ."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Ground a couple of primitives so META-CGN has something to share
@@ -1750,7 +1771,7 @@ def test_p8_meta_cgn_responds_to_external_knowledge_request():
 
 def test_p8_meta_cgn_ignores_own_requests():
     """D8.4: META-CGN must not respond to its own broadcast requests."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         resp = c.handle_knowledge_request({
@@ -1763,7 +1784,7 @@ def test_p8_meta_cgn_ignores_own_requests():
 
 def test_p8_source_credit_tracking():
     """D8.5: provided_by_source increments on response; helpful_by_source on inject."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     from queue import Queue
     q = Queue()
     with tempfile.TemporaryDirectory() as tmp:
@@ -1787,7 +1808,7 @@ def test_p8_source_credit_tracking():
 
 def test_p9_blend_weights_shadow_mode_zero_grounded():
     """Bootstrap/shadow_mode → w_grounded = 0 (reward blending starts clean)."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         w_leg, w_comp, w_grd = c.compute_blend_weights("general")
@@ -1797,7 +1818,7 @@ def test_p9_blend_weights_shadow_mode_zero_grounded():
 
 def test_p9_blend_weights_active_stage_half_grounded():
     """Active stage → w_grounded ≈ 0.5 (rFP §7 Mature), subject to E3 gate."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Satisfy E3 β-dispersion gate explicitly
@@ -1810,20 +1831,24 @@ def test_p9_blend_weights_active_stage_half_grounded():
 
 
 def test_p9_e3_beta_dispersion_gate_caps_w_grounded():
-    """E3: β-dispersion EMA below 0.05 caps w_grounded at ~0.05 regardless
-    of graduation stage."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    """E3: β-dispersion EMA below threshold caps w_grounded at the configured
+    `e3_dispersion_cap` (regardless of graduation stage). Asserts against the
+    configured cap rather than a magic number — the cap is prod-tunable
+    (0.05 → 0.20 as of 2026-05-20 K1 composition-weight)."""
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
-        c._status = "active"
-        c._beta_dispersion_ema = 0.001  # silent β
+        c._status = "active"  # base w_grounded would be 0.5 (Mature)
+        c._beta_dispersion_ema = 0.001  # silent β → gate fires
         _, _, w_grd = c.compute_blend_weights("general")
-        assert w_grd <= 0.06, w_grd
+        # Capped: must be ≤ configured cap and strictly below the un-gated 0.5
+        assert w_grd <= c._e3_dispersion_cap + 1e-9, (w_grd, c._e3_dispersion_cap)
+        assert w_grd < 0.5, w_grd
 
 
 def test_p9_d4_disabled_auto_zero_grounded():
     """D4 safety: disabled states → w_grounded = 0."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         c._status = "disabled_failsafe"
@@ -1834,7 +1859,7 @@ def test_p9_d4_disabled_auto_zero_grounded():
 def test_p9_e1_pessimistic_ci_lowers_r_grounded():
     """E1: r_grounded uses pessimistic shift — primitive with wide CI
     contributes less than its posterior mean would suggest."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Modest grounding → wide CI still
@@ -1850,7 +1875,7 @@ def test_p9_e1_pessimistic_ci_lowers_r_grounded():
 
 def test_p9_e4_per_domain_bonus_activates_when_domain_well_grounded():
     """E4: when 2+ primitives have n_domain ≥ threshold, w_grounded gets bonus."""
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, COMPOSITION_DEFAULTS)
     dom_thresh = COMPOSITION_DEFAULTS["domain_obs_threshold"]
     with tempfile.TemporaryDirectory() as tmp:
@@ -1869,7 +1894,7 @@ def test_p9_e4_per_domain_bonus_activates_when_domain_well_grounded():
 
 def test_p9_e5_blend_weights_history_written():
     """E5: log_blend_weights appends JSONL rows for audit."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     import json
     import os
     with tempfile.TemporaryDirectory() as tmp:
@@ -1894,7 +1919,7 @@ def test_p9_e5_blend_weights_history_written():
 def test_p10_known_signal_applies_pseudo_observation():
     """D10.1 + D10.2: a (language, concept_grounded) signal nudges FORMULATE
     and RECALL's Beta posterior by P10_SIGNAL_WEIGHT × intensity."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer, P10_SIGNAL_WEIGHT
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer, P10_SIGNAL_WEIGHT
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         a0_form = c._primitives["FORMULATE"].alpha
@@ -1912,7 +1937,7 @@ def test_p10_known_signal_applies_pseudo_observation():
 
 def test_p10_unknown_signal_rejected_cleanly():
     """Unknown (consumer, event_type) increments rejected counter, no crash."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         ok = c.handle_cross_consumer_signal(
@@ -1925,7 +1950,7 @@ def test_p10_unknown_signal_rejected_cleanly():
 
 def test_p10_intensity_scales_signal_weight():
     """Intensity × P10_SIGNAL_WEIGHT controls the pseudo-observation magnitude."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         a0 = c._primitives["HYPOTHESIZE"].alpha
@@ -1946,7 +1971,7 @@ def test_p10_intensity_scales_signal_weight():
 def test_p10_narrative_hook_triggers_when_intensity_above_threshold():
     """P10 Layer 2 stub: high-intensity signals with narrative_context record
     a counter (deferred to standalone narrative rFP for real bridging)."""
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, P10_NARRATIVE_TRIGGER_INTENSITY)
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
@@ -1965,7 +1990,7 @@ def test_p10_narrative_hook_triggers_when_intensity_above_threshold():
 
 def test_p10_signal_respects_disabled_failsafe():
     """P10 must be a no-op when META-CGN is disabled (safety)."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         c._status = "disabled_failsafe"
@@ -1978,7 +2003,7 @@ def test_p10_signal_respects_disabled_failsafe():
 
 def test_p10_per_consumer_counter_tracked():
     """signals_by_consumer tallies per-source counts for observability."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         c.handle_cross_consumer_signal("language", "concept_grounded", 1.0)
@@ -1996,7 +2021,7 @@ def test_p10_per_consumer_counter_tracked():
 def test_soar_phase3_dynamic_mapping_nudges_repeated_primitive():
     """Phase 3: when narrative_context.repeated_primitive is present, the
     signal nudges THAT primitive (not the static FORMULATE fallback)."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         # Baseline α+β for RECALL and FORMULATE before signal
@@ -2027,7 +2052,7 @@ def test_soar_phase3_dynamic_mapping_nudges_repeated_primitive():
 def test_soar_phase3_quality_below_neutral_penalizes_repetition():
     """Phase 3: dynamic mapping uses quality=0.35 (below 0.5 neutral),
     shifting the Beta posterior toward penalty (β grows more than α)."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         a0 = c._primitives["HYPOTHESIZE"].alpha
@@ -2049,7 +2074,7 @@ def test_soar_phase3_fallback_to_static_when_no_payload():
     """Phase 3 preserves backwards compatibility: if narrative_context is
     missing or repeated_primitive absent, the static {"FORMULATE": 0.5}
     fallback from Phase 2 applies (neutral observability nudge)."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         a0 = c._primitives["FORMULATE"].alpha
@@ -2067,7 +2092,7 @@ def test_soar_phase3_fallback_to_static_when_no_payload():
 def test_soar_phase3_ignores_invalid_repeated_primitive():
     """Phase 3: if payload has an unrecognized primitive name, fall back
     to static mapping rather than silently succeeding with no effect."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         a0_formulate = c._primitives["FORMULATE"].alpha
@@ -2089,7 +2114,7 @@ def test_drift_apply_increases_nudge_within_cap():
     """Positive-direction hint with sample count ≥ DRIFT_MIN_SAMPLES
     increases the quality_nudge for that (consumer, event, primitive) tuple,
     capped at DRIFT_MAX_PER_APPLY per call."""
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, SIGNAL_TO_PRIMITIVE, DRIFT_MAX_PER_APPLY)
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
@@ -2113,7 +2138,7 @@ def test_drift_apply_increases_nudge_within_cap():
 
 def test_drift_apply_decreases_nudge():
     """Direction=decrease reduces the quality_nudge."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer, SIGNAL_TO_PRIMITIVE
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer, SIGNAL_TO_PRIMITIVE
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         tup = ("meta_reasoning", "eureka")
@@ -2131,7 +2156,7 @@ def test_drift_apply_decreases_nudge():
 
 def test_drift_apply_skips_low_sample_hints():
     """Hints with N < DRIFT_MIN_SAMPLES are skipped (noise filter)."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         hints = [{
@@ -2147,7 +2172,7 @@ def test_drift_apply_skips_low_sample_hints():
 def test_drift_apply_rejects_unknown_tuples_and_primitives():
     """Hints referencing tuples/primitives absent from SIGNAL_TO_PRIMITIVE
     are rejected cleanly (no crash, skipped counter increments)."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         hints = [
@@ -2170,7 +2195,7 @@ def test_drift_apply_rejects_unknown_tuples_and_primitives():
 def test_drift_overrides_consulted_in_signal_handling():
     """After apply_drift_hints, subsequent handle_cross_consumer_signal
     uses the drifted quality_nudge instead of the static one."""
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, SIGNAL_TO_PRIMITIVE, P10_SIGNAL_WEIGHT)
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
@@ -2204,7 +2229,7 @@ def test_drift_overrides_consulted_in_signal_handling():
 def test_drift_overrides_persist_across_restart():
     """drift_overrides + applies_total + last_applied_ts survive
     save_state → fresh-consumer → _load_state cycle."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c1 = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         c1.apply_drift_hints([{
@@ -2227,7 +2252,7 @@ def test_drift_overrides_persist_across_restart():
 def test_drift_overrides_bounded_at_dmin_dmax():
     """Overrides clamp to [DRIFT_BOUND_MIN, DRIFT_BOUND_MAX] even under
     many successive applies pushing same direction."""
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, DRIFT_BOUND_MIN, DRIFT_BOUND_MAX)
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
@@ -2256,7 +2281,7 @@ def test_drift_overrides_bounded_at_dmin_dmax():
 
 def test_drift_get_stats_snapshot_shape():
     """get_drift_stats returns JSON-safe snapshot for /v4/meta-cgn/drift."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         c.apply_drift_hints([{
@@ -2279,7 +2304,7 @@ def test_drift_get_stats_snapshot_shape():
 def test_p11_export_kin_snapshot_has_correct_schema():
     """export_kin_snapshot returns v1 schema with primitives, hypotheses,
     protocol version."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp, titan_id="T1")
         # Give some grounding
@@ -2298,7 +2323,7 @@ def test_p11_export_kin_snapshot_has_correct_schema():
 def test_p11_import_kin_snapshot_adds_priors_at_scaled_strength():
     """Imported (α,β) contributions scaled by confidence_scale, merged into
     local posterior. V moves toward peer's V proportionally."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer, BETA_PARAM_FLOOR
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer, BETA_PARAM_FLOOR
     with tempfile.TemporaryDirectory() as tmp1, \
             tempfile.TemporaryDirectory() as tmp2:
         # T1 builds grounding
@@ -2325,7 +2350,7 @@ def test_p11_import_kin_snapshot_adds_priors_at_scaled_strength():
 
 def test_p11_import_kin_snapshot_rejects_unsupported_version():
     """Version mismatch aborts import cleanly."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp, titan_id="T2")
         result = c.import_kin_snapshot(
@@ -2337,7 +2362,7 @@ def test_p11_import_kin_snapshot_rejects_unsupported_version():
 
 def test_p11_import_kin_snapshot_rejects_self_import():
     """Titan must not import its own snapshot (would double-count native evidence)."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp, titan_id="T1")
         snap = c.export_kin_snapshot()
@@ -2348,7 +2373,7 @@ def test_p11_import_kin_snapshot_rejects_self_import():
 
 def test_p11_import_kin_snapshot_respects_disabled_failsafe():
     """Disabled consumer refuses import (safety)."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp, titan_id="T2")
         c._status = "disabled_failsafe"
@@ -2362,7 +2387,7 @@ def test_p11_import_kin_snapshot_respects_disabled_failsafe():
 
 def test_p11_import_kin_snapshot_merges_per_domain_entries():
     """by_domain entries from peer are merged at scaled strength."""
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp1, \
             tempfile.TemporaryDirectory() as tmp2:
         t1 = MetaCGNConsumer(send_queue=None, save_dir=tmp1, titan_id="T1")
@@ -2386,7 +2411,7 @@ def test_p11_import_kin_snapshot_merges_per_domain_entries():
 def test_haov_signal_entry_written():
     """handle_cross_consumer_signal writes an entry to the HAOV log."""
     import json as _json
-    from titan_plugin.logic.meta_cgn import (
+    from titan_hcl.logic.meta_cgn import (
         MetaCGNConsumer, SIGNAL_TO_PRIMITIVE)
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
@@ -2411,7 +2436,7 @@ def test_haov_signal_entry_written():
 def test_haov_chain_entry_written():
     """log_haov_chain writes a chain-outcome entry."""
     import json as _json
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         c.log_haov_chain(
@@ -2433,7 +2458,7 @@ def test_haov_log_rotates_at_cap():
     """Log rotation: when line cap hit, current becomes .archive, new file
     starts fresh. Prevents unbounded disk growth."""
     import json as _json
-    from titan_plugin.logic.meta_cgn import MetaCGNConsumer
+    from titan_hcl.logic.meta_cgn import MetaCGNConsumer
     with tempfile.TemporaryDirectory() as tmp:
         c = MetaCGNConsumer(send_queue=None, save_dir=tmp)
         c._haov_log_max_lines = 5  # Force early rotation for test

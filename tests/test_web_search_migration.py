@@ -15,14 +15,14 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from titan_plugin.logic.agency.helpers.web_search import WebSearchHelper
-from titan_plugin.logic.knowledge_backends import (
+from titan_hcl.logic.agency.helpers.web_search import WebSearchHelper
+from titan_hcl.logic.knowledge_backends import (
     BackendResult,
     fetch_searxng_raw,
 )
-from titan_plugin.logic.knowledge_cache import KnowledgeCache
-from titan_plugin.logic.knowledge_dispatcher import dispatch
-from titan_plugin.logic.knowledge_router import QueryType
+from titan_hcl.logic.knowledge_cache import KnowledgeCache
+from titan_hcl.logic.knowledge_dispatcher import dispatch
+from titan_hcl.logic.knowledge_router import QueryType
 
 
 def _patch_httpx_get(response_or_exc):
@@ -121,7 +121,7 @@ class TestRawDispatchMode:
     @pytest.mark.asyncio
     async def test_conceptual_uses_searxng_raw(self, cache):
         # Stub fetch_searxng_raw at the dispatcher's import location
-        from titan_plugin.logic import knowledge_dispatcher as kd
+        from titan_hcl.logic import knowledge_dispatcher as kd
         call_args = []
 
         async def fake_raw(topic, searxng_url="", max_results=5, timeout=10.0):
@@ -164,7 +164,7 @@ class TestRawDispatchMode:
     async def test_dictionary_unaffected_by_raw_flag(
             self, cache, monkeypatch):
         # raw_results shouldn't change behaviour for direct-REST backends
-        from titan_plugin.logic import knowledge_dispatcher as kd
+        from titan_hcl.logic import knowledge_dispatcher as kd
         hits = []
 
         async def mock_wikt(topic, timeout=10.0):
@@ -187,7 +187,7 @@ class TestRawDispatchMode:
 class TestWebSearchHelper:
     @pytest.mark.asyncio
     async def test_success_returns_legacy_shape(self, monkeypatch):
-        from titan_plugin.logic import knowledge_dispatcher as kd
+        from titan_hcl.logic import knowledge_dispatcher as kd
 
         async def fake_raw(topic, searxng_url="", max_results=5, timeout=10.0):
             return BackendResult(
@@ -230,7 +230,7 @@ class TestWebSearchHelper:
 
     @pytest.mark.asyncio
     async def test_cache_hit_reflected_in_enrichment(self, monkeypatch):
-        from titan_plugin.logic import knowledge_dispatcher as kd
+        from titan_hcl.logic import knowledge_dispatcher as kd
 
         call_count = 0
 

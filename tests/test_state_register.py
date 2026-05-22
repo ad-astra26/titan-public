@@ -9,7 +9,7 @@ Style mirrors tests/test_t1_coherence_observables.py.
 """
 import pytest
 
-from titan_plugin.logic.state_register import OuterState, _pad_to
+from titan_hcl.logic.state_register import OuterState, _pad_to
 
 
 # ── _pad_to helper ──────────────────────────────────────────────────
@@ -177,7 +177,7 @@ def test_state_snapshot_payload_has_four_dim_keys():
 
     reg._bus = MockBus()
     # Emulate one iteration of _snapshot_publish_loop's body.
-    from titan_plugin.bus import make_msg
+    from titan_hcl.bus import make_msg
 
     snapshot_30dt = reg.get_full_30dt()
     extended = reg.get_full_extended()

@@ -21,7 +21,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("torchrl")
 
-from titan_plugin.core.sage.recorder import (  # noqa: E402
+from titan_hcl.core.sage.recorder import (  # noqa: E402
     DEFAULT_BUFFER_SIZE,
     SageRecorder,
     _LAZY_SENTINEL,

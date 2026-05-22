@@ -26,7 +26,7 @@ from scripts.learning.api_helpers import (
 )
 
 DB_PATH = "data/inner_memory.db"
-from titan_plugin.logic.composition_engine import CompositionEngine
+from titan_hcl.logic.composition_engine import CompositionEngine
 
 logger = logging.getLogger("testsuite.composition")
 

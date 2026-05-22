@@ -1,4 +1,4 @@
-//! unified_spirit — Full Rust port of `titan_plugin/logic/unified_spirit.py`.
+//! unified_spirit — Full Rust port of `titan_hcl/logic/unified_spirit.py`.
 //!
 //! Per SPEC §10.F G12 (SPIRIT cannot move backward) + §11.H.1 critical-data
 //! row + Decision Log D-SPEC-26 (lives inside unified-spirit-rs).
@@ -640,6 +640,54 @@ impl UnifiedSpirit {
     /// Read the last alignment from `micro_enrich`.
     pub fn last_alignment(&self) -> f64 {
         self.last_alignment
+    }
+
+    /// Phase B: msgpack-serializable snapshot for `unified_spirit_metadata.bin`
+    /// SHM slot (rFP_phase_c_state_read_unification §B / D-SPEC-72). Mirrors
+    /// Python `UnifiedSpirit.get_stats()` 1:1 — pre-Phase-B the Python wrapper
+    /// computed this against an in-Python instance of UnifiedSpirit; post
+    /// Phase B the Rust instance is the canonical source.
+    pub fn get_stats(&self, ts: f64) -> crate::metadata_publisher::UnifiedSpiritMetadata {
+        use crate::metadata_publisher::{UnifiedSpiritConfigSummary, UnifiedSpiritMetadata};
+        use titan_core::constants::UNIFIED_SPIRIT_METADATA_SCHEMA_VERSION;
+
+        // Python parity rounds — match precision exactly so consumers
+        // post-ownership-flip see byte-identical msgpack output.
+        let r4 = |v: f64| (v * 1e4).round() / 1e4;
+        let r6 = |v: f64| (v * 1e6).round() / 1e6;
+
+        let tensor_mag = r4(tensor_magnitude_arr(&self.tensor));
+        let tensor_sum: f64 = r4(self.tensor.iter().sum());
+
+        // Clone full GreatEpoch (all 10 fields) — matches Python
+        // `GreatEpoch.to_dict()` 1:1 (no simplification).
+        let latest_epoch = self.epochs.last().cloned();
+
+        UnifiedSpiritMetadata {
+            epoch_count: self.epochs.len(),
+            current_epoch_id: self.current_epoch_id,
+            velocity: r4(self.current_velocity),
+            is_stale: self.is_stale,
+            consecutive_stale: self.consecutive_stale,
+            stale_focus_multiplier: r4(self.stale_focus_multiplier()),
+            tensor_magnitude: tensor_mag,
+            tensor_sum,
+            latest_epoch,
+            cumulative_quality: r4(self.cumulative_quality),
+            micro_tick_count: self.micro_tick_count,
+            last_alignment: r4(self.last_alignment),
+            enrichment_rate: self.config.enrichment_rate,
+            full_130dt: self.tensor.iter().map(|v| r6(*v)).collect(),
+            config: UnifiedSpiritConfigSummary {
+                stale_threshold: self.config.stale_threshold,
+                enrichment_base: self.config.enrichment_base,
+                velocity_window: self.config.velocity_window,
+                enrichment_rate: self.config.enrichment_rate,
+                min_alignment_threshold: self.config.min_alignment_threshold,
+            },
+            schema_version: UNIFIED_SPIRIT_METADATA_SCHEMA_VERSION as u32,
+            ts,
+        }
     }
 
     // ── Persistence ────────────────────────────────────────────────────

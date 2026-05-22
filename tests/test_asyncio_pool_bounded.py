@@ -3,18 +3,18 @@
 Closes a load-bearing contributor to BUG-PARENT-MEMORY-LEAK-HOST-OOM-20260428:
 pre-V6 hardcoded max_workers=64 → V6 microkernel-aware max_workers=16.
 
-See `_resolve_asyncio_pool_size` in scripts/titan_main.py and
+See `_resolve_asyncio_pool_size` in scripts/titan_hcl.py and
 rFP_microkernel_phase_a8_l2_l3_residency_completion §A.8.2 §3.4.
 """
 import os
 import sys
 
-# Make scripts/ importable so we can pull `_resolve_asyncio_pool_size` from titan_main.py
+# Make scripts/ importable so we can pull `_resolve_asyncio_pool_size` from titan_hcl.py
 _SCRIPTS = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
-from titan_main import _resolve_asyncio_pool_size  # noqa: E402
+from titan_hcl import _resolve_asyncio_pool_size  # noqa: E402
 
 
 def test_default_returns_bounded_16_when_no_config():

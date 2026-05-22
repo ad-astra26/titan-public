@@ -282,7 +282,7 @@ async def compose_sentence(client: httpx.AsyncClient, max_level: int = 5,
 
     # Fallback: local composition using vocabulary from DB + state from API
     try:
-        from titan_plugin.logic.composition_engine import CompositionEngine
+        from titan_hcl.logic.composition_engine import CompositionEngine
         # Load vocabulary directly from DB (API endpoint may not exist)
         vocab = await get_vocabulary(client)
         if not vocab:
@@ -697,7 +697,7 @@ async def run_phase_3(client: httpx.AsyncClient,
 
     Exit: >80% confidence → advance to Phase 4
     """
-    from titan_plugin.logic.grammar_validator import GrammarValidator
+    from titan_hcl.logic.grammar_validator import GrammarValidator
     grammar = GrammarValidator()
 
     profile = profile or TITAN1_PROFILE
@@ -815,7 +815,7 @@ async def run_phase_4(client: httpx.AsyncClient,
 
     LLM is NEVER used for generation. Optional evaluator runs post-hoc for science.
     """
-    from titan_plugin.logic.grammar_validator import GrammarValidator
+    from titan_hcl.logic.grammar_validator import GrammarValidator
     grammar = GrammarValidator()
 
     profile = profile or TITAN1_PROFILE
@@ -912,8 +912,11 @@ async def run_phase_5_dialogue_test(client: httpx.AsyncClient,
     attempts to compose a response from felt-state using DialogueComposer.
     Measures: composition rate, confidence, intent accuracy.
     """
-    from titan_plugin.logic.dialogue_composer import DialogueComposer
-    composer = DialogueComposer()
+    # D-SPEC-72 (SPEC v1.17.0 §9.F.2) — route through llm_pipeline.compose_pre
+    # with caller-provided state overrides since this batch script already
+    # holds felt_state + vocabulary in-memory per loop iteration (auto-gather
+    # would refetch from DBs per call — wasteful in batch context).
+    from titan_hcl import llm_pipeline
 
     profile = profile or TITAN1_PROFILE
     personas = profile.get("personas", ["Jake", "Jane"])
@@ -963,18 +966,20 @@ async def run_phase_5_dialogue_test(client: httpx.AsyncClient,
         state_vec = state.get("state_vector", [0.5] * 130)
         vocab = await get_vocabulary(client)
 
-        # Try to compose response
+        # Try to compose response — pass pre-fetched state via override params
         total_count += 1
-        result = composer.compose_response(
+        result = await llm_pipeline.compose_pre(
+            message,
+            user_id=persona,
             felt_state=state_vec,
             vocabulary=vocab,
             hormone_shifts=hormone_shifts,
         )
 
-        if result["composed"]:
+        if result.composed:
             composed_count += 1
             log.info("[Phase 5] ★ COMPOSED: '%s' (intent=%s, conf=%.2f)",
-                     result["response"], result["intent"], result["confidence"])
+                     result.pre_text, result.intent, result.confidence)
         else:
             log.info("[Phase 5] ✗ Fallback needed (LLM said: '%s')",
                      str(llm_response)[:80])
@@ -1019,7 +1024,7 @@ async def run_phase_6_narrative_test(client: httpx.AsyncClient,
 
     Composes narratives at various triggers, measures coherence and confidence.
     """
-    from titan_plugin.logic.narrative_composer import NarrativeComposer
+    from titan_hcl.logic.narrative_composer import NarrativeComposer
     narrator = NarrativeComposer()
 
     log.info("═══ PHASE 6 TEST: Narrative Composition (%d narratives) ═══",

@@ -13,8 +13,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from titan_plugin.logic.backup import RebirthBackup
-from titan_plugin.logic.backup_chain import (
+from titan_hcl.logic.backup import RebirthBackup
+from titan_hcl.logic.backup_chain import (
     read_chain,
     verify_chain,
     verify_chain_file,
@@ -203,8 +203,8 @@ def test_anchor_emits_v2_memo_with_prev_genesis(tmp_path):
         captured_memo["text"] = text
         return MagicMock()
 
-    with patch("titan_plugin.utils.solana_client.build_memo_instruction", side_effect=_build_memo), \
-         patch("titan_plugin.utils.solana_client.is_available", return_value=True):
+    with patch("titan_hcl.utils.solana_client.build_memo_instruction", side_effect=_build_memo), \
+         patch("titan_hcl.utils.solana_client.is_available", return_value=True):
         sig = asyncio.run(b.anchor_backup_hash(
             archive_hash="abc123" * 10 + "defg",
             size_mb=25.0, backup_type="personality"))
@@ -233,8 +233,8 @@ def test_anchor_second_entry_references_first(tmp_path):
         memos.append(text)
         return MagicMock()
 
-    with patch("titan_plugin.utils.solana_client.build_memo_instruction", side_effect=_build), \
-         patch("titan_plugin.utils.solana_client.is_available", return_value=True):
+    with patch("titan_hcl.utils.solana_client.build_memo_instruction", side_effect=_build), \
+         patch("titan_hcl.utils.solana_client.is_available", return_value=True):
         h1 = "a" * 64
         asyncio.run(b.anchor_backup_hash(h1, 25.0, "personality"))
         h2 = "b" * 64
@@ -257,8 +257,8 @@ def test_anchor_no_chain_append_when_tx_fails(tmp_path):
     b.network.pubkey = MagicMock()
     b.network.send_sovereign_transaction = AsyncMock(return_value=None)
 
-    with patch("titan_plugin.utils.solana_client.build_memo_instruction", return_value=MagicMock()), \
-         patch("titan_plugin.utils.solana_client.is_available", return_value=True):
+    with patch("titan_hcl.utils.solana_client.build_memo_instruction", return_value=MagicMock()), \
+         patch("titan_hcl.utils.solana_client.is_available", return_value=True):
         sig = asyncio.run(b.anchor_backup_hash("a" * 64, 25.0, "personality"))
 
     assert sig is None

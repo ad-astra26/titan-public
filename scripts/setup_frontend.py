@@ -285,7 +285,7 @@ def main():
     print(f"   # Frontend (port {args.frontend_port}):")
     print(f"   cd {PROJECT_ROOT / 'titan-observatory'} && npm run build && npm start")
     print(f"   # API (port {args.api_port}):")
-    print("   # Start via your Titan plugin / titan_main.py")
+    print("   # Start via your Titan plugin / titan_hcl.py")
     print()
 
     if ssl:

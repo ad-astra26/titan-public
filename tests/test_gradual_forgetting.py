@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 
-from titan_plugin.core.memory import (
+from titan_hcl.core.memory import (
     TieredMemoryGraph,
     _MEMPOOL_DECAY_K,
     _MEMPOOL_HALF_LIFE_HOURS,
@@ -28,7 +28,7 @@ from titan_plugin.core.memory import (
 @pytest.fixture
 def memory():
     """Fresh TieredMemoryGraph with mocked Cognee."""
-    with patch("titan_plugin.core.memory.TieredMemoryGraph._ensure_cognee", new_callable=AsyncMock, return_value=False):
+    with patch("titan_hcl.core.memory.TieredMemoryGraph._ensure_cognee", new_callable=AsyncMock, return_value=False):
         mg = TieredMemoryGraph(config={})
     return mg
 
@@ -36,7 +36,7 @@ def memory():
 @pytest.fixture
 def memory_with_embeddings():
     """TieredMemoryGraph with fastembed available."""
-    with patch("titan_plugin.core.memory.TieredMemoryGraph._ensure_cognee", new_callable=AsyncMock, return_value=False):
+    with patch("titan_hcl.core.memory.TieredMemoryGraph._ensure_cognee", new_callable=AsyncMock, return_value=False):
         mg = TieredMemoryGraph(config={})
     return mg
 

@@ -9,7 +9,7 @@
 //!
 //! # Substrate-scoped chi vs Python `LifeForceEngine`
 //!
-//! Python's `titan_plugin/logic/life_force.py::LifeForceEngine` computes a
+//! Python's `titan_hcl/logic/life_force.py::LifeForceEngine` computes a
 //! richer chi from L2-only signals (vocabulary, sovereignty, sol_balance,
 //! anchor freshness, expression rate, etc.) — those signals are owned by
 //! Python L2 modules and are not visible to the substrate. The substrate's
@@ -29,9 +29,7 @@
 //! reads chi_state.bin as a substrate-scoped baseline + augments with its
 //! own L2 inputs.
 
-use titan_core::constants::{
-    CHI_STATE_FIELD_COUNT, CHI_STATE_PAYLOAD_BYTES, NEUROMOD_FIELD_COUNT,
-};
+use titan_core::constants::{CHI_STATE_FIELD_COUNT, CHI_STATE_PAYLOAD_BYTES, NEUROMOD_FIELD_COUNT};
 
 use crate::sphere_clocks::SphereClockSet;
 use crate::topology::{l2_norm, BODY_5D, MIND_15D, MIND_WILLING_RANGE, SPIRIT_45D};
@@ -45,7 +43,12 @@ const W_SPIRIT: f32 = 0.40;
 const W_MIND: f32 = 0.35;
 const W_BODY: f32 = 0.25;
 // Sanity: weights sum to 1.0 (spirit-heavy mature trinity per Python's terminus).
-const _: () = assert!((W_SPIRIT + W_MIND + W_BODY - 1.0).abs() < 1e-6);
+// Squared-tolerance form avoids `f32::abs()` which isn't `const fn` until
+// Rust 1.85 (workspace MSRV is 1.75). Equivalent: |d| < 1e-6  ⟺  d² < 1e-12.
+const _: () = {
+    let d = W_SPIRIT + W_MIND + W_BODY - 1.0;
+    assert!(d * d < 1e-12);
+};
 
 /// Trinity-magnitude normalization scale: `BODY_5D=5` so theoretical max
 /// L2 norm of [1.0; 5] is √5 ≈ 2.236. Normalize by √5 to get [0,1] range
@@ -121,12 +124,10 @@ impl ChiState {
 
         // Mind willing dims [10..15] feed the magnitude — matches lower
         // topology compute (Preamble G10).
-        let inner_mind_willing: [f32; BODY_5D] = std::array::from_fn(|i| {
-            inputs.inner_mind_15d[MIND_WILLING_RANGE.start + i]
-        });
-        let outer_mind_willing: [f32; BODY_5D] = std::array::from_fn(|i| {
-            inputs.outer_mind_15d[MIND_WILLING_RANGE.start + i]
-        });
+        let inner_mind_willing: [f32; BODY_5D] =
+            std::array::from_fn(|i| inputs.inner_mind_15d[MIND_WILLING_RANGE.start + i]);
+        let outer_mind_willing: [f32; BODY_5D] =
+            std::array::from_fn(|i| inputs.outer_mind_15d[MIND_WILLING_RANGE.start + i]);
         let mind_inner_mag = l2_norm(&inner_mind_willing) / MIND_NORM;
         let mind_outer_mag = l2_norm(&outer_mind_willing) / MIND_NORM;
         let mind_mag = ((mind_inner_mag + mind_outer_mag) * 0.5).clamp(0.0, 1.0);
@@ -161,10 +162,8 @@ impl ChiState {
         // Spirit truncated to first 5 dims for cross-cosine — full 45D is
         // dimensionally incompatible with body/mind. Spirit is its own
         // axis; we sample the first 5 for the matrix off-diagonal.
-        let spirit_head_inner: [f32; BODY_5D] =
-            std::array::from_fn(|i| inputs.inner_spirit_45d[i]);
-        let spirit_head_outer: [f32; BODY_5D] =
-            std::array::from_fn(|i| inputs.outer_spirit_45d[i]);
+        let spirit_head_inner: [f32; BODY_5D] = std::array::from_fn(|i| inputs.inner_spirit_45d[i]);
+        let spirit_head_outer: [f32; BODY_5D] = std::array::from_fn(|i| inputs.outer_spirit_45d[i]);
         let spirit_avg = avg_pair(&spirit_head_inner, &spirit_head_outer);
 
         let cos_bm = cosine_similarity(&body_avg, &mind_willing_avg);
@@ -274,8 +273,7 @@ mod tests {
             urgency: 6.0,
         };
         let bytes = chi.serialize();
-        let read_f32 =
-            |off: usize| f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        let read_f32 = |off: usize| f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
         assert_eq!(read_f32(0), 1.0);
         assert_eq!(read_f32(4), 2.0);
         assert_eq!(read_f32(8), 3.0);
@@ -500,5 +498,4 @@ mod tests {
     fn weights_sum_to_unity() {
         assert!((W_SPIRIT + W_MIND + W_BODY - 1.0).abs() < 1e-6);
     }
-
 }

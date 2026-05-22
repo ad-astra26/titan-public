@@ -10,11 +10,11 @@ import os
 
 import pytest
 
-from titan_plugin.maker import (
+from titan_hcl.maker import (
     MakerResponse, ProposalRecord, ProposalStatus, ProposalStore, ProposalType,
     TitanMaker,
 )
-from titan_plugin.maker.schemas import validate_reason
+from titan_hcl.maker.schemas import validate_reason
 
 
 # ── Schemas ──────────────────────────────────────────────────────
@@ -388,7 +388,7 @@ class TestTitanMaker:
         tm = TitanMaker(proposal_store=store, maker_pubkey=maker_pubkey_b58)
 
         # Monkeypatch the contracts dir resolution by creating a real proposal
-        # and then asserting the file gets written under titan_plugin/contracts/.
+        # and then asserting the file gets written under titan_hcl/contracts/.
         # To keep the test hermetic, monkeypatch _on_contract_bundle_approved
         # to use tmp_path instead of the package path.
         original = tm._on_contract_bundle_approved

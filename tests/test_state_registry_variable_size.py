@@ -15,14 +15,14 @@ Covers:
 
 Reference:
   - titan-docs/PLAN_microkernel_phase_a_s4.md §3 D11 + §4.0 + §5.4
-  - titan_plugin/core/state_registry.py write_variable / read_variable
+  - titan_hcl/core/state_registry.py write_variable / read_variable
 """
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from titan_plugin.core.state_registry import (
+from titan_hcl.core.state_registry import (
     HEADER_SIZE,
     RegistrySpec,
     StateRegistryReader,

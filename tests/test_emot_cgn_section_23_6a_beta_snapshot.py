@@ -10,7 +10,7 @@ import pytest
 
 def test_cgn_beta_snapshot_bus_message_exists():
     """The new bus message type is registered."""
-    from titan_plugin.bus import CGN_BETA_SNAPSHOT
+    from titan_hcl.bus import CGN_BETA_SNAPSHOT
     assert CGN_BETA_SNAPSHOT == "CGN_BETA_SNAPSHOT"
 
 
@@ -18,7 +18,7 @@ def test_cgn_beta_states_removed_from_known_deferred():
     """Dead-dim detector no longer annotates cgn_beta_states as expected-dead.
     After §23.6a ships, the group is populated by CGN_BETA_SNAPSHOT → WARN
     fires only if the producer path actually breaks."""
-    from titan_plugin.logic.emot_region_clusterer import RegionClusterer
+    from titan_hcl.logic.emot_region_clusterer import RegionClusterer
     assert "cgn_beta_states" not in RegionClusterer._KNOWN_DEFERRED_GROUPS, \
         "cgn_beta_states should be removed from _KNOWN_DEFERRED_GROUPS post-§23.6a"
 
@@ -27,7 +27,7 @@ def test_emot_cgn_worker_handles_cgn_beta_snapshot():
     """Static source check — the CGN_BETA_SNAPSHOT handler is wired in
     emot_cgn_worker main loop + writes to last_cgn_beta_states_8d."""
     from pathlib import Path
-    src = (Path(__file__).parent.parent / "titan_plugin" / "modules"
+    src = (Path(__file__).parent.parent / "titan_hcl" / "modules"
            / "emot_cgn_worker.py").read_text()
     assert 'elif msg_type == "CGN_BETA_SNAPSHOT"' in src, \
         "emot_cgn_worker must have CGN_BETA_SNAPSHOT handler"
@@ -40,7 +40,7 @@ def test_cgn_worker_emits_cgn_beta_snapshot():
     """Static source check — cgn_worker emits CGN_BETA_SNAPSHOT at the
     same snapshot interval as CGN_STATE_SNAPSHOT."""
     from pathlib import Path
-    src = (Path(__file__).parent.parent / "titan_plugin" / "modules"
+    src = (Path(__file__).parent.parent / "titan_hcl" / "modules"
            / "cgn_worker.py").read_text()
     assert 'CGN_BETA_SNAPSHOT' in src, \
         "cgn_worker must emit CGN_BETA_SNAPSHOT"
@@ -53,7 +53,7 @@ def test_cgn_worker_emits_cgn_beta_snapshot():
 def test_cgn_beta_snapshot_values_ordered_by_cgn_consumers():
     """End-to-end sim: simulate a CGN_BETA_SNAPSHOT arriving at the handler
     and verify the 8D array is ordered per CGN_CONSUMERS layout."""
-    from titan_plugin.logic.emot_bundle_protocol import CGN_CONSUMERS
+    from titan_hcl.logic.emot_bundle_protocol import CGN_CONSUMERS
     assert len(CGN_CONSUMERS) == 8
     assert CGN_CONSUMERS == [
         "language", "social", "knowledge", "reasoning",
@@ -79,7 +79,7 @@ def test_cgn_beta_snapshot_values_ordered_by_cgn_consumers():
 def test_cgn_beta_snapshot_missing_consumer_defaults_to_05():
     """If a consumer is missing from payload (e.g. not registered), its
     slot defaults to 0.5 (neutral) so the 8D vector never has NaN/None."""
-    from titan_plugin.logic.emot_bundle_protocol import CGN_CONSUMERS
+    from titan_hcl.logic.emot_bundle_protocol import CGN_CONSUMERS
 
     # Partial payload — only 3 of 8 consumers
     v_by = {"language": 0.7, "meta": 0.4, "knowledge": 0.6}
@@ -99,7 +99,7 @@ def test_bug12_spirit_worker_dead_forward_removed():
     """BUG #12 fix: spirit_worker no longer tries to forward
     CGN_CROSS_INSIGHT to meta_engine._emot_cgn (dead since Phase 1.6h)."""
     from pathlib import Path
-    src = (Path(__file__).parent.parent / "titan_plugin" / "modules"
+    src = (Path(__file__).parent.parent / "titan_hcl" / "modules"
            / "spirit_worker.py").read_text()
     # The dead forward pattern should no longer exist
     assert "_emot.handle_incoming_cross_insight" not in src, \

@@ -12,8 +12,8 @@ import tempfile
 import numpy as np
 import pytest
 
-from titan_plugin.logic.meta_autoencoder import MetaAutoencoder
-from titan_plugin.logic.meta_reasoning import MetaChainState, MetaReasoningEngine
+from titan_hcl.logic.meta_autoencoder import MetaAutoencoder
+from titan_hcl.logic.meta_reasoning import MetaChainState, MetaReasoningEngine
 
 
 class _FakeMetaReasoning:

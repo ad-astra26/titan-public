@@ -8,7 +8,7 @@
 //!
 //! # Byte-identical port (per SPEC §11.6)
 //!
-//! Implementation matches `titan_plugin/logic/sphere_clock.py:46-179`:
+//! Implementation matches `titan_hcl/logic/sphere_clock.py:46-179`:
 //!   - Each clock's scalar contracts at velocity = `base_speed × max(min_velocity_factor, coherence)`
 //!   - Pulse fires when scalar reaches center (≤ 0.0)
 //!   - On pulse: balanced → radius shrinks (faster future cadence); unbalanced → radius grows
@@ -43,7 +43,15 @@ pub const DEFAULT_MIN_RADIUS: f32 = 0.3;
 /// Radius shrink rate per balanced pulse (faster future cadence reward).
 pub const DEFAULT_PULSE_SHRINK_RATE: f32 = 0.02;
 /// Coherence threshold above which a clock counts as "balanced" (1.0 - threshold).
-pub const DEFAULT_BALANCE_THRESHOLD: f32 = 0.20;
+///
+/// 2026-05-18 calibrated 0.20 → 0.30 (threshold 0.80 → 0.70) per Maker decision
+/// after D-SPEC-84 variance-formula restoration revealed that real-world Titan
+/// tensor variance (5D body / 15D mind / 45D spirit) rarely produces coherence
+/// ≥ 0.80 — natural distribution sits 0.50–0.75. Threshold 0.70 lets balanced
+/// pulses fire periodically across all 6 layers without forcing artificial
+/// tensor flattening. Python parity: `sphere_clock.py:36 DEFAULT_BALANCE_THRESHOLD`
+/// matched. SPEC §G11 records this calibration.
+pub const DEFAULT_BALANCE_THRESHOLD: f32 = 0.30;
 /// Floor on velocity factor — even max-imbalanced clocks contract at 15% speed.
 pub const DEFAULT_MIN_VELOCITY_FACTOR: f32 = 0.15;
 

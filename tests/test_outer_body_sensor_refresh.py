@@ -1,5 +1,5 @@
 """
-Tests for ``titan_plugin.logic.outer_body_sensor_refresh``.
+Tests for ``titan_hcl.logic.outer_body_sensor_refresh``.
 
 Covers:
   1. Slot bytes round-trip — write a synthetic source-dict, read shm,
@@ -27,12 +27,17 @@ import msgpack
 import numpy as np
 import pytest
 
-from titan_plugin._phase_c_constants import (
+from titan_hcl._phase_c_constants import (
     OUTER_BODY_TICK_BASE_S,
     OUTER_SENSOR_CACHE_BODY_MAX_BYTES,
 )
-from titan_plugin.core.state_registry import HEADER_SIZE, HEADER_STRUCT
-from titan_plugin.logic.outer_body_sensor_refresh import (
+from titan_hcl.core.state_registry import (
+    BUFFER_META_SIZE,
+    HEADER_SIZE,
+    HEADER_STRUCT,
+    _unpack_header_seq,
+)
+from titan_hcl.logic.outer_body_sensor_refresh import (
     MAX_PAYLOAD_BYTES,
     REFRESH_PERIOD_S,
     SLOT_NAME,
@@ -52,13 +57,25 @@ def shm_root(tmp_path, monkeypatch):
 
 
 def _read_slot_payload(shm_path: Path) -> tuple[int, int, int, bytes]:
-    """Read header + payload from a sensor_cache_*.bin file. Returns (seq, schema, wall_ns, payload_bytes)."""
+    """Read header + payload from v1.0.0 triple-buffer slot.
+
+    Returns (version, schema, wall_ns, payload) — `version` is the
+    monotonically-incrementing publish counter extracted from header_seq.
+    """
     raw = shm_path.read_bytes()
-    seq, schema, wall_ns, payload_bytes, _crc = struct.unpack(
+    header_seq, schema, payload_cap = struct.unpack(
         HEADER_STRUCT, raw[:HEADER_SIZE]
     )
-    payload = bytes(raw[HEADER_SIZE:HEADER_SIZE + payload_bytes])
-    return seq, schema, wall_ns, payload
+    version, ready_idx = _unpack_header_seq(header_seq)
+    buf_block_sz = BUFFER_META_SIZE + payload_cap
+    off = HEADER_SIZE + ready_idx * buf_block_sz
+    wall_ns, payload_bytes, _crc = struct.unpack(
+        "<QII", raw[off:off + BUFFER_META_SIZE]
+    )
+    payload = bytes(
+        raw[off + BUFFER_META_SIZE : off + BUFFER_META_SIZE + payload_bytes]
+    )
+    return version, schema, wall_ns, payload
 
 
 def _make_sources(sol_balance: float = 1.5) -> dict:
@@ -180,9 +197,10 @@ def test_oversize_payload_skipped(shm_root):
     assert sidecar.oversize_failure_count == 1
     assert sidecar.last_payload_bytes == 0  # no write happened
 
-    # Slot should still exist (created by writer init) but seq=0 (no write)
+    # v1.0.0 triple-buffer init publishes a zero-payload snapshot at seq=1;
+    # oversize skip means no further publish — seq retained at 1.
     seq, _, _, _ = _read_slot_payload(shm_root / f"{SLOT_NAME}.bin")
-    assert seq == 0
+    assert seq == 1
 
     sidecar._writer.close()
 
@@ -252,7 +270,7 @@ async def test_restart_on_inner_crash(shm_root, monkeypatch):
     monkeypatch.setattr(OuterBodySensorRefresh, "_refresh_loop", flaky_loop)
     # Shrink restart backoff so test runs fast
     monkeypatch.setattr(
-        "titan_plugin.logic.outer_body_sensor_refresh._RESTART_BACKOFF_S", 0.05
+        "titan_hcl.logic.outer_body_sensor_refresh._RESTART_BACKOFF_S", 0.05
     )
 
     sidecar = OuterBodySensorRefresh(

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import gc
 
-from titan_plugin.core.profiler import take_heap_snapshot
+from titan_hcl.core.profiler import take_heap_snapshot
 
 
 def test_schema_keys_present():

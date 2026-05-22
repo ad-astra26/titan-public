@@ -32,7 +32,7 @@ GRADUATING = {
     # FAISS/DuckDB/timechain-state/region-buffer state in-process across
     # kernel swap. Architectural fix vs the "bump SHADOW_BOOT_TIMEOUT"
     # smell when workers re-load heavy state in shadow.
-    "memory", "timechain", "emot_cgn", "rl",
+    "memory", "timechain", "emot_cgn", "recorder",
 }
 
 # Workers that MUST stay fork-mode under spawn_graduated_workers_enabled.
@@ -48,9 +48,10 @@ NON_GRADUATING = {
     "social_graph_writer", "events_teacher_writer", "consciousness_writer",
 }
 
+# core/plugin.py is the sole ModuleSpec registration site (legacy_core.py /
+# TitanCore retired 2026-05-21 / D-SPEC-106).
 PLUGIN_FILES = [
-    Path(__file__).parent.parent / "titan_plugin" / "core" / "plugin.py",
-    Path(__file__).parent.parent / "titan_plugin" / "legacy_core.py",
+    Path(__file__).parent.parent / "titan_hcl" / "core" / "plugin.py",
 ]
 
 
@@ -170,7 +171,7 @@ def test_titan_params_flag_documented_default_off():
     active E2E testing (codified per session log) — but the documentation
     of the default must always say OFF, so any new deploy starts safe.
     """
-    p = Path(__file__).parent.parent / "titan_plugin" / "titan_params.toml"
+    p = Path(__file__).parent.parent / "titan_hcl" / "titan_params.toml"
     txt = p.read_text()
     # Find the relevant comment block
     idx = txt.find("spawn_graduated_workers_enabled")
@@ -190,8 +191,8 @@ def test_titan_params_flag_documented_default_off():
 
 def test_runtime_flag_off_keeps_workers_in_fork_mode():
     """When _spawn_grad=False, all 9 graduating workers register as fork."""
-    from titan_plugin import bus as bus_mod
-    from titan_plugin.guardian import Guardian, ModuleSpec
+    from titan_hcl import bus as bus_mod
+    from titan_hcl.guardian import Guardian, ModuleSpec
 
     div = bus_mod.DivineBus(maxsize=100)
     g = Guardian(div)
@@ -210,8 +211,8 @@ def test_runtime_flag_off_keeps_workers_in_fork_mode():
 
 def test_runtime_flag_on_flips_workers_to_spawn():
     """When _spawn_grad=True, all 9 graduating workers register as spawn."""
-    from titan_plugin import bus as bus_mod
-    from titan_plugin.guardian import Guardian, ModuleSpec
+    from titan_hcl import bus as bus_mod
+    from titan_hcl.guardian import Guardian, ModuleSpec
 
     div = bus_mod.DivineBus(maxsize=100)
     g = Guardian(div)

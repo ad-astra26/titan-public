@@ -8,7 +8,7 @@
 //! # Modules
 //!
 //! - [`error`] — `DaemonError` + `Result<T>` for the whole crate.
-//! - [`ground_up`] — 1:1 port of `titan_plugin/logic/ground_up.py`.
+//! - [`ground_up`] — 1:1 port of `titan_hcl/logic/ground_up.py`.
 //!   Applies grounding nudges from lower topology to body[0:5] (full)
 //!   + mind willing[10:15] (per SPEC G10).
 //!
@@ -62,12 +62,16 @@ pub mod subscriptions;
 // ── C-S6 outer-side additions (per master plan §7 + PLAN §3.4) ──
 //
 // `tick.rs` ships `SchumannTicker` for inner-trinity (Schumann-locked,
-// SPEC G13). Outer trinity is NOT Schumann-locked per SPEC §18.1 —
-// outer daemons run at jittered seconds-scale cadences. The 3 modules
-// below provide the outer-specific helpers; inner daemons keep using
-// SchumannTicker / existing slot_io / filter_apply / ground_up unchanged.
+// SPEC G13). Post-A.S8 D2 the outer daemons are ALSO Schumann-locked
+// (each ticks via SchumannGenerator at its role's Schumann harmonic);
+// OUTER_*_TICK_BASE_S now drives only the Python sensor-sidecar
+// source-refresh cadence + the 3× stale threshold (D-SPEC-100). The
+// modules below provide the outer-specific helpers; inner daemons keep
+// using SchumannTicker / existing slot_io / filter_apply / ground_up
+// unchanged. (The pre-D2 `jittered_tick` ticker was removed D-SPEC-100
+// as dead code — never wired into any daemon main loop.)
 
-pub mod jittered_tick;
+pub mod homeostasis;
 pub mod observer_mask;
 pub mod publish_throttle;
 pub mod sensor_cache_read;
@@ -90,6 +94,10 @@ pub use crate::ground_up::{
     GroundUpEnricher, GroundUpNudge, Side, GROUND_UP_DEFAULT_DAMPING, GROUND_UP_DEFAULT_STRENGTH,
     GROUND_UP_MAX_NUDGE,
 };
+pub use crate::homeostasis::{
+    gradient, observe, stateful_update, Layer, LayerObs, RestoringCfg, CENTRE, DEFAULT_K_COHESION,
+    DEFAULT_K_DRIVE, DEFAULT_K_MOMENTUM, DEFAULT_K_RESTORE,
+};
 pub use crate::slot_io::{
     decode_floats, encode_floats, open_slot, read_dim_slice, read_topology_inner_lower,
     read_topology_outer_lower, read_topology_whole, write_dim_slice,
@@ -101,8 +109,7 @@ pub use crate::subscriptions::{
     OUTER_SPIRIT_TOPICS,
 };
 
-// ── C-S6 re-exports (jittered cadence + observer mask + sensor cache) ──
-pub use crate::jittered_tick::{scale_period, JitteredTickEvent, JitteredTicker};
+// ── C-S6 re-exports (observer mask + sensor cache) ──
 pub use crate::observer_mask::{
     extract_outer_spirit_content, mask_observer_dims_in_place, observer_dims_are_zero,
     CONTENT_DIM_COUNT, OBSERVER_BYTE_END, OBSERVER_BYTE_START, OBSERVER_DIM_COUNT,

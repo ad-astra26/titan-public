@@ -18,7 +18,7 @@ import time
 
 import pytest
 
-from titan_plugin.core.bus_socket import (
+from titan_hcl.core.bus_socket import (
     BusSocketClient,
     BusSocketServer,
 )
@@ -70,8 +70,12 @@ def test_three_workers_concurrent_publish_and_receive(tmp_path, authkey):
     queues = []
     try:
         for name in ("w1", "w2", "w3"):
+            # SPEC §8.2 v1.4.0 (D-SPEC-42): declare BCAST as a subscribed
+            # broadcast topic so the broker delivers dst="all" BCAST to us.
+            # P12/P23 are TARGETED (dst="w2", "w3") so they bypass the
+            # broadcast filter — no topic declaration needed for them.
             c = BusSocketClient(titan_id="testT", authkey=authkey, name=name,
-                                sock_path=sock)
+                                sock_path=sock, topics=["BCAST"])
             c.start()
             assert c.wait_until_connected(timeout=3.0)
             clients.append(c)
@@ -225,8 +229,12 @@ def test_three_clients_all_survive_broker_swap(tmp_path, authkey):
     qs = []
     try:
         for name in ("body", "mind", "spirit"):
+            # SPEC §8.2 v1.4.0 (D-SPEC-42): declare POST_RESUME as a
+            # subscribed broadcast topic so post-swap broadcast lands.
+            # PRE_SWAP/POST_SWAP are targeted (dst="<name>") so no
+            # topic declaration needed.
             c = BusSocketClient(titan_id="testT", authkey=authkey, name=name,
-                                sock_path=sock)
+                                sock_path=sock, topics=["POST_RESUME"])
             c.start()
             assert c.wait_until_connected(timeout=3.0)
             clients.append(c)

@@ -21,8 +21,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from titan_plugin.core import shadow_data_dir as sdd
-from titan_plugin.core import lock_polling
+from titan_hcl.core import shadow_data_dir as sdd
+from titan_hcl.core import lock_polling
 
 
 class TestResolveDataPath(unittest.TestCase):

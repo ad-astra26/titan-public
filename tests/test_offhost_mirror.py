@@ -1,4 +1,4 @@
-"""Tests for titan_plugin/logic/offhost_mirror.py — rFP_backup_worker Phase 9.1.
+"""Tests for titan_hcl/logic/offhost_mirror.py — rFP_backup_worker Phase 9.1.
 
 No live SSH/rsync involved. Covers:
   1. Construction: disabled by default, honors config keys
@@ -19,7 +19,7 @@ from unittest import mock
 
 import pytest
 
-from titan_plugin.logic.offhost_mirror import OffhostMirror
+from titan_hcl.logic.offhost_mirror import OffhostMirror
 
 
 def _cfg(enabled=True, **overrides):

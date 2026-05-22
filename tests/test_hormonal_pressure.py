@@ -1,7 +1,7 @@
 """Tests for the Hormonal Pressure System (Phase H)."""
 import time
 import pytest
-from titan_plugin.logic.hormonal_pressure import (
+from titan_hcl.logic.hormonal_pressure import (
     HormonalPressure, HormonalSystem, extract_stimuli,
     DEFAULT_CROSS_TALK, CIRCADIAN, DEFAULT_HORMONE_PARAMS,
 )

@@ -10,7 +10,7 @@ class TestBlockchainSonification:
     """V1 blockchain sonification (preserved behavior)."""
 
     def test_generates_wav(self, tmp_path):
-        from titan_plugin.expressive.audio import ProceduralAudioGen
+        from titan_hcl.expressive.audio import ProceduralAudioGen
         gen = ProceduralAudioGen(output_dir=str(tmp_path))
         path = gen.generate_blockchain_sonification(
             tx_signature="abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
@@ -27,7 +27,7 @@ class TestBlockchainSonification:
             assert wf.getnframes() == 44100 * 3  # 3 seconds
 
     def test_low_energy_drone(self, tmp_path):
-        from titan_plugin.expressive.audio import ProceduralAudioGen
+        from titan_hcl.expressive.audio import ProceduralAudioGen
         gen = ProceduralAudioGen(output_dir=str(tmp_path))
         path = gen.generate_blockchain_sonification(
             tx_signature="0" * 64,
@@ -36,7 +36,7 @@ class TestBlockchainSonification:
         assert os.path.exists(path)
 
     def test_high_energy_harmonics(self, tmp_path):
-        from titan_plugin.expressive.audio import ProceduralAudioGen
+        from titan_hcl.expressive.audio import ProceduralAudioGen
         gen = ProceduralAudioGen(output_dir=str(tmp_path))
         path = gen.generate_blockchain_sonification(
             tx_signature="f" * 64,
@@ -49,7 +49,7 @@ class TestTrinitySonification:
     """V3 Trinity sonification — tensor → music mapping."""
 
     def test_generates_wav(self, tmp_path):
-        from titan_plugin.expressive.audio import ProceduralAudioGen
+        from titan_hcl.expressive.audio import ProceduralAudioGen
         gen = ProceduralAudioGen(output_dir=str(tmp_path))
         path = gen.generate_trinity_sonification(
             body=[0.5, 0.5, 0.5, 0.5, 0.5],
@@ -69,7 +69,7 @@ class TestTrinitySonification:
 
     def test_different_tensors_produce_different_audio(self, tmp_path):
         """Verify that different Trinity states produce meaningfully different audio."""
-        from titan_plugin.expressive.audio import ProceduralAudioGen
+        from titan_hcl.expressive.audio import ProceduralAudioGen
         gen = ProceduralAudioGen(output_dir=str(tmp_path))
 
         # Calm state: low energy, balanced
@@ -99,7 +99,7 @@ class TestTrinitySonification:
 
     def test_short_tensor_padding(self, tmp_path):
         """Tensors shorter than 5 dims should be padded to 0.5."""
-        from titan_plugin.expressive.audio import ProceduralAudioGen
+        from titan_hcl.expressive.audio import ProceduralAudioGen
         gen = ProceduralAudioGen(output_dir=str(tmp_path))
         path = gen.generate_trinity_sonification(
             body=[0.5],   # only 1 dim
@@ -111,7 +111,7 @@ class TestTrinitySonification:
 
     def test_all_scales_reachable(self, tmp_path):
         """All 7 scale types should be reachable via Mind[2] taste values."""
-        from titan_plugin.expressive.audio import ProceduralAudioGen
+        from titan_hcl.expressive.audio import ProceduralAudioGen
         gen = ProceduralAudioGen(output_dir=str(tmp_path))
         paths = []
         for taste_val in [0.0, 0.15, 0.3, 0.45, 0.6, 0.75, 0.99]:
@@ -127,7 +127,7 @@ class TestTrinitySonification:
 
     def test_consonance_vs_dissonance(self, tmp_path):
         """Low loss (consonant) and high loss (dissonant) should produce different audio."""
-        from titan_plugin.expressive.audio import ProceduralAudioGen
+        from titan_hcl.expressive.audio import ProceduralAudioGen
         gen = ProceduralAudioGen(output_dir=str(tmp_path))
 
         path_consonant = gen.generate_trinity_sonification(
@@ -149,7 +149,7 @@ class TestTrinitySonification:
 
     def test_no_clipping(self, tmp_path):
         """Verify no sample exceeds 16-bit range even with extreme inputs."""
-        from titan_plugin.expressive.audio import ProceduralAudioGen
+        from titan_hcl.expressive.audio import ProceduralAudioGen
         gen = ProceduralAudioGen(output_dir=str(tmp_path))
         path = gen.generate_trinity_sonification(
             body=[1.0] * 5,
@@ -166,7 +166,7 @@ class TestTrinitySonification:
 
     def test_custom_sample_rate(self, tmp_path):
         """Verify custom sample rate works."""
-        from titan_plugin.expressive.audio import ProceduralAudioGen
+        from titan_hcl.expressive.audio import ProceduralAudioGen
         gen = ProceduralAudioGen(output_dir=str(tmp_path), sample_rate=22050)
         path = gen.generate_trinity_sonification(
             body=[0.5] * 5, mind=[0.5] * 5, spirit=[0.5] * 5,

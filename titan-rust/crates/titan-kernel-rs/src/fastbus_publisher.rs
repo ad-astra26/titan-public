@@ -81,7 +81,7 @@ pub fn spawn_kernel_fastbus_publisher(
                     let msg = Message::new(MsgType::Circadian, ts_ns, epoch, pid);
                     if let Err(e) = producer.publish(&msg.encode()) {
                         // QueueFull = slow consumer (substrate). Rate-limited warn.
-                        if epoch % 10 == 0 {
+                        if epoch.is_multiple_of(10) {
                             warn!(err = ?e, epoch, "kernel: fastbus circadian publish failed (slow substrate?)");
                         }
                     }
@@ -91,7 +91,7 @@ pub fn spawn_kernel_fastbus_publisher(
                     let ts_ns = wall_now_ns();
                     let msg = Message::new(MsgType::PiHeartbeat, ts_ns, epoch, pid);
                     if let Err(e) = producer.publish(&msg.encode()) {
-                        if epoch % 30 == 0 {
+                        if epoch.is_multiple_of(30) {
                             warn!(err = ?e, epoch, "kernel: fastbus pi-heartbeat publish failed (slow substrate?)");
                         }
                     }

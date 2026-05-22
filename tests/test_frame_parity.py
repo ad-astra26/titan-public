@@ -1,5 +1,5 @@
 """
-Phase C Rust parity vectors for titan_plugin/core/_frame.py.
+Phase C Rust parity vectors for titan_hcl/core/_frame.py.
 
 This file locks the wire protocol against silent drift between Python (Phase A/B)
 and Rust (Phase C). Every test below pins fixed inputs to fixed outputs. When
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import struct
 
-from titan_plugin.core._frame import (
+from titan_hcl.core._frame import (
     AUTH_TAG_SIZE,
     CHALLENGE_SIZE,
     LENGTH_PREFIX_SIZE,

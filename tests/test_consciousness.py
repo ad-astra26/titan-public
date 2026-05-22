@@ -13,25 +13,25 @@ import pytest
 def test_meta_indices_9d_legacy_returns_7_8():
     """9D legacy state has curvature/density canonically at [7:8]
     (STATE_DIMS[7]=curvature, [8]=density). Helper preserves this."""
-    from titan_plugin.logic.consciousness import _meta_indices
+    from titan_hcl.logic.consciousness import _meta_indices
     assert _meta_indices(9) == (7, 8)
 
 
 def test_meta_indices_67d_inner_returns_65_66():
     """67D inner-only vector: tail positions."""
-    from titan_plugin.logic.consciousness import _meta_indices
+    from titan_hcl.logic.consciousness import _meta_indices
     assert _meta_indices(67) == (65, 66)
 
 
 def test_meta_indices_132d_full_returns_130_131():
     """132D full vector: tail positions match msl.py attention masks."""
-    from titan_plugin.logic.consciousness import _meta_indices
+    from titan_hcl.logic.consciousness import _meta_indices
     assert _meta_indices(132) == (130, 131)
 
 
 def test_meta_indices_unsupported_raises():
     """Non-canonical dimension raises — prevents silent dim drift."""
-    from titan_plugin.logic.consciousness import _meta_indices
+    from titan_hcl.logic.consciousness import _meta_indices
     with pytest.raises(ValueError):
         _meta_indices(50)
     with pytest.raises(ValueError):
@@ -44,7 +44,7 @@ def test_meta_indices_unsupported_raises():
 
 def _make_ctx_stub():
     """Minimal StateVector + ConsciousnessDB mock for isolated tests."""
-    from titan_plugin.logic.consciousness import StateVector, EpochRecord
+    from titan_hcl.logic.consciousness import StateVector, EpochRecord
 
     class _MockDB:
         def __init__(self):
@@ -78,14 +78,14 @@ def _make_ctx_stub():
 
 def test_snapshot_state_9d_preserves_legacy_meta_at_7_8():
     """For 9D vectors, meta writes land at [7:8] — backward compat unchanged."""
-    from titan_plugin.logic.consciousness import StateVector
+    from titan_hcl.logic.consciousness import StateVector
     sv = StateVector(values=[0.5] * 9)
     db = _make_ctx_stub()
     db.push_epoch(curvature=0.42, density=0.77)
 
     # Simulate the meta-write block directly (bypasses full snapshot_state
     # which needs a full ConsciousnessLoop — here we isolate the logic).
-    from titan_plugin.logic.consciousness import _meta_indices
+    from titan_hcl.logic.consciousness import _meta_indices
     ci, di = _meta_indices(len(sv))
     recent = db.get_recent_epochs(1)
     sv[ci] = recent[-1].curvature
@@ -98,7 +98,7 @@ def test_snapshot_state_9d_preserves_legacy_meta_at_7_8():
 
 def test_snapshot_state_67d_writes_meta_to_tail_not_7_8():
     """For 67D vectors, meta writes MUST go to [65:67], NOT [7:8]."""
-    from titan_plugin.logic.consciousness import StateVector, _meta_indices
+    from titan_hcl.logic.consciousness import StateVector, _meta_indices
     sv = StateVector(values=[0.5] * 67)
     db = _make_ctx_stub()
     db.push_epoch(curvature=1.23, density=0.33)
@@ -119,7 +119,7 @@ def test_snapshot_state_67d_writes_meta_to_tail_not_7_8():
 
 def test_snapshot_state_132d_writes_meta_to_tail_not_7_8():
     """For 132D vectors, meta writes MUST go to [130:132], NOT [7:8]."""
-    from titan_plugin.logic.consciousness import StateVector, _meta_indices
+    from titan_hcl.logic.consciousness import StateVector, _meta_indices
     sv = StateVector(values=[0.5] * 132)
     db = _make_ctx_stub()
     db.push_epoch(curvature=2.71, density=0.11)
@@ -140,7 +140,7 @@ def test_snapshot_state_132d_writes_meta_to_tail_not_7_8():
 
 def test_first_epoch_initialises_meta_tail_to_zero():
     """Empty DB → meta at tail initialised to 0.0."""
-    from titan_plugin.logic.consciousness import StateVector, _meta_indices
+    from titan_hcl.logic.consciousness import StateVector, _meta_indices
     sv = StateVector(values=[0.5] * 132)
     db = _make_ctx_stub()
     # No epochs pushed
@@ -164,7 +164,7 @@ def test_first_epoch_initialises_meta_tail_to_zero():
 def test_run_write_back_writes_meta_to_tail_132d():
     """The run()'s feedback write (state[ci]=curvature, state[di]=density)
     lands at tail positions for 132D state — simulates the post-distill write."""
-    from titan_plugin.logic.consciousness import StateVector, _meta_indices
+    from titan_hcl.logic.consciousness import StateVector, _meta_indices
     state = StateVector(values=[0.3] * 132)
     curvature = 1.57  # π/2
     density = 0.5

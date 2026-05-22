@@ -17,11 +17,11 @@
 //! cadence` the cache is treated as STALE; the daemon writes its slot
 //! with last-known dims + emits structured-log line `confidence=0.0`.
 //!
-//! Per cadence in SPEC §18.1:
+//! Per cadence in SPEC §18.1 + D-SPEC-100 (G13 1:3:9, spirit fastest):
 //!
-//!   - outer_body : stale at  30s (3 × OUTER_BODY_TICK_BASE_S = 10 s)
-//!   - outer_mind : stale at  15s (3 × OUTER_MIND_TICK_BASE_S =  5 s)
-//!   - outer_spirit: stale at 90s (3 × OUTER_SPIRIT_TICK_BASE_S = 30 s)
+//!   - outer_body : stale at 135s (3 × OUTER_BODY_TICK_BASE_S = 45 s)
+//!   - outer_mind : stale at  45s (3 × OUTER_MIND_TICK_BASE_S = 15 s)
+//!   - outer_spirit: stale at 15s (3 × OUTER_SPIRIT_TICK_BASE_S =  5 s)
 //!
 //! # API
 //!

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from queue import Queue
 
-from titan_plugin.bus import emit_meta_chain_complete
+from titan_hcl.bus import emit_meta_chain_complete
 
 
 def _base_kwargs(**overrides):

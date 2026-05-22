@@ -110,7 +110,7 @@ def store_shard3_onchain(keypair, encrypted_shard3: bytes) -> str:
     Store encrypted Shard 3 as a Memo TX on Solana.
     Returns the TX signature (the Genesis Anchor pointer).
     """
-    from titan_plugin.utils.solana_client import build_memo_instruction, is_available
+    from titan_hcl.utils.solana_client import build_memo_instruction, is_available
 
     if not is_available():
         print("  [!] Solana SDK not available — Shard 3 stored locally only.")
@@ -128,11 +128,11 @@ def store_shard3_onchain(keypair, encrypted_shard3: bytes) -> str:
 
     # Build and send the memo transaction
     try:
-        from titan_plugin.core.network import HybridNetworkClient
+        from titan_hcl.core.network import HybridNetworkClient
         import asyncio
 
         # Load config for RPC URLs
-        config_path = os.path.join(os.path.dirname(__file__), "..", "titan_plugin", "config.toml")
+        config_path = os.path.join(os.path.dirname(__file__), "..", "titan_hcl", "config.toml")
         config = {}
         try:
             try:
@@ -198,7 +198,7 @@ def save_genesis_record(
 
 def encrypt_keypair_for_hardware(key_bytes: bytes):
     """Encrypt the keypair with hardware-bound AES and save."""
-    from titan_plugin.utils.crypto import encrypt_for_machine
+    from titan_hcl.utils.crypto import encrypt_for_machine
 
     os.makedirs("data", exist_ok=True)
     encrypted = encrypt_for_machine(key_bytes)
@@ -256,7 +256,7 @@ def main():
     # ─── Phase 2: Shamir Splitting ───
     print_phase(2, "Shamir Secret Splitting (2-of-3)")
 
-    from titan_plugin.utils.shamir import (
+    from titan_hcl.utils.shamir import (
         split_secret, verify_all_combinations, create_maker_envelope,
         encrypt_shard3,
     )
@@ -349,7 +349,7 @@ def main():
     genesis_art_path = os.path.join("data", "genesis_art.png")
     try:
         import hashlib
-        from titan_plugin.expressive.art import ProceduralArtGen
+        from titan_hcl.expressive.art import ProceduralArtGen
 
         art_dir = os.path.join("data", "genesis_art_tmp")
         os.makedirs(art_dir, exist_ok=True)
@@ -411,13 +411,13 @@ def main():
             print(f"  Inscribing art provenance on-chain...")
             art_memo = f"TITAN:GENESIS|pubkey={titan_pubkey[:16]}|art={genesis_art_hash[:16]}"
             try:
-                from titan_plugin.utils.solana_client import build_memo_instruction, is_available
+                from titan_hcl.utils.solana_client import build_memo_instruction, is_available
 
                 if is_available():
-                    from titan_plugin.core.network import HybridNetworkClient
+                    from titan_hcl.core.network import HybridNetworkClient
                     import asyncio
 
-                    config_path = os.path.join(os.path.dirname(__file__), "..", "titan_plugin", "config.toml")
+                    config_path = os.path.join(os.path.dirname(__file__), "..", "titan_hcl", "config.toml")
                     config = {}
                     try:
                         try:
@@ -461,7 +461,7 @@ def main():
 
     genesis_nft_address = None
     try:
-        from titan_plugin.utils.solana_client import (
+        from titan_hcl.utils.solana_client import (
             build_mpl_core_create_v1, is_available as solana_available,
         )
         from solders.keypair import Keypair as SoldersKeypair
@@ -501,10 +501,10 @@ def main():
 
             if ix:
                 import asyncio
-                from titan_plugin.core.network import HybridNetworkClient
+                from titan_hcl.core.network import HybridNetworkClient
 
                 config_path = os.path.join(
-                    os.path.dirname(__file__), "..", "titan_plugin", "config.toml",
+                    os.path.dirname(__file__), "..", "titan_hcl", "config.toml",
                 )
                 net_config = {}
                 try:

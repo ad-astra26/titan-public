@@ -135,7 +135,7 @@ def live_composition_test(api: str) -> dict:
 
         # Import and test composition engine
         sys.path.insert(0, ".")
-        from titan_plugin.logic.composition_engine import CompositionEngine
+        from titan_hcl.logic.composition_engine import CompositionEngine
         engine = CompositionEngine()
 
         # Test each stage

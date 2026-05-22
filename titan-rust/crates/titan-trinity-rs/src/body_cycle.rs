@@ -61,9 +61,7 @@ use titan_core::constants::{
 use titan_state::Slot;
 
 use crate::chi_state::{ChiInputs, ChiState};
-use crate::main_bus_publisher::{
-    publish_sphere_pulse, publish_topology_updated, MainBusError,
-};
+use crate::main_bus_publisher::{publish_sphere_pulse, publish_topology_updated, MainBusError};
 use crate::tick_loop::{BodyTickInputs, SubstrateState};
 use crate::topology::{BODY_5D, MIND_15D, SPIRIT_45D};
 
@@ -174,8 +172,9 @@ pub async fn run_substrate_body_cycle(
     mut slots: BodyCycleSlots,
     bus_client: Arc<BusClient>,
     shutdown: Arc<Notify>,
+    data_dir: std::path::PathBuf,
 ) {
-    let mut state = SubstrateState::new();
+    let mut state = SubstrateState::new(data_dir);
     let interval_period = Duration::from_millis(BODY_CYCLE_INTERVAL_MS);
     let mut interval = tokio::time::interval(interval_period);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -296,7 +295,7 @@ async fn run_one_tick(
 
     // Periodic structured tick log — every ~10s (every 9 ticks at 1.15s)
     // gives runtime observability without spamming journald.
-    if tick_count % 9 == 0 {
+    if tick_count.is_multiple_of(9) {
         debug!(
             event = "BODY_CYCLE_TICK",
             tick = tick_count,
@@ -314,17 +313,13 @@ async fn run_one_tick(
 
 /// Read the 6 daemon tensor slots into a `BodyTickInputs`. On any read
 /// error returns the propagated error so the caller can log + skip the tick.
-fn read_body_tick_inputs(
-    slots: &BodyCycleSlots,
-) -> Result<BodyTickInputs, BodyCycleSlotReadError> {
+fn read_body_tick_inputs(slots: &BodyCycleSlots) -> Result<BodyTickInputs, BodyCycleSlotReadError> {
     let inner_body = read_f32_array::<BODY_5D>(&slots.inner_body, "inner_body_5d.bin")?;
     let inner_mind = read_f32_array::<MIND_15D>(&slots.inner_mind, "inner_mind_15d.bin")?;
-    let inner_spirit =
-        read_f32_array::<SPIRIT_45D>(&slots.inner_spirit, "inner_spirit_45d.bin")?;
+    let inner_spirit = read_f32_array::<SPIRIT_45D>(&slots.inner_spirit, "inner_spirit_45d.bin")?;
     let outer_body = read_f32_array::<BODY_5D>(&slots.outer_body, "outer_body_5d.bin")?;
     let outer_mind = read_f32_array::<MIND_15D>(&slots.outer_mind, "outer_mind_15d.bin")?;
-    let outer_spirit =
-        read_f32_array::<SPIRIT_45D>(&slots.outer_spirit, "outer_spirit_45d.bin")?;
+    let outer_spirit = read_f32_array::<SPIRIT_45D>(&slots.outer_spirit, "outer_spirit_45d.bin")?;
 
     Ok(BodyTickInputs {
         inner_body_5d: inner_body,
@@ -376,9 +371,7 @@ struct BodyCycleSlotReadError {
 enum BodyCycleSlotReadCause {
     #[error("io: {0}")]
     Io(#[from] titan_state::SlotIoError),
-    #[error(
-        "expected {expected} bytes (≥ {needed} for f32 array), got {actual}"
-    )]
+    #[error("expected {expected} bytes (≥ {needed} for f32 array), got {actual}")]
     ShortRead {
         expected: usize,
         needed: usize,
@@ -462,8 +455,7 @@ mod tests {
         CHI_STATE_PAYLOAD_BYTES, CHI_STATE_SCHEMA_VERSION, INNER_BODY_5D_SCHEMA_VERSION,
         INNER_MIND_15D_SCHEMA_VERSION, INNER_SPIRIT_45D_SCHEMA_VERSION,
         OUTER_BODY_5D_SCHEMA_VERSION, OUTER_MIND_15D_SCHEMA_VERSION,
-        OUTER_SPIRIT_45D_SCHEMA_VERSION, SPHERE_CLOCKS_SCHEMA_VERSION,
-        TOPOLOGY_30D_SCHEMA_VERSION,
+        OUTER_SPIRIT_45D_SCHEMA_VERSION, SPHERE_CLOCKS_SCHEMA_VERSION, TOPOLOGY_30D_SCHEMA_VERSION,
     };
 
     fn create_slot(dir: &Path, name: &str, schema: u32, payload_bytes: u32) -> Slot {
@@ -472,24 +464,54 @@ mod tests {
     }
 
     fn create_all_slots(dir: &Path) {
-        let _ = create_slot(dir, "inner_body_5d.bin", INNER_BODY_5D_SCHEMA_VERSION as u32, 5 * 4);
-        let _ = create_slot(dir, "inner_mind_15d.bin", INNER_MIND_15D_SCHEMA_VERSION as u32, 15 * 4);
+        let _ = create_slot(
+            dir,
+            "inner_body_5d.bin",
+            INNER_BODY_5D_SCHEMA_VERSION as u32,
+            5 * 4,
+        );
+        let _ = create_slot(
+            dir,
+            "inner_mind_15d.bin",
+            INNER_MIND_15D_SCHEMA_VERSION as u32,
+            15 * 4,
+        );
         let _ = create_slot(
             dir,
             "inner_spirit_45d.bin",
             INNER_SPIRIT_45D_SCHEMA_VERSION as u32,
             45 * 4,
         );
-        let _ = create_slot(dir, "outer_body_5d.bin", OUTER_BODY_5D_SCHEMA_VERSION as u32, 5 * 4);
-        let _ = create_slot(dir, "outer_mind_15d.bin", OUTER_MIND_15D_SCHEMA_VERSION as u32, 15 * 4);
+        let _ = create_slot(
+            dir,
+            "outer_body_5d.bin",
+            OUTER_BODY_5D_SCHEMA_VERSION as u32,
+            5 * 4,
+        );
+        let _ = create_slot(
+            dir,
+            "outer_mind_15d.bin",
+            OUTER_MIND_15D_SCHEMA_VERSION as u32,
+            15 * 4,
+        );
         let _ = create_slot(
             dir,
             "outer_spirit_45d.bin",
             OUTER_SPIRIT_45D_SCHEMA_VERSION as u32,
             45 * 4,
         );
-        let _ = create_slot(dir, "topology_30d.bin", TOPOLOGY_30D_SCHEMA_VERSION as u32, 30 * 4);
-        let _ = create_slot(dir, "sphere_clocks.bin", SPHERE_CLOCKS_SCHEMA_VERSION as u32, 168);
+        let _ = create_slot(
+            dir,
+            "topology_30d.bin",
+            TOPOLOGY_30D_SCHEMA_VERSION as u32,
+            30 * 4,
+        );
+        let _ = create_slot(
+            dir,
+            "sphere_clocks.bin",
+            SPHERE_CLOCKS_SCHEMA_VERSION as u32,
+            168,
+        );
         let _ = create_slot(
             dir,
             "chi_state.bin",
@@ -516,8 +538,7 @@ mod tests {
         assert_eq!(bytes.len(), 120);
         for (i, v) in t.iter().enumerate() {
             let off = i * 4;
-            let recovered =
-                f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+            let recovered = f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
             assert!((recovered - *v).abs() < 1e-6);
         }
     }
@@ -527,7 +548,10 @@ mod tests {
         let dir = tempdir().unwrap();
         create_all_slots(dir.path());
         let slots = BodyCycleSlots::open(dir.path()).expect("all required slots created");
-        assert!(slots.neuromod_state.is_none(), "neuromod absent in test fixture");
+        assert!(
+            slots.neuromod_state.is_none(),
+            "neuromod absent in test fixture"
+        );
         // verify all required handles opened
         assert_eq!(slots.inner_body.read().unwrap().len(), 20);
         assert_eq!(slots.topology_30d.read().unwrap().len(), 120);
@@ -540,7 +564,10 @@ mod tests {
         // Skip creating inner_body_5d.bin — required slot
         create_slot(dir.path(), "inner_mind_15d.bin", 1, 60);
         let result = BodyCycleSlots::open(dir.path());
-        assert!(result.is_err(), "expected open to fail when required slot missing");
+        assert!(
+            result.is_err(),
+            "expected open to fail when required slot missing"
+        );
         match result.err().unwrap() {
             BodyCycleError::SlotOpen { slot, .. } => {
                 assert_eq!(slot, "inner_body_5d.bin");
@@ -604,7 +631,7 @@ mod tests {
         let dir = tempdir().unwrap();
         create_all_slots(dir.path());
         let mut slots = BodyCycleSlots::open(dir.path()).unwrap();
-        let mut state = SubstrateState::new();
+        let mut state = SubstrateState::default();
 
         // Pre-populate inputs with known non-zero values so chi/topology
         // are non-trivial.
@@ -614,10 +641,10 @@ mod tests {
             *v = 0.5;
         }
         write_known_input(&mut slots.inner_mind, &mind_vals);
-        write_known_input(&mut slots.inner_spirit, &vec![0.5_f32; 45]);
+        write_known_input(&mut slots.inner_spirit, &[0.5_f32; 45]);
         write_known_input(&mut slots.outer_body, &[0.5; 5]);
         write_known_input(&mut slots.outer_mind, &mind_vals);
-        write_known_input(&mut slots.outer_spirit, &vec![0.5_f32; 45]);
+        write_known_input(&mut slots.outer_spirit, &[0.5_f32; 45]);
 
         // Drive the read+compute+write path manually (without bus).
         let inputs = read_body_tick_inputs(&slots).unwrap();
@@ -637,7 +664,10 @@ mod tests {
             .topology_30d
             .write(&bytes_of_topology_30d(&outputs.topology_30d))
             .unwrap();
-        slots.sphere_clocks.write(&outputs.sphere_clocks_payload).unwrap();
+        slots
+            .sphere_clocks
+            .write(&outputs.sphere_clocks_payload)
+            .unwrap();
         slots.chi_state.write(&chi.serialize()).unwrap();
 
         // Read back and verify non-zero / well-formed output.
@@ -649,7 +679,10 @@ mod tests {
         let chi_bytes = slots.chi_state.read().unwrap();
         assert_eq!(chi_bytes.len(), 24);
         let chi_total = f32::from_le_bytes(chi_bytes[0..4].try_into().unwrap());
-        assert!(chi_total > 0.0, "chi.total should be non-zero with active inputs");
+        assert!(
+            chi_total > 0.0,
+            "chi.total should be non-zero with active inputs"
+        );
     }
 
     /// Counter-driven test: spawn `run_substrate_body_cycle`, let it run a
@@ -665,11 +698,11 @@ mod tests {
 
         // Pre-populate inputs so body cycle has real data.
         write_known_input(&mut slots.inner_body, &[0.5; 5]);
-        write_known_input(&mut slots.inner_mind, &vec![0.3_f32; 15]);
-        write_known_input(&mut slots.inner_spirit, &vec![0.5_f32; 45]);
+        write_known_input(&mut slots.inner_mind, &[0.3_f32; 15]);
+        write_known_input(&mut slots.inner_spirit, &[0.5_f32; 45]);
         write_known_input(&mut slots.outer_body, &[0.5; 5]);
-        write_known_input(&mut slots.outer_mind, &vec![0.3_f32; 15]);
-        write_known_input(&mut slots.outer_spirit, &vec![0.5_f32; 45]);
+        write_known_input(&mut slots.outer_mind, &[0.3_f32; 15]);
+        write_known_input(&mut slots.outer_spirit, &[0.5_f32; 45]);
 
         let topo_path = dir.path().join("topology_30d.bin");
         let chi_path = dir.path().join("chi_state.bin");
@@ -680,7 +713,13 @@ mod tests {
         let shutdown = Arc::new(Notify::new());
         let shutdown_for_task = shutdown.clone();
         let task = tokio::spawn(async move {
-            run_substrate_body_cycle(slots, bus_client, shutdown_for_task).await;
+            run_substrate_body_cycle(
+                slots,
+                bus_client,
+                shutdown_for_task,
+                std::path::PathBuf::new(),
+            )
+            .await;
         });
 
         // Let cycle run ~3 ticks (3 × 1.15s = 3.45s). Use a slightly longer

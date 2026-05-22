@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from titan_plugin.persistence.journal import (
+from titan_hcl.persistence.journal import (
     HEADER_SIZE,
     CallerJournal,
     JournalError,

@@ -1,4 +1,4 @@
-"""Tests for titan_plugin/core/worker_lifecycle.py — orphan prevention.
+"""Tests for titan_hcl/core/worker_lifecycle.py — orphan prevention.
 
 Two complementary defenses are tested:
 
@@ -32,7 +32,7 @@ from unittest import mock
 # Ensure project root on sys.path for direct invocation
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from titan_plugin.core import worker_lifecycle as wl
+from titan_hcl.core import worker_lifecycle as wl
 
 
 class TestInstallParentDeathSignal(unittest.TestCase):
@@ -193,7 +193,7 @@ class TestEndToEndOrphanScenario(unittest.TestCase):
         script = """
 import os, signal, time, sys
 sys.path.insert(0, %r)
-from titan_plugin.core.worker_lifecycle import install_full_protection
+from titan_hcl.core.worker_lifecycle import install_full_protection
 pid = os.fork()
 if pid == 0:
     install_full_protection(watcher_interval=0.5)

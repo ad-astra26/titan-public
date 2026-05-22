@@ -1,6 +1,6 @@
 """Tests for Episodic Memory — autobiographical life events."""
 import pytest
-from titan_plugin.logic.episodic_memory import EpisodicMemory
+from titan_hcl.logic.episodic_memory import EpisodicMemory
 
 
 def _fresh(tmp_path, name):

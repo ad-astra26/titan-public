@@ -35,7 +35,7 @@ class TestTrinityStateDispatcher:
     """SPEC §8.5: 3 event types × payload.src ∈ {inner, outer} → 6 cache slots."""
 
     def setup_method(self):
-        from titan_plugin.modules.cognitive_worker import _dispatch_trinity_state
+        from titan_hcl.modules.cognitive_worker import _dispatch_trinity_state
         self.dispatch = _dispatch_trinity_state
         self.state_refs = {
             "_inner_body_state": [0.5] * 5,
@@ -140,7 +140,7 @@ class TestNonTrinityDispatchers:
     """Dispatchers for non-trinity events (PLAN §3.1)."""
 
     def test_dispatch_dream_consolidate_calls_coordinator_dreaming(self):
-        from titan_plugin.modules.cognitive_worker import _dispatch_dream_consolidate
+        from titan_hcl.modules.cognitive_worker import _dispatch_dream_consolidate
 
         class FakeDreaming:
             def __init__(self):
@@ -158,13 +158,13 @@ class TestNonTrinityDispatchers:
         assert coord.dreaming.calls == [{"insight": "test"}]
 
     def test_dispatch_dream_consolidate_no_coordinator_is_noop(self):
-        from titan_plugin.modules.cognitive_worker import _dispatch_dream_consolidate
+        from titan_hcl.modules.cognitive_worker import _dispatch_dream_consolidate
         state_refs = {"coordinator": None}
         _dispatch_dream_consolidate(state_refs, {"foo": "bar"})  # no raise
 
     def test_dispatch_stimulus_calls_reasoning_observe(self):
-        from titan_plugin.modules.cognitive_worker import _dispatch_stimulus
-        from titan_plugin import bus
+        from titan_hcl.modules.cognitive_worker import _dispatch_stimulus
+        from titan_hcl import bus
 
         class FakeReasoning:
             def __init__(self):
@@ -182,8 +182,8 @@ class TestNonTrinityDispatchers:
         assert re.observed[0].get("text") == "hello"
 
     def test_dispatch_stimulus_experience_source_tag(self):
-        from titan_plugin.modules.cognitive_worker import _dispatch_stimulus
-        from titan_plugin import bus
+        from titan_hcl.modules.cognitive_worker import _dispatch_stimulus
+        from titan_hcl import bus
 
         class FakeReasoning:
             def __init__(self):
@@ -197,7 +197,7 @@ class TestNonTrinityDispatchers:
         assert re.observed[0].get("source") == "experience"
 
     def test_dispatch_meditation_complete_calls_coordinator(self):
-        from titan_plugin.modules.cognitive_worker import _dispatch_meditation_complete
+        from titan_hcl.modules.cognitive_worker import _dispatch_meditation_complete
 
         class FakeCoordinator:
             def __init__(self):
@@ -218,11 +218,11 @@ class TestPersistence:
     """_persist_engine_state graceful failure."""
 
     def test_persist_no_engines_is_noop(self):
-        from titan_plugin.modules.cognitive_worker import _persist_engine_state
+        from titan_hcl.modules.cognitive_worker import _persist_engine_state
         _persist_engine_state({})  # no raise
 
     def test_persist_calls_each_engine_save(self):
-        from titan_plugin.modules.cognitive_worker import _persist_engine_state
+        from titan_hcl.modules.cognitive_worker import _persist_engine_state
 
         calls = []
 
@@ -253,7 +253,7 @@ class TestPersistence:
 
     def test_persist_isolates_failures(self):
         """One engine raising on save shouldn't block the others."""
-        from titan_plugin.modules.cognitive_worker import _persist_engine_state
+        from titan_hcl.modules.cognitive_worker import _persist_engine_state
 
         calls = []
 
@@ -290,23 +290,23 @@ class TestCognitiveConstants:
     """
 
     def test_min_interval_is_1x_schumann_body(self):
-        from titan_plugin._phase_c_constants import COGNITIVE_EPOCH_MIN_INTERVAL_S
+        from titan_hcl._phase_c_constants import COGNITIVE_EPOCH_MIN_INTERVAL_S
         assert COGNITIVE_EPOCH_MIN_INTERVAL_S == 1.15  # 1× Schumann body
 
     def test_default_interval_is_9x_schumann_body(self):
-        from titan_plugin._phase_c_constants import COGNITIVE_EPOCH_DEFAULT_INTERVAL_S
+        from titan_hcl._phase_c_constants import COGNITIVE_EPOCH_DEFAULT_INTERVAL_S
         assert COGNITIVE_EPOCH_DEFAULT_INTERVAL_S == 10.35  # 9× Schumann body
 
     def test_max_interval_is_27x_schumann_body(self):
-        from titan_plugin._phase_c_constants import COGNITIVE_EPOCH_MAX_INTERVAL_S
+        from titan_hcl._phase_c_constants import COGNITIVE_EPOCH_MAX_INTERVAL_S
         assert COGNITIVE_EPOCH_MAX_INTERVAL_S == 31.05  # 27× Schumann body
 
     def test_persist_every_n_epochs(self):
-        from titan_plugin._phase_c_constants import COGNITIVE_PERSIST_EVERY_N_EPOCHS
+        from titan_hcl._phase_c_constants import COGNITIVE_PERSIST_EVERY_N_EPOCHS
         assert COGNITIVE_PERSIST_EVERY_N_EPOCHS == 100
 
     def test_min_default_max_are_ordered(self):
-        from titan_plugin._phase_c_constants import (
+        from titan_hcl._phase_c_constants import (
             COGNITIVE_EPOCH_MIN_INTERVAL_S,
             COGNITIVE_EPOCH_DEFAULT_INTERVAL_S,
             COGNITIVE_EPOCH_MAX_INTERVAL_S,
@@ -321,14 +321,28 @@ class TestCognitiveConstants:
 
 class TestSubscribeTopics:
     """PLAN §11 acceptance criterion #3: cognitive_worker subscribes to
-    exactly these 10 bus topics. Drift here breaks the journalctl
-    assertion at chunk 8L T3 deploy gate."""
+    exactly these bus topics. Drift here breaks the journalctl
+    assertion at chunk 8L T3 deploy gate.
+
+    Topic-count drift history:
+      - chunk 8E (v0.1.8): 10 topics (PLAN §11 canonical)
+      - Track 2 (v1.2.1): +2 → 12 (ADVISOR_REFRACTORY_STATE, PREDICTION_GENERATED)
+      - §4.B Track 3 (v1.7.4 D-SPEC-53): +2 → 14 (SPEAK_REQUEST_PENDING, NS_REWARD)
+      - §4.Q (v1.8.0 D-SPEC-54): +4 → 18 (PREDICTION_STATS_UPDATED,
+        EXPRESSION_COMPOSITES_UPDATED, KIN_SIGNATURE_UPDATED, NEUROMOD_STATS_UPDATED)
+      - RFP_meta-reasoning_CGN_FIX Chunk B.7b: +5 → 23 (CGN_KNOWLEDGE_REQ,
+        META_REASON_REQUEST, META_REASON_OUTCOME, CGN_KNOWLEDGE_RESP,
+        TIMECHAIN_QUERY_RESP — MetaService relocated to cognitive_worker)
+      - §4.I (v1.8.2 D-SPEC-56): +1 → 24 (DREAM_WAKE_FORWARD —
+        dream_state_worker forwards wake requests here)
+    """
 
     def test_subscribe_topics_list_canonical(self):
-        from titan_plugin.modules.cognitive_worker import _COGNITIVE_WORKER_SUBSCRIBE_TOPICS
-        from titan_plugin import bus
+        from titan_hcl.modules.cognitive_worker import _COGNITIVE_WORKER_SUBSCRIBE_TOPICS
+        from titan_hcl import bus
 
         expected = {
+            # Chunk 8E canonical (PLAN §11):
             bus.BODY_STATE,                # 5D × src ∈ {inner, outer}
             bus.MIND_STATE,                # 15D × src ∈ {inner, outer}
             bus.SPIRIT_STATE,              # 45D × src ∈ {inner, outer}
@@ -339,16 +353,61 @@ class TestSubscribeTopics:
             bus.MEDITATION_COMPLETE,       # meditation phase tracking
             bus.MODULE_SHUTDOWN,           # lifecycle
             bus.SAVE_NOW,                  # B.1 persistence trigger
+            # Track 2 (v1.2.1) — SPEAK gate cache feed from
+            # outer_interface_worker. Per SPEC §8.5 D-SPEC-38.
+            bus.ADVISOR_REFRACTORY_STATE,  # SPEAK refractory gate
+            # Track 2 (v1.2.1 commit B8) — prediction_engine drift correction.
+            bus.PREDICTION_GENERATED,
+            # §4.B Track 3 (v1.7.4 D-SPEC-53) — expression_worker bridges.
+            bus.SPEAK_REQUEST_PENDING,
+            bus.NS_REWARD,
+            # §4.Q (v1.8.0 D-SPEC-54) — neuromod_inputs.bin builder feeds.
+            bus.PREDICTION_STATS_UPDATED,
+            bus.EXPRESSION_COMPOSITES_UPDATED,
+            bus.KIN_SIGNATURE_UPDATED,
+            bus.NEUROMOD_STATS_UPDATED,
+            # RFP_meta-reasoning_CGN_FIX Chunk B.7b — MetaService relocation.
+            bus.CGN_KNOWLEDGE_REQ,
+            bus.META_REASON_REQUEST,
+            bus.META_REASON_OUTCOME,
+            bus.CGN_KNOWLEDGE_RESP,
+            bus.TIMECHAIN_QUERY_RESP,
+            # §4.I (v1.8.2 D-SPEC-56) — dream_state_worker → cognitive_worker.
+            bus.DREAM_WAKE_FORWARD,
+            # §4.I post-cleanup — FORCE_DREAM_REQUEST orphan handler closure.
+            bus.FORCE_DREAM_REQUEST,
+            # D-SPEC-64 v1.10.0 PLAN §1.6 — kin_resonance catalyst emit
+            # (D8-3 catalyst-producer site #7 closure).
+            bus.KIN_SIGNAL,
+            # D-SPEC-103 (v1.41.0) — Record stage of the ExperienceOrchestrator
+            # loop; _dispatch_experience_record (dispatcher handler at
+            # cognitive_worker.py msg_type == bus.EXPERIENCE_RECORD).
+            bus.EXPERIENCE_RECORD,
+            # rFP_subsystem_reward_refresh_restore — CONTRACT_LIST_RESP feeds
+            # meta_engine.update_subsystem_cache (dispatcher handler present).
+            bus.CONTRACT_LIST_RESP,
+            # D-SPEC-116 (Phase D) — spirit_worker retirement re-homed 3 flows:
+            bus.MEMORY_RECALL_PERTURBATION,  # → msl.i_depth + working_mem.attend
+            bus.TEACHER_SIGNALS,             # → msl.concept_grounder + neuromod nudge
+            bus.OUTER_OBSERVATION,           # → msl.signal_engagement
         }
         actual = set(_COGNITIVE_WORKER_SUBSCRIBE_TOPICS)
         assert actual == expected, (
-            f"Subscribe topics drifted from PLAN §11(3). "
+            f"Subscribe topics drifted from PLAN §11(3) + SPEC §8.5 D-SPEC-38 "
+            f"+ §4.B/§4.Q/§4.I/Meta-Reasoning/D-SPEC-64 lineage. "
             f"Missing: {expected - actual}; Extra: {actual - expected}"
         )
 
-    def test_subscribe_topics_count_is_ten(self):
-        from titan_plugin.modules.cognitive_worker import _COGNITIVE_WORKER_SUBSCRIBE_TOPICS
-        assert len(_COGNITIVE_WORKER_SUBSCRIBE_TOPICS) == 10
+    def test_subscribe_topics_count_is_thirty_one(self):
+        """Topic-count walk: 10 → 12 (Track 2) → 14 (§4.B Track 3)
+        → 18 (§4.Q) → 23 (Meta-Reasoning B.7b) → 24 (§4.I dream_state)
+        → 25 (§4.I FORCE_DREAM_REQUEST orphan closure) → 26 (D-SPEC-64
+        v1.10.0 KIN_SIGNAL for #7 kin_resonance migration) → 27 (D-SPEC-103
+        EXPERIENCE_RECORD) → 28 (rFP_subsystem_reward_refresh CONTRACT_LIST_RESP)
+        → 31 (D-SPEC-116 spirit_worker retirement: MEMORY_RECALL_PERTURBATION +
+        TEACHER_SIGNALS + OUTER_OBSERVATION re-homed)."""
+        from titan_hcl.modules.cognitive_worker import _COGNITIVE_WORKER_SUBSCRIBE_TOPICS
+        assert len(_COGNITIVE_WORKER_SUBSCRIBE_TOPICS) == 31
 
 
 # ── Neuromod shm reader factory ─────────────────────────────────────
@@ -358,14 +417,14 @@ class TestNeuromodReader:
     """_make_neuromod_reader graceful failure."""
 
     def test_reader_returns_callable_or_none(self):
-        from titan_plugin.modules.cognitive_worker import _make_neuromod_reader
+        from titan_hcl.modules.cognitive_worker import _make_neuromod_reader
         reader = _make_neuromod_reader()
         # Either a callable (shm available) or None (shm disabled / no Rust)
         assert reader is None or callable(reader)
 
     def test_reader_does_not_raise(self):
         """Even when shm slot isn't initialized, factory must not raise."""
-        from titan_plugin.modules.cognitive_worker import _make_neuromod_reader
+        from titan_hcl.modules.cognitive_worker import _make_neuromod_reader
         try:
             _make_neuromod_reader()
         except Exception as e:

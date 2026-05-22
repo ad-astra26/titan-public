@@ -21,7 +21,7 @@ class TestNeuralReflexNet:
     """Tests for the core micro-network."""
 
     def _make_net(self, input_dim=55):
-        from titan_plugin.logic.neural_reflex_net import NeuralReflexNet
+        from titan_hcl.logic.neural_reflex_net import NeuralReflexNet
         return NeuralReflexNet("test_net", input_dim=input_dim)
 
     def test_forward_output_range(self):
@@ -78,7 +78,7 @@ class TestNeuralReflexNet:
             path = os.path.join(tmpdir, "test_weights.json")
             net.save(path)
 
-            from titan_plugin.logic.neural_reflex_net import NeuralReflexNet
+            from titan_hcl.logic.neural_reflex_net import NeuralReflexNet
             net2 = NeuralReflexNet("test_net", input_dim=10)
             loaded = net2.load(path)
             assert loaded is True
@@ -120,7 +120,7 @@ class TestNervousTransitionBuffer:
     """Tests for per-program transition storage."""
 
     def test_add_and_len(self):
-        from titan_plugin.logic.neural_reflex_net import NervousTransitionBuffer
+        from titan_hcl.logic.neural_reflex_net import NervousTransitionBuffer
         buf = NervousTransitionBuffer(max_size=100)
         assert len(buf) == 0
 
@@ -131,14 +131,14 @@ class TestNervousTransitionBuffer:
         assert len(buf) == 2
 
     def test_max_size_eviction(self):
-        from titan_plugin.logic.neural_reflex_net import NervousTransitionBuffer
+        from titan_hcl.logic.neural_reflex_net import NervousTransitionBuffer
         buf = NervousTransitionBuffer(max_size=5)
         for i in range(10):
             buf.add([float(i)], 0.5, 0.3, 0.0, False)
         assert len(buf) == 5
 
     def test_sample(self):
-        from titan_plugin.logic.neural_reflex_net import NervousTransitionBuffer
+        from titan_hcl.logic.neural_reflex_net import NervousTransitionBuffer
         buf = NervousTransitionBuffer()
         for i in range(20):
             buf.add([float(i), float(i) * 2], 0.5, 0.3, 0.1, i % 3 == 0)
@@ -151,7 +151,7 @@ class TestNervousTransitionBuffer:
         assert len(fired) == 8
 
     def test_update_last_reward(self):
-        from titan_plugin.logic.neural_reflex_net import NervousTransitionBuffer
+        from titan_hcl.logic.neural_reflex_net import NervousTransitionBuffer
         buf = NervousTransitionBuffer()
         buf.add([1.0], 0.5, 0.3, 0.0, True)
         buf.add([2.0], 0.2, 0.1, 0.0, False)
@@ -162,7 +162,7 @@ class TestNervousTransitionBuffer:
         assert buf._rewards[0] == 0.9
 
     def test_save_load_roundtrip(self):
-        from titan_plugin.logic.neural_reflex_net import NervousTransitionBuffer
+        from titan_hcl.logic.neural_reflex_net import NervousTransitionBuffer
         buf = NervousTransitionBuffer()
         for i in range(10):
             buf.add([float(i)], 0.5, 0.3, float(i) / 10, i % 2 == 0)
@@ -195,7 +195,7 @@ class TestObservationSpace:
         }
 
     def _make_space(self):
-        from titan_plugin.logic.observation_space import ObservationSpace
+        from titan_hcl.logic.observation_space import ObservationSpace
         space = ObservationSpace()
         space.update(observables=self._make_observables())
         return space
@@ -237,7 +237,7 @@ class TestObservationSpace:
 
     def test_feature_names_count(self):
         """Feature names should match dimension count."""
-        from titan_plugin.logic.observation_space import ObservationSpace
+        from titan_hcl.logic.observation_space import ObservationSpace
         space = ObservationSpace()
         for fset, expected_dim in [("core", 30), ("standard", 55),
                                     ("extended", 75), ("full", 88)]:
@@ -246,7 +246,7 @@ class TestObservationSpace:
 
     def test_get_dim(self):
         """get_dim should return correct dimensions."""
-        from titan_plugin.logic.observation_space import ObservationSpace
+        from titan_hcl.logic.observation_space import ObservationSpace
         assert ObservationSpace.get_dim("core") == 30
         assert ObservationSpace.get_dim("standard") == 55
         assert ObservationSpace.get_dim("extended") == 75
@@ -254,7 +254,7 @@ class TestObservationSpace:
 
     def test_no_nan_with_empty_data(self):
         """ObservationSpace should produce finite values with empty/missing data."""
-        from titan_plugin.logic.observation_space import ObservationSpace
+        from titan_hcl.logic.observation_space import ObservationSpace
         space = ObservationSpace()
         space.update()  # No data at all
         vec = space.build_input("full")
@@ -293,7 +293,7 @@ class TestNeuralNervousSystem:
         }
 
     def test_loads_enabled_programs(self):
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
         with tempfile.TemporaryDirectory() as tmpdir:
             ns = NeuralNervousSystem(self._make_config(), data_dir=tmpdir)
             assert len(ns.programs) == 3  # DISABLED_PROG excluded
@@ -303,7 +303,7 @@ class TestNeuralNervousSystem:
             assert "DISABLED_PROG" not in ns.programs
 
     def test_evaluate_returns_signals(self):
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
         with tempfile.TemporaryDirectory() as tmpdir:
             ns = NeuralNervousSystem(self._make_config(), data_dir=tmpdir)
             ns.update_observation_space(observables=self._make_observables())
@@ -316,7 +316,7 @@ class TestNeuralNervousSystem:
                 assert 0.0 <= sig["urgency"] <= 1.0
 
     def test_supervision_weight_decay(self):
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
         with tempfile.TemporaryDirectory() as tmpdir:
             ns = NeuralNervousSystem(self._make_config(), data_dir=tmpdir)
             assert ns._get_supervision_weight() == 1.0  # Start
@@ -328,7 +328,7 @@ class TestNeuralNervousSystem:
             assert ns._get_supervision_weight() == 0.0  # End
 
     def test_training_phase_transitions(self):
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
         with tempfile.TemporaryDirectory() as tmpdir:
             ns = NeuralNervousSystem(self._make_config(), data_dir=tmpdir)
             assert ns.training_phase == "bootstrap"
@@ -340,7 +340,7 @@ class TestNeuralNervousSystem:
             assert ns.training_phase == "autonomous"
 
     def test_save_load_roundtrip(self):
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
         with tempfile.TemporaryDirectory() as tmpdir:
             ns = NeuralNervousSystem(self._make_config(), data_dir=tmpdir)
             ns._total_transitions = 42
@@ -352,7 +352,7 @@ class TestNeuralNervousSystem:
             assert ns2._total_train_steps == 7
 
     def test_get_stats(self):
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
         with tempfile.TemporaryDirectory() as tmpdir:
             ns = NeuralNervousSystem(self._make_config(), data_dir=tmpdir)
             stats = ns.get_stats()
@@ -363,7 +363,7 @@ class TestNeuralNervousSystem:
 
     def test_training_reduces_loss(self):
         """After multiple evaluate cycles, training should reduce loss."""
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
         with tempfile.TemporaryDirectory() as tmpdir:
             config = self._make_config()
             config["train_every_n"] = 2
@@ -383,7 +383,7 @@ class TestNeuralNervousSystem:
             assert ns._total_train_steps > 0, f"Expected >0 train steps, got {ns._total_train_steps}"
 
     def test_record_outcome(self):
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
         with tempfile.TemporaryDirectory() as tmpdir:
             ns = NeuralNervousSystem(self._make_config(), data_dir=tmpdir)
             obs = self._make_observables()

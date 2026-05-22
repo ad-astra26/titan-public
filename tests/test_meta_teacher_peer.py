@@ -1,4 +1,4 @@
-"""Tests for titan_plugin.logic.meta_teacher_peer — Phase D.1 + D.2 of
+"""Tests for titan_hcl.logic.meta_teacher_peer — Phase D.1 + D.2 of
 rFP_meta_teacher_v2_content_awareness_memory.md.
 
 Covers:
@@ -21,7 +21,7 @@ import time
 
 import pytest
 
-from titan_plugin.logic.meta_teacher_peer import (
+from titan_hcl.logic.meta_teacher_peer import (
     PeerExchangeClient,
     PeerQueryPolicy,
     ALLOWED_QUESTION_TYPES,

@@ -1,42 +1,32 @@
 """
-Tests for Phase B.2 IPC §D8 outbound buffer in BusSocketClient.
+Tests for the BusSocketClient outbound buffer.
 
-Background (2026-04-30 follow-up after BUG-BUS-IPC-IN-PROCESS-ORPHAN-QUEUE
-gate fix):
+Originally added 2026-04-30 for Phase B.2 IPC §D8 (BUG-BUS-IPC-WORKER-READY-RACE)
+to pin the 256-frame bounded buffer that survived the initial-connect window.
 
-`BusSocketClient.start()` returns immediately; the connection thread takes
-~50-150ms (jitter + handshake) to establish the socket. Light-init workers
-(outer_trinity, reflex, warning_monitor, output_verifier) hit
-`send_queue.put(MODULE_READY)` within 1-10ms — `_raw_send` returned False
-(sock is None) and the message was silently dropped. Guardian never
-transitioned worker to RUNNING.
+Rewritten 2026-05-14 for SPEC §8.0.ter (rFP_bus_socket_outbound_writer_thread.md
+v1.6.0): the outbound buffer is now the canonical write path for ALL publishes,
+not just the disconnect window. `_raw_send` packs the frame synchronously
+(fail-fast validation per rFP_bus_payload_contracts §4) then appends the
+**packed bytes** to the buffer. The dedicated writer thread is the sole
+`send_frame()` caller. Buffer is unbounded (§8.0 P0 never-drop); high-water
+warning fires at OUTBOUND_BUFFER_HIGH_WATER per Chunk 4 of the rFP.
 
-Initial fix attempt (Option A) added `wait_until_connected(timeout=5.0)`
-in `setup_worker_bus`, but that put 50-150ms boot latency on every worker
-— against microkernel v2's design intent. Final fix (Option B): outbound
-buffer in BusSocketClient. publish() while disconnected enqueues into a
-bounded deque; _connection_loop flushes on connect. Zero added boot
-latency. Same mechanism survives kernel-swap reconnects (matches §D8
-intent for ANY disconnect, not just initial connect).
-
-These tests pin the contract:
-- publish() while sock is None → buffers, returns True
-- _flush_outbound_buffer drains FIFO over reconnected socket
-- Bounded buffer (deque maxlen=256) — overflow drops oldest
-- Mid-flush connection break re-buffers unsent tail
-- Buffer survives kernel-swap reconnect cycles
-
-B.3 cleanup §11.4.a does NOT delete the buffer — kernel swaps still
-need it. Only the legacy mp.Queue fallback path retires.
+This test file pins the storage contract (bytes in buffer) + drain behavior.
+The writer-thread/non-blocking guarantees are pinned by the new test files
+in Chunk 3: `test_bus_socket_writer_thread.py` and
+`test_bus_socket_deadlock_impossible.py`.
 """
 from __future__ import annotations
 
-from collections import deque
 from unittest.mock import MagicMock, patch
 
-import pytest
+import msgpack
 
-from titan_plugin.core.bus_socket import BusSocketClient
+from titan_hcl.core.bus_socket import (
+    BusSocketClient,
+    OUTBOUND_BUFFER_HIGH_WATER,
+)
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────
@@ -53,13 +43,21 @@ def _make_client(name: str = "outer_trinity") -> BusSocketClient:
     )
 
 
+def _unpack(frame: bytes) -> dict:
+    """Decode a buffered frame back to its dict form for assertions."""
+    return msgpack.unpackb(frame, raw=False, strict_map_key=False)
+
+
 # ── Buffer behavior under disconnect ───────────────────────────────────
 
 
 def test_publish_buffers_when_sock_is_none():
     """When sock is None (pre-connect or mid-reconnect), publish() must
     buffer the message rather than dropping it. Returns True so caller
-    treats as success — fire-and-forget semantics same as in-process bus."""
+    treats as success — fire-and-forget semantics same as in-process bus.
+
+    Per SPEC §8.0.ter, publish() ALWAYS enqueues (regardless of sock state)
+    — the writer thread is the sole socket-toucher."""
     client = _make_client()
     assert client._sock is None  # not started
 
@@ -68,31 +66,61 @@ def test_publish_buffers_when_sock_is_none():
 
     assert result is True, "publish must return True so worker doesn't treat as failure"
     assert len(client._outbound_buffer) == 1, "message must be buffered"
-    assert client._outbound_buffer[0] is msg
+    assert _unpack(client._outbound_buffer[0])["type"] == "MODULE_READY"
 
 
 def test_publish_buffer_preserves_fifo_order():
-    """Buffer drains in FIFO — first publish before connect = first sent."""
+    """Buffer drains in FIFO — first publish before connect = first sent.
+    Order preserved across pack → enqueue → drain cycle."""
     client = _make_client()
     msgs = [{"type": f"MSG_{i}", "src": "x", "dst": "y", "payload": {}} for i in range(5)]
     for m in msgs:
         client.publish(m)
 
-    assert list(client._outbound_buffer) == msgs
+    buffered_types = [_unpack(b)["type"] for b in client._outbound_buffer]
+    expected_types = [m["type"] for m in msgs]
+    assert buffered_types == expected_types
 
 
-def test_publish_buffer_bounded_at_256():
-    """Buffer maxlen=256; overflow drops oldest. Worker boot bursts are
-    well under 256 (MODULE_READY + first heartbeat + a few state
-    publishes). Any worker hitting this cap has a runaway publish bug."""
+def test_publish_buffer_is_unbounded_per_spec_8_0_ter():
+    """Buffer is UNBOUNDED per SPEC §8.0 P0 never-drop guarantee — every
+    enqueued frame is preserved until drained. Backpressure surfaces as
+    rate-limited high-water WARN (see Chunk 4), not as a silent drop.
+
+    Pre-§8.0.ter the buffer was deque(maxlen=256) which would silently
+    drop oldest frames on overflow — a P0 violation per §8.0.
+    """
     client = _make_client()
-    for i in range(300):
+    # Push well past the old maxlen=256 to prove no drops.
+    n = 1500
+    for i in range(n):
         client.publish({"type": f"MSG_{i}", "src": "x", "dst": "y", "payload": {}})
 
-    assert len(client._outbound_buffer) == 256, "deque maxlen=256"
-    # Oldest dropped: MSG_0..MSG_43 evicted; buffer holds MSG_44..MSG_299
-    assert client._outbound_buffer[0]["type"] == "MSG_44"
-    assert client._outbound_buffer[-1]["type"] == "MSG_299"
+    assert len(client._outbound_buffer) == n, (
+        f"buffer must keep all {n} frames; got {len(client._outbound_buffer)}"
+    )
+    # First + last present in FIFO order — no eviction.
+    assert _unpack(client._outbound_buffer[0])["type"] == "MSG_0"
+    assert _unpack(client._outbound_buffer[-1])["type"] == f"MSG_{n - 1}"
+
+
+def test_publish_high_water_warn_fires_after_threshold(caplog):
+    """Once depth crosses OUTBOUND_BUFFER_HIGH_WATER (1000), a rate-limited
+    WARN per the SPEC §8.0.ter spec is emitted. This is operator-visible
+    backpressure signal — the producing module is named in the log line.
+    """
+    import logging
+    client = _make_client(name="testworker")
+    caplog.set_level(logging.WARNING, logger="titan_hcl.core.bus_socket")
+    for i in range(OUTBOUND_BUFFER_HIGH_WATER + 5):
+        client.publish({"type": f"MSG_{i}", "src": "x", "dst": "y", "payload": {}})
+
+    matches = [
+        r for r in caplog.records
+        if "outbound buffer high water" in r.getMessage()
+           and "testworker" in r.getMessage()
+    ]
+    assert matches, "expected at least one high-water WARN naming the client"
 
 
 # ── Flush after connect ────────────────────────────────────────────────
@@ -100,23 +128,33 @@ def test_publish_buffer_bounded_at_256():
 
 def test_flush_drains_buffer_over_live_socket():
     """After connect, _flush_outbound_buffer drains buffered messages
-    over the now-live socket via send_frame."""
+    over the now-live socket via send_frame.
+
+    Post-§8.0.ter the buffer holds pre-packed bytes; flush is pure I/O
+    (no re-pack)."""
     client = _make_client()
-    # Pre-populate buffer
+    # Pre-populate buffer through the canonical publish() path.
     msgs = [{"type": f"MSG_{i}", "src": "x", "dst": "y", "payload": {}} for i in range(3)]
     for m in msgs:
         client.publish(m)
     assert len(client._outbound_buffer) == 3
 
-    # Inject fake live socket
+    # Inject fake live socket.
     fake_sock = MagicMock()
     client._sock = fake_sock
 
-    with patch("titan_plugin.core.bus_socket.send_frame") as mock_send:
+    with patch("titan_hcl.core.bus_socket.send_frame") as mock_send:
         client._flush_outbound_buffer()
 
     assert mock_send.call_count == 3, "all 3 buffered messages sent"
     assert len(client._outbound_buffer) == 0, "buffer cleared after flush"
+
+    # send_frame called with pre-packed bytes (verify via decode round-trip).
+    sent_types = [
+        _unpack(call.args[1])["type"]
+        for call in mock_send.call_args_list
+    ]
+    assert sent_types == [m["type"] for m in msgs], "FIFO preserved through drain"
 
 
 def test_flush_with_empty_buffer_is_noop():
@@ -124,7 +162,7 @@ def test_flush_with_empty_buffer_is_noop():
     client = _make_client()
     client._sock = MagicMock()
 
-    with patch("titan_plugin.core.bus_socket.send_frame") as mock_send:
+    with patch("titan_hcl.core.bus_socket.send_frame") as mock_send:
         client._flush_outbound_buffer()
 
     mock_send.assert_not_called()
@@ -145,7 +183,10 @@ def test_flush_when_sock_is_none_is_noop():
 
 def test_flush_rebuffers_unsent_tail_on_connection_break():
     """If the socket breaks mid-flush, the unsent tail must be re-buffered
-    (prepended to the front) so next reconnect retries them in order."""
+    (prepended to the front) so next reconnect retries them in order.
+
+    Per §8.0.ter the buffer holds packed bytes; the re-prepend logic
+    operates on bytes, not dicts, but FIFO order is identical."""
     client = _make_client()
     msgs = [{"type": f"MSG_{i}", "src": "x", "dst": "y", "payload": {}} for i in range(5)]
     for m in msgs:
@@ -154,61 +195,78 @@ def test_flush_rebuffers_unsent_tail_on_connection_break():
     fake_sock = MagicMock()
     client._sock = fake_sock
 
-    # send_frame succeeds for MSG_0+MSG_1, fails on MSG_2 with ConnectionError
+    # send_frame succeeds for MSG_0+MSG_1, fails on MSG_2 with ConnectionError.
     call_count = [0]
     def send_side_effect(sock, payload):
         call_count[0] += 1
         if call_count[0] == 3:
             raise ConnectionError("simulated mid-flush break")
 
-    with patch("titan_plugin.core.bus_socket.send_frame", side_effect=send_side_effect):
+    with patch("titan_hcl.core.bus_socket.send_frame", side_effect=send_side_effect):
         client._flush_outbound_buffer()
 
     # Tail (MSG_2, MSG_3, MSG_4) must be re-buffered in order.
-    remaining = [m["type"] for m in client._outbound_buffer]
+    remaining = [_unpack(b)["type"] for b in client._outbound_buffer]
     assert remaining == ["MSG_2", "MSG_3", "MSG_4"], (
         f"unsent tail must be re-buffered FIFO; got {remaining}"
     )
 
 
-# ── _raw_send buffers on mid-send connection break ─────────────────────
+# ── _raw_send buffers on every publish (post-§8.0.ter — no mid-send branch) ──
 
 
-def test_raw_send_buffers_on_connection_error_mid_send():
-    """If sock is non-None but send_frame raises ConnectionError (broker
-    died between sock-check and write), buffer the message so next
-    reconnect retries. Caller still sees True (eventual delivery)."""
+def test_raw_send_always_enqueues_never_calls_send_frame():
+    """Post-§8.0.ter, `_raw_send` MUST NOT call `send_frame` directly under
+    any circumstance — that's the writer thread's sole responsibility.
+
+    Pre-§8.0.ter, `_raw_send` checked sock and called send_frame inline
+    when sock was non-None. Now it always enqueues + signals the writer."""
     client = _make_client()
     fake_sock = MagicMock()
-    client._sock = fake_sock
+    client._sock = fake_sock  # even with a live sock, _raw_send must not write
 
     msg = {"type": "MODULE_READY", "src": "x", "dst": "guardian", "payload": {}}
+    with patch("titan_hcl.core.bus_socket.send_frame") as mock_send:
+        result = client._raw_send(msg)
+
+    assert result is True, "enqueue succeeded"
+    assert mock_send.call_count == 0, (
+        "SPEC §8.0.ter: _raw_send MUST NOT touch the socket. "
+        "Writer thread is the sole send_frame caller."
+    )
+    assert len(client._outbound_buffer) == 1
+    assert _unpack(client._outbound_buffer[0])["type"] == "MODULE_READY"
+
+
+def test_raw_send_signals_outbound_event():
+    """Every successful enqueue must signal _outbound_event so the writer
+    thread wakes promptly (microsecond wake latency)."""
+    client = _make_client()
+    client._outbound_event.clear()  # start cleared
+    assert not client._outbound_event.is_set()
+
+    client.publish({"type": "MSG", "src": "x", "dst": "y", "payload": {}})
+
+    assert client._outbound_event.is_set(), (
+        "publish() must set _outbound_event so the writer thread wakes"
+    )
+
+
+def test_raw_send_returns_false_and_does_not_enqueue_on_validation_failure():
+    """If `_packb_safe` raises (unencodable payload / contract violation),
+    `_raw_send` must return False AND not enqueue. This is the fail-fast
+    accountability point per rFP_bus_payload_contracts §4: producer learns
+    about the violation; bad frame never enters the buffer."""
+    client = _make_client()
+    msg = {"type": "TEST", "src": "x", "dst": "y", "payload": {}}
+
     with patch(
-        "titan_plugin.core.bus_socket.send_frame",
-        side_effect=ConnectionError("broker dropped"),
+        "titan_hcl.core.bus_socket._packb_safe",
+        side_effect=TypeError("unencodable"),
     ):
         result = client._raw_send(msg)
 
-    assert result is True, "buffered = success from caller's view"
-    assert len(client._outbound_buffer) == 1
-    assert client._outbound_buffer[0] is msg
-
-
-# ── B.3 seam ────────────────────────────────────────────────────────────
-
-
-def test_b3_cleanup_seam_documented():
-    """Pin the comment that documents the B.3 deletion seam — buffer
-    survives B.3 (kernel swaps need it); only the legacy mp.Queue
-    fallback path retires."""
-    import inspect
-
-    from titan_plugin.core import bus_socket as bs
-
-    src = inspect.getsource(bs.BusSocketClient)
-    assert "B.3 cleanup" in src or "Phase B.2 IPC §D8" in src, (
-        "The B.3 cleanup notes in BusSocketClient must remain. They "
-        "tell a future maintainer the buffer is permanent (kernel swap "
-        "uses it) while the mp.Queue fallback retires. Don't remove "
-        "without updating B.3 cleanup PLAN."
+    assert result is False, "validation failure → False return"
+    assert len(client._outbound_buffer) == 0, (
+        "bad frame must NOT be enqueued; writer would just drop it later"
     )

@@ -1,4 +1,4 @@
-"""Unit tests for titan_plugin.logic.knowledge_cache (KP-2).
+"""Unit tests for titan_hcl.logic.knowledge_cache (KP-2).
 
 Each test uses a fresh tmp DB path so runs are hermetic. Covers:
   * resolve_ttl() mapping — success types + failure taxonomy + no-cache
@@ -17,14 +17,14 @@ import time
 
 import pytest
 
-from titan_plugin.logic.knowledge_cache import (
+from titan_hcl.logic.knowledge_cache import (
     CacheEntry,
     KnowledgeCache,
     TTL_FAILURE,
     TTL_SUCCESS,
     resolve_ttl,
 )
-from titan_plugin.logic.knowledge_router import QueryType
+from titan_hcl.logic.knowledge_router import QueryType
 
 
 @pytest.fixture

@@ -12,7 +12,7 @@ import unittest.mock
 for _mod in ["solana.rpc.async_api", "solana.rpc.commitment", "solders.pubkey", "cognee"]:
     sys.modules.setdefault(_mod, unittest.mock.MagicMock())
 
-from titan_plugin.core.memory import TieredMemoryGraph
+from titan_hcl.core.memory import TieredMemoryGraph
 
 async def run_turing_vibe_test():
     """

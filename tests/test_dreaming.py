@@ -6,7 +6,7 @@ root fix), and edge cases around mixed-dim / empty / no-significant buffers.
 """
 import pytest
 
-from titan_plugin.logic.dreaming import DreamingEngine
+from titan_hcl.logic.dreaming import DreamingEngine
 
 
 def _mk_engine(threshold: float = 0.85, distill_threshold: float = 0.005):

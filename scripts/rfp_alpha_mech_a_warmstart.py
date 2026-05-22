@@ -13,12 +13,12 @@ Safety design
 -------------
 1. Default output path is STAGED (`sequence_quality.json.warmstart`).
    User promotes it to `sequence_quality.json` only after reviewing.
-2. Detects running T1 titan_main process — warns if found (don't write
+2. Detects running T1 titan_hcl process — warns if found (don't write
    to main file while engine has it mapped in memory; live engine's
    periodic save_all would clobber our seed).
 3. `--dry-run` prints full preview without writing anything.
 4. `--deploy` promotes staged → main file; requires T1 to be stopped
-   (hard fail if pgrep finds titan_main running).
+   (hard fail if pgrep finds titan_hcl running).
 5. Filters: chain_length >= 4 (excludes pre-TUNING-015 len-3 monoculture);
    created_at cutoff configurable (default: TUNING-015 commit date);
    outcome_score >= 0 (excludes null / invalid rows).
@@ -26,7 +26,7 @@ Safety design
 Workflow
 --------
 Offline seed + deploy:
-    $ bash scripts/safe_restart.sh t1 --stop        # (or equivalent stop)
+    $ bash scripts/t1_manage.sh stop
     $ python scripts/rfp_alpha_mech_a_warmstart.py --dry-run
     $ python scripts/rfp_alpha_mech_a_warmstart.py  # writes staged file
     $ python scripts/rfp_alpha_mech_a_warmstart.py --deploy
@@ -67,7 +67,7 @@ from datetime import datetime, timezone
 # Make project imports work when run from repo root
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from titan_plugin.logic.reasoning import SequenceQualityStore  # noqa: E402
+from titan_hcl.logic.reasoning import SequenceQualityStore  # noqa: E402
 
 
 # ── Constants ─────────────────────────────────────────────────────
@@ -86,10 +86,10 @@ MAIN_FILENAME = "sequence_quality.json"
 
 
 def _t1_running() -> bool:
-    """Return True if titan_main is running locally."""
+    """Return True if titan_hcl is running locally."""
     try:
         r = subprocess.run(
-            ["pgrep", "-f", "titan_main"],
+            ["pgrep", "-f", "titan_hcl"],
             capture_output=True, text=True, timeout=3)
         return r.returncode == 0 and bool(r.stdout.strip())
     except Exception:
@@ -243,7 +243,7 @@ def main() -> int:
     # ── Deploy mode: promote staged → main ───────────────────────
     if args.deploy:
         if _t1_running():
-            print("ERROR: T1 titan_main is running. Stop T1 before --deploy —",
+            print("ERROR: T1 titan_hcl is running. Stop T1 before --deploy —",
                   "otherwise the live engine's periodic save_all would clobber",
                   "the warm-start seed.", file=sys.stderr)
             return 2
@@ -328,9 +328,9 @@ def main() -> int:
     print()
     print("  Next steps:")
     print(f"    1. Review staged file: less {staged_path}")
-    print(f"    2. Stop T1: bash scripts/safe_restart.sh t1 --stop  (or kill)")
+    print(f"    2. Stop T1: bash scripts/t1_manage.sh stop")
     print(f"    3. Deploy: python {__file__} --deploy")
-    print(f"    4. Start T1: bash scripts/safe_restart.sh t1")
+    print(f"    4. Start T1: bash scripts/t1_manage.sh start")
     return 0
 
 

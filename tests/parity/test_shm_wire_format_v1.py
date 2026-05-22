@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from titan_plugin.core.state_registry import (
+from titan_hcl.core.state_registry import (
     BUFFER_COUNT,
     BUFFER_META_SIZE,
     BUFFER_META_STRUCT,

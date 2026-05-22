@@ -1,6 +1,6 @@
 """Tests for Experience Memory (ex_mem) — action outcome learning."""
 import pytest
-from titan_plugin.logic.experience_memory import ExperienceMemory
+from titan_hcl.logic.experience_memory import ExperienceMemory
 
 
 def _fresh(tmp_path, name):

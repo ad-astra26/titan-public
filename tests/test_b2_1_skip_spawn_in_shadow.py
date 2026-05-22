@@ -31,8 +31,8 @@ from unittest.mock import patch
 
 import pytest
 
-from titan_plugin import bus as bus_mod
-from titan_plugin.guardian import Guardian, ModuleSpec
+from titan_hcl import bus as bus_mod
+from titan_hcl.guardian import Guardian, ModuleSpec
 
 
 def _noop_entry(*args, **kwargs):  # pragma: no cover
@@ -131,7 +131,7 @@ def test_phase_shadow_boot_b2_1_sets_env_and_relaxes_health():
        (b) _wait_for_health is called with relaxed HealthCriteria
            (min_modules_running=5)
     """
-    from titan_plugin.core import shadow_orchestrator as so
+    from titan_hcl.core import shadow_orchestrator as so
 
     captured_env: dict = {}
     captured_criteria = []
@@ -152,14 +152,17 @@ def test_phase_shadow_boot_b2_1_sets_env_and_relaxes_health():
     fake_kernel = type("K", (), {})()
     fake_kernel.bus = bus_mod.DivineBus(maxsize=10)
     fake_kernel.guardian = None
+    # _phase_shadow_boot reads kernel._config for api_process_separation; with
+    # it enabled, "api" stays in the relaxed b2_1 critical set.
+    fake_kernel._config = {"microkernel": {"api_process_separation_enabled": True}}
     result = so.SwapResult(event_id="test_eid", reason="t")
 
     with patch.object(so.subprocess, "Popen", side_effect=_fake_popen), \
          patch.object(so, "_wait_for_health",
                       side_effect=_fake_wait_for_health), \
-         patch("titan_plugin.core.shadow_data_dir.copy_data_dir",
+         patch("titan_hcl.core.shadow_data_dir.copy_data_dir",
                return_value=(True, "hardlink")), \
-         patch("titan_plugin.core.shadow_data_dir.cleanup_shadow_dir"), \
+         patch("titan_hcl.core.shadow_data_dir.cleanup_shadow_dir"), \
          patch.object(so, "read_active_port", return_value=7777), \
          patch.object(so, "pick_shadow_port", return_value=7779):
         proc = so._phase_shadow_boot(
@@ -184,15 +187,17 @@ def test_phase_shadow_boot_b2_1_sets_env_and_relaxes_health():
     assert "timechain" not in crit.critical_modules
     assert "body" not in crit.critical_modules
     assert "mind" not in crit.critical_modules
-    # Spirit (fork-mode) + imw + api still must be in shadow at boot time.
-    assert "spirit" in crit.critical_modules
+    # cognitive_worker (consciousness host; D-SPEC-116 spirit→cognitive_worker)
+    # + imw + api still must be in shadow at boot time.
+    assert "cognitive_worker" in crit.critical_modules
+    assert "spirit" not in crit.critical_modules  # retired (D-SPEC-116)
     assert "imw" in crit.critical_modules
     assert "api" in crit.critical_modules
 
 
 def test_phase_shadow_boot_legacy_no_env_no_relaxation():
     """When b2_1_active=False (default): no env set, default HealthCriteria."""
-    from titan_plugin.core import shadow_orchestrator as so
+    from titan_hcl.core import shadow_orchestrator as so
 
     captured_env: dict = {}
     captured_criteria = []
@@ -213,14 +218,15 @@ def test_phase_shadow_boot_legacy_no_env_no_relaxation():
     fake_kernel = type("K", (), {})()
     fake_kernel.bus = bus_mod.DivineBus(maxsize=10)
     fake_kernel.guardian = None
+    fake_kernel._config = {}   # legacy path still reads kernel._config
     result = so.SwapResult(event_id="test_eid", reason="t")
 
     with patch.object(so.subprocess, "Popen", side_effect=_fake_popen), \
          patch.object(so, "_wait_for_health",
                       side_effect=_fake_wait_for_health), \
-         patch("titan_plugin.core.shadow_data_dir.copy_data_dir",
+         patch("titan_hcl.core.shadow_data_dir.copy_data_dir",
                return_value=(True, "hardlink")), \
-         patch("titan_plugin.core.shadow_data_dir.cleanup_shadow_dir"), \
+         patch("titan_hcl.core.shadow_data_dir.cleanup_shadow_dir"), \
          patch.object(so, "read_active_port", return_value=7777), \
          patch.object(so, "pick_shadow_port", return_value=7779):
         so._phase_shadow_boot(
@@ -242,7 +248,7 @@ def test_orchestrator_passes_b2_1_active_to_shadow_boot():
     """AST guard: orchestrate_shadow_swap must compute b2_1_active BEFORE
     calling _phase_shadow_boot and pass it as kwarg. Without this, the
     skip-spawn + relaxed-health path is dead code."""
-    import inspect, titan_plugin.core.shadow_orchestrator as so_mod
+    import inspect, titan_hcl.core.shadow_orchestrator as so_mod
     src = inspect.getsource(so_mod.orchestrate_shadow_swap)
     # Find the _phase_shadow_boot call. It must contain b2_1_active=
     boot_call_idx = src.find("_phase_shadow_boot(")

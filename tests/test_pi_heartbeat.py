@@ -2,7 +2,7 @@
 import math
 import pytest
 
-from titan_plugin.logic.pi_heartbeat import PiHeartbeatMonitor
+from titan_hcl.logic.pi_heartbeat import PiHeartbeatMonitor
 
 
 def _fresh(tmp_path, name, min_cluster=3, min_gap=2):

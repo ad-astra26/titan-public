@@ -18,7 +18,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from titan_plugin.utils.observatory_db import ObservatoryDB
+from titan_hcl.utils.observatory_db import ObservatoryDB
 
 
 @pytest.fixture
@@ -165,7 +165,7 @@ def test_prune_direct_path_keeps_vacuum_for_no_writer_case():
 def test_init_auto_construct_writer_when_config_enabled(monkeypatch, tmp_path):
     """When [persistence_observatory].enabled=true, ObservatoryDB.__init__
     auto-constructs a writer client (without needing the caller to pass one)."""
-    from titan_plugin.persistence import config as cfg_mod
+    from titan_hcl.persistence import config as cfg_mod
 
     fake_cfg = cfg_mod.IMWConfig(
         enabled=True, mode="shadow",
@@ -184,7 +184,7 @@ def test_init_auto_construct_writer_when_config_enabled(monkeypatch, tmp_path):
     fake_client_instance = MagicMock()
     fake_client_class.return_value = fake_client_instance
     monkeypatch.setattr(
-        "titan_plugin.persistence.writer_client.InnerMemoryWriterClient",
+        "titan_hcl.persistence.writer_client.InnerMemoryWriterClient",
         fake_client_class,
     )
 

@@ -12,7 +12,7 @@ Verifies:
   - R7: per-Titan contracts_dna passes through cfg["contracts_dna"] unchanged.
   - Inverse-frequency weighting math (the formula used in the
         META_STRATEGY_DRIFT handler).
-  - Contract JSON files in titan_plugin/contracts/meta_cognitive/ are valid + parseable.
+  - Contract JSON files in titan_hcl/contracts/meta_cognitive/ are valid + parseable.
   - load_meta_cognitive_contracts loader is callable + computes a stable
         bundle hash.
 """
@@ -24,7 +24,7 @@ import os
 import numpy as np
 import pytest
 
-from titan_plugin.logic.meta_reasoning import (
+from titan_hcl.logic.meta_reasoning import (
     META_PRIMITIVES,
     NUM_META_ACTIONS,
     MetaReasoningEngine,
@@ -32,9 +32,9 @@ from titan_plugin.logic.meta_reasoning import (
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# Phase C contracts live INSIDE the package (titan_plugin/contracts/...) so
+# Phase C contracts live INSIDE the package (titan_hcl/contracts/...) so
 # they ship via git pull. data/ is per-Titan runtime state and must not sync.
-CONTRACTS_DIR = os.path.join(REPO_ROOT, "titan_plugin", "contracts", "meta_cognitive")
+CONTRACTS_DIR = os.path.join(REPO_ROOT, "titan_hcl", "contracts", "meta_cognitive")
 
 
 # ── R1: enriched _conclude_chain return dict ─────────────────────────
@@ -329,7 +329,7 @@ class TestContractJsons:
 class TestContractsDnaParsing:
     def test_titan_params_has_section(self):
         import tomllib
-        params_path = os.path.join(REPO_ROOT, "titan_plugin", "titan_params.toml")
+        params_path = os.path.join(REPO_ROOT, "titan_hcl", "titan_params.toml")
         with open(params_path, "rb") as f:
             d = tomllib.load(f)
         assert "cognitive_contracts_dna" in d

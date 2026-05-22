@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from titan_plugin.core.sensor_cache import (
+from titan_hcl.core.sensor_cache import (
     start_shm_writer_thread,
     stop_threads,
 )
@@ -63,7 +63,7 @@ def test_spirit_holder_writer_thread_writes_45d_at_schumann_x9(isolated_shm_root
     - cadence is in the Schumann × 9 ballpark
     """
     config = {"microkernel": {"shm_spirit_fast_enabled": True}}
-    from titan_plugin.core.state_registry import INNER_SPIRIT_45D, RegistryBank
+    from titan_hcl.core.state_registry import INNER_SPIRIT_45D, RegistryBank
 
     bank = RegistryBank(titan_id=None, config=config)
     assert bank.is_enabled(INNER_SPIRIT_45D)
@@ -115,7 +115,7 @@ def test_spirit_holder_empty_tick_skips_write(isolated_shm_root):
     must skip cleanly without errors and no shm file should be created.
     """
     config = {"microkernel": {"shm_spirit_fast_enabled": True}}
-    from titan_plugin.core.state_registry import INNER_SPIRIT_45D, RegistryBank
+    from titan_hcl.core.state_registry import INNER_SPIRIT_45D, RegistryBank
 
     bank = RegistryBank(titan_id=None, config=config)
     writer = bank.writer(INNER_SPIRIT_45D)
@@ -157,7 +157,7 @@ def test_spirit_holder_concurrent_update_no_torn_state(isolated_shm_root):
     writer thread reads + writes — no torn data.
     """
     config = {"microkernel": {"shm_spirit_fast_enabled": True}}
-    from titan_plugin.core.state_registry import INNER_SPIRIT_45D, RegistryBank
+    from titan_hcl.core.state_registry import INNER_SPIRIT_45D, RegistryBank
 
     bank = RegistryBank(titan_id=None, config=config)
     writer = bank.writer(INNER_SPIRIT_45D)
@@ -214,7 +214,7 @@ def test_spirit_holder_concurrent_update_no_torn_state(isolated_shm_root):
 def test_spirit_writer_stops_on_event(isolated_shm_root):
     """stop_event halts the writer thread cleanly."""
     config = {"microkernel": {"shm_spirit_fast_enabled": True}}
-    from titan_plugin.core.state_registry import INNER_SPIRIT_45D, RegistryBank
+    from titan_hcl.core.state_registry import INNER_SPIRIT_45D, RegistryBank
 
     bank = RegistryBank(titan_id=None, config=config)
     writer = bank.writer(INNER_SPIRIT_45D)

@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from titan_plugin.logic.backup_cascade import BackupCascade
+from titan_hcl.logic.backup_cascade import BackupCascade
 
 
 def _make_tarball_bytes(payload: bytes = b"hello world") -> tuple[bytes, str]:
@@ -208,7 +208,7 @@ def test_timechain_snapshot_to_arweave_uses_cascade(tmp_path, monkeypatch):
     Covers the wiring: TimeChainBackup constructs BackupCascade, passes
     full_config through, and the cascade handles S2-S10 around the upload.
     """
-    from titan_plugin.logic.timechain_backup import TimeChainBackup
+    from titan_hcl.logic.timechain_backup import TimeChainBackup
 
     class _FakeStore:
         async def upload_file_bytes(self, data, tags, ct):
@@ -245,7 +245,7 @@ def test_timechain_snapshot_to_arweave_uses_cascade(tmp_path, monkeypatch):
     monkeypatch.setattr(tcb, "create_snapshot_tarball",
                         lambda: (fake_tarball, fake_metadata))
     # Bypass S4 (no real Irys query in tests)
-    from titan_plugin.logic.backup_cascade import BackupCascade
+    from titan_hcl.logic.backup_cascade import BackupCascade
     monkeypatch.setattr(BackupCascade, "check_irys_balance",
                         lambda self, size_mb: (True, 1.0, "test"))
     # Don't let _record_arweave_anchor touch real manifest

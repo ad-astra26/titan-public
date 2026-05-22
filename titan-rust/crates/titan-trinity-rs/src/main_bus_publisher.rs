@@ -106,7 +106,7 @@ pub async fn publish_sphere_pulse(
 ) -> Result<(), MainBusError> {
     let payload = encode_sphere_pulse_payload(pulse, ts);
     client
-        .publish("SPHERE_PULSE", Some("all"), Some(&payload))
+        .publish("SPHERE_PULSE", Some("all"), Some(payload))
         .await?;
     Ok(())
 }
@@ -120,7 +120,7 @@ pub async fn publish_sphere_epoch_tick(
 ) -> Result<(), MainBusError> {
     let payload = encode_epoch_tick_payload(epoch_id, ts);
     client
-        .publish("SPHERE_EPOCH_TICK", Some("all"), Some(&payload))
+        .publish("SPHERE_EPOCH_TICK", Some("all"), Some(payload))
         .await?;
     Ok(())
 }
@@ -136,7 +136,7 @@ pub async fn publish_topology_updated(client: &BusClient, ts: f64) -> Result<(),
         .publish(
             "TRINITY_SUBSTRATE_TOPOLOGY_UPDATED",
             Some("all"),
-            Some(&payload),
+            Some(payload),
         )
         .await?;
     Ok(())
@@ -225,9 +225,10 @@ pub fn spawn_inbound_dispatch(
     })
 }
 
-/// Encode SPHERE_PULSE payload per SPEC §8.6.
-fn encode_sphere_pulse_payload(pulse: &PulseEvent, ts: f64) -> Vec<u8> {
-    let entries = vec![
+/// Build SPHERE_PULSE payload as `rmpv::Value::Map` per SPEC §8.6 + §8.10
+/// byte-identical guarantee.
+fn encode_sphere_pulse_payload(pulse: &PulseEvent, ts: f64) -> rmpv::Value {
+    rmpv::Value::Map(vec![
         (
             rmpv::Value::String("clock_name".into()),
             rmpv::Value::String(pulse.role.as_str().into()),
@@ -240,36 +241,36 @@ fn encode_sphere_pulse_payload(pulse: &PulseEvent, ts: f64) -> Vec<u8> {
             rmpv::Value::String("phase".into()),
             rmpv::Value::F64(pulse.phase as f64),
         ),
+        (
+            rmpv::Value::String("balanced".into()),
+            rmpv::Value::Boolean(pulse.balanced),
+        ),
+        (
+            rmpv::Value::String("consecutive_balanced".into()),
+            rmpv::Value::Integer(rmpv::Integer::from(pulse.consecutive_balanced as u64)),
+        ),
         (rmpv::Value::String("ts".into()), rmpv::Value::F64(ts)),
-    ];
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(entries))
-        .expect("msgpack encode never fails for fixed-size known-good payload");
-    buf
+    ])
 }
 
-/// Encode SPHERE_EPOCH_TICK payload per SPEC §8.6.
-fn encode_epoch_tick_payload(epoch_id: u64, ts: f64) -> Vec<u8> {
-    let entries = vec![
+/// Build SPHERE_EPOCH_TICK payload as `rmpv::Value::Map` per SPEC §8.6.
+fn encode_epoch_tick_payload(epoch_id: u64, ts: f64) -> rmpv::Value {
+    rmpv::Value::Map(vec![
         (
             rmpv::Value::String("epoch_id".into()),
             rmpv::Value::Integer(rmpv::Integer::from(epoch_id)),
         ),
         (rmpv::Value::String("ts".into()), rmpv::Value::F64(ts)),
-    ];
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(entries))
-        .expect("msgpack encode never fails for fixed-size known-good payload");
-    buf
+    ])
 }
 
-/// Encode TRINITY_SUBSTRATE_TOPOLOGY_UPDATED payload per SPEC §8.6.
-fn encode_topology_updated_payload(ts: f64) -> Vec<u8> {
-    let entries = vec![(rmpv::Value::String("ts".into()), rmpv::Value::F64(ts))];
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(entries))
-        .expect("msgpack encode never fails for fixed-size known-good payload");
-    buf
+/// Build TRINITY_SUBSTRATE_TOPOLOGY_UPDATED payload as `rmpv::Value::Map` per
+/// SPEC §8.6 (signal-only — consumers read shm slot for content).
+fn encode_topology_updated_payload(ts: f64) -> rmpv::Value {
+    rmpv::Value::Map(vec![(
+        rmpv::Value::String("ts".into()),
+        rmpv::Value::F64(ts),
+    )])
 }
 
 #[cfg(test)]
@@ -377,9 +378,8 @@ mod tests {
         assert!(frames.len() >= 2);
         let header = decode_header(&frames[1]).unwrap();
         assert_eq!(header.msg_type.as_deref(), Some("SPHERE_PULSE"));
-        let payload_bytes = extract_payload(&frames[1]).unwrap();
-        let payload: rmpv::Value =
-            rmpv::decode::read_value(&mut std::io::Cursor::new(&payload_bytes[..])).unwrap();
+        // §4.C-ter wire-format: extract_payload returns nested Value::Map directly
+        let payload = extract_payload(&frames[1]).unwrap();
         let map = match payload {
             rmpv::Value::Map(m) => m,
             other => panic!("expected map, got {other:?}"),
@@ -387,6 +387,7 @@ mod tests {
         let mut got_clock = None;
         let mut got_phase = None;
         let mut got_pulse_count = None;
+        let mut got_consec_balanced = None;
         let mut got_ts = None;
         for (k, v) in map {
             if let rmpv::Value::String(s) = &k {
@@ -394,6 +395,7 @@ mod tests {
                     Some("clock_name") => got_clock = v.as_str().map(String::from),
                     Some("phase") => got_phase = v.as_f64(),
                     Some("pulse_count") => got_pulse_count = v.as_u64(),
+                    Some("consecutive_balanced") => got_consec_balanced = v.as_u64(),
                     Some("ts") => got_ts = v.as_f64(),
                     _ => {}
                 }
@@ -402,6 +404,7 @@ mod tests {
         assert_eq!(got_clock.as_deref(), Some("inner_body"));
         assert!((got_phase.unwrap() - 1.5).abs() < 1e-6);
         assert_eq!(got_pulse_count, Some(42));
+        assert_eq!(got_consec_balanced, Some(7));
         assert!((got_ts.unwrap() - 1234567890.5).abs() < 1e-3);
     }
 

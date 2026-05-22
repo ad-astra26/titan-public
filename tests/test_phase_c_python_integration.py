@@ -32,19 +32,19 @@ class TestDriftAliases:
     """Each rename pair: import old name → equals canonical value."""
 
     def test_d01_restart_backoff_base(self):
-        from titan_plugin._phase_c_constants import (
+        from titan_hcl._phase_c_constants import (
             SUPERVISION_RESTART_BACKOFF_MAX_S,
         )
-        from titan_plugin._phase_c_drift_aliases import RESTART_BACKOFF_BASE
+        from titan_hcl._phase_c_drift_aliases import RESTART_BACKOFF_BASE
 
         assert RESTART_BACKOFF_BASE == SUPERVISION_RESTART_BACKOFF_MAX_S
 
     def test_d02_max_restarts_in_window_and_window_seconds(self):
-        from titan_plugin._phase_c_constants import (
+        from titan_hcl._phase_c_constants import (
             SUPERVISION_INTENSITY_WINDOW_S,
             SUPERVISION_MAX_RESTARTS,
         )
-        from titan_plugin._phase_c_drift_aliases import (
+        from titan_hcl._phase_c_drift_aliases import (
             MAX_RESTARTS_IN_WINDOW,
             RESTART_WINDOW_SECONDS,
         )
@@ -53,11 +53,11 @@ class TestDriftAliases:
         assert RESTART_WINDOW_SECONDS == SUPERVISION_INTENSITY_WINDOW_S
 
     def test_d03_heartbeat(self):
-        from titan_plugin._phase_c_constants import (
+        from titan_hcl._phase_c_constants import (
             MODULE_HEARTBEAT_INTERVAL_S,
             MODULE_HEARTBEAT_TIMEOUT_S,
         )
-        from titan_plugin._phase_c_drift_aliases import (
+        from titan_hcl._phase_c_drift_aliases import (
             HEARTBEAT_INTERVAL,
             HEARTBEAT_TIMEOUT,
         )
@@ -66,8 +66,8 @@ class TestDriftAliases:
         assert HEARTBEAT_TIMEOUT == MODULE_HEARTBEAT_TIMEOUT_S
 
     def test_d06_authkey(self):
-        from titan_plugin._phase_c_constants import AUTHKEY_BYTES, AUTHKEY_HKDF_SALT
-        from titan_plugin._phase_c_drift_aliases import (
+        from titan_hcl._phase_c_constants import AUTHKEY_BYTES, AUTHKEY_HKDF_SALT
+        from titan_hcl._phase_c_drift_aliases import (
             BUS_AUTHKEY_LEN,
             BUS_AUTHKEY_SALT,
         )
@@ -76,11 +76,11 @@ class TestDriftAliases:
         assert BUS_AUTHKEY_LEN == AUTHKEY_BYTES
 
     def test_d07_frame_handshake_sizes(self):
-        from titan_plugin._phase_c_constants import (
+        from titan_hcl._phase_c_constants import (
             FRAME_AUTH_TAG_BYTES,
             FRAME_CHALLENGE_BYTES,
         )
-        from titan_plugin._phase_c_drift_aliases import (
+        from titan_hcl._phase_c_drift_aliases import (
             AUTH_TAG_SIZE,
             CHALLENGE_SIZE,
         )
@@ -89,11 +89,11 @@ class TestDriftAliases:
         assert AUTH_TAG_SIZE == FRAME_AUTH_TAG_BYTES
 
     def test_d19_reconnect_backoff_ms_to_s_conversion(self):
-        from titan_plugin._phase_c_constants import (
+        from titan_hcl._phase_c_constants import (
             BUS_RECONNECT_BACKOFF_INITIAL_MS,
             BUS_RECONNECT_BACKOFF_MAX_S,
         )
-        from titan_plugin._phase_c_drift_aliases import (
+        from titan_hcl._phase_c_drift_aliases import (
             RECONNECT_BACKOFF_BASE_S,
             RECONNECT_BACKOFF_MAX_S,
         )
@@ -102,7 +102,7 @@ class TestDriftAliases:
         assert RECONNECT_BACKOFF_MAX_S == BUS_RECONNECT_BACKOFF_MAX_S
 
     def test_drift_aliases_module_all_exports_resolve(self):
-        from titan_plugin import _phase_c_drift_aliases as a
+        from titan_hcl import _phase_c_drift_aliases as a
 
         # Every name in __all__ must resolve and be non-None
         assert len(a.__all__) >= 25
@@ -120,7 +120,7 @@ class TestL0RustFlag:
         except ImportError:
             import tomli as tomllib  # py310
 
-        cfg_path = Path(__file__).parent.parent / "titan_plugin" / "config.toml"
+        cfg_path = Path(__file__).parent.parent / "titan_hcl" / "config.toml"
         with cfg_path.open("rb") as f:
             cfg = tomllib.load(f)
 
@@ -135,19 +135,18 @@ class TestL0RustFlag:
         # is sufficient to gate the contract.
         kernel_src = (
             Path(__file__).parent.parent
-            / "titan_plugin"
+            / "titan_hcl"
             / "core"
             / "kernel.py"
         ).read_text(encoding="utf-8")
         assert 'l0_rust_enabled' in kernel_src
         assert 'skipping' in kernel_src.lower()
 
-    def test_titan_watchdog_branches_on_l0_rust_enabled(self):
-        watchdog_src = (
-            Path(__file__).parent.parent / "scripts" / "titan_watchdog.sh"
-        ).read_text(encoding="utf-8")
-        assert "l0_rust_enabled" in watchdog_src
-        assert "titan-kernel-rs" in watchdog_src
+    # test_titan_watchdog_branches_on_l0_rust_enabled retired 2026-05-16 —
+    # titan_watchdog.sh was removed (cron retired 2026-05-14 Phase C migration;
+    # systemd + HCL Guardian own supervision now). l0_rust_enabled branching
+    # contract still verified at the kernel.py source level by
+    # test_kernel_py_skips_bus_broker_when_l0_rust_enabled above.
 
 
 # ─── Bus census per-Titan path (D11) ──────────────────────────────────────
@@ -170,7 +169,7 @@ class TestBusCensusPerTitanPath:
                 os.environ.pop(k, None)
             for k, v in env_overrides.items():
                 os.environ[k] = v
-            from titan_plugin.core import bus_census  # noqa: WPS433
+            from titan_hcl.core import bus_census  # noqa: WPS433
 
             importlib.reload(bus_census)
             return bus_census.CENSUS_LOG_PATH
@@ -369,9 +368,15 @@ class TestSupervisionLogReader:
 class TestDriftBridgeDualEmit:
     """Verify bus_socket.publish() dual-emits canonical ↔ legacy."""
 
+    @pytest.mark.skip(reason=(
+        "D8-1 retirement (2026-05-16) — BusSocketServer Python class "
+        "deleted; _PHASE_C_BRIDGE_PAIRS Phase B drift-bridge table went "
+        "with it. titan-kernel-rs (Rust) owns the bus broker under "
+        "fleet-wide Phase C; cross-name bridging handled inside the "
+        "Rust broker per SPEC §8.2 v1.3.0 multi-name BUS_SUBSCRIBE."))
     def test_bridge_pairs_table_covers_d13_d14_d15(self):
         # Source-level check: each canonical name maps back to its legacy peer
-        from titan_plugin.core.bus_socket import BusSocketServer
+        from titan_hcl.core.bus_socket import BusSocketServer  # noqa: F401 — DELETED D8-1
 
         pairs = BusSocketServer._PHASE_C_BRIDGE_PAIRS
         # D13: SWAP_HANDOFF
@@ -389,7 +394,7 @@ class TestDriftBridgeDualEmit:
         assert pairs["KERNEL_EPOCH_TICK"] == "EPOCH_TICK"
 
     def test_bus_module_has_canonical_names(self):
-        from titan_plugin import bus
+        from titan_hcl import bus
 
         # New canonical names alongside legacy
         assert bus.SWAP_HANDOFF == "SWAP_HANDOFF"

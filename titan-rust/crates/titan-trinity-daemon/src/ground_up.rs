@@ -1,5 +1,5 @@
 //! ground_up — Per-daemon GROUND_UP grounding nudge (Rust 1:1 port of
-//! `titan_plugin/logic/ground_up.py`).
+//! `titan_hcl/logic/ground_up.py`).
 //!
 //! # SPEC ground truths
 //!
@@ -206,17 +206,22 @@ impl GroundUpEnricher {
         GroundUpNudge { nudge, magnitude }
     }
 
-    /// Apply the computed nudge to a body[0:5] vector in place.
+    /// Apply the currently-**held** nudge (`self.prev_nudge`, last set by
+    /// [`compute_nudge`]) to a body[0:5] vector in place — WITHOUT recomputing.
     /// Returns Err if `self.side != Side::Body`.
     ///
-    /// Implements `ground_up.py:124-130`:
-    ///     `delta = nudge[i] * strength * min(dt, 30.0); body[i] = clamp(body[i] + delta, 0.0, 1.0)`
-    pub fn apply_to_body(
-        &mut self,
-        body: &mut [f32; 5],
-        topology_lower: &[f32; 10],
-        dt_s: f32,
-    ) -> DaemonResult<()> {
+    /// SPEC §G5.1 / Phase 0 chunk 0E (D-SPEC-97 refinement, v1.36.2): the
+    /// nudge is *recomputed* only on `KERNEL_EPOCH_TICK` (via
+    /// [`compute_nudge`], which evolves the per-epoch 0.95 damping EMA at
+    /// epoch cadence); this method *applies* that held value every Schumann
+    /// tick so the grounding offset manifests continuously in the per-tick-
+    /// recomputed tensor (symmetric with the held filter_down multiplier).
+    /// `dt_s` is the per-epoch unit (1.0) — applied to each tick's fresh body
+    /// it holds a steady offset (no compounding: body is rebuilt each tick).
+    ///
+    /// Implements the apply half of `ground_up.py:124-130`:
+    ///     `delta = held_nudge[i] * strength * min(dt, 30.0); body[i] = clamp(body[i] + delta, 0.0, 1.0)`
+    pub fn apply_held_to_body(&mut self, body: &mut [f32; 5], dt_s: f32) -> DaemonResult<()> {
         if self.side != Side::Body {
             // Programming error — daemon constructed wrong-Side enricher.
             // Use a structured error so the binary's main.rs can log + exit.
@@ -226,30 +231,25 @@ impl GroundUpEnricher {
                 actual_bytes: 0,
             });
         }
-        let nudge = self.compute_nudge(topology_lower);
         let dt_clamped = dt_s.clamp(0.0, GROUND_UP_DT_CLAMP_S);
-        for (b, n) in body.iter_mut().zip(nudge.nudge.iter()) {
+        for (b, n) in body.iter_mut().zip(self.prev_nudge.iter()) {
             let delta = n * self.strength * dt_clamped;
             *b = (*b + delta).clamp(0.0, 1.0);
         }
         self.apply_count = self.apply_count.saturating_add(1);
-        let abs_sum: f32 = nudge.nudge.iter().map(|n| n.abs()).sum();
+        let abs_sum: f32 = self.prev_nudge.iter().map(|n| n.abs()).sum();
         self.cumulative_delta += abs_sum;
         Ok(())
     }
 
-    /// Apply the computed nudge to a mind[0:15] vector — modifies ONLY
-    /// `mind[10:15]` (willing) per G10. Returns Err if
-    /// `self.side != Side::MindWilling`.
+    /// Apply the currently-**held** nudge to a mind[0:15] vector — modifies
+    /// ONLY `mind[10:15]` (willing) per G10, WITHOUT recomputing. Returns Err
+    /// if `self.side != Side::MindWilling`. See [`apply_held_to_body`] for the
+    /// 0E held-nudge contract.
     ///
-    /// Implements `ground_up.py:133-140`:
-    ///     `delta = nudge[i] * strength * min(dt, 30.0); mind[10+i] = clamp(mind[10+i] + delta, 0.0, 1.0)`
-    pub fn apply_to_mind(
-        &mut self,
-        mind: &mut [f32; 15],
-        topology_lower: &[f32; 10],
-        dt_s: f32,
-    ) -> DaemonResult<()> {
+    /// Implements the apply half of `ground_up.py:133-140`:
+    ///     `delta = held_nudge[i] * strength * min(dt, 30.0); mind[10+i] = clamp(mind[10+i] + delta, 0.0, 1.0)`
+    pub fn apply_held_to_mind(&mut self, mind: &mut [f32; 15], dt_s: f32) -> DaemonResult<()> {
         if self.side != Side::MindWilling {
             return Err(crate::error::DaemonError::DimMismatch {
                 expected: 15,
@@ -257,14 +257,13 @@ impl GroundUpEnricher {
                 actual_bytes: 0,
             });
         }
-        let nudge = self.compute_nudge(topology_lower);
         let dt_clamped = dt_s.clamp(0.0, GROUND_UP_DT_CLAMP_S);
         for i in 0..5 {
-            let delta = nudge.nudge[i] * self.strength * dt_clamped;
+            let delta = self.prev_nudge[i] * self.strength * dt_clamped;
             mind[10 + i] = (mind[10 + i] + delta).clamp(0.0, 1.0);
         }
         self.apply_count = self.apply_count.saturating_add(1);
-        let abs_sum: f32 = nudge.nudge.iter().map(|n| n.abs()).sum();
+        let abs_sum: f32 = self.prev_nudge.iter().map(|n| n.abs()).sum();
         self.cumulative_delta += abs_sum;
         Ok(())
     }
@@ -332,7 +331,9 @@ mod tests {
         let mut e = GroundUpEnricher::new(Side::Body);
         let topo: [f32; 10] = [0.04, 0.04, 0.04, 0.04, 0.04, 0.0, 0.0, 0.0, 0.0, 0.0];
         let mut body: [f32; 5] = [0.5; 5];
-        e.apply_to_body(&mut body, &topo, 1.0).unwrap();
+        // 0E: recompute the held nudge on the (simulated) epoch, then apply it.
+        e.compute_nudge(&topo);
+        e.apply_held_to_body(&mut body, 1.0).unwrap();
         // delta = 0.002 * 0.1 * 1.0 = 0.0002 per dim
         for v in body.iter() {
             assert!(approx_eq(*v, 0.5002, 1e-6));
@@ -345,7 +346,8 @@ mod tests {
         // Strong topo on the mind half [5:10]
         let topo: [f32; 10] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.04, 0.04, 0.04, 0.04, 0.04];
         let mut mind: [f32; 15] = [0.5; 15];
-        e.apply_to_mind(&mut mind, &topo, 1.0).unwrap();
+        e.compute_nudge(&topo);
+        e.apply_held_to_mind(&mut mind, 1.0).unwrap();
         // [0:5] thinking + [5:10] feeling unchanged
         for i in 0..10 {
             assert!(
@@ -368,7 +370,8 @@ mod tests {
         let mut e = GroundUpEnricher::new(Side::Body);
         let topo: [f32; 10] = [100.0; 10];
         let mut body: [f32; 5] = [1.0; 5];
-        e.apply_to_body(&mut body, &topo, 30.0).unwrap();
+        e.compute_nudge(&topo);
+        e.apply_held_to_body(&mut body, 30.0).unwrap();
         for v in body.iter() {
             assert!(approx_eq(*v, 1.0, 1e-6));
         }
@@ -376,7 +379,8 @@ mod tests {
         let mut e2 = GroundUpEnricher::new(Side::Body);
         let neg_topo: [f32; 10] = [-100.0; 10];
         let mut body2: [f32; 5] = [0.0; 5];
-        e2.apply_to_body(&mut body2, &neg_topo, 30.0).unwrap();
+        e2.compute_nudge(&neg_topo);
+        e2.apply_held_to_body(&mut body2, 30.0).unwrap();
         for v in body2.iter() {
             assert!(approx_eq(*v, 0.0, 1e-6));
         }
@@ -386,8 +390,7 @@ mod tests {
     fn apply_to_body_rejects_mind_side_enricher() {
         let mut e = GroundUpEnricher::new(Side::MindWilling);
         let mut body: [f32; 5] = [0.5; 5];
-        let topo: [f32; 10] = [0.0; 10];
-        let r = e.apply_to_body(&mut body, &topo, 1.0);
+        let r = e.apply_held_to_body(&mut body, 1.0);
         assert!(r.is_err());
     }
 
@@ -395,8 +398,7 @@ mod tests {
     fn apply_to_mind_rejects_body_side_enricher() {
         let mut e = GroundUpEnricher::new(Side::Body);
         let mut mind: [f32; 15] = [0.5; 15];
-        let topo: [f32; 10] = [0.0; 10];
-        let r = e.apply_to_mind(&mut mind, &topo, 1.0);
+        let r = e.apply_held_to_mind(&mut mind, 1.0);
         assert!(r.is_err());
     }
 
@@ -406,7 +408,8 @@ mod tests {
         let mut e = GroundUpEnricher::new(Side::Body);
         let topo: [f32; 10] = [0.04; 10];
         let mut body: [f32; 5] = [0.5; 5];
-        e.apply_to_body(&mut body, &topo, 1000.0).unwrap();
+        e.compute_nudge(&topo);
+        e.apply_held_to_body(&mut body, 1000.0).unwrap();
         // Expected: delta = 0.002 * 0.1 * 30 = 0.006 per dim
         for v in body.iter() {
             assert!(approx_eq(*v, 0.506, 1e-5));
@@ -419,7 +422,8 @@ mod tests {
         let mut e = GroundUpEnricher::new(Side::Body);
         let topo: [f32; 10] = [0.04; 10];
         let mut body: [f32; 5] = [0.5; 5];
-        e.apply_to_body(&mut body, &topo, -5.0).unwrap();
+        e.compute_nudge(&topo);
+        e.apply_held_to_body(&mut body, -5.0).unwrap();
         for v in body.iter() {
             assert!(approx_eq(*v, 0.5, 1e-6));
         }
@@ -443,10 +447,13 @@ mod tests {
         let mut e = GroundUpEnricher::new(Side::Body);
         let topo: [f32; 10] = [0.0; 10];
         let mut body: [f32; 5] = [0.5; 5];
+        // compute_nudge alone does NOT bump apply_count (0E: compute is the
+        // epoch event; apply is per-tick) — only apply_held_to_body does.
+        e.compute_nudge(&topo);
         assert_eq!(e.apply_count(), 0);
-        e.apply_to_body(&mut body, &topo, 1.0).unwrap();
+        e.apply_held_to_body(&mut body, 1.0).unwrap();
         assert_eq!(e.apply_count(), 1);
-        e.apply_to_body(&mut body, &topo, 1.0).unwrap();
+        e.apply_held_to_body(&mut body, 1.0).unwrap();
         assert_eq!(e.apply_count(), 2);
     }
 

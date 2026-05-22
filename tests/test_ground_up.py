@@ -1,6 +1,6 @@
 """Tests for GroundUpEnricher — GROUND_UP enrichment mechanism."""
 import pytest
-from titan_plugin.logic.ground_up import GroundUpEnricher
+from titan_hcl.logic.ground_up import GroundUpEnricher
 
 
 class TestGroundUpEnricher:

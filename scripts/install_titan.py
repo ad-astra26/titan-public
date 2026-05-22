@@ -29,7 +29,7 @@ import time
 # Constants
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
-CONFIG_PATH = os.path.join(PROJECT_ROOT, "titan_plugin", "config.toml")
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "titan_hcl", "config.toml")
 VENV_DIR = os.path.join(PROJECT_ROOT, ".venv")
 MIN_PYTHON = (3, 11)
 MIN_DISK_GB = 2  # Minimum free disk space for core install
@@ -186,7 +186,7 @@ def install_core():
     # Verify critical imports
     python = os.path.join(VENV_DIR, "bin", "python")
     checks = [
-        ("titan_plugin", "Titan plugin"),
+        ("titan_hcl", "Titan plugin"),
         ("torch", "PyTorch"),
         ("fastapi", "FastAPI"),
         ("httpx", "httpx"),
@@ -543,13 +543,13 @@ def health_check():
     python = os.path.join(VENV_DIR, "bin", "python")
 
     checks = {
-        "Titan Plugin": 'from titan_plugin import TitanPlugin; print("ok")',
-        "StudioCoordinator": 'from titan_plugin.expressive.studio import StudioCoordinator; print("ok")',
-        "Solana SDK": 'from titan_plugin.utils.solana_client import is_available; print("ok" if is_available() else "degraded")',
-        "Cognee Memory": 'from titan_plugin.core.memory import TieredMemoryGraph; print("ok")',
-        "SageGuardian": 'from titan_plugin.logic.sage.guardian import SageGuardian; print("ok")',
-        "ProceduralArt": 'from titan_plugin.expressive.art import ProceduralArtGen; print("ok")',
-        "Observatory API": 'from titan_plugin.api import create_app; print("ok")',
+        "Titan Plugin": 'import titan_hcl; print("ok")',
+        "StudioCoordinator": 'from titan_hcl.expressive.studio import StudioCoordinator; print("ok")',
+        "Solana SDK": 'from titan_hcl.utils.solana_client import is_available; print("ok" if is_available() else "degraded")',
+        "Cognee Memory": 'from titan_hcl.core.memory import TieredMemoryGraph; print("ok")',
+        "SageGuardian": 'from titan_hcl.logic.sage.guardian import SageGuardian; print("ok")',
+        "ProceduralArt": 'from titan_hcl.expressive.art import ProceduralArtGen; print("ok")',
+        "Observatory API": 'from titan_hcl.api import create_app; print("ok")',
     }
 
     results = {}

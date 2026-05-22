@@ -16,9 +16,9 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from titan_plugin.api.dashboard import router
-from titan_plugin.bus import DivineBus
-from titan_plugin.guardian import Guardian, ModuleSpec, ModuleState
+from titan_hcl.api.dashboard import router
+from titan_hcl.bus import DivineBus
+from titan_hcl.guardian import Guardian, ModuleSpec, ModuleState
 
 
 def _noop_entry(recv_q, send_q, name, config):  # pragma: no cover
@@ -54,10 +54,16 @@ def client():
     plugin = _FakePlugin(guardian)
     # Post-S5-amendment: dashboard reads via `app.state.titan_state`
     # (StateAccessor pattern). Some other api/ modules still use
-    # the legacy `titan_plugin` name; set both for fixture neutrality.
-    app.state.titan_plugin = plugin
+    # the legacy `titan_hcl` name; set both for fixture neutrality.
+    app.state.titan_hcl = plugin
     app.state.titan_state = plugin
     app.include_router(router)
+    # Phase E: mount the v6 roof + legacy /v3,/v4→/v6 redirects so
+    # deprecated paths resolve via 301/308 to the live v6 handler.
+    from titan_hcl.api.v6 import router as _v6_router
+    from titan_hcl.api.v6_deprecation import router as _v6_dep_router
+    app.include_router(_v6_router)
+    app.include_router(_v6_dep_router)
     with TestClient(app) as c:
         yield c
 

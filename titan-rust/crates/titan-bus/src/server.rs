@@ -38,7 +38,7 @@ use titan_core::frame::{
     FRAME_MAX_FRAME_BYTES,
 };
 
-use crate::message::{decode_header, MsgHeader};
+use crate::message::{decode_bus_subscribe_payload, decode_header, MsgHeader};
 use crate::subscriber::BrokerSubscriber;
 
 /// Errors during connection handling.
@@ -126,6 +126,11 @@ pub enum InboundEvent {
         name: String,
         /// Topics to add to subscribed set.
         topics: Vec<String>,
+        /// D-SPEC-42 (SPEC v1.4.0, 2026-05-12) subscriber-intent flag.
+        /// When true, broker silently skips this subscriber from
+        /// `dst="all"` broadcast fan-out (targeted routing still works).
+        /// Connection-level — last value wins on multi-name subscribe.
+        reply_only: bool,
     },
     /// Client unsubscribed from topics.
     Unsubscribe {
@@ -189,10 +194,43 @@ pub async fn run_recv_loop(
         };
 
         let event = match header.msg_type.as_deref() {
-            Some("BUS_SUBSCRIBE") => InboundEvent::Subscribe {
-                name: header.src.clone().unwrap_or_default(),
-                topics: Vec::new(),
-            },
+            Some("BUS_SUBSCRIBE") => {
+                // SPEC §8.2 (v1.3.0): BUS_SUBSCRIBE payload is
+                // `{name: str, topics: [str]}`. The CANONICAL subscriber
+                // name is `payload.name` — NOT `header.src`. Multi-name
+                // BUS_SUBSCRIBE relies on this: a single connection can
+                // register under multiple names by sending repeated
+                // BUS_SUBSCRIBE frames over the SAME connection, each
+                // with a different `payload.name`. Pre-v1.3.0 code that
+                // wrote `header.src` as the name worked for single-name
+                // callers by coincidence (Python BusSocketClient sets
+                // both header.src and payload.name to self.name) but
+                // dropped multi-name aliases on the floor (the broker
+                // saw N frames all naming "titan_HCL"). Falls back to
+                // header.src if payload.name is missing to preserve
+                // backward-compat with any client that omits it.
+                // D-SPEC-42 (SPEC v1.4.0): decode_bus_subscribe_payload
+                // returns a 3-tuple including reply_only intent. Backward
+                // compatible: pre-v1.4.0 clients omit the field, decoder
+                // returns reply_only=false (broadcast-consumer intent).
+                let (payload_name, payload_topics, payload_reply_only) =
+                    match decode_bus_subscribe_payload(&payload) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            warn!(name = %sub_name, err = ?e, "recv loop: BUS_SUBSCRIBE payload decode failed; falling back to header.src");
+                            (None, Vec::new(), false)
+                        }
+                    };
+                let resolved_name = payload_name
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| header.src.clone())
+                    .unwrap_or_default();
+                InboundEvent::Subscribe {
+                    name: resolved_name,
+                    topics: payload_topics,
+                    reply_only: payload_reply_only,
+                }
+            }
             Some("BUS_UNSUBSCRIBE") => InboundEvent::Unsubscribe { topics: Vec::new() },
             Some("BUS_PONG") => InboundEvent::Pong,
             Some(_) => InboundEvent::Publish {
@@ -308,6 +346,12 @@ mod tests {
         let _ = InboundEvent::Subscribe {
             name: "test".into(),
             topics: vec!["BODY_STATE".into()],
+            reply_only: false,
+        };
+        let _ = InboundEvent::Subscribe {
+            name: "rpc_reply_queue".into(),
+            topics: vec![],
+            reply_only: true,
         };
         let _ = InboundEvent::Unsubscribe {
             topics: vec!["BODY_STATE".into()],

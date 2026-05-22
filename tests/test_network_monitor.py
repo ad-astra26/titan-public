@@ -1,10 +1,10 @@
-"""Unit tests for titan_plugin.utils.network_monitor."""
+"""Unit tests for titan_hcl.utils.network_monitor."""
 import json
 from unittest.mock import patch, MagicMock
 
 import pytest
 
-from titan_plugin.utils import network_monitor as nm
+from titan_hcl.utils import network_monitor as nm
 
 
 @pytest.fixture(autouse=True)

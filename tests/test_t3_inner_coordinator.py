@@ -14,10 +14,10 @@ import pytest
 
 def _make_coordinator(with_vm=False):
     """Helper: create a fully wired coordinator."""
-    from titan_plugin.logic.inner_state import InnerState
-    from titan_plugin.logic.spirit_state import SpiritState
-    from titan_plugin.logic.observables import ObservableEngine
-    from titan_plugin.logic.inner_coordinator import InnerTrinityCoordinator
+    from titan_hcl.logic.inner_state import InnerState
+    from titan_hcl.logic.spirit_state import SpiritState
+    from titan_hcl.logic.observables import ObservableEngine
+    from titan_hcl.logic.inner_coordinator import InnerTrinityCoordinator
 
     inner = InnerState()
     spirit = SpiritState()

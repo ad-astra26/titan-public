@@ -1,6 +1,6 @@
 """Tests for Prediction Engine — predictive processing and surprise detection."""
 import pytest
-from titan_plugin.logic.prediction_engine import PredictionEngine, _cosine_distance
+from titan_hcl.logic.prediction_engine import PredictionEngine, _cosine_distance
 
 
 class TestPredictionEngine:

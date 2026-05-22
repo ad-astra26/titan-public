@@ -5,7 +5,7 @@ Phase 7 Endurance Test Harness for Titan Sovereign Agent.
 
 Sends prompts to the running Titan agent via POST /chat, collecting metrics
 from the Observatory API in real-time. The agent must be running first
-(via `python scripts/titan_main.py`).
+(via `python scripts/titan_hcl.py`).
 
 Orchestrates three test phases:
   Phase 1 (1h): Heavy load — rapid prompts, fault injection, epoch compression
@@ -20,7 +20,7 @@ Usage:
   python scripts/endurance_test.py --verify          # Check agent is running and responsive
 
 Prerequisites:
-  1. Start the Titan agent: python scripts/titan_main.py
+  1. Start the Titan agent: python scripts/titan_hcl.py
   2. Agent must be listening on the configured port (default: 7777)
   3. Run this script in a separate terminal
 """
@@ -42,8 +42,8 @@ import httpx
 
 # Resolve project root
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CONFIG_PATH = PROJECT_ROOT / "titan_plugin" / "config.toml"
-CONFIG_BACKUP = PROJECT_ROOT / "titan_plugin" / "config.toml.prod_backup"
+CONFIG_PATH = PROJECT_ROOT / "titan_hcl" / "config.toml"
+CONFIG_BACKUP = PROJECT_ROOT / "titan_hcl" / "config.toml.prod_backup"
 LOG_DIR = PROJECT_ROOT / "data" / "logs" / "endurance"
 REPORT_DIR = PROJECT_ROOT / "data" / "endurance_reports"
 PROMPT_CORPUS_PATH = Path(__file__).resolve().parent / "endurance_prompts.json"
@@ -475,7 +475,7 @@ class EnduranceRunner:
         health = await self.metrics.get_health()
         if "error" in health:
             logger.error("Agent not reachable at %s: %s", self.base_url, health["error"])
-            logger.error("Start the agent first: python scripts/titan_main.py")
+            logger.error("Start the agent first: python scripts/titan_hcl.py")
             return {"error": "Agent not reachable", "phase": self.phase}
 
         logger.info("Agent health: %s", json.dumps(health, indent=2)[:500])
@@ -811,7 +811,7 @@ async def verify_setup() -> bool:
 
     if not all_pass:
         logger.error("Some checks FAILED.")
-        logger.error("Make sure the agent is running: python scripts/titan_main.py")
+        logger.error("Make sure the agent is running: python scripts/titan_hcl.py")
     else:
         logger.info("All checks PASSED. Ready to run endurance tests.")
 

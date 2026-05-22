@@ -1,6 +1,6 @@
 """Tests for LowerTopology — 10DT grounding space topology."""
 import pytest
-from titan_plugin.logic.lower_topology import LowerTopology, _cosine_sim, _l2_norm
+from titan_hcl.logic.lower_topology import LowerTopology, _cosine_sim, _l2_norm
 
 
 class TestLowerTopology:

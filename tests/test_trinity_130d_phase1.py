@@ -28,7 +28,7 @@ class TestAgencySchemaBridge:
     """
 
     def _make_agency(self):
-        from titan_plugin.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.module import AgencyModule
         return AgencyModule()
 
     def test_empty_history_returns_zero_counts(self):
@@ -41,7 +41,7 @@ class TestAgencySchemaBridge:
         assert s["recent_actions_detail"] == []
 
     def test_action_type_derivation_from_helper_name(self):
-        from titan_plugin.logic.agency.module import _derive_action_type
+        from titan_hcl.logic.agency.module import _derive_action_type
         assert _derive_action_type("art_generate", "create") == "art"
         assert _derive_action_type("audio_generate", "create") == "audio"
         assert _derive_action_type("web_search", "research") == "research"
@@ -133,7 +133,7 @@ class TestAssessmentSchemaBridge:
     """
 
     def _make(self):
-        from titan_plugin.logic.agency.assessment import SelfAssessment
+        from titan_hcl.logic.agency.assessment import SelfAssessment
         return SelfAssessment()
 
     def test_empty_state_midpoints(self):
@@ -189,7 +189,7 @@ class TestOuterBodyThermalRedesign:
     """
 
     def _collect(self, **kwargs):
-        from titan_plugin.logic.outer_body_tensor import collect_outer_body_5d
+        from titan_hcl.logic.outer_body_tensor import collect_outer_body_5d
         return collect_outer_body_5d(kwargs.get("sources", {}))
 
     def test_thermal_uses_hormonal_heat_not_llm_latency(self):
@@ -242,7 +242,7 @@ class TestOuterMindRedesigns:
     """SPEC §23.8 — REDESIGNED dims: thinking[0,1,2], willing[11,14]."""
 
     def _collect(self, **kwargs):
-        from titan_plugin.logic.outer_mind_tensor import collect_outer_mind_15d
+        from titan_hcl.logic.outer_mind_tensor import collect_outer_mind_15d
         defaults = dict(current_5d=[0.5] * 5)
         defaults.update(kwargs)
         return collect_outer_mind_15d(**defaults)
@@ -314,7 +314,7 @@ class TestOuterSpiritRedesigns:
     """SPEC §23.9 — extensive SAT/CHIT/ANANDA redesigns."""
 
     def _collect(self, **kwargs):
-        from titan_plugin.logic.outer_spirit_tensor import (
+        from titan_hcl.logic.outer_spirit_tensor import (
             collect_outer_spirit_45d,
         )
         defaults = dict(
@@ -447,12 +447,12 @@ class TestHelperActionTypeMap:
     where appropriate (SAT[1] coherence + creative_this_hour rely on this)."""
 
     def test_creative_helpers_map_to_creative_types(self):
-        from titan_plugin.logic.agency.module import _HELPER_ACTION_TYPES
+        from titan_hcl.logic.agency.module import _HELPER_ACTION_TYPES
         assert _HELPER_ACTION_TYPES["art_generate"] == "art"
         assert _HELPER_ACTION_TYPES["audio_generate"] == "audio"
 
     def test_non_creative_helpers_dont_pollute_creative_count(self):
-        from titan_plugin.logic.agency.module import _HELPER_ACTION_TYPES
+        from titan_hcl.logic.agency.module import _HELPER_ACTION_TYPES
         for name in ("web_search", "code_knowledge", "coding_sandbox",
                      "infra_inspect", "memo_inscribe"):
             assert _HELPER_ACTION_TYPES[name] not in ("art", "audio", "music"), \
@@ -468,7 +468,7 @@ class TestUnifiedSpiritFull130dt:
     """
 
     def test_get_stats_includes_full_130dt(self):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         # Skip if init signature requires args we don't have here
         try:
             us = UnifiedSpirit(config={}, data_dir="/tmp")

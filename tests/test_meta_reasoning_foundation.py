@@ -20,7 +20,7 @@ import pytest
 class TestChainArchive:
     @pytest.fixture
     def archive(self, tmp_path):
-        from titan_plugin.logic.chain_archive import ChainArchive
+        from titan_hcl.logic.chain_archive import ChainArchive
         db_path = str(tmp_path / "test_inner.db")
         return ChainArchive(db_path=db_path)
 
@@ -159,7 +159,7 @@ class TestChainArchive:
 class TestMetaWisdomStore:
     @pytest.fixture
     def wisdom(self, tmp_path):
-        from titan_plugin.logic.meta_wisdom import MetaWisdomStore
+        from titan_hcl.logic.meta_wisdom import MetaWisdomStore
         db_path = str(tmp_path / "test_inner.db")
         return MetaWisdomStore(db_path=db_path)
 
@@ -299,7 +299,7 @@ class TestMetaWisdomStore:
 class TestMetaAutoencoder:
     @pytest.fixture
     def autoencoder(self, tmp_path):
-        from titan_plugin.logic.meta_autoencoder import MetaAutoencoder
+        from titan_hcl.logic.meta_autoencoder import MetaAutoencoder
         return MetaAutoencoder(save_dir=str(tmp_path))
 
     def test_encode_decode_shape(self, autoencoder):
@@ -320,7 +320,7 @@ class TestMetaAutoencoder:
         assert autoencoder.is_trained is True
 
     def test_save_load_roundtrip(self, autoencoder, tmp_path):
-        from titan_plugin.logic.meta_autoencoder import MetaAutoencoder
+        from titan_hcl.logic.meta_autoencoder import MetaAutoencoder
         state = [random.random() for _ in range(132)]
         emb1 = autoencoder.encode(state)
         autoencoder._training_steps = 50
@@ -341,13 +341,13 @@ class TestMetaAutoencoder:
         assert autoencoder.cosine_similarity(a, c) == pytest.approx(0.0)
 
     def test_dream_train_insufficient_chains(self, autoencoder, tmp_path):
-        from titan_plugin.logic.chain_archive import ChainArchive
+        from titan_hcl.logic.chain_archive import ChainArchive
         archive = ChainArchive(db_path=str(tmp_path / "test.db"))
         result = autoencoder.dream_train(archive)
         assert result["trained"] is False
 
     def test_dream_train_with_chains(self, autoencoder, tmp_path):
-        from titan_plugin.logic.chain_archive import ChainArchive
+        from titan_hcl.logic.chain_archive import ChainArchive
         archive = ChainArchive(db_path=str(tmp_path / "test.db"))
 
         # Insert 15 chains with varying outcomes and snapshots
@@ -369,8 +369,8 @@ class TestMetaAutoencoder:
 
     def test_contrastive_clustering(self, tmp_path):
         """After training, similar-outcome chains should have closer embeddings."""
-        from titan_plugin.logic.meta_autoencoder import MetaAutoencoder
-        from titan_plugin.logic.chain_archive import ChainArchive
+        from titan_hcl.logic.meta_autoencoder import MetaAutoencoder
+        from titan_hcl.logic.chain_archive import ChainArchive
 
         ae = MetaAutoencoder(save_dir=str(tmp_path), learning_rate=0.005)
         archive = ChainArchive(db_path=str(tmp_path / "test.db"))
@@ -415,7 +415,7 @@ class TestMetaAutoencoder:
         assert len(emb_low) == 16
 
     def test_backfill_embeddings(self, autoencoder, tmp_path):
-        from titan_plugin.logic.chain_archive import ChainArchive
+        from titan_hcl.logic.chain_archive import ChainArchive
         archive = ChainArchive(db_path=str(tmp_path / "test.db"))
 
         archive.record_main_chain(

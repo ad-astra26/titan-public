@@ -11,7 +11,7 @@ loaded value is bound to a local like `_TID` or `_titan_identity["titan_id"]`.
 Hardcoded `[T1:...]/[T2:...]/[T3:...]` prefixes will be wrong on at least
 two of the three Titans.
 
-This test scans every `.py` file under `titan_plugin/` and `scripts/`,
+This test scans every `.py` file under `titan_hcl/` and `scripts/`,
 parses with AST, and fails if any logger call has a string-literal first
 argument starting with `[T1:`, `[T2:`, or `[T3:`.
 
@@ -28,7 +28,7 @@ import pathlib
 import pytest
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
-SCAN_DIRS = [PROJECT_ROOT / "titan_plugin", PROJECT_ROOT / "scripts"]
+SCAN_DIRS = [PROJECT_ROOT / "titan_hcl", PROJECT_ROOT / "scripts"]
 LOGGER_METHODS = {"debug", "info", "warning", "warn", "error", "exception", "critical"}
 FORBIDDEN_PREFIXES = ("[T1:", "[T2:", "[T3:")
 NOQA_MARKER = "noqa: log-prefix"

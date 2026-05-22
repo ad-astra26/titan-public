@@ -19,7 +19,7 @@ import pathlib
 
 import pytest
 
-from titan_plugin.persistence.config import IMWConfig
+from titan_hcl.persistence.config import IMWConfig
 
 
 def test_from_titan_config_section_loads_default_persistence():
@@ -65,7 +65,7 @@ def test_imw_main_metrics_file_namespaced_by_module_name():
     # The actual filename construction is in persistence_entry.py and
     # only happens inside the spawned subprocess. We test it indirectly by
     # confirming the source contains the f-string pattern.
-    pe = pathlib.Path(__file__).resolve().parent.parent / "titan_plugin" / "persistence_entry.py"
+    pe = pathlib.Path(__file__).resolve().parent.parent / "titan_hcl" / "persistence_entry.py"
     src = pe.read_text(encoding="utf-8")
     assert 'f"{name}_metrics.json"' in src, (
         "persistence_entry.py must derive metrics filename from the module "
@@ -83,14 +83,18 @@ def test_imw_main_metrics_file_namespaced_by_module_name():
 
 
 def test_observatory_writer_modulespec_registered_default_off(tmp_path, monkeypatch):
-    """v5_core.py must register a `observatory_writer` ModuleSpec, defaulted
-    to autostart=False so deploys don't accidentally activate it before
-    Maker flips the toggle."""
-    # We can't safely instantiate the full TitanCore in unit tests (it
-    # imports torch + boots Guardian etc.). Instead, scan v5_core.py source
-    # for the registration block.
-    v5 = pathlib.Path(__file__).resolve().parent.parent / "titan_plugin" / "v5_core.py"
-    src = v5.read_text(encoding="utf-8")
+    """core/plugin.py must register an `observatory_writer` ModuleSpec,
+    defaulted to autostart=False so deploys don't accidentally activate it
+    before Maker flips the toggle."""
+    # We can't safely instantiate the full TitanHCL in unit tests (it
+    # imports torch + boots Guardian etc.). Instead, scan the registration
+    # source. core/plugin.py is the sole registration site (the old
+    # v5_core.py / TitanCore filenames are retired).
+    plugin_py = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "titan_hcl" / "core" / "plugin.py"
+    )
+    src = plugin_py.read_text(encoding="utf-8")
 
     assert 'name="observatory_writer"' in src, "ModuleSpec name must be exactly 'observatory_writer'"
     assert "persistence_observatory" in src, "Config section name must be `persistence_observatory`"

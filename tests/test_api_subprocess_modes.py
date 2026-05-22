@@ -12,8 +12,8 @@ the deploy verification on T1/T2/T3 — separate from this pytest suite).
 
 Reference:
   - titan-docs/PLAN_microkernel_phase_a_s5.md §5.1 + §5.2
-  - titan_plugin/core/plugin.py:_register_api_subprocess_module
-  - titan_plugin/core/plugin.py:boot (Phase 5 flag check)
+  - titan_hcl/core/plugin.py:_register_api_subprocess_module
+  - titan_hcl/core/plugin.py:boot (Phase 5 flag check)
 """
 from __future__ import annotations
 
@@ -24,14 +24,14 @@ import pytest
 
 def test_register_api_subprocess_skipped_when_flag_off():
     """When api_process_separation_enabled=False, no api module registered."""
-    from titan_plugin.core.plugin import TitanPlugin
+    from titan_hcl.core.plugin import TitanHCL
 
-    plugin = MagicMock(spec=TitanPlugin)
+    plugin = MagicMock(spec=TitanHCL)
     plugin._full_config = {"microkernel": {"api_process_separation_enabled": False}}
     plugin.guardian = MagicMock()
 
     # Call the helper directly via the unbound class method
-    TitanPlugin._register_api_subprocess_module(plugin)
+    TitanHCL._register_api_subprocess_module(plugin)
 
     # No guardian.register call expected
     plugin.guardian.register.assert_not_called()
@@ -40,17 +40,17 @@ def test_register_api_subprocess_skipped_when_flag_off():
 def test_register_api_subprocess_runs_when_flag_on():
     """When api_process_separation_enabled=True, guardian.register called
     with ModuleSpec(name='api', layer='L3', autostart=True, ...)."""
-    from titan_plugin.core.plugin import TitanPlugin
-    from titan_plugin.guardian import ModuleSpec
+    from titan_hcl.core.plugin import TitanHCL
+    from titan_hcl.guardian import ModuleSpec
 
-    plugin = MagicMock(spec=TitanPlugin)
+    plugin = MagicMock(spec=TitanHCL)
     plugin._full_config = {
         "microkernel": {"api_process_separation_enabled": True},
         "api": {"host": "0.0.0.0", "port": 7777},
     }
     plugin.guardian = MagicMock()
 
-    TitanPlugin._register_api_subprocess_module(plugin)
+    TitanHCL._register_api_subprocess_module(plugin)
 
     # guardian.register should have been called exactly once
     plugin.guardian.register.assert_called_once()
@@ -64,7 +64,7 @@ def test_register_api_subprocess_runs_when_flag_on():
     assert spec.rss_limit_mb == 300
     assert spec.heartbeat_timeout == 60.0
     # entry_fn must be the api_subprocess_main function
-    from titan_plugin.api.api_subprocess import api_subprocess_main
+    from titan_hcl.api.api_subprocess import api_subprocess_main
     assert spec.entry_fn is api_subprocess_main
     # Sub-config carries [api] + [microkernel] sections
     assert "api" in spec.config
@@ -73,7 +73,7 @@ def test_register_api_subprocess_runs_when_flag_on():
 
 def test_kernel_rpc_skipped_when_flag_off():
     """TitanKernel._start_kernel_rpc() is a no-op when flag is off."""
-    from titan_plugin.core.kernel import TitanKernel
+    from titan_hcl.core.kernel import TitanKernel
 
     k = MagicMock(spec=TitanKernel)
     k._config = {"microkernel": {"api_process_separation_enabled": False}}
@@ -89,7 +89,7 @@ def test_kernel_rpc_skipped_when_flag_off():
 def test_kernel_rpc_skipped_when_no_plugin_ref():
     """When flag is on but _plugin_ref isn't set yet, log warning + bail.
     Prevents crashing on misconfigured boot order."""
-    from titan_plugin.core.kernel import TitanKernel
+    from titan_hcl.core.kernel import TitanKernel
 
     k = MagicMock(spec=TitanKernel)
     k._config = {"microkernel": {"api_process_separation_enabled": True}}
@@ -103,7 +103,7 @@ def test_kernel_rpc_skipped_when_no_plugin_ref():
 def test_exposed_methods_includes_critical_paths():
     """Smoke check that the EXPOSED_METHODS list covers the most-used
     plugin paths from the audit (§1.3)."""
-    from titan_plugin.core.kernel import KERNEL_RPC_EXPOSED_METHODS
+    from titan_hcl.core.kernel import KERNEL_RPC_EXPOSED_METHODS
 
     must_have = {
         "guardian.get_status",
@@ -127,17 +127,17 @@ def test_exposed_methods_includes_critical_paths():
 
 def test_create_app_accepts_proxy_or_plugin():
     """create_app docstring states it accepts either real plugin or
-    _RPCRemoteRef proxy. Behavior identical because app.state.titan_plugin
-    is opaque to FastAPI — endpoint code does request.app.state.titan_plugin.X
+    _RPCRemoteRef proxy. Behavior identical because app.state.titan_hcl
+    is opaque to FastAPI — endpoint code does request.app.state.titan_hcl.X
     and the proxy intercepts."""
-    from titan_plugin.api import create_app
-    from titan_plugin.api.events import EventBus
-    from titan_plugin.core.kernel_rpc import _RPCRemoteRef
+    from titan_hcl.api import create_app
+    from titan_hcl.api.events import EventBus
+    from titan_hcl.core.kernel_rpc import _RPCRemoteRef
 
     fake_client = MagicMock()
     proxy = _RPCRemoteRef(fake_client, ())
 
     event_bus = EventBus()
     app = create_app(proxy, event_bus, config={"cors_origins": []})
-    assert app.state.titan_plugin is proxy
+    assert app.state.titan_hcl is proxy
     assert app.state.event_bus is event_bus

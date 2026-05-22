@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import pytest
 
-from titan_plugin._layer_canon import LAYER_CANON, VALID_LAYERS, validate_layer
-from titan_plugin.bus import DivineBus
-from titan_plugin.guardian import Guardian, ModuleSpec, ModuleState
+from titan_hcl._layer_canon import LAYER_CANON, VALID_LAYERS, validate_layer
+from titan_hcl.bus import DivineBus
+from titan_hcl.guardian import Guardian, ModuleSpec, ModuleState
 
 
 def _noop_entry(recv_q, send_q, name, config):  # pragma: no cover — never invoked in these tests
@@ -82,30 +82,37 @@ def test_register_accepts_all_valid_layers(guardian):
 # ── Canon conformance ──────────────────────────────────────────────
 
 
-def test_layer_canon_covers_17_production_modules():
-    """Every module that plugin.py / legacy_core.py registers must have a canon entry.
+def test_layer_canon_covers_canonical_production_modules():
+    """LAYER_CANON pins the canonical supervised-module roster (core/plugin.py
+    is the sole registration site; legacy_core.py / v5_core.py retired).
 
-    17 modules total: 16 from v5_core.py + warning_monitor (added 2026-04-25
-    silent-swallow runtime visibility worker, plugin.py:317).
+    26 modules: the original Phase-A 17 grew with the outer trinity (A.S8),
+    output_verifier (A.8.3), reflex (A.8.5), agency_worker (A.8.6), and the 3
+    universal SQLite writers (consciousness/social_graph/events_teacher).
+    Adding a module here must be a deliberate edit, not silent drift.
     """
     expected_modules = {
-        "imw", "observatory_writer",
-        "body", "mind", "spirit",
-        "memory", "rl", "cgn", "emot_cgn", "language",
-        "meta_teacher", "timechain",
-        "llm", "media", "backup", "knowledge",
-        "warning_monitor",
+        # L1 trinity daemons + IMW + outer trinity (A.S8)
+        "body", "mind", "spirit", "imw",
+        "outer_body", "outer_mind", "outer_spirit",
+        # L2
+        "memory", "recorder", "cgn", "emot_cgn", "language",
+        "meta_teacher", "timechain", "output_verifier",
+        # L3
+        "llm", "media", "backup", "knowledge", "observatory_writer",
+        "warning_monitor", "reflex", "agency_worker",
+        "consciousness_writer", "social_graph_writer", "events_teacher_writer",
     }
     assert set(LAYER_CANON.keys()) == expected_modules
 
 
 def test_layer_canon_distribution():
-    """L1 has 4, L2 has 7, L3 has 6, L0 has 0."""
+    """L1 has 7, L2 has 8, L3 has 11, L0 has 0."""
     from collections import Counter
     counts = Counter(LAYER_CANON.values())
-    assert counts["L1"] == 4  # body, mind, spirit, imw
-    assert counts["L2"] == 7  # memory, rl, cgn, emot_cgn, language, meta_teacher, timechain
-    assert counts["L3"] == 6  # llm, media, backup, knowledge, observatory_writer, warning_monitor
+    assert counts["L1"] == 7  # body, mind, spirit, imw, outer_{body,mind,spirit}
+    assert counts["L2"] == 8  # memory, recorder, cgn, emot_cgn, language, meta_teacher, timechain, output_verifier
+    assert counts["L3"] == 11  # llm, media, backup, knowledge, observatory_writer, warning_monitor, reflex, agency_worker + 3 writers
     assert counts["L0"] == 0  # L0 is in-process kernel, no Guardian modules
 
 
@@ -175,7 +182,7 @@ def test_layer_stats_counts_totals(guardian):
     # 2 L1, 3 L2, 1 L3
     for name in ("body", "mind"):
         guardian.register(ModuleSpec(name=name, entry_fn=_noop_entry, layer="L1"))
-    for name in ("memory", "rl", "cgn"):
+    for name in ("memory", "recorder", "cgn"):
         guardian.register(ModuleSpec(name=name, entry_fn=_noop_entry, layer="L2"))
     guardian.register(ModuleSpec(name="llm", entry_fn=_noop_entry, layer="L3"))
     stats = guardian.layer_stats()

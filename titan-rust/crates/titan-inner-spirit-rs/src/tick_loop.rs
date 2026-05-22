@@ -59,14 +59,16 @@ use anyhow::{anyhow, Context, Result};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use titan_bus::{BusClient, InboundEvent};
 use titan_core::constants::{INNER_SPIRIT_FIRING_MAX_BYTES, INNER_SPIRIT_FIRING_SCHEMA_VERSION};
+use titan_core::small_filter_down::{SmallFilterDownEngine, HALF_DIM};
 use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
-    apply_multipliers, apply_spirit_strength, decode_filter_down_payload, encode_floats,
-    read_dim_slice, ContentGate, DriftAggregator, EmaSmoother, FiringSlotWriter,
-    INNER_SPIRIT_TOPICS, MULTIPLIER_CEIL, MULTIPLIER_FLOOR, SPIRIT_FILTER_STRENGTH_MULT,
+    apply_multipliers, decode_filter_down_payload, encode_floats, read_dim_slice, stateful_update,
+    ContentGate, DriftAggregator, FiringSlotWriter, Layer, RestoringCfg, INNER_SPIRIT_TOPICS,
 };
 
 const SPIRIT_DIMS: usize = 45;
@@ -78,7 +80,7 @@ const DRIFT_THRESHOLD_PCT: f64 = 0.005;
 const CONTENT_RANGE: std::ops::Range<usize> = 5..45;
 const CONTENT_DIMS: usize = 40;
 
-pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()> {
+pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path, data_dir: &Path) -> Result<()> {
     let client = BusClient::connect(bus_socket, authkey, "inner-spirit")
         .await
         .with_context(|| format!("bus connect to {}", bus_socket.display()))?;
@@ -87,6 +89,13 @@ pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()
         .await
         .context("bus subscribe")?;
     info!(event = "BUS_SUBSCRIBED", topics = ?INNER_SPIRIT_TOPICS);
+
+    // Small filter_down learned engine (SPEC §G5.1 / D-SPEC-97) — fired once
+    // per KERNEL_EPOCH_TICK, NOT per Schumann tick. Loads its own per-half
+    // trained brain (filter_down_local_inner_*.json) from data_dir.
+    let engine = SmallFilterDownEngine::with_defaults(data_dir, "inner")
+        .context("init inner small filter_down engine")?;
+    let epoch_pending = Arc::new(AtomicBool::new(false));
 
     let inner_spirit_slot = open_slot(shm_dir, "inner_spirit_45d.bin")?;
     let body_slot = open_slot(shm_dir, "inner_body_5d.bin")?;
@@ -97,7 +106,10 @@ pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()
     // open in tick loop. C-S5 closure 2026-05-08.
     let sensor_cache_path = shm_dir.join("sensor_cache_inner_spirit.bin");
     let sensor_cache = Slot::open(&sensor_cache_path).ok();
-    info!(event = "SHM_OPENED", sensor_cache_present = sensor_cache.is_some());
+    info!(
+        event = "SHM_OPENED",
+        sensor_cache_present = sensor_cache.is_some()
+    );
 
     // Phase C 130D dim-live tracker bridge (rFP §4.7).
     let firing_writer = FiringSlotWriter::new(
@@ -120,8 +132,15 @@ pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()
     let dispatcher_state = state.clone();
     let dispatcher_shutdown = shutdown.clone();
     let bus_for_dispatcher = bus.clone();
+    let dispatcher_epoch = epoch_pending.clone();
     let dispatcher = tokio::spawn(async move {
-        run_event_dispatcher(bus_for_dispatcher, dispatcher_state, dispatcher_shutdown).await;
+        run_event_dispatcher(
+            bus_for_dispatcher,
+            dispatcher_state,
+            dispatcher_shutdown,
+            dispatcher_epoch,
+        )
+        .await;
     });
 
     let tick_result = run_tick_loop(
@@ -134,6 +153,8 @@ pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()
         sensor_cache,
         sensor_cache_path,
         firing_writer,
+        engine,
+        epoch_pending,
     )
     .await;
 
@@ -144,19 +165,41 @@ pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()
     tick_result
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DaemonState {
     /// UNIFIED inner_spirit_content multipliers (40D, observer already
     /// masked at publish side).
     unified_spirit_content: Option<[f32; CONTENT_DIMS]>,
     /// Shutdown via KERNEL_SHUTDOWN_ANNOUNCE.
     shutdown_requested: bool,
+    /// Last successfully-computed 45D spirit tensor (Sprint 7 — used as
+    /// `current_5d` fallback when source dict omits it; matches Python's
+    /// `_last_spirit_45d` rolling-state pattern).
+    last_spirit: [f32; SPIRIT_DIMS],
+    /// Throttle counter for SENSOR_CACHE_ABSENT WARNs. Reset to 0 on every
+    /// successful cache read; incremented each absent tick. The daemon ticks
+    /// at Schumann spirit (~70 Hz) so an unthrottled WARN floods rsyslog
+    /// (~40GB observed fleet-wide). WARN only on the first 3 absences + once
+    /// per ~60s (4200 ticks) while persistently absent.
+    sensor_cache_absent_count: u64,
+}
+
+impl Default for DaemonState {
+    fn default() -> Self {
+        Self {
+            unified_spirit_content: None,
+            shutdown_requested: false,
+            last_spirit: [0.5; SPIRIT_DIMS],
+            sensor_cache_absent_count: 0,
+        }
+    }
 }
 
 async fn run_event_dispatcher(
     bus: Arc<BusClient>,
     state: Arc<Mutex<DaemonState>>,
     shutdown: Arc<Notify>,
+    epoch_pending: Arc<AtomicBool>,
 ) {
     loop {
         tokio::select! {
@@ -164,6 +207,11 @@ async fn run_event_dispatcher(
             event = bus.recv() => match event {
                 Some(InboundEvent::Message { msg_type, raw_bytes, .. }) => {
                     handle_bus_message(&msg_type, &raw_bytes, &state);
+                    // §G5.1 / D-SPEC-97: kernel epoch boundary → arm the small
+                    // filter_down for the next Schumann tick (consumed once).
+                    if msg_type == "KERNEL_EPOCH_TICK" {
+                        epoch_pending.store(true, Ordering::Relaxed);
+                    }
                     if msg_type == "KERNEL_SHUTDOWN_ANNOUNCE" {
                         if let Ok(mut s) = state.lock() { s.shutdown_requested = true; }
                         shutdown.notify_waiters();
@@ -211,13 +259,16 @@ async fn run_tick_loop(
     mut sensor_cache: Option<Slot>,
     sensor_cache_path: std::path::PathBuf,
     mut firing_writer: FiringSlotWriter,
+    mut engine: SmallFilterDownEngine,
+    epoch_pending: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut content_gate = ContentGate::new();
-    // EMA smoothers for the 3 LOCAL filter_down output fields.
-    let mut ema_body = EmaSmoother::new(5);
-    let mut ema_mind = EmaSmoother::new(15);
-    let mut ema_spirit_content = EmaSmoother::new(CONTENT_DIMS);
+    // Previous epoch's 65D half-state — the `s` in the TD(0) transition s→s'.
+    let mut prev_half: Option<[f64; HALF_DIM]> = None;
     let mut drift_agg = DriftAggregator::new("spirit", DRIFT_THRESHOLD_PCT);
+    // §G5.2 traveling-tensor state (x[t-1], x[t-2]); cold-start at 0.5 centre.
+    let mut prev: [f32; SPIRIT_DIMS] = [0.5; SPIRIT_DIMS];
+    let mut prev2: [f32; SPIRIT_DIMS] = [0.5; SPIRIT_DIMS];
 
     // Per master plan §7 + C-S3 PLAN §1.1 #2: Schumann timer wheels live in
     // titan-schumann (canonical shared library for trinity daemons).
@@ -255,9 +306,9 @@ async fn run_tick_loop(
                     drift_agg.observe(drift_pct, tick_event.jitter_ns(), tick_event.epoch);
                     if let Err(e) = run_one_tick(
                         &bus, &state, &mut content_gate,
-                        &mut ema_body, &mut ema_mind, &mut ema_spirit_content,
+                        &mut engine, &epoch_pending, &mut prev_half,
                         &mut inner_spirit_slot, &body_slot, &mind_slot, &sensor_cache,
-                        &mut firing_writer,
+                        &mut firing_writer, &mut prev, &mut prev2,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
@@ -284,34 +335,70 @@ async fn run_one_tick(
     bus: &Arc<BusClient>,
     state: &Arc<Mutex<DaemonState>>,
     content_gate: &mut ContentGate,
-    ema_body: &mut EmaSmoother,
-    ema_mind: &mut EmaSmoother,
-    ema_spirit_content: &mut EmaSmoother,
+    engine: &mut SmallFilterDownEngine,
+    epoch_pending: &AtomicBool,
+    prev_half: &mut Option<[f64; HALF_DIM]>,
     inner_spirit_slot: &mut Slot,
     body_slot: &Slot,
     mind_slot: &Slot,
     sensor_cache: &Option<Slot>,
     firing_writer: &mut FiringSlotWriter,
+    prev: &mut [f32; SPIRIT_DIMS],
+    prev2: &mut [f32; SPIRIT_DIMS],
 ) -> Result<()> {
     // 1. Observer Principle G8: read sibling body + mind slots.
     let body = read_dim_slice::<5>(body_slot).map_err(|e| anyhow!("read body: {e}"))?;
     let mind = read_dim_slice::<15>(mind_slot).map_err(|e| anyhow!("read mind: {e}"))?;
 
-    // 2. Read sensor_cache_inner_spirit (45D Python-computed canonical
-    //    spirit_tensor.collect_spirit_45d output per SPEC §G1 + §23.6).
-    //    When the Python sidecar (logic/inner_spirit_sensor_refresh.py)
-    //    is running, this path returns the canonical 45D and we skip the
-    //    Rust-side `compose_spirit_tensor` MVP entirely — produces
-    //    byte-identical Python ↔ Rust spirit values.
+    // 2. Read sensor_cache_inner_spirit. Sprint 7 §4.6: Rust now owns
+    //    the 45D formula compute (via `project_inner_spirit_45d`) — the
+    //    Python sidecar publishes raw inputs only, no tensor compute.
+    //    Backward-compat with the legacy `{tensor:[45D]}` Python-computed
+    //    payload is preserved in `project_inner_spirit_45d`.
     //
-    //    When sensor cache is absent (cold boot, sidecar starting, Python
-    //    writer crashed), fall back to the local MVP `compose_spirit_tensor`
-    //    that derives 45D from body + mind alone. This keeps the daemon
-    //    resilient — degraded but not stuck.
-    let mut spirit: [f32; SPIRIT_DIMS] = match read_spirit_cache(sensor_cache) {
-        Some(cache_45d) => cache_45d, // canonical Python compute (preferred)
-        None => compose_spirit_tensor(&body, &mind, &[0.0_f32; 5]),
+    //    Sprint 8 (rFP §4.6 closure): the legacy `compose_spirit_tensor`
+    //    synthetic fallback (body+mind MVP) is RETIRED — it produced
+    //    SPEC-incorrect values that masked Python sidecar outages. When
+    //    the sensor cache is absent (cold boot, sidecar starting, Python
+    //    writer crashed) we now retain the last successful 45D output
+    //    and WARN throttled. Daemon stays resilient via last-known; the
+    //    failure is observable rather than silently degraded.
+    let last_spirit_snapshot = {
+        let s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
+        s.last_spirit
     };
+    let mut spirit: [f32; SPIRIT_DIMS] =
+        match read_spirit_cache(sensor_cache, &body, &mind, &last_spirit_snapshot) {
+            Some(cache_45d) => {
+                // Recovered (or never absent) — reset the throttle counter.
+                if let Ok(mut s) = state.lock() {
+                    s.sensor_cache_absent_count = 0;
+                }
+                cache_45d
+            }
+            None => {
+                let count = {
+                    let mut s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
+                    s.sensor_cache_absent_count = s.sensor_cache_absent_count.saturating_add(1);
+                    s.sensor_cache_absent_count
+                };
+                // Throttle: first 3 absences + once per ~60s (4200 ticks at
+                // ~70 Hz). Unthrottled, this WARN floods rsyslog.
+                if count <= 3 || count.is_multiple_of(4200) {
+                    warn!(
+                        event = "SENSOR_CACHE_ABSENT",
+                        count = count,
+                        consequence = "retain_last_known_45d"
+                    );
+                }
+                last_spirit_snapshot
+            }
+        };
+    // Cache fresh spirit (used as `current_5d` fallback on the next tick
+    // when the source dict omits it — matches Python `_last_spirit_45d`).
+    if let Ok(mut s) = state.lock() {
+        s.last_spirit = spirit;
+    }
 
     // 4. Apply UNIFIED filter_down to spirit content [5:45] (NOT observer).
     let unified_content = {
@@ -323,6 +410,19 @@ async fn run_one_tick(
         // get the unified multiplier applied.
         apply_multipliers(&mut spirit[CONTENT_RANGE], &u);
     }
+
+    // 4b. §G5.2 traveling-tensor update (Layer::Spirit — gradient .3/.7,
+    //     qualitative-led). Applies to ALL 45D incl. observer dims [0:5] (they
+    //     travel; observer masking is a filter_down-OUTPUT concern per §G8, not
+    //     a tensor-state concern). The restoring spring covers spirit's 45D —
+    //     the layer GROUND_UP (§G10) deliberately does not reach.
+    let cfg = RestoringCfg::for_layer(Layer::Spirit);
+    let x = stateful_update(&prev[..], &prev2[..], &spirit[..], &cfg);
+    let mut spirit_state = [0.0_f32; SPIRIT_DIMS];
+    spirit_state.copy_from_slice(&x[..SPIRIT_DIMS]);
+    *prev2 = *prev;
+    *prev = spirit_state;
+    let spirit = spirit_state;
 
     // 5. Encode + content-hash gate slot write.
     let bytes = encode_floats::<SPIRIT_DIMS>(&spirit);
@@ -339,160 +439,85 @@ async fn run_one_tick(
 
     // 6. Publish SPIRIT_STATE (P1 coalesce, src=inner) every tick.
     let payload = encode_spirit_state_payload(&spirit);
-    bus.publish("SPIRIT_STATE", Some("all"), Some(&payload))
+    bus.publish("SPIRIT_STATE", Some("all"), Some(payload))
         .await
         .map_err(|e| anyhow!("publish SPIRIT_STATE: {e}"))?;
 
-    // 7. Compute LOCAL filter_down multipliers for inner_body + inner_mind +
-    //    inner_spirit_content. Per SPEC §10.F + filter_down.py:737-740 +
-    //    apply_spirit_strength: gentle bias proportional to spirit deviation
-    //    from neutral 0.5; observer dims masked at publish.
-    let (body_mults, mind_mults, content_mults) =
-        compute_local_filter_down(&spirit, ema_body, ema_mind, ema_spirit_content);
+    // 7. Small filter_down — EVENT-gated on KERNEL_EPOCH_TICK (SPEC §G5.1 /
+    //    D-SPEC-97), NOT per Schumann tick. Once per kernel epoch: assemble
+    //    the 65D half-state (body[5] + mind[15] + spirit[45]), feed the
+    //    TD(0) transition s→s', train, compute the learned gradient-attention
+    //    multipliers, and publish INNER_SPIRIT_FILTER_DOWN. The learned
+    //    engine (SmallFilterDownEngine) reshapes + smoothens body/mind toward
+    //    the 0.5 Divine Center so per-layer coherence can cross the balance
+    //    threshold — replacing the inert C-S5 `1.0+(spirit-0.5)*0.1` placeholder.
+    if epoch_pending.swap(false, Ordering::Relaxed) {
+        let mut half = [0.0_f64; HALF_DIM];
+        for (i, &v) in body.iter().enumerate() {
+            half[i] = v as f64;
+        }
+        for (i, &v) in mind.iter().enumerate() {
+            half[5 + i] = v as f64;
+        }
+        for (i, &v) in spirit.iter().enumerate() {
+            half[20 + i] = v as f64;
+        }
 
-    // 8. Publish INNER_SPIRIT_FILTER_DOWN (P1, LOCAL bias) — observer dims
-    //    NEVER appear in inner_spirit_content (G8: it's already only [5:45]
-    //    = 40D content).
-    let local_payload = encode_local_filter_down_payload(&body_mults, &mind_mults, &content_mults);
-    bus.publish(
-        "INNER_SPIRIT_FILTER_DOWN",
-        Some("all"),
-        Some(&local_payload),
-    )
-    .await
-    .map_err(|e| anyhow!("publish INNER_SPIRIT_FILTER_DOWN: {e}"))?;
+        if let Some(prev) = prev_half.as_ref() {
+            engine.record_transition(prev, &half);
+            let mut rng = rand::thread_rng();
+            engine.maybe_train(&mut rng);
+        }
+        *prev_half = Some(half);
+
+        let mults = engine.compute_multipliers(&half);
+        let body_mults: Vec<f32> = mults.body.iter().map(|&v| v as f32).collect();
+        let mind_mults: Vec<f32> = mults.mind.iter().map(|&v| v as f32).collect();
+        let content_mults: Vec<f32> = mults.spirit_content.iter().map(|&v| v as f32).collect();
+
+        // Observer dims [0:5] NEVER appear in inner_spirit_content (G8: it's
+        // already only [5:45] = 40D content).
+        let local_payload =
+            encode_local_filter_down_payload(&body_mults, &mind_mults, &content_mults);
+        bus.publish("INNER_SPIRIT_FILTER_DOWN", Some("all"), Some(local_payload))
+            .await
+            .map_err(|e| anyhow!("publish INNER_SPIRIT_FILTER_DOWN: {e}"))?;
+    }
 
     Ok(())
 }
 
-/// Pure-compute spirit tensor from body + mind + (optional) cache. 45D
-/// output per SPEC §7.1 + Preamble G3 / G8.
+/// Read sensor_cache_inner_spirit.bin and compute the 45D inner-spirit
+/// tensor per SPEC §23.6 `spirit_tensor.collect_spirit_45d`.
 ///
-/// Composition is INTENTIONALLY simple for the daemon MVP:
+/// Sprint 7 §4.6 FULL Rust formula port: Python `spirit_worker._provide_
+/// spirit_45d` publishes RAW inputs (consciousness / hormone_levels /
+/// hormone_fires / unified_spirit_stats / sphere_clocks / memory_stats /
+/// birth_state / topology / expression_stats / history / current_5d) and
+/// this function computes the 45D Sat-Chit-Ananda tensor in Rust using
+/// the freshly-read body + mind tensors as Observer Principle inputs.
 ///
-/// - SAT[0:15]: presence/being. dims [0:5] = body itself (Observer slice
-///   per G8 — preserves embodiment witness); dims [5:10] = mean of body +
-///   thinking[0:5]; dims [10:15] = mean of body + feeling[5:10].
-/// - CHIT[15:30]: knowing/awareness. dims [15:25] = mean of thinking+feeling
-///   pairwise (10D); dims [25:30] = mean of mind willing[10:15] doubled.
-/// - ANANDA[30:45]: bliss/resonance. dims [30:40] = mind itself (10 of 15);
-///   dims [40:45] = mean of body + mind willing.
+/// Backward-compat with the pre-Sprint-7 `{tensor: [45 floats]}` legacy
+/// payload (Python-computed 45D) is preserved for atomic-deploy safety.
 ///
-/// All values clamped to `[0, 1]`. The deeper learned spirit tensor lives
-/// in `titan-unified-spirit-rs::self_assembly` (C-S4); this MVP daemon
-/// produces stable derived state for downstream consumers + filter_down
-/// publish input.
-pub fn compose_spirit_tensor(
+/// Returns `Some(45D)` when the cache contains a usable payload (either
+/// schema). Returns `None` only when the slot is absent, read errors,
+/// or the payload is fundamentally malformed — caller falls back to
+/// `compose_spirit_tensor` MVP (body+mind only) in the `None` case.
+fn read_spirit_cache(
+    sensor_cache: &Option<Slot>,
     body: &[f32; 5],
     mind: &[f32; 15],
-    cache: &[f32; 5],
-) -> [f32; SPIRIT_DIMS] {
-    let mut s = [0.0_f32; SPIRIT_DIMS];
-
-    // SAT[0:15] — presence
-    for i in 0..5 {
-        s[i] = body[i]; // observer slice
-        s[5 + i] = (body[i] + mind[i]) * 0.5; // body × thinking
-        s[10 + i] = (body[i] + mind[5 + i]) * 0.5; // body × feeling
-    }
-    // CHIT[15:30] — knowing
-    for i in 0..5 {
-        s[15 + i] = (mind[i] + mind[5 + i]) * 0.5; // thinking × feeling pair 1
-    }
-    for i in 0..5 {
-        s[20 + i] = (mind[5 + i] + mind[10 + i]) * 0.5; // feeling × willing
-    }
-    s[25..30].copy_from_slice(&mind[10..15]); // willing direct
-                                              // ANANDA[30:45] — bliss/resonance, modulated by sensor cache
-    s[30..35].copy_from_slice(&mind[0..5]); // thinking direct
-    s[35..40].copy_from_slice(&mind[5..10]); // feeling direct
-    for i in 0..5 {
-        s[40 + i] = (body[i] + mind[10 + i] + cache[i]) / 3.0;
-    }
-
-    // Clamp to [0, 1]
-    for v in s.iter_mut() {
-        *v = v.clamp(0.0, 1.0);
-    }
-    s
-}
-
-/// Compute LOCAL filter_down multipliers from spirit tensor.
-/// Output: (body[5], mind[15], spirit_content[40]) — observer-masked.
-pub fn compute_local_filter_down(
-    spirit: &[f32; SPIRIT_DIMS],
-    ema_body: &mut EmaSmoother,
-    ema_mind: &mut EmaSmoother,
-    ema_spirit_content: &mut EmaSmoother,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    // Step 1: derive raw multipliers from spirit. For body + mind use the
-    // mean of relevant spirit dims as the bias signal.
-    //
-    // body bias from SAT body-related slice [0:5] (the observer slice
-    // serves as the body's spirit-witness; G8 says observer dims are
-    // never PUBLISHED but here we're using them as INPUT to compute body
-    // multipliers — that's allowed).
-    let mut body_raw = [0.0_f32; 5];
-    for i in 0..5 {
-        body_raw[i] = 1.0 + (spirit[i] - 0.5) * 0.1;
-    }
-    // mind bias from CHIT [15:30] — knowing pairs.
-    let mut mind_raw = [0.0_f32; 15];
-    for i in 0..15 {
-        mind_raw[i] = 1.0 + (spirit[15 + i] - 0.5) * 0.1;
-    }
-    // spirit_content bias from spirit content [5:45] (40D excluding observer).
-    let mut content_raw = [0.0_f32; CONTENT_DIMS];
-    for i in 0..CONTENT_DIMS {
-        content_raw[i] = 1.0 + (spirit[5 + i] - 0.5) * 0.1;
-    }
-
-    // Step 2: clamp to [FLOOR, CEIL].
-    for v in body_raw.iter_mut() {
-        *v = v.clamp(MULTIPLIER_FLOOR, MULTIPLIER_CEIL);
-    }
-    for v in mind_raw.iter_mut() {
-        *v = v.clamp(MULTIPLIER_FLOOR, MULTIPLIER_CEIL);
-    }
-    for v in content_raw.iter_mut() {
-        *v = v.clamp(MULTIPLIER_FLOOR, MULTIPLIER_CEIL);
-    }
-
-    // Step 3: spirit-strength scaling on content (per filter_down.py:737-740
-    // + Preamble G9 — gentle filter prevents over-steering inner loop).
-    apply_spirit_strength(&mut content_raw, SPIRIT_FILTER_STRENGTH_MULT);
-
-    // Step 4: EMA smoothing across publishes (mirrors V5 publish path
-    // smoothing per filter_down.py:742-743).
-    let body_smoothed = ema_body.update(&body_raw).to_vec();
-    let mind_smoothed = ema_mind.update(&mind_raw).to_vec();
-    let content_smoothed = ema_spirit_content.update(&content_raw).to_vec();
-
-    (body_smoothed, mind_smoothed, content_smoothed)
-}
-
-/// Read the 45D Python-computed spirit tensor from
-/// `sensor_cache_inner_spirit.bin`. Returns `Some(45D)` only when the
-/// Python sidecar has written at least one full payload; returns `None`
-/// when the slot is missing, the read fails, or the payload is short
-/// (cold-boot / partial-write window). The caller falls back to the
-/// local MVP `compose_spirit_tensor` in the `None` case.
-///
-/// SPEC §G1 (Inner-Spirit = 45D) + §23.6 formulas + §9.A line 1055.
-/// Pre-fix this function returned `[f32; 5]` — that was a SPEC
-/// non-compliance bug fixed 2026-05-08 alongside C-S5 closure.
-fn read_spirit_cache(sensor_cache: &Option<Slot>) -> Option<[f32; SPIRIT_DIMS]> {
+    last_spirit: &[f32; SPIRIT_DIMS],
+) -> Option<[f32; SPIRIT_DIMS]> {
     let slot = sensor_cache.as_ref()?;
     let raw = slot.read().ok()?;
     if raw.is_empty() {
         return None;
     }
-    // Step 9 §4.6 schema migration v1→v2: msgpack source-dict
-    // {"tensor": [v0..v44]} (Phase C). Falls back to legacy 45-float32-LE
-    // for backward compat with pre-deploy.
     let is_msgpack = matches!(raw[0], 0x80..=0x8f | 0xde | 0xdf);
     if is_msgpack {
-        return decode_spirit_source_dict(&raw);
+        return project_inner_spirit_45d(&raw, body, mind, last_spirit).ok();
     }
     if raw.len() < SPIRIT_DIMS * 4 {
         return None; // partial payload — sidecar still starting up
@@ -506,32 +531,432 @@ fn read_spirit_cache(sensor_cache: &Option<Slot>) -> Option<[f32; SPIRIT_DIMS]> 
     Some(out)
 }
 
-/// Decode msgpack source dict {"tensor": [45 floats]} produced by
-/// `spirit_worker._provide_spirit_45d` (Step 9 §4.6 schema v2).
-fn decode_spirit_source_dict(payload: &[u8]) -> Option<[f32; SPIRIT_DIMS]> {
+/// V6 45D inner-spirit projection. Pure compute over the msgpack source
+/// dict + observer-principle body/mind reads. Implements SPEC §23.6
+/// `collect_spirit_45d` SAT[0:15] + CHIT[15:30] + ANANDA[30:45].
+///
+/// Source dict (NEW schema, Sprint 7) — all keys optional:
+///   - `current_5d`: [5 × f32] from last spirit tick (for SAT[0,5,12]).
+///   - `consciousness`: {epoch_id, density, curvature, dream_quality,
+///     fatigue, trajectory_magnitude, ...}
+///   - `hormone_levels`: {CURIOSITY, FOCUS, INSPIRATION, IMPULSE,
+///     VIGILANCE, ...}
+///   - `hormone_fires`: {INTUITION, REFLECTION, CREATIVITY, EMPATHY,
+///     CURIOSITY, ...} (counts; sum used for SAT[1])
+///   - `unified_spirit_stats`: {velocity, epoch_count}
+///   - `sphere_clocks`: {clock_name: {pulse_count}, ...}
+///   - `memory_stats`: {action_chains}
+///   - `birth_state`: [3+ × f32]
+///   - `topology`: {volume, curvature} (optional — SAT[7]/CHIT[12]
+///     fall back to default when absent)
+///   - `expression_stats`: {sovereignty_ratio, composites:{...}}
+///     (CHIT[13] + ANANDA[8])
+///   - `history`: {expression:{sovereignty_ratio}} (SAT[2] fallback)
+///
+/// Source dict (LEGACY schema): `tensor: [45 × f32]` — already-computed
+/// 45D passthrough for atomic-deploy safety.
+///
+/// `body` + `mind` are read by the caller from `inner_body_5d.bin` +
+/// `inner_mind_15d.bin` SHM slots (Observer Principle G8); used for
+/// body_coh + mind_coh + combined_coh aggregates that feed many dims.
+///
+/// `last_spirit` provides the fallback for `current_5d` when the source
+/// dict omits it (cold-boot tick before Python sidecar has accumulated
+/// any tensor state). Same role as Python's `_last_spirit_45d[:5]`.
+pub fn project_inner_spirit_45d(
+    payload: &[u8],
+    body: &[f32; 5],
+    mind: &[f32; 15],
+    last_spirit: &[f32; SPIRIT_DIMS],
+) -> Result<[f32; SPIRIT_DIMS]> {
     use rmpv::Value;
-    let v = rmpv::decode::read_value(&mut std::io::Cursor::new(payload)).ok()?;
-    let map = match v {
+    let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(payload))
+        .map_err(|e| anyhow!("decode source dict: {e}"))?;
+    let map = match &v {
         Value::Map(items) => items,
-        _ => return None,
+        _ => return Ok(*last_spirit),
     };
-    for (k, val) in map.iter() {
+
+    // Legacy schema: 45D already computed — pass through.
+    if let Some(tensor) = lookup_array(map, "tensor") {
+        let mut out = [0.5_f32; SPIRIT_DIMS];
+        for (i, item) in tensor.iter().take(SPIRIT_DIMS).enumerate() {
+            out[i] = item.as_f64().unwrap_or(0.5) as f32;
+        }
+        return Ok(out);
+    }
+
+    // NEW schema: extract raw inputs.
+    let current_5d = lookup_array(map, "current_5d")
+        .map(|arr| {
+            let mut t = [0.5_f32; 5];
+            for (i, item) in arr.iter().take(5).enumerate() {
+                t[i] = item.as_f64().unwrap_or(0.5) as f32;
+            }
+            t
+        })
+        .unwrap_or_else(|| {
+            let mut t = [0.5_f32; 5];
+            t.copy_from_slice(&last_spirit[..5]);
+            t
+        });
+
+    let consciousness = lookup_map(map, "consciousness");
+    let hormone_levels = lookup_map(map, "hormone_levels");
+    let memory_stats = lookup_map(map, "memory_stats");
+    let birth_state = lookup_array(map, "birth_state");
+
+    // Observer Principle aggregates.
+    let body_coh = mean_f32(body);
+    let mind_coh = mean_f32(mind);
+    let combined_coh = (body_coh + mind_coh) / 2.0;
+
+    let mut spirit = [0.5_f32; SPIRIT_DIMS];
+
+    // D-SPEC-101 (rFP Dims Redesign Closure Phase 1): short-window
+    // self-observation breath signals (0..1, already normalized by the
+    // inner_spirit sidecar's dual-EMA tracker — fast ~90s ÷ slow ~30min
+    // baseline). Feed the re-grounded dims that previously saturated on
+    // cumulative `min(1, count/N)` or pinned on `epoch/N`. Absent (boot) →
+    // 0.0 (quiet); warms up over ~minutes.
+    let win = lookup_map(map, "inner_spirit_window");
+    // D-SPEC-101 Phase-1 completion (2026-05-21): rich expression rolling-
+    // window breath (image/sound/speak/word variety+volume + windowed
+    // sovereignty-of-expression) — feeds sovereignty[2], causal_understanding[28],
+    // expression_quality[38]. Absent (boot) → neutral defaults at each use.
+    let expr_win = lookup_map(map, "expression_window");
+
+    // ── SAT[0..14] — Being/Existence (offset 0) ──
+    // [0] self_recognition: cosine_sim(current_5d[:3], birth[:3])
+    if let Some(b) = birth_state.as_ref() {
+        if b.len() >= 3 {
+            let a3 = [
+                current_5d[0] as f64,
+                current_5d[1] as f64,
+                current_5d[2] as f64,
+            ];
+            let b3 = [
+                b[0].as_f64().unwrap_or(0.5),
+                b[1].as_f64().unwrap_or(0.5),
+                b[2].as_f64().unwrap_or(0.5),
+            ];
+            spirit[0] = safe_clamp(cosine_sim(&a3, &b3)) as f32;
+        }
+    }
+    // [1] authenticity RE-GROUNDED (D-SPEC-101): how the Titan's
+    //   authenticity-cluster dims (self_recognition/sovereignty/essence_purity/
+    //   uniqueness/integrity) MOVE over the ~90s window — not a saturating
+    //   lifetime fire-count. Source: inner_spirit_window.authenticity_change.
+    spirit[1] = safe_clamp(field_or_default(win.as_ref(), "authenticity_change", 0.0)) as f32;
+    // [2] sovereignty RE-GROUNDED (D-SPEC-101 Phase-1 completion): windowed
+    //   sovereignty-of-expression — self-authored (learned postures) vs total
+    //   expressive actions over the recent window. Was the static
+    //   history.expression.sovereignty_ratio (empty → pinned 0.5 / 0.0).
+    //   Source: expression_window.sovereignty.
+    spirit[2] = safe_clamp(field_or_default(expr_win.as_ref(), "sovereignty", 0.5)) as f32;
+    // [3] boundary_clarity: (body_coh + mind_coh) / 2
+    spirit[3] = safe_clamp((body_coh + mind_coh) / 2.0) as f32;
+    // [4] temporal_continuity RE-GROUNDED (D-SPEC-101): steady self ⇒ high
+    //   continuity; fast change of the 45D ⇒ low. Was min(1, epoch/3000)
+    //   (pinned 1.0). Source: 1 − inner_spirit_window.self_churn.
+    spirit[4] = safe_clamp(1.0 - field_or_default(win.as_ref(), "self_churn", 0.0)) as f32;
+    // [5] origin_connection: 1 - l2_dist(current_5d, birth) / 3
+    if let Some(b) = birth_state.as_ref() {
+        if !b.is_empty() {
+            let n = current_5d.len().min(b.len());
+            let a: Vec<f64> = current_5d.iter().take(n).map(|v| *v as f64).collect();
+            let bvec: Vec<f64> = b
+                .iter()
+                .take(n)
+                .map(|v| v.as_f64().unwrap_or(0.5))
+                .collect();
+            spirit[5] = safe_clamp(1.0 - l2_dist(&a, &bvec) / 3.0) as f32;
+        }
+    }
+    // [6] growth_trajectory RE-GROUNDED (D-SPEC-101): dynamic growth of
+    //   inner_spirit's OWN 44 dims over the short window (NOT unified_spirit
+    //   velocity — wrong layer). Source: inner_spirit_window.growth.
+    spirit[6] = safe_clamp(field_or_default(win.as_ref(), "growth", 0.0)) as f32;
+    // [7] spatial_presence RE-GROUNDED (D-SPEC-101): inner topology 10D
+    //   change over the ~90s window. Was topo.volume/5 (static). Source:
+    //   inner_spirit_window.topo_change.
+    spirit[7] = safe_clamp(field_or_default(win.as_ref(), "topo_change", 0.0)) as f32;
+    // [8] personality_coherence: body_coh * mind_coh * 2
+    spirit[8] = safe_clamp(body_coh * mind_coh * 2.0) as f32;
+    // [9] essence_purity: cons.density (default 0.5)
+    spirit[9] = safe_clamp(field_or_default(consciousness.as_ref(), "density", 0.5)) as f32;
+    // [10] resilience: 1 - |curvature|/π
+    let curvature = field_or_default(consciousness.as_ref(), "curvature", 0.0).abs();
+    spirit[10] = safe_clamp(1.0 - curvature / std::f64::consts::PI) as f32;
+    // [11] adaptability RE-GROUNDED (D-SPEC-101): recent windowed
+    //   hormone-deviation RATE (how much hormones are MOVING) — breathing,
+    //   not the saturating cumulative |h−0.5| sum. Source:
+    //   inner_spirit_window.hormone_velocity.
+    spirit[11] = safe_clamp(field_or_default(win.as_ref(), "hormone_velocity", 0.0)) as f32;
+    // [12] uniqueness: l2_dist(current_5d, [0.5;5]) / 2
+    {
+        let a: Vec<f64> = current_5d.iter().map(|v| *v as f64).collect();
+        let d: Vec<f64> = vec![0.5; current_5d.len()];
+        spirit[12] = safe_clamp(l2_dist(&a, &d) / 2.0) as f32;
+    }
+    // [13] integrity: (body_coh + mind_coh) / 2 (same shape as [3])
+    spirit[13] = safe_clamp((body_coh + mind_coh) / 2.0) as f32;
+    // [14] vitality: hormone_activity * 0.4 + body_health * 0.6
+    let hormone_activity = mean_map_values(hormone_levels.as_ref());
+    let body_health = if body.is_empty() { 0.5 } else { mean_f32(body) };
+    spirit[14] = safe_clamp(hormone_activity * 0.4 + body_health * 0.6) as f32;
+
+    // ── CHIT[15..29] — Consciousness/Awareness (offset 15) ──
+    // [15] self_awareness_depth RE-GROUNDED (D-SPEC-101 Phase-1 completion):
+    //   DYNAMIC depth = self-observed coherence across the OTHER 44 inner_spirit
+    //   dims (1 − var/0.25, smoothed). Was min(1, epoch/5000) (pinned 1.0 — a
+    //   lifetime counter, zero variance). Source: inner_spirit_window.coherence_depth.
+    spirit[15] = safe_clamp(field_or_default(win.as_ref(), "coherence_depth", 0.5)) as f32;
+    // [16] observation_clarity: combined_coh
+    spirit[16] = safe_clamp(combined_coh) as f32;
+    // [17] discernment_quality RE-GROUNDED (rFP_trinity_dim_resonance, greenlit
+    //   2026-05-20): the Titan's judgment apparatus — output_verifier
+    //   verified/rejected volume + sovereignty score — plus the original
+    //   action_chains as the meta-reasoning chains crystallize. Replaces the
+    //   bare `min(1, action_chains/20)` that sat at 0.5 fleet-wide because
+    //   action_chains=0 (the known meta-reasoning crystallization gap).
+    {
+        let ov = lookup_map(map, "output_verifier_stats");
+        let verified = field_or_default(ov.as_ref(), "verified_count", 0.0);
+        let rejected = field_or_default(ov.as_ref(), "rejected_count", 0.0);
+        let sovereignty = field_or_default(ov.as_ref(), "sovereignty_score", 0.5);
+        let action_chains = field_or_default(memory_stats.as_ref(), "action_chains", 0.0);
+        let judgment_volume = ((verified + rejected) / 50.0).min(1.0);
+        spirit[17] = safe_clamp(
+            0.4 * judgment_volume + 0.3 * sovereignty + 0.3 * (action_chains / 20.0).min(1.0),
+        ) as f32;
+    }
+    // [18] integration_level: combined_coh
+    spirit[18] = safe_clamp(combined_coh) as f32;
+    // [19] witness_presence: body_coh * mind_coh * 2
+    spirit[19] = safe_clamp(body_coh * mind_coh * 2.0) as f32;
+    // [20] pattern_recognition RE-GROUNDED (D-SPEC-101): recent INTUITION
+    //   fire-RATE (windowed breath), not the saturating cumulative count.
+    //   Source: inner_spirit_window.fire_rate_INTUITION.
+    spirit[20] = safe_clamp(field_or_default(win.as_ref(), "fire_rate_INTUITION", 0.0)) as f32;
+    // [21] wisdom_accumulation: cons.density (default 0.0 here per Python)
+    spirit[21] = safe_clamp(field_or_default(consciousness.as_ref(), "density", 0.0)) as f32;
+    // [22] truth_seeking RE-GROUNDED (D-SPEC-101 Phase-1 completion): recent
+    //   CURIOSITY fire-RATE (active truth-seeking right now), windowed breath.
+    //   Was the hormone LEVEL hlvl.CURIOSITY (saturated ~1.0). Source:
+    //   inner_spirit_window.fire_rate_CURIOSITY.
+    spirit[22] = safe_clamp(field_or_default(win.as_ref(), "fire_rate_CURIOSITY", 0.0)) as f32;
+    // [23] attention_depth: hlvl.FOCUS
+    spirit[23] = safe_clamp(field_or_default(hormone_levels.as_ref(), "FOCUS", 0.0)) as f32;
+    // [24] reflective_capacity RE-GROUNDED (D-SPEC-101): recent REFLECTION
+    //   fire-RATE (windowed breath), not the saturating cumulative count.
+    //   Source: inner_spirit_window.fire_rate_REFLECTION.
+    spirit[24] = safe_clamp(field_or_default(win.as_ref(), "fire_rate_REFLECTION", 0.0)) as f32;
+    // [25] dream_awareness: dream_quality * 0.7 + fatigue * 0.3
+    let dream_quality = field_or_default(consciousness.as_ref(), "dream_quality", 0.0);
+    let fatigue = field_or_default(consciousness.as_ref(), "fatigue", 0.0);
+    spirit[25] = safe_clamp(dream_quality * 0.7 + fatigue * 0.3) as f32;
+    // [26] temporal_awareness RE-GROUNDED (D-SPEC-101 Phase-1 completion):
+    //   recent sphere-clock pulse RATE — temporal awareness BREATHES with how
+    //   actively the clocks pulse. Was min(1, Σpulse_count/50): the sidecar
+    //   reader was also mismapped (summed RADII), and once the canonical
+    //   pulse_count is read it saturates 1.0 on any mature Titan. The windowed
+    //   rate breathes per the rFP cumulative→recent-rate principle. Source:
+    //   inner_spirit_window.clock_pulse_rate.
+    spirit[26] = safe_clamp(field_or_default(win.as_ref(), "clock_pulse_rate", 0.0)) as f32;
+    // [27] spatial_awareness RE-GROUNDED (D-SPEC-101): inner topology 10D
+    //   change over the ~90s window (shares the topo breath with [7]
+    //   spatial_presence). Was the static (volume/5 + |curvature|)/2.
+    //   Source: inner_spirit_window.topo_change.
+    spirit[27] = safe_clamp(field_or_default(win.as_ref(), "topo_change", 0.0)) as f32;
+    // [28] causal_understanding RE-GROUNDED (D-SPEC-101 Phase-1 completion):
+    //   breadth of recent expressive output (variety of active modalities).
+    //   Was expression_intensity (empty → 0). Source: expression_window.variety.
+    spirit[28] = safe_clamp(field_or_default(expr_win.as_ref(), "variety", 0.0)) as f32;
+    // [29] meta_cognition: cons.trajectory OR cons.trajectory_magnitude
+    let traj = field_or_default(consciousness.as_ref(), "trajectory", -1.0);
+    let traj = if traj < 0.0 {
+        field_or_default(consciousness.as_ref(), "trajectory_magnitude", 0.0)
+    } else {
+        traj
+    };
+    spirit[29] = safe_clamp(traj) as f32;
+
+    // ── ANANDA[30..44] — Bliss/Fulfillment (offset 30) ──
+    // [30] purpose_alignment: combined_coh * 0.8 + 0.2
+    spirit[30] = safe_clamp(combined_coh * 0.8 + 0.2) as f32;
+    // [31] meaning_depth: density * combined_coh * 2
+    let density = field_or_default(consciousness.as_ref(), "density", 0.0);
+    spirit[31] = safe_clamp(density * combined_coh * 2.0) as f32;
+    // [32] creative_joy RE-GROUNDED (D-SPEC-101): recent CREATIVITY
+    //   fire-RATE (windowed breath), not the saturating cumulative count.
+    //   Source: inner_spirit_window.fire_rate_CREATIVITY.
+    spirit[32] = safe_clamp(field_or_default(win.as_ref(), "fire_rate_CREATIVITY", 0.0)) as f32;
+    // [33] harmony_seeking: combined_coh
+    spirit[33] = safe_clamp(combined_coh) as f32;
+    // [34] beauty_perception: body_coh * mind_coh * 2
+    spirit[34] = safe_clamp(body_coh * mind_coh * 2.0) as f32;
+    // [35] truth_resonance RE-GROUNDED (D-SPEC-101): recent INTUITION
+    //   fire-RATE (windowed breath), shares the INTUITION breath with [20].
+    //   Source: inner_spirit_window.fire_rate_INTUITION.
+    spirit[35] = safe_clamp(field_or_default(win.as_ref(), "fire_rate_INTUITION", 0.0)) as f32;
+    // [36] connection_fulfillment RE-GROUNDED (D-SPEC-101 Phase-1 completion):
+    //   recent EMPATHY fire-RATE (windowed breath). Was min(1, EMPATHY/15)
+    //   (sat 1.0). Source: inner_spirit_window.fire_rate_EMPATHY.
+    spirit[36] = safe_clamp(field_or_default(win.as_ref(), "fire_rate_EMPATHY", 0.0)) as f32;
+    // [37] growth_satisfaction RE-GROUNDED (D-SPEC-101 Phase-1 completion):
+    //   own-44-dim short-window growth (same source as [6] growth_trajectory),
+    //   NOT unified_spirit velocity (wrong layer, sat 1.0). Source:
+    //   inner_spirit_window.growth.
+    spirit[37] = safe_clamp(field_or_default(win.as_ref(), "growth", 0.0)) as f32;
+    // [38] expression_quality RE-GROUNDED (D-SPEC-101 Phase-1 completion):
+    //   volume×variety blend of the rich expression-window (how MUCH and how
+    //   VARIED the recent expressive output). Was expression_intensity*0.5+0.3
+    //   (floor 0.30, empty). Source: expression_window.{volume, variety}.
+    {
+        let vol = field_or_default(expr_win.as_ref(), "volume", 0.0);
+        let var = field_or_default(expr_win.as_ref(), "variety", 0.0);
+        spirit[38] = safe_clamp(0.5 * (vol + var)) as f32;
+    }
+    // [39] exploration_joy RE-GROUNDED (D-SPEC-101 Phase-1 completion): recent
+    //   CURIOSITY fire-RATE (windowed breath). Was min(1, CURIOSITY/15) (sat
+    //   1.0). Source: inner_spirit_window.fire_rate_CURIOSITY.
+    spirit[39] = safe_clamp(field_or_default(win.as_ref(), "fire_rate_CURIOSITY", 0.0)) as f32;
+    // [40] rest_fulfillment: 1 - fatigue (cons.fatigue default 0.5)
+    let fatigue_for_rest = field_or_default(consciousness.as_ref(), "fatigue", 0.5);
+    spirit[40] = safe_clamp(1.0 - fatigue_for_rest) as f32;
+    // [41] creative_tension RE-GROUNDED (D-SPEC-101 Phase-1 completion): recent
+    //   INSPIRATION fire-RATE (windowed breath). Was the hormone LEVEL
+    //   hlvl.INSPIRATION (frozen). Source: inner_spirit_window.fire_rate_INSPIRATION.
+    spirit[41] = safe_clamp(field_or_default(win.as_ref(), "fire_rate_INSPIRATION", 0.0)) as f32;
+    // [42] surrender_capacity: 1 - (IMPULSE + VIGILANCE) / 2
+    let impulse = field_or_default(hormone_levels.as_ref(), "IMPULSE", 0.5);
+    let vigilance = field_or_default(hormone_levels.as_ref(), "VIGILANCE", 0.5);
+    spirit[42] = safe_clamp(1.0 - (impulse + vigilance) / 2.0) as f32;
+    // [43] gratitude_depth: fulfillment * combined_coh; fulfillment=(body_health+mind_health)/2
+    let mind_health = if mind.is_empty() { 0.5 } else { mean_f32(mind) };
+    let fulfillment = (body_health + mind_health) / 2.0;
+    spirit[43] = safe_clamp(fulfillment * combined_coh) as f32;
+    // [44] transcendence_glimpse RE-GROUNDED (D-SPEC-101 Phase-1 completion):
+    //   inner↔outer spirit-pair BIG-PULSE proximity (both spirit sphere clocks
+    //   contracted + balanced → BIG PULSE). Was min(1, great_pulse_epochs/5)
+    //   (=0, GREAT-circular). Source: inner_spirit_window.spirit_pair_resonance.
+    spirit[44] = safe_clamp(field_or_default(win.as_ref(), "spirit_pair_resonance", 0.0)) as f32;
+
+    Ok(spirit)
+}
+
+// ── Helpers (inlined per outer-spirit-rs convention; D8 cleanup will
+//    extract these to the shared trinity-daemon crate) ──
+
+fn safe_clamp(v: f64) -> f64 {
+    if v.is_nan() {
+        return 0.5;
+    }
+    v.clamp(0.0, 1.0)
+}
+
+fn mean_f32(v: &[f32]) -> f64 {
+    if v.is_empty() {
+        return 0.5;
+    }
+    let s: f64 = v.iter().map(|x| *x as f64).sum();
+    s / v.len() as f64
+}
+
+fn l2_dist(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len().min(b.len());
+    let mut sum = 0.0;
+    for i in 0..n {
+        let d = a[i] - b[i];
+        sum += d * d;
+    }
+    sum.sqrt()
+}
+
+fn cosine_sim(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len().min(b.len());
+    let mut dot = 0.0;
+    let mut na = 0.0;
+    let mut nb = 0.0;
+    for i in 0..n {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na.sqrt() < 1e-10 || nb.sqrt() < 1e-10 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+fn lookup_map(
+    map: &[(rmpv::Value, rmpv::Value)],
+    key: &str,
+) -> Option<Vec<(rmpv::Value, rmpv::Value)>> {
+    use rmpv::Value;
+    for (k, v) in map.iter() {
         if let Value::String(s) = k {
-            if s.as_str() == Some("tensor") {
-                if let Value::Array(items) = val {
-                    if items.len() < SPIRIT_DIMS {
-                        return None;
-                    }
-                    let mut out = [0.5_f32; SPIRIT_DIMS];
-                    for (i, item) in items.iter().take(SPIRIT_DIMS).enumerate() {
-                        out[i] = item.as_f64().unwrap_or(0.5) as f32;
-                    }
-                    return Some(out);
+            if s.as_str() == Some(key) {
+                if let Value::Map(items) = v {
+                    return Some(items.clone());
                 }
+                return None;
             }
         }
     }
     None
+}
+
+fn lookup_array(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<Vec<rmpv::Value>> {
+    use rmpv::Value;
+    for (k, v) in map.iter() {
+        if let Value::String(s) = k {
+            if s.as_str() == Some(key) {
+                if let Value::Array(items) = v {
+                    return Some(items.clone());
+                }
+                return None;
+            }
+        }
+    }
+    None
+}
+
+fn field_or_default(map: Option<&Vec<(rmpv::Value, rmpv::Value)>>, key: &str, default: f64) -> f64 {
+    let map = match map {
+        Some(m) => m,
+        None => return default,
+    };
+    use rmpv::Value;
+    for (k, v) in map.iter() {
+        if let Value::String(s) = k {
+            if s.as_str() == Some(key) {
+                return v.as_f64().unwrap_or(default);
+            }
+        }
+    }
+    default
+}
+
+/// Mean of all numeric values in a map (used for hormone_activity).
+fn mean_map_values(map: Option<&Vec<(rmpv::Value, rmpv::Value)>>) -> f64 {
+    let map = match map {
+        Some(m) => m,
+        None => return 0.0,
+    };
+    let mut total = 0.0;
+    let mut count = 0;
+    for (_, v) in map.iter() {
+        if let Some(f) = v.as_f64() {
+            total += f;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    total / count as f64
 }
 
 fn open_slot(shm_dir: &Path, name: &str) -> Result<Slot> {
@@ -539,10 +964,12 @@ fn open_slot(shm_dir: &Path, name: &str) -> Result<Slot> {
     Slot::open(&path).with_context(|| format!("open slot {}", path.display()))
 }
 
-fn encode_spirit_state_payload(spirit: &[f32; SPIRIT_DIMS]) -> Vec<u8> {
+/// Build a SPEC §8.5 `SPIRIT_STATE` payload as `rmpv::Value::Map` per
+/// SPEC §8.10 line 900 byte-identical guarantee.
+fn encode_spirit_state_payload(spirit: &[f32; SPIRIT_DIMS]) -> rmpv::Value {
     use rmpv::Value;
     let values = Value::Array(spirit.iter().map(|f| Value::F64(*f as f64)).collect());
-    let map = Value::Map(vec![
+    Value::Map(vec![
         (Value::String("src".into()), Value::String("inner".into())),
         (
             Value::String("type".into()),
@@ -550,18 +977,15 @@ fn encode_spirit_state_payload(spirit: &[f32; SPIRIT_DIMS]) -> Vec<u8> {
         ),
         (Value::String("values".into()), values),
         (Value::String("ts".into()), Value::F64(now_secs())),
-    ]);
-    let mut out = Vec::with_capacity(512);
-    rmpv::encode::write_value(&mut out, &map)
-        .expect("rmpv encode never fails on well-formed Value");
-    out
+    ])
 }
 
+/// Build a SPEC §8.6 `INNER_SPIRIT_FILTER_DOWN` payload as `rmpv::Value::Map`.
 fn encode_local_filter_down_payload(
     body_mults: &[f32],
     mind_mults: &[f32],
     spirit_content_mults: &[f32],
-) -> Vec<u8> {
+) -> rmpv::Value {
     use rmpv::Value;
     fn arr_from_vec(v: &[f32]) -> Value {
         Value::Array(v.iter().map(|f| Value::F64(*f as f64)).collect())
@@ -574,14 +998,10 @@ fn encode_local_filter_down_payload(
             arr_from_vec(spirit_content_mults),
         ),
     ]);
-    let map = Value::Map(vec![
+    Value::Map(vec![
         (Value::String("multipliers".into()), multipliers),
         (Value::String("ts".into()), Value::F64(now_secs())),
-    ]);
-    let mut out = Vec::with_capacity(1024);
-    rmpv::encode::write_value(&mut out, &map)
-        .expect("rmpv encode never fails on well-formed Value");
-    out
+    ])
 }
 
 fn now_secs() -> f64 {
@@ -607,110 +1027,13 @@ mod tests {
     }
 
     #[test]
-    fn compose_spirit_tensor_returns_45d() {
-        let body = [0.5; 5];
-        let mind = [0.5; 15];
-        let cache = [0.5; 5];
-        let spirit = compose_spirit_tensor(&body, &mind, &cache);
-        assert_eq!(spirit.len(), 45);
-    }
-
-    #[test]
-    fn compose_spirit_clamps_to_0_1_range() {
-        // Out-of-range inputs → clamped output.
-        let body = [2.0_f32; 5]; // > 1.0
-        let mind = [-0.5_f32; 15]; // < 0.0
-        let cache = [0.0; 5];
-        let spirit = compose_spirit_tensor(&body, &mind, &cache);
-        for (i, v) in spirit.iter().enumerate() {
-            assert!(*v >= 0.0 && *v <= 1.0, "spirit[{i}]={v} out of range");
-        }
-    }
-
-    #[test]
-    fn compose_spirit_observer_slice_is_body() {
-        // SAT[0:5] = body itself (observer slice per G8)
-        let body = [0.1, 0.2, 0.3, 0.4, 0.5];
-        let mind = [0.0; 15];
-        let cache = [0.0; 5];
-        let spirit = compose_spirit_tensor(&body, &mind, &cache);
-        for i in 0..5 {
-            assert!(
-                (spirit[i] - body[i]).abs() < 1e-6,
-                "observer dim {i} should equal body[{i}]={}, got {}",
-                body[i],
-                spirit[i]
-            );
-        }
-    }
-
-    #[test]
-    fn observer_dims_never_in_filter_down_output() {
-        // G8: filter_down output's inner_spirit_content has 40D, NOT 45D.
-        // observer dims [0:5] are absent.
-        let body = [0.5; 5];
-        let mind = [0.5; 15];
-        let cache = [0.5; 5];
-        let spirit = compose_spirit_tensor(&body, &mind, &cache);
-        let mut ema_b = EmaSmoother::new(5);
-        let mut ema_m = EmaSmoother::new(15);
-        let mut ema_c = EmaSmoother::new(40);
-        let (b, m, c) = compute_local_filter_down(&spirit, &mut ema_b, &mut ema_m, &mut ema_c);
-        assert_eq!(b.len(), 5);
-        assert_eq!(m.len(), 15);
-        assert_eq!(
-            c.len(),
-            40,
-            "inner_spirit_content must be 40D (observer masked per G8)"
-        );
-    }
-
-    #[test]
-    fn local_filter_down_multipliers_within_floor_ceil() {
-        // Output multipliers must respect SPEC G7 [FLOOR=0.3, CEIL=3.0].
-        let body = [1.0; 5]; // extreme inputs
-        let mind = [1.0; 15];
-        let cache = [1.0; 5];
-        let spirit = compose_spirit_tensor(&body, &mind, &cache);
-        let mut ema_b = EmaSmoother::new(5);
-        let mut ema_m = EmaSmoother::new(15);
-        let mut ema_c = EmaSmoother::new(40);
-        let (b, m, c) = compute_local_filter_down(&spirit, &mut ema_b, &mut ema_m, &mut ema_c);
-        for v in b.iter().chain(m.iter()).chain(c.iter()) {
-            assert!(*v >= MULTIPLIER_FLOOR - 1e-6 && *v <= MULTIPLIER_CEIL + 1e-6);
-        }
-    }
-
-    #[test]
-    fn spirit_content_multipliers_pulled_toward_one() {
-        // SPIRIT_FILTER_STRENGTH_MULT=0.3 means content multipliers gently
-        // approach 1.0. With body+mind=1.0 (max), spirit_raw deviates from
-        // 0.5 by 0.5, raw mult = 1.05; after spirit_strength=0.3:
-        // (1.05-1)*0.3+1 = 1.015. EMA first-call replaces directly.
-        let body = [1.0; 5];
-        let mind = [1.0; 15];
-        let cache = [0.0; 5];
-        let spirit = compose_spirit_tensor(&body, &mind, &cache);
-        let mut ema_b = EmaSmoother::new(5);
-        let mut ema_m = EmaSmoother::new(15);
-        let mut ema_c = EmaSmoother::new(40);
-        let (_b, _m, c) = compute_local_filter_down(&spirit, &mut ema_b, &mut ema_m, &mut ema_c);
-        // All content mults should be close to 1.0 (within ~0.05)
-        for v in c.iter() {
-            assert!((v - 1.0).abs() < 0.05, "content mult {v} too far from 1.0");
-        }
-    }
-
-    #[test]
     fn local_filter_down_payload_decodes_correctly() {
-        let body = [0.5; 5];
-        let mind = [0.5; 15];
-        let cache = [0.5; 5];
-        let spirit = compose_spirit_tensor(&body, &mind, &cache);
-        let mut ema_b = EmaSmoother::new(5);
-        let mut ema_m = EmaSmoother::new(15);
-        let mut ema_c = EmaSmoother::new(40);
-        let (b, m, c) = compute_local_filter_down(&spirit, &mut ema_b, &mut ema_m, &mut ema_c);
+        // Encoder round-trip with representative per-half multipliers
+        // (body[5] + mind[15] + spirit_content[40]) as produced by
+        // SmallFilterDownEngine::compute_multipliers.
+        let b: Vec<f32> = vec![1.1, 0.9, 1.0, 1.2, 0.8];
+        let m: Vec<f32> = (0..15).map(|i| 1.0 + (i as f32 - 7.0) * 0.02).collect();
+        let c: Vec<f32> = (0..40).map(|i| 1.0 + (i as f32 - 20.0) * 0.005).collect();
         let bytes = encode_local_filter_down_payload(&b, &m, &c);
         let decoded = decode_local_filter_down_payload(&bytes).unwrap();
         for i in 0..5 {
@@ -729,7 +1052,7 @@ mod tests {
         let spirit = [0.5_f32; 45];
         let bytes = encode_spirit_state_payload(&spirit);
         use rmpv::Value;
-        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let v: Value = bytes; // §4.C-ter: encode_*_payload now returns Value directly
         let map = match v {
             Value::Map(items) => items,
             _ => panic!("not a map"),
@@ -757,7 +1080,7 @@ mod tests {
         let spirit = [0.0; 45];
         let bytes = encode_spirit_state_payload(&spirit);
         use rmpv::Value;
-        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let v: Value = bytes; // §4.C-ter: encode_*_payload now returns Value directly
         let mut found_src = false;
         let mut found_type = false;
         if let Value::Map(items) = v {
@@ -781,7 +1104,7 @@ mod tests {
         let spirit: [f32; 45] = std::array::from_fn(|i| (i as f32) * 0.02);
         let bytes = encode_spirit_state_payload(&spirit);
         use rmpv::Value;
-        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let v: Value = bytes; // §4.C-ter: encode_*_payload now returns Value directly
         if let Value::Map(items) = v {
             for (k, val) in items {
                 if let Value::String(s) = k {
@@ -813,8 +1136,9 @@ mod tests {
     fn read_spirit_cache_handles_none() {
         // Updated 2026-05-08 alongside C-S5 closure: read_spirit_cache
         // now returns `Option<[f32; 45]>` per SPEC §G1 (was `[f32; 5]`).
-        // None signals "fall back to compose_spirit_tensor MVP".
-        let r = read_spirit_cache(&None);
+        // Sprint 7: extended signature with body/mind/last_spirit for
+        // Rust-side formula compute.
+        let r = read_spirit_cache(&None, &[0.5; 5], &[0.5; 15], &[0.5; 45]);
         assert!(r.is_none());
     }
 
@@ -844,7 +1168,8 @@ mod tests {
         // Reader picks up via Slot::open (separate handle, mirrors
         // titan-inner-spirit-rs runtime path).
         let reopened = Some(Slot::open(&path).expect("reopen slot"));
-        let recovered = read_spirit_cache(&reopened).expect("Some(45D)");
+        let recovered =
+            read_spirit_cache(&reopened, &[0.5; 5], &[0.5; 15], &[0.5; 45]).expect("Some(45D)");
         for i in 0..45 {
             assert!(
                 (recovered[i] - payload[i]).abs() < 1e-6,
@@ -871,31 +1196,430 @@ mod tests {
         slot.write(&bytes).expect("write 5×f32");
 
         let reopened = Some(Slot::open(&path).expect("reopen"));
-        let recovered = read_spirit_cache(&reopened);
+        let recovered = read_spirit_cache(&reopened, &[0.5; 5], &[0.5; 15], &[0.5; 45]);
         assert!(
             recovered.is_none(),
             "short 5×f32 payload must return None (forces MVP fallback)"
         );
     }
 
+    // ── Sprint 7 §4.6 parity tests: project_inner_spirit_45d ──
+
+    fn encode_msgpack_map(pairs: Vec<(&str, rmpv::Value)>) -> Vec<u8> {
+        use rmpv::Value;
+        let items: Vec<(Value, Value)> = pairs
+            .into_iter()
+            .map(|(k, v)| (Value::String(k.into()), v))
+            .collect();
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &Value::Map(items)).unwrap();
+        out
+    }
+
+    fn f_pair(k: &str, v: f64) -> (rmpv::Value, rmpv::Value) {
+        (rmpv::Value::String(k.into()), rmpv::Value::F64(v))
+    }
+
     #[test]
-    fn ema_smoothing_steady_state_converges() {
-        let body = [0.5; 5];
-        let mind = [0.5; 15];
-        let cache = [0.5; 5];
-        let spirit = compose_spirit_tensor(&body, &mind, &cache);
-        let mut ema_b = EmaSmoother::new(5);
-        let mut ema_m = EmaSmoother::new(15);
-        let mut ema_c = EmaSmoother::new(40);
-        // First publish — EMA replaces directly.
-        let (b1, _, _) = compute_local_filter_down(&spirit, &mut ema_b, &mut ema_m, &mut ema_c);
-        // Successive publishes converge.
-        for _ in 0..50 {
-            compute_local_filter_down(&spirit, &mut ema_b, &mut ema_m, &mut ema_c);
+    fn project_inner_spirit_45d_empty_dict_returns_python_defaults() {
+        // Empty source dict: SPEC §23.6 defaults (_DEFAULT = 0.5 for
+        // most dims, with some dims producing computed defaults).
+        // Body = [0.5; 5], mind = [0.5; 15] → body_coh = mind_coh = 0.5,
+        // combined_coh = 0.5.
+        let payload = encode_msgpack_map(vec![]);
+        let body = [0.5_f32; 5];
+        let mind = [0.5_f32; 15];
+        let out = project_inner_spirit_45d(&payload, &body, &mind, &[0.5; 45]).unwrap();
+
+        // SAT[0] no birth_state → stays at default 0.5.
+        assert_eq!(out[0], 0.5);
+        // SAT[1] authenticity RE-GROUNDED (D-SPEC-101): no inner_spirit_window
+        //   → authenticity_change absent → 0.0.
+        assert_eq!(out[1], 0.0);
+        // SAT[2] sovereignty: no history → 0.5.
+        assert_eq!(out[2], 0.5);
+        // SAT[3] boundary_clarity: (0.5+0.5)/2 = 0.5.
+        assert!((out[3] - 0.5).abs() < 1e-5);
+        // SAT[4] temporal_continuity RE-GROUNDED (D-SPEC-101): 1 − self_churn;
+        //   no window → self_churn absent 0.0 → continuity 1.0 (steady self).
+        assert_eq!(out[4], 1.0);
+        // SAT[6] growth_trajectory RE-GROUNDED (D-SPEC-101): no window → 0.0.
+        assert!((out[6] - 0.0).abs() < 1e-5);
+        // SAT[7] spatial_presence RE-GROUNDED (D-SPEC-101): no window → 0.0.
+        assert!((out[7] - 0.0).abs() < 1e-5);
+        // SAT[8] personality_coherence: 0.5 * 0.5 * 2 = 0.5.
+        assert!((out[8] - 0.5).abs() < 1e-5);
+        // SAT[9] essence_purity: default density = 0.5.
+        assert!((out[9] - 0.5).abs() < 1e-5);
+        // CHIT[16] observation_clarity = combined_coh = 0.5.
+        assert!((out[16] - 0.5).abs() < 1e-5);
+        // CHIT[17] discernment_quality RE-GROUNDED: empty source → no OV
+        //   verified/rejected, sovereignty default 0.5, action_chains=0 →
+        //   0.4·0 + 0.3·0.5 + 0.3·0 = 0.15.
+        assert!(
+            (out[17] - 0.15).abs() < 1e-4,
+            "discernment empty = 0.15, got {}",
+            out[17]
+        );
+        // CHIT[19] witness_presence: 0.5*0.5*2 = 0.5.
+        assert!((out[19] - 0.5).abs() < 1e-5);
+        // ANANDA[30] purpose_alignment: 0.5*0.8 + 0.2 = 0.6.
+        assert!((out[30] - 0.6).abs() < 1e-5);
+        // ANANDA[33] harmony_seeking = 0.5.
+        assert!((out[33] - 0.5).abs() < 1e-5);
+        // ANANDA[37] growth_satisfaction RE-GROUNDED (D-SPEC-101): window.growth;
+        //   no window → 0.0.
+        assert!((out[37] - 0.0).abs() < 1e-5);
+        // CHIT[15] self_awareness_depth RE-GROUNDED (D-SPEC-101): window.
+        //   coherence_depth; no window → default 0.5.
+        assert!((out[15] - 0.5).abs() < 1e-5);
+        // ANANDA[38] expression_quality RE-GROUNDED (D-SPEC-101): expr_window
+        //   0.5·(vol+var); no window → 0.0.
+        assert!((out[38] - 0.0).abs() < 1e-5);
+        // ANANDA[40] rest_fulfillment: 1 - default fatigue 0.5 = 0.5.
+        assert!((out[40] - 0.5).abs() < 1e-5);
+        // ANANDA[42] surrender_capacity: 1 - (0.5+0.5)/2 = 0.5.
+        assert!((out[42] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn project_inner_spirit_45d_hormone_fires_no_longer_consumed() {
+        // D-SPEC-101 Phase-1 completion: hormone_fires cumulative counts are
+        // NO LONGER read — all fire dims read the windowed fire-RATES from the
+        // inner_spirit_window (EMPATHY→[36], CURIOSITY→[22]/[39], INSPIRATION→
+        // [41], INTUITION→[20]/[35], REFLECTION→[24], CREATIVITY→[32]). Feeding
+        // raw fires alone leaves them at the absent-window default 0.0.
+        let fires = rmpv::Value::Map(vec![f_pair("EMPATHY", 3.0), f_pair("CURIOSITY", 15.0)]);
+        let payload = encode_msgpack_map(vec![("hormone_fires", fires)]);
+        let out = project_inner_spirit_45d(&payload, &[0.5; 5], &[0.5; 15], &[0.5; 45]).unwrap();
+        for i in [22usize, 36, 39, 41] {
+            assert_eq!(out[i], 0.0, "dim[{i}] should ignore raw hormone_fires");
         }
-        let (b2, _, _) = compute_local_filter_down(&spirit, &mut ema_b, &mut ema_m, &mut ema_c);
-        for i in 0..5 {
-            assert!((b2[i] - b1[i]).abs() < 1e-3, "should converge");
+    }
+
+    #[test]
+    fn project_inner_spirit_45d_window_drives_regrounded_dims() {
+        // D-SPEC-101: the inner_spirit_window source dict (pre-normalized
+        // 0..1 breath signals from the sidecar dual-EMA tracker) drives the
+        // 10 re-grounded dims. Verify each reads its own key.
+        let win = rmpv::Value::Map(vec![
+            f_pair("authenticity_change", 0.42),
+            f_pair("self_churn", 0.30),
+            f_pair("growth", 0.55),
+            f_pair("topo_change", 0.18),
+            f_pair("hormone_velocity", 0.66),
+            f_pair("fire_rate_INTUITION", 0.71),
+            f_pair("fire_rate_REFLECTION", 0.24),
+            f_pair("fire_rate_CREATIVITY", 0.38),
+            // Phase-1 completion additions:
+            f_pair("fire_rate_EMPATHY", 0.12),
+            f_pair("fire_rate_CURIOSITY", 0.49),
+            f_pair("fire_rate_INSPIRATION", 0.61),
+            f_pair("coherence_depth", 0.83),
+            f_pair("clock_pulse_rate", 0.27),
+            f_pair("spirit_pair_resonance", 0.09),
+        ]);
+        let payload = encode_msgpack_map(vec![("inner_spirit_window", win)]);
+        let out = project_inner_spirit_45d(&payload, &[0.5; 5], &[0.5; 15], &[0.5; 45]).unwrap();
+        assert!((out[1] - 0.42).abs() < 1e-5, "authenticity={}", out[1]); // [1]
+        assert!(
+            (out[4] - 0.70).abs() < 1e-5,
+            "temporal_continuity={}",
+            out[4]
+        ); // 1−0.30
+        assert!((out[6] - 0.55).abs() < 1e-5); // growth_trajectory
+        assert!((out[7] - 0.18).abs() < 1e-5); // spatial_presence
+        assert!((out[11] - 0.66).abs() < 1e-5); // adaptability
+        assert!((out[20] - 0.71).abs() < 1e-5); // pattern_recognition
+        assert!((out[24] - 0.24).abs() < 1e-5); // reflective_capacity
+        assert!((out[27] - 0.18).abs() < 1e-5); // spatial_awareness (shares topo)
+        assert!((out[32] - 0.38).abs() < 1e-5); // creative_joy
+        assert!((out[35] - 0.71).abs() < 1e-5); // truth_resonance (shares INTUITION)
+                                                // Phase-1 completion re-groundings:
+        assert!((out[15] - 0.83).abs() < 1e-5); // self_awareness_depth = coherence_depth
+        assert!((out[22] - 0.49).abs() < 1e-5); // truth_seeking = CURIOSITY rate
+        assert!((out[26] - 0.27).abs() < 1e-5); // temporal_awareness = clock_pulse_rate
+        assert!((out[36] - 0.12).abs() < 1e-5); // connection_fulfillment = EMPATHY rate
+        assert!((out[37] - 0.55).abs() < 1e-5); // growth_satisfaction = growth (shares [6])
+        assert!((out[39] - 0.49).abs() < 1e-5); // exploration_joy = CURIOSITY rate
+        assert!((out[41] - 0.61).abs() < 1e-5); // creative_tension = INSPIRATION rate
+        assert!((out[44] - 0.09).abs() < 1e-5); // transcendence_glimpse = spirit_pair_resonance
+    }
+
+    #[test]
+    fn project_inner_spirit_45d_consciousness_drives_temporal_density_dims() {
+        let cons = rmpv::Value::Map(vec![
+            f_pair("epoch_id", 1500.0),
+            f_pair("density", 0.8),
+            f_pair("curvature", std::f64::consts::FRAC_PI_2),
+            f_pair("dream_quality", 0.6),
+            f_pair("fatigue", 0.2),
+            f_pair("trajectory_magnitude", 0.45),
+        ]);
+        let payload = encode_msgpack_map(vec![("consciousness", cons)]);
+        let out = project_inner_spirit_45d(&payload, &[0.5; 5], &[0.5; 15], &[0.5; 45]).unwrap();
+        // SAT[4] temporal_continuity is now window-driven (D-SPEC-101), not
+        //   epoch — verified in project_inner_spirit_45d_window_drives_regrounded.
+        // SAT[9] essence_purity = 0.8
+        assert!((out[9] - 0.8).abs() < 1e-5);
+        // SAT[10] resilience = 1 - 1.5708/π = 0.5
+        assert!((out[10] - 0.5).abs() < 1e-3, "SAT[10]={}", out[10]);
+        // CHIT[15] self_awareness_depth RE-GROUNDED (D-SPEC-101): now reads
+        //   window.coherence_depth (not epoch_count); no window → default 0.5.
+        assert!((out[15] - 0.5).abs() < 1e-5);
+        // CHIT[21] wisdom_accumulation = 0.8
+        assert!((out[21] - 0.8).abs() < 1e-5);
+        // CHIT[25] dream_awareness = 0.6*0.7 + 0.2*0.3 = 0.42 + 0.06 = 0.48
+        assert!((out[25] - 0.48).abs() < 1e-4);
+        // CHIT[29] meta_cognition = trajectory_magnitude = 0.45
+        assert!((out[29] - 0.45).abs() < 1e-5);
+        // ANANDA[31] meaning_depth = 0.8 * 0.5 * 2 = 0.8 (combined_coh = 0.5)
+        assert!((out[31] - 0.8).abs() < 1e-5);
+        // ANANDA[40] rest_fulfillment = 1 - 0.2 = 0.8
+        assert!((out[40] - 0.8).abs() < 1e-5);
+    }
+
+    #[test]
+    fn project_inner_spirit_45d_hormone_levels_drive_truth_seeking_and_more() {
+        let hlvl = rmpv::Value::Map(vec![
+            f_pair("CURIOSITY", 0.7),
+            f_pair("FOCUS", 0.4),
+            f_pair("INSPIRATION", 0.6),
+            f_pair("IMPULSE", 0.3),
+            f_pair("VIGILANCE", 0.5),
+        ]);
+        let payload = encode_msgpack_map(vec![("hormone_levels", hlvl)]);
+        let out = project_inner_spirit_45d(&payload, &[0.5; 5], &[0.5; 15], &[0.5; 45]).unwrap();
+        // CHIT[23] attention_depth = hlvl.FOCUS = 0.4 (unchanged — hormone LEVEL).
+        assert!((out[23] - 0.4).abs() < 1e-5);
+        // ANANDA[42] surrender_capacity = 1 - (0.3+0.5)/2 = 0.6 (unchanged).
+        assert!((out[42] - 0.6).abs() < 1e-5);
+        // D-SPEC-101 Phase-1 completion: [22] truth_seeking + [41] creative_tension
+        //   NO LONGER read hormone LEVELS — they read the windowed fire-RATES
+        //   (CURIOSITY/INSPIRATION). With levels-only fed, both stay at 0.0.
+        assert_eq!(out[22], 0.0);
+        assert_eq!(out[41], 0.0);
+    }
+
+    #[test]
+    fn project_inner_spirit_45d_birth_state_drives_self_recognition() {
+        // Birth = [0.7, 0.8, 0.9]; current_5d = [0.7, 0.8, 0.9, 0.5, 0.5]
+        // cosine_sim of [0.7, 0.8, 0.9] with itself = 1.0
+        let birth = rmpv::Value::Array(vec![
+            rmpv::Value::F64(0.7),
+            rmpv::Value::F64(0.8),
+            rmpv::Value::F64(0.9),
+        ]);
+        let current = rmpv::Value::Array(vec![
+            rmpv::Value::F64(0.7),
+            rmpv::Value::F64(0.8),
+            rmpv::Value::F64(0.9),
+            rmpv::Value::F64(0.5),
+            rmpv::Value::F64(0.5),
+        ]);
+        let payload = encode_msgpack_map(vec![("birth_state", birth), ("current_5d", current)]);
+        let out = project_inner_spirit_45d(&payload, &[0.5; 5], &[0.5; 15], &[0.5; 45]).unwrap();
+        // SAT[0] = cosine_sim = 1.0
+        assert!((out[0] - 1.0).abs() < 1e-5, "SAT[0]={}", out[0]);
+        // SAT[5] = 1 - l2_dist([0.7,0.8,0.9], [0.7,0.8,0.9])/3 = 1.0
+        assert!((out[5] - 1.0).abs() < 1e-5, "SAT[5]={}", out[5]);
+    }
+
+    #[test]
+    fn project_inner_spirit_45d_observer_principle_body_mind_drive_coh_dims() {
+        // body mean = (0.2+0.4+0.6+0.8+1.0)/5 = 0.6
+        // mind mean = ((0.1+0.3+0.5+0.7+0.9)*3)/15 = 0.5
+        // combined_coh = (0.6 + 0.5) / 2 = 0.55
+        let body: [f32; 5] = [0.2, 0.4, 0.6, 0.8, 1.0];
+        let mut mind = [0.0_f32; 15];
+        for i in 0..15 {
+            mind[i] = match i % 5 {
+                0 => 0.1,
+                1 => 0.3,
+                2 => 0.5,
+                3 => 0.7,
+                _ => 0.9,
+            };
         }
+        let payload = encode_msgpack_map(vec![]);
+        let out = project_inner_spirit_45d(&payload, &body, &mind, &[0.5; 45]).unwrap();
+        // SAT[3] = (0.6 + 0.5)/2 = 0.55
+        assert!((out[3] - 0.55).abs() < 1e-5);
+        // SAT[8] = 0.6 * 0.5 * 2 = 0.6
+        assert!((out[8] - 0.6).abs() < 1e-5);
+        // SAT[13] = 0.55 (same as [3])
+        assert!((out[13] - 0.55).abs() < 1e-5);
+        // SAT[14] vitality: hormone_activity=0 → 0*0.4 + 0.6*0.6 = 0.36
+        assert!((out[14] - 0.36).abs() < 1e-4);
+        // CHIT[16] observation_clarity = 0.55
+        assert!((out[16] - 0.55).abs() < 1e-5);
+        // CHIT[18] integration_level = 0.55
+        assert!((out[18] - 0.55).abs() < 1e-5);
+        // CHIT[19] witness_presence = 0.6 * 0.5 * 2 = 0.6
+        assert!((out[19] - 0.6).abs() < 1e-5);
+        // ANANDA[30] purpose_alignment = 0.55 * 0.8 + 0.2 = 0.64
+        assert!((out[30] - 0.64).abs() < 1e-5);
+        // ANANDA[33] harmony_seeking = 0.55
+        assert!((out[33] - 0.55).abs() < 1e-5);
+        // ANANDA[34] beauty_perception = 0.6 * 0.5 * 2 = 0.6
+        assert!((out[34] - 0.6).abs() < 1e-5);
+    }
+
+    #[test]
+    fn project_inner_spirit_45d_sphere_clocks_no_longer_drive_temporal_awareness() {
+        // D-SPEC-101 Phase-1 completion: [26] temporal_awareness now reads the
+        // windowed clock-pulse RATE (inner_spirit_window.clock_pulse_rate),
+        // computed by the sidecar from the CANONICAL sphere_clocks.bin layout —
+        // NOT a raw `sphere_clocks` sub-map sum in the source dict (the old
+        // reader was also mismapped). Feeding a raw sphere_clocks map no longer
+        // affects [26]; it stays at the absent-window default 0.0.
+        let clock_a = rmpv::Value::Map(vec![f_pair("pulse_count", 99.0)]);
+        let clocks = rmpv::Value::Map(vec![(rmpv::Value::String("inner_spirit".into()), clock_a)]);
+        let payload = encode_msgpack_map(vec![("sphere_clocks", clocks)]);
+        let out = project_inner_spirit_45d(&payload, &[0.5; 5], &[0.5; 15], &[0.5; 45]).unwrap();
+        assert_eq!(out[26], 0.0);
+    }
+
+    #[test]
+    fn project_inner_spirit_45d_expression_window_drives_expression_dims() {
+        // D-SPEC-101 Phase-1 completion: the rich expression rolling-window
+        // (variety + volume + windowed sovereignty) drives the expressiveness
+        // dims — [2] sovereignty, [28] causal_understanding (variety), [38]
+        // expression_quality (0.5·(volume+variety)). The old expression_intensity
+        // / history.sovereignty paths are deleted.
+        let expr_win = rmpv::Value::Map(vec![
+            f_pair("variety", 0.50),
+            f_pair("volume", 0.30),
+            f_pair("sovereignty", 0.77),
+        ]);
+        let payload = encode_msgpack_map(vec![("expression_window", expr_win)]);
+        let out = project_inner_spirit_45d(&payload, &[0.5; 5], &[0.5; 15], &[0.5; 45]).unwrap();
+        assert!((out[2] - 0.77).abs() < 1e-5, "sovereignty={}", out[2]);
+        assert!(
+            (out[28] - 0.50).abs() < 1e-5,
+            "causal_understanding={}",
+            out[28]
+        );
+        assert!(
+            (out[38] - 0.40).abs() < 1e-5,
+            "expression_quality={}",
+            out[38]
+        ); // 0.5·(0.30+0.50)
+    }
+
+    #[test]
+    fn project_inner_spirit_45d_legacy_tensor_schema_passes_through() {
+        let tensor: Vec<rmpv::Value> = (0..45).map(|i| rmpv::Value::F32(i as f32 * 0.02)).collect();
+        let payload = encode_msgpack_map(vec![("tensor", rmpv::Value::Array(tensor))]);
+        let out = project_inner_spirit_45d(&payload, &[0.5; 5], &[0.5; 15], &[0.5; 45]).unwrap();
+        for i in 0..45 {
+            assert!((out[i] - (i as f32 * 0.02)).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn project_inner_spirit_45d_malformed_envelope_returns_last_spirit() {
+        let payload = {
+            let v = rmpv::Value::Array(vec![rmpv::Value::F64(1.0)]);
+            let mut out = Vec::new();
+            rmpv::encode::write_value(&mut out, &v).unwrap();
+            out
+        };
+        let last = [0.42_f32; 45];
+        let out = project_inner_spirit_45d(&payload, &[0.5; 5], &[0.5; 15], &last).unwrap();
+        for i in 0..45 {
+            assert!((out[i] - 0.42).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn project_inner_spirit_45d_unified_spirit_stats_no_longer_consumed() {
+        // D-SPEC-101 Phase-1 completion: unified_spirit_stats is no longer read
+        // (wrong layer). [37] growth_satisfaction now reads window.growth and
+        // [44] transcendence_glimpse reads window.spirit_pair_resonance — both
+        // covered by window_drives_regrounded. Feeding unified_spirit_stats alone
+        // leaves them at the absent-window default 0.0.
+        let us = rmpv::Value::Map(vec![f_pair("velocity", 0.7), f_pair("epoch_count", 3.0)]);
+        let payload = encode_msgpack_map(vec![("unified_spirit_stats", us)]);
+        let out = project_inner_spirit_45d(&payload, &[0.5; 5], &[0.5; 15], &[0.5; 45]).unwrap();
+        assert_eq!(out[37], 0.0);
+        assert_eq!(out[44], 0.0);
+    }
+
+    #[test]
+    fn project_inner_spirit_45d_memory_action_chains_drive_discernment() {
+        // RE-GROUNDED (rFP_trinity_dim_resonance): 0.4·judgment_volume
+        //   + 0.3·sovereignty + 0.3·min(1, action_chains/20).
+        // action_chains=10 only (no OV): 0.4·0 + 0.3·0.5(default) + 0.3·0.5 = 0.30.
+        let mem = rmpv::Value::Map(vec![f_pair("action_chains", 10.0)]);
+        let payload = encode_msgpack_map(vec![("memory_stats", mem)]);
+        let out = project_inner_spirit_45d(&payload, &[0.5; 5], &[0.5; 15], &[0.5; 45]).unwrap();
+        assert!(
+            (out[17] - 0.30).abs() < 1e-4,
+            "discernment chains-only = 0.30, got {}",
+            out[17]
+        );
+
+        // OV active: verified=30, rejected=20 → vol=min(1,50/50)=1.0; sovereignty=0.8;
+        //   action_chains=0 → 0.4·1 + 0.3·0.8 + 0.3·0 = 0.64.
+        let ov = rmpv::Value::Map(vec![
+            f_pair("verified_count", 30.0),
+            f_pair("rejected_count", 20.0),
+            f_pair("sovereignty_score", 0.8),
+        ]);
+        let payload2 = encode_msgpack_map(vec![("output_verifier_stats", ov)]);
+        let out2 = project_inner_spirit_45d(&payload2, &[0.5; 5], &[0.5; 15], &[0.5; 45]).unwrap();
+        assert!(
+            (out2[17] - 0.64).abs() < 1e-4,
+            "discernment OV-active = 0.64, got {}",
+            out2[17]
+        );
+    }
+
+    // (D-SPEC-101: spatial_presence[7] + spatial_awareness[27] are now
+    //  driven by inner_spirit_window.topo_change, not the static topology
+    //  volume/curvature — covered by project_inner_spirit_45d_window_drives_regrounded.)
+
+    #[test]
+    fn project_inner_spirit_45d_history_no_longer_drives_sovereignty() {
+        // D-SPEC-101 Phase-1 completion: [2] sovereignty now reads the windowed
+        // expression_window.sovereignty (self-authored ratio), not the static
+        // history.expression.sovereignty_ratio. Feeding history alone leaves [2]
+        // at the expr_window-absent default 0.5.
+        let expr_history = rmpv::Value::Map(vec![f_pair("sovereignty_ratio", 0.85)]);
+        let history = rmpv::Value::Map(vec![(
+            rmpv::Value::String("expression".into()),
+            expr_history,
+        )]);
+        let payload = encode_msgpack_map(vec![("history", history)]);
+        let out = project_inner_spirit_45d(&payload, &[0.5; 5], &[0.5; 15], &[0.5; 45]).unwrap();
+        assert!((out[2] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn project_inner_spirit_45d_current_5d_fallback_to_last_spirit() {
+        // No current_5d in source dict → use last_spirit[..5].
+        // Birth differs from last_spirit[..5] so SAT[5] origin_connection != 1.
+        let birth = rmpv::Value::Array(vec![
+            rmpv::Value::F64(0.0),
+            rmpv::Value::F64(0.0),
+            rmpv::Value::F64(0.0),
+        ]);
+        let payload = encode_msgpack_map(vec![("birth_state", birth)]);
+        let mut last = [0.5_f32; 45];
+        last[0] = 1.0;
+        last[1] = 1.0;
+        last[2] = 1.0;
+        let out = project_inner_spirit_45d(&payload, &[0.5; 5], &[0.5; 15], &last).unwrap();
+        // SAT[5] = 1 - l2_dist([1,1,1,0.5,0.5], [0,0,0]) / 3
+        //        = 1 - sqrt(1+1+1)/3 = 1 - 1.732/3 = ~0.422
+        assert!(out[5] > 0.4 && out[5] < 0.45, "SAT[5]={}", out[5]);
+    }
+
+    #[test]
+    fn project_inner_spirit_45d_dimensionality_is_45() {
+        let payload = encode_msgpack_map(vec![]);
+        let out = project_inner_spirit_45d(&payload, &[0.5; 5], &[0.5; 15], &[0.5; 45]).unwrap();
+        assert_eq!(out.len(), 45);
     }
 }

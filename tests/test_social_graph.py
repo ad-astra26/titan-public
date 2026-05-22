@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from titan_plugin.core.social_graph import (
+from titan_hcl.core.social_graph import (
     SocialGraph,
     UserProfile,
     DONATION_TIERS,
@@ -329,7 +329,7 @@ class TestEngagement:
 # ---------------------------------------------------------------------------
 class TestWebhookExtractSolAmount:
     def test_extract_from_native_transfers(self):
-        from titan_plugin.api.webhook import _extract_sol_amount
+        from titan_hcl.api.webhook import _extract_sol_amount
 
         plugin = MagicMock()
         plugin.network.pubkey = "TitanWalletAddress123"
@@ -343,7 +343,7 @@ class TestWebhookExtractSolAmount:
         assert abs(amount - 0.05) < 0.0001
 
     def test_extract_from_account_data_fallback(self):
-        from titan_plugin.api.webhook import _extract_sol_amount
+        from titan_hcl.api.webhook import _extract_sol_amount
 
         plugin = MagicMock()
         plugin.network.pubkey = "TitanWallet456"
@@ -358,7 +358,7 @@ class TestWebhookExtractSolAmount:
         assert abs(amount - 0.1) < 0.0001
 
     def test_extract_no_wallet(self):
-        from titan_plugin.api.webhook import _extract_sol_amount
+        from titan_hcl.api.webhook import _extract_sol_amount
 
         plugin = MagicMock()
         plugin.network = None
@@ -367,7 +367,7 @@ class TestWebhookExtractSolAmount:
         assert _extract_sol_amount(tx, plugin) == 0.0
 
     def test_extract_no_matching_transfer(self):
-        from titan_plugin.api.webhook import _extract_sol_amount
+        from titan_hcl.api.webhook import _extract_sol_amount
 
         plugin = MagicMock()
         plugin.network.pubkey = "TitanWallet789"
@@ -380,7 +380,7 @@ class TestWebhookExtractSolAmount:
         assert _extract_sol_amount(tx, plugin) == 0.0
 
     def test_extract_empty_tx(self):
-        from titan_plugin.api.webhook import _extract_sol_amount
+        from titan_hcl.api.webhook import _extract_sol_amount
 
         plugin = MagicMock()
         plugin.network.pubkey = "TitanWallet"
@@ -390,7 +390,7 @@ class TestWebhookExtractSolAmount:
 
 class TestWebhookMemoExtraction:
     def test_extract_memo_from_instructions(self):
-        from titan_plugin.api.webhook import _extract_memo_data
+        from titan_hcl.api.webhook import _extract_memo_data
 
         tx = {
             "instructions": [
@@ -403,7 +403,7 @@ class TestWebhookMemoExtraction:
         assert _extract_memo_data(tx) == "I:Stay curious, Titan!"
 
     def test_extract_memo_from_inner_instructions(self):
-        from titan_plugin.api.webhook import _extract_memo_data
+        from titan_hcl.api.webhook import _extract_memo_data
 
         tx = {
             "instructions": [],
@@ -421,7 +421,7 @@ class TestWebhookMemoExtraction:
         assert _extract_memo_data(tx) == "I:Hello from inner"
 
     def test_extract_memo_empty(self):
-        from titan_plugin.api.webhook import _extract_memo_data
+        from titan_hcl.api.webhook import _extract_memo_data
 
         assert _extract_memo_data({}) == ""
 
@@ -429,7 +429,7 @@ class TestWebhookMemoExtraction:
 class TestWebhookTransactionRouting:
     @pytest.mark.asyncio
     async def test_routes_inspiration(self):
-        from titan_plugin.api.webhook import _process_transaction
+        from titan_hcl.api.webhook import _process_transaction
 
         plugin = MagicMock()
         plugin.network.pubkey = "TitanWallet"
@@ -461,7 +461,7 @@ class TestWebhookTransactionRouting:
 
     @pytest.mark.asyncio
     async def test_routes_donation(self):
-        from titan_plugin.api.webhook import _process_transaction
+        from titan_hcl.api.webhook import _process_transaction
 
         plugin = MagicMock()
         plugin.network.pubkey = "TitanWallet"
@@ -488,7 +488,7 @@ class TestWebhookTransactionRouting:
 
     @pytest.mark.asyncio
     async def test_ignores_irrelevant_tx(self):
-        from titan_plugin.api.webhook import _process_transaction
+        from titan_hcl.api.webhook import _process_transaction
 
         plugin = MagicMock()
         plugin.network.pubkey = "TitanWallet"
@@ -506,7 +506,7 @@ class TestWebhookTransactionRouting:
 
     @pytest.mark.asyncio
     async def test_routes_maker_directive(self):
-        from titan_plugin.api.webhook import _process_transaction
+        from titan_hcl.api.webhook import _process_transaction
 
         plugin = MagicMock()
         plugin.network.pubkey = "TitanWallet"
@@ -523,7 +523,7 @@ class TestWebhookTransactionRouting:
         plugin.event_bus.emit = AsyncMock()
 
         # Mock signature verification to pass
-        with patch("titan_plugin.utils.crypto.verify_maker_signature", return_value=True):
+        with patch("titan_hcl.utils.crypto.verify_maker_signature", return_value=True):
             tx = {
                 "type": "MEMO",
                 "signature": "di_sig",
@@ -566,7 +566,7 @@ class TestUserMemoryIntegration:
     @pytest.mark.asyncio
     async def test_mempool_tags_user_identity(self):
         """add_to_mempool creates an IdentityNode and tags the memory."""
-        from titan_plugin.core.memory import TieredMemoryGraph
+        from titan_hcl.core.memory import TieredMemoryGraph
 
         mem = TieredMemoryGraph.__new__(TieredMemoryGraph)
         mem._node_store = {}
@@ -594,7 +594,7 @@ class TestUserMemoryIntegration:
     @pytest.mark.asyncio
     async def test_query_user_memories_filters_by_user(self):
         """query_user_memories only returns memories from the specified user."""
-        from titan_plugin.core.memory import TieredMemoryGraph
+        from titan_hcl.core.memory import TieredMemoryGraph
 
         mem = TieredMemoryGraph.__new__(TieredMemoryGraph)
         mem._node_store = {}
@@ -621,7 +621,7 @@ class TestUserMemoryIntegration:
     @pytest.mark.asyncio
     async def test_query_user_memories_empty_for_unknown(self):
         """Returns empty list for unknown user."""
-        from titan_plugin.core.memory import TieredMemoryGraph
+        from titan_hcl.core.memory import TieredMemoryGraph
 
         mem = TieredMemoryGraph.__new__(TieredMemoryGraph)
         mem._node_store = {}
@@ -641,7 +641,7 @@ class TestAgnoHooksSocialWiring:
 
     def test_post_hook_records_interaction(self):
         """Post-hook should call social_graph.record_interaction."""
-        from titan_plugin.agno_hooks import create_post_hook
+        from titan_hcl.modules.agno_hooks import create_post_hook
 
         plugin = MagicMock()
         plugin._limbo_mode = False
@@ -663,7 +663,7 @@ class TestAgnoHooksSocialWiring:
 
     def test_pre_hook_social_context_injection(self):
         """Pre-hook factory should create a callable that handles social graph."""
-        from titan_plugin.agno_hooks import create_pre_hook
+        from titan_hcl.modules.agno_hooks import create_pre_hook
 
         plugin = MagicMock()
         plugin._limbo_mode = False

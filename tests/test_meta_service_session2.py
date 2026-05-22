@@ -16,7 +16,7 @@ import math
 
 import pytest
 
-from titan_plugin.logic.meta_consumer_contexts import (
+from titan_hcl.logic.meta_consumer_contexts import (
     build_language_meta_context_30d,
     build_knowledge_meta_context_30d,
     build_reasoning_meta_context_30d,
@@ -32,10 +32,10 @@ from titan_plugin.logic.meta_consumer_contexts import (
     compute_outcome_emotional,
     compute_outcome_dreaming,
 )
-from titan_plugin.logic.meta_recruitment import (
+from titan_hcl.logic.meta_recruitment import (
     KNOWN_RESOLVER_CATEGORIES, MetaRecruitment,
 )
-from titan_plugin.logic.meta_resolvers import (
+from titan_hcl.logic.meta_resolvers import (
     register_default_resolvers, get_supported_categories,
 )
 
@@ -65,37 +65,45 @@ def test_resolver_registration_drops_stale_to_zero():
     assert after["resolver_categories_missing"] == []
 
 
-def test_resolver_returns_shell_success_for_known_name():
-    """reasoning.DECOMPOSE resolver returns success=True + action hint."""
+def test_resolver_graceful_unavailable_when_dispatch_not_wired():
+    """Session 3 (RFP_meta-reasoning_CGN_FIX.md PART A): when
+    register_default_resolvers is called without send_queue +
+    pending_registry, resolvers register as graceful-error fallbacks
+    returning failure_mode=resolver_unavailable. Catalog stays covered."""
     mr = MetaRecruitment()
     register_default_resolvers(mr)
     resolver = mr._resolvers.get("reasoning")
     assert resolver is not None
     result = resolver("DECOMPOSE", {})
-    assert result["success"] is True
+    assert result["success"] is False
+    assert result["failure_mode"] == "resolver_unavailable"
     assert "DECOMPOSE" in result["recruiter"]
-    assert result["output"]["primitive_hint"] == "DECOMPOSE"
 
 
-def test_resolver_returns_failure_for_unknown_name():
-    """reasoning resolver with unknown op returns success=False without raising."""
+def test_resolver_graceful_unavailable_for_any_name_when_not_wired():
+    """The unwired fallback ignores name validity — any input returns
+    failure_mode=resolver_unavailable so callers can treat it uniformly."""
     mr = MetaRecruitment()
     register_default_resolvers(mr)
     resolver = mr._resolvers.get("reasoning")
     result = resolver("FROBULATE", {})
     assert result["success"] is False
-    assert "unknown" in result["reason"].lower()
+    assert result["failure_mode"] == "resolver_unavailable"
 
 
-def test_resolver_timechain_ops():
-    """timechain resolver accepts all 5 bus ops per rFP §9."""
+def test_resolver_timechain_unavailable_when_dispatch_not_wired():
+    """timechain resolver, like the other 9, reports unavailable in the
+    unwired fallback path. With send_queue + pending_registry wired
+    (production path), it dispatches TIMECHAIN_QUERY to kernel-rs and
+    awaits TIMECHAIN_QUERY_RESP via the correlation_id contract — covered
+    in tests/test_meta_service_dispatch.py."""
     mr = MetaRecruitment()
     register_default_resolvers(mr)
     resolver = mr._resolvers.get("timechain")
     for op in ("recall", "check", "compare", "aggregate", "similar"):
         r = resolver(op, {})
-        assert r["success"] is True
-        assert r["output"]["timechain_op"] == op
+        assert r["success"] is False
+        assert r["failure_mode"] == "resolver_unavailable"
 
 
 def test_resolver_idempotent_registration():
@@ -302,7 +310,7 @@ def test_all_outcome_computers_respect_signed_bounds(computer, args):
 
 def test_four_new_meta_service_endpoints_registered():
     """All 4 Session 2 endpoints registered on the dashboard router."""
-    from titan_plugin.api.dashboard import router
+    from titan_hcl.api.dashboard import router
     paths = {r.path for r in router.routes if hasattr(r, "path")}
     for p in (
         "/v4/meta-service",           # Session 1
@@ -322,10 +330,10 @@ def test_consumer_home_worker_map_covers_all_known_consumers():
     """consumer_home_worker in titan_params.toml maps every KNOWN_CONSUMER."""
     import tomllib
     from pathlib import Path
-    from titan_plugin.logic.meta_service_client import KNOWN_CONSUMERS
+    from titan_hcl.logic.meta_service_client import KNOWN_CONSUMERS
 
     cfg_path = (Path(__file__).parent.parent
-                / "titan_plugin" / "titan_params.toml")
+                / "titan_hcl" / "titan_params.toml")
     with open(cfg_path, "rb") as f:
         cfg = tomllib.load(f)
     mapping = cfg.get("meta_service_interface", {}).get(
@@ -336,7 +344,7 @@ def test_consumer_home_worker_map_covers_all_known_consumers():
 
 def test_meta_consumer_contexts_covers_all_7_session2_consumers():
     """Every Session 2 consumer has a build_*_30d helper importable."""
-    from titan_plugin.logic import meta_consumer_contexts as mcc
+    from titan_hcl.logic import meta_consumer_contexts as mcc
     for fn_name in (
         "build_language_meta_context_30d",
         "build_knowledge_meta_context_30d",
@@ -353,8 +361,8 @@ def test_end_to_end_language_request_roundtrip():
     """language consumer sends a META_REASON_REQUEST via the same client
     path social uses; request_id returned; validators accept the context."""
     from queue import Queue
-    from titan_plugin.logic.meta_service_client import send_meta_request
-    from titan_plugin.logic.meta_consumer_contexts import (
+    from titan_hcl.logic.meta_service_client import send_meta_request
+    from titan_hcl.logic.meta_consumer_contexts import (
         build_language_meta_context_30d)
     q = Queue()
     ctx = build_language_meta_context_30d(
@@ -372,6 +380,8 @@ def test_end_to_end_language_request_roundtrip():
     assert q.qsize() == 1
     msg = q.get_nowait()
     assert msg["type"] == "META_REASON_REQUEST"
-    assert msg["dst"] == "spirit"
+    # RFP_meta-reasoning_CGN_FIX.md Chunk B.7b — MetaService relocated
+    # to cognitive_worker.
+    assert msg["dst"] == "cognitive_worker"
     assert msg["payload"]["consumer_id"] == "language"
     assert len(msg["payload"]["context_vector"]) == 30

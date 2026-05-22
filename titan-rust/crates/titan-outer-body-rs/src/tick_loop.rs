@@ -1,4 +1,4 @@
-//! tick_loop — outer-body jittered ~10s tick + state machine.
+//! tick_loop — outer-body Schumann-locked tick (7.83 Hz) + state machine.
 //!
 //! Per SPEC §9.A `titan-outer-body-rs` row + §18.1 outer cadence
 //! resolution + master plan §10.6 chunk C6-3. Logic flow per tick:
@@ -35,8 +35,9 @@ use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
     apply_multipliers, compose_multipliers_default, decode_local_filter_down_payload,
-    encode_floats, read_sensor_cache, read_topology_outer_lower, ContentGate, FiringSlotWriter,
-    GroundUpEnricher, PublishThrottle, SensorCacheRead, Side, OUTER_BODY_TOPICS,
+    encode_floats, read_sensor_cache, read_topology_outer_lower, stateful_update, ContentGate,
+    FiringSlotWriter, GroundUpEnricher, Layer, PublishThrottle, RestoringCfg, SensorCacheRead,
+    Side, OUTER_BODY_TOPICS,
 };
 
 /// Boot the daemon's runtime + drive the tick loop until SIGTERM /
@@ -113,6 +114,9 @@ struct DaemonState {
     local: Option<[f32; 5]>,
     /// Most recent topology_lower from TRINITY_SUBSTRATE_TOPOLOGY_UPDATED.
     topology_signaled: bool,
+    /// Set true on each KERNEL_EPOCH_TICK; consumed by the tick loop to
+    /// recompute the ground_up held nudge once per epoch (SPEC §G5.1 / 0E).
+    epoch_pending: bool,
     /// Set true when KERNEL_SHUTDOWN_ANNOUNCE arrives.
     shutdown_requested: bool,
     /// Last successfully-computed 5D body vector — fall-back when sensor
@@ -190,19 +194,26 @@ fn handle_bus_message(msg_type: &str, raw_bytes: &[u8], state: &Arc<Mutex<Daemon
                 s.topology_signaled = true;
             }
         }
+        "KERNEL_EPOCH_TICK" => {
+            // 0E: mark an epoch boundary — tick loop recomputes the held
+            // ground_up nudge once per epoch (SPEC §G5.1).
+            if let Ok(mut s) = state.lock() {
+                s.epoch_pending = true;
+            }
+        }
         _ => {}
     }
 }
 
-/// Decode `UNIFIED_SPIRIT_FILTER_DOWN.multipliers.outer_body[5]` from the
-/// msgpack envelope. Sibling of `decode_filter_down_payload` in
+/// Decode `UNIFIED_SPIRIT_FILTER_DOWN.multipliers.outer_body[5]` from a
+/// structured payload. Sibling of `decode_filter_down_payload` in
 /// titan-trinity-daemon::subscriptions which only extracts inner fields;
-/// outer daemons need the outer slice from the same message.
-fn decode_unified_outer_body(payload: &[u8]) -> Result<[f32; 5]> {
+/// outer daemons need the outer slice from the same message. SPEC §8.2
+/// line 789 + §8.10 line 900: payload is `rmpv::Value::Map` per §8.6 schema.
+/// Closure of `rFP_worker_broadcast_topics_completion §4.C-ter` (2026-05-13).
+fn decode_unified_outer_body(payload: &rmpv::Value) -> Result<[f32; 5]> {
     use rmpv::Value;
-    let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(payload))
-        .map_err(|e| anyhow!("payload root: {e}"))?;
-    let map = match &v {
+    let map = match payload {
         Value::Map(items) => items,
         _ => return Err(anyhow!("payload not a map")),
     };
@@ -278,6 +289,9 @@ async fn run_tick_loop(
     let mut content_gate = ContentGate::new();
     let mut ground_up = GroundUpEnricher::new(Side::Body);
     let mut publish_throttle = PublishThrottle::new(OUTER_BODY_BUS_PUBLISH_INTERVAL_S);
+    // §G5.2 traveling-tensor state (x[t-1], x[t-2]); cold-start at 0.5 centre.
+    let mut prev: [f32; 5] = [0.5; 5];
+    let mut prev2: [f32; 5] = [0.5; 5];
 
     info!(
         event = "TICK_LOOP_START",
@@ -302,7 +316,7 @@ async fn run_tick_loop(
                     if let Err(e) = run_one_tick(
                         &bus, &state, &mut content_gate, &mut ground_up, &mut publish_throttle,
                         &mut outer_body_slot, &topology_slot, &sensor_cache_path,
-                        &mut firing_writer,
+                        &mut firing_writer, &mut prev, &mut prev2,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
@@ -339,6 +353,8 @@ async fn run_one_tick(
     topology_slot: &Slot,
     sensor_cache_path: &Path,
     firing_writer: &mut FiringSlotWriter,
+    prev: &mut [f32; 5],
+    prev2: &mut [f32; 5],
 ) -> Result<()> {
     // 1. Read sensor cache (msgpack source dict from Python sidecar) +
     //    project to 5D body vector. On stale or missing, use last-known.
@@ -348,10 +364,12 @@ async fn run_one_tick(
     };
     let mut body = read_outer_body_from_cache(sensor_cache_path, last_body);
 
-    // 2. Snapshot bus state.
-    let (unified_mult, local_mult, topology_fresh) = {
-        let s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
-        (s.unified, s.local, s.topology_signaled)
+    // 2. Snapshot bus state (+ consume the epoch-pending edge for 0E).
+    let (unified_mult, local_mult, topology_fresh, epoch_due) = {
+        let mut s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
+        let epoch_due = s.epoch_pending;
+        s.epoch_pending = false;
+        (s.unified, s.local, s.topology_signaled, epoch_due)
     };
 
     // 3. Compose multipliers (UNIFIED ⊗ LOCAL when both present).
@@ -365,18 +383,34 @@ async fn run_one_tick(
     // 4. Apply filter_down multipliers (G7 clamp [0.3, 3.0] enforced by lib).
     apply_multipliers(&mut body, &composed);
 
-    // 5. Apply ground_up if topology has been signaled at least once.
+    // 5. ground_up — 0E held-nudge model (SPEC §G5.1, D-SPEC-97 refinement):
+    //    RECOMPUTE the damped nudge ONCE per kernel epoch (so the 0.95 EMA
+    //    evolves at epoch cadence), then APPLY the held nudge every tick.
     //    Per G10 ground_up_body_range=0:5 — body all 5D grounded.
     if topology_fresh {
-        if let Ok(topology_lower) = read_topology_outer_lower(topology_slot) {
-            ground_up.apply_to_body(&mut body, &topology_lower, 1.0)?;
+        if epoch_due {
+            if let Ok(topology_lower) = read_topology_outer_lower(topology_slot) {
+                ground_up.compute_nudge(&topology_lower);
+            }
         }
+        ground_up.apply_held_to_body(&mut body, 1.0)?;
     }
 
     // 6. Cache fresh body for next-tick fallback.
     if let Ok(mut s) = state.lock() {
         s.last_body = body;
     }
+
+    // 6b. §G5.2 traveling-tensor update (Layer::Body). `last_body` (step 6) keeps
+    //     the producer/drive value for stale fallback; the traveling state `x` is
+    //     what is written/published.
+    let cfg = RestoringCfg::for_layer(Layer::Body);
+    let x = stateful_update(&prev[..], &prev2[..], &body[..], &cfg);
+    let mut body_state = [0.0_f32; 5];
+    body_state.copy_from_slice(&x[..5]);
+    *prev2 = *prev;
+    *prev = body_state;
+    let body = body_state;
 
     // 7. Encode + content-hash gate the slot write.
     let bytes = encode_floats::<5>(&body);
@@ -398,7 +432,7 @@ async fn run_one_tick(
     //    at full tick cadence under content-hash gating.
     if publish_throttle.should_publish() {
         let payload = encode_body_state_payload(&body);
-        bus.publish("BODY_STATE", Some("all"), Some(&payload))
+        bus.publish("BODY_STATE", Some("all"), Some(payload))
             .await
             .map_err(|e| anyhow!("publish BODY_STATE: {e}"))?;
     }
@@ -442,7 +476,7 @@ fn read_outer_body_from_cache(path: &Path, last_body: [f32; 5]) -> [f32; 5] {
 
 // ── V6 outer_body_5d full port ─────────────────────────────────────
 //
-// Byte-identical port of `titan_plugin/logic/outer_trinity.py::_collect_outer_body`
+// Byte-identical port of `titan_hcl/logic/outer_trinity.py::_collect_outer_body`
 // (lines 372–478). 5DT V6 body-felt semantics with weighted blends + clamp.
 //
 // Parity bar: |Δ| < 1e-4 (the Python output is `round(v, 4)`, so f32 cast
@@ -471,25 +505,23 @@ fn project_outer_body_5d(payload: &[u8], last_body: [f32; 5]) -> Result<[f32; 5]
     };
 
     // ── Top-level field lookups (each may be Nil/missing → None). ──
-    let agency = lookup_map(map, "agency_stats");
     let helper_statuses = lookup_map(map, "helper_statuses");
     let sys_stats = lookup_map(map, "system_sensor_stats");
     let net_stats = lookup_map(map, "network_monitor_stats");
     let tx_lat = lookup_map(map, "tx_latency_stats");
-    let blk_delta = lookup_map(map, "block_delta_stats");
-    let anchor = lookup_map(map, "anchor_state");
-    let sol_balance = lookup_field(map, "sol_balance");
+    // D-SPEC-101 Phase-2: minutes-scale rate-of-change breath for entropy[68]
+    // + thermal[69] (computed + tracked by the plugin ChangeBreathTracker).
+    let outer_body_change = lookup_map(map, "outer_body_change");
 
-    // ── [0] interoception ─────────────────────────────────────────
-    // Python lines 393-410.
-    let sol_norm: f64 = match sol_balance.and_then(value_as_f64_nonneg) {
-        Some(s) => safe_clamp(s.ln_1p() / 10.0_f64.ln_1p()),
-        None => 0.5,
-    };
-    let block_rate_norm: f64 = field_or_default(blk_delta.as_ref(), "normalized", 0.5);
-    let anchor_fresh: f64 = anchor_freshness(anchor.as_ref());
-    let interoception: f64 =
-        safe_clamp(0.4 * sol_norm + 0.3 * block_rate_norm + 0.3 * anchor_fresh);
+    // ── [0] interoception RE-GROUNDED (D-SPEC-101 Phase-2) ────────────
+    //   π-cluster heartbeat variance over a rolling 24h window (HRV-like) —
+    //   the Titan's awareness of its own fluctuating inner cadence. The plugin
+    //   EmaVarianceTracker emits the scale-free CV² of the π-heartbeat pulse
+    //   rate (`pi_heartbeat_hrv`). Was 0.4*sol_norm + 0.3*block_rate +
+    //   0.3*anchor_fresh (a chain/wallet-liveness blend — that signal lives in
+    //   the SAT origin/transactional dims; topology rate-of-change is used
+    //   elsewhere). Source: top-level pi_heartbeat_hrv. Per Maker 2026-05-21.
+    let interoception: f64 = safe_clamp(field_or_default(Some(map), "pi_heartbeat_hrv", 0.5));
 
     // ── [1] proprioception ────────────────────────────────────────
     // Python lines 412-423.
@@ -507,33 +539,28 @@ fn project_outer_body_5d(payload: &[u8], last_body: [f32; 5]) -> Result<[f32; 5]
     let tx_lat_norm: f64 = field_or_default(tx_lat.as_ref(), "normalized", 0.5);
     let current_ob2: f64 = apply_dim2_decay(last_body[2] as f64);
     let cpu_spikes: f64 = field_or_default(sys_stats.as_ref(), "cpu_spike_rate", 0.0);
-    let somatosensation: f64 =
-        safe_clamp(0.4 * tx_lat_norm + 0.3 * current_ob2 + 0.3 * cpu_spikes);
+    let somatosensation: f64 = safe_clamp(0.4 * tx_lat_norm + 0.3 * current_ob2 + 0.3 * cpu_spikes);
 
-    // ── [3] entropy ───────────────────────────────────────────────
-    // Python lines 444-458.
-    let ping_var: f64 = field_or_default(net_stats.as_ref(), "ping_variance", 0.5);
-    let bus_drop_rate: f64 = field_or_default(net_stats.as_ref(), "bus_drop_rate", 0.0);
-    let error_rate: f64 = compute_error_rate(agency.as_ref());
-    let entropy: f64 = safe_clamp(0.4 * ping_var + 0.3 * bus_drop_rate + 0.3 * error_rate);
+    // ── [3] entropy RE-GROUNDED (D-SPEC-101 Phase-2) ──────────────────
+    //   RATE OF CHANGE of the system-entropy level over a minutes-scale window
+    //   (breath), not the instantaneous value. The plugin composes the level
+    //   (ping_var/bus_drop/error_rate) + tracks |Δ|/dt via ChangeBreathTracker
+    //   (old instantaneous Rust formula deleted — no shim). Source:
+    //   outer_body_change.entropy_change. Per Maker 2026-05-21.
+    let entropy: f64 = safe_clamp(field_or_default(
+        outer_body_change.as_ref(),
+        "entropy_change",
+        0.0,
+    ));
 
-    // ── [4] thermal ───────────────────────────────────────────────
-    // SPEC §23.7 dim 4 thermal REDESIGNED 2026-05-07 (rFP §4.1 P1):
-    //   `0.35 * cpu_thermal + 0.25 * circadian + 0.40 * hormonal_heat`
-    // where `hormonal_heat = mean(IMPULSE, VIGILANCE)` from spirit_proxy
-    // hormones. Replaces pre-redesign `0.4*cpu_thermal + 0.3*circadian +
-    // 0.3*llm_latency_norm` (with llm_latency_norm always 0.5 because
-    // llm_avg_latency was never in outer_body SOURCE_KEYS — was a
-    // misconfigured stub). hormone_levels added to outer_body
-    // SOURCE_KEYS Step 3 commit ea70d3d9.
-    let cpu_thermal: f64 = field_or_default(sys_stats.as_ref(), "cpu_thermal", 0.5);
-    let circadian: f64 = field_or_default(sys_stats.as_ref(), "circadian_phase", 0.5);
-    let hormone_levels = lookup_map(map, "hormone_levels");
-    let impulse: f64 = field_or_default(hormone_levels.as_ref(), "IMPULSE", 0.5);
-    let vigilance: f64 = field_or_default(hormone_levels.as_ref(), "VIGILANCE", 0.5);
-    let hormonal_heat: f64 = (impulse + vigilance) / 2.0;
-    let thermal: f64 =
-        safe_clamp(0.35 * cpu_thermal + 0.25 * circadian + 0.40 * hormonal_heat);
+    // ── [4] thermal RE-GROUNDED (D-SPEC-101 Phase-2) ──────────────────
+    //   RATE OF CHANGE of the thermal level (cpu_thermal/circadian/hormonal_heat)
+    //   over a minutes-scale window (breath). Source: outer_body_change.thermal_change.
+    let thermal: f64 = safe_clamp(field_or_default(
+        outer_body_change.as_ref(),
+        "thermal_change",
+        0.0,
+    ));
 
     // ── Final: round to 4 decimals + cast to f32 (matches Python
     // `round(v, 4)` output then f32 slot write). ─────────────────────
@@ -570,8 +597,8 @@ fn round4_f32(v: f64) -> f32 {
 /// Look up a top-level key; if value is a map, return its entries.
 /// Missing or non-map values return None — callers treat that as
 /// "field absent → use defaults" (matches Python `sources.get("k") or {}`).
-fn lookup_map<'a>(
-    map: &'a [(rmpv::Value, rmpv::Value)],
+fn lookup_map(
+    map: &[(rmpv::Value, rmpv::Value)],
     key: &str,
 ) -> Option<Vec<(rmpv::Value, rmpv::Value)>> {
     use rmpv::Value;
@@ -588,28 +615,8 @@ fn lookup_map<'a>(
     None
 }
 
-/// Look up a top-level field as a raw rmpv::Value (no type check).
-fn lookup_field<'a>(
-    map: &'a [(rmpv::Value, rmpv::Value)],
-    key: &str,
-) -> Option<rmpv::Value> {
-    use rmpv::Value;
-    for (k, v) in map.iter() {
-        if let Value::String(s) = k {
-            if s.as_str() == Some(key) {
-                return Some(v.clone());
-            }
-        }
-    }
-    None
-}
-
 /// Look up a numeric field within a sub-map; default if missing/non-numeric.
-fn field_or_default(
-    map: Option<&Vec<(rmpv::Value, rmpv::Value)>>,
-    key: &str,
-    default: f64,
-) -> f64 {
+fn field_or_default(map: Option<&Vec<(rmpv::Value, rmpv::Value)>>, key: &str, default: f64) -> f64 {
     let map = match map {
         Some(m) => m,
         None => return default,
@@ -625,65 +632,9 @@ fn field_or_default(
     default
 }
 
-/// Convert an rmpv::Value to f64 if it's a non-negative numeric. Used
-/// for `sol_balance` per Python's `isinstance(sol_balance, (int, float))
-/// and sol_balance >= 0` guard.
-fn value_as_f64_nonneg(v: rmpv::Value) -> Option<f64> {
-    let f = v.as_f64()?;
-    if f >= 0.0 {
-        Some(f)
-    } else {
-        None
-    }
-}
-
-/// Compute anchor freshness per Python lines 402-406:
-///   anchor_fresh = 0.5
-///   if anchor.success and anchor.last_anchor_time:
-///     since = time.time() - anchor.last_anchor_time
-///     anchor_fresh = max(0.05, 1.0 / (1.0 + since / 300.0))
-fn anchor_freshness(anchor: Option<&Vec<(rmpv::Value, rmpv::Value)>>) -> f64 {
-    let anchor = match anchor {
-        Some(a) => a,
-        None => return 0.5,
-    };
-    use rmpv::Value;
-    let mut success = false;
-    let mut last_ts: Option<f64> = None;
-    for (k, v) in anchor.iter() {
-        if let Value::String(s) = k {
-            match s.as_str() {
-                Some("success") => {
-                    success = matches!(v, Value::Boolean(true));
-                }
-                Some("last_anchor_time") => {
-                    last_ts = v.as_f64();
-                }
-                _ => {}
-            }
-        }
-    }
-    if !success {
-        return 0.5;
-    }
-    let last_ts = match last_ts {
-        Some(t) if t > 0.0 => t,
-        _ => return 0.5,
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    let since = (now - last_ts).max(0.0);
-    let raw = 1.0 / (1.0 + since / 300.0);
-    raw.max(0.05)
-}
-
 /// Compute helper_health = (count "available") / total per Python lines 415-417.
 /// total_helpers = max(1, len(helper_statuses)); empty/None → 0.5 neutral.
-fn compute_helper_health(
-    helper_statuses: Option<&Vec<(rmpv::Value, rmpv::Value)>>,
-) -> f64 {
+fn compute_helper_health(helper_statuses: Option<&Vec<(rmpv::Value, rmpv::Value)>>) -> f64 {
     let helpers = match helper_statuses {
         Some(h) => h,
         None => return 0.5,
@@ -702,22 +653,6 @@ fn compute_helper_health(
         }
     }
     available as f64 / total as f64
-}
-
-/// Compute error_rate = failed_actions / total_actions per Python lines 449-454.
-/// total_actions == 0 → error_rate = 0.0 (no actions → no errors).
-fn compute_error_rate(agency: Option<&Vec<(rmpv::Value, rmpv::Value)>>) -> f64 {
-    let agency = match agency {
-        Some(a) => a,
-        None => return 0.0,
-    };
-    let total: f64 = field_or_default(Some(agency), "total_actions", 0.0);
-    let failed: f64 = field_or_default(Some(agency), "failed_actions", 0.0);
-    if total > 0.0 {
-        (failed / total).clamp(0.0, 1.0)
-    } else {
-        0.0
-    }
 }
 
 /// 9G decay-fix: dim[2] (somatosensation) reads its own previous-tick
@@ -744,10 +679,12 @@ fn open_slot(shm_dir: &Path, name: &str) -> Result<Slot> {
     Slot::open(&path).with_context(|| format!("open slot {}", path.display()))
 }
 
-fn encode_body_state_payload(body: &[f32; 5]) -> Vec<u8> {
+/// Build a SPEC §8.5 outer `BODY_STATE` payload as `rmpv::Value::Map` per
+/// SPEC §8.10 line 900 byte-identical guarantee.
+fn encode_body_state_payload(body: &[f32; 5]) -> rmpv::Value {
     use rmpv::Value;
     let values = Value::Array(body.iter().map(|f| Value::F64(*f as f64)).collect());
-    let map = Value::Map(vec![
+    Value::Map(vec![
         (Value::String("src".into()), Value::String("outer".into())),
         (
             Value::String("type".into()),
@@ -755,11 +692,7 @@ fn encode_body_state_payload(body: &[f32; 5]) -> Vec<u8> {
         ),
         (Value::String("values".into()), values),
         (Value::String("ts".into()), Value::F64(now_secs())),
-    ]);
-    let mut out = Vec::with_capacity(96);
-    rmpv::encode::write_value(&mut out, &map)
-        .expect("rmpv encode never fails on well-formed Value");
-    out
+    ])
 }
 
 fn now_secs() -> f64 {
@@ -793,8 +726,11 @@ mod tests {
             (None, None) => vec![1.0_f32; 5],
         };
         apply_multipliers(&mut body, &composed);
+        // 0E: Some(topo) models an epoch boundary — recompute the held nudge,
+        // then apply it (the per-tick application path).
         if let Some(topo) = topology_lower {
-            ground_up.apply_to_body(&mut body, &topo, 1.0).unwrap();
+            ground_up.compute_nudge(&topo);
+            ground_up.apply_held_to_body(&mut body, 1.0).unwrap();
         }
         body
     }
@@ -874,7 +810,7 @@ mod tests {
         let body = [0.1, 0.2, 0.3, 0.4, 0.5];
         let bytes = encode_body_state_payload(&body);
         use rmpv::Value;
-        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let v: Value = bytes; // §4.C-ter: encode_*_payload now returns Value directly
         let map = match v {
             Value::Map(items) => items,
             _ => panic!("not a map"),
@@ -900,7 +836,7 @@ mod tests {
         let body = [0.0; 5];
         let bytes = encode_body_state_payload(&body);
         use rmpv::Value;
-        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let v: Value = bytes; // §4.C-ter: encode_*_payload now returns Value directly
         if let Value::Map(items) = v {
             for (k, val) in items {
                 if let Value::String(s) = k {
@@ -928,13 +864,12 @@ mod tests {
 
     #[test]
     fn project_outer_body_returns_neutral_on_empty_dict() {
-        // Empty msgpack map → defaults dominate. Expected per Python:
-        // dim[0] = 0.4·0.5 + 0.3·0.5 + 0.3·0.5 = 0.5
+        // Empty msgpack map → defaults dominate. D-SPEC-101 Phase-2:
+        // dim[0] interoception = pi_heartbeat_hrv default 0.5
         // dim[1] = 0.5·0.5 + 0.3·0.5 + 0.2·0.5 = 0.5
-        // dim[2] = 0.4·0.5 + 0.3·apply_dim2_decay(0.5) + 0.3·0.0
-        //        = 0.20 + 0.3·0.5 + 0.0 = 0.35  (last_body[2]=0.5 → decayed=0.5)
-        // dim[3] = 0.4·0.5 + 0.3·0.0 + 0.3·0.0 = 0.20
-        // dim[4] = 0.4·0.5 + 0.3·0.5 + 0.3·0.5 = 0.5
+        // dim[2] = 0.4·0.5 + 0.3·apply_dim2_decay(0.5) + 0.3·0.0 = 0.35
+        // dim[3] entropy = outer_body_change.entropy_change absent → 0.0
+        // dim[4] thermal = outer_body_change.thermal_change absent → 0.0
         use rmpv::Value;
         let mut payload = Vec::new();
         rmpv::encode::write_value(&mut payload, &Value::Map(vec![])).unwrap();
@@ -943,29 +878,46 @@ mod tests {
         assert!((body[0] - 0.5).abs() < 1e-4);
         assert!((body[1] - 0.5).abs() < 1e-4);
         assert!((body[2] - 0.35).abs() < 1e-4);
-        assert!((body[3] - 0.20).abs() < 1e-4);
-        assert!((body[4] - 0.5).abs() < 1e-4);
+        assert!((body[3] - 0.0).abs() < 1e-4);
+        assert!((body[4] - 0.0).abs() < 1e-4);
     }
 
     #[test]
-    fn project_outer_body_uses_sol_balance_for_interoception() {
-        // sol_balance=0.5 only: dim[0] interoception
-        // = 0.4·sol_norm + 0.3·0.5 (block_rate default) + 0.3·0.5 (anchor default)
-        // sol_norm = log1p(0.5)/log1p(10) ≈ 0.169
-        // dim[0] = 0.4·0.169 + 0.3·0.5 + 0.3·0.5 ≈ 0.368
+    fn project_outer_body_interoception_reads_pi_heartbeat_hrv() {
+        // D-SPEC-101 Phase-2 (Maker 2026-05-21): interoception[0] = π-heartbeat
+        // 24h HRV (top-level pi_heartbeat_hrv), NOT the sol/block/anchor blend.
         use rmpv::Value;
         let mut payload = Vec::new();
-        let map = Value::Map(vec![(Value::String("sol_balance".into()), Value::F64(0.5))]);
+        let map = Value::Map(vec![(
+            Value::String("pi_heartbeat_hrv".into()),
+            Value::F64(0.62),
+        )]);
         rmpv::encode::write_value(&mut payload, &map).unwrap();
         let body = project_outer_body_5d(&payload, [0.5_f32; 5]).unwrap();
-        let sol_norm = 0.5_f64.ln_1p() / 10.0_f64.ln_1p();
-        let expected_d0 = (0.4 * sol_norm + 0.3 * 0.5 + 0.3 * 0.5) as f32;
         assert!(
-            (body[0] - expected_d0).abs() < 1e-3,
-            "interoception got {} expected {}",
-            body[0],
-            expected_d0
+            (body[0] - 0.62).abs() < 1e-3,
+            "interoception got {}",
+            body[0]
         );
+    }
+
+    #[test]
+    fn project_outer_body_entropy_thermal_read_change_breath() {
+        // D-SPEC-101 Phase-2: entropy[3] + thermal[4] read the minutes-scale
+        // rate-of-change breath (outer_body_change.{entropy,thermal}_change).
+        use rmpv::Value;
+        let map = Value::Map(vec![(
+            Value::String("outer_body_change".into()),
+            Value::Map(vec![
+                (Value::String("entropy_change".into()), Value::F64(0.44)),
+                (Value::String("thermal_change".into()), Value::F64(0.21)),
+            ]),
+        )]);
+        let mut payload = Vec::new();
+        rmpv::encode::write_value(&mut payload, &map).unwrap();
+        let body = project_outer_body_5d(&payload, [0.5_f32; 5]).unwrap();
+        assert!((body[3] - 0.44).abs() < 1e-3, "entropy got {}", body[3]);
+        assert!((body[4] - 0.21).abs() < 1e-3, "thermal got {}", body[4]);
     }
 
     #[test]
@@ -995,10 +947,7 @@ mod tests {
             (Value::String("sol_balance".into()), Value::F64(2.0)),
             (
                 Value::String("block_delta_stats".into()),
-                Value::Map(vec![(
-                    Value::String("normalized".into()),
-                    Value::F64(0.7),
-                )]),
+                Value::Map(vec![(Value::String("normalized".into()), Value::F64(0.7))]),
             ),
             (
                 Value::String("anchor_state".into()),
@@ -1031,26 +980,14 @@ mod tests {
             (
                 Value::String("helper_statuses".into()),
                 Value::Map(vec![
-                    (
-                        Value::String("a".into()),
-                        Value::String("available".into()),
-                    ),
-                    (
-                        Value::String("b".into()),
-                        Value::String("available".into()),
-                    ),
-                    (
-                        Value::String("c".into()),
-                        Value::String("offline".into()),
-                    ),
+                    (Value::String("a".into()), Value::String("available".into())),
+                    (Value::String("b".into()), Value::String("available".into())),
+                    (Value::String("c".into()), Value::String("offline".into())),
                 ]),
             ),
             (
                 Value::String("tx_latency_stats".into()),
-                Value::Map(vec![(
-                    Value::String("normalized".into()),
-                    Value::F64(0.4),
-                )]),
+                Value::Map(vec![(Value::String("normalized".into()), Value::F64(0.4))]),
             ),
             (
                 Value::String("system_sensor_stats".into()),
@@ -1063,8 +1000,24 @@ mod tests {
             (
                 Value::String("agency_stats".into()),
                 Value::Map(vec![
-                    (Value::String("total_actions".into()), Value::Integer(100.into())),
-                    (Value::String("failed_actions".into()), Value::Integer(15.into())),
+                    (
+                        Value::String("total_actions".into()),
+                        Value::Integer(100.into()),
+                    ),
+                    (
+                        Value::String("failed_actions".into()),
+                        Value::Integer(15.into()),
+                    ),
+                ]),
+            ),
+            // D-SPEC-101 Phase-2 source keys: interoception[0] = π HRV,
+            // entropy[3]/thermal[4] = minutes-scale rate-of-change breath.
+            (Value::String("pi_heartbeat_hrv".into()), Value::F64(0.55)),
+            (
+                Value::String("outer_body_change".into()),
+                Value::Map(vec![
+                    (Value::String("entropy_change".into()), Value::F64(0.33)),
+                    (Value::String("thermal_change".into()), Value::F64(0.66)),
                 ]),
             ),
         ]);
@@ -1073,17 +1026,15 @@ mod tests {
         let last_body = [0.0_f32, 0.0, 0.6, 0.0, 0.0]; // dim[2] tracks
         let body = project_outer_body_5d(&bytes, last_body).unwrap();
 
-        // Hand-computed expected (Python-faithful):
-        //   sol_norm = log1p(2.0)/log1p(10) ≈ 0.4581
-        //   d0 = 0.4·0.4581 + 0.3·0.7 + 0.3·1.0 = 0.6932
+        // Hand-computed expected (D-SPEC-101 Phase-2):
+        //   d0 interoception = pi_heartbeat_hrv = 0.55
         //   helper_health = 2/3 ≈ 0.6667
         //   d1 = 0.5·0.8 + 0.3·0.6667 + 0.2·0.6 = 0.72
         //   ob2_decayed = 0.5 + (0.6 - 0.5)*0.95 = 0.595
         //   d2 = 0.4·0.4 + 0.3·0.595 + 0.3·0.2 = 0.3985
-        //   error_rate = 15/100 = 0.15
-        //   d3 = 0.4·0.3 + 0.3·0.1 + 0.3·0.15 = 0.195
-        //   d4 = 0.4·0.6 + 0.3·0.4 + 0.3·0.5 = 0.51
-        let expected = [0.6932_f32, 0.72_f32, 0.3985_f32, 0.195_f32, 0.51_f32];
+        //   d3 entropy = outer_body_change.entropy_change = 0.33
+        //   d4 thermal = outer_body_change.thermal_change = 0.66
+        let expected = [0.55_f32, 0.72_f32, 0.3985_f32, 0.33_f32, 0.66_f32];
         for i in 0..5 {
             assert!(
                 (body[i] - expected[i]).abs() < 1e-3,
@@ -1142,9 +1093,7 @@ mod tests {
             (Value::String("epoch_id".into()), Value::Integer(42.into())),
             (Value::String("ts".into()), Value::F64(1714400000.0)),
         ]);
-        let mut bytes = Vec::new();
-        rmpv::encode::write_value(&mut bytes, &payload).unwrap();
-        let mults = decode_unified_outer_body(&bytes).unwrap();
+        let mults = decode_unified_outer_body(&payload).unwrap();
         let expected: [f32; 5] = [1.5, 0.8, 2.0, 1.0, 0.5];
         for i in 0..5 {
             assert!((mults[i] - expected[i]).abs() < 1e-6);
@@ -1159,9 +1108,7 @@ mod tests {
             Value::String("multipliers".into()),
             Value::Map(vec![]),
         )]);
-        let mut bytes = Vec::new();
-        rmpv::encode::write_value(&mut bytes, &payload).unwrap();
-        let result = decode_unified_outer_body(&bytes);
+        let result = decode_unified_outer_body(&payload);
         assert!(result.is_err(), "missing outer_body should error");
     }
 
@@ -1179,15 +1126,16 @@ mod tests {
 
     #[test]
     fn stale_threshold_is_3x_cadence() {
-        // SPEC §18.1: outer_body cadence 10s × 3 = 30s
-        assert_eq!(outer_body_stale_threshold_s(), 30.0);
+        // SPEC §18.1 + D-SPEC-100: outer_body cadence 45s × 3 = 135s
+        assert_eq!(outer_body_stale_threshold_s(), 135.0);
     }
 
     #[test]
     fn cadence_constants_match_spec() {
-        // Sensor sidecar refresh cadence (post-A.S8 D2: stale threshold source).
-        assert_eq!(OUTER_BODY_TICK_BASE_S, 10.0);
-        // Bus publish throttle (post-A.S8 D2 — Schumann body × 39 ≈ 45s).
+        // Sensor sidecar source-refresh cadence (D-SPEC-100: stale threshold source).
+        // G13 body-slowest: 45s = strict 1:3:9 (spirit 5 / mind 15 / body 45).
+        assert_eq!(OUTER_BODY_TICK_BASE_S, 45.0);
+        // Bus publish throttle (Schumann body × 39 ≈ 45s) — now mirrors TICK_BASE.
         // Body-slowest G13 invariant: 45 > 15 (mind) > 5 (spirit).
         assert_eq!(OUTER_BODY_BUS_PUBLISH_INTERVAL_S, 45.0);
     }

@@ -41,7 +41,7 @@ class TestBatchRootComputation:
 
     def test_single_hash_root(self):
         """Root of a single hash is the hash itself."""
-        from titan_plugin.utils.solana_client import compute_batch_root
+        from titan_hcl.utils.solana_client import compute_batch_root
 
         h = hashlib.sha256(b"memory_1").digest()
         root = compute_batch_root([h])
@@ -49,7 +49,7 @@ class TestBatchRootComputation:
 
     def test_deterministic(self):
         """Same hashes always produce the same root."""
-        from titan_plugin.utils.solana_client import compute_batch_root
+        from titan_hcl.utils.solana_client import compute_batch_root
 
         hashes = [hashlib.sha256(f"mem_{i}".encode()).digest() for i in range(5)]
         root1 = compute_batch_root(hashes)
@@ -58,7 +58,7 @@ class TestBatchRootComputation:
 
     def test_different_hashes_different_roots(self):
         """Different input hashes produce different roots."""
-        from titan_plugin.utils.solana_client import compute_batch_root
+        from titan_hcl.utils.solana_client import compute_batch_root
 
         hashes_a = [hashlib.sha256(b"alpha").digest()]
         hashes_b = [hashlib.sha256(b"beta").digest()]
@@ -66,7 +66,7 @@ class TestBatchRootComputation:
 
     def test_order_matters(self):
         """[A,B] produces a different root than [B,A]."""
-        from titan_plugin.utils.solana_client import compute_batch_root
+        from titan_hcl.utils.solana_client import compute_batch_root
 
         a = hashlib.sha256(b"first").digest()
         b = hashlib.sha256(b"second").digest()
@@ -74,14 +74,14 @@ class TestBatchRootComputation:
 
     def test_empty_returns_zeros(self):
         """Empty list returns 32 zero bytes."""
-        from titan_plugin.utils.solana_client import compute_batch_root
+        from titan_hcl.utils.solana_client import compute_batch_root
 
         root = compute_batch_root([])
         assert root == b"\x00" * 32
 
     def test_two_hash_root(self):
         """Two hashes produce SHA-256(left || right)."""
-        from titan_plugin.utils.solana_client import compute_batch_root
+        from titan_hcl.utils.solana_client import compute_batch_root
 
         a = hashlib.sha256(b"A").digest()
         b = hashlib.sha256(b"B").digest()
@@ -90,7 +90,7 @@ class TestBatchRootComputation:
 
     def test_three_hash_odd_promotion(self):
         """Three hashes: pair first two, promote third."""
-        from titan_plugin.utils.solana_client import compute_batch_root
+        from titan_hcl.utils.solana_client import compute_batch_root
 
         a = hashlib.sha256(b"A").digest()
         b = hashlib.sha256(b"B").digest()
@@ -111,7 +111,7 @@ class TestCompressedInstructionBuilders:
 
     def test_compress_memory_batch_data_layout(self):
         """Verify discriminator and field packing for compress_memory_batch."""
-        from titan_plugin.utils.solana_client import (
+        from titan_hcl.utils.solana_client import (
             build_compress_memory_batch_instruction,
             _VAULT_IX_COMPRESS_MEMORY_BATCH,
             is_available,
@@ -158,7 +158,7 @@ class TestCompressedInstructionBuilders:
 
     def test_append_epoch_snapshot_data_layout(self):
         """Verify discriminator and field packing for append_epoch_snapshot."""
-        from titan_plugin.utils.solana_client import (
+        from titan_hcl.utils.solana_client import (
             build_append_epoch_snapshot_instruction,
             _VAULT_IX_APPEND_EPOCH_SNAPSHOT,
             is_available,
@@ -207,7 +207,7 @@ class TestCompressedInstructionBuilders:
 
     def test_decode_compressed_memory_batch_round_trip(self):
         """Encode and decode a CompressedMemoryBatch."""
-        from titan_plugin.utils.solana_client import decode_compressed_memory_batch
+        from titan_hcl.utils.solana_client import decode_compressed_memory_batch
 
         authority = b"\x01" * 32
         batch_root = hashlib.sha256(b"memories").digest()
@@ -233,7 +233,7 @@ class TestCompressedInstructionBuilders:
 
     def test_decode_compressed_epoch_snapshot_round_trip(self):
         """Encode and decode a CompressedEpochSnapshot."""
-        from titan_plugin.utils.solana_client import decode_compressed_epoch_snapshot
+        from titan_hcl.utils.solana_client import decode_compressed_epoch_snapshot
 
         authority = b"\x02" * 32
         state_root = hashlib.sha256(b"state").digest()
@@ -259,7 +259,7 @@ class TestCompressedInstructionBuilders:
 
     def test_decode_too_short_returns_none(self):
         """Short data returns None, no crash."""
-        from titan_plugin.utils.solana_client import (
+        from titan_hcl.utils.solana_client import (
             decode_compressed_memory_batch,
             decode_compressed_epoch_snapshot,
         )
@@ -280,7 +280,7 @@ class TestDualModeFallback:
     @pytest.mark.asyncio
     async def test_queue_persistence(self, test_env):
         """ZK queue survives restart via file-backed persistence."""
-        from titan_plugin.core.memory import TieredMemoryGraph
+        from titan_hcl.core.memory import TieredMemoryGraph
 
         config = {"cognee_db_path": str(test_env / "cognee_db")}
 
@@ -301,7 +301,7 @@ class TestDualModeFallback:
     @pytest.mark.asyncio
     async def test_drain_clears_queue(self, test_env):
         """drain_zk_queue returns hashes and clears the queue."""
-        from titan_plugin.core.memory import TieredMemoryGraph
+        from titan_hcl.core.memory import TieredMemoryGraph
 
         config = {"cognee_db_path": str(test_env / "cognee_db")}
         graph = TieredMemoryGraph(config=config)
@@ -322,7 +322,7 @@ class TestDualModeFallback:
     @pytest.mark.asyncio
     async def test_migrate_queues_hash(self, test_env):
         """migrate_to_persistent queues memory hash for ZK compression."""
-        from titan_plugin.core.memory import TieredMemoryGraph
+        from titan_hcl.core.memory import TieredMemoryGraph
 
         config = {"cognee_db_path": str(test_env / "cognee_db")}
         graph = TieredMemoryGraph(config=config)
@@ -341,8 +341,8 @@ class TestDualModeFallback:
     @pytest.mark.asyncio
     async def test_tier3_offline_requeue(self, test_env):
         """When SDK unavailable, _zk_batch_compress re-queues hashes."""
-        from titan_plugin.logic.meditation import MeditationEpoch
-        from titan_plugin.core.memory import TieredMemoryGraph
+        from titan_hcl.logic.meditation import MeditationEpoch
+        from titan_hcl.core.memory import TieredMemoryGraph
 
         config = {"cognee_db_path": str(test_env / "cognee_db")}
         memory = TieredMemoryGraph(config=config)
@@ -371,7 +371,7 @@ class TestPhotonClient:
     @pytest.mark.asyncio
     async def test_health_check(self):
         """Photon responds to getIndexerHealth."""
-        from titan_plugin.utils.photon_client import PhotonClient
+        from titan_hcl.utils.photon_client import PhotonClient
 
         client = PhotonClient(HELIUS_RPC_URL)
         try:
@@ -383,7 +383,7 @@ class TestPhotonClient:
     @pytest.mark.asyncio
     async def test_fetch_nonexistent_account(self):
         """Fetching a non-existent compressed account returns None gracefully."""
-        from titan_plugin.utils.photon_client import PhotonClient
+        from titan_hcl.utils.photon_client import PhotonClient
 
         client = PhotonClient(HELIUS_RPC_URL)
         try:
@@ -401,7 +401,7 @@ class TestPhotonClient:
     @pytest.mark.asyncio
     async def test_rpc_error_handling(self):
         """Bad URL returns None, no crash."""
-        from titan_plugin.utils.photon_client import PhotonClient
+        from titan_hcl.utils.photon_client import PhotonClient
 
         client = PhotonClient("http://localhost:1/invalid")
         result = await client.health_check()
@@ -410,7 +410,7 @@ class TestPhotonClient:
     @pytest.mark.asyncio
     async def test_fetch_accounts_by_owner(self):
         """Fetch compressed accounts by owner returns list (possibly empty)."""
-        from titan_plugin.utils.photon_client import PhotonClient
+        from titan_hcl.utils.photon_client import PhotonClient
 
         client = PhotonClient(HELIUS_RPC_URL)
         try:
@@ -446,7 +446,7 @@ class TestConfigIntegration:
         config_path = os.path.join(
             os.path.dirname(__file__),
             "..",
-            "titan_plugin",
+            "titan_hcl",
             "config.toml",
         )
         with open(config_path, "rb") as f:
@@ -468,7 +468,7 @@ class TestConfigIntegration:
         config_path = os.path.join(
             os.path.dirname(__file__),
             "..",
-            "titan_plugin",
+            "titan_hcl",
             "config.toml",
         )
         with open(config_path, "rb") as f:
@@ -480,7 +480,7 @@ class TestConfigIntegration:
 
     def test_light_protocol_constants(self):
         """Light Protocol program IDs are defined."""
-        from titan_plugin.utils.solana_client import (
+        from titan_hcl.utils.solana_client import (
             LIGHT_SYSTEM_PROGRAM_ID,
             LIGHT_REGISTRY_PROGRAM_ID,
             LIGHT_COMPRESSION_PROGRAM_ID,
@@ -492,7 +492,7 @@ class TestConfigIntegration:
 
     def test_new_discriminators_defined(self):
         """New instruction discriminators match IDL output."""
-        from titan_plugin.utils.solana_client import (
+        from titan_hcl.utils.solana_client import (
             _VAULT_IX_COMPRESS_MEMORY_BATCH,
             _VAULT_IX_APPEND_EPOCH_SNAPSHOT,
         )

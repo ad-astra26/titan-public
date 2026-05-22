@@ -1,6 +1,6 @@
 //! Cross-language parity test — load `tests/parity/vectors.json::ground_up_nudge`
 //! from repo root and verify titan-trinity-rs::ground_up produces byte-identical
-//! output to Python `titan_plugin/logic/ground_up.py:51-101` per Preamble G5.
+//! output to Python `titan_hcl/logic/ground_up.py:51-101` per Preamble G5.
 //!
 //! Per SPEC §11.6 + PLAN_microkernel_phase_c_s3_substrate.md §14. Same JSON
 //! file is loaded by pytest tests in `tests/test_phase_c_constants_in_sync.py`

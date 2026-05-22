@@ -1,6 +1,6 @@
 //! filter_down — V5 TrinityValueNet + TransitionBuffer + FilterDownV5Engine.
 //!
-//! Full Rust port of `titan_plugin/logic/filter_down.py:89-842` per SPEC
+//! Full Rust port of `titan_hcl/logic/filter_down.py:89-842` per SPEC
 //! §10.F G6+G7+G8+G9 (V5 sole live FILTER_DOWN engine since 2026-04-25).
 //!
 //! Chunk decomposition:
@@ -37,430 +37,19 @@
 use std::path::{Path, PathBuf};
 
 use rand::Rng;
-use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
-use tracing::{info, warn};
+use tracing::warn;
 
-use titan_core::constants::{
-    FILTER_DOWN_HIDDEN_1, FILTER_DOWN_HIDDEN_2, FILTER_DOWN_INPUT_DIM, FILTER_DOWN_OUTPUT_DIM,
-};
+use titan_core::constants::{FILTER_DOWN_INPUT_DIM, FILTER_DOWN_OUTPUT_DIM};
+use titan_core::transition_buffer::TransitionBuffer;
+use titan_core::trinity_value_net::{FilterDownError, TrinityValueNet};
 
 /// Network input dim = 162 (130D Trinity + 30D topology + 2D journey).
+/// This is the const-generic `N` for the unified engine's `TrinityValueNet<INPUT_DIM>`.
 pub const INPUT_DIM: usize = FILTER_DOWN_INPUT_DIM as usize;
-/// Hidden layer 1 width = 128.
-pub const HIDDEN_1: usize = FILTER_DOWN_HIDDEN_1 as usize;
-/// Hidden layer 2 width = 64.
-pub const HIDDEN_2: usize = FILTER_DOWN_HIDDEN_2 as usize;
 /// Multiplier output dim = 120 (5+15+40+5+15+40 — observer 10 dims masked
 /// per SPEC §10.F G8); referenced by C4-3c `compute_multipliers`.
 pub const OUTPUT_DIM: usize = FILTER_DOWN_OUTPUT_DIM as usize;
-/// Schema version for `data/filter_down_v5_weights.json` per SPEC §11.H.4.
-pub const FILTER_DOWN_WEIGHTS_SCHEMA_VERSION: u32 = 1;
-
-/// Errors during persistence + restore.
-#[derive(Debug, Error)]
-pub enum FilterDownError {
-    /// `data/filter_down_v5_weights.json` write failed.
-    #[error("filter_down weights write failed: {0}")]
-    Write(#[from] titan_core::atomic_write::AtomicWriteError),
-    /// JSON encode/decode failed.
-    #[error("filter_down weights json: {0}")]
-    Json(#[from] serde_json::Error),
-    /// io error reading state file.
-    #[error("filter_down weights io: {0}")]
-    Io(#[from] std::io::Error),
-    /// Loaded weights have wrong shape — refuse-load (V3-legacy 15D vs
-    /// V5 162D, etc.). SPEC §11.H.4 boot integrity check.
-    #[error(
-        "filter_down weights shape mismatch: layer={layer} expected={expected} actual={actual}"
-    )]
-    ShapeMismatch {
-        /// Which layer (`w1` / `b1` / etc.).
-        layer: &'static str,
-        /// Expected element count.
-        expected: usize,
-        /// Actual element count from JSON.
-        actual: usize,
-    },
-}
-
-/// Persistent weights schema for `data/filter_down_v5_weights.json`.
-/// Format mirrors Python `TrinityValueNet.save` (nested-list matrices
-/// from `numpy.tolist()`) so cross-language round-trip is byte-equal.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrinityValueNetWeights {
-    /// Schema version for boot integrity check.
-    pub schema_version: u32,
-    /// Layer 1 weights — nested list `[INPUT_DIM][HIDDEN_1]`.
-    pub w1: Vec<Vec<f64>>,
-    /// Layer 1 bias — `[HIDDEN_1]`.
-    pub b1: Vec<f64>,
-    /// Layer 2 weights — nested list `[HIDDEN_1][HIDDEN_2]`.
-    pub w2: Vec<Vec<f64>>,
-    /// Layer 2 bias — `[HIDDEN_2]`.
-    pub b2: Vec<f64>,
-    /// Layer 3 weights — nested list `[HIDDEN_2][1]`.
-    pub w3: Vec<Vec<f64>>,
-    /// Layer 3 bias — `[1]`.
-    pub b3: Vec<f64>,
-}
-
-/// Tiny feedforward value network: 162→128→64→1 ReLU MLP.
-///
-/// Predicts expected future middle-path-loss from current TITAN_SELF
-/// (162D) state. Pure Rust — no PyTorch / autograd / ndarray dependency.
-/// Weight matrices stored row-major as flat `Vec<f64>` for cache friendliness.
-#[derive(Debug, Clone)]
-pub struct TrinityValueNet {
-    /// Layer 1 weights (162×128 = 20736 elements, row-major: `w1[in*HIDDEN_1 + h1]`).
-    pub w1: Vec<f64>,
-    /// Layer 1 biases (128).
-    pub b1: Vec<f64>,
-    /// Layer 2 weights (128×64 = 8192 elements, row-major: `w2[h1*HIDDEN_2 + h2]`).
-    pub w2: Vec<f64>,
-    /// Layer 2 biases (64).
-    pub b2: Vec<f64>,
-    /// Layer 3 weights (64×1 = 64 elements; really a column vector).
-    pub w3: Vec<f64>,
-    /// Layer 3 bias (1 element).
-    pub b3: Vec<f64>,
-}
-
-impl TrinityValueNet {
-    /// Construct with He-init weights using the provided RNG. He-init is
-    /// `w_ij ~ N(0, sqrt(2/fan_in))` (Python `randn() * sqrt(2/in_dim)`),
-    /// not strictly Xavier-Glorot, but the variable name "Xavier" in
-    /// Python matches the math here — both terms appear interchangeably
-    /// in the original codebase. Faithfully ported.
-    pub fn new<R: Rng + ?Sized>(rng: &mut R) -> Self {
-        let std1 = (2.0 / INPUT_DIM as f64).sqrt();
-        let std2 = (2.0 / HIDDEN_1 as f64).sqrt();
-        let std3 = (2.0 / HIDDEN_2 as f64).sqrt();
-        let dist1 = Normal::new(0.0, std1).expect("std1 > 0");
-        let dist2 = Normal::new(0.0, std2).expect("std2 > 0");
-        let dist3 = Normal::new(0.0, std3).expect("std3 > 0");
-
-        let mut w1 = vec![0.0_f64; INPUT_DIM * HIDDEN_1];
-        for v in w1.iter_mut() {
-            *v = dist1.sample(rng);
-        }
-        let mut w2 = vec![0.0_f64; HIDDEN_1 * HIDDEN_2];
-        for v in w2.iter_mut() {
-            *v = dist2.sample(rng);
-        }
-        let mut w3 = vec![0.0_f64; HIDDEN_2];
-        for v in w3.iter_mut() {
-            *v = dist3.sample(rng);
-        }
-
-        Self {
-            w1,
-            b1: vec![0.0_f64; HIDDEN_1],
-            w2,
-            b2: vec![0.0_f64; HIDDEN_2],
-            w3,
-            b3: vec![0.0_f64; 1],
-        }
-    }
-
-    /// Construct with all-zero weights (test path — for deterministic-output
-    /// scenarios + as `Default`-style fallback when loading fails AND the
-    /// caller doesn't want random init).
-    pub fn zeros() -> Self {
-        Self {
-            w1: vec![0.0_f64; INPUT_DIM * HIDDEN_1],
-            b1: vec![0.0_f64; HIDDEN_1],
-            w2: vec![0.0_f64; HIDDEN_1 * HIDDEN_2],
-            b2: vec![0.0_f64; HIDDEN_2],
-            w3: vec![0.0_f64; HIDDEN_2],
-            b3: vec![0.0_f64; 1],
-        }
-    }
-
-    /// Forward pass. `state` is 162D TITAN_SELF. Returns scalar V(s).
-    pub fn forward(&self, state: &[f64; INPUT_DIM]) -> f64 {
-        let z1 = self.layer1_z(state);
-        let a1 = relu_inplace(z1);
-        let z2 = self.layer2_z(&a1);
-        let a2 = relu_inplace(z2);
-        self.layer3_z(&a2)
-    }
-
-    /// Forward pass for a batch. Equivalent to looping `forward` over
-    /// `states` rows.
-    pub fn forward_batch(&self, states: &[[f64; INPUT_DIM]]) -> Vec<f64> {
-        states.iter().map(|s| self.forward(s)).collect()
-    }
-
-    /// Compute ∂V/∂state via manual backprop through ReLU layers.
-    /// Returns 162-D attention vector (per Python:131-156).
-    ///
-    /// Used by [`crate::filter_down`] (C4-3c) to derive per-dim multipliers
-    /// downstream (clamped + observer-masked + spirit-weakened).
-    pub fn gradient_wrt_input(&self, state: &[f64; INPUT_DIM]) -> [f64; INPUT_DIM] {
-        // Forward (capture pre-activation z1, z2)
-        let z1 = self.layer1_z(state);
-        let a1 = relu_inplace(z1.clone());
-        let z2 = self.layer2_z(&a1);
-
-        // dL/dz3 = 1.0 (scalar output, identity gradient up the chain)
-        // da2[h2] = sum_o(dz3[o] * w3[h2*1 + o]) = w3[h2] (since dz3 is scalar 1.0)
-        let mut da2 = vec![0.0_f64; HIDDEN_2];
-        for (h2, slot) in da2.iter_mut().enumerate() {
-            *slot = self.w3[h2];
-        }
-
-        // dz2 = da2 * relu_grad(z2)
-        let mut dz2 = vec![0.0_f64; HIDDEN_2];
-        for (slot, (&zv, &dv)) in dz2.iter_mut().zip(z2.iter().zip(da2.iter())) {
-            *slot = if zv > 0.0 { dv } else { 0.0 };
-        }
-
-        // da1[h1] = sum_h2(dz2[h2] * w2[h1*HIDDEN_2 + h2])
-        let mut da1 = vec![0.0_f64; HIDDEN_1];
-        for (h1, slot) in da1.iter_mut().enumerate() {
-            let row_off = h1 * HIDDEN_2;
-            let mut sum = 0.0;
-            for (h2, &d) in dz2.iter().enumerate() {
-                sum += d * self.w2[row_off + h2];
-            }
-            *slot = sum;
-        }
-
-        // dz1 = da1 * relu_grad(z1)
-        let mut dz1 = vec![0.0_f64; HIDDEN_1];
-        for (slot, (&zv, &dv)) in dz1.iter_mut().zip(z1.iter().zip(da1.iter())) {
-            *slot = if zv > 0.0 { dv } else { 0.0 };
-        }
-
-        // ds[i] = sum_h1(dz1[h1] * w1[i*HIDDEN_1 + h1])
-        let mut ds = [0.0_f64; INPUT_DIM];
-        for (i, slot) in ds.iter_mut().enumerate() {
-            let row = &self.w1[i * HIDDEN_1..(i + 1) * HIDDEN_1];
-            let mut sum = 0.0;
-            for (&d, &w) in dz1.iter().zip(row.iter()) {
-                sum += d * w;
-            }
-            *slot = sum;
-        }
-        ds
-    }
-
-    /// Layer 1 pre-activation: `z1[h1] = sum_i(state[i] * w1[i*HIDDEN_1 + h1]) + b1[h1]`.
-    fn layer1_z(&self, state: &[f64; INPUT_DIM]) -> Vec<f64> {
-        let mut z1 = self.b1.clone();
-        for (i, &s) in state.iter().enumerate() {
-            let row = &self.w1[i * HIDDEN_1..(i + 1) * HIDDEN_1];
-            for (slot, &w) in z1.iter_mut().zip(row.iter()) {
-                *slot += s * w;
-            }
-        }
-        z1
-    }
-
-    /// Layer 2 pre-activation.
-    fn layer2_z(&self, a1: &[f64]) -> Vec<f64> {
-        let mut z2 = self.b2.clone();
-        for (h1, &a) in a1.iter().enumerate() {
-            let row = &self.w2[h1 * HIDDEN_2..(h1 + 1) * HIDDEN_2];
-            for (slot, &w) in z2.iter_mut().zip(row.iter()) {
-                *slot += a * w;
-            }
-        }
-        z2
-    }
-
-    /// Layer 3: scalar output.
-    fn layer3_z(&self, a2: &[f64]) -> f64 {
-        let mut z3 = self.b3[0];
-        for (h2, &a) in a2.iter().enumerate() {
-            z3 += a * self.w3[h2];
-        }
-        z3
-    }
-
-    /// Convert weights to nested-list schema (Python-compatible).
-    pub fn to_weights(&self) -> TrinityValueNetWeights {
-        TrinityValueNetWeights {
-            schema_version: FILTER_DOWN_WEIGHTS_SCHEMA_VERSION,
-            w1: matrix_to_nested(&self.w1, INPUT_DIM, HIDDEN_1),
-            b1: self.b1.clone(),
-            w2: matrix_to_nested(&self.w2, HIDDEN_1, HIDDEN_2),
-            b2: self.b2.clone(),
-            w3: matrix_to_nested(&self.w3, HIDDEN_2, 1),
-            b3: self.b3.clone(),
-        }
-    }
-
-    /// Apply weights from nested-list schema. Validates dims; refuses on
-    /// mismatch (legacy V3 15-dim) per SPEC §11.H.4.
-    pub fn apply_weights(&mut self, w: &TrinityValueNetWeights) -> Result<(), FilterDownError> {
-        check_matrix_shape(&w.w1, INPUT_DIM, HIDDEN_1, "w1")?;
-        check_vec_shape(&w.b1, HIDDEN_1, "b1")?;
-        check_matrix_shape(&w.w2, HIDDEN_1, HIDDEN_2, "w2")?;
-        check_vec_shape(&w.b2, HIDDEN_2, "b2")?;
-        check_matrix_shape(&w.w3, HIDDEN_2, 1, "w3")?;
-        check_vec_shape(&w.b3, 1, "b3")?;
-
-        self.w1 = nested_to_matrix(&w.w1);
-        self.b1 = w.b1.clone();
-        self.w2 = nested_to_matrix(&w.w2);
-        self.b2 = w.b2.clone();
-        self.w3 = nested_to_matrix(&w.w3);
-        self.b3 = w.b3.clone();
-        Ok(())
-    }
-
-    /// Save weights to JSON via `titan-core::atomic_write` + 2-backup
-    /// retention per SPEC §11.H.1 critical-data row.
-    pub fn save(&self, path: &Path) -> Result<(), FilterDownError> {
-        let w = self.to_weights();
-        let bytes = serde_json::to_vec_pretty(&w)?;
-        titan_core::atomic_write::atomic_write(
-            path,
-            &bytes,
-            titan_core::constants::DATA_BACKUP_RETENTION_GENERATIONS as usize,
-        )?;
-        Ok(())
-    }
-
-    /// Load weights from JSON, falling back to `.bak` then `.bak.prev`
-    /// per SPEC §11.H.4. Returns `Ok(false)` when no file found (caller
-    /// keeps fresh-init weights). Returns `Err` on shape mismatch /
-    /// corruption — caller decides halt vs proceed-with-fresh.
-    pub fn load(&mut self, path: &Path) -> Result<bool, FilterDownError> {
-        let candidates = [
-            path.to_path_buf(),
-            path.with_extension("json.bak"),
-            path.with_extension("json.bak.prev"),
-        ];
-
-        let mut last_err: Option<FilterDownError> = None;
-        let mut found_any = false;
-        for candidate in &candidates {
-            if !candidate.exists() {
-                continue;
-            }
-            found_any = true;
-            match std::fs::read(candidate) {
-                Ok(bytes) => match serde_json::from_slice::<TrinityValueNetWeights>(&bytes) {
-                    Ok(w) => {
-                        if w.schema_version != FILTER_DOWN_WEIGHTS_SCHEMA_VERSION {
-                            warn!(
-                                event = "FILTER_DOWN_SCHEMA_MISMATCH",
-                                loaded = w.schema_version,
-                                expected = FILTER_DOWN_WEIGHTS_SCHEMA_VERSION,
-                                ?candidate,
-                                "schema mismatch; trying next backup"
-                            );
-                            continue;
-                        }
-                        self.apply_weights(&w)?;
-                        info!(event = "FILTER_DOWN_LOADED", ?candidate, "weights loaded");
-                        return Ok(true);
-                    }
-                    Err(e) => {
-                        warn!(
-                            event = "FILTER_DOWN_DECODE_FAIL",
-                            ?candidate,
-                            err = ?e,
-                            "decode failed; trying next backup"
-                        );
-                        last_err = Some(e.into());
-                    }
-                },
-                Err(e) => {
-                    warn!(
-                        event = "FILTER_DOWN_IO_FAIL",
-                        ?candidate,
-                        err = ?e,
-                        "io failed; trying next backup"
-                    );
-                    last_err = Some(e.into());
-                }
-            }
-        }
-
-        if !found_any {
-            return Ok(false); // No file → fresh start.
-        }
-        Err(last_err.unwrap_or(FilterDownError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "all backups failed",
-        ))))
-    }
-}
-
-/// Convenience: per-instance default (Xavier-init via OS RNG).
-impl Default for TrinityValueNet {
-    fn default() -> Self {
-        Self::new(&mut rand::thread_rng())
-    }
-}
-
-/// ReLU activation in place: `z[i] = max(0, z[i])`.
-fn relu_inplace(mut z: Vec<f64>) -> Vec<f64> {
-    for v in z.iter_mut() {
-        if *v < 0.0 {
-            *v = 0.0;
-        }
-    }
-    z
-}
-
-fn matrix_to_nested(flat: &[f64], rows: usize, cols: usize) -> Vec<Vec<f64>> {
-    debug_assert_eq!(flat.len(), rows * cols);
-    let mut out = Vec::with_capacity(rows);
-    for r in 0..rows {
-        out.push(flat[r * cols..(r + 1) * cols].to_vec());
-    }
-    out
-}
-
-fn nested_to_matrix(nested: &[Vec<f64>]) -> Vec<f64> {
-    let mut out = Vec::with_capacity(nested.len() * nested.first().map(|r| r.len()).unwrap_or(0));
-    for row in nested {
-        out.extend_from_slice(row);
-    }
-    out
-}
-
-fn check_matrix_shape(
-    nested: &[Vec<f64>],
-    rows: usize,
-    cols: usize,
-    layer: &'static str,
-) -> Result<(), FilterDownError> {
-    if nested.len() != rows {
-        return Err(FilterDownError::ShapeMismatch {
-            layer,
-            expected: rows,
-            actual: nested.len(),
-        });
-    }
-    for row in nested {
-        if row.len() != cols {
-            return Err(FilterDownError::ShapeMismatch {
-                layer,
-                expected: cols,
-                actual: row.len(),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn check_vec_shape(v: &[f64], n: usize, layer: &'static str) -> Result<(), FilterDownError> {
-    if v.len() != n {
-        return Err(FilterDownError::ShapeMismatch {
-            layer,
-            expected: n,
-            actual: v.len(),
-        });
-    }
-    Ok(())
-}
 
 /// Default path under `data_dir` for V5 weights (matches Python
 /// `filter_down.py:559`).
@@ -471,342 +60,6 @@ pub fn default_weights_path(data_dir: &Path) -> PathBuf {
 /// Default path under `data_dir` for V5 transition buffer.
 pub fn default_buffer_path(data_dir: &Path) -> PathBuf {
     data_dir.join("filter_down_v5_buffer.json")
-}
-
-// ── TD(0) Training (C4-3b) ────────────────────────────────────────────
-
-impl TrinityValueNet {
-    /// One TD(0) batch update. Returns mean MSE loss BEFORE the gradient
-    /// descent step (matches Python semantics: loss is computed pre-update).
-    ///
-    /// Per `filter_down.py:156-222` (manual numpy backprop):
-    /// - TD target: `target_i = reward_i + γ × V(next_state_i)` (target net = self).
-    /// - Loss: `MSE(V(state_i), target_i) = mean((value_i - target_i)²)`.
-    /// - Backprop derivative `dL/dvalue = 2 × (value - target) / N`.
-    /// - Layer-3 gradients: `dw3 = a2.T @ dz3`, `db3 = sum(dz3, axis=0)`.
-    /// - Layer-2 gradients: `dz2 = (dz3 @ w3.T) * relu_grad(z2)`, etc.
-    /// - Layer-1 gradients: `dz1 = (dz2 @ w2.T) * relu_grad(z1)`, etc.
-    /// - Update: `param -= lr × grad`.
-    ///
-    /// Constraint: caller must pass equal-length `states`, `rewards`,
-    /// `next_states`. Empty batch is a no-op (returns 0.0 loss).
-    pub fn train_step(
-        &mut self,
-        states: &[[f64; INPUT_DIM]],
-        rewards: &[f64],
-        next_states: &[[f64; INPUT_DIM]],
-        lr: f64,
-        gamma: f64,
-    ) -> f64 {
-        debug_assert_eq!(states.len(), rewards.len());
-        debug_assert_eq!(states.len(), next_states.len());
-        let n = states.len();
-        if n == 0 {
-            return 0.0;
-        }
-        let n_f = n as f64;
-
-        // ── Forward pass for current states (capture intermediates) ──
-        let mut z1_batch = vec![vec![0.0_f64; HIDDEN_1]; n];
-        let mut a1_batch = vec![vec![0.0_f64; HIDDEN_1]; n];
-        let mut z2_batch = vec![vec![0.0_f64; HIDDEN_2]; n];
-        let mut a2_batch = vec![vec![0.0_f64; HIDDEN_2]; n];
-        let mut values = vec![0.0_f64; n];
-        for i in 0..n {
-            z1_batch[i] = self.layer1_z(&states[i]);
-            a1_batch[i] = relu_inplace(z1_batch[i].clone());
-            z2_batch[i] = self.layer2_z(&a1_batch[i]);
-            a2_batch[i] = relu_inplace(z2_batch[i].clone());
-            values[i] = self.layer3_z(&a2_batch[i]);
-        }
-
-        // ── Forward pass for next states (target net = self) ──
-        let mut next_values = vec![0.0_f64; n];
-        for i in 0..n {
-            let z1n = self.layer1_z(&next_states[i]);
-            let a1n = relu_inplace(z1n);
-            let z2n = self.layer2_z(&a1n);
-            let a2n = relu_inplace(z2n);
-            next_values[i] = self.layer3_z(&a2n);
-        }
-
-        // ── TD targets + loss ──
-        let mut targets = vec![0.0_f64; n];
-        let mut errors = vec![0.0_f64; n];
-        let mut sum_sq = 0.0_f64;
-        for i in 0..n {
-            targets[i] = rewards[i] + gamma * next_values[i];
-            errors[i] = values[i] - targets[i];
-            sum_sq += errors[i] * errors[i];
-        }
-        let loss = sum_sq / n_f;
-
-        // ── Backprop dL/dvalue = 2 * errors / N ──
-        let mut dv = vec![0.0_f64; n];
-        for i in 0..n {
-            dv[i] = 2.0 * errors[i] / n_f;
-        }
-
-        // dz3[i] = dv[i] (since output is z3 directly, no activation)
-        // dw3 = a2.T @ dz3 (HIDDEN_2,) — sum over batch
-        // db3 = sum(dz3, axis=0)
-        let mut dw3 = vec![0.0_f64; HIDDEN_2];
-        let mut db3 = 0.0_f64;
-        for i in 0..n {
-            let dz3_i = dv[i];
-            for (slot, &a) in dw3.iter_mut().zip(a2_batch[i].iter()) {
-                *slot += a * dz3_i;
-            }
-            db3 += dz3_i;
-        }
-
-        // ── Layer 2 gradients ──
-        // da2[i] = dz3[i] * w3 (HIDDEN_2,) per-sample
-        // dz2[i] = da2[i] * relu_grad(z2[i])
-        // dw2 = a1.T @ dz2 (HIDDEN_1, HIDDEN_2) — sum over batch
-        // db2 = sum(dz2, axis=0)
-        let mut dw2 = vec![0.0_f64; HIDDEN_1 * HIDDEN_2];
-        let mut db2 = vec![0.0_f64; HIDDEN_2];
-        let mut dz2_batch = vec![vec![0.0_f64; HIDDEN_2]; n];
-        for i in 0..n {
-            let dz3_i = dv[i];
-            for h2 in 0..HIDDEN_2 {
-                let da2_i = dz3_i * self.w3[h2];
-                let g = if z2_batch[i][h2] > 0.0 { da2_i } else { 0.0 };
-                dz2_batch[i][h2] = g;
-                db2[h2] += g;
-            }
-            for (h1, &a) in a1_batch[i].iter().enumerate() {
-                let row_off = h1 * HIDDEN_2;
-                for (h2, &dz) in dz2_batch[i].iter().enumerate() {
-                    dw2[row_off + h2] += a * dz;
-                }
-            }
-        }
-
-        // ── Layer 1 gradients ──
-        // da1[i] = dz2[i] @ w2.T (HIDDEN_1,) per-sample
-        // dz1[i] = da1[i] * relu_grad(z1[i])
-        // dw1 = states.T @ dz1 (INPUT_DIM, HIDDEN_1) — sum over batch
-        // db1 = sum(dz1, axis=0)
-        let mut dw1 = vec![0.0_f64; INPUT_DIM * HIDDEN_1];
-        let mut db1 = vec![0.0_f64; HIDDEN_1];
-        for i in 0..n {
-            let mut da1 = vec![0.0_f64; HIDDEN_1];
-            for (h1, slot) in da1.iter_mut().enumerate() {
-                let row_off = h1 * HIDDEN_2;
-                let mut sum = 0.0;
-                for (h2, &dz) in dz2_batch[i].iter().enumerate() {
-                    sum += dz * self.w2[row_off + h2];
-                }
-                *slot = sum;
-            }
-            let mut dz1 = vec![0.0_f64; HIDDEN_1];
-            for (h1, slot) in dz1.iter_mut().enumerate() {
-                *slot = if z1_batch[i][h1] > 0.0 { da1[h1] } else { 0.0 };
-                db1[h1] += *slot;
-            }
-            for (k, &s) in states[i].iter().enumerate() {
-                let row_off = k * HIDDEN_1;
-                for (h1, &dz) in dz1.iter().enumerate() {
-                    dw1[row_off + h1] += s * dz;
-                }
-            }
-        }
-
-        // ── Gradient descent: param -= lr × grad ──
-        for (w, dw) in self.w3.iter_mut().zip(dw3.iter()) {
-            *w -= lr * dw;
-        }
-        self.b3[0] -= lr * db3;
-        for (w, dw) in self.w2.iter_mut().zip(dw2.iter()) {
-            *w -= lr * dw;
-        }
-        for (b, db) in self.b2.iter_mut().zip(db2.iter()) {
-            *b -= lr * db;
-        }
-        for (w, dw) in self.w1.iter_mut().zip(dw1.iter()) {
-            *w -= lr * dw;
-        }
-        for (b, db) in self.b1.iter_mut().zip(db1.iter()) {
-            *b -= lr * db;
-        }
-
-        loss
-    }
-}
-
-// ── TransitionBuffer (C4-3b) ───────────────────────────────────────────
-
-/// Single transition record. Matches Python `(state, reward, next_state)` tuple.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Transition {
-    /// State `s` (162D TITAN_SELF snapshot at time t).
-    pub state: Vec<f64>,
-    /// Reward `r` observed in transition s → s'.
-    pub reward: f64,
-    /// Next state `s'` (162D TITAN_SELF snapshot at time t+1).
-    pub next_state: Vec<f64>,
-}
-
-/// Capped ring buffer of `(state, reward, next_state)` transitions.
-/// Per `filter_down.py:259-303`: when full, overwrites at write_idx;
-/// `sample` returns `n = min(batch_size, len)` entries WITHOUT replacement.
-#[derive(Debug, Clone)]
-pub struct TransitionBuffer {
-    buffer: Vec<Transition>,
-    max_size: usize,
-    write_idx: usize,
-}
-
-impl TransitionBuffer {
-    /// Construct an empty buffer with the given capacity. Default capacity
-    /// per SPEC v0.1.5 `FILTER_DOWN_BUFFER_MAX = 2000`.
-    pub fn new(max_size: usize) -> Self {
-        Self {
-            buffer: Vec::with_capacity(max_size),
-            max_size,
-            write_idx: 0,
-        }
-    }
-
-    /// Construct with SPEC default capacity.
-    pub fn with_defaults() -> Self {
-        Self::new(titan_core::constants::FILTER_DOWN_BUFFER_MAX as usize)
-    }
-
-    /// Add one transition. Per Python: append until cap, then overwrite
-    /// at write_idx (FIFO eviction). Advances write_idx mod max_size.
-    pub fn add(&mut self, state: Vec<f64>, reward: f64, next_state: Vec<f64>) {
-        debug_assert_eq!(state.len(), INPUT_DIM);
-        debug_assert_eq!(next_state.len(), INPUT_DIM);
-        let t = Transition {
-            state,
-            reward,
-            next_state,
-        };
-        if self.buffer.len() < self.max_size {
-            self.buffer.push(t);
-        } else {
-            self.buffer[self.write_idx] = t;
-        }
-        self.write_idx = (self.write_idx + 1) % self.max_size;
-    }
-
-    /// Random mini-batch sampler — `n = min(batch_size, len)` transitions
-    /// without replacement. Mirrors Python `np.random.choice(replace=False)`.
-    pub fn sample<R: Rng + ?Sized>(&self, batch_size: usize, rng: &mut R) -> Vec<Transition> {
-        if self.buffer.is_empty() {
-            return Vec::new();
-        }
-        let n = batch_size.min(self.buffer.len());
-        // Reservoir sampling without replacement via shuffle indices.
-        use rand::seq::SliceRandom;
-        let mut indices: Vec<usize> = (0..self.buffer.len()).collect();
-        indices.shuffle(rng);
-        indices.truncate(n);
-        indices.iter().map(|&i| self.buffer[i].clone()).collect()
-    }
-
-    /// Number of transitions stored.
-    pub fn len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    /// True if no transitions stored.
-    pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
-    }
-
-    /// Capacity (max_size).
-    pub fn capacity(&self) -> usize {
-        self.max_size
-    }
-
-    /// Save buffer to JSON via `titan-core::atomic_write` per SPEC §11.H.1.
-    pub fn save(&self, path: &Path) -> Result<(), FilterDownError> {
-        let bytes = serde_json::to_vec_pretty(&self.buffer)?;
-        titan_core::atomic_write::atomic_write(
-            path,
-            &bytes,
-            titan_core::constants::DATA_BACKUP_RETENTION_GENERATIONS as usize,
-        )?;
-        Ok(())
-    }
-
-    /// Load buffer from JSON. Recomputes `write_idx = len % max_size` per
-    /// Python `TransitionBuffer.load:300`.
-    /// Returns `Ok(false)` when no file present (clean start).
-    pub fn load(&mut self, path: &Path) -> Result<bool, FilterDownError> {
-        let candidates = [
-            path.to_path_buf(),
-            path.with_extension("json.bak"),
-            path.with_extension("json.bak.prev"),
-        ];
-
-        let mut last_err: Option<FilterDownError> = None;
-        let mut found_any = false;
-        for candidate in &candidates {
-            if !candidate.exists() {
-                continue;
-            }
-            found_any = true;
-            match std::fs::read(candidate) {
-                Ok(bytes) => match serde_json::from_slice::<Vec<Transition>>(&bytes) {
-                    Ok(buffer) => {
-                        // Truncate if loaded > current cap (spec change scenarios).
-                        let buffer = if buffer.len() > self.max_size {
-                            buffer.into_iter().take(self.max_size).collect()
-                        } else {
-                            buffer
-                        };
-                        let len = buffer.len();
-                        self.buffer = buffer;
-                        self.write_idx = len % self.max_size;
-                        info!(
-                            event = "TRANSITION_BUFFER_LOADED",
-                            ?candidate,
-                            len = len,
-                            "transition buffer restored"
-                        );
-                        return Ok(true);
-                    }
-                    Err(e) => {
-                        warn!(
-                            event = "TRANSITION_BUFFER_DECODE_FAIL",
-                            ?candidate,
-                            err = ?e,
-                            "decode failed; trying next backup"
-                        );
-                        last_err = Some(e.into());
-                    }
-                },
-                Err(e) => {
-                    warn!(
-                        event = "TRANSITION_BUFFER_IO_FAIL",
-                        ?candidate,
-                        err = ?e,
-                        "io failed; trying next backup"
-                    );
-                    last_err = Some(e.into());
-                }
-            }
-        }
-
-        if !found_any {
-            return Ok(false);
-        }
-        Err(last_err.unwrap_or(FilterDownError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "all backups failed",
-        ))))
-    }
-}
-
-impl Default for TransitionBuffer {
-    fn default() -> Self {
-        Self::with_defaults()
-    }
 }
 
 // ── FilterDownV5Engine (C4-3c) ─────────────────────────────────────────
@@ -960,7 +213,7 @@ pub fn default_state_path(data_dir: &Path) -> PathBuf {
 /// + counters. Mirrors `filter_down.py:489-842` (FilterDownV5Engine class).
 pub struct FilterDownV5Engine {
     /// Value network.
-    pub net: TrinityValueNet,
+    pub net: TrinityValueNet<INPUT_DIM>,
     /// Transition buffer.
     pub buffer: TransitionBuffer,
     /// EMA multiplier state (survives restart per Python:610-621).
@@ -1005,7 +258,7 @@ impl FilterDownV5Engine {
     /// Construct with SPEC defaults; loads weights/buffer/state from
     /// `data_dir` if files present (per SPEC §11.H.4 boot integrity).
     pub fn with_defaults(data_dir: &Path) -> Result<Self, FilterDownError> {
-        let mut net = TrinityValueNet::default();
+        let mut net = TrinityValueNet::<INPUT_DIM>::default();
         let mut buffer = TransitionBuffer::with_defaults();
         let weights_path = default_weights_path(data_dir);
         let buffer_path = default_buffer_path(data_dir);
@@ -1061,12 +314,12 @@ impl FilterDownV5Engine {
         // Reward from middle-path loss on raw felt, per Python:643-656.
         // body[0:5], mind core[5:10], spirit core[20:25] for inner;
         // body[65:70], mind core[70:75], spirit core[85:90] for outer.
-        let inner_loss = crate::middle_path::middle_path_loss(
+        let inner_loss = titan_core::middle_path::middle_path_loss(
             &felt_curr[0..5],
             &felt_curr[5..10],
             &felt_curr[20..25],
         );
-        let outer_loss = crate::middle_path::middle_path_loss(
+        let outer_loss = titan_core::middle_path::middle_path_loss(
             &felt_curr[65..70],
             &felt_curr[70..75],
             &felt_curr[85..90],
@@ -1124,7 +377,7 @@ impl FilterDownV5Engine {
         self.transitions_since_train = 0;
 
         // Auto-persist every 10 train steps per Python:684-685.
-        if self.total_train_steps % 10 == 0 {
+        if self.total_train_steps.is_multiple_of(10) {
             if let Err(e) = self.persist() {
                 warn!(event = "FILTER_DOWN_PERSIST_FAIL", err = ?e);
             }
@@ -1299,12 +552,74 @@ impl FilterDownV5Engine {
         }
         Ok(true)
     }
+
+    /// Phase B: msgpack-serializable snapshot for `filter_down_state.bin`
+    /// SHM slot (rFP_phase_c_state_read_unification §B / D-SPEC-72). Mirrors
+    /// Python `FilterDownV5Engine.get_stats()` 1:1. `publish_enabled` is
+    /// always `true` in Rust (V4 retired per SPEC G6 2026-04-25; V5 is the
+    /// sole engine).
+    pub fn get_stats(&self, ts: f64) -> crate::metadata_publisher::FilterDownStateMetadata {
+        use crate::metadata_publisher::{
+            FilterDownStateMetadata, MultipliersBands, MultipliersMean,
+        };
+        use titan_core::constants::FILTER_DOWN_STATE_SCHEMA_VERSION;
+
+        let mean = |slice: &[f64]| -> f64 {
+            if slice.is_empty() {
+                0.0
+            } else {
+                slice.iter().sum::<f64>() / slice.len() as f64
+            }
+        };
+        let round4 =
+            |slice: &[f64]| -> Vec<f64> { slice.iter().map(|v| (v * 1e4).round() / 1e4).collect() };
+
+        FilterDownStateMetadata {
+            version: "v5".to_string(),
+            input_dim: INPUT_DIM as u32,
+            output_dim: OUTPUT_DIM as u32,
+            buffer_size: self.buffer.len(),
+            total_train_steps: self.total_train_steps,
+            last_loss: (self.last_loss * 1e6).round() / 1e6,
+            publish_enabled: true,
+            spirit_filter_strength: self.spirit_strength,
+            cold_start_floor: self.cold_start_floor,
+            multipliers_mean: MultipliersMean {
+                inner_body: mean(&self.multipliers.inner_body),
+                inner_mind: mean(&self.multipliers.inner_mind),
+                inner_spirit_content: mean(&self.multipliers.inner_spirit_content),
+                outer_body: mean(&self.multipliers.outer_body),
+                outer_mind: mean(&self.multipliers.outer_mind),
+                outer_spirit_content: mean(&self.multipliers.outer_spirit_content),
+            },
+            multipliers: MultipliersBands {
+                inner_body: round4(&self.multipliers.inner_body),
+                inner_mind: round4(&self.multipliers.inner_mind),
+                inner_spirit_content: round4(&self.multipliers.inner_spirit_content),
+                outer_body: round4(&self.multipliers.outer_body),
+                outer_mind: round4(&self.multipliers.outer_mind),
+                outer_spirit_content: round4(&self.multipliers.outer_spirit_content),
+            },
+            schema_version: FILTER_DOWN_STATE_SCHEMA_VERSION as u32,
+            ts,
+        }
+    }
 }
 
-/// Encode UNIFIED_SPIRIT_FILTER_DOWN bus payload per SPEC §3.5 wire
-/// contract. Caller publishes via `BusClient::publish` with msg_type
+/// Build UNIFIED_SPIRIT_FILTER_DOWN bus payload as `rmpv::Value::Map` per
+/// SPEC §8.6 schema + §8.10 line 900 byte-identical guarantee. Caller
+/// publishes via `BusClient::publish` with msg_type
 /// `"UNIFIED_SPIRIT_FILTER_DOWN"`, src `"unified_spirit"`, P1 priority.
-pub fn encode_filter_down_payload(multipliers: &Multipliers, epoch_id: u64, ts: f64) -> Vec<u8> {
+///
+/// Pre-2026-05-13 returned `Vec<u8>` (msgpack-encoded). Closure of
+/// `rFP_worker_broadcast_topics_completion §4.C-ter`: now returns the
+/// structured Value so `BusClient::publish` / `encode_simple` can embed it
+/// directly into the envelope as a nested Map (matching Python ground truth).
+pub fn encode_filter_down_payload(
+    multipliers: &Multipliers,
+    epoch_id: u64,
+    ts: f64,
+) -> rmpv::Value {
     let to_array = |v: &[f64]| -> rmpv::Value {
         rmpv::Value::Array(v.iter().map(|x| rmpv::Value::F64(*x)).collect())
     };
@@ -1334,18 +649,14 @@ pub fn encode_filter_down_payload(multipliers: &Multipliers, epoch_id: u64, ts: 
             to_array(&multipliers.outer_spirit_content),
         ),
     ]);
-    let payload = rmpv::Value::Map(vec![
+    rmpv::Value::Map(vec![
         (rmpv::Value::String("multipliers".into()), mults_map),
         (
             rmpv::Value::String("epoch_id".into()),
             rmpv::Value::Integer(rmpv::Integer::from(epoch_id)),
         ),
         (rmpv::Value::String("ts".into()), rmpv::Value::F64(ts)),
-    ]);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &payload)
-        .expect("msgpack encode never fails for fixed-size known-good payload");
-    buf
+    ])
 }
 
 #[cfg(test)]
@@ -1353,6 +664,13 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
+    use titan_core::trinity_value_net::{
+        TrinityValueNetWeights,
+        TRINITY_VALUE_NET_WEIGHTS_SCHEMA_VERSION as FILTER_DOWN_WEIGHTS_SCHEMA_VERSION,
+    };
+
+    /// Test alias: the unified engine's value net is `TrinityValueNet<INPUT_DIM>` (162D).
+    type ValueNet = TrinityValueNet<INPUT_DIM>;
     use tempfile::tempdir;
 
     fn seeded_rng(seed: u64) -> ChaCha8Rng {
@@ -1368,7 +686,7 @@ mod tests {
     #[test]
     fn forward_zeros_weights_outputs_zero_bias() {
         // C4-3a test 1: with zero weights + zero biases, V(s)=0 for any input
-        let net = TrinityValueNet::zeros();
+        let net = ValueNet::zeros();
         let s = ones_state();
         let v = net.forward(&s);
         assert_eq!(v, 0.0);
@@ -1378,7 +696,7 @@ mod tests {
     fn forward_output_finite_for_random_init() {
         // C4-3a test 2: random weights + random input → finite scalar
         let mut rng = seeded_rng(42);
-        let net = TrinityValueNet::new(&mut rng);
+        let net = ValueNet::new(&mut rng);
         let s = ones_state();
         let v = net.forward(&s);
         assert!(v.is_finite(), "V(s) must be finite, got {v}");
@@ -1388,7 +706,7 @@ mod tests {
     fn forward_batch_matches_per_sample_loop() {
         // C4-3a test 3: forward_batch == [forward(s) for s in states]
         let mut rng = seeded_rng(123);
-        let net = TrinityValueNet::new(&mut rng);
+        let net = ValueNet::new(&mut rng);
         let s1 = [0.5_f64; INPUT_DIM];
         let mut s2 = [0.0_f64; INPUT_DIM];
         for (i, v) in s2.iter_mut().enumerate() {
@@ -1407,7 +725,7 @@ mod tests {
     fn xavier_init_w1_variance_approx_2_over_in_dim() {
         // C4-3a test 4: empirical variance of w1 ~ 2 / INPUT_DIM
         let mut rng = seeded_rng(0xDEADBEEF);
-        let net = TrinityValueNet::new(&mut rng);
+        let net = ValueNet::new(&mut rng);
         let mean: f64 = net.w1.iter().sum::<f64>() / net.w1.len() as f64;
         let variance: f64 =
             net.w1.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / net.w1.len() as f64;
@@ -1425,7 +743,7 @@ mod tests {
     fn biases_initialize_to_zero() {
         // C4-3a test 5: per Python:99-104, biases zero-init
         let mut rng = seeded_rng(7);
-        let net = TrinityValueNet::new(&mut rng);
+        let net = ValueNet::new(&mut rng);
         for v in &net.b1 {
             assert_eq!(*v, 0.0);
         }
@@ -1443,7 +761,7 @@ mod tests {
     fn gradient_wrt_input_dimension_and_finite() {
         // C4-3a test 6: returns 162 floats, all finite
         let mut rng = seeded_rng(99);
-        let net = TrinityValueNet::new(&mut rng);
+        let net = ValueNet::new(&mut rng);
         let s = ones_state();
         let g = net.gradient_wrt_input(&s);
         assert_eq!(g.len(), INPUT_DIM);
@@ -1458,7 +776,7 @@ mod tests {
         // negative input * positive zero weights → zeros, but flip with
         // zeroed net + non-zero biases set negative), all gradients
         // through ReLU should be 0.
-        let mut net = TrinityValueNet::zeros();
+        let mut net = ValueNet::zeros();
         // Force all z1, z2 negative by setting biases to -1 and zero weights
         for v in net.b1.iter_mut() {
             *v = -1.0;
@@ -1478,7 +796,7 @@ mod tests {
         // central-difference (cheap sanity check; full Python parity in
         // C4-3b TD(0) tests where we have shared-seed weights).
         let mut rng = seeded_rng(2026);
-        let net = TrinityValueNet::new(&mut rng);
+        let net = ValueNet::new(&mut rng);
         let mut s = ones_state();
         // Push a few inputs into "active" ReLU regions
         for (i, v) in s.iter_mut().enumerate() {
@@ -1514,12 +832,12 @@ mod tests {
         // Tighter byte-equality is impractical due to JSON float formatting
         // (matches GreatEpoch timestamp fix pattern in unified_spirit.rs).
         let mut rng = seeded_rng(0xCAFEF00D);
-        let net = TrinityValueNet::new(&mut rng);
+        let net = ValueNet::new(&mut rng);
         let dir = tempdir().unwrap();
         let path = default_weights_path(dir.path());
         net.save(&path).unwrap();
 
-        let mut loaded = TrinityValueNet::zeros();
+        let mut loaded = ValueNet::zeros();
         let ok = loaded.load(&path).unwrap();
         assert!(ok, "load returns true on success");
 
@@ -1552,7 +870,7 @@ mod tests {
     fn load_handles_missing_file_returns_false() {
         // C4-3a test 10: missing file = clean start (Ok(false))
         let dir = tempdir().unwrap();
-        let mut net = TrinityValueNet::zeros();
+        let mut net = ValueNet::zeros();
         let result = net.load(&default_weights_path(dir.path())).unwrap();
         assert!(!result, "no file → load returns false");
     }
@@ -1563,7 +881,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = default_weights_path(dir.path());
         std::fs::write(&path, b"not valid json").unwrap();
-        let mut net = TrinityValueNet::zeros();
+        let mut net = ValueNet::zeros();
         let result = net.load(&path);
         assert!(matches!(
             result,
@@ -1588,7 +906,7 @@ mod tests {
             b3: vec![0.0_f64; 1],
         };
         std::fs::write(&path, serde_json::to_vec(&bogus).unwrap()).unwrap();
-        let mut net = TrinityValueNet::zeros();
+        let mut net = ValueNet::zeros();
         let result = net.load(&path);
         assert!(matches!(result, Err(FilterDownError::ShapeMismatch { .. })));
     }
@@ -1610,12 +928,12 @@ mod tests {
         // overwriting 0, 1, but write_idx wraps).
         assert_eq!(buf.len(), 3);
         // After 5 adds with cap 3: write_idx = 5 % 3 = 2.
-        assert_eq!(buf.write_idx, 2);
+        assert_eq!(buf.write_idx(), 2);
         // First 3 added entries fill [0,1,2], then 4th overwrites [0],
         // 5th overwrites [1]. So buffer = [overwritten-from-4, overwritten-from-5, original-2]
-        assert_eq!(buf.buffer[0].reward, 3.0);
-        assert_eq!(buf.buffer[1].reward, 4.0);
-        assert_eq!(buf.buffer[2].reward, 2.0);
+        assert_eq!(buf.transitions()[0].reward, 3.0);
+        assert_eq!(buf.transitions()[1].reward, 4.0);
+        assert_eq!(buf.transitions()[2].reward, 2.0);
     }
 
     #[test]
@@ -1667,9 +985,9 @@ mod tests {
         assert!(ok);
         assert_eq!(buf2.len(), 3);
         // write_idx = len % max_size = 3 % 5 = 3
-        assert_eq!(buf2.write_idx, 3);
+        assert_eq!(buf2.write_idx(), 3);
         for i in 0..3 {
-            assert_eq!(buf2.buffer[i].reward, i as f64);
+            assert_eq!(buf2.transitions()[i].reward, i as f64);
         }
     }
 
@@ -1683,7 +1001,7 @@ mod tests {
     fn train_step_empty_batch_returns_zero_loss() {
         // C4-3b test 17: empty batch → 0.0 loss + no weights mutated
         let mut rng = seeded_rng(42);
-        let mut net = TrinityValueNet::new(&mut rng);
+        let mut net = ValueNet::new(&mut rng);
         let w1_before = net.w1.clone();
         let loss = net.train_step(&[], &[], &[], 0.001, 0.95);
         assert_eq!(loss, 0.0);
@@ -1694,7 +1012,7 @@ mod tests {
     fn train_step_td_target_formula() {
         // C4-3b test 18: with all-zero weights, V(s) = V(s') = 0 →
         // target = r, error = -r, loss = mean(r²).
-        let mut net = TrinityValueNet::zeros();
+        let mut net = ValueNet::zeros();
         let states = vec![ones_batch_state(); 3];
         let next_states = vec![ones_batch_state(); 3];
         let rewards = vec![1.0, 2.0, 3.0];
@@ -1710,7 +1028,7 @@ mod tests {
     fn train_step_loss_decreases_after_one_update() {
         // C4-3b test 19: gradient descent reduces loss (sanity)
         let mut rng = seeded_rng(2026);
-        let mut net = TrinityValueNet::new(&mut rng);
+        let mut net = ValueNet::new(&mut rng);
         // Construct a simple regression target: predict state[0]
         let states: Vec<[f64; INPUT_DIM]> = (0..8)
             .map(|i| {
@@ -1739,7 +1057,7 @@ mod tests {
         // C4-3b test 20: with zero weights, only b3 should receive nonzero
         // gradient on first step (since a2 = ReLU(0) = 0 → dw3 = 0; only db3
         // updates from dz3 sum). Compute expected db3 manually.
-        let mut net = TrinityValueNet::zeros();
+        let mut net = ValueNet::zeros();
         let states = vec![ones_batch_state(); 2];
         let next_states = vec![ones_batch_state(); 2];
         let rewards = vec![1.0, 2.0];
@@ -1761,7 +1079,7 @@ mod tests {
     fn train_step_layer2_gradient_zero_when_relu_dead() {
         // C4-3b test 21: when all z2 are negative (ReLU dead), dz2 = 0 →
         // dw2 = 0, db2 = 0, weights unchanged at layer 2 + below.
-        let mut net = TrinityValueNet::zeros();
+        let mut net = ValueNet::zeros();
         // Force z2 always negative by setting b2 = -1
         for v in net.b2.iter_mut() {
             *v = -1.0;
@@ -1781,7 +1099,7 @@ mod tests {
     #[test]
     fn train_step_layer1_gradient_zero_when_layer2_dead() {
         // C4-3b test 22: extension of above — layer1 also untouched
-        let mut net = TrinityValueNet::zeros();
+        let mut net = ValueNet::zeros();
         for v in net.b1.iter_mut() {
             *v = -1.0;
         }
@@ -1801,11 +1119,11 @@ mod tests {
         let next_states = vec![ones_batch_state(); 2];
         let rewards = vec![1.0, 2.0];
 
-        let mut net1 = TrinityValueNet::zeros();
+        let mut net1 = ValueNet::zeros();
         let _ = net1.train_step(&states, &rewards, &next_states, 0.5, 0.95);
         let b3_lr_half = net1.b3[0];
 
-        let mut net2 = TrinityValueNet::zeros();
+        let mut net2 = ValueNet::zeros();
         let _ = net2.train_step(&states, &rewards, &next_states, 1.0, 0.95);
         let b3_lr_full = net2.b3[0];
 
@@ -1820,7 +1138,7 @@ mod tests {
     fn train_step_gamma_zero_makes_target_just_reward() {
         // C4-3b test 24: gamma = 0 → target = r (no bootstrapping)
         let mut rng = seeded_rng(3);
-        let mut net = TrinityValueNet::new(&mut rng);
+        let mut net = ValueNet::new(&mut rng);
         // Force V(s') ≠ 0 by giving non-zero weights
         let states = vec![ones_batch_state(); 2];
         let next_states = vec![ones_batch_state(); 2];
@@ -1841,7 +1159,7 @@ mod tests {
         // C4-3b test 25: train + save + load + re-forward — weights match
         // post-train output within 1e-9
         let mut rng = seeded_rng(0xBEEFFACE);
-        let mut net = TrinityValueNet::new(&mut rng);
+        let mut net = ValueNet::new(&mut rng);
         let states = vec![ones_batch_state(); 4];
         let next_states = vec![ones_batch_state(); 4];
         let rewards = vec![0.5, 1.0, 1.5, 2.0];
@@ -1851,7 +1169,7 @@ mod tests {
         let path = default_weights_path(dir.path());
         net.save(&path).unwrap();
 
-        let mut loaded = TrinityValueNet::zeros();
+        let mut loaded = ValueNet::zeros();
         loaded.load(&path).unwrap();
 
         let s = ones_batch_state();
@@ -1901,7 +1219,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut rng = seeded_rng(0xC0FFEE);
         let mut engine = engine_with_trained_net(dir.path(), 9999);
-        engine.net = TrinityValueNet::new(&mut rng);
+        engine.net = ValueNet::new(&mut rng);
         let s = ones_batch_state();
         let m = engine.compute_multipliers(&s);
         let all = m
@@ -1930,7 +1248,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut rng = seeded_rng(0xBADCAFE);
         let mut engine = engine_with_trained_net(dir.path(), 9999);
-        engine.net = TrinityValueNet::new(&mut rng);
+        engine.net = ValueNet::new(&mut rng);
         let s = ones_batch_state();
         let m = engine.compute_multipliers(&s);
         // Total dims sum to 120 = 5+15+40+5+15+40
@@ -1952,7 +1270,7 @@ mod tests {
         let mut engine = engine_with_trained_net(dir.path(), 9999);
         engine.smoothing = 0.0; // skip EMA
                                 // Force gradient by giving net non-zero w3 = 1.0 + small w1 + bias
-        engine.net = TrinityValueNet::zeros();
+        engine.net = ValueNet::zeros();
         for v in engine.net.w3.iter_mut() {
             *v = 1.0;
         }
@@ -1997,7 +1315,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut rng = seeded_rng(11);
         let mut engine = engine_with_trained_net(dir.path(), 9999);
-        engine.net = TrinityValueNet::new(&mut rng);
+        engine.net = ValueNet::new(&mut rng);
         let s = ones_batch_state();
         let m1 = engine.compute_multipliers(&s);
         // EMA[1] = 0.9 * 1.0 (initial) + 0.1 * raw
@@ -2033,7 +1351,7 @@ mod tests {
         let felt = [0.5_f64; 130];
         engine.record_transition(&prev, &curr, &felt);
         let last_idx = engine.buffer.len() - 1;
-        assert_eq!(engine.buffer.buffer[last_idx].reward, 0.0);
+        assert_eq!(engine.buffer.transitions()[last_idx].reward, 0.0);
     }
 
     #[test]
@@ -2081,12 +1399,10 @@ mod tests {
 
     #[test]
     fn encode_filter_down_payload_round_trip() {
-        // C4-3c test 38: msgpack-encoded payload decodes to expected schema
+        // C4-3c test 38: structured payload exposes expected SPEC §8.6 schema
         let m = Multipliers::ones();
         let payload = encode_filter_down_payload(&m, 42, 1234567890.5);
-        let decoded: rmpv::Value =
-            rmpv::decode::read_value(&mut std::io::Cursor::new(&payload[..])).unwrap();
-        let entries = match decoded {
+        let entries = match payload {
             rmpv::Value::Map(e) => e,
             _ => panic!("expected map"),
         };

@@ -11,9 +11,9 @@ import os
 import tempfile
 import time
 
-from titan_plugin.maker.narrative_channel import NarrativeChannel
-from titan_plugin.maker.maker_profile import MakerProfile
-from titan_plugin.maker.schemas import ProposalType
+from titan_hcl.maker.narrative_channel import NarrativeChannel
+from titan_hcl.maker.maker_profile import MakerProfile
+from titan_hcl.maker.schemas import ProposalType
 
 
 class FakeBus:

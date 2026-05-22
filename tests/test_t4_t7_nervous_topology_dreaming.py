@@ -16,7 +16,7 @@ import pytest
 class TestNervousSystemPrograms:
     def test_reflex_fires_on_high_velocity(self):
         """REFLEX program fires when avg velocity > 0.3."""
-        from titan_plugin.logic.nervous_system import NervousSystem, flatten_observables
+        from titan_hcl.logic.nervous_system import NervousSystem, flatten_observables
         ns = NervousSystem()
         obs = _make_obs(velocity=0.5)
         signals = ns.evaluate(obs)
@@ -25,7 +25,7 @@ class TestNervousSystemPrograms:
 
     def test_reflex_silent_on_low_velocity(self):
         """REFLEX doesn't fire on calm state."""
-        from titan_plugin.logic.nervous_system import NervousSystem
+        from titan_hcl.logic.nervous_system import NervousSystem
         ns = NervousSystem()
         obs = _make_obs(velocity=0.1)
         signals = ns.evaluate(obs)
@@ -34,7 +34,7 @@ class TestNervousSystemPrograms:
 
     def test_focus_fires_on_strong_polarity(self):
         """FOCUS fires when |polarity| > 0.15."""
-        from titan_plugin.logic.nervous_system import NervousSystem
+        from titan_hcl.logic.nervous_system import NervousSystem
         ns = NervousSystem()
         obs = _make_obs(polarity=0.3)
         signals = ns.evaluate(obs)
@@ -42,7 +42,7 @@ class TestNervousSystemPrograms:
         assert "FOCUS" in names
 
     def test_focus_silent_on_neutral_polarity(self):
-        from titan_plugin.logic.nervous_system import NervousSystem
+        from titan_hcl.logic.nervous_system import NervousSystem
         ns = NervousSystem()
         obs = _make_obs(polarity=0.05)
         signals = ns.evaluate(obs)
@@ -51,7 +51,7 @@ class TestNervousSystemPrograms:
 
     def test_intuition_fires_on_erratic_direction(self):
         """INTUITION fires when direction < 0.5."""
-        from titan_plugin.logic.nervous_system import NervousSystem
+        from titan_hcl.logic.nervous_system import NervousSystem
         ns = NervousSystem()
         obs = _make_obs(direction=0.2)
         signals = ns.evaluate(obs)
@@ -59,7 +59,7 @@ class TestNervousSystemPrograms:
         assert "INTUITION" in names
 
     def test_intuition_silent_on_stable_direction(self):
-        from titan_plugin.logic.nervous_system import NervousSystem
+        from titan_hcl.logic.nervous_system import NervousSystem
         ns = NervousSystem()
         obs = _make_obs(direction=0.9)
         signals = ns.evaluate(obs)
@@ -68,7 +68,7 @@ class TestNervousSystemPrograms:
 
     def test_impulse_fires_on_high_coherence_and_magnitude(self):
         """IMPULSE fires when coherence > 0.7 AND magnitude > 0.5."""
-        from titan_plugin.logic.nervous_system import NervousSystem
+        from titan_hcl.logic.nervous_system import NervousSystem
         ns = NervousSystem()
         obs = _make_obs(coherence=0.9, magnitude=0.8)
         signals = ns.evaluate(obs)
@@ -76,7 +76,7 @@ class TestNervousSystemPrograms:
         assert "IMPULSE" in names
 
     def test_impulse_silent_on_low_coherence(self):
-        from titan_plugin.logic.nervous_system import NervousSystem
+        from titan_hcl.logic.nervous_system import NervousSystem
         ns = NervousSystem()
         obs = _make_obs(coherence=0.3, magnitude=0.8)
         signals = ns.evaluate(obs)
@@ -85,7 +85,7 @@ class TestNervousSystemPrograms:
 
     def test_no_signals_on_neutral_state(self):
         """Neutral state (all 0.5) shouldn't fire REFLEX, FOCUS, INTUITION."""
-        from titan_plugin.logic.nervous_system import NervousSystem
+        from titan_hcl.logic.nervous_system import NervousSystem
         ns = NervousSystem()
         obs = _make_obs(coherence=0.5, magnitude=0.5, velocity=0.0,
                         direction=0.9, polarity=0.0)
@@ -97,7 +97,7 @@ class TestNervousSystemPrograms:
 
     def test_urgency_scales_with_observable(self):
         """Higher velocity → higher REFLEX urgency."""
-        from titan_plugin.logic.nervous_system import NervousSystem
+        from titan_hcl.logic.nervous_system import NervousSystem
         ns = NervousSystem()
         low = ns.evaluate(_make_obs(velocity=0.35))
         high = ns.evaluate(_make_obs(velocity=0.9))
@@ -112,7 +112,7 @@ class TestNervousSystemPrograms:
 class TestTopologyEngine:
     def test_uniform_observables_minimum_volume(self):
         """All parts with identical observables → minimum (zero) volume."""
-        from titan_plugin.logic.topology import TopologyEngine
+        from titan_hcl.logic.topology import TopologyEngine
         topo = TopologyEngine()
         obs = _make_obs(coherence=0.8, magnitude=0.5, velocity=0.1,
                         direction=0.9, polarity=0.0)
@@ -121,7 +121,7 @@ class TestTopologyEngine:
 
     def test_divergent_observables_large_volume(self):
         """Different parts with different observables → large volume."""
-        from titan_plugin.logic.topology import TopologyEngine
+        from titan_hcl.logic.topology import TopologyEngine
         topo = TopologyEngine()
         obs = {
             "inner_body": {"coherence": 0.1, "magnitude": 0.9, "velocity": 0.8,
@@ -136,7 +136,7 @@ class TestTopologyEngine:
 
     def test_contracting_volume_positive_curvature(self):
         """Volume shrinking over ticks → positive curvature."""
-        from titan_plugin.logic.topology import TopologyEngine
+        from titan_hcl.logic.topology import TopologyEngine
         topo = TopologyEngine()
         # First tick: large volume
         topo.compute({
@@ -156,7 +156,7 @@ class TestTopologyEngine:
 
     def test_expanding_volume_negative_curvature(self):
         """Volume growing over ticks → negative curvature."""
-        from titan_plugin.logic.topology import TopologyEngine
+        from titan_hcl.logic.topology import TopologyEngine
         topo = TopologyEngine()
         # First tick: small but non-zero volume
         topo.compute({
@@ -176,7 +176,7 @@ class TestTopologyEngine:
 
     def test_cluster_detection(self):
         """Parts with similar observables form a cluster."""
-        from titan_plugin.logic.topology import TopologyEngine
+        from titan_hcl.logic.topology import TopologyEngine
         topo = TopologyEngine(cluster_threshold=0.3)
         obs = {
             "inner_body": {"coherence": 0.8, "magnitude": 0.5, "velocity": 0.1,
@@ -194,7 +194,7 @@ class TestTopologyEngine:
 
     def test_isolated_part_detected(self):
         """A part far from all others is isolated."""
-        from titan_plugin.logic.topology import TopologyEngine
+        from titan_hcl.logic.topology import TopologyEngine
         topo = TopologyEngine(cluster_threshold=0.2)
         obs = {
             "inner_body": {"coherence": 0.5, "magnitude": 0.5, "velocity": 0.1,
@@ -209,11 +209,11 @@ class TestTopologyEngine:
 
     def test_topology_persisted_in_inner_state(self):
         """Coordinator stores topology in InnerState."""
-        from titan_plugin.logic.inner_state import InnerState
-        from titan_plugin.logic.spirit_state import SpiritState
-        from titan_plugin.logic.observables import ObservableEngine
-        from titan_plugin.logic.topology import TopologyEngine
-        from titan_plugin.logic.inner_coordinator import InnerTrinityCoordinator
+        from titan_hcl.logic.inner_state import InnerState
+        from titan_hcl.logic.spirit_state import SpiritState
+        from titan_hcl.logic.observables import ObservableEngine
+        from titan_hcl.logic.topology import TopologyEngine
+        from titan_hcl.logic.inner_coordinator import InnerTrinityCoordinator
 
         inner = InnerState()
         coord = InnerTrinityCoordinator(
@@ -236,7 +236,7 @@ class TestDreamingCycle:
         full formula by also passing neurochemical + experience inputs so
         inner_fatigue contributes meaningfully.
         """
-        from titan_plugin.logic.dreaming import DreamingEngine
+        from titan_hcl.logic.dreaming import DreamingEngine
         engine = DreamingEngine()
         obs = _make_obs(coherence=0.2, magnitude=0.2, direction=0.3)
         neuro = {
@@ -257,7 +257,7 @@ class TestDreamingCycle:
         readiness metric). Testing wake_drive directly is the closest
         semantic replacement.
         """
-        from titan_plugin.logic.dreaming import DreamingEngine
+        from titan_hcl.logic.dreaming import DreamingEngine
         engine = DreamingEngine()
         engine.last_fatigue = 0.1  # well-rested
         wake = engine.compute_wake_drive(ne_level=0.9, da_level=0.8)
@@ -271,8 +271,8 @@ class TestDreamingCycle:
         pressure × adenosine) vs wake_drive (NE × DA × fatigue dampening).
         Test provides high sleep-promoting + low wake-promoting values.
         """
-        from titan_plugin.logic.dreaming import DreamingEngine
-        from titan_plugin.logic.inner_state import InnerState
+        from titan_hcl.logic.dreaming import DreamingEngine
+        from titan_hcl.logic.inner_state import InnerState
         engine = DreamingEngine()
         inner = InnerState()
         obs = _make_obs(coherence=0.1, magnitude=0.1, direction=0.1)
@@ -295,8 +295,8 @@ class TestDreamingCycle:
 
     def test_end_dreaming_transition(self):
         """Readiness above threshold during dreaming triggers END_DREAMING."""
-        from titan_plugin.logic.dreaming import DreamingEngine
-        from titan_plugin.logic.inner_state import InnerState
+        from titan_hcl.logic.dreaming import DreamingEngine
+        from titan_hcl.logic.inner_state import InnerState
         engine = DreamingEngine(readiness_threshold=0.3)
         engine._last_transition_ts = time.time() - 600
         inner = InnerState()
@@ -307,8 +307,8 @@ class TestDreamingCycle:
 
     def test_full_cycle(self):
         """awake → dreaming → awake cycle."""
-        from titan_plugin.logic.dreaming import DreamingEngine
-        from titan_plugin.logic.inner_state import InnerState
+        from titan_hcl.logic.dreaming import DreamingEngine
+        from titan_hcl.logic.inner_state import InnerState
         engine = DreamingEngine(fatigue_threshold=0.3, readiness_threshold=0.3)
         inner = InnerState()
 
@@ -328,8 +328,8 @@ class TestDreamingCycle:
 
     def test_experience_buffer_drains_on_wake(self):
         """Buffered experiences are drained when dreaming ends."""
-        from titan_plugin.logic.dreaming import DreamingEngine
-        from titan_plugin.logic.inner_state import InnerState
+        from titan_hcl.logic.dreaming import DreamingEngine
+        from titan_hcl.logic.inner_state import InnerState
         engine = DreamingEngine()
         inner = InnerState()
         inner.buffer_experience({"body_tensor": [0.3]*5, "ts": 1.0})
@@ -341,7 +341,7 @@ class TestDreamingCycle:
 
     def test_inner_keeps_running_during_dreaming(self):
         """InnerState is still updatable when dreaming."""
-        from titan_plugin.logic.inner_state import InnerState
+        from titan_hcl.logic.inner_state import InnerState
         inner = InnerState()
         inner.is_dreaming = True
         inner.update_observables({"inner_body": {"coherence": 0.9}})
@@ -349,7 +349,7 @@ class TestDreamingCycle:
 
     def test_distillation_filters_significant_experiences(self):
         """Only experiences with sufficient variance are distilled."""
-        from titan_plugin.logic.dreaming import DreamingEngine
+        from titan_hcl.logic.dreaming import DreamingEngine
         engine = DreamingEngine()
         buffer = [
             {"body_tensor": [0.5, 0.5, 0.5, 0.5, 0.5]},  # boring
@@ -365,7 +365,7 @@ class TestDreamingCycle:
 class TestEmergentGreatPulse:
     def test_convergence_detected_at_volume_minimum(self):
         """is_convergence_peak returns True at local volume minimum."""
-        from titan_plugin.logic.topology import TopologyEngine
+        from titan_hcl.logic.topology import TopologyEngine
         topo = TopologyEngine()
         # Simulate volume history: decreasing then increasing
         topo._volume_history = [5.0, 3.0, 2.0, 1.0, 1.5]
@@ -374,18 +374,18 @@ class TestEmergentGreatPulse:
 
     def test_no_convergence_during_contraction(self):
         """No convergence peak while still contracting."""
-        from titan_plugin.logic.topology import TopologyEngine
+        from titan_hcl.logic.topology import TopologyEngine
         topo = TopologyEngine()
         topo._volume_history = [5.0, 4.0, 3.0, 2.0, 1.0]
         assert not topo.is_convergence_peak()
 
     def test_great_pulse_fires_during_dreaming_convergence(self):
         """Full coordinator: GREAT PULSE fires at topology convergence during dreaming."""
-        from titan_plugin.logic.inner_state import InnerState
-        from titan_plugin.logic.spirit_state import SpiritState
-        from titan_plugin.logic.observables import ObservableEngine
-        from titan_plugin.logic.topology import TopologyEngine
-        from titan_plugin.logic.inner_coordinator import InnerTrinityCoordinator
+        from titan_hcl.logic.inner_state import InnerState
+        from titan_hcl.logic.spirit_state import SpiritState
+        from titan_hcl.logic.observables import ObservableEngine
+        from titan_hcl.logic.topology import TopologyEngine
+        from titan_hcl.logic.inner_coordinator import InnerTrinityCoordinator
 
         inner = InnerState()
         inner.is_dreaming = True  # must be dreaming
@@ -409,11 +409,11 @@ class TestEmergentGreatPulse:
 
     def test_no_great_pulse_when_awake(self):
         """GREAT PULSE should NOT fire during active (non-dreaming) state."""
-        from titan_plugin.logic.inner_state import InnerState
-        from titan_plugin.logic.spirit_state import SpiritState
-        from titan_plugin.logic.observables import ObservableEngine
-        from titan_plugin.logic.topology import TopologyEngine
-        from titan_plugin.logic.inner_coordinator import InnerTrinityCoordinator
+        from titan_hcl.logic.inner_state import InnerState
+        from titan_hcl.logic.spirit_state import SpiritState
+        from titan_hcl.logic.observables import ObservableEngine
+        from titan_hcl.logic.topology import TopologyEngine
+        from titan_hcl.logic.inner_coordinator import InnerTrinityCoordinator
 
         inner = InnerState()
         inner.is_dreaming = False  # awake
@@ -428,11 +428,11 @@ class TestEmergentGreatPulse:
 
     def test_enrichment_quality_increases_on_great_pulse(self):
         """Spirit enrichment quality increases when GREAT PULSE fires."""
-        from titan_plugin.logic.inner_state import InnerState
-        from titan_plugin.logic.spirit_state import SpiritState
-        from titan_plugin.logic.observables import ObservableEngine
-        from titan_plugin.logic.topology import TopologyEngine
-        from titan_plugin.logic.inner_coordinator import InnerTrinityCoordinator
+        from titan_hcl.logic.inner_state import InnerState
+        from titan_hcl.logic.spirit_state import SpiritState
+        from titan_hcl.logic.observables import ObservableEngine
+        from titan_hcl.logic.topology import TopologyEngine
+        from titan_hcl.logic.inner_coordinator import InnerTrinityCoordinator
 
         inner = InnerState()
         inner.is_dreaming = True

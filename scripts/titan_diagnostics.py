@@ -22,7 +22,7 @@ import time
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-CONFIG_PATH = PROJECT_ROOT / "titan_plugin" / "config.toml"
+CONFIG_PATH = PROJECT_ROOT / "titan_hcl" / "config.toml"
 
 # ---------------------------------------------------------------------------
 # ANSI helpers
@@ -228,7 +228,7 @@ def check_dependencies(results: DiagResult):
     results.begin_category("Dependencies")
 
     modules = {
-        "titan_plugin": "titan_plugin",
+        "titan_hcl": "titan_hcl",
         "torch": "torch",
         "fastapi": "fastapi",
         "httpx": "httpx",

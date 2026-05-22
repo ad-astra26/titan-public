@@ -7,7 +7,7 @@ Microkernel v2 Phase A §A.4 S5 amendment (2026-04-25), Phase 4.
 
 Two passes:
   1. text_pass(): longest-first string replacements for the canonical
-     patterns from titan_plugin.api.state_mapping. Safe because patterns
+     patterns from titan_hcl.api.state_mapping. Safe because patterns
      are anchored on `plugin.<attr>` which is unique to endpoint code
      accessing the plugin object.
   2. libcst_pass(): structured edits for `await asyncio.wait_for(...)`
@@ -15,8 +15,8 @@ Two passes:
      attr read.
 
 Run:
-  python scripts/s5_endpoint_codemod.py --dry-run titan_plugin/api/
-  python scripts/s5_endpoint_codemod.py --apply titan_plugin/api/
+  python scripts/s5_endpoint_codemod.py --dry-run titan_hcl/api/
+  python scripts/s5_endpoint_codemod.py --apply titan_hcl/api/
 
 After --apply, re-run scripts/s5_callsite_audit.py to verify the
 remaining unmatched callsites (Category C, manual handling).
@@ -35,7 +35,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # Import the mapping table
 sys.path.insert(0, str(PROJECT_ROOT))
-from titan_plugin.api.state_mapping import build_simple_replacements  # noqa: E402
+from titan_hcl.api.state_mapping import build_simple_replacements  # noqa: E402
 
 
 # ── Pass 1: text-level replacements ───────────────────────────────────
@@ -202,7 +202,7 @@ def _count_diff(a: str, b: str) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("paths", nargs="*", default=["titan_plugin/api"])
+    parser.add_argument("paths", nargs="*", default=["titan_hcl/api"])
     parser.add_argument("--dry-run", action="store_true",
                         help="Show stats without writing files")
     parser.add_argument("--apply", action="store_true",

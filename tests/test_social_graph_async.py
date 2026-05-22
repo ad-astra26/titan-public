@@ -19,7 +19,7 @@ import time
 
 import pytest
 
-from titan_plugin.core.social_graph import SocialGraph
+from titan_hcl.core.social_graph import SocialGraph
 
 
 @pytest.fixture

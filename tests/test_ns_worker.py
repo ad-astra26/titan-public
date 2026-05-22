@@ -1,4 +1,4 @@
-"""Tests for titan_plugin.modules.ns_worker (C-S5 §10 D22).
+"""Tests for titan_hcl.modules.ns_worker (C-S5 §10 D22).
 
 Bus-independent tests covering:
 - Canonical NS program roster matches NS_PROGRAMS
@@ -16,9 +16,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from titan_plugin import bus
-from titan_plugin.logic.emot_bundle_protocol import NS_PROGRAMS
-from titan_plugin.modules import ns_worker as nw
+from titan_hcl import bus
+from titan_hcl.logic.emot_bundle_protocol import NS_PROGRAMS
+from titan_hcl.modules import ns_worker as nw
 
 
 def test_program_names_match_ns_programs_canonical_order():
@@ -169,7 +169,7 @@ def test_urgency_independent_of_fire_count():
 
 def test_titanvm_registers_schema_version_present():
     """Auto-generated TITANVM_REGISTERS_SCHEMA_VERSION = 1 at SPEC v0.1.0."""
-    from titan_plugin._phase_c_constants import TITANVM_REGISTERS_SCHEMA_VERSION
+    from titan_hcl._phase_c_constants import TITANVM_REGISTERS_SCHEMA_VERSION
     assert TITANVM_REGISTERS_SCHEMA_VERSION == 1
 
 

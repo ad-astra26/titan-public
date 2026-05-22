@@ -41,15 +41,15 @@ if _ROOT not in sys.path:
 
 class TestBusConstants(unittest.TestCase):
     def test_agency_ready_constant_exists(self):
-        from titan_plugin.bus import AGENCY_READY
+        from titan_hcl.bus import AGENCY_READY
         self.assertEqual(AGENCY_READY, "AGENCY_READY")
 
     def test_agency_stats_constant_exists(self):
-        from titan_plugin.bus import AGENCY_STATS
+        from titan_hcl.bus import AGENCY_STATS
         self.assertEqual(AGENCY_STATS, "AGENCY_STATS")
 
     def test_assessment_stats_constant_exists(self):
-        from titan_plugin.bus import ASSESSMENT_STATS
+        from titan_hcl.bus import ASSESSMENT_STATS
         self.assertEqual(ASSESSMENT_STATS, "ASSESSMENT_STATS")
 
 
@@ -83,13 +83,13 @@ class TestAgencyProxyCore(unittest.TestCase):
         return bus
 
     def test_proxy_subscribes_to_bus_at_construction(self):
-        from titan_plugin.proxies.agency_proxy import AgencyProxy
+        from titan_hcl.proxies.agency_proxy import AgencyProxy
         bus = self._make_bus_mock()
         AgencyProxy(bus)
         bus.subscribe.assert_called_once_with("agency_proxy", reply_only=True)
 
     def test_proxy_default_stats(self):
-        from titan_plugin.proxies.agency_proxy import AgencyProxy
+        from titan_hcl.proxies.agency_proxy import AgencyProxy
         bus = self._make_bus_mock()
         proxy = AgencyProxy(bus)
         stats = proxy.get_stats()
@@ -98,7 +98,7 @@ class TestAgencyProxyCore(unittest.TestCase):
         self.assertEqual(stats["registered_helpers"], [])
 
     def test_proxy_update_cached_stats(self):
-        from titan_plugin.proxies.agency_proxy import AgencyProxy
+        from titan_hcl.proxies.agency_proxy import AgencyProxy
         bus = self._make_bus_mock()
         proxy = AgencyProxy(bus)
         proxy.update_cached_stats({
@@ -116,7 +116,7 @@ class TestAgencyProxyCore(unittest.TestCase):
         self.assertEqual(stats["helper_statuses"]["web_search"], "available")
 
     def test_proxy_handle_intent_routes_to_bus(self):
-        from titan_plugin.proxies.agency_proxy import AgencyProxy
+        from titan_hcl.proxies.agency_proxy import AgencyProxy
         action_result = {
             "action_id": 1, "impulse_id": 7, "posture": "research",
             "helper": "web_search", "success": True, "result": "found",
@@ -144,7 +144,7 @@ class TestAgencyProxyCore(unittest.TestCase):
         self.assertEqual(result["helper"], "web_search")
 
     def test_proxy_handle_intent_returns_none_on_timeout(self):
-        from titan_plugin.proxies.agency_proxy import AgencyProxy
+        from titan_hcl.proxies.agency_proxy import AgencyProxy
         bus = self._make_bus_mock(return_none=True)
         proxy = AgencyProxy(bus)
         result = asyncio.get_event_loop().run_until_complete(
@@ -153,7 +153,7 @@ class TestAgencyProxyCore(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_proxy_handle_intent_returns_none_on_worker_error(self):
-        from titan_plugin.proxies.agency_proxy import AgencyProxy
+        from titan_hcl.proxies.agency_proxy import AgencyProxy
         bus = self._make_bus_mock(response_payload={"error": "boom"})
         proxy = AgencyProxy(bus)
         result = asyncio.get_event_loop().run_until_complete(
@@ -162,7 +162,7 @@ class TestAgencyProxyCore(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_proxy_dispatch_from_nervous_signals_routes_to_bus(self):
-        from titan_plugin.proxies.agency_proxy import AgencyProxy
+        from titan_hcl.proxies.agency_proxy import AgencyProxy
         results = [
             {"action_id": 1, "impulse_id": -1, "posture": "creativity",
              "helper": "art_generate", "success": True, "result": "art.png",
@@ -182,7 +182,7 @@ class TestAgencyProxyCore(unittest.TestCase):
         self.assertEqual(out[0]["helper"], "art_generate")
 
     def test_proxy_dispatch_returns_empty_on_timeout(self):
-        from titan_plugin.proxies.agency_proxy import AgencyProxy
+        from titan_hcl.proxies.agency_proxy import AgencyProxy
         bus = self._make_bus_mock(return_none=True)
         proxy = AgencyProxy(bus)
         out = asyncio.get_event_loop().run_until_complete(
@@ -192,7 +192,7 @@ class TestAgencyProxyCore(unittest.TestCase):
 
     def test_proxy_registry_facade_returns_cached_helpers(self):
         """_handle_impulse reads self._agency._registry.list_helper_names()."""
-        from titan_plugin.proxies.agency_proxy import AgencyProxy
+        from titan_hcl.proxies.agency_proxy import AgencyProxy
         bus = self._make_bus_mock()
         proxy = AgencyProxy(bus)
         proxy.update_cached_stats({
@@ -230,13 +230,13 @@ class TestAssessmentProxyCore(unittest.TestCase):
         return bus
 
     def test_proxy_subscribes_at_construction(self):
-        from titan_plugin.proxies.assessment_proxy import AssessmentProxy
+        from titan_hcl.proxies.assessment_proxy import AssessmentProxy
         bus = self._make_bus_mock()
         AssessmentProxy(bus)
         bus.subscribe.assert_called_once_with("assessment_proxy", reply_only=True)
 
     def test_proxy_assess_routes_to_bus(self):
-        from titan_plugin.proxies.assessment_proxy import AssessmentProxy
+        from titan_hcl.proxies.assessment_proxy import AssessmentProxy
         body_assessment = {
             "action_id": 1, "impulse_id": 7, "score": 0.78,
             "reflection": "ok", "enrichment": {"mind": {0: 0.05}},
@@ -254,7 +254,7 @@ class TestAssessmentProxyCore(unittest.TestCase):
         self.assertEqual(result["threshold_direction"], "lower")
 
     def test_proxy_assess_returns_neutral_on_timeout(self):
-        from titan_plugin.proxies.assessment_proxy import AssessmentProxy
+        from titan_hcl.proxies.assessment_proxy import AssessmentProxy
         bus = self._make_bus_mock(return_none=True)
         proxy = AssessmentProxy(bus)
         result = asyncio.get_event_loop().run_until_complete(
@@ -265,7 +265,7 @@ class TestAssessmentProxyCore(unittest.TestCase):
         self.assertIn("proxy_neutral", result["reflection"])
 
     def test_proxy_assess_returns_neutral_on_worker_error(self):
-        from titan_plugin.proxies.assessment_proxy import AssessmentProxy
+        from titan_hcl.proxies.assessment_proxy import AssessmentProxy
         bus = self._make_bus_mock(response_payload={"error": "scoring crashed"})
         proxy = AssessmentProxy(bus)
         result = asyncio.get_event_loop().run_until_complete(
@@ -275,7 +275,7 @@ class TestAssessmentProxyCore(unittest.TestCase):
         self.assertIn("scoring crashed", result["reflection"])
 
     def test_proxy_update_cached_stats(self):
-        from titan_plugin.proxies.assessment_proxy import AssessmentProxy
+        from titan_hcl.proxies.assessment_proxy import AssessmentProxy
         bus = self._make_bus_mock()
         proxy = AssessmentProxy(bus)
         proxy.update_cached_stats({
@@ -315,7 +315,7 @@ class TestAgencyWorkerHandler(unittest.TestCase):
         return sent
 
     def test_worker_emits_module_ready_and_agency_ready_on_boot(self):
-        from titan_plugin.modules.agency_worker import agency_worker_main
+        from titan_hcl.modules.agency_worker import agency_worker_main
         recv, send = Queue(), Queue()
         recv.put({"type": "MODULE_SHUTDOWN", "src": "guardian", "dst": "agency_worker"})
         with tempfile.TemporaryDirectory() as td:
@@ -329,7 +329,7 @@ class TestAgencyWorkerHandler(unittest.TestCase):
         self.assertIn("helpers", ready_agency[0]["payload"])
 
     def test_worker_handles_handle_intent_query(self):
-        from titan_plugin.modules.agency_worker import agency_worker_main
+        from titan_hcl.modules.agency_worker import agency_worker_main
         recv, send = Queue(), Queue()
         recv.put({
             "type": "QUERY", "src": "test_caller", "dst": "agency_worker",
@@ -366,7 +366,7 @@ class TestAgencyWorkerHandler(unittest.TestCase):
             self.assertEqual(ar["posture"], "meditate")
 
     def test_worker_handles_assess_query(self):
-        from titan_plugin.modules.agency_worker import agency_worker_main
+        from titan_hcl.modules.agency_worker import agency_worker_main
         recv, send = Queue(), Queue()
         recv.put({
             "type": "QUERY", "src": "test", "dst": "agency_worker",
@@ -398,7 +398,7 @@ class TestAgencyWorkerHandler(unittest.TestCase):
         self.assertLessEqual(assessment["score"], 1.0)
 
     def test_worker_handles_dispatch_from_nervous_signals_query(self):
-        from titan_plugin.modules.agency_worker import agency_worker_main
+        from titan_hcl.modules.agency_worker import agency_worker_main
         recv, send = Queue(), Queue()
         recv.put({
             "type": "QUERY", "src": "test", "dst": "agency_worker",
@@ -419,49 +419,15 @@ class TestAgencyWorkerHandler(unittest.TestCase):
         self.assertEqual(len(responses), 1)
         self.assertEqual(responses[0]["payload"].get("action_results"), [])
 
-    def test_worker_handles_agency_stats_query(self):
-        from titan_plugin.modules.agency_worker import agency_worker_main
-        recv, send = Queue(), Queue()
-        recv.put({
-            "type": "QUERY", "src": "test", "dst": "agency_worker",
-            "rid": "rid-stats",
-            "payload": {"action": "agency_stats"},
-            "ts": time.time(),
-        })
-        recv.put({"type": "MODULE_SHUTDOWN", "src": "guardian", "dst": "agency_worker"})
-        with tempfile.TemporaryDirectory() as td:
-            agency_worker_main(recv, send, "agency_worker", self._make_cfg(td))
-        sent = self._drain(send)
-        responses = [m for m in sent if m.get("type") == "RESPONSE"
-                     and m.get("rid") == "rid-stats"]
-        self.assertEqual(len(responses), 1)
-        stats = responses[0]["payload"].get("stats")
-        self.assertIsNotNone(stats)
-        self.assertIn("action_count", stats)
-        self.assertIn("registered_helpers", stats)
-
-    def test_worker_handles_assessment_stats_query(self):
-        from titan_plugin.modules.agency_worker import agency_worker_main
-        recv, send = Queue(), Queue()
-        recv.put({
-            "type": "QUERY", "src": "test", "dst": "agency_worker",
-            "rid": "rid-asstats",
-            "payload": {"action": "assessment_stats"},
-            "ts": time.time(),
-        })
-        recv.put({"type": "MODULE_SHUTDOWN", "src": "guardian", "dst": "agency_worker"})
-        with tempfile.TemporaryDirectory() as td:
-            agency_worker_main(recv, send, "agency_worker", self._make_cfg(td))
-        sent = self._drain(send)
-        responses = [m for m in sent if m.get("type") == "RESPONSE"
-                     and m.get("rid") == "rid-asstats"]
-        self.assertEqual(len(responses), 1)
-        stats = responses[0]["payload"].get("stats")
-        self.assertIn("total", stats)
-        self.assertIn("avg_score", stats)
+    # Phase C Session 5 §4.D.4 (rFP_phase_c_async_shm_consumer_migration):
+    # agency_stats + assessment_stats bus QUERY handlers RETIRED. Stats
+    # read via SHM-direct agency_state.bin + assessment_state.bin (Session 3
+    # §4.B.2 + §4.B.3 publishers). Tests for the retired handlers deleted
+    # along with the handlers themselves; the new SHM read paths are tested
+    # in tests/test_state_accessor.py + tests/test_session3_state_publishers.py.
 
     def test_worker_handles_unknown_action_gracefully(self):
-        from titan_plugin.modules.agency_worker import agency_worker_main
+        from titan_hcl.modules.agency_worker import agency_worker_main
         recv, send = Queue(), Queue()
         recv.put({
             "type": "QUERY", "src": "test", "dst": "agency_worker",
@@ -485,9 +451,9 @@ class TestAgencyWorkerHandler(unittest.TestCase):
 class TestPluginFlagRouting(unittest.TestCase):
     def test_boot_agency_has_both_paths(self):
         """_boot_agency contains flag-on (proxy) and flag-off (local) branches."""
-        from titan_plugin.core.plugin import TitanPlugin
+        from titan_hcl.core.plugin import TitanHCL
         import inspect
-        src = inspect.getsource(TitanPlugin._boot_agency)
+        src = inspect.getsource(TitanHCL._boot_agency)
         self.assertIn("a8_agency_subprocess_enabled", src)
         self.assertIn("AgencyProxy", src)
         self.assertIn("AssessmentProxy", src)
@@ -496,9 +462,9 @@ class TestPluginFlagRouting(unittest.TestCase):
         self.assertIn("SelfAssessment", src)
 
     def test_module_spec_registered_with_flag_aware_autostart(self):
-        from titan_plugin.core.plugin import TitanPlugin
+        from titan_hcl.core.plugin import TitanHCL
         import inspect
-        src = inspect.getsource(TitanPlugin)
+        src = inspect.getsource(TitanHCL)
         self.assertIn('name="agency_worker"', src)
         self.assertIn('layer="L3"', src)
         self.assertIn("autostart=_ag_subproc_enabled", src)
@@ -506,9 +472,9 @@ class TestPluginFlagRouting(unittest.TestCase):
 
     def test_agency_loop_handles_stats_broadcasts(self):
         """_agency_loop refreshes proxy cached stats on AGENCY_STATS / ASSESSMENT_STATS."""
-        from titan_plugin.core.plugin import TitanPlugin
+        from titan_hcl.core.plugin import TitanHCL
         import inspect
-        src = inspect.getsource(TitanPlugin._agency_loop)
+        src = inspect.getsource(TitanHCL._agency_loop)
         self.assertIn("AGENCY_STATS", src)
         self.assertIn("ASSESSMENT_STATS", src)
         self.assertIn("AGENCY_READY", src)
@@ -518,7 +484,7 @@ class TestPluginFlagRouting(unittest.TestCase):
         """titan_params.toml has the flag with docstring. Original ship default
         was false; flag flipped to true 2026-04-28 PM after fleet validation
         (see rFP_microkernel_phase_a8 + ROADMAP flag-state table)."""
-        params_path = os.path.join(_ROOT, "titan_plugin", "titan_params.toml")
+        params_path = os.path.join(_ROOT, "titan_hcl", "titan_params.toml")
         with open(params_path) as f:
             content = f.read()
         self.assertIn("a8_agency_subprocess_enabled", content)

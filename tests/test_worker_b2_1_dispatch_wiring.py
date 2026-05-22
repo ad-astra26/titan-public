@@ -8,7 +8,7 @@ Two layers of verification:
      messages or when no state is registered.
 
   2. **AST drift guard** — every `*_worker_main` entry_fn in
-     titan_plugin/modules/ contains a call to
+     titan_hcl/modules/ contains a call to
      `worker_swap_handler.maybe_dispatch_swap_msg(...)` inside its body.
      Catches future regressions where someone forgets to wire B.2.1 into
      a new worker.
@@ -16,7 +16,7 @@ Two layers of verification:
 Wiring contract (per worker, after recv_queue.get → msg, after _b1_reporter
 dispatch, before worker-specific elif chain):
 
-    from titan_plugin.core import worker_swap_handler as _swap
+    from titan_hcl.core import worker_swap_handler as _swap
     if _swap.maybe_dispatch_swap_msg(msg):
         continue
 """
@@ -29,10 +29,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from titan_plugin import bus
-from titan_plugin.core import worker_swap_handler
-from titan_plugin.core.worker_lifecycle import WatcherState
-from titan_plugin.core.worker_swap_handler import (
+from titan_hcl import bus
+from titan_hcl.core import worker_swap_handler
+from titan_hcl.core.worker_lifecycle import WatcherState
+from titan_hcl.core.worker_swap_handler import (
     SwapHandlerState,
     maybe_dispatch_swap_msg,
     set_active_swap_state,
@@ -122,7 +122,7 @@ def test_dispatch_missing_type_field_safe():
 
 
 WORKERS_DIR = (
-    Path(__file__).parent.parent / "titan_plugin" / "modules"
+    Path(__file__).parent.parent / "titan_hcl" / "modules"
 )
 
 EXPECTED_WORKERS = {

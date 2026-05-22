@@ -12,7 +12,7 @@ import os
 # Ensure the project root is in path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from titan_plugin.expressive.social import SocialManager
+from titan_hcl.expressive.social import SocialManager
 
 async def test_smart_login_logic():
     print("Testing Smart Login logic...")

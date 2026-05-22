@@ -16,7 +16,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from titan_plugin.api.dashboard import router as dashboard_router
+from titan_hcl.api.dashboard import router as dashboard_router
 
 
 class _OuterState:
@@ -46,6 +46,21 @@ class _FakeCache:
         return self._d.get(key, default)
 
 
+class _NullAccessor:
+    """Empty accessor stub — every method (read_*/get_*) returns None so
+    /v3/trinity falls through to its defaults (inner → [0.5]*N) and the
+    outer_state path (outer → plugin.outer_state). Added 2026-05-22: the
+    dashboard now reads inner/outer tensors via `titan_state.shm.read_*` and
+    spirit metadata via `titan_state.spirit.get_sphere_clocks()` (canonical
+    Phase C SHM-direct path, TitanStateAccessor.shm/.spirit — always present in
+    production). This fixture predated that and modeled spirit/body/mind as
+    None, so the endpoint 500'd on the missing attrs."""
+
+    def __getattr__(self, _name):
+        # Any read_*/get_* method → callable returning None (cache/shm miss).
+        return lambda *a, **k: None
+
+
 class _FakePlugin:
     """Real-attribute plugin stub. Post-S5-amendment dashboard reads via
     `titan_state.cache.get(...)` and `titan_state.body / .mind / .spirit`,
@@ -56,7 +71,11 @@ class _FakePlugin:
         self.cache = _FakeCache()
         self.body = None
         self.mind = None
-        self.spirit = None
+        # Phase C: dashboard reads titan_state.shm.read_* + .spirit.get_* — both
+        # are always-present accessors in production (TitanStateAccessor); model
+        # them as null accessors (return None) to exercise the fallback paths.
+        self.spirit = _NullAccessor()
+        self.shm = _NullAccessor()
         self._proxies = {}
         if outer_state is not None:
             self.outer_state = outer_state
@@ -79,6 +98,12 @@ def app_client():
     app = FastAPI()
     app.include_router(dashboard_router)
 
+    # Phase E: mount the v6 roof + legacy /v3,/v4→/v6 redirects so
+    # deprecated paths resolve via 301/308 to the live v6 handler.
+    from titan_hcl.api.v6 import router as _v6_router
+    from titan_hcl.api.v6_deprecation import router as _v6_dep_router
+    app.include_router(_v6_router)
+    app.include_router(_v6_dep_router)
     plugin = _FakePlugin(outer_state=_OuterState(
         outer_body=[0.234, 0.847, 0.735, 0.051, 0.522],
         outer_mind_15d=[0.6] * 15,
@@ -86,41 +111,45 @@ def app_client():
     ))
 
     # S5-amendment (2026-04-25): dashboard reads `app.state.titan_state`;
-    # legacy `titan_plugin` kept as alias for un-migrated callers. Set both
+    # legacy `titan_hcl` kept as alias for un-migrated callers. Set both
     # so the fixture works regardless of which attribute the endpoint reads.
-    app.state.titan_plugin = plugin
+    app.state.titan_hcl = plugin
     app.state.titan_state = plugin
 
     with TestClient(app) as client:
         yield client, plugin
 
 
-def test_v3_trinity_falls_back_to_state_register_when_cache_misses(app_client):
-    """When coordinator cache lacks consciousness, endpoint reads outer_state
-    directly instead of returning [0.5]*5 defaults."""
-    client, _ = app_client
+def test_v3_trinity_reads_outer_tensors_shm_direct(app_client):
+    """Phase C canonical (D-SPEC-82, 2026-05-22): /v3/trinity reads the outer
+    tensors SHM-direct via `titan_state.shm.read_outer_*` (Rust-owned slots) —
+    the values flow to the response. (Supersedes the 2026-04-23 Phase-1 test of
+    the legacy `plugin.outer_state` fallback: the bus-cache pipeline that path
+    backstopped was retired at D-SPEC-82, and `plugin.outer_state` is no longer
+    a production attribute — the outer read is now shm-first.)"""
+    client, plugin = app_client
 
-    # Prime the tensor cache (warmer thread lazy-starts on first call). Wait
-    # briefly for at least one warmer cycle to populate body/mind/spirit data.
+    # Replace the null shm with one returning real outer tensors (Rust slots
+    # populated). Inner reads stay None → inner defaults; outer flows through.
+    class _OuterDataShm:
+        _DATA = {
+            "read_outer_body_5d": {"values": [0.234, 0.847, 0.735, 0.051, 0.522]},
+            "read_outer_mind_15d": {"values": [0.6] * 15},
+            "read_outer_spirit_45d": {"values": [0.7] * 45},
+        }
+
+        def __getattr__(self, name):
+            return lambda *a, **k: self._DATA.get(name)
+
+    plugin.shm = _OuterDataShm()
+
     resp = client.get("/v3/trinity")
     assert resp.status_code == 200
-    # Second call ensures warmed cache
-    resp = client.get("/v3/trinity")
-    assert resp.status_code == 200
-
     data = resp.json()["data"]
-    ob = data.get("outer_body", [])
-    om = data.get("outer_mind", [])
-    os = data.get("outer_spirit", [])
-
-    # THE FIX: with no 130D state_vector, outer_body must come from
-    # plugin.outer_state.outer_body, not the in-function [0.5]*5 default.
-    assert ob == [0.234, 0.847, 0.735, 0.051, 0.522], \
-        f"outer_body did NOT fall back to state_register.outer_body — got {ob}"
-    assert om == [0.6] * 15, \
-        f"outer_mind did NOT fall back to state_register.outer_mind_15d — got {om}"
-    assert os == [0.7] * 45, \
-        f"outer_spirit did NOT fall back to state_register.outer_spirit_45d — got {os}"
+    assert data.get("outer_body") == [0.234, 0.847, 0.735, 0.051, 0.522], \
+        f"outer_body did NOT come from shm.read_outer_body_5d — got {data.get('outer_body')}"
+    assert data.get("outer_mind") == [0.6] * 15
+    assert data.get("outer_spirit") == [0.7] * 45
 
 
 def test_state_vector_path_precedence_verified_in_code():
@@ -133,7 +162,7 @@ def test_state_vector_path_precedence_verified_in_code():
     coordinator cache lacks the 130D state_vector.
     """
     import inspect
-    from titan_plugin.api import dashboard
+    from titan_hcl.api import dashboard
     src = inspect.getsource(dashboard.get_v3_trinity)
     # State_vector path must set the flag
     assert "state_vector_available = True" in src, \

@@ -1,5 +1,5 @@
 """
-Tests for titan_plugin.core.shadow_protocol — B.1 §2.
+Tests for titan_hcl.core.shadow_protocol — B.1 §2.
 
 Covers dataclass round-trips, msgpack serialization, compatibility checks,
 event_id generation, and SHA-256 file checksums.
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from titan_plugin.core import shadow_protocol as sp
+from titan_hcl.core import shadow_protocol as sp
 
 
 # ── Constants (smoke-test the canonical values) ────────────────────

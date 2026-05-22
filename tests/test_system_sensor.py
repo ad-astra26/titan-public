@@ -1,4 +1,4 @@
-"""Unit tests for titan_plugin.utils.system_sensor.
+"""Unit tests for titan_hcl.utils.system_sensor.
 
 Runs in its own pytest process per project convention (TorchRL mmap).
 """
@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from titan_plugin.utils import system_sensor as ss
+from titan_hcl.utils import system_sensor as ss
 
 
 @pytest.fixture(autouse=True)
@@ -83,10 +83,21 @@ def test_cpu_thermal_reads_sys_class():
 
 
 def test_cpu_thermal_fallback_when_unavailable():
-    """No /sys/class/thermal → return 0.5 neutral."""
-    with patch("os.path.isdir", return_value=False):
+    """No /sys/class/thermal → fall back to CPU load-average proxy (v1.36.3).
+
+    Heat ∝ work: the flat 0.5 non-signal that froze cpu_thermal-gated dims
+    (env_adapt >0.6 gate, inner_smell ambient stddev) is replaced by the
+    1-min load-average. Load 3.0 on 4 cores = 0.75 proves the proxy is
+    live (not the old constant 0.5).
+    """
+    # Reset both TTL caches so the patched values are observed fresh.
+    ss._cpu_thermal_cache._value = None
+    ss._cpu_load_cache._value = None
+    with patch("os.path.isdir", return_value=False), \
+         patch("os.getloadavg", return_value=(3.0, 3.0, 3.0)), \
+         patch("os.cpu_count", return_value=4):
         thermal = ss.get_cpu_thermal()
-    assert thermal == 0.5
+    assert abs(thermal - 0.75) < 0.01, f"expected load-proxy 0.75, got {thermal}"
 
 
 def test_circadian_phase_peak_midday():

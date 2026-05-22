@@ -1,6 +1,6 @@
 """Tests for the Expression Translation Layer (Phase E)."""
 import pytest
-from titan_plugin.logic.expression_translator import (
+from titan_hcl.logic.expression_translator import (
     ExpressionTranslator, FeedbackRouter, MIN_CONFIDENCE,
 )
 
@@ -97,7 +97,7 @@ class TestExpressionTranslator:
 
 class TestFeedbackRouter:
     def test_positive_outcome_reduces_pressure(self):
-        from titan_plugin.logic.hormonal_pressure import HormonalSystem
+        from titan_hcl.logic.hormonal_pressure import HormonalSystem
         hs = HormonalSystem(["CREATIVITY"])
         hs.get_hormone("CREATIVITY").level = 1.0
         hs.get_hormone("CREATIVITY").refractory = 0.0
@@ -114,7 +114,7 @@ class TestFeedbackRouter:
         assert hs.get_hormone("CREATIVITY").level < 0.5
 
     def test_negative_outcome_partial_relief(self):
-        from titan_plugin.logic.hormonal_pressure import HormonalSystem
+        from titan_hcl.logic.hormonal_pressure import HormonalSystem
         hs = HormonalSystem(["CURIOSITY"])
         hs.get_hormone("CURIOSITY").level = 1.0
         hs.get_hormone("CURIOSITY").refractory = 0.0
@@ -131,7 +131,7 @@ class TestFeedbackRouter:
         assert 0.5 < hs.get_hormone("CURIOSITY").level < 1.0
 
     def test_translator_learns_from_feedback(self):
-        from titan_plugin.logic.hormonal_pressure import HormonalSystem
+        from titan_hcl.logic.hormonal_pressure import HormonalSystem
         hs = HormonalSystem(["CREATIVITY"])
         translator = ExpressionTranslator()
         router = FeedbackRouter(hs, translator)
@@ -147,7 +147,7 @@ class TestFeedbackRouter:
         assert new_score > old_score
 
     def test_no_crash_on_missing_program(self):
-        from titan_plugin.logic.hormonal_pressure import HormonalSystem
+        from titan_hcl.logic.hormonal_pressure import HormonalSystem
         hs = HormonalSystem(["FOCUS"])
         translator = ExpressionTranslator()
         router = FeedbackRouter(hs, translator)

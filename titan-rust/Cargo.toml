@@ -31,7 +31,12 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# MSRV bumped 1.75 → 1.87 on 2026-05-12 to align declared compat window with
+# the codebase's actual usage: `f32::abs` const-fn (stabilized 1.85),
+# `f32::round_ties_even` (1.77), and `u64::is_multiple_of` (1.87). Production
+# deploys via stable (currently 1.95); CI uses dtolnay/rust-toolchain@stable.
+# 1.75 was aspirational; we have not in fact supported it for some time.
+rust-version = "1.87"
 authors = ["Titan Architect <hello@iamtitan.tech>"]
 license = "Proprietary"
 

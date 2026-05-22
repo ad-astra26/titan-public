@@ -13,7 +13,7 @@ Covers:
 
 Reference:
   - titan-docs/PLAN_microkernel_phase_a_s6.md §5.1
-  - titan_plugin/guardian.py (ModuleSpec + start() context branch)
+  - titan_hcl/guardian.py (ModuleSpec + start() context branch)
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import pickle
 
 import pytest
 
-from titan_plugin.guardian import ModuleSpec
+from titan_hcl.guardian import ModuleSpec
 
 
 def _noop():
@@ -103,8 +103,8 @@ def test_unknown_method_in_get_context_raises():
 
 def test_guardian_register_accepts_spawn_spec():
     """Guardian.register() doesn't reject spawn-method specs."""
-    from titan_plugin.bus import DivineBus
-    from titan_plugin.guardian import Guardian
+    from titan_hcl.bus import DivineBus
+    from titan_hcl.guardian import Guardian
 
     bus = DivineBus(maxsize=100)
     g = Guardian(bus)

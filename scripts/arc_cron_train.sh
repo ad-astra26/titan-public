@@ -71,7 +71,7 @@ esac
 NOW=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
 echo "[$NOW] ARC training: game=$GAME (slot=$SLOT from hour=$HOUR)  dir=$TITAN_DIR"
 
-# Check if titan_main is running (use API health check, not just process check)
+# Check if titan_hcl is running (use API health check, not just process check)
 API_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://127.0.0.1:7777/health" 2>/dev/null || echo "000")
 if [ "$API_STATUS" != "200" ]; then
     echo "[$NOW] Titan API not healthy (HTTP $API_STATUS) — skipping ARC training"

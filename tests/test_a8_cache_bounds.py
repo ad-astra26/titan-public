@@ -19,31 +19,38 @@ from collections import OrderedDict, deque
 
 
 class TestDreamInboxBound(unittest.TestCase):
-    """A.8.1.1 — _dream_inbox is a deque(maxlen=256) in plugin.__init__."""
+    """A.8.1.1 — the chat-during-dream inbox is a bounded deque.
 
-    def test_plugin_dream_inbox_is_bounded_deque(self):
-        """V6 path: TitanPlugin.__init__ creates deque(maxlen=256)."""
-        from titan_plugin.core.plugin import TitanPlugin
-        # Construct minimal plugin (no kernel reference required for inbox check).
-        # __init__ takes a kernel parameter; we don't need the kernel for this test,
-        # so we mock-construct with a placeholder. The inbox is set unconditionally.
-        # This test inspects the construction path rather than runtime behavior.
-        import inspect
-        src = inspect.getsource(TitanPlugin.__init__)
-        # Verify the implementation declares deque(maxlen=256), not unbounded list.
-        self.assertIn("deque(maxlen=256)", src,
-                      "plugin.__init__ must use deque(maxlen=256) for _dream_inbox")
-        self.assertNotIn("self._dream_inbox = []", src,
-                         "plugin.__init__ must not initialize _dream_inbox to []")
+    v1.8.2 / D-SPEC-56 (rFP_titan_hcl_l2_separation_strategy §4.I): ownership
+    of `_dream_inbox` moved OUT of TitanHCL.__init__ into the
+    dream_state_worker subprocess (G21 single writer). The bound therefore
+    lives in dream_state_worker.py now (deque(maxlen=DREAM_INBOX_MAX_ENTRIES),
+    capped at 50), not in plugin.__init__."""
 
-    def test_legacy_core_dream_inbox_is_bounded_deque(self):
-        """Legacy path: TitanCore.__init__ also uses deque(maxlen=256)."""
-        from titan_plugin.legacy_core import TitanCore
+    def test_dream_state_worker_inbox_is_bounded_deque(self):
+        """dream_state_worker bounds the chat-during-dream inbox with
+        deque(maxlen=DREAM_INBOX_MAX_ENTRIES) — the migrated A.8.1.1 cache
+        bound (was plugin._dream_inbox pre-D-SPEC-56)."""
+        from titan_hcl import _phase_c_constants
         import inspect
-        src = inspect.getsource(TitanCore.__init__)
-        self.assertIn("deque(maxlen=256)", src,
-                      "legacy_core.__init__ must use deque(maxlen=256)")
-        self.assertNotIn("self._dream_inbox = []", src)
+        from titan_hcl.modules import dream_state_worker
+        src = inspect.getsource(dream_state_worker)
+        self.assertIn("deque(maxlen=DREAM_INBOX_MAX_ENTRIES)", src,
+                      "dream_state_worker must bound the inbox with "
+                      "deque(maxlen=DREAM_INBOX_MAX_ENTRIES)")
+        # The cap must be a finite, sane bound.
+        self.assertGreater(_phase_c_constants.DREAM_INBOX_MAX_ENTRIES, 0)
+
+    def test_plugin_no_longer_owns_dream_inbox(self):
+        """Regression guard for D-SPEC-56: TitanHCL.__init__ must NOT
+        re-create a parent-owned _dream_inbox (would re-introduce a second
+        writer of dream state, violating G21)."""
+        from titan_hcl.core.plugin import TitanHCL
+        import inspect
+        src = inspect.getsource(TitanHCL.__init__)
+        self.assertNotIn("self._dream_inbox", src,
+                         "plugin.__init__ must not own _dream_inbox — "
+                         "dream_state_worker owns it (G21, D-SPEC-56)")
 
     def test_deque_evicts_oldest_at_overflow(self):
         """deque(maxlen=256) auto-evicts oldest when exceeding bound."""
@@ -77,7 +84,7 @@ class TestAgencyHistoryBound(unittest.TestCase):
 
     def test_history_field_is_bounded_deque(self):
         """AgencyModule.__init__ declares _history as deque(maxlen=50)."""
-        from titan_plugin.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.module import AgencyModule
         import inspect
         src = inspect.getsource(AgencyModule.__init__)
         self.assertIn("deque(maxlen=50)", src)
@@ -85,7 +92,7 @@ class TestAgencyHistoryBound(unittest.TestCase):
 
     def test_record_action_no_longer_manually_trims(self):
         """The record-action helper no longer needs `self._history = self._history[-50:]`."""
-        from titan_plugin.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.module import AgencyModule
         import inspect
         src = inspect.getsource(AgencyModule)
         # The manual trim line should be gone.
@@ -108,7 +115,7 @@ class TestBusTimeoutWarnedAtBound(unittest.TestCase):
 
     def test_field_is_ordered_dict(self):
         """DivineBus.__init__ creates OrderedDict, not regular dict."""
-        from titan_plugin.bus import DivineBus
+        from titan_hcl.bus import DivineBus
         bus = DivineBus()
         self.assertIsInstance(bus._timeout_warned_at, OrderedDict)
         self.assertEqual(bus._TIMEOUT_WARNED_MAX, 2048)
@@ -117,7 +124,7 @@ class TestBusTimeoutWarnedAtBound(unittest.TestCase):
         """When _timeout_warned_at exceeds 2048, oldest pair is evicted (FIFO)."""
         # Manually exercise the eviction logic (we don't need a real timeout to fire).
         # Use the same dict the bus uses.
-        from titan_plugin.bus import DivineBus
+        from titan_hcl.bus import DivineBus
         bus = DivineBus()
         bus._TIMEOUT_WARNED_MAX = 5  # shrink for test speed
         for i in range(8):
@@ -134,7 +141,7 @@ class TestBusTimeoutWarnedAtBound(unittest.TestCase):
 
     def test_repeated_pair_does_not_count_twice(self):
         """Same (src, dst) pair stays as one entry, just gets re-ordered."""
-        from titan_plugin.bus import DivineBus
+        from titan_hcl.bus import DivineBus
         bus = DivineBus()
         bus._TIMEOUT_WARNED_MAX = 3
         # Insert 3 distinct pairs.
@@ -158,16 +165,20 @@ class TestSkippedFixes(unittest.TestCase):
     """Audit notes for the 3 rFP items that turned out NOT to need fixing."""
 
     def test_agno_history_runs_already_config_bounded(self):
-        """agno session in agent.py uses num_history_runs from config (default 5)."""
-        from titan_plugin import agent
+        """agno session uses num_history_runs from config (default 5).
+
+        The agno agent construction moved from titan_hcl/agent.py into
+        titan_hcl/modules/agno_agent_factory.py during the Phase C L2
+        carve-out; the config-bounded history invariant lives there now."""
+        from titan_hcl.modules import agno_agent_factory
         import inspect
-        src = inspect.getsource(agent)
+        src = inspect.getsource(agno_agent_factory)
         self.assertIn("num_history_runs", src)
         self.assertIn("history_runs", src)
 
     def test_output_verifier_has_no_signature_cache(self):
         """OutputVerifier has no signature cache attribute — stateless per-call."""
-        from titan_plugin.logic.output_verifier import OutputVerifier
+        from titan_hcl.logic.output_verifier import OutputVerifier
         # Inspect __init__ signature for any signature-cache attribute.
         import inspect
         src = inspect.getsource(OutputVerifier.__init__)
@@ -178,7 +189,7 @@ class TestSkippedFixes(unittest.TestCase):
 
     def test_reflex_collector_has_no_events_buffer(self):
         """ReflexCollector accumulates no events — only cooldowns + executors."""
-        from titan_plugin.logic.reflexes import ReflexCollector
+        from titan_hcl.logic.reflexes import ReflexCollector
         rc = ReflexCollector()
         # Only these state attributes exist; no _events / _buffer.
         self.assertTrue(hasattr(rc, "_cooldowns"))

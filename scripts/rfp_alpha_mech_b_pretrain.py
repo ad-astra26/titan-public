@@ -70,7 +70,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np  # noqa: E402
 
-from titan_plugin.logic.reasoning import StepValueNet  # noqa: E402
+from titan_hcl.logic.reasoning import StepValueNet  # noqa: E402
 
 
 STAGED_FILENAME = "value_head.json.pretrained"
@@ -80,7 +80,7 @@ MAIN_FILENAME = "value_head.json"
 def _t1_running() -> bool:
     try:
         r = subprocess.run(
-            ["pgrep", "-f", "titan_main"],
+            ["pgrep", "-f", "titan_hcl"],
             capture_output=True, text=True, timeout=3)
         return r.returncode == 0 and bool(r.stdout.strip())
     except Exception:
@@ -143,7 +143,7 @@ def _load_rows(db_path: str, since_ts: float, max_rows: int = 50000,
 def _load_engine_cfg() -> dict:
     """Read policy_input_dim + Mech B params from titan_params.toml."""
     import tomllib
-    with open("titan_plugin/titan_params.toml", "rb") as f:
+    with open("titan_hcl/titan_params.toml", "rb") as f:
         params = tomllib.load(f)
     reasoning = params.get("reasoning", {})
     rr = params.get("reasoning_rewards", {})
@@ -336,7 +336,7 @@ def main() -> int:
     print()
     print("  Next steps:")
     print(f"    1. Review: less {staged_path}")
-    print(f"    2. Stop T1: pkill -9 -f scripts/titan_main")
+    print(f"    2. Stop T1: pkill -9 -f scripts/titan_hcl")
     print(f"    3. Deploy: python {__file__} --deploy")
     print(f"    4. Start T1 — engine loads pre-trained weights")
     return 0

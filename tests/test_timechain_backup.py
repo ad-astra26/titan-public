@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from titan_plugin.logic.timechain_backup import TimeChainBackup
+from titan_hcl.logic.timechain_backup import TimeChainBackup
 
 
 class _MockArweave:
@@ -49,12 +49,12 @@ def tc_dir(tmp_path, monkeypatch):
     rFP fixes this by making MANIFEST_PATH per-Titan; until then, tests must
     monkeypatch MANIFEST_PATH + CWD to avoid pollution.
     """
-    import titan_plugin.logic.timechain_backup as tcb_mod
+    import titan_hcl.logic.timechain_backup as tcb_mod
     isolated_manifest = str(tmp_path / "arweave_manifest_test.json")
     monkeypatch.setattr(tcb_mod, "MANIFEST_PATH", isolated_manifest)
     monkeypatch.chdir(tmp_path)
 
-    from titan_plugin.logic.timechain import TimeChain
+    from titan_hcl.logic.timechain import TimeChain
     tc = TimeChain(data_dir=str(tmp_path), titan_id="T1")
     if not tc.has_genesis:
         tc.create_genesis({"prime_directives": ["Sovereign Integrity"], "titan_id": "T1"})
@@ -148,14 +148,14 @@ def test_restore_from_json_preserved_for_backward_compat():
 def test_legacy_MANIFEST_PATH_constant_unchanged():
     """Module-level MANIFEST_PATH stays for legacy callers (resurrect_timechain.py)
     and test monkeypatching. Per-Titan logic is in _manifest_path()."""
-    from titan_plugin.logic.timechain_backup import MANIFEST_PATH
+    from titan_hcl.logic.timechain_backup import MANIFEST_PATH
     assert MANIFEST_PATH == "data/timechain/arweave_manifest.json"
 
 
 def test_per_titan_manifest_path_T1(tmp_path, monkeypatch):
     """_manifest_path() returns arweave_manifest_T1.json when no monkeypatch."""
     monkeypatch.chdir(tmp_path)
-    from titan_plugin.logic.timechain_backup import _manifest_path
+    from titan_hcl.logic.timechain_backup import _manifest_path
     assert _manifest_path("T1").endswith("arweave_manifest_T1.json")
     assert _manifest_path("T2").endswith("arweave_manifest_T2.json")
     assert _manifest_path("T3").endswith("arweave_manifest_T3.json")
@@ -168,7 +168,7 @@ def test_per_titan_manifest_migration_from_legacy(tmp_path, monkeypatch):
     legacy = tmp_path / "data" / "timechain" / "arweave_manifest.json"
     legacy.write_text('{"titan_id": "T1", "snapshots": [{"tx_id": "HIST"}], "total_snapshots": 1}')
 
-    from titan_plugin.logic.timechain_backup import _manifest_path
+    from titan_hcl.logic.timechain_backup import _manifest_path
     new_path = _manifest_path("T1")
     # Migration side-effect: new per-Titan file now exists with same content
     import os
@@ -180,11 +180,11 @@ def test_per_titan_manifest_migration_from_legacy(tmp_path, monkeypatch):
 
 def test_per_titan_manifest_no_cross_contamination(tmp_path, monkeypatch):
     """T1 writes must not appear in T2's manifest."""
-    import titan_plugin.logic.timechain_backup as tcb_mod
+    import titan_hcl.logic.timechain_backup as tcb_mod
     # Reset module-level override so real per-Titan logic is used
     monkeypatch.setattr(tcb_mod, "MANIFEST_PATH", "data/timechain/arweave_manifest.json")
     monkeypatch.chdir(tmp_path)
-    from titan_plugin.logic.timechain import TimeChain
+    from titan_hcl.logic.timechain import TimeChain
     # Create two Titans sharing a data_dir but different titan_id manifests
     tc = TimeChain(data_dir=str(tmp_path), titan_id="T1")
     tc.create_genesis({"prime_directives": ["Sovereign Integrity"], "titan_id": "T1"})

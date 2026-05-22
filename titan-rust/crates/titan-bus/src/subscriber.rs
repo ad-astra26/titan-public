@@ -58,8 +58,21 @@ impl CoalesceKey {
 /// the broker level.
 pub struct BrokerSubscriber {
     /// Module/worker name (e.g. `"inner-body"`, `"reasoning"`); used as
-    /// bus `dst` field for fanout.
+    /// bus `dst` field for fanout. Primary name — first BUS_SUBSCRIBE
+    /// from this connection sets it (replacing the initial "anon-N").
     pub name: String,
+
+    /// Additional names this connection is subscribed under. Set via
+    /// subsequent BUS_SUBSCRIBE frames AFTER the primary name is set;
+    /// fanout matches `dst` against both `name` and `aliases`. Closes
+    /// BUG-PHASE-C-BUS-FANOUT-MULTI-NAME-20260512: kernel-side proxy
+    /// reply queues (output_verifier_proxy, agency_proxy, …) need
+    /// RESPONSE messages routed to the parent's titan_HCL bus client
+    /// without spawning a separate connection per proxy. The Python
+    /// titan_HCL client now fires N BUS_SUBSCRIBE frames over its
+    /// single connection — the broker treats subscribes 2..N as alias
+    /// additions instead of replacing the primary name.
+    pub aliases: HashSet<String>,
 
     /// Per-connection bounded queue (P0 reserve + main region).
     pub ring: BoundedRing,
@@ -71,6 +84,20 @@ pub struct BrokerSubscriber {
 
     /// Topics this client subscribed to (`BUS_SUBSCRIBE` payload).
     pub subscribed_topics: HashSet<String>,
+
+    /// D-SPEC-42 (SPEC v1.4.0, 2026-05-12) — subscriber intent flag.
+    ///
+    /// When `true`, this subscriber receives ONLY targeted `dst=<name>`
+    /// (or `dst=<alias>`) messages — never `dst="all"` broadcasts.
+    /// Broker `fanout` silently skips reply_only subscribers from the
+    /// broadcast fan-out (no enqueue, no warn, no drop counter — they
+    /// are not in the broadcast contract by design).
+    ///
+    /// Mirrors Python `BusSocketServer.BrokerSubscriber.reply_only`.
+    /// Set from the BUS_SUBSCRIBE payload's `reply_only` field by
+    /// `decode_bus_subscribe_payload`. Connection-level property:
+    /// last BUS_SUBSCRIBE value sent on a multi-name subscribe wins.
+    pub reply_only: bool,
 
     /// Last `BUS_PONG` reception time. Broker checks against
     /// `BUS_PING_TIMEOUT_S` to detect dead connections.
@@ -99,9 +126,11 @@ impl BrokerSubscriber {
         let now = SystemTime::now();
         Self {
             name: name.into(),
+            aliases: HashSet::new(),
             ring: BoundedRing::with_defaults(),
             coalesce_index: HashSet::new(),
             subscribed_topics: HashSet::new(),
+            reply_only: false,
             last_pong_ts: now,
             drop_count_60s: 0,
             recv_count_60s: 0,
@@ -116,9 +145,11 @@ impl BrokerSubscriber {
         let now = SystemTime::now();
         Self {
             name: name.into(),
+            aliases: HashSet::new(),
             ring,
             coalesce_index: HashSet::new(),
             subscribed_topics: HashSet::new(),
+            reply_only: false,
             last_pong_ts: now,
             drop_count_60s: 0,
             recv_count_60s: 0,

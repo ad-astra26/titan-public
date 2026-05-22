@@ -2,7 +2,7 @@
 import os
 import pytest
 import tempfile
-from titan_plugin.logic.grammar_validator import GrammarValidator, GrammarRule
+from titan_hcl.logic.grammar_validator import GrammarValidator, GrammarRule
 
 
 @pytest.fixture

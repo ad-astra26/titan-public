@@ -1,0 +1,341 @@
+"""
+api/webhook.py
+Helius webhook receiver for on-chain transactions.
+
+Handles three transaction types:
+  1. DI: (Maker directive) — verified Ed25519 signature, triggers soul evolution
+  2. I: (Public inspiration) — anyone can inspire Titan via Memo TX, weighted by SOL
+  3. SOL transfer — donation detection, mood boost, gratitude response
+"""
+import logging
+import time
+
+from fastapi import APIRouter, Request, HTTPException
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/webhook", tags=["Webhooks"])
+
+
+def _get_plugin(request: Request):
+    return request.app.state.titan_hcl
+
+
+@router.post("/helius")
+async def helius_webhook(request: Request):
+    """
+    Receive Helius Enhanced Transaction webhook.
+
+    Expected payload (Helius enhanced format):
+    [
+      {
+        "type": "MEMO",
+        "source": "SYSTEM_PROGRAM",
+        "signature": "...",
+        "accountData": [...],
+        "instructions": [
+          {"programId": "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr", "data": "..."}
+        ],
+        ...
+      }
+    ]
+
+    Security: Verifies the TX signer matches the configured maker_pubkey,
+    and the memo contains a valid Ed25519 signature from the Maker.
+    """
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias for Category C callsites
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body.")
+
+    # Helius sends an array of transactions
+    if not isinstance(body, list):
+        body = [body]
+
+    processed = 0
+    errors = []
+
+    for tx in body:
+        try:
+            result = await _process_transaction(plugin, tx)
+            if result:
+                processed += 1
+        except Exception as e:
+            logger.warning("[Webhook] TX processing error: %s", e)
+            errors.append(str(e))
+
+    return {
+        "status": "ok",
+        "processed": processed,
+        "errors": errors[:5],  # Cap error list
+    }
+
+
+async def _process_transaction(plugin, tx: dict) -> bool:
+    """
+    Process a single Helius enhanced transaction.
+    Routes to appropriate handler based on memo prefix or TX type.
+    """
+    titan_state = plugin  # S5 amendment alias for codemod-rewritten refs
+    tx_type = tx.get("type", "")
+    signature = tx.get("signature", "")
+    fee_payer = tx.get("feePayer", "")
+
+    # Extract memo data
+    memo_data = _extract_memo_data(tx)
+
+    # Route 1: DI: Maker directive (requires Ed25519 verification)
+    if memo_data and memo_data.startswith("TITAN_DI:"):
+        return await _handle_maker_directive(plugin, tx, memo_data, signature, fee_payer)
+
+    # Route 2: I: Public inspiration (anyone can send)
+    if memo_data and memo_data.startswith("I:"):
+        return await _handle_inspiration(plugin, tx, memo_data, signature, fee_payer)
+
+    # Route 3: SOL transfer to Titan's wallet (donation detection)
+    if tx_type in ("TRANSFER", "SOL_TRANSFER", "NATIVE_TRANSFER"):
+        return await _handle_donation(plugin, tx, signature, fee_payer, memo_data)
+
+    return False
+
+
+async def _handle_maker_directive(plugin, tx, memo_data, signature, fee_payer) -> bool:
+    """Process a Maker directive (DI:) transaction."""
+    titan_state = plugin  # S5 amendment alias for codemod-rewritten refs
+    maker_pubkey = ""
+    if hasattr(plugin, "soul") and titan_state.soul:
+        mk = getattr(titan_state.soul, "_maker_pubkey", None)
+        if mk:
+            maker_pubkey = str(mk)
+
+    if not maker_pubkey:
+        logger.debug("[Webhook] No maker_pubkey configured, ignoring DI TX.")
+        return False
+
+    if fee_payer != maker_pubkey:
+        logger.debug("[Webhook] DI signer %s != maker %s, ignoring.", fee_payer[:8], maker_pubkey[:8])
+        return False
+
+    parts = memo_data.split(":", 2)
+    if len(parts) < 3:
+        logger.warning("[Webhook] Malformed directive memo: %s", memo_data[:50])
+        return False
+
+    directive_text = parts[1]
+    memo_signature = parts[2]
+
+    from titan_hcl.utils.crypto import verify_maker_signature
+
+    if not verify_maker_signature(directive_text, memo_signature, maker_pubkey):
+        logger.warning("[Webhook] Invalid directive signature in TX %s", signature[:16])
+        return False
+
+    logger.info("[Webhook] Valid on-chain directive from TX %s: %s", signature[:16], directive_text[:50])
+    result = await titan_state.commands.evolve_soul(directive_text, memo_signature)
+
+    # Mainnet Lifecycle Wiring rFP (2026-04-20): any verified maker-signed
+    # directive also satisfies the Cycle 0 confirm_maker requirement for
+    # GREAT CYCLE transition. Idempotent — sovereignty_worker no-ops if
+    # _maker_confirmed already True.
+    #
+    # v1.8.3 §4.L (D-SPEC-57, 2026-05-15): switched from direct
+    # `getattr(plugin, "sovereignty").confirm_maker()` to fire-and-forget bus
+    # event. Pre-carve the direct call was silently no-opping under Phase C
+    # api_subprocess (kernel_rpc cannot serialize the SovereigntyTracker class
+    # instance across processes per api_subprocess.py:274-277 comment block).
+    # The bus path reaches the new sovereignty_worker subprocess directly.
+    try:
+        bus_inst = getattr(plugin, "bus", None)
+        if bus_inst is not None:
+            from titan_hcl.bus import (
+                SOVEREIGNTY_CONFIRM_MAKER,
+                make_msg,
+            )
+            bus_inst.publish(make_msg(
+                SOVEREIGNTY_CONFIRM_MAKER, "webhook", "sovereignty",
+                {"tx_signature": signature, "ts": time.time()},
+            ))
+            logger.info(
+                "[Webhook] SOVEREIGNTY_CONFIRM_MAKER emitted on TX %s "
+                "(sovereignty_worker idempotently no-ops if already confirmed)",
+                signature[:16])
+        else:
+            logger.warning(
+                "[Webhook] plugin.bus unavailable — SOVEREIGNTY_CONFIRM_MAKER "
+                "not emitted for TX %s", signature[:16])
+    except Exception as _sce:
+        logger.warning(
+            "[Webhook] SOVEREIGNTY_CONFIRM_MAKER emit failed: %s", _sce)
+
+    if hasattr(plugin, "event_bus"):
+        await plugin.event_bus.emit("directive_update", {
+            "source": "on_chain",
+            "tx_signature": signature,
+            "memo_data": directive_text[:200],
+            "result": result,
+            "new_gen": titan_state.soul.current_gen,
+        })
+    return True
+
+
+async def _handle_inspiration(plugin, tx, memo_data, signature, fee_payer) -> bool:
+    """
+    Process a public inspiration (I:) transaction.
+    Anyone can send these — weighted by SOL amount attached.
+    """
+    titan_state = plugin  # S5 amendment alias for codemod-rewritten refs
+    message = memo_data[2:].strip()  # Remove "I:" prefix
+    if not message:
+        return False
+
+    # Get SOL amount from the TX (if any SOL was transferred alongside the memo)
+    amount_sol = _extract_sol_amount(tx, plugin)
+
+    # Record in social graph.
+    # rFP_social_graph_async_safety §5.2: async companion replaces the
+    # Phase E.2.5 caller-side to_thread wrap — the lock + to_thread now
+    # live inside social_graph.py so all callers benefit uniformly and
+    # intra-process writers are serialized (closes R2).
+    social_graph = getattr(plugin, "social_graph", None)
+    matched_user = None
+    if social_graph:
+        matched_user = await social_graph.record_inspiration_async(
+            tx_signature=signature,
+            sender_address=fee_payer,
+            message=message,
+            amount_sol=amount_sol,
+        )
+
+    # Calculate mood boost and memory weight — pure math, no DB, no wrap needed.
+    mood_delta, memory_weight = 0.01, 1.5
+    if social_graph:
+        mood_delta, memory_weight = social_graph.get_donation_mood_boost(amount_sol)
+
+    # Inject as weighted memory
+    if hasattr(plugin, "memory") and titan_state.memory:
+        source = matched_user.display_name if matched_user else fee_payer[:16]
+        await titan_state.memory.inject_memory(
+            text=f"[INSPIRATION from {source}] {message}",
+            source="inspiration",
+            weight=memory_weight,
+        )
+
+    # Emit event for WebSocket + mood engine
+    if hasattr(plugin, "event_bus"):
+        await plugin.event_bus.emit("inspiration_received", {
+            "tx_signature": signature,
+            "sender": fee_payer,
+            "user": matched_user.display_name if matched_user else None,
+            "message": message[:200],
+            "amount_sol": amount_sol,
+            "mood_delta": mood_delta,
+            "memory_weight": memory_weight,
+        })
+
+    logger.info(
+        "[Webhook] Inspiration received: '%s' from %s (%.4f SOL, mood+%.2f)",
+        message[:50], fee_payer[:16], amount_sol, mood_delta,
+    )
+    return True
+
+
+async def _handle_donation(plugin, tx, signature, fee_payer, memo_data) -> bool:
+    """
+    Process a SOL donation to Titan's wallet.
+    Detects incoming transfers, matches to known users, boosts mood.
+    """
+    titan_state = plugin  # S5 amendment alias for codemod-rewritten refs
+    amount_sol = _extract_sol_amount(tx, plugin)
+    if amount_sol <= 0:
+        return False
+
+    # rFP_social_graph_async_safety §5.2: async companion replaces the
+    # Phase E.2.5 caller-side to_thread wrap. get_donation_mood_boost is
+    # pure math — no DB, no wrap needed.
+    social_graph = getattr(plugin, "social_graph", None)
+    matched_user = None
+
+    if social_graph:
+        matched_user = await social_graph.record_donation_async(
+            tx_signature=signature,
+            sender_address=fee_payer,
+            amount_sol=amount_sol,
+            memo=memo_data or "",
+        )
+        mood_delta, _ = social_graph.get_donation_mood_boost(amount_sol)
+    else:
+        mood_delta = 0.02
+
+    # Emit event
+    if hasattr(plugin, "event_bus"):
+        await plugin.event_bus.emit("donation_received", {
+            "tx_signature": signature,
+            "sender": fee_payer,
+            "user": matched_user.display_name if matched_user else None,
+            "amount_sol": amount_sol,
+            "mood_delta": mood_delta,
+        })
+
+    logger.info(
+        "[Webhook] Donation %.4f SOL from %s (mood+%.2f)",
+        amount_sol, fee_payer[:16], mood_delta,
+    )
+    return True
+
+
+def _extract_memo_data(tx: dict) -> str:
+    """Extract memo text from Helius enhanced transaction instructions."""
+    memo_program = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+
+    for ix in tx.get("instructions", []):
+        if ix.get("programId") == memo_program:
+            # Helius provides decoded data as string
+            data = ix.get("data", "")
+            if data:
+                return data
+
+    # Also check innerInstructions
+    for inner in tx.get("innerInstructions", []):
+        for ix in inner.get("instructions", []):
+            if ix.get("programId") == memo_program:
+                data = ix.get("data", "")
+                if data:
+                    return data
+
+    return ""
+
+
+def _extract_sol_amount(tx: dict, plugin) -> float:
+    """
+    Extract SOL transfer amount from a Helius enhanced transaction.
+    Looks for native SOL transfers to Titan's wallet address.
+    Returns amount in SOL (not lamports).
+    """
+    titan_state = plugin  # S5 amendment alias for codemod-rewritten refs
+    titan_address = ""
+    if hasattr(plugin, "network") and titan_state.network:
+        pk = getattr(titan_state.network, "pubkey", None)
+        if pk:
+            titan_address = str(pk)
+
+    if not titan_address:
+        return 0.0
+
+    # Helius enhanced format: nativeTransfers array
+    for transfer in tx.get("nativeTransfers", []):
+        if transfer.get("toUserAccount") == titan_address:
+            lamports = transfer.get("amount", 0)
+            if lamports > 0:
+                return lamports / 1_000_000_000.0
+
+    # Fallback: check accountData for balance changes
+    for acct in tx.get("accountData", []):
+        if acct.get("account") == titan_address:
+            change = acct.get("nativeBalanceChange", 0)
+            if change > 0:
+                return change / 1_000_000_000.0
+
+    return 0.0

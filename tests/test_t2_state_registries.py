@@ -14,12 +14,12 @@ import pytest
 class TestOuterStateBackwardCompat:
     def test_state_register_alias_works(self):
         """StateRegister import still works and is same class as OuterState."""
-        from titan_plugin.logic.state_register import StateRegister, OuterState
+        from titan_hcl.logic.state_register import StateRegister, OuterState
         assert StateRegister is OuterState
 
     def test_outer_state_has_all_original_methods(self):
         """OuterState retains all StateRegister properties and methods."""
-        from titan_plugin.logic.state_register import OuterState
+        from titan_hcl.logic.state_register import OuterState
         reg = OuterState()
         # Properties
         assert reg.body_tensor == [0.5] * 5
@@ -37,7 +37,7 @@ class TestOuterStateBackwardCompat:
 
     def test_is_active_flag_default_true(self):
         """is_active defaults to True."""
-        from titan_plugin.logic.state_register import OuterState
+        from titan_hcl.logic.state_register import OuterState
         reg = OuterState()
         assert reg.is_active is True
 
@@ -45,7 +45,7 @@ class TestOuterStateBackwardCompat:
 class TestOuterStateIsActive:
     def test_is_active_pauses_bus_updates(self):
         """When is_active=False, _process_bus_message is a no-op."""
-        from titan_plugin.logic.state_register import OuterState
+        from titan_hcl.logic.state_register import OuterState
         reg = OuterState()
 
         # Active: update works
@@ -76,7 +76,7 @@ class TestOuterStateIsActive:
 class TestInnerState:
     def test_stores_and_retrieves_observables(self):
         """InnerState stores observables and returns them in snapshot."""
-        from titan_plugin.logic.inner_state import InnerState
+        from titan_hcl.logic.inner_state import InnerState
         state = InnerState()
 
         obs = {
@@ -96,7 +96,7 @@ class TestInnerState:
 
     def test_experience_buffer(self):
         """InnerState buffers and drains outer snapshots."""
-        from titan_plugin.logic.inner_state import InnerState
+        from titan_hcl.logic.inner_state import InnerState
         state = InnerState()
 
         state.buffer_experience({"body_tensor": [0.1] * 5, "ts": 1.0})
@@ -111,8 +111,8 @@ class TestInnerState:
 class TestSpiritState:
     def test_assembles_full_view(self):
         """SpiritState assembles from outer + inner + observables."""
-        from titan_plugin.logic.spirit_state import SpiritState
-        from titan_plugin.logic.inner_state import InnerState
+        from titan_hcl.logic.spirit_state import SpiritState
+        from titan_hcl.logic.inner_state import InnerState
         spirit = SpiritState()
         inner = InnerState()
 
@@ -145,9 +145,9 @@ class TestSpiritState:
 class TestRegistriesIndependence:
     def test_three_registries_independent(self):
         """Writing to one registry doesn't affect the others."""
-        from titan_plugin.logic.state_register import OuterState
-        from titan_plugin.logic.inner_state import InnerState
-        from titan_plugin.logic.spirit_state import SpiritState
+        from titan_hcl.logic.state_register import OuterState
+        from titan_hcl.logic.inner_state import InnerState
+        from titan_hcl.logic.spirit_state import SpiritState
 
         outer = OuterState()
         inner = InnerState()

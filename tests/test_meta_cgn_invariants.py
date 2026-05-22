@@ -30,14 +30,14 @@ import pytest
 # ======================================================================
 
 def _collect_emit_call_sites() -> list[tuple[Path, int, str, str]]:
-    """Walk titan_plugin/ for every emit_meta_cgn_signal( call and extract
+    """Walk titan_hcl/ for every emit_meta_cgn_signal( call and extract
     the consumer=... / event_type=... kwargs."""
     project_root = Path(__file__).parent.parent
-    titan_plugin = project_root / "titan_plugin"
+    titan_hcl = project_root / "titan_hcl"
     sites = []
     consumer_re = re.compile(r'consumer\s*=\s*["\']([^"\']+)["\']')
     event_type_re = re.compile(r'event_type\s*=\s*["\']([^"\']+)["\']')
-    for py in titan_plugin.rglob("*.py"):
+    for py in titan_hcl.rglob("*.py"):
         try:
             src_lines = py.read_text().splitlines()
         except Exception:
@@ -60,7 +60,7 @@ def test_no_orphan_producer_call_sites():
 
     Regression fence for the Phase 2 bug (2026-04-14) where 5 of 13
     producers emitted signals the consumer silently discarded."""
-    from titan_plugin.logic.meta_cgn import SIGNAL_TO_PRIMITIVE
+    from titan_hcl.logic.meta_cgn import SIGNAL_TO_PRIMITIVE
     sites = _collect_emit_call_sites()
 
     # Filter out the helper definition itself (it's a declaration, not
@@ -93,8 +93,8 @@ def test_rate_budget_enforced_by_helper():
     """The emit_meta_cgn_signal helper's min_interval_s rate gate must
     actually drop rapid emissions. Ensures the 0.5 Hz budget is enforced
     at the source, not hoped for."""
-    from titan_plugin.bus import emit_meta_cgn_signal, _emit_gate_last_ts
-    from titan_plugin.logic.meta_cgn import SIGNAL_TO_PRIMITIVE
+    from titan_hcl.bus import emit_meta_cgn_signal, _emit_gate_last_ts
+    from titan_hcl.logic.meta_cgn import SIGNAL_TO_PRIMITIVE
 
     # Pick a valid (consumer, event_type) tuple from the table
     consumer, event_type = next(iter(SIGNAL_TO_PRIMITIVE.keys()))
@@ -134,7 +134,7 @@ def test_rate_budget_enforced_by_helper():
 
 def test_edge_detector_first_time():
     """observe_first_time fires exactly once per unique key."""
-    from titan_plugin.logic.meta_cgn import EdgeDetector
+    from titan_hcl.logic.meta_cgn import EdgeDetector
     d = EdgeDetector()
     assert d.observe_first_time("concept_I") is True
     assert d.observe_first_time("concept_I") is False
@@ -144,7 +144,7 @@ def test_edge_detector_first_time():
 
 def test_edge_detector_threshold_crossing():
     """observe fires True only on crossing threshold, not per-call above."""
-    from titan_plugin.logic.meta_cgn import EdgeDetector
+    from titan_hcl.logic.meta_cgn import EdgeDetector
     d = EdgeDetector()
     # Below threshold — no fire
     assert d.observe("coherence", 0.2, 0.5) is False
@@ -160,7 +160,7 @@ def test_edge_detector_threshold_crossing():
 
 def test_edge_detector_new_max():
     """observe_new_max fires only on genuinely new maximum."""
-    from titan_plugin.logic.meta_cgn import EdgeDetector
+    from titan_hcl.logic.meta_cgn import EdgeDetector
     d = EdgeDetector()
     assert d.observe_new_max("depth", 3) is True      # first = new max
     assert d.observe_new_max("depth", 2) is False     # below prev
@@ -176,7 +176,7 @@ def test_edge_detector_new_max():
 def test_emit_helper_refuses_orphan_tuples():
     """The helper itself must drop emissions for tuples not in
     SIGNAL_TO_PRIMITIVE, even if a producer bypasses the CI check."""
-    from titan_plugin.bus import emit_meta_cgn_signal
+    from titan_hcl.bus import emit_meta_cgn_signal
 
     class MockQueue:
         def __init__(self):
@@ -202,8 +202,8 @@ def test_emit_helper_refuses_orphan_tuples():
 
 def test_emit_helper_accepts_mapped_tuple():
     """Sanity: a valid (consumer, event_type) pair IS accepted."""
-    from titan_plugin.bus import emit_meta_cgn_signal, _emit_gate_last_ts
-    from titan_plugin.logic.meta_cgn import SIGNAL_TO_PRIMITIVE
+    from titan_hcl.bus import emit_meta_cgn_signal, _emit_gate_last_ts
+    from titan_hcl.logic.meta_cgn import SIGNAL_TO_PRIMITIVE
 
     consumer, event_type = next(iter(SIGNAL_TO_PRIMITIVE.keys()))
     # Clear gate state for fresh test
@@ -237,8 +237,8 @@ def test_meta_cgn_signal_routes_to_spirit():
     DivineBus.publish. The consumer (handle_cross_consumer_signal) lives
     in the 'spirit' subprocess, so dst must be 'spirit'.
     """
-    from titan_plugin.bus import emit_meta_cgn_signal, _emit_gate_last_ts
-    from titan_plugin.logic.meta_cgn import SIGNAL_TO_PRIMITIVE
+    from titan_hcl.bus import emit_meta_cgn_signal, _emit_gate_last_ts
+    from titan_hcl.logic.meta_cgn import SIGNAL_TO_PRIMITIVE
 
     consumer, event_type = next(iter(SIGNAL_TO_PRIMITIVE.keys()))
     _emit_gate_last_ts.clear()
@@ -276,7 +276,7 @@ def test_event_reward_endpoint_routes_to_spirit():
     spirit_worker:8454 reaches meta_engine.add_external_reward. Same
     routing failure mode as META_CGN_SIGNAL (dst='meta' → no subscriber).
     """
-    from titan_plugin.bus import make_msg
+    from titan_hcl.bus import make_msg
 
     # Simulate the body of post_v4_meta_event_reward inline — avoids
     # having to stand up FastAPI TestClient. The critical invariant is
@@ -319,7 +319,7 @@ def test_event_reward_quality_clamped_to_unit_interval():
 
 def test_bus_health_orphan_logs_only_first_occurrence():
     """record_orphan logs WARN exactly once per tuple, then stays silent."""
-    from titan_plugin.core.bus_health import BusHealthMonitor
+    from titan_hcl.core.bus_health import BusHealthMonitor
     m = BusHealthMonitor()
     # First call: logs
     m.record_orphan("fake", "event_a")
@@ -334,7 +334,7 @@ def test_bus_health_orphan_logs_only_first_occurrence():
 
 def test_bus_health_snapshot_structure():
     """Snapshot returns the keys consumers depend on."""
-    from titan_plugin.core.bus_health import BusHealthMonitor
+    from titan_hcl.core.bus_health import BusHealthMonitor
     m = BusHealthMonitor()
     m.record_emission("producer_a", "consumer_a", "event_a", 0.8)
     snap = m.snapshot()

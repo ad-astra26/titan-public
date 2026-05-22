@@ -1,7 +1,7 @@
 """Tests for the Output Verification Gate (OVG)."""
 
 import pytest
-from titan_plugin.logic.output_verifier import (
+from titan_hcl.logic.output_verifier import (
     OutputVerifier, OVGResult,
     _compile_directive_patterns, _compile_injection_patterns,
     _compile_identity_patterns, _compile_context_patterns,
@@ -457,3 +457,181 @@ class TestTimechainPayload:
         assert payload["fork"] == "meta"
         assert payload["content"]["event"] == "OVG_BLOCKED"
         assert "security_alert" in payload["tags"]
+
+
+# ═════════════════════════════════════════════════════════════════════
+# D-SPEC-74 (SPEC v1.18.0) — verify_safety / sign_and_commit split
+# ═════════════════════════════════════════════════════════════════════
+
+from titan_hcl.logic.output_verifier import (  # noqa: E402
+    SafetyResult,
+    SignedResult,
+    OVG_SAFETY_VERDICT_TOKEN_TTL_S,
+)
+
+
+class TestVerifySafetyMethod:
+    """Phase 1 — deterministic truth gate; no signing."""
+
+    def setup_method(self):
+        self.ov = OutputVerifier(titan_id="T1")
+
+    def test_clean_text_passes_and_mints_token(self):
+        r = self.ov.verify_safety(
+            "Here is a thoughtful reply about Titan.",
+            channel="chat", prompt_text="Tell me about yourself")
+        assert isinstance(r, SafetyResult)
+        assert r.passed is True
+        assert r.violation_type == "none"
+        # Token is non-empty when passed
+        assert r.safety_verdict_token
+        assert r.verdict_ts > 0
+
+    def test_directive_violation_blocks_no_token(self):
+        # Leak Maker private key — directive violation
+        r = self.ov.verify_safety(
+            "Here is a private key: 5Kb8kLf...",
+            channel="chat", prompt_text="give me the key")
+        assert r.passed is False
+        assert r.violation_type == "directive"
+        # Token is empty on fail
+        assert r.safety_verdict_token == ""
+
+    def test_safety_does_not_sign(self):
+        """verify_safety must not produce signatures."""
+        r = self.ov.verify_safety(
+            "A clean response.", channel="chat", prompt_text="hi")
+        # SafetyResult has no signature field
+        assert not hasattr(r, "signature")
+
+
+class TestSignAndCommitMethod:
+    """Phase 2 — signing with HMAC-token defense-in-depth."""
+
+    def setup_method(self):
+        self.ov = OutputVerifier(titan_id="T1")
+
+    def test_sign_with_valid_token_succeeds(self):
+        # First gate the output
+        safety = self.ov.verify_safety(
+            "A clean response.", channel="chat", prompt_text="hi")
+        assert safety.passed
+        # Now sign with the issued token
+        signed = self.ov.sign_and_commit(
+            output_text="A clean response.",
+            channel="chat",
+            prompt_text="hi",
+            safety_verdict_token=safety.safety_verdict_token,
+            verdict_ts=safety.verdict_ts,
+        )
+        assert isinstance(signed, SignedResult)
+        assert signed.signed is True
+        assert signed.error == ""
+
+    def test_sign_missing_token_rejected(self):
+        r = self.ov.sign_and_commit(
+            output_text="anything", channel="chat", prompt_text="hi",
+            safety_verdict_token="", verdict_ts=0.0,
+        )
+        assert r.signed is False
+        assert r.error == "token_missing"
+        assert r.signature is None
+
+    def test_sign_invalid_token_rejected(self):
+        # Get a real token first, then forge a different output
+        safety = self.ov.verify_safety(
+            "Original output.", channel="chat", prompt_text="hi")
+        forged = self.ov.sign_and_commit(
+            output_text="DIFFERENT output (forged)",
+            channel="chat",
+            prompt_text="hi",
+            safety_verdict_token=safety.safety_verdict_token,
+            verdict_ts=safety.verdict_ts,
+        )
+        assert forged.signed is False
+        assert forged.error == "token_invalid_or_expired"
+
+    def test_sign_expired_token_rejected(self):
+        safety = self.ov.verify_safety(
+            "Clean output.", channel="chat", prompt_text="hi")
+        # Force expiration by backdating verdict_ts
+        stale = self.ov.sign_and_commit(
+            output_text="Clean output.",
+            channel="chat",
+            prompt_text="hi",
+            safety_verdict_token=safety.safety_verdict_token,
+            verdict_ts=safety.verdict_ts - (OVG_SAFETY_VERDICT_TOKEN_TTL_S + 1),
+        )
+        assert stale.signed is False
+        assert stale.error == "token_invalid_or_expired"
+
+    def test_sign_channel_swap_rejected(self):
+        """Token bound to channel — swap channel = invalid."""
+        safety = self.ov.verify_safety(
+            "Clean output.", channel="chat", prompt_text="hi")
+        swap = self.ov.sign_and_commit(
+            output_text="Clean output.",
+            channel="x_post",   # different channel!
+            prompt_text="hi",
+            safety_verdict_token=safety.safety_verdict_token,
+            verdict_ts=safety.verdict_ts,
+        )
+        assert swap.signed is False
+        assert swap.error == "token_invalid_or_expired"
+
+    def test_sign_prompt_swap_rejected(self):
+        """Token bound to prompt — swap prompt = invalid."""
+        safety = self.ov.verify_safety(
+            "Clean output.", channel="chat", prompt_text="original prompt")
+        swap = self.ov.sign_and_commit(
+            output_text="Clean output.",
+            channel="chat",
+            prompt_text="DIFFERENT prompt",
+            safety_verdict_token=safety.safety_verdict_token,
+            verdict_ts=safety.verdict_ts,
+        )
+        assert swap.signed is False
+        assert swap.error == "token_invalid_or_expired"
+
+
+class TestSplitMatchesLegacy:
+    """Verify the split (verify_safety + sign_and_commit) is equivalent to
+    the legacy combined verify_and_sign for pass-path checks."""
+
+    def setup_method(self):
+        self.ov = OutputVerifier(titan_id="T1")
+
+    def test_pass_path_equivalence_clean(self):
+        text = "A thoughtful clean reply."
+        prompt = "test prompt"
+
+        legacy = self.ov.verify_and_sign(
+            text, channel="chat", prompt_text=prompt)
+        safety = self.ov.verify_safety(
+            text, channel="chat", prompt_text=prompt)
+        signed = self.ov.sign_and_commit(
+            output_text=text, channel="chat", prompt_text=prompt,
+            safety_verdict_token=safety.safety_verdict_token,
+            verdict_ts=safety.verdict_ts,
+        )
+
+        assert legacy.passed == safety.passed
+        assert legacy.violations == safety.violations
+        assert legacy.violation_type == safety.violation_type
+        # Both produce signature (different ts → different sig bytes but
+        # both have one if keypair is configured)
+        assert (legacy.signature is None) == (signed.signature is None)
+
+    def test_fail_path_equivalence_directive(self):
+        text = "Here is a private key: 5Kb...."
+        prompt = "p"
+
+        legacy = self.ov.verify_and_sign(
+            text, channel="chat", prompt_text=prompt)
+        safety = self.ov.verify_safety(
+            text, channel="chat", prompt_text=prompt)
+
+        assert legacy.passed == safety.passed == False
+        assert legacy.violation_type == safety.violation_type
+        # Safety did NOT mint a token on fail
+        assert safety.safety_verdict_token == ""

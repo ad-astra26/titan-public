@@ -20,18 +20,18 @@ import time
 import msgpack
 import pytest
 
-from titan_plugin.core.state_registry import StateRegistryReader
-from titan_plugin.logic.agency_state_publisher import AgencyStatePublisher
-from titan_plugin.logic.assessment_state_publisher import AssessmentStatePublisher
-from titan_plugin.logic.base_state_publisher import (
+from titan_hcl.core.state_registry import StateRegistryReader
+from titan_hcl.logic.agency_state_publisher import AgencyStatePublisher
+from titan_hcl.logic.assessment_state_publisher import AssessmentStatePublisher
+from titan_hcl.logic.base_state_publisher import (
     BaseStatePublisher,
     MultiSlotStatePublisher,
 )
-from titan_plugin.logic.output_verifier_state_publisher import (
+from titan_hcl.logic.output_verifier_state_publisher import (
     OutputVerifierStatePublisher)
-from titan_plugin.logic.reflex_state_publisher import ReflexStatePublisher
-from titan_plugin.logic.rl_state_publisher import RLStatePublisher
-from titan_plugin.logic.session3_state_specs import (
+from titan_hcl.logic.reflex_state_publisher import ReflexStatePublisher
+from titan_hcl.logic.rl_state_publisher import RLStatePublisher
+from titan_hcl.logic.session3_state_specs import (
     AGENCY_STATE_SPEC,
     ASSESSMENT_STATE_SPEC,
     OUTPUT_VERIFIER_STATE_SPEC,
@@ -40,9 +40,9 @@ from titan_plugin.logic.session3_state_specs import (
     SOCIAL_PERCEPTION_STATE_SPEC,
     TIMECHAIN_STATE_SPEC,
 )
-from titan_plugin.logic.social_perception_state_publisher import (
+from titan_hcl.logic.social_perception_state_publisher import (
     SocialPerceptionStatePublisher)
-from titan_plugin.logic.timechain_state_publisher import (
+from titan_hcl.logic.timechain_state_publisher import (
     TimechainStatePublisher)
 
 
@@ -77,7 +77,7 @@ class _DummySpec:
 def _make_dummy_publisher(shm_root_path):
     """A minimal subclass that publishes a fixed payload."""
     import numpy as np
-    from titan_plugin.core.state_registry import RegistrySpec
+    from titan_hcl.core.state_registry import RegistrySpec
 
     class _DummyPub(BaseStatePublisher):
         slot_name = "test_dummy"
@@ -93,7 +93,7 @@ def _make_dummy_publisher(shm_root_path):
 
 def test_base_init_logs_and_writer_lazy(shm_root, caplog):
     caplog.set_level(logging.INFO,
-                     logger="titan_plugin.logic.base_state_publisher")
+                     logger="titan_hcl.logic.base_state_publisher")
     pub = _make_dummy_publisher(shm_root)
     stats = pub.get_stats()
     assert stats["publish_count"] == 0
@@ -103,7 +103,7 @@ def test_base_init_logs_and_writer_lazy(shm_root, caplog):
 
 def test_base_publish_success_path(shm_root, caplog):
     caplog.set_level(logging.INFO,
-                     logger="titan_plugin.logic.base_state_publisher")
+                     logger="titan_hcl.logic.base_state_publisher")
     pub = _make_dummy_publisher(shm_root)
     pub.publish({"x": 1, "ts": time.time()})
     stats = pub.get_stats()
@@ -114,7 +114,7 @@ def test_base_publish_success_path(shm_root, caplog):
 
 def test_base_oversize_logged_critical_no_write(shm_root, caplog):
     caplog.set_level(logging.CRITICAL,
-                     logger="titan_plugin.logic.base_state_publisher")
+                     logger="titan_hcl.logic.base_state_publisher")
     pub = _make_dummy_publisher(shm_root)
     # 256-byte slot; pack 1KB to trigger oversize
     pub.publish({"big": "x" * 1024})
@@ -129,7 +129,7 @@ def test_base_compute_payload_raises_isolated(shm_root):
     """Subclass _compute_payload raising must NOT crash the thread —
     BaseStatePublisher.publish catches and counts it."""
     import numpy as np
-    from titan_plugin.core.state_registry import RegistrySpec
+    from titan_hcl.core.state_registry import RegistrySpec
 
     class _BrokenPub(BaseStatePublisher):
         slot_name = "test_broken"
@@ -149,7 +149,7 @@ def test_base_compute_payload_raises_isolated(shm_root):
 
 def test_base_heartbeat_at_canonical_ticks(shm_root, caplog):
     caplog.set_level(logging.INFO,
-                     logger="titan_plugin.logic.base_state_publisher")
+                     logger="titan_hcl.logic.base_state_publisher")
     pub = _make_dummy_publisher(shm_root)
     for _ in range(10):
         pub.publish({"x": 1})
@@ -414,7 +414,7 @@ def test_multi_slot_composition(shm_root):
 def test_worker_publisher_runner_thread_starts(shm_root):
     """run_worker_publisher must start a daemon thread that ticks and
     survives state_fetcher returning None or raising."""
-    from titan_plugin.logic.worker_publisher_runner import run_worker_publisher
+    from titan_hcl.logic.worker_publisher_runner import run_worker_publisher
     pub = _make_dummy_publisher(shm_root)
     fetch_count = {"n": 0}
 

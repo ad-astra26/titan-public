@@ -21,7 +21,7 @@ import threading
 import unittest
 from unittest.mock import patch, MagicMock
 
-from titan_plugin.api import dashboard as _dash
+from titan_hcl.api import dashboard as _dash
 
 
 class TestVocabularyWarmer(unittest.TestCase):
@@ -165,16 +165,19 @@ class TestEndpointRegistration(unittest.TestCase):
     """Endpoints are registered + reachable through the router."""
 
     def test_v4_vocabulary_route_registered(self):
-        routes = [r.path for r in _dash.router.routes if hasattr(r, "path")]
-        self.assertIn("/v4/vocabulary", routes)
+        from titan_hcl.api.v6 import router as _v6
+        routes = [r.path for r in _v6.routes if hasattr(r, "path")]
+        self.assertIn("/v6/language/vocabulary", routes)
 
     def test_v4_timechain_verify_route_registered(self):
-        routes = [r.path for r in _dash.router.routes if hasattr(r, "path")]
-        self.assertIn("/v4/timechain/verify", routes)
+        from titan_hcl.api.v6 import router as _v6
+        routes = [r.path for r in _v6.routes if hasattr(r, "path")]
+        self.assertIn("/v6/timechain/verify", routes)
 
     def test_v4_history_route_registered(self):
-        routes = [r.path for r in _dash.router.routes if hasattr(r, "path")]
-        self.assertIn("/v4/history", routes)
+        from titan_hcl.api.v6 import router as _v6
+        routes = [r.path for r in _v6.routes if hasattr(r, "path")]
+        self.assertIn("/v6/expression/history", routes)
 
 
 class TestLifespanEagerStart(unittest.TestCase):

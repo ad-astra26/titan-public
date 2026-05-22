@@ -2,7 +2,7 @@
 import os
 import pytest
 import tempfile
-from titan_plugin.logic.dialogue_composer import DialogueComposer
+from titan_hcl.logic.dialogue_composer import DialogueComposer
 
 
 @pytest.fixture

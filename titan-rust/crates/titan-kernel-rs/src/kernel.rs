@@ -89,7 +89,7 @@ impl KernelError {
 pub struct KernelRunOptions {
     /// `false` → skip spawning the substrate placeholder (tests).
     pub spawn_substrate: bool,
-    /// `false` → skip spawning `python -m titan_main` (tests).
+    /// `false` → skip spawning `python -m titan_hcl` (tests).
     pub spawn_python: bool,
     /// Path to the substrate placeholder binary. None → use a default
     /// resolved relative to `target/debug/`.
@@ -338,7 +338,7 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
     if options.spawn_python {
         info!(
             event = "BOOT_B9_SPAWN_PYTHON",
-            "B9 spawning python -m titan_main via KernelChildSupervisor"
+            "B9 spawning python -m titan_hcl via KernelChildSupervisor"
         );
         match kernel_supervisor.spawn_and_watch_python() {
             Ok(Some(handle)) => {

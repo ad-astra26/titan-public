@@ -28,7 +28,7 @@ def temp_db():
 @pytest.fixture
 def explorer(temp_db):
     """Create a CodingExplorer with test config."""
-    from titan_plugin.logic.coding_explorer import CodingExplorer
+    from titan_hcl.logic.coding_explorer import CodingExplorer
     config = {
         "cooldown_epochs": 5,
         "max_exercises_per_dream": 3,
@@ -40,7 +40,7 @@ def explorer(temp_db):
 
 class TestCodingExplorerInit:
     def test_init_creates_db_table(self, temp_db):
-        from titan_plugin.logic.coding_explorer import CodingExplorer
+        from titan_hcl.logic.coding_explorer import CodingExplorer
         ce = CodingExplorer(db_path=temp_db)
         conn = sqlite3.connect(temp_db)
         tables = [r[0] for r in conn.execute(
@@ -69,7 +69,7 @@ class TestCodingExplorerInit:
 
 class TestExerciseTemplates:
     def test_all_templates_have_required_fields(self):
-        from titan_plugin.logic.coding_explorer import EXERCISE_TEMPLATES
+        from titan_hcl.logic.coding_explorer import EXERCISE_TEMPLATES
         for name, template in EXERCISE_TEMPLATES.items():
             assert "concept" in template, f"{name} missing concept"
             assert "difficulty" in template, f"{name} missing difficulty"
@@ -79,11 +79,11 @@ class TestExerciseTemplates:
             assert "associations" in template, f"{name} missing associations"
 
     def test_template_count(self):
-        from titan_plugin.logic.coding_explorer import EXERCISE_TEMPLATES
+        from titan_hcl.logic.coding_explorer import EXERCISE_TEMPLATES
         assert len(EXERCISE_TEMPLATES) >= 8
 
     def test_all_action_exercise_mappings_valid(self):
-        from titan_plugin.logic.coding_explorer import (
+        from titan_hcl.logic.coding_explorer import (
             ACTION_EXERCISE_MAP, EXERCISE_TEMPLATES)
         for action, exercises in ACTION_EXERCISE_MAP.items():
             for ex_name in exercises:
@@ -204,7 +204,7 @@ class TestExerciseSelection:
 
     def test_returns_none_for_empty(self, explorer):
         # Use a monkeypatched empty map without modifying globals
-        import titan_plugin.logic.coding_explorer as mod
+        import titan_hcl.logic.coding_explorer as mod
         orig_map = mod.ACTION_EXERCISE_MAP
         orig_templates = dict(mod.EXERCISE_TEMPLATES)
         try:
@@ -294,7 +294,7 @@ class TestNmFloat:
 
 class TestCodingInterpreter:
     def test_interpreter_registered(self):
-        from titan_plugin.logic.reasoning_interpreter import ReasoningInterpreter
+        from titan_hcl.logic.reasoning_interpreter import ReasoningInterpreter
         ri = ReasoningInterpreter()
         coding = ri.registry.get("coding")
         assert coding is not None
@@ -304,7 +304,7 @@ class TestCodingInterpreter:
         assert "compose" in coding.action_names
 
     def test_interpreter_build_features(self):
-        from titan_plugin.logic.reasoning_interpreter import CodingInterpreter
+        from titan_hcl.logic.reasoning_interpreter import CodingInterpreter
         ci = CodingInterpreter()
         plan = {"intent": "reflect", "structure": "decomposition"}
         context = {"success_rate": 0.5, "sandbox_available": 1.0}
@@ -312,7 +312,7 @@ class TestCodingInterpreter:
         assert features.shape == (24,)
 
     def test_interpreter_interpret(self):
-        from titan_plugin.logic.reasoning_interpreter import CodingInterpreter
+        from titan_hcl.logic.reasoning_interpreter import CodingInterpreter
         ci = CodingInterpreter()
         reasoning_output = {
             "action": "COMMIT",
@@ -333,7 +333,7 @@ class TestSandboxTemplates:
     """
 
     def _run_template(self, name):
-        from titan_plugin.logic.coding_explorer import EXERCISE_TEMPLATES
+        from titan_hcl.logic.coding_explorer import EXERCISE_TEMPLATES
         code = EXERCISE_TEMPLATES[name]["code_template"]
         # Use a shared globals dict so imports and recursive calls work
         g = {}

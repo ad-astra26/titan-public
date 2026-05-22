@@ -15,15 +15,17 @@ Uses pytest tmp_path + TITAN_SHM_ROOT env override. No /dev/shm pollution.
 
 Reference:
   - titan-docs/PLAN_microkernel_phase_a_s3.md §6.3
-  - titan_plugin/core/state_registry.py INNER_SPIRIT_45D declaration
-  - titan_plugin/modules/spirit_worker.py:2036+ writer hook
+  - titan_hcl/core/state_registry.py INNER_SPIRIT_45D declaration
+  - titan_hcl/modules/spirit_worker.py:2036+ writer hook
 """
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-from titan_plugin.core.state_registry import (
+from titan_hcl.core.state_registry import (
+    BUFFER_COUNT,
+    BUFFER_META_SIZE,
     HEADER_SIZE,
     INNER_SPIRIT_45D,
     RegistryBank,
@@ -46,9 +48,13 @@ def test_inner_spirit_45d_spec_shape():
 
 
 def test_inner_spirit_45d_payload_size():
-    """45D × 4 bytes = 180 B payload; total = 180 + 24 B header = 204 B."""
+    """45D × 4 bytes = 180 B payload. total_bytes follows the §7.0 triple-buffer
+    SeqLock layout: HEADER_SIZE + BUFFER_COUNT × (BUFFER_META_SIZE + payload)
+    = 16 + 3 × (16 + 180) = 604 B. (Was asserted as 180 + single header before
+    the triple-buffer upgrade — rFP_rust_seqlock_retry_exhaustion.)"""
     assert INNER_SPIRIT_45D.payload_bytes == 180
-    assert INNER_SPIRIT_45D.total_bytes == 180 + HEADER_SIZE
+    assert INNER_SPIRIT_45D.total_bytes == HEADER_SIZE + BUFFER_COUNT * (
+        BUFFER_META_SIZE + 180)
 
 
 def test_writer_reader_roundtrip_byte_equivalent(shm_root):

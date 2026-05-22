@@ -8,7 +8,7 @@ import tempfile
 import numpy as np
 import pytest
 
-from titan_plugin.logic.emotion_cluster import (
+from titan_hcl.logic.emotion_cluster import (
     EMOT_PRIMITIVES,
     EMOT_PRIMITIVE_INDEX,
     FEATURE_DIM,

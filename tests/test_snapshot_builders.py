@@ -18,7 +18,7 @@ import time
 import types
 import pytest
 
-from titan_plugin.modules import spirit_loop
+from titan_hcl.modules import spirit_loop
 
 
 # ---------------------------------------------------------------------------

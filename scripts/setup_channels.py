@@ -8,7 +8,7 @@ Interactive Textual-based wizard for configuring Titan's communication channels:
   - Slack (via Slack API, Socket Mode)
   - WhatsApp (via Meta Business API)
 
-Writes configuration to titan_plugin/config.toml [channels] section.
+Writes configuration to titan_hcl/config.toml [channels] section.
 Tests connectivity before saving credentials.
 
 Usage:
@@ -26,7 +26,7 @@ import pathlib
 # Ensure project root on path
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-CONFIG_PATH = PROJECT_ROOT / "titan_plugin" / "config.toml"
+CONFIG_PATH = PROJECT_ROOT / "titan_hcl" / "config.toml"
 
 TEXTUAL_AVAILABLE = True
 try:

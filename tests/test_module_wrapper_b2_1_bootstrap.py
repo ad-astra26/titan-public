@@ -29,15 +29,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from titan_plugin.core import worker_swap_handler
-from titan_plugin.core.worker_lifecycle import WatcherState
-from titan_plugin.core.worker_swap_handler import (
+from titan_hcl.core import worker_swap_handler
+from titan_hcl.core.worker_lifecycle import WatcherState
+from titan_hcl.core.worker_swap_handler import (
     SwapHandlerState,
     get_active_swap_state,
     set_active_swap_state,
     start_supervision_thread,
 )
-from titan_plugin.guardian import _module_wrapper
+from titan_hcl.guardian import _module_wrapper
 
 
 # ── Active-state helpers (process global) ────────────────────────────────
@@ -237,7 +237,7 @@ def test_module_wrapper_passes_start_method_to_swap_state():
         return t
 
     set_active_swap_state(None)
-    with patch("titan_plugin.core.worker_bus_bootstrap.setup_worker_bus",
+    with patch("titan_hcl.core.worker_bus_bootstrap.setup_worker_bus",
                side_effect=fake_setup), \
          patch.object(worker_swap_handler, "start_supervision_thread",
                       side_effect=fake_start_thread):
@@ -258,7 +258,7 @@ def test_module_wrapper_legacy_mode_no_swap_state():
         return recv_q, send_q, None
 
     set_active_swap_state(None)
-    with patch("titan_plugin.core.worker_bus_bootstrap.setup_worker_bus",
+    with patch("titan_hcl.core.worker_bus_bootstrap.setup_worker_bus",
                side_effect=fake_setup):
         _module_wrapper(entry, "w_legacy", orig_recv, orig_send, {},
                         start_method="fork")
@@ -282,7 +282,7 @@ def test_module_wrapper_clears_active_state_on_exit():
         t = threading.Thread(target=lambda: None, daemon=True); t.start()
         return t
 
-    with patch("titan_plugin.core.worker_bus_bootstrap.setup_worker_bus",
+    with patch("titan_hcl.core.worker_bus_bootstrap.setup_worker_bus",
                side_effect=fake_setup), \
          patch.object(worker_swap_handler, "start_supervision_thread",
                       side_effect=fake_start_thread):
@@ -301,7 +301,7 @@ def test_module_wrapper_handles_setup_failure_gracefully():
     def boom(name, recv_q, send_q):
         raise RuntimeError("simulated setup_worker_bus failure")
 
-    with patch("titan_plugin.core.worker_bus_bootstrap.setup_worker_bus",
+    with patch("titan_hcl.core.worker_bus_bootstrap.setup_worker_bus",
                side_effect=boom):
         # Must NOT crash; falls through to entry_fn with original queues
         _module_wrapper(entry, "w_fail", orig_recv, orig_send, {},
@@ -317,7 +317,7 @@ def test_module_wrapper_default_start_method_is_fork():
     def fake_setup(name, recv_q, send_q):
         return recv_q, send_q, None  # legacy mode → no swap state path
 
-    with patch("titan_plugin.core.worker_bus_bootstrap.setup_worker_bus",
+    with patch("titan_hcl.core.worker_bus_bootstrap.setup_worker_bus",
                side_effect=fake_setup):
         _module_wrapper(entry, "w_default", object(), object(), {})
         # No exception = pass; default kw works
@@ -337,7 +337,7 @@ def test_guardian_spawn_site_passes_start_method():
     import ast
     import inspect
 
-    import titan_plugin.guardian as guardian_mod
+    import titan_hcl.guardian as guardian_mod
 
     src = inspect.getsource(guardian_mod)
     tree = ast.parse(src)

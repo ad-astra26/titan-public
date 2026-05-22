@@ -13,7 +13,7 @@ import os
 
 import pytest
 
-from titan_plugin.logic.titan_vm import Op, TitanVM, VMRuntimeState, _sigmoid
+from titan_hcl.logic.titan_vm import Op, TitanVM, VMRuntimeState, _sigmoid
 
 
 class _FakeRegister:
@@ -98,7 +98,7 @@ class TestVMRuntimeState:
         with open(state_path, "w") as f:
             f.write("{not valid json at all")
 
-        with caplog.at_level(logging.WARNING, logger="titan_plugin.logic.titan_vm"):
+        with caplog.at_level(logging.WARNING, logger="titan_hcl.logic.titan_vm"):
             rs = VMRuntimeState(data_dir=str(tmp_path), load=True)
 
         # No crash, fresh defaults
@@ -113,7 +113,7 @@ class TestVMRuntimeState:
         with open(state_path, "w") as f:
             json.dump({"schema": 99, "ema_state": {"X": {"y": 0.5}}}, f)
 
-        with caplog.at_level(logging.WARNING, logger="titan_plugin.logic.titan_vm"):
+        with caplog.at_level(logging.WARNING, logger="titan_hcl.logic.titan_vm"):
             rs = VMRuntimeState(data_dir=str(tmp_path), load=True)
 
         assert rs.ema_state == {}  # schema 99 rejected, defaults used

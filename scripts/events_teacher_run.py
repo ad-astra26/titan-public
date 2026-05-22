@@ -42,10 +42,10 @@ def main():
     logger = logging.getLogger("events_teacher")
 
     # Load merged config (config.toml + ~/.titan/secrets.toml)
-    from titan_plugin.config_loader import load_titan_config
+    from titan_hcl.config_loader import load_titan_config
     config = load_titan_config()
     if not config:
-        logger.error("Merged config empty — check titan_plugin/config.toml exists")
+        logger.error("Merged config empty — check titan_hcl/config.toml exists")
         sys.exit(1)
 
     # API base URL
@@ -67,7 +67,7 @@ def main():
         sys.exit(1)
 
     # Hot-reload the events_teacher module (picks up code changes)
-    import titan_plugin.logic.events_teacher as et_module
+    import titan_hcl.logic.events_teacher as et_module
     importlib.reload(et_module)
 
     # Load state, run window, save state

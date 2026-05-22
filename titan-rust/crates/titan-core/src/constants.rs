@@ -3,17 +3,17 @@
 //! DO NOT EDIT BY HAND. Edit the TOML, then run:
 //!     python scripts/generate_phase_c_constants.py
 //!
-//! SPEC version: 1.2.0
-//! Source SHA-256: dfb308daa1f0d8794d2bd7f1eac0297b638adbdd96046af6594c1687cc8c505d
+//! SPEC version: 1.11.4
+//! Source SHA-256: b1742e30425623ecbc3cd1734eb485735be957723c0b5f52b0400d110e562218
 //!
 //! Per SPEC §19 + §2.6: hand-editing this file is a SPEC violation flagged by
 //! `arch_map phase-c verify`.
 #![allow(dead_code)]
 
 // ── SPEC version metadata ──────────────────────────────────────────────
-pub const SPEC_VERSION: &str = "1.2.0";
+pub const SPEC_VERSION: &str = "1.11.4";
 pub const SPEC_SOURCE_SHA256: &str =
-    "dfb308daa1f0d8794d2bd7f1eac0297b638adbdd96046af6594c1687cc8c505d";
+    "b1742e30425623ecbc3cd1734eb485735be957723c0b5f52b0400d110e562218";
 
 // ── KERNEL ────────────────────────────────────────────────────────────────
 // titan-kernel-rs internals (boot, snapshot, signal handling, persistence)
@@ -138,6 +138,8 @@ pub const SUPERVISION_DEPENDENCY_RECHECK_INTERVAL_S: f64 = 10.0;
 pub const SUPERVISION_DEPENDENCY_BLOCKED_TIMEOUT_S: f64 = 300.0;
 /// HTTP/RPC probe timeout for external_service dependency check
 pub const SUPERVISION_DEPENDENCY_PROBE_TIMEOUT_S: f64 = 5.0;
+/// SPEC §11.G.2.5 (D-SPEC-90, v1.29.0) — max wait for an ENSURE_RUNNING dep to reach state=RUNNING + emit MODULE_READY before the dependent's start gives up. Sized to comfortably exceed memory_worker's empirical cold-boot time on devnet T3 (~52s for FAISS+Kuzu+DuckDB hot init observed 2026-05-19) plus headroom; below the 120s module heartbeat_timeout for L2/L3 workers.
+pub const SUPERVISION_DEPENDENCY_ACTIVATION_TIMEOUT_S: f64 = 90.0;
 /// Single supervision log file (kernel writes; arch_map reads)
 pub const SUPERVISION_LOG_PATH: &str = "data/supervision.jsonl";
 /// Max size before rotation (100 MB)
@@ -164,6 +166,12 @@ pub const BUS_ACCEPT_RATE_LIMIT_PER_S: u64 = 50;
 pub const BUS_SLOW_CONSUMER_DROP_RATE_RATIO: f64 = 0.05;
 /// Throttle slow-consumer warnings
 pub const BUS_SLOW_CONSUMER_WARN_INTERVAL_S: f64 = 60.0;
+/// Per-client outbound buffer depth at which a rate-limited WARN fires (SPEC §8.0.ter). NOT a cap — per §8.0 P0 never-drop, frames stay queued; this is operator-visible backpressure signal surfaced via /v4/warning-monitor under key bus_client.<name>.
+pub const OUTBOUND_BUFFER_HIGH_WATER: u64 = 1000;
+/// Per-client rate-limit on the SPEC §8.0.ter high-water WARN — one log line per client per minute. Prevents sustained-backpressure log flood.
+pub const OUTBOUND_BUFFER_HIGH_WATER_WARN_INTERVAL_S: f64 = 60.0;
+/// BusSocketClient writer thread defensive idle-poll interval. Writer wakes on _outbound_event signal OR every N seconds. Idle polling lets the writer recover if the event was somehow missed (defense-in-depth; signal is set on every enqueue + on every (re)connect). SPEC §8.0.ter.
+pub const OUTBOUND_WRITER_IDLE_POLL_S: f64 = 1.0;
 /// Batch-send flush timeout (50ms)
 pub const BUS_SEND_FLUSH_TIMEOUT_S: f64 = 0.05;
 /// Client reconnect initial backoff
@@ -244,12 +252,18 @@ pub const OUTER_MIND_15D_SCHEMA_VERSION: u64 = 1;
 pub const OUTER_SPIRIT_45D_SCHEMA_VERSION: u64 = 1;
 /// Schema version for topology_30d.bin slot ([0:10] outer_lower + [10:20] inner_lower + [20:30] whole)
 pub const TOPOLOGY_30D_SCHEMA_VERSION: u64 = 1;
-/// Schema version for neuromod_state.bin slot (DA, 5HT, NE, ACh, Endorphin, GABA)
-pub const NEUROMOD_SCHEMA_VERSION: u64 = 1;
-/// Number of neuromodulator fields persisted in neuromod_state.bin (DA, 5HT, NE, ACh, Endorphin, GABA)
+/// Schema version for neuromod_state.bin slot. v1=(6,) levels only. v2=(6,4) (level,gain,phasic,tonic) per modulator — added 2026-05-15 with §4.Q neuromod_worker.evaluate migration.
+pub const NEUROMOD_SCHEMA_VERSION: u64 = 2;
+/// Number of neuromodulators in neuromod_state.bin (DA, 5HT, NE, ACh, Endorphin, GABA)
 pub const NEUROMOD_FIELD_COUNT: u64 = 6;
-/// Total payload bytes for neuromod_state.bin = NEUROMOD_FIELD_COUNT × 4 (f32 LE) = 6 × 4 = 24 bytes
-pub const NEUROMOD_PAYLOAD_BYTES: u64 = 24;
+/// Per-modulator fields in neuromod_state.bin v2 layout (level, gain, phasic, tonic) — required by cognitive_worker for cross-process modulation reconstruction via compute_modulation_from_state().
+pub const NEUROMOD_FIELDS_PER_MOD: u64 = 4;
+/// Total payload bytes for neuromod_state.bin v2 = NEUROMOD_FIELD_COUNT × NEUROMOD_FIELDS_PER_MOD × 4 (f32 LE) = 6 × 4 × 4 = 96 bytes
+pub const NEUROMOD_PAYLOAD_BYTES: u64 = 96;
+/// Schema version for neuromod_inputs.bin slot — cognitive_worker writes the 11 emergent inputs + chi_health + kin signal + topology_velocity as msgpack; neuromod_worker reads per KERNEL_EPOCH_TICK. Added 2026-05-15 with §4.Q.
+pub const NEUROMOD_INPUTS_SCHEMA_VERSION: u64 = 1;
+/// Max msgpack payload size for neuromod_inputs.bin. Typical payload ≈400-700 bytes (11 emergent inputs × ~20 bytes each + small DNA section).
+pub const NEUROMOD_INPUTS_MAX_BYTES: u64 = 4096;
 /// Schema version for epoch_counter.bin slot
 pub const EPOCH_COUNTER_SCHEMA_VERSION: u64 = 1;
 /// Schema version for sphere_clocks.bin slot (6 × 7 fields)
@@ -258,7 +272,13 @@ pub const SPHERE_CLOCKS_SCHEMA_VERSION: u64 = 1;
 pub const CHI_STATE_SCHEMA_VERSION: u64 = 1;
 /// Schema version for titanvm_registers.bin slot (11 NS programs × 4 fields)
 pub const TITANVM_REGISTERS_SCHEMA_VERSION: u64 = 1;
-/// Schema version for hormonal_state.bin slot (11 hormones × 4 fields × float32 = 176 bytes payload). Canonical hormone order matches NS_PROGRAMS in emot_bundle_protocol.py (REFLEX, FOCUS, INTUITION, IMPULSE, METABOLISM, CREATIVITY, CURIOSITY, EMPATHY, REFLECTION, INSPIRATION, VIGILANCE). Per-hormone fields: level, threshold, refractory, peak_level (read-mostly state surfaced from HormonalPressure class in titan_plugin/logic/hormonal_pressure.py).
+/// Schema version for ns_program_urgencies_input.bin slot (11 × float32 = 44 bytes payload — cross-process bridge from cognitive_worker canonical NS evaluator to ns_worker titanvm_registers.bin urgency-column writer + NS_URGENCIES_UPDATE → emot_cgn ns_urgencies substrate cache). NS_PROGRAMS row order from emot_bundle_protocol.py. Closes the load-bearing wire-up gap from ns_worker L2 carve-out (Phase C). Pattern mirrors NEUROMOD_INPUTS (§4.Q D-SPEC-57) + LIFE_FORCE_INPUTS (§4.G D-SPEC-57).
+pub const NS_PROGRAM_URGENCIES_INPUT_SCHEMA_VERSION: u64 = 1;
+/// Schema version for trajectory_state.bin slot (2 × float32 = 8 bytes payload — curvature + density global meta-scalars from state_132d[130:132] per consciousness.py:46). cognitive_worker writes from coordinator's freshly-computed values per _run_consciousness_epoch (bypassing the broken consciousness.latest_epoch.state_vector snapshot pipe). Reader: emot_cgn_worker (substrate trajectory_2d key in bundle). Retires TRAJECTORY_UPDATE bus event (PART B §8 D-SPEC-65 v1.9.6) per G18.
+pub const TRAJECTORY_STATE_SCHEMA_VERSION: u64 = 1;
+/// Schema version for cgn_beta_state.bin slot (8 × float32 = 32 bytes payload — per-consumer reward_ema in CGN_CONSUMERS order: language, social, knowledge, reasoning, coding, self_model, reasoning_strategy, meta from emot_bundle_protocol.py:172-175). cgn_worker writes from live cgn_consumer._reward_ema attribute (NOT the snapshot that defaults to 0.5). Reader: emot_cgn_worker (substrate cgn_beta_states key in bundle). Retires CGN_BETA_SNAPSHOT bus event (§23.6a) per G18.
+pub const CGN_BETA_STATE_SCHEMA_VERSION: u64 = 1;
+/// Schema version for hormonal_state.bin slot (11 hormones × 4 fields × float32 = 176 bytes payload). Canonical hormone order matches NS_PROGRAMS in emot_bundle_protocol.py (REFLEX, FOCUS, INTUITION, IMPULSE, METABOLISM, CREATIVITY, CURIOSITY, EMPATHY, REFLECTION, INSPIRATION, VIGILANCE). Per-hormone fields: level, threshold, refractory, peak_level (read-mostly state surfaced from HormonalPressure class in titan_hcl/logic/hormonal_pressure.py).
 pub const HORMONAL_STATE_SCHEMA_VERSION: u64 = 1;
 /// Schema version for identity.bin slot (kernel identity + per-boot nonce)
 pub const IDENTITY_SCHEMA_VERSION: u64 = 1;
@@ -294,10 +314,16 @@ pub const AGENCY_STATE_MAX_BYTES: u64 = 8192;
 pub const SOCIAL_PERCEPTION_STATE_SCHEMA_VERSION: u64 = 1;
 /// Max msgpack payload bytes for social_perception_state.bin.
 pub const SOCIAL_PERCEPTION_STATE_MAX_BYTES: u64 = 2048;
-/// Schema version for rl_state.bin slot — variable msgpack {programs[], current_program_id, dream_quality, training_loss_ema, transitions, last_train_ts, ts}. Owned by rl_worker. (Session 2.)
+/// Schema version for recorder_state.bin slot — variable msgpack {programs[], current_program_id, dream_quality, training_loss_ema, transitions, last_train_ts, ts}. Owned by recorder_worker (was rl_worker prior to v1.8.4 §4.N rename, D-SPEC-58). (Session 2.)
 pub const RL_STATE_SCHEMA_VERSION: u64 = 1;
-/// Max msgpack payload bytes for rl_state.bin.
+/// Max msgpack payload bytes for recorder_state.bin.
 pub const RL_STATE_MAX_BYTES: u64 = 4096;
+/// Schema version for interface_advisor_state.bin slot — variable msgpack {rates: {msg_type → current_rate_in_window}, limits: dict[msg_type → limit], window_s: float, rate_limit_count: int, schema_version: int, ts: float}. Owned by interface_advisor_worker (G21 single-writer). NEW v1.8.5 §4.H (D-SPEC-59).
+pub const INTERFACE_ADVISOR_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max msgpack payload bytes for interface_advisor_state.bin. NEW v1.8.5 §4.H (D-SPEC-59).
+pub const INTERFACE_ADVISOR_STATE_MAX_BYTES: u64 = 512;
+/// Minimum cadence between SHM republishes from interface_advisor_worker after IMPULSE_RECEIVED activity. Caps publish rate to 10Hz to avoid SHM thrash under burst. NEW v1.8.5 §4.H (D-SPEC-59).
+pub const INTERFACE_ADVISOR_RATE_REFRESH_CADENCE_S: f64 = 0.1;
 /// Schema version for memory_state.bin slot — variable msgpack {persistent_count, mempool_size, learning_velocity, directive_alignment, effective_nodes_24h, high_quality_count, kg_node_count, kg_edge_count, topology_clusters_summary, ts}. Owned by memory_worker. (Session 2.)
 pub const MEMORY_STATE_SCHEMA_VERSION: u64 = 1;
 /// Max msgpack payload bytes for memory_state.bin (topology_clusters_summary can include cluster digests).
@@ -322,14 +348,34 @@ pub const RESONANCE_STATE_MAX_BYTES: u64 = 4096;
 pub const UNIFIED_SPIRIT_METADATA_SCHEMA_VERSION: u64 = 1;
 /// Max msgpack payload bytes for unified_spirit_metadata.bin (full_130dt 130 floats + latest_epoch with 130D state vector + scalars — typical ~4-6KB, 8192B cap).
 pub const UNIFIED_SPIRIT_METADATA_MAX_BYTES: u64 = 8192;
+/// Schema version for resonance_metadata.bin slot — variable msgpack ResonanceDetector::get_stats() Rust-side output (pairs, resonant_count, all_resonant, great_pulse_count, last_great_pulse_ts, config, schema_version, ts). Rust-owned by titan-unified-spirit-rs (G21 single-writer). Replaces Python wrapper resonance_state.bin per rFP_phase_c_state_read_unification Phase B.
+pub const RESONANCE_METADATA_SCHEMA_VERSION: u64 = 1;
+/// Max msgpack payload bytes for resonance_metadata.bin (3 pairs × per-pair stats + counters + config — typical ~1.5KB, 4096B cap).
+pub const RESONANCE_METADATA_MAX_BYTES: u64 = 4096;
+/// Schema version for filter_down_state.bin slot — variable msgpack FilterDownV5Engine::get_stats() output (version, input_dim, output_dim, buffer_size, total_train_steps, last_loss, publish_enabled, spirit_filter_strength, cold_start_floor, multipliers_mean, multipliers, schema_version, ts). Rust-owned by titan-unified-spirit-rs (G21 single-writer). NEW slot replacing the bus-event-only V5 publish path with G18-compliant SHM read.
+pub const FILTER_DOWN_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max msgpack payload bytes for filter_down_state.bin (120 multipliers + 6 means + scalars — typical ~4KB, 8192B cap).
+pub const FILTER_DOWN_STATE_MAX_BYTES: u64 = 8192;
 /// Schema version for mind_state.bin slot — variable msgpack {mood_label, mood_valence, mood_intensity, current_reward, info_gain_ema, mood_history_digest, ts}. Owned by mind_worker (MoodEngine + reward telemetry). Supplements Rust-owned inner_mind_15d.bin tensor slot. Closes mind_proxy.get_mood_label/get_mood_valence/get_current_reward sync-RPC (rFP §4.B.6 + §4.C.2).
 pub const MIND_STATE_SCHEMA_VERSION: u64 = 1;
 /// Max msgpack payload bytes for mind_state.bin (mood scalars + small history digest, typical ~500B, 4096B cap).
 pub const MIND_STATE_MAX_BYTES: u64 = 4096;
+/// Schema version for expression_state.bin slot — variable msgpack {sovereignty_ratio, learned_actions, llm_actions, total_actions, posture_authenticity_ratio_30, top_mappings[], total_learned_pairs, intensity, composites{name → {urge, threshold, fire_count}}, ts}. Owned by main plugin (ExpressionTranslator.get_stats() + ExpressionManager.get_stats()). Closes rFP_phase_c_130d_rust_l1_port §3.2 — feeds inner_spirit SAT[2] sovereignty + CHIT[28] causal_understanding + ANANDA[8] expression_quality + outer_spirit SAT[1] expressive_authenticity. Sprint 7 §4.6 closure 2026-05-12.
+pub const EXPRESSION_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max msgpack payload bytes for expression_state.bin (sovereignty stats + ~15 top_mappings + composites dict, typical ~2-3KB, 8192B cap).
+pub const EXPRESSION_STATE_MAX_BYTES: u64 = 8192;
+/// Schema version for inner_perception_state.bin slot — variable msgpack {audio_state, visual_state, ambient_change, last_create_ts, ts}. Owned by main plugin (InnerPerception is parent-resident hardware ambient sampler). Phase C dissolution 2026-05-22: replaces the OUTER_SOURCES_SNAPSHOT.inner_perception_stats bus delivery to mind_worker (G18). Feeds inner_mind feeling[5] inner_hearing / [7] inner_sight / [9] inner_smell + outer_spirit ANANDA[41] creative_tension.
+pub const INNER_PERCEPTION_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max msgpack payload bytes for inner_perception_state.bin (audio_state + visual_state dicts + 2 scalars, typical <1KB, 4096B cap).
+pub const INNER_PERCEPTION_STATE_MAX_BYTES: u64 = 4096;
 /// Schema version for body_state.bin slot — variable msgpack {interoception, proprioception, somatosensation, entropy, thermal, sol_balance, sol_norm, block_delta_norm, anchor_fresh, body_health, body_details, ts}. Owned by body_worker. Supplements Rust-owned inner_body_5d.bin tensor slot with queryable body-detail metadata. Closes body_proxy.get_body_details sync-RPC (rFP §4.B.6 + §4.C.3).
 pub const BODY_STATE_SCHEMA_VERSION: u64 = 1;
 /// Max msgpack payload bytes for body_state.bin (body_details dict + scalars, typical ~1KB, 4096B cap).
 pub const BODY_STATE_MAX_BYTES: u64 = 4096;
+/// Schema version for social_x_state.bin slot — variable msgpack {recent_posts, current_urge, post_threshold, next_allowed_post_ts, posts_this_hour, posts_today, catalysts_pending, last_archetype_fired, archetype_dispatch_state, last_post_ts, is_canonical_poller, titan_id, ts}. Owned by social_worker (Phase C-S9 §4.C — chunk 9E SHIPPED 2026-05-12). 1 Hz publisher. Consumed by /v4/social Observatory route + dim-live producers (ANANDA[11]/[36]/[38]). Restored 2026-05-12 after auto-regen sweep dropped the entries — same pattern as f58d998e (EXPRESSION_STATE).
+pub const SOCIAL_X_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max msgpack payload bytes for social_x_state.bin (recent_posts list ~5 × 200B + scalars + archetype_dispatch_state dict, typical 10-20KB on T1 with active orchestrator, 32KB cap covers production worst-case + 10% margin).
+pub const SOCIAL_X_STATE_MAX_BYTES: u64 = 32768;
 /// Schema version for language_state.bin slot — variable msgpack {vocab_total, vocab_producible, vocab_contextual, avg_confidence, max_confidence, recent_words[], teacher_sessions_last_hour, composition_level, teacher_compositions_since, teacher_last_fire_time, ts}. Mirrors language_pipeline.update_language_stats() output (the same payload as LANGUAGE_STATS_UPDATE bus event). Owned by language_worker. Closes LANGUAGE_STATS_UPDATE RPC path (rFP §4.B.7 + §23.13 row 10).
 pub const LANGUAGE_STATE_SCHEMA_VERSION: u64 = 1;
 /// Max msgpack payload bytes for language_state.bin (small scalar set, 4096B cap).
@@ -338,10 +384,46 @@ pub const LANGUAGE_STATE_MAX_BYTES: u64 = 4096;
 pub const EVENTS_TEACHER_STATE_SCHEMA_VERSION: u64 = 1;
 /// Max msgpack payload bytes for events_teacher_state.bin (curated-signal scalar telemetry, 4096B cap).
 pub const EVENTS_TEACHER_STATE_MAX_BYTES: u64 = 4096;
-/// Schema version for spirit_supplemental_state.bin slot — variable msgpack {filter_down_status, meditation_health, coordinator, nervous_system, ts}. Owned by spirit_worker. Covers the 4 spirit_loop handlers Session 1 retained sync (filter_down_status / meditation_health / coordinator / nervous_system) until producer migrated. Closes spirit_proxy fully (rFP §4.C.1 expansion — Session 4 greenlight 2026-05-07).
-pub const SPIRIT_SUPPLEMENTAL_STATE_SCHEMA_VERSION: u64 = 1;
-/// Max msgpack payload bytes for spirit_supplemental_state.bin. Bumped 8192→65536 2026-05-07 after T3 deploy showed live payload at 58106B (coordinator section carries every spirit subsystem snapshot). 64KB cap covers production worst-case + 10% margin.
+/// Schema version for spirit_supplemental_state.bin slot — variable msgpack {filter_down_status, meditation_health, coordinator, nervous_system, post_context, ts}. Owned by spirit_worker (l0_rust_enabled=false) or cognitive_worker (l0_rust_enabled=true) — G21 single-writer holds per-Titan via mutually-exclusive flag gating. Covers the 4 spirit_loop handlers Session 1 retained sync (filter_down_status / meditation_health / coordinator / nervous_system) plus Phase C-S9 chunk 9Q-1 post_context section (pi_ratio + expression_composites_fire_counts + social_contagion_latest) consumed by social_worker's post-dispatch orchestration tick for PostContext construction. Schema bump 1→2 is backward-compatible — pre-9Q-1 consumers ignore the new key.
+pub const SPIRIT_SUPPLEMENTAL_STATE_SCHEMA_VERSION: u64 = 2;
+/// Max msgpack payload bytes for spirit_supplemental_state.bin. Bumped 8192→65536 2026-05-07 after T3 deploy showed live payload at 58106B (coordinator section carries every spirit subsystem snapshot). 64KB cap covers production worst-case + 10% margin. Phase C-S9 chunk 9Q-1 post_context section adds ~150 bytes (3 small subfields); no further bump needed for v2.
 pub const SPIRIT_SUPPLEMENTAL_STATE_MAX_BYTES: u64 = 65536;
+/// Schema version for social_graph_state.bin slot — variable msgpack {users: int, edges: int, donations: int, total_donated_sol: float, inspirations: int, engagement_ledger_today: int, schema_version: int, ts: float}. Owned by social_graph_worker (G21 single-writer). Closes G22 violation: mind_worker `_sense_taste` formerly called `social_graph.get_stats()` over a bus QUERY (the `get_social_stats` orphan-handler on phase_c_rpc_exemptions.yaml::orphan_handler_allowlist rationale: 'SocialGraph stats; full migration deferred'). Now reads SHM directly per G18 (state via SHM, never bus).
+pub const SOCIAL_GRAPH_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max msgpack payload bytes for social_graph_state.bin. Small fixed payload (~200 bytes nominal: 6 ints + 1 float + ts; cap at 8KB for headroom on future small extensions). 1Hz publisher cadence; G21 single-writer (social_graph_worker).
+pub const SOCIAL_GRAPH_STATE_MAX_BYTES: u64 = 8192;
+/// Schema version for metabolism_state.bin slot — variable msgpack {tier: str, balance_pct: float, gates_enforced: bool, last_gate_decision_reason: str, tier_info: dict, last_tier_change_ts: float, social_gravity_score: float, schema_version: int, ts: float}. Owned by metabolism_worker (G21 single-writer). Hot-path tier + gates_enforced reads (Soul NFT mint, memo_inscribe, dashboard /status, kernel `metabolism.get_metabolic_tier` proxy) bypass bus entirely via this slot per G18+G20.
+pub const METABOLISM_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max msgpack payload bytes for metabolism_state.bin. Small fixed payload (~400 bytes nominal: 1 str tier + 2 floats + 1 bool + 1 str reason + tier_info dict (~6 keys × small values) + 2 floats + 1 int schema + 1 float ts; cap at 2KB for headroom on future small extensions). 1Hz publisher cadence; G21 single-writer (metabolism_worker).
+pub const METABOLISM_STATE_MAX_BYTES: u64 = 2048;
+/// Schema version for dream_state.bin slot — variable msgpack {is_dreaming: bool, state: str (∈ {"awake", "dreaming", "dream_start", "dream_end"}), recovery_pct: float, remaining_epochs: int, wake_transition: bool, just_woke: bool, wake_ts: float, dream_started_ts: float, last_transition_ts: float (freshness probe), schema_version: int, ts: float}. Owned by dream_state_worker (G21 single-writer; sole writer under Phase C). Dual-trigger republish: on every KERNEL_EPOCH_TICK (1.0 Hz adaptive) + on every DREAMING_STATE_UPDATED arrival per D-SPEC-56 Maker Q6 greenlight. Hot-path is_dreaming reads (plugin chat-during-dream buffer decision, api_subprocess chat-bridge buffer decision, spirit_worker _read_is_dreaming_from_shm helper replacing the deleted _shared_is_dreaming module-level flag + 20+ readers, expression_worker tick-gate cache, timechain_worker dream-hook) bypass bus entirely via this slot per G18+G20. Closes the latent fleet-wide Phase C DREAM_STATE_CHANGED silent-emit bug.
+pub const DREAM_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max msgpack payload bytes for dream_state.bin. Base payload (~180 bytes: is_dreaming + state ∈ 4-set + recovery_pct + remaining_epochs + 2 bools + 3 floats + schema_version + ts) PLUS circadian telemetry (cycle_count + fatigue + developmental_age + epochs_since_dream) consumed by the Observatory DreamingTab/DreamingIndicator/CircadianClock — those pushed the payload to ~268B, overflowing the prior 256B cap (oversize guard rejected every write → dream_state.bin never created → /v4/dreaming lost cycle_count/epochs_since_dream/state). Bumped 256 → 512 for the new fields + headroom. Slot total = 64 + 3·512 = 1600 bytes. 1Hz dual-trigger publisher cadence; G21 single-writer (dream_state_worker).
+pub const DREAM_STATE_MAX_BYTES: u64 = 512;
+/// Schema version for life_force_state.bin slot — variable msgpack {total: float ∈ [0,1], spirit: ChiLayer, mind: ChiLayer, body: ChiLayer (each: {raw, effective, weight, thinking, feeling, willing, components: dict}), circulation: float, weights: {spirit, mind, body}, state: str ∈ {FLOURISHING/HEALTHY/CONSERVING/SURVIVAL/STARVATION}, developmental_phase: str ∈ {BIRTH/YOUTH/MATURE}, contemplation: {active, phase ∈ [0,4], phase_name, conviction, conviction_threshold, mature_enough, survival_mode?, action?}, metabolic_drain: float ∈ [0,0.8], is_dreaming: bool, schema_version: int, ts: float}. Owned by life_force_worker (G21 single-writer). Hot-path readers: cognitive_worker (MSL static_context chi_total + reasoning body_state + hormonal_pressure inputs + ground_up_enricher chi_overlay + NN modulation cap), api_subprocess (/v4/chi route via chi.state cache key — populated by CHI_UPDATED bus event whose producer is now life_force_worker), metabolism_worker (soft-dep tier weighting per metabolism_worker.py:93-95 NULL-safe subscriber, wired in v1.7.2 awaiting this slot). 1 Hz cadence; republish-on-change content-hash gated.
+pub const LIFE_FORCE_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max msgpack payload bytes for life_force_state.bin. Typical 1200-1600 bytes (3 ChiLayer dicts × ~400 bytes each + circulation + weights + state + contemplation + drain + ts; cap at 4096B for headroom on future components-dict extensions per Maker Q2 lock 2026-05-15). 1Hz publisher cadence; G21 single-writer (life_force_worker).
+pub const LIFE_FORCE_STATE_MAX_BYTES: u64 = 4096;
+/// Schema version for life_force_inputs.bin slot — variable msgpack {pi_heartbeat_ratio, developmental_age: int, sovereignty_index: int, spirit_coherence, vocabulary_size: int, learning_rate_gain, emotional_coherence, neuromodulator_homeostasis, mind_coherence, expression_fire_rate, sol_balance, anchor_freshness, hormonal_vitality, body_coherence, topology_grounding, infrastructure_health: float (each input × float), schema_version: int, ts: float}. Cross-process bridge feeding life_force_worker.evaluate per KERNEL_EPOCH_TICK — cognitive_worker aggregates the 16 emergent inputs from its in-process state via compute_life_force_inputs(...) and writes the result here. Mirrors §4.Q neuromod_inputs.bin pattern (same writer/reader roles, same cadence). G21 single-writer = cognitive_worker.
+pub const LIFE_FORCE_INPUTS_SCHEMA_VERSION: u64 = 1;
+/// Max msgpack payload bytes for life_force_inputs.bin. Typical 300-450 bytes (16 floats + 3 ints + schema + ts; cap at 1024B for headroom). 1Hz cadence matching KERNEL_EPOCH_TICK (adaptive 1-30s); G21 single-writer (cognitive_worker).
+pub const LIFE_FORCE_INPUTS_MAX_BYTES: u64 = 1024;
+/// Schema version for meditation_state.bin slot — variable msgpack {tracker: {last_epoch: int, count: int, count_since_nft: int, last_ts: float, in_meditation: bool, current_phase: str (∈ {"idle", "entering", "deep", "exiting"})}, watchdog: {last_check_ts: float, gap_samples: int, expected_interval_hours: float, in_meditation_since_ts: float, consecutive_zero_promoted: int, selftest_done: bool, selftest_pass: bool}, last_alert: {severity, failure_mode, detail, ts} | null, last_completion: {epoch, promoted, pruned, trigger, success, ts} | null, schema_version: int, ts: float}. Owned by meditation_worker (G21 single-writer; sole writer under Phase C). Dual-trigger republish: on every KERNEL_EPOCH_TICK (1.0 Hz adaptive floor) + on every transition (in_meditation flip, phase change, watchdog alert, completion) per D-SPEC-57 Maker Q1/Q3 greenlight. Hot-path reads (/v4/meditation/health dashboard, daily_nft trigger, soul-NFT mint cron) bypass bus entirely via this slot per G18+G20. Closes the cross-process state_refs['meditation_tracker'] direct dict reference + spirit_supplemental_state.bin meditation_health section indirection (G21 violation).
+pub const MEDITATION_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max msgpack payload bytes for meditation_state.bin. Fixed small payload (~400 bytes nominal: tracker section ~60B + watchdog section ~80B + last_alert ~80B + last_completion ~100B + framing ~80B; cap at 1024B for headroom on long failure_mode/detail strings). 1Hz + on-transition publisher cadence; G21 single-writer (meditation_worker).
+pub const MEDITATION_STATE_MAX_BYTES: u64 = 1024;
+/// Schema version for studio_state.bin slot — variable msgpack payload (matches the Python L2 slot family pattern: metabolism_state.bin D-SPEC-51 / social_graph_state.bin D-SPEC-50 / dream_state.bin D-SPEC-56). Schema: {schema_version: int, meditation_count: int, epoch_count: int, eureka_count: int, last_render_ts: float (unix epoch, 0 if no renders yet), last_render_type: str ∈ {"none", "meditation", "epoch", "eureka"}, output_root: str (output_path config — readers can hash for config-drift detection), default_resolution: int, highres_resolution: int, nft_composite_enabled: bool, ts: float}. Owned by studio_worker (G21 single-writer; sole writer under Phase C). Dual-trigger republish on every KERNEL_EPOCH_TICK (1.0 Hz adaptive cadence — keeps counts fresh against external dir scans) + immediately after each successful render (updates counts + last_render_ts / last_render_type). Hot-path stats reads (/v4/studio/stats Observatory route, future dashboards) bypass bus entirely via this slot per G18+G20.
+pub const STUDIO_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max msgpack payload bytes for studio_state.bin. Fixed small payload (~180 bytes nominal: ~11 keys, all primitives + 2 short strings); cap at 512B for headroom. 1Hz dual-trigger publisher cadence; G21 single-writer (studio_worker).
+pub const STUDIO_STATE_MAX_BYTES: u64 = 512;
+/// Schema version for agno_state.bin slot — variable msgpack. v1 (1.17.0): {schema_version, session_count, last_chat_ts, total_chats_24h, provider_stats, dream_inbox_size, ts}. v2 (1.18.0, D-SPEC-76): adds {session_cache_size, session_hits, session_misses} for agno session pre-warm LRU observability. Owned by agno_worker (G21 single-writer). Dual-trigger republish: every KERNEL_EPOCH_TICK (1.0 Hz adaptive floor) + immediately after every chat completion.
+pub const AGNO_STATE_SCHEMA_VERSION: u64 = 2;
+/// Max msgpack payload bytes for agno_state.bin. Fixed small payload (~250 bytes nominal: 5 primitive fields + provider_stats dict per active provider ~50B each + 3 LRU counters @v2); cap at 512B for headroom. 1Hz + on-completion publisher cadence; G21 single-writer (agno_worker).
+pub const AGNO_STATE_MAX_BYTES: u64 = 512;
+/// Default capacity for agno_worker's (user_id, session_id) LRU pre-warm cache (D-SPEC-76). Overridable via [agno_worker].session_cache_capacity in titan_hcl/config.toml. Hits/misses/size surfaced in agno_state.bin schema v2 for Observatory + health monitor.
+pub const AGNO_SESSION_CACHE_DEFAULT_CAPACITY: u64 = 32;
+/// Maximum age of a safety_verdict_token (HMAC issued by OutputVerifier.verify_safety) consumable by OutputVerifier.sign_and_commit (D-SPEC-74). Matches the 90s phase_c_rpc_exemptions.yaml allowlist for agno_proxy → agno_worker work-RPC ceiling — no signing of in-flight requests that would have already returned 504 to the user. Defense-in-depth: prevents replay of stale safety verdicts; combined with HMAC binding to (prompt, response, channel, ts), forging signing without a paired in-window safety check is cryptographically prevented.
+pub const OVG_SAFETY_VERDICT_TOKEN_TTL_S: f64 = 90.0;
 /// Schema version for inner_body_firing.bin dim-firing diagnostic slot. Producer: body_worker via DimFiringTracker.record_block. Reader: api_subprocess /v4/debug/dim-sources endpoint.
 pub const INNER_BODY_FIRING_SCHEMA_VERSION: u64 = 1;
 /// Max msgpack payload bytes for inner_body_firing.bin (5 dims × per-dim {v, ts} + block metadata + inputs_state).
@@ -366,6 +448,50 @@ pub const OUTER_MIND_FIRING_MAX_BYTES: u64 = 2048;
 pub const OUTER_SPIRIT_FIRING_SCHEMA_VERSION: u64 = 1;
 /// Max msgpack payload bytes for outer_spirit_firing.bin (45 dims × per-dim {v, ts} + block metadata + 25 inputs_state).
 pub const OUTER_SPIRIT_FIRING_MAX_BYTES: u64 = 4096;
+/// Schema version for soul_state.bin slot — variable msgpack {maker_pubkey: str, nft_address: str, current_gen: int, active_directives: list[dict], directives_count: int, last_directive_ts: float, soul_initialized: bool, schema_version: int, ts: float}. Owned by sovereignty_worker (G21 single-writer). Reader: api_subprocess StateAccessor.soul + IdentityAccessor.maker_pubkey fallback per Phase A.4 closing the soul.state bus-cache lookup.
+pub const SOUL_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max bytes for soul_state.bin payload. Typical ≈ 600-1200 bytes (depends on active_directives count). Bounded 2KB cap.
+pub const SOUL_STATE_MAX_BYTES: u64 = 2048;
+/// Schema version for cgn_engine_state.bin slot — variable msgpack {consumers: dict[str→dict], total_transitions: int, buffer_size: int, consolidations: int, anchor_count: int, sigma_updates: int, soar_impasses: int, haov_stats: dict, schema_version: int, ts: float}. Owned by cgn_worker (G21 single-writer). Sibling to existing cgn_live_weights.bin (tensor) + cgn_beta_state.bin (8-float per-consumer reward EMA) — this slot carries the engine-level stats previously surfaced via cgn.stats bus-cache key. Reader: api_subprocess StateAccessor.cgn.
+pub const CGN_ENGINE_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max bytes for cgn_engine_state.bin payload. CGN has 9 consumers × ~10 fields each plus aggregates → typically 3-5KB. Bounded 8KB cap.
+pub const CGN_ENGINE_STATE_MAX_BYTES: u64 = 8192;
+/// Schema version for reasoning_state.bin slot — variable msgpack {total_chains: int, total_commits: int, commit_rate: float, avg_chain_length: float, buffer_size: int, current_active: bool, last_action: str, last_outcome: str, action_distribution: dict[str→int], schema_version: int, ts: float}. Owned by cognitive_worker (engine lives there per SPEC §1 glossary). Reader: api_subprocess StateAccessor.reasoning + memory.get_reasoning_state.
+pub const REASONING_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max bytes for reasoning_state.bin payload. Typical ≈ 800-1500 bytes. Bounded 4KB cap.
+pub const REASONING_STATE_MAX_BYTES: u64 = 4096;
+/// Schema version for meta_reasoning_state.bin slot. v2 (D-SPEC-91, v1.30.0) — additive extension: {total_meta_chains: int, total_introspect_picks: int, total_introspect_executions: int, monoculture_score: float, primitive_distribution: dict[str→float], last_chain_id: int, last_chain_reason: str, last_chain_succeeded: bool, subsystem_signals_status: dict, meta_cgn: dict, schema_version: int, ts: float}. meta_cgn = {status, graduation: {progress, rolled_back_count}, primitives_well_sampled, haov: {by_status: {confirmed}}, updates_applied, ready_to_graduate, primitive_v_summary: dict[str→float], failsafe: {status, last_check_ts, recent_failures}}. failsafe nested under meta_cgn matching MetaCGNConsumer.get_stats() native shape + /v4/meta-cgn/failsafe-status drill path. v1 readers tolerate missing meta_cgn key (defaults to empty dict). Owned by cognitive_worker (MetaReasoningEngine lives there). Reader: api_subprocess StateAccessor.spirit.get_coordinator overlay (meta_reasoning key) feeding /v4/meta-cgn + /v4/meta-cgn/failsafe-status + /v4/meta-cgn/graduation-readiness dashboard endpoints.
+pub const META_REASONING_STATE_SCHEMA_VERSION: u64 = 2;
+/// Max bytes for meta_reasoning_state.bin payload. Typical ≈ 1-2KB (subsystem signals + primitive distribution). Bounded 4KB cap.
+pub const META_REASONING_STATE_MAX_BYTES: u64 = 4096;
+/// Schema version for consciousness_age.bin slot — variable msgpack {age_epochs: int, schema_version: int, ts: float}. Owned by cognitive_worker (Consciousness lives in spirit_loop under cognitive_worker per SPEC §1 glossary). G21 single-writer. Reader: api_subprocess + post_dispatch footer (canonical source for Titan's 'main age' — the fast cognitive self-observation tick counter, distinct from unified_spirit_metadata.epoch_count GreatEpoch counter). Per D-SPEC-85 v1.25.0.
+pub const CONSCIOUSNESS_AGE_SCHEMA_VERSION: u64 = 1;
+/// Max bytes for consciousness_age.bin payload. Tiny dict (~30-50 bytes). Bounded 256B cap; fits trivially with msgpack overhead.
+pub const CONSCIOUSNESS_AGE_MAX_BYTES: u64 = 256;
+/// Schema version for meta_teacher_state.bin slot — variable msgpack {total_critiques: int, voice_tuning_enabled: bool, peer_exchange_enabled: bool, last_critique_ts: float, per_domain_critiques: dict[str→int], adoption_rate: float, schema_version: int, ts: float}. Owned by cognitive_worker (MetaTeacherEngine instance). Reader: api_subprocess StateAccessor.meta_teacher.
+pub const META_TEACHER_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max bytes for meta_teacher_state.bin payload. Typical ≈ 600-1500 bytes. Bounded 4KB cap.
+pub const META_TEACHER_STATE_MAX_BYTES: u64 = 4096;
+/// Schema version for guardian_state.bin slot — variable msgpack {modules: dict[str→{state: str, pid: int, rss_mb: float, uptime: float, restart_count: int, restarts_in_window: int, last_heartbeat_age: float, layer: str, start_method: str, adopted: bool, adopt_ts: float}], total_modules: int, modules_by_layer: dict[str→list[str]], escalation_count: int, schema_version: int, ts: float}. Owned by guardian (Python L1 supervisor — `titan_hcl/guardian.py`). Reader: api_subprocess StateAccessor.guardian.get_status + get_modules_by_layer.
+pub const GUARDIAN_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max bytes for guardian_state.bin payload. ~30-40 modules × ~200 bytes each → typically 8-10KB. Bounded 16KB cap accommodates fleet growth.
+pub const GUARDIAN_STATE_MAX_BYTES: u64 = 16384;
+/// Schema version for llm_state.bin slot — variable msgpack {provider: str, model: str, total_completions: int, completions_this_hour: int, avg_latency_ms: float, p99_latency_ms: float, total_input_tokens: int, total_output_tokens: int, last_completion_ts: float, last_error: str, error_rate: float, schema_version: int, ts: float}. Owned by llm_worker (G21 single-writer). Reader: api_subprocess StateAccessor.llm.
+pub const LLM_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max bytes for llm_state.bin payload. Typical ≈ 600-900 bytes. Bounded 4KB cap.
+pub const LLM_STATE_MAX_BYTES: u64 = 4096;
+/// Schema version for media_state.bin slot — variable msgpack {meditation_render_count: int, epoch_render_count: int, eureka_render_count: int, last_render_ts: float, last_render_type: str, total_disk_mb: float, nft_composite_count: int, schema_version: int, ts: float}. Owned by studio_worker (G21 single-writer). Distinct from existing studio_state.bin in that this slot carries media-pipeline counters consumed by dashboard's MediaAccessor (studio_state.bin is owned by StudioCoordinator with broader render lifecycle data). Reader: api_subprocess StateAccessor.media.
+pub const MEDIA_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max bytes for media_state.bin payload. Typical ≈ 400-700 bytes. Bounded 2KB cap.
+pub const MEDIA_STATE_MAX_BYTES: u64 = 2048;
+/// Schema version for msl_state.bin slot — variable msgpack {synthesis_count: int, novel_associations: int, cross_modal_bindings: int, decay_rate: float, current_capacity: int, schema_version: int, ts: float}. Owned by cognitive_worker (MSL — Multisensory Synthesis Layer engine — lives there per SPEC §1 glossary preamble_extensions_pending). Reader: api_subprocess StateAccessor.spirit.get_coordinator overlay (msl key).
+pub const MSL_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max bytes for msl_state.bin payload. Typical ≈ 300-600 bytes. Bounded 2KB cap.
+pub const MSL_STATE_MAX_BYTES: u64 = 2048;
+/// Schema version for network_state.bin slot — variable msgpack {balance_sol: float, pubkey: str, premium_rpc: str|None, rpc_urls: list[str], rpc_endpoint: str, recent_account_data: dict[str→dict], last_balance_update_ts: float, last_info_update_ts: float, network_available: bool, schema_version: int, ts: float}. Owned by network_state writer in titan_HCL kernel monitor_tick loop (G21 single-writer). Reader: api_subprocess StateAccessor.network. Closes the network.balance / network.info / network.account.* bus-cache state-lookups per Preamble G18. Note: this slot exposes the Solana RPC client's cached state, not the live RPC (each request to /v4/wallet etc. still hits the RPC if cache is stale).
+pub const NETWORK_STATE_SCHEMA_VERSION: u64 = 1;
+/// Max bytes for network_state.bin payload. Typical ≈ 600-1200 bytes (depends on cached account_data entries). Bounded 4KB cap.
+pub const NETWORK_STATE_MAX_BYTES: u64 = 4096;
 
 // ── SCHUMANN ──────────────────────────────────────────────────────────────
 // 7.83 / 23.49 / 70.47 Hz frequencies (locked by biology, NOT tunable)
@@ -418,6 +544,10 @@ pub const MODULE_HEARTBEAT_INTERVAL_S: f64 = 10.0;
 pub const MODULE_HEARTBEAT_TIMEOUT_S: f64 = 90.0;
 /// Default per-module RSS limit (overridable via ModuleSpec.rss_limit_mb)
 pub const MODULE_DEFAULT_RSS_LIMIT_MB: u64 = 1500;
+/// Maximum end-to-end elapsed time for Guardian.reload_module() to reach MODULE_RELOAD_ACK status=ready. Acceptance gate §4.6 #1. Sized to exceed L2 worker boot (2-8s) + adoption (~1-3s) + margin.
+pub const MODULE_RELOAD_HAPPY_PATH_S: f64 = 10.0;
+/// Default caller-side timeout on Guardian.reload_module(). Larger than MODULE_RELOAD_HAPPY_PATH_S to allow rollback path to complete cleanly. Also bounds the §11.B.3 supervision-suppression window.
+pub const MODULE_RELOAD_DEFAULT_TIMEOUT_S: f64 = 30.0;
 
 // ── GUARDIAN_HCL ──────────────────────────────────────────────────────────
 // guardian_HCL Python supervisor internals (Python-only — Rust supervision uses shm slot freshness, not heartbeat)
@@ -454,6 +584,16 @@ pub const DATA_QUERY_DRAIN_TIMEOUT_S: f64 = 2.0;
 pub const DATA_BACKUP_RETENTION_GENERATIONS: u64 = 2;
 /// Per-file integrity-check timeout at boot (G16 invariant 5)
 pub const DATA_INTEGRITY_CHECK_TIMEOUT_S: f64 = 5.0;
+/// Monthly baseline rebase cadence — full snapshot on 1st of UTC month OR when chain depth cap hit (first-wins per SPEC §24.2)
+pub const BACKUP_BASELINE_CADENCE_DAYS: u64 = 30;
+/// Max incrementals before forcing baseline rebase (chain-depth cap per SPEC §24.2; pairs with monthly date-trigger first-wins)
+pub const BACKUP_INCREMENTAL_MAX_CHAIN_DEPTH: u64 = 30;
+/// Weekly mandatory restore-test (full byte-for-byte) per SPEC §24.12 — every Sunday after soul upload
+pub const BACKUP_RESTORE_TEST_CADENCE_DAYS: u64 = 7;
+/// Per-tarball Arweave fetch + Merkle verification timeout during restore (mismatch emits BACKUP_MERKLE_MISMATCH P0)
+pub const BACKUP_VERIFY_MERKLE_TIMEOUT_S: f64 = 30.0;
+/// Daily-incremental FAISS index ships full only when content_hash changes by >5% (signal of major retrain); otherwise FAISS ships only at weekly cadence per SPEC §24.5
+pub const BACKUP_FAISS_FULL_SHIP_DELTA_THRESHOLD_PCT: f64 = 5.0;
 
 // ── WORKER ────────────────────────────────────────────────────────────────
 // Generic Python worker shutdown grace (used by all L2/L3 modules under guardian_HCL)
@@ -464,22 +604,22 @@ pub const WORKER_SHUTDOWN_GRACE_S: f64 = 5.0;
 // ── OUTER ─────────────────────────────────────────────────────────────────
 // Outer trinity daemon cadences (NOT Schumann-locked; per SPEC §18.1)
 
-/// Outer-body Python sensor sidecar refresh period; stale-threshold = 3× this. Post-A.S8 the Rust daemon ticks at SCHUMANN_BODY_HZ (7.83 Hz) — this constant defines sidecar cadence + sensor staleness, NOT daemon tick rate.
-pub const OUTER_BODY_TICK_BASE_S: f64 = 10.0;
+/// Outer-body Python sensor sidecar source-refresh period; stale-threshold = 3× this (135s). Post-A.S8 the Rust daemon ticks at SCHUMANN_BODY_HZ (7.83 Hz) — this constant defines sidecar cadence + sensor staleness, NOT daemon tick rate. G13 body-slowest: 45s = strict 1:3:9 with mind 15s / spirit 5s; mirrors OUTER_BODY_BUS_PUBLISH_INTERVAL_S (45s) and the 5/15/45 dim counts (body 5D reads slowest). Was 10s (1:2:6 inverted) pre-D-SPEC-100.
+pub const OUTER_BODY_TICK_BASE_S: f64 = 45.0;
 /// Outer-body sensor sidecar jitter (±). DEPRECATED for daemon tick — daemon now uses SchumannGenerator (no jitter).
 pub const OUTER_BODY_TICK_JITTER_PCT: u64 = 20;
 /// Outer-body daemon bus publish throttle interval. Daemon ticks at Schumann body (7.83 Hz) but throttles MIND_STATE/SPIRIT_STATE bus publishes to this cadence. Body-slowest G13 invariant: this > OUTER_MIND_BUS_PUBLISH_INTERVAL_S > OUTER_SPIRIT_BUS_PUBLISH_INTERVAL_S.
 pub const OUTER_BODY_BUS_PUBLISH_INTERVAL_S: f64 = 45.0;
-/// Outer-mind Python sensor sidecar refresh period; stale-threshold = 3× this. Post-A.S8 the Rust daemon ticks at SCHUMANN_MIND_HZ (23.49 Hz) — this constant defines sidecar cadence + sensor staleness, NOT daemon tick rate.
-pub const OUTER_MIND_TICK_BASE_S: f64 = 5.0;
+/// Outer-mind Python sensor sidecar source-refresh period; stale-threshold = 3× this (45s). Post-A.S8 the Rust daemon ticks at SCHUMANN_MIND_HZ (23.49 Hz) — this constant defines sidecar cadence + sensor staleness, NOT daemon tick rate. G13: 15s = strict 1:3:9 (spirit 5s / mind 15s / body 45s); mirrors OUTER_MIND_BUS_PUBLISH_INTERVAL_S (15s) and the 15D dim count. Was 5s pre-D-SPEC-100.
+pub const OUTER_MIND_TICK_BASE_S: f64 = 15.0;
 /// Outer-mind sensor sidecar jitter (±). DEPRECATED for daemon tick.
 pub const OUTER_MIND_TICK_JITTER_PCT: u64 = 20;
 /// Outer-mind daemon bus publish throttle interval. Daemon ticks at Schumann mind (23.49 Hz) but throttles MIND_STATE bus publishes to this cadence.
 pub const OUTER_MIND_BUS_PUBLISH_INTERVAL_S: f64 = 15.0;
 /// Outer-spirit daemon bus publish throttle interval. Daemon ticks at Schumann spirit (70.47 Hz) but throttles SPIRIT_STATE / OUTER_SPIRIT_FILTER_DOWN bus publishes to this cadence. Spirit-fastest at bus layer (mirrors inner spirit publish rate).
 pub const OUTER_SPIRIT_BUS_PUBLISH_INTERVAL_S: f64 = 5.0;
-/// Outer-spirit Python sensor sidecar refresh period; stale-threshold = 3× this. Post-A.S8 the Rust daemon ticks at SCHUMANN_SPIRIT_HZ (70.47 Hz) — this constant defines sidecar cadence + sensor staleness, NOT daemon tick rate.
-pub const OUTER_SPIRIT_TICK_BASE_S: f64 = 30.0;
+/// Outer-spirit Python sensor sidecar source-refresh period; stale-threshold = 3× this (15s). Post-A.S8 the Rust daemon ticks at SCHUMANN_SPIRIT_HZ (70.47 Hz) — this constant defines sidecar cadence + sensor staleness, NOT daemon tick rate. G13 spirit-fastest: 5s = strict 1:3:9 (spirit 5s / mind 15s / body 45s); mirrors OUTER_SPIRIT_BUS_PUBLISH_INTERVAL_S (5s) and the 45D dim count (spirit carries the most dims and reads fastest). Was 30s (slowest — inverted) pre-D-SPEC-100. Load-safe: _gather_outer_sources reads in-process + bus-cached stats only; separate _heavy_stats_refresher owns DB/RPC cadence.
+pub const OUTER_SPIRIT_TICK_BASE_S: f64 = 5.0;
 /// Outer-spirit sensor sidecar jitter (±). DEPRECATED for daemon tick.
 pub const OUTER_SPIRIT_TICK_JITTER_PCT: u64 = 10;
 /// Start dim of outer_mind willing range (ground_up applies here per G10 ground_up_mind_range=10:15)
@@ -488,11 +628,11 @@ pub const OUTER_MIND_WILLING_DIM_START: u64 = 10;
 pub const OUTER_MIND_WILLING_DIM_END: u64 = 15;
 /// Sensor cache staleness threshold = N × daemon's natural cadence (wall_ns < now − N×cadence → cache stale, daemon writes last-known with confidence=0.0 log)
 pub const OUTER_CACHE_STALE_CADENCE_MULTIPLIER: u64 = 3;
-/// Max payload bytes for sensor_cache_outer_body.bin (msgpack source dict + Step 3 hormone_levels). Bumped 8192→65536 2026-05-10.
+/// Max payload bytes for sensor_cache_outer_body.bin (msgpack source dict per O4 lock — agency_stats/helper_statuses/bus_stats/system_sensor_stats/network_monitor_stats/tx_latency_stats/block_delta_stats/anchor_state/sol_balance). Bumped 8192→65536 (v1.36.3): restores commit dd7e1d91's intent, which edited only the generated _phase_c_constants.py + constants.rs and was reverted by the next regen — Step 3 §4.3 P3 SOURCE_KEYS extension produces payloads up to ~33KB.
 pub const OUTER_SENSOR_CACHE_BODY_MAX_BYTES: u64 = 65536;
-/// Max payload bytes for sensor_cache_outer_mind.bin (msgpack source dict + Step 3 SOURCE_KEYS extensions). Bumped 8192→65536 2026-05-10 (live oversize at 32970B).
+/// Max payload bytes for sensor_cache_outer_mind.bin (msgpack source dict — persona narrative + social context + creative_stats + memory_stats + agency_stats). Bumped 8192→65536 (v1.36.3): restores commit dd7e1d91's intent (lost on regen — generated-files-only edit).
 pub const OUTER_SENSOR_CACHE_MIND_MAX_BYTES: u64 = 65536;
-/// Max payload bytes for sensor_cache_outer_spirit.bin (msgpack source dict + Step 3 SOURCE_KEYS extensions). Bumped 8192→65536 2026-05-10 (live oversize at 32994B).
+/// Max payload bytes for sensor_cache_outer_spirit.bin (msgpack pre-aggregated outer-state — action_stats/sovereignty_ratio/uptime_ratio/social_stats/solana_stats/hormone_levels/recovery_stats/creative_stats/memory_stats/assessment_stats/history). Bumped 8192→65536 (v1.36.3): restores commit dd7e1d91's intent (lost on regen). Step 3 §4.3 P3 SOURCE_KEYS extension produces ~33KB payloads on T3; the 8192 cap silently rejected oversize writes, freezing outer_spirit dims on stale data.
 pub const OUTER_SENSOR_CACHE_SPIRIT_MAX_BYTES: u64 = 65536;
 
 // ── OUTER_SPIRIT ──────────────────────────────────────────────────────────
@@ -518,3 +658,21 @@ pub const COGNITIVE_EPOCH_DEFAULT_INTERVAL_S: f64 = 10.35;
 pub const COGNITIVE_EPOCH_MAX_INTERVAL_S: f64 = 31.05;
 /// Engine state persistence cadence — every 100 epochs (≈10–30 min wall time at default 10.35s, max 51 min at 31.05s ceiling). Persists reasoning_totals.json + dreaming_state.json + pi_heartbeat_state.json + neural_ns/* + msl/* atomically per G16 invariants. Intermediate crash recovers from last checkpoint without losing chain history.
 pub const COGNITIVE_PERSIST_EVERY_N_EPOCHS: u64 = 100;
+/// Maximum entries in dream_state_worker's _dream_inbox chat-during-dream buffer (deque maxlen). Matches the existing plugin.py:2270 429-error threshold ('Titan is dreaming and message queue is full (50)') preserved verbatim through the carve. Chat handlers (plugin + api_subprocess) check this cap before emitting DREAM_INBOX_ENQUEUE; queue-full → return standard 429 to client. Queue is volatile by design (worker crash forfeits messages, same as today's plugin._dream_inbox in-memory behavior).
+pub const DREAM_INBOX_MAX_ENTRIES: u64 = 50;
+/// Upward-crossing threshold for FATIGUE_LEVEL_CRITICAL emission — when life_force_engine._metabolic_drain ≥ 0.7 (87.5% of 0.8 cap), life_force_worker emits the P1 single-shot event. Edge-debounced: re-emission requires drain to drop below LIFE_FORCE_FATIGUE_RESET (0.6) first, preventing threshold-edge oscillation. Publish-only per Maker Q6 2026-05-15; consumer wiring (cognitive_worker epoch-cadence reducer) deferred to follow-up rFP.
+pub const LIFE_FORCE_FATIGUE_THRESHOLD: f64 = 0.7;
+/// Hysteresis reset threshold for FATIGUE_LEVEL_CRITICAL — once emitted at drain≥0.7, the single-shot edge re-arms only after drain falls back ≤0.6. Prevents oscillation when drain hovers near the threshold.
+pub const LIFE_FORCE_FATIGUE_RESET: f64 = 0.6;
+/// Proportional drain-recovery factor applied to LifeForceEngine._metabolic_drain on every MEDITATION_COMPLETE event (drain *= 0.85 → ~15% reduction). Matches the *= 0.93 dreaming-recovery precedent at life_force.py:303 (7%/eval) in proportional shape. Maker Q4 lock 2026-05-15.
+pub const LIFE_FORCE_MEDITATION_RECOVERY_FACTOR: f64 = 0.85;
+/// Max chat message length buffered into dream_state_worker's _dream_inbox during dream. Matches the existing plugin.py:2280 truncation (`message[:500]`) preserved verbatim through the carve. Chat handlers truncate before emitting DREAM_INBOX_ENQUEUE.
+pub const DREAM_INBOX_MAX_MESSAGE_CHARS: u64 = 500;
+/// Cadence at which dream_state_worker republishes dream_state.bin SHM slot on every KERNEL_EPOCH_TICK (dual-trigger pattern: on tick + on DREAMING_STATE_UPDATED arrival per Maker Q6 greenlight 2026-05-15). Last_transition_ts field in the payload is the freshness probe — readers detect staleness if (time.time() - last_transition_ts) > DREAM_STATE_REPUBLISH_CADENCE_S * 5. Prevents readers from seeing infinite-stale SHM if cognitive_worker hangs (same staleness-detection pattern as metabolism_worker per D-SPEC-51).
+pub const DREAM_STATE_REPUBLISH_CADENCE_S: f64 = 1.0;
+
+// ── SOCIAL ────────────────────────────────────────────────────────────────
+// L3 social-presence + X-posting cluster owned by social_worker L2 module (Phase C-S9 §4.C SHIPPED 2026-05-12 per PLAN_microkernel_phase_c_s9_social_worker_extraction.md). Houses SocialXGateway + SocialPressureMeter + ArchetypeDispatcher + PostDispatchOrchestrator + per-Titan polling-autonomy gates (canonical_poller_titan_id). Tick cadence + bus event priorities here decouple posting policy from underlying engine state (which flows via SHM).
+
+/// Cadence at which social_worker's PostDispatchOrchestrator drives one orchestration tick (build PostContext from SHM → optional delegate-rotation → F-phase pre-post → gateway.post → outcome emit → mention-cycle 30-min-gated → polling broadcasts on canonical poller). Matches legacy spirit_worker:7772 which gated the same block on `_msl_tick_count % 30 == 0` at 1 Hz tick (~30s). Configurable via [social_x].post_dispatch_tick_interval_seconds in titan_hcl/config.toml — read once at worker boot per `feedback_no_quick_patches_only_spec_correct_solutions` (set up front, not per-tick).
+pub const POST_DISPATCH_TICK_INTERVAL_SECONDS: f64 = 30.0;

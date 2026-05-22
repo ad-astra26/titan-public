@@ -1,9 +1,9 @@
 """Tests for Step 7.7 — CodingSandboxHelper (AST-validated code execution)."""
 import pytest
-from titan_plugin.logic.agency.helpers.coding_sandbox import (
+from titan_hcl.logic.agency.helpers.coding_sandbox import (
     CodingSandboxHelper, validate_code, ALLOWED_IMPORTS, BLOCKED_IMPORTS,
 )
-from titan_plugin.logic.agency.registry import BaseHelper
+from titan_hcl.logic.agency.registry import BaseHelper
 
 
 class TestASTValidation:
@@ -137,7 +137,7 @@ class TestHelperRegistration:
     """Verify CodingSandbox registers in the registry."""
 
     def test_register_in_registry(self):
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.registry import HelperRegistry
         registry = HelperRegistry()
         helper = CodingSandboxHelper()
         registry.register(helper)

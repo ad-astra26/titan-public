@@ -5,8 +5,8 @@ import os
 import pytest
 import tempfile
 
-from titan_plugin.logic.inner_memory import InnerMemoryStore
-from titan_plugin.logic.language_learning import (
+from titan_hcl.logic.inner_memory import InnerMemoryStore
+from titan_hcl.logic.language_learning import (
     LanguageLearningExperience,
     _cosine_similarity,
     _flatten_perturbation,
@@ -241,17 +241,20 @@ class TestLanguageLearningPlugin:
         assert len(pert["outer_body"]) == 5
         assert len(pert["outer_mind"]) == 15
         assert len(pert["outer_spirit"]) == 45
-        # "warm" has inner_body thermal +0.4
-        assert pert["inner_body"][4] == pytest.approx(0.4)
+        # "warm" has inner_body thermal +0.4 (recipe value);
+        # FEEL pass scales by 0.5 → 0.2 (scale narrowed from 1.0/0.3 to
+        # 0.5/0.15 to test autonomous word selection with less
+        # scaffolding — see language_learning.compute_perturbation).
+        assert pert["inner_body"][4] == pytest.approx(0.2)
         assert "hormone_stimuli" in pert
-        assert pert["hormone_stimuli"].get("EMPATHY", 0) == pytest.approx(0.1)
+        assert pert["hormone_stimuli"].get("EMPATHY", 0) == pytest.approx(0.05)
 
     def test_perturbation_recognize_reduced(self, plugin):
         stimulus = {"content": "warm", "pass_type": PASS_RECOGNIZE}
         pert = plugin.compute_perturbation(stimulus)
-        # 30% of 0.4 = 0.12
-        assert pert["inner_body"][4] == pytest.approx(0.12)
-        assert pert["hormone_stimuli"]["EMPATHY"] == pytest.approx(0.03)
+        # 15% of 0.4 = 0.06 (RECOGNIZE scale narrowed from 0.3 to 0.15)
+        assert pert["inner_body"][4] == pytest.approx(0.06)
+        assert pert["hormone_stimuli"]["EMPATHY"] == pytest.approx(0.015)
 
     def test_perturbation_produce_zero(self, plugin):
         stimulus = {"content": "warm", "pass_type": PASS_PRODUCE}
@@ -362,7 +365,7 @@ class TestLanguageLearningIntegration:
 
     @pytest.mark.asyncio
     async def test_full_session(self, memory):
-        from titan_plugin.logic.experience_playground import ExperiencePlayground
+        from titan_hcl.logic.experience_playground import ExperiencePlayground
 
         pg = ExperiencePlayground(inner_memory=memory)
         plugin = LanguageLearningExperience(inner_memory=memory)
@@ -391,7 +394,7 @@ class TestLanguageLearningIntegration:
 
     @pytest.mark.asyncio
     async def test_session_records_all_passes(self, memory):
-        from titan_plugin.logic.experience_playground import ExperiencePlayground
+        from titan_hcl.logic.experience_playground import ExperiencePlayground
 
         pg = ExperiencePlayground(inner_memory=memory)
         plugin = LanguageLearningExperience(inner_memory=memory)

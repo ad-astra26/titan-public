@@ -12,7 +12,7 @@ import pytest
 
 @pytest.fixture
 def sp():
-    from titan_plugin.logic.spatial_perception import SpatialPerception
+    from titan_hcl.logic.spatial_perception import SpatialPerception
     return SpatialPerception()
 
 
@@ -178,7 +178,7 @@ class TestBackwardCompat:
         fpath = tmp_path / "test.png"
         img.save(str(fpath))
 
-        from titan_plugin.modules.media_worker import _digest_image
+        from titan_hcl.modules.media_worker import _digest_image
         result = _digest_image(fpath)
         assert result is not None
         assert len(result) == 5

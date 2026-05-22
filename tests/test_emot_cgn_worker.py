@@ -18,10 +18,10 @@ from queue import Queue
 
 import pytest
 
-from titan_plugin.logic.emot_shm_protocol import (
+from titan_hcl.logic.emot_shm_protocol import (
     ShmEmotReader, ShmEmotWriter, STATE_SIZE, GROUNDING_SIZE,
 )
-from titan_plugin.logic.emotion_cluster import EMOT_PRIMITIVES
+from titan_hcl.logic.emotion_cluster import EMOT_PRIMITIVES
 
 
 # ── ShmEmotWriter + ShmEmotReader roundtrip ─────────────────────────
@@ -119,7 +119,7 @@ class _BusQueueMock:
 def test_worker_main_emits_module_ready_then_exits_on_shutdown(tmp_path):
     """Smoke: run emot_cgn_worker_main in a thread with mock queues,
     send MODULE_SHUTDOWN, verify it boots + exits cleanly."""
-    from titan_plugin.modules.emot_cgn_worker import emot_cgn_worker_main
+    from titan_hcl.modules.emot_cgn_worker import emot_cgn_worker_main
     recv = _BusQueueMock()
     send = _BusQueueMock()
     config = {
@@ -154,7 +154,7 @@ def test_worker_handles_emot_chain_evidence(tmp_path):
     state_path = str(tmp_path / "state.bin")
     grounding_path = str(tmp_path / "grounding.bin")
 
-    from titan_plugin.modules.emot_cgn_worker import emot_cgn_worker_main
+    from titan_hcl.modules.emot_cgn_worker import emot_cgn_worker_main
     recv = _BusQueueMock()
     send = _BusQueueMock()
     config = {"titan_id": "T_TEST",
@@ -193,7 +193,7 @@ def test_worker_handles_felt_cluster_update_with_130d(tmp_path):
     state_path = str(tmp_path / "state.bin")
     grounding_path = str(tmp_path / "grounding.bin")
 
-    from titan_plugin.modules.emot_cgn_worker import emot_cgn_worker_main
+    from titan_hcl.modules.emot_cgn_worker import emot_cgn_worker_main
     recv = _BusQueueMock()
     send = _BusQueueMock()
     config = {"titan_id": "T_TEST",
@@ -226,7 +226,7 @@ def test_worker_ignores_own_cross_insight_origin(tmp_path):
     state_path = str(tmp_path / "state.bin")
     grounding_path = str(tmp_path / "grounding.bin")
 
-    from titan_plugin.modules.emot_cgn_worker import emot_cgn_worker_main
+    from titan_hcl.modules.emot_cgn_worker import emot_cgn_worker_main
     recv = _BusQueueMock()
     send = _BusQueueMock()
     config = {"titan_id": "T_TEST",

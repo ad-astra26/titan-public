@@ -1,5 +1,5 @@
 """
-Tests for ``titan_plugin.logic.memory_state_publisher``.
+Tests for ``titan_hcl.logic.memory_state_publisher``.
 
 Phase C Session 2 of rFP_phase_c_async_shm_consumer_migration §4.B.8.
 
@@ -13,9 +13,9 @@ import time
 import msgpack
 import pytest
 
-from titan_plugin.core.state_registry import StateRegistryReader
-from titan_plugin.logic.memory_state_publisher import MemoryStatePublisher
-from titan_plugin.logic.memory_state_specs import (
+from titan_hcl.core.state_registry import StateRegistryReader
+from titan_hcl.logic.memory_state_publisher import MemoryStatePublisher
+from titan_hcl.logic.memory_state_specs import (
     MEMORY_STATE_SLOT,
     MEMORY_STATE_SPEC,
 )
@@ -67,7 +67,7 @@ class _StubMemory:
 
 def test_init_logs(shm_root, caplog):
     caplog.set_level(logging.INFO,
-                     logger="titan_plugin.logic.memory_state_publisher")
+                     logger="titan_hcl.logic.memory_state_publisher")
     pub = MemoryStatePublisher(titan_id="T_TEST")
     stats = pub.get_stats()
     assert stats["publish_count"] == 0
@@ -80,7 +80,7 @@ def test_init_logs(shm_root, caplog):
 
 def test_publish_cold_boot_with_none_memory(shm_root, caplog):
     caplog.set_level(logging.INFO,
-                     logger="titan_plugin.logic.memory_state_publisher")
+                     logger="titan_hcl.logic.memory_state_publisher")
     pub = MemoryStatePublisher(titan_id="T_TEST")
     pub.publish(memory=None)
     stats = pub.get_stats()
@@ -146,7 +146,7 @@ def test_publish_with_partial_memory_attrs(shm_root):
 
 def test_heartbeat_at_tick_1_and_10(shm_root, caplog):
     caplog.set_level(logging.INFO,
-                     logger="titan_plugin.logic.memory_state_publisher")
+                     logger="titan_hcl.logic.memory_state_publisher")
     pub = MemoryStatePublisher(titan_id="T_TEST")
     mem = _StubMemory()
     for _ in range(10):
@@ -180,7 +180,7 @@ def test_publish_with_broken_graph_doesnt_crash(shm_root, caplog):
     publisher from writing the slot — publisher logs warning and
     continues with kg_node_count=0."""
     caplog.set_level(logging.WARNING,
-                     logger="titan_plugin.logic.memory_state_publisher")
+                     logger="titan_hcl.logic.memory_state_publisher")
 
     class _BadGraph:
         def get_stats(self):

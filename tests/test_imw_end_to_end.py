@@ -14,12 +14,12 @@ from pathlib import Path
 
 import pytest
 
-from titan_plugin.persistence.config import IMWConfig
-from titan_plugin.persistence.writer_client import (
+from titan_hcl.persistence.config import IMWConfig
+from titan_hcl.persistence.writer_client import (
     InnerMemoryWriterClient,
     detect_table,
 )
-from titan_plugin.persistence.writer_service import IMWDaemon
+from titan_hcl.persistence.writer_service import IMWDaemon
 
 
 # ── fixtures ────────────────────────────────────────────────────────

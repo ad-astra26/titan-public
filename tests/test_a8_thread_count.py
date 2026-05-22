@@ -29,7 +29,7 @@ class TestModuleWrapperForkModeSupervisionSkip(unittest.TestCase):
     def test_module_wrapper_has_explicit_start_method_check(self):
         """Source-inspection: guardian.py _module_wrapper conditions
         start_supervision_thread() on start_method == 'spawn'."""
-        from titan_plugin import guardian
+        from titan_hcl import guardian
         src = inspect.getsource(guardian._module_wrapper)
         # The fix moves the gate from inside worker_swap_handler to
         # _module_wrapper itself. Verify the explicit guard is present
@@ -46,7 +46,7 @@ class TestModuleWrapperForkModeSupervisionSkip(unittest.TestCase):
         return for fork-mode callers (existing test contract). The new
         _module_wrapper behavior is to NOT call it for fork-mode, but
         the function itself remains tolerant of being called either way."""
-        from titan_plugin.core.worker_swap_handler import (
+        from titan_hcl.core.worker_swap_handler import (
             SwapHandlerState,
             start_supervision_thread,
         )
@@ -69,7 +69,7 @@ class TestKernelDumpThreadInventory(unittest.TestCase):
 
     def test_method_exists_on_kernel(self):
         """TitanKernel exposes dump_thread_inventory()."""
-        from titan_plugin.core.kernel import TitanKernel
+        from titan_hcl.core.kernel import TitanKernel
         self.assertTrue(hasattr(TitanKernel, "dump_thread_inventory"),
                         "TitanKernel must define dump_thread_inventory()")
 
@@ -77,7 +77,7 @@ class TestKernelDumpThreadInventory(unittest.TestCase):
         """The RPC allowlist (EXPOSED_METHODS at top of kernel.py) must
         include dump_thread_inventory under both bare and kernel-prefix
         forms — same pattern as dump_heap / dump_tracemalloc."""
-        from titan_plugin.core import kernel
+        from titan_hcl.core import kernel
         src = inspect.getsource(kernel)
         # The list literal contains both forms.
         self.assertIn('"dump_thread_inventory"', src,
@@ -88,7 +88,7 @@ class TestKernelDumpThreadInventory(unittest.TestCase):
     def test_inventory_payload_shape(self):
         """Method returns a dict with: pid, process, total, threads list,
         and a by_prefix grouping that aggregates thread names by prefix."""
-        from titan_plugin.core.kernel import TitanKernel
+        from titan_hcl.core.kernel import TitanKernel
         # We don't need a fully-booted kernel for this contract test —
         # threading.enumerate() reads the test process's own threads.
         # Construct a minimal stub that exposes dump_thread_inventory only.
@@ -121,7 +121,7 @@ class TestKernelDumpThreadInventory(unittest.TestCase):
         """by_prefix grouping must collapse names like 'shadow-swap-abc12345'
         to 'shadow-swap' (per the rFP §6 audit goal: count by subsystem,
         not by per-instance ID)."""
-        from titan_plugin.core.kernel import TitanKernel
+        from titan_hcl.core.kernel import TitanKernel
         import types
 
         # Spawn a real thread with a hex-id suffix so the grouping logic
@@ -157,7 +157,7 @@ class TestKernelDumpThreadInventory(unittest.TestCase):
     def test_by_prefix_preserves_non_hex_suffix(self):
         """Non-hex suffixes (e.g., 'imw.heartbeat', 'titan-spirit') must NOT
         be incorrectly collapsed — they're meaningful subsystem IDs."""
-        from titan_plugin.core.kernel import TitanKernel
+        from titan_hcl.core.kernel import TitanKernel
         import types
 
         stop = threading.Event()

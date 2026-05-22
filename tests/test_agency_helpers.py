@@ -1,13 +1,13 @@
 """Tests for Step 7.5 — Helper implementations (BaseHelper protocol compliance)."""
 import pytest
-from titan_plugin.logic.agency.registry import BaseHelper
+from titan_hcl.logic.agency.registry import BaseHelper
 
 
 class TestWebSearchHelper:
     """WebSearchHelper protocol compliance and status."""
 
     def test_implements_protocol(self):
-        from titan_plugin.logic.agency.helpers.web_search import WebSearchHelper
+        from titan_hcl.logic.agency.helpers.web_search import WebSearchHelper
         helper = WebSearchHelper()
         assert isinstance(helper, BaseHelper)
         assert helper.name == "web_search"
@@ -20,7 +20,7 @@ class TestInfraInspectHelper:
     """InfraInspectHelper protocol compliance and execution."""
 
     def test_implements_protocol(self):
-        from titan_plugin.logic.agency.helpers.infra_inspect import InfraInspectHelper
+        from titan_hcl.logic.agency.helpers.infra_inspect import InfraInspectHelper
         helper = InfraInspectHelper()
         assert isinstance(helper, BaseHelper)
         assert helper.name == "infra_inspect"
@@ -28,13 +28,13 @@ class TestInfraInspectHelper:
         assert helper.enriches == ["body"]
 
     def test_always_available(self):
-        from titan_plugin.logic.agency.helpers.infra_inspect import InfraInspectHelper
+        from titan_hcl.logic.agency.helpers.infra_inspect import InfraInspectHelper
         helper = InfraInspectHelper()
         assert helper.status() == "available"
 
     @pytest.mark.asyncio
     async def test_system_inspection(self):
-        from titan_plugin.logic.agency.helpers.infra_inspect import InfraInspectHelper
+        from titan_hcl.logic.agency.helpers.infra_inspect import InfraInspectHelper
         helper = InfraInspectHelper()
         result = await helper.execute({"what": "system"})
         assert result["success"] is True
@@ -47,21 +47,26 @@ class TestSocialPostHelper:
     """SocialPostHelper protocol compliance and status."""
 
     def test_implements_protocol(self):
-        from titan_plugin.logic.agency.helpers.social_post import SocialPostHelper
-        helper = SocialPostHelper()
+        from titan_hcl.logic.agency.helpers.social_post import SocialPostHelper
+        # SocialPostHelper DISABLED 2026-04-30 — all X API via
+        # SocialXGateway. Tests pass _explicit_opt_in=True to bypass
+        # the safety guard (this test only validates protocol shape,
+        # not runtime posting behavior).
+        helper = SocialPostHelper(_explicit_opt_in=True)
         assert isinstance(helper, BaseHelper)
         assert helper.name == "social_post"
         assert "post" in helper.capabilities
         assert helper.enriches == ["mind"]
 
     def test_unavailable_without_api_key(self):
-        from titan_plugin.logic.agency.helpers.social_post import SocialPostHelper
-        helper = SocialPostHelper(api_key="")
+        from titan_hcl.logic.agency.helpers.social_post import SocialPostHelper
+        helper = SocialPostHelper(api_key="", _explicit_opt_in=True)
         assert helper.status() == "unavailable"
 
     def test_available_with_api_key(self):
-        from titan_plugin.logic.agency.helpers.social_post import SocialPostHelper
-        helper = SocialPostHelper(api_key="test_key_123")
+        from titan_hcl.logic.agency.helpers.social_post import SocialPostHelper
+        helper = SocialPostHelper(
+            api_key="test_key_123", _explicit_opt_in=True)
         assert helper.status() == "available"
 
 
@@ -69,7 +74,7 @@ class TestArtGenerateHelper:
     """ArtGenerateHelper protocol compliance."""
 
     def test_implements_protocol(self):
-        from titan_plugin.logic.agency.helpers.art_generate import ArtGenerateHelper
+        from titan_hcl.logic.agency.helpers.art_generate import ArtGenerateHelper
         helper = ArtGenerateHelper()
         assert isinstance(helper, BaseHelper)
         assert helper.name == "art_generate"
@@ -82,7 +87,7 @@ class TestAudioGenerateHelper:
     """AudioGenerateHelper protocol compliance and execution."""
 
     def test_implements_protocol(self):
-        from titan_plugin.logic.agency.helpers.audio_generate import AudioGenerateHelper
+        from titan_hcl.logic.agency.helpers.audio_generate import AudioGenerateHelper
         helper = AudioGenerateHelper()
         assert isinstance(helper, BaseHelper)
         assert helper.name == "audio_generate"
@@ -93,13 +98,13 @@ class TestAudioGenerateHelper:
         assert helper.requires_sandbox is False
 
     def test_always_available(self):
-        from titan_plugin.logic.agency.helpers.audio_generate import AudioGenerateHelper
+        from titan_hcl.logic.agency.helpers.audio_generate import AudioGenerateHelper
         helper = AudioGenerateHelper()
         assert helper.status() == "available"
 
     @pytest.mark.asyncio
     async def test_trinity_sonification(self, tmp_path):
-        from titan_plugin.logic.agency.helpers.audio_generate import AudioGenerateHelper
+        from titan_hcl.logic.agency.helpers.audio_generate import AudioGenerateHelper
         helper = AudioGenerateHelper(
             output_dir=str(tmp_path / "audio"),
             media_queue_dir=str(tmp_path / "queue"),
@@ -117,17 +122,19 @@ class TestAudioGenerateHelper:
         assert "trinity" in result["result"].lower()
         assert result["enrichment_data"]["mind"] == [1]
         assert result["enrichment_data"]["spirit"] == [2]
-        # Verify WAV file was created
-        import os
-        audio_files = list((tmp_path / "audio").glob("*.wav"))
+        # Verify WAV file was created. AudioGenerateHelper writes into
+        # an `expression_audio/` subdirectory under output_dir per the
+        # 2026-04-xx layout change — use rglob to match recursively.
+        audio_files = list((tmp_path / "audio").rglob("*.wav"))
         assert len(audio_files) == 1
-        # Verify media queue copy for enrichment loop
-        queue_files = list((tmp_path / "queue").glob("*.wav"))
+        # Verify media queue copy for enrichment loop (same subdir
+        # layout).
+        queue_files = list((tmp_path / "queue").rglob("*.wav"))
         assert len(queue_files) == 1
 
     @pytest.mark.asyncio
     async def test_blockchain_sonification(self, tmp_path):
-        from titan_plugin.logic.agency.helpers.audio_generate import AudioGenerateHelper
+        from titan_hcl.logic.agency.helpers.audio_generate import AudioGenerateHelper
         helper = AudioGenerateHelper(
             output_dir=str(tmp_path / "audio"),
             media_queue_dir=str(tmp_path / "queue"),
@@ -142,7 +149,7 @@ class TestAudioGenerateHelper:
 
     @pytest.mark.asyncio
     async def test_duration_cap(self, tmp_path):
-        from titan_plugin.logic.agency.helpers.audio_generate import AudioGenerateHelper
+        from titan_hcl.logic.agency.helpers.audio_generate import AudioGenerateHelper
         helper = AudioGenerateHelper(
             output_dir=str(tmp_path / "audio"),
             media_queue_dir=str(tmp_path / "queue"),
@@ -156,16 +163,18 @@ class TestAudioGenerateHelper:
             "spirit": [0.5] * 5,
         })
         assert result["success"] is True
-        # File should be ~5s not 999s
-        import os
-        audio_files = list((tmp_path / "audio").glob("*.wav"))
+        # File should be ~5s not 999s. Use rglob — file lands under
+        # output_dir/expression_audio/ subdir.
+        audio_files = list((tmp_path / "audio").rglob("*.wav"))
+        assert len(audio_files) >= 1, \
+            "duration-cap test produced no audio files"
         # 5s at 44100Hz * 2 bytes = ~441KB, not ~88MB
         assert audio_files[0].stat().st_size < 500_000
 
     @pytest.mark.asyncio
     async def test_extreme_tensor_values(self, tmp_path):
         """Test with extreme tensor values (all 0s and all 1s)."""
-        from titan_plugin.logic.agency.helpers.audio_generate import AudioGenerateHelper
+        from titan_hcl.logic.agency.helpers.audio_generate import AudioGenerateHelper
         helper = AudioGenerateHelper(
             output_dir=str(tmp_path / "audio"),
             media_queue_dir=str(tmp_path / "queue"),
@@ -198,8 +207,8 @@ class TestHelperRegistration:
     """Verify all helpers can register in the registry."""
 
     def test_register_all_helpers(self):
-        from titan_plugin.logic.agency.registry import HelperRegistry
-        from titan_plugin.logic.agency.helpers import (
+        from titan_hcl.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.helpers import (
             WebSearchHelper, InfraInspectHelper, SocialPostHelper,
             ArtGenerateHelper, AudioGenerateHelper,
         )
@@ -208,7 +217,8 @@ class TestHelperRegistration:
         helpers = [
             WebSearchHelper(),
             InfraInspectHelper(),
-            SocialPostHelper(api_key="test"),
+            # SocialPostHelper DISABLED 2026-04-30 — opt-in for test
+            SocialPostHelper(api_key="test", _explicit_opt_in=True),
             ArtGenerateHelper(),
             AudioGenerateHelper(),
         ]

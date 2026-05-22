@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from titan_plugin.logic.chain_archive import ChainArchive
+from titan_hcl.logic.chain_archive import ChainArchive
 
 
 @pytest.fixture

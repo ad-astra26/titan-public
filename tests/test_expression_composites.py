@@ -1,6 +1,6 @@
 """Tests for ExpressionComposites — SPEAK, ART, MUSIC, SOCIAL."""
 import pytest
-from titan_plugin.logic.expression_composites import (
+from titan_hcl.logic.expression_composites import (
     ExpressionComposite, ExpressionManager,
     create_speak, create_art, create_music, create_social,
 )

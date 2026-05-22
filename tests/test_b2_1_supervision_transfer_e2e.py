@@ -38,18 +38,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from titan_plugin import bus
-from titan_plugin.bus import (
+from titan_hcl import bus
+from titan_hcl.bus import (
     BUS_WORKER_ADOPT_ACK,
     BUS_WORKER_ADOPT_REQUEST,
     DivineBus,
     make_msg,
 )
-from titan_plugin.core.shadow_orchestrator import (
+from titan_hcl.core.shadow_orchestrator import (
     SwapResult,
     _phase_b2_1_wait_adoption,
 )
-from titan_plugin.guardian import Guardian, ModuleSpec, ModuleState
+from titan_hcl.guardian import Guardian, ModuleSpec, ModuleState
 
 
 def _noop_entry(*args, **kwargs):  # pragma: no cover
@@ -131,7 +131,7 @@ def test_full_fleet_adopted_via_bus_dispatch():
 
         fake_state = {"data": {"guardian": status}}
         with patch(
-            "titan_plugin.core.shadow_orchestrator._fetch_state_json",
+            "titan_hcl.core.shadow_orchestrator._fetch_state_json",
             return_value=fake_state,
         ):
             ok = _phase_b2_1_wait_adoption(

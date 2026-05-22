@@ -19,4 +19,4 @@ else
     echo "Warning: No virtualenv found (tried test_env, .venv). Using system Python."
 fi
 
-exec python -m titan_plugin.channels.terminal "$@"
+exec python -m titan_hcl.channels.terminal "$@"

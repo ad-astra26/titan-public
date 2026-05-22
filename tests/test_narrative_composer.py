@@ -2,7 +2,7 @@
 import os
 import pytest
 import tempfile
-from titan_plugin.logic.narrative_composer import NarrativeComposer
+from titan_hcl.logic.narrative_composer import NarrativeComposer
 
 
 @pytest.fixture

@@ -11,7 +11,7 @@ import json
 import os
 from pathlib import Path
 
-from titan_plugin.modules.warning_monitor_worker import (
+from titan_hcl.modules.warning_monitor_worker import (
     EVENTS_LOG_KEEP_ARCHIVES,
     EVENTS_LOG_MAX_MB,
     _maybe_rotate_events_log,

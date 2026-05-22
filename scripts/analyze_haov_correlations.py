@@ -195,7 +195,7 @@ def _load_current_nudges() -> dict[tuple[str, str, str], float]:
     """
     try:
         sys.path.insert(0, str(Path(__file__).parent.parent))
-        from titan_plugin.logic.meta_cgn import SIGNAL_TO_PRIMITIVE
+        from titan_hcl.logic.meta_cgn import SIGNAL_TO_PRIMITIVE
         flat: dict[tuple[str, str, str], float] = {}
         for (consumer, event), prim_map in SIGNAL_TO_PRIMITIVE.items():
             for prim, nudge in prim_map.items():

@@ -2,7 +2,7 @@
 import os
 import pytest
 import tempfile
-from titan_plugin.logic.neuromodulator import (
+from titan_hcl.logic.neuromodulator import (
     Neuromodulator, NeuromodulatorSystem, compute_inputs_from_titan,
 )
 

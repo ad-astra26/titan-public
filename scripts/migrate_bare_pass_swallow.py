@@ -340,7 +340,7 @@ def main() -> int:
     ap.add_argument("--tier", action="append",
                     choices=["T2", "T3", "T4"],
                     help="Tiers to migrate. Default: T2 + T3 + T4.")
-    ap.add_argument("--root", default="titan_plugin", type=Path)
+    ap.add_argument("--root", default="titan_hcl", type=Path)
     args = ap.parse_args()
 
     tiers = set(args.tier) if args.tier else {"T2", "T3", "T4"}

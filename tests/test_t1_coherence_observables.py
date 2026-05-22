@@ -18,7 +18,7 @@ import pytest
 class TestLayerCoherence:
     def test_uniform_tensor_returns_one(self):
         """Uniform tensor (all same value) → coherence = 1.0."""
-        from titan_plugin.logic.middle_path import layer_coherence
+        from titan_hcl.logic.middle_path import layer_coherence
         # All 0.3 — perfectly coherent (zero variance)
         assert layer_coherence([0.3, 0.3, 0.3, 0.3, 0.3]) == 1.0
         # All 0.9 — also perfectly coherent
@@ -28,7 +28,7 @@ class TestLayerCoherence:
 
     def test_maximally_varied_returns_near_zero(self):
         """Half at 0, half at 1 → coherence ≈ 0.0."""
-        from titan_plugin.logic.middle_path import layer_coherence
+        from titan_hcl.logic.middle_path import layer_coherence
         # 3 at 0.0, 2 at 1.0 — not exactly 0.0 because uneven split
         # but [0, 0, 1, 1] (even split in 4-dim) is exactly 0.0
         assert layer_coherence([0.0, 0.0, 1.0, 1.0]) == pytest.approx(0.0, abs=1e-6)
@@ -38,7 +38,7 @@ class TestLayerCoherence:
 
     def test_backward_compat_with_layer_loss(self):
         """layer_loss still works and returns L2 distance from center."""
-        from titan_plugin.logic.middle_path import layer_loss, layer_coherence
+        from titan_hcl.logic.middle_path import layer_loss, layer_coherence
         tensor = [0.3, 0.7, 0.5, 0.2, 0.8]
         loss = layer_loss(tensor)
         # L2 from center should be positive
@@ -52,7 +52,7 @@ class TestLayerCoherence:
 
     def test_single_dim_returns_one(self):
         """Single dimension tensor → coherence = 1.0 (no variance possible)."""
-        from titan_plugin.logic.middle_path import layer_coherence
+        from titan_hcl.logic.middle_path import layer_coherence
         assert layer_coherence([0.7]) == 1.0
 
 
@@ -61,14 +61,14 @@ class TestLayerCoherence:
 class TestObservables:
     def test_coherence_observable(self):
         """BodyPartObserver.observe() returns correct coherence."""
-        from titan_plugin.logic.observables import BodyPartObserver
+        from titan_hcl.logic.observables import BodyPartObserver
         obs = BodyPartObserver("test")
         result = obs.observe([0.5, 0.5, 0.5, 0.5, 0.5])
         assert result["coherence"] == pytest.approx(1.0, abs=1e-6)
 
     def test_magnitude_observable(self):
         """Magnitude: normalized L2 norm. Zero vector → 0, all-1 → 1."""
-        from titan_plugin.logic.observables import BodyPartObserver
+        from titan_hcl.logic.observables import BodyPartObserver
         obs = BodyPartObserver("test")
         # All zeros → magnitude = 0
         result = obs.observe([0.0, 0.0, 0.0, 0.0, 0.0])
@@ -79,7 +79,7 @@ class TestObservables:
 
     def test_velocity_observable(self):
         """Velocity: L2 distance from previous tensor."""
-        from titan_plugin.logic.observables import BodyPartObserver
+        from titan_hcl.logic.observables import BodyPartObserver
         obs = BodyPartObserver("test")
         # First call: distance from default [0.5]*5
         result = obs.observe([0.5, 0.5, 0.5, 0.5, 0.5])
@@ -91,7 +91,7 @@ class TestObservables:
 
     def test_direction_observable(self):
         """Direction: cosine similarity with previous tensor."""
-        from titan_plugin.logic.observables import BodyPartObserver
+        from titan_hcl.logic.observables import BodyPartObserver
         obs = BodyPartObserver("test")
         # Move to [1,1,1,1,1]
         obs.observe([1.0, 1.0, 1.0, 1.0, 1.0])
@@ -102,7 +102,7 @@ class TestObservables:
 
     def test_polarity_observable(self):
         """Polarity: mean - 0.5. Positive = above center, negative = below."""
-        from titan_plugin.logic.observables import BodyPartObserver
+        from titan_hcl.logic.observables import BodyPartObserver
         obs = BodyPartObserver("test")
         # All at 0.8 → polarity = 0.3
         result = obs.observe([0.8, 0.8, 0.8, 0.8, 0.8])
@@ -117,7 +117,7 @@ class TestObservables:
 class TestObservableEngine:
     def test_processes_all_six_parts(self):
         """ObservableEngine.observe_all() returns observables for all 6 parts."""
-        from titan_plugin.logic.observables import ObservableEngine, ALL_PARTS
+        from titan_hcl.logic.observables import ObservableEngine, ALL_PARTS
         engine = ObservableEngine()
         tensors = {name: [0.5] * 5 for name in ALL_PARTS}
         result = engine.observe_all(tensors)
@@ -132,7 +132,7 @@ class TestObservableEngine:
 class TestSphereClockCoherence:
     def test_coherent_tensor_fast_clock(self):
         """High coherence → high velocity → fast contraction."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         clock = SphereClock("test", base_speed=0.05, min_velocity_factor=0.15)
         # High coherence = 0.95
         clock.tick(0.95)
@@ -140,7 +140,7 @@ class TestSphereClockCoherence:
 
     def test_incoherent_tensor_slow_clock(self):
         """Low coherence → low velocity (floored at min_velocity_factor)."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         clock = SphereClock("test", base_speed=0.05, min_velocity_factor=0.15)
         # Low coherence = 0.05 (below min_velocity_factor)
         clock.tick(0.05)
@@ -148,7 +148,7 @@ class TestSphereClockCoherence:
 
     def test_clock_always_pulses_when_incoherent(self):
         """Even at zero coherence, clock eventually pulses due to velocity floor."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         clock = SphereClock("test", base_speed=0.05, min_velocity_factor=0.15)
         # Tick with zero coherence many times — should eventually pulse
         pulse = None
@@ -178,7 +178,7 @@ class TestGetObservations30D:
         }
 
     def test_returns_exactly_30_floats(self):
-        from titan_plugin.logic.observables import ObservableEngine
+        from titan_hcl.logic.observables import ObservableEngine
         eng = ObservableEngine()
         out = eng.get_observations_30d(self._sample_dict())
         assert len(out) == 30
@@ -186,7 +186,7 @@ class TestGetObservations30D:
 
     def test_canonical_order_inner_first_outer_last(self):
         """Part 0 = inner_body (0.10-0.14); part 5 = outer_spirit (0.60-0.64)."""
-        from titan_plugin.logic.observables import ObservableEngine
+        from titan_hcl.logic.observables import ObservableEngine
         eng = ObservableEngine()
         out = eng.get_observations_30d(self._sample_dict())
         # First 5 floats = inner_body's 5 observables
@@ -198,7 +198,7 @@ class TestGetObservations30D:
 
     def test_missing_part_pads_with_zeros(self):
         """Dict missing outer_spirit → last 5 floats are 0.0 (not 0.5)."""
-        from titan_plugin.logic.observables import ObservableEngine
+        from titan_hcl.logic.observables import ObservableEngine
         eng = ObservableEngine()
         partial = self._sample_dict()
         del partial["outer_spirit"]
@@ -207,19 +207,19 @@ class TestGetObservations30D:
         assert out[25:30] == [0.0] * 5
 
     def test_empty_dict_returns_all_zeros(self):
-        from titan_plugin.logic.observables import ObservableEngine
+        from titan_hcl.logic.observables import ObservableEngine
         eng = ObservableEngine()
         assert eng.get_observations_30d({}) == [0.0] * 30
 
     def test_non_dict_input_returns_all_zeros(self):
         """Defensive: None / non-dict input → 30 zeros, no crash."""
-        from titan_plugin.logic.observables import ObservableEngine
+        from titan_hcl.logic.observables import ObservableEngine
         eng = ObservableEngine()
         assert eng.get_observations_30d(None) == [0.0] * 30
 
     def test_observer_state_not_mutated(self):
         """Pure function — engine's observer _prev_tensor values untouched."""
-        from titan_plugin.logic.observables import ObservableEngine
+        from titan_hcl.logic.observables import ObservableEngine
         eng = ObservableEngine()
         before = [list(obs._prev_tensor) for obs in eng.observers.values()]
         eng.get_observations_30d(self._sample_dict())

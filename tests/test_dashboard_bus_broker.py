@@ -18,10 +18,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from titan_plugin.api.dashboard import router
-from titan_plugin.bus import DivineBus
-from titan_plugin.core.kernel import KERNEL_RPC_EXPOSED_METHODS
-from titan_plugin.guardian import Guardian
+from titan_hcl.api.dashboard import router
+from titan_hcl.bus import DivineBus
+from titan_hcl.core.kernel import KERNEL_RPC_EXPOSED_METHODS
+from titan_hcl.guardian import Guardian
 
 
 # ── KERNEL_RPC exposure ─────────────────────────────────────────────────
@@ -43,7 +43,7 @@ class _FakeKernel:
         self._bus_broker = broker
 
     # Re-import the real method onto our stub for fidelity
-    from titan_plugin.core.kernel import TitanKernel
+    from titan_hcl.core.kernel import TitanKernel
     bus_broker_stats = TitanKernel.bus_broker_stats
 
 
@@ -98,14 +98,20 @@ def _make_client(plugin):
     app = FastAPI()
     # dashboard.py reads two app.state attributes:
     #   - titan_state for typed sub-accessors (guardian.get_status, spirit, etc.)
-    #   - titan_plugin for the kernel_rpc proxy that exposes kernel methods
+    #   - titan_hcl for the kernel_rpc proxy that exposes kernel methods
     #     like kernel.bus_broker_stats (added in Phase B.2.1 hot-fix).
     # Our _FakePluginWithBroker stub plays both roles in tests — its .kernel
     # attribute is reached via either the StateAccessor (legacy) or the
     # kernel_rpc proxy (api_subprocess mode).
     app.state.titan_state = plugin
-    app.state.titan_plugin = plugin
+    app.state.titan_hcl = plugin
     app.include_router(router)
+    # Phase E: mount the v6 roof + legacy /v3,/v4→/v6 redirects so
+    # deprecated paths resolve via 301/308 to the live v6 handler.
+    from titan_hcl.api.v6 import router as _v6_router
+    from titan_hcl.api.v6_deprecation import router as _v6_dep_router
+    app.include_router(_v6_router)
+    app.include_router(_v6_dep_router)
     return TestClient(app)
 
 

@@ -16,7 +16,7 @@ class TestGreatEpoch:
     """Tests for the GreatEpoch record."""
 
     def test_creation(self):
-        from titan_plugin.logic.unified_spirit import GreatEpoch
+        from titan_hcl.logic.unified_spirit import GreatEpoch
         tensor = [0.5] * 30
         epoch = GreatEpoch(
             epoch_id=1,
@@ -31,14 +31,14 @@ class TestGreatEpoch:
         assert epoch.enrichment_sent is False
 
     def test_magnitude_computed(self):
-        from titan_plugin.logic.unified_spirit import GreatEpoch
+        from titan_hcl.logic.unified_spirit import GreatEpoch
         # All at 1.0 → magnitude = sqrt(30 * 1.0) ≈ 5.477
         tensor = [1.0] * 30
         epoch = GreatEpoch(1, tensor, 1.0, {})
         assert epoch.magnitude == pytest.approx(math.sqrt(30), abs=0.01)
 
     def test_serialization(self):
-        from titan_plugin.logic.unified_spirit import GreatEpoch
+        from titan_hcl.logic.unified_spirit import GreatEpoch
         tensor = [0.6] * 30
         epoch = GreatEpoch(42, tensor, 1.5, {"body": True})
 
@@ -58,7 +58,7 @@ class TestUnifiedSpirit:
     """Tests for the Unified SPIRIT."""
 
     def test_init_defaults(self):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit, SPIRIT_DIMS
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit, SPIRIT_DIMS
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
             assert len(spirit.tensor) == SPIRIT_DIMS
@@ -69,7 +69,7 @@ class TestUnifiedSpirit:
 
     def test_update_subconscious(self):
         """Subconscious layer updates Inner Trinity slice (5D body + 15D mind + 45D spirit = 65D)."""
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
             inner_body = [0.1, 0.2, 0.3, 0.4, 0.5]
@@ -87,7 +87,7 @@ class TestUnifiedSpirit:
 
     def test_update_conscious(self):
         """Conscious layer updates Outer Trinity slice (5D body + 15D mind + 45D spirit = 65D)."""
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
             outer_body = [0.8, 0.7, 0.6, 0.5, 0.4]
@@ -105,7 +105,7 @@ class TestUnifiedSpirit:
 
     def test_inner_outer_tensors(self):
         """inner_tensor and outer_tensor properties return correct 65D slices."""
-        from titan_plugin.logic.unified_spirit import (
+        from titan_hcl.logic.unified_spirit import (
             UnifiedSpirit, INNER_DIMS, OUTER_DIMS,
         )
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -124,7 +124,7 @@ class TestUnifiedSpirit:
 
     def test_tensor_padding(self):
         """Short tensors are padded with 0.5."""
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
             spirit.update_subconscious([0.1, 0.2], [0.3], [])
@@ -140,7 +140,7 @@ class TestGreatPulseAdvancement:
     """Tests for SPIRIT advancement via GREAT PULSE."""
 
     def test_advance_creates_epoch(self):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit, SPIRIT_DIMS
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit, SPIRIT_DIMS
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
             spirit.update_subconscious([0.6]*5, [0.5]*15, [0.7]*45)
@@ -154,7 +154,7 @@ class TestGreatPulseAdvancement:
             assert spirit.epoch_count == 1
 
     def test_advance_increments_epoch_id(self):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
             for i in range(5):
@@ -164,7 +164,7 @@ class TestGreatPulseAdvancement:
 
     def test_advance_captures_tensor_snapshot(self):
         """Each epoch captures the tensor state at that moment."""
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
 
@@ -180,7 +180,7 @@ class TestGreatPulseAdvancement:
 
     def test_advance_cannot_go_backward(self):
         """SPIRIT tensor cannot move backward — epoch IDs always increase."""
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
             spirit.advance({})
@@ -191,7 +191,7 @@ class TestGreatPulseAdvancement:
             assert [e.epoch_id for e in spirit._epochs] == [1, 2, 3]
 
     def test_latest_epoch(self):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
             spirit.advance({})
@@ -199,7 +199,7 @@ class TestGreatPulseAdvancement:
             assert spirit.latest_epoch.epoch_id == 2
 
     def test_get_epoch_by_id(self):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
             spirit.advance({})
@@ -220,7 +220,7 @@ class TestVelocityTracking:
 
     def test_first_epoch_neutral_velocity(self):
         """First epoch has neutral velocity (no history to compare)."""
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
             epoch = spirit.advance({})
@@ -228,7 +228,7 @@ class TestVelocityTracking:
 
     def test_growing_tensor_high_velocity(self):
         """Tensor magnitude increasing → velocity > 1.0."""
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
 
@@ -246,7 +246,7 @@ class TestVelocityTracking:
 
     def test_shrinking_tensor_low_velocity(self):
         """Tensor magnitude decreasing → velocity < 1.0."""
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
 
@@ -264,7 +264,7 @@ class TestVelocityTracking:
 
     def test_stable_tensor_neutral_velocity(self):
         """Unchanged tensor → velocity ≈ 1.0."""
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
 
@@ -277,7 +277,7 @@ class TestVelocityTracking:
 
     def test_velocity_window_limited(self):
         """Velocity only looks back N epochs (velocity_window)."""
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(
                 config={"velocity_window": 3},
@@ -300,14 +300,14 @@ class TestStaleDetection:
     """Tests for STALE state detection and FOCUS cascade multiplier."""
 
     def test_not_stale_initially(self):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
             assert spirit.is_stale is False
 
     def test_stale_when_shrinking(self):
         """SPIRIT goes STALE when tensor magnitude drops."""
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(
                 config={"stale_threshold": 0.9},
@@ -328,7 +328,7 @@ class TestStaleDetection:
 
     def test_stale_focus_multiplier_escalates(self):
         """FOCUS cascade multiplier grows with consecutive STALE epochs."""
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(
                 config={"stale_threshold": 0.9},
@@ -353,7 +353,7 @@ class TestStaleDetection:
 
     def test_stale_recovery(self):
         """SPIRIT recovers from STALE when growth resumes."""
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(
                 config={"stale_threshold": 0.9},
@@ -379,7 +379,7 @@ class TestStaleDetection:
 
     def test_focus_multiplier_capped(self):
         """FOCUS cascade multiplier is capped at 3×."""
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(
                 config={"stale_threshold": 0.99},
@@ -405,7 +405,7 @@ class TestEnrichment:
     """Tests for GREAT PULSE enrichment rewards."""
 
     def test_enrichment_after_advance(self):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
             spirit.update_subconscious([0.5]*5, [0.5]*5, [0.5]*5)
@@ -422,7 +422,7 @@ class TestEnrichment:
 
     def test_balanced_gets_higher_enrichment(self):
         """Components at center (0.5) get higher enrichment than off-center."""
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
             # Inner Body at center, Inner Mind far off
@@ -435,7 +435,7 @@ class TestEnrichment:
             assert enrichment["inner_body"]["balance_score"] > enrichment["inner_mind"]["balance_score"]
 
     def test_enrichment_marks_sent(self):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
             spirit.advance({})
@@ -443,7 +443,7 @@ class TestEnrichment:
             assert spirit.latest_epoch.enrichment_sent is True
 
     def test_no_enrichment_without_epochs(self):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
             assert spirit.compute_enrichment() == {}
@@ -455,7 +455,7 @@ class TestPersistence:
     """Tests for SPIRIT state persistence."""
 
     def test_save_load_round_trip(self):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             s1 = UnifiedSpirit(data_dir=tmpdir)
             s1.update_subconscious([0.7]*5, [0.6]*5, [0.8]*5)
@@ -471,7 +471,7 @@ class TestPersistence:
 
     def test_auto_save_on_advance(self):
         """advance() auto-saves state."""
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         import os
         with tempfile.TemporaryDirectory() as tmpdir:
             s1 = UnifiedSpirit(data_dir=tmpdir)
@@ -481,7 +481,7 @@ class TestPersistence:
             assert os.path.exists(os.path.join(tmpdir, "unified_spirit_state.json"))
 
     def test_stats_structure(self):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         with tempfile.TemporaryDirectory() as tmpdir:
             spirit = UnifiedSpirit(data_dir=tmpdir)
             spirit.advance({})
@@ -500,12 +500,12 @@ class TestPersistence:
 class TestUtilities:
 
     def test_tensor_magnitude(self):
-        from titan_plugin.logic.unified_spirit import _tensor_magnitude
+        from titan_hcl.logic.unified_spirit import _tensor_magnitude
         assert _tensor_magnitude([0.0] * 30) == 0.0
         assert _tensor_magnitude([1.0] * 30) == pytest.approx(math.sqrt(30), abs=0.01)
 
     def test_pad_or_trim(self):
-        from titan_plugin.logic.unified_spirit import _pad_or_trim
+        from titan_hcl.logic.unified_spirit import _pad_or_trim
         assert _pad_or_trim([0.1, 0.2], 5) == [0.1, 0.2, 0.5, 0.5, 0.5]
         assert _pad_or_trim([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], 5) == [0.1, 0.2, 0.3, 0.4, 0.5]
         assert _pad_or_trim([], 3) == [0.5, 0.5, 0.5]

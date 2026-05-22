@@ -20,21 +20,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("titan.channels")
 
-# Ensure the project root is on sys.path so titan_plugin is importable
+# Ensure the project root is on sys.path so titan_hcl is importable
 _PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from titan_plugin.channels import get_channel_config  # noqa: E402
+from titan_hcl.channels import get_channel_config  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
 # Adapter registry: channel_name -> (module_path, start_function_name)
 # ---------------------------------------------------------------------------
 _ADAPTERS = {
-    "telegram": ("titan_plugin.channels.telegram", "start_telegram"),
-    "discord":  ("titan_plugin.channels.discord_bot", "start_discord"),
-    "slack":    ("titan_plugin.channels.slack_bot", "start_slack"),
-    "whatsapp": ("titan_plugin.channels.whatsapp", "start_whatsapp"),
+    "telegram": ("titan_hcl.channels.telegram", "start_telegram"),
+    "discord":  ("titan_hcl.channels.discord_bot", "start_discord"),
+    "slack":    ("titan_hcl.channels.slack_bot", "start_slack"),
+    "whatsapp": ("titan_hcl.channels.whatsapp", "start_whatsapp"),
 }
 
 
@@ -54,10 +54,10 @@ async def _launch_adapter(name: str, module_path: str, func_name: str, titan_url
 async def main(titan_url: str) -> None:
     """Discover enabled channels and start them concurrently."""
     # Load the full merged channels config (config.toml + ~/.titan/secrets.toml)
-    from titan_plugin.config_loader import load_titan_config
+    from titan_hcl.config_loader import load_titan_config
     full_config = load_titan_config()
     if not full_config:
-        logger.error("Merged config empty — check titan_plugin/config.toml + ~/.titan/secrets.toml")
+        logger.error("Merged config empty — check titan_hcl/config.toml + ~/.titan/secrets.toml")
         sys.exit(1)
 
     channels_section = full_config.get("channels", {})

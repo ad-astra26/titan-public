@@ -28,8 +28,8 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from titan_plugin.core.sensor_cache import SensorCache, stop_threads
-from titan_plugin.modules import body_worker, mind_worker
+from titan_hcl.core.sensor_cache import SensorCache, stop_threads
+from titan_hcl.modules import body_worker, mind_worker
 
 
 _HISTORY_SIZE = body_worker._HISTORY_SIZE
@@ -79,7 +79,7 @@ def test_body_collect_tensor_no_cache_byte_identical_to_pre_s7():
 
 def test_body_collect_tensor_with_cache_uses_cached_readings():
     """When a cache is provided, the tick MUST NOT call _sense_*."""
-    from titan_plugin.modules.body_worker import Severity
+    from titan_hcl.modules.body_worker import Severity
 
     history = _empty_body_history()
     thresholds = _empty_thresholds()
@@ -123,7 +123,7 @@ def test_body_collect_tensor_cache_cold_falls_back_to_inline():
     # All 5 inline calls should fire.
     call_count = {"n": 0}
     def stub_sense(_t):
-        from titan_plugin.modules.body_worker import Severity
+        from titan_hcl.modules.body_worker import Severity
         call_count["n"] += 1
         return {"value": 0.5, "severity": Severity.INFO}
 
@@ -192,7 +192,7 @@ def test_body_tick_latency_under_1ms_with_cache():
     when senses would otherwise be slow. Asserts: 100 ticks read from
     cache complete in well under 100 ms total (avg < 1 ms / tick).
     """
-    from titan_plugin.modules.body_worker import Severity
+    from titan_hcl.modules.body_worker import Severity
 
     history = _empty_body_history()
     thresholds = _empty_thresholds()
@@ -386,7 +386,7 @@ def test_body_shm_writer_writes_5d_tensor_when_flag_on(isolated_shm_root, monkey
 
         # Read back via reader. read() returns just np.ndarray | None;
         # read_meta() returns the SeqLock header dict.
-        from titan_plugin.core.state_registry import INNER_BODY_5D
+        from titan_hcl.core.state_registry import INNER_BODY_5D
         reader = shm_bank.reader(INNER_BODY_5D)
         arr = reader.read()
         assert arr is not None
@@ -423,7 +423,7 @@ def test_mind_shm_writer_writes_15d_tensor_when_flag_on(isolated_shm_root, monke
         # Mind ticks at 23.49 Hz = 42.6ms. 300ms = ~7 ticks.
         time.sleep(0.3)
 
-        from titan_plugin.core.state_registry import INNER_MIND_15D, RegistryBank
+        from titan_hcl.core.state_registry import INNER_MIND_15D, RegistryBank
         bank = RegistryBank(titan_id=None, config=config)
         reader = bank.reader(INNER_MIND_15D)
         arr = reader.read()
@@ -451,7 +451,7 @@ def test_shm_writer_runs_at_schumann_cadence(isolated_shm_root, monkeypatch):
                                       lambda: ([1.0]*5, [0.0]*5))
     )
     try:
-        from titan_plugin.core.state_registry import INNER_BODY_5D
+        from titan_hcl.core.state_registry import INNER_BODY_5D
         reader = shm_bank.reader(INNER_BODY_5D)
 
         time.sleep(0.15)  # let writer warm up + emit at least one tick

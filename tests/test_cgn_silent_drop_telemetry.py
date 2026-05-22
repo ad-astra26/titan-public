@@ -18,7 +18,7 @@ import tempfile
 
 import pytest
 
-from titan_plugin.logic.cgn import ConceptGroundingNetwork
+from titan_hcl.logic.cgn import ConceptGroundingNetwork
 
 
 @pytest.fixture
@@ -68,7 +68,7 @@ def test_throttle_independent_per_consumer(cgn, caplog):
 
 def test_telemetry_exposes_registered_consumers(cgn):
     """get_silent_drop_telemetry includes the current registered set for diff."""
-    from titan_plugin.logic.cgn import CGNConsumerConfig
+    from titan_hcl.logic.cgn import CGNConsumerConfig
     cgn.register_consumer(CGNConsumerConfig(name="reasoning"))
     telemetry = cgn.get_silent_drop_telemetry()
     assert "reasoning" in telemetry["registered"]
@@ -81,7 +81,7 @@ def test_no_behavior_change_for_registered_consumer(cgn):
     transition (the existing benign case). It should NOT increment
     unregistered, but MAY increment unmatched.
     """
-    from titan_plugin.logic.cgn import CGNConsumerConfig
+    from titan_hcl.logic.cgn import CGNConsumerConfig
     cgn.register_consumer(CGNConsumerConfig(name="reasoning"))
     cgn.record_outcome("reasoning", "no_such_concept", 0.5)
     telemetry = cgn.get_silent_drop_telemetry()

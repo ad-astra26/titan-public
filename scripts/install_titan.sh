@@ -190,7 +190,7 @@ try:
         import tomllib
     except ImportError:
         import toml as tomllib
-    with open("titan_plugin/config.toml", "rb") as f:
+    with open("titan_hcl/config.toml", "rb") as f:
         cfg = tomllib.load(f)
     ss = cfg.get("stealth_sage", {})
     missing = []
@@ -202,7 +202,7 @@ try:
         print("ℹ️ Advisory: The following optional stealth_sage credentials are not configured:")
         for m in missing:
             print(f"   • {m}")
-        print("   Edit titan_plugin/config.toml to enable these features.")
+        print("   Edit titan_hcl/config.toml to enable these features.")
         print("   The Titan will operate gracefully without them.")
     else:
         print("✅ All optional stealth_sage credentials are configured.")
@@ -220,7 +220,7 @@ echo "==============================================="
 echo ""
 echo "Next Steps:"
 echo "1. Configure .env with PREMIUM_RPC_URL and INFERENCE_API_KEY."
-echo "2. (Optional) Add twitterapi_io_key and webshare_rotating_url to titan_plugin/config.toml."
+echo "2. (Optional) Add twitterapi_io_key and webshare_rotating_url to titan_hcl/config.toml."
 echo "3. Generate your sovereign wallet: 'solana-keygen new --outfile ./authority.json'"
 echo "4. Restart your OpenClaw agent instance."
 echo "5. Verify with: python -m pytest tests/test_sage_v2.py -v"

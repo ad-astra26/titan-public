@@ -16,8 +16,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from titan_plugin.bus import DivineBus
-from titan_plugin.guardian import Guardian, ModuleSpec
+from titan_hcl.bus import DivineBus
+from titan_hcl.guardian import Guardian, ModuleSpec
 
 
 def _spec(name: str) -> ModuleSpec:
@@ -156,7 +156,7 @@ def test_monitor_tick_does_not_call_restart_synchronously():
     """Inspect monitor_tick source — should call self.restart_async, not
     self.restart, for the heartbeat-timeout + crash-restart paths."""
     import inspect
-    from titan_plugin import guardian as g_mod
+    from titan_hcl import guardian as g_mod
 
     src = inspect.getsource(g_mod.Guardian.monitor_tick)
     # heartbeat-timeout path uses async
@@ -174,7 +174,7 @@ def test_bus_peer_died_handler_uses_restart_async():
     """The BUS_PEER_DIED handler in _process_guardian_messages must also
     use restart_async (it runs inside monitor_tick → same starvation risk)."""
     import inspect
-    from titan_plugin import guardian as g_mod
+    from titan_hcl import guardian as g_mod
 
     src = inspect.getsource(g_mod.Guardian._process_guardian_messages)
     assert 'restart_async(name, reason="broker_peer_dead")' in src, \

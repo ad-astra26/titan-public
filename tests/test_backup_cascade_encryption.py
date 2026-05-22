@@ -19,8 +19,8 @@ import tarfile
 
 import pytest
 
-from titan_plugin.logic.backup_cascade import BackupCascade
-from titan_plugin.logic.backup_crypto import (
+from titan_hcl.logic.backup_cascade import BackupCascade
+from titan_hcl.logic.backup_crypto import (
     build_encryption_context_from_config,
     decrypt_tarball,
     derive_backup_key,

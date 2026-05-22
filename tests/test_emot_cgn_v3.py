@@ -20,7 +20,7 @@ import time
 import numpy as np
 import pytest
 
-from titan_plugin.logic.emot_bundle_protocol import (
+from titan_hcl.logic.emot_bundle_protocol import (
     BUNDLE_SIZE, CORE_SIZE, RESERVED_TAIL, BUNDLE_SCHEMA_VERSION,
     FELT_TENSOR_DIM, TRAJECTORY_DIM, SPACE_TOPOLOGY_DIM, NEUROMOD_DIM,
     HORMONE_DIM, NS_URGENCY_DIM, CGN_BETA_DIM, MSL_ACT_DIM, PI_PHASE_DIM,
@@ -31,12 +31,12 @@ from titan_plugin.logic.emot_bundle_protocol import (
     read_emotion_valence_normalized, read_full_emotion_context,
     _fnv1a_32,
 )
-from titan_plugin.logic.emot_thin_encoder import ThinEmotEncoder
-from titan_plugin.logic.emot_region_clusterer import (
+from titan_hcl.logic.emot_thin_encoder import ThinEmotEncoder
+from titan_hcl.logic.emot_region_clusterer import (
     RegionClusterer, STATE_DIM, NATIVE_CORE_DIM, SIDE_CHANNEL_DIM,
     assemble_state_vec, _signature_from_centroid,
 )
-from titan_plugin.logic.emot_kin_protocol import (
+from titan_hcl.logic.emot_kin_protocol import (
     build_kin_emot_state_payload, parse_kin_emot_state,
     compute_msl_activations, KIN_EMOT_STATE_MSG_TYPE,
 )
@@ -471,7 +471,7 @@ class TestKinProtocol:
 
 class TestPlugB:
     def test_cross_insight_ema(self):
-        from titan_plugin.logic.cgn_consumer_client import CGNConsumerClient
+        from titan_hcl.logic.cgn_consumer_client import CGNConsumerClient
         c = CGNConsumerClient(consumer_name="language")
         assert c._emot_insight_reward_ema == 0.5
 
@@ -489,7 +489,7 @@ class TestPlugB:
         assert abs(c._emot_insight_reward_ema - 0.464) < 1e-5
 
     def test_own_emission_ignored(self):
-        from titan_plugin.logic.cgn_consumer_client import CGNConsumerClient
+        from titan_hcl.logic.cgn_consumer_client import CGNConsumerClient
         c = CGNConsumerClient(consumer_name="language")
         c.note_incoming_cross_insight({
             "origin_consumer": "language",
@@ -498,7 +498,7 @@ class TestPlugB:
         assert c._emot_insight_reward_ema == 0.5  # unchanged
 
     def test_non_emotional_origin_ignored(self):
-        from titan_plugin.logic.cgn_consumer_client import CGNConsumerClient
+        from titan_hcl.logic.cgn_consumer_client import CGNConsumerClient
         c = CGNConsumerClient(consumer_name="knowledge")
         c.note_incoming_cross_insight({
             "origin_consumer": "meta",

@@ -24,8 +24,8 @@ import time
 
 import pytest
 
-from titan_plugin.logic.knowledge_router import QueryType
-from titan_plugin.logic.knowledge_routing_learner import (
+from titan_hcl.logic.knowledge_router import QueryType
+from titan_hcl.logic.knowledge_routing_learner import (
     DEFAULT_MIN_SAMPLES,
     EVENT_KIND_CHAIN_REORDERED,
     BackendStats,

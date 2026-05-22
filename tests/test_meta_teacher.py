@@ -1,4 +1,4 @@
-"""Tests for titan_plugin.logic.meta_teacher.MetaTeacher.
+"""Tests for titan_hcl.logic.meta_teacher.MetaTeacher.
 
 Covers per rFP §10 "Tests" checklist:
   - evaluate_chain output shape (via parse_critique + build_feedback_payload)
@@ -11,8 +11,8 @@ import time
 
 import pytest
 
-from titan_plugin.logic.meta_teacher import MetaTeacher
-from titan_plugin.logic.meta_teacher_prompts import (
+from titan_hcl.logic.meta_teacher import MetaTeacher
+from titan_hcl.logic.meta_teacher_prompts import (
     ALL_PRIMITIVES,
     SYSTEM_PROMPT,
     SYSTEM_PROMPT_VERSION,

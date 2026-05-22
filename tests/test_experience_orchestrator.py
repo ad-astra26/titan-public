@@ -3,13 +3,13 @@
 import os
 import tempfile
 import pytest
-from titan_plugin.logic.experience_orchestrator import (
+from titan_hcl.logic.experience_orchestrator import (
     ExperienceOrchestrator,
     ExperienceBias,
     ExperiencePlugin,
     _cosine_sim,
 )
-from titan_plugin.logic.experience_plugins import (
+from titan_hcl.logic.experience_plugins import (
     ArcPuzzlePlugin,
     LanguageLearningPlugin,
     CreativeExpressionPlugin,

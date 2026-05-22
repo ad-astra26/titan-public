@@ -24,7 +24,7 @@ pub mod cli;
 pub mod exit;
 pub mod filter_down;
 pub mod logging;
-pub mod middle_path;
+pub mod metadata_publisher;
 pub mod orchestration;
 pub mod resonance;
 pub mod runtime;

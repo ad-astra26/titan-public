@@ -41,7 +41,7 @@ class MockCoordinator:
 
 @pytest.fixture
 def engine(tmp_path):
-    from titan_plugin.logic.meta_reasoning import MetaReasoningEngine
+    from titan_hcl.logic.meta_reasoning import MetaReasoningEngine
     return MetaReasoningEngine(config={
         "save_dir": str(tmp_path),
         "max_chain_length": 10,
@@ -66,7 +66,7 @@ def neuromods():
 
 class TestMetaPolicy:
     def test_select_action_valid_range(self):
-        from titan_plugin.logic.meta_reasoning import MetaPolicy, NUM_META_ACTIONS
+        from titan_hcl.logic.meta_reasoning import MetaPolicy, NUM_META_ACTIONS
         policy = MetaPolicy()
         inp = [random.random() for _ in range(80)]
         action = policy.select_action(inp)
@@ -76,7 +76,7 @@ class TestMetaPolicy:
         assert 0 <= action < NUM_META_ACTIONS
 
     def test_train_step(self):
-        from titan_plugin.logic.meta_reasoning import MetaPolicy
+        from titan_hcl.logic.meta_reasoning import MetaPolicy
         policy = MetaPolicy()
         inp = [random.random() for _ in range(80)]
         loss = policy.train_step(np.array(inp), 2, 0.5)
@@ -84,7 +84,7 @@ class TestMetaPolicy:
         assert policy.total_updates == 1
 
     def test_save_load_roundtrip(self, tmp_path):
-        from titan_plugin.logic.meta_reasoning import MetaPolicy
+        from titan_hcl.logic.meta_reasoning import MetaPolicy
         p1 = MetaPolicy()
         inp = [random.random() for _ in range(80)]
         a1 = p1.forward(np.array(inp, dtype=np.float32))
@@ -98,21 +98,21 @@ class TestMetaPolicy:
 
 class TestSubModePolicy:
     def test_select_action(self):
-        from titan_plugin.logic.meta_reasoning import SubModePolicy
+        from titan_hcl.logic.meta_reasoning import SubModePolicy
         sp = SubModePolicy(n_modes=4)
         inp = [random.random() for _ in range(30)]
         action = sp.select_action(inp)
         assert 0 <= action < 4
 
     def test_train_step(self):
-        from titan_plugin.logic.meta_reasoning import SubModePolicy
+        from titan_hcl.logic.meta_reasoning import SubModePolicy
         sp = SubModePolicy(n_modes=3)
         inp = [random.random() for _ in range(30)]
         loss = sp.train_step(inp, 1, 0.3)
         assert loss >= 0
 
     def test_to_from_dict(self):
-        from titan_plugin.logic.meta_reasoning import SubModePolicy
+        from titan_hcl.logic.meta_reasoning import SubModePolicy
         sp1 = SubModePolicy(n_modes=3)
         d = sp1.to_dict()
         sp2 = SubModePolicy(n_modes=3)
@@ -124,7 +124,7 @@ class TestSubModePolicy:
 
 class TestMetaTransitionBuffer:
     def test_record_and_sample(self):
-        from titan_plugin.logic.meta_reasoning import MetaTransitionBuffer
+        from titan_hcl.logic.meta_reasoning import MetaTransitionBuffer
         buf = MetaTransitionBuffer(max_size=100)
         for i in range(20):
             buf.record([0.5] * 80, i % 6, i % 3, 0.1 * i)
@@ -134,14 +134,14 @@ class TestMetaTransitionBuffer:
         assert len(batch[0]) == 10  # states
 
     def test_max_size(self):
-        from titan_plugin.logic.meta_reasoning import MetaTransitionBuffer
+        from titan_hcl.logic.meta_reasoning import MetaTransitionBuffer
         buf = MetaTransitionBuffer(max_size=10)
         for i in range(20):
             buf.record([0.5] * 80, 0, 0, 0.1)
         assert buf.size() == 10
 
     def test_save_load(self, tmp_path):
-        from titan_plugin.logic.meta_reasoning import MetaTransitionBuffer
+        from titan_hcl.logic.meta_reasoning import MetaTransitionBuffer
         buf = MetaTransitionBuffer()
         for i in range(5):
             buf.record([0.1 * i] * 80, i % 6, i % 3, 0.1)
@@ -174,7 +174,7 @@ class TestMetaReasoningEngine:
         assert result["action"] == "IDLE"
 
     def test_tick_triggers_on_low_commit(self, engine, state_132d, neuromods, tmp_path):
-        from titan_plugin.logic.chain_archive import ChainArchive
+        from titan_hcl.logic.chain_archive import ChainArchive
         archive = ChainArchive(db_path=str(tmp_path / "test.db"))
 
         mock_re = MockReasoningEngine()
@@ -187,8 +187,8 @@ class TestMetaReasoningEngine:
         assert "low_commit_rate" in engine.state.trigger_reason
 
     def test_full_chain_lifecycle(self, engine, state_132d, neuromods, tmp_path):
-        from titan_plugin.logic.chain_archive import ChainArchive
-        from titan_plugin.logic.meta_wisdom import MetaWisdomStore
+        from titan_hcl.logic.chain_archive import ChainArchive
+        from titan_hcl.logic.meta_wisdom import MetaWisdomStore
 
         archive = ChainArchive(db_path=str(tmp_path / "test.db"))
         wisdom = MetaWisdomStore(db_path=str(tmp_path / "test.db"))
@@ -224,7 +224,7 @@ class TestMetaReasoningEngine:
         assert engine.state.awaiting_delegate is True
 
     def test_consolidate_training(self, engine, state_132d, neuromods, tmp_path):
-        from titan_plugin.logic.chain_archive import ChainArchive
+        from titan_hcl.logic.chain_archive import ChainArchive
         archive = ChainArchive(db_path=str(tmp_path / "test.db"))
         mock_re = MockReasoningEngine()
         mock_re._total_chains = 100
@@ -250,7 +250,7 @@ class TestMetaReasoningEngine:
         engine._total_meta_steps = 42
         engine.save_all()
 
-        from titan_plugin.logic.meta_reasoning import MetaReasoningEngine
+        from titan_hcl.logic.meta_reasoning import MetaReasoningEngine
         engine2 = MetaReasoningEngine(config={"save_dir": str(tmp_path)})
         assert engine2._total_meta_chains == 5
         assert engine2._total_meta_steps == 42
@@ -258,7 +258,7 @@ class TestMetaReasoningEngine:
 
 class TestTriggerConditions:
     def test_low_commit_rate(self):
-        from titan_plugin.logic.meta_reasoning import should_trigger_meta
+        from titan_hcl.logic.meta_reasoning import should_trigger_meta
         mock_re = MockReasoningEngine()
         mock_re._total_chains = 100
         mock_re._total_conclusions = 20
@@ -267,7 +267,7 @@ class TestTriggerConditions:
         assert "low_commit_rate" in reason
 
     def test_high_reflection(self):
-        from titan_plugin.logic.meta_reasoning import should_trigger_meta
+        from titan_hcl.logic.meta_reasoning import should_trigger_meta
         mock_re = MockReasoningEngine()
         mock_re._total_chains = 100
         mock_re._total_conclusions = 80
@@ -277,7 +277,7 @@ class TestTriggerConditions:
         assert "high_reflection" in reason
 
     def test_periodic(self):
-        from titan_plugin.logic.meta_reasoning import should_trigger_meta
+        from titan_hcl.logic.meta_reasoning import should_trigger_meta
         mock_re = MockReasoningEngine()
         mock_re._total_chains = 50
         mock_re._total_conclusions = 40
@@ -287,7 +287,7 @@ class TestTriggerConditions:
         assert "periodic" in reason
 
     def test_no_trigger(self):
-        from titan_plugin.logic.meta_reasoning import should_trigger_meta
+        from titan_hcl.logic.meta_reasoning import should_trigger_meta
         mock_re = MockReasoningEngine()
         mock_re._total_chains = 97  # Not a multiple of 50 (periodic interval)
         mock_re._total_conclusions = 80
@@ -318,7 +318,7 @@ class TestMetaReward:
 
 class TestStrategyBiasIntegration:
     def test_reasoning_policy_accepts_bias(self):
-        from titan_plugin.logic.reasoning import ReasoningPolicyNet
+        from titan_hcl.logic.reasoning import ReasoningPolicyNet
         policy = ReasoningPolicyNet(input_dim=115)
         x = np.random.randn(115).astype(np.float32)
         bias = np.array([2.0, 0, 0, 0, 1.0, 0, 0, -1.0], dtype=np.float32)
@@ -372,7 +372,7 @@ class TestExternalRewardRouting:
 
     def test_dna_external_reward_blend_alpha_loaded(self, tmp_path):
         """external_reward_blend_alpha from DNA lands on the engine."""
-        from titan_plugin.logic.meta_reasoning import MetaReasoningEngine
+        from titan_hcl.logic.meta_reasoning import MetaReasoningEngine
         eng = MetaReasoningEngine(config={
             "save_dir": str(tmp_path),
             "dna": {"external_reward_blend_alpha": 0.7},
@@ -380,7 +380,7 @@ class TestExternalRewardRouting:
         assert abs(eng._external_reward_blend_alpha - 0.7) < 1e-9
 
     def test_dna_external_reward_blend_alpha_defaults_to_half(self, tmp_path):
-        from titan_plugin.logic.meta_reasoning import MetaReasoningEngine
+        from titan_hcl.logic.meta_reasoning import MetaReasoningEngine
         eng = MetaReasoningEngine(config={"save_dir": str(tmp_path)})
         assert abs(eng._external_reward_blend_alpha - 0.5) < 1e-9
 

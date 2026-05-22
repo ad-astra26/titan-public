@@ -14,6 +14,7 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod anchor;
 pub mod body_cycle;
 pub mod boot;
 pub mod chi_state;
@@ -157,10 +158,17 @@ async fn main() -> ExitCode {
             {
                 Ok(bus_client) => match crate::body_cycle::BodyCycleSlots::open(&cfg.shm_dir) {
                     Ok(slots) => {
+                        // rFP_phase_c_substrate_observable_closure §2.2 — pass
+                        // data_dir so SubstrateState's AnchorReader can read
+                        // data/anchor_state.json (60s cached). Falls back to
+                        // PathBuf::new() (no anchor file → default factor 1.0)
+                        // when --data-dir not supplied.
+                        let data_dir = cfg.data_dir.clone().unwrap_or_default();
                         let task = tokio::spawn(crate::body_cycle::run_substrate_body_cycle(
                             slots,
                             bus_client,
                             shutdown.clone(),
+                            data_dir,
                         ));
                         info!(
                             event = "BODY_CYCLE_SPAWNED",

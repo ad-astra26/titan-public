@@ -124,7 +124,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--vault-program-id", default=None,
         help="Override vault program ID. Defaults to the configured "
-             "VAULT_PROGRAM_ID in titan_plugin.utils.solana_client.",
+             "VAULT_PROGRAM_ID in titan_hcl.utils.solana_client.",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -170,7 +170,7 @@ def main(argv=None) -> int:
         from solana.rpc.api import Client
         from solders.message import Message
         from solders.transaction import Transaction
-        from titan_plugin.utils.solana_client import (
+        from titan_hcl.utils.solana_client import (
             VAULT_PROGRAM_ID,
             build_vault_initialize_instruction,
             decode_vault_state,

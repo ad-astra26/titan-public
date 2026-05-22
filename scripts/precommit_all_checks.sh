@@ -3,24 +3,20 @@
 #
 # Runs in order:
 #   1. scripts/precommit_async_check.sh — blocks async-boundary violations
-#      in titan_plugin/*.py (existing, established 2026-04-14)
+#      in titan_hcl/*.py (existing, established 2026-04-14)
 #   2. gitleaks on staged diffs — blocks commits that introduce secrets
 #      (added 2026-04-15 after public-repo leak incident)
-#   3. arch_map cache-keys --audit — blocks commits that drift the
-#      observatory data contract registry (added 2026-04-26 per
-#      rFP_observatory_data_loading_v1 Phase 1). Skipped if no
-#      titan_plugin/api/* or titan_plugin/{modules,core}/* files staged.
-#   4. tests/test_lazy_imports.py — blocks commits that re-introduce
+#   3. tests/test_lazy_imports.py — blocks commits that re-introduce
 #      eager module-level imports of torch/transformers/faiss/etc into
 #      worker modules (added 2026-04-27 closing DEFERRED I-002). Skipped
-#      if no titan_plugin/*.py files staged. ~5s wall when active.
+#      if no titan_hcl/*.py files staged. ~5s wall when active.
 #      Reason: a single eager torch import in a hot-path file costs
 #      ~860MB × 9 workers ≈ 2.3GB at boot (per commit 7f01125 history).
-#   5. arch_map phase-c verify --strict — blocks SPEC drift + G-RPC
+#   4. arch_map phase-c verify --strict — blocks SPEC drift + G-RPC
 #      violations per titan-docs/SPEC_titan_architecture.md §20 + Rule
 #      2 of feedback_phase_c_spec_enforcement.md. Runs when SPEC TOML,
 #      generated constants files, generator script, arch_map.py, or any
-#      titan_plugin/ / titan-rust/ source is staged. Catches:
+#      titan_hcl/ / titan-rust/ source is staged. Catches:
 #        • Hand-edits to _phase_c_constants.py / constants.rs (regen drift)
 #        • TOML constant added without regen
 #        • Domain used by constant but missing from [domains.X] block
@@ -29,17 +25,39 @@
 #        • G-RPC-2 bus.request* without explicit timeout kwarg
 #        • G-RPC-3 proxy `def get_*` not reading SHM (Preamble G18)
 #        • G-RPC-4 orphan `if action == "get_*"` handler (caller graph)
+#        • G-RPC-5 forbidden _cache.get(state_key) read OR Python-side
+#          StateRegistryWriter for Rust-canonical L0+L1 slot (D-SPEC-81
+#          Phase E enforcement gate — blocks bus-cache drift recurrence)
 #      G-RPC-1..4 added 2026-05-07 by Phase C Session 5 rFP §4.E.
-#   6. cargo fmt --check + cargo clippy -D warnings on titan-rust/ —
+#      G-RPC-5 added 2026-05-18 by Phase E (D-SPEC-83 v1.22.0).
+#   5. cargo fmt --check + cargo clippy -D warnings on titan-rust/ —
 #      blocks Rust formatting drift + clippy warnings per Phase C C-S8
 #      PLAN §15.4. Skipped if no titan-rust/ files staged.
+#
+# RETIRED 2026-05-18 (D-SPEC-80 Phase D):
+#   - arch_map cache-keys --audit (former step 3) — cache_key_registry
+#     deleted along with the bus-cache → CachedState pipeline. G-RPC-5
+#     in step 4 supersedes the audit role.
 #
 # Enable:   ln -sf ../../scripts/precommit_all_checks.sh .git/hooks/pre-commit
 # Bypass:   git commit --no-verify  (use sparingly; each check has a reason)
 
 set -u
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# 2026-05-14 — use git's worktree-aware resolver instead of
+# `$(cd "$(dirname "$0")/.." && pwd)`. The dirname-based form was broken
+# in git worktrees because `.git/hooks/pre-commit` is a SHARED symlink
+# pointing to this script in the MAIN repo (lives at
+# `<main-repo>/.git/hooks/pre-commit` regardless of which worktree
+# triggers the commit), so dirname/.. always resolved to the main repo's
+# `.git/` dir — meaning `$REPO_ROOT/scripts/tracker_indexer.py` tried to
+# read `/path/to/main/.git/scripts/tracker_indexer.py` (doesn't exist)
+# and the hook bailed with a misleading "tracker drift" banner.
+# `git rev-parse --show-toplevel` returns the ACTIVE worktree path, so
+# `scripts/*` refs resolve correctly from any worktree. Discovered
+# 2026-05-14 during BUG-CHRONICLE-WRITER-DEAD-POST-A87 filing — first
+# commit in the session to touch a tracker body from a worktree.
+REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
 # ── 1. Async-block scanner (existing) ────────────────────────────
@@ -79,50 +97,11 @@ BANNER
     fi
 fi
 
-# ── 3. Cache key registry audit ──────────────────────────────────
-# Only runs when staged changes touch files that could affect the
-# producer / cache-key / consumer chain.
-STAGED_RELEVANT=$(git diff --cached --name-only --diff-filter=ACM \
-    -- 'titan_plugin/api/**' 'titan_plugin/modules/**' \
-       'titan_plugin/core/**' 'titan_plugin/bus.py' 2>/dev/null || true)
-
-if [ -n "$STAGED_RELEVANT" ]; then
-    if [ -x "$REPO_ROOT/test_env/bin/python" ]; then
-        if ! "$REPO_ROOT/test_env/bin/python" "$REPO_ROOT/scripts/arch_map.py" \
-                cache-keys --audit > /tmp/precommit_cache_keys.log 2>&1; then
-            cat >&2 <<BANNER
-
-┌──────────────────────────────────────────────────────────────────────┐
-│  ⛔  cache_key_registry audit failed.                                │
-│                                                                      │
-│  The observatory data contract has drifted — a producer was renamed, │
-│  a new cache.get() call was added without registering, a consumer    │
-│  endpoint moved, or a bus constant was renamed.                      │
-│                                                                      │
-│  See full audit:                                                     │
-│      cat /tmp/precommit_cache_keys.log                               │
-│                                                                      │
-│  Re-run manually:                                                    │
-│      python scripts/arch_map.py cache-keys --audit                   │
-│                                                                      │
-│  Fix by editing titan_plugin/api/cache_key_registry.py.              │
-│                                                                      │
-│  Bypass (only when registry is intentionally being updated):         │
-│      git commit --no-verify                                          │
-└──────────────────────────────────────────────────────────────────────┘
-
-BANNER
-            tail -40 /tmp/precommit_cache_keys.log >&2
-            exit 1
-        fi
-    fi
-fi
-
-# ── 4. Lazy-imports enforcement (I-002 closure 2026-04-27) ───────
+# ── 3. Lazy-imports enforcement (I-002 closure 2026-04-27) ───────
 # Block re-introduction of eager torch/transformers/faiss imports in
-# worker modules. Test runs only when titan_plugin/*.py is staged.
+# worker modules. Test runs only when titan_hcl/*.py is staged.
 STAGED_TP_PY=$(git diff --cached --name-only --diff-filter=ACM \
-    -- 'titan_plugin/**/*.py' 2>/dev/null || true)
+    -- 'titan_hcl/**/*.py' 2>/dev/null || true)
 
 if [ -n "$STAGED_TP_PY" ]; then
     if [ -x "$REPO_ROOT/test_env/bin/python" ]; then
@@ -135,7 +114,7 @@ if [ -n "$STAGED_TP_PY" ]; then
 ┌──────────────────────────────────────────────────────────────────────┐
 │  ⛔  Lazy-imports check failed.                                      │
 │                                                                      │
-│  A staged file in titan_plugin/ introduced (or re-introduced) an     │
+│  A staged file in titan_hcl/ introduced (or re-introduced) an     │
 │  eager module-level import of a heavy ML library — torch,            │
 │  transformers, faiss, sentence_transformers, triton, or torchvision. │
 │                                                                      │
@@ -146,7 +125,7 @@ if [ -n "$STAGED_TP_PY" ]; then
 │  Fix: move the import inside the function/method that uses it,       │
 │  OR use PEP 562 `__getattr__` for module-level exports.              │
 │                                                                      │
-│  See: memory/feedback_lazy_imports_titan_plugin.md                   │
+│  See: memory/feedback_lazy_imports_titan_hcl.md                   │
 │       tests/test_lazy_imports.py (the canonical enforcement)         │
 │                                                                      │
 │  Full output:                                                        │
@@ -163,16 +142,16 @@ BANNER
     fi
 fi
 
-# ── 5. Phase C SPEC enforcer (titan-docs/SPEC_titan_architecture.md §20) ───
+# ── 4. Phase C SPEC enforcer (titan-docs/SPEC_titan_architecture.md §20) ───
 # Runs when SPEC scope is staged: TOML / generated files / generator /
-# arch_map / any titan_plugin or titan-rust source. ~1s wall when active.
+# arch_map / any titan_hcl or titan-rust source. ~1s wall when active.
 STAGED_SPEC_SCOPE=$(git diff --cached --name-only --diff-filter=ACM -- \
     'titan-docs/SPEC_titan_architecture*' \
-    'titan_plugin/_phase_c_constants.py' \
+    'titan_hcl/_phase_c_constants.py' \
     'titan-rust/crates/titan-core/src/constants.rs' \
     'scripts/generate_phase_c_constants.py' \
     'scripts/arch_map.py' \
-    'titan_plugin/**/*.py' \
+    'titan_hcl/**/*.py' \
     'titan-rust/**' \
     2>/dev/null || true)
 
@@ -196,7 +175,7 @@ if [ -n "$STAGED_SPEC_SCOPE" ]; then
 │                                                                      │
 │  Common fix:                                                         │
 │      python scripts/arch_map.py phase-c regen                        │
-│      git add titan_plugin/_phase_c_constants.py                      │
+│      git add titan_hcl/_phase_c_constants.py                      │
 │      git add titan-rust/crates/titan-core/src/constants.rs           │
 │                                                                      │
 │  Per feedback_phase_c_spec_enforcement.md Rule 2:                    │
@@ -247,7 +226,7 @@ BANNER
     fi
 fi
 
-# ── 6. cargo fmt + clippy on Rust workspace (Phase C C-S8 PLAN §15.4) ─
+# ── 5. cargo fmt + clippy on Rust workspace (Phase C C-S8 PLAN §15.4) ─
 # Runs only when staged changes touch titan-rust/. Drift discipline:
 # lint warnings = build failure for Rust, mirroring SPEC strictness.
 STAGED_RUST=$(git diff --cached --name-only --diff-filter=ACM -- \
@@ -296,6 +275,173 @@ BANNER
             exit 1
         fi
         cd "$REPO_ROOT"
+    fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Tracker index drift gate — added 2026-05-13.
+#
+# When BUGS.md / OBSERVABLES.md / DEFERRED_ITEMS.md is edited, the matching
+# *_index.md must be regenerated in the same commit. Post-commit hook
+# auto-regenerates for the NEXT commit; this gate prevents shipping a body
+# change without its synced index. Skipped if no tracker body is staged.
+# Discipline rule: memory/feedback_tracker_index_discipline.md
+# ─────────────────────────────────────────────────────────────────────────────
+STAGED_TRACKERS=$(git diff --cached --name-only --diff-filter=ACM -- \
+    titan-docs/BUGS.md \
+    titan-docs/OBSERVABLES.md \
+    titan-docs/DEFERRED_ITEMS.md \
+    2>/dev/null)
+
+# Architecture doc drift gate — added 2026-05-19.
+# When ARCHITECTURE_cgn_family.md is edited, ARCHITECTURE_cgn_family_index.md
+# must be regenerated in the same commit. Same discipline as SPEC_index.
+STAGED_ARCH=$(git diff --cached --name-only --diff-filter=ACM -- \
+    titan-docs/ARCHITECTURE_cgn_family.md \
+    2>/dev/null)
+
+if [ -n "$STAGED_ARCH" ]; then
+    PY="$REPO_ROOT/test_env/bin/python"
+    [ -x "$PY" ] || PY=python3
+    if ! "$PY" "$REPO_ROOT/scripts/architecture_cgn_family_index.py" --check 2>/tmp/precommit_arch_drift.log; then
+        cat >&2 <<'BANNER'
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  ⛔  Architecture index drift detected.                              │
+│                                                                      │
+│  ARCHITECTURE_cgn_family.md was edited but its _index.md is stale.   │
+│                                                                      │
+│  Fix:                                                                │
+│      python scripts/architecture_cgn_family_index.py                 │
+│      git add titan-docs/ARCHITECTURE_cgn_family_index.md             │
+│                                                                      │
+│  See: cat /tmp/precommit_arch_drift.log                              │
+└──────────────────────────────────────────────────────────────────────┘
+
+BANNER
+        cat /tmp/precommit_arch_drift.log >&2
+        exit 1
+    fi
+fi
+
+# Synthesis-engine architecture doc drift gate — added 2026-05-20.
+# When ARCHITECTURE_synthesis_engine.md is edited, its _index.md must be
+# regenerated in the same commit. Same discipline as the CGN-family gate above.
+STAGED_SYNTH_ARCH=$(git diff --cached --name-only --diff-filter=ACM -- \
+    titan-docs/ARCHITECTURE_synthesis_engine.md \
+    2>/dev/null)
+
+if [ -n "$STAGED_SYNTH_ARCH" ]; then
+    PY="$REPO_ROOT/test_env/bin/python"
+    [ -x "$PY" ] || PY=python3
+    if ! "$PY" "$REPO_ROOT/scripts/architecture_synthesis_engine_index.py" --check 2>/tmp/precommit_synth_arch_drift.log; then
+        cat >&2 <<'BANNER'
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  ⛔  Synthesis-engine architecture index drift detected.             │
+│                                                                      │
+│  ARCHITECTURE_synthesis_engine.md was edited but its _index.md is    │
+│  stale.                                                              │
+│                                                                      │
+│  Fix:                                                                │
+│      python scripts/architecture_synthesis_engine_index.py           │
+│      git add titan-docs/ARCHITECTURE_synthesis_engine_index.md       │
+│                                                                      │
+│  See: cat /tmp/precommit_synth_arch_drift.log                        │
+└──────────────────────────────────────────────────────────────────────┘
+
+BANNER
+        cat /tmp/precommit_synth_arch_drift.log >&2
+        exit 1
+    fi
+fi
+
+# When ARCHITECTURE_api_family.md is edited, its _index.md must be
+# regenerated in the same commit. Same discipline as the CGN-family +
+# synthesis-engine gates above.
+STAGED_API_ARCH=$(git diff --cached --name-only --diff-filter=ACM -- \
+    titan-docs/ARCHITECTURE_api_family.md \
+    2>/dev/null)
+
+if [ -n "$STAGED_API_ARCH" ]; then
+    PY="$REPO_ROOT/test_env/bin/python"
+    [ -x "$PY" ] || PY=python3
+    if ! "$PY" "$REPO_ROOT/scripts/architecture_api_family_index.py" --check 2>/tmp/precommit_api_arch_drift.log; then
+        cat >&2 <<'BANNER'
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  ⛔  API-family architecture index drift detected.                   │
+│                                                                      │
+│  ARCHITECTURE_api_family.md was edited but its _index.md is stale.   │
+│                                                                      │
+│  Fix:                                                                │
+│      python scripts/architecture_api_family_index.py                 │
+│      git add titan-docs/ARCHITECTURE_api_family_index.md             │
+│                                                                      │
+│  See: cat /tmp/precommit_api_arch_drift.log                          │
+└──────────────────────────────────────────────────────────────────────┘
+
+BANNER
+        cat /tmp/precommit_api_arch_drift.log >&2
+        exit 1
+    fi
+fi
+
+# When ARCHITECTURE_trinity.md is edited, its _index.md must be
+# regenerated in the same commit. Same discipline as the CGN-family +
+# synthesis-engine + API-family gates above.
+STAGED_TRINITY_ARCH=$(git diff --cached --name-only --diff-filter=ACM -- \
+    titan-docs/ARCHITECTURE_trinity.md \
+    2>/dev/null)
+
+if [ -n "$STAGED_TRINITY_ARCH" ]; then
+    PY="$REPO_ROOT/test_env/bin/python"
+    [ -x "$PY" ] || PY=python3
+    if ! "$PY" "$REPO_ROOT/scripts/architecture_trinity_index.py" --check 2>/tmp/precommit_trinity_arch_drift.log; then
+        cat >&2 <<'BANNER'
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  ⛔  Trinity architecture index drift detected.                      │
+│                                                                      │
+│  ARCHITECTURE_trinity.md was edited but its _index.md is stale.      │
+│                                                                      │
+│  Fix:                                                                │
+│      python scripts/architecture_trinity_index.py                    │
+│      git add titan-docs/ARCHITECTURE_trinity_index.md               │
+│                                                                      │
+│  See: cat /tmp/precommit_trinity_arch_drift.log                      │
+└──────────────────────────────────────────────────────────────────────┘
+
+BANNER
+        cat /tmp/precommit_trinity_arch_drift.log >&2
+        exit 1
+    fi
+fi
+
+if [ -n "$STAGED_TRACKERS" ]; then
+    PY="$REPO_ROOT/test_env/bin/python"
+    [ -x "$PY" ] || PY=python3
+    if ! "$PY" "$REPO_ROOT/scripts/tracker_indexer.py" --check-all 2>/tmp/precommit_tracker_drift.log; then
+        cat >&2 <<'BANNER'
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  ⛔  Tracker index drift detected.                                   │
+│                                                                      │
+│  A staged tracker body was edited but its *_index.md is stale.       │
+│                                                                      │
+│  Fix:                                                                │
+│      python scripts/tracker_indexer.py --emit-all                    │
+│      git add titan-docs/BUGS_index.md \                              │
+│              titan-docs/OBSERVABLES_index.md \                       │
+│              titan-docs/DEFERRED_index.md                            │
+│                                                                      │
+│  See: cat /tmp/precommit_tracker_drift.log                           │
+│  Discipline: memory/feedback_tracker_index_discipline.md             │
+└──────────────────────────────────────────────────────────────────────┘
+
+BANNER
+        cat /tmp/precommit_tracker_drift.log >&2
+        exit 1
     fi
 fi
 

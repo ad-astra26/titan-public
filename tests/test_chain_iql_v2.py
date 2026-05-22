@@ -15,7 +15,7 @@ import tempfile
 import numpy as np
 import pytest
 
-from titan_plugin.logic.chain_iql import ChainIQL
+from titan_hcl.logic.chain_iql import ChainIQL
 
 
 @pytest.fixture

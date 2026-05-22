@@ -21,8 +21,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from titan_plugin.bus import DivineBus
-from titan_plugin.guardian import Guardian, ModuleSpec, ModuleState
+from titan_hcl.bus import DivineBus
+from titan_hcl.guardian import Guardian, ModuleSpec, ModuleState
 
 
 def _dummy_entry(*args, **kwargs):
@@ -132,7 +132,7 @@ def test_setup_worker_bus_raises_when_queues_none_and_fallback(monkeypatch):
     setup_worker_bus's fallback path fires (env vars missing or keypair
     unreadable), we MUST raise — silently returning (None, None, None)
     would let the worker AttributeError deep in entry_fn."""
-    from titan_plugin.core.worker_bus_bootstrap import setup_worker_bus
+    from titan_hcl.core.worker_bus_bootstrap import setup_worker_bus
 
     # Empty env → all 3 vars missing → fallback path
     monkeypatch.setenv("PYTHONPATH", "")  # noqa  (just to exercise monkeypatch)
@@ -146,7 +146,7 @@ def test_setup_worker_bus_legacy_fallback_with_real_queues_returns_them(monkeypa
     """Inverse case: legacy mode (no broker, real mp.Queue passed) —
     fallback returns the queues unchanged. Behavior preserved for
     non-microkernel-v2 callers (tests, legacy fallback)."""
-    from titan_plugin.core.worker_bus_bootstrap import setup_worker_bus
+    from titan_hcl.core.worker_bus_bootstrap import setup_worker_bus
 
     fake_env = {}  # no socket env vars
     real_recv = multiprocessing.Queue()

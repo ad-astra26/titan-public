@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-# The gateway is 100% standalone — no titan_plugin imports needed
-from titan_plugin.logic.social_x_gateway import (
+# The gateway is 100% standalone — no titan_hcl imports needed
+from titan_hcl.logic.social_x_gateway import (
     SocialXGateway, BaseContext, PostContext, ReplyContext,
     ActionResult, SearchResult,
 )
@@ -460,6 +460,10 @@ class TestTelemetry:
 # ── Public API (Phase 1 stubs) ─────────────────────────────────────
 
 class TestPublicAPIStubs:
+    # Phase 3 Chunk ω-bis (D-SPEC-88) — gate checks moved to prepare_post().
+    # post() now requires a descriptor + composed_text, returning not_prepared
+    # otherwise. Early-exit gate tests verify prepare_post returns the gate
+    # ActionResult as the first tuple element.
     def test_post_disabled_when_config_disabled(self, tmp_db, tmp_path, tmp_telemetry):
         config_path = str(tmp_path / "disabled.toml")
         with open(config_path, "w") as f:
@@ -467,14 +471,16 @@ class TestPublicAPIStubs:
         gw = SocialXGateway(tmp_db, config_path, tmp_telemetry)
         ctx = PostContext(session="", proxy="", api_key="", titan_id="T1",
                           catalysts=[{"type": "test"}])
-        result = gw.post(ctx)
-        assert result.status == "disabled"
+        err, desc = gw.prepare_post(ctx)
+        assert desc is None
+        assert err is not None and err.status == "disabled"
 
     def test_post_no_catalyst(self, gateway):
         ctx = PostContext(session="", proxy="", api_key="", titan_id="T1",
                           catalysts=[])
-        result = gateway.post(ctx, consumer="test_consumer")
-        assert result.status == "no_catalyst"
+        err, desc = gateway.prepare_post(ctx, consumer="test_consumer")
+        assert desc is None
+        assert err is not None and err.status == "no_catalyst"
 
     def test_post_rate_limited(self, gateway):
         # Max out hourly posts
@@ -488,21 +494,44 @@ class TestPublicAPIStubs:
 
         ctx = PostContext(session="", proxy="", api_key="", titan_id="T1",
                           catalysts=[{"type": "test"}])
-        result = gateway.post(ctx, consumer="test_consumer")
-        assert result.status == "hourly_limit"
+        err, desc = gateway.prepare_post(ctx, consumer="test_consumer")
+        assert desc is None
+        assert err is not None and err.status == "hourly_limit"
 
 
 # ── Stats ───────────────────────────────────────────────────────────
 
 # ── Phase 2: Post Generation + Quality Gate ────────────────────────
 
+@pytest.fixture
+def gateway_no_archetype(gateway):
+    """Gateway with archetype dispatcher disabled.
+
+    2026-05-17 — these tests target the catalyst_map and FELT_STATE_POOL
+    fall-through paths of _select_post_type. After rFP §4.3 X-voice
+    archetype dispatcher shipped (commit 2908faae), the dispatcher fires
+    at step (0) and short-circuits the catalyst_map/pool paths whenever
+    it produces a candidate — which it does for fresh DBs because the
+    archetype priority-order returns one by default. Tests need to
+    isolate the fall-through paths.
+
+    Sentinel: setting _archetype_dispatcher = False matches the init-
+    failure sentinel at gateway.py:264 — _select_post_type then skips
+    the probe entirely.
+    """
+    gateway._archetype_dispatcher = False
+    return gateway
+
+
 class TestPostTypeSelection:
-    def test_onchain_catalyst(self, gateway):
+    def test_onchain_catalyst(self, gateway_no_archetype):
+        gateway = gateway_no_archetype
         ctx = PostContext(session="", proxy="", api_key="", titan_id="T1")
         catalyst = {"type": "onchain_anchor", "significance": 0.4}
         assert gateway._select_post_type(catalyst, ctx) == "onchain"
 
-    def test_eureka_spirit_catalyst(self, gateway):
+    def test_eureka_spirit_catalyst(self, gateway_no_archetype):
+        gateway = gateway_no_archetype
         ctx = PostContext(session="", proxy="", api_key="", titan_id="T1")
         catalyst = {"type": "eureka_spirit", "significance": 0.95}
         assert gateway._select_post_type(catalyst, ctx) == "eureka_thread"
@@ -518,29 +547,96 @@ class TestPostTypeSelection:
         db.commit()
         db.close()
 
-    def test_emotion_shift_becomes_reflection(self, gateway):
+    def test_emotion_shift_falls_through_to_felt_state_pool(
+            self, gateway_no_archetype):
+        """F-6 (rFP_social_x_improvements §B.3.F-6, 2026-05-17): emotion_shift
+        no longer pre-selects reflection via catalyst_map (would bypass
+        reflection.find_candidate's per_titan_count_today daily cap).
+        With dispatcher disabled, emotion_shift now falls through to the
+        FELT_STATE_POOL weighted draw — result is one of the 8 pool
+        post_types, NOT deterministically reflection."""
+        from titan_hcl.logic.social_x_gateway import SocialXGateway
+        gateway = gateway_no_archetype
         self._seed_recent_full_stack(gateway)
         ctx = PostContext(session="", proxy="", api_key="", titan_id="T1")
         catalyst = {"type": "emotion_shift", "significance": 0.5}
-        assert gateway._select_post_type(catalyst, ctx) == "reflection"
+        result = gateway._select_post_type(catalyst, ctx)
+        pool_types = {pt for pt, _w in SocialXGateway.FELT_STATE_POOL}
+        # Hard-threshold rules may also fire on neutral-ish neuromods —
+        # accept anything that came from a legitimate variety-respecting
+        # selector. The forbidden outcome is "reflection picked by
+        # catalyst_map bypass" — that path is now gone.
+        assert result in pool_types or result in {
+            "vulnerability", "thread_storm", "self_quote"}
 
-    def test_high_endorphin_becomes_connective(self, gateway):
+    def test_high_endorphin_biases_connective(self, gateway_no_archetype, monkeypatch):
+        """Endorphin > 0.7 must apply a 2× bias to the connective weight in
+        the felt-state pool. Verify the bias propagates into the weights
+        list passed to random.choices, regardless of the random draw."""
+        gateway = gateway_no_archetype
         self._seed_recent_full_stack(gateway)
         ctx = PostContext(session="", proxy="", api_key="", titan_id="T1",
                           neuromods={"Endorphin": 0.8})
-        catalyst = {"type": "strong_composition", "significance": 0.5}
-        assert gateway._select_post_type(catalyst, ctx) == "connective"
+        catalyst = {"type": "neutral_signal", "significance": 0.5}
 
-    def test_default_bilingual(self, gateway):
+        captured = {}
+        def fake_choices(population, weights=None, k=1):
+            captured["population"] = list(population)
+            captured["weights"] = list(weights or [])
+            return ["connective"]
+        monkeypatch.setattr("random.choices", fake_choices)
+
+        result = gateway._select_post_type(catalyst, ctx)
+        assert result == "connective"
+        # Verify Endorphin bias landed: connective baseline is 0.10, after
+        # ×2 bias must be 0.20.
+        conn_idx = captured["population"].index("connective")
+        assert captured["weights"][conn_idx] == pytest.approx(0.20)
+
+    def test_default_pool_max_weight_is_full_stack(self, gateway_no_archetype, monkeypatch):
+        """With a recent rich post (no full_stack bias kicks in) and an
+        unmapped catalyst, the felt-state pool's highest-weighted item is
+        full_stack at 0.35. Verify the pool composition + max-weight pick."""
+        gateway = gateway_no_archetype
         self._seed_recent_full_stack(gateway)
         ctx = PostContext(session="", proxy="", api_key="", titan_id="T1")
         catalyst = {"type": "unknown", "significance": 0.3}
-        assert gateway._select_post_type(catalyst, ctx) == "bilingual"
 
-    def test_full_stack_when_no_recent_rich_post(self, gateway):
+        captured = {}
+        def fake_choices(population, weights=None, k=1):
+            captured["population"] = list(population)
+            captured["weights"] = list(weights or [])
+            # Return the max-weighted item — deterministic verification.
+            max_idx = max(range(len(weights)),
+                          key=lambda i: weights[i])
+            return [population[max_idx]]
+        monkeypatch.setattr("random.choices", fake_choices)
+
+        result = gateway._select_post_type(catalyst, ctx)
+        assert result == "full_stack"
+        fs_idx = captured["population"].index("full_stack")
+        assert captured["weights"][fs_idx] == pytest.approx(0.35)
+
+    def test_no_rich_post_biases_full_stack(self, gateway_no_archetype, monkeypatch):
+        """When no full_stack post in the last hour, the gateway biases
+        full_stack ×2 (0.35 → 0.70) to preserve rich-post cadence. Verify
+        the bias lands in the weights list."""
+        gateway = gateway_no_archetype
         ctx = PostContext(session="", proxy="", api_key="", titan_id="T1")
-        catalyst = {"type": "emotion_shift", "significance": 0.5}
-        assert gateway._select_post_type(catalyst, ctx) == "full_stack"
+        catalyst = {"type": "neutral_signal", "significance": 0.5}
+
+        captured = {}
+        def fake_choices(population, weights=None, k=1):
+            captured["population"] = list(population)
+            captured["weights"] = list(weights or [])
+            return ["full_stack"]
+        monkeypatch.setattr("random.choices", fake_choices)
+
+        result = gateway._select_post_type(catalyst, ctx)
+        assert result == "full_stack"
+        fs_idx = captured["population"].index("full_stack")
+        # Baseline 0.35 × 2 = 0.70 (no-rich-post bias).
+        assert captured["weights"][fs_idx] == pytest.approx(0.70)
 
 
 class TestStyleOwnWords:
@@ -625,7 +721,8 @@ class TestAssembleFinalText:
         config = gateway._load_config()
         text = gateway._assemble_final_text(
             "A beautiful thought", "bilingual", catalyst, ctx, config)
-        assert "[T1]" in text
+        # T1's actor tag is "Titan" (gateway:2334); T2/T3 keep short id.
+        assert "[Titan]" in text
         assert "\u25C7 wonder" in text  # ◇ wonder
         assert "A beautiful thought" in text
 
@@ -641,7 +738,10 @@ class TestAssembleFinalText:
         assert "solscan" not in text.lower()  # Uses our shortener, not Solscan
 
     def test_no_url_for_non_onchain(self, gateway):
-        ctx = PostContext(session="", proxy="", api_key="", titan_id="T1",
+        # T1 ALWAYS appends the mainnet chain-identity URL (gateway:2339-2340).
+        # Use T2 to exercise the no-URL path for non-onchain post types,
+        # since the chain_line is T1-only.
+        ctx = PostContext(session="", proxy="", api_key="", titan_id="T2",
                           emotion="wonder", epoch=1000, neuromods={})
         catalyst = {"type": "emotion_shift", "data": {}}
         config = gateway._load_config()
@@ -669,14 +769,15 @@ class TestPostFullFlow:
         gw = SocialXGateway(tmp_db, config_path, tmp_telemetry)
         ctx = PostContext(session="s", proxy="p", api_key="k", titan_id="T1",
                           catalysts=[{"type": "test", "significance": 0.5}])
-        result = gw.post(ctx)
-        assert result.status == "disabled"
+        # Phase 3 Chunk ω-bis: gate check via prepare_post (see TestPublicAPIStubs).
+        err, desc = gw.prepare_post(ctx)
+        assert desc is None and err.status == "disabled"
 
     def test_post_no_catalyst(self, gateway):
         ctx = PostContext(session="s", proxy="p", api_key="k", titan_id="T1",
                           catalysts=[])
-        result = gateway.post(ctx, consumer="test_consumer")
-        assert result.status == "no_catalyst"
+        err, desc = gateway.prepare_post(ctx, consumer="test_consumer")
+        assert desc is None and err.status == "no_catalyst"
 
     def test_post_rate_limited_hourly(self, gateway):
         db = gateway._db()
@@ -688,8 +789,8 @@ class TestPostFullFlow:
         db.close()
         ctx = PostContext(session="s", proxy="p", api_key="k", titan_id="T1",
                           catalysts=[{"type": "test", "significance": 0.5}])
-        result = gateway.post(ctx, consumer="test_consumer")
-        assert result.status == "hourly_limit"
+        err, desc = gateway.prepare_post(ctx, consumer="test_consumer")
+        assert desc is None and err.status == "hourly_limit"
 
     def test_post_rate_limited_interval(self, gateway):
         db = gateway._db()
@@ -700,8 +801,8 @@ class TestPostFullFlow:
         db.close()
         ctx = PostContext(session="s", proxy="p", api_key="k", titan_id="T1",
                           catalysts=[{"type": "test", "significance": 0.5}])
-        result = gateway.post(ctx, consumer="test_consumer")
-        assert result.status == "too_soon"
+        err, desc = gateway.prepare_post(ctx, consumer="test_consumer")
+        assert desc is None and err.status == "too_soon"
 
 
 # ── Stats ───────────────────────────────────────────────────────────
@@ -747,18 +848,79 @@ class TestConsumerAccess:
     def test_post_with_consumer_check(self, gateway):
         ctx = PostContext(session="s", proxy="p", api_key="k", titan_id="T1",
                           catalysts=[{"type": "test", "significance": 0.5}])
-        # Unregistered consumer blocked
-        result = gateway.post(ctx, consumer="unknown_module")
-        assert result.status == "consumer_blocked"
+        # Phase 3 Chunk ω-bis: unregistered consumer blocked at prepare_post.
+        err, desc = gateway.prepare_post(ctx, consumer="unknown_module")
+        assert desc is None and err.status == "consumer_blocked"
 
     def test_post_with_allowed_consumer(self, gateway):
-        # spirit_worker is allowed to post — will get past consumer check
-        # but fail on LLM generation (no LLM configured in test)
+        # spirit_worker is allowed — prepare_post returns a descriptor
+        # (composition happens externally; gateway no longer drives the LLM).
         ctx = PostContext(session="s", proxy="p", api_key="k", titan_id="T1",
                           catalysts=[{"type": "test", "significance": 0.5}])
+        err, desc = gateway.prepare_post(ctx, consumer="spirit_worker")
+        # Should get past consumer + catalyst gates → descriptor returned.
+        # (May still hit "disabled" if test config has enabled=false.)
+        if err is None:
+            assert desc is not None
+            assert desc.post_type
+            assert desc.system_prompt
+            assert desc.user_prompt
+        else:
+            assert err.status in ("disabled",)
+
+
+# ── Phase 3 Chunk ω-bis — two-call shape invariants ──────────────────
+
+
+class TestTwoCallShape:
+    """D-SPEC-88 invariants: post() refuses to run without prepare_post+compose."""
+
+    def test_post_without_descriptor_returns_not_prepared(self, gateway):
+        """Calling post() without the descriptor from prepare_post is rejected."""
+        ctx = PostContext(session="s", proxy="p", api_key="k", titan_id="T1",
+                          composed_text="some text")
         result = gateway.post(ctx, consumer="spirit_worker")
-        # Should get past consumer check — fails later at generation
-        assert result.status in ("generation_failed", "disabled")
+        assert result.status == "not_prepared"
+        assert "prepare_post" in (result.reason or "")
+
+    def test_post_with_descriptor_but_empty_composed_text_returns_not_prepared(self, gateway):
+        """Even with a descriptor, missing composed_text is rejected — caller
+        must run the LLM round-trip between prepare_post and post."""
+        from titan_hcl.logic.social_x_gateway import PostDescriptor
+        desc = PostDescriptor(
+            post_type="bilingual", catalyst={"type": "test"},
+            system_prompt="sys", user_prompt="user",
+            max_tokens=200, temperature=0.8, voice_cfg={})
+        ctx = PostContext(session="s", proxy="p", api_key="k", titan_id="T1",
+                          composed_text="")
+        result = gateway.post(ctx, consumer="spirit_worker", descriptor=desc)
+        assert result.status == "not_prepared"
+        assert "composed_text" in (result.reason or "")
+
+    def test_generate_text_deleted_no_shim(self):
+        """Per feedback_no_shim_old_path_must_be_deleted.md, _generate_text is gone."""
+        assert not hasattr(SocialXGateway, "_generate_text"), (
+            "_generate_text must be DELETED post-ω-bis (no shim)")
+
+    def test_post_descriptor_is_dataclass_with_expected_fields(self):
+        """PostDescriptor carries exactly the fields callers need."""
+        from titan_hcl.logic.social_x_gateway import PostDescriptor
+        import dataclasses
+        assert dataclasses.is_dataclass(PostDescriptor)
+        fields = {f.name for f in dataclasses.fields(PostDescriptor)}
+        assert fields == {
+            "post_type", "catalyst", "system_prompt", "user_prompt",
+            "max_tokens", "temperature", "voice_cfg",
+        }
+
+    def test_post_context_has_composed_text_field(self):
+        """PostContext gains composed_text per ω-bis."""
+        ctx = PostContext(session="s", proxy="p", api_key="k", titan_id="T1")
+        # Default empty string
+        assert ctx.composed_text == ""
+        # Settable
+        ctx.composed_text = "hello"
+        assert ctx.composed_text == "hello"
 
 
 # ── Phase 3: Reply ──────────────────────────────────────────────────
@@ -1163,12 +1325,13 @@ class TestCircuitBreaker:
         assert gateway._cb_is_open()
 
     def test_cb_blocks_post(self, gateway):
-        """Tripped circuit breaker returns early from post()."""
+        """Tripped circuit breaker returns early from prepare_post()."""
         gateway._cb_tripped_at = time.time()
         gateway._cb_failures = 5
         ctx = PostContext(session="s", proxy="p", api_key="k", titan_id="T1")
-        result = gateway.post(ctx, consumer="spirit_worker")
-        assert result.status == "circuit_breaker"
+        # Phase 3 Chunk ω-bis: circuit-breaker gate now lives in prepare_post.
+        err, desc = gateway.prepare_post(ctx, consumer="spirit_worker")
+        assert desc is None and err.status == "circuit_breaker"
 
     def test_cb_blocks_reply(self, gateway):
         gateway._cb_tripped_at = time.time()
@@ -1224,7 +1387,7 @@ class TestCircuitBreaker:
 
 def test_sanitize_catalyst_replaces_novelty_with_categorical_high():
     """B2: 'novelty=0.9' → 'insight: novel' so LLM never sees raw numeric."""
-    from titan_plugin.logic.social_x_gateway import SocialXGateway
+    from titan_hcl.logic.social_x_gateway import SocialXGateway
     out = SocialXGateway._sanitize_catalyst_content(
         "EUREKA: self_model novelty=0.9")
     assert "novelty=" not in out
@@ -1233,7 +1396,7 @@ def test_sanitize_catalyst_replaces_novelty_with_categorical_high():
 
 def test_sanitize_catalyst_replaces_novelty_with_categorical_low():
     """B2: 'novelty=0.04' → 'insight: reinforced' (threshold=0.5)."""
-    from titan_plugin.logic.social_x_gateway import SocialXGateway
+    from titan_hcl.logic.social_x_gateway import SocialXGateway
     out = SocialXGateway._sanitize_catalyst_content(
         "EUREKA: self_model novelty=0.04")
     assert "novelty=" not in out
@@ -1242,7 +1405,7 @@ def test_sanitize_catalyst_replaces_novelty_with_categorical_low():
 
 def test_sanitize_catalyst_preserves_non_novelty_content():
     """B2: sanitizer must not touch unrelated text."""
-    from titan_plugin.logic.social_x_gateway import SocialXGateway
+    from titan_hcl.logic.social_x_gateway import SocialXGateway
     out = SocialXGateway._sanitize_catalyst_content(
         "META_LANGUAGE: vocab grew by 5 words")
     assert out == "META_LANGUAGE: vocab grew by 5 words"
@@ -1250,7 +1413,7 @@ def test_sanitize_catalyst_preserves_non_novelty_content():
 
 def test_sanitize_catalyst_handles_empty_string():
     """B2: empty / None tolerated."""
-    from titan_plugin.logic.social_x_gateway import SocialXGateway
+    from titan_hcl.logic.social_x_gateway import SocialXGateway
     assert SocialXGateway._sanitize_catalyst_content("") == ""
     assert SocialXGateway._sanitize_catalyst_content(None) is None
 
@@ -1261,7 +1424,7 @@ def test_wisdom_growth_warns_when_all_counters_zero(caplog, tmp_path):
     """B1: render must emit a WARNING log and still produce framing text
     when all wisdom counters are zero (likely attribute lookup failure)."""
     import logging
-    from titan_plugin.logic.social_x_gateway import (
+    from titan_hcl.logic.social_x_gateway import (
         SocialXGateway, PostContext)
     gateway = SocialXGateway(db_path=str(tmp_path / "t.db"),
                              config_path=str(tmp_path / "c.toml"))
@@ -1280,7 +1443,7 @@ def test_wisdom_growth_warns_when_all_counters_zero(caplog, tmp_path):
 
 def test_wisdom_growth_renders_numbers_when_populated(tmp_path):
     """B1: when counters have real values, the numeric lines must render."""
-    from titan_plugin.logic.social_x_gateway import (
+    from titan_hcl.logic.social_x_gateway import (
         SocialXGateway, PostContext)
     gateway = SocialXGateway(db_path=str(tmp_path / "t.db"),
                              config_path=str(tmp_path / "c.toml"))
@@ -1301,7 +1464,7 @@ def test_wisdom_growth_renders_numbers_when_populated(tmp_path):
 
 def test_reasoning_totals_persist_across_restart():
     """A1: _total_chains / _total_conclusions survive save_all() + reload."""
-    from titan_plugin.logic.reasoning import ReasoningEngine
+    from titan_hcl.logic.reasoning import ReasoningEngine
     with tempfile.TemporaryDirectory() as tmp:
         e1 = ReasoningEngine(config={"save_dir": tmp})
         e1._total_chains = 250
@@ -1316,7 +1479,7 @@ def test_reasoning_totals_persist_across_restart():
 
 def test_reasoning_totals_file_schema(tmp_path):
     """A1: reasoning_totals.json has expected schema (v1)."""
-    from titan_plugin.logic.reasoning import ReasoningEngine
+    from titan_hcl.logic.reasoning import ReasoningEngine
     e = ReasoningEngine(config={"save_dir": str(tmp_path)})
     e._total_chains = 5
     e._total_conclusions = 1
@@ -1330,7 +1493,7 @@ def test_reasoning_totals_file_schema(tmp_path):
 
 def test_reasoning_totals_missing_file_safe_on_first_boot(tmp_path):
     """A1: no reasoning_totals.json → counters start at 0, no crash."""
-    from titan_plugin.logic.reasoning import ReasoningEngine
+    from titan_hcl.logic.reasoning import ReasoningEngine
     e = ReasoningEngine(config={"save_dir": str(tmp_path)})
     assert e._total_chains == 0
     assert e._total_conclusions == 0

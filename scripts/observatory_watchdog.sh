@@ -73,8 +73,8 @@ Status: ✅ recovered"
 fi
 
 # --- Check Backend API (port 7777) ---
-# Startup grace period: skip backend check if titan_main started < 120s ago
-TITAN_PID=$(pgrep -o -f "titan_main.*--server" 2>/dev/null)
+# Startup grace period: skip backend check if titan_hcl started < 120s ago
+TITAN_PID=$(pgrep -o -f "titan_hcl.*--server" 2>/dev/null)
 TITAN_AGE=""
 [ -n "$TITAN_PID" ] && TITAN_AGE=$(ps -o etimes= -p "$TITAN_PID" 2>/dev/null | tr -d ' ')
 BACKEND_OK=true
@@ -100,7 +100,7 @@ fi
 if [ "$FRONTEND_OK" = false ] || [ "$BACKEND_OK" = false ]; then
     if should_alert; then
         # Check if processes are running to distinguish crash vs overload
-        TITAN_RUNNING=$(pgrep -f "titan_main.*--server" >/dev/null 2>&1 && echo "yes" || echo "no")
+        TITAN_RUNNING=$(pgrep -f "titan_hcl.*--server" >/dev/null 2>&1 && echo "yes" || echo "no")
         NEXT_RUNNING=$(pgrep -f "next-server" >/dev/null 2>&1 && echo "yes" || echo "no")
 
         MSG="🚨 *Observatory Issue*"

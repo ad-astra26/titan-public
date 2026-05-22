@@ -15,7 +15,7 @@ Covers:
 
 Reference:
   - titan-docs/PLAN_microkernel_phase_a_s4.md §2.5 + §3 D10 + §5.3
-  - titan_plugin/logic/cgn_shm_protocol.py dual-mode helpers
+  - titan_hcl/logic/cgn_shm_protocol.py dual-mode helpers
   - memory/project_cgn_as_higher_state_registry.md (CGN-as-L2-StateRegistry
     invariant — keystone preserved by this work)
 """
@@ -28,7 +28,7 @@ from collections import OrderedDict
 import numpy as np
 import pytest
 
-from titan_plugin.logic.cgn_shm_protocol import (
+from titan_hcl.logic.cgn_shm_protocol import (
     DEFAULT_SHM_PATH,
     HEADER_SIZE,
     ShmWeightReader,

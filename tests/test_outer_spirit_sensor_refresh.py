@@ -1,5 +1,5 @@
 """
-Tests for ``titan_plugin.logic.outer_spirit_sensor_refresh``.
+Tests for ``titan_hcl.logic.outer_spirit_sensor_refresh``.
 
 Structural twin to outer_body / outer_mind sidecar tests with
 outer_spirit-specific source-keys + 30s cadence.
@@ -19,12 +19,17 @@ from pathlib import Path
 import msgpack
 import pytest
 
-from titan_plugin._phase_c_constants import (
+from titan_hcl._phase_c_constants import (
     OUTER_SENSOR_CACHE_SPIRIT_MAX_BYTES,
     OUTER_SPIRIT_TICK_BASE_S,
 )
-from titan_plugin.core.state_registry import HEADER_SIZE, HEADER_STRUCT
-from titan_plugin.logic.outer_spirit_sensor_refresh import (
+from titan_hcl.core.state_registry import (
+    BUFFER_META_SIZE,
+    HEADER_SIZE,
+    HEADER_STRUCT,
+    _unpack_header_seq,
+)
+from titan_hcl.logic.outer_spirit_sensor_refresh import (
     MAX_PAYLOAD_BYTES,
     REFRESH_PERIOD_S,
     SLOT_NAME,
@@ -40,12 +45,25 @@ def shm_root(tmp_path, monkeypatch):
 
 
 def _read_slot_payload(shm_path: Path) -> tuple[int, int, int, bytes]:
+    """Read header + payload from v1.0.0 triple-buffer slot.
+
+    Returns (version, schema, wall_ns, payload) — `version` is the
+    monotonically-incrementing publish counter extracted from header_seq.
+    """
     raw = shm_path.read_bytes()
-    seq, schema, wall_ns, payload_bytes, _crc = struct.unpack(
+    header_seq, schema, payload_cap = struct.unpack(
         HEADER_STRUCT, raw[:HEADER_SIZE]
     )
-    payload = bytes(raw[HEADER_SIZE:HEADER_SIZE + payload_bytes])
-    return seq, schema, wall_ns, payload
+    version, ready_idx = _unpack_header_seq(header_seq)
+    buf_block_sz = BUFFER_META_SIZE + payload_cap
+    off = HEADER_SIZE + ready_idx * buf_block_sz
+    wall_ns, payload_bytes, _crc = struct.unpack(
+        "<QII", raw[off:off + BUFFER_META_SIZE]
+    )
+    payload = bytes(
+        raw[off + BUFFER_META_SIZE : off + BUFFER_META_SIZE + payload_bytes]
+    )
+    return version, schema, wall_ns, payload
 
 
 def _make_sources() -> dict:
@@ -57,7 +75,12 @@ def _make_sources() -> dict:
                             "creative_rate_per_day": 5.2},
         "guardian_stats": {"threats_detected": 0, "interventions": 0,
                             "uptime_pct": 0.998},
+        # sovereignty_ratio moved INSIDE agency_stats post Step 3 SOURCE_KEYS
+        # extension (commit ea70d3d9). Both old + new locations kept so
+        # legacy assertions can still pass through normalize (raw key
+        # gets filtered out but agency_stats container carries forward).
         "sovereignty_ratio": 0.75,
+        "agency_stats": {"sovereignty_ratio": 0.75},
         "uptime_ratio": 0.95,
         "recovery_stats": {"crashes": 0, "recovery_time_s": 0.0,
                             "successful_restarts": 0},
@@ -90,7 +113,9 @@ def test_slot_bytes_roundtrip(shm_root):
 
     decoded = msgpack.unpackb(payload, raw=False)
     assert set(decoded.keys()) == set(SOURCE_KEYS)
-    assert decoded["sovereignty_ratio"] == 0.75
+    # sovereignty_ratio moved INSIDE agency_stats post Step 3 SOURCE_KEYS
+    # extension (commit ea70d3d9); test asserts via container key now.
+    assert decoded["agency_stats"]["sovereignty_ratio"] == 0.75
     assert decoded["hormone_levels"]["DA"] == 0.65
     assert decoded["solana_stats"]["balance"] == 1.5
     assert len(decoded["history"]["recent_45d"]) == 3
@@ -100,11 +125,11 @@ def test_slot_bytes_roundtrip(shm_root):
 
 
 def test_normalize_sources_missing_keys_become_none(shm_root):
-    raw = {"sovereignty_ratio": 0.5, "extraneous": 1}
+    raw = {"agency_stats": {"sovereignty_ratio": 0.5}, "extraneous": 1}
     normalized = OuterSpiritSensorRefresh._normalize_sources(raw)
 
     assert set(normalized.keys()) == set(SOURCE_KEYS)
-    assert normalized["sovereignty_ratio"] == 0.5
+    assert normalized["agency_stats"] == {"sovereignty_ratio": 0.5}
     assert normalized["hormone_levels"] is None
     assert normalized["history"] is None
     assert "extraneous" not in normalized
@@ -159,8 +184,10 @@ def test_oversize_payload_skipped(shm_root):
     assert sidecar.oversize_failure_count == 1
     assert sidecar.last_payload_bytes == 0
 
+    # v1.0.0 triple-buffer init publishes a zero-payload snapshot at seq=1;
+    # oversize skip means no further publish — seq retained at 1.
     seq, _, _, _ = _read_slot_payload(shm_root / f"{SLOT_NAME}.bin")
-    assert seq == 0
+    assert seq == 1
 
     sidecar._writer.close()
 
@@ -210,7 +237,7 @@ async def test_restart_on_inner_crash(shm_root, monkeypatch):
 
     monkeypatch.setattr(OuterSpiritSensorRefresh, "_refresh_loop", flaky_loop)
     monkeypatch.setattr(
-        "titan_plugin.logic.outer_spirit_sensor_refresh._RESTART_BACKOFF_S", 0.05
+        "titan_hcl.logic.outer_spirit_sensor_refresh._RESTART_BACKOFF_S", 0.05
     )
 
     sidecar = OuterSpiritSensorRefresh(
@@ -229,9 +256,11 @@ async def test_restart_on_inner_crash(shm_root, monkeypatch):
 
 def test_default_period_matches_spec_toml():
     assert REFRESH_PERIOD_S == OUTER_SPIRIT_TICK_BASE_S
-    assert REFRESH_PERIOD_S == 30.0
+    assert REFRESH_PERIOD_S == 5.0  # SPEC §18.1 + D-SPEC-100 (G13 spirit-fastest)
 
 
 def test_max_payload_matches_spec_toml():
     assert MAX_PAYLOAD_BYTES == OUTER_SENSOR_CACHE_SPIRIT_MAX_BYTES
-    assert MAX_PAYLOAD_BYTES == 8192
+    # Bumped 8KB→64KB 2026-05-10 (commit dd7e1d91) after Step 3 §4.3 P3
+    # SOURCE_KEYS extension produced ~33KB payloads on T3.
+    assert MAX_PAYLOAD_BYTES == 65536

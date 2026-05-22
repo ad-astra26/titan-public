@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from titan_plugin.core import shadow_orchestrator as so
+from titan_hcl.core import shadow_orchestrator as so
 
 
 def _make_db(path: Path, healthy: bool = True) -> None:
@@ -46,7 +46,7 @@ class TestShadowDBIntegrityGate(unittest.TestCase):
         self.shadow_dir = self.root / f"data_shadow_{self.port}"
         # Shim: monkey-patch shadow_data_dir.shadow_data_dir_for_port to
         # our tmpdir-relative location for this test.
-        from titan_plugin.core import shadow_data_dir as sdd
+        from titan_hcl.core import shadow_data_dir as sdd
         self._orig_sdd_for_port = sdd.shadow_data_dir_for_port
         sdd.shadow_data_dir_for_port = lambda port, root=".": (
             self.root / f"data_shadow_{port}"
@@ -58,7 +58,7 @@ class TestShadowDBIntegrityGate(unittest.TestCase):
         # which is what the shim above does.
 
     def tearDown(self):
-        from titan_plugin.core import shadow_data_dir as sdd
+        from titan_hcl.core import shadow_data_dir as sdd
         sdd.shadow_data_dir_for_port = self._orig_sdd_for_port
         self._tmp.cleanup()
 

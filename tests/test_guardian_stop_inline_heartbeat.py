@@ -19,9 +19,9 @@ from __future__ import annotations
 import time
 from unittest.mock import MagicMock, patch
 
-from titan_plugin import bus
-from titan_plugin.bus import DivineBus
-from titan_plugin.guardian import Guardian, ModuleSpec, ModuleState
+from titan_hcl import bus
+from titan_hcl.bus import DivineBus
+from titan_hcl.guardian import Guardian, ModuleSpec, ModuleState
 
 
 def _spec(name: str) -> ModuleSpec:
@@ -157,7 +157,7 @@ def test_save_done_for_target_module_still_breaks_loop():
     the original semantics."""
     # Verify the SAVE_DONE branch is unchanged by inspecting source.
     import inspect
-    from titan_plugin import guardian as g_mod
+    from titan_hcl import guardian as g_mod
     src = inspect.getsource(g_mod.Guardian.stop)
     # The SAVE_DONE check + break is in the loop
     assert "save_done_seen = True" in src

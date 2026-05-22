@@ -48,7 +48,7 @@ fn unified_filter_down_full_round_trip() {
     let outer_mind = [1.0; 15];
     let outer_spirit_content = [1.0; 40];
 
-    let bytes = encode_filter_down_payload(
+    let payload = encode_filter_down_payload(
         &inner_body,
         &inner_mind,
         &inner_spirit_content,
@@ -59,7 +59,7 @@ fn unified_filter_down_full_round_trip() {
         1730000000.5,
     );
 
-    let decoded = decode_filter_down_payload(&bytes).expect("decode");
+    let decoded = decode_filter_down_payload(&payload).expect("decode");
 
     // Inner daemons see only the inner slice (outer fields decoded but
     // discarded at the boundary).
@@ -147,11 +147,9 @@ fn inner_spirit_filter_down_cascade_to_body_and_mind() {
         (Value::String("multipliers".into()), mults_map),
         (Value::String("ts".into()), Value::F64(99.0)),
     ]);
-    let mut bytes = Vec::new();
-    rmpv::encode::write_value(&mut bytes, &payload_map).unwrap();
 
-    // inner-body decodes
-    let decoded = decode_local_filter_down_payload(&bytes).expect("decode local");
+    // inner-body decodes — §4.C-ter: decoder takes &Value directly
+    let decoded = decode_local_filter_down_payload(&payload_map).expect("decode local");
     for i in 0..5 {
         assert!((decoded.body[i] - body_mults[i]).abs() < 1e-5);
     }
@@ -200,7 +198,9 @@ fn topology_30d_inner_lower_slice_drives_body_and_mind_ground_up() {
     // ground_up Body side (signal[0:5]) drives all 5D body
     let mut g_body = GroundUpEnricher::new(Side::Body);
     let mut body = [0.5_f32; 5];
-    g_body.apply_to_body(&mut body, &inner_lower, 1.0).unwrap();
+    // 0E: recompute the held nudge on the epoch, then apply it.
+    g_body.compute_nudge(&inner_lower);
+    g_body.apply_held_to_body(&mut body, 1.0).unwrap();
     // Body changed from 0.5 (signal[0:5] is non-zero in this test)
     for i in 0..5 {
         // signal[i] = 1.0 + 0.01*i; clamped at MAX_NUDGE=0.05 after damping;
@@ -212,7 +212,8 @@ fn topology_30d_inner_lower_slice_drives_body_and_mind_ground_up() {
     // ground_up MindWilling side (signal[5:10]) drives mind[10:15] ONLY
     let mut g_mind = GroundUpEnricher::new(Side::MindWilling);
     let mut mind = [0.5_f32; 15];
-    g_mind.apply_to_mind(&mut mind, &inner_lower, 1.0).unwrap();
+    g_mind.compute_nudge(&inner_lower);
+    g_mind.apply_held_to_mind(&mut mind, 1.0).unwrap();
     // Thinking[0:5] + Feeling[5:10] UNTOUCHED (G10)
     for i in 0..10 {
         assert!(
@@ -261,9 +262,18 @@ fn full_inner_trinity_slot_lifecycle() {
     .unwrap();
 
     // Verify SPEC §7.1 byte counts (v1.0.0: 16 fixed header + 3 × (16 buffer meta + payload))
-    assert_eq!(std::fs::metadata(&body_path).unwrap().len(), 16 + 3 * (16 + 20));
-    assert_eq!(std::fs::metadata(&mind_path).unwrap().len(), 16 + 3 * (16 + 60));
-    assert_eq!(std::fs::metadata(&spirit_path).unwrap().len(), 16 + 3 * (16 + 180));
+    assert_eq!(
+        std::fs::metadata(&body_path).unwrap().len(),
+        16 + 3 * (16 + 20)
+    );
+    assert_eq!(
+        std::fs::metadata(&mind_path).unwrap().len(),
+        16 + 3 * (16 + 60)
+    );
+    assert_eq!(
+        std::fs::metadata(&spirit_path).unwrap().len(),
+        16 + 3 * (16 + 180)
+    );
 
     // Daemons write tick output — body first
     let body: [f32; 5] = std::array::from_fn(|i| (i as f32) * 0.1);

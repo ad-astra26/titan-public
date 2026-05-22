@@ -37,7 +37,7 @@ import re
 
 import pytest
 
-from titan_plugin.modules import cognitive_worker
+from titan_hcl.modules import cognitive_worker
 
 
 # Sentinel marking engines that don't need a per-tick driver in
@@ -81,8 +81,12 @@ BOOT_DRIVER_PARITY: list[tuple[str, str]] = [
     ("ex_mem", "ex_mem"),
     ("e_mem", DRIVER_PASSIVE),  # Backing store consumed by exp_orchestrator
     # ── Block F (2026-05-10): pre-D8 audit Track 1 migrations ──────
+    # prediction_engine REMOVED from this list 2026-05-12 (Track 2
+    # drift correction commit B8 per rFP_phase_c_self_improvement_subsystem_migration
+    # §0 table). PredictionEngine now lives in self_reflection_worker —
+    # cognitive_worker consumes PREDICTION_GENERATED bus events via the
+    # dispatcher → state_refs["_latest_prediction"] cache slot.
     ("working_mem", "working_mem"),
-    ("prediction_engine", "prediction_engine"),
     ("episodic_mem", "episodic_mem"),
     ("intuition_convergence", "intuition_convergence"),
     ("wallet_observer", "wallet_observer"),

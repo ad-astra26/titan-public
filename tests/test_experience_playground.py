@@ -77,7 +77,7 @@ class TestExperiencePlugin:
     """Test the base plugin interface."""
 
     def test_plugin_has_required_attributes(self):
-        from titan_plugin.logic.experience_playground import ExperiencePlugin
+        from titan_hcl.logic.experience_playground import ExperiencePlugin
         plugin = ExperiencePlugin()
         assert hasattr(plugin, 'name')
         assert hasattr(plugin, 'description')
@@ -86,7 +86,7 @@ class TestExperiencePlugin:
         assert hasattr(plugin, '_total_stimuli')
 
     def test_plugin_stats(self):
-        from titan_plugin.logic.experience_playground import ExperiencePlugin
+        from titan_hcl.logic.experience_playground import ExperiencePlugin
         plugin = ExperiencePlugin()
         stats = plugin.get_stats()
         assert "name" in stats
@@ -96,7 +96,7 @@ class TestExperiencePlugin:
         assert stats["accuracy"] == 0.0
 
     def test_should_advance_needs_minimum_stimuli(self):
-        from titan_plugin.logic.experience_playground import ExperiencePlugin
+        from titan_hcl.logic.experience_playground import ExperiencePlugin
         plugin = ExperiencePlugin()
         assert not plugin.should_advance_level()  # No stimuli yet
 
@@ -105,7 +105,7 @@ class TestExperiencePlayground:
     """Test the playground runner."""
 
     def test_register_plugin(self):
-        from titan_plugin.logic.experience_playground import ExperiencePlayground
+        from titan_hcl.logic.experience_playground import ExperiencePlayground
         pg = ExperiencePlayground()
         plugin = MockExperiencePlugin()
         pg.register(plugin)
@@ -113,7 +113,7 @@ class TestExperiencePlayground:
         assert len(pg.list_experiences()) == 1
 
     def test_list_experiences(self):
-        from titan_plugin.logic.experience_playground import ExperiencePlayground
+        from titan_hcl.logic.experience_playground import ExperiencePlayground
         pg = ExperiencePlayground()
         pg.register(MockExperiencePlugin())
         experiences = pg.list_experiences()
@@ -121,20 +121,20 @@ class TestExperiencePlayground:
         assert experiences[0]["name"] == "test_experience"
 
     def test_is_active_default_false(self):
-        from titan_plugin.logic.experience_playground import ExperiencePlayground
+        from titan_hcl.logic.experience_playground import ExperiencePlayground
         pg = ExperiencePlayground()
         assert not pg.is_active
 
     @pytest.mark.asyncio
     async def test_run_session_unknown_experience(self):
-        from titan_plugin.logic.experience_playground import ExperiencePlayground
+        from titan_hcl.logic.experience_playground import ExperiencePlayground
         pg = ExperiencePlayground()
         result = await pg.run_session("nonexistent")
         assert "error" in result
 
     @pytest.mark.asyncio
     async def test_run_session_basic(self):
-        from titan_plugin.logic.experience_playground import ExperiencePlayground
+        from titan_hcl.logic.experience_playground import ExperiencePlayground
         pg = ExperiencePlayground()
         pg.register(MockExperiencePlugin())
         result = await pg.run_session("test_experience",
@@ -146,7 +146,7 @@ class TestExperiencePlayground:
 
     @pytest.mark.asyncio
     async def test_session_records_scores(self):
-        from titan_plugin.logic.experience_playground import ExperiencePlayground
+        from titan_hcl.logic.experience_playground import ExperiencePlayground
         pg = ExperiencePlayground()
         pg.register(MockExperiencePlugin())
         result = await pg.run_session("test_experience",
@@ -159,7 +159,7 @@ class TestExperiencePlayground:
 
     @pytest.mark.asyncio
     async def test_session_updates_plugin_stats(self):
-        from titan_plugin.logic.experience_playground import ExperiencePlayground
+        from titan_hcl.logic.experience_playground import ExperiencePlayground
         pg = ExperiencePlayground()
         plugin = MockExperiencePlugin()
         pg.register(plugin)
@@ -170,7 +170,7 @@ class TestExperiencePlayground:
 
     @pytest.mark.asyncio
     async def test_level_advancement(self):
-        from titan_plugin.logic.experience_playground import ExperiencePlayground
+        from titan_hcl.logic.experience_playground import ExperiencePlayground
         pg = ExperiencePlayground()
         plugin = MockExperiencePlugin()
         pg.register(plugin)
@@ -182,7 +182,7 @@ class TestExperiencePlayground:
 
     @pytest.mark.asyncio
     async def test_not_active_after_session(self):
-        from titan_plugin.logic.experience_playground import ExperiencePlayground
+        from titan_hcl.logic.experience_playground import ExperiencePlayground
         pg = ExperiencePlayground()
         pg.register(MockExperiencePlugin())
         await pg.run_session("test_experience",
@@ -190,7 +190,7 @@ class TestExperiencePlayground:
         assert not pg.is_active
 
     def test_get_stats(self):
-        from titan_plugin.logic.experience_playground import ExperiencePlayground
+        from titan_hcl.logic.experience_playground import ExperiencePlayground
         pg = ExperiencePlayground()
         pg.register(MockExperiencePlugin())
         stats = pg.get_stats()

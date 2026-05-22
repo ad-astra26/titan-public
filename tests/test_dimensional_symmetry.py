@@ -1,7 +1,7 @@
 """Tests for Dimensional Quantitative Symmetry (5/15/45/135D)."""
 import pytest
-from titan_plugin.logic.mind_tensor import collect_mind_15d, MIND_DIM_NAMES
-from titan_plugin.logic.spirit_tensor import collect_spirit_45d, SPIRIT_DIM_NAMES
+from titan_hcl.logic.mind_tensor import collect_mind_15d, MIND_DIM_NAMES
+from titan_hcl.logic.spirit_tensor import collect_spirit_45d, SPIRIT_DIM_NAMES
 
 
 class TestMindTensor15D:

@@ -1,7 +1,7 @@
 """Tests for IMW wire_format — frame encode/decode + schema roundtrip."""
 import pytest
 
-from titan_plugin.persistence.wire_format import (
+from titan_hcl.persistence.wire_format import (
     MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
     WireFormatError,

@@ -8,12 +8,12 @@
 #
 #   1. Python multiprocessing-spawn children that don't inherit pdeathsig
 #      from the Python parent (kernel orphans them on titan_HCL panic).
-#   2. Legacy `python -u scripts/titan_main.py --server` instances
+#   2. Legacy `python -u scripts/titan_hcl.py --server` instances
 #      launched by `t3_manage.sh` (NOT a kernel-rs descendant — pdeathsig
 #      doesn't reach it).
-#   3. Stale `data/titan_main.pid` left by abrupt Python exit, which
-#      causes kernel-rs's freshly-spawned `titan_main` to abort with
-#      "Another titan_main is already running".
+#   3. Stale `data/titan_hcl.pid` left by abrupt Python exit, which
+#      causes kernel-rs's freshly-spawned `titan_hcl` to abort with
+#      "Another titan_hcl is already running".
 #   4. Stale UNIX sockets + `/dev/shm/titan_T3/` slot files from the
 #      previous kernel generation (Phase C kernel rebuilds slots from
 #      L0 snapshot every boot — preserving stale half-written slots
@@ -21,7 +21,7 @@
 #
 # Strictly scoped to T3 paths (`/projects/titan3/`) so it can NEVER
 # touch T1 (`/projects/titan/`) or T2 (`/projects/titan/`) processes
-# on the shared VPS — see `feedback_pkill_f_titan_main_kills_t2.md`
+# on the shared VPS — see `feedback_pkill_f_titan_hcl_kills_t2.md`
 # (Day 1 lesson 2 of `SESSION_20260506_phase_c_close_runtime_gaps`).
 #
 # Closes BUG-T3-LEGACY-PYTHON-COLLISION-2026-05-06 (filed this session).
@@ -34,18 +34,18 @@ T3_BIN_DIR="${T3_ROOT}/bin"
 T3_SHM="/dev/shm/titan_T3"
 T3_BUS_SOCK="/tmp/titan_bus_T3.sock"
 T3_KERNEL_RPC_SOCK="/tmp/titan_kernel_T3.sock"
-T3_PID_FILE="${T3_DATA}/titan_main.pid"
+T3_PID_FILE="${T3_DATA}/titan_hcl.pid"
 
 log() { echo "[t3-cleanup] $*"; }
 
 # ── 1. Kill T3-scoped Python multiprocessing orphans + legacy main ─
 # Pattern matches:
 #   - /projects/titan3/test_env/bin/python (multiprocessing-fork etc)
-#   - python -u scripts/titan_main.py --server (cwd: titan3) — legacy
+#   - python -u scripts/titan_hcl.py --server (cwd: titan3) — legacy
 # pgrep -f matches the full command line + cwd is implicit via path.
 # `|| true` so we don't fail when nothing matches (post-clean-shutdown).
 log "killing T3 Python orphans (cwd=titan3)"
-pkill -9 -f "/projects/titan3/.*python.*titan_main" 2>/dev/null || true
+pkill -9 -f "/projects/titan3/.*python.*titan_hcl" 2>/dev/null || true
 pkill -9 -f "/projects/titan3/test_env/bin/python" 2>/dev/null || true
 
 # ── 2. Kill any T3 Rust daemon processes that escaped pdeathsig ──

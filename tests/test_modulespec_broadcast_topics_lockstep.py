@@ -10,7 +10,7 @@ Catches drift in BOTH directions:
   (b) ModuleSpec.broadcast_topics lists "FOO" but drain has no handler →
       silent log/drop noise, plus arch_map dead-wiring will flag.
 
-Mechanism reminder (titan_plugin/core/bus_socket.py:761-832):
+Mechanism reminder (titan_hcl/core/bus_socket.py:761-832):
   - `subscribed_topics` (set on broker subscriber) — populated from
     ModuleSpec.broadcast_topics via Guardian → setup_worker_bus.
   - On publish() with dst="all": if subscribed_topics is non-empty,
@@ -60,23 +60,22 @@ TARGETED_LIFECYCLE_TYPES = frozenset({
 # Worker → drain-source-file mapping (the source-of-truth files).
 # ─────────────────────────────────────────────────────────────────────
 WORKER_DRAIN_FILE = {
-    "outer_body":       "titan_plugin/modules/outer_body_worker.py",
-    "outer_mind":       "titan_plugin/modules/outer_mind_worker.py",
-    "outer_spirit":     "titan_plugin/modules/outer_spirit_worker.py",
-    "body":             "titan_plugin/modules/body_worker.py",
-    "mind":             "titan_plugin/modules/mind_worker.py",
-    "rl":               "titan_plugin/modules/rl_worker.py",
-    "llm":              "titan_plugin/modules/llm_worker.py",
-    "warning_monitor":  "titan_plugin/modules/warning_monitor_worker.py",
-    "language":         "titan_plugin/modules/language_worker.py",
-    "meta_teacher":     "titan_plugin/modules/meta_teacher_worker.py",
-    "emot_cgn":         "titan_plugin/modules/emot_cgn_worker.py",
-    "cgn":              "titan_plugin/modules/cgn_worker.py",
-    "knowledge":        "titan_plugin/modules/knowledge_worker.py",
-    "timechain":        "titan_plugin/modules/timechain_worker.py",
-    "spirit":           "titan_plugin/modules/spirit_worker.py",
-    "cognitive_worker": "titan_plugin/modules/cognitive_worker.py",
-    "backup":           "titan_plugin/modules/backup_worker.py",
+    # outer_{body,mind,spirit} workers RETIRED (Phase C dissolution C.8) — the
+    # Rust outer daemons own the tensor slots; source data is SHM-direct.
+    "body":             "titan_hcl/modules/body_worker.py",
+    "mind":             "titan_hcl/modules/mind_worker.py",
+    "recorder":               "titan_hcl/modules/recorder_worker.py",
+    "llm":              "titan_hcl/modules/llm_worker.py",
+    "warning_monitor":  "titan_hcl/modules/warning_monitor_worker.py",
+    "language":         "titan_hcl/modules/language_worker.py",
+    "meta_teacher":     "titan_hcl/modules/meta_teacher_worker.py",
+    "emot_cgn":         "titan_hcl/modules/emot_cgn_worker.py",
+    "cgn":              "titan_hcl/modules/cgn_worker.py",
+    "knowledge":        "titan_hcl/modules/knowledge_worker.py",
+    "timechain":        "titan_hcl/modules/timechain_worker.py",
+    # spirit_worker RETIRED (D-SPEC-116) — engines live in cognitive_worker.
+    "cognitive_worker": "titan_hcl/modules/cognitive_worker.py",
+    "backup":           "titan_hcl/modules/backup_worker.py",
 }
 
 # Workers that consume NO broadcasts (only targeted QUERY) — reply_only=True.
@@ -154,11 +153,11 @@ def _extract_broadcast_topics(spec_kwargs: dict) -> Optional[set[str]]:
 def _resolve_module_constant(path: Path, var_name: str) -> set[str]:
     """Find a module-level assignment `<var_name> = [bus.X, bus.Y, ...]`.
 
-    Looks first in `path`. If not found, walks `from titan_plugin.X.Y import
+    Looks first in `path`. If not found, walks `from titan_hcl.X.Y import
     <var_name>` statements in the same file to find the source module, then
     looks there. This handles patterns like:
 
-        from titan_plugin.modules.cognitive_worker import (
+        from titan_hcl.modules.cognitive_worker import (
             cognitive_worker_main, _COGNITIVE_WORKER_SUBSCRIBE_TOPICS,
         )
         ...broadcast_topics=_COGNITIVE_WORKER_SUBSCRIBE_TOPICS,
@@ -182,12 +181,12 @@ def _resolve_module_constant(path: Path, var_name: str) -> set[str]:
                             if n is not None:
                                 out.add(n)
                         return out
-    # Pass 2: follow `from titan_plugin.X import <var_name>`.
+    # Pass 2: follow `from titan_hcl.X import <var_name>`.
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module:
             for alias in node.names:
                 if alias.name == var_name or alias.asname == var_name:
-                    # Resolve module path: titan_plugin.modules.foo → titan_plugin/modules/foo.py
+                    # Resolve module path: titan_hcl.modules.foo → titan_hcl/modules/foo.py
                     rel = node.module.replace(".", "/") + ".py"
                     candidate = REPO_ROOT / rel
                     if candidate.exists():
@@ -232,14 +231,16 @@ def _extract_drain_types(path: Path) -> set[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Combined ModuleSpec lookup — merge legacy_core.py + core/plugin.py.
+# ModuleSpec lookup — core/plugin.py is the SOLE registration site.
+# (legacy_core.py / TitanCore retired 2026-05-21, D-SPEC-106; the old
+# dual-site merge collapsed to single-source.)
 # ─────────────────────────────────────────────────────────────────────
 
 
 def _all_modulespecs() -> dict[str, dict[str, dict]]:
-    """{worker_name: {file_path: kwargs_dict}} — both registration sites."""
+    """{worker_name: {file_path: kwargs_dict}} — the single registration site."""
     out: dict[str, dict[str, dict]] = {}
-    for fname in ("titan_plugin/legacy_core.py", "titan_plugin/core/plugin.py"):
+    for fname in ("titan_hcl/core/plugin.py",):
         path = REPO_ROOT / fname
         for name, kwargs in _extract_modulespec_kwargs(path).items():
             out.setdefault(name, {})[fname] = kwargs
@@ -350,67 +351,13 @@ def test_worker_filter_intersects_drain_chain(all_specs):
             print(f, file=sys.stderr)
 
 
-def test_dual_registered_workers_have_consistent_filters(all_specs):
-    """Per feedback_bus_dst_all_publish_filter.md filter-union semantics:
-    workers registered in BOTH legacy_core.py + core/plugin.py must declare
-    the SAME broadcast_topics in both sites (otherwise the broader wins
-    and the narrower decoration is a lie).
-
-    Catches: someone updates one site but forgets the other.
-    """
-    failures: list[str] = []
-    for worker, sites in all_specs.items():
-        if worker == "_w_name":
-            continue
-        if len(sites) < 2:
-            continue  # not dual-registered
-        # Resolve filters per site
-        resolved_per_site: dict[str, Optional[set[str]]] = {}
-        for fname, kwargs in sites.items():
-            declared = _extract_broadcast_topics(kwargs)
-            if declared is None:
-                # Could be reply_only=True. Mark None.
-                resolved_per_site[fname] = None
-                continue
-            r: set[str] = set()
-            for t in declared:
-                if t.startswith("@"):
-                    var_name = t[1:]
-                    r |= _resolve_module_constant(REPO_ROOT / fname, var_name)
-                else:
-                    r.add(t)
-            resolved_per_site[fname] = r
-        # All sites must agree, after stripping TARGETED_LIFECYCLE_TYPES
-        # (those bypass the broadcast filter anyway so listing them in
-        # broadcast_topics is cosmetic — sites may legitimately differ on
-        # whether they list them).
-        non_none = [
-            (fname, (v - TARGETED_LIFECYCLE_TYPES) if v is not None else None)
-            for fname, v in resolved_per_site.items()
-        ]
-        non_none_sets = [v for _, v in non_none if v is not None]
-        none_count = sum(1 for v in non_none_sets if v is None)
-        if non_none_sets and none_count > 0:
-            # Mixed: some sites declare, some don't. Drift.
-            failures.append(
-                f"  {worker}: dual-registered with INCONSISTENT filter "
-                f"declaration. Sites: {dict((f, 'declared' if v is not None else 'none/reply_only') for f, v in resolved_per_site.items())}"
-            )
-        elif len(non_none_sets) > 1 and not all(s == non_none_sets[0] for s in non_none_sets[1:]):
-            failures.append(
-                f"  {worker}: dual-registered with DIFFERENT filter sets "
-                f"(after stripping lifecycle types):\n"
-                + "\n".join(
-                    f"      {fname}: {sorted(v - TARGETED_LIFECYCLE_TYPES)}"
-                    for fname, v in resolved_per_site.items() if v is not None
-                )
-            )
-    assert not failures, (
-        "Dual-registration filter drift detected:\n" + "\n".join(failures)
-        + "\n\nFix: update both legacy_core.py AND core/plugin.py with the "
-        "same broadcast_topics list. Per feedback_bus_dst_all_publish_filter.md: "
-        "'pre-narrowing one site does NOT narrow the other unless both are updated'."
-    )
+# test_dual_registered_workers_have_consistent_filters RETIRED 2026-05-21
+# (D-SPEC-106): it policed broadcast_topics drift between the legacy_core.py
+# and core/plugin.py ModuleSpec registration sites. legacy_core.py is gone —
+# core/plugin.py is the SOLE registration site, so dual-site drift is
+# structurally impossible. Single-site filter correctness is still covered by
+# test_all_workers_have_explicit_filter_or_reply_only +
+# test_worker_filter_intersects_drain_chain above.
 
 
 def test_rpc_reply_only_workers_are_marked():
@@ -445,12 +392,10 @@ def test_filter_count_baseline():
     """
     specs = _all_modulespecs()
     expected_min_counts = {
-        "outer_body":       2,
-        "outer_mind":       2,
-        "outer_spirit":     2,
+        # outer_{body,mind,spirit} RETIRED (Phase C dissolution C.8).
         "body":             4,
-        "mind":             7,
-        "rl":               1,
+        "mind":             6,   # was 7 — OUTER_SOURCES_SNAPSHOT dropped (C.7/C.8)
+        "recorder":               1,
         "llm":              1,
         "warning_monitor":  1,
         "language":         14,
@@ -459,7 +404,8 @@ def test_filter_count_baseline():
         "cgn":              7,
         "knowledge":        10,
         "timechain":        23,
-        "spirit":           50,   # 57 declared; 50 = lower bound
+        # spirit RETIRED (D-SPEC-116). cognitive_worker now hosts the re-homed
+        # MEMORY_RECALL_PERTURBATION + TEACHER_SIGNALS + OUTER_OBSERVATION flows.
         "cognitive_worker": 8,
         "backup":           2,
     }

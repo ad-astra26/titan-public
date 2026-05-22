@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from titan_plugin.logic.meditation_watchdog import (
+from titan_hcl.logic.meditation_watchdog import (
     MeditationWatchdog, WatchdogAlert,
 )
 
@@ -198,22 +198,9 @@ def test_expected_interval_wide_window_stability():
     assert abs(expected_hours - 2 * avg_hours) < 0.01
 
 
-# ── Diagnose-first classification ────────────────────────────────────
-
-def test_classify_overdue_natural_calm():
-    wd = MeditationWatchdog("T1")
-    assert wd.classify_overdue({}, drain_flat_12h=False, gaba_flat_12h=False) == "natural_calm"
-
-
-def test_classify_overdue_stuck():
-    wd = MeditationWatchdog("T1")
-    assert wd.classify_overdue({}, drain_flat_12h=True, gaba_flat_12h=True) == "stuck"
-
-
-def test_classify_overdue_partial_still_natural():
-    """Only one flat signal → conservative: still 'natural_calm' (avoids false force-trigger)."""
-    wd = MeditationWatchdog("T1")
-    assert wd.classify_overdue({}, drain_flat_12h=True, gaba_flat_12h=False) == "natural_calm"
+# classify_overdue tests REMOVED — method retired with the F1/F2 watchdog
+# force-trigger (rFP_meditation_emergent_onset_redesign / D-SPEC-107); cadence
+# now owned by the onset-v2 hard floor.
 
 
 # ── I1: self-test on boot ────────────────────────────────────────────

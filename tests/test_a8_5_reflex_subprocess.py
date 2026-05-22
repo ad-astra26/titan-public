@@ -55,7 +55,7 @@ class TestReflexCollectorBackCompat(unittest.IsolatedAsyncioTestCase):
     """Verify the refactor preserves collect_and_fire behavior."""
 
     def _build_collector(self):
-        from titan_plugin.logic.reflexes import ReflexCollector, ReflexType
+        from titan_hcl.logic.reflexes import ReflexCollector, ReflexType
 
         cfg = {
             "fire_threshold": 0.05, "action_threshold": 0.20,
@@ -73,7 +73,7 @@ class TestReflexCollectorBackCompat(unittest.IsolatedAsyncioTestCase):
         return c
 
     async def test_collect_and_fire_produces_perceptual_field(self):
-        from titan_plugin.logic.reflexes import PerceptualField
+        from titan_hcl.logic.reflexes import PerceptualField
         c = self._build_collector()
         signals = _convergent_signals("identity_check", conf=0.7)
         pf = await c.collect_and_fire(
@@ -113,7 +113,7 @@ class TestAggregateInline(unittest.TestCase):
     """Pure-function aggregation behavior (_aggregate_inline)."""
 
     def _build_collector(self):
-        from titan_plugin.logic.reflexes import ReflexCollector
+        from titan_hcl.logic.reflexes import ReflexCollector
         return ReflexCollector({
             "fire_threshold": 0.05, "action_threshold": 0.20,
             "public_action_threshold": 0.40, "session_cooldown": 30.0,
@@ -122,7 +122,7 @@ class TestAggregateInline(unittest.TestCase):
         })
 
     def test_aggregate_inline_returns_selected_tuples(self):
-        from titan_plugin.logic.reflexes import ReflexType
+        from titan_hcl.logic.reflexes import ReflexType
         c = self._build_collector()
         signals = _convergent_signals("identity_check", conf=0.7)
         selected = c._aggregate_inline(
@@ -143,7 +143,7 @@ class TestAggregateInline(unittest.TestCase):
         self.assertEqual(selected, [])
 
     def test_aggregate_inline_guardian_fast_path(self):
-        from titan_plugin.logic.reflexes import ReflexType
+        from titan_hcl.logic.reflexes import ReflexType
         c = self._build_collector()
         # Threat level high → guardian fires regardless of signal convergence
         selected = c._aggregate_inline(
@@ -179,7 +179,7 @@ class TestReflexWorkerLifecycle(unittest.TestCase):
     """Boot signals + shutdown."""
 
     def _run_worker(self, recv, send):
-        from titan_plugin.modules.reflex_worker import reflex_worker_main
+        from titan_hcl.modules.reflex_worker import reflex_worker_main
 
         def _run():
             reflex_worker_main(
@@ -228,7 +228,7 @@ class TestReflexWorkerAggregate(unittest.TestCase):
     """QUERY(action="aggregate") → RESPONSE round-trip."""
 
     def _run_and_query(self, query_payload):
-        from titan_plugin.modules.reflex_worker import reflex_worker_main
+        from titan_hcl.modules.reflex_worker import reflex_worker_main
         recv, send = Queue(), Queue()
 
         def _run():
@@ -321,7 +321,7 @@ class TestReflexProxyCore(unittest.IsolatedAsyncioTestCase):
         return bus
 
     def _build_proxy(self, bus):
-        from titan_plugin.proxies.reflex_proxy import ReflexProxy
+        from titan_hcl.proxies.reflex_proxy import ReflexProxy
         cfg = {
             "fire_threshold": 0.05, "action_threshold": 0.20,
             "public_action_threshold": 0.40, "session_cooldown": 30.0,
@@ -336,7 +336,7 @@ class TestReflexProxyCore(unittest.IsolatedAsyncioTestCase):
         bus.subscribe.assert_called_once_with("reflex_proxy", reply_only=True)
 
     def test_proxy_inherits_register_executor(self):
-        from titan_plugin.logic.reflexes import ReflexType
+        from titan_hcl.logic.reflexes import ReflexType
         bus = self._make_bus_mock()
         proxy = self._build_proxy(bus)
 
@@ -360,7 +360,7 @@ class TestReflexProxyCore(unittest.IsolatedAsyncioTestCase):
         async def _fake_identity(stim):
             return {"identity_verified": True, "summary": "ok"}
 
-        from titan_plugin.logic.reflexes import ReflexType
+        from titan_hcl.logic.reflexes import ReflexType
         proxy.register_executor(ReflexType.IDENTITY_CHECK, _fake_identity)
 
         pf = await proxy.collect_and_fire(
@@ -422,14 +422,14 @@ class TestPluginFlagRouting(unittest.TestCase):
     """Verify worker function signature + ReflexProxy is a ReflexCollector."""
 
     def test_worker_main_signature(self):
-        from titan_plugin.modules.reflex_worker import reflex_worker_main
+        from titan_hcl.modules.reflex_worker import reflex_worker_main
         sig = inspect.signature(reflex_worker_main)
         params = list(sig.parameters.keys())
         self.assertEqual(params[:4], ["recv_queue", "send_queue", "name", "config"])
 
     def test_proxy_is_reflex_collector_subclass(self):
-        from titan_plugin.logic.reflexes import ReflexCollector
-        from titan_plugin.proxies.reflex_proxy import ReflexProxy
+        from titan_hcl.logic.reflexes import ReflexCollector
+        from titan_hcl.proxies.reflex_proxy import ReflexProxy
         self.assertTrue(issubclass(ReflexProxy, ReflexCollector))
 
 

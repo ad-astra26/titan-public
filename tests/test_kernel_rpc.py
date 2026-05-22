@@ -14,7 +14,7 @@ Covers:
 
 Reference:
   - titan-docs/PLAN_microkernel_phase_a_s5.md §5.0
-  - titan_plugin/core/kernel_rpc.py
+  - titan_hcl/core/kernel_rpc.py
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ import time
 
 import pytest
 
-from titan_plugin.core.kernel_rpc import (
+from titan_hcl.core.kernel_rpc import (
     KernelRPCServer,
     KernelRPCClient,
     _RPCRemoteRef,

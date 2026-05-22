@@ -94,7 +94,10 @@ impl SlotRegistry {
             // has no Slot handle (Slot::open would fail on the size).
             if spec.name == "fastbus.bin" {
                 Self::create_raw_file(&slot_path, spec.fastbus_total_bytes())?;
-                debug!(slot = "fastbus.bin", "created raw SPSC fastbus file (excluded from §7.0 universal slot wrapping)");
+                debug!(
+                    slot = "fastbus.bin",
+                    "created raw SPSC fastbus file (excluded from §7.0 universal slot wrapping)"
+                );
                 continue;
             }
 
@@ -141,13 +144,14 @@ impl SlotRegistry {
                     source: e,
                 },
             })?;
-        file.set_len(total_bytes).map_err(|e| RegistryError::SlotCreate {
-            slot_name: "fastbus.bin",
-            source: SlotIoError::Io {
-                path: tmp_path.clone(),
-                source: e,
-            },
-        })?;
+        file.set_len(total_bytes)
+            .map_err(|e| RegistryError::SlotCreate {
+                slot_name: "fastbus.bin",
+                source: SlotIoError::Io {
+                    path: tmp_path.clone(),
+                    source: e,
+                },
+            })?;
         drop(file);
         std::fs::rename(&tmp_path, path).map_err(|e| RegistryError::SlotCreate {
             slot_name: "fastbus.bin",

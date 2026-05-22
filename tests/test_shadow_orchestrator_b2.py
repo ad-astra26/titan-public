@@ -21,7 +21,7 @@ import dataclasses
 
 import pytest
 
-from titan_plugin.core.shadow_orchestrator import (
+from titan_hcl.core.shadow_orchestrator import (
     HealthCriteria,
     _check_bus_broker_criteria,
 )
@@ -149,8 +149,8 @@ def test_bus_handoff_emitted_in_phase_hibernate():
     This is a self-contained verification: we don't run a full swap,
     just exercise _phase_hibernate with mock bus + kernel.
     """
-    from titan_plugin import bus as bus_module
-    from titan_plugin.core import shadow_orchestrator as so
+    from titan_hcl import bus as bus_module
+    from titan_hcl.core import shadow_orchestrator as so
 
     # Capture publish() calls in order
     published: list[dict] = []

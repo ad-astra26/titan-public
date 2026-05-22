@@ -1,5 +1,5 @@
 """
-Tests for titan_plugin/bus_specs.py — declarative priority + coalesce table.
+Tests for titan_hcl/bus_specs.py — declarative priority + coalesce table.
 
 Covers:
 - BusMsgSpec dataclass: frozen, hashable, sane defaults
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from titan_plugin.bus_specs import (
+from titan_hcl.bus_specs import (
     DEFAULT_SPEC,
     MSG_SPECS,
     BusMsgSpec,
@@ -164,7 +164,7 @@ def test_b2_1_adoption_messages_registered_p0():
 
 def test_b2_1_constants_match_bus_module():
     """B.2.1 constants in bus.py match their bus_specs.MSG_SPECS keys."""
-    from titan_plugin import bus
+    from titan_hcl import bus
     for name in ("BUS_WORKER_ADOPT_REQUEST", "BUS_WORKER_ADOPT_ACK",
                  "BUS_HANDOFF_CANCELED"):
         assert hasattr(bus, name), f"bus.py missing constant {name}"

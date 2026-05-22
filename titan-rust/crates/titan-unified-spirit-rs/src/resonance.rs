@@ -1,7 +1,7 @@
 //! resonance — Phase-aligned inner↔outer pair detector + GREAT PULSE
 //! gating.
 //!
-//! Full Rust port of `titan_plugin/logic/resonance.py` per SPEC §10.F G11
+//! Full Rust port of `titan_hcl/logic/resonance.py` per SPEC §10.F G11
 //! + Decision Log D-SPEC-26 (resonance lives inside unified-spirit-rs).
 //!
 //! Three pairs tracked per `PAIRS` constant (`body`, `mind`, `spirit`):
@@ -34,6 +34,25 @@ use titan_core::constants::{
 
 /// Canonical pair names per resonance.py:42 + SPEC.
 pub const PAIRS: [&str; 3] = ["body", "mind", "spirit"];
+
+/// Sustained-balance debounce floor for the §G11 harmony gate (D-SPEC-113).
+///
+/// A side counts as harmonious only once its sphere clock reports
+/// `consecutive_balanced >= HARMONY_TICKS` — i.e. coherence has held above the
+/// 0.70 balance threshold for this many consecutive substrate ticks. This
+/// debounces the coherence flicker that lives around the threshold (natural
+/// tensor-variance distribution sits 0.50–0.75 per `sphere_clocks.rs:46-54`),
+/// so a single transient balanced tick does NOT spuriously open harmony and
+/// spam BIG PULSEs.
+///
+/// Deliberately NOT a SPEC TOML constant — like the `sphere_clocks.rs:36-39`
+/// `DEFAULT_*` clock-tuning consts, this is a calibration knob, not a wire
+/// contract. Starting value 5 (≈ one balanced-pulse interval of sustained
+/// coherence); calibrate against T3 soak (GREAT-pulse cadence target ≈ 1 per
+/// Titan-day per §7 emergent time). Under genuine sustained balance the
+/// per-clock counter reaches the hundreds, so 5 is trivially cleared; its job
+/// is purely to reject single-tick flicker.
+pub const HARMONY_TICKS: u32 = 5;
 
 /// Errors during resonance state persistence + restore.
 #[derive(Debug, thiserror::Error)]
@@ -88,10 +107,24 @@ pub struct ResonancePair {
 
     inner_last_pulse_ts: f64,
     inner_last_phase: f64,
-    inner_fresh: bool,
+    /// §G11 balance-coincidence (D-SPEC-112): whether the last inner pulse
+    /// fired in a balanced regime. Retained for telemetry.
+    inner_last_balanced: bool,
+    /// §G11 sustained-balance (D-SPEC-113): consecutive_balanced of the last
+    /// inner pulse — the harmony gate's per-side input.
+    inner_last_consec_balanced: u32,
     outer_last_pulse_ts: f64,
     outer_last_phase: f64,
-    outer_fresh: bool,
+    /// §G11 balance-coincidence (D-SPEC-112): last outer pulse balanced?
+    outer_last_balanced: bool,
+    /// §G11 sustained-balance (D-SPEC-113): consecutive_balanced of the last
+    /// outer pulse.
+    outer_last_consec_balanced: u32,
+
+    /// §G11 sustained-balance (D-SPEC-113): harmony level at the previous
+    /// pulse — used to detect the rising edge that fires a BIG PULSE.
+    /// Runtime-only (rebuilt from `is_resonant` on restore).
+    was_harmonious: bool,
 
     consecutive_resonant: u32,
     total_resonant_cycles: u64,
@@ -149,10 +182,13 @@ impl ResonancePair {
             pulse_window,
             inner_last_pulse_ts: 0.0,
             inner_last_phase: 0.0,
-            inner_fresh: false,
+            inner_last_balanced: false,
+            inner_last_consec_balanced: 0,
             outer_last_pulse_ts: 0.0,
             outer_last_phase: 0.0,
-            outer_fresh: false,
+            outer_last_balanced: false,
+            outer_last_consec_balanced: 0,
+            was_harmonious: false,
             consecutive_resonant: 0,
             total_resonant_cycles: 0,
             total_checks: 0,
@@ -175,76 +211,86 @@ impl ResonancePair {
         )
     }
 
-    /// Record a SPHERE_PULSE event with explicit phase. `component` is
-    /// the full name (`"inner_body"`, `"outer_mind"`, etc.). Returns
-    /// `Some(BigPulse)` if this event closes a BIG PULSE streak,
-    /// `None` otherwise.
+    /// Record a SPHERE_PULSE event with explicit phase + balance state.
+    /// `component` is the full name (`"inner_body"`, `"outer_mind"`, etc.).
+    ///
+    /// §G11 sustained-balance harmony gate (D-SPEC-113): instead of requiring
+    /// both sides to pulse simultaneously and balanced for 3 consecutive
+    /// coincidences (fragile under the inner-fast / outer-slow rate asymmetry —
+    /// the spirit-pair never reached BIG), harmony is now a *level* re-evaluated
+    /// on every pulse from each side's last-known sustained-balance state. A
+    /// BIG PULSE fires on the **rising edge** of pair harmony (re-armed when it
+    /// falls), naturally paced by the slower side and free of BIG-spam.
+    ///
+    /// Returns `Some(BigPulse)` iff this event is the rising edge of pair
+    /// harmony, `None` otherwise.
     pub fn record_pulse_with_phase(
         &mut self,
         component: &str,
         phase: f64,
+        balanced: bool,
+        consecutive_balanced: u32,
         pulse_ts: f64,
     ) -> Option<BigPulse> {
         let is_inner = component.starts_with("inner_");
         if is_inner {
             self.inner_last_pulse_ts = pulse_ts;
             self.inner_last_phase = phase;
+            self.inner_last_balanced = balanced;
+            self.inner_last_consec_balanced = consecutive_balanced;
             self.inner_pulse_count += 1;
-            self.inner_fresh = true;
         } else {
             self.outer_last_pulse_ts = pulse_ts;
             self.outer_last_phase = phase;
+            self.outer_last_balanced = balanced;
+            self.outer_last_consec_balanced = consecutive_balanced;
             self.outer_pulse_count += 1;
-            self.outer_fresh = true;
         }
 
-        if self.inner_fresh && self.outer_fresh {
-            self.check_resonance(pulse_ts)
+        self.evaluate_harmony(pulse_ts)
+    }
+
+    /// Re-evaluate pair harmony at `now` and emit a BIG PULSE on the rising
+    /// edge. Both sides must (1) have pulsed at least once, (2) be in sustained
+    /// balance (`consecutive_balanced >= HARMONY_TICKS`), and (3) both be
+    /// recent — neither side's last pulse older than `pulse_window` relative to
+    /// `now` (rejects a stuck clock holding a stale high counter forever).
+    fn evaluate_harmony(&mut self, now: f64) -> Option<BigPulse> {
+        self.total_checks += 1;
+
+        let both_seen = self.inner_last_pulse_ts > 0.0 && self.outer_last_pulse_ts > 0.0;
+        let both_recent = (now - self.inner_last_pulse_ts).abs() <= self.pulse_window
+            && (now - self.outer_last_pulse_ts).abs() <= self.pulse_window;
+        let both_sustained = self.inner_last_consec_balanced >= HARMONY_TICKS
+            && self.outer_last_consec_balanced >= HARMONY_TICKS;
+
+        let harmonious = both_seen && both_recent && both_sustained;
+        self.is_resonant = harmonious;
+        if harmonious {
+            // consecutive_resonant + total_resonant_cycles retained as
+            // telemetry: how long harmony has held / cumulative harmony.
+            self.consecutive_resonant += 1;
+            self.total_resonant_cycles += 1;
+        } else {
+            self.consecutive_resonant = 0;
+        }
+
+        let rising_edge = harmonious && !self.was_harmonious;
+        self.was_harmonious = harmonious;
+
+        if rising_edge {
+            let phase_diff = phase_difference(self.inner_last_phase, self.outer_last_phase);
+            let time_diff = (self.inner_last_pulse_ts - self.outer_last_pulse_ts).abs();
+            Some(self.generate_big_pulse(phase_diff, time_diff))
         } else {
             None
         }
-    }
-
-    fn check_resonance(&mut self, _now: f64) -> Option<BigPulse> {
-        self.total_checks += 1;
-        // Consume fresh flags
-        self.inner_fresh = false;
-        self.outer_fresh = false;
-
-        if self.inner_last_pulse_ts == 0.0 || self.outer_last_pulse_ts == 0.0 {
-            return None;
-        }
-
-        let time_diff = (self.inner_last_pulse_ts - self.outer_last_pulse_ts).abs();
-        if time_diff > self.pulse_window {
-            self.consecutive_resonant = 0;
-            self.is_resonant = false;
-            return None;
-        }
-
-        let phase_diff = phase_difference(self.inner_last_phase, self.outer_last_phase);
-        if phase_diff <= self.phase_threshold {
-            self.consecutive_resonant += 1;
-            self.total_resonant_cycles += 1;
-            self.is_resonant = true;
-
-            if self.consecutive_resonant >= self.required_cycles {
-                return Some(self.generate_big_pulse(phase_diff, time_diff));
-            }
-        } else {
-            self.consecutive_resonant = 0;
-            self.is_resonant = false;
-        }
-
-        None
     }
 
     fn generate_big_pulse(&mut self, phase_diff: f64, time_diff: f64) -> BigPulse {
         self.big_pulse_count += 1;
         let now = wall_seconds();
         self.last_big_pulse_ts = now;
-        // Reset streak — start fresh for next BIG PULSE
-        self.consecutive_resonant = 0;
 
         BigPulse {
             pair: self.name.clone(),
@@ -290,6 +336,9 @@ impl ResonancePair {
         self.inner_pulse_count = state.inner_pulse_count;
         self.outer_pulse_count = state.outer_pulse_count;
         self.is_resonant = state.is_resonant;
+        // Seed the edge detector from the persisted level so a restore does
+        // NOT manufacture a spurious rising-edge BIG PULSE on the next pulse.
+        self.was_harmonious = state.is_resonant;
     }
 }
 
@@ -327,6 +376,10 @@ pub struct ResonanceDetector {
     pairs: std::collections::BTreeMap<String, ResonancePair>,
     great_pulse_count: u64,
     last_great_pulse_ts: f64,
+    /// §G11 sustained-balance (D-SPEC-113): all-3-harmony level at the previous
+    /// pulse — gates the GREAT PULSE rising edge. Runtime-only (rebuilt from
+    /// the restored per-pair levels on load).
+    all_harmonious_prev: bool,
     state_path: PathBuf,
 }
 
@@ -344,6 +397,7 @@ impl ResonanceDetector {
             pairs,
             great_pulse_count: 0,
             last_great_pulse_ts: 0.0,
+            all_harmonious_prev: false,
             state_path,
         };
         // Best-effort load — never fatal at boot. Boot integrity check
@@ -370,6 +424,7 @@ impl ResonanceDetector {
             pairs,
             great_pulse_count: 0,
             last_great_pulse_ts: 0.0,
+            all_harmonious_prev: false,
             state_path,
         }
     }
@@ -379,33 +434,60 @@ impl ResonanceDetector {
     /// payload schema, the "clock_name" is e.g. `"inner_body"` matching
     /// PAIR-prefix convention).
     ///
-    /// `phase` is from the SPHERE_PULSE payload float.
-    /// Returns `Some(BigPulse)` if the pulse closed a BIG PULSE streak —
-    /// caller may publish to bus + (when `great_pulse_ready == true`)
-    /// trigger `UnifiedSpirit::advance()`.
+    /// `phase` is from the SPHERE_PULSE payload float; `consecutive_balanced`
+    /// from the payload int (§G11 sustained-balance gate, D-SPEC-113).
+    ///
+    /// Returns `Some(BigPulse)` on the rising edge of pair harmony — the
+    /// caller publishes it to the bus and (when `great_pulse_ready == true`,
+    /// i.e. this edge completed all-3-harmony for the first time since the
+    /// last drop) triggers `UnifiedSpirit::advance()`.
     pub fn record_pulse_with_phase(
         &mut self,
         component: &str,
         phase: f64,
+        balanced: bool,
+        consecutive_balanced: u32,
         pulse_ts: f64,
     ) -> Option<BigPulse> {
         let pair_name = component_to_pair(component)?;
-        let pair = self.pairs.get_mut(pair_name)?;
-        let mut big_pulse = pair.record_pulse_with_phase(component, phase, pulse_ts)?;
+        // Route to the pair. Once routed, the pair's harmony level is
+        // recomputed on every pulse (inside `record_pulse_with_phase`) — a pair
+        // can DROP harmony on a non-edge pulse, which re-arms the GREAT edge.
+        let big_opt = match self.pairs.get_mut(pair_name) {
+            Some(pair) => pair.record_pulse_with_phase(
+                component,
+                phase,
+                balanced,
+                consecutive_balanced,
+                pulse_ts,
+            ),
+            None => return None,
+        };
 
-        // GREAT PULSE gate: any time a BIG PULSE fires AND all 3 pairs
-        // are simultaneously resonant → mark great_pulse_ready.
-        if self.all_resonant() {
+        // GREAT PULSE = rising edge of all-3-pairs-harmonious (§G11 PoH).
+        // By construction this can only coincide with a pair BIG PULSE: the
+        // edge requires the just-processed pair to have *itself* just risen
+        // into harmony (the other two already harmonious), which is exactly
+        // when `big_opt` is `Some`.
+        let now_all = self.all_resonant();
+        let great_edge = now_all && !self.all_harmonious_prev;
+        self.all_harmonious_prev = now_all;
+        if great_edge {
             self.great_pulse_count += 1;
             self.last_great_pulse_ts = wall_seconds();
-            big_pulse.great_pulse_ready = true;
-            big_pulse.great_pulse_count = self.great_pulse_count;
         }
-        Some(big_pulse)
+
+        big_opt.map(|mut bp| {
+            if great_edge {
+                bp.great_pulse_ready = true;
+                bp.great_pulse_count = self.great_pulse_count;
+            }
+            bp
+        })
     }
 
-    /// True iff all 3 pairs currently resonate. Used by callers to
-    /// invoke `UnifiedSpirit::advance(...)` (C4-2b2).
+    /// True iff all 3 pairs are currently harmonious (§G11 sustained-balance).
+    /// Used by callers to invoke `UnifiedSpirit::advance(...)` (C4-2b2).
     pub fn all_resonant(&self) -> bool {
         self.pairs.values().all(|p| p.is_resonant())
     }
@@ -423,6 +505,66 @@ impl ResonanceDetector {
     /// Wall-clock seconds of last GREAT PULSE.
     pub fn last_great_pulse_ts(&self) -> f64 {
         self.last_great_pulse_ts
+    }
+
+    /// Phase B: msgpack-serializable snapshot for `resonance_metadata.bin`
+    /// SHM slot (rFP_phase_c_state_read_unification §B / D-SPEC-72).
+    /// Mirrors Python `ResonanceDetector.get_stats()` 1:1 so the ownership
+    /// flip Python → Rust is transparent to consumers.
+    pub fn get_stats(&self, ts: f64) -> crate::metadata_publisher::ResonanceMetadata {
+        use crate::metadata_publisher::{
+            ResonanceConfigSummary, ResonanceMetadata, ResonancePairStats,
+        };
+        use titan_core::constants::RESONANCE_METADATA_SCHEMA_VERSION;
+
+        // Python parity rounds — phase_threshold to 4 decimals, config
+        // phase_threshold_deg to 1 decimal (`round(math.degrees(_), 1)`).
+        let r4 = |v: f64| (v * 1e4).round() / 1e4;
+        let r1 = |v: f64| (v * 1e1).round() / 1e1;
+
+        let mut pairs = std::collections::BTreeMap::new();
+        for (name, pair) in &self.pairs {
+            let state = pair.to_state();
+            pairs.insert(
+                name.clone(),
+                ResonancePairStats {
+                    name: state.name,
+                    is_resonant: state.is_resonant,
+                    consecutive_resonant: state.consecutive_resonant,
+                    required_cycles: pair.required_cycles,
+                    total_resonant_cycles: state.total_resonant_cycles,
+                    total_checks: state.total_checks,
+                    big_pulse_count: state.big_pulse_count,
+                    inner_pulse_count: state.inner_pulse_count,
+                    outer_pulse_count: state.outer_pulse_count,
+                    last_big_pulse_ts: state.last_big_pulse_ts,
+                    phase_threshold: r4(pair.phase_threshold),
+                    pulse_window: pair.pulse_window,
+                },
+            );
+        }
+
+        // Config summary uses the FIRST pair's thresholds — all 3 share the
+        // same config in practice (constructed via ResonancePair::with_defaults).
+        let first = self.pairs.values().next();
+        let (phase_threshold, required_cycles, pulse_window) = first
+            .map(|p| (p.phase_threshold, p.required_cycles, p.pulse_window))
+            .unwrap_or((0.0, 0, 0.0));
+
+        ResonanceMetadata {
+            pairs,
+            resonant_count: self.resonant_count() as u32,
+            all_resonant: self.all_resonant(),
+            great_pulse_count: self.great_pulse_count,
+            last_great_pulse_ts: self.last_great_pulse_ts,
+            config: ResonanceConfigSummary {
+                phase_threshold_deg: r1(phase_threshold.to_degrees()),
+                required_cycles,
+                pulse_window,
+            },
+            schema_version: RESONANCE_METADATA_SCHEMA_VERSION as u32,
+            ts,
+        }
     }
 
     /// Snapshot ResonancePair state for persistence.
@@ -448,6 +590,9 @@ impl ResonanceDetector {
         }
         self.great_pulse_count = state.great_pulse_count;
         self.last_great_pulse_ts = state.last_great_pulse_ts;
+        // Seed the GREAT edge detector from the restored per-pair levels so a
+        // restore does not manufacture a spurious GREAT PULSE on the next pulse.
+        self.all_harmonious_prev = self.all_resonant();
     }
 
     /// Persist state to `data/resonance_state.json` via atomic_write +
@@ -560,77 +705,109 @@ mod tests {
 
     // ── RECORD_PULSE_WITH_PHASE (1) ────────────────────────────────────
 
+    /// A consecutive_balanced value comfortably above `HARMONY_TICKS`.
+    const SUSTAINED: u32 = HARMONY_TICKS + 5;
+
     #[test]
-    fn record_pulse_inner_only_no_resonance_check() {
-        // C4-2b1 test 2: only inner pulse (outer not fresh) → no check
+    fn record_pulse_inner_only_no_harmony() {
+        // D-SPEC-113: a single inner pulse (outer never seen) → not harmonious.
+        // `total_checks` now counts every pulse evaluation (was: only when both
+        // sides were fresh), so it is 1 after one pulse.
         let mut pair = ResonancePair::with_defaults("body");
-        let result = pair.record_pulse_with_phase("inner_body", 0.0, 100.0);
+        let result = pair.record_pulse_with_phase("inner_body", 0.0, true, SUSTAINED, 100.0);
         assert!(result.is_none());
         assert!(!pair.is_resonant());
-        assert_eq!(pair.total_checks, 0);
+        assert_eq!(pair.total_checks, 1);
         assert_eq!(pair.inner_pulse_count, 1);
         assert_eq!(pair.outer_pulse_count, 0);
     }
 
-    // ── 3-CYCLE BIG PULSE (1) ──────────────────────────────────────────
+    // ── HARMONY RISING-EDGE BIG PULSE (1) ──────────────────────────────
 
     #[test]
-    fn pair_emits_big_pulse_after_3_consecutive_resonant_cycles() {
-        // C4-2b1 test 3: 3 phase-aligned inner+outer pulses → BIG PULSE
+    fn pair_emits_big_pulse_on_harmony_rising_edge() {
+        // D-SPEC-113: harmony is a level; BIG fires on the rising edge (the
+        // first pulse that makes both sides sustained-balanced + recent), and
+        // does NOT re-fire while harmony holds (no BIG-spam).
         let mut pair = ResonancePair::with_defaults("body");
-        // Cycle 1
-        let _ = pair.record_pulse_with_phase("inner_body", 0.0, 100.0);
-        let r1 = pair.record_pulse_with_phase("outer_body", 0.0, 100.1);
-        assert!(r1.is_none());
-        assert_eq!(pair.consecutive_resonant, 1);
-        assert!(pair.is_resonant());
-        // Cycle 2
-        let _ = pair.record_pulse_with_phase("inner_body", 0.0, 200.0);
-        let r2 = pair.record_pulse_with_phase("outer_body", 0.0, 200.1);
-        assert!(r2.is_none());
-        assert_eq!(pair.consecutive_resonant, 2);
-        // Cycle 3 — fires BIG PULSE
-        let _ = pair.record_pulse_with_phase("inner_body", 0.0, 300.0);
-        let r3 = pair.record_pulse_with_phase("outer_body", 0.0, 300.1);
-        assert!(r3.is_some());
-        let bp = r3.unwrap();
+        // inner alone — outer unseen → not harmonious, no BIG
+        let r0 = pair.record_pulse_with_phase("inner_body", 0.0, true, SUSTAINED, 100.0);
+        assert!(r0.is_none());
+        assert!(!pair.is_resonant());
+        // outer arrives sustained + recent → rising edge → BIG
+        let r1 = pair.record_pulse_with_phase("outer_body", 0.0, true, SUSTAINED, 100.1);
+        assert!(r1.is_some());
+        let bp = r1.unwrap();
         assert_eq!(bp.pair, "body");
         assert_eq!(bp.big_pulse_count, 1);
-        assert_eq!(bp.total_resonant_cycles, 3);
-        // Streak resets after BIG PULSE per Python:_generate_big_pulse
-        assert_eq!(pair.consecutive_resonant, 0);
+        assert!(pair.is_resonant());
+        // Further pulses while still harmonious → NO new BIG (edge-triggered)
+        let r2 = pair.record_pulse_with_phase("inner_body", 0.0, true, SUSTAINED, 100.2);
+        let r3 = pair.record_pulse_with_phase("outer_body", 0.0, true, SUSTAINED, 100.3);
+        assert!(r2.is_none());
+        assert!(r3.is_none());
+        assert!(pair.is_resonant());
+        assert_eq!(pair.big_pulse_count, 1);
     }
 
-    // ── PHASE DIVERGENCE BREAKS STREAK (1) ─────────────────────────────
+    // ── BELOW HARMONY_TICKS → NO HARMONY (1) ───────────────────────────
 
     #[test]
-    fn pair_drops_resonance_on_phase_divergence() {
-        // C4-2b1 test 4: phase_diff > threshold → streak resets
+    fn pair_below_harmony_ticks_not_harmonious() {
+        // D-SPEC-113: a balanced pulse whose consecutive_balanced is below
+        // HARMONY_TICKS does NOT open harmony (the flicker debounce).
         let mut pair = ResonancePair::with_defaults("body");
-        // Resonant cycle 1
-        let _ = pair.record_pulse_with_phase("inner_body", 0.0, 100.0);
-        let _ = pair.record_pulse_with_phase("outer_body", 0.0, 100.1);
-        assert_eq!(pair.consecutive_resonant, 1);
-        // Cycle 2 — phase off by π/3 (60°), > threshold π/6 (30°)
-        let _ = pair.record_pulse_with_phase("inner_body", 0.0, 200.0);
-        let _ = pair.record_pulse_with_phase("outer_body", PI / 3.0, 200.1);
-        assert_eq!(pair.consecutive_resonant, 0);
+        let _ = pair.record_pulse_with_phase("inner_body", 0.0, true, HARMONY_TICKS - 1, 100.0);
+        let r = pair.record_pulse_with_phase("outer_body", 0.0, true, SUSTAINED, 100.1);
+        assert!(r.is_none());
         assert!(!pair.is_resonant());
     }
 
-    // ── PULSE WINDOW EXPIRY (1) ────────────────────────────────────────
+    // ── HARMONY DROPS ON LOST BALANCE (1) ──────────────────────────────
 
     #[test]
-    fn pair_drops_resonance_on_pulse_window_expiry() {
-        // C4-2b1 test 5: time_diff > pulse_window → streak resets
+    fn pair_drops_harmony_on_lost_balance() {
+        // D-SPEC-113: harmony drops when EITHER side falls out of sustained
+        // balance (consecutive_balanced resets to 0 on an unbalanced tick).
         let mut pair = ResonancePair::with_defaults("body");
-        let _ = pair.record_pulse_with_phase("inner_body", 0.0, 100.0);
-        let _ = pair.record_pulse_with_phase("outer_body", 0.0, 100.1);
-        assert_eq!(pair.consecutive_resonant, 1);
-        // Cycle 2 with time_diff > 120s (pulse_window default)
-        let _ = pair.record_pulse_with_phase("inner_body", 0.0, 200.0);
-        let _ = pair.record_pulse_with_phase("outer_body", 0.0, 350.0); // 150s diff
-        assert_eq!(pair.consecutive_resonant, 0);
+        let _ = pair.record_pulse_with_phase("inner_body", 0.0, true, SUSTAINED, 100.0);
+        let _ = pair.record_pulse_with_phase("outer_body", 0.0, true, SUSTAINED, 100.1);
+        assert!(pair.is_resonant());
+        // outer loses balance (consec resets to 0) → harmony drops
+        let _ = pair.record_pulse_with_phase("outer_body", 0.0, false, 0, 100.2);
+        assert!(!pair.is_resonant());
+    }
+
+    // ── BIG RE-ARMS AFTER HARMONY DROP (1) ─────────────────────────────
+
+    #[test]
+    fn pair_big_pulse_re_arms_after_harmony_drop() {
+        // D-SPEC-113: after harmony falls, a new rising edge fires a 2nd BIG.
+        let mut pair = ResonancePair::with_defaults("body");
+        let _ = pair.record_pulse_with_phase("inner_body", 0.0, true, SUSTAINED, 100.0);
+        let bp1 = pair.record_pulse_with_phase("outer_body", 0.0, true, SUSTAINED, 100.1);
+        assert!(bp1.is_some());
+        // drop
+        let _ = pair.record_pulse_with_phase("outer_body", 0.0, false, 0, 100.2);
+        assert!(!pair.is_resonant());
+        // recover → rising edge again → BIG #2
+        let bp2 = pair.record_pulse_with_phase("outer_body", 0.0, true, SUSTAINED, 100.3);
+        assert!(bp2.is_some());
+        assert_eq!(bp2.unwrap().big_pulse_count, 2);
+    }
+
+    // ── STALE COUNTERPART → NO HARMONY (1) ─────────────────────────────
+
+    #[test]
+    fn pair_drops_harmony_on_stale_counterpart() {
+        // D-SPEC-113: a side that has not pulsed within `pulse_window` is
+        // stale — harmony cannot stand on a stuck clock holding an old counter.
+        let mut pair = ResonancePair::with_defaults("body");
+        let _ = pair.record_pulse_with_phase("inner_body", 0.0, true, SUSTAINED, 100.0);
+        let _ = pair.record_pulse_with_phase("outer_body", 0.0, true, SUSTAINED, 100.1);
+        assert!(pair.is_resonant());
+        // inner pulses 200s later → outer (last @100.1) now stale (>120s)
+        let _ = pair.record_pulse_with_phase("inner_body", 0.0, true, SUSTAINED, 300.0);
         assert!(!pair.is_resonant());
     }
 
@@ -638,29 +815,28 @@ mod tests {
 
     #[test]
     fn detector_all_resonant_and_resonant_count() {
-        // C4-2b1 test 6: GREAT PULSE gate boundary
+        // D-SPEC-113: each pair becomes harmonious once both sides are
+        // sustained-balanced + recent.
         let dir = tempdir().unwrap();
         let mut det = ResonanceDetector::with_defaults(dir.path());
         assert!(!det.all_resonant());
         assert_eq!(det.resonant_count(), 0);
 
-        // Drive body pair to resonance (3 cycles)
-        for ts in [100.0_f64, 200.0, 300.0] {
-            let _ = det.record_pulse_with_phase("inner_body", 0.0, ts);
-            let _ = det.record_pulse_with_phase("outer_body", 0.0, ts + 0.1);
-        }
+        // body pair → harmonious
+        let _ = det.record_pulse_with_phase("inner_body", 0.0, true, SUSTAINED, 100.0);
+        let _ = det.record_pulse_with_phase("outer_body", 0.0, true, SUSTAINED, 100.1);
         assert_eq!(det.resonant_count(), 1);
         assert!(!det.all_resonant());
 
-        // Mind pair — first cycle only
-        let _ = det.record_pulse_with_phase("inner_mind", 0.0, 100.0);
-        let _ = det.record_pulse_with_phase("outer_mind", 0.0, 100.1);
+        // mind pair → harmonious
+        let _ = det.record_pulse_with_phase("inner_mind", 0.0, true, SUSTAINED, 100.0);
+        let _ = det.record_pulse_with_phase("outer_mind", 0.0, true, SUSTAINED, 100.1);
         assert_eq!(det.resonant_count(), 2);
         assert!(!det.all_resonant());
 
-        // Spirit pair — first cycle
-        let _ = det.record_pulse_with_phase("inner_spirit", 0.0, 100.0);
-        let _ = det.record_pulse_with_phase("outer_spirit", 0.0, 100.1);
+        // spirit pair → harmonious → all 3
+        let _ = det.record_pulse_with_phase("inner_spirit", 0.0, true, SUSTAINED, 100.0);
+        let _ = det.record_pulse_with_phase("outer_spirit", 0.0, true, SUSTAINED, 100.1);
         assert_eq!(det.resonant_count(), 3);
         assert!(det.all_resonant());
     }
@@ -683,32 +859,31 @@ mod tests {
     // ── GREAT PULSE GATING (1) ─────────────────────────────────────────
 
     #[test]
-    fn great_pulse_count_increments_on_all_3_resonant_big_pulse() {
-        // C4-2b1 test 8: GREAT PULSE counter increments only when a BIG
-        // PULSE fires while ALL 3 pairs are resonant
+    fn great_pulse_count_increments_on_all_3_harmony_rising_edge() {
+        // D-SPEC-113: GREAT PULSE fires on the rising edge of all-3-harmony —
+        // the pulse that brings the LAST pair into harmony carries it.
         let dir = tempdir().unwrap();
         let mut det = ResonanceDetector::with_defaults(dir.path());
 
-        // Drive ALL 3 pairs to streak count 2 (just below BIG PULSE)
-        for ts in [100.0_f64, 200.0] {
-            for name in PAIRS.iter() {
-                let inner = format!("inner_{name}");
-                let outer = format!("outer_{name}");
-                let _ = det.record_pulse_with_phase(&inner, 0.0, ts);
-                let _ = det.record_pulse_with_phase(&outer, 0.0, ts + 0.1);
-            }
+        // body + mind harmonious — all-3 not yet, so no GREAT
+        for name in ["body", "mind"] {
+            let inner = format!("inner_{name}");
+            let outer = format!("outer_{name}");
+            let _ = det.record_pulse_with_phase(&inner, 0.0, true, SUSTAINED, 100.0);
+            let _ = det.record_pulse_with_phase(&outer, 0.0, true, SUSTAINED, 100.1);
         }
-        assert!(det.all_resonant());
+        assert!(!det.all_resonant());
         assert_eq!(det.great_pulse_count(), 0);
 
-        // Now fire one more cycle on body pair → BIG PULSE on body, all
-        // 3 still resonant (mind + spirit at streak 2 + body just hit 3)
-        let _ = det.record_pulse_with_phase("inner_body", 0.0, 300.0);
-        let body_bp = det
-            .record_pulse_with_phase("outer_body", 0.0, 300.1)
+        // spirit completes the trio → rising edge of all-3 → GREAT on the
+        // spirit BIG that closed it.
+        let _ = det.record_pulse_with_phase("inner_spirit", 0.0, true, SUSTAINED, 100.0);
+        let spirit_bp = det
+            .record_pulse_with_phase("outer_spirit", 0.0, true, SUSTAINED, 100.1)
             .unwrap();
-        assert!(body_bp.great_pulse_ready);
-        assert_eq!(body_bp.great_pulse_count, 1);
+        assert!(det.all_resonant());
+        assert!(spirit_bp.great_pulse_ready);
+        assert_eq!(spirit_bp.great_pulse_count, 1);
         assert_eq!(det.great_pulse_count(), 1);
     }
 
@@ -716,17 +891,19 @@ mod tests {
 
     #[test]
     fn save_and_load_state_roundtrip() {
-        // C4-2b1 test 9: save → load preserves all per-pair state
+        // D-SPEC-113: save → load preserves all per-pair state
         let dir = tempdir().unwrap();
         let mut det = ResonanceDetector::with_defaults(dir.path());
 
-        // Drive body pair into resonance
-        for ts in [100.0_f64, 200.0, 300.0] {
-            let _ = det.record_pulse_with_phase("inner_body", 0.0, ts);
-            let _ = det.record_pulse_with_phase("outer_body", 0.0, ts + 0.1);
+        // Drive body pair into (and sustain) harmony
+        for ts in [100.0_f64, 100.2, 100.4, 100.6] {
+            let _ = det.record_pulse_with_phase("inner_body", 0.0, true, SUSTAINED, ts);
+            let _ = det.record_pulse_with_phase("outer_body", 0.0, true, SUSTAINED, ts + 0.1);
         }
         let total_resonant = det.pairs.get("body").unwrap().total_resonant_cycles;
         let big_pulse_count = det.pairs.get("body").unwrap().big_pulse_count;
+        assert!(total_resonant >= 1);
+        assert_eq!(big_pulse_count, 1); // single rising edge
 
         // Persist
         det.save_state().unwrap();
@@ -740,20 +917,20 @@ mod tests {
 
     #[test]
     fn load_state_falls_back_to_bak_when_canonical_corrupt() {
-        // C4-2b1 test 10: corrupt canonical → restore from .bak
+        // D-SPEC-113: corrupt canonical → restore from .bak
         let dir = tempdir().unwrap();
         let mut det = ResonanceDetector::with_defaults(dir.path());
 
         // Save once → creates canonical
-        for ts in [100.0_f64, 200.0, 300.0] {
-            let _ = det.record_pulse_with_phase("inner_body", 0.0, ts);
-            let _ = det.record_pulse_with_phase("outer_body", 0.0, ts + 0.1);
+        for ts in [100.0_f64, 100.2, 100.4] {
+            let _ = det.record_pulse_with_phase("inner_body", 0.0, true, SUSTAINED, ts);
+            let _ = det.record_pulse_with_phase("outer_body", 0.0, true, SUSTAINED, ts + 0.1);
         }
         det.save_state().unwrap();
         // Save again → rotates canonical to .bak
-        for ts in [400.0_f64, 500.0, 600.0] {
-            let _ = det.record_pulse_with_phase("inner_mind", 0.0, ts);
-            let _ = det.record_pulse_with_phase("outer_mind", 0.0, ts + 0.1);
+        for ts in [400.0_f64, 400.2, 400.4] {
+            let _ = det.record_pulse_with_phase("inner_mind", 0.0, true, SUSTAINED, ts);
+            let _ = det.record_pulse_with_phase("outer_mind", 0.0, true, SUSTAINED, ts + 0.1);
         }
         det.save_state().unwrap();
 

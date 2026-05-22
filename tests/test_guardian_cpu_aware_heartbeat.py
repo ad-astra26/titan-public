@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 import time
 
-from titan_plugin.guardian import (
+from titan_hcl.guardian import (
     MAX_STARVED_CYCLES,
     MIN_CPU_DELTA_FOR_ALIVE,
     Guardian,

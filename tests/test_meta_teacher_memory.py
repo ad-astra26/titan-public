@@ -1,4 +1,4 @@
-"""Tests for titan_plugin.logic.meta_teacher_memory — Phase B of
+"""Tests for titan_hcl.logic.meta_teacher_memory — Phase B of
 rFP_meta_teacher_v2_content_awareness_memory.md.
 
 Covers:
@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from titan_plugin.logic.meta_teacher_memory import (
+from titan_hcl.logic.meta_teacher_memory import (
     TeacherMemory,
     canonical_topic_key,
 )

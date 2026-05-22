@@ -15,10 +15,10 @@ import os
 import numpy as np
 import pytest
 
-from titan_plugin.logic.emot_bundle_protocol import (
+from titan_hcl.logic.emot_bundle_protocol import (
     GRAD_SHADOW, GRAD_OBSERVING, GRAD_GRADUATED,
 )
-from titan_plugin.logic.emot_region_clusterer import (
+from titan_hcl.logic.emot_region_clusterer import (
     RegionClusterer, STATE_DIM,
 )
 

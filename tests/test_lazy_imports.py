@@ -7,7 +7,7 @@ as its own Python process and must boot quickly with minimal RSS before
 doing any actual cognitive work.
 
 History:
-- Commit 7f01125 (Mar 2026) applied lazy imports to titan_plugin/__init__.py
+- Commit 7f01125 (Mar 2026) applied lazy imports to titan_hcl/__init__.py
   via PEP 562 __getattr__. Saved ~860MB × 9 workers = ~2.3GB.
 - Commit 09fcdf5 (Apr 5 2026) added cgn_consumer_client.py with module-level
   `import torch` at the top, bypassing the lazy fix. Saved ~200MB lost.
@@ -22,7 +22,7 @@ boot. Move the import inside the function/method that uses it, or use
 PEP 562 __getattr__ for module-level exports.
 
 See:
-- memory/feedback_lazy_imports_titan_plugin.md
+- memory/feedback_lazy_imports_titan_hcl.md
 - memory/tuning_012_compound_rewards.md (related scaffolding)
 - titan-docs/codebase_audit_08042026.md (Cluster 1)
 """
@@ -41,24 +41,25 @@ HEAVY_LIBS = [
 
 # Each entry: (module_path, entry_fn_name, display_name)
 WORKERS = [
-    ("titan_plugin.modules.body_worker", "body_worker_main", "body_worker"),
-    ("titan_plugin.modules.mind_worker", "mind_worker_main", "mind_worker"),
-    ("titan_plugin.modules.spirit_worker", "spirit_worker_main", "spirit_worker"),
-    ("titan_plugin.modules.language_worker", "language_worker_main", "language_worker"),
-    ("titan_plugin.modules.knowledge_worker", "knowledge_worker_main", "knowledge_worker"),
-    ("titan_plugin.modules.memory_worker", "memory_worker_main", "memory_worker"),
-    ("titan_plugin.modules.llm_worker", "llm_worker_main", "llm_worker"),
-    ("titan_plugin.modules.media_worker", "media_worker_main", "media_worker"),
-    ("titan_plugin.modules.rl_worker", "rl_worker_main", "rl_worker"),
-    ("titan_plugin.modules.cgn_worker", "cgn_worker_main", "cgn_worker"),
-    ("titan_plugin.modules.timechain_worker", "timechain_worker_main", "timechain_worker"),
+    ("titan_hcl.modules.body_worker", "body_worker_main", "body_worker"),
+    ("titan_hcl.modules.mind_worker", "mind_worker_main", "mind_worker"),
+    # spirit_worker retired (D-SPEC-116) — engines live in cognitive_worker.
+    ("titan_hcl.modules.cognitive_worker", "cognitive_worker_main", "cognitive_worker"),
+    ("titan_hcl.modules.language_worker", "language_worker_main", "language_worker"),
+    ("titan_hcl.modules.knowledge_worker", "knowledge_worker_main", "knowledge_worker"),
+    ("titan_hcl.modules.memory_worker", "memory_worker_main", "memory_worker"),
+    ("titan_hcl.modules.llm_worker", "llm_worker_main", "llm_worker"),
+    ("titan_hcl.modules.media_worker", "media_worker_main", "media_worker"),
+    ("titan_hcl.modules.recorder_worker", "recorder_worker_main", "recorder_worker"),
+    ("titan_hcl.modules.cgn_worker", "cgn_worker_main", "cgn_worker"),
+    ("titan_hcl.modules.timechain_worker", "timechain_worker_main", "timechain_worker"),
 ]
 
 
 def _clear_torch_and_titan():
-    """Remove torch/titan_plugin from sys.modules so we can test fresh imports."""
+    """Remove torch/titan_hcl from sys.modules so we can test fresh imports."""
     for key in list(sys.modules.keys()):
-        if key == "torch" or key.startswith("torch.") or key.startswith("titan_plugin"):
+        if key == "torch" or key.startswith("torch.") or key.startswith("titan_hcl"):
             del sys.modules[key]
         for lib in HEAVY_LIBS:
             if key == lib or key.startswith(lib + "."):
@@ -83,7 +84,7 @@ def test_worker_does_not_leak_torch(module_path, entry_fn, display_name):
         f"{display_name} import loaded torch at module level. "
         "Move torch imports inside the functions/methods that use them, "
         "or use lazy-load pattern from cgn_consumer_client.py. "
-        "See memory/feedback_lazy_imports_titan_plugin.md"
+        "See memory/feedback_lazy_imports_titan_hcl.md"
     )
 
 
@@ -107,7 +108,7 @@ def test_cgn_consumer_client_construction_lazy():
     This is the Apr 8 2026 fix from commit b351965.
     """
     _clear_torch_and_titan()
-    from titan_plugin.logic.cgn_consumer_client import CGNConsumerClient
+    from titan_hcl.logic.cgn_consumer_client import CGNConsumerClient
     assert "torch" not in sys.modules, (
         "Importing CGNConsumerClient class loaded torch"
     )
@@ -118,15 +119,15 @@ def test_cgn_consumer_client_construction_lazy():
     )
 
 
-def test_titan_plugin_root_import_lazy():
-    """Importing titan_plugin top-level must not load torch.
+def test_titan_hcl_root_import_lazy():
+    """Importing titan_hcl top-level must not load torch.
 
     This verifies the PEP 562 __getattr__ lazy imports from commit 7f01125
     are still working.
     """
     _clear_torch_and_titan()
-    import titan_plugin
+    import titan_hcl
     assert "torch" not in sys.modules, (
-        "Importing titan_plugin leaked torch. "
-        "Check titan_plugin/__init__.py __getattr__ lazy imports."
+        "Importing titan_hcl leaked torch. "
+        "Check titan_hcl/__init__.py __getattr__ lazy imports."
     )

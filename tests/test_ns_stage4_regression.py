@@ -49,7 +49,7 @@ def _make_test_config(n_programs: int = 3) -> dict:
 class TestPersistenceRegression:
     def test_all_programs_persisted_after_record(self, tmp_path):
         """Every enabled program must have weights + buffer files after save_all."""
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
         nns = NeuralNervousSystem(config=_make_test_config(3),
                                    data_dir=str(tmp_path), vm_nervous_system=None)
         # Force a save
@@ -61,7 +61,7 @@ class TestPersistenceRegression:
 
     def test_audit_log_entries_well_formed(self, tmp_path):
         """Every record_outcome event writes a JSON-parseable audit line."""
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
         nns = NeuralNervousSystem(config=_make_test_config(2),
                                    data_dir=str(tmp_path), vm_nervous_system=None)
         # Add a transition that fires so reward update has a target
@@ -85,7 +85,7 @@ class TestPersistenceRegression:
 class TestSoftFirePropagation:
     def test_soft_fire_with_meaningful_urgency_applies_reward(self):
         """Not-fired transition with urgency near threshold gets soft reward."""
-        from titan_plugin.logic.neural_reflex_net import NervousTransitionBuffer
+        from titan_hcl.logic.neural_reflex_net import NervousTransitionBuffer
         buf = NervousTransitionBuffer(max_size=10)
         # Simulate a transition that DIDN'T fire but had high urgency (close to threshold)
         buf.add(observation=[0.5] * 10, urgency=0.25, vm_baseline=0.2, fired=False)
@@ -98,7 +98,7 @@ class TestSoftFirePropagation:
 
     def test_soft_fire_below_threshold_skipped(self):
         """Urgency ratio < 0.1 (true restraint) → no soft reward."""
-        from titan_plugin.logic.neural_reflex_net import NervousTransitionBuffer
+        from titan_hcl.logic.neural_reflex_net import NervousTransitionBuffer
         buf = NervousTransitionBuffer(max_size=10)
         buf.add(observation=[0.5] * 10, urgency=0.01, vm_baseline=0.0, fired=False)
         applied = buf.update_soft_reward(reward=0.7, fire_threshold=0.3)
@@ -109,7 +109,7 @@ class TestSoftFirePropagation:
 class TestStratifiedSampling:
     def test_stratified_returns_balanced_classes(self):
         """When both classes have samples, sample_stratified returns ~50/50."""
-        from titan_plugin.logic.neural_reflex_net import NervousTransitionBuffer
+        from titan_hcl.logic.neural_reflex_net import NervousTransitionBuffer
         buf = NervousTransitionBuffer(max_size=200)
         # 90% not-fired, 10% fired (extreme imbalance)
         for i in range(180):
@@ -125,7 +125,7 @@ class TestStratifiedSampling:
 
     def test_stratified_falls_back_when_one_class_empty(self):
         """If only one class has samples, fall back to uniform."""
-        from titan_plugin.logic.neural_reflex_net import NervousTransitionBuffer
+        from titan_hcl.logic.neural_reflex_net import NervousTransitionBuffer
         buf = NervousTransitionBuffer(max_size=50)
         # Only not-fired samples
         for i in range(30):
@@ -139,7 +139,7 @@ class TestStratifiedSampling:
 class TestPerProgramRouting:
     def test_record_outcome_program_kwarg_isolates_update(self, tmp_path):
         """record_outcome(reward, program=X) updates ONLY X's buffer."""
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
         nns = NeuralNervousSystem(config=_make_test_config(3),
                                    data_dir=str(tmp_path), vm_nervous_system=None)
         # Add fired transition to all 3 buffers
@@ -156,7 +156,7 @@ class TestPerProgramRouting:
 
     def test_record_outcome_firehose_updates_all_fired(self, tmp_path):
         """record_outcome(reward) WITHOUT program kwarg = legacy firehose."""
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
         nns = NeuralNervousSystem(config=_make_test_config(3),
                                    data_dir=str(tmp_path), vm_nervous_system=None)
         for name in ["TEST_A", "TEST_B", "TEST_C"]:
@@ -170,7 +170,7 @@ class TestPerProgramRouting:
 
     def test_unknown_program_warns_no_crash(self, tmp_path):
         """record_outcome(program="NONEXISTENT") logs WARNING, doesn't crash."""
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
         nns = NeuralNervousSystem(config=_make_test_config(2),
                                    data_dir=str(tmp_path), vm_nervous_system=None)
         # Add a fired transition to each known program so we can verify they're untouched
@@ -187,7 +187,7 @@ class TestPerProgramRouting:
 class TestEligibilityTraces:
     def test_recent_rewards_with_decay(self):
         """update_recent_rewards applies exponential decay to last K fires."""
-        from titan_plugin.logic.neural_reflex_net import NervousTransitionBuffer
+        from titan_hcl.logic.neural_reflex_net import NervousTransitionBuffer
         buf = NervousTransitionBuffer(max_size=20)
         # Add 5 fired transitions interleaved with not-fired
         for i in range(10):
@@ -207,7 +207,7 @@ class TestEligibilityTraces:
 
     def test_k_larger_than_available_fires(self):
         """K=10 with only 2 fires available → updates 2, returns 2."""
-        from titan_plugin.logic.neural_reflex_net import NervousTransitionBuffer
+        from titan_hcl.logic.neural_reflex_net import NervousTransitionBuffer
         buf = NervousTransitionBuffer(max_size=20)
         for i in range(5):
             buf.add(observation=[0.5] * 10, urgency=0.5, vm_baseline=0.4,
@@ -219,7 +219,7 @@ class TestEligibilityTraces:
 class TestZScoreNormalization:
     def test_z_score_stabilizes_to_zero_for_constant_reward(self, tmp_path):
         """Constant reward stream → z-score converges toward 0 (zero variance)."""
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
         nns = NeuralNervousSystem(config=_make_test_config(1),
                                    data_dir=str(tmp_path), vm_nervous_system=None)
         # Feed 100 constant rewards
@@ -230,7 +230,7 @@ class TestZScoreNormalization:
 
     def test_z_score_amplifies_outlier(self, tmp_path):
         """Outlier reward against established baseline → high |z|."""
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
         nns = NeuralNervousSystem(config=_make_test_config(1),
                                    data_dir=str(tmp_path), vm_nervous_system=None)
         # Establish baseline of 0.3 ± small noise
@@ -249,7 +249,7 @@ class TestZScoreNormalization:
 
 class TestResidualTargetFormula:
     def _ns(self, tmp_path):
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
         return NeuralNervousSystem(
             config=_make_test_config(1),
             data_dir=str(tmp_path), vm_nervous_system=None)
@@ -361,7 +361,7 @@ class TestResidualTargetFormula:
 
 class TestSigmoidTrapLiberation:
     def _ns(self, tmp_path):
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
         return NeuralNervousSystem(
             config=_make_test_config(1),
             data_dir=str(tmp_path), vm_nervous_system=None)

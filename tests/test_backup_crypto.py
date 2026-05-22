@@ -1,4 +1,4 @@
-"""Tests for titan_plugin/logic/backup_crypto.py — rFP_backup_worker Phase 7.1.
+"""Tests for titan_hcl/logic/backup_crypto.py — rFP_backup_worker Phase 7.1.
 
 Covers:
   1. Roundtrip encrypt/decrypt
@@ -14,7 +14,7 @@ import pytest
 
 from cryptography.exceptions import InvalidTag
 
-from titan_plugin.logic.backup_crypto import (
+from titan_hcl.logic.backup_crypto import (
     ALGORITHM_ID,
     IV_LEN,
     KEY_LEN,
@@ -28,7 +28,7 @@ from titan_plugin.logic.backup_crypto import (
     encrypt_tarball,
     key_id,
 )
-from titan_plugin.utils.shamir import combine_shares, split_secret
+from titan_hcl.utils.shamir import combine_shares, split_secret
 
 
 TITAN_PUBKEY = "J1cdk4f1qZWTV1j8MSWAkPJ6Nqg63AXBn8d5JbaGLNoG"

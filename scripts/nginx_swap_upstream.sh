@@ -1,7 +1,7 @@
 #!/bin/bash
 # B.1 §9 — nginx upstream port swap helper.
 #
-# Used by titan_plugin/core/shadow_orchestrator.py during phase 4 to
+# Used by titan_hcl/core/shadow_orchestrator.py during phase 4 to
 # update /etc/nginx/sites-enabled/iamtitan.tech upstream from OLD_PORT
 # to NEW_PORT, validate via `nginx -t`, then reload via `nginx -s reload`.
 #

@@ -145,6 +145,35 @@ pub const SLOT_SPECS: &[SlotSpec] = &[
         creator: SlotCreator::Kernel,
         writer: "titan-unified-spirit-rs",
     },
+    // ── Phase B metadata slots (Rust-owned, Kernel-created at boot) ───────
+    // Per rFP_phase_c_state_read_unification §B + D-SPEC-72. These three
+    // variable-msgpack slots are written by titan-unified-spirit-rs and
+    // replace Python-wrapper drift slots (resonance_state.bin etc.) per
+    // Preamble G15 single-source-of-truth + G18 SHM-canonical state.
+    SlotSpec {
+        name: "resonance_metadata.bin",
+        schema_version: RESONANCE_METADATA_SCHEMA_VERSION as u32,
+        payload_bytes: RESONANCE_METADATA_MAX_BYTES as u32,
+        max_payload_bytes: RESONANCE_METADATA_MAX_BYTES as u32,
+        creator: SlotCreator::Kernel,
+        writer: "titan-unified-spirit-rs",
+    },
+    SlotSpec {
+        name: "unified_spirit_metadata.bin",
+        schema_version: UNIFIED_SPIRIT_METADATA_SCHEMA_VERSION as u32,
+        payload_bytes: UNIFIED_SPIRIT_METADATA_MAX_BYTES as u32,
+        max_payload_bytes: UNIFIED_SPIRIT_METADATA_MAX_BYTES as u32,
+        creator: SlotCreator::Kernel,
+        writer: "titan-unified-spirit-rs",
+    },
+    SlotSpec {
+        name: "filter_down_state.bin",
+        schema_version: FILTER_DOWN_STATE_SCHEMA_VERSION as u32,
+        payload_bytes: FILTER_DOWN_STATE_MAX_BYTES as u32,
+        max_payload_bytes: FILTER_DOWN_STATE_MAX_BYTES as u32,
+        creator: SlotCreator::Kernel,
+        writer: "titan-unified-spirit-rs",
+    },
     // ── Control + state slots (kernel writes) ─────────────────────────────
     SlotSpec {
         name: "epoch_counter.bin",
@@ -276,17 +305,19 @@ pub const SLOT_SPECS: &[SlotSpec] = &[
 /// Number of slots that the kernel creates at boot (per SPEC §10.A B3).
 ///
 /// 9 tensor slots (`self_162d` + 6 trinity + `topology_30d` + `unified_spirit_132d`)
+/// plus 3 Phase B metadata slots (`resonance_metadata`, `unified_spirit_metadata`,
+/// `filter_down_state` — Rust-owned per rFP_phase_c_state_read_unification §B)
 /// plus 7 control/state slots (`epoch_counter`, `circadian`, `pi_heartbeat`,
-/// `sphere_clocks`, `chi_state`, `identity`, `fastbus`) = 16 total.
-pub const KERNEL_CREATED_COUNT: usize = 16;
+/// `sphere_clocks`, `chi_state`, `identity`, `fastbus`) = 19 total.
+pub const KERNEL_CREATED_COUNT: usize = 19;
 
 /// Total slot count across all creators.
 ///
-/// 16 kernel-created + 3 Python-managed (`neuromod_state`, `titanvm_registers`,
+/// 19 kernel-created + 3 Python-managed (`neuromod_state`, `titanvm_registers`,
 /// `hormonal_state` — added in SPEC v0.1.4 per master plan §10 D22) plus 5
-/// sensor cache slots (Python sensor refresh tasks) = 24 total.
+/// sensor cache slots (Python sensor refresh tasks) = 27 total.
 /// Note that `cgn_live_weights.bin` lives in `titan-cgn` instead, per SPEC §18.2.
-pub const TOTAL_SLOT_COUNT: usize = 24;
+pub const TOTAL_SLOT_COUNT: usize = 27;
 
 /// Iterate over slots whose creator is `Kernel` — used by `SlotRegistry::create_all`.
 pub fn kernel_slots() -> impl Iterator<Item = &'static SlotSpec> {
@@ -359,13 +390,27 @@ mod tests {
     }
 
     #[test]
-    fn schema_versions_all_v1_at_v0_1_0() {
-        // Per SPEC §3.1 D05: every per-slot schema version starts at 1.
+    fn schema_versions_started_at_v1_and_only_bump_intentionally() {
+        // Per SPEC §3.1 D05: every per-slot schema version starts at 1; bumps
+        // are intentional and tracked in the SPEC Changelog.
+        //
+        // Known bumped slots (post-v0.1.0, tracked in SPEC Changelog):
+        //   - neuromod_state.bin: v1 → v2 at SPEC v1.8.0 (D-SPEC-54, 2026-05-15)
+        //     per (6,) → (6,4) shape change per §4.Q neuromod_worker migration.
+        //
+        // Adding a slot bump here without updating SPEC Changelog =
+        // arch_map drift; gate enforces parity at constants TOML level.
+        const KNOWN_BUMPED: &[(&str, u32)] = &[("neuromod_state.bin", 2)];
         for spec in SLOT_SPECS.iter() {
+            let expected = KNOWN_BUMPED
+                .iter()
+                .find(|(n, _)| *n == spec.name)
+                .map(|(_, v)| *v)
+                .unwrap_or(1);
             assert_eq!(
-                spec.schema_version, 1,
-                "{} schema_version should be 1 at SPEC v0.1.0",
-                spec.name
+                spec.schema_version, expected,
+                "{} schema_version should be {} (check SPEC Changelog)",
+                spec.name, expected
             );
         }
     }

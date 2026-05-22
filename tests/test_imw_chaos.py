@@ -14,9 +14,9 @@ import time
 
 import pytest
 
-from titan_plugin.persistence.config import IMWConfig
-from titan_plugin.persistence.journal import CallerJournal
-from titan_plugin.persistence.writer_service import IMWDaemon
+from titan_hcl.persistence.config import IMWConfig
+from titan_hcl.persistence.journal import CallerJournal
+from titan_hcl.persistence.writer_service import IMWDaemon
 
 
 def _spawn_daemon(cfg: IMWConfig):
@@ -113,7 +113,7 @@ def test_orphan_journal_replayed_on_daemon_boot(tmp_path):
 
 
 def test_bad_sql_handled_gracefully(tmp_path):
-    from titan_plugin.persistence.writer_client import InnerMemoryWriterClient
+    from titan_hcl.persistence.writer_client import InnerMemoryWriterClient
     cfg = _make_cfg(tmp_path)
     daemon, stop = _spawn_daemon(cfg)
     try:
@@ -166,7 +166,7 @@ def test_journal_append_raises_on_readonly(tmp_path):
 
 
 def test_large_params_dont_corrupt(tmp_path):
-    from titan_plugin.persistence.writer_client import InnerMemoryWriterClient
+    from titan_hcl.persistence.writer_client import InnerMemoryWriterClient
     cfg = _make_cfg(tmp_path)
     # Make t accept a text blob
     c = sqlite3.connect(cfg.db_path)

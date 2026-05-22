@@ -17,11 +17,10 @@
 # Override with: bash scripts/backup_critical_data.sh /path/to/dst/
 #
 # Restore:
-#   1. Stop T1: bash scripts/safe_restart.sh t1 (then Ctrl-C after STOP)
-#      OR for T1 specifically, use the kill+wait pattern in the script.
+#   1. Stop T1: bash scripts/t1_manage.sh stop
 #   2. Replace each affected file from the backup dir:
 #      cp -a data.backup.<ts>/timechain/index.db data/timechain/index.db
-#   3. Start T1: bash scripts/safe_restart.sh t1
+#   3. Start T1: bash scripts/t1_manage.sh start
 #
 # This script is fast (~30s for ~10GB on local SSD) and idempotent (each
 # invocation creates a NEW timestamped backup; old backups are untouched).
@@ -105,6 +104,14 @@ for jsonfile in \
     neuromodulator_state.json \
     filter_down_weights.json \
     filter_down_v5_buffer.json \
+    filter_down_v5_weights.json \
+    filter_down_v5_state.json \
+    filter_down_local_inner_weights.json \
+    filter_down_local_inner_state.json \
+    filter_down_local_inner_buffer.json \
+    filter_down_local_outer_weights.json \
+    filter_down_local_outer_state.json \
+    filter_down_local_outer_buffer.json \
     titan_identity_keypair.json \
     reasoning_totals.json \
     chi_state.json \
@@ -149,9 +156,9 @@ Contents:
   - run/ metric files                               ($RUN_COUNT files)
 
 Restore:
-  1. Stop T1 (bash scripts/safe_restart.sh t1, Ctrl-C after STOP phase)
+  1. Stop T1 (bash scripts/t1_manage.sh stop)
   2. Replace affected file(s) from this backup dir
-  3. Restart T1 (bash scripts/safe_restart.sh t1)
+  3. Restart T1 (bash scripts/t1_manage.sh start)
 
 Created by: scripts/backup_critical_data.sh
 Trigger:    operator discretion (no scheduling)

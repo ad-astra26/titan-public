@@ -42,7 +42,7 @@ def _make_knowledge_db(path: str, rows: list[tuple[str, float]]) -> None:
 
 
 def test_extract_topic_words_filters_stopwords_and_short():
-    from titan_plugin.logic.knowledge_gate import extract_topic_words
+    from titan_hcl.logic.knowledge_gate import extract_topic_words
     out = extract_topic_words(
         "What is the aurora borealis and why does it happen?")
     # "what", "is", "the", "and", "why", "does", "it" → stopwords;
@@ -55,7 +55,7 @@ def test_extract_topic_words_filters_stopwords_and_short():
 
 
 def test_extract_topic_words_empty_returns_empty_list():
-    from titan_plugin.logic.knowledge_gate import extract_topic_words
+    from titan_hcl.logic.knowledge_gate import extract_topic_words
     assert extract_topic_words("") == []
     assert extract_topic_words("   ") == []
     # All stopwords (checked against the actual STOPWORDS set in utility):
@@ -71,7 +71,7 @@ def test_check_topic_confidence_returns_max_across_keyword_matches():
             ("borealis visual guide", 0.55),
             ("quantum mechanics", 0.90),
         ])
-        from titan_plugin.logic.knowledge_gate import check_topic_confidence
+        from titan_hcl.logic.knowledge_gate import check_topic_confidence
         # aurora → 0.82, borealis → 0.55 → max=0.82
         assert check_topic_confidence(
             ["aurora", "borealis"], db_path=db) == pytest.approx(0.82)
@@ -83,7 +83,7 @@ def test_check_topic_confidence_returns_max_across_keyword_matches():
 
 
 def test_check_topic_confidence_nonexistent_db_returns_zero():
-    from titan_plugin.logic.knowledge_gate import check_topic_confidence
+    from titan_hcl.logic.knowledge_gate import check_topic_confidence
     assert check_topic_confidence(["anything"],
                                   db_path="/tmp/does_not_exist.db") == 0.0
 
@@ -91,7 +91,7 @@ def test_check_topic_confidence_nonexistent_db_returns_zero():
 # ── gateway grounding gate ──────────────────────────────────────────
 
 def _make_gateway(tmp: str, telemetry_name: str = "tel.jsonl"):
-    from titan_plugin.logic.social_x_gateway import (
+    from titan_hcl.logic.social_x_gateway import (
         SocialXGateway, PostContext)
     gw = SocialXGateway(
         db_path=os.path.join(tmp, "sx.db"),
@@ -283,9 +283,9 @@ def test_multi_topic_fires_for_first_past_cooldown(tmp_path, monkeypatch):
 def test_agno_hooks_uses_knowledge_gate_utility():
     """Regression: §[24] should route through knowledge_gate so both paths
     share topic semantics. If this fails the shared utility was not wired."""
-    import titan_plugin.agno_hooks as ah
+    import titan_hcl.modules.agno_hooks as ah
     src = Path(ah.__file__).read_text()
-    assert "from titan_plugin.logic.knowledge_gate import" in src
+    assert "from titan_hcl.logic.knowledge_gate import" in src
     assert "extract_topic_words" in src
     assert "check_topic_confidence" in src
 
@@ -299,7 +299,7 @@ def test_load_config_surfaces_voice_section(tmp_path, monkeypatch):
     This test writes a minimal config.toml with a [voice] section, points
     the loader at it, and asserts the dict surfaces the keys.
     """
-    import titan_plugin.config_loader as cl
+    import titan_hcl.config_loader as cl
 
     cfg_path = tmp_path / "config.toml"
     cfg_path.write_text(
@@ -316,10 +316,10 @@ def test_load_config_surfaces_voice_section(tmp_path, monkeypatch):
             return tomllib.load(f)
 
     monkeypatch.setattr(cl, "load_titan_config", fake_load)
-    monkeypatch.setattr("titan_plugin.logic.social_x_gateway.logger.warning",
+    monkeypatch.setattr("titan_hcl.logic.social_x_gateway.logger.warning",
                         lambda *a, **kw: None)
 
-    from titan_plugin.logic.social_x_gateway import SocialXGateway
+    from titan_hcl.logic.social_x_gateway import SocialXGateway
     gw = SocialXGateway(
         db_path=str(tmp_path / "sx.db"),
         config_path=str(cfg_path),

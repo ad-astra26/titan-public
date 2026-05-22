@@ -1,5 +1,5 @@
 """
-Unit tests for ``titan_plugin.core.sensor_cache`` — the §L1 Trinity
+Unit tests for ``titan_hcl.core.sensor_cache`` — the §L1 Trinity
 Daemon Internal Design substrate (cache + refresh threads + Schumann
 shm writer).
 
@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from titan_plugin.core.sensor_cache import (
+from titan_hcl.core.sensor_cache import (
     RefreshSpec,
     SensorCache,
     start_refresh_threads,

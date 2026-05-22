@@ -48,19 +48,19 @@ class TestHelperRegistryCRUD:
     """Registration, lookup, and removal."""
 
     def test_register_and_get(self):
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.registry import HelperRegistry
         registry = HelperRegistry()
         helper = MockHelper("web_search")
         registry.register(helper)
         assert registry.get_helper("web_search") is helper
 
     def test_get_nonexistent_returns_none(self):
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.registry import HelperRegistry
         registry = HelperRegistry()
         assert registry.get_helper("nonexistent") is None
 
     def test_unregister(self):
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.registry import HelperRegistry
         registry = HelperRegistry()
         helper = MockHelper("test")
         registry.register(helper)
@@ -69,7 +69,7 @@ class TestHelperRegistryCRUD:
         assert registry.unregister("test") is False  # Already removed
 
     def test_list_all_names(self):
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.registry import HelperRegistry
         registry = HelperRegistry()
         registry.register(MockHelper("alpha"))
         registry.register(MockHelper("beta"))
@@ -82,7 +82,7 @@ class TestHelperRegistryManifest:
     """LLM-readable manifest generation."""
 
     def test_manifest_includes_available(self):
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.registry import HelperRegistry
         registry = HelperRegistry()
         registry.register(MockHelper("web_search", "available"))
         manifest = registry.list_available()
@@ -91,14 +91,14 @@ class TestHelperRegistryManifest:
         assert "mind" in manifest  # enriches
 
     def test_manifest_excludes_unavailable(self):
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.registry import HelperRegistry
         registry = HelperRegistry()
         registry.register(MockHelper("broken_helper", "unavailable"))
         manifest = registry.list_available()
         assert "broken_helper" not in manifest
 
     def test_manifest_marks_degraded(self):
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.registry import HelperRegistry
         registry = HelperRegistry()
         registry.register(MockHelper("slow_helper", "degraded"))
         manifest = registry.list_available()
@@ -106,7 +106,7 @@ class TestHelperRegistryManifest:
         assert "[degraded]" in manifest
 
     def test_empty_registry(self):
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.registry import HelperRegistry
         registry = HelperRegistry()
         assert registry.list_available() == "No helpers available."
 
@@ -115,7 +115,7 @@ class TestHelperRegistryStatus:
     """Status tracking and caching."""
 
     def test_status_cached(self):
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.registry import HelperRegistry
         registry = HelperRegistry()
         helper = MockHelper("test", "available")
         registry.register(helper)
@@ -127,7 +127,7 @@ class TestHelperRegistryStatus:
         assert registry.get_status("test") == "available"
 
     def test_stats_structure(self):
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.registry import HelperRegistry
         registry = HelperRegistry()
         registry.register(MockHelper("a", "available"))
         registry.register(MockHelper("b", "unavailable"))
@@ -143,6 +143,6 @@ class TestBaseHelperProtocol:
     """Verify protocol compliance checking."""
 
     def test_mock_helper_implements_protocol(self):
-        from titan_plugin.logic.agency.registry import BaseHelper
+        from titan_hcl.logic.agency.registry import BaseHelper
         helper = MockHelper()
         assert isinstance(helper, BaseHelper)

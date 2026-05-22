@@ -22,7 +22,7 @@ import time
 
 import pytest
 
-from titan_plugin.logic.knowledge_health import (
+from titan_hcl.logic.knowledge_health import (
     ALERT_KIND_BUDGET_EXCEEDED,
     ALERT_KIND_BUDGET_WARNING,
     ALERT_KIND_CIRCUIT_OPEN,

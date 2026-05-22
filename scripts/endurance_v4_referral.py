@@ -43,7 +43,7 @@ import httpx
 
 # ─── Paths ────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CONFIG_PATH = PROJECT_ROOT / "titan_plugin" / "config.toml"
+CONFIG_PATH = PROJECT_ROOT / "titan_hcl" / "config.toml"
 LOG_DIR = PROJECT_ROOT / "data" / "logs" / "endurance"
 REPORT_DIR = PROJECT_ROOT / "data" / "endurance_reports"
 

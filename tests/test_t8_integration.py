@@ -14,13 +14,13 @@ import pytest
 
 def _build_full_stack():
     """Build the complete T1-T7 stack."""
-    from titan_plugin.logic.observables import ObservableEngine
-    from titan_plugin.logic.inner_state import InnerState
-    from titan_plugin.logic.spirit_state import SpiritState
-    from titan_plugin.logic.nervous_system import NervousSystem
-    from titan_plugin.logic.topology import TopologyEngine
-    from titan_plugin.logic.dreaming import DreamingEngine
-    from titan_plugin.logic.inner_coordinator import InnerTrinityCoordinator
+    from titan_hcl.logic.observables import ObservableEngine
+    from titan_hcl.logic.inner_state import InnerState
+    from titan_hcl.logic.spirit_state import SpiritState
+    from titan_hcl.logic.nervous_system import NervousSystem
+    from titan_hcl.logic.topology import TopologyEngine
+    from titan_hcl.logic.dreaming import DreamingEngine
+    from titan_hcl.logic.inner_coordinator import InnerTrinityCoordinator
 
     inner = InnerState()
     spirit = SpiritState()
@@ -204,8 +204,8 @@ class TestFullCycleIntegration:
     def test_backward_compat_sphere_clock_with_coherence(self):
         """Sphere clocks work with coherence values from the new pipeline."""
         import tempfile
-        from titan_plugin.logic.sphere_clock import SphereClockEngine
-        from titan_plugin.logic.middle_path import layer_coherence
+        from titan_hcl.logic.sphere_clock import SphereClockEngine
+        from titan_hcl.logic.middle_path import layer_coherence
 
         # Use temp dir to avoid loading persisted state from running Titan
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -227,7 +227,7 @@ class TestFullCycleIntegration:
 
     def test_state_register_backward_compat(self):
         """StateRegister import still works and OuterState has is_active."""
-        from titan_plugin.logic.state_register import StateRegister, OuterState
+        from titan_hcl.logic.state_register import StateRegister, OuterState
         assert StateRegister is OuterState
         reg = StateRegister()
         assert reg.is_active is True

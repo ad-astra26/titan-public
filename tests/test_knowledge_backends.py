@@ -1,4 +1,4 @@
-"""Unit tests for titan_plugin.logic.knowledge_backends (KP-1).
+"""Unit tests for titan_hcl.logic.knowledge_backends (KP-1).
 
 Mocks httpx at the AsyncClient level so tests stay hermetic — no real
 network, no DNS, no external state. Covers success + each documented
@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from titan_plugin.logic.knowledge_backends import (
+from titan_hcl.logic.knowledge_backends import (
     BACKEND_REGISTRY,
     BackendResult,
     fetch_free_dictionary,

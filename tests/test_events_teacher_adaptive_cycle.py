@@ -19,7 +19,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from titan_plugin.logic.events_teacher import EventsTeacher, EventsTeacherDB
+from titan_hcl.logic.events_teacher import EventsTeacher, EventsTeacherDB
 
 
 @pytest.fixture

@@ -12,8 +12,8 @@ import time
 import msgpack
 import pytest
 
-from titan_plugin.api import bus_contracts, cache_schemas
-from titan_plugin.api.cache_schemas import (
+from titan_hcl.api import bus_contracts, cache_schemas
+from titan_hcl.api.cache_schemas import (
     EVENT_SCHEMAS,
     MemoryKnowledgeGraphEvent,
     MemoryMempoolEvent,
@@ -21,7 +21,7 @@ from titan_plugin.api.cache_schemas import (
     MemoryTopEvent,
     MemoryTopologyEvent,
 )
-from titan_plugin.core.bus_socket import (
+from titan_hcl.core.bus_socket import (
     BusContractViolation,
     _packb_safe,
 )
@@ -213,63 +213,11 @@ class TestPackbSafeContractEnforcement:
         assert unpacked["payload"]["last_id"] == "abc-123-def"
 
 
-# ── BusSubscriber RECEIVE-time enforcement ─────────────────────────────
-
-
-class TestBusSubscriberSchemaEnforcement:
-    """Validate that BusSubscriber.handle_message validates against schemas."""
-
-    def _make_subscriber(self):
-        from titan_plugin.api.bus_subscriber import BusSubscriber
-        from titan_plugin.api.cached_state import CachedState
-
-        cs = CachedState()
-        return BusSubscriber(cached_state=cs, send_queue=None), cs
-
-    def test_valid_payload_populates_cache(self):
-        sub, cs = self._make_subscriber()
-        msg = {
-            "type": "MEMORY_STATUS_UPDATED",
-            "payload": {
-                "persistent_count": 100,
-                "mempool_size": 5,
-                "cognee_ready": True,
-                "memory_backend_ready": True,
-                "updated_at": 1.0,
-            },
-        }
-        result = sub.handle_message(msg)
-        assert result is True
-        assert cs.get("memory.status")["persistent_count"] == 100
-
-    def test_invalid_payload_drops_cache_clean(self):
-        sub, cs = self._make_subscriber()
-        # Seed valid value first
-        sub.handle_message({
-            "type": "MEMORY_STATUS_UPDATED",
-            "payload": {"persistent_count": 50, "mempool_size": 1,
-                        "cognee_ready": True, "memory_backend_ready": True,
-                        "updated_at": 1.0},
-        })
-        # Send malformed
-        result = sub.handle_message({
-            "type": "MEMORY_STATUS_UPDATED",
-            "payload": {"persistent_count": "BAD"},
-        })
-        # Returns True (consumed) — drops the bad one + leaves cache untouched
-        assert result is True
-        assert cs.get("memory.status")["persistent_count"] == 50  # not corrupted
-
-    def test_unschematized_msg_passes_through_to_handler(self):
-        # OBSERVATORY_EVENT has no contract — should still dispatch normally
-        sub, cs = self._make_subscriber()
-        # No handler for OBSERVATORY_EVENT in BusSubscriber default handlers
-        # → returns False (not handled), does NOT crash
-        result = sub.handle_message({
-            "type": "OBSERVATORY_EVENT",
-            "payload": {"event_type": "expr", "data": {}},
-        })
-        assert result is False  # not in BusSubscriber._handlers
+# NOTE: TestBusSubscriberSchemaEnforcement was RETIRED in Phase D D-SPEC-80
+# along with the BusSubscriber + CachedState classes. The kernel snapshot
+# pipeline that populated the cache no longer exists; every state-read path
+# is SHM-direct per Preamble G18. Contract-validation surface coverage is
+# preserved by the producer-side `_packb_safe` tests above.
 
 
 # ── End-to-end pack-then-unpack roundtrip ──────────────────────────────

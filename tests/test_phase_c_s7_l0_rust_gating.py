@@ -13,7 +13,7 @@ preventing a SeqLock double-writer race or a duplicate Guardian
 registration from sneaking through silently.
 
 Lightweight by design: no full kernel boot, no event loop, no
-TitanPlugin construction — gating is a structural property, so we verify
+TitanHCL construction — gating is a structural property, so we verify
 it structurally. Behavioral end-to-end coverage is added in commit 6
 (activation soak under l0_rust=true).
 """
@@ -49,7 +49,7 @@ class TestShmWriterGating:
 
     def test_trinity_shm_writer_call_is_gated(self):
         """_start_trinity_shm_writer call is wrapped in l0_rust check."""
-        src = _read_source("titan_plugin/core/kernel.py")
+        src = _read_source("titan_hcl/core/kernel.py")
         # Find the boot() method's section near _start_trinity_shm_writer().
         # Pattern: an l0_rust_enabled guard immediately preceding the call.
         m = re.search(
@@ -64,7 +64,7 @@ class TestShmWriterGating:
 
     def test_topology_shm_writer_call_is_gated(self):
         """_start_topology_shm_writer call is wrapped in l0_rust check."""
-        src = _read_source("titan_plugin/core/kernel.py")
+        src = _read_source("titan_hcl/core/kernel.py")
         m = re.search(
             r'l0_rust_enabled["\'],?\s*False\s*\)[\s\S]{0,400}?'
             r'self\._start_topology_shm_writer\(\)',
@@ -82,7 +82,7 @@ class TestShmWriterGating:
         announce SHIM-mode under l0_rust=true so operators can confirm
         the Rust path is active.
         """
-        src = _read_source("titan_plugin/core/kernel.py")
+        src = _read_source("titan_hcl/core/kernel.py")
         # Find the _start_spirit_shm_writer method body and verify it
         # branches on l0_rust_enabled.
         method_match = re.search(
@@ -114,67 +114,20 @@ class TestOuterWorkerRegistrationGating:
     owns them per arch §4.5).
     """
 
-    def test_outer_workers_registration_block_is_gated(self):
-        """guardian.register(... outer_body ...) calls live inside
-        an `if not _l0_rust:` block."""
-        src = _read_source("titan_plugin/core/plugin.py")
-
-        # The l0_rust flag must be read BEFORE the outer worker block.
-        l0_rust_read = re.search(
-            r'_l0_rust\s*=\s*self\._full_config\.get\("microkernel"',
-            src,
-        )
-        assert l0_rust_read is not None, (
-            "plugin must read microkernel.l0_rust_enabled into a local "
-            "_l0_rust before the outer worker registration block "
-            "(Phase C C-S7 Gap 7+11)"
-        )
-
-        # The outer_body registration must be inside an `if not _l0_rust:` block.
-        # We look for the pattern: `if not _l0_rust:` on a line, then within the
-        # following block (any amount of whitespace + content) the three
-        # registrations appear in order.
-        gated_block = re.search(
-            r'if not _l0_rust:[\s\S]+?'
-            r'outer_body[\s\S]+?'
-            r'outer_mind[\s\S]+?'
-            r'outer_spirit',
-            src,
-        )
-        assert gated_block is not None, (
-            "Outer worker registrations (outer_body/mind/spirit) must be "
-            "wrapped in an `if not _l0_rust:` block "
-            "(Phase C C-S7 Gap 7 Option b — ModuleSpec gate)"
-        )
-
-    def test_outer_worker_imports_are_gated(self):
-        """Imports of outer_*_worker modules must also live inside the gate.
-
-        Rationale: under l0_rust=true Python should not even import the
-        worker modules — they may pull heavy dependencies and exist purely
-        for the legacy path.
-        """
-        src = _read_source("titan_plugin/core/plugin.py")
-        # The three outer_*_worker imports must not appear at module level —
-        # they should be inside the gated block. Check that EVERY occurrence
-        # of `from titan_plugin.modules.outer_body_worker import` is preceded
-        # in the same indentation context by `if not _l0_rust:`.
-        # Lightweight check: find each import, then walk back to the nearest
-        # `if not _l0_rust:` line within the prior 50 lines.
+    def test_outer_workers_fully_retired(self):
+        """The legacy outer_*_worker modules are RETIRED (Phase C dissolution
+        C.8, 2026-05-22, no-shim). Under l0_rust=true (production fleet) they
+        were never spawned (C.0); the Rust outer daemons own the tensor slots
+        and the source data plane is now SHM-direct. plugin.py must neither
+        import nor register them. Supersedes 'imports are gated'."""
+        src = _read_source("titan_hcl/core/plugin.py")
         for worker_name in ("outer_body_worker", "outer_mind_worker",
                             "outer_spirit_worker"):
-            import_match = re.search(
-                rf'from titan_plugin\.modules\.{worker_name} import',
-                src,
-            )
-            assert import_match is not None, (
-                f"{worker_name} import not found in plugin.py")
-            preceding_400 = src[max(0, import_match.start() - 400):
-                                import_match.start()]
-            assert "if not _l0_rust" in preceding_400, (
-                f"{worker_name} import must be inside the "
-                "`if not _l0_rust:` gated block (Phase C C-S7 Gap 7)"
-            )
+            assert re.search(
+                rf'from titan_hcl\.modules\.{worker_name} import', src
+            ) is None, f"{worker_name} must NOT be imported (retired C.8)"
+            assert f"{worker_name}_main" not in src, (
+                f"{worker_name}_main must NOT be registered (retired C.8)")
 
 
 # ─── Test 1+2 — BusSocketClient attach + outbound + dispatcher ─────────
@@ -185,7 +138,7 @@ class TestBusClientAttach:
     Gap 1+2+3) and is mutually exclusive with attach_broker."""
 
     def _make_bus(self):
-        from titan_plugin.bus import DivineBus
+        from titan_hcl.bus import DivineBus
         return DivineBus()
 
     def test_attach_client_routes_publish(self):
@@ -249,18 +202,18 @@ class TestInProcessSubscriberNames:
     """Phase C C-S7 — the constant must include all names workers target."""
 
     def test_includes_guardian_for_module_heartbeat(self):
-        from titan_plugin.core.kernel import IN_PROCESS_SUBSCRIBER_NAMES
+        from titan_hcl.core.kernel import IN_PROCESS_SUBSCRIBER_NAMES
         # MODULE_HEARTBEAT and MODULE_READY are dst="guardian" — the constant
         # MUST register a client under this name or worker liveness breaks.
         assert "guardian" in IN_PROCESS_SUBSCRIBER_NAMES
 
     def test_includes_titan_HCL_as_canonical_outbound(self):
-        from titan_plugin.core.kernel import IN_PROCESS_SUBSCRIBER_NAMES
+        from titan_hcl.core.kernel import IN_PROCESS_SUBSCRIBER_NAMES
         # The plugin's canonical outbound publisher identity. Per PLAN §2 Gap 1.
         assert "titan_HCL" in IN_PROCESS_SUBSCRIBER_NAMES
 
     def test_no_duplicates(self):
-        from titan_plugin.core.kernel import IN_PROCESS_SUBSCRIBER_NAMES
+        from titan_hcl.core.kernel import IN_PROCESS_SUBSCRIBER_NAMES
         assert len(IN_PROCESS_SUBSCRIBER_NAMES) == len(set(IN_PROCESS_SUBSCRIBER_NAMES))
 
 
@@ -270,7 +223,7 @@ class TestInboundDispatcherEchoAndDedup:
     def test_echo_prevention_drops_self_published_messages(self):
         """Messages whose src is in IN_PROCESS_SUBSCRIBER_NAMES are dropped
         (they originated in this process; broker echoed them back)."""
-        src = _read_source("titan_plugin/core/kernel.py")
+        src = _read_source("titan_hcl/core/kernel.py")
         m = re.search(
             r'def _bus_client_inbound_dispatcher\([\s\S]+?'
             r'(?=\n    def |\Z)',
@@ -298,9 +251,22 @@ class TestInboundDispatcherEchoAndDedup:
         )
 
     def test_broadcast_dedup_only_titan_HCL_relays(self):
-        """Broadcast (dst='all'/'') messages are received by every client;
-        only the titan_HCL dispatcher relays. Otherwise N-fold duplication."""
-        src = _read_source("titan_plugin/core/kernel.py")
+        """SPEC §9.B-aligned design: SINGLE BusSocketClient connection +
+        SINGLE inbound dispatcher = broadcasts arrive EXACTLY ONCE per
+        dispatcher → no relay-gate, no dedup needed.
+
+        Pre-2026-05-12: 6 dispatcher threads (one per per-name connection),
+        broadcasts arrived 6× and we gated relay on `client_name == "titan_HCL"`
+        via an `is_broadcast_relay` flag.
+
+        Post-2026-05-12 (D-SPEC-42 v1.4.0 multi-name BUS_SUBSCRIBE): 1
+        connection → 1 dispatcher → 1× delivery. The `is_broadcast_relay`
+        variable was deleted with intent. This test asserts the dispatcher
+        body documents that decision (so a future refactor doesn't
+        accidentally re-introduce the per-name multi-connection pattern
+        without re-introducing the dedup gate).
+        """
+        src = _read_source("titan_hcl/core/kernel.py")
         m = re.search(
             r'def _bus_client_inbound_dispatcher\([\s\S]+?'
             r'(?=\n    def |\Z)',
@@ -308,16 +274,18 @@ class TestInboundDispatcherEchoAndDedup:
         )
         assert m is not None
         body = m.group(0)
-        # The dispatcher must designate titan_HCL as the broadcast relay.
-        assert 'is_broadcast_relay' in body, (
-            "Dispatcher must compute is_broadcast_relay (titan_HCL only)"
+        # The dispatcher MUST document the dedup-not-needed rationale so a
+        # future refactor that re-introduces multi-connection topology
+        # also re-introduces the dedup gate.
+        assert "Broadcast deduplication: NO LONGER NEEDED" in body or "no dedup needed" in body, (
+            "Dispatcher must document why broadcast dedup is no longer "
+            "needed (single connection post-D-SPEC-42); without this docstring "
+            "comment, a future refactor that adds per-name connections back "
+            "would silently regress to N-fold broadcast duplication."
         )
-        assert '"titan_HCL"' in body, (
-            "Dispatcher must reference titan_HCL as the broadcast-relay client"
-        )
-        # And the broadcast skip must check both '' and 'all'.
-        assert '"all"' in body or "'all'" in body, (
-            "Dispatcher must recognize dst='all' as broadcast"
+        assert '"titan_HCL"' in body or 'titan_HCL' in body, (
+            "Dispatcher must reference titan_HCL as the canonical "
+            "connection name (per SPEC §9.B titan_HCL block)."
         )
 
 
@@ -329,7 +297,7 @@ class TestShadowSwapBlockedUnderL0Rust:
     l0_rust=true; Rust kernel has no BUS_HANDOFF protocol yet."""
 
     def test_shadow_swap_refuses_under_l0_rust(self):
-        src = _read_source("titan_plugin/core/kernel.py")
+        src = _read_source("titan_hcl/core/kernel.py")
         # Locate shadow_swap_orchestrate body
         m = re.search(
             r'def shadow_swap_orchestrate\([\s\S]+?'
@@ -357,7 +325,7 @@ class TestShadowSwapBlockedUnderL0Rust:
         """The l0_rust check must come BEFORE the shadow_swap_enabled flag
         check — otherwise an operator with l0_rust=true who flips
         shadow_swap_enabled=true would get the wrong refusal reason."""
-        src = _read_source("titan_plugin/core/kernel.py")
+        src = _read_source("titan_hcl/core/kernel.py")
         m = re.search(
             r'def shadow_swap_orchestrate\([\s\S]+?'
             r'(?=\n    def |\Z)',
@@ -392,7 +360,7 @@ class TestBusSpecsParity:
 
     @staticmethod
     def _python_keys() -> set[str]:
-        from titan_plugin.bus_specs import MSG_SPECS
+        from titan_hcl.bus_specs import MSG_SPECS
         return set(MSG_SPECS.keys())
 
     @staticmethod
@@ -455,19 +423,39 @@ class TestKernelSupervisorWiring:
     substrate→unified-spirit through the titan-core Supervisor framework."""
 
     def test_main_rs_flips_spawn_python_to_true(self):
-        """main.rs constructs KernelRunOptions with spawn_python=true so
-        production boot spawns titan_HCL (Gap A)."""
+        """main.rs constructs KernelRunOptions so production boot spawns
+        titan_HCL (Gap A).
+
+        Production must spawn Python by default. The implementation derives
+        the flag from `!std::env::var("TITAN_KERNEL_SKIP_PYTHON")` so
+        cross-language integration tests can opt out by setting that env
+        var — production never sets it, so production gets spawn_python=true.
+
+        This test accepts either form:
+          - Literal `spawn_python: true` (simple production-only main.rs)
+          - `spawn_python: !skip_python` (current production main.rs with
+            opt-out env var for integration tests)
+        """
         src = _read_source("titan-rust/crates/titan-kernel-rs/src/main.rs")
-        m = re.search(
+        # Accept literal `true` OR the `!skip_python` opt-out pattern (which
+        # defaults to true when TITAN_KERNEL_SKIP_PYTHON is unset).
+        m_literal = re.search(
             r'KernelRunOptions\s*\{[^}]*spawn_python:\s*true',
             src,
             re.DOTALL,
         )
-        assert m is not None, (
-            "main.rs must explicitly set spawn_python: true on the "
-            "production KernelRunOptions (Phase C C-S7 Gap A — without "
-            "this the kernel boots Rust tree but never spawns the Python "
-            "plugin, leaving Titan brain-dead under l0_rust=true)"
+        m_optout = re.search(
+            r'KernelRunOptions\s*\{[^}]*spawn_python:\s*!\s*skip_python',
+            src,
+            re.DOTALL,
+        )
+        assert m_literal is not None or m_optout is not None, (
+            "main.rs must set spawn_python=true on the production "
+            "KernelRunOptions (Phase C C-S7 Gap A — without this the "
+            "kernel boots Rust tree but never spawns the Python plugin, "
+            "leaving Titan brain-dead under l0_rust=true). Accepted "
+            "patterns: `spawn_python: true` OR `spawn_python: !skip_python` "
+            "with TITAN_KERNEL_SKIP_PYTHON env var opt-out."
         )
 
     def test_kernel_supervisor_module_exists(self):
@@ -591,7 +579,7 @@ class TestPythonSupervisionModule:
     payloads are wire-compatible."""
 
     def test_supervision_reason_mirrors_rust_enum(self):
-        from titan_plugin.supervision import SupervisionReason
+        from titan_hcl.supervision import SupervisionReason
         # All 11 Rust SupervisionReason variants must be present.
         for variant in (
             "OOM", "PANIC", "SEGV", "HANG", "EMPTY",
@@ -605,7 +593,7 @@ class TestPythonSupervisionModule:
             assert SupervisionReason[variant].value == variant
 
     def test_kernel_default_decision_mirrors_rust(self):
-        from titan_plugin.supervision import (
+        from titan_hcl.supervision import (
             EscalationDecision, SupervisionReason, kernel_default_decision,
         )
         # Per SPEC §11.B.2 + Rust kernel_default_decision in escalation.rs:
@@ -622,7 +610,7 @@ class TestPythonSupervisionModule:
 
     def test_classify_exit_code_mirrors_rust(self):
         """Mirror of titan_core::supervisor::restart::classify_exit per SPEC §15."""
-        from titan_plugin.supervision import SupervisionReason, classify_exit_code
+        from titan_hcl.supervision import SupervisionReason, classify_exit_code
         assert classify_exit_code(0) == SupervisionReason.CLEAN_EXIT
         assert classify_exit_code(1) == SupervisionReason.PANIC
         assert classify_exit_code(2) == SupervisionReason.CONFIG_ERROR
@@ -633,7 +621,7 @@ class TestPythonSupervisionModule:
         assert classify_exit_code(None) == SupervisionReason.KILLED  # signal-killed
 
     def test_dependency_dataclass_fields(self):
-        from titan_plugin.supervision import (
+        from titan_hcl.supervision import (
             Dependency, DependencyKind, DependencySeverity,
         )
         dep = Dependency(
@@ -653,8 +641,8 @@ class TestPythonGuardianSupervisionEmit:
     on restart events + runs escalation handshake on max_restarts."""
 
     def test_module_spec_has_dependencies_field(self):
-        from titan_plugin.guardian import ModuleSpec
-        from titan_plugin.supervision import Dependency
+        from titan_hcl.guardian import ModuleSpec
+        from titan_hcl.supervision import Dependency
         # Default empty list (existing modules unaffected — byte-identical).
         spec = ModuleSpec(name="x", entry_fn=lambda *a, **k: None)
         assert spec.dependencies == []
@@ -667,7 +655,7 @@ class TestPythonGuardianSupervisionEmit:
         assert isinstance(spec_with_deps.dependencies, list)
 
     def test_module_info_has_reason_buffer(self):
-        from titan_plugin.guardian import ModuleInfo, ModuleSpec
+        from titan_hcl.guardian import ModuleInfo, ModuleSpec
         spec = ModuleSpec(name="x", entry_fn=lambda *a, **k: None)
         info = ModuleInfo(spec=spec)
         # reason_buffer is a deque with maxlen 16 (SPEC §11.B step 3).
@@ -677,7 +665,7 @@ class TestPythonGuardianSupervisionEmit:
         assert info.last_escalation_id is None
 
     def test_guardian_imports_supervision_messages(self):
-        src = _read_source("titan_plugin/guardian.py")
+        src = _read_source("titan_hcl/guardian.py")
         # All 6 SUPERVISION_* constants imported from .bus
         for const_name in (
             "SUPERVISION_CHILD_DOWN",
@@ -693,7 +681,7 @@ class TestPythonGuardianSupervisionEmit:
             )
 
     def test_guardian_restart_emits_child_down_and_restarted(self):
-        src = _read_source("titan_plugin/guardian.py")
+        src = _read_source("titan_hcl/guardian.py")
         # restart() must publish SUPERVISION_CHILD_DOWN before stop + start
         # AND SUPERVISION_CHILD_RESTARTED after successful start.
         # Pattern: both message types appear inside restart() body.
@@ -714,7 +702,7 @@ class TestPythonGuardianSupervisionEmit:
         )
 
     def test_guardian_handles_escalation_per_spec(self):
-        src = _read_source("titan_plugin/guardian.py")
+        src = _read_source("titan_hcl/guardian.py")
         # _handle_escalation must use kernel_default_decision (in-process)
         # + emit SUPERVISION_ESCALATION + handle all 3 EscalationDecision
         # variants per SPEC §11.B.1.
@@ -741,7 +729,7 @@ class TestBusSpecsSupervisionParity:
     Rust SPECS phf_map priorities (parity test from Commit 5)."""
 
     def test_supervision_messages_in_python_msg_specs(self):
-        from titan_plugin.bus_specs import MSG_SPECS
+        from titan_hcl.bus_specs import MSG_SPECS
         for msg_type, expected_priority in [
             ("SUPERVISION_CHILD_DOWN", 0),
             ("SUPERVISION_CHILD_RESTARTED", 0),
@@ -768,7 +756,7 @@ class TestDefaultOffPathPreserved:
 
     def test_config_default_is_false(self):
         """config.toml ships l0_rust_enabled = false."""
-        src = _read_source("titan_plugin/config.toml")
+        src = _read_source("titan_hcl/config.toml")
         m = re.search(r'^l0_rust_enabled\s*=\s*false\s*$', src, re.MULTILINE)
         assert m is not None, (
             "config.toml must default l0_rust_enabled = false "
@@ -778,7 +766,7 @@ class TestDefaultOffPathPreserved:
     def test_kernel_gates_use_get_with_false_default(self):
         """All kernel.py l0_rust gates default to False on missing key —
         guarantees that a config without the key still picks the legacy path."""
-        src = _read_source("titan_plugin/core/kernel.py")
+        src = _read_source("titan_hcl/core/kernel.py")
         # Every l0_rust_enabled lookup must specify False as the default.
         # Extract every lookup and verify.
         lookups = re.findall(

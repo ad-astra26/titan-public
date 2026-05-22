@@ -4,7 +4,7 @@ Locks the fix for the 2026-04-28 BUS_HANDOFF_ACK blind spot.
 
 The pre-fix scanner filtered AST findings by `msg_type in known_types`,
 silently skipping any literal that wasn't a registered constant in
-`titan_plugin/bus.py`. That made the scanner blind to exactly the drift
+`titan_hcl/bus.py`. That made the scanner blind to exactly the drift
 class it was meant to catch (literals bypassing constant registration).
 
 After fix: every `make_msg("...", ...)` / `_send_msg(q, "...", ...)`
@@ -13,7 +13,7 @@ literal that looks like a bus msg type (UPPER_SNAKE_CASE) but is NOT in
 
 These tests are isolated — they construct a tmp directory with a fake
 bus.py and a fake worker, then run the scanner against it. No reliance
-on the live titan_plugin tree.
+on the live titan_hcl tree.
 """
 from __future__ import annotations
 

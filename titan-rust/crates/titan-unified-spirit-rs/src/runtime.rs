@@ -188,17 +188,27 @@ impl Runtime {
 
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
-        // Step 7: spawn body_cycle_publisher
+        // §G5.1 / D-SPEC-96 D4: GREAT-pulse → unified filter_down channel.
+        // The dispatch loop's advance callback sends the GREAT count here;
+        // the publisher task computes + publishes UNIFIED_SPIRIT_FILTER_DOWN
+        // once per GREAT pulse (event, not per-tick).
+        let (great_pulse_tx, great_pulse_rx) = watch::channel(0u64);
+
+        // Step 7: spawn body_cycle_publisher (also publishes Phase B SHM
+        // metadata slots per rFP_phase_c_state_read_unification §B).
         let publisher_handle = spawn_publisher_task(
             shm_dir.clone(),
             cadence_ms,
             engine.clone(),
+            detector.clone(),
+            spirit.clone(),
             bus_client.clone(),
             shutdown_flag.clone(),
+            great_pulse_rx,
         );
 
         // Step 8: spawn bus dispatch loop
-        let on_big_pulse = build_advance_callback(spirit.clone(), detector.clone());
+        let on_big_pulse = build_advance_callback(spirit.clone(), detector.clone(), great_pulse_tx);
         let dispatch_handle = tokio::spawn({
             let client = bus_client.clone();
             let det = detector.clone();
@@ -359,15 +369,22 @@ impl Runtime {
     }
 }
 
-/// Body-cycle publisher task — every `cadence_ms`, polls self_162d
-/// slot, publishes UNIFIED_SPIRIT_SELF_ASSEMBLED + (when not cold-start)
-/// UNIFIED_SPIRIT_FILTER_DOWN per SPEC §10.G + §10.F.
+/// Body-cycle publisher task — every `cadence_ms`, polls self_162d slot,
+/// publishes UNIFIED_SPIRIT_SELF_ASSEMBLED (per-cycle signal), feeds the
+/// V5 engine a transition + trains it (§G5.1 / D-SPEC-96 D3 closure), and
+/// publishes UNIFIED_SPIRIT_FILTER_DOWN ONLY on a new GREAT pulse
+/// (§G5.1 / D4 closure — unified filter_down is a GREAT-gated EVENT).
+/// SHM metadata slots are published per-cycle for observability.
+#[allow(clippy::too_many_arguments)]
 fn spawn_publisher_task(
     shm_dir: PathBuf,
     cadence_ms: u64,
     engine: Arc<Mutex<FilterDownV5Engine>>,
+    detector: Arc<Mutex<ResonanceDetector>>,
+    spirit: Arc<Mutex<UnifiedSpirit>>,
     bus_client: Arc<BusClient>,
     shutdown_flag: Arc<AtomicBool>,
+    great_pulse_rx: watch::Receiver<u64>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Open self_162d slot read-only handle (separate from body_cycle_loop's writer)
@@ -380,10 +397,31 @@ fn spawn_publisher_task(
             }
         };
 
+        // Phase B: open 3 Rust-owned metadata slots (rFP §B / D-SPEC-72).
+        // Open-once + write-per-tick mirrors the self_162d pattern above.
+        // Failure logged once; publisher continues without metadata slots
+        // (B.7 cascade verifies kernel pre-created them).
+        let mut metadata_pub =
+            match crate::metadata_publisher::MetadataPublisher::open_all(&shm_dir) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    warn!(
+                        event = "METADATA_PUBLISHER_FAIL_OPEN",
+                        err = ?e,
+                        "Phase B metadata slots unavailable — proceeding with bus-only publish path"
+                    );
+                    None
+                }
+            };
+
         let mut tick = tokio::time::interval(Duration::from_millis(cadence_ms));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut epoch_id: u64 = 0;
+        // §G5.1 / D3: previous 162D SELF snapshot for the TD(0) transition.
+        let mut prev_self: Option<[f64; ASM_SELF_DIMS]> = None;
+        // §G5.1 / D4: GREAT count last published as a filter_down event.
+        let mut last_published_great: u64 = 0;
         info!(event = "PUBLISHER_LOOP_START", cadence_ms = cadence_ms);
 
         loop {
@@ -420,38 +458,77 @@ fn spawn_publisher_task(
                 .publish(
                     "UNIFIED_SPIRIT_SELF_ASSEMBLED",
                     Some("all"),
-                    Some(&assembled_payload),
+                    Some(assembled_payload),
                 )
                 .await
             {
                 warn!(event = "PUBLISHER_PUBLISH_FAIL", msg = "UNIFIED_SPIRIT_SELF_ASSEMBLED", err = ?e);
             }
 
-            // Compute multipliers + publish UNIFIED_SPIRIT_FILTER_DOWN (P1)
-            let multipliers = engine.lock().compute_multipliers(&self_162_f64);
-            let fd_payload = encode_filter_down_payload(&multipliers, epoch_id, ts);
-            if let Err(e) = bus_client
-                .publish("UNIFIED_SPIRIT_FILTER_DOWN", Some("all"), Some(&fd_payload))
-                .await
-            {
-                warn!(event = "PUBLISHER_PUBLISH_FAIL", msg = "UNIFIED_SPIRIT_FILTER_DOWN", err = ?e);
+            // §G5.1 / D3: feed the V5 engine a transition s→s' + train.
+            // Continuous learning builds `total_train_steps` toward the
+            // cold-start floor (2000); `compute_multipliers` keeps emitting
+            // all-1.0 until then, so this has no premature dim effect. The
+            // 130D `felt_curr` is the first 130 dims of the 162D SELF. The
+            // engine internally throttles training via `train_every_n` +
+            // `min_transitions`. The lock + thread_rng are confined to this
+            // synchronous block (dropped before the next .await) so the task
+            // future stays Send.
+            if let Some(prev) = prev_self {
+                let mut felt_curr = [0.0_f64; 130];
+                felt_curr.copy_from_slice(&self_162_f64[0..130]);
+                let mut eng = engine.lock();
+                eng.record_transition(&prev, &self_162_f64, &felt_curr);
+                let mut rng = rand::thread_rng();
+                eng.maybe_train(&mut rng);
+            }
+            prev_self = Some(self_162_f64);
+
+            // §G5.1 / D4: publish UNIFIED_SPIRIT_FILTER_DOWN ONLY on a new
+            // GREAT pulse. The advance callback bumps `great_pulse_rx` with
+            // the GREAT count; we compute the multipliers from the freshest
+            // SELF and publish once per pulse (event, not per Schumann tick).
+            let great_count = *great_pulse_rx.borrow();
+            if great_count > last_published_great {
+                last_published_great = great_count;
+                let multipliers = engine.lock().compute_multipliers(&self_162_f64);
+                let fd_payload = encode_filter_down_payload(&multipliers, great_count, ts);
+                if let Err(e) = bus_client
+                    .publish("UNIFIED_SPIRIT_FILTER_DOWN", Some("all"), Some(fd_payload))
+                    .await
+                {
+                    warn!(event = "PUBLISHER_PUBLISH_FAIL", msg = "UNIFIED_SPIRIT_FILTER_DOWN", err = ?e);
+                } else {
+                    info!(
+                        event = "UNIFIED_FILTER_DOWN_PUBLISHED",
+                        great_pulse_count = great_count,
+                        "GREAT-gated unified filter_down published"
+                    );
+                }
+            }
+
+            // Phase B: publish 3 SHM metadata slots (resonance, unified_spirit,
+            // filter_down). G18 SHM-canonical + G21 single-writer; consumers
+            // read via Python ShmReaderBank instead of bus subscription /
+            // Python-wrapper publishers (B.4 retirement). Per-tick so the
+            // climbing `total_train_steps` + `last_loss` stay observable.
+            if let Some(mp) = metadata_pub.as_mut() {
+                mp.publish(&detector, &spirit, &engine, ts);
             }
         }
     })
 }
 
-/// Encode UNIFIED_SPIRIT_SELF_ASSEMBLED payload `{epoch_id, ts}`.
-fn encode_assembled_payload(epoch_id: u64, ts: f64) -> Vec<u8> {
-    let payload = rmpv::Value::Map(vec![
+/// Build UNIFIED_SPIRIT_SELF_ASSEMBLED payload `{epoch_id, ts}` as
+/// `rmpv::Value::Map` per SPEC §8.6 + §8.10.
+fn encode_assembled_payload(epoch_id: u64, ts: f64) -> rmpv::Value {
+    rmpv::Value::Map(vec![
         (
             rmpv::Value::String("epoch_id".into()),
             rmpv::Value::Integer(rmpv::Integer::from(epoch_id)),
         ),
         (rmpv::Value::String("ts".into()), rmpv::Value::F64(ts)),
-    ]);
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, &payload).expect("known-good payload");
-    buf
+    ])
 }
 
 /// Build child env for daemon spawns — pass through identifying vars.
@@ -492,9 +569,7 @@ mod tests {
     #[test]
     fn encode_assembled_payload_round_trips() {
         // C4-5 test 1: assembled payload schema {epoch_id, ts}
-        let bytes = encode_assembled_payload(42, 1234567890.5);
-        let v: rmpv::Value =
-            rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes[..])).unwrap();
+        let v = encode_assembled_payload(42, 1234567890.5);
         if let rmpv::Value::Map(entries) = v {
             let mut got_epoch = None;
             let mut got_ts = None;

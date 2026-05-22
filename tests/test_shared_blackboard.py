@@ -2,8 +2,8 @@
 import threading
 import time
 import pytest
-from titan_plugin.shared_blackboard import SharedBlackboard
-from titan_plugin.bus import DivineBus, BODY_STATE, MIND_STATE, IMPULSE
+from titan_hcl.shared_blackboard import SharedBlackboard
+from titan_hcl.bus import DivineBus, BODY_STATE, MIND_STATE, IMPULSE
 
 
 class TestSharedBlackboard:

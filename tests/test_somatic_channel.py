@@ -6,10 +6,10 @@ Verifies that:
     approve and decline
   - Bus failures are caught and logged (no crash)
 """
-from titan_plugin.maker.schemas import (
+from titan_hcl.maker.schemas import (
     ProposalRecord, ProposalStatus, ProposalType,
 )
-from titan_plugin.maker.somatic_channel import SomaticChannel
+from titan_hcl.maker.somatic_channel import SomaticChannel
 
 
 class FakeBus:

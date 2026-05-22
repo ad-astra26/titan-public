@@ -1,4 +1,4 @@
-//! tick_loop — outer-mind jittered ~5s tick + state machine.
+//! tick_loop — outer-mind Schumann-locked tick (23.49 Hz) + state machine.
 //!
 //! Per SPEC §9.A `titan-outer-mind-rs` row + §18.1 + master plan §10.6 C6-4.
 //! Logic flow per tick:
@@ -26,8 +26,9 @@ use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
     apply_multipliers, compose_multipliers_default, decode_local_filter_down_payload,
-    encode_floats, read_dim_slice, read_sensor_cache, read_topology_outer_lower, ContentGate,
-    FiringSlotWriter, GroundUpEnricher, PublishThrottle, SensorCacheRead, Side, OUTER_MIND_TOPICS,
+    encode_floats, read_dim_slice, read_sensor_cache, read_topology_outer_lower, stateful_update,
+    ContentGate, FiringSlotWriter, GroundUpEnricher, Layer, PublishThrottle, RestoringCfg,
+    SensorCacheRead, Side, OUTER_MIND_TOPICS,
 };
 
 pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()> {
@@ -99,6 +100,9 @@ struct DaemonState {
     unified: Option<[f32; 15]>,
     local: Option<[f32; 15]>,
     topology_signaled: bool,
+    /// Set true on each KERNEL_EPOCH_TICK; consumed by the tick loop to
+    /// recompute the ground_up held nudge once per epoch (SPEC §G5.1 / 0E).
+    epoch_pending: bool,
     shutdown_requested: bool,
     last_mind: [f32; 15],
 }
@@ -109,6 +113,7 @@ impl Default for DaemonState {
             unified: None,
             local: None,
             topology_signaled: false,
+            epoch_pending: false,
             shutdown_requested: false,
             last_mind: [0.5; 15],
         }
@@ -185,15 +190,24 @@ fn handle_bus_message(msg_type: &str, raw_bytes: &[u8], state: &Arc<Mutex<Daemon
                 s.topology_signaled = true;
             }
         }
+        "KERNEL_EPOCH_TICK" => {
+            // 0E: mark an epoch boundary — tick loop recomputes the held
+            // ground_up nudge once per epoch (SPEC §G5.1).
+            if let Ok(mut s) = state.lock() {
+                s.epoch_pending = true;
+            }
+        }
         _ => {}
     }
 }
 
-fn decode_unified_outer_mind(payload: &[u8]) -> Result<[f32; 15]> {
+/// Decode the `outer_mind` slice (length 15) from a structured
+/// UNIFIED_SPIRIT_FILTER_DOWN payload. SPEC §8.2 line 789 + §8.10 line 900:
+/// payload is `rmpv::Value::Map` per the §8.6 schema. Closure of
+/// `rFP_worker_broadcast_topics_completion §4.C-ter` (2026-05-13).
+fn decode_unified_outer_mind(payload: &rmpv::Value) -> Result<[f32; 15]> {
     use rmpv::Value;
-    let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(payload))
-        .map_err(|e| anyhow!("payload root: {e}"))?;
-    let map = match &v {
+    let map = match payload {
         Value::Map(items) => items,
         _ => return Err(anyhow!("payload not a map")),
     };
@@ -269,6 +283,9 @@ async fn run_tick_loop(
     let mut content_gate = ContentGate::new();
     let mut ground_up = GroundUpEnricher::new(Side::MindWilling);
     let mut publish_throttle = PublishThrottle::new(OUTER_MIND_BUS_PUBLISH_INTERVAL_S);
+    // §G5.2 traveling-tensor state (x[t-1], x[t-2]); cold-start at 0.5 centre.
+    let mut prev: [f32; 15] = [0.5; 15];
+    let mut prev2: [f32; 15] = [0.5; 15];
 
     info!(
         event = "TICK_LOOP_START",
@@ -293,7 +310,7 @@ async fn run_tick_loop(
                     if let Err(e) = run_one_tick(
                         &bus, &state, &mut content_gate, &mut ground_up, &mut publish_throttle,
                         &mut outer_mind_slot, &topology_slot, &outer_body_slot,
-                        &sensor_cache_path, &mut firing_writer,
+                        &sensor_cache_path, &mut firing_writer, &mut prev, &mut prev2,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
@@ -330,6 +347,8 @@ async fn run_one_tick(
     outer_body_slot: &Slot,
     sensor_cache_path: &Path,
     firing_writer: &mut FiringSlotWriter,
+    prev: &mut [f32; 15],
+    prev2: &mut [f32; 15],
 ) -> Result<()> {
     let last_mind = {
         let s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
@@ -340,9 +359,11 @@ async fn run_one_tick(
     let outer_body_5d = read_dim_slice::<5>(outer_body_slot).unwrap_or([0.5_f32; 5]);
     let mut mind = read_outer_mind_from_cache(sensor_cache_path, last_mind, outer_body_5d);
 
-    let (unified_mult, local_mult, topology_fresh) = {
-        let s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
-        (s.unified, s.local, s.topology_signaled)
+    let (unified_mult, local_mult, topology_fresh, epoch_due) = {
+        let mut s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
+        let epoch_due = s.epoch_pending;
+        s.epoch_pending = false;
+        (s.unified, s.local, s.topology_signaled, epoch_due)
     };
 
     let composed: Vec<f32> = match (unified_mult, local_mult) {
@@ -356,15 +377,31 @@ async fn run_one_tick(
 
     // Per SPEC G10: ground_up applies to willing[10:15] ONLY.
     // Thinking[0:5] + Feeling[5:10] are NEVER grounded.
+    // 0E held-nudge model (SPEC §G5.1): RECOMPUTE the damped nudge ONCE per
+    // kernel epoch, then APPLY the held nudge every tick (continuous,
+    // no compounding — mind is rebuilt from raw each tick).
     if topology_fresh {
-        if let Ok(topology_lower) = read_topology_outer_lower(topology_slot) {
-            ground_up.apply_to_mind(&mut mind, &topology_lower, 1.0)?;
+        if epoch_due {
+            if let Ok(topology_lower) = read_topology_outer_lower(topology_slot) {
+                ground_up.compute_nudge(&topology_lower);
+            }
         }
+        ground_up.apply_held_to_mind(&mut mind, 1.0)?;
     }
 
     if let Ok(mut s) = state.lock() {
         s.last_mind = mind;
     }
+
+    // §G5.2 traveling-tensor update (Layer::Mind). `last_mind` keeps the
+    // producer/drive value for stale fallback; `x` (traveling state) is written.
+    let cfg = RestoringCfg::for_layer(Layer::Mind);
+    let x = stateful_update(&prev[..], &prev2[..], &mind[..], &cfg);
+    let mut mind_state = [0.0_f32; 15];
+    mind_state.copy_from_slice(&x[..15]);
+    *prev2 = *prev;
+    *prev = mind_state;
+    let mind = mind_state;
 
     let bytes = encode_floats::<15>(&mind);
     if content_gate.should_write(&bytes) {
@@ -383,7 +420,7 @@ async fn run_one_tick(
     // full tick cadence under content-hash gating.
     if publish_throttle.should_publish() {
         let payload = encode_mind_state_payload(&mind);
-        bus.publish("MIND_STATE", Some("all"), Some(&payload))
+        bus.publish("MIND_STATE", Some("all"), Some(payload))
             .await
             .map_err(|e| anyhow!("publish MIND_STATE: {e}"))?;
     }
@@ -425,8 +462,8 @@ fn read_outer_mind_from_cache(
 
 // ── V6 outer_mind_15d full port ────────────────────────────────────
 //
-// Byte-faithful port of `titan_plugin/logic/outer_mind_tensor.py::collect_outer_mind_15d`
-// (lines 35-173) wrapping `titan_plugin/logic/outer_trinity.py::_collect_extended`
+// Byte-faithful port of `titan_hcl/logic/outer_mind_tensor.py::collect_outer_mind_15d`
+// (lines 35-173) wrapping `titan_hcl/logic/outer_trinity.py::_collect_extended`
 // preprocessing (lines 592-712 — the subset that feeds the 15D mind formula).
 //
 // Closes rFP_phase_c_close_all_runtime_gaps chunk 9I — supersedes the
@@ -474,11 +511,8 @@ pub fn project_outer_mind_15d(payload: &[u8], outer_body: [f32; 5]) -> Result<[f
     let meta_cgn = lookup_map(map, "meta_cgn_stats");
     let cgn = lookup_map(map, "cgn_stats");
     let memory_stats = lookup_map(map, "memory_stats");
-    let language_stats = lookup_map(map, "language_stats");
     let events_teacher = lookup_map(map, "events_teacher_stats");
     let social_x_gateway = lookup_map(map, "social_x_gateway_stats");
-    let output_verifier = lookup_map(map, "output_verifier_stats");
-    let jailbreak_alerts = lookup_map(map, "jailbreak_alerts_stats");
 
     // ── Step 2: Preprocess into derived stats ─
     // Mirrors `_collect_extended` lines 607-694 — only the subset
@@ -490,13 +524,19 @@ pub fn project_outer_mind_15d(payload: &[u8], outer_body: [f32; 5]) -> Result<[f
     // Python: success_rate = (total - failed) / max(1, total)
     let action_success_rate: f64 = (total_actions - failed_actions) / total_actions.max(1.0);
     let action_per_window: f64 = field_or_default(agency.as_ref(), "actions_this_hour", 0.0);
+    // SPEC §23.8 D-SPEC-87 Phase 3.F wave 3a (2026-05-18) — 24h smoothing
+    // variant feeds willing[10] action_throughput with divisor /240 (was
+    // per_hour/10 → per_day/(10*24)). Eliminates bursty-window misses for
+    // active Titans whose actions cluster around quiet hours.
+    let action_per_day: f64 = field_or_default(agency.as_ref(), "actions_this_day", 0.0);
 
     // creative_stats — derived (lines 624-653); only `per_window` consumed
     let creative_per_window: f64 = field_or_default(agency.as_ref(), "creative_this_hour", 0.0);
+    // D-SPEC-87 24h smoothing for willing[12] creative_output (divisor /120).
+    let creative_per_day: f64 = field_or_default(agency.as_ref(), "creative_this_day", 0.0);
 
     // guardian_stats — derived (lines 656-661); only `rejections_per_window`
-    let rejections_per_window: f64 =
-        field_or_default(agency.as_ref(), "rejections_this_hour", 0.0);
+    let rejections_per_window: f64 = field_or_default(agency.as_ref(), "rejections_this_hour", 0.0);
 
     // social_stats — derived (lines 664-672)
     let interactions_per_window: f64 =
@@ -568,15 +608,18 @@ pub fn project_outer_mind_15d(payload: &[u8], outer_body: [f32; 5]) -> Result<[f
     thinking[4] = safe_clamp(assessment_mean);
     // Suppress unused-var warnings for legacy research_* now that
     // thinking[0,2] use the redesigned formulas.
-    let _ = (research_queries, research_usage_rate, research_seconds_since_last);
+    let _ = (
+        research_queries,
+        research_usage_rate,
+        research_seconds_since_last,
+    );
 
     // ── FEELING (5D) — outer_mind_tensor.py:96-148 ──
     let mut feeling = [0.5_f64; 5];
 
     // Shared social_activity score (lines 100-102)
-    let social_activity = safe_clamp(
-        (interactions_per_window / 5.0).min(1.0) * 0.5 + sentiment_avg * 0.5,
-    );
+    let social_activity =
+        safe_clamp((interactions_per_window / 5.0).min(1.0) * 0.5 + sentiment_avg * 0.5);
 
     // [5] social_temperature (lines 104-107)
     let interaction_rate = (interactions_per_window / 8.0).min(1.0);
@@ -588,8 +631,8 @@ pub fn project_outer_mind_15d(payload: &[u8], outer_body: [f32; 5]) -> Result<[f
         let twin_da = field_or_default(twin_state.as_ref(), "DA", 0.5);
         let twin_ne = field_or_default(twin_state.as_ref(), "NE", 0.5);
         let twin_gaba = field_or_default(twin_state.as_ref(), "GABA", 0.5);
-        let twin_sim = 1.0
-            - ((twin_da - 0.5).abs() + (twin_ne - 0.5).abs() + (twin_gaba - 0.5).abs()) / 3.0;
+        let twin_sim =
+            1.0 - ((twin_da - 0.5).abs() + (twin_ne - 0.5).abs() + (twin_gaba - 0.5).abs()) / 3.0;
         feeling[1] = safe_clamp(0.6 * (0.3 + 0.5 * twin_sim) + 0.4 * social_activity);
     } else {
         feeling[1] = safe_clamp(social_activity);
@@ -603,8 +646,7 @@ pub fn project_outer_mind_15d(payload: &[u8], outer_body: [f32; 5]) -> Result<[f
     let blockchain_active = compute_blockchain_active(anchor_state.as_ref());
     let circadian = outer_body[4] as f64;
     let net_oscillation = outer_body[3] as f64;
-    feeling[3] =
-        safe_clamp(0.35 * blockchain_active + 0.35 * circadian + 0.30 * net_oscillation);
+    feeling[3] = safe_clamp(0.35 * blockchain_active + 0.35 * circadian + 0.30 * net_oscillation);
 
     // [9] external_information_flow (lines 139-148)
     let bus_published: f64 = field_or_default(bus_stats.as_ref(), "published", 0.0);
@@ -621,52 +663,33 @@ pub fn project_outer_mind_15d(payload: &[u8], outer_body: [f32; 5]) -> Result<[f
     // ── WILLING (5D) — outer_mind_tensor.py:150-171 ──
     // SPEC §23.8 willing[1,3,4] updated 2026-05-07 (Phase 1 redesign).
     let mut willing = [0.5_f64; 5];
-    // [10] action_throughput — unchanged
-    willing[0] = safe_clamp((action_per_window / 10.0).min(1.0));
-
-    // [11] social_initiative — SPEC §23.8 wiring fix:
-    // min(1, (social_x_gateway.posts_last_hour + replies_last_hour) / 5)
-    // Replaces hardcoded social_outputs_per_window=0.0 (was always 0).
-    let posts_last_hour: f64 =
-        field_or_default(social_x_gateway.as_ref(), "posts_last_hour", 0.0);
-    let replies_last_hour: f64 =
-        field_or_default(social_x_gateway.as_ref(), "replies_last_hour", 0.0);
-    willing[1] = safe_clamp(((posts_last_hour + replies_last_hour) / 5.0).min(1.0));
-    let _ = social_outputs_per_window; // legacy var, replaced
-
-    // [12] creative_output — unchanged
-    willing[2] = safe_clamp((creative_per_window / 5.0).min(1.0));
-
-    // [13] protective_response — SPEC §23.8 REDESIGNED:
-    // min(1, total_rejections_per_hour / 5) where total = output_verifier.rejected_per_hour
-    // + jailbreak.defended_per_hour + reflex.boundary_blocked_per_hour.
-    // Divisor changed 3 → 5 per SPEC. reflex_stats not yet in SOURCE_KEYS →
-    // boundary_blocked_per_hour defaults to 0; willing[3] still computes
-    // from output_verifier + jailbreak portions.
-    let ov_rejected_per_hour: f64 =
-        field_or_default(output_verifier.as_ref(), "rejected_per_hour", 0.0);
-    let jb_defended_per_hour: f64 =
-        field_or_default(jailbreak_alerts.as_ref(), "defended_per_hour", 0.0);
-    let reflex_boundary_per_hour: f64 = 0.0; // reflex_stats not yet plumbed
-    let total_rejections_per_hour =
-        ov_rejected_per_hour + jb_defended_per_hour + reflex_boundary_per_hour;
-    willing[3] = safe_clamp((total_rejections_per_hour / 5.0).min(1.0));
-    let _ = rejections_per_window; // legacy var, replaced
-
-    // [14] exploration_drive — SPEC §23.8 REDESIGNED:
-    // 0.40*min(1, cgn.grounded_density/2) + 0.30*min(1, language.teacher_sessions_last_hour/3)
-    // + 0.30*min(1, meta_cgn.eureka_accelerated_per_hour/5)
-    let cgn_grounded_density: f64 = field_or_default(cgn.as_ref(), "grounded_density", 0.0);
-    let lang_teacher_sessions: f64 =
-        field_or_default(language_stats.as_ref(), "teacher_sessions_last_hour", 0.0);
-    let mc_eureka_per_hour: f64 =
-        field_or_default(meta_cgn.as_ref(), "eureka_accelerated_per_hour", 0.0);
-    willing[4] = safe_clamp(
-        0.40 * (cgn_grounded_density / 2.0).min(1.0)
-            + 0.30 * (lang_teacher_sessions / 3.0).min(1.0)
-            + 0.30 * (mc_eureka_per_hour / 5.0).min(1.0),
+    // willing[10..14] RE-GROUNDED (D-SPEC-101 Phase-2, Maker 2026-05-21):
+    //   ~90s fast-EMA breath at the 23.49 Hz mind cadence, replacing the
+    //   D-SPEC-87 24h-rolling-count normalizations (action_per_day/240,
+    //   (posts+replies)_day/120, …) that barely moved. The plugin willing-
+    //   window tracker emits a dual-EMA breath over cumulative volitional
+    //   counters — action (total_actions) / social (SOCIAL composite fires) /
+    //   creative (ART+MUSIC fires) / protective (verifier rejections) /
+    //   exploration (vocab + grounded primitives). Old per-day path deleted
+    //   (no shim) per SPEC §23.8.
+    let ww = lookup_map(map, "willing_window");
+    willing[0] = safe_clamp(field_or_default(ww.as_ref(), "action_rate", 0.0)); // [10] action_throughput
+    willing[1] = safe_clamp(field_or_default(ww.as_ref(), "social_rate", 0.0)); // [11] social_initiative
+    willing[2] = safe_clamp(field_or_default(ww.as_ref(), "creative_rate", 0.0)); // [12] creative_output
+    willing[3] = safe_clamp(field_or_default(ww.as_ref(), "protective_rate", 0.0)); // [13] protective_response
+    willing[4] = safe_clamp(field_or_default(ww.as_ref(), "exploration_rate", 0.0)); // [14] exploration_drive
+                                                                                     // Preprocessing vars superseded by the willing-window breath (kept as
+                                                                                     // upstream lookups for the thinking/feeling dims; the willing-only ones
+                                                                                     // are explicitly discarded here).
+    let _ = (
+        action_per_window,
+        action_per_day,
+        social_outputs_per_window,
+        creative_per_window,
+        creative_per_day,
+        rejections_per_window,
+        research_queries_per_window,
     );
-    let _ = research_queries_per_window; // legacy var, replaced
 
     // ── Final: cast f64 → f32. Python does NOT `round(v, 4)` here
     // (unlike `_collect_outer_body`); preserve full f32 precision. ─
@@ -712,11 +735,7 @@ fn lookup_map(
 }
 
 /// Look up a numeric field within a sub-map; default if missing/non-numeric.
-fn field_or_default(
-    map: Option<&Vec<(rmpv::Value, rmpv::Value)>>,
-    key: &str,
-    default: f64,
-) -> f64 {
+fn field_or_default(map: Option<&Vec<(rmpv::Value, rmpv::Value)>>, key: &str, default: f64) -> f64 {
     let map = match map {
         Some(m) => m,
         None => return default,
@@ -820,10 +839,12 @@ fn open_slot(shm_dir: &Path, name: &str) -> Result<Slot> {
     Slot::open(&path).with_context(|| format!("open slot {}", path.display()))
 }
 
-fn encode_mind_state_payload(mind: &[f32; 15]) -> Vec<u8> {
+/// Build a SPEC §8.5 outer `MIND_STATE` payload as `rmpv::Value::Map` per
+/// SPEC §8.10 line 900 byte-identical guarantee.
+fn encode_mind_state_payload(mind: &[f32; 15]) -> rmpv::Value {
     use rmpv::Value;
     let values = Value::Array(mind.iter().map(|f| Value::F64(*f as f64)).collect());
-    let map = Value::Map(vec![
+    Value::Map(vec![
         (Value::String("src".into()), Value::String("outer".into())),
         (
             Value::String("type".into()),
@@ -831,11 +852,7 @@ fn encode_mind_state_payload(mind: &[f32; 15]) -> Vec<u8> {
         ),
         (Value::String("values".into()), values),
         (Value::String("ts".into()), Value::F64(now_secs())),
-    ]);
-    let mut out = Vec::with_capacity(192);
-    rmpv::encode::write_value(&mut out, &map)
-        .expect("rmpv encode never fails on well-formed Value");
-    out
+    ])
 }
 
 fn now_secs() -> f64 {
@@ -866,8 +883,11 @@ mod tests {
             (None, None) => vec![1.0_f32; 15],
         };
         apply_multipliers(&mut mind, &composed);
+        // 0E: Some(topo) models an epoch boundary — recompute the held nudge,
+        // then apply it (the per-tick application path).
         if let Some(topo) = topology_lower {
-            ground_up.apply_to_mind(&mut mind, &topo, 1.0).unwrap();
+            ground_up.compute_nudge(&topo);
+            ground_up.apply_held_to_mind(&mut mind, 1.0).unwrap();
         }
         mind
     }
@@ -948,7 +968,7 @@ mod tests {
         let mind = [0.0_f32; 15];
         let bytes = encode_mind_state_payload(&mind);
         use rmpv::Value;
-        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let v: Value = bytes; // §4.C-ter: encode_*_payload now returns Value directly
         if let Value::Map(items) = v {
             for (k, val) in items {
                 if let Value::String(s) = k {
@@ -967,7 +987,7 @@ mod tests {
         let mind = [0.0_f32; 15];
         let bytes = encode_mind_state_payload(&mind);
         use rmpv::Value;
-        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let v: Value = bytes; // §4.C-ter: encode_*_payload now returns Value directly
         if let Value::Map(items) = v {
             for (k, val) in items {
                 if let Value::String(s) = k {
@@ -1031,8 +1051,60 @@ mod tests {
         assert!((mind[8] - 0.5).abs() < 1e-3);
         assert!((mind[9] - 0.03).abs() < 1e-3);
         for i in 10..15 {
-            assert!((mind[i] - 0.0).abs() < 1e-3, "willing[{}] = {}", i - 10, mind[i]);
+            assert!(
+                (mind[i] - 0.0).abs() < 1e-3,
+                "willing[{}] = {}",
+                i - 10,
+                mind[i]
+            );
         }
+    }
+
+    #[test]
+    fn project_outer_mind_willing_window_drives_willing_dims() {
+        // D-SPEC-101 Phase-2 (Maker 2026-05-21): willing[10-14] read the ~90s
+        // breath from the plugin willing-window tracker (action/social/creative/
+        // protective/exploration rates), replacing the D-SPEC-87 24h per-day
+        // normalizations.
+        use rmpv::Value;
+        let payload = Value::Map(vec![(
+            Value::String("willing_window".into()),
+            Value::Map(vec![
+                (Value::String("action_rate".into()), Value::F64(0.61)),
+                (Value::String("social_rate".into()), Value::F64(0.22)),
+                (Value::String("creative_rate".into()), Value::F64(0.48)),
+                (Value::String("protective_rate".into()), Value::F64(0.13)),
+                (Value::String("exploration_rate".into()), Value::F64(0.37)),
+            ]),
+        )]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &payload).unwrap();
+        let mind = project_outer_mind_15d(&bytes, [0.5_f32; 5]).unwrap();
+        assert!(
+            (mind[10] - 0.61).abs() < 1e-4,
+            "action_throughput={}",
+            mind[10]
+        );
+        assert!(
+            (mind[11] - 0.22).abs() < 1e-4,
+            "social_initiative={}",
+            mind[11]
+        );
+        assert!(
+            (mind[12] - 0.48).abs() < 1e-4,
+            "creative_output={}",
+            mind[12]
+        );
+        assert!(
+            (mind[13] - 0.13).abs() < 1e-4,
+            "protective_response={}",
+            mind[13]
+        );
+        assert!(
+            (mind[14] - 0.37).abs() < 1e-4,
+            "exploration_drive={}",
+            mind[14]
+        );
     }
 
     #[test]
@@ -1105,10 +1177,7 @@ mod tests {
         let payload = Value::Map(vec![(
             Value::String("twin_state".into()),
             Value::Map(vec![
-                (
-                    Value::String("reachable".into()),
-                    Value::Boolean(true),
-                ),
+                (Value::String("reachable".into()), Value::Boolean(true)),
                 (Value::String("DA".into()), Value::F64(0.5)),
                 (Value::String("NE".into()), Value::F64(0.5)),
                 (Value::String("GABA".into()), Value::F64(0.5)),
@@ -1121,37 +1190,32 @@ mod tests {
     }
 
     #[test]
-    fn project_outer_mind_action_per_window_drives_willing_0() {
-        // actions_this_hour = 5 → willing[0] = clamp(5/10) = 0.5
+    fn project_outer_mind_willing_ignores_legacy_per_day_counts() {
+        // D-SPEC-101 Phase-2 (Maker 2026-05-21): willing[10-14] no longer read
+        // the D-SPEC-87 24h per-day counts (actions_this_day/240,
+        // creative_this_day/120, …) — they read the ~90s willing-window breath.
+        // Feeding agency per-day counts alone leaves willing at the absent-
+        // window default 0.0 (the breath comes from willing_window — see
+        // project_outer_mind_willing_window_drives_willing_dims).
         use rmpv::Value;
         let payload = Value::Map(vec![(
             Value::String("agency_stats".into()),
-            Value::Map(vec![(
-                Value::String("actions_this_hour".into()),
-                Value::Integer(5.into()),
-            )]),
+            Value::Map(vec![
+                (
+                    Value::String("actions_this_day".into()),
+                    Value::Integer(120.into()),
+                ),
+                (
+                    Value::String("creative_this_day".into()),
+                    Value::Integer(72.into()),
+                ),
+            ]),
         )]);
         let mut bytes = Vec::new();
         rmpv::encode::write_value(&mut bytes, &payload).unwrap();
         let mind = project_outer_mind_15d(&bytes, [0.5_f32; 5]).unwrap();
-        assert!((mind[10] - 0.5).abs() < 1e-3, "willing[0] = {}", mind[10]);
-    }
-
-    #[test]
-    fn project_outer_mind_creative_drives_willing_2() {
-        // creative_this_hour = 3 → willing[2] = clamp(3/5) = 0.6
-        use rmpv::Value;
-        let payload = Value::Map(vec![(
-            Value::String("agency_stats".into()),
-            Value::Map(vec![(
-                Value::String("creative_this_hour".into()),
-                Value::Integer(3.into()),
-            )]),
-        )]);
-        let mut bytes = Vec::new();
-        rmpv::encode::write_value(&mut bytes, &payload).unwrap();
-        let mind = project_outer_mind_15d(&bytes, [0.5_f32; 5]).unwrap();
-        assert!((mind[12] - 0.6).abs() < 1e-3, "willing[2] = {}", mind[12]);
+        assert_eq!(mind[10], 0.0, "willing[0] should ignore actions_this_day");
+        assert_eq!(mind[12], 0.0, "willing[2] should ignore creative_this_day");
     }
 
     #[test]
@@ -1221,9 +1285,7 @@ mod tests {
                 Value::Array(mults_arr),
             )]),
         )]);
-        let mut bytes = Vec::new();
-        rmpv::encode::write_value(&mut bytes, &payload).unwrap();
-        let mults = decode_unified_outer_mind(&bytes).unwrap();
+        let mults = decode_unified_outer_mind(&payload).unwrap();
         for i in 0..15 {
             let expected = 0.5_f32 + i as f32 * 0.1;
             assert!((mults[i] - expected).abs() < 1e-5);
@@ -1237,9 +1299,7 @@ mod tests {
             Value::String("multipliers".into()),
             Value::Map(vec![]),
         )]);
-        let mut bytes = Vec::new();
-        rmpv::encode::write_value(&mut bytes, &payload).unwrap();
-        assert!(decode_unified_outer_mind(&bytes).is_err());
+        assert!(decode_unified_outer_mind(&payload).is_err());
     }
 
     #[test]
@@ -1254,15 +1314,16 @@ mod tests {
 
     #[test]
     fn stale_threshold_is_3x_cadence() {
-        // SPEC §18.1: outer_mind cadence 5s × 3 = 15s
-        assert_eq!(outer_mind_stale_threshold_s(), 15.0);
+        // SPEC §18.1 + D-SPEC-100: outer_mind cadence 15s × 3 = 45s
+        assert_eq!(outer_mind_stale_threshold_s(), 45.0);
     }
 
     #[test]
     fn cadence_constants_match_spec() {
-        // Sensor sidecar refresh cadence (post-A.S8 D2: stale threshold source).
-        assert_eq!(OUTER_MIND_TICK_BASE_S, 5.0);
-        // Bus publish throttle (post-A.S8 D2 — Schumann body × 13 ≈ 15s).
+        // Sensor sidecar source-refresh cadence (D-SPEC-100: stale threshold source).
+        // G13: 15s = strict 1:3:9 (spirit 5 / mind 15 / body 45).
+        assert_eq!(OUTER_MIND_TICK_BASE_S, 15.0);
+        // Bus publish throttle (Schumann mind ≈ 15s) — now mirrors TICK_BASE.
         assert_eq!(OUTER_MIND_BUS_PUBLISH_INTERVAL_S, 15.0);
     }
 

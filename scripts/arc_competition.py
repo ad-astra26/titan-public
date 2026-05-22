@@ -40,8 +40,8 @@ from dataclasses import asdict
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from titan_plugin.logic.arc import ArcSDKBridge, GridPerception, ActionMapper, ArcSession, StateActionMemory
-from titan_plugin.logic.neural_reflex_net import NeuralReflexNet
+from titan_hcl.logic.arc import ArcSDKBridge, GridPerception, ActionMapper, ArcSession, StateActionMemory
+from titan_hcl.logic.neural_reflex_net import NeuralReflexNet
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NS_WEIGHTS_DIR = os.path.join(PROJECT_ROOT, "data", "neural_nervous_system")
@@ -60,7 +60,7 @@ def load_arc_config() -> dict:
         import tomllib
     except ImportError:
         import tomli as tomllib
-    params_path = os.path.join(PROJECT_ROOT, "titan_plugin", "titan_params.toml")
+    params_path = os.path.join(PROJECT_ROOT, "titan_hcl", "titan_params.toml")
 
     arc: dict = {}
     if os.path.exists(params_path):
@@ -70,7 +70,7 @@ def load_arc_config() -> dict:
     # Merged config (config.toml + ~/.titan/secrets.toml) overrides titan_params.toml —
     # the api_key secret lives in ~/.titan/secrets.toml.
     try:
-        from titan_plugin.config_loader import load_titan_config
+        from titan_hcl.config_loader import load_titan_config
         override = load_titan_config().get("arc_agi_3", {})
         arc.update(override)
     except Exception:
@@ -388,7 +388,7 @@ def main():
         # Wire reasoning engine (Option B: deliberate cognition during play)
         if args.reasoning:
             try:
-                from titan_plugin.logic.reasoning import ReasoningEngine
+                from titan_hcl.logic.reasoning import ReasoningEngine
                 # Fresh reasoning engine per game — learns ARC-specific chains
                 re_config = {
                     "max_chain_length": 10,

@@ -1,6 +1,6 @@
 """Tests for Step 7.6 — SelfAssessment (IQL self-scoring and enrichment routing)."""
 import pytest
-from titan_plugin.logic.agency.assessment import SelfAssessment, ENRICHMENT_MAP
+from titan_hcl.logic.agency.assessment import SelfAssessment, ENRICHMENT_MAP
 
 
 def _make_action_result(

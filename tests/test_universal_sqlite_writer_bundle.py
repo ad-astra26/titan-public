@@ -23,7 +23,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from titan_plugin.persistence.config import IMWConfig
+from titan_hcl.persistence.config import IMWConfig
 
 
 # ── Configuration loading ───────────────────────────────────────────────
@@ -83,9 +83,9 @@ def test_consciousness_db_constructs_writer_client_in_production(
 ):
     """ConsciousnessDB() in production constructs writer client when
     [persistence_consciousness].enabled = true."""
-    from titan_plugin.persistence import config as cfg_mod
-    from titan_plugin.persistence import writer_client as wc_mod
-    from titan_plugin.logic.consciousness import ConsciousnessDB
+    from titan_hcl.persistence import config as cfg_mod
+    from titan_hcl.persistence import writer_client as wc_mod
+    from titan_hcl.logic.consciousness import ConsciousnessDB
 
     real_db = tmp_path / "consciousness.db"
     real_db.write_bytes(b"")
@@ -117,7 +117,7 @@ def test_consciousness_db_constructs_writer_client_in_production(
 
 def test_consciousness_insert_epoch_routes_through_writer():
     """ConsciousnessDB.insert_epoch routes through writer when client present."""
-    from titan_plugin.logic.consciousness import ConsciousnessDB, EpochRecord
+    from titan_hcl.logic.consciousness import ConsciousnessDB, EpochRecord
 
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         mock_writer = MagicMock()
@@ -139,9 +139,9 @@ def test_consciousness_insert_epoch_routes_through_writer():
 def test_social_graph_constructs_writer_client(monkeypatch, tmp_path):
     """SocialGraph() constructs writer client when [persistence_social_graph]
     is enabled — infrastructure presence (per-site refactor is followup)."""
-    from titan_plugin.persistence import config as cfg_mod
-    from titan_plugin.persistence import writer_client as wc_mod
-    from titan_plugin.core.social_graph import SocialGraph
+    from titan_hcl.persistence import config as cfg_mod
+    from titan_hcl.persistence import writer_client as wc_mod
+    from titan_hcl.core.social_graph import SocialGraph
 
     real_db = tmp_path / "social_graph.db"
     monkeypatch.chdir(tmp_path)
@@ -172,9 +172,9 @@ def test_social_graph_constructs_writer_client(monkeypatch, tmp_path):
 
 def test_events_teacher_db_constructs_writer_client(monkeypatch, tmp_path):
     """EventsTeacherDB() constructs writer client when section enabled."""
-    from titan_plugin.persistence import config as cfg_mod
-    from titan_plugin.persistence import writer_client as wc_mod
-    from titan_plugin.logic.events_teacher import EventsTeacherDB
+    from titan_hcl.persistence import config as cfg_mod
+    from titan_hcl.persistence import writer_client as wc_mod
+    from titan_hcl.logic.events_teacher import EventsTeacherDB
 
     real_db = tmp_path / "events_teacher.db"
     monkeypatch.chdir(tmp_path)
@@ -206,7 +206,7 @@ def test_events_teacher_db_constructs_writer_client(monkeypatch, tmp_path):
 def test_social_graph_route_write_direct_fallback_when_no_writer(tmp_path):
     """SocialGraph._route_write must fall back to direct sqlite3 when
     writer is None (current state for most call sites pre-refactor)."""
-    from titan_plugin.core.social_graph import SocialGraph
+    from titan_hcl.core.social_graph import SocialGraph
 
     db_file = tmp_path / "social_graph.db"
     sg = SocialGraph(db_path=str(db_file), writer_client=None)
@@ -233,7 +233,7 @@ def test_social_graph_route_write_direct_fallback_when_no_writer(tmp_path):
 
 def test_events_teacher_route_write_direct_fallback_when_no_writer(tmp_path):
     """EventsTeacherDB._route_write fallback safety."""
-    from titan_plugin.logic.events_teacher import EventsTeacherDB
+    from titan_hcl.logic.events_teacher import EventsTeacherDB
 
     db_file = tmp_path / "events_teacher.db"
     et = EventsTeacherDB(db_path=str(db_file), writer_client=None)

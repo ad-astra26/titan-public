@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from titan_plugin.core.state_registry import (
+from titan_hcl.core.state_registry import (
     EPOCH_COUNTER,
     HEADER_SIZE,
     HEADER_STRUCT,
@@ -105,7 +105,7 @@ def test_resolve_shm_root_falls_through_to_canonical_resolver(monkeypatch):
 
 
 def test_resolve_titan_id_env_override(monkeypatch):
-    from titan_plugin.core import state_registry
+    from titan_hcl.core import state_registry
     monkeypatch.setenv("TITAN_ID", "T_CUSTOM")
     # The canonical precedence chain checks data/titan_identity.json BEFORE
     # the env var, so we must monkeypatch the file-existence check to a
@@ -126,7 +126,7 @@ def test_resolve_titan_id_env_override(monkeypatch):
 
 def test_resolve_titan_id_hardcoded_fallback(monkeypatch, tmp_path):
     """No explicit, no identity.json, no env → returns 'T1'."""
-    from titan_plugin.core.state_registry import resolve_titan_id
+    from titan_hcl.core.state_registry import resolve_titan_id
     monkeypatch.delenv("TITAN_ID", raising=False)
     # Override the project-root path resolution by temporarily masking
     # the expected identity.json (can't easily do without monkeypatching
@@ -168,9 +168,11 @@ def test_canonical_trinity_spec_162d():
 
 
 def test_canonical_neuromod_spec_6d():
-    assert NEUROMOD_STATE.shape == (6,)
+    # neuromod_state bumped v1 (6,)/24B → v2 (6,4)/96B at v1.8.0 D-SPEC-54
+    # (per-modulator level/gain/phasic/tonic) — SPEC §7.1 + NEUROMOD_SCHEMA_VERSION=2.
+    assert NEUROMOD_STATE.shape == (6, 4)
     assert NEUROMOD_STATE.dtype == np.dtype("<f4")
-    assert NEUROMOD_STATE.payload_bytes == 24
+    assert NEUROMOD_STATE.payload_bytes == 96
     assert NEUROMOD_STATE.feature_flag == "microkernel.shm_neuromod_enabled"
 
 
@@ -263,7 +265,7 @@ def test_reader_missing_file_returns_none(shm_root, trinity_spec):
 def test_reader_fallback_logged_once(shm_root, trinity_spec, caplog):
     import logging as _logging
     r = StateRegistryReader(trinity_spec, shm_root)
-    with caplog.at_level(_logging.INFO, logger="titan_plugin.core.state_registry"):
+    with caplog.at_level(_logging.INFO, logger="titan_hcl.core.state_registry"):
         for _ in range(5):
             assert r.read() is None
     # Exactly one INFO record with "fallback"
@@ -324,7 +326,7 @@ def test_reader_detects_crc_corruption(shm_root, trinity_spec):
     """SPEC v1.0.0 (D-SPEC-35): CRC32 lives in per-buffer metadata at
     offset (16 + ready_idx*(16+N) + 12). Corrupting that field makes
     read() return None."""
-    from titan_plugin.core.state_registry import (
+    from titan_hcl.core.state_registry import (
         _buffer_offset, _unpack_header_seq, HEADER_SIZE,
     )
     w = StateRegistryWriter(trinity_spec, shm_root)

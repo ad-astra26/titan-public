@@ -18,7 +18,7 @@ import os
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from titan_plugin.logic.neuromodulator import (
+from titan_hcl.logic.neuromodulator import (
     CLEARANCE_RATES, COUPLING_MATRIX, METABOLIC_COSTS,
     Neuromodulator, NEUROMOD_PRESSURE_RATE,
 )
@@ -425,7 +425,7 @@ if __name__ == "__main__":
         is_dreaming=False, dna=DNA)
 
     # Old inputs for comparison
-    from titan_plugin.logic.neuromodulator import compute_inputs_from_titan
+    from titan_hcl.logic.neuromodulator import compute_inputs_from_titan
     old_inputs = compute_inputs_from_titan(
         prediction_surprise=0.02, action_outcome=0.5,
         middle_path_stability=0.65, pi_regularity=0.071,

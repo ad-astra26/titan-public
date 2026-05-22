@@ -26,7 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 def decode_and_print(token: str) -> None:
     """Decode and print JWT claims for inspection."""
-    from titan_plugin.inference.venice_session import _decode_jwt_payload
+    from titan_hcl.inference.venice_session import _decode_jwt_payload
     import time
 
     claims = _decode_jwt_payload(token)
@@ -64,7 +64,7 @@ async def main():
     # Fallback: read from config.toml
     if not session_token:
         import re
-        config_path = PROJECT_ROOT / "titan_plugin" / "config.toml"
+        config_path = PROJECT_ROOT / "titan_hcl" / "config.toml"
         content = config_path.read_text()
 
         match = re.search(r'^venice_session_token\s*=\s*"([^"]*)"', content, re.MULTILINE)
@@ -106,7 +106,7 @@ async def main():
     print()
 
     # Test connection
-    from titan_plugin.inference.venice_session import VeniceSessionClient
+    from titan_hcl.inference.venice_session import VeniceSessionClient
 
     client = VeniceSessionClient(
         session_token=session_token,

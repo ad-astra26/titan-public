@@ -32,7 +32,7 @@ async def main():
     parser.add_argument("--cleanup", action="store_true", help="Burn test NFT after verification")
     args = parser.parse_args()
 
-    from titan_plugin.utils.solana_client import (
+    from titan_hcl.utils.solana_client import (
         build_mpl_core_create_v1,
         decode_mpl_core_asset,
         fetch_mpl_core_asset,
@@ -44,7 +44,7 @@ async def main():
         sys.exit(1)
 
     from solders.keypair import Keypair
-    from titan_plugin.core.network import HybridNetworkClient
+    from titan_hcl.core.network import HybridNetworkClient
 
     # Load wallet
     wallet_path = args.wallet
@@ -59,7 +59,7 @@ async def main():
     print(f"  Wallet: {wallet_pubkey}")
 
     # Load config for RPC URLs
-    config_path = os.path.join(os.path.dirname(__file__), "..", "titan_plugin", "config.toml")
+    config_path = os.path.join(os.path.dirname(__file__), "..", "titan_hcl", "config.toml")
     net_config = {}
     try:
         try:

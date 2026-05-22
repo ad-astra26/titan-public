@@ -12,7 +12,7 @@ import pytest
 
 class TestPrimitiveAffinityTable:
     def test_all_11_programs_present(self):
-        from titan_plugin.logic.reasoning import PRIMITIVE_AFFINITY
+        from titan_hcl.logic.reasoning import PRIMITIVE_AFFINITY
         expected = {"REFLEX", "FOCUS", "INTUITION", "IMPULSE", "INSPIRATION",
                     "CREATIVITY", "CURIOSITY", "EMPATHY", "REFLECTION",
                     "METABOLISM", "VIGILANCE"}
@@ -20,14 +20,14 @@ class TestPrimitiveAffinityTable:
 
     def test_affinity_values_in_valid_range(self):
         """All affinity values must be in [0, 1] (formula assumption)."""
-        from titan_plugin.logic.reasoning import PRIMITIVE_AFFINITY
+        from titan_hcl.logic.reasoning import PRIMITIVE_AFFINITY
         for prog, affs in PRIMITIVE_AFFINITY.items():
             for prim, val in affs.items():
                 assert 0.0 <= val <= 1.0, f"{prog}.{prim}={val} out of range"
 
     def test_only_real_primitives_referenced(self):
         """Affinity entries must reference primitives that actually exist."""
-        from titan_plugin.logic.reasoning import PRIMITIVE_AFFINITY, PRIMITIVES
+        from titan_hcl.logic.reasoning import PRIMITIVE_AFFINITY, PRIMITIVES
         for prog, affs in PRIMITIVE_AFFINITY.items():
             for prim in affs:
                 assert prim in PRIMITIVES, (
@@ -35,7 +35,7 @@ class TestPrimitiveAffinityTable:
 
     def test_each_program_has_at_least_one_primary(self):
         """Every program must have at least one primary affinity (1.0)."""
-        from titan_plugin.logic.reasoning import PRIMITIVE_AFFINITY
+        from titan_hcl.logic.reasoning import PRIMITIVE_AFFINITY
         for prog, affs in PRIMITIVE_AFFINITY.items():
             assert any(v >= 0.95 for v in affs.values()), (
                 f"{prog} has no primary affinity (max={max(affs.values())})")
@@ -56,7 +56,7 @@ class TestGutFormula:
 
     def test_aligned_program_pulls_gut_high(self, mock_engine):
         """FOCUS firing strongly while DECOMPOSE executes → high gut."""
-        from titan_plugin.logic.reasoning import ReasoningEngine
+        from titan_hcl.logic.reasoning import ReasoningEngine
         ReasoningEngine._update_gut_agreement(
             mock_engine, gut_signals={"FOCUS": 0.8}, current_primitive="DECOMPOSE")
         # FOCUS affinity for DECOMPOSE = 1.0 → contribution = 0.8 × 1.0 = 0.8
@@ -65,7 +65,7 @@ class TestGutFormula:
 
     def test_anti_affinity_pulls_gut_low(self, mock_engine):
         """CURIOSITY firing strongly while CONCLUDE executes → low gut."""
-        from titan_plugin.logic.reasoning import ReasoningEngine
+        from titan_hcl.logic.reasoning import ReasoningEngine
         ReasoningEngine._update_gut_agreement(
             mock_engine, gut_signals={"CURIOSITY": 0.8}, current_primitive="CONCLUDE")
         # CURIOSITY affinity for CONCLUDE = 0.3 → contribution = 0.8 × -0.4 = -0.32
@@ -74,7 +74,7 @@ class TestGutFormula:
 
     def test_neutral_program_no_contribution(self, mock_engine):
         """REFLEX only knows CONCLUDE. With DECOMPOSE → neutral 0.5."""
-        from titan_plugin.logic.reasoning import ReasoningEngine
+        from titan_hcl.logic.reasoning import ReasoningEngine
         ReasoningEngine._update_gut_agreement(
             mock_engine, gut_signals={"REFLEX": 0.6}, current_primitive="DECOMPOSE")
         # REFLEX has no DECOMPOSE entry → uses NEUTRAL_AFFINITY=0.5
@@ -83,7 +83,7 @@ class TestGutFormula:
 
     def test_mixed_signals_balance(self, mock_engine):
         """FOCUS (loves DECOMPOSE) + METABOLISM (neutral on DECOMPOSE) → high."""
-        from titan_plugin.logic.reasoning import ReasoningEngine
+        from titan_hcl.logic.reasoning import ReasoningEngine
         ReasoningEngine._update_gut_agreement(
             mock_engine,
             gut_signals={"FOCUS": 0.6, "METABOLISM": 0.4},
@@ -95,7 +95,7 @@ class TestGutFormula:
 
     def test_metabolism_anti_loop(self, mock_engine):
         """METABOLISM has 0.3 affinity for LOOP → opposes loop."""
-        from titan_plugin.logic.reasoning import ReasoningEngine
+        from titan_hcl.logic.reasoning import ReasoningEngine
         ReasoningEngine._update_gut_agreement(
             mock_engine, gut_signals={"METABOLISM": 0.7}, current_primitive="LOOP")
         # METABOLISM.LOOP = 0.3 → contribution = 0.7 × -0.4 = -0.28
@@ -103,14 +103,14 @@ class TestGutFormula:
         assert 0.25 <= mock_engine.gut_agreement <= 0.35
 
     def test_empty_signals_neutral(self, mock_engine):
-        from titan_plugin.logic.reasoning import ReasoningEngine
+        from titan_hcl.logic.reasoning import ReasoningEngine
         ReasoningEngine._update_gut_agreement(
             mock_engine, gut_signals={}, current_primitive="COMPARE")
         assert mock_engine.gut_agreement == 0.5
 
     def test_below_noise_floor_neutral(self, mock_engine):
         """Urgencies below 0.05 don't contribute (filtered noise)."""
-        from titan_plugin.logic.reasoning import ReasoningEngine
+        from titan_hcl.logic.reasoning import ReasoningEngine
         ReasoningEngine._update_gut_agreement(
             mock_engine,
             gut_signals={"FOCUS": 0.01, "CURIOSITY": 0.02},
@@ -119,7 +119,7 @@ class TestGutFormula:
 
     def test_legacy_mode_no_primitive(self, mock_engine):
         """Backward compat: no primitive passed → falls back to mean-urgency."""
-        from titan_plugin.logic.reasoning import ReasoningEngine
+        from titan_hcl.logic.reasoning import ReasoningEngine
         mock_engine.confidence = 0.7
         ReasoningEngine._update_gut_agreement(
             mock_engine, gut_signals={"FOCUS": 0.6})
@@ -130,7 +130,7 @@ class TestGutFormula:
 class TestGutEMA:
     def test_ema_smoothing_applies(self):
         """Multiple calls should EMA-smooth gut, not snap to instantaneous value."""
-        from titan_plugin.logic.reasoning import ReasoningEngine
+        from titan_hcl.logic.reasoning import ReasoningEngine
 
         class M:
             confidence = 0.5
@@ -155,7 +155,7 @@ class TestGutEMA:
 
     def test_ema_alpha_disabled_uses_instantaneous(self):
         """Setting alpha=1.0 should make gut snap to instantaneous value."""
-        from titan_plugin.logic.reasoning import ReasoningEngine
+        from titan_hcl.logic.reasoning import ReasoningEngine
 
         class M:
             confidence = 0.5
@@ -172,7 +172,7 @@ class TestGutEMA:
 class TestHormoneAugmentation:
     def test_blend_zero_returns_pure_nn(self):
         """hormone_blend=0 should return raw _all_urgencies unchanged."""
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
 
         # Minimal mock — only need _all_urgencies + flags
         class M:
@@ -184,7 +184,7 @@ class TestHormoneAugmentation:
 
     def test_blend_with_hormone_above_threshold(self):
         """Hormone level/threshold > 1 should be clamped at 1.0 in blend."""
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
 
         class MockHormone:
             level = 1.5
@@ -204,7 +204,7 @@ class TestHormoneAugmentation:
 
     def test_blend_normal_case(self):
         """Standard blend: 70% NN + 30% hormone-ratio."""
-        from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem
+        from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem
 
         class MockHormone:
             level = 0.4

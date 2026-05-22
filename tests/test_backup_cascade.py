@@ -1,6 +1,6 @@
 """Tests for rFP_backup_worker Phase 2 cascade on path-based uploads (personality, soul).
 
-Cascade logic lives in titan_plugin.logic.backup_cascade.BackupCascade — exercised
+Cascade logic lives in titan_hcl.logic.backup_cascade.BackupCascade — exercised
 directly here. For TimeChain (bytes-based) variant see test_backup_cascade_timechain.py.
 Does NOT test live Arweave upload (S5) or gateway HEAD verify (S6).
 """
@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from titan_plugin.logic.backup_cascade import BackupCascade
+from titan_hcl.logic.backup_cascade import BackupCascade
 
 
 def _make_tarball_file(path: str, payload: bytes = b"hello world") -> str:

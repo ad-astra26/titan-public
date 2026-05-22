@@ -32,8 +32,8 @@ class TestSpecGlossaryAndTreeAlignment:
 
     def test_module_importable_at_documented_path(self):
         """SPEC §1 + §9.B documents:
-            entry: titan_plugin/modules/cognitive_worker.py — cognitive_worker_main"""
-        from titan_plugin.modules.cognitive_worker import cognitive_worker_main
+            entry: titan_hcl/modules/cognitive_worker.py — cognitive_worker_main"""
+        from titan_hcl.modules.cognitive_worker import cognitive_worker_main
         assert callable(cognitive_worker_main)
 
     def test_module_runs_only_under_l0_rust_enabled(self):
@@ -44,22 +44,11 @@ class TestSpecGlossaryAndTreeAlignment:
         # We can't easily run the function without spawning + bus setup,
         # but a static contains check catches accidental removal.
         import inspect
-        from titan_plugin.modules import cognitive_worker
+        from titan_hcl.modules import cognitive_worker
         src = inspect.getsource(cognitive_worker)
         assert "l0_rust_enabled" in src, (
             "cognitive_worker.py lost the l0_rust_enabled flag-gate — "
             "Maker D3 (b) rollback path would silently break."
-        )
-
-    def test_canonical_name_in_legacy_core_registration(self):
-        """SPEC §9.B documents 'cognitive_worker' as the ModuleSpec name.
-        legacy_core.py registers under that exact name."""
-        import inspect
-        from titan_plugin import legacy_core
-        src = inspect.getsource(legacy_core)
-        assert 'name="cognitive_worker"' in src, (
-            "legacy_core.py registration under name 'cognitive_worker' "
-            "missing — would be invisible to guardian + arch_map."
         )
 
 
@@ -76,8 +65,8 @@ class TestSpec85WireContract:
         legacy A.S8 names OUTER_BODY_STATE / OUTER_MIND_STATE /
         OUTER_SPIRIT_STATE (those are l0_rust=false rollback path).
         See PLAN §3.1 driver table."""
-        from titan_plugin.modules.cognitive_worker import _COGNITIVE_WORKER_SUBSCRIBE_TOPICS
-        from titan_plugin import bus
+        from titan_hcl.modules.cognitive_worker import _COGNITIVE_WORKER_SUBSCRIBE_TOPICS
+        from titan_hcl import bus
 
         topics = set(_COGNITIVE_WORKER_SUBSCRIBE_TOPICS)
         assert bus.BODY_STATE in topics
@@ -103,7 +92,7 @@ class TestSpec85WireContract:
         Static check: source contains the 6 cache-slot key strings.
         Functional check: dispatcher tests in test_cognitive_worker.py."""
         import inspect
-        from titan_plugin.modules import cognitive_worker
+        from titan_hcl.modules import cognitive_worker
         src = inspect.getsource(cognitive_worker)
         for slot in ("_inner_body_state", "_outer_body_state",
                      "_inner_mind_state", "_outer_mind_state",
@@ -123,7 +112,7 @@ class TestSpecV020CognitiveConstants:
     architectural override unrecorded in SPEC."""
 
     def test_constants_exist_in_python_phase_c_module(self):
-        from titan_plugin._phase_c_constants import (
+        from titan_hcl._phase_c_constants import (
             COGNITIVE_EPOCH_MIN_INTERVAL_S,
             COGNITIVE_EPOCH_DEFAULT_INTERVAL_S,
             COGNITIVE_EPOCH_MAX_INTERVAL_S,
@@ -135,7 +124,7 @@ class TestSpecV020CognitiveConstants:
         """Per Maker D4 (a) the constants are integer multiples of
         Schumann body period (1.15s) — preserves harmonic structure at
         the cognitive layer."""
-        from titan_plugin._phase_c_constants import (
+        from titan_hcl._phase_c_constants import (
             COGNITIVE_EPOCH_MIN_INTERVAL_S,
             COGNITIVE_EPOCH_DEFAULT_INTERVAL_S,
             COGNITIVE_EPOCH_MAX_INTERVAL_S,
@@ -150,7 +139,7 @@ class TestSpecV020CognitiveConstants:
         assert abs(COGNITIVE_EPOCH_MAX_INTERVAL_S - (27 * SCHUMANN_BODY_S)) < EPS
 
     def test_persist_cadence(self):
-        from titan_plugin._phase_c_constants import COGNITIVE_PERSIST_EVERY_N_EPOCHS
+        from titan_hcl._phase_c_constants import COGNITIVE_PERSIST_EVERY_N_EPOCHS
         assert COGNITIVE_PERSIST_EVERY_N_EPOCHS == 100
 
 
@@ -163,15 +152,26 @@ class TestPlanAcceptanceStatic:
     here so commits can't introduce regressions before deploy."""
 
     def test_criterion_3_subscribe_topics_count(self):
-        """PLAN §11(3): journalctl `subscribed to 10 bus topics`."""
-        from titan_plugin.modules.cognitive_worker import _COGNITIVE_WORKER_SUBSCRIBE_TOPICS
-        assert len(_COGNITIVE_WORKER_SUBSCRIBE_TOPICS) == 10
+        """PLAN §11(3): journalctl `subscribed to N bus topics`.
 
-    def test_criterion_10_no_slim_shim_loop_remains(self):
-        """PLAN §11(10): grep -r `_spirit_worker_shim_loop` returns empty.
-        Mirrors test_spirit_worker_shim.py::test_no_old_shim_loop_remains
-        — defense in depth."""
-        from titan_plugin.modules import spirit_worker
-        assert not hasattr(spirit_worker, "_spirit_worker_shim_loop"), (
-            "Slim-shim 4A code resurrected — chunk 8I deletion regressed."
+        Baseline 10 at chunk 8L ship; 12 after Track 2 v1.2.1 D-SPEC-38
+        (ADVISOR_REFRACTORY_STATE + PREDICTION_GENERATED); 14 after
+        §4.B Track 3 v1.7.4 D-SPEC-53 (SPEAK_REQUEST_PENDING + NS_REWARD);
+        18 (§4.Q); 23 (Meta-Reasoning B.7b); 25 (§4.I dream_state +
+        FORCE_DREAM_REQUEST); 26 (D-SPEC-64 KIN_SIGNAL); 27 (D-SPEC-103
+        EXPERIENCE_RECORD); 28 (rFP_subsystem_reward_refresh CONTRACT_LIST_RESP);
+        31 (D-SPEC-116 spirit_worker retirement — MEMORY_RECALL_PERTURBATION +
+        TEACHER_SIGNALS + OUTER_OBSERVATION re-homed).
+        Canonical list lives in test_cognitive_worker.py::test_subscribe_topics_list_canonical."""
+        from titan_hcl.modules.cognitive_worker import _COGNITIVE_WORKER_SUBSCRIBE_TOPICS
+        assert len(_COGNITIVE_WORKER_SUBSCRIBE_TOPICS) == 31
+
+    def test_criterion_10_spirit_worker_fully_retired(self):
+        """PLAN §11(10) superseded by D-SPEC-116: spirit_worker.py is fully
+        DELETED (was a heartbeat stub). The strongest no-resurrection invariant
+        is that the module itself no longer exists."""
+        import importlib.util
+        assert importlib.util.find_spec(
+            "titan_hcl.modules.spirit_worker") is None, (
+            "spirit_worker.py resurrected — D-SPEC-116 retirement regressed."
         )

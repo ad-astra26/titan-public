@@ -1,5 +1,5 @@
 """
-Tests for the SHM-direct migration of ``titan_plugin.proxies.memory_proxy``.
+Tests for the SHM-direct migration of ``titan_hcl.proxies.memory_proxy``.
 
 Phase C Session 2 of rFP_phase_c_async_shm_consumer_migration §4.C.13.
 
@@ -17,8 +17,8 @@ import logging
 
 import pytest
 
-from titan_plugin.logic.memory_state_publisher import MemoryStatePublisher
-from titan_plugin.proxies.memory_proxy import MemoryProxy
+from titan_hcl.logic.memory_state_publisher import MemoryStatePublisher
+from titan_hcl.proxies.memory_proxy import MemoryProxy
 
 from tests.test_memory_state_publisher import _StubMemory  # noqa: E402
 
@@ -80,7 +80,7 @@ def proxy_cold(shm_root):
 
 
 def test_init_logs(shm_root, caplog):
-    caplog.set_level(logging.INFO, logger="titan_plugin.proxies.memory_proxy")
+    caplog.set_level(logging.INFO, logger="titan_hcl.proxies.memory_proxy")
     proxy = MemoryProxy(bus=_StubBus(), guardian=_StubGuardian())
     assert any("initialized" in r.message and "SHM reader" in r.message
                for r in caplog.records)
@@ -212,7 +212,7 @@ def test_diagnostics_lists_migration_status(proxy_cold):
 
 
 def test_cold_boot_logs_first_fallback_then_throttles(proxy_cold, caplog):
-    caplog.set_level(logging.INFO, logger="titan_plugin.proxies.memory_proxy")
+    caplog.set_level(logging.INFO, logger="titan_hcl.proxies.memory_proxy")
     proxy, _ = proxy_cold
     proxy.get_memory_status()  # triggers fallback
     # Repeat — should NOT add new first-fallback logs (throttle)

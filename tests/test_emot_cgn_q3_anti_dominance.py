@@ -8,7 +8,7 @@ import pytest
 def test_anti_dominance_scales_weight_by_inverse_v():
     """A primitive with V=0.29 (WONDER-like dominant) should get a smaller
     β update than a primitive with V=0.50 (LOVE-like neutral)."""
-    from titan_plugin.logic.emot_cgn import EmotCGNConsumer
+    from titan_hcl.logic.emot_cgn import EmotCGNConsumer
 
     # Build two minimal consumer instances, each with one primitive at a
     # different V. We'll call handle_incoming_cross_insight on each and
@@ -58,7 +58,7 @@ def test_anti_dominance_scales_weight_by_inverse_v():
 def test_anti_dominance_high_v_primitive_gets_tiny_update():
     """A primitive at V=0.99 (runaway dominance) should get ~floor-weight
     update (0.05 × reward), protecting against further reinforcement."""
-    from titan_plugin.logic.emot_cgn import EmotCGNConsumer
+    from titan_hcl.logic.emot_cgn import EmotCGNConsumer
 
     c = EmotCGNConsumer(titan_id="TEST2")
     p = c._primitives["WONDER"]
@@ -87,7 +87,7 @@ def test_anti_dominance_high_v_primitive_gets_tiny_update():
 def test_anti_dominance_negative_reward_also_scales():
     """Negative reward should also scale by (1 - V) — still penalize less
     if already dominant vs. more if emerging."""
-    from titan_plugin.logic.emot_cgn import EmotCGNConsumer
+    from titan_hcl.logic.emot_cgn import EmotCGNConsumer
 
     c = EmotCGNConsumer(titan_id="TEST3")
     p = c._primitives["WONDER"]
@@ -112,7 +112,7 @@ def test_anti_dominance_negative_reward_also_scales():
 def test_anti_dominance_cross_insight_counter_still_increments():
     """Ensure counter increments — proves the handler is actually running
     through the update block."""
-    from titan_plugin.logic.emot_cgn import EmotCGNConsumer
+    from titan_hcl.logic.emot_cgn import EmotCGNConsumer
 
     c = EmotCGNConsumer(titan_id="TEST4")
     c._dominant_emotion = "WONDER"
@@ -131,7 +131,7 @@ def test_anti_dominance_marker_comment_in_source():
     """Static check — the §11 Q3 Option B reference comment must stay for
     future-reader discoverability."""
     from pathlib import Path
-    src = (Path(__file__).parent.parent / "titan_plugin" / "logic"
+    src = (Path(__file__).parent.parent / "titan_hcl" / "logic"
            / "emot_cgn.py").read_text()
     assert "§11 Q3 Option B" in src
     assert "anti-dominance correction" in src

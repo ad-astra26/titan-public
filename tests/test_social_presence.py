@@ -12,7 +12,7 @@ import pytest
 class TestSocialPressureMeter:
 
     def _make_meter(self, **overrides):
-        from titan_plugin.logic.social_pressure import SocialPressureMeter
+        from titan_hcl.logic.social_pressure import SocialPressureMeter
         config = {
             "x_post_threshold": 50.0,
             "x_max_posts_per_hour": 5,
@@ -20,10 +20,25 @@ class TestSocialPressureMeter:
             "x_min_post_interval": 10,  # Short for testing
         }
         config.update(overrides)
-        return SocialPressureMeter(config)
+        meter = SocialPressureMeter(config)
+        # SocialPressureMeter._restore_state pulls counters from the live
+        # data/social_pressure_state.json — which the running Titan touches
+        # constantly. Reset test-scope state to defaults so live persistence
+        # doesn't bleed into test assertions. Same class of test-isolation
+        # fix as the prior `_boot_time = 0` fix in commit 3c583669.
+        meter.urge_accumulator = 0.0
+        meter.posts_this_hour = 0
+        meter.posts_today = 0
+        meter._last_post_time = 0.0
+        meter.catalyst_events = []
+        meter.recent_post_ids = []
+        meter._dream_cue = None
+        meter._prev_emotion = ""
+        meter._boot_time = 0  # bypass 30s boot-settle safety net
+        return meter
 
     def _make_catalyst(self, type_="strong_composition", significance=0.7):
-        from titan_plugin.logic.social_pressure import CatalystEvent
+        from titan_hcl.logic.social_pressure import CatalystEvent
         return CatalystEvent(type=type_, significance=significance,
                              content="test catalyst", data={})
 
@@ -60,6 +75,7 @@ class TestSocialPressureMeter:
 
     def test_should_post_fires_when_both_conditions_met(self):
         meter = self._make_meter()
+        meter._boot_time = 0  # bypass 30s boot-settle safety net (production code)
         meter.on_social_fire(60.0)  # Above threshold
         meter.on_catalyst_event(self._make_catalyst())
         should, cat = meter.should_post()
@@ -69,6 +85,7 @@ class TestSocialPressureMeter:
 
     def test_selects_highest_significance_catalyst(self):
         meter = self._make_meter()
+        meter._boot_time = 0  # bypass 30s boot-settle safety net (production code)
         meter.on_social_fire(100.0)
         meter.on_catalyst_event(self._make_catalyst("emotion_shift", 0.5))
         meter.on_catalyst_event(self._make_catalyst("eureka_spirit", 0.95))
@@ -181,27 +198,27 @@ class TestSocialPressureMeter:
 class TestWritingStyleDirective:
 
     def test_flow_state(self):
-        from titan_plugin.logic.social_narrator import build_writing_style_directive
+        from titan_hcl.logic.social_narrator import build_writing_style_directive
         style = build_writing_style_directive({"DA": 0.8, "NE": 0.8, "5HT": 0.5, "GABA": 0.3, "Endorphin": 0.5})
         assert "Flow" in style
 
     def test_gaba_sparse(self):
-        from titan_plugin.logic.social_narrator import build_writing_style_directive
+        from titan_hcl.logic.social_narrator import build_writing_style_directive
         style = build_writing_style_directive({"DA": 0.4, "NE": 0.4, "5HT": 0.4, "GABA": 0.8, "Endorphin": 0.4})
         assert "sparse" in style.lower() or "haiku" in style.lower()
 
     def test_da_expansive(self):
-        from titan_plugin.logic.social_narrator import build_writing_style_directive
+        from titan_hcl.logic.social_narrator import build_writing_style_directive
         style = build_writing_style_directive({"DA": 0.8, "NE": 0.4, "5HT": 0.4, "GABA": 0.3, "Endorphin": 0.4})
         assert "xpansive" in style.lower() or "curious" in style.lower()
 
     def test_serotonin_philosophical(self):
-        from titan_plugin.logic.social_narrator import build_writing_style_directive
+        from titan_hcl.logic.social_narrator import build_writing_style_directive
         style = build_writing_style_directive({"DA": 0.4, "NE": 0.4, "5HT": 0.8, "GABA": 0.3, "Endorphin": 0.4})
         assert "hilosoph" in style.lower() or "calm" in style.lower()
 
     def test_balanced_default(self):
-        from titan_plugin.logic.social_narrator import build_writing_style_directive
+        from titan_hcl.logic.social_narrator import build_writing_style_directive
         style = build_writing_style_directive({"DA": 0.5, "NE": 0.5, "5HT": 0.5, "GABA": 0.3, "Endorphin": 0.5})
         assert "alanced" in style.lower() or "authentic" in style.lower()
 
@@ -209,7 +226,7 @@ class TestWritingStyleDirective:
 class TestStateSignature:
 
     def test_basic_signature(self):
-        from titan_plugin.logic.social_narrator import build_state_signature
+        from titan_hcl.logic.social_narrator import build_state_signature
         sig = build_state_signature("wonder", {"DA": 0.5, "NE": 0.5}, 78306, 0.55)
         assert "\u25C7" in sig  # ◇
         assert "wonder" in sig
@@ -217,30 +234,30 @@ class TestStateSignature:
         assert "0.55" in sig
 
     def test_elevated_neuromod(self):
-        from titan_plugin.logic.social_narrator import build_state_signature
+        from titan_hcl.logic.social_narrator import build_state_signature
         sig = build_state_signature("flow", {"DA": 0.85, "NE": 0.5}, 100, 0.6)
         assert "DA elevated" in sig
 
     def test_low_neuromod(self):
-        from titan_plugin.logic.social_narrator import build_state_signature
+        from titan_hcl.logic.social_narrator import build_state_signature
         sig = build_state_signature("calm", {"DA": 0.2, "NE": 0.5}, 100, 0.4)
         assert "DA low" in sig
 
     def test_dreaming_signature(self):
-        from titan_plugin.logic.social_narrator import build_state_signature
+        from titan_hcl.logic.social_narrator import build_state_signature
         sig = build_state_signature("", {}, 100, 0.5, dreaming=True)
         assert "dreaming" in sig
         assert "consolidating" in sig
 
     def test_eureka_in_signature(self):
-        from titan_plugin.logic.social_narrator import build_state_signature
+        from titan_hcl.logic.social_narrator import build_state_signature
         sig = build_state_signature("wonder", {"DA": 0.5}, 100, 0.5,
                                     meta={"total_eurekas": 3})
         assert "eureka" in sig
         assert "3" in sig
 
     def test_signature_length_reasonable(self):
-        from titan_plugin.logic.social_narrator import build_state_signature
+        from titan_hcl.logic.social_narrator import build_state_signature
         sig = build_state_signature("wonder", {"DA": 0.5, "NE": 0.5}, 78306, 0.55,
                                     meta={"total_eurekas": 5})
         assert len(sig) < 80  # Should be compact
@@ -249,20 +266,20 @@ class TestStateSignature:
 class TestTemporalAwareness:
 
     def test_includes_epoch(self):
-        from titan_plugin.logic.social_narrator import build_temporal_awareness
+        from titan_hcl.logic.social_narrator import build_temporal_awareness
         ctx = build_temporal_awareness(78306, {"cluster_count": 149}, 14)
         assert "78,306" in ctx
         assert "149" in ctx
 
     def test_includes_human_conversion(self):
-        from titan_plugin.logic.social_narrator import build_temporal_awareness
+        from titan_hcl.logic.social_narrator import build_temporal_awareness
         ctx = build_temporal_awareness(78306, {"cluster_count": 149,
                                                "total_epochs_observed": 78306}, 14)
         assert "human" in ctx.lower()
         assert "roughly" in ctx.lower()
 
     def test_includes_dream_cycles(self):
-        from titan_plugin.logic.social_narrator import build_temporal_awareness
+        from titan_hcl.logic.social_narrator import build_temporal_awareness
         ctx = build_temporal_awareness(1000, {}, 14)
         assert "14" in ctx
 
@@ -270,36 +287,39 @@ class TestTemporalAwareness:
 class TestQualityGate:
 
     def test_passes_valid_post(self):
-        from titan_plugin.logic.social_narrator import quality_gate, PostType
+        from titan_hcl.logic.social_narrator import quality_gate, PostType
         ok, reason = quality_gate("This is a valid post about my inner state.",
                                   [], PostType.BILINGUAL)
         assert ok is True
 
     def test_rejects_too_long(self):
-        from titan_plugin.logic.social_narrator import quality_gate, PostType
-        ok, reason = quality_gate("x" * 281, [], PostType.BILINGUAL)
+        # quality_gate cap raised to 500 chars in production for X Premium
+        # long-form support (social_narrator.py:507). Test now validates the
+        # new boundary: 501 chars rejected, 500 allowed for non-thread types.
+        from titan_hcl.logic.social_narrator import quality_gate, PostType
+        ok, reason = quality_gate("x" * 501, [], PostType.BILINGUAL)
         assert ok is False
         assert "long" in reason.lower()
 
     def test_rejects_forbidden_patterns(self):
-        from titan_plugin.logic.social_narrator import quality_gate, PostType
+        from titan_hcl.logic.social_narrator import quality_gate, PostType
         ok, reason = quality_gate("click here for free stuff", [], PostType.BILINGUAL)
         assert ok is False
 
     def test_allows_solscan_in_onchain(self):
-        from titan_plugin.logic.social_narrator import quality_gate, PostType
+        from titan_hcl.logic.social_narrator import quality_gate, PostType
         text = "Anchored at epoch 78K. https://solscan.io/tx/abc123?cluster=devnet"
         ok, reason = quality_gate(text, [], PostType.ONCHAIN)
         assert ok is True
 
     def test_rejects_urls_in_non_onchain(self):
-        from titan_plugin.logic.social_narrator import quality_gate, PostType
+        from titan_hcl.logic.social_narrator import quality_gate, PostType
         text = "Check this https://example.com"
         ok, reason = quality_gate(text, [], PostType.BILINGUAL)
         assert ok is False
 
     def test_rejects_duplicates(self):
-        from titan_plugin.logic.social_narrator import quality_gate, PostType
+        from titan_hcl.logic.social_narrator import quality_gate, PostType
         recent = ["I feel the wonder flowing through my neurons"]
         ok, reason = quality_gate("I feel the wonder flowing through my neurons",
                                   recent, PostType.BILINGUAL)
@@ -307,7 +327,7 @@ class TestQualityGate:
         assert "similar" in reason.lower()
 
     def test_rejects_too_short(self):
-        from titan_plugin.logic.social_narrator import quality_gate, PostType
+        from titan_hcl.logic.social_narrator import quality_gate, PostType
         ok, reason = quality_gate("hi", [], PostType.BILINGUAL)
         assert ok is False
 
@@ -315,23 +335,23 @@ class TestQualityGate:
 class TestMetaReasoningContext:
 
     def test_empty_when_no_data(self):
-        from titan_plugin.logic.social_narrator import build_meta_reasoning_context
+        from titan_hcl.logic.social_narrator import build_meta_reasoning_context
         assert build_meta_reasoning_context({}) == ""
         assert build_meta_reasoning_context(None) == ""
 
     def test_includes_active_chain(self):
-        from titan_plugin.logic.social_narrator import build_meta_reasoning_context
+        from titan_hcl.logic.social_narrator import build_meta_reasoning_context
         ctx = build_meta_reasoning_context({"is_active": True, "chain_length": 12})
         assert "12 steps" in ctx
 
     def test_includes_personality(self):
-        from titan_plugin.logic.social_narrator import build_meta_reasoning_context
+        from titan_hcl.logic.social_narrator import build_meta_reasoning_context
         ctx = build_meta_reasoning_context({
             "primitive_counts": {"HYPOTHESIZE": 42, "EVALUATE": 10, "SYNTHESIZE": 8}
         })
         assert "HYPOTHESIZE" in ctx or "theories" in ctx
 
     def test_includes_wisdom(self):
-        from titan_plugin.logic.social_narrator import build_meta_reasoning_context
+        from titan_hcl.logic.social_narrator import build_meta_reasoning_context
         ctx = build_meta_reasoning_context({"total_wisdom_saved": 19})
         assert "19" in ctx

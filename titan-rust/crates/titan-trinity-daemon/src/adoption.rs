@@ -1,7 +1,7 @@
 //! adoption — B.2.1 supervision-transfer ADOPTION_REQUEST/ACK msgpack codec.
 //!
 //! Per SPEC §8.4 + §8.10 + D14 + D18 — locked against Python ground truth
-//! at `titan_plugin/core/worker_swap_handler.py:206-216`:
+//! at `titan_hcl/core/worker_swap_handler.py:206-216`:
 //!
 //! ```python
 //! req = bus.make_msg(

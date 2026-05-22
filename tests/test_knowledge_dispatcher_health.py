@@ -11,11 +11,11 @@ from unittest.mock import patch
 
 import pytest
 
-from titan_plugin.logic.knowledge_backends import BackendResult
-from titan_plugin.logic.knowledge_cache import KnowledgeCache
-from titan_plugin.logic.knowledge_dispatcher import dispatch
-from titan_plugin.logic.knowledge_health import CIRCUIT_OPEN, HealthTracker
-from titan_plugin.logic.knowledge_router import QueryType
+from titan_hcl.logic.knowledge_backends import BackendResult
+from titan_hcl.logic.knowledge_cache import KnowledgeCache
+from titan_hcl.logic.knowledge_dispatcher import dispatch
+from titan_hcl.logic.knowledge_health import CIRCUIT_OPEN, HealthTracker
+from titan_hcl.logic.knowledge_router import QueryType
 
 
 @pytest.fixture
@@ -41,7 +41,7 @@ def ctx():
 class TestDispatchWithHealth:
     @pytest.mark.asyncio
     async def test_circuit_breaker_skips_backend(self, ctx, monkeypatch):
-        from titan_plugin.logic import knowledge_dispatcher as kd
+        from titan_hcl.logic import knowledge_dispatcher as kd
         wikt_calls = 0
 
         async def wikt_failing(topic, timeout=10.0):
@@ -76,7 +76,7 @@ class TestDispatchWithHealth:
 
     @pytest.mark.asyncio
     async def test_successful_dispatch_writes_decision_log(self, ctx, monkeypatch):
-        from titan_plugin.logic import knowledge_dispatcher as kd
+        from titan_hcl.logic import knowledge_dispatcher as kd
 
         async def ok(topic, timeout=10.0):
             return BackendResult(
@@ -112,7 +112,7 @@ class TestDispatchWithHealth:
 
     @pytest.mark.asyncio
     async def test_health_records_every_attempt(self, ctx, monkeypatch):
-        from titan_plugin.logic import knowledge_dispatcher as kd
+        from titan_hcl.logic import knowledge_dispatcher as kd
 
         async def ok(topic, timeout=10.0):
             return BackendResult(
@@ -128,7 +128,7 @@ class TestDispatchWithHealth:
 
     @pytest.mark.asyncio
     async def test_budget_exhausted_skips_backend(self, ctx, monkeypatch):
-        from titan_plugin.logic import knowledge_dispatcher as kd
+        from titan_hcl.logic import knowledge_dispatcher as kd
 
         async def ok(topic, timeout=10.0):
             return BackendResult(
@@ -163,7 +163,7 @@ class TestDispatchWithHealth:
                 near_dup_jaccard=0.5)
 
             caplog.set_level(logging.INFO,
-                             logger="titan_plugin.logic.knowledge_health")
+                             logger="titan_hcl.logic.knowledge_health")
 
             # Seed two conceptual queries with >50% token overlap
             low_health.note_query_for_near_dup("hypothesis generation critical")

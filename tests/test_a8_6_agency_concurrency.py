@@ -53,7 +53,7 @@ class TestAgencyWorkerQueryOrdering(unittest.TestCase):
         """Inject 10 handle_intent QUERYs back-to-back; expect 10 RESPONSEs in
         the same rid order. This is the unit-level guarantor for the
         OBS-a8-agency-impulse-ordering 7d soak gate."""
-        from titan_plugin.modules.agency_worker import agency_worker_main
+        from titan_hcl.modules.agency_worker import agency_worker_main
         recv, send = Queue(), Queue()
 
         # Inject 10 IMPULSEs back-to-back, each with a distinct rid + impulse_id
@@ -102,7 +102,7 @@ class TestAgencyWorkerQueryOrdering(unittest.TestCase):
     def test_mixed_action_types_responses_in_order(self):
         """Worker handles different actions (handle_intent, agency_stats, assess)
         interleaved + RESPONSE rid order matches QUERY arrival order."""
-        from titan_plugin.modules.agency_worker import agency_worker_main
+        from titan_hcl.modules.agency_worker import agency_worker_main
         recv, send = Queue(), Queue()
 
         # 5 mixed QUERYs in deterministic order
@@ -170,7 +170,7 @@ class TestAgencyWorkerStatsBroadcast(unittest.TestCase):
     broadcast structure is right when triggered)."""
 
     def test_module_ready_payload_has_helper_count(self):
-        from titan_plugin.modules.agency_worker import agency_worker_main
+        from titan_hcl.modules.agency_worker import agency_worker_main
         recv, send = Queue(), Queue()
         recv.put({"type": "MODULE_SHUTDOWN", "src": "guardian", "dst": "agency_worker"})
         with tempfile.TemporaryDirectory() as td:

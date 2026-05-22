@@ -16,7 +16,7 @@ import pytest
 
 def test_auxiliary_backup_paths_constant_includes_maker_proposals():
     """Sanity check: the constant has the expected entry."""
-    from titan_plugin.logic.timechain_backup import AUXILIARY_BACKUP_PATHS
+    from titan_hcl.logic.timechain_backup import AUXILIARY_BACKUP_PATHS
     assert "auxiliary/maker_proposals.db" in AUXILIARY_BACKUP_PATHS
     assert AUXILIARY_BACKUP_PATHS["auxiliary/maker_proposals.db"] == \
         "data/maker_proposals.db"
@@ -24,11 +24,11 @@ def test_auxiliary_backup_paths_constant_includes_maker_proposals():
 
 def test_auxiliary_files_included_in_tarball(tmp_path, monkeypatch):
     """Verify create_snapshot_tarball() includes auxiliary files when present."""
-    from titan_plugin.logic.timechain_backup import (
+    from titan_hcl.logic.timechain_backup import (
         AUXILIARY_BACKUP_PATHS, TimeChainBackup,
     )
     # Build a real ProposalStore at a tmp path so the file exists
-    from titan_plugin.maker import ProposalStore, ProposalType
+    from titan_hcl.maker import ProposalStore, ProposalType
     fake_aux_path = tmp_path / "fake_maker_proposals.db"
     store = ProposalStore(db_path=str(fake_aux_path))
     store.create(
@@ -40,7 +40,7 @@ def test_auxiliary_files_included_in_tarball(tmp_path, monkeypatch):
 
     # Monkey-patch AUXILIARY_BACKUP_PATHS to point to our tmp file
     monkeypatch.setattr(
-        "titan_plugin.logic.timechain_backup.AUXILIARY_BACKUP_PATHS",
+        "titan_hcl.logic.timechain_backup.AUXILIARY_BACKUP_PATHS",
         {"auxiliary/maker_proposals.db": str(fake_aux_path)},
     )
 
@@ -54,7 +54,7 @@ def test_auxiliary_files_included_in_tarball(tmp_path, monkeypatch):
     fake_tc.genesis_hash = b"\x00" * 32
     fake_tc.compute_merkle_root = lambda: b"\x01" * 32
     fake_tc.total_blocks = 0
-    with patch("titan_plugin.logic.timechain.TimeChain", return_value=fake_tc):
+    with patch("titan_hcl.logic.timechain.TimeChain", return_value=fake_tc):
         backup = TimeChainBackup(data_dir=str(fake_tc_dir), titan_id="T1")
         tarball, metadata = backup.create_snapshot_tarball()
 
@@ -81,11 +81,11 @@ def test_auxiliary_files_included_in_tarball(tmp_path, monkeypatch):
 
 def test_auxiliary_files_relocated_during_restore(tmp_path, monkeypatch):
     """Verify _restore_from_tarball moves auxiliary/* to disk paths."""
-    from titan_plugin.logic.timechain_backup import TimeChainBackup
+    from titan_hcl.logic.timechain_backup import TimeChainBackup
     # Stub Path for the relocation target — keep within tmp_path
     aux_target = tmp_path / "data_dir" / "maker_proposals.db"
     monkeypatch.setattr(
-        "titan_plugin.logic.timechain_backup.AUXILIARY_BACKUP_PATHS",
+        "titan_hcl.logic.timechain_backup.AUXILIARY_BACKUP_PATHS",
         {"auxiliary/maker_proposals.db": str(aux_target)},
     )
 
@@ -120,7 +120,7 @@ def test_auxiliary_files_relocated_during_restore(tmp_path, monkeypatch):
 
 def test_backward_compat_v2_tarball_has_no_auxiliary(tmp_path):
     """v2 tarballs (no auxiliary section) should still restore cleanly."""
-    from titan_plugin.logic.timechain_backup import TimeChainBackup
+    from titan_hcl.logic.timechain_backup import TimeChainBackup
     # Build a v2-style tarball (only chain data, no auxiliary/)
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:

@@ -54,7 +54,7 @@ def phase_1_identity(args) -> tuple:
     Collect available shards and reconstruct the Titan's keypair.
     Returns (key_bytes, titan_pubkey, keypair_obj).
     """
-    from titan_plugin.utils.shamir import (
+    from titan_hcl.utils.shamir import (
         parse_maker_envelope, combine_shares, decrypt_shard3,
     )
 
@@ -167,7 +167,7 @@ def _fetch_shard2_from_shadow_drive(titan_pubkey: str) -> bytes | None:
 
         # Load Shadow Drive account from config
         config_path = os.path.join(
-            os.path.dirname(__file__), "..", "titan_plugin", "config.toml",
+            os.path.dirname(__file__), "..", "titan_hcl", "config.toml",
         )
         sd_account = ""
         try:
@@ -191,7 +191,7 @@ def _fetch_shard2_from_shadow_drive(titan_pubkey: str) -> bytes | None:
         with httpx.Client(timeout=30) as client:
             resp = client.get(url)
             if resp.status_code == 200:
-                from titan_plugin.utils.shamir import decrypt_shard3
+                from titan_hcl.utils.shamir import decrypt_shard3
                 # Shard 2 is encrypted with the same deterministic key as Shard 3
                 return decrypt_shard3(resp.content, titan_pubkey)
             else:
@@ -207,7 +207,7 @@ def _recover_shard3(titan_pubkey: str, genesis_tx: str) -> bytes | None:
     Recover Shard 3 from on-chain Genesis Memo TX.
     Derives the AES key from the pubkey, fetches the memo, decrypts.
     """
-    from titan_plugin.utils.shamir import decrypt_shard3
+    from titan_hcl.utils.shamir import decrypt_shard3
 
     try:
         encrypted_hex = _fetch_genesis_memo(titan_pubkey, genesis_tx)
@@ -230,7 +230,7 @@ def _fetch_genesis_memo(titan_pubkey: str, genesis_tx: str) -> str | None:
         import httpx
 
         config_path = os.path.join(
-            os.path.dirname(__file__), "..", "titan_plugin", "config.toml",
+            os.path.dirname(__file__), "..", "titan_hcl", "config.toml",
         )
         rpc_url = "https://api.mainnet-beta.solana.com"
         try:
@@ -344,7 +344,7 @@ def phase_2_rebody(keypair, titan_pubkey: str) -> str | None:
     # Construct Shadow Drive URL if not in ZK state
     if not sd_url:
         config_path = os.path.join(
-            os.path.dirname(__file__), "..", "titan_plugin", "config.toml",
+            os.path.dirname(__file__), "..", "titan_hcl", "config.toml",
         )
         try:
             try:
@@ -388,7 +388,7 @@ def phase_2_rebody(keypair, titan_pubkey: str) -> str | None:
 
     # Verify integrity
     if expected_hash:
-        from titan_plugin.utils.crypto import verify_file_integrity
+        from titan_hcl.utils.crypto import verify_file_integrity
         print(f"  Verifying archive integrity against ZK anchor...")
         if not verify_file_integrity(archive_path, expected_hash):
             print("  *** INTEGRITY CHECK FAILED — possible brain tampering! ***")
@@ -407,10 +407,10 @@ def _query_zk_account(titan_pubkey: str) -> dict | None:
     """Query the Titan's ZK-Compressed Account for state data."""
     try:
         import httpx
-        from titan_plugin.utils.solana_client import decode_zk_account_data
+        from titan_hcl.utils.solana_client import decode_zk_account_data
 
         config_path = os.path.join(
-            os.path.dirname(__file__), "..", "titan_plugin", "config.toml",
+            os.path.dirname(__file__), "..", "titan_hcl", "config.toml",
         )
         rpc_url = "https://api.mainnet-beta.solana.com"
         try:
@@ -468,7 +468,7 @@ def phase_3_rehydrate(archive_path: str, key_bytes: bytes,
     if encryption_manifest and encryption_manifest.get("algorithm", "none") != "none":
         print(f"  Encrypted archive detected (algorithm={encryption_manifest['algorithm']})")
         try:
-            from titan_plugin.logic.backup_crypto import decrypt_from_manifest
+            from titan_hcl.logic.backup_crypto import decrypt_from_manifest
             import hashlib as _hashlib
             with open(archive_path, "rb") as f:
                 ciphertext = f.read()
@@ -528,7 +528,7 @@ def phase_3_rehydrate(archive_path: str, key_bytes: bytes,
 
     # Re-encrypt keypair for new hardware
     print("  Re-encrypting keypair for this machine's hardware fingerprint...")
-    from titan_plugin.utils.crypto import encrypt_for_machine
+    from titan_hcl.utils.crypto import encrypt_for_machine
 
     os.makedirs("data", exist_ok=True)
     encrypted = encrypt_for_machine(key_bytes)
@@ -542,7 +542,7 @@ def phase_3_rehydrate(archive_path: str, key_bytes: bytes,
     print("  authority.json restored.")
 
     # Re-calculate local state hash for verification
-    from titan_plugin.utils.crypto import hash_file
+    from titan_hcl.utils.crypto import hash_file
     if os.path.exists(archive_path):
         local_hash = hash_file(archive_path)
         print(f"  Local archive hash: {local_hash[:24]}...")
@@ -597,7 +597,7 @@ def phase_4_first_breath(titan_pubkey: str):
     print(f"  Keypair:   data/soul_keypair.enc (re-encrypted for this hardware)")
     print()
     print("  Next steps:")
-    print("    1. Start the Titan: python3 -m titan_plugin.main")
+    print("    1. Start the Titan: python3 -m titan_hcl.main")
     print("    2. The Titan will detect RECOVERY mode and post a rebirth tweet.")
     print("    3. Verify: GET http://localhost:7777/health")
     print(f"{'=' * 70}\n")

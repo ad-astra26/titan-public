@@ -33,7 +33,7 @@ if pgrep -f "twin_telemetry.py" > /dev/null 2>&1; then
 fi
 
 if [ "$TELEMETRY_RUNNING" -eq 0 ]; then
-    if pgrep -f "titan_main" > /dev/null 2>&1; then
+    if pgrep -f "titan_hcl" > /dev/null 2>&1; then
         nohup "$PYTHON" scripts/twin_telemetry.py --duration 600 > /tmp/twin_telemetry.log 2>&1 &
         echo "[$(date +%H:%M)] Telemetry auto-started (PID: $!)"
     fi

@@ -69,7 +69,7 @@ def main():
     # Use a nonexistent init path so the monitor starts CLEAN (no load).
     try:
         sys.path.insert(0, os.path.abspath("."))
-        from titan_plugin.logic.pi_heartbeat import PiHeartbeatMonitor
+        from titan_hcl.logic.pi_heartbeat import PiHeartbeatMonitor
     except ImportError as e:
         print(f"ERROR: cannot import PiHeartbeatMonitor ({e})", file=sys.stderr)
         print("Run from the project root with test_env activated.", file=sys.stderr)

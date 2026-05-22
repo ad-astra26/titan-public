@@ -23,8 +23,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from titan_plugin.api.dashboard import router
-from titan_plugin.core.state_registry import (
+from titan_hcl.api.dashboard import router
+from titan_hcl.core.state_registry import (
     TRINITY_STATE,
     RegistryBank,
     StateRegistryWriter,
@@ -87,10 +87,16 @@ def _make_client(plugin):
     app = FastAPI()
     # Post-S5-amendment: dashboard reads via `app.state.titan_state`
     # (StateAccessor pattern); legacy api/ modules still use
-    # `titan_plugin`. Set both for fixture neutrality.
-    app.state.titan_plugin = plugin
+    # `titan_hcl`. Set both for fixture neutrality.
+    app.state.titan_hcl = plugin
     app.state.titan_state = plugin
     app.include_router(router)
+    # Phase E: mount the v6 roof + legacy /v3,/v4→/v6 redirects so
+    # deprecated paths resolve via 301/308 to the live v6 handler.
+    from titan_hcl.api.v6 import router as _v6_router
+    from titan_hcl.api.v6_deprecation import router as _v6_dep_router
+    app.include_router(_v6_router)
+    app.include_router(_v6_dep_router)
     return TestClient(app)
 
 

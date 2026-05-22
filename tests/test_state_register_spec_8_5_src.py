@@ -18,8 +18,8 @@ import time
 
 import pytest
 
-from titan_plugin import bus
-from titan_plugin.logic.state_register import OuterState, StateRegister
+from titan_hcl import bus
+from titan_hcl.logic.state_register import OuterState, StateRegister
 
 
 # ── Inner src (default) — preserves Phase A+B behavior ───────────────

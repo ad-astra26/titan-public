@@ -19,7 +19,7 @@ class TestImpulseEngineThreshold:
     """Threshold detection and adaptive learning."""
 
     def test_no_impulse_below_threshold(self):
-        from titan_plugin.logic.impulse_engine import ImpulseEngine
+        from titan_hcl.logic.impulse_engine import ImpulseEngine
         engine = ImpulseEngine(threshold=0.3)
         # Small deficit (0.1) — below threshold
         body = _make_deficit(0, 0.4)  # deficit = 0.1
@@ -27,7 +27,7 @@ class TestImpulseEngineThreshold:
         assert result is None
 
     def test_impulse_above_threshold(self):
-        from titan_plugin.logic.impulse_engine import ImpulseEngine
+        from titan_hcl.logic.impulse_engine import ImpulseEngine
         engine = ImpulseEngine(threshold=0.3, cooldown_seconds=0)
         # Large deficit (0.4) — above threshold
         body = _make_deficit(0, 0.1)  # deficit = 0.4
@@ -38,7 +38,7 @@ class TestImpulseEngineThreshold:
         assert result["urgency"] > 0
 
     def test_cooldown_prevents_rapid_fire(self):
-        from titan_plugin.logic.impulse_engine import ImpulseEngine
+        from titan_hcl.logic.impulse_engine import ImpulseEngine
         engine = ImpulseEngine(threshold=0.2, cooldown_seconds=300)
         body = _make_deficit(0, 0.1)  # deficit = 0.4
         # First impulse fires
@@ -49,7 +49,7 @@ class TestImpulseEngineThreshold:
         assert r2 is None
 
     def test_cooldown_expired_allows_fire(self):
-        from titan_plugin.logic.impulse_engine import ImpulseEngine
+        from titan_hcl.logic.impulse_engine import ImpulseEngine
         engine = ImpulseEngine(threshold=0.2, cooldown_seconds=0)
         body = _make_deficit(0, 0.1)
         mind = _make_deficit(0, 0.1)  # different posture (research)
@@ -65,7 +65,7 @@ class TestImpulseEngineOutcomeLearning:
     """Threshold adapts based on action outcomes."""
 
     def test_success_decreases_threshold(self):
-        from titan_plugin.logic.impulse_engine import ImpulseEngine
+        from titan_hcl.logic.impulse_engine import ImpulseEngine
         engine = ImpulseEngine(threshold=0.3, alpha=0.01, beta=0.015)
         initial = engine.threshold
         # Simulate successful outcome (loss decreased)
@@ -76,7 +76,7 @@ class TestImpulseEngineOutcomeLearning:
         assert engine.threshold < initial
 
     def test_failure_increases_threshold(self):
-        from titan_plugin.logic.impulse_engine import ImpulseEngine
+        from titan_hcl.logic.impulse_engine import ImpulseEngine
         engine = ImpulseEngine(threshold=0.3, alpha=0.01, beta=0.015)
         initial = engine.threshold
         # Simulate failed outcome (loss increased)
@@ -87,7 +87,7 @@ class TestImpulseEngineOutcomeLearning:
         assert engine.threshold > initial
 
     def test_threshold_respects_floor(self):
-        from titan_plugin.logic.impulse_engine import ImpulseEngine
+        from titan_hcl.logic.impulse_engine import ImpulseEngine
         engine = ImpulseEngine(threshold=0.11, floor=0.1, alpha=0.05)
         before = {"body": [0.2] * 5, "mind": [0.5] * 5, "spirit": [0.5] * 5}
         after = {"body": [0.5] * 5, "mind": [0.5] * 5, "spirit": [0.5] * 5}
@@ -95,7 +95,7 @@ class TestImpulseEngineOutcomeLearning:
         assert engine.threshold >= 0.1
 
     def test_threshold_respects_ceil(self):
-        from titan_plugin.logic.impulse_engine import ImpulseEngine
+        from titan_hcl.logic.impulse_engine import ImpulseEngine
         engine = ImpulseEngine(threshold=0.69, ceil=0.7, beta=0.05)
         before = {"body": [0.5] * 5, "mind": [0.5] * 5, "spirit": [0.5] * 5}
         after = {"body": [0.1] * 5, "mind": [0.5] * 5, "spirit": [0.5] * 5}
@@ -107,7 +107,7 @@ class TestImpulseEnginePostureMapping:
     """Deficit → posture mapping correctness."""
 
     def test_body_energy_maps_to_rest(self):
-        from titan_plugin.logic.impulse_engine import ImpulseEngine
+        from titan_hcl.logic.impulse_engine import ImpulseEngine
         engine = ImpulseEngine(threshold=0.2, cooldown_seconds=0)
         body = _make_deficit(0, 0.1)  # interoception deficit
         result = engine.observe(body, _make_centered(), _make_centered())
@@ -115,7 +115,7 @@ class TestImpulseEnginePostureMapping:
         assert result["posture"] == "rest"
 
     def test_mind_vision_maps_to_research(self):
-        from titan_plugin.logic.impulse_engine import ImpulseEngine
+        from titan_hcl.logic.impulse_engine import ImpulseEngine
         engine = ImpulseEngine(threshold=0.2, cooldown_seconds=0)
         mind = _make_deficit(0, 0.1)  # vision deficit
         result = engine.observe(_make_centered(), mind, _make_centered())
@@ -123,7 +123,7 @@ class TestImpulseEnginePostureMapping:
         assert result["posture"] == "research"
 
     def test_mind_social_maps_to_socialize(self):
-        from titan_plugin.logic.impulse_engine import ImpulseEngine
+        from titan_hcl.logic.impulse_engine import ImpulseEngine
         engine = ImpulseEngine(threshold=0.2, cooldown_seconds=0)
         mind = _make_deficit(1, 0.1)  # hearing deficit
         result = engine.observe(_make_centered(), mind, _make_centered())
@@ -131,7 +131,7 @@ class TestImpulseEnginePostureMapping:
         assert result["posture"] == "socialize"
 
     def test_mind_mood_maps_to_create(self):
-        from titan_plugin.logic.impulse_engine import ImpulseEngine
+        from titan_hcl.logic.impulse_engine import ImpulseEngine
         engine = ImpulseEngine(threshold=0.2, cooldown_seconds=0)
         mind = _make_deficit(4, 0.1)  # touch/mood deficit
         result = engine.observe(_make_centered(), mind, _make_centered())
@@ -143,7 +143,7 @@ class TestImpulseEngineStats:
     """Stats and introspection."""
 
     def test_stats_structure(self):
-        from titan_plugin.logic.impulse_engine import ImpulseEngine
+        from titan_hcl.logic.impulse_engine import ImpulseEngine
         engine = ImpulseEngine()
         stats = engine.get_stats()
         assert "threshold" in stats

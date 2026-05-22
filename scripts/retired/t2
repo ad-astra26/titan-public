@@ -1,0 +1,141 @@
+#!/bin/bash
+# t2 — Lightweight T2 management from T1
+# Runs t2_manage.sh on T2 via SSH without deploying code.
+# For deploy + manage, use: bash scripts/deploy_t2.sh --<cmd>
+#
+# Usage:
+#   bash scripts/t2 status          Process + API health
+#   bash scripts/t2 health          Full health JSON
+#   bash scripts/t2 stop            Stop T2
+#   bash scripts/t2 start           Start T2
+#   bash scripts/t2 restart         Stop + start T2
+#   bash scripts/t2 log [N]         Last N log lines (default 30)
+#   bash scripts/t2 log-errors      Recent errors/warnings
+#   bash scripts/t2 vocab           Vocabulary state
+#   bash scripts/t2 wallet          Wallet address + balance
+#   bash scripts/t2 connections     Active connections on 7777
+#   bash scripts/t2 ns              NS training stats (backup DB)
+#   bash scripts/t2 chi             Chi life force
+#   bash scripts/t2 inner-trinity   Full inner trinity state
+#   bash scripts/t2 neuromods       Neuromodulator levels
+#   bash scripts/t2 pyexec 'code'   Run Python with venv active
+#   bash scripts/t2 shell 'cmd'     Run arbitrary shell command in project dir
+
+T2_HOST="root@10.135.0.6"
+TITAN_DIR="/home/antigravity/projects/titan"
+T2_MANAGE="${TITAN_DIR}/scripts/t2_manage.sh"
+
+CMD="${1:-status}"
+shift 2>/dev/null || true
+
+# Commands handled by t2_manage.sh on remote
+case "$CMD" in
+    status|stop|start|restart|health|log|log-errors|wallet|vocab|connections|pyexec)
+        ssh -o ConnectTimeout=10 "$T2_HOST" "bash $T2_MANAGE $CMD $*"
+        ;;
+
+    # Extended commands — API queries from T1 (no SSH escaping issues)
+    ns)
+        curl -s http://10.135.0.6:7777/v4/inner-trinity 2>/dev/null | python3 -c "
+import sys, json
+d = json.load(sys.stdin).get('data', {})
+ns = d.get('neural_nervous_system', {})
+print(f'Train Steps:  {ns.get(\"total_train_steps\", \"?\")}')
+print(f'Transitions:  {ns.get(\"total_transitions\", \"?\")}')
+print(f'Maturity:     {ns.get(\"maturity\", \"?\")}')
+print(f'Phase:        {ns.get(\"training_phase\", \"?\")}')
+print()
+print('Program Fires:')
+for name, prog in ns.get('programs', {}).items():
+    print(f'  {name:12s}  fires={prog.get(\"fire_count\",0):5d}  updates={prog.get(\"total_updates\",0):6d}  loss={prog.get(\"last_loss\",0):.4f}')
+" 2>/dev/null || echo "T2 API not reachable on VPC (use 'bash scripts/t2 health' via SSH instead)"
+        ;;
+
+    chi)
+        curl -s http://10.135.0.6:7777/v4/chi 2>/dev/null | python3 -m json.tool 2>/dev/null \
+            || ssh -o ConnectTimeout=10 "$T2_HOST" "curl -s http://localhost:7777/v4/chi | python3 -m json.tool" 2>/dev/null \
+            || echo "T2 not reachable"
+        ;;
+
+    inner-trinity)
+        curl -s http://10.135.0.6:7777/v4/inner-trinity 2>/dev/null | python3 -c "
+import sys, json
+d = json.load(sys.stdin).get('data', {})
+ns = d.get('neural_nervous_system', {})
+print(f'Tick Count:   {d.get(\"tick_count\", \"?\")}')
+print(f'Dreaming:     {d.get(\"is_dreaming\", \"?\")}')
+print(f'Dream Cycles: {d.get(\"cycle_count\", \"?\")}')
+print(f'NS Steps:     {ns.get(\"total_train_steps\", \"?\")}')
+print(f'NS Trans:     {ns.get(\"total_transitions\", \"?\")}')
+print(f'Maturity:     {ns.get(\"maturity\", \"?\")}')
+pi = d.get('pi_heartbeat', {})
+print(f'Dev Age:      {pi.get(\"developmental_age\", pi.get(\"cluster_count\", \"?\"))}')
+print(f'Episodic:     {d.get(\"episodic_memory\", {}).get(\"total\", \"?\")}')
+print(f'Working Mem:  {d.get(\"working_memory\", {})}')
+expr = d.get('expression_composites', {})
+if expr:
+    print()
+    print('Expression Composites:')
+    for name, c in expr.get('composites', {}).items():
+        print(f'  {name:10s}  fires={c.get(\"fire_count\",0):5d}  urge={c.get(\"last_urge\",0):.2f}')
+" 2>/dev/null || ssh -o ConnectTimeout=10 "$T2_HOST" "bash $T2_MANAGE pyexec \"
+import urllib.request, json
+d = json.loads(urllib.request.urlopen('http://localhost:7777/v4/inner-trinity').read()).get('data',{})
+ns = d.get('neural_nervous_system',{})
+print(f'Tick: {d.get(\\\"tick_count\\\",\\\"?\\\")} | NS Steps: {ns.get(\\\"total_train_steps\\\",\\\"?\\\")} | Trans: {ns.get(\\\"total_transitions\\\",\\\"?\\\")}')
+\"" 2>/dev/null || echo "T2 not reachable"
+        ;;
+
+    neuromods)
+        curl -s http://10.135.0.6:7777/v4/inner-trinity 2>/dev/null | python3 -c "
+import sys, json
+d = json.load(sys.stdin).get('data', {})
+mods = d.get('neuromodulators', {})
+levels = mods.get('levels', mods)
+if isinstance(levels, dict):
+    for name, val in levels.items():
+        if isinstance(val, dict):
+            print(f'{name:10s}  level={val.get(\"level\",\"?\"):.3f}  tonic={val.get(\"tonic\",\"?\"):.3f}  sensitivity={val.get(\"sensitivity\",\"?\"):.3f}')
+        else:
+            print(f'{name}: {val}')
+" 2>/dev/null || echo "T2 not reachable"
+        ;;
+
+    deploy)
+        echo "Use: bash scripts/deploy_t2.sh [--restart|--stop|--start|--status]"
+        ;;
+
+    shell)
+        ssh -o ConnectTimeout=10 "$T2_HOST" "cd $TITAN_DIR && $*"
+        ;;
+
+    *)
+        echo "T2 Management — Lightweight wrapper"
+        echo ""
+        echo "Process Management:"
+        echo "  bash scripts/t2 status          Process + API health"
+        echo "  bash scripts/t2 stop            Stop T2"
+        echo "  bash scripts/t2 start           Start T2"
+        echo "  bash scripts/t2 restart         Stop + start"
+        echo ""
+        echo "Monitoring:"
+        echo "  bash scripts/t2 health          Full health JSON"
+        echo "  bash scripts/t2 ns              NS training stats"
+        echo "  bash scripts/t2 chi             Chi life force"
+        echo "  bash scripts/t2 inner-trinity   Full inner trinity"
+        echo "  bash scripts/t2 neuromods       Neuromodulator levels"
+        echo "  bash scripts/t2 vocab           Vocabulary state"
+        echo "  bash scripts/t2 log [N]         Last N log lines"
+        echo "  bash scripts/t2 log-errors      Recent errors"
+        echo "  bash scripts/t2 connections     Active connections"
+        echo ""
+        echo "Advanced:"
+        echo "  bash scripts/t2 wallet          Wallet info"
+        echo "  bash scripts/t2 pyexec 'code'   Run Python on T2"
+        echo "  bash scripts/t2 shell 'cmd'     Run shell cmd on T2"
+        echo ""
+        echo "Deploy (syncs code + optional restart):"
+        echo "  bash scripts/deploy_t2.sh [--restart]"
+        exit 1
+        ;;
+esac

@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import msgpack
 
-from titan_plugin import bus
-from titan_plugin.bus import (
+from titan_hcl import bus
+from titan_hcl.bus import (
     BUS_HANDOFF_CANCELED,
     BUS_WORKER_ADOPT_ACK,
     BUS_WORKER_ADOPT_REQUEST,

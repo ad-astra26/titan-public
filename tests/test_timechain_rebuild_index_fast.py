@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from titan_plugin.logic.timechain import (
+from titan_hcl.logic.timechain import (
     TimeChain, FORK_NAMES, FORK_MAIN, FORK_DECLARATIVE, FORK_EPISODIC,
 )
 
@@ -37,7 +37,7 @@ class TestRebuildIndexFast(unittest.TestCase):
     def _seed_chain_with_blocks(self, n_main: int = 5, n_decl: int = 3,
                                   n_epi: int = 7) -> TimeChain:
         """Create a TimeChain + commit some blocks to populate chain files."""
-        from titan_plugin.logic.timechain import BlockPayload
+        from titan_hcl.logic.timechain import BlockPayload
         tc = TimeChain(data_dir=str(self.data_dir), titan_id="TEST")
         # Genesis (needs content dict)
         tc.create_genesis({"birth_block": True, "test_run": True})

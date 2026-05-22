@@ -1,8 +1,8 @@
-"""Unit tests for titan_plugin.logic.knowledge_errors (KP-4)."""
+"""Unit tests for titan_hcl.logic.knowledge_errors (KP-4)."""
 
 import pytest
 
-from titan_plugin.logic.knowledge_errors import (
+from titan_hcl.logic.knowledge_errors import (
     Backend4xx,
     BackendDown,
     BackendEmpty,

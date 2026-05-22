@@ -110,7 +110,9 @@ pub enum SlotIoError {
     },
 
     /// Buffer CRC32 mismatch — safety net for corruption or race edge cases.
-    #[error("slot at {path} buffer CRC mismatch (stored {stored:#010x}, computed {computed:#010x})")]
+    #[error(
+        "slot at {path} buffer CRC mismatch (stored {stored:#010x}, computed {computed:#010x})"
+    )]
     BufferCrcMismatch {
         /// Slot path.
         path: PathBuf,
@@ -164,8 +166,7 @@ impl SlotIoError {
 
 /// Total bytes for a slot file = `16 (header) + 3 × (16 (meta) + payload_bytes)`.
 fn total_slot_bytes(payload_bytes: u32) -> u64 {
-    SHM_HEADER_BYTES
-        + (SHM_BUFFER_COUNT * (SHM_BUFFER_META_BYTES + payload_bytes as u64))
+    SHM_HEADER_BYTES + (SHM_BUFFER_COUNT * (SHM_BUFFER_META_BYTES + payload_bytes as u64))
 }
 
 fn now_ns() -> u64 {
@@ -560,7 +561,10 @@ mod tests {
         let path = dir.path().join("test_slot.bin");
         let slot = Slot::create(&path, 1, 64).unwrap();
         let h = slot.header();
-        assert!(h.is_initialized(), "slot should be initialized after create");
+        assert!(
+            h.is_initialized(),
+            "slot should be initialized after create"
+        );
         assert_eq!(h.version(), 1);
         assert_eq!(h.ready_idx(), 0);
         assert_eq!(h.schema_version, 1);
@@ -667,8 +671,8 @@ mod tests {
         let buf1_meta = slot.buffer_meta(1);
         let buf2_meta = slot.buffer_meta(2);
         assert_eq!(buf0_meta.payload_bytes, 16); // initial zero publish, untouched
-        assert_eq!(buf1_meta.payload_bytes, 5);  // "alpha"
-        assert_eq!(buf2_meta.payload_bytes, 0);  // never written
+        assert_eq!(buf1_meta.payload_bytes, 5); // "alpha"
+        assert_eq!(buf2_meta.payload_bytes, 0); // never written
 
         slot.write(b"beta").unwrap();
         // ready_idx=2, buf 1 still "alpha", buf 2 has "beta" (4 bytes), buf 0 still untouched.
@@ -709,8 +713,8 @@ mod tests {
         let path = dir.path().join("test_slot.bin");
         {
             let mut original = Slot::create(&path, 1, 64).unwrap();
-            original.write(b"first").unwrap();   // version=2, idx=1
-            original.write(b"second").unwrap();  // version=3, idx=2
+            original.write(b"first").unwrap(); // version=2, idx=1
+            original.write(b"second").unwrap(); // version=3, idx=2
         }
 
         let mut reopened = Slot::open(&path).unwrap();
@@ -720,7 +724,7 @@ mod tests {
         let read = reopened.read().unwrap();
         assert_eq!(read, b"second");
 
-        reopened.write(b"third").unwrap();  // version=4, idx=0 (wrapped)
+        reopened.write(b"third").unwrap(); // version=4, idx=0 (wrapped)
         let h = reopened.header();
         assert_eq!(h.ready_idx(), 0);
         assert_eq!(h.version(), 4);
@@ -746,7 +750,10 @@ mod tests {
         let corrupt_seq = pack_header_seq(2, 5);
         store_header_seq_release(&mut slot.mmap[..], corrupt_seq);
         let result = slot.read();
-        assert!(matches!(result, Err(SlotIoError::ReadyIdxOutOfRange { got: 5, .. })));
+        assert!(matches!(
+            result,
+            Err(SlotIoError::ReadyIdxOutOfRange { got: 5, .. })
+        ));
     }
 
     #[test]

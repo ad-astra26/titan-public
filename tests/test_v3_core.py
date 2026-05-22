@@ -9,11 +9,11 @@ import pytest
 
 def test_bus_subscribe_publish():
     """DivineBus routes messages to subscribers."""
-    from titan_plugin.bus import DivineBus, make_msg
+    from titan_hcl.bus import DivineBus, make_msg
 
     bus = DivineBus()
     q1 = bus.subscribe("memory")
-    q2 = bus.subscribe("rl")
+    q2 = bus.subscribe("recorder")
 
     # Targeted message
     msg = make_msg("TEST", "core", "memory", {"data": 42})
@@ -28,12 +28,12 @@ def test_bus_subscribe_publish():
 
 def test_bus_broadcast():
     """DivineBus broadcast goes to all except sender."""
-    from titan_plugin.bus import DivineBus, make_msg
+    from titan_hcl.bus import DivineBus, make_msg
 
     bus = DivineBus()
     q_core = bus.subscribe("core")
     q_mem = bus.subscribe("memory")
-    q_rl = bus.subscribe("rl")
+    q_rl = bus.subscribe("recorder")
 
     msg = make_msg("EPOCH_TICK", "core", "all", {"epoch": 1})
     delivered = bus.publish(msg)
@@ -46,7 +46,7 @@ def test_bus_broadcast():
 
 def test_bus_drain():
     """DivineBus drain reads multiple messages."""
-    from titan_plugin.bus import DivineBus, make_msg
+    from titan_hcl.bus import DivineBus, make_msg
 
     bus = DivineBus()
     q = bus.subscribe("test")
@@ -65,7 +65,7 @@ def test_bus_drain():
 
 def test_bus_full_queue_drops():
     """DivineBus drops messages when queue is full."""
-    from titan_plugin.bus import DivineBus, make_msg
+    from titan_hcl.bus import DivineBus, make_msg
 
     bus = DivineBus(maxsize=5)
     q = bus.subscribe("test")
@@ -80,7 +80,7 @@ def test_bus_full_queue_drops():
 
 def test_bus_request_response():
     """DivineBus sync request/response works."""
-    from titan_plugin.bus import DivineBus, make_msg, QUERY, RESPONSE
+    from titan_hcl.bus import DivineBus, make_msg, QUERY, RESPONSE
     import threading
 
     bus = DivineBus()
@@ -105,8 +105,8 @@ def test_bus_request_response():
 
 def test_guardian_register():
     """Guardian registers module specs."""
-    from titan_plugin.bus import DivineBus
-    from titan_plugin.guardian import Guardian, ModuleSpec
+    from titan_hcl.bus import DivineBus
+    from titan_hcl.guardian import Guardian, ModuleSpec
 
     bus = DivineBus()
     g = Guardian(bus)
@@ -118,8 +118,8 @@ def test_guardian_register():
 
 def test_guardian_start_stop():
     """Guardian starts and stops a module process."""
-    from titan_plugin.bus import DivineBus
-    from titan_plugin.guardian import Guardian, ModuleSpec, ModuleState
+    from titan_hcl.bus import DivineBus
+    from titan_hcl.guardian import Guardian, ModuleSpec, ModuleState
 
     bus = DivineBus(multiprocess=True)
     g = Guardian(bus)
@@ -142,8 +142,8 @@ def test_guardian_start_stop():
 
 def test_guardian_status():
     """Guardian.get_status() returns module info."""
-    from titan_plugin.bus import DivineBus
-    from titan_plugin.guardian import Guardian, ModuleSpec
+    from titan_hcl.bus import DivineBus
+    from titan_hcl.guardian import Guardian, ModuleSpec
 
     bus = DivineBus()
     g = Guardian(bus)
@@ -211,8 +211,8 @@ def _echo_worker(recv_queue, send_queue, name, config):
 
 def test_cross_process_ipc():
     """Test full cross-process IPC: Core → Bus → Worker → SendQueue → Bus → reply."""
-    from titan_plugin.bus import DivineBus
-    from titan_plugin.guardian import Guardian, ModuleSpec, ModuleState
+    from titan_hcl.bus import DivineBus
+    from titan_hcl.guardian import Guardian, ModuleSpec, ModuleState
 
     bus = DivineBus(multiprocess=True)
     g = Guardian(bus)
@@ -241,7 +241,7 @@ def test_cross_process_ipc():
     assert info.state in (ModuleState.RUNNING, ModuleState.STARTING)
 
     # Send a QUERY through the bus to the echo worker
-    from titan_plugin.bus import make_request
+    from titan_hcl.bus import make_request
     client_q = bus.subscribe("test_client")
     query = make_request("test_client", "echo", {"hello": "world"})
     bus.publish(query)
@@ -268,8 +268,8 @@ def test_cross_process_ipc():
 
 def test_guardian_drain_send_queues():
     """Guardian.drain_send_queues routes worker messages to bus."""
-    from titan_plugin.bus import DivineBus
-    from titan_plugin.guardian import Guardian, ModuleSpec
+    from titan_hcl.bus import DivineBus
+    from titan_hcl.guardian import Guardian, ModuleSpec
 
     bus = DivineBus(multiprocess=True)
     g = Guardian(bus)
@@ -291,7 +291,7 @@ def test_guardian_drain_send_queues():
 
 def test_body_sensor_collection():
     """Body worker collects 5DT tensor with severity categories."""
-    from titan_plugin.modules.body_worker import (
+    from titan_hcl.modules.body_worker import (
         _collect_body_tensor, _load_thresholds, Severity
     )
     from collections import deque
@@ -324,7 +324,7 @@ def test_body_sensor_collection():
 
 def test_body_severity_weighting():
     """Critical events produce lower health scores than INFO."""
-    from titan_plugin.modules.body_worker import Severity
+    from titan_hcl.modules.body_worker import Severity
 
     # Category weights are exponential
     assert Severity.INFO == 1
@@ -346,7 +346,7 @@ def test_body_severity_weighting():
 
 def test_body_velocity_calculation():
     """Velocity detects rapid changes in sensor readings."""
-    from titan_plugin.modules.body_worker import _calculate_velocity
+    from titan_hcl.modules.body_worker import _calculate_velocity
     from collections import deque
 
     hist = deque(maxlen=30)
@@ -378,7 +378,7 @@ def test_body_velocity_calculation():
 
 def test_make_msg_format():
     """make_msg produces valid envelope."""
-    from titan_plugin.bus import make_msg
+    from titan_hcl.bus import make_msg
 
     msg = make_msg("BODY_STATE", "body", "core", {"tensor": [0.5] * 5})
     assert msg["type"] == "BODY_STATE"
@@ -391,7 +391,7 @@ def test_make_msg_format():
 
 def test_make_request_has_rid():
     """make_request generates a unique request ID."""
-    from titan_plugin.bus import make_request
+    from titan_hcl.bus import make_request
 
     r1 = make_request("client", "server", {"q": 1})
     r2 = make_request("client", "server", {"q": 2})
@@ -404,15 +404,17 @@ def test_make_request_has_rid():
 # ── Proxy Wiring Tests ──────────────────────────────────────────────
 
 def test_proxy_creation():
-    """Proxies are created and wired to the bus."""
-    from titan_plugin.bus import DivineBus
-    from titan_plugin.guardian import Guardian
-    from titan_plugin.proxies.memory_proxy import MemoryProxy
-    from titan_plugin.proxies.rl_proxy import RLProxy
-    from titan_plugin.proxies.llm_proxy import LLMProxy
-    from titan_plugin.proxies.mind_proxy import MindProxy
-    from titan_plugin.proxies.body_proxy import BodyProxy
-    from titan_plugin.proxies.spirit_proxy import SpiritProxy
+    """Bus-wired proxies are created and subscribe to the bus.
+
+    Phase C trinity-in-Rust: the body/mind/spirit proxies became Rust-backed
+    SHM readers (BodyProxy/MindProxy construct but do NOT subscribe to the
+    bus; SpiritProxy was removed entirely). The bus-subscribing proxies are
+    memory/rl/llm — those are what this test wires + asserts."""
+    from titan_hcl.bus import DivineBus
+    from titan_hcl.guardian import Guardian
+    from titan_hcl.proxies.memory_proxy import MemoryProxy
+    from titan_hcl.proxies.rl_proxy import RLProxy
+    from titan_hcl.proxies.llm_proxy import LLMProxy
 
     bus = DivineBus()
     guardian = Guardian(bus)
@@ -420,23 +422,17 @@ def test_proxy_creation():
     mem = MemoryProxy(bus, guardian)
     rl = RLProxy(bus, guardian)
     llm = LLMProxy(bus, guardian)
-    mind = MindProxy(bus, guardian)
-    body = BodyProxy(bus, guardian)
-    spirit = SpiritProxy(bus, guardian)
 
-    # All proxies should have subscribed to the bus
+    # The bus-wired proxies should have subscribed to the bus.
     assert "memory_proxy" in bus.modules
     assert "rl_proxy" in bus.modules
     assert "llm_proxy" in bus.modules
-    assert "mind_proxy" in bus.modules
-    assert "body_proxy" in bus.modules
-    assert "spirit_proxy" in bus.modules
 
 
 def test_mind_proxy_routes_to_worker():
     """MindProxy sends QUERY via bus, worker echoes back."""
-    from titan_plugin.bus import DivineBus
-    from titan_plugin.guardian import Guardian, ModuleSpec, ModuleState
+    from titan_hcl.bus import DivineBus
+    from titan_hcl.guardian import Guardian, ModuleSpec, ModuleState
 
     bus = DivineBus(multiprocess=True)
     guardian = Guardian(bus)
@@ -461,7 +457,7 @@ def test_mind_proxy_routes_to_worker():
     guardian.monitor_tick()
 
     # Create MindProxy and query mood
-    from titan_plugin.proxies.mind_proxy import MindProxy
+    from titan_hcl.proxies.mind_proxy import MindProxy
     mind = MindProxy(bus, guardian)
 
     # Send query — worker should respond
@@ -480,13 +476,13 @@ def test_mind_proxy_routes_to_worker():
 
 def test_body_proxy_routes_to_worker():
     """BodyProxy sends QUERY via bus, worker returns tensor."""
-    from titan_plugin.bus import DivineBus
-    from titan_plugin.guardian import Guardian, ModuleSpec
+    from titan_hcl.bus import DivineBus
+    from titan_hcl.guardian import Guardian, ModuleSpec
 
     bus = DivineBus(multiprocess=True)
     guardian = Guardian(bus)
 
-    from titan_plugin.modules.body_worker import body_worker_main
+    from titan_hcl.modules.body_worker import body_worker_main
     guardian.register(ModuleSpec(
         name="body",
         entry_fn=body_worker_main,
@@ -511,7 +507,7 @@ def test_body_proxy_routes_to_worker():
         time.sleep(0.2)
 
     # Create BodyProxy and query tensor
-    from titan_plugin.proxies.body_proxy import BodyProxy
+    from titan_hcl.proxies.body_proxy import BodyProxy
     body = BodyProxy(bus, guardian)
 
     # We need to drain send queues while request is in flight
@@ -541,7 +537,7 @@ def test_body_proxy_routes_to_worker():
 
 def test_mind_vision_ambient():
     """Vision sub_a: knowledge freshness decays over time."""
-    from titan_plugin.modules.mind_worker import _sense_vision_ambient
+    from titan_hcl.modules.mind_worker import _sense_vision_ambient
     import tempfile, os
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -559,7 +555,7 @@ def test_mind_vision_ambient():
 
 def test_mind_hearing_ambient_no_db():
     """Hearing sub_a: no session DB → quiet hearing."""
-    from titan_plugin.modules.mind_worker import _sense_hearing_ambient
+    from titan_hcl.modules.mind_worker import _sense_hearing_ambient
 
     val = _sense_hearing_ambient("/nonexistent/path/sessions.db")
     assert 0.3 <= val <= 0.5, f"No DB should give moderate hearing: {val}"
@@ -567,7 +563,7 @@ def test_mind_hearing_ambient_no_db():
 
 def test_mind_smell_circadian():
     """Smell: circadian fallback produces valid value."""
-    from titan_plugin.modules.mind_worker import _get_circadian_rhythm
+    from titan_hcl.modules.mind_worker import _get_circadian_rhythm
 
     val = _get_circadian_rhythm()
     assert 0.0 <= val <= 1.0, f"Circadian out of range: {val}"
@@ -575,7 +571,7 @@ def test_mind_smell_circadian():
 
 def test_mind_tensor_all_senses():
     """Full Mind tensor returns 5 valid values with dual-layer perception."""
-    from titan_plugin.modules.mind_worker import _collect_mind_tensor
+    from titan_hcl.modules.mind_worker import _collect_mind_tensor
 
     media_state = {
         "last_visual": None,
@@ -592,7 +588,7 @@ def test_mind_tensor_all_senses():
 
 def test_mind_media_digest_decay():
     """Media sub_b features decay toward neutral over time."""
-    from titan_plugin.modules.mind_worker import _get_decayed_feature
+    from titan_hcl.modules.mind_worker import _get_decayed_feature
     import time as _t
 
     media_state = {
@@ -615,7 +611,7 @@ def test_mind_media_digest_decay():
 
 def test_media_image_digest():
     """Image digest extracts 5 valid features."""
-    from titan_plugin.modules.media_worker import _digest_image
+    from titan_hcl.modules.media_worker import _digest_image
     from PIL import Image
     import tempfile
     from pathlib import Path
@@ -651,7 +647,7 @@ def test_media_image_digest():
 
 def test_media_image_harmony_varies():
     """Different images produce different harmony scores."""
-    from titan_plugin.modules.media_worker import _digest_image
+    from titan_hcl.modules.media_worker import _digest_image
     from PIL import Image
     import tempfile, numpy as np
     from pathlib import Path
@@ -685,7 +681,7 @@ def test_media_image_harmony_varies():
 
 def test_middle_path_loss_at_center():
     """Middle Path loss is zero when all tensors are at center."""
-    from titan_plugin.logic.middle_path import middle_path_loss
+    from titan_hcl.logic.middle_path import middle_path_loss
     center = [0.5] * 5
     loss = middle_path_loss(center, center, center)
     assert loss == 0.0
@@ -693,7 +689,7 @@ def test_middle_path_loss_at_center():
 
 def test_middle_path_loss_increases_with_drift():
     """Middle Path loss increases as tensors drift from center."""
-    from titan_plugin.logic.middle_path import middle_path_loss
+    from titan_hcl.logic.middle_path import middle_path_loss
     center = [0.5] * 5
     drifted = [0.9, 0.9, 0.9, 0.9, 0.9]  # All drifted high
     loss_center = middle_path_loss(center, center, center)
@@ -704,7 +700,7 @@ def test_middle_path_loss_increases_with_drift():
 
 def test_middle_path_per_dim_loss():
     """Per-dim loss correctly identifies the drifted dimension."""
-    from titan_plugin.logic.middle_path import per_dim_loss
+    from titan_hcl.logic.middle_path import per_dim_loss
     tensor = [0.5, 0.5, 0.9, 0.5, 0.5]  # Only dim 2 drifted
     losses = per_dim_loss(tensor)
     assert losses[2] > 0.1  # Drifted dim has high loss
@@ -713,7 +709,7 @@ def test_middle_path_per_dim_loss():
 
 def test_filter_down_value_network_forward():
     """TrinityValueNet produces a scalar output from 15-dim input."""
-    from titan_plugin.logic.filter_down import TrinityValueNet
+    from titan_hcl.logic.filter_down import TrinityValueNet
     net = TrinityValueNet()
     state = [0.5] * 15
     value = net.forward(state)
@@ -722,7 +718,7 @@ def test_filter_down_value_network_forward():
 
 def test_filter_down_gradient():
     """Value network gradient w.r.t. input returns 15-dim vector."""
-    from titan_plugin.logic.filter_down import TrinityValueNet
+    from titan_hcl.logic.filter_down import TrinityValueNet
     net = TrinityValueNet()
     state = [0.5] * 15
     grad = net.gradient_wrt_input(state)
@@ -732,7 +728,7 @@ def test_filter_down_gradient():
 
 def test_filter_down_training():
     """FILTER_DOWN trains and reduces loss over iterations."""
-    from titan_plugin.logic.filter_down import TrinityValueNet
+    from titan_hcl.logic.filter_down import TrinityValueNet
     import numpy as np
 
     net = TrinityValueNet()
@@ -756,7 +752,7 @@ def test_filter_down_training():
 def test_filter_down_engine_lifecycle():
     """FilterDownEngine records transitions and computes multipliers."""
     import tempfile
-    from titan_plugin.logic.filter_down import FilterDownEngine
+    from titan_hcl.logic.filter_down import FilterDownEngine
 
     with tempfile.TemporaryDirectory() as tmpdir:
         engine = FilterDownEngine(data_dir=tmpdir)
@@ -782,7 +778,7 @@ def test_filter_down_engine_lifecycle():
 
 def test_focus_pid_nudges():
     """FOCUS PID produces nudges toward center for drifted tensor."""
-    from titan_plugin.logic.focus_pid import FocusPID
+    from titan_hcl.logic.focus_pid import FocusPID
 
     pid = FocusPID("test_body")
     # Tensor drifted high
@@ -796,7 +792,7 @@ def test_focus_pid_nudges():
 
 def test_focus_pid_threshold():
     """FOCUS PID only publishes if nudges exceed threshold."""
-    from titan_plugin.logic.focus_pid import FocusPID
+    from titan_hcl.logic.focus_pid import FocusPID
 
     pid = FocusPID("test")
     # Perfectly centered — no nudge needed
@@ -810,7 +806,7 @@ def test_focus_pid_threshold():
 
 def test_intuition_suggests_for_deficit():
     """INTUITION suggests a posture when a sense has a large deficit."""
-    from titan_plugin.logic.intuition import IntuitionEngine
+    from titan_hcl.logic.intuition import IntuitionEngine
 
     engine = IntuitionEngine()
     # Vision (mind[0]) very low — should suggest research
@@ -825,7 +821,7 @@ def test_intuition_suggests_for_deficit():
 
 def test_intuition_no_suggest_when_balanced():
     """INTUITION doesn't suggest when all senses are near center."""
-    from titan_plugin.logic.intuition import IntuitionEngine
+    from titan_hcl.logic.intuition import IntuitionEngine
 
     engine = IntuitionEngine()
     suggestion = engine.suggest([0.5] * 5, [0.5] * 5, [0.5] * 5)
@@ -834,7 +830,7 @@ def test_intuition_no_suggest_when_balanced():
 
 def test_body_tensor_with_filter_down():
     """Body tensor incorporates FILTER_DOWN multipliers."""
-    from titan_plugin.modules.body_worker import (
+    from titan_hcl.modules.body_worker import (
         _collect_body_tensor, _load_thresholds,
     )
     from collections import deque
@@ -864,7 +860,7 @@ def test_body_tensor_with_filter_down():
 
 def test_mind_tensor_with_filter_down():
     """Mind tensor incorporates FILTER_DOWN multipliers."""
-    from titan_plugin.modules.mind_worker import _collect_mind_tensor
+    from titan_hcl.modules.mind_worker import _collect_mind_tensor
 
     media_state = {
         "last_visual": None, "last_visual_ts": 0.0,
@@ -936,7 +932,7 @@ def _mood_worker(recv_queue, send_queue, name, config):
 
 def test_input_extractor_valence_positive():
     """InputExtractor detects positive valence from positive keywords."""
-    from titan_plugin.logic.interface_input import InputExtractor
+    from titan_hcl.logic.interface_input import InputExtractor
 
     ext = InputExtractor()
     result = ext.extract("This is amazing and wonderful! I love it!")
@@ -945,7 +941,7 @@ def test_input_extractor_valence_positive():
 
 def test_input_extractor_valence_negative():
     """InputExtractor detects negative valence from negative keywords."""
-    from titan_plugin.logic.interface_input import InputExtractor
+    from titan_hcl.logic.interface_input import InputExtractor
 
     ext = InputExtractor()
     result = ext.extract("This is terrible and broken, I hate this bug")
@@ -954,7 +950,7 @@ def test_input_extractor_valence_negative():
 
 def test_input_extractor_valence_neutral():
     """InputExtractor returns near-zero valence for neutral messages."""
-    from titan_plugin.logic.interface_input import InputExtractor
+    from titan_hcl.logic.interface_input import InputExtractor
 
     ext = InputExtractor()
     result = ext.extract("What time is the meeting tomorrow?")
@@ -963,7 +959,7 @@ def test_input_extractor_valence_neutral():
 
 def test_input_extractor_intensity():
     """InputExtractor detects high intensity from caps and punctuation."""
-    from titan_plugin.logic.interface_input import InputExtractor
+    from titan_hcl.logic.interface_input import InputExtractor
 
     ext = InputExtractor()
     calm = ext.extract("ok")
@@ -974,7 +970,7 @@ def test_input_extractor_intensity():
 
 def test_input_extractor_topic_crypto():
     """InputExtractor identifies crypto topic from blockchain keywords."""
-    from titan_plugin.logic.interface_input import InputExtractor
+    from titan_hcl.logic.interface_input import InputExtractor
 
     ext = InputExtractor()
     result = ext.extract("What's the current SOL balance? Any new NFT mints on devnet?")
@@ -983,7 +979,7 @@ def test_input_extractor_topic_crypto():
 
 def test_input_extractor_topic_philosophy():
     """InputExtractor identifies philosophy topic."""
-    from titan_plugin.logic.interface_input import InputExtractor
+    from titan_hcl.logic.interface_input import InputExtractor
 
     ext = InputExtractor()
     result = ext.extract("What does it mean to be conscious? Do you experience awareness and identity?")
@@ -992,7 +988,7 @@ def test_input_extractor_topic_philosophy():
 
 def test_input_extractor_engagement():
     """InputExtractor measures engagement from questions and code."""
-    from titan_plugin.logic.interface_input import InputExtractor
+    from titan_hcl.logic.interface_input import InputExtractor
 
     ext = InputExtractor()
     shallow = ext.extract("hi")
@@ -1002,7 +998,7 @@ def test_input_extractor_engagement():
 
 def test_input_extractor_momentum():
     """InputExtractor tracks conversation momentum over multiple messages."""
-    from titan_plugin.logic.interface_input import InputExtractor
+    from titan_hcl.logic.interface_input import InputExtractor
 
     ext = InputExtractor()
     # Start with short messages
@@ -1018,7 +1014,7 @@ def test_input_extractor_momentum():
 
 def test_output_coloring_stressed_body():
     """OutputColoring generates stress hints when body is low."""
-    from titan_plugin.logic.interface_output import OutputColoring
+    from titan_hcl.logic.interface_output import OutputColoring
 
     coloring = OutputColoring()
     text = coloring.compute(
@@ -1031,7 +1027,7 @@ def test_output_coloring_stressed_body():
 
 def test_output_coloring_healthy():
     """OutputColoring generates positive hints when body is healthy."""
-    from titan_plugin.logic.interface_output import OutputColoring
+    from titan_hcl.logic.interface_output import OutputColoring
 
     coloring = OutputColoring()
     text = coloring.compute(
@@ -1044,7 +1040,7 @@ def test_output_coloring_healthy():
 
 def test_output_coloring_high_equilibrium_loss():
     """OutputColoring reports restlessness when middle path loss is high."""
-    from titan_plugin.logic.interface_output import OutputColoring
+    from titan_hcl.logic.interface_output import OutputColoring
 
     coloring = OutputColoring()
     text = coloring.compute(
@@ -1058,7 +1054,7 @@ def test_output_coloring_high_equilibrium_loss():
 
 def test_output_coloring_with_intuition():
     """OutputColoring includes INTUITION posture hint."""
-    from titan_plugin.logic.interface_output import OutputColoring
+    from titan_hcl.logic.interface_output import OutputColoring
 
     coloring = OutputColoring()
     text = coloring.compute(
@@ -1072,7 +1068,7 @@ def test_output_coloring_with_intuition():
 
 def test_output_coloring_conversation_topic():
     """OutputColoring reflects conversation topic in coloring."""
-    from titan_plugin.logic.interface_output import OutputColoring
+    from titan_hcl.logic.interface_output import OutputColoring
 
     coloring = OutputColoring()
     text = coloring.compute(
@@ -1086,7 +1082,7 @@ def test_output_coloring_conversation_topic():
 
 def test_interface_bus_message():
     """INTERFACE_INPUT message type exists and routes through bus."""
-    from titan_plugin.bus import DivineBus, make_msg, INTERFACE_INPUT
+    from titan_hcl.bus import DivineBus, make_msg, INTERFACE_INPUT
 
     bus = DivineBus()
     q_body = bus.subscribe("body")
@@ -1116,7 +1112,7 @@ def test_interface_bus_message():
 def test_observatory_trinity_snapshot():
     """ObservatoryDB records and retrieves Trinity tensor snapshots."""
     import tempfile, os
-    from titan_plugin.utils.observatory_db import ObservatoryDB
+    from titan_hcl.utils.observatory_db import ObservatoryDB
 
     with tempfile.TemporaryDirectory() as tmp:
         db = ObservatoryDB(os.path.join(tmp, "test.db"))
@@ -1143,7 +1139,7 @@ def test_observatory_trinity_snapshot():
 def test_observatory_trinity_history_window():
     """Trinity history only returns snapshots within the requested time window."""
     import tempfile, os
-    from titan_plugin.utils.observatory_db import ObservatoryDB
+    from titan_hcl.utils.observatory_db import ObservatoryDB
 
     with tempfile.TemporaryDirectory() as tmp:
         db = ObservatoryDB(os.path.join(tmp, "test.db"))
@@ -1167,7 +1163,7 @@ def test_observatory_trinity_history_window():
 def test_observatory_growth_snapshot():
     """ObservatoryDB records and retrieves growth metric snapshots."""
     import tempfile, os
-    from titan_plugin.utils.observatory_db import ObservatoryDB
+    from titan_hcl.utils.observatory_db import ObservatoryDB
 
     with tempfile.TemporaryDirectory() as tmp:
         db = ObservatoryDB(os.path.join(tmp, "test.db"))
@@ -1191,7 +1187,7 @@ def test_observatory_growth_snapshot():
 def test_observatory_schema_migration():
     """ObservatoryDB creates new tables on schema upgrade (v1 → v2)."""
     import tempfile, os, sqlite3
-    from titan_plugin.utils.observatory_db import ObservatoryDB
+    from titan_hcl.utils.observatory_db import ObservatoryDB
 
     with tempfile.TemporaryDirectory() as tmp:
         db_path = os.path.join(tmp, "test.db")
@@ -1222,7 +1218,7 @@ def test_observatory_schema_migration():
 def test_observatory_prune_includes_new_tables():
     """Prune operation covers trinity and growth tables."""
     import tempfile, os
-    from titan_plugin.utils.observatory_db import ObservatoryDB
+    from titan_hcl.utils.observatory_db import ObservatoryDB
 
     with tempfile.TemporaryDirectory() as tmp:
         db = ObservatoryDB(os.path.join(tmp, "test.db"))
@@ -1251,7 +1247,7 @@ def test_config_frontend_section():
         import toml as tomllib
 
     import os
-    config_path = os.path.join(os.path.dirname(__file__), "..", "titan_plugin", "config.toml")
+    config_path = os.path.join(os.path.dirname(__file__), "..", "titan_hcl", "config.toml")
     with open(config_path, "rb") as f:
         config = tomllib.load(f)
 

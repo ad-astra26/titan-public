@@ -21,8 +21,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from titan_plugin import bus
-from titan_plugin.core.shadow_orchestrator import (
+from titan_hcl import bus
+from titan_hcl.core.shadow_orchestrator import (
     HealthCriteria,
     SwapResult,
     _check_adopted_workers_criteria,
@@ -30,7 +30,7 @@ from titan_plugin.core.shadow_orchestrator import (
     _unwind_b2_1_handoff,
     orchestrate_shadow_swap,
 )
-from titan_plugin.guardian import Guardian, ModuleSpec, ModuleState
+from titan_hcl.guardian import Guardian, ModuleSpec, ModuleState
 
 
 def _noop_entry(*args, **kwargs):  # pragma: no cover
@@ -139,7 +139,7 @@ def test_phase_b2_1_wait_adoption_returns_true_when_expected_adopted():
         "backup": {"adopted": True, "state": "running"},
     }}}
     with patch(
-        "titan_plugin.core.shadow_orchestrator._fetch_state_json",
+        "titan_hcl.core.shadow_orchestrator._fetch_state_json",
         return_value=fake_state,
     ):
         ok = _phase_b2_1_wait_adoption(
@@ -164,7 +164,7 @@ def test_phase_b2_1_wait_adoption_returns_false_on_timeout():
         "backup": {"adopted": False, "state": "running"},
     }}}
     with patch(
-        "titan_plugin.core.shadow_orchestrator._fetch_state_json",
+        "titan_hcl.core.shadow_orchestrator._fetch_state_json",
         return_value=fake_state,
     ):
         ok = _phase_b2_1_wait_adoption(

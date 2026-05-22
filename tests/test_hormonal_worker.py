@@ -1,4 +1,4 @@
-"""Tests for titan_plugin.modules.hormonal_worker (C-S5 §10 D22).
+"""Tests for titan_hcl.modules.hormonal_worker (C-S5 §10 D22).
 
 Bus-independent tests covering:
 - Canonical hormone roster matches NS_PROGRAMS
@@ -19,9 +19,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from titan_plugin import bus
-from titan_plugin.logic.emot_bundle_protocol import NS_PROGRAMS
-from titan_plugin.modules import hormonal_worker as hw
+from titan_hcl import bus
+from titan_hcl.logic.emot_bundle_protocol import NS_PROGRAMS
+from titan_hcl.modules import hormonal_worker as hw
 
 
 def test_hormone_names_match_ns_programs_canonical_order():
@@ -77,7 +77,7 @@ def test_encode_returns_correct_shape_and_dtype():
     """encode_hormonal_state must return (11, 4) float32 — matches
     HORMONAL_STATE RegistrySpec in state_registry.py + slot byte
     layout in SPEC §7.1."""
-    from titan_plugin.modules.hormonal_worker import _build_hormonal_system
+    from titan_hcl.modules.hormonal_worker import _build_hormonal_system
     hs = _build_hormonal_system({})
     arr = hw.encode_hormonal_state(hs)
     assert arr.shape == (11, 4)
@@ -99,7 +99,7 @@ def test_encode_with_missing_hormone_zeroes_that_row():
     NOT shift other rows down."""
     class FakeHS:
         def __init__(self, present_names):
-            from titan_plugin.logic.hormonal_pressure import HormonalPressure
+            from titan_hcl.logic.hormonal_pressure import HormonalPressure
             self._hormones = {n: HormonalPressure(name=n) for n in present_names}
 
         def get_hormone(self, name):
@@ -119,7 +119,7 @@ def test_encode_with_missing_hormone_zeroes_that_row():
 def test_encode_decode_round_trip():
     """encode → decode preserves all 4 fields per hormone byte-identically
     (within float32 precision)."""
-    from titan_plugin.modules.hormonal_worker import _build_hormonal_system
+    from titan_hcl.modules.hormonal_worker import _build_hormonal_system
     hs = _build_hormonal_system({})
     # Mutate a few hormones to non-default values so we can verify round-trip
     hs._hormones["REFLEX"].level = 0.42
@@ -155,7 +155,7 @@ def test_decode_rejects_wrong_shape():
 def test_registry_spec_byte_layout_matches_slot():
     """RegistrySpec.payload_bytes must equal HORMONAL_STATE_PAYLOAD_BYTES.
     Drift here = Python writer / Rust reader byte mismatch."""
-    from titan_plugin.core.state_registry import HORMONAL_STATE
+    from titan_hcl.core.state_registry import HORMONAL_STATE
     assert HORMONAL_STATE.shape == (11, 4)
     assert HORMONAL_STATE.dtype == np.dtype("<f4")
     assert HORMONAL_STATE.payload_bytes == hw.HORMONAL_STATE_PAYLOAD_BYTES
@@ -164,7 +164,7 @@ def test_registry_spec_byte_layout_matches_slot():
 
 def test_generated_schema_version_constant_matches_spec():
     """The auto-generated HORMONAL_STATE_SCHEMA_VERSION constant in
-    titan_plugin/_phase_c_constants.py must equal 1 at SPEC v0.1.4 ship
+    titan_hcl/_phase_c_constants.py must equal 1 at SPEC v0.1.4 ship
     (per SPEC §3.1 D05). Drift = SPEC TOML out of sync with code."""
-    from titan_plugin._phase_c_constants import HORMONAL_STATE_SCHEMA_VERSION
+    from titan_hcl._phase_c_constants import HORMONAL_STATE_SCHEMA_VERSION
     assert HORMONAL_STATE_SCHEMA_VERSION == 1

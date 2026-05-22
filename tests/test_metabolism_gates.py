@@ -11,7 +11,7 @@ Run:
 """
 import pytest
 
-from titan_plugin.core.metabolism import MetabolismController
+from titan_hcl.core.metabolism import MetabolismController
 
 
 class _MockNetwork:
@@ -34,11 +34,16 @@ def _make_controller(balance: float, gates_enforced: bool = False) -> Metabolism
 
 
 @pytest.mark.parametrize("balance,expected_tier,expected_features_enabled", [
+    # Thresholds aligned with relaxed mainnet T1 reality per commit
+    # 803bf25f (2026-05-13): THRIVING≥0.15, HEALTHY≥0.05, CONSERVING≥0.02,
+    # SURVIVAL≥0.01, HIBERNATION≥0.001. EMERGENCY shares min_sol=0.01 with
+    # SURVIVAL so the top-down walk in _update_tier always picks SURVIVAL
+    # first — EMERGENCY is currently unreachable via balance alone (pre-
+    # existing config artifact, separate scope).
     (2.0, "THRIVING", True),
-    (0.5, "HEALTHY", True),
-    (0.2, "CONSERVING", True),   # features ENABLED but rate_factor=0.5
-    (0.1, "SURVIVAL", False),
-    (0.03, "EMERGENCY", False),
+    (0.10, "HEALTHY", True),
+    (0.03, "CONSERVING", True),   # features ENABLED but rate_factor=0.5
+    (0.015, "SURVIVAL", False),
     (0.005, "HIBERNATION", False),
 ])
 def test_tier_thresholds(balance, expected_tier, expected_features_enabled):
@@ -60,7 +65,7 @@ def test_evaluate_gate_observation_mode_never_blocks():
 
 def test_evaluate_gate_enforcement_mode_blocks_at_survival():
     """With gates_enforced=True, SURVIVAL tier closes all features."""
-    c = _make_controller(0.1, gates_enforced=True)  # SURVIVAL
+    c = _make_controller(0.015, gates_enforced=True)  # SURVIVAL (≥0.01, <0.02)
     for feature in ("memos", "nfts", "expression", "research", "social"):
         proceed, rate = c.evaluate_gate(feature, f"UnitTest.{feature}")
         assert proceed is False
@@ -69,7 +74,7 @@ def test_evaluate_gate_enforcement_mode_blocks_at_survival():
 
 def test_evaluate_gate_enforcement_mode_at_conserving_throttles():
     """With gates_enforced=True, CONSERVING returns allowed=True with rate=0.5."""
-    c = _make_controller(0.2, gates_enforced=True)  # CONSERVING
+    c = _make_controller(0.03, gates_enforced=True)  # CONSERVING (≥0.02, <0.05)
     proceed, rate = c.evaluate_gate("research", "UnitTest")
     assert proceed is True
     assert rate == 0.5  # half-rate throttle
@@ -77,7 +82,7 @@ def test_evaluate_gate_enforcement_mode_at_conserving_throttles():
 
 def test_evaluate_gate_enforcement_mode_at_healthy_fullrate():
     """With gates_enforced=True, HEALTHY tier passes cleanly at rate=1.0."""
-    c = _make_controller(0.5, gates_enforced=True)  # HEALTHY
+    c = _make_controller(0.10, gates_enforced=True)  # HEALTHY (≥0.05, <0.15)
     proceed, rate = c.evaluate_gate("social", "UnitTest")
     assert proceed is True
     assert rate == 1.0
@@ -99,7 +104,7 @@ def test_ring_buffer_records_decisions():
 
 def test_gate_decision_summary_structure():
     """get_gate_decision_summary returns the telemetry shape used by /v4."""
-    c = _make_controller(0.1, gates_enforced=True)  # SURVIVAL, closures expected
+    c = _make_controller(0.015, gates_enforced=True)  # SURVIVAL (≥0.01, <0.02), closures expected
     c.evaluate_gate("memos", "Test.alpha")
     c.evaluate_gate("memos", "Test.alpha")
     c.evaluate_gate("social", "Test.beta")
@@ -118,7 +123,7 @@ def test_gate_decision_summary_structure():
 
 def test_ring_buffer_bounded():
     """Ring buffer respects _GATE_DECISION_RING_SIZE cap."""
-    from titan_plugin.core.metabolism import _GATE_DECISION_RING_SIZE
+    from titan_hcl.core.metabolism import _GATE_DECISION_RING_SIZE
     c = _make_controller(0.5)
     for i in range(_GATE_DECISION_RING_SIZE + 50):
         c.evaluate_gate("memos", f"Test.{i}")

@@ -27,8 +27,8 @@ use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
     apply_multipliers, compose_multipliers_default, decode_filter_down_payload,
-    decode_local_filter_down_payload, encode_floats, ContentGate, DriftAggregator, FiringSlotWriter,
-    GroundUpEnricher, Side, INNER_BODY_TOPICS,
+    decode_local_filter_down_payload, encode_floats, stateful_update, ContentGate, DriftAggregator,
+    FiringSlotWriter, GroundUpEnricher, Layer, RestoringCfg, Side, INNER_BODY_TOPICS,
 };
 
 /// Drift threshold as fraction of period — 0.5% per master plan §16 OBS gate.
@@ -54,7 +54,7 @@ pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()
     let inner_body_slot = open_slot(shm_dir, "inner_body_5d.bin")?;
     let topology_slot = open_slot(shm_dir, "topology_30d.bin")?;
     // sensor_cache_inner_body.bin is created by Python sidecar
-    // (titan_plugin/logic/inner_body_sensor_refresh.py inside body_worker)
+    // (titan_hcl/logic/inner_body_sensor_refresh.py inside body_worker)
     // which spawns LATER than the Rust daemon — hence Option<Slot> at
     // boot, with retry-open in the tick loop. C-S5 closure 2026-05-08.
     let sensor_cache_path = shm_dir.join("sensor_cache_inner_body.bin");
@@ -131,6 +131,11 @@ struct DaemonState {
     /// Most recent topology_lower from TRINITY_SUBSTRATE_TOPOLOGY_UPDATED.
     /// Cached + slot read happens on tick when topology_signaled=true.
     topology_signaled: bool,
+    /// Set true on each KERNEL_EPOCH_TICK; consumed (swapped false) by the
+    /// tick loop to recompute the ground_up held nudge once per epoch
+    /// (SPEC §G5.1 / 0E — the 0.95 damping EMA must evolve at epoch cadence,
+    /// NOT per Schumann tick).
+    epoch_pending: bool,
     /// Set true when KERNEL_SHUTDOWN_ANNOUNCE arrives.
     shutdown_requested: bool,
 }
@@ -206,6 +211,13 @@ fn handle_bus_message(msg_type: &str, raw_bytes: &[u8], state: &Arc<Mutex<Daemon
                 s.topology_signaled = true;
             }
         }
+        "KERNEL_EPOCH_TICK" => {
+            // 0E: mark an epoch boundary — tick loop recomputes the held
+            // ground_up nudge once per epoch (SPEC §G5.1).
+            if let Ok(mut s) = state.lock() {
+                s.epoch_pending = true;
+            }
+        }
         _ => {}
     }
 }
@@ -224,6 +236,10 @@ async fn run_tick_loop(
     let mut content_gate = ContentGate::new();
     let mut ground_up = GroundUpEnricher::new(Side::Body);
     let mut drift_agg = DriftAggregator::new("body", DRIFT_THRESHOLD_PCT);
+    // §G5.2 traveling-tensor state: x[t-1] and x[t-2]. Cold-start at the 0.5
+    // Divine Centre (checkpoint reload wired in P0 §1.3). Persists across ticks.
+    let mut prev: [f32; 5] = [0.5; 5];
+    let mut prev2: [f32; 5] = [0.5; 5];
 
     // Per master plan §7 + C-S3 PLAN §1.1 #2: Schumann timer wheels live in
     // titan-schumann (substrate-owned shared library). Pinning epoch_t0 to
@@ -270,7 +286,7 @@ async fn run_tick_loop(
                     if let Err(e) = run_one_tick(
                         &bus, &state, &mut content_gate, &mut ground_up,
                         &mut inner_body_slot, &topology_slot, &sensor_cache,
-                        &mut firing_writer,
+                        &mut firing_writer, &mut prev, &mut prev2,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
@@ -302,14 +318,19 @@ async fn run_one_tick(
     topology_slot: &Slot,
     sensor_cache: &Option<Slot>,
     firing_writer: &mut FiringSlotWriter,
+    prev: &mut [f32; 5],
+    prev2: &mut [f32; 5],
 ) -> Result<()> {
     // 1. Read sensor cache (raw 5D body input).
     let mut body = read_sensor_cache(sensor_cache)?;
 
-    // 2. Snapshot bus state (filter_down multipliers + topology flag).
-    let (unified_mult, local_mult, topology_fresh) = {
-        let s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
-        (s.unified, s.local, s.topology_signaled)
+    // 2. Snapshot bus state (filter_down multipliers + topology flag +
+    //    consume the epoch-pending edge for 0E ground_up recompute).
+    let (unified_mult, local_mult, topology_fresh, epoch_due) = {
+        let mut s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
+        let epoch_due = s.epoch_pending;
+        s.epoch_pending = false;
+        (s.unified, s.local, s.topology_signaled, epoch_due)
     };
 
     // 3. Compose multipliers (UNIFIED ⊗ LOCAL when both present).
@@ -323,12 +344,34 @@ async fn run_one_tick(
     // 4. Apply filter_down multipliers to body[0:5]
     apply_multipliers(&mut body, &composed);
 
-    // 5. Apply ground_up if topology has been signaled at least once.
+    // 5. ground_up — 0E held-nudge model (SPEC §G5.1, D-SPEC-97 refinement):
+    //    RECOMPUTE the damped nudge ONCE per kernel epoch (so the 0.95 EMA +
+    //    ±0.05/epoch clamp evolve at epoch cadence, not 7.83 Hz), then APPLY
+    //    the held nudge every Schumann tick so the grounding offset manifests
+    //    continuously in the per-tick-recomputed body tensor (no compounding —
+    //    body is rebuilt from raw each tick).
     if topology_fresh {
-        if let Ok(topology_lower) = titan_trinity_daemon::read_topology_inner_lower(topology_slot) {
-            ground_up.apply_to_body(&mut body, &topology_lower, 1.0)?;
+        if epoch_due {
+            if let Ok(topology_lower) =
+                titan_trinity_daemon::read_topology_inner_lower(topology_slot)
+            {
+                ground_up.compute_nudge(&topology_lower);
+            }
         }
+        ground_up.apply_held_to_body(&mut body, 1.0)?;
     }
+
+    // 5b. §G5.2 traveling-tensor update: `body` is now the per-tick ENRICHED
+    //     DRIVE target (raw + filter_down + ground_up). Integrate it onto the
+    //     persistent tensor under the restoring spring + observable-feedback so
+    //     the tensor travels and the Middle Path is an attractor (D-SPEC-112).
+    let cfg = RestoringCfg::for_layer(Layer::Body);
+    let x = stateful_update(&prev[..], &prev2[..], &body[..], &cfg);
+    let mut body_state = [0.0_f32; 5];
+    body_state.copy_from_slice(&x[..5]);
+    *prev2 = *prev;
+    *prev = body_state;
+    let body = body_state; // the traveling state is what we publish
 
     // 6. Encode payload bytes.
     let bytes = encode_floats::<5>(&body);
@@ -351,7 +394,7 @@ async fn run_one_tick(
     // 9. Publish BODY_STATE (P1) with values + ts. Always publish (even
     //    when slot write was suppressed) so consumers see the cadence.
     let payload = encode_body_state_payload(&body);
-    bus.publish("BODY_STATE", Some("all"), Some(&payload))
+    bus.publish("BODY_STATE", Some("all"), Some(payload))
         .await
         .map_err(|e| anyhow!("publish BODY_STATE: {e}"))?;
 
@@ -372,8 +415,7 @@ fn read_sensor_cache(sensor_cache: &Option<Slot>) -> Result<[f32; 5]> {
             // Format detection: msgpack source dict starts with map-marker byte
             // (0x80-0x8f for fixmap, 0xde for map16, 0xdf for map32). 5*float32
             // = 20 bytes raw with no map prefix.
-            let is_msgpack = !raw.is_empty()
-                && matches!(raw[0], 0x80..=0x8f | 0xde | 0xdf);
+            let is_msgpack = !raw.is_empty() && matches!(raw[0], 0x80..=0x8f | 0xde | 0xdf);
             if is_msgpack {
                 project_inner_body_5d(&raw).or_else(|_| Ok([0.5_f32; 5]))
             } else {
@@ -471,10 +513,13 @@ fn open_slot(shm_dir: &Path, name: &str) -> Result<Slot> {
     Slot::open(&path).with_context(|| format!("open slot {}", path.display()))
 }
 
-fn encode_body_state_payload(body: &[f32; 5]) -> Vec<u8> {
+/// Build a SPEC §8.5 `BODY_STATE` payload as `rmpv::Value::Map`. Embedded
+/// directly into the envelope by `encode_simple` per SPEC §8.10 line 900
+/// byte-identical guarantee — NOT pre-encoded to opaque bytes.
+fn encode_body_state_payload(body: &[f32; 5]) -> rmpv::Value {
     use rmpv::Value;
     let values = Value::Array(body.iter().map(|f| Value::F64(*f as f64)).collect());
-    let map = Value::Map(vec![
+    Value::Map(vec![
         (Value::String("src".into()), Value::String("inner".into())),
         (
             Value::String("type".into()),
@@ -482,11 +527,7 @@ fn encode_body_state_payload(body: &[f32; 5]) -> Vec<u8> {
         ),
         (Value::String("values".into()), values),
         (Value::String("ts".into()), Value::F64(now_secs())),
-    ]);
-    let mut out = Vec::with_capacity(96);
-    rmpv::encode::write_value(&mut out, &map)
-        .expect("rmpv encode never fails on well-formed Value");
-    out
+    ])
 }
 
 fn now_secs() -> f64 {
@@ -523,8 +564,11 @@ mod tests {
             (None, None) => vec![1.0_f32; 5],
         };
         apply_multipliers(&mut body, &composed);
+        // 0E: Some(topo) models an epoch boundary — recompute the held nudge,
+        // then apply it (the per-tick application path).
         if let Some(topo) = topology_lower {
-            ground_up.apply_to_body(&mut body, &topo, 1.0).unwrap();
+            ground_up.compute_nudge(&topo);
+            ground_up.apply_held_to_body(&mut body, 1.0).unwrap();
         }
         body
     }
@@ -600,7 +644,7 @@ mod tests {
         let bytes = encode_body_state_payload(&body);
         // Must decode successfully + contain expected keys.
         use rmpv::Value;
-        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let v: Value = bytes; // §4.C-ter: encode_*_payload now returns Value directly
         let map = match v {
             Value::Map(items) => items,
             _ => panic!("not a map"),
@@ -626,7 +670,7 @@ mod tests {
         let body = [0.0; 5];
         let bytes = encode_body_state_payload(&body);
         use rmpv::Value;
-        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let v: Value = bytes; // §4.C-ter: encode_*_payload now returns Value directly
         if let Value::Map(items) = v {
             for (k, val) in items {
                 if let Value::String(s) = k {

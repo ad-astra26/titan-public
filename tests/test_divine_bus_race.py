@@ -16,7 +16,7 @@ import time
 
 import pytest
 
-from titan_plugin.bus import DivineBus, make_msg
+from titan_hcl.bus import DivineBus, make_msg
 
 
 @pytest.fixture

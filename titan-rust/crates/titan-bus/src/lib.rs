@@ -1,6 +1,6 @@
 //! titan-bus — Main bus broker for Titan microkernel v2 Phase C.
 //!
-//! Byte-identical port of Python `titan_plugin/core/bus_socket.py`
+//! Byte-identical port of Python `titan_hcl/core/bus_socket.py`
 //! `BusSocketServer` (B.2 protocol locked 2026-04-27).
 //!
 //! # Architecture
@@ -29,6 +29,7 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod boot_buffer;
 pub mod broker;
 pub mod client;
 pub mod drift_bridge;

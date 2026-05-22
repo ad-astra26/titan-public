@@ -18,12 +18,16 @@ future regression that re-introduces None into outer_state is loud.
 import logging
 import re
 
-from titan_plugin.modules.spirit_worker import _merge_outer_trinity_payload
+# NOTE (2026-05-21): _merge_outer_trinity_payload was deleted with the dead
+# spirit_worker helper block (Phase C — spirit_worker is a heartbeat stub; the
+# outer-trinity merge + boot-default init moved off spirit_worker). The method
+# that exercised it (test_first_real_payload_replaces_boot_defaults) is retired.
+# The live 67D-collapse guard below (test_consciousness_epoch_warns_on_67d_fallback,
+# against spirit_loop._run_consciousness_epoch) is unaffected. The boot-default-init
+# invariant's new owner + test migration is tracked in RFP_phase_c_titan_hcl_cleanup.
 
-
-# Mirror of the spirit_worker init dict — IF THIS DRIFTS FROM
-# spirit_worker.py:641-648 the test will catch it via a separate
-# invariant test below.
+# Boot outer-state shape the consciousness epoch expects (self-contained
+# invariant on the 132D-not-67D shape).
 _BOOT_OUTER_STATE = {
     "outer_body": [0.5] * 5,
     "outer_mind": [0.5] * 5,
@@ -62,44 +66,11 @@ def test_boot_state_neutral_defaults_match_collector_fallback():
     assert _BOOT_OUTER_STATE["outer_spirit_45d"] == [0.5] * 45
 
 
-def test_first_real_payload_replaces_boot_defaults():
-    """First OUTER_TRINITY_STATE arrives with truthy extended fields →
-    boot-default [0.5]*N gets replaced with real data via the merge
-    logic. (For outer_mind_15d the merge takes Thinking[0:5]+Feeling[5:10]
-    from incoming and preserves Willing[10:15] from existing — since
-    boot Willing is [0.5]*5 it's still neutral until GROUND_UP fills
-    it, which is correct.)"""
-    st = dict(_BOOT_OUTER_STATE)
-    # Defensive: deep-copy the lists since merge mutates outer_mind_15d
-    st["outer_mind_15d"] = list(st["outer_mind_15d"])
-    st["outer_spirit_45d"] = list(st["outer_spirit_45d"])
-
-    incoming_15d = [0.1] * 5 + [0.2] * 5 + [0.3] * 5  # Thinking, Feeling, Willing
-    incoming_45d = [0.7] * 45
-    _merge_outer_trinity_payload(st, {
-        "outer_body": [0.5] * 5,
-        "outer_mind": [0.5] * 5,
-        "outer_spirit": [0.5] * 5,
-        "outer_mind_15d": incoming_15d,
-        "outer_spirit_45d": incoming_45d,
-    })
-
-    # Thinking[0:5] from incoming
-    assert st["outer_mind_15d"][0:5] == [0.1] * 5
-    # Feeling[5:10] from incoming
-    assert st["outer_mind_15d"][5:10] == [0.2] * 5
-    # Willing[10:15] preserved from boot defaults (NOT incoming's 0.3)
-    # — GROUND_UP enrichment owns this octave
-    assert st["outer_mind_15d"][10:15] == [0.5] * 5
-    # outer_spirit_45d full-overwrite
-    assert st["outer_spirit_45d"] == [0.7] * 45
-
-
 def test_consciousness_epoch_warns_on_67d_fallback(caplog):
     """If outer_state somehow has None extended fields when
     _run_consciousness_epoch runs, we log a WARNING (not silent
     INFO-only) so the symmetry violation is visible to scanners."""
-    from titan_plugin.modules import spirit_loop
+    from titan_hcl.modules import spirit_loop
 
     # Build a minimal mock consciousness/topology/body/mind dict
     # sufficient to enter the function's `has_outer_extended` block.

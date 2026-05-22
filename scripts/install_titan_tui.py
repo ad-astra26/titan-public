@@ -32,7 +32,7 @@ import pathlib
 import time
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
-CONFIG_PATH = PROJECT_ROOT / "titan_plugin" / "config.toml"
+CONFIG_PATH = PROJECT_ROOT / "titan_hcl" / "config.toml"
 VENV_DIR = PROJECT_ROOT / ".venv"
 STATE_FILE = PROJECT_ROOT / "data" / ".install_state.json"
 MIN_PYTHON = (3, 11)
@@ -482,7 +482,7 @@ class TitanInstaller(App):
 
         # Verify critical imports
         critical_modules = [
-            ("titan_plugin", "Titan Plugin"),
+            ("titan_hcl", "Titan Plugin"),
             ("torch", "PyTorch"),
             ("fastapi", "FastAPI"),
             ("httpx", "httpx"),
@@ -539,7 +539,7 @@ class TitanInstaller(App):
         # Phase 5: Configuration
         self.call_from_thread(self._update_phase_display,
             "Phase 5: Configuration",
-            "Config values are read from titan_plugin/config.toml.\n"
+            "Config values are read from titan_hcl/config.toml.\n"
             "Edit the file directly or use the channel setup wizard:\n"
             "  python scripts/setup_channels.py")
         self.call_from_thread(self._log, "─── Phase 5: Configuration ───")
@@ -603,13 +603,13 @@ class TitanInstaller(App):
 
         vp = str(venv_python)
         health_checks = {
-            "Titan Plugin": f'{vp} -c "from titan_plugin import TitanPlugin; print(\'ok\')"',
-            "Studio": f'{vp} -c "from titan_plugin.expressive.studio import StudioCoordinator; print(\'ok\')"',
-            "Solana SDK": f'{vp} -c "from titan_plugin.utils.solana_client import is_available; print(\'ok\' if is_available() else \'degraded\')"',
-            "Cognee Memory": f'{vp} -c "from titan_plugin.core.memory import TieredMemoryGraph; print(\'ok\')"',
-            "Guardian": f'{vp} -c "from titan_plugin.logic.sage.guardian import SageGuardian; print(\'ok\')"',
-            "Art Generator": f'{vp} -c "from titan_plugin.expressive.art import ProceduralArtGen; print(\'ok\')"',
-            "Observatory API": f'{vp} -c "from titan_plugin.api import create_app; print(\'ok\')"',
+            "Titan Plugin": f'{vp} -c "import titan_hcl; print(\'ok\')"',
+            "Studio": f'{vp} -c "from titan_hcl.expressive.studio import StudioCoordinator; print(\'ok\')"',
+            "Solana SDK": f'{vp} -c "from titan_hcl.utils.solana_client import is_available; print(\'ok\' if is_available() else \'degraded\')"',
+            "Cognee Memory": f'{vp} -c "from titan_hcl.core.memory import TieredMemoryGraph; print(\'ok\')"',
+            "Guardian": f'{vp} -c "from titan_hcl.logic.sage.guardian import SageGuardian; print(\'ok\')"',
+            "Art Generator": f'{vp} -c "from titan_hcl.expressive.art import ProceduralArtGen; print(\'ok\')"',
+            "Observatory API": f'{vp} -c "from titan_hcl.api import create_app; print(\'ok\')"',
         }
 
         active = 0
@@ -636,7 +636,7 @@ class TitanInstaller(App):
             "Next steps:\n"
             "  1. Activate venv:   source .venv/bin/activate\n"
             "  2. Configure channels: python scripts/setup_channels.py\n"
-            "  3. Run Titan:       python scripts/titan_main.py --server\n"
+            "  3. Run Titan:       python scripts/titan_hcl.py --server\n"
             "  4. Run frontend:    cd titan-observatory && npm run build && npm start\n"
             "  5. Run tests:       python -m pytest tests/ -p no:anchorpy -v\n\n"
             "[dim]The Titan awaits its first thought.[/]",

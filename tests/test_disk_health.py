@@ -6,7 +6,7 @@ driving _compute_state directly and calling _transition with mocked hooks.
 import pytest
 from unittest.mock import MagicMock, patch
 
-from titan_plugin.core.disk_health import (
+from titan_hcl.core.disk_health import (
     DiskHealthMonitor,
     DiskState,
     DEFAULT_THRESHOLDS,

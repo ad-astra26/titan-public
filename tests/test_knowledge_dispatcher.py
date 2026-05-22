@@ -1,4 +1,4 @@
-"""Unit tests for titan_plugin.logic.knowledge_dispatcher (KP-3).
+"""Unit tests for titan_hcl.logic.knowledge_dispatcher (KP-3).
 
 Covers: end-to-end dispatch flow, cache-hit short-circuit, chain-fallback
 semantics, INTERNAL_REJECTED short-circuit, SearXNG→Sage delegation,
@@ -12,14 +12,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from titan_plugin.logic.knowledge_backends import BackendResult
-from titan_plugin.logic.knowledge_cache import KnowledgeCache
-from titan_plugin.logic.knowledge_dispatcher import (
+from titan_hcl.logic.knowledge_backends import BackendResult
+from titan_hcl.logic.knowledge_cache import KnowledgeCache
+from titan_hcl.logic.knowledge_dispatcher import (
     DispatchResult,
     dispatch,
     dispatch_sync,
 )
-from titan_plugin.logic.knowledge_router import QueryType
+from titan_hcl.logic.knowledge_router import QueryType
 
 
 @pytest.fixture
@@ -93,7 +93,7 @@ class TestDirectRESTDispatch:
     @pytest.mark.asyncio
     async def test_dictionary_cache_miss_then_hit(
             self, cache, monkeypatch):
-        from titan_plugin.logic import knowledge_dispatcher as kd
+        from titan_hcl.logic import knowledge_dispatcher as kd
         # Mock wiktionary to succeed
         success = BackendResult(
             backend="wiktionary", query="chi",
@@ -122,7 +122,7 @@ class TestDirectRESTDispatch:
     @pytest.mark.asyncio
     async def test_chain_fallback_to_second_backend(
             self, cache, monkeypatch):
-        from titan_plugin.logic import knowledge_dispatcher as kd
+        from titan_hcl.logic import knowledge_dispatcher as kd
         wikt_fail = _mk_backend_fn({})  # empty → error_type="empty"
         dict_ok = _mk_backend_fn({"obscureword": BackendResult(
             backend="free_dictionary", query="obscureword", success=True,
@@ -140,7 +140,7 @@ class TestDirectRESTDispatch:
     @pytest.mark.asyncio
     async def test_all_backends_fail_returns_failure(
             self, cache, monkeypatch):
-        from titan_plugin.logic import knowledge_dispatcher as kd
+        from titan_hcl.logic import knowledge_dispatcher as kd
         failing = _mk_backend_fn({})  # every query returns empty
         monkeypatch.setitem(kd.BACKEND_REGISTRY, "wiktionary", failing)
         monkeypatch.setitem(kd.BACKEND_REGISTRY, "free_dictionary", failing)
@@ -158,7 +158,7 @@ class TestDirectRESTDispatch:
     @pytest.mark.asyncio
     async def test_dictionary_phrase_transforms_query(
             self, cache, monkeypatch):
-        from titan_plugin.logic import knowledge_dispatcher as kd
+        from titan_hcl.logic import knowledge_dispatcher as kd
         captured = []
 
         async def mock_wikt(topic, timeout=10.0):
@@ -214,7 +214,7 @@ class TestRequestCoalescing:
     @pytest.mark.asyncio
     async def test_concurrent_same_query_coalesces(
             self, cache, monkeypatch):
-        from titan_plugin.logic import knowledge_dispatcher as kd
+        from titan_hcl.logic import knowledge_dispatcher as kd
         call_count = 0
 
         async def slow_backend(topic, timeout=10.0):
@@ -245,7 +245,7 @@ class TestRequestCoalescing:
     @pytest.mark.asyncio
     async def test_different_queries_no_coalescing(
             self, cache, monkeypatch):
-        from titan_plugin.logic import knowledge_dispatcher as kd
+        from titan_hcl.logic import knowledge_dispatcher as kd
         call_count = 0
 
         async def slow_backend(topic, timeout=10.0):
@@ -269,7 +269,7 @@ class TestRequestCoalescing:
     @pytest.mark.asyncio
     async def test_inflight_cleared_after_completion(
             self, cache, monkeypatch):
-        from titan_plugin.logic import knowledge_dispatcher as kd
+        from titan_hcl.logic import knowledge_dispatcher as kd
 
         async def fast_backend(topic, timeout=10.0):
             return BackendResult(
@@ -287,7 +287,7 @@ class TestRequestCoalescing:
 
 class TestDispatchSync:
     def test_sync_adapter(self, cache, monkeypatch):
-        from titan_plugin.logic import knowledge_dispatcher as kd
+        from titan_hcl.logic import knowledge_dispatcher as kd
 
         async def mock_wikt(topic, timeout=10.0):
             return BackendResult(

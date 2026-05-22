@@ -20,14 +20,14 @@ class TestStateRegisterFull30DT:
     """E1: get_full_30dt() assembles all 6 tensor components."""
 
     def test_get_full_30dt_returns_30_floats(self):
-        from titan_plugin.logic.state_register import StateRegister
+        from titan_hcl.logic.state_register import StateRegister
         reg = StateRegister()
         result = reg.get_full_30dt()
         assert len(result) == 30
         assert all(isinstance(v, float) for v in result)
 
     def test_get_full_30dt_reflects_updated_inner_tensors(self):
-        from titan_plugin.logic.state_register import StateRegister
+        from titan_hcl.logic.state_register import StateRegister
         reg = StateRegister()
         reg._update("body_tensor", [0.1, 0.2, 0.3, 0.4, 0.5])
         reg._update("mind_tensor", [0.6, 0.7, 0.8, 0.9, 1.0])
@@ -38,7 +38,7 @@ class TestStateRegisterFull30DT:
         assert result[10:15] == [0.11, 0.22, 0.33, 0.44, 0.55]
 
     def test_get_full_30dt_reflects_outer_tensors(self):
-        from titan_plugin.logic.state_register import StateRegister
+        from titan_hcl.logic.state_register import StateRegister
         reg = StateRegister()
         reg._update_many({
             "outer_body": [0.7, 0.7, 0.7, 0.7, 0.7],
@@ -51,7 +51,7 @@ class TestStateRegisterFull30DT:
         assert result[25:30] == [0.9, 0.9, 0.9, 0.9, 0.9]
 
     def test_outer_trinity_state_message_updates_register(self):
-        from titan_plugin.logic.state_register import StateRegister
+        from titan_hcl.logic.state_register import StateRegister
         reg = StateRegister()
         reg._process_bus_message({
             "type": "OUTER_TRINITY_STATE",
@@ -66,7 +66,7 @@ class TestStateRegisterFull30DT:
         assert reg.outer_spirit == [0.8, 0.8, 0.8, 0.8, 0.8]
 
     def test_default_outer_tensors_are_neutral(self):
-        from titan_plugin.logic.state_register import StateRegister
+        from titan_hcl.logic.state_register import StateRegister
         reg = StateRegister()
         assert reg.outer_body == [0.5] * 5
         assert reg.outer_mind == [0.5] * 5
@@ -80,7 +80,7 @@ class TestMicroEnrich:
     """E2: UnifiedSpirit.micro_enrich() — resonant geometric blending."""
 
     def _make_spirit(self, **overrides):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         import tempfile, os
         d = tempfile.mkdtemp()
         cfg = {"enrichment_rate": 0.02, "min_alignment_threshold": 0.1}
@@ -190,7 +190,7 @@ class TestGreatPulseCrystallization:
     """E4: Quality-enhanced enrichment at GREAT PULSE."""
 
     def _make_spirit(self):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         import tempfile
         d = tempfile.mkdtemp()
         return UnifiedSpirit(
@@ -249,7 +249,7 @@ class TestEnrichmentConfig:
     """E5: Config loading and stats exposure."""
 
     def test_enrichment_stats_in_get_stats(self):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         import tempfile
         d = tempfile.mkdtemp()
         spirit = UnifiedSpirit(
@@ -270,7 +270,7 @@ class TestEnrichmentConfig:
         assert stats["config"]["min_alignment_threshold"] == 0.15
 
     def test_enrichment_persisted_and_restored(self):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         import tempfile
         d = tempfile.mkdtemp()
         spirit = UnifiedSpirit(
@@ -290,7 +290,7 @@ class TestEnrichmentConfig:
         assert spirit2._micro_tick_count == ticks
 
     def test_epoch_quality_persisted(self):
-        from titan_plugin.logic.unified_spirit import UnifiedSpirit
+        from titan_hcl.logic.unified_spirit import UnifiedSpirit
         import tempfile
         d = tempfile.mkdtemp()
         spirit = UnifiedSpirit(

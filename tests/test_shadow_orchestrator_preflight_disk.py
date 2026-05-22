@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 import pytest
 
-from titan_plugin.core.shadow_orchestrator import (
+from titan_hcl.core.shadow_orchestrator import (
     SHADOW_SWAP_DISK_SAFETY_MARGIN_BYTES,
     _compute_real_copy_bytes,
     preflight_disk_check,

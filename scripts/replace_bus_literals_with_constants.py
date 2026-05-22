@@ -2,7 +2,7 @@
 """replace_bus_literals_with_constants — AST-based literal-to-constant rewrite.
 
 Companion to register_unregistered_bus_literals.py. After all 77 unregistered
-literals have been registered as constants in titan_plugin/bus.py, this script
+literals have been registered as constants in titan_hcl/bus.py, this script
 replaces the remaining string literals at producer/consumer sites with
 references to those constants.
 
@@ -19,9 +19,9 @@ Strategy (per file):
        {bus.HIBERNATE_ACK, "X"}   → {bus.HIBERNATE_ACK, bus.X}
   2. Apply line-aware text edits (offsets-from-end so prior edits don't
      shift later positions).
-  3. Ensure `from titan_plugin import bus` is importable in scope. We use
+  3. Ensure `from titan_hcl import bus` is importable in scope. We use
      the `bus.X` Attribute form throughout — the file just needs `bus`
-     accessible (top-level `from titan_plugin import bus` is added if no
+     accessible (top-level `from titan_hcl import bus` is added if no
      bus alias is already in scope).
 
 Safety guards:
@@ -50,8 +50,8 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BUS_PY = REPO_ROOT / "titan_plugin" / "bus.py"
-PLUGIN_ROOT = REPO_ROOT / "titan_plugin"
+BUS_PY = REPO_ROOT / "titan_hcl" / "bus.py"
+PLUGIN_ROOT = REPO_ROOT / "titan_hcl"
 
 
 # ─── Reading existing bus constants ─────────────────────────────────────────
@@ -201,18 +201,18 @@ def detect_bus_alias(src: str) -> str | None:
     """Return how `bus` is currently importable at module level.
 
     Returns:
-      - "bus": top-level `from titan_plugin import bus` (or relative `from .. import bus`)
-        OR `import titan_plugin.bus as bus` (any form that gives a name `bus` in scope)
+      - "bus": top-level `from titan_hcl import bus` (or relative `from .. import bus`)
+        OR `import titan_hcl.bus as bus` (any form that gives a name `bus` in scope)
       - None: not imported at module level (we'll need to add it)
 
     Inline imports inside functions are NOT detected — they have local scope.
     Adding a top-level import is safe (Python ignores duplicates from inline).
     """
     pats = [
-        re.compile(r"^from\s+titan_plugin\s+import\s+bus(?:\s|$|,)", re.M),
+        re.compile(r"^from\s+titan_hcl\s+import\s+bus(?:\s|$|,)", re.M),
         re.compile(r"^from\s+\.+\s+import\s+bus(?:\s|$|,)", re.M),
-        re.compile(r"^import\s+titan_plugin\.bus\s+as\s+bus\s*$", re.M),
-        re.compile(r"^from\s+titan_plugin\s+import\s+\([^)]*\bbus\b", re.M | re.S),
+        re.compile(r"^import\s+titan_hcl\.bus\s+as\s+bus\s*$", re.M),
+        re.compile(r"^from\s+titan_hcl\s+import\s+\([^)]*\bbus\b", re.M | re.S),
     ]
     for pat in pats:
         if pat.search(src):
@@ -289,17 +289,17 @@ def apply_edits_to_file(file_path: Path, sites: list[LiteralSite],
 
     new_src = "\n".join(lines)
 
-    # Add `from titan_plugin import bus` if needed and we made any edit
+    # Add `from titan_hcl import bus` if needed and we made any edit
     if ensure_bus_import and n_edits > 0:
-        # Determine import to add based on file's location relative to titan_plugin.
+        # Determine import to add based on file's location relative to titan_hcl.
         rel = file_path.relative_to(PLUGIN_ROOT.parent)
         depth = len(rel.parts) - 1  # parts include the file name
         if depth == 0:
             # File is at repo root (rare) — use absolute
-            import_line = "from titan_plugin import bus"
+            import_line = "from titan_hcl import bus"
         else:
-            # File is under titan_plugin — use absolute too (works at all depths)
-            import_line = "from titan_plugin import bus"
+            # File is under titan_hcl — use absolute too (works at all depths)
+            import_line = "from titan_hcl import bus"
         # Only add if not already present
         if detect_bus_alias(new_src) is None:
             insert_at = find_import_insertion_point(new_src)
@@ -318,7 +318,7 @@ def main() -> int:
     p.add_argument("--apply", action="store_true",
                    help="actually edit files (default: dry-run with diffs)")
     p.add_argument("--root", default=str(PLUGIN_ROOT),
-                   help="root to scan (default: titan_plugin)")
+                   help="root to scan (default: titan_hcl)")
     p.add_argument("--exclude", action="append", default=[],
                    help="path substring to exclude (repeatable)")
     args = p.parse_args()

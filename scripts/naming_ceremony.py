@@ -29,18 +29,18 @@ from scripts.learning.api_helpers import (
     _headers,
     scale_perturbation,
 )
-from titan_plugin.utils.directive_signer import (
+from titan_hcl.utils.directive_signer import (
     verify_directives,
     sign_directives,
     compute_constitution_hash,
 )
-from titan_plugin.utils.arweave_store import ArweaveStore
-from titan_plugin.logic.birth_dna import (
+from titan_hcl.utils.arweave_store import ArweaveStore
+from titan_hcl.logic.birth_dna import (
     serialize_for_arweave,
     get_genesis_nft_attributes,
     compute_dna_hash,
 )
-from titan_plugin.core.soul import regenerate_soul_md
+from titan_hcl.core.soul import regenerate_soul_md
 
 logger = logging.getLogger("naming_ceremony")
 

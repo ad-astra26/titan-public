@@ -23,7 +23,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from titan_plugin.core import shadow_orchestrator as so
+from titan_hcl.core import shadow_orchestrator as so
 
 
 def _mk_module(state="running", restart_count=0, heartbeat_age=1.0,
@@ -37,10 +37,10 @@ def _mk_module(state="running", restart_count=0, heartbeat_age=1.0,
     }
 
 
-def _mk_state_response(modules: dict, spirit_uptime: float | None = None) -> dict:
+def _mk_state_response(modules: dict, cognitive_uptime: float | None = None) -> dict:
     """Build a /v4/state payload with the given modules dict."""
-    if spirit_uptime is not None and "spirit" in modules:
-        modules["spirit"]["uptime"] = spirit_uptime
+    if cognitive_uptime is not None and "cognitive_worker" in modules:
+        modules["cognitive_worker"]["uptime"] = cognitive_uptime
     return {
         "status": "ok",
         "data": {"v4": True, "guardian": modules},
@@ -49,8 +49,8 @@ def _mk_state_response(modules: dict, spirit_uptime: float | None = None) -> dic
 
 def _healthy_modules() -> dict:
     """Return a roster of 18 healthy modules covering all critical names."""
-    names = ["spirit", "body", "mind", "timechain", "memory", "imw", "api",
-             "warning_monitor", "observatory_writer", "rl", "llm", "media",
+    names = ["cognitive_worker", "body", "mind", "timechain", "memory", "imw", "api",
+             "warning_monitor", "observatory_writer", "recorder", "llm", "media",
              "language", "meta_teacher", "cgn", "knowledge", "backup", "emot_cgn"]
     return {n: _mk_module() for n in names}
 
@@ -108,13 +108,13 @@ class TestMultiCriterionHealth(unittest.TestCase):
     def test_fails_when_critical_module_missing(self):
         # spirit is critical — drop it
         modules = _healthy_modules()
-        modules["spirit"]["state"] = "stopped"
+        modules["cognitive_worker"]["state"] = "stopped"
         with self._patch_http(state_payload=_mk_state_response(modules)):
             passed, diag = so._check_multi_criterion_health(7779, self.criteria)
         self.assertFalse(passed)
         crit = diag["checks"]["critical_modules_running"]
         self.assertFalse(crit["pass"])
-        self.assertIn("spirit", crit["missing"])
+        self.assertIn("cognitive_worker", crit["missing"])
 
     def test_fails_when_module_in_crash_loop(self):
         modules = _healthy_modules()
@@ -143,7 +143,7 @@ class TestMultiCriterionHealth(unittest.TestCase):
     def test_fails_when_too_few_modules_running(self):
         # Reduce healthy count below 14 by stopping 6 modules
         modules = _healthy_modules()
-        for name in ["warning_monitor", "rl", "llm", "media", "meta_teacher", "knowledge"]:
+        for name in ["warning_monitor", "recorder", "llm", "media", "meta_teacher", "knowledge"]:
             modules[name]["state"] = "stopped"
         with self._patch_http(state_payload=_mk_state_response(modules)):
             passed, diag = so._check_multi_criterion_health(7779, self.criteria)
@@ -156,7 +156,7 @@ class TestMultiCriterionHealth(unittest.TestCase):
     def test_diagnosis_is_serializable_json(self):
         """Diagnosis must be JSON-safe for shadow_swap_history.jsonl audit log."""
         modules = _healthy_modules()
-        modules["spirit"]["state"] = "stopped"
+        modules["cognitive_worker"]["state"] = "stopped"
         with self._patch_http(state_payload=_mk_state_response(modules)):
             _, diag = so._check_multi_criterion_health(7779, self.criteria)
         json.dumps(diag)  # must not raise
@@ -172,8 +172,8 @@ class TestSmokeAdvancing(unittest.TestCase):
     def test_passes_when_uptime_advances(self):
         # First call: spirit.uptime=100; second call: 200
         states = [
-            _mk_state_response(_healthy_modules(), spirit_uptime=100.0),
-            _mk_state_response(_healthy_modules(), spirit_uptime=200.0),
+            _mk_state_response(_healthy_modules(), cognitive_uptime=100.0),
+            _mk_state_response(_healthy_modules(), cognitive_uptime=200.0),
         ]
         with mock.patch.object(so, "_fetch_state_json", side_effect=states):
             passed, diag = so._check_smoke_advancing(7779, self.criteria)
@@ -182,8 +182,8 @@ class TestSmokeAdvancing(unittest.TestCase):
 
     def test_fails_when_uptime_stuck(self):
         states = [
-            _mk_state_response(_healthy_modules(), spirit_uptime=100.0),
-            _mk_state_response(_healthy_modules(), spirit_uptime=100.0),  # no advance
+            _mk_state_response(_healthy_modules(), cognitive_uptime=100.0),
+            _mk_state_response(_healthy_modules(), cognitive_uptime=100.0),  # no advance
         ]
         with mock.patch.object(so, "_fetch_state_json", side_effect=states):
             passed, diag = so._check_smoke_advancing(7779, self.criteria)
@@ -246,7 +246,7 @@ class TestWaitForHealth(unittest.TestCase):
 class TestHealthCriteriaDefaults(unittest.TestCase):
     def test_default_criteria_includes_critical_modules(self):
         c = so.HealthCriteria()
-        for name in ("spirit", "body", "mind", "timechain", "memory", "imw", "api"):
+        for name in ("cognitive_worker", "body", "mind", "timechain", "memory", "imw", "api"):
             self.assertIn(name, c.critical_modules)
 
     def test_default_min_running_is_reasonable(self):

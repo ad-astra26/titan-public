@@ -16,13 +16,13 @@ import statistics
 
 import pytest
 
-from titan_plugin.logic.nervous_system import (
+from titan_hcl.logic.nervous_system import (
     NervousSystem,
     _v2_enabled,
     _v2_cfg,
     load_nervous_system_programs,
 )
-from titan_plugin.logic.titan_vm import TitanVM
+from titan_hcl.logic.titan_vm import TitanVM
 
 
 # ── Fixtures ────────────────────────────────────────────────────────
@@ -304,7 +304,7 @@ class TestCgnVmSnapshot:
     def test_snapshot_returns_expected_keys(self, tmp_path):
         # CGN requires a lot of wiring — exercise get_vm_snapshot on a
         # lightly-initialized instance
-        from titan_plugin.logic.cgn import ConceptGroundingNetwork
+        from titan_hcl.logic.cgn import ConceptGroundingNetwork
         cgn = ConceptGroundingNetwork(
             db_path=str(tmp_path / "inner_memory.db"),
             state_dir=str(tmp_path),

@@ -31,17 +31,17 @@ def setup_logging():
 
 def _load_config() -> dict:
     try:
-        from titan_plugin.config_loader import load_titan_config
+        from titan_hcl.config_loader import load_titan_config
         return load_titan_config()
     except Exception:
         return {}
 
 
 def _build_components(config: dict):
-    """Build installer components without booting full TitanPlugin."""
-    from titan_plugin.skills.registry import SkillRegistry
-    from titan_plugin.skills.validator import SkillValidator
-    from titan_plugin.skills.installer import SkillInstaller
+    """Build installer components without booting full TitanHCL."""
+    from titan_hcl.skills.registry import SkillRegistry
+    from titan_hcl.skills.validator import SkillValidator
+    from titan_hcl.skills.installer import SkillInstaller
 
     skills_cfg = config.get("skills", {})
     skills_dir = os.path.expanduser(skills_cfg.get("skills_dir", "~/.titan/skills"))

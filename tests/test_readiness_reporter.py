@@ -1,5 +1,5 @@
 """
-Tests for titan_plugin.core.readiness_reporter — B.1 §5+§6 helper.
+Tests for titan_hcl.core.readiness_reporter — B.1 §5+§6 helper.
 
 Covers the four B.1 message handlers + trivial-reporter factory.
 PLAN: titan-docs/PLAN_microkernel_phase_b1_shadow_swap.md §5 + §6
@@ -11,9 +11,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from titan_plugin import bus
-from titan_plugin.core import shadow_protocol as sp
-from titan_plugin.core.readiness_reporter import (
+from titan_hcl import bus
+from titan_hcl.core import shadow_protocol as sp
+from titan_hcl.core.readiness_reporter import (
     ReadinessReporter,
     trivial_reporter,
 )

@@ -1,7 +1,7 @@
 """
 Tests for Microkernel v2 Phase A §A.4 (S5) — EXPOSED_METHODS drift detection.
 
-Statically analyzes titan_plugin/api/{dashboard,chat,maker,webhook}.py for
+Statically analyzes titan_hcl/api/{dashboard,chat,maker,webhook}.py for
 runtime `plugin.X.Y(...)` and `plugin.X` access patterns and asserts every
 unique path is in KERNEL_RPC_EXPOSED_METHODS. Catches future endpoint
 additions that forget to update the exposed list (which would cause the
@@ -13,12 +13,12 @@ Approach (intentionally pragmatic, not full AST):
   - Extract `plugin.X` and `plugin.X.Y` patterns via regex
   - Filter out obvious false positives (modules: plugin.core, plugin.utils,
     plugin.logic, plugin.api, plugin.expressive, plugin.channels, plugin.maker
-    — when used as `from titan_plugin.X import ...`)
+    — when used as `from titan_hcl.X import ...`)
   - Assert each remaining path is in EXPOSED_METHODS
 
 Reference:
   - titan-docs/PLAN_microkernel_phase_a_s5.md §5.4
-  - titan_plugin/core/kernel.py:KERNEL_RPC_EXPOSED_METHODS
+  - titan_hcl/core/kernel.py:KERNEL_RPC_EXPOSED_METHODS
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from titan_plugin.core.kernel import KERNEL_RPC_EXPOSED_METHODS
+from titan_hcl.core.kernel import KERNEL_RPC_EXPOSED_METHODS
 
 
 # False-positive filter: these are module-import paths, not runtime attr access
@@ -64,10 +64,10 @@ FALSE_POSITIVES = {
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 API_FILES = [
-    PROJECT_ROOT / "titan_plugin" / "api" / "dashboard.py",
-    PROJECT_ROOT / "titan_plugin" / "api" / "chat.py",
-    PROJECT_ROOT / "titan_plugin" / "api" / "maker.py",
-    PROJECT_ROOT / "titan_plugin" / "api" / "webhook.py",
+    PROJECT_ROOT / "titan_hcl" / "api" / "dashboard.py",
+    PROJECT_ROOT / "titan_hcl" / "api" / "chat.py",
+    PROJECT_ROOT / "titan_hcl" / "api" / "maker.py",
+    PROJECT_ROOT / "titan_hcl" / "api" / "webhook.py",
 ]
 
 
@@ -121,7 +121,7 @@ def test_no_drift_in_api_dashboard():
     assert not missing, (
         f"DRIFT: dashboard.py uses {len(missing)} plugin paths NOT in "
         f"KERNEL_RPC_EXPOSED_METHODS — add them to "
-        f"titan_plugin/core/kernel.py:KERNEL_RPC_EXPOSED_METHODS:\n"
+        f"titan_hcl/core/kernel.py:KERNEL_RPC_EXPOSED_METHODS:\n"
         + "\n".join(f"  - {p}" for p in missing[:20])
     )
 

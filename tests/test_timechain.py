@@ -21,7 +21,7 @@ import time
 
 import pytest
 
-from titan_plugin.logic.timechain import (
+from titan_hcl.logic.timechain import (
     Block,
     BlockHeader,
     BlockPayload,
@@ -38,7 +38,7 @@ from titan_plugin.logic.timechain import (
     HEADER_SIZE,
     sha256,
 )
-from titan_plugin.logic.proof_of_thought import (
+from titan_hcl.logic.proof_of_thought import (
     BASE_CHI_COSTS,
     DEFAULT_THRESHOLDS,
     MIN_THRESHOLD,
@@ -736,11 +736,18 @@ class TestStats:
     """Test chain status and fork statistics."""
 
     def test_get_chain_status(self, chain):
+        # `total_forks` reflects the count of entries in FORK_NAMES at
+        # `titan_hcl/logic/timechain.py:60`. The set grew over time
+        # (MAIN+DECLARATIVE+PROCEDURAL+EPISODIC+META=5 originally; then
+        # CONVERSATION added; then SYSTEM=100 added — total 7 as of v1.8.2).
+        # Assert against the live FORK_NAMES dict so future additions don't
+        # break this regression check (test refactored 2026-05-15 during §4.I).
+        from titan_hcl.logic.timechain import FORK_NAMES
         status = chain.get_chain_status()
         assert status["titan_id"] == "T_TEST"
         assert status["genesis_exists"]
         assert status["total_blocks"] == 1
-        assert status["total_forks"] == 5
+        assert status["total_forks"] == len(FORK_NAMES)
 
     def test_fork_stats(self, chain):
         chain.commit_block(
@@ -841,7 +848,7 @@ class TestNeuromodColoring:
     """Test neuromodulator-colored blocks."""
 
     def test_neuromod_hash_varies_with_state(self, chain):
-        from titan_plugin.logic.timechain import TimeChain
+        from titan_hcl.logic.timechain import TimeChain
         # Different neuromod states should produce different hashes
         h1 = chain._compute_neuromod_hash({"DA": 0.9, "ACh": 0.1})
         h2 = chain._compute_neuromod_hash({"DA": 0.1, "ACh": 0.9})

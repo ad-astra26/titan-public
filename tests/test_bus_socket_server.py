@@ -26,7 +26,7 @@ import time
 import msgpack
 import pytest
 
-from titan_plugin.core.bus_socket import (
+from titan_hcl.core.bus_socket import (
     PING_INTERVAL_S,
     PING_TIMEOUT_S,
     SEND_BATCH_THRESHOLD,
@@ -35,7 +35,7 @@ from titan_plugin.core.bus_socket import (
     BusSocketServer,
     bus_sock_path,
 )
-from titan_plugin.core._frame import (
+from titan_hcl.core._frame import (
     AUTH_TAG_SIZE,
     CHALLENGE_SIZE,
     compute_hmac,
@@ -250,8 +250,13 @@ def test_publish_routed_to_subscriber_by_dst(server, authkey):
 
 
 def test_publish_broadcast_dst_all(server, authkey):
-    a = _connect_and_handshake(server.sock_path, authkey, subscribe_as="w1")
-    b = _connect_and_handshake(server.sock_path, authkey, subscribe_as="w2")
+    # SPEC §8.2 v1.4.0 (D-SPEC-42) + rFP_worker_broadcast_topics_completion §4.C:
+    # subscribers MUST declare broadcast_topics to receive dst="all" broadcasts.
+    # Without explicit topics, broker correctly drops the broadcast (loud WARN).
+    a = _connect_and_handshake(server.sock_path, authkey, subscribe_as="w1",
+                               topics=["BCAST"])
+    b = _connect_and_handshake(server.sock_path, authkey, subscribe_as="w2",
+                               topics=["BCAST"])
     try:
         assert _wait_for_subscriber(server, "w1")
         assert _wait_for_subscriber(server, "w2")

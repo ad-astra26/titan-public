@@ -25,14 +25,14 @@ import pytest
 
 class TestAudioPerception:
     def test_record_and_count_recent(self):
-        from titan_plugin.logic.inner_perception import AudioPerception
+        from titan_hcl.logic.inner_perception import AudioPerception
         ap = AudioPerception()
         ap.record_create()
         ap.record_create()
         assert ap.get_state()["creates_recent"] == 2
 
     def test_old_creates_excluded_from_window(self):
-        from titan_plugin.logic.inner_perception import AudioPerception
+        from titan_hcl.logic.inner_perception import AudioPerception
         ap = AudioPerception()
         ap.record_create(ts=time.time() - 7200)  # 2h ago
         ap.record_create()
@@ -41,7 +41,7 @@ class TestAudioPerception:
 
 class TestVisualPerception:
     def test_record_and_count(self):
-        from titan_plugin.logic.inner_perception import VisualPerception
+        from titan_hcl.logic.inner_perception import VisualPerception
         vp = VisualPerception()
         for _ in range(3):
             vp.record_create()
@@ -50,12 +50,12 @@ class TestVisualPerception:
 
 class TestAmbientChangeMonitor:
     def test_cold_start_returns_zero(self):
-        from titan_plugin.logic.inner_perception import AmbientChangeMonitor
+        from titan_hcl.logic.inner_perception import AmbientChangeMonitor
         m = AmbientChangeMonitor(lambda: (0.5, 0.5))
         assert m.get_value() == 0.0  # n<5 cold-start
 
     def test_high_variance_saturates(self):
-        from titan_plugin.logic.inner_perception import AmbientChangeMonitor
+        from titan_hcl.logic.inner_perception import AmbientChangeMonitor
         m = AmbientChangeMonitor(lambda: (0.0, 0.0))
         # Manually push samples with high variance.
         m._history.extend([0.0, 1.5, 0.0, 1.5, 0.0, 1.5, 0.0, 1.5, 0.0, 1.5])
@@ -63,7 +63,7 @@ class TestAmbientChangeMonitor:
         assert v == 1.0  # saturation expected
 
     def test_low_variance_low_value(self):
-        from titan_plugin.logic.inner_perception import AmbientChangeMonitor
+        from titan_hcl.logic.inner_perception import AmbientChangeMonitor
         m = AmbientChangeMonitor(lambda: (0.5, 0.5))
         m._history.extend([1.0, 1.01, 1.02, 1.0, 0.99, 1.0, 1.0])
         v = m.get_value()
@@ -72,7 +72,7 @@ class TestAmbientChangeMonitor:
 
 class TestInnerPerceptionStateNotifyCreate:
     def test_audio_only_routes_to_audio(self):
-        from titan_plugin.logic.inner_perception import InnerPerceptionState
+        from titan_hcl.logic.inner_perception import InnerPerceptionState
         s = InnerPerceptionState(lambda: (0.5, 0.5))
         s.notify_create("audio")
         s.notify_create("music")
@@ -84,7 +84,7 @@ class TestInnerPerceptionStateNotifyCreate:
         assert stats["last_create_ts"] > 0
 
     def test_text_only_updates_last_create_ts(self):
-        from titan_plugin.logic.inner_perception import InnerPerceptionState
+        from titan_hcl.logic.inner_perception import InnerPerceptionState
         s = InnerPerceptionState(lambda: (0.5, 0.5))
         s.notify_create("text")
         stats = s.get_stats()
@@ -101,7 +101,7 @@ class TestMindTensorPhase2Formulas:
     """Pin SPEC §23.5 inner_mind[5,7,9] formulas."""
 
     def test_inner_hearing_full_creates_no_ambient(self):
-        from titan_plugin.logic.mind_tensor import collect_mind_15d
+        from titan_hcl.logic.mind_tensor import collect_mind_15d
         v = collect_mind_15d(
             current_5d=[0.5] * 5,
             audio_state={"creates_recent": 5, "ambient": 0.0},
@@ -110,7 +110,7 @@ class TestMindTensorPhase2Formulas:
         assert abs(v[5] - 0.5) < 1e-9
 
     def test_inner_hearing_zero_creates_high_ambient(self):
-        from titan_plugin.logic.mind_tensor import collect_mind_15d
+        from titan_hcl.logic.mind_tensor import collect_mind_15d
         v = collect_mind_15d(
             current_5d=[0.5] * 5,
             audio_state={"creates_recent": 0, "ambient": 0.8},
@@ -119,7 +119,7 @@ class TestMindTensorPhase2Formulas:
         assert abs(v[5] - 0.4) < 1e-9
 
     def test_inner_sight_5_creates_05_ambient(self):
-        from titan_plugin.logic.mind_tensor import collect_mind_15d
+        from titan_hcl.logic.mind_tensor import collect_mind_15d
         v = collect_mind_15d(
             current_5d=[0.5] * 5,
             visual_state={"creates_recent": 5, "ambient": 0.5},
@@ -128,12 +128,12 @@ class TestMindTensorPhase2Formulas:
         assert abs(v[7] - 0.75) < 1e-9
 
     def test_inner_smell_passthrough_ambient_change(self):
-        from titan_plugin.logic.mind_tensor import collect_mind_15d
+        from titan_hcl.logic.mind_tensor import collect_mind_15d
         v = collect_mind_15d(current_5d=[0.5] * 5, ambient_change=0.42)
         assert abs(v[9] - 0.42) < 1e-9
 
     def test_inner_smell_clamped(self):
-        from titan_plugin.logic.mind_tensor import collect_mind_15d
+        from titan_hcl.logic.mind_tensor import collect_mind_15d
         v = collect_mind_15d(current_5d=[0.5] * 5, ambient_change=2.5)
         assert v[9] == 1.0
         v2 = collect_mind_15d(current_5d=[0.5] * 5, ambient_change=-0.3)
@@ -146,7 +146,7 @@ class TestMindTensorPhase2Formulas:
 
 class TestAgencySurrenderProducers:
     def _make_agency(self):
-        from titan_plugin.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.module import AgencyModule
         return AgencyModule()
 
     def _push(self, m, helper, posture, success):
@@ -207,7 +207,7 @@ class TestAgencySurrenderProducers:
 
 class TestEnvironmentalAdaptationTracker:
     def _make(self):
-        from titan_plugin.logic.outer_spirit_history import (
+        from titan_hcl.logic.outer_spirit_history import (
             EnvironmentalAdaptationTracker)
         return EnvironmentalAdaptationTracker()
 
@@ -236,7 +236,7 @@ class TestEnvironmentalAdaptationTracker:
 
 class TestGracefulRestTracker:
     def _make(self):
-        from titan_plugin.logic.outer_spirit_history import GracefulRestTracker
+        from titan_hcl.logic.outer_spirit_history import GracefulRestTracker
         return GracefulRestTracker()
 
     def test_cold_start_neutral(self):
@@ -262,68 +262,53 @@ class TestGracefulRestTracker:
 
 class TestCircadianAlignmentTracker:
     def _make(self):
-        from titan_plugin.logic.outer_spirit_history import (
+        from titan_hcl.logic.outer_spirit_history import (
             CircadianAlignmentTracker)
         return CircadianAlignmentTracker()
 
     def test_cold_start_neutral(self):
-        assert self._make().compute() == 0.5
-
-    def test_actions_at_sin_peak_align(self):
+        # RE-GROUNDED (rFP_trinity_dim_resonance): π-pulse cadence regularity.
+        # < MIN_INTERVALS observed → 0.5.
         t = self._make()
-        # h=6 → sin(2π·6/24) = sin(π/2) = 1 → mean≈1 → (1+1)/2 ≈ 1.0.
-        # Distinct timestamps required (de-dup watermark filters duplicates).
-        # 20 timestamps at h=6:00..6:00:19 — sin spread is < 1e-3 so result
-        # rounds to 1.0 within tolerance.
-        base = 86400 * 5 + 6 * 3600
-        for i in range(20):
-            t.record(base + i)
-        assert abs(t.compute() - 1.0) < 1e-3
+        t.record_cluster(0, 0)    # baseline seed (no interval)
+        t.record_cluster(1, 30)   # 1 interval — still < MIN_INTERVALS
+        assert t.compute() == 0.5
 
-    def test_actions_at_sin_trough_anti_align(self):
+    def test_steady_cadence_high_alignment(self):
+        # Perfectly steady epochs-per-pulse (interval=30 each) → CV=0 → ~1.0.
         t = self._make()
-        # h=18 → sin(2π·18/24) = sin(3π/2) = -1 → (−1+1)/2 = 0.0.
-        # Use distinct timestamps so the watermark de-dup lets all of them
-        # land — the test cares about sin(hour), not strict-uniqueness.
-        base = 86400 * 5 + 18 * 3600
-        for i in range(20):
-            t.record(base + i)
-        assert abs(t.compute() - 0.0) < 1e-3
+        ep = 0
+        for c in range(1, 11):
+            ep += 30
+            t.record_cluster(c, ep)
+        assert t.compute() > 0.95
 
-    def test_dedup_watermark_skips_duplicates(self):
-        """Same recent_actions_detail slice ingested every gather cycle
-        must not bloat the deque with duplicates."""
+    def test_erratic_cadence_low_alignment(self):
+        # Wildly varying intervals → high CV → low alignment.
         t = self._make()
-        slice_ = [1000.0, 1010.0, 1020.0, 1030.0, 1040.0]
-        # Simulate 10 gather cycles re-feeding the same slice.
+        ep = 0
+        for c, iv in enumerate([5, 200, 8, 300, 12, 250, 6, 180], start=1):
+            ep += iv
+            t.record_cluster(c, ep)
+        steady = self._make()
+        ep2 = 0
+        for c in range(1, 11):
+            ep2 += 30
+            steady.record_cluster(c, ep2)
+        assert t.compute() < steady.compute()
+
+    def test_idempotent_same_pulse_count(self):
+        """Repeated gathers with the same pulse_count record no new interval."""
+        t = self._make()
+        t.record_cluster(5, 100)   # baseline seed
         for _ in range(10):
-            t.record_many(slice_)
-        # Only 5 unique timestamps should have landed, not 50.
-        assert len(t._timestamps) == 5
-
-    def test_dedup_advances_on_new_timestamps(self):
-        """When a NEW (higher) timestamp arrives, it gets appended."""
-        t = self._make()
-        t.record_many([1000.0, 1010.0, 1020.0])
-        assert len(t._timestamps) == 3
-        # Next gather: 3 old + 2 new
-        t.record_many([1000.0, 1010.0, 1020.0, 1030.0, 1040.0])
-        assert len(t._timestamps) == 5  # 3 originals + 2 new
-        assert t._last_ts_seen == 1040.0
-
-    def test_record_single_dedups_too(self):
-        t = self._make()
-        t.record(1000.0)
-        t.record(1000.0)  # duplicate
-        t.record(999.0)   # older
-        t.record(1001.0)  # new
-        assert len(t._timestamps) == 2
-        assert t._last_ts_seen == 1001.0
+            t.record_cluster(5, 130)  # same count → no new interval
+        assert len(t._intervals) == 0
 
 
 class TestSelfTrajectoryTracker:
     def _make(self):
-        from titan_plugin.logic.outer_spirit_history import SelfTrajectoryTracker
+        from titan_hcl.logic.outer_spirit_history import SelfTrajectoryTracker
         return SelfTrajectoryTracker()
 
     def test_cold_start_zero(self):
@@ -352,80 +337,14 @@ class TestSelfTrajectoryTracker:
         assert t.compute() == 1.0
 
 
-class TestSelfTrajectoryThrottleIntegration:
-    """Regression test for the 70Hz-Schumann tick bug found 2026-05-07.
-
-    outer_spirit_worker._collect_tick is called from the SHM writer thread
-    at ~70.47 Hz (Schumann). Without throttling, _OUTER_SPIRIT_SNAPSHOTS
-    (deque maxlen=120) rotates fully in ~1.7s, so self_trajectory measures
-    change over 1.7s instead of 60min and pins at ~0.0 for any stable
-    system. Fix: gate append on _SELF_TRAJ_SNAPSHOT_INTERVAL_S = 30.0s.
-    """
-
-    def test_module_constants_present(self):
-        from titan_plugin.modules import outer_spirit_worker as osw
-        # If these are missing, the throttle isn't installed.
-        assert hasattr(osw, "_SELF_TRAJ_SNAPSHOT_INTERVAL_S")
-        assert hasattr(osw, "_OUTER_SPIRIT_SNAPSHOT_LAST_TS")
-        assert osw._SELF_TRAJ_SNAPSHOT_INTERVAL_S == 30.0
-
-    def test_throttle_at_high_tick_rate(self):
-        """Simulate 70Hz ticks for 5 seconds; deque must not exceed
-        ceil(5 / 30) + 1 = 1 entry (or 2 across a boundary)."""
-        from titan_plugin.modules import outer_spirit_worker as osw
-        # Reset module state for the test.
-        osw._OUTER_SPIRIT_SNAPSHOTS.clear()
-        osw._OUTER_SPIRIT_SNAPSHOT_LAST_TS[0] = 0.0
-        # Call the throttled append loop manually at high rate for 5 sim
-        # seconds. We can't call _collect_tick directly (heavy deps), but
-        # the throttle logic itself is the unit under test:
-        import time
-        start = time.time()
-        # Mock 350 ticks (70Hz × 5s) by inlining the throttle check.
-        for _ in range(350):
-            now = time.time()
-            if now - osw._OUTER_SPIRIT_SNAPSHOT_LAST_TS[0] >= osw._SELF_TRAJ_SNAPSHOT_INTERVAL_S:
-                osw._OUTER_SPIRIT_SNAPSHOTS.append((now, [0.5] * 45))
-                osw._OUTER_SPIRIT_SNAPSHOT_LAST_TS[0] = now
-        # After 350 fast iterations within ~milliseconds, only the FIRST
-        # tick should have appended (last_ts was 0.0). Subsequent calls
-        # are within the 30 s window → throttled.
-        assert len(osw._OUTER_SPIRIT_SNAPSHOTS) == 1, (
-            "throttle failed — high-rate ticks must produce ≤1 snapshot "
-            "within 30 s window")
-
-    def test_throttle_allows_30s_gap(self):
-        """Verify the throttle DOES let a snapshot through after 30 s."""
-        from titan_plugin.modules import outer_spirit_worker as osw
-        osw._OUTER_SPIRIT_SNAPSHOTS.clear()
-        osw._OUTER_SPIRIT_SNAPSHOT_LAST_TS[0] = 0.0
-        # First append: gap ∞ from 0.0 → allowed.
-        now = 1000.0
-        if now - osw._OUTER_SPIRIT_SNAPSHOT_LAST_TS[0] >= osw._SELF_TRAJ_SNAPSHOT_INTERVAL_S:
-            osw._OUTER_SPIRIT_SNAPSHOTS.append((now, [0.5] * 45))
-            osw._OUTER_SPIRIT_SNAPSHOT_LAST_TS[0] = now
-        # 25s later: still throttled.
-        now = 1025.0
-        if now - osw._OUTER_SPIRIT_SNAPSHOT_LAST_TS[0] >= osw._SELF_TRAJ_SNAPSHOT_INTERVAL_S:
-            osw._OUTER_SPIRIT_SNAPSHOTS.append((now, [0.5] * 45))
-            osw._OUTER_SPIRIT_SNAPSHOT_LAST_TS[0] = now
-        assert len(osw._OUTER_SPIRIT_SNAPSHOTS) == 1
-        # 30s after first: allowed.
-        now = 1030.0
-        if now - osw._OUTER_SPIRIT_SNAPSHOT_LAST_TS[0] >= osw._SELF_TRAJ_SNAPSHOT_INTERVAL_S:
-            osw._OUTER_SPIRIT_SNAPSHOTS.append((now, [0.5] * 45))
-            osw._OUTER_SPIRIT_SNAPSHOT_LAST_TS[0] = now
-        assert len(osw._OUTER_SPIRIT_SNAPSHOTS) == 2
-
-
 class TestDreamRecallProducer:
     def test_cold_start_zero(self):
-        from titan_plugin.logic.outer_spirit_history import DreamRecallProducer
+        from titan_hcl.logic.outer_spirit_history import DreamRecallProducer
         p = DreamRecallProducer(lambda: None)
         assert p.get_value() == 0.0
 
     def test_refresh_reads_e_mem(self):
-        from titan_plugin.logic.outer_spirit_history import DreamRecallProducer
+        from titan_hcl.logic.outer_spirit_history import DreamRecallProducer
 
         class _StubEMem:
             def get_recall_ratio(self): return 0.42
@@ -436,7 +355,7 @@ class TestDreamRecallProducer:
 
 class TestOuterSpiritHistoryAggregator:
     def test_idempotent_ingestion(self):
-        from titan_plugin.logic.outer_spirit_history import OuterSpiritHistory
+        from titan_hcl.logic.outer_spirit_history import OuterSpiritHistory
         h = OuterSpiritHistory(lambda: None)
         # Same assessments fed twice — should only land once
         recents = [{"score": 0.7, "ts": 100.0}, {"score": 0.6, "ts": 200.0}]
@@ -448,15 +367,49 @@ class TestOuterSpiritHistoryAggregator:
         assert len(h.environmental_adaptation._scores) == 2
 
     def test_get_stats_shape(self):
-        from titan_plugin.logic.outer_spirit_history import OuterSpiritHistory
+        from titan_hcl.logic.outer_spirit_history import OuterSpiritHistory
         h = OuterSpiritHistory(lambda: None)
         s = h.get_stats()
+        # v1.32.0 / D-SPEC-94 — outer_spirit_trajectory added to OSH
+        # output to close CHIT[14] self_trajectory missing-field gap.
         assert set(s.keys()) == {
             "environmental_adaptation",
             "graceful_rest",
             "circadian_alignment",
             "dream_recall_ratio",
+            "outer_spirit_trajectory",
         }
+
+    def test_self_trajectory_in_get_stats_v1_32_0(self):
+        """v1.32.0 / D-SPEC-94 — outer_spirit_trajectory populated from
+        SelfTrajectoryTracker after 45D snapshots ingested via
+        ``ingest_outer_spirit_45d``."""
+        import time
+        from titan_hcl.logic.outer_spirit_history import (
+            OuterSpiritHistory, SELF_TRAJ_SNAPSHOT_INTERVAL_S)
+        h = OuterSpiritHistory(lambda: None)
+        # Cold start — no snapshots → trajectory 0.0
+        assert h.get_stats()["outer_spirit_trajectory"] == 0.0
+        # Ingest first snapshot
+        h.ingest_outer_spirit_45d([0.5] * 45)
+        # Force throttle past 30s for second ingest (overwrite internal ts)
+        h._self_traj_last_ingest_ts = time.time() - (
+            SELF_TRAJ_SNAPSHOT_INTERVAL_S + 1.0)
+        h.ingest_outer_spirit_45d([0.6] * 45)
+        # 2 snapshots → trajectory = L2(diff) / 5.0 = sqrt(45*0.01)/5 ≈ 0.134
+        traj = h.get_stats()["outer_spirit_trajectory"]
+        assert 0.05 < traj < 0.30, f"expected ~0.134, got {traj}"
+
+    def test_ingest_outer_spirit_45d_throttle(self):
+        """v1.32.0 / D-SPEC-94 — back-to-back ingests within
+        ``SELF_TRAJ_SNAPSHOT_INTERVAL_S`` window should drop the second
+        snapshot (deque stays at length 1)."""
+        from titan_hcl.logic.outer_spirit_history import OuterSpiritHistory
+        h = OuterSpiritHistory(lambda: None)
+        h.ingest_outer_spirit_45d([0.1] * 45)
+        h.ingest_outer_spirit_45d([0.9] * 45)  # within throttle window
+        # Deque holds only the first; second was throttled out.
+        assert len(h.self_trajectory._snapshots) == 1
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -466,7 +419,7 @@ class TestOuterSpiritHistoryAggregator:
 class TestOuterSpiritPhase2Formulas:
     def _build(self, *, hist=None, acts=None, soc=None, hlvl=None,
                assess=None):
-        from titan_plugin.logic.outer_spirit_tensor import (
+        from titan_hcl.logic.outer_spirit_tensor import (
             collect_outer_spirit_45d)
         return collect_outer_spirit_45d(
             current_5d=[0.5] * 5,
@@ -566,14 +519,14 @@ class TestOuterSpiritPhase2Formulas:
 
 class TestSocialXGatewayCommunityProducer:
     def test_community_engagement_method_exists(self):
-        from titan_plugin.logic.social_x_gateway import SocialXGateway
+        from titan_hcl.logic.social_x_gateway import SocialXGateway
         assert hasattr(SocialXGateway, "get_community_engagement_stats")
 
     def test_method_returns_expected_shape(self):
         # Unit test against an in-memory schema: instantiate against a
         # tmp DB so the queries exercise real SQL paths.
         import tempfile, os
-        from titan_plugin.logic.social_x_gateway import SocialXGateway
+        from titan_hcl.logic.social_x_gateway import SocialXGateway
 
         with tempfile.TemporaryDirectory() as td:
             db_path = os.path.join(td, "social_x.db")
@@ -593,7 +546,7 @@ class TestSocialXGatewayCommunityProducer:
         """T2/T3 don't have local X data — producer must short-circuit
         when is_x_gateway=False, NOT touch the local DB."""
         import tempfile, os
-        from titan_plugin.logic.social_x_gateway import SocialXGateway
+        from titan_hcl.logic.social_x_gateway import SocialXGateway
 
         with tempfile.TemporaryDirectory() as td:
             db_path = os.path.join(td, "social_x.db")
@@ -609,7 +562,7 @@ class TestSocialXGatewayCommunityProducer:
         """Sanity check that is_x_gateway=True still reaches the DB layer
         (so the canonical T1 path doesn't accidentally short-circuit)."""
         import tempfile, os
-        from titan_plugin.logic.social_x_gateway import SocialXGateway
+        from titan_hcl.logic.social_x_gateway import SocialXGateway
 
         with tempfile.TemporaryDirectory() as td:
             db_path = os.path.join(td, "social_x.db")

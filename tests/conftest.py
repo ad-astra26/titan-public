@@ -37,8 +37,8 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _disable_imw_for_tests(monkeypatch):
-    from titan_plugin.persistence.config import IMWConfig
-    from titan_plugin.persistence import writer_client as _wc
+    from titan_hcl.persistence.config import IMWConfig
+    from titan_hcl.persistence import writer_client as _wc
 
     def _disabled(cls):
         return cls(enabled=False, mode="disabled")

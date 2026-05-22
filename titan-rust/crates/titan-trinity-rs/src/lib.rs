@@ -16,6 +16,7 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod anchor;
 pub mod body_cycle;
 pub mod boot;
 pub mod chi_state;

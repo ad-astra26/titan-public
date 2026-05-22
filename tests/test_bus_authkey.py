@@ -1,5 +1,5 @@
 """
-Tests for titan_plugin/core/bus_authkey.py — HKDF-SHA256 bus authkey derivation.
+Tests for titan_hcl/core/bus_authkey.py — HKDF-SHA256 bus authkey derivation.
 
 Covers:
 - Determinism (recoverability): same input → same output, every call
@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import pytest
 
-from titan_plugin.core.bus_authkey import (
+from titan_hcl.core.bus_authkey import (
     BUS_AUTHKEY_INFO,
     BUS_AUTHKEY_LEN,
     BUS_AUTHKEY_SALT,

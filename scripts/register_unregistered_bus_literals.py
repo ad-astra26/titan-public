@@ -2,7 +2,7 @@
 """register_unregistered_bus_literals — mechanical registration of bus literals.
 
 Scope: takes the `bus_literal_msg_type` findings from the patched
-arch_map_dead_wiring scanner and produces a single edit to `titan_plugin/bus.py`
+arch_map_dead_wiring scanner and produces a single edit to `titan_hcl/bus.py`
 that registers every unregistered literal as a constant.
 
 What this script DOES:
@@ -13,7 +13,7 @@ What this script DOES:
 What this script DOES NOT do (manual follow-up):
   - Replace string literals at the producer/consumer call sites with the
     constants. That requires per-file judgment (each module has its own
-    bus-import style: `from titan_plugin.bus import X`, aliased imports,
+    bus-import style: `from titan_hcl.bus import X`, aliased imports,
     relative imports). Surgical Edit's are safer than auto-rewrite.
   - Add spec entries to bus_specs.py with non-default priority/coalesce/ttl.
     Most can stay at the safe DEFAULT_SPEC (P2, no coalesce). Specs only
@@ -35,7 +35,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BUS_PY = REPO_ROOT / "titan_plugin" / "bus.py"
+BUS_PY = REPO_ROOT / "titan_hcl" / "bus.py"
 SCANNER = REPO_ROOT / "scripts" / "arch_map_dead_wiring.py"
 
 SECTION_HEADER = (
@@ -49,7 +49,7 @@ SECTION_HEADER = (
     "# for any literal looking like a bus msg type (UPPER_SNAKE_CASE) that\n"
     "# isn't in this file. Future literal drift fails CI.\n"
     "#\n"
-    "# Spec entries in titan_plugin/bus_specs.py are optional: messages here\n"
+    "# Spec entries in titan_hcl/bus_specs.py are optional: messages here\n"
     "# default to P2 + no-coalesce (the safe default per Phase B.2 §D6).\n"
     "# Add a spec entry only if a message genuinely needs P0/P1/P3 or\n"
     "# coalesce semantics — judgment per-message.\n"
@@ -162,7 +162,7 @@ def apply_to_bus_py(section: str) -> None:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--apply", action="store_true",
-                   help="actually edit titan_plugin/bus.py (default: dry-run)")
+                   help="actually edit titan_hcl/bus.py (default: dry-run)")
     args = p.parse_args()
 
     print("running arch_map dead_wiring --all --json …", file=sys.stderr)

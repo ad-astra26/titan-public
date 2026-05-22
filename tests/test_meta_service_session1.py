@@ -30,7 +30,7 @@ import pytest
 # ═══════════════════════════════════════════════════════════════════════
 
 def test_bus_constants_present():
-    from titan_plugin import bus
+    from titan_hcl import bus
     for name in (
         "META_REASON_REQUEST",
         "META_REASON_RESPONSE",
@@ -46,7 +46,7 @@ def test_meta_service_interface_config_loads():
     import tomllib
     from pathlib import Path
     cfg_path = (Path(__file__).parent.parent
-                / "titan_plugin" / "titan_params.toml")
+                / "titan_hcl" / "titan_params.toml")
     with open(cfg_path, "rb") as f:
         cfg = tomllib.load(f)
     msi = cfg.get("meta_service_interface")
@@ -63,7 +63,12 @@ def test_meta_service_interface_config_loads():
         "cache_ttl_seconds",
         "cache_cosine_match_threshold",
         "alpha_ramp_enabled",
+        "alpha_phase_warmup_end",  # RFP §4.4 Chunk D — NEW α=0.10 warm-up tier
         "alpha_phase_0_end",
+        "alpha_time_escape_enabled",  # RFP §4.4 Chunk D — time-escape hatch
+        "alpha_time_escape_seconds_per_step",
+        "alpha_time_escape_increment",
+        "alpha_time_escape_cap",
         "outcome_reward_min",
         "outcome_reward_max",
         "timechain_queries_per_min",
@@ -72,9 +77,10 @@ def test_meta_service_interface_config_loads():
         "similar_limit_default",
     ):
         assert k in msi, f"missing config key: {k}"
-    # Session 1 hard-wire: α ramp DISABLED
-    assert msi["alpha_ramp_enabled"] is False, \
-        "Session 1 MUST ship with alpha_ramp_enabled=false"
+    # Chunk D: α ramp ACTIVATED (RFP_meta-reasoning_CGN_FIX.md §4.4).
+    # Was Session 1 hard-wire=False; now true with gentler 5-tier schedule.
+    assert msi["alpha_ramp_enabled"] is True, \
+        "Chunk D ships with alpha_ramp_enabled=true"
     # Signed outcome bounds
     assert msi["outcome_reward_min"] == -1.0
     assert msi["outcome_reward_max"] == 1.0
@@ -90,7 +96,7 @@ def test_meta_service_interface_config_loads():
 # ═══════════════════════════════════════════════════════════════════════
 
 def test_client_request_happy_path():
-    from titan_plugin.logic import meta_service_client as msc
+    from titan_hcl.logic import meta_service_client as msc
 
     class _Q:
         def __init__(self): self.msgs = []
@@ -109,7 +115,9 @@ def test_client_request_happy_path():
     assert len(q.msgs) == 1
     m = q.msgs[0]
     assert m["type"] == "META_REASON_REQUEST"
-    assert m["dst"] == "spirit"
+    # RFP_meta-reasoning_CGN_FIX.md Chunk B.7b — MetaService relocated to
+    # cognitive_worker (was: spirit_worker, D8 retirement target)
+    assert m["dst"] == "cognitive_worker"
     assert m["src"] == "spirit"
     assert m["payload"]["request_id"] == rid
     assert len(m["payload"]["context_vector"]) == 30
@@ -129,13 +137,13 @@ def test_client_request_happy_path():
           context_vector=[0.0]*30, time_budget_ms=-1), "positive int"),
 ])
 def test_client_request_schema_violations(kwargs, needle):
-    from titan_plugin.logic import meta_service_client as msc
+    from titan_hcl.logic import meta_service_client as msc
     with pytest.raises(ValueError, match=needle):
         msc.send_meta_request(**kwargs)
 
 
 def test_client_outcome_signed_bounds():
-    from titan_plugin.logic import meta_service_client as msc
+    from titan_hcl.logic import meta_service_client as msc
 
     class _Q:
         def __init__(self): self.msgs = []
@@ -154,7 +162,7 @@ def test_client_outcome_signed_bounds():
 
 
 def test_client_dispatch_response():
-    from titan_plugin.logic import meta_service_client as msc
+    from titan_hcl.logic import meta_service_client as msc
     msc._clear_handlers_for_testing()
     bucket = []
     msc.register_response_handler("social", bucket.append)
@@ -169,7 +177,7 @@ def test_client_dispatch_response():
 
 
 def test_client_dispatch_handles_exception_without_crash():
-    from titan_plugin.logic import meta_service_client as msc
+    from titan_hcl.logic import meta_service_client as msc
     msc._clear_handlers_for_testing()
 
     def _broken(p): raise RuntimeError("boom")
@@ -189,7 +197,9 @@ def _make_request_msg(consumer="social", qt="formulate_strategy",
     return {
         "type": "META_REASON_REQUEST",
         "src": "spirit",
-        "dst": "spirit",
+        # RFP_meta-reasoning_CGN_FIX.md Chunk B.7b — MetaService relocated
+        # to cognitive_worker. Test fixture matches new routing.
+        "dst": "cognitive_worker",
         "ts": 0.0,
         "rid": None,
         "payload": {
@@ -205,7 +215,7 @@ def _make_request_msg(consumer="social", qt="formulate_strategy",
 
 
 def test_service_dry_run_resolves_request():
-    from titan_plugin.logic.meta_service import MetaService
+    from titan_hcl.logic.meta_service import MetaService
     out = []
     svc = MetaService(response_emitter=out.append)
     svc.handle_request(_make_request_msg(request_id="r-a"))
@@ -218,7 +228,7 @@ def test_service_dry_run_resolves_request():
 
 
 def test_service_rate_limit_per_consumer():
-    from titan_plugin.logic.meta_service import MetaService
+    from titan_hcl.logic.meta_service import MetaService
     out = []
     svc = MetaService(response_emitter=out.append)
     # Per-consumer default = 10/min; 12 requests → 10 dry-run + 2 rate-limited
@@ -230,7 +240,7 @@ def test_service_rate_limit_per_consumer():
 
 
 def test_service_rejects_schema_invalid():
-    from titan_plugin.logic.meta_service import MetaService
+    from titan_hcl.logic.meta_service import MetaService
     svc = MetaService(response_emitter=lambda m: None)
     bad_ctx = _make_request_msg(request_id="bad-1", ctx_dim=29)
     assert svc.handle_request(bad_ctx) == "schema_invalid"
@@ -245,7 +255,7 @@ def test_service_rejects_schema_invalid():
 
 
 def test_service_outcome_ingestion_bounded():
-    from titan_plugin.logic.meta_service import MetaService
+    from titan_hcl.logic.meta_service import MetaService
     svc = MetaService(response_emitter=lambda m: None)
     # Happy
     assert svc.handle_outcome({"payload": {
@@ -269,7 +279,7 @@ def test_service_outcome_ingestion_bounded():
 
 
 def test_service_status_export_shape():
-    from titan_plugin.logic.meta_service import MetaService
+    from titan_hcl.logic.meta_service import MetaService
     svc = MetaService(response_emitter=lambda m: None)
     status = svc.get_status()
     # Required top-level keys
@@ -278,7 +288,8 @@ def test_service_status_export_shape():
               "cache", "recruitment", "rewards"):
         assert k in status, f"missing status key: {k}"
     assert status["session_phase"] == "session_1_dry_run"
-    assert status["alpha_ramp_enabled"] is False
+    # Chunk D (RFP §4.4): alpha_ramp_enabled flipped true at activation.
+    assert status["alpha_ramp_enabled"] is True
     # Home worker map sanity
     assert status["home_worker_map"]["social"] == "spirit"
 
@@ -288,16 +299,19 @@ def test_service_status_export_shape():
 # ═══════════════════════════════════════════════════════════════════════
 
 def test_recruitment_catalog_complete():
-    from titan_plugin.logic.meta_recruitment import RECRUITMENT_CATALOG
-    # 47 keys per rFP §5.1 (9 primitives × varying sub-modes)
-    assert len(RECRUITMENT_CATALOG) == 47
+    from titan_hcl.logic.meta_recruitment import RECRUITMENT_CATALOG
+    # 50 keys: 47 per F-phase rFP §5.1 (9 primitives × varying sub-modes) +
+    # 3 from rFP_titan_meta_outer_layer (RECALL.topic, EVALUATE.peer_cgn,
+    # DELEGATE.gap_fill — catalog-coverage added 2026-05-15 per
+    # RFP_meta-reasoning_CGN_FIX.md Chunk A drift cleanup).
+    assert len(RECRUITMENT_CATALOG) == 50
     # Every key has at least one recruiter
     for k, v in RECRUITMENT_CATALOG.items():
         assert isinstance(v, list) and len(v) >= 1, f"{k} has no recruiters"
 
 
 def test_recruitment_health_check_no_unknowns():
-    from titan_plugin.logic.meta_recruitment import MetaRecruitment
+    from titan_hcl.logic.meta_recruitment import MetaRecruitment
     mr = MetaRecruitment()
     health = mr.catalog_health_check()
     assert health["unknown_recruiter_count"] == 0, \
@@ -306,7 +320,7 @@ def test_recruitment_health_check_no_unknowns():
 
 
 def test_recruitment_thompson_converges_to_best():
-    from titan_plugin.logic.meta_recruitment import MetaRecruitment
+    from titan_hcl.logic.meta_recruitment import MetaRecruitment
     mr = MetaRecruitment()
     # Train: DECOMPOSE strongly positive, others negative
     for _ in range(50):
@@ -325,7 +339,7 @@ def test_recruitment_thompson_converges_to_best():
 
 
 def test_recruitment_resolver_registration_reduces_stale():
-    from titan_plugin.logic.meta_recruitment import MetaRecruitment
+    from titan_hcl.logic.meta_recruitment import MetaRecruitment
     mr = MetaRecruitment()
     stale_before = mr.catalog_health_check()["stale_recruiter_count"]
     mr.register_resolver("reasoning", lambda name, ctx: {"success": True})
@@ -338,10 +352,13 @@ def test_recruitment_resolver_registration_reduces_stale():
 # Commit 5 — SUB_MODES compositional extension
 # ═══════════════════════════════════════════════════════════════════════
 
-def test_sub_modes_expanded_to_47():
-    from titan_plugin.logic.meta_reasoning import SUB_MODES, STEP_REWARDS
+def test_sub_modes_expanded_to_50():
+    from titan_hcl.logic.meta_reasoning import SUB_MODES, STEP_REWARDS
     total = sum(len(v) for v in SUB_MODES.values())
-    assert total == 47
+    # 47 per F-phase rFP §5.1 + 3 from rFP_titan_meta_outer_layer
+    # (catalog-coverage drift closed 2026-05-15 per
+    # RFP_meta-reasoning_CGN_FIX.md Chunk A).
+    assert total == 50
     # F-phase new sub-modes
     assert "compose_intersection" in SUB_MODES["FORMULATE"]
     assert "compose_union" in SUB_MODES["FORMULATE"]
@@ -356,15 +373,20 @@ def test_sub_modes_expanded_to_47():
     assert "contrast_with" in SUB_MODES["HYPOTHESIZE"]
     assert "propose_by_inversion" in SUB_MODES["HYPOTHESIZE"]
     assert "extend_pattern" in SUB_MODES["HYPOTHESIZE"]
-    # All 47 have STEP_REWARDS
+    # rFP_titan_meta_outer_layer sub-modes (shipped 2026-04-23,
+    # catalog + STEP_REWARDS coverage closed 2026-05-15)
+    assert "topic" in SUB_MODES["RECALL"]
+    assert "peer_cgn" in SUB_MODES["EVALUATE"]
+    assert "gap_fill" in SUB_MODES["DELEGATE"]
+    # All 50 have STEP_REWARDS
     for p, modes in SUB_MODES.items():
         for m in modes:
             assert f"{p}.{m}" in STEP_REWARDS, f"{p}.{m} missing STEP_REWARDS"
 
 
 def test_recruitment_catalog_covers_all_sub_modes():
-    from titan_plugin.logic.meta_reasoning import SUB_MODES
-    from titan_plugin.logic.meta_recruitment import RECRUITMENT_CATALOG
+    from titan_hcl.logic.meta_reasoning import SUB_MODES
+    from titan_hcl.logic.meta_recruitment import RECRUITMENT_CATALOG
     sm_keys = {f"{p}.{m}" for p, modes in SUB_MODES.items() for m in modes}
     cat_keys = set(RECRUITMENT_CATALOG.keys())
     gap = sm_keys - cat_keys
@@ -376,7 +398,7 @@ def test_recruitment_catalog_covers_all_sub_modes():
 # ═══════════════════════════════════════════════════════════════════════
 
 def test_accumulator_alpha_disabled_forces_zero():
-    from titan_plugin.logic.meta_dynamic_rewards import DynamicRewardAccumulator
+    from titan_hcl.logic.meta_dynamic_rewards import DynamicRewardAccumulator
     acc = DynamicRewardAccumulator(alpha_ramp_enabled=False)
     # Even after many outcomes, α stays 0
     for _ in range(5000):
@@ -386,34 +408,48 @@ def test_accumulator_alpha_disabled_forces_zero():
 
 
 def test_accumulator_alpha_ramp_boundaries():
-    from titan_plugin.logic.meta_dynamic_rewards import DynamicRewardAccumulator
+    """5-tier schedule per RFP_meta-reasoning_CGN_FIX.md §4.4 Chunk D:
+    warm_up (α=0.10) → phase_0 (0.25) → phase_1 (0.50) → phase_2 (0.75) →
+    steady (1.0). Time-escape disabled for predictable count-based path."""
+    from titan_hcl.logic.meta_dynamic_rewards import DynamicRewardAccumulator
     acc = DynamicRewardAccumulator(
         alpha_ramp_enabled=True,
-        phase_0_end=5, phase_1_end=10, phase_2_end=15, phase_3_end=20,
+        phase_warmup_end=5, phase_0_end=10, phase_1_end=15,
+        phase_2_end=20, phase_3_end=25,
+        time_escape_enabled=False,
     )
-    assert acc.current_alpha() == 0.0
+    # Warm-up tier (0-5)
+    assert acc.current_alpha() == 0.10
     for _ in range(5):
         acc.record_single_step("social", "FORMULATE", "define", 0.1)
+    # phase_0 (5-10)
     assert acc.current_alpha() == 0.25
     for _ in range(5):
         acc.record_single_step("social", "FORMULATE", "define", 0.1)
+    # phase_1 (10-15)
     assert acc.current_alpha() == 0.50
     for _ in range(5):
         acc.record_single_step("social", "FORMULATE", "define", 0.1)
+    # phase_2 (15-20)
     assert acc.current_alpha() == 0.75
     for _ in range(5):
         acc.record_single_step("social", "FORMULATE", "define", 0.1)
+    # steady (≥20)
     assert acc.current_alpha() == 1.0
 
 
 def test_accumulator_cold_start_returns_static():
-    from titan_plugin.logic.meta_dynamic_rewards import DynamicRewardAccumulator
+    from titan_hcl.logic.meta_dynamic_rewards import DynamicRewardAccumulator
+    # Time-escape disabled for predictable count-based path; tight thresholds
+    # so test runs fast. RFP §4.4 5-tier schedule.
     acc = DynamicRewardAccumulator(
         alpha_ramp_enabled=True,
-        phase_0_end=5, phase_1_end=100, phase_2_end=200, phase_3_end=300,
+        phase_warmup_end=5, phase_0_end=100, phase_1_end=200,
+        phase_2_end=300, phase_3_end=400,
         cold_start_n=10,
+        time_escape_enabled=False,
     )
-    # Below cold_start_n=10 → static
+    # Below cold_start_n=10 → static (per-tuple blend_step_reward gate)
     for _ in range(5):
         acc.record_single_step("social", "FORMULATE", "define", 1.0)
     b = acc.blend_step_reward(
@@ -421,18 +457,19 @@ def test_accumulator_cold_start_returns_static():
         sub_mode="define", consumer_context="social")
     assert b == 0.05
 
-    # Above cold_start_n with α=0.25, dynamic=1.0, static=0.05
-    for _ in range(15):
+    # Above cold_start_n with α=0.25 (phase_0 tier, 20 outcomes total),
+    # dynamic=1.0, static=0.05 → (1 - 0.25) * 0.05 + 0.25 * 1.0 = 0.2875
+    for _ in range(15):  # total 20, crosses phase_warmup_end=5 → phase_0
         acc.record_single_step("social", "FORMULATE", "define", 1.0)
+    assert acc.current_alpha() == 0.25
     b = acc.blend_step_reward(
         static_reward=0.05, primitive="FORMULATE",
         sub_mode="define", consumer_context="social")
-    # (1 - 0.25) * 0.05 + 0.25 * 1.0 = 0.2875
     assert abs(b - 0.2875) < 1e-6
 
 
 def test_accumulator_self_driven_chains_unchanged():
-    from titan_plugin.logic.meta_dynamic_rewards import DynamicRewardAccumulator
+    from titan_hcl.logic.meta_dynamic_rewards import DynamicRewardAccumulator
     acc = DynamicRewardAccumulator(alpha_ramp_enabled=True)
     for _ in range(1000):
         acc.record_single_step("social", "FORMULATE", "define", 1.0)
@@ -447,7 +484,7 @@ def test_accumulator_self_driven_chains_unchanged():
 # ═══════════════════════════════════════════════════════════════════════
 
 def test_similar_query_dataclass_defaults():
-    from titan_plugin.logic.timechain_v2 import SimilarQuery
+    from titan_hcl.logic.timechain_v2 import SimilarQuery
     q = SimilarQuery(query_vector=[0.1] * 132)
     assert q.threshold == 0.75
     assert q.limit == 10
@@ -457,7 +494,7 @@ def test_similar_query_dataclass_defaults():
 
 def test_similar_ranks_by_cosine_and_skips_missing():
     from types import MethodType
-    from titan_plugin.logic.timechain_v2 import (
+    from titan_hcl.logic.timechain_v2 import (
         TimeChainOrchestrator, SimilarQuery,
     )
 
@@ -486,7 +523,7 @@ def test_similar_ranks_by_cosine_and_skips_missing():
 
 def test_similar_empty_query_returns_empty():
     from types import MethodType
-    from titan_plugin.logic.timechain_v2 import (
+    from titan_hcl.logic.timechain_v2 import (
         TimeChainOrchestrator, SimilarQuery,
     )
 
@@ -503,7 +540,7 @@ def test_similar_empty_query_returns_empty():
 # ═══════════════════════════════════════════════════════════════════════
 
 def test_social_context_builder_30d():
-    from titan_plugin.logic.social_narrator import build_social_meta_context_30d
+    from titan_hcl.logic.social_narrator import build_social_meta_context_30d
     # With realistic inputs
     vec = build_social_meta_context_30d(
         neuromods={"DA": 0.7, "5HT": 0.5, "NE": 0.6, "GABA": 0.4},
@@ -519,7 +556,7 @@ def test_social_context_builder_30d():
 
 
 def test_social_context_builder_defaults_are_valid():
-    from titan_plugin.logic.social_narrator import build_social_meta_context_30d
+    from titan_hcl.logic.social_narrator import build_social_meta_context_30d
     vec = build_social_meta_context_30d()
     assert len(vec) == 30
     assert all(0.0 <= x <= 1.0 for x in vec)
@@ -528,9 +565,9 @@ def test_social_context_builder_defaults_are_valid():
 def test_end_to_end_social_request_outcome_roundtrip():
     """Full social flow: build context → send request → service dry-runs →
     response emitted → outcome sent → counters reflect traffic."""
-    from titan_plugin.logic import meta_service_client as msc
-    from titan_plugin.logic.meta_service import MetaService
-    from titan_plugin.logic.social_narrator import build_social_meta_context_30d
+    from titan_hcl.logic import meta_service_client as msc
+    from titan_hcl.logic.meta_service import MetaService
+    from titan_hcl.logic.social_narrator import build_social_meta_context_30d
 
     responses = []
     svc = MetaService(response_emitter=responses.append)

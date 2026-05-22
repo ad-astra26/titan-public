@@ -101,7 +101,7 @@ def kernel_subprocess(tmp_path: Path) -> Generator[dict, None, None]:
         "TITAN_KERNEL_LOG_LEVEL": "warn",
         # Skip Python plugin spawn — this test exercises the Rust-side
         # heartbeat loop only. Python plugin would conflict with any other
-        # titan_main.pid in the canonical CWD.
+        # titan_hcl.pid in the canonical CWD.
         "TITAN_KERNEL_SKIP_PYTHON": "1",
     }
     log_path = tmp_path / "kernel.log"

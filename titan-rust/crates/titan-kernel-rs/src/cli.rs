@@ -111,8 +111,8 @@ pub struct Cli {
     #[arg(long, env = "TITAN_KERNEL_LOG_LEVEL", value_enum, default_value_t = LogLevel::Info)]
     pub log_level: LogLevel,
 
-    /// Path to `titan_plugin/config.toml`.
-    #[arg(long, default_value = "titan_plugin/config.toml")]
+    /// Path to `titan_hcl/config.toml`.
+    #[arg(long, default_value = "titan_hcl/config.toml")]
     pub config: PathBuf,
 }
 

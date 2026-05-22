@@ -1,7 +1,7 @@
 """Tests for IMW ServiceWAL — append, checkpoint, replay on boot."""
 from pathlib import Path
 
-from titan_plugin.persistence.service_wal import ServiceWAL
+from titan_hcl.persistence.service_wal import ServiceWAL
 
 
 def test_append_and_iterate(tmp_path):

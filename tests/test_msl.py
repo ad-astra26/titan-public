@@ -8,7 +8,7 @@ import tempfile
 import numpy as np
 import pytest
 
-from titan_plugin.logic.msl import (
+from titan_hcl.logic.msl import (
     CONCEPT_NAMES,
     SELF_RELEVANCE_MAP,
     SPIRIT_DIMS,

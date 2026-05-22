@@ -73,13 +73,11 @@ async fn recv_loop_auto_pongs_within_100ms_of_ping() {
 
         // Server reads next frame — expect BUS_PONG
         let mut prefix = [0u8; 4];
-        let read_result = tokio::time::timeout(
-            Duration::from_millis(500),
-            stream.read_exact(&mut prefix),
-        )
-        .await
-        .expect("PONG read should not time out — recv loop must auto-pong")
-        .expect("PONG read I/O ok");
+        let read_result =
+            tokio::time::timeout(Duration::from_millis(500), stream.read_exact(&mut prefix))
+                .await
+                .expect("PONG read should not time out — recv loop must auto-pong")
+                .expect("PONG read I/O ok");
         let _ = read_result;
         let n = decode_length_prefix(&prefix).unwrap() as usize;
         let mut payload = vec![0u8; n];
@@ -176,17 +174,26 @@ async fn bus_ping_not_forwarded_to_caller_events() {
 
         // Send BUS_PING
         let ping = encode_simple("BUS_PING", Some("broker"), None, None).unwrap();
-        stream.write_all(&encode_frame(&ping).unwrap()).await.unwrap();
+        stream
+            .write_all(&encode_frame(&ping).unwrap())
+            .await
+            .unwrap();
 
         // Send a real message (SPHERE_PULSE)
         let real = encode_simple(
             "SPHERE_PULSE",
             Some("titan-trinity-rs"),
             Some("all"),
-            Some(&[0xAA, 0xBB]),
+            Some(rmpv::Value::Map(vec![(
+                rmpv::Value::String("phase".into()),
+                rmpv::Value::F64(0.5),
+            )])),
         )
         .unwrap();
-        stream.write_all(&encode_frame(&real).unwrap()).await.unwrap();
+        stream
+            .write_all(&encode_frame(&real).unwrap())
+            .await
+            .unwrap();
 
         // Drain the PONG so the connection doesn't error.
         let mut prefix = [0u8; 4];

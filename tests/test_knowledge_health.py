@@ -1,4 +1,4 @@
-"""Unit tests for titan_plugin.logic.knowledge_health (KP-4).
+"""Unit tests for titan_hcl.logic.knowledge_health (KP-4).
 
 Covers: circuit breaker state transitions, budget counters + persistence
 across "restart", decision-log write + rotation, near-duplicate detection.
@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from titan_plugin.logic.knowledge_health import (
+from titan_hcl.logic.knowledge_health import (
     CIRCUIT_CLOSED,
     CIRCUIT_HALF_OPEN,
     CIRCUIT_OPEN,

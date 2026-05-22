@@ -1,6 +1,6 @@
 //! frame — Length-prefix + HMAC-SHA256 challenge-response framing.
 //!
-//! Byte-identical port of `titan_plugin/core/_frame.py` (B.2 protocol).
+//! Byte-identical port of `titan_hcl/core/_frame.py` (B.2 protocol).
 //! SPEC §8.10 guarantees Rust output matches Python output bit-for-bit
 //! for every input, verified by parity vectors at `tests/parity/vectors.json`.
 //!
@@ -25,7 +25,7 @@
 //! All constants here come from [`crate::constants`] (auto-generated from
 //! `SPEC_titan_architecture_constants.toml` per SPEC §19.2). Python
 //! `_frame.py` constants alias to these names via SPEC §3.1 D07/D23 in
-//! `titan_plugin/_phase_c_drift_aliases.py` (C2-7).
+//! `titan_hcl/_phase_c_drift_aliases.py` (C2-7).
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;

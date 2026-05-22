@@ -106,7 +106,7 @@ def kernel_subprocess(tmp_path: Path) -> Generator[dict, None, None]:
 
     # Spawn the kernel — Python plugin spawn disabled (we only need the bus
     # broker for this test; spawning python_main would conflict with the
-    # production T1's titan_main.pid file at the canonical CWD).
+    # production T1's titan_hcl.pid file at the canonical CWD).
     # TITAN_KERNEL_SKIP_PYTHON=1 disables python_main spawn (production never sets this).
     env = {
         **os.environ,
@@ -186,7 +186,7 @@ def test_python_worker_handshake_with_rust_kernel(kernel_subprocess: dict) -> No
     """
     from queue import Queue
 
-    from titan_plugin.core.worker_bus_bootstrap import (
+    from titan_hcl.core.worker_bus_bootstrap import (
         ENV_BUS_KEYPAIR_PATH,
         ENV_BUS_SOCKET_PATH,
         ENV_BUS_TITAN_ID,

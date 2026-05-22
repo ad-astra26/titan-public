@@ -102,7 +102,10 @@ mod tests {
         assert!(path.exists());
         let meta = std::fs::metadata(&path).unwrap();
         // §7.0 v1.0.0: 16-byte fixed header + 3 × (16-byte buffer meta + 256 KB max payload)
-        assert_eq!(meta.len(), 16 + 3 * (16 + CGN_LIVE_WEIGHTS_MAX_BYTES as u64));
+        assert_eq!(
+            meta.len(),
+            16 + 3 * (16 + CGN_LIVE_WEIGHTS_MAX_BYTES as u64)
+        );
         let _ = slot;
     }
 
@@ -123,7 +126,10 @@ mod tests {
         // Re-create — should unlink + recreate clean
         let slot = create_cgn_live_weights(dir.path()).unwrap();
         let meta = std::fs::metadata(&path).unwrap();
-        assert_eq!(meta.len(), 16 + 3 * (16 + CGN_LIVE_WEIGHTS_MAX_BYTES as u64));
+        assert_eq!(
+            meta.len(),
+            16 + 3 * (16 + CGN_LIVE_WEIGHTS_MAX_BYTES as u64)
+        );
         let _ = slot;
     }
 

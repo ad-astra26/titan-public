@@ -96,7 +96,7 @@ def main():
 
     # ─── Configuration ───
     print("\n  Configuration:")
-    config_path = os.path.join("titan_plugin", "config.toml")
+    config_path = os.path.join("titan_hcl", "config.toml")
     has_config = check("config.toml", os.path.exists(config_path), config_path)
 
     if has_config:

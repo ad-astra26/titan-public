@@ -47,6 +47,8 @@ phf.workspace = true
 
 # RNG for jittered restart backoff (per SPEC §11.B step 5 — ±25% jitter)
 rand.workspace = true
+# Normal distribution for TrinityValueNet He-init (shared filter_down value net)
+rand_distr = "0.4"
 
 [dev-dependencies]
 # Cross-language parity vectors loaded from tests/parity/vectors.json at repo root
@@ -54,6 +56,7 @@ serde_json.workspace = true
 # Test helpers
 tempfile = "3"
 rand = "0.8"
+rand_chacha = "0.3"
 
 [lints]
 workspace = true

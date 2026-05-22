@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 """
 scripts/s5_callsite_audit.py — categorize all `plugin.X.Y` callsites in
-titan_plugin/api/ for the S5 amendment codemod.
+titan_hcl/api/ for the S5 amendment codemod.
 
 Microkernel v2 Phase A §A.4 S5 amendment (2026-04-25), Phase 2.
 
-Walks every .py under titan_plugin/api/ and finds attribute access
+Walks every .py under titan_hcl/api/ and finds attribute access
 chains rooted at `plugin` (any of the names: plugin, _plugin, agent.plugin,
-request.app.state.titan_plugin, etc.). Each chain is classified:
+request.app.state.titan_hcl, etc.). Each chain is classified:
 
   A — pure state read (e.g. plugin.network.pubkey, plugin.soul.maker_pubkey)
       ⇒ codemod target: state.<sub>.<attr>
@@ -25,7 +25,7 @@ Outputs CSV at titan-docs/s5_callsite_inventory.csv with columns:
 
 Run:
   python scripts/s5_callsite_audit.py
-  python scripts/s5_callsite_audit.py --paths titan_plugin/api/dashboard.py
+  python scripts/s5_callsite_audit.py --paths titan_hcl/api/dashboard.py
 """
 from __future__ import annotations
 
@@ -42,8 +42,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PLUGIN_ROOT_NAMES = {"plugin", "_plugin", "request_plugin"}
 # Attribute paths that mean "current plugin" via attribute chain
 PLUGIN_ATTR_PREFIXES = [
-    ("request", "app", "state", "titan_plugin"),
-    ("app", "state", "titan_plugin"),
+    ("request", "app", "state", "titan_hcl"),
+    ("app", "state", "titan_hcl"),
     ("agent", "plugin"),
 ]
 
@@ -154,7 +154,7 @@ def _flatten_attr_chain(node: ast.AST) -> list[str] | None:
 
 def _is_plugin_root(parts: list[str]) -> tuple[bool, list[str]]:
     """Return (is_plugin_chain, normalized_chain) — strips the prefix
-    that resolves to plugin (request.app.state.titan_plugin etc.) and
+    that resolves to plugin (request.app.state.titan_hcl etc.) and
     returns the remainder starting from the first plugin attribute.
     """
     if not parts:
@@ -364,8 +364,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--paths", nargs="*",
-        default=["titan_plugin/api"],
-        help="files or dirs to scan (default: titan_plugin/api)",
+        default=["titan_hcl/api"],
+        help="files or dirs to scan (default: titan_hcl/api)",
     )
     parser.add_argument(
         "--out", default="titan-docs/s5_callsite_inventory.csv",

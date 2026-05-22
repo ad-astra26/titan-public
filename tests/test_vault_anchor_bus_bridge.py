@@ -3,34 +3,43 @@ Tests for the vault anchor bus-bridge (BUG-VAULT-COMMITS-NOT-LANDING fix).
 
 Two surfaces under test:
 
-  * ``titan_plugin.modules.memory_worker._request_anchor_via_kernel``
-    — sends ANCHOR_REQUEST, waits on the worker's recv_queue for a matching
-    bus.RESPONSE, re-injects unrelated messages, times out gracefully.
+  * ``titan_hcl.modules.memory_worker._request_anchor_via_kernel``
+    — sends ANCHOR_REQUEST, registers a Future in `InFlightRegistry`, and
+    blocks until the kernel's RESPONSE arrives (resolved by the main loop)
+    or the timeout expires.
 
-  * ``titan_plugin.core.kernel.TitanKernel._handle_anchor_request``
+    Phase A refactor (rFP §3.4.1, 2026-05-12): the function no longer reads
+    from recv_queue directly. The main loop is the SOLE recv_queue reader
+    and uses `registry.resolve(msg)` to route RESPONSE messages to the
+    waiting Future. Unrelated messages and wrong-rid responses are NOT the
+    bus-bridge's concern any more — the main loop dispatches them normally.
+
+  * ``titan_hcl.core.kernel.TitanKernel._handle_anchor_request``
     — limbo guard, no-vault-program-id guard, build_failed path, send_failed
     path, success path. We mock self.network + self.bus + self._anchor_helper
     so we can assert the response payload without touching Solana.
 
-Reference: titan_plugin/bus.py (ANCHOR_REQUEST docstring + wire contract).
+Reference: titan_hcl/bus.py (ANCHOR_REQUEST docstring + wire contract),
+PLAN_phase_c_memory_worker_concurrent_dispatch.md §2.4 (InFlightRegistry).
 """
 from __future__ import annotations
 
 import asyncio
 import threading
 import time
-from queue import Queue, Empty
-from unittest.mock import MagicMock, patch
+from queue import Queue
+from unittest.mock import MagicMock
 
 import pytest
 
-from titan_plugin import bus as bus_mod
-from titan_plugin.modules import memory_worker
-from titan_plugin.core.kernel import TitanKernel
+from titan_hcl import bus as bus_mod
+from titan_hcl.modules import memory_worker
+from titan_hcl.modules._memory_dispatch import InFlightRegistry
+from titan_hcl.core.kernel import TitanKernel
 
 
 # ---------------------------------------------------------------------------
-# memory_worker._request_anchor_via_kernel
+# memory_worker._request_anchor_via_kernel (Phase A — InFlightRegistry)
 # ---------------------------------------------------------------------------
 
 
@@ -46,26 +55,29 @@ def _make_response(rid: str, tx_signature: str | None, error: str | None) -> dic
 
 
 def test_request_anchor_returns_tx_signature_on_match():
-    """Happy path: ANCHOR_REQUEST published, matching RESPONSE arrives."""
+    """Happy path: ANCHOR_REQUEST published; kernel simulator reads it,
+    builds matching RESPONSE, resolves the registered Future via
+    `registry.resolve(...)`. Bus-bridge returns the kernel's payload."""
     send_queue: Queue = Queue()
-    recv_queue: Queue = Queue()
+    registry = InFlightRegistry()
 
-    # Helper thread waits for the request to land on send_queue, then
-    # injects a matching RESPONSE on recv_queue.
     def _kernel_simulator():
-        # Pull the published ANCHOR_REQUEST.
+        # Read the published ANCHOR_REQUEST off send_queue
         msg = send_queue.get(timeout=2.0)
         assert msg["type"] == bus_mod.ANCHOR_REQUEST
         assert msg["dst"] == "kernel"
         assert msg["src"] == "memory"
         rid = msg["rid"]
-        recv_queue.put_nowait(_make_response(rid, "SIG_123abc", None))
+        # Main loop would call registry.resolve on incoming RESPONSE.
+        # Simulate it directly here.
+        ok = registry.resolve(_make_response(rid, "SIG_123abc", None))
+        assert ok is True
 
     t = threading.Thread(target=_kernel_simulator, daemon=True)
     t.start()
 
     result = memory_worker._request_anchor_via_kernel(
-        send_queue, recv_queue, "memory",
+        registry, send_queue, "memory",
         state_root="MERKLE_abc",
         payload_json='[{"id":"n1"}]',
         promoted_count=1,
@@ -74,16 +86,19 @@ def test_request_anchor_returns_tx_signature_on_match():
 
     t.join(timeout=2.0)
     assert result == {"tx_signature": "SIG_123abc", "error": None}
+    # Registry is purged after resolve
+    assert registry.in_flight_count() == 0
 
 
 def test_request_anchor_times_out_when_no_response():
-    """Timeout returns explicit error, never blocks indefinitely."""
+    """Timeout returns explicit error, never blocks indefinitely.
+    Registry is purged on timeout (rid cancelled)."""
     send_queue: Queue = Queue()
-    recv_queue: Queue = Queue()
+    registry = InFlightRegistry()
 
     t0 = time.time()
     result = memory_worker._request_anchor_via_kernel(
-        send_queue, recv_queue, "memory",
+        registry, send_queue, "memory",
         state_root="MERKLE_abc",
         payload_json='[{"id":"n1"}]',
         promoted_count=1,
@@ -94,87 +109,88 @@ def test_request_anchor_times_out_when_no_response():
     assert result == {"error": "anchor_request_timeout"}
     # Sanity: should have waited approximately the timeout, not bailed early.
     assert 1.4 <= elapsed <= 3.5
-    # And the request was published.
+    # The request was published.
     msg = send_queue.get_nowait()
     assert msg["type"] == bus_mod.ANCHOR_REQUEST
+    # Registry purged the timed-out rid via cancel
+    assert registry.in_flight_count() == 0
 
 
-def test_request_anchor_reinjects_unrelated_messages():
-    """Non-matching messages must end up back in recv_queue after the wait,
-    so the main worker loop can process them after meditation returns."""
+def test_request_anchor_does_not_touch_recv_queue():
+    """The Phase A refactor guarantees the bus-bridge never reads from
+    recv_queue. We assert this structurally: pass a Queue with items in
+    it; verify it's untouched after the bus-bridge runs."""
     send_queue: Queue = Queue()
+    # An "unused" queue that the bus-bridge MUST NOT touch
     recv_queue: Queue = Queue()
+    recv_queue.put_nowait({"type": "MEMORY_ADD", "src": "spirit",
+                           "dst": "memory", "rid": None,
+                           "payload": {"text": "hello"}})
+    recv_queue.put_nowait({"type": "QUERY", "src": "spirit",
+                           "dst": "memory", "rid": "other_rid",
+                           "payload": {"action": "status"}})
+    pre_size = recv_queue.qsize()
 
-    # Pre-load recv_queue with two non-anchor messages and one matching
-    # RESPONSE. The function should consume only the RESPONSE; the
-    # unrelated messages must be re-injected (in arrival order).
-    rid_holder: dict = {}
+    registry = InFlightRegistry()
 
     def _kernel_simulator():
         msg = send_queue.get(timeout=2.0)
-        rid_holder["rid"] = msg["rid"]
-
-        # Emit two unrelated messages first, then the matching RESPONSE.
-        recv_queue.put_nowait({"type": "MEMORY_ADD", "src": "spirit",
-                               "dst": "memory", "ts": time.time(),
-                               "rid": None, "payload": {"text": "hello"}})
-        recv_queue.put_nowait({"type": "QUERY", "src": "spirit",
-                               "dst": "memory", "ts": time.time(),
-                               "rid": "other_rid",
-                               "payload": {"action": "status"}})
-        recv_queue.put_nowait(_make_response(rid_holder["rid"], "SIG_x", None))
+        registry.resolve(_make_response(msg["rid"], "SIG_x", None))
 
     t = threading.Thread(target=_kernel_simulator, daemon=True)
     t.start()
 
     result = memory_worker._request_anchor_via_kernel(
-        send_queue, recv_queue, "memory",
+        registry, send_queue, "memory",
         state_root="MERKLE_x", payload_json="[]", promoted_count=0,
         timeout=5.0,
     )
     t.join(timeout=2.0)
 
     assert result["tx_signature"] == "SIG_x"
-
-    # The two unrelated messages must be back on recv_queue, in order.
+    # recv_queue is unchanged — bus-bridge never reads it
+    assert recv_queue.qsize() == pre_size
     leftover_1 = recv_queue.get(timeout=0.5)
     leftover_2 = recv_queue.get(timeout=0.5)
     assert leftover_1["type"] == "MEMORY_ADD"
     assert leftover_2["type"] == "QUERY"
-    assert leftover_2["rid"] == "other_rid"
-    # Queue is now drained.
-    with pytest.raises(Empty):
-        recv_queue.get_nowait()
 
 
 def test_request_anchor_ignores_response_with_wrong_rid():
-    """A RESPONSE with a non-matching rid must be deferred, not consumed."""
+    """A RESPONSE with non-matching rid does NOT resolve our Future
+    (registry.resolve returns False for unknown rids). The bus-bridge
+    keeps waiting until the matching rid arrives.
+
+    Under the new InFlightRegistry contract, wrong-rid messages are
+    silently no-ops as far as the bus-bridge is concerned — the main
+    loop's normal dispatcher handles them. We don't put wrong-rid msgs
+    into the registry at all; we just call resolve(...) and check it
+    returns False before the correct-rid resolve."""
     send_queue: Queue = Queue()
-    recv_queue: Queue = Queue()
+    registry = InFlightRegistry()
 
     def _kernel_simulator():
         msg = send_queue.get(timeout=2.0)
         rid = msg["rid"]
-        # First put a RESPONSE with the WRONG rid (should be deferred).
-        recv_queue.put_nowait(_make_response("not_our_rid", "SIG_other", None))
-        # Then the correct one.
-        recv_queue.put_nowait(_make_response(rid, "SIG_correct", None))
+        # Main loop sees wrong-rid first — registry says "not mine"
+        wrong = _make_response("not_our_rid", "SIG_other", None)
+        assert registry.resolve(wrong) is False
+        # ... main loop dispatches `wrong` normally (not our concern here).
+        # Then the correct RESPONSE arrives — registry resolves the Future.
+        assert registry.resolve(_make_response(rid, "SIG_correct", None)) is True
 
     t = threading.Thread(target=_kernel_simulator, daemon=True)
     t.start()
 
     result = memory_worker._request_anchor_via_kernel(
-        send_queue, recv_queue, "memory",
+        registry, send_queue, "memory",
         state_root="MERKLE_x", payload_json="[]", promoted_count=0,
         timeout=5.0,
     )
     t.join(timeout=2.0)
 
     assert result["tx_signature"] == "SIG_correct"
-
-    # The wrong-rid RESPONSE must be back on recv_queue.
-    leftover = recv_queue.get(timeout=0.5)
-    assert leftover["payload"]["tx_signature"] == "SIG_other"
+    assert registry.in_flight_count() == 0
 
 
 # ---------------------------------------------------------------------------

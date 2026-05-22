@@ -158,14 +158,34 @@ impl BusClient {
     }
 
     /// Send `BUS_SUBSCRIBE` to the broker with our `src` name + topic list.
-    /// Topics are encoded as a msgpack array under key `"topics"`.
+    /// `reply_only=false` is the broadcast-consumer default; pass `true` to
+    /// declare the subscriber consumes only targeted `dst=<name>` messages
+    /// (SPEC §8.2 v1.4.0 D-SPEC-42).
     pub async fn subscribe(&self, topics: &[&str]) -> Result<(), BusClientError> {
-        let payload = encode_subscribe_payload(topics)?;
+        self.subscribe_with_intent(topics, false).await
+    }
+
+    /// Send `BUS_SUBSCRIBE` with explicit `reply_only` intent (D-SPEC-42).
+    /// `reply_only=true` ↔ subscriber receives ONLY targeted `dst=<name>`
+    /// messages (never `dst="all"` broadcasts). The broker silently skips
+    /// reply_only subscribers from broadcast fan-out.
+    ///
+    /// SPEC §8.2 line 789 payload schema: `{name, topics, reply_only}` as a
+    /// nested Map. Per SPEC §8.10 the wire format is byte-identical to Python
+    /// `bus_socket.py:_send_subscribe_frame` (line 1391-1396) — payload is
+    /// embedded as `MpValue::Map`, NOT `MpValue::Binary`. Closure of the
+    /// pre-2026-05-13 parity gap: `rFP_worker_broadcast_topics_completion §4.C-ter`.
+    pub async fn subscribe_with_intent(
+        &self,
+        topics: &[&str],
+        reply_only: bool,
+    ) -> Result<(), BusClientError> {
+        let payload = build_subscribe_payload(self.name.as_str(), topics, reply_only);
         let envelope = encode_simple(
             "BUS_SUBSCRIBE",
             Some(self.name.as_str()),
             Some("broker"),
-            Some(&payload),
+            Some(payload),
         )?;
         let frame = encode_frame(&envelope)?;
         let mut w = self.write_half.lock().await;
@@ -182,13 +202,21 @@ impl BusClient {
         Ok(())
     }
 
-    /// Convenience: publish a message with type + dst + raw msgpack
-    /// payload. `src` defaults to our client name.
+    /// Convenience: publish a message with type + dst + structured payload.
+    /// `src` defaults to our client name.
+    ///
+    /// `payload` is a `rmpv::Value` (typically `Value::Map(...)` per the
+    /// message-specific schema in SPEC §8.x). The envelope is encoded with
+    /// the payload embedded as a structured msgpack value per SPEC §8.2
+    /// line 789 + §8.10 line 900 — NOT wrapped as `MpValue::Binary`. Python
+    /// ground truth at `bus_socket.py:1391-1396` produces byte-identical
+    /// output. Closure of the pre-2026-05-13 parity gap:
+    /// `rFP_worker_broadcast_topics_completion §4.C-ter`.
     pub async fn publish(
         &self,
         msg_type: &str,
         dst: Option<&str>,
-        payload: Option<&[u8]>,
+        payload: Option<rmpv::Value>,
     ) -> Result<(), BusClientError> {
         let envelope = encode_simple(msg_type, Some(self.name.as_str()), dst, payload)?;
         self.publish_envelope(&envelope).await
@@ -223,23 +251,32 @@ impl BusClient {
     }
 }
 
-/// Encode `{"topics": [topic1, topic2, ...]}` as msgpack bytes.
-fn encode_subscribe_payload(topics: &[&str]) -> Result<Vec<u8>, BusClientError> {
-    let mut entries = Vec::with_capacity(1);
+/// Build `{name, topics, reply_only}` as a `rmpv::Value::Map` per SPEC §8.2
+/// line 789 payload schema. SPEC §8.10 byte-identical guarantee: matches
+/// Python ground truth at `bus_socket.py:1391-1396` shape.
+///
+/// SPEC §8.2 v1.4.0 (D-SPEC-42) — `reply_only` carries connection-level
+/// subscriber-intent flag. SPEC §8.2 v1.3.0 — `name` field is the canonical
+/// subscriber name used for multi-name alias semantics.
+fn build_subscribe_payload(name: &str, topics: &[&str], reply_only: bool) -> rmpv::Value {
     let topic_values: Vec<rmpv::Value> = topics
         .iter()
         .map(|t| rmpv::Value::String((*t).into()))
         .collect();
-    entries.push((
-        rmpv::Value::String("topics".into()),
-        rmpv::Value::Array(topic_values),
-    ));
-    let map = rmpv::Value::Map(entries);
-    let mut out = Vec::new();
-    rmpv::encode::write_value(&mut out, &map).map_err(|e| {
-        BusClientError::MsgEncode(crate::message::MsgError::Decode(format!("{e:?}")))
-    })?;
-    Ok(out)
+    rmpv::Value::Map(vec![
+        (
+            rmpv::Value::String("name".into()),
+            rmpv::Value::String(name.into()),
+        ),
+        (
+            rmpv::Value::String("topics".into()),
+            rmpv::Value::Array(topic_values),
+        ),
+        (
+            rmpv::Value::String("reply_only".into()),
+            rmpv::Value::Boolean(reply_only),
+        ),
+    ])
 }
 
 /// Recv loop — reads length-prefixed frames, decodes headers, dispatches
@@ -355,20 +392,28 @@ async fn run_recv_loop(
     }
 }
 
-/// Helper for tests + integration: extract a typed payload from a
-/// msgpack envelope's `"payload"` field (binary blob nested inside the
-/// outer map). Returns the raw payload bytes that callers can decode
-/// further per message-type schema.
-pub fn extract_payload(envelope_bytes: &[u8]) -> Option<Vec<u8>> {
+/// Extract the structured payload from a msgpack envelope's `"payload"`
+/// field. Returns the payload as a `rmpv::Value` (typically `Value::Map(...)`
+/// per the message-specific schema in SPEC §8.x). Callers traverse the Value
+/// directly per message-type schema — NO additional msgpack-decode step is
+/// needed.
+///
+/// SPEC §8.2 line 789 + §8.10 line 900: the `payload` envelope field is a
+/// structured Value per the per-message schema, NOT an opaque `MpValue::Binary`
+/// blob. This function returns the Value as-is so consumers see the
+/// structure the SPEC defines.
+///
+/// Pre-2026-05-13 signature returned `Option<Vec<u8>>` matching the buggy
+/// Rust encoder that wrapped payload as Binary. Closure of the parity gap:
+/// `rFP_worker_broadcast_topics_completion §4.C-ter` (2026-05-13).
+pub fn extract_payload(envelope_bytes: &[u8]) -> Option<rmpv::Value> {
     let value: rmpv::Value =
         rmpv::decode::read_value(&mut std::io::Cursor::new(envelope_bytes)).ok()?;
     if let rmpv::Value::Map(entries) = value {
         for (k, v) in entries {
             if let rmpv::Value::String(s) = &k {
                 if s.as_str() == Some("payload") {
-                    if let rmpv::Value::Binary(b) = v {
-                        return Some(b);
-                    }
+                    return Some(v);
                 }
             }
         }
@@ -451,50 +496,128 @@ mod tests {
     }
 
     #[test]
-    fn extract_payload_returns_binary_blob() {
-        // C4-2b1 bus_client test 3: extract_payload helper round-trips
+    fn extract_payload_returns_nested_map() {
+        // SPEC §8.2 line 789 + §8.10 line 900: envelope payload is a nested
+        // structured Value (Map per per-message schema), NOT an opaque
+        // Binary blob. Validates the §4.C-ter wire-protocol parity closure.
+        let inner = rmpv::Value::Map(vec![(
+            rmpv::Value::String("phase".into()),
+            rmpv::Value::F64(1.234),
+        )]);
         let envelope = encode_simple(
             "SPHERE_PULSE",
             Some("titan-trinity-rs"),
             Some("all"),
-            Some(&[0x01, 0x02, 0x03, 0x04]),
+            Some(inner.clone()),
         )
         .unwrap();
         let extracted = extract_payload(&envelope).unwrap();
-        assert_eq!(extracted, vec![0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(extracted, inner, "payload roundtrips as nested Value");
     }
 
     #[test]
     fn extract_payload_returns_none_when_payload_field_missing() {
-        // C4-2b1 bus_client test 4: BUS_PING-style envelope with no payload
+        // BUS_PING-style envelope with no payload field at all.
         let envelope = encode_simple("BUS_PING", Some("broker"), None, None).unwrap();
         assert!(extract_payload(&envelope).is_none());
     }
 
     #[test]
-    fn encode_subscribe_payload_round_trips() {
-        // C4-2b1 bus_client test 5: subscribe payload encoder produces
-        // valid msgpack with a topics array
-        let payload =
-            encode_subscribe_payload(&["SPHERE_PULSE", "KERNEL_SHUTDOWN_ANNOUNCE"]).unwrap();
-        let value: rmpv::Value =
-            rmpv::decode::read_value(&mut std::io::Cursor::new(&payload[..])).unwrap();
-        if let rmpv::Value::Map(entries) = value {
-            let mut found = false;
-            for (k, v) in entries {
-                if let rmpv::Value::String(s) = &k {
-                    if s.as_str() == Some("topics") {
+    fn build_subscribe_payload_produces_spec_schema() {
+        // SPEC §8.2 line 789 payload schema: {name, topics, reply_only}.
+        // Verifies the §4.C-ter wire-protocol shape matches Python ground
+        // truth at bus_socket.py:1391-1396 (nested Map with three keys).
+        let payload = build_subscribe_payload(
+            "inner-body",
+            &["SPHERE_PULSE", "KERNEL_SHUTDOWN_ANNOUNCE"],
+            false,
+        );
+        let entries = match payload {
+            rmpv::Value::Map(e) => e,
+            other => panic!("expected Map; got {other:?}"),
+        };
+        let mut name_found = false;
+        let mut topics_found = false;
+        let mut reply_only_found = false;
+        for (k, v) in entries {
+            if let rmpv::Value::String(s) = &k {
+                match s.as_str() {
+                    Some("name") => {
+                        assert_eq!(v, rmpv::Value::String("inner-body".into()));
+                        name_found = true;
+                    }
+                    Some("topics") => {
                         if let rmpv::Value::Array(topics) = v {
                             assert_eq!(topics.len(), 2);
-                            found = true;
+                            topics_found = true;
                         }
                     }
+                    Some("reply_only") => {
+                        assert_eq!(v, rmpv::Value::Boolean(false));
+                        reply_only_found = true;
+                    }
+                    _ => {}
                 }
             }
-            assert!(found, "topics key present");
-        } else {
-            panic!("expected msgpack map");
         }
+        assert!(name_found, "SPEC §8.2 v1.3.0 name field present");
+        assert!(topics_found, "SPEC §8.2 topics array present");
+        assert!(
+            reply_only_found,
+            "SPEC §8.2 v1.4.0 D-SPEC-42 reply_only present"
+        );
+    }
+
+    #[test]
+    fn build_subscribe_payload_reply_only_true() {
+        // SPEC §8.2 v1.4.0 D-SPEC-42: reply_only=true intent declaration.
+        let payload = build_subscribe_payload("rpc_reply", &[], true);
+        let entries = match payload {
+            rmpv::Value::Map(e) => e,
+            other => panic!("expected Map; got {other:?}"),
+        };
+        for (k, v) in entries {
+            if let rmpv::Value::String(s) = &k {
+                if s.as_str() == Some("reply_only") {
+                    assert_eq!(v, rmpv::Value::Boolean(true));
+                    return;
+                }
+            }
+        }
+        panic!("reply_only key missing");
+    }
+
+    #[test]
+    fn subscribe_payload_round_trips_through_full_envelope_per_spec_8_10() {
+        // §4.C-ter closure gate: the FULL envelope path (encode_simple →
+        // extract_payload) MUST preserve the nested Map shape per SPEC §8.10.
+        // The pre-2026-05-13 bug slipped CI because two existing unit tests
+        // exercised only the inner build_subscribe_payload helper, never the
+        // full envelope. This test fixes that gap.
+        let payload = build_subscribe_payload(
+            "inner-body",
+            &["UNIFIED_SPIRIT_FILTER_DOWN", "INNER_SPIRIT_FILTER_DOWN"],
+            false,
+        );
+        let envelope = encode_simple(
+            "BUS_SUBSCRIBE",
+            Some("inner-body"),
+            Some("broker"),
+            Some(payload.clone()),
+        )
+        .unwrap();
+        // The broker's decode_bus_subscribe_payload expects a Map at "payload".
+        let (name, topics, reply_only) =
+            crate::message::decode_bus_subscribe_payload(&envelope).unwrap();
+        assert_eq!(name.as_deref(), Some("inner-body"));
+        assert_eq!(
+            topics,
+            vec![
+                "UNIFIED_SPIRIT_FILTER_DOWN".to_string(),
+                "INNER_SPIRIT_FILTER_DOWN".to_string()
+            ]
+        );
+        assert!(!reply_only);
     }
 
     #[tokio::test]

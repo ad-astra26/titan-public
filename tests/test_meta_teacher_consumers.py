@@ -9,8 +9,8 @@ Covers rFP §10 checklist:
 import numpy as np
 import pytest
 
-from titan_plugin.logic.meta_cgn import MetaCGNConsumer, BETA_PARAM_FLOOR
-from titan_plugin.logic.chain_iql import ChainIQL
+from titan_hcl.logic.meta_cgn import MetaCGNConsumer, BETA_PARAM_FLOOR
+from titan_hcl.logic.chain_iql import ChainIQL
 
 
 @pytest.fixture

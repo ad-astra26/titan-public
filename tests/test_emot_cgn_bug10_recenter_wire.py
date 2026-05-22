@@ -29,7 +29,7 @@ def test_emotion_clusterer_maybe_recenter_fires_when_last_recenter_ts_zero():
     now >> interval for any positive interval). Prior to BUG #10 fix
     this was the condition that would have fired ONCE at first
     dream-cycle end, but dreaming.py never reached this call."""
-    from titan_plugin.logic.emotion_cluster import EmotionClusterer
+    from titan_hcl.logic.emotion_cluster import EmotionClusterer
     clusterer = EmotionClusterer(save_dir=f"/tmp/test_emotion_cluster_b10_{id(object())}")
 
     # Fresh state — never recentered
@@ -54,7 +54,7 @@ def test_emotion_clusterer_first_fire_override_threshold_lowered_to_10():
     post-restart state), the observation buffer threshold drops from 50→10
     so the first recenter fires within ~1h post-boot rather than ~6h.
     After first fire, threshold reverts to 50 for steady-state operation."""
-    from titan_plugin.logic.emotion_cluster import EmotionClusterer
+    from titan_hcl.logic.emotion_cluster import EmotionClusterer
     import numpy as np
 
     clusterer = EmotionClusterer(save_dir=f"/tmp/test_emotion_cluster_b10_ff_{id(object())}")
@@ -75,7 +75,7 @@ def test_emotion_clusterer_first_fire_override_threshold_lowered_to_10():
 def test_emotion_clusterer_post_first_fire_threshold_restored_to_50():
     """After the first fire, the buffer threshold goes back to 50 for
     normal operation. Verify by forcing interval elapsed + buffer of 20."""
-    from titan_plugin.logic.emotion_cluster import EmotionClusterer
+    from titan_hcl.logic.emotion_cluster import EmotionClusterer
     import numpy as np, time
 
     clusterer = EmotionClusterer(save_dir=f"/tmp/test_emotion_cluster_b10_n_{id(object())}")
@@ -98,7 +98,7 @@ def test_emotion_clusterer_post_first_fire_threshold_restored_to_50():
 def test_emotion_clusterer_gate_throttles_subsequent_calls():
     """After a successful recenter, subsequent calls within the gate
     window return False until interval elapses."""
-    from titan_plugin.logic.emotion_cluster import EmotionClusterer
+    from titan_hcl.logic.emotion_cluster import EmotionClusterer
     clusterer = EmotionClusterer(save_dir=f"/tmp/test_emotion_cluster_b10b_{id(object())}")
     clusterer._recenter_interval_s = 7 * 86400.0
 
@@ -129,7 +129,7 @@ def test_worker_config_exposes_k_recenter_check_interval_s():
     # require booting the whole worker.
     from pathlib import Path
     source = Path(
-        __file__).parent.parent / "titan_plugin" / "modules" / "emot_cgn_worker.py"
+        __file__).parent.parent / "titan_hcl" / "modules" / "emot_cgn_worker.py"
     content = source.read_text()
     assert "emot_k_recenter_check_interval_s" in content, \
         "worker must read config key `emot_k_recenter_check_interval_s`"
@@ -146,7 +146,7 @@ def test_worker_main_loop_invokes_maybe_recenter():
     test_emot_cgn_bus_contract.py smoke tests)."""
     from pathlib import Path
     source = Path(
-        __file__).parent.parent / "titan_plugin" / "modules" / "emot_cgn_worker.py"
+        __file__).parent.parent / "titan_hcl" / "modules" / "emot_cgn_worker.py"
     content = source.read_text()
     assert "emot_cgn._clusterer.maybe_recenter(force=False)" in content, \
         "worker main loop must invoke maybe_recenter() — BUG #10 fix wire"
@@ -160,7 +160,7 @@ def test_dreaming_emot_cgn_branch_documented_as_dead():
     someone removes the comment, the dead code becomes a mystery."""
     from pathlib import Path
     source = Path(
-        __file__).parent.parent / "titan_plugin" / "logic" / "dreaming.py"
+        __file__).parent.parent / "titan_hcl" / "logic" / "dreaming.py"
     content = source.read_text()
     assert "DEAD PATH since Phase 1.6h cutover" in content, \
         "dreaming.py must document the dead emot_cgn branch"

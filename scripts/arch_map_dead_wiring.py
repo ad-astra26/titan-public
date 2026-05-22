@@ -24,7 +24,7 @@ Deferred for v2/v3:
 
 Usage:
     python scripts/arch_map_dead_wiring.py
-    python scripts/arch_map_dead_wiring.py --root titan_plugin --verbose
+    python scripts/arch_map_dead_wiring.py --root titan_hcl --verbose
     python scripts/arch_map_dead_wiring.py --rfp titan-docs/rFP_foo.md
     python scripts/arch_map_dead_wiring.py --json   # machine-readable
 """
@@ -274,7 +274,7 @@ def scan_tree(roots: list[Path]) -> tuple[list[MethodDef], list[CallSite],
     """Scan every .py under root(s), excluding __pycache__. Returns
     (defs, calls, refs, file_count).
 
-    Multiple roots supported so callers can scan titan_plugin/ + scripts/
+    Multiple roots supported so callers can scan titan_hcl/ + scripts/
     + tests/ together (v1.1 expansion: config + reference consumers live
     outside the primary module tree).
     """
@@ -649,7 +649,7 @@ def verify_rfp(rfp_path: Path, defs: list[MethodDef], code_root: Path,
                 detail=(
                     f"Referenced in {rfp_path.name} and used as a string "
                     f"literal in code, but NOT registered as a constant in "
-                    f"titan_plugin/bus.py. Add `{b} = \"{b}\"` to bus.py + "
+                    f"titan_hcl/bus.py. Add `{b} = \"{b}\"` to bus.py + "
                     f"spec entry in bus_specs.py + replace literals."
                 ),
                 file=str(rfp_path),
@@ -1008,7 +1008,7 @@ def find_bus_flow_imbalances(
                 detail=(
                     f"Literal {msg_type!r} used as bus message type at "
                     f"{len(sites)} site(s) without a registered constant in "
-                    f"titan_plugin/bus.py. Add `{msg_type} = \"{msg_type}\"` "
+                    f"titan_hcl/bus.py. Add `{msg_type} = \"{msg_type}\"` "
                     f"to bus.py + a spec entry in bus_specs.py, then replace "
                     f"the literal at each site with the constant."
                 ),
@@ -1068,7 +1068,7 @@ def find_bus_flow_imbalances(
                 severity="medium",
                 title=f"msg {msg_type} — defined in bus.py, never used",
                 detail="Constant exists but neither published nor subscribed anywhere",
-                file="titan_plugin/bus.py",
+                file="titan_hcl/bus.py",
                 line=0,
                 extra={"pub_count": 0, "sub_count": 0},
             ))
@@ -1081,7 +1081,7 @@ _BUS_RESERVED_CACHE: dict | None = None
 
 
 def _bus_const_has_reserved_marker(msg_type: str,
-                                    bus_path: str = "titan_plugin/bus.py") -> bool:
+                                    bus_path: str = "titan_hcl/bus.py") -> bool:
     """Check if a bus.py constant has a RESERVED:/LEGACY: marker within ±3
     lines. These markers flag constants that are intentionally unused (for
     future wiring or legacy back-compat), silencing the bus_unused_type
@@ -2366,7 +2366,7 @@ def annotate_git_context(findings: list[Finding], max_findings: int = 30) -> Non
 
 # ─── Entry point ───────────────────────────────────────────────────────
 
-def run(root: str = "titan_plugin",
+def run(root: str = "titan_hcl",
         tomls: list[str] | None = None,
         allowlist_path: str | None = None,
         rfp_path: str | None = None,
@@ -2388,7 +2388,7 @@ def run(root: str = "titan_plugin",
         allowlist = load_allowlist(Path(allowlist_path))
 
     # v1.1: scan additional directories for reachability (scripts/, tests/)
-    # so dispatch-dict + entry_fn= refs outside titan_plugin/ register.
+    # so dispatch-dict + entry_fn= refs outside titan_hcl/ register.
     project_root = root_path.parent if root_path.is_dir() else root_path.parent.parent
     scan_roots = [root_path]
     for extra in ("scripts", "tests"):
@@ -2404,8 +2404,8 @@ def run(root: str = "titan_plugin",
         root_path.resolve())]
 
     toml_paths = [Path(t) for t in (tomls or [
-        "titan_plugin/titan_params.toml",
-        "titan_plugin/config.toml",
+        "titan_hcl/titan_params.toml",
+        "titan_hcl/config.toml",
     ])]
 
     findings: list[Finding] = []
@@ -2622,9 +2622,9 @@ def find_silent_swallows(root: Path) -> list[dict]:
 
 def run_silent_swallows_scan(runtime: bool = False) -> int:
     """Print silent-swallow findings grouped by tier. Returns exit code."""
-    root = Path("titan_plugin")
+    root = Path("titan_hcl")
     if not root.exists():
-        print("titan_plugin/ not found — run from repo root")
+        print("titan_hcl/ not found — run from repo root")
         return 1
     findings = find_silent_swallows(root)
     by_tier: dict[str, list[dict]] = defaultdict(list)
@@ -2790,11 +2790,11 @@ def run_warnings(all_titans: bool = False, top_n: int = 15) -> int:
 
 def main():
     p = argparse.ArgumentParser(description="Dead-wiring static analysis for Titan codebase.")
-    p.add_argument("--root", default="titan_plugin",
-                   help="Directory to scan (default: titan_plugin)")
+    p.add_argument("--root", default="titan_hcl",
+                   help="Directory to scan (default: titan_hcl)")
     p.add_argument("--tomls", nargs="*",
-                   default=["titan_plugin/titan_params.toml",
-                            "titan_plugin/config.toml"],
+                   default=["titan_hcl/titan_params.toml",
+                            "titan_hcl/config.toml"],
                    help="TOML files to trace section usage")
     p.add_argument("--allowlist", default="scripts/arch_map_dead_wiring_allowlist.txt",
                    help="Path to allowlist (one method name per line)")

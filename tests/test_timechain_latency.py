@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from titan_plugin.logic import timechain_v2 as tcv2
+from titan_hcl.logic import timechain_v2 as tcv2
 
 
 @pytest.fixture(autouse=True)

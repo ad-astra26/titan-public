@@ -14,7 +14,7 @@ is standalone — it does NOT require a running Titan. It relies only on:
 
 Flow:
   1. Reconstruct the Titan keypair from 2-of-3 Shamir shards (reuses
-     titan_plugin.utils.shamir).
+     titan_hcl.utils.shamir).
   2. Derive the master key (HKDF-SHA256 from Ed25519 seed, salted with titan
      pubkey).
   3. Derive the per-backup key (HKDF from master + backup_id + backup_type).
@@ -65,7 +65,7 @@ def _load_shard(hex_path_or_literal: str) -> bytes:
     Uses shamir.parse_maker_envelope first (JSON-over-hex envelope minted at
     mainnet birth); if that fails, falls back to raw hex → bytes.
     """
-    from titan_plugin.utils.shamir import parse_maker_envelope
+    from titan_hcl.utils.shamir import parse_maker_envelope
 
     data = hex_path_or_literal
     if os.path.exists(data):
@@ -86,7 +86,7 @@ def _load_shard(hex_path_or_literal: str) -> bytes:
 
 def _reconstruct_keypair(shard_sources: list) -> tuple:
     """shard_sources = list of 2-or-more string args (paths or hex literals)."""
-    from titan_plugin.utils.shamir import combine_shares
+    from titan_hcl.utils.shamir import combine_shares
     try:
         shards = [_load_shard(s) for s in shard_sources]
         if len(shards) < 2:
@@ -157,7 +157,7 @@ def main():
     # ── Keypair reconstruction ─────────────────────────────────────────
     if args.keypair_file:
         try:
-            from titan_plugin.logic.backup_crypto import load_keypair_bytes
+            from titan_hcl.logic.backup_crypto import load_keypair_bytes
             kp_bytes, titan_pubkey = load_keypair_bytes(args.keypair_file)
         except Exception as e:
             _err(f"keypair load failed: {e}", 2)
@@ -194,7 +194,7 @@ def main():
     _info(f"Loaded ciphertext: {len(ct)} bytes")
 
     try:
-        from titan_plugin.logic.backup_crypto import decrypt_from_manifest
+        from titan_hcl.logic.backup_crypto import decrypt_from_manifest
         plaintext = decrypt_from_manifest(
             ct, encryption, kp_bytes, titan_pubkey, backup_type)
     except Exception as e:

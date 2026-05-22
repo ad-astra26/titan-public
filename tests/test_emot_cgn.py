@@ -8,7 +8,7 @@ import tempfile
 import numpy as np
 import pytest
 
-from titan_plugin.logic.emot_cgn import (
+from titan_hcl.logic.emot_cgn import (
     BETA_PARAM_FLOOR,
     EMOT_SIGNAL_TO_PRIMITIVE,
     EmotCGNConsumer,
@@ -18,7 +18,7 @@ from titan_plugin.logic.emot_cgn import (
     _beta_mean,
     _posterior_confidence,
 )
-from titan_plugin.logic.emotion_cluster import (
+from titan_hcl.logic.emotion_cluster import (
     EMOT_PRIMITIVES,
     FEATURE_DIM,
     NUM_PRIMITIVES,
@@ -546,7 +546,7 @@ def test_get_stats_compact_has_status():
 # Verify EMOT-CGN properly integrates with cgn_worker as the 8th CGN consumer,
 # participates in shared V(s) learning, and handles cross-consumer insights.
 
-from titan_plugin.logic.emot_cgn import (
+from titan_hcl.logic.emot_cgn import (
     CGN_CONSUMER_NAME, FEATURE_DIMS, ACTION_DIMS,
 )
 

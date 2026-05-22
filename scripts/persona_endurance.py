@@ -54,7 +54,7 @@ from solders.keypair import Keypair
 
 # ─── Paths ────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CONFIG_PATH = PROJECT_ROOT / "titan_plugin" / "config.toml"
+CONFIG_PATH = PROJECT_ROOT / "titan_hcl" / "config.toml"
 LOG_DIR = PROJECT_ROOT / "data" / "logs" / "endurance"
 REPORT_DIR = PROJECT_ROOT / "data" / "endurance_reports"
 
@@ -75,7 +75,7 @@ logger = logging.getLogger("persona_endurance")
 # ─── Config ───────────────────────────────────────────────────────────────
 
 def _load_config() -> dict:
-    from titan_plugin.config_loader import load_titan_config
+    from titan_hcl.config_loader import load_titan_config
     return load_titan_config()
 
 

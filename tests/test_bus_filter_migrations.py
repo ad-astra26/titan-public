@@ -14,7 +14,7 @@ not just human discipline.
 """
 from __future__ import annotations
 
-from titan_plugin.bus import (
+from titan_hcl.bus import (
     BODY_STATE,
     BUS_PEER_DIED,
     BUS_WORKER_ADOPT_REQUEST,
@@ -28,6 +28,7 @@ from titan_plugin.bus import (
     MIND_STATE,
     MODULE_HEARTBEAT,
     MODULE_READY,
+    MODULE_RELOAD_REQUEST,
     MODULE_SHUTDOWN,
     OBSERVABLES_SNAPSHOT,
     OUTER_BODY_STATE,
@@ -53,7 +54,7 @@ def test_rl_proxy_stats_filter_is_sage_stats_only():
 
     # Mimic the construction path: rl_proxy.py:70 subscribes via
     # bus.subscribe("rl_proxy_stats", types=[SAGE_STATS])
-    from titan_plugin.proxies.rl_proxy import RLProxy
+    from titan_hcl.proxies.rl_proxy import RLProxy
     # RLProxy needs a Guardian for spawn-on-demand. Use a stub — we only
     # care about the subscribe() side effect at __init__.
     class _StubGuardian:
@@ -97,11 +98,11 @@ def test_v4_bridge_filter_matches_V4_EVENT_TYPES_constant():
     # Drift-detection assertion: the consumer-side check must list
     # exactly the same types. Verify by reading the source.
     import inspect
-    from titan_plugin.core.plugin import TitanPlugin
+    from titan_hcl.core.plugin import TitanHCL
     # The bridge function is async-defined inside another async function —
     # we can't easily inspect it. Instead, read the source file and check
     # the V4_EVENT_TYPES literal set is exactly these 7 entries.
-    src = inspect.getsource(TitanPlugin)
+    src = inspect.getsource(TitanHCL)
     assert "V4_EVENT_TYPES = {SPHERE_PULSE, BIG_PULSE, GREAT_PULSE, DREAM_STATE_CHANGED" in src, (
         "V4_EVENT_TYPES literal in core/plugin.py drifted — update both "
         "this test AND the V4_EVENT_TYPES set at the subscribe site.")
@@ -112,22 +113,25 @@ def test_v4_bridge_filter_matches_V4_EVENT_TYPES_constant():
 
 def test_guardian_filter_matches_lifecycle_msg_handlers():
     """Guardian declares types=[MODULE_HEARTBEAT, MODULE_READY,
-    MODULE_SHUTDOWN, BUS_WORKER_ADOPT_REQUEST, BUS_PEER_DIED] at subscribe
-    time. These are the 5 msg_types its `_process_guardian_messages`
-    consumer handles + targeted (lifecycle) — listed explicitly so the
-    contract is self-documenting.
+    MODULE_SHUTDOWN, BUS_WORKER_ADOPT_REQUEST, BUS_PEER_DIED,
+    MODULE_RELOAD_REQUEST] at subscribe time. These are the msg_types its
+    `_process_guardian_messages` consumer handles + targeted (lifecycle) —
+    listed explicitly so the contract is self-documenting.
 
     BUS_PEER_DIED added 2026-05-02 (commit bc1e23be / Phase B.2 §D9):
     broker detects peer PID dead via os.kill(pid, 0) and publishes
     BUS_PEER_DIED → Guardian triggers immediate restart for named workers
-    (faster than 1Hz polling)."""
+    (faster than 1Hz polling).
+
+    MODULE_RELOAD_REQUEST added later (guardian.py:307): hot-reload request
+    routed to Guardian to re-spawn a named module without full restart."""
     bus = DivineBus()
-    from titan_plugin.guardian import Guardian
+    from titan_hcl.guardian import Guardian
     guardian = Guardian(bus)
     flt = bus.get_broadcast_filter("guardian")
     expected = frozenset({
         MODULE_HEARTBEAT, MODULE_READY, MODULE_SHUTDOWN,
-        BUS_WORKER_ADOPT_REQUEST, BUS_PEER_DIED,
+        BUS_WORKER_ADOPT_REQUEST, BUS_PEER_DIED, MODULE_RELOAD_REQUEST,
     })
     assert flt == expected, (
         f"guardian filter drift: expected {expected}, got {flt}. "
@@ -146,9 +150,9 @@ def test_guardian_module_heartbeat_targeted_msgs_bypass_filter():
     because the queue was saturated with broadcast _UPDATED noise — 87
     heartbeat drops in a single 500-line window on T1, risking false
     heartbeat-timeouts and unnecessary worker restarts."""
-    from titan_plugin.bus import make_msg
+    from titan_hcl.bus import make_msg
     bus = DivineBus()
-    from titan_plugin.guardian import Guardian
+    from titan_hcl.guardian import Guardian
     guardian = Guardian(bus)
 
     # Targeted MODULE_HEARTBEAT — must arrive even though filter excludes
@@ -168,9 +172,9 @@ def test_guardian_filters_out_unwanted_broadcasts():
     broadcast. Post-fix, broadcasts not in the lifecycle whitelist are
     dropped at publish, never enter Guardian's queue, never displace
     MODULE_HEARTBEAT."""
-    from titan_plugin.bus import make_msg
+    from titan_hcl.bus import make_msg
     bus = DivineBus()
-    from titan_plugin.guardian import Guardian
+    from titan_hcl.guardian import Guardian
     guardian = Guardian(bus)
 
     # Spam the broadcast bus with the kinds of msgs that flooded T1
@@ -205,16 +209,16 @@ def test_guardian_filters_out_unwanted_broadcasts():
 
 
 def test_agency_filter_matches_loop_elif_chain():
-    """TitanPlugin._agency_loop handles 6 msg_types (manually verified):
+    """TitanHCL._agency_loop handles 6 msg_types (manually verified):
     IMPULSE, OUTER_DISPATCH, QUERY, AGENCY_STATS, ASSESSMENT_STATS,
     AGENCY_READY. Legacy_core path handles only the first 3 — filter
     union semantics keeps both call sites' behavior consistent."""
-    from titan_plugin.bus import (
+    from titan_hcl.bus import (
         AGENCY_READY, AGENCY_STATS, ASSESSMENT_STATS,
         OUTER_DISPATCH, QUERY,
     )
     bus = DivineBus()
-    # Mimic the call site directly — full TitanPlugin construction is
+    # Mimic the call site directly — full TitanHCL construction is
     # too heavy and not needed to verify the filter declaration.
     bus.subscribe(
         "agency",
@@ -251,7 +255,7 @@ def test_state_register_filter_matches_process_bus_message_chain():
       OBSERVABLES_SNAPSHOT — periodic snapshot
       SPHERE_PULSE — Schumann clock"""
     bus = DivineBus()
-    from titan_plugin.logic.state_register import StateRegister
+    from titan_hcl.logic.state_register import StateRegister
     sr = StateRegister()
     sr.start(bus, snapshot_interval=999.0)  # large interval = no snapshot fires
     try:
@@ -274,7 +278,7 @@ def test_state_register_filter_matches_process_bus_message_chain():
 
 
 def test_chat_handler_filter_is_query_only():
-    """TitanPlugin._chat_handler_loop / TitanCore._chat_handler_loop
+    """TitanHCL._chat_handler_loop / TitanCore._chat_handler_loop
     only handle msg.type == QUERY (with payload.action == 'chat'). The
     queue is targeted via dst='chat_handler' for CHAT_REQUEST round-trips
     via bus.request_async — those bypass the filter regardless. The
@@ -293,7 +297,7 @@ def test_chat_handler_filter_is_query_only():
 
 def test_sovereignty_filter_is_sovereignty_epoch_only():
     """Sovereignty queue only consumes SOVEREIGNTY_EPOCH per the elif
-    chain in TitanPlugin._sovereignty_loop and
+    chain in TitanHCL._sovereignty_loop and
     TitanCore._sovereignty_loop."""
     bus = DivineBus()
     bus.subscribe("sovereignty", types=[SOVEREIGNTY_EPOCH])
@@ -334,9 +338,9 @@ def test_guardian_receives_only_lifecycle_msgs_under_mixed_load():
     """Realistic mixed-load test: spam broadcasts AND lifecycle msgs.
     Verify Guardian gets all lifecycle msgs (none dropped) and zero
     broadcasts."""
-    from titan_plugin.bus import make_msg
+    from titan_hcl.bus import make_msg
     bus = DivineBus()
-    from titan_plugin.guardian import Guardian
+    from titan_hcl.guardian import Guardian
     guardian = Guardian(bus)
 
     # Interleave: 100 broadcasts + 1 lifecycle, repeat 10x

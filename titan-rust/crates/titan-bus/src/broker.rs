@@ -24,12 +24,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use crate::boot_buffer::{BootBuffer, BootBufferPushOutcome};
 use crate::drift_bridge::bridge_emit_names;
 use crate::heartbeat::run_heartbeat_loop;
 use crate::message::{rewrite_msg_type, MsgHeader};
@@ -72,6 +74,10 @@ pub struct BusBroker {
     shutdown: Arc<Notify>,
     sock_path: Option<PathBuf>,
     anon_counter: Arc<Mutex<u64>>,
+    /// SPEC §8.0.bis boot-window buffer — holds targeted P0 messages
+    /// whose destination subscriber has not yet attached. Drained on
+    /// BUS_SUBSCRIBE; TTL-evicted on lazy GC during fanout.
+    boot_buffer: Arc<Mutex<BootBuffer>>,
 }
 
 impl BusBroker {
@@ -93,6 +99,7 @@ impl BusBroker {
             shutdown: Arc::new(Notify::new()),
             sock_path: None,
             anon_counter: Arc::new(Mutex::new(0)),
+            boot_buffer: Arc::new(Mutex::new(BootBuffer::new())),
         }
     }
 
@@ -128,6 +135,7 @@ impl BusBroker {
             inbound_rx,
             self.subs.clone(),
             self.notify_per_sub.clone(),
+            self.boot_buffer.clone(),
         )));
 
         // Spawn heartbeat loop
@@ -232,6 +240,7 @@ impl BusBroker {
         Self::fanout(
             &self.subs,
             &self.notify_per_sub,
+            &self.boot_buffer,
             &format!("kernel:internal:{src}"),
             header,
             raw_bytes,
@@ -296,9 +305,16 @@ impl BusBroker {
         notify_per_sub: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
         inbound_tx: mpsc::UnboundedSender<(String, InboundEvent)>,
     ) -> Result<(), BrokerError> {
-        // 1. Handshake
+        // 1. Handshake — capture peer credentials BEFORE handshake for diagnostics
+        // so we can identify the failing client process when HMAC mismatch occurs.
+        let peer_pid: i64 = stream
+            .peer_cred()
+            .ok()
+            .and_then(|c| c.pid())
+            .map(|p| p as i64)
+            .unwrap_or(-1);
         if let Err(e) = perform_handshake(&mut stream, &authkey).await {
-            warn!(name = %sub_name, err = ?e, "handshake failed; closing");
+            warn!(name = %sub_name, peer_pid = peer_pid, err = ?e, "handshake failed; closing");
             return Err(BrokerError::Io(std::io::Error::other(format!("{e:?}"))));
         }
 
@@ -350,21 +366,113 @@ impl BusBroker {
         mut inbound_rx: mpsc::UnboundedReceiver<(String, InboundEvent)>,
         subs: Arc<Mutex<SubscriberMap>>,
         notify_per_sub: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+        boot_buffer: Arc<Mutex<BootBuffer>>,
     ) {
         while let Some((sub_name, event)) = inbound_rx.recv().await {
             match event {
-                InboundEvent::Subscribe { name, topics } => {
+                InboundEvent::Subscribe {
+                    name,
+                    topics,
+                    reply_only,
+                } => {
                     // Update the subscriber's `name` field in place; map key
                     // remains stable (anon-N). Fanout filters by `sub.name`,
                     // not by map key, so promotion is just a field update.
                     // Avoids invalidating the per-connection notify + send-loop
                     // map-key references.
-                    let mut subs_guard = subs.lock().await;
-                    if let Some(sub) = subs_guard.get_mut(&sub_name) {
-                        if !name.is_empty() {
-                            sub.name = name;
+                    //
+                    // 2026-05-12 — Multi-name semantics: the first
+                    // BUS_SUBSCRIBE with a non-anon name sets sub.name
+                    // (replacing the initial "anon-N"). Subsequent
+                    // BUS_SUBSCRIBE frames over the SAME connection with a
+                    // DIFFERENT non-anon name are treated as ALIAS
+                    // additions (sub.aliases.insert(name)) rather than
+                    // primary-name replacement. Re-sends of the same name
+                    // are idempotent. Fanout matches dst against both
+                    // sub.name and sub.aliases (see fanout() filter
+                    // below). Closes BUG-PHASE-C-BUS-FANOUT-MULTI-NAME-
+                    // 20260512: kernel-side proxy reply queues
+                    // (output_verifier_proxy, agency_proxy, …) need
+                    // RESPONSE messages routed to titan_HCL's single
+                    // connection without spawning a separate broker
+                    // connection per proxy.
+                    // Capture the name(s) this connection registers so we
+                    // can drain the SPEC §8.0.bis boot-buffer for those
+                    // identities after releasing the subs lock. Buffer
+                    // drain MUST NOT hold the subs lock — drained frames
+                    // are enqueued onto the subscriber's send queue
+                    // which itself coordinates with notify_per_sub.
+                    let mut drain_names: Vec<String> = Vec::new();
+                    {
+                        let mut subs_guard = subs.lock().await;
+                        if let Some(sub) = subs_guard.get_mut(&sub_name) {
+                            if !name.is_empty() {
+                                let already_primary = sub.name == name;
+                                if sub.name.starts_with("anon-") || already_primary {
+                                    sub.name = name.clone();
+                                } else {
+                                    sub.aliases.insert(name.clone());
+                                }
+                                // Drain buffer for the registered identity.
+                                // Re-sends of the same name are idempotent
+                                // for the buffer too (drain of empty queue).
+                                drain_names.push(name.clone());
+                            }
+                            sub.subscribed_topics.extend(topics);
+                            // D-SPEC-42 (SPEC v1.4.0, 2026-05-12) — connection-
+                            // level subscriber intent. Last value wins on
+                            // multi-name subscribe per SPEC §8.2 v1.4.0.
+                            // Mirrors Python `BusSocketServer._handle_inbound`
+                            // BUS_SUBSCRIBE handler.
+                            sub.reply_only = reply_only;
                         }
-                        sub.subscribed_topics.extend(topics);
+                    }
+                    // SPEC §8.0.bis boot-buffer drain — outside subs lock.
+                    // For each newly-registered name (primary or alias),
+                    // deliver any buffered frames in arrival order.
+                    if !drain_names.is_empty() {
+                        let now = Instant::now();
+                        for dst_name in &drain_names {
+                            let drained = {
+                                let mut bb = boot_buffer.lock().await;
+                                bb.drain(dst_name, now)
+                            };
+                            if drained.is_empty() {
+                                continue;
+                            }
+                            // Re-deliver each buffered frame as a Publish
+                            // event into the inbound dispatch path. This
+                            // reuses the canonical fanout — including
+                            // closed-sub silent-skip, reply_only checks,
+                            // drift-bridge expansion, etc. — without
+                            // duplicating those rules here.
+                            info!(
+                                dst = %dst_name,
+                                count = drained.len(),
+                                "[boot_buffer] drained {} frames to subscriber {}",
+                                drained.len(),
+                                dst_name
+                            );
+                            for frame in drained {
+                                // Synthesize a minimal MsgHeader from the
+                                // buffered msg_type + targeted dst. The
+                                // original raw_bytes are passed through.
+                                let header = MsgHeader {
+                                    msg_type: Some(frame.msg_type.clone()),
+                                    src: None,
+                                    dst: Some(dst_name.clone()),
+                                };
+                                Self::fanout(
+                                    &subs,
+                                    &notify_per_sub,
+                                    &boot_buffer,
+                                    "boot_buffer", // virtual src (no echo loop possible)
+                                    header,
+                                    frame.raw_bytes,
+                                )
+                                .await;
+                            }
+                        }
                     }
                 }
                 InboundEvent::Unsubscribe { topics } => {
@@ -382,7 +490,15 @@ impl BusBroker {
                     }
                 }
                 InboundEvent::Publish { header, raw_bytes } => {
-                    Self::fanout(&subs, &notify_per_sub, &sub_name, header, raw_bytes).await;
+                    Self::fanout(
+                        &subs,
+                        &notify_per_sub,
+                        &boot_buffer,
+                        &sub_name,
+                        header,
+                        raw_bytes,
+                    )
+                    .await;
                 }
             }
         }
@@ -392,6 +508,7 @@ impl BusBroker {
     async fn fanout(
         subs: &Arc<Mutex<SubscriberMap>>,
         notify_per_sub: &Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+        boot_buffer: &Arc<Mutex<BootBuffer>>,
         from_name: &str,
         header: MsgHeader,
         raw_bytes: Vec<u8>,
@@ -399,6 +516,66 @@ impl BusBroker {
         let dst = header.dst.as_deref().unwrap_or("all");
         let msg_type = header.msg_type.clone().unwrap_or_default();
         let src = header.src.clone().unwrap_or_default();
+
+        // SPEC §8.0.bis boot-window buffer:
+        //   if dst != "all" AND no subscriber registered under dst
+        //   AND msg_type is boot-buffer-eligible → enqueue to buffer
+        //   instead of dropping. Drained on next BUS_SUBSCRIBE that
+        //   registers dst as primary name or alias.
+        // Also performs lazy TTL GC on every fanout call (cheap; typical
+        // buffer state is empty in steady state).
+        if dst != "all" {
+            let now = Instant::now();
+            let has_subscriber = {
+                let subs_guard = subs.lock().await;
+                subs_guard
+                    .values()
+                    .any(|sub| !sub.closed && (sub.name == dst || sub.aliases.contains(dst)))
+            };
+            if !has_subscriber {
+                let outcome = {
+                    let mut bb = boot_buffer.lock().await;
+                    bb.gc(now); // lazy GC every fanout call
+                    bb.push(dst, msg_type.clone(), raw_bytes.clone(), now)
+                };
+                match outcome {
+                    BootBufferPushOutcome::Buffered => {
+                        debug!(
+                            dst = %dst,
+                            msg_type = %msg_type,
+                            "[boot_buffer] buffered targeted P0 frame for late-attach"
+                        );
+                        return;
+                    }
+                    BootBufferPushOutcome::BufferedOverflowLogged => {
+                        // 2026-05-17 — instrumented with src + from_name for
+                        // BUG-PHASE-C-BOOT-BUFFER-GUARDIAN-OVERFLOW-PERSISTENT.
+                        // The persistent overflow on dst=guardian survives the
+                        // 545a6eca stale-alias fix; surface the publisher so
+                        // we can trace which producer's HEARTBEATs are landing
+                        // when guardian's subscriber should already match.
+                        warn!(
+                            dst = %dst,
+                            msg_type = %msg_type,
+                            src = %src,
+                            from_name = %from_name,
+                            "[boot_buffer] overflow on dst={} src={} from_name={} msg_type={} — oldest frame evicted (rate-limited 1/60s per dst). Subscriber attach delayed > expected boot window.",
+                            dst, src, from_name, msg_type
+                        );
+                        return;
+                    }
+                    BootBufferPushOutcome::BufferedOverflowSilent => {
+                        // Suppressed by rate-limiter — buffered, no log
+                        return;
+                    }
+                    BootBufferPushOutcome::TypeNotBuffered => {
+                        // Fall through to existing fanout behavior
+                        // (will result in no delivery since target_keys
+                        // is empty; existing logs / metrics unchanged).
+                    }
+                }
+            }
+        }
 
         // Drift bridge: emit under both names if applicable
         let names: Vec<String> = {
@@ -411,20 +588,31 @@ impl BusBroker {
         };
 
         // Resolve target subscribers by their registered `name` field
-        // (NOT map key). Map keys stay anon-N forever; fanout filters by
-        // logical name. Skip the publisher (no echo loops).
+        // (NOT map key) OR matching alias. Map keys stay anon-N forever;
+        // fanout filters by logical name(s). Publisher-skip applies ONLY
+        // to broadcasts (dst="all") per SPEC §8.2 v1.4.0 D-SPEC-42 +
+        // D-SPEC-52 (v1.7.3): "Targeted routing remains unaffected". A
+        // worker MAY legitimately address itself by name when an in-process
+        // consumer lives there (e.g. spirit_worker emitting META_CGN_SIGNAL
+        // with dst="spirit" → MetaCGNConsumer in spirit). The aliases set
+        // is populated by multi-name BUS_SUBSCRIBE (see
+        // InboundEvent::Subscribe handler) and enables one connection to
+        // be addressable as multiple dst names — used by Python titan_HCL
+        // to register all its kernel-side proxy reply queues
+        // (output_verifier_proxy, agency_proxy, …) on a single connection.
         let target_keys: Vec<String> = {
             let subs_guard = subs.lock().await;
             subs_guard
                 .iter()
-                .filter(|(map_key, _)| map_key.as_str() != from_name)
-                .filter(|(_, sub)| dst == "all" || sub.name == dst)
+                .filter(|(map_key, _)| dst != "all" || map_key.as_str() != from_name)
+                .filter(|(_, sub)| dst == "all" || sub.name == dst || sub.aliases.contains(dst))
                 .map(|(map_key, _)| map_key.clone())
                 .collect()
         };
         let target_names = target_keys; // alias for downstream loop body
 
         for target in target_names {
+            let mut delivered_any = false;
             for emit_name in &names {
                 let priority = get_spec(emit_name).priority;
                 // For drift-bridge alias names, re-encode the bytes with the
@@ -453,11 +641,71 @@ impl BusBroker {
                 };
                 let mut subs_guard = subs.lock().await;
                 if let Some(sub) = subs_guard.get_mut(&target) {
+                    // D-SPEC-45 (SPEC v1.5.1 → v1.5.2 PATCH per §2.6 —
+                    // closed-subscriber transient-state silent-skip):
+                    // Subscribers marked `closed=true` by the heartbeat
+                    // task (heartbeat.rs:108) are in tear-down transient
+                    // state — the recv_task is still draining the dead
+                    // TCP connection before the connection_handler at
+                    // broker.rs:343 purges them from the map. They are
+                    // NOT in the SPEC §8.2 v1.4.0 D-SPEC-42 row-3
+                    // forbidden-regression state — they're a normal
+                    // cleanup transient. Silent skip: no deliver, no
+                    // warn, no drop counter. Without this guard, every
+                    // broadcast fired during a stale-subscriber's purge
+                    // window generates a WARN+drop log (observed
+                    // 11K/min on T3 from a single dead anon subscriber).
+                    if sub.closed {
+                        continue;
+                    }
+                    // SPEC §8.2 v1.4.0 (D-SPEC-42) dispatch order for
+                    // `dst="all"` broadcasts (closed subs already skipped above):
+                    //   (1) reply_only=true → silent skip (no enqueue,
+                    //       no warn, no drop counter; subscriber
+                    //       declared it does not consume broadcasts).
+                    //   (2) subscribed_topics non-empty AND msg_type
+                    //       ∈ topics → deliver.
+                    //   (3) subscribed_topics empty AND !reply_only →
+                    //       WARN+drop (SPEC violation — caller must
+                    //       declare topics OR reply_only=true).
+                    //
+                    // Targeted routing (dst != "all") was resolved by
+                    // the outer `target_keys` filter and bypasses all
+                    // three checks. Mirrors Python `BusSocketServer.publish`.
+                    if dst == "all" {
+                        if sub.reply_only {
+                            // D-SPEC-42 (SPEC v1.4.0): reply-only
+                            // subscribers do not receive broadcasts by
+                            // SPEC. Silent skip — no log, no drop
+                            // counter — this is the contracted path.
+                            continue;
+                        }
+                        if sub.subscribed_topics.is_empty() {
+                            // SPEC §8.2 v1.4.0 forbidden regression:
+                            // empty topics AND reply_only=false.
+                            // Caller violates intent declaration; CI
+                            // lockstep gate should have caught at
+                            // commit time. Drop loudly so the field
+                            // operator sees the regression.
+                            warn!(
+                                subscriber = %sub.name,
+                                msg_type = %emit_name,
+                                "[divine_bus] subscriber has empty broadcast_topics AND reply_only=false — broadcast dropped. Declare ModuleSpec.broadcast_topics OR set reply_only=true. Per SPEC §8.2 v1.4.0 + rFP_bus_reply_only_socket_broker_port §3."
+                            );
+                            continue;
+                        }
+                        if !sub.subscribed_topics.contains(emit_name) {
+                            continue;
+                        }
+                    }
                     let _ = sub.publish(envelope);
+                    delivered_any = true;
                 }
             }
-            if let Some(notify) = notify_per_sub.lock().await.get(&target) {
-                notify.notify_one();
+            if delivered_any {
+                if let Some(notify) = notify_per_sub.lock().await.get(&target) {
+                    notify.notify_one();
+                }
             }
         }
     }

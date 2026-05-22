@@ -7,7 +7,7 @@ Fix: mean-revert toward 0.5 with 5min half-life before each new nudge.
 """
 import pytest
 
-from titan_plugin.logic.perception import (
+from titan_hcl.logic.perception import (
     _apply_creation_nudge_with_decay,
     _CREATION_NUDGE_BASELINE,
     _CREATION_NUDGE_HALF_LIFE_S,

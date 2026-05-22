@@ -76,7 +76,7 @@ if [ "$TIER" != "green" ] && [ "$TIER" != "unknown" ] && [ "$TIER" != "parse_err
     if [ "$TIER" != "$PRIOR_TIER" ] || [ "$TIER" = "red" ]; then
         echo "[$(date -u +%H:%M:%S)] Firing maker_notify (transition: $PRIOR_TIER → $TIER)"
         python3 -c "
-from titan_plugin.utils.maker_notify import notify_maker, format_runway_alert
+from titan_hcl.utils.maker_notify import notify_maker, format_runway_alert
 import os, json
 titan_id = 'T1'
 if os.path.exists('data/titan_identity.json'):

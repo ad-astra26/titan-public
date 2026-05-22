@@ -13,9 +13,9 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from titan_plugin.api.dashboard import router as dashboard_router
-from titan_plugin.logic import timechain_v2 as tcv2
-from titan_plugin.utils import system_sensor as ss
+from titan_hcl.api.dashboard import router as dashboard_router
+from titan_hcl.logic import timechain_v2 as tcv2
+from titan_hcl.utils import system_sensor as ss
 
 
 @pytest.fixture
@@ -27,6 +27,12 @@ def app_client():
     app = FastAPI()
     app.include_router(dashboard_router)
 
+    # Phase E: mount the v6 roof + legacy /v3,/v4→/v6 redirects so
+    # deprecated paths resolve via 301/308 to the live v6 handler.
+    from titan_hcl.api.v6 import router as _v6_router
+    from titan_hcl.api.v6_deprecation import router as _v6_dep_router
+    app.include_router(_v6_router)
+    app.include_router(_v6_dep_router)
     plugin = MagicMock()
 
     # Network stub — single RPC URL
@@ -46,7 +52,8 @@ def app_client():
     plugin.outer_state = MagicMock()
     plugin.outer_state.outer_body = [0.23, 0.85, 0.73, 0.05, 0.52]
 
-    app.state.titan_plugin = plugin
+    app.state.titan_hcl = plugin
+    app.state.titan_state = plugin  # _get_plugin reads titan_state
 
     with TestClient(app) as client:
         yield client, plugin
@@ -97,7 +104,7 @@ def test_outer_body_pulled_from_state_register(app_client):
     because MagicMock plugin has no real coordinator snapshot."""
     client, _ = app_client
     with patch(
-        "titan_plugin.api.dashboard._get_cached_coordinator_async",
+        "titan_hcl.api.dashboard._get_cached_coordinator_async",
         return_value={},  # no consciousness/state_vector → fall through
     ):
         resp = client.get("/v4/sensors")
@@ -117,7 +124,7 @@ def test_outer_body_pulled_from_coordinator_state_vector(app_client):
     fake_state_vector = [0.0] * 132
     fake_state_vector[65:70] = [0.41, 0.88, 0.65, 0.20, 0.47]
     with patch(
-        "titan_plugin.api.dashboard._get_cached_coordinator_async",
+        "titan_hcl.api.dashboard._get_cached_coordinator_async",
         return_value={"consciousness": {"state_vector": fake_state_vector}},
     ):
         resp = client.get("/v4/sensors")
@@ -131,7 +138,7 @@ def test_outer_body_falls_back_when_state_vector_too_short(app_client):
     code must fall back to state_register rather than slicing past end."""
     client, _ = app_client
     with patch(
-        "titan_plugin.api.dashboard._get_cached_coordinator_async",
+        "titan_hcl.api.dashboard._get_cached_coordinator_async",
         return_value={"consciousness": {"state_vector": [0.5] * 30}},
     ):
         resp = client.get("/v4/sensors")
@@ -215,7 +222,7 @@ def test_endpoint_survives_state_register_missing(app_client):
     del plugin.state_register
     with patch("urllib.request.urlopen", side_effect=OSError("no net")), \
          patch(
-             "titan_plugin.api.dashboard._get_cached_coordinator_async",
+             "titan_hcl.api.dashboard._get_cached_coordinator_async",
              return_value={},
          ):
         resp = client.get("/v4/sensors")
@@ -230,7 +237,7 @@ def test_endpoint_never_500s_on_producer_failures(app_client):
     """Every producer wrapped in try/except. If one crashes, endpoint still returns 200."""
     client, _ = app_client
     # Patch one producer to raise an exception internally
-    with patch("titan_plugin.utils.system_sensor.get_all_stats",
+    with patch("titan_hcl.utils.system_sensor.get_all_stats",
                side_effect=RuntimeError("sensor boom")), \
          patch("urllib.request.urlopen", side_effect=OSError("no net")):
         resp = client.get("/v4/sensors")

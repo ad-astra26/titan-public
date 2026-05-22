@@ -23,8 +23,8 @@ import os
 
 import pytest
 
-from titan_plugin.core.kernel import TitanKernel
-from titan_plugin.core.kernel_interface import KernelView
+from titan_hcl.core.kernel import TitanKernel
+from titan_hcl.core.kernel_interface import KernelView
 
 
 @pytest.fixture
@@ -133,7 +133,7 @@ def test_kernel_start_spirit_shm_writer_emits_log(kernel, caplog):
     anchor so operators see all active shm paths at kernel boot.
     """
     import logging
-    with caplog.at_level(logging.INFO, logger="titan_plugin.core.kernel"):
+    with caplog.at_level(logging.INFO, logger="titan_hcl.core.kernel"):
         kernel._start_spirit_shm_writer()
     # One log line mentioning spirit-fast with the flag state
     matching = [r for r in caplog.records if "Spirit-fast" in r.message]

@@ -2,8 +2,8 @@
 # precommit_async_check.sh — Block commits that introduce CRITICAL async-blocks.
 #
 # Invoked by .git/hooks/pre-commit. Runs the async-blocks scanner against
-# the entire titan_plugin/ tree (fast — ~10s) only when .py files under
-# titan_plugin/ are staged. Fails if CRITICAL > 0.
+# the entire titan_hcl/ tree (fast — ~10s) only when .py files under
+# titan_hcl/ are staged. Fails if CRITICAL > 0.
 #
 # Enable:   ln -sf ../../scripts/precommit_async_check.sh .git/hooks/pre-commit
 # Disable:  rm .git/hooks/pre-commit   (or: git commit --no-verify)
@@ -13,8 +13,8 @@
 
 set -u
 
-# Only run when titan_plugin/ Python files are staged.
-STAGED_PY=$(git diff --cached --name-only --diff-filter=ACM | grep -E '^titan_plugin/.*\.py$' || true)
+# Only run when titan_hcl/ Python files are staged.
+STAGED_PY=$(git diff --cached --name-only --diff-filter=ACM | grep -E '^titan_hcl/.*\.py$' || true)
 if [ -z "$STAGED_PY" ]; then
     exit 0
 fi

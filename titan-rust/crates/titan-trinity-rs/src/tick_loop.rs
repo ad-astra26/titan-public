@@ -26,10 +26,12 @@
 //! Reverse order = race per SPEC §10.E. arch_map static-checks call ordering
 //! in the integration layer.
 
+use crate::anchor::AnchorReader;
 use crate::chi_state::ChiState;
 use crate::sphere_clocks::{PulseEvent, SphereClockSet};
+use crate::topology::TopologyEngine;
 use crate::topology::{
-    assemble_topology_30d, compute_whole_10d, l2_norm, BasicTopology, LowerResult, LowerTopology,
+    assemble_topology_30d, compute_whole_10d, l2_norm, layer_coherence, LowerResult, LowerTopology,
     BODY_5D, MIND_15D, MIND_WILLING_RANGE, SPIRIT_45D, TOPOLOGY_30D,
 };
 
@@ -106,17 +108,31 @@ pub struct SubstrateState {
     /// Last whole_10d output, used as `whole_10d` input to next tick's
     /// lower-topology compute (drives polarity observable).
     pub last_whole_10d: Option<[f32; 10]>,
+    /// Topology engine — produces the 5 BasicTopology fields (volume,
+    /// curvature, mean_distance, cluster_count, cross_layer_mirror) per
+    /// rFP_phase_c_substrate_observable_closure.md §2.1. Stateful across
+    /// ticks via volume_history + prev_magnitudes.
+    pub topology_engine: TopologyEngine,
+    /// On-chain anchor freshness reader. Re-reads `data/anchor_state.json`
+    /// at 60s cadence; produces `anchor_factor` in [0.5, 1.0] that
+    /// modulates whole-topology grounding_tension per
+    /// rFP_phase_c_substrate_observable_closure.md §2.2.
+    pub anchor_reader: AnchorReader,
 }
 
 impl SubstrateState {
     /// Construct with default tunings — used at substrate boot.
-    pub fn new() -> Self {
+    /// `data_dir` is the substrate's data directory (parent of
+    /// `anchor_state.json`); typically `data/` under the Titan repo root.
+    pub fn new(data_dir: std::path::PathBuf) -> Self {
         Self {
             inner_lower: LowerTopology::inner_default(),
             outer_lower: LowerTopology::outer_default(),
             sphere_clocks: SphereClockSet::new(),
             chi_state: ChiState::zero(),
             last_whole_10d: None,
+            topology_engine: TopologyEngine::new(),
+            anchor_reader: AnchorReader::new(data_dir),
         }
     }
 
@@ -147,10 +163,20 @@ impl SubstrateState {
             l2_norm(&inputs.outer_spirit_45d),
         ];
 
-        // Step 4: compute whole-10D — basic topology is zero in C-S3
-        // (substrate has no body-part observable derivation today; daemon-tensor
-        // observables would feed BasicTopology in Phase D enhancement)
-        let basic = BasicTopology::default();
+        // Step 4: compute basic topology from 6 daemon tensors via
+        // TopologyEngine per rFP_phase_c_substrate_observable_closure.md §2.1.
+        // Closes the C-S3 -> C-S4 inter-PLAN orphan where BasicTopology was
+        // hardcoded to zero; volume / curvature / mean_distance / cluster_count
+        // / cross_layer_mirror now flow from real layer-observable derivation.
+        let basic = self.topology_engine.compute(
+            &inputs.inner_body_5d,
+            &inputs.inner_mind_15d,
+            &inputs.inner_spirit_45d,
+            &inputs.outer_body_5d,
+            &inputs.outer_mind_15d,
+            &inputs.outer_spirit_45d,
+        );
+        let anchor_factor = self.anchor_reader.factor();
         let whole_10d = compute_whole_10d(
             &basic,
             &inner,
@@ -158,7 +184,36 @@ impl SubstrateState {
             &inner_mind_willing,
             &outer_mind_willing,
             &spirit_magnitudes,
+            anchor_factor,
         );
+
+        // rFP_phase_c_substrate_observable_closure §2.3 — willing_coherence
+        // diagnostic: every WILLING_DIAGNOSTIC_TICK_CADENCE ticks (~19 min
+        // body cycles), emit the inner/outer willing dims + cosine_sim
+        // numerator + magnitudes so live = 0 episodes can be traced to the
+        // upstream producer (outer-mind-rs / inner-mind-rs) rather than the
+        // computation itself. INFO level so journalctl captures by default.
+        if self.topology_engine.should_log_willing_diagnostic() {
+            let dot: f32 = inner_mind_willing
+                .iter()
+                .zip(outer_mind_willing.iter())
+                .map(|(a, b)| a * b)
+                .sum();
+            let mag_i: f32 = inner_mind_willing.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let mag_o: f32 = outer_mind_willing.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let willing_coh = whole_10d[8]; // position [8] in WHOLE-10D per Preamble G4
+            tracing::info!(
+                event = "WILLING_COHERENCE_DIAGNOSTIC",
+                tick = self.topology_engine.tick_count(),
+                inner_mind_willing = ?inner_mind_willing,
+                outer_mind_willing = ?outer_mind_willing,
+                dot_product = dot,
+                mag_inner = mag_i,
+                mag_outer = mag_o,
+                willing_coherence = willing_coh,
+                "willing_coherence diagnostic (rFP §2.3) — live=0 traces to mag<MIN_MAGNITUDE on either side"
+            );
+        }
 
         // Step 5: assemble 30D output per Preamble G4 layout
         let topology_30d = assemble_topology_30d(&outer, &inner, &whole_10d);
@@ -166,14 +221,18 @@ impl SubstrateState {
         // Cache for next tick
         self.last_whole_10d = Some(whole_10d);
 
-        // Step 6: tick all 6 sphere clocks. Coherence input = lower
-        // topology's coherence observable. Inner-spirit + outer-spirit don't
-        // have lower topologies, so they receive their own daemon's spirit
-        // tensor cosine-with-balanced as a stand-in (zero in C-S3).
+        // Step 6: tick all 6 sphere clocks. Coherence input per SPEC §G4 +
+        // §G11 + D-SPEC-84 — canonical `layer_coherence` (1 - variance/0.25)
+        // applied to the layer-relevant tensor:
+        //   - inner_body / inner_mind clocks use combined inner-lower 10D coherence
+        //   - outer_body / outer_mind clocks use combined outer-lower 10D coherence
+        //   - inner_spirit / outer_spirit clocks use direct 45D spirit coherence
+        // (Spirit has no lower-topology by design — it IS the higher form per
+        // §G3. The 45D tensor's variance-coherence directly drives the clock.)
         let inner_coh = inner.observables.coherence;
         let outer_coh = outer.observables.coherence;
-        let inner_spirit_coh = spirit_coherence(&inputs.inner_spirit_45d);
-        let outer_spirit_coh = spirit_coherence(&inputs.outer_spirit_45d);
+        let inner_spirit_coh = layer_coherence(&inputs.inner_spirit_45d);
+        let outer_spirit_coh = layer_coherence(&inputs.outer_spirit_45d);
 
         let mut pulses: Vec<PulseEvent> = Vec::new();
         if let Some(p) = self.sphere_clocks.inner_body.tick(inner_coh, inputs.dt_s) {
@@ -218,29 +277,11 @@ impl SubstrateState {
     }
 }
 
+/// Default constructs an in-memory-only substrate state (no anchor file).
+/// Used in legacy tests; production code calls `SubstrateState::new(data_dir)`.
 impl Default for SubstrateState {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Spirit coherence stand-in: cosine similarity with [0.5; 45]. Used as
-/// sphere-clock coherence input for inner-spirit + outer-spirit clocks
-/// (since substrate doesn't compute a true spirit-lower-topology — that's
-/// inner-spirit-rs / outer-spirit-rs daemon territory in C-S5/C-S6).
-fn spirit_coherence(spirit_45d: &[f32; SPIRIT_45D]) -> f32 {
-    let reference = [0.5_f32; SPIRIT_45D];
-    let dot = spirit_45d
-        .iter()
-        .zip(reference.iter())
-        .map(|(a, b)| a * b)
-        .sum::<f32>();
-    let mag_a = l2_norm(spirit_45d);
-    let mag_b = l2_norm(&reference);
-    if mag_a < 1e-10 || mag_b < 1e-10 {
-        0.0
-    } else {
-        dot / (mag_a * mag_b)
+        Self::new(std::path::PathBuf::new())
     }
 }
 
@@ -265,18 +306,47 @@ mod tests {
     }
 
     #[test]
-    fn body_tick_zero_inputs_yields_zero_topology_30d() {
-        let mut s = SubstrateState::new();
+    fn body_tick_zero_inputs_topology_30d_lower_blocks_zero_whole_minimal() {
+        // Under rFP_phase_c_substrate_observable_closure: zero tensors yield
+        // zero lower-topology values (parity with Python `compute()` returning
+        // zeros when observables are empty/zero) BUT degenerate cluster_count
+        // = 1 because all 6 zero-vectors are identical → adjacency complete →
+        // one connected component of size 6. This is SPEC-correct behavior:
+        // the C-S3 stub's "zero in zero out" expectation was incorrect for
+        // a real TopologyEngine.
+        let mut s = SubstrateState::default();
         let out = s.body_tick(&zero_inputs());
-        // All zeros: zero in → zero out
-        for (i, v) in out.topology_30d.iter().enumerate() {
-            assert_eq!(*v, 0.0, "topology_30d[{i}] should be 0.0");
+        // [0:20] outer_lower + inner_lower — pure zero (no observables → no signal)
+        for (i, v) in out.topology_30d[..20].iter().enumerate() {
+            assert_eq!(*v, 0.0, "lower-block topology_30d[{i}] should be 0.0");
+        }
+        // [20] volume = 0 (all distances zero)
+        assert_eq!(out.topology_30d[20], 0.0);
+        // [21] curvature = 0 (first tick, no history)
+        assert_eq!(out.topology_30d[21], 0.0);
+        // [22] density = 0 (mean_distance = 0 → density floor at 0)
+        assert_eq!(out.topology_30d[22], 0.0);
+        // [23] mean_distance = 0
+        assert_eq!(out.topology_30d[23], 0.0);
+        // [24] cross_layer_mirror = 0 (both 65D vectors zero magnitude)
+        assert_eq!(out.topology_30d[24], 0.0);
+        // [25] cluster_count = 1 (degenerate: all-zero observables are identical → one cluster)
+        assert_eq!(out.topology_30d[25], 1.0);
+        // [26..30] grounding_tension / matter_spirit_ratio / willing_coherence / field_polarity
+        // are all 0 with zero inputs (matter_spirit_ratio = 0/0.5 clamp = 0).
+        for (offset, v) in out.topology_30d[26..30].iter().enumerate() {
+            assert_eq!(
+                *v,
+                0.0,
+                "whole-block topology_30d[{}] should be 0.0",
+                26 + offset
+            );
         }
     }
 
     #[test]
     fn body_tick_topology_30d_layout_outer_inner_whole_per_g4() {
-        let mut s = SubstrateState::new();
+        let mut s = SubstrateState::default();
         let mut inputs = zero_inputs();
         // Distinguishable inputs per trinity
         inputs.inner_body_5d = [0.3; 5];
@@ -314,7 +384,7 @@ mod tests {
 
     #[test]
     fn body_tick_inner_outer_magnitudes_surfaced_for_telemetry() {
-        let mut s = SubstrateState::new();
+        let mut s = SubstrateState::default();
         let mut inputs = zero_inputs();
         inputs.inner_body_5d = [0.5; 5];
         inputs.inner_mind_15d[10..15].copy_from_slice(&[0.5; 5]);
@@ -331,7 +401,7 @@ mod tests {
 
     #[test]
     fn body_tick_no_pulse_on_first_tick_with_zero_coherence() {
-        let mut s = SubstrateState::new();
+        let mut s = SubstrateState::default();
         let out = s.body_tick(&zero_inputs());
         // Zero coherence → min velocity = 0.0075 / tick → no pulse on first tick
         assert!(out.pulses.is_empty());
@@ -339,7 +409,7 @@ mod tests {
 
     #[test]
     fn body_tick_six_sphere_clocks_advance_each_call() {
-        let mut s = SubstrateState::new();
+        let mut s = SubstrateState::default();
         let inputs = zero_inputs();
         let _ = s.body_tick(&inputs);
         for clk in s.sphere_clocks.iter() {
@@ -353,7 +423,7 @@ mod tests {
 
     #[test]
     fn body_tick_balanced_inputs_eventually_produce_pulses() {
-        let mut s = SubstrateState::new();
+        let mut s = SubstrateState::default();
         let mut inputs = zero_inputs();
         // Drive inner-lower coherence high: state == reference [0.5]*10
         inputs.inner_body_5d = [0.5; 5];
@@ -375,14 +445,14 @@ mod tests {
 
     #[test]
     fn body_tick_sphere_clocks_payload_is_168_bytes() {
-        let mut s = SubstrateState::new();
+        let mut s = SubstrateState::default();
         let out = s.body_tick(&zero_inputs());
         assert_eq!(out.sphere_clocks_payload.len(), 168);
     }
 
     #[test]
     fn body_tick_chi_payload_is_zero_24_bytes_in_c_s3() {
-        let mut s = SubstrateState::new();
+        let mut s = SubstrateState::default();
         let out = s.body_tick(&zero_inputs());
         assert_eq!(out.chi_state_payload.len(), 24);
         for v in out.chi_state_payload.iter() {
@@ -392,7 +462,7 @@ mod tests {
 
     #[test]
     fn body_tick_caches_last_whole_for_next_polarity_observable() {
-        let mut s = SubstrateState::new();
+        let mut s = SubstrateState::default();
         assert!(s.last_whole_10d.is_none());
         let mut inputs = zero_inputs();
         inputs.inner_body_5d = [0.5; 5];
@@ -400,16 +470,20 @@ mod tests {
         assert!(s.last_whole_10d.is_some());
     }
 
-    // ── spirit_coherence helper ────────────────────────────────────────────
+    // ── spirit clock coherence input parity (SPEC §G4 + D-SPEC-84) ─────────
 
     #[test]
-    fn spirit_coherence_zero_input_returns_zero() {
-        assert_eq!(spirit_coherence(&[0.0; 45]), 0.0);
+    fn spirit_clock_coherence_uniform_45d_returns_one() {
+        // [0.5; 45] → variance=0 → layer_coherence=1.0 (≥ balanced threshold)
+        assert!(approx(layer_coherence(&[0.5_f32; 45]), 1.0, 1e-6));
     }
 
     #[test]
-    fn spirit_coherence_balanced_input_returns_one() {
-        let r = spirit_coherence(&[0.5; 45]);
-        assert!(approx(r, 1.0, 1e-5));
+    fn spirit_clock_coherence_zero_45d_returns_one() {
+        // [0.0; 45] → variance=0 → layer_coherence=1.0 (uniform, even at zero)
+        // Note: this is a SEMANTIC fix vs pre-D-SPEC-84 cosine standin which
+        // returned 0.0 for [0.0;45]. Uniform-zero IS coherent per
+        // middle_path.py:62-66 position-independence rule.
+        assert!(approx(layer_coherence(&[0.0_f32; 45]), 1.0, 1e-6));
     }
 }

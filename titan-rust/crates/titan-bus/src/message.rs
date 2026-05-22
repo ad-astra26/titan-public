@@ -81,6 +81,81 @@ fn mp_value_as_string(v: &MpValue) -> Option<String> {
     }
 }
 
+/// Decode the `payload.name`, `payload.topics`, and `payload.reply_only`
+/// fields from a BUS_SUBSCRIBE msgpack frame. Returns
+/// `(name, topics, reply_only)`.
+///
+/// Per SPEC §8.2:
+///   - v1.3.0 introduced `payload.name` (broker uses as canonical
+///     subscriber name; multi-name semantics — repeated BUS_SUBSCRIBE
+///     frames with different names are additive on `aliases`).
+///   - v1.4.0 (D-SPEC-42, 2026-05-12) introduced `payload.reply_only`
+///     declaring subscriber intent: `true` = receives only targeted
+///     `dst=<name>` messages, never `dst="all"` broadcasts. Backward
+///     compatible — pre-v1.4.0 clients omit the key; this decoder
+///     defaults to `false` (broadcast-consumer intent), preserving
+///     byte-identical prior behavior.
+///
+/// Used by `server.rs` to construct `InboundEvent::Subscribe`.
+pub fn decode_bus_subscribe_payload(
+    bytes: &[u8],
+) -> Result<(Option<String>, Vec<String>, bool), MsgError> {
+    let value: MpValue = rmpv::decode::read_value(&mut std::io::Cursor::new(bytes))
+        .map_err(|e| MsgError::Decode(format!("{e:?}")))?;
+    let map = match value {
+        MpValue::Map(m) => m,
+        other => {
+            return Err(MsgError::NotAMap {
+                got: msgpack_type_name(&other),
+            })
+        }
+    };
+
+    let mut name: Option<String> = None;
+    let mut topics: Vec<String> = Vec::new();
+    let mut reply_only: bool = false; // D-SPEC-42 default per SPEC v1.4.0
+
+    for (k, v) in map {
+        if let MpValue::String(key_s) = k {
+            if let Some(key_str) = key_s.as_str() {
+                if key_str == "payload" {
+                    if let MpValue::Map(payload_map) = v {
+                        for (pk, pv) in payload_map {
+                            if let MpValue::String(pk_s) = pk {
+                                if let Some(pk_str) = pk_s.as_str() {
+                                    match pk_str {
+                                        "name" => name = mp_value_as_string(&pv),
+                                        "topics" => {
+                                            if let MpValue::Array(arr) = pv {
+                                                for t in arr {
+                                                    if let Some(s) = mp_value_as_string(&t) {
+                                                        topics.push(s);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // D-SPEC-42 — accept boolean.
+                                        // Absent key or non-bool value
+                                        // → keep default false.
+                                        "reply_only" => {
+                                            if let MpValue::Boolean(b) = pv {
+                                                reply_only = b;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    break; // payload found; stop scanning
+                }
+            }
+        }
+    }
+    Ok((name, topics, reply_only))
+}
+
 fn msgpack_type_name(v: &MpValue) -> &'static str {
     match v {
         MpValue::Nil => "nil",
@@ -137,14 +212,26 @@ pub fn rewrite_msg_type(raw_bytes: &[u8], new_msg_type: &str) -> Result<Vec<u8>,
     Ok(out)
 }
 
-/// Encode a simple `{type, src, dst, payload}` map as msgpack. Used by
-/// integration tests + helpers. Production code typically receives bytes
-/// pre-encoded by the publisher.
+/// Encode a top-level bus envelope `{type, src?, dst?, payload?}` to msgpack bytes.
+///
+/// SPEC §8.2 line 789 + §8.10 line 900 — the `payload` field MUST be encoded as
+/// a structured msgpack value (typically a nested Map per the message-specific
+/// schema in §8.x), NOT as opaque `MpValue::Binary` bytes. Python ground truth
+/// at `bus_socket.py:1391-1396` emits `payload` as a nested dict; the Rust port
+/// matches byte-identically per §8.10.
+///
+/// Pre-2026-05-13 the Rust encoder wrapped `payload` as `MpValue::Binary(p)`,
+/// which broke BUS_SUBSCRIBE wire-protocol parity: the broker's
+/// `decode_bus_subscribe_payload` expects a Map at `"payload"` per
+/// `message.rs:122`, so Rust-encoded BUS_SUBSCRIBE arrived with empty topics +
+/// reply_only=false (the SPEC §8.2 v1.4.0 forbidden-regression state) and
+/// every Rust subscriber's broadcasts were dropped at the broker. Closure:
+/// `rFP_worker_broadcast_topics_completion §4.C-ter` (2026-05-13).
 pub fn encode_simple(
     msg_type: &str,
     src: Option<&str>,
     dst: Option<&str>,
-    payload: Option<&[u8]>,
+    payload: Option<MpValue>,
 ) -> Result<Vec<u8>, MsgError> {
     let mut entries = Vec::with_capacity(4);
     entries.push((
@@ -158,10 +245,11 @@ pub fn encode_simple(
         entries.push((MpValue::String("dst".into()), MpValue::String(d.into())));
     }
     if let Some(p) = payload {
-        entries.push((
-            MpValue::String("payload".into()),
-            MpValue::Binary(p.to_vec()),
-        ));
+        // SPEC §8.2 line 789: payload is a structured Value (e.g. Map per
+        // per-message schema). Embedded directly so the broker can decode
+        // structured fields via msgpack Value traversal — NOT wrapped in
+        // MpValue::Binary which would render the field opaque.
+        entries.push((MpValue::String("payload".into()), p));
     }
     let val = MpValue::Map(entries);
     let mut out = Vec::new();
@@ -179,7 +267,10 @@ mod tests {
             "BUS_SUBSCRIBE",
             Some("inner-body"),
             Some("all"),
-            Some(b"payload"),
+            Some(MpValue::Map(vec![(
+                MpValue::String("topics".into()),
+                MpValue::Array(vec![MpValue::String("BODY_STATE".into())]),
+            )])),
         )
         .unwrap();
         let hdr = decode_header(&bytes).unwrap();
@@ -234,8 +325,16 @@ mod tests {
 
     #[test]
     fn rewrite_msg_type_replaces_existing_type() {
-        let original =
-            encode_simple("EPOCH_TICK", Some("kernel"), Some("all"), Some(b"payload")).unwrap();
+        let original = encode_simple(
+            "EPOCH_TICK",
+            Some("kernel"),
+            Some("all"),
+            Some(MpValue::Map(vec![(
+                MpValue::String("epoch_id".into()),
+                MpValue::Integer(42.into()),
+            )])),
+        )
+        .unwrap();
         let rewritten = rewrite_msg_type(&original, "KERNEL_EPOCH_TICK").unwrap();
         let hdr = decode_header(&rewritten).unwrap();
         assert_eq!(hdr.msg_type.as_deref(), Some("KERNEL_EPOCH_TICK"));

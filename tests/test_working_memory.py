@@ -1,6 +1,6 @@
 """Tests for Working Memory — short-term processing buffer."""
 import pytest
-from titan_plugin.logic.working_memory import WorkingMemory
+from titan_hcl.logic.working_memory import WorkingMemory
 
 
 class TestWorkingMemory:

@@ -20,8 +20,8 @@ import httpx
 # Add project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from titan_plugin.logic.inner_memory import InnerMemoryStore
-from titan_plugin.logic.language_learning import (
+from titan_hcl.logic.inner_memory import InnerMemoryStore
+from titan_hcl.logic.language_learning import (
     LanguageLearningExperience,
     _flatten_perturbation,
     _cosine_similarity,
@@ -208,7 +208,7 @@ async def run_session(num_words: int = 5, dry_run: bool = False):
         if not dry_run:
             h = initial_state.get("hormones", {})
             # Find words that match dominant hormones
-            from titan_plugin.logic.language_learning import HORMONE_WORD_MAP
+            from titan_hcl.logic.language_learning import HORMONE_WORD_MAP
             top_hormones = sorted(h.items(), key=lambda x: x[1], reverse=True)[:2]
             suggested = []
             for hormone, _ in top_hormones:

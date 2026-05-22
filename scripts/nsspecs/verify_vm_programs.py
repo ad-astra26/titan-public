@@ -19,14 +19,14 @@ Exit 0 if all 11 programs pass, 1 otherwise.
 import sys
 from pathlib import Path
 
-# Make titan_plugin importable
+# Make titan_hcl importable
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from titan_plugin.logic.nervous_system import (
+from titan_hcl.logic.nervous_system import (
     NervousSystem, load_nervous_system_programs, flatten_observables,
 )
-from titan_plugin.logic.titan_vm import TitanVM
+from titan_hcl.logic.titan_vm import TitanVM
 
 
 def make_observables(*, inner_body=None, inner_mind=None, inner_spirit=None,

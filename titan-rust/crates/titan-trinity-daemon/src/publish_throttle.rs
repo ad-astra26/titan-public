@@ -120,9 +120,15 @@ mod tests {
             OUTER_BODY_BUS_PUBLISH_INTERVAL_S, OUTER_MIND_BUS_PUBLISH_INTERVAL_S,
             OUTER_SPIRIT_BUS_PUBLISH_INTERVAL_S,
         };
-        // SPEC §13 G13 — body slowest at bus publish layer
-        assert!(OUTER_BODY_BUS_PUBLISH_INTERVAL_S > OUTER_MIND_BUS_PUBLISH_INTERVAL_S);
-        assert!(OUTER_MIND_BUS_PUBLISH_INTERVAL_S > OUTER_SPIRIT_BUS_PUBLISH_INTERVAL_S);
+        // SPEC §13 G13 — body slowest at bus publish layer.
+        // Compile-time assertions: clippy 1.95+ flags runtime assertions on
+        // constants (`clippy::assertions_on_constants`); move to const-context
+        // so the invariant is verified at compile time and the test body
+        // remains purely for the canonical-value asserts below.
+        const _: () =
+            assert!(OUTER_BODY_BUS_PUBLISH_INTERVAL_S > OUTER_MIND_BUS_PUBLISH_INTERVAL_S);
+        const _: () =
+            assert!(OUTER_MIND_BUS_PUBLISH_INTERVAL_S > OUTER_SPIRIT_BUS_PUBLISH_INTERVAL_S);
         // Locked values per SPEC TOML
         assert_eq!(OUTER_BODY_BUS_PUBLISH_INTERVAL_S, 45.0);
         assert_eq!(OUTER_MIND_BUS_PUBLISH_INTERVAL_S, 15.0);

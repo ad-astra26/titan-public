@@ -1,4 +1,4 @@
-//! spawn — Spawn `titan-trinity-rs` + `python -m titan_main` per SPEC §10.A
+//! spawn — Spawn `titan-trinity-rs` + `python -m titan_hcl` per SPEC §10.A
 //! B8 + B9. Sets all canonical env vars per §3 D18 + §5.
 //!
 //! C-S2 shipped the spawn pathway against `titan-trinity-rs-placeholder`;
@@ -49,9 +49,9 @@ pub struct SpawnConfig {
     /// Path to `titan-trinity-rs` binary (renamed from
     /// `titan-trinity-rs-placeholder` in C-S3 chunk C3-3).
     pub substrate_binary: PathBuf,
-    /// Path to Python executable (for `python -m titan_main`).
+    /// Path to Python executable (for `python -m titan_hcl`).
     pub python_executable: Option<PathBuf>,
-    /// CWD for Python child (where `titan_plugin/` lives).
+    /// CWD for Python child (where `titan_hcl/` lives).
     pub python_cwd: Option<PathBuf>,
     /// `false` = skip spawning Python (used by tests).
     pub spawn_python_main: bool,
@@ -124,7 +124,7 @@ impl SpawnConfig {
 pub struct SpawnedChildren {
     /// Substrate (placeholder in C-S2; real titan-trinity-rs in C-S3).
     pub substrate: Mutex<Option<Child>>,
-    /// Python `titan_main` (optional; when `spawn_python_main=true`).
+    /// Python `titan_hcl` (optional; when `spawn_python_main=true`).
     pub python_main: Mutex<Option<Child>>,
 }
 
@@ -179,7 +179,7 @@ pub fn spawn_substrate(config: &SpawnConfig) -> Result<Child, SpawnError> {
     })
 }
 
-/// Spawn `python -m titan_main` per SPEC §10.A B9. Returns `Ok(None)` if
+/// Spawn `python -m titan_hcl` per SPEC §10.A B9. Returns `Ok(None)` if
 /// `spawn_python_main=false` (tests).
 pub fn spawn_python_main(config: &SpawnConfig) -> Result<Option<Child>, SpawnError> {
     if !config.spawn_python_main {
@@ -216,15 +216,15 @@ pub fn spawn_python_main(config: &SpawnConfig) -> Result<Option<Child>, SpawnErr
 
     let mut cmd = Command::new(python);
     // Phase C C-S7 (2026-05-05): invoke as a script (`python -u
-    // scripts/titan_main.py --server`) to match the legacy boot path
+    // scripts/titan_hcl.py --server`) to match the legacy boot path
     // (t3_manage.sh / titan_watchdog.sh). `-u` = unbuffered stdout/stderr
     // so journald + tee'd log file receive lines as they're written.
     // `--server` = non-interactive mode (no stdin prompt). Path-based
     // invocation avoids the PYTHONPATH coordination needed for the
-    // module form (`-m titan_main` requires `titan_main` to be on
+    // module form (`-m titan_hcl` requires `titan_hcl` to be on
     // sys.path).
     cmd.arg("-u")
-        .arg("scripts/titan_main.py")
+        .arg("scripts/titan_hcl.py")
         .arg("--server")
         .current_dir(&cwd)
         .env_clear()
@@ -235,7 +235,7 @@ pub fn spawn_python_main(config: &SpawnConfig) -> Result<Option<Child>, SpawnErr
         python = ?python,
         cwd = ?cwd,
         titan_id = %config.titan_id,
-        "kernel: spawning python -u scripts/titan_main.py --server per SPEC §10.A B9"
+        "kernel: spawning python -u scripts/titan_hcl.py --server per SPEC §10.A B9"
     );
 
     let child = cmd.spawn().map_err(|source| {

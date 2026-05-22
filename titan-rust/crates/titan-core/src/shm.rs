@@ -246,7 +246,9 @@ pub enum SlotError {
     /// Reader was preempted long enough that writer lapped through all
     /// 3 buffers during the read — buffer the reader copied was overwritten.
     /// Extraordinarily rare in practice.
-    #[error("slot reader lapped — version delta {delta} > 2 (writer overwrote buffer during read)")]
+    #[error(
+        "slot reader lapped — version delta {delta} > 2 (writer overwrote buffer during read)"
+    )]
     ReaderLapped {
         /// Number of writer publishes that completed during the read.
         delta: u64,

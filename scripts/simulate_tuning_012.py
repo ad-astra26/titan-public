@@ -38,12 +38,12 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-# Make titan_plugin importable when run from project root
+# Make titan_hcl importable when run from project root
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from titan_plugin.logic.meta_reasoning_rewards import (  # noqa: E402
+from titan_hcl.logic.meta_reasoning_rewards import (  # noqa: E402
     compute_primitive_reward,
     empty_subsystem_signals,
 )
@@ -340,7 +340,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--db", default="data/inner_memory.db")
     ap.add_argument("--limit", type=int, default=500)
-    ap.add_argument("--params", default="titan_plugin/titan_params.toml")
+    ap.add_argument("--params", default="titan_hcl/titan_params.toml")
     ap.add_argument("--titan", default="T1", choices=["T1", "T2", "T3"])
     args = ap.parse_args()
 

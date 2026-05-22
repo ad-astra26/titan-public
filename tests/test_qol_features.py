@@ -13,31 +13,31 @@ class TestBannerRendering:
     """Test banner string generation (pure offline, no mocks needed)."""
 
     def test_render_bar_0_percent(self):
-        from titan_plugin.utils.banner import render_bar
+        from titan_hcl.utils.banner import render_bar
         bar = render_bar(0)
         assert bar == "\u2591" * 10
         assert len(bar) == 10
 
     def test_render_bar_100_percent(self):
-        from titan_plugin.utils.banner import render_bar
+        from titan_hcl.utils.banner import render_bar
         bar = render_bar(100)
         assert bar == "\u2588" * 10
         assert len(bar) == 10
 
     def test_render_bar_50_percent(self):
-        from titan_plugin.utils.banner import render_bar
+        from titan_hcl.utils.banner import render_bar
         bar = render_bar(50)
         assert bar == "\u2588" * 5 + "\u2591" * 5
 
     def test_render_bar_clamps(self):
-        from titan_plugin.utils.banner import render_bar
+        from titan_hcl.utils.banner import render_bar
         bar_over = render_bar(150)
         assert bar_over == "\u2588" * 10
         bar_under = render_bar(-10)
         assert bar_under == "\u2591" * 10
 
     def test_build_banner_compact(self):
-        from titan_plugin.utils.banner import build_banner
+        from titan_hcl.utils.banner import build_banner
         banner = build_banner(68.0, 74.0, 31.0, "Contemplative", 3, style="compact")
         assert "[TITAN]" in banner
         assert "Life" in banner
@@ -49,7 +49,7 @@ class TestBannerRendering:
         assert "Epoch 3" in banner
 
     def test_build_banner_minimal(self):
-        from titan_plugin.utils.banner import build_banner
+        from titan_hcl.utils.banner import build_banner
         banner = build_banner(68.0, 74.0, 31.0, "Contemplative", 3, style="minimal")
         assert "[TITAN]" in banner
         assert "Life 68%" in banner
@@ -61,14 +61,14 @@ class TestBannerRendering:
         assert "\u2588" not in banner
 
     def test_build_banner_unavailable_life(self):
-        from titan_plugin.utils.banner import build_banner
+        from titan_hcl.utils.banner import build_banner
         banner = build_banner(-1, 50.0, 10.0, "Unknown", 0, style="compact")
         assert "--%" in banner
         # Should show empty bars (all light shade)
         assert "\u2591" * 10 in banner
 
     def test_banner_single_line(self):
-        from titan_plugin.utils.banner import build_banner
+        from titan_hcl.utils.banner import build_banner
         banner = build_banner(100.0, 100.0, 100.0, "Energetic", 99)
         assert "\n" not in banner
 
@@ -85,7 +85,7 @@ class TestSovereigntyScore:
         class FakeRecorder:
             storage = []
 
-        from titan_plugin.logic.sage.gatekeeper import SageGatekeeper
+        from titan_hcl.logic.sage.gatekeeper import SageGatekeeper
         return SageGatekeeper(FakeScholar(), FakeRecorder())
 
     def test_empty_history(self):
@@ -141,42 +141,42 @@ class TestPrivacyFilter:
     """Test PII sanitization (pure offline)."""
 
     def test_email_redacted(self):
-        from titan_plugin.utils.privacy import sanitize_outbound
+        from titan_hcl.utils.privacy import sanitize_outbound
         text, count = sanitize_outbound("Contact user@example.com for info")
         assert "[EMAIL_REDACTED]" in text
         assert "user@example.com" not in text
         assert count == 1
 
     def test_phone_redacted(self):
-        from titan_plugin.utils.privacy import sanitize_outbound
+        from titan_hcl.utils.privacy import sanitize_outbound
         text, count = sanitize_outbound("Call 555-123-4567 or (555) 987-6543")
         assert "[PHONE_REDACTED]" in text
         assert "555-123-4567" not in text
         assert count >= 1
 
     def test_ssn_redacted(self):
-        from titan_plugin.utils.privacy import sanitize_outbound
+        from titan_hcl.utils.privacy import sanitize_outbound
         text, count = sanitize_outbound("SSN: 123-45-6789")
         assert "[SSN_REDACTED]" in text
         assert "123-45-6789" not in text
         assert count == 1
 
     def test_credit_card_redacted(self):
-        from titan_plugin.utils.privacy import sanitize_outbound
+        from titan_hcl.utils.privacy import sanitize_outbound
         text, count = sanitize_outbound("Card: 4111 1111 1111 1111")
         assert "[CARD_REDACTED]" in text
         assert "4111 1111 1111 1111" not in text
         assert count == 1
 
     def test_ip_redacted(self):
-        from titan_plugin.utils.privacy import sanitize_outbound
+        from titan_hcl.utils.privacy import sanitize_outbound
         text, count = sanitize_outbound("Server at 192.168.1.1 is down")
         assert "[IP_REDACTED]" in text
         assert "192.168.1.1" not in text
         assert count == 1
 
     def test_solana_address_preserved(self):
-        from titan_plugin.utils.privacy import sanitize_outbound
+        from titan_hcl.utils.privacy import sanitize_outbound
         # A real Solana address (base58, 44 chars)
         addr = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"
         text, count = sanitize_outbound(f"Wallet: {addr}")
@@ -184,14 +184,14 @@ class TestPrivacyFilter:
         assert count == 0
 
     def test_no_pii_unchanged(self):
-        from titan_plugin.utils.privacy import sanitize_outbound
+        from titan_hcl.utils.privacy import sanitize_outbound
         original = "The Titan is sovereign and free."
         text, count = sanitize_outbound(original)
         assert text == original
         assert count == 0
 
     def test_multiple_pii_in_one_text(self):
-        from titan_plugin.utils.privacy import sanitize_outbound
+        from titan_hcl.utils.privacy import sanitize_outbound
         text, count = sanitize_outbound(
             "Email: a@b.com, Phone: 555-111-2222, IP: 10.0.0.1"
         )
@@ -201,14 +201,14 @@ class TestPrivacyFilter:
         assert count >= 3
 
     def test_redaction_count_correct(self):
-        from titan_plugin.utils.privacy import sanitize_outbound
+        from titan_hcl.utils.privacy import sanitize_outbound
         text, count = sanitize_outbound(
             "Emails: a@b.com and c@d.com"
         )
         assert count == 2
 
     def test_selective_patterns(self):
-        from titan_plugin.utils.privacy import sanitize_outbound
+        from titan_hcl.utils.privacy import sanitize_outbound
         # Only apply email pattern — phone should survive
         text, count = sanitize_outbound(
             "Email: a@b.com Phone: 555-111-2222",
@@ -219,7 +219,7 @@ class TestPrivacyFilter:
         assert count == 1
 
     def test_empty_text(self):
-        from titan_plugin.utils.privacy import sanitize_outbound
+        from titan_hcl.utils.privacy import sanitize_outbound
         text, count = sanitize_outbound("")
         assert text == ""
         assert count == 0
@@ -232,7 +232,7 @@ class TestPrivacyFilter:
         except ModuleNotFoundError:
             import toml as tomllib  # type: ignore
         config_path = os.path.join(
-            os.path.dirname(__file__), "..", "titan_plugin", "config.toml"
+            os.path.dirname(__file__), "..", "titan_hcl", "config.toml"
         )
         with open(config_path, "rb") as f:
             config = tomllib.load(f)
@@ -247,7 +247,7 @@ class TestBannerIntegration:
     """Test banner wiring into pre_prompt_hook (mocked subsystems)."""
 
     def _make_plugin_stub(self, banner_enabled=True, banner_style="compact"):
-        """Build a minimal TitanPlugin-like object with mocked subsystems."""
+        """Build a minimal TitanHCL-like object with mocked subsystems."""
 
         class Stub:
             pass
@@ -295,7 +295,7 @@ class TestBannerIntegration:
         return plugin
 
     def test_banner_prepended_when_enabled(self):
-        from titan_plugin.utils.banner import build_banner
+        from titan_hcl.utils.banner import build_banner
 
         plugin = self._make_plugin_stub(banner_enabled=True)
         banner = build_banner(
@@ -332,7 +332,7 @@ class TestMetabolismBalancePct:
 
         soul = Stub()
         network = Stub()
-        from titan_plugin.core.metabolism import MetabolismController
+        from titan_hcl.core.metabolism import MetabolismController
         return MetabolismController(soul, network)
 
     def test_no_balance_returns_negative(self):

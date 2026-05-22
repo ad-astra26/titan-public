@@ -48,13 +48,13 @@ class TestOutputVerifierProxyCore(unittest.TestCase):
         return bus
 
     def test_proxy_subscribes_to_bus_at_construction(self):
-        from titan_plugin.proxies.output_verifier_proxy import OutputVerifierProxy
+        from titan_hcl.proxies.output_verifier_proxy import OutputVerifierProxy
         bus = self._make_bus_mock()
         OutputVerifierProxy(bus)
         bus.subscribe.assert_called_once_with("output_verifier_proxy", reply_only=True)
 
     def test_proxy_default_stats_zero(self):
-        from titan_plugin.proxies.output_verifier_proxy import OutputVerifierProxy
+        from titan_hcl.proxies.output_verifier_proxy import OutputVerifierProxy
         bus = self._make_bus_mock()
         proxy = OutputVerifierProxy(bus)
         self.assertEqual(proxy.sovereignty_score, 0.0)
@@ -62,7 +62,7 @@ class TestOutputVerifierProxyCore(unittest.TestCase):
         self.assertEqual(proxy.rejected_count, 0)
 
     def test_proxy_update_cached_stats(self):
-        from titan_plugin.proxies.output_verifier_proxy import OutputVerifierProxy
+        from titan_hcl.proxies.output_verifier_proxy import OutputVerifierProxy
         bus = self._make_bus_mock()
         proxy = OutputVerifierProxy(bus)
         proxy.update_cached_stats({
@@ -73,8 +73,8 @@ class TestOutputVerifierProxyCore(unittest.TestCase):
         self.assertEqual(proxy.rejected_count, 3)
 
     def test_proxy_verify_and_sign_routes_to_bus(self):
-        from titan_plugin.proxies.output_verifier_proxy import OutputVerifierProxy
-        from titan_plugin.logic.output_verifier import OVGResult
+        from titan_hcl.proxies.output_verifier_proxy import OutputVerifierProxy
+        from titan_hcl.logic.output_verifier import OVGResult
         valid_dict = dataclasses.asdict(OVGResult(
             passed=True, output_text="hi", signature="sig", channel="chat",
         ))
@@ -91,7 +91,7 @@ class TestOutputVerifierProxyCore(unittest.TestCase):
         self.assertEqual(result.signature, "sig")
 
     def test_proxy_verify_and_sign_returns_hard_fail_on_timeout(self):
-        from titan_plugin.proxies.output_verifier_proxy import OutputVerifierProxy
+        from titan_hcl.proxies.output_verifier_proxy import OutputVerifierProxy
         bus = self._make_bus_mock(return_none=True)
         proxy = OutputVerifierProxy(bus)
         result = proxy.verify_and_sign("hi", channel="chat")
@@ -100,7 +100,7 @@ class TestOutputVerifierProxyCore(unittest.TestCase):
         self.assertIsNone(result.signature)
 
     def test_proxy_verify_and_sign_returns_hard_fail_on_worker_error(self):
-        from titan_plugin.proxies.output_verifier_proxy import OutputVerifierProxy
+        from titan_hcl.proxies.output_verifier_proxy import OutputVerifierProxy
         bus = self._make_bus_mock(response_payload={"error": "boom"})
         proxy = OutputVerifierProxy(bus)
         result = proxy.verify_and_sign("hi", channel="chat")
@@ -109,7 +109,7 @@ class TestOutputVerifierProxyCore(unittest.TestCase):
         self.assertIn("boom", result.violations[0])
 
     def test_proxy_get_stats(self):
-        from titan_plugin.proxies.output_verifier_proxy import OutputVerifierProxy
+        from titan_hcl.proxies.output_verifier_proxy import OutputVerifierProxy
         bus = self._make_bus_mock(response_payload={
             "sovereignty_score": 0.92, "verified_count": 100, "rejected_count": 7,
         })
@@ -124,7 +124,7 @@ class TestOutputVerifierWorkerHandler(unittest.TestCase):
 
     def test_worker_handles_verify_and_sign_query(self):
         """Drive the worker loop with a single QUERY, verify it produces RESPONSE."""
-        from titan_plugin.modules.output_verifier_worker import (
+        from titan_hcl.modules.output_verifier_worker import (
             output_verifier_worker_main,
         )
         recv = Queue()
@@ -173,7 +173,7 @@ class TestOutputVerifierWorkerHandler(unittest.TestCase):
         self.assertEqual(body["channel"], "chat")
 
     def test_worker_handles_unknown_action_gracefully(self):
-        from titan_plugin.modules.output_verifier_worker import (
+        from titan_hcl.modules.output_verifier_worker import (
             output_verifier_worker_main,
         )
         recv = Queue()
@@ -205,7 +205,7 @@ class TestOutputVerifierWorkerHandler(unittest.TestCase):
 
     def test_worker_emits_ready_signal_on_boot(self):
         """Worker publishes OUTPUT_VERIFIER_READY once at startup."""
-        from titan_plugin.modules.output_verifier_worker import (
+        from titan_hcl.modules.output_verifier_worker import (
             output_verifier_worker_main,
         )
         recv = Queue()
@@ -238,9 +238,9 @@ class TestPluginFlagRouting(unittest.TestCase):
 
     def test_init_uses_local_when_flag_off(self):
         """When flag is off (default), plugin gets a real OutputVerifier (not proxy)."""
-        from titan_plugin.core.plugin import TitanPlugin
+        from titan_hcl.core.plugin import TitanHCL
         import inspect
-        src = inspect.getsource(TitanPlugin.__init__)
+        src = inspect.getsource(TitanHCL.__init__)
         # Both paths exist in the source.
         self.assertIn("a8_output_verifier_subprocess_enabled", src)
         self.assertIn("OutputVerifierProxy", src)
@@ -249,9 +249,9 @@ class TestPluginFlagRouting(unittest.TestCase):
 
     def test_module_spec_registered_with_flag_aware_autostart(self):
         """Guardian.register is called with name='output_verifier' and autostart bound to flag."""
-        from titan_plugin.core.plugin import TitanPlugin
+        from titan_hcl.core.plugin import TitanHCL
         import inspect
-        src = inspect.getsource(TitanPlugin)
+        src = inspect.getsource(TitanHCL)
         self.assertIn('name="output_verifier"', src)
         self.assertIn('layer="L2"', src)
         self.assertIn("autostart=_ov_subproc_enabled", src)

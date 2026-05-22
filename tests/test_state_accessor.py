@@ -1,24 +1,20 @@
-"""Microkernel v2 Phase A §A.4 (S5 amendment) D3 — TitanStateAccessor unit tests.
+"""
+tests/test_state_accessor.py — TitanStateAccessor surface tests.
 
-Covers the StateAccessor abstraction + cache shims that survived from
-the Apr 25-26 session work:
+Post-Phase-D (D-SPEC-80): the bus-cache → CachedState pipeline is RETIRED.
+Every sub-accessor is SHM-direct per Preamble G18; the legacy CachedState +
+BusSubscriber files no longer exist. These tests cover the
+production-grade contracts left after the retirement:
+  - _CacheGetter empty-default fallback for unenumerated sub-accessors
+  - _CallableValue serialization + await contract
+  - TitanStateAccessor.__getattr__ private/public fallback
+  - _BusShim.publish routes via CommandSender (legacy plugin.bus.publish
+    callsites in api/__init__.py + maker module)
+  - _EventBusShim.emit publishes OBSERVATORY_EVENT
+  - SpiritAccessor SHM-direct typed methods (Phase B Rust canonical slots)
+  - CommandSender.emit + publish
 
-  - _CacheGetter / _CallableValue await contracts (defensive cover for
-    no-parens `await titan_state.X.Y` legacy patterns)
-  - _CacheGetter / _CallableValue serialization safety (no _CallableValue
-    leak into JSON — regression from commit 3dd3ae84 → 019881bf)
-  - TitanStateAccessor.__getattr__ private-attr cache fallback (D2 fix
-    for chat.py reads of plugin._dream_inbox / plugin._current_user_id)
-  - _EventBusShim.emit() wraps in _AwaitableValue (D2 — supports
-    legacy `await plugin.event_bus.emit(...)` callsites in maker.py +
-    webhook.py without rewriting)
-  - _BusShim.publish() routes via CommandSender (D2 — supports legacy
-    plugin.bus.publish(make_msg(...)) in api/__init__.py + maker module)
-  - _BusShim.stats reads bus.stats from cache (kernel snapshot publishes)
-  - SpiritAccessor new typed methods (D1 follow-up — 4 new endpoint paths)
-  - CommandSender.emit() publishes OBSERVATORY_EVENT bus type (D2)
-
-All tests use fake CachedState + fake send_queue — no real bus, shm, or
+All tests use fake send_queue + mocked ShmReaderBank — no real bus, shm, or
 subprocess overhead. Run via:
 
   source test_env/bin/activate
@@ -30,10 +26,9 @@ import json
 
 import pytest
 
-from titan_plugin.api.cached_state import CachedState
-from titan_plugin.api.command_sender import CommandSender
-from titan_plugin.api.shm_reader_bank import ShmReaderBank
-from titan_plugin.api.state_accessor import (
+from titan_hcl.api.command_sender import CommandSender
+from titan_hcl.api.shm_reader_bank import ShmReaderBank
+from titan_hcl.api.state_accessor import (
     SpiritAccessor,
     TitanStateAccessor,
     _AwaitableValue,
@@ -55,23 +50,16 @@ class _FakeQueue:
 
 
 @pytest.fixture
-def cache():
-    c = CachedState()
-    return c
-
-
-@pytest.fixture
 def commands():
     return CommandSender(send_queue=_FakeQueue())
 
 
 @pytest.fixture
-def state(cache, commands):
+def state(commands):
     """Build a TitanStateAccessor with stub deps. ShmReaderBank is bare;
     sub-accessors that touch shm degrade gracefully (return defaults)."""
     return TitanStateAccessor(
         shm=ShmReaderBank(titan_id="TEST"),
-        cache=cache,
         commands=commands,
         full_config={"network": {"vault_program_id": "test_pid"}},
     )
@@ -80,40 +68,38 @@ def state(cache, commands):
 # ── _CacheGetter / _CallableValue serialization + await contracts ─────
 
 
-def test_cache_getter_call_returns_raw_dict_for_json(cache):
-    """_CacheGetter.__call__ must return JSON-serializable raw dict, not
-    a _CallableValue wrapper. Regression test for /v4/metabolic-state
-    (commit 019881bf)."""
-    cache.set("metabolism", {"energy": 0.5})
-    g = _CacheGetter("metabolism", cache)
+def test_cache_getter_call_returns_empty_dict_g18_neutralized():
+    """Phase A.4 / Phase D closure (D-SPEC-71 / D-SPEC-80): _CacheGetter
+    returns empty default per Preamble G18 (state transport is SHM, never
+    bus). The fallback exists only as a backward-compat hedge for
+    unenumerated sub-accessor names."""
+    g = _CacheGetter("metabolism")
     result = g()
     assert isinstance(result, dict)
-    assert result == {"energy": 0.5}
-    # Must JSON-serialize cleanly
+    assert result == {}
     json.dumps(result)
 
 
-def test_cache_getter_call_empty_returns_empty_dict(cache):
+def test_cache_getter_call_empty_returns_empty_dict():
     """Missing key → empty dict, not _CallableValue."""
-    g = _CacheGetter("nonexistent", cache)
+    g = _CacheGetter("nonexistent")
     result = g()
     assert result == {}
     json.dumps(result)
 
 
-def test_cache_getter_await_resolves_to_value(cache):
-    """`await titan_state.X` (no method invocation, no parens) must work."""
-    cache.set("metabolism", {"energy": 0.5})
-    g = _CacheGetter("metabolism", cache)
+def test_cache_getter_await_resolves_to_empty_g18_neutralized():
+    """`await titan_state.X` resolves to empty dict per Preamble G18."""
+    g = _CacheGetter("metabolism")
 
     async def _t():
         return await g
 
     result = asyncio.run(_t())
-    assert result == {"energy": 0.5}
+    assert result == {}
 
 
-def test_callable_value_await_resolves_to_inner(cache):
+def test_callable_value_await_resolves_to_inner():
     """`await _CallableValue(x)` resolves to x — defensive cover for
     legacy `await titan_state.X.Y` (no parens)."""
     cv = _CallableValue({"a": 1})
@@ -125,7 +111,7 @@ def test_callable_value_await_resolves_to_inner(cache):
     assert result == {"a": 1}
 
 
-def test_callable_value_call_returns_inner_for_json(cache):
+def test_callable_value_call_returns_inner_for_json():
     """`titan_state.X.Y()` returns raw inner value, not wrapped — endpoints
     that JSON-serialize must not see _CallableValue leaks."""
     cv = _CallableValue([1, 2, 3])
@@ -134,25 +120,17 @@ def test_callable_value_call_returns_inner_for_json(cache):
     json.dumps(result)
 
 
-# ── TitanStateAccessor.__getattr__ private fallback (D2) ──────────────
+# ── TitanStateAccessor.__getattr__ fallback (Phase D) ─────────────────
 
 
-def test_titan_state_private_attr_falls_back_to_cache(state, cache):
-    """plugin._dream_inbox → cache.get('plugin._dream_inbox', None) — D2
-    fix for chat.py reads in microkernel mode."""
-    cache.set("plugin._dream_inbox", ["msg1", "msg2", "msg3"])
-    assert state._dream_inbox == ["msg1", "msg2", "msg3"]
-
-
-def test_titan_state_private_attr_missing_raises_attributeerror(state):
-    """Missing private cache key raises AttributeError so hasattr() returns
+def test_titan_state_private_attr_raises_attributeerror(state):
+    """Missing private attribute raises AttributeError so hasattr() returns
     False — preserves legacy mode-detection patterns like
-    `if hasattr(plugin, '_proxies')`. (D2 v2 — original always-return-None
-    broke /v3/trinity warmer detection, caused str-float crash.)"""
+    `if hasattr(plugin, '_proxies')`. (Phase D retired the cache fallback;
+    private names now always AttributeError.)"""
     with pytest.raises(AttributeError):
         _ = state._never_published_attr
     assert hasattr(state, "_never_published_attr") is False
-    # getattr with default still works for callers that want None
     assert getattr(state, "_never_published_attr", "DEFAULT") == "DEFAULT"
 
 
@@ -162,7 +140,7 @@ def test_titan_state_public_unknown_attr_returns_cache_getter(state):
     assert isinstance(result, _CacheGetter)
 
 
-# ── _EventBusShim — D2 maker.py + webhook.py compat ───────────────────
+# ── _EventBusShim — maker.py + webhook.py compat ──────────────────────
 
 
 def test_event_bus_shim_emit_publishes_observatory_event(commands):
@@ -187,22 +165,22 @@ def test_event_bus_shim_emit_is_awaitable(commands):
         return rid
 
     result = asyncio.run(_t())
-    assert isinstance(result, str)  # request_id from CommandSender.publish
+    assert isinstance(result, str)
 
 
 def test_event_bus_shim_subscriber_count(commands):
     eb = _EventBusShim(commands)
-    assert eb.subscriber_count == 0  # microkernel: api_subprocess-managed
+    assert eb.subscriber_count == 0
 
 
-# ── _BusShim — D2 api/__init__.py + maker module compat ───────────────
+# ── _BusShim — api/__init__.py + maker module compat ──────────────────
 
 
 def test_bus_shim_publish_routes_msg_dict(commands):
     """plugin.bus.publish(make_msg(...)) → CommandSender.publish."""
-    from titan_plugin.bus import make_msg
+    from titan_hcl.bus import make_msg
 
-    bus = _BusShim(commands, CachedState())
+    bus = _BusShim(commands)
     msg = make_msg("MAKER_PROPOSAL_CREATED", "titan_maker", "all",
                    {"proposal_id": "p1"})
     delivered = bus.publish(msg)
@@ -214,103 +192,80 @@ def test_bus_shim_publish_routes_msg_dict(commands):
 
 
 def test_bus_shim_publish_invalid_returns_zero(commands):
-    bus = _BusShim(commands, CachedState())
+    bus = _BusShim(commands)
     assert bus.publish(None) == 0
     assert bus.publish("not a dict") == 0
 
 
-def test_bus_shim_stats_reads_from_cache(commands):
-    cache = CachedState()
-    cache.set("bus.stats", {"published": 100, "dropped": 0, "routed": 95})
-    bus = _BusShim(commands, cache)
-    stats = bus.stats
-    assert stats == {"published": 100, "dropped": 0, "routed": 95}
-
-
-def test_bus_shim_stats_empty_when_no_cache(commands):
-    bus = _BusShim(commands, CachedState())
+def test_bus_shim_stats_empty_dict(commands):
+    """Phase A.4 / D closure: _BusShim.stats returns empty dict per
+    Preamble G18. Canonical bus stats come from kernel_rpc proxy at
+    `app.state.titan_hcl.kernel.bus_broker_stats()` per
+    dashboard.py /v4/state."""
+    bus = _BusShim(commands)
     assert bus.stats == {}
 
 
 def test_bus_shim_truthy(commands):
     """if plugin.bus: should pass even on empty cache."""
-    bus = _BusShim(commands, CachedState())
+    bus = _BusShim(commands)
     assert bool(bus) is True
     assert bus is not None
 
 
-# ── SpiritAccessor new typed methods (D1 follow-up) ───────────────────
+# ── SpiritAccessor SHM-direct typed methods (Phase B Rust canonical) ─
 
 
-def test_spirit_accessor_get_nervous_system_reads_cache(cache):
-    """SpiritAccessor.get_nervous_system → cache.get('spirit.neural_nervous_system')."""
-    cache.set("spirit.neural_nervous_system",
-              {"version": "v5_neural", "total_transitions": 14_000_000})
-    spirit = SpiritAccessor(shm=ShmReaderBank(titan_id="TEST"), cache=cache)
+def test_spirit_accessor_get_nervous_system_reads_shm():
+    """Phase B.5: SpiritAccessor.get_nervous_system reads SHM-direct via
+    ShmReaderBank.read_titanvm_registers() (ns_worker L2 publisher;
+    titanvm_registers.bin slot)."""
+    from unittest.mock import MagicMock
+    expected = {"version": "v5_neural", "total_transitions": 14_000_000}
+    shm = MagicMock(spec=ShmReaderBank)
+    shm.read_titanvm_registers.return_value = expected
+    spirit = SpiritAccessor(shm=shm)
     result = spirit.get_nervous_system()
     assert result["version"] == "v5_neural"
     assert result["total_transitions"] == 14_000_000
 
 
-def test_spirit_accessor_get_expression_composites_reads_cache(cache):
-    cache.set("spirit.expression_composites",
-              {"SPEAK": {"urge": 0.5, "fire_count": 7}})
-    spirit = SpiritAccessor(shm=ShmReaderBank(titan_id="TEST"), cache=cache)
+def test_spirit_accessor_get_expression_composites_reads_shm():
+    """Phase A.3: get_expression_composites reads SHM-direct via
+    ShmReaderBank.read_expression_state()."""
+    from unittest.mock import MagicMock
+    expected = {"SPEAK": {"urge": 0.5, "fire_count": 7}}
+    shm = MagicMock(spec=ShmReaderBank)
+    shm.read_expression_state.return_value = expected
+    spirit = SpiritAccessor(shm=shm)
     result = spirit.get_expression_composites()
     assert result["SPEAK"]["urge"] == 0.5
+    assert result["SPEAK"]["fire_count"] == 7
 
 
-def test_spirit_accessor_get_unified_spirit_reads_cache(cache):
-    cache.set("spirit.unified_spirit", {"epoch_count": 1040, "magnitude": 5.72})
-    spirit = SpiritAccessor(shm=ShmReaderBank(titan_id="TEST"), cache=cache)
+def test_spirit_accessor_get_unified_spirit_reads_shm():
+    """Phase B.5: SpiritAccessor.get_unified_spirit reads SHM-direct via
+    ShmReaderBank.read_unified_spirit_metadata() (Rust-owned
+    unified_spirit_metadata.bin slot, Python→Rust ownership flipped at B.0)."""
+    from unittest.mock import MagicMock
+    expected = {"epoch_count": 1040, "tensor_magnitude": 5.72}
+    shm = MagicMock(spec=ShmReaderBank)
+    shm.read_unified_spirit_metadata.return_value = expected
+    spirit = SpiritAccessor(shm=shm)
     result = spirit.get_unified_spirit()
     assert result["epoch_count"] == 1040
 
 
-def test_spirit_accessor_missing_keys_return_empty_dict(cache):
-    """All new typed methods return {} when cache key missing — never crash."""
-    spirit = SpiritAccessor(shm=ShmReaderBank(titan_id="TEST"), cache=cache)
+def test_spirit_accessor_missing_keys_return_empty_dict():
+    """All typed methods return {} when SHM slot empty/missing — never crash."""
+    spirit = SpiritAccessor(shm=ShmReaderBank(titan_id="TEST"))
     assert spirit.get_nervous_system() == {}
     assert spirit.get_expression_composites() == {}
     assert spirit.get_resonance() == {}
     assert spirit.get_unified_spirit() == {}
 
 
-# ── CachedState diagnostic surface (powers /v4/cache-staleness) ───────
-
-
-def test_cached_state_staleness_report_per_key():
-    """staleness_report() returns per-key age — what /v4/cache-staleness
-    serializes."""
-    import time
-
-    c = CachedState()
-    c.set("key1", "v1")
-    time.sleep(0.05)
-    c.set("key2", "v2")
-    report = c.staleness_report()
-    assert "key1" in report
-    assert "key2" in report
-    assert report["key1"] >= report["key2"]  # key1 older
-
-
-def test_cached_state_get_with_age_returns_age_for_present_key():
-    c = CachedState()
-    c.set("k", "v")
-    val, age = c.get_with_age("k")
-    assert val == "v"
-    assert age is not None
-    assert age >= 0
-
-
-def test_cached_state_get_with_age_returns_none_for_missing():
-    c = CachedState()
-    val, age = c.get_with_age("missing", default="dflt")
-    assert val == "dflt"
-    assert age is None
-
-
-# ── CommandSender — D2 emit() addition ────────────────────────────────
+# ── CommandSender ─────────────────────────────────────────────────────
 
 
 def test_command_sender_emit_routes_observatory_event(commands):

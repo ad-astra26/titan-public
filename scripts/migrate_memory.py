@@ -43,7 +43,7 @@ def migrate_sqlite_to_duckdb():
         logger.error("SQLite DB not found: %s", SQLITE_PATH)
         return 0, 0
 
-    from titan_plugin.core.direct_memory import TitanDuckDB
+    from titan_hcl.core.direct_memory import TitanDuckDB
 
     # Check if DuckDB already has data
     db = TitanDuckDB(DUCKDB_PATH)
@@ -81,7 +81,7 @@ def migrate_sqlite_to_duckdb():
 
 def embed_persistent_nodes():
     """Step 2: Re-embed all persistent nodes into FAISS index."""
-    from titan_plugin.core.direct_memory import TitanDuckDB, TitanVectorIndex
+    from titan_hcl.core.direct_memory import TitanDuckDB, TitanVectorIndex
 
     db = TitanDuckDB(DUCKDB_PATH)
     vi = TitanVectorIndex(FAISS_PATH)
@@ -140,7 +140,7 @@ def cognify_to_kuzu():
     """
     import asyncio
     import duckdb
-    from titan_plugin.core.direct_memory import TitanKnowledgeGraph, TitanCognify
+    from titan_hcl.core.direct_memory import TitanKnowledgeGraph, TitanCognify
 
     # Track which nodes we've already cognified (survives interruptions)
     cognify_done_path = os.path.join(DATA_DIR, "cognify_done_ids.json")
@@ -185,15 +185,15 @@ def cognify_to_kuzu():
 
     # Initialize LLM client
     try:
-        from titan_plugin.utils.ollama_cloud import OllamaCloudClient
-        config_path = os.path.join(os.path.dirname(__file__), "..", "titan_plugin", "config.toml")
+        from titan_hcl.inference import get_provider
+        config_path = os.path.join(os.path.dirname(__file__), "..", "titan_hcl", "config.toml")
         import tomllib
         with open(config_path, "rb") as f:
             config = tomllib.load(f)
         inference_cfg = config.get("inference", {})
         api_key = inference_cfg.get("ollama_cloud_api_key", "")
         base_url = inference_cfg.get("ollama_cloud_url", "https://ollama.com/v1")
-        llm = OllamaCloudClient(api_key=api_key, base_url=base_url)
+        llm = get_provider("ollama_cloud", {"ollama_cloud_api_key": api_key, "ollama_cloud_base_url": base_url})
         logger.info("Ollama Cloud client initialized: %s", base_url)
     except Exception as e:
         logger.error("Failed to initialize LLM client: %s", e)
@@ -299,7 +299,7 @@ def cognify_to_kuzu():
 
 def verify_migration():
     """Step 3: Verify counts and search quality."""
-    from titan_plugin.core.direct_memory import TitanDuckDB, TitanVectorIndex, TitanKnowledgeGraph
+    from titan_hcl.core.direct_memory import TitanDuckDB, TitanVectorIndex, TitanKnowledgeGraph
 
     print("\n" + "=" * 60)
     print("  MIGRATION VERIFICATION")

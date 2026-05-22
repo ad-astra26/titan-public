@@ -6,7 +6,7 @@ Mocks TwitterAPI.io v2 endpoints and verifies session recovery + media flow.
 import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
-from titan_plugin.expressive.social import SocialManager
+from titan_hcl.expressive.social import SocialManager
 
 @pytest.fixture
 def mock_metabolism():

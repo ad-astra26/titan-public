@@ -1,7 +1,7 @@
 """Unit tests for /v4/search-pipeline/* endpoints (KP-5).
 
 Uses FastAPI TestClient with a mounted dashboard router and a stub
-titan_plugin providing .bus.publish(). Filesystem paths point to a tmp
+titan_hcl providing .bus.publish(). Filesystem paths point to a tmp
 directory so tests don't touch live data.
 """
 
@@ -15,10 +15,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from titan_plugin.api.dashboard import router as dashboard_router
-from titan_plugin.logic.knowledge_cache import KnowledgeCache
-from titan_plugin.logic.knowledge_health import HealthTracker
-from titan_plugin.logic.knowledge_router import QueryType
+from titan_hcl.api.dashboard import router as dashboard_router
+from titan_hcl.logic.knowledge_cache import KnowledgeCache
+from titan_hcl.logic.knowledge_health import HealthTracker
+from titan_hcl.logic.knowledge_router import QueryType
 
 
 @pytest.fixture
@@ -63,11 +63,18 @@ def app_client(monkeypatch):
         # Build app
         app = FastAPI()
         app.include_router(dashboard_router)
+        # Phase E: mount the v6 roof + legacy /v3,/v4→/v6 redirects so
+        # deprecated paths resolve via 301/308 to the live v6 handler.
+        from titan_hcl.api.v6 import router as _v6_router
+        from titan_hcl.api.v6_deprecation import router as _v6_dep_router
+        app.include_router(_v6_router)
+        app.include_router(_v6_dep_router)
         # Stub plugin for budget-reset endpoint
         plugin = MagicMock()
         plugin.bus = MagicMock()
         plugin.bus.publish = MagicMock()
-        app.state.titan_plugin = plugin
+        app.state.titan_hcl = plugin
+        app.state.titan_state = plugin
 
         with TestClient(app) as client:
             try:
@@ -99,7 +106,15 @@ class TestPipelineHealth:
         monkeypatch.chdir(tmp_path)
         app = FastAPI()
         app.include_router(dashboard_router)
-        app.state.titan_plugin = MagicMock()
+        # Phase E: mount the v6 roof + legacy /v3,/v4→/v6 redirects so
+        # deprecated paths resolve via 301/308 to the live v6 handler.
+        from titan_hcl.api.v6 import router as _v6_router
+        from titan_hcl.api.v6_deprecation import router as _v6_dep_router
+        app.include_router(_v6_router)
+        app.include_router(_v6_dep_router)
+        _sp_mock = MagicMock()
+        app.state.titan_hcl = _sp_mock
+        app.state.titan_state = _sp_mock
         with TestClient(app) as client:
             resp = client.get("/v4/search-pipeline/health")
         assert resp.status_code == 200

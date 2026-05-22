@@ -23,7 +23,7 @@ import pytest
 
 def test_emit_chain_outcome_insight_accepts_reasoning_strategy_consumer():
     """Module-level helper accepts the 3 new consumer names."""
-    from titan_plugin.logic.cgn_consumer_client import emit_chain_outcome_insight
+    from titan_hcl.logic.cgn_consumer_client import emit_chain_outcome_insight
     import queue
 
     for consumer in ("reasoning_strategy", "self_model", "reasoning"):
@@ -41,7 +41,7 @@ def test_emit_chain_outcome_insight_accepts_reasoning_strategy_consumer():
 
 def test_emit_chain_outcome_insight_filters_non_informative_rewards():
     """Rewards near 0.5 (|r - 0.5| <= 0.3) are filtered as non-informative."""
-    from titan_plugin.logic.cgn_consumer_client import (
+    from titan_hcl.logic.cgn_consumer_client import (
         emit_chain_outcome_insight, _PEER_CROSS_INSIGHT_RATE_STATE)
     import queue
 
@@ -61,30 +61,24 @@ def test_emit_chain_outcome_insight_filters_non_informative_rewards():
     assert result is True
 
 
-def test_bug3_wire_points_exist_in_source():
-    """Every BUG #3 Phase C §23.1 wire point has a reference comment +
-    an emit_chain_outcome_insight invocation. Static check ensures the
-    fixes are preserved across refactors."""
-    from pathlib import Path
-    src = (Path(__file__).parent.parent
-           / "titan_plugin" / "modules" / "spirit_worker.py").read_text()
-
-    # BUG #3 reference markers must all appear
-    bug3_markers = src.count("BUG #3 Phase C §23.1")
-    assert bug3_markers >= 5, \
-        f"Expected >=5 BUG #3 Phase C wire points, found {bug3_markers}"
-
-    # Each of the 3 consumer names must appear in an emit_chain_outcome_insight context
-    # (check for adjacency — the consumer_name arg follows "name,")
-    assert '"reasoning_strategy",' in src
-    assert '"self_model",' in src
-    assert '"reasoning",' in src
+def test_bug3_wire_points_migrated_off_deleted_spirit_worker():
+    """D-SPEC-116: the BUG #3 §23.1 wire points were source-comment markers
+    inside spirit_worker.py, now DELETED. The capability (emit_chain_outcome_
+    insight) migrated with the engines and lives in knowledge_worker +
+    language_worker; behavior is covered by the test_emit_chain_outcome_insight_*
+    tests in this file. The obsolete source-grep on spirit_worker.py is retired."""
+    import importlib.util
+    import inspect
+    assert importlib.util.find_spec("titan_hcl.modules.spirit_worker") is None
+    from titan_hcl.modules import knowledge_worker, language_worker
+    assert ("emit_chain_outcome_insight" in inspect.getsource(knowledge_worker)
+            or "emit_chain_outcome_insight" in inspect.getsource(language_worker))
 
 
 def test_emit_chain_outcome_insight_negative_rewards_pass_informative_filter():
     """Negative rewards (like self_model's -0.1 miss) need to pass the
     informative filter too. |(-0.1) - 0.5| = 0.6 > 0.3 → informative."""
-    from titan_plugin.logic.cgn_consumer_client import (
+    from titan_hcl.logic.cgn_consumer_client import (
         emit_chain_outcome_insight, _PEER_CROSS_INSIGHT_RATE_STATE)
     import queue
 

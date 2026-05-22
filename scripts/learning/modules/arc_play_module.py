@@ -22,7 +22,7 @@ import numpy as np
 
 logger = logging.getLogger("testsuite.arc_play")
 
-# ARC module lives in titan_plugin
+# ARC module lives in titan_hcl
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))))))
 
@@ -83,11 +83,11 @@ class ArcPlayModule:
         t0 = time.time()
 
         try:
-            from titan_plugin.logic.arc import (
+            from titan_hcl.logic.arc import (
                 ArcSDKBridge, GridPerception, ActionMapper,
                 ArcSession, StateActionMemory,
             )
-            from titan_plugin.logic.neural_reflex_net import NeuralReflexNet
+            from titan_hcl.logic.neural_reflex_net import NeuralReflexNet
         except ImportError as e:
             return self._result(t0, success=False, error=f"import: {e}")
 
@@ -153,10 +153,10 @@ class ArcPlayModule:
                 import tomllib
             except ImportError:
                 import tomli as tomllib
-            params_path = os.path.join(os.path.dirname(ARC_DATA_DIR), "titan_plugin", "titan_params.toml")
+            params_path = os.path.join(os.path.dirname(ARC_DATA_DIR), "titan_hcl", "titan_params.toml")
             if not os.path.exists(params_path):
                 params_path = os.path.join(os.path.dirname(os.path.dirname(ARC_DATA_DIR)),
-                                           "titan_plugin", "titan_params.toml")
+                                           "titan_hcl", "titan_params.toml")
             if os.path.exists(params_path):
                 with open(params_path, "rb") as f:
                     arc_cfg = tomllib.load(f).get("arc_agi_3", {})
@@ -203,7 +203,7 @@ class ArcPlayModule:
 
         # ── Forward Model (Phase A1): action-effect prediction ──────────
         try:
-            from titan_plugin.logic.arc.forward_model import ForwardModel
+            from titan_hcl.logic.arc.forward_model import ForwardModel
             fm = ForwardModel(feature_dim=30, num_actions=7, learning_rate=0.001)
             fm_path = os.path.join(ARC_DATA_DIR, f"{game_id}_forward_model.json")
             fm.load(fm_path)
@@ -219,7 +219,7 @@ class ArcPlayModule:
         # ARC uses CGNConsumerClient for local forward pass + sends transitions via API.
         cgn = None
         try:
-            from titan_plugin.logic.cgn_consumer_client import CGNConsumerClient
+            from titan_hcl.logic.cgn_consumer_client import CGNConsumerClient
             _project_root = os.path.dirname(os.path.dirname(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
             cgn = CGNConsumerClient(

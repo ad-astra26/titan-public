@@ -1,7 +1,7 @@
 """Tests for the Dual-Layer Inner Memory System (Phase M)."""
 import time
 import pytest
-from titan_plugin.logic.inner_memory import InnerMemoryStore
+from titan_hcl.logic.inner_memory import InnerMemoryStore
 
 
 @pytest.fixture

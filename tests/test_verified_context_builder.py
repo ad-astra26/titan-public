@@ -3,7 +3,7 @@
 import time
 import pytest
 from unittest.mock import MagicMock, patch
-from titan_plugin.logic.verified_context_builder import (
+from titan_hcl.logic.verified_context_builder import (
     QueryParser, StoreRouter, VerifiedContextBuilder, ParsedQuery, VerifiedContext,
 )
 

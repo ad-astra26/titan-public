@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from titan_plugin.core import shadow_protocol as sp
+from titan_hcl.core import shadow_protocol as sp
 
 
 def _make_minimal_kernel(
@@ -32,7 +32,7 @@ def _make_minimal_kernel(
     + registers shm writers, all of which require disk/secrets/network.
     Instead we manufacture the minimal duck-type the hibernate methods need.
     """
-    from titan_plugin.core.kernel import TitanKernel
+    from titan_hcl.core.kernel import TitanKernel
 
     kernel = TitanKernel.__new__(TitanKernel)
     kernel._titan_id = titan_id
@@ -246,7 +246,7 @@ class TestKernelVersion:
         assert kernel._kernel_version_cache == "abc12345"
 
     def test_falls_back_to_unknown_if_not_cached_and_git_fails(self, monkeypatch):
-        from titan_plugin.core.kernel import TitanKernel
+        from titan_hcl.core.kernel import TitanKernel
         kernel = TitanKernel.__new__(TitanKernel)
         # Don't pre-set _kernel_version_cache — force the live lookup
         kernel._kernel_version_cache = None

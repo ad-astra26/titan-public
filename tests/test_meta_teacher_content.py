@@ -1,4 +1,4 @@
-"""Tests for titan_plugin.logic.meta_teacher_content — Phase A of
+"""Tests for titan_hcl.logic.meta_teacher_content — Phase A of
 rFP_meta_teacher_v2_content_awareness_memory.md.
 
 Covers:
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from titan_plugin.logic.meta_teacher_content import (
+from titan_hcl.logic.meta_teacher_content import (
     build_step_arguments,
     build_teacher_outer_summary,
     render_chain_content_prompt_section,
@@ -372,12 +372,12 @@ class TestUserPromptWithContent:
         return base
 
     def test_legacy_payload_no_chain_content_section(self):
-        from titan_plugin.logic.meta_teacher_prompts import build_user_prompt
+        from titan_hcl.logic.meta_teacher_prompts import build_user_prompt
         text = build_user_prompt(self._base_payload())
         assert "Chain content:" not in text
 
     def test_with_outer_summary_includes_chain_content(self):
-        from titan_plugin.logic.meta_teacher_prompts import build_user_prompt
+        from titan_hcl.logic.meta_teacher_prompts import build_user_prompt
         payload = self._base_payload(
             outer_summary={
                 "primary_person": "@jkacrpto",
@@ -399,7 +399,7 @@ class TestUserPromptWithContent:
         assert "NOT USED" in text
 
     def test_step_arguments_only_still_renders(self):
-        from titan_plugin.logic.meta_teacher_prompts import build_user_prompt
+        from titan_hcl.logic.meta_teacher_prompts import build_user_prompt
         payload = self._base_payload(
             step_arguments=[
                 {"step": 0, "primitive": "FORMULATE", "sub_mode": "goal",

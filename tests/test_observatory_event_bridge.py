@@ -15,8 +15,8 @@ the correct (event_type, data) args.
 
 Reference:
   - titan-docs/PLAN_microkernel_phase_a_s5.md §5.3
-  - titan_plugin/api/api_subprocess.py:_bus_listener_loop
-  - titan_plugin/bus.py:OBSERVATORY_EVENT
+  - titan_hcl/api/api_subprocess.py:_bus_listener_loop
+  - titan_hcl/bus.py:OBSERVATORY_EVENT
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from queue import Queue, Empty
 
 import pytest
 
-from titan_plugin.bus import OBSERVATORY_EVENT, make_msg
+from titan_hcl.bus import OBSERVATORY_EVENT, make_msg
 
 
 def test_observatory_event_constant_registered():
@@ -51,7 +51,7 @@ def test_make_msg_with_observatory_event():
 def test_bridge_translation_logic():
     """Simulate the api_subprocess bus_listener_loop translation:
     OBSERVATORY_EVENT bus message → event_bus.emit(type, data)."""
-    from titan_plugin.api.events import EventBus
+    from titan_hcl.api.events import EventBus
 
     event_bus = EventBus()
     captured = []

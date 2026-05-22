@@ -11,7 +11,7 @@ class TestDecompose:
     """Test DECOMPOSE primitive — grid → connected components."""
 
     def setup_method(self):
-        from titan_plugin.logic.mini_reasoning import MiniReasoningEngine
+        from titan_hcl.logic.mini_reasoning import MiniReasoningEngine
         self.engine = MiniReasoningEngine()
 
     def test_empty_grid(self):
@@ -56,7 +56,7 @@ class TestFilter:
     """Test FILTER primitive — what changed between steps."""
 
     def setup_method(self):
-        from titan_plugin.logic.mini_reasoning import MiniReasoningEngine
+        from titan_hcl.logic.mini_reasoning import MiniReasoningEngine
         self.engine = MiniReasoningEngine()
 
     def test_no_change(self):
@@ -94,7 +94,7 @@ class TestSurprise:
     """Test surprise signal computation."""
 
     def setup_method(self):
-        from titan_plugin.logic.mini_reasoning import MiniReasoningEngine, ActionEffect
+        from titan_hcl.logic.mini_reasoning import MiniReasoningEngine, ActionEffect
         self.engine = MiniReasoningEngine()
         self.ActionEffect = ActionEffect
 
@@ -135,7 +135,7 @@ class TestCausalMemory:
     """Test action-effect causal memory."""
 
     def setup_method(self):
-        from titan_plugin.logic.mini_reasoning import MiniReasoningEngine, ActionEffect
+        from titan_hcl.logic.mini_reasoning import MiniReasoningEngine, ActionEffect
         self.engine = MiniReasoningEngine()
         self.ActionEffect = ActionEffect
 
@@ -169,7 +169,7 @@ class TestTrendWindow:
     """Test pattern trend tracking."""
 
     def setup_method(self):
-        from titan_plugin.logic.mini_reasoning import MiniReasoningEngine
+        from titan_hcl.logic.mini_reasoning import MiniReasoningEngine
         self.engine = MiniReasoningEngine(trend_window=9)
 
     def test_rising_trend(self):
@@ -195,8 +195,8 @@ class TestProcessStep:
     """Test full mini-reasoning pipeline."""
 
     def setup_method(self):
-        from titan_plugin.logic.mini_reasoning import MiniReasoningEngine
-        from titan_plugin.logic.pattern_primitives import PatternPrimitives
+        from titan_hcl.logic.mini_reasoning import MiniReasoningEngine
+        from titan_hcl.logic.pattern_primitives import PatternPrimitives
         self.engine = MiniReasoningEngine()
         self.pp = PatternPrimitives()
 
@@ -232,7 +232,7 @@ class TestPatternPrimitives:
     """Test pattern detection on synthetic grids."""
 
     def setup_method(self):
-        from titan_plugin.logic.pattern_primitives import PatternPrimitives
+        from titan_hcl.logic.pattern_primitives import PatternPrimitives
         self.pp = PatternPrimitives()
 
     def test_symmetric_grid(self):
@@ -314,8 +314,8 @@ class TestIntegration:
     """Test mini-reasoning + pattern primitives working together."""
 
     def setup_method(self):
-        from titan_plugin.logic.mini_reasoning import MiniReasoningEngine
-        from titan_plugin.logic.pattern_primitives import PatternPrimitives
+        from titan_hcl.logic.mini_reasoning import MiniReasoningEngine
+        from titan_hcl.logic.pattern_primitives import PatternPrimitives
         self.engine = MiniReasoningEngine()
         self.pp = PatternPrimitives()
 

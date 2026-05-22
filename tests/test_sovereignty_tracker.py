@@ -16,8 +16,8 @@ import os
 import tempfile
 import pytest
 
-from titan_plugin.logic import sovereignty as sov_module
-from titan_plugin.logic.sovereignty import SovereigntyTracker
+from titan_hcl.logic import sovereignty as sov_module
+from titan_hcl.logic.sovereignty import SovereigntyTracker
 
 
 @pytest.fixture

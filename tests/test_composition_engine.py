@@ -1,8 +1,8 @@
 """Tests for Word Selector and Composition Engine — felt-state language."""
 import pytest
 
-from titan_plugin.logic.word_selector import WordSelector, _cosine_sim
-from titan_plugin.logic.composition_engine import CompositionEngine
+from titan_hcl.logic.word_selector import WordSelector, _cosine_sim
+from titan_hcl.logic.composition_engine import CompositionEngine
 
 
 def _word(name, word_type, confidence=0.5, felt_tensor=None, hormone_pattern=None):

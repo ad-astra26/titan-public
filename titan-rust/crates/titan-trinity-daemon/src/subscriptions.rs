@@ -36,6 +36,9 @@ pub const INNER_BODY_TOPICS: &[&str] = &[
     "UNIFIED_SPIRIT_FILTER_DOWN",
     "INNER_SPIRIT_FILTER_DOWN",
     "TRINITY_SUBSTRATE_TOPOLOGY_UPDATED",
+    // Phase 0 / 0E (D-SPEC-97 refinement): ground_up nudge is RECOMPUTED
+    // once per kernel epoch (held + applied per Schumann tick), NOT per tick.
+    "KERNEL_EPOCH_TICK",
 ];
 
 /// SPEC §9.A REQUIRED bus subscriptions for `titan-inner-mind-rs`.
@@ -44,13 +47,20 @@ pub const INNER_MIND_TOPICS: &[&str] = &[
     "UNIFIED_SPIRIT_FILTER_DOWN",
     "INNER_SPIRIT_FILTER_DOWN",
     "TRINITY_SUBSTRATE_TOPOLOGY_UPDATED",
+    // Phase 0 / 0E: ground_up nudge recomputed per kernel epoch.
+    "KERNEL_EPOCH_TICK",
 ];
 
 /// SPEC §9.A REQUIRED bus subscriptions for `titan-inner-spirit-rs`.
 /// Inner-spirit does NOT subscribe to topology (it's the Observer of
 /// inner_body / inner_mind sibling slots; no ground_up applied to spirit).
-pub const INNER_SPIRIT_TOPICS: &[&str] =
-    &["KERNEL_SHUTDOWN_ANNOUNCE", "UNIFIED_SPIRIT_FILTER_DOWN"];
+pub const INNER_SPIRIT_TOPICS: &[&str] = &[
+    "KERNEL_SHUTDOWN_ANNOUNCE",
+    "UNIFIED_SPIRIT_FILTER_DOWN",
+    // Phase 0 / D-SPEC-97: small filter_down fires once per kernel epoch
+    // (Rust-native), NOT per Schumann tick.
+    "KERNEL_EPOCH_TICK",
+];
 
 /// SPEC §9.A REQUIRED bus subscriptions for `titan-outer-body-rs`.
 /// Provided here for C-S6 reuse (the inner trinity daemons consume the
@@ -60,6 +70,8 @@ pub const OUTER_BODY_TOPICS: &[&str] = &[
     "UNIFIED_SPIRIT_FILTER_DOWN",
     "OUTER_SPIRIT_FILTER_DOWN",
     "TRINITY_SUBSTRATE_TOPOLOGY_UPDATED",
+    // Phase 0 / 0E: ground_up nudge recomputed per kernel epoch.
+    "KERNEL_EPOCH_TICK",
 ];
 
 /// SPEC §9.A REQUIRED bus subscriptions for `titan-outer-mind-rs`.
@@ -68,11 +80,18 @@ pub const OUTER_MIND_TOPICS: &[&str] = &[
     "UNIFIED_SPIRIT_FILTER_DOWN",
     "OUTER_SPIRIT_FILTER_DOWN",
     "TRINITY_SUBSTRATE_TOPOLOGY_UPDATED",
+    // Phase 0 / 0E: ground_up nudge recomputed per kernel epoch.
+    "KERNEL_EPOCH_TICK",
 ];
 
 /// SPEC §9.A REQUIRED bus subscriptions for `titan-outer-spirit-rs`.
-pub const OUTER_SPIRIT_TOPICS: &[&str] =
-    &["KERNEL_SHUTDOWN_ANNOUNCE", "UNIFIED_SPIRIT_FILTER_DOWN"];
+pub const OUTER_SPIRIT_TOPICS: &[&str] = &[
+    "KERNEL_SHUTDOWN_ANNOUNCE",
+    "UNIFIED_SPIRIT_FILTER_DOWN",
+    // Phase 0 / D-SPEC-97: small filter_down fires once per kernel epoch
+    // (Rust-native), NOT per Schumann tick.
+    "KERNEL_EPOCH_TICK",
+];
 
 /// Connect a daemon to the main bus + subscribe to its REQUIRED topics
 /// in one call.
@@ -110,18 +129,24 @@ pub struct InnerFilterDownPayload {
     pub ts: f64,
 }
 
-/// Decode an UNIFIED_SPIRIT_FILTER_DOWN msgpack payload to typed inner
+/// Decode an UNIFIED_SPIRIT_FILTER_DOWN structured payload to typed inner
 /// multipliers. Outer fields + event_id are ignored at the inner daemon
 /// boundary.
+///
+/// Per SPEC §8.2 line 789 + §8.10 line 900, the envelope `payload` field is a
+/// structured Value (Map per SPEC §8.6 schema) — NOT an opaque Binary blob.
+/// Callers use `titan_bus::client::extract_payload` to obtain the Value from
+/// the envelope, then pass it here. Closure of the pre-2026-05-13 parity gap:
+/// `rFP_worker_broadcast_topics_completion §4.C-ter` (2026-05-13).
 ///
 /// Returns Err on schema drift (missing keys, wrong array lengths,
 /// non-numeric multipliers). The inner daemon falls back to neutral
 /// multipliers (all 1.0) on Err per defensive design.
-pub fn decode_filter_down_payload(payload: &[u8]) -> Result<InnerFilterDownPayload, DaemonError> {
+pub fn decode_filter_down_payload(
+    payload: &rmpv::Value,
+) -> Result<InnerFilterDownPayload, DaemonError> {
     use rmpv::Value;
-    let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(payload))
-        .map_err(|e| DaemonError::MsgpackDecode(format!("payload root: {e}")))?;
-    let map = match &v {
+    let map = match payload {
         Value::Map(items) => items,
         _ => return Err(DaemonError::MsgpackDecode("payload not a map".into())),
     };
@@ -197,13 +222,15 @@ pub struct LocalFilterDownPayload {
 
 /// Decode an INNER_SPIRIT_FILTER_DOWN (or OUTER_SPIRIT_FILTER_DOWN) payload.
 /// Used by inner-body + inner-mind daemons (and outer counterparts in C-S6).
+///
+/// Per SPEC §8.2 line 789 + §8.10 line 900: structured `rmpv::Value` payload
+/// (Map per SPEC §8.6 schema). Closure of the pre-2026-05-13 parity gap:
+/// `rFP_worker_broadcast_topics_completion §4.C-ter`.
 pub fn decode_local_filter_down_payload(
-    payload: &[u8],
+    payload: &rmpv::Value,
 ) -> Result<LocalFilterDownPayload, DaemonError> {
     use rmpv::Value;
-    let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(payload))
-        .map_err(|e| DaemonError::MsgpackDecode(format!("payload root: {e}")))?;
-    let map = match &v {
+    let map = match payload {
         Value::Map(items) => items,
         _ => return Err(DaemonError::MsgpackDecode("payload not a map".into())),
     };
@@ -276,14 +303,21 @@ fn decode_float_array_into<const N: usize>(
     Ok(())
 }
 
-/// Encode a UNIFIED_SPIRIT_FILTER_DOWN payload for use in tests + the
-/// e2e harness's stub publisher. Matches Python `filter_down.py` publish
-/// shape per SPEC §8.6.
+/// Build a UNIFIED_SPIRIT_FILTER_DOWN payload as `rmpv::Value::Map` for use
+/// in tests + the e2e harness's stub publisher. Matches Python
+/// `filter_down.py` publish shape per SPEC §8.6 + §8.10 byte-identical
+/// guarantee.
 ///
 /// Refactoring this signature would break the SPEC §8.6 wire-shape
 /// contract that the test harness relies on. The 8 args mirror the
 /// 6 tensor channels (inner+outer × body/mind/spirit) plus epoch_id +
 /// ts metadata — they are NOT incidental complexity.
+///
+/// Pre-2026-05-13 this returned `Vec<u8>` (msgpack-encoded). Closure of
+/// `rFP_worker_broadcast_topics_completion §4.C-ter`: now returns the
+/// structured `Value::Map` so callers can pass it directly to
+/// `BusClient::publish` or `encode_simple` per SPEC §8.2 line 789 +
+/// §8.10 line 900.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_filter_down_payload(
     inner_body: &[f32; 5],
@@ -294,7 +328,7 @@ pub fn encode_filter_down_payload(
     outer_spirit_content: &[f32; 40],
     epoch_id: i64,
     ts: f64,
-) -> Vec<u8> {
+) -> rmpv::Value {
     use rmpv::Value;
 
     fn arr<const N: usize>(v: &[f32; N]) -> Value {
@@ -316,19 +350,14 @@ pub fn encode_filter_down_payload(
         ),
     ]);
 
-    let map = Value::Map(vec![
+    Value::Map(vec![
         (Value::String("multipliers".into()), multipliers),
         (
             Value::String("epoch_id".into()),
             Value::Integer(epoch_id.into()),
         ),
         (Value::String("ts".into()), Value::F64(ts)),
-    ]);
-
-    let mut out = Vec::with_capacity(512);
-    rmpv::encode::write_value(&mut out, &map)
-        .expect("rmpv encode never fails on well-formed Value");
-    out
+    ])
 }
 
 #[cfg(test)]
@@ -338,12 +367,13 @@ mod tests {
     #[test]
     fn topic_lists_match_spec_9a() {
         // SPEC §9.A inner daemons: body / mind subscribe to 4; spirit to 2.
-        assert_eq!(INNER_BODY_TOPICS.len(), 4);
-        assert_eq!(INNER_MIND_TOPICS.len(), 4);
-        assert_eq!(INNER_SPIRIT_TOPICS.len(), 2);
-        assert_eq!(OUTER_BODY_TOPICS.len(), 4);
-        assert_eq!(OUTER_MIND_TOPICS.len(), 4);
-        assert_eq!(OUTER_SPIRIT_TOPICS.len(), 2);
+        assert_eq!(INNER_BODY_TOPICS.len(), 5);
+        assert_eq!(INNER_MIND_TOPICS.len(), 5);
+        // spirit = SHUTDOWN + UNIFIED_SPIRIT_FILTER_DOWN + KERNEL_EPOCH_TICK (0C)
+        assert_eq!(INNER_SPIRIT_TOPICS.len(), 3);
+        assert_eq!(OUTER_BODY_TOPICS.len(), 5);
+        assert_eq!(OUTER_MIND_TOPICS.len(), 5);
+        assert_eq!(OUTER_SPIRIT_TOPICS.len(), 3);
     }
 
     #[test]
@@ -404,7 +434,7 @@ mod tests {
         let outer_mind = [1.0; 15];
         let outer_spirit_content = [1.0; 40];
 
-        let bytes = encode_filter_down_payload(
+        let payload = encode_filter_down_payload(
             &inner_body,
             &inner_mind,
             &inner_spirit_content,
@@ -415,7 +445,7 @@ mod tests {
             1234567890.5,
         );
 
-        let decoded = decode_filter_down_payload(&bytes).unwrap();
+        let decoded = decode_filter_down_payload(&payload).unwrap();
         for i in 0..5 {
             assert!((decoded.inner_body[i] - inner_body[i]).abs() < 1e-5);
         }
@@ -431,15 +461,8 @@ mod tests {
 
     #[test]
     fn decode_filter_down_rejects_non_map() {
-        let bytes = rmpv::encode::write_value_ref(
-            &mut Vec::new(),
-            &rmpv::ValueRef::String("not a map".into()),
-        )
-        .map(|_| {});
-        let _ = bytes; // verify encode itself works
-        let mut out = Vec::new();
-        rmpv::encode::write_value(&mut out, &rmpv::Value::String("not a map".into())).unwrap();
-        let r = decode_filter_down_payload(&out);
+        let v = rmpv::Value::String("not a map".into());
+        let r = decode_filter_down_payload(&v);
         assert!(r.is_err());
     }
 
@@ -449,10 +472,8 @@ mod tests {
         use rmpv::Value;
         let bad_inner_body = Value::Array(vec![Value::F64(0.5), Value::F64(0.5), Value::F64(0.5)]);
         let mults = Value::Map(vec![(Value::String("inner_body".into()), bad_inner_body)]);
-        let map = Value::Map(vec![(Value::String("multipliers".into()), mults)]);
-        let mut bytes = Vec::new();
-        rmpv::encode::write_value(&mut bytes, &map).unwrap();
-        let r = decode_filter_down_payload(&bytes);
+        let payload = Value::Map(vec![(Value::String("multipliers".into()), mults)]);
+        let r = decode_filter_down_payload(&payload);
         assert!(r.is_err());
     }
 
@@ -474,14 +495,12 @@ mod tests {
                 arr(&spirit_content),
             ),
         ]);
-        let map = Value::Map(vec![
+        let payload = Value::Map(vec![
             (Value::String("multipliers".into()), mults),
             (Value::String("ts".into()), Value::F64(99.0)),
         ]);
-        let mut bytes = Vec::new();
-        rmpv::encode::write_value(&mut bytes, &map).unwrap();
 
-        let decoded = decode_local_filter_down_payload(&bytes).unwrap();
+        let decoded = decode_local_filter_down_payload(&payload).unwrap();
         for i in 0..5 {
             assert!((decoded.body[i] - body[i]).abs() < 1e-5);
         }

@@ -5,7 +5,7 @@ generate_phase_c_constants.py — regenerator for Titan SPEC constants.
 Reads `titan-docs/SPEC_titan_architecture_constants.toml` (single source of truth
 per SPEC §19) and emits two byte-identical generated files:
 
-  - titan_plugin/_phase_c_constants.py   (Python `Final[T]` annotations)
+  - titan_hcl/_phase_c_constants.py   (Python `Final[T]` annotations)
   - titan-rust/crates/titan-core/src/constants.rs  (Rust `pub const NAME: T = V;`)
 
 Both files have an AUTO-GENERATED header — hand-editing them is a SPEC violation
@@ -31,7 +31,7 @@ except ImportError:
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOML_PATH = REPO_ROOT / "titan-docs" / "SPEC_titan_architecture_constants.toml"
-PYTHON_OUT = REPO_ROOT / "titan_plugin" / "_phase_c_constants.py"
+PYTHON_OUT = REPO_ROOT / "titan_hcl" / "_phase_c_constants.py"
 RUST_DIR = REPO_ROOT / "titan-rust" / "crates" / "titan-core" / "src"
 RUST_OUT = RUST_DIR / "constants.rs"
 

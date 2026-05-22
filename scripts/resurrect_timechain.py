@@ -254,7 +254,7 @@ def step4_rebuild(data, target_dir: str, titan_id: str) -> dict:
         target.rename(backup_dir)
         print(f"  Backed up existing data to {backup_dir}")
 
-    from titan_plugin.logic.timechain_backup import TimeChainBackup
+    from titan_hcl.logic.timechain_backup import TimeChainBackup
     backup = TimeChainBackup(data_dir=str(target), titan_id=titan_id)
 
     if isinstance(data, dict):
@@ -271,7 +271,7 @@ def step4_rebuild(data, target_dir: str, titan_id: str) -> dict:
             return {"passed": False, "error": str(e)}
 
     if ok:
-        from titan_plugin.logic.timechain import TimeChain
+        from titan_hcl.logic.timechain import TimeChain
         tc = TimeChain(data_dir=str(target), titan_id=titan_id)
         print(f"  Rebuilt: {tc.total_blocks:,} blocks")
         print(f"  Genesis: {tc.genesis_hash.hex()[:24]}...")
@@ -289,7 +289,7 @@ def step5_cross_verify(target_dir: str, titan_id: str,
     """Cross-verify restored chain against Solana anchors."""
     print("\n═══ STEP 5: CROSS-VERIFY AGAINST SOLANA ═══")
 
-    from titan_plugin.logic.timechain import TimeChain
+    from titan_hcl.logic.timechain import TimeChain
     tc = TimeChain(data_dir=target_dir, titan_id=titan_id)
 
     local_merkle = tc.compute_merkle_root().hex()
@@ -331,7 +331,7 @@ def step6_verify_directives(target_dir: str, titan_id: str) -> dict:
     """Verify genesis block contains correct prime directives."""
     print("\n═══ STEP 6: VERIFY PRIME DIRECTIVES ═══")
 
-    from titan_plugin.logic.timechain_backup import TimeChainBackup
+    from titan_hcl.logic.timechain_backup import TimeChainBackup
     backup = TimeChainBackup(data_dir=target_dir, titan_id=titan_id)
     result = backup.verify_genesis_integrity()
 
@@ -356,8 +356,8 @@ def step7_resume(target_dir: str, titan_id: str, arweave_tx: str) -> dict:
     """Resume operation — commit RESURRECTION meta block."""
     print("\n═══ STEP 7: RESUME OPERATION ═══")
 
-    from titan_plugin.logic.timechain import TimeChain, FORK_META, BlockPayload
-    from titan_plugin.logic.proof_of_thought import PoTValidator
+    from titan_hcl.logic.timechain import TimeChain, FORK_META, BlockPayload
+    from titan_hcl.logic.proof_of_thought import PoTValidator
 
     tc = TimeChain(data_dir=target_dir, titan_id=titan_id)
     pot = PoTValidator()
@@ -416,8 +416,8 @@ def verify_only(titan_id: str):
     """Verify existing chain without restoration."""
     print("\n═══ TIMECHAIN VERIFICATION (no restoration) ═══\n")
 
-    from titan_plugin.logic.timechain import TimeChain
-    from titan_plugin.logic.timechain_backup import TimeChainBackup
+    from titan_hcl.logic.timechain import TimeChain
+    from titan_hcl.logic.timechain_backup import TimeChainBackup
 
     tc = TimeChain(data_dir=DATA_DIR, titan_id=titan_id)
     if not tc.has_genesis:
@@ -454,7 +454,7 @@ def verify_only(titan_id: str):
 
 def show_status(titan_id: str):
     """Show backup system status."""
-    from titan_plugin.logic.timechain_backup import TimeChainBackup
+    from titan_hcl.logic.timechain_backup import TimeChainBackup
     backup = TimeChainBackup(data_dir=DATA_DIR, titan_id=titan_id)
     status = backup.get_backup_status()
     print(json.dumps(status, indent=2))
@@ -464,7 +464,7 @@ def repair_mode(titan_id: str):
     """Interactive self-healing repair mode."""
     print("\n═══ TIMECHAIN SELF-HEALING REPAIR ═══\n")
 
-    from titan_plugin.logic.timechain_integrity import ChainIntegrity
+    from titan_hcl.logic.timechain_integrity import ChainIntegrity
 
     integrity = ChainIntegrity(data_dir=DATA_DIR, titan_id=titan_id)
 
@@ -512,8 +512,8 @@ def repair_mode(titan_id: str):
                     print(f"\n  Found Arweave backup: {latest['tx_id'][:30]}...")
                     print(f"  Extracting to {backup_dir}...")
 
-                    from titan_plugin.logic.timechain_backup import TimeChainBackup
-                    from titan_plugin.utils.arweave_store import ArweaveStore
+                    from titan_hcl.logic.timechain_backup import TimeChainBackup
+                    from titan_hcl.utils.arweave_store import ArweaveStore
                     arweave = ArweaveStore(network="devnet")
                     backup = TimeChainBackup(data_dir=DATA_DIR, titan_id=titan_id,
                                               arweave_store=arweave)
@@ -581,7 +581,7 @@ async def run_resurrection(args):
         return
 
     # Step 3
-    from titan_plugin.utils.arweave_store import ArweaveStore
+    from titan_hcl.utils.arweave_store import ArweaveStore
     arweave = ArweaveStore(keypair_path=KEYPAIR_PATH, network="devnet")
     download = await step3_download(tx_id, arweave)
     if not download["passed"]:

@@ -20,23 +20,22 @@ from __future__ import annotations
 def test_all_new_python_modules_import_cleanly():
     """C5-5 / C5-6 / C5-7 / C5-8 modules must all be importable —
     catches accidental breakage of the spirit_worker triad split."""
-    from titan_plugin.modules import ns_worker
-    from titan_plugin.modules import neuromod_worker
-    from titan_plugin.modules import hormonal_worker
-    from titan_plugin.modules import spirit_worker
+    from titan_hcl.modules import ns_worker
+    from titan_hcl.modules import neuromod_worker
+    from titan_hcl.modules import hormonal_worker
 
-    # All 4 main entry functions exist + are callable
+    # All 3 main entry functions exist + are callable
     assert callable(ns_worker.ns_worker_main)
     assert callable(neuromod_worker.neuromod_worker_main)
     assert callable(hormonal_worker.hormonal_worker_main)
-    assert callable(spirit_worker.spirit_worker_main)
-    # The C5-8 thin shim
-    assert callable(spirit_worker._spirit_worker_shim_loop)
+    # spirit_worker fully retired (D-SPEC-116) — module no longer exists.
+    import importlib.util
+    assert importlib.util.find_spec("titan_hcl.modules.spirit_worker") is None
 
 
 def test_all_new_bus_constants_present():
     """The 3 new XXX_READY constants for the Python L2 worker triad."""
-    from titan_plugin import bus
+    from titan_hcl import bus
     assert hasattr(bus, "NS_READY")
     assert hasattr(bus, "NEUROMOD_READY")
     assert hasattr(bus, "HORMONAL_READY")
@@ -47,9 +46,9 @@ def test_all_new_bus_constants_present():
 
 def test_slot_byte_invariants_consistent_across_modules():
     """Sibling-symmetry per master plan §10 D22 + SPEC §7.1 v0.1.5:
-    titanvm_registers + hormonal_state both 200B total (11 × 4 × float32
-    + 24B header). neuromod_state is the smaller sibling (48B)."""
-    from titan_plugin.modules import ns_worker, hormonal_worker, neuromod_worker
+    titanvm_registers + hormonal_state both 176B payload (11 × 4 × float32).
+    neuromod_state is the smaller sibling — 6 mods × 4 fields = 96B (v2)."""
+    from titan_hcl.modules import ns_worker, hormonal_worker, neuromod_worker
 
     # NS + Hormonal share identical byte layout (11 rows × 4 fields)
     assert ns_worker.TITANVM_REGISTERS_PAYLOAD_BYTES == 176
@@ -59,16 +58,16 @@ def test_slot_byte_invariants_consistent_across_modules():
     # Both have 4 fields per row
     assert ns_worker.NS_FIELD_COUNT == hormonal_worker.HORMONE_FIELD_COUNT == 4
 
-    # Neuromod is the smaller sibling — 6 mods × 1 field
+    # Neuromod is the smaller sibling — 6 mods × 4 fields (v2, D-SPEC-54)
     assert neuromod_worker.NEUROMOD_COUNT == 6
-    assert neuromod_worker.NEUROMOD_STATE_PAYLOAD_BYTES == 24
+    assert neuromod_worker.NEUROMOD_STATE_PAYLOAD_BYTES == 96
 
 
 def test_ns_and_hormonal_share_canonical_program_order():
     """11 NS programs + 11 hormones MUST share the same canonical order
     per SPEC §7.1 — drift here = silent slot-layout mismatch between
     the sibling slots."""
-    from titan_plugin.modules import ns_worker, hormonal_worker
+    from titan_hcl.modules import ns_worker, hormonal_worker
     assert ns_worker.NS_PROGRAM_NAMES == hormonal_worker.HORMONE_NAMES
     # Both must start with the 5 inner programs in canonical order
     expected_inner = ("REFLEX", "FOCUS", "INTUITION", "IMPULSE", "METABOLISM")
@@ -79,7 +78,7 @@ def test_ns_and_hormonal_share_canonical_program_order():
 def test_module_names_match_spec_9b_titan_hcl_row():
     """SPEC §9.B titan_HCL line 982 lists the new modules — drift =
     supervisor cannot route bus traffic to them."""
-    from titan_plugin.modules import ns_worker, neuromod_worker, hormonal_worker
+    from titan_hcl.modules import ns_worker, neuromod_worker, hormonal_worker
     assert ns_worker.MODULE_NAME == "ns_module"
     assert neuromod_worker.MODULE_NAME == "neuromod_module"
     assert hormonal_worker.MODULE_NAME == "hormonal_module"
@@ -88,7 +87,7 @@ def test_module_names_match_spec_9b_titan_hcl_row():
 def test_spec_v0_1_5_generated_constants_match():
     """SPEC v0.1.5 PATCH locked HORMONAL_STATE_SCHEMA_VERSION + canonical
     ADOPTION vectors. The auto-generated constants module must reflect this."""
-    from titan_plugin._phase_c_constants import (
+    from titan_hcl._phase_c_constants import (
         HORMONAL_STATE_SCHEMA_VERSION,
         TITANVM_REGISTERS_SCHEMA_VERSION,
         NEUROMOD_SCHEMA_VERSION,
@@ -99,7 +98,8 @@ def test_spec_v0_1_5_generated_constants_match():
     # All slot schema versions = 1 at SPEC v0.1.x (per SPEC §3.1 D05)
     assert HORMONAL_STATE_SCHEMA_VERSION == 1
     assert TITANVM_REGISTERS_SCHEMA_VERSION == 1
-    assert NEUROMOD_SCHEMA_VERSION == 1
+    # neuromod_state bumped v1→v2 at v1.8.0 D-SPEC-54 ((6,) → (6,4)).
+    assert NEUROMOD_SCHEMA_VERSION == 2
     assert INNER_BODY_5D_SCHEMA_VERSION == 1
     assert INNER_MIND_15D_SCHEMA_VERSION == 1
     assert INNER_SPIRIT_45D_SCHEMA_VERSION == 1
@@ -108,7 +108,7 @@ def test_spec_v0_1_5_generated_constants_match():
 def test_state_registry_specs_for_all_3_python_l2_slots():
     """state_registry.py must expose RegistrySpec for all 3 Python-managed
     slots in the C-S5 triad."""
-    from titan_plugin.core.state_registry import HORMONAL_STATE, NEUROMOD_STATE
+    from titan_hcl.core.state_registry import HORMONAL_STATE, NEUROMOD_STATE
     import numpy as np
 
     # HORMONAL_STATE is the new C-S5 v0.1.4 addition
@@ -117,27 +117,24 @@ def test_state_registry_specs_for_all_3_python_l2_slots():
     assert HORMONAL_STATE.dtype == np.dtype("<f4")
     assert HORMONAL_STATE.payload_bytes == 176
 
-    # NEUROMOD_STATE existed pre-C-S5 but neuromod_worker now owns it
+    # NEUROMOD_STATE existed pre-C-S5 but neuromod_worker now owns it.
+    # v1.8.0 D-SPEC-54 (2026-05-15) bumped it v1 (6,)/24B → v2 (6,4)/96B
+    # (per-modulator level/gain/phasic/tonic) — SPEC §7.1 + NEUROMOD_SCHEMA_VERSION=2.
     assert NEUROMOD_STATE.name == "neuromod_state"
-    assert NEUROMOD_STATE.shape == (6,)
+    assert NEUROMOD_STATE.shape == (6, 4)
     assert NEUROMOD_STATE.dtype == np.dtype("<f4")
-    assert NEUROMOD_STATE.payload_bytes == 24
+    assert NEUROMOD_STATE.payload_bytes == 96
 
 
-def test_spirit_worker_shim_lookup_uses_l0_rust_enabled_flag():
-    """C5-8 flag-gate: only `microkernel.l0_rust_enabled` triggers shim mode.
-    All 3 sibling Python L2 workers each have their OWN feature flag
-    (`microkernel.shm_ns_enabled`, `_neuromod_enabled`, `_hormonal_enabled`)
-    independently of the shim flag — drift here = workers + shim out of sync."""
-    from titan_plugin.modules import (
-        ns_worker, neuromod_worker, hormonal_worker, spirit_worker,
+def test_sibling_workers_use_their_own_slot_feature_flags():
+    """Each Python L2 state worker has its OWN feature flag
+    (`microkernel.shm_ns_enabled`, `_neuromod_enabled`, `_hormonal_enabled`).
+    (D-SPEC-116: the spirit_worker shim-flag portion was removed with the
+    retirement of spirit_worker; the sibling-flag invariant still holds.)"""
+    from titan_hcl.modules import (
+        ns_worker, neuromod_worker, hormonal_worker,
     )
     import inspect
-
-    # Confirm the shim's flag check uses microkernel.l0_rust_enabled
-    src = inspect.getsource(spirit_worker.spirit_worker_main)
-    assert "l0_rust_enabled" in src
-    assert "_spirit_worker_shim_loop" in src
 
     # Confirm each worker uses its own slot feature flag
     for module, expected_flag in [

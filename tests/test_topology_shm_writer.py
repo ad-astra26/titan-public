@@ -14,7 +14,7 @@ import numpy as np
 
 def _make_kernel_stub(topology_values=None):
     """Minimal kernel-like object with _start_topology_shm_writer."""
-    from titan_plugin.core.kernel import TitanKernel
+    from titan_hcl.core.kernel import TitanKernel
     k = TitanKernel.__new__(TitanKernel)
 
     # Mock state_register
@@ -34,7 +34,7 @@ def _make_kernel_stub(topology_values=None):
 
 
 def test_topology_30d_registryspec_shape():
-    from titan_plugin.core.state_registry import TOPOLOGY_30D
+    from titan_hcl.core.state_registry import TOPOLOGY_30D
     assert TOPOLOGY_30D.shape == (30,)
     assert TOPOLOGY_30D.name == "topology_30d"
 

@@ -58,13 +58,19 @@ def fake_state_file():
 @pytest.fixture
 def app_client():
     """Build a minimal FastAPI app + TestClient that mounts the
-    dashboard router. Avoids spinning up the full TitanPlugin."""
+    dashboard router. Avoids spinning up the full TitanHCL."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
-    from titan_plugin.api import dashboard
+    from titan_hcl.api import dashboard
 
     app = FastAPI()
     app.include_router(dashboard.router)
+    # Phase E: mount the v6 roof + legacy /v3,/v4→/v6 redirects so
+    # deprecated paths resolve via 301/308 to the live v6 handler.
+    from titan_hcl.api.v6 import router as _v6_router
+    from titan_hcl.api.v6_deprecation import router as _v6_dep_router
+    app.include_router(_v6_router)
+    app.include_router(_v6_dep_router)
     return TestClient(app)
 
 

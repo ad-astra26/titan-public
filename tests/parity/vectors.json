@@ -1,8 +1,9 @@
 {
-  "_comment": "Cross-language parity vectors for Phase C Rust ↔ Python byte-identical guarantee. Per SPEC §7.4 + §8.10 + §11.6. Loaded by both pytest (titan_plugin tests) and cargo test (titan-rust crates). DO NOT EDIT manually after a vector ships — bump spec_version + parity vector set together.",
-  "spec_version": "0.1.4",
+  "_comment": "Cross-language parity vectors for Phase C Rust ↔ Python byte-identical guarantee. Per SPEC §7.4 + §8.10 + §11.6. Loaded by both pytest (titan_hcl tests) and cargo test (titan-rust crates). DO NOT EDIT manually after a vector ships — bump spec_version + parity vector set together.",
+  "spec_version": "0.1.5",
+  "_v0_1_5_addendum": "Added bus_subscribe_envelope canonical vectors per rFP_worker_broadcast_topics_completion §4.C-ter.2. Closes the parity-test gap that allowed the pre-2026-05-13 Rust encoder Binary-vs-Map bug to land.",
   "frame": {
-    "_comment": "HMAC-SHA256 vectors for the connection-handshake response. Per SPEC §8 + B.2 + RFC 4231. Used by titan-core::frame::compute_hmac AND titan_plugin/core/_frame.compute_hmac — must produce byte-identical output.",
+    "_comment": "HMAC-SHA256 vectors for the connection-handshake response. Per SPEC §8 + B.2 + RFC 4231. Used by titan-core::frame::compute_hmac AND titan_hcl/core/_frame.compute_hmac — must produce byte-identical output.",
     "rfc4231": [
       {
         "name": "test_case_1",
@@ -33,7 +34,7 @@
     ]
   },
   "authkey": {
-    "_comment": "HKDF-SHA256 vectors for bus authkey derivation per SPEC §3.1 D06. Used by titan-core::authkey::derive_bus_authkey AND titan_plugin/core/bus_authkey.derive_bus_authkey — byte-identical.",
+    "_comment": "HKDF-SHA256 vectors for bus authkey derivation per SPEC §3.1 D06. Used by titan-core::authkey::derive_bus_authkey AND titan_hcl/core/bus_authkey.derive_bus_authkey — byte-identical.",
     "rfc5869": [
       {
         "name": "rfc_test_case_1",
@@ -111,6 +112,55 @@
       "OBSERVATORY_EVENT":            { "priority": "P3", "coalesce_by": null, "catalog": "Observatory" }
     }
   },
+  "bus_subscribe_envelope": {
+    "_comment": "SPEC §8.2 line 789 BUS_SUBSCRIBE byte-locked envelope vector — closes the parity-test gap that allowed the pre-2026-05-13 Rust encoder Binary-vs-Map bug to land. Python ground truth from bus_socket.py::_send_subscribe_frame (lines 1391-1396). Rust port at titan-bus::message::encode_simple + client::build_subscribe_payload MUST produce byte-identical output per SPEC §8.10 line 900. Loaded by both Python pytest (tests/parity/test_bus_subscribe_envelope.py) AND cargo test (titan-rust/crates/titan-bus/tests/bus_subscribe_envelope.rs). Pre-existing helper-only unit tests at client.rs:499+538 exercised only build_subscribe_payload, never the full encode_simple envelope path — that's why the bug slipped CI. This vector exercises the full envelope.",
+    "rFP_reference": "rFP_worker_broadcast_topics_completion §4.C-ter (codified 2026-05-13)",
+    "spec_reference": "§8.2 line 789 (payload schema {name, topics, reply_only}) + §8.2 v1.4.0 D-SPEC-42 (reply_only intent) + §8.10 line 900 (byte-identical guarantee)",
+    "canonical_v1": {
+      "broadcast_consumer_inner_body": {
+        "input": {
+          "envelope": {
+            "type": "BUS_SUBSCRIBE",
+            "src": "inner-body",
+            "dst": "broker"
+          },
+          "payload": {
+            "name": "inner-body",
+            "topics": [
+              "KERNEL_SHUTDOWN_ANNOUNCE",
+              "UNIFIED_SPIRIT_FILTER_DOWN",
+              "INNER_SPIRIT_FILTER_DOWN",
+              "TRINITY_SUBSTRATE_TOPOLOGY_UPDATED"
+            ],
+            "reply_only": false
+          }
+        },
+        "msgpack_bytes": 204,
+        "msgpack_hex": "84a474797065ad4255535f535542534352494245a3737263aa696e6e65722d626f6479a3647374a662726f6b6572a77061796c6f616483a46e616d65aa696e6e65722d626f6479a6746f7069637394b84b45524e454c5f53485554444f574e5f414e4e4f554e4345ba554e49464945445f5350495249545f46494c5445525f444f574eb8494e4e45525f5350495249545f46494c5445525f444f574ed9225452494e4954595f5355425354524154455f544f504f4c4f47595f55504441544544aa7265706c795f6f6e6c79c2",
+        "encoder_options": "Python: msgpack.packb(msg, use_bin_type=True). Rust: encode_simple(\"BUS_SUBSCRIBE\", Some(\"inner-body\"), Some(\"broker\"), Some(build_subscribe_payload(\"inner-body\", topics, false))) — rmpv default Map ordering preserves insertion order, matching Python dict order.",
+        "envelope_field_order": ["type", "src", "dst", "payload"],
+        "payload_field_order": ["name", "topics", "reply_only"],
+        "verification": "Both Python pytest + cargo test compute encoder output bytes + assert bytes.hex() == this.msgpack_hex. Any wire-format regression (Binary blob payload wrapping, key reordering, encoder-options drift) fails both tests at commit time."
+      },
+      "reply_only_titan_HCL": {
+        "input": {
+          "envelope": {
+            "type": "BUS_SUBSCRIBE",
+            "src": "titan_HCL",
+            "dst": "broker"
+          },
+          "payload": {
+            "name": "titan_HCL",
+            "topics": [],
+            "reply_only": true
+          }
+        },
+        "msgpack_bytes": 89,
+        "msgpack_hex": "84a474797065ad4255535f535542534352494245a3737263a9746974616e5f48434ca3647374a662726f6b6572a77061796c6f616483a46e616d65a9746974616e5f48434ca6746f7069637390aa7265706c795f6f6e6c79c3",
+        "verification_note": "SPEC §8.2 v1.4.0 (D-SPEC-42) row 2 of three legal intents — reply_only=true means broker silently skips this subscriber from dst=\"all\" broadcasts. Payload bool byte differs (0xc3 = true vs 0xc2 = false in the broadcast_consumer vector above). Empty topics array encodes as 0x90 (fixarray-0). Used by titan_HCL parent + RPC reply queues + writer services per SPEC §8.2 line 802."
+      }
+    }
+  },
   "adoption_payload": {
     "_comment": "B.2.1 supervision-transfer ADOPTION_REQUEST + ADOPTION_ACK byte-locked vectors per SPEC §8.4 + §8.4.1 (LOCKED in v0.1.5 — earlier 79-byte target was an unvalidated estimate; canonical Python ground truth at worker_swap_handler.py:206-216 produces 60 bytes for the request payload). Loaded by both Python pytest (tests/parity/test_adoption_payload.py) and cargo test (titan-trinity-daemon::adoption::tests).",
     "schema_correction_v0_1_5": "Earlier SPEC §8.4 row claimed payload includes rid (5 fields). Python ground truth puts rid in the bus envelope (top-level msg dict, set by bus.make_msg(rid=...)), NOT inside the payload. Payload itself has 4 fields. SPEC §8.4 row + §8.4.1 corrected in v0.1.5; Decision Log D-SPEC-31 entry.",
@@ -141,27 +191,27 @@
     }
   },
   "outer_body_5d": {
-    "_comment": "C-S6 outer-body parity vectors. Each vector: input msgpack source dict (sensor_cache_outer_body payload) + topology[0:10] outer_lower bytes + UNIFIED_SPIRIT_FILTER_DOWN.outer_body[5] multipliers + OUTER_SPIRIT_FILTER_DOWN.outer_body[5] multipliers -> expected outer_body_5d.bin payload bytes (5 x float32 LE = 20). Logic-source: titan_plugin/logic/outer_trinity.py:_collect_outer_body. Populated in C6-3 by tests/parity/gen_outer_body_vectors.py.",
+    "_comment": "C-S6 outer-body parity vectors. Each vector: input msgpack source dict (sensor_cache_outer_body payload) + topology[0:10] outer_lower bytes + UNIFIED_SPIRIT_FILTER_DOWN.outer_body[5] multipliers + OUTER_SPIRIT_FILTER_DOWN.outer_body[5] multipliers -> expected outer_body_5d.bin payload bytes (5 x float32 LE = 20). Logic-source: titan_hcl/logic/outer_trinity.py:_collect_outer_body. Populated in C6-3 by tests/parity/gen_outer_body_vectors.py.",
     "vectors_target_count": 20,
-    "logic_source": "titan_plugin/logic/outer_trinity.py:_collect_outer_body",
+    "logic_source": "titan_hcl/logic/outer_trinity.py:_collect_outer_body",
     "vectors": []
   },
   "outer_mind_15d": {
-    "_comment": "C-S6 outer-mind parity vectors. Same shape as outer_body_5d but 15 dims; ground_up applies to willing[10:15] ONLY per G10. Logic-source: titan_plugin/logic/outer_mind_tensor.py:collect_outer_mind_15d + outer_trinity._collect_outer_mind. Populated in C6-4.",
+    "_comment": "C-S6 outer-mind parity vectors. Same shape as outer_body_5d but 15 dims; ground_up applies to willing[10:15] ONLY per G10. Logic-source: titan_hcl/logic/outer_mind_tensor.py:collect_outer_mind_15d + outer_trinity._collect_outer_mind. Populated in C6-4.",
     "vectors_target_count": 20,
-    "logic_source": "titan_plugin/logic/outer_mind_tensor.py:collect_outer_mind_15d",
+    "logic_source": "titan_hcl/logic/outer_mind_tensor.py:collect_outer_mind_15d",
     "vectors": []
   },
   "outer_spirit_45d": {
-    "_comment": "C-S6 outer-spirit parity vectors. Inputs: outer_body_5d slot bytes + outer_mind_15d slot bytes (Observer Principle reads) + sensor_cache_outer_spirit msgpack pre-aggregated outer-state. Output: outer_spirit_45d.bin payload (45 x float32 LE = 180; SAT[0:15]+CHIT[15:30]+ANANDA[30:45]; Material aspects). Observer dims [0:5] present in slot but masked at filter_down emit per G8. Logic-source: titan_plugin/logic/outer_spirit_tensor.py:collect_outer_spirit_45d. Populated in C6-5.",
+    "_comment": "C-S6 outer-spirit parity vectors. Inputs: outer_body_5d slot bytes + outer_mind_15d slot bytes (Observer Principle reads) + sensor_cache_outer_spirit msgpack pre-aggregated outer-state. Output: outer_spirit_45d.bin payload (45 x float32 LE = 180; SAT[0:15]+CHIT[15:30]+ANANDA[30:45]; Material aspects). Observer dims [0:5] present in slot but masked at filter_down emit per G8. Logic-source: titan_hcl/logic/outer_spirit_tensor.py:collect_outer_spirit_45d. Populated in C6-5.",
     "vectors_target_count": 30,
-    "logic_source": "titan_plugin/logic/outer_spirit_tensor.py:collect_outer_spirit_45d",
+    "logic_source": "titan_hcl/logic/outer_spirit_tensor.py:collect_outer_spirit_45d",
     "vectors": []
   },
   "outer_spirit_filter_down_msg": {
     "_comment": "C-S6 OUTER_SPIRIT_FILTER_DOWN msgpack payload parity vectors. Input: outer_spirit_45d slot bytes (the full 45D). Output: msgpack-encoded {multipliers: {outer_body[5], outer_mind[15], outer_spirit_content[40]}, ts}. Asserts outer_spirit_content is exactly outer_spirit_45d[5:45] byte-identical (length 40, observer dims [0:5] EXCLUDED per G8 + §10.F step 3). Populated in C6-5.",
     "vectors_target_count": 10,
-    "logic_source": "titan_plugin/logic/filter_down.py:478-482 + outer_spirit_tensor.py observer-mask doctrine",
+    "logic_source": "titan_hcl/logic/filter_down.py:478-482 + outer_spirit_tensor.py observer-mask doctrine",
     "vectors": []
   },
   "fastbus_layout": {

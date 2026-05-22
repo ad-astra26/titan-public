@@ -25,7 +25,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from titan_plugin.logic.haov_causal_generator import (
+from titan_hcl.logic.haov_causal_generator import (
     CausalCandidate,
     CausalGenerator,
     CausalGeneratorRegistry,
@@ -37,7 +37,7 @@ from titan_plugin.logic.haov_causal_generator import (
 
 
 # ── Lightweight transition stand-in ────────────────────────────────────────
-# Real CGNTransition lives in titan_plugin.logic.cgn (pulls torch + numpy).
+# Real CGNTransition lives in titan_hcl.logic.cgn (pulls torch + numpy).
 # These tests only need duck-type access to .action and .metadata, so a
 # SimpleNamespace is sufficient and fast.
 
@@ -365,7 +365,7 @@ def test_registry_decay_stale_all_aggregates():
 def cgn_with_consumer():
     """Real CGN instance with one registered consumer.  Uses tmp state dir."""
     # Lazy import — torch + numpy are heavy.
-    from titan_plugin.logic.cgn import (
+    from titan_hcl.logic.cgn import (
         ConceptGroundingNetwork,
         CGNConsumerConfig,
     )
@@ -389,7 +389,7 @@ def cgn_with_consumer():
 def test_integration_record_outcome_promotes_through_tracker(cgn_with_consumer):
     """End-to-end: record_outcome → causal_generator.observe → maybe_promote
     → tracker.hypothesize → tracker._stats["formed"] increments."""
-    from titan_plugin.logic.cgn import CGNTransition
+    from titan_hcl.logic.cgn import CGNTransition
     cgn = cgn_with_consumer
     tracker = cgn._haov_trackers["test_consumer"]
     formed_before = tracker.get_stats()["formed"]
@@ -413,7 +413,7 @@ def test_integration_record_outcome_promotes_through_tracker(cgn_with_consumer):
 
 def test_integration_flag_default_false_means_no_promotion():
     """With enabled=False (the default), record_outcome must NOT promote."""
-    from titan_plugin.logic.cgn import (
+    from titan_hcl.logic.cgn import (
         ConceptGroundingNetwork, CGNConsumerConfig, CGNTransition,
     )
     import numpy as np
@@ -446,7 +446,7 @@ def test_integration_flag_default_false_means_no_promotion():
 
 def test_integration_decay_stale_haov_no_op_when_disabled():
     """cgn.decay_stale_haov() returns 0 quickly when generator is disabled."""
-    from titan_plugin.logic.cgn import ConceptGroundingNetwork
+    from titan_hcl.logic.cgn import ConceptGroundingNetwork
     tmpdir = tempfile.mkdtemp(prefix="cgn_h4_decay_")
     try:
         cgn = ConceptGroundingNetwork(

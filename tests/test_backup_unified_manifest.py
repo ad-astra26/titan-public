@@ -1,0 +1,381 @@
+"""Tests for SPEC §24.3 unified backup manifest (Arweave plane).
+
+Per rFP_backup_diff_baseline_unified_v1 §5.2 test-coverage requirements:
+  - schema round-trip
+  - atomic-write per §11.H.2 (.bak + .bak.prev rotation)
+  - walk-backward semantics
+  - prev_event_id linkage / chain-break detection
+  - baseline-trigger first-wins (month_boundary OR depth_cap)
+"""
+
+import json
+import os
+from datetime import datetime, timezone
+from unittest.mock import patch
+
+import pytest
+
+from titan_hcl.logic.backup_unified_manifest import (
+    UNIFIED_MANIFEST_SCHEMA_VERSION,
+    UnifiedManifest,
+    _atomic_write_json,
+    make_event,
+    new_event_id,
+)
+
+
+# ── helpers ───────────────────────────────────────────────────────────────
+
+
+def _make_personality(tx="ar_tx_p", root="00" * 32, size=1024, mode="full",
+                      diff_against=None, skipped=None, tier="none"):
+    return {
+        "tx_id": tx, "merkle_root": root, "size_bytes": size,
+        "diff_mode": mode, "diff_against_event_id": diff_against,
+        "skipped_files": skipped or [], "encryption_tier": tier,
+    }
+
+
+def _make_timechain(tx="ar_tx_t", root="11" * 32, size=2048, mode="full",
+                    block_range=(0, 1000), prev_offset=0):
+    return {
+        "tx_id": tx, "merkle_root": root, "size_bytes": size,
+        "diff_mode": mode, "block_range": list(block_range),
+        "prev_offset_bytes": prev_offset,
+    }
+
+
+def _baseline_event(event_id=None, prev=None, trigger="month_boundary", ts=None):
+    return make_event(
+        event_id=event_id or new_event_id(),
+        event_type="baseline",
+        prev_event_id=prev,
+        baseline_trigger=trigger,
+        personality=_make_personality(),
+        timechain=_make_timechain(),
+        ts_unix=ts,
+    )
+
+
+def _incremental_event(prev_id, event_id=None, ts=None,
+                       diff_against=None):
+    return make_event(
+        event_id=event_id or new_event_id(),
+        event_type="incremental",
+        prev_event_id=prev_id,
+        baseline_trigger=None,
+        personality=_make_personality(
+            mode="incremental", diff_against=diff_against),
+        timechain=_make_timechain(mode="tail"),
+        ts_unix=ts,
+    )
+
+
+# ── schema construction + round-trip ─────────────────────────────────────
+
+
+def test_fresh_manifest_has_empty_event_list(tmp_path):
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    assert m.events == []
+    assert m.current_baseline_event_id is None
+    assert m.current_baseline_date is None
+
+
+def test_save_and_reload_round_trip(tmp_path):
+    m1 = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    ev = _baseline_event(trigger="first_event")
+    m1.append_event(ev)
+    m1.save()
+
+    m2 = UnifiedManifest.load(titan_id="T1", base_dir=str(tmp_path))
+    assert len(m2.events) == 1
+    assert m2.events[0]["event_id"] == ev["event_id"]
+    assert m2.current_baseline_event_id == ev["event_id"]
+
+
+def test_schema_version_present_on_save(tmp_path):
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    m.append_event(_baseline_event(trigger="first_event"))
+    m.save()
+    with open(m.path) as f:
+        loaded = json.load(f)
+    assert loaded["schema_version"] == UNIFIED_MANIFEST_SCHEMA_VERSION
+
+
+def test_load_rejects_cross_titan_contamination(tmp_path):
+    """SPEC §24.3 — titan_id mismatch is a load-bearing safety check."""
+    m1 = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    m1.append_event(_baseline_event(trigger="first_event"))
+    m1.save()
+
+    # Try loading the T1 file as T2 — must reject
+    t2_path = os.path.join(str(tmp_path), "backup_unified_manifest_T2.json")
+    os.replace(m1.path, t2_path)
+    with pytest.raises(ValueError, match="titan_id mismatch"):
+        UnifiedManifest.load(titan_id="T2", base_dir=str(tmp_path))
+
+
+# ── atomic-write per §11.H.2 ─────────────────────────────────────────────
+
+
+def test_atomic_write_creates_bak_on_second_save(tmp_path):
+    """SPEC §11.H.2 — 2-generation .bak retention."""
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    m.append_event(_baseline_event(trigger="first_event"))
+    m.save()
+    assert os.path.exists(m.path)
+    assert not os.path.exists(m.path + ".bak")  # first save, no prior
+
+    # Second save — primary becomes .bak
+    e2 = _incremental_event(prev_id=m.get_latest_event()["event_id"])
+    m.append_event(e2)
+    m.save()
+    assert os.path.exists(m.path)
+    assert os.path.exists(m.path + ".bak")
+
+
+def test_atomic_write_rotates_bak_to_bak_prev(tmp_path):
+    """SPEC §11.H.2 — 3rd write rotates .bak → .bak.prev."""
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    m.append_event(_baseline_event(trigger="first_event"))
+    m.save()
+    e2 = _incremental_event(prev_id=m.get_latest_event()["event_id"])
+    m.append_event(e2)
+    m.save()
+    e3 = _incremental_event(prev_id=m.get_latest_event()["event_id"])
+    m.append_event(e3)
+    m.save()
+    assert os.path.exists(m.path)
+    assert os.path.exists(m.path + ".bak")
+    assert os.path.exists(m.path + ".bak.prev")
+
+
+def test_load_falls_through_to_bak_on_primary_corruption(tmp_path):
+    """SPEC §11.H.4 — boot integrity check falls back to .bak."""
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    m.append_event(_baseline_event(trigger="first_event"))
+    m.save()
+    e2 = _incremental_event(prev_id=m.get_latest_event()["event_id"])
+    m.append_event(e2)
+    m.save()
+    # Now corrupt the primary
+    with open(m.path, "w") as f:
+        f.write("{not json")
+    m2 = UnifiedManifest.load(titan_id="T1", base_dir=str(tmp_path))
+    # .bak has 1 event (post-first-save, pre-second-save state)
+    assert len(m2.events) == 1
+
+
+def test_load_raises_when_all_3_corrupt(tmp_path):
+    """SPEC §11.H.4 — both backups also corrupted → escalate, do not silent-reset."""
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    m.append_event(_baseline_event(trigger="first_event"))
+    m.save()
+    # Save twice more to create both .bak and .bak.prev
+    e2 = _incremental_event(prev_id=m.get_latest_event()["event_id"])
+    m.append_event(e2)
+    m.save()
+    e3 = _incremental_event(prev_id=m.get_latest_event()["event_id"])
+    m.append_event(e3)
+    m.save()
+    # Corrupt all 3
+    for p in (m.path, m.path + ".bak", m.path + ".bak.prev"):
+        with open(p, "w") as f:
+            f.write("{not json")
+    with pytest.raises(ValueError, match="corrupted on all 3 generations"):
+        UnifiedManifest.load(titan_id="T1", base_dir=str(tmp_path))
+
+
+# ── append_event chain enforcement ──────────────────────────────────────
+
+
+def test_append_rejects_invalid_prev_event_id(tmp_path):
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    m.append_event(_baseline_event(trigger="first_event"))
+    # Try appending an incremental with WRONG prev_event_id
+    bad = _incremental_event(prev_id="nonexistent_uuid")
+    with pytest.raises(ValueError, match="prev_event_id chain break"):
+        m.append_event(bad)
+
+
+def test_first_event_requires_prev_none(tmp_path):
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    # First-ever append with non-None prev → chain break
+    bad = _baseline_event(prev="some_uuid", trigger="first_event")
+    with pytest.raises(ValueError, match="prev_event_id chain break"):
+        m.append_event(bad)
+
+
+def test_baseline_updates_current_baseline_pointers(tmp_path):
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    e1 = _baseline_event(trigger="first_event", ts=1700000000.0)
+    m.append_event(e1)
+    assert m.current_baseline_event_id == e1["event_id"]
+    assert m.current_baseline_date == "2023-11-14"  # UTC date of ts=1700000000
+
+
+def test_incremental_does_not_change_baseline_pointer(tmp_path):
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    e1 = _baseline_event(trigger="first_event")
+    m.append_event(e1)
+    e2 = _incremental_event(prev_id=e1["event_id"])
+    m.append_event(e2)
+    assert m.current_baseline_event_id == e1["event_id"]
+
+
+# ── walk_chain semantics ────────────────────────────────────────────────
+
+
+def test_walk_chain_yields_newest_first(tmp_path):
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    e1 = _baseline_event(trigger="first_event")
+    m.append_event(e1)
+    e2 = _incremental_event(prev_id=e1["event_id"])
+    m.append_event(e2)
+    e3 = _incremental_event(prev_id=e2["event_id"])
+    m.append_event(e3)
+    walked = list(m.walk_chain())
+    assert [w["event_id"] for w in walked] == [
+        e3["event_id"], e2["event_id"], e1["event_id"]]
+
+
+def test_walk_chain_from_specific_event(tmp_path):
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    e1 = _baseline_event(trigger="first_event")
+    m.append_event(e1)
+    e2 = _incremental_event(prev_id=e1["event_id"])
+    m.append_event(e2)
+    e3 = _incremental_event(prev_id=e2["event_id"])
+    m.append_event(e3)
+    walked = list(m.walk_chain(from_event_id=e2["event_id"]))
+    assert [w["event_id"] for w in walked] == [e2["event_id"], e1["event_id"]]
+
+
+def test_get_baseline_for_event_finds_predecessor_baseline(tmp_path):
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    b1 = _baseline_event(trigger="first_event")
+    m.append_event(b1)
+    i1 = _incremental_event(prev_id=b1["event_id"])
+    m.append_event(i1)
+    i2 = _incremental_event(prev_id=i1["event_id"])
+    m.append_event(i2)
+    result = m.get_baseline_for_event(i2["event_id"])
+    assert result["event_id"] == b1["event_id"]
+
+
+def test_incrementals_since_baseline_chronological_order(tmp_path):
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    b1 = _baseline_event(trigger="first_event")
+    m.append_event(b1)
+    i1 = _incremental_event(prev_id=b1["event_id"])
+    m.append_event(i1)
+    i2 = _incremental_event(prev_id=i1["event_id"])
+    m.append_event(i2)
+    incs = m.incrementals_since_baseline()
+    assert [i["event_id"] for i in incs] == [i1["event_id"], i2["event_id"]]
+
+
+# ── should_rebase trigger (first-wins per Maker Q3) ─────────────────────
+
+
+def test_should_rebase_true_on_first_event(tmp_path):
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    do, reason = m.should_rebase()
+    assert do is True
+    assert reason == "first_event"
+
+
+def test_should_rebase_false_mid_month_under_depth_cap(tmp_path):
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    b1 = _baseline_event(trigger="first_event",
+                          ts=datetime(2026, 6, 1, 12, tzinfo=timezone.utc).timestamp())
+    m.append_event(b1)
+    for _ in range(5):
+        m.append_event(_incremental_event(prev_id=m.get_latest_event()["event_id"]))
+    # Now check on 2026-06-15 (mid-month, well under depth cap of 30)
+    do, reason = m.should_rebase(now=datetime(2026, 6, 15, 12, tzinfo=timezone.utc))
+    assert do is False
+    assert reason is None
+
+
+def test_should_rebase_true_on_month_boundary(tmp_path):
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    b1 = _baseline_event(trigger="first_event",
+                          ts=datetime(2026, 6, 1, 12, tzinfo=timezone.utc).timestamp())
+    m.append_event(b1)
+    # 1st of next month — should rebase
+    do, reason = m.should_rebase(now=datetime(2026, 7, 1, 12, tzinfo=timezone.utc))
+    assert do is True
+    assert reason == "month_boundary"
+
+
+def test_should_rebase_false_on_same_day_as_baseline(tmp_path):
+    """Don't double-rebase if a baseline already landed today."""
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    b1 = _baseline_event(trigger="month_boundary",
+                          ts=datetime(2026, 7, 1, 0, tzinfo=timezone.utc).timestamp())
+    m.append_event(b1)
+    # Later on the SAME 1st — already rebased today, no double-rebase
+    do, reason = m.should_rebase(now=datetime(2026, 7, 1, 23, tzinfo=timezone.utc))
+    assert do is False
+
+
+def test_should_rebase_true_on_depth_cap_first_wins(tmp_path):
+    """Per SPEC §24.2 Maker Q3 — first-wins of (month) OR (30 incrementals)."""
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    b1 = _baseline_event(trigger="first_event",
+                          ts=datetime(2026, 6, 5, 12, tzinfo=timezone.utc).timestamp())
+    m.append_event(b1)
+    # 30 incrementals — hit the depth cap mid-month
+    for _ in range(30):
+        m.append_event(_incremental_event(prev_id=m.get_latest_event()["event_id"]))
+    do, reason = m.should_rebase(now=datetime(2026, 6, 20, 12, tzinfo=timezone.utc))
+    assert do is True
+    assert reason == "depth_cap"
+
+
+def test_should_rebase_month_boundary_wins_over_depth(tmp_path):
+    """If both conditions fire, month_boundary is reported first (first-wins)."""
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    b1 = _baseline_event(trigger="first_event",
+                          ts=datetime(2026, 6, 5, 12, tzinfo=timezone.utc).timestamp())
+    m.append_event(b1)
+    for _ in range(30):
+        m.append_event(_incremental_event(prev_id=m.get_latest_event()["event_id"]))
+    # 1st of July — both trigger; month boundary wins per code order
+    do, reason = m.should_rebase(now=datetime(2026, 7, 1, 12, tzinfo=timezone.utc))
+    assert do is True
+    assert reason == "month_boundary"
+
+
+# ── make_event validation ────────────────────────────────────────────────
+
+
+def test_make_event_rejects_invalid_event_type():
+    with pytest.raises(ValueError, match="event_type must be"):
+        make_event(event_id="x", event_type="garbage", prev_event_id=None,
+                   baseline_trigger=None, personality=_make_personality(),
+                   timechain=_make_timechain())
+
+
+def test_make_event_rejects_baseline_without_trigger():
+    with pytest.raises(ValueError, match="baseline_trigger"):
+        make_event(event_id="x", event_type="baseline", prev_event_id=None,
+                   baseline_trigger=None, personality=_make_personality(),
+                   timechain=_make_timechain())
+
+
+def test_make_event_rejects_incremental_with_trigger():
+    with pytest.raises(ValueError, match="incremental events must have baseline_trigger=None"):
+        make_event(event_id="x", event_type="incremental", prev_event_id="prev",
+                   baseline_trigger="month_boundary",
+                   personality=_make_personality(),
+                   timechain=_make_timechain())
+
+
+def test_make_event_requires_personality_subfields():
+    with pytest.raises(ValueError, match="event.personality missing required field"):
+        make_event(event_id="x", event_type="incremental", prev_event_id="prev",
+                   baseline_trigger=None,
+                   personality={"tx_id": "ar"},  # missing merkle_root etc.
+                   timechain=_make_timechain())

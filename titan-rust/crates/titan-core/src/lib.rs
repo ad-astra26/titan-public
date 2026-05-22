@@ -2,7 +2,7 @@
 //!
 //! This crate is consumed by every Phase C Rust binary (kernel, substrate,
 //! unified-spirit, 6 trinity daemons) and provides byte-identical contracts
-//! to today's Python `titan_plugin/core/` modules.
+//! to today's Python `titan_hcl/core/` modules.
 //!
 //! # Modules
 //!
@@ -42,8 +42,12 @@ pub mod bus_specs;
 pub mod constants;
 pub mod frame;
 pub mod identity;
+pub mod middle_path;
 pub mod shm;
+pub mod small_filter_down;
 pub mod supervisor;
+pub mod transition_buffer;
+pub mod trinity_value_net;
 
 // Convenience re-exports for the most-used types
 pub use crate::authkey::{derive_bus_authkey, AUTHKEY_BYTES, AUTHKEY_HKDF_INFO, AUTHKEY_HKDF_SALT};

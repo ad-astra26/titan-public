@@ -20,17 +20,17 @@ import tempfile
 import numpy as np
 import pytest
 
-from titan_plugin.logic.emot_bundle_protocol import (
+from titan_hcl.logic.emot_bundle_protocol import (
     BundleReader, BundleWriter, BUNDLE_SCHEMA_VERSION,
     ENCODER_THIN_ASSEMBLY,
     FELT_TENSOR_DIM, TRAJECTORY_DIM, SPACE_TOPOLOGY_DIM, NEUROMOD_DIM,
     HORMONE_DIM, NS_URGENCY_DIM, CGN_BETA_DIM, MSL_ACT_DIM, PI_PHASE_DIM,
     REGION_UNCLUSTERED, GRAD_SHADOW,
 )
-from titan_plugin.logic.emot_region_clusterer import (
+from titan_hcl.logic.emot_region_clusterer import (
     RegionClusterer, STATE_DIM, assemble_state_vec,
 )
-from titan_plugin.logic.emot_thin_encoder import ThinEmotEncoder
+from titan_hcl.logic.emot_thin_encoder import ThinEmotEncoder
 
 
 # Realistic input fixtures — non-zero, non-constant per group so that

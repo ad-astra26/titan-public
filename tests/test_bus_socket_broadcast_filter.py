@@ -1,22 +1,36 @@
 """Tests for BusSocketServer broadcast filter at publish time.
 
-Closes the 2026-04-30 fleet-wide queue-full flood + heap leak:
-broker was delivering ALL `dst="all"` broadcasts to ALL subscribers,
-ignoring subscribed_topics. SPHERE_PULSE / SPIRIT_STATE / PI_HEARTBEAT_UPDATED
-high-rate broadcasts saturated every worker queue and grew BrokerSubscriber
-coalesce_index dicts unbounded.
+Post-rFP_worker_broadcast_topics_completion §4.C contract (2026-05-12):
+the `_HIGH_RATE_BROADCAST_TYPES` stopgap was retired (deleted entirely)
+after all 21 workers declared explicit `ModuleSpec.broadcast_topics` and
+both the Python broker (this file) + Rust DivineBus broker (titan-rust/
+crates/titan-bus/src/broker.rs `fanout`) implement the same filter.
 
-Fix: publish() now filters at fan-out time:
-  - subscribed_topics non-empty → opt-in (msg type must be in set)
-  - subscribed_topics empty → block HIGH_RATE_BROADCAST_TYPES; allow others
-  - dst == <name> → name-based routing, filter does NOT apply
+Contract:
+  • dst != "all"  → targeted name-based routing — bypasses topics filter.
+  • dst == "all" + subscribed_topics non-empty → strict opt-in (msg type
+    must be in the set).
+  • dst == "all" + subscribed_topics EMPTY → WARN+drop (loud-fail). Every
+    worker MUST declare `broadcast_topics` on its ModuleSpec; reaching
+    this branch is a SPEC violation surfaced via logger.warning.
 
-See bus_socket.py:_HIGH_RATE_BROADCAST_TYPES + publish() docstring.
+History — superseded contracts:
+  • 2026-04-30: added `_HIGH_RATE_BROADCAST_TYPES` frozenset as stopgap
+    fallback for unmigrated subscribe-all workers (closed fleet-wide
+    queue-full flood + heap leak).
+  • 2026-05-09: expanded the stopgap with 6 Rust-only Schumann-rate
+    types after C-S5 unstuck Phase C inner-trinity Rust daemons.
+  • 2026-05-12: deleted entirely after lockstep tests confirm all
+    workers have explicit filters (per rFP §4.C + soak gate).
+
+See bus_socket.py:publish() docstring.
 """
+import logging
+
 import pytest
 
-from titan_plugin import bus
-from titan_plugin.core.bus_socket import BusSocketServer, BrokerSubscriber
+from titan_hcl import bus
+from titan_hcl.core.bus_socket import BusSocketServer, BrokerSubscriber
 
 
 @pytest.fixture
@@ -26,11 +40,17 @@ def server():
     yield s
 
 
-def _make_sub(server, name, subscribed_topics=None):
-    """Inject a fake subscriber into the server's _subscribers dict."""
-    sub = BrokerSubscriber(name=name, conn=None, addr="test")  # conn is None — we don't actually send
+def _make_sub(server, name, subscribed_topics=None, reply_only=False):
+    """Inject a fake subscriber into the server's _subscribers dict.
+
+    D-SPEC-42 (SPEC v1.4.0): `reply_only=True` declares the subscriber
+    consumes ONLY targeted dst=<name> messages — broker silently skips
+    it from dst='all' fan-out (no enqueue, no warn, no drop counter).
+    """
+    sub = BrokerSubscriber(name=name, conn=None, addr="test")  # conn None — we don't actually send
     if subscribed_topics:
         sub.subscribed_topics.update(subscribed_topics)
+    sub.reply_only = bool(reply_only)
     with server._subs_lock:
         server._subscribers[name] = sub
     return sub
@@ -51,57 +71,39 @@ def _enqueue_count(server, sub, msg):
     return calls
 
 
-# ── HIGH_RATE filter ────────────────────────────────────────────────────────
+# ── Post-§4.C: empty topics = WARN + drop on ALL broadcasts ────────────────
 
-def test_high_rate_broadcast_blocked_for_subscribe_all(server):
-    """SPHERE_PULSE broadcast NOT delivered to subscriber with empty topics."""
-    sub = _make_sub(server, "test_worker")
-    calls = _enqueue_count(server, sub,
-        {"type": bus.SPHERE_PULSE, "dst": "all", "payload": {}})
-    assert calls == [], "SPHERE_PULSE should be blocked for subscribe-all"
-
-
-def test_pi_heartbeat_blocked_for_subscribe_all(server):
-    sub = _make_sub(server, "w")
-    calls = _enqueue_count(server, sub,
-        {"type": bus.PI_HEARTBEAT_UPDATED, "dst": "all", "payload": {}})
-    assert calls == []
-
-
-def test_big_pulse_blocked_for_subscribe_all(server):
-    sub = _make_sub(server, "w")
-    calls = _enqueue_count(server, sub,
-        {"type": bus.BIG_PULSE, "dst": "all", "payload": {}})
-    assert calls == []
-
-
-def test_spirit_state_blocked_for_subscribe_all(server):
-    sub = _make_sub(server, "w")
-    calls = _enqueue_count(server, sub,
-        {"type": bus.SPIRIT_STATE, "dst": "all", "payload": {}})
-    assert calls == []
-
-
-def test_topology_state_blocked_for_subscribe_all(server):
-    sub = _make_sub(server, "w")
-    calls = _enqueue_count(server, sub,
-        {"type": bus.TOPOLOGY_STATE_UPDATED, "dst": "all", "payload": {}})
-    assert calls == []
+@pytest.mark.parametrize("msg_type", [
+    bus.SPHERE_PULSE,
+    bus.PI_HEARTBEAT_UPDATED,
+    bus.BIG_PULSE,
+    bus.SPIRIT_STATE,
+    bus.TOPOLOGY_STATE_UPDATED,
+    bus.MEDITATION_COMPLETE,
+    bus.MODULE_READY,
+    "ANY_CUSTOM_TYPE",
+])
+def test_empty_topics_subscriber_drops_all_broadcasts(server, caplog, msg_type):
+    """Post-§4.C: a subscriber with empty subscribed_topics receives NO
+    broadcasts (former 'subscribe-all' mode is retired). The drop logs
+    a WARN so regressions are visible.
+    """
+    sub = _make_sub(server, "no_topics_worker")  # empty subscribed_topics
+    with caplog.at_level(logging.WARNING, logger="titan_hcl.core.bus_socket"):
+        calls = _enqueue_count(server, sub,
+            {"type": msg_type, "dst": "all", "payload": {}})
+    assert calls == [], (
+        f"{msg_type} delivered to empty-topics sub — post-§4.C contract broken"
+    )
+    assert any(
+        "empty broadcast_topics" in rec.message
+        for rec in caplog.records
+    ), "expected WARN about empty broadcast_topics"
 
 
-# ── Low-rate broadcast still flows ──────────────────────────────────────────
+# ── Explicit topic subscription — strict opt-in ────────────────────────────
 
-def test_low_rate_broadcast_delivered_to_subscribe_all(server):
-    """MEDITATION_COMPLETE (not in high-rate set) STILL flows on subscribe-all."""
-    sub = _make_sub(server, "w")
-    calls = _enqueue_count(server, sub,
-        {"type": bus.MEDITATION_COMPLETE, "dst": "all", "payload": {}})
-    assert calls == [bus.MEDITATION_COMPLETE]
-
-
-# ── Explicit topic subscription ─────────────────────────────────────────────
-
-def test_explicit_topic_filter_blocks_other_types(server):
+def test_explicit_topic_filter_blocks_unsubscribed_types(server):
     """Worker subscribed to MEDITATION_COMPLETE doesn't receive SPHERE_PULSE."""
     sub = _make_sub(server, "backup",
                     subscribed_topics={bus.MEDITATION_COMPLETE, bus.BACKUP_TRIGGER_MANUAL})
@@ -119,63 +121,132 @@ def test_explicit_topic_filter_passes_subscribed_type(server):
     assert calls == [bus.MEDITATION_COMPLETE]
 
 
-def test_explicit_topic_can_opt_into_high_rate(server):
-    """Worker that explicitly subscribed to SPHERE_PULSE STILL receives it."""
+def test_explicit_topic_can_opt_into_former_high_rate(server):
+    """Workers that explicitly opt into formerly-blocked high-rate types
+    DO receive them — the filter is fully under per-worker control now.
+    """
     sub = _make_sub(server, "spirit_consumer",
                     subscribed_topics={bus.SPHERE_PULSE})
     calls = _enqueue_count(server, sub,
         {"type": bus.SPHERE_PULSE, "dst": "all", "payload": {}})
-    assert calls == [bus.SPHERE_PULSE], (
-        "Workers with SPHERE_PULSE in subscribed_topics MUST still receive it")
+    assert calls == [bus.SPHERE_PULSE]
 
 
 # ── Targeted (named) routing — filter does NOT apply ────────────────────────
 
-def test_targeted_message_bypasses_filter(server):
-    """dst='backup' SPHERE_PULSE goes through even though high-rate."""
+def test_targeted_message_bypasses_filter_even_with_empty_topics(server):
+    """dst='backup' SPHERE_PULSE goes through even though sub has empty
+    topics — targeted routing is for RPC RESPONSE / SHUTDOWN / etc. and
+    MUST work regardless of broadcast filter.
+    """
     sub = _make_sub(server, "backup")  # empty topics
     calls = _enqueue_count(server, sub,
         {"type": bus.SPHERE_PULSE, "dst": "backup", "payload": {}})
-    assert calls == [bus.SPHERE_PULSE], (
-        "Targeted messages bypass broadcast filter")
+    assert calls == [bus.SPHERE_PULSE]
 
 
 def test_targeted_to_other_subscriber_not_delivered(server):
     """dst='backup' is NOT delivered to 'other_worker'."""
-    backup = _make_sub(server, "backup")
-    other = _make_sub(server, "other_worker")
+    _make_sub(server, "backup", subscribed_topics={bus.MEDITATION_COMPLETE})
+    other = _make_sub(server, "other_worker",
+                      subscribed_topics={bus.MEDITATION_COMPLETE})
     calls_other = _enqueue_count(server, other,
         {"type": bus.MEDITATION_COMPLETE, "dst": "backup", "payload": {}})
     assert calls_other == []
 
 
-# ── HIGH_RATE_BROADCAST_TYPES is comprehensive but not too aggressive ──────
+# ── §4.C stopgap retirement: dead-code check ───────────────────────────────
 
-def test_high_rate_set_is_frozen(server):
-    """HIGH_RATE_BROADCAST_TYPES is a frozenset (immutable, hashable)."""
-    assert isinstance(server._HIGH_RATE_BROADCAST_TYPES, frozenset)
-
-
-def test_high_rate_set_includes_documented_types(server):
-    """All 5 known high-rate types are in the filter set."""
-    expected = {
-        bus.SPHERE_PULSE,
-        bus.PI_HEARTBEAT_UPDATED,
-        bus.BIG_PULSE,
-        bus.SPIRIT_STATE,
-        bus.TOPOLOGY_STATE_UPDATED,
-    }
-    assert expected.issubset(server._HIGH_RATE_BROADCAST_TYPES)
+def test_high_rate_broadcast_types_is_retired(server):
+    """Post-§4.C: the `_HIGH_RATE_BROADCAST_TYPES` frozenset MUST be
+    deleted entirely. Any future regression that re-introduces the
+    stopgap violates `feedback_no_quick_patches_only_spec_correct_solutions
+    .md` — file a new SPEC-correct bug instead.
+    """
+    assert not hasattr(server, "_HIGH_RATE_BROADCAST_TYPES"), (
+        "_HIGH_RATE_BROADCAST_TYPES stopgap was retired per rFP §4.C — "
+        "if a high-rate broadcast is flooding queues, fix the producer or "
+        "extend per-worker broadcast_topics; do NOT re-add the stopgap."
+    )
 
 
-def test_low_rate_types_NOT_in_high_rate_set(server):
-    """MEDITATION_COMPLETE / BACKUP_TRIGGER_MANUAL / etc. should pass through."""
-    safe_types = {
-        bus.MEDITATION_COMPLETE,
-        bus.BACKUP_TRIGGER_MANUAL,
-        bus.MODULE_SHUTDOWN,
-        bus.MODULE_READY,
-    }
-    for t in safe_types:
-        assert t not in server._HIGH_RATE_BROADCAST_TYPES, (
-            f"{t} must NOT be in high-rate set — it would break low-rate flow")
+# ── D-SPEC-42 (SPEC v1.4.0): reply_only silent skip ────────────────────────
+
+@pytest.mark.parametrize("msg_type", [
+    bus.SPHERE_PULSE,
+    bus.MEDITATION_COMPLETE,
+    bus.MODULE_READY,
+    "ANY_CUSTOM_TYPE",
+])
+def test_reply_only_subscriber_silently_skipped_on_broadcast(
+    server, caplog, msg_type
+):
+    """D-SPEC-42: reply_only=True subscriber receives NO broadcasts AND
+    the broker does NOT log a WARN about empty topics. The skip is silent
+    by design — these subscribers (RPC reply queues, writer services,
+    proxy aliases) declared they don't consume broadcasts.
+    """
+    sub = _make_sub(server, "rpc_reply_queue", reply_only=True)
+    with caplog.at_level(logging.WARNING, logger="titan_hcl.core.bus_socket"):
+        calls = _enqueue_count(server, sub,
+            {"type": msg_type, "dst": "all", "payload": {}})
+    assert calls == [], (
+        f"{msg_type} delivered to reply_only sub — D-SPEC-42 contract broken"
+    )
+    # Crucially: NO WARN. This is the architectural difference from the
+    # empty-topics-no-reply_only regression case above.
+    assert not any(
+        "empty broadcast_topics" in rec.message
+        for rec in caplog.records
+    ), (
+        "reply_only=True must produce ZERO warn output — silent skip is "
+        "the SPEC v1.4.0 contract per D-SPEC-42"
+    )
+
+
+def test_reply_only_subscriber_receives_targeted(server):
+    """D-SPEC-42: reply_only=True subscriber DOES receive targeted
+    dst=<name> messages (RPC RESPONSE, MODULE_SHUTDOWN, etc.). The
+    flag only affects broadcast fan-out — targeted routing is
+    unconditional.
+    """
+    sub = _make_sub(server, "rpc_reply_queue", reply_only=True)
+    calls = _enqueue_count(server, sub,
+        {"type": "RESPONSE", "dst": "rpc_reply_queue",
+         "payload": {"result": "ok"}})
+    assert calls == ["RESPONSE"]
+
+
+def test_reply_only_takes_precedence_over_topics(server):
+    """D-SPEC-42: if a subscriber declares BOTH reply_only=True AND
+    topics=[non-empty] (pathological — canonical pattern is
+    reply_only=True ∧ topics=[]), reply_only wins. The subscriber
+    is silently skipped from broadcasts.
+    """
+    sub = _make_sub(
+        server,
+        "weird_pattern_sub",
+        subscribed_topics={bus.MEDITATION_COMPLETE},
+        reply_only=True,
+    )
+    calls = _enqueue_count(server, sub,
+        {"type": bus.MEDITATION_COMPLETE, "dst": "all", "payload": {}})
+    assert calls == [], (
+        "reply_only=True must take precedence over topics filter — "
+        "matches Rust broker.rs::fanout dispatch order"
+    )
+
+
+def test_brokersubscriber_default_reply_only_is_false(server):
+    """D-SPEC-42: backward compatibility — BrokerSubscriber instances
+    default `reply_only=False` (broadcast-consumer intent), preserving
+    byte-identical behavior for pre-v1.4.0 clients that omit the field
+    from BUS_SUBSCRIBE payload.
+    """
+    sub = _make_sub(server, "default_sub",
+                    subscribed_topics={bus.MEDITATION_COMPLETE})
+    assert sub.reply_only is False
+    # And the subscriber DOES receive its subscribed broadcast.
+    calls = _enqueue_count(server, sub,
+        {"type": bus.MEDITATION_COMPLETE, "dst": "all", "payload": {}})
+    assert calls == [bus.MEDITATION_COMPLETE]

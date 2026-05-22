@@ -30,22 +30,22 @@ import pytest
 
 
 def test_sage_gate_decide_constant_registered() -> None:
-    from titan_plugin.bus import SAGE_GATE_DECIDE
+    from titan_hcl.bus import SAGE_GATE_DECIDE
     assert SAGE_GATE_DECIDE == "SAGE_GATE_DECIDE"
 
 
 def test_sage_iql_train_step_constant_registered() -> None:
-    from titan_plugin.bus import SAGE_IQL_TRAIN_STEP
+    from titan_hcl.bus import SAGE_IQL_TRAIN_STEP
     assert SAGE_IQL_TRAIN_STEP == "SAGE_IQL_TRAIN_STEP"
 
 
 def test_sage_stats_constant_registered() -> None:
-    from titan_plugin.bus import SAGE_STATS
+    from titan_hcl.bus import SAGE_STATS
     assert SAGE_STATS == "SAGE_STATS"
 
 
 def test_sage_ready_constant_registered() -> None:
-    from titan_plugin.bus import SAGE_READY
+    from titan_hcl.bus import SAGE_READY
     assert SAGE_READY == "SAGE_READY"
 
 
@@ -55,7 +55,7 @@ def test_sage_ready_constant_registered() -> None:
 def test_rl_worker_handle_query_decide_execution_mode() -> None:
     """rl_worker `_handle_query` action="decide_execution_mode" calls
     gatekeeper.decide_execution_mode and unpacks 3-tuple into RESPONSE."""
-    from titan_plugin.modules.rl_worker import _handle_query
+    from titan_hcl.modules.recorder_worker import _handle_query
 
     captured: dict = {}
 
@@ -89,7 +89,7 @@ def test_rl_worker_handle_query_decide_execution_mode() -> None:
         scholar=MagicMock(),
         gatekeeper=_FakeGatekeeper(),
         send_queue=fake_send_queue,
-        name="rl",
+        name="recorder",
     )
 
     assert captured["state_shape"] == [128]
@@ -106,7 +106,7 @@ def test_rl_worker_handle_query_decide_execution_mode() -> None:
 
 def test_rl_worker_handle_query_evaluate_alias() -> None:
     """`action="evaluate"` is back-compat alias — same handler, same response."""
-    from titan_plugin.modules.rl_worker import _handle_query
+    from titan_hcl.modules.recorder_worker import _handle_query
 
     class _FakeGatekeeper:
         sovereignty_score = 0.0
@@ -124,7 +124,7 @@ def test_rl_worker_handle_query_evaluate_alias() -> None:
         scholar=MagicMock(),
         gatekeeper=_FakeGatekeeper(),
         send_queue=fake_send_queue,
-        name="rl",
+        name="recorder",
     )
     assert captured[0]["payload"]["mode"] == "Shadow"
 
@@ -132,7 +132,7 @@ def test_rl_worker_handle_query_evaluate_alias() -> None:
 def test_rl_worker_handle_query_dream() -> None:
     """`action="dream"` calls scholar.dream with epochs+batch_size and
     returns 4-key reply with floats + buffer_len + epochs."""
-    from titan_plugin.modules.rl_worker import _handle_query
+    from titan_hcl.modules.recorder_worker import _handle_query
 
     async def _fake_dream(epochs, batch_size):
         return {
@@ -160,7 +160,7 @@ def test_rl_worker_handle_query_dream() -> None:
         scholar=fake_scholar,
         gatekeeper=MagicMock(),
         send_queue=fake_send_queue,
-        name="rl",
+        name="recorder",
     )
 
     assert len(captured) == 1
@@ -174,7 +174,7 @@ def test_rl_worker_handle_query_dream() -> None:
 
 def test_rl_worker_handle_query_swallows_dream_exception() -> None:
     """Dream handler exception → RESPONSE with error key, never crashes worker."""
-    from titan_plugin.modules.rl_worker import _handle_query
+    from titan_hcl.modules.recorder_worker import _handle_query
 
     async def _crash(epochs, batch_size):
         raise RuntimeError("boom")
@@ -194,14 +194,14 @@ def test_rl_worker_handle_query_swallows_dream_exception() -> None:
         scholar=fake_scholar,
         gatekeeper=MagicMock(),
         send_queue=fake_send_queue,
-        name="rl",
+        name="recorder",
     )
     assert captured[0]["payload"].get("error") == "boom"
 
 
 def test_rl_worker_handle_query_stats() -> None:
     """`action="stats"` returns the SAGE_STATS payload shape."""
-    from titan_plugin.modules.rl_worker import _handle_query
+    from titan_hcl.modules.recorder_worker import _handle_query
 
     fake_recorder = MagicMock()
     fake_recorder.buffer = [0] * 100
@@ -223,7 +223,7 @@ def test_rl_worker_handle_query_stats() -> None:
         scholar=MagicMock(),
         gatekeeper=fake_gk,
         send_queue=fake_send_queue,
-        name="rl",
+        name="recorder",
     )
     payload = captured[0]["payload"]
     assert payload["buffer_len"] == 100
@@ -235,7 +235,7 @@ def test_rl_worker_handle_query_stats() -> None:
 
 def test_rl_worker_broadcast_sage_stats_emits_correct_msg() -> None:
     """_broadcast_sage_stats emits SAGE_STATS dst="all" with full snapshot."""
-    from titan_plugin.modules.rl_worker import _broadcast_sage_stats
+    from titan_hcl.modules.recorder_worker import _broadcast_sage_stats
 
     fake_recorder = MagicMock()
     fake_recorder.buffer = []
@@ -250,13 +250,13 @@ def test_rl_worker_broadcast_sage_stats_emits_correct_msg() -> None:
     fake_send_queue = MagicMock()
     fake_send_queue.put_nowait.side_effect = captured.append
 
-    _broadcast_sage_stats(fake_send_queue, "rl", fake_recorder, fake_gk)
+    _broadcast_sage_stats(fake_send_queue, "recorder", fake_recorder, fake_gk)
 
     assert len(captured) == 1
     msg = captured[0]
     assert msg["type"] == "SAGE_STATS"
     assert msg["dst"] == "all"
-    assert msg["src"] == "rl"
+    assert msg["src"] == "recorder"
     assert "buffer_size" in msg["payload"]
 
 
@@ -265,7 +265,7 @@ def test_rl_worker_broadcast_sage_stats_emits_correct_msg() -> None:
 
 def _make_proxy_with_mock_bus():
     """Construct an RLProxy with a mocked bus. Avoids Guardian import path."""
-    from titan_plugin.proxies.rl_proxy import RLProxy
+    from titan_hcl.proxies.rl_proxy import RLProxy
 
     bus = MagicMock()
     bus.subscribe = MagicMock(return_value=MagicMock())  # subscribe always returns a queue
@@ -429,7 +429,7 @@ def test_rlproxy_dynamic_embedding_dim_via_lazy_encoder() -> None:
 
 def test_rlproxy_coerce_state_accepts_list_tensor_and_falls_back() -> None:
     """_coerce_state handles list, tensor (via tolist), and falls back to zeros."""
-    from titan_plugin.proxies.rl_proxy import RLProxy
+    from titan_hcl.proxies.rl_proxy import RLProxy
 
     assert RLProxy._coerce_state([1.0, 2.0]) == [1.0, 2.0]
 
@@ -453,11 +453,11 @@ def test_legacy_plugin_flag_off_creates_full_sage_stack() -> None:
     """Flag default (false) → SageRecorder + SageScholar + SageGatekeeper
     instantiated as before. We verify by checking the import is reachable
     and the construction path is unchanged."""
-    # We don't fully boot TitanPlugin (heavy). Verify the conditional
-    # branch logic via direct read of titan_plugin/__init__.py.
+    # We don't fully boot TitanHCL (heavy). Verify the conditional
+    # branch logic via direct read of titan_hcl/__init__.py.
     import inspect
-    import titan_plugin
-    src = inspect.getsource(titan_plugin)
+    import titan_hcl
+    src = inspect.getsource(titan_hcl)
     # The flag-aware swap must be present
     assert "a8_sage_scholar_gatekeeper_subprocess_enabled" in src
     # Both branches are reachable
@@ -473,8 +473,8 @@ def test_legacy_plugin_flag_on_skips_heavy_sage_imports() -> None:
     instead of SageRecorder. The Scholar + Gatekeeper are not instantiated."""
     # Read the actual conditional structure to verify intent.
     import inspect
-    import titan_plugin
-    src = inspect.getsource(titan_plugin)
+    import titan_hcl
+    src = inspect.getsource(titan_hcl)
 
     # Find the conditional block
     assert "if a8_sage_subproc:" in src
@@ -494,7 +494,7 @@ def test_agno_hooks_no_longer_uses_hasattr_guard() -> None:
     guard silently disabled routing in V6. Removed in A.8.7 (None-guard
     replaces it for legacy fallback)."""
     import inspect
-    from titan_plugin import agno_hooks
+    from titan_hcl import agno_hooks
     src = inspect.getsource(agno_hooks)
 
     # The guard string is gone — replaced with None check.

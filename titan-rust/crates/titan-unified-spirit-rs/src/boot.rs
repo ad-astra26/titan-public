@@ -26,6 +26,7 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::resonance::{BigPulse, ResonanceDetector};
@@ -52,16 +53,22 @@ pub const OPTIONAL_SUBSCRIPTIONS: [&str; 1] = ["SWAP_SUBTREE_REQUEST"];
 ///
 /// Returns `None` on schema mismatch — caller logs + drops.
 pub fn decode_sphere_pulse(envelope_bytes: &[u8]) -> Option<SpherePulseFields> {
-    // The payload is a msgpack-binary blob nested inside the outer envelope.
-    // Try direct envelope decode first — if the broker forwards the inner
-    // map directly (no nested binary), we get the fields off the outer map.
+    // SPEC §8.6 publisher emits SPHERE_PULSE as `{clock_name, phase, ts}`
+    // wrapped in the envelope's `payload` field (nested Map per SPEC §8.2 +
+    // §8.10 byte-identical wire-format guarantee). Try direct envelope decode
+    // first — if a publisher happens to flatten the fields at the outer-map
+    // level (legacy / test path), we can still extract them. Otherwise pluck
+    // them from the nested payload Map.
     let raw_map = decode_top_level_map(envelope_bytes)?;
     if let Some(fields) = pluck_pulse_fields(&raw_map) {
         return Some(fields);
     }
-    // Fallback: payload is a msgpack-binary inside the outer map.
-    let inner_bytes = extract_payload(envelope_bytes)?;
-    let inner_map = decode_top_level_map(&inner_bytes)?;
+    // Canonical path: payload is a nested Map per §4.C-ter wire-format closure.
+    let payload = extract_payload(envelope_bytes)?;
+    let inner_map = match payload {
+        rmpv::Value::Map(entries) => entries,
+        _ => return None,
+    };
     pluck_pulse_fields(&inner_map)
 }
 
@@ -71,10 +78,20 @@ pub struct SpherePulseFields {
     /// Clock canonical name — `"inner_body"`, `"outer_mind"`, etc. Maps
     /// to a pair via `resonance::component_to_pair`.
     pub clock_name: String,
-    /// Phase (radians).
+    /// Phase (radians). Retained for `/v4/resonance` telemetry; the §G11
+    /// gate now uses `balanced` (D-SPEC-112), not phase.
     pub phase: f64,
     /// Wall clock seconds (f64) of the pulse.
     pub ts: f64,
+    /// Whether this pulse fired in a balanced-coherence regime (§G11
+    /// balance-coincidence gate, D-SPEC-112).
+    pub balanced: bool,
+    /// Consecutive balanced ticks at pulse time (sphere_clock counter).
+    /// Feeds the §G11 sustained-balance harmony gate (D-SPEC-113): a side
+    /// counts as harmonious only after `HARMONY_TICKS` sustained balanced
+    /// ticks, debouncing coherence flicker around the 0.70 threshold.
+    /// Absent on the wire → 0 (safe-fail: not-yet-sustained).
+    pub consecutive_balanced: u32,
 }
 
 fn decode_top_level_map(bytes: &[u8]) -> Option<Vec<(rmpv::Value, rmpv::Value)>> {
@@ -90,6 +107,8 @@ fn pluck_pulse_fields(entries: &[(rmpv::Value, rmpv::Value)]) -> Option<SpherePu
     let mut clock_name: Option<String> = None;
     let mut phase: Option<f64> = None;
     let mut ts: Option<f64> = None;
+    let mut balanced: bool = false; // §G11 balance-coincidence (D-SPEC-112); absent → false (safe-fail)
+    let mut consecutive_balanced: u32 = 0; // §G11 sustained-balance (D-SPEC-113); absent → 0 (safe-fail)
     for (k, v) in entries {
         let key = match k {
             rmpv::Value::String(s) => s.as_str()?,
@@ -107,6 +126,12 @@ fn pluck_pulse_fields(entries: &[(rmpv::Value, rmpv::Value)]) -> Option<SpherePu
             "ts" => {
                 ts = v.as_f64();
             }
+            "balanced" => {
+                balanced = v.as_bool().unwrap_or(false);
+            }
+            "consecutive_balanced" => {
+                consecutive_balanced = v.as_u64().unwrap_or(0) as u32;
+            }
             _ => {}
         }
     }
@@ -114,6 +139,8 @@ fn pluck_pulse_fields(entries: &[(rmpv::Value, rmpv::Value)]) -> Option<SpherePu
         clock_name: clock_name?,
         phase: phase?,
         ts: ts?,
+        balanced,
+        consecutive_balanced,
     })
 }
 
@@ -125,16 +152,24 @@ fn pluck_pulse_fields(entries: &[(rmpv::Value, rmpv::Value)]) -> Option<SpherePu
 /// resonant), invokes `UnifiedSpirit::advance(ResonanceSnapshot)` —
 /// which crystallizes a GreatEpoch + auto-persists state.
 ///
+/// On a successful advance the callback also sends the `great_pulse_count`
+/// over `great_pulse_tx`. The publisher task watches this channel and
+/// computes + publishes `UNIFIED_SPIRIT_FILTER_DOWN` ONCE per GREAT pulse
+/// — the unified filter_down is a GREAT-gated EVENT, never per-tick state
+/// (SPEC §G5.1 / D-SPEC-96 D4 closure).
+///
 /// Used by main.rs to wire the dispatch loop:
 /// ```ignore
 /// let detector = Arc::new(Mutex::new(ResonanceDetector::with_defaults(&data_dir)));
 /// let spirit = Arc::new(Mutex::new(UnifiedSpirit::with_defaults(&data_dir)?));
-/// let on_big_pulse = build_advance_callback(spirit.clone(), detector.clone());
+/// let (great_tx, great_rx) = tokio::sync::watch::channel(0u64);
+/// let on_big_pulse = build_advance_callback(spirit.clone(), detector.clone(), great_tx);
 /// run_bus_dispatch_loop(client, detector, on_big_pulse, shutdown).await;
 /// ```
 pub fn build_advance_callback(
     spirit: Arc<Mutex<UnifiedSpirit>>,
     detector: Arc<Mutex<ResonanceDetector>>,
+    great_pulse_tx: watch::Sender<u64>,
 ) -> impl Fn(BigPulse) + Send + Sync + 'static {
     move |big_pulse: BigPulse| {
         if !big_pulse.great_pulse_ready {
@@ -160,6 +195,11 @@ pub fn build_advance_callback(
                     great_pulse_count = big_pulse.great_pulse_count,
                     "GREAT PULSE → UnifiedSpirit advanced + persisted"
                 );
+                // §G5.1 / D4: signal the publisher to compute + publish the
+                // GREAT-gated unified filter_down for this pulse. send()
+                // only errs if every receiver dropped (publisher gone) —
+                // benign during shutdown.
+                let _ = great_pulse_tx.send(big_pulse.great_pulse_count);
             }
             Err(e) => {
                 warn!(
@@ -240,9 +280,13 @@ pub async fn run_bus_dispatch_loop(
                 "SPHERE_PULSE" => match decode_sphere_pulse(&raw_bytes) {
                     Some(fields) => {
                         let mut det = detector.lock();
-                        if let Some(big_pulse) =
-                            det.record_pulse_with_phase(&fields.clock_name, fields.phase, fields.ts)
-                        {
+                        if let Some(big_pulse) = det.record_pulse_with_phase(
+                            &fields.clock_name,
+                            fields.phase,
+                            fields.balanced,
+                            fields.consecutive_balanced,
+                            fields.ts,
+                        ) {
                             // BIG PULSE fired. If great_pulse_ready, the
                             // detector already incremented its counter.
                             on_big_pulse(big_pulse);
@@ -304,24 +348,19 @@ mod tests {
     use titan_bus::message::encode_simple;
 
     fn encode_sphere_pulse(clock_name: &str, phase: f64, ts: f64) -> Vec<u8> {
-        let entries = vec![
+        let payload = rmpv::Value::Map(vec![
             (
                 rmpv::Value::String("clock_name".into()),
                 rmpv::Value::String(clock_name.into()),
             ),
             (rmpv::Value::String("phase".into()), rmpv::Value::F64(phase)),
             (rmpv::Value::String("ts".into()), rmpv::Value::F64(ts)),
-        ];
-        let payload_bytes = {
-            let mut buf = Vec::new();
-            rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(entries)).unwrap();
-            buf
-        };
+        ]);
         encode_simple(
             "SPHERE_PULSE",
             Some("titan-trinity-rs"),
             Some("all"),
-            Some(&payload_bytes),
+            Some(payload),
         )
         .unwrap()
     }
@@ -369,7 +408,10 @@ mod tests {
         // missing "phase" + "ts"
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(entries)).unwrap();
-        let envelope = encode_simple("SPHERE_PULSE", None, None, Some(&buf)).unwrap();
+        // Decode the buf back to Value so we can pass as structured payload
+        let payload: rmpv::Value =
+            rmpv::decode::read_value(&mut std::io::Cursor::new(&buf[..])).unwrap();
+        let envelope = encode_simple("SPHERE_PULSE", None, None, Some(payload)).unwrap();
         assert!(decode_sphere_pulse(&envelope).is_none());
     }
 
@@ -401,7 +443,8 @@ mod tests {
                 .unwrap()
             }),
         ));
-        let cb = build_advance_callback(spirit.clone(), detector.clone());
+        let (great_tx, great_rx) = watch::channel(0u64);
+        let cb = build_advance_callback(spirit.clone(), detector.clone(), great_tx);
 
         // BIG PULSE on a single pair — should NOT advance
         let bp_single = BigPulse {
@@ -422,6 +465,11 @@ mod tests {
             0,
             "single-pair BIG PULSE should NOT advance"
         );
+        assert_eq!(
+            *great_rx.borrow(),
+            0,
+            "single-pair BIG PULSE should NOT signal the filter_down publisher"
+        );
 
         // BIG PULSE with great_pulse_ready=true — SHOULD advance
         let bp_great = BigPulse {
@@ -441,6 +489,12 @@ mod tests {
             spirit.lock().epoch_count(),
             1,
             "great_pulse_ready=true should invoke advance"
+        );
+        // §G5.1 / D4: GREAT advance must signal the publisher with the count
+        assert_eq!(
+            *great_rx.borrow(),
+            1,
+            "great_pulse_ready=true should signal the filter_down publisher with the GREAT count"
         );
         // Verify ResonanceSnapshot fields propagated correctly
         let latest = spirit.lock();

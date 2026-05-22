@@ -23,9 +23,9 @@ import tarfile
 
 import pytest
 
-from titan_plugin.logic.backup_cascade import BackupCascade
-from titan_plugin.logic.backup_crypto import derive_master_key
-from titan_plugin.utils.shamir import split_secret
+from titan_hcl.logic.backup_cascade import BackupCascade
+from titan_hcl.logic.backup_crypto import derive_master_key
+from titan_hcl.utils.shamir import split_secret
 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))

@@ -44,8 +44,8 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from titan_plugin.logic.inner_memory import InnerMemoryStore
-from titan_plugin.logic.language_learning import (
+from titan_hcl.logic.inner_memory import InnerMemoryStore
+from titan_hcl.logic.language_learning import (
     LanguageLearningExperience, _flatten_perturbation,
     LAYER_ORDER, LAYER_SIZES, PASS_FEEL, PASS_RECOGNIZE, PASS_PRODUCE,
 )

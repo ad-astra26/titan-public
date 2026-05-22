@@ -16,7 +16,7 @@ def tmp_dir():
 
 @pytest.fixture
 def engine(tmp_dir):
-    from titan_plugin.logic.meta_reasoning import MetaReasoningEngine
+    from titan_hcl.logic.meta_reasoning import MetaReasoningEngine
     # Seed numpy RNG so MetaPolicy.select_action is deterministic across
     # test runs. Without this, the policy can randomly select BREAK during
     # setup loops, inflating break_count and breaking exact-equality asserts.
@@ -53,9 +53,42 @@ def mock_reasoning():
 
 
 @pytest.fixture
-def wisdom_store(tmp_dir):
-    from titan_plugin.logic.meta_wisdom import MetaWisdomStore
-    return MetaWisdomStore(db_path=os.path.join(tmp_dir, "test.db"))
+def wisdom_store(tmp_dir, monkeypatch):
+    """Provide a MetaWisdomStore writing to an isolated tmp DB.
+
+    Pre-fix: conftest._disable_imw_for_tests monkey-patches
+    `IMWConfig.from_titan_config` to return a disabled config with the
+    DEFAULT `db_path="data/inner_memory.db"`. MetaWisdomStore's
+    `_init_tables` runs against tmp_dir/test.db (passed explicitly), but
+    `store_wisdom` routes through `self._client.write()` → `_route_direct`
+    which uses the IMW config's db_path (the default — wrong DB). Result:
+    "no such table: meta_wisdom" on the global default DB, store returns
+    -1, test fails.
+
+    Fix: re-monkey-patch `IMWConfig.from_titan_config` to also point the
+    IMW config's db_path at tmp_dir/test.db so the disabled-mode
+    `_route_direct` writes to the SAME DB that `_init_tables` created.
+    Reset the singleton client cache so the new config is picked up.
+    """
+    import os
+    from titan_hcl.logic.meta_wisdom import MetaWisdomStore
+    from titan_hcl.persistence.config import IMWConfig
+    from titan_hcl.persistence import writer_client as _wc
+
+    test_db = os.path.join(tmp_dir, "test.db")
+
+    def _disabled_with_db(cls):
+        return cls(enabled=False, mode="disabled", db_path=test_db)
+
+    monkeypatch.setattr(
+        IMWConfig, "from_titan_config", classmethod(_disabled_with_db)
+    )
+    # Reset singleton cache so MetaWisdomStore's get_client() call sees
+    # the new config (the conftest's reset before-yield already ran).
+    _wc.reset_client()
+    store = MetaWisdomStore(db_path=test_db)
+    yield store
+    _wc.reset_client()
 
 
 def _start_chain(engine, mock_reasoning):
@@ -132,13 +165,30 @@ class TestM7Break:
         assert len(engine.state.checkpoints) == 1
         assert engine.state.checkpoints[0]["step_index"] == 1
 
-    def test_break_reward_penalty(self, engine, mock_reasoning):
+    def test_break_count_does_not_affect_meta_reward(self, engine, mock_reasoning):
+        """Post-2026-04-13 Phase 3 healing: M7 BREAK penalty REMOVED.
+
+        Pre-Phase-3 the legacy reward applied `-break_base_cost * break_count`
+        which gave BREAK a baseline ~-0.13 per use and trained the policy
+        to never select BREAK. BREAK is a meta-cognitive escape tool —
+        per `meta_reasoning.py:4726-4735`, the penalty is intentionally
+        zeroed so per-primitive reward symmetry is restored (all
+        primitives clamped at 0 baseline).
+
+        This test locks the invariant: `break_count` no longer changes
+        `_compute_meta_reward()`. Was `assert reward_2 < reward_0` —
+        replaced with `==` to reflect the post-healing contract.
+        """
         sv, nm = _start_chain(engine, mock_reasoning)
         engine.state.break_count = 0
         reward_0 = engine._compute_meta_reward()
         engine.state.break_count = 2
         reward_2 = engine._compute_meta_reward()
-        assert reward_2 < reward_0  # penalty applied
+        # Reward is INDEPENDENT of break_count post-Phase-3 healing.
+        assert reward_2 == reward_0, (
+            f"break_count is supposed to be reward-neutral (Phase 3 "
+            f"healing 2026-04-13) — saw reward_0={reward_0} vs "
+            f"reward_2={reward_2}")
 
 
 # ── M9: EUREKA Tests ──────────────────────────────────────────────
@@ -233,7 +283,7 @@ class TestM8SpiritSelf:
         assert reward >= reward_no_spirit
 
     def test_all_nudge_modes(self, engine, mock_reasoning):
-        from titan_plugin.logic.meta_reasoning import SPIRIT_SELF_NUDGE_MAP
+        from titan_hcl.logic.meta_reasoning import SPIRIT_SELF_NUDGE_MAP
         for mode, nudges in SPIRIT_SELF_NUDGE_MAP.items():
             result = engine._prim_spirit_self(mode, {})
             assert result["nudge_request"]["sub_mode"] == mode
@@ -245,7 +295,7 @@ class TestM8SpiritSelf:
 class TestM10Parallel:
 
     def test_resource_detection(self):
-        from titan_plugin.logic.meta_reasoning import _detect_resource_budget
+        from titan_hcl.logic.meta_reasoning import _detect_resource_budget
         budget, max_par, ram, cpu = _detect_resource_budget()
         assert budget >= 20
         assert budget <= 100
@@ -255,21 +305,21 @@ class TestM10Parallel:
         assert cpu > 0
 
     def test_scheduler_spawn(self):
-        from titan_plugin.logic.meta_reasoning import MultiChainScheduler
+        from titan_hcl.logic.meta_reasoning import MultiChainScheduler
         sched = MultiChainScheduler(max_chains=3, total_budget=20)
         chain = sched.spawn_chain("test", [0.5] * 132, 20)
         assert chain.is_active
         assert len(sched.chains) == 1
 
     def test_scheduler_budget(self):
-        from titan_plugin.logic.meta_reasoning import MultiChainScheduler
+        from titan_hcl.logic.meta_reasoning import MultiChainScheduler
         sched = MultiChainScheduler(max_chains=3, total_budget=20)
         assert sched.budget_remaining() == 20
         sched.total_steps_used = 15
         assert sched.budget_remaining() == 5
 
     def test_scheduler_round_robin(self):
-        from titan_plugin.logic.meta_reasoning import MultiChainScheduler
+        from titan_hcl.logic.meta_reasoning import MultiChainScheduler
         sched = MultiChainScheduler(max_chains=3, total_budget=40,
                                      config={"parallel_schedule_mode": "round_robin"})
         sched.spawn_chain("a", [0.5] * 132, 20)
@@ -281,7 +331,7 @@ class TestM10Parallel:
         assert sched.active_index == 0
 
     def test_scheduler_should_spawn(self):
-        from titan_plugin.logic.meta_reasoning import MultiChainScheduler
+        from titan_hcl.logic.meta_reasoning import MultiChainScheduler
         sched = MultiChainScheduler(max_chains=3, total_budget=40)
         sched.spawn_chain("a", [0.5] * 132, 20)
         # High NE+DA = parallel tendency
@@ -290,7 +340,7 @@ class TestM10Parallel:
         assert not sched.should_spawn({"NE": 0.1, "DA": 0.1, "5HT": 0.9, "GABA": 0.9})
 
     def test_scheduler_merge(self):
-        from titan_plugin.logic.meta_reasoning import MultiChainScheduler
+        from titan_hcl.logic.meta_reasoning import MultiChainScheduler
         sched = MultiChainScheduler(max_chains=3, total_budget=40)
         c1 = sched.spawn_chain("a", [0.5] * 132, 20)
         c2 = sched.spawn_chain("b", [0.5] * 132, 20)
@@ -320,7 +370,7 @@ class TestMigration:
 
     def test_policy_migration_6_to_8(self, tmp_dir):
         """Verify MetaPolicy loads 6-output weights into 8-output model."""
-        from titan_plugin.logic.meta_reasoning import MetaPolicy, NUM_META_ACTIONS
+        from titan_hcl.logic.meta_reasoning import MetaPolicy, NUM_META_ACTIONS
         # Save a 6-output policy
         old = MetaPolicy(input_dim=80, h1=40, h2=20)
         old_w3 = np.random.randn(20, 6).astype(np.float32)
@@ -343,7 +393,7 @@ class TestMigration:
                  "baseline_confidence": 0.5}
         with open(os.path.join(tmp_dir, "meta_stats.json"), "w") as f:
             json.dump(stats, f)
-        from titan_plugin.logic.meta_reasoning import MetaReasoningEngine
+        from titan_hcl.logic.meta_reasoning import MetaReasoningEngine
         eng = MetaReasoningEngine(config={"save_dir": tmp_dir, "max_chain_length": 20,
                                            "trigger_periodic_interval": 999})
         assert eng._total_eurekas == 0  # default
@@ -358,7 +408,7 @@ class TestMigration:
         correctly. Frequent restarts during incident recovery compounded the
         problem. Lifetime accounting now persists in meta_stats.json.
         """
-        from titan_plugin.logic.meta_reasoning import MetaReasoningEngine
+        from titan_hcl.logic.meta_reasoning import MetaReasoningEngine
         # Seed an engine with realistic counter values + last_* payloads
         eng = MetaReasoningEngine(config={
             "save_dir": tmp_dir, "max_chain_length": 20,
@@ -399,7 +449,7 @@ class TestMigration:
                  "total_wisdom_saved": 5, "baseline_confidence": 0.6}
         with open(os.path.join(tmp_dir, "meta_stats.json"), "w") as f:
             json.dump(stats, f)
-        from titan_plugin.logic.meta_reasoning import MetaReasoningEngine
+        from titan_hcl.logic.meta_reasoning import MetaReasoningEngine
         eng = MetaReasoningEngine(config={
             "save_dir": tmp_dir, "max_chain_length": 20,
             "trigger_periodic_interval": 999})
@@ -413,7 +463,7 @@ class TestMigration:
         """Systematic audit fix: 14 previously-ephemeral lifetime/state
         attributes now persist across restart. Pattern identical to
         cc_* counters — this is the class-of-bug fix. 2026-04-21."""
-        from titan_plugin.logic.meta_reasoning import MetaReasoningEngine
+        from titan_hcl.logic.meta_reasoning import MetaReasoningEngine
         eng = MetaReasoningEngine(config={
             "save_dir": tmp_dir, "max_chain_length": 20,
             "trigger_periodic_interval": 999})

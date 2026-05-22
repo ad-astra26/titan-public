@@ -57,7 +57,7 @@ class TestOuterTrinityCollector:
 
     def test_collect_returns_correct_structure(self):
         """Collector returns dict with 3 keys, each a 5-element list."""
-        from titan_plugin.logic.outer_trinity import OuterTrinityCollector
+        from titan_hcl.logic.outer_trinity import OuterTrinityCollector
         collector = OuterTrinityCollector()
         result = collector.collect(_make_sources())
 
@@ -70,7 +70,7 @@ class TestOuterTrinityCollector:
 
     def test_all_values_normalized_0_1(self):
         """All output values are within [0.0, 1.0]."""
-        from titan_plugin.logic.outer_trinity import OuterTrinityCollector
+        from titan_hcl.logic.outer_trinity import OuterTrinityCollector
         collector = OuterTrinityCollector()
         result = collector.collect(_make_sources())
 
@@ -78,28 +78,26 @@ class TestOuterTrinityCollector:
             for i, v in enumerate(result[key]):
                 assert 0.0 <= v <= 1.0, f"{key}[{i}] = {v} out of range"
 
-    def test_outer_body_action_energy(self):
-        """action_energy decreases as budget is consumed."""
-        from titan_plugin.logic.outer_trinity import OuterTrinityCollector
+    def test_outer_body_interoception_tracks_sol_balance(self):
+        """[0] interoception varies with sol_balance per SPEC §23.7
+        (REDESIGNED 2026-05-06: 0.4*sol_norm + 0.3*block_delta + 0.3*anchor_fresh).
+        Agency stats no longer drive dim 0 — proxy semantics retired."""
+        from titan_hcl.logic.outer_trinity import OuterTrinityCollector
         collector = OuterTrinityCollector()
 
-        # Low usage → high energy
-        result_low = collector.collect(_make_sources(
-            agency_stats={"budget_per_hour": 10, "actions_this_hour": 1,
-                         "total_actions": 5, "failed_actions": 0}
-        ))
+        # Low SOL → low interoception
+        result_low = collector.collect(_make_sources(sol_balance=0.1))
+        # High SOL → high interoception
+        result_high = collector.collect(_make_sources(sol_balance=10.0))
 
-        # High usage → low energy
-        result_high = collector.collect(_make_sources(
-            agency_stats={"budget_per_hour": 10, "actions_this_hour": 9,
-                         "total_actions": 50, "failed_actions": 5}
-        ))
+        assert result_high["outer_body"][0] > result_low["outer_body"][0]
 
-        assert result_low["outer_body"][0] > result_high["outer_body"][0]
-
-    def test_outer_body_helper_health(self):
-        """helper_health reflects available/total ratio."""
-        from titan_plugin.logic.outer_trinity import OuterTrinityCollector
+    def test_outer_body_proprioception_tracks_helper_health(self):
+        """[1] proprioception per SPEC §23.7: 0.5*peer_entropy + 0.3*helper_health
+        + 0.2*bus_module_div. With defaulted peer_entropy=0.5 + bus_div=0.5,
+        helper_health=3/4=0.75 yields proprioception = 0.5*0.5 + 0.3*0.75
+        + 0.2*0.5 = 0.575 (no longer pure helper ratio)."""
+        from titan_hcl.logic.outer_trinity import OuterTrinityCollector
         collector = OuterTrinityCollector()
 
         result = collector.collect(_make_sources(
@@ -110,25 +108,29 @@ class TestOuterTrinityCollector:
                 "h4": "available",
             }
         ))
-        # 3/4 = 0.75
-        assert result["outer_body"][1] == pytest.approx(0.75, abs=0.01)
+        assert result["outer_body"][1] == pytest.approx(0.575, abs=0.01)
 
-    def test_outer_body_from_bus_stats(self):
-        """bus_throughput is derived from bus routing stats."""
-        from titan_plugin.logic.outer_trinity import OuterTrinityCollector
+    def test_outer_body_somatosensation_tracks_tx_latency(self):
+        """[2] somatosensation per SPEC §23.7: 0.4*tx_lat_norm + 0.3*last_ob2
+        + 0.3*cpu_spikes. Bus stats no longer drive dim 2 — bus_throughput
+        proxy retired."""
+        from titan_hcl.logic.outer_trinity import OuterTrinityCollector
         collector = OuterTrinityCollector()
 
-        result = collector.collect(_make_sources(
-            bus_stats={"routed": 3600, "published": 4000, "dropped": 10},
-            uptime_seconds=3600.0,
+        # Low tx latency (fast TXs) → high somatosensation
+        result_fast = collector.collect(_make_sources(
+            tx_latency_stats={"normalized": 0.9},
+        ))
+        # High tx latency (slow TXs) → low somatosensation
+        result_slow = collector.collect(_make_sources(
+            tx_latency_stats={"normalized": 0.1},
         ))
 
-        # 3600 routed / 3600 expected ≈ 1.0
-        assert result["outer_body"][2] >= 0.9
+        assert result_fast["outer_body"][2] > result_slow["outer_body"][2]
 
     def test_outer_mind_memory_quality(self):
         """memory_quality reflects persistent/total ratio."""
-        from titan_plugin.logic.outer_trinity import OuterTrinityCollector
+        from titan_hcl.logic.outer_trinity import OuterTrinityCollector
         collector = OuterTrinityCollector()
 
         result = collector.collect(_make_sources(
@@ -144,7 +146,7 @@ class TestOuterTrinityCollector:
 
     def test_outer_spirit_identity_coherence(self):
         """identity_coherence uses soul_health directly."""
-        from titan_plugin.logic.outer_trinity import OuterTrinityCollector
+        from titan_hcl.logic.outer_trinity import OuterTrinityCollector
         collector = OuterTrinityCollector()
 
         result = collector.collect(_make_sources(soul_health=0.92))
@@ -152,7 +154,7 @@ class TestOuterTrinityCollector:
 
     def test_outer_spirit_purpose_clarity(self):
         """purpose_clarity from assessment average score."""
-        from titan_plugin.logic.outer_trinity import OuterTrinityCollector
+        from titan_hcl.logic.outer_trinity import OuterTrinityCollector
         collector = OuterTrinityCollector()
 
         result = collector.collect(_make_sources(
@@ -163,7 +165,7 @@ class TestOuterTrinityCollector:
 
     def test_outer_spirit_scalars_are_means(self):
         """outer_body_scalar and outer_mind_scalar are means of respective tensors."""
-        from titan_plugin.logic.outer_trinity import OuterTrinityCollector
+        from titan_hcl.logic.outer_trinity import OuterTrinityCollector
         collector = OuterTrinityCollector()
 
         result = collector.collect(_make_sources())
@@ -179,7 +181,7 @@ class TestOuterTrinityCollector:
 
     def test_missing_sources_degrade_gracefully(self):
         """Missing or None sources return 0.5 (neutral) values."""
-        from titan_plugin.logic.outer_trinity import OuterTrinityCollector
+        from titan_hcl.logic.outer_trinity import OuterTrinityCollector
         collector = OuterTrinityCollector()
 
         # All sources missing/empty
@@ -191,7 +193,7 @@ class TestOuterTrinityCollector:
 
     def test_full_integration_with_all_sources(self):
         """Full collection with all sources populated."""
-        from titan_plugin.logic.outer_trinity import OuterTrinityCollector
+        from titan_hcl.logic.outer_trinity import OuterTrinityCollector
         collector = OuterTrinityCollector()
 
         sources = _make_sources(
@@ -211,7 +213,7 @@ class TestOuterTrinityCollector:
 
     def test_get_last_tensors(self):
         """get_last_tensors returns most recent collection."""
-        from titan_plugin.logic.outer_trinity import OuterTrinityCollector
+        from titan_hcl.logic.outer_trinity import OuterTrinityCollector
         collector = OuterTrinityCollector()
 
         collector.collect(_make_sources())
@@ -226,24 +228,24 @@ class TestSafeClamp:
     """Test the _safe_clamp utility."""
 
     def test_normal_values(self):
-        from titan_plugin.logic.outer_trinity import _safe_clamp
+        from titan_hcl.logic.outer_trinity import _safe_clamp
         assert _safe_clamp(0.5) == 0.5
         assert _safe_clamp(0.0) == 0.0
         assert _safe_clamp(1.0) == 1.0
 
     def test_out_of_range(self):
-        from titan_plugin.logic.outer_trinity import _safe_clamp
+        from titan_hcl.logic.outer_trinity import _safe_clamp
         assert _safe_clamp(-0.5) == 0.0
         assert _safe_clamp(1.5) == 1.0
 
     def test_nan_returns_default(self):
-        from titan_plugin.logic.outer_trinity import _safe_clamp
+        from titan_hcl.logic.outer_trinity import _safe_clamp
         assert _safe_clamp(float('nan')) == 0.5
 
     def test_none_returns_default(self):
-        from titan_plugin.logic.outer_trinity import _safe_clamp
+        from titan_hcl.logic.outer_trinity import _safe_clamp
         assert _safe_clamp(None) == 0.5
 
     def test_inf_returns_default(self):
-        from titan_plugin.logic.outer_trinity import _safe_clamp
+        from titan_hcl.logic.outer_trinity import _safe_clamp
         assert _safe_clamp(float('inf')) == 0.5

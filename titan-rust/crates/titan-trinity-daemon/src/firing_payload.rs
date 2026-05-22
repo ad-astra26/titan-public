@@ -11,7 +11,7 @@
 //!
 //! # Schema parity with Python writer
 //!
-//! 1:1 byte-compatible with [`titan_plugin/api/dim_registry.py:444`]
+//! 1:1 byte-compatible with [`titan_hcl/api/dim_registry.py:444`]
 //! `_block_payload_locked` msgpack encoding:
 //!
 //! ```text
@@ -192,7 +192,7 @@ impl FiringSlotWriter {
 
         if let Err(e) = slot.write(&payload) {
             self.write_failures = self.write_failures.saturating_add(1);
-            if self.write_failures <= 5 || self.write_failures % WARN_THROTTLE_EVERY == 0 {
+            if self.write_failures <= 5 || self.write_failures.is_multiple_of(WARN_THROTTLE_EVERY) {
                 warn!(
                     block = self.block_name,
                     failures = self.write_failures,
@@ -216,7 +216,7 @@ impl FiringSlotWriter {
 
 /// Encode the firing payload as msgpack — 1:1 byte-compatible with the
 /// Python `_block_payload_locked` writer in
-/// `titan_plugin/api/dim_registry.py:444`.
+/// `titan_hcl/api/dim_registry.py:444`.
 ///
 /// Public for parity-test reuse.
 pub fn encode_firing_payload(

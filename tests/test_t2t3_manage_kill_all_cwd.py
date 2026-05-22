@@ -1,16 +1,16 @@
 """C2-11 / BUG-DUPLICATE-KERNELS-FRAGMENT-BUS-20260428.
 
-Verifies t{2,3}_manage.sh `stop` kills ALL titan_main process groups
+Verifies t{2,3}_manage.sh `stop` kills ALL titan_hcl process groups
 whose `cwd` matches the manage script's `TITAN_DIR`, not just the
 PIDFILE PID. Closes the race where services_watchdog spawned a fresh
-titan_main between PIDFILE write and stop call, leaving two parents
+titan_hcl between PIDFILE write and stop call, leaving two parents
 fighting for the bus socket.
 
 Per PLAN_microkernel_phase_c_s2_kernel.md §17.3.
 
 Tests run a sandbox version of the stop algorithm (the relevant
 function lifted into a portable shell snippet) against fake
-titan_main processes (sleep loops with cd into a sandbox dir).
+titan_hcl processes (sleep loops with cd into a sandbox dir).
 The actual scripts wire this same algorithm with the right TITAN_DIR.
 """
 
@@ -40,7 +40,7 @@ if [ -f "$PIDFILE" ]; then
     fi
     rm -f "$PIDFILE"
 fi
-for p in $(pgrep -f "titan_main.*--server" 2>/dev/null); do
+for p in $(pgrep -f "titan_hcl.*--server" 2>/dev/null); do
     PCWD=$(readlink -f "/proc/$p/cwd" 2>/dev/null)
     if [ "$PCWD" = "$TITAN_DIR" ]; then
         TITAN_PIDS="$TITAN_PIDS $p"
@@ -100,9 +100,9 @@ done
 _POPENS: dict[int, subprocess.Popen] = {}
 
 
-def _spawn_fake_titan_main(cwd: Path) -> int:
+def _spawn_fake_titan_hcl(cwd: Path) -> int:
     cwd.mkdir(parents=True, exist_ok=True)
-    cmd = "exec -a 'python -u scripts/titan_main.py --server' sleep 60"
+    cmd = "exec -a 'python -u scripts/titan_hcl.py --server' sleep 60"
     proc = subprocess.Popen(
         ["bash", "-c", cmd],
         cwd=str(cwd),
@@ -115,7 +115,7 @@ def _spawn_fake_titan_main(cwd: Path) -> int:
     while time.monotonic() < deadline:
         try:
             cmdline = Path(f"/proc/{proc.pid}/cmdline").read_text()
-            if "titan_main" in cmdline:
+            if "titan_hcl" in cmdline:
                 break
         except (FileNotFoundError, OSError):
             pass
@@ -183,7 +183,7 @@ def sandbox_titan_dirs(tmp_path):
     # Cleanup any stragglers (paranoid; tests should kill their own)
     for cwd in (titan_dir, titan3_dir):
         for p in subprocess.run(
-            ["pgrep", "-f", "titan_main.*--server"],
+            ["pgrep", "-f", "titan_hcl.*--server"],
             capture_output=True, text=True,
         ).stdout.split():
             try:
@@ -197,7 +197,7 @@ def sandbox_titan_dirs(tmp_path):
 class TestStopKillsAllCwdMatchedTitanMain:
     def test_stop_kills_pidfile_pid(self, sandbox_titan_dirs, tmp_path):
         titan_dir, _ = sandbox_titan_dirs
-        pid = _spawn_fake_titan_main(titan_dir)
+        pid = _spawn_fake_titan_hcl(titan_dir)
         pidfile = tmp_path / "titan.pid"
         pidfile.write_text(str(pid))
 
@@ -209,11 +209,11 @@ class TestStopKillsAllCwdMatchedTitanMain:
             if _is_alive(pid):
                 os.kill(pid, signal.SIGKILL)
 
-    def test_stop_kills_orphan_titan_main_in_same_cwd(self, sandbox_titan_dirs):
+    def test_stop_kills_orphan_titan_hcl_in_same_cwd(self, sandbox_titan_dirs):
         titan_dir, _ = sandbox_titan_dirs
         # Two orphans in titan_dir, NOT registered in PIDFILE
-        orphan1 = _spawn_fake_titan_main(titan_dir)
-        orphan2 = _spawn_fake_titan_main(titan_dir)
+        orphan1 = _spawn_fake_titan_hcl(titan_dir)
+        orphan2 = _spawn_fake_titan_hcl(titan_dir)
 
         try:
             _run_stop(titan_dir, pidfile=None)
@@ -231,10 +231,10 @@ class TestStopKillsAllCwdMatchedTitanMain:
         self, sandbox_titan_dirs
     ):
         """Cwd scoping: stopping T2 doesn't touch T3 processes (which
-        share the same VPS + would also match `pgrep -f titan_main`)."""
+        share the same VPS + would also match `pgrep -f titan_hcl`)."""
         titan_dir, titan3_dir = sandbox_titan_dirs
-        t2_pid = _spawn_fake_titan_main(titan_dir)
-        t3_pid = _spawn_fake_titan_main(titan3_dir)
+        t2_pid = _spawn_fake_titan_hcl(titan_dir)
+        t3_pid = _spawn_fake_titan_hcl(titan3_dir)
 
         try:
             _run_stop(titan_dir, pidfile=None)
@@ -251,7 +251,7 @@ class TestStopKillsAllCwdMatchedTitanMain:
         """Verifies the stop returns AFTER all targeted PIDs have exited
         (i.e. the post-stop state is clean, no follow-up sleep needed)."""
         titan_dir, _ = sandbox_titan_dirs
-        pids = [_spawn_fake_titan_main(titan_dir) for _ in range(3)]
+        pids = [_spawn_fake_titan_hcl(titan_dir) for _ in range(3)]
 
         try:
             _run_stop(titan_dir, pidfile=None)

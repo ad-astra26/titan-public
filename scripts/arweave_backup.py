@@ -35,8 +35,8 @@ logger = logging.getLogger("ArweaveBackup")
 
 
 async def run_backup(titan_id: str, dry_run: bool = False):
-    from titan_plugin.logic.timechain_backup import TimeChainBackup
-    from titan_plugin.utils.arweave_store import ArweaveStore
+    from titan_hcl.logic.timechain_backup import TimeChainBackup
+    from titan_hcl.utils.arweave_store import ArweaveStore
 
     data_dir = "data/timechain"
     keypair_path = "data/titan_identity_keypair.json"
@@ -67,7 +67,7 @@ async def run_backup(titan_id: str, dry_run: bool = False):
     # (validate + local-always + balance check + verify + cleanup)
     logger.info("Uploading to Arweave via Irys (cascade applied)...")
     try:
-        from titan_plugin.config_loader import load_titan_config
+        from titan_hcl.config_loader import load_titan_config
         _full_cfg = load_titan_config()
     except Exception:
         _full_cfg = {}

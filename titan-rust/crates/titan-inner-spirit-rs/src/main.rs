@@ -37,6 +37,8 @@ struct Cli {
     authkey_hex: Option<String>,
     #[arg(long, env = "TITAN_KERNEL_SHM_DIR")]
     shm_dir: Option<PathBuf>,
+    #[arg(long, env = "TITAN_KERNEL_DATA_DIR")]
+    data_dir: Option<PathBuf>,
     #[arg(long, env = "TITAN_KERNEL_LOG_LEVEL", default_value = "info")]
     log_level: String,
 }
@@ -61,6 +63,13 @@ async fn main() -> ExitCode {
         .shm_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from(format!("/dev/shm/titan_{titan_id}")));
+    // data_dir holds the per-half learned filter_down brain
+    // (filter_down_local_inner_*.json). Falls back to ./data (daemons run
+    // with cwd = TITAN_DIR under systemd).
+    let data_dir = cli
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("data"));
     let authkey_hex = match cli.authkey_hex.clone() {
         Some(s) => s,
         None => {
@@ -90,7 +99,7 @@ async fn main() -> ExitCode {
         warn!(err = ?e, "set_pdeathsig failed");
     }
 
-    if let Err(e) = tick_loop::run(&bus_socket, &authkey, &shm_dir).await {
+    if let Err(e) = tick_loop::run(&bus_socket, &authkey, &shm_dir, &data_dir).await {
         error!(err = ?e, "inner-spirit daemon exited with error");
         return ExitCode::from(1);
     }

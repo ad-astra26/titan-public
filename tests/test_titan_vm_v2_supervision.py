@@ -23,8 +23,8 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _disable_imw_for_tests(monkeypatch):
-    from titan_plugin.persistence.config import IMWConfig
-    from titan_plugin.persistence import writer_client as _wc
+    from titan_hcl.persistence.config import IMWConfig
+    from titan_hcl.persistence import writer_client as _wc
 
     def _disabled(cls):
         return cls(enabled=False, mode="disabled")
@@ -37,7 +37,7 @@ def _disable_imw_for_tests(monkeypatch):
     _wc.reset_client()
 
 
-from titan_plugin.logic.neural_nervous_system import NeuralNervousSystem  # noqa: E402
+from titan_hcl.logic.neural_nervous_system import NeuralNervousSystem  # noqa: E402
 
 
 # ── Fixtures ────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-"""Tests for titan_plugin.config_loader deep-merge behavior."""
+"""Tests for titan_hcl.config_loader deep-merge behavior."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ def _clear_loader_cache(tmp_path_factory):
     Layer 1 empty by default for all tests — individual tests can override
     with their own mock.patch.object if they need titan_params behavior.
     """
-    from titan_plugin import config_loader
+    from titan_hcl import config_loader
 
     config_loader.clear_cache()
     fake_params = tmp_path_factory.mktemp("_no_params") / "titan_params.toml"
@@ -33,7 +33,7 @@ def _write_toml(path: Path, content: str) -> None:
 
 
 def test_deep_merge_leaf_overrides():
-    from titan_plugin.config_loader import _deep_merge
+    from titan_hcl.config_loader import _deep_merge
 
     base = {"a": 1, "b": 2}
     overlay = {"b": 20, "c": 3}
@@ -43,7 +43,7 @@ def test_deep_merge_leaf_overrides():
 
 
 def test_deep_merge_nested_dicts():
-    from titan_plugin.config_loader import _deep_merge
+    from titan_hcl.config_loader import _deep_merge
 
     base = {"inference": {"provider": "venice", "api_key": "", "timeout": 30}}
     overlay = {"inference": {"api_key": "secret-key-value"}}
@@ -52,7 +52,7 @@ def test_deep_merge_nested_dicts():
 
 
 def test_deep_merge_new_section_from_overlay():
-    from titan_plugin.config_loader import _deep_merge
+    from titan_hcl.config_loader import _deep_merge
 
     base = {"api": {"port": 7777}}
     overlay = {"arc_agi_3": {"api_key": "new-key"}}
@@ -88,7 +88,7 @@ internal_key = "internal_placeholder_test"
 """,
     )
 
-    from titan_plugin import config_loader
+    from titan_hcl import config_loader
 
     with mock.patch.object(config_loader, "BASE_CONFIG_PATH", base), mock.patch.object(
         config_loader, "SECRETS_PATH", secrets
@@ -108,7 +108,7 @@ def test_load_without_secrets_file_uses_base_and_warns(tmp_path, caplog):
     missing_secrets = tmp_path / "does_not_exist.toml"
     _write_toml(base, '[api]\nport = 7777\ninternal_key = ""\n')
 
-    from titan_plugin import config_loader
+    from titan_hcl import config_loader
 
     with mock.patch.object(config_loader, "BASE_CONFIG_PATH", base), mock.patch.object(
         config_loader, "SECRETS_PATH", missing_secrets
@@ -125,7 +125,7 @@ def test_load_without_base_returns_empty(tmp_path, caplog):
     base = tmp_path / "missing_config.toml"
     secrets = tmp_path / "missing_secrets.toml"
 
-    from titan_plugin import config_loader
+    from titan_hcl import config_loader
 
     with mock.patch.object(config_loader, "BASE_CONFIG_PATH", base), mock.patch.object(
         config_loader, "SECRETS_PATH", secrets
@@ -142,7 +142,7 @@ def test_load_with_malformed_secrets_falls_back_to_base(tmp_path, caplog):
     _write_toml(base, '[api]\nport = 7777\ninternal_key = ""\n')
     _write_toml(secrets, "this is not = valid toml [[[")
 
-    from titan_plugin import config_loader
+    from titan_hcl import config_loader
 
     with mock.patch.object(config_loader, "BASE_CONFIG_PATH", base), mock.patch.object(
         config_loader, "SECRETS_PATH", secrets
@@ -160,7 +160,7 @@ def test_cache_is_reused(tmp_path):
     _write_toml(base, "[api]\nport = 7777\n")
     _write_toml(secrets, '[api]\ninternal_key = "k1"\n')
 
-    from titan_plugin import config_loader
+    from titan_hcl import config_loader
 
     with mock.patch.object(config_loader, "BASE_CONFIG_PATH", base), mock.patch.object(
         config_loader, "SECRETS_PATH", secrets
@@ -181,7 +181,7 @@ def test_update_secret_creates_file_and_writes_section(tmp_path):
     base = tmp_path / "config.toml"
     _write_toml(base, "[api]\nport = 7777\n")
 
-    from titan_plugin import config_loader
+    from titan_hcl import config_loader
 
     with mock.patch.object(config_loader, "SECRETS_PATH", secrets), mock.patch.object(
         config_loader, "BASE_CONFIG_PATH", base
@@ -213,7 +213,7 @@ auth_session = "placeholder_old_sess"
 """,
     )
 
-    from titan_plugin import config_loader
+    from titan_hcl import config_loader
 
     with mock.patch.object(config_loader, "SECRETS_PATH", secrets), mock.patch.object(
         config_loader, "BASE_CONFIG_PATH", base
@@ -263,7 +263,7 @@ timeout = 60
     )
     _write_toml(secrets, '[inference]\nvenice_api_key = "vk_placeholder_l3"\n')
 
-    from titan_plugin import config_loader
+    from titan_hcl import config_loader
 
     with mock.patch.object(config_loader, "TITAN_PARAMS_PATH", params), \
          mock.patch.object(config_loader, "BASE_CONFIG_PATH", base), \
@@ -289,7 +289,7 @@ def test_titan_params_missing_is_non_fatal(tmp_path):
     secrets = tmp_path / "no_secrets.toml"
     _write_toml(base, '[api]\nport = 7777\n')
 
-    from titan_plugin import config_loader
+    from titan_hcl import config_loader
 
     with mock.patch.object(config_loader, "TITAN_PARAMS_PATH", missing_params), \
          mock.patch.object(config_loader, "BASE_CONFIG_PATH", base), \
@@ -320,7 +320,7 @@ port = 7777
     )
     _write_toml(secrets, '[inference]\napi_key = "real_key"\n')
 
-    from titan_plugin import config_loader
+    from titan_hcl import config_loader
 
     with mock.patch.object(config_loader, "BASE_CONFIG_PATH", base), mock.patch.object(
         config_loader, "SECRETS_PATH", secrets
@@ -335,7 +335,7 @@ port = 7777
 
 
 # ---------------------------------------------------------------------------
-# titan_plugin.params delegates to config_loader (BUG-CONFIG-LOADER-MERGE-TITAN-PARAMS)
+# titan_hcl.params delegates to config_loader (BUG-CONFIG-LOADER-MERGE-TITAN-PARAMS)
 # ---------------------------------------------------------------------------
 
 def test_params_get_params_returns_merged_layers(tmp_path):
@@ -364,7 +364,7 @@ fire_threshold = 0.20
 """,
     )
 
-    from titan_plugin import config_loader, params as params_mod
+    from titan_hcl import config_loader, params as params_mod
 
     config_loader.clear_cache()
     with mock.patch.object(config_loader, "TITAN_PARAMS_PATH", titan_params), mock.patch.object(
@@ -389,7 +389,7 @@ def test_params_get_params_unknown_section_returns_empty_dict(tmp_path):
     _write_toml(titan_params, "[reflexes]\nfire_threshold = 0.10\n")
     _write_toml(base, "[api]\nport = 7777\n")
 
-    from titan_plugin import config_loader, params as params_mod
+    from titan_hcl import config_loader, params as params_mod
 
     config_loader.clear_cache()
     with mock.patch.object(config_loader, "TITAN_PARAMS_PATH", titan_params), mock.patch.object(

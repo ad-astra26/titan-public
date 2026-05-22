@@ -11,9 +11,9 @@ from __future__ import annotations
 
 
 def test_sqlite_writer_client_alias_resolves():
-    """`SqliteWriterClient` must be importable from titan_plugin.persistence
+    """`SqliteWriterClient` must be importable from titan_hcl.persistence
     AND be the same class as `InnerMemoryWriterClient`."""
-    from titan_plugin.persistence import (
+    from titan_hcl.persistence import (
         InnerMemoryWriterClient,
         SqliteWriterClient,
     )
@@ -25,7 +25,7 @@ def test_sqlite_writer_client_alias_resolves():
 
 def test_sqlite_writer_daemon_alias_resolves():
     """`SqliteWriterDaemon` must be the same class as `IMWDaemon`."""
-    from titan_plugin.persistence.writer_service import (
+    from titan_hcl.persistence.writer_service import (
         IMWDaemon,
         SqliteWriterDaemon,
     )
@@ -36,7 +36,7 @@ def test_imwconfig_loads_arbitrary_section_name():
     """`IMWConfig.from_titan_config_section()` must accept any
     [persistence_*] section name — this is the foundation of the
     generic-pattern adoption recipe."""
-    from titan_plugin.persistence.config import IMWConfig
+    from titan_hcl.persistence.config import IMWConfig
 
     cfg_inner = IMWConfig.from_titan_config_section("persistence")
     cfg_obs = IMWConfig.from_titan_config_section("persistence_observatory")
@@ -53,7 +53,7 @@ def test_observatory_section_canonical_mode():
     """rFP_universal_sqlite_writer Phase 3: observatory.db must boot in
     canonical mode with the 14 hot tables listed. Locks the config-side
     of the bug fix."""
-    from titan_plugin.persistence.config import IMWConfig
+    from titan_hcl.persistence.config import IMWConfig
 
     cfg = IMWConfig.from_titan_config_section("persistence_observatory")
     assert cfg.enabled is True

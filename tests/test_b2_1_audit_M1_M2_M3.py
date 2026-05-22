@@ -24,10 +24,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from titan_plugin import bus
-from titan_plugin.core import worker_swap_handler
-from titan_plugin.core.worker_lifecycle import WatcherState
-from titan_plugin.core.worker_swap_handler import (
+from titan_hcl import bus
+from titan_hcl.core import worker_swap_handler
+from titan_hcl.core.worker_lifecycle import WatcherState
+from titan_hcl.core.worker_swap_handler import (
     SwapHandlerState,
     on_bus_handoff,
     start_supervision_thread,
@@ -45,7 +45,7 @@ def test_bus_worker_adopt_request_dst_is_guardian():
     so adoption requests were silently dropped — workers reconnected to
     shadow's broker but Guardian never registered them as adopted=True.
     """
-    from titan_plugin.core.worker_swap_handler import request_adoption
+    from titan_hcl.core.worker_swap_handler import request_adoption
     state = SwapHandlerState(
         name="body",
         start_method="spawn",
@@ -114,7 +114,7 @@ def test_bus_handoff_ack_dst_is_shadow_swap():
 def test_phase_hibernate_drains_both_ack_types():
     """_phase_hibernate must call _drain_messages with BOTH HIBERNATE_ACK
     and BUS_HANDOFF_ACK in the message-type set."""
-    import titan_plugin.core.shadow_orchestrator as so_mod
+    import titan_hcl.core.shadow_orchestrator as so_mod
     src = inspect.getsource(so_mod._phase_hibernate)
     # Look for the _drain_messages call
     drain_idx = src.find("_drain_messages(")
@@ -128,7 +128,7 @@ def test_phase_hibernate_drains_both_ack_types():
 def test_phase_hibernate_classifies_missing_per_start_method():
     """_phase_hibernate must compute spawn_missing + fork_missing separately
     based on each worker's ModuleSpec.start_method."""
-    import titan_plugin.core.shadow_orchestrator as so_mod
+    import titan_hcl.core.shadow_orchestrator as so_mod
     src = inspect.getsource(so_mod._phase_hibernate)
     assert "spawn_expected" in src and "fork_expected" in src, (
         "_phase_hibernate must split expected workers by start_method"
@@ -142,7 +142,7 @@ def test_phase_hibernate_only_kills_fork_mode_stragglers():
     """fast_kill must be called ONLY for fork-mode missing workers.
     Spawn-mode workers in B.2.1 swap_pending are alive and awaiting
     adoption — killing them defeats the whole graduation design."""
-    import titan_plugin.core.shadow_orchestrator as so_mod
+    import titan_hcl.core.shadow_orchestrator as so_mod
     src = inspect.getsource(so_mod._phase_hibernate)
     fast_kill_idx = src.find("fast_kill(")
     assert fast_kill_idx > 0, "_phase_hibernate must still fast_kill stragglers"
@@ -157,7 +157,7 @@ def test_phase_hibernate_only_kills_fork_mode_stragglers():
 def test_phase_hibernate_emits_split_ack_event():
     """The hibernate_acks_collected event should include hibernate_acked
     and handoff_acked fields for audit traceability."""
-    import titan_plugin.core.shadow_orchestrator as so_mod
+    import titan_hcl.core.shadow_orchestrator as so_mod
     src = inspect.getsource(so_mod._phase_hibernate)
     event_idx = src.find('result.event(\n        "hibernate_acks_collected"')
     if event_idx < 0:
@@ -175,7 +175,7 @@ def test_phase_hibernate_emits_split_ack_event():
 
 def test_orchestrate_swap_adoption_timeout_default_is_30s():
     """orchestrate_shadow_swap's b2_1_adoption_timeout_s default = 30.0."""
-    from titan_plugin.core.shadow_orchestrator import orchestrate_shadow_swap
+    from titan_hcl.core.shadow_orchestrator import orchestrate_shadow_swap
     sig = inspect.signature(orchestrate_shadow_swap)
     assert sig.parameters["b2_1_adoption_timeout_s"].default == 30.0, (
         "M2: b2_1_adoption_timeout_s default must be 30.0 (was 15.0; "

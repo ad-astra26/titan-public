@@ -41,7 +41,7 @@ def _make_engine_with_state(state, soar_config=None):
     Avoids expensive full-engine init by monkey-patching just what the method
     reads. Tests the 3-tier fallback logic directly.
     """
-    from titan_plugin.logic import meta_reasoning as mr
+    from titan_hcl.logic import meta_reasoning as mr
 
     class _Engine:
         def __init__(self, state, soar):
@@ -130,7 +130,7 @@ def test_phase_3a_all_known_primitives_have_mappings():
 
     Otherwise impasses on that primitive produce no knowledge request.
     """
-    from titan_plugin.logic import meta_reasoning as mr
+    from titan_hcl.logic import meta_reasoning as mr
     for primitive in mr.META_PRIMITIVES:
         state = _MockState(
             chain=[f"{primitive}.some_submode", f"{primitive}.other"],
@@ -171,22 +171,22 @@ def test_phase_3b_short_words_get_enriched():
 
 def test_cgn_core_imports():
     """Phase 0: all CGN-EXTRACT core modules import without error."""
-    from titan_plugin.logic import cgn  # noqa: F401
-    from titan_plugin.logic import cgn_consumer_client  # noqa: F401
-    from titan_plugin.logic import cgn_shm_protocol  # noqa: F401
-    from titan_plugin.modules import cgn_worker  # noqa: F401
-    from titan_plugin.modules import knowledge_worker  # noqa: F401
+    from titan_hcl.logic import cgn  # noqa: F401
+    from titan_hcl.logic import cgn_consumer_client  # noqa: F401
+    from titan_hcl.logic import cgn_shm_protocol  # noqa: F401
+    from titan_hcl.modules import cgn_worker  # noqa: F401
+    from titan_hcl.modules import knowledge_worker  # noqa: F401
 
 
 def test_cgn_worker_entry_function_exists():
     """Phase 0: cgn_worker_main is callable (Guardian module entry point)."""
-    from titan_plugin.modules.cgn_worker import cgn_worker_main
+    from titan_hcl.modules.cgn_worker import cgn_worker_main
     assert callable(cgn_worker_main), "cgn_worker_main must be callable"
 
 
 def test_cgn_consumer_client_constructor():
     """Phase 1: CGNConsumerClient instantiates without requiring a live CGN worker."""
-    from titan_plugin.logic.cgn_consumer_client import CGNConsumerClient
+    from titan_hcl.logic.cgn_consumer_client import CGNConsumerClient
 
     with tempfile.TemporaryDirectory() as tmp:
         # Use a non-existent SHM path — client should degrade gracefully
@@ -206,7 +206,7 @@ def test_shm_protocol_header_format():
     Regression guard for 2026-04-12 verification confusion where header
     `total_size` was mis-interpreted as total file size (it's payload-only).
     """
-    from titan_plugin.logic.cgn_shm_protocol import HEADER_SIZE
+    from titan_hcl.logic.cgn_shm_protocol import HEADER_SIZE
     assert HEADER_SIZE == 16, (
         "HEADER_SIZE changed — any reader/writer update must stay consistent")
 
@@ -215,7 +215,7 @@ def test_shm_protocol_header_format():
 
 def test_reward_helpers_cover_compound_primitives():
     """Phase A compound rewards: reward_recall, reward_formulate etc. exist."""
-    from titan_plugin.logic.meta_reasoning_rewards import PRIMITIVE_REWARD_HELPERS
+    from titan_hcl.logic.meta_reasoning_rewards import PRIMITIVE_REWARD_HELPERS
 
     # Compound rewards defined for core primitives; others fall back to legacy
     assert "RECALL" in PRIMITIVE_REWARD_HELPERS

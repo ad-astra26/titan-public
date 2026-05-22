@@ -18,7 +18,7 @@
 //!
 //! # Byte-identical port (per SPEC §11.6)
 //!
-//! Implementation byte-identical to `titan_plugin/logic/ground_up.py` lines
+//! Implementation byte-identical to `titan_hcl/logic/ground_up.py` lines
 //! 51–147 + Preamble G10 dim mask. Verified by parity vectors at
 //! `tests/parity/vectors.json::ground_up_nudge`.
 //!

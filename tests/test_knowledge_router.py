@@ -1,4 +1,4 @@
-"""Unit tests for titan_plugin.logic.knowledge_router (KP-0).
+"""Unit tests for titan_hcl.logic.knowledge_router (KP-0).
 
 Covers: normalize_query, query_hash, classify_query across all 7 types,
 and route() backend-chain resolution. Pure-function tests — no network,
@@ -9,7 +9,7 @@ See: titan-docs/rFP_knowledge_pipeline_v2.md §3.1.
 
 import pytest
 
-from titan_plugin.logic.knowledge_router import (
+from titan_hcl.logic.knowledge_router import (
     QueryType,
     classify_query,
     normalize_query,

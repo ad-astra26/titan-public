@@ -97,7 +97,7 @@ def test_18_shm_slots_in_spec():
         "unified_spirit_metadata.bin", "memory_state.bin",
         "agency_state.bin", "assessment_state.bin",
         "output_verifier_state.bin", "reflex_state.bin",
-        "rl_state.bin", "social_perception_state.bin",
+        "recorder_state.bin", "social_perception_state.bin",
         "timechain_state.bin", "mind_state.bin", "body_state.bin",
         "language_state.bin", "events_teacher_state.bin",
         "spirit_supplemental_state.bin",
@@ -132,7 +132,7 @@ def test_no_orphan_migrated_handlers():
     Session 1-4 migrated ones are retired."""
     # Map of relative path → set of retired handler actions.
     retired_per_file: dict[str, set[str]] = {
-        "titan_plugin/modules/spirit_loop.py": {
+        "titan_hcl/modules/spirit_loop.py": {
             "get_tensor", "get_trinity", "get_consciousness",
             "get_filter_down", "get_intuition", "get_impulse_engine",
             "get_sphere_clock", "get_resonance", "get_unified_spirit",
@@ -140,17 +140,17 @@ def test_no_orphan_migrated_handlers():
             "get_coordinator", "get_nervous_system",
             "get_social_perception_stats",
         },
-        "titan_plugin/modules/mind_worker.py": {
+        "titan_hcl/modules/mind_worker.py": {
             "get_tensor", "get_mood", "get_valence", "get_current_reward",
         },
-        "titan_plugin/modules/body_worker.py": {
+        "titan_hcl/modules/body_worker.py": {
             "get_tensor", "get_status", "get_details",
         },
-        "titan_plugin/modules/memory_worker.py": {"growth_metrics"},
-        "titan_plugin/modules/agency_worker.py": {
+        "titan_hcl/modules/memory_worker.py": {"growth_metrics"},
+        "titan_hcl/modules/agency_worker.py": {
             "agency_stats", "assessment_stats",
         },
-        "titan_plugin/modules/language_worker.py": {"get_language_stats"},
+        "titan_hcl/modules/language_worker.py": {"get_language_stats"},
     }
     for rel, retired_handlers in retired_per_file.items():
         path = REPO_ROOT / rel

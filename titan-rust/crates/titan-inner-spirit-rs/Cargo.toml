@@ -27,6 +27,7 @@ serde_json.workspace = true
 hex.workspace = true
 anyhow.workspace = true
 rmpv.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

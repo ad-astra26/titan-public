@@ -33,18 +33,18 @@ class TestBusIpcPoolExists(unittest.TestCase):
     """Layer 1 — the dedicated pool must exist and be configurable."""
 
     def test_get_bus_ipc_pool_returns_thread_pool(self):
-        from titan_plugin.bus import get_bus_ipc_pool
+        from titan_hcl.bus import get_bus_ipc_pool
         pool = get_bus_ipc_pool()
         self.assertIsInstance(pool, concurrent.futures.ThreadPoolExecutor)
 
     def test_pool_is_singleton(self):
-        from titan_plugin.bus import get_bus_ipc_pool
+        from titan_hcl.bus import get_bus_ipc_pool
         a = get_bus_ipc_pool()
         b = get_bus_ipc_pool()
         self.assertIs(a, b, "get_bus_ipc_pool must return the same pool every call")
 
     def test_pool_size_matches_default_or_config(self):
-        from titan_plugin.bus import get_bus_ipc_pool, _BUS_IPC_DEFAULT_WORKERS
+        from titan_hcl.bus import get_bus_ipc_pool, _BUS_IPC_DEFAULT_WORKERS
         pool = get_bus_ipc_pool()
         # _max_workers is a public-enough internal of stdlib ThreadPoolExecutor
         self.assertGreaterEqual(pool._max_workers, 1)
@@ -57,7 +57,7 @@ class TestBusIpcPoolExists(unittest.TestCase):
     def test_pool_threads_named_distinctly(self):
         """Threads must have a recognizable name prefix so /v4/thread-pool
         and py-spy can distinguish bus-ipc workers from default workers."""
-        from titan_plugin.bus import get_bus_ipc_pool
+        from titan_hcl.bus import get_bus_ipc_pool
         pool = get_bus_ipc_pool()
         # Submit a no-op so a thread spawns
         pool.submit(lambda: None).result(timeout=2.0)
@@ -73,7 +73,7 @@ class TestBusRequestAsyncRoutesThroughPool(unittest.TestCase):
     """Layer 2 — request_async() must use bus_ipc_pool, not default."""
 
     def test_request_async_method_exists(self):
-        from titan_plugin.bus import DivineBus
+        from titan_hcl.bus import DivineBus
         self.assertTrue(hasattr(DivineBus, "request_async"))
         self.assertTrue(asyncio.iscoroutinefunction(DivineBus.request_async))
 
@@ -82,7 +82,7 @@ class TestBusRequestAsyncRoutesThroughPool(unittest.TestCase):
         get_bus_ipc_pool. The runtime check (that the wait actually
         happens on a bus-ipc thread) is in
         test_request_async_runs_on_bus_ipc_thread below."""
-        from titan_plugin.bus import DivineBus
+        from titan_hcl.bus import DivineBus
         src = inspect.getsource(DivineBus.request_async)
         self.assertIn("get_bus_ipc_pool", src,
                       "request_async must route through get_bus_ipc_pool")
@@ -96,8 +96,8 @@ class TestBusRequestAsyncRoutesThroughPool(unittest.TestCase):
         """Runtime: when await request_async, the inner sync request()
         executes on a thread named bus-ipc-N. Without a real bus this
         test stubs request() to capture its execution thread name."""
-        from titan_plugin import bus as bus_mod
-        from titan_plugin.bus import DivineBus
+        from titan_hcl import bus as bus_mod
+        from titan_hcl.bus import DivineBus
 
         captured = {}
 
@@ -134,7 +134,7 @@ class TestProxyHygiene(unittest.TestCase):
         return (REPO_ROOT / path).read_text()
 
     def test_agency_proxy_uses_request_async(self):
-        src = self._read("titan_plugin/proxies/agency_proxy.py")
+        src = self._read("titan_hcl/proxies/agency_proxy.py")
         self.assertIn("self._bus.request_async(", src)
         self.assertNotRegex(
             src, r"asyncio\.to_thread\(\s*self\._bus\.request\b",
@@ -142,14 +142,14 @@ class TestProxyHygiene(unittest.TestCase):
             "must migrate to await self._bus.request_async(...)")
 
     def test_assessment_proxy_uses_request_async(self):
-        src = self._read("titan_plugin/proxies/assessment_proxy.py")
+        src = self._read("titan_hcl/proxies/assessment_proxy.py")
         self.assertIn("self._bus.request_async(", src)
         self.assertNotRegex(
             src, r"asyncio\.to_thread\(\s*self\._bus\.request\b",
             "assessment_proxy still uses to_thread(self._bus.request)")
 
     def test_rl_proxy_uses_request_async(self):
-        src = self._read("titan_plugin/proxies/rl_proxy.py")
+        src = self._read("titan_hcl/proxies/rl_proxy.py")
         self.assertIn("self._bus.request_async(", src)
         self.assertNotRegex(
             src, r"asyncio\.to_thread\(\s*self\._bus\.request\b",
@@ -159,7 +159,7 @@ class TestProxyHygiene(unittest.TestCase):
         """Project-wide invariant: no proxy may use
         asyncio.to_thread(...bus.request...). Scanner enforces."""
         violations = []
-        proxies_dir = REPO_ROOT / "titan_plugin" / "proxies"
+        proxies_dir = REPO_ROOT / "titan_hcl" / "proxies"
         for f in proxies_dir.glob("*.py"):
             text = f.read_text()
             # Match asyncio.to_thread( ... bus.request ... ) on the same
@@ -179,7 +179,7 @@ class TestPoolStatsEndpointMultiPool(unittest.TestCase):
     """The /v4/thread-pool endpoint must report both pools, not just default."""
 
     def test_endpoint_emits_pools_dict(self):
-        from titan_plugin.api import dashboard
+        from titan_hcl.api import dashboard
         src = inspect.getsource(dashboard.thread_pool_stats)
         self.assertIn('"pools"', src, "endpoint must emit a 'pools' key")
         self.assertIn('"default"', src, "endpoint must report default pool")

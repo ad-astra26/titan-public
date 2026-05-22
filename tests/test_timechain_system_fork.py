@@ -11,7 +11,7 @@ import time
 
 import pytest
 
-from titan_plugin.logic.timechain import (
+from titan_hcl.logic.timechain import (
     BlockPayload, FORK_EPISODIC, FORK_NAMES, FORK_SYSTEM, TimeChain,
 )
 
@@ -117,7 +117,7 @@ class TestDualForkCommit:
 class TestNoBackwardsBreak:
     def test_existing_forks_unchanged(self):
         """Adding FORK_SYSTEM=100 doesn't shift existing fork IDs."""
-        from titan_plugin.logic.timechain import (
+        from titan_hcl.logic.timechain import (
             FORK_MAIN, FORK_DECLARATIVE, FORK_PROCEDURAL,
             FORK_EPISODIC as _EPI, FORK_META, FORK_CONVERSATION,
             FORK_SIDECHAIN_START,

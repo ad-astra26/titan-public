@@ -27,8 +27,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from titan_plugin.core import worker_lifecycle, worker_swap_handler
-from titan_plugin.core.worker_lifecycle import (
+from titan_hcl.core import worker_lifecycle, worker_swap_handler
+from titan_hcl.core.worker_lifecycle import (
     WatcherState,
     clear_parent_death_signal,
     install_full_protection,
@@ -38,7 +38,7 @@ from titan_plugin.core.worker_lifecycle import (
     resume_parent_watcher,
     start_parent_watcher,
 )
-from titan_plugin.core.worker_swap_handler import (
+from titan_hcl.core.worker_swap_handler import (
     SwapHandlerState,
     on_bus_adopt_ack,
     on_bus_handoff,

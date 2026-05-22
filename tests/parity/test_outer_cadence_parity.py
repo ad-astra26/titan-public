@@ -2,7 +2,7 @@
 Cross-language cadence parity test for outer-trinity daemons (post-A.S8 D2).
 
 Verifies the Schumann frequencies + bus publish throttle intervals match
-between Python (`titan_plugin._phase_c_constants`) and Rust
+between Python (`titan_hcl._phase_c_constants`) and Rust
 (`titan-rust/crates/titan-core/src/constants.rs`) regenerated from the
 single SPEC TOML source-of-truth.
 
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from titan_plugin._phase_c_constants import (
+from titan_hcl._phase_c_constants import (
     OUTER_BODY_BUS_PUBLISH_INTERVAL_S,
     OUTER_BODY_TICK_BASE_S,
     OUTER_MIND_BUS_PUBLISH_INTERVAL_S,
@@ -116,22 +116,23 @@ def test_publish_intervals_monotone_decreasing_body_to_spirit() -> None:
 
 
 def test_outer_sidecar_cadence_python_rust_parity() -> None:
-    """OUTER_*_TICK_BASE_S now defines sensor sidecar refresh cadence
+    """OUTER_*_TICK_BASE_S defines sensor sidecar source-refresh cadence
     (and stale threshold = 3× this), NOT daemon tick rate. Daemon ticks
-    at Schumann via SchumannGenerator."""
-    assert OUTER_BODY_TICK_BASE_S == 10.0
-    assert OUTER_MIND_TICK_BASE_S == 5.0
-    assert OUTER_SPIRIT_TICK_BASE_S == 30.0
-    assert _rust_const("OUTER_BODY_TICK_BASE_S") == 10.0
-    assert _rust_const("OUTER_MIND_TICK_BASE_S") == 5.0
-    assert _rust_const("OUTER_SPIRIT_TICK_BASE_S") == 30.0
+    at Schumann via SchumannGenerator. G13 1:3:9 (spirit fastest, body
+    slowest) per D-SPEC-100 — mirrors OUTER_*_BUS_PUBLISH_INTERVAL_S."""
+    assert OUTER_BODY_TICK_BASE_S == 45.0
+    assert OUTER_MIND_TICK_BASE_S == 15.0
+    assert OUTER_SPIRIT_TICK_BASE_S == 5.0
+    assert _rust_const("OUTER_BODY_TICK_BASE_S") == 45.0
+    assert _rust_const("OUTER_MIND_TICK_BASE_S") == 15.0
+    assert _rust_const("OUTER_SPIRIT_TICK_BASE_S") == 5.0
 
 
 def test_stale_thresholds_3x_sidecar_cadence() -> None:
-    """SPEC §18.1 stale rule: 3× sidecar refresh cadence."""
-    assert OUTER_BODY_TICK_BASE_S * 3 == 30.0
-    assert OUTER_MIND_TICK_BASE_S * 3 == 15.0
-    assert OUTER_SPIRIT_TICK_BASE_S * 3 == 90.0
+    """SPEC §18.1 + D-SPEC-100 stale rule: 3× sidecar refresh cadence."""
+    assert OUTER_BODY_TICK_BASE_S * 3 == 135.0
+    assert OUTER_MIND_TICK_BASE_S * 3 == 45.0
+    assert OUTER_SPIRIT_TICK_BASE_S * 3 == 15.0
 
 
 # ── Schumann period derivations (informational) ──────────────────────

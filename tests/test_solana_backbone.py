@@ -41,7 +41,7 @@ def _rpc_reachable(url: str) -> bool:
 def _solana_available() -> bool:
     """Check if Solana SDK is importable."""
     try:
-        from titan_plugin.utils.solana_client import is_available
+        from titan_hcl.utils.solana_client import is_available
         return is_available()
     except Exception:
         return False
@@ -75,7 +75,7 @@ def test_keypair():
 @pytest.fixture(scope="module")
 def network_client(rpc_url, test_keypair):
     """Create a HybridNetworkClient pointed at testnet/devnet."""
-    from titan_plugin.core.network import HybridNetworkClient
+    from titan_hcl.core.network import HybridNetworkClient
 
     config = {
         "solana_network": "devnet" if "devnet" in rpc_url else "testnet",
@@ -98,28 +98,28 @@ class TestSolanaPrimitives:
     """Verify the Solana primitive facade resolves all imports correctly."""
 
     def test_sdk_available(self):
-        from titan_plugin.utils.solana_client import is_available
+        from titan_hcl.utils.solana_client import is_available
         assert is_available(), "Solana SDK should be available"
 
     def test_parse_pubkey(self):
-        from titan_plugin.utils.solana_client import parse_pubkey
+        from titan_hcl.utils.solana_client import parse_pubkey
         # Known testnet system program
         pk = parse_pubkey("11111111111111111111111111111111")
         assert pk is not None
 
     def test_parse_invalid_pubkey(self):
-        from titan_plugin.utils.solana_client import parse_pubkey
+        from titan_hcl.utils.solana_client import parse_pubkey
         pk = parse_pubkey("not-a-valid-pubkey!!!")
         assert pk is None
 
     def test_build_memo_instruction(self, test_keypair):
-        from titan_plugin.utils.solana_client import build_memo_instruction
+        from titan_hcl.utils.solana_client import build_memo_instruction
         ix = build_memo_instruction(test_keypair.pubkey(), "TITAN:TEST|hello=world")
         assert ix is not None
 
     def test_memo_instruction_size_limit(self, test_keypair):
         """Verify memo instruction respects the 566-byte Solana Memo limit."""
-        from titan_plugin.utils.solana_client import build_memo_instruction
+        from titan_hcl.utils.solana_client import build_memo_instruction
         # Under limit
         ix = build_memo_instruction(test_keypair.pubkey(), "A" * 500)
         assert ix is not None
@@ -127,14 +127,14 @@ class TestSolanaPrimitives:
         # (either truncate or return None depending on implementation)
 
     def test_build_compute_budget_instruction(self):
-        from titan_plugin.utils.solana_client import build_compute_budget_instruction
+        from titan_hcl.utils.solana_client import build_compute_budget_instruction
         ix = build_compute_budget_instruction(50000)
         assert ix is not None
 
     def test_load_keypair_from_json(self, tmp_path):
         """Test keypair loading from standard Solana JSON format."""
         from solders.keypair import Keypair
-        from titan_plugin.utils.solana_client import load_keypair_from_json
+        from titan_hcl.utils.solana_client import load_keypair_from_json
 
         kp = Keypair()
         key_path = tmp_path / "test_key.json"
@@ -162,7 +162,7 @@ class TestRPCConnectivity:
     @pytest.mark.asyncio
     async def test_balance_system_program(self, rpc_url):
         """Query a known account (System Program) to verify RPC response parsing."""
-        from titan_plugin.core.network import HybridNetworkClient
+        from titan_hcl.core.network import HybridNetworkClient
 
         config = {
             "solana_network": "devnet",
@@ -193,21 +193,21 @@ class TestMemoTransaction:
     """Verify Memo TX construction produces valid transaction structures."""
 
     def test_memo_instruction_has_correct_program_id(self, test_keypair):
-        from titan_plugin.utils.solana_client import build_memo_instruction
+        from titan_hcl.utils.solana_client import build_memo_instruction
         ix = build_memo_instruction(test_keypair.pubkey(), "TITAN:TEST")
         assert ix is not None
         # Verify the program ID matches Memo Program V2
         assert str(ix.program_id) == "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
 
     def test_memo_instruction_data_is_utf8(self, test_keypair):
-        from titan_plugin.utils.solana_client import build_memo_instruction
+        from titan_hcl.utils.solana_client import build_memo_instruction
         memo_text = "TITAN:EPOCH|root=MERKLE_abc123"
         ix = build_memo_instruction(test_keypair.pubkey(), memo_text)
         assert ix is not None
         assert bytes(ix.data) == memo_text.encode("utf-8")
 
     def test_memo_instruction_signer_is_account(self, test_keypair):
-        from titan_plugin.utils.solana_client import build_memo_instruction
+        from titan_hcl.utils.solana_client import build_memo_instruction
         ix = build_memo_instruction(test_keypair.pubkey(), "test")
         assert ix is not None
         assert len(ix.accounts) >= 1
@@ -222,7 +222,7 @@ class TestZKSchema:
     """Verify the ZK-Omni-Schema encode/decode round-trips correctly."""
 
     def test_encode_decode_round_trip(self):
-        from titan_plugin.utils.solana_client import encode_zk_account_data, decode_zk_account_data
+        from titan_hcl.utils.solana_client import encode_zk_account_data, decode_zk_account_data
 
         state = {
             "schema": "v2.0-sage",
@@ -243,12 +243,12 @@ class TestZKSchema:
         assert decoded["mems"]["persistent_count"] == 42
 
     def test_decode_empty_returns_empty(self):
-        from titan_plugin.utils.solana_client import decode_zk_account_data
+        from titan_hcl.utils.solana_client import decode_zk_account_data
         result = decode_zk_account_data(b"")
         assert result == {}
 
     def test_decode_garbage_returns_empty(self):
-        from titan_plugin.utils.solana_client import decode_zk_account_data
+        from titan_hcl.utils.solana_client import decode_zk_account_data
         result = decode_zk_account_data(b"\x00" * 20)
         assert result == {}
 
@@ -260,27 +260,27 @@ class TestCryptoSolana:
     """Verify cryptographic operations that touch Solana primitives."""
 
     def test_state_hash_deterministic(self):
-        from titan_plugin.utils.crypto import generate_state_hash
+        from titan_hcl.utils.crypto import generate_state_hash
         h1 = generate_state_hash('{"nodes": [1, 2, 3]}')
         h2 = generate_state_hash('{"nodes": [1, 2, 3]}')
         assert h1 == h2
         assert len(h1) == 64  # SHA-256 hex
 
     def test_state_hash_differs_for_different_data(self):
-        from titan_plugin.utils.crypto import generate_state_hash
+        from titan_hcl.utils.crypto import generate_state_hash
         h1 = generate_state_hash("data_a")
         h2 = generate_state_hash("data_b")
         assert h1 != h2
 
     def test_sign_solana_payload(self, test_keypair):
-        from titan_plugin.utils.crypto import sign_solana_payload
+        from titan_hcl.utils.crypto import sign_solana_payload
         sig = sign_solana_payload(test_keypair, "test message")
         assert sig is not None
         assert len(sig) > 40  # Base58-encoded Ed25519 signature
 
     def test_sign_verify_round_trip(self, test_keypair):
         """Sign a message and verify with the same pubkey."""
-        from titan_plugin.utils.crypto import sign_solana_payload
+        from titan_hcl.utils.crypto import sign_solana_payload
         from solders.signature import Signature
         from solders.pubkey import Pubkey
 
@@ -304,7 +304,7 @@ class TestGasLeak:
 
     def test_memo_transaction_size_reasonable(self, test_keypair):
         """A single Memo TX should be well under 1232 bytes (Solana max)."""
-        from titan_plugin.utils.solana_client import build_memo_instruction
+        from titan_hcl.utils.solana_client import build_memo_instruction
         ix = build_memo_instruction(
             test_keypair.pubkey(),
             "TITAN:EPOCH|root=MERKLE_1234567890abcdef",
@@ -317,7 +317,7 @@ class TestGasLeak:
 
     def test_compute_budget_is_micro_lamports(self):
         """Verify compute budget instruction uses microlamports, not lamports."""
-        from titan_plugin.utils.solana_client import build_compute_budget_instruction
+        from titan_hcl.utils.solana_client import build_compute_budget_instruction
         # 50000 microlamports = 0.00005 lamports per CU
         # A typical TX uses ~200k CU, so total = 10 lamports = 0.00000001 SOL
         ix = build_compute_budget_instruction(50000)
@@ -366,7 +366,7 @@ class TestCapabilityReport:
 
     def test_capability_report_structure(self, rpc_url):
         """Build the capability report dict and verify all keys present."""
-        from titan_plugin.utils.solana_client import is_available
+        from titan_hcl.utils.solana_client import is_available
 
         report = {
             "SOLANA_SDK": "ACTIVE" if is_available() else "ABSENT",

@@ -2,7 +2,7 @@
 """
 Titan Architecture Mapper — AST-based dependency and wiring analysis.
 
-Scans titan_plugin/**/*.py and builds a queryable dependency graph that tracks:
+Scans titan_hcl/**/*.py and builds a queryable dependency graph that tracks:
 - Module imports (who imports whom)
 - Class/function definitions with line numbers
 - Function calls (cross-module where detectable)
@@ -27,8 +27,13 @@ Usage:
   python scripts/arch_map.py health                  # LIVE runtime health checks against API
   python scripts/arch_map.py health --all            # Check ALL 3 Titans (T1+T2+T3)
   python scripts/arch_map.py health --t2             # Also check T2 (10.135.0.6:7777)
-  python scripts/arch_map.py services                # Teacher + ARC + Persona diagnostics (all Titans)
+  python scripts/arch_map.py services                # Teacher + ARC + Persona + Events + X-HEALTH diagnostics (all Titans)
   python scripts/arch_map.py services --json         # Same, JSON output (cron-friendly)
+  python scripts/arch_map.py x_check                 # Tail social_x health journal (last 24h on T1, SPEC v1.12.0)
+  python scripts/arch_map.py x_check --hours 6       # Custom window
+  python scripts/arch_map.py health-monitor          # health_monitor_worker plugin status table (T1 only)
+  python scripts/arch_map.py health-monitor --all    # All 3 Titans (SSH for T2/T3)
+  python scripts/arch_map.py health-monitor --plugin social_x  # Filter to one plugin
   python scripts/arch_map.py audit --live            # Static audit + live wiring contract verification
   python scripts/arch_map.py cgn                     # CGN grounding telemetry (T1 only)
   python scripts/arch_map.py cgn --all               # CGN grounding telemetry (all 3 Titans)
@@ -78,16 +83,16 @@ from datetime import datetime, timezone
 
 # ── Configuration ─────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SCAN_DIRS = [PROJECT_ROOT / "titan_plugin"]
+SCAN_DIRS = [PROJECT_ROOT / "titan_hcl"]
 SCRIPTS_DIRS = [PROJECT_ROOT / "scripts"]
 OUTPUT_FILE = PROJECT_ROOT / "architecture_map.json"
-BUS_CONSTANTS_FILE = PROJECT_ROOT / "titan_plugin" / "bus.py"
+BUS_CONSTANTS_FILE = PROJECT_ROOT / "titan_hcl" / "bus.py"
 REL_BASE = PROJECT_ROOT
 
 # Force-prefer the project root next to this script over the
 # editable-install (`__editable__.openclaw_plugin_titan-*.pth`) finder
-# which hardcodes `titan_plugin` → main-repo path. Without this,
-# arch_map subcommands that import `titan_plugin.core.X` from a session
+# which hardcodes `titan_hcl` → main-repo path. Without this,
+# arch_map subcommands that import `titan_hcl.core.X` from a session
 # worktree silently get the main-repo's stale module instead of the
 # worktree's edited code (e.g. fresh RegistrySpec adds invisible).
 # Inserting at 0 puts us ahead of MetaPathFinder.
@@ -859,7 +864,7 @@ def query_depends(graph: dict, filename: str):
     target_modules = set()
     for fp in files:
         if filename.lower() in fp.lower():
-            # Convert file path to module: titan_plugin/logic/dreaming.py -> titan_plugin.logic.dreaming
+            # Convert file path to module: titan_hcl/logic/dreaming.py -> titan_hcl.logic.dreaming
             mod = fp.replace("/", ".").replace(".py", "")
             target_modules.add(mod)
             # Also add short forms
@@ -877,7 +882,7 @@ def query_depends(graph: dict, filename: str):
     for fp, imports in import_graph.items():
         for imp in imports:
             # Precise matching: import must end with a target module component
-            # e.g., "titan_plugin.logic.dreaming" matches target "dreaming"
+            # e.g., "titan_hcl.logic.dreaming" matches target "dreaming"
             imp_parts = imp.split(".")
             for tm in target_modules:
                 tm_parts = tm.split(".")
@@ -1094,7 +1099,7 @@ def show_audit(graph: dict):
     # B: Consumer code exists but nothing sends/publishes it
     #
     # Filters applied (2026-04-08 audit):
-    # - Consumers outside titan_plugin/ are skipped (scripts/arch_map.py
+    # - Consumers outside titan_hcl/ are skipped (scripts/arch_map.py
     #   session-close parser uses `msg["role"] == "assistant"` idiomatically
     #   without it being a DivineBus message type — false positive source)
     # - Consumers marked DEPRECATED/REMOVED/NO_LONGER_USED in the ±3 line
@@ -1110,8 +1115,9 @@ def show_audit(graph: dict):
         intentionally implemented as future-API endpoints awaiting upstream
         wiring (e.g., TimeChain v2 Phase 2 RECALL/CHECK handlers, contract
         engine, CGN_KNOWLEDGE_USAGE awaiting cross-consumer wiring).
-        These are tracked in known_issues.md I-003 as 'incomplete feature'
-        not 'dead handler'.
+        These were originally tracked in known_issues.md I-003 as 'incomplete
+        feature' not 'dead handler' (registry retired 2026-04-25; tracking now
+        in titan-docs/BUGS.md).
         """
         if not consumers_list:
             return False
@@ -1140,12 +1146,12 @@ def show_audit(graph: dict):
 
     # ── Runtime-published signals (cognitive contracts JSON + helper fns) ──
     # Some msg types are published at runtime by the TitanVM contract
-    # interpreter after evaluating JSON contracts (titan_plugin/contracts/**).
+    # interpreter after evaluating JSON contracts (titan_hcl/contracts/**).
     # AST analysis cannot see these — scan the JSON files for "event": "TYPE"
     # entries and treat those types as having runtime publishers.
     import json as _json, glob as _glob
     _runtime_pubs: dict = defaultdict(list)
-    for jf in _glob.glob("titan_plugin/contracts/**/*.json", recursive=True):
+    for jf in _glob.glob("titan_hcl/contracts/**/*.json", recursive=True):
         try:
             with open(jf) as _jfh:
                 _jd = _json.load(_jfh)
@@ -1233,9 +1239,9 @@ def show_audit(graph: dict):
         # Augment with any callers of helper-publisher functions for this type.
         pubs = list(pubs) + _helper_caller_pubs.get(mtype, [])
         consumers = data.get("consumers", [])
-        # Filter consumers to only those inside titan_plugin/ (the bus's canonical tree)
+        # Filter consumers to only those inside titan_hcl/ (the bus's canonical tree)
         valid_consumers = [c for c in consumers
-                          if c.get("file", "").startswith("titan_plugin/")]
+                          if c.get("file", "").startswith("titan_hcl/")]
         if not sends and not pubs and valid_consumers:
             if _is_deprecated_handler(valid_consumers):
                 deprecated_count += 1
@@ -1377,12 +1383,12 @@ def _audit_scope_leaks():
     results = []
     # Files with known scope-sensitive standalone functions
     targets = [
-        ("titan_plugin/modules/spirit_loop.py", "_handle_query"),
-        ("titan_plugin/modules/spirit_worker.py", "_handle_query"),
-        ("titan_plugin/modules/rl_worker.py", "_handle_query"),
-        ("titan_plugin/modules/llm_worker.py", "_handle_query"),
-        ("titan_plugin/modules/mind_worker.py", "_handle_query"),
-        ("titan_plugin/modules/memory_worker.py", "_handle_query"),
+        ("titan_hcl/modules/spirit_loop.py", "_handle_query"),
+        ("titan_hcl/modules/spirit_worker.py", "_handle_query"),
+        ("titan_hcl/modules/rl_worker.py", "_handle_query"),
+        ("titan_hcl/modules/llm_worker.py", "_handle_query"),
+        ("titan_hcl/modules/mind_worker.py", "_handle_query"),
+        ("titan_hcl/modules/memory_worker.py", "_handle_query"),
     ]
 
     # Common builtins/globals that are NOT scope leaks
@@ -1523,7 +1529,7 @@ def _audit_dual_path():
       body tick) and should be checked for mere presence in the file, NOT
       for dual-path completeness. Previously these generated false positives.
     """
-    fpath = PROJECT_ROOT / "titan_plugin" / "modules" / "spirit_worker.py"
+    fpath = PROJECT_ROOT / "titan_hcl" / "modules" / "spirit_worker.py"
     if not fpath.exists():
         return None
 
@@ -1638,7 +1644,7 @@ def show_params(graph: dict):
     """Audit titan_params.toml — find keys that are defined but never referenced in code."""
     import tomllib
 
-    params_file = PROJECT_ROOT / "titan_plugin" / "titan_params.toml"
+    params_file = PROJECT_ROOT / "titan_hcl" / "titan_params.toml"
     if not params_file.exists():
         print(f"ERROR: {params_file} not found")
         return
@@ -1992,19 +1998,43 @@ def query_flow(graph: dict, msg_type: str):
 
 # ── LIVE Health Check ─────────────────────────────────────────────────
 
+# Per-host session pool — TCP keep-alive eliminates connection churn on Titans
+# (each Titan now sees ONE TCP connection from arch_map regardless of N requests).
+# Added 2026-05-14 after T2 EMFILE diagnosis showed our own arch_map was a likely
+# trigger of the 18:54 accept() pile-up burst.
+_HTTP_SESSIONS: dict = {}
+
+
+def _get_session(base_url: str):
+    """Get-or-create a requests.Session for this base_url with keep-alive."""
+    import requests
+    sess = _HTTP_SESSIONS.get(base_url)
+    if sess is None:
+        sess = requests.Session()
+        # Limit per-host connection pool to 2 (one in use + one warm spare)
+        # — enough for sequential probes; doesn't burst the Titan.
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=2, pool_maxsize=2, max_retries=0,
+        )
+        sess.mount("http://", adapter)
+        sess.mount("https://", adapter)
+        sess.headers.update({"Connection": "keep-alive"})
+        _HTTP_SESSIONS[base_url] = sess
+    return sess
+
+
 def _health_get(base_url: str, path: str, timeout: float = 20.0, retries: int = 1) -> dict | None:
     """GET a JSON endpoint, return parsed dict or None on failure.
 
+    Uses per-host keep-alive Session (TCP reuse → zero connection churn on Titan).
     Retries once on transient failure (timeout / non-200 / exception) before
-    giving up. Absorbs network blips on shared-VPS T2/T3 endpoints so that
-    health checks do not report `0 transitions` when the cause is a momentary
-    HTTP error rather than a genuinely-stalled subsystem.
+    giving up. Absorbs network blips on shared-VPS T2/T3 endpoints.
     """
-    import requests
     import time as _time
+    sess = _get_session(base_url)
     for attempt in range(retries + 1):
         try:
-            r = requests.get(f"{base_url}{path}", timeout=timeout)
+            r = sess.get(f"{base_url}{path}", timeout=timeout)
             if r.status_code == 200:
                 return r.json()
         except Exception:
@@ -2071,7 +2101,8 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
     ns1_resp = _unwrap(ns1_raw)
     trinity1_resp = _unwrap(trinity1_raw)
     ns1_transitions = ns1_resp.get("total_transitions", 0)
-    epoch1 = trinity1_resp.get("pi_heartbeat", {}).get("total_epochs_observed", 0)
+    epoch1 = (trinity1_resp.get("unified_spirit", {}).get("epoch_count")
+              or trinity1_resp.get("pi_heartbeat", {}).get("total_epochs_observed", 0))
 
     time.sleep(10)
 
@@ -2082,10 +2113,29 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
     trinity2_resp = _unwrap(trinity2_raw)
     ns2_transitions = ns2_resp.get("total_transitions", 0)
     last_train_ts = ns2_resp.get("last_train_ts", None)
-    epoch2 = trinity2_resp.get("pi_heartbeat", {}).get("total_epochs_observed", 0)
+    epoch2 = (trinity2_resp.get("unified_spirit", {}).get("epoch_count")
+              or trinity2_resp.get("pi_heartbeat", {}).get("total_epochs_observed", 0))
 
     ns_fetch_failed = ns1_raw is None or ns2_raw is None
     trinity_fetch_failed = trinity1_raw is None or trinity2_raw is None
+
+    # Phase C shape detection: post-2026-05-14 the /v4/nervous-system response
+    # carries only {age_seconds, programs, seq} with per-program payload
+    # {urgency, fire_count, total_updates, last_loss}. Phase A/B carried
+    # top-level {total_transitions, last_train_ts} + per-program
+    # {feature_set, input_dim, obs_dim, ...}. The old check fields are absent
+    # on every Titan today, so detect by shape and switch behavior rather
+    # than alarm on the missing fields.
+    def _ns_total_updates(resp: dict) -> float:
+        return sum(float((p or {}).get("total_updates", 0) or 0)
+                   for p in (resp.get("programs", {}) or {}).values())
+
+    _ns_phase_c_shape = (
+        not ns_fetch_failed
+        and ns2_transitions == 0
+        and last_train_ts in (None, 0, 0.0)
+        and "programs" in ns2_resp
+    )
 
     # ── 2. NS training active (age-based — no 10s window blip) ────────
     # Switched from 10s delta sampling to `now - last_train_ts` age check.
@@ -2095,6 +2145,16 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
     # so age is the single source of truth.
     if ns_fetch_failed:
         warn("NS training — /v4/nervous-system fetch failed (transient HTTP error — re-run check)")
+    elif _ns_phase_c_shape:
+        # Phase C shape — derive activity from sum(total_updates) delta.
+        _u1, _u2 = _ns_total_updates(ns1_resp), _ns_total_updates(ns2_resp)
+        _u_delta = _u2 - _u1
+        if _u_delta > 0:
+            ok(f"NS training active (Σtotal_updates {_u1:.0f} -> {_u2:.0f}, +{_u_delta:.0f} in 10s, Phase C shape)")
+        elif _u2 > 0:
+            warn(f"NS training idle (Σtotal_updates={_u2:.0f}, +0 in 10s — quiet period or stall)")
+        else:
+            warn(f"NS training cold (Σtotal_updates=0 across {len(ns2_resp.get('programs', {}))} programs)")
     elif ns2_transitions == 0 and last_train_ts in (None, 0, 0.0):
         fail("NS training not running (0 transitions, no last_train_ts)")
     elif last_train_ts in (None, 0, 0.0):
@@ -2152,19 +2212,37 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
             ok(f"IQL/reasoning ready (chains={rsn2_chains}, awaiting first chain)")
 
     # ── 2b. NS program feature_set vs input_dim consistency ──────────
+    # Phase C /v4/nervous-system payload only carries {urgency, fire_count,
+    # total_updates, last_loss} per program — feature_set + input_dim were
+    # in the Phase A/B snapshot but were dropped when the Rust ns_worker
+    # took over the slot (publish-path gap, same class as the pi_heartbeat
+    # rich-stats gap). Skip the check when no program carries the legacy
+    # fields rather than fail-alarm on the missing schema.
     _dim_map = {"core": 30, "standard": 55, "extended": 75, "full": 88, "enriched": 79, "full_enriched": 112}
     ns_programs = ns2_resp.get("programs", {})
-    _dim_mismatches = []
-    for _pname, _pinfo in ns_programs.items():
-        _fs = _pinfo.get("feature_set", "standard")
-        _expected = _dim_map.get(_fs, 55)
-        _actual = _pinfo.get("input_dim", 0)
-        if _expected != _actual:
-            _dim_mismatches.append(f"{_pname}: {_fs}={_expected}D but net={_actual}D")
-    if not _dim_mismatches:
-        ok(f"NS dimensions consistent ({len(ns_programs)} programs, feature_set matches input_dim)")
+    _has_dim_fields = any(
+        ("feature_set" in (p or {}) or "input_dim" in (p or {}))
+        for p in ns_programs.values()
+    )
+    if not ns_programs:
+        # already covered by ns_fetch_failed path above; nothing to assert
+        pass
+    elif not _has_dim_fields:
+        warn(f"NS dim check skipped (Phase C shape — programs={len(ns_programs)} expose "
+             f"{{urgency, fire_count, total_updates, last_loss}} only; feature_set+input_dim "
+             f"absent from API. Verify NS network shape via direct ns_worker introspection.)")
     else:
-        fail(f"NS dimension MISMATCH (silent training failure): {', '.join(_dim_mismatches)}")
+        _dim_mismatches = []
+        for _pname, _pinfo in ns_programs.items():
+            _fs = _pinfo.get("feature_set", "standard")
+            _expected = _dim_map.get(_fs, 55)
+            _actual = _pinfo.get("input_dim", 0)
+            if _expected != _actual:
+                _dim_mismatches.append(f"{_pname}: {_fs}={_expected}D but net={_actual}D")
+        if not _dim_mismatches:
+            ok(f"NS dimensions consistent ({len(ns_programs)} programs, feature_set matches input_dim)")
+        else:
+            fail(f"NS dimension MISMATCH (silent training failure): {', '.join(_dim_mismatches)}")
 
     # ── 3. Consciousness epochs advancing (retry on suspect stall) ────
     # A 10s window can catch a brief pause (module subprocess restart, dream
@@ -2186,7 +2264,9 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
             if trinity3_raw is None:
                 warn(f"Consciousness stalled (epoch {epoch2}, +0 in 10s; retry fetch failed)")
             else:
-                epoch3 = _unwrap(trinity3_raw).get("pi_heartbeat", {}).get("total_epochs_observed", 0)
+                _t3resp = _unwrap(trinity3_raw)
+                epoch3 = (_t3resp.get("unified_spirit", {}).get("epoch_count")
+                          or _t3resp.get("pi_heartbeat", {}).get("total_epochs_observed", 0))
                 if epoch3 > epoch2:
                     ok(f"Consciousness advancing (epoch {epoch1} -> {epoch3} confirmed after retry)")
                 else:
@@ -2350,21 +2430,50 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
         # but they may not be in the coordinator response yet
         warn("Sleep/wake drives not exposed in API (emergent dreaming may need wiring)")
 
-    # ── 11. Experience records growing ────────────────────────────────
-    try:
-        db_path = str(PROJECT_ROOT / "data" / "experience_orchestrator.db")
-        conn = sqlite3.connect(db_path, timeout=5.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        total_records = conn.execute("SELECT COUNT(*) FROM experience_records").fetchone()[0]
-        undistilled = conn.execute(
-            "SELECT COUNT(*) FROM experience_records WHERE distilled=0").fetchone()[0]
-        conn.close()
-        if total_records > 0:
-            ok(f"Experience records ({total_records} total, {undistilled} undistilled)")
-        else:
-            warn("Experience records empty (0 total)")
-    except Exception as e:
-        warn(f"Experience DB not accessible ({e})")
+    # ── 11. Experience records growing + distillation health (loop B) ──────
+    # rFP_experience_distillation_phase_c Bug A: experience_orchestrator.db is
+    # LOCAL to each Titan's host. Reading PROJECT_ROOT's copy for a remote
+    # T2/T3 base_url reports T1's numbers (byte-identical across hosts = the
+    # 2026-05-21 false signal). Gate to localhost; remote → local-only note.
+    # Plus a DIRECT loop-B check: experience RECORDING must be live (recent
+    # record) — catches a Record-stage disconnect (the regression this rFP
+    # fixed) which the API distill counters alone cannot, since the homeostatic
+    # DreamingEngine counters keep advancing even when recording is dead.
+    _is_local = ("127.0.0.1" in base_url or "localhost" in base_url)
+    if _is_local:
+        try:
+            db_path = str(PROJECT_ROOT / "data" / "experience_orchestrator.db")
+            conn = sqlite3.connect(db_path, timeout=5.0)
+            conn.execute("PRAGMA journal_mode=WAL")
+            total_records = conn.execute(
+                "SELECT COUNT(*) FROM experience_records").fetchone()[0]
+            undistilled = conn.execute(
+                "SELECT COUNT(*) FROM experience_records WHERE distilled=0"
+            ).fetchone()[0]
+            newest = conn.execute(
+                "SELECT MAX(created_at) FROM experience_records").fetchone()[0]
+            conn.close()
+            if total_records > 0:
+                _age_h = ((time.time() - float(newest)) / 3600.0
+                          if newest else 1e9)
+                _distilled_pct = (
+                    100.0 * (total_records - undistilled) / total_records)
+                if _age_h > 48:
+                    fail(f"EXPERIENCE RECORDING STALLED — newest record "
+                         f"{_age_h:.1f}h ago ({total_records} total, "
+                         f"{_distilled_pct:.1f}% distilled). Record stage may be "
+                         f"disconnected (rFP_experience_distillation_phase_c).")
+                else:
+                    ok(f"Experience records ({total_records} total, "
+                       f"{_distilled_pct:.1f}% distilled, newest {_age_h:.1f}h "
+                       f"ago, {undistilled} undistilled)")
+            else:
+                warn("Experience records empty (0 total)")
+        except Exception as e:
+            warn(f"Experience DB not accessible ({e})")
+    else:
+        ok("Experience records — local-only DB (checked on T1; remote host's "
+           "experience_orchestrator.db not read over network)")
 
     # ── 12. Bus queue healthy ─────────────────────────────────────────
     try:
@@ -2448,8 +2557,15 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
         ok(f"Dream distillation pending (cycles={cycle_count}, attempts={distill_attempts})")
 
     # ── 15. π-Heartbeat health (curvature rate + cluster growth) ────────
+    # Phase C shape detection (2026-05-19): under l0_rust_enabled=true the
+    # /v4/inner-trinity.pi_heartbeat block returns the Rust kernel-rs clock
+    # primitive {phase, pulse_count, age_seconds, seq} — the rich Python
+    # PiHeartbeatMonitor stats (heartbeat_ratio, cluster_count,
+    # total_pi_epochs, avg_cluster_size) live in cognitive_worker.pi_monitor
+    # but never reach the API (publish-path gap). The monitor IS observing
+    # — state persists fresh to data/pi_heartbeat_state.json.
     pi_data = trinity2_resp.get("pi_heartbeat", {})
-    if pi_data:
+    if pi_data and "heartbeat_ratio" in pi_data:
         pi_rate = pi_data.get("heartbeat_ratio", 0)
         pi_clusters = pi_data.get("cluster_count", 0)
         pi_total = pi_data.get("total_epochs_observed", 0)
@@ -2467,6 +2583,24 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
         else:
             fail(f"π-heartbeat CRITICAL (rate={pi_rate*100:.2f}% — near-zero curvature, "
                  f"6 critical systems may degrade)")
+    elif pi_data and "pulse_count" in pi_data:
+        # Phase C kernel-rs clock primitive shape — clock is running but
+        # rich monitor stats are not exposed via API. Surface as WARN, not
+        # CRITICAL: the clock is healthy and the Python monitor IS observing
+        # (state persists to data/pi_heartbeat_state.json). Underlying gap
+        # belongs to a follow-up rFP wiring cognitive_worker.pi_monitor →
+        # SHM slot or bus publish (current spirit_loop publish path is
+        # Phase A/B only). Reading pulse_count delta from the prior fetch
+        # confirms the clock is advancing.
+        _prev_pulse = (trinity1_resp.get("pi_heartbeat", {}) or {}).get("pulse_count", 0)
+        _now_pulse = pi_data.get("pulse_count", 0)
+        _pulse_delta = _now_pulse - _prev_pulse
+        if _pulse_delta > 0:
+            warn(f"π-heartbeat clock advancing (pulse={_now_pulse}, +{_pulse_delta} in 10s) "
+                 f"— Phase C publish-path gap: rich PiHeartbeatMonitor stats not exposed via "
+                 f"API (see data/pi_heartbeat_state.json for ratio/clusters). Follow-up rFP needed.")
+        else:
+            fail(f"π-heartbeat clock STALLED (pulse={_now_pulse}, +0 in 10s — kernel-rs clock not advancing)")
     else:
         warn("π-heartbeat data not available in API")
 
@@ -2932,11 +3066,14 @@ def _services_get(base_url: str, path: str, timeout: float = 15.0) -> dict | Non
     """
     import requests
     import sys as _sys
+    # Reuse the per-host keep-alive Session (see _get_session above) so services
+    # diagnostics don't burst connections on the Titan. Same TCP for every probe.
+    sess = _get_session(base_url)
     key = (base_url, path)
     _SERVICES_GET_LAST_ERROR.pop(key, None)
     for attempt in (1, 2):
         try:
-            r = requests.get(f"{base_url}{path}", timeout=timeout)
+            r = sess.get(f"{base_url}{path}", timeout=timeout)
             if r.status_code != 200:
                 _SERVICES_GET_LAST_ERROR[key] = f"http_{r.status_code}"
                 print(f"[services_get] {base_url}{path} → HTTP {r.status_code}",
@@ -3423,6 +3560,12 @@ def run_services_diagnostics(json_output: bool = False):
         # Events Teacher
         all_results.append(_check_events_teacher(base_url, titan_id))
 
+    # X-HEALTH integration (SPEC v1.12.0 D-SPEC-67) — single canonical-
+    # poller check, appended once (not per-Titan loop). Reads T1's
+    # health_monitor state.json directly. Other Titans have no social_x
+    # plugin loaded by design (applies_on=canonical_poller filter).
+    all_results.append(_check_social_x_health())
+
     if json_output:
         # Cron-friendly: one JSON line per result with timestamp
         ts = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
@@ -3442,10 +3585,12 @@ def run_services_diagnostics(json_output: bool = False):
     print("=" * 90)
 
     # Group by subsystem for clear reading
-    for subsystem in ("teacher", "arc", "persona", "events_teacher"):
+    for subsystem in ("teacher", "arc", "persona", "events_teacher",
+                       "social_x_health"):
         sub_label = {"teacher": "LANGUAGE TEACHER", "arc": "ARC (REASONING)",
                      "persona": "PERSONA SOCIAL",
-                     "events_teacher": "EVENTS TEACHER"}[subsystem]
+                     "events_teacher": "EVENTS TEACHER",
+                     "social_x_health": "X HEALTH (social_x plugin)"}[subsystem]
         print(f"\n  {sub_label}")
         print(f"  {'-' * 86}")
 
@@ -3487,6 +3632,16 @@ def run_services_diagnostics(json_output: bool = False):
                 last = r.get("last_run_ago", "?")
                 print(f"    {icon} {tid}  windows={windows:>4d}  last={last:<18s}  "
                       f"| {r.get('details', '')}")
+            elif subsystem == "social_x_health":
+                ls = r.get("last_status", "?")
+                ll = r.get("last_layer", "")
+                la = r.get("last_check_ago", "?")
+                cf = r.get("consecutive_failures", 0)
+                h24 = r.get("heals_24h", 0)
+                print(f"    {icon} {tid}  last_status={ls:<8s} "
+                      f"layer={ll:<10s} check_ago={la:<8s} "
+                      f"heals_24h={h24} consec_fail={cf}  "
+                      f"| {r.get('details', '')}")
 
     # Summary line
     ok_count = sum(1 for r in all_results if r["status"] == "ok")
@@ -3497,6 +3652,396 @@ def run_services_diagnostics(json_output: bool = False):
     print("=" * 90)
 
     return all_results
+
+
+# ── Health Monitor (SPEC v1.12.0 §9.B + D-SPEC-67 — rFP Phase 2) ─────
+#
+# Two subcommands:
+#   `arch_map x_check`         — tail recent social_x events from journal
+#   `arch_map health-monitor`  — full plugin status table per Titan
+#
+# Plus integration into `arch_map services` (X-HEALTH section appended
+# after the existing 4 subsystems — pulls last social_x status from T1
+# state.json).
+#
+# Data sources:
+#   data/health_monitor/state.json   — last result + heal-history per plugin
+#   data/health_monitor/events.jsonl — append-only audit (check_result,
+#                                       heal_request, heal_result events)
+#
+# T1 reads local files; T2/T3 SSH to root@10.135.0.6 against the remote
+# titan dir (/home/antigravity/projects/titan/ for T2, .../titan3/ for T3).
+# Per `feedback_t2t3_management_only_scripts.md` — read-only state queries
+# don't go through manage scripts; ssh + cat is fine for inspection.
+
+import subprocess as _subprocess  # noqa: E402 (import-after-code is OK
+                                   # in this file; matches existing style)
+
+_HM_REMOTE_HOST = "root@10.135.0.6"
+_HM_REMOTE_DIRS = {
+    "T2": "/home/antigravity/projects/titan",
+    "T3": "/home/antigravity/projects/titan3",
+}
+_HM_STATE_REL = "data/health_monitor/state.json"
+_HM_JOURNAL_REL = "data/health_monitor/events.jsonl"
+
+
+def _hm_read_state(titan_id: str) -> dict | None:
+    """Read state.json for the given Titan. Returns parsed dict or None on
+    any error (file missing, ssh fail, JSON parse)."""
+    if titan_id == "T1":
+        p = PROJECT_ROOT / _HM_STATE_REL
+        if not p.exists():
+            return None
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            return None
+    remote_dir = _HM_REMOTE_DIRS.get(titan_id)
+    if not remote_dir:
+        return None
+    try:
+        r = _subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=5", "-o",
+             "BatchMode=yes", _HM_REMOTE_HOST,
+             f"cat {remote_dir}/{_HM_STATE_REL} 2>/dev/null || true"],
+            capture_output=True, text=True, timeout=12)
+        if not r.stdout.strip():
+            return None
+        return json.loads(r.stdout)
+    except Exception:
+        return None
+
+
+def _hm_read_journal_tail(titan_id: str,
+                           max_lines: int = 500) -> list[dict]:
+    """Read the last `max_lines` events from events.jsonl on the given
+    Titan. Returns a list of parsed event dicts (oldest → newest).
+    Empty list on any error."""
+    if titan_id == "T1":
+        p = PROJECT_ROOT / _HM_JOURNAL_REL
+        if not p.exists():
+            return []
+        try:
+            # Cheap tail — read whole file (50MB rotation cap).
+            lines = p.read_text().splitlines()
+        except Exception:
+            return []
+        out: list[dict] = []
+        for line in lines[-max_lines:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                # Per-line tolerant — one corrupt line must not silence
+                # the whole tail.
+                continue
+        return out
+    remote_dir = _HM_REMOTE_DIRS.get(titan_id)
+    if not remote_dir:
+        return []
+    try:
+        r = _subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=5", "-o",
+             "BatchMode=yes", _HM_REMOTE_HOST,
+             f"tail -n {max_lines} {remote_dir}/{_HM_JOURNAL_REL} "
+             "2>/dev/null || true"],
+            capture_output=True, text=True, timeout=12)
+        out: list[dict] = []
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def _hm_ago(ts: float | None, now: float | None = None) -> str:
+    """Human-readable 'time ago' for a unix timestamp. Future timestamps
+    render as 'in Xm' (used for next_fire_time scheduler display)."""
+    if not ts:
+        return "never"
+    if now is None:
+        import time as _t
+        now = _t.time()
+    delta = now - float(ts)
+    if delta < 0:
+        # Future — scheduler next-fire-time. Format with 'in ' prefix.
+        future = -delta
+        if future < 60:
+            return f"in {int(future)}s"
+        if future < 3600:
+            return f"in {int(future / 60)}m"
+        if future < 86400:
+            return f"in {future / 3600:.1f}h"
+        return f"in {future / 86400:.1f}d"
+    if delta < 60:
+        return f"{int(delta)}s"
+    if delta < 3600:
+        return f"{int(delta / 60)}m"
+    if delta < 86400:
+        return f"{delta / 3600:.1f}h"
+    return f"{delta / 86400:.1f}d"
+
+
+def _hm_status_icon(status: str) -> str:
+    return {"OK": "✓", "DEGRADED": "⚠",
+            "DOWN": "✗"}.get(status, "?")
+
+
+def run_x_check(args: list) -> int:
+    """`arch_map x_check [--hours H] [--titan T1|T2|T3]`
+
+    Tail the social_x plugin events from the health-monitor journal.
+    Default window 24h, T1 only (social_x is canonical_poller, so T2/T3
+    skip it at plugin discovery anyway).
+    """
+    import time as _t
+
+    titan_id = "T1"
+    hours = 24.0
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--titan" and i + 1 < len(args):
+            titan_id = args[i + 1].upper()
+            i += 2
+        elif a.startswith("--titan="):
+            titan_id = a.split("=", 1)[1].upper()
+            i += 1
+        elif a == "--hours" and i + 1 < len(args):
+            hours = float(args[i + 1])
+            i += 2
+        elif a.startswith("--hours="):
+            hours = float(a.split("=", 1)[1])
+            i += 1
+        elif a in ("-h", "--help"):
+            print("Usage: arch_map x_check [--hours H] "
+                  "[--titan T1|T2|T3]")
+            print("Tail social_x plugin events from the "
+                  "health-monitor journal.")
+            return 0
+        else:
+            print(f"Unknown arg: {a}", file=sys.stderr)
+            return 1
+
+    cutoff = _t.time() - (hours * 3600.0)
+    events = _hm_read_journal_tail(titan_id, max_lines=2000)
+    if not events:
+        print(f"  (no health-monitor journal on {titan_id} — "
+              "worker may not be running yet, or no events "
+              "in this window)")
+        return 0
+
+    # Filter to social_x events only.
+    sx_events: list[dict] = []
+    for ev in events:
+        if ev.get("ts", 0) < cutoff:
+            continue
+        payload = ev.get("payload") or {}
+        if payload.get("plugin") != "social_x":
+            continue
+        sx_events.append(ev)
+
+    print(f"\nSOCIAL_X HEALTH — last {hours:g}h on {titan_id}")
+    print("=" * 90)
+    if not sx_events:
+        print(f"  (no social_x events in last {hours:g}h)")
+        print("=" * 90)
+        return 0
+
+    # Group by kind for readability.
+    check_results = [e for e in sx_events
+                     if e.get("kind") == "check_result"]
+    heal_requests = [e for e in sx_events
+                     if e.get("kind") == "heal_request"]
+    heal_results = [e for e in sx_events
+                    if e.get("kind") == "heal_result"]
+
+    if check_results:
+        print(f"\n  CHECK RESULTS ({len(check_results)}):")
+        # Group by layer; show count of each status + most recent.
+        layers: dict[str, list[dict]] = {}
+        for ev in check_results:
+            p = ev.get("payload") or {}
+            layers.setdefault(p.get("layer", "?"), []).append(ev)
+        for layer, evs in sorted(layers.items()):
+            statuses = [(e.get("payload") or {}).get("status", "?")
+                        for e in evs]
+            ok = sum(1 for s in statuses if s == "OK")
+            deg = sum(1 for s in statuses if s == "DEGRADED")
+            down = sum(1 for s in statuses if s == "DOWN")
+            last = evs[-1].get("payload") or {}
+            icon = _hm_status_icon(last.get("status", "?"))
+            print(f"    {icon} layer={layer:<10s} "
+                  f"OK={ok} DEG={deg} DOWN={down}  "
+                  f"last: {last.get('status', '?'):<8s} "
+                  f"reason={last.get('reason', ''):<35s} "
+                  f"ago={_hm_ago(last.get('ts'))}")
+    if heal_requests:
+        print(f"\n  HEAL REQUESTS ({len(heal_requests)}):")
+        for ev in heal_requests[-10:]:
+            p = ev.get("payload") or {}
+            print(f"    → action={p.get('action', '?'):<20s} "
+                  f"owning={p.get('owning_worker', '?'):<10s} "
+                  f"correlation={p.get('correlation_id', '')[:12]}  "
+                  f"ago={_hm_ago(ev.get('ts'))}")
+    if heal_results:
+        print(f"\n  HEAL RESULTS ({len(heal_results)}):")
+        for ev in heal_results[-10:]:
+            p = ev.get("payload") or {}
+            icon = "✓" if p.get("success") else "✗"
+            print(f"    {icon} action={p.get('action', '?'):<20s} "
+                  f"success={p.get('success')} "
+                  f"reason={p.get('reason', ''):<35s} "
+                  f"ago={_hm_ago(ev.get('ts'))}")
+
+    print("=" * 90)
+    return 0
+
+
+def run_health_monitor(args: list) -> int:
+    """`arch_map health-monitor [--all] [--titan T1|T2|T3] [--plugin NAME]`
+
+    Full plugin status table. Default = T1 only. `--all` queries T1+T2+T3
+    via SSH for T2/T3. `--plugin NAME` filters to one plugin.
+    """
+    import time as _t
+
+    targets = ["T1"]
+    plugin_filter: str | None = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--all":
+            targets = ["T1", "T2", "T3"]
+            i += 1
+        elif a == "--titan" and i + 1 < len(args):
+            targets = [args[i + 1].upper()]
+            i += 2
+        elif a.startswith("--titan="):
+            targets = [a.split("=", 1)[1].upper()]
+            i += 1
+        elif a == "--plugin" and i + 1 < len(args):
+            plugin_filter = args[i + 1]
+            i += 2
+        elif a.startswith("--plugin="):
+            plugin_filter = a.split("=", 1)[1]
+            i += 1
+        elif a in ("-h", "--help"):
+            print("Usage: arch_map health-monitor [--all] "
+                  "[--titan T1|T2|T3] [--plugin NAME]")
+            print("Show health_monitor_worker plugin status table.")
+            return 0
+        else:
+            print(f"Unknown arg: {a}", file=sys.stderr)
+            return 1
+
+    now = _t.time()
+    print("\nHEALTH MONITOR STATUS")
+    print("=" * 100)
+
+    any_data = False
+    for titan_id in targets:
+        state = _hm_read_state(titan_id)
+        print(f"\n  {titan_id} ({TITAN_ENDPOINTS.get(titan_id, '?')})")
+        print(f"  {'-' * 96}")
+        if state is None:
+            print(f"    (no state.json — health_monitor_worker not "
+                  f"running, or no plugins active on {titan_id})")
+            continue
+        any_data = True
+        plugins = state.get("plugins") or {}
+        if not plugins:
+            print("    (no plugins loaded — registry filtered to "
+                  "zero for this Titan's role)")
+            continue
+        updated_at = state.get("updated_at")
+        if updated_at:
+            print(f"    state.json updated_at: "
+                  f"{_hm_ago(updated_at, now)} ago")
+        for pname, p_state in sorted(plugins.items()):
+            if plugin_filter and pname != plugin_filter:
+                continue
+            last_result = (p_state.get("last_result") or {})
+            heal_history = p_state.get("heal_history_24h") or []
+            cf = int(p_state.get("consecutive_failures", 0))
+            next_fire = p_state.get("next_fire_time")
+            last_heal_at = p_state.get("last_heal_at")
+            status = last_result.get("status", "?")
+            reason = last_result.get("reason", "")
+            layer = last_result.get("layer", "")
+            last_ts = last_result.get("ts")
+            icon = _hm_status_icon(status)
+            heals_24h = len(heal_history)
+            successes = sum(1 for h in heal_history
+                            if h.get("result") == "success")
+            print(f"    {icon} {pname:<20s} status={status:<8s} "
+                  f"layer={layer:<10s} reason={reason:<32s}")
+            print(f"      last_check: {_hm_ago(last_ts, now):<8s} "
+                  f"next_check: {_hm_ago(next_fire, now):<8s} "
+                  f"(in future means scheduled)")
+            print(f"      heal_history_24h: total={heals_24h} "
+                  f"success={successes} failed={heals_24h - successes} "
+                  f"consecutive_failures={cf} "
+                  f"last_heal: {_hm_ago(last_heal_at, now)}")
+    print("=" * 100)
+    if not any_data:
+        print("\n  No health_monitor data found on any target Titan.")
+        print("  Either the worker hasn't shipped, hasn't booted, or "
+              "no plugins survived the applies_on filter.")
+        return 1
+    return 0
+
+
+def _check_social_x_health() -> dict:
+    """For `arch_map services` X-HEALTH integration. Returns a single-
+    dict result for T1 (canonical poller for social_x). Schema matches
+    other `_check_*` helpers in this file (status, details, titan, subsystem)."""
+    state = _hm_read_state("T1")
+    if state is None:
+        return {
+            "titan": "T1", "subsystem": "social_x_health",
+            "status": "warn",
+            "details": "health_monitor state.json missing (worker "
+                       "not yet booted or no canonical_poller plugin)",
+            "pipeline_status": "?", "posting_status": "?",
+            "last_check_ago": "?",
+        }
+    p_state = (state.get("plugins") or {}).get("social_x")
+    if p_state is None:
+        return {
+            "titan": "T1", "subsystem": "social_x_health",
+            "status": "warn",
+            "details": "social_x plugin not loaded on T1",
+            "pipeline_status": "?", "posting_status": "?",
+            "last_check_ago": "?",
+        }
+    last_result = p_state.get("last_result") or {}
+    last_status = last_result.get("status", "?")
+    overall = "ok"
+    if last_status in ("DEGRADED",):
+        overall = "warn"
+    elif last_status == "DOWN":
+        overall = "fail"
+    return {
+        "titan": "T1", "subsystem": "social_x_health",
+        "status": overall,
+        "details": last_result.get("reason", ""),
+        "last_status": last_status,
+        "last_layer": last_result.get("layer", ""),
+        "last_check_ago": _hm_ago(last_result.get("ts")),
+        "consecutive_failures": int(
+            p_state.get("consecutive_failures", 0)),
+        "heals_24h": len(p_state.get("heal_history_24h") or []),
+    }
 
 
 # ── Live Wiring Contract Verification ────────────────────────────────
@@ -4074,10 +4619,10 @@ def run_deploy(targets: list, restart: bool = False):
         print(f"{'='*60}")
 
         if target == "t2":
-            # Use existing deploy_t2.sh (well-tested, handles config.toml safely)
-            cmd = f"bash {TITAN_DIR}/scripts/deploy_t2.sh"
-            if restart:
-                cmd += " --restart"
+            # Use unified t2_manage.sh (per Phase C fleet management — replaces
+            # retired deploy_t2.sh; restart is always part of the deploy flow
+            # so the legacy `restart` flag is now a no-op for T2).
+            cmd = f"bash {TITAN_DIR}/scripts/t2_manage.sh deploy"
             print(f"  Running: {cmd}")
             try:
                 proc = subprocess.run(cmd, shell=True, capture_output=True,
@@ -4100,15 +4645,15 @@ def run_deploy(targets: list, restart: bool = False):
             print("  ⚠  config.toml EXCLUDED (T3 port=7778)")
 
             rsync_cmds = [
-                # 1. titan_plugin/ — code only, config.toml explicitly excluded
+                # 1. titan_hcl/ — code only, config.toml explicitly excluded
                 f"rsync -az {exclude_str} --exclude='config.toml' "
-                f"{TITAN_DIR}/titan_plugin/ {T2_HOST}:{T3_DIR}/titan_plugin/",
+                f"{TITAN_DIR}/titan_hcl/ {T2_HOST}:{T3_DIR}/titan_hcl/",
                 # 2. scripts/ — deployment and management tools
                 f"rsync -az --exclude='__pycache__/' --exclude='*.pyc' "
                 f"{TITAN_DIR}/scripts/ {T2_HOST}:{T3_DIR}/scripts/",
                 # 3. titan_params.toml ONLY — shared tuning parameters (NOT config.toml)
-                f"rsync -az {TITAN_DIR}/titan_plugin/titan_params.toml "
-                f"{T2_HOST}:{T3_DIR}/titan_plugin/titan_params.toml",
+                f"rsync -az {TITAN_DIR}/titan_hcl/titan_params.toml "
+                f"{T2_HOST}:{T3_DIR}/titan_hcl/titan_params.toml",
             ]
             try:
                 for cmd in rsync_cmds:
@@ -4118,7 +4663,7 @@ def run_deploy(targets: list, restart: bool = False):
 
                 # Verify T3 config integrity — port MUST be 7778
                 port_check = subprocess.run(
-                    f"ssh {T2_HOST} \"grep '^port = ' {T3_DIR}/titan_plugin/config.toml\"",
+                    f"ssh {T2_HOST} \"grep '^port = ' {T3_DIR}/titan_hcl/config.toml\"",
                     shell=True, capture_output=True, text=True, timeout=10)
                 port_line = port_check.stdout.strip()
                 if "7778" in port_line:
@@ -4643,9 +5188,32 @@ def run_voice_diagnostics(all_titans: bool = False, hours: int = 24):
 
 
 def run_errors(all_titans: bool = False):
-    """Scan Titan logs for errors, group and count them."""
+    """Scan Titan logs for errors, group and count them.
+
+    Per-Titan log source selection:
+      - T1: local /tmp/titan_brain.log (Phase A+B — Python kernel writes brain log).
+      - T2: ssh /tmp/titan2_brain.log (Phase A+B — same).
+      - T3: ssh /tmp/titan3_brain.log, **with fallback to journald** when the
+        brain log is stale (mtime > LOG_STALE_THRESHOLD_S). T3 runs under
+        Phase C / titan-t3.service (`l0_rust_enabled=true`) since 2026-05-05
+        C-S7 — titan-kernel-rs is L0 supervisor and the Python plugin's
+        stdout/stderr are inherited via systemd-journald, NOT redirected
+        to /tmp/titan3_brain.log. The brain log file may still exist as a
+        stale artifact from before the systemd migration; reading it without
+        a freshness check returns logs frozen at the last pre-migration
+        write — exactly the silent failure mode that hid BUG-T3-PARENT-DEADLOCK
+        on 2026-05-14 (file frozen May 8; investigator read "current" errors
+        from 6 days earlier).
+
+    Fix (2026-05-14): for every remote Titan, stat the log file remotely; if
+    mtime is older than LOG_STALE_THRESHOLD_S, fall back to `journalctl
+    SYSLOG_IDENTIFIER=titan-kernel-rs` with the matching titan_id filter.
+    Print which source was used so operators see whether they're reading
+    live data or a stale file.
+    """
     import subprocess
     import re as _re
+    import time as _time_errors
 
     # Known noise patterns to exclude
     NOISE = [
@@ -4654,6 +5222,12 @@ def run_errors(all_titans: bool = False):
         "RequestsDependencyWarning", "urllib3", "charset_normalizer",
     ]
     noise_pattern = "|".join(NOISE)
+
+    # If a remote brain log hasn't been written to in this long, fall back
+    # to journald. 10 min is conservative — a healthy Titan writes brain
+    # log every second (heartbeat publishes), so anything older means the
+    # process moved its stdout/stderr elsewhere (Phase C systemd-journald).
+    LOG_STALE_THRESHOLD_S = 600
 
     log_sources = [("T1", "/tmp/titan_brain.log", "local")]
     if all_titans:
@@ -4668,26 +5242,108 @@ def run_errors(all_titans: bool = False):
     print("=" * 90)
 
     for tid, log_path, mode in log_sources:
-        print(f"\n  {tid} — {log_path}")
-        print("  " + "-" * 80)
-
         # Get last 2000 lines of log
         if mode == "local":
+            # Phase C also retired T1's brain log: kernel-rs runs under systemd
+            # with StandardOutput=journal, so /tmp/titan_brain.log only exists
+            # while a Phase A/B process held the path. After the fleet-wide
+            # Phase C migration (2026-05-14) T1 stops writing to it across
+            # restarts. Mirror the T2/T3 staleness check + journalctl fallback
+            # so the error scan doesn't silently surface 9h-old shutdown noise.
             try:
-                with open(log_path, "r", errors="replace") as f:
-                    lines = f.readlines()[-2000:]
-            except FileNotFoundError:
-                print(f"    ✗ Log file not found")
-                continue
+                mtime = os.path.getmtime(log_path) if os.path.exists(log_path) else 0.0
+                age_s = _time_errors.time() - mtime if mtime > 0 else float("inf")
+            except Exception:
+                mtime, age_s = 0.0, float("inf")
+
+            if mtime > 0 and age_s < LOG_STALE_THRESHOLD_S:
+                print(f"\n  {tid} — {log_path} (age {age_s:.0f}s)")
+                print("  " + "-" * 80)
+                try:
+                    with open(log_path, "r", errors="replace") as f:
+                        lines = f.readlines()[-2000:]
+                except FileNotFoundError:
+                    print(f"    ✗ Log file not found")
+                    continue
+            else:
+                age_label = f"{age_s:.0f}s" if mtime > 0 else "missing"
+                print(f"\n  {tid} — journalctl -u titan-t1.service (brain log {age_label}; stale → fallback)")
+                print("  " + "-" * 80)
+                try:
+                    proc = subprocess.run(
+                        ["journalctl", "-u", "titan-t1.service",
+                         "--since", "30 min ago", "--no-pager", "-n", "2000"],
+                        capture_output=True, text=True, timeout=20)
+                    lines = proc.stdout.splitlines()
+                    if not lines:
+                        print(f"    ⚠ journalctl returned empty — unit may not exist (try `systemctl list-units`)")
+                        continue
+                except Exception as e:
+                    print(f"    ✗ Cannot read journalctl: {e}")
+                    continue
         else:
+            # 2026-05-14 fix: brain log mtime check + journald fallback.
+            # T3 went journald-only post-C-S7; reading stale brain log
+            # was the silent failure that hid BUG-T3-PARENT-DEADLOCK.
             try:
-                proc = subprocess.run(
-                    f"ssh root@10.135.0.6 'tail -2000 {log_path}'",
-                    shell=True, capture_output=True, text=True, timeout=15)
-                lines = proc.stdout.splitlines()
+                # `stat -c %Y` returns mtime as unix epoch; missing file → blank.
+                stat_proc = subprocess.run(
+                    f"ssh root@10.135.0.6 'stat -c %Y {log_path} 2>/dev/null || echo 0'",
+                    shell=True, capture_output=True, text=True, timeout=10)
+                mtime_str = stat_proc.stdout.strip()
+                mtime = float(mtime_str) if mtime_str else 0.0
+                age_s = _time_errors.time() - mtime if mtime > 0 else float("inf")
             except Exception as e:
-                print(f"    ✗ Cannot read log: {e}")
+                print(f"\n  {tid} — {log_path}")
+                print("  " + "-" * 80)
+                print(f"    ✗ Cannot stat log: {e}")
                 continue
+
+            if mtime > 0 and age_s < LOG_STALE_THRESHOLD_S:
+                # Brain log fresh — use it.
+                print(f"\n  {tid} — {log_path} (age {age_s:.0f}s)")
+                print("  " + "-" * 80)
+                try:
+                    proc = subprocess.run(
+                        f"ssh root@10.135.0.6 'tail -2000 {log_path}'",
+                        shell=True, capture_output=True, text=True, timeout=15)
+                    lines = proc.stdout.splitlines()
+                except Exception as e:
+                    print(f"    ✗ Cannot read log: {e}")
+                    continue
+            else:
+                # Brain log stale (or missing) → journald fallback.
+                # Filter by titan_id ("T2"/"T3") via grep — journald entries
+                # don't have a per-Titan tag at the systemd-identifier level
+                # on the shared VPS (both T2 + T3 emit under different units
+                # though). T3 runs under `titan-t3.service`; the Python plugin
+                # writes lines like "07:20:00 [INFO] [...]" inherited through
+                # the systemd journal stdout pipe. We tail journalctl for the
+                # specific service unit.
+                if tid == "T3":
+                    service_unit = "titan-t3.service"
+                else:
+                    # T2 isn't expected to be journald-only today (Phase A+B
+                    # still writes brain log), but if we land here it means
+                    # the brain log went stale for T2 too — try a generic
+                    # journalctl filter on the python plugin process. Best-
+                    # effort fallback.
+                    service_unit = "titan-t2.service"
+                age_label = f"{age_s:.0f}s" if mtime > 0 else "missing"
+                print(f"\n  {tid} — journalctl -u {service_unit} (brain log {age_label}; stale → fallback)")
+                print("  " + "-" * 80)
+                try:
+                    proc = subprocess.run(
+                        f"ssh root@10.135.0.6 'journalctl -u {service_unit} "
+                        f"--since \"30 min ago\" --no-pager -n 2000 2>/dev/null'",
+                        shell=True, capture_output=True, text=True, timeout=20)
+                    lines = proc.stdout.splitlines()
+                    if not lines:
+                        print(f"    ⚠ journalctl returned empty — unit may not exist (try `systemctl list-units`)")
+                        continue
+                except Exception as e:
+                    print(f"    ✗ Cannot read journalctl: {e}")
+                    continue
 
         # Filter for ERROR/WARNING, exclude noise
         errors = {}
@@ -4794,11 +5450,11 @@ def run_cgn_signals_audit(all_titans: bool = False,
         r"_ed_observe|_edge_result"
     )
 
-    titan_plugin_root = Path("titan_plugin")
+    titan_hcl_root = Path("titan_hcl")
     # Skip bus.py — it contains the helper DEFINITION (function signature +
     # type constant), not producer call sites. Including it would produce
     # false-positive "orphans" for the framework itself.
-    for py_file in titan_plugin_root.rglob("*.py"):
+    for py_file in titan_hcl_root.rglob("*.py"):
         if py_file.name == "bus.py":
             continue
         try:
@@ -4832,7 +5488,7 @@ def run_cgn_signals_audit(all_titans: bool = False,
     mapping_keys = set()
     try:
         sys.path.insert(0, str(Path.cwd()))
-        from titan_plugin.logic.meta_cgn import SIGNAL_TO_PRIMITIVE
+        from titan_hcl.logic.meta_cgn import SIGNAL_TO_PRIMITIVE
         mapping_keys = set(SIGNAL_TO_PRIMITIVE.keys())
     except Exception as e:
         print(f"  ✗ Could not load SIGNAL_TO_PRIMITIVE: {e}")
@@ -4854,7 +5510,7 @@ def run_cgn_signals_audit(all_titans: bool = False,
 
     # ── 4. Report ──
     print()
-    print(f"  {len(producer_sites)} emit_meta_cgn_signal call site(s) found in titan_plugin/")
+    print(f"  {len(producer_sites)} emit_meta_cgn_signal call site(s) found in titan_hcl/")
     print(f"  {len(mapping_keys)} (consumer, event_type) entries in SIGNAL_TO_PRIMITIVE")
     print()
 
@@ -5147,13 +5803,13 @@ def run_producers_diagnostics(argv: list) -> None:
         print("-" * 90)
         try:
             sys.path.insert(0, str(Path.cwd()))
-            from titan_plugin.logic.meta_cgn import SIGNAL_TO_PRIMITIVE
+            from titan_hcl.logic.meta_cgn import SIGNAL_TO_PRIMITIVE
             wired_tuples = set()  # (src, event_type) — extract from emit_meta_cgn_signal call sites
             import re
             call_pat = re.compile(r"emit_meta_cgn_signal\s*\(")
             src_pat = re.compile(r'src\s*=\s*["\']([^"\']+)["\']')
             et_pat = re.compile(r'event_type\s*=\s*["\']([^"\']+)["\']')
-            for pyf in Path("titan_plugin").rglob("*.py"):
+            for pyf in Path("titan_hcl").rglob("*.py"):
                 if pyf.name == "bus.py":
                     continue
                 try:
@@ -5389,27 +6045,37 @@ def run_preflight():
         warnings.append("cgn: pipeline not fully healthy")
         print("  ⚠ CGN pipeline partial (see verify output)")
 
-    # ── 8. Known issues ──
-    print("\n[8/9] KNOWN ISSUES — registry scan for new CRITICAL")
+    # ── 8. BUGS index — active CRITICAL/HIGH from titan-docs/BUGS_index.md ──
+    # Rewired 2026-05-14: memory/known_issues.md retired (frozen 2026-04-25). All
+    # defect tracking now lives in titan-docs/BUGS.md; the auto-generated
+    # titan-docs/BUGS_index.md carries the "Active count by severity" line.
+    print("\n[8/9] BUGS INDEX — active CRITICAL/HIGH scan")
     try:
-        kn_path = PROJECT_ROOT / "memory" / "known_issues.md"
-        if kn_path.exists():
-            content = kn_path.read_text()
-            # Count active critical items (I-NNN not marked RESOLVED)
+        bug_idx_path = PROJECT_ROOT / "titan-docs" / "BUGS_index.md"
+        if bug_idx_path.exists():
+            content = bug_idx_path.read_text()
             import re as _re
-            active_crit = len(_re.findall(r"### I-\d+ — [^\n]*\[(HIGH PRIORITY|CRITICAL)", content))
-            if active_crit <= 3:
-                passes.append(f"known issues: {active_crit} active HIGH/CRIT")
-                print(f"  ✓ {active_crit} active HIGH/CRITICAL issues (baseline)")
+            # Parse: "- 🔴 CRITICAL: N  ·  🟠 HIGH: M  ·  ..."
+            crit_m = _re.search(r"CRITICAL:\s*(\d+)", content)
+            high_m = _re.search(r"HIGH:\s*(\d+)", content)
+            active_crit = int(crit_m.group(1)) if crit_m else 0
+            active_high = int(high_m.group(1)) if high_m else 0
+            total = active_crit + active_high
+            if active_crit > 0:
+                warnings.append(f"bugs: {active_crit} CRITICAL + {active_high} HIGH OPEN")
+                print(f"  ⚠ {active_crit} CRITICAL + {active_high} HIGH OPEN bugs")
+            elif total <= 12:
+                passes.append(f"bugs: {active_crit} CRIT / {active_high} HIGH OPEN")
+                print(f"  ✓ {active_crit} CRITICAL + {active_high} HIGH OPEN (baseline)")
             else:
-                warnings.append(f"known issues: {active_crit} active HIGH/CRIT")
-                print(f"  ⚠ {active_crit} active HIGH/CRITICAL issues")
+                warnings.append(f"bugs: {active_high} HIGH OPEN exceeds baseline")
+                print(f"  ⚠ {active_high} HIGH OPEN exceeds baseline (12)")
         else:
-            warnings.append("known issues: file not found")
-            print("  ⚠ memory/known_issues.md not found")
+            warnings.append("bugs index: file not found — run scripts/tracker_indexer.py")
+            print("  ⚠ titan-docs/BUGS_index.md not found — regenerate via tracker_indexer.py")
     except Exception as e:
-        warnings.append(f"known issues: {e}")
-        print(f"  ⚠ known_issues scan error: {e}")
+        warnings.append(f"bugs index: {e}")
+        print(f"  ⚠ BUGS_index scan error: {e}")
 
     # ── Final verdict ──
     print()
@@ -5443,7 +6109,7 @@ def run_preflight():
 
 
 def run_async_blocks_scan():
-    """Scan titan_plugin/ for sync I/O calls reachable from async functions.
+    """Scan titan_hcl/ for sync I/O calls reachable from async functions.
 
     Built 2026-04-14 after py-spy diagnosis found 3 separate latent bugs
     (web_search.status sync httpx, coding_sandbox.status subprocess.run,
@@ -5452,7 +6118,7 @@ def run_async_blocks_scan():
     an `async def` endpoint. None were caught by yesterday's audits.
 
     Strategy:
-      1. Parse all .py files under titan_plugin/ with AST
+      1. Parse all .py files under titan_hcl/ with AST
       2. For each function, classify: async, sync, or sync-called-from-async
          (transitive reachability via function call graph)
       3. Detect dangerous patterns at every call site:
@@ -5487,7 +6153,7 @@ def run_async_blocks_scan():
     import os
     from collections import defaultdict
 
-    SCAN_ROOT = Path(__file__).parent.parent / "titan_plugin"
+    SCAN_ROOT = Path(__file__).parent.parent / "titan_hcl"
     # Worker modules — different process, separate event loop. Sync I/O
     # there only blocks that worker, not the FastAPI loop.
     WORKER_FILES = {
@@ -5600,7 +6266,33 @@ def run_async_blocks_scan():
                 return ("SYNC_DB", f"{mod}.connect")
         return None
 
-    DETECTORS = [_is_sync_http, _is_urlopen, _is_subprocess, _is_compression, _is_sync_db]
+    # ── kernel_rpc proxy calls (v4, D-SPEC-115 / ARCHITECTURE_api_family INV-9) ──
+    # The api_subprocess reaches the live plugin/kernel via the kernel_rpc proxy
+    # (request.app.state.titan_hcl) — a SYNCHRONOUS socket round-trip. Calling it
+    # on the api event-loop thread blocks ALL concurrent readouts (the Phase-E
+    # cascade). _resolve_module() deliberately skips instance-method calls, so the
+    # module-name detectors above never see these. Detect them by the codebase
+    # naming convention: any call rooted at a `kernel_proxy` / `kernel_obj` Name
+    # (e.g. `kernel_proxy.guardian.get_status()`, `kernel_obj.bus_broker_stats()`).
+    # Reachability + thread-boundary (to_thread) exclusion is handled by the v2
+    # machinery below, so an offloaded kernel_rpc call (inside a to_thread'd helper)
+    # is correctly NOT flagged. LIMITATION: a proxy aliased to a differently-named
+    # var (e.g. `mon = kernel_proxy.bus_health; mon.snapshot()`) is not caught by
+    # name — keep the convention (name kernel_rpc proxies `kernel_proxy`/`kernel_obj`).
+    _KERNEL_RPC_VARS = {"kernel_proxy", "kernel_obj"}
+
+    def _is_kernel_rpc(node: ast.Call, aliases: dict[str, str]) -> tuple[str, str] | None:
+        if not isinstance(node.func, ast.Attribute):
+            return None
+        cur: ast.AST = node.func.value
+        while isinstance(cur, ast.Attribute):
+            cur = cur.value
+        if isinstance(cur, ast.Name) and cur.id in _KERNEL_RPC_VARS:
+            return ("KERNEL_RPC", f"{cur.id}.{node.func.attr}")
+        return None
+
+    DETECTORS = [_is_sync_http, _is_urlopen, _is_subprocess, _is_compression,
+                 _is_sync_db, _is_kernel_rpc]
 
     # ── Thread-boundary detection (to_thread / run_in_executor / Thread) ──
     #
@@ -6017,7 +6709,7 @@ def run_bus_census_analysis(log_path: str = "/tmp/titan_bus_census.log",
                              top_n: int = 15):
     """Phase E.1 diagnosis: analyze bus census log to find cascade root cause.
 
-    Reads the TSV emitted by titan_plugin/core/bus_census.py and produces:
+    Reads the TSV emitted by titan_hcl/core/bus_census.py and produces:
       • Top emitters by msg/s  (find the burst producers)
       • Top dropped by msg/s   (find the saturated subscribers)
       • Queue depth stats      (find the slow drains)
@@ -6040,7 +6732,7 @@ def run_bus_census_analysis(log_path: str = "/tmp/titan_bus_census.log",
 
     if not os.path.exists(log_path):
         print(f"  ✗ Census log not found: {log_path}")
-        print(f"  Enable with: TITAN_BUS_CENSUS=1 (env var on titan_main)")
+        print(f"  Enable with: TITAN_BUS_CENSUS=1 (env var on titan_hcl)")
         return
 
     emit_total: dict[str, int] = defaultdict(int)
@@ -6449,7 +7141,7 @@ def run_thread_pool_check():
         print("  endpoints are down. Verify with /health first.")
     elif any_hot:
         print("  At least one Titan has elevated saturation. Watch for slow /v4/* endpoints")
-        print("  and consider increasing max_workers in scripts/titan_main.py (line ~185).")
+        print("  and consider increasing max_workers in scripts/titan_hcl.py (line ~185).")
     else:
         print("  All reachable pools healthy. Current 64-worker size has headroom for ~100")
         print("  concurrent to_thread sites as of Phase E.2 + ccd2ef6 API-fix deploy.")
@@ -6501,8 +7193,8 @@ def run_stability_check(hours: int = 24):
     ts_pat = re.compile(r"^\[(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+UTC\]")
 
     # Guardian in-process module restart patterns (brain log). These are
-    # respawns WITHIN a running titan_main — distinct from watchdog-detected
-    # process-level crashes above. Counted since last full titan_main boot
+    # respawns WITHIN a running titan_hcl — distinct from watchdog-detected
+    # process-level crashes above. Counted since last full titan_hcl boot
     # (last "Titan.*starting" marker in brain log) so stale historical events
     # don't pollute the current-session view.
     mod_timeout_pat = re.compile(
@@ -6510,16 +7202,16 @@ def run_stability_check(hours: int = 24):
     mod_rss_pat = re.compile(
         r"\[Guardian\] Module '([a-z_]+)' RSS \d+MB > limit")
     # Capture exitcode too — we skip graceful shutdowns (exitcode=0 emitted
-    # by Guardian's own stop_all during titan_main restarts). Only non-zero
+    # by Guardian's own stop_all during titan_hcl restarts). Only non-zero
     # exits represent true crashes. Before this fix, every clean restart
     # produced 8-11 "died" events, badly inflating the stability count.
     mod_died_pat = re.compile(
         r"\[Guardian\] Module '([a-z_]+)' died \(exitcode=(-?\d+)")
     # Brain log timestamp (no date, just HH:MM:SS at line start)
     brain_ts_pat = re.compile(r"^(\d{2}:\d{2}:\d{2})")
-    # Full titan_main boot marker
+    # Full titan_hcl boot marker
     boot_marker_pat = re.compile(
-        r"(RESTART boundary|Titan.*starting|\[TitanCore\].*Boot)")
+        r"(RESTART boundary|Titan.*starting|Booting Titan microkernel)")
 
     def _parse_watchdog(content: str) -> tuple[list[dt.datetime], int]:
         """Return (restart_timestamps_in_window, total_restarts_in_log)."""
@@ -6629,7 +7321,7 @@ def run_stability_check(hours: int = 24):
                         except (ValueError, IndexError):
                             _exitcode = -1
                         # Skip exitcode=0: that's Guardian's own graceful
-                        # stop_all during clean titan_main shutdown — not a crash.
+                        # stop_all during clean titan_hcl shutdown — not a crash.
                         if _exitcode != 0:
                             matched_reason = "died"
                             matched_mod = m.group(1)
@@ -6890,7 +7582,7 @@ def run_state_dims():
     """Dimensional audit: every state-vector reference with its assumed dim."""
     print()
     print("=" * 90)
-    print("  STATE-DIMS — dimensional audit across titan_plugin/ + scripts/")
+    print("  STATE-DIMS — dimensional audit across titan_hcl/ + scripts/")
     print("=" * 90)
 
     by_kind: dict[str, list[dict]] = defaultdict(list)
@@ -6997,8 +7689,8 @@ def run_bus_contracts_audit():
     # checkouts; degrade gracefully).
     try:
         sys.path.insert(0, str(Path(__file__).parent.parent))
-        from titan_plugin.api.bus_contracts import REGISTRY
-        from titan_plugin.api.cache_schemas import EVENT_SCHEMAS
+        from titan_hcl.api.bus_contracts import REGISTRY
+        from titan_hcl.api.cache_schemas import EVENT_SCHEMAS
     except ImportError as e:
         print(f"\n  ✗ bus_contracts module not loadable: {e}")
         print(f"  rFP_bus_payload_contracts may not be deployed yet.")
@@ -7211,7 +7903,7 @@ def _ns_vm_program_set():
     definitions instead of the old hardcoded return-dict. Each function
     matches one program (e.g. _make_metabolism_program → METABOLISM).
     """
-    ns_path = PROJECT_ROOT / "titan_plugin" / "logic" / "nervous_system.py"
+    ns_path = PROJECT_ROOT / "titan_hcl" / "logic" / "nervous_system.py"
     if not ns_path.exists():
         return set()
     src = ns_path.read_text()
@@ -7520,7 +8212,7 @@ def run_backup_diagnostics(all_titans: bool = False):
 
             # Phase 8 — chain integrity (local mirror of on-chain anchor sequence)
             try:
-                from titan_plugin.logic.backup_chain import verify_chain_file
+                from titan_hcl.logic.backup_chain import verify_chain_file
                 chain_result = verify_chain_file(tid)
                 if chain_result["length"] == 0:
                     print(f"    ℹ Anchor chain: empty (Phase 8 not yet active "
@@ -7560,7 +8252,7 @@ def run_backup_verify_chain(all_titans: bool = False) -> int:
     their API (not yet wired); for now recommends running directly on each
     VPS for multi-Titan audit.
     """
-    from titan_plugin.logic.backup_chain import read_chain, verify_chain
+    from titan_hcl.logic.backup_chain import read_chain, verify_chain
 
     titans = ["T1", "T2", "T3"] if all_titans else ["T1"]
     print()
@@ -7601,6 +8293,351 @@ def run_backup_verify_chain(all_titans: bool = False) -> int:
     print(f"OVERALL: {'ALL CHAINS INTACT' if overall == 0 else 'CHAIN BREAK DETECTED'}")
     print()
     return overall
+
+
+def run_backup_verify_cli(args: list) -> int:
+    """SPEC §24.11 — `arch_map backup verify` family dispatcher.
+
+    Accepts flags (args[0+]):
+      --personality / --timechain / --soul / --allbackups
+      --restore-sim
+      --titan T1|T2|T3   (defaults to T1 — mainnet target)
+      --no-zk-verify     (skips ZK Vault memo round-trip; useful when
+                          Solana RPC is degraded)
+      --scratch DIR      (--restore-sim only; defaults to tempfile)
+    """
+    import asyncio
+    from titan_hcl.logic.backup_unified_manifest import UnifiedManifest
+    from titan_hcl.logic.backup_verify_cli import (
+        TIER_ORDER, allbackups_exit_code, restore_sim_exit_code,
+        tier_result_exit_code, verify_allbackups, verify_restore_sim,
+        verify_tier,
+    )
+
+    titan_id = "T1"
+    if "--titan" in args:
+        idx = args.index("--titan")
+        if idx + 1 < len(args):
+            titan_id = args[idx + 1]
+    verify_zk = "--no-zk-verify" not in args
+    scratch_dir = None
+    if "--scratch" in args:
+        idx = args.index("--scratch")
+        if idx + 1 < len(args):
+            scratch_dir = args[idx + 1]
+
+    # Load manifest from local disk — caller's responsibility to ensure
+    # manifest is current; we don't fetch it from Arweave at the CLI
+    # boundary (see backup_restore.py module docstring on manifest discovery).
+    try:
+        manifest = UnifiedManifest.load(titan_id=titan_id, base_dir="data")
+    except (FileNotFoundError, ValueError) as e:
+        print(f"[arch_map backup verify] failed to load manifest for "
+              f"{titan_id}: {e}")
+        return 1
+
+    # Acquire the runtime fetchers (Arweave + Solana memo)
+    fetchers = _acquire_backup_verify_fetchers(titan_id)
+    if fetchers is None:
+        print("[arch_map backup verify] no Arweave + Solana fetchers available "
+              "(network not configured)")
+        return 1
+    arweave_fetch, memo_fetch = fetchers
+
+    def _printer(line: str):
+        print(line)
+
+    if "--allbackups" in args:
+        results = asyncio.run(verify_allbackups(
+            manifest=manifest, arweave_fetch=arweave_fetch,
+            memo_fetch=memo_fetch, verify_zk_chain=verify_zk,
+            line_callback=_printer,
+        ))
+        print()
+        for tier in TIER_ORDER:
+            r = results[tier]
+            print(f"  {tier:>12s}: ok={r.ok_events}/{r.total_events} "
+                  f"fail={r.fail_events} skipped={r.skipped_events}")
+        return allbackups_exit_code(results)
+
+    if "--restore-sim" in args:
+        # arc_to_target maps (component, arc_name) → scratch path
+        from pathlib import Path
+        def _arc(comp: str, arc: str) -> str:
+            return str(Path(scratch_dir or "/tmp/titan_restore_sim") /
+                       comp / arc)
+        result = asyncio.run(verify_restore_sim(
+            manifest=manifest, arweave_fetch=arweave_fetch,
+            memo_fetch=memo_fetch, arc_to_target=_arc,
+            scratch_dir=scratch_dir, line_callback=_printer,
+        ))
+        return restore_sim_exit_code(result)
+
+    # Per-tier subcommand — first matching flag wins
+    for flag, tier in (("--personality", "personality"),
+                      ("--timechain", "timechain"),
+                      ("--soul", "soul")):
+        if flag in args:
+            result = asyncio.run(verify_tier(
+                manifest=manifest, tier=tier,
+                arweave_fetch=arweave_fetch, memo_fetch=memo_fetch,
+                verify_zk_chain=verify_zk, line_callback=_printer,
+            ))
+            print()
+            print(f"  {tier}: ok={result.ok_events}/{result.total_events} "
+                  f"fail={result.fail_events} skipped={result.skipped_events}")
+            return tier_result_exit_code(result)
+
+    print("[arch_map backup verify] usage:")
+    print("  arch_map backup verify --personality | --timechain | --soul")
+    print("  arch_map backup verify --allbackups")
+    print("  arch_map backup verify --restore-sim [--scratch DIR]")
+    print("  optional: --titan T1|T2|T3, --no-zk-verify")
+    return 2
+
+
+def run_backup_audit_coverage_cli(args: list) -> int:
+    """SPEC §24.11 — `arch_map backup audit-coverage` — flag persistent
+    files in data/ not declared in any backup inventory tuple.
+
+    Accepts: --data-dir DIR (defaults to data).
+    """
+    from titan_hcl.logic.backup_verify_cli import (
+        audit_coverage, audit_coverage_exit_code,
+    )
+
+    data_dir = "data"
+    if "--data-dir" in args:
+        idx = args.index("--data-dir")
+        if idx + 1 < len(args):
+            data_dir = args[idx + 1]
+
+    declared = _collect_declared_backup_paths()
+    if not declared:
+        print(
+            "[arch_map backup audit-coverage] could not collect declared "
+            "backup paths from backup.py — module missing?"
+        )
+        return 2
+
+    result = audit_coverage(
+        declared_paths=declared, data_dir=data_dir, line_callback=print,
+    )
+    print()
+    print(f"  declared={result.declared_count}  found={result.found_count}  "
+          f"undeclared={len(result.undeclared_files)}  status={result.status}")
+    return audit_coverage_exit_code(result)
+
+
+def _collect_declared_backup_paths():
+    """Pull the canonical PERSONALITY/WEEKLY/TIMECHAIN/ARWEAVE_DAILY_EXCLUDE
+    tuples from titan_hcl.logic.backup so audit-coverage stays in sync
+    with whatever Phase 1+ landed."""
+    try:
+        from titan_hcl.logic.backup import RebirthBackup
+    except Exception:
+        return []
+    declared = []
+    for attr in ("PERSONALITY_PATHS", "WEEKLY_EXTRA_PATHS", "TIMECHAIN_PATHS",
+                 "ARWEAVE_DAILY_EXCLUDE"):
+        paths = getattr(RebirthBackup, attr, [])
+        for entry in paths:
+            if isinstance(entry, (tuple, list)) and entry:
+                src = entry[0]
+            elif isinstance(entry, str):
+                src = entry
+            else:
+                continue
+            declared.append(src)
+    return declared
+
+
+def _acquire_backup_verify_fetchers(titan_id: str):
+    """Return (arweave_fetch_async, memo_fetch_async) or None.
+
+    Wires:
+      - ArweaveStore.download_file as arweave_fetch
+      - SolanaClient.get_memo_for_tx as memo_fetch (Phase 11 will land
+        this helper on the network client; for now this returns None if
+        the helper isn't present and the caller halts cleanly with a
+        descriptive error)
+    """
+    try:
+        from titan_hcl.utils.arweave_store import ArweaveStore
+    except Exception:
+        return None
+    try:
+        from titan_hcl.utils.solana_client import is_available
+    except Exception:
+        return None
+    if not is_available():
+        return None
+
+    # ArweaveStore needs keypair + network — read from the same config
+    # paths that backup.py uses. The verify CLI is operator-driven so
+    # we accept the default mainnet keypair.
+    try:
+        kp = os.path.expanduser("~/.config/solana/id.json")
+        store = ArweaveStore(keypair_path=kp, network="mainnet")
+
+        async def _arweave_fetch(tx_id: str) -> bytes:
+            data = await store.download_file(tx_id)
+            if data is None:
+                raise RuntimeError(f"Arweave download returned None for {tx_id}")
+            return data
+
+        async def _memo_fetch(sig: str) -> str:
+            # Network client memo fetcher will land with Phase 11 wiring.
+            # For now, surface the SPEC §24.13 gap explicitly so verify
+            # cleanly degrades to --no-zk-verify with operator guidance.
+            raise NotImplementedError(
+                "Solana memo fetcher not yet wired; use --no-zk-verify "
+                "until Phase 11 wires SolanaClient.get_memo_for_tx"
+            )
+
+        return _arweave_fetch, _memo_fetch
+    except Exception:
+        return None
+
+
+def run_backup_restore_test_cli(args: list) -> int:
+    """SPEC §24.12 — `arch_map backup restore-test` — operator-driven
+    weekly mandatory restore-test, exposed for cron + manual gates.
+
+    Wraps `backup_restore_test.run_weekly_restore_test` so the same logic
+    BackupWorker uses internally is reachable from the CLI. On success
+    persists a receipt JSON at `data/backup_restore_tests/<titan>_<ts>.json`
+    that observability (OBS-backup-unified-restore-test-weekly) ages.
+
+    Flags:
+      --titan T1|T2|T3      (defaults to T1 — mainnet target)
+      --scratch DIR         (optional pre-allocated scratch dir)
+      --no-zk-verify        (skip Solana memo round-trip; useful when
+                             SolanaClient.get_memo_for_tx isn't wired)
+      --keep-scratch        (keep the reconstructed dir even on PASS for
+                             operator inspection)
+      --receipt-dir DIR     (override `data/backup_restore_tests/`)
+
+    Exit codes: 0 PASS, 1 FAIL, 2 SKIPPED-no-manifest-events, 3 setup error.
+    Designed to be safe under cron.
+    """
+    import asyncio
+    import json
+    import time as _time
+    from pathlib import Path
+
+    from titan_hcl.logic.backup_restore_test import (
+        EVENT_BACKUP_RESTORE_TEST_FAIL,
+        EVENT_BACKUP_RESTORE_TEST_PASS,
+        build_fail_bus_payload,
+        build_pass_bus_payload,
+        run_weekly_restore_test,
+    )
+    from titan_hcl.logic.backup_unified_manifest import UnifiedManifest
+
+    titan_id = "T1"
+    scratch_dir = None
+    keep_scratch = False
+    verify_zk = "--no-zk-verify" not in args
+    receipt_dir = "data/backup_restore_tests"
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--titan" and i + 1 < len(args):
+            titan_id = args[i + 1]
+            i += 2
+            continue
+        if a == "--scratch" and i + 1 < len(args):
+            scratch_dir = args[i + 1]
+            i += 2
+            continue
+        if a == "--keep-scratch":
+            keep_scratch = True
+            i += 1
+            continue
+        if a == "--receipt-dir" and i + 1 < len(args):
+            receipt_dir = args[i + 1]
+            i += 2
+            continue
+        i += 1
+
+    try:
+        manifest = UnifiedManifest.load(titan_id=titan_id, base_dir="data")
+    except (FileNotFoundError, ValueError) as e:
+        print(f"[arch_map backup restore-test] no manifest for {titan_id}: {e}")
+        return 3
+
+    fetchers = _acquire_backup_verify_fetchers(titan_id)
+    if fetchers is None:
+        print("[arch_map backup restore-test] no Arweave + Solana fetchers "
+              "available (network not configured)")
+        return 3
+    arweave_fetch, memo_fetch = fetchers
+
+    if not verify_zk:
+        async def _memo_skip(_sig: str) -> str:
+            return ""
+        memo_fetch = _memo_skip
+
+    def _arc(comp: str, arc: str) -> str:
+        return str(Path(scratch_dir or "/tmp/titan_restore_test") /
+                   comp / arc)
+
+    print(f"[arch_map backup restore-test] {titan_id} — chain has "
+          f"{len(manifest.events)} events; verify_zk={verify_zk}")
+    result = asyncio.run(run_weekly_restore_test(
+        titan_id=titan_id,
+        manifest=manifest,
+        arweave_fetch=arweave_fetch,
+        memo_fetch=memo_fetch,
+        arc_to_target=_arc,
+        scratch_dir=scratch_dir,
+        cleanup_scratch_on_pass=not keep_scratch,
+        cleanup_scratch_on_fail=False,
+    ))
+
+    if result.status == "pass":
+        payload = build_pass_bus_payload(result, titan_id)
+        event_name = EVENT_BACKUP_RESTORE_TEST_PASS
+        exit_code = 0
+    elif result.status == "skipped":
+        payload = {
+            "event": "BACKUP_RESTORE_TEST_SKIPPED",
+            "titan_id": titan_id,
+            "ts_unix": result.ts_unix,
+            "skipped_reason": result.skipped_reason,
+            "duration_s": round(result.duration_s, 3),
+        }
+        event_name = payload["event"]
+        exit_code = 2
+    else:
+        payload = build_fail_bus_payload(result, titan_id)
+        event_name = EVENT_BACKUP_RESTORE_TEST_FAIL
+        exit_code = 1
+
+    print()
+    print(f"  result   : {result.status.upper()}")
+    print(f"  event    : {event_name}")
+    print(f"  depth    : {result.chain_depth}")
+    print(f"  bytes    : {result.bytes_fetched}")
+    print(f"  duration : {result.duration_s:.2f}s")
+    if result.notes:
+        for n in result.notes:
+            print(f"  note     : {n}")
+
+    # Persist receipt regardless of pass/fail/skipped so observability
+    # can age the last-known-good ts and the CRITICAL-FAIL ts separately.
+    try:
+        Path(receipt_dir).mkdir(parents=True, exist_ok=True)
+        ts_iso = _time.strftime("%Y%m%dT%H%M%SZ",
+                                _time.gmtime(result.ts_unix or _time.time()))
+        receipt_path = Path(receipt_dir) / f"{titan_id}_{ts_iso}.json"
+        receipt_path.write_text(json.dumps(payload, indent=2, sort_keys=False))
+        print(f"  receipt  : {receipt_path}")
+    except OSError as e:
+        print(f"  receipt  : FAILED to persist ({e}) — caller may rerun")
+    return exit_code
 
 
 def run_sovereign_ops(all_titans: bool = False):
@@ -7708,11 +8745,14 @@ def run_sovereign_ops(all_titans: bool = False):
 
 
 # ── Trinity 130D dim-live ──
-# Phase 2.5.B (rFP_trinity_130d_phase2_5_closure §3): four-state classifier
-# (ALIVE / ALIVE_AT_DEFAULT / PARTIAL / SILENT / GHOST) reads
+# Phase 2.5.B (rFP_trinity_130d_phase2_5_closure §3) classifier:
+# ALIVE / PARTIAL / SILENT / CORRUPTED / GHOST — reads
 # /v4/debug/dim-sources for full producer-firing context.
 # Falls back to the original /v4/unified-spirit binary ALIVE/SILENT
 # classifier when the new endpoint is unavailable (older Titan / pre-Phase-2.5).
+# Maker directive 2026-05-12: ALIVE_AT_DEFAULT collapsed into PARTIAL —
+# a dim firing the default sentinel is not "alive", it's a producer
+# running on no-data inputs.
 
 _DIM_LIVE_TITAN_URLS = {
     "T1": "http://127.0.0.1:7777",
@@ -7792,24 +8832,27 @@ def _dim_live_classify_v2(record: dict,
                            epsilon: float = _DIM_LIVE_EPSILON,
                            firing_window_s: float = _DIM_LIVE_FIRING_WINDOW_S
                            ) -> str:
-    """rFP_trinity_130d_phase2_5_closure §3.1 four-state classifier.
+    """rFP_trinity_130d_phase2_5_closure §3.1 classifier — five states.
 
     Returns one of:
-      ALIVE              ← |value − spec_default| ≥ epsilon
-      ALIVE_AT_DEFAULT   ← within epsilon AND block fired ≤ firing_window_s ago
-                           AND no inputs ABSENT
-      PARTIAL            ← within epsilon AND block fired recently AND
-                           ≥ 1 input ABSENT (producer running, degraded inputs)
-      SILENT             ← within epsilon AND block has not fired in firing_window_s
-      CORRUPTED          ← NaN / inf / out-of-[0,1]
-      GHOST              ← producer not registered (should never happen
-                           post-Phase-2)
+      ALIVE        ← |value − spec_default| ≥ epsilon (real formula output)
+      PARTIAL      ← within epsilon AND block fired ≤ firing_window_s ago
+                     (producer firing but value stuck at SPEC default sentinel —
+                     formula running on default/absent inputs, no real signal)
+      SILENT       ← within epsilon AND block has not fired in firing_window_s
+      CORRUPTED    ← NaN / inf / out-of-[0,1]
+      GHOST        ← producer not registered
+
+    Maker directive 2026-05-12: ALIVE_AT_DEFAULT collapsed into PARTIAL.
+    A dim firing the default sentinel gave false hope the formula was
+    working when it was actually running on all-default inputs; PARTIAL
+    more honestly captures that state. Strict-gate acceptance is now
+    ALIVE-only (no @def credit).
     """
     import math as _m
     val = record.get("last_value")
     spec_default = float(record.get("spec_default", 0.5))
     seconds_since = record.get("seconds_since_last_write")
-    inputs = record.get("inputs") or []
     block_calls = int(record.get("block_calls_total", 0) or 0)
 
     if val is None:
@@ -7823,18 +8866,17 @@ def _dim_live_classify_v2(record: dict,
     if abs(float(val) - spec_default) >= epsilon:
         return "ALIVE"
 
-    # Within epsilon of SPEC default — distinguish A_AT_D / PARTIAL / SILENT.
+    # Within epsilon of SPEC default — producer either silent or
+    # firing-but-degraded. Firing window distinguishes the two.
     if (seconds_since is None
             or float(seconds_since) > firing_window_s):
         return "SILENT"
-    has_absent = any(i.get("state") == "absent" for i in inputs)
-    return "PARTIAL" if has_absent else "ALIVE_AT_DEFAULT"
+    return "PARTIAL"
 
 
 def _dim_live_state_marker(state: str) -> str:
     return {
         "ALIVE": "✓",
-        "ALIVE_AT_DEFAULT": "○",
         "PARTIAL": "◑",
         "SILENT": "·",
         "CORRUPTED": "✗",
@@ -7850,7 +8892,7 @@ def _dim_live_render_summary(label: str, tensor: list[float],
     full producer-firing metadata. Otherwise falls back to the legacy
     binary ALIVE/SILENT classifier on ``tensor``.
     """
-    from titan_plugin.api.dim_registry import iter_registry, _BLOCKS as DR_BLOCKS
+    from titan_hcl.api.dim_registry import iter_registry, _BLOCKS as DR_BLOCKS
 
     using_v2 = sources is not None
     if not using_v2 and not tensor:
@@ -7858,7 +8900,7 @@ def _dim_live_render_summary(label: str, tensor: list[float],
         return {}
 
     state_keys = (
-        ["ALIVE", "ALIVE_AT_DEFAULT", "PARTIAL", "SILENT", "CORRUPTED", "GHOST"]
+        ["ALIVE", "PARTIAL", "SILENT", "CORRUPTED", "GHOST"]
         if using_v2 else ["ALIVE", "SILENT", "CORRUPTED"]
     )
     counts: dict[str, dict[str, int]] = {}
@@ -7878,54 +8920,47 @@ def _dim_live_render_summary(label: str, tensor: list[float],
 
     print(f"  {label}")
     if using_v2:
-        # ALIVE + ALIVE_AT_DEFAULT both count toward "active" — Phase 2.5
-        # acceptance criterion is ALIVE-or-ALIVE_AT_DEFAULT = 130.
-        header = (f"  {'block':<14s} {'alive':>5s} {'@def':>5s} "
-                  f"{'partial':>7s} {'silent':>6s} {'corrupt':>7s} "
-                  f"{'ghost':>5s} {'total':>5s} {'%active':>7s}")
+        # Maker directive 2026-05-12: ALIVE-only is the active count.
+        # @def collapsed into PARTIAL — a dim firing the default sentinel
+        # is NOT "alive" (the formula runs on no-data inputs).
+        header = (f"  {'block':<14s} {'alive':>5s} {'partial':>7s} "
+                  f"{'silent':>6s} {'corrupt':>7s} {'ghost':>5s} "
+                  f"{'total':>5s} {'%alive':>7s}")
     else:
         header = (f"  {'block':<14s} {'alive':>7s} {'silent':>7s} "
                   f"{'corrupt':>8s} {'total':>6s} {'%alive':>7s}")
     print(header)
     print("  " + "-" * (len(header) - 2))
-    total_alive = total_at_def = total_partial = 0
+    total_alive = total_partial = 0
     total_silent = total_corrupt = total_ghost = 0
     for start, length, block in DR_BLOCKS:
         b = counts.get(block, {k: 0 for k in state_keys} | {"total": length})
         a = b.get("ALIVE", 0)
-        ad = b.get("ALIVE_AT_DEFAULT", 0)
         p = b.get("PARTIAL", 0)
         s = b.get("SILENT", 0)
         c = b.get("CORRUPTED", 0)
         g = b.get("GHOST", 0)
         t = b["total"]
-        active = a + ad  # rFP §9 — both count
-        pct = 100.0 * active / max(1, t)
-        marker = "✓" if active == t and p == 0 else (
-            "⚠" if pct >= 80 else "✗"
-        )
+        pct = 100.0 * a / max(1, t)
+        marker = "✓" if a == t else ("⚠" if pct >= 80 else "✗")
         if using_v2:
-            print(f"  {marker} {block:<12s} {a:>5d} {ad:>5d} "
-                  f"{p:>7d} {s:>6d} {c:>7d} {g:>5d} {t:>5d} {pct:>6.1f}%")
+            print(f"  {marker} {block:<12s} {a:>5d} {p:>7d} "
+                  f"{s:>6d} {c:>7d} {g:>5d} {t:>5d} {pct:>6.1f}%")
         else:
             print(f"  {marker} {block:<12s} {a:>7d} {s:>7d} {c:>8d} "
                   f"{t:>6d} {pct:>6.1f}%")
         total_alive += a
-        total_at_def += ad
         total_partial += p
         total_silent += s
         total_corrupt += c
         total_ghost += g
-    total = (total_alive + total_at_def + total_partial + total_silent
+    total = (total_alive + total_partial + total_silent
              + total_corrupt + total_ghost)
-    active = total_alive + total_at_def
-    pct = 100.0 * active / max(1, total)
+    pct = 100.0 * total_alive / max(1, total)
     print("  " + "-" * (len(header) - 2))
-    marker = "✓" if active == total and total_partial == 0 else (
-        "⚠" if pct >= 80 else "✗"
-    )
+    marker = "✓" if total_alive == total else ("⚠" if pct >= 80 else "✗")
     if using_v2:
-        print(f"  {marker} {'TOTAL':<12s} {total_alive:>5d} {total_at_def:>5d} "
+        print(f"  {marker} {'TOTAL':<12s} {total_alive:>5d} "
               f"{total_partial:>7d} {total_silent:>6d} {total_corrupt:>7d} "
               f"{total_ghost:>5d} {total:>5d} {pct:>6.1f}%")
     else:
@@ -7941,7 +8976,7 @@ def _dim_live_render_verbose(label: str, tensor: list[float],
     With ``sources`` the four-state classifier renders ALIVE / @DEF /
     PARTIAL / SILENT / GHOST; otherwise legacy ALIVE / SILENT.
     """
-    from titan_plugin.api.dim_registry import iter_registry
+    from titan_hcl.api.dim_registry import iter_registry
 
     using_v2 = sources is not None
     if not using_v2 and not tensor:
@@ -7984,7 +9019,7 @@ def _dim_live_render_diff(label_a: str, tensor_a: list[float],
 
     Uses the four-state classifier when both sources are available.
     """
-    from titan_plugin.api.dim_registry import iter_registry
+    from titan_hcl.api.dim_registry import iter_registry
 
     using_v2 = sources_a is not None and sources_b is not None
     if not using_v2 and (not tensor_a or not tensor_b):
@@ -8029,7 +9064,7 @@ def _dim_live_render_diff(label_a: str, tensor_a: list[float],
 def _dim_live_render_producer_status(label: str,
                                        sources: list[dict]) -> None:
     """Per-block producer-status snapshot — block_calls_total + last_call age."""
-    from titan_plugin.api.dim_registry import _BLOCKS as DR_BLOCKS
+    from titan_hcl.api.dim_registry import _BLOCKS as DR_BLOCKS
 
     print(f"  {label} — producer status")
     print(f"  {'block':<14s}  {'calls':>10s}  {'last_call_age_s':>15s}")
@@ -8060,9 +9095,10 @@ def run_dim_live(args: list[str]) -> None:
     """Trinity 130D — dim-live measurement.
 
     Phase 0 (rFP_trinity_130d_awakening §2): binary ALIVE/SILENT classifier.
-    Phase 2.5.B (rFP_trinity_130d_phase2_5_closure §3): four-state
-    classifier (ALIVE / ALIVE_AT_DEFAULT / PARTIAL / SILENT / GHOST) with
+    Phase 2.5.B (rFP_trinity_130d_phase2_5_closure §3): five-state
+    classifier (ALIVE / PARTIAL / SILENT / CORRUPTED / GHOST) with
     producer-firing context, fed by /v4/debug/dim-sources.
+    Maker directive 2026-05-12 collapsed ALIVE_AT_DEFAULT into PARTIAL.
 
     Usage:
       python scripts/arch_map.py dim-live                       # T1 summary
@@ -8151,25 +9187,25 @@ def run_dim_live(args: list[str]) -> None:
             _dim_live_render_summary(f"{label}  ({url})", tensor, sources)
         print()
 
-        # Strict-mode acceptance: every dim must be ALIVE or ALIVE_AT_DEFAULT
-        # (PARTIAL counts as failure — producer is firing but inputs are
-        # incomplete; that's a producer wiring bug to fix).
+        # Strict-mode acceptance (Maker directive 2026-05-12): every dim
+        # must be ALIVE. PARTIAL (formerly ALIVE_AT_DEFAULT) counts as
+        # failure — formula firing default sentinel = no real signal, not
+        # acceptable for closure.
         if strict and sources is not None:
-            non_active = []
+            non_alive = []
             for rec in sources:
                 state = _dim_live_classify_v2(rec)
-                if state not in ("ALIVE", "ALIVE_AT_DEFAULT"):
-                    non_active.append((rec.get("idx"), rec.get("name"),
-                                       state))
-            if non_active:
-                msg = (f"{label}: {len(non_active)}/130 dims not "
-                       f"ALIVE-or-ALIVE_AT_DEFAULT")
+                if state != "ALIVE":
+                    non_alive.append((rec.get("idx"), rec.get("name"),
+                                      state))
+            if non_alive:
+                msg = (f"{label}: {len(non_alive)}/130 dims not ALIVE")
                 strict_failures.append(msg)
                 print(f"  {msg}")
-                for idx, name, state in non_active[:10]:
+                for idx, name, state in non_alive[:10]:
                     print(f"    idx={idx:3d} {name:<32s} {state}")
-                if len(non_active) > 10:
-                    print(f"    ... and {len(non_active) - 10} more")
+                if len(non_alive) > 10:
+                    print(f"    ... and {len(non_alive) - 10} more")
                 print()
         elif strict and sources is None:
             msg = (f"{label}: /v4/debug/dim-sources unavailable — "
@@ -8180,13 +9216,13 @@ def run_dim_live(args: list[str]) -> None:
 
     if strict and strict_failures:
         print("=" * 70)
-        print(f"--strict FAILED: {len(strict_failures)} target(s) below 130/130")
+        print(f"--strict FAILED: {len(strict_failures)} target(s) below 130/130 ALIVE")
         for f in strict_failures:
             print(f"  ✗ {f}")
         sys.exit(1)
     if strict:
         print("=" * 70)
-        print("--strict PASSED: 130/130 ALIVE-or-ALIVE_AT_DEFAULT on all targets")
+        print("--strict PASSED: 130/130 ALIVE on all targets")
 
 
 def main():
@@ -8197,7 +9233,7 @@ def main():
     cmd = sys.argv[1]
 
     if cmd == "scan":
-        print("Scanning titan_plugin/ ...")
+        print("Scanning titan_hcl/ ...")
         graph = build_graph(SCAN_DIRS, SCRIPTS_DIRS)
         OUTPUT_FILE.write_text(json.dumps(graph, indent=2, default=str))
         print(f"Written: {rel(OUTPUT_FILE)}")
@@ -8288,6 +9324,17 @@ def main():
     elif cmd == "services":
         json_mode = "--json" in sys.argv
         run_services_diagnostics(json_output=json_mode)
+
+    elif cmd == "x_check":
+        # SPEC v1.12.0 D-SPEC-67 rFP Phase 2 — tail recent social_x
+        # events from the health-monitor journal.
+        rc = run_x_check(sys.argv[2:])
+        sys.exit(rc)
+
+    elif cmd == "health-monitor":
+        # SPEC v1.12.0 D-SPEC-67 rFP Phase 2 — full plugin status table.
+        rc = run_health_monitor(sys.argv[2:])
+        sys.exit(rc)
 
     elif cmd == "audit":
         graph = load_graph()
@@ -8463,6 +9510,18 @@ def main():
     elif cmd == "backup":
         # rFP_backup_worker Phase 5 — master invariant check per Titan.
         # Phase 8.2 — --verify-chain flag switches to verbose chain walk.
+        # SPEC §24.11 — verify / audit-coverage subcommands
+        #   backup verify --personality | --timechain | --soul | --allbackups
+        #   backup verify --restore-sim
+        #   backup audit-coverage
+        sub = sys.argv[2] if len(sys.argv) >= 3 else None
+        if sub == "verify":
+            sys.exit(run_backup_verify_cli(sys.argv[3:]))
+        if sub == "audit-coverage":
+            sys.exit(run_backup_audit_coverage_cli(sys.argv[3:]))
+        # Phase 5 chunk 5D — operator-driven weekly restore-test entry point.
+        if sub == "restore-test":
+            sys.exit(run_backup_restore_test_cli(sys.argv[3:]))
         if "--verify-chain" in sys.argv:
             sys.exit(run_backup_verify_chain(all_titans="--all" in sys.argv))
         run_backup_diagnostics(all_titans="--all" in sys.argv)
@@ -8520,9 +9579,31 @@ def main():
         run_bus_contracts_audit()
 
     elif cmd == "session-close":
+        # opt #7 (2026-05-17): --scope=trivial|small|large pre-selects steps.
+        # opt #12 (2026-05-17): --interactive walks each step asking
+        # done/skip/needs-hand-fill. opt #13: --force-incomplete bypasses
+        # mandatory-completeness check (warns + records the override).
         _sc_args = [a for a in sys.argv[2:] if not a.startswith("--")]
         title = " ".join(_sc_args).strip()
-        run_session_close(title, commit="--no-commit" not in sys.argv)
+        _scope = "large"  # default to safety
+        for a in sys.argv[2:]:
+            if a.startswith("--scope="):
+                _scope = a.split("=", 1)[1].strip().lower()
+            elif a == "--scope" and sys.argv.index(a) + 1 < len(sys.argv):
+                _scope = sys.argv[sys.argv.index(a) + 1].strip().lower()
+        if _scope not in ("trivial", "small", "large"):
+            print(f"error: --scope must be trivial|small|large (got {_scope!r})",
+                  file=sys.stderr)
+            sys.exit(2)
+        _interactive = "--interactive" in sys.argv
+        _force_incomplete = "--force-incomplete" in sys.argv
+        run_session_close(
+            title,
+            commit="--no-commit" not in sys.argv,
+            scope=_scope,
+            interactive=_interactive,
+            force_incomplete=_force_incomplete,
+        )
 
     elif cmd == "meta-cgn":
         sub = sys.argv[2] if len(sys.argv) > 2 else "status"
@@ -8577,14 +9658,14 @@ def main():
         run_preflight()
 
     elif cmd == "async-blocks":
-        # 2026-04-14: scan titan_plugin/ for sync I/O reachable from async
+        # 2026-04-14: scan titan_hcl/ for sync I/O reachable from async
         # functions. Built after 3 latent async-block bugs were found in
         # one session via py-spy. Run as part of session_startup_protocol.
         run_async_blocks_scan()
 
     elif cmd == "census":
         # 2026-04-14 Phase E.1: read /tmp/titan_bus_census.log and produce
-        # diagnosis report. Requires titan_main running with TITAN_BUS_CENSUS=1.
+        # diagnosis report. Requires titan_hcl running with TITAN_BUS_CENSUS=1.
         log_path = "/tmp/titan_bus_census.log"
         for a in sys.argv[2:]:
             if a.startswith("--log="):
@@ -8725,10 +9806,10 @@ def main():
 
     elif cmd == "kernel-status":
         # Microkernel v2 Phase A §A.1 (2026-04-24 S3): per-titan kernel
-        # health summary. Shows kernel_plugin_split_enabled flag state,
-        # supervised module count, Trinity/Neuromod/Epoch/Spirit-fast
-        # shm writer status, boot banner mode. Used as a single command
-        # to verify kernel+plugin split cutover success during deploy.
+        # health summary. Shows supervised module count, Trinity/Neuromod/
+        # Epoch/Spirit-fast shm writer status, boot banner mode. (The
+        # kernel/plugin split is unconditional since D-SPEC-106 — no split
+        # flag to display.) Used as a single command to verify L0 health.
         run_kernel_status(all_titans="--all" in sys.argv)
 
     elif cmd == "titanvm-schema":
@@ -8786,26 +9867,22 @@ def main():
         # B/C migrations clean.
         run_s5_callsites(verbose=("--verbose" in sys.argv or "-v" in sys.argv))
 
-    elif cmd in ("cache-keys", "cache_keys"):
-        # rFP_observatory_data_loading_v1 Phase 1 (2026-04-26): single source of
-        # truth audit for the producer→bus event→cache key→endpoint→frontend
-        # contract. Reads titan_plugin/api/cache_key_registry.REGISTRY and
-        # validates each entry against the source tree (+ optionally live state).
-        # Modes:
-        #   --audit   full static audit, exit-code on errors  (default)
-        #   --status  live-state matrix per Titan (--all for T1+T2+T3)
-        #   --list    one-line per registry entry, grouped by kind
-        #   --json    machine-readable output (works with --audit / --status / --list)
-        modes = {"audit", "status", "list"}
-        mode = next(
-            (a.lstrip("-") for a in sys.argv[2:] if a.lstrip("-") in modes),
-            "audit",
-        )
-        rc = run_cache_keys_command(
-            mode=mode,
-            all_titans="--all" in sys.argv,
-            json_mode="--json" in sys.argv,
-        )
+    elif cmd == "reload-module":
+        # SPEC §8.3 Phase B (D-SPEC-49) — per-module hot-reload CLI.
+        # Wraps POST /v4/admin/reload-module/{name} for the target Titan.
+        # Usage:
+        #   arch_map reload-module <name> [--titan T1|T2|T3] [--new-path PATH] [--timeout S]
+        rc = run_reload_module_command(sys.argv[2:])
+        sys.exit(rc)
+
+    elif cmd == "observatory-bff":
+        # rFP_observatory_enhancements §5.1 Phase 5: observability for the
+        # Next.js BFF + page-aggregate layer. Polls /api/bff-metrics on the
+        # local Observatory process and summarizes per-route hit/stale/miss
+        # ratios. Single observatory serves all 3 Titans, so no --all.
+        # Flags: --json (machine-readable), --url URL (default
+        # http://127.0.0.1:3000).
+        rc = run_observatory_bff(sys.argv[2:])
         sys.exit(rc)
 
     elif cmd == "phase-c":
@@ -8827,6 +9904,214 @@ def main():
     else:
         print(__doc__)
         sys.exit(1)
+
+
+# ── Observatory BFF metrics CLI (rFP §5.1 Phase 5) ─────────────────────
+
+def run_observatory_bff(args: list) -> int:
+    """`arch_map observatory-bff [--json] [--url URL]`
+
+    Snapshot the Next.js BFF + page-aggregate cache metrics. Single
+    Observatory process serves all 3 Titans, so there's no --all variant.
+
+    Output: per-route hit/stale/miss/error counts + summary hit-rate.
+    Hit-rate < 50% sustained signals TTL is too tight OR background
+    refresh is failing (rFP §5.3).
+    """
+    json_mode = "--json" in args
+    base_url = "http://127.0.0.1:3000"
+    for i, a in enumerate(args):
+        if a == "--url" and i + 1 < len(args):
+            base_url = args[i + 1]
+        elif a.startswith("--url="):
+            base_url = a.split("=", 1)[1]
+    url = f"{base_url}/api/bff-metrics"
+    try:
+        import requests
+        r = requests.get(url, timeout=5.0)
+    except Exception as e:
+        print(f"[observatory-bff] connection error to {url}: {e}", file=sys.stderr)
+        return 3
+    if r.status_code != 200:
+        print(f"[observatory-bff] HTTP {r.status_code}: {r.text[:200]}",
+              file=sys.stderr)
+        return 4
+    try:
+        payload = r.json()
+    except Exception:
+        print(f"[observatory-bff] non-JSON response: {r.text[:200]}",
+              file=sys.stderr)
+        return 5
+
+    if json_mode:
+        import json as _json
+        print(_json.dumps(payload, indent=2))
+        return 0
+
+    routes = payload.get("routes", {})
+    summary = payload.get("summary", {})
+    captured = payload.get("capturedAt")
+    print(f"Observatory BFF metrics — {url}")
+    if captured:
+        import datetime as _dt
+        ts = _dt.datetime.fromtimestamp(captured / 1000).isoformat(timespec="seconds")
+        print(f"  captured: {ts}")
+    if not routes:
+        print("  (no requests served yet — observatory may be cold)")
+        return 0
+    print(f"  {'route':<28} {'fresh':>7} {'stale':>7} {'miss':>7} {'error':>7} {'hit%':>6}")
+    for route in sorted(routes.keys()):
+        c = routes[route]
+        fresh = c.get("fresh", 0)
+        stale = c.get("stale", 0)
+        miss = c.get("miss", 0)
+        error = c.get("error", 0)
+        total = fresh + stale + miss
+        hit_pct = (100.0 * (fresh + stale) / total) if total > 0 else 0.0
+        print(f"  {route:<28} {fresh:>7} {stale:>7} {miss:>7} {error:>7} {hit_pct:>5.1f}%")
+    print()
+    total_req = summary.get("totalRequests", 0)
+    hit_rate = summary.get("hitRate", 0.0) * 100.0
+    print(f"  Σ requests: {total_req:>5}   hit-rate: {hit_rate:>5.1f}%")
+    if total_req >= 50 and hit_rate < 50.0:
+        print("  ⚠ hit-rate < 50% — TTL may be too tight or background refresh failing")
+        return 1
+    return 0
+
+
+# ── Phase B per-module hot-reload CLI (SPEC §8.3 D-SPEC-49) ────────────
+
+def run_reload_module_command(args: list) -> int:
+    """`arch_map reload-module <name> [--titan T1|T2|T3] [--new-path PATH] [--timeout S]`
+
+    POSTs to /v4/admin/reload-module/{name} on the target Titan and prints
+    the MODULE_RELOAD_ACK terminal status. Exit code 0 only on
+    status="ready".
+    """
+    if not args or args[0] in ("-h", "--help"):
+        print("Usage: arch_map reload-module <name> [--titan T1|T2|T3] "
+              "[--new-path PATH] [--timeout SECONDS]")
+        print("Per-module hot-reload per SPEC §8.3 + §11.B.3 (D-SPEC-49).")
+        return 1
+    module_name = args[0]
+    titan_id = "T1"
+    new_path: str | None = None
+    timeout_s = 30.0
+    i = 1
+    while i < len(args):
+        a = args[i]
+        if a == "--titan" and i + 1 < len(args):
+            titan_id = args[i + 1].upper()
+            i += 2
+        elif a.startswith("--titan="):
+            titan_id = a.split("=", 1)[1].upper()
+            i += 1
+        elif a == "--new-path" and i + 1 < len(args):
+            new_path = args[i + 1]
+            i += 2
+        elif a.startswith("--new-path="):
+            new_path = a.split("=", 1)[1]
+            i += 1
+        elif a == "--timeout" and i + 1 < len(args):
+            timeout_s = float(args[i + 1])
+            i += 2
+        elif a.startswith("--timeout="):
+            timeout_s = float(a.split("=", 1)[1])
+            i += 1
+        else:
+            print(f"unknown flag: {a}", file=sys.stderr)
+            return 2
+
+    if titan_id not in ("T1", "T2", "T3"):
+        print(f"--titan must be T1|T2|T3 (got {titan_id!r})", file=sys.stderr)
+        return 2
+
+    url_map = {
+        "T1": "http://127.0.0.1:7777",
+        "T2": "http://10.135.0.6:7777",
+        "T3": "http://10.135.0.6:7778",
+    }
+    base = url_map[titan_id]
+    url = f"{base}/v4/admin/reload-module/{module_name}"
+    body: dict = {"timeout_s": timeout_s}
+    if new_path is not None:
+        body["new_module_path"] = new_path
+
+    print(f"[reload-module] POST {url}  body={body}")
+    # D-SPEC-93 companion mitigation (2026-05-19) — transient failure
+    # retry-with-backoff for two known races surfaced during T1 cascade:
+    #
+    #   (1) "reload_in_flight" — prior reload's Guardian orchestrator
+    #       has finalized status=ready but its `finally` block clearing
+    #       `_reloads_in_flight` hasn't executed yet (HTTP response can
+    #       race with thread-finally on a heavily-loaded host).
+    #
+    #   (2) "not_running:state=starting" — prior reload's NEW worker is
+    #       running + heartbeating but the per-tick state finalization
+    #       (Step 8 RUNNING transition under _module_lock) hasn't been
+    #       observed by THIS request yet. The window is small but real
+    #       under T1 host load. The D-SPEC-93 companion fix at
+    #       guardian.py:Step 8 closes the post-Step-7-overwrite race
+    #       for slow boots, but a fresh request immediately following
+    #       reload completion can still observe the transient.
+    #
+    # Both are TRANSIENT — they self-resolve within seconds. Retry up
+    # to 3 times with 5s linear backoff before declaring failure.
+    import time as _time
+    _RETRY_REASONS = (
+        "reload_in_flight",
+        "not_running:state=starting",
+    )
+    _MAX_RETRIES = 3
+    _BACKOFF_S = 5.0
+
+    last_status = None
+    last_reason = None
+    last_elapsed = None
+    last_swap = ""
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            import requests
+            r = requests.post(url, json=body, timeout=timeout_s + 20.0)
+        except Exception as e:
+            print(f"[reload-module] HTTP error (attempt {attempt}): {e}",
+                  file=sys.stderr)
+            return 3
+        if r.status_code != 200:
+            print(f"[reload-module] HTTP {r.status_code}: {r.text}",
+                  file=sys.stderr)
+            return 4
+        try:
+            data = r.json()
+        except Exception:
+            print(f"[reload-module] non-JSON response: {r.text}",
+                  file=sys.stderr)
+            return 5
+        # Dashboard wraps in {ok, data} via _ok() helper.
+        payload = data.get("data", data) if isinstance(data, dict) else {}
+        last_status = payload.get("status", "unknown")
+        last_reason = payload.get("reason")
+        last_elapsed = payload.get("total_elapsed_ms")
+        last_swap = (payload.get("swap_id") or "")[:8]
+        if last_status == "ready":
+            break
+        # Decide whether to retry.
+        if last_status == "failed" and last_reason in _RETRY_REASONS \
+                and attempt < _MAX_RETRIES:
+            print(f"[reload-module] attempt {attempt} transient: "
+                  f"reason={last_reason!r}; retry in {_BACKOFF_S:.0f}s")
+            _time.sleep(_BACKOFF_S)
+            continue
+        # Permanent failure (or out of retries).
+        break
+
+    print()
+    print(f"  status        : {last_status}")
+    print(f"  reason        : {last_reason!r}")
+    print(f"  total_elapsed : {last_elapsed} ms")
+    print(f"  swap_id       : {last_swap}...")
+    print()
+    return 0 if last_status == "ready" else 1
 
 
 # ── Phase C SPEC enforcer (titan-docs/SPEC_titan_architecture.md §20) ──
@@ -8981,9 +10266,10 @@ _ARCH_OWNERSHIP_REGISTRY = [
     ("FilterDownV5Engine", "titan-unified-spirit-rs",
         r"^pub struct FilterDownV5Engine\b",
         "V5 filter_down engine lives ONLY in titan-unified-spirit-rs"),
-    ("TrinityValueNet", "titan-unified-spirit-rs",
+    ("TrinityValueNet", "titan-core",
         r"^pub struct TrinityValueNet\b",
-        "V5 162→128→64→1 value network lives ONLY in titan-unified-spirit-rs"),
+        "Const-generic TrinityValueNet<N> value network lives ONLY in titan-core "
+        "(shared by unified <162> + per-half small filter_down <65> per D-SPEC-97 / Phase 0 0C)"),
     ("ResonancePair", "titan-unified-spirit-rs",
         r"^pub struct ResonancePair\b",
         "Inner↔outer resonance pair detector lives ONLY in titan-unified-spirit-rs"),
@@ -9502,8 +10788,8 @@ def _phase_c_g_rpc_gates(repo, gates: "set | None") -> list:
     import yaml
 
     findings: list = []
-    titan_plugin = repo / "titan_plugin"
-    proxies_dir = titan_plugin / "proxies"
+    titan_hcl = repo / "titan_hcl"
+    proxies_dir = titan_hcl / "proxies"
     exemptions_path = repo / "titan-docs" / "phase_c_rpc_exemptions.yaml"
 
     # Load exemptions YAML (work-RPC allowlist + orphan handler allowlist).
@@ -9553,7 +10839,7 @@ def _phase_c_g_rpc_gates(repo, gates: "set | None") -> list:
 
     # ── G-RPC-1 + G-RPC-2 — bus.request call site scan ──────────────
     if _gate_enabled("G-RPC-1") or _gate_enabled("G-RPC-2"):
-        for py_file in titan_plugin.rglob("*.py"):
+        for py_file in titan_hcl.rglob("*.py"):
             rel = str(py_file.relative_to(repo))
             try:
                 tree = ast.parse(py_file.read_text(encoding="utf-8"),
@@ -9695,7 +10981,7 @@ def _phase_c_g_rpc_gates(repo, gates: "set | None") -> list:
         # Phase 1: enumerate handler actions across modules + logic + core.
         handlers: list = []  # list of (file, line, action_name)
         for sub_dir in ("modules", "logic", "core"):
-            sub_path = titan_plugin / sub_dir
+            sub_path = titan_hcl / sub_dir
             if not sub_path.exists():
                 continue
             for py_file in sub_path.rglob("*.py"):
@@ -9728,7 +11014,7 @@ def _phase_c_g_rpc_gates(repo, gates: "set | None") -> list:
         # Phase 2: enumerate caller actions — find `{"action": "X"}`
         # literal dicts AND simple `action="X"` keyword args.
         caller_actions: set = set()
-        for py_file in titan_plugin.rglob("*.py"):
+        for py_file in titan_hcl.rglob("*.py"):
             try:
                 tree = ast.parse(py_file.read_text(encoding="utf-8"),
                                  filename=str(py_file))
@@ -9776,6 +11062,196 @@ def _phase_c_g_rpc_gates(repo, gates: "set | None") -> list:
                 ),
             })
 
+    # ── G-RPC-5 — bus-cache drift enforcement (Phase E D-SPEC-81) ───
+    if _gate_enabled("G-RPC-5"):
+        findings.extend(_phase_c_g_rpc_5(repo, titan_hcl))
+
+    return findings
+
+
+# State-key prefixes that signal a state-domain `_cache.get(...)` read.
+# Any cache.get("<prefix>.*") call inside titan_hcl/ is a G-RPC-5a finding
+# unless allowlisted. Derived from the retired cache_key_registry's
+# state-domain keys (Phase D D-SPEC-82 retirement closure).
+_G_RPC_5_STATE_KEY_PREFIXES = (
+    "network.", "spirit.", "body.", "mind.", "memory.", "agency.",
+    "reasoning.", "dreaming.", "cgn.", "language.", "meta_teacher.",
+    "social.", "soul.", "guardian.", "llm.", "media.", "chi.",
+    "topology.", "neuromods.", "expression.", "social_perception.",
+    "msl.", "pi_heartbeat.", "meta_reasoning.", "self_reflection.",
+    "coding_explorer.", "prediction.", "outer_interface.", "kin.",
+    "metabolism.", "studio.", "gatekeeper.", "rl.", "timechain.",
+    "config.full", "bus.stats", "bus_health.snapshot", "v3.status",
+    "plugin._",
+)
+
+# Rust-canonical L0+L1 SHM slots whose owner is a Rust daemon per SPEC
+# §7.1 + §1 glossary + G21 single-writer. Standing up a Python-side
+# `StateRegistryWriter` for any of these is a G-RPC-5b violation.
+_G_RPC_5_RUST_CANONICAL_SLOTS = frozenset({
+    "INNER_BODY_5D_SLOT",
+    "INNER_MIND_15D_SLOT",
+    "INNER_SPIRIT_45D_SLOT",
+    "OUTER_BODY_5D_SLOT",
+    "OUTER_MIND_15D_SLOT",
+    "OUTER_SPIRIT_45D_SLOT",
+    "TOPOLOGY_30D_SLOT",
+    "TITAN_SELF_TENSOR_SLOT",
+    "RESONANCE_METADATA_SLOT",
+    "UNIFIED_SPIRIT_METADATA_SLOT",
+    "FILTER_DOWN_STATE_SLOT",
+})
+
+
+def _phase_c_g_rpc_5(repo, titan_hcl) -> list:
+    """G-RPC-5 scanner (Phase E D-SPEC-81).
+
+    Forbids bus-cache drift re-introduction after the Phase D pipeline
+    retirement. Two finding classes:
+
+      5a — Call(func=Attribute(attr='get'),
+                args=[Constant(value=<state-domain dotted key>)])
+           anywhere in `titan_hcl/`. Catches the most common
+           re-introduction vector: `something._cache.get("spirit.X")`.
+
+      5b — Call(func=Name('StateRegistryWriter'),
+                args=[Name(id=<denylisted slot constant>)])
+           anywhere in `titan_hcl/`. Catches standing up a Python
+           writer for a Rust-canonical L0+L1 slot.
+
+    Allowlist: `titan-docs/g_rpc_5_allowlist.yaml` — same Maker greenlight
+    discipline as `phase_c_rpc_exemptions.yaml`.
+    """
+    import ast
+    import yaml
+
+    findings: list = []
+
+    # Load allowlist
+    allow_cache: set = set()  # (file, line) OR (file, key)
+    allow_writer: set = set()  # (file, line) OR (file, slot)
+    allowlist_path = repo / "titan-docs" / "g_rpc_5_allowlist.yaml"
+    if allowlist_path.exists():
+        try:
+            with allowlist_path.open() as fh:
+                al = yaml.safe_load(fh) or {}
+            for entry in (al.get("cache_get_sites", []) or []):
+                f = entry.get("file", "")
+                site = entry.get("site", "")
+                key = entry.get("key", "")
+                if site and ":" in site:
+                    try:
+                        f_site, ln_site = site.rsplit(":", 1)
+                        allow_cache.add((f_site, int(ln_site)))
+                    except ValueError:
+                        # site is "<file>:<method>" — track loosely by key
+                        if f and key:
+                            allow_cache.add((f, key))
+                elif f and key:
+                    allow_cache.add((f, key))
+            for entry in (al.get("shm_writer_sites", []) or []):
+                f = entry.get("file", "")
+                site = entry.get("site", "")
+                slot = entry.get("slot", "")
+                if site and ":" in site:
+                    try:
+                        f_site, ln_site = site.rsplit(":", 1)
+                        allow_writer.add((f_site, int(ln_site)))
+                    except ValueError:
+                        if f and slot:
+                            allow_writer.add((f, slot))
+                elif f and slot:
+                    allow_writer.add((f, slot))
+        except Exception as e:
+            findings.append({
+                "kind": "G-RPC-5_ALLOWLIST_PARSE_FAIL",
+                "severity": "HIGH",
+                "message": f"g_rpc_5_allowlist.yaml parse failed: {e}",
+                "remediation": "fix YAML syntax; gate runs with empty allowlist meanwhile",
+            })
+
+    def _is_state_key(key: str) -> bool:
+        for prefix in _G_RPC_5_STATE_KEY_PREFIXES:
+            if key.startswith(prefix):
+                return True
+        return False
+
+    for py_file in titan_hcl.rglob("*.py"):
+        # Skip the state_accessor.py + shm_reader_bank.py introspection
+        # surfaces that internally enumerate cache keys for diagnostics —
+        # they don't perform cache reads, they introspect.
+        rel = str(py_file.relative_to(repo))
+        try:
+            source = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(py_file))
+        except (SyntaxError, OSError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+
+            # G-RPC-5a — Call(func=Attribute(attr='get'),
+            #                 args=[Constant(value=<state-key>)])
+            if (isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "get"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)
+                    and _is_state_key(node.args[0].value)):
+                key = node.args[0].value
+                if (rel, node.lineno) in allow_cache:
+                    continue
+                if (rel, key) in allow_cache:
+                    continue
+                findings.append({
+                    "kind": "G-RPC-5a",
+                    "severity": "HIGH",
+                    "message": (
+                        f"forbidden `cache.get({key!r})` at {rel}:{node.lineno} "
+                        f"— Preamble G-RPC-5a forbids state-domain cache reads"
+                    ),
+                    "remediation": (
+                        "migrate to SHM-direct via ShmReaderBank.read_<slot>() "
+                        "per Preamble G18 (D-SPEC-71 / D-SPEC-78 / D-SPEC-79 / "
+                        "D-SPEC-80); or add an entry to "
+                        "titan-docs/g_rpc_5_allowlist.yaml with rationale + "
+                        "Maker greenlight"
+                    ),
+                })
+
+            # G-RPC-5b — Call(func=Name('StateRegistryWriter'),
+            #                 args=[Name(id=<denylisted slot constant>)])
+            if (isinstance(node.func, ast.Name)
+                    and node.func.id == "StateRegistryWriter"
+                    and node.args):
+                first = node.args[0]
+                slot_name = None
+                if isinstance(first, ast.Name):
+                    slot_name = first.id
+                elif isinstance(first, ast.Attribute):
+                    slot_name = first.attr
+                if slot_name in _G_RPC_5_RUST_CANONICAL_SLOTS:
+                    if (rel, node.lineno) in allow_writer:
+                        continue
+                    if (rel, slot_name) in allow_writer:
+                        continue
+                    findings.append({
+                        "kind": "G-RPC-5b",
+                        "severity": "HIGH",
+                        "message": (
+                            f"forbidden `StateRegistryWriter({slot_name})` at "
+                            f"{rel}:{node.lineno} — slot is Rust-canonical "
+                            f"per SPEC §7.1 + G21 single-writer; Python-side "
+                            f"writer would duplicate the Rust L0+L1 daemon"
+                        ),
+                        "remediation": (
+                            "remove the Python-side writer; the canonical "
+                            "owner is the Rust daemon per SPEC §7.1 ownership "
+                            "column. Add allowlist entry only with Maker "
+                            "greenlight + rationale"
+                        ),
+                    })
+
     return findings
 
 
@@ -9795,6 +11271,9 @@ def _phase_c_verify(strict: bool = False, json_mode: bool = False,
       G-RPC-2 — no bus.request* without explicit timeout kwarg
       G-RPC-3 — every proxy `def get_*` reads SHM via StateRegistryReader
       G-RPC-4 — no orphan `if action == "get_*"` handler (caller graph)
+      G-RPC-5 — bus-cache drift enforcement (D-SPEC-81 Phase E): no
+                _cache.get(state_key) and no Python-side StateRegistryWriter
+                for Rust-canonical L0+L1 slots
 
     `gates` is a set of gate names to run; None = run all gates.
     """
@@ -9873,7 +11352,7 @@ def _phase_c_verify(strict: bool = False, json_mode: bool = False,
     def _gate_enabled(gate: str) -> bool:
         return gates is None or gate in gates
 
-    if any(_gate_enabled(f"G-RPC-{i}") for i in (1, 2, 3, 4)):
+    if any(_gate_enabled(f"G-RPC-{i}") for i in (1, 2, 3, 4, 5)):
         findings.extend(_phase_c_g_rpc_gates(repo, gates))
 
     # Output
@@ -10221,7 +11700,7 @@ def run_shm_status(all_titans: bool = False, verify: bool = False) -> int:
     # Schumann). Each registry's file is only present after its flag
     # has been flipped.
     try:
-        from titan_plugin.core.state_registry import (
+        from titan_hcl.core.state_registry import (
             CGN_LIVE_WEIGHTS, CHI_STATE, EPOCH_COUNTER, IDENTITY,
             INNER_BODY_5D, INNER_MIND_15D, INNER_SPIRIT_45D,
             NEUROMOD_STATE, SPHERE_CLOCKS_STATE, TITANVM_REGISTERS,
@@ -10262,7 +11741,7 @@ def run_shm_status(all_titans: bool = False, verify: bool = False) -> int:
             seq_str = "?"
             try:
                 if tid == "T1":  # local access
-                    from titan_plugin.core.state_registry import StateRegistryReader
+                    from titan_hcl.core.state_registry import StateRegistryReader
                     r = StateRegistryReader(spec, shm_dir)
                     meta = r.read_meta()
                     r.close()
@@ -10278,7 +11757,7 @@ def run_shm_status(all_titans: bool = False, verify: bool = False) -> int:
                 any_failed = True
             if verify and tid == "T1":
                 try:
-                    from titan_plugin.core.state_registry import StateRegistryReader
+                    from titan_hcl.core.state_registry import StateRegistryReader
                     r = StateRegistryReader(spec, shm_dir)
                     arr = r.read()
                     r.close()
@@ -10302,7 +11781,7 @@ def run_shm_status(all_titans: bool = False, verify: bool = False) -> int:
             seq_str = "?"
             try:
                 if tid == "T1":
-                    from titan_plugin.core.state_registry import StateRegistryReader
+                    from titan_hcl.core.state_registry import StateRegistryReader
                     r = StateRegistryReader(cgn_spec, shm_dir)
                     meta = r.read_meta()
                     r.close()
@@ -10338,8 +11817,9 @@ def run_kernel_status(all_titans: bool = False) -> int:
     Microkernel v2 Phase A §A.1 (S3) — per-titan kernel health summary.
 
     Combines per-Titan:
-      - Microkernel flag state (kernel_plugin_split_enabled,
-        shm_*_enabled flags) — queried via /health
+      - Microkernel shm_*_enabled flag state — queried via /health
+        (the kernel/plugin split is unconditional since legacy_core
+        retirement, 2026-05-21 / D-SPEC-106 — no split flag remains)
       - Guardian supervised module count (via /v4/layers)
       - Shm writer health (via /v4/trinity-shm + file inspection for T1)
       - Boot banner mode (from /health 'boot_mode' when available)
@@ -10363,7 +11843,7 @@ def run_kernel_status(all_titans: bool = False) -> int:
     print("=" * 90)
 
     try:
-        from titan_plugin.core.state_registry import (
+        from titan_hcl.core.state_registry import (
             EPOCH_COUNTER, INNER_SPIRIT_45D, NEUROMOD_STATE, TRINITY_STATE,
         )
         specs = [TRINITY_STATE, NEUROMOD_STATE, EPOCH_COUNTER, INNER_SPIRIT_45D]
@@ -10383,9 +11863,9 @@ def run_kernel_status(all_titans: bool = False) -> int:
             print(f"    ✗ /health unreachable")
             any_failed = True
             continue
-        # /health doesn't currently expose kernel_plugin_split_enabled
-        # directly — we infer from the process-title or boot log. For
-        # now, show a basic alive indicator.
+        # The kernel/plugin split is the sole boot path (legacy_core retired
+        # 2026-05-21 / D-SPEC-106), so there's no split flag to display —
+        # show a basic alive indicator.
         print(f"    ✓ API reachable")
 
         # ── Guardian modules supervised (from /v4/layers) ─────────────
@@ -10420,7 +11900,7 @@ def run_kernel_status(all_titans: bool = False) -> int:
                 continue
             age = _time.time() - path.stat().st_mtime
             try:
-                from titan_plugin.core.state_registry import StateRegistryReader
+                from titan_hcl.core.state_registry import StateRegistryReader
                 r = StateRegistryReader(spec, shm_dir)
                 meta = r.read_meta()
                 r.close()
@@ -10535,7 +12015,7 @@ def run_layers(all_titans: bool = False) -> int:
 
         # Canon check — compare live layers against _layer_canon.LAYER_CANON
         try:
-            from titan_plugin._layer_canon import LAYER_CANON
+            from titan_hcl._layer_canon import LAYER_CANON
             mismatches = []
             for layer, names in modules_by_layer.items():
                 for n in names:
@@ -10771,8 +12251,8 @@ def run_memory_profile(all_titans: bool = False, diff: bool = False,
                 sign = "+" if diff and sz > 0 else ""
                 fname = item.get("file", "?")
                 # Shorten paths for readability
-                if "titan_plugin/" in fname:
-                    fname = fname[fname.index("titan_plugin/"):]
+                if "titan_hcl/" in fname:
+                    fname = fname[fname.index("titan_hcl/"):]
                 elif "site-packages/" in fname:
                     fname = "..." + fname[fname.index("site-packages/") + 13:]
                 count = item.get("count", 0)
@@ -11739,12 +13219,31 @@ def _append_meta_cgn_trajectory(date_str: str, title: str) -> None:
         pass
 
 
-def run_session_close(title: str = "", commit: bool = True):
+def run_session_close(title: str = "", commit: bool = True,
+                       scope: str = "large", interactive: bool = False,
+                       force_incomplete: bool = False):
     """Parse current Claude session JSONL into conversation + session markdown, then commit.
 
     Produces:
       - titan-docs/conversations/CONVERSATION_YYYYMMDD_<slug>.md
+      - titan-docs/conversations/HIGHLIGHTS_YYYYMMDD_<slug>.md
       - titan-docs/sessions/SESSION_YYYYMMDD_<slug>.md (template)
+      - Appends one line to titan-docs/conversations/INDEX.md
+
+    Per session_close_protocol.md (opts #6, #7, #8, #12, #13 — 2026-05-17):
+      • scope:           trivial|small|large — pre-selects which steps to run.
+                         trivial = commit + health only.
+                         small   = rFP + memory + commit + health.
+                         large   = ALL steps.
+      • interactive:     walk each protocol step interactively, ticking off
+                         done/skip/needs-hand-fill. Refuses to complete
+                         unless all hand-fills are done OR force_incomplete.
+      • force_incomplete:bypass mandatory-completeness check (records
+                         override in session log).
+
+    Auto-extracts Architectural Decisions from AskUserQuestion + ExitPlanMode
+    tool-use events in the JSONL (opt #8) — every Maker greenlight becomes
+    a structured decision-list bullet automatically.
 
     JSONL structure (Claude Code):
       Each line is JSON with 'type' field: 'user', 'assistant', 'attachment', etc.
@@ -11753,6 +13252,48 @@ def run_session_close(title: str = "", commit: bool = True):
     """
     import glob as _glob
     import subprocess
+
+    # opt #7: scope-based step gating banner.
+    SCOPE_STEPS = {
+        "trivial": "step 5 (commit) + step 7 (health)",
+        "small":   "steps 1 (rFP) + 4 (memory) + 5 (commit) + 7 (health)",
+        "large":   "ALL steps (1/1b/2/3/4/5/5b/6/6a/7)",
+    }
+    print(f"\n  SESSION CLOSE — scope={scope} ({SCOPE_STEPS[scope]})")
+    if interactive:
+        print(f"  Mode: INTERACTIVE — will prompt at each step")
+    if force_incomplete:
+        print(f"  ⚠ force_incomplete=True — completeness check will be bypassed")
+
+    def _interactive_step(step_id: str, step_desc: str) -> bool:
+        """Interactive checklist prompt. Returns True if step should run.
+        Non-interactive mode: always returns True (caller's scope logic
+        gates whether the step actually runs)."""
+        if not interactive:
+            return True
+        prompt = (f"\n  [STEP {step_id}] {step_desc}\n"
+                  f"    Run this step? [Y/n/s=skip] ")
+        try:
+            resp = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Aborted by user.")
+            sys.exit(130)
+        if resp in ("", "y", "yes"):
+            return True
+        if resp in ("n", "no", "s", "skip"):
+            print(f"    skipped step {step_id}")
+            return False
+        # default: run
+        return True
+
+    # opt #7: for trivial scope, skip the heavy generators entirely and
+    # just run a minimal commit + health flow.
+    if scope == "trivial":
+        print("  trivial scope — skipping conversation/session/highlights "
+              "generation; commit your own changes and run process health "
+              "check manually. See session_close_protocol.md \"When to skip "
+              "steps\".")
+        return
 
     now = datetime.now(timezone.utc)
     date_str = now.strftime("%Y%m%d")
@@ -11778,35 +13319,28 @@ def run_session_close(title: str = "", commit: bool = True):
     print(f"  JSONL:      {jsonl_path}")
     print(f"  Session ID: {session_id}")
 
-    # ── 1a. Kick off dead-wiring full scan in background ─────────────────
-    # Runs in parallel with JSONL parsing (~2min scan vs ~30s parse).
-    # Non-blocking: we fire-and-wait at the reporting step. Result feeds
-    # into the session doc as a pre-close validation — surfaces any new
-    # orphan methods, bus gaps, or config sections the session introduced
-    # so we know of imminent problems BEFORE every close.
-    _dead_wiring_proc = None
-    _dead_wiring_out_path = f"/tmp/dead_wiring_session_{short_id}.json"
-    try:
-        print(f"  [1a] Launching arch_map dead-wiring scan (background)...")
-        _dead_wiring_proc = subprocess.Popen(
-            [
-                os.path.join("test_env", "bin", "python"),
-                "scripts/arch_map_dead_wiring.py",
-                "--all", "--json",
-            ],
-            stdout=open(_dead_wiring_out_path, "w"),
-            stderr=subprocess.DEVNULL,
-            cwd=os.getcwd(),
-        )
-    except Exception as _dw_err:
-        print(f"  [1a] dead-wiring launch failed (non-fatal): {_dw_err}")
-        _dead_wiring_proc = None
+    # Dead-wiring scan removed from session-close 2026-05-13 per user request
+    # — the scan added 30-60s wait to every close, frequently produced JSON
+    # parse errors, and didn't surface actionable issues. Run manually via
+    # `python scripts/arch_map.py dead-wiring` when needed.
 
     # ── 2. Parse JSONL into conversation transcript ──
     human_msgs = []
     assistant_msgs = []
     human_idx = 0
     assistant_idx = 0
+
+    # Per session_close_protocol opt #8 (2026-05-17): collect
+    # AskUserQuestion + ExitPlanMode tool_use events + their tool_result
+    # replies — every greenlight on these tools is an explicit Maker
+    # decision worth surfacing as an Architectural Decision in the
+    # session log. Format:
+    #   pending_decisions[toolUseId] = {"tool": "AskUserQuestion"|"ExitPlanMode",
+    #                                    "input": <dict>}
+    # When a matching tool_result arrives, move to `decisions` with the
+    # user's answer text appended.
+    pending_decisions: dict = {}
+    decisions: list[dict] = []
 
     with open(jsonl_path) as f:
         for line in f:
@@ -11821,6 +13355,39 @@ def run_session_close(title: str = "", commit: bool = True):
 
             content = obj.get("message", {}).get("content", "")
             text_parts = []
+
+            if isinstance(content, list):
+                # Pass 1: harvest decision tool_use events (opt #8)
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "tool_use":
+                        tname = block.get("name", "")
+                        if tname in ("AskUserQuestion", "ExitPlanMode"):
+                            tuid = block.get("id", "")
+                            pending_decisions[tuid] = {
+                                "tool": tname,
+                                "input": block.get("input", {}),
+                            }
+                    elif btype == "tool_result":
+                        tuid = block.get("tool_use_id", "")
+                        if tuid in pending_decisions:
+                            # Extract answer text from the result content
+                            result_content = block.get("content", "")
+                            if isinstance(result_content, list):
+                                answer_parts = []
+                                for rb in result_content:
+                                    if isinstance(rb, dict) and rb.get("type") == "text":
+                                        answer_parts.append(rb.get("text", ""))
+                                answer_text = " | ".join(answer_parts)
+                            elif isinstance(result_content, str):
+                                answer_text = result_content
+                            else:
+                                answer_text = str(result_content)[:500]
+                            entry = pending_decisions.pop(tuid)
+                            entry["answer"] = answer_text[:1000]
+                            decisions.append(entry)
 
             if isinstance(content, str):
                 text_parts.append(content)
@@ -12061,66 +13628,9 @@ def run_session_close(title: str = "", commit: bool = True):
     except Exception:
         git_log = "(could not read git log)"
 
-    # ── Collect dead-wiring scan result (launched at step 1a) ──
-    # Waits for completion (scan takes ~2min; JSONL parsing usually runs
-    # longer so this typically returns instantly). Non-fatal if scan
-    # errored: session still closes, but the doc notes the skip.
-    dead_wiring_summary: dict = {}
-    dead_wiring_report_md = "*Dead-wiring scan unavailable — see stderr*"
-    if _dead_wiring_proc is not None:
-        try:
-            print(f"  [dead-wiring] Waiting for scan to complete...")
-            _dead_wiring_proc.wait(timeout=300)
-            with open(_dead_wiring_out_path, "r") as _f:
-                _dw_result = json.load(_f)
-            dead_wiring_summary = _dw_result.get("summary", {})
-            runtime_ev = _dw_result.get("runtime_evidence") or {}
-            # Build a compact markdown summary
-            lines = [
-                f"- **Files scanned:** {_dw_result.get('n_files', '?')}",
-                f"- **Method defs:** {_dw_result.get('n_defs', '?')}",
-                f"- **Call sites:** {_dw_result.get('n_calls', '?')}",
-                f"- **Runtime evidence:** "
-                f"{'available' if runtime_ev.get('available') else 'API unreachable'}",
-                "",
-                "| Category | Count |",
-                "|---|---:|",
-            ]
-            titles_map = {
-                "orphan": "Orphan methods",
-                "pair_gap": "Pair-closure gaps",
-                "unused_config": "Unused config sections",
-                "rfp_missing": "rFP entities missing",
-                "bus_dead_msg": "Bus dead messages",
-                "bus_dead_handler": "Bus dead handlers",
-                "bus_unused_type": "Bus unused types",
-                "crud_write_only": "DB write-only tables",
-                "crud_read_only": "DB read-only tables",
-                "static_runtime_divergence": "⚡ Static-runtime divergence",
-            }
-            for k, pretty in titles_map.items():
-                cnt = dead_wiring_summary.get(k, 0)
-                if cnt > 0 or k in ("orphan", "unused_config"):
-                    lines.append(f"| {pretty} | {cnt} |")
-            # Highlight any divergence findings (these are interesting)
-            divergences = [
-                f for f in _dw_result.get("findings", [])
-                if f.get("kind") == "static_runtime_divergence"
-            ]
-            if divergences:
-                lines.append("")
-                lines.append("### ⚡ Static-runtime divergences (new this session)")
-                for d in divergences[:5]:
-                    lines.append(f"- **{d.get('title', '')}** — {d.get('detail', '')[:120]}")
-            dead_wiring_report_md = "\n".join(lines)
-            print(f"  [dead-wiring] DONE — "
-                  f"orphans={dead_wiring_summary.get('orphan', 0)}, "
-                  f"config={dead_wiring_summary.get('unused_config', 0)}, "
-                  f"bus_dead_msg={dead_wiring_summary.get('bus_dead_msg', 0)}, "
-                  f"divergence={dead_wiring_summary.get('static_runtime_divergence', 0)}")
-        except Exception as _dw_err:
-            print(f"  [dead-wiring] collection failed: {_dw_err}")
-            dead_wiring_report_md = f"*Dead-wiring scan failed: {_dw_err}*"
+    # Dead-wiring scan collect-block removed 2026-05-13 alongside the launch
+    # block above. Run `python scripts/arch_map.py dead-wiring` manually if
+    # the session introduced changes that warrant a fresh scan.
 
     # Harvest architectural decision candidates from highlight_pairs
     # (first line of marker-bearing messages — short enough to be summary-ish)
@@ -12145,25 +13655,54 @@ def run_session_close(title: str = "", commit: bool = True):
         # issues?". A clean summary means work landed cleanly; non-zero in
         # the DIVERGENCE category is the highest-priority signal (static
         # scanner missed a dynamic dispatch → should refine next time).
-        f.write("## 🔍 Dead-wiring validation scan\n\n")
-        f.write("*Auto-generated by `arch_map_dead_wiring.py --all` at session-close. "
-                "Flags new silent-wiring issues before the session commits.*\n\n")
-        f.write(dead_wiring_report_md)
-        f.write("\n\n---\n\n")
+        # Dead-wiring section removed from session-log template 2026-05-13
+        # (scan retired from session-close path; run manually if needed).
 
-        # Architectural Decisions (Part 1 of session-close enhancement)
+        # Architectural Decisions — opt #8 (2026-05-17): auto-extracted from
+        # AskUserQuestion + ExitPlanMode tool-use events in JSONL, plus
+        # legacy keyword-marker candidates as fallback.
         f.write("## Architectural Decisions\n\n")
-        f.write("TODO: list decisions locked in this session. "
-                "Candidates auto-extracted from highlight markers:\n\n")
+        if decisions:
+            f.write("**Maker greenlights via AskUserQuestion/ExitPlanMode "
+                    f"(auto-extracted from {len(decisions)} decision events):**\n\n")
+            for d in decisions:
+                tool = d.get("tool", "?")
+                inp = d.get("input", {}) or {}
+                answer = (d.get("answer", "") or "").strip()
+                if tool == "AskUserQuestion":
+                    questions = inp.get("questions", [])
+                    for q in questions:
+                        qtext = (q.get("question", "") or "").strip()
+                        if qtext:
+                            f.write(f"- **Q:** {qtext[:200]}\n")
+                    # Answer text usually contains "User has answered ... = ..." or option text
+                    if answer:
+                        # Trim quote-noise; keep only the chosen option text
+                        snippet = answer[:300].replace("\n", " ")
+                        f.write(f"  - **A:** {snippet}\n")
+                elif tool == "ExitPlanMode":
+                    plan = (inp.get("plan", "") or "")[:200].replace("\n", " ")
+                    if plan:
+                        f.write(f"- **Plan approved:** {plan}\n")
+                    if answer:
+                        f.write(f"  - **Result:** {answer[:200].replace(chr(10), ' ')}\n")
+            f.write("\n")
+        # Always also include legacy keyword-marker candidates as supplementary signal.
         if decision_candidates:
-            for dc in decision_candidates[:20]:
+            f.write("**Supplementary candidates from architectural keyword markers in HIGHLIGHTS:**\n\n")
+            for dc in decision_candidates[:10]:
                 f.write(f"{dc}\n")
-            if len(decision_candidates) > 20:
-                f.write(f"\n*...and {len(decision_candidates) - 20} more — "
+            if len(decision_candidates) > 10:
+                f.write(f"\n*...and {len(decision_candidates) - 10} more — "
                         f"see HIGHLIGHTS_{date_str}_{slug}.md*\n")
-        else:
-            f.write("*No automated candidates detected. See HIGHLIGHTS file.*\n")
-        f.write("\n---\n\n")
+            f.write("\n")
+        if not decisions and not decision_candidates:
+            f.write("*No automated candidates detected (no AskUserQuestion / "
+                    "ExitPlanMode events + no marker hits). Hand-fill below "
+                    "if any architectural decisions were made.*\n\n")
+        f.write("TODO: hand-curate the above into a clean decision list — "
+                "drop noise, add SPEC §refs / D-SPEC-NN / memory pointers.\n\n")
+        f.write("---\n\n")
 
         # Design Discussions (links to message numbers)
         f.write("## Design Discussions\n\n")
@@ -12179,7 +13718,8 @@ def run_session_close(title: str = "", commit: bool = True):
             rfp_result = subprocess.check_output(
                 ["git", "log", "--since=12 hours ago", "--name-only",
                  "--pretty=format:", "--", "titan-docs/rFP_*.md",
-                 "titan-docs/DEFERRED_ITEMS.md", "memory/known_issues.md"],
+                 "titan-docs/DEFERRED_ITEMS.md", "titan-docs/BUGS.md",
+                 "titan-docs/OBSERVABLES.md"],
                 cwd=str(PROJECT_ROOT), text=True, stderr=subprocess.DEVNULL
             ).strip()
             rfps_touched = sorted(set(l.strip() for l in rfp_result.split("\n") if l.strip()))
@@ -12213,6 +13753,30 @@ def run_session_close(title: str = "", commit: bool = True):
 
     # Append snapshot row to meta_cgn_trajectory.tsv for time-series tracking
     _append_meta_cgn_trajectory(date_str, title or "")
+
+    # ── 5a. Prepend session_brief.py mechanical metrics ──────────────
+    # scripts/session_brief.py is the canonical companion to session-close
+    # (see its docstring: "Wired into session_close_protocol Step 4"). It
+    # computes git-derived fields the JSONL parser can't see — branch,
+    # merge-base, commit subjects, diffstat, files-touched-by-directory.
+    # Auto-invoked here so the SESSION_*.md file lands with mechanical
+    # metadata prepended without needing a separate manual step.
+    # Maker direction 2026-05-14: wire this in so it's never forgotten.
+    try:
+        brief_result = subprocess.run(
+            [sys.executable, os.path.join(PROJECT_ROOT, "scripts", "session_brief.py"),
+             "--prepend", sess_path],
+            cwd=str(PROJECT_ROOT), capture_output=True, text=True, timeout=30,
+        )
+        if brief_result.returncode == 0:
+            stdout = brief_result.stdout.strip()
+            if stdout:
+                print(f"  Brief:        {stdout}")
+        else:
+            err = (brief_result.stderr or brief_result.stdout).strip()
+            print(f"  Brief:        ⚠ session_brief.py exit {brief_result.returncode}: {err[:120]}")
+    except Exception as e:
+        print(f"  Brief:        ⚠ session_brief.py invocation failed: {e}")
 
     print(f"  Session:      {sess_path}")
     print(f"               (template — fill in TODOs)")
@@ -12273,7 +13837,7 @@ def run_session_close(title: str = "", commit: bool = True):
     if commit:
         try:
             # SAFETY: build the set of files we must NEVER auto-commit:
-            #   1. Files marked --assume-unchanged (e.g. titan_plugin/config.toml
+            #   1. Files marked --assume-unchanged (e.g. titan_hcl/config.toml
             #      which auto-refreshes Twitter auth_session runtime token).
             #      Per-Titan runtime state — committing it leaks secrets and
             #      stomps on T2/T3 state via git pull.
@@ -12299,7 +13863,7 @@ def run_session_close(title: str = "", commit: bool = True):
 
             # Hardcoded secrets blocklist (regardless of assume-unchanged state)
             SECRETS_BLOCKLIST = {
-                "titan_plugin/config.toml",  # Twitter auth_session refresh
+                "titan_hcl/config.toml",  # Twitter auth_session refresh
                 "authority.json",
             }
             SECRETS_PATTERNS = (
@@ -13152,8 +14716,8 @@ def run_where(symbol: str):
     Case-insensitive substring match. Returns grouped results with full paths.
 
     Example — `arch_map where agno_hooks` would have caught the 2026-04-12
-    error where searching `titan_plugin/logic/agno_hooks.py` returned empty
-    but the file exists at `titan_plugin/agno_hooks.py`.
+    error where searching `titan_hcl/logic/agno_hooks.py` returned empty
+    but the file exists at `titan_hcl/agno_hooks.py`.
     """
     graph = load_graph()
     sym = symbol.lower()
@@ -13239,7 +14803,7 @@ def run_where(symbol: str):
             print(f"    ... and {len(attr_matches)-20} more")
 
     # 5. Config keys in titan_params.toml + config.toml
-    config_files = ["titan_plugin/titan_params.toml", "titan_plugin/config.toml"]
+    config_files = ["titan_hcl/titan_params.toml", "titan_hcl/config.toml"]
     config_matches = []
     for cfg_path in config_files:
         try:
@@ -13857,8 +15421,8 @@ def run_titanvm_schema() -> int:
     print("=" * 90)
 
     try:
-        from titan_plugin.logic.emot_bundle_protocol import NS_PROGRAMS
-        from titan_plugin.logic.neural_reflex_net import (
+        from titan_hcl.logic.emot_bundle_protocol import NS_PROGRAMS
+        from titan_hcl.logic.neural_reflex_net import (
             NeuralReflexNet,
             DEFAULT_INPUT_DIM,
         )
@@ -14016,7 +15580,7 @@ def run_api_status(all_titans: bool = False) -> int:
         if tid == "T1":
             from pathlib import Path as _Path
             try:
-                from titan_plugin.core.kernel_rpc import (
+                from titan_hcl.core.kernel_rpc import (
                     kernel_sock_path, kernel_authkey_path)
                 # We need the actual titan_id of T1. Try data/titan_identity.json
                 import json as _json
@@ -14057,7 +15621,7 @@ def run_s5_callsites(verbose: bool = False) -> int:
     (Phase B/C will fail to migrate cleanly).
 
     Wraps scripts/s5_callsite_audit.py — runs the libcst categorizer over
-    titan_plugin/api/ and reports per-file A/B/C split. Returns exit code
+    titan_hcl/api/ and reports per-file A/B/C split. Returns exit code
     1 if any Category B (async cross-process) callsites exist (those are
     the highest-risk regressions — they break in microkernel mode).
     """
@@ -14075,7 +15639,7 @@ def run_s5_callsites(verbose: bool = False) -> int:
     print()
 
     cmd = [sys.executable, str(audit_script),
-           "--paths", "titan_plugin/api/", "--summary"]
+           "--paths", "titan_hcl/api/", "--summary"]
     res = _sp.run(cmd, cwd=str(repo), capture_output=True, text=True, timeout=60)
     out = res.stdout.strip()
     print(out)
@@ -14168,7 +15732,7 @@ def run_module_methods(all_titans: bool = False) -> int:
         spawn_ref_flag = "?"
         if tid == "T1":
             try:
-                from titan_plugin.config_loader import load_titan_config
+                from titan_hcl.config_loader import load_titan_config
                 cfg = load_titan_config()
                 spawn_ref_flag = cfg.get("microkernel", {}).get(
                     "spawn_reference_worker_enabled", False)
@@ -14199,376 +15763,129 @@ def run_module_methods(all_titans: bool = False) -> int:
     return 0 if not any_failed else 1
 
 
-# ── rFP_observatory_data_loading_v1 Phase 1 — cache-keys subcommand ─
 
-def run_cache_keys_command(
-    mode: str = "audit",
-    all_titans: bool = False,
-    json_mode: bool = False,
-) -> int:
-    """Dispatcher for `arch_map cache-keys [--audit|--status|--list] [--all] [--json]`.
+def run_track2_acceptance(titans: list, json_mode: bool = False,
+                            strict: bool = False,
+                            with_pytest: bool = False) -> int:
+    """Top-level Track 2 acceptance runner."""
+    overall_results: dict = {}
+    overall_fails = 0
 
-    Returns process exit code (0 = clean, 1 = errors found).
-    """
-    # Lazy import — registry lives in titan_plugin/, so this only loads
-    # when the subcommand is invoked.
-    try:
-        from titan_plugin.api import cache_key_registry as ckr
-    except Exception as e:
-        print(f"ERROR: cannot import cache_key_registry: {e}", file=sys.stderr)
-        return 2
-
-    if mode == "list":
-        return _cache_keys_list(ckr, json_mode=json_mode)
-    if mode == "status":
-        return _cache_keys_status(ckr, all_titans=all_titans, json_mode=json_mode)
-    return _cache_keys_audit(ckr, json_mode=json_mode)
-
-
-def _cache_keys_list(ckr, json_mode: bool = False) -> int:
-    if json_mode:
-        out = [
-            {
-                "key": s.key,
-                "kind": s.kind,
-                "producer_event": s.producer_event,
-                "producer_module": s.producer_module,
-                "publish_cadence_s": s.publish_cadence_s,
-                "consumer_endpoints": list(s.consumer_endpoints),
-                "frontend_hook": s.frontend_hook,
-            }
-            for s in ckr.REGISTRY
-        ]
-        print(json.dumps(out, indent=2))
-        return 0
-
-    print()
-    print("=" * 100)
-    print(f"  CACHE KEY REGISTRY — {len(ckr.REGISTRY)} entries")
-    print("=" * 100)
-    for kind in ("hybrid", "bus_event", "snapshot", "missing", "deprecated"):
-        entries = ckr.specs_by_kind(kind)
-        if not entries:
+    for titan in titans:
+        label, base_url = _track2_titan_url(titan)
+        if not base_url:
             continue
-        print()
-        print(f"  [{kind.upper()}]  {len(entries)} entries")
-        print("  " + "-" * 96)
-        for s in entries:
-            ev = s.producer_event or ""
-            hook = s.frontend_hook or ""
-            print(f"    {s.key:<40s}  ev={ev:<32s}  hook={hook}")
-    print()
-    return 0
+        gates = []
+        gates.append((
+            "Gate #1 outer_interface_worker running",
+            _track2_check_worker_running(base_url, "outer_interface_worker")))
+        gates.append((
+            "Gate #2 self_reflection_worker running",
+            _track2_check_worker_running(base_url, "self_reflection_worker")))
+        for route, short in [
+            ("/v4/self-exploration", "self-exploration"),
+            ("/v4/self-reflection", "self-reflection"),
+            ("/v4/coding-explorer", "coding-explorer"),
+            ("/v4/prediction", "prediction"),
+            ("/v4/kin-signature", "kin-signature"),
+            ("/v4/kin-society", "kin-society"),
+        ]:
+            gates.append((f"Gate #6 {short} populated",
+                          _track2_check_route_populated(base_url, route)))
+        overall_results[label] = gates
+        overall_fails += sum(1 for _, r in gates if r["pass"] is False)
 
+    cross = []
+    cross.append(("Gate #5 cognitive_worker no prediction_engine",
+                  _track2_check_cognitive_no_prediction_engine()))
+    cross.append(("Gate #10 BOOT_DRIVER_PARITY clean",
+                  _track2_check_boot_driver_parity()))
+    cross.append(("Gate #8 spirit_worker_main heuristic",
+                  _track2_check_spirit_worker_unreferenced()))
+    cross.append(("Gate #9 bus_specs audit",
+                  _track2_check_bus_specs_audit()))
+    cross.append(("Gate ✓ SPEC v1.2.1",
+                  _track2_check_spec_version()))
+    if with_pytest:
+        cross.append(("Gate #11 pytest workspace",
+                      _track2_check_pytest_subset()))
+    overall_fails += sum(1 for _, r in cross if r["pass"] is False)
 
-def _cache_keys_audit(ckr, json_mode: bool = False) -> int:
-    """Static audit — checks REGISTRY against source tree.
-
-    Errors (cause non-zero exit):
-      • bus_event/hybrid producer_event missing from titan_plugin.bus
-      • bus_event/hybrid producer_module missing _send_msg(... event ...) call
-      • snapshot producer_module not found in source tree
-      • REGISTRY key duplicated
-      • cache.get('X') in api/* code with X not in REGISTRY and not allowlisted
-      • EVENT_TO_CACHE_KEY hand-maintained drift (defensive — should be derived)
-
-    Warnings (no exit-code impact):
-      • consumer_endpoints not found in dashboard.py
-      • frontend_hook not found in useTitanAPI.ts
-      • missing-kind entries (no producer wired) — listed for visibility
-    """
-    import re
-    import importlib
-
-    repo_root = Path(__file__).resolve().parent.parent
-    api_dir = repo_root / "titan_plugin" / "api"
-    modules_dir = repo_root / "titan_plugin" / "modules"
-    core_dir = repo_root / "titan_plugin" / "core"
-    dashboard_path = api_dir / "dashboard.py"
-    hooks_path = repo_root / "titan-observatory" / "hooks" / "useTitanAPI.ts"
-
-    errors: list[str] = []
-    warnings: list[str] = []
-    info: list[str] = []
-
-    # 1. Duplicate keys
-    seen: set[str] = set()
-    for s in ckr.REGISTRY:
-        if s.key in seen:
-            errors.append(f"DUPLICATE KEY: {s.key!r}")
-        seen.add(s.key)
-
-    # 2. Bus constants exist in titan_plugin.bus
-    try:
-        bus_module = importlib.import_module("titan_plugin.bus")
-    except Exception as e:
-        errors.append(f"Cannot import titan_plugin.bus: {e}")
-        bus_module = None
-
-    if bus_module is not None:
-        for s in ckr.REGISTRY:
-            if s.producer_event is None:
-                continue
-            if not hasattr(bus_module, s.producer_event):
-                errors.append(
-                    f"BUS CONSTANT MISSING: {s.key} declares producer_event="
-                    f"{s.producer_event!r} but it is not defined in titan_plugin.bus")
-
-    # 3. Producer modules contain expected publishers / function refs
-    #
-    # For `bus_event`/`hybrid`: search the producer_module's source file for
-    #   _send_msg(... PRODUCER_EVENT ...) — anywhere in the file is OK.
-    # For `snapshot`: producer_module must reference an existing function/method
-    #   in the snapshot builder's file.
-    file_cache: dict[Path, str] = {}
-
-    def _read(p: Path) -> str:
-        if p not in file_cache:
-            try:
-                file_cache[p] = p.read_text()
-            except Exception:
-                file_cache[p] = ""
-        return file_cache[p]
-
-    def _module_to_path(mod_dotted: str) -> Path | None:
-        # Split off `:func` or `.func` — keep just the module path.
-        # Accept formats: `titan_plugin.modules.spirit_worker._publish_chi`
-        #              or `titan_plugin.modules.spirit_worker`
-        #              or `titan_plugin.core.kernel.MicroKernel._build_state_snapshot`
-        parts = mod_dotted.split(".")
-        # Walk from longest prefix down until we find a .py
-        for cut in range(len(parts), 0, -1):
-            candidate = repo_root / Path(*parts[:cut]).with_suffix(".py")
-            if candidate.exists():
-                return candidate
-        return None
-
-    for s in ckr.REGISTRY:
-        if s.kind in ("deprecated", "missing"):
-            continue
-        if not s.producer_module:
-            errors.append(f"NO PRODUCER MODULE: {s.key} (kind={s.kind})")
-            continue
-        prod_path = _module_to_path(s.producer_module)
-        if prod_path is None:
-            errors.append(
-                f"PRODUCER MODULE FILE NOT FOUND: {s.key} → "
-                f"{s.producer_module!r} (no .py on import path)")
-            continue
-        src = _read(prod_path)
-        if s.kind in ("bus_event", "hybrid"):
-            # Look for any of these patterns referencing producer_event:
-            #   _send_msg(... EVENT ...)
-            #   bus.publish(make_msg(EVENT, ...))
-            #   self.bus.publish(make_msg(EVENT, ...))
-            # Accept either constant name (CHI_UPDATED) or string literal.
-            ev = s.producer_event
-            patterns = [
-                rf"_send_msg\([^)]*\b{re.escape(ev)}\b",
-                rf'_send_msg\([^)]*"{re.escape(ev)}"',
-                rf"make_msg\(\s*{re.escape(ev)}\b",
-                rf'make_msg\(\s*"{re.escape(ev)}"',
-            ]
-            if not any(re.search(p, src, re.DOTALL) for p in patterns):
-                errors.append(
-                    f"PRODUCER NOT FOUND IN SOURCE: {s.key} → "
-                    f"expected _send_msg(... {ev} ...) or make_msg({ev}, ...) "
-                    f"in {prod_path.relative_to(repo_root)}")
-        elif s.kind == "snapshot":
-            # Verify the snapshot builder file mentions this cache key
-            # (kernel._build_state_snapshot writes `snapshot["X"] = ...`).
-            patt = re.compile(rf'snapshot\[\s*[\'"]{re.escape(s.key)}[\'"]\s*\]')
-            patt_alt = re.compile(rf'snapshot\[f?\s*[\'"][^\'"]*{re.escape(s.key)}')
-            patt_attr = re.compile(rf'snapshot\["plugin\.{re.escape(s.key.split(".", 1)[1])}"\]'
-                                   ) if s.key.startswith("plugin.") else None
-            if not (patt.search(src) or patt_alt.search(src) or
-                    (patt_attr and patt_attr.search(src))):
-                # Some snapshot keys are written via the f-string `snapshot[f"plugin.{attr}"]`
-                # loop in kernel.py. Allow that pattern too.
-                if s.key.startswith("plugin."):
-                    attr = s.key.split(".", 1)[1]
-                    if f'"{attr}"' in src and "snapshot[f" in src:
-                        continue
-                errors.append(
-                    f"SNAPSHOT KEY NOT WRITTEN: {s.key} → expected "
-                    f"snapshot[\"{s.key}\"] in {prod_path.relative_to(repo_root)}")
-
-    # 4. Reverse check — every cache.get(LITERAL) must resolve to REGISTRY or allowlist.
-    cache_get_pat = re.compile(r'cache\.get\(\s*[\'"]([^\'"]+)[\'"]')
-    scan_dirs = [api_dir, modules_dir, core_dir]
-    # cache_key_registry.py defines the registry itself — its docstring
-    # examples reference cache.get() literally and must be excluded from
-    # the reverse scan.
-    skip_files = {api_dir / "cache_key_registry.py"}
-    found_keys: dict[str, list[tuple[Path, int]]] = {}
-    for d in scan_dirs:
-        for py in d.rglob("*.py"):
-            if py in skip_files:
-                continue
-            try:
-                lines = py.read_text().splitlines()
-            except Exception:
-                continue
-            for lineno, line in enumerate(lines, start=1):
-                for m in cache_get_pat.finditer(line):
-                    k = m.group(1)
-                    found_keys.setdefault(k, []).append((py, lineno))
-
-    for k, sites in found_keys.items():
-        if k in ckr.REGISTERED_KEYS:
-            continue
-        if ckr.is_allowlisted(k):
-            continue
-        first = sites[0]
-        errors.append(
-            f"UNREGISTERED CACHE KEY: cache.get({k!r}) at "
-            f"{first[0].relative_to(repo_root)}:{first[1]} "
-            f"({len(sites)} callsite{'s' if len(sites) > 1 else ''})")
-
-    # 5. Consumer endpoints — WARN only
-    if dashboard_path.exists():
-        dashboard_src = _read(dashboard_path)
-        endpoint_pat = re.compile(r'@router\.(?:get|post)\(\s*[\'"]([^\'"]+)[\'"]')
-        declared_endpoints = {m.group(1) for m in endpoint_pat.finditer(dashboard_src)}
-        for s in ckr.REGISTRY:
-            for ep in s.consumer_endpoints:
-                if ep not in declared_endpoints:
-                    warnings.append(
-                        f"CONSUMER ENDPOINT MISSING: {s.key} → {ep!r} not in dashboard.py")
-
-    # 6. Frontend hooks — WARN only
-    if hooks_path.exists():
-        hooks_src = _read(hooks_path)
-        for s in ckr.REGISTRY:
-            if not s.frontend_hook:
-                continue
-            patt = re.compile(rf'\bexport\s+(?:function|const)\s+{re.escape(s.frontend_hook)}\b')
-            if not patt.search(hooks_src):
-                warnings.append(
-                    f"FRONTEND HOOK MISSING: {s.key} → "
-                    f"{s.frontend_hook!r} not in useTitanAPI.ts")
-    else:
-        warnings.append(f"useTitanAPI.ts not found at {hooks_path} — frontend hook checks skipped")
-
-    # 7. INFO — list missing-kind entries
-    for s in ckr.REGISTRY:
-        if s.kind == "missing":
-            info.append(
-                f"MISSING PRODUCER (declared, unwired): {s.key} "
-                f"event={s.producer_event} — Phase 4 bring-up target")
-
-    # ── Render ─────────────────────────────────────────────────────
     if json_mode:
         out = {
-            "errors": errors,
-            "warnings": warnings,
-            "info": info,
-            "registry_size": len(ckr.REGISTRY),
-            "exit_code": 1 if errors else 0,
+            "titan_gates": {
+                k: [{"name": n, **r} for n, r in v]
+                for k, v in overall_results.items()
+            },
+            "cross_cutting_gates": [{"name": n, **r} for n, r in cross],
+            "fails": overall_fails,
+            "exit_code": 1 if (strict and overall_fails > 0) else 0,
         }
         print(json.dumps(out, indent=2))
-        return 1 if errors else 0
+        return out["exit_code"]
 
     print()
-    print("=" * 100)
-    print(f"  CACHE KEYS AUDIT — {len(ckr.REGISTRY)} registry entries")
-    print("=" * 100)
-    if errors:
+    print("=" * 80)
+    print("  TRACK 2 — SELF-IMPROVEMENT SUBSYSTEM MIGRATION — ACCEPTANCE GATES")
+    print("  rFP_phase_c_self_improvement_subsystem_migration.md §9.B")
+    print("=" * 80)
+
+    def _fmt(r: dict) -> str:
+        if r["pass"] is True:
+            return f"✓ PASS  {r['detail']}"
+        if r["pass"] is False:
+            return f"✗ FAIL  {r['detail']}"
+        return f"⚠ SKIP  {r['detail']}"
+
+    for label, gates in overall_results.items():
         print()
-        print(f"  ERRORS ({len(errors)})")
-        print("  " + "-" * 96)
-        for e in errors:
-            print(f"    ✗ {e}")
-    if warnings:
-        print()
-        print(f"  WARNINGS ({len(warnings)})")
-        print("  " + "-" * 96)
-        for w in warnings:
-            print(f"    ⚠ {w}")
-    if info:
-        print()
-        print(f"  INFO — Phase 4 bring-up targets ({len(info)})")
-        print("  " + "-" * 96)
-        for i in info:
-            print(f"    ℹ {i}")
-    print()
-    if not errors:
-        print("  ✓ AUDIT CLEAN — no producer drift, no unregistered cache.get sites")
-    else:
-        print(f"  ✗ AUDIT FAILED — {len(errors)} errors")
-    print("=" * 100)
-    print()
-    return 1 if errors else 0
-
-
-def _cache_keys_status(ckr, all_titans: bool = False, json_mode: bool = False) -> int:
-    """Live-state matrix per Titan — probes /v4/cache-staleness and reports
-    which registered keys are populated and how stale each is."""
-    titans = [("T1", "http://127.0.0.1:7777")]
-    if all_titans:
-        titans.extend([
-            ("T2", "http://10.135.0.6:7777"),
-            ("T3", "http://10.135.0.6:7778"),
-        ])
-
-    results = {}
-    for label, url in titans:
-        info = _unwrap(_health_get(url, "/v4/cache-staleness"))
-        if not info:
-            results[label] = {"reachable": False, "keys": {}}
-            continue
-        # Endpoint shape: {available, bootstrap_done, key_count, max_age_seconds,
-        #                  buckets:{fresh,warm,stale,cold}, ages:{key: age_seconds}}
-        ages = info.get("ages", {}) if isinstance(info, dict) else {}
-        # Normalize to {key: {age_seconds: float}} for the matrix below.
-        keys_info = {k: {"age_seconds": v} for k, v in ages.items()}
-        results[label] = {"reachable": True, "keys": keys_info}
-
-    if json_mode:
-        out = {"results": results, "registry_size": len(ckr.REGISTRY)}
-        print(json.dumps(out, indent=2, default=str))
-        return 0
+        print(f"  {label}")
+        print("  " + "-" * 76)
+        for name, r in gates:
+            print(f"    {name:<54s}  {_fmt(r)}")
 
     print()
-    print("=" * 110)
-    print(f"  CACHE KEYS LIVE STATUS — {len(ckr.REGISTRY)} registered keys")
-    print("=" * 110)
-    for label, _url in titans:
-        r = results[label]
-        print()
-        print(f"  {label}  reachable={r['reachable']}")
-        print("  " + "-" * 106)
-        if not r["reachable"]:
-            print(f"    (cannot reach {_url}/v4/cache-staleness)")
-            continue
-        live_keys = r["keys"]
-        # Header
-        print(f"    {'key':<40s}  {'kind':<10s}  {'cadence':>8s}  {'live age':>10s}  {'status'}")
-        for s in ckr.REGISTRY:
-            if s.kind == "deprecated":
-                continue
-            row = live_keys.get(s.key, None)
-            if row is None:
-                age_str = "—"
-                status = "ABSENT" if s.kind != "missing" else "missing-by-design"
-            else:
-                age = row.get("age_seconds") if isinstance(row, dict) else None
-                if age is None:
-                    age_str = "?"
-                    status = "(no age)"
-                else:
-                    age_str = f"{age:.1f}s"
-                    if s.publish_cadence_s > 0 and age > s.publish_cadence_s * 3:
-                        status = "STALE"
-                    else:
-                        status = "FRESH"
-            cadence = f"{s.publish_cadence_s:.1f}s" if s.publish_cadence_s else "—"
-            print(f"    {s.key:<40s}  {s.kind:<10s}  {cadence:>8s}  {age_str:>10s}  {status}")
+    print("  Cross-cutting (titan-independent)")
+    print("  " + "-" * 76)
+    for name, r in cross:
+        print(f"    {name:<54s}  {_fmt(r)}")
+
     print()
-    print("=" * 110)
+    print("=" * 80)
+    pass_count = sum(
+        sum(1 for _, r in gates if r["pass"] is True)
+        for gates in overall_results.values()
+    ) + sum(1 for _, r in cross if r["pass"] is True)
+    total = sum(len(g) for g in overall_results.values()) + len(cross)
+    print(f"  {pass_count}/{total} PASS  |  {overall_fails} FAIL  "
+          f"|  rest SKIP/advisory")
+    if overall_fails > 0 and strict:
+        print(f"  STRICT MODE: exit 1 ({overall_fails} explicit FAIL)")
+    print("=" * 80)
     print()
-    return 0
+    return 1 if (strict and overall_fails > 0) else 0
 
 
 if __name__ == "__main__":
+    # Track 2 acceptance subcommand intercept (before main() dispatch).
+    if len(sys.argv) >= 2 and sys.argv[1] == "track2-acceptance":
+        _t2_argv = sys.argv[2:]
+        _t2_titans = ["T1"]
+        _t2_json = False
+        _t2_strict = False
+        _t2_pytest = False
+        for arg in _t2_argv:
+            if arg == "--all":
+                _t2_titans = ["T1", "T2", "T3"]
+            elif arg.startswith("--titan="):
+                _t2_titans = [arg.split("=", 1)[1]]
+            elif arg == "--json":
+                _t2_json = True
+            elif arg == "--strict":
+                _t2_strict = True
+            elif arg == "--with-pytest":
+                _t2_pytest = True
+        sys.exit(run_track2_acceptance(
+            _t2_titans, json_mode=_t2_json, strict=_t2_strict,
+            with_pytest=_t2_pytest))
     main()

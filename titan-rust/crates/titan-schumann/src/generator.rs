@@ -177,7 +177,7 @@ impl SchumannGenerator {
                         if let Err(e) = tx.try_send(event) {
                             match e {
                                 mpsc::error::TrySendError::Full(_) => {
-                                    if tick_idx % 100 == 0 {
+                                    if tick_idx.is_multiple_of(100) {
                                         warn!(
                                             role = role.as_str(),
                                             epoch = tick_idx,

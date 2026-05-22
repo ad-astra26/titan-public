@@ -1,6 +1,6 @@
 //! authkey — HKDF-SHA256 derivation of the bus authkey from Titan's identity.
 //!
-//! Byte-identical port of `titan_plugin/core/bus_authkey.py` (B.2 §D1).
+//! Byte-identical port of `titan_hcl/core/bus_authkey.py` (B.2 §D1).
 //! Uses RustCrypto's `hkdf` + `sha2` — pure Rust, no system dependencies.
 //!
 //! # Properties

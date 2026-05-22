@@ -3,7 +3,7 @@
 scripts/arc_test_harness.py — ARC reward-rebalance validation harness.
 
 Analyses the `episode_diagnostics_{YYYYMMDD}.jsonl` files emitted by
-titan_plugin/logic/arc/session.py across T1/T2/T3 and reports:
+titan_hcl/logic/arc/session.py across T1/T2/T3 and reports:
 
   • L1 completion rate per game
   • Action entropy distribution (collapse detector)

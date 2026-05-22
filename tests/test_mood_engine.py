@@ -30,8 +30,8 @@ for mod in _MOCKED_MODULES:
 # httpx is a real installed package — do NOT mock it. Only mock modules that
 # are truly absent and not needed by downstream imports (huggingface_hub, etc).
 
-from titan_plugin.logic.mood.engine import MoodEngine, MoodRegistry
-from titan_plugin.logic.mood.base import AbstractMoodAddon
+from titan_hcl.logic.mood.engine import MoodEngine, MoodRegistry
+from titan_hcl.logic.mood.base import AbstractMoodAddon
 
 
 class FailingAddonMock(AbstractMoodAddon):

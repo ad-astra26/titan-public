@@ -10,7 +10,7 @@ import pytest
 
 
 def _make_state_register():
-    from titan_plugin.logic.state_register import StateRegister
+    from titan_hcl.logic.state_register import StateRegister
     from unittest.mock import MagicMock
     mock_bus = MagicMock()
     mock_bus.subscribe.return_value = None
@@ -28,7 +28,7 @@ def _make_state_register():
 
 def _apply_handler(sr, msg_type, payload):
     """Call the internal handler dispatch directly."""
-    from titan_plugin import bus as _bus
+    from titan_hcl import bus as _bus
     msg = {"type": msg_type, "payload": payload}
     # Replicate what _bus_listener_loop does for the outer handlers
     if msg_type == _bus.OUTER_BODY_STATE:
@@ -77,7 +77,7 @@ def _apply_handler(sr, msg_type, payload):
 
 
 def test_outer_body_state_handler():
-    from titan_plugin import bus
+    from titan_hcl import bus
     sr = _make_state_register()
     body = [0.1, 0.2, 0.3, 0.4, 0.5]
     _apply_handler(sr, bus.OUTER_BODY_STATE, {"outer_body": body})
@@ -85,7 +85,7 @@ def test_outer_body_state_handler():
 
 
 def test_outer_mind_state_handler():
-    from titan_plugin import bus
+    from titan_hcl import bus
     sr = _make_state_register()
     mind = [0.2, 0.3, 0.4, 0.5, 0.6]
     mind_15d = [0.1] * 15
@@ -95,7 +95,7 @@ def test_outer_mind_state_handler():
 
 
 def test_outer_spirit_state_handler():
-    from titan_plugin import bus
+    from titan_hcl import bus
     sr = _make_state_register()
     spirit = [0.3, 0.4, 0.5, 0.6, 0.7]
     spirit_45d = [0.2] * 45
@@ -106,7 +106,7 @@ def test_outer_spirit_state_handler():
 
 def test_willing_preservation_in_outer_mind_handler():
     """Willing [10:15] from GROUND_UP enrichment must be preserved when incoming om15 exists."""
-    from titan_plugin import bus
+    from titan_hcl import bus
     sr = _make_state_register()
     # Set up existing om15 with non-neutral Willing slice
     existing_willing = [0.8, 0.9, 0.7, 0.85, 0.75]
@@ -123,7 +123,7 @@ def test_willing_preservation_in_outer_mind_handler():
 
 def test_legacy_outer_trinity_state_still_works():
     """Legacy OUTER_TRINITY_STATE must still populate all 5 _state keys."""
-    from titan_plugin import bus
+    from titan_hcl import bus
     sr = _make_state_register()
     body = [0.1] * 5
     mind = [0.2] * 5
@@ -143,7 +143,7 @@ def test_legacy_outer_trinity_state_still_works():
 
 def test_three_handlers_produce_same_result_as_combined():
     """3 split handlers produce identical _state to the legacy combined handler."""
-    from titan_plugin import bus
+    from titan_hcl import bus
     body = [0.11, 0.22, 0.33, 0.44, 0.55]
     mind = [0.12, 0.23, 0.34, 0.45, 0.56]
     spirit = [0.13, 0.24, 0.35, 0.46, 0.57]

@@ -19,7 +19,7 @@ import time
 from collections import defaultdict, deque
 from pathlib import Path
 
-from titan_plugin.modules.warning_monitor_worker import (
+from titan_hcl.modules.warning_monitor_worker import (
     AGGREGATED_KEY_CAP,
     MAX_TAIL_BYTES,
     _evict_aggregated_lru,

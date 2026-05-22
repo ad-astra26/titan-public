@@ -58,7 +58,7 @@ def empty_social_x_db(tmp_path):
     """)
     conn.commit()
     conn.close()
-    from titan_plugin.logic.social_x.schema_migrations import apply_social_x_migrations
+    from titan_hcl.logic.social_x.schema_migrations import apply_social_x_migrations
     apply_social_x_migrations(db_path)
     return db_path
 
@@ -69,7 +69,7 @@ def empty_social_x_db(tmp_path):
 
 def test_schema_migrations_idempotent(empty_social_x_db):
     """Apply twice — second pass adds nothing."""
-    from titan_plugin.logic.social_x.schema_migrations import apply_social_x_migrations
+    from titan_hcl.logic.social_x.schema_migrations import apply_social_x_migrations
     s = apply_social_x_migrations(empty_social_x_db)
     assert s["created"] == []
     assert s["added"] == []
@@ -106,7 +106,7 @@ def test_inner_memory_migration_columns(tmp_path):
     )
     conn.commit()
     conn.close()
-    from titan_plugin.logic.social_x.schema_migrations import apply_inner_memory_migrations
+    from titan_hcl.logic.social_x.schema_migrations import apply_inner_memory_migrations
     s = apply_inner_memory_migrations(db)
     assert "vocabulary.grounded_at" in s["added"]
     assert "vocabulary.grounded_felt_summary" in s["added"]
@@ -117,19 +117,19 @@ def test_inner_memory_migration_columns(tmp_path):
 # ─────────────────────────────────────────────────────────────────────
 
 def test_felt_state_compact_summary_basic():
-    from titan_plugin.logic.social_x.felt_state import compact_felt_summary
+    from titan_hcl.logic.social_x.felt_state import compact_felt_summary
     out = compact_felt_summary({"DA": 0.72, "5HT": 0.65, "GABA": 0.80}, "flow")
     assert "flow" in out
     assert "DA" in out and "GABA" in out
 
 
 def test_felt_state_compact_summary_empty():
-    from titan_plugin.logic.social_x.felt_state import compact_felt_summary
+    from titan_hcl.logic.social_x.felt_state import compact_felt_summary
     assert compact_felt_summary({}, "") == "balanced"
 
 
 def test_neuromods_to_json_deterministic():
-    from titan_plugin.logic.social_x.felt_state import neuromods_to_json
+    from titan_hcl.logic.social_x.felt_state import neuromods_to_json
     a = neuromods_to_json({"DA": 0.7, "5HT": 0.5})
     b = neuromods_to_json({"5HT": 0.5, "DA": 0.7})
     assert a == b  # sort_keys
@@ -140,7 +140,7 @@ def test_neuromods_to_json_deterministic():
 # ─────────────────────────────────────────────────────────────────────
 
 def test_pool_scoring_cold_start_picks_salience(empty_social_x_db):
-    from titan_plugin.logic.social_x import pool_scoring as ps
+    from titan_hcl.logic.social_x import pool_scoring as ps
     chosen = ps.select_pool(
         empty_social_x_db, titan_id="T1", archetype="outer_rumination",
         candidates={"A": {"salience": 0.7, "relevance": 0.6},
@@ -150,7 +150,7 @@ def test_pool_scoring_cold_start_picks_salience(empty_social_x_db):
 
 
 def test_pool_scoring_rolling_7_picks_higher_score(empty_social_x_db):
-    from titan_plugin.logic.social_x import pool_scoring as ps
+    from titan_hcl.logic.social_x import pool_scoring as ps
     ps.record_pending_post(empty_social_x_db, titan_id="T1",
                             archetype="outer_rumination", pool="A",
                             source_id="x1", tweet_id="111",
@@ -168,7 +168,7 @@ def test_pool_scoring_rolling_7_picks_higher_score(empty_social_x_db):
 
 def test_pool_scoring_5d_anti_starvation_forces_rotation(empty_social_x_db):
     """A pool with no firing in 5 d wins outright when others have fired."""
-    from titan_plugin.logic.social_x import pool_scoring as ps
+    from titan_hcl.logic.social_x import pool_scoring as ps
     now = time.time()
     # Pool A: 3 recent landings (last hour)
     for i in range(3):
@@ -190,7 +190,7 @@ def test_pool_scoring_5d_anti_starvation_forces_rotation(empty_social_x_db):
 
 
 def test_pool_scoring_get_stats_aggregates(empty_social_x_db):
-    from titan_plugin.logic.social_x import pool_scoring as ps
+    from titan_hcl.logic.social_x import pool_scoring as ps
     ps.record_pending_post(empty_social_x_db, titan_id="T1",
                             archetype="grounded_today", pool="A_vocabulary",
                             source_id="v:1", tweet_id="9001")
@@ -204,7 +204,7 @@ def test_pool_scoring_get_stats_aggregates(empty_social_x_db):
 # ─────────────────────────────────────────────────────────────────────
 
 def test_strategy_phrasing_humanize():
-    from titan_plugin.logic.social_x.strategy_phrasing import humanize_strategy
+    from titan_hcl.logic.social_x.strategy_phrasing import humanize_strategy
     out = humanize_strategy(["FORMULATE.define", "RECALL.lookup",
                               "HYPOTHESIZE.test"])
     assert "name the thing precisely" in out
@@ -213,7 +213,7 @@ def test_strategy_phrasing_humanize():
 
 
 def test_strategy_phrasing_unknown_falls_back():
-    from titan_plugin.logic.social_x.strategy_phrasing import humanize_strategy
+    from titan_hcl.logic.social_x.strategy_phrasing import humanize_strategy
     out = humanize_strategy(["UNKNOWN.thing", "FORMULATE.define"])
     assert "unknown thing" in out
     assert "name the thing precisely" in out
@@ -221,7 +221,7 @@ def test_strategy_phrasing_unknown_falls_back():
 
 def test_strategy_phrasing_coverage_gate_15():
     """rFP §4.8 gate 15: coverage ≥ 90 % on observed primitives."""
-    from titan_plugin.logic.social_x.strategy_phrasing import (
+    from titan_hcl.logic.social_x.strategy_phrasing import (
         coverage_for, PROGRAM_HUMAN,
     )
     typical = [
@@ -243,7 +243,7 @@ def test_strategy_phrasing_coverage_gate_15():
 # ─────────────────────────────────────────────────────────────────────
 
 def test_image_pipeline_receipt_card_renders(tmp_path):
-    from titan_plugin.logic.social_x.image_pipeline import render_proof_receipt_card
+    from titan_hcl.logic.social_x.image_pipeline import render_proof_receipt_card
     out = str(tmp_path / "card.jpg")
     render_proof_receipt_card(
         payload={"size_mb": 847, "backup_type": "personality+state",
@@ -261,7 +261,7 @@ def test_image_pipeline_receipt_card_renders(tmp_path):
 
 def test_image_pipeline_jpg_conversion(tmp_path):
     from PIL import Image
-    from titan_plugin.logic.social_x.image_pipeline import convert_to_jpg
+    from titan_hcl.logic.social_x.image_pipeline import convert_to_jpg
     src = str(tmp_path / "src.png")
     Image.new("RGBA", (800, 800), (255, 0, 0, 255)).save(src, "PNG")
     out = convert_to_jpg(src, str(tmp_path / "out.jpg"))
@@ -275,7 +275,7 @@ def test_image_pipeline_jpg_conversion(tmp_path):
 
 def test_rich_layers_phase1_registered():
     """All 10 new layers + REFLECTABLE_POST_TYPES must be in the gateway."""
-    from titan_plugin.logic.social_x_gateway import SocialXGateway as G
+    from titan_hcl.logic.social_x_gateway import SocialXGateway as G
     expected = {
         "outer_following_voice", "cgn_grounded_today", "emot_cgn_signal",
         "procedural_recall", "proof_of_existence", "outer_rumination",
@@ -303,11 +303,11 @@ def test_open_the_dam_catalyst_map_eureka_routes_to_thread(tmp_path,
     OUTER_RUMINATION need is_following data we don't stage) abstain and the
     catalyst_map check is exercised.
     """
-    from titan_plugin.logic.social_x_gateway import SocialXGateway, PostContext
+    from titan_hcl.logic.social_x_gateway import SocialXGateway, PostContext
     monkeypatch.chdir(tmp_path)
     path = str(tmp_path / "social_x.db")
     g = SocialXGateway(db_path=path,
-                       config_path="titan_plugin/config.toml",
+                       config_path="titan_hcl/config.toml",
                        telemetry_path=str(tmp_path / "telemetry.jsonl"))
     ctx = PostContext(session="s", proxy="p", api_key="k", titan_id="T2",
                       emotion="neutral",
@@ -323,12 +323,12 @@ def test_open_the_dam_weighted_pool_diversifies(tmp_path, monkeypatch):
 
     Isolated cwd + T2 so the dispatcher abstains and the weighted pool
     draw is what's actually exercised."""
-    from titan_plugin.logic.social_x_gateway import SocialXGateway, PostContext
+    from titan_hcl.logic.social_x_gateway import SocialXGateway, PostContext
     import collections
     monkeypatch.chdir(tmp_path)
     path = str(tmp_path / "social_x.db")
     g = SocialXGateway(db_path=path,
-                       config_path="titan_plugin/config.toml",
+                       config_path="titan_hcl/config.toml",
                        telemetry_path=str(tmp_path / "telemetry.jsonl"))
     ctx = PostContext(session="s", proxy="p", api_key="k", titan_id="T2",
                       emotion="neutral",
@@ -346,7 +346,7 @@ def test_open_the_dam_weighted_pool_diversifies(tmp_path, monkeypatch):
 
 def test_archetype_base_idempotency_lifetime(empty_social_x_db):
     """is_already_cited finds rows by the metadata source-id key."""
-    from titan_plugin.logic.social_x.archetypes.base import ArchetypeBase
+    from titan_hcl.logic.social_x.archetypes.base import ArchetypeBase
 
     class _T(ArchetypeBase):
         name = "world_mirror"
@@ -372,8 +372,131 @@ def test_archetype_base_idempotency_lifetime(empty_social_x_db):
     assert "123" in t.cited_set(titan_id="T1")
 
 
+def test_archetype_cited_set_30day_window(empty_social_x_db):
+    """F-3 (2026-05-17) — `window_seconds=30*86400` bounds the dedup
+    set: source_ids cited >30d ago drop out of the result and become
+    re-citable. Closes RC-3 (rFP_social_x_improvements §B.2).
+    """
+    from titan_hcl.logic.social_x.archetypes.base import ArchetypeBase
+
+    class _T(ArchetypeBase):
+        name = "outer_rumination"
+        metadata_key = "outer_rumination_source_id"
+
+    t = _T(gateway=None, social_x_db_path=empty_social_x_db)
+
+    sq = sqlite3.connect(empty_social_x_db)
+    now = time.time()
+    # 31d-old citation — should fall outside a 30-day window.
+    sq.execute(
+        "INSERT INTO actions (action_type, status, titan_id, post_type, "
+        "created_at, metadata) VALUES (?, ?, ?, ?, ?, ?)",
+        ("post", "posted", "T1", "outer_rumination",
+         now - 31 * 86400,
+         json.dumps({"outer_rumination_source_id": "OLD"},
+                     separators=(",", ":"), sort_keys=True)),
+    )
+    # 1d-old citation — should remain in the 30-day window.
+    sq.execute(
+        "INSERT INTO actions (action_type, status, titan_id, post_type, "
+        "created_at, metadata) VALUES (?, ?, ?, ?, ?, ?)",
+        ("post", "posted", "T1", "outer_rumination",
+         now - 86400,
+         json.dumps({"outer_rumination_source_id": "FRESH"},
+                     separators=(",", ":"), sort_keys=True)),
+    )
+    sq.commit(); sq.close()
+
+    # Lifetime dedup (no window) — both sources appear.
+    lifetime = t.cited_set(titan_id="T1")
+    assert lifetime == {"OLD", "FRESH"}
+
+    # 30-day window — only the recent citation appears.
+    windowed = t.cited_set(titan_id="T1", window_seconds=30 * 86400)
+    assert windowed == {"FRESH"}
+
+    # 365-day window — both still appear (sanity: window expands properly).
+    yearly = t.cited_set(titan_id="T1", window_seconds=365 * 86400)
+    assert yearly == {"OLD", "FRESH"}
+
+
+def test_self_watching_recency_72h_window_catches_dryspell_candidates(
+        empty_social_x_db, tmp_path):
+    """F-2-finish (rFP_social_x_improvements §B.3.F-2, 2026-05-17):
+    self_watching's RECENCY_S widened 24h→72h to match F-2 Pool C
+    convention. Live probe 2026-05-17 found T1 had 0 candidates in 24h
+    but 5 in 72h, T2 had 0 in 24h but 3 in 72h — archetype was dormant
+    fleet-wide because behavioral self_insights write at a slow + bursty
+    cadence (Pool C semantics). 72h catches the bursts.
+
+    Test asserts the LIVE constant matches the F-2 Pool C convention
+    AND that the windowed SQL would actually catch a 30h-old insight
+    that a 24h window would have dropped.
+    """
+    from titan_hcl.logic.social_x.archetypes.self_watching import (
+        RECENCY_S, BEHAVIORAL_SUB_MODES, CONFIDENCE_FLOOR,
+    )
+
+    # Constant value matches F-2 Pool C convention (grounded_today.py:57).
+    assert RECENCY_S == 72 * 3600, (
+        f"F-2-finish: RECENCY_S must be 72h (Pool C convention), got "
+        f"{RECENCY_S}s")
+
+    # Seed a temp inner_memory.db with self_insights rows at the
+    # critical age cutoffs:
+    #   - 30h ago: outside 24h, inside 72h  → caught by new window
+    #   - 70h ago: inside 72h               → caught by new window
+    #   - 80h ago: outside 72h              → still excluded
+    im_path = str(tmp_path / "inner_memory.db")
+    im = sqlite3.connect(im_path)
+    im.execute(
+        "CREATE TABLE self_insights ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "sub_mode TEXT NOT NULL, "
+        "epoch INTEGER, "
+        "timestamp REAL NOT NULL, "
+        "data TEXT, "
+        "confidence REAL DEFAULT 0.0)"
+    )
+    now = time.time()
+    seeds = [
+        ("state_audit",     0.65, now - 30 * 3600, "30h_ago_FRESH72_NOT24"),
+        ("coherence_check", 0.70, now - 70 * 3600, "70h_ago_FRESH72"),
+        ("prediction",      0.80, now - 80 * 3600, "80h_ago_TOO_OLD"),
+    ]
+    for sub_mode, conf, ts, tag in seeds:
+        im.execute(
+            "INSERT INTO self_insights (sub_mode, epoch, timestamp, "
+            "data, confidence) VALUES (?, 1, ?, ?, ?)",
+            (sub_mode, ts, json.dumps({"tag": tag}), conf),
+        )
+    im.commit(); im.close()
+
+    # Run the same SQL the archetype runs (verbatim from
+    # self_watching.py:79-91 — keep this test reflecting the live query
+    # so any drift fails the test loudly).
+    conn = sqlite3.connect(im_path)
+    placeholders = ",".join("?" * len(BEHAVIORAL_SUB_MODES))
+    rows = conn.execute(
+        f"SELECT data FROM self_insights "
+        f"WHERE timestamp >= ? AND confidence >= ? "
+        f"  AND sub_mode IN ({placeholders}) "
+        f"ORDER BY confidence DESC, timestamp DESC LIMIT 30",
+        (now - RECENCY_S, CONFIDENCE_FLOOR, *BEHAVIORAL_SUB_MODES),
+    ).fetchall()
+    conn.close()
+
+    tags = {json.loads(r[0]).get("tag") for r in rows}
+    # 30h-old row was the dropped-by-24h candidate the widen recovers.
+    assert "30h_ago_FRESH72_NOT24" in tags
+    # 70h-old row inside 72h window.
+    assert "70h_ago_FRESH72" in tags
+    # 80h-old row outside 72h — still excluded (sanity).
+    assert "80h_ago_TOO_OLD" not in tags
+
+
 def test_archetype_base_cross_archetype_spacing(empty_social_x_db):
-    from titan_plugin.logic.social_x.archetypes.base import ArchetypeBase
+    from titan_hcl.logic.social_x.archetypes.base import ArchetypeBase
 
     class _T(ArchetypeBase):
         name = "world_mirror"
@@ -430,7 +553,7 @@ def _proof_day_fixtures(work_dir: str, titan_id: str = "T1") -> None:
 
 
 def test_proof_day_t1_only(empty_social_x_db, tmp_path, monkeypatch):
-    from titan_plugin.logic.social_x.archetypes.proof_day import ProofDayArchetype
+    from titan_hcl.logic.social_x.archetypes.proof_day import ProofDayArchetype
     monkeypatch.chdir(tmp_path)
     _proof_day_fixtures(str(tmp_path), "T1")
 
@@ -449,7 +572,7 @@ def test_proof_day_t1_only(empty_social_x_db, tmp_path, monkeypatch):
 
 def test_proof_day_idempotent_one_per_utc_day(empty_social_x_db, tmp_path,
                                                  monkeypatch):
-    from titan_plugin.logic.social_x.archetypes.proof_day import ProofDayArchetype
+    from titan_hcl.logic.social_x.archetypes.proof_day import ProofDayArchetype
     monkeypatch.chdir(tmp_path)
     _proof_day_fixtures(str(tmp_path), "T1")
     arc = ProofDayArchetype(gateway=None, social_x_db_path=empty_social_x_db)
@@ -475,7 +598,7 @@ def test_proof_day_idempotent_one_per_utc_day(empty_social_x_db, tmp_path,
 
 def test_reflection_excludes_proof_day(empty_social_x_db, tmp_path):
     """A past PROOF_DAY post must NOT be a reflection candidate."""
-    from titan_plugin.logic.social_x.archetypes.reflection import ReflectionArchetype
+    from titan_hcl.logic.social_x.archetypes.reflection import ReflectionArchetype
     arc = ReflectionArchetype(gateway=None, social_x_db_path=empty_social_x_db,
                                 events_teacher_db=str(tmp_path / "et.db"))
     sq = sqlite3.connect(empty_social_x_db)
@@ -501,7 +624,7 @@ def test_reflection_excludes_proof_day(empty_social_x_db, tmp_path):
 # ─────────────────────────────────────────────────────────────────────
 
 def test_composed_thought_pair_dedup_order_insensitive(empty_social_x_db):
-    from titan_plugin.logic.social_x.archetypes.composed_thought import (
+    from titan_hcl.logic.social_x.archetypes.composed_thought import (
         ComposedThoughtArchetype,
     )
     arc = ComposedThoughtArchetype(
@@ -525,7 +648,7 @@ def test_composed_thought_pair_dedup_order_insensitive(empty_social_x_db):
 # ─────────────────────────────────────────────────────────────────────
 
 def test_dispatcher_constructs_all_nine(empty_social_x_db, tmp_path):
-    from titan_plugin.logic.social_x.dispatcher import (
+    from titan_hcl.logic.social_x.dispatcher import (
         ArchetypeDispatcher, PRIORITY_ORDER,
     )
     d = ArchetypeDispatcher(
@@ -543,7 +666,7 @@ def test_dispatcher_constructs_all_nine(empty_social_x_db, tmp_path):
 
 def test_dispatcher_probe_returns_none_when_no_data(empty_social_x_db,
                                                      tmp_path):
-    from titan_plugin.logic.social_x.dispatcher import ArchetypeDispatcher
+    from titan_hcl.logic.social_x.dispatcher import ArchetypeDispatcher
 
     class _Ctx: pass
     d = ArchetypeDispatcher(
@@ -567,14 +690,14 @@ def test_dispatcher_probe_returns_none_when_no_data(empty_social_x_db,
 def test_archetype_probe_runs_before_catalyst_map(tmp_path, monkeypatch):
     """When an archetype fires, its `archetype` becomes the post_type and
     the catalyst_map's eureka→eureka_thread route is bypassed."""
-    from titan_plugin.logic.social_x_gateway import SocialXGateway, PostContext
+    from titan_hcl.logic.social_x_gateway import SocialXGateway, PostContext
     monkeypatch.chdir(tmp_path)
     # Stand up PROOF_DAY's fixtures so the dispatcher fires it.
     _proof_day_fixtures(str(tmp_path), "T1")
 
     db_path = str(tmp_path / "x.db")
     g = SocialXGateway(db_path=db_path,
-                       config_path="titan_plugin/config.toml",
+                       config_path="titan_hcl/config.toml",
                        telemetry_path="/tmp/test_xv_archetype_probe.jsonl")
     ctx = PostContext(session="s", proxy="p", api_key="k", titan_id="T1",
                       emotion="neutral",

@@ -33,29 +33,29 @@ class TestBorshHelpers:
     """Test low-level Borsh encoding functions."""
 
     def test_borsh_string_basic(self):
-        from titan_plugin.utils.solana_client import _borsh_string
+        from titan_hcl.utils.solana_client import _borsh_string
         result = _borsh_string("hello")
         # 4-byte LE length (5) + "hello" UTF-8
         assert result == b"\x05\x00\x00\x00hello"
 
     def test_borsh_string_empty(self):
-        from titan_plugin.utils.solana_client import _borsh_string
+        from titan_hcl.utils.solana_client import _borsh_string
         result = _borsh_string("")
         assert result == b"\x00\x00\x00\x00"
 
     def test_borsh_string_unicode(self):
-        from titan_plugin.utils.solana_client import _borsh_string
+        from titan_hcl.utils.solana_client import _borsh_string
         result = _borsh_string("Titan \u2728")
         encoded = "Titan \u2728".encode("utf-8")
         assert result[:4] == len(encoded).to_bytes(4, "little")
         assert result[4:] == encoded
 
     def test_borsh_option_none(self):
-        from titan_plugin.utils.solana_client import _borsh_option_none
+        from titan_hcl.utils.solana_client import _borsh_option_none
         assert _borsh_option_none() == bytes([0])
 
     def test_borsh_option_some(self):
-        from titan_plugin.utils.solana_client import _borsh_option_some
+        from titan_hcl.utils.solana_client import _borsh_option_some
         result = _borsh_option_some(b"\xAA\xBB")
         assert result == bytes([1, 0xAA, 0xBB])
 
@@ -64,21 +64,21 @@ class TestAttributesPlugin:
     """Test Attributes plugin serialization."""
 
     def test_single_attribute(self):
-        from titan_plugin.utils.solana_client import _borsh_attributes_plugin
+        from titan_hcl.utils.solana_client import _borsh_attributes_plugin
         result = _borsh_attributes_plugin({"Generation": "1"})
         # Plugin type byte (11) + vec len (1) + key + value + authority None
         assert result[0] == 6  # _MPL_PLUGIN_ATTRIBUTES (Attributes = variant 6)
         assert result[1:5] == (1).to_bytes(4, "little")  # Vec len = 1 attribute
 
     def test_multiple_attributes(self):
-        from titan_plugin.utils.solana_client import _borsh_attributes_plugin
+        from titan_hcl.utils.solana_client import _borsh_attributes_plugin
         attrs = {"Generation": "1", "Type": "Genesis", "Parent": "GENESIS"}
         result = _borsh_attributes_plugin(attrs)
         assert result[0] == 6  # Plugin::Attributes variant index
         assert result[1:5] == (3).to_bytes(4, "little")  # Vec len = 3 attributes
 
     def test_empty_attributes(self):
-        from titan_plugin.utils.solana_client import _borsh_attributes_plugin
+        from titan_hcl.utils.solana_client import _borsh_attributes_plugin
         result = _borsh_attributes_plugin({})
         assert result[0] == 6  # Plugin::Attributes variant index
         assert result[1:5] == (0).to_bytes(4, "little")  # Vec len = 0
@@ -92,7 +92,7 @@ class TestCreateV1:
     """Test Metaplex Core CreateV1 instruction building."""
 
     def test_create_v1_basic(self):
-        from titan_plugin.utils.solana_client import build_mpl_core_create_v1, is_available
+        from titan_hcl.utils.solana_client import build_mpl_core_create_v1, is_available
         if not is_available():
             pytest.skip("Solana SDK not available")
 
@@ -114,7 +114,7 @@ class TestCreateV1:
         assert len(ix.accounts) == 8
 
     def test_create_v1_with_attributes(self):
-        from titan_plugin.utils.solana_client import build_mpl_core_create_v1, is_available
+        from titan_hcl.utils.solana_client import build_mpl_core_create_v1, is_available
         if not is_available():
             pytest.skip("Solana SDK not available")
 
@@ -135,7 +135,7 @@ class TestCreateV1:
         assert bytes([1]) in ix.data  # At least one Some marker
 
     def test_create_v1_with_separate_owner(self):
-        from titan_plugin.utils.solana_client import build_mpl_core_create_v1, is_available
+        from titan_hcl.utils.solana_client import build_mpl_core_create_v1, is_available
         if not is_available():
             pytest.skip("Solana SDK not available")
 
@@ -157,7 +157,7 @@ class TestCreateV1:
         assert ix.accounts[4].pubkey == owner_kp.pubkey()
 
     def test_create_v1_asset_is_signer(self):
-        from titan_plugin.utils.solana_client import build_mpl_core_create_v1, is_available
+        from titan_hcl.utils.solana_client import build_mpl_core_create_v1, is_available
         if not is_available():
             pytest.skip("Solana SDK not available")
 
@@ -177,7 +177,7 @@ class TestCreateV1:
         assert ix.accounts[0].is_writable is True
 
     def test_create_v1_name_in_data(self):
-        from titan_plugin.utils.solana_client import build_mpl_core_create_v1, is_available
+        from titan_hcl.utils.solana_client import build_mpl_core_create_v1, is_available
         if not is_available():
             pytest.skip("Solana SDK not available")
 
@@ -201,7 +201,7 @@ class TestUpdateV1:
     """Test Metaplex Core UpdateV1 instruction building."""
 
     def test_update_v1_name_only(self):
-        from titan_plugin.utils.solana_client import build_mpl_core_update_v1, is_available
+        from titan_hcl.utils.solana_client import build_mpl_core_update_v1, is_available
         if not is_available():
             pytest.skip("Solana SDK not available")
 
@@ -220,7 +220,7 @@ class TestUpdateV1:
         assert b"Titan Soul Gen 2" in ix.data
 
     def test_update_v1_uri_only(self):
-        from titan_plugin.utils.solana_client import build_mpl_core_update_v1, is_available
+        from titan_hcl.utils.solana_client import build_mpl_core_update_v1, is_available
         if not is_available():
             pytest.skip("Solana SDK not available")
 
@@ -235,7 +235,7 @@ class TestUpdateV1:
         assert b"https://new-uri.com/meta.json" in ix.data
 
     def test_update_v1_no_changes(self):
-        from titan_plugin.utils.solana_client import build_mpl_core_update_v1, is_available
+        from titan_hcl.utils.solana_client import build_mpl_core_update_v1, is_available
         if not is_available():
             pytest.skip("Solana SDK not available")
 
@@ -258,7 +258,7 @@ class TestAssetDecoding:
 
     def _build_mock_asset(self, name="Test NFT", uri="https://example.com"):
         """Build a minimal mock Asset account byte representation."""
-        from titan_plugin.utils.solana_client import _borsh_string, is_available
+        from titan_hcl.utils.solana_client import _borsh_string, is_available
         if not is_available():
             pytest.skip("Solana SDK not available")
 
@@ -284,7 +284,7 @@ class TestAssetDecoding:
         return bytes(data), str(owner.pubkey()), str(update_auth.pubkey())
 
     def test_decode_basic_asset(self):
-        from titan_plugin.utils.solana_client import decode_mpl_core_asset
+        from titan_hcl.utils.solana_client import decode_mpl_core_asset
         data, owner_str, _ = self._build_mock_asset("Titan Soul Gen 1", "https://shdw.com/gen1")
 
         result = decode_mpl_core_asset(data)
@@ -294,12 +294,12 @@ class TestAssetDecoding:
         assert result["owner"] == owner_str
 
     def test_decode_empty_data(self):
-        from titan_plugin.utils.solana_client import decode_mpl_core_asset
+        from titan_hcl.utils.solana_client import decode_mpl_core_asset
         result = decode_mpl_core_asset(b"")
         assert result is None
 
     def test_decode_too_short(self):
-        from titan_plugin.utils.solana_client import decode_mpl_core_asset
+        from titan_hcl.utils.solana_client import decode_mpl_core_asset
         result = decode_mpl_core_asset(b"\x01" + b"\x00" * 10)
         assert result is None
 
@@ -314,7 +314,7 @@ class TestSoulNFTMinting:
     @pytest.fixture
     def mock_soul(self, tmp_path):
         """Create a SovereignSoul with mocked network."""
-        from titan_plugin.utils.solana_client import is_available
+        from titan_hcl.utils.solana_client import is_available
         if not is_available():
             pytest.skip("Solana SDK not available")
 
@@ -330,7 +330,7 @@ class TestSoulNFTMinting:
         # Write a temp state file path
         state_file = tmp_path / "soul_state.json"
 
-        from titan_plugin.core.soul import SovereignSoul
+        from titan_hcl.core.soul import SovereignSoul
 
         # Patch _load_local_state to avoid touching real filesystem
         with patch.object(SovereignSoul, "_load_local_state"):
@@ -405,7 +405,7 @@ class TestSoulNFTMinting:
         mock_fetch = AsyncMock(return_value={"owner": owner_str, "name": "Test", "uri": ""})
         with patch.dict("sys.modules", {}):
             with patch(
-                "titan_plugin.utils.solana_client.fetch_mpl_core_asset",
+                "titan_hcl.utils.solana_client.fetch_mpl_core_asset",
                 mock_fetch,
             ):
                 result = await mock_soul.verify_nft_ownership()
@@ -417,7 +417,7 @@ class TestSoulNFTMinting:
 
         mock_fetch = AsyncMock(return_value={"owner": "DifferentOwner999", "name": "Test", "uri": ""})
         with patch(
-            "titan_plugin.utils.solana_client.fetch_mpl_core_asset",
+            "titan_hcl.utils.solana_client.fetch_mpl_core_asset",
             mock_fetch,
         ):
             result = await mock_soul.verify_nft_ownership()
@@ -432,12 +432,12 @@ class TestEvolveSoulWithNFT:
     """Test that evolve_soul now mints a NextGen NFT."""
 
     def test_evolve_mints_nextgen(self, tmp_path):
-        from titan_plugin.utils.solana_client import is_available
+        from titan_hcl.utils.solana_client import is_available
         if not is_available():
             pytest.skip("Solana SDK not available")
 
         from solders.keypair import Keypair
-        from titan_plugin.core.soul import SovereignSoul
+        from titan_hcl.core.soul import SovereignSoul
 
         network = MagicMock()
         kp = Keypair()
@@ -479,12 +479,12 @@ class TestEpochNFTMinting:
     """Test epoch NFT minting in RebirthBackup."""
 
     def test_mint_epoch_nft(self):
-        from titan_plugin.utils.solana_client import is_available
+        from titan_hcl.utils.solana_client import is_available
         if not is_available():
             pytest.skip("Solana SDK not available")
 
         from solders.keypair import Keypair
-        from titan_plugin.logic.backup import RebirthBackup
+        from titan_hcl.logic.backup import RebirthBackup
 
         network = MagicMock()
         kp = Keypair()
@@ -511,7 +511,7 @@ class TestEpochNFTMinting:
         assert "extra_signers" in call_args.kwargs
 
     def test_mint_epoch_nft_no_keypair(self):
-        from titan_plugin.logic.backup import RebirthBackup
+        from titan_hcl.logic.backup import RebirthBackup
 
         network = MagicMock()
         network.keypair = None
@@ -539,14 +539,14 @@ class TestNetworkExtraSigners:
     def test_signature_includes_extra_signers(self):
         """Verify the method signature accepts extra_signers parameter."""
         import inspect
-        from titan_plugin.core.network import HybridNetworkClient
+        from titan_hcl.core.network import HybridNetworkClient
 
         sig = inspect.signature(HybridNetworkClient.send_sovereign_transaction)
         assert "extra_signers" in sig.parameters
 
     def test_extra_signers_default_none(self):
         import inspect
-        from titan_plugin.core.network import HybridNetworkClient
+        from titan_hcl.core.network import HybridNetworkClient
 
         sig = inspect.signature(HybridNetworkClient.send_sovereign_transaction)
         param = sig.parameters["extra_signers"]

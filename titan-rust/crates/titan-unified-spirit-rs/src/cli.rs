@@ -109,7 +109,11 @@ pub struct Cli {
     /// have its own bin/ (T1: /home/antigravity/projects/titan/bin/,
     /// T3: /home/antigravity/projects/titan3/bin/) and the env var
     /// flows kernel → substrate → unified-spirit unchanged.
-    #[arg(long, env = "TITAN_DAEMON_BINARY_DIR", default_value = "/usr/local/bin")]
+    #[arg(
+        long,
+        env = "TITAN_DAEMON_BINARY_DIR",
+        default_value = "/usr/local/bin"
+    )]
     pub daemon_binary_dir: PathBuf,
 
     /// If set, spawn 6 instances of `titan-trinity-rs-placeholder` instead
@@ -127,8 +131,8 @@ pub struct Cli {
     #[arg(long, env = "TITAN_KERNEL_LOG_LEVEL", value_enum, default_value_t = LogLevel::Info)]
     pub log_level: LogLevel,
 
-    /// Config file path (default: `titan_plugin/config.toml`).
-    #[arg(long, default_value = "titan_plugin/config.toml")]
+    /// Config file path (default: `titan_hcl/config.toml`).
+    #[arg(long, default_value = "titan_hcl/config.toml")]
     pub config: PathBuf,
 }
 

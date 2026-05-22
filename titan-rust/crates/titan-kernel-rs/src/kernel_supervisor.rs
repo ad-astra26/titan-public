@@ -6,7 +6,7 @@
 //! children:
 //!
 //! 1. `trinity-substrate` (titan-trinity-rs)
-//! 2. `titan_HCL` (python -m titan_main)
+//! 2. `titan_HCL` (python -m titan_hcl)
 //!
 //! Mirrors the proven shape of `titan-unified-spirit-rs::supervise::DaemonSupervisor`
 //! that already supervises the 6 leaf trinity daemons.
@@ -58,7 +58,7 @@ use crate::supervision_log::{JsonlSupervisionPublisher, SupervisionLogError};
 /// child. MUST match SPEC §9.A.
 pub const CHILD_NAME_SUBSTRATE: &str = "trinity-substrate";
 
-/// Canonical child name for the Python plugin (`python -m titan_main`)
+/// Canonical child name for the Python plugin (`python -m titan_hcl`)
 /// child. MUST match SPEC §9.B titan_HCL row.
 pub const CHILD_NAME_PYTHON: &str = "titan_HCL";
 

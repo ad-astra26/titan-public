@@ -14,7 +14,7 @@ Tests cover:
 import time
 import pytest
 from unittest.mock import MagicMock, patch
-from titan_plugin.logic.titan_vm import TitanVM, Op, VMResult, MAX_STACK_DEPTH
+from titan_hcl.logic.titan_vm import TitanVM, Op, VMResult, MAX_STACK_DEPTH
 
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -380,14 +380,14 @@ class TestSpecialOps:
 
 class TestReflexScoreProgram:
     def test_program_loads(self):
-        from titan_plugin.logic.vm_programs import get_program
+        from titan_hcl.logic.vm_programs import get_program
         prog = get_program("reflex_score")
         assert len(prog) > 0
         assert any(isinstance(i, tuple) and i[0] == Op.SCORE for i in prog)
 
     def test_program_executes_with_good_state(self):
         """Good convergence + high engagement + fresh state → high score."""
-        from titan_plugin.logic.vm_programs import get_program
+        from titan_hcl.logic.vm_programs import get_program
 
         reg = MockStateRegister({
             "body_tensor": [0.6, 0.6, 0.6, 0.6, 0.6],    # avg 0.6
@@ -410,7 +410,7 @@ class TestReflexScoreProgram:
 
     def test_program_executes_with_poor_state(self):
         """Poor convergence + low engagement + high drift → low score."""
-        from titan_plugin.logic.vm_programs import get_program
+        from titan_hcl.logic.vm_programs import get_program
 
         reg = MockStateRegister({
             "body_tensor": [0.1, 0.1, 0.1, 0.1, 0.1],    # avg 0.1
@@ -433,7 +433,7 @@ class TestReflexScoreProgram:
 
     def test_program_no_reflexes_still_scores(self):
         """Even with no reflexes fired, convergence/engagement/freshness contribute."""
-        from titan_plugin.logic.vm_programs import get_program
+        from titan_hcl.logic.vm_programs import get_program
 
         reg = MockStateRegister({
             "body_tensor": [0.5, 0.5, 0.5, 0.5, 0.5],
@@ -455,7 +455,7 @@ class TestReflexScoreProgram:
 
     def test_program_emits_reflex_reward(self):
         """Program should emit REFLEX_REWARD to bus."""
-        from titan_plugin.logic.vm_programs import get_program
+        from titan_hcl.logic.vm_programs import get_program
 
         reg = MockStateRegister()
         vm = TitanVM(state_register=reg)
@@ -472,7 +472,7 @@ class TestReflexScoreProgram:
 
 class TestValenceBoostProgram:
     def test_positive_valence_high_engagement(self):
-        from titan_plugin.logic.vm_programs import get_program
+        from titan_hcl.logic.vm_programs import get_program
         vm = TitanVM()
         result = vm.execute(get_program("valence_boost"), context={
             "valence": 0.8,
@@ -482,7 +482,7 @@ class TestValenceBoostProgram:
         assert result.score > 0.0  # positive boost
 
     def test_negative_valence_penalty(self):
-        from titan_plugin.logic.vm_programs import get_program
+        from titan_hcl.logic.vm_programs import get_program
         vm = TitanVM()
         result = vm.execute(get_program("valence_boost"), context={
             "valence": -0.8,
@@ -492,7 +492,7 @@ class TestValenceBoostProgram:
         assert result.score == pytest.approx(-0.05)
 
     def test_neutral_valence_no_modifier(self):
-        from titan_plugin.logic.vm_programs import get_program
+        from titan_hcl.logic.vm_programs import get_program
         vm = TitanVM()
         result = vm.execute(get_program("valence_boost"), context={
             "valence": 0.0,
@@ -504,18 +504,18 @@ class TestValenceBoostProgram:
 
 class TestProgramRegistry:
     def test_get_program_exists(self):
-        from titan_plugin.logic.vm_programs import get_program
+        from titan_hcl.logic.vm_programs import get_program
         prog = get_program("reflex_score")
         assert len(prog) > 10
 
     def test_get_program_unknown(self):
-        from titan_plugin.logic.vm_programs import get_program
+        from titan_hcl.logic.vm_programs import get_program
         with pytest.raises(KeyError):
             get_program("nonexistent_program")
 
     def test_all_programs_execute(self):
         """Every registered program should execute without error."""
-        from titan_plugin.logic.vm_programs import PROGRAMS
+        from titan_hcl.logic.vm_programs import PROGRAMS
         vm = TitanVM(state_register=MockStateRegister())
         for name, factory in PROGRAMS.items():
             result = vm.execute(factory(), context={
@@ -534,7 +534,7 @@ class TestProgramRegistry:
 class TestVMPerformance:
     def test_scoring_under_5ms(self):
         """R5 scoring should complete in under 5ms (fast enough for every interaction)."""
-        from titan_plugin.logic.vm_programs import get_program
+        from titan_hcl.logic.vm_programs import get_program
 
         reg = MockStateRegister()
         vm = TitanVM(state_register=reg)

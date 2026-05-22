@@ -19,7 +19,7 @@ class TestSphereClock:
 
     def test_init_defaults(self):
         """Clock starts fully expanded with scalar at edge."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         clock = SphereClock("test")
         assert clock.radius == 1.0
         assert clock.scalar_position == 1.0
@@ -29,7 +29,7 @@ class TestSphereClock:
 
     def test_contraction_moves_toward_center(self):
         """Ticking with balanced tensor moves scalar closer to center."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         clock = SphereClock("test", base_speed=0.1)
         initial_pos = clock.scalar_position
 
@@ -40,7 +40,7 @@ class TestSphereClock:
 
     def test_balanced_tensor_faster_contraction(self):
         """Lower delta (more balanced) produces faster contraction."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         clock_balanced = SphereClock("balanced", base_speed=0.1)
         clock_imbalanced = SphereClock("imbalanced", base_speed=0.1)
 
@@ -52,7 +52,7 @@ class TestSphereClock:
 
     def test_imbalanced_tensor_slow_contraction(self):
         """High delta (imbalanced) produces near-zero contraction."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         clock = SphereClock("test", base_speed=0.05)
 
         clock.tick(delta_from_center=0.95)
@@ -63,7 +63,7 @@ class TestSphereClock:
 
     def test_pulse_fires_when_scalar_reaches_center(self):
         """Pulse is generated when scalar_position reaches 0."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         # Set up a clock that will pulse on next tick
         clock = SphereClock("test", base_speed=1.0)
         clock.scalar_position = 0.05  # Very close to center
@@ -76,7 +76,7 @@ class TestSphereClock:
 
     def test_sphere_expands_after_pulse(self):
         """After pulse, scalar resets to edge of (new) sphere radius."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         clock = SphereClock("test", base_speed=1.0, pulse_shrink_rate=0.02)
         clock.scalar_position = 0.01
 
@@ -87,7 +87,7 @@ class TestSphereClock:
 
     def test_phase_wraps_at_2pi(self):
         """Phase stays within [0, 2π)."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         clock = SphereClock("test", base_speed=0.5)
 
         # Tick many times to accumulate phase
@@ -97,7 +97,7 @@ class TestSphereClock:
 
     def test_pulse_count_increments(self):
         """Each pulse increments the counter."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         clock = SphereClock("test", base_speed=10.0)  # Very fast
 
         pulse_events = []
@@ -111,7 +111,7 @@ class TestSphereClock:
 
     def test_sphere_shrinks_for_balanced_parts(self):
         """Consistently balanced components get tighter (smaller) spheres."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         clock = SphereClock("test", base_speed=10.0, pulse_shrink_rate=0.05)
 
         initial_radius = clock.radius
@@ -124,7 +124,7 @@ class TestSphereClock:
 
     def test_sphere_grows_for_imbalanced_pulse(self):
         """Imbalanced pulse makes sphere slightly larger (slower next cycle)."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         clock = SphereClock("test", base_speed=10.0, pulse_shrink_rate=0.05)
 
         # First force a shrink
@@ -138,7 +138,7 @@ class TestSphereClock:
 
     def test_iql_scoring_balanced_at_center(self):
         """IQL: +1 when balanced and at center."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         clock = SphereClock("test", balance_threshold=0.20)
         clock.scalar_position = 0.005  # Near center
 
@@ -147,7 +147,7 @@ class TestSphereClock:
 
     def test_iql_scoring_imbalanced(self):
         """IQL: -1 when outside balance threshold."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         clock = SphereClock("test", balance_threshold=0.20)
 
         score = clock.get_iql_score(delta_from_center=0.5)
@@ -155,7 +155,7 @@ class TestSphereClock:
 
     def test_iql_scoring_neutral(self):
         """IQL: 0 when balanced but not at center yet."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         clock = SphereClock("test", balance_threshold=0.20)
         clock.scalar_position = 0.5  # Not at center
 
@@ -164,7 +164,7 @@ class TestSphereClock:
 
     def test_balance_threshold_check(self):
         """20% delta threshold correctly classifies balanced/imbalanced."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         clock = SphereClock("test", base_speed=10.0, balance_threshold=0.20)
 
         # Balanced (delta=0.15 < threshold=0.20)
@@ -181,7 +181,7 @@ class TestSphereClock:
 
     def test_persistence_save_load(self):
         """Clock state survives save/load cycle."""
-        from titan_plugin.logic.sphere_clock import SphereClock
+        from titan_hcl.logic.sphere_clock import SphereClock
         clock = SphereClock("test", base_speed=0.1)
 
         # Advance state
@@ -208,7 +208,7 @@ class TestSphereClockEngine:
 
     def test_engine_creates_6_clocks(self):
         """Engine initializes with all 6 Trinity component clocks."""
-        from titan_plugin.logic.sphere_clock import SphereClockEngine, ALL_COMPONENTS
+        from titan_hcl.logic.sphere_clock import SphereClockEngine, ALL_COMPONENTS
         engine = SphereClockEngine()
 
         assert len(engine.clocks) == 6
@@ -217,7 +217,7 @@ class TestSphereClockEngine:
 
     def test_get_all_phases_returns_6_entries(self):
         """get_all_phases returns phase for all 6 clocks."""
-        from titan_plugin.logic.sphere_clock import SphereClockEngine
+        from titan_hcl.logic.sphere_clock import SphereClockEngine
         engine = SphereClockEngine()
 
         phases = engine.get_all_phases()
@@ -227,7 +227,7 @@ class TestSphereClockEngine:
 
     def test_get_paired_phases(self):
         """get_paired_phases returns 3 pairs (body, mind, spirit)."""
-        from titan_plugin.logic.sphere_clock import SphereClockEngine
+        from titan_hcl.logic.sphere_clock import SphereClockEngine
         engine = SphereClockEngine()
 
         pairs = engine.get_paired_phases()
@@ -241,7 +241,7 @@ class TestSphereClockEngine:
 
     def test_tick_inner_returns_pulse_events(self):
         """tick_inner processes 3 inner clocks and returns any pulses."""
-        from titan_plugin.logic.sphere_clock import SphereClockEngine
+        from titan_hcl.logic.sphere_clock import SphereClockEngine
         engine = SphereClockEngine(config={"base_contraction_speed": 10.0})
 
         body = [0.5] * 5    # Perfect center
@@ -257,7 +257,7 @@ class TestSphereClockEngine:
 
     def test_tick_outer_returns_pulse_events(self):
         """tick_outer processes 3 outer clocks and returns any pulses."""
-        from titan_plugin.logic.sphere_clock import SphereClockEngine
+        from titan_hcl.logic.sphere_clock import SphereClockEngine
         engine = SphereClockEngine(config={"base_contraction_speed": 10.0})
 
         outer_body = [0.5] * 5
@@ -272,7 +272,7 @@ class TestSphereClockEngine:
 
     def test_tick_inner_no_pulse_when_imbalanced(self):
         """Very imbalanced tensors produce no pulse on single tick."""
-        from titan_plugin.logic.sphere_clock import SphereClockEngine
+        from titan_hcl.logic.sphere_clock import SphereClockEngine
         engine = SphereClockEngine(config={"base_contraction_speed": 0.01})
 
         # Extreme imbalance: all at 1.0 (max distance from center 0.5)
@@ -285,7 +285,7 @@ class TestSphereClockEngine:
 
     def test_engine_persistence(self):
         """Engine state persists across save/load."""
-        from titan_plugin.logic.sphere_clock import SphereClockEngine
+        from titan_hcl.logic.sphere_clock import SphereClockEngine
         with tempfile.TemporaryDirectory() as tmpdir:
             engine1 = SphereClockEngine(
                 config={"base_contraction_speed": 10.0},
@@ -308,7 +308,7 @@ class TestSphereClockEngine:
 
     def test_engine_stats(self):
         """get_stats returns structured data."""
-        from titan_plugin.logic.sphere_clock import SphereClockEngine
+        from titan_hcl.logic.sphere_clock import SphereClockEngine
         engine = SphereClockEngine()
         stats = engine.get_stats()
 

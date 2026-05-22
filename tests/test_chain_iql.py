@@ -14,12 +14,12 @@ import os
 import numpy as np
 import pytest
 
-from titan_plugin.logic.task_embedding import (
+from titan_hcl.logic.task_embedding import (
     encode_task,
     extract_chain_template,
     template_to_primitive_list,
 )
-from titan_plugin.logic.chain_iql import ChainTemplateQNet, ChainIQL
+from titan_hcl.logic.chain_iql import ChainTemplateQNet, ChainIQL
 
 
 # ── task_embedding ────────────────────────────────────────────────

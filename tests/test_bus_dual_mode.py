@@ -20,9 +20,9 @@ import time
 
 import pytest
 
-from titan_plugin import bus as bus_module
-from titan_plugin.bus import DivineBus
-from titan_plugin.bus_specs import (
+from titan_hcl import bus as bus_module
+from titan_hcl.bus import DivineBus
+from titan_hcl.bus_specs import (
     audit_against_bus_constants,
     get_spec,
 )
@@ -63,7 +63,7 @@ def test_bus_ipc_socket_enabled_flag_registered():
     bool — matches whatever the config currently declares (True under
     microkernel v2 mode).
     """
-    from titan_plugin.config_loader import load_titan_config
+    from titan_hcl.config_loader import load_titan_config
     cfg = load_titan_config()
     micro = cfg.get("microkernel", {})
     assert "bus_ipc_socket_enabled" in micro, \
@@ -85,7 +85,7 @@ def test_divinebus_default_has_no_broker():
 
 def test_is_kernel_internal_known_names():
     """Every kernel-internal name in the canonical allowlist returns True."""
-    from titan_plugin.bus import _is_kernel_internal
+    from titan_hcl.bus import _is_kernel_internal
     for name in [
         "guardian", "core", "meditation", "sovereignty", "kernel",
         "agency", "chat_handler", "v4_bridge",
@@ -96,7 +96,7 @@ def test_is_kernel_internal_known_names():
 
 def test_is_kernel_internal_proxy_suffix():
     """Reply-queue subscribers ending in _proxy are kernel-internal."""
-    from titan_plugin.bus import _is_kernel_internal
+    from titan_hcl.bus import _is_kernel_internal
     for name in [
         "memory_proxy", "spirit_proxy", "body_proxy", "mind_proxy",
         "rl_proxy", "agency_proxy", "media_proxy", "llm_proxy",
@@ -108,16 +108,16 @@ def test_is_kernel_internal_proxy_suffix():
 
 def test_is_kernel_internal_query_suffix():
     """reflex_executors.py query reply queues end in _query — kernel-internal."""
-    from titan_plugin.bus import _is_kernel_internal
+    from titan_hcl.bus import _is_kernel_internal
     assert _is_kernel_internal("reflex_spirit_query")
     assert _is_kernel_internal("reflex_time_query")
 
 
 def test_is_kernel_internal_worker_names_return_false():
     """Worker process names should NOT be classified as kernel-internal."""
-    from titan_plugin.bus import _is_kernel_internal
+    from titan_hcl.bus import _is_kernel_internal
     for name in [
-        "memory", "rl", "spirit", "media", "cgn", "knowledge", "timechain",
+        "memory", "recorder", "spirit", "media", "cgn", "knowledge", "timechain",
         "backup", "output_verifier", "outer_body", "outer_mind", "outer_spirit",
         "reflex", "agency_worker", "warning_monitor", "imw",
         "observatory_writer", "social_graph_writer", "events_teacher_writer",
@@ -265,14 +265,18 @@ def test_broadcast_publish_routes_to_broker_too():
     assert fake_broker.received[0]["type"] == "BCAST"
 
 
-# ── End-to-end via real BusSocketServer ────────────────────────────────────
-
-
+# test_dual_mode_with_real_broker_e2e retired with D8-1 2026-05-16 —
+# Python BusSocketServer class deleted (titan-kernel-rs owns the bus
+# broker under fleet-wide Phase C since 2026-05-14). The dual-mode
+# attach-broker pattern is now tested with a _StubBroker (above) which
+# preserves the DivineBus integration contract without depending on
+# the retired Python broker class.
+@pytest.mark.skip(reason="D8-1 retirement — Python BusSocketServer deleted; titan-kernel-rs (Rust) owns the bus broker under fleet-wide Phase C since 2026-05-14.")
 def test_dual_mode_with_real_broker_e2e(tmp_path):
     """Real socket-mode test: in-process subscriber receives via ThreadQueue,
     cross-process-style BusSocketClient receives via socket. Both off the
     same DivineBus.publish() call."""
-    from titan_plugin.core.bus_socket import BusSocketClient, BusSocketServer
+    from titan_hcl.core.bus_socket import BusSocketClient  # BusSocketServer DELETED D8-1
 
     sock = tmp_path / "bus.sock"
     authkey = b"x" * 32
@@ -285,9 +289,16 @@ def test_dual_mode_with_real_broker_e2e(tmp_path):
     inproc_q = bus.subscribe("inproc_sub")
     bus.attach_broker(broker)
 
-    # External client
+    # External client.
+    # SPEC §8.2 v1.4.0 D-SPEC-42: broker silently skips subscribers with
+    # empty broadcast_topics AND reply_only=False from dst="all" fanout.
+    # This test publishes a "DUAL" broadcast that the external_sub MUST
+    # receive — declare broadcast_topics=["DUAL"] to keep the subscriber
+    # eligible. (Pre-D-SPEC-42 the broker fanned to ALL subscribers
+    # regardless; the test predated the v1.4.0 contract change.)
     client = BusSocketClient(titan_id="testT", authkey=authkey,
-                             name="external_sub", sock_path=sock)
+                             name="external_sub", sock_path=sock,
+                             topics=["DUAL"])
     client.start()
     assert client.wait_until_connected(timeout=3.0)
     # Wait for broker registration

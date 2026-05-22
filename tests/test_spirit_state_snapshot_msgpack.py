@@ -1,7 +1,7 @@
 """SpiritState.snapshot() msgpack-round-trip safety.
 
 Regression test for the 2026-04-28 malformed-frame incident, where Fix B's
-hex-dump diagnostic in titan_plugin/core/bus_socket.py caught spirit's
+hex-dump diagnostic in titan_hcl/core/bus_socket.py caught spirit's
 RESPONSE payloads being unpackable with `strict_map_key=True` because the
 nested `topology["distance_matrix"]` dict used tuple keys (msgpack
 serializes tuples as arrays — "list as map key" — which strict unpack
@@ -14,7 +14,7 @@ from __future__ import annotations
 import msgpack
 import pytest
 
-from titan_plugin.logic.spirit_state import SpiritState
+from titan_hcl.logic.spirit_state import SpiritState
 
 
 def _pack_then_strict_unpack(snap: dict) -> dict:

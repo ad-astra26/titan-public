@@ -10,7 +10,7 @@ PLAN: titan-docs/PLAN_microkernel_phase_b1_shadow_swap.md §1
 """
 import pytest
 
-from titan_plugin import bus
+from titan_hcl import bus
 
 
 # Canonical list of B.1 message-type constants (the contract).
@@ -88,7 +88,7 @@ class TestB1NotInStateMsgTypes:
 
     @pytest.mark.parametrize("name", B1_MESSAGE_CONSTANTS)
     def test_not_in_state_msg_types(self, name):
-        from titan_plugin.bus import DivineBus
+        from titan_hcl.bus import DivineBus
         value = getattr(bus, name)
         assert value not in DivineBus.STATE_MSG_TYPES, (
             f"B.1 type {name}={value!r} must NOT be in STATE_MSG_TYPES "
@@ -100,7 +100,7 @@ class TestB1MakeMsgRoundTrip:
     """make_msg builds valid envelopes with B.1 types — sanity check integration."""
 
     def test_make_msg_with_each_b1_type(self):
-        from titan_plugin.bus import make_msg
+        from titan_hcl.bus import make_msg
 
         for name in B1_MESSAGE_CONSTANTS:
             mtype = getattr(bus, name)
@@ -128,7 +128,7 @@ class TestB1NoStringLiteralsInBus:
 
     def test_bus_py_uses_constants_not_literals(self):
         from pathlib import Path
-        bus_py = Path(__file__).parent.parent / "titan_plugin" / "bus.py"
+        bus_py = Path(__file__).parent.parent / "titan_hcl" / "bus.py"
         text = bus_py.read_text()
         for name in B1_MESSAGE_CONSTANTS:
             value = getattr(bus, name)

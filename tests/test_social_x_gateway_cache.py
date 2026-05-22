@@ -20,7 +20,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from titan_plugin.logic.social_x_gateway import SocialXGateway
+from titan_hcl.logic.social_x_gateway import SocialXGateway
 
 
 @pytest.fixture
@@ -302,13 +302,13 @@ def test_three_methods_share_cache(gateway):
 # ── SocialPostHelper disabled-by-default guard ─────────────────────────
 
 def test_social_post_helper_blocked_by_default():
-    from titan_plugin.logic.agency.helpers.social_post import SocialPostHelper
+    from titan_hcl.logic.agency.helpers.social_post import SocialPostHelper
     with pytest.raises(ValueError, match="DISABLED"):
         SocialPostHelper(api_key="x")
 
 
 def test_social_post_helper_explicit_opt_in_works():
     """For testing only — _explicit_opt_in=True bypasses the guard."""
-    from titan_plugin.logic.agency.helpers.social_post import SocialPostHelper
+    from titan_hcl.logic.agency.helpers.social_post import SocialPostHelper
     h = SocialPostHelper(api_key="test", _explicit_opt_in=True)
     assert h._api_key == "test"

@@ -26,12 +26,12 @@ set -e
 cd "$1"
 
 # Mirror deploy_t*.sh: --skip-worktree mark + filter from reset list
-git update-index --skip-worktree titan_plugin/titan_params.toml 2>/dev/null || true
+git update-index --skip-worktree titan_hcl/titan_params.toml 2>/dev/null || true
 
 SKIP_WORKTREE_FILES=$(git ls-files -v 2>/dev/null \
     | awk '$1 == "S" || $1 == "h" {sub(/^[a-zA-Z] /,""); print}')
 {
-    echo "titan_plugin/config.toml"
+    echo "titan_hcl/config.toml"
     [ -n "$SKIP_WORKTREE_FILES" ] && echo "$SKIP_WORKTREE_FILES"
 } | sort -u > /tmp/test_skip_reset.lst
 
@@ -50,7 +50,7 @@ def _git(repo: Path, *args: str) -> str:
 
 def _setup_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
-    (repo / "titan_plugin").mkdir(parents=True)
+    (repo / "titan_hcl").mkdir(parents=True)
     subprocess.check_call(["git", "init", "-q", "-b", "main"], cwd=str(repo))
     subprocess.check_call(
         ["git", "config", "user.email", "test@example.com"], cwd=str(repo)
@@ -58,11 +58,11 @@ def _setup_repo(tmp_path: Path) -> Path:
     subprocess.check_call(
         ["git", "config", "user.name", "Test"], cwd=str(repo)
     )
-    (repo / "titan_plugin" / "titan_params.toml").write_text(
+    (repo / "titan_hcl" / "titan_params.toml").write_text(
         "# initial\nflag = false\n"
     )
-    (repo / "titan_plugin" / "config.toml").write_text("# config\n")
-    (repo / "titan_plugin" / "other.py").write_text("# other\n")
+    (repo / "titan_hcl" / "config.toml").write_text("# config\n")
+    (repo / "titan_hcl" / "other.py").write_text("# other\n")
     subprocess.check_call(["git", "add", "."], cwd=str(repo))
     subprocess.check_call(
         ["git", "commit", "-q", "-m", "initial"], cwd=str(repo)
@@ -76,11 +76,11 @@ class TestSkipWorktreeFilter:
 
         # Edit titan_params.toml WITHOUT staging — simulates Maker's
         # in-flight flag flip on T2/T3.
-        params = repo / "titan_plugin" / "titan_params.toml"
+        params = repo / "titan_hcl" / "titan_params.toml"
         params.write_text("# initial\nflag = true  # MAKER EDIT\n")
 
         # Edit other.py too — this one is NOT skip-worktree, should be wiped.
-        other = repo / "titan_plugin" / "other.py"
+        other = repo / "titan_hcl" / "other.py"
         other.write_text("# THIS SHOULD BE RESET BY DEPLOY\n")
 
         subprocess.check_call(
@@ -99,7 +99,7 @@ class TestSkipWorktreeFilter:
     def test_skip_worktree_idempotent(self, tmp_path):
         """Running the deploy script twice doesn't break the lock."""
         repo = _setup_repo(tmp_path)
-        params = repo / "titan_plugin" / "titan_params.toml"
+        params = repo / "titan_hcl" / "titan_params.toml"
         params.write_text("# initial\nflag = true  # MAKER EDIT\n")
 
         for _ in range(2):
@@ -109,29 +109,13 @@ class TestSkipWorktreeFilter:
 
         assert "MAKER EDIT" in params.read_text()
         # Verify --skip-worktree flag still set
-        ls = _git(repo, "ls-files", "-v", "titan_plugin/titan_params.toml")
+        ls = _git(repo, "ls-files", "-v", "titan_hcl/titan_params.toml")
         assert ls.startswith("S "), f"flag dropped: {ls!r}"
 
 
-class TestDeployScriptSourceContract:
-    """Source-level contracts on the actual deploy scripts."""
-
-    @pytest.mark.parametrize("script", ["deploy_t2.sh", "deploy_t3.sh"])
-    def test_deploy_uses_skip_worktree_filter(self, script):
-        path = Path(__file__).parent.parent / "scripts" / script
-        src = path.read_text(encoding="utf-8")
-        # Filter logic present
-        assert "skip-worktree" in src, (
-            f"{script} missing skip-worktree mark"
-        )
-        assert "titan_params.toml" in src, (
-            f"{script} missing titan_params.toml mention"
-        )
-        # The dangerous unfiltered checkout is GONE
-        bad_pattern = (
-            'git diff --name-only | grep -v "^titan_plugin/config.toml$"'
-            ' | xargs -r git checkout --'
-        )
-        assert bad_pattern not in src, (
-            f"{script} still uses pre-fix unfiltered checkout pattern"
-        )
+# TestDeployScriptSourceContract retired 2026-05-16 — deploy_t{2,3}.sh
+# were removed (replaced by t{2,3}_manage.sh deploy) per fleet-wide Phase C
+# 2026-05-14. Equivalent skip-worktree filter contract for t{2,3}_manage.sh
+# is left to a future test if a regression appears; the underlying
+# `git update-index --skip-worktree` behavior is exercised by
+# TestSkipWorktree above.

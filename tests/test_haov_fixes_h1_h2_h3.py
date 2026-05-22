@@ -8,6 +8,11 @@ H.3 — Periodic HAOV test pump in cgn_worker decouples test-trigger from
 Pure source-inspection tests — verifier branches and pump logic live in long
 worker loops; runtime exercise is covered by the existing 76-test
 test_meta_service_session2.py + integration soak.
+
+2026-05-17 cleanup: spirit_worker.py was retired to a heartbeat stub in D8-3
+(commit 72f95a6b). The 5 verifier-branch tests that searched spirit_worker.py
+for code that has been deleted are removed. The emot_cgn check is updated to
+match the actual coding convention (constants, not literal strings).
 """
 from __future__ import annotations
 
@@ -17,10 +22,10 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-LANGUAGE_WORKER = REPO_ROOT / "titan_plugin/modules/language_worker.py"
-SPIRIT_WORKER = REPO_ROOT / "titan_plugin/modules/spirit_worker.py"
-EMOT_CGN_WORKER = REPO_ROOT / "titan_plugin/modules/emot_cgn_worker.py"
-CGN_WORKER = REPO_ROOT / "titan_plugin/modules/cgn_worker.py"
+LANGUAGE_WORKER = REPO_ROOT / "titan_hcl/modules/language_worker.py"
+SPIRIT_WORKER = REPO_ROOT / "titan_hcl/modules/spirit_worker.py"
+EMOT_CGN_WORKER = REPO_ROOT / "titan_hcl/modules/emot_cgn_worker.py"
+CGN_WORKER = REPO_ROOT / "titan_hcl/modules/cgn_worker.py"
 
 
 def _read(p: Path) -> str:
@@ -50,20 +55,14 @@ def test_h1a_language_verifier_qual_or_cheat_removed():
         "Honest per-word delta clause must remain")
 
 
-def test_h1b_social_verifier_nm_delta_or_cheat_removed():
-    src = _read_code_only(SPIRIT_WORKER)
-    assert "or _nm_delta > 0.02" not in src, (
-        "H.1.b regression — social verifier nm_delta OR-cheat returned")
-    assert "_confirmed = (_q_a > _q_b + 0.01)" in src, (
-        "Honest social quality delta must remain")
+# test_h1b_social_verifier_nm_delta_or_cheat_removed REMOVED 2026-05-17:
+# spirit_worker.py's social verifier branch was retired in D8-3 (commit
+# 72f95a6b). No code to defend against the OR-cheat regression because the
+# whole verifier is gone. If a future migration re-introduces a social
+# verifier in its new home, a new test should target that new home directly.
 
-
-def test_h1c_self_model_verifier_depth_cheat_removed():
-    src = _read_code_only(SPIRIT_WORKER)
-    assert "or (_depth_a > _depth_b)" not in src, (
-        "H.1.c regression — self_model i_depth monotonic-counter cheat returned")
-    assert "_confirmed = (_acc_a > _acc_b + 0.01)" in src, (
-        "Honest accuracy delta must remain in self_model verifier")
+# test_h1c_self_model_verifier_depth_cheat_removed REMOVED 2026-05-17:
+# Same reason as test_h1b — self_model verifier was retired in D8-3.
 
 
 # ─────────────────── H.2 dest map + new verifiers ───────────────────
@@ -94,7 +93,10 @@ def test_h2_dest_map_routes_all_9_registered_consumers():
 
 def test_h2_emot_cgn_handles_emotional_verify():
     src = _read(EMOT_CGN_WORKER)
-    assert 'msg_type == "CGN_HAOV_VERIFY_REQ"' in src, (
+    # 2026-05-17 — pattern fixed: actual code uses the bus.* constant
+    # (`msg_type == bus.CGN_HAOV_VERIFY_REQ`), not a literal-string
+    # comparison. Adjust the assertion to match real codebase convention.
+    assert "msg_type == bus.CGN_HAOV_VERIFY_REQ" in src, (
         "emot_cgn_worker must subscribe to CGN_HAOV_VERIFY_REQ")
     assert '_haov_consumer == "emotional"' in src, (
         "emot_cgn_worker must handle the emotional consumer specifically")
@@ -105,41 +107,29 @@ def test_h2_emot_cgn_handles_emotional_verify():
         "Emotional verifier must use V_dominant delta")
 
 
-def test_h2_spirit_handles_meta_verify():
-    src = _read(SPIRIT_WORKER)
-    assert '_haov_consumer == "meta"' in src, (
-        "spirit_worker must add meta verifier branch")
-    assert "meta_commit_rate" in src, (
-        "Meta verifier must check commit_rate delta")
+# test_h2_spirit_handles_meta_verify REMOVED 2026-05-17:
+# spirit_worker.py was retired to a heartbeat stub in D8-3 (commit
+# 72f95a6b). Meta-verifier branch deleted with it. If a future migration
+# re-homes meta-verification (e.g. inside cognitive_worker), a new test
+# should target that new owner directly.
 
 
-def test_h2_spirit_handles_reasoning_strategy_verify():
-    src = _read(SPIRIT_WORKER)
-    assert '_haov_consumer == "reasoning_strategy"' in src, (
-        "spirit_worker must add reasoning_strategy verifier branch")
-    assert "strategy_commit_rate" in src
-    assert "strategy_total_chains" in src, (
-        "reasoning_strategy verifier must check both rate AND new chains "
-        "(AND, not OR — strict to avoid stale-data confirmation)")
+# test_h2_spirit_handles_reasoning_strategy_verify REMOVED 2026-05-17:
+# Same reason — reasoning_strategy verifier branch was inside the now-
+# retired spirit_worker.py body.
 
 
-def test_h2_spirit_handles_dreaming_verify():
-    src = _read(SPIRIT_WORKER)
-    assert '_haov_consumer == "dreaming"' in src, (
-        "spirit_worker must add dreaming verifier branch")
-    assert "dream_cycle_count" in src
-    assert "epochs_since_dream" in src
+# test_h2_spirit_handles_dreaming_verify REMOVED 2026-05-17:
+# Same reason — dreaming verifier branch was inside the now-retired
+# spirit_worker.py body.
 
 
-def test_h2_all_new_verifiers_send_response():
-    spirit = _read(SPIRIT_WORKER)
+def test_h2_emot_cgn_verifier_sends_response():
+    """The only verifier of these four (emot, meta, reasoning_strategy,
+    dreaming) that survived D8-3 retirement is the emotional one in
+    emot_cgn_worker. Reduced from the original test_h2_all_new_verifiers_
+    send_response to assert only the still-extant case."""
     emot = _read(EMOT_CGN_WORKER)
-    # Each new verifier branch must emit CGN_HAOV_VERIFY_RSP back to cgn
-    for consumer in ("meta", "reasoning_strategy", "dreaming"):
-        # Look for "consumer": "<name>" inside CGN_HAOV_VERIFY_RSP payload
-        assert f'"consumer": "{consumer}"' in spirit, (
-            f"spirit_worker must emit CGN_HAOV_VERIFY_RSP with "
-            f"consumer={consumer!r}")
     assert '"consumer": "emotional"' in emot, (
         "emot_cgn_worker must emit CGN_HAOV_VERIFY_RSP with consumer='emotional'")
 
@@ -220,8 +210,9 @@ def test_h3_pump_config_keys_present():
 
 
 def test_haov_no_or_cheats_remain_in_any_verifier():
-    """Defect 2 cross-check — no system-wide baseline OR-clauses anywhere."""
-    spirit = _read_code_only(SPIRIT_WORKER)
+    """Defect 2 cross-check — no system-wide baseline OR-clauses anywhere.
+    (D-SPEC-116: spirit_worker.py deleted — it was a heartbeat stub with no
+    verifiers; the OR-cheat guard now covers the live verifier hosts.)"""
     lang = _read_code_only(LANGUAGE_WORKER)
     forbidden = [
         "or _qual > 0.5",          # language baseline cheat
@@ -229,5 +220,5 @@ def test_haov_no_or_cheats_remain_in_any_verifier():
         "or (_depth_a > _depth_b)",  # self_model monotonic-counter cheat
     ]
     for f in forbidden:
-        assert f not in lang and f not in spirit, (
+        assert f not in lang, (
             f"OR-cheat regression: {f!r} must not appear in any verifier")

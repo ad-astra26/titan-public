@@ -14,7 +14,7 @@ import os
 import numpy as np
 import pytest
 
-from titan_plugin.logic.arc.goal_detector import GoalDetector
+from titan_hcl.logic.arc.goal_detector import GoalDetector
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────

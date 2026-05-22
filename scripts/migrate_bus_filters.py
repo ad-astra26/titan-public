@@ -298,12 +298,14 @@ def main():
                     help="Emit machine-readable JSON instead of table")
     args = ap.parse_args()
 
-    sites = find_subscribe_call_sites(REPO_ROOT / "titan_plugin")
+    sites = find_subscribe_call_sites(REPO_ROOT / "titan_hcl")
     # Narrow to the un-migrated subscribers
     todo = [s for s in sites if not s["has_types"]]
 
     # Group by name → multiple subscribe sites for the same logical
-    # subscriber (legacy_core + core/plugin) are reported together.
+    # subscriber are reported together. (core/plugin.py is the sole
+    # registration site since legacy_core retirement, D-SPEC-106, but a
+    # worker may still subscribe from both its parent + module file.)
     by_name: dict[str, list[dict]] = {}
     for s in todo:
         by_name.setdefault(s["name"], []).append(s)

@@ -30,7 +30,7 @@ class TestResonancePair:
 
     def test_init_defaults(self):
         """Pair starts with no resonance state."""
-        from titan_plugin.logic.resonance import ResonancePair
+        from titan_hcl.logic.resonance import ResonancePair
         pair = ResonancePair("body")
         assert pair.name == "body"
         assert pair.is_resonant is False
@@ -39,7 +39,7 @@ class TestResonancePair:
 
     def test_single_pulse_no_resonance(self):
         """A single pulse from one side cannot produce resonance."""
-        from titan_plugin.logic.resonance import ResonancePair
+        from titan_hcl.logic.resonance import ResonancePair
         pair = ResonancePair("body")
         result = pair.record_pulse("inner_body", _make_pulse("inner_body"))
         assert result is None
@@ -47,7 +47,7 @@ class TestResonancePair:
 
     def test_counterpart_pulses_aligned_produce_resonance(self):
         """Two counterpart pulses with aligned phases produce a resonant cycle."""
-        from titan_plugin.logic.resonance import ResonancePair
+        from titan_hcl.logic.resonance import ResonancePair
         pair = ResonancePair("body", required_cycles=1, pulse_window=10.0)
 
         now = time.time()
@@ -61,7 +61,7 @@ class TestResonancePair:
 
     def test_phase_misalignment_breaks_streak(self):
         """Large phase difference breaks the resonance streak."""
-        from titan_plugin.logic.resonance import ResonancePair
+        from titan_hcl.logic.resonance import ResonancePair
         pair = ResonancePair("mind", phase_threshold=math.pi / 6, required_cycles=3)
 
         # First resonant cycle (same pulse count → same approximate phase)
@@ -83,7 +83,7 @@ class TestResonancePair:
 
     def test_time_window_exceeded_breaks_streak(self):
         """Pulses too far apart in time break the resonance streak."""
-        from titan_plugin.logic.resonance import ResonancePair
+        from titan_hcl.logic.resonance import ResonancePair
         pair = ResonancePair("spirit", pulse_window=5.0, required_cycles=2)
 
         now = time.time()
@@ -94,7 +94,7 @@ class TestResonancePair:
 
     def test_big_pulse_after_n_cycles(self):
         """BIG PULSE fires after N consecutive resonant cycles."""
-        from titan_plugin.logic.resonance import ResonancePair
+        from titan_hcl.logic.resonance import ResonancePair
         pair = ResonancePair("body", required_cycles=3, pulse_window=60.0)
 
         now = time.time()
@@ -115,7 +115,7 @@ class TestResonancePair:
 
     def test_big_pulse_resets_streak(self):
         """After BIG PULSE, streak resets to 0 (start fresh for next)."""
-        from titan_plugin.logic.resonance import ResonancePair
+        from titan_hcl.logic.resonance import ResonancePair
         pair = ResonancePair("body", required_cycles=2, pulse_window=60.0)
 
         now = time.time()
@@ -129,7 +129,7 @@ class TestResonancePair:
 
     def test_multiple_big_pulses(self):
         """Multiple BIG PULSEs can fire over time."""
-        from titan_plugin.logic.resonance import ResonancePair
+        from titan_hcl.logic.resonance import ResonancePair
         pair = ResonancePair("mind", required_cycles=1, pulse_window=60.0)
 
         now = time.time()
@@ -142,7 +142,7 @@ class TestResonancePair:
 
     def test_phase_difference_wrapping(self):
         """Phase difference correctly handles wrapping around 2π."""
-        from titan_plugin.logic.resonance import ResonancePair
+        from titan_hcl.logic.resonance import ResonancePair
 
         # Phases near 0 and 2π should be close
         diff = ResonancePair._phase_difference(0.1, 2 * math.pi - 0.1)
@@ -158,7 +158,7 @@ class TestResonancePair:
 
     def test_persistence_save_load(self):
         """Pair state survives serialization."""
-        from titan_plugin.logic.resonance import ResonancePair
+        from titan_hcl.logic.resonance import ResonancePair
         pair = ResonancePair("body")
         pair._big_pulse_count = 7
         pair._total_resonant_cycles = 42
@@ -176,7 +176,7 @@ class TestResonancePair:
 
     def test_stats_structure(self):
         """get_stats returns complete information."""
-        from titan_plugin.logic.resonance import ResonancePair
+        from titan_hcl.logic.resonance import ResonancePair
         pair = ResonancePair("spirit")
         stats = pair.get_stats()
 
@@ -195,7 +195,7 @@ class TestResonanceDetector:
 
     def test_init_creates_3_pairs(self):
         """Detector initializes with body, mind, spirit pairs."""
-        from titan_plugin.logic.resonance import ResonanceDetector
+        from titan_hcl.logic.resonance import ResonanceDetector
         detector = ResonanceDetector()
 
         assert len(detector.pairs) == 3
@@ -205,7 +205,7 @@ class TestResonanceDetector:
 
     def test_component_to_pair_mapping(self):
         """Components map to correct pairs."""
-        from titan_plugin.logic.resonance import ResonanceDetector
+        from titan_hcl.logic.resonance import ResonanceDetector
 
         assert ResonanceDetector._component_to_pair("inner_body") == "body"
         assert ResonanceDetector._component_to_pair("outer_body") == "body"
@@ -215,7 +215,7 @@ class TestResonanceDetector:
 
     def test_record_pulse_routes_to_correct_pair(self):
         """Pulses are routed to the correct resonance pair."""
-        from titan_plugin.logic.resonance import ResonanceDetector
+        from titan_hcl.logic.resonance import ResonanceDetector
         detector = ResonanceDetector()
 
         detector.record_pulse(_make_pulse("inner_body"))
@@ -227,7 +227,7 @@ class TestResonanceDetector:
 
     def test_resonant_count(self):
         """resonant_count tracks how many pairs are resonant."""
-        from titan_plugin.logic.resonance import ResonanceDetector
+        from titan_hcl.logic.resonance import ResonanceDetector
         detector = ResonanceDetector(config={"resonance_cycles": 1, "pulse_window": 60.0})
 
         assert detector.resonant_count() == 0
@@ -245,13 +245,13 @@ class TestResonanceDetector:
 
     def test_all_resonant_false_initially(self):
         """all_resonant is False when no pairs have resonated."""
-        from titan_plugin.logic.resonance import ResonanceDetector
+        from titan_hcl.logic.resonance import ResonanceDetector
         detector = ResonanceDetector()
         assert detector.all_resonant() is False
 
     def test_great_pulse_condition(self):
         """GREAT PULSE condition met when all 3 pairs achieve resonance."""
-        from titan_plugin.logic.resonance import ResonanceDetector
+        from titan_hcl.logic.resonance import ResonanceDetector
         detector = ResonanceDetector(config={
             "resonance_cycles": 1,
             "pulse_window": 60.0,
@@ -280,7 +280,7 @@ class TestResonanceDetector:
 
     def test_big_pulse_has_pair_info(self):
         """BIG PULSE events contain pair identification."""
-        from titan_plugin.logic.resonance import ResonanceDetector
+        from titan_hcl.logic.resonance import ResonanceDetector
         detector = ResonanceDetector(config={"resonance_cycles": 1, "pulse_window": 60.0})
 
         now = time.time()
@@ -295,7 +295,7 @@ class TestResonanceDetector:
 
     def test_unknown_component_ignored(self):
         """Unknown component names don't cause errors."""
-        from titan_plugin.logic.resonance import ResonanceDetector
+        from titan_hcl.logic.resonance import ResonanceDetector
         detector = ResonanceDetector()
 
         result = detector.record_pulse(_make_pulse("unknown_component"))
@@ -303,7 +303,7 @@ class TestResonanceDetector:
 
     def test_persistence(self):
         """Detector state persists across save/load."""
-        from titan_plugin.logic.resonance import ResonanceDetector
+        from titan_hcl.logic.resonance import ResonanceDetector
         with tempfile.TemporaryDirectory() as tmpdir:
             d1 = ResonanceDetector(
                 config={"resonance_cycles": 1, "pulse_window": 60.0},
@@ -325,7 +325,7 @@ class TestResonanceDetector:
 
     def test_stats_structure(self):
         """get_stats returns comprehensive data."""
-        from titan_plugin.logic.resonance import ResonanceDetector
+        from titan_hcl.logic.resonance import ResonanceDetector
         detector = ResonanceDetector()
         stats = detector.get_stats()
 
@@ -339,7 +339,7 @@ class TestResonanceDetector:
 
     def test_record_pulse_with_phases(self):
         """Explicit phase recording works for resonance detection."""
-        from titan_plugin.logic.resonance import ResonanceDetector
+        from titan_hcl.logic.resonance import ResonanceDetector
         detector = ResonanceDetector(config={"resonance_cycles": 1, "pulse_window": 60.0})
 
         now = time.time()

@@ -1,4 +1,4 @@
-"""Tests for titan_plugin.logic.meta_teacher_voice — Phase C of
+"""Tests for titan_hcl.logic.meta_teacher_voice — Phase C of
 rFP_meta_teacher_v2_content_awareness_memory.md.
 
 Covers:
@@ -23,7 +23,7 @@ import time
 
 import pytest
 
-from titan_plugin.logic.meta_teacher_voice import (
+from titan_hcl.logic.meta_teacher_voice import (
     TeacherVoice,
     _hash_state,
     _make_default_voice_state,

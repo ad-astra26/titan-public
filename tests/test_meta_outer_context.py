@@ -18,7 +18,7 @@ import time
 
 import pytest
 
-from titan_plugin.logic.meta_outer_context import (
+from titan_hcl.logic.meta_outer_context import (
     _LRUTTLCache,
     FeltExperiencesReader,
     OuterContextConfig,

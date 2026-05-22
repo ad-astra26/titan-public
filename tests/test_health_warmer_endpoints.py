@@ -14,7 +14,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import MagicMock, patch
 
-from titan_plugin.api import dashboard as _dash
+from titan_hcl.api import dashboard as _dash
 
 
 class TestHealthLightEndpoint(unittest.TestCase):
@@ -56,7 +56,7 @@ class TestVaultStatusWarmer(unittest.TestCase):
     def test_builder_returns_none_when_solana_unavailable(self):
         plugin = MagicMock()
         plugin.config = {"network": {"vault_program_id": "abc"}}
-        with patch("titan_plugin.utils.solana_client.is_available", return_value=False):
+        with patch("titan_hcl.utils.solana_client.is_available", return_value=False):
             result = _dash._build_vault_status_sync(plugin)
         self.assertIsNone(result)
 
@@ -160,23 +160,10 @@ class TestHealthHandlerCachePath(unittest.TestCase):
         self.assertIn("asyncio.wait_for", src)
 
 
-class TestWatchdogScriptUsesLightProbe(unittest.TestCase):
-    """services_watchdog.sh + t3_manage.sh should probe /health/light not /health."""
-
-    def test_services_watchdog_uses_health_light_for_liveness(self):
-        from pathlib import Path
-        path = Path(_dash.__file__).parent.parent.parent / "scripts" / "services_watchdog.sh"
-        src = path.read_text()
-        # Must contain /health/light somewhere
-        self.assertIn("/health/light", src,
-                      "services_watchdog.sh missing /health/light probe")
-        # The CHECK 1 block specifically must use /health/light
-        check1_anchor = src.find("CHECK 1: Core API health")
-        self.assertGreater(check1_anchor, 0)
-        # In the next 500 chars, /health/light should appear before /health (full)
-        snippet = src[check1_anchor:check1_anchor + 1500]
-        light_idx = snippet.find("/health/light")
-        self.assertGreater(light_idx, 0, "CHECK 1 block missing /health/light probe")
+# TestWatchdogScriptUsesLightProbe retired 2026-05-16 — services_watchdog.sh
+# was removed (cron retired 2026-05-14 Phase C migration; systemd + HCL
+# Guardian own supervision). t{1,2,3}_manage.sh probes /health/light
+# directly without the watchdog-script intermediary.
 
 
 if __name__ == "__main__":

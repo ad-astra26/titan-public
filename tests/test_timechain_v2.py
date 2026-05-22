@@ -14,7 +14,7 @@ import unittest
 
 import pytest
 
-from titan_plugin.logic.timechain_v2 import (
+from titan_hcl.logic.timechain_v2 import (
     Transaction, RecallQuery, CheckQuery, CompareQuery, AggregateQuery,
     BloomFilter, MempoolWAL, Mempool, GenesisChain, BlockBuilder,
     TimeChainOrchestrator, FORK_IDS,

@@ -14,8 +14,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from titan_plugin.core import shadow_orchestrator as so
-from titan_plugin import bus as bus_mod
+from titan_hcl.core import shadow_orchestrator as so
+from titan_hcl import bus as bus_mod
 
 
 class _FakeBus:

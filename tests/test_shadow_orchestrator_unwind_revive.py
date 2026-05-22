@@ -24,12 +24,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from titan_plugin import bus
-from titan_plugin.core.shadow_orchestrator import (
+from titan_hcl import bus
+from titan_hcl.core.shadow_orchestrator import (
     SwapResult,
     _revive_guardian_after_unwind,
 )
-from titan_plugin.guardian import Guardian, ModuleSpec
+from titan_hcl.guardian import Guardian, ModuleSpec
 
 
 def _noop_entry(*args, **kwargs):  # pragma: no cover
@@ -142,7 +142,7 @@ def test_orchestrator_rollback_paths_all_call_revive():
     that forget to revive Guardian.
     """
     import inspect
-    from titan_plugin.core import shadow_orchestrator as so
+    from titan_hcl.core import shadow_orchestrator as so
     src = inspect.getsource(so.orchestrate_shadow_swap)
     # Every rollback branch (outcome="rollback") should be followed by
     # the revive helper call within the same path before its return.

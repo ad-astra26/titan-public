@@ -1,331 +1,138 @@
 #!/bin/bash
-# t3_manage.sh — Titan3 VPS management script
-# T3 runs alongside T2 on the same VPS (10.135.0.6) on port 7778
-# For clean birth experiment: NO accumulated state, fresh DNA
+# t3_manage.sh — Unified T3 (devnet, remote 10.135.0.6) management.
 #
-# Usage from T1:
-#   ssh root@10.135.0.6 "bash /home/antigravity/projects/titan3/scripts/t3_manage.sh {status|start|stop|restart|log|health|vocab|telemetry}"
+# Phase C: kernel-rs is supervised by systemd unit `titan-t3.service`.
+# T3 lives at /home/antigravity/projects/titan3/ on 10.135.0.6 (separate
+# repo clone from T2's /home/antigravity/projects/titan/).
+#
+# Usage: bash scripts/t3_manage.sh {status|health|start|stop|restart|logs|pid|deploy|help}
+#        bash scripts/t3_manage.sh restart --force    # skip dreaming wait
+#        bash scripts/t3_manage.sh deploy             # git pull + restart on T3
+#        bash scripts/t3_manage.sh deploy                         # pushes Rust musl binaries by default (v1.34.0)
+#        bash scripts/t3_manage.sh deploy --skip-rust-binaries     # opt-out (rare; Python-only quick re-push)
 
+set -u
+
+# ── T3-specific configuration ──────────────────────────────────────────
+TITAN_ID="T3"
+SYSTEMD_UNIT="titan-t3.service"
+API_URL="http://10.135.0.6:7778"
+REMOTE_HOST="root@10.135.0.6"
 TITAN_DIR="/home/antigravity/projects/titan3"
-VENV="/home/antigravity/projects/titan3/test_env/bin/activate"  # dedicated T3 venv
-BRAIN_LOG="/tmp/titan3_brain.log"
-TELEM_LOG="/tmp/titan3_telemetry.log"
-PIDFILE="/tmp/titan3.pid"
+STATE_FILE="${TITAN_DIR}/data/dreaming_state.json"
 
-cd "$TITAN_DIR" || { echo "ERROR: Cannot cd to $TITAN_DIR"; exit 1; }
-source "$VENV" 2>/dev/null || { echo "ERROR: Cannot activate venv at $VENV"; exit 1; }
-export OPENROUTER_API_KEY=
-# Raise FD limit (cron default 1024 causes fd exhaustion ~2h into uptime,
-# 2026-04-22 T2 incident). `ulimit -n N` can return 0 in cron/env-i context
-# WITHOUT actually raising the soft limit, so the old `|| fallback` chain
-# short-circuited silently. Verify after setting + fall back explicitly.
-ulimit -n 1048576 2>/dev/null
-if [ "$(ulimit -n)" -lt 65536 ]; then
-    ulimit -n 65536 2>/dev/null || true
+# Source shared helpers
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/titan_common.sh
+source "${SCRIPT_DIR}/lib/titan_common.sh"
+
+# ── T3-specific deploy override ────────────────────────────────────────
+# Same atomic config.toml dance + Rust binary push as T2's deploy, but
+# targets T3's directory (/home/antigravity/projects/titan3/).
+cmd_deploy() {
+    # 2026-05-19 D-SPEC-94 fleet drift learning — `include_rust=1` is now
+    # the default. T2 binary drift (May 18 19:41) persisted past the
+    # D-SPEC-94 expression_reach Rust fix on 2026-05-19 because the
+    # default-off Rust push left every Python-only deploy carrying a
+    # stale Rust daemon. `--skip-rust-binaries` is the explicit opt-out
+    # for the rare case where only Python code changed and a
+    # several-second scp is meaningfully cheaper than the safe-default.
+    local include_rust=1
+    for arg in "$@"; do
+        case "${arg}" in
+            --include-rust-binaries) include_rust=1 ;;
+            --skip-rust-binaries) include_rust=0 ;;
+        esac
+    done
+
+    echo "=== Pre-deploy sovereign-state check on ${TITAN_ID} ==="
+    if ! verify_sovereign_state | tail -20; then
+        echo "  🚨 Sovereign-state check FAILED — refusing to deploy to ${TITAN_ID}"
+        echo "     Deploy would risk overwriting a divergent identity file. Fix first."
+        return 2
+    fi
+    echo
+    echo "=== Deploy ${TITAN_ID} (git pull on remote) ==="
+    local backup="/tmp/${TITAN_ID,,}_config_backup_$(date +%s).toml"
+    ssh -o ConnectTimeout=10 "${REMOTE_HOST}" bash -s -- "${TITAN_DIR}" "${backup}" "${TITAN_ID}" <<'REMOTE_SCRIPT' || return 1
+set -e
+REMOTE_DIR="$1"
+BACKUP="$2"
+LABEL="$3"
+cd "${REMOTE_DIR}"
+
+if [ ! -f titan_hcl/config.toml ]; then
+    echo "  ✗ ${LABEL}: titan_hcl/config.toml missing — aborting"
+    exit 1
 fi
-# T3 can sense T2 as kin on localhost
-export TITAN_KIN_ADDRESSES="http://localhost:7777"
+cp titan_hcl/config.toml "${BACKUP}"
+BACKUP_SIZE=$(stat -c%s "${BACKUP}")
+echo "  ✓ ${LABEL}: backed up config.toml (${BACKUP_SIZE} bytes) → ${BACKUP}"
 
-# Helper: check if T3 is actually running via PID file
-t3_is_running() {
-    [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
+git update-index --no-assume-unchanged titan_hcl/config.toml 2>/dev/null || true
+git checkout HEAD -- titan_hcl/config.toml 2>/dev/null || true
+
+echo "  → git pull --ff-only origin titan-v6"
+git pull --ff-only origin titan-v6 2>&1 | tail -10
+
+python3 <<'PYMERGE'
+import re, sys, os
+pulled = open('titan_hcl/config.toml').read()
+backup_path = "${BACKUP}"
+backup = open(backup_path).read() if os.path.exists(backup_path) else ''
+pulled_sections = re.findall(r'^\[([^\]]+)\]', pulled, re.MULTILINE)
+backup_sections = re.findall(r'^\[([^\]]+)\]', backup, re.MULTILINE)
+new_sections = [s for s in pulled_sections if s not in backup_sections]
+if new_sections:
+    print(f'  + new sections to merge: {", ".join(new_sections)}')
+    for sec in new_sections:
+        m = re.search(rf'(\[{re.escape(sec)}\][^\[]*)', pulled)
+        if m:
+            backup += '\n\n' + m.group(1).rstrip() + '\n'
+    open(backup_path, 'w').write(backup)
+PYMERGE
+
+cp "${BACKUP}" titan_hcl/config.toml
+git update-index --assume-unchanged titan_hcl/config.toml
+RESTORED_SIZE=$(stat -c%s titan_hcl/config.toml)
+echo "  ✓ ${LABEL}: restored config.toml (${RESTORED_SIZE} bytes)"
+REMOTE_SCRIPT
+
+    if [ "${include_rust}" = "1" ]; then
+        echo
+        echo "=== Push Rust musl binaries ==="
+        # T3 builds from /home/antigravity/projects/titan/titan-rust/ (T2 repo
+        # is the shared source-of-truth; T3 is a parallel clone that pulls).
+        local bins_local="/home/antigravity/projects/titan/titan-rust/target/x86_64-unknown-linux-musl/release"
+        if [ ! -d "${bins_local}" ]; then
+            echo "  ⚠ ${bins_local} missing — run 'bash scripts/build_titan_rust.sh musl' first"
+            return 1
+        fi
+        local scp_args=()
+        for bin_name in titan-kernel-rs titan-trinity-rs titan-unified-spirit-rs \
+                        titan-inner-body-rs titan-inner-mind-rs titan-inner-spirit-rs \
+                        titan-outer-body-rs titan-outer-mind-rs titan-outer-spirit-rs; do
+            [ -f "${bins_local}/${bin_name}" ] && scp_args+=("${bins_local}/${bin_name}")
+        done
+        if [ ${#scp_args[@]} -gt 0 ]; then
+            # scp to a staging dir, then atomic-rename into bin/. The live
+            # titan-kernel-rs holds its on-disk binary busy (ETXTBSY), so a
+            # direct scp over it fails with "dest open Failure". rename(2)
+            # over a busy executable succeeds — the running process keeps the
+            # old (now-unlinked) inode while the path picks up the new binary,
+            # which the subsequent restart launches.
+            local staging="${TITAN_DIR}/bin/.deploy_staging"
+            ssh -o ConnectTimeout=10 "${REMOTE_HOST}" "mkdir -p '${staging}'" || return 1
+            scp -q "${scp_args[@]}" "${REMOTE_HOST}:${staging}/" || return 1
+            ssh -o ConnectTimeout=10 "${REMOTE_HOST}" "set -e; for f in '${staging}'/*; do chmod +x \"\$f\"; mv -f \"\$f\" '${TITAN_DIR}/bin/'; done; rmdir '${staging}' 2>/dev/null || true" || return 1
+            echo "  ✓ staged + atomically installed ${#scp_args[@]} binaries to ${REMOTE_HOST}:${TITAN_DIR}/bin/"
+        fi
+    fi
+
+    echo
+    echo "=== Restart ${TITAN_ID} (systemctl) ==="
+    cmd_restart --force || return $?
+    echo "  ✓ ${TITAN_ID} deploy complete"
 }
 
-CMD="${1:-status}"
-shift 2>/dev/null || true
-
-case "$CMD" in
-    status)
-        echo "=== T3 Process ==="
-        if t3_is_running; then
-            echo "RUNNING (PID=$(cat "$PIDFILE"))"
-        else
-            echo "NOT RUNNING"
-            rm -f "$PIDFILE"
-        fi
-        echo ""
-        echo "=== API Health ==="
-        HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:7778/health/light 2>/dev/null)
-        echo "HTTP: $HTTP"
-        echo ""
-        echo "=== Connections on 7778 ==="
-        ss -tnp | grep -c ':7778' 2>/dev/null || echo "0"
-        echo ""
-        echo "=== Last 5 log lines ==="
-        tail -5 "$BRAIN_LOG" 2>/dev/null || echo "(no log)"
-        ;;
-
-    start)
-        echo "=== Starting T3 ==="
-        if t3_is_running; then
-            echo "Already running! (PID=$(cat "$PIDFILE"))"
-            exit 1
-        fi
-        # Guard: T3 MUST run on 7778 (T2 owns 7777 on this shared VPS).
-        # `git pull` restores the repo default `port = 7777`, clobbering the
-        # local T3-only override. Idempotent sed here — no-op if already 7778,
-        # fixes it otherwise. Documented in memory/feedback_t3_deploy_port.md.
-        if grep -q '^port = 7777' titan_plugin/config.toml 2>/dev/null; then
-            sed -i 's/^port = 7777/port = 7778/' titan_plugin/config.toml
-            echo "Port fixed 7777 → 7778 (was clobbered by git pull)"
-        fi
-        rm -f "$PIDFILE"
-        cd "$TITAN_DIR"
-        # setsid: ensure the new process becomes its own session leader so
-        # the PGID-based kill in `stop` works correctly when called from
-        # SSH/cron without a controlling terminal. Matches t2_manage.sh.
-        # MALLOC_ARENA_MAX=2 — limits glibc malloc arenas (see safe_restart.sh
-        # for full rationale). Closes C-level RssAnon fragmentation 2026-04-27.
-        MALLOC_ARENA_MAX=2 setsid nohup python -u scripts/titan_main.py --server >> "$BRAIN_LOG" 2>&1 &
-        echo "$!" > "$PIDFILE"
-        echo "PID: $!"
-        echo "Waiting 15s for boot..."
-        sleep 15
-        HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://localhost:7778/health/light 2>/dev/null)
-        echo "Health: ${HTTP:-PENDING}"
-        ;;
-
-    stop)
-        echo "=== Stopping T3 ==="
-        # Phase C C-S2 (PLAN §17.3 / BUG-DUPLICATE-KERNELS-FRAGMENT-BUS-20260428):
-        # `stop` kills ALL titan_main process groups whose cwd matches T3's
-        # project dir, NOT just the PIDFILE PID. See t2_manage.sh stop for
-        # the algorithm + rationale (cwd-exact-match per
-        # feedback_shared_vps_pkill_trap.md).
-
-        TITAN_PIDS=""
-        if [ -f "$PIDFILE" ]; then
-            PFPID=$(cat "$PIDFILE" 2>/dev/null | tr -d '[:space:]')
-            if [ -n "$PFPID" ] && kill -0 "$PFPID" 2>/dev/null; then
-                TITAN_PIDS="$PFPID"
-            fi
-            rm -f "$PIDFILE"
-        fi
-        for p in $(pgrep -f "titan_main.*--server" 2>/dev/null); do
-            PCWD=$(readlink -f "/proc/$p/cwd" 2>/dev/null)
-            if [ "$PCWD" = "$TITAN_DIR" ]; then
-                TITAN_PIDS="$TITAN_PIDS $p"
-            fi
-        done
-        TITAN_PIDS=$(echo "$TITAN_PIDS" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
-
-        if [ -n "$TITAN_PIDS" ]; then
-            TITAN_PGIDS=""
-            for p in $TITAN_PIDS; do
-                PGID=$(ps -o pgid= -p "$p" 2>/dev/null | tr -d ' ')
-                if [ -n "$PGID" ] && [ "$PGID" != "0" ] && [ "$PGID" != "1" ]; then
-                    TITAN_PGIDS="$TITAN_PGIDS $PGID"
-                fi
-            done
-            TITAN_PGIDS=$(echo "$TITAN_PGIDS" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
-
-            for pgid in $TITAN_PGIDS; do
-                kill -- -"$pgid" 2>/dev/null
-            done
-            for _ in 1 2 3 4 5 6; do
-                ALIVE=0
-                for p in $TITAN_PIDS; do
-                    if [ -e "/proc/$p" ]; then ALIVE=$((ALIVE+1)); fi
-                done
-                [ "$ALIVE" -eq 0 ] && break
-                sleep 1
-            done
-            for pgid in $TITAN_PGIDS; do
-                kill -9 -- -"$pgid" 2>/dev/null
-            done
-            for _ in 1 2 3; do
-                ALIVE=0
-                for p in $TITAN_PIDS; do
-                    if [ -e "/proc/$p" ]; then ALIVE=$((ALIVE+1)); fi
-                done
-                [ "$ALIVE" -eq 0 ] && break
-                sleep 1
-            done
-        fi
-
-        # 3. Kill anything still on port 7778
-        sleep 1
-        fuser -k 7778/tcp 2>/dev/null
-        echo "Stopped"
-        ;;
-
-    restart)
-        # Safe restart: check is_dreaming before stopping (matches T1's
-        # safe_restart.sh philosophy — never wake a Titan mid-dream).
-        # If mid-dream, waits up to WAIT_S seconds for natural wake before
-        # giving up. Pass --force as second arg to skip the check entirely.
-        if [ "$1" != "--force" ]; then
-            check_dreaming() {
-                # 2026-04-23 fix: longer curl timeout (5s → 10s) + file-based
-                # epochs_since_dream fallback when API fails. Prevents
-                # false-negatives under Observatory API latency conditions.
-                local dj
-                dj=$(curl -s --max-time 10 http://localhost:7778/v4/dreaming 2>/dev/null)
-                local api_result
-                api_result=$(echo "$dj" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin).get('data', {})
-    v = d.get('is_dreaming')
-    if v is None:
-        print('unknown')
-    else:
-        print(v)
-except: print('unknown')
-" 2>/dev/null)
-                if [ "$api_result" = "True" ] || [ "$api_result" = "False" ]; then
-                    echo "$api_result"
-                    return
-                fi
-                # API failed — fall back to T3's local state file
-                python3 -c "
-import json
-try:
-    with open('/home/antigravity/projects/titan3/data/dreaming_state.json') as f:
-        d = json.load(f)
-    epochs = d.get('epochs_since_dream', 0)
-    print('False' if epochs > 5 else 'unknown')
-except: print('unknown')
-" 2>/dev/null
-            }
-            IS_DREAMING=$(check_dreaming)
-            if [ "$IS_DREAMING" = "True" ]; then
-                # Wait-for-wake: poll every 10s up to 300s (5min).
-                WAIT_S=300
-                POLL_S=10
-                WAITED=0
-                echo "=== T3 is DREAMING — waiting up to ${WAIT_S}s for natural wake (poll every ${POLL_S}s) ==="
-                while [ $WAITED -lt $WAIT_S ]; do
-                    sleep $POLL_S
-                    WAITED=$((WAITED + POLL_S))
-                    IS_DREAMING=$(check_dreaming)
-                    if [ "$IS_DREAMING" = "False" ]; then
-                        echo "  ✓ T3 woke after ${WAITED}s (is_dreaming=False) — proceeding with restart"
-                        break
-                    fi
-                    echo "  [t+${WAITED}s] still dreaming..."
-                done
-                if [ "$IS_DREAMING" = "True" ]; then
-                    echo "=== T3 still dreaming after ${WAIT_S}s — restart skipped ==="
-                    echo "Code is on disk; next natural restart picks it up."
-                    echo "Pass --force to override (will wake mid-dream)."
-                    exit 1
-                fi
-            elif [ "$IS_DREAMING" = "False" ]; then
-                echo "  ✓ T3 dream check: is_dreaming=False — safe to restart"
-            else
-                # 2026-04-20 fix: "unknown" = API unreachable or parse error.
-                # Previously this fell through as "safe to restart" which is
-                # wrong — refuse unless --force so operator sees the real state.
-                echo "=== T3 dream state could not be verified (is_dreaming=$IS_DREAMING) ==="
-                echo "  API at localhost:7778/v4/dreaming returned no/bad response."
-                echo "  Refusing to restart without verified awake state."
-                echo "  Pass --force to override (will proceed regardless of dream state)."
-                exit 1
-            fi
-        fi
-        # Acquire restart-coordination lockfile so services_watchdog.sh skips
-        # its zombie/duplicate-group check during the kill-then-spawn window.
-        # Closes BUG-RESTART-WATCHDOG-RACE (2026-04-27).
-        RESTART_LOCK="/tmp/titan3_restart.lock"
-        date +%s > "$RESTART_LOCK"
-        trap 'rm -f "$RESTART_LOCK"' INT TERM
-        $0 stop
-        sleep 2
-        $0 start
-        ;;
-
-    log)
-        N="${1:-30}"
-        tail -"$N" "$BRAIN_LOG" 2>/dev/null
-        ;;
-
-    log-errors)
-        grep -a "ERROR\|WARNING\|Traceback\|Exception" "$BRAIN_LOG" | tail -20
-        ;;
-
-    health)
-        curl -s http://localhost:7778/health 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "unavailable"
-        ;;
-
-    vocab)
-        python3 -c "
-import sqlite3
-db = sqlite3.connect('${TITAN_DIR}/data/inner_memory.db', timeout=5)
-total = db.execute('SELECT COUNT(*) FROM vocabulary').fetchone()[0]
-by_phase = db.execute('SELECT learning_phase, COUNT(*) as c FROM vocabulary GROUP BY learning_phase').fetchall()
-comps = db.execute('SELECT COUNT(*) FROM composition_history').fetchone()[0]
-print(f'Vocabulary: {total} words')
-for p, c in by_phase: print(f'  {p}: {c}')
-print(f'Compositions: {comps}')
-db.close()
-" 2>/dev/null || echo "(no vocabulary yet)"
-        ;;
-
-    telemetry)
-        # One-shot developmental telemetry snapshot
-        python3 -c "
-import json, sqlite3, time, os, urllib.request
-
-snap = {'timestamp': time.time(), 'utc': time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}
-
-# API data
-try:
-    r = urllib.request.urlopen('http://localhost:7778/health', timeout=5)
-    snap['health'] = json.loads(r.read().decode())
-except: snap['health'] = 'unavailable'
-
-try:
-    r = urllib.request.urlopen('http://localhost:7778/v4/neuromodulators', timeout=5)
-    d = json.loads(r.read().decode())
-    mods = d.get('modulators', d) if isinstance(d, dict) else {}
-    snap['neuromods'] = {n: {'level': m.get('level',0), 'setpoint': m.get('setpoint',0)} for n,m in mods.items() if isinstance(m, dict)}
-    snap['emotion'] = d.get('current_emotion', 'unknown')
-except: snap['neuromods'] = {}
-
-try:
-    r = urllib.request.urlopen('http://localhost:7778/v4/inner-trinity', timeout=5)
-    d = json.loads(r.read().decode())
-    snap['epoch'] = d.get('epoch', 0)
-    snap['ns_steps'] = d.get('ns', {}).get('total_train_steps', 0)
-    snap['dreaming'] = d.get('dreaming', {})
-except: pass
-
-# DB stats
-db_path = '${TITAN_DIR}/data/inner_memory.db'
-if os.path.exists(db_path):
-    try:
-        db = sqlite3.connect(db_path, timeout=5)
-        snap['vocabulary'] = db.execute('SELECT COUNT(*) FROM vocabulary').fetchone()[0]
-        snap['vocab_by_phase'] = dict(db.execute('SELECT learning_phase, COUNT(*) FROM vocabulary GROUP BY learning_phase').fetchall())
-        snap['compositions'] = db.execute('SELECT COUNT(*) FROM composition_history').fetchone()[0]
-        snap['comp_by_level'] = dict(db.execute('SELECT level, COUNT(*) FROM composition_history GROUP BY level').fetchall())
-        try: snap['teacher_sessions'] = db.execute('SELECT COUNT(*) FROM teacher_sessions').fetchone()[0]
-        except: snap['teacher_sessions'] = 0
-        try: snap['grammar_patterns'] = db.execute('SELECT COUNT(*) FROM grammar_patterns').fetchone()[0]
-        except: snap['grammar_patterns'] = 0
-        db.close()
-    except: pass
-
-# Log-derived stats
-try:
-    import subprocess
-    log = '${BRAIN_LOG}'
-    snap['commits'] = int(subprocess.check_output(['grep', '-ac', 'Reasoning.*COMMIT', log]).strip())
-    snap['abandons'] = int(subprocess.check_output(['grep', '-ac', 'Reasoning.*ABANDON', log]).strip())
-    snap['interpreter_fires'] = int(subprocess.check_output(['grep', '-ac', 'INTERPRET', log]).strip())
-    snap['expression_fires'] = {}
-    for comp in ['SPEAK', 'ART', 'MUSIC', 'SOCIAL', 'KIN_SENSE', 'LONGING']:
-        snap['expression_fires'][comp] = int(subprocess.check_output(['grep', '-ac', f'EXPRESSION.{comp}.*FIRED', log]).strip())
-    snap['teacher_errors'] = int(subprocess.check_output(['grep', '-ac', 'TEACHER.*error', log]).strip())
-    snap['bus_timeouts'] = int(subprocess.check_output(['grep', '-ac', 'timed out', log]).strip())
-except: pass
-
-print(json.dumps(snap, indent=2, default=str))
-" 2>/dev/null
-        ;;
-
-    *)
-        echo "Usage: $0 {status|start|stop|restart|log|log-errors|health|vocab|telemetry}"
-        ;;
-esac
+dispatch "$@"

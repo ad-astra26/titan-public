@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 import pytest
 
-from titan_plugin.logic.backup_cascade import BackupCascade
+from titan_hcl.logic.backup_cascade import BackupCascade
 
 
 @pytest.fixture

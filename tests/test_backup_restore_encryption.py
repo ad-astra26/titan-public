@@ -20,8 +20,8 @@ import tarfile
 
 import pytest
 
-from titan_plugin.logic.backup_cascade import BackupCascade
-from titan_plugin.logic.backup_crypto import (
+from titan_hcl.logic.backup_cascade import BackupCascade
+from titan_hcl.logic.backup_crypto import (
     ALGORITHM_ID,
     decrypt_from_manifest,
     derive_master_key,
@@ -50,7 +50,7 @@ def _make_tarball_bytes(payload: bytes = b"restore me") -> bytes:
 # ────────────────────────────────────────────────────────────────────────────
 
 def test_decrypt_from_manifest_roundtrip(tmp_path):
-    from titan_plugin.logic.backup_crypto import derive_backup_key, encrypt_tarball
+    from titan_hcl.logic.backup_crypto import derive_backup_key, encrypt_tarball
     kp = _fake_kp()
     master = derive_master_key(kp, TITAN_PUBKEY)
     plaintext = _make_tarball_bytes(b"restore-payload")
@@ -164,7 +164,7 @@ def test_resurrection_phase_3_decrypts_then_extracts(tmp_path, monkeypatch):
     """resurrection.py phase_3_rehydrate must decrypt the archive in-place
     before tarfile.open is attempted. Exercise with a fresh encrypted archive."""
     import scripts.resurrection as res
-    from titan_plugin.logic.backup_crypto import derive_backup_key, encrypt_tarball
+    from titan_hcl.logic.backup_crypto import derive_backup_key, encrypt_tarball
 
     kp = _fake_kp()
     master = derive_master_key(kp, TITAN_PUBKEY)
@@ -190,7 +190,7 @@ def test_resurrection_phase_3_decrypts_then_extracts(tmp_path, monkeypatch):
     os.makedirs("data", exist_ok=True)
 
     from unittest import mock
-    with mock.patch("titan_plugin.utils.crypto.encrypt_for_machine", return_value=b""):
+    with mock.patch("titan_hcl.utils.crypto.encrypt_for_machine", return_value=b""):
         # tar extract doesn't write anything we care about (payload is "restore.bin" → data/restore.bin)
         res.phase_3_rehydrate(str(archive_path), kp,
                                 encryption_manifest=manifest,

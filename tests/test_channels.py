@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from titan_plugin.channels import (
+from titan_hcl.channels import (
     forward_to_titan,
     format_response,
     get_channel_config,
@@ -38,7 +38,7 @@ class TestForwardToTitan:
             },
             request=httpx.Request("POST", "http://test/chat"),
         )
-        with patch("titan_plugin.channels.httpx.AsyncClient") as mock_cls:
+        with patch("titan_hcl.channels.httpx.AsyncClient") as mock_cls:
             mock_client = AsyncMock()
             mock_client.post.return_value = mock_response
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -62,7 +62,7 @@ class TestForwardToTitan:
             },
             request=httpx.Request("POST", "http://test/chat"),
         )
-        with patch("titan_plugin.channels.httpx.AsyncClient") as mock_cls:
+        with patch("titan_hcl.channels.httpx.AsyncClient") as mock_cls:
             mock_client = AsyncMock()
             mock_client.post.return_value = mock_response
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -82,7 +82,7 @@ class TestForwardToTitan:
             json={"error": "Titan is in Limbo state."},
             request=httpx.Request("POST", "http://test/chat"),
         )
-        with patch("titan_plugin.channels.httpx.AsyncClient") as mock_cls:
+        with patch("titan_hcl.channels.httpx.AsyncClient") as mock_cls:
             mock_client = AsyncMock()
             mock_client.post.return_value = mock_response
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -96,7 +96,7 @@ class TestForwardToTitan:
 
     @pytest.mark.asyncio
     async def test_timeout(self):
-        with patch("titan_plugin.channels.httpx.AsyncClient") as mock_cls:
+        with patch("titan_hcl.channels.httpx.AsyncClient") as mock_cls:
             mock_client = AsyncMock()
             mock_client.post.side_effect = httpx.TimeoutException("timed out")
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -110,7 +110,7 @@ class TestForwardToTitan:
 
     @pytest.mark.asyncio
     async def test_connection_error(self):
-        with patch("titan_plugin.channels.httpx.AsyncClient") as mock_cls:
+        with patch("titan_hcl.channels.httpx.AsyncClient") as mock_cls:
             mock_client = AsyncMock()
             mock_client.post.side_effect = httpx.ConnectError("refused")
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -129,7 +129,7 @@ class TestForwardToTitan:
             json={"error": "Internal server error"},
             request=httpx.Request("POST", "http://test/chat"),
         )
-        with patch("titan_plugin.channels.httpx.AsyncClient") as mock_cls:
+        with patch("titan_hcl.channels.httpx.AsyncClient") as mock_cls:
             mock_client = AsyncMock()
             mock_client.post.return_value = mock_response
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -296,7 +296,7 @@ class TestTelegramAdapter:
 
     def _make_bot(self):
         """Create a TitanTelegramBot without importing python-telegram-bot."""
-        from titan_plugin.channels.telegram import TitanTelegramBot
+        from titan_hcl.channels.telegram import TitanTelegramBot
         bot = object.__new__(TitanTelegramBot)
         bot.token = "test"
         bot.titan_url = "http://test"
@@ -320,7 +320,7 @@ class TestTelegramAdapter:
             "mood": "Curious",
         }
 
-        with patch("titan_plugin.channels.telegram.forward_to_titan", new_callable=AsyncMock) as mock_fwd:
+        with patch("titan_hcl.channels.telegram.forward_to_titan", new_callable=AsyncMock) as mock_fwd:
             mock_fwd.return_value = titan_response
             bot = self._make_bot()
             await bot.handle_message(mock_update, MagicMock())
@@ -351,7 +351,7 @@ class TestTelegramAdapter:
             "mode": "Guardian",
         }
 
-        with patch("titan_plugin.channels.telegram.forward_to_titan", new_callable=AsyncMock) as mock_fwd:
+        with patch("titan_hcl.channels.telegram.forward_to_titan", new_callable=AsyncMock) as mock_fwd:
             mock_fwd.return_value = blocked_response
             bot = self._make_bot()
             await bot.handle_message(mock_update, MagicMock())
@@ -378,7 +378,7 @@ class TestTelegramAdapter:
             "mood": "Content",
         }
 
-        with patch("titan_plugin.channels.telegram.forward_to_titan", new_callable=AsyncMock) as mock_fwd:
+        with patch("titan_hcl.channels.telegram.forward_to_titan", new_callable=AsyncMock) as mock_fwd:
             mock_fwd.return_value = titan_response
             bot = self._make_bot()
             await bot.handle_message(mock_update, MagicMock())
@@ -415,10 +415,10 @@ class TestDiscordAdapter:
             "mood": "Happy",
         }
 
-        with patch("titan_plugin.channels.discord_bot.forward_to_titan", new_callable=AsyncMock) as mock_fwd:
+        with patch("titan_hcl.channels.discord_bot.forward_to_titan", new_callable=AsyncMock) as mock_fwd:
             mock_fwd.return_value = titan_response
 
-            from titan_plugin.channels.discord_bot import TitanDiscordBot
+            from titan_hcl.channels.discord_bot import TitanDiscordBot
             bot = object.__new__(TitanDiscordBot)
             bot.titan_url = "http://test"
             bot.token = "test"
@@ -443,7 +443,7 @@ class TestSlackAdapter:
     """Test Slack message handling with mocked slack-bolt."""
 
     def _make_bot(self):
-        from titan_plugin.channels.slack_bot import TitanSlackBot
+        from titan_hcl.channels.slack_bot import TitanSlackBot
         bot = object.__new__(TitanSlackBot)
         bot.titan_url = "http://test"
         return bot
@@ -464,7 +464,7 @@ class TestSlackAdapter:
             "mood": "Focused",
         }
 
-        with patch("titan_plugin.channels.slack_bot.forward_to_titan", new_callable=AsyncMock) as mock_fwd:
+        with patch("titan_hcl.channels.slack_bot.forward_to_titan", new_callable=AsyncMock) as mock_fwd:
             mock_fwd.return_value = titan_response
             bot = self._make_bot()
             await bot._on_message(event, say)
@@ -509,7 +509,7 @@ class TestSlackAdapter:
             "mood": "Philosophical",
         }
 
-        with patch("titan_plugin.channels.slack_bot.forward_to_titan", new_callable=AsyncMock) as mock_fwd:
+        with patch("titan_hcl.channels.slack_bot.forward_to_titan", new_callable=AsyncMock) as mock_fwd:
             mock_fwd.return_value = titan_response
             bot = self._make_bot()
             await bot._on_message(event, say)
@@ -528,50 +528,50 @@ class TestStartGuards:
 
     @pytest.mark.asyncio
     async def test_telegram_start_no_lib(self):
-        with patch("titan_plugin.channels.telegram._HAS_TELEGRAM", False):
-            from titan_plugin.channels.telegram import start_telegram
+        with patch("titan_hcl.channels.telegram._HAS_TELEGRAM", False):
+            from titan_hcl.channels.telegram import start_telegram
             # Should not raise — just log and return
             await start_telegram({"bot_token": "test"})
 
     @pytest.mark.asyncio
     async def test_discord_start_no_lib(self):
-        with patch("titan_plugin.channels.discord_bot._HAS_DISCORD", False):
-            from titan_plugin.channels.discord_bot import start_discord
+        with patch("titan_hcl.channels.discord_bot._HAS_DISCORD", False):
+            from titan_hcl.channels.discord_bot import start_discord
             await start_discord({"bot_token": "test"})
 
     @pytest.mark.asyncio
     async def test_slack_start_no_lib(self):
-        with patch("titan_plugin.channels.slack_bot._HAS_SLACK", False):
-            from titan_plugin.channels.slack_bot import start_slack
+        with patch("titan_hcl.channels.slack_bot._HAS_SLACK", False):
+            from titan_hcl.channels.slack_bot import start_slack
             await start_slack({"bot_token": "test", "app_token": "test"})
 
     @pytest.mark.asyncio
     async def test_whatsapp_start_no_lib(self):
-        with patch("titan_plugin.channels.whatsapp._HAS_PYWA", False):
-            from titan_plugin.channels.whatsapp import start_whatsapp
+        with patch("titan_hcl.channels.whatsapp._HAS_PYWA", False):
+            from titan_hcl.channels.whatsapp import start_whatsapp
             await start_whatsapp({"phone_id": "123", "token": "test"})
 
     @pytest.mark.asyncio
     async def test_telegram_start_no_token(self):
-        with patch("titan_plugin.channels.telegram._HAS_TELEGRAM", True):
-            from titan_plugin.channels.telegram import start_telegram
+        with patch("titan_hcl.channels.telegram._HAS_TELEGRAM", True):
+            from titan_hcl.channels.telegram import start_telegram
             # Empty token — should skip gracefully
             await start_telegram({})
 
     @pytest.mark.asyncio
     async def test_discord_start_no_token(self):
-        with patch("titan_plugin.channels.discord_bot._HAS_DISCORD", True):
-            from titan_plugin.channels.discord_bot import start_discord
+        with patch("titan_hcl.channels.discord_bot._HAS_DISCORD", True):
+            from titan_hcl.channels.discord_bot import start_discord
             await start_discord({})
 
     @pytest.mark.asyncio
     async def test_slack_start_missing_tokens(self):
-        with patch("titan_plugin.channels.slack_bot._HAS_SLACK", True):
-            from titan_plugin.channels.slack_bot import start_slack
+        with patch("titan_hcl.channels.slack_bot._HAS_SLACK", True):
+            from titan_hcl.channels.slack_bot import start_slack
             await start_slack({"bot_token": "yes"})  # missing app_token
 
     @pytest.mark.asyncio
     async def test_whatsapp_start_missing_creds(self):
-        with patch("titan_plugin.channels.whatsapp._HAS_PYWA", True):
-            from titan_plugin.channels.whatsapp import start_whatsapp
+        with patch("titan_hcl.channels.whatsapp._HAS_PYWA", True):
+            from titan_hcl.channels.whatsapp import start_whatsapp
             await start_whatsapp({})  # missing phone_id and token

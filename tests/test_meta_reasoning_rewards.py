@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from titan_plugin.logic.meta_reasoning_rewards import (
+from titan_hcl.logic.meta_reasoning_rewards import (
     PRIMITIVE_REWARD_HELPERS,
     compute_primitive_reward,
     empty_subsystem_signals,

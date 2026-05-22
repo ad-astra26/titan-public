@@ -34,8 +34,8 @@ from queue import Queue as ThreadQueue
 from unittest.mock import AsyncMock, MagicMock
 
 
-from titan_plugin import bus
-from titan_plugin.api.chat_bridge_client import ChatBridgeClient
+from titan_hcl import bus
+from titan_hcl.api.chat_bridge_client import ChatBridgeClient
 
 
 class TestChatBridgeClientInterface(unittest.TestCase):
@@ -287,21 +287,21 @@ class TestParentChatHandlerLoop(unittest.TestCase):
     a small smoke test of dispatch logic."""
 
     def test_chat_handler_loop_method_exists(self):
-        from titan_plugin.core.plugin import TitanPlugin
-        self.assertTrue(hasattr(TitanPlugin, "_chat_handler_loop"))
-        self.assertTrue(asyncio.iscoroutinefunction(TitanPlugin._chat_handler_loop))
+        from titan_hcl.core.plugin import TitanHCL
+        self.assertTrue(hasattr(TitanHCL, "_chat_handler_loop"))
+        self.assertTrue(asyncio.iscoroutinefunction(TitanHCL._chat_handler_loop))
 
     def test_handle_chat_request_method_exists(self):
-        from titan_plugin.core.plugin import TitanPlugin
-        self.assertTrue(hasattr(TitanPlugin, "_handle_chat_request"))
-        self.assertTrue(asyncio.iscoroutinefunction(TitanPlugin._handle_chat_request))
+        from titan_hcl.core.plugin import TitanHCL
+        self.assertTrue(hasattr(TitanHCL, "_handle_chat_request"))
+        self.assertTrue(asyncio.iscoroutinefunction(TitanHCL._handle_chat_request))
 
     def test_chat_handler_loop_filters_by_action(self):
         """Source-inspection: the loop filters msg.type==QUERY AND
         payload.action=="chat" — so non-chat traffic on this queue is
         silently ignored."""
-        from titan_plugin.core.plugin import TitanPlugin
-        src = inspect.getsource(TitanPlugin._chat_handler_loop)
+        from titan_hcl.core.plugin import TitanHCL
+        src = inspect.getsource(TitanHCL._chat_handler_loop)
         self.assertIn('bus.QUERY', src)
         self.assertIn('"action") != "chat"', src)
         self.assertIn('"chat_handler"', src)
@@ -309,8 +309,8 @@ class TestParentChatHandlerLoop(unittest.TestCase):
     def test_handle_chat_request_publishes_response_rid_routed(self):
         """Source-inspection: _handle_chat_request publishes
         type=bus.RESPONSE with src='chat_handler' and dst=msg.src."""
-        from titan_plugin.core.plugin import TitanPlugin
-        src = inspect.getsource(TitanPlugin._handle_chat_request)
+        from titan_hcl.core.plugin import TitanHCL
+        src = inspect.getsource(TitanHCL._handle_chat_request)
         self.assertIn("bus.RESPONSE", src)
         self.assertIn('"chat_handler"', src)
         self.assertIn("self.bus.publish", src)
@@ -319,21 +319,21 @@ class TestParentChatHandlerLoop(unittest.TestCase):
 
 
 class TestRunChatInterface(unittest.TestCase):
-    """Layer: TitanPlugin.run_chat exists, async, has the documented
+    """Layer: TitanHCL.run_chat exists, async, has the documented
     contract (returns dict with status_code/body/extra_headers)."""
 
     def test_run_chat_method_exists(self):
-        from titan_plugin.core.plugin import TitanPlugin
-        self.assertTrue(hasattr(TitanPlugin, "run_chat"))
-        self.assertTrue(asyncio.iscoroutinefunction(TitanPlugin.run_chat))
+        from titan_hcl.core.plugin import TitanHCL
+        self.assertTrue(hasattr(TitanHCL, "run_chat"))
+        self.assertTrue(asyncio.iscoroutinefunction(TitanHCL.run_chat))
 
     def _build_plugin_stub(self, agent=None, limbo=False):
-        """Build a TitanPlugin instance with no kernel boot — bypassing
+        """Build a TitanHCL instance with no kernel boot — bypassing
         __init__ avoids loading the entire microkernel for these guard-
         rail tests. _limbo_mode is a @property reading kernel.limbo_mode,
         so we attach a tiny mock kernel."""
-        from titan_plugin.core.plugin import TitanPlugin
-        plugin = TitanPlugin.__new__(TitanPlugin)
+        from titan_hcl.core.plugin import TitanHCL
+        plugin = TitanHCL.__new__(TitanHCL)
         plugin._agent = agent
         # Attach a fake kernel exposing limbo_mode (the real attribute the
         # _limbo_mode property reads).
@@ -385,7 +385,7 @@ class TestCreateAppExposesChatBridgeBus(unittest.TestCase):
     app.state — the contract chat.py Mode 2 depends on."""
 
     def test_create_app_signature_includes_chat_bridge_bus(self):
-        from titan_plugin.api import create_app
+        from titan_hcl.api import create_app
         sig = inspect.signature(create_app)
         self.assertIn("chat_bridge_bus", sig.parameters)
         self.assertIsNone(sig.parameters["chat_bridge_bus"].default)
@@ -394,7 +394,7 @@ class TestCreateAppExposesChatBridgeBus(unittest.TestCase):
         """Source-inspection — runtime asserting requires booting the
         plugin which is heavy. Source-inspection is consistent with
         test_a8_thread_count.py pattern."""
-        from titan_plugin.api import create_app as ca_mod
+        from titan_hcl.api import create_app as ca_mod
         src = inspect.getsource(ca_mod)
         self.assertIn("app.state.chat_bridge_bus = chat_bridge_bus", src)
 

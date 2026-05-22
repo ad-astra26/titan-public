@@ -33,6 +33,8 @@ parking_lot.workspace = true
 hex.workspace = true
 once_cell.workspace = true
 rmpv.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

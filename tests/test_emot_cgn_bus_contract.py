@@ -7,7 +7,7 @@ BEFORE any producer/consumer code uses them. Protects against future
 silent refactors + sets the contract for Phase 1.6e worker subscribers.
 """
 import pytest
-from titan_plugin.bus import (
+from titan_hcl.bus import (
     EMOT_CHAIN_EVIDENCE,
     EMOT_CGN_SIGNAL,
     FELT_CLUSTER_UPDATE,

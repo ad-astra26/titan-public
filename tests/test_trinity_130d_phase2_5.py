@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from titan_plugin.api.dim_registry import (
+from titan_hcl.api.dim_registry import (
     DimFiringRecord,
     DimFiringTracker,
     BlockFiringRecord,
@@ -183,20 +183,40 @@ class TestPhase25AEndpoint:
 
     def setup_method(self):
         reset_firing_tracker()
+        # SHM-read isolation: dashboard endpoint at line 4387 prefers
+        # `read_all_blocks_from_shm()` over in-process tracker. Without
+        # this, the test reads /dev/shm/titan_T1/*_firing.bin from a
+        # running T1 (or stale slots from prior runs) and fails with
+        # leaked values instead of the [0.1]*5 the test records.
+        # Monkey-patch the dim_registry module-level function so the
+        # dashboard's per-call `from ... import` re-binds to the stub.
+        # Restored in teardown_method so the SHMRoundtrip class below
+        # (which legitimately exercises the real SHM path) is unaffected.
+        from titan_hcl.api import dim_registry as _dr
+        _dr._SHM_READERS.clear()
+        self._orig_read_shm = _dr.read_all_blocks_from_shm
+        _dr.read_all_blocks_from_shm = lambda: {}
+
+    def teardown_method(self):
+        try:
+            from titan_hcl.api import dim_registry as _dr
+            _dr.read_all_blocks_from_shm = self._orig_read_shm
+        except Exception:
+            pass
 
     def test_endpoint_route_registered(self):
         # Verify the route is registered on the dashboard router. Avoids
         # spinning up a full FastAPI TestClient (heavy import chain).
-        from titan_plugin.api.dashboard import router as dashboard_router
-        paths = [r.path for r in dashboard_router.routes]
-        assert "/v4/debug/dim-sources" in paths, (
-            "/v4/debug/dim-sources route not registered on dashboard router"
+        from titan_hcl.api.v6 import router as v6_router
+        paths = [r.path for r in v6_router.routes]
+        assert "/v6/system/debug/dim-sources" in paths, (
+            "/v6/system/debug/dim-sources route not registered on v6 router"
         )
 
     def test_endpoint_handler_returns_all_130_dims_when_no_filter(self):
         # Direct handler invocation (no HTTP layer) — fast.
         import asyncio
-        from titan_plugin.api.dashboard import get_v4_debug_dim_sources
+        from titan_hcl.api.dashboard import get_v4_debug_dim_sources
 
         # Fire some tensors so the tracker has data
         t = get_firing_tracker()
@@ -223,7 +243,7 @@ class TestPhase25AEndpoint:
 
     def test_endpoint_handler_filters_by_dim(self):
         import asyncio
-        from titan_plugin.api.dashboard import get_v4_debug_dim_sources
+        from titan_hcl.api.dashboard import get_v4_debug_dim_sources
         t = get_firing_tracker()
         t.record_block("outer_spirit", [0.5] * 45, {})
 
@@ -244,7 +264,7 @@ class TestPhase25AEndpoint:
 
     def test_endpoint_handler_invalid_dim_filter_returns_error(self):
         import asyncio
-        from titan_plugin.api.dashboard import get_v4_debug_dim_sources
+        from titan_hcl.api.dashboard import get_v4_debug_dim_sources
 
         class _DummyRequest:
             pass
@@ -257,7 +277,7 @@ class TestPhase25AEndpoint:
 
     def test_endpoint_payload_includes_inputs_and_block_metadata(self):
         import asyncio
-        from titan_plugin.api.dashboard import get_v4_debug_dim_sources
+        from titan_hcl.api.dashboard import get_v4_debug_dim_sources
         t = get_firing_tracker()
         t.record_block(
             "inner_mind",
@@ -295,7 +315,7 @@ class TestPhase25ATensorWiring:
         reset_firing_tracker()
 
     def test_collect_mind_15d_records_block(self):
-        from titan_plugin.logic.mind_tensor import collect_mind_15d
+        from titan_hcl.logic.mind_tensor import collect_mind_15d
         result = collect_mind_15d(
             current_5d=[0.5, 0.5, 0.5, 0.5, 0.5],
             audio_state={"creates_recent": 2, "ambient": 0.3},
@@ -313,7 +333,7 @@ class TestPhase25ATensorWiring:
         assert br.last_inputs_state["audio_state"] == "real"
 
     def test_collect_outer_body_5d_records_block(self):
-        from titan_plugin.logic.outer_body_tensor import collect_outer_body_5d
+        from titan_hcl.logic.outer_body_tensor import collect_outer_body_5d
         result = collect_outer_body_5d(sources={
             "anchor_state": {"success": True, "last_anchor_time": time.time()},
             "block_delta_stats": {"normalized": 0.5},
@@ -331,7 +351,7 @@ class TestPhase25ATensorWiring:
 
     def test_tensor_wiring_does_not_break_on_tracker_failure(self):
         """If the tracker raises, the tensor function must still return."""
-        from titan_plugin.logic.mind_tensor import collect_mind_15d
+        from titan_hcl.logic.mind_tensor import collect_mind_15d
         # Don't reset; leave singleton in valid state. The exception path
         # is exercised by the try/except in the tensor wrapper. We just
         # confirm the function still returns a 15-element list under
@@ -349,7 +369,12 @@ class TestPhase25ATensorWiring:
 
 class TestPhase25BFourStateClassifier:
     """rFP_trinity_130d_phase2_5_closure §3.1 — five-state classifier
-    (ALIVE / ALIVE_AT_DEFAULT / PARTIAL / SILENT / GHOST + CORRUPTED)."""
+    (ALIVE / PARTIAL / SILENT / CORRUPTED / GHOST).
+
+    Maker directive 2026-05-12: ALIVE_AT_DEFAULT collapsed into PARTIAL.
+    A dim firing the SPEC default sentinel = no real signal = PARTIAL,
+    regardless of input-state reporting. Strict-gate acceptance is now
+    ALIVE-only (no @def credit)."""
 
     def _record(self, **overrides):
         # Sensible default record; tests override specific fields.
@@ -375,16 +400,20 @@ class TestPhase25BFourStateClassifier:
         rec = self._record(last_value=0.8, spec_default=0.5)
         assert _dim_live_classify_v2(rec) == "ALIVE"
 
-    def test_alive_at_default_when_within_epsilon_and_firing(self):
+    def test_partial_when_within_epsilon_and_firing(self):
+        # Maker directive 2026-05-12: was ALIVE_AT_DEFAULT, now PARTIAL.
         from scripts.arch_map import _dim_live_classify_v2
         rec = self._record(
             last_value=0.501, spec_default=0.5,
             seconds_since_last_write=10.0,
             inputs=[{"name": "body_state", "state": "real"}],
         )
-        assert _dim_live_classify_v2(rec) == "ALIVE_AT_DEFAULT"
+        assert _dim_live_classify_v2(rec) == "PARTIAL"
 
     def test_partial_when_at_default_and_input_absent(self):
+        # Was PARTIAL pre-collapse and is still PARTIAL — semantics
+        # subsumed: any dim firing the default sentinel is PARTIAL,
+        # regardless of input-state reporting.
         from scripts.arch_map import _dim_live_classify_v2
         rec = self._record(
             last_value=0.5, spec_default=0.5,
@@ -450,21 +479,22 @@ class TestPhase25BFourStateClassifier:
         )
         assert _dim_live_classify_v2(rec) == "ALIVE"
 
-    def test_zero_default_with_value_zero_and_firing_is_at_default(self):
+    def test_zero_default_with_value_zero_and_firing_is_partial(self):
         # Cold-start of community_connection: value=0.0 (matches default),
-        # producer firing, all inputs real → ALIVE_AT_DEFAULT.
+        # producer firing, all inputs real → PARTIAL (was ALIVE_AT_DEFAULT
+        # pre Maker directive 2026-05-12; collapsed because firing the
+        # default sentinel = no real signal = partial coverage).
         from scripts.arch_map import _dim_live_classify_v2
         rec = self._record(
             spec_default=0.0, last_value=0.0,
             seconds_since_last_write=5.0,
             inputs=[{"name": "social_x_gateway_stats", "state": "real"}],
         )
-        assert _dim_live_classify_v2(rec) == "ALIVE_AT_DEFAULT"
+        assert _dim_live_classify_v2(rec) == "PARTIAL"
 
     def test_state_marker_returns_unicode(self):
         from scripts.arch_map import _dim_live_state_marker
         assert _dim_live_state_marker("ALIVE") == "✓"
-        assert _dim_live_state_marker("ALIVE_AT_DEFAULT") == "○"
         assert _dim_live_state_marker("PARTIAL") == "◑"
         assert _dim_live_state_marker("SILENT") == "·"
         assert _dim_live_state_marker("CORRUPTED") == "✗"
@@ -485,7 +515,7 @@ class TestPhase25CCreativeTensionFormula:
     def _outer_spirit_45d_with_inputs(
             self, hormone_levels=None, history=None,
             **kwargs) -> list:
-        from titan_plugin.logic.outer_spirit_tensor import collect_outer_spirit_45d
+        from titan_hcl.logic.outer_spirit_tensor import collect_outer_spirit_45d
         return collect_outer_spirit_45d(
             current_5d=[0.5] * 5,
             outer_body=[0.5] * 5,
@@ -610,7 +640,7 @@ class TestPhase25ESocialXGatewayPerTitan:
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
     def test_titan_id_filter_t1(self):
-        from titan_plugin.logic.social_x_gateway import SocialXGateway
+        from titan_hcl.logic.social_x_gateway import SocialXGateway
         sxg = SocialXGateway.__new__(SocialXGateway)  # bypass __init__
         sxg._db_path = self._db_path
         stats = sxg.get_community_engagement_stats(
@@ -620,7 +650,7 @@ class TestPhase25ESocialXGatewayPerTitan:
         assert stats["gateway_role"] == "canonical"
 
     def test_titan_id_filter_t2(self):
-        from titan_plugin.logic.social_x_gateway import SocialXGateway
+        from titan_hcl.logic.social_x_gateway import SocialXGateway
         sxg = SocialXGateway.__new__(SocialXGateway)
         sxg._db_path = self._db_path
         stats = sxg.get_community_engagement_stats(
@@ -629,9 +659,9 @@ class TestPhase25ESocialXGatewayPerTitan:
 
     def test_titan_id_filter_t3_returns_zero(self):
         # T3 has no mentions in this DB — distinct_handles_24h must be 0.
-        # This is "ALIVE_AT_DEFAULT" semantically (real producer, no signal),
-        # NOT silent-by-design.
-        from titan_plugin.logic.social_x_gateway import SocialXGateway
+        # This is "PARTIAL" semantically (real producer, no signal),
+        # NOT silent-by-design. (Pre-2026-05-12 was "ALIVE_AT_DEFAULT".)
+        from titan_hcl.logic.social_x_gateway import SocialXGateway
         sxg = SocialXGateway.__new__(SocialXGateway)
         sxg._db_path = self._db_path
         stats = sxg.get_community_engagement_stats(
@@ -640,7 +670,7 @@ class TestPhase25ESocialXGatewayPerTitan:
 
     def test_signature_includes_titan_id_default_t1(self):
         # Back-compat: pre-Phase-2.5 callers without titan_id default to T1
-        from titan_plugin.logic.social_x_gateway import SocialXGateway
+        from titan_hcl.logic.social_x_gateway import SocialXGateway
         sxg = SocialXGateway.__new__(SocialXGateway)
         sxg._db_path = self._db_path
         stats = sxg.get_community_engagement_stats(is_x_gateway=True)
@@ -652,10 +682,10 @@ class TestPhase25EDashboardEndpoint:
     """Verify /v4/community-engagement-stats endpoint route registration."""
 
     def test_endpoint_route_registered(self):
-        from titan_plugin.api.dashboard import router as dashboard_router
-        paths = [r.path for r in dashboard_router.routes]
-        assert "/v4/community-engagement-stats" in paths, (
-            "Phase 2.5.E /v4/community-engagement-stats not registered")
+        from titan_hcl.api.v6 import router as v6_router
+        paths = [r.path for r in v6_router.routes]
+        assert "/v6/social/community-engagement-stats" in paths, (
+            "Phase 2.5.E /v6/social/community-engagement-stats not registered")
 
 
 # ── Chunk 2.5.A.2: SHM cross-process roundtrip ────────────────────────
@@ -677,7 +707,7 @@ class TestPhase25A2SHMRoundtrip:
         os.environ["TITAN_ID"] = "TEST"
         os.environ["TITAN_SHM_ROOT"] = self._tmp_root
         # Clear any cached module-level reader state
-        from titan_plugin.api import dim_registry as _dr
+        from titan_hcl.api import dim_registry as _dr
         _dr._SHM_READERS.clear()
 
     def teardown_method(self):
@@ -686,7 +716,7 @@ class TestPhase25A2SHMRoundtrip:
         os.environ.pop("TITAN_SHM_ROOT", None)
         shutil.rmtree(self._tmp_root, ignore_errors=True)
         # Clear cached readers so next test gets fresh SHM state
-        from titan_plugin.api import dim_registry as _dr
+        from titan_hcl.api import dim_registry as _dr
         _dr._SHM_READERS.clear()
         reset_firing_tracker()
 
@@ -694,7 +724,7 @@ class TestPhase25A2SHMRoundtrip:
         # Skip if test env can't init shm (e.g. missing TITAN_SHM_ROOT
         # support — don't fail the suite for environment reasons).
         try:
-            from titan_plugin.core.state_registry import (
+            from titan_hcl.core.state_registry import (
                 ensure_shm_root, resolve_titan_id,
             )
             shm_root = ensure_shm_root(resolve_titan_id())
@@ -710,7 +740,7 @@ class TestPhase25A2SHMRoundtrip:
         # SHM write should have happened
         assert t._shm_writes_total >= 1, (
             f"expected SHM write; failures={t._shm_write_failures}")
-        from titan_plugin.api.dim_registry import read_all_blocks_from_shm
+        from titan_hcl.api.dim_registry import read_all_blocks_from_shm
         blocks = read_all_blocks_from_shm()
         assert "inner_body" in blocks, (
             f"inner_body slot not readable; got blocks={list(blocks.keys())}")
@@ -723,7 +753,7 @@ class TestPhase25A2SHMRoundtrip:
 
     def test_endpoint_uses_shm_source_marker_when_available(self):
         try:
-            from titan_plugin.core.state_registry import (
+            from titan_hcl.core.state_registry import (
                 ensure_shm_root, resolve_titan_id,
             )
             ensure_shm_root(resolve_titan_id())
@@ -738,7 +768,7 @@ class TestPhase25A2SHMRoundtrip:
         )
         # Call the endpoint
         import asyncio
-        from titan_plugin.api.dashboard import get_v4_debug_dim_sources
+        from titan_hcl.api.dashboard import get_v4_debug_dim_sources
 
         class _DummyRequest:
             pass
@@ -756,7 +786,7 @@ class TestPhase25A2SHMRoundtrip:
 
     def test_block_input_classification_round_trips_through_shm(self):
         try:
-            from titan_plugin.core.state_registry import (
+            from titan_hcl.core.state_registry import (
                 ensure_shm_root, resolve_titan_id,
             )
             ensure_shm_root(resolve_titan_id())
@@ -772,7 +802,7 @@ class TestPhase25A2SHMRoundtrip:
                 "interaction_quality": 0.5,  # default
             },
         )
-        from titan_plugin.api.dim_registry import read_all_blocks_from_shm
+        from titan_hcl.api.dim_registry import read_all_blocks_from_shm
         blocks = read_all_blocks_from_shm()
         assert "inner_mind" in blocks
         states = blocks["inner_mind"]["inputs_state"]

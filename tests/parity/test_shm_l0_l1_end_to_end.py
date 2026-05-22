@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from titan_plugin.core.state_registry import (
+from titan_hcl.core.state_registry import (
     BUFFER_COUNT,
     BUFFER_META_SIZE,
     BUFFER_META_STRUCT,
@@ -177,7 +177,7 @@ def test_byte_exact_publish_for_canonical_payload(tmp_path, monkeypatch):
     )
     payload_bytes = struct.pack("<4f", 1.0, 2.0, 3.0, 4.0)
 
-    monkeypatch.setattr("titan_plugin.core.state_registry.time", _FixedTime(fixed_wall_ns))
+    monkeypatch.setattr("titan_hcl.core.state_registry.time", _FixedTime(fixed_wall_ns))
 
     w = StateRegistryWriter(spec, tmp_path)
     # __init__ already published zeros at idx=0 with fixed_wall_ns.
@@ -262,7 +262,7 @@ def test_rust_test_binary_writes_slots_python_reads(tmp_path, monkeypatch):
 def test_python_constants_match_rust_constants():
     """Python `_phase_c_constants.py` (auto-generated) must hold identical
     numeric values to Rust `constants.rs` for all SHM domain constants."""
-    py_constants = (REPO_ROOT / "titan_plugin" / "_phase_c_constants.py").read_text()
+    py_constants = (REPO_ROOT / "titan_hcl" / "_phase_c_constants.py").read_text()
     rs_constants = (
         REPO_ROOT / "titan-rust" / "crates" / "titan-core" / "src" / "constants.rs"
     ).read_text()

@@ -66,7 +66,7 @@ pub enum Catalog {
 }
 
 /// One bus message specification. Every `SPECS` entry is byte-identical to
-/// the corresponding `MSG_SPECS` entry in `titan_plugin/bus_specs.py` — see
+/// the corresponding `MSG_SPECS` entry in `titan_hcl/bus_specs.py` — see
 /// SPEC §8.10 byte-identical guarantee + C2-7 Python catalog refactor.
 #[derive(Debug, Clone, Copy)]
 pub struct BusMsgSpec {
@@ -84,6 +84,10 @@ pub struct BusMsgSpec {
 
 // Coalesce-key tuples need to be `'static` slices for use in `phf_map!`.
 const COALESCE_SRC_TYPE: &[&str] = &["src", "type"];
+const COALESCE_TITAN_ID: &[&str] = &["titan_id"];
+const COALESCE_FEATURE: &[&str] = &["feature"];
+const COALESCE_TYPE: &[&str] = &["type"];
+const COALESCE_REQUEST_ID: &[&str] = &["request_id"];
 
 /// Canonical SPEC §8 message catalog. Full list of all messages the Phase C
 /// bus broker recognizes — 47 canonical + 5 legacy drift-bridge.
@@ -288,6 +292,44 @@ pub static SPECS: phf::Map<&'static str, BusMsgSpec> = phf_map! {
         ttl_ms: None, catalog: Catalog::Observatory,
     },
 
+    // ── §8.9 Phase C-S9 social_worker (12 NEW types, all P3 social tier) ──
+    // PLAN_microkernel_phase_c_s9_social_worker_extraction §11.2.
+    // Mirrored byte-identical from titan_hcl/bus_specs.py per parity rule
+    // (feedback_function_parity_vs_contract_parity).
+    "KIN_SIGNAL" => BusMsgSpec {
+        name: "KIN_SIGNAL", priority: Priority::P3, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "SOCIAL_RECEIVED" => BusMsgSpec {
+        name: "SOCIAL_RECEIVED", priority: Priority::P3, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    // ONE generic catalyst event — type in payload (see bus.py comment).
+    "SOCIAL_CATALYST" => BusMsgSpec {
+        name: "SOCIAL_CATALYST", priority: Priority::P3, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "X_POST_PUBLISHED" => BusMsgSpec {
+        name: "X_POST_PUBLISHED", priority: Priority::P3, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "SOCIAL_GRAPH_UPDATE" => BusMsgSpec {
+        name: "SOCIAL_GRAPH_UPDATE", priority: Priority::P3, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "MENTION_RECEIVED" => BusMsgSpec {
+        name: "MENTION_RECEIVED", priority: Priority::P3, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "FELT_EXPERIENCE_CAPTURED" => BusMsgSpec {
+        name: "FELT_EXPERIENCE_CAPTURED", priority: Priority::P3, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "ENGAGEMENT_SNAPSHOT_TAKEN" => BusMsgSpec {
+        name: "ENGAGEMENT_SNAPSHOT_TAKEN", priority: Priority::P3, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+
     // ── §8.8 Drift bridges (D13/D14/D15) — DELETED in C-S8 ──
     // Legacy names share the same priority/catalog as canonical so subscribers
     // listening on either name see consistent broker behavior. The `titan-bus`
@@ -312,6 +354,113 @@ pub static SPECS: phf::Map<&'static str, BusMsgSpec> = phf_map! {
         name: "EPOCH_TICK", priority: Priority::P0, coalesce_by: None,
         ttl_ms: None, catalog: Catalog::KernelSupervision,
     },
+
+    // ── §8.7+ Observatory / worker-lifecycle additions (Phase C carves 2026-05-13 → 2026-05-16) ──
+    // Backported to Rust 2026-05-16 (v1.9.5 / D-SPEC-64) — Python MSG_SPECS
+    // had these registered since the corresponding §4.X worker carves, but
+    // the Rust phf_map was missing them, causing the broker to fall back to
+    // DEFAULT_SPEC (P2, no coalesce) — silent drift detected by
+    // `tests/test_phase_c_s7_l0_rust_gating.py::test_every_python_msg_spec_has_rust_counterpart`.
+    "ADVISOR_REFRACTORY_STATE" => BusMsgSpec {
+        name: "ADVISOR_REFRACTORY_STATE", priority: Priority::P1, coalesce_by: Some(COALESCE_TITAN_ID),
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "CODING_EXPLORER_STATS_UPDATED" => BusMsgSpec {
+        name: "CODING_EXPLORER_STATS_UPDATED", priority: Priority::P2, coalesce_by: Some(COALESCE_TITAN_ID),
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "CODING_INSIGHT" => BusMsgSpec {
+        name: "CODING_INSIGHT", priority: Priority::P2, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "GATE_DECISION_RECORDED" => BusMsgSpec {
+        name: "GATE_DECISION_RECORDED", priority: Priority::P3, coalesce_by: Some(COALESCE_FEATURE),
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "KIN_SIGNATURE_UPDATED" => BusMsgSpec {
+        name: "KIN_SIGNATURE_UPDATED", priority: Priority::P2, coalesce_by: Some(COALESCE_TITAN_ID),
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "KIN_SOCIETY_UPDATED" => BusMsgSpec {
+        name: "KIN_SOCIETY_UPDATED", priority: Priority::P2, coalesce_by: Some(COALESCE_TITAN_ID),
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "MEMORY_INGEST_COMPLETED" => BusMsgSpec {
+        name: "MEMORY_INGEST_COMPLETED", priority: Priority::P2, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "MEMORY_INGEST_REQUEST" => BusMsgSpec {
+        name: "MEMORY_INGEST_REQUEST", priority: Priority::P2, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "METABOLIC_STATS_UPDATED" => BusMsgSpec {
+        name: "METABOLIC_STATS_UPDATED", priority: Priority::P3, coalesce_by: Some(COALESCE_TYPE),
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "METABOLIC_TIER_CHANGED" => BusMsgSpec {
+        name: "METABOLIC_TIER_CHANGED", priority: Priority::P1, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "OUTER_INTERFACE_STATS_UPDATED" => BusMsgSpec {
+        name: "OUTER_INTERFACE_STATS_UPDATED", priority: Priority::P2, coalesce_by: Some(COALESCE_TITAN_ID),
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "PREDICTION_GENERATED" => BusMsgSpec {
+        name: "PREDICTION_GENERATED", priority: Priority::P2, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "PREDICTION_STATS_UPDATED" => BusMsgSpec {
+        name: "PREDICTION_STATS_UPDATED", priority: Priority::P2, coalesce_by: Some(COALESCE_TITAN_ID),
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "SELF_REASONING_INSIGHT" => BusMsgSpec {
+        name: "SELF_REASONING_INSIGHT", priority: Priority::P2, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "SELF_REFLECTION_STATS_UPDATED" => BusMsgSpec {
+        name: "SELF_REFLECTION_STATS_UPDATED", priority: Priority::P2, coalesce_by: Some(COALESCE_TITAN_ID),
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "SOCIAL_DONATION_RECORDED" => BusMsgSpec {
+        name: "SOCIAL_DONATION_RECORDED", priority: Priority::P3, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "SOCIAL_GRAPH_READY" => BusMsgSpec {
+        name: "SOCIAL_GRAPH_READY", priority: Priority::P1, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::KernelSupervision,
+    },
+    "SOCIAL_GRAPH_STATS_UPDATED" => BusMsgSpec {
+        name: "SOCIAL_GRAPH_STATS_UPDATED", priority: Priority::P3, coalesce_by: Some(COALESCE_TYPE),
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "SOCIAL_INSPIRATION_RECORDED" => BusMsgSpec {
+        name: "SOCIAL_INSPIRATION_RECORDED", priority: Priority::P3, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "SOCIAL_INTERACTION_RECORDED" => BusMsgSpec {
+        name: "SOCIAL_INTERACTION_RECORDED", priority: Priority::P3, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "SPEAK_REQUEST_PENDING" => BusMsgSpec {
+        name: "SPEAK_REQUEST_PENDING", priority: Priority::P2, coalesce_by: Some(COALESCE_REQUEST_ID),
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "STUDIO_RENDER_COMPLETED" => BusMsgSpec {
+        name: "STUDIO_RENDER_COMPLETED", priority: Priority::P3, coalesce_by: Some(COALESCE_REQUEST_ID),
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "STUDIO_RENDER_REQUEST" => BusMsgSpec {
+        name: "STUDIO_RENDER_REQUEST", priority: Priority::P3, coalesce_by: Some(COALESCE_REQUEST_ID),
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
+    "STUDIO_WORKER_READY" => BusMsgSpec {
+        name: "STUDIO_WORKER_READY", priority: Priority::P1, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::KernelSupervision,
+    },
+    "WORD_PERTURBATION_HINT" => BusMsgSpec {
+        name: "WORD_PERTURBATION_HINT", priority: Priority::P2, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::Observatory,
+    },
 };
 
 /// Total spec count expected at SPEC v0.1.0.
@@ -319,13 +468,27 @@ pub static SPECS: phf::Map<&'static str, BusMsgSpec> = phf_map! {
 /// 45 canonical entries (17 §8.1 + 6 §8.2 + 7 §8.3 + 2 §8.4 + 5 §8.5 +
 /// 7 §8.6 + 1 §8.7) plus 5 legacy drift-bridge entries (`BUS_HANDOFF`,
 /// `BUS_HANDOFF_CANCELED`, `BUS_WORKER_ADOPT_REQUEST`, `BUS_WORKER_ADOPT_ACK`,
-/// `EPOCH_TICK`) = 50 total. Used by `tests/parity_vectors.rs::bus_specs_*`
-/// for regression coverage.
+/// `EPOCH_TICK`) = 50 baseline. Phase C-S9 chunk 9D (2026-05-12) added 8
+/// social events (KIN_SIGNAL, SOCIAL_RECEIVED, SOCIAL_CATALYST,
+/// X_POST_PUBLISHED, SOCIAL_GRAPH_UPDATE, MENTION_RECEIVED,
+/// FELT_EXPERIENCE_CAPTURED, ENGAGEMENT_SNAPSHOT_TAKEN) → 58 total. Used by
+/// `tests/parity_vectors.rs::bus_specs_*` for regression coverage.
 ///
 /// Phase C C-S7 Gap 10 (2026-05-05): added BUS_PEER_DIED to §8.2 after
 /// Python↔Rust parity test caught the drift. See
 /// PLAN_microkernel_phase_c_s7_activation_prep.md §2 Gap 10.
-pub const SPECS_COUNT_V0_1_0: usize = 45 + 5;
+///
+/// v1.9.5 / D-SPEC-64 (2026-05-16): backported 25 Phase C worker-lifecycle +
+/// observatory message types that were registered in Python `MSG_SPECS`
+/// since the §4.D / §4.J / §4.K / §4.L / §4.P / §4.E / §4.B / §4.H worker
+/// carves shipped, but were missing from the Rust phf_map. The Rust broker
+/// previously fell back to `DEFAULT_SPEC` (P2, no coalesce) for these
+/// → silent priority + coalesce drift fleet-wide. Categories: 5 STUDIO/
+/// METABOLIC/STATE_UPDATED P1-P3, 8 SOCIAL_GRAPH/DONATION/INSPIRATION/
+/// INTERACTION events, 4 KIN/CODING/PREDICTION/SELF_REASONING insights, 2
+/// MEMORY_INGEST_REQUEST/COMPLETED P2 (D-SPEC-46 event protocol), 2
+/// SOCIAL_GRAPH_READY/STUDIO_WORKER_READY P1 lifecycle, 4 misc. 58 + 25 = 83.
+pub const SPECS_COUNT_V0_1_0: usize = 45 + 5 + 8 + 25;
 
 /// Default spec for any message type not explicitly listed (per Python
 /// `bus_specs.DEFAULT_SPEC`). Canonical name `<default>`, priority P2,

@@ -22,7 +22,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from titan_plugin.logic.neuromodulator import (
+from titan_hcl.logic.neuromodulator import (
     CLEARANCE_RATES, COUPLING_MATRIX, METABOLIC_COSTS,
     Neuromodulator, NEUROMOD_PRESSURE_RATE,
     compute_emergent_inputs, apply_movement_excess_clearance,
@@ -82,7 +82,7 @@ def load_dna():
         import tomllib
     except ImportError:
         import tomli as tomllib
-    with open("titan_plugin/titan_params.toml", "rb") as f:
+    with open("titan_hcl/titan_params.toml", "rb") as f:
         config = tomllib.load(f)
     return config.get("neuromodulator_dna", {})
 

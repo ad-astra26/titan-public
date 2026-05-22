@@ -23,9 +23,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from titan_plugin import bus
-from titan_plugin.core import shadow_protocol as sp
-from titan_plugin.guardian import Guardian, ModuleSpec
+from titan_hcl import bus
+from titan_hcl.core import shadow_protocol as sp
+from titan_hcl.guardian import Guardian, ModuleSpec
 
 
 def _noop_entry(*args, **kwargs):  # pragma: no cover
@@ -196,7 +196,7 @@ def test_lock_polling_removed_from_phase_shadow_boot():
     handles even after fast_kill).
     """
     import inspect
-    from titan_plugin.core import shadow_orchestrator as so
+    from titan_hcl.core import shadow_orchestrator as so
     src = inspect.getsource(so._phase_shadow_boot)
     # The lock_polling.poll_locks_released call must be GONE.
     assert "lock_polling.poll_locks_released" not in src, (
@@ -215,7 +215,7 @@ def test_lock_polling_removed_from_phase_shadow_boot():
 def test_phase_hibernate_uses_pause():
     """_phase_hibernate must call guardian.pause(), NOT stop_all (the slow path)."""
     import inspect
-    from titan_plugin.core import shadow_orchestrator as so
+    from titan_hcl.core import shadow_orchestrator as so
     src = inspect.getsource(so._phase_hibernate)
     # Required: pause is called
     assert "kernel.guardian.pause()" in src, (

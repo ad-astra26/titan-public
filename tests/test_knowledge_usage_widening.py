@@ -24,7 +24,7 @@ import tempfile
 
 import pytest
 
-from titan_plugin.logic.knowledge_gate import (
+from titan_hcl.logic.knowledge_gate import (
     check_topic_confidence,
     check_topic_confidence_with_match,
 )
@@ -106,20 +106,20 @@ def test_legacy_check_topic_confidence_still_returns_float(knowledge_db):
 # ── WebSearchHelper budgets forwarding ────────────────────────────────
 
 def test_websearch_helper_accepts_budgets():
-    from titan_plugin.logic.agency.helpers.web_search import WebSearchHelper
+    from titan_hcl.logic.agency.helpers.web_search import WebSearchHelper
     budgets = {"wiktionary": 52_428_800, "wikipedia_direct": 104_857_600}
     h = WebSearchHelper(budgets=budgets)
     assert h._budgets == budgets
 
 
 def test_websearch_helper_budgets_default_empty():
-    from titan_plugin.logic.agency.helpers.web_search import WebSearchHelper
+    from titan_hcl.logic.agency.helpers.web_search import WebSearchHelper
     h = WebSearchHelper()  # no budgets
     assert h._budgets == {}
 
 
 def test_websearch_helper_forwards_budgets_to_health_tracker(tmp_path):
-    from titan_plugin.logic.agency.helpers.web_search import WebSearchHelper
+    from titan_hcl.logic.agency.helpers.web_search import WebSearchHelper
     budgets = {"wiktionary": 52_428_800}
     h = WebSearchHelper(
         health_path=str(tmp_path / "h.json"),
@@ -135,7 +135,7 @@ def test_websearch_helper_forwards_budgets_to_health_tracker(tmp_path):
 def test_websearch_helper_no_budgets_no_default_budgets(tmp_path):
     """Regression: the old behaviour must stay safe when caller doesn't
     pass budgets — HealthTracker's _default_budgets becomes empty."""
-    from titan_plugin.logic.agency.helpers.web_search import WebSearchHelper
+    from titan_hcl.logic.agency.helpers.web_search import WebSearchHelper
     h = WebSearchHelper(
         health_path=str(tmp_path / "h.json"),
         decision_log_path=str(tmp_path / "d.jsonl"),
@@ -150,7 +150,7 @@ def test_social_x_gateway_emit_knowledge_usage_happy_path():
     """The gateway helper emits a properly shaped CGN_KNOWLEDGE_USAGE
     when a grounded concept contributed to post publish.
     """
-    from titan_plugin.logic.social_x_gateway import SocialXGateway
+    from titan_hcl.logic.social_x_gateway import SocialXGateway
 
     gw = SocialXGateway.__new__(SocialXGateway)  # bypass __init__
 
@@ -172,7 +172,7 @@ def test_social_x_gateway_emit_knowledge_usage_happy_path():
 
 
 def test_social_x_gateway_emit_knowledge_usage_empty_topic_noop():
-    from titan_plugin.logic.social_x_gateway import SocialXGateway
+    from titan_hcl.logic.social_x_gateway import SocialXGateway
     gw = SocialXGateway.__new__(SocialXGateway)
     published = []
     class _Bus:
@@ -183,7 +183,7 @@ def test_social_x_gateway_emit_knowledge_usage_empty_topic_noop():
 
 
 def test_social_x_gateway_emit_knowledge_usage_none_bus_safe():
-    from titan_plugin.logic.social_x_gateway import SocialXGateway
+    from titan_hcl.logic.social_x_gateway import SocialXGateway
     gw = SocialXGateway.__new__(SocialXGateway)
     # Should not raise even though bus is None
     gw._emit_knowledge_usage(None, "cognitive flexibility",
@@ -192,7 +192,7 @@ def test_social_x_gateway_emit_knowledge_usage_none_bus_safe():
 
 def test_social_x_gateway_emit_knowledge_usage_callable_bus():
     """Bus can be a plain callable (worker-IPC shape)."""
-    from titan_plugin.logic.social_x_gateway import SocialXGateway
+    from titan_hcl.logic.social_x_gateway import SocialXGateway
     gw = SocialXGateway.__new__(SocialXGateway)
     received = []
     gw._emit_knowledge_usage(lambda m: received.append(m),
@@ -205,7 +205,7 @@ def test_social_x_gateway_emit_knowledge_usage_callable_bus():
 
 def test_social_x_gateway_emit_knowledge_usage_bus_exception_swallowed():
     """A bus that throws must not break the emit."""
-    from titan_plugin.logic.social_x_gateway import SocialXGateway
+    from titan_hcl.logic.social_x_gateway import SocialXGateway
     gw = SocialXGateway.__new__(SocialXGateway)
     class _BadBus:
         def publish(self, _msg):
@@ -225,7 +225,7 @@ def test_spirit_worker_knowledge_usage_dst_is_knowledge():
     import ast
     import pathlib
     root = pathlib.Path(__file__).parent.parent
-    source = (root / "titan_plugin" / "modules" / "spirit_worker.py").read_text()
+    source = (root / "titan_hcl" / "modules" / "spirit_worker.py").read_text()
     tree = ast.parse(source)
     bad = []
     for node in ast.walk(tree):

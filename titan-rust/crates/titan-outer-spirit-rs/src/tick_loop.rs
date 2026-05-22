@@ -1,4 +1,4 @@
-//! tick_loop — outer-spirit jittered ~30s tick + Observer Principle.
+//! tick_loop — outer-spirit Schumann-locked tick (70.47 Hz) + Observer Principle.
 //!
 //! Per SPEC §9.A `titan-outer-spirit-rs` + §18.1 + master plan §10.6 C6-5.
 //! Logic flow per tick:
@@ -36,20 +36,23 @@ use anyhow::{anyhow, Context, Result};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use titan_bus::{BusClient, InboundEvent};
 use titan_core::constants::{
     OUTER_SPIRIT_BUS_PUBLISH_INTERVAL_S, OUTER_SPIRIT_FIRING_MAX_BYTES,
     OUTER_SPIRIT_FIRING_SCHEMA_VERSION, OUTER_SPIRIT_TICK_BASE_S,
 };
+
+use titan_core::small_filter_down::{SmallFilterDownEngine, HALF_DIM};
 use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
-    apply_multipliers, encode_floats, extract_outer_spirit_content, read_dim_slice,
-    read_sensor_cache, ContentGate, FiringSlotWriter, PublishThrottle, SensorCacheRead,
+    apply_multipliers, encode_floats, read_dim_slice, read_sensor_cache, stateful_update,
+    ContentGate, FiringSlotWriter, Layer, PublishThrottle, RestoringCfg, SensorCacheRead,
     CONTENT_DIM_COUNT, OUTER_SPIRIT_TOPICS,
 };
 
-pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()> {
+pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path, data_dir: &Path) -> Result<()> {
     let client = BusClient::connect(bus_socket, authkey, "outer-spirit")
         .await
         .with_context(|| format!("bus connect to {}", bus_socket.display()))?;
@@ -58,6 +61,13 @@ pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()
         .await
         .context("bus subscribe")?;
     info!(event = "BUS_SUBSCRIBED", topics = ?OUTER_SPIRIT_TOPICS);
+
+    // Small filter_down learned engine (SPEC §G5.1 / D-SPEC-97) — fired once
+    // per KERNEL_EPOCH_TICK, NOT per Schumann tick. Loads its own per-half
+    // trained brain (filter_down_local_outer_*.json) from data_dir.
+    let engine = SmallFilterDownEngine::with_defaults(data_dir, "outer")
+        .context("init outer small filter_down engine")?;
+    let epoch_pending = Arc::new(AtomicBool::new(false));
 
     let outer_spirit_slot = open_slot(shm_dir, "outer_spirit_45d.bin")?;
     let outer_body_slot = open_slot(shm_dir, "outer_body_5d.bin")?;
@@ -86,8 +96,15 @@ pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()
     let dispatcher_shutdown = shutdown.clone();
     let bus = Arc::new(client);
     let bus_for_dispatcher = bus.clone();
+    let dispatcher_epoch = epoch_pending.clone();
     let dispatcher = tokio::spawn(async move {
-        run_event_dispatcher(bus_for_dispatcher, dispatcher_state, dispatcher_shutdown).await;
+        run_event_dispatcher(
+            bus_for_dispatcher,
+            dispatcher_state,
+            dispatcher_shutdown,
+            dispatcher_epoch,
+        )
+        .await;
     });
 
     let tick_result = run_tick_loop(
@@ -99,6 +116,8 @@ pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()
         outer_mind_slot,
         sensor_cache_path,
         firing_writer,
+        engine,
+        epoch_pending,
     )
     .await;
 
@@ -117,6 +136,19 @@ struct DaemonState {
     shutdown_requested: bool,
     /// Last successfully-computed 45D outer-spirit vector.
     last_spirit: [f32; 45],
+    /// Sprint 1 closure (rFP follow-up 2026-05-12): last successful
+    /// `outer_body_5d.bin` read. Used to retain prior real values when
+    /// `read_dim_slice` fails (Uninitialized at boot / ReaderLapped /
+    /// CRC retry exhaustion). Replaces the silent `unwrap_or([0.5; 5])`
+    /// fallback that left CHIT[1,4,12] = combined_coh-dependent dims
+    /// stuck at exactly 0.5000 invisibly. `None` until first success.
+    last_body: Option<[f32; 5]>,
+    /// Same pattern for `outer_mind_15d.bin`.
+    last_mind: Option<[f32; 15]>,
+    /// Throttle counter for SHM read failure WARNs (avoids log flood
+    /// when a writer is genuinely down).
+    body_read_fail_count: u64,
+    mind_read_fail_count: u64,
 }
 
 impl Default for DaemonState {
@@ -125,6 +157,10 @@ impl Default for DaemonState {
             unified: None,
             shutdown_requested: false,
             last_spirit: [0.5; 45],
+            last_body: None,
+            last_mind: None,
+            body_read_fail_count: 0,
+            mind_read_fail_count: 0,
         }
     }
 }
@@ -133,6 +169,7 @@ async fn run_event_dispatcher(
     bus: Arc<BusClient>,
     state: Arc<Mutex<DaemonState>>,
     shutdown: Arc<Notify>,
+    epoch_pending: Arc<AtomicBool>,
 ) {
     loop {
         tokio::select! {
@@ -143,6 +180,11 @@ async fn run_event_dispatcher(
             event = bus.recv() => match event {
                 Some(InboundEvent::Message { msg_type, raw_bytes, .. }) => {
                     handle_bus_message(&msg_type, &raw_bytes, &state);
+                    // §G5.1 / D-SPEC-97: kernel epoch boundary → arm the small
+                    // filter_down for the next Schumann tick (consumed once).
+                    if msg_type == "KERNEL_EPOCH_TICK" {
+                        epoch_pending.store(true, Ordering::Relaxed);
+                    }
                     if msg_type == "KERNEL_SHUTDOWN_ANNOUNCE" {
                         if let Ok(mut s) = state.lock() {
                             s.shutdown_requested = true;
@@ -183,11 +225,13 @@ fn handle_bus_message(msg_type: &str, raw_bytes: &[u8], state: &Arc<Mutex<Daemon
     }
 }
 
-fn decode_unified_outer_spirit_content(payload: &[u8]) -> Result<[f32; CONTENT_DIM_COUNT]> {
+/// Decode the `outer_spirit_content` slice (length 40) from a structured
+/// UNIFIED_SPIRIT_FILTER_DOWN payload. SPEC §8.2 line 789 + §8.10 line 900:
+/// payload is `rmpv::Value::Map` per the §8.6 schema. Closure of
+/// `rFP_worker_broadcast_topics_completion §4.C-ter` (2026-05-13).
+fn decode_unified_outer_spirit_content(payload: &rmpv::Value) -> Result<[f32; CONTENT_DIM_COUNT]> {
     use rmpv::Value;
-    let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(payload))
-        .map_err(|e| anyhow!("payload root: {e}"))?;
-    let map = match &v {
+    let map = match payload {
         Value::Map(items) => items,
         _ => return Err(anyhow!("payload not a map")),
     };
@@ -252,6 +296,8 @@ async fn run_tick_loop(
     outer_mind_slot: Slot,
     sensor_cache_path: std::path::PathBuf,
     mut firing_writer: FiringSlotWriter,
+    mut engine: SmallFilterDownEngine,
+    epoch_pending: Arc<AtomicBool>,
 ) -> Result<()> {
     // Post-A.S8 D2 cadence migration (rFP §4.2): tick at canonical Schumann
     // spirit (70.47 Hz, ~14.2ms) — same generator inner-spirit-rs uses.
@@ -263,6 +309,11 @@ async fn run_tick_loop(
 
     let mut content_gate = ContentGate::new();
     let mut publish_throttle = PublishThrottle::new(OUTER_SPIRIT_BUS_PUBLISH_INTERVAL_S);
+    // Previous epoch's 65D half-state — the `s` in the TD(0) transition s→s'.
+    let mut prev_half: Option<[f64; HALF_DIM]> = None;
+    // §G5.2 traveling-tensor state (x[t-1], x[t-2]); cold-start at 0.5 centre.
+    let mut prev: [f32; 45] = [0.5; 45];
+    let mut prev2: [f32; 45] = [0.5; 45];
 
     info!(
         event = "TICK_LOOP_START",
@@ -286,8 +337,9 @@ async fn run_tick_loop(
                     );
                     if let Err(e) = run_one_tick(
                         &bus, &state, &mut content_gate, &mut publish_throttle,
+                        &mut engine, &epoch_pending, &mut prev_half,
                         &mut outer_spirit_slot, &outer_body_slot, &outer_mind_slot,
-                        &sensor_cache_path, &mut firing_writer,
+                        &sensor_cache_path, &mut firing_writer, &mut prev, &mut prev2,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
@@ -318,20 +370,68 @@ async fn run_one_tick(
     state: &Arc<Mutex<DaemonState>>,
     content_gate: &mut ContentGate,
     publish_throttle: &mut PublishThrottle,
+    engine: &mut SmallFilterDownEngine,
+    epoch_pending: &AtomicBool,
+    prev_half: &mut Option<[f64; HALF_DIM]>,
     outer_spirit_slot: &mut Slot,
     outer_body_slot: &Slot,
     outer_mind_slot: &Slot,
     sensor_cache_path: &Path,
     firing_writer: &mut FiringSlotWriter,
+    prev: &mut [f32; 45],
+    prev2: &mut [f32; 45],
 ) -> Result<()> {
-    // 1+2. Observer Principle reads (G8) — sibling outer_body + outer_mind.
-    let outer_body: [f32; 5] = read_dim_slice::<5>(outer_body_slot).unwrap_or([0.5; 5]);
-    let outer_mind: [f32; 15] = read_dim_slice::<15>(outer_mind_slot).unwrap_or([0.5; 15]);
-
-    // 3. Sensor cache (msgpack pre-aggregated outer-state).
-    let last_spirit = {
-        let s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
-        s.last_spirit
+    // 1+2. Observer Principle reads (G8) — sibling outer_body +
+    //      outer_mind. Sprint 1 closure (rFP follow-up 2026-05-12):
+    //      stop the silent `unwrap_or([0.5; N])` fallback that left
+    //      CHIT[1,4,12] combined_coh-dependent dims stuck at 0.5000
+    //      invisibly. On read success: cache as last_body/last_mind.
+    //      On read failure: throttled WARN + reuse last successful
+    //      values. At cold boot before any success: fall back to
+    //      [0.5; N] (matches Python `_DEFAULT` sentinel for one tick).
+    let body_read = read_dim_slice::<5>(outer_body_slot);
+    let mind_read = read_dim_slice::<15>(outer_mind_slot);
+    let (outer_body, outer_mind, last_spirit) = {
+        let mut s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
+        let body = match body_read {
+            Ok(v) => {
+                s.last_body = Some(v);
+                s.body_read_fail_count = 0;
+                v
+            }
+            Err(e) => {
+                s.body_read_fail_count = s.body_read_fail_count.saturating_add(1);
+                let count = s.body_read_fail_count;
+                if count <= 3 || count.is_multiple_of(600) {
+                    warn!(
+                        err = ?e,
+                        count = count,
+                        "outer_body_5d read failed; reusing last-known"
+                    );
+                }
+                s.last_body.unwrap_or([0.5; 5])
+            }
+        };
+        let mind = match mind_read {
+            Ok(v) => {
+                s.last_mind = Some(v);
+                s.mind_read_fail_count = 0;
+                v
+            }
+            Err(e) => {
+                s.mind_read_fail_count = s.mind_read_fail_count.saturating_add(1);
+                let count = s.mind_read_fail_count;
+                if count <= 3 || count.is_multiple_of(600) {
+                    warn!(
+                        err = ?e,
+                        count = count,
+                        "outer_mind_15d read failed; reusing last-known"
+                    );
+                }
+                s.last_mind.unwrap_or([0.5; 15])
+            }
+        };
+        (body, mind, s.last_spirit)
     };
 
     // 4+5. Compute 45D Sat-Chit-Ananda Material (preprocesses + projects).
@@ -384,6 +484,17 @@ async fn run_one_tick(
         s.last_spirit = spirit;
     }
 
+    // 7b. §G5.2 traveling-tensor update (Layer::Spirit). Applies to all 45D incl.
+    //     observer dims [0:5] (they travel; §G8 masking is filter_down-OUTPUT only).
+    //     The restoring spring covers spirit's 45D — GROUND_UP (§G10) does not.
+    let cfg = RestoringCfg::for_layer(Layer::Spirit);
+    let x = stateful_update(&prev[..], &prev2[..], &spirit[..], &cfg);
+    let mut spirit_state = [0.0_f32; 45];
+    spirit_state.copy_from_slice(&x[..45]);
+    *prev2 = *prev;
+    *prev = spirit_state;
+    let spirit = spirit_state;
+
     // 8. Encode + content-hash gate the slot write (full 45D unmasked).
     let bytes = encode_floats::<45>(&spirit);
     if content_gate.should_write(&bytes) {
@@ -403,16 +514,48 @@ async fn run_one_tick(
     if publish_throttle.should_publish() {
         // 9. Publish SPIRIT_STATE (full 45D unmasked).
         let state_payload = encode_spirit_state_payload(&spirit);
-        bus.publish("SPIRIT_STATE", Some("all"), Some(&state_payload))
+        bus.publish("SPIRIT_STATE", Some("all"), Some(state_payload))
             .await
             .map_err(|e| anyhow!("publish SPIRIT_STATE: {e}"))?;
+    }
 
-        // 10+11. Compose + publish OUTER_SPIRIT_FILTER_DOWN with observer mask.
-        let filter_down_payload = encode_outer_spirit_filter_down_payload(&spirit);
+    // 10+11. Small filter_down — EVENT-gated on KERNEL_EPOCH_TICK (SPEC §G5.1
+    //   / D-SPEC-97), NOT per Schumann tick + NOT throttle-bound. Once per
+    //   kernel epoch: assemble the 65D half-state (outer_body[5] +
+    //   outer_mind[15] + spirit[45]), feed the TD(0) transition s→s', train,
+    //   compute learned gradient-attention multipliers, publish
+    //   OUTER_SPIRIT_FILTER_DOWN. Replaces the inert all-1.0 body/mind
+    //   passthrough the Phase C port shipped (D2 drift).
+    if epoch_pending.swap(false, Ordering::Relaxed) {
+        let mut half = [0.0_f64; HALF_DIM];
+        for (i, &v) in outer_body.iter().enumerate() {
+            half[i] = v as f64;
+        }
+        for (i, &v) in outer_mind.iter().enumerate() {
+            half[5 + i] = v as f64;
+        }
+        for (i, &v) in spirit.iter().enumerate() {
+            half[20 + i] = v as f64;
+        }
+
+        if let Some(prev) = prev_half.as_ref() {
+            engine.record_transition(prev, &half);
+            let mut rng = rand::thread_rng();
+            engine.maybe_train(&mut rng);
+        }
+        *prev_half = Some(half);
+
+        let mults = engine.compute_multipliers(&half);
+        let body_mults: Vec<f32> = mults.body.iter().map(|&v| v as f32).collect();
+        let mind_mults: Vec<f32> = mults.mind.iter().map(|&v| v as f32).collect();
+        let content_mults: Vec<f32> = mults.spirit_content.iter().map(|&v| v as f32).collect();
+
+        let filter_down_payload =
+            encode_outer_spirit_filter_down_payload(&body_mults, &mind_mults, &content_mults);
         bus.publish(
             "OUTER_SPIRIT_FILTER_DOWN",
             Some("all"),
-            Some(&filter_down_payload),
+            Some(filter_down_payload),
         )
         .await
         .map_err(|e| anyhow!("publish OUTER_SPIRIT_FILTER_DOWN: {e}"))?;
@@ -423,8 +566,8 @@ async fn run_one_tick(
 
 // ── V6 outer_spirit_45d full port ──────────────────────────────────
 //
-// Byte-faithful port of `titan_plugin/logic/outer_spirit_tensor.py::collect_outer_spirit_45d`
-// (lines 53-101) wrapping `titan_plugin/logic/outer_trinity.py::_collect_extended`
+// Byte-faithful port of `titan_hcl/logic/outer_spirit_tensor.py::collect_outer_spirit_45d`
+// (lines 53-101) wrapping `titan_hcl/logic/outer_trinity.py::_collect_extended`
 // preprocessing (lines 600-697 — only the subset that feeds the 45D
 // spirit formula).
 //
@@ -493,7 +636,6 @@ pub fn project_outer_spirit_45d(
     let output_verifier = lookup_map(map, "output_verifier_stats");
     let anchor_state = lookup_map(map, "anchor_state");
     let bus_stats = lookup_map(map, "bus_stats");
-    let expression_translator = lookup_map(map, "expression_translator_stats");
     let outer_spirit_history = lookup_map(map, "outer_spirit_history_stats");
     let community_engagement = lookup_map(map, "community_engagement_stats");
 
@@ -503,36 +645,28 @@ pub fn project_outer_spirit_45d(
     // action_stats (lines 608-622)
     let total_actions: f64 = field_or_default(agency.as_ref(), "total_actions", 0.0);
     let failed_actions: f64 = field_or_default(agency.as_ref(), "failed_actions", 0.0);
-    let action_success_rate: f64 =
-        (total_actions - failed_actions) / total_actions.max(1.0);
+    let action_success_rate: f64 = (total_actions - failed_actions) / total_actions.max(1.0);
     let actions_per_hour: f64 = total_actions / (uptime / 3600.0).max(0.01);
-    let action_per_window: f64 =
-        field_or_default(agency.as_ref(), "actions_this_hour", 0.0);
-    let failed_retry_rate: f64 =
-        field_or_default(agency.as_ref(), "failed_retry_rate", 0.0);
-    let burst_frequency: f64 =
-        field_or_default(agency.as_ref(), "burst_frequency", 0.0);
+    let action_per_window: f64 = field_or_default(agency.as_ref(), "actions_this_hour", 0.0);
+    let failed_retry_rate: f64 = field_or_default(agency.as_ref(), "failed_retry_rate", 0.0);
+    let burst_frequency: f64 = field_or_default(agency.as_ref(), "burst_frequency", 0.0);
     let action_error_rate: f64 = 1.0 - action_success_rate;
 
     // creative_stats (lines 646-653)
     let creative_total: f64 = (art_count + audio_count) as f64;
-    let creative_per_window: f64 =
-        field_or_default(agency.as_ref(), "creative_this_hour", 0.0);
+    let creative_per_window: f64 = field_or_default(agency.as_ref(), "creative_this_hour", 0.0);
     let creative_unique_types: f64 =
         ((art_count > 0.0) as i32 + (audio_count > 0.0) as i32).min(2) as f64;
-    let creative_mean_assessment: f64 =
-        field_or_default(assessment.as_ref(), "average_score", 0.5);
+    let creative_mean_assessment: f64 = field_or_default(assessment.as_ref(), "average_score", 0.5);
 
     // guardian_stats (lines 656-661)
-    let threats_detected: f64 =
-        field_or_default(agency.as_ref(), "threats_detected", 0.0);
+    let threats_detected: f64 = field_or_default(agency.as_ref(), "threats_detected", 0.0);
     let rejections: f64 = field_or_default(agency.as_ref(), "rejections", 0.0);
     // Python `threat_severity_avg` / `rejections_per_window` exist in dict
     // but the 45D spirit formula does not consume them — skip lookup.
 
     // sovereignty_ratio passed as `agency.get("sovereignty_ratio", 0.0)`
-    let sovereignty_ratio: f64 =
-        field_or_default(agency.as_ref(), "sovereignty_ratio", 0.0);
+    let sovereignty_ratio: f64 = field_or_default(agency.as_ref(), "sovereignty_ratio", 0.0);
 
     // social_stats (lines 664-672)
     let interactions_per_window: f64 =
@@ -545,8 +679,7 @@ pub fn project_outer_spirit_45d(
     // referenced by the 45D formula — skip.
 
     // assessment_stats_ext (lines 683-688)
-    let assessment_mean: f64 =
-        field_or_default(assessment.as_ref(), "average_score", 0.5);
+    let assessment_mean: f64 = field_or_default(assessment.as_ref(), "average_score", 0.5);
     let assessment_trend: f64 = field_or_default(assessment.as_ref(), "trend", 0.0);
     // count not used by 45D formula
     let assessment_score_variance: f64 =
@@ -633,8 +766,7 @@ pub fn project_outer_spirit_45d(
         let threats_total = jb_count_24h + ov_violations_24h;
         let jb_blocked: f64 =
             field_or_default(jailbreak_alerts.as_ref(), "score_ge_0.9_count", 0.0);
-        let ov_rejected_24h: f64 =
-            field_or_default(output_verifier.as_ref(), "rejected_24h", 0.0);
+        let ov_rejected_24h: f64 = field_or_default(output_verifier.as_ref(), "rejected_24h", 0.0);
         let blocked_total = jb_blocked + ov_rejected_24h;
         sat[3] = safe_clamp(blocked_total / threats_total.max(1.0));
     }
@@ -663,21 +795,96 @@ pub fn project_outer_spirit_45d(
         0.5,
     ));
 
-    // SAT[13] transactional_integrity REDESIGNED:
-    //   0.5 if anchor_count==0 else anchor_count / (anchor_count + 5*consecutive_failures)
+    // SAT[13] transactional_integrity RE-GROUNDED (rFP_trinity_dim_resonance,
+    //   greenlit 2026-05-20): on-chain Solana tx reliability + volume over 24h,
+    //   NOT the anchor/backup counter. success_rate · min(1, confirmed/20).
+    //   confirmed/failed counted from getSignaturesForAddress on the Titan's
+    //   own wallet (mainnet T1 / devnet T2/T3 both submit memo txs daily).
     {
-        let anchor_count: f64 = field_or_default(anchor_state.as_ref(), "anchor_count", 0.0);
-        let consec_fails: f64 =
-            field_or_default(anchor_state.as_ref(), "consecutive_failures", 0.0);
-        sat[13] = if anchor_count == 0.0 {
-            0.5
-        } else {
-            safe_clamp(anchor_count / (anchor_count + 5.0 * consec_fails))
-        };
+        let tx = lookup_map(map, "solana_tx_stats");
+        let confirmed: f64 = field_or_default(tx.as_ref(), "confirmed_tx_24h", 0.0);
+        let failed: f64 = field_or_default(tx.as_ref(), "failed_tx_24h", 0.0);
+        let total = confirmed + failed;
+        let success_rate = if total > 0.0 { confirmed / total } else { 0.5 };
+        let volume = (confirmed / 20.0).min(1.0);
+        sat[13] = safe_clamp(success_rate * volume);
     }
 
     // SAT[14] operational_vitality: min(1, acts.per_hour/20) * uptime
     sat[14] = safe_clamp((actions_per_hour / 20.0).min(1.0) * uptime_ratio);
+
+    // rFP §9 closure batch 2026-05-12 — outer_spirit deferred dim ports.
+
+    // SAT[5] origin_anchoring RE-GROUNDED (rFP_trinity_dim_resonance_regrounding,
+    //   greenlit 2026-05-20): origin is anchored in the genesis-anchored
+    //   TimeChain (FORK_MAIN=0), not just the static genesis_record.json.
+    //   Folds three signals, true to "rooted in genesis identity":
+    //     0.5 · genesis_present       — mainnet-birth genesis record (boolean)
+    //     0.3 · chain_depth           — total_blocks / 500 (accumulating self-record)
+    //     0.2 · anchor_recency        — 1 - age/24h (actively anchoring new blocks)
+    //   Gives real signal on devnet Titans (no genesis_record) via the depth +
+    //   recency of their growing cognitive chain. Replaces the bare boolean that
+    //   left T2/T3 frozen at 0.0 with zero variance.
+    {
+        let genesis_present = lookup_bool_or_numeric(map, "genesis_record_exists");
+        let tc = lookup_map(map, "timechain_genesis_stats");
+        let total_blocks = field_or_default(tc.as_ref(), "total_blocks", 0.0);
+        let anchor_age_s = field_or_default(tc.as_ref(), "recent_anchor_age_s", 86400.0);
+        let chain_depth = (total_blocks / 500.0).min(1.0);
+        let anchor_recency = (1.0 - (anchor_age_s / 86400.0)).clamp(0.0, 1.0);
+        sat[5] = safe_clamp(0.5 * genesis_present + 0.3 * chain_depth + 0.2 * anchor_recency);
+    }
+
+    // SAT[7] world_footprint REDESIGNED per SPEC §23.3 weighted log-sum:
+    //   `min(1.0, Σ_i log1p(N_i) * w_i / log1p(target))`
+    //   Streams (Maker-tunable weights; sum to 1.0):
+    //     - persistent memory nodes (w=0.30) — long-term knowledge body
+    //     - total actions (w=0.20) — agency expression
+    //     - creative outputs (w=0.20) — art + audio
+    //     - arweave inscriptions (w=0.10) — permanent world artifacts
+    //     - meditation memos (w=0.10) — sovereign reflective output
+    //     - solana tx_count (w=0.10) — on-chain footprint
+    //   target=500 (log1p≈6.21) — saturation point for a "fully embedded"
+    //   Titan; tunable as the fleet matures.
+    {
+        let tx_count_local = field_or_default(solana.as_ref(), "tx_count", 0.0);
+        let wf_extra = lookup_map(map, "world_footprint_extra_counts");
+        let arweave_count = field_or_default(wf_extra.as_ref(), "arweave_inscriptions", 0.0);
+        let memo_count = field_or_default(wf_extra.as_ref(), "meditation_memos", 0.0);
+        // safe_clamp arg is f64; total/persistent/creative are already f64.
+        let score_sum = (mem_persistent_nodes + 1.0).ln() * 0.30
+            + (total_actions + 1.0).ln() * 0.20
+            + (creative_total + 1.0).ln() * 0.20
+            + (arweave_count + 1.0).ln() * 0.10
+            + (memo_count + 1.0).ln() * 0.10
+            + (tx_count_local + 1.0).ln() * 0.10;
+        let target_log = (500.0_f64 + 1.0).ln(); // ≈ 6.217
+        sat[7] = safe_clamp((score_sum / target_log).min(1.0));
+    }
+
+    // ANANDA[7] capability_growth REDESIGNED per SPEC §23.9 + rFP
+    //   §4.3.3 row 7:
+    //     0.30*min(1, max(0, comp_level - level_24h_ago))
+    //   + 0.25*min(1, primitives_grounded_delta_24h / 3)
+    //   + 0.25*min(1, vocab.producible_delta_24h / 10)
+    //   + 0.20*min(1, reflex.distinct_fired_24h / 5)
+    {
+        let comp_now = field_or_default(meta_cgn.as_ref(), "composition_level", 0.0);
+        let comp_24h = field_or_default(meta_cgn.as_ref(), "composition_level_24h_ago", 0.0);
+        let comp_delta = (comp_now - comp_24h).max(0.0);
+        let grounded_delta =
+            field_or_default(meta_cgn.as_ref(), "primitives_grounded_delta_24h", 0.0);
+        let vocab_stats_local = lookup_map(map, "vocab_stats");
+        let vocab_delta = field_or_default(vocab_stats_local.as_ref(), "producible_delta_24h", 0.0);
+        let reflex_stats_local = lookup_map(map, "reflex_stats");
+        let reflex_fired = field_or_default(reflex_stats_local.as_ref(), "distinct_fired_24h", 0.0);
+        ananda[7] = safe_clamp(
+            0.30 * comp_delta.min(1.0)
+                + 0.25 * (grounded_delta / 3.0).min(1.0)
+                + 0.25 * (vocab_delta / 10.0).min(1.0)
+                + 0.20 * (reflex_fired / 5.0).min(1.0),
+        );
+    }
 
     // ── CHIT overrides ─────────────────────────────────────────────
     // CHIT[0] world_model_depth REDESIGNED:
@@ -722,6 +929,43 @@ pub fn project_outer_spirit_45d(
         chit[2] = safe_clamp((jb_part + ov_part) / 2.0);
     }
 
+    // CHIT[3] cross_domain_integration REDESIGNED per SPEC §23.9:
+    //   if knowledge_helpful_by_source non-empty: min(1, num_sources / 6)
+    //     (diversity of knowledge sources providing helpful responses,
+    //      saturated at 6 distinct sources)
+    //   else: meta_cgn.knowledge_helpful_ratio fallback
+    // (Pure-port of outer_spirit_tensor.py:_knowledge_helpful_ratio
+    // fallback branch + len(helpful_by) / 6 primary branch.)
+    {
+        let helpful_by_count: usize = match meta_cgn.as_ref() {
+            Some(m) => match lookup_map(m, "knowledge_helpful_by_source") {
+                Some(inner) => inner.len(),
+                None => 0,
+            },
+            None => 0,
+        };
+        if helpful_by_count > 0 {
+            chit[3] = safe_clamp((helpful_by_count as f64 / 6.0).min(1.0));
+        } else {
+            let kh_ratio: f64 = field_or_default(meta_cgn.as_ref(), "knowledge_helpful_ratio", 0.0);
+            chit[3] = safe_clamp(kh_ratio);
+        }
+    }
+
+    // CHIT[5] situation_recognition REDESIGNED per SPEC §23.9:
+    //   0.5*(1 - meta_cgn.usage_gini) + 0.3*min(1, cgn.consolidations/50)
+    //   + 0.2*min(1, meta_cgn.haov.verified_rules/10)
+    {
+        let usage_gini: f64 = field_or_default(meta_cgn.as_ref(), "usage_gini", 0.0);
+        let cgn_consolidations: f64 = field_or_default(cgn.as_ref(), "consolidations", 0.0);
+        let verified_rules = haov_verified_rules(meta_cgn.as_ref());
+        chit[5] = safe_clamp(
+            0.5 * (1.0 - usage_gini)
+                + 0.3 * (cgn_consolidations / 50.0).min(1.0)
+                + 0.2 * (verified_rules / 10.0).min(1.0),
+        );
+    }
+
     // CHIT[6] knowledge_growth REDESIGNED:
     //   0.35*memory.learning_velocity + 0.25*vocab.producible_growth_per_day
     //   + 0.20*meta_cgn.primitives_grounded_delta_24h
@@ -730,16 +974,10 @@ pub fn project_outer_spirit_45d(
         let mem_learning_velocity: f64 =
             field_or_default(memory_stats_ext.as_ref(), "learning_velocity", 0.5);
         let vocab_growth = 0.0; // vocab_stats.producible_growth_per_day not yet plumbed
-        let mc_primitives_delta_24h: f64 = field_or_default(
-            meta_cgn.as_ref(),
-            "primitives_grounded_delta_24h",
-            0.0,
-        );
-        let mc_compositions_delta_24h: f64 = field_or_default(
-            meta_cgn.as_ref(),
-            "compositions_computed_delta_24h",
-            0.0,
-        );
+        let mc_primitives_delta_24h: f64 =
+            field_or_default(meta_cgn.as_ref(), "primitives_grounded_delta_24h", 0.0);
+        let mc_compositions_delta_24h: f64 =
+            field_or_default(meta_cgn.as_ref(), "compositions_computed_delta_24h", 0.0);
         chit[6] = safe_clamp(
             0.35 * mem_learning_velocity
                 + 0.25 * vocab_growth
@@ -763,6 +1001,45 @@ pub fn project_outer_spirit_45d(
         );
     }
 
+    // CHIT[13] causal_attribution REDESIGNED per SPEC §23.9:
+    //   0.6 * mean(meta_cgn.primitive_V_summary[*].confidence)
+    //   + 0.4 * min(1, meta_cgn.haov.verified_rules / 10)
+    {
+        let mean_conf: f64 = {
+            let summaries = meta_cgn
+                .as_ref()
+                .and_then(|m| lookup_map(m, "primitive_V_summary"));
+            match summaries {
+                Some(items) if !items.is_empty() => {
+                    let mut sum = 0.0_f64;
+                    let mut count = 0_usize;
+                    for (_, v) in items.iter() {
+                        if let rmpv::Value::Map(inner) = v {
+                            for (ik, iv) in inner.iter() {
+                                if let rmpv::Value::String(s) = ik {
+                                    if s.as_str() == Some("confidence") {
+                                        if let Some(c) = iv.as_f64() {
+                                            sum += c;
+                                            count += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if count > 0 {
+                        sum / count as f64
+                    } else {
+                        0.0
+                    }
+                }
+                _ => 0.0,
+            }
+        };
+        let verified_rules = haov_verified_rules(meta_cgn.as_ref());
+        chit[13] = safe_clamp(0.6 * mean_conf + 0.4 * (verified_rules / 10.0).min(1.0));
+    }
+
     // CHIT[8] engagement_depth: assessment.average_score (alias)
     chit[8] = safe_clamp(assessment_mean);
 
@@ -772,11 +1049,8 @@ pub fn project_outer_spirit_45d(
     // CHIT[10] dream_recall: 0.6 * recall_ratio + 0.4 * body_coh
     //   (recall_ratio from osh.dream_recall_ratio)
     {
-        let recall_ratio: f64 = field_or_default(
-            outer_spirit_history.as_ref(),
-            "dream_recall_ratio",
-            0.5,
-        );
+        let recall_ratio: f64 =
+            field_or_default(outer_spirit_history.as_ref(), "dream_recall_ratio", 0.5);
         chit[10] = safe_clamp(0.6 * recall_ratio + 0.4 * outer_body_coh);
     }
 
@@ -803,11 +1077,8 @@ pub fn project_outer_spirit_45d(
     {
         let mc_knowledge_helpful: f64 =
             field_or_default(meta_cgn.as_ref(), "knowledge_helpful_ratio", 0.5);
-        let haov_high_conf: f64 = field_or_default(
-            meta_cgn.as_ref(),
-            "haov_verified_rules_high_conf",
-            0.0,
-        );
+        let haov_high_conf: f64 =
+            field_or_default(meta_cgn.as_ref(), "haov_verified_rules_high_conf", 0.0);
         let mem_directive_alignment: f64 =
             field_or_default(memory_stats_ext.as_ref(), "directive_alignment", 0.5);
         ananda[5] = safe_clamp(
@@ -817,26 +1088,38 @@ pub fn project_outer_spirit_45d(
         );
     }
 
-    // ANANDA[6] community_connection: min(1, distinct_handles_24h / 5)
-    //   Phase 2.5.E per-Titan via community_engagement_stats.
+    // ANANDA[6] community_connection RE-GROUNDED (rFP_trinity_dim_resonance,
+    //   greenlit 2026-05-20): broaden beyond inbound @mentions to the Titan's
+    //   full social footprint — distinct handles engaging + its own replies +
+    //   posts (all 24h). Real variance on devnet via the Titan's own activity.
     {
-        let distinct_handles: f64 = field_or_default(
-            community_engagement.as_ref(),
-            "distinct_handles_24h",
-            0.0,
+        let ce = community_engagement.as_ref();
+        let distinct_handles = field_or_default(ce, "distinct_handles_24h", 0.0);
+        let replies_24h = field_or_default(ce, "replies_24h", 0.0);
+        let posts_24h = field_or_default(ce, "posts_24h", 0.0);
+        ananda[6] = safe_clamp(
+            0.4 * (distinct_handles / 5.0).min(1.0)
+                + 0.3 * (replies_24h / 5.0).min(1.0)
+                + 0.3 * (posts_24h / 5.0).min(1.0),
         );
-        ananda[6] = safe_clamp((distinct_handles / 5.0).min(1.0));
     }
 
-    // ANANDA[8] expression_reach: min(1, mean_engagement_delta_7d / 5)
-    //   (producer pre-normalizes to [0,1], we still clamp defensively)
+    // ANANDA[8] expression_reach RE-GROUNDED (rFP_trinity_dim_resonance,
+    //   greenlit 2026-05-20): keep the X engagement signal
+    //   (expression_reach_norm) and enrich with output volume (likes given +
+    //   posts) scaled by archetype variousness (distinct post_types/24h). Reach
+    //   = how far AND how variedly the Titan's expression lands.
     {
-        let mean_engagement_delta: f64 = field_or_default(
-            community_engagement.as_ref(),
-            "mean_engagement_delta_7d",
-            0.0,
-        );
-        ananda[8] = safe_clamp((mean_engagement_delta / 5.0).min(1.0));
+        let ce = community_engagement.as_ref();
+        let reach_norm = field_or_default(ce, "expression_reach_norm", 0.0);
+        let likes_24h = field_or_default(ce, "likes_24h", 0.0);
+        let posts_24h = field_or_default(ce, "posts_24h", 0.0);
+        let distinct_types = field_or_default(ce, "distinct_post_types_24h", 0.0);
+        let norm_likes = (likes_24h / 10.0).min(1.0);
+        let norm_posts = (posts_24h / 5.0).min(1.0);
+        let variousness = 0.5 + 0.5 * (distinct_types / 4.0).min(1.0);
+        ananda[8] =
+            safe_clamp((0.5 * reach_norm + 0.5 * norm_likes + 0.5 * norm_posts) * variousness);
     }
 
     // ANANDA[9] discovery_value REDESIGNED:
@@ -866,14 +1149,54 @@ pub fn project_outer_spirit_45d(
     //   (replaces legacy history.resource_efficiency passthrough)
     {
         let outputs_per_hour = creative_per_window + action_per_window; // proxy for outputs
-        let llm_calls: f64 =
-            field_or_default(agency.as_ref(), "llm_calls_this_hour", 0.0);
+        let llm_calls: f64 = field_or_default(agency.as_ref(), "llm_calls_this_hour", 0.0);
         ananda[13] = safe_clamp((outputs_per_hour / llm_calls.max(1.0)).min(1.0));
     }
 
-    // Suppress unused-variable warnings for fields we kept in scope but
-    // didn't end up using in overrides (reserved for future Phase 6.5 dims):
-    let _ = expression_translator;
+    // ANANDA[14] flow_state RE-GROUNDED (rFP_trinity_dim_resonance, greenlit
+    //   2026-05-20): the legacy compute_ananda factor `(1 - action_error_rate)`
+    //   hard-zeroed flow because action_error_rate=1 whenever agency.total_actions=0
+    //   (formal handle_intent rarely fires). Replace with the broad substrate
+    //   success rate (expression/NS substrate, where the Titan actually acts).
+    //   Other factors (coherence, assessment, surrender=ananda[12]) already healthy.
+    {
+        let substrate_success = top_level_f64_or(map, "substrate_success_rate", 0.7);
+        let min_coh = outer_body_coh.min(outer_mind_coh);
+        ananda[14] = safe_clamp(min_coh * substrate_success * assessment_mean * ananda[12]);
+    }
+
+    // ── D-SPEC-101 Phase-2 outer_spirit re-grounding (Maker 2026-05-21) ──
+    //   §23.9-anchored. world_recognition + the expression cluster re-sourced
+    //   to recent-window movement of the Titan's own expressive output (rich
+    //   expression rolling-window: image/sound/speak/word variety+volume +
+    //   windowed sovereignty) per the Maker's §85/§86 directives. Old static
+    //   sources (identity boolean / posture_ratio / assessment-mean) deleted.
+    {
+        let expr_win = lookup_map(map, "expr_window");
+        let evar = field_or_default(expr_win.as_ref(), "variety", 0.0);
+        let evol = field_or_default(expr_win.as_ref(), "volume", 0.0);
+        let esov = field_or_default(expr_win.as_ref(), "sovereignty", 0.5);
+        let eimg = field_or_default(expr_win.as_ref(), "image_rate", 0.0);
+        let esnd = field_or_default(expr_win.as_ref(), "sound_rate", 0.0);
+        // SAT[0] world_recognition (§85): fast rate-of-change of the OTHER 44
+        //   outer_spirit dims (the world recognized as moving). Was the static
+        //   identity_verified boolean. Source: top-level outer_spirit_self_change.
+        sat[0] = safe_clamp(field_or_default(Some(map), "outer_spirit_self_change", 0.0));
+        // SAT[1] expressive_authenticity (§86): variety+volume of expressive
+        //   output (authentic = actually generating diverse, present expression).
+        sat[1] = safe_clamp(0.5 * (evar + evol));
+        // SAT[2] action_sovereignty (§86): windowed self-authored expression
+        //   ratio (sovereignty of expression over the recent window).
+        sat[2] = safe_clamp(esov);
+        // SAT[12] distinctive_voice (§86): breadth of distinct active expressive
+        //   modalities — a varied voice is a distinct one.
+        sat[12] = safe_clamp(evar);
+        // ANANDA[2] creative_impact (§86): creative-modality output volume
+        //   (image + sound generation rate).
+        ananda[2] = safe_clamp(0.5 * (eimg + esnd));
+        // ANANDA[4] aesthetic_quality (§86): overall expressive volume breath.
+        ananda[4] = safe_clamp(evol);
+    }
 
     let mut out = [0.0_f32; 45];
     for (i, v) in sat.iter().enumerate() {
@@ -939,8 +1262,7 @@ fn compute_sat(
     // [9] action_purity: mean_score × success_rate × 2.0
     sat[9] = safe_clamp(assessment_mean * action_success_rate * 2.0);
     // [10] recovery_speed: 1 / (1 + mean_recovery / 30)
-    let mean_recovery_s: f64 =
-        field_or_default(recovery, "mean_recovery_seconds", 60.0);
+    let mean_recovery_s: f64 = field_or_default(recovery, "mean_recovery_seconds", 60.0);
     sat[10] = safe_clamp(1.0 / (1.0 + mean_recovery_s / 30.0));
     // [11] environmental_adaptation: 1 - load_variance (default 0.3)
     let load_variance: f64 = 0.3; // assess.load_variance never set by _collect_extended
@@ -1012,8 +1334,7 @@ fn compute_chit(
     // [9] outcome_reflection: 0.5 + assess.trend
     chit[9] = safe_clamp(0.5 + assessment_trend);
     // [10] dream_recall: history.dream_recall_ratio × 0.6 + body_coh × 0.4
-    let dream_recall_ratio: f64 =
-        field_or_default(history, "dream_recall_ratio", 0.0);
+    let dream_recall_ratio: f64 = field_or_default(history, "dream_recall_ratio", 0.0);
     chit[10] = safe_clamp(dream_recall_ratio * 0.6 + outer_body_coh * 0.4);
     // [11] temporal_context: history.circadian_alignment
     chit[11] = safe_clamp(field_or_default(history, "circadian_alignment", 0.5));
@@ -1072,13 +1393,12 @@ fn compute_ananda(
     ananda[10] = safe_clamp(field_or_default(history, "rest_performance_floor", 0.5));
     // [11] creative_tension: CREATIVITY × min(1, time_since_last/600)
     let creativity_level: f64 = field_or_default(hormone_levels, "CREATIVITY", 0.0);
-    let time_since_create: f64 =
-        field_or_default(history, "seconds_since_last_create", 300.0);
+    let time_since_create: f64 = field_or_default(history, "seconds_since_last_create", 300.0);
     ananda[11] = safe_clamp(creativity_level * (time_since_create / 600.0).min(1.0));
     // [12] surrender_capacity: 1 - clamp((failed_retry + (1-body_coh) + burst) / 3)
     let resource_depletion = 1.0 - outer_body_coh;
-    let surrender = 1.0
-        - safe_clamp((failed_retry_rate + resource_depletion + burst_frequency) / 3.0);
+    let surrender =
+        1.0 - safe_clamp((failed_retry_rate + resource_depletion + burst_frequency) / 3.0);
     ananda[12] = safe_clamp(surrender);
     // [13] resource_appreciation: history.resource_efficiency → 0.5
     ananda[13] = safe_clamp(field_or_default(history, "resource_efficiency", 0.5));
@@ -1136,11 +1456,7 @@ fn lookup_map(
     None
 }
 
-fn field_or_default(
-    map: Option<&Vec<(rmpv::Value, rmpv::Value)>>,
-    key: &str,
-    default: f64,
-) -> f64 {
+fn field_or_default(map: Option<&Vec<(rmpv::Value, rmpv::Value)>>, key: &str, default: f64) -> f64 {
     let map = match map {
         Some(m) => m,
         None => return default,
@@ -1156,11 +1472,20 @@ fn field_or_default(
     default
 }
 
-fn top_level_f64_or(
-    map: &[(rmpv::Value, rmpv::Value)],
-    key: &str,
-    default: f64,
-) -> f64 {
+/// Nested `meta_cgn.haov.verified_rules` lookup. Returns 0.0 when the
+/// `haov` sub-map or `verified_rules` field is absent. The producer
+/// (titan_hcl.logic.meta_cgn.get_haov_stats) publishes this as
+/// `by_status["confirmed"]` count; SPEC §23.9 CHIT[5,13] + ANANDA[5]
+/// consume the SPEC-named `verified_rules` field directly.
+fn haov_verified_rules(meta_cgn: Option<&Vec<(rmpv::Value, rmpv::Value)>>) -> f64 {
+    let haov = match meta_cgn.and_then(|m| lookup_map(m, "haov")) {
+        Some(h) => h,
+        None => return 0.0,
+    };
+    field_or_default(Some(&haov), "verified_rules", 0.0)
+}
+
+fn top_level_f64_or(map: &[(rmpv::Value, rmpv::Value)], key: &str, default: f64) -> f64 {
     use rmpv::Value;
     for (k, v) in map.iter() {
         if let Value::String(s) = k {
@@ -1172,15 +1497,49 @@ fn top_level_f64_or(
     default
 }
 
+/// Top-level lookup that handles Boolean OR numeric truthiness.
+/// Used by SAT[5] origin_anchoring where the publisher serializes
+/// `genesis_record_exists` as a Python bool (msgpack Boolean) but
+/// older publishers may emit 1.0/0.0 as F64.
+/// Returns 1.0 / 0.0 (no clamping needed; SAT[5] is binary).
+fn lookup_bool_or_numeric(map: &[(rmpv::Value, rmpv::Value)], key: &str) -> f64 {
+    use rmpv::Value;
+    for (k, v) in map.iter() {
+        if let Value::String(s) = k {
+            if s.as_str() == Some(key) {
+                return match v {
+                    Value::Boolean(b) => {
+                        if *b {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    _ => {
+                        if v.as_f64().unwrap_or(0.0) > 0.5 {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                };
+            }
+        }
+    }
+    0.0
+}
+
 fn open_slot(shm_dir: &Path, name: &str) -> Result<Slot> {
     let path = shm_dir.join(name);
     Slot::open(&path).with_context(|| format!("open slot {}", path.display()))
 }
 
-fn encode_spirit_state_payload(spirit: &[f32; 45]) -> Vec<u8> {
+/// Build a SPEC §8.5 outer `SPIRIT_STATE` payload as `rmpv::Value::Map` per
+/// SPEC §8.10 line 900 byte-identical guarantee.
+fn encode_spirit_state_payload(spirit: &[f32; 45]) -> rmpv::Value {
     use rmpv::Value;
     let values = Value::Array(spirit.iter().map(|f| Value::F64(*f as f64)).collect());
-    let map = Value::Map(vec![
+    Value::Map(vec![
         (Value::String("src".into()), Value::String("outer".into())),
         (
             Value::String("type".into()),
@@ -1188,11 +1547,7 @@ fn encode_spirit_state_payload(spirit: &[f32; 45]) -> Vec<u8> {
         ),
         (Value::String("values".into()), values),
         (Value::String("ts".into()), Value::F64(now_secs())),
-    ]);
-    let mut out = Vec::with_capacity(512);
-    rmpv::encode::write_value(&mut out, &map)
-        .expect("rmpv encode never fails on well-formed Value");
-    out
+    ])
 }
 
 /// Compose OUTER_SPIRIT_FILTER_DOWN payload per SPEC §8.6 row 4.
@@ -1215,41 +1570,31 @@ fn encode_spirit_state_payload(spirit: &[f32; 45]) -> Vec<u8> {
 /// state is the parity-vector cycle's job (D2/D5 follow-up). The
 /// observer-mask guarantee for outer_spirit_content[40] is ALREADY
 /// ENFORCED here at type-level via extract_outer_spirit_content.
-fn encode_outer_spirit_filter_down_payload(spirit: &[f32; 45]) -> Vec<u8> {
+/// Encode `OUTER_SPIRIT_FILTER_DOWN` from the learned per-half multipliers
+/// (body[5] + mind[15] + spirit_content[40]) produced by
+/// `SmallFilterDownEngine::compute_multipliers`. Observer dims [0:5] are
+/// never present (content is already 40D, G8).
+fn encode_outer_spirit_filter_down_payload(
+    body: &[f32],
+    mind: &[f32],
+    content: &[f32],
+) -> rmpv::Value {
     use rmpv::Value;
 
-    // OBSERVER MASK: structurally extracts [5:45] only, length 40.
-    let outer_spirit_content: [f32; CONTENT_DIM_COUNT] = extract_outer_spirit_content(spirit);
-
-    let outer_body_mults = vec![1.0_f64; 5];
-    let outer_mind_mults = vec![1.0_f64; 15];
-    let outer_spirit_content_mults: Vec<Value> = outer_spirit_content
-        .iter()
-        .map(|f| Value::F64(*f as f64))
-        .collect();
-
+    let to_arr =
+        |v: &[f32]| -> Value { Value::Array(v.iter().map(|f| Value::F64(*f as f64)).collect()) };
     let multipliers = Value::Map(vec![
-        (
-            Value::String("outer_body".into()),
-            Value::Array(outer_body_mults.into_iter().map(Value::F64).collect()),
-        ),
-        (
-            Value::String("outer_mind".into()),
-            Value::Array(outer_mind_mults.into_iter().map(Value::F64).collect()),
-        ),
+        (Value::String("outer_body".into()), to_arr(body)),
+        (Value::String("outer_mind".into()), to_arr(mind)),
         (
             Value::String("outer_spirit_content".into()),
-            Value::Array(outer_spirit_content_mults),
+            to_arr(content),
         ),
     ]);
-    let map = Value::Map(vec![
+    Value::Map(vec![
         (Value::String("multipliers".into()), multipliers),
         (Value::String("ts".into()), Value::F64(now_secs())),
-    ]);
-    let mut out = Vec::with_capacity(512);
-    rmpv::encode::write_value(&mut out, &map)
-        .expect("rmpv encode never fails on well-formed Value");
-    out
+    ])
 }
 
 fn now_secs() -> f64 {
@@ -1312,20 +1657,38 @@ mod tests {
         //   SAT[3] boundary_enforcement REDESIGNED → 0.0 (was 0.8 from old branch)
         //   SAT[10] recovery_speed REDESIGNED → 1.0 (was 1/3, now 1 - 0/10)
         //   SAT[11] env_adapt REDESIGNED → 0.5 (osh.environmental_adaptation default)
-        assert!((spirit[0] - 0.5).abs() < 1e-3, "SAT[0] = {}", spirit[0]);
-        assert!((spirit[1] - 0.5).abs() < 1e-3);
-        assert!((spirit[2] - 0.0).abs() < 1e-3);
+        // rFP §9 closure batch 2026-05-12: SAT[1,5,7] no longer default
+        // to Python `_DEFAULT` 0.5 — they compute real SPEC §23.9 values:
+        //   SAT[1] = posture_authenticity_ratio_30 (empty → 0.0)
+        //   SAT[5] = genesis_record_exists ? 1.0 : 0.0 (empty → 0.0)
+        //   SAT[7] = world_footprint weighted log-sum (empty → 0.0)
+        // D-SPEC-101 Phase-2 re-grounding (Maker 2026-05-21):
+        //   SAT[0] world_recognition = outer_spirit_self_change (absent → 0.0)
+        //   SAT[1] expressive_authenticity = 0.5·(variety+volume) (absent → 0.0)
+        //   SAT[2] action_sovereignty = expr_window.sovereignty (absent → 0.5)
+        assert!((spirit[0] - 0.0).abs() < 1e-3, "SAT[0] = {}", spirit[0]);
+        assert!((spirit[1] - 0.0).abs() < 1e-3, "SAT[1] = {}", spirit[1]);
+        assert!((spirit[2] - 0.5).abs() < 1e-3, "SAT[2] = {}", spirit[2]);
         assert!((spirit[3] - 0.0).abs() < 1e-3, "SAT[3] = {}", spirit[3]);
         assert!(spirit[4] < 0.05, "SAT[4] = {} (expected ≈0)", spirit[4]);
-        assert!((spirit[5] - 0.5).abs() < 1e-3);
+        assert!(
+            (spirit[5] - 0.0).abs() < 1e-3,
+            "SAT[5] = {} (rFP closure: no genesis→0)",
+            spirit[5]
+        );
         assert!((spirit[6] - 0.5).abs() < 1e-3);
-        assert!((spirit[7] - 0.0).abs() < 1e-3);
+        assert!(
+            (spirit[7] - 0.0).abs() < 1e-3,
+            "SAT[7] = {} (rFP closure: empty footprint→0)",
+            spirit[7]
+        );
         assert!((spirit[8] - 0.7).abs() < 1e-3);
         assert!((spirit[9] - 0.0).abs() < 1e-3);
         assert!((spirit[10] - 1.0).abs() < 1e-3, "SAT[10] = {}", spirit[10]);
         assert!((spirit[11] - 0.5).abs() < 1e-3, "SAT[11] = {}", spirit[11]);
         assert!((spirit[12] - 0.0).abs() < 1e-3);
-        assert!((spirit[13] - 0.5).abs() < 1e-3);
+        // SAT[13] RE-GROUNDED: no solana_tx_stats → 0 confirmed → 0.0.
+        assert!((spirit[13] - 0.0).abs() < 1e-3, "SAT[13] no-tx = 0.0");
         assert!((spirit[14] - 0.0).abs() < 1e-3);
     }
 
@@ -1351,26 +1714,35 @@ mod tests {
         let spirit =
             project_outer_spirit_45d(&payload, [0.5_f32; 5], [0.5_f32; 15], [0.5; 45]).unwrap();
 
-        // SPEC §23.9 redesign overrides applied (Step 6 §4.3 P3):
-        //   CHIT[0] world_model_depth REDESIGNED → 0.05 (KG=0+0.10*0.5 vocab default)
-        //   CHIT[2] threat_discernment REDESIGNED → 0.0 (was 0.8, all defaults yield 0)
-        //   CHIT[6] knowledge_growth REDESIGNED → 0.175 (0.35*0.5 mem_learning default)
+        // SPEC §23.9 redesign overrides applied:
+        //   CHIT[0]  Step 6 §4.3 P3 — REDESIGNED → 0.05 (KG=0+0.10*0.5 vocab default)
+        //   CHIT[2]  Step 6 §4.3 P3 — REDESIGNED → 0.0 (was 0.8, all defaults yield 0)
+        //   CHIT[3]  §4.3.1 Chunk B — REDESIGNED → 0.0 (helpful_by absent → fallback
+        //            to knowledge_helpful_ratio default 0.0)
+        //   CHIT[5]  §4.3.1 Chunk B — REDESIGNED → 0.5 (0.5*(1-0) + 0.3*0 + 0.2*0)
+        //   CHIT[6]  Step 6 §4.3 P3 — REDESIGNED → 0.175 (0.35*0.5 mem_learning default)
         //   CHIT[10] dream_recall → 0.5 (0.6*0.5 + 0.4*0.5)
-        //   CHIT[14] self_trajectory REDESIGNED → 0.0 (osh.outer_spirit_trajectory default)
+        //   CHIT[13] §4.3.1 Chunk B — REDESIGNED → 0.0 (no primitive_V_summary,
+        //            no haov.verified_rules → 0.6*0 + 0.4*0)
+        //   CHIT[14] Step 6 §4.3 P3 — REDESIGNED → 0.0 (osh.outer_spirit_trajectory default)
         assert!((spirit[15] - 0.05).abs() < 1e-3, "CHIT[0] = {}", spirit[15]);
         assert!((spirit[16] - 0.5).abs() < 1e-3);
         assert!((spirit[17] - 0.0).abs() < 1e-3, "CHIT[2] = {}", spirit[17]);
-        assert!((spirit[18] - 0.5).abs() < 1e-3);
+        assert!((spirit[18] - 0.0).abs() < 1e-3, "CHIT[3] = {}", spirit[18]);
         assert!((spirit[19] - 0.5).abs() < 1e-3);
-        assert!((spirit[20] - 0.5).abs() < 1e-3);
-        assert!((spirit[21] - 0.175).abs() < 1e-3, "CHIT[6] = {}", spirit[21]);
+        assert!((spirit[20] - 0.5).abs() < 1e-3, "CHIT[5] = {}", spirit[20]);
+        assert!(
+            (spirit[21] - 0.175).abs() < 1e-3,
+            "CHIT[6] = {}",
+            spirit[21]
+        );
         assert!((spirit[22] - 0.5).abs() < 1e-3);
         assert!((spirit[23] - 0.5).abs() < 1e-3);
         assert!((spirit[24] - 0.5).abs() < 1e-3);
         assert!((spirit[25] - 0.5).abs() < 1e-3, "CHIT[10] = {}", spirit[25]);
         assert!((spirit[26] - 0.5).abs() < 1e-3);
         assert!((spirit[27] - 0.5).abs() < 1e-3);
-        assert!((spirit[28] - 0.5).abs() < 1e-3);
+        assert!((spirit[28] - 0.0).abs() < 1e-3, "CHIT[13] = {}", spirit[28]);
         assert!((spirit[29] - 0.0).abs() < 1e-3, "CHIT[14] = {}", spirit[29]);
     }
 
@@ -1404,21 +1776,66 @@ mod tests {
         //   ANANDA[8] expression_reach REDESIGNED → 0.0 (community_engagement.delta default)
         //   ANANDA[9] discovery_value REDESIGNED → 0.0 (all components default 0)
         //   ANANDA[13] resource_appreciation REDESIGNED → 0.0 (outputs=0)
-        assert!((spirit[30] - 0.0).abs() < 1e-3, "ANANDA[0] = {}", spirit[30]);
+        assert!(
+            (spirit[30] - 0.0).abs() < 1e-3,
+            "ANANDA[0] = {}",
+            spirit[30]
+        );
         assert!((spirit[31] - 0.5).abs() < 1e-3);
-        assert!((spirit[32] - 0.5).abs() < 1e-3);
-        assert!((spirit[33] - 1.0).abs() < 1e-3, "ANANDA[3] = {}", spirit[33]);
-        assert!((spirit[34] - 0.5).abs() < 1e-3);
-        assert!((spirit[35] - 0.35).abs() < 1e-3, "ANANDA[5] = {}", spirit[35]);
+        // D-SPEC-101 Phase-2: ANANDA[2] creative_impact = 0.5·(image+sound rate)
+        //   and ANANDA[4] aesthetic_quality = expr_window.volume (absent → 0.0).
+        assert!(
+            (spirit[32] - 0.0).abs() < 1e-3,
+            "ANANDA[2] = {}",
+            spirit[32]
+        );
+        assert!(
+            (spirit[33] - 1.0).abs() < 1e-3,
+            "ANANDA[3] = {}",
+            spirit[33]
+        );
+        assert!(
+            (spirit[34] - 0.0).abs() < 1e-3,
+            "ANANDA[4] = {}",
+            spirit[34]
+        );
+        assert!(
+            (spirit[35] - 0.35).abs() < 1e-3,
+            "ANANDA[5] = {}",
+            spirit[35]
+        );
         assert!((spirit[36] - 0.0).abs() < 1e-3);
         assert!((spirit[37] - 0.0).abs() < 1e-3);
-        assert!((spirit[38] - 0.0).abs() < 1e-3, "ANANDA[8] = {}", spirit[38]);
-        assert!((spirit[39] - 0.0).abs() < 1e-3, "ANANDA[9] = {}", spirit[39]);
+        assert!(
+            (spirit[38] - 0.0).abs() < 1e-3,
+            "ANANDA[8] = {}",
+            spirit[38]
+        );
+        assert!(
+            (spirit[39] - 0.0).abs() < 1e-3,
+            "ANANDA[9] = {}",
+            spirit[39]
+        );
         assert!((spirit[40] - 0.5).abs() < 1e-3);
         assert!((spirit[41] - 0.0).abs() < 1e-3);
-        assert!((spirit[42] - 0.833_f32).abs() < 5e-3, "ANANDA[12] = {}", spirit[42]);
-        assert!((spirit[43] - 0.0).abs() < 1e-3, "ANANDA[13] = {}", spirit[43]);
-        assert!((spirit[44] - 0.0).abs() < 1e-3, "ANANDA[14] = {}", spirit[44]);
+        assert!(
+            (spirit[42] - 0.833_f32).abs() < 5e-3,
+            "ANANDA[12] = {}",
+            spirit[42]
+        );
+        assert!(
+            (spirit[43] - 0.0).abs() < 1e-3,
+            "ANANDA[13] = {}",
+            spirit[43]
+        );
+        // ANANDA[14] flow_state RE-GROUNDED: no longer hard-zero at defaults.
+        //   min_coh(0.5) · substrate_success(0.7 default) · assess(0.5) · surrender(0.833)
+        //   = 0.5·0.7·0.5·0.833 ≈ 0.146.
+        assert!(
+            (spirit[44] - 0.146_f32).abs() < 5e-3,
+            "ANANDA[14] flow_state re-grounded = ~0.146, got {}",
+            spirit[44]
+        );
     }
 
     #[test]
@@ -1450,28 +1867,16 @@ mod tests {
                         Value::String("threats_detected".into()),
                         Value::Integer(5.into()),
                     ),
-                    (
-                        Value::String("rejections".into()),
-                        Value::Integer(4.into()),
-                    ),
-                    (
-                        Value::String("sovereignty_ratio".into()),
-                        Value::F64(0.7),
-                    ),
+                    (Value::String("rejections".into()), Value::Integer(4.into())),
+                    (Value::String("sovereignty_ratio".into()), Value::F64(0.7)),
                 ]),
             ),
             (
                 Value::String("assessment_stats".into()),
                 Value::Map(vec![
-                    (
-                        Value::String("average_score".into()),
-                        Value::F64(0.7),
-                    ),
+                    (Value::String("average_score".into()), Value::F64(0.7)),
                     (Value::String("trend".into()), Value::F64(0.05)),
-                    (
-                        Value::String("score_variance".into()),
-                        Value::F64(0.2),
-                    ),
+                    (Value::String("score_variance".into()), Value::F64(0.2)),
                 ]),
             ),
             (
@@ -1481,16 +1886,10 @@ mod tests {
                         Value::String("persistent_count".into()),
                         Value::Integer(200.into()),
                     ),
-                    (
-                        Value::String("growth_per_epoch".into()),
-                        Value::F64(2.0),
-                    ),
+                    (Value::String("growth_per_epoch".into()), Value::F64(2.0)),
                 ]),
             ),
-            (
-                Value::String("uptime_seconds".into()),
-                Value::F64(3600.0),
-            ),
+            (Value::String("uptime_seconds".into()), Value::F64(3600.0)),
             (
                 Value::String("art_count_500".into()),
                 Value::Integer(3.into()),
@@ -1515,22 +1914,44 @@ mod tests {
         //   CHIT[6] now uses memory.learning_velocity + meta_cgn deltas + vocab.
         //          With memory_stats not in test → all default 0.5/0:
         //          0.35*0.5 + 0.25*0 + 0.20*0 + 0.20*0 = 0.175.
-        assert!((spirit[2] - 0.7).abs() < 1e-3, "SAT[2] = {}", spirit[2]);
+        // D-SPEC-101 Phase-2: SAT[2] action_sovereignty = expr_window.sovereignty
+        //   (no expr_window in this payload → default 0.5).
+        assert!((spirit[2] - 0.5).abs() < 1e-3, "SAT[2] = {}", spirit[2]);
         assert!((spirit[3] - 0.0).abs() < 1e-3, "SAT[3] = {}", spirit[3]);
-        assert!((spirit[4] - 0.9836_f32).abs() < 1e-3, "SAT[4] = {}", spirit[4]);
+        assert!(
+            (spirit[4] - 0.9836_f32).abs() < 1e-3,
+            "SAT[4] = {}",
+            spirit[4]
+        );
         assert!((spirit[6] - 0.55).abs() < 1e-3);
         assert!((spirit[8] - 0.8).abs() < 1e-3);
         assert!((spirit[9] - 1.0).abs() < 1e-3);
-        assert!((spirit[12] - 0.4).abs() < 1e-3);
+        // D-SPEC-101 Phase-2: SAT[12] distinctive_voice = expr_window.variety
+        //   (no expr_window → 0.0).
+        assert!((spirit[12] - 0.0).abs() < 1e-3, "SAT[12] = {}", spirit[12]);
 
         assert!((spirit[15] - 0.20).abs() < 1e-3, "CHIT[0] = {}", spirit[15]);
-        assert!((spirit[21] - 0.175).abs() < 1e-3, "CHIT[6] = {}", spirit[21]);
+        assert!(
+            (spirit[21] - 0.175).abs() < 1e-3,
+            "CHIT[6] = {}",
+            spirit[21]
+        );
         assert!((spirit[24] - 0.55).abs() < 1e-3);
 
         // ANANDA[0] = success_rate = 0.8
-        assert!((spirit[30] - 0.8).abs() < 1e-3, "ANANDA[0] = {}", spirit[30]);
+        assert!(
+            (spirit[30] - 0.8).abs() < 1e-3,
+            "ANANDA[0] = {}",
+            spirit[30]
+        );
         // ANANDA[2] = mean_assessment = 0.7
-        assert!((spirit[32] - 0.7).abs() < 1e-3);
+        // D-SPEC-101 Phase-2: ANANDA[2] creative_impact = 0.5·(image+sound rate)
+        //   (no expr_window → 0.0).
+        assert!(
+            (spirit[32] - 0.0).abs() < 1e-3,
+            "ANANDA[2] = {}",
+            spirit[32]
+        );
     }
 
     #[test]
@@ -1539,22 +1960,10 @@ mod tests {
         let payload = Value::Map(vec![(
             Value::String("solana_stats".into()),
             Value::Map(vec![
-                (
-                    Value::String("identity_verified".into()),
-                    Value::F64(0.9),
-                ),
-                (
-                    Value::String("genesis_nft_exists".into()),
-                    Value::F64(1.0),
-                ),
-                (
-                    Value::String("tx_success_rate".into()),
-                    Value::F64(0.95),
-                ),
-                (
-                    Value::String("tx_count".into()),
-                    Value::Integer(50.into()),
-                ),
+                (Value::String("identity_verified".into()), Value::F64(0.9)),
+                (Value::String("genesis_nft_exists".into()), Value::F64(1.0)),
+                (Value::String("tx_success_rate".into()), Value::F64(0.95)),
+                (Value::String("tx_count".into()), Value::Integer(50.into())),
             ]),
         )]);
         let mut bytes = Vec::new();
@@ -1565,11 +1974,26 @@ mod tests {
         // SPEC §23.9 redesign overrides applied (Step 6 §4.3 P3):
         //   SAT[13] transactional_integrity REDESIGNED — no longer uses
         //   solana_stats.tx_success_rate. Now: anchor_count==0 → 0.5
-        //   (anchor_state not in test). SAT[0,5] still legacy compute_sat
-        //   reading solana_stats.identity_verified / genesis_nft_exists.
-        assert!((spirit[0] - 0.9).abs() < 1e-3, "SAT[0] = {}", spirit[0]);
-        assert!((spirit[5] - 1.0).abs() < 1e-3);
-        assert!((spirit[13] - 0.5).abs() < 1e-3, "SAT[13] = {}", spirit[13]);
+        //   (anchor_state not in test).
+        //   D-SPEC-101 Phase-2: SAT[0] world_recognition no longer reads
+        //   solana_stats.identity_verified — it reads outer_spirit_self_change
+        //   (rate-of-change of the other 44 dims, §85); absent → 0.0.
+        //   rFP §9 closure batch 2026-05-12: SAT[5] origin_anchoring
+        //   no longer reads solana_stats.genesis_nft_exists — it reads
+        //   the top-level genesis_record_exists key (not in this test
+        //   payload → 0.0).
+        assert!((spirit[0] - 0.0).abs() < 1e-3, "SAT[0] = {}", spirit[0]);
+        assert!(
+            (spirit[5] - 0.0).abs() < 1e-3,
+            "SAT[5] (rFP closure: top-level key absent) = {}",
+            spirit[5]
+        );
+        // SAT[13] RE-GROUNDED: no solana_tx_stats → 0 confirmed → 0.0.
+        assert!(
+            (spirit[13] - 0.0).abs() < 1e-3,
+            "SAT[13] no-tx = 0.0, got {}",
+            spirit[13]
+        );
     }
 
     #[test]
@@ -1599,10 +2023,7 @@ mod tests {
             (
                 Value::String("history".into()),
                 Value::Map(vec![
-                    (
-                        Value::String("circadian_alignment".into()),
-                        Value::F64(0.7),
-                    ),
+                    (Value::String("circadian_alignment".into()), Value::F64(0.7)),
                     (
                         Value::String("rest_performance_floor".into()),
                         Value::F64(0.85),
@@ -1620,12 +2041,20 @@ mod tests {
             project_outer_spirit_45d(&bytes, [0.5_f32; 5], [0.5_f32; 15], [0.5; 45]).unwrap();
 
         // CHIT[10] = 0.6*0.8 + 0.4*0.5 = 0.68
-        assert!((spirit[25] - 0.68).abs() < 1e-3, "CHIT[10] = {}", spirit[25]);
+        assert!(
+            (spirit[25] - 0.68).abs() < 1e-3,
+            "CHIT[10] = {}",
+            spirit[25]
+        );
         assert!((spirit[26] - 0.7).abs() < 1e-3);
         assert!((spirit[29] - 0.6).abs() < 1e-3, "CHIT[14] = {}", spirit[29]);
         assert!((spirit[40] - 0.85).abs() < 1e-3);
         // ANANDA[13] now 0 (outputs=0 with no agency_stats).
-        assert!((spirit[43] - 0.0).abs() < 1e-3, "ANANDA[13] = {}", spirit[43]);
+        assert!(
+            (spirit[43] - 0.0).abs() < 1e-3,
+            "ANANDA[13] = {}",
+            spirit[43]
+        );
     }
 
     #[test]
@@ -1636,10 +2065,7 @@ mod tests {
         let payload = Value::Map(vec![
             (
                 Value::String("hormone_levels".into()),
-                Value::Map(vec![(
-                    Value::String("CREATIVITY".into()),
-                    Value::F64(0.6),
-                )]),
+                Value::Map(vec![(Value::String("CREATIVITY".into()), Value::F64(0.6))]),
             ),
             (
                 Value::String("history".into()),
@@ -1654,7 +2080,11 @@ mod tests {
         let spirit =
             project_outer_spirit_45d(&bytes, [0.5_f32; 5], [0.5_f32; 15], [0.5; 45]).unwrap();
 
-        assert!((spirit[41] - 0.3).abs() < 1e-3, "ANANDA[11] = {}", spirit[41]);
+        assert!(
+            (spirit[41] - 0.3).abs() < 1e-3,
+            "ANANDA[11] = {}",
+            spirit[41]
+        );
     }
 
     #[test]
@@ -1690,6 +2120,211 @@ mod tests {
         assert!((spirit[19] - 1.0).abs() < 1e-3, "CHIT[4] = {}", spirit[19]);
     }
 
+    // ── rFP §9 closure batch tests — SAT[1,5,7] + ANANDA[7] ──
+
+    #[test]
+    fn project_45d_expr_window_drives_expression_cluster() {
+        // D-SPEC-101 Phase-2 (Maker §86, 2026-05-21): the rich expression
+        // rolling-window drives the outer_spirit expression cluster + [0]
+        // world_recognition reads the self-change rate (§85).
+        use rmpv::Value;
+        let bytes = {
+            let map = Value::Map(vec![
+                (
+                    Value::String("expr_window".into()),
+                    Value::Map(vec![
+                        (Value::String("variety".into()), Value::F64(0.50)),
+                        (Value::String("volume".into()), Value::F64(0.40)),
+                        (Value::String("sovereignty".into()), Value::F64(0.72)),
+                        (Value::String("image_rate".into()), Value::F64(0.30)),
+                        (Value::String("sound_rate".into()), Value::F64(0.10)),
+                    ]),
+                ),
+                (
+                    Value::String("outer_spirit_self_change".into()),
+                    Value::F64(0.18),
+                ),
+            ]);
+            let mut b = Vec::new();
+            rmpv::encode::write_value(&mut b, &map).unwrap();
+            b
+        };
+        let spirit =
+            project_outer_spirit_45d(&bytes, [0.5_f32; 5], [0.5_f32; 15], [0.5; 45]).unwrap();
+        // SAT[0] world_recognition = self_change = 0.18 (§85)
+        assert!((spirit[0] - 0.18).abs() < 1e-4, "SAT[0]={}", spirit[0]);
+        // SAT[1] expressive_authenticity = 0.5·(variety+volume) = 0.45
+        assert!((spirit[1] - 0.45).abs() < 1e-4, "SAT[1]={}", spirit[1]);
+        // SAT[2] action_sovereignty = sovereignty = 0.72
+        assert!((spirit[2] - 0.72).abs() < 1e-4, "SAT[2]={}", spirit[2]);
+        // SAT[12] distinctive_voice = variety = 0.50
+        assert!((spirit[12] - 0.50).abs() < 1e-4, "SAT[12]={}", spirit[12]);
+        // ANANDA[2] creative_impact = 0.5·(image+sound) = 0.20
+        assert!((spirit[32] - 0.20).abs() < 1e-4, "ANANDA[2]={}", spirit[32]);
+        // ANANDA[4] aesthetic_quality = volume = 0.40
+        assert!((spirit[34] - 0.40).abs() < 1e-4, "ANANDA[4]={}", spirit[34]);
+    }
+
+    #[test]
+    fn project_45d_sat5_genesis_record_exists_drives_origin_anchoring() {
+        use rmpv::Value;
+        // RE-GROUNDED (rFP_trinity_dim_resonance): SAT[5] = 0.5·genesis_present
+        //   + 0.3·(total_blocks/500) + 0.2·(1 - anchor_age/24h).
+        // Empty source → all three 0 → SAT[5] = 0.0.
+        let no_key = {
+            let mut bytes = Vec::new();
+            rmpv::encode::write_value(&mut bytes, &Value::Map(vec![])).unwrap();
+            bytes
+        };
+        let spirit =
+            project_outer_spirit_45d(&no_key, [0.5_f32; 5], [0.5_f32; 15], [0.5; 45]).unwrap();
+        assert_eq!(spirit[5], 0.0, "SAT[5] empty = 0.0");
+
+        // genesis_present only (no timechain stats) → 0.5·1 = 0.5.
+        let yes = {
+            let mut bytes = Vec::new();
+            rmpv::encode::write_value(
+                &mut bytes,
+                &Value::Map(vec![(
+                    Value::String("genesis_record_exists".into()),
+                    Value::Boolean(true),
+                )]),
+            )
+            .unwrap();
+            bytes
+        };
+        let spirit2 =
+            project_outer_spirit_45d(&yes, [0.5_f32; 5], [0.5_f32; 15], [0.5; 45]).unwrap();
+        assert!(
+            (spirit2[5] - 0.5).abs() < 1e-4,
+            "SAT[5] genesis-only = 0.5, got {}",
+            spirit2[5]
+        );
+
+        // Fully anchored: genesis + 500-block chain + just-anchored (age 0)
+        //   → 0.5 + 0.3 + 0.2 = 1.0.
+        let full = {
+            let mut bytes = Vec::new();
+            rmpv::encode::write_value(
+                &mut bytes,
+                &Value::Map(vec![
+                    (
+                        Value::String("genesis_record_exists".into()),
+                        Value::Boolean(true),
+                    ),
+                    (
+                        Value::String("timechain_genesis_stats".into()),
+                        Value::Map(vec![
+                            (Value::String("total_blocks".into()), Value::F64(500.0)),
+                            (Value::String("recent_anchor_age_s".into()), Value::F64(0.0)),
+                        ]),
+                    ),
+                ]),
+            )
+            .unwrap();
+            bytes
+        };
+        let spirit3 =
+            project_outer_spirit_45d(&full, [0.5_f32; 5], [0.5_f32; 15], [0.5; 45]).unwrap();
+        assert!(
+            (spirit3[5] - 1.0).abs() < 1e-4,
+            "SAT[5] fully anchored = 1.0, got {}",
+            spirit3[5]
+        );
+    }
+
+    #[test]
+    fn project_45d_sat7_world_footprint_weighted_log_sum() {
+        // Empty source → ALL streams 0 → score_sum=0 → SAT[7]=0.0.
+        let empty = empty_payload();
+        let spirit =
+            project_outer_spirit_45d(&empty, [0.5_f32; 5], [0.5_f32; 15], [0.5; 45]).unwrap();
+        assert_eq!(spirit[7], 0.0, "SAT[7] empty = 0.0");
+
+        // Saturated: 500 of each stream → score_sum = log1p(500) * 1.0 = target_log
+        // → SAT[7] = 1.0 (saturated).
+        use rmpv::Value;
+        let agency = Value::Map(vec![(
+            Value::String("total_actions".into()),
+            Value::F64(500.0),
+        )]);
+        let solana_stats = Value::Map(vec![(Value::String("tx_count".into()), Value::F64(500.0))]);
+        let mem = Value::Map(vec![(
+            Value::String("persistent_count".into()),
+            Value::F64(500.0),
+        )]);
+        let wf_extra = Value::Map(vec![
+            (
+                Value::String("arweave_inscriptions".into()),
+                Value::F64(500.0),
+            ),
+            (Value::String("meditation_memos".into()), Value::F64(500.0)),
+        ]);
+        let pairs = vec![
+            (Value::String("agency_stats".into()), agency),
+            (Value::String("solana_stats".into()), solana_stats),
+            (Value::String("memory_status".into()), mem),
+            (
+                Value::String("world_footprint_extra_counts".into()),
+                wf_extra,
+            ),
+            (Value::String("art_count_500".into()), Value::F64(250.0)),
+            (Value::String("audio_count_500".into()), Value::F64(250.0)),
+        ];
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &Value::Map(pairs)).unwrap();
+        let spirit =
+            project_outer_spirit_45d(&bytes, [0.5_f32; 5], [0.5_f32; 15], [0.5; 45]).unwrap();
+        assert!(
+            (spirit[7] - 1.0).abs() < 1e-4,
+            "SAT[7] saturated = 1.0, got {}",
+            spirit[7]
+        );
+    }
+
+    #[test]
+    fn project_45d_ananda7_capability_growth_multi_factor() {
+        // composition_level=3.0 / level_24h_ago=2.5 → delta=0.5 → clamp→0.5
+        // primitives_grounded_delta_24h=6 → min(1, 6/3)=1.0
+        // vocab.producible_delta_24h=20 → min(1, 20/10)=1.0
+        // reflex.distinct_fired_24h=5 → min(1, 5/5)=1.0
+        // ANANDA[7] = 0.30*0.5 + 0.25*1 + 0.25*1 + 0.20*1 = 0.15+0.25+0.25+0.20 = 0.85
+        use rmpv::Value;
+        let meta = Value::Map(vec![
+            (Value::String("composition_level".into()), Value::F64(3.0)),
+            (
+                Value::String("composition_level_24h_ago".into()),
+                Value::F64(2.5),
+            ),
+            (
+                Value::String("primitives_grounded_delta_24h".into()),
+                Value::F64(6.0),
+            ),
+        ]);
+        let vocab = Value::Map(vec![(
+            Value::String("producible_delta_24h".into()),
+            Value::F64(20.0),
+        )]);
+        let reflex = Value::Map(vec![(
+            Value::String("distinct_fired_24h".into()),
+            Value::F64(5.0),
+        )]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(
+            &mut bytes,
+            &Value::Map(vec![
+                (Value::String("meta_cgn_stats".into()), meta),
+                (Value::String("vocab_stats".into()), vocab),
+                (Value::String("reflex_stats".into()), reflex),
+            ]),
+        )
+        .unwrap();
+        let spirit =
+            project_outer_spirit_45d(&bytes, [0.5_f32; 5], [0.5_f32; 15], [0.5; 45]).unwrap();
+        // 0.30*0.5 + 0.25*1 + 0.25*1 + 0.20*1 = 0.85
+        assert!((spirit[37] - 0.85).abs() < 1e-3, "ANANDA[7]={}", spirit[37]);
+    }
+
     #[test]
     fn project_45d_malformed_envelope_returns_fallback() {
         // Top-level msgpack value that is NOT a map → fallback returned.
@@ -1712,7 +2347,7 @@ mod tests {
         let spirit = make_distinct_45d();
         let bytes = encode_spirit_state_payload(&spirit);
         use rmpv::Value;
-        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let v: Value = bytes; // §4.C-ter
         if let Value::Map(items) = v {
             for (k, val) in items {
                 if let Value::String(s) = k {
@@ -1739,7 +2374,7 @@ mod tests {
         let spirit = [0.0_f32; 45];
         let bytes = encode_spirit_state_payload(&spirit);
         use rmpv::Value;
-        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let v: Value = bytes; // §4.C-ter
         if let Value::Map(items) = v {
             for (k, val) in items {
                 if let Value::String(s) = k {
@@ -1754,125 +2389,47 @@ mod tests {
     }
 
     #[test]
-    fn filter_down_payload_observer_dims_excluded_per_g8() {
-        // CRITICAL G8 observance: outer_spirit_content[40] in
-        // OUTER_SPIRIT_FILTER_DOWN must be EXACTLY [5:45] of the 45D
-        // input — observer dims [0:5] never leak into the bus message.
-        let mut spirit = make_distinct_45d();
-        for slot in spirit[0..5].iter_mut() {
-            *slot = 99.99;
-        }
-        let bytes = encode_outer_spirit_filter_down_payload(&spirit);
+    fn filter_down_payload_field_shapes() {
+        // Encoder packs the engine's learned per-half multipliers verbatim:
+        // outer_body[5] + outer_mind[15] + outer_spirit_content[40].
+        // Observer masking (G8) is upstream — the engine emits 40D content
+        // by construction (half spirit content [25:65]).
         use rmpv::Value;
-        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
+        let body: Vec<f32> = vec![1.1, 0.9, 1.0, 1.2, 0.8];
+        let mind: Vec<f32> = (0..15).map(|i| 1.0 + (i as f32 - 7.0) * 0.02).collect();
+        let content: Vec<f32> = (0..40).map(|i| 1.0 + (i as f32 - 20.0) * 0.005).collect();
+        let v = encode_outer_spirit_filter_down_payload(&body, &mind, &content);
         let multipliers = if let Value::Map(items) = v {
-            items.into_iter().find_map(|(k, val)| {
-                if let Value::String(s) = k {
-                    if s.as_str() == Some("multipliers") {
-                        return Some(val);
-                    }
-                }
-                None
+            items.into_iter().find_map(|(k, val)| match k {
+                Value::String(s) if s.as_str() == Some("multipliers") => Some(val),
+                _ => None,
             })
         } else {
             None
         }
         .expect("multipliers field");
-
-        let mults_map = if let Value::Map(m) = multipliers {
+        let m = if let Value::Map(m) = multipliers {
             m
         } else {
-            panic!()
+            panic!("multipliers not a map")
         };
-        let content = mults_map
-            .into_iter()
-            .find_map(|(k, val)| {
-                if let Value::String(s) = k {
-                    if s.as_str() == Some("outer_spirit_content") {
-                        return Some(val);
+        let field_len = |name: &str| -> usize {
+            m.iter()
+                .find_map(|(k, val)| match (k, val) {
+                    (Value::String(s), Value::Array(a)) if s.as_str() == Some(name) => {
+                        Some(a.len())
                     }
-                }
-                None
-            })
-            .expect("outer_spirit_content field");
-
-        let arr = if let Value::Array(a) = content {
-            a
-        } else {
-            panic!()
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name} missing"))
         };
-        assert_eq!(arr.len(), 40, "outer_spirit_content MUST be 40D per G8");
-        for v in &arr {
-            if let Value::F64(f) = v {
-                assert_ne!(
-                    *f, 99.99,
-                    "observer sentinel leaked into outer_spirit_content"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn filter_down_payload_outer_body_is_5d() {
-        let spirit = [0.5_f32; 45];
-        let bytes = encode_outer_spirit_filter_down_payload(&spirit);
-        use rmpv::Value;
-        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
-        let mults = if let Value::Map(items) = v {
-            items.into_iter().find_map(|(k, val)| {
-                if let Value::String(s) = k {
-                    if s.as_str() == Some("multipliers") {
-                        return Some(val);
-                    }
-                }
-                None
-            })
-        } else {
-            None
-        }
-        .unwrap();
-        if let Value::Map(m) = mults {
-            for (k, val) in m {
-                if let Value::String(s) = k {
-                    if s.as_str() == Some("outer_body") {
-                        if let Value::Array(arr) = val {
-                            assert_eq!(arr.len(), 5);
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-        panic!("outer_body field missing or wrong shape");
-    }
-
-    #[test]
-    fn filter_down_payload_outer_mind_is_15d() {
-        let spirit = [0.5_f32; 45];
-        let bytes = encode_outer_spirit_filter_down_payload(&spirit);
-        use rmpv::Value;
-        let v: Value = rmpv::decode::read_value(&mut std::io::Cursor::new(&bytes)).unwrap();
-        if let Value::Map(items) = v {
-            for (k, val) in items {
-                if let Value::String(s) = k {
-                    if s.as_str() == Some("multipliers") {
-                        if let Value::Map(m) = val {
-                            for (k2, v2) in m {
-                                if let Value::String(s2) = k2 {
-                                    if s2.as_str() == Some("outer_mind") {
-                                        if let Value::Array(arr) = v2 {
-                                            assert_eq!(arr.len(), 15);
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        panic!("outer_mind field missing");
+        assert_eq!(field_len("outer_body"), 5);
+        assert_eq!(field_len("outer_mind"), 15);
+        assert_eq!(
+            field_len("outer_spirit_content"),
+            40,
+            "content MUST be 40D per G8"
+        );
     }
 
     #[test]
@@ -1898,9 +2455,7 @@ mod tests {
                 Value::Array(mults_arr),
             )]),
         )]);
-        let mut bytes = Vec::new();
-        rmpv::encode::write_value(&mut bytes, &payload).unwrap();
-        let mults = decode_unified_outer_spirit_content(&bytes).unwrap();
+        let mults = decode_unified_outer_spirit_content(&payload).unwrap();
         assert_eq!(mults.len(), 40);
     }
 
@@ -1915,9 +2470,7 @@ mod tests {
                 Value::Array(mults_arr),
             )]),
         )]);
-        let mut bytes = Vec::new();
-        rmpv::encode::write_value(&mut bytes, &payload).unwrap();
-        assert!(decode_unified_outer_spirit_content(&bytes).is_err());
+        assert!(decode_unified_outer_spirit_content(&payload).is_err());
     }
 
     #[test]
@@ -1932,14 +2485,16 @@ mod tests {
 
     #[test]
     fn stale_threshold_is_3x_cadence() {
-        assert_eq!(outer_spirit_stale_threshold_s(), 90.0);
+        // SPEC §18.1 + D-SPEC-100: outer_spirit cadence 5s × 3 = 15s
+        assert_eq!(outer_spirit_stale_threshold_s(), 15.0);
     }
 
     #[test]
     fn cadence_constants_match_spec() {
-        // Sensor sidecar refresh cadence (post-A.S8: stale threshold source).
-        assert_eq!(OUTER_SPIRIT_TICK_BASE_S, 30.0);
-        // Bus publish throttle (post-A.S8 D2 — Schumann spirit/3 × 13 ≈ 5s).
+        // Sensor sidecar source-refresh cadence (D-SPEC-100: stale threshold source).
+        // G13 spirit-fastest: 5s = strict 1:3:9 (spirit 5 / mind 15 / body 45).
+        assert_eq!(OUTER_SPIRIT_TICK_BASE_S, 5.0);
+        // Bus publish throttle (Schumann spirit ≈ 5s) — now mirrors TICK_BASE.
         assert_eq!(OUTER_SPIRIT_BUS_PUBLISH_INTERVAL_S, 5.0);
     }
 
@@ -1991,30 +2546,18 @@ mod tests {
                         Value::String("threats_detected".into()),
                         Value::Integer(3.into()),
                     ),
-                    (
-                        Value::String("rejections".into()),
-                        Value::Integer(2.into()),
-                    ),
-                    (
-                        Value::String("sovereignty_ratio".into()),
-                        Value::F64(0.6),
-                    ),
+                    (Value::String("rejections".into()), Value::Integer(2.into())),
+                    (Value::String("sovereignty_ratio".into()), Value::F64(0.6)),
                 ]),
             ),
             (
                 Value::String("assessment_stats".into()),
                 Value::Map(vec![
-                    (
-                        Value::String("average_score".into()),
-                        Value::F64(0.65),
-                    ),
+                    (Value::String("average_score".into()), Value::F64(0.65)),
                     (Value::String("trend".into()), Value::F64(0.03)),
                 ]),
             ),
-            (
-                Value::String("uptime_seconds".into()),
-                Value::F64(7200.0),
-            ),
+            (Value::String("uptime_seconds".into()), Value::F64(7200.0)),
             (
                 Value::String("art_count_500".into()),
                 Value::Integer(2.into()),

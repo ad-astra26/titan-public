@@ -20,7 +20,7 @@ import time
 import msgpack
 import pytest
 
-from titan_plugin.core.bus_socket import (
+from titan_hcl.core.bus_socket import (
     PING_INTERVAL_S,
     BusSocketClient,
     BusSocketServer,

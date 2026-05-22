@@ -58,15 +58,15 @@ class TestAgencyModuleHandleIntent:
 
     @pytest.mark.asyncio
     async def test_handle_intent_no_helpers(self):
-        from titan_plugin.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.module import AgencyModule
         agency = AgencyModule()
         result = await agency.handle_intent(_make_intent())
         assert result is None  # No helpers registered → skip
 
     @pytest.mark.asyncio
     async def test_handle_intent_rule_based(self):
-        from titan_plugin.logic.agency.module import AgencyModule
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.registry import HelperRegistry
         registry = HelperRegistry()
         registry.register(MockHelper("web_search"))
         agency = AgencyModule(registry=registry)
@@ -80,8 +80,8 @@ class TestAgencyModuleHandleIntent:
 
     @pytest.mark.asyncio
     async def test_handle_intent_fallback_helper(self):
-        from titan_plugin.logic.agency.module import AgencyModule
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.registry import HelperRegistry
         registry = HelperRegistry()
         registry.register(MockHelper("only_helper"))
         agency = AgencyModule(registry=registry)
@@ -93,8 +93,8 @@ class TestAgencyModuleHandleIntent:
 
     @pytest.mark.asyncio
     async def test_handle_intent_helper_error(self):
-        from titan_plugin.logic.agency.module import AgencyModule
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.registry import HelperRegistry
         registry = HelperRegistry()
         registry.register(FailingHelper("web_search"))
         agency = AgencyModule(registry=registry)
@@ -106,8 +106,8 @@ class TestAgencyModuleHandleIntent:
 
     @pytest.mark.asyncio
     async def test_action_counter_increments(self):
-        from titan_plugin.logic.agency.module import AgencyModule
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.registry import HelperRegistry
         registry = HelperRegistry()
         registry.register(MockHelper("web_search"))
         agency = AgencyModule(registry=registry)
@@ -122,8 +122,8 @@ class TestAgencyModuleBudget:
 
     @pytest.mark.asyncio
     async def test_budget_exhausted_skips(self):
-        from titan_plugin.logic.agency.module import AgencyModule
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.registry import HelperRegistry
 
         async def mock_llm(prompt):
             return '{"helper": "web_search", "params": {}, "reasoning": "test"}'
@@ -142,7 +142,7 @@ class TestAgencyModuleBudget:
     @pytest.mark.asyncio
     async def test_budget_resets_after_hour(self):
         import time
-        from titan_plugin.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.module import AgencyModule
         agency = AgencyModule(budget_per_hour=1)
         agency._llm_calls_this_hour = 1
         agency._hour_start = time.time() - 3601  # Force hour reset
@@ -155,8 +155,8 @@ class TestAgencyModuleLLMSelection:
 
     @pytest.mark.asyncio
     async def test_llm_selects_helper(self):
-        from titan_plugin.logic.agency.module import AgencyModule
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.registry import HelperRegistry
 
         async def mock_llm(prompt):
             return '{"helper": "web_search", "params": {"query": "solana"}, "reasoning": "need research"}'
@@ -171,8 +171,8 @@ class TestAgencyModuleLLMSelection:
 
     @pytest.mark.asyncio
     async def test_llm_returns_none(self):
-        from titan_plugin.logic.agency.module import AgencyModule
-        from titan_plugin.logic.agency.registry import HelperRegistry
+        from titan_hcl.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.registry import HelperRegistry
 
         async def mock_llm(prompt):
             return '{"helper": "none", "reasoning": "nothing fits"}'
@@ -190,24 +190,24 @@ class TestAgencyModuleParsing:
     """JSON parsing from LLM responses."""
 
     def test_parse_plain_json(self):
-        from titan_plugin.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.module import AgencyModule
         result = AgencyModule._parse_selection('{"helper": "web_search", "params": {}}')
         assert result["helper"] == "web_search"
 
     def test_parse_markdown_block(self):
-        from titan_plugin.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.module import AgencyModule
         raw = 'Here is my choice:\n```json\n{"helper": "web_search", "params": {}}\n```'
         result = AgencyModule._parse_selection(raw)
         assert result["helper"] == "web_search"
 
     def test_parse_embedded_json(self):
-        from titan_plugin.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.module import AgencyModule
         raw = 'I think the best option is {"helper": "art_generate", "params": {}} because it fits.'
         result = AgencyModule._parse_selection(raw)
         assert result["helper"] == "art_generate"
 
     def test_parse_garbage_returns_none(self):
-        from titan_plugin.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.module import AgencyModule
         result = AgencyModule._parse_selection("this is not json at all")
         assert result is None
 
@@ -216,7 +216,7 @@ class TestAgencyModuleStats:
     """Stats and introspection."""
 
     def test_stats_structure(self):
-        from titan_plugin.logic.agency.module import AgencyModule
+        from titan_hcl.logic.agency.module import AgencyModule
         agency = AgencyModule()
         stats = agency.get_stats()
         assert "action_count" in stats

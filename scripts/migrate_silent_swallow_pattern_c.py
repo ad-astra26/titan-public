@@ -18,7 +18,7 @@ scope:
   - Only converts EXCEPT handlers whose body is exactly one logger.debug
     call (single statement). Multi-statement bodies, bare-pass, and
     rethrows are left alone for manual review.
-  - Adds `from titan_plugin.utils.silent_swallow import swallow_warn`
+  - Adds `from titan_hcl.utils.silent_swallow import swallow_warn`
     once per file if missing.
 
 usage:
@@ -47,7 +47,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from arch_map_dead_wiring import find_silent_swallows  # type: ignore  # noqa: E402
 
-IMPORT_LINE = "from titan_plugin.utils.silent_swallow import swallow_warn"
+IMPORT_LINE = "from titan_hcl.utils.silent_swallow import swallow_warn"
 
 
 @dataclass
@@ -75,11 +75,11 @@ class Rewrite:
 def _file_module_key(file: Path) -> str:
     """Stable module-prefix for the swallow_warn `key=` argument.
 
-    Example: titan_plugin/logic/backup.py → "logic.backup".
+    Example: titan_hcl/logic/backup.py → "logic.backup".
     """
     rel = file.relative_to(REPO_ROOT)
     parts = rel.with_suffix("").parts
-    if parts and parts[0] == "titan_plugin":
+    if parts and parts[0] == "titan_hcl":
         parts = parts[1:]
     return ".".join(parts)
 
@@ -402,8 +402,8 @@ def apply_rewrites_to_file(file: Path, rewrites: list[Rewrite]) -> tuple[str, st
 
 
 def _has_top_level_swallow_warn_import(text: str) -> bool:
-    """Returns True iff a `from titan_plugin.utils.silent_swallow import
-    swallow_warn` (or an `import titan_plugin.utils.silent_swallow ...`)
+    """Returns True iff a `from titan_hcl.utils.silent_swallow import
+    swallow_warn` (or an `import titan_hcl.utils.silent_swallow ...`)
     is present at module scope."""
     try:
         tree = ast.parse(text)
@@ -411,19 +411,19 @@ def _has_top_level_swallow_warn_import(text: str) -> bool:
         return False
     for node in tree.body:
         if isinstance(node, ast.ImportFrom):
-            if node.module == "titan_plugin.utils.silent_swallow":
+            if node.module == "titan_hcl.utils.silent_swallow":
                 for alias in node.names:
                     if alias.name == "swallow_warn":
                         return True
         elif isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name == "titan_plugin.utils.silent_swallow":
+                if alias.name == "titan_hcl.utils.silent_swallow":
                     return True
     return False
 
 
 def _insert_import(text: str) -> str:
-    """Insert `from titan_plugin.utils.silent_swallow import swallow_warn`
+    """Insert `from titan_hcl.utils.silent_swallow import swallow_warn`
     after the last existing top-level import statement.
 
     Uses AST to locate the last top-level Import/ImportFrom node so we
@@ -468,8 +468,8 @@ def main() -> int:
                     help="Write changes to disk. Default is dry-run.")
     ap.add_argument("--tier", action="append", choices=["T2", "T3", "T4"],
                     help="Tiers to migrate. Default: T2 + T3.")
-    ap.add_argument("--root", default="titan_plugin", type=Path,
-                    help="Scan root (default: titan_plugin)")
+    ap.add_argument("--root", default="titan_hcl", type=Path,
+                    help="Scan root (default: titan_hcl)")
     args = ap.parse_args()
 
     tiers = set(args.tier) if args.tier else {"T2", "T3"}
