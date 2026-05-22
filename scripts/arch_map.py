@@ -9243,6 +9243,13 @@ def main():
         print(f"  {len(graph['definitions'])} definitions indexed")
         print(f"  {len(graph['attr_index'])} attribute access patterns tracked")
 
+    elif cmd == "trinity-conformance":
+        # Trinity SPEC-conformance gate: run the clause→test manifest checker
+        # (titan-docs/specs/TRINITY_CONFORMANCE.md / scripts/trinity_conformance.py).
+        # Pass-through args, e.g. `--strict` (fail on any PENDING = "P0 done" gate).
+        import trinity_conformance
+        sys.exit(trinity_conformance.main(sys.argv[2:]))
+
     elif cmd == "query" and len(sys.argv) >= 3:
         graph = load_graph()
         pattern = sys.argv[2]
