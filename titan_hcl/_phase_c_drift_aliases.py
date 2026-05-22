@@ -6,7 +6,7 @@ existing modules MAY continue to import old names from here.
 NEW modules MUST import canonical names from `_phase_c_constants.py`.
 
 Coverage: drift items D01-D11/D13-D15/D18-D29 from
-`titan-docs/SPEC_titan_architecture.md §3` whose canonical name has
+`titan-docs/specs/SPEC_titan_architecture.md §3` whose canonical name has
 landed in `_phase_c_constants.py` (auto-generated from
 `SPEC_titan_architecture_constants.toml`). Drift items whose canonical
 name is not yet TOML-sourced (e.g. SWAP_AUDIT_LOG_PATH, SWAP_ACTIVE_PORT_PATH,

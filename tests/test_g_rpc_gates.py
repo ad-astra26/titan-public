@@ -70,7 +70,7 @@ def test_g_rpc_4_only():
 def test_exemptions_yaml_parseable():
     """phase_c_rpc_exemptions.yaml must be valid YAML."""
     import yaml
-    p = REPO_ROOT / "titan-docs" / "phase_c_rpc_exemptions.yaml"
+    p = REPO_ROOT / "titan-docs" / "specs" / "phase_c_rpc_exemptions.yaml"
     assert p.exists(), "exemptions YAML missing"
     with p.open() as f:
         data = yaml.safe_load(f)
@@ -89,7 +89,7 @@ def test_exemptions_yaml_parseable():
 
 def test_18_shm_slots_in_spec():
     """Verify all 18 Sessions 1-4 SHM slots appear in SPEC §7.1."""
-    spec = REPO_ROOT / "titan-docs" / "SPEC_titan_architecture.md"
+    spec = REPO_ROOT / "titan-docs" / "specs" / "SPEC_titan_architecture.md"
     text = spec.read_text(encoding="utf-8")
     expected_slots = [
         "hormone_fires.bin", "impulse_engine_state.bin",
@@ -108,7 +108,7 @@ def test_18_shm_slots_in_spec():
 
 def test_constants_toml_has_36_session_constants():
     """36 SCHEMA_VERSION + MAX_BYTES constants for the 18 slots."""
-    toml = REPO_ROOT / "titan-docs" / "SPEC_titan_architecture_constants.toml"
+    toml = REPO_ROOT / "titan-docs" / "specs" / "SPEC_titan_architecture_constants.toml"
     text = toml.read_text(encoding="utf-8")
     slot_prefixes = [
         "HORMONE_FIRES", "IMPULSE_ENGINE_STATE", "CONSCIOUSNESS_STATE",

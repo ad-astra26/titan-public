@@ -18,7 +18,7 @@ Methods classified per Preamble G19 + §1.B:
   - get_or_create_user      → bus.request_async + 5s timeout (true
                               work-RPC: write/upsert per Preamble G19;
                               exemption rationale in
-                              titan-docs/phase_c_rpc_exemptions.yaml)
+                              titan-docs/specs/phase_c_rpc_exemptions.yaml)
   - should_engage           → bus.request_async + 5s timeout (true
                               work-RPC: computation that needs
                               SocialGraph state — same exemption)

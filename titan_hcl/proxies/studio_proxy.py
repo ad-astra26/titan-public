@@ -444,7 +444,7 @@ class StudioProxy:
         self, category: str = "all", limit: int = 20,
     ) -> list[dict]:
         """Fetch recent artifacts via bus.QUERY work-RPC. G19-compliant (≤2s).
-        Allowlisted in `titan-docs/phase_c_rpc_exemptions.yaml` under
+        Allowlisted in `titan-docs/specs/phase_c_rpc_exemptions.yaml` under
         `studio_proxy:`. Returns [] on timeout / error.
         """
         self._ensure_started()

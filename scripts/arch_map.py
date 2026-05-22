@@ -9886,7 +9886,7 @@ def main():
         sys.exit(rc)
 
     elif cmd == "phase-c":
-        # SPEC enforcer per titan-docs/SPEC_titan_architecture.md §20.
+        # SPEC enforcer per titan-docs/specs/SPEC_titan_architecture.md §20.
         # Reads SPEC_titan_architecture_constants.toml as single source of truth
         # (no hardcoded SPEC values in arch_map source per §2.6 live-versioning).
         # Sub-actions:
@@ -10114,7 +10114,7 @@ def run_reload_module_command(args: list) -> int:
     return 0 if last_status == "ready" else 1
 
 
-# ── Phase C SPEC enforcer (titan-docs/SPEC_titan_architecture.md §20) ──
+# ── Phase C SPEC enforcer (titan-docs/specs/SPEC_titan_architecture.md §20) ──
 
 def run_phase_c_command(args: list) -> int:
     """Dispatch `arch_map phase-c <action>` per SPEC §20."""
@@ -10164,7 +10164,7 @@ def run_phase_c_command(args: list) -> int:
 def _phase_c_help() -> int:
     print(
         """\
-arch_map phase-c — SPEC enforcer per titan-docs/SPEC_titan_architecture.md §20
+arch_map phase-c — SPEC enforcer per titan-docs/specs/SPEC_titan_architecture.md §20
 
 Actions:
   verify [--strict] [--json]   Static check codebase against SPEC. --strict exits
@@ -10199,8 +10199,8 @@ Actions:
                                   --json            machine-readable
                                   --strict          exit non-zero if any STUCK/SLOW
 
-Source of truth: titan-docs/SPEC_titan_architecture_constants.toml +
-                 titan-docs/SPEC_titan_architecture.md (Preamble G17 +
+Source of truth: titan-docs/specs/SPEC_titan_architecture_constants.toml +
+                 titan-docs/specs/SPEC_titan_architecture.md (Preamble G17 +
                  master plan §7 Cargo Workspace Structure for ownership map)
 """
     )
@@ -10757,7 +10757,7 @@ def _phase_c_load_toml() -> dict:
         import tomllib  # py 3.11+
     except ImportError:
         import tomli as tomllib  # type: ignore
-    path = _phase_c_repo_root() / "titan-docs" / "SPEC_titan_architecture_constants.toml"
+    path = _phase_c_repo_root() / "titan-docs" / "specs" / "SPEC_titan_architecture_constants.toml"
     if not path.exists():
         print(f"ERROR: SPEC TOML not found at {path}", file=sys.stderr)
         sys.exit(2)
@@ -10790,7 +10790,7 @@ def _phase_c_g_rpc_gates(repo, gates: "set | None") -> list:
     findings: list = []
     titan_hcl = repo / "titan_hcl"
     proxies_dir = titan_hcl / "proxies"
-    exemptions_path = repo / "titan-docs" / "phase_c_rpc_exemptions.yaml"
+    exemptions_path = repo / "titan-docs" / "specs" / "phase_c_rpc_exemptions.yaml"
 
     # Load exemptions YAML (work-RPC allowlist + orphan handler allowlist).
     exempt_files: set = set()
@@ -11119,7 +11119,7 @@ def _phase_c_g_rpc_5(repo, titan_hcl) -> list:
            anywhere in `titan_hcl/`. Catches standing up a Python
            writer for a Rust-canonical L0+L1 slot.
 
-    Allowlist: `titan-docs/g_rpc_5_allowlist.yaml` — same Maker greenlight
+    Allowlist: `titan-docs/specs/g_rpc_5_allowlist.yaml` — same Maker greenlight
     discipline as `phase_c_rpc_exemptions.yaml`.
     """
     import ast
@@ -11130,7 +11130,7 @@ def _phase_c_g_rpc_5(repo, titan_hcl) -> list:
     # Load allowlist
     allow_cache: set = set()  # (file, line) OR (file, key)
     allow_writer: set = set()  # (file, line) OR (file, slot)
-    allowlist_path = repo / "titan-docs" / "g_rpc_5_allowlist.yaml"
+    allowlist_path = repo / "titan-docs" / "specs" / "g_rpc_5_allowlist.yaml"
     if allowlist_path.exists():
         try:
             with allowlist_path.open() as fh:
@@ -11214,7 +11214,7 @@ def _phase_c_g_rpc_5(repo, titan_hcl) -> list:
                         "migrate to SHM-direct via ShmReaderBank.read_<slot>() "
                         "per Preamble G18 (D-SPEC-71 / D-SPEC-78 / D-SPEC-79 / "
                         "D-SPEC-80); or add an entry to "
-                        "titan-docs/g_rpc_5_allowlist.yaml with rationale + "
+                        "titan-docs/specs/g_rpc_5_allowlist.yaml with rationale + "
                         "Maker greenlight"
                     ),
                 })
@@ -11339,12 +11339,12 @@ def _phase_c_verify(strict: bool = False, json_mode: bool = False,
         })
 
     # Check 4: SPEC doc presence
-    spec_doc = repo / "titan-docs" / "SPEC_titan_architecture.md"
+    spec_doc = repo / "titan-docs" / "specs" / "SPEC_titan_architecture.md"
     if not spec_doc.exists():
         findings.append({
             "kind": "SPEC_DOC_MISSING",
             "severity": "CRITICAL",
-            "message": "SPEC document not found at titan-docs/SPEC_titan_architecture.md",
+            "message": "SPEC document not found at titan-docs/specs/SPEC_titan_architecture.md",
             "remediation": "restore from git history",
         })
 
@@ -11386,7 +11386,7 @@ def _phase_c_verify(strict: bool = False, json_mode: bool = False,
 def _phase_c_diff(ref1: str, ref2: str) -> int:
     """Show SPEC delta between two git refs (TOML diff with constant-level summary)."""
     import subprocess
-    toml_path = "titan-docs/SPEC_titan_architecture_constants.toml"
+    toml_path = "titan-docs/specs/SPEC_titan_architecture_constants.toml"
     print(f"=== SPEC delta {ref1} → {ref2} ===\n")
     result = subprocess.run(
         ["git", "diff", "--no-color", f"{ref1}..{ref2}", "--", toml_path],

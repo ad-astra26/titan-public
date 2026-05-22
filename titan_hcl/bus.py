@@ -1394,7 +1394,7 @@ class DivineBus:
     # State lookup MUST go via SHM (Preamble G18). Work-RPC MUST go via
     # bus.request_async with explicit timeout (Preamble G19). The list of
     # legitimate sync bus.request call sites is enumerated in
-    # titan-docs/phase_c_rpc_exemptions.yaml — every call site there has
+    # titan-docs/specs/phase_c_rpc_exemptions.yaml — every call site there has
     # documented rationale + bounded timeout. NEW use of bus.request()
     # is a SPEC violation (G22 — no new sync-RPC patterns post-Phase-C).
     #
@@ -1414,7 +1414,7 @@ class DivineBus:
         bus.request_async with explicit timeout for work-RPC
         (Preamble G19). New use is a SPEC violation per G22.
         Existing legitimate call sites are enumerated in
-        titan-docs/phase_c_rpc_exemptions.yaml.
+        titan-docs/specs/phase_c_rpc_exemptions.yaml.
 
         Publishes a QUERY, waits for a matching RESPONSE on the reply_queue.
         Caller must provide their own reply_queue (from subscribe()).
@@ -1435,7 +1435,7 @@ class DivineBus:
                         f"via StateRegistryReader for state lookup (G18) or "
                         f"bus.request_async with explicit timeout for "
                         f"work-RPC (G19). See "
-                        f"titan-docs/phase_c_rpc_exemptions.yaml for the "
+                        f"titan-docs/specs/phase_c_rpc_exemptions.yaml for the "
                         f"allowlist of legitimate sync sites.",
                         DeprecationWarning, stacklevel=2,
                     )

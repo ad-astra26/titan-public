@@ -2,7 +2,7 @@
 """
 generate_phase_c_constants.py — regenerator for Titan SPEC constants.
 
-Reads `titan-docs/SPEC_titan_architecture_constants.toml` (single source of truth
+Reads `titan-docs/specs/SPEC_titan_architecture_constants.toml` (single source of truth
 per SPEC §19) and emits two byte-identical generated files:
 
   - titan_hcl/_phase_c_constants.py   (Python `Final[T]` annotations)
@@ -30,7 +30,7 @@ except ImportError:
     import tomli as tomllib  # type: ignore
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TOML_PATH = REPO_ROOT / "titan-docs" / "SPEC_titan_architecture_constants.toml"
+TOML_PATH = REPO_ROOT / "titan-docs" / "specs" / "SPEC_titan_architecture_constants.toml"
 PYTHON_OUT = REPO_ROOT / "titan_hcl" / "_phase_c_constants.py"
 RUST_DIR = REPO_ROOT / "titan-rust" / "crates" / "titan-core" / "src"
 RUST_OUT = RUST_DIR / "constants.rs"
@@ -195,7 +195,7 @@ def render_python(toml: dict, toml_sha: str) -> str:
     lines.append(
         PY_HEADER.format(
             name="_phase_c_constants.py",
-            source="titan-docs/SPEC_titan_architecture_constants.toml",
+            source="titan-docs/specs/SPEC_titan_architecture_constants.toml",
             spec_version=spec_version,
             toml_sha256=toml_sha,
         )
@@ -252,7 +252,7 @@ def render_rust(toml: dict, toml_sha: str) -> str:
     lines.append(
         RUST_HEADER.format(
             name="constants.rs",
-            source="titan-docs/SPEC_titan_architecture_constants.toml",
+            source="titan-docs/specs/SPEC_titan_architecture_constants.toml",
             spec_version=spec_version,
             toml_sha256=toml_sha,
         )

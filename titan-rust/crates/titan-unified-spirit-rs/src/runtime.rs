@@ -33,7 +33,10 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use crate::boot::{build_advance_callback, run_bus_dispatch_loop, REQUIRED_SUBSCRIPTIONS};
+use crate::boot::{
+    build_advance_callback, run_bus_dispatch_loop, run_sphere_clock_poll_loop,
+    REQUIRED_SUBSCRIPTIONS,
+};
 use crate::cli::Cli;
 use crate::exit::UnifiedSpiritExitCode;
 use crate::filter_down::{encode_filter_down_payload, FilterDownV5Engine};
@@ -207,14 +210,28 @@ impl Runtime {
             great_pulse_rx,
         );
 
-        // Step 8: spawn bus dispatch loop
-        let on_big_pulse = build_advance_callback(spirit.clone(), detector.clone(), great_pulse_tx);
+        // Step 8: spawn bus dispatch loop (control topics only —
+        // KERNEL_SHUTDOWN / TOPOLOGY / CHILD_DOWN). The resonance detector
+        // is NO LONGER fed from the bus (D-SPEC-117).
         let dispatch_handle = tokio::spawn({
             let client = bus_client.clone();
-            let det = detector.clone();
             let flag = shutdown_flag.clone();
             async move {
-                run_bus_dispatch_loop(client, det, on_big_pulse, flag).await;
+                run_bus_dispatch_loop(client, flag).await;
+            }
+        });
+
+        // Step 8b (D-SPEC-117 / G18): feed the ResonanceDetector SHM-direct
+        // from sphere_clocks.bin instead of the SPHERE_PULSE bus event.
+        let on_big_pulse = build_advance_callback(spirit.clone(), detector.clone(), great_pulse_tx);
+        // Detached: dropping the handle does NOT abort the task (tokio
+        // semantics); the loop stops gracefully on `shutdown_flag`.
+        let _sphere_poll_handle = tokio::spawn({
+            let det = detector.clone();
+            let flag = shutdown_flag.clone();
+            let dir = shm_dir.clone();
+            async move {
+                run_sphere_clock_poll_loop(dir, cadence_ms, det, on_big_pulse, flag).await;
             }
         });
 

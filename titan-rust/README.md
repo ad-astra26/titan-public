@@ -4,8 +4,8 @@ Phase C ships Titan's microkernel + supervision tree as a hierarchical Rust proc
 
 ## Canonical references (read first)
 
-- **`titan-docs/SPEC_titan_architecture.md`** v0.1.0 — single source of truth for every constant, byte layout, bus message, and supervision contract.
-- **`titan-docs/SPEC_titan_architecture_constants.toml`** — generates `crates/titan-core/src/constants.rs` + `titan_plugin/_phase_c_constants.py` via `arch_map phase-c regen`.
+- **`titan-docs/specs/SPEC_titan_architecture.md`** v0.1.0 — single source of truth for every constant, byte layout, bus message, and supervision contract.
+- **`titan-docs/specs/SPEC_titan_architecture_constants.toml`** — generates `crates/titan-core/src/constants.rs` + `titan_plugin/_phase_c_constants.py` via `arch_map phase-c regen`.
 - **`titan-docs/finished/PLAN_microkernel_phase_c_l0_l1_rust.md`** — MASTER PLAN (24 D-decisions, 8-session sequence).
 - **`titan-docs/PLAN_microkernel_phase_c_s2_kernel.md`** — current session PLAN (kernel binary).
 

@@ -27,18 +27,24 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::resonance::{BigPulse, ResonanceDetector};
 use crate::unified_spirit::{ResonanceSnapshot, UnifiedSpirit};
 use titan_bus::client::{extract_payload, BusClient, InboundEvent};
 
-/// Topics the unified-spirit-rs binary subscribes to per SPEC §9.A
-/// REQUIRED set + Decision Log D-SPEC-26 (SPHERE_PULSE added in
-/// SPEC v0.1.3).
-pub const REQUIRED_SUBSCRIPTIONS: [&str; 4] = [
+/// Topics the unified-spirit-rs binary subscribes to per SPEC §9.A.
+///
+/// `SPHERE_PULSE` is NO LONGER a bus subscription (D-SPEC-117): the
+/// resonance detector now reads `sphere_clocks.bin` SHM-direct per
+/// Preamble G18 (state via SHM, not bus). The bus `SPHERE_PULSE` event is
+/// retained for observers (observatory_worker → dashboard WS) but the
+/// detector derives pulse + sustained-balance from the SHM slot the
+/// substrate already writes — eliminating the fragile broker-delivery path
+/// that left the detector starved fleet-wide (see
+/// `project_sphere_pulse_not_reaching_broker_freeze_20260522`).
+pub const REQUIRED_SUBSCRIPTIONS: [&str; 3] = [
     "TRINITY_SUBSTRATE_TOPOLOGY_UPDATED",
-    "SPHERE_PULSE",
     "KERNEL_SHUTDOWN_ANNOUNCE",
     "SUPERVISION_CHILD_DOWN",
 ];
@@ -240,8 +246,6 @@ fn build_resonance_snapshot(
 /// `UnifiedSpirit::advance()`.
 pub async fn run_bus_dispatch_loop(
     client: Arc<BusClient>,
-    detector: Arc<Mutex<ResonanceDetector>>,
-    on_big_pulse: impl Fn(BigPulse) + Send + Sync + 'static,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
 ) {
     info!(
@@ -272,33 +276,7 @@ pub async fn run_bus_dispatch_loop(
         };
 
         match event {
-            InboundEvent::Message {
-                msg_type,
-                raw_bytes,
-                ..
-            } => match msg_type.as_str() {
-                "SPHERE_PULSE" => match decode_sphere_pulse(&raw_bytes) {
-                    Some(fields) => {
-                        let mut det = detector.lock();
-                        if let Some(big_pulse) = det.record_pulse_with_phase(
-                            &fields.clock_name,
-                            fields.phase,
-                            fields.balanced,
-                            fields.consecutive_balanced,
-                            fields.ts,
-                        ) {
-                            // BIG PULSE fired. If great_pulse_ready, the
-                            // detector already incremented its counter.
-                            on_big_pulse(big_pulse);
-                        }
-                    }
-                    None => {
-                        warn!(
-                            event = "SPHERE_PULSE_DECODE_FAIL",
-                            "could not decode SPHERE_PULSE payload"
-                        );
-                    }
-                },
+            InboundEvent::Message { msg_type, .. } => match msg_type.as_str() {
                 "KERNEL_SHUTDOWN_ANNOUNCE" => {
                     info!(
                         event = "KERNEL_SHUTDOWN_RECEIVED",
@@ -340,6 +318,129 @@ pub async fn run_bus_dispatch_loop(
             }
         }
     }
+}
+
+/// Canonical sphere-clock order in `sphere_clocks.bin` (SPEC §7.1) — must
+/// match `titan-trinity-rs::sphere_clocks::ClockRole::all()`.
+const SPHERE_CLOCK_NAMES: [&str; 6] = [
+    "inner_body",
+    "inner_mind",
+    "inner_spirit",
+    "outer_body",
+    "outer_mind",
+    "outer_spirit",
+];
+
+/// Per-clock field count + byte layout in `sphere_clocks.bin` (SPEC §7.1):
+/// 6 clocks × 7 f32 LE. Field indices: [2]=phase, [4]=pulse_count,
+/// [5]=consecutive_balanced, [6]=last_pulse_age_s.
+const SPHERE_CLOCK_FIELDS: usize = 7;
+const SPHERE_CLOCKS_MIN_BYTES: usize = 6 * SPHERE_CLOCK_FIELDS * 4;
+
+/// SHM-direct resonance feed (D-SPEC-117, Preamble G18). Polls
+/// `sphere_clocks.bin` at `cadence_ms` and feeds the `ResonanceDetector`
+/// from the substrate's canonical clock state — replacing the retired
+/// `SPHERE_PULSE` bus subscription whose broker delivery left the detector
+/// starved fleet-wide.
+///
+/// A pulse is detected when a clock's `pulse_count` increments since the
+/// last poll (monotonic counter — no missed pulses). `consecutive_balanced`
+/// feeds the §G11 sustained-balance harmony gate (D-SPEC-114). `phase` is
+/// passed through for `/v4/resonance` telemetry only.
+pub async fn run_sphere_clock_poll_loop(
+    shm_dir: std::path::PathBuf,
+    cadence_ms: u64,
+    detector: Arc<Mutex<ResonanceDetector>>,
+    on_big_pulse: impl Fn(BigPulse) + Send + Sync + 'static,
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let path = shm_dir.join("sphere_clocks.bin");
+    let slot = match titan_state::Slot::open(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            error!(
+                event = "SPHERE_POLL_OPEN_FAIL",
+                err = ?e,
+                path = ?path,
+                "could not open sphere_clocks.bin; resonance detector will NOT be fed"
+            );
+            return;
+        }
+    };
+
+    // u32::MAX sentinel = uninitialised; the first poll seeds last-seen
+    // counts WITHOUT firing pulses (avoids a spurious burst at boot).
+    let mut last_pulse_counts = [u32::MAX; 6];
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(cadence_ms));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    info!(
+        event = "SPHERE_POLL_LOOP_START",
+        cadence_ms, "SHM-direct resonance feed running (G18 / D-SPEC-117)"
+    );
+
+    loop {
+        if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            info!(
+                event = "SPHERE_POLL_LOOP_STOP",
+                reason = "shutdown_flag",
+                "stopping"
+            );
+            break;
+        }
+        interval.tick().await;
+
+        let payload = match slot.read() {
+            Ok(p) => p,
+            Err(_) => continue, // transient SeqLock contention — retry next tick
+        };
+        if payload.len() < SPHERE_CLOCKS_MIN_BYTES {
+            continue; // slot not yet written by the substrate
+        }
+
+        let now = systime_unix_secs();
+        for (i, name) in SPHERE_CLOCK_NAMES.iter().enumerate() {
+            let base = i * SPHERE_CLOCK_FIELDS * 4;
+            let read_f32 = |fi: usize| -> f32 {
+                let off = base + fi * 4;
+                f32::from_le_bytes([
+                    payload[off],
+                    payload[off + 1],
+                    payload[off + 2],
+                    payload[off + 3],
+                ])
+            };
+            let phase = read_f32(2) as f64;
+            let pulse_count = read_f32(4) as u32;
+            let consecutive_balanced = read_f32(5) as u32;
+            let last_pulse_age_s = read_f32(6) as f64;
+
+            let prev = last_pulse_counts[i];
+            last_pulse_counts[i] = pulse_count;
+            if prev == u32::MAX || pulse_count <= prev {
+                continue; // first poll (seed) or no new pulse on this clock
+            }
+
+            // A pulse fired since the last poll. Feed the detector the
+            // CURRENT sustained-balance state (D-SPEC-114 level gate).
+            let balanced = consecutive_balanced > 0;
+            let pulse_ts = now - last_pulse_age_s;
+            let maybe_big = {
+                let mut det = detector.lock();
+                det.record_pulse_with_phase(name, phase, balanced, consecutive_balanced, pulse_ts)
+            };
+            if let Some(big_pulse) = maybe_big {
+                on_big_pulse(big_pulse);
+            }
+        }
+    }
+}
+
+/// Wall-clock seconds since UNIX epoch (mirror of `time.time()`).
+fn systime_unix_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -416,14 +517,15 @@ mod tests {
     }
 
     #[test]
-    fn required_subscriptions_includes_sphere_pulse() {
-        // C4-2b1 boot test 4: SPEC §9.A unified-spirit-rs row + D-SPEC-26
-        // mandates SPHERE_PULSE REQUIRED.
-        assert!(REQUIRED_SUBSCRIPTIONS.contains(&"SPHERE_PULSE"));
+    fn required_subscriptions_excludes_sphere_pulse_d_spec_117() {
+        // D-SPEC-117: SPHERE_PULSE is NO LONGER a bus subscription — the
+        // detector reads sphere_clocks.bin SHM-direct (G18). The 3 control
+        // topics remain.
+        assert!(!REQUIRED_SUBSCRIPTIONS.contains(&"SPHERE_PULSE"));
         assert!(REQUIRED_SUBSCRIPTIONS.contains(&"TRINITY_SUBSTRATE_TOPOLOGY_UPDATED"));
         assert!(REQUIRED_SUBSCRIPTIONS.contains(&"KERNEL_SHUTDOWN_ANNOUNCE"));
         assert!(REQUIRED_SUBSCRIPTIONS.contains(&"SUPERVISION_CHILD_DOWN"));
-        assert_eq!(REQUIRED_SUBSCRIPTIONS.len(), 4);
+        assert_eq!(REQUIRED_SUBSCRIPTIONS.len(), 3);
     }
 
     #[test]

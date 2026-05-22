@@ -170,7 +170,7 @@ class TestSpecV1100Contract:
     def test_spec_changelog_has_v1100_row(self):
         from pathlib import Path
         spec_path = (Path(__file__).parent.parent
-                     / "titan-docs" / "SPEC_titan_architecture.md")
+                     / "titan-docs" / "specs" / "SPEC_titan_architecture.md")
         src = spec_path.read_text(encoding="utf-8")
         assert "v1.11.0 (MINOR)" in src, "SPEC v1.11.0 Changelog row missing"
         assert "D-SPEC-66" in src, "D-SPEC-66 entry missing"
@@ -185,7 +185,7 @@ class TestSpecV1100Contract:
         collisions.)"""
         from pathlib import Path
         spec_path = (Path(__file__).parent.parent
-                     / "titan-docs" / "SPEC_titan_architecture.md")
+                     / "titan-docs" / "specs" / "SPEC_titan_architecture.md")
         src = spec_path.read_text(encoding="utf-8")
         # Match spec_version: 1.11.* or higher (PATCH-bump tolerant).
         import re
@@ -202,7 +202,7 @@ class TestSpecV1100Contract:
         (was previously narrative-only)."""
         from pathlib import Path
         spec_path = (Path(__file__).parent.parent
-                     / "titan-docs" / "SPEC_titan_architecture.md")
+                     / "titan-docs" / "specs" / "SPEC_titan_architecture.md")
         src = spec_path.read_text(encoding="utf-8")
         assert "| `SOCIAL_CATALYST` | P2 | none |" in src, (
             "§8.7 SOCIAL_CATALYST table row missing")

@@ -8,7 +8,7 @@ worker(s) that write those slots. One lookup, one chain.
 
 It is consumed by:
   - `GET /v6/manifest`  (runtime introspection — adds live slot freshness)
-  - `scripts/gen_v6_manifest.py` → `titan-docs/API_V6_MANIFEST.md` (checked-in doc)
+  - `scripts/gen_v6_manifest.py` → `titan-docs/notes/API_V6_MANIFEST.md` (checked-in doc)
 
 Design (SPEC §A.4 + Preamble G18): readout routes bind to exactly ONE
 `TitanStateAccessor` method and source SHM-direct; the `shm_slots` + `producers`

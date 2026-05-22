@@ -13,7 +13,7 @@
 #      Reason: a single eager torch import in a hot-path file costs
 #      ~860MB × 9 workers ≈ 2.3GB at boot (per commit 7f01125 history).
 #   4. arch_map phase-c verify --strict — blocks SPEC drift + G-RPC
-#      violations per titan-docs/SPEC_titan_architecture.md §20 + Rule
+#      violations per titan-docs/specs/SPEC_titan_architecture.md §20 + Rule
 #      2 of feedback_phase_c_spec_enforcement.md. Runs when SPEC TOML,
 #      generated constants files, generator script, arch_map.py, or any
 #      titan_hcl/ / titan-rust/ source is staged. Catches:
@@ -142,11 +142,11 @@ BANNER
     fi
 fi
 
-# ── 4. Phase C SPEC enforcer (titan-docs/SPEC_titan_architecture.md §20) ───
+# ── 4. Phase C SPEC enforcer (titan-docs/specs/SPEC_titan_architecture.md §20) ───
 # Runs when SPEC scope is staged: TOML / generated files / generator /
 # arch_map / any titan_hcl or titan-rust source. ~1s wall when active.
 STAGED_SPEC_SCOPE=$(git diff --cached --name-only --diff-filter=ACM -- \
-    'titan-docs/SPEC_titan_architecture*' \
+    'titan-docs/specs/SPEC_titan_architecture*' \
     'titan_hcl/_phase_c_constants.py' \
     'titan-rust/crates/titan-core/src/constants.rs' \
     'scripts/generate_phase_c_constants.py' \
@@ -297,7 +297,7 @@ STAGED_TRACKERS=$(git diff --cached --name-only --diff-filter=ACM -- \
 # When ARCHITECTURE_cgn_family.md is edited, ARCHITECTURE_cgn_family_index.md
 # must be regenerated in the same commit. Same discipline as SPEC_index.
 STAGED_ARCH=$(git diff --cached --name-only --diff-filter=ACM -- \
-    titan-docs/ARCHITECTURE_cgn_family.md \
+    titan-docs/specs/ARCHITECTURE_cgn_family.md \
     2>/dev/null)
 
 if [ -n "$STAGED_ARCH" ]; then
@@ -313,7 +313,7 @@ if [ -n "$STAGED_ARCH" ]; then
 │                                                                      │
 │  Fix:                                                                │
 │      python scripts/architecture_cgn_family_index.py                 │
-│      git add titan-docs/ARCHITECTURE_cgn_family_index.md             │
+│      git add titan-docs/specs/ARCHITECTURE_cgn_family_index.md             │
 │                                                                      │
 │  See: cat /tmp/precommit_arch_drift.log                              │
 └──────────────────────────────────────────────────────────────────────┘
@@ -328,7 +328,7 @@ fi
 # When ARCHITECTURE_synthesis_engine.md is edited, its _index.md must be
 # regenerated in the same commit. Same discipline as the CGN-family gate above.
 STAGED_SYNTH_ARCH=$(git diff --cached --name-only --diff-filter=ACM -- \
-    titan-docs/ARCHITECTURE_synthesis_engine.md \
+    titan-docs/specs/ARCHITECTURE_synthesis_engine.md \
     2>/dev/null)
 
 if [ -n "$STAGED_SYNTH_ARCH" ]; then
@@ -345,7 +345,7 @@ if [ -n "$STAGED_SYNTH_ARCH" ]; then
 │                                                                      │
 │  Fix:                                                                │
 │      python scripts/architecture_synthesis_engine_index.py           │
-│      git add titan-docs/ARCHITECTURE_synthesis_engine_index.md       │
+│      git add titan-docs/specs/ARCHITECTURE_synthesis_engine_index.md       │
 │                                                                      │
 │  See: cat /tmp/precommit_synth_arch_drift.log                        │
 └──────────────────────────────────────────────────────────────────────┘
@@ -360,7 +360,7 @@ fi
 # regenerated in the same commit. Same discipline as the CGN-family +
 # synthesis-engine gates above.
 STAGED_API_ARCH=$(git diff --cached --name-only --diff-filter=ACM -- \
-    titan-docs/ARCHITECTURE_api_family.md \
+    titan-docs/specs/ARCHITECTURE_api_family.md \
     2>/dev/null)
 
 if [ -n "$STAGED_API_ARCH" ]; then
@@ -376,7 +376,7 @@ if [ -n "$STAGED_API_ARCH" ]; then
 │                                                                      │
 │  Fix:                                                                │
 │      python scripts/architecture_api_family_index.py                 │
-│      git add titan-docs/ARCHITECTURE_api_family_index.md             │
+│      git add titan-docs/specs/ARCHITECTURE_api_family_index.md             │
 │                                                                      │
 │  See: cat /tmp/precommit_api_arch_drift.log                          │
 └──────────────────────────────────────────────────────────────────────┘
@@ -391,7 +391,7 @@ fi
 # regenerated in the same commit. Same discipline as the CGN-family +
 # synthesis-engine + API-family gates above.
 STAGED_TRINITY_ARCH=$(git diff --cached --name-only --diff-filter=ACM -- \
-    titan-docs/ARCHITECTURE_trinity.md \
+    titan-docs/specs/ARCHITECTURE_trinity.md \
     2>/dev/null)
 
 if [ -n "$STAGED_TRINITY_ARCH" ]; then
@@ -407,7 +407,7 @@ if [ -n "$STAGED_TRINITY_ARCH" ]; then
 │                                                                      │
 │  Fix:                                                                │
 │      python scripts/architecture_trinity_index.py                    │
-│      git add titan-docs/ARCHITECTURE_trinity_index.md               │
+│      git add titan-docs/specs/ARCHITECTURE_trinity_index.md               │
 │                                                                      │
 │  See: cat /tmp/precommit_trinity_arch_drift.log                      │
 └──────────────────────────────────────────────────────────────────────┘

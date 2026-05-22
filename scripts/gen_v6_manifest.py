@@ -12,7 +12,7 @@ v6.py's ROUTE_TABLE), so the doc can never drift from the live router — and
 this generator asserts router↔manifest parity before writing.
 
 Usage:
-    python scripts/gen_v6_manifest.py            # write titan-docs/API_V6_MANIFEST.md
+    python scripts/gen_v6_manifest.py            # write titan-docs/notes/API_V6_MANIFEST.md
     python scripts/gen_v6_manifest.py --check     # exit 1 if the doc is stale
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ os.environ.setdefault("OPENROUTER_API_KEY", "")
 
 from titan_hcl.api import v6, v6_manifest  # noqa: E402  (import v6 → populates REGISTRY)
 
-_OUT = os.path.join(_ROOT, "titan-docs", "API_V6_MANIFEST.md")
+_OUT = os.path.join(_ROOT, "titan-docs", "notes", "API_V6_MANIFEST.md")
 
 
 def render() -> str:

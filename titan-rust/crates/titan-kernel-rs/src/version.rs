@@ -3,7 +3,7 @@
 //! Format:
 //! ```text
 //! titan-kernel-rs <cargo_version> (<git_sha_short>)
-//! SPEC v0.1.x (titan-docs/SPEC_titan_architecture.md)
+//! SPEC v0.1.x (titan-docs/specs/SPEC_titan_architecture.md)
 //! ```
 
 use titan_core::constants::{SPEC_SOURCE_SHA256, SPEC_VERSION};

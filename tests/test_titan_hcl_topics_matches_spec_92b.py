@@ -28,7 +28,7 @@ import pytest
 
 from titan_hcl.core.kernel import TITAN_HCL_BROADCAST_TOPICS
 
-SPEC_PATH = Path(__file__).resolve().parent.parent / "titan-docs" / "SPEC_titan_architecture.md"
+SPEC_PATH = Path(__file__).resolve().parent.parent / "titan-docs" / "specs" / "SPEC_titan_architecture.md"
 
 
 def _parse_titan_hcl_subscriptions_from_spec() -> set[str]:

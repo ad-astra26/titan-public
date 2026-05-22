@@ -14,7 +14,7 @@ costs ~30K tokens. This script produces a compact (~200-line) index that:
   3. Extracts `## §9.B — Python tree` `#### module_name` sub-blocks into a
      worker → section line map for fast "which §9.B has worker X" lookup.
 
-Output: titan-docs/SPEC_index.md (overwrites; never hand-edit).
+Output: titan-docs/specs/SPEC_index.md (overwrites; never hand-edit).
 
 Regenerate after every SPEC body edit. Wired into session_close_protocol Step 1b
 when `spec_version` is bumped per §2.6.
@@ -32,8 +32,8 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SPEC_PATH = REPO_ROOT / "titan-docs" / "SPEC_titan_architecture.md"
-INDEX_PATH = REPO_ROOT / "titan-docs" / "SPEC_index.md"
+SPEC_PATH = REPO_ROOT / "titan-docs" / "specs" / "SPEC_titan_architecture.md"
+INDEX_PATH = REPO_ROOT / "titan-docs" / "specs" / "SPEC_index.md"
 
 
 SECTION_RE = re.compile(r"^(#{2,4})\s+(§[\w\.]+(?:[A-Z])?)\s*[—-]\s*(.+?)\s*$")
@@ -133,7 +133,7 @@ def render(parsed: dict) -> str:
     out.append("# SPEC Architecture Index (auto-generated)")
     out.append("")
     out.append(
-        "> **Auto-generated** from `titan-docs/SPEC_titan_architecture.md` by "
+        "> **Auto-generated** from `titan-docs/specs/SPEC_titan_architecture.md` by "
         "`scripts/spec_index.py`. **DO NOT EDIT** — regenerate via "
         "`python scripts/spec_index.py` after every SPEC body edit. Wired into "
         "`session_close_protocol.md` Step 1b: any `spec_version` bump per §2.6 "

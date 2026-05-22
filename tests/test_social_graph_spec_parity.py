@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_spec_changelog_has_v161_social_graph_worker_row():
     """Changelog row for v1.7.1 social_graph_worker landed."""
-    spec = (ROOT / "titan-docs" / "SPEC_titan_architecture.md").read_text()
+    spec = (ROOT / "titan-docs" / "specs" / "SPEC_titan_architecture.md").read_text()
     assert "| 2026-05-14 | v1.7.1 (PATCH) |" in spec, (
         "Missing Changelog row for v1.7.1 PATCH bump (D-SPEC-50 / "
         "social_graph_worker extraction).")
@@ -38,7 +38,7 @@ def test_spec_changelog_has_v161_social_graph_worker_row():
 
 
 def test_spec_glossary_has_social_graph_worker_row():
-    spec = (ROOT / "titan-docs" / "SPEC_titan_architecture.md").read_text()
+    spec = (ROOT / "titan-docs" / "specs" / "SPEC_titan_architecture.md").read_text()
     glossary_block = spec.split("## §1 — Glossary")[1].split("## §2")[0]
     assert "**social_graph_worker**" in glossary_block, (
         "Missing §1 glossary row for social_graph_worker.")
@@ -48,7 +48,7 @@ def test_spec_glossary_has_social_graph_worker_row():
 
 
 def test_spec_71_has_social_graph_state_bin_row():
-    spec = (ROOT / "titan-docs" / "SPEC_titan_architecture.md").read_text()
+    spec = (ROOT / "titan-docs" / "specs" / "SPEC_titan_architecture.md").read_text()
     assert "`social_graph_state.bin`" in spec, (
         "Missing §7.1 slot row for social_graph_state.bin")
     assert "SOCIAL_GRAPH_STATE_SCHEMA_VERSION" in spec
@@ -59,7 +59,7 @@ def test_spec_71_has_social_graph_state_bin_row():
 
 
 def test_spec_9b_has_social_graph_worker_block():
-    spec = (ROOT / "titan-docs" / "SPEC_titan_architecture.md").read_text()
+    spec = (ROOT / "titan-docs" / "specs" / "SPEC_titan_architecture.md").read_text()
     assert "#### social_graph_worker (Python L2 module" in spec, (
         "Missing §9.B social_graph_worker block.")
 
@@ -68,7 +68,7 @@ def test_spec_9b_has_social_graph_worker_block():
 
 
 def test_spec_decision_log_has_d_spec_49():
-    spec = (ROOT / "titan-docs" / "SPEC_titan_architecture.md").read_text()
+    spec = (ROOT / "titan-docs" / "specs" / "SPEC_titan_architecture.md").read_text()
     assert "**D-SPEC-50 " in spec, (
         "Missing §21 Decision Log entry D-SPEC-50 (social_graph_worker).")
 
@@ -87,7 +87,7 @@ def test_toml_spec_version_is_current():
     asserts. The version-number assertion now just guards monotonicity.
     """
     toml = (
-        ROOT / "titan-docs" / "SPEC_titan_architecture_constants.toml"
+        ROOT / "titan-docs" / "specs" / "SPEC_titan_architecture_constants.toml"
     ).read_text()
     # Must include a version line AT or AFTER the social_graph_worker
     # ship landing version (1.7.1).
@@ -103,7 +103,7 @@ def test_toml_spec_version_is_current():
 
 def test_toml_has_social_graph_state_constants():
     toml = (
-        ROOT / "titan-docs" / "SPEC_titan_architecture_constants.toml"
+        ROOT / "titan-docs" / "specs" / "SPEC_titan_architecture_constants.toml"
     ).read_text()
     assert "[constants.SOCIAL_GRAPH_STATE_SCHEMA_VERSION]" in toml
     assert "[constants.SOCIAL_GRAPH_STATE_MAX_BYTES]" in toml
@@ -123,7 +123,7 @@ def test_python_constants_regen_matches_toml():
 
 def test_rpc_exemptions_has_social_graph_proxy_entries():
     yaml = (
-        ROOT / "titan-docs" / "phase_c_rpc_exemptions.yaml"
+        ROOT / "titan-docs" / "specs" / "phase_c_rpc_exemptions.yaml"
     ).read_text()
     # Spot-check: must have entries for the bug-fix method + a few core writes
     must_have = [
@@ -151,7 +151,7 @@ def test_rpc_exemptions_g22_orphan_handlers_cleaned():
     points to its corresponding social_graph_proxy work_rpc_sites entry.
     """
     yaml = (
-        ROOT / "titan-docs" / "phase_c_rpc_exemptions.yaml"
+        ROOT / "titan-docs" / "specs" / "phase_c_rpc_exemptions.yaml"
     ).read_text()
     orphan_block = yaml.split("orphan_handler_allowlist:")[1] \
         if "orphan_handler_allowlist:" in yaml else ""

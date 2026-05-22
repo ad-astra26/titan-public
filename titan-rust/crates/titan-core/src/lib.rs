@@ -7,7 +7,7 @@
 //! # Modules
 //!
 //! - [`constants`] — AUTO-GENERATED from
-//!   `titan-docs/SPEC_titan_architecture_constants.toml` via
+//!   `titan-docs/specs/SPEC_titan_architecture_constants.toml` via
 //!   `arch_map phase-c regen`. Hand-editing is a SPEC violation per §19.
 //! - [`frame`] — length-prefix + HMAC-SHA256 challenge-response framing
 //!   (B.2 protocol; SPEC §8.10 byte-identical guarantee; RFC 4231 vectors).

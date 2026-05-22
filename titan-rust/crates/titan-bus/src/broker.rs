@@ -425,6 +425,11 @@ impl BusBroker {
                             // Mirrors Python `BusSocketServer._handle_inbound`
                             // BUS_SUBSCRIBE handler.
                             sub.reply_only = reply_only;
+                            // Mark intent declared so broadcast fanout can
+                            // distinguish a pre-subscribe transient (silent
+                            // skip) from the §8.2 v1.4.0 empty-topics
+                            // forbidden regression (loud drop).
+                            sub.has_subscribed = true;
                         }
                     }
                     // SPEC §8.0.bis boot-buffer drain — outside subs lock.
@@ -678,6 +683,20 @@ impl BusBroker {
                             // subscribers do not receive broadcasts by
                             // SPEC. Silent skip — no log, no drop
                             // counter — this is the contracted path.
+                            continue;
+                        }
+                        if !sub.has_subscribed {
+                            // Pre-subscribe transient: the connection is up
+                            // but has not yet sent any BUS_SUBSCRIBE (the
+                            // normal connect→subscribe race). This is NOT the
+                            // §8.2 forbidden regression — the connection
+                            // simply hasn't declared intent yet. Silent skip
+                            // (mirrors the D-SPEC-45 closed-subscriber skip):
+                            // no enqueue, no warn, no drop counter. Without
+                            // this, every broadcast fired during a freshly-
+                            // connected worker's subscribe window logged a
+                            // WARN+drop (observed at boot: SPHERE_PULSE /
+                            // SPIRIT_STATE / MIND_STATE → anon-N).
                             continue;
                         }
                         if sub.subscribed_topics.is_empty() {

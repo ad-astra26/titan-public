@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _spec_text() -> str:
-    return (ROOT / "titan-docs" / "SPEC_titan_architecture.md").read_text()
+    return (ROOT / "titan-docs" / "specs" / "SPEC_titan_architecture.md").read_text()
 
 
 def test_spec_version_bumped_to_1_8_3():

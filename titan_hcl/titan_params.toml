@@ -2846,7 +2846,7 @@ still_needs_push_info_cadence_seconds = 86400  # 24h throttle on Maker INFO emit
 # 0.391 May 11 → 0.365 May 18); letting teacher self-adapt may help. Full
 # guardrails ship-active: principles validator, signed-diff journal,
 # Maker revert at POST /v4/meta-teacher/voice/revert. Detail in
-# titan-docs/ARCHITECTURE_cgn_family.md §9.5a (canonical) + tuning log §15.
+# titan-docs/specs/ARCHITECTURE_cgn_family.md §9.5a (canonical) + tuning log §15.
 voice_tuning_enabled = true               # T1-canary 2026-05-19; T2/T3 pick up at next restart
 voice_eval_interval_critiques = 50        # run self-assess every N critiques
 min_critiques_between_voice_changes = 100 # rate limit; per-Titan override OK

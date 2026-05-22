@@ -58,7 +58,7 @@ merge kin overrides → evaluate(inputs, dt=1.0) → apply_movement_excess_clear
 → write neuromod_state.bin (4-field v2 layout).
 
 See: titan-docs/PLAN_microkernel_phase_c_neuromod_worker_evaluate_migration.md
-     titan-docs/SPEC_titan_architecture.md §7.1 + §9.B neuromod_worker block.
+     titan-docs/specs/SPEC_titan_architecture.md §7.1 + §9.B neuromod_worker block.
 """
 from __future__ import annotations
 

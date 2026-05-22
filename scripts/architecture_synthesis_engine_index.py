@@ -12,7 +12,7 @@ Synthesis-Engine architecture narrative doc, adapted to its structure:
   3. Extracts the §20 Considered-and-rejected bullet list into a
      "design alternatives" ledger.
 
-Output: titan-docs/ARCHITECTURE_synthesis_engine_index.md (overwrites; never hand-edit).
+Output: titan-docs/specs/ARCHITECTURE_synthesis_engine_index.md (overwrites; never hand-edit).
 
 Regenerate after every body edit. Wired into the pre-commit drift gate and the
 git merge driver. Deterministic + idempotent: same input → byte-identical output.
@@ -26,8 +26,8 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ARCH_PATH = REPO_ROOT / "titan-docs" / "ARCHITECTURE_synthesis_engine.md"
-INDEX_PATH = REPO_ROOT / "titan-docs" / "ARCHITECTURE_synthesis_engine_index.md"
+ARCH_PATH = REPO_ROOT / "titan-docs" / "specs" / "ARCHITECTURE_synthesis_engine.md"
+INDEX_PATH = REPO_ROOT / "titan-docs" / "specs" / "ARCHITECTURE_synthesis_engine_index.md"
 
 
 SECTION_RE = re.compile(r"^(#{2,4})\s+(§[\w\.]+)\s*[—-]\s*(.+?)\s*$")
@@ -117,7 +117,7 @@ def render(parsed: dict) -> str:
     out.append("# ARCHITECTURE — Synthesis Engine Index (auto-generated)")
     out.append("")
     out.append(
-        "> **Auto-generated** from `titan-docs/ARCHITECTURE_synthesis_engine.md` by "
+        "> **Auto-generated** from `titan-docs/specs/ARCHITECTURE_synthesis_engine.md` by "
         "`scripts/architecture_synthesis_engine_index.py`. **DO NOT EDIT** — "
         "regenerate via `python scripts/architecture_synthesis_engine_index.py` "
         "after every body edit. Any `version` bump on the architecture doc MUST "

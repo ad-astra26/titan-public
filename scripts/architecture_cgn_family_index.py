@@ -13,7 +13,7 @@ narrative doc:
   3. Extracts §12 Considered-and-rejected entries into a "design alternatives"
      table — fast lookup for "have we considered X already?"
 
-Output: titan-docs/ARCHITECTURE_cgn_family_index.md (overwrites; never hand-edit).
+Output: titan-docs/specs/ARCHITECTURE_cgn_family_index.md (overwrites; never hand-edit).
 
 Regenerate after every body edit. Wired into session_close_protocol when
 `version` field is bumped per same discipline as SPEC versioning.
@@ -29,8 +29,8 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ARCH_PATH = REPO_ROOT / "titan-docs" / "ARCHITECTURE_cgn_family.md"
-INDEX_PATH = REPO_ROOT / "titan-docs" / "ARCHITECTURE_cgn_family_index.md"
+ARCH_PATH = REPO_ROOT / "titan-docs" / "specs" / "ARCHITECTURE_cgn_family.md"
+INDEX_PATH = REPO_ROOT / "titan-docs" / "specs" / "ARCHITECTURE_cgn_family_index.md"
 
 
 SECTION_RE = re.compile(r"^(#{2,4})\s+(§[\w\.]+(?:[A-Z])?)\s*[—-]\s*(.+?)\s*$")
@@ -135,7 +135,7 @@ def render(parsed: dict) -> str:
     out.append("# ARCHITECTURE — CGN Family Index (auto-generated)")
     out.append("")
     out.append(
-        "> **Auto-generated** from `titan-docs/ARCHITECTURE_cgn_family.md` by "
+        "> **Auto-generated** from `titan-docs/specs/ARCHITECTURE_cgn_family.md` by "
         "`scripts/architecture_cgn_family_index.py`. **DO NOT EDIT** — regenerate "
         "via `python scripts/architecture_cgn_family_index.py` after every body "
         "edit. Wired into `session_close_protocol.md` Step 1b: any `version` "

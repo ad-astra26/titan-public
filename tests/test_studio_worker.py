@@ -334,7 +334,7 @@ def test_dispatch_render_rejects_unknown_type():
 
 def test_spec_anchor_9b_block_exists():
     """SPEC §9.B contains a studio_worker block."""
-    spec_path = Path(__file__).parent.parent / "titan-docs" / "SPEC_titan_architecture.md"
+    spec_path = Path(__file__).parent.parent / "titan-docs" / "specs" / "SPEC_titan_architecture.md"
     spec_text = spec_path.read_text()
     assert "#### studio_worker (Python L2 module" in spec_text
     assert "D-SPEC-57" in spec_text
@@ -344,7 +344,7 @@ def test_spec_anchor_9b_block_exists():
 
 def test_spec_anchor_71_slot_row_exists():
     """SPEC §7.1 contains studio_state.bin row."""
-    spec_path = Path(__file__).parent.parent / "titan-docs" / "SPEC_titan_architecture.md"
+    spec_path = Path(__file__).parent.parent / "titan-docs" / "specs" / "SPEC_titan_architecture.md"
     spec_text = spec_path.read_text()
     assert "`studio_state.bin`" in spec_text
     assert "STUDIO_STATE_SCHEMA_VERSION" in spec_text
@@ -353,7 +353,7 @@ def test_spec_anchor_71_slot_row_exists():
 
 def test_spec_anchor_87_events_exist():
     """SPEC §8.7 contains all 3 new bus event rows."""
-    spec_path = Path(__file__).parent.parent / "titan-docs" / "SPEC_titan_architecture.md"
+    spec_path = Path(__file__).parent.parent / "titan-docs" / "specs" / "SPEC_titan_architecture.md"
     spec_text = spec_path.read_text()
     assert "`STUDIO_WORKER_READY`" in spec_text
     assert "`STUDIO_RENDER_REQUEST`" in spec_text
@@ -368,14 +368,14 @@ def test_spec_anchor_1_glossary_studio_worker():
     + §4.L sovereignty_worker + §4.N recorder_worker + §4.H interface_advisor_worker
     + backup_unified sessions that landed D-SPEC-57..62 first).
     """
-    spec_path = Path(__file__).parent.parent / "titan-docs" / "SPEC_titan_architecture.md"
+    spec_path = Path(__file__).parent.parent / "titan-docs" / "specs" / "SPEC_titan_architecture.md"
     spec_text = spec_path.read_text()
     assert "| **studio_worker** | (none — new in v1.9.4)" in spec_text
 
 
 def test_spec_anchor_changelog_studio_worker_row():
     """SPEC top Changelog has the renumbered v1.9.4 studio_worker row."""
-    spec_path = Path(__file__).parent.parent / "titan-docs" / "SPEC_titan_architecture.md"
+    spec_path = Path(__file__).parent.parent / "titan-docs" / "specs" / "SPEC_titan_architecture.md"
     spec_text = spec_path.read_text()
     assert "v1.9.4 (PATCH) | `studio_worker` extracted" in spec_text
     assert "D-SPEC-63" in spec_text
@@ -390,7 +390,7 @@ def test_kernel_proxy_aliases_extended():
 
 def test_phase_c_rpc_exemptions_studio_gallery_listed():
     """phase_c_rpc_exemptions.yaml has studio_proxy.get_gallery_async entry (≤2s)."""
-    yaml_path = Path(__file__).parent.parent / "titan-docs" / "phase_c_rpc_exemptions.yaml"
+    yaml_path = Path(__file__).parent.parent / "titan-docs" / "specs" / "phase_c_rpc_exemptions.yaml"
     yaml_text = yaml_path.read_text()
     assert "studio_proxy" in yaml_text
     assert "get_gallery_async" in yaml_text

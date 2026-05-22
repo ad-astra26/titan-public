@@ -3,7 +3,7 @@
 Every `bus.request_async` (or `_work_rpc_sync`) call site in
 `titan_hcl/proxies/memory_proxy.py` must have a timeout argument
 ≤5s OR be explicitly allowlisted in
-`titan-docs/phase_c_rpc_exemptions.yaml` (run_meditation 300s).
+`titan-docs/specs/phase_c_rpc_exemptions.yaml` (run_meditation 300s).
 
 This is a static-analysis test: parse the proxy source, find every
 work-RPC call site + its timeout literal, and assert the ceiling.
@@ -26,7 +26,7 @@ PROXY_PATH = (
 )
 EXEMPTIONS_PATH = (
     Path(__file__).resolve().parent.parent
-    / "titan-docs/phase_c_rpc_exemptions.yaml"
+    / "titan-docs/specs/phase_c_rpc_exemptions.yaml"
 )
 
 # Methods that are explicitly allowlisted with timeouts >5s. Each tuple is

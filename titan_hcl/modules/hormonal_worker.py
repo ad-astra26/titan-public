@@ -55,7 +55,7 @@ this worker's slot writes become the canonical hormonal state surface.
 
 See: titan-docs/PLAN_microkernel_phase_c_s5_inner_trinity.md §0.5 +
      titan-docs/PLAN_microkernel_phase_c_l0_l1_rust.md §10.5 chunk C5-7 +
-     titan-docs/SPEC_titan_architecture.md §7.1 (v0.1.4 row).
+     titan-docs/specs/SPEC_titan_architecture.md §7.1 (v0.1.4 row).
 """
 from __future__ import annotations
 

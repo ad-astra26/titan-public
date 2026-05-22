@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TOML_PATH = REPO_ROOT / "titan-docs" / "SPEC_titan_architecture_constants.toml"
+TOML_PATH = REPO_ROOT / "titan-docs" / "specs" / "SPEC_titan_architecture_constants.toml"
 GENERATOR = REPO_ROOT / "scripts" / "generate_phase_c_constants.py"
 PYTHON_OUT = REPO_ROOT / "titan_hcl" / "_phase_c_constants.py"
 RUST_OUT = REPO_ROOT / "titan-rust" / "crates" / "titan-core" / "src" / "constants.rs"

@@ -24,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
 # ─── 1. SPEC parity ───────────────────────────────────────────────────
 
 
-SPEC_PATH = REPO_ROOT / "titan-docs" / "SPEC_titan_architecture.md"
+SPEC_PATH = REPO_ROOT / "titan-docs" / "specs" / "SPEC_titan_architecture.md"
 
 
 def test_spec_version_bumped_to_1_7_4():

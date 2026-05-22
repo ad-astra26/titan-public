@@ -147,7 +147,7 @@ def test_proxy_sync_hot_reads_are_sync():
 
 
 def _spec_text() -> str:
-    return (ROOT / "titan-docs" / "SPEC_titan_architecture.md").read_text()
+    return (ROOT / "titan-docs" / "specs" / "SPEC_titan_architecture.md").read_text()
 
 
 def test_spec_changelog_has_v172_metabolism_worker_row():

@@ -1,10 +1,10 @@
-//! constants.rs — AUTO-GENERATED from titan-docs/SPEC_titan_architecture_constants.toml.
+//! constants.rs — AUTO-GENERATED from titan-docs/specs/SPEC_titan_architecture_constants.toml.
 //!
 //! DO NOT EDIT BY HAND. Edit the TOML, then run:
 //!     python scripts/generate_phase_c_constants.py
 //!
 //! SPEC version: 1.11.4
-//! Source SHA-256: b1742e30425623ecbc3cd1734eb485735be957723c0b5f52b0400d110e562218
+//! Source SHA-256: 9840e48bbd9b42d92a334b5bd620c7e734db569f22244228918794ecad163dbc
 //!
 //! Per SPEC §19 + §2.6: hand-editing this file is a SPEC violation flagged by
 //! `arch_map phase-c verify`.
@@ -13,7 +13,7 @@
 // ── SPEC version metadata ──────────────────────────────────────────────
 pub const SPEC_VERSION: &str = "1.11.4";
 pub const SPEC_SOURCE_SHA256: &str =
-    "b1742e30425623ecbc3cd1734eb485735be957723c0b5f52b0400d110e562218";
+    "9840e48bbd9b42d92a334b5bd620c7e734db569f22244228918794ecad163dbc";
 
 // ── KERNEL ────────────────────────────────────────────────────────────────
 // titan-kernel-rs internals (boot, snapshot, signal handling, persistence)

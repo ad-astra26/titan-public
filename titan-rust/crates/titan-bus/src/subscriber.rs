@@ -118,6 +118,19 @@ pub struct BrokerSubscriber {
 
     /// Connection closed (broker purges on next sweep).
     pub closed: bool,
+
+    /// `true` once this connection has sent at least one `BUS_SUBSCRIBE`
+    /// frame. Distinguishes a **pre-subscribe** anon (just connected, not
+    /// yet declared intent — a normal connect→subscribe-race transient) from
+    /// a subscriber that explicitly subscribed with an EMPTY topic set +
+    /// `reply_only=false` (the SPEC §8.2 v1.4.0 / D-SPEC-42 forbidden
+    /// regression). Broadcast fanout silently skips the former (no WARN, no
+    /// drop counter — mirrors the D-SPEC-45 closed-subscriber skip) and only
+    /// loud-drops the latter. Without this the connect→subscribe window
+    /// generated WARN+drop spam for every broadcast fired before a
+    /// freshly-connected worker finished subscribing (observed at boot:
+    /// SPHERE_PULSE/SPIRIT_STATE/MIND_STATE → anon-N).
+    pub has_subscribed: bool,
 }
 
 impl BrokerSubscriber {
@@ -137,6 +150,7 @@ impl BrokerSubscriber {
             last_slow_consumer_warn_ts: None,
             last_window_reset_ts: now,
             closed: false,
+            has_subscribed: false,
         }
     }
 
@@ -156,6 +170,7 @@ impl BrokerSubscriber {
             last_slow_consumer_warn_ts: None,
             last_window_reset_ts: now,
             closed: false,
+            has_subscribed: false,
         }
     }
 
@@ -431,5 +446,30 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
         sub.note_pong();
         assert!(sub.last_pong_ts > initial);
+    }
+
+    #[test]
+    fn new_subscriber_has_not_subscribed_yet() {
+        // A freshly-accepted connection (anon-N) has NOT declared intent.
+        // Broadcast fanout silent-skips this pre-subscribe transient.
+        let sub = BrokerSubscriber::new("anon-1");
+        assert!(!sub.has_subscribed);
+        assert!(sub.subscribed_topics.is_empty());
+        assert!(!sub.reply_only);
+    }
+
+    #[test]
+    fn pre_subscribe_anon_distinguishable_from_empty_topics_regression() {
+        // The §8.2 v1.4.0 / D-SPEC-42 forbidden regression (empty topics +
+        // reply_only=false) is loud-dropped by fanout; a pre-subscribe anon
+        // in the connect→subscribe race is silently skipped. The two states
+        // are identical EXCEPT for `has_subscribed` — the discriminator the
+        // fanout guard uses (added with the boot-time WARN-spam fix).
+        let pre = BrokerSubscriber::new("anon-2");
+        let mut subscribed_empty = BrokerSubscriber::new("worker");
+        subscribed_empty.has_subscribed = true; // broker sets this on BUS_SUBSCRIBE
+        assert!(pre.subscribed_topics.is_empty() && !pre.reply_only);
+        assert!(subscribed_empty.subscribed_topics.is_empty() && !subscribed_empty.reply_only);
+        assert_ne!(pre.has_subscribed, subscribed_empty.has_subscribed);
     }
 }
