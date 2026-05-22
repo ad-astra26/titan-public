@@ -725,20 +725,9 @@ def _orchestrator_loop(
         publisher.record_completion(epoch_id=epoch_id, completion=completion)
         publisher.publish()
 
-        # MEDITATION_COMPLETE fan-out. `timechain` + `backup` are the live
-        # directed consumers (block-seal + personality/soul backup cascade).
-        # `core` (the titan_HCL parent) is restored as the post-meditation IQL
-        # "Scholar's Dream" + chronicle orchestrator — the legacy parent
-        # meditation_cycle Phase B that was dropped in the §4.D extraction
-        # (see BUG-CHRONICLE-WRITER-DEAD + its orphaned IQL-dream trigger).
-        # The legacy `spirit` directed target is RETIRED (D-SPEC-116 deleted
-        # spirit_worker → no subscriber under that dst; the emit buffered/dropped).
-        # NOTE: cognitive_worker / life_force_worker / memory_worker /
-        # social_worker declare MEDITATION_COMPLETE as a broadcast_topic but
-        # only receive it on dst="all" — tracked as
-        # BUG-MEDITATION-COMPLETE-FANOUT-STARVES-BROADCAST-SUBSCRIBERS.
+        # MEDITATION_COMPLETE fan-out (preserves legacy plugin.py:3887-3900 pattern).
         med_payload = dict(completion)
-        for dst in ("timechain", "backup", "core"):
+        for dst in ("spirit", "timechain", "backup"):
             _send(send_queue, MEDITATION_COMPLETE, name, dst, med_payload)
 
         # STUDIO_RENDER_REQUEST(type=meditation) — v1.9.4 §4.K wire-up.
