@@ -457,9 +457,23 @@ class ConceptGroundingNetwork:
                         promoted = self._causal_generators.observe_for(
                             consumer, t, reward)
                         if promoted is not None and consumer in self._haov_trackers:
+                            _ac = {"action": int(t.action),
+                                   "source": "causal_pattern"}
+                            # Knowledge HAOV verifier (knowledge_worker
+                            # CGN_HAOV_VERIFY_REQ) needs the concept topic to
+                            # query knowledge_concepts. For the knowledge
+                            # consumer the CGN concept_id IS the topic
+                            # (knowledge_worker records concept_id=topic[:50]).
+                            # Populating action_context.topic closes
+                            # BUG-CGN-KNOWLEDGE-HAOV-NO-TOPIC-FIELD-20260517 —
+                            # action_context is the consumer-specific free-form
+                            # dict (per ARCHITECTURE_cgn_family.md), so this is
+                            # correct use of the existing field, NOT a
+                            # GeneralizedHypothesis schema change.
+                            if consumer == "knowledge":
+                                _ac["topic"] = str(t.concept_id)
                             self._haov_trackers[consumer].hypothesize(
-                                action_context={"action": int(t.action),
-                                                "source": "causal_pattern"},
+                                action_context=_ac,
                                 observation=promoted,
                             )
                     except Exception as _causal_err:  # never break reward path

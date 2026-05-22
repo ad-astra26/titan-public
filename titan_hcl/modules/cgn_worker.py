@@ -120,19 +120,16 @@ def _run_haov_pump(cgn, send_queue, name, stuck_timeout_s):
                 tracker._active_test["ts"] = now
             dest = _HAOV_DEST_MAP.get(consumer_name, consumer_name)
 
-            # 2026-05-17 — pre-emit guard for consumer="knowledge":
-            # knowledge_worker.py:881 expects test_ctx.topic or
-            # test_ctx.concept to query knowledge_concepts. Today
-            # neither hypothesize() nor hypothesize_from_impasse()
-            # records a topic on the hypothesis (action_context is
-            # {"action": int} or {"impasse_type": str} — no topic
-            # field). Without topic the consumer query short-circuits
-            # and emits noisy `topic='?'` log lines that confused fleet
-            # operators. Skip emission rather than send a verify the
-            # consumer can't process. Structural fix (adding topic to
-            # GeneralizedHypothesis or richer registration) deferred
-            # to a follow-up rFP — flagged in BUGS.md as
-            # BUG-CGN-KNOWLEDGE-HAOV-NO-TOPIC-FIELD-20260517.
+            # Pre-emit guard for consumer="knowledge": knowledge_worker
+            # expects test_ctx.topic/concept to query knowledge_concepts.
+            # As of 2026-05-22 the causal-pattern path (cgn.py record_outcome)
+            # populates action_context.topic = concept_id for the knowledge
+            # consumer, so pattern-mined knowledge hypotheses now carry a topic
+            # and pass this guard (closes BUG-CGN-KNOWLEDGE-HAOV-NO-TOPIC-FIELD).
+            # The guard stays as belt-and-suspenders: impasse-path hypotheses
+            # (hypothesize_from_impasse → action_context={"impasse_type": ...})
+            # genuinely have no concept to verify, so we still skip those rather
+            # than emit a verify the consumer can't process.
             if consumer_name == "knowledge":
                 _has_topic = bool(
                     isinstance(test_ctx, dict) and
