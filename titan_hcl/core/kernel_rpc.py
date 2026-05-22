@@ -143,8 +143,8 @@ _PROXY_CLASS_SUFFIX = "Proxy"
 
 def _is_proxy_object(obj: Any) -> bool:
     """True if obj's class name ends with 'Proxy' — heuristic that matches
-    SpiritProxy, BodyProxy, MindProxy, MemoryProxy, RLProxy, LLMProxy,
-    MediaProxy, TimechainProxy. Avoids hardcoding the full proxy class list.
+    BodyProxy, MindProxy, MemoryProxy, RLProxy, LLMProxy, MediaProxy,
+    TimechainProxy. Avoids hardcoding the full proxy class list.
     """
     return type(obj).__name__.endswith(_PROXY_CLASS_SUFFIX)
 
@@ -341,7 +341,7 @@ class KernelRPCServer:
                             # the kernel loop and ship the actual value.
                             result = self._maybe_await(result)
                             # Proxy-return handling: when result is a bus-backed
-                            # Proxy object (SpiritProxy etc.) returned from
+                            # Proxy object (MemoryProxy etc.) returned from
                             # `_proxies.get(name)`, ship a chainable remote-ref
                             # marker instead of the unserializable proxy. The
                             # client converts this to a _RPCRemoteRef pointing
@@ -480,8 +480,8 @@ class KernelRPCClient:
         if response[0] == "ok":
             return response[1]
         if response[0] == "ok_proxy_ref":
-            # Server detected a Proxy return (e.g. SpiritProxy from
-            # `_proxies.get("spirit")`). It can't ship the proxy itself, so
+            # Server detected a Proxy return (e.g. MemoryProxy from
+            # `_proxies.get("memory")`). It can't ship the proxy itself, so
             # it returned a path string we can use to construct a chainable
             # remote ref. Future attribute access + calls on this ref fire
             # RPCs at `_proxies.<name>.<method>` paths.
@@ -555,7 +555,7 @@ class _RPCRemoteRef:
         return _RPCRemoteRef(self._client, self._path + (str(key),))
 
     def __bool__(self) -> bool:
-        # Endpoint code does `if not spirit_proxy:` to skip when proxy is
+        # Endpoint code does `if not memory_proxy:` to skip when proxy is
         # missing. Always-True keeps the existing pattern working when the
         # server-side proxy genuinely exists; when it doesn't, the server
         # returns None (not a remote ref), so this dunder isn't reached.

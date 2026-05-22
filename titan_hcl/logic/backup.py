@@ -803,7 +803,7 @@ class RebirthBackup:
     #     - 6 static birth identity files → §24.4.A (on Arweave via GenesisNFT)
     #       (titan_constitution.md, titan_directives.sig, genesis_record.json,
     #        genesis_nft_metadata.json, birth_dna_snapshot.json, titan_identity.json)
-    #     - titan_chronicles.md until BUG-CHRONICLE-WRITER-DEAD-POST-A87 fixes
+    #     - titan_chronicles.md (RE-ADDED 2026-05-22 below — BUG-CHRONICLE-WRITER-DEAD-POST-A87 fixed)
     #     - data/runtime_keypair.json (ephemeral — regenerated every boot from soul_keypair.enc)
     #     - data/zk_queue/pending.json (reconstructable from memory.db uncommitted rows)
     #     - data/sage_memory/buffer_metadata.json + meta.json (pointer-only — moved to weekly with FULL dir)
@@ -830,6 +830,10 @@ class RebirthBackup:
         ("data/episodic_memory.db", "episodic_memory.db"),        # ~99MB: episodic records
         ("data/experiential_memory.db", "experiential_memory.db"),  # ~856KB: dream insights
         ("data/pi_heartbeat_state.json", "pi_heartbeat_state.json"),  # ~1KB
+        # Narrative diary — RE-ADDED 2026-05-22 (BUG-CHRONICLE-WRITER-DEAD-POST-A87
+        # fixed: titan_HCL._append_to_chronicle writes meditation reflections again
+        # on MEDITATION_COMPLETE). Was removed from §24.4.B while the writer was dead.
+        ("titan_chronicles.md", "titan_chronicles.md"),            # ~varies: Scholar's Chronicle reflections
         # MSL concept state — "I" identity + concept cascade (critical for resurrection)
         ("data/msl/msl_identity.json", "msl/msl_identity.json"),    # ~2KB: I-confidence, recipe, convergences
         ("data/msl/msl_concepts.json", "msl/msl_concepts.json"),    # ~90KB: YOU/YES/NO/WE/THEY + interaction matrix
