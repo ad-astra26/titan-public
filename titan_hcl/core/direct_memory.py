@@ -78,24 +78,15 @@ class TitanDuckDB:
                 created_at DOUBLE
             )
         """)
-        # Synthesis Engine Phase 1 / D-SPEC-123 — activation_state per arch
-        # §5.2. synthesis_worker is sole writer (G21 / INV-Syn-3). Cross-
-        # process consumers read this directly via the BridgeRecall pattern,
-        # every query gated on synth_status.bin :: last_consistent_event_ts.
-        # item_id namespacing: "kuzu:NODE" | "tc:TX" | "skill:ID" | "fork:ID"
-        # | "mem:<memory_nodes.id>" (the latter for memory_nodes rows
-        # directly).
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS activation_state (
-                item_id TEXT PRIMARY KEY,
-                last_access DOUBLE,
-                access_log BLOB,
-                access_count INTEGER DEFAULT 0,
-                first_access DOUBLE,
-                base_level DOUBLE DEFAULT 0.0,
-                last_recompute DOUBLE DEFAULT 0.0
-            )
-        """)
+        # Synthesis Engine Phase 1 / D-SPEC-123 — activation_state DDL
+        # RELOCATED 2026-05-23 to data/synthesis.duckdb (owned by
+        # synthesis_worker per G21 / INV-Syn-3). It lived here briefly
+        # in the substrate commit (b1a04736) but DuckDB v0.8+ rejects two
+        # R/W connections to one file across processes, so memory_worker
+        # (this DB's R/W owner) and synthesis_worker can't share the
+        # file — synthesis_worker now owns its own file. memory_worker
+        # reads activation_state R/O via _in_process_activation_lookup
+        # opening data/synthesis.duckdb in read_only mode.
 
     def insert_node(self, node: dict) -> int:
         """Insert a memory node. Returns node id."""

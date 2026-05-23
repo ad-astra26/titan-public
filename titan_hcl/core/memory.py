@@ -631,28 +631,50 @@ class TieredMemoryGraph:
     def _in_process_activation_lookup(
         self, item_ids: list, bridge_recall,
     ) -> dict:
-        """Watermark-gated activation_state SELECT via our existing
-        _duckdb._conn (no separate DuckDB connection — avoids the
-        same-file-different-config conflict in-process).
+        """Watermark-gated activation_state SELECT via a lazy R/O DuckDB
+        connection to data/synthesis.duckdb (synthesis_worker's R/W
+        territory per G21 / INV-Syn-3). Memory_worker process can hold
+        a R/O connection on synthesis.duckdb at the same time
+        synthesis_worker holds R/W — different processes, R/O coexists
+        with R/W in DuckDB.
 
-        Soft-fail: returns {} on stale watermark OR any DuckDB error.
-        composite_score then substitutes cold-start for every item.
+        Soft-fail: returns {} on stale watermark, DB-missing, or any
+        DuckDB error. composite_score then substitutes cold-start for
+        every item, gracefully degrading to cosine-only ordering.
         """
         if not item_ids:
             return {}
         if not bridge_recall.is_fresh(time.time()):
             return {}
+        # Resolve synthesis.duckdb path the same way the worker does.
+        data_dir = os.environ.get(
+            "TITAN_DATA_DIR", self._config.get("data_dir", "./data"))
+        synth_db_path = os.path.join(data_dir, "synthesis.duckdb")
+        if not os.path.exists(synth_db_path):
+            return {}
+        # Lazy-cache the R/O connection on the instance.
+        if not hasattr(self, "_synth_ro_conn") or self._synth_ro_conn is None:
+            try:
+                import duckdb
+                self._synth_ro_conn = duckdb.connect(
+                    synth_db_path, read_only=True)
+            except Exception as exc:
+                logger.debug(
+                    "[Memory] open synthesis.duckdb R/O failed "
+                    "(degrading): %s", exc)
+                self._synth_ro_conn = None
+                return {}
         try:
             placeholders = ", ".join(["?"] * len(item_ids))
-            rows = self._duckdb._conn.execute(
+            rows = self._synth_ro_conn.execute(
                 f"SELECT item_id, base_level FROM activation_state "
                 f"WHERE item_id IN ({placeholders})",
                 list(item_ids),
             ).fetchall()
         except Exception as exc:
             logger.debug(
-                "[Memory] in-process activation_state SELECT failed "
-                "(degrading): %s", exc)
+                "[Memory] activation_state SELECT failed (degrading): %s",
+                exc)
             return {}
         out = {}
         for item_id, base_level in rows:

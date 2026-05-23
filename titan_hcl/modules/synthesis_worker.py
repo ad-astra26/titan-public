@@ -201,7 +201,32 @@ class ActivationStore:
 
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
+        # DuckDB locks at the process level: TieredMemoryGraph (in
+        # memory_worker process) holds titan_memory.duckdb R/W. If
+        # synthesis_worker shared that file, the lock would conflict
+        # (different processes → DuckDB v0.8+ rejects). So synthesis_worker
+        # owns its OWN file `data/synthesis.duckdb` per G21 / INV-Syn-3 —
+        # sole writer of activation_state + (Phase 7) actr_buffers +
+        # (Phase 8) procedural_skills. Memory_worker + cross-process
+        # readers open this same file R/O via BridgeRecall +
+        # _in_process_activation_lookup.
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self._conn = duckdb.connect(db_path)
+        # Owner-side schema creation. CREATE TABLE IF NOT EXISTS is
+        # idempotent across restarts. Mirrors the schema previously held
+        # in titan_hcl/core/direct_memory.py (D-SPEC-123 v1; relocated
+        # 2026-05-23 to resolve the cross-worker lock conflict).
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS activation_state (
+                item_id TEXT PRIMARY KEY,
+                last_access DOUBLE,
+                access_log BLOB,
+                access_count INTEGER DEFAULT 0,
+                first_access DOUBLE,
+                base_level DOUBLE DEFAULT 0.0,
+                last_recompute DOUBLE DEFAULT 0.0
+            )
+        """)
         # Cache loaded lazily on first access — read existing rows so the
         # worker resumes ACT-R activation across restarts.
         self._cache: dict[str, ActivationState] = {}
@@ -381,9 +406,13 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     titan_id = resolve_titan_id(
         (config or {}).get("titan_id") if config else None)
 
-    # DuckDB path — same resolution as TitanDuckDB.
+    # DuckDB path — synthesis_worker owns its OWN file (not titan_memory.duckdb)
+    # per G21 / INV-Syn-3 to avoid the cross-worker R/W lock conflict
+    # (DuckDB v0.8+ rejects two R/W connections to one file across
+    # processes). `memory_db_path` config key is honored if explicitly
+    # set (for tests / migrations), else defaults to data/synthesis.duckdb.
     db_path = (config or {}).get("memory_db_path") or os.path.join(
-        "data", "titan_memory.duckdb")
+        "data", "synthesis.duckdb")
 
     interval_s = float((config or {}).get("recompute_interval_s",
                                           RECOMPUTE_INTERVAL_S))

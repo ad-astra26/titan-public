@@ -62,65 +62,105 @@ def test_alter_table_idempotent_on_reopen(tmp_path):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# activation_state table (sole-writer G21 / INV-Syn-3 surface — schema only)
+# activation_state table — sole-writer G21 / INV-Syn-3
+# DDL now lives in data/synthesis.duckdb (owned by synthesis_worker).
+# Tests verify the schema lands when ActivationStore initializes.
 # ─────────────────────────────────────────────────────────────────────────
 
-def test_activation_state_schema_present(fresh_db):
+def test_activation_state_schema_present_in_synth_db(tmp_path):
+    """ActivationStore.__init__ creates activation_state schema in
+    data/synthesis.duckdb (NOT titan_memory.duckdb — that was the brief
+    initial location, relocated 2026-05-23 to resolve cross-worker
+    DuckDB lock conflict)."""
+    from titan_hcl.modules.synthesis_worker import ActivationStore
+    db_path = tmp_path / "synthesis.duckdb"
+    store = ActivationStore(str(db_path))
+    try:
+        cols = store._conn.execute(
+            "PRAGMA table_info('activation_state')"
+        ).fetchall()
+        col_names = [c[1] for c in cols]
+        expected = {
+            "item_id", "last_access", "access_log", "access_count",
+            "first_access", "base_level", "last_recompute",
+        }
+        assert expected.issubset(set(col_names)), (
+            f"missing: {expected - set(col_names)}; have: {col_names}")
+    finally:
+        store.close()
+
+
+def test_activation_state_not_in_titan_memory_duckdb(fresh_db):
+    """Sanity: titan_memory.duckdb no longer carries activation_state.
+    This is the post-relocation contract — pin it so a future re-merge
+    of the schema there triggers a test failure."""
     db, _ = fresh_db
-    cols = db._conn.execute(
-        "PRAGMA table_info('activation_state')"
+    rows = db._conn.execute(
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_schema = 'main' AND table_name = 'activation_state'"
     ).fetchall()
-    col_names = [c[1] for c in cols]
-    expected = {
-        "item_id", "last_access", "access_log", "access_count",
-        "first_access", "base_level", "last_recompute",
-    }
-    assert expected.issubset(set(col_names)), (
-        f"missing: {expected - set(col_names)}; have: {col_names}")
+    assert rows == [], (
+        "activation_state must NOT be in titan_memory.duckdb (lives in "
+        "synthesis.duckdb per G21 / INV-Syn-3 — relocated 2026-05-23)")
 
 
-def test_activation_state_primary_key_item_id(fresh_db):
-    db, _ = fresh_db
-    cols = db._conn.execute(
-        "PRAGMA table_info('activation_state')"
-    ).fetchall()
-    pk_cols = [c[1] for c in cols if c[5] != 0]   # column 5 = 'pk' index
-    assert pk_cols == ["item_id"]
+def test_activation_state_primary_key_item_id_in_synth_db(tmp_path):
+    from titan_hcl.modules.synthesis_worker import ActivationStore
+    db_path = tmp_path / "synthesis.duckdb"
+    store = ActivationStore(str(db_path))
+    try:
+        cols = store._conn.execute(
+            "PRAGMA table_info('activation_state')"
+        ).fetchall()
+        pk_cols = [c[1] for c in cols if c[5] != 0]
+        assert pk_cols == ["item_id"]
+    finally:
+        store.close()
 
 
-def test_activation_state_insert_roundtrip(fresh_db):
-    db, _ = fresh_db
+def test_activation_state_insert_roundtrip_via_store(tmp_path):
+    from titan_hcl.modules.synthesis_worker import ActivationStore
     import time
-    now = time.time()
-    db._conn.execute(
-        "INSERT INTO activation_state "
-        "(item_id, last_access, access_count, first_access, base_level, "
-        " last_recompute) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ("kuzu:NODE_42", now, 1, now, 0.5, now),
-    )
-    row = db._conn.execute(
-        "SELECT item_id, base_level FROM activation_state "
-        "WHERE item_id = ?", ("kuzu:NODE_42",)
-    ).fetchone()
-    assert row[0] == "kuzu:NODE_42"
-    assert row[1] == pytest.approx(0.5)
+    db_path = tmp_path / "synthesis.duckdb"
+    store = ActivationStore(str(db_path))
+    try:
+        now = time.time()
+        store._conn.execute(
+            "INSERT INTO activation_state "
+            "(item_id, last_access, access_count, first_access, base_level, "
+            " last_recompute) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("kuzu:NODE_42", now, 1, now, 0.5, now),
+        )
+        row = store._conn.execute(
+            "SELECT item_id, base_level FROM activation_state "
+            "WHERE item_id = ?", ("kuzu:NODE_42",)
+        ).fetchone()
+        assert row[0] == "kuzu:NODE_42"
+        assert row[1] == pytest.approx(0.5)
+    finally:
+        store.close()
 
 
 def test_activation_state_idempotent_on_reopen(tmp_path):
-    db_path = tmp_path / "titan_memory.duckdb"
-    db1 = TitanDuckDB(str(db_path))
-    db1._conn.execute(
+    """ActivationStore's CREATE TABLE IF NOT EXISTS is idempotent across
+    restarts."""
+    from titan_hcl.modules.synthesis_worker import ActivationStore
+    db_path = tmp_path / "synthesis.duckdb"
+    store1 = ActivationStore(str(db_path))
+    store1._conn.execute(
         "INSERT INTO activation_state (item_id, base_level) "
         "VALUES (?, ?)", ("tc:abc", 0.7))
-    db1._conn.close()
+    store1.close()
     # Reopen — schema CREATE IF NOT EXISTS is a no-op.
-    db2 = TitanDuckDB(str(db_path))
-    n = db2._conn.execute(
-        "SELECT COUNT(*) FROM activation_state"
-    ).fetchone()[0]
-    assert n == 1
-    db2._conn.close()
+    store2 = ActivationStore(str(db_path))
+    try:
+        n = store2._conn.execute(
+            "SELECT COUNT(*) FROM activation_state"
+        ).fetchone()[0]
+        assert n == 1
+    finally:
+        store2.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────

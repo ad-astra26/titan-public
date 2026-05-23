@@ -25,11 +25,16 @@ def isolated_shm(monkeypatch, tmp_path):
 
 @pytest.fixture
 def fresh_db_path(tmp_path):
-    """Create titan_memory.duckdb with activation_state schema initialized."""
-    from titan_hcl.core.direct_memory import TitanDuckDB
-    db_path = tmp_path / "titan_memory.duckdb"
-    db = TitanDuckDB(str(db_path))
-    db._conn.close()
+    """Create synthesis.duckdb with activation_state schema initialized.
+
+    Post-relocation 2026-05-23: activation_state lives in synthesis.duckdb
+    (synthesis_worker's R/W territory per G21 / INV-Syn-3), NOT in
+    titan_memory.duckdb. BridgeRecall opens this file R/O cross-process.
+    """
+    from titan_hcl.modules.synthesis_worker import ActivationStore
+    db_path = tmp_path / "synthesis.duckdb"
+    store = ActivationStore(str(db_path))
+    store.close()
     return str(db_path)
 
 

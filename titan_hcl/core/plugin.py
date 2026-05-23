@@ -1229,10 +1229,14 @@ class TitanHCL:
             config={
                 "titan_id": self._full_config.get("network", {}).get(
                     "titan_id"),
+                # G21 / INV-Syn-3: synthesis_worker owns synthesis.duckdb
+                # (NOT titan_memory.duckdb — that's memory_worker's R/W
+                # territory; sharing it across workers triggers DuckDB's
+                # cross-process R/W lock rejection).
                 "memory_db_path": os.path.join(
                     self._full_config.get("memory_and_storage", {}).get(
                         "data_dir", "./data"),
-                    "titan_memory.duckdb"),
+                    "synthesis.duckdb"),
             },
             rss_limit_mb=200,
             autostart=True,
