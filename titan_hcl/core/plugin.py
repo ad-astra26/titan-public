@@ -1213,6 +1213,40 @@ class TitanHCL:
             critical_data_writer=False,
         ))
 
+        # synthesis_worker — Synthesis Engine Phase 1 (D-SPEC-123, SPEC v1.56.0
+        # §25 / §9.B `synthesis_worker` block). 2026-05-23. L2 worker, sole
+        # writer (G21 / INV-Syn-3) for activation_state DuckDB + synth_status.bin
+        # SHM watermark. Cross-process consumers read activation_state via the
+        # BridgeRecall pattern (G18 / INV-Syn-4 — watermark-gated). Phase 1
+        # producers of MEMORY_RETRIEVAL_USED: core/memory.py._cognee_search
+        # (use-gated emit per item passed to LLM context). 60s recompute
+        # interval; titan_id resolved per-Titan via state_registry.
+        from titan_hcl.modules.synthesis_worker import synthesis_worker_main
+        self.guardian.register(ModuleSpec(
+            name="synthesis",
+            layer="L2",
+            entry_fn=synthesis_worker_main,
+            config={
+                "titan_id": self._full_config.get("network", {}).get(
+                    "titan_id"),
+                "memory_db_path": os.path.join(
+                    self._full_config.get("memory_and_storage", {}).get(
+                        "data_dir", "./data"),
+                    "titan_memory.duckdb"),
+            },
+            rss_limit_mb=200,
+            autostart=True,
+            lazy=False,
+            heartbeat_timeout=60.0,
+            broadcast_topics=[
+                bus.MEMORY_RETRIEVAL_USED,
+                bus.KERNEL_EPOCH_TICK,
+                bus.MODULE_SHUTDOWN,
+            ],
+            start_method="spawn" if _spawn_grad else "fork",
+            critical_data_writer=False,
+        ))
+
         # observatory_worker — extracted per RFP_phase_c_titan_hcl_cleanup
         # Phase A+B (Track 2, 2026-05-21). Maker-greenlit inline.
         # Owns the two residual Observatory-output PRODUCTION loops carved out

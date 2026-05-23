@@ -53,13 +53,32 @@ class TieredMemoryGraph:
     Mempool and system nodes remain in a local index for fast access.
     """
 
-    def __init__(self, config: dict = None):
+    def __init__(self, config: dict = None, bus_emit=None):
         """
         Args:
             config: Dict combining [inference] + [memory_and_storage] sections from config.toml.
+            bus_emit: Optional callable (msg_type: str, payload: dict) -> None.
+                When provided AND the synthesis_worker watermark is fresh,
+                _cognee_search re-ranks FAISS hits via the ACT-R composite
+                score (arch §5.3) AND emits MEMORY_RETRIEVAL_USED for each
+                returned item (use-gated reinforcement per INV-Syn-5).
+                When None or watermark stale, retrieval degrades to the
+                pre-Phase-1 FAISS-only behavior — Phase 1 is strictly
+                additive, no regression for callers that don't wire it.
+                D-SPEC-123 (SPEC v1.56.0 §25 / 2026-05-23).
         """
         config = config or {}
         self._config = config
+        self._bus_emit = bus_emit
+        # BridgeRecall is process-local + lazy — only constructed on first
+        # _cognee_search call so consumer processes that never recall pay
+        # zero cost. The singleton accessor handles thread safety.
+        self._bridge_recall = None
+        # Composite-score weights — pulled from titan_params.toml
+        # [synthesis] block at first use; defaults match arch §5.3.
+        self._synth_w_b = None
+        self._synth_w_r = None
+        self._synth_w_p = None
 
         # Data directory. BUG-B1-SHARED-LOCKS: shadow kernels set
         # TITAN_DATA_DIR pointing at data_shadow_<port>/ so they don't
@@ -481,6 +500,16 @@ class TieredMemoryGraph:
         """
         FAISS vector search for persistent memories (replaces Cognee search).
         Returns list of node dicts matching the query semantically.
+
+        D-SPEC-123 (2026-05-23): synthesis-aware re-ranking + use-gated
+        reinforcement emit. When self._bus_emit is wired (memory_worker
+        provides it) AND the synth_status.bin watermark is fresh, the
+        FAISS hits are re-ranked via the ACT-R composite score (arch §5.3)
+        and a MEMORY_RETRIEVAL_USED event is emitted per returned item.
+        When the watermark is stale OR the worker hasn't booted yet,
+        BridgeRecall.activation_lookup returns {} → composite_score gets
+        all cold-start → falls through to cosine-only ordering, IDENTICAL
+        to the pre-Phase-1 behavior (no regression).
         """
         if self._vectors.count == 0:
             return []
@@ -488,18 +517,152 @@ class TieredMemoryGraph:
         try:
             query_vec = self._vectors.embed(prompt)
             hits = self._vectors.search(query_vec, top_k=top_k)
-            results = []
-            for node_id, score in hits:
-                node = self._node_store.get(node_id)
-                if node and node.get("status") == "persistent":
-                    results.append(node)
-            if results:
-                logger.info("[Memory] FAISS search: %d results for '%s...'",
-                            len(results), prompt[:40])
-            return results
         except Exception as e:
             logger.debug("[Memory] FAISS search failed: %s", e)
             return []
+
+        # Build candidate list — only items with valid persistent nodes.
+        from titan_hcl.synthesis.composite_score import Candidate, composite_score
+        candidates: list[Candidate] = []
+        for node_id, score in hits:
+            node = self._node_store.get(node_id)
+            if node and node.get("status") == "persistent":
+                # `effective_weight` already carries decay + reinforcement
+                # signal; use it as the per-node importance until Phase 4+
+                # bridge salience formula lands.
+                importance = float(node.get("effective_weight", 0.5))
+                candidates.append(Candidate(
+                    item_id=f"mem:{node_id}",
+                    cosine=float(score),
+                    importance=importance,
+                    payload=node,
+                ))
+
+        if not candidates:
+            return []
+
+        # Synthesis-aware re-rank path. Bus emit + activation lookup are
+        # both optional — when either is missing, we degrade to the
+        # pre-Phase-1 cosine-only ordering (which is just the FAISS hit
+        # order, since FAISS already returns sorted by inner product).
+        if self._bus_emit is not None:
+            try:
+                # WATERMARK gate via BridgeRecall (SHM only — no DuckDB
+                # connection conflict with our own _duckdb._conn since
+                # BridgeRecall lazy-opens DuckDB and we never call its
+                # activation_lookup from in-process). When stale, we
+                # still emit MEMORY_RETRIEVAL_USED (so a booting worker
+                # can backfill from the bus once fresh) but skip the
+                # composite re-rank — fall through to cosine ordering.
+                if self._bridge_recall is None:
+                    from titan_hcl.synthesis.bridge_recall import (
+                        BridgeRecall,
+                    )
+                    # Construct a watermark-only reader (db_path doesn't
+                    # matter since we won't call activation_lookup on it
+                    # from in-process — TieredMemoryGraph's own _duckdb
+                    # _conn handles activation_state SELECT directly).
+                    self._bridge_recall = BridgeRecall(
+                        titan_id=self._config.get("titan_id"),
+                        db_path="/dev/null")    # never opened
+                if self._synth_w_b is None:
+                    self._synth_w_b, self._synth_w_r, self._synth_w_p = \
+                        self._load_synth_weights()
+
+                # IN-PROCESS activation_state SELECT via our own _duckdb
+                # ._conn. Watermark-gated per INV-Syn-4 — when stale,
+                # _in_process_activation_lookup returns {} → composite_
+                # score treats every item as cold-start (same as
+                # cross-process degrade path).
+                def _activation_lookup(item_ids):
+                    return self._in_process_activation_lookup(
+                        item_ids, self._bridge_recall)
+
+                scored = composite_score(
+                    candidates,
+                    activation_lookup=_activation_lookup,
+                    w_b=self._synth_w_b,
+                    w_r=self._synth_w_r,
+                    w_p=self._synth_w_p,
+                )
+                # USE-gated emit per INV-Syn-5: every returned item is
+                # treated as "used" for Phase 1 — the strict "LLM cited"
+                # gate per arch §5.4 lands in Phase 9 meta-reasoning
+                # integration (rFP §18). Cheap fire-and-forget.
+                now = time.time()
+                for sc in scored:
+                    try:
+                        self._bus_emit("MEMORY_RETRIEVAL_USED", {
+                            "item_id": sc.candidate.item_id,
+                            "ts": now,
+                        })
+                    except Exception as emit_err:
+                        logger.debug(
+                            "[Memory] synthesis emit failed (degrading): %s",
+                            emit_err)
+                        break    # break the loop on first emit error
+                results = [sc.candidate.payload for sc in scored]
+            except Exception as synth_err:
+                logger.debug(
+                    "[Memory] composite re-rank failed (cosine-only "
+                    "fallback): %s", synth_err)
+                results = [c.payload for c in candidates]
+        else:
+            results = [c.payload for c in candidates]
+
+        if results:
+            logger.info("[Memory] FAISS search: %d results for '%s...'",
+                        len(results), prompt[:40])
+        return results
+
+    def _load_synth_weights(self) -> tuple[float, float, float]:
+        """Read [synthesis] weights from config; fall back to arch §5.3
+        defaults (all 1.0). Cached at first _cognee_search call."""
+        from titan_hcl.synthesis.composite_score import (
+            DEFAULT_W_B, DEFAULT_W_R, DEFAULT_W_P,
+        )
+        synth_cfg = (self._config.get("synthesis", {}) or {})
+        return (
+            float(synth_cfg.get("w_b", DEFAULT_W_B)),
+            float(synth_cfg.get("w_r", DEFAULT_W_R)),
+            float(synth_cfg.get("w_p", DEFAULT_W_P)),
+        )
+
+    def _in_process_activation_lookup(
+        self, item_ids: list, bridge_recall,
+    ) -> dict:
+        """Watermark-gated activation_state SELECT via our existing
+        _duckdb._conn (no separate DuckDB connection — avoids the
+        same-file-different-config conflict in-process).
+
+        Soft-fail: returns {} on stale watermark OR any DuckDB error.
+        composite_score then substitutes cold-start for every item.
+        """
+        if not item_ids:
+            return {}
+        if not bridge_recall.is_fresh(time.time()):
+            return {}
+        try:
+            placeholders = ", ".join(["?"] * len(item_ids))
+            rows = self._duckdb._conn.execute(
+                f"SELECT item_id, base_level FROM activation_state "
+                f"WHERE item_id IN ({placeholders})",
+                list(item_ids),
+            ).fetchall()
+        except Exception as exc:
+            logger.debug(
+                "[Memory] in-process activation_state SELECT failed "
+                "(degrading): %s", exc)
+            return {}
+        out = {}
+        for item_id, base_level in rows:
+            if base_level is None:
+                continue
+            try:
+                out[item_id] = float(base_level)
+            except (TypeError, ValueError):
+                continue
+        return out
 
     async def graph_completion_search(self, prompt: str, top_k: int = 3) -> list:
         """

@@ -43,13 +43,29 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     logger.info("[MemoryWorker] Initializing TieredMemoryGraph...")
     init_start = time.time()
 
+    # Synthesis Engine Phase 1 (D-SPEC-123 / SPEC v1.56.0 §25): inject a
+    # bus_emit callable so TieredMemoryGraph._cognee_search can emit
+    # MEMORY_RETRIEVAL_USED (use-gated reinforcement, INV-Syn-5). The emit
+    # is fire-and-forget; synthesis_worker is the sole consumer. Cheap
+    # closure over send_queue (multiprocessing.Queue → put_nowait).
+    def _synth_bus_emit(msg_type: str, payload: dict) -> None:
+        try:
+            from titan_hcl.bus import make_msg
+            send_queue.put_nowait(
+                make_msg(msg_type, name, "all", payload))
+        except Exception as _emit_err:
+            logger.debug(
+                "[MemoryWorker] synth bus_emit failed for %s: %s",
+                msg_type, _emit_err)
+
     # Retry with backoff — DuckDB lock may be held briefly by a dying sibling process
     memory = None
     max_retries = 3
     for attempt in range(max_retries):
         try:
             from titan_hcl.core.memory import TieredMemoryGraph
-            memory = TieredMemoryGraph(config=dict(config))
+            memory = TieredMemoryGraph(
+                config=dict(config), bus_emit=_synth_bus_emit)
             init_ms = (time.time() - init_start) * 1000
             logger.info("[MemoryWorker] TieredMemoryGraph ready in %.0fms", init_ms)
             break
