@@ -360,7 +360,14 @@ async fn run_one_tick(
         let mut s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
         let epoch_due = s.epoch_pending;
         s.epoch_pending = false;
-        (s.unified, s.local, s.topology_signaled, epoch_due)
+        // D-SPEC-121 (v1.54.0): one-shot consume-and-clear of filter_down
+        // multipliers (see inner-body for rationale).
+        (
+            s.unified.take(),
+            s.local.take(),
+            s.topology_signaled,
+            epoch_due,
+        )
     };
 
     // Compose UNIFIED ⊗ LOCAL → 15D mult vec.

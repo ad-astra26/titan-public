@@ -486,71 +486,132 @@ fn conformance_g5_2_state_checkpoint_roundtrip() {
     }
 }
 
-// ── G5.1-down-leg-spirit-pulse: small filter_down trigger reads spirit pulse ─
+// ── G5.1-down-leg-spirit-pulse: small filter_down trigger reads BALANCED spirit pulse ─
 #[test]
 fn conformance_g5_1_down_leg_on_spirit_pulse() {
-    // SPEC §G5.1 P0-0a (D-SPEC-112 amendment): the small filter_down DOWN-leg
-    // gates on the spirit sphere-clock PULSE rising-edge read SHM-direct from
-    // `sphere_clocks.bin` (NOT KERNEL_EPOCH_TICK, NOT per Schumann tick).
-    // PulseWatcher must report a rising-edge on the InnerSpirit / OuterSpirit
-    // slot when their pulse_count advances; the spirit daemon's tick_loop
-    // gates on exactly this edge (verified by file-level grep below + the
-    // watcher behavior here).
+    // SPEC §G5.1 (D-SPEC-121 v1.54.0; narrows D-SPEC-112): the small filter_down
+    // DOWN-leg gates on the spirit sphere-clock's BALANCED PULSE rising-edge —
+    // `edges[Spirit] && cb[Spirit] >= 1` read SHM-direct from `sphere_clocks.bin`.
+    // An unbalanced spirit pulse does NOT fire the small filter_down. The
+    // PulseWatcher's `tick_with_balanced()` is the canonical SPEC accessor.
     use std::fs::File;
     use std::io::Write;
     use std::path::Path;
     use tempfile::tempdir;
     use titan_state::Slot;
-    use titan_trinity_daemon::{PulseClockRole, PulseWatcher};
+    use titan_trinity_daemon::{
+        pulse_watch::{PULSE_WATCH_CONSEC_BALANCED_OFFSET, PULSE_WATCH_PAYLOAD_BYTES},
+        PulseClockRole, PulseWatcher,
+    };
 
-    // Spirit pulse rising edge — only the spirit's edge fires.
     let dir = tempdir().unwrap();
     let path = dir.path().join("sphere_clocks.bin");
-    let mut slot = Slot::create(&path, 1, 168).unwrap();
-    let mut bytes = vec![0u8; 168];
-    // pulse_count = 0 for all 6.
+    let mut slot = Slot::create(&path, 1, PULSE_WATCH_PAYLOAD_BYTES as u32).unwrap();
+    let mut bytes = vec![0u8; PULSE_WATCH_PAYLOAD_BYTES];
     slot.write(&bytes).unwrap();
     let mut watcher = PulseWatcher::open(dir.path());
-    let _ = watcher.tick(); // seed
-                            // Spirit clock pulses: inner_spirit at file index 2 → byte 2*28+16 = 72.
+    let _ = watcher.tick_with_balanced(); // seed
+
+    // (1) Spirit clock pulses but cb=0 (unbalanced) → edge fires, balanced_edge does NOT.
     let inner_spirit_off = PulseClockRole::InnerSpirit.count_byte_offset();
     bytes[inner_spirit_off..inner_spirit_off + 4].copy_from_slice(&1.0_f32.to_le_bytes());
     slot.write(&bytes).unwrap();
-    let edges = watcher.tick();
+    let (edges, balanced_edges) = watcher.tick_with_balanced();
     assert!(
         edges[PulseClockRole::InnerSpirit.index()],
         "spirit pulse rising edge must be detected SHM-direct"
     );
     assert!(
-        !edges[PulseClockRole::InnerBody.index()],
-        "body did not pulse; no edge expected"
+        !balanced_edges[PulseClockRole::InnerSpirit.index()],
+        "D-SPEC-121: unbalanced spirit pulse must NOT fire the small filter_down"
     );
 
-    // Structural assertion: the inner-spirit + outer-spirit daemons must
-    // NOT gate small filter_down on `epoch_pending` anymore — grep the
-    // tick_loop.rs files for the retired pattern. Block any regression
-    // that resurrects the KERNEL_EPOCH_TICK arm.
+    // (2) Spirit clock pulses AND cb=5 (balanced) → BOTH edges fire — small filter_down gate met.
+    bytes[inner_spirit_off..inner_spirit_off + 4].copy_from_slice(&2.0_f32.to_le_bytes());
+    let cb_off = PulseClockRole::InnerSpirit.index() * 28 + PULSE_WATCH_CONSEC_BALANCED_OFFSET;
+    bytes[cb_off..cb_off + 4].copy_from_slice(&5.0_f32.to_le_bytes());
+    slot.write(&bytes).unwrap();
+    let (_, balanced_edges2) = watcher.tick_with_balanced();
+    assert!(
+        balanced_edges2[PulseClockRole::InnerSpirit.index()],
+        "D-SPEC-121: balanced spirit pulse MUST fire the small filter_down — \
+         this is the spirit-reaches-the-Middle-Path gate"
+    );
+
+    // Structural assertions: the spirit daemons must NOT gate small filter_down
+    // on (a) `epoch_pending` (retired D-SPEC-96/97) NOR (b) raw `pulse_edges`
+    // unaware of balance (D-SPEC-121). Both spirit DOWN-legs MUST read
+    // `balanced_pulse_edges`. Block any regression that resurfaces the
+    // pre-D-SPEC-121 trigger.
     fn assert_no_epoch_arm(path: &Path) {
         let s = std::fs::read_to_string(path).expect("read daemon tick_loop.rs");
         assert!(
             !s.contains("if epoch_pending.swap(false, Ordering::Relaxed)"),
             "{}: KERNEL_EPOCH_TICK arm pattern resurfaced — small filter_down \
-             must gate on the spirit sphere-clock PULSE per D-SPEC-112 §G5.1",
+             must gate on the spirit sphere-clock BALANCED PULSE per D-SPEC-121 §G5.1",
             path.display(),
         );
     }
-    // Resolve daemon source paths relative to the crate's source location.
-    // Workspace layout: titan-rust/crates/{titan-inner-spirit-rs,titan-outer-spirit-rs}.
-    // Use CARGO_MANIFEST_DIR so the test runs cleanly under cargo from anywhere.
+    fn assert_uses_balanced_pulse_edges_for_spirit_gate(path: &Path) {
+        let s = std::fs::read_to_string(path).expect("read daemon tick_loop.rs");
+        assert!(
+            s.contains("balanced_pulse_edges[PulseClockRole::InnerSpirit.index()]")
+                || s.contains("balanced_pulse_edges[PulseClockRole::OuterSpirit.index()]"),
+            "{}: small filter_down DOWN-leg must gate on `balanced_pulse_edges[*Spirit]` \
+             per D-SPEC-121 (not raw `pulse_edges` — that would fire on unbalanced pulses)",
+            path.display(),
+        );
+    }
     let here = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let crates_dir = std::path::PathBuf::from(here).join("..");
-    assert_no_epoch_arm(&crates_dir.join("titan-inner-spirit-rs/src/tick_loop.rs"));
-    assert_no_epoch_arm(&crates_dir.join("titan-outer-spirit-rs/src/tick_loop.rs"));
+    let inner_spirit_path = crates_dir.join("titan-inner-spirit-rs/src/tick_loop.rs");
+    let outer_spirit_path = crates_dir.join("titan-outer-spirit-rs/src/tick_loop.rs");
+    assert_no_epoch_arm(&inner_spirit_path);
+    assert_no_epoch_arm(&outer_spirit_path);
+    assert_uses_balanced_pulse_edges_for_spirit_gate(&inner_spirit_path);
+    assert_uses_balanced_pulse_edges_for_spirit_gate(&outer_spirit_path);
 
-    // Belt + suspenders: emit a sentinel file so a CI watchdog can grep
-    // for this test having run — protects against accidental ignore.
     let mut f = File::create(dir.path().join("g5_1_down_leg_pulsed.ok")).unwrap();
     let _ = f.write_all(b"ok");
+}
+
+// ── G5.1 D-SPEC-121: one-shot filter_down application (consume-and-clear) ────
+#[test]
+fn conformance_g5_1_filter_down_application_is_one_shot() {
+    // SPEC §G5.1 D-SPEC-121 (v1.54.0): the filter_down multipliers received by
+    // body/mind daemons MUST be applied ONCE on the consuming Schumann tick and
+    // then cleared (held value returns to None). Static structural assertion:
+    // every receiving daemon's per-tick read of `s.unified` + `s.local` MUST
+    // use `.take()` (which sets the Option to None), NOT a plain field read
+    // (which would re-apply the same multiplier every subsequent tick — the
+    // pre-D-SPEC-121 v1.36.2 "held + applied per tick" behavior that
+    // saturated high-raw dims at 0 under §G5.2 statefulness).
+    use std::path::Path;
+    fn assert_consume_and_clear(path: &Path) {
+        let s = std::fs::read_to_string(path).expect("read daemon tick_loop.rs");
+        assert!(
+            s.contains("s.unified.take()"),
+            "{}: D-SPEC-121 violation — `s.unified` must be `.take()`'d (consume-and-clear), \
+             not held; otherwise the §G5.2 integrator gets a continuous −0.5·raw pull \
+             every Schumann tick under any non-1.0 multiplier",
+            path.display(),
+        );
+        assert!(
+            s.contains("s.local.take()"),
+            "{}: D-SPEC-121 violation — `s.local` must be `.take()`'d (consume-and-clear)",
+            path.display(),
+        );
+    }
+    let here = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let crates_dir = std::path::PathBuf::from(here).join("..");
+    for daemon in &[
+        "titan-inner-body-rs/src/tick_loop.rs",
+        "titan-inner-mind-rs/src/tick_loop.rs",
+        "titan-outer-body-rs/src/tick_loop.rs",
+        "titan-outer-mind-rs/src/tick_loop.rs",
+    ] {
+        assert_consume_and_clear(&crates_dir.join(daemon));
+    }
 }
 
 // ── G5.1-up-leg-bonus: body/mind pulse → spirit content additive bonus ───────

@@ -29,8 +29,12 @@ use tracing::{debug, warn};
 
 /// Per-clock stride in bytes (7 fields × 4 bytes).
 pub const PULSE_WATCH_CLOCK_STRIDE: usize = 28;
-/// Pulse-count field byte offset within a clock entry.
-pub const PULSE_WATCH_COUNT_OFFSET: usize = 16; // 4 × 4
+/// Pulse-count field byte offset within a clock entry (field index 4 × 4).
+pub const PULSE_WATCH_COUNT_OFFSET: usize = 16;
+/// `consecutive_balanced` field byte offset within a clock entry (field index 5 × 4).
+/// SPEC §G5.1 D-SPEC-121: a small filter_down emission requires the spirit
+/// pulse to be balanced (`consecutive_balanced ≥ 1` at pulse moment).
+pub const PULSE_WATCH_CONSEC_BALANCED_OFFSET: usize = 20;
 /// Total payload bytes — must match `SPHERE_CLOCKS_PAYLOAD_BYTES`.
 pub const PULSE_WATCH_PAYLOAD_BYTES: usize = 168;
 
@@ -64,15 +68,29 @@ impl PulseClockRole {
         }
     }
 
-    /// Byte offset of this clock's pulse_count field.
+    /// Byte offset of this clock's `pulse_count` field (field index 4).
     pub const fn count_byte_offset(self) -> usize {
         self.index() * PULSE_WATCH_CLOCK_STRIDE + PULSE_WATCH_COUNT_OFFSET
+    }
+
+    /// Byte offset of this clock's `consecutive_balanced` field (field index 5).
+    /// Used by the §G5.1 D-SPEC-121 balanced-pulse gate: a small filter_down
+    /// fires only when the spirit clock pulses AND was balanced at pulse time
+    /// (`consecutive_balanced` ≥ 1 means the latest tick was within balance).
+    pub const fn consecutive_balanced_byte_offset(self) -> usize {
+        self.index() * PULSE_WATCH_CLOCK_STRIDE + PULSE_WATCH_CONSEC_BALANCED_OFFSET
     }
 }
 
 /// Per-tick edge report: which clocks pulsed since the last [`PulseWatcher::tick`]
 /// call. `[inner_body, inner_mind, inner_spirit, outer_body, outer_mind, outer_spirit]`.
 pub type PulseEdges = [bool; 6];
+
+/// Per-tick balanced-edge report: which clocks pulsed THIS tick AND were
+/// balanced at pulse time (`consecutive_balanced ≥ 1`). The §G5.1 D-SPEC-121
+/// gate for emitting small filter_down: spirit pulse rising-edge AND
+/// balanced. Per-index alignment matches [`PulseEdges`].
+pub type BalancedPulseEdges = [bool; 6];
 
 /// SHM-direct sphere-clock pulse-count edge detector.
 ///
@@ -122,15 +140,25 @@ impl PulseWatcher {
     /// First call after seeding emits no edges (no prior); subsequent calls
     /// emit `true` for every clock whose pulse_count advanced.
     pub fn tick(&mut self) -> PulseEdges {
+        self.tick_with_balanced().0
+    }
+
+    /// Read latest pulse_counts + `consecutive_balanced` + emit BOTH
+    /// rising-edge masks: `(edges, balanced_edges)` where `balanced_edges[i]`
+    /// is true iff `edges[i]` is true AND `consecutive_balanced[i] >= 1` at
+    /// pulse time. SPEC §G5.1 D-SPEC-121 gate for small filter_down emission:
+    /// spirit pulse rising-edge AND balanced.
+    pub fn tick_with_balanced(&mut self) -> (PulseEdges, BalancedPulseEdges) {
         let mut edges: PulseEdges = [false; 6];
+        let mut balanced_edges: BalancedPulseEdges = [false; 6];
         let Some(slot) = self.slot.as_ref() else {
-            return edges;
+            return (edges, balanced_edges);
         };
         let bytes = match slot.read() {
             Ok(b) => b,
             Err(e) => {
                 debug!(err = ?e, "sphere_clocks.bin read failed; no pulse edge this tick");
-                return edges;
+                return (edges, balanced_edges);
             }
         };
         if bytes.len() < PULSE_WATCH_PAYLOAD_BYTES {
@@ -140,9 +168,10 @@ impl PulseWatcher {
                 expected = PULSE_WATCH_PAYLOAD_BYTES,
                 "sphere_clocks.bin shorter than spec — no pulse edges"
             );
-            return edges;
+            return (edges, balanced_edges);
         }
         let mut cur = [0u32; 6];
+        let mut cur_cb = [0u32; 6];
         let roles = [
             PulseClockRole::InnerBody,
             PulseClockRole::InnerMind,
@@ -158,9 +187,19 @@ impl PulseWatcher {
                     .try_into()
                     .expect("4 bytes after length check"),
             );
-            // Defensive: NaN / negative → 0 (pulse counts are monotone u32).
             cur[i] = if pc.is_finite() && pc >= 0.0 {
                 pc as u32
+            } else {
+                0
+            };
+            let cb_off = r.consecutive_balanced_byte_offset();
+            let cb = f32::from_le_bytes(
+                bytes[cb_off..cb_off + 4]
+                    .try_into()
+                    .expect("4 bytes after length check"),
+            );
+            cur_cb[i] = if cb.is_finite() && cb >= 0.0 {
+                cb as u32
             } else {
                 0
             };
@@ -168,12 +207,17 @@ impl PulseWatcher {
         if self.seeded {
             for i in 0..6 {
                 edges[i] = cur[i] > self.prev_counts[i];
+                // Balanced edge: pulse fired this tick AND the clock was within
+                // balance (`consecutive_balanced ≥ 1` at pulse moment per
+                // `sphere_clock.py` — `is_balanced` increments cb BEFORE the
+                // pulse fires, so a balanced pulse sees cb ≥ 1).
+                balanced_edges[i] = edges[i] && cur_cb[i] >= 1;
             }
         } else {
             self.seeded = true;
         }
         self.prev_counts = cur;
-        edges
+        (edges, balanced_edges)
     }
 
     /// Test-only helper: inject a synthetic previous-count baseline so
@@ -191,10 +235,19 @@ mod tests {
     use tempfile::tempdir;
 
     fn encode_clocks(counts: [u32; 6]) -> Vec<u8> {
+        encode_clocks_with_balanced(counts, [0; 6])
+    }
+
+    fn encode_clocks_with_balanced(counts: [u32; 6], consecutive_balanced: [u32; 6]) -> Vec<u8> {
         let mut out = vec![0u8; PULSE_WATCH_PAYLOAD_BYTES];
         for (i, c) in counts.iter().enumerate() {
             let off = i * PULSE_WATCH_CLOCK_STRIDE + PULSE_WATCH_COUNT_OFFSET;
             let f = *c as f32;
+            out[off..off + 4].copy_from_slice(&f.to_le_bytes());
+        }
+        for (i, cb) in consecutive_balanced.iter().enumerate() {
+            let off = i * PULSE_WATCH_CLOCK_STRIDE + PULSE_WATCH_CONSEC_BALANCED_OFFSET;
+            let f = *cb as f32;
             out[off..off + 4].copy_from_slice(&f.to_le_bytes());
         }
         out
@@ -251,5 +304,54 @@ mod tests {
             assert!(!e);
         }
         assert!(!w.is_open());
+    }
+
+    #[test]
+    fn balanced_edge_requires_pulse_and_consecutive_balanced_ge_1() {
+        // SPEC §G5.1 D-SPEC-121: a small filter_down emits only when the spirit
+        // clock pulses AND was balanced at pulse moment (consecutive_balanced ≥ 1).
+        // tick_with_balanced returns (edges, balanced_edges) where balanced_edges[i]
+        // ⇔ edges[i] AND cb[i] ≥ 1.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sphere_clocks.bin");
+        let mut slot = Slot::create(&path, 1, PULSE_WATCH_PAYLOAD_BYTES as u32).unwrap();
+        slot.write(&encode_clocks_with_balanced([0; 6], [0; 6]))
+            .unwrap();
+        let mut w = PulseWatcher::open(dir.path());
+        let _seed = w.tick_with_balanced(); // seed
+
+        // Inner-spirit pulses but is NOT balanced (cb=0) → edge fires, balanced_edge does not.
+        slot.write(&encode_clocks_with_balanced([0, 0, 1, 0, 0, 0], [0; 6]))
+            .unwrap();
+        let (edges, balanced_edges) = w.tick_with_balanced();
+        assert!(edges[PulseClockRole::InnerSpirit.index()]);
+        assert!(
+            !balanced_edges[PulseClockRole::InnerSpirit.index()],
+            "unbalanced pulse must NOT emit a balanced edge"
+        );
+
+        // Inner-spirit pulses AND is balanced (cb=5) → both edges fire.
+        slot.write(&encode_clocks_with_balanced(
+            [0, 0, 2, 0, 0, 0],
+            [0, 0, 5, 0, 0, 0],
+        ))
+        .unwrap();
+        let (edges2, balanced_edges2) = w.tick_with_balanced();
+        assert!(edges2[PulseClockRole::InnerSpirit.index()]);
+        assert!(
+            balanced_edges2[PulseClockRole::InnerSpirit.index()],
+            "balanced pulse must emit a balanced edge — the D-SPEC-121 small filter_down gate"
+        );
+
+        // No pulse, but cb ≥ 1 (clock has been balanced sustainedly without a
+        // new pulse this tick) → no edge, no balanced edge.
+        slot.write(&encode_clocks_with_balanced(
+            [0, 0, 2, 0, 0, 0],
+            [0, 0, 10, 0, 0, 0],
+        ))
+        .unwrap();
+        let (edges3, balanced_edges3) = w.tick_with_balanced();
+        assert!(!edges3[PulseClockRole::InnerSpirit.index()]);
+        assert!(!balanced_edges3[PulseClockRole::InnerSpirit.index()]);
     }
 }

@@ -139,7 +139,7 @@ pub use crate::observer_mask::{
     CONTENT_DIM_COUNT, OBSERVER_BYTE_END, OBSERVER_BYTE_START, OBSERVER_DIM_COUNT,
 };
 pub use crate::publish_throttle::PublishThrottle;
-pub use crate::pulse_watch::{PulseClockRole, PulseEdges, PulseWatcher};
+pub use crate::pulse_watch::{BalancedPulseEdges, PulseClockRole, PulseEdges, PulseWatcher};
 pub use crate::sensor_cache_read::{
     age_seconds, current_wall_ns, read_sensor_cache, SensorCacheRead,
 };

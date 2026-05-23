@@ -366,7 +366,10 @@ async fn run_tick_loop(
                         cfg = load_restoring_cfg(&shm_dir, Layer::Spirit);
                     }
                     // Per-tick SHM-direct pulse-edge read (PLAN §4 / G5.1).
-                    let pulse_edges = pulse_watcher.tick();
+                    // D-SPEC-121: also read balanced-edges for the small
+                    // filter_down DOWN-leg gate.
+                    let (pulse_edges, balanced_pulse_edges) =
+                        pulse_watcher.tick_with_balanced();
                     let drift_pct = tick_event.jitter_ns() as f64 / tick_event.period_ns as f64;
                     drift_agg.observe(drift_pct, tick_event.jitter_ns(), tick_event.epoch);
                     if let Err(e) = run_one_tick(
@@ -375,7 +378,7 @@ async fn run_tick_loop(
                         &mut inner_spirit_slot, &body_slot, &mind_slot, &sensor_cache,
                         &mut firing_writer, &mut prev, &mut prev2,
                         &mut cfg, neuromod_slot.as_ref(), focus_input_slot.as_ref(),
-                        &pulse_edges, &mut last_obs_restored,
+                        &pulse_edges, &balanced_pulse_edges, &mut last_obs_restored,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
@@ -435,7 +438,10 @@ async fn run_one_tick(
     cfg: &mut RestoringCfg,
     neuromod_slot: Option<&Slot>,
     focus_input_slot: Option<&Slot>,
-    pulse_edges: &[bool; 6],
+    // pulse_edges kept in signature for symmetry + future diagnostics; the
+    // §G5.1 D-SPEC-121 small filter_down gate uses balanced_pulse_edges only.
+    _pulse_edges: &[bool; 6],
+    balanced_pulse_edges: &[bool; 6],
     last_obs_restored: &mut Option<titan_trinity_daemon::LayerObs>,
 ) -> Result<()> {
     // 1. Observer Principle G8: read sibling body + mind slots.
@@ -521,16 +527,16 @@ async fn run_one_tick(
     // §G12 FOCUS cascade: amplified nudge composes into enrichment_force.
     let focus = read_focus_nudge::<SPIRIT_DIMS>(focus_input_slot, FocusPart::InnerSpirit);
     compose_focus_into_enrichment(&mut enrichment, &focus);
-    // §G5.1 P0-0a UP-leg (PLAN §4): when the inner-body or inner-mind sphere
-    // clock pulses, layer an additive snapshot bonus onto spirit's enrichment
-    // — on top of the continuous structural body+mind read (§G8). Bonus lands
-    // ONLY on content dims [5:45]; observer dims [0:5] never receive enrichment
-    // (G8 / observer principle). Bonus is signed by the post-tick body+mind
-    // mean's polarity around centre, so excited body/mind raise spirit and
-    // suppressed body/mind lower it — i.e. spirit reads body+mind's energy
-    // direction at the pulse moment.
-    if pulse_edges[PulseClockRole::InnerBody.index()]
-        || pulse_edges[PulseClockRole::InnerMind.index()]
+    // §G5.1 P0-0a UP-leg (D-SPEC-121 v1.54.0): when the inner-body or
+    // inner-mind sphere clock pulses BALANCED, layer an additive snapshot
+    // bonus onto spirit's enrichment — on top of the continuous structural
+    // body+mind read (§G8). Balanced-pulse gating (not any pulse) per
+    // D-SPEC-121: an unbalanced body/mind pulse does NOT emit the UP-leg
+    // bonus. Bonus lands ONLY on content dims [5:45]; observer dims [0:5]
+    // never receive enrichment (§G8 / observer principle). Bonus is signed
+    // by the post-tick body+mind mean's polarity around centre.
+    if balanced_pulse_edges[PulseClockRole::InnerBody.index()]
+        || balanced_pulse_edges[PulseClockRole::InnerMind.index()]
     {
         let body_polarity = (body.iter().copied().sum::<f32>() / 5.0) - 0.5;
         let mind_polarity = (mind.iter().copied().sum::<f32>() / 15.0) - 0.5;
@@ -568,16 +574,20 @@ async fn run_one_tick(
         .await
         .map_err(|e| anyhow!("publish SPIRIT_STATE: {e}"))?;
 
-    // 7. Small filter_down DOWN-leg — PULSE-gated on the inner-spirit sphere
-    //    clock rising edge (SPEC §G5.1 amended by D-SPEC-112 / PLAN §4).
-    //    Replaces the prior KERNEL_EPOCH_TICK arm (no shim — deleted). Once
-    //    per spirit pulse: assemble the 65D half-state (body[5] + mind[15] +
-    //    spirit[45]), feed the TD(0) transition s→s', train, compute the
-    //    learned gradient-attention multipliers, publish INNER_SPIRIT_FILTER_DOWN.
-    //    The learned engine (SmallFilterDownEngine) shapes + smoothens body/mind
-    //    toward the 0.5 Divine Center so per-layer coherence can cross the §G11
-    //    balance threshold.
-    if pulse_edges[PulseClockRole::InnerSpirit.index()] {
+    // 7. Small filter_down DOWN-leg — BALANCED-PULSE-gated on the inner-spirit
+    //    sphere clock rising edge (SPEC §G5.1 D-SPEC-121, v1.54.0; narrows
+    //    D-SPEC-112's "any spirit pulse"). Fires only when the spirit clock's
+    //    pulse_count advances AND it was balanced at pulse time
+    //    (consecutive_balanced ≥ 1) — what "spirit reaches the Middle Path"
+    //    means at the SPEC level. An unbalanced spirit pulse does NOT fire the
+    //    small filter_down. Targets inner_body + inner_mind ONLY (sovereign
+    //    half — D-SPEC-121 lock; outer-spirit owns the outer half).
+    //    Once per balanced spirit pulse: assemble the 65D half-state +
+    //    record_transition + maybe_train + compute learned multipliers +
+    //    publish INNER_SPIRIT_FILTER_DOWN. Receiving body+mind daemons apply
+    //    the multipliers ONCE on the next tick (consume-and-clear; D-SPEC-121
+    //    one-shot application replacing v1.36.2's held + per-tick).
+    if balanced_pulse_edges[PulseClockRole::InnerSpirit.index()] {
         let mut half = [0.0_f64; HALF_DIM];
         for (i, &v) in body.iter().enumerate() {
             half[i] = v as f64;

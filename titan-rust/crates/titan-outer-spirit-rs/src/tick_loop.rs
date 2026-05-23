@@ -391,14 +391,17 @@ async fn run_tick_loop(
                         cfg = load_restoring_cfg(&shm_dir, Layer::Spirit);
                     }
                     tick_count = tick_count.wrapping_add(1);
-                    let pulse_edges = pulse_watcher.tick();
+                    // D-SPEC-121: also read balanced-edges for the small
+                    // filter_down DOWN-leg gate.
+                    let (pulse_edges, balanced_pulse_edges) =
+                        pulse_watcher.tick_with_balanced();
                     if let Err(e) = run_one_tick(
                         &bus, &state, &mut content_gate, &mut publish_throttle,
                         &mut engine, &mut prev_half,
                         &mut outer_spirit_slot, &outer_body_slot, &outer_mind_slot,
                         &sensor_cache_path, &mut firing_writer, &mut prev, &mut prev2,
                         &mut cfg, neuromod_slot.as_ref(), focus_input_slot.as_ref(),
-                        &pulse_edges, &mut last_obs_restored,
+                        &pulse_edges, &balanced_pulse_edges, &mut last_obs_restored,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
@@ -461,7 +464,10 @@ async fn run_one_tick(
     cfg: &mut RestoringCfg,
     neuromod_slot: Option<&Slot>,
     focus_input_slot: Option<&Slot>,
-    pulse_edges: &[bool; 6],
+    // pulse_edges kept in signature for symmetry + future diagnostics; the
+    // §G5.1 D-SPEC-121 small filter_down gate uses balanced_pulse_edges only.
+    _pulse_edges: &[bool; 6],
+    balanced_pulse_edges: &[bool; 6],
     last_obs_restored: &mut Option<titan_trinity_daemon::LayerObs>,
 ) -> Result<()> {
     // 1+2. Observer Principle reads (G8) — sibling outer_body +
@@ -585,8 +591,9 @@ async fn run_one_tick(
     // §G5.1 P0-0a UP-leg (PLAN §4): outer_body / outer_mind pulse → additive
     // snapshot bonus on spirit content dims (observer [0:5] never enriched
     // per §G8). Polarity is signed by the post-tick body+mind mean direction.
-    if pulse_edges[PulseClockRole::OuterBody.index()]
-        || pulse_edges[PulseClockRole::OuterMind.index()]
+    // §G5.1 UP-leg balanced-pulse gate (D-SPEC-121).
+    if balanced_pulse_edges[PulseClockRole::OuterBody.index()]
+        || balanced_pulse_edges[PulseClockRole::OuterMind.index()]
     {
         let body_polarity = (outer_body.iter().copied().sum::<f32>() / 5.0) - 0.5;
         let mind_polarity = (outer_mind.iter().copied().sum::<f32>() / 15.0) - 0.5;
@@ -629,14 +636,16 @@ async fn run_one_tick(
             .map_err(|e| anyhow!("publish SPIRIT_STATE: {e}"))?;
     }
 
-    // 10+11. Small filter_down DOWN-leg — PULSE-gated on the outer-spirit
-    //   sphere-clock rising-edge (SPEC §G5.1 amended by D-SPEC-112 / PLAN §4),
-    //   NOT KERNEL_EPOCH_TICK (no shim — old arm path deleted), NOT per
-    //   Schumann tick + NOT throttle-bound. On a spirit pulse: assemble the
-    //   65D half-state (outer_body[5] + outer_mind[15] + spirit[45]), feed the
-    //   TD(0) transition s→s', train, compute the learned gradient-attention
-    //   multipliers, publish OUTER_SPIRIT_FILTER_DOWN.
-    if pulse_edges[PulseClockRole::OuterSpirit.index()] {
+    // 10+11. Small filter_down DOWN-leg — BALANCED-PULSE-gated on the
+    //   outer-spirit sphere-clock rising-edge (SPEC §G5.1 D-SPEC-121, v1.54.0;
+    //   narrows D-SPEC-112's "any spirit pulse"). Fires only when the spirit
+    //   clock pulses AND was balanced at pulse time (consecutive_balanced ≥ 1).
+    //   Targets outer_body + outer_mind ONLY (sovereign half — D-SPEC-121
+    //   lock; inner-spirit owns the inner half). On a balanced spirit pulse:
+    //   assemble 65D half-state + record_transition + maybe_train + compute
+    //   learned multipliers + publish OUTER_SPIRIT_FILTER_DOWN. Receiving
+    //   outer_body+mind daemons apply ONCE on the next tick (consume-and-clear).
+    if balanced_pulse_edges[PulseClockRole::OuterSpirit.index()] {
         let mut half = [0.0_f64; HALF_DIM];
         for (i, &v) in outer_body.iter().enumerate() {
             half[i] = v as f64;
