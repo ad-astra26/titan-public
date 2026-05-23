@@ -508,38 +508,10 @@ def _handle_query(msg: dict, social_graph, send_queue, name: str) -> None:
             social_graph.mark_inspiration_processed(tx_signature, outcome)
             _send_response(send_queue, name, src, {"ok": True}, rid)
 
-        elif action == "set_titan_preference":
-            titan_id = str(payload.get("titan_id", ""))
-            user_name = str(payload.get("user_name", ""))
-            affinity_delta = float(payload.get("affinity_delta", 0.1))
-            tags = str(payload.get("tags", ""))
-            discovered_via = str(payload.get("discovered_via", ""))
-            social_graph.set_titan_preference(
-                titan_id, user_name,
-                affinity_delta=affinity_delta, tags=tags,
-                discovered_via=discovered_via)
-            _send_response(send_queue, name, src, {"ok": True}, rid)
-
-        elif action == "sync_community":
-            users = payload.get("users", []) or []
-            relationship = str(payload.get("relationship", "follower"))
-            if not isinstance(users, list):
-                users = []
-            social_graph.sync_community(users, relationship=relationship)
-            _send_response(send_queue, name, src,
-                           {"ok": True, "count": len(users)}, rid)
-
-        elif action == "mark_checked":
-            titan_id = str(payload.get("titan_id", ""))
-            user_name = str(payload.get("user_name", ""))
-            social_graph.mark_checked(titan_id, user_name)
-            _send_response(send_queue, name, src, {"ok": True}, rid)
-
-        elif action == "update_last_tweet":
-            user_name = str(payload.get("user_name", ""))
-            tweet_text = str(payload.get("tweet_text", ""))
-            social_graph.update_last_tweet(user_name, tweet_text)
-            _send_response(send_queue, name, src, {"ok": True}, rid)
+        # set_titan_preference / sync_community / mark_checked /
+        # update_last_tweet — cross-process kin-protocol write handlers
+        # RETIRED 2026-05-23 (D-SPEC-120, BUG-SOCIAL-GRAPH-WIRING re-triage).
+        # Zero external callers; in-process `SocialGraph` API remains.
 
         elif action == "ledger_record":
             tweet_id = str(payload.get("tweet_id", ""))
@@ -569,25 +541,10 @@ def _handle_query(msg: dict, social_graph, send_queue, name: str) -> None:
             _send_response(send_queue, name, src,
                            {"connections": list(conns or [])}, rid)
 
-        elif action == "get_community":
-            relationship = payload.get("relationship")
-            community = social_graph.get_community(relationship=relationship)
-            _send_response(send_queue, name, src,
-                           {"community": list(community or [])}, rid)
-
-        elif action == "get_titan_favorites":
-            titan_id = str(payload.get("titan_id", ""))
-            limit = int(payload.get("limit", 10))
-            favs = social_graph.get_titan_favorites(titan_id, limit=limit)
-            _send_response(send_queue, name, src,
-                           {"favorites": list(favs or [])}, rid)
-
-        elif action == "get_accounts_to_check":
-            titan_id = str(payload.get("titan_id", ""))
-            limit = int(payload.get("limit", 3))
-            accts = social_graph.get_accounts_to_check(titan_id, limit=limit)
-            _send_response(send_queue, name, src,
-                           {"accounts": list(accts or [])}, rid)
+        # get_community / get_titan_favorites / get_accounts_to_check —
+        # cross-process kin-protocol read handlers RETIRED 2026-05-23
+        # (D-SPEC-120). Zero external callers; in-process `SocialGraph`
+        # read API remains.
 
         elif action == "get_pending_inspirations":
             limit = int(payload.get("limit", 10))

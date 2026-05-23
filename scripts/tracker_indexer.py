@@ -192,6 +192,12 @@ def parse_tracker(cfg: TrackerConfig) -> list[Entry]:
             cells = [c.strip() for c in ln.split("|")[1:-1]]
             if len(cells) < 3:
                 continue
+            # Skip markdown table separator rows ("|---|---|...|") — they
+            # match the cell-count check but every cell is just dashes and
+            # otherwise get parsed as a phantom entry with slug "---"
+            # (the long-standing benign "(untagged: 1)" in the index).
+            if all(c and set(c) <= set("-") for c in cells):
+                continue
             id_cell, sev_cell, status_cell = cells[0], cells[1], cells[2]
             title_cell = cells[3] if len(cells) >= 4 else ""
 
