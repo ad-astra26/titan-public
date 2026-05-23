@@ -76,6 +76,16 @@ RECOMPUTE_INTERVAL_S = 60.0          # arch §5.2 60s recompute cadence
 SYNTH_STATUS_SLOT_NAME = "synth_status"     # /dev/shm/titan_<id>/synth_status.bin
 SYNTH_STATUS_PAYLOAD_BYTES = 24             # struct '<ddII'
 
+# Cross-process activation snapshot. DuckDB 1.5+ enforces an exclusive
+# file lock even for read_only opens, so the writer process (this worker)
+# cannot share data/synthesis.duckdb with reader processes (memory_worker
+# in particular). Workaround: export a small JSON snapshot of the
+# activation_state {item_id -> base_level} mapping after each recompute
+# pass. Readers consume the snapshot file (no DB lock), gated by the
+# same synth_status.bin watermark for freshness. Snapshot atomic via
+# write-tmp + os.replace.
+ACTIVATION_SNAPSHOT_NAME = "activation_snapshot.json"
+
 # Phase 1 plug-registry container — instantiated empty; concrete plugs land
 # per phase per arch §3.3.
 _PLUG_KINDS = ("substrate", "truth_oracle", "meaning_oracle", "proof", "tool")
@@ -291,6 +301,27 @@ class ActivationStore:
                 n_touched += 1
         return n_touched
 
+    def export_snapshot(self, snapshot_path: str) -> int:
+        """Atomic JSON export of {item_id -> base_level} for cross-process
+        readers (DuckDB 1.5+ exclusive-lock workaround). Cold-start sentinels
+        (-inf, NaN) are filtered out — readers treat absent items as
+        cold-start by default. Returns the count of items written.
+        """
+        import json
+        import math
+        payload: dict[str, float] = {}
+        for state in self._cache.values():
+            bl = state.base_level
+            if bl is None or not math.isfinite(bl):
+                continue
+            payload[state.item_id] = bl
+        os.makedirs(os.path.dirname(snapshot_path) or ".", exist_ok=True)
+        tmp_path = snapshot_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(payload, f, separators=(",", ":"))
+        os.replace(tmp_path, snapshot_path)
+        return len(payload)
+
     def _persist(self, state: ActivationState) -> None:
         log_blob = msgpack.packb(state.access_log, use_bin_type=True)
         # base_level may be -inf for cold-start states; DuckDB DOUBLE
@@ -335,6 +366,7 @@ def _heartbeat_loop(send_queue, name: str,
 
 def _recompute_loop(store: "ActivationStore",
                     status_writer: "SynthStatusWriter",
+                    snapshot_path: str,
                     send_queue, name: str,
                     interval_s: float,
                     stop_event: threading.Event,
@@ -358,6 +390,9 @@ def _recompute_loop(store: "ActivationStore",
             with cache_lock:
                 n_touched = store.recompute_and_persist(now)
                 items = store.items_tracked()
+                # Export atomic snapshot for cross-process readers
+                # (DuckDB 1.5+ lock workaround — see ACTIVATION_SNAPSHOT_NAME).
+                snapshot_size = store.export_snapshot(snapshot_path)
             status_writer.publish(
                 last_consistent_event_ts=now,
                 last_recompute_ts=now,
@@ -427,6 +462,11 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     status_writer = SynthStatusWriter(titan_id)
     registry = PlugRegistry()
 
+    # Cross-process activation snapshot file — sits next to synthesis.duckdb
+    # in the same data_dir. Readers consume via plain JSON read.
+    snapshot_path = os.path.join(
+        os.path.dirname(db_path) or ".", ACTIVATION_SNAPSHOT_NAME)
+
     # Lock around the in-mem cache for the recv-loop ↔ recompute-loop
     # interleave. record_access is cheap; the lock holds only for the
     # mutation itself, never around bus I/O.
@@ -440,8 +480,8 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
 
     rc_thread = threading.Thread(
         target=_recompute_loop,
-        args=(store, status_writer, send_queue, name, interval_s,
-              stop_event, cache_lock),
+        args=(store, status_writer, snapshot_path, send_queue, name,
+              interval_s, stop_event, cache_lock),
         daemon=True, name=f"synthesis-recompute-{name}")
     rc_thread.start()
 

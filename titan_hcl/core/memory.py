@@ -631,57 +631,54 @@ class TieredMemoryGraph:
     def _in_process_activation_lookup(
         self, item_ids: list, bridge_recall,
     ) -> dict:
-        """Watermark-gated activation_state SELECT via a lazy R/O DuckDB
-        connection to data/synthesis.duckdb (synthesis_worker's R/W
-        territory per G21 / INV-Syn-3). Memory_worker process can hold
-        a R/O connection on synthesis.duckdb at the same time
-        synthesis_worker holds R/W — different processes, R/O coexists
-        with R/W in DuckDB.
+        """Watermark-gated activation lookup via the cross-process JSON
+        snapshot synthesis_worker exports each recompute pass (every 60s).
 
-        Soft-fail: returns {} on stale watermark, DB-missing, or any
-        DuckDB error. composite_score then substitutes cold-start for
-        every item, gracefully degrading to cosine-only ordering.
+        DuckDB 1.5+ enforces an exclusive file lock even for read_only
+        opens, so we CAN'T share synthesis.duckdb across worker processes.
+        Workaround: synthesis_worker exports activation_state to
+        data/activation_snapshot.json after each recompute; readers
+        consume the JSON snapshot (no DB lock). Snapshot freshness gated
+        on the same synth_status.bin watermark (INV-Syn-4).
+
+        Soft-fail: returns {} on stale watermark, snapshot-missing, or
+        JSON parse error. composite_score then substitutes cold-start
+        for every item, degrading to cosine-only.
         """
         if not item_ids:
             return {}
         if not bridge_recall.is_fresh(time.time()):
             return {}
-        # Resolve synthesis.duckdb path the same way the worker does.
+        # Resolve snapshot path — same data_dir as synthesis_worker uses.
         data_dir = os.environ.get(
             "TITAN_DATA_DIR", self._config.get("data_dir", "./data"))
-        synth_db_path = os.path.join(data_dir, "synthesis.duckdb")
-        if not os.path.exists(synth_db_path):
+        snapshot_path = os.path.join(data_dir, "activation_snapshot.json")
+        if not os.path.exists(snapshot_path):
             return {}
-        # Lazy-cache the R/O connection on the instance.
-        if not hasattr(self, "_synth_ro_conn") or self._synth_ro_conn is None:
-            try:
-                import duckdb
-                self._synth_ro_conn = duckdb.connect(
-                    synth_db_path, read_only=True)
-            except Exception as exc:
-                logger.debug(
-                    "[Memory] open synthesis.duckdb R/O failed "
-                    "(degrading): %s", exc)
-                self._synth_ro_conn = None
-                return {}
+        # Lazy-cache the snapshot dict with mtime gating — re-read only
+        # when the file changes. Avoids re-parsing the JSON on every
+        # _cognee_search call (chat hot path).
         try:
-            placeholders = ", ".join(["?"] * len(item_ids))
-            rows = self._synth_ro_conn.execute(
-                f"SELECT item_id, base_level FROM activation_state "
-                f"WHERE item_id IN ({placeholders})",
-                list(item_ids),
-            ).fetchall()
+            mtime = os.path.getmtime(snapshot_path)
+            if (not hasattr(self, "_synth_snapshot_mtime")
+                    or self._synth_snapshot_mtime != mtime):
+                import json
+                with open(snapshot_path) as f:
+                    self._synth_snapshot = json.load(f)
+                self._synth_snapshot_mtime = mtime
         except Exception as exc:
             logger.debug(
-                "[Memory] activation_state SELECT failed (degrading): %s",
-                exc)
+                "[Memory] read activation_snapshot.json failed "
+                "(degrading): %s", exc)
             return {}
+        snapshot = self._synth_snapshot or {}
         out = {}
-        for item_id, base_level in rows:
-            if base_level is None:
+        for item_id in item_ids:
+            v = snapshot.get(item_id)
+            if v is None:
                 continue
             try:
-                out[item_id] = float(base_level)
+                out[item_id] = float(v)
             except (TypeError, ValueError):
                 continue
         return out

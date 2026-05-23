@@ -153,12 +153,20 @@ class BridgeRecall:
     # ── activation lookup ──────────────────────────────────────────────
 
     def activation_lookup(self, item_ids: list[str]) -> dict[str, float]:
-        """Read `base_level` for the requested item_ids. Returns a dict
-        ONLY for items present in activation_state — absent items are
-        omitted (composite_score substitutes the cold-start default).
+        """Read `base_level` for the requested item_ids via the JSON
+        activation snapshot synthesis_worker exports each recompute pass.
 
-        Soft-fail: returns `{}` on stale watermark, missing SHM slot,
-        DuckDB error, or any other failure. Never raises to the caller.
+        Returns a dict ONLY for items present in the snapshot — absent
+        items are omitted (composite_score substitutes cold-start).
+
+        DuckDB 1.5+ enforces an exclusive file lock even for read_only
+        opens, so reading synthesis.duckdb directly from a cross-process
+        consumer would conflict with synthesis_worker's R/W connection.
+        Snapshot file (sibling of synthesis.duckdb, named
+        `activation_snapshot.json`) sidesteps this entirely.
+
+        Soft-fail: returns `{}` on stale watermark, missing snapshot, or
+        any JSON parse error. Never raises to the caller.
         """
         if not item_ids:
             return {}
@@ -167,52 +175,42 @@ class BridgeRecall:
         if not self.is_fresh(_time.time()):
             return {}
 
-        # Open DuckDB lazily (read-only) — guards against the writer
-        # creating the file later in the same process lifetime.
-        with self._duck_lock:
-            if self._duck_conn is None:
-                if not os.path.exists(self._db_path):
-                    return {}
-                try:
-                    import duckdb
-                    self._duck_conn = duckdb.connect(
-                        self._db_path, read_only=True)
-                except Exception as exc:
-                    if not self._duck_error_logged:
-                        logger.warning(
-                            "[BridgeRecall] DuckDB open failed (%s): %s "
-                            "— degrading to cosine-only",
-                            self._db_path, exc)
-                        self._duck_error_logged = True
-                    return {}
+        # Snapshot path = sibling of self._db_path
+        snapshot_path = os.path.join(
+            os.path.dirname(self._db_path) or ".",
+            "activation_snapshot.json")
+        if not os.path.exists(snapshot_path):
+            return {}
 
+        with self._duck_lock:
+            # Lazy-cache the snapshot — re-read only on mtime change.
             try:
-                placeholders = ", ".join(["?"] * len(item_ids))
-                rows = self._duck_conn.execute(
-                    f"SELECT item_id, base_level FROM activation_state "
-                    f"WHERE item_id IN ({placeholders})",
-                    list(item_ids),
-                ).fetchall()
+                mtime = os.path.getmtime(snapshot_path)
+                if not hasattr(self, "_snapshot_cache") \
+                        or self._snapshot_mtime != mtime:
+                    import json
+                    with open(snapshot_path) as f:
+                        self._snapshot_cache = json.load(f)
+                    self._snapshot_mtime = mtime
             except Exception as exc:
                 if not self._duck_error_logged:
                     logger.warning(
-                        "[BridgeRecall] activation_state query failed: %s "
-                        "— degrading to cosine-only", exc)
+                        "[BridgeRecall] snapshot read failed (%s): %s "
+                        "— degrading to cosine-only",
+                        snapshot_path, exc)
                     self._duck_error_logged = True
                 return {}
+            snapshot = self._snapshot_cache or {}
 
         out: dict[str, float] = {}
-        for item_id, base_level in rows:
-            if base_level is None:
+        for item_id in item_ids:
+            v = snapshot.get(item_id)
+            if v is None:
                 continue
             try:
-                bl = float(base_level)
+                out[item_id] = float(v)
             except (TypeError, ValueError):
                 continue
-            # Cold-start sentinel stored in DuckDB as -inf; pass through
-            # so composite_score's substitution logic gets the right
-            # signal.
-            out[item_id] = bl
         return out
 
     def close(self) -> None:

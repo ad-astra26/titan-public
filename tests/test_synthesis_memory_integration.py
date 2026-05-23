@@ -134,24 +134,13 @@ async def test_cognee_search_with_fresh_watermark_reranks(
         bus_emit=lambda msg_type, payload: emitted.append((msg_type, payload)),
     )
     # Inject very-high activation for node 2 so composite_score promotes
-    # it ahead of node 1. activation_state lives in synthesis.duckdb now
-    # (post-relocation 2026-05-23). Use ActivationStore as the writer to
-    # ensure the schema lands the way the worker would create it.
-    from titan_hcl.modules.synthesis_worker import ActivationStore
+    # it ahead of node 1. Memory_worker reads via activation_snapshot.json
+    # (DuckDB cross-process lock workaround) — write that file directly.
+    import json
     now = time.time()
-    synth_db_path = os.path.join(isolated_data_dir, "synthesis.duckdb")
-    store = ActivationStore(synth_db_path)
-    try:
-        store._conn.execute(
-            "INSERT OR REPLACE INTO activation_state "
-            "(item_id, base_level, last_access, access_count, "
-            " first_access, last_recompute) VALUES "
-            "(?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?)",
-            ("mem:1", -2.0, now, 1, now - 1000, now,
-             "mem:2", 10.0, now, 100, now - 1000, now),
-        )
-    finally:
-        store.close()
+    snapshot_path = os.path.join(isolated_data_dir, "activation_snapshot.json")
+    with open(snapshot_path, "w") as f:
+        json.dump({"mem:1": -2.0, "mem:2": 10.0}, f)
     # Publish a fresh watermark from a writer that points at the same
     # SHM root + uses the same titan_id default.
     from titan_hcl.modules.synthesis_worker import SynthStatusWriter

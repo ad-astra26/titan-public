@@ -175,20 +175,16 @@ def test_activation_lookup_empty_input_returns_empty(isolated_shm, fresh_db_path
 
 
 def test_activation_lookup_returns_rows_when_present(isolated_shm, fresh_db_path):
-    """Happy path: writer published, items in activation_state → reader
-    returns base_level for those items."""
-    # Pre-populate activation_state via a separate writer connection.
-    import duckdb
-    con = duckdb.connect(fresh_db_path)
+    """Happy path: writer published, items in snapshot → reader returns
+    base_level for those items via snapshot JSON (DuckDB lock workaround)."""
+    import json
+    import os
     now = time.time()
-    con.execute(
-        "INSERT INTO activation_state (item_id, base_level, last_access, "
-        "access_count, first_access, last_recompute) VALUES "
-        "(?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?)",
-        ("kuzu:1", 1.5, now, 3, now - 100, now,
-         "kuzu:2", -0.7, now, 1, now - 50, now),
-    )
-    con.close()
+    # Write the activation snapshot JSON (sibling of synthesis.duckdb).
+    snapshot_path = os.path.join(
+        os.path.dirname(fresh_db_path), "activation_snapshot.json")
+    with open(snapshot_path, "w") as f:
+        json.dump({"kuzu:1": 1.5, "kuzu:2": -0.7}, f)
 
     from titan_hcl.modules.synthesis_worker import SynthStatusWriter
     writer = SynthStatusWriter(titan_id="test")
@@ -211,15 +207,14 @@ def test_activation_lookup_returns_rows_when_present(isolated_shm, fresh_db_path
 def test_activation_lookup_returns_empty_when_watermark_stale(
     isolated_shm, fresh_db_path,
 ):
-    """Even if activation_state has rows, a stale watermark = no trust
-    → empty dict (caller degrades to cosine-only)."""
-    import duckdb
-    con = duckdb.connect(fresh_db_path)
-    con.execute(
-        "INSERT INTO activation_state (item_id, base_level) VALUES (?, ?)",
-        ("kuzu:1", 1.0),
-    )
-    con.close()
+    """Even if snapshot has rows, a stale watermark = no trust → empty
+    dict (caller degrades to cosine-only)."""
+    import json
+    import os
+    snapshot_path = os.path.join(
+        os.path.dirname(fresh_db_path), "activation_snapshot.json")
+    with open(snapshot_path, "w") as f:
+        json.dump({"kuzu:1": 1.0}, f)
 
     from titan_hcl.modules.synthesis_worker import SynthStatusWriter
     writer = SynthStatusWriter(titan_id="test")
