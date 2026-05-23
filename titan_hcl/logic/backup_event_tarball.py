@@ -206,11 +206,24 @@ def pack_event_tarball(
                 if patch_path is not None:
                     # STREAMING PATH (Phase 5 default): tar reads from fd in
                     # blocksize chunks; no bytes object holds the file content.
+                    # 2026-05-23 D-SPEC-123 follow-up: if the patch_path
+                    # disappeared between encode and pack (rolling-retention
+                    # source that the encoder did NOT snapshot — e.g. a
+                    # future encoder regression), SKIP the file with a clear
+                    # WARN rather than raising. Raising aborts the whole
+                    # unified_v2 event and falls back to the bug-laden legacy
+                    # cascade — strictly worse than missing one file from one
+                    # event (the next event picks up the new content; legacy
+                    # cascade costs money + has known bugs). The primary
+                    # mitigation is the encoder-side hardlink snapshot in
+                    # full_ship.encode_diff; this is defense-in-depth.
                     if not os.path.exists(patch_path):
-                        raise ValueError(
-                            f"diff_dict[{spec.arc_name!r}].patch_path does not "
-                            f"exist: {patch_path!r}"
-                        )
+                        logger.warning(
+                            "[pack_event_tarball] SKIP %s — patch_path "
+                            "vanished between encode and pack: %s (rolling-"
+                            "retention source not snapshotted by encoder?)",
+                            spec.arc_name, patch_path)
+                        continue
                     patch_size = spec.diff_dict.get(
                         "patch_size_bytes", os.path.getsize(patch_path)
                     )
@@ -311,7 +324,12 @@ def pack_event_tarball(
         "path": output_path,
         "size_bytes": size,
         "tarball_sha256": tarball_sha256,
-        "file_count": len(file_specs),
+        "file_count": len(files_meta),                # actually packed
+        "files_requested": len(file_specs),           # what caller asked for
+        "files_skipped_vanished": (
+            len(file_specs) - len(files_meta)
+        ),    # SKIP'd by the patch_path-vanished guard (D-SPEC-123 follow-up)
+        "packed_arc_names": [m["arc_name"] for m in files_meta],
     }
 
 

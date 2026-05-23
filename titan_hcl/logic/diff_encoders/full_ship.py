@@ -34,9 +34,77 @@ Restore: apply_diff writes patch_bytes (or streams from a fd) to output_path.
 
 from __future__ import annotations
 
+import errno
 import hashlib
+import logging
 import os
+import shutil
+import tempfile
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+def _race_safe_snapshot(current_path: str) -> tuple[str, bool]:
+    """Materialize a race-immune pointer to `current_path` bytes.
+
+    Returns (snapshot_path, owned). `owned=True` means caller must unlink
+    after pack. The snapshot's inode survives even if the source is
+    unlinked / rolled / pruned between encode and pack (TOCTOU race fix
+    for files like neuromodulator_snapshot_NNN.json that have rolling
+    retention — NeuromodulatorSystem._save_state prunes oldest snapshots
+    every 500 evals).
+
+    Mechanism:
+      1. os.link() — hardlink, atomic + zero-copy, same inode. Pack-time
+         reads still see the bytes even if the source path is unlinked.
+      2. On EXDEV (cross-device — temp dir on different filesystem from
+         source) or EOPNOTSUPP (filesystem doesn't support hardlinks),
+         fall back to a shutil.copy2 streaming copy.
+      3. On any other OSError, fall back to returning the source path
+         directly (preserving prior behavior — the race-window failure
+         was already rare; better to ship the file than degrade backup).
+    """
+    # Place the snapshot beside the source so we stay on the same
+    # filesystem (avoids EXDEV in practice). Suffix marks it as backup-
+    # owned so a sweeper would recognize the intent.
+    src_dir = os.path.dirname(current_path) or "."
+    src_base = os.path.basename(current_path)
+    fd, snap_path = tempfile.mkstemp(
+        prefix=f".{src_base}.bksnap.", dir=src_dir)
+    os.close(fd)
+    os.unlink(snap_path)   # mkstemp leaves an empty file; remove before link
+
+    try:
+        os.link(current_path, snap_path)
+        return snap_path, True
+    except OSError as e:
+        if e.errno in (errno.EXDEV, errno.EOPNOTSUPP, errno.EPERM):
+            # Hardlink unsupported on this fs / cross-device — fall back
+            # to a streaming copy. Slower but still race-immune.
+            try:
+                shutil.copy2(current_path, snap_path)
+                return snap_path, True
+            except OSError as e2:
+                logger.warning(
+                    "[full_ship] hardlink+copy snapshot failed for %s: %s; "
+                    "falling back to direct source path (race window open)",
+                    current_path, e2)
+                # best-effort cleanup of empty placeholder
+                try:
+                    os.unlink(snap_path)
+                except OSError:
+                    pass
+                return current_path, False
+        # Source disappeared between getsize/_sha256 and link — caller
+        # already validated existence, so this is the race window itself.
+        # Re-raise so the upper layer can skip this file (encode_diff
+        # caller treats None-return as skip; we want a clear signal).
+        try:
+            os.unlink(snap_path)
+        except OSError:
+            pass
+        raise
 
 
 def _sha256_file(path: str) -> str:
@@ -51,20 +119,32 @@ def encode_diff(current_path: str, baseline_path: Optional[str] = None,
                 **opts) -> dict:
     """Encode full content (baseline_path is ignored — full-ship is by design).
 
-    STREAMING (Phase 5, 2026-05-19): returns `patch_path` pointing at the
-    current file. No file content loaded into Python memory. The tarball
-    builder streams from this path via `tar.add()`.
+    STREAMING (Phase 5, 2026-05-19): returns `patch_path` pointing at a
+    race-immune snapshot of the current file. No file content loaded into
+    Python memory. The tarball builder streams from this path via
+    `tar.add()`.
 
-    `patch_owned=False` tells the caller NOT to unlink — patch_path IS
-    the source file. (xdelta3 + timechain_tail encoders that create temp
-    diff files return patch_owned=True.)
+    TOCTOU race fix (2026-05-23): rolling-retention sources (e.g.
+    neuromodulator_snapshot_NNN.json — pruned every 500 evals at
+    neuromodulator.py:552) could vanish between encode and pack, causing
+    pack_event_tarball:209 to raise ValueError and the entire unified_v2
+    pipeline to fall back to the bug-laden legacy cascade. We now hardlink
+    the source to a snapshot path at encode time — the inode survives even
+    if the source is unlinked, eliminating the race. `patch_owned=True`
+    tells pack_event_tarball to unlink the snapshot after packing.
+
+    Order matters: take the snapshot FIRST, then compute size + hash on
+    the snapshot (not the source). That way size/hash and the bytes packed
+    are guaranteed to be the same atomic snapshot — no race where size
+    reflects the source at T1 but bytes reflect a rotated source at T2.
     """
-    size = os.path.getsize(current_path)
-    root = _sha256_file(current_path)
+    snap_path, owned = _race_safe_snapshot(current_path)
+    size = os.path.getsize(snap_path)
+    root = _sha256_file(snap_path)
     return {
         "diff_mode": "full",
-        "patch_path": current_path,
-        "patch_owned": False,
+        "patch_path": snap_path,
+        "patch_owned": owned,
         "patch_size_bytes": size,
         "merkle_root": root,
         "size_bytes": size,

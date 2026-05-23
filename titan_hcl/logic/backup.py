@@ -221,35 +221,57 @@ class RebirthBackup:
             self._meditation_count, epoch, promoted, total_nodes, today, weekday,
         )
 
-        # SPEC §24 — Unified backup pipeline (Phase 5.5, 2026-05-16)
-        # When [backup].unified_v2_enabled = true (default false), route
-        # this meditation through the new diff/baseline/manifest/ZK pipeline
-        # (titan_hcl.logic.backup_upload_pipeline). Replaces the legacy
-        # full-tarball personality + soul + timechain cascade with ONE
-        # event-level ship that records to UnifiedManifest + commits to
-        # ZK Vault per event. Falls through to legacy upload if the
-        # pipeline raises (defense-in-depth). When flag is off, legacy
+        # SPEC §24 — Unified backup pipeline (Phase 5.5, 2026-05-16; D-SPEC-123
+        # follow-up 2026-05-23: legacy fallback DISABLED — Maker decision).
+        # When [backup].unified_v2_enabled = true (default false), route this
+        # meditation through the new diff/baseline/manifest/ZK pipeline
+        # (titan_hcl.logic.backup_upload_pipeline). When flag is off, legacy
         # cascade runs unchanged — that's the T2/T3 default + T1 rollback.
+        #
+        # NO LEGACY FALLBACK on unified_v2 failure. Legacy cascade is bug-laden
+        # + costs money per AUDIT_irys_arweave_costs_20260514; silently falling
+        # back to it on every unified_v2 hiccup is strictly worse than failing
+        # the event loudly and letting the next meditation retry. The root-
+        # cause fix for the TOCTOU race that originally triggered this
+        # fallback ships in the same commit (full_ship.encode_diff now
+        # hardlinks rolling-retention sources at encode time — see
+        # titan_hcl/logic/diff_encoders/full_ship.py + the defense-in-depth
+        # skip-with-WARN in pack_event_tarball:209). If unified_v2 still
+        # raises after those fixes, that's a real bug to investigate, not a
+        # signal to ship the legacy path.
         if self._unified_v2_enabled():
             try:
                 shipped = await self._run_unified_event_v2(weekday=weekday)
             except Exception as e:
                 logger.exception(
-                    "[Backup] §24 unified_v2 pipeline raised — falling back "
-                    "to legacy path: %s", e,
+                    "[Backup] §24 unified_v2 pipeline raised — NO legacy "
+                    "fallback (Maker policy 2026-05-23 D-SPEC-123 follow-up); "
+                    "this meditation produces no backup; next meditation will "
+                    "retry: %s", e,
                 )
-                shipped = False
+                self._alert_backup_failure(
+                    "unified_v2", f"pipeline raised: {e}")
+                return
             if shipped:
-                # Pipeline handled this meditation; skip the legacy upload
-                # paths below. ZK epoch snapshot + MyDay NFT still run via
-                # the legacy flow because they are orthogonal to §24.
-                # For unified_v2 v1, we treat shipped==True as terminal
-                # for the backup-event-level work and exit early.
+                # Pipeline handled this meditation; we're done. ZK epoch
+                # snapshot + MyDay NFT are orthogonal to §24 but per the
+                # 2026-05-23 policy ANY legacy upload path is OFF when
+                # unified_v2 is enabled — those orthogonal pieces are
+                # separately gated by their own flags
+                # ([mainnet_budget].zk_compression_enabled, etc.) and
+                # already early-return when disabled.
                 logger.info(
-                    "[Backup] §24 unified_v2 event shipped — skipping "
-                    "legacy upload cascade for this meditation",
+                    "[Backup] §24 unified_v2 event shipped — meditation "
+                    "backup complete; no legacy cascade runs",
                 )
                 return
+            # shipped == False and no exception raised: unified_v2 declined
+            # to ship (e.g. nothing changed since last event). That's a clean
+            # no-op — return without invoking legacy.
+            logger.info(
+                "[Backup] §24 unified_v2 returned shipped=False — clean "
+                "no-op; no legacy cascade")
+            return
 
         # 1. ZK Epoch Snapshot (every meditation) — DISABLED for mainnet MVM
         #    TimeChain merkle root is now committed via vault in meditation.py.
@@ -296,6 +318,12 @@ class RebirthBackup:
             _local_diff_enabled = bool(_backup_cfg.get("local_diff_enabled", False))
             _local_dir = _backup_cfg.get("local_dir", "data/backups")
             if _local_diff_enabled:
+                # 2026-05-23 D-SPEC-123 follow-up — Maker policy: NO legacy
+                # fallback on L5 failure either. Legacy cascade is bug-laden
+                # + costs money. When L5 is the chosen path, an L5 failure
+                # logs ERROR + Maker-notify; the next meditation retries.
+                # Silent fallback to the legacy upload pipeline was strictly
+                # worse than failing visibly.
                 try:
                     diff_result = await asyncio.to_thread(
                         self.create_local_diff_event, _local_dir)
@@ -305,17 +333,20 @@ class RebirthBackup:
                             diff_result["type"], diff_result["event_id"][:8],
                             diff_result["size_mb"])
                     else:
-                        # Local-diff path failed — fall through to legacy
-                        # cascade path below so we still get SOME backup.
-                        logger.warning(
-                            "[Backup] L5 personality returned None — "
-                            "falling back to legacy cascade path")
-                        _local_diff_enabled = False
+                        logger.error(
+                            "[Backup] L5 personality returned None — NO "
+                            "legacy fallback (Maker policy); next meditation "
+                            "will retry")
+                        self._alert_backup_failure(
+                            "L5_personality", "create_local_diff_event "
+                            "returned None")
                 except Exception as e:
-                    logger.error("[Backup] L5 personality crashed: %s — "
-                                 "falling back to legacy cascade path", e)
-                    _local_diff_enabled = False
-            if not _local_diff_enabled:
+                    logger.exception(
+                        "[Backup] L5 personality crashed — NO legacy "
+                        "fallback (Maker policy); next meditation will "
+                        "retry: %s", e)
+                    self._alert_backup_failure("L5_personality", str(e))
+            else:
                 try:
                     result = await self.upload_personality_to_arweave()
                     if result:

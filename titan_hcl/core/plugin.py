@@ -137,6 +137,23 @@ class TitanHCL:
         self._observatory_app = None
         self._agent = None
 
+        # ── Phase 2.5.E SocialXGateway reader exposure (2026-05-23 bug-fix) ──
+        # The `/v4/community-engagement-stats` endpoint + the kernel_rpc
+        # EXPOSED_METHODS allowlist both reference
+        # `plugin._social_x_gateway_reader.get_community_engagement_stats`,
+        # but this attribute was never bound in __init__. The Maker note in
+        # core/kernel.py:409-417 documented the EXPOSED_METHODS gap (added
+        # 2026-05-12) but missed that the underlying attribute itself was
+        # also never created. Without binding, _resolve_method returns None
+        # and kernel_rpc replies with AttributeError, surfacing as
+        # `[Dashboard] /v4/community-engagement-stats error: [AttributeError]
+        # '_social_x_gateway_reader.get_community_engagement_stats' not
+        # resolvable on plugin`. T1 owns the social_x.db locally; T2/T3
+        # consume via HTTP (see outer_source_assembly.py:295). Lazy-import
+        # to avoid pulling SocialXGateway at boot for Titans that never hit
+        # the endpoint.
+        self._social_x_gateway_reader = None
+
         # Phase C v1.8.2 (D-SPEC-56) per rFP_titan_hcl_l2_separation_strategy.md §4.I:
         # `_dream_inbox` deque + `_dream_state` dict DELETED — dream state
         # ownership moved to dream_state_worker (G21 single writer of
@@ -3464,6 +3481,26 @@ class TitanHCL:
 
         # ── Phase 4: Create proxies + wire L2/L3 subsystems ────────
         self._create_proxies()
+
+        # Phase 2.5.E SocialXGateway reader binding (2026-05-23 bug-fix).
+        # Construct the gateway READER for the /v4/community-engagement-stats
+        # endpoint exposed at dashboard.py:4835. T1 owns social_x.db locally;
+        # T2/T3 still construct the reader (same data dir layout) — the
+        # gateway tolerates missing tables and returns zero/empty stats, so
+        # the endpoint replies cleanly on every Titan. Construct here at boot
+        # so the dashboard never sees `_social_x_gateway_reader is None`
+        # under the kernel_rpc EXPOSED_METHODS allowlist (core/kernel.py:418).
+        try:
+            from titan_hcl.logic.social_x_gateway import SocialXGateway
+            self._social_x_gateway_reader = SocialXGateway()
+            logger.info("[TitanHCL] SocialXGateway reader bound — "
+                        "/v4/community-engagement-stats endpoint live")
+        except Exception as _sxg_err:
+            logger.warning(
+                "[TitanHCL] SocialXGateway reader init failed (endpoint "
+                "will 503): %s", _sxg_err)
+            # _social_x_gateway_reader stays None from __init__; endpoint
+            # returns clean 503 instead of AttributeError.
 
         # ── Phase 5: Observatory + Agency + plugin-owned loops ─────
         # EventBus + ObservatoryDB (must exist before observatory app).
