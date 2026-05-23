@@ -27,9 +27,8 @@ use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
     apply_multipliers, compose_multipliers_default, decode_filter_down_payload,
-    decode_local_filter_down_payload, encode_floats, observe, stateful_update, ContentGate,
-    DriftAggregator, FiringSlotWriter, GroundUpEnricher, Layer, RestoringCfg, Side,
-    INNER_BODY_TOPICS,
+    decode_local_filter_down_payload, encode_floats, stateful_update, ContentGate, DriftAggregator,
+    FiringSlotWriter, GroundUpEnricher, Layer, RestoringCfg, Side, INNER_BODY_TOPICS,
 };
 
 /// Drift threshold as fraction of period — 0.5% per master plan §16 OBS gate.
@@ -367,21 +366,7 @@ async fn run_one_tick(
     //     persistent tensor under the restoring spring + observable-feedback so
     //     the tensor travels and the Middle Path is an attractor (D-SPEC-112).
     let cfg = RestoringCfg::for_layer(Layer::Body);
-    // P0-0b kernel signature (§G5.2 ratified): pass raw + enrichment_force +
-    // observables separately. Full daemon-side splitting of raw vs enrichment
-    // and live neuromod-gain read are the next slice (PENDING in the manifest);
-    // for this slice we pass enriched as raw + zero enrichment so the build
-    // holds with behavior unchanged at the daemon level.
-    let obs = observe(&prev[..], &prev2[..]);
-    let enrichment_zero = [0.0_f32; 5];
-    let x = stateful_update(
-        &prev[..],
-        &prev2[..],
-        &body[..],
-        &enrichment_zero[..],
-        &obs,
-        &cfg,
-    );
+    let x = stateful_update(&prev[..], &prev2[..], &body[..], &cfg);
     let mut body_state = [0.0_f32; 5];
     body_state.copy_from_slice(&x[..5]);
     *prev2 = *prev;

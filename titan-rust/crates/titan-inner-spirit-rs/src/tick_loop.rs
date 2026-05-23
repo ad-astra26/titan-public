@@ -67,9 +67,8 @@ use titan_core::small_filter_down::{SmallFilterDownEngine, HALF_DIM};
 use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
-    apply_multipliers, decode_filter_down_payload, encode_floats, observe, read_dim_slice,
-    stateful_update, ContentGate, DriftAggregator, FiringSlotWriter, Layer, RestoringCfg,
-    INNER_SPIRIT_TOPICS,
+    apply_multipliers, decode_filter_down_payload, encode_floats, read_dim_slice, stateful_update,
+    ContentGate, DriftAggregator, FiringSlotWriter, Layer, RestoringCfg, INNER_SPIRIT_TOPICS,
 };
 
 const SPIRIT_DIMS: usize = 45;
@@ -418,17 +417,7 @@ async fn run_one_tick(
     //     a tensor-state concern). The restoring spring covers spirit's 45D —
     //     the layer GROUND_UP (§G10) deliberately does not reach.
     let cfg = RestoringCfg::for_layer(Layer::Spirit);
-    // P0-0b kernel signature (§G5.2 ratified): see inner-body for design notes.
-    let obs = observe(&prev[..], &prev2[..]);
-    let enrichment_zero = [0.0_f32; 45];
-    let x = stateful_update(
-        &prev[..],
-        &prev2[..],
-        &spirit[..],
-        &enrichment_zero[..],
-        &obs,
-        &cfg,
-    );
+    let x = stateful_update(&prev[..], &prev2[..], &spirit[..], &cfg);
     let mut spirit_state = [0.0_f32; SPIRIT_DIMS];
     spirit_state.copy_from_slice(&x[..SPIRIT_DIMS]);
     *prev2 = *prev;

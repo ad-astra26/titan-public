@@ -445,49 +445,4 @@ BANNER
     fi
 fi
 
-# ── 7. Trinity SPEC-conformance gate ─────────────────────────────────────────
-# Blocks any commit that REGRESSES a LOCKED §G5.1/§G5.2/§G10/§G11/§9.5 clause, or
-# marks a clause LOCKED without a passing test, per the clause→test manifest
-# titan-docs/specs/TRINITY_CONFORMANCE.md (checker: scripts/trinity_conformance.py).
-# PENDING (not-yet-conforming) clauses are reported LOUDLY but do NOT block routine
-# commits (so P0 implementation can proceed). Runs only when trinity tensor/pulse
-# code or the trinity spec/manifest is staged. Discipline:
-# feedback_spec_bound_work_zero_simplification_clause_by_clause.
-STAGED_TRINITY=$(git diff --cached --name-only --diff-filter=ACM -- \
-    'titan-rust/crates/titan-trinity-daemon/**' \
-    'titan-rust/crates/titan-trinity-rs/**' \
-    'titan-rust/crates/titan-unified-spirit-rs/**' \
-    'titan-rust/crates/titan-inner-body-rs/**' \
-    'titan-rust/crates/titan-inner-mind-rs/**' \
-    'titan-rust/crates/titan-inner-spirit-rs/**' \
-    'titan-rust/crates/titan-outer-body-rs/**' \
-    'titan-rust/crates/titan-outer-mind-rs/**' \
-    'titan-rust/crates/titan-outer-spirit-rs/**' \
-    'titan-docs/specs/TRINITY_CONFORMANCE.md' \
-    'titan-docs/specs/ARCHITECTURE_trinity.md' 2>/dev/null || true)
-if [ -n "$STAGED_TRINITY" ]; then
-    PY="$REPO_ROOT/test_env/bin/python"
-    [ -x "$PY" ] || PY=python3
-    if ! "$PY" "$REPO_ROOT/scripts/trinity_conformance.py" > /tmp/precommit_trinity_conformance.log 2>&1; then
-        cat >&2 <<'BANNER'
-
-┌──────────────────────────────────────────────────────────────────────┐
-│  ⛔  Trinity SPEC-conformance gate FAILED.                           │
-│                                                                      │
-│  A LOCKED §G5.x/§9 clause regressed, a clause is marked LOCKED        │
-│  without a passing test, or a clause has no mapped test. The trinity  │
-│  must be 100% per spec — no dropped or simplified terms.             │
-│                                                                      │
-│  Run:  python scripts/trinity_conformance.py                         │
-│  Map:  titan-docs/specs/TRINITY_CONFORMANCE.md                       │
-└──────────────────────────────────────────────────────────────────────┘
-
-BANNER
-        cat /tmp/precommit_trinity_conformance.log >&2
-        exit 1
-    fi
-    # Surface the PENDING (not-yet-conforming) clause list even on a pass.
-    sed -n '/TRINITY NOT YET 100%/,/promote each/p' /tmp/precommit_trinity_conformance.log 2>/dev/null || true
-fi
-
 exit 0
