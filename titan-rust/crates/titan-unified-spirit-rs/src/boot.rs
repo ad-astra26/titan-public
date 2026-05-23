@@ -420,13 +420,15 @@ pub async fn run_sphere_clock_poll_loop(
                 continue; // first poll (seed) or no new pulse on this clock
             }
 
-            // A pulse fired since the last poll. Feed the detector the
-            // CURRENT sustained-balance state (D-SPEC-114 level gate).
+            // A pulse fired since the last poll. Per §G11 D-SPEC-122 (v1.55.0,
+            // reverts D-SPEC-114), the per-pulse balanced flag is what gates
+            // the 3-consecutive-coincidence streak; `consecutive_balanced` is
+            // no longer in the gate (preserved as a per-clock telemetry field).
             let balanced = consecutive_balanced > 0;
             let pulse_ts = now - last_pulse_age_s;
             let maybe_big = {
                 let mut det = detector.lock();
-                det.record_pulse_with_phase(name, phase, balanced, consecutive_balanced, pulse_ts)
+                det.record_pulse_with_phase(name, phase, balanced, pulse_ts)
             };
             if let Some(big_pulse) = maybe_big {
                 on_big_pulse(big_pulse);
