@@ -55,7 +55,16 @@ cmd_deploy() {
     echo "=== Deploy ${TITAN_ID} (git pull on remote) ==="
     local backup="/tmp/${TITAN_ID,,}_config_backup_$(date +%s).toml"
     ssh -o ConnectTimeout=10 "${REMOTE_HOST}" bash -s -- "${TITAN_DIR}" "${backup}" "${TITAN_ID}" <<'REMOTE_SCRIPT' || return 1
-set -e
+# `pipefail` is load-bearing: closes the historical fail-silent path where
+# `git pull --ff-only … | tail -10` masked a failed pull (the `| tail` returned
+# 0 even when the pull aborted on a dirty tracked `bin/*-rs`), causing the
+# deploy to "succeed" and restart with STALE Python. With pipefail, any
+# failure in the pipe propagates → `set -e` trips → ssh exit ≠ 0 →
+# `cmd_deploy` returns 1 → `cmd_restart` is NEVER reached. Combined with the
+# pre-pull `git checkout -- bin/` clear and the post-pull tip verification
+# below, this makes the dirty-bin stale-Python failure mode structurally
+# impossible — no manual `git checkout` / `git pull` bypass is needed.
+set -eo pipefail
 REMOTE_DIR="$1"
 BACKUP="$2"
 LABEL="$3"
@@ -72,8 +81,24 @@ echo "  ✓ ${LABEL}: backed up config.toml (${BACKUP_SIZE} bytes) → ${BACKUP}
 git update-index --no-assume-unchanged titan_hcl/config.toml 2>/dev/null || true
 git checkout HEAD -- titan_hcl/config.toml 2>/dev/null || true
 
+# Clear any dirty `bin/*-rs` (mtime/size drift from prior restarts) that would
+# block `git pull --ff-only`. Mtime-only drift is recoverable via
+# `git checkout --`; real binary updates ship via the `--include-rust-binaries`
+# scp staging block below, NOT via git pull. Without this clear, the
+# pull aborts and the deploy used to proceed to restart with stale Python.
+git checkout -- bin/ 2>/dev/null || true
+
 echo "  → git pull --ff-only origin titan-v6"
 git pull --ff-only origin titan-v6 2>&1 | tail -10
+
+# Belt-and-suspenders: verify HEAD actually advanced to origin/titan-v6.
+PULLED_TIP=$(git rev-parse HEAD)
+REMOTE_TIP=$(git rev-parse origin/titan-v6 2>/dev/null || git rev-parse HEAD)
+if [ "${PULLED_TIP}" != "${REMOTE_TIP}" ]; then
+    echo "  ✗ ${LABEL}: post-pull HEAD ${PULLED_TIP:0:12} != origin/titan-v6 ${REMOTE_TIP:0:12} — aborting BEFORE restart"
+    exit 1
+fi
+echo "  ✓ ${LABEL}: HEAD at ${PULLED_TIP:0:12} (matches origin/titan-v6)"
 
 python3 <<'PYMERGE'
 import re, sys, os
@@ -128,6 +153,24 @@ REMOTE_SCRIPT
             echo "  ✓ staged + atomically installed ${#scp_args[@]} binaries to ${REMOTE_HOST}:${TITAN_DIR}/bin/"
         fi
     fi
+
+    # Defense-in-depth: verify the remote git tip from THIS host before
+    # restarting. The in-heredoc post-pull check inside the ssh session is
+    # primary; this is the redundant local-side guard so a future heredoc
+    # bug can't slip a stale-code restart through. Comparison uses local
+    # `origin/titan-v6` (which we just pushed to) as the canonical truth.
+    echo
+    echo "=== Verify ${TITAN_ID} on expected commit ==="
+    local expected_tip
+    expected_tip=$(git rev-parse origin/titan-v6 2>/dev/null || git rev-parse HEAD)
+    local remote_tip
+    remote_tip=$(ssh -o ConnectTimeout=10 "${REMOTE_HOST}" "cd '${TITAN_DIR}' && git rev-parse HEAD" 2>/dev/null || echo "?")
+    if [ "${remote_tip:0:12}" != "${expected_tip:0:12}" ]; then
+        echo "  🚨 ${TITAN_ID} deploy verification FAILED: remote ${remote_tip:0:12} != expected ${expected_tip:0:12}"
+        echo "     Refusing to restart ${TITAN_ID} with stale code. Re-run 'bash scripts/${TITAN_ID,,}_manage.sh deploy'."
+        return 3
+    fi
+    echo "  ✓ ${TITAN_ID} remote at ${remote_tip:0:12} (matches local origin/titan-v6) — safe to restart"
 
     echo
     echo "=== Restart ${TITAN_ID} (systemctl) ==="
