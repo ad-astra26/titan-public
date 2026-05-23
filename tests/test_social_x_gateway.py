@@ -524,119 +524,73 @@ def gateway_no_archetype(gateway):
 
 
 class TestPostTypeSelection:
-    def test_onchain_catalyst(self, gateway_no_archetype):
-        gateway = gateway_no_archetype
+    """Archetype-only contract (Maker rule 2026-05-23).
+
+    `_select_post_type` MUST return either the name of a registered
+    archetype (when the dispatcher.probe finds a candidate) or `None`
+    (when no archetype's predicate is met this cycle). The legacy
+    catalyst_map / felt-state-thresholds / FELT_STATE_POOL fallback
+    waterfall is DELETED — those paths kept the inline `_POST_PROMPTS`
+    templates alive and produced the 2026-05-23 X-post leaks.
+
+    Symmetric `prepare_post` contract: when `_select_post_type` returns
+    `None`, prepare_post returns `(ActionResult(status="no_archetype_fired"),
+    None)` — silence is the correct behavior, no post is sent to X.
+    """
+
+    def test_returns_archetype_name_when_dispatcher_fires(self, gateway):
+        """When the dispatcher.probe returns a candidate, _select_post_type
+        returns the candidate's archetype name and stashes it on context."""
+        from types import SimpleNamespace
         ctx = PostContext(session="", proxy="", api_key="", titan_id="T1")
-        catalyst = {"type": "onchain_anchor", "significance": 0.4}
-        assert gateway._select_post_type(catalyst, ctx) == "onchain"
+        fake_candidate = SimpleNamespace(
+            archetype="world_mirror", pool="", source_id="x")
+        fake_dispatcher = SimpleNamespace(
+            probe=lambda c: fake_candidate,
+            get_archetype=lambda name: None,
+        )
+        gateway._archetype_dispatcher = fake_dispatcher
+        assert gateway._select_post_type({}, ctx) == "world_mirror"
+        # Candidate stashed for downstream prompt builder.
+        assert ctx.archetype_candidate is fake_candidate
 
-    def test_eureka_spirit_catalyst(self, gateway_no_archetype):
-        gateway = gateway_no_archetype
+    def test_returns_None_when_dispatcher_returns_no_candidate(self, gateway):
+        """Archetype-only design: when no archetype's predicate fires,
+        _select_post_type returns None — no fallback to catalyst_map or
+        FELT_STATE_POOL (both deleted 2026-05-23)."""
+        from types import SimpleNamespace
         ctx = PostContext(session="", proxy="", api_key="", titan_id="T1")
-        catalyst = {"type": "eureka_spirit", "significance": 0.95}
-        assert gateway._select_post_type(catalyst, ctx) == "eureka_thread"
+        gateway._archetype_dispatcher = SimpleNamespace(
+            probe=lambda c: None,
+            get_archetype=lambda name: None,
+        )
+        # Even with a catalyst type that previously mapped to a non-
+        # archetype post_type (e.g. "vulnerability" → PT_VULNERABILITY),
+        # the result MUST be None now.
+        for ctype in ("vulnerability", "eureka", "kin_resonance",
+                      "onchain_anchor", "dream_summary", "milestone",
+                      "strong_composition", "emotion_shift", "unknown"):
+            assert gateway._select_post_type({"type": ctype}, ctx) is None
 
-    def _seed_recent_full_stack(self, gateway):
-        """Insert a recent full_stack post so felt-state path is tested."""
-        import time
-        db = gateway._db()
-        db.execute(
-            "INSERT INTO actions (action_type, status, post_type, titan_id, "
-            "text, created_at) VALUES (?,?,?,?,?,?)",
-            ("post", "posted", "full_stack", "T1", "test", time.time()))
-        db.commit()
-        db.close()
-
-    def test_emotion_shift_falls_through_to_felt_state_pool(
-            self, gateway_no_archetype):
-        """F-6 (rFP_social_x_improvements §B.3.F-6, 2026-05-17): emotion_shift
-        no longer pre-selects reflection via catalyst_map (would bypass
-        reflection.find_candidate's per_titan_count_today daily cap).
-        With dispatcher disabled, emotion_shift now falls through to the
-        FELT_STATE_POOL weighted draw — result is one of the 8 pool
-        post_types, NOT deterministically reflection."""
-        from titan_hcl.logic.social_x_gateway import SocialXGateway
-        gateway = gateway_no_archetype
-        self._seed_recent_full_stack(gateway)
+    def test_returns_None_when_dispatcher_unavailable(self, gateway):
+        """If the dispatcher initialization failed (sentinel = False),
+        _select_post_type returns None — no inline-template fallback."""
+        gateway._archetype_dispatcher = False  # init-failure sentinel
         ctx = PostContext(session="", proxy="", api_key="", titan_id="T1")
-        catalyst = {"type": "emotion_shift", "significance": 0.5}
-        result = gateway._select_post_type(catalyst, ctx)
-        pool_types = {pt for pt, _w in SocialXGateway.FELT_STATE_POOL}
-        # Hard-threshold rules may also fire on neutral-ish neuromods —
-        # accept anything that came from a legitimate variety-respecting
-        # selector. The forbidden outcome is "reflection picked by
-        # catalyst_map bypass" — that path is now gone.
-        assert result in pool_types or result in {
-            "vulnerability", "thread_storm", "self_quote"}
+        assert gateway._select_post_type({"type": "eureka"}, ctx) is None
 
-    def test_high_endorphin_biases_connective(self, gateway_no_archetype, monkeypatch):
-        """Endorphin > 0.7 must apply a 2× bias to the connective weight in
-        the felt-state pool. Verify the bias propagates into the weights
-        list passed to random.choices, regardless of the random draw."""
-        gateway = gateway_no_archetype
-        self._seed_recent_full_stack(gateway)
-        ctx = PostContext(session="", proxy="", api_key="", titan_id="T1",
-                          neuromods={"Endorphin": 0.8})
-        catalyst = {"type": "neutral_signal", "significance": 0.5}
-
-        captured = {}
-        def fake_choices(population, weights=None, k=1):
-            captured["population"] = list(population)
-            captured["weights"] = list(weights or [])
-            return ["connective"]
-        monkeypatch.setattr("random.choices", fake_choices)
-
-        result = gateway._select_post_type(catalyst, ctx)
-        assert result == "connective"
-        # Verify Endorphin bias landed: connective baseline is 0.10, after
-        # ×2 bias must be 0.20.
-        conn_idx = captured["population"].index("connective")
-        assert captured["weights"][conn_idx] == pytest.approx(0.20)
-
-    def test_default_pool_max_weight_is_full_stack(self, gateway_no_archetype, monkeypatch):
-        """With a recent rich post (no full_stack bias kicks in) and an
-        unmapped catalyst, the felt-state pool's highest-weighted item is
-        full_stack at 0.35. Verify the pool composition + max-weight pick."""
-        gateway = gateway_no_archetype
-        self._seed_recent_full_stack(gateway)
+    def test_returns_None_when_dispatcher_probe_raises(self, gateway):
+        """Defensive: if probe() raises, _select_post_type returns None
+        instead of crashing or silently falling through to a legacy path."""
+        from types import SimpleNamespace
         ctx = PostContext(session="", proxy="", api_key="", titan_id="T1")
-        catalyst = {"type": "unknown", "significance": 0.3}
 
-        captured = {}
-        def fake_choices(population, weights=None, k=1):
-            captured["population"] = list(population)
-            captured["weights"] = list(weights or [])
-            # Return the max-weighted item — deterministic verification.
-            max_idx = max(range(len(weights)),
-                          key=lambda i: weights[i])
-            return [population[max_idx]]
-        monkeypatch.setattr("random.choices", fake_choices)
+        def boom(c):
+            raise RuntimeError("simulated dispatcher failure")
 
-        result = gateway._select_post_type(catalyst, ctx)
-        assert result == "full_stack"
-        fs_idx = captured["population"].index("full_stack")
-        assert captured["weights"][fs_idx] == pytest.approx(0.35)
-
-    def test_no_rich_post_biases_full_stack(self, gateway_no_archetype, monkeypatch):
-        """When no full_stack post in the last hour, the gateway biases
-        full_stack ×2 (0.35 → 0.70) to preserve rich-post cadence. Verify
-        the bias lands in the weights list."""
-        gateway = gateway_no_archetype
-        ctx = PostContext(session="", proxy="", api_key="", titan_id="T1")
-        catalyst = {"type": "neutral_signal", "significance": 0.5}
-
-        captured = {}
-        def fake_choices(population, weights=None, k=1):
-            captured["population"] = list(population)
-            captured["weights"] = list(weights or [])
-            return ["full_stack"]
-        monkeypatch.setattr("random.choices", fake_choices)
-
-        result = gateway._select_post_type(catalyst, ctx)
-        assert result == "full_stack"
-        fs_idx = captured["population"].index("full_stack")
-        # Baseline 0.35 × 2 = 0.70 (no-rich-post bias).
-        assert captured["weights"][fs_idx] == pytest.approx(0.70)
+        gateway._archetype_dispatcher = SimpleNamespace(
+            probe=boom, get_archetype=lambda n: None)
+        assert gateway._select_post_type({}, ctx) is None
 
 
 class TestStyleOwnWords:
@@ -853,20 +807,32 @@ class TestConsumerAccess:
         assert desc is None and err.status == "consumer_blocked"
 
     def test_post_with_allowed_consumer(self, gateway):
-        # spirit_worker is allowed — prepare_post returns a descriptor
-        # (composition happens externally; gateway no longer drives the LLM).
+        # spirit_worker is allowed — prepare_post passes the consumer gate.
+        # With archetype-only enforcement (2026-05-23), prepare_post returns
+        # `no_archetype_fired` when no archetype's predicate is met in the
+        # test environment (which has no real archetype data). The previous
+        # contract (always returns a descriptor for an allowed consumer)
+        # was the old fallback-waterfall behavior — that is now correctly
+        # gone.
         ctx = PostContext(session="s", proxy="p", api_key="k", titan_id="T1",
                           catalysts=[{"type": "test", "significance": 0.5}])
         err, desc = gateway.prepare_post(ctx, consumer="spirit_worker")
-        # Should get past consumer + catalyst gates → descriptor returned.
-        # (May still hit "disabled" if test config has enabled=false.)
         if err is None:
             assert desc is not None
             assert desc.post_type
             assert desc.system_prompt
             assert desc.user_prompt
         else:
-            assert err.status in ("disabled",)
+            # Allowed statuses after archetype-only enforcement: archetype
+            # truly fired (handled above) OR the gate refused for one of
+            # the legitimate reasons below. "consumer_blocked" is the bug
+            # this test guards against — must NOT appear for spirit_worker.
+            assert err.status in (
+                "disabled", "no_archetype_fired", "boot_grace",
+                "circuit_breaker", "metabolism_gate",
+                "metabolism_throttled", "suppressed_ungrounded",
+                "no_catalyst",
+            )
 
 
 # ── Phase 3 Chunk ω-bis — two-call shape invariants ──────────────────

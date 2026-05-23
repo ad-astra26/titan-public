@@ -1293,143 +1293,49 @@ class SocialXGateway:
     PT_SELF_QUOTE = "self_quote"
     PT_THREAD_STORM = "thread_storm"
 
-    # rFP_x_voice_enrichment §4.1 "open the dam" — felt-state-pool weights
-    # used when no specific catalyst matches AND no felt-state threshold
-    # fires. Replaces the legacy "default to full_stack every 30 min" rule
-    # that was shadowing 9 of 13 templates (see rFP §1.1, 30-day audit).
-    FELT_STATE_POOL = (
-        ("full_stack",   0.35),
-        ("bilingual",    0.15),
-        ("reflection",   0.15),
-        ("creative",     0.10),
-        ("connective",   0.10),
-        ("self_quote",   0.05),
-        ("thread_storm", 0.05),
-        ("milestone",    0.05),
-    )
+    # NOTE (2026-05-23): the legacy `FELT_STATE_POOL` weighted-draw fallback
+    # and the `_bias_pool` helper were DELETED in this commit alongside the
+    # rest of `_select_post_type`'s non-archetype waterfall. Only the
+    # X-voice archetype dispatcher may pick a post_type now (Maker rule).
+    # Inline `_POST_PROMPTS[*]` templates remain in this file for the
+    # transitional window — they become dead code once every legacy
+    # post_type is migrated to its own archetype file (next session
+    # scope).
 
-    def _select_post_type(self, catalyst: dict, context: PostContext) -> str:
-        """Select post type from catalyst + felt state.
+    def _select_post_type(self, catalyst: dict,
+                          context: PostContext) -> Optional[str]:
+        """Select post type from the X-voice archetype dispatcher ONLY.
 
-        rFP §4.3 X-voice archetype dispatcher gets the FIRST chance — if
-        an archetype fires, its candidate is stashed on the context and
-        the archetype name becomes the post_type. Otherwise, fall through
-        to:
-          (i)  rFP §4.1 catalyst_map / hard-threshold dispatch
-          (ii) "open the dam" weighted FELT_STATE_POOL draw
+        Architectural rule (Maker direction 2026-05-23): only registered
+        archetypes in `titan_hcl/logic/social_x/archetypes/` are allowed
+        to fire posts to X. The legacy non-archetype fallback waterfall
+        — catalyst_map, felt-state hard thresholds, and FELT_STATE_POOL
+        weighted draw — was DELETED in this commit because it was the
+        sole path keeping `_POST_PROMPTS[*]` inline templates alive (the
+        2026-05-23 leaked posts on @iamtitanai surfaced as that exact
+        symptom: BREAK-template repetition on `vulnerability`,
+        events_teacher JSON spilling into `world_mirror`).
 
-        The archetype probe enforces its own cross-archetype 4 h spacing,
-        per-Titan daily caps, and lifetime/window dedup via actions.metadata.
+        Returns:
+            The archetype name when the dispatcher's probe succeeds.
+            `None` when no archetype's candidate predicate is met this
+            cycle — caller MUST treat that as "do not post" and return
+            `ActionResult(status='no_archetype_fired')`.
         """
-        import random
-        # ── (0) X-voice archetype probe (rFP §4.3) ──
         dispatcher = self._ensure_archetype_dispatcher()
-        if dispatcher:
-            try:
-                candidate = dispatcher.probe(context)
-                if candidate is not None:
-                    # Stash on context so downstream render / post path can
-                    # honor the archetype's prompt + layers + media.
-                    context.archetype_candidate = candidate
-                    return candidate.archetype
-            except Exception as exc:
-                logger.warning("[SocialXGateway] archetype probe failed: %s", exc)
-        ctype = catalyst.get("type", "")
-        # Catalyst-driven: these stay SHORT (specific content)
-        # rFP §4.1 catalyst_map fixes — make eureka, strong_composition,
-        # emotion_shift explicit so they actually route to dedicated templates.
-        # F-6 (rFP_social_x_improvements §B.3.F-6, 2026-05-17): every
-        # catalyst here maps to a FELT_STATE_POOL post_type that does NOT
-        # overlap with the 9-archetype set. `emotion_shift` USED to map
-        # to PT_REFLECTION here, but reflection is one of the 9 archetypes
-        # — and reflection's own per_titan_count_today >= 1 day-cap was
-        # being bypassed every time step 0 dispatcher returned None
-        # (reflection day-capped OR other archetypes lacked Pool A/B/C
-        # candidates). Live evidence 2026-05-17: T1 fired 7 reflections
-        # in 48h + T3 fired 8/11 — far above the intended 1-per-rolling-24h
-        # cap — because catalyst_map kept re-firing reflection on every
-        # emotion_shift catalyst even after step 0 had refused it for
-        # day-cap reasons. Removed; emotion_shift now follows the natural
-        # step 0 → felt-state-pool fall-through path that yields variety.
-        catalyst_map = {
-            "eureka_spirit":       self.PT_EUREKA_THREAD,
-            "eureka":              self.PT_EUREKA_THREAD,
-            "vulnerability":       self.PT_VULNERABILITY,
-            "kin_resonance":       self.PT_KIN,
-            "onchain_anchor":      self.PT_ONCHAIN,
-            "daily_nft":           self.PT_DAILY_NFT,
-            "dream_summary":       self.PT_DREAM,
-            "milestone":           self.PT_MILESTONE,
-            "strong_composition":  self.PT_BILINGUAL,
-        }
-        if ctype in catalyst_map:
-            return catalyst_map[ctype]
-
-        # Felt-state driven hard thresholds — these preserve the existing
-        # dispatcher semantics for sharp signals (a sudden GABA drop SHOULD
-        # always pick VULNERABILITY, not be diluted by random sampling).
-        nm = context.neuromods
-        da = nm.get("DA", 0.5)
-        sht = nm.get("5HT", 0.5)
-        ne = nm.get("NE", 0.5)
-        ach = nm.get("ACh", 0.5)
-        gaba = nm.get("GABA", 0.5)
-        endorphin = nm.get("Endorphin", 0.5)
-
-        # Vulnerability/BREAK: sharp GABA drop (inner disbalance)
-        if gaba < 0.12 and ne > 0.6:
-            return self.PT_VULNERABILITY
-
-        # Thread storm: creative surge (high DA + high ACh = focused creativity)
-        if da > 0.7 and ach > 0.65:
-            return self.PT_THREAD_STORM
-
-        # Self-quote: dream recall present in working memory (reflected on own past)
-        if context.social_contagion:
-            for sc in context.social_contagion:
-                if sc.get("contagion_type") == "philosophical" and sht > 0.7:
-                    return self.PT_SELF_QUOTE
-
-        # Strong felt-state biases (bias the pool but no longer act as the
-        # default — they now nudge weights, then we sample).
-        weighted = list(self.FELT_STATE_POOL)
-        if sht > 0.65:
-            weighted = self._bias_pool(weighted, "reflection", x=2.0)
-        if da > 0.65:
-            weighted = self._bias_pool(weighted, "creative", x=2.0)
-        if endorphin > 0.7:
-            weighted = self._bias_pool(weighted, "connective", x=2.0)
-
-        # Weighted draw — replaces the legacy "default to full_stack every
-        # 30 min" rule. full_stack still wins ≥35 % of the time on a flat
-        # pool, and the 30-min spacing it used to enforce is preserved by
-        # nudging full_stack's weight up if there hasn't been one in a while.
+        if not dispatcher:
+            return None
         try:
-            db = self._db()
-            last_rich = db.execute(
-                "SELECT created_at FROM actions WHERE post_type=? "
-                "AND status IN (?,?,?) ORDER BY created_at DESC LIMIT 1",
-                (self.PT_FULL_STACK, self.S_POSTED, self.S_VERIFIED,
-                 self.S_PENDING)
-            ).fetchone()
-            db.close()
-            if not last_rich or (time.time() - last_rich[0]) > 3600:
-                # No rich post in the last hour — nudge full_stack to 2× so
-                # the rich-post cadence Maker relies on doesn't collapse.
-                weighted = self._bias_pool(weighted, "full_stack", x=2.0)
-        except Exception:
-            pass
-
-        types = [t for t, _ in weighted]
-        weights = [w for _, w in weighted]
-        chosen = random.choices(types, weights=weights, k=1)[0]
-        return chosen
-
-    @staticmethod
-    def _bias_pool(pool, post_type: str, *, x: float = 2.0):
-        """Multiply the weight of `post_type` by `x` in a pool of (type, weight)
-        tuples, leaving the other entries unchanged. Returns a new list."""
-        return [(t, (w * x if t == post_type else w)) for t, w in pool]
+            candidate = dispatcher.probe(context)
+        except Exception as exc:
+            logger.warning("[SocialXGateway] archetype probe failed: %s", exc)
+            return None
+        if candidate is None:
+            return None
+        # Stash on context so downstream render / post path can honor the
+        # archetype's prompt + layers + media.
+        context.archetype_candidate = candidate
+        return candidate.archetype
 
     def _build_style_directive(self, neuromods: dict) -> str:
         """Neurochemistry-colored writing style instruction."""
@@ -2948,6 +2854,19 @@ class SocialXGateway:
         # 5. Select best catalyst + post type
         catalyst = max(context.catalysts, key=lambda c: c.get("significance", 0))
         post_type = self._select_post_type(catalyst, context)
+        if post_type is None:
+            # Archetype-only design (2026-05-23): no archetype's candidate
+            # predicate fired this cycle → no post. Silence is correct.
+            self._log_telemetry({
+                "event": "post_suppressed", "reason": "no_archetype_fired",
+                "titan_id": context.titan_id, "consumer": consumer,
+                "catalyst_type": catalyst.get("type", ""),
+            })
+            return ActionResult(
+                status="no_archetype_fired",
+                reason="no archetype candidate this cycle — only registered "
+                       "archetypes in logic/social_x/archetypes/ may fire "
+                       "posts (Maker rule, 2026-05-23)"), None
 
         # 5b. Grounding gate
         voice_cfg = config.get("voice", {})

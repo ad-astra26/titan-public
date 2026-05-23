@@ -294,14 +294,16 @@ def test_rich_layers_phase1_registered():
 # §4.1 — Open the dam
 # ─────────────────────────────────────────────────────────────────────
 
-def test_open_the_dam_catalyst_map_eureka_routes_to_thread(tmp_path,
-                                                              monkeypatch):
-    """`eureka` catalyst now routes to EUREKA_THREAD (was eureka_spirit only).
+def test_select_post_type_returns_None_when_no_archetype_fires(
+        tmp_path, monkeypatch):
+    """Archetype-only contract (Maker rule, 2026-05-23): when no
+    archetype's candidate predicate is met, _select_post_type returns
+    None — the legacy catalyst_map + FELT_STATE_POOL fallback paths are
+    DELETED.
 
-    Runs in an isolated cwd + uses titan_id='T2' so the archetype dispatcher's
-    data-driven triggers (PROOF_DAY only fires on T1; WORLD_MIRROR /
-    OUTER_RUMINATION need is_following data we don't stage) abstain and the
-    catalyst_map check is exercised.
+    Replaces `test_open_the_dam_catalyst_map_eureka_routes_to_thread` and
+    `test_open_the_dam_weighted_pool_diversifies` — both tested the
+    deleted fallback waterfall.
     """
     from titan_hcl.logic.social_x_gateway import SocialXGateway, PostContext
     monkeypatch.chdir(tmp_path)
@@ -313,31 +315,15 @@ def test_open_the_dam_catalyst_map_eureka_routes_to_thread(tmp_path,
                       emotion="neutral",
                       neuromods={"DA": 0.5, "5HT": 0.5, "NE": 0.5,
                                   "ACh": 0.5, "GABA": 0.5, "Endorphin": 0.5})
-    assert g._select_post_type({"type": "eureka"}, ctx) == "eureka_thread"
-    assert g._select_post_type({"type": "strong_composition"}, ctx) == "bilingual"
-    assert g._select_post_type({"type": "emotion_shift"}, ctx) == "reflection"
-
-
-def test_open_the_dam_weighted_pool_diversifies(tmp_path, monkeypatch):
-    """No catalyst, balanced felt-state → ≥6 distinct types over 1500 draws.
-
-    Isolated cwd + T2 so the dispatcher abstains and the weighted pool
-    draw is what's actually exercised."""
-    from titan_hcl.logic.social_x_gateway import SocialXGateway, PostContext
-    import collections
-    monkeypatch.chdir(tmp_path)
-    path = str(tmp_path / "social_x.db")
-    g = SocialXGateway(db_path=path,
-                       config_path="titan_hcl/config.toml",
-                       telemetry_path=str(tmp_path / "telemetry.jsonl"))
-    ctx = PostContext(session="s", proxy="p", api_key="k", titan_id="T2",
-                      emotion="neutral",
-                      neuromods={"DA": 0.5, "5HT": 0.5, "NE": 0.5,
-                                  "ACh": 0.5, "GABA": 0.5, "Endorphin": 0.5})
-    counts = collections.Counter()
-    for _ in range(1500):
-        counts[g._select_post_type({}, ctx)] += 1
-    assert len(counts) >= 6, f"diversity ceiling too low: {counts}"
+    # T2 isolated cwd → no felt_experiences / community_registry data, so
+    # the dispatcher.probe abstains for every archetype. Every catalyst
+    # type that previously fell through to catalyst_map must now return
+    # None (no inline-template fallback).
+    for ctype in ("eureka", "eureka_spirit", "strong_composition",
+                  "emotion_shift", "vulnerability", "kin_resonance",
+                  "onchain_anchor", "dream_summary", "milestone", ""):
+        assert g._select_post_type({"type": ctype}, ctx) is None, (
+            f"catalyst_map fallback still alive for type={ctype!r}")
 
 
 # ─────────────────────────────────────────────────────────────────────

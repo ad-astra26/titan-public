@@ -63,7 +63,7 @@ class ComposedThoughtArchetype(ArchetypeBase):
         if not titan_id:
             return None
         now = time.time()
-        if self.per_titan_count_today(titan_id=titan_id, now=now) >= 1:
+        if self.per_titan_count_today(titan_id=titan_id, now=now) >= 2:
             return None
         if self.cross_archetype_blocked(titan_id=titan_id, now=now):
             return None
