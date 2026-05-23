@@ -205,6 +205,19 @@ MODULE_READY = "MODULE_READY"
 MODULE_HEARTBEAT = "MODULE_HEARTBEAT"
 MODULE_SHUTDOWN = "MODULE_SHUTDOWN"
 MODULE_CRASHED = "MODULE_CRASHED"
+
+# Synthesis Engine Phase 1 (D-SPEC-123 / SPEC v1.56.0 §25):
+# MEMORY_RETRIEVAL_USED is the use-gated activation event (INV-Syn-5): emitted
+# by retrieval consumers (Phase 1.5+ producers: agno post-hook, RECALL ops)
+# ONLY for items the LLM actually cited / acted upon — never mere surfacing.
+# synthesis_worker is the sole consumer; payload =
+#     {"item_id": "kuzu:NODE_42" | "tc:0xabc..." | "mem:42" | "skill:S7",
+#      "ts": <monotonic seconds>}
+# SYNTHESIS_RECOMPUTE_DONE is observability-only — emitted by synthesis_worker
+# after each 60s recompute pass with {"items_recomputed": N, "duration_ms": M}.
+MEMORY_RETRIEVAL_USED = "MEMORY_RETRIEVAL_USED"
+SYNTHESIS_RECOMPUTE_DONE = "SYNTHESIS_RECOMPUTE_DONE"
+
 # SPEC §8.3 Phase B (rFP_phase_c_bus_delivery_continuity_and_hot_reload §4):
 # per-module hot-reload protocol. REQUEST emitted by Maker CLI / future D9
 # Guardian; ACK emitted by parent Guardian with status transitions

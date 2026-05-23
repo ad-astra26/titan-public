@@ -59,14 +59,41 @@ class TitanDuckDB:
                 last_reinforced DOUBLE,
                 embedding_id INTEGER DEFAULT -1,
                 cognified BOOLEAN DEFAULT FALSE,
-                neuromod_context TEXT
+                neuromod_context TEXT,
+                memory_type TEXT DEFAULT 'episodic'
             )
         """)
+        # Synthesis Engine Phase 1 / D-SPEC-123 — additive memory_type column
+        # for existing installs (CREATE TABLE above already carries it for
+        # new installs). Idempotent: DuckDB silent-skips ADD COLUMN IF NOT
+        # EXISTS when the column is already present.
+        self._conn.execute(
+            "ALTER TABLE memory_nodes "
+            "ADD COLUMN IF NOT EXISTS memory_type TEXT DEFAULT 'episodic'"
+        )
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS identity_nodes (
                 id TEXT PRIMARY KEY,
                 identifier TEXT,
                 created_at DOUBLE
+            )
+        """)
+        # Synthesis Engine Phase 1 / D-SPEC-123 — activation_state per arch
+        # §5.2. synthesis_worker is sole writer (G21 / INV-Syn-3). Cross-
+        # process consumers read this directly via the BridgeRecall pattern,
+        # every query gated on synth_status.bin :: last_consistent_event_ts.
+        # item_id namespacing: "kuzu:NODE" | "tc:TX" | "skill:ID" | "fork:ID"
+        # | "mem:<memory_nodes.id>" (the latter for memory_nodes rows
+        # directly).
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS activation_state (
+                item_id TEXT PRIMARY KEY,
+                last_access DOUBLE,
+                access_log BLOB,
+                access_count INTEGER DEFAULT 0,
+                first_access DOUBLE,
+                base_level DOUBLE DEFAULT 0.0,
+                last_recompute DOUBLE DEFAULT 0.0
             )
         """)
 
