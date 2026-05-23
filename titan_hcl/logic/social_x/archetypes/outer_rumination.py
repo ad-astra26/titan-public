@@ -35,9 +35,24 @@ POOL_A = "A_x_content"
 POOL_B = "B_person"
 POOL_C = "C_exchange"
 
-POOL_A_RELEVANCE_FLOOR = 0.65
-POOL_A_AGE_MIN_S = 2 * 86400
-POOL_A_AGE_MAX_S = 7 * 86400
+# Pool A diversification (2026-05-23) — closing the bug where the
+# archetype kept ruminating about the same handful of authors (T1+T3
+# both posted "Six days ago, jkacrpto's words..." on 2026-05-23 because
+# the prior {0.65 floor, 2-7d window, deterministic relevance-DESC pick}
+# collapsed to 2-5 candidates per Titan, with the same author
+# (@jkacrpto) winning on both. Empirical T2 felt_experiences probe
+# 2026-05-23 found 850 `topic_wide` rows in 30d → genuinely rich pool,
+# blocked by the filter. New defaults open the door to that pool, then
+# the per-author monopoly penalty + grounded-words boost + weighted
+# top-K random pick spread the choice across Titans.
+POOL_A_RELEVANCE_FLOOR = 0.5     # was 0.65 — admit topic_wide rows
+POOL_A_AGE_MIN_S = 1 * 86400      # was 2d — Maker rule: "yesterday" OK
+POOL_A_AGE_MAX_S = 30 * 86400     # was 7d — "anything in DB up to ~month"
+POOL_A_TOP_K = 10                 # weighted-random across top-K, not #1
+POOL_A_PER_AUTHOR_PENALTY = 0.15  # per prior citation in last 14d
+POOL_A_PER_AUTHOR_WINDOW_S = 14 * 86400
+POOL_A_GROUNDED_BOOST_PER_MATCH = 0.05
+POOL_A_GROUNDED_BOOST_MAX_MATCHES = 5
 
 POOL_B_LAST_SEEN_MIN_S = 2 * 86400
 POOL_B_LAST_SEEN_MAX_S = 14 * 86400
@@ -81,7 +96,8 @@ class OuterRuminationArchetype(ArchetypeBase):
                                          window_seconds=30 * 86400)
 
         candidates: dict[str, dict] = {}
-        a = self._pool_a(titan_id=titan_id, now=now, cited=cited_lifetime)
+        a = self._pool_a(titan_id=titan_id, now=now, cited=cited_lifetime,
+                         context=context)
         if a:
             candidates[POOL_A] = a
         b = self._pool_b(titan_id=titan_id, now=now)
@@ -104,7 +120,26 @@ class OuterRuminationArchetype(ArchetypeBase):
 
     # ── Pool queries ────────────────────────────────────────────────
 
-    def _pool_a(self, *, titan_id: str, now: float, cited: set[str]) -> dict | None:
+    def _pool_a(self, *, titan_id: str, now: float, cited: set[str],
+                context=None) -> dict | None:
+        """Pool A — felt_experiences settled. Diversified pick (2026-05-23):
+
+        1. Fetch wider window [1d, 30d] × relevance ≥ 0.5 (was 2-7d × 0.65,
+           which collapsed to 2-5 candidates per Titan and forced T1/T3 to
+           collide on @jkacrpto).
+        2. For each eligible row compute an adjusted_relevance:
+              base = row.relevance
+              − POOL_A_PER_AUTHOR_PENALTY × (#prior_OR_citations_of_author
+                                              within last 14d)
+              + POOL_A_GROUNDED_BOOST_PER_MATCH × (#grounded_word matches
+                                              in felt_summary or topic,
+                                              capped at MAX_MATCHES)
+        3. Sample weighted-random across the top-K (default 10) candidates
+           using adjusted_relevance as weights. With per-Titan grounded
+           vocabularies + per-Titan citation histories, two Titans probing
+           the same source pool diverge structurally; the random sample
+           breaks any residual deterministic tie.
+        """
         try:
             et = sqlite3.connect(self._et_db, timeout=5)
             et.row_factory = sqlite3.Row
@@ -113,7 +148,7 @@ class OuterRuminationArchetype(ArchetypeBase):
                 "FROM felt_experiences "
                 "WHERE titan_id=? AND relevance >= ? "
                 "  AND created_at <= ? AND created_at >= ? "
-                "ORDER BY relevance DESC LIMIT 30",
+                "ORDER BY relevance DESC LIMIT 120",
                 (titan_id, POOL_A_RELEVANCE_FLOOR,
                  now - POOL_A_AGE_MIN_S, now - POOL_A_AGE_MAX_S),
             ).fetchall()
@@ -121,21 +156,116 @@ class OuterRuminationArchetype(ArchetypeBase):
         except Exception as e:
             logger.warning("[outer_rumination] pool A failed: %s", e)
             return None
+        if not rows:
+            return None
+
+        author_citations = self._recent_pool_a_author_counts(
+            titan_id=titan_id, now=now)
+        grounded_tokens = self._titan_grounded_token_set(context)
+
+        eligible: list[tuple[float, dict]] = []
         for r in rows:
             sid = f"feA:{r['id']}"
             if sid in cited:
                 continue
+            base = float(r["relevance"] or 0.0)
+            author = (r["author"] or "").lower()
+            penalty = (POOL_A_PER_AUTHOR_PENALTY
+                       * author_citations.get(author, 0))
+            boost = 0.0
+            if grounded_tokens:
+                summary = (r["felt_summary"] or "").lower()
+                topic = (r["topic"] or "").lower()
+                haystack = f"{summary} {topic}"
+                matches = sum(1 for tok in grounded_tokens
+                              if tok and tok in haystack)
+                matches = min(matches, POOL_A_GROUNDED_BOOST_MAX_MATCHES)
+                boost = POOL_A_GROUNDED_BOOST_PER_MATCH * matches
+            adjusted = max(0.0, base - penalty + boost)
             days_ago = max(1, int((now - r["created_at"]) / 86400))
-            return {
+            eligible.append((adjusted, {
                 "source_id": sid,
-                "salience": min(1.0, r["relevance"]),
-                "relevance": float(r["relevance"] or 0.0),
+                "salience": min(1.0, base),
+                "relevance": base,
+                "adjusted_relevance": adjusted,
                 "handle": r["author"],
                 "days_ago": days_ago,
                 "content_excerpt": (r["felt_summary"] or "")[:200],
                 "felt_summary_at_discovery": (r["felt_summary"] or "")[:160],
-            }
-        return None
+            }))
+        if not eligible:
+            return None
+
+        eligible.sort(key=lambda kv: -kv[0])
+        top = eligible[:POOL_A_TOP_K]
+        weights = [adj for adj, _ in top]
+        if sum(weights) <= 0.0:
+            # All adjusted to zero (every candidate heavily penalized and
+            # no grounded matches) — fall back to uniform random among top.
+            weights = [1.0] * len(top)
+        import random as _random
+        chosen = _random.choices([d for _, d in top], weights=weights, k=1)[0]
+        return chosen
+
+    def _recent_pool_a_author_counts(self, *, titan_id: str,
+                                     now: float) -> dict[str, int]:
+        """Per-author count of recent (≤14d) Pool A citations by this Titan.
+        Reads `actions.metadata.handle` for `post_type=outer_rumination AND
+        pool=A_x_content`. Used by `_pool_a` to penalize the same author
+        from dominating the rumination feed — the 2026-05-23 collision
+        symptom (T1+T3 both posting about @jkacrpto)."""
+        cutoff = now - POOL_A_PER_AUTHOR_WINDOW_S
+        counts: dict[str, int] = {}
+        conn = self._conn()
+        try:
+            rows = conn.execute(
+                "SELECT metadata FROM actions "
+                "WHERE titan_id=? AND post_type=? AND created_at >= ?",
+                (titan_id, self.name, cutoff),
+            ).fetchall()
+        except Exception:
+            rows = []
+        finally:
+            conn.close()
+        for r in rows:
+            try:
+                m = json.loads(r["metadata"] or "{}")
+            except Exception:
+                continue
+            if (m.get("pool") or "") != POOL_A:
+                continue
+            h = (m.get("handle") or "").lower()
+            if h:
+                counts[h] = counts.get(h, 0) + 1
+        return counts
+
+    @staticmethod
+    def _titan_grounded_token_set(context) -> set[str]:
+        """Per-Titan grounded vocabulary tokens for relevance-boost matching.
+
+        Reads `context.grounded_words` (set by social_worker_post_dispatch
+        from the Titan's MSL vocabulary state). Returns up to 30 lowercase
+        tokens with confidence ≥ 0.3 — the same threshold the gateway uses
+        for the [MY WORDS] prompt block (`social_x_gateway.py:2114`).
+        Returns empty set if context lacks grounded_words (e.g. test
+        fixtures) so the boost cleanly no-ops.
+        """
+        if context is None:
+            return set()
+        words = getattr(context, "grounded_words", None) or []
+        out: set[str] = set()
+        for w in words:
+            if isinstance(w, dict):
+                tok = (w.get("word") or "").strip().lower()
+                conf = float(w.get("confidence") or 0.0)
+            else:
+                tok = str(w).strip().lower()
+                conf = 1.0
+            if tok and conf >= 0.3:
+                out.add(tok)
+            if len(out) >= 30:
+                break
+        return out
 
     def _pool_b(self, *, titan_id: str, now: float) -> dict | None:
         """Kuzu Person high-interaction, last_seen ∈ [2 d, 14 d], not subject
