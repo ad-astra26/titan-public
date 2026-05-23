@@ -95,8 +95,9 @@ pub use crate::ground_up::{
     GROUND_UP_MAX_NUDGE,
 };
 pub use crate::homeostasis::{
-    gradient, observe, stateful_update, Layer, LayerObs, RestoringCfg, CENTRE, DEFAULT_K_COHESION,
-    DEFAULT_K_DRIVE, DEFAULT_K_MOMENTUM, DEFAULT_K_RESTORE,
+    gradient, observe, stateful_update, Layer, LayerObs, RestoringCfg, CENTRE, DEFAULT_A_DMAG,
+    DEFAULT_A_DRIFT, DEFAULT_A_MAG, DEFAULT_K_DAMP, DEFAULT_K_DIRECTION, DEFAULT_K_DRIVE,
+    DEFAULT_K_MOMENTUM, DEFAULT_K_RESTORE,
 };
 pub use crate::slot_io::{
     decode_floats, encode_floats, open_slot, read_dim_slice, read_topology_inner_lower,
