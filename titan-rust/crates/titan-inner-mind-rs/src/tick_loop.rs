@@ -17,11 +17,18 @@ use titan_core::constants::{INNER_MIND_FIRING_MAX_BYTES, INNER_MIND_FIRING_SCHEM
 use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
-    apply_multipliers, compose_multipliers_default, decode_filter_down_payload,
-    decode_local_filter_down_payload, encode_floats, observe, stateful_update, ContentGate,
-    DriftAggregator, FiringSlotWriter, GroundUpEnricher, Layer, RestoringCfg, Side,
-    INNER_MIND_TOPICS,
+    apply_multipliers, compose_focus_into_enrichment, compose_multipliers_default,
+    decode_filter_down_payload, decode_local_filter_down_payload, encode_floats,
+    load_checkpoint_for_part, load_restoring_cfg, observe, open_focus_input_if_present,
+    open_neuromod_slot_if_present, read_focus_nudge, read_neuromod_gain, stateful_update,
+    write_checkpoint_for_part, CheckpointSnapshot, ContentGate, DriftAggregator, FiringSlotWriter,
+    FocusPart, GroundUpEnricher, Layer, RestoringCfg, Side, INNER_MIND_TOPICS,
 };
+
+/// §G5.2 item 4 checkpoint write cadence. Inner-mind ticks @ 23.49 Hz so
+/// 240 ticks ≈ 10 s between snapshots.
+const CHECKPOINT_WRITE_EVERY_N_TICKS: u64 = 240;
+const CHECKPOINT_PART: &str = "inner_mind";
 
 const MIND_DIMS: usize = 15;
 const SENSOR_CACHE_DIMS: usize = 15;
@@ -84,6 +91,7 @@ pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()
         sensor_cache,
         sensor_cache_path,
         firing_writer,
+        shm_dir.to_path_buf(),
     )
     .await;
 
@@ -195,13 +203,32 @@ async fn run_tick_loop(
     mut sensor_cache: Option<Slot>,
     sensor_cache_path: std::path::PathBuf,
     mut firing_writer: FiringSlotWriter,
+    shm_dir: std::path::PathBuf,
 ) -> Result<()> {
     let mut content_gate = ContentGate::new();
     let mut ground_up = GroundUpEnricher::new(Side::MindWilling);
     let mut drift_agg = DriftAggregator::new("mind", DRIFT_THRESHOLD_PCT);
-    // §G5.2 traveling-tensor state (x[t-1], x[t-2]); cold-start at 0.5 centre.
-    let mut prev: [f32; MIND_DIMS] = [0.5; MIND_DIMS];
-    let mut prev2: [f32; MIND_DIMS] = [0.5; MIND_DIMS];
+    // §G5.2 item 4 — restore exact tensor state from checkpoint on boot;
+    // cold-start at 0.5 only when sidecar absent/invalid.
+    let (mut prev, mut prev2, mut last_obs_restored) =
+        match load_checkpoint_for_part::<MIND_DIMS>(&shm_dir, CHECKPOINT_PART) {
+            Some(CheckpointSnapshot {
+                prev,
+                prev2,
+                last_obs,
+                ..
+            }) => (prev, prev2, Some(last_obs)),
+            None => ([0.5_f32; MIND_DIMS], [0.5_f32; MIND_DIMS], None),
+        };
+    // §G5.2 item 5 — load gains from titan_params.toml [trinity_restoring]
+    // via the Python L2-published `trinity_restoring.bin` sidecar.
+    let mut cfg = load_restoring_cfg(&shm_dir, Layer::Mind);
+    // §G5.2 item 2 — live neuromod-gain read per tick.
+    let mut neuromod_slot = open_neuromod_slot_if_present(&shm_dir);
+    let neuromod_path = shm_dir.join("neuromod_state.bin");
+    // §G5.2 item 2 + §G12 — FOCUS cascade nudge slot.
+    let mut focus_input_slot = open_focus_input_if_present(&shm_dir);
+    let focus_input_path = shm_dir.join("focus_input.bin");
 
     // Per master plan §7 + C-S3 PLAN §1.1 #2: Schumann timer wheels live in
     // titan-schumann (canonical shared library for trinity daemons).
@@ -235,16 +262,55 @@ async fn run_tick_loop(
                             sensor_cache = Some(slot);
                         }
                     }
+                    if neuromod_slot.is_none() && tick_count.is_multiple_of(retry_every_n) {
+                        if let Ok(slot) = Slot::open(&neuromod_path) {
+                            info!(
+                                event = "NEUROMOD_STATE_OPENED_LATE",
+                                path = %neuromod_path.display(),
+                                tick = tick_count,
+                            );
+                            neuromod_slot = Some(slot);
+                        }
+                    }
+                    if focus_input_slot.is_none() && tick_count.is_multiple_of(retry_every_n) {
+                        if let Ok(slot) = Slot::open(&focus_input_path) {
+                            info!(
+                                event = "FOCUS_INPUT_OPENED_LATE",
+                                path = %focus_input_path.display(),
+                                tick = tick_count,
+                            );
+                            focus_input_slot = Some(slot);
+                        }
+                    }
+                    if tick_count.is_multiple_of(retry_every_n) {
+                        cfg = load_restoring_cfg(&shm_dir, Layer::Mind);
+                    }
                     let drift_pct = tick_event.jitter_ns() as f64 / tick_event.period_ns as f64;
                     drift_agg.observe(drift_pct, tick_event.jitter_ns(), tick_event.epoch);
                     if let Err(e) = run_one_tick(
                         &bus, &state, &mut content_gate, &mut ground_up,
                         &mut inner_mind_slot, &topology_slot, &sensor_cache,
                         &mut firing_writer, &mut prev, &mut prev2,
+                        &mut cfg, neuromod_slot.as_ref(), focus_input_slot.as_ref(),
+                        &mut last_obs_restored,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
                     tick_count = tick_count.wrapping_add(1);
+                    // §G5.2 item 4 — periodic checkpoint write.
+                    if tick_count.is_multiple_of(CHECKPOINT_WRITE_EVERY_N_TICKS) {
+                        if let Some(o) = last_obs_restored.as_ref() {
+                            if let Err(e) = write_checkpoint_for_part::<MIND_DIMS>(
+                                &shm_dir,
+                                CHECKPOINT_PART,
+                                &prev,
+                                &prev2,
+                                o,
+                            ) {
+                                warn!(err = ?e, "checkpoint write failed (continuing)");
+                            }
+                        }
+                    }
                     if let Ok(s) = state.lock() {
                         if s.shutdown_requested {
                             info!(event = "SHUTDOWN_REQUESTED_VIA_BUS");
@@ -257,6 +323,13 @@ async fn run_tick_loop(
                     break;
                 }
             }
+        }
+    }
+    if let Some(o) = last_obs_restored.as_ref() {
+        if let Err(e) =
+            write_checkpoint_for_part::<MIND_DIMS>(&shm_dir, CHECKPOINT_PART, &prev, &prev2, o)
+        {
+            warn!(err = ?e, "final checkpoint write failed");
         }
     }
     Ok(())
@@ -274,8 +347,14 @@ async fn run_one_tick(
     firing_writer: &mut FiringSlotWriter,
     prev: &mut [f32; MIND_DIMS],
     prev2: &mut [f32; MIND_DIMS],
+    cfg: &mut RestoringCfg,
+    neuromod_slot: Option<&Slot>,
+    focus_input_slot: Option<&Slot>,
+    last_obs_restored: &mut Option<titan_trinity_daemon::LayerObs>,
 ) -> Result<()> {
-    let mut mind = read_sensor_cache(sensor_cache)?;
+    // raw[t] = un-enriched 15D sensor reading (§G5.2 drive target).
+    let raw = read_sensor_cache(sensor_cache)?;
+    let mut mind = raw;
 
     let (unified, local, topology_fresh, epoch_due) = {
         let mut s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
@@ -313,19 +392,21 @@ async fn run_one_tick(
     }
 
     // §G5.2 traveling-tensor update (Layer::Mind — gradient .5/.5).
-    let cfg = RestoringCfg::for_layer(Layer::Mind);
-    // P0-0b kernel signature (§G5.2 ratified): see inner-body for design notes.
-    // Full raw/enrichment splitting + live neuromod-gain are the next slice.
+    // enrichment = (enriched − raw) — the filter_down + (willing-only) ground_up
+    // delta applied above. Passed as a SEPARATE full-weight additive term per
+    // §G5.2 (G5.2-enrichment-separate). Spring is modulated by the live
+    // neuromod gain (G5.2-neuromod-gain).
+    let mut enrichment = [0.0_f32; MIND_DIMS];
+    for i in 0..MIND_DIMS {
+        enrichment[i] = mind[i] - raw[i];
+    }
+    // §G12 FOCUS cascade: amplified nudge composes into enrichment_force.
+    let focus = read_focus_nudge::<MIND_DIMS>(focus_input_slot, FocusPart::InnerMind);
+    compose_focus_into_enrichment(&mut enrichment, &focus);
+    cfg.neuromod_gain = read_neuromod_gain(neuromod_slot);
     let obs = observe(&prev[..], &prev2[..]);
-    let enrichment_zero = [0.0_f32; 15];
-    let x = stateful_update(
-        &prev[..],
-        &prev2[..],
-        &mind[..],
-        &enrichment_zero[..],
-        &obs,
-        &cfg,
-    );
+    *last_obs_restored = Some(obs);
+    let x = stateful_update(&prev[..], &prev2[..], &raw[..], &enrichment[..], &obs, cfg);
     let mut mind_state = [0.0_f32; MIND_DIMS];
     mind_state.copy_from_slice(&x[..MIND_DIMS]);
     *prev2 = *prev;

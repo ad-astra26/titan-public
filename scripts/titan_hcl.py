@@ -301,6 +301,24 @@ async def run(health_only: bool = False, server_only: bool = False,
         os.environ["TITAN_API_PORT"] = str(shadow_port)
         logging.info("[B.1] Shadow port set: API will listen on %d", shadow_port)
 
+    # §G5.2 item 5 (D-SPEC-112) — publish the trinity-restoring gain sidecar
+    # BEFORE booting workers so the 6 Rust trinity daemons retry-load real
+    # titan_params.toml values within their first ~1 s. Daemon kernel-defaults
+    # apply only while the sidecar is absent (cold boot < ~1 s). Errors are
+    # surfaced and the boot continues — daemons stay on defaults rather than
+    # blocking startup (`directive_error_visibility` + substrate continues).
+    try:
+        from titan_hcl.logic.trinity_restoring_publisher import (
+            publish_trinity_restoring_cfg,
+        )
+        publish_trinity_restoring_cfg()
+    except Exception as _e:
+        logging.exception(
+            "[trinity_restoring] publish failed; daemons will run on crate "
+            "DEFAULT_* gains until next CONFIG_RELOAD: %s",
+            _e,
+        )
+
     core = TitanHCL(kernel)
     await core.boot()
 

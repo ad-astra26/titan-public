@@ -264,11 +264,58 @@ class TestMSLRewardComputer:
     def test_epoch_stage_transition(self):
         rc = MSLRewardComputer()
         rc.update_stage_weights(100_000)  # Early
-        assert rc._w_convergence == pytest.approx(0.40)
+        # Balance reweight is gentle (5%) → other weights pay proportionally.
+        # Early: convergence 0.40 stage baseline → 0.40 × (1 − 0.05) = 0.38.
+        assert rc._w_convergence == pytest.approx(0.38, abs=0.01)
         rc.update_stage_weights(1_000_000)  # Mid
-        assert rc._w_convergence == pytest.approx(0.25)
+        assert rc._w_convergence == pytest.approx(0.25 * 0.95, abs=0.01)
         rc.update_stage_weights(3_000_000)  # Mature
-        assert rc._w_convergence == pytest.approx(0.15)
+        assert rc._w_convergence == pytest.approx(0.15 * 0.95, abs=0.01)
+
+    def test_msl_balance_pulse_reward_term(self):
+        """G9.5-msl-balance-reward (D-SPEC-112 / PLAN §6): the MSL reward must
+        include a balance + pulse-contribution term + STALE penalty sourced
+        from per-part sphere-clock state. Centering + GREAT pulses raise the
+        reward; STALE drags it down."""
+        rc = MSLRewardComputer()
+        preds = np.array([0.5] * 10, dtype=np.float32)
+        actuals = np.array([0.5] * 10, dtype=np.float32)
+        attn = np.array([1 / 7] * 7, dtype=np.float32)
+
+        # Baseline (no sphere state) — neutral 0.5 balance.
+        r_none, c_none = rc.compute(preds, actuals, 0.5, attn)
+        assert "balance" in c_none and "balance_components" in c_none
+        assert c_none["balance"] == pytest.approx(0.5, abs=1e-3)
+
+        # Centered + 2 GREAT pulses + zero STALE → strictly higher balance term.
+        good_state = {
+            "balance_fractions": [1.0] * 6,
+            "great_pulses_recent": 2,
+            "stale_fractions": [0.0] * 6,
+        }
+        r_good, c_good = rc.compute(preds, actuals, 0.5, attn, sphere_clock_state=good_state)
+        assert c_good["balance"] > c_none["balance"] + 1e-4
+        # Score = 0.5·1.0 + 0.3·tanh(1) − 0.2·0 ≈ 0.5 + 0.228 = 0.728
+        assert c_good["balance"] == pytest.approx(0.5 + 0.3 * np.tanh(1.0), abs=1e-3)
+        # Composite reward also strictly higher than baseline.
+        assert r_good > r_none + 1e-5
+
+        # Stale + uncentered → balance term drops.
+        bad_state = {
+            "balance_fractions": [0.1] * 6,
+            "great_pulses_recent": 0,
+            "stale_fractions": [1.0] * 6,
+        }
+        r_bad, c_bad = rc.compute(preds, actuals, 0.5, attn, sphere_clock_state=bad_state)
+        assert c_bad["balance"] < c_none["balance"] - 1e-4
+        # Composite reward also strictly lower.
+        assert r_bad < r_none - 1e-5
+
+        # Components surface for telemetry.
+        bc = c_good["balance_components"]
+        assert bc["balance_mean"] == pytest.approx(1.0, abs=1e-3)
+        assert bc["great_pulses_recent"] == 2
+        assert bc["stale_penalty"] == pytest.approx(0.0, abs=1e-3)
 
 
 # ── Main Orchestrator ──────────────────────────────────────────────────────

@@ -432,13 +432,30 @@ class SocialGraphProxy:
             "tx_signature": tx_signature, "outcome": outcome,
         })
 
-    # set_titan_preference / sync_community / mark_checked / update_last_tweet
-    # — cross-process kin-protocol write proxy methods RETIRED 2026-05-23
-    # (D-SPEC-120, BUG-SOCIAL-GRAPH-WIRING re-triage). Zero external callers
-    # fleet-wide; the in-process `SocialGraph` class methods remain as the
-    # legitimate API for any caller that needs them. If a future cross-process
-    # caller emerges, re-add the proxy/worker pair as a deliberate API exposure
-    # (currently no-op work-RPC roundtrip = dead surface).
+    def set_titan_preference(self, titan_id: str, user_name: str,
+                             affinity_delta: float = 0.1,
+                             tags: str = "",
+                             discovered_via: str = "") -> None:
+        self._work_rpc_sync("set_titan_preference", {
+            "titan_id": titan_id, "user_name": user_name,
+            "affinity_delta": affinity_delta, "tags": tags,
+            "discovered_via": discovered_via,
+        })
+
+    def sync_community(self, users: list, relationship: str = "follower") -> None:
+        self._work_rpc_sync("sync_community", {
+            "users": users, "relationship": relationship,
+        })
+
+    def mark_checked(self, titan_id: str, user_name: str) -> None:
+        self._work_rpc_sync("mark_checked", {
+            "titan_id": titan_id, "user_name": user_name,
+        })
+
+    def update_last_tweet(self, user_name: str, tweet_text: str) -> None:
+        self._work_rpc_sync("update_last_tweet", {
+            "user_name": user_name, "tweet_text": tweet_text,
+        })
 
     async def ledger_record_async(self, tweet_id: str, user_name: str,
                                   action: str,
@@ -486,12 +503,23 @@ class SocialGraphProxy:
         })
         return result.get("connections", []) if result else []
 
-    # get_community / get_titan_favorites / get_accounts_to_check —
-    # cross-process kin-protocol read proxy methods RETIRED 2026-05-23
-    # (D-SPEC-120, BUG-SOCIAL-GRAPH-WIRING re-triage). Zero external callers
-    # fleet-wide; in-process `SocialGraph.get_community()` /
-    # `get_titan_favorites()` / `get_accounts_to_check()` remain as the
-    # legitimate API. See companion comment above for the writes block.
+    def get_community(self, relationship: Optional[str] = None) -> list:
+        result = self._work_rpc_sync("get_community", {
+            "relationship": relationship,
+        })
+        return result.get("community", []) if result else []
+
+    def get_titan_favorites(self, titan_id: str, limit: int = 10) -> list:
+        result = self._work_rpc_sync("get_titan_favorites", {
+            "titan_id": titan_id, "limit": limit,
+        })
+        return result.get("favorites", []) if result else []
+
+    def get_accounts_to_check(self, titan_id: str, limit: int = 3) -> list:
+        result = self._work_rpc_sync("get_accounts_to_check", {
+            "titan_id": titan_id, "limit": limit,
+        })
+        return result.get("accounts", []) if result else []
 
     def get_pending_inspirations(self, limit: int = 10) -> list:
         result = self._work_rpc_sync("get_pending_inspirations", {

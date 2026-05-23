@@ -1,8 +1,7 @@
 """Tests for SPEC §24 / rFP_backup_diff_baseline_unified_v1 Phase 1:
 
 (a) PERSONALITY_PATHS / WEEKLY_EXTRA_PATHS / TIMECHAIN_PATHS canonical inventory
-    matches SPEC §24.4.B/C/D (11 dropped + 8 added on personality, after
-    titan_chronicles.md re-added 2026-05-22; 5 dropped +
+    matches SPEC §24.4.B/C/D (12 dropped + 8 added on personality; 5 dropped +
     sage_memory dir added on weekly; new TIMECHAIN_PATHS list with 7 chain .bin
     files + index.db + maker_proposals.db).
 
@@ -29,9 +28,7 @@ def _personality_path_set():
 
 @pytest.mark.parametrize("dropped", [
     "titan_constitution.md",
-    # NOTE: titan_chronicles.md was RE-ADDED 2026-05-22 once the chronicle
-    # writer was restored (BUG-CHRONICLE-WRITER-DEAD-POST-A87 fixed) — see
-    # test_personality_readds_chronicle_after_writer_restored below.
+    "titan_chronicles.md",
     "data/titan_directives.sig",
     "data/genesis_record.json",
     "data/genesis_nft_metadata.json",
@@ -44,27 +41,11 @@ def _personality_path_set():
     "data/timechain/contract_stats.json",
 ])
 def test_personality_drops_static_birth_and_ephemeral_files(dropped):
-    """SPEC §24.4.B / rFP §4.1 — 11 entries dropped from PERSONALITY_PATHS.
-
-    (Was 12; titan_chronicles.md re-added 2026-05-22 — writer restored.)
-    """
+    """SPEC §24.4.B / rFP §4.1 — 12 entries dropped from PERSONALITY_PATHS."""
     assert dropped not in _personality_path_set(), (
         f"{dropped!r} should be dropped from PERSONALITY_PATHS per SPEC §24.4.B "
         f"(static birth identity → §24.4.A on Arweave via GenesisNFT, OR "
-        f"ephemeral / reconstructable)"
-    )
-
-
-def test_personality_readds_chronicle_after_writer_restored():
-    """SPEC §24.4.B — titan_chronicles.md RE-ADDED 2026-05-22.
-
-    BUG-CHRONICLE-WRITER-DEAD-POST-A87 is fixed (titan_HCL._append_to_chronicle
-    writes meditation reflections on MEDITATION_COMPLETE again), so the
-    narrative diary must be captured in the daily personality backup again.
-    """
-    assert "titan_chronicles.md" in _personality_path_set(), (
-        "titan_chronicles.md should be back in PERSONALITY_PATHS now that the "
-        "chronicle writer is restored (BUG-CHRONICLE-WRITER-DEAD fixed)"
+        f"ephemeral / reconstructable / chronicle-writer-dead)"
     )
 
 

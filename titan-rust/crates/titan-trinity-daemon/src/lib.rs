@@ -39,6 +39,7 @@
 #![warn(rust_2018_idioms)]
 
 pub mod adoption;
+pub mod checkpoint;
 pub mod content_hash;
 pub mod drift_warn;
 pub mod error;
@@ -71,15 +72,24 @@ pub mod subscriptions;
 // unchanged. (The pre-D2 `jittered_tick` ticker was removed D-SPEC-100
 // as dead code — never wired into any daemon main loop.)
 
+pub mod focus_input;
 pub mod homeostasis;
+pub mod neuromod_read;
 pub mod observer_mask;
 pub mod publish_throttle;
+pub mod pulse_watch;
+pub mod restoring_cfg;
 pub mod sensor_cache_read;
 
 pub use crate::adoption::{
     decode_adoption_ack_payload, decode_adoption_request_payload, encode_adoption_ack_payload,
     encode_adoption_request_payload, AdoptionAck, AdoptionRequest, StartMethod,
     CANONICAL_ADOPTION_ACK_PAYLOAD_BYTES, CANONICAL_ADOPTION_REQUEST_PAYLOAD_BYTES,
+};
+pub use crate::checkpoint::{
+    checkpoint_filename, checkpoint_path, load_for_part as load_checkpoint_for_part,
+    payload_bytes as checkpoint_payload_bytes, write_for_part as write_checkpoint_for_part,
+    CheckpointSnapshot, CHECKPOINT_SCHEMA_VERSION_F32,
 };
 pub use crate::content_hash::ContentGate;
 pub use crate::drift_warn::{DriftAggregator, DRIFT_WARN_MIN_INTERVAL};
@@ -90,6 +100,11 @@ pub use crate::filter_apply::{
     SPIRIT_FILTER_STRENGTH_MULT, TENSOR_MAX, TENSOR_MIN,
 };
 pub use crate::firing_payload::{encode_firing_payload, now_secs, FiringSlotWriter};
+pub use crate::focus_input::{
+    compose_into as compose_focus_into_enrichment, open_if_present as open_focus_input_if_present,
+    read_nudge as read_focus_nudge, FocusNudge, FocusPart, FOCUS_INPUT_PAYLOAD_BYTES,
+    FOCUS_INPUT_SIDECAR,
+};
 pub use crate::ground_up::{
     GroundUpEnricher, GroundUpNudge, Side, GROUND_UP_DEFAULT_DAMPING, GROUND_UP_DEFAULT_STRENGTH,
     GROUND_UP_MAX_NUDGE,
@@ -98,6 +113,14 @@ pub use crate::homeostasis::{
     gradient, observe, stateful_update, Layer, LayerObs, RestoringCfg, CENTRE, DEFAULT_A_DMAG,
     DEFAULT_A_DRIFT, DEFAULT_A_MAG, DEFAULT_K_DAMP, DEFAULT_K_DIRECTION, DEFAULT_K_DRIVE,
     DEFAULT_K_MOMENTUM, DEFAULT_K_RESTORE,
+};
+pub use crate::neuromod_read::{
+    open_if_present as open_neuromod_slot_if_present, read_gain as read_neuromod_gain,
+    NEUROMOD_GAIN_MAX, NEUROMOD_GAIN_MIN, NEUROMOD_GAIN_NEUTRAL,
+};
+pub use crate::restoring_cfg::{
+    load_for_layer as load_restoring_cfg, TRINITY_RESTORING_PAYLOAD_BYTES,
+    TRINITY_RESTORING_SIDECAR,
 };
 pub use crate::slot_io::{
     decode_floats, encode_floats, open_slot, read_dim_slice, read_topology_inner_lower,
@@ -116,6 +139,7 @@ pub use crate::observer_mask::{
     CONTENT_DIM_COUNT, OBSERVER_BYTE_END, OBSERVER_BYTE_START, OBSERVER_DIM_COUNT,
 };
 pub use crate::publish_throttle::PublishThrottle;
+pub use crate::pulse_watch::{PulseClockRole, PulseEdges, PulseWatcher};
 pub use crate::sensor_cache_read::{
     age_seconds, current_wall_ns, read_sensor_cache, SensorCacheRead,
 };

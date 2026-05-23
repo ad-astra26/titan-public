@@ -26,11 +26,21 @@ use titan_core::constants::{INNER_BODY_FIRING_MAX_BYTES, INNER_BODY_FIRING_SCHEM
 use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
-    apply_multipliers, compose_multipliers_default, decode_filter_down_payload,
-    decode_local_filter_down_payload, encode_floats, observe, stateful_update, ContentGate,
-    DriftAggregator, FiringSlotWriter, GroundUpEnricher, Layer, RestoringCfg, Side,
-    INNER_BODY_TOPICS,
+    apply_multipliers, compose_focus_into_enrichment, compose_multipliers_default,
+    decode_filter_down_payload, decode_local_filter_down_payload, encode_floats,
+    load_checkpoint_for_part, load_restoring_cfg, observe, open_focus_input_if_present,
+    open_neuromod_slot_if_present, read_focus_nudge, read_neuromod_gain, stateful_update,
+    write_checkpoint_for_part, CheckpointSnapshot, ContentGate, DriftAggregator, FiringSlotWriter,
+    FocusPart, GroundUpEnricher, Layer, RestoringCfg, Side, INNER_BODY_TOPICS,
 };
+
+/// §G5.2 item 4 checkpoint write cadence. Inner-body ticks @ 7.83 Hz so 80 ticks
+/// ≈ 10 s of wall-clock between snapshots — gives the integrator a fresh
+/// snapshot at human-reaction cadence without bottlenecking the tick on
+/// a same-FS rename(2).
+const CHECKPOINT_WRITE_EVERY_N_TICKS: u64 = 80;
+/// §G5.2 item 4 checkpoint sidecar basename (matches the part's daemon role).
+const CHECKPOINT_PART: &str = "inner_body";
 
 /// Drift threshold as fraction of period — 0.5% per master plan §16 OBS gate.
 const DRIFT_THRESHOLD_PCT: f64 = 0.005;
@@ -107,6 +117,7 @@ pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()
         sensor_cache,
         sensor_cache_path,
         firing_writer,
+        shm_dir.to_path_buf(),
     )
     .await;
 
@@ -233,14 +244,42 @@ async fn run_tick_loop(
     mut sensor_cache: Option<Slot>,
     sensor_cache_path: std::path::PathBuf,
     mut firing_writer: FiringSlotWriter,
+    shm_dir: std::path::PathBuf,
 ) -> Result<()> {
     let mut content_gate = ContentGate::new();
     let mut ground_up = GroundUpEnricher::new(Side::Body);
     let mut drift_agg = DriftAggregator::new("body", DRIFT_THRESHOLD_PCT);
-    // §G5.2 traveling-tensor state: x[t-1] and x[t-2]. Cold-start at the 0.5
-    // Divine Centre (checkpoint reload wired in P0 §1.3). Persists across ticks.
-    let mut prev: [f32; 5] = [0.5; 5];
-    let mut prev2: [f32; 5] = [0.5; 5];
+    // §G5.2 item 4 — restore the traveling tensor's exact position from
+    // the per-part checkpoint on boot (Maker override 2026-05-23: full P0
+    // closure, no deferral). Cold-start at the 0.5 Divine Centre only when
+    // the sidecar is absent / invalid / version-mismatched. The last
+    // observable signature is also restored so the very first stateful_update
+    // tick sees the same gradient-weighted gains it had pre-restart.
+    let (mut prev, mut prev2, mut last_obs_restored) =
+        match load_checkpoint_for_part::<5>(&shm_dir, CHECKPOINT_PART) {
+            Some(CheckpointSnapshot {
+                prev,
+                prev2,
+                last_obs,
+                ..
+            }) => (prev, prev2, Some(last_obs)),
+            None => ([0.5_f32; 5], [0.5_f32; 5], None),
+        };
+    // §G5.2 item 5 — gains sourced from titan_params.toml [trinity_restoring]
+    // via the Python L2-published sidecar `trinity_restoring.bin`. Falls back
+    // to crate DEFAULT_* constants if sidecar absent. Gradient is fixed per
+    // INV-9 (Body 0.7/0.3 quant/qual).
+    let mut cfg = load_restoring_cfg(&shm_dir, Layer::Body);
+    // §G5.2 item 2 — `k_restore` is scaled by the live neuromod gain. Open
+    // the slot now (Python L2 may have already populated it) and retry
+    // periodically below if absent (sidecar arrives after daemon boot).
+    let mut neuromod_slot = open_neuromod_slot_if_present(&shm_dir);
+    let neuromod_path = shm_dir.join("neuromod_state.bin");
+    // §G5.2 item 2 + §G12 — FOCUS cascade nudge slot. Read each tick + compose
+    // into enrichment_force; daemon NEVER writes (G21/INV-4 — sole writer is
+    // Python L2's FocusPIDPublisher).
+    let mut focus_input_slot = open_focus_input_if_present(&shm_dir);
+    let focus_input_path = shm_dir.join("focus_input.bin");
 
     // Per master plan §7 + C-S3 PLAN §1.1 #2: Schumann timer wheels live in
     // titan-schumann (substrate-owned shared library). Pinning epoch_t0 to
@@ -282,16 +321,61 @@ async fn run_tick_loop(
                             sensor_cache = Some(slot);
                         }
                     }
+                    // Retry neuromod_state.bin open if Python L2 hadn't created it at boot.
+                    if neuromod_slot.is_none() && tick_count.is_multiple_of(retry_every_n) {
+                        if let Ok(slot) = Slot::open(&neuromod_path) {
+                            info!(
+                                event = "NEUROMOD_STATE_OPENED_LATE",
+                                path = %neuromod_path.display(),
+                                tick = tick_count,
+                            );
+                            neuromod_slot = Some(slot);
+                        }
+                    }
+                    if focus_input_slot.is_none() && tick_count.is_multiple_of(retry_every_n) {
+                        if let Ok(slot) = Slot::open(&focus_input_path) {
+                            info!(
+                                event = "FOCUS_INPUT_OPENED_LATE",
+                                path = %focus_input_path.display(),
+                                tick = tick_count,
+                            );
+                            focus_input_slot = Some(slot);
+                        }
+                    }
+                    // Refresh cfg from sidecar at the same retry cadence so a Python
+                    // L2 re-publish (config reload) becomes visible without restart.
+                    if tick_count.is_multiple_of(retry_every_n) {
+                        cfg = load_restoring_cfg(&shm_dir, Layer::Body);
+                    }
                     let drift_pct = tick_event.jitter_ns() as f64 / tick_event.period_ns as f64;
                     drift_agg.observe(drift_pct, tick_event.jitter_ns(), tick_event.epoch);
                     if let Err(e) = run_one_tick(
                         &bus, &state, &mut content_gate, &mut ground_up,
                         &mut inner_body_slot, &topology_slot, &sensor_cache,
                         &mut firing_writer, &mut prev, &mut prev2,
+                        &mut cfg, neuromod_slot.as_ref(), focus_input_slot.as_ref(),
+                        &mut last_obs_restored,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
                     tick_count = tick_count.wrapping_add(1);
+                    // §G5.2 item 4 — periodic checkpoint write. Use the
+                    // per-tick `last_obs_restored` (now populated from the
+                    // most-recent `observe(prev, prev2)`) to preserve the
+                    // 5D signature across restart.
+                    if tick_count.is_multiple_of(CHECKPOINT_WRITE_EVERY_N_TICKS) {
+                        if let Some(o) = last_obs_restored.as_ref() {
+                            if let Err(e) = write_checkpoint_for_part::<5>(
+                                &shm_dir,
+                                CHECKPOINT_PART,
+                                &prev,
+                                &prev2,
+                                o,
+                            ) {
+                                warn!(err = ?e, "checkpoint write failed (continuing)");
+                            }
+                        }
+                    }
                     if let Ok(s) = state.lock() {
                         if s.shutdown_requested {
                             info!(event = "SHUTDOWN_REQUESTED_VIA_BUS");
@@ -304,6 +388,14 @@ async fn run_tick_loop(
                     break;
                 }
             }
+        }
+    }
+    // Final checkpoint on clean shutdown so a planned restart resumes from
+    // the latest tick (not from the periodic snapshot up to ~10 s ago).
+    if let Some(o) = last_obs_restored.as_ref() {
+        if let Err(e) = write_checkpoint_for_part::<5>(&shm_dir, CHECKPOINT_PART, &prev, &prev2, o)
+        {
+            warn!(err = ?e, "final checkpoint write failed");
         }
     }
     Ok(())
@@ -321,9 +413,15 @@ async fn run_one_tick(
     firing_writer: &mut FiringSlotWriter,
     prev: &mut [f32; 5],
     prev2: &mut [f32; 5],
+    cfg: &mut RestoringCfg,
+    neuromod_slot: Option<&Slot>,
+    focus_input_slot: Option<&Slot>,
+    last_obs_restored: &mut Option<titan_trinity_daemon::LayerObs>,
 ) -> Result<()> {
-    // 1. Read sensor cache (raw 5D body input).
-    let mut body = read_sensor_cache(sensor_cache)?;
+    // 1. Read sensor cache (raw 5D body input). This is `raw[t]` per §G5.2 —
+    //    the un-enriched producer output that the spring/drive integrate.
+    let raw = read_sensor_cache(sensor_cache)?;
+    let mut body = raw;
 
     // 2. Snapshot bus state (filter_down multipliers + topology flag +
     //    consume the epoch-pending edge for 0E ground_up recompute).
@@ -362,26 +460,32 @@ async fn run_one_tick(
         ground_up.apply_held_to_body(&mut body, 1.0)?;
     }
 
-    // 5b. §G5.2 traveling-tensor update: `body` is now the per-tick ENRICHED
-    //     DRIVE target (raw + filter_down + ground_up). Integrate it onto the
-    //     persistent tensor under the restoring spring + observable-feedback so
-    //     the tensor travels and the Middle Path is an attractor (D-SPEC-112).
-    let cfg = RestoringCfg::for_layer(Layer::Body);
-    // P0-0b kernel signature (§G5.2 ratified): pass raw + enrichment_force +
-    // observables separately. Full daemon-side splitting of raw vs enrichment
-    // and live neuromod-gain read are the next slice (PENDING in the manifest);
-    // for this slice we pass enriched as raw + zero enrichment so the build
-    // holds with behavior unchanged at the daemon level.
+    // 5b. §G5.2 traveling-tensor update.
+    //   - raw       = the un-enriched sensor output (already snapshotted as `raw`).
+    //   - enrichment = the full enrichment delta the producer pipeline added:
+    //                  filter_down (UNIFIED ⊗ LOCAL) + ground_up. We compute it
+    //                  element-wise as (enriched − raw) so the kernel can apply
+    //                  it as a SEPARATE full-weight additive term per the
+    //                  §G5.2 equation literal (G5.2-enrichment-separate clause).
+    //   - obs(prev, prev2) feeds all 5 observables into the kernel; the per-tick
+    //                  neuromod gain reads from `neuromod_state.bin` and
+    //                  multiplies the spring per §G5.2 item 2 (G5.2-neuromod-gain).
+    let mut enrichment = [0.0_f32; 5];
+    for i in 0..5 {
+        enrichment[i] = body[i] - raw[i];
+    }
+    // §G12 FOCUS cascade: amplified nudge from the FocusPIDPublisher composes
+    // into enrichment_force as another full-weight additive (still SEPARATE
+    // from drive per G5.2-enrichment-separate). When the layer is STALE the
+    // stale_focus_multiplier amplifies SPIRIT→Lower-Spirit→Mind→Body.
+    let focus = read_focus_nudge::<5>(focus_input_slot, FocusPart::InnerBody);
+    compose_focus_into_enrichment(&mut enrichment, &focus);
+    cfg.neuromod_gain = read_neuromod_gain(neuromod_slot);
     let obs = observe(&prev[..], &prev2[..]);
-    let enrichment_zero = [0.0_f32; 5];
-    let x = stateful_update(
-        &prev[..],
-        &prev2[..],
-        &body[..],
-        &enrichment_zero[..],
-        &obs,
-        &cfg,
-    );
+    // Cache the latest observable signature so the checkpoint writer can
+    // persist it (§G5.2 item 4: tensor + observables MUST checkpoint together).
+    *last_obs_restored = Some(obs);
+    let x = stateful_update(&prev[..], &prev2[..], &raw[..], &enrichment[..], &obs, cfg);
     let mut body_state = [0.0_f32; 5];
     body_state.copy_from_slice(&x[..5]);
     *prev2 = *prev;

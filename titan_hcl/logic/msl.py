@@ -861,22 +861,49 @@ class MSLRewardComputer:
     2. Convergence: sustained cross-modal coherence across temporal buffer
     3. Internal coherence: attention weight stability
     4. External: downstream action success (weighted low in early stages)
+    5. Balance + pulse-contribution (D-SPEC-112 / PLAN §6 — ARCHITECTURE_trinity
+       §9.5 + §G12): per-part sphere-clock balance + GREAT-pulse contribution
+       net of a STALE penalty. Rewards the §G5.2 traveling-tensor as it
+       centres + earns BIG/GREAT pulses; penalises drift-without-progress.
 
-    Epoch-based stage weights from rFP:
-    - Early (0-500K):  convergence=0.40, prediction=0.30, internal=0.20, external=0.10
-    - Mid (500K-2M):   all 0.25
-    - Mature (2M+):    convergence=0.15, prediction=0.15, internal=0.20, external=0.50
+    Epoch-based stage weights from rFP — `balance` weight is gentle (5%) and
+    constant across stages: it shapes the reward signal toward homeostasis
+    without dominating the prediction/convergence/external mix; the other
+    weights are re-normalised proportionally so they still sum to 1.0.
     """
 
     def __init__(self, config: dict | None = None):
         cfg = config or {}
+        # Balance weight is constant across stages (5%) by default; the
+        # other 4 weights pay proportionally per `_renormalise_weights`.
+        self._w_balance = cfg.get("reward_balance_weight", 0.05)
         self._w_convergence = cfg.get("reward_convergence_weight", 0.40)
         self._w_prediction = cfg.get("reward_prediction_weight", 0.30)
         self._w_internal = cfg.get("reward_internal_weight", 0.20)
         self._w_external = cfg.get("reward_external_weight", 0.10)
+        self._renormalise_weights()
+
+    def _renormalise_weights(self) -> None:
+        """Renormalise the 4 stage weights so the total (incl. balance) sums to 1.0."""
+        non_balance = max(0.0, 1.0 - self._w_balance)
+        stage_sum = (
+            self._w_convergence + self._w_prediction + self._w_internal + self._w_external
+        )
+        if stage_sum <= 0.0:
+            return
+        scale = non_balance / stage_sum
+        self._w_convergence *= scale
+        self._w_prediction *= scale
+        self._w_internal *= scale
+        self._w_external *= scale
 
     def update_stage_weights(self, epoch: int) -> None:
-        """Adjust reward weights based on developmental epoch."""
+        """Adjust reward weights based on developmental epoch.
+
+        Balance weight stays constant; the other four are restored to their
+        stage baseline (NOT the post-renormalise values from a prior stage)
+        and re-normalised so the composite sums to 1.0 (incl. balance).
+        """
         if epoch < 500_000:
             self._w_convergence = 0.40
             self._w_prediction = 0.30
@@ -892,10 +919,17 @@ class MSLRewardComputer:
             self._w_prediction = 0.15
             self._w_internal = 0.20
             self._w_external = 0.50
+        self._renormalise_weights()
 
-    def compute(self, predictions: np.ndarray, actuals: np.ndarray,
-                cross_modal_coherence: float, attention_weights: np.ndarray,
-                external_reward: float = 0.0) -> tuple[float, dict]:
+    def compute(
+        self,
+        predictions: np.ndarray,
+        actuals: np.ndarray,
+        cross_modal_coherence: float,
+        attention_weights: np.ndarray,
+        external_reward: float = 0.0,
+        sphere_clock_state: dict | None = None,
+    ) -> tuple[float, dict]:
         """Compute composite reward.
 
         Args:
@@ -904,6 +938,17 @@ class MSLRewardComputer:
             cross_modal_coherence: scalar from cross-modal resonance measurement
             attention_weights: 7D attention head output
             external_reward: downstream success signal (default 0)
+            sphere_clock_state: optional per-part sphere-clock summary used to
+                compute the §9.5 balance + pulse + STALE term. Expected shape:
+
+                  {
+                      "balance_fractions": [6 floats in [0,1]],   # one per part
+                      "great_pulses_recent": int,                 # GREAT pulses since last call
+                      "stale_fractions": [6 floats in [0,1]],     # 1.0 = fully STALE
+                  }
+
+                When omitted the balance term is 0.5 (neutral) — substrate
+                continues per §11.B; the reward still computes.
 
         Returns:
             (total_reward, component_dict)
@@ -925,21 +970,78 @@ class MSLRewardComputer:
         # 4. External reward (passed in, default 0)
         r_external = float(np.clip(external_reward, 0.0, 1.0))
 
+        # 5. Balance + pulse - STALE (D-SPEC-112 / PLAN §6). Sourced from the
+        #    per-part sphere-clock state. balance_fractions in [0,1] mean each
+        #    part's balance ratio; GREAT pulses cap their contribution at the
+        #    saturation of `tanh(n / 2)` so a single pulse already counts most
+        #    of its weight, two pulses are near-saturated, etc.
+        r_balance, balance_components = self._compute_balance_term(sphere_clock_state)
+
         # Weighted composite
-        total = (self._w_prediction * r_prediction +
-                 self._w_convergence * r_convergence +
-                 self._w_internal * r_internal +
-                 self._w_external * r_external)
+        total = (
+            self._w_prediction * r_prediction
+            + self._w_convergence * r_convergence
+            + self._w_internal * r_internal
+            + self._w_external * r_external
+            + self._w_balance * r_balance
+        )
 
         components = {
             "prediction": round(r_prediction, 4),
             "convergence": round(r_convergence, 4),
             "internal": round(r_internal, 4),
             "external": round(r_external, 4),
+            "balance": round(r_balance, 4),
+            "balance_components": balance_components,
             "total": round(total, 4),
             "pred_error": round(pred_error, 4),
         }
         return total, components
+
+    @staticmethod
+    def _compute_balance_term(state: dict | None) -> tuple[float, dict]:
+        """Per-part balance + pulse-contribution net STALE penalty ∈ [0, 1].
+
+        Neutral 0.5 baseline when no state provided. Per PLAN §6: rewards
+        cross-part balance + GREAT-pulse arrival; penalises STALE.
+        Subscores are exposed in the returned dict for telemetry.
+        """
+        if not state:
+            return 0.5, {"reason": "no_sphere_state"}
+        try:
+            balance = state.get("balance_fractions") or []
+            stale = state.get("stale_fractions") or []
+            great = int(state.get("great_pulses_recent", 0))
+        except Exception:
+            return 0.5, {"reason": "malformed_sphere_state"}
+
+        # balance_mean ∈ [0,1] — 1.0 = all 6 parts perfectly balanced.
+        if balance:
+            balance_arr = np.clip(np.asarray(balance, dtype=np.float32), 0.0, 1.0)
+            balance_mean = float(balance_arr.mean())
+        else:
+            balance_mean = 0.5
+
+        # Single GREAT pulse already counts most of its weight (tanh(0.5) ≈ 0.46);
+        # two ≈ 0.76; three ≈ 0.90.
+        pulse_term = float(np.tanh(max(0, great) / 2.0))
+
+        # STALE penalty: mean stale fraction across parts ∈ [0,1].
+        if stale:
+            stale_arr = np.clip(np.asarray(stale, dtype=np.float32), 0.0, 1.0)
+            stale_penalty = float(stale_arr.mean())
+        else:
+            stale_penalty = 0.0
+
+        # Net: 50% balance + 30% pulse + 20% penalty deduction, clamped [0,1].
+        r = 0.5 * balance_mean + 0.3 * pulse_term - 0.2 * stale_penalty
+        r = float(np.clip(r, 0.0, 1.0))
+        return r, {
+            "balance_mean": round(balance_mean, 4),
+            "pulse_term": round(pulse_term, 4),
+            "stale_penalty": round(stale_penalty, 4),
+            "great_pulses_recent": great,
+        }
 
 
 # ── Phase 2: Convergence Detector ──────────────────────────────────────────

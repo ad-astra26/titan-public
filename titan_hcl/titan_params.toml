@@ -517,6 +517,52 @@ weight_mind = 1.0
 weight_spirit = 1.2
 
 
+# ─── TRINITY RESTORING FORCE (SPEC §G5.2 / D-SPEC-112 — homeostasis kernel) ──
+# Per-Titan tunable gains for the §G5.2 closed-form integrator running inside
+# the 6 trinity-part daemons (inner/outer × body/mind/spirit). Python L2 reads
+# this section at startup and publishes it as a fixed-layout SHM sidecar
+# `trinity_restoring.bin` in shm_dir/; each Rust daemon retry-loads at boot
+# and refreshes at ~1s cadence (titan-trinity-daemon::restoring_cfg).
+#
+# Conservative starting values; tuning pass expected after VERIFY gate (PLAN §3).
+# Layer gradient (INV-9 body 0.7/0.3, mind 0.5/0.5, spirit 0.3/0.7) is STRUCTURAL
+# — fixed in the Rust kernel, NOT a TOML key. Neuromod gain is LIVE — read from
+# neuromod_state.bin per tick, NOT a TOML key.
+#
+# Risk note (PLAN §7): k_restore too high pins tensors at 0.5 (kills the journey).
+# Start gentle (0.05) and tune up only after the §3 VERIFY gate observes outer
+# coherence crossing the §G11 balance threshold without over-damping.
+
+[trinity_restoring]
+# Drive coefficient — how fast the tensor tracks the raw producer per tick.
+# x_drive = k_drive · (1 + w_quant·a_mag·(2·magnitude − 1)) · (raw − x[t-1])
+k_drive = 0.30
+
+# Restoring-spring coefficient — gentle PD position pull toward 0.5 Divine Centre.
+# Modulated per tick by `neuromod_gain` (from neuromod_state.bin) + the
+# coherence/polarity drift signal.
+k_restore = 0.05
+
+# PD damping coefficient — gentle opposition to velocity per §9.2.
+k_damp = 0.05
+
+# Momentum coefficient — velocity-carry feedback (§9.0 "velocity → momentum").
+k_mom = 0.10
+
+# Direction-continuity coefficient — trajectory bias (§9.0 "direction → continuity").
+k_dir = 0.05
+
+# Magnitude landing-gain amplitude. drive_gain ∈ [1 − w_quant·a_mag, 1 + w_quant·a_mag].
+a_mag = 0.50
+
+# Spring drift-modulation amplitude. spring_gain = 1 + w_qual·a_drift·((1−coh) + |pol|).
+# Higher = stronger off-centre pull; gentler for steady-state.
+a_drift = 1.00
+
+# Damping magnitude-modulation amplitude. damp_gain = 1 + w_quant·a_dmag·magnitude.
+a_dmag = 0.50
+
+
 # ─── GUARDIAN (Module Supervision) ────────────────────────────────
 # Process lifecycle management for all Trinity workers.
 

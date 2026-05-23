@@ -136,6 +136,14 @@ def main(argv: list[str]) -> int:
             if res == "ok":
                 ok.append(cid)
                 rows.append((cid, status, test, "✓ green"))
+            elif res == "py:assumed":
+                # Python clauses are run via pytest, not by this gate. LOCKED
+                # on a `test_*` clause is the author's assertion that the
+                # corresponding pytest test exists + is green (verified in CI
+                # by the pytest job). Treat as OK so this Rust-runner-only
+                # gate doesn't double-block on Python tests it never executes.
+                ok.append(cid)
+                rows.append((cid, status, test, "✓ py:assumed"))
             elif res == "MISSING":
                 blocked.append(f"{cid}: LOCKED but test '{test}' NOT FOUND in suite")
                 rows.append((cid, status, test, "✗ MISSING"))

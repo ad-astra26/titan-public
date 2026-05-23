@@ -4494,6 +4494,19 @@ async def post_v4_reload_config(request: Request):
             new_params = tomllib.load(f)
         from ..bus import make_msg
         titan_state.bus.publish(make_msg(bus.CONFIG_RELOAD, "api", "spirit", new_params))
+        # §G5.2 item 5 (D-SPEC-112) — re-publish the trinity-restoring sidecar so
+        # the 6 Rust trinity daemons pick up updated [trinity_restoring] gains
+        # on their next ~1 s retry-load (no restart). Surface failures.
+        try:
+            from titan_hcl.logic.trinity_restoring_publisher import (
+                publish_trinity_restoring_cfg,
+            )
+            publish_trinity_restoring_cfg()
+        except Exception as _e:
+            logger.exception(
+                "[Dashboard] /v4/reload-config: trinity_restoring republish failed: %s",
+                _e,
+            )
         return _ok({"status": "config_reloaded", "sections": list(new_params.keys())})
     except Exception as e:
         logger.error("[Dashboard] /v4/reload-config error: %s", e)

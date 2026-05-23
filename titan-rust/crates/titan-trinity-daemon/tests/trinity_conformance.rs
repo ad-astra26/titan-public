@@ -364,3 +364,323 @@ fn conformance_g5_1_learned_value_net_not_placeholder() {
         "small filter_down is the 65D learned-half engine, not a placeholder"
     );
 }
+
+// ── G5.2-config: gain coefficients sourced from titan_params.toml sidecar ────
+#[test]
+fn conformance_g5_2_gains_from_titan_params_toml() {
+    // The daemon-side path is `load_restoring_cfg(shm_dir, layer)` which reads
+    // `shm_dir/trinity_restoring.bin` (Python L2-published from
+    // `titan_params.toml [trinity_restoring]`) and falls back to the kernel
+    // DEFAULT_* constants only when the sidecar is absent (cold boot).
+    use std::fs;
+    use tempfile::tempdir;
+    use titan_trinity_daemon::{load_restoring_cfg, DEFAULT_K_DRIVE, TRINITY_RESTORING_SIDECAR};
+    let dir = tempdir().unwrap();
+
+    // Absent → kernel default (substrate continues per §11.B).
+    let cfg_default = load_restoring_cfg(dir.path(), Layer::Body);
+    assert!(
+        (cfg_default.k_drive - DEFAULT_K_DRIVE).abs() < 1e-6,
+        "fallback should match kernel default"
+    );
+
+    // Present + valid → values come from TOML-derived sidecar.
+    let path = dir.path().join(TRINITY_RESTORING_SIDECAR);
+    let gains = [0.42_f32, 0.07, 0.06, 0.11, 0.04, 0.55, 1.10, 0.45];
+    let mut bytes = Vec::with_capacity(32);
+    for v in gains.iter() {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    fs::write(&path, &bytes).unwrap();
+    let cfg_tuned = load_restoring_cfg(dir.path(), Layer::Body);
+    assert!(
+        (cfg_tuned.k_drive - 0.42).abs() < 1e-6,
+        "loaded k_drive should reflect sidecar override (got {})",
+        cfg_tuned.k_drive
+    );
+    assert!(
+        (cfg_tuned.a_drift - 1.10).abs() < 1e-6,
+        "loaded a_drift should reflect sidecar override (got {})",
+        cfg_tuned.a_drift
+    );
+}
+
+// ── G5.2-persistence: traveling tensor + observable EMAs survive restart ─────
+#[test]
+fn conformance_g5_2_state_checkpoint_roundtrip() {
+    // SPEC §G5.2 item 4 (Maker override 2026-05-23): the per-part tensor
+    // state (x[t-1], x[t-2]) + the latest 5D observable signature MUST be
+    // checkpointed + reloaded on boot — so a restart never erases the
+    // §G5.2 traveling tensor's journey. The checkpoint module exposes a
+    // single API (`write_for_part` + `load_for_part`) used by all 6 daemons;
+    // a roundtrip per layer (body / mind / spirit dim counts) verifies
+    // the contract end-to-end.
+    use tempfile::tempdir;
+    use titan_trinity_daemon::checkpoint::{load_for_part, write_for_part, CheckpointSnapshot};
+
+    fn sample_obs() -> LayerObs {
+        obs_of(0.65, 0.42, 0.05, -1.0, 0.18)
+    }
+
+    // Body roundtrip (5D).
+    {
+        let dir = tempdir().unwrap();
+        let prev: [f32; 5] = [0.10, 0.20, 0.30, 0.40, 0.50];
+        let prev2: [f32; 5] = [0.11, 0.21, 0.31, 0.41, 0.51];
+        let obs = sample_obs();
+        write_for_part(dir.path(), "inner_body", &prev, &prev2, &obs).unwrap();
+        let snap: CheckpointSnapshot<5> = load_for_part(dir.path(), "inner_body").expect("loaded");
+        assert_eq!(snap.prev, prev);
+        assert_eq!(snap.prev2, prev2);
+        assert!((snap.last_obs.coherence - obs.coherence).abs() < 1e-6);
+        assert!((snap.last_obs.polarity - obs.polarity).abs() < 1e-6);
+    }
+    // Mind roundtrip (15D).
+    {
+        let dir = tempdir().unwrap();
+        let prev: [f32; 15] = std::array::from_fn(|i| (i as f32) * 0.013);
+        let prev2: [f32; 15] = std::array::from_fn(|i| (i as f32) * 0.017);
+        let obs = sample_obs();
+        write_for_part(dir.path(), "outer_mind", &prev, &prev2, &obs).unwrap();
+        let snap: CheckpointSnapshot<15> = load_for_part(dir.path(), "outer_mind").expect("loaded");
+        assert_eq!(snap.prev, prev);
+        assert_eq!(snap.prev2, prev2);
+    }
+    // Spirit roundtrip (45D).
+    {
+        let dir = tempdir().unwrap();
+        let prev: [f32; 45] = std::array::from_fn(|i| ((i as f32) * 0.007) % 1.0);
+        let prev2: [f32; 45] = std::array::from_fn(|i| ((i as f32) * 0.009) % 1.0);
+        let obs = sample_obs();
+        write_for_part(dir.path(), "inner_spirit", &prev, &prev2, &obs).unwrap();
+        let snap: CheckpointSnapshot<45> =
+            load_for_part(dir.path(), "inner_spirit").expect("loaded");
+        assert_eq!(snap.prev, prev);
+        assert_eq!(snap.prev2, prev2);
+        assert!((snap.last_obs.coherence - obs.coherence).abs() < 1e-6);
+    }
+    // Restart-simulation: after the kernel re-spawns the daemon, the next
+    // §G5.2 stateful_update fed (prev, prev2) restored from checkpoint must
+    // produce the SAME output a continuous run would have produced — i.e.
+    // a checkpoint is a true continuation, not a re-seed at 0.5.
+    {
+        let dir = tempdir().unwrap();
+        let prev: [f32; 5] = [0.7, 0.7, 0.7, 0.7, 0.7];
+        let prev2: [f32; 5] = [0.65, 0.65, 0.65, 0.65, 0.65];
+        let obs = obs_of(0.9, 0.55, 0.05, 1.0, 0.4);
+        write_for_part(dir.path(), "outer_body", &prev, &prev2, &obs).unwrap();
+        let snap: CheckpointSnapshot<5> = load_for_part(dir.path(), "outer_body").expect("loaded");
+
+        let cfg = RestoringCfg::for_layer(Layer::Body);
+        let raw = vec![0.7_f32; 5];
+        let enrich = vec![0.0_f32; 5];
+        let x_continuous = stateful_update(&prev, &prev2, &raw, &enrich, &obs, &cfg);
+        let x_restored =
+            stateful_update(&snap.prev, &snap.prev2, &raw, &enrich, &snap.last_obs, &cfg);
+        for i in 0..5 {
+            assert!(
+                (x_continuous[i] - x_restored[i]).abs() < 1e-6,
+                "restored kernel output must match continuous run (dim {i})",
+            );
+        }
+    }
+}
+
+// ── G5.1-down-leg-spirit-pulse: small filter_down trigger reads spirit pulse ─
+#[test]
+fn conformance_g5_1_down_leg_on_spirit_pulse() {
+    // SPEC §G5.1 P0-0a (D-SPEC-112 amendment): the small filter_down DOWN-leg
+    // gates on the spirit sphere-clock PULSE rising-edge read SHM-direct from
+    // `sphere_clocks.bin` (NOT KERNEL_EPOCH_TICK, NOT per Schumann tick).
+    // PulseWatcher must report a rising-edge on the InnerSpirit / OuterSpirit
+    // slot when their pulse_count advances; the spirit daemon's tick_loop
+    // gates on exactly this edge (verified by file-level grep below + the
+    // watcher behavior here).
+    use std::fs::File;
+    use std::io::Write;
+    use std::path::Path;
+    use tempfile::tempdir;
+    use titan_state::Slot;
+    use titan_trinity_daemon::{PulseClockRole, PulseWatcher};
+
+    // Spirit pulse rising edge — only the spirit's edge fires.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("sphere_clocks.bin");
+    let mut slot = Slot::create(&path, 1, 168).unwrap();
+    let mut bytes = vec![0u8; 168];
+    // pulse_count = 0 for all 6.
+    slot.write(&bytes).unwrap();
+    let mut watcher = PulseWatcher::open(dir.path());
+    let _ = watcher.tick(); // seed
+                            // Spirit clock pulses: inner_spirit at file index 2 → byte 2*28+16 = 72.
+    let inner_spirit_off = PulseClockRole::InnerSpirit.count_byte_offset();
+    bytes[inner_spirit_off..inner_spirit_off + 4].copy_from_slice(&1.0_f32.to_le_bytes());
+    slot.write(&bytes).unwrap();
+    let edges = watcher.tick();
+    assert!(
+        edges[PulseClockRole::InnerSpirit.index()],
+        "spirit pulse rising edge must be detected SHM-direct"
+    );
+    assert!(
+        !edges[PulseClockRole::InnerBody.index()],
+        "body did not pulse; no edge expected"
+    );
+
+    // Structural assertion: the inner-spirit + outer-spirit daemons must
+    // NOT gate small filter_down on `epoch_pending` anymore — grep the
+    // tick_loop.rs files for the retired pattern. Block any regression
+    // that resurrects the KERNEL_EPOCH_TICK arm.
+    fn assert_no_epoch_arm(path: &Path) {
+        let s = std::fs::read_to_string(path).expect("read daemon tick_loop.rs");
+        assert!(
+            !s.contains("if epoch_pending.swap(false, Ordering::Relaxed)"),
+            "{}: KERNEL_EPOCH_TICK arm pattern resurfaced — small filter_down \
+             must gate on the spirit sphere-clock PULSE per D-SPEC-112 §G5.1",
+            path.display(),
+        );
+    }
+    // Resolve daemon source paths relative to the crate's source location.
+    // Workspace layout: titan-rust/crates/{titan-inner-spirit-rs,titan-outer-spirit-rs}.
+    // Use CARGO_MANIFEST_DIR so the test runs cleanly under cargo from anywhere.
+    let here = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let crates_dir = std::path::PathBuf::from(here).join("..");
+    assert_no_epoch_arm(&crates_dir.join("titan-inner-spirit-rs/src/tick_loop.rs"));
+    assert_no_epoch_arm(&crates_dir.join("titan-outer-spirit-rs/src/tick_loop.rs"));
+
+    // Belt + suspenders: emit a sentinel file so a CI watchdog can grep
+    // for this test having run — protects against accidental ignore.
+    let mut f = File::create(dir.path().join("g5_1_down_leg_pulsed.ok")).unwrap();
+    let _ = f.write_all(b"ok");
+}
+
+// ── G5.1-up-leg-bonus: body/mind pulse → spirit content additive bonus ───────
+#[test]
+fn conformance_g5_1_up_leg_bonus_on_body_mind_pulse() {
+    // SPEC §G5.1 P0-0a (D-SPEC-112 amendment): on a body/mind sphere-clock
+    // PULSE, an additive snapshot bonus lands on SPIRIT content dims [5:45]
+    // (observer [0:5] excluded per §G8). Replicate the spirit daemon's
+    // composition + kernel call: with a positive body+mind polarity, content
+    // dims must move strictly above the no-pulse baseline; observer dims
+    // must be unchanged.
+    // (Inner-spirit + outer-spirit daemons share the same logic — testing
+    // the shared semantics is sufficient. The amplitude constant
+    // UP_LEG_BONUS_AMPLITUDE = 0.02 is per-daemon-local; mirrored here.)
+    const UP_LEG_AMP: f32 = 0.02;
+    const SPIRIT_DIMS: usize = 45;
+    let body: [f32; 5] = [0.9_f32; 5]; // body polarity = +0.4
+    let mind: [f32; 15] = [0.9_f32; 15]; // mind polarity = +0.4
+                                         // Bonus = 0.02 * (0.4 + 0.4) = 0.016 (clamped within [-1, 1] before scale).
+    let body_polarity = (body.iter().copied().sum::<f32>() / 5.0) - 0.5;
+    let mind_polarity = (mind.iter().copied().sum::<f32>() / 15.0) - 0.5;
+    let signed = UP_LEG_AMP * (body_polarity + mind_polarity).clamp(-1.0, 1.0);
+    assert!(signed > 0.0, "polarised body+mind → positive bonus");
+
+    // Construct enrichment_with_bonus: zeros + add `signed` to content [5..45].
+    let mut enrichment_with_bonus = [0.0_f32; SPIRIT_DIMS];
+    for i in 5..SPIRIT_DIMS {
+        enrichment_with_bonus[i] += signed;
+    }
+    let enrichment_no_pulse = [0.0_f32; SPIRIT_DIMS];
+
+    let cfg = RestoringCfg {
+        k_restore: 0.0,
+        k_damp: 0.0,
+        k_mom: 0.0,
+        k_dir: 0.0,
+        ..RestoringCfg::for_layer(Layer::Spirit)
+    };
+    let prev = vec![CENTRE; SPIRIT_DIMS];
+    let prev2 = vec![CENTRE; SPIRIT_DIMS];
+    let raw = vec![CENTRE; SPIRIT_DIMS]; // drive = 0
+    let obs = obs_of(1.0, 0.5, 0.0, 0.0, 0.0);
+
+    let x_no_pulse = stateful_update(&prev, &prev2, &raw, &enrichment_no_pulse, &obs, &cfg);
+    let x_pulsed = stateful_update(&prev, &prev2, &raw, &enrichment_with_bonus, &obs, &cfg);
+
+    // Observer dims [0..5] — no bonus.
+    for i in 0..5 {
+        assert!(
+            (x_pulsed[i] - x_no_pulse[i]).abs() < 1e-6,
+            "observer dim {i} must NOT receive UP-leg bonus (G8)",
+        );
+    }
+    // Content dims [5..45] — strictly above baseline.
+    for i in 5..SPIRIT_DIMS {
+        assert!(
+            x_pulsed[i] > x_no_pulse[i] + 1e-6,
+            "content dim {i}: UP-leg bonus must raise output (no_pulse={} pulsed={})",
+            x_no_pulse[i],
+            x_pulsed[i],
+        );
+    }
+}
+
+// ── G5.2-focus-input: FOCUS cascade nudge composes via focus_input.bin ───────
+#[test]
+fn conformance_g5_2_focus_input_applied() {
+    // SPEC §G5.2 item 2 + §G12: FOCUS enters every part daemon via a read-only
+    // `focus_input.bin` SHM slot. The nudge is amplified by
+    // `stale_focus_multiplier` (the §G12 SPIRIT→Lower-Spirit→Mind→Body
+    // cascade) and composes into `enrichment_force` — a SEPARATE full-weight
+    // additive per §G5.2 (preserving G5.2-enrichment-separate semantics, NOT
+    // folded into drive). A non-zero focus nudge MUST move the §G5.2 kernel
+    // output away from the no-focus baseline; the amplifier scales the move.
+    use tempfile::tempdir;
+    use titan_state::Slot;
+    use titan_trinity_daemon::{
+        compose_focus_into_enrichment, read_focus_nudge, FocusPart, FOCUS_INPUT_PAYLOAD_BYTES,
+        FOCUS_INPUT_SIDECAR,
+    };
+
+    // Build a payload that nudges inner-body[0] up by +0.10, amplified ×2.0.
+    let mut bytes = vec![0u8; FOCUS_INPUT_PAYLOAD_BYTES];
+    bytes[0..4].copy_from_slice(&0.0_f32.to_le_bytes()); // ts
+    bytes[4..8].copy_from_slice(&2.0_f32.to_le_bytes()); // stale_focus_multiplier
+    bytes[8..12].copy_from_slice(&0.10_f32.to_le_bytes()); // inner_body[0] nudge
+    let dir = tempdir().unwrap();
+    let path = dir.path().join(FOCUS_INPUT_SIDECAR);
+    let mut slot = Slot::create(&path, 1, FOCUS_INPUT_PAYLOAD_BYTES as u32).unwrap();
+    slot.write(&bytes).unwrap();
+
+    // Daemon-side read returns the part's slice + amplifier.
+    let nudge = read_focus_nudge::<5>(Some(&slot), FocusPart::InnerBody);
+    assert_eq!(nudge.stale_focus_multiplier, 2.0);
+    assert!((nudge.nudge[0] - 0.10).abs() < 1e-6);
+
+    // Compose into enrichment + run the §G5.2 kernel — output MUST move
+    // upward vs the no-focus baseline.
+    let mut enrichment = [0.0_f32; 5];
+    compose_focus_into_enrichment(&mut enrichment, &nudge);
+    // Amplified nudge: enrichment[0] = 0.10 * 2.0 = 0.20.
+    assert!(
+        (enrichment[0] - 0.20).abs() < 1e-6,
+        "amplified enrichment should be 0.20 (got {})",
+        enrichment[0]
+    );
+
+    let cfg = RestoringCfg {
+        k_restore: 0.0, // isolate the additive enrichment from spring pull
+        k_damp: 0.0,
+        k_mom: 0.0,
+        k_dir: 0.0,
+        ..RestoringCfg::for_layer(Layer::Body)
+    };
+    let prev = vec![CENTRE; 5];
+    let prev2 = vec![CENTRE; 5];
+    let raw = vec![CENTRE; 5]; // drive = 0
+    let obs = obs_of(1.0, 0.5, 0.0, 0.0, 0.0);
+
+    let x_baseline = stateful_update(&prev, &prev2, &raw, &[0.0_f32; 5], &obs, &cfg);
+    let x_focused = stateful_update(&prev, &prev2, &raw, &enrichment, &obs, &cfg);
+    assert!(
+        x_focused[0] > x_baseline[0] + 1e-4,
+        "FOCUS nudge must move the §G5.2 output upward vs no-focus baseline \
+         (focused={} baseline={})",
+        x_focused[0],
+        x_baseline[0],
+    );
+    // Other dims (no nudge) must be unchanged by focus.
+    for i in 1..5 {
+        assert!((x_focused[i] - x_baseline[i]).abs() < 1e-6);
+    }
+}

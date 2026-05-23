@@ -725,25 +725,10 @@ def _orchestrator_loop(
         publisher.record_completion(epoch_id=epoch_id, completion=completion)
         publisher.publish()
 
-        # MEDITATION_COMPLETE — single broadcast (dst="all"). Per the Rust
-        # broker fanout (§8.2), dst="all" delivers to every subscriber whose
-        # `subscribed_topics` includes the type. Verified current consumers:
-        #   - timechain_worker: broadcast_topic ✓ (block-seal cascade)
-        #   - backup_worker:    broadcast_topic ✓ (personality/soul backup)
-        #   - cognitive_worker: broadcast_topic ✓ (coordinator.meditation_observe)
-        #   - life_force_worker / memory_worker / social_worker: broadcast_topics ✓
-        #   - titan_HCL parent: `subscribe("core", types=[MEDITATION_COMPLETE])`
-        #     in `_meditation_chronicle_loop` — the broadcast topic-filter
-        #     contract delivers dst="all" of that type to this virtual sub.
-        #
-        # This closes BUG-MEDITATION-COMPLETE-FANOUT-STARVES-BROADCAST-SUBSCRIBERS:
-        # the legacy directed fan-out ("spirit","timechain","backup") starved the
-        # 4 workers above (they declared the topic but only dst="all" matches the
-        # broadcast contract). The "spirit" leg was already a dead target after
-        # D-SPEC-116 spirit_worker retirement. The retained dst="all" is the
-        # SPEC-correct broadcast pattern the broadcast_topics declarations imply.
+        # MEDITATION_COMPLETE fan-out (preserves legacy plugin.py:3887-3900 pattern).
         med_payload = dict(completion)
-        _send(send_queue, MEDITATION_COMPLETE, name, "all", med_payload)
+        for dst in ("spirit", "timechain", "backup"):
+            _send(send_queue, MEDITATION_COMPLETE, name, dst, med_payload)
 
         # STUDIO_RENDER_REQUEST(type=meditation) — v1.9.4 §4.K wire-up.
         # Closes the post-§4.D regression where meditation art generation was

@@ -59,7 +59,9 @@ use anyhow::{anyhow, Context, Result};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
-use std::sync::atomic::{AtomicBool, Ordering};
+// std::sync::atomic removed with the KERNEL_EPOCH_TICK arm path (P0-0a §4 —
+// no shim; spirit pulse rising-edge gates the small filter_down DOWN-leg now,
+// detected SHM-direct from sphere_clocks.bin).
 
 use titan_bus::{BusClient, InboundEvent};
 use titan_core::constants::{INNER_SPIRIT_FIRING_MAX_BYTES, INNER_SPIRIT_FIRING_SCHEMA_VERSION};
@@ -67,10 +69,25 @@ use titan_core::small_filter_down::{SmallFilterDownEngine, HALF_DIM};
 use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
-    apply_multipliers, decode_filter_down_payload, encode_floats, observe, read_dim_slice,
-    stateful_update, ContentGate, DriftAggregator, FiringSlotWriter, Layer, RestoringCfg,
+    apply_multipliers, compose_focus_into_enrichment, decode_filter_down_payload, encode_floats,
+    load_checkpoint_for_part, load_restoring_cfg, observe, open_focus_input_if_present,
+    open_neuromod_slot_if_present, read_dim_slice, read_focus_nudge, read_neuromod_gain,
+    stateful_update, write_checkpoint_for_part, CheckpointSnapshot, ContentGate, DriftAggregator,
+    FiringSlotWriter, FocusPart, Layer, PulseClockRole, PulseWatcher, RestoringCfg,
     INNER_SPIRIT_TOPICS,
 };
+
+/// §G5.2 item 4 checkpoint cadence. Inner-spirit ticks @ 70.47 Hz so 720
+/// ticks ≈ 10 s between checkpoint snapshots.
+const CHECKPOINT_WRITE_EVERY_N_TICKS: u64 = 720;
+const CHECKPOINT_PART: &str = "inner_spirit";
+
+/// §G5.1 UP-leg (PLAN §4): per-content-dim additive bonus added to spirit's
+/// enrichment_force when a body/mind sphere-clock pulses. Conservative starting
+/// value — the field is small ([0,1] tensor space) so 0.02 is a noticeable
+/// nudge without dominating drift/spring dynamics. Tunable via
+/// titan_params.toml later when the §3 VERIFY gate observes outer coherence.
+const UP_LEG_BONUS_AMPLITUDE: f32 = 0.02;
 
 const SPIRIT_DIMS: usize = 45;
 const DRIFT_THRESHOLD_PCT: f64 = 0.005;
@@ -91,12 +108,12 @@ pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path, data_dir: &P
         .context("bus subscribe")?;
     info!(event = "BUS_SUBSCRIBED", topics = ?INNER_SPIRIT_TOPICS);
 
-    // Small filter_down learned engine (SPEC §G5.1 / D-SPEC-97) — fired once
-    // per KERNEL_EPOCH_TICK, NOT per Schumann tick. Loads its own per-half
+    // Small filter_down learned engine (SPEC §G5.1 / D-SPEC-112 P0-0a — fires
+    // on the spirit sphere-clock PULSE EDGE read from `sphere_clocks.bin`,
+    // NOT KERNEL_EPOCH_TICK, NOT per Schumann tick). Loads its own per-half
     // trained brain (filter_down_local_inner_*.json) from data_dir.
     let engine = SmallFilterDownEngine::with_defaults(data_dir, "inner")
         .context("init inner small filter_down engine")?;
-    let epoch_pending = Arc::new(AtomicBool::new(false));
 
     let inner_spirit_slot = open_slot(shm_dir, "inner_spirit_45d.bin")?;
     let body_slot = open_slot(shm_dir, "inner_body_5d.bin")?;
@@ -133,15 +150,8 @@ pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path, data_dir: &P
     let dispatcher_state = state.clone();
     let dispatcher_shutdown = shutdown.clone();
     let bus_for_dispatcher = bus.clone();
-    let dispatcher_epoch = epoch_pending.clone();
     let dispatcher = tokio::spawn(async move {
-        run_event_dispatcher(
-            bus_for_dispatcher,
-            dispatcher_state,
-            dispatcher_shutdown,
-            dispatcher_epoch,
-        )
-        .await;
+        run_event_dispatcher(bus_for_dispatcher, dispatcher_state, dispatcher_shutdown).await;
     });
 
     let tick_result = run_tick_loop(
@@ -155,7 +165,7 @@ pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path, data_dir: &P
         sensor_cache_path,
         firing_writer,
         engine,
-        epoch_pending,
+        shm_dir.to_path_buf(),
     )
     .await;
 
@@ -200,7 +210,6 @@ async fn run_event_dispatcher(
     bus: Arc<BusClient>,
     state: Arc<Mutex<DaemonState>>,
     shutdown: Arc<Notify>,
-    epoch_pending: Arc<AtomicBool>,
 ) {
     loop {
         tokio::select! {
@@ -208,11 +217,12 @@ async fn run_event_dispatcher(
             event = bus.recv() => match event {
                 Some(InboundEvent::Message { msg_type, raw_bytes, .. }) => {
                     handle_bus_message(&msg_type, &raw_bytes, &state);
-                    // §G5.1 / D-SPEC-97: kernel epoch boundary → arm the small
-                    // filter_down for the next Schumann tick (consumed once).
-                    if msg_type == "KERNEL_EPOCH_TICK" {
-                        epoch_pending.store(true, Ordering::Relaxed);
-                    }
+                    // §G5.1 / P0-0a (D-SPEC-112): the small filter_down DOWN-leg
+                    // no longer gates on KERNEL_EPOCH_TICK — the spirit sphere
+                    // clock PULSE rising-edge (SHM-direct via PulseWatcher) is
+                    // the canonical trigger now. The KERNEL_EPOCH_TICK subscription
+                    // is intentionally retained (other consumers / health checks)
+                    // but its receipt is no longer routed through this daemon.
                     if msg_type == "KERNEL_SHUTDOWN_ANNOUNCE" {
                         if let Ok(mut s) = state.lock() { s.shutdown_requested = true; }
                         shutdown.notify_waiters();
@@ -261,15 +271,38 @@ async fn run_tick_loop(
     sensor_cache_path: std::path::PathBuf,
     mut firing_writer: FiringSlotWriter,
     mut engine: SmallFilterDownEngine,
-    epoch_pending: Arc<AtomicBool>,
+    shm_dir: std::path::PathBuf,
 ) -> Result<()> {
     let mut content_gate = ContentGate::new();
     // Previous epoch's 65D half-state — the `s` in the TD(0) transition s→s'.
     let mut prev_half: Option<[f64; HALF_DIM]> = None;
     let mut drift_agg = DriftAggregator::new("spirit", DRIFT_THRESHOLD_PCT);
-    // §G5.2 traveling-tensor state (x[t-1], x[t-2]); cold-start at 0.5 centre.
-    let mut prev: [f32; SPIRIT_DIMS] = [0.5; SPIRIT_DIMS];
-    let mut prev2: [f32; SPIRIT_DIMS] = [0.5; SPIRIT_DIMS];
+    // §G5.2 item 4 — restore exact tensor + observable state from checkpoint
+    // on boot; cold-start at 0.5 only when sidecar absent/invalid.
+    let (mut prev, mut prev2, mut last_obs_restored) =
+        match load_checkpoint_for_part::<SPIRIT_DIMS>(&shm_dir, CHECKPOINT_PART) {
+            Some(CheckpointSnapshot {
+                prev,
+                prev2,
+                last_obs,
+                ..
+            }) => (prev, prev2, Some(last_obs)),
+            None => ([0.5_f32; SPIRIT_DIMS], [0.5_f32; SPIRIT_DIMS], None),
+        };
+    // §G5.2 item 5 — gains from titan_params.toml [trinity_restoring] sidecar.
+    let mut cfg = load_restoring_cfg(&shm_dir, Layer::Spirit);
+    // §G5.2 item 2 — live neuromod-gain read per tick.
+    let mut neuromod_slot = open_neuromod_slot_if_present(&shm_dir);
+    let neuromod_path = shm_dir.join("neuromod_state.bin");
+    // §G5.2 item 2 + §G12 — FOCUS cascade nudge slot.
+    let mut focus_input_slot = open_focus_input_if_present(&shm_dir);
+    let focus_input_path = shm_dir.join("focus_input.bin");
+    // §G5.1 Phase 0a (PLAN §4): SHM-direct pulse-edge detector on
+    // `sphere_clocks.bin`. DOWN-leg small filter_down fires on inner_spirit
+    // rising-edge (replaces the old KERNEL_EPOCH_TICK arm — no shim). UP-leg
+    // adds an additive snapshot bonus to spirit's enrichment on body/mind
+    // rising-edge. Retry-open at the same cadence as the other sidecars.
+    let mut pulse_watcher = PulseWatcher::open(&shm_dir);
 
     // Per master plan §7 + C-S3 PLAN §1.1 #2: Schumann timer wheels live in
     // titan-schumann (canonical shared library for trinity daemons).
@@ -303,17 +336,64 @@ async fn run_tick_loop(
                             sensor_cache = Some(slot);
                         }
                     }
+                    if neuromod_slot.is_none() && tick_count.is_multiple_of(retry_every_n) {
+                        if let Ok(slot) = Slot::open(&neuromod_path) {
+                            info!(
+                                event = "NEUROMOD_STATE_OPENED_LATE",
+                                path = %neuromod_path.display(),
+                                tick = tick_count,
+                            );
+                            neuromod_slot = Some(slot);
+                        }
+                    }
+                    if focus_input_slot.is_none() && tick_count.is_multiple_of(retry_every_n) {
+                        if let Ok(slot) = Slot::open(&focus_input_path) {
+                            info!(
+                                event = "FOCUS_INPUT_OPENED_LATE",
+                                path = %focus_input_path.display(),
+                                tick = tick_count,
+                            );
+                            focus_input_slot = Some(slot);
+                        }
+                    }
+                    if !pulse_watcher.is_open() && tick_count.is_multiple_of(retry_every_n) {
+                        pulse_watcher.retry_open(&shm_dir);
+                        if pulse_watcher.is_open() {
+                            info!(event = "PULSE_WATCH_OPENED_LATE", tick = tick_count);
+                        }
+                    }
+                    if tick_count.is_multiple_of(retry_every_n) {
+                        cfg = load_restoring_cfg(&shm_dir, Layer::Spirit);
+                    }
+                    // Per-tick SHM-direct pulse-edge read (PLAN §4 / G5.1).
+                    let pulse_edges = pulse_watcher.tick();
                     let drift_pct = tick_event.jitter_ns() as f64 / tick_event.period_ns as f64;
                     drift_agg.observe(drift_pct, tick_event.jitter_ns(), tick_event.epoch);
                     if let Err(e) = run_one_tick(
                         &bus, &state, &mut content_gate,
-                        &mut engine, &epoch_pending, &mut prev_half,
+                        &mut engine, &mut prev_half,
                         &mut inner_spirit_slot, &body_slot, &mind_slot, &sensor_cache,
                         &mut firing_writer, &mut prev, &mut prev2,
+                        &mut cfg, neuromod_slot.as_ref(), focus_input_slot.as_ref(),
+                        &pulse_edges, &mut last_obs_restored,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
                     tick_count = tick_count.wrapping_add(1);
+                    // §G5.2 item 4 — periodic checkpoint write.
+                    if tick_count.is_multiple_of(CHECKPOINT_WRITE_EVERY_N_TICKS) {
+                        if let Some(o) = last_obs_restored.as_ref() {
+                            if let Err(e) = write_checkpoint_for_part::<SPIRIT_DIMS>(
+                                &shm_dir,
+                                CHECKPOINT_PART,
+                                &prev,
+                                &prev2,
+                                o,
+                            ) {
+                                warn!(err = ?e, "checkpoint write failed (continuing)");
+                            }
+                        }
+                    }
                     if let Ok(s) = state.lock() {
                         if s.shutdown_requested {
                             info!(event = "SHUTDOWN_REQUESTED_VIA_BUS");
@@ -328,6 +408,13 @@ async fn run_tick_loop(
             }
         }
     }
+    if let Some(o) = last_obs_restored.as_ref() {
+        if let Err(e) =
+            write_checkpoint_for_part::<SPIRIT_DIMS>(&shm_dir, CHECKPOINT_PART, &prev, &prev2, o)
+        {
+            warn!(err = ?e, "final checkpoint write failed");
+        }
+    }
     Ok(())
 }
 
@@ -337,7 +424,6 @@ async fn run_one_tick(
     state: &Arc<Mutex<DaemonState>>,
     content_gate: &mut ContentGate,
     engine: &mut SmallFilterDownEngine,
-    epoch_pending: &AtomicBool,
     prev_half: &mut Option<[f64; HALF_DIM]>,
     inner_spirit_slot: &mut Slot,
     body_slot: &Slot,
@@ -346,6 +432,11 @@ async fn run_one_tick(
     firing_writer: &mut FiringSlotWriter,
     prev: &mut [f32; SPIRIT_DIMS],
     prev2: &mut [f32; SPIRIT_DIMS],
+    cfg: &mut RestoringCfg,
+    neuromod_slot: Option<&Slot>,
+    focus_input_slot: Option<&Slot>,
+    pulse_edges: &[bool; 6],
+    last_obs_restored: &mut Option<titan_trinity_daemon::LayerObs>,
 ) -> Result<()> {
     // 1. Observer Principle G8: read sibling body + mind slots.
     let body = read_dim_slice::<5>(body_slot).map_err(|e| anyhow!("read body: {e}"))?;
@@ -401,6 +492,9 @@ async fn run_one_tick(
         s.last_spirit = spirit;
     }
 
+    // Snapshot raw[t] = un-enriched 45D producer output BEFORE filter_down.
+    let raw: [f32; SPIRIT_DIMS] = spirit;
+
     // 4. Apply UNIFIED filter_down to spirit content [5:45] (NOT observer).
     let unified_content = {
         let s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
@@ -417,18 +511,38 @@ async fn run_one_tick(
     //     travel; observer masking is a filter_down-OUTPUT concern per §G8, not
     //     a tensor-state concern). The restoring spring covers spirit's 45D —
     //     the layer GROUND_UP (§G10) deliberately does not reach.
-    let cfg = RestoringCfg::for_layer(Layer::Spirit);
-    // P0-0b kernel signature (§G5.2 ratified): see inner-body for design notes.
+    //     enrichment = filter_down delta on content dims; 0 on observer dims
+    //     (which §G8 forbids from filter_down). Spring is neuromod-modulated
+    //     per §G5.2 item 2 (G5.2-neuromod-gain).
+    let mut enrichment = [0.0_f32; SPIRIT_DIMS];
+    for i in 0..SPIRIT_DIMS {
+        enrichment[i] = spirit[i] - raw[i];
+    }
+    // §G12 FOCUS cascade: amplified nudge composes into enrichment_force.
+    let focus = read_focus_nudge::<SPIRIT_DIMS>(focus_input_slot, FocusPart::InnerSpirit);
+    compose_focus_into_enrichment(&mut enrichment, &focus);
+    // §G5.1 P0-0a UP-leg (PLAN §4): when the inner-body or inner-mind sphere
+    // clock pulses, layer an additive snapshot bonus onto spirit's enrichment
+    // — on top of the continuous structural body+mind read (§G8). Bonus lands
+    // ONLY on content dims [5:45]; observer dims [0:5] never receive enrichment
+    // (G8 / observer principle). Bonus is signed by the post-tick body+mind
+    // mean's polarity around centre, so excited body/mind raise spirit and
+    // suppressed body/mind lower it — i.e. spirit reads body+mind's energy
+    // direction at the pulse moment.
+    if pulse_edges[PulseClockRole::InnerBody.index()]
+        || pulse_edges[PulseClockRole::InnerMind.index()]
+    {
+        let body_polarity = (body.iter().copied().sum::<f32>() / 5.0) - 0.5;
+        let mind_polarity = (mind.iter().copied().sum::<f32>() / 15.0) - 0.5;
+        let signed = UP_LEG_BONUS_AMPLITUDE * (body_polarity + mind_polarity).clamp(-1.0, 1.0);
+        for i in 5..SPIRIT_DIMS {
+            enrichment[i] += signed;
+        }
+    }
+    cfg.neuromod_gain = read_neuromod_gain(neuromod_slot);
     let obs = observe(&prev[..], &prev2[..]);
-    let enrichment_zero = [0.0_f32; 45];
-    let x = stateful_update(
-        &prev[..],
-        &prev2[..],
-        &spirit[..],
-        &enrichment_zero[..],
-        &obs,
-        &cfg,
-    );
+    *last_obs_restored = Some(obs);
+    let x = stateful_update(&prev[..], &prev2[..], &raw[..], &enrichment[..], &obs, cfg);
     let mut spirit_state = [0.0_f32; SPIRIT_DIMS];
     spirit_state.copy_from_slice(&x[..SPIRIT_DIMS]);
     *prev2 = *prev;
@@ -454,15 +568,16 @@ async fn run_one_tick(
         .await
         .map_err(|e| anyhow!("publish SPIRIT_STATE: {e}"))?;
 
-    // 7. Small filter_down — EVENT-gated on KERNEL_EPOCH_TICK (SPEC §G5.1 /
-    //    D-SPEC-97), NOT per Schumann tick. Once per kernel epoch: assemble
-    //    the 65D half-state (body[5] + mind[15] + spirit[45]), feed the
-    //    TD(0) transition s→s', train, compute the learned gradient-attention
-    //    multipliers, and publish INNER_SPIRIT_FILTER_DOWN. The learned
-    //    engine (SmallFilterDownEngine) reshapes + smoothens body/mind toward
-    //    the 0.5 Divine Center so per-layer coherence can cross the balance
-    //    threshold — replacing the inert C-S5 `1.0+(spirit-0.5)*0.1` placeholder.
-    if epoch_pending.swap(false, Ordering::Relaxed) {
+    // 7. Small filter_down DOWN-leg — PULSE-gated on the inner-spirit sphere
+    //    clock rising edge (SPEC §G5.1 amended by D-SPEC-112 / PLAN §4).
+    //    Replaces the prior KERNEL_EPOCH_TICK arm (no shim — deleted). Once
+    //    per spirit pulse: assemble the 65D half-state (body[5] + mind[15] +
+    //    spirit[45]), feed the TD(0) transition s→s', train, compute the
+    //    learned gradient-attention multipliers, publish INNER_SPIRIT_FILTER_DOWN.
+    //    The learned engine (SmallFilterDownEngine) shapes + smoothens body/mind
+    //    toward the 0.5 Divine Center so per-layer coherence can cross the §G11
+    //    balance threshold.
+    if pulse_edges[PulseClockRole::InnerSpirit.index()] {
         let mut half = [0.0_f64; HALF_DIM];
         for (i, &v) in body.iter().enumerate() {
             half[i] = v as f64;
