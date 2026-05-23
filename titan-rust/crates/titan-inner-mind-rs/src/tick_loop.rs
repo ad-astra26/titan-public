@@ -18,9 +18,8 @@ use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
     apply_multipliers, compose_multipliers_default, decode_filter_down_payload,
-    decode_local_filter_down_payload, encode_floats, observe, stateful_update, ContentGate,
-    DriftAggregator, FiringSlotWriter, GroundUpEnricher, Layer, RestoringCfg, Side,
-    INNER_MIND_TOPICS,
+    decode_local_filter_down_payload, encode_floats, stateful_update, ContentGate, DriftAggregator,
+    FiringSlotWriter, GroundUpEnricher, Layer, RestoringCfg, Side, INNER_MIND_TOPICS,
 };
 
 const MIND_DIMS: usize = 15;
@@ -314,18 +313,7 @@ async fn run_one_tick(
 
     // §G5.2 traveling-tensor update (Layer::Mind — gradient .5/.5).
     let cfg = RestoringCfg::for_layer(Layer::Mind);
-    // P0-0b kernel signature (§G5.2 ratified): see inner-body for design notes.
-    // Full raw/enrichment splitting + live neuromod-gain are the next slice.
-    let obs = observe(&prev[..], &prev2[..]);
-    let enrichment_zero = [0.0_f32; 15];
-    let x = stateful_update(
-        &prev[..],
-        &prev2[..],
-        &mind[..],
-        &enrichment_zero[..],
-        &obs,
-        &cfg,
-    );
+    let x = stateful_update(&prev[..], &prev2[..], &mind[..], &cfg);
     let mut mind_state = [0.0_f32; MIND_DIMS];
     mind_state.copy_from_slice(&x[..MIND_DIMS]);
     *prev2 = *prev;

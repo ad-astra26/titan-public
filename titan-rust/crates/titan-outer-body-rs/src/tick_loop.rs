@@ -35,9 +35,9 @@ use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
     apply_multipliers, compose_multipliers_default, decode_local_filter_down_payload,
-    encode_floats, observe, read_sensor_cache, read_topology_outer_lower, stateful_update,
-    ContentGate, FiringSlotWriter, GroundUpEnricher, Layer, PublishThrottle, RestoringCfg,
-    SensorCacheRead, Side, OUTER_BODY_TOPICS,
+    encode_floats, read_sensor_cache, read_topology_outer_lower, stateful_update, ContentGate,
+    FiringSlotWriter, GroundUpEnricher, Layer, PublishThrottle, RestoringCfg, SensorCacheRead,
+    Side, OUTER_BODY_TOPICS,
 };
 
 /// Boot the daemon's runtime + drive the tick loop until SIGTERM /
@@ -405,17 +405,7 @@ async fn run_one_tick(
     //     the producer/drive value for stale fallback; the traveling state `x` is
     //     what is written/published.
     let cfg = RestoringCfg::for_layer(Layer::Body);
-    // P0-0b kernel signature (§G5.2 ratified): see inner-body for design notes.
-    let obs = observe(&prev[..], &prev2[..]);
-    let enrichment_zero = [0.0_f32; 5];
-    let x = stateful_update(
-        &prev[..],
-        &prev2[..],
-        &body[..],
-        &enrichment_zero[..],
-        &obs,
-        &cfg,
-    );
+    let x = stateful_update(&prev[..], &prev2[..], &body[..], &cfg);
     let mut body_state = [0.0_f32; 5];
     body_state.copy_from_slice(&x[..5]);
     *prev2 = *prev;

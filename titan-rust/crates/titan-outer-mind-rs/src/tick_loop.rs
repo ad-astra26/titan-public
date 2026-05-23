@@ -26,9 +26,9 @@ use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
     apply_multipliers, compose_multipliers_default, decode_local_filter_down_payload,
-    encode_floats, observe, read_dim_slice, read_sensor_cache, read_topology_outer_lower,
-    stateful_update, ContentGate, FiringSlotWriter, GroundUpEnricher, Layer, PublishThrottle,
-    RestoringCfg, SensorCacheRead, Side, OUTER_MIND_TOPICS,
+    encode_floats, read_dim_slice, read_sensor_cache, read_topology_outer_lower, stateful_update,
+    ContentGate, FiringSlotWriter, GroundUpEnricher, Layer, PublishThrottle, RestoringCfg,
+    SensorCacheRead, Side, OUTER_MIND_TOPICS,
 };
 
 pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()> {
@@ -396,17 +396,7 @@ async fn run_one_tick(
     // §G5.2 traveling-tensor update (Layer::Mind). `last_mind` keeps the
     // producer/drive value for stale fallback; `x` (traveling state) is written.
     let cfg = RestoringCfg::for_layer(Layer::Mind);
-    // P0-0b kernel signature (§G5.2 ratified): see inner-body for design notes.
-    let obs = observe(&prev[..], &prev2[..]);
-    let enrichment_zero = [0.0_f32; 15];
-    let x = stateful_update(
-        &prev[..],
-        &prev2[..],
-        &mind[..],
-        &enrichment_zero[..],
-        &obs,
-        &cfg,
-    );
+    let x = stateful_update(&prev[..], &prev2[..], &mind[..], &cfg);
     let mut mind_state = [0.0_f32; 15];
     mind_state.copy_from_slice(&x[..15]);
     *prev2 = *prev;

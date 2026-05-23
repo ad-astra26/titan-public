@@ -2689,6 +2689,217 @@ class TitanHCL:
             logger.error("[TitanHCL] guardian RESPONSE publish failed: %s", e)
 
     # ------------------------------------------------------------------
+    # Meditation IQL-dream + chronicle orchestrator (BUG-CHRONICLE-WRITER-DEAD)
+    # ------------------------------------------------------------------
+    async def _meditation_chronicle_loop(self) -> None:
+        """Bus subscriber for MEDITATION_COMPLETE dst="core".
+
+        On every completed meditation cycle this drives the legacy
+        "Phase B: Scholar's Dream" (IQL training via the recorder worker)
+        and, when training actually occurred (non-zero loss), appends a
+        narrative entry to `titan_chronicles.md` + regenerates `titan.md`.
+
+        Both legs were dropped in the §4.D meditation_worker extraction:
+        the IQL-dream trigger became an orphan (RLProxy.dream had no
+        callers) and the chronicle writer was deleted with the legacy
+        in-process meditation_cycle. This loop restores both in the
+        parent — the original home of the meditation cycle and the sole
+        owner of the soul files.
+
+        Each MEDITATION_COMPLETE is dispatched to a separate task: the IQL
+        dream is a 30-90s work-RPC and must not serialize the drain loop
+        (meditation cycles are 6h apart, but the watchdog/manual paths can
+        fire bursts).
+        """
+        try:
+            queue = self.bus.subscribe("core", types=[bus.MEDITATION_COMPLETE])
+        except Exception as e:
+            logger.warning(
+                "[TitanHCL] chronicle handler subscribe failed: %s", e)
+            return
+        logger.info(
+            "[TitanHCL] meditation chronicle loop started — listening for "
+            "MEDITATION_COMPLETE (IQL dream + chronicle)")
+        while True:
+            try:
+                msgs = self.bus.drain(queue, max_msgs=10)
+                for msg in msgs:
+                    if msg.get("type") != bus.MEDITATION_COMPLETE:
+                        continue
+                    asyncio.get_event_loop().create_task(
+                        self._handle_meditation_dream_chronicle(msg))
+                await asyncio.sleep(1.0)  # 1 Hz — meditations are rare
+            except Exception as e:
+                logger.error(
+                    "[TitanHCL] chronicle loop error: %s", e, exc_info=True)
+                await asyncio.sleep(5.0)
+
+    async def _handle_meditation_dream_chronicle(self, msg: dict) -> None:
+        """Run the IQL dream for one MEDITATION_COMPLETE, then chronicle it.
+
+        Mirrors the legacy meditation_cycle Phase B: dream over the
+        optimized ReplayBuffer, and only write to the Chronicle if IQL
+        actually trained (total loss > 0) — a zero-loss dream means the
+        buffer was too small to sample, which is not a reflection-worthy
+        event.
+        """
+        recorder = self._proxies.get("recorder")
+        if recorder is None:
+            logger.warning(
+                "[TitanHCL] chronicle: no recorder proxy — IQL dream skipped")
+            return
+        try:
+            dream_results = await recorder.dream(epochs=50, batch_size=256)
+        except Exception as e:
+            logger.error(
+                "[TitanHCL] chronicle: Scholar's Dream (IQL) failed: %s", e)
+            return
+        total_loss = sum(
+            float(dream_results.get(k, 0.0))
+            for k in ("loss_actor", "loss_qvalue", "loss_value"))
+        if total_loss <= 0.0:
+            logger.info(
+                "[TitanHCL] chronicle: Scholar's Dream produced no training "
+                "(total_loss=0; buffer too small) — skipping Chronicle entry")
+            return
+        try:
+            # File I/O off the event loop (atomic rewrite + soul regen).
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._append_to_chronicle, dream_results)
+        except Exception as e:
+            logger.error("[TitanHCL] chronicle: append failed: %s", e)
+
+    def _append_to_chronicle(self, dream_results: dict) -> None:
+        """Append one narrative meditation entry to `titan_chronicles.md`.
+
+        Ported from the legacy in-process meditation_cycle writer (deleted
+        with `legacy_core` in D-SPEC-109). Two corrections vs the legacy
+        version per the current soul architecture:
+
+          1. Writes to `titan_chronicles.md` (the CHRONICLE source of truth)
+             — NOT directly to `titan.md`. `titan.md` is regenerated from
+             constitution + chronicle by `regenerate_soul_md()`; the legacy
+             direct-to-titan.md write was clobbered on every boot regen.
+          2. Atomic write (tmp + os.replace) per SPEC §11.H.2 — the chronicle
+             is a critical persistent identity file.
+
+        Maps raw IQL losses → self-aware narrative states (the "Cognitive
+        State Mapper"), keeps a rolling window of 50 entries, archives older
+        ones to `data/history/soul_archive.md`, then regenerates `titan.md`.
+        """
+        import os
+        from datetime import datetime
+        from titan_hcl.core.soul import CHRONICLE_PATH, regenerate_soul_md
+
+        chronicle_path = CHRONICLE_PATH  # "titan_chronicles.md" (CWD-relative)
+        archive_path = os.path.join("data", "history", "soul_archive.md")
+        raw_log_path = os.path.join("data", "logs", "scholar_raw.log")
+        os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+        os.makedirs(os.path.dirname(raw_log_path), exist_ok=True)
+
+        actor_loss = float(dream_results.get("loss_actor", 0.0))
+        q_loss = float(dream_results.get("loss_qvalue", 0.0))
+        v_loss = float(dream_results.get("loss_value", 0.0))
+        total_loss = actor_loss + q_loss + v_loss
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        # Raw metrics data log (append-only, unbounded by design — small).
+        with open(raw_log_path, "a", encoding="utf-8") as rf:
+            rf.write(
+                f"[{timestamp}] Raw Loss -> Actor: {actor_loss:.4f}, "
+                f"Q: {q_loss:.4f}, V: {v_loss:.4f}\n")
+
+        # ── Cognitive State Mapper — raw RL metrics → narrative states ──
+        if actor_loss < 0.01:
+            alignment_label, alignment = (
+                "Sovereign Clarity",
+                "Decisions are fully aligned with Prime Directives.")
+        elif actor_loss < 0.1:
+            alignment_label, alignment = (
+                "Converging",
+                "Decisions are converging toward Prime Directive alignment.")
+        elif actor_loss < 0.5:
+            alignment_label, alignment = (
+                "Stabilizing",
+                "Policy is stabilizing; directive integration in progress.")
+        else:
+            alignment_label, alignment = (
+                "Foundational",
+                "Early learning phase; building foundational decision patterns.")
+
+        if q_loss < 0.05:
+            complexity = "Action-value landscape is well-mapped and predictable."
+        elif q_loss < 0.3:
+            complexity = "Navigating moderate conceptual complexity in action evaluation."
+        else:
+            complexity = "High conceptual complexity — exploring unfamiliar action-value territory."
+
+        if v_loss < 0.05:
+            insight = "State valuation is sharp — I can clearly distinguish beneficial from harmful states."
+        elif v_loss < 0.3:
+            insight = "State awareness is developing; value distinctions are becoming clearer with each cycle."
+        else:
+            insight = "State valuation is still forming — many states remain ambiguous in their long-term impact."
+
+        new_entry = (
+            f"[{timestamp}] Meditation Cycle\n"
+            f"* IQL Loss — Actor: {actor_loss:.4f}, Q-Value: {q_loss:.4f}, "
+            f"V-Value: {v_loss:.4f} (Total: {total_loss:.4f})\n"
+            f"* Policy Alignment: {alignment_label} — {alignment}\n"
+            f"* Complexity: {complexity}\n"
+            f"* Insight: \"{insight}\"\n\n"
+        )
+
+        separator = "## The Scholar's Chronicle"
+        try:
+            with open(chronicle_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except FileNotFoundError:
+            content = "# Titan Chronicles\n"
+        if separator not in content:
+            content += f"\n\n{separator}\n"
+
+        header, chronicle = content.split(separator, 1)
+        chronicle = chronicle.strip()
+        entries = [e for e in chronicle.split("\n[") if e.strip()]
+
+        # Rolling window — archive oldest beyond 50.
+        if len(entries) >= 50:
+            if not os.path.exists(archive_path):
+                with open(archive_path, "w", encoding="utf-8") as af:
+                    af.write(
+                        "# Titan Soul Archive\n## Historical Records of the "
+                        "Sage's Growth\nArchived meditation reflections moved "
+                        "from titan_chronicles.md to preserve cognitive "
+                        "efficiency.\n\n")
+            oldest = "[" + entries[0].strip() + "\n\n"
+            with open(archive_path, "a", encoding="utf-8") as af:
+                af.write(oldest)
+            entries = entries[1:]
+
+        rebuilt = "\n".join("[" + e.strip() for e in entries)
+        if rebuilt:
+            rebuilt += "\n\n"
+        rebuilt += new_entry
+
+        new_content = f"{header.rstrip()}\n\n{separator}\n{rebuilt}"
+
+        # Atomic write (SPEC §11.H.2) — tmp + fsync + os.replace.
+        tmp = chronicle_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(new_content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, chronicle_path)
+
+        # Refresh the LLM-context titan.md from constitution + chronicle.
+        regenerate_soul_md()
+        logger.info(
+            "[TitanHCL] chronicle: appended meditation entry "
+            "(total_loss=%.4f, %s) + regenerated titan.md",
+            total_loss, alignment_label)
+
+    # ------------------------------------------------------------------
     # Agency / Sovereignty / Impulse loops + handlers
     # ------------------------------------------------------------------
     # All lifted verbatim from v5_core.py:1218-1585 per PLAN §4.2 Commit 5.
@@ -3396,6 +3607,19 @@ class TitanHCL:
         # command_sender.py finally have a receiver. SPEC §[KERNEL_RPC] +
         # Phase C G19 — work-RPC pattern with rid-routed RESPONSE.
         asyncio.get_event_loop().create_task(self._guardian_handler_loop())
+
+        # Meditation IQL-dream + chronicle orchestrator — parent-side handler
+        # for MEDITATION_COMPLETE dst="core". Restores the legacy parent
+        # meditation_cycle "Phase B: Scholar's Dream" (IQL training) + chronicle
+        # write that were BOTH silently dropped in the §4.D meditation_worker
+        # extraction (BUG-CHRONICLE-WRITER-DEAD + the orphaned IQL-dream
+        # trigger it depends on). Same Phase C "events/commands over bus"
+        # pattern as _guardian_handler_loop. The IQL dream RPC reuses the
+        # already-exempted RLProxy.dream() work-RPC (phase_c_rpc_exemptions.yaml
+        # → recorder/dream, 120s); the chronicle write stays in the parent,
+        # which is the sole owner of the soul files (titan_chronicles.md →
+        # regenerate_soul_md → titan.md).
+        asyncio.get_event_loop().create_task(self._meditation_chronicle_loop())
 
         # Sovereignty listener RETIRED v1.8.3 §4.L (D-SPEC-57, 2026-05-15) —
         # SOVEREIGNTY_EPOCH is now consumed by sovereignty_worker subprocess
