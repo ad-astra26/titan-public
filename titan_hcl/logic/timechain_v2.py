@@ -1132,6 +1132,11 @@ class RuleEvaluator:
         self._total_chi_spent: float = 0.0
         self._total_evaluations: int = 0
         self._total_chi_exhausted: int = 0
+        # Snapshot of the final `variables` dict from the most recent
+        # evaluate() call (Phase 2 D-P2-1 — EngineRecall consumes this to
+        # read candidate $vars from the matched rank_composite action).
+        # Empty when no evaluation has run yet.
+        self._last_variables: dict = {}
 
     # ── Chi accounting ────────────────────────────────────────────────
 
@@ -1235,6 +1240,10 @@ class RuleEvaluator:
             self._total_chi_spent += self._chi_spent
             if self._chi_exhausted:
                 self._total_chi_exhausted += 1
+            # Stash the final variables dict so callers (EngineRecall)
+            # can consume candidate-source $vars from a matched action.
+            # Always overwritten — never leaks state across evaluations.
+            self._last_variables = variables
 
     def _chi_exhausted_action(self) -> dict:
         """Emitted when chi_cap is exceeded mid-evaluation."""

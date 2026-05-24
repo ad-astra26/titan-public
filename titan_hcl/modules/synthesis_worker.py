@@ -15,6 +15,13 @@ What this worker owns:
   3. Plug registries (substrate / truth-oracle / meaning-oracle / proof /
      tool) — instantiated empty in Phase 1; concrete plugs register per
      phase per arch §3.3.
+  4. Phase 2: StandingBundleStore writes (G21 / association_bundles), the
+     post-seal hook's MAINTAIN_BUNDLE consumer.
+  5. Phase 2D: EngineRecall — process-local contract-driven recall
+     coordinator. Constructs its own RuleEvaluator (with index.db R/O
+     handle + lazy FAISS reader) and exposes a process-local accessor
+     so future in-process consumers (agno tool layer, bridge) can use
+     contract-driven recall without a sync bus.request (INV-Syn-2 / G19).
 
 Bus subscriptions:
   • MEMORY_RETRIEVAL_USED — use-gated record_access (INV-Syn-5)
@@ -80,6 +87,33 @@ from titan_hcl.synthesis.standing_store import (
     DEFAULT_RING_SIZE,
     StandingBundleStore,
 )
+from titan_hcl.synthesis.recall import EngineRecall
+
+# Process-local EngineRecall singleton (PLAN §2D). Constructed during
+# synthesis_worker_main boot; exposed via get_engine_recall() so future
+# in-process consumers (e.g. an agno tool wrapper that lives inside this
+# worker) can drive contract-driven recall without a sync bus.request
+# (INV-Syn-2 / G19). Cross-process consumers must NOT use this — they go
+# through BridgeRecall.
+_engine_recall_singleton: Optional[EngineRecall] = None
+_engine_recall_lock = threading.Lock()
+
+
+def get_engine_recall() -> Optional[EngineRecall]:
+    """Return the process-local EngineRecall instance, or None when this
+    process is not the synthesis_worker (the worker is the only writer
+    of `_engine_recall_singleton`). Other processes can publish recall
+    requests on the bus (Phase 3+ surface) or use BridgeRecall directly
+    for the watermark-gated reader path."""
+    with _engine_recall_lock:
+        return _engine_recall_singleton
+
+
+def _set_engine_recall(er: Optional[EngineRecall]) -> None:
+    """Internal — synthesis_worker_main writes the singleton at boot."""
+    global _engine_recall_singleton
+    with _engine_recall_lock:
+        _engine_recall_singleton = er
 
 logger = logging.getLogger(__name__)
 
@@ -350,6 +384,20 @@ class ActivationStore:
     def items_tracked(self) -> int:
         return len(self._cache)
 
+    def bulk_base_level(self, item_ids: list[str]) -> dict[str, float]:
+        """Phase 2 D-P2-1 — bulk activation lookup for EngineRecall's
+        composite-score pass. Returns `{item_id: base_level}` ONLY for
+        items present in the in-memory cache; absent items are omitted
+        (composite_score substitutes cold-start). Pure read; never raises."""
+        out: dict[str, float] = {}
+        cache = self._cache
+        for iid in item_ids:
+            state = cache.get(iid)
+            if state is None:
+                continue
+            out[iid] = state.base_level
+        return out
+
     def close(self) -> None:
         self._conn.close()
 
@@ -524,15 +572,57 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         daemon=True, name=f"synthesis-recompute-{name}")
     rc_thread.start()
 
+    # Phase 2 D-P2-1 EngineRecall — contract-driven recall coordinator.
+    # Lazy-open a read-only sqlite handle on data/timechain/index.db so
+    # the RuleEvaluator's FORK_READ + CROSS_REF ops have a substrate.
+    # The FAISS reader is NOT wired in Phase 2D scope — production
+    # consumers inject a concrete adapter (P2D scope = structure + accessor
+    # + contract-driven recall via direct call with mock-friendly handles).
+    # If index.db is missing (fresh boot, no chain yet), engine_recall
+    # falls back to no-op (returns None on recall) — matches PLAN policy.
+    engine_recall: Optional[EngineRecall] = None
+    try:
+        import sqlite3 as _sqlite3
+        index_db_path = os.path.join(
+            os.path.dirname(db_path) or ".", "timechain", "index.db")
+        index_db_conn = None
+        if os.path.exists(index_db_path):
+            # Read-only URI open — never writes.
+            index_db_conn = _sqlite3.connect(
+                f"file:{index_db_path}?mode=ro", uri=True,
+                check_same_thread=False, timeout=1.0)
+        from titan_hcl.logic.timechain_v2 import RuleEvaluator
+        evaluator = RuleEvaluator(
+            orchestrator=None,
+            faiss_reader=None,    # P2D: caller-injected later (deferred)
+            index_db=index_db_conn,
+        )
+        engine_recall = EngineRecall(
+            rule_evaluator=evaluator,
+            activation_lookup=store.bulk_base_level,
+            embedder=None,        # P2D: lazy-injected by future consumer
+        )
+        _set_engine_recall(engine_recall)
+        logger.info(
+            "[synthesis_worker] EngineRecall constructed — index_db=%s "
+            "faiss=deferred embedder=deferred",
+            "attached" if index_db_conn else "missing")
+    except Exception as exc:
+        logger.warning(
+            "[synthesis_worker] EngineRecall construction failed: %s — "
+            "recall surface will return None (caller falls back)",
+            exc, exc_info=True)
+
     _send(send_queue, MODULE_READY, name, "guardian", {
         "titan_id": titan_id,
         "module": "synthesis_worker",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "schema_version": 1,
-        "spec_ref": "SPEC §25 / D-SPEC-123 + PLAN_synthesis_engine_Phase2.md §2B",
+        "spec_ref": "SPEC §25 / D-SPEC-123 + PLAN_synthesis_engine_Phase2.md §2B+2D",
         "plug_counts": registry.counts(),
         "items_tracked_at_boot": store.items_tracked(),
         "bundles_tracked_at_boot": bundle_store.entities_tracked(),
+        "engine_recall_ready": engine_recall is not None,
     })
     logger.info(
         "[synthesis_worker] MODULE_READY emitted — items_at_boot=%d "
@@ -617,6 +707,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
 
     finally:
         stop_event.set()
+        _set_engine_recall(None)
         try:
             store.close()
         except Exception:
