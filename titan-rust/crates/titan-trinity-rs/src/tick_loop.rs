@@ -221,24 +221,38 @@ impl SubstrateState {
         // Cache for next tick
         self.last_whole_10d = Some(whole_10d);
 
-        // Step 6: tick all 6 sphere clocks. Coherence input per SPEC §G4 +
-        // §G11 + D-SPEC-84 — canonical `layer_coherence` (1 - variance/0.25)
-        // applied to the layer-relevant tensor:
-        //   - inner_body / inner_mind clocks use combined inner-lower 10D coherence
-        //   - outer_body / outer_mind clocks use combined outer-lower 10D coherence
-        //   - inner_spirit / outer_spirit clocks use direct 45D spirit coherence
-        // (Spirit has no lower-topology by design — it IS the higher form per
-        // §G3. The 45D tensor's variance-coherence directly drives the clock.)
-        let inner_coh = inner.observables.coherence;
-        let outer_coh = outer.observables.coherence;
+        // Step 6: tick all 6 sphere clocks. Per SPEC §G4 + §G11 + D-SPEC-84
+        // + D-SPEC-124 (2026-05-24) — each clock reads its OWN layer's tensor
+        // coherence directly via `layer_coherence` (1 - variance/0.25). No
+        // merged scalars, no shared inputs: 6 truly independent coherence
+        // drivers (corrected from the pre-D-SPEC-124 design where body+mind
+        // clocks shared the merged inner-lower 10D scalar from
+        // `inner.observables.coherence`, producing byte-identical clock
+        // state across body and mind). Per Maker call 2026-05-24: the mind
+        // clock observes the FULL 15D mind tensor (not just willing 5D) —
+        // the sphere clock represents the whole mind tensor's subjective
+        // time; ground_up's 5+5 additive scope (§G10) is a separate force
+        // and does NOT constrain coherence-feed scope.
+        let inner_body_coh = layer_coherence(&inputs.inner_body_5d);
+        let inner_mind_coh = layer_coherence(&inputs.inner_mind_15d);
         let inner_spirit_coh = layer_coherence(&inputs.inner_spirit_45d);
+        let outer_body_coh = layer_coherence(&inputs.outer_body_5d);
+        let outer_mind_coh = layer_coherence(&inputs.outer_mind_15d);
         let outer_spirit_coh = layer_coherence(&inputs.outer_spirit_45d);
 
         let mut pulses: Vec<PulseEvent> = Vec::new();
-        if let Some(p) = self.sphere_clocks.inner_body.tick(inner_coh, inputs.dt_s) {
+        if let Some(p) = self
+            .sphere_clocks
+            .inner_body
+            .tick(inner_body_coh, inputs.dt_s)
+        {
             pulses.push(p);
         }
-        if let Some(p) = self.sphere_clocks.inner_mind.tick(inner_coh, inputs.dt_s) {
+        if let Some(p) = self
+            .sphere_clocks
+            .inner_mind
+            .tick(inner_mind_coh, inputs.dt_s)
+        {
             pulses.push(p);
         }
         if let Some(p) = self
@@ -248,10 +262,18 @@ impl SubstrateState {
         {
             pulses.push(p);
         }
-        if let Some(p) = self.sphere_clocks.outer_body.tick(outer_coh, inputs.dt_s) {
+        if let Some(p) = self
+            .sphere_clocks
+            .outer_body
+            .tick(outer_body_coh, inputs.dt_s)
+        {
             pulses.push(p);
         }
-        if let Some(p) = self.sphere_clocks.outer_mind.tick(outer_coh, inputs.dt_s) {
+        if let Some(p) = self
+            .sphere_clocks
+            .outer_mind
+            .tick(outer_mind_coh, inputs.dt_s)
+        {
             pulses.push(p);
         }
         if let Some(p) = self
@@ -440,6 +462,47 @@ mod tests {
         assert!(
             total_pulses > 0,
             "expected at least one pulse over 30 balanced ticks"
+        );
+    }
+
+    /// D-SPEC-124 (SPEC v1.57.0, 2026-05-24): per-layer sphere clock
+    /// coherence feed. Pre-D-SPEC-124, body+mind clocks shared the merged
+    /// `inner.observables.coherence` 10D scalar → body and mind clocks
+    /// traced byte-identically. This regression test pins the invariant:
+    /// given DIFFERENT inner_body_5d and inner_mind_15d tensors with
+    /// distinguishable variance, the body and mind sphere clocks MUST
+    /// diverge (different consecutive_balanced, different radius, different
+    /// pulse_count after enough ticks).
+    #[test]
+    fn body_and_mind_sphere_clocks_diverge_on_different_layer_tensors() {
+        let mut s = SubstrateState::default();
+        let mut inputs = zero_inputs();
+        // inner_body: high variance (incoherent) → low coherence
+        inputs.inner_body_5d = [0.0, 1.0, 0.0, 1.0, 0.0];
+        // inner_mind: uniform (high coherence) → balanced
+        inputs.inner_mind_15d = [0.5; 15];
+        // Spirits zeroed (irrelevant to this test)
+        // Run enough ticks for the mind clock (high coherence) to pulse +
+        // accumulate balanced streak, while body clock (low coherence)
+        // contracts slowly.
+        for _ in 0..30 {
+            let _ = s.body_tick(&inputs);
+        }
+        let body_clk = &s.sphere_clocks.inner_body;
+        let mind_clk = &s.sphere_clocks.inner_mind;
+        assert_ne!(
+            body_clk.consecutive_balanced, mind_clk.consecutive_balanced,
+            "D-SPEC-124: inner_body and inner_mind clocks must diverge given different tensor variances; \
+             pre-D-SPEC-124 they shared inner.observables.coherence and traced identically. \
+             body cons_bal={} mind cons_bal={}",
+            body_clk.consecutive_balanced, mind_clk.consecutive_balanced
+        );
+        // Mind should be more balanced than body
+        assert!(
+            mind_clk.consecutive_balanced > body_clk.consecutive_balanced,
+            "mind (uniform tensor → high coherence) should accumulate more balanced ticks than \
+             body (high-variance tensor → low coherence); got body={} mind={}",
+            body_clk.consecutive_balanced, mind_clk.consecutive_balanced
         );
     }
 
