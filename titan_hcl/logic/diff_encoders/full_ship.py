@@ -139,8 +139,22 @@ def encode_diff(current_path: str, baseline_path: Optional[str] = None,
     reflects the source at T1 but bytes reflect a rotated source at T2.
     """
     snap_path, owned = _race_safe_snapshot(current_path)
-    size = os.path.getsize(snap_path)
-    root = _sha256_file(snap_path)
+    # 2026-05-24 orphan cleanup hygiene: if size/hash computation raises
+    # (source vanished race window — small but real), unlink the
+    # owned snapshot so we don't leak orphan hardlinks. Without this
+    # try/except, orphans accumulate fleet-wide (757 orphans found on
+    # T1 alone before this fix — hardlinks so no disk cost but
+    # filename clutter that scales with backup cadence).
+    try:
+        size = os.path.getsize(snap_path)
+        root = _sha256_file(snap_path)
+    except Exception:
+        if owned:
+            try:
+                os.unlink(snap_path)
+            except OSError:
+                pass
+        raise
     return {
         "diff_mode": "full",
         "patch_path": snap_path,
