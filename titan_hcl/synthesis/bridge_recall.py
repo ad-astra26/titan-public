@@ -213,6 +213,82 @@ class BridgeRecall:
                 continue
         return out
 
+    # ── bundle read (Phase 2 D-P2-4) ──────────────────────────────────
+
+    def read_bundle(
+        self, entity_class: str, entity_id: str, fork: str,
+    ) -> list[dict]:
+        """Read the materialized standing-contract bundle for
+        `(entity_class, entity_id, fork)` via the cross-process snapshot
+        file synthesis_worker exports each recompute pass.
+
+        Returns the bundle list (newest-first list of tx records) when:
+          - the synth_status.bin watermark is fresh, AND
+          - bundle_snapshot.json exists + parses, AND
+          - the composite key is present in the snapshot.
+
+        Returns `[]` on any soft-fail path (stale watermark, missing
+        snapshot, missing key, parse error) — consumers should treat the
+        empty result as "no materialized bundle yet, fall back to a
+        SEARCH" (PLAN_synthesis_engine_Phase2.md §2D engine recall).
+
+        Soft-fail rationale (INV-Syn-4): cross-process readers MUST
+        degrade gracefully when the writer is missing/stale, never raise
+        to the caller.
+        """
+        # Synthesis-bundle snapshot lives next to synthesis.duckdb, NOT
+        # next to titan_memory.duckdb. The two DBs share `data/` (or
+        # data_shadow_<port>/ under TITAN_DATA_DIR) but have distinct
+        # filenames. We resolve the synthesis snapshot path independently
+        # of self._db_path (which points at titan_memory.duckdb for the
+        # P1 activation_lookup path).
+        snapshot_path = self._resolve_bundle_snapshot_path()
+        if not os.path.exists(snapshot_path):
+            return []
+
+        import time as _time
+        if not self.is_fresh(_time.time()):
+            return []
+
+        composite_key = f"{entity_class}|{entity_id}|{fork}"
+
+        with self._duck_lock:
+            # Lazy-cache the bundle snapshot — re-read only on mtime change.
+            try:
+                mtime = os.path.getmtime(snapshot_path)
+                if not hasattr(self, "_bundle_snapshot_cache") \
+                        or self._bundle_snapshot_mtime != mtime:
+                    import json
+                    with open(snapshot_path) as f:
+                        self._bundle_snapshot_cache = json.load(f)
+                    self._bundle_snapshot_mtime = mtime
+            except Exception as exc:
+                if not getattr(self, "_bundle_error_logged", False):
+                    logger.warning(
+                        "[BridgeRecall] bundle snapshot read failed (%s): "
+                        "%s — degrading to empty",
+                        snapshot_path, exc)
+                    self._bundle_error_logged = True
+                return []
+            snapshot = self._bundle_snapshot_cache or {}
+
+        bundles = snapshot.get("bundles", {}) if isinstance(snapshot, dict) else {}
+        result = bundles.get(composite_key, [])
+        if not isinstance(result, list):
+            return []
+        return [dict(r) for r in result if isinstance(r, dict)]
+
+    def _resolve_bundle_snapshot_path(self) -> str:
+        """Resolve `data/bundle_snapshot.json` (or shadow equivalent) —
+        sibling of synthesis.duckdb, NOT of self._db_path
+        (titan_memory.duckdb)."""
+        # Mirror synthesis_worker's path resolution:
+        #   db_path = os.path.join(data_dir, "synthesis.duckdb")
+        #   snapshot_path = os.path.join(data_dir, BUNDLE_SNAPSHOT_NAME)
+        data_dir = os.environ.get("TITAN_DATA_DIR", "data")
+        from titan_hcl.synthesis.standing_store import BUNDLE_SNAPSHOT_NAME
+        return os.path.join(data_dir, BUNDLE_SNAPSHOT_NAME)
+
     def close(self) -> None:
         with self._reader_lock:
             if self._reader is not None:

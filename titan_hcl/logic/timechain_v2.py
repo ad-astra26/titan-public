@@ -45,6 +45,9 @@ FORK_IDS = {
     "main": 0, "declarative": 1, "procedural": 2,
     "episodic": 3, "meta": 4, "conversation": 5,
 }
+# Reverse lookup — used by Phase 2 SC ops to annotate result rows with
+# fork-name for the contract author's convenience.
+_FORK_BY_ID = {v: k for k, v in FORK_IDS.items()}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1043,51 +1046,206 @@ class ContractStore:
 # RuleEvaluator — Non-Turing-complete contract rule interpreter
 # ═══════════════════════════════════════════════════════════════════════
 
+# Phase 2 (D-P2-6) default chi cost table — matches titan_params.toml
+# [synthesis.chi] and arch §22 proposed Chi cost row. Values here are
+# fallbacks for callers that construct RuleEvaluator without injecting
+# costs (tests + embedded use); production wires the params loader.
+DEFAULT_CHI_COSTS: dict[str, float] = {
+    "search":    0.002,
+    "fork_read": 0.001,
+    "diff":      0.0001,
+    "cross_ref": 0.002,
+    "group_by":  0.0005,
+    "recall":    0.001,
+}
+DEFAULT_CHI_CAP: float = 0.01
+
+
 class RuleEvaluator:
     """Evaluates contract rules against a context dict.
 
-    Non-Turing-complete: no loops, no recursion, max 50 rules, max 3 queries.
+    Non-Turing-complete: no loops, no recursion, max 50 rules, max 5 queries.
     Rules evaluated top-to-bottom. First action-producing rule wins.
 
     Rule format: {"op": "IF", "field": "significance", "cmp": "LT", "value": 0.05,
                   "then": {"action": "drop"}}
     Compound: {"op": "AND", "clauses": [...], "then": {"action": "aggregate"}}
+
+    Phase 2 (D-P2-1..8, PLAN_synthesis_engine_Phase2.md) adds five SC ops:
+      SEARCH      — FAISS knn (via injected `faiss_reader`)
+      FORK_READ   — read-only SQL on `data/timechain/index.db`
+      DIFF        — boolean clause comparing two fields by delta
+      CROSS_REF   — references to a TX across forks (block_index.cross_refs)
+      GROUP_BY    — post-pass grouping over a $var list or fork-spec source
+    Each op pays chi from a per-evaluate() budget (cap default 0.01); on
+    overflow, remaining rules short-circuit and the evaluator returns the
+    `chi_budget_exhausted` action (B.5 acceptance gate).
+
+    The substrate handles (faiss_reader, index_db) are *injected* — the
+    evaluator stays substrate-handle-agnostic and works with any duck-typed
+    adapter (production: synthesis_worker wires concrete handles; tests
+    pass mocks). Cf. arch §3.5 "RuleEvaluator stays the in-process
+    executor; the engine never issues sync RPC" (G19).
     """
 
     MAX_RULES = 50
-    MAX_QUERIES = 3
+    MAX_QUERIES = 5   # bumped from 3 in P2 (RECALL/SEARCH/FORK_READ/CROSS_REF/GROUP_BY family)
 
-    def __init__(self, orchestrator=None):
-        self._orchestrator = orchestrator  # For RECALL queries (Consumer API)
+    # SC-op handler dispatch keys (the variable-binding ops — top-level only,
+    # never inside AND/OR/NOT clauses). DIFF is purely a comparison clause
+    # and is dispatched via _eval_condition.
+    _BINDING_OPS = ("RECALL", "SEARCH", "FORK_READ", "CROSS_REF", "GROUP_BY")
+
+    def __init__(
+        self,
+        orchestrator=None,
+        faiss_reader=None,
+        index_db=None,
+        chi_costs: Optional[dict[str, float]] = None,
+        chi_cap: float = DEFAULT_CHI_CAP,
+    ):
+        """
+        Args:
+            orchestrator: Consumer-API holder for RECALL queries (existing).
+            faiss_reader: Duck-typed adapter with
+                `.knn(fork, vec, k, min_similarity) -> list[dict]` —
+                used by SEARCH (D-P2-3). Concrete impl wired in 2D.
+            index_db: A read-only sqlite3.Connection on
+                `data/timechain/index.db` (or `:memory:` for tests).
+                Used by FORK_READ + CROSS_REF.
+            chi_costs: Per-op chi cost dict (lowercase op names ->
+                float). Defaults to DEFAULT_CHI_COSTS.
+            chi_cap: Hard cap on aggregate chi any single evaluate()
+                call may spend. Defaults to DEFAULT_CHI_CAP (0.01).
+        """
+        self._orchestrator = orchestrator
+        self._faiss_reader = faiss_reader
+        self._index_db = index_db
+        self._chi_costs = dict(DEFAULT_CHI_COSTS)
+        if chi_costs:
+            self._chi_costs.update({k.lower(): float(v) for k, v in chi_costs.items()})
+        self._chi_cap = float(chi_cap)
+        # Per-evaluate() state (reset on entry to evaluate()).
+        self._chi_spent: float = 0.0
+        self._chi_exhausted: bool = False
+        # Per-instance aggregated stats (for ContractStore.get_stats()).
+        self._total_chi_spent: float = 0.0
+        self._total_evaluations: int = 0
+        self._total_chi_exhausted: int = 0
+
+    # ── Chi accounting ────────────────────────────────────────────────
+
+    def _spend_chi(self, op_name: str) -> bool:
+        """Charge the cost of `op_name` to the current evaluate() budget.
+
+        Returns True if there is budget left after the spend, False if the
+        cap is exceeded (caller should short-circuit + emit
+        chi_budget_exhausted).
+        """
+        cost = self._chi_costs.get(op_name.lower(), 0.0)
+        self._chi_spent += cost
+        if self._chi_spent > self._chi_cap:
+            self._chi_exhausted = True
+            return False
+        return True
+
+    def get_stats(self) -> dict:
+        """Aggregate chi accounting stats — surfaced by ContractStore for
+        the B.5 acceptance gate."""
+        return {
+            "total_chi_spent": self._total_chi_spent,
+            "total_evaluations": self._total_evaluations,
+            "total_chi_exhausted": self._total_chi_exhausted,
+            "chi_cap": self._chi_cap,
+            "chi_costs": dict(self._chi_costs),
+        }
+
+    # ── Evaluate ──────────────────────────────────────────────────────
 
     def evaluate(self, rules: list[dict], context: dict,
                  genesis_states: list[dict] = None) -> Optional[dict]:
-        """Evaluate rules against context. Returns action dict or None."""
+        """Evaluate rules against context. Returns action dict or None.
+
+        Phase 2: per-call chi accounting + variable-binding SC ops
+        (SEARCH/FORK_READ/CROSS_REF/GROUP_BY join RECALL). On chi-budget
+        overflow, returns `{"action": "chi_budget_exhausted", ...}` and
+        stops processing remaining rules.
+        """
         if len(rules) > self.MAX_RULES:
             logger.warning("[RuleEval] Contract exceeds %d rule limit", self.MAX_RULES)
             return None
 
-        variables = {}
+        # Reset per-call chi accounting.
+        self._chi_spent = 0.0
+        self._chi_exhausted = False
+        self._total_evaluations += 1
+
+        variables: dict = {}
         query_count = 0
 
-        for rule in rules:
-            op = rule.get("op", "").upper()
+        try:
+            for rule in rules:
+                op = rule.get("op", "").upper()
 
-            # Variable binding (RECALL query)
-            if op == "RECALL" and query_count < self.MAX_QUERIES:
-                query_count += 1
-                result = self._exec_recall(rule, context)
-                store_as = rule.get("store", "")
-                if store_as.startswith("$"):
-                    variables[store_as] = result
-                continue
+                # Variable-binding ops (SC ops + legacy RECALL).
+                if op in self._BINDING_OPS:
+                    if query_count >= self.MAX_QUERIES:
+                        logger.warning(
+                            "[RuleEval] Query cap %d hit; skipping %s",
+                            self.MAX_QUERIES, op)
+                        continue
+                    query_count += 1
+                    # Pay chi BEFORE execution (so budget is honored even
+                    # if substrate handle fails / returns empty).
+                    if not self._spend_chi(op):
+                        return self._chi_exhausted_action()
+                    result = self._exec_binding_op(op, rule, context, variables)
+                    store_as = rule.get("store", "")
+                    if isinstance(store_as, str) and store_as.startswith("$"):
+                        variables[store_as] = result
+                    continue
 
-            # Evaluate condition
-            matched = self._eval_condition(rule, context, variables, genesis_states)
-            if matched:
-                action = rule.get("then", {})
-                if action and action.get("action"):
-                    return action
+                # DIFF clause (top-level) — pay chi then evaluate as condition.
+                if op == "DIFF":
+                    if not self._spend_chi("diff"):
+                        return self._chi_exhausted_action()
+                    # Fall through to _eval_condition which handles DIFF.
+
+                # Evaluate condition.
+                matched = self._eval_condition(rule, context, variables, genesis_states)
+                if matched:
+                    action = rule.get("then", {})
+                    if action and action.get("action"):
+                        return action
+            return None
+        finally:
+            self._total_chi_spent += self._chi_spent
+            if self._chi_exhausted:
+                self._total_chi_exhausted += 1
+
+    def _chi_exhausted_action(self) -> dict:
+        """Emitted when chi_cap is exceeded mid-evaluation."""
+        return {
+            "action": "chi_budget_exhausted",
+            "spent": round(self._chi_spent, 6),
+            "cap": self._chi_cap,
+        }
+
+    def _exec_binding_op(self, op: str, rule: dict, ctx: dict,
+                          variables: dict) -> Any:
+        """Dispatch to the binding op handler (RECALL/SEARCH/FORK_READ/
+        CROSS_REF/GROUP_BY). Returns the result list/value to be stored
+        in `$var` per the rule's `store` field."""
+        if op == "RECALL":
+            return self._exec_recall(rule, ctx)
+        if op == "SEARCH":
+            return self._exec_search(rule, ctx, variables)
+        if op == "FORK_READ":
+            return self._exec_fork_read(rule, ctx, variables)
+        if op == "CROSS_REF":
+            return self._exec_cross_ref(rule, ctx, variables)
+        if op == "GROUP_BY":
+            return self._exec_group_by(rule, ctx, variables)
         return None
 
     def _eval_condition(self, rule: dict, ctx: dict, variables: dict,
@@ -1106,6 +1264,8 @@ class RuleEvaluator:
         elif op == "NOT":
             inner = rule.get("clause", {})
             return not self._eval_condition(inner, ctx, variables, genesis_states)
+        elif op == "DIFF":
+            return self._eval_diff_clause(rule, ctx, variables)
         elif op in ("TREND", "DELTA", "SINCE", "STATE_AT"):
             return self._eval_genesis_primitive(op, rule, ctx, genesis_states)
         return False
@@ -1123,7 +1283,7 @@ class RuleEvaluator:
 
         # Resolve target if it's a variable reference
         if isinstance(target, str) and target.startswith("$"):
-            target = variables.get(target)
+            target = self._resolve_field(target, ctx, variables)
 
         try:
             if cmp_op == "GT":
@@ -1147,19 +1307,68 @@ class RuleEvaluator:
                     return target[0] <= float(actual) <= target[1]
             elif cmp_op == "STARTSWITH":
                 return str(actual).startswith(str(target))
+            elif cmp_op == "STARTSWITH_ANY":
+                # `actual` may be a list (e.g., tags); match if ANY element
+                # startswith `target` (or any element of target if target is
+                # a list). Phase 2 D-P2-7 — used by `actr_user_conversation_bundle`
+                # to match TX tags carrying `user:<hash>`.
+                if isinstance(actual, (list, tuple, set)):
+                    items = [str(x) for x in actual]
+                else:
+                    items = [str(actual)]
+                prefixes = target if isinstance(target, (list, tuple, set)) else [target]
+                prefixes = [str(p) for p in prefixes]
+                return any(item.startswith(p) for item in items for p in prefixes)
         except (TypeError, ValueError):
             return False
         return False
 
     def _resolve_field(self, field: str, ctx: dict, variables: dict):
-        """Resolve a dotted field path or variable from context."""
+        """Resolve a dotted field path or variable from context.
+
+        Phase 2: supports `$var.subkey` (dotted suffix on a variable) and
+        list pseudo-attrs (`.length`/`.count`/`.first`/`.last`) — enables
+        rules like `{op:IF, field:"$traces.length", cmp:GTE, value:10}`
+        (the proposer contract pattern).
+        """
+        if not isinstance(field, str):
+            return None
         if field.startswith("$"):
-            return variables.get(field)
-        parts = field.split(".")
-        val = ctx
-        for p in parts:
+            # Split into $head and dotted tail.
+            head, _, tail = field.partition(".")
+            val = variables.get(head)
+            if not tail:
+                return val
+            return self._walk_path(val, tail)
+        return self._walk_path(ctx, field)
+
+    @staticmethod
+    def _walk_path(val: Any, dotted_path: str) -> Any:
+        """Walk a dotted path on `val`, supporting list pseudo-attrs."""
+        if not dotted_path:
+            return val
+        for p in dotted_path.split("."):
+            if val is None:
+                return None
             if isinstance(val, dict):
                 val = val.get(p)
+            elif isinstance(val, (list, tuple)):
+                # List pseudo-attrs (cheap, no recursion).
+                if p in ("length", "count"):
+                    return len(val)
+                if p == "first":
+                    val = val[0] if val else None
+                elif p == "last":
+                    val = val[-1] if val else None
+                else:
+                    # Numeric index support: `$traces.0.tx_hash`.
+                    try:
+                        idx = int(p)
+                        val = val[idx] if -len(val) <= idx < len(val) else None
+                    except ValueError:
+                        return None
+            elif hasattr(val, p):
+                val = getattr(val, p)
             else:
                 return None
         return val
@@ -1197,6 +1406,307 @@ class RuleEvaluator:
         except Exception as e:
             logger.error("[RuleEval] RECALL query failed: %s", e, exc_info=True)
             return None
+
+    # ── Phase 2 SC op handlers (D-P2-1..8) ────────────────────────────
+
+    def _exec_search(self, rule: dict, ctx: dict, variables: dict) -> list[dict]:
+        """SEARCH — semantic similarity over a fork via FAISS (arch §12.1).
+
+        Schema: {op:"SEARCH", fork, query_embedding:"$var"|[...], limit,
+                 min_similarity, store:"$var"}
+        Returns list of {"tx_hash":..., "score":..., "fork":...} dicts.
+        Soft-fails to [] on missing reader / invalid embedding / handler error
+        (the contract author is responsible for testing emptiness via $var.length).
+        """
+        if not self._faiss_reader:
+            logger.debug("[RuleEval/SEARCH] no faiss_reader injected — returning []")
+            return []
+        fork = rule.get("fork", "auto")
+        qe = rule.get("query_embedding")
+        if isinstance(qe, str) and qe.startswith("$"):
+            qe = self._resolve_field(qe, ctx, variables)
+        if not isinstance(qe, (list, tuple)) or not qe:
+            logger.warning("[RuleEval/SEARCH] missing/invalid query_embedding — returning []")
+            return []
+        limit = int(rule.get("limit", 50))
+        min_sim = float(rule.get("min_similarity", 0.0))
+        try:
+            return list(self._faiss_reader.knn(
+                fork=fork, vec=list(qe), k=limit, min_similarity=min_sim))
+        except Exception as e:
+            logger.error("[RuleEval/SEARCH] knn failed: %s", e, exc_info=True)
+            return []
+
+    # FORK_READ whitelisted filter columns — guards against SQL injection.
+    _FORK_READ_COLS = (
+        "thought_type", "source", "significance", "chi_spent", "epoch_id",
+    )
+
+    def _exec_fork_read(self, rule: dict, ctx: dict, variables: dict) -> list[dict]:
+        """FORK_READ — cross-fork query on `data/timechain/index.db` (arch §12.1).
+
+        Schema: {op:"FORK_READ", fork, filter:{tags_include?, source?,
+                 thought_type?, significance_min?}, since_epoch?,
+                 since_hours?, limit, store:"$var"}
+        Returns list of block_index row dicts.
+        """
+        if not self._index_db:
+            logger.debug("[RuleEval/FORK_READ] no index_db injected — returning []")
+            return []
+        fork = rule.get("fork", "")
+        fork_id = FORK_IDS.get(fork) if fork else None
+        if fork and fork_id is None:
+            logger.warning("[RuleEval/FORK_READ] unknown fork %r — returning []", fork)
+            return []
+        limit = int(rule.get("limit", 50))
+        filt = rule.get("filter") or {}
+
+        # Resolve $var values in filter dict (e.g. {"source": "$current_source"}).
+        resolved_filt = {}
+        for k, v in filt.items():
+            if isinstance(v, str) and v.startswith("$"):
+                resolved_filt[k] = self._resolve_field(v, ctx, variables)
+            else:
+                resolved_filt[k] = v
+
+        conds = []
+        params: list = []
+        if fork_id is not None:
+            conds.append("fork_id = ?")
+            params.append(fork_id)
+        # Recency: since_epoch wins, else since_hours converted.
+        since_epoch = rule.get("since_epoch")
+        if since_epoch is None and rule.get("since_hours"):
+            # Approximate epochs/hour — same as Orchestrator.recall (~1600/h on T1).
+            since_epoch = self._estimate_since_epoch(rule.get("since_hours", 0))
+        if since_epoch:
+            conds.append("epoch_id >= ?")
+            params.append(int(since_epoch))
+        if resolved_filt.get("thought_type"):
+            conds.append("thought_type = ?")
+            params.append(str(resolved_filt["thought_type"]))
+        if resolved_filt.get("source"):
+            conds.append("source = ?")
+            params.append(str(resolved_filt["source"]))
+        if resolved_filt.get("significance_min") is not None:
+            conds.append("significance >= ?")
+            params.append(float(resolved_filt["significance_min"]))
+        # tags_include: substring match on the comma/JSON-encoded tags column.
+        if resolved_filt.get("tags_include"):
+            tags = resolved_filt["tags_include"]
+            if isinstance(tags, str):
+                tags = [tags]
+            for tag in tags:
+                conds.append("tags LIKE ?")
+                params.append(f"%{tag}%")
+
+        where = " AND ".join(conds) if conds else "1=1"
+        sql = (
+            "SELECT block_hash, fork_id, block_height, epoch_id, thought_type, "
+            "source, significance, chi_spent, tags, db_ref "
+            f"FROM block_index WHERE {where} "
+            "ORDER BY epoch_id DESC LIMIT ?"
+        )
+        params.append(limit)
+
+        try:
+            cur = self._index_db.execute(sql, params)
+            cols = [d[0] for d in cur.description]
+            rows = []
+            for row in cur.fetchall():
+                d = dict(zip(cols, row))
+                bh = d.get("block_hash")
+                if isinstance(bh, (bytes, bytearray)):
+                    d["block_hash"] = bytes(bh).hex()
+                # Resolve fork_id → fork name for caller convenience.
+                fid = d.get("fork_id")
+                if fid is not None:
+                    d["fork"] = _FORK_BY_ID.get(int(fid), str(fid))
+                rows.append(d)
+            return rows
+        except Exception as e:
+            logger.error("[RuleEval/FORK_READ] SQL failed: %s", e, exc_info=True)
+            return []
+
+    def _exec_cross_ref(self, rule: dict, ctx: dict, variables: dict) -> list[dict]:
+        """CROSS_REF — references to a TX across forks (arch §12.1).
+
+        Schema: {op:"CROSS_REF", tx_hash:"$var"|<hex>, in_forks?:[...],
+                 via_field:parent_chat_tx|compiled_from|composed_from|
+                          linked_hashes,
+                 limit, store:"$var"}
+        Returns list of block_index rows that reference the given tx_hash
+        (substring match on `cross_refs` text column or `db_ref` field;
+        Phase 4 enriches with payload-edge lookup).
+        """
+        if not self._index_db:
+            logger.debug("[RuleEval/CROSS_REF] no index_db injected — returning []")
+            return []
+        tx_hash = rule.get("tx_hash")
+        if isinstance(tx_hash, str) and tx_hash.startswith("$"):
+            tx_hash = self._resolve_field(tx_hash, ctx, variables)
+        if not tx_hash:
+            return []
+        tx_hash_str = str(tx_hash)
+        via_field = str(rule.get("via_field", "linked_hashes"))
+        in_forks = rule.get("in_forks") or []
+        limit = int(rule.get("limit", 20))
+
+        conds = ["cross_refs LIKE ?"]
+        params: list = [f"%{tx_hash_str}%"]
+        if in_forks:
+            fork_ids = [FORK_IDS[f] for f in in_forks if f in FORK_IDS]
+            if fork_ids:
+                placeholders = ",".join("?" * len(fork_ids))
+                conds.append(f"fork_id IN ({placeholders})")
+                params.extend(fork_ids)
+        sql = (
+            "SELECT block_hash, fork_id, block_height, epoch_id, thought_type, "
+            "source, significance, tags, cross_refs "
+            f"FROM block_index WHERE {' AND '.join(conds)} "
+            "ORDER BY epoch_id DESC LIMIT ?"
+        )
+        params.append(limit)
+
+        try:
+            cur = self._index_db.execute(sql, params)
+            cols = [d[0] for d in cur.description]
+            rows = []
+            for row in cur.fetchall():
+                d = dict(zip(cols, row))
+                bh = d.get("block_hash")
+                if isinstance(bh, (bytes, bytearray)):
+                    d["block_hash"] = bytes(bh).hex()
+                fid = d.get("fork_id")
+                if fid is not None:
+                    d["fork"] = _FORK_BY_ID.get(int(fid), str(fid))
+                d["via_field"] = via_field
+                rows.append(d)
+            return rows
+        except Exception as e:
+            logger.error("[RuleEval/CROSS_REF] SQL failed: %s", e, exc_info=True)
+            return []
+
+    def _exec_group_by(self, rule: dict, ctx: dict, variables: dict) -> list[dict]:
+        """GROUP_BY — post-pass grouping over a $var list or fork-spec source
+        (arch §12.1, D-P2-2).
+
+        Schema: {op:"GROUP_BY", source:"$var"|{fork,filter,...}, group_by:<field>,
+                 agg:count|sum|avg|max|min, agg_field?, having?:{cmp,value},
+                 limit, store:"$var"}
+        Returns list of {"group_key":..., "count":..., "agg":..., "members":[...]}.
+        """
+        # Resolve source: either a $var (already a list) or a nested fork-spec
+        # which we read via _exec_fork_read.
+        source = rule.get("source")
+        if isinstance(source, str) and source.startswith("$"):
+            records = self._resolve_field(source, ctx, variables)
+        elif isinstance(source, dict):
+            # Inline FORK_READ; do NOT recurse into chi (the GROUP_BY cost
+            # already accounts for the loaded-set pass; if the source
+            # references the index_db, the caller should issue a separate
+            # FORK_READ rule and pass the $var instead).
+            sub_rule = dict(source)
+            sub_rule["op"] = "FORK_READ"
+            records = self._exec_fork_read(sub_rule, ctx, variables)
+        else:
+            records = []
+
+        if not isinstance(records, (list, tuple)) or not records:
+            return []
+
+        group_field = rule.get("group_by", "")
+        if not group_field:
+            return []
+
+        agg_kind = str(rule.get("agg", "count")).lower()
+        agg_field = rule.get("agg_field")
+        having = rule.get("having") or {}
+        limit = int(rule.get("limit", 50))
+
+        buckets: dict[Any, list[dict]] = {}
+        for r in records:
+            # Support dict records or arbitrary objects via _walk_path.
+            key = self._walk_path(r, group_field)
+            if key is None:
+                continue
+            # Make keys hashable: list → tuple; dict → JSON str.
+            if isinstance(key, list):
+                key = tuple(key)
+            elif isinstance(key, dict):
+                key = json.dumps(key, sort_keys=True)
+            buckets.setdefault(key, []).append(r)
+
+        results: list[dict] = []
+        for key, members in buckets.items():
+            count = len(members)
+            agg_value: Any = count
+            if agg_kind != "count" and agg_field:
+                vals = []
+                for m in members:
+                    v = self._walk_path(m, agg_field)
+                    try:
+                        vals.append(float(v))
+                    except (TypeError, ValueError):
+                        pass
+                if vals:
+                    if agg_kind == "sum":
+                        agg_value = sum(vals)
+                    elif agg_kind == "avg":
+                        agg_value = sum(vals) / len(vals)
+                    elif agg_kind == "max":
+                        agg_value = max(vals)
+                    elif agg_kind == "min":
+                        agg_value = min(vals)
+                else:
+                    agg_value = 0.0
+            # Apply HAVING filter on count (default) or on agg value.
+            if having:
+                cmp_op = str(having.get("cmp", "GTE")).upper()
+                threshold = having.get("value", 0)
+                target = agg_value if agg_kind != "count" else count
+                if not self._simple_compare(target, cmp_op, threshold):
+                    continue
+            results.append({
+                "group_key": key,
+                "count": count,
+                "agg": agg_value,
+                "members": members,
+            })
+        # Stable ordering: by descending count, then by string-key.
+        results.sort(key=lambda d: (-d["count"], str(d["group_key"])))
+        return results[:limit]
+
+    def _eval_diff_clause(self, rule: dict, ctx: dict, variables: dict) -> bool:
+        """DIFF — boolean clause comparing two fields by delta (arch §12.1).
+
+        Schema: {op:"DIFF", field_a, field_b, cmp:GT|LT|GTE|LTE|EQ|NEQ, value}
+            → boolean: _simple_compare(float(field_a) - float(field_b), cmp, value)
+        If `value` omitted, treat as `cmp != EQ vs 0` (i.e. "did anything change").
+        """
+        a = self._resolve_field(rule.get("field_a", ""), ctx, variables)
+        b = self._resolve_field(rule.get("field_b", ""), ctx, variables)
+        if a is None or b is None:
+            return False
+        try:
+            delta = float(a) - float(b)
+        except (TypeError, ValueError):
+            return False
+        cmp_op = str(rule.get("cmp", "NEQ")).upper()
+        target = rule.get("value", 0)
+        return self._simple_compare(delta, cmp_op, target)
+
+    # ── Helpers ───────────────────────────────────────────────────────
+
+    def _estimate_since_epoch(self, since_hours: float) -> int:
+        """Approximate epoch-clock back-walk. Uses ~1600 epochs/hour (T1)."""
+        if not self._orchestrator:
+            return 0
+        try:
+            current = int(getattr(self._orchestrator, "_current_epoch", 0))
+        except Exception:
+            current = 0
+        return max(0, current - int(float(since_hours) * 1600))
 
     def _eval_genesis_primitive(self, op: str, rule: dict, ctx: dict,
                                 genesis_states: list[dict] = None) -> bool:
@@ -1811,6 +2321,179 @@ class BlockBuilder:
         # creation only happens on the first slimmed seal.
         self._content_store = content_store
         self._cas_slimming = bool(config.get("cas_payload_slimming_enabled", False))
+        # Phase 2 D-P2-4 post-seal contract hook attachments. None until
+        # Orchestrator wires set_post_seal_hook() — keeps the BlockBuilder
+        # constructor backward-compatible with existing tests.
+        self._contract_store: Optional["ContractStore"] = None
+        self._rule_evaluator: Optional[RuleEvaluator] = None
+        self._post_seal_evals = 0
+        self._post_seal_hits = 0
+        self._maintain_bundle_emits = 0
+
+    def set_post_seal_hook(self, contract_store: "ContractStore",
+                            rule_evaluator: RuleEvaluator) -> None:
+        """Attach the post-seal contract hook (Phase 2 D-P2-4). Called by
+        Orchestrator after both ContractStore and RuleEvaluator are
+        constructed. Once attached, every successfully-committed block
+        triggers per-TX evaluation of active `trigger`-type contracts
+        whose `triggers` include `tx_sealed` and whose then.action is
+        `maintain_bundle`; matches emit MAINTAIN_BUNDLE on the bus."""
+        self._contract_store = contract_store
+        self._rule_evaluator = rule_evaluator
+
+    def _emit_maintain_bundle_events(
+        self, all_txs: list[Transaction], fork_name: str,
+        block, send_queue, worker_name: str,
+    ) -> None:
+        """Per-TX evaluation of active maintain_bundle contracts (D-P2-4).
+
+        For every TX in the sealed block, build a per-TX context dict and
+        evaluate every active `trigger` contract whose triggers include
+        "tx_sealed". When a contract returns an action with
+        `action="maintain_bundle"`, extract the entity_id per the action's
+        `entity_id_from` micro-DSL and publish MAINTAIN_BUNDLE for the
+        synthesis_worker consumer.
+
+        Soft-fail policy: any exception during evaluation logs + is swallowed
+        — sealing must not fail because a standing contract is broken.
+        """
+        if not (self._contract_store and self._rule_evaluator and send_queue):
+            return
+        try:
+            triggers = [
+                c for c in self._contract_store.get_all()
+                if c.status == "active" and c.contract_type == "trigger"
+                and "tx_sealed" in (c.triggers or [])
+            ]
+        except Exception as exc:
+            logger.warning(
+                "[BlockBuilder/post_seal] contract enumeration failed: %s",
+                exc, exc_info=True)
+            return
+        if not triggers:
+            return
+
+        block_hash_hex = block.block_hash.hex() if block else ""
+        block_height = block.header.block_height if block else 0
+
+        for tx in all_txs:
+            tags = list(tx.tags or [])
+            ctx = {
+                "event": "tx_sealed",
+                "fork": fork_name,
+                "fork_id": FORK_IDS.get(fork_name, -1),
+                "thought_type": tx.tx_type,
+                "source": tx.source,
+                "significance": tx.significance,
+                "epoch_id": tx.epoch_id,
+                "tags": tags,
+                "tx_hash": tx.tx_hash.hex() if tx.tx_hash else "",
+                "block_hash": block_hash_hex,
+                "block_height": block_height,
+                "ts": tx.timestamp,
+            }
+            for contract in triggers:
+                self._post_seal_evals += 1
+                try:
+                    action = self._rule_evaluator.evaluate(
+                        contract.rules, ctx)
+                except Exception as exc:
+                    logger.debug(
+                        "[BlockBuilder/post_seal] contract %s eval failed: %s",
+                        contract.contract_id, exc)
+                    continue
+                if not action:
+                    continue
+                if action.get("action") != "maintain_bundle":
+                    continue
+                self._post_seal_hits += 1
+                contract.execution_count += 1
+                contract.last_executed = time.time()
+                payload = self._build_maintain_bundle_payload(
+                    action, ctx, contract)
+                if payload is None:
+                    continue
+                try:
+                    from titan_hcl.bus import MAINTAIN_BUNDLE as _MAINTAIN_BUNDLE
+                    send_queue.put_nowait({
+                        "type": _MAINTAIN_BUNDLE,
+                        "src": worker_name,
+                        "dst": "synthesis",
+                        "ts": time.time(),
+                        "payload": payload,
+                    })
+                    self._maintain_bundle_emits += 1
+                except Exception as exc:
+                    logger.debug(
+                        "[BlockBuilder/post_seal] MAINTAIN_BUNDLE emit "
+                        "failed: %s", exc)
+
+    @staticmethod
+    def _build_maintain_bundle_payload(
+        action: dict, ctx: dict, contract: "Contract",
+    ) -> Optional[dict]:
+        """Build the MAINTAIN_BUNDLE payload from a matched contract action.
+
+        Action shape (per PLAN_synthesis_engine_Phase2.md §2C
+        actr_user_conversation_bundle):
+            {"action": "maintain_bundle",
+             "entity_class": "user" | "topic" | "skill",
+             "entity_id_from": "tag_prefix:user:"|"field:source"|"literal:X",
+             "fork": "conversation" | <override of ctx fork>,
+             "ring_size": <int, advisory — store enforces its own cap>}
+        Returns None if entity_id cannot be resolved (logged at debug).
+        """
+        entity_class = action.get("entity_class")
+        if not isinstance(entity_class, str) or not entity_class:
+            return None
+        fork = action.get("fork") or ctx.get("fork")
+        if not isinstance(fork, str) or not fork:
+            return None
+        eid_spec = action.get("entity_id_from", "")
+        entity_id = BlockBuilder._resolve_entity_id(eid_spec, ctx)
+        if not entity_id:
+            logger.debug(
+                "[BlockBuilder/post_seal] contract %s matched but "
+                "entity_id_from=%r did not resolve",
+                contract.contract_id, eid_spec)
+            return None
+        return {
+            "entity_class": entity_class,
+            "entity_id": entity_id,
+            "fork": fork,
+            "tx_hash": ctx.get("tx_hash", ""),
+            "epoch_id": int(ctx.get("epoch_id", 0)),
+            "ts": float(ctx.get("ts", time.time())),
+            "significance": float(ctx.get("significance", 0.0)),
+            "source": str(ctx.get("source", "")),
+            "contract_id": contract.contract_id,
+        }
+
+    @staticmethod
+    def _resolve_entity_id(spec: str, ctx: dict) -> str:
+        """Extract entity_id per a tiny micro-DSL (PLAN §2C):
+          - "tag_prefix:<prefix>"  → first tag starting with <prefix>, suffix.
+          - "field:<name>"          → ctx[name] as str.
+          - "literal:<value>"       → <value> literal.
+          - ""                      → empty (caller drops).
+        """
+        if not spec or not isinstance(spec, str):
+            return ""
+        if spec.startswith("tag_prefix:"):
+            prefix = spec[len("tag_prefix:"):]
+            for tag in ctx.get("tags", []) or []:
+                if isinstance(tag, str) and tag.startswith(prefix):
+                    return tag[len(prefix):]
+            return ""
+        if spec.startswith("field:"):
+            name = spec[len("field:"):]
+            v = ctx.get(name)
+            return str(v) if v is not None else ""
+        if spec.startswith("literal:"):
+            return spec[len("literal:"):]
+        # Unknown spec → treat as literal field name (back-compat).
+        v = ctx.get(spec)
+        return str(v) if v is not None else ""
 
     def _get_content_store(self):
         if self._content_store is None:
@@ -1962,6 +2645,15 @@ class BlockBuilder:
                     })
                 except Exception:
                     pass
+
+            # Phase 2 D-P2-4 post-seal contract hook — emit
+            # MAINTAIN_BUNDLE for every TX matching an active
+            # tx_sealed-triggered maintain_bundle contract. No-op when
+            # the hook is unattached (back-compat with existing tests +
+            # boot order: ContractStore wires after BlockBuilder is
+            # constructed).
+            self._emit_maintain_bundle_events(
+                all_txs, fork_name, block, send_queue, worker_name)
 
         return block
 
@@ -2247,6 +2939,12 @@ class TimeChainOrchestrator:
                                  if c.status == "active"]))
                 # Pass contract store + evaluator to mempool for filter contracts
                 self._mempool.set_contract_filter(
+                    self._contract_store, self._rule_evaluator)
+                # Phase 2 D-P2-4: post-seal contract hook on BlockBuilder.
+                # Active `trigger`-type contracts with triggers including
+                # "tx_sealed" + action=maintain_bundle emit MAINTAIN_BUNDLE
+                # events to synthesis_worker after each sealed TX.
+                self._builder.set_post_seal_hook(
                     self._contract_store, self._rule_evaluator)
                 # NOTE: TitanMaker substrate (R8 autoseed) is initialized in
                 # create_app() in the MAIN process, not here. The orchestrator

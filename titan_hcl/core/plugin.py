@@ -1244,6 +1244,11 @@ class TitanHCL:
             heartbeat_timeout=60.0,
             broadcast_topics=[
                 bus.MEMORY_RETRIEVAL_USED,
+                # Phase 2 D-P2-4: standing-contract maintenance event, single
+                # consumer = synthesis_worker (sole writer of
+                # association_bundles). Post-seal contract hook in
+                # timechain_v2.Mempool/BlockBuilder publishes.
+                bus.MAINTAIN_BUNDLE,
                 bus.KERNEL_EPOCH_TICK,
                 bus.MODULE_SHUTDOWN,
             ],

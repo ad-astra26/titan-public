@@ -18,6 +18,11 @@ What this worker owns:
 
 Bus subscriptions:
   • MEMORY_RETRIEVAL_USED — use-gated record_access (INV-Syn-5)
+  • MAINTAIN_BUNDLE       — Phase 2 standing-contract maintenance event
+                            (D-P2-4): post-seal contract hook emits one
+                            per sealed TX matching an active contract
+                            with action="maintain_bundle"; routed to the
+                            StandingBundleStore.maintain() hot path.
   • KERNEL_EPOCH_TICK     — 60s recompute cadence trigger (loose — actual
                             recompute runs on a wall-clock timer in a
                             daemon thread, the tick just nudges it forward
@@ -54,6 +59,7 @@ import msgpack
 from titan_hcl import bus
 from titan_hcl.bus import (
     KERNEL_EPOCH_TICK,
+    MAINTAIN_BUNDLE,
     MEMORY_RETRIEVAL_USED,
     MODULE_HEARTBEAT,
     MODULE_READY,
@@ -67,6 +73,12 @@ from titan_hcl.synthesis.activation import (
     ActivationState,
     base_level,
     record_access,
+)
+from titan_hcl.synthesis.standing_store import (
+    BUNDLE_SNAPSHOT_NAME,
+    DEFAULT_MAX_ENTITIES,
+    DEFAULT_RING_SIZE,
+    StandingBundleStore,
 )
 
 logger = logging.getLogger(__name__)
@@ -365,15 +377,18 @@ def _heartbeat_loop(send_queue, name: str,
 
 
 def _recompute_loop(store: "ActivationStore",
+                    bundle_store: "StandingBundleStore",
                     status_writer: "SynthStatusWriter",
                     snapshot_path: str,
+                    bundle_snapshot_path: str,
                     send_queue, name: str,
                     interval_s: float,
                     stop_event: threading.Event,
                     cache_lock: threading.Lock) -> None:
     """Daemon thread — 60s recompute of B_i across activation_state + SHM
-    watermark publish (arch §5.2). Separate from the recv loop so a slow
-    DuckDB COMMIT never delays inbound MEMORY_RETRIEVAL_USED handling.
+    watermark publish + standing-bundle snapshot export (arch §5.2 +
+    Phase 2 D-P2-4). Separate from the recv loop so a slow DuckDB COMMIT
+    never delays inbound MEMORY_RETRIEVAL_USED / MAINTAIN_BUNDLE handling.
 
     Per feedback_recv_queue_except_empty_periodic_trap.md: periodic work
     MUST run in its own thread, never inside `except Empty:`.
@@ -385,6 +400,7 @@ def _recompute_loop(store: "ActivationStore",
     while not stop_event.is_set():
         t0 = time.monotonic()
         n_touched = 0
+        bundles_exported = 0
         try:
             now = time.time()
             with cache_lock:
@@ -392,7 +408,11 @@ def _recompute_loop(store: "ActivationStore",
                 items = store.items_tracked()
                 # Export atomic snapshot for cross-process readers
                 # (DuckDB 1.5+ lock workaround — see ACTIVATION_SNAPSHOT_NAME).
-                snapshot_size = store.export_snapshot(snapshot_path)
+                store.export_snapshot(snapshot_path)
+            # Bundle snapshot has its own internal lock — no need to hold
+            # cache_lock (and shouldn't, since maintain() is a separate
+            # write path with shorter critical section).
+            bundles_exported = bundle_store.export_snapshot(bundle_snapshot_path)
             status_writer.publish(
                 last_consistent_event_ts=now,
                 last_recompute_ts=now,
@@ -403,14 +423,16 @@ def _recompute_loop(store: "ActivationStore",
             _send(send_queue, SYNTHESIS_RECOMPUTE_DONE, name, "all", {
                 "items_recomputed": n_touched,
                 "items_tracked": items,
+                "bundles_exported": bundles_exported,
                 "duration_ms": duration_ms,
             })
             pass_count += 1
             if pass_count % 60 == 1:    # ~hourly summary
                 logger.info(
                     "[synthesis_worker] recompute pass #%d — items=%d "
-                    "touched=%d duration=%dms errors=%d",
-                    pass_count, items, n_touched, duration_ms, error_count)
+                    "touched=%d bundles=%d duration=%dms errors=%d",
+                    pass_count, items, n_touched, bundles_exported,
+                    duration_ms, error_count)
         except Exception as exc:
             error_count += 1
             logger.warning(
@@ -462,14 +484,30 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     status_writer = SynthStatusWriter(titan_id)
     registry = PlugRegistry()
 
+    # Phase 2 D-P2-4 standing-bundle store — sole writer of
+    # data/synthesis.duckdb / association_bundles. Shares the synthesis.duckdb
+    # file with ActivationStore (same process, separate connections fine —
+    # the DuckDB cross-PROCESS lock is the constraint).
+    standing_cfg = (config or {}).get("standing") or {}
+    ring_size = int(standing_cfg.get(
+        "user_bundle_max_txs", DEFAULT_RING_SIZE))
+    max_entities = int(standing_cfg.get(
+        "user_bundle_max_users", DEFAULT_MAX_ENTITIES))
+    bundle_store = StandingBundleStore(
+        db_path, ring_size=ring_size, max_entities=max_entities)
+
     # Cross-process activation snapshot file — sits next to synthesis.duckdb
     # in the same data_dir. Readers consume via plain JSON read.
     snapshot_path = os.path.join(
         os.path.dirname(db_path) or ".", ACTIVATION_SNAPSHOT_NAME)
+    bundle_snapshot_path = os.path.join(
+        os.path.dirname(db_path) or ".", BUNDLE_SNAPSHOT_NAME)
 
-    # Lock around the in-mem cache for the recv-loop ↔ recompute-loop
-    # interleave. record_access is cheap; the lock holds only for the
-    # mutation itself, never around bus I/O.
+    # Lock around the in-mem activation cache for the recv-loop ↔
+    # recompute-loop interleave. record_access is cheap; the lock holds
+    # only for the mutation itself, never around bus I/O. The
+    # StandingBundleStore has its own internal lock so its hot path
+    # doesn't contend with activation recompute.
     cache_lock = threading.Lock()
 
     stop_event = threading.Event()
@@ -480,7 +518,8 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
 
     rc_thread = threading.Thread(
         target=_recompute_loop,
-        args=(store, status_writer, snapshot_path, send_queue, name,
+        args=(store, bundle_store, status_writer, snapshot_path,
+              bundle_snapshot_path, send_queue, name,
               interval_s, stop_event, cache_lock),
         daemon=True, name=f"synthesis-recompute-{name}")
     rc_thread.start()
@@ -488,17 +527,21 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     _send(send_queue, MODULE_READY, name, "guardian", {
         "titan_id": titan_id,
         "module": "synthesis_worker",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "schema_version": 1,
-        "spec_ref": "SPEC §25 / D-SPEC-123",
+        "spec_ref": "SPEC §25 / D-SPEC-123 + PLAN_synthesis_engine_Phase2.md §2B",
         "plug_counts": registry.counts(),
         "items_tracked_at_boot": store.items_tracked(),
+        "bundles_tracked_at_boot": bundle_store.entities_tracked(),
     })
     logger.info(
         "[synthesis_worker] MODULE_READY emitted — items_at_boot=%d "
-        "plug_counts=%s", store.items_tracked(), registry.counts())
+        "bundles_at_boot=%d plug_counts=%s",
+        store.items_tracked(), bundle_store.entities_tracked(),
+        registry.counts())
 
     events_recorded = 0
+    bundles_maintained = 0
 
     try:
         while True:
@@ -521,8 +564,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             if msg_type == MODULE_SHUTDOWN:
                 logger.info(
                     "[synthesis_worker] MODULE_SHUTDOWN received — exiting "
-                    "(events_recorded=%d items_tracked=%d)",
-                    events_recorded, store.items_tracked())
+                    "(events_recorded=%d items_tracked=%d "
+                    "bundles_maintained=%d bundles_tracked=%d)",
+                    events_recorded, store.items_tracked(),
+                    bundles_maintained, bundle_store.entities_tracked())
                 break
 
             if msg_type == MEMORY_RETRIEVAL_USED:
@@ -535,6 +580,38 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 events_recorded += 1
                 continue
 
+            if msg_type == MAINTAIN_BUNDLE:
+                # Phase 2 D-P2-4 standing-contract maintenance event.
+                # Payload shape (see titan_hcl/bus.py MAINTAIN_BUNDLE doc):
+                #   {entity_class, entity_id, fork, tx_hash, epoch_id, ts,
+                #    significance?, source?}
+                entity_class = payload.get("entity_class")
+                entity_id = payload.get("entity_id")
+                fork = payload.get("fork")
+                tx_hash = payload.get("tx_hash")
+                if not all(isinstance(x, str) and x for x in
+                           (entity_class, entity_id, fork, tx_hash)):
+                    logger.debug(
+                        "[synthesis_worker] MAINTAIN_BUNDLE missing required "
+                        "field(s); payload=%s", payload)
+                    continue
+                tx_record = {
+                    "tx_hash": tx_hash,
+                    "epoch_id": int(payload.get("epoch_id", 0)),
+                    "ts": float(payload.get("ts", time.time())),
+                    "significance": float(payload.get("significance", 0.0)),
+                    "source": str(payload.get("source", "")),
+                }
+                try:
+                    bundle_store.maintain(
+                        entity_class, entity_id, fork, tx_record)
+                    bundles_maintained += 1
+                except Exception as exc:
+                    logger.warning(
+                        "[synthesis_worker] bundle_store.maintain failed: %s",
+                        exc, exc_info=True)
+                continue
+
             # KERNEL_EPOCH_TICK + everything else: no-op in Phase 1. The
             # recompute_loop drives on wall-clock, not on this tick.
 
@@ -544,6 +621,10 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             store.close()
         except Exception:
             logger.exception("[synthesis_worker] store close failed")
+        try:
+            bundle_store.close()
+        except Exception:
+            logger.exception("[synthesis_worker] bundle_store close failed")
         try:
             status_writer.close()
         except Exception:

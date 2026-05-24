@@ -218,6 +218,23 @@ MODULE_CRASHED = "MODULE_CRASHED"
 MEMORY_RETRIEVAL_USED = "MEMORY_RETRIEVAL_USED"
 SYNTHESIS_RECOMPUTE_DONE = "SYNTHESIS_RECOMPUTE_DONE"
 
+# Phase 2 standing-contract event (PLAN_synthesis_engine_Phase2.md 2B,
+# D-P2-4): emitted by the post-seal contract hook in
+# timechain_v2.Mempool/BlockBuilder for every TX sealed that matches an
+# active contract whose action is `maintain_bundle`. Single consumer =
+# synthesis_worker (sole writer G21 / INV-Syn-3) of
+# data/synthesis.duckdb / association_bundles. Payload:
+#     {"entity_class": "user" | "topic" | "skill" | ...,
+#      "entity_id":    "<hash>" | "<tag>" | "<skill_id>",
+#      "fork":         "conversation" | "procedural" | ...,
+#      "tx_hash":      "<hex>",
+#      "epoch_id":     <int>,
+#      "ts":           <wall-clock seconds>,
+#      "significance": <float>}
+# Standing contracts convert RECALL of a bundled entity into a READ
+# (single SELECT) per arch §12.2.
+MAINTAIN_BUNDLE = "MAINTAIN_BUNDLE"
+
 # SPEC §8.3 Phase B (rFP_phase_c_bus_delivery_continuity_and_hot_reload §4):
 # per-module hot-reload protocol. REQUEST emitted by Maker CLI / future D9
 # Guardian; ACK emitted by parent Guardian with status transitions
