@@ -494,7 +494,30 @@ class TieredMemoryGraph:
             scored.append((score, node))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [node for _, node in scored[:limit]]
+        results = [node for _, node in scored[:limit]]
+
+        # Synthesis Engine Phase 1 (D-SPEC-123 / SPEC v1.56.0 §25):
+        # use-gated MEMORY_RETRIEVAL_USED emit per returned user-memory
+        # node (INV-Syn-5). Same `mem:<id>` namespace as _cognee_search
+        # so the same memory_node gets unified activation across both
+        # retrieval paths. Fire-and-forget; failures degrade silently.
+        if self._bus_emit is not None and results:
+            now = time.time()
+            for node in results:
+                nid = node.get("id")
+                if nid is None:
+                    continue
+                try:
+                    self._bus_emit("MEMORY_RETRIEVAL_USED", {
+                        "item_id": f"mem:{nid}",
+                        "ts": now,
+                    })
+                except Exception as _emit_err:
+                    logger.debug(
+                        "[Memory] query_user_memories emit failed: %s",
+                        _emit_err)
+                    break
+        return results
 
     async def _cognee_search(self, prompt: str, top_k: int = 10) -> list:
         """

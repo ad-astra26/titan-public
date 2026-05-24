@@ -688,11 +688,19 @@ class VerifiedContextBuilder:
 
     def __init__(self, data_dir: str = "./data",
                  memory_verifier=None,
-                 known_users: list[str] = None):
+                 known_users: list[str] = None,
+                 bus_emit=None):
         self._data_dir = data_dir
         self._parser = QueryParser(known_users=known_users)
         self._router = StoreRouter(data_dir=data_dir)
         self._verifier = memory_verifier  # MemoryVerifier instance (optional)
+        # Synthesis Engine Phase 1 (D-SPEC-123 / SPEC v1.56.0 §25 / 2026-05-23):
+        # optional MEMORY_RETRIEVAL_USED emit per returned record. Item-id
+        # namespace = "vcb:<db_ref>" so VCB-sourced items are distinguishable
+        # from the f"mem:<memory_nodes.id>" namespace _cognee_search uses.
+        # Use-gated reinforcement per INV-Syn-5; the soft "passed to LLM
+        # context" gate (Phase 1) — strict "LLM cited" gate is Phase 9.
+        self._bus_emit = bus_emit
 
     def build(self, query: str, user_id: str = "",
               max_tokens: int = 2000,
@@ -799,6 +807,26 @@ class VerifiedContextBuilder:
         # Step 4: Rank and trim
         all_records.sort(key=lambda r: (r.confidence, r.timestamp), reverse=True)
         records = all_records[:max_records]
+
+        # Synthesis Engine Phase 1 — emit MEMORY_RETRIEVAL_USED per returned
+        # record so synthesis_worker records access (INV-Syn-5 use-gated
+        # reinforcement). Item-id namespace `vcb:<db_ref>` keeps VCB items
+        # distinguishable from `mem:<id>` (memory_nodes from _cognee_search).
+        # Fire-and-forget; failures degrade silently.
+        if self._bus_emit is not None and records:
+            now = time.time()
+            for rec in records:
+                if not rec.db_ref:
+                    continue
+                try:
+                    self._bus_emit("MEMORY_RETRIEVAL_USED", {
+                        "item_id": f"vcb:{rec.db_ref}",
+                        "ts": now,
+                    })
+                except Exception as _emit_err:
+                    logger.debug(
+                        "[VCB] synth bus_emit failed: %s", _emit_err)
+                    break
 
         # Step 5: Assemble text
         text = self._assemble_text(records, parsed, max_tokens)
