@@ -350,6 +350,38 @@ class Guardian:
         # (in-process; no kernel split) → swap interlock degrades to no-op.
         self._kernel_ref = None
 
+        # D-SPEC-123 follow-up (2026-05-23, Option B): SHM-based module-
+        # ready state for cross-process liveness checks. Replaces the
+        # tactical guardian=None tolerance in proxies/_start_safe.py with
+        # a proper Phase-C-canonical mechanism (G18 watermark pattern).
+        # Guardian publishes the full {name: state} snapshot to
+        # module_ready.bin every 1s; subprocess proxies that don't hold a
+        # Guardian reference (MemoryProxy / SocialGraphProxy / RLProxy
+        # constructed with guardian=None in agno_worker_plugin.py) read
+        # this slot for liveness checks. Best-effort construct — if SHM
+        # init fails the proxies fall back to the optimistic-True path
+        # (still no crash).
+        self._module_ready_shm_writer = None
+        self._module_ready_publisher_stop = threading.Event()
+        self._module_ready_publisher_thread: Optional[threading.Thread] = None
+        try:
+            from titan_hcl.core.module_ready_shm import ModuleReadyShmWriter
+            self._module_ready_shm_writer = ModuleReadyShmWriter()
+            self._module_ready_publisher_thread = threading.Thread(
+                target=self._module_ready_publish_loop,
+                name="guardian-module-ready-shm",
+                daemon=True,
+            )
+            self._module_ready_publisher_thread.start()
+            logger.info(
+                "[Guardian] module_ready.bin SHM publisher started "
+                "(D-SPEC-123 follow-up Option B — 1Hz snapshot)")
+        except Exception as _mr_err:
+            logger.warning(
+                "[Guardian] module_ready.bin SHM writer init failed: %s "
+                "(proxies fall back to optimistic-True liveness path)",
+                _mr_err)
+
         # [guardian] toml plumbing — 2026-04-16. Previously Guardian(bus)
         # was constructed with no config, so the module-level constants
         # HEARTBEAT_TIMEOUT / DEFAULT_RSS_LIMIT_MB / MAX_RESTARTS_IN_WINDOW
@@ -1853,9 +1885,45 @@ class Guardian:
                 len(skipped), sorted(skipped),
             )
 
+    def _module_ready_publish_loop(self) -> None:
+        """1Hz loop: snapshot {name: state.value} for every module and
+        publish to module_ready.bin SHM (D-SPEC-123 follow-up Option B).
+
+        Errors swallowed at this level — a stale SHM slot is a graceful
+        degrade (readers fall back to optimistic-True) so we must NEVER
+        kill the publisher thread.
+        """
+        while not self._module_ready_publisher_stop.is_set():
+            try:
+                snapshot = {
+                    name: info.state.value
+                    for name, info in list(self._modules.items())
+                }
+                if self._module_ready_shm_writer is not None:
+                    self._module_ready_shm_writer.publish(snapshot)
+            except Exception as exc:
+                # Throttled — one log per 60s.
+                now = time.time()
+                last = getattr(
+                    self, "_module_ready_publish_last_err_log", 0.0)
+                if now - last > 60.0:
+                    logger.warning(
+                        "[Guardian] module_ready.bin publish failed: %s",
+                        exc)
+                    self._module_ready_publish_last_err_log = now
+            # 1Hz cadence. Use Event.wait so shutdown is responsive.
+            self._module_ready_publisher_stop.wait(1.0)
+
     def stop_all(self, reason: str = "shutdown") -> None:
         """Gracefully stop all running modules."""
         self._stop_requested = True
+        # Stop module-ready SHM publisher.
+        try:
+            self._module_ready_publisher_stop.set()
+            if self._module_ready_shm_writer is not None:
+                self._module_ready_shm_writer.close()
+        except Exception:  # noqa: BLE001
+            pass
         # Option B (2026-05-02) — shut down restart executor cleanly so
         # in-flight async restart tasks finish before we shut down modules.
         # wait=False because we're about to forcibly stop all modules anyway;

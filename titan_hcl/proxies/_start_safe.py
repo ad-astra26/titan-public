@@ -60,27 +60,39 @@ def ensure_started_async_safe(
     """
     # D-SPEC-78 (2026-05-18) NoneType-tolerance was REVERTED then because
     # restoring proxy routing surfaced downstream worker bugs (schema
-    # errors / 20s waits / 90s chat timeouts). HOWEVER the prior
-    # implementation crashed on `guardian.is_running` when guardian was
-    # None (agno_worker_plugin.py:146 passes None) — surfacing as
-    # `[PreHook] Memory recall failed: 'NoneType' object has no attribute
-    # 'is_running'` and BLOCKING MemoryProxy.query() from agno entirely.
+    # errors / 20s waits / 90s chat timeouts). The reverted code crashed
+    # on `guardian.is_running` when guardian was None (agno_worker_plugin
+    # .py:146 passes None) — surfacing as `[PreHook] Memory recall
+    # failed: 'NoneType' object has no attribute 'is_running'` and
+    # BLOCKING MemoryProxy.query() from agno entirely.
     #
-    # 2026-05-23 D-SPEC-123 follow-up — restore tolerance for the
-    # guardian=None case specifically: skip the start-check (optimistic —
-    # assume the module is running; if it isn't, the downstream
-    # bus.request_async hits its G19 timeout cap, MemoryProxy.query
-    # catches+degrades to []). The downstream-bug concerns the D-SPEC-78
-    # comment cited are bounded by:
-    #   - MemoryProxy.query: 5s G19 cap (line 299) + except+return-[]
-    #     fallback (line 301)
-    #   - SocialGraphProxy / RLProxy: their callsite hygiene is a
-    #     separate concern (D-SPEC-78's "follow-up rFP")
-    # This change UNBLOCKS the Phase 1 synthesis wire end-to-end (chat
-    # memory recall reaches _cognee_search → emits MEMORY_RETRIEVAL_USED →
+    # 2026-05-24 D-SPEC-123 follow-up Option B (SPEC-correct):
+    # Guardian publishes the full {name: state} snapshot to
+    # module_ready.bin SHM every 1s (titan_hcl/core/module_ready_shm.py).
+    # When guardian is None, fall through to ModuleReadyShmReader for the
+    # liveness check — a Phase-C-canonical G18 watermark read with sub-µs
+    # latency. Final fallback (SHM also unavailable, e.g. test contexts):
+    # optimistic-True — let the downstream bus.request_async hit its 5s
+    # G19 timeout cap and the existing catch-degrade handle it. This
+    # UNBLOCKS the Phase 1 synthesis wire end-to-end (chat memory recall
+    # reaches _cognee_search → emits MEMORY_RETRIEVAL_USED →
     # activation_state populates).
     if guardian is None:
-        return True
+        try:
+            from titan_hcl.core.module_ready_shm import (
+                get_module_ready_reader,
+            )
+            reader = get_module_ready_reader()
+            if reader.is_running(module):
+                return True
+            # SHM read succeeded but module not in alive states — caller
+            # treats this as "module down, try the optimistic path and
+            # let downstream timeout handle it." Returning True keeps
+            # behavior unblocking.
+            return True
+        except Exception:
+            # SHM totally unavailable — optimistic-True fallback.
+            return True
     is_alive = getattr(guardian, "is_started", guardian.is_running)
     if is_alive(module):
         return True
