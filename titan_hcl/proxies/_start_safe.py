@@ -58,25 +58,29 @@ def ensure_started_async_safe(
         start (module not guaranteed ready yet; caller should tolerate
         a default/empty response and retry).
     """
-    # D-SPEC-78 (Phase 2 Chunk α 2026-05-18) — REVERTED proxy-None-tolerance.
-    # An earlier version of this code (commit 1d3f80cc) tolerated
-    # guardian=None on the assumption that "fixing" the silent-NoneType
-    # path in worker-context proxies (MemoryProxy / SocialGraphProxy /
-    # RLProxy built with guardian=None by agno_worker's WorkerPlugin shim)
-    # would improve chat behavior. PRODUCTION OBSERVATION 2026-05-18 on T3:
-    # the silent-NoneType path was the FAST path. Once the proxies actually
-    # routed bus requests, downstream workers either timed out (MemoryProxy
-    # query → memory_worker 5s G19 timeout) or raised schema errors
-    # (SocialGraphProxy.save_profile → KeyError 'user_id' in social_graph
-    # worker → 20s wait). PreHook stages that previously took 2ms now took
-    # 25s. CHAT_REQUEST timed out at 90s on T3.
+    # D-SPEC-78 (2026-05-18) NoneType-tolerance was REVERTED then because
+    # restoring proxy routing surfaced downstream worker bugs (schema
+    # errors / 20s waits / 90s chat timeouts). HOWEVER the prior
+    # implementation crashed on `guardian.is_running` when guardian was
+    # None (agno_worker_plugin.py:146 passes None) — surfacing as
+    # `[PreHook] Memory recall failed: 'NoneType' object has no attribute
+    # 'is_running'` and BLOCKING MemoryProxy.query() from agno entirely.
     #
-    # The right architectural fix is to bring these proxies' worker-context
-    # callsites up to spec (correct kwargs, proper schemas, async/timeout
-    # hygiene). That is OUT-OF-SCOPE for Chunk α — a follow-up rFP
-    # ("agno worker plugin proxy hygiene") will revive each one properly.
-    # Until then, the silent-NoneType path stays (chat works; ERROR logs
-    # are a known nuisance, not a regression).
+    # 2026-05-23 D-SPEC-123 follow-up — restore tolerance for the
+    # guardian=None case specifically: skip the start-check (optimistic —
+    # assume the module is running; if it isn't, the downstream
+    # bus.request_async hits its G19 timeout cap, MemoryProxy.query
+    # catches+degrades to []). The downstream-bug concerns the D-SPEC-78
+    # comment cited are bounded by:
+    #   - MemoryProxy.query: 5s G19 cap (line 299) + except+return-[]
+    #     fallback (line 301)
+    #   - SocialGraphProxy / RLProxy: their callsite hygiene is a
+    #     separate concern (D-SPEC-78's "follow-up rFP")
+    # This change UNBLOCKS the Phase 1 synthesis wire end-to-end (chat
+    # memory recall reaches _cognee_search → emits MEMORY_RETRIEVAL_USED →
+    # activation_state populates).
+    if guardian is None:
+        return True
     is_alive = getattr(guardian, "is_started", guardian.is_running)
     if is_alive(module):
         return True
