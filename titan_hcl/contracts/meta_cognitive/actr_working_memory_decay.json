@@ -1,0 +1,23 @@
+{
+  "contract_id": "actr_working_memory_decay",
+  "version": 1,
+  "contract_type": "trigger",
+  "author": "titan",
+  "description": "ACT-R use-gated reinforcement (arch §12.3, §5.4, INV-Syn-5; PLAN_synthesis_engine_Phase2.md §2C.c). Formalizes Phase 1's record_access path under a signed contract: when synthesis_worker observes MEMORY_RETRIEVAL_USED for an item that the LLM actually cited (`used_by_llm = true`), increment the item's activation_state access log. Phase 1 shipped this as hardcoded Python in synthesis_worker.synthesis_worker_main; Phase 2 makes it Maker-tunable + chain-anchored (the contract IS the rule that defines what 'use-gated reinforcement' means; Maker can refine the gate without code change). The action's only side effect is calling ActivationStore.record_access(item_id, ts) — both fields read from ctx.",
+  "rules": [
+    {
+      "op": "AND",
+      "clauses": [
+        {"op": "IF", "field": "event", "cmp": "EQ", "value": "MEMORY_RETRIEVAL_USED"},
+        {"op": "IF", "field": "used_by_llm", "cmp": "EQ", "value": true}
+      ],
+      "then": {
+        "action": "record_access"
+      }
+    }
+  ],
+  "triggers": ["memory_retrieval_used"],
+  "fork_scope": "",
+  "status": "active",
+  "phase": "p2_actr_defaults_20260524"
+}

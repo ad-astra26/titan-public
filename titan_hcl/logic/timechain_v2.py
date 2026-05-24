@@ -1163,13 +1163,22 @@ class RuleEvaluator:
     # ── Evaluate ──────────────────────────────────────────────────────
 
     def evaluate(self, rules: list[dict], context: dict,
-                 genesis_states: list[dict] = None) -> Optional[dict]:
+                 genesis_states: list[dict] = None,
+                 initial_variables: Optional[dict] = None) -> Optional[dict]:
         """Evaluate rules against context. Returns action dict or None.
 
         Phase 2: per-call chi accounting + variable-binding SC ops
         (SEARCH/FORK_READ/CROSS_REF/GROUP_BY join RECALL). On chi-budget
         overflow, returns `{"action": "chi_budget_exhausted", ...}` and
         stops processing remaining rules.
+
+        `initial_variables` (Phase 2 D-P2-3) pre-seeds the $-keyed
+        variables dict so callers can plumb pre-computed values into a
+        contract — most importantly `$query_embedding` (caller pre-embeds
+        per arch §3.5 / §12.1 SEARCH schema) and `$current_chat_tx` (the
+        recall caller's pivot TX hash). Keys MUST start with `$`. None
+        keeps the existing fresh-dict behavior for back-compat with all
+        pre-2C callers.
         """
         if len(rules) > self.MAX_RULES:
             logger.warning("[RuleEval] Contract exceeds %d rule limit", self.MAX_RULES)
@@ -1181,6 +1190,10 @@ class RuleEvaluator:
         self._total_evaluations += 1
 
         variables: dict = {}
+        if initial_variables:
+            for k, v in initial_variables.items():
+                if isinstance(k, str) and k.startswith("$"):
+                    variables[k] = v
         query_count = 0
 
         try:

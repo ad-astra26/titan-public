@@ -1,0 +1,28 @@
+{
+  "contract_id": "actr_user_conversation_bundle",
+  "version": 1,
+  "contract_type": "trigger",
+  "author": "titan",
+  "description": "Standing contract — per-user conversation bundle (arch §12.2 + §12.3, PLAN_synthesis_engine_Phase2.md §2C.d + D-P2-5). The Phase 2 standing pilot: on every sealed conversation-fork TX carrying a `user:<hash>` tag, the post-seal contract hook (PLAN §2B BlockBuilder._emit_maintain_bundle_events) emits MAINTAIN_BUNDLE; synthesis_worker maintains a ring-buffer of the last 50 TXs per user in association_bundles. Cross-process consumers fetch via BridgeRecall.read_bundle('user', <hash>, 'conversation') — turning RECALL of a bundled entity from a SEARCH into a single READ (arch §12.2 'precompiled by SC = incremental view maintenance'). entity_id_from='tag_prefix:user:' extracts the hashed user id from the first tag matching the prefix.",
+  "rules": [
+    {
+      "op": "AND",
+      "clauses": [
+        {"op": "IF", "field": "event", "cmp": "EQ", "value": "tx_sealed"},
+        {"op": "IF", "field": "fork", "cmp": "EQ", "value": "conversation"},
+        {"op": "IF", "field": "tags", "cmp": "STARTSWITH_ANY", "value": "user:"}
+      ],
+      "then": {
+        "action": "maintain_bundle",
+        "entity_class": "user",
+        "entity_id_from": "tag_prefix:user:",
+        "fork": "conversation",
+        "ring_size": 50
+      }
+    }
+  ],
+  "triggers": ["tx_sealed"],
+  "fork_scope": "conversation",
+  "status": "active",
+  "phase": "p2_actr_defaults_20260524"
+}

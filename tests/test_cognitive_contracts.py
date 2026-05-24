@@ -264,13 +264,24 @@ class TestContractJsons:
         assert os.path.isdir(CONTRACTS_DIR), \
             f"Phase C contracts directory missing: {CONTRACTS_DIR}"
 
-    def test_three_contracts_present(self):
+    def test_all_contracts_present(self):
+        """Phase 2 (PLAN §2C) added 4 ACT-R default contracts alongside
+        the original 3 TUNING-012 v2 Sub-phase C contracts. The 3
+        existing contracts retain their genesis / META_* / fork=meta
+        shape; the 4 new contracts ship as algorithm-encoded recipes
+        consuming Phase 2 SC ops (SEARCH/FORK_READ/CROSS_REF/GROUP_BY)."""
         files = sorted(
             f for f in os.listdir(CONTRACTS_DIR)
             if f.endswith(".json") and not f.startswith(".")
         )
         assert files == [
+            # Original 3 (TUNING-012 v2 Sub-phase C, 2026-04-25).
             "abstract_pattern_extraction.json",
+            # Phase 2 ACT-R defaults (PLAN_synthesis_engine_Phase2.md §2C, 2026-05-24).
+            "actr_episodic_recall_helper.json",
+            "actr_procedural_skill_proposer.json",
+            "actr_user_conversation_bundle.json",
+            "actr_working_memory_decay.json",
             "monoculture_detector.json",
             "strategy_evolution.json",
         ]

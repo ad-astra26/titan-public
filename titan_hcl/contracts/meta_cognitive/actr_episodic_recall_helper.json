@@ -1,0 +1,30 @@
+{
+  "contract_id": "actr_episodic_recall_helper",
+  "version": 1,
+  "contract_type": "filter",
+  "author": "titan",
+  "description": "ACT-R episodic recall (arch §12.3, PLAN_synthesis_engine_Phase2.md §2C.a, D-P2-1 algorithm-encoded). Composite-ranked merge of three retrieval sources over the conversation fork: (1) recency window via FORK_READ (last 168h, 50 most recent), (2) semantic top-50 via SEARCH against the caller-pre-embedded query (D-P2-3 caller-pre-embeds via $query_embedding), (3) thread continuity via CROSS_REF on the caller's pivot TX ($current_chat_tx, via_field=parent_chat_tx). The action's weights override composite_score's defaults; Maker tunes ranking end-to-end by editing this JSON + re-signing. Engine consumer = synthesis_worker EngineRecall (PLAN §2D). Falls through to no-action when ALL three sources are empty (engine recall fallback path).",
+  "rules": [
+    {"op": "FORK_READ", "fork": "conversation", "since_hours": 168, "limit": 50, "store": "$base"},
+    {"op": "SEARCH", "fork": "conversation", "query_embedding": "$query_embedding", "limit": 50, "min_similarity": 0.3, "store": "$semantic"},
+    {"op": "CROSS_REF", "tx_hash": "$current_chat_tx", "via_field": "parent_chat_tx", "in_forks": ["conversation"], "limit": 20, "store": "$threaded"},
+    {
+      "op": "OR",
+      "clauses": [
+        {"op": "IF", "field": "$base.length", "cmp": "GTE", "value": 1},
+        {"op": "IF", "field": "$semantic.length", "cmp": "GTE", "value": 1},
+        {"op": "IF", "field": "$threaded.length", "cmp": "GTE", "value": 1}
+      ],
+      "then": {
+        "action": "rank_composite",
+        "candidates_from": ["$base", "$semantic", "$threaded"],
+        "weights": {"w_b": 1.0, "w_s": 1.0, "w_r": 1.0, "w_p": 1.0},
+        "limit": 8
+      }
+    }
+  ],
+  "triggers": ["retrieval_request"],
+  "fork_scope": "conversation",
+  "status": "active",
+  "phase": "p2_actr_defaults_20260524"
+}
