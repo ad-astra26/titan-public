@@ -3009,36 +3009,6 @@ reasoning = "data/reasoning_cgn/state_snapshot.json"
 # Rollback at any time: flip flag back to false + CONFIG_RELOAD.
 # ═══════════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════════
-# Synthesis Engine (arch §0 v0.5.0 + PLAN_synthesis_engine_Phase2.md)
-# Phase 2 D-P2-6: chi accounting + cap per RuleEvaluator.evaluate() call.
-# Maker-tunable post-soak per arch §23 active tuning log discipline.
-# ═══════════════════════════════════════════════════════════════════
-
-[synthesis]
-# Engine-side parameters consumed by titan_hcl/synthesis/*.
-# d (activation decay), composite weights, etc. land here as P1 promoted
-# its hardcoded defaults; currently only the chi subtable is consumed.
-
-[synthesis.chi]
-# Per-op cost paid into RuleEvaluator._chi_spent each time an op is
-# executed during a single evaluate() call. Costs match arch §22
-# (proposed) Chi cost table; SPEC §22 + INV-Syn-6 codify on RATIFY.
-# All values in SOL-units; Titan's metabolic budget gates the cap.
-search    = 0.002    # FAISS top-K (arch §12.1)
-fork_read = 0.001    # SQL index.db query
-diff      = 0.0001   # in-context binary compare
-cross_ref = 0.002    # SQL block_index.cross_refs walk
-group_by  = 0.0005   # post-pass over loaded $var (D-P2-2)
-recall    = 0.001    # legacy RECALL op (formalized for budget accounting)
-
-# Hard cap on aggregate chi any single evaluate() call may spend.
-# On overflow: remaining rules short-circuit, evaluator returns
-# {"action": "chi_budget_exhausted", "spent": ..., "cap": ...}.
-# Default 0.01 = 10× a maximum-heavy single-op rule; comfortably above
-# any existing filter contract (which use only IF/AND/cmp = 0 chi).
-per_eval_cap = 0.01
-
 [microkernel]
 
 # ── Memory hygiene daemon (2026-05-01) ─────────────────────────────
