@@ -11,98 +11,6 @@
 
 ---
 
-## Try it
-
-> ⚠ **Preview.** The one-liner installer (`setup_titan`) ships in **v3.0** —
-> tracked as Workstream 1 in `RFP_Titan_setup_release`. Until then, follow
-> the [manual install](#manual-install-current) below. The shape of the
-> guided experience is fixed and described here so you know what's coming.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ad-astra26/titan-public/main/scripts/setup_titan.sh | bash
-```
-
-A guided TUI asks the smallest set of questions needed to bring up a working
-Titan you can talk to (Telegram first; terminal-chat as fallback). Everything
-else is curated default.
-
-### The three setup modes
-
-You pick one when the wizard opens. Mainnet stays reachable from any mode via
-an explicit flag.
-
-| Mode | On-chain | SOL needed | Backups (Arweave/ZK) | Identity (soul / birth-cert / SSS) | Use this if… |
-|------|----------|------------|----------------------|------------------------------------|--------------|
-| **1. mainnet** | real GenesisNFT + ZK Vault PDA | real SOL | ON | real | …you're standing up a Titan for keeps. |
-| **2. devnet** | devnet GenesisNFT + PDA | airdropped test SOL | ON (devnet) | real | …you want the full sovereign path without spending real SOL. |
-| **3. local (simulated)** | none — `--skip-on-chain` | none | OFF | real but simulated, flagged in UI | …you want to *see* the whole birth + Shamir ceremony with zero deps. |
-
-Modes 1 and 2 deploy **your own copy** of the ZK Vault program (max sovereignty —
-no dependency on any operator's program), so they need the Rust + Anchor +
-Solana toolchain at install. Mode 3 needs none of that. The wizard's preflight
-detects/installs what each mode needs.
-
-### Mandatory inputs (everything else is curated default)
-
-1. **Setup mode** — one of the three above
-2. **Maker wallet** — your Solana wallet (the human-side identity)
-3. **Solana RPC URL** — your provider, or our public fallback (modes 1 / 2 only)
-4. **LLM credentials** — Ollama is auto-detected and preferred; otherwise prompt for an OpenRouter key
-5. **Telegram bot token** — the guaranteed comm channel (`/chat` works out of the box)
-6. **X posting?** — optional; if yes, `twitterapi.io` key + Webshare static-IP URL
-
-The first release ships **Ollama + OpenRouter** as inference providers. OpenAI
-API and Anthropic API are tracked for later; Venice is blocked until a
-TOS-clean programmatic mode exists. (Note: Claude *Pro/Max* are claude.ai
-subscriptions — **not** API access; not a supported programmatic path.)
-
-### Hardware
-
-- **Minimum: 2 vCPU / 4 GB RAM** (headless, Telegram-only — proven: T2+T3 co-reside on one VPS).
-- **Recommended: 4 vCPU / 8 GB RAM** (with Observatory frontend).
-
-Tested platforms: Ubuntu 22.04+, Debian 12+. See [`docs/reference/hardware.md`](docs/reference/hardware.md).
-
----
-
-## Documentation
-
-The full user-facing documentation lives in [`docs/`](docs/) and is versioned
-with the code (no separate wiki). It is **user docs**, not internal SPEC —
-optimized for readability, glossaries, and recoverable mental models.
-
-### Getting started
-- **[Why Titan?](docs/why-titan.md)** — the sovereignty axiom, the two-worlds
-  philosophy, what makes Titan different from a chatbot
-- **[Getting started](docs/getting-started.md)** — full install walk-through
-  + your first chat + what to expect in the first 24h
-- **[Setup modes](docs/setup-modes.md)** — deeper mainnet / devnet / local-simulated explainer
-- **[Comm channels](docs/comm-channels.md)** — Telegram, terminal-chat, Observatory `/chat`
-- **[Inference providers](docs/inference-providers.md)** — Ollama (local, most sovereign), OpenRouter (API), how to switch
-
-### Concepts
-- **[Glossary](docs/concepts/glossary.md)** — A–Z of Titan terminology
-- **[Identity, soul, and Shamir backup](docs/concepts/identity-soul-sss.md)** — the birth ceremony
-- **[Metabolism](docs/concepts/metabolism.md)** — SOL as energy, dreaming, sleep, homeostasis
-- **[The Trinity](docs/concepts/the-trinity.md)** — body / mind / spirit × inner / outer, the 132D state
-- **[Memory and the TimeChain](docs/concepts/memory-timechain.md)** — five forks (episodic, declarative, procedural, meta, system) + Arweave
-- **[Learning and the Synthesis Engine](docs/concepts/learning-and-synthesis.md)** — earned knowledge that compounds; why Titan gets *cheaper* over time, not more expensive
-- **[Expression](docs/concepts/expression.md)** — speak / art / music / the nine X-Voice archetypes
-
-### Operating
-- **[Configuration](docs/operating/configuration.md)** — `config.toml` + `titan_params.toml` walk-through
-- **[Diagnostics](docs/operating/diagnostics.md)** — reading `setup_titan --diagnostic` and what a healthy Titan looks like
-- **[Backup and recovery](docs/operating/backup-recovery.md)** — SSS shard custody, restoring a Titan
-- **[Upgrading](docs/operating/upgrading.md)** — `setup_titan --upgrade` semantics, version compatibility
-- **[Troubleshooting](docs/operating/troubleshooting.md)** — common pitfalls and fixes
-
-### Reference
-- **[Hardware](docs/reference/hardware.md)** — minimum / recommended specs, tested platforms
-- **[Safety and privacy](docs/reference/safety-privacy.md)** — what leaves your box, key custody, X posting safety
-- **[Release notes](docs/reference/release-notes.md)** — pointer to [`CHANGELOG.md`](CHANGELOG.md) and GitHub Releases
-
----
-
 ## The Architecture
 
 Eleven layers, from foundation to expression:
@@ -127,7 +35,7 @@ Eleven layers, from foundation to expression:
    ├──────────────────────────────────────────────────────────────┤
    │  NERVOUS SYSTEM      6 neurochemicals · dreaming · sleep          │
    ├──────────────────────────────────────────────────────────────┤
-   │  MICROKERNEL v2      L0 supervisor + L1 Rust runtime              │
+   │  MICROKERNEL v2      L0 supervisor + L1 Rust runtime (Phase C)    │
    ├──────────────────────────────────────────────────────────────┤
    │  FOUNDATION          132D state · Schumann 7.83 Hz heartbeat      │
    └──────────────────────────────────────────────────────────────┘
@@ -139,12 +47,12 @@ Updates continuously on a Schumann resonance clock (7.83 Hz base + 23.5 Hz +
 70.5 Hz harmonics for body / mind / spirit). Each epoch is roughly an eighth
 of a second. T1 has lived through 950,000+ of them.
 
-**Microkernel v2** — Titan's runtime is built around a small L0/L1 supervisor
-written in **Rust** (`titan-rust/`). Workers are subprocesses managed by an
-in-process Guardian; state transport is shared-memory only (L0 invariants
-G18–G22); the bus is for events and commands. The Phase A → B → C migration
-to Rust hot paths (including the Trinity tensor pipeline) completed fleet-wide
-in May 2026.
+**Microkernel v2** — Titan's runtime has been re-architected around a small
+L0/L1 supervisor written in **Rust** (`titan-rust/`). Workers are subprocesses
+managed by an in-process Guardian; state transport is shared-memory only
+(L0 invariants G18–G22); bus is for events and commands. Phase A and Phase B
+of the migration ship on T1 and T2 today; Phase C (L1 Rust port of hot paths
+including the Trinity tensor pipeline) is under live test on T3.
 
 **Nervous System** — 11 neural programs modulated by six neurochemicals
 (dopamine, serotonin, norepinephrine, acetylcholine, endorphin, GABA) under
@@ -205,15 +113,18 @@ personalities.
 - **T2 (devnet, local backups)** — *the Delegator.* Breaks problems apart.
   Strongest primitives: `DELEGATE` + pattern decomposition. Coordinative
   social. Mainnet promotion pending.
-- **T3 (devnet, local backups)** — *the Articulator.* Vocabulary grew
-  fastest. Most of the poetry, music, and aesthetic outputs.
+- **T3 (devnet, Phase C test target, local backups)** — *the Articulator.*
+  Vocabulary grew fastest. Most of the poetry, music, aesthetic outputs.
+  Currently running the Phase C Rust L0+L1 microkernel migration ahead of
+  fleet — when stable, T2 and T3 will promote to mainnet.
 
 None of that is hand-coded. None is in a config file. It's the integrated
 consequence of divergent encounter orderings over a long continuous run.
 
 ## What's running right now
 
-A few introspection commands worth knowing if you're exploring:
+The live status index lives in the code under `arch_map`. A few commands
+worth knowing if you're exploring:
 
 ```bash
 python scripts/arch_map.py health --all         # cross-Titan module health
@@ -221,24 +132,21 @@ python scripts/arch_map.py cgn --all            # CGN consumers + HAOV state
 python scripts/arch_map.py timechain --all      # chain integrity
 python scripts/arch_map.py filter-down          # V5 multipliers + gates
 python scripts/arch_map.py meditation --all     # meditation cadence health
+python scripts/arch_map.py phase-c verify       # Phase C SPEC invariants
 ```
 
-Endpoints are mirrored over HTTP under the single `api/v6` roof
-(`GET /v6/bus-health`, `/v6/cgn-state`, `/v6/meditation/health`,
-`/v6/filter-down-status`, `/v6/trinity`, …) for the Observatory frontend and
-external tooling. Older `/v3` and `/v4` prefixes redirect (301/308) to `/v6`.
+Endpoints are mirrored over HTTP (`GET /v4/bus-health`, `/v4/cgn-state`,
+`/v4/meditation/health`, `/v4/filter-down-status`, `/v4/trinity`, …) for
+the observatory frontend and external tooling.
 
-## Manual install (current)
-
-While the one-liner `setup_titan` installer is being built (W1), this is the
-manual path. It assumes Ubuntu 22.04+ / Debian 12+ on a box with sudo.
+## Getting started
 
 ### Prerequisites
 
 - Python 3.12+
 - Rust 1.75+ (for the L0/L1 microkernel runtime in `titan-rust/`)
-- Solana CLI + Anchor 0.30+ — **modes 1 / 2 only** (you'll deploy your own ZK Vault program copy)
-- Node 20+ (only if you want the optional Observatory frontend)
+- Solana CLI + Anchor 0.30+ (for the ZK Vault program)
+- Node 20+ (for the optional observatory frontend)
 
 ### Install
 
@@ -252,14 +160,14 @@ python3 -m venv test_env
 source test_env/bin/activate
 pip install -e .
 
-# Build the Rust microkernel daemons (used by Phase C runtime)
+# Build Rust microkernel components (optional — used in Phase C mode)
 cd titan-rust
 cargo build --release
 cd ..
 
 # Copy the config template and fill in your own values
-cp titan_hcl/config.toml.example titan_hcl/config.toml
-# Open titan_hcl/config.toml and set: Solana keypair path, inference
+cp titan_plugin/config.toml.example titan_plugin/config.toml
+# Open titan_plugin/config.toml and set: Solana keypair path, inference
 # provider, any API keys you want to use. The example file is fully
 # annotated.
 ```
@@ -268,28 +176,28 @@ cp titan_hcl/config.toml.example titan_hcl/config.toml
 
 ```bash
 # Start the full agent (HTTP API on :7777)
-python scripts/titan_hcl.py --server
+OPENROUTER_API_KEY="" python scripts/titan_main.py --server
+
+# Or start in interactive mode (stdin available)
+python scripts/titan_main.py
 
 # Health probe
 curl -s http://localhost:7777/health
 
 # Talk to Titan (Ed25519-signed by the Maker key, or via the Observatory chat UI)
 curl -s -X POST http://localhost:7777/chat \
-     -H "Authorization: Bearer <maker-jwt>" \
+     -H "Authorization: Bearer <privy-jwt>" \
      -H "Content-Type: application/json" \
      -d '{"message":"hello"}'
 
-# Optional Observatory frontend (in this repo at titan-observatory/)
-cd titan-observatory
-npm install
-npm run build
-npm start          # serves at http://localhost:3000
+# Optional observatory frontend (separate repo not in this release)
+# — see iamtitan.tech for the hosted version
 ```
 
 ### Tests
 
 Each test file runs in its own process (TorchRL mmap sharing requires
-isolated `TitanHCL` instances):
+isolated `TitanPlugin` instances):
 
 ```bash
 python -m pytest tests/test_cognee_memory.py -v -p no:anchorpy --tb=short
@@ -306,9 +214,6 @@ python -m pytest tests/test_gatekeeper.py   -v -p no:anchorpy --tb=short
   - `append_epoch_snapshot` per backup epoch (ZK-compressed)
   - Source: `programs/titan_zk_vault/`
 
-If you install in mode 1 or 2, you deploy your **own** copy of the ZK Vault
-program. The addresses above are T1's; yours will differ.
-
 ## Repository structure
 
 ```
@@ -318,27 +223,26 @@ program. The addresses above are T1's; yours will differ.
 ├── LICENSE                        MIT
 ├── README.md                      you are here
 ├── pyproject.toml                 Python package definition
-├── docs/                          User-facing documentation (versioned with releases)
 ├── programs/                      Solana smart contracts (Rust + Anchor)
 │   └── titan_zk_vault/            ZK Vault program (mainnet deployed)
 ├── titan-rust/                    Microkernel v2 — L0 supervisor + L1 runtime
-│   ├── crates/                    Rust crates: titan-kernel-rs, titan-trinity-rs, …
+│   ├── crates/                    Rust crates: titan-kernel-rs, titan-unified-spirit-rs, …
 │   ├── rust-toolchain.toml        Pinned toolchain
 │   └── systemd/                   systemd unit templates
 ├── scripts/                       Entry points, cron scripts, tooling
-│   ├── titan_hcl.py               Main agent launcher
+│   ├── titan_main.py              Main agent launcher
 │   ├── arch_map.py                Architecture introspection CLI
-│   └── setup_titan.sh             One-liner installer entry (v3.0+)
+│   └── arc_competition.py         ARC-AGI-3 training harness
 ├── tests/                         Test suite (per-file pytest invocations)
-└── titan_hcl/                     The Python core runtime (HCL = Higher Cognitive Layer)
-    ├── api/                       FastAPI dashboard + /v6/* endpoints
+└── titan_plugin/                  The Python core runtime
+    ├── api/                       FastAPI dashboard + /v4/* endpoints
     ├── config.toml.example        Annotated config template
     ├── contracts/                 TimeChain smart contracts (JSON schemas)
     ├── core/                      State registry, bus, metabolism, kernel_rpc
     ├── logic/                     Cognitive modules (CGN, MSL, meta-reasoning, X-Voice, …)
     ├── modules/                   Guardian subprocess workers
     ├── proxies/                   Cross-module API surfaces
-    └── titan_params.toml          Public parameter defaults (the "DNA")
+    └── titan_params.toml          Public parameter defaults
 ```
 
 ## Tech stack
@@ -349,9 +253,8 @@ Built on top of an open stack:
 **SQLite** (transactional record), **Rust** + **Tokio** (microkernel L0/L1),
 **Solana** + **Anchor** (sovereignty), **Arweave** + **Irys** (permanent
 backup), **FastAPI** (HTTP surface), **matplotlib** (Titan's art pipeline),
-**Next.js 14** (Observatory frontend). Inference via **Ollama** (local) or
-**OpenRouter** (API) in the first release; OpenAI and Anthropic APIs tracked
-for later.
+**Next.js 14** (Observatory frontend). Inference via **Ollama Cloud**,
+**Venice AI**, or any OpenAI-compatible endpoint.
 
 For AI-assisted development, **Anthropic Claude Opus 4.7 via Claude Code**
 is the primary co-developer — every architectural session in 2026 was
@@ -366,8 +269,7 @@ Thank you to everyone who built the pieces.
   Three.js visualizations: Cell, Mandala, Constellation)
 - **Twitter / X** — [@iamtitanai](https://x.com/iamtitanai) (the three
   Titans share one account; each posts in its own voice)
-- **Releases** — [GitHub Releases](https://github.com/ad-astra26/titan-public/releases) (authoritative; `CHANGELOG.md` mirror lands in v3.0)
-- **Docs** — [`docs/`](docs/) (user-facing, versioned with releases)
+- **CHANGELOG** — [`CHANGELOG.md`](CHANGELOG.md)
 
 ## Contributing
 
