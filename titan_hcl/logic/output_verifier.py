@@ -1022,17 +1022,78 @@ class OutputVerifier:
     # ── Utility ────────────────────────────────────────────────────
 
     def build_timechain_payload(self, result: OVGResult,
-                                prompt_text: str = "") -> dict:
+                                prompt_text: str = "",
+                                *,
+                                user_id: str = "",
+                                chat_id: str = "",
+                                turn_index: int = 0,
+                                topic_tags: Optional[list] = None) -> dict:
         """Build the TIMECHAIN_COMMIT payload for a verified/blocked output.
 
-        Returns dict ready to publish to the bus as a TIMECHAIN_COMMIT message.
+        Phase 2 closure (D-SPEC-125 follow-up, 2026-05-25): brings the
+        pass-path conversation-fork TX into `ARCHITECTURE_synthesis_engine.md
+        §7` conformance. Adds normative content fields (`chat_id`,
+        `user_id_hash`, `turn_index`) and the arch §7 tag list
+        `["chat", f"chat:<id>", f"user:<hash>"] + topic_tags + [channel]`.
+        The `actr_user_conversation_bundle` standing contract (arch §12.3,
+        Phase 2 D-P2-5) consumes `user:<hash>` tags to maintain per-user
+        bundles in synthesis_worker's `association_bundles` table.
+
+        Args:
+            result:      OVGResult from verify_and_sign / verify_safety+sign.
+            prompt_text: Originating prompt (for prompt_hash audit field).
+            user_id:     Raw user identifier (Privy `claims["sub"]`, "maker",
+                         channel-synthesized id, etc.). Empty or "anonymous"
+                         → no `user:` tag (anonymous traffic does NOT
+                         create a bundle). Hashed via
+                         `synthesis.user_id_hash.hash_user_id` using the
+                         per-Titan salt persisted in
+                         `~/.titan/secrets.toml [synthesis] user_id_hash_salt`.
+            chat_id:     Session/conversation id (empty → no `chat:<id>`
+                         tag; chat_id field still present in content
+                         as empty string for schema stability).
+            turn_index:  Turn number within the chat session (0 = first
+                         turn, +1 per agent reply).
+            topic_tags:  Optional caller-supplied topic-extraction tags.
+                         None / empty → omitted from tag list. Phase 4+
+                         topic-extraction pipeline populates these.
+
+        Returns dict ready to publish to the bus as a TIMECHAIN_COMMIT
+        message. Blocked path (result.passed=False) unchanged — routes
+        to meta fork with `OVG_BLOCKED` event (no per-user bundling
+        intended for security alerts).
         """
         if result.passed:
+            # Arch §7 normative tag list. Order matters for visual log
+            # diff stability; the contract matcher uses STARTSWITH_ANY
+            # so order doesn't affect matching semantics.
+            tags = ["chat"]
+            if chat_id:
+                tags.append(f"chat:{chat_id}")
+            # user_tag is empty string for anonymous / missing user_id,
+            # exactly the case where no per-user bundle is wanted.
+            from titan_hcl.synthesis.user_id_hash import (
+                hash_user_id, hash_user_id_raw,
+            )
+            user_tag = hash_user_id(user_id)
+            if user_tag:
+                tags.append(user_tag)
+            if topic_tags:
+                # Defensive: caller may pass non-string elements.
+                tags.extend(str(t) for t in topic_tags if t)
+            if result.channel:
+                tags.append(result.channel)
+
             return {
                 "fork": "conversation",
                 "thought_type": "conversation",
                 "source": "output_verifier",
                 "content": {
+                    # Arch §7 normative fields (NEW Phase 2 closure):
+                    "chat_id": chat_id,
+                    "user_id_hash": hash_user_id_raw(user_id),
+                    "turn_index": int(turn_index),
+                    # Existing OVG audit fields (load-bearing — kept):
                     "output_hash": hashlib.sha256(
                         result.output_text.encode()).hexdigest(),
                     "prompt_hash": hashlib.sha256(
@@ -1043,7 +1104,7 @@ class OutputVerifier:
                     "violation_type": "none",
                     "titan_id": self._titan_id,
                 },
-                "tags": ["verified_output", result.channel],
+                "tags": tags,
                 "significance": 0.3,
                 "novelty": 0.1,
                 "coherence": 0.5,
