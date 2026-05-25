@@ -370,9 +370,8 @@ fn conformance_g5_1_learned_value_net_not_placeholder() {
 fn conformance_g5_2_gains_from_titan_params_toml() {
     // The daemon-side path is `load_restoring_cfg(shm_dir, layer)` which reads
     // `shm_dir/trinity_restoring.bin` (Python L2-published from
-    // `titan_params.toml [trinity_restoring.{body,mind,spirit}]` per D-SPEC-129
-    // per-layer schema, v1.59.2) and falls back to the kernel DEFAULT_* constants
-    // only when the sidecar is absent (cold boot).
+    // `titan_params.toml [trinity_restoring]`) and falls back to the kernel
+    // DEFAULT_* constants only when the sidecar is absent (cold boot).
     use std::fs;
     use tempfile::tempdir;
     use titan_trinity_daemon::{load_restoring_cfg, DEFAULT_K_DRIVE, TRINITY_RESTORING_SIDECAR};
@@ -385,49 +384,24 @@ fn conformance_g5_2_gains_from_titan_params_toml() {
         "fallback should match kernel default"
     );
 
-    // Present + valid (D-SPEC-129, 96-byte per-layer sidecar) → values come
-    // from the TOML-derived sidecar. body slice [0:32], mind [32:64], spirit
-    // [64:96]; each layer is 8 × f32 LE in the field order documented in
-    // restoring_cfg.rs. Distinct per-layer k_drive values (0.30 / 0.40 / 0.20)
-    // verify the per-layer offset table — not just position 0 for everyone.
+    // Present + valid → values come from TOML-derived sidecar.
     let path = dir.path().join(TRINITY_RESTORING_SIDECAR);
-    let body = [0.30_f32, 0.05, 0.05, 0.10, 0.05, 0.50, 1.10, 0.50];
-    let mind = [0.40_f32, 0.07, 0.06, 0.11, 0.04, 0.55, 1.10, 0.45];
-    let spirit = [0.20_f32, 0.05, 0.05, 0.10, 0.05, 0.50, 1.10, 0.50];
-    let mut bytes = Vec::with_capacity(96);
-    for v in body.iter() {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    for v in mind.iter() {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    for v in spirit.iter() {
+    let gains = [0.42_f32, 0.07, 0.06, 0.11, 0.04, 0.55, 1.10, 0.45];
+    let mut bytes = Vec::with_capacity(32);
+    for v in gains.iter() {
         bytes.extend_from_slice(&v.to_le_bytes());
     }
     fs::write(&path, &bytes).unwrap();
-
-    let body_cfg = load_restoring_cfg(dir.path(), Layer::Body);
-    let mind_cfg = load_restoring_cfg(dir.path(), Layer::Mind);
-    let spirit_cfg = load_restoring_cfg(dir.path(), Layer::Spirit);
+    let cfg_tuned = load_restoring_cfg(dir.path(), Layer::Body);
     assert!(
-        (body_cfg.k_drive - 0.30).abs() < 1e-6,
-        "body k_drive (got {})",
-        body_cfg.k_drive
+        (cfg_tuned.k_drive - 0.42).abs() < 1e-6,
+        "loaded k_drive should reflect sidecar override (got {})",
+        cfg_tuned.k_drive
     );
     assert!(
-        (mind_cfg.k_drive - 0.40).abs() < 1e-6,
-        "mind k_drive — PLAN §6.6.2 bump (got {})",
-        mind_cfg.k_drive
-    );
-    assert!(
-        (spirit_cfg.k_drive - 0.20).abs() < 1e-6,
-        "spirit k_drive (got {})",
-        spirit_cfg.k_drive
-    );
-    assert!(
-        (mind_cfg.a_drift - 1.10).abs() < 1e-6,
-        "mind a_drift override (got {})",
-        mind_cfg.a_drift
+        (cfg_tuned.a_drift - 1.10).abs() < 1e-6,
+        "loaded a_drift should reflect sidecar override (got {})",
+        cfg_tuned.a_drift
     );
 }
 

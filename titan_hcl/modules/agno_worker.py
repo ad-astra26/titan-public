@@ -784,11 +784,19 @@ def agno_worker_main(recv_queue, send_queue, name: str,
     )
 
     # ── Main dispatch loop ──
+    # D-SPEC-128 (BUG-AGNO-SILENT-HANG fix): read from the bus client's
+    # `consumer_queue`, NOT the raw `recv_queue`. The bus_client's
+    # dispatcher thread owns raw recv_queue exclusively; any other
+    # consumer of raw recv_queue would race with it and steal messages.
+    # The dispatcher routes rid-bearing replies to request_async waiters
+    # via Futures; everything else lands in consumer_queue for this
+    # loop.
+    consumer_queue = bus_client.consumer_queue
     last_shm_publish = 0.0
     try:
         while True:
             try:
-                msg = recv_queue.get(timeout=5.0)
+                msg = consumer_queue.get(timeout=5.0)
             except Empty:
                 # No message; opportunity to republish SHM if cadence elapsed
                 now = time.time()
@@ -902,6 +910,13 @@ def agno_worker_main(recv_queue, send_queue, name: str,
     finally:
         logger.info("[AgnoWorker] Exiting")
         hb_stop.set()
+        # D-SPEC-128: stop the bus dispatcher cleanly. Daemon thread so
+        # the process will exit either way, but explicit stop avoids
+        # spurious "raw_recv.get raised" warnings during teardown.
+        try:
+            bus_client.stop()
+        except Exception:
+            pass
         try:
             loop.close()
         except Exception:
@@ -909,21 +924,179 @@ def agno_worker_main(recv_queue, send_queue, name: str,
 
 
 def _build_worker_bus_client(send_queue, recv_queue, worker_name: str):
-    """Build a lightweight bus client surface backed by the worker's
-    send/recv queues so WorkerPlugin proxies can publish/subscribe.
+    """Build the worker's in-process bus client.
 
-    This is a minimal facade — full bus_socket_client integration into
-    worker subprocesses is a Chunk-K hardening pass. For C2, hooks that
-    require bus access (memory queries, social_graph ops, etc.) will use
-    the kernel-mediated send/recv path; this client makes that work.
+    **Architecture (BUG-AGNO-SILENT-HANG proper fix — D-SPEC-128, 2026-05-25):**
+
+    The kernel delivers ALL messages destined for this worker (chat
+    requests, lifecycle events, broadcasts, work-RPC replies) into a
+    single `recv_queue`. Multiple consumers want to read from it:
+
+      - The **worker's main loop** wants CHAT_REQUEST, CHAT_STREAM_REQUEST,
+        MODULE_SHUTDOWN, KERNEL_EPOCH_TICK, broadcasts.
+      - Each in-flight `request_async()` wants ITS specific
+        `QUERY_RESPONSE` (matched by `rid`).
+
+    Pre-fix (D-SPEC-74 era), all consumers raced on `recv_queue.get()`:
+    main loop in its own thread, `request_async` via executor poll. Any
+    message popped by the wrong consumer was dropped — silently stealing
+    CHAT_REQUESTs during OVG verify_safety_async calls → fleet-wide
+    silent agno_worker degradation. See `tests/
+    test_agno_worker_request_async_redelivery.py` for the
+    reproduction.
+
+    **This implementation (the spec-correct fix):** a single
+    **dispatcher thread** owns the raw `recv_queue` exclusively. It
+    reads serially and routes each message:
+
+      1. If the message carries an `rid` AND a `request_async()` waiter
+         is registered for that rid → resolve the waiter's
+         `asyncio.Future` directly (via `loop.call_soon_threadsafe` so
+         the resolve runs on the caller's loop).
+      2. Otherwise → push the message onto a per-worker
+         `consumer_queue` that the main loop reads.
+
+    Consequences:
+
+      - **No race possible.** Dispatcher is the SOLE reader of
+        `recv_queue`. Main loop reads only from `consumer_queue`;
+        request_async awaits a future. No two consumers ever pop the
+        same queue.
+      - **No message loss.** Every message lands in exactly one
+        destination: either a registered waiter, or the consumer queue.
+      - **No CPU burn.** Future-based wait (no polling); dispatcher
+        sleeps in a single blocking `recv_queue.get()` between messages.
+      - **Back-compat for proxies.** `subscribe()` returns
+        `consumer_queue` so any external code that polls it still gets
+        non-request_async messages. `request_async`'s `reply_queue`
+        parameter is now ignored (kept in signature for back-compat
+        with proxies that pass it positionally).
+      - **Single fix covers all 6 affected proxies** (output_verifier,
+        life_force, assessment, metabolism, rl, media) — they all
+        funnel through `_WorkerBusClient.request_async`.
+
+    Main loop wiring requirement: callers of `_build_worker_bus_client`
+    MUST read messages from `client.consumer_queue` instead of the
+    `recv_queue` they originally passed in. The dispatcher OWNS the raw
+    recv_queue; reading from it directly would race with the
+    dispatcher's `.get()` call (mp.Queue handles concurrent gets safely
+    but each message goes to ONE consumer — so messages would be lost
+    to whichever consumer got there first). See `agno_worker_main` for
+    the canonical usage.
+
+    Refs:
+      - BUG-AGNO-SILENT-HANG (2026-05-25)
+      - D-SPEC-128 (this commit)
+      - directive_error_visibility.md (silent-worker anti-pattern this closes)
+      - feedback_no_quick_patches_only_spec_correct_solutions.md (why this
+        replaces the prior minimal re-queue fix)
     """
+    import asyncio as _aio
+    import threading as _threading
+    import queue as _queue
+
     class _WorkerBusClient:
         def __init__(self, send_q, recv_q, name):
             self._send = send_q
-            self._recv = recv_q
+            self._raw_recv = recv_q
             self._name = name
 
+            # Per-rid waiter registry — request_async registers a Future,
+            # dispatcher resolves it. Lock guards concurrent register/pop.
+            self._rid_lock = _threading.Lock()
+            self._rid_waiters: dict[str, _aio.Future] = {}
+
+            # Main-loop-facing queue — receives every message that ISN'T
+            # routed to a request_async waiter.
+            self.consumer_queue: _queue.Queue = _queue.Queue()
+
+            # Dispatcher thread lifecycle.
+            self._stop = _threading.Event()
+            self._dispatcher = _threading.Thread(
+                target=self._dispatcher_loop,
+                daemon=True,
+                name=f"{name}-bus-dispatcher",
+            )
+            self._dispatcher.start()
+
+        # ── Dispatcher (sole reader of raw_recv) ──────────────────────
+
+        def _dispatcher_loop(self) -> None:
+            """Read raw_recv serially; route by rid → future OR consumer."""
+            while not self._stop.is_set():
+                try:
+                    # 0.2s poll — keeps dispatcher responsive to stop_event
+                    # without busy-spinning. mp.Queue.get with timeout
+                    # raises Empty (queue module's Empty); both queue and
+                    # mp.Queue use the same exception class.
+                    msg = self._raw_recv.get(timeout=0.2)
+                except _queue.Empty:
+                    continue
+                except Exception as exc:
+                    # Any other queue exception (e.g. closed at shutdown):
+                    # log + retry. Don't kill the dispatcher silently.
+                    logger.warning(
+                        "[WorkerBusClient:dispatcher] raw_recv.get raised "
+                        "%s — retrying", exc)
+                    continue
+                if not msg:
+                    continue
+
+                rid = msg.get("rid") if isinstance(msg, dict) else None
+
+                # Try rid-routed delivery first.
+                routed = False
+                if rid:
+                    with self._rid_lock:
+                        fut = self._rid_waiters.pop(rid, None)
+                    if fut is not None and not fut.done():
+                        try:
+                            loop = fut.get_loop()
+                            loop.call_soon_threadsafe(
+                                _safe_set_future_result, fut, msg)
+                            routed = True
+                        except Exception as exc:
+                            # Loop closed / future already cancelled —
+                            # fall through to consumer_queue so the
+                            # message isn't lost.
+                            logger.warning(
+                                "[WorkerBusClient:dispatcher] rid=%s "
+                                "future-resolve failed (%s) — routing to "
+                                "consumer queue", rid, exc)
+
+                if routed:
+                    continue
+
+                # Default route: main consumer queue.
+                try:
+                    self.consumer_queue.put_nowait(msg)
+                except _queue.Full as exc:
+                    # consumer_queue is unbounded by default → Full
+                    # shouldn't happen. If it ever does, log loudly and
+                    # block-with-timeout to apply backpressure.
+                    logger.error(
+                        "[WorkerBusClient:dispatcher] consumer_queue full "
+                        "(unbounded by default) — applying backpressure: %s",
+                        exc)
+                    try:
+                        self.consumer_queue.put(msg, timeout=1.0)
+                    except Exception as exc2:
+                        logger.error(
+                            "[WorkerBusClient:dispatcher] consumer_queue "
+                            "blocked-put failed — message LOST "
+                            "(type=%s rid=%s): %s",
+                            msg.get("type"), rid, exc2)
+
+        def stop(self) -> None:
+            """Signal the dispatcher to exit. Safe to call from main loop
+            during shutdown. Does NOT join — daemon thread exits with
+            process; join would deadlock if main loop holds locks."""
+            self._stop.set()
+
+        # ── Public API ────────────────────────────────────────────────
+
         def publish(self, msg) -> None:
+            """Non-blocking send to kernel via send_queue."""
             try:
                 self._send.put_nowait(msg)
             except Exception as e:
@@ -932,61 +1105,88 @@ def _build_worker_bus_client(send_queue, recv_queue, worker_name: str):
                 )
 
         def subscribe(self, name: str, reply_only: bool = False):
-            # Proxies that call subscribe() get the recv_queue by default;
-            # the real broker handles per-name fan-out at the kernel side.
-            return self._recv
+            """Return the consumer_queue.
+
+            Per the dispatcher architecture, ALL non-rid-routed messages
+            arrive in consumer_queue regardless of `name`. The `name`
+            param is preserved in the signature for back-compat with
+            proxy code that calls `bus.subscribe("foo_proxy",
+            reply_only=True)`; since `request_async` now uses futures
+            (not the returned queue), callers using subscribe() purely
+            to pass to request_async get a working — if unused — queue
+            reference.
+            """
+            return self.consumer_queue
 
         async def request_async(self, src, dst, payload, timeout,
-                                reply_queue, msg_type=None) -> Optional[dict]:
-            """Async work-RPC. Publishes QUERY/msg_type, awaits matching RESPONSE.
+                                reply_queue=None,
+                                msg_type=None) -> Optional[dict]:
+            """Async work-RPC. Publishes QUERY/msg_type, awaits the
+            matching RESPONSE via the dispatcher's rid-routing.
 
-            D-SPEC-74 fix (2026-05-18): override `src` with the worker's
-            registered name so replies route back via name-based routing.
-            Callers (e.g. OutputVerifierProxy from inside agno_worker) pass
-            src="output_verifier_proxy" — but that name is NEVER registered
-            with the broker from worker context (subscribe() in
-            _WorkerBusClient just returns the worker's main recv_queue, it
-            doesn't register a new broker name). Result: output_verifier
-            replied with dst="output_verifier_proxy", broker had no
-            subscriber, message dropped, request_async timed out — surfaced
-            on T3 production 2026-05-18 as "[VERIFICATION UNAVAILABLE]"
-            after OVG correctly returned PASS upstream. Using the worker's
-            primary name (`self._name`) means the reply goes to the
-            worker's actual subscription. rid still drives matching.
+            D-SPEC-74 / D-SPEC-128: `src` is overridden with the
+            worker's registered name so kernel-side reply routing
+            delivers the response back to THIS worker's raw_recv
+            (the dispatcher then routes by rid to this caller's future).
+
+            `reply_queue` is IGNORED (back-compat parameter). The
+            dispatcher owns the raw queue; routing is via the
+            per-rid Future registry. See class docstring.
+
+            Returns the matching reply message, or None on:
+              - publish failure (kernel send_queue full)
+              - timeout (no matching reply within `timeout` seconds)
+              - future cancellation (caller aborted)
             """
-            from queue import Empty as _Empty
-            import asyncio as _aio
-
             request_id = f"{self._name}_{int(time.time() * 1e6)}"
             type_to_send = msg_type or bus.QUERY
-            try:
-                self._send.put_nowait({
-                    "type": type_to_send,
-                    # Override src with worker's registered name so the
-                    # reply routes back to this worker (see docstring).
-                    "src": self._name, "dst": dst,
-                    "rid": request_id,
-                    "payload": payload,
-                    "ts": time.time(),
-                })
-            except Exception as e:
-                logger.warning(
-                    "[WorkerBusClient] request_async publish failed: %s", e
-                )
-                return None
 
-            deadline = time.time() + float(timeout)
-            while time.time() < deadline:
+            # Register the future BEFORE sending — eliminates any race
+            # where the reply arrives faster than the registration.
+            loop = _aio.get_running_loop()
+            fut = loop.create_future()
+            with self._rid_lock:
+                self._rid_waiters[request_id] = fut
+
+            try:
                 try:
-                    reply = await _aio.get_event_loop().run_in_executor(
-                        None, lambda: reply_queue.get(True, 0.05),
+                    self._send.put_nowait({
+                        "type": type_to_send,
+                        "src": self._name, "dst": dst,
+                        "rid": request_id,
+                        "payload": payload,
+                        "ts": time.time(),
+                    })
+                except Exception as e:
+                    logger.warning(
+                        "[WorkerBusClient] request_async publish failed: %s", e
                     )
-                except (_Empty, Exception):
-                    continue
-                if not reply:
-                    continue
-                if reply.get("rid") == request_id:
-                    return reply
-            return None
+                    return None
+
+                try:
+                    return await _aio.wait_for(fut, timeout=float(timeout))
+                except _aio.TimeoutError:
+                    return None
+                except _aio.CancelledError:
+                    raise
+            finally:
+                # Always clean up the registration — on timeout/cancel
+                # the dispatcher would otherwise hold a stale entry and
+                # silently drop a late-arriving reply on consumer_queue
+                # (correct — late replies are uninteresting; explicit
+                # cleanup just frees the dict slot).
+                with self._rid_lock:
+                    self._rid_waiters.pop(request_id, None)
 
     return _WorkerBusClient(send_queue, recv_queue, worker_name)
+
+
+def _safe_set_future_result(fut, value) -> None:
+    """Helper for `loop.call_soon_threadsafe` — guard the actual
+    `set_result` call so a cancelled/done future doesn't raise inside
+    the asyncio loop machinery."""
+    try:
+        if not fut.done():
+            fut.set_result(value)
+    except Exception:
+        pass
