@@ -34,12 +34,7 @@ const MIND_DIMS: usize = 15;
 const SENSOR_CACHE_DIMS: usize = 15;
 const DRIFT_THRESHOLD_PCT: f64 = 0.005;
 
-pub async fn run(
-    bus_socket: &Path,
-    authkey: &[u8],
-    shm_dir: &Path,
-    data_dir: &Path,
-) -> Result<()> {
+pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()> {
     let client = BusClient::connect(bus_socket, authkey, "inner-mind")
         .await
         .with_context(|| format!("bus connect to {}", bus_socket.display()))?;
@@ -97,7 +92,6 @@ pub async fn run(
         sensor_cache_path,
         firing_writer,
         shm_dir.to_path_buf(),
-        data_dir.to_path_buf(),
     )
     .await;
 
@@ -210,7 +204,6 @@ async fn run_tick_loop(
     sensor_cache_path: std::path::PathBuf,
     mut firing_writer: FiringSlotWriter,
     shm_dir: std::path::PathBuf,
-    data_dir: std::path::PathBuf,
 ) -> Result<()> {
     let mut content_gate = ContentGate::new();
     let mut ground_up = GroundUpEnricher::new(Side::MindWilling);
@@ -218,7 +211,7 @@ async fn run_tick_loop(
     // §G5.2 item 4 — restore exact tensor state from checkpoint on boot;
     // cold-start at 0.5 only when sidecar absent/invalid.
     let (mut prev, mut prev2, mut last_obs_restored) =
-        match load_checkpoint_for_part::<MIND_DIMS>(&data_dir, CHECKPOINT_PART) {
+        match load_checkpoint_for_part::<MIND_DIMS>(&shm_dir, CHECKPOINT_PART) {
             Some(CheckpointSnapshot {
                 prev,
                 prev2,
@@ -308,7 +301,7 @@ async fn run_tick_loop(
                     if tick_count.is_multiple_of(CHECKPOINT_WRITE_EVERY_N_TICKS) {
                         if let Some(o) = last_obs_restored.as_ref() {
                             if let Err(e) = write_checkpoint_for_part::<MIND_DIMS>(
-                                &data_dir,
+                                &shm_dir,
                                 CHECKPOINT_PART,
                                 &prev,
                                 &prev2,
@@ -334,7 +327,7 @@ async fn run_tick_loop(
     }
     if let Some(o) = last_obs_restored.as_ref() {
         if let Err(e) =
-            write_checkpoint_for_part::<MIND_DIMS>(&data_dir, CHECKPOINT_PART, &prev, &prev2, o)
+            write_checkpoint_for_part::<MIND_DIMS>(&shm_dir, CHECKPOINT_PART, &prev, &prev2, o)
         {
             warn!(err = ?e, "final checkpoint write failed");
         }

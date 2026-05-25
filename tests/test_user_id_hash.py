@@ -161,6 +161,30 @@ class TestSaltBootstrapAndPersistence(unittest.TestCase):
             salt_second_boot = uih.get_user_id_hash_salt()
             assert salt_first_boot == salt_second_boot
 
+    def test_persistence_failure_falls_back_to_process_local(self) -> None:
+        """If update_secret raises (e.g. tomli_w missing, file perms, disk),
+        get_user_id_hash_salt MUST NOT propagate the exception. Returns
+        an in-process salt so OVG's build_timechain_payload never breaks
+        because of a persistence problem. This is the defensive path
+        that surfaced during T3 live test 2026-05-25."""
+        from titan_hcl import config_loader
+        # Force config_loader.update_secret to raise ImportError (mimics
+        # tomli_w not installed on the target Titan).
+        with patch.object(config_loader, "SECRETS_PATH", self.secrets_path), \
+                patch.object(
+                    config_loader, "update_secret",
+                    side_effect=ImportError("No module named 'tomli_w'")):
+            config_loader.clear_cache()
+            uih.clear_cache()
+            # Must NOT raise — must return a valid 32-byte salt.
+            salt = uih.get_user_id_hash_salt()
+            assert isinstance(salt, bytes)
+            assert len(salt) == 32
+            # And hash_user_id MUST work end-to-end without raising.
+            tag = uih.hash_user_id("maker")
+            assert tag.startswith("user:")
+            assert len(tag) == len("user:") + 16
+
     def test_invalid_hex_is_regenerated(self) -> None:
         """Garbage in secrets.toml → regenerate (don't crash)."""
         from titan_hcl import config_loader

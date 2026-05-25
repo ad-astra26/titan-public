@@ -89,18 +89,30 @@ def get_user_id_hash_salt() -> bytes:
         salt_hex = synth_section.get("user_id_hash_salt", "")
 
         if not isinstance(salt_hex, str) or len(salt_hex) < 32:
-            # Bootstrap: generate + persist.
+            # Bootstrap: generate + persist. Persistence is best-effort —
+            # any failure (missing tomli_w dep, file perms, disk, etc.) is
+            # caught here so OVG's build_timechain_payload NEVER raises
+            # because of a salt-persistence problem. In-process salt still
+            # mints valid bundles for THIS session; only continuity across
+            # restart is lost. Maker-visible WARNING surfaces the issue.
             salt_hex = _generate_salt()
-            ok = update_secret("synthesis", "user_id_hash_salt", salt_hex)
+            ok = False
+            try:
+                ok = update_secret(
+                    "synthesis", "user_id_hash_salt", salt_hex)
+            except Exception as persist_err:
+                logger.warning(
+                    "[user_id_hash] update_secret raised %s: %s — "
+                    "falling back to process-local salt (will regenerate "
+                    "next restart, breaking bundle continuity)",
+                    type(persist_err).__name__, persist_err)
             if not ok:
-                # Persistence failed — fall back to in-process-only.
-                # This keeps the Titan running but the salt won't survive
-                # restart. Loud warning so we notice.
                 logger.warning(
                     "[user_id_hash] failed to persist user_id_hash_salt "
                     "to ~/.titan/secrets.toml — using process-local salt "
                     "(will REGENERATE next restart, breaking bundle "
-                    "continuity). Check secrets file permissions.")
+                    "continuity). Check tomli_w installed + secrets file "
+                    "permissions.")
             else:
                 logger.info(
                     "[user_id_hash] generated + persisted new per-Titan "
@@ -114,7 +126,12 @@ def get_user_id_hash_salt() -> bytes:
                 "[user_id_hash] secrets.toml [synthesis].user_id_hash_salt "
                 "is not valid hex — regenerating")
             salt_hex = _generate_salt()
-            update_secret("synthesis", "user_id_hash_salt", salt_hex)
+            try:
+                update_secret("synthesis", "user_id_hash_salt", salt_hex)
+            except Exception:
+                logger.warning(
+                    "[user_id_hash] regen-persist failed; using "
+                    "process-local salt")
             _salt_cache = bytes.fromhex(salt_hex)
 
         return _salt_cache
