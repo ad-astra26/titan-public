@@ -2303,6 +2303,23 @@ seal_significance_immediate = 0.9 # Above this → immediate seal (important mom
 # Chain mechanics unchanged; NEW blocks only; existing blocks keep inline
 # summaries (dual-shape read via resolve_batch_summaries). Default OFF —
 # staged rollout T3 → T2 → T1 (mainnet last) per the soak plan.
+#
+# Phase 3 P3.F (D-SPEC-127): now ALSO essential for conversation-fork TXs.
+# Arch §7 chat-TX content carries user_msg + agent_response + tool_calls +
+# neuromods + embedding_hash + topic_tags — without CAS these inline into
+# every chat block (~5-20 KB/turn × ~200 turns/day fleet-wide). With CAS the
+# TX stores a single hash; the body lives once in data/content_store/.
+# Per-Titan override (recommended): ~/.titan/microkernel_<id>.toml
+#   [timechain.v2]
+#   cas_payload_slimming_enabled = true
+# Cascade procedure (PLAN_synthesis_engine_Phase3.md §P3.F):
+#   1. Maker greenlight per Titan
+#   2. T3 override → restart → 48-72h soak (chain_conversation.bin byte
+#      growth bounded, integrity green via verify_fork)
+#   3. T2 same
+#   4. T1 (mainnet) last — same procedure
+# Soak telemetry: BlockBuilder logs cas_slimming_active=true/false per
+# seal; chain_reader resolves both shapes transparently (dual-shape).
 cas_payload_slimming_enabled = false
 
 # Genesis chain — autobiographical spine on FORK_MAIN
