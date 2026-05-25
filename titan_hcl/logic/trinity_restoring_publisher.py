@@ -97,7 +97,11 @@ def _resolve_layer_gains(layer: str) -> dict[str, float]:
     continues). Missing single key → that one defaults (warned at info).
     Non-numeric value → that one defaults (warned at warn — surface bad data).
     """
-    cfg = get_params(f"trinity_restoring.{layer}") or {}
+    # `get_params(section)` is a flat dict lookup — `[trinity_restoring.body]`
+    # in TOML lives at `cfg["trinity_restoring"]["body"]` (nested dict), not at
+    # `cfg["trinity_restoring.body"]` (dotted key). Resolve in two steps.
+    parent = get_params("trinity_restoring") or {}
+    cfg = parent.get(layer, {}) or {}
     gains: dict[str, float] = {}
     for key, default in _DEFAULTS.items():
         raw = cfg.get(key, default)

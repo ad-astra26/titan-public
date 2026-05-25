@@ -12,9 +12,12 @@ on:
   push:
     branches:
       - main
+      - titan-v6
+      - 'session/**'
   pull_request:
     branches:
       - main
+      - titan-v6
 
 jobs:
   rust-gates:
