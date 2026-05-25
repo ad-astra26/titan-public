@@ -166,6 +166,7 @@ pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path, data_dir: &P
         firing_writer,
         engine,
         shm_dir.to_path_buf(),
+        data_dir.to_path_buf(),
     )
     .await;
 
@@ -272,6 +273,7 @@ async fn run_tick_loop(
     mut firing_writer: FiringSlotWriter,
     mut engine: SmallFilterDownEngine,
     shm_dir: std::path::PathBuf,
+    data_dir: std::path::PathBuf,
 ) -> Result<()> {
     let mut content_gate = ContentGate::new();
     // Previous epoch's 65D half-state — the `s` in the TD(0) transition s→s'.
@@ -280,7 +282,7 @@ async fn run_tick_loop(
     // §G5.2 item 4 — restore exact tensor + observable state from checkpoint
     // on boot; cold-start at 0.5 only when sidecar absent/invalid.
     let (mut prev, mut prev2, mut last_obs_restored) =
-        match load_checkpoint_for_part::<SPIRIT_DIMS>(&shm_dir, CHECKPOINT_PART) {
+        match load_checkpoint_for_part::<SPIRIT_DIMS>(&data_dir, CHECKPOINT_PART) {
             Some(CheckpointSnapshot {
                 prev,
                 prev2,
@@ -387,7 +389,7 @@ async fn run_tick_loop(
                     if tick_count.is_multiple_of(CHECKPOINT_WRITE_EVERY_N_TICKS) {
                         if let Some(o) = last_obs_restored.as_ref() {
                             if let Err(e) = write_checkpoint_for_part::<SPIRIT_DIMS>(
-                                &shm_dir,
+                                &data_dir,
                                 CHECKPOINT_PART,
                                 &prev,
                                 &prev2,
@@ -413,7 +415,7 @@ async fn run_tick_loop(
     }
     if let Some(o) = last_obs_restored.as_ref() {
         if let Err(e) =
-            write_checkpoint_for_part::<SPIRIT_DIMS>(&shm_dir, CHECKPOINT_PART, &prev, &prev2, o)
+            write_checkpoint_for_part::<SPIRIT_DIMS>(&data_dir, CHECKPOINT_PART, &prev, &prev2, o)
         {
             warn!(err = ?e, "final checkpoint write failed");
         }
