@@ -1,0 +1,79 @@
+# Phase C SPEC + Rust gates.
+#
+# Per PLAN_microkernel_phase_c_s2_kernel.md §15.5 + SPEC §20.7-§20.8.
+# This workflow ships in C-S2 as a stub. The repo currently relies on
+# the pre-commit hook (scripts/precommit_all_checks.sh) as the active
+# gate. When CI is enabled (GitHub Actions on this repo or upstream),
+# this file already encodes the canonical checks.
+
+name: phase-c
+
+on:
+  push:
+    branches:
+      - main
+      - titan-v6
+      - 'session/**'
+  pull_request:
+    branches:
+      - main
+      - titan-v6
+
+jobs:
+  rust-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            titan-rust/target
+          key: cargo-${{ hashFiles('titan-rust/Cargo.lock') }}
+      - name: cargo fmt --check
+        working-directory: titan-rust
+        run: cargo fmt --check
+      - name: cargo clippy
+        working-directory: titan-rust
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        working-directory: titan-rust
+        run: cargo test --workspace --all-targets
+
+  phase-c-spec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install minimum deps for arch_map + parity tests
+        run: |
+          python -m pip install --upgrade pip
+          # arch_map phase-c verify needs stdlib + tomli (3.10/11) + click +
+          # PyYAML (loaded in _phase_c_g_rpc_gates for phase_c_rpc_exemptions.yaml).
+          # arch_map phase-c parity + constants_in_sync pytest need pytest
+          # + the eager import chain of titan_hcl/__init__.py:
+          #   - numpy        (core.memory)
+          #   - msgpack      (frame parity tests)
+          #   - httpx        (core.network + logic.meditation)
+          #   - fastapi      (api.events imports FastAPI/Request at module top)
+          # Anything heavier (torch, faiss, duckdb, kuzu, sentence-transformers,
+          # cryptography, etc.) is intentionally skipped — the parity tests
+          # themselves never reach those modules. This set has been verified
+          # in a clean venv to be sufficient + minimal for all 3 phase-c-spec
+          # steps below.
+          python -m pip install tomli click pytest numpy msgpack httpx fastapi pyyaml
+      - name: phase-c verify --strict
+        run: python scripts/arch_map.py phase-c verify --strict --json
+      - name: phase-c parity
+        run: python scripts/arch_map.py phase-c parity
+      - name: phase-c constants in sync (pytest)
+        run: python -m pytest tests/test_phase_c_constants_in_sync.py -p no:anchorpy -v
