@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use tokio::sync::Mutex;
 use tokio::time::interval;
-use tracing::{debug, warn};
+use tracing::{debug, error};
 
 use titan_core::constants::{BUS_PING_INTERVAL_S, BUS_PING_TIMEOUT_S};
 
@@ -105,8 +105,37 @@ pub async fn heartbeat_tick(
             if sub.closed {
                 HeartbeatResult::Closed
             } else if is_pong_timeout(sub.last_pong_ts, now) {
-                warn!(name = %name, "heartbeat timeout — closing subscriber");
-                sub.closed = true;
+                // Promoted WARN→ERROR with structured fields per SPEC
+                // error-cascade discipline (Maker 2026-05-25). This is
+                // ONE OF TWO paths that previously produced silent-zombie
+                // subscribers (BUG-AGNO-SILENT-HANG):
+                //   - Pre-fix the WARN was logged with the MAP KEY only
+                //     (e.g. "anon-44") so operators couldn't tell WHICH
+                //     worker was disconnected. The `sub_name` field now
+                //     surfaces the logical worker name (e.g. "agno_worker")
+                //     so kernel logs become diagnostically complete.
+                //   - Pre-fix `sub.closed = true` left recv_loop blocked
+                //     in `read_half.read_exact` forever (half-open
+                //     connection), the subscriber map never purged, and
+                //     all fanout to `dst=<sub.name>` silent-skipped at
+                //     broker.rs:663 → permanent silent zombie.
+                //
+                // `signal_close()` fixes BOTH: structured ERROR log
+                // AND fires the per-sub notify, waking recv_loop's
+                // tokio::select! so it exits, allowing the
+                // connection_handler to purge the map entry. The
+                // worker's bus_socket recv_loop sees EOF → triggers
+                // reconnect → fresh subscription → routing restored.
+                error!(
+                    name = %name,
+                    sub_name = %sub.name,
+                    timeout_s = BUS_PING_TIMEOUT_S,
+                    reason = "heartbeat_pong_timeout",
+                    "ERROR: subscriber heartbeat timeout — closing connection \
+                     (BUG-AGNO-SILENT-HANG defense; worker should reconnect \
+                     within seconds and re-subscribe)"
+                );
+                sub.signal_close();
                 HeartbeatResult::TimedOut
             } else {
                 let _ = sub.publish(encode_ping_envelope());

@@ -436,7 +436,8 @@ async fn run_tick_loop(
         }
     }
     if let Some(o) = last_obs_restored.as_ref() {
-        if let Err(e) = write_checkpoint_for_part::<45>(&data_dir, CHECKPOINT_PART, &prev, &prev2, o)
+        if let Err(e) =
+            write_checkpoint_for_part::<45>(&data_dir, CHECKPOINT_PART, &prev, &prev2, o)
         {
             warn!(err = ?e, "final checkpoint write failed");
         }

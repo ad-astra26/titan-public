@@ -40,8 +40,6 @@ ACTR_CONTRACTS = (
     "actr_procedural_skill_proposer.json",
     "actr_working_memory_decay.json",
     "actr_user_conversation_bundle.json",
-    # Phase 3 P3.E (D-SPEC-127) — companion to user bundle.
-    "actr_topic_conversation_bundle.json",
 )
 
 
@@ -57,8 +55,7 @@ def _load_contract(fname: str) -> dict:
 class TestActrContractsLoad(unittest.TestCase):
     """Each of the 4 new contracts parses + has the declared shape."""
 
-    def test_all_five_present(self) -> None:
-        """Phase 3 P3.E adds the per-topic companion bundle — total = 5."""
+    def test_all_four_present(self) -> None:
         for f in ACTR_CONTRACTS:
             assert os.path.exists(os.path.join(CONTRACTS_DIR, f)), \
                 f"missing contract JSON: {f}"
@@ -115,28 +112,6 @@ class TestActrContractsLoad(unittest.TestCase):
         assert action["entity_class"] == "user"
         assert action["entity_id_from"] == "tag_prefix:user:"
         assert action["fork"] == "conversation"
-
-    def test_topic_bundle_schema(self) -> None:
-        """P3.E — per-topic standing bundle (D-SPEC-127). Mirrors the
-        per-user bundle but matches on `topic:` tag prefix."""
-        d = _load_contract("actr_topic_conversation_bundle.json")
-        assert d["contract_id"] == "actr_topic_conversation_bundle"
-        assert d["contract_type"] == "trigger"
-        assert "tx_sealed" in d["triggers"]
-        assert d["fork_scope"] == "conversation"
-        action = d["rules"][0]["then"]
-        assert action["action"] == "maintain_bundle"
-        assert action["entity_class"] == "topic"
-        assert action["entity_id_from"] == "tag_prefix:topic:"
-        assert action["fork"] == "conversation"
-        assert action["ring_size"] == 50
-        # Tag-prefix gate
-        clauses = d["rules"][0]["clauses"]
-        tag_clause = [c for c in clauses
-                      if c.get("field") == "tags"]
-        assert len(tag_clause) == 1
-        assert tag_clause[0]["cmp"] == "STARTSWITH_ANY"
-        assert tag_clause[0]["value"] == "topic:"
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -390,69 +365,20 @@ class TestUserBundleFires(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# actr_topic_conversation_bundle (P3.E) — mirror of user-bundle on `topic:`
-# ─────────────────────────────────────────────────────────────────────────
-
-
-class TestTopicBundleFires(unittest.TestCase):
-    """Per-topic standing bundle (D-SPEC-127). Same wiring as user-bundle;
-    matches on `topic:` tag prefix."""
-
-    def setUp(self) -> None:
-        self.contract = _load_contract("actr_topic_conversation_bundle.json")
-        self.ev = RuleEvaluator()
-
-    def test_matches_conv_tx_with_topic_tag(self) -> None:
-        ctx = {
-            "event": "tx_sealed",
-            "fork": "conversation",
-            "tags": ["chat", "chat:s1", "user:hash", "topic:solana"],
-            "tx_hash": "TX1",
-            "epoch_id": 100,
-            "ts": time.time(),
-            "significance": 0.5,
-        }
-        result = self.ev.evaluate(self.contract["rules"], ctx)
-        assert result is not None
-        assert result["action"] == "maintain_bundle"
-        assert result["entity_class"] == "topic"
-        assert result["entity_id_from"] == "tag_prefix:topic:"
-        assert result["fork"] == "conversation"
-
-    def test_skips_non_conversation_fork(self) -> None:
-        ctx = {
-            "event": "tx_sealed",
-            "fork": "procedural",
-            "tags": ["topic:solana"],
-        }
-        assert self.ev.evaluate(self.contract["rules"], ctx) is None
-
-    def test_skips_no_topic_tag(self) -> None:
-        ctx = {
-            "event": "tx_sealed",
-            "fork": "conversation",
-            "tags": ["chat", "user:hash"],
-        }
-        assert self.ev.evaluate(self.contract["rules"], ctx) is None
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# Bundle hash determinism for the 8-contract bundle (P3.E adds 1)
+# Bundle hash determinism for the 7-contract bundle
 # ─────────────────────────────────────────────────────────────────────────
 
 class TestSevenContractBundle(unittest.TestCase):
     """The R8 bundle ceremony hashes all JSONs in the directory. After
-    P3.E adds the topic bundle, total = 8 contracts. Maker re-signs the
-    new bundle at end of P3 cascade. Hash must be deterministic across
-    reads."""
+    P2C the bundle is 7 contracts; Maker re-signs the new bundle at end
+    of P2 (PLAN §2E). Hash must be deterministic across reads."""
 
-    def test_eight_contracts_in_bundle(self) -> None:
-        """P3.E adds actr_topic_conversation_bundle.json (8th contract)."""
+    def test_seven_contracts_in_bundle(self) -> None:
         files = sorted(
             f for f in os.listdir(CONTRACTS_DIR)
             if f.endswith(".json") and not f.startswith(".")
         )
-        assert len(files) == 8
+        assert len(files) == 7
 
     def test_bundle_hash_is_deterministic_across_reads(self) -> None:
         files = sorted(
@@ -491,7 +417,6 @@ class TestSevenContractBundle(unittest.TestCase):
             "abstract_pattern_extraction",
             "actr_episodic_recall_helper",
             "actr_procedural_skill_proposer",
-            "actr_topic_conversation_bundle",   # Phase 3 P3.E
             "actr_user_conversation_bundle",
             "actr_working_memory_decay",
             "monoculture_detector",

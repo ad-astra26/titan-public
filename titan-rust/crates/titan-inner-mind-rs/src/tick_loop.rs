@@ -34,12 +34,7 @@ const MIND_DIMS: usize = 15;
 const SENSOR_CACHE_DIMS: usize = 15;
 const DRIFT_THRESHOLD_PCT: f64 = 0.005;
 
-pub async fn run(
-    bus_socket: &Path,
-    authkey: &[u8],
-    shm_dir: &Path,
-    data_dir: &Path,
-) -> Result<()> {
+pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path, data_dir: &Path) -> Result<()> {
     let client = BusClient::connect(bus_socket, authkey, "inner-mind")
         .await
         .with_context(|| format!("bus connect to {}", bus_socket.display()))?;

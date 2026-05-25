@@ -175,14 +175,25 @@ impl BusBroker {
             self.shutdown.notify_waiters();
         }
 
-        // Mark all subscribers closed so send tasks exit
+        // Mark all subscribers closed so recv + send tasks exit.
+        // BUG-AGNO-SILENT-HANG fix (2026-05-25): use signal_close()
+        // which fires the per-sub notify, waking BOTH send_loop AND
+        // recv_loop (via tokio::select!). The separate notify_waiters
+        // loop below is now redundant for tasks that observed
+        // signal_close's notification, but kept as belt-and-suspenders
+        // since notify_per_sub may have entries that no longer match
+        // a live BrokerSubscriber (mid-purge race) and we want to wake
+        // any stragglers.
         {
             let mut subs = self.subs.lock().await;
             for sub in subs.values_mut() {
-                sub.closed = true;
+                sub.signal_close();
             }
         }
-        // Wake all send tasks so they observe the closed flag and exit
+        // Wake all send tasks so they observe the closed flag and exit.
+        // After signal_close() above this is mostly redundant — kept as
+        // defense-in-depth for any subscriber whose notify is no longer
+        // attached to a live BrokerSubscriber (purge race).
         for notify in self.notify_per_sub.lock().await.values() {
             notify.notify_waiters();
         }
@@ -318,16 +329,26 @@ impl BusBroker {
             return Err(BrokerError::Io(std::io::Error::other(format!("{e:?}"))));
         }
 
-        // 2. Register subscriber + create per-sub notify
-        let notify = Arc::new(Notify::new());
-        {
+        // 2. Register subscriber + per-sub notify.
+        //
+        // BUG-AGNO-SILENT-HANG fix (2026-05-25): the per-sub notify is
+        // now OWNED by the subscriber (`BrokerSubscriber::notify`,
+        // created in `new()`). We clone it into the `notify_per_sub`
+        // map for fanout's existing wake-on-publish path (unchanged)
+        // AND into the recv_task spawn args for the new shutdown-wake
+        // path. Single Arc identity means firing on any reference
+        // wakes ALL listeners (send_loop + recv_loop in select).
+        let notify = {
             let mut subs_guard = subs.lock().await;
-            subs_guard.insert(sub_name.clone(), BrokerSubscriber::new(&sub_name));
+            let sub = BrokerSubscriber::new(&sub_name);
+            let notify = sub.notify.clone();
+            subs_guard.insert(sub_name.clone(), sub);
             notify_per_sub
                 .lock()
                 .await
                 .insert(sub_name.clone(), notify.clone());
-        }
+            notify
+        };
 
         // 3. Split stream + spawn recv + send tasks concurrently
         let (read_half, write_half) = stream.into_split();
@@ -345,7 +366,15 @@ impl BusBroker {
             SubByName::new(subs.clone(), sub_name.clone())
         };
 
-        let recv_task = tokio::spawn(run_recv_loop(read_half, sub_name.clone(), inbound_tx));
+        let recv_task = tokio::spawn(run_recv_loop(
+            read_half,
+            sub_name.clone(),
+            inbound_tx,
+            // Pass the SAME Arc<Notify>. `signal_close()` fires
+            // notify_waiters() which wakes both send_loop (via existing
+            // wait) and recv_loop (via tokio::select! on this notify).
+            notify.clone(),
+        ));
         let send_task = tokio::spawn(run_send_loop_via_map(
             write_half,
             sub_arc.subs,
@@ -770,10 +799,36 @@ async fn run_send_loop_via_map(
             }
             for env in popped {
                 if let Err(e) = write_frame_to_half(&mut write_half, &env.payload).await {
-                    debug!(name = %sub_name, err = ?e, "send loop: write failed; closing");
+                    // Promoted DEBUG→WARN with structured sub.name —
+                    // this is one of the two paths that previously
+                    // produced the silent-zombie subscriber. Per SPEC
+                    // error-cascade discipline (Maker 2026-05-25),
+                    // every connection-tear-down emits a visible
+                    // structured event. The other path is
+                    // heartbeat.rs:108.
+                    let sub_logical_name = {
+                        let subs_guard = subs.lock().await;
+                        subs_guard
+                            .get(&sub_name)
+                            .map(|s| s.name.clone())
+                            .unwrap_or_default()
+                    };
+                    warn!(
+                        name = %sub_name,
+                        sub_name = %sub_logical_name,
+                        err = ?e,
+                        reason = "send_write_failed",
+                        "send loop: write to peer failed; signaling close \
+                         (BUG-AGNO-SILENT-HANG defense)"
+                    );
                     let mut subs_guard = subs.lock().await;
                     if let Some(sub) = subs_guard.get_mut(&sub_name) {
-                        sub.closed = true;
+                        // signal_close() marks closed AND fires the
+                        // per-sub notify, which wakes recv_loop's
+                        // tokio::select! so it exits — forcing
+                        // tokio::join! to complete and the
+                        // connection_handler to purge from the map.
+                        sub.signal_close();
                     }
                     return;
                 }

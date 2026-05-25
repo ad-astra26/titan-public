@@ -280,8 +280,6 @@ class TestContractJsons:
             # Phase 2 ACT-R defaults (PLAN_synthesis_engine_Phase2.md §2C, 2026-05-24).
             "actr_episodic_recall_helper.json",
             "actr_procedural_skill_proposer.json",
-            # Phase 3 P3.E (D-SPEC-127, 2026-05-25) — sort-order before user bundle.
-            "actr_topic_conversation_bundle.json",
             "actr_user_conversation_bundle.json",
             "actr_working_memory_decay.json",
             "monoculture_detector.json",

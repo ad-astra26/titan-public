@@ -19,9 +19,11 @@
 //! - `closed` — flag; broker purges closed subscribers from the map
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use titan_core::bus_specs::Priority;
 use titan_core::constants::BUS_SLOW_CONSUMER_DROP_RATE_RATIO;
+use tokio::sync::Notify;
 
 use crate::ring::{BoundedRing, EnqueueOutcome, Envelope, RingError};
 
@@ -117,7 +119,30 @@ pub struct BrokerSubscriber {
     pub last_window_reset_ts: SystemTime,
 
     /// Connection closed (broker purges on next sweep).
+    ///
+    /// **Forbidden direct assignment** — all callers MUST use
+    /// [`BrokerSubscriber::signal_close`] (see method docstring for the
+    /// BUG-AGNO-SILENT-HANG context — direct `closed = true` without
+    /// firing the per-sub notify leaves recv_loop blocked in `socket.read()`
+    /// indefinitely, producing the silent-zombie subscriber state observed
+    /// 2026-05-25 fleet-wide).
     pub closed: bool,
+
+    /// Per-subscriber wake notify. Fired by:
+    ///
+    /// 1. fanout (broker.rs) when a new message lands in this sub's ring
+    ///    → wakes `run_send_loop_via_map` to flush.
+    /// 2. [`signal_close`](Self::signal_close) when shutdown is requested
+    ///    → wakes BOTH `run_send_loop_via_map` AND `run_recv_loop`
+    ///    (which selects on this notify alongside its read_exact),
+    ///    ensuring both tasks exit promptly so the connection_handler
+    ///    purges the map entry instead of leaving a zombie subscriber.
+    ///
+    /// Cloned into the broker's `notify_per_sub` map at subscriber-creation
+    /// time (handle_connection) so fanout can reach it without re-locking
+    /// the subs map. The Arc<Notify> shared identity means firing on EITHER
+    /// reference wakes all listeners.
+    pub notify: Arc<Notify>,
 
     /// `true` once this connection has sent at least one `BUS_SUBSCRIBE`
     /// frame. Distinguishes a **pre-subscribe** anon (just connected, not
@@ -150,6 +175,7 @@ impl BrokerSubscriber {
             last_slow_consumer_warn_ts: None,
             last_window_reset_ts: now,
             closed: false,
+            notify: Arc::new(Notify::new()),
             has_subscribed: false,
         }
     }
@@ -170,8 +196,42 @@ impl BrokerSubscriber {
             last_slow_consumer_warn_ts: None,
             last_window_reset_ts: now,
             closed: false,
+            notify: Arc::new(Notify::new()),
             has_subscribed: false,
         }
+    }
+
+    /// Mark this subscriber closed AND wake both `run_recv_loop` (via
+    /// `tokio::select!` on `self.notify`) and `run_send_loop_via_map`
+    /// (via existing `notify.notified()` wait) so they exit promptly.
+    ///
+    /// **Why this method exists** — BUG-AGNO-SILENT-HANG fix
+    /// (2026-05-25): direct `closed = true` assignment without
+    /// notifying left `run_recv_loop` blocked in `read_half.read_exact`
+    /// forever (the underlying socket was half-open — broker stopped
+    /// pulling but hadn't closed write_half). The recv_task never
+    /// exited → `tokio::join!(recv_task, send_task)` in
+    /// `handle_connection` never completed → subscriber stayed in the
+    /// map with `closed=true` → every fanout to `dst=<sub.name>`
+    /// silent-skipped (broker.rs:663). Result: silent zombie
+    /// subscriber. Observed on T2 fleet-wide 2026-05-25 after chat #1
+    /// succeeded → chat #2+ vanished without trace until manual
+    /// restart. Same class as
+    /// `project_sphere_pulse_not_reaching_broker_freeze_20260522`.
+    ///
+    /// **All call sites must use this method.** Direct `closed = true`
+    /// is forbidden going forward (the field is `pub` only because
+    /// existing tests construct it directly; production code must
+    /// route through `signal_close`).
+    ///
+    /// Idempotent: safe to call multiple times.
+    pub fn signal_close(&mut self) {
+        self.closed = true;
+        // notify_waiters() wakes ALL pending listeners on this notify
+        // (send_loop + recv_loop in select). notify_one() would only
+        // wake one — we explicitly want both tasks to observe the
+        // closed flag and exit.
+        self.notify.notify_waiters();
     }
 
     /// Enqueue a message, applying P1 coalesce-by-(src,type) when applicable.
@@ -471,5 +531,105 @@ mod tests {
         assert!(pre.subscribed_topics.is_empty() && !pre.reply_only);
         assert!(subscribed_empty.subscribed_topics.is_empty() && !subscribed_empty.reply_only);
         assert_ne!(pre.has_subscribed, subscribed_empty.has_subscribed);
+    }
+
+    // ── BUG-AGNO-SILENT-HANG fix tests (2026-05-25) ──────────────
+
+    #[tokio::test]
+    async fn signal_close_marks_closed_and_wakes_notify() {
+        // Smoking-gun test for BUG-AGNO-SILENT-HANG:
+        // signal_close MUST both mark closed AND wake any task
+        // awaiting the per-sub notify. Without the wake, recv_loop
+        // stays blocked in read_exact forever → silent zombie.
+        let mut sub = BrokerSubscriber::new("agno_worker");
+        assert!(!sub.closed);
+        let notify_ref = sub.notify.clone();
+
+        // Spawn a "fake recv_loop" that awaits the notify.
+        let woken = std::sync::Arc::new(tokio::sync::Mutex::new(false));
+        let woken_clone = woken.clone();
+        let task = tokio::spawn(async move {
+            notify_ref.notified().await;
+            *woken_clone.lock().await = true;
+        });
+
+        // Give the spawned task a chance to start awaiting.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Fire signal_close — should mark closed AND wake the task.
+        sub.signal_close();
+        assert!(sub.closed);
+
+        // Wait for the task to observe the notification.
+        tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .expect(
+                "recv_loop equivalent did not wake within 200ms — \
+                 BUG-AGNO-SILENT-HANG regression: signal_close not waking notify",
+            )
+            .unwrap();
+        assert!(*woken.lock().await);
+    }
+
+    #[tokio::test]
+    async fn signal_close_is_idempotent() {
+        // Repeated signal_close must be safe (heartbeat may fire it
+        // again on subsequent ticks while purge is in flight).
+        let mut sub = BrokerSubscriber::new("worker");
+        sub.signal_close();
+        sub.signal_close();
+        sub.signal_close();
+        assert!(sub.closed);
+        // No panic = pass.
+    }
+
+    #[tokio::test]
+    async fn signal_close_wakes_multiple_waiters() {
+        // Both send_loop AND recv_loop wait on the same per-sub
+        // notify. signal_close MUST wake BOTH (notify_waiters, not
+        // notify_one) — otherwise one of them stays blocked forever
+        // → silent zombie state returns.
+        let mut sub = BrokerSubscriber::new("worker");
+        let n1 = sub.notify.clone();
+        let n2 = sub.notify.clone();
+
+        let counter = std::sync::Arc::new(tokio::sync::Mutex::new(0u32));
+        let c1 = counter.clone();
+        let c2 = counter.clone();
+
+        let t1 = tokio::spawn(async move {
+            n1.notified().await;
+            *c1.lock().await += 1;
+        });
+        let t2 = tokio::spawn(async move {
+            n2.notified().await;
+            *c2.lock().await += 1;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        sub.signal_close();
+
+        tokio::time::timeout(Duration::from_millis(200), async {
+            t1.await.unwrap();
+            t2.await.unwrap();
+        })
+        .await
+        .expect(
+            "notify_waiters() did not wake both listeners — \
+             BUG-AGNO-SILENT-HANG regression",
+        );
+
+        assert_eq!(*counter.lock().await, 2, "expected both waiters to wake");
+    }
+
+    #[test]
+    fn new_subscriber_has_fresh_notify() {
+        // Each subscriber gets its own Notify — firing one does NOT
+        // wake another's listeners.
+        let sub_a = BrokerSubscriber::new("a");
+        let sub_b = BrokerSubscriber::new("b");
+        // Different Arc identities.
+        assert!(!Arc::ptr_eq(&sub_a.notify, &sub_b.notify));
     }
 }

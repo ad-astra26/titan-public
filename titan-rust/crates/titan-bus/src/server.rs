@@ -158,6 +158,16 @@ pub async fn run_recv_loop(
     mut read_half: tokio::net::unix::OwnedReadHalf,
     sub_name: String,
     inbound_tx: mpsc::UnboundedSender<(String, InboundEvent)>,
+    // BUG-AGNO-SILENT-HANG fix (2026-05-25): broker-side shutdown
+    // signal. Fired by `BrokerSubscriber::signal_close()` when the
+    // subscriber is marked closed (heartbeat timeout or send-loop
+    // write failure). Without this, the recv_loop would block in
+    // `read_half.read_exact` indefinitely on a half-open connection
+    // → recv_task never exits → connection_handler's tokio::join!
+    // never completes → subscriber stays in the broker's map with
+    // `closed=true` → every fanout silent-skips → silent zombie.
+    // See `BrokerSubscriber::signal_close` doc for full reasoning.
+    shutdown_notify: Arc<Notify>,
 ) {
     // We re-create a UnixStream-like read API on the half. tokio's
     // OwnedReadHalf supports AsyncRead but not the full UnixStream API
@@ -165,23 +175,73 @@ pub async fn run_recv_loop(
     // AsyncRead — generic. For C2-2.b we use a small helper.
     use tokio::io::AsyncReadExt;
     loop {
-        // Read length prefix (4 bytes)
+        // Read length prefix (4 bytes). Wrapped in tokio::select! with
+        // the shutdown notify so a broker-side close request (e.g.
+        // heartbeat timeout) wakes us out of the blocking read.
         let mut prefix = [0u8; 4];
-        if read_half.read_exact(&mut prefix).await.is_err() {
-            debug!(name = %sub_name, "recv loop: peer closed");
+        let prefix_result = tokio::select! {
+            r = read_half.read_exact(&mut prefix) => r,
+            _ = shutdown_notify.notified() => {
+                // Promoted from silent path: closure-by-broker is
+                // surfaced at INFO so the kernel log retains a single
+                // unambiguous trace of every connection exit reason.
+                // Per SPEC error-cascade discipline (Maker 2026-05-25):
+                // every failure mode emits a structured, visible event.
+                tracing::info!(
+                    name = %sub_name,
+                    reason = "broker_shutdown_signal",
+                    "recv loop: exiting on shutdown signal from broker"
+                );
+                return;
+            }
+        };
+        if prefix_result.is_err() {
+            // Promoted DEBUG→INFO: peer-close is normal but the kernel
+            // log MUST retain a marker (SPEC error-cascade discipline).
+            tracing::info!(
+                name = %sub_name,
+                reason = "peer_eof_prefix",
+                "recv loop: peer closed (EOF before length-prefix)"
+            );
             break;
         }
         let n = match decode_length_prefix(&prefix) {
             Ok(n) => n as usize,
             Err(e) => {
-                warn!(name = %sub_name, err = ?e, "recv loop: invalid length prefix; closing");
+                // Promoted WARN→ERROR with structured fields: a
+                // malformed length-prefix means the wire protocol is
+                // broken (auth bypass attempt? client bug? memory
+                // corruption?) — operator MUST see this.
+                tracing::error!(
+                    name = %sub_name,
+                    err = ?e,
+                    reason = "malformed_length_prefix",
+                    "recv loop: ERROR — invalid length prefix; closing connection"
+                );
                 break;
             }
         };
         let mut payload = vec![0u8; n];
-        if n > 0 && read_half.read_exact(&mut payload).await.is_err() {
-            debug!(name = %sub_name, "recv loop: peer closed mid-frame");
-            break;
+        if n > 0 {
+            let payload_result = tokio::select! {
+                r = read_half.read_exact(&mut payload) => r,
+                _ = shutdown_notify.notified() => {
+                    tracing::info!(
+                        name = %sub_name,
+                        reason = "broker_shutdown_signal_mid_frame",
+                        "recv loop: exiting on shutdown signal mid-frame"
+                    );
+                    return;
+                }
+            };
+            if payload_result.is_err() {
+                tracing::info!(
+                    name = %sub_name,
+                    reason = "peer_eof_mid_frame",
+                    "recv loop: peer closed mid-frame"
+                );
+                break;
+            }
         }
 
         // Decode header + classify
