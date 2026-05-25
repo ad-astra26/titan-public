@@ -57,14 +57,40 @@ pub fn encode_ping_envelope() -> Envelope {
     }
 }
 
+/// Boot-grace window: heartbeat-timeout enforcement is SUSPENDED for the
+/// first `BOOT_GRACE_S` seconds after broker start.
+///
+/// **Why** (BUG-AGNO-SILENT-HANG follow-up, 2026-05-25): under heavy VPS
+/// load (observed: load avg 17/4 cores during fleet restart), workers
+/// can't always send BUS_PONG within the 15s `BUS_PING_TIMEOUT_S` ceiling
+/// — scheduling latency alone can exceed it during the boot storm where
+/// 30+ workers attach simultaneously. Pre-grace, this caused a cascading
+/// close→reconnect cycle (39 closes in 30s observed) that prevented
+/// agno_worker chat from stabilizing.
+///
+/// 120s is sized to cover:
+///   - the worst-observed boot cascade (~60s of churn)
+///   - 2x margin for slower VPS conditions
+///   - well within human-perceptible liveness expectations
+///
+/// After grace, normal 15s timeout enforcement resumes. Steady-state
+/// behavior unchanged — a TRULY dead worker still gets force-closed
+/// within 15s of going silent.
+///
+/// SPEC error-cascade discipline (Maker 2026-05-25): grace expiry +
+/// resumed enforcement is logged at INFO so operators see the
+/// transition.
+const BOOT_GRACE_S: f64 = 120.0;
+
 /// Run the heartbeat loop forever. Caller wraps in `tokio::spawn` + holds a
 /// shutdown signal externally to stop it.
 ///
 /// Per `BUS_PING_INTERVAL_S=5.0` cadence:
 /// 1. Walk the subscriber map.
 /// 2. For each non-closed subscriber:
-///    - If `last_pong_ts` exceeds `BUS_PING_TIMEOUT_S` → mark closed; broker
-///      purges in the next sweep.
+///    - If `last_pong_ts` exceeds `BUS_PING_TIMEOUT_S` AND boot-grace has
+///      elapsed → mark closed via `signal_close()`; recv_loop + send_loop
+///      exit promptly; connection_handler purges.
 ///    - Otherwise → enqueue a `BUS_PING` envelope into their ring.
 pub async fn run_heartbeat_loop(
     subs: Arc<Mutex<SubscriberMap>>,
@@ -74,10 +100,30 @@ pub async fn run_heartbeat_loop(
     let mut interval = interval(Duration::from_secs_f64(BUS_PING_INTERVAL_S));
     interval.tick().await; // first tick fires immediately; consume it
 
+    let broker_start = SystemTime::now();
+    let mut boot_grace_logged = false;
+
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                heartbeat_tick(&subs, &notify_per_sub).await;
+                let in_boot_grace = SystemTime::now()
+                    .duration_since(broker_start)
+                    .map(|d| d.as_secs_f64() < BOOT_GRACE_S)
+                    .unwrap_or(false);
+                if !in_boot_grace && !boot_grace_logged {
+                    // SPEC error-cascade discipline: surface the
+                    // transition so operators see when full enforcement
+                    // resumed (helps correlate post-grace timeouts to
+                    // true dead workers vs boot-storm artifacts).
+                    tracing::info!(
+                        grace_s = BOOT_GRACE_S,
+                        timeout_s = BUS_PING_TIMEOUT_S,
+                        "heartbeat boot-grace window expired; \
+                         full timeout enforcement now active"
+                    );
+                    boot_grace_logged = true;
+                }
+                heartbeat_tick(&subs, &notify_per_sub, in_boot_grace).await;
             }
             _ = shutdown.notified() => {
                 debug!("heartbeat loop: shutdown signal received");
@@ -88,9 +134,13 @@ pub async fn run_heartbeat_loop(
 }
 
 /// One iteration of the heartbeat loop. Exposed for unit testing.
+///
+/// `in_boot_grace=true` suspends timeout enforcement (still sends
+/// pings; just doesn't close on timeout). See [`BOOT_GRACE_S`] docstring.
 pub async fn heartbeat_tick(
     subs: &Arc<Mutex<SubscriberMap>>,
     notify_per_sub: &Arc<Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>>,
+    in_boot_grace: bool,
 ) {
     let now = SystemTime::now();
     let names: Vec<String> = subs.lock().await.keys().cloned().collect();
@@ -104,7 +154,7 @@ pub async fn heartbeat_tick(
             };
             if sub.closed {
                 HeartbeatResult::Closed
-            } else if is_pong_timeout(sub.last_pong_ts, now) {
+            } else if is_pong_timeout(sub.last_pong_ts, now) && !in_boot_grace {
                 // Promoted WARN→ERROR with structured fields per SPEC
                 // error-cascade discipline (Maker 2026-05-25). This is
                 // ONE OF TWO paths that previously produced silent-zombie
@@ -197,7 +247,7 @@ mod tests {
             .await
             .insert("alive".to_string(), notify.clone());
 
-        heartbeat_tick(&subs, &notify_map).await;
+        heartbeat_tick(&subs, &notify_map, false).await;
 
         // Sub should have one BUS_PING enqueued
         let s = subs.lock().await;
@@ -214,7 +264,7 @@ mod tests {
         let subs = Arc::new(Mutex::new(map));
         let notify_map = Arc::new(Mutex::new(HashMap::new()));
 
-        heartbeat_tick(&subs, &notify_map).await;
+        heartbeat_tick(&subs, &notify_map, false).await;
 
         let s = subs.lock().await;
         assert!(s.get("dead").unwrap().closed);
@@ -229,7 +279,7 @@ mod tests {
         let subs = Arc::new(Mutex::new(map));
         let notify_map = Arc::new(Mutex::new(HashMap::new()));
 
-        heartbeat_tick(&subs, &notify_map).await;
+        heartbeat_tick(&subs, &notify_map, false).await;
 
         // No ping enqueued; sub still closed
         let s = subs.lock().await;
