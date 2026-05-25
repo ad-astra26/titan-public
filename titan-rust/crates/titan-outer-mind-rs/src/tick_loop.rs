@@ -38,12 +38,7 @@ use titan_trinity_daemon::{
 const CHECKPOINT_WRITE_EVERY_N_TICKS: u64 = 240;
 const CHECKPOINT_PART: &str = "outer_mind";
 
-pub async fn run(
-    bus_socket: &Path,
-    authkey: &[u8],
-    shm_dir: &Path,
-    data_dir: &Path,
-) -> Result<()> {
+pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path, data_dir: &Path) -> Result<()> {
     let client = BusClient::connect(bus_socket, authkey, "outer-mind")
         .await
         .with_context(|| format!("bus connect to {}", bus_socket.display()))?;
@@ -403,7 +398,8 @@ async fn run_tick_loop(
         }
     }
     if let Some(o) = last_obs_restored.as_ref() {
-        if let Err(e) = write_checkpoint_for_part::<15>(&data_dir, CHECKPOINT_PART, &prev, &prev2, o)
+        if let Err(e) =
+            write_checkpoint_for_part::<15>(&data_dir, CHECKPOINT_PART, &prev, &prev2, o)
         {
             warn!(err = ?e, "final checkpoint write failed");
         }
