@@ -502,8 +502,7 @@ mod tests {
             mind_clk.consecutive_balanced > body_clk.consecutive_balanced,
             "mind (uniform tensor → high coherence) should accumulate more balanced ticks than \
              body (high-variance tensor → low coherence); got body={} mind={}",
-            body_clk.consecutive_balanced,
-            mind_clk.consecutive_balanced
+            body_clk.consecutive_balanced, mind_clk.consecutive_balanced
         );
     }
 

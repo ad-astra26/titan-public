@@ -143,6 +143,16 @@ def verify_post(
     chat_id: str = "",
     turn_index: int = 0,
     topic_tags: Optional[list] = None,
+    # Phase 3 (D-SPEC-127) — arch §7 normative content carry. Like the
+    # P2 closure kwargs, defaults are byte-identical to pre-P3 behavior:
+    # empty tool_calls/neuromods + empty embedding_hash + importance 0.5
+    # (cold-start) produce a TX content shape that's a strict superset of
+    # the P2 shape (new keys are zero-valued; consumers ignore unknown
+    # keys cleanly). Non-chat callers still get safe defaults.
+    tool_calls: Optional[list] = None,
+    neuromods: Optional[dict] = None,
+    embedding_hash: str = "",
+    importance: float = 0.5,
 ) -> VerifiedResult:
     """Verify, sign, and TimeChain-commit an LLM response.
 
@@ -273,6 +283,8 @@ def verify_post(
                 ovg_result, prompt_text=prompt,
                 user_id=user_id, chat_id=chat_id, turn_index=turn_index,
                 topic_tags=topic_tags,
+                tool_calls=tool_calls, neuromods=neuromods,
+                embedding_hash=embedding_hash, importance=importance,
             )
             if tc_payload:
                 from titan_hcl.bus import TIMECHAIN_COMMIT, make_msg
@@ -329,6 +341,12 @@ async def verify_post_async(
     chat_id: str = "",
     turn_index: int = 0,
     topic_tags: Optional[list] = None,
+    # Phase 3 (D-SPEC-127) — arch §7 normative content carry. See
+    # verify_post() docstring; sync + async paths share the kwarg shape.
+    tool_calls: Optional[list] = None,
+    neuromods: Optional[dict] = None,
+    embedding_hash: str = "",
+    importance: float = 0.5,
 ) -> VerifiedResult:
     """Async verify_post with split safety / signing.
 
@@ -487,6 +505,10 @@ async def verify_post_async(
                 chat_id=chat_id,
                 turn_index=turn_index,
                 topic_tags=topic_tags,
+                tool_calls=tool_calls,
+                neuromods=neuromods,
+                embedding_hash=embedding_hash,
+                importance=importance,
             )
         )
         return VerifiedResult(
@@ -520,6 +542,8 @@ async def verify_post_async(
         guard_alert, violations, violation_type, append_guard_on_pass,
         user_id=user_id, chat_id=chat_id, turn_index=turn_index,
         topic_tags=topic_tags,
+        tool_calls=tool_calls, neuromods=neuromods,
+        embedding_hash=embedding_hash, importance=importance,
     )
 
 
@@ -528,7 +552,13 @@ async def _sign_and_attach(sign_coro, *, output_verifier, safety_result,
                            src_for_timechain: str,
                            user_id: str = "", chat_id: str = "",
                            turn_index: int = 0,
-                           topic_tags: Optional[list] = None):
+                           topic_tags: Optional[list] = None,
+                           # Phase 3 (D-SPEC-127) §7 content carry — see
+                           # verify_post() docstring.
+                           tool_calls: Optional[list] = None,
+                           neuromods: Optional[dict] = None,
+                           embedding_hash: str = "",
+                           importance: float = 0.5):
     """Run the sign coroutine and publish TimeChain commit. Returns the
     SignedResult (or None on failure)."""
     signed = await sign_coro
@@ -558,7 +588,9 @@ async def _sign_and_attach(sign_coro, *, output_verifier, safety_result,
             tc_payload = output_verifier.build_timechain_payload(
                 ovg_compat, prompt_text=prompt,
                 user_id=user_id, chat_id=chat_id, turn_index=turn_index,
-                topic_tags=topic_tags)
+                topic_tags=topic_tags,
+                tool_calls=tool_calls, neuromods=neuromods,
+                embedding_hash=embedding_hash, importance=importance)
             if tc_payload:
                 from titan_hcl.bus import TIMECHAIN_COMMIT, make_msg
                 bus.publish(
@@ -579,7 +611,13 @@ def _assemble_signed_result(final_text: str, safety, signed,
                             *,
                             user_id: str = "", chat_id: str = "",
                             turn_index: int = 0,
-                            topic_tags: Optional[list] = None) -> VerifiedResult:
+                            topic_tags: Optional[list] = None,
+                            # Phase 3 (D-SPEC-127) §7 content carry — see
+                            # verify_post() docstring.
+                            tool_calls: Optional[list] = None,
+                            neuromods: Optional[dict] = None,
+                            embedding_hash: str = "",
+                            importance: float = 0.5) -> VerifiedResult:
     """For concurrent_sign=False legacy path — assemble final result inline."""
     signature = getattr(signed, "signature", None) if signed else None
     merkle_root = getattr(signed, "merkle_root", "") if signed else ""
@@ -602,7 +640,9 @@ def _assemble_signed_result(final_text: str, safety, signed,
             tc_payload = output_verifier.build_timechain_payload(
                 ovg_compat, prompt_text=prompt,
                 user_id=user_id, chat_id=chat_id, turn_index=turn_index,
-                topic_tags=topic_tags)
+                topic_tags=topic_tags,
+                tool_calls=tool_calls, neuromods=neuromods,
+                embedding_hash=embedding_hash, importance=importance)
             if tc_payload:
                 from titan_hcl.bus import TIMECHAIN_COMMIT, make_msg
                 bus.publish(

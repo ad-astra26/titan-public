@@ -1877,12 +1877,58 @@ def create_post_hook(plugin):
                     or getattr(agent, "session_id", "")
                     or ""
                 )
-                # turn_index Phase 2 closure ships 0 as the safe default —
-                # full per-session counter lands with the Phase 3 episodic
-                # model (rFP §18 Phase 3: granularity-aware retrieval). Until
-                # then bundle order is preserved by ring-buffer insertion-time
-                # ordering in StandingBundleStore (newest-first).
-                _ovg_turn_index = int(kwargs.get("turn_index", 0) or 0)
+                # Phase 3 (D-SPEC-127): turn_index now resolves through
+                # synthesis.turn_index_store (P3.B) — caller kwarg still
+                # wins if explicitly supplied (preserves test injection +
+                # external orchestration overrides).
+                _ovg_turn_index = kwargs.get("turn_index")
+                if _ovg_turn_index is None and _ovg_chat_id:
+                    try:
+                        from titan_hcl.synthesis.turn_index_store import (
+                            next_turn_index,
+                        )
+                        _ovg_turn_index = next_turn_index(_ovg_chat_id)
+                    except Exception as _ti_err:
+                        logger.warning(
+                            "[PostHook] turn_index resolve failed: %s "
+                            "(falling back to 0)", _ti_err)
+                        _ovg_turn_index = 0
+                _ovg_turn_index = int(_ovg_turn_index or 0)
+
+                # Phase 3 §7 normative content carry: felt-state snapshot
+                # + tool-calls extraction. Both soft-fail to empty/zero
+                # values so chat path never breaks on SHM unavailability
+                # or malformed run_output.tools.
+                _p3_snapshot: dict = {}
+                _p3_tool_calls: list = []
+                try:
+                    from titan_hcl.synthesis.turn_snapshot import (
+                        capture_turn_snapshot, extract_tool_calls,
+                    )
+                    _p3_snapshot = capture_turn_snapshot()
+                    _p3_tool_calls = extract_tool_calls(
+                        getattr(run_output, "tools", None))
+                except Exception as _p3_err:
+                    logger.warning(
+                        "[PostHook:P3] turn snapshot/tool-call extraction "
+                        "failed (non-blocking): %s", _p3_err)
+
+                # Phase 3 §7 NEW: topic-tag extraction (P3.C). Lives in
+                # llm_pipeline.topic_extractor; deterministic in-process
+                # match against inner_memory.db knowledge_concepts.topic.
+                # Caller-supplied topic_tags merge inside verify_post_async.
+                _p3_topic_tags: list = []
+                try:
+                    from titan_hcl.llm_pipeline.topic_extractor import (
+                        extract_topic_tags,
+                    )
+                    _p3_topic_tags = extract_topic_tags(
+                        user_prompt, response_text)
+                except Exception as _tx_err:
+                    logger.warning(
+                        "[PostHook:P3] topic-tag extraction failed "
+                        "(non-blocking): %s", _tx_err)
+
                 from titan_hcl.llm_pipeline.verifier import verify_post_async
                 _verified = await verify_post_async(
                     response_text,
@@ -1894,10 +1940,16 @@ def create_post_hook(plugin):
                     # Chat path default: append guard_message footer on pass,
                     # publish TIMECHAIN_COMMIT for verified outputs.
                     concurrent_sign=True,
-                    # Arch §7 chat-TX shape kwargs.
+                    # Arch §7 chat-TX shape kwargs (P2 closure):
                     user_id=_ovg_user_id,
                     chat_id=_ovg_chat_id,
                     turn_index=_ovg_turn_index,
+                    topic_tags=_p3_topic_tags,
+                    # Arch §7 normative content carry (Phase 3 D-SPEC-127):
+                    tool_calls=_p3_tool_calls,
+                    neuromods=_p3_snapshot.get("neuromods"),
+                    embedding_hash=_p3_snapshot.get("embedding_hash", ""),
+                    importance=_p3_snapshot.get("importance", 0.5),
                 )
                 response_text = _verified.text
                 if hasattr(run_output, 'content'):
