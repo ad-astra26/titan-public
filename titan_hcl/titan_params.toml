@@ -518,48 +518,80 @@ weight_spirit = 1.2
 
 
 # ─── TRINITY RESTORING FORCE (SPEC §G5.2 / D-SPEC-112 — homeostasis kernel) ──
-# Per-Titan tunable gains for the §G5.2 closed-form integrator running inside
-# the 6 trinity-part daemons (inner/outer × body/mind/spirit). Python L2 reads
-# this section at startup and publishes it as a fixed-layout SHM sidecar
-# `trinity_restoring.bin` in shm_dir/; each Rust daemon retry-loads at boot
-# and refreshes at ~1s cadence (titan-trinity-daemon::restoring_cfg).
+# Per-Titan, per-LAYER tunable gains for the §G5.2 closed-form integrator
+# running inside the 6 trinity-part daemons (inner/outer × body/mind/spirit).
+# Inner+outer of the same layer share one tuning unit (matches Rust `Layer`
+# enum {Body, Mind, Spirit} and PLAN §6.6.2 — "Body (inner+outer): keep
+# k_drive ~ 0.30 ... Mind (inner+outer): bump k_drive 0.30 → 0.40 ...").
 #
-# Conservative starting values; tuning pass expected after VERIFY gate (PLAN §3).
-# Layer gradient (INV-9 body 0.7/0.3, mind 0.5/0.5, spirit 0.3/0.7) is STRUCTURAL
-# — fixed in the Rust kernel, NOT a TOML key. Neuromod gain is LIVE — read from
-# neuromod_state.bin per tick, NOT a TOML key.
+# Python L2 reads the three subsections at startup and publishes them as one
+# fixed-layout SHM sidecar `trinity_restoring.bin` in shm_dir/ (3 layers × 8
+# floats × 4 bytes = 96 bytes, ordered body[0:32] → mind[32:64] → spirit[64:96]).
+# Each Rust daemon retry-loads at boot and refreshes at ~1s cadence
+# (titan-trinity-daemon::restoring_cfg::load_for_layer indexes its layer's
+# 32-byte slice based on the `Layer` enum).
 #
-# Risk note (PLAN §7): k_restore too high pins tensors at 0.5 (kills the journey).
-# Start gentle (0.05) and tune up only after the §3 VERIFY gate observes outer
-# coherence crossing the §G11 balance threshold without over-damping.
+# Per-layer schema D-SPEC-128 (v1.58.3, 2026-05-25) replaces the previous flat
+# `[trinity_restoring]` single-set-of-gains layout (8 floats / 32 bytes). All
+# 6 daemons previously got identical gains; bumping mind without affecting
+# body/spirit required the per-layer extension. No shims — flat schema deleted
+# (`feedback_no_shim_old_path_must_be_deleted`).
+#
+# Layer gradient (INV-9 body 0.7/0.3, mind 0.5/0.5, spirit 0.3/0.7) is
+# STRUCTURAL — fixed in the Rust kernel, NOT a TOML key. Neuromod gain is LIVE
+# — read from neuromod_state.bin per tick, NOT a TOML key.
+#
+# Risk note (PLAN §7): k_restore too high pins tensors at 0.5 (kills the
+# journey). Start gentle (0.05) and tune up only after the §3 VERIFY gate
+# observes outer coherence crossing the §G11 balance threshold without
+# over-damping.
 
 [trinity_restoring]
-# Drive coefficient — how fast the tensor tracks the raw producer per tick.
-# x_drive = k_drive · (1 + w_quant·a_mag·(2·magnitude − 1)) · (raw − x[t-1])
+# Top-level reserved for future shared constants; per-layer gains live in the
+# three subsections below.
+
+[trinity_restoring.body]
+# k_drive: how fast the tensor tracks the raw producer per tick.
+# Body already gets natural sensor perturbation; keep at the conservative
+# default. P0.6-A audit (2026-05-25) shows body breath_score 0.479–0.882 —
+# some dims breathing, none catastrophically flat. Tuning unnecessary.
 k_drive = 0.30
-
-# Restoring-spring coefficient — gentle PD position pull toward 0.5 Divine Centre.
-# Modulated per tick by `neuromod_gain` (from neuromod_state.bin) + the
-# coherence/polarity drift signal.
 k_restore = 0.05
-
-# PD damping coefficient — gentle opposition to velocity per §9.2.
 k_damp = 0.05
-
-# Momentum coefficient — velocity-carry feedback (§9.0 "velocity → momentum").
 k_mom = 0.10
-
-# Direction-continuity coefficient — trajectory bias (§9.0 "direction → continuity").
 k_dir = 0.05
-
-# Magnitude landing-gain amplitude. drive_gain ∈ [1 − w_quant·a_mag, 1 + w_quant·a_mag].
 a_mag = 0.50
-
-# Spring drift-modulation amplitude. spring_gain = 1 + w_qual·a_drift·((1−coh) + |pol|).
-# Higher = stronger off-centre pull; gentler for steady-state.
 a_drift = 1.00
+a_dmag = 0.50
 
-# Damping magnitude-modulation amplitude. damp_gain = 1 + w_quant·a_dmag·magnitude.
+[trinity_restoring.mind]
+# k_drive: BUMPED 0.30 → 0.40 per P0.6-B (PLAN §6.6.2). P0.6-A audit
+# (`AUDIT_p0_6_a_dim_breath_summary_20260525.md`) shows mind dims are flat
+# fleet-wide: std 0.01–0.05, cluster% 95–100%, NO bimodal saturation. Raw NS
+# / neuromod signal exists at source — the §G5.2 restoring spring is too
+# strong relative to drive, smoothing the perturbation away before it reaches
+# the published tensor. Lifting k_drive lets mind "feel" raw signal more.
+k_drive = 0.40
+k_restore = 0.05
+k_damp = 0.05
+k_mom = 0.10
+k_dir = 0.05
+a_mag = 0.50
+a_drift = 1.00
+a_dmag = 0.50
+
+[trinity_restoring.spirit]
+# k_drive: unchanged for P0.6-B — PLAN §6.6.2 says "lower k_drive for
+# self-feedback loop (under review per P0.6-A findings)" but P0.6-A only
+# covered the 40 BMS dims (no spirit). Keeping at the conservative default
+# until a spirit-specific audit (P0.6-A-bis) informs the tuning decision.
+k_drive = 0.30
+k_restore = 0.05
+k_damp = 0.05
+k_mom = 0.10
+k_dir = 0.05
+a_mag = 0.50
+a_drift = 1.00
 a_dmag = 0.50
 
 

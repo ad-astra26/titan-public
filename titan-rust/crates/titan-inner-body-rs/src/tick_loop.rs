@@ -51,12 +51,7 @@ const SENSOR_CACHE_DIMS: usize = 5;
 
 /// Boot the daemon's runtime + drive the tick loop until SIGTERM /
 /// disconnect.
-pub async fn run(
-    bus_socket: &Path,
-    authkey: &[u8],
-    shm_dir: &Path,
-    data_dir: &Path,
-) -> Result<()> {
+pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path, data_dir: &Path) -> Result<()> {
     let client = BusClient::connect(bus_socket, authkey, "inner-body")
         .await
         .with_context(|| format!("bus connect to {}", bus_socket.display()))?;
