@@ -49,12 +49,7 @@ const CHECKPOINT_PART: &str = "outer_body";
 
 /// Boot the daemon's runtime + drive the tick loop until SIGTERM /
 /// disconnect.
-pub async fn run(
-    bus_socket: &Path,
-    authkey: &[u8],
-    shm_dir: &Path,
-    data_dir: &Path,
-) -> Result<()> {
+pub async fn run(bus_socket: &Path, authkey: &[u8], shm_dir: &Path) -> Result<()> {
     let client = BusClient::connect(bus_socket, authkey, "outer-body")
         .await
         .with_context(|| format!("bus connect to {}", bus_socket.display()))?;
@@ -107,7 +102,6 @@ pub async fn run(
         sensor_cache_path,
         firing_writer,
         shm_dir.to_path_buf(),
-        data_dir.to_path_buf(),
     )
     .await;
 
@@ -292,7 +286,6 @@ async fn run_tick_loop(
     sensor_cache_path: std::path::PathBuf,
     mut firing_writer: FiringSlotWriter,
     shm_dir: std::path::PathBuf,
-    data_dir: std::path::PathBuf,
 ) -> Result<()> {
     // Post-A.S8 D2 cadence migration (rFP §4.2): Schumann body (7.83 Hz)
     // tick + bus publish throttled to OUTER_BODY_BUS_PUBLISH_INTERVAL_S.
@@ -308,7 +301,7 @@ async fn run_tick_loop(
     // §G5.2 item 4 — restore exact tensor + observable state from checkpoint
     // on boot; cold-start at 0.5 only when sidecar absent/invalid.
     let (mut prev, mut prev2, mut last_obs_restored) =
-        match load_checkpoint_for_part::<5>(&data_dir, CHECKPOINT_PART) {
+        match load_checkpoint_for_part::<5>(&shm_dir, CHECKPOINT_PART) {
             Some(CheckpointSnapshot {
                 prev,
                 prev2,
@@ -384,7 +377,7 @@ async fn run_tick_loop(
                     if tick_count.is_multiple_of(CHECKPOINT_WRITE_EVERY_N_TICKS) {
                         if let Some(o) = last_obs_restored.as_ref() {
                             if let Err(e) = write_checkpoint_for_part::<5>(
-                                &data_dir,
+                                &shm_dir,
                                 CHECKPOINT_PART,
                                 &prev,
                                 &prev2,
@@ -409,7 +402,7 @@ async fn run_tick_loop(
         }
     }
     if let Some(o) = last_obs_restored.as_ref() {
-        if let Err(e) = write_checkpoint_for_part::<5>(&data_dir, CHECKPOINT_PART, &prev, &prev2, o)
+        if let Err(e) = write_checkpoint_for_part::<5>(&shm_dir, CHECKPOINT_PART, &prev, &prev2, o)
         {
             warn!(err = ?e, "final checkpoint write failed");
         }
