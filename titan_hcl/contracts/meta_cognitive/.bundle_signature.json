@@ -1,7 +1,7 @@
 {
-  "bundle_hash": "a249534a7969a63f341d4eba4f8fed9708a728bf21179ad291c899173ea19310",
+  "bundle_hash": "c6a54c71484b55bdd40d03e51a5f0f1eeafbc113abee90f2b3e61ae1ba193972",
   "approver_pubkey": "Bsg2swDJuPXgWwkq2aQuTxCrnv1iUQD3VLBXyYjMGcVN",
-  "approver_signature": "2dKZGtJiDv7P4BtHpxrzvqPCu17MWxRQwvrmHgN4QPXMqa7NPf7cSd9ZPyzeN1DiJvtUJn75J3y9maVj4oKqVjsj",
-  "signed_at": 1775753503.8078637,
-  "proposal_id": "93a5d9a1c1354783925e3d670334a53e"
+  "approver_signature": "xewsQLxoVjwz4w2pbdFCcCaB3qV7JhuRh9a2xSkgAdfKSFPN6rqbNcj2U2vozEbtrV3tJABUpmZtzu44w1vUguy",
+  "signed_at": 1779702774.3531084,
+  "proposal_id": "93a84dfe86ce42d89506b8e6cc8c11a5"
 }
