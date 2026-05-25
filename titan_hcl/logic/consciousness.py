@@ -77,14 +77,6 @@ def _meta_indices(ndims: int) -> tuple[int, int]:
     regardless of vector size, contaminating inner_mind[2:4] for 67D/132D
     vectors and leaving msl.py's [130:132] attention pointing at zero slots.
     This helper restores the documented architecture.
-
-    Meta-tail bounds (D-SPEC-127, SPEC v1.58.2): the value at the
-    curvature index is RADIANS [0, π] per compute_curvature(); the
-    density index is [0, 1] per compute_density(). These bounds are
-    distinct from the trinity-tensor slice's [0, 1] clamp (SPEC §G5.2
-    line 215). Audits that flag state_vector[meta_tail] > 1.0 as a
-    §G5.2 violation are measuring the wrong thing — see SPEC §G3
-    per-slice bounds paragraph.
     """
     if ndims == EXTENDED_NUM_DIMS:
         return (130, 131)

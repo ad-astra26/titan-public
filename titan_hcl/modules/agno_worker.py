@@ -953,6 +953,45 @@ def _build_worker_bus_client(send_queue, recv_queue, worker_name: str):
             after OVG correctly returned PASS upstream. Using the worker's
             primary name (`self._name`) means the reply goes to the
             worker's actual subscription. rid still drives matching.
+
+            **BUG-AGNO-SILENT-HANG fix (2026-05-25):** the `reply_queue`
+            parameter IS the worker's main `recv_queue` — see
+            `_WorkerBusClient.subscribe()` which ignores its `name` +
+            `reply_only` args and returns `self._recv` for every caller.
+            While this coroutine polls `reply_queue` via the executor
+            thread looking for an rid match, ANY message arriving in
+            `recv_queue` (CHAT_REQUEST, CHAT_STREAM_REQUEST,
+            MODULE_SHUTDOWN, another QUERY_RESPONSE, broadcast events)
+            can be popped here. Pre-fix, non-matching messages were
+            silently dropped (`continue` without re-queue), which
+            silently stole CHAT_REQUEST messages arriving during a
+            PostHook's `verify_safety_async` work-RPC → kernel-side
+            `AgnoBridge` timed out at 90s → fleet-wide silent
+            `agno_worker` degradation (T1 + T3 both observed 2026-05-25;
+            chat capability lost permanently per Titan once first race
+            triggered, until restart).
+
+            Fix: ACCUMULATE non-matching popped messages and re-queue
+            them on exit (matching reply found OR deadline reached).
+            Order among them is preserved (pop-order = re-put order).
+            The main loop picks them up on next iteration. Restores the
+            invariant "every message put into `recv_queue` is eventually
+            processed by exactly one consumer."
+
+            Caveats:
+              - Concurrent `request_async` calls (multiple PostHooks in
+                flight) can interleave re-queueing; messages may be
+                re-popped + re-queued repeatedly until their intended
+                consumer (main loop OR a specific request_async) finds
+                them. Bounded by deadline; correct semantics preserved.
+              - The proper fix is a per-proxy dedicated reply queue
+                (`subscribe()` returning a real per-name queue), which
+                requires kernel-side routing changes. Tracked as
+                follow-up; this is the minimal-correct restoration.
+              - Same shared-queue pattern affects all 6 proxies that
+                subscribe in worker context (output_verifier, life_force,
+                assessment, metabolism, rl, media). This fix in
+                _WorkerBusClient.request_async covers all of them.
             """
             from queue import Empty as _Empty
             import asyncio as _aio
@@ -976,17 +1015,37 @@ def _build_worker_bus_client(send_queue, recv_queue, worker_name: str):
                 return None
 
             deadline = time.time() + float(timeout)
-            while time.time() < deadline:
-                try:
-                    reply = await _aio.get_event_loop().run_in_executor(
-                        None, lambda: reply_queue.get(True, 0.05),
-                    )
-                except (_Empty, Exception):
-                    continue
-                if not reply:
-                    continue
-                if reply.get("rid") == request_id:
-                    return reply
-            return None
+            # Accumulate non-matching popped messages; re-queue on exit.
+            # See docstring "BUG-AGNO-SILENT-HANG fix" for full reasoning.
+            pending_redeliver: list = []
+            try:
+                while time.time() < deadline:
+                    try:
+                        reply = await _aio.get_event_loop().run_in_executor(
+                            None, lambda: reply_queue.get(True, 0.05),
+                        )
+                    except (_Empty, Exception):
+                        continue
+                    if not reply:
+                        continue
+                    if reply.get("rid") == request_id:
+                        return reply
+                    # rid mismatch — NEVER drop. Stash for re-delivery.
+                    pending_redeliver.append(reply)
+                return None
+            finally:
+                # Re-queue popped non-matching messages in pop-order so
+                # the main loop (or concurrent request_async callers)
+                # can process them. Re-queue failure logs LOUDLY — the
+                # only known cause is a closed queue at shutdown.
+                for msg in pending_redeliver:
+                    try:
+                        reply_queue.put_nowait(msg)
+                    except Exception as redeliver_err:
+                        logger.error(
+                            "[WorkerBusClient] redeliver put_nowait failed "
+                            "— message LOST (type=%s rid=%s): %s",
+                            msg.get("type"), msg.get("rid"),
+                            redeliver_err)
 
     return _WorkerBusClient(send_queue, recv_queue, worker_name)
