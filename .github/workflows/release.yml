@@ -1,0 +1,141 @@
+# Titan release pipeline — builds 9 musl daemons + attaches them to a GitHub
+# Release whose body comes from the CHANGELOG.md section matching the tag.
+#
+# Fires on the PUBLIC repo (ad-astra26/titan-public) when a `v*` tag lands.
+# Tags are created with `scripts/cut_release.sh` (which tags on the public
+# repo since SHAs differ from dev). Tags do NOT sync from dev — this is
+# deliberate per RFP_Titan_setup_release W6 (decoupled product semver).
+#
+# Output: a GitHub Release with
+#   - body = CHANGELOG.md "## <tag>" section (falls back to git log if missing)
+#   - 9 x86_64-linux-musl binaries attached
+#   - SHA256SUMS file alongside (verify with `sha256sum -c SHA256SUMS`)
+#
+# No secrets used. Only the default GITHUB_TOKEN (scoped contents: write).
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # full history so the CHANGELOG awk can verify
+
+      - name: Resolve tag name
+        id: tag
+        run: echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain (stable + musl target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            titan-rust/target
+          key: cargo-release-${{ hashFiles('titan-rust/Cargo.lock') }}
+
+      - name: Build 9 musl daemons (release)
+        working-directory: titan-rust
+        run: cargo build --release --bins --target x86_64-unknown-linux-musl
+
+      - name: Stage binaries + compute checksums
+        id: stage
+        run: |
+          set -euo pipefail
+          STAGE=release-staging
+          mkdir -p "$STAGE"
+          BINS=(
+            titan-inner-body-rs
+            titan-inner-mind-rs
+            titan-inner-spirit-rs
+            titan-kernel-rs
+            titan-outer-body-rs
+            titan-outer-mind-rs
+            titan-outer-spirit-rs
+            titan-trinity-rs
+            titan-unified-spirit-rs
+          )
+          SRC=titan-rust/target/x86_64-unknown-linux-musl/release
+          for b in "${BINS[@]}"; do
+            [[ -x "$SRC/$b" ]] || { echo "::error::missing binary $SRC/$b"; exit 1; }
+            cp "$SRC/$b" "$STAGE/$b"
+          done
+          ( cd "$STAGE" && sha256sum titan-*-rs > SHA256SUMS )
+          ls -la "$STAGE"
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Extract release notes from CHANGELOG.md (or fall back to git log)
+        id: notes
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.name }}"
+          NOTES_FILE=release-body.md
+          if [[ -f CHANGELOG.md ]]; then
+            # extract the "## <TAG>" section up to the next "## " or EOF
+            awk -v tag="$TAG" '
+              /^## / {
+                if (in_section) exit
+                # match `## v0.0.1` OR `## v0.0.1 — date` etc.
+                if ($2 == tag) { in_section = 1; print; next }
+              }
+              in_section { print }
+            ' CHANGELOG.md > "$NOTES_FILE"
+          fi
+          if [[ ! -s "$NOTES_FILE" ]]; then
+            echo "::warning::no CHANGELOG.md section for $TAG — falling back to git log"
+            PREV=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
+            {
+              echo "## $TAG"
+              echo
+              echo "_No curated notes — auto-generated from commits since ${PREV:-the beginning}._"
+              echo
+              if [[ -n "$PREV" ]]; then
+                git log --no-merges --pretty='- %s' "$PREV..$TAG"
+              else
+                git log --no-merges --pretty='- %s' "$TAG"
+              fi
+            } > "$NOTES_FILE"
+          fi
+          echo "notes=$NOTES_FILE" >> "$GITHUB_OUTPUT"
+          echo "----- release body -----"
+          cat "$NOTES_FILE"
+          echo "------------------------"
+
+      - name: Create GitHub Release + attach binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          body_path: ${{ steps.notes.outputs.notes }}
+          fail_on_unmatched_files: true
+          files: |
+            release-staging/titan-inner-body-rs
+            release-staging/titan-inner-mind-rs
+            release-staging/titan-inner-spirit-rs
+            release-staging/titan-kernel-rs
+            release-staging/titan-outer-body-rs
+            release-staging/titan-outer-mind-rs
+            release-staging/titan-outer-spirit-rs
+            release-staging/titan-trinity-rs
+            release-staging/titan-unified-spirit-rs
+            release-staging/SHA256SUMS
