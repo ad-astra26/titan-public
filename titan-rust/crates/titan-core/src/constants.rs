@@ -154,8 +154,24 @@ pub const SUPERVISION_EMPTY_GRACE_S: f64 = 60.0;
 
 /// Bus broker ping interval
 pub const BUS_PING_INTERVAL_S: f64 = 5.0;
-/// Bus broker drops connection after this much silence (3 missed pings)
-pub const BUS_PING_TIMEOUT_S: f64 = 15.0;
+/// Bus broker drops connection after this much silence.
+///
+/// **Sized 60s** (D-SPEC-130 follow-up, 2026-05-25 BUG-AGNO-SILENT-HANG):
+/// the original 15s (3 missed pings @ 5s interval) was too tight under
+/// heavy VPS load (load avg 17/4 cores during fleet restart observed
+/// fleet-wide on 2026-05-25 → sustained 1.45 close-events/sec post-
+/// boot-grace → agno_worker chat unable to stabilize). Python workers
+/// processing broadcast floods (NEUROMOD_STATS, MIND_STATE, etc.) at
+/// up to 20 Hz can starve the bus_socket recv-loop for 15-30s under
+/// load before processing the PING; 60s gives 4× margin while still
+/// detecting truly-dead workers within a minute.
+///
+/// Steady-state liveness contract preserved — a worker that genuinely
+/// stops responding still gets force-closed via
+/// `BrokerSubscriber::signal_close()` within ≤60s (vs ≤15s pre-fix).
+/// Boot storm class entirely closed by the 120s
+/// `BOOT_GRACE_S` in `heartbeat.rs` (D-SPEC-130 follow-up).
+pub const BUS_PING_TIMEOUT_S: f64 = 60.0;
 /// Per-subscriber bounded ring buffer size
 pub const BUS_RING_CAPACITY_SLOTS: u64 = 1024;
 /// P0 priority lane reserve (never dropped)
