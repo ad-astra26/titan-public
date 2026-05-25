@@ -5,9 +5,14 @@ One-shot migration of `data/consciousness.db` `epochs` table from TEXT-JSON
 vector storage → BLOB quantized storage. Cuts row data ~8x; cuts DB file
 ~75% after VACUUM (~4.4GB → ~600MB on T1 1M-row scale).
 
-Per Maker design call 2026-05-25 (Task #25-B):
-  - state_vector:      TEXT-JSON 130D float64 → BLOB u8 quantized (130B/row)
-                       Bounded [0,1], 1/255 ≈ 0.004 precision (negligible).
+Per Maker design call 2026-05-25 (Task #25-B), refined 2026-05-25 after live audit:
+  - state_vector:      TEXT-JSON 130D float64 → BLOB f32 LOSSLESS (520B/row)
+                       Originally proposed u8 quantization, but live audit
+                       revealed 81% of rows have values OUTSIDE [0,1]
+                       (max overshoot 2.14) — SPEC §G3 says "bounded [0,1]"
+                       but writer doesn't clamp historically. f32 preserves
+                       every value exactly (no clamping, no quantization).
+                       Separate bug-file required for the §G3 bounds violation.
   - drift_vector:      TEXT-JSON 9D float (CAN be negative) → BLOB f32 (36B/row)
   - trajectory_vector: TEXT-JSON 9D float                   → BLOB f32 (36B/row)
   - distillation:      TEXT (sparse — 132/1M rows non-empty) → kept as-is
@@ -60,18 +65,8 @@ DRIFT_VECTOR_DIM = 9     # 9D drift
 TRAJ_VECTOR_DIM = 9      # 9D trajectory
 
 
-def quantize_u8(vals: list[float], target_dim: int) -> bytes:
-    """Quantize bounded-[0,1] floats to u8 BLOB; pad/clip to target_dim."""
-    # Pad with 0.5 (centre) if short; clip if long
-    if len(vals) < target_dim:
-        vals = list(vals) + [0.5] * (target_dim - len(vals))
-    elif len(vals) > target_dim:
-        vals = vals[:target_dim]
-    return bytes(max(0, min(255, round(max(0.0, min(1.0, v)) * 255))) for v in vals)
-
-
 def pack_f32(vals: list[float], target_dim: int) -> bytes:
-    """Pack signed floats as f32 LE BLOB; pad/clip to target_dim."""
+    """Pack signed floats as f32 LE BLOB; pad/clip to target_dim. Lossless."""
     if len(vals) < target_dim:
         vals = list(vals) + [0.0] * (target_dim - len(vals))
     elif len(vals) > target_dim:
@@ -117,7 +112,7 @@ def main() -> int:
         "FROM epochs"
     ).fetchone()[0] or 0
     row_blob_projected = (
-        STATE_VECTOR_DIM +              # u8 state
+        STATE_VECTOR_DIM * 4 +           # f32 state (lossless — was u8, refined 2026-05-25)
         DRIFT_VECTOR_DIM * 4 +           # f32 drift
         TRAJ_VECTOR_DIM * 4 +            # f32 traj
         4 +                               # ~avg distillation (sparse)
@@ -139,7 +134,7 @@ def main() -> int:
             sv = json.loads(row["state_vector"] or "[]")
             dv = json.loads(row["drift_vector"] or "[]")
             tv = json.loads(row["trajectory_vector"] or "[]")
-            sv_blob = quantize_u8(sv, STATE_VECTOR_DIM)
+            sv_blob = pack_f32(sv, STATE_VECTOR_DIM)
             dv_blob = pack_f32(dv, DRIFT_VECTOR_DIM)
             tv_blob = pack_f32(tv, TRAJ_VECTOR_DIM)
             text_size = (len(row["state_vector"] or "") + len(row["drift_vector"] or "")
@@ -163,7 +158,7 @@ def main() -> int:
             epoch_id          INTEGER PRIMARY KEY,
             timestamp         REAL NOT NULL,
             block_hash        TEXT NOT NULL DEFAULT '',
-            state_vector_u8   BLOB NOT NULL,      -- 130B (D-SPEC-127)
+            state_vector_f32  BLOB NOT NULL,      -- 520B (D-SPEC-127, lossless 130D × f32)
             drift_vector_f32  BLOB NOT NULL,      -- 36B
             trajectory_vector_f32 BLOB NOT NULL,  -- 36B
             journey_x         REAL NOT NULL,
@@ -190,7 +185,7 @@ def main() -> int:
             sv, dv, tv = [], [], []
         batch.append((
             row["epoch_id"], row["timestamp"], row["block_hash"] or "",
-            quantize_u8(sv, STATE_VECTOR_DIM),
+            pack_f32(sv, STATE_VECTOR_DIM),
             pack_f32(dv, DRIFT_VECTOR_DIM),
             pack_f32(tv, TRAJ_VECTOR_DIM),
             row["journey_x"], row["journey_y"], row["journey_z"],
