@@ -48,6 +48,12 @@ struct Cli {
     #[arg(long, env = "TITAN_KERNEL_SHM_DIR")]
     shm_dir: Option<PathBuf>,
 
+    /// Data directory for disk-persistent state (e.g. checkpoint sidecars per
+    /// §G5.2 item 4 + §24 sovereign-backup chain). Falls back to
+    /// TITAN_KERNEL_DATA_DIR env, then "data" relative to cwd. D-SPEC-126.
+    #[arg(long, env = "TITAN_KERNEL_DATA_DIR")]
+    data_dir: Option<PathBuf>,
+
     /// Log level (info / debug / trace).
     #[arg(long, env = "TITAN_KERNEL_LOG_LEVEL", default_value = "info")]
     log_level: String,
@@ -73,6 +79,10 @@ async fn main() -> ExitCode {
         Some(p) => p,
         None => PathBuf::from(format!("/dev/shm/titan_{titan_id}")),
     };
+    let data_dir = cli
+        .data_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("data"));
     let authkey_hex = match cli.authkey_hex.clone() {
         Some(s) => s,
         None => {
@@ -102,7 +112,7 @@ async fn main() -> ExitCode {
         warn!(err = ?e, "set_pdeathsig failed (non-Linux dev?)");
     }
 
-    if let Err(e) = tick_loop::run(&bus_socket, &authkey, &shm_dir).await {
+    if let Err(e) = tick_loop::run(&bus_socket, &authkey, &shm_dir, &data_dir).await {
         error!(err = ?e, "inner-body daemon exited with error");
         return ExitCode::from(1);
     }

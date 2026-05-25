@@ -924,6 +924,16 @@ class RebirthBackup:
         ("data/meta_teacher/adoption_metrics.json", "meta_teacher/adoption_metrics.json"),
         ("data/mini_reasoning/", "mini_reasoning"),                                     # mini-reasoning state subtree
         ("data/titan_vm_v2/", "titan_vm_v2"),                                           # FULL DIR — Maker decision 2026-05-15 Q5; small now, grows with rFP_titan_vm_v2
+        # ─── Added 2026-05-25 (D-SPEC-125 / v1.57.1 — §G5.2 item 4 traveling-tensor checkpoints) ───
+        # Per-part tensor state (prev, prev2, last 5D observable signature) written
+        # by each BMS+spirit daemon (G21 single-writer); enables tensor journey to
+        # survive systemctl restart AND host reboot AND restore-from-Arweave.
+        ("data/inner_body_checkpoint.bin", "inner_body_checkpoint.bin"),                # 68B  (body 5D × 2 + obs)
+        ("data/inner_mind_checkpoint.bin", "inner_mind_checkpoint.bin"),                # 148B (mind 15D × 2 + obs)
+        ("data/inner_spirit_checkpoint.bin", "inner_spirit_checkpoint.bin"),            # 388B (spirit 45D × 2 + obs)
+        ("data/outer_body_checkpoint.bin", "outer_body_checkpoint.bin"),                # 68B
+        ("data/outer_mind_checkpoint.bin", "outer_mind_checkpoint.bin"),                # 148B
+        ("data/outer_spirit_checkpoint.bin", "outer_spirit_checkpoint.bin"),            # 388B
     ]
 
     # Filename patterns excluded from ALL archives — historical dev backups that

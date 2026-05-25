@@ -1859,30 +1859,6 @@ def create_post_hook(plugin):
                 _injected_ctx = ""
                 if hasattr(agent, 'additional_context') and agent.additional_context:
                     _injected_ctx = agent.additional_context[:500]
-                # Phase 2 closure (2026-05-25, D-SPEC-125 follow-up): plumb
-                # user_id + chat_id (session) + turn_index through to OVG's
-                # build_timechain_payload so the conversation-fork TX carries
-                # arch §7 normative tags `["chat", f"chat:<id>", f"user:<hash>"
-                # ] + topic_tags + [channel]`. The user_id flows from /chat
-                # claims["sub"] → agno run kwargs → here. Empty / "anonymous"
-                # short-circuits in build_timechain_payload (no `user:` tag).
-                _ovg_user_id = (
-                    kwargs.get("user_id")
-                    or getattr(plugin, "_current_user_id", None)
-                    or getattr(agent, "_current_user_id", None)
-                    or ""
-                )
-                _ovg_chat_id = (
-                    kwargs.get("session_id")
-                    or getattr(agent, "session_id", "")
-                    or ""
-                )
-                # turn_index Phase 2 closure ships 0 as the safe default —
-                # full per-session counter lands with the Phase 3 episodic
-                # model (rFP §18 Phase 3: granularity-aware retrieval). Until
-                # then bundle order is preserved by ring-buffer insertion-time
-                # ordering in StandingBundleStore (newest-first).
-                _ovg_turn_index = int(kwargs.get("turn_index", 0) or 0)
                 from titan_hcl.llm_pipeline.verifier import verify_post_async
                 _verified = await verify_post_async(
                     response_text,
@@ -1894,10 +1870,6 @@ def create_post_hook(plugin):
                     # Chat path default: append guard_message footer on pass,
                     # publish TIMECHAIN_COMMIT for verified outputs.
                     concurrent_sign=True,
-                    # Arch §7 chat-TX shape kwargs.
-                    user_id=_ovg_user_id,
-                    chat_id=_ovg_chat_id,
-                    turn_index=_ovg_turn_index,
                 )
                 response_text = _verified.text
                 if hasattr(run_output, 'content'):
