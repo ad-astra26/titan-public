@@ -371,6 +371,21 @@ class TitanKnowledgeGraph:
                 "[KnowledgeGraph] X-voice Person migration skipped: %s", exc
             )
 
+        # Phase 4 — synthesis-engine Concept-spine schema (§6.1 / §10).
+        # 4 node tables + 5 rel tables, additive + idempotent. Empty
+        # Production/ActionChain/HypothesisFork ship in P4 so consumers
+        # can issue Cypher without a schema-missing branch; population
+        # lands in P5/P8.
+        try:
+            from titan_hcl.synthesis.kuzu_spine_schema import (
+                bootstrap_spine_schema,
+            )
+            bootstrap_spine_schema(self)
+        except Exception as exc:
+            logger.warning(
+                "[KnowledgeGraph] synthesis spine bootstrap skipped: %s", exc
+            )
+
         # Relationship tables — we use a generic rel table per node-type pair
         # to keep schema manageable. Kuzu requires explicit FROM/TO types.
         all_tables = list(node_tables.keys())
@@ -586,6 +601,315 @@ class TitanKnowledgeGraph:
             json.dump(data, f, indent=2, default=str)
         logger.info("[KnowledgeGraph] Exported %d entities, %d rels to %s",
                      len(data["entities"]), len(data["relationships"]), path)
+
+    # ─── Phase 4 — synthesis-engine Concept-spine helpers (§6.1 / §10) ───
+    #
+    # Low-level Cypher wrappers consumed by `titan_hcl/synthesis/concept_store.py`
+    # (the sole writer per INV-Syn-3 extended). High-level invariants
+    # (INV-3 no parent mutation, INV-4 single canonical write path, INV-10
+    # parent must exist) live in ConceptStore; these helpers are intentionally
+    # primitive so they're also safe for read-only consumers (BridgeRecall +
+    # observatory endpoints).
+
+    @staticmethod
+    def _spine_pk(concept_id: str, version: int) -> str:
+        """Synthetic single-column PK for the Concept node table — needed
+        because Kuzu 0.11 does not support composite PRIMARY KEY. The format
+        is `<concept_id>:v<version>`; the API surface still takes (concept_id,
+        version) so callers never see this implementation detail."""
+        return f"{concept_id}:v{int(version)}"
+
+    def spine_create_concept_node(
+        self, concept_id: str, version: int, name: str, memory_type: str,
+        groundedness: float, anchor_tx: str, created_at: float,
+    ) -> bool:
+        """INSERT one Concept row keyed by synthetic pk = `<id>:v<ver>` so the
+        same concept_id can carry multiple versions (§10 versioning invariant).
+
+        Returns True on insert, False if the row already exists (idempotent —
+        safe to call on replay). Raises only on unexpected Cypher errors.
+        """
+        pk = self._spine_pk(concept_id, version)
+        try:
+            self._conn.execute(
+                "CREATE (c:Concept {pk: $pk, concept_id: $cid, version: $ver, "
+                "name: $name, memory_type: $mt, groundedness: $g, "
+                "anchor_tx: $atx, created_at: $ts})",
+                {"pk": pk, "cid": concept_id, "ver": int(version),
+                 "name": name, "mt": memory_type,
+                 "g": float(groundedness), "atx": anchor_tx,
+                 "ts": float(created_at)},
+            )
+            return True
+        except Exception as e:
+            msg = str(e).lower()
+            if (
+                "primary key" in msg or "duplicate" in msg
+                or "constraint" in msg or "violates" in msg
+            ):
+                return False
+            logger.warning(
+                "[KnowledgeGraph] spine_create_concept_node(%s,v%d) failed: %s",
+                concept_id, version, e,
+            )
+            raise
+
+    def spine_get_concept_version(
+        self, concept_id: str, version: int,
+    ) -> dict | None:
+        """Return the row dict for (concept_id, version) or None if missing."""
+        pk = self._spine_pk(concept_id, version)
+        try:
+            qr = self._conn.execute(
+                "MATCH (c:Concept {pk: $pk}) "
+                "RETURN c.concept_id, c.version, c.name, c.memory_type, "
+                "c.groundedness, c.anchor_tx, c.created_at",
+                {"pk": pk},
+            )
+            if not qr.has_next():
+                return None
+            row = qr.get_next()
+            return {
+                "concept_id": row[0], "version": int(row[1]), "name": row[2],
+                "memory_type": row[3], "groundedness": float(row[4]),
+                "anchor_tx": row[5], "created_at": float(row[6]),
+            }
+        except Exception as e:
+            logger.debug(
+                "[KnowledgeGraph] spine_get_concept_version(%s,v%d) failed: %s",
+                concept_id, version, e,
+            )
+            return None
+
+    def spine_get_latest_concept(self, concept_id: str) -> dict | None:
+        """Return the highest-version row for concept_id, or None if no
+        version exists. Used by ConceptStore.bump_version() to compute v+1
+        and by spine recall (P4.H) to pick the latest spine root."""
+        try:
+            qr = self._conn.execute(
+                "MATCH (c:Concept {concept_id: $cid}) "
+                "RETURN c.concept_id, c.version, c.name, c.memory_type, "
+                "c.groundedness, c.anchor_tx, c.created_at "
+                "ORDER BY c.version DESC LIMIT 1",
+                {"cid": concept_id},
+            )
+            if not qr.has_next():
+                return None
+            row = qr.get_next()
+            return {
+                "concept_id": row[0], "version": int(row[1]), "name": row[2],
+                "memory_type": row[3], "groundedness": float(row[4]),
+                "anchor_tx": row[5], "created_at": float(row[6]),
+            }
+        except Exception as e:
+            logger.debug(
+                "[KnowledgeGraph] spine_get_latest_concept(%s) failed: %s",
+                concept_id, e,
+            )
+            return None
+
+    def spine_update_groundedness(
+        self, concept_id: str, version: int, new_groundedness: float,
+    ) -> bool:
+        """UPDATE one Concept row's groundedness column. Allowed by INV-3
+        because groundedness is a *derived metric column*, not the row's
+        identity / version / lineage — it can be recomputed at any time
+        without violating the immutability of the version itself. Returns
+        True on update, False if the row is missing."""
+        pk = self._spine_pk(concept_id, version)
+        try:
+            # Verify row exists first (Kuzu MATCH+SET silently succeeds with
+            # zero rows; we want a definite signal).
+            if self.spine_get_concept_version(concept_id, version) is None:
+                return False
+            self._conn.execute(
+                "MATCH (c:Concept {pk: $pk}) SET c.groundedness = $g",
+                {"pk": pk, "g": float(new_groundedness)},
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "[KnowledgeGraph] spine_update_groundedness(%s,v%d) failed: %s",
+                concept_id, version, e,
+            )
+            return False
+
+    def spine_add_composition_edge(
+        self,
+        from_concept_id: str, from_version: int,
+        to_concept_id: str, to_version: int,
+        direction: str = "from",
+    ) -> bool:
+        """Create a COMPOSED_FROM or COMPOSED_INTO edge between two Concept
+        rows. `direction="from"` means the FROM-node was composed FROM the
+        TO-node (decompile / down); `direction="into"` means the FROM-node
+        composes INTO the TO-node (recompile / up). Per §10, both directions
+        are maintained when a version bump consumes base concepts.
+
+        Both endpoints must already exist; returns False if either is missing
+        or the edge already exists. Idempotent on duplicate edge attempts.
+        """
+        rel = "COMPOSED_FROM" if direction == "from" else "COMPOSED_INTO"
+        if direction not in ("from", "into"):
+            logger.warning(
+                "[KnowledgeGraph] spine_add_composition_edge: bad direction %r",
+                direction,
+            )
+            return False
+        # Existence check — Kuzu's CREATE on a missing MATCH silently no-ops,
+        # so we verify endpoints first for a definitive signal.
+        if self.spine_get_concept_version(
+            from_concept_id, from_version,
+        ) is None:
+            return False
+        if self.spine_get_concept_version(
+            to_concept_id, to_version,
+        ) is None:
+            return False
+        from_pk = self._spine_pk(from_concept_id, from_version)
+        to_pk = self._spine_pk(to_concept_id, to_version)
+        try:
+            self._conn.execute(
+                f"MATCH (a:Concept {{pk: $apk}}), (b:Concept {{pk: $bpk}}) "
+                f"CREATE (a)-[:{rel}]->(b)",
+                {"apk": from_pk, "bpk": to_pk},
+            )
+            return True
+        except Exception as e:
+            msg = str(e).lower()
+            if "duplicate" in msg or "constraint" in msg:
+                return False
+            logger.warning(
+                "[KnowledgeGraph] spine_add_composition_edge(%s v%d -[%s]-> "
+                "%s v%d) failed: %s",
+                from_concept_id, from_version, rel,
+                to_concept_id, to_version, e,
+            )
+            return False
+
+    def spine_count_concepts(self) -> int:
+        """Total Concept rows across all (concept_id, version) tuples.
+        Used by the fleet E2E test P4.kuzu-spine-active check (§P4.J)."""
+        try:
+            qr = self._conn.execute("MATCH (c:Concept) RETURN COUNT(c)")
+            if qr.has_next():
+                return int(qr.get_next()[0])
+        except Exception as e:
+            logger.debug("[KnowledgeGraph] spine_count_concepts failed: %s", e)
+        return 0
+
+    def spine_count_composition_edges(self, direction: str = "from") -> int:
+        """Total COMPOSED_FROM or COMPOSED_INTO edges across the graph.
+        Used by the fleet E2E test P4.composition-edges-present check."""
+        rel = "COMPOSED_FROM" if direction == "from" else "COMPOSED_INTO"
+        try:
+            qr = self._conn.execute(
+                f"MATCH ()-[r:{rel}]->() RETURN COUNT(r)"
+            )
+            if qr.has_next():
+                return int(qr.get_next()[0])
+        except Exception as e:
+            logger.debug(
+                "[KnowledgeGraph] spine_count_composition_edges(%s) failed: %s",
+                direction, e,
+            )
+        return 0
+
+    def spine_concept_neighbors(
+        self, concept_id: str, version: int | None = None,
+        limit: int = 20,
+    ) -> list[tuple[str, int]]:
+        """Return up-to-`limit` neighbor concept (id, version) tuples reachable
+        via COMPOSED_FROM or COMPOSED_INTO from the given concept. If `version`
+        is None, anchors on the latest version (typical spreading-activation
+        usage from §P4.F kuzu_spreading_lookup).
+
+        The spreading-activation formula `S - ln(fan_j)` needs the fan-out of
+        each buffer-entity concept; the consumer counts the returned tuples to
+        get `fan_j`. Both COMPOSED_FROM and COMPOSED_INTO are walked because
+        spreading should pick up sibling concepts in either direction.
+        """
+        anchor_version = version
+        if anchor_version is None:
+            latest = self.spine_get_latest_concept(concept_id)
+            if latest is None:
+                return []
+            anchor_version = latest["version"]
+
+        seen: list[tuple[str, int]] = []
+        anchor_pk = self._spine_pk(concept_id, anchor_version)
+        for rel in ("COMPOSED_FROM", "COMPOSED_INTO"):
+            try:
+                qr = self._conn.execute(
+                    f"MATCH (a:Concept {{pk: $apk}})-[:{rel}]->(b:Concept) "
+                    f"RETURN b.concept_id, b.version LIMIT $lim",
+                    {"apk": anchor_pk, "lim": int(limit)},
+                )
+                while qr.has_next():
+                    row = qr.get_next()
+                    pair = (row[0], int(row[1]))
+                    if pair not in seen:
+                        seen.append(pair)
+            except Exception as e:
+                logger.debug(
+                    "[KnowledgeGraph] spine_concept_neighbors(%s,v%d,%s) failed: %s",
+                    concept_id, anchor_version, rel, e,
+                )
+        return seen[:limit]
+
+    def spine_list_concepts(
+        self, limit: int = 100, offset: int = 0,
+        memory_type: str | None = None,
+    ) -> list[dict]:
+        """Paginated list of concepts (latest version per concept_id), ordered
+        by groundedness DESC. Backs the Observatory /v6/synthesis/concepts
+        endpoint (§P4.I).
+
+        Kuzu's Cypher dialect doesn't provide MAX+GROUP BY in 0.11, so we
+        fetch all rows + collapse to latest-per-concept_id in Python. Cheap
+        even at fleet scale because total concept-version count stays bounded
+        by the dream-boundary cap in §P4.G (max_concepts_per_pass).
+        """
+        all_rows: list[dict] = []
+        try:
+            if memory_type is not None:
+                qr = self._conn.execute(
+                    "MATCH (c:Concept) WHERE c.memory_type = $mt "
+                    "RETURN c.concept_id, c.version, c.name, c.memory_type, "
+                    "c.groundedness, c.anchor_tx, c.created_at",
+                    {"mt": memory_type},
+                )
+            else:
+                qr = self._conn.execute(
+                    "MATCH (c:Concept) "
+                    "RETURN c.concept_id, c.version, c.name, c.memory_type, "
+                    "c.groundedness, c.anchor_tx, c.created_at"
+                )
+            while qr.has_next():
+                row = qr.get_next()
+                all_rows.append({
+                    "concept_id": row[0], "version": int(row[1]),
+                    "name": row[2], "memory_type": row[3],
+                    "groundedness": float(row[4]),
+                    "anchor_tx": row[5], "created_at": float(row[6]),
+                })
+        except Exception as e:
+            logger.debug("[KnowledgeGraph] spine_list_concepts failed: %s", e)
+            return []
+
+        # Collapse to latest-version-per-concept_id.
+        latest: dict[str, dict] = {}
+        for r in all_rows:
+            existing = latest.get(r["concept_id"])
+            if existing is None or r["version"] > existing["version"]:
+                latest[r["concept_id"]] = r
+
+        ordered = sorted(
+            latest.values(),
+            key=lambda r: r.get("groundedness", 0.0),
+            reverse=True,
+        )
+        return ordered[offset : offset + limit]
 
     def close(self):
         del self._conn
