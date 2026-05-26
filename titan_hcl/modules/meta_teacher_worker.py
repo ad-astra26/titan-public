@@ -295,6 +295,19 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
     # Restore adoption EMAs from disk — version-aware: v1→v2→v3 bump resets.
     teacher.adoption_ema_by_domain.update(
         _load_adoption_state(data_dir, SYSTEM_PROMPT_VERSION))
+    # rFP_teachers_update F5 (2026-05-26): bootstrap the 24h critique window
+    # from disk so SHM-published dashboard stats are accurate from the first
+    # heartbeat tick (steady-state appends in record_critique_entry).
+    try:
+        _bootstrap_n = teacher.bootstrap_24h_window(data_dir)
+        if _bootstrap_n > 0:
+            logger.info(
+                "[MetaTeacher] 24h window bootstrapped: %d critiques loaded "
+                "from disk (rFP_teachers_update F5)", _bootstrap_n)
+    except Exception as _bs_err:
+        logger.warning(
+            "[MetaTeacher] bootstrap_24h_window failed (continuing with "
+            "empty window): %s", _bs_err)
 
     # Phase B: TeacherMemory — hot/cold tiers. load() lazily reads journal.
     teacher_memory = TeacherMemory(config, data_dir=data_dir)
@@ -367,10 +380,11 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
         )
         meta_teacher_state_publisher = MetaTeacherStatePublisher(
             titan_id=titan_id)
-        meta_teacher_state_publisher.publish(teacher)
+        meta_teacher_state_publisher.publish(teacher, memory=teacher_memory)
         logger.info(
             "[MetaTeacher] meta_teacher_state publisher attached "
-            "(G21 single-writer; Phase A.4 / D-SPEC-70)")
+            "(G21 single-writer; Phase A.4 / D-SPEC-70; "
+            "rFP_teachers_update F5 dashboard payload included)")
     except Exception as _err:
         logger.warning(
             "[MetaTeacher] meta_teacher_state publisher init failed: %s — "
@@ -385,9 +399,12 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
             _send_heartbeat(send_queue, name)
             # Phase A.4 — refresh meta_teacher_state.bin every heartbeat (30s)
             # so readers see fresh ts even if no critiques arrived recently.
+            # rFP_teachers_update F5: also threads teacher_memory through so
+            # the SHM payload carries cold-tier counts + still_needs_push.
             if meta_teacher_state_publisher is not None:
                 try:
-                    meta_teacher_state_publisher.publish(teacher)
+                    meta_teacher_state_publisher.publish(
+                        teacher, memory=teacher_memory)
                 except Exception:
                     pass
             _hb_stop.wait(30.0)
