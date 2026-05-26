@@ -2101,15 +2101,8 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
     ns1_resp = _unwrap(ns1_raw)
     trinity1_resp = _unwrap(trinity1_raw)
     ns1_transitions = ns1_resp.get("total_transitions", 0)
-    # B1 (rFP_arch_map_health_observability_closure): prefer
-    # `pi_heartbeat.total_epochs_observed` — live consciousness epoch counter
-    # co-published by cognitive_worker (D-SPEC-103 / D-SPEC-115 / v1.41.0+).
-    # The legacy `unified_spirit.epoch_count` reads `len(self._epochs)` on the
-    # API-side UnifiedSpirit instance, which on Phase C runs in a separate
-    # subprocess from the live cognitive_worker loop and goes stale (RFP §1:
-    # T2 stale at 619, T3 at 0 while live consciousness was ~879k).
-    epoch1 = (trinity1_resp.get("pi_heartbeat", {}).get("total_epochs_observed")
-              or trinity1_resp.get("unified_spirit", {}).get("epoch_count", 0))
+    epoch1 = (trinity1_resp.get("unified_spirit", {}).get("epoch_count")
+              or trinity1_resp.get("pi_heartbeat", {}).get("total_epochs_observed", 0))
 
     time.sleep(10)
 
@@ -2120,15 +2113,8 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
     trinity2_resp = _unwrap(trinity2_raw)
     ns2_transitions = ns2_resp.get("total_transitions", 0)
     last_train_ts = ns2_resp.get("last_train_ts", None)
-    epoch2 = (trinity2_resp.get("pi_heartbeat", {}).get("total_epochs_observed")
-              or trinity2_resp.get("unified_spirit", {}).get("epoch_count", 0))
-
-    # A1 (rFP_arch_map_health_observability_closure): D-SPEC-105 intentionally
-    # gates waking NS/IQL training off during dreams — so "idle" mid-dream is
-    # CORRECT, not a stall. Read `is_dreaming` from the same trinity payload
-    # (no extra fetch) and let the NS/IQL checks below report a paused-state
-    # OK instead of a false WARN.
-    _is_dreaming = bool(trinity2_resp.get("dreaming", {}).get("is_dreaming", False))
+    epoch2 = (trinity2_resp.get("unified_spirit", {}).get("epoch_count")
+              or trinity2_resp.get("pi_heartbeat", {}).get("total_epochs_observed", 0))
 
     ns_fetch_failed = ns1_raw is None or ns2_raw is None
     trinity_fetch_failed = trinity1_raw is None or trinity2_raw is None
@@ -2165,9 +2151,6 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
         _u_delta = _u2 - _u1
         if _u_delta > 0:
             ok(f"NS training active (Σtotal_updates {_u1:.0f} -> {_u2:.0f}, +{_u_delta:.0f} in 10s, Phase C shape)")
-        elif _is_dreaming and _u2 > 0:
-            # A1: D-SPEC-105 gates waking training off during dreams
-            ok(f"NS training paused (dreaming — expected per D-SPEC-105; Σtotal_updates={_u2:.0f})")
         elif _u2 > 0:
             warn(f"NS training idle (Σtotal_updates={_u2:.0f}, +0 in 10s — quiet period or stall)")
         else:
@@ -2221,9 +2204,6 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
         if pol_delta > 0 or chain_delta > 0:
             ok(f"IQL/reasoning advancing (chains={rsn2_chains} +{chain_delta}, "
                f"policy_updates={rsn2_pol} +{pol_delta} in 10s)")
-        elif _is_dreaming and rsn2_chains > 0:
-            # A1: D-SPEC-105 gates waking training off during dreams
-            ok(f"IQL/reasoning paused (dreaming — expected per D-SPEC-105; chains={rsn2_chains}, policy_updates={rsn2_pol})")
         elif rsn2_chains > 0:
             # Have prior data, current delta=0. Could be quiet period (normal)
             # OR frozen (bug). Conservative: warn, not fail.
@@ -2673,9 +2653,6 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
             else:
                 ok(f"Nginx healthy ({_req_rate:.0f} req/min, {_err_rate:.1f}% errors, "
                    f"{_nginx_stats.get('unique_ips', 0)} unique IPs)")
-        elif _nginx_stats.get("nginx_absent"):
-            # A3: nginx not installed on this host (e.g. T2/T3) — not a fault.
-            ok("Nginx not applicable on this host (no log directory)")
         else:
             warn("Nginx log not readable (check permissions)")
     except Exception as e:
@@ -2738,27 +2715,15 @@ def _check_nginx_health(log_path: str = "/var/log/nginx/access.log",
                         window_minutes: int = 5) -> dict:
     """Analyze recent nginx traffic for health check.
 
-    Returns dict with: log_readable, nginx_absent, req_per_min, error_pct,
-    upstream_errors, unique_ips. `nginx_absent` is True when neither the log
-    file nor the /var/log/nginx directory exists on this host — meaning
-    nginx isn't installed (e.g. T2/T3 typically don't run it). The caller
-    should report this as OK/not-applicable rather than WARN.
+    Returns dict with: log_readable, req_per_min, error_pct, upstream_errors, unique_ips.
     """
     import subprocess
     import time as _time
 
     result = {
-        "log_readable": False, "nginx_absent": False, "req_per_min": 0,
-        "error_pct": 0, "upstream_errors": 0, "unique_ips": 0,
+        "log_readable": False, "req_per_min": 0, "error_pct": 0,
+        "upstream_errors": 0, "unique_ips": 0,
     }
-
-    # A3 (rFP_arch_map_health_observability_closure): if neither the log file
-    # nor its parent /var/log/nginx directory exists, nginx isn't installed
-    # on this host. Skip with `nginx_absent=True` so the caller can emit a
-    # not-applicable INFO instead of a permission WARN.
-    if not os.path.exists(log_path) and not os.path.isdir(os.path.dirname(log_path)):
-        result["nginx_absent"] = True
-        return result
 
     # Read last N lines (enough for ~5 min window at 500 req/min = ~2500 lines)
     try:
@@ -3327,21 +3292,8 @@ def _check_arc(base_url: str, titan_id: str) -> dict:
 
     # Determine status
     if not result["active"]:
-        # A2 (rFP_arch_map_health_observability_closure): ARC is opt-in
-        # (CPU-bound; `[arc_agi_3].api_key` empty by default in titan_params).
-        # When there's no training history at all (no scorers, no games), the
-        # Titan never opted into ARC — surface as OK with an "opt-in" note,
-        # not WARN. If scorers exist (training WAS attempted) but `active`
-        # went False, that's a real regression and still warns.
-        if not scorers and not games:
-            result["status"] = "ok"
-            result["details"] = "ARC inactive (opt-in; no training history)"
-        else:
-            result["status"] = "warn"
-            result["details"] = (
-                f"ARC inactive but training history exists "
-                f"(scorers={len(scorers)}, games={len(games)})"
-            )
+        result["status"] = "warn"
+        result["details"] = "ARC inactive"
     elif result["total_games"] == 0:
         result["status"] = "warn"
         result["details"] = "ARC active but no game results"

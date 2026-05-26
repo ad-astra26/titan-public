@@ -7847,14 +7847,9 @@ async def get_v4_meta_teacher_status(request: Request):
             "memory_and_storage", {}).get("data_dir", "./data")
         mt_dir = _os.path.join(data_dir, "meta_teacher")
 
-        # Aggregate recent critiques (last 24h).
-        # F5 (rFP_teachers_update) — bound the file scan by mtime: only files
-        # touched within the last ~25h can carry data in the 24h window. With
-        # ~10k+ lifetime critiques the previous full-history glob caused a
-        # ~3s endpoint timeout (audit 2026-05-26).
+        # Aggregate recent critiques (last 24h)
         now = _time.time()
         cutoff = now - 86400.0
-        scan_floor_mtime = now - (25.0 * 3600.0)  # 25h slack for tz/clock skew
         cat_counts: dict[str, int] = {}
         scores_24h: list[float] = []
         critiques_24h = 0
@@ -7864,8 +7859,6 @@ async def get_v4_meta_teacher_status(request: Request):
             for fpath in sorted(_glob.glob(
                     _os.path.join(mt_dir, "critiques.*.jsonl"))):
                 try:
-                    if _os.path.getmtime(fpath) < scan_floor_mtime:
-                        continue
                     with open(fpath) as f:
                         for line in f:
                             try:
@@ -7926,13 +7919,22 @@ async def get_v4_meta_teacher_status(request: Request):
         journal_path = _os.path.join(mt_dir, "teaching_journal.jsonl")
         cold_topics = 0
         still_needs_push_count = 0
-        # F5 (rFP_teachers_update) — collapse two full passes into one: the
-        # journal is append-only so the LAST row per topic_key carries both
-        # last_seen AND still_needs_push. Halves wall time on the file
-        # (alongside the critiques scan bound above this addressed the 3s
-        # timeout the teachers re-audit found).
+        cold_last_seen: dict[str, float] = {}
         if _os.path.exists(journal_path):
             try:
+                with open(journal_path) as f:
+                    for line in f:
+                        try:
+                            r = _json.loads(line)
+                        except Exception:
+                            continue
+                        tk = r.get("topic_key")
+                        if not isinstance(tk, str):
+                            continue
+                        # Journal is append-only; later row wins.
+                        cold_last_seen[tk] = float(r.get("last_seen") or 0.0)
+                cold_topics = len(cold_last_seen)
+                # Count still_needs_push from last row per topic
                 last_rows: dict[str, dict] = {}
                 with open(journal_path) as f:
                     for line in f:
@@ -7944,7 +7946,6 @@ async def get_v4_meta_teacher_status(request: Request):
                         if not isinstance(tk, str):
                             continue
                         last_rows[tk] = r
-                cold_topics = len(last_rows)
                 still_needs_push_count = sum(
                     1 for r in last_rows.values() if r.get("still_needs_push"))
             except Exception:
