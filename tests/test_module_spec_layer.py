@@ -19,7 +19,7 @@ import pytest
 
 from titan_hcl._layer_canon import LAYER_CANON, VALID_LAYERS, validate_layer
 from titan_hcl.bus import DivineBus
-from titan_hcl.guardian_hcl import Guardian, ModuleSpec, ModuleState
+from titan_hcl.guardian import Guardian, ModuleSpec, ModuleState
 
 
 def _noop_entry(recv_q, send_q, name, config):  # pragma: no cover — never invoked in these tests

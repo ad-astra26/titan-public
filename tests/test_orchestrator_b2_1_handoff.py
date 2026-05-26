@@ -30,7 +30,7 @@ from titan_hcl.core.shadow_orchestrator import (
     _unwind_b2_1_handoff,
     orchestrate_shadow_swap,
 )
-from titan_hcl.guardian_hcl import Guardian, ModuleSpec, ModuleState
+from titan_hcl.guardian import Guardian, ModuleSpec, ModuleState
 
 
 def _noop_entry(*args, **kwargs):  # pragma: no cover

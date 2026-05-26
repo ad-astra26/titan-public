@@ -97,17 +97,6 @@ from titan_hcl.logic.cgn_engine_state_specs import CGN_ENGINE_STATE_SPEC
 from titan_hcl.logic.consciousness_age_state_specs import (
     CONSCIOUSNESS_AGE_SPEC,
 )
-# ARCH-MAP-HEALTH-OBSERVABILITY Class B (2026-05-26): consciousness_state.bin
-# slot reader. Writer: cognitive_worker (G21 single-writer, see
-# cognitive_worker.py:3002 — Phase 3.A D-SPEC-86 v1.26.0). Surfaces
-# {epoch_count, epoch_id, density, curvature, dream_quality, fatigue,
-# trajectory_magnitude, ts} so /v4/inner-trinity can overlay the live epoch
-# counter onto the stale `unified_spirit.epoch_count` field that
-# `_get_cached_coordinator_async` returns. Per SPEC §10.E telemetry
-# write-then-publish (SHM-canonical, LOCKED 2026-05-07 per Preamble G18).
-from titan_hcl.logic.spirit_state_specs import (
-    CONSCIOUSNESS_STATE_SPEC,
-)
 from titan_hcl.logic.reasoning_state_specs import REASONING_STATE_SPEC
 from titan_hcl.logic.meta_reasoning_state_specs import META_REASONING_STATE_SPEC
 from titan_hcl.logic.meta_teacher_state_specs import META_TEACHER_STATE_SPEC
@@ -314,10 +303,6 @@ class ShmReaderBank:
         "_reasoning_state", "_meta_reasoning_state", "_meta_teacher_state",
         "_guardian_state", "_llm_state", "_media_state", "_msl_state",
         "_consciousness_age",
-        # ARCH-MAP-HEALTH-OBSERVABILITY Class B (2026-05-26): consciousness_state.bin
-        # reader for D-SPEC-86 v1.26.0 slot — closes the
-        # `unified_spirit.epoch_count` staleness gap on /v4/inner-trinity.
-        "_consciousness_state",
         "_network_state",
         # rFP_meta_reasoning_self_reasoning_resolver_migration / SPEC §7.1
         # + D-SPEC-70 v1.15.0 (parallel session, landed first): variable
@@ -489,15 +474,6 @@ class ShmReaderBank:
         # reach the DB per G18. G21 single-writer = cognitive_worker.
         self._consciousness_age = StateRegistryReader(
             CONSCIOUSNESS_AGE_SPEC, self.shm_root)
-        # ARCH-MAP-HEALTH-OBSERVABILITY Class B (2026-05-26) — D-SPEC-86
-        # v1.26.0 consciousness_state.bin reader. Writer is cognitive_worker
-        # (G21 single-writer at cognitive_worker.py:3002, Phase 3.A). The
-        # payload carries the current `epoch_count`/`epoch_id` that the
-        # /v4/inner-trinity API must overlay on top of the stale
-        # cached-snapshot `unified_spirit.epoch_count` per the
-        # ARCH-MAP-HEALTH-OBSERVABILITY rFP.
-        self._consciousness_state = StateRegistryReader(
-            CONSCIOUSNESS_STATE_SPEC, self.shm_root)
         logger.info(
             "[ShmReaderBank] initialized for titan_id=%s root=%s",
             self.titan_id, self.shm_root,
@@ -1333,23 +1309,6 @@ class ShmReaderBank:
         """
         return self._read_msgpack_variable(
             self._consciousness_age, "consciousness_age")
-
-    def read_consciousness_state(self) -> dict[str, Any] | None:
-        """Consciousness-loop latest-epoch state — Phase 3.A D-SPEC-86 v1.26.0
-        consciousness_state.bin slot. Producer: cognitive_worker (G21
-        single-writer at cognitive_worker.py:3002). Schema:
-        ``{epoch_count, epoch_id, density, curvature, dream_quality, fatigue,
-        trajectory, trajectory_magnitude, ts}``.
-
-        Closes ARCH-MAP-HEALTH-OBSERVABILITY Class B field 1 (2026-05-26):
-        `/v4/inner-trinity.unified_spirit.epoch_count` was being served from
-        the cached coordinator snapshot, which lags the live consciousness
-        loop. This reader is the SPEC §10.E canonical source — the live
-        loop writes per-epoch, the API now overlays the SHM value onto the
-        cached snapshot.
-        """
-        return self._read_msgpack_variable(
-            self._consciousness_state, "consciousness_state")
 
     def read_meta_teacher_state(self) -> dict[str, Any] | None:
         """MetaTeacherStatePublisher payload — MetaTeacherEngine.get_stats()

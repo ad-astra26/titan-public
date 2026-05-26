@@ -1435,26 +1435,7 @@ async def metabolism_evaluate_gate(
         # reads use callable-shaped getters so the kernel_rpc proxy fires real
         # RPC roundtrips (attribute access alone returns an unresolved
         # _RPCRemoteRef which is not JSON-serializable).
-        #
-        # MEDITATION-WORK-RPC-SYNC-AUDIT (2026-05-26): prefer the async
-        # sibling so the legacy in-process path (where `met` is the actual
-        # MetabolismProxy) avoids `_work_rpc_sync`'s in-loop fallback (which
-        # would block this async endpoint's event loop via a blocking
-        # `bus.request`). Per SPEC Preamble G19.
-        #
-        # Under production `api_process_separation_enabled=true` `met` is a
-        # kernel_rpc `_RPCRemoteRef` and `evaluate_gate_async` returns the
-        # RPC result synchronously — the kernel_rpc proxy makes the call
-        # over the Unix socket and returns the tuple directly (no
-        # coroutine wrapper). So the call must be conditionally awaited;
-        # `inspect.isawaitable` is the SPEC-conformant cross-mode
-        # discriminator. T2 deploy verification 2026-05-26 surfaced this.
-        import inspect as _inspect
-        _gate_result = met.evaluate_gate_async(
-            feature, caller=caller or feature)
-        if _inspect.isawaitable(_gate_result):
-            _gate_result = await _gate_result
-        should_proceed, rate_mult = _gate_result
+        should_proceed, rate_mult = met.evaluate_gate(feature, caller=caller or feature)
         return _ok({
             "should_proceed": should_proceed,
             "rate_multiplier": rate_mult,
@@ -5184,38 +5165,6 @@ async def get_v4_inner_trinity(request: Request):
             if shm is not None:
                 snapshot["unified_spirit"] = shm
                 snapshot["self_162d"] = shm
-
-        # ARCH-MAP-HEALTH-OBSERVABILITY Class B field 1 (2026-05-26):
-        # overlay the live consciousness_state.bin epoch onto
-        # `unified_spirit.epoch_count`. The cached coordinator snapshot lags
-        # the live consciousness loop on T1/T2/T3 by minutes-to-hours under
-        # Phase C — `_get_cached_coordinator_async` reads from the legacy
-        # in-process `plugin.consciousness` path that moved to
-        # cognitive_worker per D-SPEC-110 v1.48.0, so the cached value
-        # freezes at the last value before the rename. SPEC §10.E telemetry
-        # write-then-publish is SHM-canonical (LOCKED 2026-05-07 per
-        # Preamble G18) — the consciousness_state.bin slot is the
-        # authoritative source, written per consciousness epoch by
-        # cognitive_worker (G21 single-writer, see cognitive_worker.py:3002,
-        # Phase 3.A D-SPEC-86 v1.26.0). When the SHM value is available it
-        # always wins over the snapshot value; otherwise we keep the
-        # snapshot value to preserve cold-boot behaviour.
-        try:
-            cs_shm = await asyncio.to_thread(
-                titan_state.shm.read_consciousness_state)
-            if cs_shm and cs_shm.get("epoch_count"):
-                _us = snapshot.get("unified_spirit")
-                if not isinstance(_us, dict):
-                    _us = {}
-                _us["epoch_count"] = int(cs_shm["epoch_count"])
-                _us["epoch_id"] = int(
-                    cs_shm.get("epoch_id", cs_shm["epoch_count"]))
-                _us["epoch_source"] = "shm.consciousness_state"
-                snapshot["unified_spirit"] = _us
-        except Exception as _cs_err:
-            logger.debug(
-                "[Dashboard] consciousness_state SHM overlay failed: %s",
-                _cs_err)
         if _empty(snapshot.get("hormonal")):
             shm = await asyncio.to_thread(titan_state.shm.read_hormonal)
             if shm is not None:
@@ -7898,14 +7847,9 @@ async def get_v4_meta_teacher_status(request: Request):
             "memory_and_storage", {}).get("data_dir", "./data")
         mt_dir = _os.path.join(data_dir, "meta_teacher")
 
-        # Aggregate recent critiques (last 24h).
-        # F5 (rFP_teachers_update) — bound the file scan by mtime: only files
-        # touched within the last ~25h can carry data in the 24h window. With
-        # ~10k+ lifetime critiques the previous full-history glob caused a
-        # ~3s endpoint timeout (audit 2026-05-26).
+        # Aggregate recent critiques (last 24h)
         now = _time.time()
         cutoff = now - 86400.0
-        scan_floor_mtime = now - (25.0 * 3600.0)  # 25h slack for tz/clock skew
         cat_counts: dict[str, int] = {}
         scores_24h: list[float] = []
         critiques_24h = 0
@@ -7915,8 +7859,6 @@ async def get_v4_meta_teacher_status(request: Request):
             for fpath in sorted(_glob.glob(
                     _os.path.join(mt_dir, "critiques.*.jsonl"))):
                 try:
-                    if _os.path.getmtime(fpath) < scan_floor_mtime:
-                        continue
                     with open(fpath) as f:
                         for line in f:
                             try:
@@ -7977,13 +7919,22 @@ async def get_v4_meta_teacher_status(request: Request):
         journal_path = _os.path.join(mt_dir, "teaching_journal.jsonl")
         cold_topics = 0
         still_needs_push_count = 0
-        # F5 (rFP_teachers_update) — collapse two full passes into one: the
-        # journal is append-only so the LAST row per topic_key carries both
-        # last_seen AND still_needs_push. Halves wall time on the file
-        # (alongside the critiques scan bound above this addressed the 3s
-        # timeout the teachers re-audit found).
+        cold_last_seen: dict[str, float] = {}
         if _os.path.exists(journal_path):
             try:
+                with open(journal_path) as f:
+                    for line in f:
+                        try:
+                            r = _json.loads(line)
+                        except Exception:
+                            continue
+                        tk = r.get("topic_key")
+                        if not isinstance(tk, str):
+                            continue
+                        # Journal is append-only; later row wins.
+                        cold_last_seen[tk] = float(r.get("last_seen") or 0.0)
+                cold_topics = len(cold_last_seen)
+                # Count still_needs_push from last row per topic
                 last_rows: dict[str, dict] = {}
                 with open(journal_path) as f:
                     for line in f:
@@ -7995,7 +7946,6 @@ async def get_v4_meta_teacher_status(request: Request):
                         if not isinstance(tk, str):
                             continue
                         last_rows[tk] = r
-                cold_topics = len(last_rows)
                 still_needs_push_count = sum(
                     1 for r in last_rows.values() if r.get("still_needs_push"))
             except Exception:
@@ -12112,3 +12062,21 @@ async def get_v4_admin_parent_threads(request: Request):
     except Exception as e:
         logger.error("[Dashboard] /v4/admin/parent-threads error: %s", e)
         return _error(str(e))
+
+
+# ─── Phase 4 §P4.I — synthesis concept-spine endpoints ─────────────────
+# Re-exports from titan_hcl/api/synthesis_concept_handlers.py so the v6.py
+# ROUTE_TABLE's `getattr(_dash, func_name)` resolves them without further
+# machinery change. The handlers themselves live in the synthesis module
+# because they open the canonical Kuzu graph; they're surfaced here purely
+# to fit the v6 wiring convention.
+from titan_hcl.api.synthesis_concept_handlers import (
+    get_synthesis_concepts,
+    get_synthesis_concept,
+    get_synthesis_concepts_heatmap,
+)
+
+# Aliases that fit v6 ROUTE_TABLE naming conventions.
+get_v6_synthesis_concepts = get_synthesis_concepts
+get_v6_synthesis_concept = get_synthesis_concept
+get_v6_synthesis_concepts_heatmap = get_synthesis_concepts_heatmap

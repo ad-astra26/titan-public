@@ -2143,16 +2143,6 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
     # fetches transiently failed, or (b) the API snapshot cache TTL exceeded
     # the 10s window. last_train_ts is updated by the trainer on every step,
     # so age is the single source of truth.
-    #
-    # ARCH-MAP-HEALTH-OBSERVABILITY Class A (2026-05-26): dream-aware gate.
-    # Per D-SPEC-105 v1.43.0 (Dream-consolidation suite off-tick restoration),
-    # waking training is intentionally suspended while the Titan is dreaming.
-    # The "+0 in 10s" warn during dream cycles is a false alarm — propagate
-    # the dreaming state from trinity2_resp into a `_is_dreaming_now` flag
-    # and downgrade idle/cold warns to informative OK during dreams.
-    _is_dreaming_now = bool(
-        (trinity2_resp or {}).get("dreaming", {}).get("is_dreaming", False)
-    )
     if ns_fetch_failed:
         warn("NS training — /v4/nervous-system fetch failed (transient HTTP error — re-run check)")
     elif _ns_phase_c_shape:
@@ -2161,12 +2151,8 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
         _u_delta = _u2 - _u1
         if _u_delta > 0:
             ok(f"NS training active (Σtotal_updates {_u1:.0f} -> {_u2:.0f}, +{_u_delta:.0f} in 10s, Phase C shape)")
-        elif _u2 > 0 and _is_dreaming_now:
-            ok(f"NS training quiesced during dream (Σtotal_updates={_u2:.0f}; D-SPEC-105 suspends waking training)")
         elif _u2 > 0:
             warn(f"NS training idle (Σtotal_updates={_u2:.0f}, +0 in 10s — quiet period or stall)")
-        elif _is_dreaming_now:
-            ok(f"NS training cold but dreaming (Σtotal_updates=0; will resume on wake per D-SPEC-105)")
         else:
             warn(f"NS training cold (Σtotal_updates=0 across {len(ns2_resp.get('programs', {}))} programs)")
     elif ns2_transitions == 0 and last_train_ts in (None, 0, 0.0):
@@ -2218,12 +2204,6 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
         if pol_delta > 0 or chain_delta > 0:
             ok(f"IQL/reasoning advancing (chains={rsn2_chains} +{chain_delta}, "
                f"policy_updates={rsn2_pol} +{pol_delta} in 10s)")
-        elif rsn2_chains > 0 and _is_dreaming_now:
-            # ARCH-MAP-HEALTH-OBSERVABILITY Class A (2026-05-26): dream-aware
-            # gate per D-SPEC-105 v1.43.0 — waking IQL training intentionally
-            # suspended during dream consolidation, so a 0 delta is expected.
-            ok(f"IQL/reasoning quiesced during dream (chains={rsn2_chains}, "
-               f"policy_updates={rsn2_pol}; D-SPEC-105 suspends waking train)")
         elif rsn2_chains > 0:
             # Have prior data, current delta=0. Could be quiet period (normal)
             # OR frozen (bug). Conservative: warn, not fail.
@@ -2674,17 +2654,7 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
                 ok(f"Nginx healthy ({_req_rate:.0f} req/min, {_err_rate:.1f}% errors, "
                    f"{_nginx_stats.get('unique_ips', 0)} unique IPs)")
         else:
-            # ARCH-MAP-HEALTH-OBSERVABILITY Class A (2026-05-26): degrade to
-            # OK with informative message. T2 + T3 hosts have no nginx
-            # (mainnet ingress is T1-only), so log_readable=False there is
-            # the EXPECTED state. On T1 the log is owned by `adm:adm` and
-            # is unreadable without sudo — same expected outcome under
-            # standard `arch_map` invocation. The original `warn` produced
-            # noise on every health run with no actionable signal. Per
-            # SPEC §6 (Repository directory roles / public vs internal) +
-            # `project_nginx_caching_ratelimit.md`, nginx is T1-only by
-            # design; absence elsewhere is canonical not anomalous.
-            ok("Nginx log not directly readable (expected — T2/T3 have no nginx; T1 log is adm-owned)")
+            warn("Nginx log not readable (check permissions)")
     except Exception as e:
         warn(f"Nginx health check failed ({e})")
 
@@ -3328,18 +3298,8 @@ def _check_arc(base_url: str, titan_id: str) -> dict:
         result["status"] = "warn"
         result["details"] = "ARC active but no game results"
     elif result["best_levels"] == 0 and total_updates > 100:
-        # ARCH-MAP-HEALTH-OBSERVABILITY Class A (2026-05-26): downgrade to OK
-        # when ARC is actively training but hasn't crossed the L1-WIN gate.
-        # The gate is tracked by OBS-arc-iter3-win (HIGH observable) — until
-        # that observable closes, "0 levels completed" is the EXPECTED state
-        # per COMPLETE-4-ARC-WIRING (LOW, GATED, DEFERRED_ITEMS.md). Raising
-        # this to a warn every health check has produced no actionable signal
-        # since 2026-04-19; the levels-completion fix is its own workstream.
-        result["status"] = "ok"
-        result["details"] = (
-            f"training (0 levels yet, {total_updates} scorer updates; "
-            f"gated by OBS-arc-iter3-win)"
-        )
+        result["status"] = "warn"
+        result["details"] = f"0 levels completed ({total_updates} scorer updates)"
     else:
         result["status"] = "ok"
         result["details"] = (

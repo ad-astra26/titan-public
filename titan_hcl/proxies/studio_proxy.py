@@ -60,7 +60,7 @@ from titan_hcl.core.state_registry import (
     ensure_shm_root,
     resolve_titan_id,
 )
-from titan_hcl.guardian_hcl import Guardian
+from titan_hcl.guardian import Guardian
 from titan_hcl.logic.studio_state_specs import (
     STUDIO_STATE_SLOT,
     STUDIO_STATE_SPEC,
