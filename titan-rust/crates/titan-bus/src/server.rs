@@ -29,7 +29,7 @@ use std::sync::Arc;
 use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tracing::{debug, warn};
 
 use titan_core::constants::{FRAME_AUTH_TAG_BYTES, FRAME_CHALLENGE_BYTES};
@@ -158,16 +158,22 @@ pub async fn run_recv_loop(
     mut read_half: tokio::net::unix::OwnedReadHalf,
     sub_name: String,
     inbound_tx: mpsc::UnboundedSender<(String, InboundEvent)>,
-    // BUG-AGNO-SILENT-HANG fix (2026-05-25): broker-side shutdown
-    // signal. Fired by `BrokerSubscriber::signal_close()` when the
-    // subscriber is marked closed (heartbeat timeout or send-loop
-    // write failure). Without this, the recv_loop would block in
-    // `read_half.read_exact` indefinitely on a half-open connection
-    // → recv_task never exits → connection_handler's tokio::join!
-    // never completes → subscriber stays in the broker's map with
-    // `closed=true` → every fanout silent-skips → silent zombie.
-    // See `BrokerSubscriber::signal_close` doc for full reasoning.
-    shutdown_notify: Arc<Notify>,
+    // SPEC §8.0.quat / D-SPEC-131 (2026-05-26): broker-side close-state
+    // channel (level-triggered). Set ONCE by
+    // `BrokerSubscriber::signal_close()` when the subscriber is marked
+    // closed (heartbeat timeout / send-loop write failure / explicit
+    // shutdown). `wait_for(|v| *v)` resolves immediately if already
+    // true at subscribe time, so the H1 race (signal_close fires before
+    // recv_loop reaches its select) cannot lose the signal.
+    //
+    // **Distinct from the data-wake `notify`** — recv_loop MUST NOT
+    // listen to the data-wake notify (SPEC §8.0.quat invariant 2). The
+    // D-SPEC-130 partial fix re-used the data-wake notify for shutdown
+    // signaling; that caused recv_loop to be probabilistically woken
+    // by every fanout's `notify_one()` (undefined choice-of-waiter
+    // semantics) → recv_loop exited thinking it was a shutdown → fleet
+    // cascade. D-SPEC-131 separates the two primitives.
+    mut close_rx: watch::Receiver<bool>,
 ) {
     // We re-create a UnixStream-like read API on the half. tokio's
     // OwnedReadHalf supports AsyncRead but not the full UnixStream API
@@ -176,21 +182,24 @@ pub async fn run_recv_loop(
     use tokio::io::AsyncReadExt;
     loop {
         // Read length prefix (4 bytes). Wrapped in tokio::select! with
-        // the shutdown notify so a broker-side close request (e.g.
+        // the close-state receiver so a broker-side close request (e.g.
         // heartbeat timeout) wakes us out of the blocking read.
         let mut prefix = [0u8; 4];
         let prefix_result = tokio::select! {
             r = read_half.read_exact(&mut prefix) => r,
-            _ = shutdown_notify.notified() => {
-                // Promoted from silent path: closure-by-broker is
-                // surfaced at INFO so the kernel log retains a single
+            // Wrap `wait_for` in an inline async block so its `Ref<'_, bool>`
+            // (carries an `RwLockReadGuard`, not `Send`) is dropped INSIDE
+            // the block and the select's `Out` enum only stores `()`.
+            _ = async { let _ = close_rx.wait_for(|v| *v).await; } => {
+                // SPEC §8.0.quat exit-reason: authoritative close-state
+                // transition observed by recv_loop. Surfaced at INFO per
+                // SPEC error-cascade discipline (Maker 2026-05-25,
+                // extended 2026-05-26) so kernel logs retain a single
                 // unambiguous trace of every connection exit reason.
-                // Per SPEC error-cascade discipline (Maker 2026-05-25):
-                // every failure mode emits a structured, visible event.
                 tracing::info!(
                     name = %sub_name,
-                    reason = "broker_shutdown_signal",
-                    "recv loop: exiting on shutdown signal from broker"
+                    reason = "broker_close_signal",
+                    "recv loop: exiting on close-state signal from broker"
                 );
                 return;
             }
@@ -225,11 +234,11 @@ pub async fn run_recv_loop(
         if n > 0 {
             let payload_result = tokio::select! {
                 r = read_half.read_exact(&mut payload) => r,
-                _ = shutdown_notify.notified() => {
+                _ = async { let _ = close_rx.wait_for(|v| *v).await; } => {
                     tracing::info!(
                         name = %sub_name,
-                        reason = "broker_shutdown_signal_mid_frame",
-                        "recv loop: exiting on shutdown signal mid-frame"
+                        reason = "broker_close_signal_mid_frame",
+                        "recv loop: exiting on close-state signal mid-frame"
                     );
                     return;
                 }
@@ -314,7 +323,10 @@ pub async fn run_recv_loop(
 // shared subscriber map (matches Python `BusSocketServer._send_loop` design).
 
 // Suppress unused-import warning when this module is built without a broker
-// driving it (tests etc.).
+// driving it (tests etc.). `Notify` retained for backward-compat with any
+// downstream crate still importing it from titan_bus::server; the actual
+// shutdown primitive used by run_recv_loop is `watch::Receiver<bool>`
+// (SPEC §8.0.quat / D-SPEC-131).
 #[allow(dead_code)]
 const _UNUSED: Option<(Arc<Mutex<BrokerSubscriber>>, Arc<Notify>)> = None;
 
