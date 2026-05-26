@@ -199,9 +199,13 @@ def _build_bus_and_client(titan_id: str, config: dict):
     from titan_hcl.core.worker_bus_bootstrap import (
         ENV_BUS_SOCKET_PATH, ENV_BUS_TITAN_ID, ENV_BUS_KEYPAIR_PATH,
     )
-    os.environ[ENV_BUS_SOCKET_PATH] = sock_path
-    os.environ[ENV_BUS_TITAN_ID] = titan_id
-    os.environ[ENV_BUS_KEYPAIR_PATH] = wallet_path
+    # os.environ requires str values; sock_path + wallet_path may be
+    # pathlib.PosixPath after the D-SPEC-135 refactor. Coerce explicitly
+    # so a PosixPath caller doesn't fail with `TypeError: str expected,
+    # not PosixPath` (caught 2026-05-26 during T1 restart).
+    os.environ[ENV_BUS_SOCKET_PATH] = str(sock_path)
+    os.environ[ENV_BUS_TITAN_ID] = str(titan_id)
+    os.environ[ENV_BUS_KEYPAIR_PATH] = str(wallet_path)
 
     return bus, client
 
