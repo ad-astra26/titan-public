@@ -33,7 +33,7 @@ from ..core.state_registry import (
     ensure_shm_root,
     resolve_titan_id,
 )
-from ..guardian import Guardian
+from ..guardian_hcl import Guardian
 from ..logic.meditation_state_reader import MeditationStateReader
 from ..logic.meditation_state_specs import (
     MEDITATION_STATE_SLOT,

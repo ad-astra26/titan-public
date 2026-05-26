@@ -68,7 +68,7 @@ class KernelView(Protocol):
         """Guardian instance — module supervisor.
 
         Same circular-import caveat as `bus`. TitanKernel returns
-        a `titan_hcl.guardian.Guardian`.
+        a `titan_hcl.guardian_hcl.Guardian`.
         """
         ...
 

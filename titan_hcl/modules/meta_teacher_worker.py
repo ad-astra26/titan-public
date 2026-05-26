@@ -295,6 +295,19 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
     # Restore adoption EMAs from disk — version-aware: v1→v2→v3 bump resets.
     teacher.adoption_ema_by_domain.update(
         _load_adoption_state(data_dir, SYSTEM_PROMPT_VERSION))
+    # rFP_teachers_update F5 (2026-05-26): bootstrap the 24h critique window
+    # from disk so SHM-published dashboard stats are accurate from the first
+    # heartbeat tick (steady-state appends in record_critique_entry).
+    try:
+        _bootstrap_n = teacher.bootstrap_24h_window(data_dir)
+        if _bootstrap_n > 0:
+            logger.info(
+                "[MetaTeacher] 24h window bootstrapped: %d critiques loaded "
+                "from disk (rFP_teachers_update F5)", _bootstrap_n)
+    except Exception as _bs_err:
+        logger.warning(
+            "[MetaTeacher] bootstrap_24h_window failed (continuing with "
+            "empty window): %s", _bs_err)
 
     # Phase B: TeacherMemory — hot/cold tiers. load() lazily reads journal.
     teacher_memory = TeacherMemory(config, data_dir=data_dir)
@@ -367,10 +380,11 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
         )
         meta_teacher_state_publisher = MetaTeacherStatePublisher(
             titan_id=titan_id)
-        meta_teacher_state_publisher.publish(teacher)
+        meta_teacher_state_publisher.publish(teacher, memory=teacher_memory)
         logger.info(
             "[MetaTeacher] meta_teacher_state publisher attached "
-            "(G21 single-writer; Phase A.4 / D-SPEC-70)")
+            "(G21 single-writer; Phase A.4 / D-SPEC-70; "
+            "rFP_teachers_update F5 dashboard payload included)")
     except Exception as _err:
         logger.warning(
             "[MetaTeacher] meta_teacher_state publisher init failed: %s — "
@@ -385,9 +399,12 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
             _send_heartbeat(send_queue, name)
             # Phase A.4 — refresh meta_teacher_state.bin every heartbeat (30s)
             # so readers see fresh ts even if no critiques arrived recently.
+            # rFP_teachers_update F5: also threads teacher_memory through so
+            # the SHM payload carries cold-tier counts + still_needs_push.
             if meta_teacher_state_publisher is not None:
                 try:
-                    meta_teacher_state_publisher.publish(teacher)
+                    meta_teacher_state_publisher.publish(
+                        teacher, memory=teacher_memory)
                 except Exception:
                     pass
             _hb_stop.wait(30.0)
@@ -724,6 +741,17 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
                 if suggested:
                     adopted = bool(suggested & actual)
                     teacher.update_adoption(domain, adopted)
+                    # F1 (rFP_teachers_update): make adoption observable in
+                    # real-time. Without this, the only signal of the loop's
+                    # effect was the jsonl on disk (the worker logged
+                    # Initializing/Ready/still_needs_push and went silent).
+                    logger.info(
+                        "[MetaTeacher] adoption: chain %s domain=%s applied=%s "
+                        "(suggested=%d ∩ actual=%d) → adoption_ema=%.2f",
+                        payload.get("chain_id", "?"), domain,
+                        "YES" if adopted else "NO",
+                        len(suggested), len(actual),
+                        teacher.adoption_ema_by_domain.get(domain, 0.0))
                     # Phase B: feed adoption back to memory cold tier.
                     prior_topic_key = sug.get("topic_key")
                     if teacher_memory.enabled and prior_topic_key:
@@ -761,6 +789,15 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
 
         # Sampling gate
         sample_ok, reason = teacher.should_sample(payload)
+        # F1 (rFP_teachers_update): emit the sampling decision so the loop is
+        # observable in journalctl in real time. Previously the only signal
+        # was the on-disk critiques jsonl — no live telemetry for whether
+        # should_sample() was accepting or rate-limiting.
+        logger.info(
+            "[MetaTeacher] sample chain=%s domain=%s mode=%s reason=%s",
+            payload.get("chain_id", "?"),
+            payload.get("domain", "general"),
+            "ACCEPT" if sample_ok else "SKIP", reason)
         if not sample_ok:
             continue
 
@@ -842,6 +879,20 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
         fb_payload = teacher.build_feedback_payload(
             payload, critique, retrieved_context_ids=retrieved_ids or None)
         gr_payloads = teacher.build_grounding_payloads(payload, critique)
+
+        # F1 (rFP_teachers_update): emit the critique result so the loop's
+        # output is visible in real-time. quality_score + suggested_primitives
+        # + llm_ok tell the operator at a glance whether the critique fired
+        # and what it returned.
+        _sug_count = len(fb_payload.get("suggested_primitives") or [])
+        logger.info(
+            "[MetaTeacher] critique chain=%s domain=%s score=%.2f reward_w=%.2f "
+            "primitives_suggested=%d llm_ok=%s",
+            payload.get("chain_id", "?"),
+            payload.get("domain", "general"),
+            float(fb_payload.get("quality_score", 0.0) or 0.0),
+            float(fb_payload.get("reward_bonus", 0.0) or 0.0),
+            _sug_count, bool(fb_payload.get("llm_ok", False)))
 
         # Persist-first, publish-second: write the critique to disk before
         # emitting bus messages. Guarantees that a crash between emit and
