@@ -397,6 +397,33 @@ def run() -> int:
             "[guardian_hcl] start_all complete — modules: %s",
             list(guardian._modules.keys()))
 
+        # ── Spawn titan_hcl (L2 plugin process) ──────────────────────
+        # SPEC §11.B.4 / D-SPEC-135 / v1.62.0 — guardian_hcl is the parent
+        # of titan_hcl per INV-PROC-3. titan_hcl runs the TitanKernel +
+        # TitanHCL plugin: kernel_rpc server (api needs this), proxies,
+        # agency/sovereignty/meditation coordination loops, FastAPI when
+        # api_process_separation is off, etc. We spawn via subprocess.Popen
+        # so titan_hcl gets its own clean process tree and inherits the
+        # broker env vars set by _build_bus_and_client (titan_hcl's
+        # BusSocketClient picks them up via the kernel boot path).
+        import subprocess
+        repo_root = os.path.normpath(os.path.join(
+            os.path.dirname(__file__), ".."))
+        titan_hcl_cmd = [
+            sys.executable, "-u",
+            os.path.join(repo_root, "scripts", "titan_hcl.py"),
+            "--server",
+        ]
+        logger.info("[guardian_hcl] spawning titan_hcl: %s", " ".join(titan_hcl_cmd))
+        titan_hcl_proc = subprocess.Popen(
+            titan_hcl_cmd,
+            cwd=repo_root,
+            env={**os.environ, "TITAN_BUS_SOCKET_PATH": os.environ.get(
+                "TITAN_BUS_SOCKET_PATH", "")},
+            stdout=None, stderr=None,
+        )
+        logger.info("[guardian_hcl] titan_hcl spawned (pid=%d)", titan_hcl_proc.pid)
+
         # ── Main supervision loop ────────────────────────────────────
         # 1 Hz monitor tick + drain_send_queues. drain_send_queues is a
         # no-op when workers communicate via socket (which they do under
@@ -417,6 +444,20 @@ def run() -> int:
             guardian.stop_all(reason="shutdown")
         except Exception as e:  # noqa: BLE001
             logger.warning("[guardian_hcl] stop_all error: %s", e)
+
+        # Terminate titan_hcl child cleanly
+        try:
+            if titan_hcl_proc.poll() is None:
+                logger.info("[guardian_hcl] terminating titan_hcl child (pid=%d)",
+                            titan_hcl_proc.pid)
+                titan_hcl_proc.terminate()
+                try:
+                    titan_hcl_proc.wait(timeout=10.0)
+                except subprocess.TimeoutExpired:
+                    logger.warning("[guardian_hcl] titan_hcl did not exit in 10s — SIGKILL")
+                    titan_hcl_proc.kill()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[guardian_hcl] titan_hcl shutdown error: %s", e)
 
         return 0
 
