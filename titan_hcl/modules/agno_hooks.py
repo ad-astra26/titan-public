@@ -1872,8 +1872,17 @@ def create_post_hook(plugin):
                     or getattr(agent, "_current_user_id", None)
                     or ""
                 )
+                # Agno 2.x passes the kwarg as `session` (NOT `session_id`).
+                # Verified live on T3 2026-05-26: PostHook kwargs.keys() =
+                # ['session', 'run_context', 'user_id', 'debug_mode', 'metadata'].
+                # `session_id` is kept first for test-injection / external-override
+                # back-compat per PLAN_synthesis_engine_Phase3 §P3.B "caller kwarg
+                # still wins if explicitly supplied". `session` is the production
+                # path. The `agent.session_id` fallback covers any other Agno
+                # versions or in-process overrides.
                 _ovg_chat_id = (
                     kwargs.get("session_id")
+                    or kwargs.get("session")
                     or getattr(agent, "session_id", "")
                     or ""
                 )

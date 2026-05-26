@@ -354,23 +354,93 @@ def check_p2(titan: Titan, baseline: dict) -> list[CheckResult]:
 # ---------------------------------------------------------------------------
 
 def check_p3(titan: Titan, baseline: dict) -> list[CheckResult]:
-    """P3 checks: deployed-only — emits SKIP across the board if the branch isn't merged."""
+    """P3 checks: episode model (D-SPEC-127, merged 2026-05-26).
+    Verifies:
+      - P3 code present (turn_index_store.py, turn_snapshot.py, topic_extractor.py)
+      - actr_topic_conversation_bundle.json contract present
+      - conversation_turn_index.json appears after chat (proves PostHook integration)
+      - inner_memory.db has knowledge_concepts.topic rows (topic_extractor source)
+      - No `[PostHook:P3]` ERROR/EXCEPTION in last 5 min journal
+    """
     results: list[CheckResult] = []
 
-    rc, _, _ = run_cmd(titan.host,
-                       f"test -f {titan.titan_dir}/titan_hcl/synthesis/turn_index_store.py")
-    if rc != 0:
-        results.append(CheckResult("P3.code-deployed", "SKIP",
-                                   "P3 code (turn_index_store.py) NOT deployed on this Titan — "
-                                   "branch session/20260525_synthesis_p3_episode_model is in origin but unmerged"))
+    # 1. All P3 source modules present
+    p3_files = [
+        f"{titan.titan_dir}/titan_hcl/synthesis/turn_index_store.py",
+        f"{titan.titan_dir}/titan_hcl/synthesis/turn_snapshot.py",
+        f"{titan.titan_dir}/titan_hcl/llm_pipeline/topic_extractor.py",
+    ]
+    missing = []
+    for f in p3_files:
+        rc, _, _ = run_cmd(titan.host, f"test -f {shlex.quote(f)}")
+        if rc != 0:
+            missing.append(os.path.basename(f))
+    if not missing:
+        results.append(CheckResult("P3.code-deployed", "PASS",
+                                   "all 3 P3 modules present"))
+    else:
+        results.append(CheckResult("P3.code-deployed", "FAIL",
+                                   f"missing modules: {missing}"))
         return results
-    results.append(CheckResult("P3.code-deployed", "PASS", "turn_index_store.py present"))
 
-    # When deployed, exercise:
-    # - turn_index_store.json advances after chat
-    # - chat-TX content carries tool_calls/neuromods/embedding_hash/importance/topic_tags
-    # - topic_extractor.py loaded + tag count per-turn ≤ MAX_TAGS_PER_TURN=10
-    # Implementation deferred until P3 deploys (lazy scaffold per the audit-on-touch discipline).
+    # 2. actr_topic_conversation_bundle.json contract present
+    rc, _, _ = run_cmd(titan.host,
+                       f"test -f {titan.titan_dir}/titan_hcl/contracts/meta_cognitive/"
+                       f"actr_topic_conversation_bundle.json")
+    if rc == 0:
+        results.append(CheckResult("P3.topic-bundle-contract-present", "PASS",
+                                   "actr_topic_conversation_bundle.json deployed"))
+    else:
+        results.append(CheckResult("P3.topic-bundle-contract-present", "FAIL",
+                                   "actr_topic_conversation_bundle.json missing"))
+
+    # 3. conversation_turn_index.json appeared after chat (proves PostHook P3 plumbing)
+    turn_index_path = f"{titan.titan_dir}/data/conversation_turn_index.json"
+    s = stat_remote(titan.host, turn_index_path)
+    if s and s["size"] > 0:
+        # Inspect a bit
+        data = read_remote_file(titan.host, turn_index_path)
+        try:
+            d = json.loads((data or b"{}").decode()) if data else {}
+            n_sessions = len(d) if isinstance(d, dict) else 0
+            results.append(CheckResult("P3.turn-index-store-active", "PASS",
+                                       f"{turn_index_path} tracks {n_sessions} session(s)"))
+        except json.JSONDecodeError:
+            results.append(CheckResult("P3.turn-index-store-active", "WARN",
+                                       "file exists but invalid JSON"))
+    else:
+        results.append(CheckResult("P3.turn-index-store-active", "FAIL",
+                                   f"{turn_index_path} not created — PostHook P3 integration "
+                                   "did NOT fire next_turn_index() during chat burst"))
+
+    # 4. inner_memory.db has knowledge_concepts.topic rows (topic_extractor source)
+    rc, out, _ = run_cmd(titan.host,
+                         f"sqlite3 {titan.titan_dir}/data/inner_memory.db "
+                         f"'SELECT COUNT(*) FROM knowledge_concepts;' 2>/dev/null || echo 0")
+    try:
+        topic_count = int(out.strip() or 0)
+    except ValueError:
+        topic_count = 0
+    if topic_count > 0:
+        results.append(CheckResult("P3.topic-extractor-source-available", "PASS",
+                                   f"inner_memory.db has {topic_count} knowledge_concepts rows"))
+    else:
+        results.append(CheckResult("P3.topic-extractor-source-available", "WARN",
+                                   "0 knowledge_concepts rows — topic_extractor will return empty tag lists "
+                                   "(no source corpus); not a P3 code bug"))
+
+    # 5. No P3-related errors in last 5 min
+    rc, out, _ = run_cmd(titan.host,
+                         f"journalctl -u {titan.journal_unit} --since '5 min ago' --no-pager 2>/dev/null "
+                         f"| grep -ciE '\\[PostHook:P3\\].*(ERROR|Exception|raised|failed)' || true")
+    err_count = int(out.strip() or 0)
+    if err_count == 0:
+        results.append(CheckResult("P3.no-posthook-errors", "PASS",
+                                   "no [PostHook:P3] errors in last 5 min"))
+    else:
+        results.append(CheckResult("P3.no-posthook-errors", "WARN",
+                                   f"{err_count} [PostHook:P3] error events — inspect with: "
+                                   f"journalctl -u {titan.journal_unit} | grep '\\[PostHook:P3\\]'"))
 
     return results
 
