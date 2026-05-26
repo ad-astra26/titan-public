@@ -35,6 +35,11 @@ import os
 
 from titan_hcl import bus as _bus_constants
 from titan_hcl.guardian_hcl import ModuleSpec
+# §11.G.2.5 dep-activation primitives (D-SPEC-90) — used by ModuleSpec
+# dependencies fields in the carved catalog (mirrors plugin.py imports).
+from titan_hcl.supervision import (
+    Dependency, DependencyAction, DependencyKind, DependencySeverity,
+)
 
 logger = logging.getLogger(__name__)
 
