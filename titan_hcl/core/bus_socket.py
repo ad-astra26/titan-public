@@ -532,8 +532,13 @@ class BusSocketClient:
         # on every reconnect (same pattern as _initial_topics).
         self._reply_only = bool(reply_only)
         self._inbound: deque = deque()
-        self._inbound_event = threading.Event()
+        # SPEC §8.0.quat parity (D-SPEC-131-Py, RFP_Phase_C_python_fix) — single
+        # wake primitive on a predicate (data arrived OR stop requested), so
+        # callers re-check authoritative state on every wakeup instead of
+        # interpreting a dual-purpose Event. The Condition uses _inbound_lock
+        # as its underlying lock — zero new lock contention.
         self._inbound_lock = threading.Lock()
+        self._wake_cond = threading.Condition(self._inbound_lock)
         self._inbound_capacity = inbound_capacity
         self._sock: Optional[socket.socket] = None
         self._sock_lock = threading.Lock()
@@ -674,8 +679,10 @@ class BusSocketClient:
                 except OSError:
                     pass
                 self._sock = None
-        # Wake any pending get() callers
-        self._inbound_event.set()
+        # Wake any pending get() callers — they re-check the predicate and
+        # observe _stop_event.is_set() = True, raising QueueEmpty.
+        with self._inbound_lock:
+            self._wake_cond.notify_all()
         if self._conn_thread is not None and self._conn_thread.is_alive():
             self._conn_thread.join(timeout=timeout)
         if self._writer_thread is not None and self._writer_thread.is_alive():
@@ -1131,7 +1138,7 @@ class BusSocketClient:
                 # doesn't accumulate stale state when it can't keep up
                 self._inbound.popleft()
             self._inbound.append(msg)
-        self._inbound_event.set()
+            self._wake_cond.notify_all()
 
 
 class SocketQueue:
@@ -1154,36 +1161,32 @@ class SocketQueue:
     def get(self, timeout: Optional[float] = None) -> dict:
         """Block until a message is available; raise queue.Empty on timeout.
 
-        Mirrors Queue.get(timeout=N) semantics — including the partial-wait
-        loop pattern (event may be falsely set after a drain elsewhere)."""
+        Uses Condition.wait_for with a multi-predicate (data arrived OR client
+        stopping). Predicate is re-evaluated on every wakeup, so a stop signal
+        cannot be mistaken for data and a spurious wake cannot return stale
+        state. SPEC §8.0.quat parity (D-SPEC-131-Py)."""
+        client = self._client
         deadline = time.time() + timeout if timeout is not None else None
-        while True:
-            with self._client._inbound_lock:
-                if self._client._inbound:
-                    msg = self._client._inbound.popleft()
-                    if not self._client._inbound:
-                        self._client._inbound_event.clear()
-                    return msg
-                self._client._inbound_event.clear()
-            if self._client._stop_event.is_set():
-                raise QueueEmpty()
+        predicate = lambda: bool(client._inbound) or client._stop_event.is_set()
+        with client._inbound_lock:
             if deadline is None:
-                self._client._inbound_event.wait()
+                client._wake_cond.wait_for(predicate)
             else:
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     raise QueueEmpty()
-                if not self._client._inbound_event.wait(timeout=remaining):
+                if not client._wake_cond.wait_for(predicate, timeout=remaining):
                     raise QueueEmpty()
+            # Predicate matched. Drain data if any; otherwise stop signal won.
+            if client._inbound:
+                return client._inbound.popleft()
+            raise QueueEmpty()
 
     def get_nowait(self) -> dict:
         with self._client._inbound_lock:
             if not self._client._inbound:
                 raise QueueEmpty()
-            msg = self._client._inbound.popleft()
-            if not self._client._inbound:
-                self._client._inbound_event.clear()
-            return msg
+            return self._client._inbound.popleft()
 
     def put_nowait(self, msg: dict) -> None:
         """Outbound — publish via broker. Worker's bus.publish API."""

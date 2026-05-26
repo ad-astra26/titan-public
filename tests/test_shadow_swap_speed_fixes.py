@@ -25,7 +25,7 @@ import pytest
 
 from titan_hcl import bus
 from titan_hcl.core import shadow_protocol as sp
-from titan_hcl.guardian import Guardian, ModuleSpec
+from titan_hcl.guardian_hcl import Guardian, ModuleSpec
 
 
 def _noop_entry(*args, **kwargs):  # pragma: no cover

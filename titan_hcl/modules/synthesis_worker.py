@@ -65,7 +65,6 @@ import msgpack
 
 from titan_hcl import bus
 from titan_hcl.bus import (
-    DREAM_STATE_CHANGED,
     KERNEL_EPOCH_TICK,
     MAINTAIN_BUNDLE,
     MEMORY_RETRIEVAL_USED,
@@ -634,133 +633,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     events_recorded = 0
     bundles_maintained = 0
 
-    # ── Phase 4 §P4.G — dream-boundary consolidation pass wiring ──────
-    # Subscribes to DREAM_STATE_CHANGED; on `dreaming=True` transition,
-    # runs a ConsolidationPass in a worker thread (does NOT block the bus
-    # loop). Rate-limited: at most 1 pass per dream window. LLM provider
-    # is best-effort — if inference module is unavailable or unconfigured,
-    # the proposer returns all-reject (pass still mines + anchors summary
-    # TXs for audit; spine writes simply don't happen until provider lands).
-    consolidation_pass: Optional[Any] = None
-    last_dream_pass_started_ts: float = 0.0
-    consolidation_thread_lock = threading.Lock()
-    try:
-        from titan_hcl.synthesis.cgn_bridge import CGNRegistrationBridge
-        from titan_hcl.synthesis.concept_store import ConceptStore
-        from titan_hcl.synthesis.consolidation import (
-            ConsolidationPass, LLMProposal,
-        )
-        from titan_hcl.synthesis.consolidation_defaults import (
-            default_mine_recent_txs, make_default_llm_propose,
-        )
-        # Resolve the canonical Kuzu graph used by the rest of the stack
-        # (memory_worker also opens it read-only); synthesis_worker opens
-        # it for spine writes. Single-Kuzu-DB invariant (arch §6.1 footnote).
-        from titan_hcl.core.direct_memory import TitanKnowledgeGraph
-        knowledge_graph_path = os.path.join("data", "knowledge_graph.kuzu")
-        kuzu_graph = TitanKnowledgeGraph(knowledge_graph_path)
-
-        # OuterMemoryWriter wired to the worker's send_queue (every
-        # concept-version TX + consolidation_pass TX flows through here).
-        from titan_hcl.synthesis.outer_memory_writer import OuterMemoryWriter
-        writer = OuterMemoryWriter(
-            send_queue=send_queue, src="synthesis_worker",
-        )
-        cgn_bridge = CGNRegistrationBridge(
-            registry_path=os.path.join("data", "synthesis_spine_concepts.json"),
-        )
-        concept_store = ConceptStore(kuzu_graph, writer)
-
-        # LLM provider — best-effort. Falls back to all-reject proposer
-        # when the inference module isn't importable / configured.
-        propose_fn = None
-        try:
-            from titan_hcl import inference as _inference_mod
-            # Resolve provider via the existing get_provider surface; the
-            # specific model + cfg are part of the broader inference setup
-            # this worker doesn't own. If provider construction fails the
-            # proposer falls through to the no-op.
-            provider = getattr(_inference_mod, "get_default_provider", None)
-            if callable(provider):
-                p = provider()  # may raise if not configured
-                propose_fn = make_default_llm_propose(p)
-        except Exception as e:
-            logger.info(
-                "[synthesis_worker] LLM proposer unavailable at boot (%s) — "
-                "consolidation will run with all-reject proposer until "
-                "provider is wired; pass-summary TXs still anchored",
-                e,
-            )
-        if propose_fn is None:
-            def propose_fn(_cluster) -> "LLMProposal":  # type: ignore[no-redef]
-                return LLMProposal(
-                    action="reject", reason="llm_proposer_unconfigured",
-                )
-
-        consolidation_pass = ConsolidationPass(
-            concept_store=concept_store,
-            cgn_bridge=cgn_bridge,
-            outer_memory_writer=writer,
-            mine_recent_txs_fn=default_mine_recent_txs,
-            llm_propose_fn=propose_fn,
-        )
-        logger.info(
-            "[synthesis_worker] ConsolidationPass ready — DREAM_STATE_CHANGED "
-            "subscription active; rate-limit = 1 pass / dream window",
-        )
-    except Exception as exc:
-        logger.warning(
-            "[synthesis_worker] ConsolidationPass construction failed: %s — "
-            "dream-boundary consolidation will be a no-op this session",
-            exc, exc_info=True,
-        )
-
-    def _maybe_run_consolidation_async(dream_start_ts: float) -> None:
-        """Fire a ConsolidationPass in a worker thread; never blocks the
-        bus loop. Rate-limited by dream window — second DREAM_STATE_CHANGED
-        within the same window is a no-op."""
-        nonlocal last_dream_pass_started_ts
-        if consolidation_pass is None:
-            return
-        with consolidation_thread_lock:
-            # Rate-limit: at most 1 pass per dream-start timestamp. A new
-            # dream window must arrive (last_dream_pass_started_ts differs)
-            # before another pass fires.
-            if dream_start_ts <= last_dream_pass_started_ts:
-                logger.debug(
-                    "[synthesis_worker] consolidation already ran for "
-                    "dream window %.3f — skipping",
-                    dream_start_ts,
-                )
-                return
-            last_dream_pass_started_ts = dream_start_ts
-
-        def _run():
-            try:
-                result = consolidation_pass.run()
-                logger.info(
-                    "[synthesis_worker] consolidation_pass %s done — "
-                    "created=%d bumped=%d rejected=%d llm_calls=%d "
-                    "txs_mined=%d duration_ms=%.1f",
-                    result.pass_id,
-                    len(result.concepts_created),
-                    len(result.concepts_bumped),
-                    result.rejected_clusters,
-                    result.llm_calls,
-                    result.txs_mined,
-                    result.duration_ms,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[synthesis_worker] consolidation_pass crashed: %s",
-                    e, exc_info=True,
-                )
-
-        threading.Thread(
-            target=_run, name="synthesis-consolidation",
-            daemon=True,
-        ).start()
-
     try:
         while True:
             try:
@@ -828,31 +700,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     logger.warning(
                         "[synthesis_worker] bundle_store.maintain failed: %s",
                         exc, exc_info=True)
-                continue
-
-            if msg_type == DREAM_STATE_CHANGED:
-                # Phase 4 §P4.G — dream-boundary consolidation listener.
-                # On dreaming=True transition fire one ConsolidationPass
-                # in a worker thread (rate-limited by dream window so a
-                # noisy publisher can't blow the LLM budget). On
-                # dreaming=False: log only — the pass running in the
-                # background must finish on its own.
-                dreaming = bool(payload.get("dreaming", False))
-                if dreaming:
-                    dream_start_ts = float(
-                        payload.get("ts", time.time())
-                    )
-                    logger.info(
-                        "[synthesis_worker] DREAM_STATE_CHANGED dreaming=True "
-                        "ts=%.3f — scheduling consolidation pass",
-                        dream_start_ts,
-                    )
-                    _maybe_run_consolidation_async(dream_start_ts)
-                else:
-                    logger.debug(
-                        "[synthesis_worker] DREAM_STATE_CHANGED dreaming=False "
-                        "— pass continues in background if running",
-                    )
                 continue
 
             # KERNEL_EPOCH_TICK + everything else: no-op in Phase 1. The

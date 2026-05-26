@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from titan_hcl.api.dashboard import router
 from titan_hcl.bus import DivineBus
-from titan_hcl.guardian import Guardian, ModuleSpec, ModuleState
+from titan_hcl.guardian_hcl import Guardian, ModuleSpec, ModuleState
 
 
 def _noop_entry(recv_q, send_q, name, config):  # pragma: no cover
