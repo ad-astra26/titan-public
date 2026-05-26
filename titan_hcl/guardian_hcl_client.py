@@ -77,15 +77,16 @@ class GuardianHCLClient:
         # returns a queue; for our event-driven cache we want a callback
         # pattern instead. We attach a small dispatcher thread.
         self._stop_event = threading.Event()
-        # reply_only=False — MODULE_READY / MODULE_CRASHED etc. are
-        # broadcasts (workers publish them dst="all" or dst="guardian").
-        # Pre-fix `reply_only=True` made the broker drop the broadcasts
-        # at the subscriber filter, so the cache never filled and /health
-        # showed 6/50 subsystems ACTIVE. With reply_only=False the local
-        # DivineBus broadcast filter still gates on `types` so only the
-        # 6 cache-relevant types are delivered.
+        # Subscribe under name "guardian" so dst="guardian" targeted messages
+        # (MODULE_HEARTBEAT, MODULE_READY, MODULE_RELOAD_ACK — workers
+        # always publish these dst="guardian") route to this subscriber via
+        # name match. Pre-Phase-6 the in-process Guardian held this name;
+        # under Phase 6 Guardian lives in a separate process — this client
+        # is the canonical "guardian" subscriber inside the titan_hcl
+        # process. reply_only=False so broadcast dst="all" events like
+        # SUPERVISION_CHILD_RESTARTED also reach the cache.
         self._cache_queue = self._bus.subscribe(
-            "guardian_hcl_client_cache",
+            "guardian",
             types=[
                 MODULE_READY, MODULE_HEARTBEAT, MODULE_CRASHED, MODULE_SHUTDOWN,
                 SUPERVISION_CHILD_RESTARTED, SUPERVISION_CHILD_DOWN,
