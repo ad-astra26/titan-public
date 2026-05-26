@@ -975,6 +975,49 @@ class TestConceptGrounder:
         assert cg._trackers["YOU"].confidence > 0.1
         assert cg.is_we_unlocked(i_confidence=0.5)
 
+    # PLAN_msl_phase3 §3g closure — L7 housekeeping 2026-05-26.
+
+    def test_compute_shared_attention_identical_vectors(self):
+        """Two Titans focused on the same modality → shared_attention = 1.0."""
+        cg = ConceptGrounder()
+        same = {
+            "visual": 0.5, "audio": 0.1, "pattern": 0.1, "inner_body": 0.1,
+            "inner_mind": 0.1, "outer_body": 0.05, "neuromod": 0.05,
+        }
+        score = cg.compute_shared_attention(same, same)
+        assert score == pytest.approx(1.0, rel=0.001)
+
+    def test_compute_shared_attention_orthogonal_vectors(self):
+        """Visual-focused Titan vs neuromod-focused Titan → score ≈ 0."""
+        cg = ConceptGrounder()
+        ours = {"visual": 1.0, "audio": 0.0, "pattern": 0.0, "inner_body": 0.0,
+                "inner_mind": 0.0, "outer_body": 0.0, "neuromod": 0.0}
+        theirs = {"visual": 0.0, "audio": 0.0, "pattern": 0.0, "inner_body": 0.0,
+                  "inner_mind": 0.0, "outer_body": 0.0, "neuromod": 1.0}
+        score = cg.compute_shared_attention(ours, theirs)
+        assert score == pytest.approx(0.0, abs=0.001)
+
+    def test_compute_shared_attention_list_input(self):
+        """List input form also works (7-element vector)."""
+        cg = ConceptGrounder()
+        ours = [0.5, 0.1, 0.1, 0.1, 0.1, 0.05, 0.05]
+        theirs = [0.4, 0.2, 0.1, 0.1, 0.1, 0.05, 0.05]
+        score = cg.compute_shared_attention(ours, theirs)
+        assert 0.95 < score <= 1.0  # close to but not exactly 1.0
+
+    def test_compute_shared_attention_handles_short_vectors(self):
+        """Vectors shorter than 7 modalities → 0.0 (defensive)."""
+        cg = ConceptGrounder()
+        assert cg.compute_shared_attention([0.5, 0.5], [0.5, 0.5]) == 0.0
+
+    def test_compute_shared_attention_handles_zero_magnitude(self):
+        """All-zero attention vector → 0.0 (no NaN from div-by-zero)."""
+        cg = ConceptGrounder()
+        zeros = [0.0] * 7
+        normal = [0.5, 0.1, 0.1, 0.1, 0.1, 0.05, 0.05]
+        assert cg.compute_shared_attention(zeros, normal) == 0.0
+        assert cg.compute_shared_attention(normal, zeros) == 0.0
+
     def test_concept_confidences(self):
         cg = ConceptGrounder()
         confs = cg.get_concept_confidences()

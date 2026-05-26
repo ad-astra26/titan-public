@@ -2310,6 +2310,23 @@ def _handle_query(msg: dict, config: dict, body_state: dict, mind_state: dict,
                         extra.get("kin_pubkey", "persona"),
                         quality, epoch, None)
                 elif concept == "WE":
+                    # PLAN_msl_phase3 §3g: WE detection wants
+                    # shared_attention = cosine(our_attn, kin_attn) when
+                    # the kin pair has shared their attention vector. Fall
+                    # back to raw quality if kin_attention not supplied
+                    # (e.g. local persona/echo dispatches without a kin
+                    # exchange context). Housekeeping closure 2026-05-26.
+                    kin_attn = extra.get("kin_attention")
+                    if kin_attn:
+                        our_attn = msl.get_attention_weights_for_kin()
+                        if our_attn:
+                            shared = cg.compute_shared_attention(
+                                our_attn, kin_attn)
+                            # shared replaces upstream quality only when
+                            # both attention vectors are available — this
+                            # is the §3g "I+YOU grounded + kin attention
+                            # comparison" pathway.
+                            quality = shared
                     event = cg.signal_we(quality, epoch, None)
                 elif concept == "THEY":
                     event = cg.signal_they(
