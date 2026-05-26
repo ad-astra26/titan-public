@@ -1,0 +1,40 @@
+"""
+titan_hcl.guardian_hcl — Guardian L1 supervisor package.
+
+Carved from titan_hcl/guardian.py per SPEC §11.B.4 / D-SPEC-135 / v1.62.0.
+Public surface re-exports preserved so existing call sites keep working:
+    from titan_hcl.guardian_hcl import Guardian, ModuleSpec, ModuleInfo, ...
+
+Internal organization:
+    core.py             — class Guardian (lifecycle, monitor_tick, supervision)
+    reload.py           — GuardianReloadMixin (D-SPEC-50 reload_module + 7-step seq)
+    dep_activation.py   — GuardianDepActivationMixin (D-SPEC-90 §11.G.2.5)
+    module_registry.py  — ModuleState / ModuleSpec / ModuleInfo / ReloadState
+
+Public API per RFP §3C.3 6C is bus messages (MODULE_RELOAD_REQUEST/ACK,
+MODULE_RESTART_REQUEST, SUPERVISION_*), not Python imports. The imports
+below remain for legacy in-process callers until the standalone process
+cutover (chunk 6F) replaces them with thin bus clients.
+"""
+from titan_hcl.guardian_hcl.core import Guardian, _module_wrapper
+from titan_hcl.guardian_hcl.module_registry import (
+    ModuleState,
+    ModuleSpec,
+    ModuleInfo,
+    ReloadState,
+    _append_meta_cgn_emission_log,
+)
+from titan_hcl.guardian_hcl.reload import GuardianReloadMixin
+from titan_hcl.guardian_hcl.dep_activation import GuardianDepActivationMixin
+
+__all__ = [
+    "Guardian",
+    "GuardianReloadMixin",
+    "GuardianDepActivationMixin",
+    "ModuleState",
+    "ModuleSpec",
+    "ModuleInfo",
+    "ReloadState",
+    "_module_wrapper",
+    "_append_meta_cgn_emission_log",
+]
