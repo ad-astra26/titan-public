@@ -41,7 +41,7 @@ def test_register_api_subprocess_runs_when_flag_on():
     """When api_process_separation_enabled=True, guardian.register called
     with ModuleSpec(name='api', layer='L3', autostart=True, ...)."""
     from titan_hcl.core.plugin import TitanHCL
-    from titan_hcl.guardian import ModuleSpec
+    from titan_hcl.guardian_hcl import ModuleSpec
 
     plugin = MagicMock(spec=TitanHCL)
     plugin._full_config = {
