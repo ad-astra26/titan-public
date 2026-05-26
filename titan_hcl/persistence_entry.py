@@ -144,9 +144,17 @@ def imw_main(recv_queue, send_queue, name: str, config: dict) -> None:
         await daemon.start()
         try:
             send_queue.put(make_msg(MODULE_READY, name, "guardian", {}))
+            # Phase 6 / D-SPEC-135 diagnostic — IMW MODULE_READY was reportedly
+            # never reaching guardian_hcl during T3 cascade. This INFO confirms
+            # the publish completed without raising; if Guardian still doesn't
+            # transition the module, the issue is broker-side routing not the
+            # worker's emit.
+            logger.info("[imw] MODULE_READY published (name=%s, dst=guardian)", name)
         except Exception as _swallow_exc:
             swallow_warn("[persistence_entry] _run: send_queue.put(make_msg(MODULE_READY, name, 'guardian', {}))", _swallow_exc,
                          key='persistence_entry._run.line117', throttle=100)
+            logger.warning("[imw] MODULE_READY publish FAILED (name=%s): %s",
+                           name, _swallow_exc)
         try:
             while not stop_event.is_set():
                 await asyncio.sleep(0.5)
