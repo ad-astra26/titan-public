@@ -50,7 +50,7 @@ from titan_hcl.bus import (
     DivineBus,
     make_msg,
 )
-from titan_hcl.guardian_hcl import Guardian
+from titan_hcl.guardian import Guardian
 
 logger = logging.getLogger(__name__)
 
