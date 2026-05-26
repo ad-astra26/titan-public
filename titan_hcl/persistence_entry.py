@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import signal
+import sys
 import threading
 import time
 from typing import Any
@@ -142,15 +143,26 @@ def imw_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
     async def _run():
         await daemon.start()
+        # Phase 6 D-SPEC-135 diagnostic — bypass Python logging to write directly
+        # to stderr so we see this even if the worker's logger state is broken
+        # post-fork. The MODULE_READY publish path under broker socket-mode
+        # has been mysteriously losing IMW emissions on T3 (5 workers showed
+        # DEGRADED indefinitely after the inbound-dispatcher fix landed). If
+        # this stderr line appears in journalctl but "MODULE_READY published"
+        # does not, the logger.info call itself is the blocker; if neither
+        # appears, send_queue.put hung; if both appear but Guardian still
+        # doesn't see RUNNING, the broker is filtering reply_only=True
+        # subscribers' outbound MODULE_READY.
+        print(f"[imw] PRE-PUBLISH name={name} sq_type={type(send_queue).__name__}",
+              file=sys.stderr, flush=True)
         try:
             send_queue.put(make_msg(MODULE_READY, name, "guardian", {}))
-            # Phase 6 / D-SPEC-135 diagnostic — IMW MODULE_READY was reportedly
-            # never reaching guardian_hcl during T3 cascade. This INFO confirms
-            # the publish completed without raising; if Guardian still doesn't
-            # transition the module, the issue is broker-side routing not the
-            # worker's emit.
+            print(f"[imw] POST-PUBLISH name={name} (no exception raised)",
+                  file=sys.stderr, flush=True)
             logger.info("[imw] MODULE_READY published (name=%s, dst=guardian)", name)
         except Exception as _swallow_exc:
+            print(f"[imw] PUT-RAISED name={name} err={_swallow_exc!r}",
+                  file=sys.stderr, flush=True)
             swallow_warn("[persistence_entry] _run: send_queue.put(make_msg(MODULE_READY, name, 'guardian', {}))", _swallow_exc,
                          key='persistence_entry._run.line117', throttle=100)
             logger.warning("[imw] MODULE_READY publish FAILED (name=%s): %s",
