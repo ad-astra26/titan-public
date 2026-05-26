@@ -129,17 +129,21 @@ class GuardianHCLClient:
         if not name:
             return
 
+        # State values match legacy Guardian.get_status() — ModuleState enum
+        # .value emits lowercase ("running" / "stopped" / "starting" /
+        # "unhealthy"). dashboard.py:2182 compares against "running" so the
+        # case must match for /health to count modules ACTIVE.
         if mtype == MODULE_READY:
             slot = self._modules_cache.setdefault(name, {})
-            slot["state"] = "RUNNING"
+            slot["state"] = "running"
             slot["last_event_ts"] = time.time()
         elif mtype == MODULE_CRASHED:
             slot = self._modules_cache.setdefault(name, {})
-            slot["state"] = "CRASHED"
+            slot["state"] = "crashed"
             slot["last_event_ts"] = time.time()
         elif mtype == MODULE_SHUTDOWN:
             slot = self._modules_cache.setdefault(name, {})
-            slot["state"] = "STOPPED"
+            slot["state"] = "stopped"
             slot["last_event_ts"] = time.time()
         elif mtype == SUPERVISION_CHILD_RESTARTED:
             slot = self._modules_cache.setdefault(name, {})
@@ -147,7 +151,7 @@ class GuardianHCLClient:
             slot["last_event_ts"] = time.time()
         elif mtype == SUPERVISION_CHILD_DOWN:
             slot = self._modules_cache.setdefault(name, {})
-            slot["state"] = "CRASHED"
+            slot["state"] = "crashed"
             slot["last_event_ts"] = time.time()
 
     # ─────────────── Guardian API surface (thin) ───────────────
@@ -255,22 +259,38 @@ class GuardianHCLClient:
     # ─────────────── Read paths (cache-served) ───────────────
 
     def is_running(self, name: str) -> bool:
-        return self._modules_cache.get(name, {}).get("state") == "RUNNING"
+        # Match legacy Guardian.is_running which reads ModuleState.RUNNING.value
+        # = "running" (lowercase). dashboard.py:2182 also tests against
+        # "running" — keep the case consistent fleet-wide.
+        return self._modules_cache.get(name, {}).get("state") == "running"
 
     def get_status(self) -> dict:
-        # Mirror the relevant subset of Guardian.get_status() — guardian_hcl's
-        # full status (including restart-window stats) is published into the
-        # guardian_state.bin SHM slot and api_subprocess reads that directly.
+        """Return `{module_name: {state, restart_count, ...}}` matching the
+        legacy Guardian.get_status() shape — dashboard.py:2180-2184 iterates
+        this dict and calls .get("state") on each value. A wrapping
+        {"modules": ..., "from_cache": True} shape breaks that iteration
+        (bool from cache key is treated as a value → AttributeError).
+
+        Layer + pid + uptime are not tracked in the cache (we only see
+        bus-event-driven state transitions); legacy fields default to
+        sensible neutral values so consumers that .get() them don't crash.
+        """
         return {
-            "modules": {
-                name: {
-                    "state": info.get("state", "UNKNOWN"),
-                    "restart_count": info.get("restart_count", 0),
-                }
-                for name, info in self._modules_cache.items()
-            },
-            "from_cache": True,
-            "source": "GuardianHCLClient (Phase 6)",
+            name: {
+                "state": info.get("state", "stopped"),
+                "restart_count": info.get("restart_count", 0),
+                # Legacy fields — not tracked in cache; consumers .get() them.
+                "pid": info.get("pid", 0),
+                "rss_mb": info.get("rss_mb", 0.0),
+                "uptime": info.get("uptime", 0),
+                "restarts_in_window": info.get("restarts_in_window", 0),
+                "last_heartbeat_age": info.get("last_heartbeat_age", -1),
+                "layer": info.get("layer", "L?"),
+                "start_method": info.get("start_method", "fork"),
+                "adopted": info.get("adopted", False),
+                "adopt_ts": info.get("adopt_ts", 0.0),
+            }
+            for name, info in self._modules_cache.items()
         }
 
     def get_modules_by_layer(self) -> dict[str, list[str]]:
