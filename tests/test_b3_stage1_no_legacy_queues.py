@@ -22,7 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from titan_hcl.bus import DivineBus
-from titan_hcl.guardian import Guardian, ModuleSpec, ModuleState
+from titan_hcl.guardian_hcl import Guardian, ModuleSpec, ModuleState
 
 
 def _dummy_entry(*args, **kwargs):
