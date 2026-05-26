@@ -1,13 +1,4 @@
 """
-titan_hcl.guardian_hcl.core — Guardian L1 supervisor class.
-
-Carved from titan_hcl/guardian.py by scripts/_phase6_carve_guardian.py per
-SPEC §11.B.4 / D-SPEC-135 / v1.62.0. Guardian = GuardianReloadMixin +
-GuardianDepActivationMixin + remaining lifecycle methods. Dataclasses
-(ModuleState/ModuleSpec/ModuleInfo/ReloadState) live in module_registry.
-Public API surface frozen as bus messages per RFP §3C.3 6C.
-"""
-"""
 Guardian — Module supervisor for Titan V4.0 microkernel.
 
 Manages the lifecycle of supervised module processes:
@@ -36,7 +27,7 @@ from multiprocessing import Process
 from queue import Empty
 from typing import Callable, Optional
 
-from titan_hcl.bus import (
+from .bus import (
     AnyQueue,
     BUS_PEER_DIED,
     BUS_WORKER_ADOPT_ACK,
@@ -102,19 +93,169 @@ MAX_STARVED_CYCLES = 5          # how many consecutive starved-but-alive cycles 
 # typical ARC tail without leaving truly-stuck modules hanging too long.
 
 
-
-from titan_hcl.guardian_hcl.module_registry import (
-    ModuleState,
-    ModuleSpec,
-    ModuleInfo,
-    ReloadState,
-    _append_meta_cgn_emission_log,
-)
-from titan_hcl.guardian_hcl.reload import GuardianReloadMixin
-from titan_hcl.guardian_hcl.dep_activation import GuardianDepActivationMixin
+class ModuleState(Enum):
+    STOPPED = "stopped"
+    STARTING = "starting"
+    RUNNING = "running"
+    UNHEALTHY = "unhealthy"
+    CRASHED = "crashed"
+    DISABLED = "disabled"
 
 
-class Guardian(GuardianReloadMixin, GuardianDepActivationMixin):
+@dataclass
+class ModuleSpec:
+    """Specification for a supervised module."""
+    name: str
+    entry_fn: Callable  # function(bus_queue, config) → runs in child process
+    config: dict = field(default_factory=dict)
+    rss_limit_mb: int = DEFAULT_RSS_LIMIT_MB
+    autostart: bool = False      # start immediately on Guardian boot
+    lazy: bool = True            # start on first use (via proxy)
+    restart_on_crash: bool = True
+    heartbeat_timeout: float = HEARTBEAT_TIMEOUT  # per-module override
+    reply_only: bool = False     # if True, skip dst="all" broadcasts (only receive targeted msgs)
+    # Microkernel v2 Phase A §A.5 (2026-04-24): layer assignment.
+    # Canonical values in titan_hcl._layer_canon.LAYER_CANON.
+    # Validated in Guardian.register(). Used by arch_map, dashboard,
+    # and layer-aware crash logging.
+    layer: str = "L3"
+    # Microkernel v2 Phase A §A.3 (2026-04-25, S6): spawn vs fork
+    # start method. Default "fork" preserves Guardian's current
+    # byte-identical behavior. When set to "spawn", Guardian boots
+    # the worker via multiprocessing.get_context("spawn") — fresh
+    # interpreter, no parent COW inheritance. Saves ~200 MB RSS per
+    # worker (fork baseline ~265 MB → spawn baseline ~50-80 MB).
+    # Unknown values fall back to "fork" with a WARNING (Guardian
+    # never crashes boot on a misconfigured ModuleSpec).
+    start_method: str = "fork"
+    # Microkernel v2 Phase B.2 (2026-04-30): broadcast topic filter.
+    # When non-empty + bus_ipc_socket_enabled=true, the broker filters
+    # `dst="all"` broadcasts at publish time so only messages with
+    # `type` in this list reach the subscriber. Empty list = legacy
+    # "subscribe-all" (every broadcast delivered) — preserved for
+    # backward compatibility with workers not yet migrated.
+    # Closes the per-subscriber flood class identified 2026-04-30
+    # (backup queue receiving SPHERE_PULSE/SPIRIT_STATE/etc. it never
+    # consumes). See bus_socket.py:563 BrokerSubscriber.publish docs.
+    broadcast_topics: list = field(default_factory=list)
+    # Microkernel v2 Phase B.2.1 §M5 (2026-04-27 PM): adoption criticality.
+    # When True (default): worker MUST adopt for shadow swap to succeed —
+    # holds heavy in-process state (FAISS, DuckDB, audit chain, neural
+    # nets, vocabulary) that would be expensive to re-load. When False:
+    # nice-to-adopt — orchestrator declares swap successful regardless;
+    # if this worker doesn't adopt by timeout, it's left to self-SIGTERM
+    # via supervision daemon's bus-as-supervision check, and shadow's
+    # Guardian respawns it fresh post-swap (light-state workers like
+    # autonomous writers, observability aggregators, periodic backup
+    # daemons).
+    b2_1_swap_critical: bool = True
+    # SG6 (2026-05-14) — Phase 13 Sage Socialite social_graph_worker
+    # extraction (rFP_titan_hcl_l2_separation_strategy §4.P + D-SPEC-50).
+    # Marker for modules that own a critical-data SHM slot (e.g.,
+    # social_graph_state.bin G21 single-writer). Used by:
+    #   - shadow_swap_orchestrator.py: gates SWAP_CHECKPOINT_REQUEST scope
+    #     to only critical-data writers (per SPEC §8.3 / §12.E.1)
+    #   - backup_worker: prioritizes critical-data slot snapshotting in
+    #     incremental capture cadence
+    # Closed BUG-MODULESPEC-CRITICAL-DATA-WRITER-FIELD-MISSING-20260514
+    # (kwarg added in plugin.py:1030 + legacy_core.py:911 by SG6 commit
+    # but field declaration was missed — TypeError on T2 Phase C boot).
+    critical_data_writer: bool = False
+    # Phase C C-S7 (2026-05-05) — declarative dependencies per SPEC §11.G.1.
+    # Default empty → no pre-respawn dep check (legacy behavior). Future
+    # commits populate per-module (e.g., social_module.dependencies =
+    # [Dependency("x_api_reachable", EXTERNAL_SVC, SOFT, ...)]).
+    dependencies: list[Dependency] = field(default_factory=list)
+
+
+@dataclass
+class ModuleInfo:
+    """Runtime state for a supervised module."""
+    spec: ModuleSpec
+    state: ModuleState = ModuleState.STOPPED
+    process: Optional[Process] = None
+    pid: Optional[int] = None
+    queue: Optional[AnyQueue] = None     # module's receive queue (bus→worker)
+    send_queue: Optional[AnyQueue] = None  # module's send queue (worker→bus)
+    last_heartbeat: float = 0.0
+    start_time: float = 0.0
+    restart_count: int = 0
+    last_restart: float = 0.0
+    rss_mb: float = 0.0
+    restart_timestamps: deque = field(default_factory=lambda: deque(maxlen=MAX_RESTARTS_IN_WINDOW + 1))
+    ready_time: float = 0.0  # when MODULE_READY was received
+    disabled_at: float = 0.0  # when module was disabled (for auto-re-enable cooldown)
+    # CPU-aware heartbeat (added 2026-04-21 after iter-3 ARC load triggered
+    # cascading media-module restart loops on shared T2/T3 VPS — modules
+    # were CPU-starved, not deadlocked, but wallclock heartbeat fired anyway).
+    last_cpu_time: float = 0.0           # /proc/<pid>/stat utime+stime sample (seconds)
+    last_cpu_sample_ts: float = 0.0      # when last_cpu_time was sampled
+    consecutive_starved_cycles: int = 0  # heartbeat misses where CPU grew (alive-but-starved)
+    # Microkernel v2 Phase B.2.1 (2026-04-27): worker supervision-transfer.
+    # When True, this ModuleInfo refers to an externally-spawned worker
+    # (adopted from a prior kernel via BUS_WORKER_ADOPT_REQUEST). We do NOT
+    # own info.process (it stays None); cleanup uses os.kill instead of
+    # process.kill(). First heartbeat after adoption resets clocks fresh.
+    adopted: bool = False
+    adopt_ts: float = 0.0                # when adoption completed (for telemetry)
+    # Phase C C-S7 (2026-05-05) — rolling reason buffer (last 16) per
+    # SPEC §11.B step 3, used to compute most_common_reason for
+    # SUPERVISION_ESCALATION payloads (§11.B.1 step 1).
+    reason_buffer: deque = field(default_factory=lambda: deque(maxlen=16))
+    # Phase C C-S7 — track in-flight escalations + dependency-blocked state.
+    last_escalation_id: Optional[str] = None
+    blocked_dependency: Optional[str] = None
+    blocked_since: float = 0.0
+    # SPEC §11.B.3 (Phase B, D-SPEC-49) — per-module hot-reload state.
+    # Set True by Guardian.reload_module() on entry; cleared on terminal
+    # status (ready / failed / rolled_back). While True, monitor_tick MUST
+    # skip restart paths (heartbeat-timeout / CPU-starvation / RSS-overflow)
+    # for this module's OLD pid; restart_async() from any other caller
+    # returns None. Bounded by the orchestrator-level timeout
+    # MODULE_RELOAD_DEFAULT_TIMEOUT_S=30s so supervision authority is
+    # always recoverable. Single-threaded — only the orchestrator
+    # mutates this under Guardian._reload_lock.
+    reload_in_flight: bool = False
+
+
+@dataclass
+class ReloadState:
+    """SPEC §11.B.3 (D-SPEC-49) — orchestrator state for one in-flight
+    per-module hot-reload. Owned by Guardian._reloads_in_flight (keyed by
+    module_name). Lifetime is from `reload_module()` entry to terminal
+    MODULE_RELOAD_ACK emission; the orchestrator deletes the entry under
+    `Guardian._reload_lock` before returning.
+
+    The two queues route ADOPTION_REQUEST + MODULE_READY frames from
+    `_process_guardian_messages` to the orchestrator thread without
+    blocking message processing. They are bounded but generously sized
+    (8 frames) because at most one of each is expected per reload.
+    """
+    swap_id: str
+    module_name: str
+    old_pid: int
+    new_module_path: Optional[str]
+    started_ts: float
+    status: str = "spawning"          # spawning → adopted → ready | failed | rolled_back
+    new_process: Optional[Process] = None
+    new_pid: Optional[int] = None
+    new_queue: Optional[AnyQueue] = None
+    new_send_queue: Optional[AnyQueue] = None
+    new_recv_queue_registered: bool = False
+    error: Optional[str] = None
+    failed_step: Optional[str] = None
+    # Inter-thread routing — _process_guardian_messages fills these so the
+    # orchestrator thread (running on _restart_executor via _reload_module_sync)
+    # doesn't block the bus drain loop.
+    adoption_q: "_queue_mod.Queue" = field(
+        default_factory=lambda: _queue_mod.Queue(maxsize=8)
+    )
+    ready_q: "_queue_mod.Queue" = field(
+        default_factory=lambda: _queue_mod.Queue(maxsize=8)
+    )
+
+
+class Guardian:
     """
     Supervises module processes — starts, monitors, restarts.
 
@@ -256,7 +397,7 @@ class Guardian(GuardianReloadMixin, GuardianDepActivationMixin):
     def register(self, spec: ModuleSpec) -> None:
         """Register a module specification. Does not start the module."""
         # Microkernel v2 Phase A §A.5 — validate layer before registering.
-        from titan_hcl._layer_canon import validate_layer
+        from ._layer_canon import validate_layer
         validate_layer(spec.layer)
         if spec.name in self._modules:
             logger.warning("[Guardian] Module '%s' already registered, updating spec", spec.name)
@@ -1000,6 +1141,607 @@ class Guardian(GuardianReloadMixin, GuardianDepActivationMixin):
             "error": None,
         }
 
+    # ── SPEC §8.3 + §11.B.3 — Per-module hot-reload (D-SPEC-49) ─────────
+
+    async def reload_module(self, module_name: str,
+                            new_module_path: Optional[str] = None,
+                            timeout_s: float = MODULE_RELOAD_DEFAULT_TIMEOUT_S
+                            ) -> dict:
+        """SPEC §8.3 + §11.B.3 — initiate per-module hot-reload.
+
+        Per `rFP_phase_c_bus_delivery_continuity_and_hot_reload.md` §4.4.
+        Orchestrates spawn-NEW → adopt → kill-OLD reusing §8.4 ADOPTION
+        protocol + §8.0.bis boot-buffer for delivery continuity across
+        the transfer window.
+
+        Args:
+            module_name: registered ModuleSpec.name
+            new_module_path: path to new module file (None = same-source
+                in-place reload of stuck module)
+            timeout_s: max wait for terminal status (default
+                MODULE_RELOAD_DEFAULT_TIMEOUT_S=30s)
+
+        Returns:
+            {swap_id, module_name, status, reason, total_elapsed_ms, ts}
+            where status ∈ {ready, failed, rolled_back}.
+
+        Idempotent — re-issuing during in-flight returns status="failed"
+        with reason="reload_in_flight" per §4.4.
+
+        Async coroutine wrapping a synchronous orchestrator delegated to
+        `_restart_executor` so FastAPI/dashboard callers can `await`
+        without blocking their event loop. The orchestrator itself is
+        synchronous because mp.Process spawn + queue.get + os.kill are
+        all sync I/O.
+        """
+        swap_id = str(uuid.uuid4())
+        return await asyncio.to_thread(
+            self._reload_module_sync,
+            module_name, new_module_path, timeout_s, swap_id,
+        )
+
+    def _reload_module_sync(self, module_name: str,
+                            new_module_path: Optional[str],
+                            timeout_s: float, swap_id: str) -> dict:
+        """Synchronous orchestrator for `reload_module()` + bus
+        MODULE_RELOAD_REQUEST entry point. Runs on `_restart_executor`.
+
+        Implements the §4.3 8-step sequence with rollback on adoption
+        timeout. Always clears `info.reload_in_flight` and pops the
+        `_reloads_in_flight` entry in `finally` so supervision authority
+        is always recoverable.
+        """
+        started_ts = time.time()
+
+        # ── Step 1: validate + register reload state ──────────────────
+        with self._reload_lock:
+            info = self._modules.get(module_name)
+            if info is None:
+                self._emit_reload_ack(
+                    swap_id, module_name, "failed",
+                    "unknown_module", started_ts)
+                return self._reload_result(
+                    swap_id, module_name, "failed",
+                    "unknown_module", started_ts)
+            if module_name in self._reloads_in_flight:
+                self._emit_reload_ack(
+                    swap_id, module_name, "failed",
+                    "reload_in_flight", started_ts)
+                return self._reload_result(
+                    swap_id, module_name, "failed",
+                    "reload_in_flight", started_ts)
+            if info.state != ModuleState.RUNNING:
+                self._emit_reload_ack(
+                    swap_id, module_name, "failed",
+                    f"not_running:state={info.state.value}", started_ts)
+                return self._reload_result(
+                    swap_id, module_name, "failed",
+                    f"not_running:state={info.state.value}", started_ts)
+            if info.process is None or info.pid is None:
+                self._emit_reload_ack(
+                    swap_id, module_name, "failed",
+                    "no_process", started_ts)
+                return self._reload_result(
+                    swap_id, module_name, "failed",
+                    "no_process", started_ts)
+            old_process = info.process
+            old_pid = info.pid
+            rs = ReloadState(
+                swap_id=swap_id,
+                module_name=module_name,
+                old_pid=old_pid,
+                new_module_path=new_module_path,
+                started_ts=started_ts,
+            )
+            self._reloads_in_flight[module_name] = rs
+            info.reload_in_flight = True
+
+        deadline = started_ts + timeout_s
+        try:
+            # ── Step 2: ACK status="spawning" ──────────────────────────
+            self._emit_reload_ack(
+                swap_id, module_name, "spawning", None, started_ts)
+
+            # ── Step 3: spawn NEW alongside OLD ────────────────────────
+            spawn_err = self._spawn_for_reload(rs, info)
+            if spawn_err is not None:
+                return self._rollback_reload(
+                    rs, info, old_process, "spawn", spawn_err, started_ts)
+
+            # ── Step 4: wait ADOPTION_REQUEST from NEW pid ────────────
+            # Drains adoption_q until we get a frame whose payload.pid matches
+            # rs.new_pid (defensive — race-free routing in
+            # _process_guardian_messages places frames by name only; here we
+            # validate the actual sender). Defensive pid-validation moved
+            # here per BUG-PHASE-B-FIRST-RELOAD-ADOPTION-ROUTING-MISS-20260514
+            # closure (race-free Guardian-side routing relies on this
+            # validation site, not the broker-routing site).
+            adoption_msg: dict | None = None
+            while True:
+                timeout_left = max(
+                    0.5, min(ADOPTION_TIMEOUT_S, deadline - time.time()))
+                if timeout_left <= 0.5 and deadline - time.time() <= 0:
+                    break
+                try:
+                    candidate = rs.adoption_q.get(timeout=timeout_left)
+                except _queue_mod.Empty:
+                    break
+                cand_pid = (candidate.get("payload") or {}).get("pid")
+                if cand_pid == rs.new_pid:
+                    adoption_msg = candidate
+                    break
+                logger.warning(
+                    "[Guardian] reload '%s' (swap_id=%s) ignoring stale "
+                    "ADOPTION_REQUEST from pid=%s (expected rs.new_pid=%s) — "
+                    "likely fanout from a sibling/prior reload",
+                    module_name, rs.swap_id, cand_pid, rs.new_pid)
+            if adoption_msg is None:
+                return self._rollback_reload(
+                    rs, info, old_process,
+                    "adoption", "adoption_timeout", started_ts)
+
+            # ── Step 5: emit ADOPTION_ACK + ACK status="adopted" ──────
+            rid = adoption_msg.get("rid")
+            self.bus.publish(make_msg(
+                BUS_WORKER_ADOPT_ACK, "guardian", module_name, {
+                    "name": module_name,
+                    "pid": rs.new_pid,
+                    "shadow_pid": os.getpid(),
+                    "status": "adopted",
+                    "reason": None,
+                }, rid=rid))
+            rs.status = "adopted"
+            self._emit_reload_ack(
+                swap_id, module_name, "adopted", None, started_ts)
+
+            # ── Step 6: send MODULE_SHUTDOWN to OLD + grace + SIGKILL ─
+            self.bus.publish(make_msg(
+                MODULE_SHUTDOWN, "guardian", module_name, {
+                    "reason": "reload",
+                    "swap_id": swap_id,
+                    "target_pid": old_pid,
+                }))
+            # SUPERVISION_SHUTDOWN_GRACE_S=10s implicit per SPEC §11.A —
+            # match Guardian.stop() semantics (gentle SIGTERM → 2s grace
+            # for adopted workers; we have explicit grace here).
+            shutdown_grace_deadline = time.time() + 10.0
+            while time.time() < shutdown_grace_deadline:
+                if not self._pid_alive(old_pid):
+                    break
+                time.sleep(0.1)
+            if self._pid_alive(old_pid):
+                logger.warning(
+                    "[Guardian] Reload OLD pid=%s for '%s' did not exit "
+                    "gracefully within 10s — SIGKILL", old_pid, module_name)
+                try:
+                    os.kill(old_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "[Guardian] SIGKILL of OLD pid=%s failed: %s",
+                        old_pid, e)
+                # Brief wait for SIGKILL to take effect before swap
+                t_end = time.time() + 1.0
+                while time.time() < t_end:
+                    if not self._pid_alive(old_pid):
+                        break
+                    time.sleep(0.05)
+
+            # ── Step 7: atomic swap of info.process / info.pid / queues ─
+            with self._module_lock:
+                if old_process is not None:
+                    try:
+                        old_process.join(timeout=2.0)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        old_process.close()
+                    except (ValueError, OSError):
+                        # Process already closed or never started cleanly —
+                        # benign in this code path.
+                        pass
+                info.process = rs.new_process
+                info.pid = rs.new_pid
+                # Queues: in socket-broker mode, both are None (worker
+                # rebinds via setup_worker_bus). In legacy mp.Queue mode,
+                # _spawn_for_reload pre-allocated rs.new_queue/send_queue
+                # and registered with the bus.
+                info.queue = rs.new_queue
+                info.send_queue = rs.new_send_queue
+                info.start_time = time.time()
+                info.last_heartbeat = time.time()
+                info.state = ModuleState.STARTING
+                # Keep reload_in_flight=True until MODULE_READY arrives so
+                # NEW gets boot grace without monitor_tick heartbeat-timeout
+                # restart-cycling it. Cleared in `finally`.
+
+            # ── Step 8: wait MODULE_READY from NEW ────────────────────
+            timeout_left = max(
+                1.0, min(MODULE_RELOAD_HAPPY_PATH_S, deadline - time.time()))
+            try:
+                rs.ready_q.get(timeout=timeout_left)
+            except _queue_mod.Empty:
+                # NEW didn't emit MODULE_READY within budget. OLD is dead,
+                # NEW is alive — this is NOT a rollback (no recovery path).
+                # Leave NEW running as the slot's new owner; supervision
+                # will handle it normally via heartbeat-timeout if it never
+                # boots. Emit failed status so initiator knows.
+                self._emit_reload_ack(
+                    swap_id, module_name, "failed",
+                    "ready_timeout", started_ts)
+                return self._reload_result(
+                    swap_id, module_name, "failed",
+                    "ready_timeout", started_ts)
+
+            # NEW emitted MODULE_READY — finalize state=RUNNING explicitly
+            # here regardless of whether _process_guardian_messages
+            # already transitioned it. Race window: MODULE_READY may
+            # arrive BEFORE Step 7's atomic swap (NEW boots faster than
+            # Step 6's 10s SIGKILL grace). In that case
+            # _process_guardian_messages set state=RUNNING first, then
+            # Step 7 overwrote it back to STARTING. Without this final
+            # transition the module stays stuck at state=starting forever
+            # despite being fully alive (heartbeats arriving, requests
+            # processed). Live-discovered 2026-05-19 during T3 cascade
+            # of D-SPEC-93 (knowledge_worker pid=1090355 stuck STARTING
+            # after pid=1090080 SIGKILL). Part of D-SPEC-93 closure.
+            with self._module_lock:
+                if info.state != ModuleState.RUNNING:
+                    info.state = ModuleState.RUNNING
+                    info.ready_time = time.time()
+                    info.last_heartbeat = time.time()
+                    logger.info(
+                        "[Guardian] Module '%s' state finalized RUNNING "
+                        "post-reload (pid=%s, swap_id=%s)",
+                        module_name, info.pid, swap_id)
+            self._emit_reload_ack(
+                swap_id, module_name, "ready", None, started_ts)
+            return self._reload_result(
+                swap_id, module_name, "ready", None, started_ts)
+        finally:
+            # Always release supervision authority on this module so
+            # monitor_tick can resume per §11.B.3 contract.
+            with self._reload_lock:
+                info.reload_in_flight = False
+                self._reloads_in_flight.pop(module_name, None)
+
+    def _spawn_for_reload(self, rs: "ReloadState",
+                          info: ModuleInfo) -> Optional[str]:
+        """Spawn NEW subprocess alongside OLD, populating rs.new_process /
+        rs.new_pid / rs.new_queue / rs.new_send_queue. Returns None on
+        success, an error string on failure.
+
+        Mirrors `start()`'s spawn block but does NOT touch `info.process`
+        — OLD stays the registered owner until the atomic swap in step 7.
+        """
+        import copy as _copy
+        import multiprocessing
+
+        method = info.spec.start_method
+        if method not in ("fork", "spawn"):
+            method = "fork"
+        ctx = multiprocessing.get_context(method)
+
+        # Mirror start() queue-allocation logic. In socket-broker mode
+        # the worker rebinds via setup_worker_bus() so both queues are
+        # None. In legacy mode we allocate ctx.Queue() for bidirectional
+        # bus routing.
+        if self.bus.has_socket_broker:
+            rs.new_queue = None
+            rs.new_send_queue = None
+        else:
+            rs.new_queue = ctx.Queue(maxsize=10000)
+            rs.new_send_queue = ctx.Queue(maxsize=10000)
+
+        # SPEC §11.B.3 Phase B — deep-copy config + inject swap_id so the
+        # NEW worker's setup_worker_bus emits ADOPTION_REQUEST on initial
+        # subscribe-ack. deep-copy prevents OLD's spec.config from being
+        # mutated (which would race with concurrent reloads on other
+        # modules). _module_wrapper pops the key before passing config
+        # down to entry_fn so worker code sees its normal config dict.
+        reload_config = _copy.deepcopy(info.spec.config) \
+            if isinstance(info.spec.config, dict) else {}
+        reload_config["_phase_b_reload_swap_id"] = rs.swap_id
+
+        try:
+            proc = ctx.Process(
+                target=_module_wrapper,
+                args=(
+                    info.spec.entry_fn,
+                    info.spec.name,
+                    rs.new_queue,
+                    rs.new_send_queue,
+                    reload_config,
+                    info.spec.start_method,
+                    info.spec.broadcast_topics,
+                    info.spec.reply_only,
+                ),
+                name=f"titan-{info.spec.name}-reload",
+                daemon=True,
+            )
+            proc.start()
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "[Guardian] reload spawn failed for '%s': %s",
+                info.spec.name, e)
+            return f"spawn_exception:{e!r}"
+
+        rs.new_process = proc
+        rs.new_pid = proc.pid
+        logger.info(
+            "[Guardian] Reload: spawned NEW '%s' pid=%d alongside OLD pid=%d "
+            "(swap_id=%s)",
+            info.spec.name, proc.pid, rs.old_pid, rs.swap_id)
+        return None
+
+    def _rollback_reload(self, rs: "ReloadState", info: ModuleInfo,
+                         old_process: Optional[Process],
+                         failed_step: str, reason: str,
+                         started_ts: float) -> dict:
+        """Rollback path — kill NEW (still alive at this point), leave OLD
+        untouched as sole owner. Caller is responsible for clearing
+        `info.reload_in_flight` (done in `_reload_module_sync` `finally`).
+
+        Only valid for failures BEFORE step 6 (MODULE_SHUTDOWN to OLD) —
+        after that, OLD is dead and there's no recovery path. Step 8
+        ready_timeout is handled separately as a SOFT failure.
+        """
+        logger.warning(
+            "[Guardian] Reload rollback for '%s' (swap_id=%s): step=%s "
+            "reason=%s; killing NEW pid=%s, OLD pid=%s resumes as owner",
+            rs.module_name, rs.swap_id, failed_step, reason,
+            rs.new_pid, rs.old_pid)
+        # Kill NEW if it spawned
+        if rs.new_process is not None:
+            try:
+                rs.new_process.kill()
+                rs.new_process.join(timeout=2.0)
+                rs.new_process.close()
+            except (ValueError, OSError):
+                pass
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[Guardian] Reload rollback NEW kill failed for '%s': "
+                    "%s", rs.module_name, e)
+        # Also belt-and-suspenders: SIGKILL by pid if we have one
+        if rs.new_pid is not None and self._pid_alive(rs.new_pid):
+            try:
+                os.kill(rs.new_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception:  # noqa: BLE001
+                pass
+        self._emit_reload_ack(
+            rs.swap_id, rs.module_name, "rolled_back",
+            f"{failed_step}:{reason}", started_ts)
+        return self._reload_result(
+            rs.swap_id, rs.module_name, "rolled_back",
+            f"{failed_step}:{reason}", started_ts)
+
+    def _emit_reload_ack(self, swap_id: str, module_name: str, status: str,
+                         reason: Optional[str], started_ts: float) -> None:
+        """Publish a MODULE_RELOAD_ACK frame on the bus. dst="all" is the
+        practical broadcast because the initiator subscription is not
+        named (Maker CLI / future D9 Guardian). MODULE_RELOAD_ACK is
+        pre-listed in BOOT_BUFFERED_TYPES so transient subscription gaps
+        on the initiator side don't lose the terminal status (§8.0.bis).
+
+        `total_elapsed_ms` is recorded on every ACK so observers can
+        track end-to-end timing per acceptance gate §4.6 #1.
+        """
+        elapsed_ms = int((time.time() - started_ts) * 1000)
+        try:
+            self.bus.publish(make_msg(
+                MODULE_RELOAD_ACK, "guardian", "all", {
+                    "swap_id": swap_id,
+                    "module_name": module_name,
+                    "status": status,
+                    "reason": reason,
+                    "total_elapsed_ms": elapsed_ms,
+                    "ts": time.time(),
+                }))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "[Guardian] MODULE_RELOAD_ACK publish failed for '%s' "
+                "(swap_id=%s, status=%s): %s",
+                module_name, swap_id, status, e)
+
+    @staticmethod
+    def _reload_result(swap_id: str, module_name: str, status: str,
+                       reason: Optional[str], started_ts: float) -> dict:
+        """Build the dict returned by `reload_module()` / `_reload_module_sync`.
+        Mirrors MODULE_RELOAD_ACK payload shape per SPEC §8.3."""
+        return {
+            "swap_id": swap_id,
+            "module_name": module_name,
+            "status": status,
+            "reason": reason,
+            "total_elapsed_ms": int((time.time() - started_ts) * 1000),
+            "ts": time.time(),
+        }
+
+    # Phase C C-S7 — supervision helpers (cross-language unification).
+
+    def _reason_string_to_canonical(self, reason: str) -> SupervisionReason:
+        """Map Guardian's free-form reason strings to canonical
+        SupervisionReason enum values per SPEC §11.B step 2.
+
+        Best-effort heuristic — exit-code-based classification (used by
+        monitor_tick when an exitcode is observable) is more accurate.
+        """
+        r = reason.lower()
+        if "heartbeat" in r or "starved" in r or "stall" in r:
+            return SupervisionReason.HANG
+        if "rss" in r or "oom" in r or "memory" in r:
+            return SupervisionReason.OOM
+        if "exitcode" in r:
+            # Try to extract trailing integer
+            import re as _re
+            m = _re.search(r"(\d+)", reason)
+            if m:
+                return classify_exit_code(int(m.group(1)))
+            return SupervisionReason.PANIC
+        if "config" in r:
+            return SupervisionReason.CONFIG_ERROR
+        if "boot" in r:
+            return SupervisionReason.BOOT_FAILURE
+        if "killed" in r or "sigkill" in r:
+            return SupervisionReason.KILLED
+        if "broker_peer_dead" in r or "peer_died" in r:
+            return SupervisionReason.PANIC  # broker observed peer death
+        if "dependency" in r:
+            return SupervisionReason.DEPENDENCY_BLOCKED
+        return SupervisionReason.OTHER
+
+    def _activate_dependencies(self, name: str) -> None:
+        """SPEC §11.G.2.5 (D-SPEC-90, v1.29.0) — pre-start dependency activation.
+
+        For each `MODULE`-kind `CRITICAL`-severity dep declared with
+        `action=ENSURE_RUNNING`, recursively start the dep if it is registered
+        and currently STOPPED, then wait up to
+        SUPERVISION_DEPENDENCY_ACTIVATION_TIMEOUT_S (30s) for the dep to reach
+        RUNNING + emit MODULE_READY.
+
+        Closes the lazy-start chicken-and-egg discovered post-§4.D
+        meditation_worker extraction: `memory` was `autostart=False, lazy=True`
+        and no subprocess could wake it from the parent's
+        `MemoryProxy._ensure_started` bridge. Pre-§4.D it worked because
+        plugin.py main process called `_ensure_started`; post-§4.D the
+        subprocess can only emit bus events, leaving the lazy dep stranded.
+
+        Runs at every Guardian.start(name) — including autostart-driven first
+        start, lazy-wake start, and post-crash respawn. Soft and PROBE deps
+        are ignored here (they go through §11.G.2 respawn check unchanged).
+
+        DAG-acyclicity is enforced by SPEC §11.G.7
+        (`arch_map phase-c verify --check-deps`); recursion terminates by
+        induction on DAG depth.
+
+        On dep-not-registered → emit SUPERVISION_DEPENDENCY_BLOCKED + log
+        ERROR + continue (do not block dependent — let §11.G.2 catch the
+        persistent failure mode if dep stays down).
+
+        On activation-timeout → log WARNING + continue (do not block
+        dependent — start proceeds and the dependent's own readiness probe
+        absorbs the late-arrival, with §11.G.2 catching truly-down deps).
+        """
+        info = self._modules.get(name)
+        if not info or not info.spec.dependencies:
+            return
+        for dep in info.spec.dependencies:
+            if dep.action != DependencyAction.ENSURE_RUNNING:
+                continue
+            if dep.severity != DependencySeverity.CRITICAL:
+                continue
+            if dep.kind != DependencyKind.MODULE:
+                continue
+
+            dep_info = self._modules.get(dep.name)
+            if dep_info is None:
+                logger.error(
+                    "[Guardian] ENSURE_RUNNING dep '%s' for module '%s' is "
+                    "not registered — cannot activate (SPEC §11.G.2.5)",
+                    dep.name, name)
+                self.bus.publish(make_msg(
+                    SUPERVISION_DEPENDENCY_BLOCKED, "guardian", "kernel", {
+                        "child_name": name,
+                        "supervisor": "guardian_HCL",
+                        "blocked_dependency": dep.name,
+                        "dependency_kind": dep.kind.value,
+                        "severity": dep.severity.value,
+                        "reason": "unregistered_dep",
+                        "ts": time.time(),
+                    }))
+                continue
+
+            if dep_info.state == ModuleState.RUNNING:
+                continue  # Already up; nothing to do.
+
+            if dep_info.state == ModuleState.DISABLED:
+                logger.warning(
+                    "[Guardian] ENSURE_RUNNING dep '%s' for module '%s' is "
+                    "DISABLED — skipping activation (SPEC §11.G.2.5)",
+                    dep.name, name)
+                continue
+
+            # Dep is registered + STOPPED/CRASHED/UNHEALTHY/STARTING →
+            # announce + recursively start.
+            logger.info(
+                "[Guardian] Activating dep '%s' for module '%s' "
+                "(SPEC §11.G.2.5 ENSURE_RUNNING; current state=%s)",
+                dep.name, name, dep_info.state.value)
+            self.bus.publish(make_msg(
+                SUPERVISION_DEPENDENCY_ACTIVATING, "guardian", "kernel", {
+                    "child_name": name,
+                    "supervisor": "guardian_HCL",
+                    "dependency_name": dep.name,
+                    "dependency_kind": dep.kind.value,
+                    "severity": dep.severity.value,
+                    "ts": time.time(),
+                }))
+
+            # Recursive start — itself runs §11.G.2.5 on the dep's own deps.
+            # Re-acquires _module_lock; the outer start() has not yet acquired
+            # it (this method is called BEFORE the `with self._module_lock`
+            # block in start()), so no deadlock.
+            self.start(dep.name)
+
+            # Wait for dep to reach RUNNING + ready_time > 0 (MODULE_READY
+            # observed by Guardian's main loop). Bounded by
+            # SUPERVISION_DEPENDENCY_ACTIVATION_TIMEOUT_S (30s).
+            became_ready = False
+            deadline = time.time() + SUPERVISION_DEPENDENCY_ACTIVATION_TIMEOUT_S
+            while time.time() < deadline:
+                cur = self._modules.get(dep.name)
+                if (cur is not None
+                        and cur.state == ModuleState.RUNNING
+                        and cur.ready_time > 0.0):
+                    became_ready = True
+                    break
+                time.sleep(0.2)
+
+            if not became_ready:
+                logger.warning(
+                    "[Guardian] Dep '%s' did not reach READY in %.0fs for "
+                    "module '%s' — proceeding with dependent start anyway "
+                    "(§11.G.2 respawn check catches persistent failure)",
+                    dep.name, SUPERVISION_DEPENDENCY_ACTIVATION_TIMEOUT_S,
+                    name)
+
+    def _check_critical_dependencies(
+        self, name: str, info: "ModuleInfo",
+    ) -> Optional[str]:
+        """Run pre-respawn dep check per SPEC §11.G.2. Returns the name of
+        the first blocking critical dependency, or None if all are healthy.
+
+        Soft deps that fail emit SUPERVISION_DEPENDENCY_DEGRADED (informational)
+        but don't block. Custom check callables that raise are treated as
+        "down" — fail closed for safety."""
+        for dep in info.spec.dependencies:
+            if dep.check is None:
+                continue  # framework declared but no probe wired yet
+            try:
+                healthy = bool(dep.check())
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[Guardian] dep probe '%s' for module '%s' raised %s — "
+                    "treating as down (fail-closed)", dep.name, name, e)
+                healthy = False
+            if not healthy:
+                if dep.severity == DependencySeverity.CRITICAL:
+                    return dep.name
+                # Soft dep failed — emit degraded event + continue.
+                self.bus.publish(make_msg(
+                    SUPERVISION_DEPENDENCY_DEGRADED, "guardian", "kernel", {
+                        "child_name": name,
+                        "supervisor": "guardian_HCL",
+                        "dependency_name": dep.name,
+                        "kind": dep.kind.value,
+                        "severity": dep.severity.value,
+                    }))
+        return None
+
     def _handle_escalation(
         self, name: str, info: "ModuleInfo", reason: str, now: float,
     ) -> None:
@@ -1574,6 +2316,49 @@ class Guardian(GuardianReloadMixin, GuardianDepActivationMixin):
                 # heartbeat processing.
                 self._dispatch_reload_request(msg)
 
+    def _dispatch_reload_request(self, msg: dict) -> None:
+        """SPEC §8.3 entry point — submit a MODULE_RELOAD_REQUEST to the
+        reload orchestrator on _restart_executor.
+
+        Validates the request shape + dispatches; emits an immediate
+        MODULE_RELOAD_ACK status="failed" for malformed/unknown-module
+        requests without spawning anything. Successful dispatch returns
+        the executor Future — caller's request-progress visibility is
+        via subsequent MODULE_RELOAD_ACK frames on the bus."""
+        payload = msg.get("payload", {}) or {}
+        module_name = payload.get("module_name")
+        new_module_path = payload.get("new_module_path")
+        swap_id = payload.get("swap_id") or str(uuid.uuid4())
+        if not module_name or not isinstance(module_name, str):
+            logger.warning(
+                "[Guardian] MODULE_RELOAD_REQUEST malformed: %r", payload)
+            self._emit_reload_ack(
+                swap_id, str(module_name or ""),
+                status="failed",
+                reason="malformed_request",
+                started_ts=time.time())
+            return
+        # Submit to _restart_executor — reuses the same thread pool that
+        # owns restart() so we share its 4-worker capacity (more than
+        # enough for realistic concurrent reload requests).
+        try:
+            self._restart_executor.submit(
+                self._reload_module_sync,
+                module_name,
+                new_module_path,
+                MODULE_RELOAD_DEFAULT_TIMEOUT_S,
+                swap_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "[Guardian] MODULE_RELOAD_REQUEST dispatch failed for "
+                "'%s': %s", module_name, e)
+            self._emit_reload_ack(
+                swap_id, module_name,
+                status="failed",
+                reason=f"dispatch_error:{e!r}",
+                started_ts=time.time())
+
     @staticmethod
     def _get_rss_mb(pid: int) -> float:
         """Read RSS from /proc/{pid}/status (Linux only)."""
@@ -1812,9 +2597,9 @@ class Guardian(GuardianReloadMixin, GuardianDepActivationMixin):
         deletion in Stage 3.
         """
         from queue import Empty
-        from titan_hcl.bus import META_CGN_SIGNAL
+        from .bus import META_CGN_SIGNAL
         try:
-            from titan_hcl.core.bus_health import get_global_monitor
+            from .core.bus_health import get_global_monitor
             _bh_monitor = get_global_monitor()
         except Exception:
             _bh_monitor = None
@@ -1857,6 +2642,44 @@ class Guardian(GuardianReloadMixin, GuardianDepActivationMixin):
                 except Empty:
                     break
         return total
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Persistent META-CGN emission log
+# ──────────────────────────────────────────────────────────────────────
+# Single canonical append-only JSONL file. Written from Guardian drain loop
+# (the only point where parent sees every worker emission). Readable by
+# `arch_map producers --history N` for cross-Titan cross-time analysis.
+# Schema is versioned so we can evolve; schema_version=1 as of 2026-04-15.
+_META_CGN_EMISSION_LOG_PATH = os.environ.get(
+    "TITAN_META_CGN_EMISSION_LOG", "./data/meta_cgn_emissions.jsonl"
+)
+
+
+def _append_meta_cgn_emission_log(msg: dict, payload: dict) -> None:
+    """Append one META_CGN_SIGNAL emission event to the persistent JSONL log.
+
+    Called from the Guardian drain loop after each drained META_CGN_SIGNAL.
+    Schema v1: {ts, src, consumer, event_type, intensity, domain, reason,
+                schema_version}. Missing optional fields recorded as null.
+    """
+    import json
+    event = {
+        "ts": float(msg.get("ts", time.time())),
+        "src": str(msg.get("src", "unknown")),
+        "consumer": str(payload.get("consumer", "")),
+        "event_type": str(payload.get("event_type", "")),
+        "intensity": float(payload.get("intensity", 1.0)),
+        "domain": (str(payload["domain"])[:40] if payload.get("domain") else None),
+        "reason": (str(payload["reason"])[:200] if payload.get("reason") else None),
+        "schema_version": 1,
+    }
+    # Ensure parent dir exists (cheap, idempotent)
+    _dir = os.path.dirname(_META_CGN_EMISSION_LOG_PATH)
+    if _dir and not os.path.isdir(_dir):
+        os.makedirs(_dir, exist_ok=True)
+    with open(_META_CGN_EMISSION_LOG_PATH, "a") as f:
+        f.write(json.dumps(event, separators=(",", ":")) + "\n")
 
 
 def _module_wrapper(entry_fn: Callable, name: str, recv_queue, send_queue,

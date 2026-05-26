@@ -44,7 +44,7 @@ def test_titan_hcl_compiles():
 _CRITICAL_MODULES = [
     "titan_hcl",
     "titan_hcl.bus",
-    "titan_hcl.guardian_hcl",
+    "titan_hcl.guardian",
     "titan_hcl.core.plugin",
     "titan_hcl.core.kernel",
     "titan_hcl.api.maker",

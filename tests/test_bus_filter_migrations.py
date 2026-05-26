@@ -126,7 +126,7 @@ def test_guardian_filter_matches_lifecycle_msg_handlers():
     MODULE_RELOAD_REQUEST added later (guardian.py:307): hot-reload request
     routed to Guardian to re-spawn a named module without full restart."""
     bus = DivineBus()
-    from titan_hcl.guardian_hcl import Guardian
+    from titan_hcl.guardian import Guardian
     guardian = Guardian(bus)
     flt = bus.get_broadcast_filter("guardian")
     expected = frozenset({
@@ -152,7 +152,7 @@ def test_guardian_module_heartbeat_targeted_msgs_bypass_filter():
     heartbeat-timeouts and unnecessary worker restarts."""
     from titan_hcl.bus import make_msg
     bus = DivineBus()
-    from titan_hcl.guardian_hcl import Guardian
+    from titan_hcl.guardian import Guardian
     guardian = Guardian(bus)
 
     # Targeted MODULE_HEARTBEAT — must arrive even though filter excludes
@@ -174,7 +174,7 @@ def test_guardian_filters_out_unwanted_broadcasts():
     MODULE_HEARTBEAT."""
     from titan_hcl.bus import make_msg
     bus = DivineBus()
-    from titan_hcl.guardian_hcl import Guardian
+    from titan_hcl.guardian import Guardian
     guardian = Guardian(bus)
 
     # Spam the broadcast bus with the kinds of msgs that flooded T1
@@ -340,7 +340,7 @@ def test_guardian_receives_only_lifecycle_msgs_under_mixed_load():
     broadcasts."""
     from titan_hcl.bus import make_msg
     bus = DivineBus()
-    from titan_hcl.guardian_hcl import Guardian
+    from titan_hcl.guardian import Guardian
     guardian = Guardian(bus)
 
     # Interleave: 100 broadcasts + 1 lifecycle, repeat 10x

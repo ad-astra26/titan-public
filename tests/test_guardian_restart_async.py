@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from titan_hcl.bus import DivineBus
-from titan_hcl.guardian_hcl import Guardian, ModuleSpec
+from titan_hcl.guardian import Guardian, ModuleSpec
 
 
 def _spec(name: str) -> ModuleSpec:
