@@ -1435,7 +1435,18 @@ async def metabolism_evaluate_gate(
         # reads use callable-shaped getters so the kernel_rpc proxy fires real
         # RPC roundtrips (attribute access alone returns an unresolved
         # _RPCRemoteRef which is not JSON-serializable).
-        should_proceed, rate_mult = met.evaluate_gate(feature, caller=caller or feature)
+        #
+        # MEDITATION-WORK-RPC-SYNC-AUDIT (2026-05-26): switched to the async
+        # sibling. The sync `evaluate_gate()` routes through MetabolismProxy.
+        # `_work_rpc_sync` (metabolism_proxy.py:333) whose in-loop fallback
+        # at the wire layer calls blocking `bus.request` — which would block
+        # this async FastAPI endpoint's event loop on every gate evaluation.
+        # Per SPEC Preamble G19 (no sync bus.request for state in async
+        # contexts; async ≤5s work-RPC only), async callers MUST use the
+        # async sibling. `evaluate_gate_async()` is the documented mirror at
+        # metabolism_proxy.py:382 and uses `_work_rpc_async()` end-to-end.
+        should_proceed, rate_mult = await met.evaluate_gate_async(
+            feature, caller=caller or feature)
         return _ok({
             "should_proceed": should_proceed,
             "rate_multiplier": rate_mult,
@@ -5165,6 +5176,38 @@ async def get_v4_inner_trinity(request: Request):
             if shm is not None:
                 snapshot["unified_spirit"] = shm
                 snapshot["self_162d"] = shm
+
+        # ARCH-MAP-HEALTH-OBSERVABILITY Class B field 1 (2026-05-26):
+        # overlay the live consciousness_state.bin epoch onto
+        # `unified_spirit.epoch_count`. The cached coordinator snapshot lags
+        # the live consciousness loop on T1/T2/T3 by minutes-to-hours under
+        # Phase C — `_get_cached_coordinator_async` reads from the legacy
+        # in-process `plugin.consciousness` path that moved to
+        # cognitive_worker per D-SPEC-110 v1.48.0, so the cached value
+        # freezes at the last value before the rename. SPEC §10.E telemetry
+        # write-then-publish is SHM-canonical (LOCKED 2026-05-07 per
+        # Preamble G18) — the consciousness_state.bin slot is the
+        # authoritative source, written per consciousness epoch by
+        # cognitive_worker (G21 single-writer, see cognitive_worker.py:3002,
+        # Phase 3.A D-SPEC-86 v1.26.0). When the SHM value is available it
+        # always wins over the snapshot value; otherwise we keep the
+        # snapshot value to preserve cold-boot behaviour.
+        try:
+            cs_shm = await asyncio.to_thread(
+                titan_state.shm.read_consciousness_state)
+            if cs_shm and cs_shm.get("epoch_count"):
+                _us = snapshot.get("unified_spirit")
+                if not isinstance(_us, dict):
+                    _us = {}
+                _us["epoch_count"] = int(cs_shm["epoch_count"])
+                _us["epoch_id"] = int(
+                    cs_shm.get("epoch_id", cs_shm["epoch_count"]))
+                _us["epoch_source"] = "shm.consciousness_state"
+                snapshot["unified_spirit"] = _us
+        except Exception as _cs_err:
+            logger.debug(
+                "[Dashboard] consciousness_state SHM overlay failed: %s",
+                _cs_err)
         if _empty(snapshot.get("hormonal")):
             shm = await asyncio.to_thread(titan_state.shm.read_hormonal)
             if shm is not None:
