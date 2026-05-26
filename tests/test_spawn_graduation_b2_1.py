@@ -192,7 +192,7 @@ def test_titan_params_flag_documented_default_off():
 def test_runtime_flag_off_keeps_workers_in_fork_mode():
     """When _spawn_grad=False, all 9 graduating workers register as fork."""
     from titan_hcl import bus as bus_mod
-    from titan_hcl.guardian_hcl import Guardian, ModuleSpec
+    from titan_hcl.guardian import Guardian, ModuleSpec
 
     div = bus_mod.DivineBus(maxsize=100)
     g = Guardian(div)
@@ -212,7 +212,7 @@ def test_runtime_flag_off_keeps_workers_in_fork_mode():
 def test_runtime_flag_on_flips_workers_to_spawn():
     """When _spawn_grad=True, all 9 graduating workers register as spawn."""
     from titan_hcl import bus as bus_mod
-    from titan_hcl.guardian_hcl import Guardian, ModuleSpec
+    from titan_hcl.guardian import Guardian, ModuleSpec
 
     div = bus_mod.DivineBus(maxsize=100)
     g = Guardian(div)

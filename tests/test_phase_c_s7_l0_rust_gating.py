@@ -641,7 +641,7 @@ class TestPythonGuardianSupervisionEmit:
     on restart events + runs escalation handshake on max_restarts."""
 
     def test_module_spec_has_dependencies_field(self):
-        from titan_hcl.guardian_hcl import ModuleSpec
+        from titan_hcl.guardian import ModuleSpec
         from titan_hcl.supervision import Dependency
         # Default empty list (existing modules unaffected — byte-identical).
         spec = ModuleSpec(name="x", entry_fn=lambda *a, **k: None)
@@ -655,7 +655,7 @@ class TestPythonGuardianSupervisionEmit:
         assert isinstance(spec_with_deps.dependencies, list)
 
     def test_module_info_has_reason_buffer(self):
-        from titan_hcl.guardian_hcl import ModuleInfo, ModuleSpec
+        from titan_hcl.guardian import ModuleInfo, ModuleSpec
         spec = ModuleSpec(name="x", entry_fn=lambda *a, **k: None)
         info = ModuleInfo(spec=spec)
         # reason_buffer is a deque with maxlen 16 (SPEC §11.B step 3).

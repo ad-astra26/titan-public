@@ -14,7 +14,7 @@ arg → _module_wrapper → setup_worker_bus(topics=...) → BusSocketClient(top
 
 Empty list = legacy subscribe-all (preserves backward compat).
 """
-from titan_hcl.guardian_hcl import ModuleSpec
+from titan_hcl.guardian import ModuleSpec
 
 
 def test_broadcast_topics_default_empty():
@@ -47,7 +47,7 @@ def test_broadcast_topics_independent_per_spec():
 def test_module_wrapper_signature_accepts_topics():
     """_module_wrapper takes broadcast_topics as 7th positional arg."""
     import inspect
-    from titan_hcl.guardian_hcl import _module_wrapper
+    from titan_hcl.guardian import _module_wrapper
     sig = inspect.signature(_module_wrapper)
     params = list(sig.parameters.keys())
     assert "broadcast_topics" in params, f"broadcast_topics missing from: {params}"
