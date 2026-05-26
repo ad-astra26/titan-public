@@ -38,6 +38,7 @@ from typing import Any, Optional
 
 from titan_hcl.bus import (
     MODULE_CRASHED,
+    MODULE_HEARTBEAT,
     MODULE_READY,
     MODULE_RELOAD_ACK,
     MODULE_RELOAD_REQUEST,
@@ -86,7 +87,7 @@ class GuardianHCLClient:
         self._cache_queue = self._bus.subscribe(
             "guardian_hcl_client_cache",
             types=[
-                MODULE_READY, MODULE_CRASHED, MODULE_SHUTDOWN,
+                MODULE_READY, MODULE_HEARTBEAT, MODULE_CRASHED, MODULE_SHUTDOWN,
                 SUPERVISION_CHILD_RESTARTED, SUPERVISION_CHILD_DOWN,
                 MODULE_RELOAD_ACK,
             ],
@@ -141,6 +142,14 @@ class GuardianHCLClient:
         # "unhealthy"). dashboard.py:2182 compares against "running" so the
         # case must match for /health to count modules ACTIVE.
         if mtype == MODULE_READY:
+            slot = self._modules_cache.setdefault(name, {})
+            slot["state"] = "running"
+            slot["last_event_ts"] = time.time()
+        elif mtype == MODULE_HEARTBEAT:
+            # Any heartbeat proves the worker is RUNNING regardless of
+            # whether we caught the (one-shot) MODULE_READY event during
+            # boot. Closes the cache-cold-boot race where modules booted
+            # before the cache subscriber attached.
             slot = self._modules_cache.setdefault(name, {})
             slot["state"] = "running"
             slot["last_event_ts"] = time.time()
