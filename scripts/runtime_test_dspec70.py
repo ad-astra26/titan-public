@@ -30,8 +30,8 @@ Tests categorized into 5 groups:
     B5. X-Titan-Verified header is present
     B6. Round-trip latency < 90s (the agno_proxy timeout ceiling)
 
-  Group C — /v6/pitch/chat round-trip
-    C1. POST /v6/pitch/chat with X-Pitch-Token → HTTP 200 + PitchChatResponse
+  Group C — /v4/pitch-chat round-trip
+    C1. POST /v4/pitch-chat with X-Pitch-Token → HTTP 200 + PitchChatResponse
     C2. response.thread_id matches request thread_id
     C3. response.internal_time present (mood + emotion + chi)
     C4. declined=False for a normal message
@@ -316,12 +316,12 @@ async def test_b_chat(client: httpx.AsyncClient, base_url: str, key: str) -> lis
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Group C — /v6/pitch/chat round-trip
+# Group C — /v4/pitch-chat round-trip
 # ─────────────────────────────────────────────────────────────────────
 
 async def test_c_pitch_chat(client: httpx.AsyncClient, base_url: str,
                             pitch_token: str, titan: str) -> list[TestResult]:
-    """C1-C4. /v6/pitch/chat round-trip (wallet-less pitch route)."""
+    """C1-C4. /v4/pitch-chat round-trip (wallet-less pitch route)."""
     thread_id = f"dspec70_pitch_test_{uuid.uuid4().hex[:8]}"
     msg = f"Hello Titan, this is a routine pitch-chat runtime test ({uuid.uuid4().hex[:8]})."
     body = {"message": msg, "thread_id": thread_id, "titan": titan}
@@ -333,17 +333,17 @@ async def test_c_pitch_chat(client: httpx.AsyncClient, base_url: str,
     t0 = time.time()
     try:
         resp = await client.post(
-            f"{base_url}/v6/pitch/chat",
+            f"{base_url}/v4/pitch-chat",
             headers=headers, json=body, timeout=120.0,
         )
         latency_ms = (time.time() - t0) * 1000
     except Exception as e:
-        return [TestResult("C1 /v6/pitch/chat HTTP 200", False,
+        return [TestResult("C1 /v4/pitch-chat HTTP 200", False,
                            f"request error: {e}", (time.time() - t0) * 1000)]
 
     results: list[TestResult] = []
     results.append(TestResult(
-        "C1 /v6/pitch/chat HTTP 200",
+        "C1 /v4/pitch-chat HTTP 200",
         resp.status_code == 200,
         f"status={resp.status_code}, body_preview={resp.text[:200]}",
         latency_ms,
@@ -552,13 +552,13 @@ async def run_all_tests(titan: str, base_url: str) -> dict[str, Any]:
                 all_results.append(r)
         print()
 
-    # ─── Group C — /v6/pitch/chat ───
+    # ─── Group C — /v4/pitch-chat ───
     pitch = _load_pitch_token()
     if not pitch:
         print("[Group C] SKIPPED — no PITCH_TOKEN env or data/pitch_token")
         all_results.append(TestResult("C SKIPPED", False, "no pitch token"))
     else:
-        print(f"[Group C] /v6/pitch/chat round-trip")
+        print(f"[Group C] /v4/pitch-chat round-trip")
         async with httpx.AsyncClient(timeout=120.0) as client:
             c_results = await test_c_pitch_chat(client, base_url, pitch, titan)
             for r in c_results:

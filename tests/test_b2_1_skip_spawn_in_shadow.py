@@ -32,7 +32,7 @@ from unittest.mock import patch
 import pytest
 
 from titan_hcl import bus as bus_mod
-from titan_hcl.guardian_hcl import Guardian, ModuleSpec
+from titan_hcl.guardian import Guardian, ModuleSpec
 
 
 def _noop_entry(*args, **kwargs):  # pragma: no cover

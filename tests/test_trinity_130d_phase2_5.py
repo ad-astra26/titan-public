@@ -691,17 +691,6 @@ class TestPhase25EDashboardEndpoint:
 # ── Chunk 2.5.A.2: SHM cross-process roundtrip ────────────────────────
 
 
-@pytest.mark.skip(reason=(
-    "POST-PHASE-C-STALE-TEST-HYGIENE (2026-05-26): the per-block SHM "
-    "round-trip needs the live Rust trinity-dim-stats SHM writer "
-    "(`titan-unified-spirit-rs` + flag-on) — under pytest the writer "
-    "subprocess is not started, so `_record_block_writes_to_shm_when_"
-    "titan_id_set` etc. see an empty slot. Per SPEC §7.1 (SHM slot byte "
-    "layouts) + D-SPEC-86 v1.26.0 (Trinity SHM input slots wired), "
-    "this is an integration test gated on the Rust daemon. Live behavior "
-    "verified via /v6/trinity/state pulse_count flowing fleet-wide. "
-    "Re-enable with a `tests/integration/` move + Rust daemon harness."
-))
 class TestPhase25A2SHMRoundtrip:
     """rFP §2.5.A.2 — verify per-block SHM slot round-trip.
 

@@ -44,7 +44,7 @@ from ..core.state_registry import (
     ensure_shm_root,
     resolve_titan_id,
 )
-from ..guardian_hcl import Guardian
+from ..guardian import Guardian
 from ..logic.life_force_state_specs import (
     LIFE_FORCE_STATE_SLOT,
     LIFE_FORCE_STATE_SPEC,

@@ -45,7 +45,7 @@ from ..core.state_registry import (
     ensure_shm_root,
     resolve_titan_id,
 )
-from ..guardian_hcl import Guardian
+from ..guardian import Guardian
 from ..logic.metabolism_state_specs import (
     METABOLISM_STATE_SLOT,
     METABOLISM_STATE_SPEC,

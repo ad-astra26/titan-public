@@ -443,61 +443,6 @@ BANNER
         cat /tmp/precommit_tracker_drift.log >&2
         exit 1
     fi
-
-    # ── 6b. Graveyard-split drift gate (2026-05-26) ─────────────────────
-    # When OBSERVABLES.md or BUGS.md is edited and a previously-active
-    # entry gets marked closed (strikethrough table row OR closure marker
-    # in detail-block header), it MUST be physically moved to the
-    # corresponding *_graveyard.md so the active file stays lean.
-    #
-    # `--check` mode exits 1 if any closed entry still lives in the
-    # active body file. Fix: run the split script + git add both files.
-    #
-    # Closes the "active file bloats to 500KB" class (OBSERVABLES.md
-    # reached 467KB / 4870 lines pre-split). Discipline mirrors the
-    # tracker_indexer drift gate above — CHECK in hook, MANUAL regen.
-    if ! "$PY" "$REPO_ROOT/scripts/split_observables_graveyard.py" --check 2>/tmp/precommit_obs_graveyard_drift.log; then
-        cat >&2 <<'BANNER'
-
-┌──────────────────────────────────────────────────────────────────────┐
-│  ⛔  OBSERVABLES_graveyard split is STALE.                           │
-│                                                                      │
-│  Closed entries (~~OBS-X~~ in table OR ✅/🔁/SUPERSEDED in detail    │
-│  header) are still in OBSERVABLES.md — should be in graveyard file.  │
-│                                                                      │
-│  Fix:                                                                │
-│      python scripts/split_observables_graveyard.py                   │
-│      git add titan-docs/OBSERVABLES.md \                             │
-│              titan-docs/OBSERVABLES_graveyard.md                     │
-│                                                                      │
-│  See: cat /tmp/precommit_obs_graveyard_drift.log                     │
-└──────────────────────────────────────────────────────────────────────┘
-
-BANNER
-        cat /tmp/precommit_obs_graveyard_drift.log >&2
-        exit 1
-    fi
-    if ! "$PY" "$REPO_ROOT/scripts/split_bugs_graveyard.py" --check 2>/tmp/precommit_bugs_graveyard_drift.log; then
-        cat >&2 <<'BANNER'
-
-┌──────────────────────────────────────────────────────────────────────┐
-│  ⛔  BUGS_graveyard split is STALE.                                  │
-│                                                                      │
-│  Closed entries (~~BUG-X~~ or ✅ FIXED in detail header, or          │
-│  **Status:** FIXED in body) are still in BUGS.md — should be in      │
-│  graveyard file.                                                     │
-│                                                                      │
-│  Fix:                                                                │
-│      python scripts/split_bugs_graveyard.py                          │
-│      git add titan-docs/BUGS.md titan-docs/BUGS_graveyard.md         │
-│                                                                      │
-│  See: cat /tmp/precommit_bugs_graveyard_drift.log                    │
-└──────────────────────────────────────────────────────────────────────┘
-
-BANNER
-        cat /tmp/precommit_bugs_graveyard_drift.log >&2
-        exit 1
-    fi
 fi
 
 # ── 7. Trinity SPEC-conformance gate ─────────────────────────────────────────
