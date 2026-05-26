@@ -3097,6 +3097,44 @@ per_eval_cap = 0.01
 user_bundle_max_txs   = 50    # ring-buffer size per (entity_class, entity_id, fork)
 user_bundle_max_users = 2000  # hard cap on distinct entity keys (LRU-evicted on overflow)
 
+[synthesis.groundedness]
+# Phase 4 — groundedness score per concept spine (arch §6 + §18).
+# groundedness = clamp(w_e·norm(epi) + w_c·norm(ctx) + w_p·norm(proc) + w_f·felt, 0, 1)
+# Each count term is log1p-normalized so any single term saturates at
+# ~50. w_f stays 0.0 in P4 (felt-state strand ships with the inner-outer
+# bridge phase); the formula already carries the term so the bridge
+# phase only has to flip the weight, not change callers.
+w_e = 0.3   # episodic encounters
+w_c = 0.3   # distinct contexts
+w_p = 0.4   # procedural links (highest in P4 since felt = 0)
+w_f = 0.0   # felt-state coverage (bridge phase populates)
+
+# Recompute trigger: groundedness is computed on every consolidation pass
+# (P4.G) + on demand by API consumers. The 60s synth_status recompute
+# tick does NOT recompute groundedness (consolidation already covers it
+# cheaply at low rate; per-tick recompute would burn CPU for no signal).
+recompute_on = "consolidation_pass"
+
+# Composite-score weight wiring (§P4.F). Phase 1 shipped w_s=0 (deferred);
+# P4 enables it now that the Kuzu Concept spine provides fan_j lookup.
+# Default w_s=1.0 matches the other terms; soak (B.1) validates ≥10%
+# improvement over cosine-only — tune post-soak if needed.
+[synthesis.composite]
+w_b = 1.0   # base-level activation B_i
+w_s = 1.0   # spreading activation (P4 enables, was 0 in P1)
+w_r = 1.0   # cosine similarity
+w_p = 1.0   # importance(i)
+S   = 2.0   # spreading-activation S constant per arch §5.3
+
+# Buffer-entity stub source for spreading-activation lookup. P4 ships a
+# stub source consisting of the in-flight chat-TX topic_tags plus the
+# last-N-turns CGN concept_ids touched. Phase 7 replaces with the real
+# actr_buffers table; the swap is a single import-source change in
+# titan_hcl/synthesis/buffer_stub.py — config stays.
+[synthesis.buffer_stub]
+cgn_history_window_turns = 3   # last N turns of CGN concept_ids
+max_buffer_entities      = 20  # hard cap on union size
+
 [microkernel]
 
 # ── Memory hygiene daemon (2026-05-01) ─────────────────────────────
