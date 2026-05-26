@@ -352,6 +352,9 @@ def update_vocabulary_after_speak(
     sentence: str,
     neuromods: dict | None = None,
     emotion: str = "",
+    *,
+    msl_attention: dict | None = None,
+    msl_concept_confidences: dict | None = None,
 ) -> tuple[int, list[str]]:
     """Update vocabulary for words Titan just spoke (advance to producible).
 
@@ -361,6 +364,13 @@ def update_vocabulary_after_speak(
     'producible' for the first time, capture the felt-state at that moment
     via `grounded_at` + `grounded_felt_summary` (rFP_x_voice_enrichment §4.5,
     Phase 1 GROUNDED_TODAY Pool A source).
+
+    L6 housekeeping (2026-05-26): when ``msl_attention`` and/or
+    ``msl_concept_confidences`` are supplied, brand-new words (the
+    INSERT branch below) get their ``felt_tensor`` column seeded from
+    current MSL state via ``vocabulary_grounding.seed_new_word_felt_tensor``
+    instead of left NULL. Existing words are not touched (the UPDATE
+    branch is reinforcement-only).
 
     Returns:
         (words_updated, list_of_words_reinforced)
@@ -378,6 +388,21 @@ def update_vocabulary_after_speak(
             grounded_summary = compact_felt_summary(neuromods, emotion)
         except Exception:
             grounded_summary = ""
+
+    # L6: precompute MSL-seeded felt_tensor once per call (same for every
+    # new word in this sentence — they all share the Titan's current
+    # state at acquisition time). None if no MSL state supplied.
+    seed_felt_tensor_json: str | None = None
+    if msl_attention or msl_concept_confidences:
+        try:
+            from titan_hcl.logic.vocabulary_grounding import (
+                seed_new_word_felt_tensor,
+            )
+            seed_felt_tensor_json = seed_new_word_felt_tensor(
+                msl_attention, msl_concept_confidences)
+        except Exception as e:
+            logger.debug("[LanguagePipeline] MSL seed failed: %s", e)
+            seed_felt_tensor_json = None
 
     try:
         conn = sqlite3.connect(db_path, timeout=5.0)
@@ -450,17 +475,32 @@ def update_vocabulary_after_speak(
                 # Auto-create word not in vocabulary
                 w_type = classify_word_type(word)
                 now_ts = time.time()
-                conn.execute(
-                    "INSERT OR IGNORE INTO vocabulary "
-                    "(word, word_type, confidence, learning_phase, "
-                    "times_encountered, times_produced, created_at, "
-                    "last_encountered, "
-                    "grounded_at, grounded_felt_summary) "
-                    "VALUES (?, ?, 0.05, 'producible', 1, 1, ?, ?, ?, ?)",
-                    (word, w_type, now_ts, now_ts,
-                     now_ts if grounded_summary else 0,
-                     grounded_summary)
-                )
+                if seed_felt_tensor_json is not None:
+                    # L6 housekeeping closure: seed felt_tensor from current
+                    # MSL state at acquisition time (instead of NULL).
+                    conn.execute(
+                        "INSERT OR IGNORE INTO vocabulary "
+                        "(word, word_type, confidence, learning_phase, "
+                        "times_encountered, times_produced, created_at, "
+                        "last_encountered, "
+                        "grounded_at, grounded_felt_summary, felt_tensor) "
+                        "VALUES (?, ?, 0.05, 'producible', 1, 1, ?, ?, ?, ?, ?)",
+                        (word, w_type, now_ts, now_ts,
+                         now_ts if grounded_summary else 0,
+                         grounded_summary, seed_felt_tensor_json)
+                    )
+                else:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO vocabulary "
+                        "(word, word_type, confidence, learning_phase, "
+                        "times_encountered, times_produced, created_at, "
+                        "last_encountered, "
+                        "grounded_at, grounded_felt_summary) "
+                        "VALUES (?, ?, 0.05, 'producible', 1, 1, ?, ?, ?, ?)",
+                        (word, w_type, now_ts, now_ts,
+                         now_ts if grounded_summary else 0,
+                         grounded_summary)
+                    )
                 updated += 1
                 words_reinforced.append(word)
                 # Register dynamic recipe if narrator available
