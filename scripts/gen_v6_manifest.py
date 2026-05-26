@@ -29,17 +29,29 @@ sys.path.insert(0, _ROOT)
 
 os.environ.setdefault("OPENROUTER_API_KEY", "")
 
-from titan_hcl.api import v6, v6_manifest  # noqa: E402  (import v6 → populates REGISTRY)
+from titan_hcl.api import v6, v6_manifest, pitch_chat  # noqa: E402
+# Imports populate REGISTRY: v6 wires the dashboard-backed routes; pitch_chat
+# (Phase E migration 2026-05-26) is a self-contained router with its own
+# manifest registration at module bottom. Any future non-dashboard router
+# under /v6 must be added here so its rows land in REGISTRY before render().
+_NON_DASHBOARD_ROUTERS = (pitch_chat.router,)
 
 _OUT = os.path.join(_ROOT, "titan-docs", "notes", "API_V6_MANIFEST.md")
 
 
 def render() -> str:
     rows = v6_manifest.as_rows()
-    # parity assertion vs the live router
+    # parity assertion vs the live router (union of v6 + non-dashboard routers)
     live = {(r.path, list(r.methods)[0]) for r in v6.router.routes
             if getattr(r, "path", "").startswith("/v6") and hasattr(r, "methods")
             and r.path != "/v6/manifest"}
+    for sub in _NON_DASHBOARD_ROUTERS:
+        for r in sub.routes:
+            path = getattr(r, "path", "")
+            if path.startswith("/v6") and hasattr(r, "methods"):
+                for m in r.methods:
+                    if m in ("GET", "POST", "PUT", "DELETE"):
+                        live.add((path, m))
     manifest = {(r["route"], r["method"]) for r in rows}
     drift_live = sorted(live - manifest)
     drift_manifest = sorted(manifest - live)
