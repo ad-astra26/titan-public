@@ -760,28 +760,50 @@ def _read_event_tail(event_types: tuple[str, ...], limit: int) -> list[dict]:
     it read-only here so writer contention is impossible. Failures yield
     an empty list — degraded-but-honest (rFP §8 risk: "DEGRADED state to
     a VC" → never lie; surface as empty).
+
+    Query shape: UNION ALL of per-event-type subqueries, NOT a single
+    `WHERE event_type IN (...)`. Measured on T1 observatory.db (~4.2 GB,
+    220M rows, 2026-05-26):
+        IN (...) ORDER BY ts DESC LIMIT 5      → ~25,000 ms (SQLite
+            picks idx_event_type and builds a TEMP B-TREE for ORDER BY)
+        UNION ALL of LIMIT-5 subqueries        → ~10 ms (each subquery
+            uses the composite idx_event_type_ts to walk the tail)
+    The shape is preserved by an outer `ORDER BY ts DESC LIMIT N` so
+    callers still get global most-recent-N.
     """
     import os
     import sqlite3
-    if limit <= 0:
+    if limit <= 0 or not event_types:
         return []
     limit = min(limit, _TAIL_HARD_MAX)
     db_path = os.path.join("data", "observatory.db")
     if not os.path.exists(db_path):
         return []
-    placeholders = ",".join("?" for _ in event_types)
     try:
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
     except sqlite3.Error:
         logger.debug("[PitchChat] event_log open failed", exc_info=True)
         return []
+    # Build a UNION ALL of indexed per-event-type tails. Each inner query
+    # benefits from the (event_type, ts) composite index; the outer sort
+    # then merges the (≤ len(event_types) × limit) candidates.
+    inner_parts: list[str] = []
+    params: list = []
+    for _et in event_types:
+        inner_parts.append(
+            "SELECT ts, event_type, summary FROM ("
+            "  SELECT ts, event_type, summary FROM event_log "
+            "  WHERE event_type = ? ORDER BY ts DESC LIMIT ?"
+            ")"
+        )
+        params.extend([_et, limit])
+    sql = (
+        f"SELECT ts, event_type, summary FROM ({' UNION ALL '.join(inner_parts)}) "
+        f"ORDER BY ts DESC LIMIT ?"
+    )
+    params.append(limit)
     try:
-        rows = con.execute(
-            f"SELECT ts, event_type, summary FROM event_log "
-            f"WHERE event_type IN ({placeholders}) "
-            f"ORDER BY ts DESC LIMIT ?",
-            (*event_types, limit),
-        ).fetchall()
+        rows = con.execute(sql, params).fetchall()
     except sqlite3.Error:
         logger.debug("[PitchChat] event_log query failed", exc_info=True)
         con.close()
