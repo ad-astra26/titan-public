@@ -358,6 +358,16 @@ class PostDispatchOrchestrator:
 
         creative_works_samples = self._fetch_creative_works_samples()
 
+        # SOCIAL-MEMORY-ENRICHMENT (2026-05-26) — read persistent + mempool
+        # counts from the canonical `memory_state.bin` SHM slot (G18,
+        # MEMORY_STATE_SPEC, owned by memory_worker per G21). Free read —
+        # the publisher refreshes ~1Hz, so it's always within freshness for
+        # post cadence.
+        memory_state = bank.read_memory_state() or {}
+        memory_persistent_count = int(
+            memory_state.get("persistent_count", 0) or 0)
+        memory_mempool_size = int(memory_state.get("mempool_size", 0) or 0)
+
         return PostContext(
             session=session, proxy=proxy, api_key=api_key,
             titan_id=self._titan_id, emotion=emotion, neuromods=neuromods,
@@ -387,6 +397,8 @@ class PostDispatchOrchestrator:
             meta_cgn_signals=meta_cgn_signals,
             crystallized_samples=crystallized_samples,
             creative_works_samples=creative_works_samples,
+            memory_persistent_count=memory_persistent_count,
+            memory_mempool_size=memory_mempool_size,
         )
 
     def _fetch_creative_works_samples(self) -> list:
