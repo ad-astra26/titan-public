@@ -3,26 +3,6 @@ Tests for Meta-Reasoning Foundation (M1-M3):
   - M1: ChainArchive
   - M2: MetaWisdomStore
   - M3: MetaAutoencoder
-
-POST-PHASE-C-STALE-TEST-HYGIENE (2026-05-26): The 21 failing tests in this
-file expect ChainArchive / MetaWisdomStore to construct a self-contained
-SQLite DB at the `db_path` argument. Under the current architecture (per
-SPEC §G19 + D-SPEC-46 v1.5.4 + the IMW dispatch redesign in
-`titan_hcl/persistence/writer_client.py:701` `get_client()`), all writes
-route through a per-caller WriterClient that resolves its DB path from
-`IMWConfig.from_titan_config()` — NOT from the constructor's `db_path`
-argument. Tests that pass `db_path=tmp_path/test.db` write to the singleton
-DB whose `chain_archive` table doesn't exist in the pytest environment.
-
-PRODUCTION behavior is verified live every session via
-`scripts/arch_map.py health --all` (chains accumulating fleet-wide; this
-session's startup check: T1=64438+ chains, T2/T3 similar). Re-enabling
-these tests requires a fixture rewrite that constructs an `IMWConfig`
-pointed at `tmp_path` and primes the table — separate session, test
-rewrite scope only, NO production code change required.
-
-SPEC anchors: D-SPEC-46 (SPEC §21 — memory_worker concurrent dispatch),
-G19 (Preamble — no sync bus.request for state), §9.B writer-client pattern.
 """
 
 import json
@@ -33,15 +13,6 @@ import time
 
 import numpy as np
 import pytest
-
-pytestmark = pytest.mark.skip(reason=(
-    "POST-PHASE-C-STALE-TEST-HYGIENE: ChainArchive/MetaWisdomStore tests "
-    "predate IMW writer-client architecture (D-SPEC-46 v1.5.4). Fixture "
-    "passes db_path that the constructor stores but writes route via "
-    "get_client() singleton — 21 tests fail with 'no such table'. "
-    "Re-enable via IMWConfig-aware fixture rewrite (test scope only). "
-    "Production behavior verified live via arch_map health --all."
-))
 
 
 # ── M1: ChainArchive ──────────────────────────────────────────────
