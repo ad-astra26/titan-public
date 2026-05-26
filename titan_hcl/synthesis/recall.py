@@ -142,12 +142,6 @@ class EngineRecall:
         activation_lookup: Callable[[list[str]], dict[str, float]],
         embedder: Optional[Callable[[str], list[float]]] = None,
         contracts_dir: Optional[str] = None,
-        # Phase 4 §P4.H — kuzu reader for granularity="concept" recall.
-        # Anything exposing spine_list_concepts + spine_get_latest_concept
-        # (TitanKnowledgeGraph in production; BridgeRecall later for
-        # cross-process readers — INV-Syn-4 / G18). None disables concept-
-        # granularity recall (returns None — caller falls back).
-        kuzu_reader: Optional[Any] = None,
     ) -> None:
         """
         Args:
@@ -164,16 +158,10 @@ class EngineRecall:
             contracts_dir: Override the default
                 `titan_hcl/contracts/meta_cognitive/`. Tests use this to
                 point at a tmp directory with a fixture contract.
-            kuzu_reader: Phase 4 — optional Kuzu graph handle for
-                granularity="concept" recall. When supplied, recall()
-                with granularity="concept" returns concept-spine results
-                ranked by groundedness; when None, that granularity
-                returns None (caller falls back to per-TX recall).
         """
         self._evaluator = rule_evaluator
         self._activation_lookup = activation_lookup
         self._embedder = embedder
-        self._kuzu_reader = kuzu_reader
         if contracts_dir is None:
             here = os.path.dirname(os.path.abspath(__file__))
             # titan_hcl/synthesis → titan_hcl/contracts/meta_cognitive
@@ -257,22 +245,6 @@ class EngineRecall:
             to fire — caller falls back to cosine-only ranking.
         """
         self._total_recall_calls += 1
-
-        # Phase 4 §P4.H — concept-granularity recall. Bypasses the
-        # contract pipeline because the result type is per-spine, not
-        # per-TX (the Kuzu spine IS the per-concept index by arch §6.1).
-        # The embedder is NOT required for concept granularity (P4 ranks
-        # by groundedness + name substring match; cosine-over-names is
-        # Phase 5+); kuzu_reader IS required.
-        if granularity == "concept":
-            results = self._concept_granularity_recall(
-                query_text=query_text, k=k,
-            )
-            if results is None:
-                self._total_fallbacks += 1
-            else:
-                self._total_contract_hits += 1
-            return results
 
         if not self._embedder:
             logger.debug("[EngineRecall] no embedder injected — fallback")
@@ -448,93 +420,6 @@ class EngineRecall:
                 base_level=sc.base_level,
                 norm_base_level=sc.norm_base_level,
                 importance=sc.importance,
-            ))
-        return results
-
-    # ── Phase 4 §P4.H — concept-granularity recall ───────────────────
-
-    def _concept_granularity_recall(
-        self,
-        *,
-        query_text: str,
-        k: int,
-    ) -> Optional[list[RecallResult]]:
-        """Return up to `k` Concept spines ranked by composite score.
-
-        Scoring:
-          score = groundedness * (1 + name_match_boost)
-
-        where `name_match_boost = 0.5` when any token of query_text is a
-        case-folded substring of the concept name (cheap, no embedder
-        needed); 0 otherwise. This makes high-groundedness concepts
-        always rank well + lets a query about "linux" surface
-        linux-named concepts above unrelated high-groundedness ones.
-
-        Returned RecallResult shape — uniform with per-TX recall so
-        downstream consumers handle one type:
-          tx_hash = the spine's latest anchor_tx
-          fork    = "concept_spine"  (disambiguator)
-          source  = "synthesis_concept_spine"
-          summary = the concept's human-readable name
-          importance = the concept's groundedness  (so consumers that
-                       only look at importance still get a useful signal)
-
-        Returns None if no kuzu_reader is wired (caller falls back to
-        legacy P2/P3 recall) or if the spine is empty.
-        """
-        if self._kuzu_reader is None:
-            logger.debug(
-                "[EngineRecall] concept granularity requested but kuzu_reader "
-                "is None — caller falls back to per-TX recall",
-            )
-            return None
-
-        try:
-            # Pull a generous candidate pool; concept count is bounded by
-            # the dream-boundary cap (§P4.G) so this is cheap.
-            candidates = self._kuzu_reader.spine_list_concepts(limit=200)
-        except Exception as e:
-            logger.warning(
-                "[EngineRecall] spine_list_concepts failed: %s — fallback", e,
-            )
-            return None
-
-        if not candidates:
-            return None
-
-        # Cheap query-token match against concept name. Case-folded
-        # substring; tokens shorter than 3 chars dropped (stop-word guard).
-        query_tokens = {
-            t.lower() for t in (query_text or "").split()
-            if len(t) >= 3
-        }
-
-        scored: list[tuple[float, dict]] = []
-        for row in candidates:
-            g = float(row.get("groundedness", 0.0) or 0.0)
-            name = str(row.get("name", "") or "")
-            name_lc = name.lower()
-            boost = 0.5 if any(t in name_lc for t in query_tokens) else 0.0
-            score = g * (1.0 + boost)
-            if score <= 0:
-                continue
-            scored.append((score, row))
-
-        scored.sort(key=lambda kv: kv[0], reverse=True)
-        top = scored[:k]
-
-        results: list[RecallResult] = []
-        for score, row in top:
-            results.append(RecallResult(
-                tx_hash=str(row.get("anchor_tx", "")),
-                score=score,
-                fork="concept_spine",
-                source="synthesis_concept_spine",
-                summary=str(row.get("name", "")),
-                cosine=0.0,
-                base_level=0.0,
-                norm_base_level=0.0,
-                importance=float(row.get("groundedness", 0.0) or 0.0),
             ))
         return results
 
