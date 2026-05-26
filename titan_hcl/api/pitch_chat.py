@@ -148,6 +148,24 @@ class InternalTime(BaseModel):
     emotion: Optional[str] = None
 
 
+class PitchChainProof(BaseModel):
+    """Chain-of-evidence proof attached to a pitch reply (rFP §4 #5 Pitch
+    half — chain-proof drawer per reply).
+
+    JSON shape matches the frontend discriminated union in
+    `components/pitch/ChainProofDrawer.tsx` (ChainProof type). v1 only
+    emits the two kinds whose fields are snake_case-compatible across
+    both sides (no alias plumbing): `memo` (Solana tx signature) and
+    `timechain_block` (TimeChain height + merkle root). Adding `arweave`
+    / `titan_identity` later requires camelCase aliases.
+    """
+    kind: str  # "memo" | "timechain_block"
+    signature: Optional[str] = None
+    height: Optional[int] = None
+    merkle: Optional[str] = None
+    label: Optional[str] = None
+
+
 class PitchChatResponse(BaseModel):
     response: str
     titan: str
@@ -158,6 +176,11 @@ class PitchChatResponse(BaseModel):
     declined: bool = False
     decline_reason: Optional[str] = None
     decline_explanation: Optional[str] = None
+    # Chain-proof references attached to successful replies (rFP §4 #5
+    # Pitch half — chain-proof drawer per reply, memory references only).
+    # Empty on decline. Frontend renders each entry as a chevron via
+    # ChainProofDrawer.
+    proofs: list[PitchChainProof] = Field(default_factory=list)
 
 
 # ── Recording ─────────────────────────────────────────────────────────
@@ -312,6 +335,70 @@ def _snapshot_internal_time(plugin, result_body: Optional[dict] = None) -> Inter
         logger.debug("[PitchChat] epoch read partial", exc_info=True)
 
     return InternalTime(epoch=epoch, phase=phase, fatigue=fatigue, emotion=emotion)
+
+
+# ── Chain-proof annotation (rFP §4 #5 Pitch — memory references) ──────
+
+
+def _compute_pitch_proofs(request: Request) -> list[PitchChainProof]:
+    """Derive 0-1 chain-proof references for a successful pitch reply.
+
+    The Maker direction (Stage 5 design call 2026-05-26) was "memory
+    references only". Every pitch reply is informed by Titan's memory
+    pipeline (agno_worker memory recall), and that memory itself is
+    anchored to the TimeChain on a rolling basis — so the cleanest
+    proof-of-memory each reply can carry is "here's where my memory
+    chain is right now": the most recent Solana memo signature (when
+    the TimeChain has been anchored on-chain) or the local TimeChain
+    block height + merkle root (when only the local chain has
+    advanced past genesis).
+
+    Prefers the Solana memo proof — judges click → Solscan → see
+    on-chain evidence. Falls back to the local block proof so the
+    chevron still has something verifiable when on-chain anchoring is
+    lagging. Returns [] on any read failure so a stale Titan never
+    fails a reply (rFP §8 risk: never lie).
+
+    SHM-direct via TimechainAccessor (G19, no sync bus.request).
+    """
+    state = getattr(request.app.state, "titan_state", None)
+    tc = getattr(state, "timechain", None)
+    if tc is None:
+        return []
+    try:
+        stats = tc.get_stats()
+    except Exception:
+        logger.debug("[PitchChat] timechain.get_stats failed", exc_info=True)
+        return []
+    if not isinstance(stats, dict) or not stats:
+        return []
+
+    # Prefer Solana memo anchor — strongest "on-chain memory" claim.
+    anchor = stats.get("anchor")
+    if isinstance(anchor, dict):
+        sig = anchor.get("last_tx_sig")
+        if isinstance(sig, str) and len(sig) >= 32:
+            return [PitchChainProof(kind="memo", signature=sig, label="memory chain")]
+
+    # Fallback: local TimeChain tip. `forks["0"]` is the canonical main
+    # fork (timechain_state_publisher.py:Phase C §4.B.9). Height + merkle
+    # gives the visitor a verifiable local-chain pointer even when no
+    # mainnet anchor has landed yet.
+    forks = stats.get("forks")
+    if isinstance(forks, dict):
+        main = forks.get("0") or forks.get(0)
+        if isinstance(main, dict):
+            height = main.get("tip_height")
+            if isinstance(height, int) and height > 0:
+                merkle = stats.get("merkle_root")
+                return [PitchChainProof(
+                    kind="timechain_block",
+                    height=height,
+                    merkle=merkle if isinstance(merkle, str) else None,
+                    label="memory chain",
+                )]
+
+    return []
 
 
 # ── Decline classification ────────────────────────────────────────────
@@ -533,12 +620,20 @@ async def pitch_chat(
     # snapshot helper can read mood + emotion + is_dreaming directly.
     internal = _snapshot_internal_time(plugin, body_inner if isinstance(body_inner, dict) else None)
 
+    # Chain-of-evidence (rFP §4 #5 Pitch). Only attach to non-declined
+    # replies — a "why declined" card already carries its substrate
+    # explanation; chevroning a decline would be visual noise.
+    proofs: list[PitchChainProof] = []
+    if decline is None and reply_text:
+        proofs = _compute_pitch_proofs(request)
+
     # ── Recording: outbound ───────────────────────────────────────
     _append_recording(thread_id, "out", {
         "response": reply_text,
         "declined": decline is not None,
         "decline_reason": decline[0] if decline else None,
         "internal_time": internal.model_dump(),
+        "proofs": [p.model_dump() for p in proofs],
     })
 
     return PitchChatResponse(
@@ -549,6 +644,7 @@ async def pitch_chat(
         declined=decline is not None,
         decline_reason=decline[0] if decline else None,
         decline_explanation=decline[1] if decline else None,
+        proofs=proofs,
     )
 
 
