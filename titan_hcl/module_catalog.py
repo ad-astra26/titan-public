@@ -95,6 +95,19 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=60.0,
         reply_only=True,  # IMW IPC is via unix socket, not bus broadcasts
+        # Phase 6 / D-SPEC-135 / v1.62.0: IMW must spawn (not fork) because
+        # imw_main runs an asyncio loop + heartbeat thread + bus-watcher
+        # thread in parallel. Under fork-mode from guardian_hcl (which has
+        # 4+ background threads of its own — BusSocketClient writer +
+        # reader, GuardianStatePublisher loop, module_ready_publisher,
+        # lifecycle dispatcher, supervision loop), the child inherits a
+        # locked-mp.Queue / locked-mp.Lock state from threads that no
+        # longer exist post-fork. Live evidence (T3 2026-05-26): 4 of 5
+        # IMW workers HANG on the first `send_queue.put(MODULE_READY)`
+        # call indefinitely (PRE-PUBLISH stderr log emits, POST-PUBLISH
+        # never does) → /health stays DEGRADED forever for 5 IMW writers.
+        # spawn forces a fresh interpreter; no inherited lock state.
+        start_method="spawn",
     ))
 
     # Output Verifier Worker — L2 §A.8.3 subprocess extraction.
@@ -300,6 +313,10 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=60.0,
         reply_only=True,                       # Unix-socket IPC, no bus broadcasts
+        # Phase 6 / D-SPEC-135: spawn-mode (same rationale as 'imw' above —
+        # multi-threaded asyncio + heartbeat + bus-watcher; fork from
+        # multi-threaded guardian_hcl deadlocks on inherited locks).
+        start_method="spawn",
     ))
 
     # ─────────────────────────────────────────────────────────────────
@@ -338,6 +355,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             lazy=False,
             heartbeat_timeout=60.0,
             reply_only=True,
+            # Phase 6 / D-SPEC-135: spawn-mode (same rationale as 'imw' /
+            # 'observatory_writer' above).
+            start_method="spawn",
         ))
 
     # Memory module (FAISS + Kuzu + DuckDB)
@@ -855,8 +875,17 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         name="journey_persistence",
         layer="L2",
         entry_fn=journey_persistence_worker_main,
+        # Phase 6 / D-SPEC-135 sizing correction (2026-05-26): the original
+        # P0.5/P0.6-C ModuleSpec set rss_limit_mb=60 but live evidence on
+        # T2 + T3 fleet boots showed actual VmRSS at boot = 73 MB (Python
+        # 3.12 interpreter + sqlite3 + msgpack + asyncio import baseline is
+        # ~55-65 MB on its own; worker logic + IMW client + buffer push it
+        # to 70-80 MB). 60 MB caused boot-loop kills → /health DEGRADED.
+        # 150 MB matches realistic baseline + ~2× headroom for SQLite page
+        # cache + journal-replay temporaries. Per `feedback_no_rss_band_aid_understand_root_cause`
+        # the limit reflects ACTUAL observed memory, not a guess.
         config=_journey_cfg,
-        rss_limit_mb=60,
+        rss_limit_mb=150,
         autostart=True,
         lazy=False,
         heartbeat_timeout=60.0,
@@ -884,7 +913,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         layer="L2",
         entry_fn=corrective_events_persistence_worker_main,
         config=_journey_cfg,  # same consciousness_db path + info_banner
-        rss_limit_mb=60,
+        # Phase 6 / D-SPEC-135 sizing correction (2026-05-26): see
+        # journey_persistence rationale above — same Python+sqlite baseline.
+        rss_limit_mb=150,
         autostart=True,
         lazy=False,
         heartbeat_timeout=60.0,
@@ -1045,6 +1076,12 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # association_bundles). Post-seal contract hook in
             # timechain_v2.Mempool/BlockBuilder publishes.
             _bus_constants.MAINTAIN_BUNDLE,
+            # Phase 4 §P4.G: dream-boundary consolidation pass trigger.
+            # dream_state_worker emits this on sleep/wake transitions
+            # (v1.8.2 D-SPEC-56 canonical producer). synthesis_worker is
+            # an INDEPENDENT listener (INV-11 restart-isolation; does
+            # not attach to cognitive_worker's off-tick suite).
+            _bus_constants.DREAM_STATE_CHANGED,
             _bus_constants.KERNEL_EPOCH_TICK,
             _bus_constants.MODULE_SHUTDOWN,
         ],
