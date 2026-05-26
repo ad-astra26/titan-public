@@ -3053,6 +3053,125 @@ async def get_trinity_history(
 
 
 # ---------------------------------------------------------------------------
+# GET /v6/trinity/polarity-homeostat — P0.6-C PolarityHomeostat telemetry
+# ---------------------------------------------------------------------------
+async def get_v6_polarity_homeostat(
+    request: Request,
+    limit: int = Query(200, ge=1, le=2000),
+    hours: int = Query(24, ge=1, le=720),
+):
+    """P0.6-C / D-SPEC-132 §6.6.6 telemetry surface.
+
+    Returns recent `trinity_corrective_events` (EXTREME_IMBALANCE_DETECTED
+    paired with CORRECTIVE_NUDGE) + per-part summary stats: lifetime fire
+    count, last 24 h rate, recent sigma_multiplier mean (≈ allostatic
+    drift state), recent polarity_at_fire / duration_ticks averages.
+
+    Per-part / per-side breakdown lets the Observatory show 4 panels
+    (inner_body / inner_mind / outer_body / outer_mind) so volatility +
+    chronicity stand out by part. Live homeostat state (in-process
+    Layer-2/3 EMAs) is NOT yet SHM-published — the recent-events trail is
+    the proxy until that follow-up lands.
+    """
+    import json as _json
+    import asyncio
+    titan_state = _get_plugin(request)
+    plugin = titan_state  # backward-compat alias
+    try:
+        consciousness_db_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", "data", "consciousness.db")
+        if not os.path.exists(consciousness_db_path):
+            return _ok({"events": [], "summary": {}, "note": "No consciousness DB found."})
+
+        def _read_events_blocking():
+            import sqlite3 as _sqlite3
+            cutoff = time.time() - (hours * 3600)
+            conn = _sqlite3.connect(consciousness_db_path, timeout=5)
+            try:
+                conn.execute("PRAGMA query_only=1")
+                conn.row_factory = _sqlite3.Row
+                rows = conn.execute(
+                    "SELECT event_id, timestamp, titan_id, source_part, side, "
+                    "dominant_dim_idx, dominant_dim_value, polarity_at_fire, "
+                    "polarity_sign, duration_ticks, sigma_multiplier, "
+                    "lifetime_event_count, nudge_value, nudge_intensity, nudge_ts "
+                    "FROM trinity_corrective_events "
+                    "WHERE timestamp >= ? ORDER BY event_id DESC LIMIT ?",
+                    (cutoff, int(limit)),
+                ).fetchall()
+                return [dict(r) for r in rows]
+            finally:
+                conn.close()
+
+        try:
+            events = await asyncio.to_thread(_read_events_blocking)
+        except Exception:
+            events = _read_events_blocking()
+
+        # Per (source_part, side) summary.
+        per_key: dict[str, dict] = {}
+        for ev in events:
+            key = f"{ev['source_part']}.{ev['side']}"
+            agg = per_key.setdefault(key, {
+                "source_part": ev["source_part"],
+                "side": ev["side"],
+                "count": 0,
+                "polarity_at_fire_sum": 0.0,
+                "duration_ticks_sum": 0,
+                "sigma_multiplier_sum": 0.0,
+                "lifetime_event_count_latest": 0,
+                "paired_count": 0,
+                "orphan_count": 0,
+            })
+            agg["count"] += 1
+            agg["polarity_at_fire_sum"] += float(ev["polarity_at_fire"] or 0.0)
+            agg["duration_ticks_sum"] += int(ev["duration_ticks"] or 0)
+            agg["sigma_multiplier_sum"] += float(ev["sigma_multiplier"] or 0.0)
+            # newest-first → first seen for a key is the latest lifetime count.
+            if agg["lifetime_event_count_latest"] == 0:
+                agg["lifetime_event_count_latest"] = int(
+                    ev["lifetime_event_count"] or 0
+                )
+            if ev["nudge_value"] is not None:
+                agg["paired_count"] += 1
+            else:
+                agg["orphan_count"] += 1
+
+        summary = []
+        for key, agg in per_key.items():
+            n = max(1, agg["count"])
+            window_s = max(1.0, hours * 3600.0)
+            summary.append({
+                "key": key,
+                "source_part": agg["source_part"],
+                "side": agg["side"],
+                "events_in_window": agg["count"],
+                "events_per_day": round(agg["count"] * 86_400.0 / window_s, 3),
+                "polarity_at_fire_avg": round(
+                    agg["polarity_at_fire_sum"] / n, 4
+                ),
+                "duration_ticks_avg": round(agg["duration_ticks_sum"] / n, 2),
+                "sigma_multiplier_avg": round(
+                    agg["sigma_multiplier_sum"] / n, 4
+                ),
+                "lifetime_event_count": agg["lifetime_event_count_latest"],
+                "paired_count": agg["paired_count"],
+                "orphan_count": agg["orphan_count"],
+            })
+        summary.sort(key=lambda d: d["key"])
+
+        return _ok({
+            "events": events,
+            "summary": summary,
+            "hours": hours,
+            "limit": limit,
+            "event_count": len(events),
+        })
+    except Exception as e:
+        return _error(str(e))
+
+
+# ---------------------------------------------------------------------------
 # GET /status/consciousness/history — Full Consciousness Epoch History
 # ---------------------------------------------------------------------------
 @router.get("/status/consciousness/history")

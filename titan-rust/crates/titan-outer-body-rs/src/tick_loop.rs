@@ -35,12 +35,15 @@ use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
     apply_multipliers, compose_focus_into_enrichment, compose_multipliers_default,
-    decode_local_filter_down_payload, encode_floats, load_checkpoint_for_part, load_restoring_cfg,
-    observe, open_focus_input_if_present, open_neuromod_slot_if_present, read_focus_nudge,
+    decode_corrective_nudge, decode_local_filter_down_payload, encode_body_balance_gift,
+    encode_extreme_imbalance, encode_floats, load_checkpoint_for_part, load_restoring_cfg, observe,
+    open_focus_input_if_present, open_neuromod_slot_if_present, read_focus_nudge,
     read_neuromod_gain, read_sensor_cache, read_topology_outer_lower, stateful_update,
-    write_checkpoint_for_part, CheckpointSnapshot, ContentGate, FiringSlotWriter, FocusPart,
-    GroundUpEnricher, Layer, PublishThrottle, RestoringCfg, SensorCacheRead, Side,
-    OUTER_BODY_TOPICS,
+    write_checkpoint_for_part, BalancedPulseEdges, CheckpointSnapshot, ContentGate,
+    FiringSlotWriter, FocusPart, GroundUpEnricher, JourneyAccumulator, JourneyTickInputs, Layer,
+    PolarityHomeostat, PolarityHomeostatCfg, PublishThrottle, PulseClockRole, PulseWatcher,
+    RestoringCfg, SensorCacheRead, Side, TrinitySide, BODY_BALANCE_GIFT_TOPIC, BODY_GIFT_WEIGHTS,
+    EXTREME_IMBALANCE_DETECTED_TOPIC, OUTER_BODY_TOPICS,
 };
 
 /// §G5.2 item 4 checkpoint cadence (outer-body @ 7.83 Hz → ~10s).
@@ -128,6 +131,8 @@ struct DaemonState {
     epoch_pending: bool,
     /// Set true when KERNEL_SHUTDOWN_ANNOUNCE arrives.
     shutdown_requested: bool,
+    /// P0.6-C / D-SPEC-132 one-shot CORRECTIVE_NUDGE from outer-spirit-rs.
+    pending_nudge: Option<(usize, f32)>,
     /// Last successfully-computed 5D body vector — fall-back when sensor
     /// cache is stale per SPEC §18.1.
     last_body: [f32; 5],
@@ -208,6 +213,28 @@ fn handle_bus_message(msg_type: &str, raw_bytes: &[u8], state: &Arc<Mutex<Daemon
             // ground_up nudge once per epoch (SPEC §G5.1).
             if let Ok(mut s) = state.lock() {
                 s.epoch_pending = true;
+            }
+        }
+        "CORRECTIVE_NUDGE" => {
+            let payload = match titan_bus::client::extract_payload(raw_bytes) {
+                Some(p) => p,
+                None => return,
+            };
+            match decode_corrective_nudge(&payload) {
+                Ok(n) => {
+                    if n.target_src != "body" || n.target_side != TrinitySide::Outer {
+                        return;
+                    }
+                    let idx = n.target_dim_idx as usize;
+                    if idx >= 5 {
+                        warn!(target_dim_idx = idx, "CORRECTIVE_NUDGE idx out of range");
+                        return;
+                    }
+                    if let Ok(mut s) = state.lock() {
+                        s.pending_nudge = Some((idx, n.nudge_value));
+                    }
+                }
+                Err(e) => warn!(err = ?e, "decode CORRECTIVE_NUDGE failed"),
             }
         }
         _ => {}
@@ -318,6 +345,12 @@ async fn run_tick_loop(
     let neuromod_path = shm_dir.join("neuromod_state.bin");
     let mut focus_input_slot = open_focus_input_if_present(&shm_dir);
     let focus_input_path = shm_dir.join("focus_input.bin");
+    // P0.5 / D-SPEC-131 §G5.1 UP-leg gift state (outer mirror of inner-body).
+    let mut pulse_watcher = PulseWatcher::open(&shm_dir);
+    let mut journey_acc: JourneyAccumulator<5> = JourneyAccumulator::new();
+    // P0.6-C / D-SPEC-132 PolarityHomeostat for outer_body.
+    let mut polarity_homeostat: PolarityHomeostat<5> =
+        PolarityHomeostat::new(PolarityHomeostatCfg::for_body());
     let mut tick_count: u64 = 0;
     // Outer-body @ 7.83 Hz: ~8 ticks ≈ 1s — refresh cfg + retry neuromod open at ~1s.
     let retry_every_n: u64 = (1.0_f64 / 0.1277).ceil() as u64;
@@ -362,9 +395,16 @@ async fn run_tick_loop(
                             focus_input_slot = Some(slot);
                         }
                     }
+                    if !pulse_watcher.is_open() && tick_count.is_multiple_of(retry_every_n) {
+                        pulse_watcher.retry_open(&shm_dir);
+                        if pulse_watcher.is_open() {
+                            info!(event = "PULSE_WATCH_OPENED_LATE", tick = tick_count);
+                        }
+                    }
                     if tick_count.is_multiple_of(retry_every_n) {
                         cfg = load_restoring_cfg(&shm_dir, Layer::Body);
                     }
+                    let (_pulse_edges, balanced_pulse_edges) = pulse_watcher.tick_with_balanced();
                     tick_count = tick_count.wrapping_add(1);
                     if let Err(e) = run_one_tick(
                         &bus, &state, &mut content_gate, &mut ground_up, &mut publish_throttle,
@@ -372,6 +412,8 @@ async fn run_tick_loop(
                         &mut firing_writer, &mut prev, &mut prev2,
                         &mut cfg, neuromod_slot.as_ref(), focus_input_slot.as_ref(),
                         &mut last_obs_restored,
+                        &mut journey_acc, &balanced_pulse_edges,
+                        &mut polarity_homeostat,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
@@ -434,6 +476,9 @@ async fn run_one_tick(
     neuromod_slot: Option<&Slot>,
     focus_input_slot: Option<&Slot>,
     last_obs_restored: &mut Option<titan_trinity_daemon::LayerObs>,
+    journey_acc: &mut JourneyAccumulator<5>,
+    balanced_pulse_edges: &BalancedPulseEdges,
+    polarity_homeostat: &mut PolarityHomeostat<5>,
 ) -> Result<()> {
     // 1. Read sensor cache (msgpack source dict from Python sidecar) +
     //    project to 5D body vector. On stale or missing, use last-known.
@@ -504,12 +549,74 @@ async fn run_one_tick(
     cfg.neuromod_gain = read_neuromod_gain(neuromod_slot);
     let obs = observe(&prev[..], &prev2[..]);
     *last_obs_restored = Some(obs);
+    // P0.6-C / D-SPEC-132: apply pending CORRECTIVE_NUDGE before stateful_update.
+    let pending_nudge = {
+        let mut s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
+        s.pending_nudge.take()
+    };
+    if let Some((dim_idx, signed_nudge)) = pending_nudge {
+        if dim_idx < 5 {
+            enrichment[dim_idx] += signed_nudge;
+            debug!(event = "CORRECTIVE_NUDGE_APPLIED", dim_idx, signed_nudge);
+        }
+    }
+
     let x = stateful_update(&prev[..], &prev2[..], &raw[..], &enrichment[..], &obs, cfg);
     let mut body_state = [0.0_f32; 5];
     body_state.copy_from_slice(&x[..5]);
     *prev2 = *prev;
     *prev = body_state;
     let body = body_state;
+
+    // 6c. P0.5 / D-SPEC-131 §G5.1 UP-leg balance gift — outer mirror of inner.
+    let tick_ts = now_secs();
+    journey_acc.tick(JourneyTickInputs {
+        x: &body,
+        obs,
+        now_secs: tick_ts as f32,
+    });
+    // P0.6-C / D-SPEC-132: PolarityHomeostat tick (outer mirror).
+    if let Some(ev) = polarity_homeostat.tick(obs.polarity, &body) {
+        let payload = encode_extreme_imbalance("body", TrinitySide::Outer, &ev, tick_ts);
+        if let Err(e) = bus
+            .publish(EXTREME_IMBALANCE_DETECTED_TOPIC, Some("all"), Some(payload))
+            .await
+        {
+            warn!(err = ?e, "publish EXTREME_IMBALANCE_DETECTED failed (continuing)");
+        } else {
+            debug!(
+                event = "EXTREME_IMBALANCE_DETECTED",
+                side = "outer",
+                src = "body",
+                dim = ev.dominant_dim_idx,
+                pol = ev.polarity_at_fire,
+                duration_ticks = ev.duration_ticks,
+                sigma = ev.sigma_multiplier,
+            );
+        }
+    }
+
+    if balanced_pulse_edges[PulseClockRole::OuterBody.index()] {
+        journey_acc.mark_balanced(obs);
+        if let Some(digest) = journey_acc.finalize_body_gift(&BODY_GIFT_WEIGHTS) {
+            let payload = encode_body_balance_gift::<5>(TrinitySide::Outer, &digest, tick_ts);
+            if let Err(e) = bus
+                .publish(BODY_BALANCE_GIFT_TOPIC, Some("all"), Some(payload))
+                .await
+            {
+                warn!(err = ?e, "publish BODY_BALANCE_GIFT failed (continuing)");
+            } else {
+                debug!(
+                    event = "BODY_BALANCE_GIFT_EMITTED",
+                    side = "outer",
+                    amplitude = digest.gift_amplitude,
+                    cycle_s = digest.cycle_duration_s,
+                    ticks = digest.cycle_tick_count,
+                );
+            }
+        }
+        journey_acc.reset_for_next_cycle();
+    }
 
     // 7. Encode + content-hash gate the slot write.
     let bytes = encode_floats::<5>(&body);
@@ -622,23 +729,63 @@ fn project_outer_body_5d(payload: &[u8], last_body: [f32; 5]) -> Result<[f32; 5]
     //   elsewhere). Source: top-level pi_heartbeat_hrv. Per Maker 2026-05-21.
     let interoception: f64 = safe_clamp(field_or_default(Some(map), "pi_heartbeat_hrv", 0.5));
 
-    // ── [1] proprioception ────────────────────────────────────────
-    // Python lines 412-423.
-    let peer_entropy: f64 = field_or_default(net_stats.as_ref(), "peer_entropy", 0.5);
-    let helper_health: f64 = compute_helper_health(helper_statuses.as_ref());
-    let bus_module_diversity: f64 =
-        field_or_default(net_stats.as_ref(), "bus_module_diversity", 0.5);
-    let proprioception: f64 =
-        safe_clamp(0.5 * peer_entropy + 0.3 * helper_health + 0.2 * bus_module_diversity);
+    // ── [1] proprioception RE-GROUNDED (P0.6-B / Maker call 2026-05-26) ──
+    //   D-SPEC-104 pattern: the legacy composite formula (peer_entropy +
+    //   helper_health + bus_module_diversity) produced a near-constant 0.7
+    //   under steady fleet conditions → std=0.02 fleet-wide per audit
+    //   2026-05-25. Re-ground to ChangeBreathTracker's `proprioception_change`
+    //   (computed L2-side by outer_sidecar_providers from the SAME composite
+    //   level — so the dim now breathes on |Δlevel|/dt instead of the level
+    //   itself). Falls back to the legacy composite when outer_body_change
+    //   field is absent (graceful pre-D-SPEC-104 producer compatibility).
+    let proprioception_change_opt: Option<f64> = outer_body_change.as_ref().and_then(|m| {
+        for (k, v) in m.iter() {
+            if let rmpv::Value::String(s) = k {
+                if s.as_str() == Some("proprioception_change") {
+                    return v.as_f64();
+                }
+            }
+        }
+        None
+    });
+    let proprioception: f64 = if let Some(p) = proprioception_change_opt {
+        safe_clamp(p)
+    } else {
+        let peer_entropy: f64 = field_or_default(net_stats.as_ref(), "peer_entropy", 0.5);
+        let helper_health: f64 = compute_helper_health(helper_statuses.as_ref());
+        let bus_module_diversity: f64 =
+            field_or_default(net_stats.as_ref(), "bus_module_diversity", 0.5);
+        safe_clamp(0.5 * peer_entropy + 0.3 * helper_health + 0.2 * bus_module_diversity)
+    };
 
-    // ── [2] somatosensation ───────────────────────────────────────
-    // Python lines 425-442. dim[2] reads previous-tick value (`current_ob2`).
-    // 9G decay-fix: apply exponential decay toward 0.5 per tick to
-    // prevent saturation. See `apply_dim2_decay` rationale.
-    let tx_lat_norm: f64 = field_or_default(tx_lat.as_ref(), "normalized", 0.5);
-    let current_ob2: f64 = apply_dim2_decay(last_body[2] as f64);
-    let cpu_spikes: f64 = field_or_default(sys_stats.as_ref(), "cpu_spike_rate", 0.0);
-    let somatosensation: f64 = safe_clamp(0.4 * tx_lat_norm + 0.3 * current_ob2 + 0.3 * cpu_spikes);
+    // ── [2] somatosensation RE-GROUNDED (P0.6-B / Maker call 2026-05-26) ──
+    //   D-SPEC-104 pattern: legacy formula included `current_ob2` (self-reference
+    //   with decay-toward-0.5) which dominated → dim saturated at ~0.5 fleet-wide
+    //   per audit 2026-05-25. Re-ground to ChangeBreathTracker's
+    //   `somatosensation_change` (L2 composite: tx_lat_norm + cpu_spikes, NO
+    //   self-reference). Falls back to a stateless composite (no current_ob2)
+    //   when the change field is absent.
+    let somatosensation_change_opt: Option<f64> = outer_body_change.as_ref().and_then(|m| {
+        for (k, v) in m.iter() {
+            if let rmpv::Value::String(s) = k {
+                if s.as_str() == Some("somatosensation_change") {
+                    return v.as_f64();
+                }
+            }
+        }
+        None
+    });
+    let somatosensation: f64 = if let Some(s) = somatosensation_change_opt {
+        safe_clamp(s)
+    } else {
+        let tx_lat_norm: f64 = field_or_default(tx_lat.as_ref(), "normalized", 0.5);
+        let cpu_spikes: f64 = field_or_default(sys_stats.as_ref(), "cpu_spike_rate", 0.0);
+        safe_clamp(0.6 * tx_lat_norm + 0.4 * cpu_spikes)
+    };
+    // Suppress the apply_dim2_decay helper warning by tagging the previous
+    // self-reference value as observed (kept for future telemetry; the new
+    // re-grounded path no longer depends on it).
+    let _retired_current_ob2 = apply_dim2_decay(last_body[2] as f64);
 
     // ── [3] entropy RE-GROUNDED (D-SPEC-101 Phase-2) ──────────────────
     //   RATE OF CHANGE of the system-entropy level over a minutes-scale window

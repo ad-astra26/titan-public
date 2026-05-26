@@ -485,6 +485,15 @@ OUTER_TRINITY_COLLECT_REQUEST = "OUTER_TRINITY_COLLECT_REQUEST"
 SPHERE_PULSE = "SPHERE_PULSE"
 BIG_PULSE = "BIG_PULSE"
 GREAT_PULSE = "GREAT_PULSE"
+# P0.5 / D-SPEC-131 §G5.1 UP-leg gift events published by titan-{inner,outer}-{body,mind}-rs
+# on their own sphere clock's balanced rising-edge. Spirit daemons subscribe;
+# journey_persistence_worker on Python L2 also subscribes for SQL durability.
+BODY_BALANCE_GIFT = "BODY_BALANCE_GIFT"
+MIND_BALANCE_GIFT = "MIND_BALANCE_GIFT"
+# P0.6-C / D-SPEC-132 §6.6 polarity-homeostat corrective event chain.
+# body/mind → spirit on imbalance detection; spirit → body/mind on nudge.
+EXTREME_IMBALANCE_DETECTED = "EXTREME_IMBALANCE_DETECTED"
+CORRECTIVE_NUDGE = "CORRECTIVE_NUDGE"
 # LEGACY:FILTER_DOWN_V4 superseded by FILTER_DOWN_V5 (162D TITAN_SELF).
 # V4 FilterDown engine is still instantiated for back-compat but the bus
 # message type is no longer published — V5 carries the live multipliers.

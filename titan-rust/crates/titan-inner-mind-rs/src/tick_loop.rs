@@ -18,11 +18,15 @@ use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
     apply_multipliers, compose_focus_into_enrichment, compose_multipliers_default,
-    decode_filter_down_payload, decode_local_filter_down_payload, encode_floats,
-    load_checkpoint_for_part, load_restoring_cfg, observe, open_focus_input_if_present,
-    open_neuromod_slot_if_present, read_focus_nudge, read_neuromod_gain, stateful_update,
-    write_checkpoint_for_part, CheckpointSnapshot, ContentGate, DriftAggregator, FiringSlotWriter,
-    FocusPart, GroundUpEnricher, Layer, RestoringCfg, Side, INNER_MIND_TOPICS,
+    decode_corrective_nudge, decode_filter_down_payload, decode_local_filter_down_payload,
+    encode_extreme_imbalance, encode_floats, encode_mind_balance_gift, load_checkpoint_for_part,
+    load_restoring_cfg, observe, open_focus_input_if_present, open_neuromod_slot_if_present,
+    read_focus_nudge, read_neuromod_gain, stateful_update, write_checkpoint_for_part,
+    BalancedPulseEdges, CheckpointSnapshot, ContentGate, DriftAggregator, FiringSlotWriter,
+    FocusPart, GroundUpEnricher, JourneyAccumulator, JourneyTickInputs, Layer, PolarityHomeostat,
+    PolarityHomeostatCfg, PulseClockRole, PulseWatcher, RestoringCfg, Side, TrinitySide,
+    EXTREME_IMBALANCE_DETECTED_TOPIC, INNER_MIND_TOPICS, MIND_BALANCE_GIFT_TOPIC,
+    MIND_GIFT_WEIGHTS,
 };
 
 /// §G5.2 item 4 checkpoint write cadence. Inner-mind ticks @ 23.49 Hz so
@@ -116,6 +120,8 @@ struct DaemonState {
     epoch_pending: bool,
     /// Shutdown via KERNEL_SHUTDOWN_ANNOUNCE.
     shutdown_requested: bool,
+    /// P0.6-C / D-SPEC-132 one-shot CORRECTIVE_NUDGE from inner-spirit-rs.
+    pending_nudge: Option<(usize, f32)>,
 }
 
 async fn run_event_dispatcher(
@@ -190,6 +196,29 @@ fn handle_bus_message(msg_type: &str, raw_bytes: &[u8], state: &Arc<Mutex<Daemon
                 s.epoch_pending = true;
             }
         }
+        "CORRECTIVE_NUDGE" => {
+            // P0.6-C / D-SPEC-132: accept only target_src=mind + target_side=Inner.
+            let payload = match titan_bus::client::extract_payload(raw_bytes) {
+                Some(p) => p,
+                None => return,
+            };
+            match decode_corrective_nudge(&payload) {
+                Ok(n) => {
+                    if n.target_src != "mind" || n.target_side != TrinitySide::Inner {
+                        return;
+                    }
+                    let idx = n.target_dim_idx as usize;
+                    if idx >= 15 {
+                        warn!(target_dim_idx = idx, "CORRECTIVE_NUDGE idx out of range");
+                        return;
+                    }
+                    if let Ok(mut s) = state.lock() {
+                        s.pending_nudge = Some((idx, n.nudge_value));
+                    }
+                }
+                Err(e) => warn!(err = ?e, "decode CORRECTIVE_NUDGE failed"),
+            }
+        }
         _ => {}
     }
 }
@@ -231,6 +260,17 @@ async fn run_tick_loop(
     // §G5.2 item 2 + §G12 — FOCUS cascade nudge slot.
     let mut focus_input_slot = open_focus_input_if_present(&shm_dir);
     let focus_input_path = shm_dir.join("focus_input.bin");
+
+    // P0.5 / D-SPEC-131 §G5.1 UP-leg balance-gift state (mirror of inner-body
+    // wiring): SHM-direct PulseWatcher detects the inner_mind clock balanced
+    // rising-edge; the JourneyAccumulator<15> tracks per-cycle qualitative
+    // aggregates (coherence climb, polarity dynamics, direction stability)
+    // that feed the MIND_BALANCE_GIFT digest.
+    let mut pulse_watcher = PulseWatcher::open(&shm_dir);
+    let mut journey_acc: JourneyAccumulator<MIND_DIMS> = JourneyAccumulator::new();
+    // P0.6-C / D-SPEC-132 PolarityHomeostat for inner_mind.
+    let mut polarity_homeostat: PolarityHomeostat<MIND_DIMS> =
+        PolarityHomeostat::new(PolarityHomeostatCfg::for_mind());
 
     // Per master plan §7 + C-S3 PLAN §1.1 #2: Schumann timer wheels live in
     // titan-schumann (canonical shared library for trinity daemons).
@@ -284,9 +324,16 @@ async fn run_tick_loop(
                             focus_input_slot = Some(slot);
                         }
                     }
+                    if !pulse_watcher.is_open() && tick_count.is_multiple_of(retry_every_n) {
+                        pulse_watcher.retry_open(&shm_dir);
+                        if pulse_watcher.is_open() {
+                            info!(event = "PULSE_WATCH_OPENED_LATE", tick = tick_count);
+                        }
+                    }
                     if tick_count.is_multiple_of(retry_every_n) {
                         cfg = load_restoring_cfg(&shm_dir, Layer::Mind);
                     }
+                    let (_pulse_edges, balanced_pulse_edges) = pulse_watcher.tick_with_balanced();
                     let drift_pct = tick_event.jitter_ns() as f64 / tick_event.period_ns as f64;
                     drift_agg.observe(drift_pct, tick_event.jitter_ns(), tick_event.epoch);
                     if let Err(e) = run_one_tick(
@@ -295,6 +342,8 @@ async fn run_tick_loop(
                         &mut firing_writer, &mut prev, &mut prev2,
                         &mut cfg, neuromod_slot.as_ref(), focus_input_slot.as_ref(),
                         &mut last_obs_restored,
+                        &mut journey_acc, &balanced_pulse_edges,
+                        &mut polarity_homeostat,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
@@ -353,6 +402,9 @@ async fn run_one_tick(
     neuromod_slot: Option<&Slot>,
     focus_input_slot: Option<&Slot>,
     last_obs_restored: &mut Option<titan_trinity_daemon::LayerObs>,
+    journey_acc: &mut JourneyAccumulator<MIND_DIMS>,
+    balanced_pulse_edges: &BalancedPulseEdges,
+    polarity_homeostat: &mut PolarityHomeostat<MIND_DIMS>,
 ) -> Result<()> {
     // raw[t] = un-enriched 15D sensor reading (§G5.2 drive target).
     let raw = read_sensor_cache(sensor_cache)?;
@@ -415,12 +467,76 @@ async fn run_one_tick(
     cfg.neuromod_gain = read_neuromod_gain(neuromod_slot);
     let obs = observe(&prev[..], &prev2[..]);
     *last_obs_restored = Some(obs);
+    // P0.6-C / D-SPEC-132: apply pending CORRECTIVE_NUDGE before stateful_update.
+    let pending_nudge = {
+        let mut s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
+        s.pending_nudge.take()
+    };
+    if let Some((dim_idx, signed_nudge)) = pending_nudge {
+        if dim_idx < MIND_DIMS {
+            enrichment[dim_idx] += signed_nudge;
+            debug!(event = "CORRECTIVE_NUDGE_APPLIED", dim_idx, signed_nudge);
+        }
+    }
+
     let x = stateful_update(&prev[..], &prev2[..], &raw[..], &enrichment[..], &obs, cfg);
     let mut mind_state = [0.0_f32; MIND_DIMS];
     mind_state.copy_from_slice(&x[..MIND_DIMS]);
     *prev2 = *prev;
     *prev = mind_state;
     let mind = mind_state;
+
+    // P0.5 / D-SPEC-131 §G5.1 UP-leg: track this tick's journey + emit a
+    // MIND_BALANCE_GIFT on this daemon's own clock balanced rising-edge.
+    let tick_ts = now_secs();
+    journey_acc.tick(JourneyTickInputs {
+        x: &mind,
+        obs,
+        now_secs: tick_ts as f32,
+    });
+    // P0.6-C / D-SPEC-132: PolarityHomeostat tick on the post-§G5.2 mind state.
+    if let Some(ev) = polarity_homeostat.tick(obs.polarity, &mind) {
+        let payload = encode_extreme_imbalance("mind", TrinitySide::Inner, &ev, tick_ts);
+        if let Err(e) = bus
+            .publish(EXTREME_IMBALANCE_DETECTED_TOPIC, Some("all"), Some(payload))
+            .await
+        {
+            warn!(err = ?e, "publish EXTREME_IMBALANCE_DETECTED failed (continuing)");
+        } else {
+            debug!(
+                event = "EXTREME_IMBALANCE_DETECTED",
+                side = "inner",
+                src = "mind",
+                dim = ev.dominant_dim_idx,
+                pol = ev.polarity_at_fire,
+                duration_ticks = ev.duration_ticks,
+                sigma = ev.sigma_multiplier,
+            );
+        }
+    }
+
+    if balanced_pulse_edges[PulseClockRole::InnerMind.index()] {
+        journey_acc.mark_balanced(obs);
+        if let Some(digest) = journey_acc.finalize_mind_gift(&MIND_GIFT_WEIGHTS) {
+            let payload =
+                encode_mind_balance_gift::<MIND_DIMS>(TrinitySide::Inner, &digest, tick_ts);
+            if let Err(e) = bus
+                .publish(MIND_BALANCE_GIFT_TOPIC, Some("all"), Some(payload))
+                .await
+            {
+                warn!(err = ?e, "publish MIND_BALANCE_GIFT failed (continuing)");
+            } else {
+                debug!(
+                    event = "MIND_BALANCE_GIFT_EMITTED",
+                    side = "inner",
+                    amplitude = digest.gift_amplitude,
+                    cycle_s = digest.cycle_duration_s,
+                    ticks = digest.cycle_tick_count,
+                );
+            }
+        }
+        journey_acc.reset_for_next_cycle();
+    }
 
     let bytes = encode_floats::<MIND_DIMS>(&mind);
 

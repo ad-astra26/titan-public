@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::net::UnixListener;
-use tokio::sync::{mpsc, watch, Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -329,32 +329,25 @@ impl BusBroker {
             return Err(BrokerError::Io(std::io::Error::other(format!("{e:?}"))));
         }
 
-        // 2. Register subscriber + per-sub data-wake notify + per-sub
-        //    close-state receivers.
+        // 2. Register subscriber + per-sub notify.
         //
-        // SPEC §8.0.quat / D-SPEC-131 (2026-05-26): the per-sub `notify`
-        // is the **data-wake** primitive (send_loop only listens; fanout
-        // + heartbeat fire it via `notify.notify_one()`). The per-sub
-        // `close_tx` is the **close-state** primitive — we derive two
-        // receivers (one for recv_task, one for send_task) at spawn
-        // time. Both tasks await `close_rx.wait_for(|v| *v)` as their
-        // authoritative shutdown signal. Level-triggered: if
-        // `signal_close()` fires before either task reaches its select,
-        // the wait_for resolves immediately on first poll (closes H1
-        // miss-the-wake race documented in
-        // titan-docs/HANDOFF_broker_silent_hang_continuation_20260526.md §7).
-        let (notify, recv_close_rx, send_close_rx) = {
+        // BUG-AGNO-SILENT-HANG fix (2026-05-25): the per-sub notify is
+        // now OWNED by the subscriber (`BrokerSubscriber::notify`,
+        // created in `new()`). We clone it into the `notify_per_sub`
+        // map for fanout's existing wake-on-publish path (unchanged)
+        // AND into the recv_task spawn args for the new shutdown-wake
+        // path. Single Arc identity means firing on any reference
+        // wakes ALL listeners (send_loop + recv_loop in select).
+        let notify = {
             let mut subs_guard = subs.lock().await;
             let sub = BrokerSubscriber::new(&sub_name);
             let notify = sub.notify.clone();
-            let recv_close_rx = sub.subscribe_close();
-            let send_close_rx = sub.subscribe_close();
             subs_guard.insert(sub_name.clone(), sub);
             notify_per_sub
                 .lock()
                 .await
                 .insert(sub_name.clone(), notify.clone());
-            (notify, recv_close_rx, send_close_rx)
+            notify
         };
 
         // 3. Split stream + spawn recv + send tasks concurrently
@@ -377,20 +370,16 @@ impl BusBroker {
             read_half,
             sub_name.clone(),
             inbound_tx,
-            // Authoritative close-state receiver (SPEC §8.0.quat
-            // invariant 2). recv_loop does NOT listen to the data-wake
-            // notify — that distinction is the D-SPEC-131 fix.
-            recv_close_rx,
+            // Pass the SAME Arc<Notify>. `signal_close()` fires
+            // notify_waiters() which wakes both send_loop (via existing
+            // wait) and recv_loop (via tokio::select! on this notify).
+            notify.clone(),
         ));
         let send_task = tokio::spawn(run_send_loop_via_map(
             write_half,
             sub_arc.subs,
             sub_arc.name,
             notify,
-            // Same close-state subscription so send_loop wakes promptly
-            // on close even if it's mid `notify.notified().await` and
-            // no further data wakes are coming.
-            send_close_rx,
         ));
 
         let _ = tokio::join!(recv_task, send_task);
@@ -788,52 +777,11 @@ async fn run_send_loop_via_map(
     subs: Arc<Mutex<SubscriberMap>>,
     sub_name: String,
     notify: Arc<Notify>,
-    // SPEC §8.0.quat / D-SPEC-131: level-triggered close-state
-    // receiver. Wakes send_loop promptly on `signal_close()` even
-    // when no further data publications are coming (otherwise
-    // send_loop could sleep indefinitely in `notify.notified()`
-    // while waiting for a message that will never arrive on a
-    // closed subscriber).
-    mut close_rx: watch::Receiver<bool>,
 ) {
     /// Mirrors Python `SEND_BATCH_THRESHOLD=5` from bus_socket.py:171.
     const SEND_BATCH_THRESHOLD: usize = 5;
     loop {
-        // Wait for either a data wake OR a close signal. Both arms are
-        // distinct primitives per SPEC §8.0.quat — the data-wake notify
-        // is fired by fanout + heartbeat; the close-state watch is
-        // fired by `signal_close()`. recv_loop is on a separate
-        // `close_rx.wait_for(...)` arm (server.rs) so the close
-        // signal reaches BOTH tasks without any single primitive being
-        // overloaded.
-        tokio::select! {
-            _ = notify.notified() => {}
-            // Wrap `wait_for` in an inline async block so its `Ref<'_, bool>`
-            // (carries an `RwLockReadGuard`, not `Send`) is dropped INSIDE
-            // the block and the select's `Out` enum only stores `()`. Without
-            // the wrapper, the macro-generated future is not Send and cannot
-            // be spawned across threads.
-            _ = async { let _ = close_rx.wait_for(|v| *v).await; } => {
-                // Authoritative close transition observed. Surfaced at
-                // INFO per SPEC error-cascade discipline so the kernel
-                // log retains a single unambiguous trace of every
-                // connection exit reason.
-                let sub_logical_name = {
-                    let subs_guard = subs.lock().await;
-                    subs_guard
-                        .get(&sub_name)
-                        .map(|s| s.name.clone())
-                        .unwrap_or_default()
-                };
-                tracing::info!(
-                    name = %sub_name,
-                    sub_name = %sub_logical_name,
-                    reason = "broker_close_signal",
-                    "send loop: exiting on close-state signal from broker"
-                );
-                return;
-            }
-        }
+        notify.notified().await;
         loop {
             let popped: Vec<Envelope> = {
                 let mut subs_guard = subs.lock().await;

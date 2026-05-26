@@ -771,3 +771,365 @@ fn conformance_g5_2_focus_input_applied() {
         assert!((x_focused[i] - x_baseline[i]).abs() < 1e-6);
     }
 }
+
+// ── P0.5 / D-SPEC-131 — UP-leg meaning-mapped gift (PLAN §6.5) ───────────────
+
+// G5.1-up-leg-q-l-d-mask: spirit dims classified Q / L / D per locked masks.
+#[test]
+fn conformance_p0_5_up_leg_masks_q_l_d_locked() {
+    // PLAN §6.5.4 LOCKED 2026-05-24: inner = 15Q + 16L + 14D; outer = 10Q +
+    // 22L + 13D. D-dim combined fraction = 1.0 (body 0.25 + mind 0.75 per the
+    // power-of-three law). Q dims receive 1.0 body / 0.0 mind; L mirror.
+    use titan_trinity_daemon::{
+        BODY_FLAG_INNER, BODY_FLAG_OUTER, MIND_FLAG_INNER, MIND_FLAG_OUTER,
+    };
+    for i in 0..45 {
+        let inner = BODY_FLAG_INNER[i] + MIND_FLAG_INNER[i];
+        let outer = BODY_FLAG_OUTER[i] + MIND_FLAG_OUTER[i];
+        assert!(
+            (inner - 1.0).abs() < 1e-6,
+            "inner dim {i}: body+mind mask must combine to 1.0 (got {inner}) — \
+             classification clauseQ=1+0, L=0+1, D=0.25+0.75",
+        );
+        assert!(
+            (outer - 1.0).abs() < 1e-6,
+            "outer dim {i}: body+mind mask must combine to 1.0 (got {outer})",
+        );
+    }
+    // PLAN-locked class counts (must hold by construction).
+    let inner_body_sum: f32 = BODY_FLAG_INNER.iter().sum();
+    let inner_mind_sum: f32 = MIND_FLAG_INNER.iter().sum();
+    let outer_body_sum: f32 = BODY_FLAG_OUTER.iter().sum();
+    let outer_mind_sum: f32 = MIND_FLAG_OUTER.iter().sum();
+    // 15·1 + 14·0.25 = 18.5; 16·1 + 14·0.75 = 26.5
+    assert!(
+        (inner_body_sum - 18.5).abs() < 1e-5,
+        "inner BODY sum {inner_body_sum}"
+    );
+    assert!(
+        (inner_mind_sum - 26.5).abs() < 1e-5,
+        "inner MIND sum {inner_mind_sum}"
+    );
+    // 10·1 + 13·0.25 = 13.25; 22·1 + 13·0.75 = 31.75
+    assert!(
+        (outer_body_sum - 13.25).abs() < 1e-5,
+        "outer BODY sum {outer_body_sum}"
+    );
+    assert!(
+        (outer_mind_sum - 31.75).abs() < 1e-5,
+        "outer MIND sum {outer_mind_sum}"
+    );
+}
+
+// G5.1-journey-first-cycle-suppressed: first balanced pulse after boot emits NO gift.
+#[test]
+fn conformance_p0_5_journey_first_cycle_suppressed() {
+    // PLAN §6.5.2: the first balanced pulse after daemon boot only RESETS
+    // the accumulator — no gift emitted. This prevents cold-start partial
+    // cycles from gifting unrepresentative data.
+    use titan_trinity_daemon::{
+        JourneyAccumulator, JourneyTickInputs, BODY_GIFT_WEIGHTS, MIND_GIFT_WEIGHTS,
+    };
+    let mut acc: JourneyAccumulator<5> = JourneyAccumulator::new();
+    let x = [0.5_f32; 5];
+    acc.tick(JourneyTickInputs {
+        x: &x,
+        obs: LayerObs::default(),
+        now_secs: 0.0,
+    });
+    acc.mark_balanced(LayerObs::default());
+    assert!(
+        acc.finalize_body_gift(&BODY_GIFT_WEIGHTS).is_none(),
+        "first balanced pulse: body gift MUST be None (cold-start suppression)",
+    );
+    let mut acc2: JourneyAccumulator<15> = JourneyAccumulator::new();
+    let x15 = [0.5_f32; 15];
+    acc2.tick(JourneyTickInputs {
+        x: &x15,
+        obs: LayerObs::default(),
+        now_secs: 0.0,
+    });
+    acc2.mark_balanced(LayerObs::default());
+    assert!(
+        acc2.finalize_mind_gift(&MIND_GIFT_WEIGHTS).is_none(),
+        "first balanced pulse: mind gift MUST be None",
+    );
+}
+
+// G5.1-gift-event-roundtrip: encode → decode preserves side + amplitude.
+#[test]
+fn conformance_p0_5_gift_event_roundtrip() {
+    // P0.5 / D-SPEC-131: BODY_BALANCE_GIFT + MIND_BALANCE_GIFT payloads are
+    // structured rmpv::Value::Map per §8.6 convention (NOT opaque binary).
+    // decode_gift_at_spirit MUST recover side + gift_amplitude + duration +
+    // tick count + ts — the fields the spirit daemon uses for mask-weighted
+    // enrichment.
+    use titan_trinity_daemon::{
+        decode_gift_at_spirit, encode_body_balance_gift, encode_mind_balance_gift,
+        BodyJourneyDigest, MindJourneyDigest, TrinitySide, JOURNEY_SNAPSHOT_RING_LEN,
+    };
+    let body_digest: BodyJourneyDigest<5> = BodyJourneyDigest {
+        gift_amplitude: 0.37,
+        cycle_duration_s: 2.1,
+        cycle_tick_count: 17,
+        peak_excursion: [0.1; 5],
+        path_length: [0.2; 5],
+        excursion_integral: [0.05; 5],
+        direction_flips: [1; 5],
+        polarity_max: 0.3,
+        polarity_at_balance: 0.1,
+        per_dim_contribution: [0.2; 5],
+        snapshots: [[0.5_f32; 5]; JOURNEY_SNAPSHOT_RING_LEN],
+    };
+    let body_payload = encode_body_balance_gift::<5>(TrinitySide::Inner, &body_digest, 99.0);
+    let decoded = decode_gift_at_spirit(&body_payload).unwrap();
+    assert_eq!(decoded.side, TrinitySide::Inner);
+    assert!((decoded.gift_amplitude - 0.37).abs() < 1e-5);
+    assert_eq!(decoded.cycle_tick_count, 17);
+
+    let mind_digest: MindJourneyDigest<15> = MindJourneyDigest {
+        gift_amplitude: 0.22,
+        cycle_duration_s: 1.0,
+        cycle_tick_count: 23,
+        peak_excursion: [0.2; 15],
+        path_length: [0.5; 15],
+        excursion_integral: [0.1; 15],
+        direction_flips: [1; 15],
+        coherence_climb_max: 0.4,
+        polarity_max: 0.5,
+        polarity_at_balance: 0.1,
+        per_dim_contribution: [1.0 / 15.0; 15],
+        snapshots: [[0.5_f32; 15]; JOURNEY_SNAPSHOT_RING_LEN],
+    };
+    let mind_payload = encode_mind_balance_gift::<15>(TrinitySide::Outer, &mind_digest, 100.0);
+    let decoded_m = decode_gift_at_spirit(&mind_payload).unwrap();
+    assert_eq!(decoded_m.side, TrinitySide::Outer);
+    assert!((decoded_m.gift_amplitude - 0.22).abs() < 1e-5);
+}
+
+// G5.1-spirit-subscribes-to-gifts: both spirit daemons receive both gifts.
+#[test]
+fn conformance_p0_5_spirit_subscribes_to_balance_gifts() {
+    // P0.5 / D-SPEC-131: inner-spirit-rs + outer-spirit-rs MUST list both
+    // BODY_BALANCE_GIFT and MIND_BALANCE_GIFT in their REQUIRED subscription
+    // topics. Sovereign-half filtering happens at payload-decode time (by
+    // `side` field) — the broker delivers both events to both daemons.
+    use titan_trinity_daemon::{INNER_SPIRIT_TOPICS, OUTER_SPIRIT_TOPICS};
+    assert!(INNER_SPIRIT_TOPICS.contains(&"BODY_BALANCE_GIFT"));
+    assert!(INNER_SPIRIT_TOPICS.contains(&"MIND_BALANCE_GIFT"));
+    assert!(OUTER_SPIRIT_TOPICS.contains(&"BODY_BALANCE_GIFT"));
+    assert!(OUTER_SPIRIT_TOPICS.contains(&"MIND_BALANCE_GIFT"));
+}
+
+// ── P0.6-C / D-SPEC-132 — PolarityHomeostat + corrective events ──────────────
+
+// G6.6-cold-start-no-fire: warmup ticks at modest |polarity| must not fire.
+#[test]
+fn conformance_p0_6_c_polarity_homeostat_warmup_no_fire() {
+    // PLAN §6.6.3 + Cold-start variance=0.0625 default: at sigma_init=2.5 the
+    // initial threshold ≈ 0.625; any |polarity| < 0.6 with no streak should
+    // NOT fire even before EMAs converge.
+    use titan_trinity_daemon::{PolarityHomeostat, PolarityHomeostatCfg};
+    let mut h = PolarityHomeostat::<5>::new(PolarityHomeostatCfg::for_body());
+    let x = [0.5_f32; 5];
+    for _ in 0..50 {
+        assert!(
+            h.tick(0.5, &x).is_none(),
+            "warmup at |polarity|=0.5 must not fire (threshold ~0.625)"
+        );
+    }
+}
+
+// G6.6-sustained-extreme-fires: streak ≥ duration_threshold → fire.
+#[test]
+fn conformance_p0_6_c_sustained_extreme_fires_after_duration() {
+    use titan_trinity_daemon::{PolarityHomeostat, PolarityHomeostatCfg};
+    let mut cfg = PolarityHomeostatCfg::for_body();
+    cfg.baseline_lr = 0.05;
+    cfg.variance_lr = 0.05;
+    cfg.sigma_init = 2.0;
+    cfg.sigma_max = 2.0;
+    cfg.min_dur_ticks = 5;
+    cfg.k_dur = 1.0;
+    let mut h = PolarityHomeostat::<5>::new(cfg);
+    let x_calm = [0.5_f32; 5];
+    for _ in 0..200 {
+        h.tick(0.1, &x_calm);
+    }
+    let mut x_spike = [0.5_f32; 5];
+    x_spike[3] = 0.95;
+    let mut fired = None;
+    for _ in 0..50 {
+        if let Some(ev) = h.tick(0.9, &x_spike) {
+            fired = Some(ev);
+            break;
+        }
+    }
+    let ev = fired.expect("sustained extreme should fire after min_dur_ticks");
+    assert_eq!(ev.dominant_dim_idx, 3, "argmax dim is the protagonist");
+    assert!(ev.duration_ticks >= 5);
+    assert!(ev.polarity_at_fire > 0.5);
+}
+
+// G6.6-sigma-bounded: σ stays in [σ_min, σ_max] under construction.
+#[test]
+fn conformance_p0_6_c_sigma_bounded_to_cfg() {
+    use titan_trinity_daemon::{PolarityHomeostat, PolarityHomeostatCfg};
+    let mut cfg = PolarityHomeostatCfg::for_body();
+    cfg.sigma_init = 99.0; // out-of-bounds init
+    cfg.sigma_min = 1.5;
+    cfg.sigma_max = 4.0;
+    let h = PolarityHomeostat::<3>::new(cfg);
+    let t = h.telemetry();
+    assert!(t.sigma_multiplier <= 4.0 + 1e-6);
+    assert!(t.sigma_multiplier >= 1.5 - 1e-6);
+}
+
+// G6.6-extreme-event-roundtrip: encode/decode preserves all fields.
+#[test]
+fn conformance_p0_6_c_extreme_imbalance_roundtrip() {
+    use titan_trinity_daemon::{
+        decode_extreme_imbalance, encode_extreme_imbalance, ExtremeImbalanceEvent, TrinitySide,
+    };
+    let ev = ExtremeImbalanceEvent {
+        dominant_dim_idx: 7,
+        dominant_dim_value: 0.92,
+        polarity_at_fire: 0.74,
+        polarity_sign: -1.0,
+        duration_ticks: 99,
+        sigma_multiplier: 2.7,
+        extreme_event_count_lifetime: 42,
+    };
+    let payload = encode_extreme_imbalance("mind", TrinitySide::Outer, &ev, 1.5);
+    let dec = decode_extreme_imbalance(&payload).unwrap();
+    assert_eq!(dec.src, "mind");
+    assert_eq!(dec.side, TrinitySide::Outer);
+    assert_eq!(dec.dominant_dim_idx, 7);
+    assert!((dec.polarity_sign - (-1.0)).abs() < 1e-5);
+    assert!((dec.sigma_multiplier - 2.7).abs() < 1e-5);
+    assert!((dec.ts - 1.5).abs() < 1e-3);
+}
+
+// G6.6-nudge-event-roundtrip: encode/decode preserves target + nudge.
+#[test]
+fn conformance_p0_6_c_corrective_nudge_roundtrip() {
+    use titan_trinity_daemon::{decode_corrective_nudge, encode_corrective_nudge, TrinitySide};
+    let payload = encode_corrective_nudge("body", TrinitySide::Inner, 4, -0.075, 0.075, 99.5);
+    let dec = decode_corrective_nudge(&payload).unwrap();
+    assert_eq!(dec.target_src, "body");
+    assert_eq!(dec.target_side, TrinitySide::Inner);
+    assert_eq!(dec.target_dim_idx, 4);
+    assert!((dec.nudge_value - (-0.075)).abs() < 1e-6);
+    assert!((dec.intensity - 0.075).abs() < 1e-6);
+}
+
+// G6.6-nudge-amplitude-formula: compute_nudge_amplitude respects all 3 factors.
+#[test]
+fn conformance_p0_6_c_nudge_amplitude_formula() {
+    // PLAN §6.6.4: nudge_amp = base_gain × excess × (1/max(0.1, chi))
+    //                         × (1 + atan(rate / rate_target_upper))
+    use titan_trinity_daemon::compute_nudge_amplitude;
+    let baseline = 0.1;
+    let threshold = 0.2;
+    // Floor at zero — no excess → no amp.
+    let zero = compute_nudge_amplitude(0.3, baseline, threshold, 1.0, 5.0, 50.0, 0.1);
+    assert!(zero.abs() < 1e-6, "zero excess → zero amp");
+    // Bigger excess → bigger amp.
+    let small = compute_nudge_amplitude(0.55, baseline, threshold, 1.0, 5.0, 50.0, 0.1);
+    let big = compute_nudge_amplitude(0.9, baseline, threshold, 1.0, 5.0, 50.0, 0.1);
+    assert!(big > small);
+    // Lower chi → bigger amp (metabolic factor 1/max(0.1, chi)).
+    let healthy = compute_nudge_amplitude(0.6, baseline, threshold, 1.0, 5.0, 50.0, 0.1);
+    let failing = compute_nudge_amplitude(0.6, baseline, threshold, 0.1, 5.0, 50.0, 0.1);
+    assert!(failing > healthy, "low chi → stronger correction");
+    // Higher rate → bigger amp (chronicity factor).
+    let fresh = compute_nudge_amplitude(0.6, baseline, threshold, 1.0, 0.0, 50.0, 0.1);
+    let chronic = compute_nudge_amplitude(0.6, baseline, threshold, 1.0, 100.0, 50.0, 0.1);
+    assert!(chronic > fresh, "chronic offender → escalating amp");
+}
+
+// G6.6-subscriptions: spirit + body/mind topic lists carry the new events.
+#[test]
+fn conformance_p0_6_c_topic_subscriptions_for_corrective_events() {
+    use titan_trinity_daemon::{
+        INNER_BODY_TOPICS, INNER_MIND_TOPICS, INNER_SPIRIT_TOPICS, OUTER_BODY_TOPICS,
+        OUTER_MIND_TOPICS, OUTER_SPIRIT_TOPICS,
+    };
+    // Spirit daemons subscribe to EXTREME_IMBALANCE_DETECTED.
+    assert!(INNER_SPIRIT_TOPICS.contains(&"EXTREME_IMBALANCE_DETECTED"));
+    assert!(OUTER_SPIRIT_TOPICS.contains(&"EXTREME_IMBALANCE_DETECTED"));
+    // Body/mind daemons subscribe to CORRECTIVE_NUDGE.
+    assert!(INNER_BODY_TOPICS.contains(&"CORRECTIVE_NUDGE"));
+    assert!(INNER_MIND_TOPICS.contains(&"CORRECTIVE_NUDGE"));
+    assert!(OUTER_BODY_TOPICS.contains(&"CORRECTIVE_NUDGE"));
+    assert!(OUTER_MIND_TOPICS.contains(&"CORRECTIVE_NUDGE"));
+}
+
+// G5.1-gift-mask-applied-by-kernel: BODY_FLAG_INNER * amp lands on correct dims.
+#[test]
+fn conformance_p0_5_gift_mask_applied_to_enrichment() {
+    // P0.5 / D-SPEC-131: when a spirit daemon receives a BODY_BALANCE_GIFT
+    // with amplitude `a`, the resulting enrichment vector has `UP_LEG_BONUS *
+    // a * BODY_FLAG_*[i]` on each dim. The §G5.2 integrator then propagates
+    // that enrichment into x[t]. Asserts the kernel composition is the
+    // same regardless of HOW the enrichment was constructed (the kernel
+    // doesn't know about masks — it only knows about additive enrichment).
+    //
+    // The integration tests in journey + gift_events + up_leg_masks lib tests
+    // assert the per-component correctness; this conformance test verifies the
+    // composition lands as designed at the kernel boundary.
+    use titan_trinity_daemon::{BODY_FLAG_INNER, MIND_FLAG_INNER};
+    const UP_LEG_AMP: f32 = 0.02;
+    const DIMS: usize = 45;
+    let body_amp = 0.5_f32;
+    let mind_amp = 0.4_f32;
+    let mut enrichment = [0.0_f32; DIMS];
+    for i in 0..DIMS {
+        enrichment[i] += UP_LEG_AMP * body_amp * BODY_FLAG_INNER[i];
+        enrichment[i] += UP_LEG_AMP * mind_amp * MIND_FLAG_INNER[i];
+    }
+    // Q dim (inner Q list includes 6): receives body only.
+    let q_dim = 6;
+    let expected_q = UP_LEG_AMP * body_amp * 1.0 + UP_LEG_AMP * mind_amp * 0.0;
+    assert!(
+        (enrichment[q_dim] - expected_q).abs() < 1e-6,
+        "Q dim {q_dim}: body-only enrichment {} (got {})",
+        expected_q,
+        enrichment[q_dim],
+    );
+    // L dim (inner L list includes 0): receives mind only.
+    let l_dim = 0;
+    let expected_l = UP_LEG_AMP * mind_amp * 1.0;
+    assert!(
+        (enrichment[l_dim] - expected_l).abs() < 1e-6,
+        "L dim {l_dim}: mind-only enrichment {} (got {})",
+        expected_l,
+        enrichment[l_dim],
+    );
+    // D dim (inner D list includes 1): receives both with 0.25/0.75 split.
+    let d_dim = 1;
+    let expected_d = UP_LEG_AMP * body_amp * 0.25 + UP_LEG_AMP * mind_amp * 0.75;
+    assert!(
+        (enrichment[d_dim] - expected_d).abs() < 1e-6,
+        "D dim {d_dim}: 0.25body + 0.75mind = {} (got {})",
+        expected_d,
+        enrichment[d_dim],
+    );
+    // Drive the §G5.2 kernel with this composed enrichment — output should
+    // move on classified dims (no flat zero for any classified position).
+    let cfg = RestoringCfg {
+        k_restore: 0.0,
+        k_damp: 0.0,
+        k_mom: 0.0,
+        k_dir: 0.0,
+        ..RestoringCfg::for_layer(Layer::Spirit)
+    };
+    let prev = vec![CENTRE; DIMS];
+    let prev2 = vec![CENTRE; DIMS];
+    let raw = vec![CENTRE; DIMS];
+    let obs = obs_of(1.0, 0.5, 0.0, 0.0, 0.0);
+    let x = stateful_update(&prev, &prev2, &raw, &enrichment, &obs, &cfg);
+    assert!(x[q_dim] > CENTRE);
+    assert!(x[l_dim] > CENTRE);
+    assert!(x[d_dim] > CENTRE);
+}
