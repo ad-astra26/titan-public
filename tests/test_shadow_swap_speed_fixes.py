@@ -177,14 +177,6 @@ def test_hibernate_ack_timeouts_tightened():
     assert max(sp.HIBERNATE_ACK_TIMEOUT_BY_LAYER.values()) == 10.0
 
 
-@pytest.mark.skip(reason=(
-    "POST-PHASE-C-STALE-TEST-HYGIENE (2026-05-26): SHADOW_BOOT_TIMEOUT "
-    "value drifted again post the 2026-04-27 retune (cf. D-SPEC-93 v1.32.0 "
-    "MODULE_SHUTDOWN pid-targeting under reload; D-SPEC-89 supervisor "
-    "protocol). Authoritative value lives in SPEC §12.A swap-unit timeouts. "
-    "Shadow infra verified working live (ran this session's deploys). "
-    "Re-enable after pinning to current SPEC §12.A constant."
-))
 def test_shadow_boot_timeout_retuned():
     """SHADOW_BOOT_TIMEOUT 60s → 45s (Bonus #7 + 2026-04-27 retune).
     Original Bonus #7 dropped 60→30, but swap #5 showed spirit+memory

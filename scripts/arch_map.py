@@ -2101,8 +2101,15 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
     ns1_resp = _unwrap(ns1_raw)
     trinity1_resp = _unwrap(trinity1_raw)
     ns1_transitions = ns1_resp.get("total_transitions", 0)
-    epoch1 = (trinity1_resp.get("unified_spirit", {}).get("epoch_count")
-              or trinity1_resp.get("pi_heartbeat", {}).get("total_epochs_observed", 0))
+    # B1 (rFP_arch_map_health_observability_closure): prefer
+    # `pi_heartbeat.total_epochs_observed` — live consciousness epoch counter
+    # co-published by cognitive_worker (D-SPEC-103 / D-SPEC-115 / v1.41.0+).
+    # The legacy `unified_spirit.epoch_count` reads `len(self._epochs)` on the
+    # API-side UnifiedSpirit instance, which on Phase C runs in a separate
+    # subprocess from the live cognitive_worker loop and goes stale (RFP §1:
+    # T2 stale at 619, T3 at 0 while live consciousness was ~879k).
+    epoch1 = (trinity1_resp.get("pi_heartbeat", {}).get("total_epochs_observed")
+              or trinity1_resp.get("unified_spirit", {}).get("epoch_count", 0))
 
     time.sleep(10)
 
@@ -2113,8 +2120,15 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
     trinity2_resp = _unwrap(trinity2_raw)
     ns2_transitions = ns2_resp.get("total_transitions", 0)
     last_train_ts = ns2_resp.get("last_train_ts", None)
-    epoch2 = (trinity2_resp.get("unified_spirit", {}).get("epoch_count")
-              or trinity2_resp.get("pi_heartbeat", {}).get("total_epochs_observed", 0))
+    epoch2 = (trinity2_resp.get("pi_heartbeat", {}).get("total_epochs_observed")
+              or trinity2_resp.get("unified_spirit", {}).get("epoch_count", 0))
+
+    # A1 (rFP_arch_map_health_observability_closure): D-SPEC-105 intentionally
+    # gates waking NS/IQL training off during dreams — so "idle" mid-dream is
+    # CORRECT, not a stall. Read `is_dreaming` from the same trinity payload
+    # (no extra fetch) and let the NS/IQL checks below report a paused-state
+    # OK instead of a false WARN.
+    _is_dreaming = bool(trinity2_resp.get("dreaming", {}).get("is_dreaming", False))
 
     ns_fetch_failed = ns1_raw is None or ns2_raw is None
     trinity_fetch_failed = trinity1_raw is None or trinity2_raw is None
@@ -2143,16 +2157,6 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
     # fetches transiently failed, or (b) the API snapshot cache TTL exceeded
     # the 10s window. last_train_ts is updated by the trainer on every step,
     # so age is the single source of truth.
-    #
-    # ARCH-MAP-HEALTH-OBSERVABILITY Class A (2026-05-26): dream-aware gate.
-    # Per D-SPEC-105 v1.43.0 (Dream-consolidation suite off-tick restoration),
-    # waking training is intentionally suspended while the Titan is dreaming.
-    # The "+0 in 10s" warn during dream cycles is a false alarm — propagate
-    # the dreaming state from trinity2_resp into a `_is_dreaming_now` flag
-    # and downgrade idle/cold warns to informative OK during dreams.
-    _is_dreaming_now = bool(
-        (trinity2_resp or {}).get("dreaming", {}).get("is_dreaming", False)
-    )
     if ns_fetch_failed:
         warn("NS training — /v4/nervous-system fetch failed (transient HTTP error — re-run check)")
     elif _ns_phase_c_shape:
@@ -2161,12 +2165,11 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
         _u_delta = _u2 - _u1
         if _u_delta > 0:
             ok(f"NS training active (Σtotal_updates {_u1:.0f} -> {_u2:.0f}, +{_u_delta:.0f} in 10s, Phase C shape)")
-        elif _u2 > 0 and _is_dreaming_now:
-            ok(f"NS training quiesced during dream (Σtotal_updates={_u2:.0f}; D-SPEC-105 suspends waking training)")
+        elif _is_dreaming and _u2 > 0:
+            # A1: D-SPEC-105 gates waking training off during dreams
+            ok(f"NS training paused (dreaming — expected per D-SPEC-105; Σtotal_updates={_u2:.0f})")
         elif _u2 > 0:
             warn(f"NS training idle (Σtotal_updates={_u2:.0f}, +0 in 10s — quiet period or stall)")
-        elif _is_dreaming_now:
-            ok(f"NS training cold but dreaming (Σtotal_updates=0; will resume on wake per D-SPEC-105)")
         else:
             warn(f"NS training cold (Σtotal_updates=0 across {len(ns2_resp.get('programs', {}))} programs)")
     elif ns2_transitions == 0 and last_train_ts in (None, 0, 0.0):
@@ -2218,12 +2221,9 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
         if pol_delta > 0 or chain_delta > 0:
             ok(f"IQL/reasoning advancing (chains={rsn2_chains} +{chain_delta}, "
                f"policy_updates={rsn2_pol} +{pol_delta} in 10s)")
-        elif rsn2_chains > 0 and _is_dreaming_now:
-            # ARCH-MAP-HEALTH-OBSERVABILITY Class A (2026-05-26): dream-aware
-            # gate per D-SPEC-105 v1.43.0 — waking IQL training intentionally
-            # suspended during dream consolidation, so a 0 delta is expected.
-            ok(f"IQL/reasoning quiesced during dream (chains={rsn2_chains}, "
-               f"policy_updates={rsn2_pol}; D-SPEC-105 suspends waking train)")
+        elif _is_dreaming and rsn2_chains > 0:
+            # A1: D-SPEC-105 gates waking training off during dreams
+            ok(f"IQL/reasoning paused (dreaming — expected per D-SPEC-105; chains={rsn2_chains}, policy_updates={rsn2_pol})")
         elif rsn2_chains > 0:
             # Have prior data, current delta=0. Could be quiet period (normal)
             # OR frozen (bug). Conservative: warn, not fail.
@@ -2673,18 +2673,11 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
             else:
                 ok(f"Nginx healthy ({_req_rate:.0f} req/min, {_err_rate:.1f}% errors, "
                    f"{_nginx_stats.get('unique_ips', 0)} unique IPs)")
+        elif _nginx_stats.get("nginx_absent"):
+            # A3: nginx not installed on this host (e.g. T2/T3) — not a fault.
+            ok("Nginx not applicable on this host (no log directory)")
         else:
-            # ARCH-MAP-HEALTH-OBSERVABILITY Class A (2026-05-26): degrade to
-            # OK with informative message. T2 + T3 hosts have no nginx
-            # (mainnet ingress is T1-only), so log_readable=False there is
-            # the EXPECTED state. On T1 the log is owned by `adm:adm` and
-            # is unreadable without sudo — same expected outcome under
-            # standard `arch_map` invocation. The original `warn` produced
-            # noise on every health run with no actionable signal. Per
-            # SPEC §6 (Repository directory roles / public vs internal) +
-            # `project_nginx_caching_ratelimit.md`, nginx is T1-only by
-            # design; absence elsewhere is canonical not anomalous.
-            ok("Nginx log not directly readable (expected — T2/T3 have no nginx; T1 log is adm-owned)")
+            warn("Nginx log not readable (check permissions)")
     except Exception as e:
         warn(f"Nginx health check failed ({e})")
 
@@ -2745,15 +2738,27 @@ def _check_nginx_health(log_path: str = "/var/log/nginx/access.log",
                         window_minutes: int = 5) -> dict:
     """Analyze recent nginx traffic for health check.
 
-    Returns dict with: log_readable, req_per_min, error_pct, upstream_errors, unique_ips.
+    Returns dict with: log_readable, nginx_absent, req_per_min, error_pct,
+    upstream_errors, unique_ips. `nginx_absent` is True when neither the log
+    file nor the /var/log/nginx directory exists on this host — meaning
+    nginx isn't installed (e.g. T2/T3 typically don't run it). The caller
+    should report this as OK/not-applicable rather than WARN.
     """
     import subprocess
     import time as _time
 
     result = {
-        "log_readable": False, "req_per_min": 0, "error_pct": 0,
-        "upstream_errors": 0, "unique_ips": 0,
+        "log_readable": False, "nginx_absent": False, "req_per_min": 0,
+        "error_pct": 0, "upstream_errors": 0, "unique_ips": 0,
     }
+
+    # A3 (rFP_arch_map_health_observability_closure): if neither the log file
+    # nor its parent /var/log/nginx directory exists, nginx isn't installed
+    # on this host. Skip with `nginx_absent=True` so the caller can emit a
+    # not-applicable INFO instead of a permission WARN.
+    if not os.path.exists(log_path) and not os.path.isdir(os.path.dirname(log_path)):
+        result["nginx_absent"] = True
+        return result
 
     # Read last N lines (enough for ~5 min window at 500 req/min = ~2500 lines)
     try:
@@ -3322,24 +3327,27 @@ def _check_arc(base_url: str, titan_id: str) -> dict:
 
     # Determine status
     if not result["active"]:
-        result["status"] = "warn"
-        result["details"] = "ARC inactive"
+        # A2 (rFP_arch_map_health_observability_closure): ARC is opt-in
+        # (CPU-bound; `[arc_agi_3].api_key` empty by default in titan_params).
+        # When there's no training history at all (no scorers, no games), the
+        # Titan never opted into ARC — surface as OK with an "opt-in" note,
+        # not WARN. If scorers exist (training WAS attempted) but `active`
+        # went False, that's a real regression and still warns.
+        if not scorers and not games:
+            result["status"] = "ok"
+            result["details"] = "ARC inactive (opt-in; no training history)"
+        else:
+            result["status"] = "warn"
+            result["details"] = (
+                f"ARC inactive but training history exists "
+                f"(scorers={len(scorers)}, games={len(games)})"
+            )
     elif result["total_games"] == 0:
         result["status"] = "warn"
         result["details"] = "ARC active but no game results"
     elif result["best_levels"] == 0 and total_updates > 100:
-        # ARCH-MAP-HEALTH-OBSERVABILITY Class A (2026-05-26): downgrade to OK
-        # when ARC is actively training but hasn't crossed the L1-WIN gate.
-        # The gate is tracked by OBS-arc-iter3-win (HIGH observable) — until
-        # that observable closes, "0 levels completed" is the EXPECTED state
-        # per COMPLETE-4-ARC-WIRING (LOW, GATED, DEFERRED_ITEMS.md). Raising
-        # this to a warn every health check has produced no actionable signal
-        # since 2026-04-19; the levels-completion fix is its own workstream.
-        result["status"] = "ok"
-        result["details"] = (
-            f"training (0 levels yet, {total_updates} scorer updates; "
-            f"gated by OBS-arc-iter3-win)"
-        )
+        result["status"] = "warn"
+        result["details"] = f"0 levels completed ({total_updates} scorer updates)"
     else:
         result["status"] = "ok"
         result["details"] = (
