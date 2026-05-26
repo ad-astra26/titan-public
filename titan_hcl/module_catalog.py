@@ -1663,15 +1663,13 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
 # ------------------------------------------------------------------
 
 
-# ── api_subprocess registration (from plugin._register_api_subprocess_module) ──
-    flag_on = config.get("microkernel", {}).get(
-        "api_process_separation_enabled", False)
-    if not flag_on:
-        logger.info(
-            "[TitanHCL] api_subprocess NOT registered "
-            "(microkernel.api_process_separation_enabled=False) — "
-            "legacy in-process uvicorn will start in Phase 5")
-        return
+# ── api_subprocess registration ──
+    # Phase 6 (D-SPEC-135 / v1.62.0): api is ALWAYS a separate Guardian-
+    # supervised process — there is no "in-process uvicorn" path anymore
+    # because there is no titan_hcl plugin process to host it in. The
+    # legacy `microkernel.api_process_separation_enabled` flag check is
+    # gone: under Phase 6, process separation is mandatory by SPEC
+    # §11.B.4 INV-PROC-4+5 (titan_hcl_api owns its own PID + crash domain).
 
     # Phase 6 (D-SPEC-135 / v1.62.0): api entry now lives in
     # titan_hcl/api/api_main.py:entry which sets setproctitle('titan_hcl_api')
