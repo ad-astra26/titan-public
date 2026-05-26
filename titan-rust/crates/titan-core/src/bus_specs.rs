@@ -300,6 +300,19 @@ pub static SPECS: phf::Map<&'static str, BusMsgSpec> = phf_map! {
         name: "MIND_BALANCE_GIFT", priority: Priority::P1, coalesce_by: None,
         ttl_ms: None, catalog: Catalog::FilterDownCascade,
     },
+    // ── §8.6.ter Trinity polarity-homeostat corrective events (PLAN §6.6 / P0.6-C / D-SPEC-132) ──
+    // body/mind → spirit on EXTREME_IMBALANCE_DETECTED; spirit → body/mind on
+    // CORRECTIVE_NUDGE. Fire rate target 1–50 events/day per part (allostatic
+    // self-regulated) so P1 with no coalesce. Sovereign-half filtering by
+    // payload `side` / `target_side`.
+    "EXTREME_IMBALANCE_DETECTED" => BusMsgSpec {
+        name: "EXTREME_IMBALANCE_DETECTED", priority: Priority::P1, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::FilterDownCascade,
+    },
+    "CORRECTIVE_NUDGE" => BusMsgSpec {
+        name: "CORRECTIVE_NUDGE", priority: Priority::P1, coalesce_by: None,
+        ttl_ms: None, catalog: Catalog::FilterDownCascade,
+    },
 
     // ── §8.7 Observatory (1, P3 drop-newest) ──
     "OBSERVATORY_EVENT" => BusMsgSpec {
@@ -507,7 +520,11 @@ pub static SPECS: phf::Map<&'static str, BusMsgSpec> = phf_map! {
 /// P0.5 / D-SPEC-131 (2026-05-26): 2 trinity UP-leg balance-gift event types
 /// (BODY_BALANCE_GIFT + MIND_BALANCE_GIFT) added to §8.6 FilterDownCascade
 /// catalog per PLAN §6.5. 83 + 2 = 85.
-pub const SPECS_COUNT_V0_1_0: usize = 45 + 5 + 8 + 25 + 2;
+///
+/// P0.6-C / D-SPEC-132 (2026-05-26): 2 trinity polarity-homeostat corrective
+/// events (EXTREME_IMBALANCE_DETECTED + CORRECTIVE_NUDGE) per PLAN §6.6.
+/// 85 + 2 = 87.
+pub const SPECS_COUNT_V0_1_0: usize = 45 + 5 + 8 + 25 + 2 + 2;
 
 /// Default spec for any message type not explicitly listed (per Python
 /// `bus_specs.DEFAULT_SPEC`). Canonical name `<default>`, priority P2,

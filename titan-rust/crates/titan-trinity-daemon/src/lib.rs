@@ -72,12 +72,14 @@ pub mod subscriptions;
 // unchanged. (The pre-D2 `jittered_tick` ticker was removed D-SPEC-100
 // as dead code — never wired into any daemon main loop.)
 
+pub mod corrective_events;
 pub mod focus_input;
 pub mod gift_events;
 pub mod homeostasis;
 pub mod journey;
 pub mod neuromod_read;
 pub mod observer_mask;
+pub mod polarity_homeostat;
 pub mod publish_throttle;
 pub mod pulse_watch;
 pub mod restoring_cfg;
@@ -137,6 +139,11 @@ pub use crate::subscriptions::{
 };
 
 // ── C-S6 re-exports (observer mask + sensor cache) ──
+pub use crate::corrective_events::{
+    compute_nudge_amplitude, decode_corrective_nudge, decode_extreme_imbalance,
+    encode_corrective_nudge, encode_extreme_imbalance, CorrectiveNudgeIn, ExtremeImbalanceIn,
+    CORRECTIVE_NUDGE_TOPIC, EXTREME_IMBALANCE_DETECTED_TOPIC,
+};
 pub use crate::gift_events::{
     decode_gift_at_spirit, decode_snapshots, encode_body_balance_gift, encode_mind_balance_gift,
     GiftAtSpiritIn, BODY_BALANCE_GIFT_TOPIC, MIND_BALANCE_GIFT_TOPIC,
@@ -148,6 +155,9 @@ pub use crate::journey::{
 pub use crate::observer_mask::{
     extract_outer_spirit_content, mask_observer_dims_in_place, observer_dims_are_zero,
     CONTENT_DIM_COUNT, OBSERVER_BYTE_END, OBSERVER_BYTE_START, OBSERVER_DIM_COUNT,
+};
+pub use crate::polarity_homeostat::{
+    ExtremeImbalanceEvent, PolarityHomeostat, PolarityHomeostatCfg, PolarityHomeostatTelemetry,
 };
 pub use crate::publish_throttle::PublishThrottle;
 pub use crate::pulse_watch::{BalancedPulseEdges, PulseClockRole, PulseEdges, PulseWatcher};

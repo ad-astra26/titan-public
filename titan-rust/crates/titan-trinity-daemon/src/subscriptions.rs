@@ -39,6 +39,10 @@ pub const INNER_BODY_TOPICS: &[&str] = &[
     // Phase 0 / 0E (D-SPEC-97 refinement): ground_up nudge is RECOMPUTED
     // once per kernel epoch (held + applied per Schumann tick), NOT per tick.
     "KERNEL_EPOCH_TICK",
+    // P0.6-C / D-SPEC-132: spirit publishes one-shot CORRECTIVE_NUDGE
+    // targeting this daemon when the polarity-homeostat fires; sovereign-half
+    // + part filtering happens at payload-decode time.
+    "CORRECTIVE_NUDGE",
 ];
 
 /// SPEC §9.A REQUIRED bus subscriptions for `titan-inner-mind-rs`.
@@ -49,6 +53,8 @@ pub const INNER_MIND_TOPICS: &[&str] = &[
     "TRINITY_SUBSTRATE_TOPOLOGY_UPDATED",
     // Phase 0 / 0E: ground_up nudge recomputed per kernel epoch.
     "KERNEL_EPOCH_TICK",
+    // P0.6-C / D-SPEC-132 — see body topics above.
+    "CORRECTIVE_NUDGE",
 ];
 
 /// SPEC §9.A REQUIRED bus subscriptions for `titan-inner-spirit-rs`.
@@ -67,6 +73,11 @@ pub const INNER_SPIRIT_TOPICS: &[&str] = &[
     // payload `side` at decode time (sovereign-half lock per PLAN §6.5.1).
     "BODY_BALANCE_GIFT",
     "MIND_BALANCE_GIFT",
+    // P0.6-C / D-SPEC-132: inner_body / inner_mind publish
+    // EXTREME_IMBALANCE_DETECTED on PolarityHomeostat fire. Inner-spirit
+    // computes nudge amplitude + publishes CORRECTIVE_NUDGE targeting the
+    // originating part.
+    "EXTREME_IMBALANCE_DETECTED",
 ];
 
 /// SPEC §9.A REQUIRED bus subscriptions for `titan-outer-body-rs`.
@@ -79,6 +90,8 @@ pub const OUTER_BODY_TOPICS: &[&str] = &[
     "TRINITY_SUBSTRATE_TOPOLOGY_UPDATED",
     // Phase 0 / 0E: ground_up nudge recomputed per kernel epoch.
     "KERNEL_EPOCH_TICK",
+    // P0.6-C / D-SPEC-132 — see INNER_BODY_TOPICS.
+    "CORRECTIVE_NUDGE",
 ];
 
 /// SPEC §9.A REQUIRED bus subscriptions for `titan-outer-mind-rs`.
@@ -89,6 +102,8 @@ pub const OUTER_MIND_TOPICS: &[&str] = &[
     "TRINITY_SUBSTRATE_TOPOLOGY_UPDATED",
     // Phase 0 / 0E: ground_up nudge recomputed per kernel epoch.
     "KERNEL_EPOCH_TICK",
+    // P0.6-C / D-SPEC-132 — see INNER_BODY_TOPICS.
+    "CORRECTIVE_NUDGE",
 ];
 
 /// SPEC §9.A REQUIRED bus subscriptions for `titan-outer-spirit-rs`.
@@ -101,6 +116,8 @@ pub const OUTER_SPIRIT_TOPICS: &[&str] = &[
     // P0.5 / D-SPEC-131 §G5.1 UP-leg gift — outer mirror (see inner above).
     "BODY_BALANCE_GIFT",
     "MIND_BALANCE_GIFT",
+    // P0.6-C / D-SPEC-132 — see INNER_SPIRIT_TOPICS.
+    "EXTREME_IMBALANCE_DETECTED",
 ];
 
 /// Connect a daemon to the main bus + subscribe to its REQUIRED topics
@@ -376,15 +393,15 @@ mod tests {
 
     #[test]
     fn topic_lists_match_spec_9a() {
-        // SPEC §9.A inner daemons: body / mind subscribe to 5; spirit to 5
-        // (the original 3 + BODY_BALANCE_GIFT + MIND_BALANCE_GIFT per
-        // P0.5 / D-SPEC-131 §G5.1 UP-leg gift).
-        assert_eq!(INNER_BODY_TOPICS.len(), 5);
-        assert_eq!(INNER_MIND_TOPICS.len(), 5);
-        assert_eq!(INNER_SPIRIT_TOPICS.len(), 5);
-        assert_eq!(OUTER_BODY_TOPICS.len(), 5);
-        assert_eq!(OUTER_MIND_TOPICS.len(), 5);
-        assert_eq!(OUTER_SPIRIT_TOPICS.len(), 5);
+        // P0.5 D-SPEC-131 + P0.6-C D-SPEC-132 expanded subscriptions:
+        // body / mind = 6 (was 5 + CORRECTIVE_NUDGE);
+        // spirit = 6 (was 5 + EXTREME_IMBALANCE_DETECTED).
+        assert_eq!(INNER_BODY_TOPICS.len(), 6);
+        assert_eq!(INNER_MIND_TOPICS.len(), 6);
+        assert_eq!(INNER_SPIRIT_TOPICS.len(), 6);
+        assert_eq!(OUTER_BODY_TOPICS.len(), 6);
+        assert_eq!(OUTER_MIND_TOPICS.len(), 6);
+        assert_eq!(OUTER_SPIRIT_TOPICS.len(), 6);
     }
 
     #[test]
