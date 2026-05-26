@@ -106,7 +106,7 @@ def test_bus_request_response():
 def test_guardian_register():
     """Guardian registers module specs."""
     from titan_hcl.bus import DivineBus
-    from titan_hcl.guardian import Guardian, ModuleSpec
+    from titan_hcl.guardian_hcl import Guardian, ModuleSpec
 
     bus = DivineBus()
     g = Guardian(bus)
@@ -119,7 +119,7 @@ def test_guardian_register():
 def test_guardian_start_stop():
     """Guardian starts and stops a module process."""
     from titan_hcl.bus import DivineBus
-    from titan_hcl.guardian import Guardian, ModuleSpec, ModuleState
+    from titan_hcl.guardian_hcl import Guardian, ModuleSpec, ModuleState
 
     bus = DivineBus(multiprocess=True)
     g = Guardian(bus)
@@ -143,7 +143,7 @@ def test_guardian_start_stop():
 def test_guardian_status():
     """Guardian.get_status() returns module info."""
     from titan_hcl.bus import DivineBus
-    from titan_hcl.guardian import Guardian, ModuleSpec
+    from titan_hcl.guardian_hcl import Guardian, ModuleSpec
 
     bus = DivineBus()
     g = Guardian(bus)
@@ -212,7 +212,7 @@ def _echo_worker(recv_queue, send_queue, name, config):
 def test_cross_process_ipc():
     """Test full cross-process IPC: Core → Bus → Worker → SendQueue → Bus → reply."""
     from titan_hcl.bus import DivineBus
-    from titan_hcl.guardian import Guardian, ModuleSpec, ModuleState
+    from titan_hcl.guardian_hcl import Guardian, ModuleSpec, ModuleState
 
     bus = DivineBus(multiprocess=True)
     g = Guardian(bus)
@@ -269,7 +269,7 @@ def test_cross_process_ipc():
 def test_guardian_drain_send_queues():
     """Guardian.drain_send_queues routes worker messages to bus."""
     from titan_hcl.bus import DivineBus
-    from titan_hcl.guardian import Guardian, ModuleSpec
+    from titan_hcl.guardian_hcl import Guardian, ModuleSpec
 
     bus = DivineBus(multiprocess=True)
     g = Guardian(bus)
@@ -411,7 +411,7 @@ def test_proxy_creation():
     bus; SpiritProxy was removed entirely). The bus-subscribing proxies are
     memory/rl/llm — those are what this test wires + asserts."""
     from titan_hcl.bus import DivineBus
-    from titan_hcl.guardian import Guardian
+    from titan_hcl.guardian_hcl import Guardian
     from titan_hcl.proxies.memory_proxy import MemoryProxy
     from titan_hcl.proxies.rl_proxy import RLProxy
     from titan_hcl.proxies.llm_proxy import LLMProxy
@@ -432,7 +432,7 @@ def test_proxy_creation():
 def test_mind_proxy_routes_to_worker():
     """MindProxy sends QUERY via bus, worker echoes back."""
     from titan_hcl.bus import DivineBus
-    from titan_hcl.guardian import Guardian, ModuleSpec, ModuleState
+    from titan_hcl.guardian_hcl import Guardian, ModuleSpec, ModuleState
 
     bus = DivineBus(multiprocess=True)
     guardian = Guardian(bus)
@@ -477,7 +477,7 @@ def test_mind_proxy_routes_to_worker():
 def test_body_proxy_routes_to_worker():
     """BodyProxy sends QUERY via bus, worker returns tensor."""
     from titan_hcl.bus import DivineBus
-    from titan_hcl.guardian import Guardian, ModuleSpec
+    from titan_hcl.guardian_hcl import Guardian, ModuleSpec
 
     bus = DivineBus(multiprocess=True)
     guardian = Guardian(bus)

@@ -49,7 +49,7 @@ from titan_hcl.core.shadow_orchestrator import (
     SwapResult,
     _phase_b2_1_wait_adoption,
 )
-from titan_hcl.guardian import Guardian, ModuleSpec, ModuleState
+from titan_hcl.guardian_hcl import Guardian, ModuleSpec, ModuleState
 
 
 def _noop_entry(*args, **kwargs):  # pragma: no cover

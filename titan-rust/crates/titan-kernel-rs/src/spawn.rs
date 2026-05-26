@@ -1,10 +1,15 @@
-//! spawn — Spawn `titan-trinity-rs` + `python -m titan_hcl` per SPEC §10.A
-//! B8 + B9. Sets all canonical env vars per §3 D18 + §5.
+//! spawn — Spawn `titan-trinity-rs` + `python -u scripts/guardian_hcl.py`
+//! per SPEC §10.A B8 + §11.B.4 INV-PROC-3. Sets all canonical env vars
+//! per §3 D18 + §5.
 //!
 //! C-S2 shipped the spawn pathway against `titan-trinity-rs-placeholder`;
 //! C-S3 chunk C3-3 renamed the placeholder to `titan-trinity-rs` and filled in
-//! the real substrate body. Python child is optional — controlled by
-//! [`SpawnConfig::spawn_python_main`].
+//! the real substrate body. Phase 6 (D-SPEC-135 / v1.62.0) renamed the
+//! Python child entry from `scripts/titan_hcl.py --server` to
+//! `scripts/guardian_hcl.py` — kernel-rs now spawns the L1 supervisor
+//! (guardian_hcl) which in turn supervises L2 (titan_hcl) + L3
+//! (titan_hcl_api) via the module catalog (INV-PROC-3). The field
+//! [`SpawnConfig::spawn_guardian_hcl`] gates this child.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -49,12 +54,14 @@ pub struct SpawnConfig {
     /// Path to `titan-trinity-rs` binary (renamed from
     /// `titan-trinity-rs-placeholder` in C-S3 chunk C3-3).
     pub substrate_binary: PathBuf,
-    /// Path to Python executable (for `python -m titan_hcl`).
+    /// Path to Python executable (for `python -u scripts/guardian_hcl.py`).
     pub python_executable: Option<PathBuf>,
-    /// CWD for Python child (where `titan_hcl/` lives).
+    /// CWD for Python child (where `scripts/guardian_hcl.py` lives).
     pub python_cwd: Option<PathBuf>,
-    /// `false` = skip spawning Python (used by tests).
-    pub spawn_python_main: bool,
+    /// `false` = skip spawning the L1 supervisor (used by tests).
+    /// Phase 6 / D-SPEC-135: gates `scripts/guardian_hcl.py` (was
+    /// `spawn_python_main` gating `scripts/titan_hcl.py --server`).
+    pub spawn_guardian_hcl: bool,
 }
 
 impl SpawnConfig {
@@ -124,7 +131,10 @@ impl SpawnConfig {
 pub struct SpawnedChildren {
     /// Substrate (placeholder in C-S2; real titan-trinity-rs in C-S3).
     pub substrate: Mutex<Option<Child>>,
-    /// Python `titan_hcl` (optional; when `spawn_python_main=true`).
+    /// Python L1 supervisor `guardian_hcl` (optional; when
+    /// `spawn_guardian_hcl=true`). Phase 6 / D-SPEC-135 / v1.62.0 — was
+    /// `python_main` gating `titan_hcl.py --server`. Field name retained
+    /// for binary-on-disk handle compatibility.
     pub python_main: Mutex<Option<Child>>,
 }
 
@@ -179,10 +189,17 @@ pub fn spawn_substrate(config: &SpawnConfig) -> Result<Child, SpawnError> {
     })
 }
 
-/// Spawn `python -m titan_hcl` per SPEC §10.A B9. Returns `Ok(None)` if
-/// `spawn_python_main=false` (tests).
-pub fn spawn_python_main(config: &SpawnConfig) -> Result<Option<Child>, SpawnError> {
-    if !config.spawn_python_main {
+/// Spawn `python -u scripts/guardian_hcl.py` per SPEC §11.B.4 INV-PROC-3
+/// (Phase 6 / D-SPEC-135 / v1.62.0). Returns `Ok(None)` if
+/// `spawn_guardian_hcl=false` (tests).
+///
+/// Pre-Phase-6 kernel-rs spawned `titan_hcl.py --server` directly. Phase 6
+/// inserts `guardian_hcl` as the L1 supervisor between kernel-rs (L0) and
+/// titan_hcl (L2). guardian_hcl in turn spawns titan_hcl and titan_hcl_api
+/// as Guardian-supervised module children — see
+/// `titan_hcl/module_catalog.py:build_catalog`.
+pub fn spawn_guardian_hcl(config: &SpawnConfig) -> Result<Option<Child>, SpawnError> {
+    if !config.spawn_guardian_hcl {
         return Ok(None);
     }
     let python = config
@@ -200,7 +217,7 @@ pub fn spawn_python_main(config: &SpawnConfig) -> Result<Option<Child>, SpawnErr
         .as_ref()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let mut env = config.build_child_env("titan_HCL");
+    let mut env = config.build_child_env("guardian_hcl");
     // Phase C C-S7 (2026-05-05): forward a small set of parent env vars
     // Python needs to function. PATH for subprocess() finding bash/cargo/etc;
     // HOME for ~/.config/* lookups (Solana CLI fallback paths, ~/.cache for
@@ -215,17 +232,15 @@ pub fn spawn_python_main(config: &SpawnConfig) -> Result<Option<Child>, SpawnErr
     }
 
     let mut cmd = Command::new(python);
-    // Phase C C-S7 (2026-05-05): invoke as a script (`python -u
-    // scripts/titan_hcl.py --server`) to match the legacy boot path
-    // (t3_manage.sh / titan_watchdog.sh). `-u` = unbuffered stdout/stderr
-    // so journald + tee'd log file receive lines as they're written.
-    // `--server` = non-interactive mode (no stdin prompt). Path-based
-    // invocation avoids the PYTHONPATH coordination needed for the
-    // module form (`-m titan_hcl` requires `titan_hcl` to be on
-    // sys.path).
+    // Phase 6 (D-SPEC-135 / v1.62.0): kernel-rs spawns the L1 supervisor
+    // (`scripts/guardian_hcl.py`) per SPEC §11.B.4 INV-PROC-3. guardian_hcl
+    // boots BEFORE titan_hcl and titan_hcl_api and spawns both as
+    // Guardian-supervised module children. No `--server` flag —
+    // guardian_hcl is non-interactive by default. `-u` = unbuffered
+    // stdout/stderr so journald + tee'd log files receive lines as they're
+    // written. Path-based invocation avoids PYTHONPATH coordination.
     cmd.arg("-u")
-        .arg("scripts/titan_hcl.py")
-        .arg("--server")
+        .arg("scripts/guardian_hcl.py")
         .current_dir(&cwd)
         .env_clear()
         .envs(env)
@@ -235,11 +250,11 @@ pub fn spawn_python_main(config: &SpawnConfig) -> Result<Option<Child>, SpawnErr
         python = ?python,
         cwd = ?cwd,
         titan_id = %config.titan_id,
-        "kernel: spawning python -u scripts/titan_hcl.py --server per SPEC §10.A B9"
+        "kernel: spawning python -u scripts/guardian_hcl.py per Phase 6 §11.B.4 INV-PROC-3 (D-SPEC-135 / v1.62.0)"
     );
 
     let child = cmd.spawn().map_err(|source| {
-        warn!(err = ?source, "python_main spawn failed");
+        warn!(err = ?source, "guardian_hcl spawn failed");
         SpawnError::SpawnFailed {
             binary: python.to_string_lossy().into_owned(),
             source,
@@ -265,7 +280,7 @@ mod tests {
             substrate_binary: PathBuf::from("/nonexistent/binary"),
             python_executable: None,
             python_cwd: None,
-            spawn_python_main: false,
+            spawn_guardian_hcl: false,
         }
     }
 
@@ -301,9 +316,9 @@ mod tests {
     }
 
     #[test]
-    fn spawn_python_main_returns_none_when_disabled() {
+    fn spawn_guardian_hcl_returns_none_when_disabled() {
         let cfg = test_config();
-        let result = spawn_python_main(&cfg).unwrap();
+        let result = spawn_guardian_hcl(&cfg).unwrap();
         assert!(result.is_none());
     }
 }

@@ -39,7 +39,7 @@ from ..core.state_registry import (
     ensure_shm_root,
     resolve_titan_id,
 )
-from ..guardian import Guardian
+from ..guardian_hcl import Guardian
 from ..logic.session4_state_specs import MIND_STATE_SLOT, MIND_STATE_SPEC
 
 logger = logging.getLogger(__name__)

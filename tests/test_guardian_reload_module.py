@@ -35,7 +35,7 @@ from titan_hcl.bus import (
     MODULE_RELOAD_REQUEST,
     make_msg,
 )
-from titan_hcl.guardian import (
+from titan_hcl.guardian_hcl import (
     Guardian,
     ModuleInfo,
     ModuleSpec,
@@ -421,7 +421,7 @@ def test_reload_step6_module_shutdown_includes_target_pid_and_swap_id():
     receive the shutdown intended for OLD → Guardian's restart:
     died_exitcode_0 cascade.
     """
-    from titan_hcl.guardian import Guardian
+    from titan_hcl.guardian_hcl import Guardian
     import inspect
     src = inspect.getsource(Guardian._reload_module_sync)
     # The Step 6 publish must include both fields explicitly.
@@ -454,7 +454,7 @@ def test_reload_step8_finalizes_state_running_after_module_ready():
     sentinel "state finalized RUNNING" log line, which is uniquely
     produced by this finalization path.
     """
-    from titan_hcl.guardian import Guardian
+    from titan_hcl.guardian_hcl import Guardian
     import inspect
     src = inspect.getsource(Guardian._reload_module_sync)
     assert "state finalized RUNNING" in src, (
