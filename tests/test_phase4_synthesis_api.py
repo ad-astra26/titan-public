@@ -1,14 +1,16 @@
-"""Phase 4 — Observatory /v6/synthesis/concepts/* handler tests (§P4.I).
+"""Phase 4 — Observatory /v6/synthesis/concepts/* handler tests (§P4.I + FU-1).
 
 Covers `titan_hcl/api/synthesis_concept_handlers.py`:
 - list endpoint: pagination, memory_type filter, ordering by groundedness DESC
 - get-one endpoint: returns all versions + composition edges
 - heatmap endpoint: 4x10 grid bucketed by (memory_type, groundedness decile)
-- soft-fail: missing Kuzu file → empty response with kuzu="missing"
+- soft-fail: missing snapshot → empty response with snapshot="missing"
 
-Each test sets up a real Kuzu graph in tmp dir + seeds spine concepts via
-ConceptStore, then opens the handler read-only against the same path. This
-exercises the production read-only cross-process pattern.
+FU-1 swapped the read source from direct Kuzu to data/spine_snapshot.json
+(written by synthesis_worker each 60s tick). Tests build the spine via
+ConceptStore in a tmp dir, call concept_store.export_snapshot() to write
+the JSON, then close the Kuzu writer and exercise the handlers (which read
+the JSON only — no Kuzu open).
 """
 from __future__ import annotations
 
@@ -56,10 +58,12 @@ def seeded_kuzu(monkeypatch):
         )
         store.bump_version("linux_terminal")  # produces v=2
 
-        # IMPORTANT: close the writer handle before opening the read-only
-        # handle in the handlers. Kuzu 0.11 supports concurrent read-only
-        # with an active writer ONLY across processes, not within the same
-        # process. Tests model the cross-process case by closing first.
+        # FU-1: export the spine to JSON snapshot at the canonical path
+        # the handlers will look for (data_dir/spine_snapshot.json under
+        # TITAN_DATA_DIR=tmp). Close Kuzu writer; handlers read only the
+        # JSON.
+        snapshot_path = os.path.join(tmp, "spine_snapshot.json")
+        store.export_snapshot(snapshot_path)
         g.close()
 
         try:
@@ -177,23 +181,74 @@ def test_heatmap_solana_rpc_lands_in_mid_decile(seeded_kuzu):
 # ── Soft-fail paths ─────────────────────────────────────────────────
 
 
-def test_missing_kuzu_returns_empty_response(monkeypatch):
-    """No Kuzu file → handler returns ok=True with empty list (the
-    frontend renders an empty state, not an error toast)."""
+def test_missing_snapshot_returns_empty_response(monkeypatch):
+    """No spine snapshot file → handler returns ok=True with empty list
+    (the frontend renders an empty state, not an error toast)."""
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setenv("TITAN_DATA_DIR", tmp)
         handlers._reset_cache_for_tests()
         resp = handlers.get_synthesis_concepts()
         assert resp["ok"] is True
         assert resp["concepts"] == []
-        assert resp.get("kuzu") == "missing"
+        assert resp.get("snapshot") == "missing"
 
         resp2 = handlers.get_synthesis_concept("anything")
         assert resp2["ok"] is True
         assert resp2["versions"] == []
+        assert resp2.get("snapshot") == "missing"
 
         resp3 = handlers.get_synthesis_concepts_heatmap()
         assert resp3["ok"] is True
+        assert resp3.get("snapshot") == "missing"
         # Empty heatmap = all zeros.
         for row in resp3["heatmap"].values():
             assert row == [0] * 10
+
+
+def test_stale_snapshot_returns_data_with_stale_flag(monkeypatch):
+    """Snapshot present but mtime > SNAPSHOT_STALENESS_SECONDS old →
+    payload still returned, with snapshot="stale" so callers can decide
+    how to react (UI can show a warning ribbon)."""
+    import json
+    import os
+    import time
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setenv("TITAN_DATA_DIR", tmp)
+        handlers._reset_cache_for_tests()
+        snap_path = os.path.join(tmp, "spine_snapshot.json")
+        with open(snap_path, "w") as f:
+            json.dump({
+                "version": 1, "exported_at": 0.0,
+                "concepts": [{"concept_id": "x", "version": 1,
+                              "name": "X", "memory_type": "declarative",
+                              "groundedness": 0.5, "anchor_tx": "tx",
+                              "created_at": 100.0}],
+                "composition_edges": {"from": [], "into": []},
+            }, f)
+        # Force mtime well past the staleness threshold.
+        old = time.time() - (handlers.SNAPSHOT_STALENESS_SECONDS + 60)
+        os.utime(snap_path, (old, old))
+
+        resp = handlers.get_synthesis_concepts()
+        assert resp["ok"] is True
+        assert resp["snapshot"] == "stale"
+        # Data still returned (UI can choose to render with a warning).
+        assert len(resp["concepts"]) == 1
+
+
+def test_corrupt_snapshot_returns_empty_response(monkeypatch):
+    """Snapshot file exists but is unparseable → ok=True with empty list
+    and snapshot="corrupt" so the frontend can render an empty state."""
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setenv("TITAN_DATA_DIR", tmp)
+        handlers._reset_cache_for_tests()
+        snap_path = os.path.join(tmp, "spine_snapshot.json")
+        with open(snap_path, "w") as f:
+            f.write("{not valid json")
+        resp = handlers.get_synthesis_concepts()
+        assert resp["ok"] is True
+        assert resp["concepts"] == []
+        assert resp["snapshot"] == "corrupt"

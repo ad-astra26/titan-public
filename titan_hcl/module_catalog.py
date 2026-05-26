@@ -875,17 +875,8 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         name="journey_persistence",
         layer="L2",
         entry_fn=journey_persistence_worker_main,
-        # Phase 6 / D-SPEC-135 sizing correction (2026-05-26): the original
-        # P0.5/P0.6-C ModuleSpec set rss_limit_mb=60 but live evidence on
-        # T2 + T3 fleet boots showed actual VmRSS at boot = 73 MB (Python
-        # 3.12 interpreter + sqlite3 + msgpack + asyncio import baseline is
-        # ~55-65 MB on its own; worker logic + IMW client + buffer push it
-        # to 70-80 MB). 60 MB caused boot-loop kills → /health DEGRADED.
-        # 150 MB matches realistic baseline + ~2× headroom for SQLite page
-        # cache + journal-replay temporaries. Per `feedback_no_rss_band_aid_understand_root_cause`
-        # the limit reflects ACTUAL observed memory, not a guess.
         config=_journey_cfg,
-        rss_limit_mb=150,
+        rss_limit_mb=60,
         autostart=True,
         lazy=False,
         heartbeat_timeout=60.0,
@@ -913,9 +904,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         layer="L2",
         entry_fn=corrective_events_persistence_worker_main,
         config=_journey_cfg,  # same consciousness_db path + info_banner
-        # Phase 6 / D-SPEC-135 sizing correction (2026-05-26): see
-        # journey_persistence rationale above — same Python+sqlite baseline.
-        rss_limit_mb=150,
+        rss_limit_mb=60,
         autostart=True,
         lazy=False,
         heartbeat_timeout=60.0,

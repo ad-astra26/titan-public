@@ -452,6 +452,114 @@ class ConceptStore:
                 )
         return n
 
+    # ── Snapshot export (cross-process read surface — FU-1) ──────────
+
+    def export_snapshot(self, snapshot_path: str) -> int:
+        """Atomic JSON export of the full spine state for cross-process
+        readers. Mirrors the standing_store + activation_snapshot pattern:
+        synthesis_worker is the sole writer (G21); cross-process consumers
+        (api process for `/v6/synthesis/concepts/*`) read this JSON
+        snapshot — the same Kuzu file CANNOT be opened read-only against
+        an active RW writer in Kuzu 0.11 (read_only=True still acquires
+        the exclusive lock), so the snapshot pattern is the canonical
+        cross-process read surface.
+
+        Schema:
+            {
+              "version": 1,
+              "exported_at": <wall-clock seconds>,
+              "concepts": [
+                {concept_id, version, name, memory_type, groundedness,
+                 anchor_tx, created_at},
+                ...
+              ],  # ALL versions of every concept (sorted concept_id asc, version asc)
+              "composition_edges": {
+                "from": [[(from_id, from_ver), (to_id, to_ver)], ...],
+                "into": [[(from_id, from_ver), (to_id, to_ver)], ...]
+              }
+            }
+
+        Atomic write via tmp + os.replace. Returns the total concept-row
+        count in the snapshot (NOT the latest-version count — full
+        history). Empty graph → returns 0 and writes a minimal payload
+        so the api endpoint can distinguish "spine empty" from "snapshot
+        missing".
+        """
+        concepts: list[dict] = []
+        try:
+            qr = self._graph._conn.execute(
+                "MATCH (c:Concept) "
+                "RETURN c.concept_id, c.version, c.name, c.memory_type, "
+                "c.groundedness, c.anchor_tx, c.created_at"
+            )
+            while qr.has_next():
+                row = qr.get_next()
+                concepts.append({
+                    "concept_id": row[0],
+                    "version": int(row[1]),
+                    "name": row[2],
+                    "memory_type": row[3],
+                    "groundedness": float(row[4]),
+                    "anchor_tx": row[5],
+                    "created_at": float(row[6]),
+                })
+        except Exception as e:
+            logger.warning(
+                "[ConceptStore] export_snapshot: concept fetch failed: %s", e,
+            )
+
+        concepts.sort(key=lambda r: (r["concept_id"], r["version"]))
+
+        edges_from: list[list[list]] = []
+        edges_into: list[list[list]] = []
+        for rel, bucket in (("COMPOSED_FROM", edges_from),
+                            ("COMPOSED_INTO", edges_into)):
+            try:
+                qr = self._graph._conn.execute(
+                    f"MATCH (a:Concept)-[:{rel}]->(b:Concept) "
+                    f"RETURN a.concept_id, a.version, b.concept_id, b.version"
+                )
+                while qr.has_next():
+                    row = qr.get_next()
+                    bucket.append([
+                        [row[0], int(row[1])],
+                        [row[2], int(row[3])],
+                    ])
+            except Exception as e:
+                logger.debug(
+                    "[ConceptStore] export_snapshot: %s edge fetch failed: %s",
+                    rel, e,
+                )
+
+        payload = {
+            "version": 1,
+            "exported_at": self._clock(),
+            "concepts": concepts,
+            "composition_edges": {
+                "from": edges_from,
+                "into": edges_into,
+            },
+        }
+
+        import json
+        import os
+        os.makedirs(os.path.dirname(snapshot_path) or ".", exist_ok=True)
+        tmp_path = snapshot_path + ".tmp"
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(payload, f, separators=(",", ":"))
+            os.replace(tmp_path, snapshot_path)
+        except Exception as e:
+            logger.warning(
+                "[ConceptStore] export_snapshot atomic write failed: %s", e,
+            )
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return 0
+        return len(concepts)
+
     # ── Internal helpers ─────────────────────────────────────
 
     def _maintain_composition_edges(

@@ -133,6 +133,14 @@ SYNTH_STATUS_PAYLOAD_BYTES = 24             # struct '<ddII'
 # write-tmp + os.replace.
 ACTIVATION_SNAPSHOT_NAME = "activation_snapshot.json"
 
+# Phase 4 FU-1 — concept-spine cross-process read surface. synthesis_worker
+# exports the full Kuzu spine state to JSON each 60s recompute pass; the api
+# process reads this snapshot (NOT the Kuzu file directly) per the same
+# pattern as ACTIVATION_SNAPSHOT_NAME + BUNDLE_SNAPSHOT_NAME. Kuzu 0.11's
+# read_only=True still acquires the exclusive write lock — cross-process
+# reads MUST go through this snapshot.
+SPINE_SNAPSHOT_NAME = "spine_snapshot.json"
+
 # Phase 1 plug-registry container — instantiated empty; concrete plugs land
 # per phase per arch §3.3.
 _PLUG_KINDS = ("substrate", "truth_oracle", "meaning_oracle", "proof", "tool")
@@ -430,6 +438,7 @@ def _recompute_loop(store: "ActivationStore",
                     status_writer: "SynthStatusWriter",
                     snapshot_path: str,
                     bundle_snapshot_path: str,
+                    spine_exporter_holder: dict,
                     send_queue, name: str,
                     interval_s: float,
                     stop_event: threading.Event,
@@ -462,6 +471,17 @@ def _recompute_loop(store: "ActivationStore",
             # cache_lock (and shouldn't, since maintain() is a separate
             # write path with shorter critical section).
             bundles_exported = bundle_store.export_snapshot(bundle_snapshot_path)
+            # Phase 4 FU-1 — spine snapshot for cross-process api reads.
+            # Holder pattern: synthesis_worker_main sets the exporter to
+            # ConceptStore.export_snapshot AFTER kuzu_graph_obj is wired;
+            # default no-op until that completes.
+            try:
+                spine_exporter_holder["fn"]()
+            except Exception as _spine_exp_err:
+                logger.debug(
+                    "[synthesis_worker] spine_exporter call failed: %s",
+                    _spine_exp_err,
+                )
             status_writer.publish(
                 last_consistent_event_ts=now,
                 last_recompute_ts=now,
@@ -551,6 +571,9 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         os.path.dirname(db_path) or ".", ACTIVATION_SNAPSHOT_NAME)
     bundle_snapshot_path = os.path.join(
         os.path.dirname(db_path) or ".", BUNDLE_SNAPSHOT_NAME)
+    # Phase 4 FU-1 — Kuzu Concept-spine cross-process read surface.
+    spine_snapshot_path = os.path.join(
+        os.path.dirname(db_path) or ".", SPINE_SNAPSHOT_NAME)
 
     # Lock around the in-mem activation cache for the recv-loop ↔
     # recompute-loop interleave. record_access is cheap; the lock holds
@@ -565,10 +588,16 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         daemon=True, name=f"synthesis-hb-{name}")
     hb_thread.start()
 
+    # Phase 4 FU-1 — spine exporter holder (late-bound). Default is a
+    # no-op so the recompute loop fires safely before the ConceptStore is
+    # ready. The consolidation wiring below sets the real exporter.
+    spine_exporter_holder: dict = {"fn": lambda: None}
+
     rc_thread = threading.Thread(
         target=_recompute_loop,
         args=(store, bundle_store, status_writer, snapshot_path,
-              bundle_snapshot_path, send_queue, name,
+              bundle_snapshot_path, spine_exporter_holder,
+              send_queue, name,
               interval_s, stop_event, cache_lock),
         daemon=True, name=f"synthesis-recompute-{name}")
     rc_thread.start()
@@ -668,6 +697,11 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # the proposer returns all-reject (pass still mines + anchors summary
     # TXs for audit; spine writes simply don't happen until provider lands).
     consolidation_pass: Optional[Any] = None
+    # Phase 4 FU-1 — the ConceptStore instance is hoisted into the outer
+    # scope so the recompute loop can call concept_store.export_snapshot()
+    # each 60s tick regardless of whether ConsolidationPass construction
+    # succeeded. Stays None if kuzu_graph_obj is unavailable.
+    concept_store: Optional[Any] = None
     last_dream_pass_started_ts: float = 0.0
     consolidation_thread_lock = threading.Lock()
     try:
@@ -700,6 +734,29 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             registry_path=os.path.join("data", "synthesis_spine_concepts.json"),
         )
         concept_store = ConceptStore(kuzu_graph, writer)
+
+        # Phase 4 FU-1 — wire the spine_exporter so the recompute loop's
+        # next 60s tick starts writing data/spine_snapshot.json. The api
+        # process reads this JSON (NOT Kuzu directly — Kuzu 0.11 holds
+        # the exclusive lock even for read_only=True opens).
+        spine_exporter_holder["fn"] = (
+            lambda: concept_store.export_snapshot(spine_snapshot_path)
+        )
+        # Initial export so the snapshot is non-empty + present before
+        # the first 60s tick (api process gets data immediately on first
+        # poll after worker boot).
+        try:
+            initial_n = concept_store.export_snapshot(spine_snapshot_path)
+            logger.info(
+                "[synthesis_worker] initial spine snapshot exported "
+                "(%d concept rows) → %s",
+                initial_n, spine_snapshot_path,
+            )
+        except Exception as _initial_exp_err:
+            logger.warning(
+                "[synthesis_worker] initial spine snapshot failed: %s",
+                _initial_exp_err,
+            )
 
         # LLM provider — best-effort. Falls back to all-reject proposer
         # when the inference module isn't importable / configured.

@@ -341,6 +341,61 @@ def test_recompute_groundedness_batch_handles_partial_failures(graph, store):
 # ── Sole-writer contract ────────────────────────────────────────────
 
 
+def test_export_snapshot_writes_atomic_json(graph, store):
+    """FU-1: ConceptStore.export_snapshot writes a valid JSON snapshot
+    with the documented schema (version + exported_at + concepts +
+    composition_edges)."""
+    import json
+    import os
+    import tempfile
+
+    store.create_concept("a", "A", memory_type="declarative")
+    store.create_concept(
+        "b", "B", memory_type="declarative",
+        composed_from=[("a", 1)],
+    )
+    store.bump_version("b")  # B v=2
+
+    with tempfile.TemporaryDirectory() as tmp:
+        snap_path = os.path.join(tmp, "spine.json")
+        n = store.export_snapshot(snap_path)
+        assert n == 3  # a/v1, b/v1, b/v2
+
+        with open(snap_path) as f:
+            data = json.load(f)
+        assert data["version"] == 1
+        assert "exported_at" in data
+        concept_ids = sorted({c["concept_id"] for c in data["concepts"]})
+        assert concept_ids == ["a", "b"]
+        b_versions = sorted(
+            c["version"] for c in data["concepts"]
+            if c["concept_id"] == "b"
+        )
+        assert b_versions == [1, 2]
+        edges_from = data["composition_edges"]["from"]
+        edges_into = data["composition_edges"]["into"]
+        assert [["b", 1], ["a", 1]] in edges_from
+        assert [["a", 1], ["b", 1]] in edges_into
+
+
+def test_export_snapshot_empty_spine_returns_zero(graph, store):
+    """Brand-new spine → exports 0 concepts but still writes a valid
+    JSON file (frontend can distinguish 'empty spine' from 'missing
+    snapshot')."""
+    import json
+    import os
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        snap_path = os.path.join(tmp, "spine.json")
+        n = store.export_snapshot(snap_path)
+        assert n == 0
+        with open(snap_path) as f:
+            data = json.load(f)
+        assert data["concepts"] == []
+        assert data["composition_edges"] == {"from": [], "into": []}
+
+
 def test_writer_called_once_per_create_or_bump(graph):
     """Sanity: exactly one outer_memory_writer call per ConceptStore op."""
     writer = FakeWriter()
