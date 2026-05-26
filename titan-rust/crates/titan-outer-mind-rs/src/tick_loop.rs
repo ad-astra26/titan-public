@@ -26,13 +26,14 @@ use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
     apply_multipliers, compose_focus_into_enrichment, compose_multipliers_default,
-    decode_local_filter_down_payload, encode_floats, encode_mind_balance_gift,
-    load_checkpoint_for_part, load_restoring_cfg, observe, open_focus_input_if_present,
-    open_neuromod_slot_if_present, read_dim_slice, read_focus_nudge, read_neuromod_gain,
-    read_sensor_cache, read_topology_outer_lower, stateful_update, write_checkpoint_for_part,
-    BalancedPulseEdges, CheckpointSnapshot, ContentGate, FiringSlotWriter, FocusPart,
-    GroundUpEnricher, JourneyAccumulator, JourneyTickInputs, Layer, PublishThrottle,
-    PulseClockRole, PulseWatcher, RestoringCfg, SensorCacheRead, Side, TrinitySide,
+    decode_corrective_nudge, decode_local_filter_down_payload, encode_extreme_imbalance,
+    encode_floats, encode_mind_balance_gift, load_checkpoint_for_part, load_restoring_cfg, observe,
+    open_focus_input_if_present, open_neuromod_slot_if_present, read_dim_slice, read_focus_nudge,
+    read_neuromod_gain, read_sensor_cache, read_topology_outer_lower, stateful_update,
+    write_checkpoint_for_part, BalancedPulseEdges, CheckpointSnapshot, ContentGate,
+    FiringSlotWriter, FocusPart, GroundUpEnricher, JourneyAccumulator, JourneyTickInputs, Layer,
+    PolarityHomeostat, PolarityHomeostatCfg, PublishThrottle, PulseClockRole, PulseWatcher,
+    RestoringCfg, SensorCacheRead, Side, TrinitySide, EXTREME_IMBALANCE_DETECTED_TOPIC,
     MIND_BALANCE_GIFT_TOPIC, MIND_GIFT_WEIGHTS, OUTER_MIND_TOPICS,
 };
 
@@ -116,6 +117,8 @@ struct DaemonState {
     epoch_pending: bool,
     shutdown_requested: bool,
     last_mind: [f32; 15],
+    /// P0.6-C / D-SPEC-132 one-shot CORRECTIVE_NUDGE from outer-spirit-rs.
+    pending_nudge: Option<(usize, f32)>,
 }
 
 impl Default for DaemonState {
@@ -127,6 +130,7 @@ impl Default for DaemonState {
             epoch_pending: false,
             shutdown_requested: false,
             last_mind: [0.5; 15],
+            pending_nudge: None,
         }
     }
 }
@@ -206,6 +210,28 @@ fn handle_bus_message(msg_type: &str, raw_bytes: &[u8], state: &Arc<Mutex<Daemon
             // ground_up nudge once per epoch (SPEC §G5.1).
             if let Ok(mut s) = state.lock() {
                 s.epoch_pending = true;
+            }
+        }
+        "CORRECTIVE_NUDGE" => {
+            let payload = match titan_bus::client::extract_payload(raw_bytes) {
+                Some(p) => p,
+                None => return,
+            };
+            match decode_corrective_nudge(&payload) {
+                Ok(n) => {
+                    if n.target_src != "mind" || n.target_side != TrinitySide::Outer {
+                        return;
+                    }
+                    let idx = n.target_dim_idx as usize;
+                    if idx >= 15 {
+                        warn!(target_dim_idx = idx, "CORRECTIVE_NUDGE idx out of range");
+                        return;
+                    }
+                    if let Ok(mut s) = state.lock() {
+                        s.pending_nudge = Some((idx, n.nudge_value));
+                    }
+                }
+                Err(e) => warn!(err = ?e, "decode CORRECTIVE_NUDGE failed"),
             }
         }
         _ => {}
@@ -317,6 +343,9 @@ async fn run_tick_loop(
     // P0.5 / D-SPEC-131 §G5.1 UP-leg gift state (outer mirror of inner-mind).
     let mut pulse_watcher = PulseWatcher::open(&shm_dir);
     let mut journey_acc: JourneyAccumulator<15> = JourneyAccumulator::new();
+    // P0.6-C / D-SPEC-132 PolarityHomeostat for outer_mind.
+    let mut polarity_homeostat: PolarityHomeostat<15> =
+        PolarityHomeostat::new(PolarityHomeostatCfg::for_mind());
     let mut tick_count: u64 = 0;
     // Mind @ 23.49 Hz: ~24 ticks ≈ 1s.
     let retry_every_n: u64 = (1.0_f64 / 0.04258).ceil() as u64;
@@ -379,6 +408,7 @@ async fn run_tick_loop(
                         &mut cfg, neuromod_slot.as_ref(), focus_input_slot.as_ref(),
                         &mut last_obs_restored,
                         &mut journey_acc, &balanced_pulse_edges,
+                        &mut polarity_homeostat,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
@@ -444,6 +474,7 @@ async fn run_one_tick(
     last_obs_restored: &mut Option<titan_trinity_daemon::LayerObs>,
     journey_acc: &mut JourneyAccumulator<15>,
     balanced_pulse_edges: &BalancedPulseEdges,
+    polarity_homeostat: &mut PolarityHomeostat<15>,
 ) -> Result<()> {
     let last_mind = {
         let s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
@@ -510,12 +541,46 @@ async fn run_one_tick(
     cfg.neuromod_gain = read_neuromod_gain(neuromod_slot);
     let obs = observe(&prev[..], &prev2[..]);
     *last_obs_restored = Some(obs);
+    // P0.6-C / D-SPEC-132: apply pending CORRECTIVE_NUDGE before stateful_update.
+    let pending_nudge = {
+        let mut s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
+        s.pending_nudge.take()
+    };
+    if let Some((dim_idx, signed_nudge)) = pending_nudge {
+        if dim_idx < 15 {
+            enrichment[dim_idx] += signed_nudge;
+            debug!(event = "CORRECTIVE_NUDGE_APPLIED", dim_idx, signed_nudge);
+        }
+    }
+
     let x = stateful_update(&prev[..], &prev2[..], &raw[..], &enrichment[..], &obs, cfg);
     let mut mind_state = [0.0_f32; 15];
     mind_state.copy_from_slice(&x[..15]);
     *prev2 = *prev;
     *prev = mind_state;
     let mind = mind_state;
+
+    // P0.6-C / D-SPEC-132 PolarityHomeostat tick (outer mirror).
+    let tick_ts_polarity = now_secs();
+    if let Some(ev) = polarity_homeostat.tick(obs.polarity, &mind) {
+        let payload = encode_extreme_imbalance("mind", TrinitySide::Outer, &ev, tick_ts_polarity);
+        if let Err(e) = bus
+            .publish(EXTREME_IMBALANCE_DETECTED_TOPIC, Some("all"), Some(payload))
+            .await
+        {
+            warn!(err = ?e, "publish EXTREME_IMBALANCE_DETECTED failed (continuing)");
+        } else {
+            debug!(
+                event = "EXTREME_IMBALANCE_DETECTED",
+                side = "outer",
+                src = "mind",
+                dim = ev.dominant_dim_idx,
+                pol = ev.polarity_at_fire,
+                duration_ticks = ev.duration_ticks,
+                sigma = ev.sigma_multiplier,
+            );
+        }
+    }
 
     // P0.5 / D-SPEC-131 §G5.1 UP-leg balance gift — outer mirror of inner-mind.
     let tick_ts = now_secs();

@@ -27,13 +27,15 @@ use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
     apply_multipliers, compose_focus_into_enrichment, compose_multipliers_default,
-    decode_filter_down_payload, decode_local_filter_down_payload, encode_body_balance_gift,
-    encode_floats, load_checkpoint_for_part, load_restoring_cfg, observe,
-    open_focus_input_if_present, open_neuromod_slot_if_present, read_focus_nudge,
-    read_neuromod_gain, stateful_update, write_checkpoint_for_part, BalancedPulseEdges,
-    CheckpointSnapshot, ContentGate, DriftAggregator, FiringSlotWriter, FocusPart,
-    GroundUpEnricher, JourneyAccumulator, JourneyTickInputs, Layer, PulseClockRole, PulseWatcher,
-    RestoringCfg, Side, TrinitySide, BODY_BALANCE_GIFT_TOPIC, BODY_GIFT_WEIGHTS, INNER_BODY_TOPICS,
+    decode_corrective_nudge, decode_filter_down_payload, decode_local_filter_down_payload,
+    encode_body_balance_gift, encode_extreme_imbalance, encode_floats, load_checkpoint_for_part,
+    load_restoring_cfg, observe, open_focus_input_if_present, open_neuromod_slot_if_present,
+    read_focus_nudge, read_neuromod_gain, stateful_update, write_checkpoint_for_part,
+    BalancedPulseEdges, CheckpointSnapshot, ContentGate, DriftAggregator, FiringSlotWriter,
+    FocusPart, GroundUpEnricher, JourneyAccumulator, JourneyTickInputs, Layer, PolarityHomeostat,
+    PolarityHomeostatCfg, PulseClockRole, PulseWatcher, RestoringCfg, Side, TrinitySide,
+    BODY_BALANCE_GIFT_TOPIC, BODY_GIFT_WEIGHTS, EXTREME_IMBALANCE_DETECTED_TOPIC,
+    INNER_BODY_TOPICS,
 };
 
 /// §G5.2 item 4 checkpoint write cadence. Inner-body ticks @ 7.83 Hz so 80 ticks
@@ -153,6 +155,10 @@ struct DaemonState {
     epoch_pending: bool,
     /// Set true when KERNEL_SHUTDOWN_ANNOUNCE arrives.
     shutdown_requested: bool,
+    /// P0.6-C / D-SPEC-132: one-shot CORRECTIVE_NUDGE from inner-spirit-rs.
+    /// `(dim_idx, signed_nudge)` — applied additively to enrichment_force
+    /// on the next tick (one-shot per the D-SPEC-121 pattern).
+    pending_nudge: Option<(usize, f32)>,
 }
 
 async fn run_event_dispatcher(
@@ -233,6 +239,31 @@ fn handle_bus_message(msg_type: &str, raw_bytes: &[u8], state: &Arc<Mutex<Daemon
                 s.epoch_pending = true;
             }
         }
+        "CORRECTIVE_NUDGE" => {
+            // P0.6-C / D-SPEC-132: spirit publishes a one-shot nudge toward
+            // 0.5 on the dominant_dim of a fired imbalance. Accept only when
+            // target_src=body + target_side=Inner (sovereign-half + part filter).
+            let payload = match titan_bus::client::extract_payload(raw_bytes) {
+                Some(p) => p,
+                None => return,
+            };
+            match decode_corrective_nudge(&payload) {
+                Ok(n) => {
+                    if n.target_src != "body" || n.target_side != TrinitySide::Inner {
+                        return;
+                    }
+                    let idx = n.target_dim_idx as usize;
+                    if idx >= 5 {
+                        warn!(target_dim_idx = idx, "CORRECTIVE_NUDGE idx out of range");
+                        return;
+                    }
+                    if let Ok(mut s) = state.lock() {
+                        s.pending_nudge = Some((idx, n.nudge_value));
+                    }
+                }
+                Err(e) => warn!(err = ?e, "decode CORRECTIVE_NUDGE failed"),
+            }
+        }
         _ => {}
     }
 }
@@ -293,6 +324,13 @@ async fn run_tick_loop(
     // by the accumulator (PLAN §6.5.2).
     let mut pulse_watcher = PulseWatcher::open(&shm_dir);
     let mut journey_acc: JourneyAccumulator<5> = JourneyAccumulator::new();
+    // P0.6-C / D-SPEC-132 §6.6.3 three-layer self-regulating polarity
+    // homeostat. Per-tick: feed obs.polarity → on fire → publish
+    // EXTREME_IMBALANCE_DETECTED. The §6.6.4 emergent nudge formula is
+    // computed by inner-spirit-rs on receipt + sent back via CORRECTIVE_NUDGE,
+    // which the dispatcher above stores in pending_nudge.
+    let mut polarity_homeostat: PolarityHomeostat<5> =
+        PolarityHomeostat::new(PolarityHomeostatCfg::for_body());
 
     // Per master plan §7 + C-S3 PLAN §1.1 #2: Schumann timer wheels live in
     // titan-schumann (substrate-owned shared library). Pinning epoch_t0 to
@@ -379,6 +417,7 @@ async fn run_tick_loop(
                         &mut cfg, neuromod_slot.as_ref(), focus_input_slot.as_ref(),
                         &mut last_obs_restored,
                         &mut journey_acc, &balanced_pulse_edges,
+                        &mut polarity_homeostat,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
@@ -443,6 +482,7 @@ async fn run_one_tick(
     last_obs_restored: &mut Option<titan_trinity_daemon::LayerObs>,
     journey_acc: &mut JourneyAccumulator<5>,
     balanced_pulse_edges: &BalancedPulseEdges,
+    polarity_homeostat: &mut PolarityHomeostat<5>,
 ) -> Result<()> {
     // 1. Read sensor cache (raw 5D body input). This is `raw[t]` per §G5.2 —
     //    the un-enriched producer output that the spring/drive integrate.
@@ -521,6 +561,20 @@ async fn run_one_tick(
     // Cache the latest observable signature so the checkpoint writer can
     // persist it (§G5.2 item 4: tensor + observables MUST checkpoint together).
     *last_obs_restored = Some(obs);
+    // P0.6-C / D-SPEC-132: apply any pending CORRECTIVE_NUDGE BEFORE the
+    // §G5.2 integrator runs — composing it into enrichment_force on the
+    // dominant_dim (one-shot, consume-and-clear per the D-SPEC-121 pattern).
+    let pending_nudge = {
+        let mut s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
+        s.pending_nudge.take()
+    };
+    if let Some((dim_idx, signed_nudge)) = pending_nudge {
+        if dim_idx < 5 {
+            enrichment[dim_idx] += signed_nudge;
+            debug!(event = "CORRECTIVE_NUDGE_APPLIED", dim_idx, signed_nudge,);
+        }
+    }
+
     let x = stateful_update(&prev[..], &prev2[..], &raw[..], &enrichment[..], &obs, cfg);
     let mut body_state = [0.0_f32; 5];
     body_state.copy_from_slice(&x[..5]);
@@ -558,6 +612,30 @@ async fn run_one_tick(
             }
         }
         journey_acc.reset_for_next_cycle();
+    }
+
+    // 5d. P0.6-C / D-SPEC-132 PolarityHomeostat tick (after §G5.2 settles).
+    //     Feed the same `obs` used by §G5.2 + post-integration `body`. On
+    //     fire → publish EXTREME_IMBALANCE_DETECTED for inner-spirit-rs to
+    //     compute the §6.6.4 emergent nudge + back-publish CORRECTIVE_NUDGE.
+    if let Some(ev) = polarity_homeostat.tick(obs.polarity, &body) {
+        let payload = encode_extreme_imbalance("body", TrinitySide::Inner, &ev, tick_ts);
+        if let Err(e) = bus
+            .publish(EXTREME_IMBALANCE_DETECTED_TOPIC, Some("all"), Some(payload))
+            .await
+        {
+            warn!(err = ?e, "publish EXTREME_IMBALANCE_DETECTED failed (continuing)");
+        } else {
+            debug!(
+                event = "EXTREME_IMBALANCE_DETECTED",
+                side = "inner",
+                src = "body",
+                dim = ev.dominant_dim_idx,
+                pol = ev.polarity_at_fire,
+                duration_ticks = ev.duration_ticks,
+                sigma = ev.sigma_multiplier,
+            );
+        }
     }
 
     // 6. Encode payload bytes.

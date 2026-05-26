@@ -69,12 +69,14 @@ use titan_core::small_filter_down::{SmallFilterDownEngine, HALF_DIM};
 use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
-    apply_multipliers, compose_focus_into_enrichment, decode_filter_down_payload,
-    decode_gift_at_spirit, encode_floats, load_checkpoint_for_part, load_restoring_cfg, observe,
+    apply_multipliers, compose_focus_into_enrichment, compute_nudge_amplitude,
+    decode_extreme_imbalance, decode_filter_down_payload, decode_gift_at_spirit,
+    encode_corrective_nudge, encode_floats, load_checkpoint_for_part, load_restoring_cfg, observe,
     open_focus_input_if_present, open_neuromod_slot_if_present, read_dim_slice, read_focus_nudge,
     read_neuromod_gain, stateful_update, write_checkpoint_for_part, CheckpointSnapshot,
-    ContentGate, DriftAggregator, FiringSlotWriter, FocusPart, Layer, PulseClockRole, PulseWatcher,
-    RestoringCfg, TrinitySide, BODY_FLAG_INNER, INNER_SPIRIT_TOPICS, MIND_FLAG_INNER,
+    ContentGate, DriftAggregator, ExtremeImbalanceIn, FiringSlotWriter, FocusPart, Layer,
+    PolarityHomeostatCfg, PulseClockRole, PulseWatcher, RestoringCfg, TrinitySide, BODY_FLAG_INNER,
+    CORRECTIVE_NUDGE_TOPIC, INNER_SPIRIT_TOPICS, MIND_FLAG_INNER,
 };
 
 /// §G5.2 item 4 checkpoint cadence. Inner-spirit ticks @ 70.47 Hz so 720
@@ -203,6 +205,9 @@ struct DaemonState {
     /// P0.5 / D-SPEC-131 §G5.1: amplitude of a MIND_BALANCE_GIFT received
     /// from inner-mind. Same one-shot semantic.
     pending_mind_gift_amplitude: Option<f32>,
+    /// P0.6-C / D-SPEC-132: most recent EXTREME_IMBALANCE_DETECTED awaiting
+    /// CORRECTIVE_NUDGE composition on the next spirit tick. One-shot.
+    pending_extreme: Option<ExtremeImbalanceIn>,
 }
 
 impl Default for DaemonState {
@@ -214,6 +219,7 @@ impl Default for DaemonState {
             sensor_cache_absent_count: 0,
             pending_body_gift_amplitude: None,
             pending_mind_gift_amplitude: None,
+            pending_extreme: None,
         }
     }
 }
@@ -292,6 +298,24 @@ fn handle_bus_message(msg_type: &str, raw_bytes: &[u8], state: &Arc<Mutex<Daemon
                     }
                 }
                 Err(e) => warn!(err = ?e, msg_type, "decode balance gift failed"),
+            }
+        }
+        "EXTREME_IMBALANCE_DETECTED" => {
+            // P0.6-C / D-SPEC-132: accept only inner-side events (sovereign half).
+            let payload = match titan_bus::client::extract_payload(raw_bytes) {
+                Some(p) => p,
+                None => return,
+            };
+            match decode_extreme_imbalance(&payload) {
+                Ok(ev) => {
+                    if ev.side != TrinitySide::Inner {
+                        return;
+                    }
+                    if let Ok(mut s) = state.lock() {
+                        s.pending_extreme = Some(ev);
+                    }
+                }
+                Err(e) => warn!(err = ?e, "decode EXTREME_IMBALANCE_DETECTED failed"),
             }
         }
         _ => {}
@@ -595,6 +619,63 @@ async fn run_one_tick(
     if let Some(amp) = mind_gift_amp {
         for i in 0..SPIRIT_DIMS {
             enrichment[i] += UP_LEG_BONUS_AMPLITUDE * amp * MIND_FLAG_INNER[i];
+        }
+    }
+    // P0.6-C / D-SPEC-132: handle any pending EXTREME_IMBALANCE_DETECTED.
+    // Compute the §6.6.4 emergent nudge amplitude + publish CORRECTIVE_NUDGE
+    // targeting the originating body/mind daemon's dominant dim. Sovereign
+    // half preserved (the dispatcher only stores inner-side events).
+    let pending_extreme = {
+        let mut s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
+        s.pending_extreme.take()
+    };
+    if let Some(ev) = pending_extreme {
+        // Use the homeostat config bounds to drive the chronicity factor's
+        // rate_target_upper. base_gain is the only amplitude knob; conservative
+        // 0.05 start so the corrective is meaningful but never dominant.
+        let cfg_h = if ev.src == "body" {
+            PolarityHomeostatCfg::for_body()
+        } else {
+            PolarityHomeostatCfg::for_mind()
+        };
+        // Spirit reads chi from chi_state.bin once available; default to
+        // 1.0 (healthy) for now — graceful degradation, low-chi amplifier
+        // still works in the steady state.
+        let chi_health = 1.0_f32;
+        let threshold = ev.sigma_multiplier * 0.1; // approx std at fire-edge
+        let base_gain = 0.05_f32;
+        let amp = compute_nudge_amplitude(
+            ev.polarity_at_fire,
+            0.0, // baseline absorbed into polarity_at_fire (carrying excess directly)
+            threshold,
+            chi_health,
+            0.0,
+            cfg_h.rate_target_upper_per_day,
+            base_gain,
+        );
+        let signed = -ev.polarity_sign * amp; // toward 0.5
+        let payload = encode_corrective_nudge(
+            &ev.src,
+            TrinitySide::Inner,
+            ev.dominant_dim_idx,
+            signed,
+            amp,
+            now_secs(),
+        );
+        if let Err(e) = bus
+            .publish(CORRECTIVE_NUDGE_TOPIC, Some("all"), Some(payload))
+            .await
+        {
+            warn!(err = ?e, "publish CORRECTIVE_NUDGE failed (continuing)");
+        } else {
+            debug!(
+                event = "CORRECTIVE_NUDGE_EMITTED",
+                target_src = %ev.src,
+                target_side = "inner",
+                dim = ev.dominant_dim_idx,
+                nudge = signed,
+                intensity = amp,
+            );
         }
     }
     // `balanced_pulse_edges` continues downstream for the spirit-clock

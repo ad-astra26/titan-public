@@ -49,13 +49,14 @@ use titan_core::small_filter_down::{SmallFilterDownEngine, HALF_DIM};
 use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
-    apply_multipliers, compose_focus_into_enrichment, decode_gift_at_spirit, encode_floats,
+    apply_multipliers, compose_focus_into_enrichment, compute_nudge_amplitude,
+    decode_extreme_imbalance, decode_gift_at_spirit, encode_corrective_nudge, encode_floats,
     load_checkpoint_for_part, load_restoring_cfg, observe, open_focus_input_if_present,
     open_neuromod_slot_if_present, read_dim_slice, read_focus_nudge, read_neuromod_gain,
     read_sensor_cache, stateful_update, write_checkpoint_for_part, CheckpointSnapshot, ContentGate,
-    FiringSlotWriter, FocusPart, Layer, PublishThrottle, PulseClockRole, PulseWatcher,
-    RestoringCfg, SensorCacheRead, TrinitySide, BODY_FLAG_OUTER, CONTENT_DIM_COUNT,
-    MIND_FLAG_OUTER, OUTER_SPIRIT_TOPICS,
+    ExtremeImbalanceIn, FiringSlotWriter, FocusPart, Layer, PolarityHomeostatCfg, PublishThrottle,
+    PulseClockRole, PulseWatcher, RestoringCfg, SensorCacheRead, TrinitySide, BODY_FLAG_OUTER,
+    CONTENT_DIM_COUNT, CORRECTIVE_NUDGE_TOPIC, MIND_FLAG_OUTER, OUTER_SPIRIT_TOPICS,
 };
 
 /// §G5.1 UP-leg (PLAN §4): per-content-dim additive bonus added to spirit's
@@ -165,6 +166,9 @@ struct DaemonState {
     /// P0.5 / D-SPEC-131 §G5.1: amplitude of a MIND_BALANCE_GIFT received
     /// from outer-mind.
     pending_mind_gift_amplitude: Option<f32>,
+    /// P0.6-C / D-SPEC-132: most recent EXTREME_IMBALANCE_DETECTED awaiting
+    /// CORRECTIVE_NUDGE composition on the next spirit tick.
+    pending_extreme: Option<ExtremeImbalanceIn>,
 }
 
 impl Default for DaemonState {
@@ -179,6 +183,7 @@ impl Default for DaemonState {
             mind_read_fail_count: 0,
             pending_body_gift_amplitude: None,
             pending_mind_gift_amplitude: None,
+            pending_extreme: None,
         }
     }
 }
@@ -261,6 +266,24 @@ fn handle_bus_message(msg_type: &str, raw_bytes: &[u8], state: &Arc<Mutex<Daemon
                     }
                 }
                 Err(e) => warn!(err = ?e, msg_type, "decode balance gift failed"),
+            }
+        }
+        "EXTREME_IMBALANCE_DETECTED" => {
+            // P0.6-C / D-SPEC-132: accept only outer-side events.
+            let payload = match titan_bus::client::extract_payload(raw_bytes) {
+                Some(p) => p,
+                None => return,
+            };
+            match decode_extreme_imbalance(&payload) {
+                Ok(ev) => {
+                    if ev.side != TrinitySide::Outer {
+                        return;
+                    }
+                    if let Ok(mut s) = state.lock() {
+                        s.pending_extreme = Some(ev);
+                    }
+                }
+                Err(e) => warn!(err = ?e, "decode EXTREME_IMBALANCE_DETECTED failed"),
             }
         }
         _ => {}
@@ -649,6 +672,56 @@ async fn run_one_tick(
     if let Some(amp) = mind_gift_amp {
         for i in 0..45 {
             enrichment[i] += UP_LEG_BONUS_AMPLITUDE * amp * MIND_FLAG_OUTER[i];
+        }
+    }
+    // P0.6-C / D-SPEC-132 (outer mirror): compute + emit CORRECTIVE_NUDGE
+    // on pending EXTREME_IMBALANCE_DETECTED. See inner-spirit-rs for the
+    // canonical formula derivation.
+    let pending_extreme = {
+        let mut s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
+        s.pending_extreme.take()
+    };
+    if let Some(ev) = pending_extreme {
+        let cfg_h = if ev.src == "body" {
+            PolarityHomeostatCfg::for_body()
+        } else {
+            PolarityHomeostatCfg::for_mind()
+        };
+        let chi_health = 1.0_f32;
+        let threshold = ev.sigma_multiplier * 0.1;
+        let base_gain = 0.05_f32;
+        let amp = compute_nudge_amplitude(
+            ev.polarity_at_fire,
+            0.0,
+            threshold,
+            chi_health,
+            0.0,
+            cfg_h.rate_target_upper_per_day,
+            base_gain,
+        );
+        let signed = -ev.polarity_sign * amp;
+        let payload = encode_corrective_nudge(
+            &ev.src,
+            TrinitySide::Outer,
+            ev.dominant_dim_idx,
+            signed,
+            amp,
+            now_secs(),
+        );
+        if let Err(e) = bus
+            .publish(CORRECTIVE_NUDGE_TOPIC, Some("all"), Some(payload))
+            .await
+        {
+            warn!(err = ?e, "publish CORRECTIVE_NUDGE failed (continuing)");
+        } else {
+            debug!(
+                event = "CORRECTIVE_NUDGE_EMITTED",
+                target_src = %ev.src,
+                target_side = "outer",
+                dim = ev.dominant_dim_idx,
+                nudge = signed,
+                intensity = amp,
+            );
         }
     }
     // `balanced_pulse_edges` continues downstream for the outer-spirit clock

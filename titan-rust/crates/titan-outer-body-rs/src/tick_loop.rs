@@ -35,14 +35,15 @@ use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
     apply_multipliers, compose_focus_into_enrichment, compose_multipliers_default,
-    decode_local_filter_down_payload, encode_body_balance_gift, encode_floats,
-    load_checkpoint_for_part, load_restoring_cfg, observe, open_focus_input_if_present,
-    open_neuromod_slot_if_present, read_focus_nudge, read_neuromod_gain, read_sensor_cache,
-    read_topology_outer_lower, stateful_update, write_checkpoint_for_part, BalancedPulseEdges,
-    CheckpointSnapshot, ContentGate, FiringSlotWriter, FocusPart, GroundUpEnricher,
-    JourneyAccumulator, JourneyTickInputs, Layer, PublishThrottle, PulseClockRole, PulseWatcher,
+    decode_corrective_nudge, decode_local_filter_down_payload, encode_body_balance_gift,
+    encode_extreme_imbalance, encode_floats, load_checkpoint_for_part, load_restoring_cfg, observe,
+    open_focus_input_if_present, open_neuromod_slot_if_present, read_focus_nudge,
+    read_neuromod_gain, read_sensor_cache, read_topology_outer_lower, stateful_update,
+    write_checkpoint_for_part, BalancedPulseEdges, CheckpointSnapshot, ContentGate,
+    FiringSlotWriter, FocusPart, GroundUpEnricher, JourneyAccumulator, JourneyTickInputs, Layer,
+    PolarityHomeostat, PolarityHomeostatCfg, PublishThrottle, PulseClockRole, PulseWatcher,
     RestoringCfg, SensorCacheRead, Side, TrinitySide, BODY_BALANCE_GIFT_TOPIC, BODY_GIFT_WEIGHTS,
-    OUTER_BODY_TOPICS,
+    EXTREME_IMBALANCE_DETECTED_TOPIC, OUTER_BODY_TOPICS,
 };
 
 /// §G5.2 item 4 checkpoint cadence (outer-body @ 7.83 Hz → ~10s).
@@ -130,6 +131,8 @@ struct DaemonState {
     epoch_pending: bool,
     /// Set true when KERNEL_SHUTDOWN_ANNOUNCE arrives.
     shutdown_requested: bool,
+    /// P0.6-C / D-SPEC-132 one-shot CORRECTIVE_NUDGE from outer-spirit-rs.
+    pending_nudge: Option<(usize, f32)>,
     /// Last successfully-computed 5D body vector — fall-back when sensor
     /// cache is stale per SPEC §18.1.
     last_body: [f32; 5],
@@ -210,6 +213,28 @@ fn handle_bus_message(msg_type: &str, raw_bytes: &[u8], state: &Arc<Mutex<Daemon
             // ground_up nudge once per epoch (SPEC §G5.1).
             if let Ok(mut s) = state.lock() {
                 s.epoch_pending = true;
+            }
+        }
+        "CORRECTIVE_NUDGE" => {
+            let payload = match titan_bus::client::extract_payload(raw_bytes) {
+                Some(p) => p,
+                None => return,
+            };
+            match decode_corrective_nudge(&payload) {
+                Ok(n) => {
+                    if n.target_src != "body" || n.target_side != TrinitySide::Outer {
+                        return;
+                    }
+                    let idx = n.target_dim_idx as usize;
+                    if idx >= 5 {
+                        warn!(target_dim_idx = idx, "CORRECTIVE_NUDGE idx out of range");
+                        return;
+                    }
+                    if let Ok(mut s) = state.lock() {
+                        s.pending_nudge = Some((idx, n.nudge_value));
+                    }
+                }
+                Err(e) => warn!(err = ?e, "decode CORRECTIVE_NUDGE failed"),
             }
         }
         _ => {}
@@ -323,6 +348,9 @@ async fn run_tick_loop(
     // P0.5 / D-SPEC-131 §G5.1 UP-leg gift state (outer mirror of inner-body).
     let mut pulse_watcher = PulseWatcher::open(&shm_dir);
     let mut journey_acc: JourneyAccumulator<5> = JourneyAccumulator::new();
+    // P0.6-C / D-SPEC-132 PolarityHomeostat for outer_body.
+    let mut polarity_homeostat: PolarityHomeostat<5> =
+        PolarityHomeostat::new(PolarityHomeostatCfg::for_body());
     let mut tick_count: u64 = 0;
     // Outer-body @ 7.83 Hz: ~8 ticks ≈ 1s — refresh cfg + retry neuromod open at ~1s.
     let retry_every_n: u64 = (1.0_f64 / 0.1277).ceil() as u64;
@@ -385,6 +413,7 @@ async fn run_tick_loop(
                         &mut cfg, neuromod_slot.as_ref(), focus_input_slot.as_ref(),
                         &mut last_obs_restored,
                         &mut journey_acc, &balanced_pulse_edges,
+                        &mut polarity_homeostat,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
@@ -449,6 +478,7 @@ async fn run_one_tick(
     last_obs_restored: &mut Option<titan_trinity_daemon::LayerObs>,
     journey_acc: &mut JourneyAccumulator<5>,
     balanced_pulse_edges: &BalancedPulseEdges,
+    polarity_homeostat: &mut PolarityHomeostat<5>,
 ) -> Result<()> {
     // 1. Read sensor cache (msgpack source dict from Python sidecar) +
     //    project to 5D body vector. On stale or missing, use last-known.
@@ -519,6 +549,18 @@ async fn run_one_tick(
     cfg.neuromod_gain = read_neuromod_gain(neuromod_slot);
     let obs = observe(&prev[..], &prev2[..]);
     *last_obs_restored = Some(obs);
+    // P0.6-C / D-SPEC-132: apply pending CORRECTIVE_NUDGE before stateful_update.
+    let pending_nudge = {
+        let mut s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
+        s.pending_nudge.take()
+    };
+    if let Some((dim_idx, signed_nudge)) = pending_nudge {
+        if dim_idx < 5 {
+            enrichment[dim_idx] += signed_nudge;
+            debug!(event = "CORRECTIVE_NUDGE_APPLIED", dim_idx, signed_nudge);
+        }
+    }
+
     let x = stateful_update(&prev[..], &prev2[..], &raw[..], &enrichment[..], &obs, cfg);
     let mut body_state = [0.0_f32; 5];
     body_state.copy_from_slice(&x[..5]);
@@ -533,6 +575,27 @@ async fn run_one_tick(
         obs,
         now_secs: tick_ts as f32,
     });
+    // P0.6-C / D-SPEC-132: PolarityHomeostat tick (outer mirror).
+    if let Some(ev) = polarity_homeostat.tick(obs.polarity, &body) {
+        let payload = encode_extreme_imbalance("body", TrinitySide::Outer, &ev, tick_ts);
+        if let Err(e) = bus
+            .publish(EXTREME_IMBALANCE_DETECTED_TOPIC, Some("all"), Some(payload))
+            .await
+        {
+            warn!(err = ?e, "publish EXTREME_IMBALANCE_DETECTED failed (continuing)");
+        } else {
+            debug!(
+                event = "EXTREME_IMBALANCE_DETECTED",
+                side = "outer",
+                src = "body",
+                dim = ev.dominant_dim_idx,
+                pol = ev.polarity_at_fire,
+                duration_ticks = ev.duration_ticks,
+                sigma = ev.sigma_multiplier,
+            );
+        }
+    }
+
     if balanced_pulse_edges[PulseClockRole::OuterBody.index()] {
         journey_acc.mark_balanced(obs);
         if let Some(digest) = journey_acc.finalize_body_gift(&BODY_GIFT_WEIGHTS) {
