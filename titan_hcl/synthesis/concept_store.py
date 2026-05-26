@@ -115,6 +115,37 @@ class _GroundednessParams:
     w_f: float = 0.0   # felt-state coverage (Phase 7+ populates)
 
 
+def _load_groundedness_params_from_toml() -> _GroundednessParams:
+    """Best-effort load of `[synthesis.groundedness]` from titan_params.toml.
+
+    Returns the in-code defaults on any error (file missing, parse error,
+    subtable missing) so tests + unit scenarios that don't need the toml
+    keep working. Production synthesis_worker calls this at boot."""
+    try:
+        import importlib.resources
+        try:
+            import tomllib  # 3.11+
+        except ImportError:
+            import tomli as tomllib  # type: ignore
+        # The params file ships under titan_hcl/titan_params.toml.
+        # In production the worker imports it from its installed package;
+        # in tests we resolve via the parent of titan_hcl/synthesis/.
+        import os
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(here, "titan_params.toml")
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        sub = data.get("synthesis", {}).get("groundedness", {})
+        return _GroundednessParams(
+            w_e=float(sub.get("w_e", 0.3)),
+            w_c=float(sub.get("w_c", 0.3)),
+            w_p=float(sub.get("w_p", 0.4)),
+            w_f=float(sub.get("w_f", 0.0)),
+        )
+    except Exception:
+        return _GroundednessParams()
+
+
 def _norm_log_count(n: int | float) -> float:
     """Smooth normalization for an unbounded count: log1p / log(1+50) so a
     count of 50 saturates to ~1.0. Cheap, no candidate-pool dependency, and
@@ -457,4 +488,5 @@ __all__ = (
     "WriterFailure",
     "compute_groundedness",
     "_GroundednessParams",
+    "_load_groundedness_params_from_toml",
 )
