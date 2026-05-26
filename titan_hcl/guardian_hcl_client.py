@@ -65,9 +65,29 @@ class GuardianHCLClient:
 
     def __init__(self, bus):
         self._bus = bus
+        # Phase 6 / D-SPEC-135: PRIMARY source of module state is the
+        # guardian_state.bin SHM slot written by guardian_hcl process at
+        # 1 Hz (G21 single-writer per SPEC §7.1 + D-SPEC-70). Any reader
+        # in any process gets fresh data via mmap. The event cache below
+        # is a SECONDARY local-bus subscriber that mirrors targeted
+        # MODULE_READY etc. when they fan to titan_HCL's "guardian"
+        # alias — but the broker may route dst="guardian" exclusively to
+        # guardian_hcl's PRIMARY subscriber (name-match priority), leaving
+        # the alias starved. SHM is the canonical G18 read path; the
+        # event cache is a defense-in-depth fallback for the cold-boot
+        # window before the publisher writes guardian_state.bin.
+        self._shm_reader = None
+        try:
+            from titan_hcl.api.shm_reader_bank import ShmReaderBank
+            from titan_hcl.core.state_registry import resolve_titan_id
+            self._shm_reader = ShmReaderBank(titan_id=resolve_titan_id())
+        except Exception as _shm_init_err:  # noqa: BLE001
+            logger.debug(
+                "[GuardianHCLClient] SHM reader init deferred (test "
+                "harness or pre-boot): %s — falling back to event cache",
+                _shm_init_err)
         # State cache populated by bus events. Each value is a dict with
-        # keys: state ("RUNNING" / "CRASHED" / "STOPPED"), restart_count,
-        # last_event_ts.
+        # keys: state, restart_count, last_event_ts.
         self._modules_cache: dict[str, dict] = {}
         # Pending reload futures keyed by correlation_id. Each value is a
         # threading.Event + a result dict populated when the ack arrives.
@@ -282,16 +302,39 @@ class GuardianHCLClient:
         return self._modules_cache.get(name, {}).get("state") == "running"
 
     def get_status(self) -> dict:
-        """Return `{module_name: {state, restart_count, ...}}` matching the
-        legacy Guardian.get_status() shape — dashboard.py:2180-2184 iterates
-        this dict and calls .get("state") on each value. A wrapping
-        {"modules": ..., "from_cache": True} shape breaks that iteration
-        (bool from cache key is treated as a value → AttributeError).
+        """Return `{module_name: {state, pid, rss_mb, uptime, layer, ...}}`
+        matching the legacy in-process Guardian.get_status() shape.
 
-        Layer + pid + uptime are not tracked in the cache (we only see
-        bus-event-driven state transitions); legacy fields default to
-        sensible neutral values so consumers that .get() them don't crash.
+        Phase 6 / D-SPEC-135 / G18: PRIMARY source is the guardian_state.bin
+        SHM slot written by guardian_hcl process at 1 Hz. This is the
+        canonical cross-process state read path — same payload shape as
+        legacy Guardian.get_status (including pid, rss_mb, uptime, layer,
+        restart_count, etc., all populated from the real Guardian._modules
+        snapshot). FALLBACK is the local event cache (which mirrors a
+        subset of fields if dst="guardian" broadcasts reach titan_HCL's
+        alias subscriber). The fallback is only meaningful during the
+        cold-boot window before guardian_hcl's first publish or in
+        unit-test harnesses that don't initialize SHM.
+
+        dashboard.py:2180-2184 iterates this dict and calls .get("state")
+        on each value — the shape MUST be a flat `{name: info}` map (no
+        wrapping under "modules" key, no sibling bools).
         """
+        # PRIMARY — SHM (guardian_state.bin) G18 path
+        if self._shm_reader is not None:
+            try:
+                payload = self._shm_reader.read_guardian_state() or {}
+                modules = payload.get("modules") or {}
+                if modules:
+                    return dict(modules)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(
+                    "[GuardianHCLClient] SHM read failed, falling back to "
+                    "event cache: %s", e)
+        # FALLBACK — event-driven local cache. Only populated if the
+        # local bus delivers MODULE_READY/HEARTBEAT events from broker
+        # fan-out (rare under name-exclusive routing — the SHM path above
+        # is the canonical one).
         return {
             name: {
                 "state": info.get("state", "stopped"),
