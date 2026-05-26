@@ -224,7 +224,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=120.0,
         reply_only=False,
-        broadcast_topics=[bus.SILENT_SWALLOW_REPORT],
+        broadcast_topics=[_bus_constants.SILENT_SWALLOW_REPORT],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         b2_1_swap_critical=False,  # M5: light-state worker; respawn-OK
     ))
@@ -253,7 +253,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         autostart=True,
         lazy=False,
         heartbeat_timeout=60.0,
-        broadcast_topics=[bus.MODULE_SHUTDOWN],
+        broadcast_topics=[_bus_constants.MODULE_SHUTDOWN],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
     ))
@@ -376,7 +376,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         rss_limit_mb=3000,
         autostart=_a8_sage_subproc_enabled,  # §A.8.7: autostart when flag-on
         lazy=not _a8_sage_subproc_enabled,   # §A.8.7: eager when flag-on
-        broadcast_topics=[bus.SAGE_RECORD_TRANSITION],
+        broadcast_topics=[_bus_constants.SAGE_RECORD_TRANSITION],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
     ))
 
@@ -393,7 +393,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         autostart=True,  # Changed: Language Teacher needs llm at boot
         lazy=False,
         heartbeat_timeout=120.0,  # LLM calls can block 30s+; match Spirit/Memory timeout
-        broadcast_topics=[bus.LLM_TEACHER_REQUEST],
+        broadcast_topics=[_bus_constants.LLM_TEACHER_REQUEST],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
     ))
 
@@ -456,15 +456,15 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=60.0,  # Background heartbeat thread bypasses arun delays
         broadcast_topics=[
-            bus.CHAT_REQUEST,
-            bus.CHAT_STREAM_REQUEST,
-            bus.KERNEL_EPOCH_TICK,
-            bus.SAVE_NOW,
+            _bus_constants.CHAT_REQUEST,
+            _bus_constants.CHAT_STREAM_REQUEST,
+            _bus_constants.KERNEL_EPOCH_TICK,
+            _bus_constants.SAVE_NOW,
             # RFP_phase_c_titan_hcl_cleanup Phase A (2026-05-21): agno_worker
             # is the new DREAM_INBOX_REPLAY consumer (re-answers messages
             # buffered during dream) — moved from the retired parent
             # _v4_event_bridge_loop. dream_state_worker broadcasts it dst="all".
-            bus.DREAM_INBOX_REPLAY,
+            _bus_constants.DREAM_INBOX_REPLAY,
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=True,  # data/agno_sessions.db is critical-data per §11.H
@@ -498,8 +498,8 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         autostart=True,  # Body senses must always be active
         lazy=False,
         broadcast_topics=[
-            bus.FILTER_DOWN, bus.FOCUS_NUDGE,
-            bus.CONVERSATION_STIMULUS, bus.INTERFACE_INPUT,
+            _bus_constants.FILTER_DOWN, _bus_constants.FOCUS_NUDGE,
+            _bus_constants.CONVERSATION_STIMULUS, _bus_constants.INTERFACE_INPUT,
         ],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
     ))
@@ -524,9 +524,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         autostart=True,  # Mind senses should always be active
         lazy=False,
         broadcast_topics=[
-            bus.FILTER_DOWN, bus.FOCUS_NUDGE,
-            bus.CONVERSATION_STIMULUS, bus.INTERFACE_INPUT,
-            bus.SENSE_VISUAL, bus.SENSE_AUDIO,
+            _bus_constants.FILTER_DOWN, _bus_constants.FOCUS_NUDGE,
+            _bus_constants.CONVERSATION_STIMULUS, _bus_constants.INTERFACE_INPUT,
+            _bus_constants.SENSE_VISUAL, _bus_constants.SENSE_AUDIO,
         ],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
     ))
@@ -666,10 +666,10 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
                 lazy=False,
                 heartbeat_timeout=60.0,
                 broadcast_topics=[
-                    bus.REASONING_STATS_UPDATED, bus.NEUROMOD_STATS_UPDATED,
-                    bus.CHI_UPDATED, bus.KERNEL_EPOCH_TICK,
-                    bus.EXPRESSION_FIRED, bus.CONVERSATION_STIMULUS,
-                    bus.SPEAK_REQUEST_PENDING, bus.GREAT_KIN_PULSE,
+                    _bus_constants.REASONING_STATS_UPDATED, _bus_constants.NEUROMOD_STATS_UPDATED,
+                    _bus_constants.CHI_UPDATED, _bus_constants.KERNEL_EPOCH_TICK,
+                    _bus_constants.EXPRESSION_FIRED, _bus_constants.CONVERSATION_STIMULUS,
+                    _bus_constants.SPEAK_REQUEST_PENDING, _bus_constants.GREAT_KIN_PULSE,
                 ],
                 b2_1_swap_critical=False,
                 start_method="spawn" if _spawn_grad else "fork",
@@ -706,16 +706,16 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
                 lazy=False,
                 heartbeat_timeout=90.0,
                 broadcast_topics=[
-                    bus.REASONING_STATS_UPDATED, bus.META_REASONING_STATS_UPDATED,
-                    bus.EXPERIENCE_STIMULUS, bus.DREAMING_STATE_UPDATED,
-                    bus.CGN_CROSS_INSIGHT, bus.KERNEL_EPOCH_TICK,
+                    _bus_constants.REASONING_STATS_UPDATED, _bus_constants.META_REASONING_STATS_UPDATED,
+                    _bus_constants.EXPERIENCE_STIMULUS, _bus_constants.DREAMING_STATE_UPDATED,
+                    _bus_constants.CGN_CROSS_INSIGHT, _bus_constants.KERNEL_EPOCH_TICK,
                     # rFP_meta_reasoning_self_reasoning_resolver_migration / SPEC §9.B
                     # + D-SPEC-70 v1.15.0 — cognitive_worker fires META_INTROSPECT_REQUEST
                     # (fire-and-forget per §8.0.ter D-SPEC-48) per META INTROSPECT action;
                     # self_reflection_worker handler runs sr.introspect(**payload),
                     # persists to data/inner_memory.db.self_insights via _persist_insight(),
                     # writes result to inner_self_insight.bin SHM slot. Closes F-8.
-                    bus.META_INTROSPECT_REQUEST,
+                    _bus_constants.META_INTROSPECT_REQUEST,
                 ],
                 b2_1_swap_critical=True,
                 start_method="spawn" if _spawn_grad else "fork",
@@ -750,14 +750,14 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             lazy=False,
             heartbeat_timeout=120.0,
             broadcast_topics=[
-                bus.EXPRESSION_FIRED,
-                bus.MEDITATION_COMPLETE,
-                bus.KIN_SIGNAL,
-                bus.SOCIAL_RECEIVED,
-                bus.SOCIAL_CATALYST,
-                bus.MENTION_RECEIVED,
-                bus.FELT_EXPERIENCE_CAPTURED,
-                bus.ENGAGEMENT_SNAPSHOT_TAKEN,
+                _bus_constants.EXPRESSION_FIRED,
+                _bus_constants.MEDITATION_COMPLETE,
+                _bus_constants.KIN_SIGNAL,
+                _bus_constants.SOCIAL_RECEIVED,
+                _bus_constants.SOCIAL_CATALYST,
+                _bus_constants.MENTION_RECEIVED,
+                _bus_constants.FELT_EXPERIENCE_CAPTURED,
+                _bus_constants.ENGAGEMENT_SNAPSHOT_TAKEN,
             ],
             start_method="spawn" if _spawn_grad else "fork",
         ))
@@ -768,7 +768,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # social_graph_state.bin SHM publisher (G21 single-writer).
     # ALWAYS-ON autostart — no flag-gate (replaces the legacy alias rot).
     # broadcast_topics minimal: dispatch arrives as dst="social_graph"
-    # bus.QUERY (not a broadcast), only MODULE_SHUTDOWN + SAVE_NOW are
+    # _bus_constants.QUERY (not a broadcast), only MODULE_SHUTDOWN + SAVE_NOW are
     # broadcasts the worker needs to consume.
     from titan_hcl.modules.social_graph_worker import (
         social_graph_worker_main,
@@ -788,8 +788,8 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=60.0,
         broadcast_topics=[
-            bus.MODULE_SHUTDOWN,
-            bus.SAVE_NOW,
+            _bus_constants.MODULE_SHUTDOWN,
+            _bus_constants.SAVE_NOW,
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=True,
@@ -801,7 +801,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # (G21 single-writer). ALWAYS-ON autostart — no flag-gate
     # (replaces the inline `_wire_metabolism` body which previously
     # constructed MetabolismController as an in-process attribute).
-    # Subscribes to bus.QUERY (dst=metabolism) for evaluate_gate /
+    # Subscribes to _bus_constants.QUERY (dst=metabolism) for evaluate_gate /
     # async state queries + SOLANA_BALANCE_UPDATED for responsive
     # tier refresh.
     from titan_hcl.modules.metabolism_worker import (
@@ -821,9 +821,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=60.0,
         broadcast_topics=[
-            bus.SOLANA_BALANCE_UPDATED,
-            bus.MODULE_SHUTDOWN,
-            bus.SAVE_NOW,
+            _bus_constants.SOLANA_BALANCE_UPDATED,
+            _bus_constants.MODULE_SHUTDOWN,
+            _bus_constants.SAVE_NOW,
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
@@ -856,10 +856,10 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=60.0,
         broadcast_topics=[
-            bus.BODY_BALANCE_GIFT,
-            bus.MIND_BALANCE_GIFT,
-            bus.MODULE_SHUTDOWN,
-            bus.SAVE_NOW,
+            _bus_constants.BODY_BALANCE_GIFT,
+            _bus_constants.MIND_BALANCE_GIFT,
+            _bus_constants.MODULE_SHUTDOWN,
+            _bus_constants.SAVE_NOW,
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
@@ -884,10 +884,10 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=60.0,
         broadcast_topics=[
-            bus.EXTREME_IMBALANCE_DETECTED,
-            bus.CORRECTIVE_NUDGE,
-            bus.MODULE_SHUTDOWN,
-            bus.SAVE_NOW,
+            _bus_constants.EXTREME_IMBALANCE_DETECTED,
+            _bus_constants.CORRECTIVE_NUDGE,
+            _bus_constants.MODULE_SHUTDOWN,
+            _bus_constants.SAVE_NOW,
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
@@ -919,13 +919,13 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=60.0,
         broadcast_topics=[
-            bus.KERNEL_EPOCH_TICK,
-            bus.DREAM_STATE_CHANGED,
-            bus.MEDITATION_COMPLETE,
-            bus.EXPRESSION_FIRED,
-            bus.NEUROMOD_STATS_UPDATED,
-            bus.MODULE_SHUTDOWN,
-            bus.SAVE_NOW,
+            _bus_constants.KERNEL_EPOCH_TICK,
+            _bus_constants.DREAM_STATE_CHANGED,
+            _bus_constants.MEDITATION_COMPLETE,
+            _bus_constants.EXPRESSION_FIRED,
+            _bus_constants.NEUROMOD_STATS_UPDATED,
+            _bus_constants.MODULE_SHUTDOWN,
+            _bus_constants.SAVE_NOW,
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
@@ -960,9 +960,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=60.0,
         broadcast_topics=[
-            bus.KERNEL_EPOCH_TICK,
-            bus.MODULE_SHUTDOWN,
-            bus.SAVE_NOW,
+            _bus_constants.KERNEL_EPOCH_TICK,
+            _bus_constants.MODULE_SHUTDOWN,
+            _bus_constants.SAVE_NOW,
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
@@ -996,9 +996,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=60.0,
         broadcast_topics=[
-            bus.DREAMING_STATE_UPDATED,
-            bus.KERNEL_EPOCH_TICK,
-            bus.MODULE_SHUTDOWN,
+            _bus_constants.DREAMING_STATE_UPDATED,
+            _bus_constants.KERNEL_EPOCH_TICK,
+            _bus_constants.MODULE_SHUTDOWN,
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
@@ -1034,14 +1034,14 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=60.0,
         broadcast_topics=[
-            bus.MEMORY_RETRIEVAL_USED,
+            _bus_constants.MEMORY_RETRIEVAL_USED,
             # Phase 2 D-P2-4: standing-contract maintenance event, single
             # consumer = synthesis_worker (sole writer of
             # association_bundles). Post-seal contract hook in
             # timechain_v2.Mempool/BlockBuilder publishes.
-            bus.MAINTAIN_BUNDLE,
-            bus.KERNEL_EPOCH_TICK,
-            bus.MODULE_SHUTDOWN,
+            _bus_constants.MAINTAIN_BUNDLE,
+            _bus_constants.KERNEL_EPOCH_TICK,
+            _bus_constants.MODULE_SHUTDOWN,
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
@@ -1080,7 +1080,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         heartbeat_timeout=60.0,
         broadcast_topics=[
             *_OBSERVATORY_V4_EVENT_TYPES,
-            bus.MODULE_SHUTDOWN,
+            _bus_constants.MODULE_SHUTDOWN,
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
@@ -1109,15 +1109,15 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=60.0,
         broadcast_topics=[
-            bus.MEDITATION_REQUEST,
-            bus.MEDITATION_FORCE_END,
-            bus.EXPRESSION_FIRED,
-            bus.KERNEL_EPOCH_TICK,
+            _bus_constants.MEDITATION_REQUEST,
+            _bus_constants.MEDITATION_FORCE_END,
+            _bus_constants.EXPRESSION_FIRED,
+            _bus_constants.KERNEL_EPOCH_TICK,
             # MODULE_READY removed v1.29.0 — meditation_worker no longer
             # waits on memory's MODULE_READY broadcast per SPEC §11.G.2.5
             # (Guardian's pre-start activation guarantees dep readiness).
-            bus.SAVE_NOW,
-            bus.MODULE_SHUTDOWN,
+            _bus_constants.SAVE_NOW,
+            _bus_constants.MODULE_SHUTDOWN,
         ],
         # SPEC §11.G.2.5 (D-SPEC-90, v1.29.0) — dependency-driven activation.
         # memory_worker is registered with autostart=False + lazy=True. Without
@@ -1163,7 +1163,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=60.0,
         broadcast_topics=[
-            bus.MODULE_SHUTDOWN,
+            _bus_constants.MODULE_SHUTDOWN,
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
@@ -1195,7 +1195,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=60.0,
         broadcast_topics=[
-            bus.MODULE_SHUTDOWN,
+            _bus_constants.MODULE_SHUTDOWN,
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
@@ -1250,9 +1250,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # filter at all — discovered via 816,560 dropped msgs on T3 soak
     # gate); both paths are now closed by the §4.C contract.
     _STATE_WORKER_BROADCAST_TOPICS = [
-        bus.MODULE_SHUTDOWN,
-        bus.KERNEL_EPOCH_TICK,
-        bus.EPOCH_TICK,
+        _bus_constants.MODULE_SHUTDOWN,
+        _bus_constants.KERNEL_EPOCH_TICK,
+        _bus_constants.EPOCH_TICK,
         # SAVE_NOW added 2026-05-15 — hormonal_worker / neuromod_worker /
         # ns_worker durability invariant. Pre-fix, hormonal_worker only
         # saved its state to data/hormonal_state.json on graceful
@@ -1261,7 +1261,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         # every 30s + on SAVE_NOW; subscribing here ensures B.1
         # shadow_swap orchestrator + manual checkpoint requests reach
         # the worker.
-        bus.SAVE_NOW,
+        _bus_constants.SAVE_NOW,
     ]
     # ns_module + hormonal_module gain extra broadcast subs per
     # rFP_phase_c_impulse_engine_d8_3_migration §3.A.1 + §3.B.7-B.8:
@@ -1271,14 +1271,14 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # HORMONE_STIMULUS is published with dst="hormonal_module" but
     # per-Titan broker routing depends on broadcast_topics filter.
     _NS_WORKER_BROADCAST_TOPICS = _STATE_WORKER_BROADCAST_TOPICS + [
-        bus.ACTION_RESULT,
+        _bus_constants.ACTION_RESULT,
     ]
     # Note: NS-program urgencies flow cross-process via the
     # `ns_program_urgencies_input.bin` SHM slot (G18-pure per SPEC
     # §7.1 + D-SPEC-68 v1.13.0), NOT a bus event. ns_worker polls
     # the slot each tick — no ModuleSpec subscription needed.
     _HORMONAL_WORKER_BROADCAST_TOPICS = _STATE_WORKER_BROADCAST_TOPICS + [
-        bus.HORMONE_STIMULUS,
+        _bus_constants.HORMONE_STIMULUS,
     ]
     if _mk.get("shm_ns_enabled", True):
         guardian.register(ModuleSpec(
@@ -1366,17 +1366,17 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=120.0,  # Teacher LLM calls can take 30s+
         broadcast_topics=[
-            bus.SPEAK_REQUEST, bus.LLM_TEACHER_RESPONSE,
-            bus.META_LANGUAGE_RESULT, bus.MAKER_NARRATION_REQUEST,
-            bus.CGN_DREAM_CONSOLIDATE, bus.CGN_CROSS_INSIGHT,
-            bus.CGN_WEIGHTS_MAJOR, bus.CGN_KNOWLEDGE_RESP,
-            bus.QUERY_RESPONSE, bus.SOCIAL_PERCEPTION,
-            bus.CGN_SOCIAL_TRANSITION, bus.CGN_HAOV_VERIFY_REQ,
-            bus.META_REASON_RESPONSE, bus.EPOCH_TICK,
+            _bus_constants.SPEAK_REQUEST, _bus_constants.LLM_TEACHER_RESPONSE,
+            _bus_constants.META_LANGUAGE_RESULT, _bus_constants.MAKER_NARRATION_REQUEST,
+            _bus_constants.CGN_DREAM_CONSOLIDATE, _bus_constants.CGN_CROSS_INSIGHT,
+            _bus_constants.CGN_WEIGHTS_MAJOR, _bus_constants.CGN_KNOWLEDGE_RESP,
+            _bus_constants.QUERY_RESPONSE, _bus_constants.SOCIAL_PERCEPTION,
+            _bus_constants.CGN_SOCIAL_TRANSITION, _bus_constants.CGN_HAOV_VERIFY_REQ,
+            _bus_constants.META_REASON_RESPONSE, _bus_constants.EPOCH_TICK,
             # Track 2 D2 (v1.3.1): WORD_PERTURBATION_HINT consumer for SPEAK
             # quality chain. Mirrors legacy_core.py registration. SPEC §8.5
             # D-SPEC-38.
-            bus.WORD_PERTURBATION_HINT,
+            _bus_constants.WORD_PERTURBATION_HINT,
         ],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
     ))
@@ -1413,7 +1413,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
                                   # take ~60-120s under load; 180s = 2x margin.
         # rFP_worker_broadcast_topics_completion §4.A.3 (Batch 3):
         # one broadcast type (META_CHAIN_COMPLETE).
-        broadcast_topics=[bus.META_CHAIN_COMPLETE],
+        broadcast_topics=[_bus_constants.META_CHAIN_COMPLETE],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
     ))
 
@@ -1446,8 +1446,8 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         broadcast_topics=[
             "CGN_TRANSITION", "CGN_REGISTER",
             "CGN_CONSOLIDATE", "CGN_SURPRISE",
-            bus.CGN_HAOV_VERIFY_RSP, bus.CGN_INFERENCE_REQ,
-            bus.CGN_KNOWLEDGE_REQ,
+            _bus_constants.CGN_HAOV_VERIFY_RSP, _bus_constants.CGN_INFERENCE_REQ,
+            _bus_constants.CGN_KNOWLEDGE_REQ,
         ],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
     ))
@@ -1490,11 +1490,11 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         heartbeat_timeout=180.0,  # Research takes 10-45s + queue wait time
         reply_only=False,    # Receives CGN_KNOWLEDGE_REQ broadcasts
         broadcast_topics=[
-            bus.CGN_KNOWLEDGE_REQ, bus.META_REASON_RESPONSE,
-            bus.CGN_KNOWLEDGE_USAGE, bus.CGN_HAOV_VERIFY_REQ,
-            bus.SEARCH_PIPELINE_BUDGET_RESET, bus.CGN_WEIGHTS_MAJOR,
-            bus.CGN_CROSS_INSIGHT, bus.KNOWLEDGE_QUERY_CONCEPT,
-            bus.KNOWLEDGE_SEARCH, bus.KNOWLEDGE_CONCEPTS_FOR_PERSON,
+            _bus_constants.CGN_KNOWLEDGE_REQ, _bus_constants.META_REASON_RESPONSE,
+            _bus_constants.CGN_KNOWLEDGE_USAGE, _bus_constants.CGN_HAOV_VERIFY_REQ,
+            _bus_constants.SEARCH_PIPELINE_BUDGET_RESET, _bus_constants.CGN_WEIGHTS_MAJOR,
+            _bus_constants.CGN_CROSS_INSIGHT, _bus_constants.KNOWLEDGE_QUERY_CONCEPT,
+            _bus_constants.KNOWLEDGE_SEARCH, _bus_constants.KNOWLEDGE_CONCEPTS_FOR_PERSON,
         ],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
     ))
@@ -1517,20 +1517,20 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         reply_only=False,     # Receives EPOCH_TICK, TIMECHAIN_COMMIT, etc.
         broadcast_topics=[
             # System-upgrade events (5)
-            bus.SYSTEM_UPGRADE_QUEUED, bus.SYSTEM_UPGRADE_STARTING,
-            bus.SYSTEM_RESUMED, bus.SYSTEM_UPGRADE_PENDING_DEFERRED,
-            bus.SYSTEM_UPGRADE_THOUGHT,
+            _bus_constants.SYSTEM_UPGRADE_QUEUED, _bus_constants.SYSTEM_UPGRADE_STARTING,
+            _bus_constants.SYSTEM_RESUMED, _bus_constants.SYSTEM_UPGRADE_PENDING_DEFERRED,
+            _bus_constants.SYSTEM_UPGRADE_THOUGHT,
             # Core timechain events (7)
-            bus.TIMECHAIN_COMMIT, bus.EPOCH_TICK, bus.DREAM_STATE_CHANGED,
-            bus.MEDITATION_COMPLETE, bus.EXPRESSION_FIRED,
-            bus.TIMECHAIN_STATUS, bus.TIMECHAIN_QUERY,
+            _bus_constants.TIMECHAIN_COMMIT, _bus_constants.EPOCH_TICK, _bus_constants.DREAM_STATE_CHANGED,
+            _bus_constants.MEDITATION_COMPLETE, _bus_constants.EXPRESSION_FIRED,
+            _bus_constants.TIMECHAIN_STATUS, _bus_constants.TIMECHAIN_QUERY,
             # Timechain query ops (5)
-            bus.TIMECHAIN_RECALL, bus.TIMECHAIN_CHECK,
-            bus.TIMECHAIN_COMPARE, bus.TIMECHAIN_AGGREGATE,
-            bus.TIMECHAIN_SIMILAR,
+            _bus_constants.TIMECHAIN_RECALL, _bus_constants.TIMECHAIN_CHECK,
+            _bus_constants.TIMECHAIN_COMPARE, _bus_constants.TIMECHAIN_AGGREGATE,
+            _bus_constants.TIMECHAIN_SIMILAR,
             # Contract events (6)
-            bus.CONTRACT_DEPLOY, bus.CONTRACT_LIST, bus.CONTRACT_STATUS,
-            bus.CONTRACT_PROPOSE, bus.CONTRACT_APPROVE, bus.CONTRACT_VETO,
+            _bus_constants.CONTRACT_DEPLOY, _bus_constants.CONTRACT_LIST, _bus_constants.CONTRACT_STATUS,
+            _bus_constants.CONTRACT_PROPOSE, _bus_constants.CONTRACT_APPROVE, _bus_constants.CONTRACT_VETO,
         ],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
     ))
@@ -1574,8 +1574,8 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         # messages (SAVE_NOW, MODULE_SHUTDOWN, RESUME) are unaffected by
         # broadcast filter — broker routes them by name match.
         broadcast_topics=[
-            bus.MEDITATION_COMPLETE,
-            bus.BACKUP_TRIGGER_MANUAL,
+            _bus_constants.MEDITATION_COMPLETE,
+            _bus_constants.BACKUP_TRIGGER_MANUAL,
         ],
     ))
 
@@ -1619,11 +1619,11 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         heartbeat_timeout=90.0,
         reply_only=False,    # Subscribes to EMOT_CHAIN_EVIDENCE + FELT_CLUSTER_UPDATE (Phase 1.6d)
         broadcast_topics=[
-            bus.EMOT_CHAIN_EVIDENCE, bus.FELT_CLUSTER_UPDATE,
-            bus.META_REASON_RESPONSE, bus.CGN_HAOV_VERIFY_REQ,
-            bus.CGN_CROSS_INSIGHT, KIN_EMOT_STATE_MSG_TYPE,
-            bus.HORMONE_FIRED,
-            # bus.CGN_BETA_SNAPSHOT RETIRED v1.14.0 / D-SPEC-69 — flows
+            _bus_constants.EMOT_CHAIN_EVIDENCE, _bus_constants.FELT_CLUSTER_UPDATE,
+            _bus_constants.META_REASON_RESPONSE, _bus_constants.CGN_HAOV_VERIFY_REQ,
+            _bus_constants.CGN_CROSS_INSIGHT, KIN_EMOT_STATE_MSG_TYPE,
+            _bus_constants.HORMONE_FIRED,
+            # _bus_constants.CGN_BETA_SNAPSHOT RETIRED v1.14.0 / D-SPEC-69 — flows
             # via cgn_beta_state.bin SHM slot now (G18-pure per
             # rFP_dead_dim_wiring_fix §2.F).
             # RFP_meta-reasoning_CGN_FIX.md §8 Stage 1 — direct
@@ -1641,12 +1641,12 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # migration 2026-05-14 the spirit_worker bridge stopped
             # attaching → meta_engine._last_* attrs zero → ctx
             # zero-fill → HDBSCAN sees zero variance).
-            # bus.TRAJECTORY_UPDATE RETIRED v1.14.0 / D-SPEC-69 — flows via
+            # _bus_constants.TRAJECTORY_UPDATE RETIRED v1.14.0 / D-SPEC-69 — flows via
             # trajectory_state.bin SHM slot now (G18-pure per rFP_dead_dim_wiring_fix §2.E).
-            bus.NS_URGENCIES_UPDATE,      # ns_worker → emot_cgn (NEW v1.9.5)
-            bus.SPACE_TOPOLOGY_UPDATE,    # cognitive_worker → emot_cgn (NEW v1.9.5)
-            bus.NEUROMOD_LEVELS_UPDATE,   # neuromod_worker → emot_cgn (NEW v1.9.5)
-            bus.PI_PHASE_UPDATE,          # cognitive_worker → emot_cgn (NEW v1.9.5)
+            _bus_constants.NS_URGENCIES_UPDATE,      # ns_worker → emot_cgn (NEW v1.9.5)
+            _bus_constants.SPACE_TOPOLOGY_UPDATE,    # cognitive_worker → emot_cgn (NEW v1.9.5)
+            _bus_constants.NEUROMOD_LEVELS_UPDATE,   # neuromod_worker → emot_cgn (NEW v1.9.5)
+            _bus_constants.PI_PHASE_UPDATE,          # cognitive_worker → emot_cgn (NEW v1.9.5)
         ],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
     ))
