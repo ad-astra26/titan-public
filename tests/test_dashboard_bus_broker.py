@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient
 from titan_hcl.api.dashboard import router
 from titan_hcl.bus import DivineBus
 from titan_hcl.core.kernel import KERNEL_RPC_EXPOSED_METHODS
-from titan_hcl.guardian import Guardian
+from titan_hcl.guardian_hcl import Guardian
 
 
 # ── KERNEL_RPC exposure ─────────────────────────────────────────────────
