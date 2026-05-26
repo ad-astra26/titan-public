@@ -95,6 +95,19 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=60.0,
         reply_only=True,  # IMW IPC is via unix socket, not bus broadcasts
+        # Phase 6 / D-SPEC-135 / v1.62.0: IMW must spawn (not fork) because
+        # imw_main runs an asyncio loop + heartbeat thread + bus-watcher
+        # thread in parallel. Under fork-mode from guardian_hcl (which has
+        # 4+ background threads of its own — BusSocketClient writer +
+        # reader, GuardianStatePublisher loop, module_ready_publisher,
+        # lifecycle dispatcher, supervision loop), the child inherits a
+        # locked-mp.Queue / locked-mp.Lock state from threads that no
+        # longer exist post-fork. Live evidence (T3 2026-05-26): 4 of 5
+        # IMW workers HANG on the first `send_queue.put(MODULE_READY)`
+        # call indefinitely (PRE-PUBLISH stderr log emits, POST-PUBLISH
+        # never does) → /health stays DEGRADED forever for 5 IMW writers.
+        # spawn forces a fresh interpreter; no inherited lock state.
+        start_method="spawn",
     ))
 
     # Output Verifier Worker — L2 §A.8.3 subprocess extraction.
@@ -300,6 +313,10 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=False,
         heartbeat_timeout=60.0,
         reply_only=True,                       # Unix-socket IPC, no bus broadcasts
+        # Phase 6 / D-SPEC-135: spawn-mode (same rationale as 'imw' above —
+        # multi-threaded asyncio + heartbeat + bus-watcher; fork from
+        # multi-threaded guardian_hcl deadlocks on inherited locks).
+        start_method="spawn",
     ))
 
     # ─────────────────────────────────────────────────────────────────
@@ -338,6 +355,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             lazy=False,
             heartbeat_timeout=60.0,
             reply_only=True,
+            # Phase 6 / D-SPEC-135: spawn-mode (same rationale as 'imw' /
+            # 'observatory_writer' above).
+            start_method="spawn",
         ))
 
     # Memory module (FAISS + Kuzu + DuckDB)
