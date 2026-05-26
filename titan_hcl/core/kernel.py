@@ -369,6 +369,11 @@ KERNEL_RPC_EXPOSED_METHODS: frozenset[str] = frozenset({
     # (direct attribute access on TitanHCL); fails through kernel_rpc
     # proxy when api_process_separation_enabled=true (production path).
     "metabolism.evaluate_gate",
+    # MEDITATION-WORK-RPC-SYNC-AUDIT (2026-05-26) — async sibling exposed
+    # for the FastAPI endpoint `metabolism_evaluate_gate()` in dashboard.py.
+    # Per SPEC Preamble G19, async callers MUST use the async sibling;
+    # the kernel_rpc proxy needs the method allowlisted same as the sync.
+    "metabolism.evaluate_gate_async",
     "metabolism.get_metabolic_tier",
     "metabolism.get_gates_enforced",
     "metabolism.get_last_gate_decision_reason",
