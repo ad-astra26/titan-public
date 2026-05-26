@@ -416,17 +416,6 @@ _T = (
      None, "commands.maker_proposal_decline", (), ("maker_worker",), False, "/v4/maker/proposals/{proposal_id}/decline"),
     ("/v6/maker/dialogue-history", "GET", "get_maker_dialogue_history", "maker", "readout",
      None, None, (), ("maker_worker",), True, "/v4/maker/dialogue-history"),
-
-    # ── synthesis — Phase 4 §P4.I (D-SPEC-128 forthcoming) ───────────────
-    # Concept-spine readouts. Source = data/knowledge_graph.kuzu (read-only
-    # cross-process open). Producer = synthesis_worker. No legacy /v4 path
-    # replaced (new in P4).
-    ("/v6/synthesis/concepts", "GET", "get_v6_synthesis_concepts", "synthesis", "readout",
-     None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/concepts/heatmap", "GET", "get_v6_synthesis_concepts_heatmap",
-     "synthesis", "readout", None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/concepts/{concept_id}", "GET", "get_v6_synthesis_concept",
-     "synthesis", "readout", None, None, (), ("synthesis_worker",), False, None),
 )
 
 
