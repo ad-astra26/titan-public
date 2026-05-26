@@ -164,7 +164,10 @@ def _build_bus_and_client(titan_id: str, config: dict):
             f"to derive the bus authkey (HKDF-SHA256).")
 
     authkey = derive_bus_authkey(identity_secret)
-    sock_path = bus_sock_path(titan_id)
+    # bus_sock_path returns a pathlib.Path; coerce to str so env-var
+    # assignments + BusSocketClient (which accepts either, but we set
+    # os.environ below which requires str) are happy.
+    sock_path = str(bus_sock_path(titan_id))
 
     bus = DivineBus(maxsize=10000)
 
