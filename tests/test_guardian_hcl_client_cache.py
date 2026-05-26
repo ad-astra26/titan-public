@@ -36,7 +36,7 @@ def client_with_bus():
 def test_module_ready_marks_running(client_with_bus):
     bus, client = client_with_bus
     bus.publish(make_msg(
-        MODULE_READY, src="guardian", dst="guardian_hcl_client_cache",
+        MODULE_READY, src="guardian", dst="guardian",
         payload={"name": "memory"},
     ))
     assert _wait_for(lambda: client.is_running("memory")), (
@@ -47,12 +47,12 @@ def test_module_ready_marks_running(client_with_bus):
 def test_module_crashed_marks_not_running(client_with_bus):
     bus, client = client_with_bus
     bus.publish(make_msg(
-        MODULE_READY, src="guardian", dst="guardian_hcl_client_cache",
+        MODULE_READY, src="guardian", dst="guardian",
         payload={"name": "rl"},
     ))
     assert _wait_for(lambda: client.is_running("rl"))
     bus.publish(make_msg(
-        MODULE_CRASHED, src="guardian", dst="guardian_hcl_client_cache",
+        MODULE_CRASHED, src="guardian", dst="guardian",
         payload={"name": "rl"},
     ))
     assert _wait_for(lambda: not client.is_running("rl"))
@@ -63,7 +63,7 @@ def test_restart_count_increments(client_with_bus):
     for _ in range(3):
         bus.publish(make_msg(
             SUPERVISION_CHILD_RESTARTED, src="guardian",
-            dst="guardian_hcl_client_cache",
+            dst="guardian",
             payload={"name": "spirit"},
         ))
     assert _wait_for(
