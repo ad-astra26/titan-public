@@ -26,7 +26,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from titan_hcl.bus import DivineBus
-from titan_hcl.guardian import Guardian, ModuleSpec
+from titan_hcl.guardian_hcl import Guardian, ModuleSpec
 
 
 def _entry_fn(*args, **kwargs):
