@@ -246,7 +246,15 @@ def _start_inbound_dispatcher(bus, client, stop_event: threading.Event) -> threa
                 inbound_deque.clear()
             for msg in drained:
                 try:
-                    bus.publish_in_process(msg)
+                    delivered = bus.publish_in_process(msg)
+                    # Diagnostic for Phase 6 IMW MODULE_READY chase — log
+                    # all MODULE_READY relays so we can confirm whether
+                    # guardian_hcl receives + routes them to subscribers.
+                    mtype = msg.get("type", "")
+                    if mtype in ("MODULE_READY", "MODULE_CRASHED", "MODULE_SHUTDOWN"):
+                        logger.info(
+                            "[guardian_hcl] dispatcher relayed %s src=%s dst=%s → %d local subscriber(s)",
+                            mtype, msg.get("src", "?"), msg.get("dst", "?"), delivered)
                 except Exception as e:  # noqa: BLE001
                     logger.debug("[guardian_hcl] inbound re-publish error: %s", e)
 
