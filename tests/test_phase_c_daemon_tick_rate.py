@@ -21,8 +21,6 @@ import sys
 import unittest
 from pathlib import Path
 
-import pytest
-
 # Direct import of arch_map.py (it's a script, not a package).
 _REPO = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location(
@@ -213,16 +211,6 @@ class TestDaemonTickRegistries(unittest.TestCase):
         self.assertEqual(arch_map._DAEMON_TICK_EXPECTED_HZ["pi_heartbeat.bin"], 3.0)
         self.assertEqual(arch_map._DAEMON_TICK_EXPECTED_HZ["epoch_counter.bin"], 3.0)
 
-    @pytest.mark.skip(reason=(
-        "POST-PHASE-C-STALE-TEST-HYGIENE (2026-05-26): outer-trinity cadence "
-        "values updated by D-SPEC-100 v1.38.0 (outer readout-cadence G13 "
-        "conformance fix — outer_body/mind/spirit base seconds corrected to "
-        "45/15/5 from scrambled 10/5/30). Test still hardcodes the legacy "
-        "15/5/30 values per its inline comment. Current authoritative table "
-        "lives in SPEC §18.1 + `OUTER_BODY/MIND/SPIRIT_TICK_BASE_S` constants. "
-        "Re-enable after updating the inline expected values to match the "
-        "D-SPEC-100 cadences (45/15/5)."
-    ))
     def test_outer_trinity_inverse_of_spec_tick_base_seconds(self):
         # SPEC §18.1: outer_body=15s, outer_mind=5s, outer_spirit=30s base.
         # Hz = 1/seconds.

@@ -71,45 +71,12 @@ API_FILES = [
 ]
 
 
-def _strip_comments_and_backticks(source: str) -> str:
-    """Remove Python line comments + backtick-quoted spans so they cannot
-    contribute false-positive plugin.X matches to the regex below.
-
-    Stale-test-hygiene fix (POST-PHASE-C-STALE-TEST-HYGIENE, 2026-05-26):
-    the D-SPEC-110 cognitive_worker carve-out left a documentation comment
-    at `dashboard.py:623` referencing the now-moved `\\`plugin.consciousness\\``
-    instance. That comment was triggering the regex below as if it were a
-    runtime call. The regex semantics (per the docstring) only target
-    RUNTIME `plugin.X` access, so comments + backtick-quoted spans must be
-    stripped first.
-
-    SPEC anchor: D-SPEC-110 (SPEC v1.48.0, §21) — package rename
-    `titan_plugin`→`titan_hcl` + class `TitanHCL`; the `plugin.consciousness`
-    instance moved to the `cognitive_worker` L2 module per §9.B.
-    """
-    out_lines = []
-    for line in source.splitlines():
-        # Drop everything from the first un-quoted `#` to EOL. Pragmatic —
-        # ignores `#` inside strings; the API files don't use `#` inside
-        # strings near plugin.X access.
-        hash_idx = line.find("#")
-        if hash_idx >= 0:
-            line = line[:hash_idx]
-        out_lines.append(line)
-    stripped = "\n".join(out_lines)
-    # Remove backtick-quoted spans (markdown-style refs in docstrings).
-    stripped = re.sub(r"`[^`]*`", " ", stripped)
-    return stripped
-
-
 def _extract_plugin_paths(source: str) -> set[str]:
     """Pragmatic regex extraction of plugin.X.Y patterns from source.
 
     Captures dotted access of up to 3 levels. Strips trailing whitespace
-    and parens. Filters out module-import-prefix paths. Comments and
-    backtick-quoted spans are removed first (see helper above).
+    and parens. Filters out module-import-prefix paths.
     """
-    source = _strip_comments_and_backticks(source)
     # Match plugin.X or plugin.X.Y or plugin.X.Y.Z (up to 3 levels)
     pattern = re.compile(
         r"\bplugin\.(?:[a-zA-Z_][a-zA-Z0-9_]*)(?:\.[a-zA-Z_][a-zA-Z0-9_]*){0,2}"
