@@ -458,9 +458,27 @@ class RebirthBackup:
             except Exception as e:
                 logger.warning("[Backup] TimeChain backup failed: %s", e)
 
-        # 4. MyDay NFT (every 4th meditation)
-        meditations_per_nft = 4
-        if self._meditation_count_since_nft >= meditations_per_nft:
+        # 4. MyDay NFT (every Nth meditation — L12 housekeeping closure
+        # 2026-05-26). Two improvements over the previous code:
+        #   (a) honor the `daily_nft_enabled` config flag at
+        #       config.toml [mainnet_budget] line 465 — it was being
+        #       ignored, so the mint was attempted on every fleet
+        #       member regardless of the gate (Maker comment said
+        #       "enable after discussion"; gate now actually gates).
+        #   (b) read the threshold from `titan_params.toml`
+        #       `meditations_per_daily_nft` (currently 4) instead of
+        #       hardcoded 4 — same value today, but param-driven so
+        #       tuning doesn't require a code change.
+        mainnet_budget_cfg = (self._full_config.get("mainnet_budget")
+                               if isinstance(self._full_config, dict)
+                               else {}) or {}
+        daily_nft_enabled = bool(
+            mainnet_budget_cfg.get("daily_nft_enabled", False))
+        meditations_per_nft = int(
+            self._full_config.get("meditations_per_daily_nft", 4)
+            if isinstance(self._full_config, dict) else 4)
+        if (daily_nft_enabled
+                and self._meditation_count_since_nft >= meditations_per_nft):
             self._meditation_count_since_nft = 0
             self._save_backup_state()
             try:
@@ -485,6 +503,14 @@ class RebirthBackup:
             except Exception as e:
                 swallow_warn('[Backup] MyDay NFT skipped', e,
                              key="logic.backup.myday_nft_skipped", throttle=100)
+        elif not daily_nft_enabled and self._meditation_count_since_nft >= meditations_per_nft:
+            # Gate is OFF — log once per overflow to make the disable
+            # visible without spamming. Counter does NOT reset so when
+            # the gate flips on, the next meditation mints immediately.
+            logger.debug(
+                "[Backup] MyDay NFT skipped (daily_nft_enabled=false, "
+                "count=%d threshold=%d)",
+                self._meditation_count_since_nft, meditations_per_nft)
 
         # Save state after all operations
         self._save_backup_state()
