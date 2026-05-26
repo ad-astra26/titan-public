@@ -7882,16 +7882,11 @@ async def get_v4_meta_cgn_graduation_readiness(request: Request):
 # rFP: titan-docs/rFP_titan_meta_reasoning_teacher.md §7.3
 # ---------------------------------------------------------------------------
 async def get_v4_meta_teacher_status(request: Request):
-    """Meta-Teacher lifetime + 24h telemetry.
-
-    rFP_teachers_update F5 (2026-05-26): SHM-first read per the D-SPEC-71 +
-    D-SPEC-103 G21 pattern. The owning worker (meta_teacher_worker) computes
-    the aggregation in-memory (24h critique window + teacher_memory snapshot)
-    and publishes it into `meta_teacher_state.bin` every 30s; this endpoint
-    reads SHM-direct (sub-millisecond) with a file-scan fallback for the
-    cold-boot window before the first publish. The prior per-request scan
-    over 30-50 MB of `teaching_journal.jsonl` made the endpoint 3-46s on
-    larger fleets and triggered the kernel-rs internal proxy timeout."""
+    """Meta-Teacher lifetime + 24h telemetry. Reads directly from
+    data/meta_teacher/{critiques.YYYYMMDD.jsonl, adoption_metrics.json} +
+    [meta_teacher] config — no bus round-trip."""
+    import glob as _glob
+    import json as _json
     import os as _os
     import time as _time
 
@@ -7903,111 +7898,14 @@ async def get_v4_meta_teacher_status(request: Request):
             "memory_and_storage", {}).get("data_dir", "./data")
         mt_dir = _os.path.join(data_dir, "meta_teacher")
 
-        # ── SHM-first read (steady-state hot path) ────────────────────
-        shm_payload: dict | None = None
-        shm_age_s: float = 0.0
-        # Stale threshold: 3× publisher heartbeat (30s) + slack = 120s.
-        # If SHM is fresher than this we trust it fully.
-        SHM_STALE_THRESHOLD_S = 120.0
-        try:
-            spirit = titan_state.spirit
-            if spirit is not None and hasattr(spirit, "_shm"):
-                raw = spirit._shm.read_meta_teacher_state()
-                if isinstance(raw, dict):
-                    shm_ts = float(raw.get("ts", 0.0) or 0.0)
-                    shm_age_s = max(0.0, _time.time() - shm_ts)
-                    # Only trust SHM if it carries F5 additive fields
-                    # (presence of `critiques_24h` is the marker) AND is
-                    # fresh enough. Otherwise fall through to file fallback.
-                    if (shm_ts > 0
-                            and shm_age_s <= SHM_STALE_THRESHOLD_S
-                            and "critiques_24h" in raw):
-                        shm_payload = raw
-        except Exception as _shm_err:
-            logger.debug(
-                "[Dashboard] meta_teacher_state SHM read raised: %s — "
-                "falling back to file scan", _shm_err)
-
-        if shm_payload is not None:
-            # ── Steady-state: SHM hit ─────────────────────────────────
-            # Coerce stable types from msgpack-decoded payload. Static
-            # config fields (content_awareness_enabled, critiques_dir) come
-            # from this process's titan_state.config + filesystem hint —
-            # they're constants per-boot, no I/O cost.
-            top_cats = shm_payload.get("top_critique_categories") or []
-            # Normalise [[name, count], ...] → [(name, count), ...]
-            if (isinstance(top_cats, list) and top_cats
-                    and isinstance(top_cats[0], list)):
-                top_cats = [[str(t[0]), int(t[1])] for t in top_cats
-                            if len(t) >= 2]
-            adoption_by_domain = shm_payload.get(
-                "adoption_rate_by_domain", {}) or {}
-            if not isinstance(adoption_by_domain, dict):
-                adoption_by_domain = {}
-            return _ok({
-                "enabled": bool(shm_payload.get(
-                    "enabled", cfg.get("enabled", False))),
-                "sample_mode": str(shm_payload.get(
-                    "sample_mode",
-                    cfg.get("sample_mode", "uncertainty_plus_random"))),
-                "task_key": str(shm_payload.get(
-                    "task_key", cfg.get("task_key", "meta_teacher"))),
-                "max_critiques_per_hour": int(shm_payload.get(
-                    "max_critiques_per_hour",
-                    cfg.get("max_critiques_per_hour", 30)) or 30),
-                "reward_weight_config": float(shm_payload.get(
-                    "reward_weight_config",
-                    cfg.get("reward_weight", 0.05)) or 0.05),
-                "reward_weight_cap": float(shm_payload.get(
-                    "reward_weight_cap",
-                    cfg.get("reward_weight_cap", 0.30)) or 0.30),
-                "grounding_weight": float(shm_payload.get(
-                    "grounding_weight",
-                    cfg.get("grounding_weight", 0.15)) or 0.15),
-                "critiques_24h": int(
-                    shm_payload.get("critiques_24h", 0) or 0),
-                "llm_ok_24h": int(shm_payload.get("llm_ok_24h", 0) or 0),
-                "llm_failed_24h": int(
-                    shm_payload.get("llm_failed_24h", 0) or 0),
-                "avg_quality_score_24h": round(float(
-                    shm_payload.get("avg_quality_score_24h", 0.0) or 0.0), 3),
-                "top_critique_categories": top_cats,
-                "adoption_prompt_version": int(shm_payload.get(
-                    "adoption_prompt_version", 1) or 1),
-                "adoption_rate_by_domain": {
-                    str(k): round(float(v), 3)
-                    for k, v in adoption_by_domain.items()
-                    if isinstance(v, (int, float))
-                },
-                "adoption_rate_overall": round(float(
-                    shm_payload.get("adoption_rate_overall", 0.0) or 0.0), 3),
-                "critiques_dir": mt_dir,
-                # Static config (per-boot, no I/O cost)
-                "content_awareness_enabled": bool(
-                    cfg.get("content_awareness_enabled", True)),
-                "teaching_memory_enabled": bool(shm_payload.get(
-                    "teaching_memory_enabled",
-                    cfg.get("teaching_memory_enabled", False))),
-                "memory_cold_tier_topics": int(
-                    shm_payload.get("memory_cold_tier_topics", 0) or 0),
-                "memory_still_needs_push_count": int(
-                    shm_payload.get(
-                        "memory_still_needs_push_count", 0) or 0),
-                # Provenance: lets callers see this came from SHM hot path
-                "source": "shm.meta_teacher_state",
-                "source_age_s": round(shm_age_s, 3),
-            })
-
-        # ── Cold-boot fallback: file scan ────────────────────────────
-        # SHM not ready yet (first publish takes ~1s after worker init) OR
-        # missing F5 fields (post-deploy boundary before new worker landed).
-        # Read files as a one-time bootstrap; once the worker's publisher
-        # fires we'll be back on the SHM hot path.
-        import glob as _glob
-        import json as _json
+        # Aggregate recent critiques (last 24h).
+        # F5 (rFP_teachers_update) — bound the file scan by mtime: only files
+        # touched within the last ~25h can carry data in the 24h window. With
+        # ~10k+ lifetime critiques the previous full-history glob caused a
+        # ~3s endpoint timeout (audit 2026-05-26).
         now = _time.time()
         cutoff = now - 86400.0
-        scan_floor_mtime = now - (25.0 * 3600.0)
+        scan_floor_mtime = now - (25.0 * 3600.0)  # 25h slack for tz/clock skew
         cat_counts: dict[str, int] = {}
         scores_24h: list[float] = []
         critiques_24h = 0
@@ -8038,9 +7936,13 @@ async def get_v4_meta_teacher_status(request: Request):
                                 cat_counts[cat] = cat_counts.get(cat, 0) + 1
                 except Exception:
                     continue
+
         avg_q_24h = (sum(scores_24h) / len(scores_24h)) if scores_24h else 0.0
         top_cats = sorted(cat_counts.items(), key=lambda x: -x[1])[:5]
 
+        # Adoption metrics — handles both legacy flat format
+        # ({"domain": score}) and v2 versioned format
+        # ({"_prompt_version": 2, "by_domain": {...}}).
         adoption: dict[str, float] = {}
         prompt_version_on_disk: int = 1
         adoption_path = _os.path.join(mt_dir, "adoption_metrics.json")
@@ -8058,6 +7960,7 @@ async def get_v4_meta_teacher_status(request: Request):
                             if isinstance(v, (int, float))
                         }
                 elif isinstance(raw, dict):
+                    # Legacy flat format
                     adoption = {
                         str(k): float(v)
                         for k, v in raw.items()
@@ -8068,9 +7971,17 @@ async def get_v4_meta_teacher_status(request: Request):
         adoption_overall = (
             sum(adoption.values()) / len(adoption)) if adoption else 0.0
 
+        # rFP_meta_teacher_v2 Phase B: teaching memory cold-tier counts.
+        # Read the journal directly — the worker persists last-state per
+        # topic_key on every upsert, so file-based view is authoritative.
         journal_path = _os.path.join(mt_dir, "teaching_journal.jsonl")
         cold_topics = 0
         still_needs_push_count = 0
+        # F5 (rFP_teachers_update) — collapse two full passes into one: the
+        # journal is append-only so the LAST row per topic_key carries both
+        # last_seen AND still_needs_push. Halves wall time on the file
+        # (alongside the critiques scan bound above this addressed the 3s
+        # timeout the teachers re-audit found).
         if _os.path.exists(journal_path):
             try:
                 last_rows: dict[str, dict] = {}
@@ -8108,14 +8019,13 @@ async def get_v4_meta_teacher_status(request: Request):
                 k: round(float(v), 3) for k, v in adoption.items()},
             "adoption_rate_overall": round(adoption_overall, 3),
             "critiques_dir": mt_dir,
+            # Phase A/B feature flags + memory counts
             "content_awareness_enabled": bool(
                 cfg.get("content_awareness_enabled", True)),
             "teaching_memory_enabled": bool(
                 cfg.get("teaching_memory_enabled", False)),
             "memory_cold_tier_topics": cold_topics,
             "memory_still_needs_push_count": still_needs_push_count,
-            "source": "file.fallback",
-            "source_age_s": round(shm_age_s, 3) if shm_age_s > 0 else None,
         })
     except Exception as e:
         logger.error("[Dashboard] /v4/meta-teacher/status error: %s", e)

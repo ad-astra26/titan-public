@@ -77,13 +77,6 @@ class MetaTeacher:
         self.total_observed: int = 0
         # Last-N critiques for /v4 API (in-memory, worker also persists to jsonl)
         self.recent_critiques: deque = deque(maxlen=100)
-        # rFP_teachers_update F5 (2026-05-26): 24h-windowed critique summary
-        # for SHM-published dashboard stats. Each entry is a compact tuple
-        # (ts, llm_ok, quality_score, categories_tuple). Bounded by 24h time
-        # window + a 5000-entry hard cap (covers >2 critiques/min sustained).
-        # Bootstrapped from disk on worker init via bootstrap_24h_window().
-        self._critiques_24h: deque = deque()
-        self._critiques_24h_cap: int = 5000
 
     @property
     def enabled(self) -> bool:
@@ -123,157 +116,6 @@ class MetaTeacher:
         for d, dq in self._critique_times_by_domain.items():
             while dq and dq[0] < cutoff:
                 dq.popleft()
-
-    def _prune_24h(self, now: float) -> None:
-        """Drop critique-summary entries older than 24h from the 24h window."""
-        cutoff = now - 86400.0
-        while self._critiques_24h and self._critiques_24h[0][0] < cutoff:
-            self._critiques_24h.popleft()
-
-    def bootstrap_24h_window(self, data_dir: str) -> int:
-        """Replay last 24h of critique entries from
-        `data/meta_teacher/critiques.YYYYMMDD.jsonl` into the in-memory
-        24h window. One-time scan called once on worker init; steady-state
-        appends happen in `record_critique_entry`. Returns count loaded.
-
-        rFP_teachers_update F5 (2026-05-26): replaces the dashboard's
-        per-request file scan with an in-memory window populated once on
-        boot. Per the D-SPEC-103 dream_state precedent (additive SHM
-        publishing of telemetry), the owning worker is the canonical place
-        for this aggregation, and the dashboard reads SHM."""
-        import glob as _glob
-        import json as _json
-        import os as _os
-
-        mt_dir = _os.path.join(data_dir, "meta_teacher")
-        if not _os.path.isdir(mt_dir):
-            return 0
-        now = time.time()
-        cutoff = now - 86400.0
-        scan_floor_mtime = now - (25.0 * 3600.0)
-        loaded = 0
-        for fpath in sorted(_glob.glob(
-                _os.path.join(mt_dir, "critiques.*.jsonl"))):
-            try:
-                if _os.path.getmtime(fpath) < scan_floor_mtime:
-                    continue
-                with open(fpath) as f:
-                    for line in f:
-                        try:
-                            e = _json.loads(line)
-                        except Exception:
-                            continue
-                        ts = float(e.get("ts", 0))
-                        if ts < cutoff:
-                            continue
-                        self._critiques_24h.append((
-                            ts,
-                            bool(e.get("llm_ok", False)),
-                            float(e.get("quality_score", 0.5)),
-                            tuple(e.get("critique_categories") or []),
-                        ))
-                        loaded += 1
-                        if loaded >= self._critiques_24h_cap:
-                            break
-            except Exception:
-                continue
-            if loaded >= self._critiques_24h_cap:
-                break
-        # Sort by ts ascending so prune-from-left works correctly.
-        if self._critiques_24h:
-            sorted_list = sorted(self._critiques_24h, key=lambda x: x[0])
-            self._critiques_24h.clear()
-            self._critiques_24h.extend(sorted_list)
-        return loaded
-
-    def _critiques_24h_aggregate(self) -> dict:
-        """Compute 24h aggregates from the in-memory window."""
-        now = time.time()
-        self._prune_24h(now)
-        snap = list(self._critiques_24h)
-        total = len(snap)
-        ok_24h = sum(1 for r in snap if r[1])
-        failed_24h = total - ok_24h
-        avg_q = (sum(r[2] for r in snap) / total) if total > 0 else 0.0
-        cat_counts: dict[str, int] = {}
-        for r in snap:
-            for c in r[3]:
-                cat_counts[c] = cat_counts.get(c, 0) + 1
-        top_cats = sorted(cat_counts.items(), key=lambda x: -x[1])[:5]
-        return {
-            "critiques_24h": total,
-            "llm_ok_24h": ok_24h,
-            "llm_failed_24h": failed_24h,
-            "avg_quality_score_24h": round(avg_q, 3),
-            "top_critique_categories": top_cats,
-        }
-
-    def get_stats(self, memory=None) -> dict:
-        """Full dashboard-ready stats payload. Combines in-memory state
-        (this teacher + optional TeacherMemory) with 24h window aggregation.
-        Replaces per-request file scans in the API endpoint per the
-        D-SPEC-71 G21 single-writer pattern.
-
-        rFP_teachers_update F5 (2026-05-26).
-        """
-        now = time.time()
-        self._prune_old(now)
-        last_ts = 0.0
-        if self.recent_critiques:
-            try:
-                last_ts = float(self.recent_critiques[-1].get("ts", 0.0) or 0.0)
-            except Exception:
-                last_ts = 0.0
-        per_domain: dict[str, int] = {}
-        for dom, dq in self._critique_times_by_domain.items():
-            per_domain[str(dom)] = len(dq)
-        adoption_overall = (
-            sum(self.adoption_ema_by_domain.values())
-            / max(1, len(self.adoption_ema_by_domain)))
-        stats: dict = {
-            # Existing fields (publisher consumers already read these).
-            "total_critiques": int(self.total_critiques),
-            "voice_tuning_enabled": False,
-            "peer_exchange_enabled": False,
-            "last_critique_ts": last_ts,
-            "per_domain_critiques": per_domain,
-            "adoption_rate": round(adoption_overall, 4),
-            # rFP_teachers_update F5 additive fields (D-SPEC-103 precedent).
-            "enabled": bool(self._enabled),
-            "sample_mode": self._sample_mode,
-            "task_key": self._task_key,
-            "max_critiques_per_hour": int(self._max_per_hour),
-            "reward_weight_config": float(self._reward_weight_config),
-            "reward_weight_cap": float(self._reward_weight_cap),
-            "grounding_weight": float(self._grounding_weight),
-            "adoption_prompt_version": int(SYSTEM_PROMPT_VERSION),
-            "adoption_rate_by_domain": {
-                str(k): round(float(v), 4)
-                for k, v in self.adoption_ema_by_domain.items()
-            },
-            "adoption_rate_overall": round(adoption_overall, 4),
-        }
-        # 24h aggregates from in-memory window.
-        stats.update(self._critiques_24h_aggregate())
-        # TeacherMemory snapshot — cold-tier counts + flags.
-        if memory is not None:
-            try:
-                mem_snap = memory.snapshot()
-                stats["memory_cold_tier_topics"] = int(
-                    mem_snap.get("cold_tier_topics", 0))
-                stats["memory_still_needs_push_count"] = int(
-                    mem_snap.get("still_needs_push_count", 0))
-                stats["teaching_memory_enabled"] = bool(
-                    mem_snap.get("enabled", False))
-            except Exception:
-                stats["memory_cold_tier_topics"] = 0
-                stats["memory_still_needs_push_count"] = 0
-                stats["teaching_memory_enabled"] = False
-        else:
-            stats["memory_cold_tier_topics"] = 0
-            stats["memory_still_needs_push_count"] = 0
-            stats["teaching_memory_enabled"] = False
-        return stats
 
     def should_sample(self, payload: dict, rng: Optional[random.Random] = None) -> tuple[bool, str]:
         """Decide whether to critique this chain.
@@ -540,22 +382,8 @@ class MetaTeacher:
         """Append a full critique entry (dict) to the in-memory ring buffer.
 
         Worker also persists to critiques.jsonl. Ring buffer serves /v4 API.
-        Also appends a compact summary into the 24h window for the
-        SHM-published dashboard stats (rFP_teachers_update F5).
         """
         self.recent_critiques.append(entry)
-        try:
-            self._critiques_24h.append((
-                float(entry.get("ts", time.time())),
-                bool(entry.get("llm_ok", False)),
-                float(entry.get("quality_score", 0.5)),
-                tuple(entry.get("critique_categories") or []),
-            ))
-            # Bound by hard cap (24h time prune happens in aggregate read).
-            if len(self._critiques_24h) > self._critiques_24h_cap:
-                self._critiques_24h.popleft()
-        except Exception:
-            pass
 
 
 def build_system_prompt() -> str:

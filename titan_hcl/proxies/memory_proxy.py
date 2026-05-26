@@ -55,7 +55,7 @@ from ..core.state_registry import (
     ensure_shm_root,
     resolve_titan_id,
 )
-from ..guardian_hcl import Guardian
+from ..guardian import Guardian
 from ..logic.memory_state_specs import MEMORY_STATE_SLOT, MEMORY_STATE_SPEC
 
 logger = logging.getLogger(__name__)
