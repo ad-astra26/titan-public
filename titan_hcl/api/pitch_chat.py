@@ -5,8 +5,15 @@ VC + hackathon route.
 Per rFP_observatory_pitch_route.md §5 + §11 (v2 locked 2026-05-11). This
 is the backend the frontend Pitch page (Compare-mode default + single-
 Titan toggle) calls. Each Titan instance serves only itself — Compare
-mode is fan-out on the frontend across /t2/v4/pitch-chat and
-/t3/v4/pitch-chat (nginx prefix routing).
+mode is fan-out on the frontend across /t2/v6/pitch/chat and
+/t3/v6/pitch/chat (nginx prefix routing).
+
+Phase E migration (D-SPEC-115, 2026-05-26): the legacy `/v4/pitch-chat`
++ `/v4/pitch-chat/health` paths are 308/301 redirects to `/v6/pitch/chat`
++ `/v6/pitch/chat/health` (built automatically by v6_deprecation.build()
+from the `replaces=` field of the manifest rows registered at module
+bottom). Old judge/VC share-URLs continue to work — the migration is
+backend-only; the frontend `/v/<TOKEN>/pitch` route is unchanged.
 
 Differences from the wallet-gated /chat endpoint:
   1. No Privy auth. Visitor identity is the X-Pitch-Token header +
@@ -51,7 +58,7 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/v4", tags=["pitch"])
+router = APIRouter(prefix="/v6/pitch", tags=["pitch"])
 
 
 # ── Rate limits (rFP §5) ──────────────────────────────────────────────
@@ -363,7 +370,7 @@ def _classify_decline(body: dict) -> Optional[tuple[str, str]]:
 # ── Endpoint ──────────────────────────────────────────────────────────
 
 
-@router.post("/pitch-chat", response_model=PitchChatResponse)
+@router.post("/chat", response_model=PitchChatResponse)
 async def pitch_chat(
     req: PitchChatRequest,
     request: Request,
@@ -543,7 +550,7 @@ async def pitch_chat(
     )
 
 
-@router.get("/pitch-chat/health")
+@router.get("/chat/health")
 async def pitch_chat_health() -> JSONResponse:
     """Tiny health probe. Does NOT require X-Pitch-Token so the frontend
     can use it as a connection-banner signal. Returns no narrative.
@@ -560,3 +567,37 @@ async def pitch_chat_health() -> JSONResponse:
             },
         },
     )
+
+
+# ── v6 manifest registration (Phase E, D-SPEC-115) ────────────────────
+#
+# Each route on this router gets a RouteSpec row in v6_manifest.REGISTRY
+# so the /v6/manifest cross-check stays in_sync and v6_deprecation.build()
+# auto-generates the legacy /v4 → /v6 redirects (308 for POST,
+# 301 for GET) from the `replaces=` field.
+#
+# Loaded at module import; titan_hcl/api/__init__.py guarantees this
+# module loads AFTER v6_manifest in both the create_app and reload paths
+# so REGISTRY isn't wiped after we register.
+from . import v6_manifest as _m
+from .v6_manifest import RouteSpec
+
+_m.register(
+    RouteSpec(
+        path="/v6/pitch/chat",
+        method="POST",
+        group="pitch",
+        kind="mutation",
+        summary="Wallet-less pitch chat (X-Pitch-Token gated, persona pipeline, per-token + fleet rate-limited, recorded to data/pitch_sessions/).",
+        command="commands.pitch_chat",
+        replaces=("/v4/pitch-chat",),
+    ),
+    RouteSpec(
+        path="/v6/pitch/chat/health",
+        method="GET",
+        group="pitch",
+        kind="readout",
+        summary="Pitch chat health probe — no auth, returns rate-limit constants for the frontend connection banner.",
+        replaces=("/v4/pitch-chat/health",),
+    ),
+)
