@@ -305,24 +305,32 @@ def reward_introspect(
     """INTROSPECT compound reward.
 
     Sources:
-      - Self-Reasoning: prediction accuracy (stub→Sub-phase E)
-      - Self-Reasoning: profile divergence/deepening (stub→Sub-phase E)
+      - Self-Reasoning: prediction accuracy (Sub-phase E SHIPPED 2026-05-26)
+      - Self-Reasoning: profile divergence/deepening (Sub-phase E SHIPPED
+        2026-05-26 — `self_reasoning.compute_introspect_signals` →
+        meta_engine.update_subsystem_cache via self_reflection_worker
+        dream-end handler)
       - TimeChain: self-state continuity
       - Smart contracts: identity contract alignment
       - Calibration: meta-confidence vs success
 
     Range: 0.0 - 0.43.
 
-    NOTE: accuracy + deepening signals are stub until Sub-phase E wires
-    SELF_PROFILE dream consolidation. They'll read 0.0 in this session.
+    L2 housekeeping closure 2026-05-26: the previous "stub → 0.0 this
+    session" note retired. Sub-phase E now publishes real values on
+    every dream-end via `self_reasoning.consolidate_training()` —
+    `prediction_accuracy_ema` (per-prediction verify_prediction
+    updates) + `self_profile_divergence` (normalized euclidean distance
+    between current and prior `SelfProfile` snapshots).
     """
     base = _safe_float(dna.get("introspect_base"), 0.08)
 
-    # Self-prediction accuracy (stub until Sub-phase E)
+    # Self-prediction accuracy (Sub-phase E live, post 2026-05-26)
     accuracy_score = _safe_float(subsystem_signals.get("self_prediction_accuracy"), 0.0)
     accuracy = accuracy_score * _safe_float(dna.get("introspect_accuracy_weight"), 0.10)
 
     # Profile deepening: how much did the introspection diverge from prior profile?
+    # (Sub-phase E live, post 2026-05-26 — see compute_introspect_signals.)
     deepening_score = _safe_float(subsystem_signals.get("self_profile_divergence"), 0.0)
     deepening = deepening_score * _safe_float(dna.get("introspect_deepening_weight"), 0.08)
 

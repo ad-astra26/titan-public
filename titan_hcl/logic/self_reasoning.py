@@ -158,6 +158,104 @@ class SelfProfile:
     active_predictions: int = 0
 
 
+# ── L2 / Sub-phase E helpers (housekeeping 2026-05-26) ────────────────
+
+
+def _profile_divergence(prior: SelfProfile, current: SelfProfile) -> float:
+    """Normalized euclidean distance between two SelfProfile snapshots.
+
+    Returns a scalar in [0,1] where 0.0 = identical profiles (no
+    introspective change since last consolidation) and 1.0 = maximal
+    divergence (every tracked dimension swung from one extreme to the
+    other).
+
+    Compared fields (Maker-locked subset — only the numeric identity
+    axes that meaningfully measure "what kind of I am I right now"):
+      * vocabulary growth: vocab_total, vocab_productive (log-normalized)
+      * neuromod profile: 6 modulator levels (DA, 5HT, NE, ACh, GABA,
+        Endorphin) — typically already in [0,1]
+      * MSL identity: i_confidence, i_depth, chi_coherence (all [0,1])
+      * concept grounding: 6 concept confidences (all [0,1])
+      * reasoning identity: commit_rate (already [0,1]),
+        eureka_count + wisdom_count (log-normalized)
+      * self-reasoning stats: prediction_accuracy (already [0,1])
+
+    Categorical fields (dominant_emotion, dominant_primitive,
+    composition_level, top_words) are deliberately EXCLUDED from this
+    distance — they're surfaced separately when building the
+    SELF_PROFILE narrative for the LLM context. A category flip there
+    is a separate "kind" of insight that meta-reasoning detects via
+    structural change, not euclidean distance.
+
+    Cold-start convention: any None / missing field on either side
+    contributes 0.0 to the distance (we don't have enough info to
+    claim divergence on that axis).
+    """
+    import math
+
+    deltas: list[float] = []
+
+    def _push_norm(field_a: float, field_b: float, scale: float = 1.0) -> None:
+        """Append normalized squared delta to running sum."""
+        try:
+            a = float(field_a) / scale
+            b = float(field_b) / scale
+            # Clip per-axis to [-1, 1] so a single huge swing can't
+            # dominate (defensive against unbounded counters).
+            a = max(-1.0, min(1.0, a))
+            b = max(-1.0, min(1.0, b))
+            deltas.append((a - b) ** 2)
+        except (TypeError, ValueError):
+            return
+
+    # Log-normalized vocabulary deltas (the counter saturates at log10
+    # of 10000 ≈ 4, so we divide by 4 to keep contribution in [0,1]).
+    log_norm = max(1.0, math.log10(max(1, max(prior.vocab_total,
+                                              current.vocab_total)) + 1))
+    _push_norm(math.log10(prior.vocab_total + 1) / log_norm,
+               math.log10(current.vocab_total + 1) / log_norm)
+    _push_norm(math.log10(prior.vocab_productive + 1) / log_norm,
+               math.log10(current.vocab_productive + 1) / log_norm)
+
+    # Neuromod profile (6 modulators).
+    for nm in ("DA", "5HT", "NE", "ACh", "GABA", "Endorphin"):
+        _push_norm(prior.neuromod_levels.get(nm, 0.0),
+                   current.neuromod_levels.get(nm, 0.0))
+
+    # MSL identity (3 axes already in [0,1]).
+    _push_norm(prior.i_confidence, current.i_confidence)
+    _push_norm(prior.i_depth, current.i_depth)
+    _push_norm(prior.chi_coherence, current.chi_coherence)
+
+    # Concept grounding (6 concepts, already in [0,1]).
+    for concept in ("I", "YOU", "WE", "YES", "NO", "THEY"):
+        _push_norm(prior.concept_confidences.get(concept, 0.0),
+                   current.concept_confidences.get(concept, 0.0))
+
+    # Reasoning identity.
+    _push_norm(prior.commit_rate, current.commit_rate)
+    # eureka + wisdom counts: log-normalized at scale=100 (a Titan with
+    # 100 eurekas saturates the axis; further growth is noise).
+    eureka_scale = max(1.0, math.log10(max(1, prior.eureka_count,
+                                            current.eureka_count) + 1))
+    _push_norm(math.log10(prior.eureka_count + 1) / eureka_scale,
+               math.log10(current.eureka_count + 1) / eureka_scale)
+    _push_norm(math.log10(prior.wisdom_count + 1) / eureka_scale,
+               math.log10(current.wisdom_count + 1) / eureka_scale)
+
+    # Self-reasoning stats.
+    _push_norm(prior.prediction_accuracy, current.prediction_accuracy)
+
+    if not deltas:
+        return 0.0
+
+    # RMS distance, then normalize against sqrt(N) (the maximum possible
+    # value when every axis contributes 1.0 squared delta).
+    n = len(deltas)
+    rms = math.sqrt(sum(deltas) / n)
+    return max(0.0, min(1.0, rms))
+
+
 # ── Self-Reasoning Engine ────────────────────────────────────────────
 
 # PERSISTENCE_BY_DESIGN: SelfReasoningEngine._active_predictions is the
@@ -1371,19 +1469,84 @@ class SelfReasoningEngine:
         except Exception:
             pass
 
+        # L2 / Sub-phase E (housekeeping 2026-05-26) — compute introspect
+        # signals so the meta-reasoning subsystem can stop reading the
+        # stub 0.0 values per meta_reasoning_rewards.py:317.
+        introspect_signals = self.compute_introspect_signals()
+
         result = {
             "pruned_predictions": pruned,
             "active_predictions": len(self._active_predictions),
             "recent_insights": recent_count,
             "prediction_accuracy": round(self._prediction_accuracy_ema, 4),
+            "introspect_signals": introspect_signals,
         }
 
         logger.info("[SelfReasoning] Dream consolidation: pruned=%d, "
-                    "active=%d, recent_insights=%d, accuracy=%.3f",
+                    "active=%d, recent_insights=%d, accuracy=%.3f, "
+                    "divergence=%.3f",
                     pruned, len(self._active_predictions),
-                    recent_count, self._prediction_accuracy_ema)
+                    recent_count, self._prediction_accuracy_ema,
+                    introspect_signals.get("self_profile_divergence", 0.0))
 
         return result
+
+    def compute_introspect_signals(
+        self, current_profile: Optional['SelfProfile'] = None
+    ) -> dict:
+        """Compute the two INTROSPECT subsystem signals (Sub-phase E).
+
+        Closes `rFP_self_reasoning.md` L1.1-L1.4 + L2.1-L2.3 via the
+        TUNING-012-v2 Sub-phase E plan (which was carried in
+        `finished/rFP_tuning_012_compound_rewards_v2.md` and never
+        shipped before this 2026-05-26 housekeeping pass).
+
+        Returns:
+            {
+              "self_prediction_accuracy": float ∈ [0,1] — from
+                  ``self._prediction_accuracy_ema``. Tracks how well
+                  the engine's predictions about Titan's own state
+                  played out (1.0 = perfect, 0.0 = always wrong).
+              "self_profile_divergence": float ∈ [0,1] — normalized
+                  euclidean distance between current and prior
+                  ``SelfProfile``. 0.0 means identity stable; 1.0
+                  means radically different "I" since last
+                  consolidation. INTROSPECT primitive rewards
+                  detecting *meaningful* divergence (insight) and
+                  punishes flat/identical profiles (no introspection
+                  happened).
+            }
+
+        These are written to meta_engine via
+        ``meta_engine.update_subsystem_cache(self_prediction_accuracy=…,
+        self_profile_divergence=…)`` by the dream-end handler in
+        self_reflection_worker.
+        """
+        # Self-prediction accuracy: EMA already maintained on every
+        # verify_prediction call. Clamp defensively in case the EMA
+        # drifted outside [0,1] from a bad upstream update.
+        accuracy = max(0.0, min(1.0, float(self._prediction_accuracy_ema)))
+
+        # Self-profile divergence: compare current state-snapshot vs
+        # _last_profile. Cold start (no _last_profile) → 1.0 (treat as
+        # maximum divergence — the FIRST consolidation is by definition
+        # a "fully new view of self").
+        divergence = 1.0
+        prior = self._last_profile
+        curr = current_profile
+        if prior is not None and curr is not None:
+            divergence = _profile_divergence(prior, curr)
+        elif prior is not None and curr is None:
+            # No current profile passed — caller didn't build one this
+            # cycle. Return prior_only signal value: we can't compute
+            # divergence so signal 0.0 (no detected change). The
+            # acceptable convention: "no profile = no novel insight".
+            divergence = 0.0
+
+        return {
+            "self_prediction_accuracy": round(accuracy, 4),
+            "self_profile_divergence": round(divergence, 4),
+        }
 
     # ── Self-Exploration Integration ─────────────────────────────────
 

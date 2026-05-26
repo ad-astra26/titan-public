@@ -1057,10 +1057,43 @@ def _handle_dreaming_state_updated(payload: dict, state_refs: dict) -> None:
                     pass  # attribute may be slotted; non-fatal
             if hasattr(sr, "consolidate_training"):
                 try:
-                    sr.consolidate_training()
+                    consolidate_result = sr.consolidate_training()
                     logger.info(
                         "[SelfReflectionWorker] self_reasoning."
                         "consolidate_training() ok")
+                    # L2 / Sub-phase E (housekeeping 2026-05-26):
+                    # push the two INTROSPECT signals to meta-reasoning's
+                    # subsystem cache so the INTROSPECT compound reward
+                    # at meta_reasoning_rewards.py:305 stops reading the
+                    # stub 0.0 default (line 317 comment retired).
+                    introspect_signals = (
+                        consolidate_result.get("introspect_signals")
+                        if isinstance(consolidate_result, dict) else None
+                    )
+                    if introspect_signals:
+                        meta_engine = state_refs.get("meta_engine")
+                        if meta_engine is not None and hasattr(
+                                meta_engine, "update_subsystem_cache"):
+                            try:
+                                meta_engine.update_subsystem_cache(
+                                    self_prediction_accuracy=introspect_signals.get(
+                                        "self_prediction_accuracy"),
+                                    self_profile_divergence=introspect_signals.get(
+                                        "self_profile_divergence"),
+                                )
+                                logger.info(
+                                    "[SelfReflectionWorker] INTROSPECT signals "
+                                    "pushed to meta_engine: accuracy=%.3f "
+                                    "divergence=%.3f",
+                                    introspect_signals.get(
+                                        "self_prediction_accuracy", 0.0),
+                                    introspect_signals.get(
+                                        "self_profile_divergence", 0.0))
+                            except Exception as e:
+                                logger.warning(
+                                    "[SelfReflectionWorker] meta_engine."
+                                    "update_subsystem_cache(INTROSPECT) "
+                                    "failed: %s", e)
                 except Exception as e:
                     logger.warning(
                         "[SelfReflectionWorker] self_reasoning."
