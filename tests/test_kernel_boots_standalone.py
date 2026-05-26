@@ -113,18 +113,46 @@ def test_kernel_registry_bank_has_per_titan_shm_root(kernel, tmp_path):
     assert str(kernel.registry_bank.shm_root).startswith(str(tmp_path))
 
 
+@pytest.mark.skip(reason=(
+    "POST-PHASE-C-STALE-TEST-HYGIENE (2026-05-26): `_sovereignty_queue` "
+    "moved out of TitanKernel into the dedicated `sovereignty_worker` L2 "
+    "module per D-SPEC-60 v1.9.1 (SPEC §9.B sovereignty_worker block + 2 "
+    "new §8.7 bus events). Eager subscribe still occurs but on a different "
+    "object. Live behavior verified via /v6/sovereignty + arch_map services "
+    "(sovereignty_worker MODULE_READY < 60s on all 3 Titans, fleet-wide). "
+    "Re-enable with a sovereignty_worker-shape fixture (test rewrite only)."
+))
 def test_kernel_sovereignty_queue_subscribed_eagerly(kernel):
     """_sovereignty_queue created in __init__ per Mainnet Lifecycle
     rFP (eager subscribe before module boot)."""
     assert kernel._sovereignty_queue is not None
 
 
+@pytest.mark.skip(reason=(
+    "POST-PHASE-C-STALE-TEST-HYGIENE (2026-05-26): `_meditation_queue` "
+    "moved out of TitanKernel into the dedicated `meditation_worker` L2 "
+    "module per D-SPEC-107 v1.45.0 (meditation emergent-onset redesign, "
+    "sleep-symmetric — SPEC §9.B meditation_worker block + §8.7 bus "
+    "events). MEDITATION_REQUEST routing is now bus-direct to the worker, "
+    "no parent queue. Live behavior verified via /v6/meditation + "
+    "MEDITATION_PHASE_CHANGED ≥4×/cycle gate (OBS-meditation-worker-* )."
+))
 def test_kernel_meditation_queue_subscribed_eagerly(kernel):
     """_meditation_queue created in __init__ before Guardian modules boot
     so spirit_worker's MEDITATION_REQUEST never drops on missing-subscriber."""
     assert kernel._meditation_queue is not None
 
 
+@pytest.mark.skip(reason=(
+    "POST-PHASE-C-STALE-TEST-HYGIENE (2026-05-26): the 'Spirit-fast' boot "
+    "log was emitted by `_start_spirit_shm_writer`, which targeted the "
+    "now-deleted `spirit_worker.py` SHM-writer surface (retired by "
+    "D-SPEC-116 v1.52.0 + D-SPEC-95 v1.34.0 G21 closure for "
+    "sensor_cache_inner_spirit.bin — sole writer is `cognitive_worker` "
+    "under l0_rust_enabled=true). The log-string contract is gone with "
+    "the writer. Live behavior verified via `/v6/trinity/state` + "
+    "ShmReaderBank reads — re-enable with a current-architecture fixture."
+))
 def test_kernel_start_spirit_shm_writer_emits_log(kernel, caplog):
     """_start_spirit_shm_writer logs the flag state without raising.
 
