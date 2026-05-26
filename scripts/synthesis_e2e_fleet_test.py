@@ -465,7 +465,7 @@ _KUZU_QUERY_PY = (
 def _kuzu_count(titan: Titan, cypher: str) -> Optional[int]:
     """Execute a Cypher COUNT query against the Titan's Kuzu graph. Soft-
     fails to None — caller WARNs rather than FAILs on infra hiccups."""
-    path = f"{titan.titan_dir}/data/knowledge_graph.kuzu"
+    path = f"{titan.titan_dir}/data/synthesis_spine.kuzu"
     py = _KUZU_QUERY_PY.format(path=path, cypher=cypher.replace("'", "\""))
     # Wrap in source venv so kuzu imports.
     cmd = (

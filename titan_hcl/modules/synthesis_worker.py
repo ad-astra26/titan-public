@@ -573,22 +573,26 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         daemon=True, name=f"synthesis-recompute-{name}")
     rc_thread.start()
 
-    # Phase 4 §P4.A/§P4.H — single canonical Kuzu graph reference used
-    # for BOTH EngineRecall concept-granularity (P4.H) and ConsolidationPass
-    # spine writes (P4.G). Constructed before EngineRecall so the recall
-    # gets a wired kuzu_reader; reused by the ConsolidationPass wiring
-    # below. Soft-fails to None: per-TX recall + ConsolidationPass still
-    # boot; only concept-granularity + spine writes degrade gracefully.
+    # Phase 4 §P4.A/§P4.H — synthesis spine Kuzu graph (G21 sole writer
+    # per INV-Syn-7). Uses its OWN Kuzu file `data/synthesis_spine.kuzu`
+    # — distinct from `data/knowledge_graph.kuzu` which memory_worker
+    # owns in RW for Person/Topic/Trinity entities. Sharing one Kuzu
+    # file across two RW processes triggers Kuzu's exclusive-write-lock
+    # rejection (same class of cross-process conflict the Phase 1 lesson
+    # 1 solved for DuckDB by giving synthesis_worker its own .duckdb).
+    # Cross-process readers open this file with read_only=True (api
+    # process for /v6/synthesis/concepts/* — Kuzu 0.11 supports
+    # concurrent read-only opens against an active writer).
     kuzu_graph_obj: Optional[Any] = None
     try:
         from titan_hcl.core.direct_memory import TitanKnowledgeGraph
         kuzu_graph_obj = TitanKnowledgeGraph(
-            os.path.join(os.path.dirname(db_path) or ".", "knowledge_graph.kuzu"),
+            os.path.join(os.path.dirname(db_path) or ".", "synthesis_spine.kuzu"),
         )
     except Exception as exc:
         logger.warning(
-            "[synthesis_worker] Kuzu graph open failed: %s — spine recall + "
-            "consolidation will degrade to no-op",
+            "[synthesis_worker] Kuzu spine graph open failed: %s — spine "
+            "recall + consolidation will degrade to no-op",
             exc,
         )
 
@@ -675,13 +679,14 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         from titan_hcl.synthesis.consolidation_defaults import (
             default_mine_recent_txs, make_default_llm_propose,
         )
-        # Reuse the kuzu_graph_obj constructed above for EngineRecall —
-        # single-Kuzu-DB invariant (arch §6.1 footnote: all I/O via the
-        # single canonical Kuzu interface).
+        # Reuse the kuzu_graph_obj constructed above for EngineRecall.
+        # Soft-fail if it's missing: the worker keeps running with
+        # consolidation disabled (logged WARN; pass-summary TXs cannot
+        # be anchored, but every other synthesis surface still works).
         if kuzu_graph_obj is None:
             raise RuntimeError(
-                "kuzu_graph_obj unavailable — consolidation cannot wire "
-                "(spine writes need a Kuzu handle)"
+                "kuzu_graph_obj unavailable (synthesis_spine.kuzu open "
+                "failed earlier) — consolidation pass disabled this session"
             )
         kuzu_graph = kuzu_graph_obj
 

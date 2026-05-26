@@ -23,7 +23,7 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_KUZU_PATH = "data/knowledge_graph.kuzu"
+DEFAULT_KUZU_PATH = "data/synthesis_spine.kuzu"
 
 
 # ── Cache (read-only Kuzu handle is moderately expensive to open) ────
@@ -34,9 +34,13 @@ _KUZU_HANDLE_CACHE: dict[str, Any] = {}
 
 def _resolve_kuzu_path() -> str:
     """Pick up TITAN_DATA_DIR like the rest of the stack so tests + shadow
-    directories work without monkey-patching."""
+    directories work without monkey-patching.
+
+    The api process opens the synthesis spine file (NOT memory_worker's
+    knowledge_graph.kuzu) — synthesis_worker is the sole writer of the
+    spine per INV-Syn-7; the api process opens it read-only."""
     data_dir = os.environ.get("TITAN_DATA_DIR", "data")
-    return os.path.join(data_dir, "knowledge_graph.kuzu")
+    return os.path.join(data_dir, "synthesis_spine.kuzu")
 
 
 def _get_kuzu_reader(path: Optional[str] = None) -> Optional[Any]:

@@ -31,7 +31,7 @@ def seeded_kuzu(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setenv("TITAN_DATA_DIR", tmp)
         handlers._reset_cache_for_tests()
-        kuzu_path = os.path.join(tmp, "knowledge_graph.kuzu")
+        kuzu_path = os.path.join(tmp, "synthesis_spine.kuzu")
 
         # Build the graph (read-write — we're the "writer" here).
         g = TitanKnowledgeGraph(kuzu_path)
