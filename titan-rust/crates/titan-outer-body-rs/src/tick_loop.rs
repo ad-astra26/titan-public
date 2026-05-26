@@ -729,23 +729,63 @@ fn project_outer_body_5d(payload: &[u8], last_body: [f32; 5]) -> Result<[f32; 5]
     //   elsewhere). Source: top-level pi_heartbeat_hrv. Per Maker 2026-05-21.
     let interoception: f64 = safe_clamp(field_or_default(Some(map), "pi_heartbeat_hrv", 0.5));
 
-    // ── [1] proprioception ────────────────────────────────────────
-    // Python lines 412-423.
-    let peer_entropy: f64 = field_or_default(net_stats.as_ref(), "peer_entropy", 0.5);
-    let helper_health: f64 = compute_helper_health(helper_statuses.as_ref());
-    let bus_module_diversity: f64 =
-        field_or_default(net_stats.as_ref(), "bus_module_diversity", 0.5);
-    let proprioception: f64 =
-        safe_clamp(0.5 * peer_entropy + 0.3 * helper_health + 0.2 * bus_module_diversity);
+    // ── [1] proprioception RE-GROUNDED (P0.6-B / Maker call 2026-05-26) ──
+    //   D-SPEC-104 pattern: the legacy composite formula (peer_entropy +
+    //   helper_health + bus_module_diversity) produced a near-constant 0.7
+    //   under steady fleet conditions → std=0.02 fleet-wide per audit
+    //   2026-05-25. Re-ground to ChangeBreathTracker's `proprioception_change`
+    //   (computed L2-side by outer_sidecar_providers from the SAME composite
+    //   level — so the dim now breathes on |Δlevel|/dt instead of the level
+    //   itself). Falls back to the legacy composite when outer_body_change
+    //   field is absent (graceful pre-D-SPEC-104 producer compatibility).
+    let proprioception_change_opt: Option<f64> = outer_body_change.as_ref().and_then(|m| {
+        for (k, v) in m.iter() {
+            if let rmpv::Value::String(s) = k {
+                if s.as_str() == Some("proprioception_change") {
+                    return v.as_f64();
+                }
+            }
+        }
+        None
+    });
+    let proprioception: f64 = if let Some(p) = proprioception_change_opt {
+        safe_clamp(p)
+    } else {
+        let peer_entropy: f64 = field_or_default(net_stats.as_ref(), "peer_entropy", 0.5);
+        let helper_health: f64 = compute_helper_health(helper_statuses.as_ref());
+        let bus_module_diversity: f64 =
+            field_or_default(net_stats.as_ref(), "bus_module_diversity", 0.5);
+        safe_clamp(0.5 * peer_entropy + 0.3 * helper_health + 0.2 * bus_module_diversity)
+    };
 
-    // ── [2] somatosensation ───────────────────────────────────────
-    // Python lines 425-442. dim[2] reads previous-tick value (`current_ob2`).
-    // 9G decay-fix: apply exponential decay toward 0.5 per tick to
-    // prevent saturation. See `apply_dim2_decay` rationale.
-    let tx_lat_norm: f64 = field_or_default(tx_lat.as_ref(), "normalized", 0.5);
-    let current_ob2: f64 = apply_dim2_decay(last_body[2] as f64);
-    let cpu_spikes: f64 = field_or_default(sys_stats.as_ref(), "cpu_spike_rate", 0.0);
-    let somatosensation: f64 = safe_clamp(0.4 * tx_lat_norm + 0.3 * current_ob2 + 0.3 * cpu_spikes);
+    // ── [2] somatosensation RE-GROUNDED (P0.6-B / Maker call 2026-05-26) ──
+    //   D-SPEC-104 pattern: legacy formula included `current_ob2` (self-reference
+    //   with decay-toward-0.5) which dominated → dim saturated at ~0.5 fleet-wide
+    //   per audit 2026-05-25. Re-ground to ChangeBreathTracker's
+    //   `somatosensation_change` (L2 composite: tx_lat_norm + cpu_spikes, NO
+    //   self-reference). Falls back to a stateless composite (no current_ob2)
+    //   when the change field is absent.
+    let somatosensation_change_opt: Option<f64> = outer_body_change.as_ref().and_then(|m| {
+        for (k, v) in m.iter() {
+            if let rmpv::Value::String(s) = k {
+                if s.as_str() == Some("somatosensation_change") {
+                    return v.as_f64();
+                }
+            }
+        }
+        None
+    });
+    let somatosensation: f64 = if let Some(s) = somatosensation_change_opt {
+        safe_clamp(s)
+    } else {
+        let tx_lat_norm: f64 = field_or_default(tx_lat.as_ref(), "normalized", 0.5);
+        let cpu_spikes: f64 = field_or_default(sys_stats.as_ref(), "cpu_spike_rate", 0.0);
+        safe_clamp(0.6 * tx_lat_norm + 0.4 * cpu_spikes)
+    };
+    // Suppress the apply_dim2_decay helper warning by tagging the previous
+    // self-reference value as observed (kept for future telemetry; the new
+    // re-grounded path no longer depends on it).
+    let _retired_current_ob2 = apply_dim2_decay(last_body[2] as f64);
 
     // ── [3] entropy RE-GROUNDED (D-SPEC-101 Phase-2) ──────────────────
     //   RATE OF CHANGE of the system-entropy level over a minutes-scale window

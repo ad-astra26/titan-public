@@ -788,12 +788,34 @@ pub fn project_outer_mind_15d(payload: &[u8], outer_body: [f32; 5]) -> Result<[f
     // vocab_stats not yet in outer_mind SOURCE_KEYS → defaults 0.5.
     let mc_usage_gini: f64 = field_or_default(meta_cgn.as_ref(), "usage_gini", 0.5);
     let vocab_avg_confidence: f64 = 0.5; // vocab_stats not yet plumbed
-    thinking[1] = safe_clamp(
-        0.35 * memory_directive_alignment
-            + 0.25 * mc_knowledge_helpful
-            + 0.20 * vocab_avg_confidence
-            + 0.20 * (1.0 - mc_usage_gini),
-    );
+                                         // P0.6-B re-grounding (D-SPEC-104 / Maker call 2026-05-26): thinking[1]
+                                         // (= outer_mind[71] in 132D state_vector) was the std=0.007 worst-flat
+                                         // dim fleet-wide per audit 2026-05-25 because its input is a slow-aggregate
+                                         // composite (memory.directive_alignment + meta_cgn.knowledge_helpful
+                                         // + vocab_conf + 1-gini). Re-ground via outer_mind_change.thinking_1_change
+                                         // (ChangeBreathTracker over the same composite level — L2-side).
+                                         // Graceful fallback to the legacy level when the change field is absent.
+    let outer_mind_change = lookup_map(map, "outer_mind_change");
+    let thinking_1_change_opt: Option<f64> = outer_mind_change.as_ref().and_then(|m| {
+        for (k, v) in m.iter() {
+            if let rmpv::Value::String(s) = k {
+                if s.as_str() == Some("thinking_1_change") {
+                    return v.as_f64();
+                }
+            }
+        }
+        None
+    });
+    thinking[1] = if let Some(t1) = thinking_1_change_opt {
+        safe_clamp(t1)
+    } else {
+        safe_clamp(
+            0.35 * memory_directive_alignment
+                + 0.25 * mc_knowledge_helpful
+                + 0.20 * vocab_avg_confidence
+                + 0.20 * (1.0 - mc_usage_gini),
+        )
+    };
 
     // [2] situational_awareness — SPEC §23.8 REDESIGNED:
     // 0.5*(1/(1+t_since_last_event/1800)) + 0.3*min(1, events_teacher.felt_experiences_24h/20)
