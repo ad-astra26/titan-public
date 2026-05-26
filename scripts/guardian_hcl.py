@@ -211,32 +211,44 @@ def _build_bus_and_client(titan_id: str, config: dict):
 
 
 def _start_inbound_dispatcher(bus, client, stop_event: threading.Event) -> threading.Thread:
-    """Drain the BusSocketClient inbound queue into the local DivineBus.
+    """Drain the BusSocketClient inbound deque into the local DivineBus.
 
     Mirrors TitanKernel._bus_client_inbound_dispatcher (kernel.py). Inbound
-    messages from the broker arrive on client.inbound_q; we re-publish them
-    onto the local DivineBus so Guardian's local subscribers (the "guardian"
-    queue registered in Guardian.__init__) receive them.
+    messages arrive on `client._inbound: deque` (protected by
+    `client._inbound_lock` + signalled via `client._wake_cond`). We block
+    on `_wake_cond.wait_for(predicate)` until data is available OR the
+    client is stopping, then drain everything pending and re-publish each
+    on the local DivineBus via `publish_in_process` (no broker echo).
+
+    The previous implementation called `client.inbound_q.get(...)` —
+    BusSocketClient has NO `inbound_q` attribute, so the `.get(...)` raised
+    AttributeError every iteration, caught by `except Exception: continue`,
+    and the dispatcher silently looped forever doing nothing. Workers' MODULE_READY
+    and MODULE_HEARTBEAT events arrived at the BusSocketClient but were never
+    relayed to Guardian → Guardian's internal `_modules[name].state` stayed
+    at the post-spawn STARTING value forever → GuardianStatePublisher wrote
+    state="starting" into guardian_state.bin → /health saw 44 modules DEGRADED.
+    Live-found on T3 cascade verification 2026-05-26.
     """
+    logger = logging.getLogger(__name__)
+    inbound_lock = client._inbound_lock
+    wake_cond = client._wake_cond
+    inbound_deque = client._inbound
+    stop_evt = client._stop_event  # client's own stop
+
     def _loop():
-        from queue import Empty
+        predicate = lambda: bool(inbound_deque) or stop_evt.is_set() or stop_event.is_set()
         while not stop_event.is_set():
-            try:
-                msg = client.inbound_q.get(timeout=0.5)
-            except Empty:
-                continue
-            except Exception:
-                continue
-            if msg is None:
-                continue
-            try:
-                # Re-inject into local bus. publish_in_process avoids the
-                # client-outbound path so we don't loop the message back to
-                # the broker.
-                bus.publish_in_process(msg)
-            except Exception as e:  # noqa: BLE001
-                logging.getLogger(__name__).debug(
-                    "[guardian_hcl] inbound re-publish error: %s", e)
+            with inbound_lock:
+                wake_cond.wait_for(predicate, timeout=1.0)
+                # Drain everything pending under the lock — fast deque pop
+                drained = list(inbound_deque)
+                inbound_deque.clear()
+            for msg in drained:
+                try:
+                    bus.publish_in_process(msg)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("[guardian_hcl] inbound re-publish error: %s", e)
 
     t = threading.Thread(
         target=_loop, name="guardian-hcl-inbound", daemon=True)
