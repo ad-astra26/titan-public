@@ -102,14 +102,26 @@ class ExpressionStatePublisher:
         self,
         translator: Any,
         manager: Optional[Any] = None,
+        translator_stats: Optional[dict] = None,
     ) -> None:
         """
         Compute payload from translator + (optional) manager and write
         to expression_state.bin. Cold-boot safe — if translator is None
         or missing expected methods, publish stub payload.
+
+        L3 housekeeping closure 2026-05-26: ``translator_stats`` is the
+        cross-process alternative for callers that don't hold the live
+        translator object (i.e. expression_worker under
+        ``l0_rust_enabled=true``). When supplied, it overrides the
+        translator-call path — the publisher uses the snapshot directly
+        instead of invoking translator.get_stats(). Expected shape:
+        ``{"sovereignty_ratio", "learned_actions", "llm_actions",
+        "total_actions", "top_mappings", "total_learned_pairs",
+        "posture_authenticity_ratio_30"}``. Missing keys default to
+        their stub values — partial snapshots are safe.
         """
         self._publish_count += 1
-        payload = self._compute_payload(translator, manager)
+        payload = self._compute_payload(translator, manager, translator_stats)
         self._write(payload)
 
         if self._publish_count in _HEARTBEAT_TICKS:
@@ -123,9 +135,18 @@ class ExpressionStatePublisher:
         self,
         translator: Any,
         manager: Optional[Any],
+        translator_stats: Optional[dict] = None,
     ) -> dict:
-        # ExpressionTranslator.get_stats() — sovereignty + action mix.
-        if translator is not None:
+        # L3 housekeeping (2026-05-26): cross-process snapshot path —
+        # expression_worker under l0_rust_enabled=true receives stats
+        # via EXPRESSION_TRANSLATOR_STATS_UPDATED bus event (emitted
+        # by main plugin's translator owner) and passes them here
+        # instead of holding the translator object directly.
+        if translator_stats is not None:
+            tstats = dict(translator_stats)
+            par30 = float(tstats.pop(
+                "posture_authenticity_ratio_30", 0.0) or 0.0)
+        elif translator is not None:
             try:
                 tstats = translator.get_stats()
             except Exception:

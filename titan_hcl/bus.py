@@ -575,6 +575,7 @@ MEMORY_KNOWLEDGE_GRAPH_UPDATED = "MEMORY_KNOWLEDGE_GRAPH_UPDATED"  # memory → 
 TOPOLOGY_STATE_UPDATED = "TOPOLOGY_STATE_UPDATED"              # spirit → all (topology.state — Batch E)
 REASONING_STATS_UPDATED = "REASONING_STATS_UPDATED"            # spirit → all (reasoning.state)
 EXPRESSION_COMPOSITES_UPDATED = "EXPRESSION_COMPOSITES_UPDATED"  # spirit → all (expression.composites)
+EXPRESSION_TRANSLATOR_STATS_UPDATED = "EXPRESSION_TRANSLATOR_STATS_UPDATED"  # parent (translator owner) → expression_worker (L3 housekeeping closure 2026-05-26)
 NEUROMOD_STATS_UPDATED = "NEUROMOD_STATS_UPDATED"              # spirit → all (neuromods.full)
 # Producer-event change-edge notifications. Consumed by trinity 130D dim
 # formulas (plugin._STATS_CACHE_EVENT_TYPES) + observatory writers; api

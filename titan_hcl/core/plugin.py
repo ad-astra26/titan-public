@@ -2144,6 +2144,58 @@ class TitanHCL:
                     "[TitanHCL] expression_state.bin publisher SKIPPED under "
                     "l0_rust_enabled=true — owned by expression_worker (G21)")
                 self._expression_state_pub = None
+                # L3 housekeeping closure 2026-05-26: bridge translator
+                # stats to expression_worker via bus so the SHM slot's
+                # translator-derived fields are real values (not the
+                # default stubs the slot otherwise carries under
+                # l0_rust=true). Translator stays in main plugin (action
+                # selection is on the impulse-handling hot path — RPC
+                # would add unacceptable latency); we emit a low-rate
+                # informational snapshot the worker subscribes to.
+                def _expression_translator_stats_emit_loop() -> None:
+                    time.sleep(20)  # let translator finish boot warm-up
+                    while True:
+                        try:
+                            tr = getattr(self, "_expression_translator", None)
+                            if tr is not None:
+                                try:
+                                    tstats = tr.get_stats() or {}
+                                except Exception as _gs_err:
+                                    logger.debug(
+                                        "[ExpressionTranslatorStatsBridge] "
+                                        "get_stats raised: %s", _gs_err)
+                                    tstats = {}
+                                try:
+                                    par30 = float(
+                                        tr.posture_authenticity_ratio_30())
+                                except (AttributeError, TypeError, ValueError):
+                                    par30 = 0.0
+                                payload = dict(tstats)
+                                payload["posture_authenticity_ratio_30"] = par30
+                                payload["ts"] = time.time()
+                                try:
+                                    self.bus.publish(make_msg(
+                                        bus.EXPRESSION_TRANSLATOR_STATS_UPDATED,
+                                        src="parent",
+                                        dst="expression_worker",
+                                        payload=payload,
+                                    ))
+                                except Exception as _pub_err:
+                                    logger.debug(
+                                        "[ExpressionTranslatorStatsBridge] "
+                                        "publish failed: %s", _pub_err)
+                        except Exception as _outer_err:
+                            logger.debug(
+                                "[ExpressionTranslatorStatsBridge] loop: %s",
+                                _outer_err)
+                        time.sleep(5.0)
+                threading.Thread(
+                    target=_expression_translator_stats_emit_loop,
+                    name="expression-translator-stats-bridge",
+                    daemon=True).start()
+                logger.info(
+                    "[TitanHCL] ExpressionTranslator stats bridge started "
+                    "(5s; l0_rust=true L3 closure)")
             else:
                 try:
                     from titan_hcl.logic.expression_state_publisher import (

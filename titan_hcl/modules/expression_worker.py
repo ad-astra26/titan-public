@@ -143,6 +143,11 @@ _OPTIONAL_TOPICS = [
     "EXPRESSION_RELIEF",
     "DREAM_STATE_CHANGED",
     "REASONING_STATS_UPDATED",
+    # L3 housekeeping closure 2026-05-26: cross-process translator
+    # stats bridge — parent (translator owner under l0_rust=true)
+    # publishes a snapshot every ~5s; we cache it for the next 1Hz
+    # SHM publish so translator-derived fields stop reading defaults.
+    "EXPRESSION_TRANSLATOR_STATS_UPDATED",
 ]
 
 
@@ -570,6 +575,17 @@ def expression_worker_main(recv_queue, send_queue, name: str,
     _dream_active = False
     _developmental_age = 0  # default; updated when pi_monitor publishes
 
+    # L3 housekeeping closure 2026-05-26: cross-process ExpressionTranslator
+    # stats cache. Main plugin emits EXPRESSION_TRANSLATOR_STATS_UPDATED
+    # every ~5s under l0_rust_enabled=true; we cache the most recent
+    # snapshot here and feed it into the 1Hz SHM publish so the
+    # translator-derived fields on the slot (sovereignty_ratio,
+    # learned_actions, llm_actions, total_actions, top_mappings,
+    # total_learned_pairs, posture_authenticity_ratio_30) carry real
+    # values instead of the default stubs. None means no snapshot has
+    # arrived yet (cold start) — publisher falls back to defaults.
+    _translator_stats_cache: dict | None = None
+
     # MODULE_READY + EXPRESSION_WORKER_READY (informational).
     _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
         "titan_id": titan_id, "ts": boot_ts,
@@ -638,11 +654,17 @@ def expression_worker_main(recv_queue, send_queue, name: str,
                 if state_publisher is not None and \
                         now - last_shm > _SHM_PUBLISH_INTERVAL_S:
                     try:
-                        # translator=None — ExpressionTranslator lives in
-                        # main plugin process; its fields are published
-                        # as defaults until a follow-up rFP migrates the
-                        # translator state into this worker.
-                        state_publisher.publish(None, expression_manager)
+                        # L3 housekeeping 2026-05-26: pass the cached
+                        # translator_stats snapshot (received every ~5s
+                        # via EXPRESSION_TRANSLATOR_STATS_UPDATED from
+                        # main plugin) so translator-derived fields on
+                        # the SHM slot stop reading defaults. None →
+                        # cold-start or l0_rust=false fallback (parent
+                        # publishes the slot directly in that mode and
+                        # this worker isn't writing).
+                        state_publisher.publish(
+                            None, expression_manager,
+                            translator_stats=_translator_stats_cache)
                     except Exception as _shmerr:
                         logger.warning(
                             "[ExpressionWorker] state publish raised: %s",
@@ -780,6 +802,22 @@ def expression_worker_main(recv_queue, send_queue, name: str,
                     _dream_active)
             except Exception:
                 pass
+            continue
+
+        # L3 housekeeping 2026-05-26: cache translator stats snapshot
+        # from main plugin so the next 1Hz SHM publish carries real
+        # values for translator-derived fields. ~5s emit cadence from
+        # parent under l0_rust_enabled=true.
+        if hasattr(bus, "EXPRESSION_TRANSLATOR_STATS_UPDATED") and \
+                msg_type == bus.EXPRESSION_TRANSLATOR_STATS_UPDATED:
+            try:
+                pl = msg.get("payload") or {}
+                if isinstance(pl, dict):
+                    _translator_stats_cache = dict(pl)
+            except Exception as _tserr:
+                logger.debug(
+                    "[ExpressionWorker] EXPRESSION_TRANSLATOR_STATS_UPDATED "
+                    "cache update raised: %s", _tserr)
             continue
 
         logger.debug(
