@@ -74,7 +74,7 @@ async fn main() -> ExitCode {
 
     // Phase C C-S7 activation prep (2026-05-05): production runs MUST spawn
     // the Python plugin (titan_HCL — runs Guardian + L2/L3 modules + API).
-    // KernelRunOptions::default() ships with spawn_guardian_hcl=false because tests
+    // KernelRunOptions::default() ships with spawn_python=false because tests
     // construct it without overrides; production explicitly flips it on here.
     // Per SPEC §10.A B9 + §9.B titan_HCL row.
     //
@@ -88,7 +88,7 @@ async fn main() -> ExitCode {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let options = KernelRunOptions {
-        spawn_guardian_hcl: !skip_python,
+        spawn_python: !skip_python,
         ..KernelRunOptions::default()
     };
 

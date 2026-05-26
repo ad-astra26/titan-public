@@ -30,7 +30,7 @@ def test_guardian_cleanup_uses_cancel_join_thread():
     cleanup invariant is preserved by the chain — we now verify the chain
     by inspecting both functions.
     """
-    from titan_hcl import guardian_hcl as guardian
+    from titan_hcl import guardian
 
     src_cleanup = inspect.getsource(guardian.Guardian._cleanup_module)
     src_finalize = inspect.getsource(guardian.Guardian._finalize_module_cleanup)

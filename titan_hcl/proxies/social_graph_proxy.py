@@ -50,7 +50,7 @@ from ..core.state_registry import (
     ensure_shm_root,
     resolve_titan_id,
 )
-from ..guardian_hcl import Guardian
+from ..guardian import Guardian
 from ..logic.social_graph_state_specs import (
     SOCIAL_GRAPH_STATE_SLOT,
     SOCIAL_GRAPH_STATE_SPEC,

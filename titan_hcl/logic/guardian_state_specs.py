@@ -12,7 +12,7 @@ Phase A.4. Single source of truth shared by:
         guardian.status bus-cache)
       * StateAccessor.guardian.get_modules_by_layer
       * dashboard /v4/state.guardian section (currently goes through
-        request.app.state.titan_hcl.guardian_hcl.get_status which is the
+        request.app.state.titan_hcl.guardian.get_status which is the
         kernel_rpc proxy path — this slot lets api_subprocess read SHM
         directly, removing the cross-process call)
 

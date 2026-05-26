@@ -90,7 +90,7 @@ pub struct KernelRunOptions {
     /// `false` → skip spawning the substrate placeholder (tests).
     pub spawn_substrate: bool,
     /// `false` → skip spawning `python -m titan_hcl` (tests).
-    pub spawn_guardian_hcl: bool,
+    pub spawn_python: bool,
     /// Path to the substrate placeholder binary. None → use a default
     /// resolved relative to `target/debug/`.
     pub substrate_binary: Option<PathBuf>,
@@ -102,10 +102,10 @@ impl Default for KernelRunOptions {
     fn default() -> Self {
         Self {
             spawn_substrate: true,
-            // spawn_guardian_hcl defaults FALSE so test fixtures don't have to
+            // spawn_python defaults FALSE so test fixtures don't have to
             // tear down a Python child. PRODUCTION main.rs explicitly flips
             // this to TRUE per Phase C C-S7 activation prep + SPEC §10.A B9.
-            spawn_guardian_hcl: false,
+            spawn_python: false,
             substrate_binary: None,
             auto_shutdown_after: None,
         }
@@ -288,7 +288,7 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
             .or_else(|| Some("python3".into()))
             .map(PathBuf::from),
         python_cwd: std::env::current_dir().ok(),
-        spawn_guardian_hcl: options.spawn_guardian_hcl,
+        spawn_python_main: options.spawn_python,
     };
 
     // Phase C C-S7 Gap B (2026-05-05): wire substrate + python_main spawns
@@ -335,7 +335,7 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
     }
 
     // B9: spawn python_main via supervisor
-    if options.spawn_guardian_hcl {
+    if options.spawn_python {
         info!(
             event = "BOOT_B9_SPAWN_PYTHON",
             "B9 spawning python -m titan_hcl via KernelChildSupervisor"
@@ -363,7 +363,7 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
         event = "BOOT_COMPLETE",
         boot_generation,
         spawned_substrate = options.spawn_substrate,
-        spawned_python = options.spawn_guardian_hcl,
+        spawned_python = options.spawn_python,
         "kernel boot complete; entering steady state"
     );
 

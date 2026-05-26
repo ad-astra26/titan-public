@@ -51,7 +51,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use crate::spawn::{spawn_guardian_hcl, spawn_substrate, SpawnConfig, SpawnError};
+use crate::spawn::{spawn_python_main, spawn_substrate, SpawnConfig, SpawnError};
 use crate::supervision_log::{JsonlSupervisionPublisher, SupervisionLogError};
 
 /// Canonical child name for the trinity-substrate (titan-trinity-rs)
@@ -201,7 +201,7 @@ impl KernelChildSupervisor {
     pub fn spawn_and_watch_python(
         self: &Arc<Self>,
     ) -> Result<Option<JoinHandle<()>>, KernelSupervisorError> {
-        let child_opt = spawn_guardian_hcl(&self.spawn_config).map_err(|source| {
+        let child_opt = spawn_python_main(&self.spawn_config).map_err(|source| {
             KernelSupervisorError::Spawn {
                 child: CHILD_NAME_PYTHON.to_string(),
                 source,
@@ -285,7 +285,7 @@ impl KernelChildSupervisor {
                     );
                     // Re-spawn via the same spawn function used at boot.
                     let respawn = if is_python {
-                        match spawn_guardian_hcl(&self.spawn_config) {
+                        match spawn_python_main(&self.spawn_config) {
                             Ok(Some(c)) => Some(c),
                             Ok(None) => None,
                             Err(e) => {
