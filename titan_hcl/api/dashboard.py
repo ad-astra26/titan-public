@@ -12133,21 +12133,3 @@ async def get_v4_admin_parent_threads(request: Request):
     except Exception as e:
         logger.error("[Dashboard] /v4/admin/parent-threads error: %s", e)
         return _error(str(e))
-
-
-# ─── Phase 4 §P4.I — synthesis concept-spine endpoints ─────────────────
-# Re-exports from titan_hcl/api/synthesis_concept_handlers.py so the v6.py
-# ROUTE_TABLE's `getattr(_dash, func_name)` resolves them without further
-# machinery change. The handlers themselves live in the synthesis module
-# because they open the canonical Kuzu graph; they're surfaced here purely
-# to fit the v6 wiring convention.
-from titan_hcl.api.synthesis_concept_handlers import (
-    get_synthesis_concepts,
-    get_synthesis_concept,
-    get_synthesis_concepts_heatmap,
-)
-
-# Aliases that fit v6 ROUTE_TABLE naming conventions.
-get_v6_synthesis_concepts = get_synthesis_concepts
-get_v6_synthesis_concept = get_synthesis_concept
-get_v6_synthesis_concepts_heatmap = get_synthesis_concepts_heatmap

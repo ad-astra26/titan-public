@@ -737,6 +737,38 @@ def agno_worker_main(recv_queue, send_queue, name: str,
             "return error responses: %s", e,
         )
 
+    # ── D-SPEC-138 (v1.63.1, 2026-05-26) — Eager OVG warmup ──
+    # OutputVerifier construction (Solana keypair load + TimeChain.open) is
+    # ~30s cold-start on T1 (50 MB mainnet chain). Pre-D-SPEC-138 the OVG
+    # was lazy-instantiated via `worker_plugin._output_verifier` property on
+    # the FIRST chat's PostHook before_ovg → after_ovg stage. That moved
+    # the cold-start latency into the request critical path, blowing past
+    # the 90s AgnoBridge CHAT_REQUEST timeout for the very first chat on
+    # a freshly-spawned worker. With Guardian RSS-limit restarts hitting
+    # agno_worker frequently (separate root-cause investigation), every
+    # subsequent chat hit the same cold start → permanent T1 timeout
+    # cascade. Eager-init at boot moves the latency where it belongs (out
+    # of the request path) and matches the same anti-pattern-correction
+    # discipline as D-SPEC-134 (`lazy init in critical path = anti-pattern`).
+    if worker_plugin is not None:
+        try:
+            ovg_start = time.time()
+            _ = worker_plugin._output_verifier  # triggers lazy init now, at boot
+            logger.info(
+                "[AgnoWorker] OVG warmed in %.0fms (eager init at boot — "
+                "D-SPEC-138; closes first-chat cold-start cascade)",
+                (time.time() - ovg_start) * 1000,
+            )
+        except Exception as _ovg_err:
+            # Defense-in-depth: if eager init fails, the lazy-init path
+            # still works on first chat. The warning surfaces the regression
+            # without blocking boot.
+            logger.warning(
+                "[AgnoWorker] OVG eager-init failed (lazy retry will run "
+                "on first chat — first-chat latency will spike): %s",
+                _ovg_err,
+            )
+
     # ── SHM publisher (G21 single-writer for agno_state.bin) ──
     try:
         publisher = AgnoStatePublisher(name=name)

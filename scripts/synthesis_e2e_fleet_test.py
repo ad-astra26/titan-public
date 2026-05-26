@@ -86,10 +86,9 @@ class TitanResults:
     p1: list[CheckResult] = field(default_factory=list)
     p2: list[CheckResult] = field(default_factory=list)
     p3: list[CheckResult] = field(default_factory=list)
-    p4: list[CheckResult] = field(default_factory=list)
 
     def all_checks(self) -> list[CheckResult]:
-        return self.p0 + self.p1 + self.p2 + self.p3 + self.p4
+        return self.p0 + self.p1 + self.p2 + self.p3
 
     def any_failed(self) -> bool:
         return any(c.status == "FAIL" for c in self.all_checks())
@@ -447,175 +446,6 @@ def check_p3(titan: Titan, baseline: dict) -> list[CheckResult]:
 
 
 # ---------------------------------------------------------------------------
-# Phase 4 §P4.J — concept-spine substrate checks
-# ---------------------------------------------------------------------------
-
-# Helper: run Cypher against the Titan's read-only Kuzu graph via a small
-# Python invocation. Returns the first row's first column as a string, or
-# None on any failure.
-_KUZU_QUERY_PY = (
-    "import kuzu, sys; "
-    "db = kuzu.Database('{path}', read_only=True); "
-    "c = kuzu.Connection(db); "
-    "qr = c.execute('{cypher}'); "
-    "print(qr.get_next()[0] if qr.has_next() else 0)"
-)
-
-
-def _kuzu_count(titan: Titan, cypher: str) -> Optional[int]:
-    """Execute a Cypher COUNT query against the Titan's Kuzu graph. Soft-
-    fails to None — caller WARNs rather than FAILs on infra hiccups."""
-    path = f"{titan.titan_dir}/data/synthesis_spine.kuzu"
-    py = _KUZU_QUERY_PY.format(path=path, cypher=cypher.replace("'", "\""))
-    # Wrap in source venv so kuzu imports.
-    cmd = (
-        f"cd {titan.titan_dir} && source test_env/bin/activate && "
-        f"python -c \"{py}\""
-    )
-    rc, out, _err = run_cmd(titan.host, cmd, timeout=15.0)
-    if rc != 0:
-        return None
-    try:
-        return int(out.strip().splitlines()[-1])
-    except (ValueError, IndexError):
-        return None
-
-
-def check_p4(titan: Titan, baseline: dict) -> list[CheckResult]:
-    """6 substrate-side-effect checks for Phase 4 concept spines. Per
-    PLAN_synthesis_engine_Phase4.md §P4.J:
-      kuzu-spine-active, composition-edges-present (WARN below 1),
-      groundedness-populated (WARN below 80%), version-bump-anchored,
-      spreading-active, consolidation-fired (WARN — timing-sensitive)."""
-    results: list[CheckResult] = []
-
-    # P4.1 — Kuzu spine populated.
-    concept_count = _kuzu_count(titan, "MATCH (c:Concept) RETURN COUNT(c)")
-    if concept_count is None:
-        results.append(CheckResult("P4.kuzu-spine-active", "WARN",
-                                   "Kuzu probe failed (graph not accessible "
-                                   "or read-only open blocked by writer)"))
-    elif concept_count > 0:
-        results.append(CheckResult("P4.kuzu-spine-active", "PASS",
-                                   f"{concept_count} Concept row(s) in spine"))
-    else:
-        # Fresh fleet pre-first-consolidation = legitimately empty.
-        results.append(CheckResult("P4.kuzu-spine-active", "WARN",
-                                   "0 Concept rows — first consolidation pass "
-                                   "may not have fired yet (DREAM_STATE_CHANGED)"))
-
-    # P4.2 — Composition edges (COMPOSED_FROM).
-    edge_count = _kuzu_count(
-        titan, "MATCH ()-[r:COMPOSED_FROM]->() RETURN COUNT(r)",
-    )
-    if edge_count is None:
-        results.append(CheckResult("P4.composition-edges-present", "WARN",
-                                   "edge probe failed"))
-    elif edge_count >= 1:
-        results.append(CheckResult("P4.composition-edges-present", "PASS",
-                                   f"{edge_count} COMPOSED_FROM edge(s)"))
-    else:
-        results.append(CheckResult("P4.composition-edges-present", "WARN",
-                                   "0 COMPOSED_FROM edges — no spine "
-                                   "composition consolidated yet"))
-
-    # P4.3 — Groundedness populated (>0 on ≥80% of concepts).
-    if concept_count and concept_count > 0:
-        grounded = _kuzu_count(
-            titan,
-            "MATCH (c:Concept) WHERE c.groundedness > 0 RETURN COUNT(c)",
-        )
-        if grounded is None:
-            results.append(CheckResult("P4.groundedness-populated", "WARN",
-                                       "groundedness probe failed"))
-        else:
-            pct = 100.0 * grounded / concept_count
-            if pct >= 80.0:
-                results.append(CheckResult("P4.groundedness-populated", "PASS",
-                                           f"{grounded}/{concept_count} "
-                                           f"({pct:.0f}%) concepts grounded"))
-            else:
-                results.append(CheckResult("P4.groundedness-populated", "WARN",
-                                           f"{grounded}/{concept_count} "
-                                           f"({pct:.0f}%) — below 80% threshold"))
-    else:
-        results.append(CheckResult("P4.groundedness-populated", "SKIP",
-                                   "no concepts to assess"))
-
-    # P4.4 — concept-version TX anchored on chain.
-    sql = (
-        "SELECT COUNT(*) FROM block_index WHERE tags LIKE '%concept_version%'"
-    )
-    rc, out, _err = run_cmd(
-        titan.host,
-        f"sqlite3 {titan.titan_dir}/data/timechain/index.db \"{sql}\" "
-        "2>/dev/null || echo 0",
-        timeout=10.0,
-    )
-    try:
-        version_tx_count = int(out.strip().splitlines()[-1])
-    except (ValueError, IndexError):
-        version_tx_count = 0
-    if version_tx_count >= 1:
-        results.append(CheckResult("P4.version-bump-anchored", "PASS",
-                                   f"{version_tx_count} concept_version TX(s) "
-                                   f"on chain"))
-    else:
-        results.append(CheckResult("P4.version-bump-anchored", "WARN",
-                                   "0 concept_version TXs on chain yet — "
-                                   "no successful create_concept/bump pass"))
-
-    # P4.5 — spreading-activation contribution observed in journal.
-    # synthesis_worker logs composite_score spreading via [EngineRecall] /
-    # [composite_score] when w_s contribution > 0. We grep last 24h.
-    cmd = (
-        f"journalctl -u {titan.journal_unit} --since '24 hours ago' "
-        f"2>/dev/null | grep -c 'spreading' || echo 0"
-    )
-    rc, out, _err = run_cmd(titan.host, cmd, timeout=10.0)
-    try:
-        spreading_lines = int(out.strip().splitlines()[-1])
-    except (ValueError, IndexError):
-        spreading_lines = 0
-    if spreading_lines >= 1:
-        results.append(CheckResult("P4.spreading-active", "PASS",
-                                   f"{spreading_lines} spreading log line(s) "
-                                   f"in last 24h"))
-    else:
-        results.append(CheckResult("P4.spreading-active", "WARN",
-                                   "no spreading log lines in last 24h — "
-                                   "w_s contribution may be 0 (empty spine)"))
-
-    # P4.6 — consolidation_pass TX anchored in last 24h.
-    sql6 = (
-        "SELECT COUNT(*) FROM block_index "
-        "WHERE tags LIKE '%consolidation_pass%' AND ts > strftime('%s','now')-86400"
-    )
-    rc, out, _err = run_cmd(
-        titan.host,
-        f"sqlite3 {titan.titan_dir}/data/timechain/index.db \"{sql6}\" "
-        "2>/dev/null || echo 0",
-        timeout=10.0,
-    )
-    try:
-        consol_count = int(out.strip().splitlines()[-1])
-    except (ValueError, IndexError):
-        consol_count = 0
-    if consol_count >= 1:
-        results.append(CheckResult("P4.consolidation-fired", "PASS",
-                                   f"{consol_count} consolidation_pass TX(s) "
-                                   f"in last 24h"))
-    else:
-        # Timing-sensitive: dream-boundary may not have fired within
-        # E2E window. WARN, not FAIL.
-        results.append(CheckResult("P4.consolidation-fired", "WARN",
-                                   "no consolidation_pass TXs in last 24h "
-                                   "(dream-boundary may not have fired)"))
-
-    return results
-
-
-# ---------------------------------------------------------------------------
 # Baseline capture (pre-chat) — needed for delta checks
 # ---------------------------------------------------------------------------
 
@@ -711,14 +541,13 @@ def run_titan(titan: Titan) -> TitanResults:
     res.p1.extend(check_p1(titan, base))
     res.p2.extend(check_p2(titan, base))
     res.p3.extend(check_p3(titan, base))
-    res.p4.extend(check_p4(titan, base))
     return res
 
 
 def print_summary(all_results: list[TitanResults]) -> int:
     """Print summary matrix. Return exit code (0 = no FAIL, 1 = at least one FAIL)."""
     print("\n" + "=" * 70)
-    print(" SYNTHESIS P0-P4 FLEET E2E SUMMARY")
+    print(" SYNTHESIS P0-P3 FLEET E2E SUMMARY")
     print("=" * 70)
     total_fail = 0
     total_warn = 0
@@ -726,8 +555,7 @@ def print_summary(all_results: list[TitanResults]) -> int:
     total_pass = 0
     for r in all_results:
         print(f"\n  [{r.titan}]")
-        for phase, checks in [("P0", r.p0), ("P1", r.p1), ("P2", r.p2),
-                              ("P3", r.p3), ("P4", r.p4)]:
+        for phase, checks in [("P0", r.p0), ("P1", r.p1), ("P2", r.p2), ("P3", r.p3)]:
             for c in checks:
                 glyph = {"PASS": "✓", "WARN": "⚠", "FAIL": "✗", "SKIP": "·"}.get(c.status, "?")
                 print(f"    {glyph} {phase}/{c.name:<40} {c.status:<5} {c.detail}")
