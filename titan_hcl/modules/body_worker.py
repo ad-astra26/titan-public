@@ -1051,18 +1051,6 @@ def _start_fast_path(thresholds: dict, config: dict, stop_event,
                 InnerBodySensorRefresh)
             import msgpack as _msgpack
 
-            # P0.6-B re-grounding (D-SPEC-104 / Maker call 2026-05-26):
-            # inner_body[3] = entropy was std=0.016–0.020 fleet-wide per audit
-            # 2026-05-25 because the raw composite (error_score + net_entropy)
-            # is mostly low + stable. Re-ground the dim's `value` field via a
-            # module-local ChangeBreathTracker so the dim reflects |Δlevel|/dt
-            # rather than the level itself. Severity + velocity stay as-is
-            # (Rust formula still applies its urgency aggregate).
-            from titan_hcl.logic.expression_window_tracker import (
-                ChangeBreathTracker as _CBT,
-            )
-            _entropy_change_tracker = _CBT()
-
             def _provide_body_source_dict() -> bytes:
                 # Per-sense raw readings (value + severity + velocity from
                 # rolling history). Rust applies urgency formula:
@@ -1083,7 +1071,6 @@ def _start_fast_path(thresholds: dict, config: dict, stop_event,
                     ("thermal", _sense_thermal),
                 ]
                 senses = {}
-                _now_for_entropy = time.time()
                 for name, fn in sense_fns:
                     try:
                         reading = fn(thresholds)
@@ -1101,15 +1088,8 @@ def _start_fast_path(thresholds: dict, config: dict, stop_event,
                         "severity": reading["severity"],
                     })
                     velocity = _calculate_velocity(history_dq)
-                    raw_value = float(reading["value"])
-                    if name == "entropy":
-                        # Re-ground to rate-of-change of raw entropy level.
-                        _ch = _entropy_change_tracker.update(
-                            _now_for_entropy, {"entropy": raw_value}
-                        )
-                        raw_value = float(_ch.get("entropy_change", 0.0))
                     senses[name] = {
-                        "value": raw_value,
+                        "value": float(reading["value"]),
                         "severity": float(reading["severity"].value),
                         "velocity": float(velocity),
                     }
