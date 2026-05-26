@@ -37,7 +37,7 @@ from titan_hcl.core.worker_swap_handler import (
     set_active_swap_state,
     start_supervision_thread,
 )
-from titan_hcl.guardian import _module_wrapper
+from titan_hcl.guardian_hcl import _module_wrapper
 
 
 # ── Active-state helpers (process global) ────────────────────────────────
@@ -358,7 +358,7 @@ def test_guardian_spawn_site_passes_start_method():
     import ast
     import inspect
 
-    import titan_hcl.guardian as guardian_mod
+    import titan_hcl.guardian_hcl as guardian_mod
 
     src = inspect.getsource(guardian_mod)
     tree = ast.parse(src)

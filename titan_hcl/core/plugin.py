@@ -52,7 +52,7 @@ from titan_hcl.bus import (
     make_msg,
 )
 from titan_hcl.core.kernel import TitanKernel
-from titan_hcl.guardian import ModuleSpec
+from titan_hcl.guardian_hcl import ModuleSpec
 from titan_hcl.supervision import (
     Dependency,
     DependencyAction,

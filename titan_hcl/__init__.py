@@ -9,6 +9,6 @@ The legacy in-process V2 parent (`titan_hcl/__init__.py:TitanHCL` +
 (D-SPEC-109): OpenClaw/MCP integration is discarded (Titans are standalone
 agno agents). Its eager imports + the `_LAZY_IMPORTS`/`__getattr__` lazy-export
 mechanism were used only by that class and went with it. This module is now a
-minimal package init; submodules (`titan_hcl.bus`, `titan_hcl.guardian`,
+minimal package init; submodules (`titan_hcl.bus`, `titan_hcl.guardian_hcl`,
 `titan_hcl.core.plugin`, …) are imported directly where needed.
 """
