@@ -44,13 +44,22 @@ import tempfile
 import time
 from pathlib import Path
 
-# 40 BMS dims layout in 132D state_vector (per consciousness.py + spirit_loop.py:1090-1167)
+# 40 BMS dims layout in 132D state_vector (per consciousness.py + spirit_loop.py:1090-1167).
 BMS_LAYERS = [
     ("inner_body",  range(0, 5)),
     ("inner_mind",  range(5, 20)),
     ("outer_body",  range(65, 70)),
     ("outer_mind",  range(70, 85)),
 ]
+# P0.6-A-bis (2026-05-26): spirit layers — extends audit scope from the 40
+# BMS dims to the 90 spirit dims (inner 45 + outer 45) per PLAN §6.6.2
+# "spirit-specific audit" deferred item. Spirit ranges per consciousness.py
+# state_vector layout: inner_spirit 20:65, outer_spirit 85:130.
+SPIRIT_LAYERS = [
+    ("inner_spirit", range(20, 65)),
+    ("outer_spirit", range(85, 130)),
+]
+ALL_LAYERS = BMS_LAYERS + SPIRIT_LAYERS
 SATURATION_DARK_THRESHOLD = 0.01
 SATURATION_BRIGHT_THRESHOLD = 0.99
 CLUSTER_HALFWIDTH = 0.05
@@ -65,7 +74,9 @@ def fetch_window(db_path: str, window_seconds: int) -> list[list[float]]:
     for (sv,) in db.execute("SELECT state_vector FROM epochs WHERE timestamp >= ?", (cutoff,)):
         try:
             v = json.loads(sv or "[]")
-            if len(v) >= 85:  # need at least up to outer_mind end
+            # Need 130+ dims to cover the full inner+outer spirit ranges
+            # under --scope=all / spirit; bms-only still requires ≥85.
+            if len(v) >= 85:
                 rows.append(v)
         except json.JSONDecodeError:
             continue
@@ -122,8 +133,13 @@ def health_tag(stats: dict) -> str:
     return "✓ OK"
 
 
-def render_titan(titan_id: str, rows: list[list[float]], window_h: float) -> dict:
-    """Print per-Titan table + return structured hit list."""
+def render_titan(titan_id: str, rows: list[list[float]], window_h: float,
+                 layers: list = None) -> dict:
+    """Print per-Titan table + return structured hit list. `layers` defaults
+    to BMS_LAYERS for back-compat with P0.6-A; --scope=spirit / --scope=all
+    expands to spirit / both via P0.6-A-bis."""
+    if layers is None:
+        layers = BMS_LAYERS
     header = f"=== {titan_id} — {len(rows):,} rows over last {window_h:.1f}h ==="
     print()
     print(header)
@@ -133,7 +149,7 @@ def render_titan(titan_id: str, rows: list[list[float]], window_h: float) -> dic
         return {"titan": titan_id, "n_rows": 0, "dims": []}
 
     structured = []
-    for layer_name, idx_range in BMS_LAYERS:
+    for layer_name, idx_range in layers:
         print(f"\n  {layer_name}")
         print(f"  {'dim':>3} | {'tag':>8} | {'mean':>6} | {'std':>6} | {'sat0%':>6} | {'sat1%':>6} | {'clust%':>6} | flat")
         print(f"  {'-'*3} + {'-'*8} + {'-'*6} + {'-'*6} + {'-'*6} + {'-'*6} + {'-'*6} + {'-'*4}")
@@ -207,7 +223,17 @@ def main() -> int:
     p.add_argument("--fleet", action="store_true",
                    help="Audit T1 (local data/consciousness.db) + T2 + T3 (via ssh)")
     p.add_argument("--json", help="Also write structured hit list to this JSON path")
+    p.add_argument(
+        "--scope", choices=["bms", "spirit", "all"], default="bms",
+        help="Layer scope: bms (40 dims, default — P0.6-A), "
+             "spirit (90 dims — P0.6-A-bis), or all (130 dims)."
+    )
     args = p.parse_args()
+    scope_layers = {
+        "bms": BMS_LAYERS,
+        "spirit": SPIRIT_LAYERS,
+        "all": ALL_LAYERS,
+    }[args.scope]
 
     window_s = int(args.window_hours * 3600)
     per_titan = []
@@ -227,7 +253,7 @@ def main() -> int:
         try:
             local = fetch_remote(spec)
             rows = fetch_window(local, window_s)
-            per_titan.append(render_titan(tid, rows, args.window_hours))
+            per_titan.append(render_titan(tid, rows, args.window_hours, layers=scope_layers))
         except Exception as e:
             print(f"\n[{tid}] FAILED: {e}", file=sys.stderr)
             per_titan.append({"titan": tid, "n_rows": 0, "dims": [], "error": str(e)})
