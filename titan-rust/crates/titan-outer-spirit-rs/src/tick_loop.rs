@@ -49,12 +49,13 @@ use titan_core::small_filter_down::{SmallFilterDownEngine, HALF_DIM};
 use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
-    apply_multipliers, compose_focus_into_enrichment, encode_floats, load_checkpoint_for_part,
-    load_restoring_cfg, observe, open_focus_input_if_present, open_neuromod_slot_if_present,
-    read_dim_slice, read_focus_nudge, read_neuromod_gain, read_sensor_cache, stateful_update,
-    write_checkpoint_for_part, CheckpointSnapshot, ContentGate, FiringSlotWriter, FocusPart, Layer,
-    PublishThrottle, PulseClockRole, PulseWatcher, RestoringCfg, SensorCacheRead,
-    CONTENT_DIM_COUNT, OUTER_SPIRIT_TOPICS,
+    apply_multipliers, compose_focus_into_enrichment, decode_gift_at_spirit, encode_floats,
+    load_checkpoint_for_part, load_restoring_cfg, observe, open_focus_input_if_present,
+    open_neuromod_slot_if_present, read_dim_slice, read_focus_nudge, read_neuromod_gain,
+    read_sensor_cache, stateful_update, write_checkpoint_for_part, CheckpointSnapshot, ContentGate,
+    FiringSlotWriter, FocusPart, Layer, PublishThrottle, PulseClockRole, PulseWatcher,
+    RestoringCfg, SensorCacheRead, TrinitySide, BODY_FLAG_OUTER, CONTENT_DIM_COUNT,
+    MIND_FLAG_OUTER, OUTER_SPIRIT_TOPICS,
 };
 
 /// §G5.1 UP-leg (PLAN §4): per-content-dim additive bonus added to spirit's
@@ -157,6 +158,13 @@ struct DaemonState {
     /// when a writer is genuinely down).
     body_read_fail_count: u64,
     mind_read_fail_count: u64,
+    /// P0.5 / D-SPEC-131 §G5.1: amplitude of a BODY_BALANCE_GIFT received
+    /// from the outer-body daemon since the last spirit tick (one-shot
+    /// consume per D-SPEC-121 pattern).
+    pending_body_gift_amplitude: Option<f32>,
+    /// P0.5 / D-SPEC-131 §G5.1: amplitude of a MIND_BALANCE_GIFT received
+    /// from outer-mind.
+    pending_mind_gift_amplitude: Option<f32>,
 }
 
 impl Default for DaemonState {
@@ -169,6 +177,8 @@ impl Default for DaemonState {
             last_mind: None,
             body_read_fail_count: 0,
             mind_read_fail_count: 0,
+            pending_body_gift_amplitude: None,
+            pending_mind_gift_amplitude: None,
         }
     }
 }
@@ -213,21 +223,47 @@ async fn run_event_dispatcher(
 }
 
 fn handle_bus_message(msg_type: &str, raw_bytes: &[u8], state: &Arc<Mutex<DaemonState>>) {
-    if msg_type == "UNIFIED_SPIRIT_FILTER_DOWN" {
-        let payload = match titan_bus::client::extract_payload(raw_bytes) {
-            Some(p) => p,
-            None => return,
-        };
-        match decode_unified_outer_spirit_content(&payload) {
-            Ok(mults) => {
-                if let Ok(mut s) = state.lock() {
-                    s.unified = Some(mults);
+    match msg_type {
+        "UNIFIED_SPIRIT_FILTER_DOWN" => {
+            let payload = match titan_bus::client::extract_payload(raw_bytes) {
+                Some(p) => p,
+                None => return,
+            };
+            match decode_unified_outer_spirit_content(&payload) {
+                Ok(mults) => {
+                    if let Ok(mut s) = state.lock() {
+                        s.unified = Some(mults);
+                    }
+                }
+                Err(e) => {
+                    warn!(err = ?e, "decode UNIFIED_SPIRIT_FILTER_DOWN.outer_spirit_content failed")
                 }
             }
-            Err(e) => {
-                warn!(err = ?e, "decode UNIFIED_SPIRIT_FILTER_DOWN.outer_spirit_content failed")
+        }
+        "BODY_BALANCE_GIFT" | "MIND_BALANCE_GIFT" => {
+            // P0.5 / D-SPEC-131 §G5.1: outer-spirit accepts gifts only from
+            // outer-half (PLAN §6.5.1 sovereign-half lock).
+            let payload = match titan_bus::client::extract_payload(raw_bytes) {
+                Some(p) => p,
+                None => return,
+            };
+            match decode_gift_at_spirit(&payload) {
+                Ok(gift) => {
+                    if gift.side != TrinitySide::Outer {
+                        return;
+                    }
+                    if let Ok(mut s) = state.lock() {
+                        if msg_type == "BODY_BALANCE_GIFT" {
+                            s.pending_body_gift_amplitude = Some(gift.gift_amplitude);
+                        } else {
+                            s.pending_mind_gift_amplitude = Some(gift.gift_amplitude);
+                        }
+                    }
+                }
+                Err(e) => warn!(err = ?e, msg_type, "decode balance gift failed"),
             }
         }
+        _ => {}
     }
 }
 
@@ -591,20 +627,32 @@ async fn run_one_tick(
     // §G12 FOCUS cascade: amplified nudge composes into enrichment_force.
     let focus = read_focus_nudge::<45>(focus_input_slot, FocusPart::OuterSpirit);
     compose_focus_into_enrichment(&mut enrichment, &focus);
-    // §G5.1 P0-0a UP-leg (PLAN §4): outer_body / outer_mind pulse → additive
-    // snapshot bonus on spirit content dims (observer [0:5] never enriched
-    // per §G8). Polarity is signed by the post-tick body+mind mean direction.
-    // §G5.1 UP-leg balanced-pulse gate (D-SPEC-121).
-    if balanced_pulse_edges[PulseClockRole::OuterBody.index()]
-        || balanced_pulse_edges[PulseClockRole::OuterMind.index()]
-    {
-        let body_polarity = (outer_body.iter().copied().sum::<f32>() / 5.0) - 0.5;
-        let mind_polarity = (outer_mind.iter().copied().sum::<f32>() / 15.0) - 0.5;
-        let signed = UP_LEG_BONUS_AMPLITUDE * (body_polarity + mind_polarity).clamp(-1.0, 1.0);
-        for i in 5..45 {
-            enrichment[i] += signed;
+    // §G5.1 P0-0a / P0.5 (D-SPEC-131): UP-leg balance-gift. The outer-body
+    // / outer-mind daemons publish BODY_BALANCE_GIFT / MIND_BALANCE_GIFT on
+    // their own clock's balanced rising-edge, with a per-cycle journey digest.
+    // This tick consumes the amplitude one-shot (D-SPEC-121 pattern) + applies
+    // via the Q/L/D mask so each spirit dim receives gift in proportion to its
+    // body- vs mind-affinity (PLAN §6.5.4 LOCKED 2026-05-24). RETIRES the
+    // v1.54.0 uniform polarity-scalar bonus per `feedback_no_shim_old_path_must_be_deleted`.
+    let (body_gift_amp, mind_gift_amp) = {
+        let mut s = state.lock().map_err(|e| anyhow!("state lock: {e}"))?;
+        (
+            s.pending_body_gift_amplitude.take(),
+            s.pending_mind_gift_amplitude.take(),
+        )
+    };
+    if let Some(amp) = body_gift_amp {
+        for i in 0..45 {
+            enrichment[i] += UP_LEG_BONUS_AMPLITUDE * amp * BODY_FLAG_OUTER[i];
         }
     }
+    if let Some(amp) = mind_gift_amp {
+        for i in 0..45 {
+            enrichment[i] += UP_LEG_BONUS_AMPLITUDE * amp * MIND_FLAG_OUTER[i];
+        }
+    }
+    // `balanced_pulse_edges` continues downstream for the outer-spirit clock
+    // DOWN-leg (small filter_down) — see OUTER_SPIRIT_FILTER_DOWN emit below.
     cfg.neuromod_gain = read_neuromod_gain(neuromod_slot);
     let obs = observe(&prev[..], &prev2[..]);
     *last_obs_restored = Some(obs);

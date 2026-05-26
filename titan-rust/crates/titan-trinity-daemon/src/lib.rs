@@ -73,13 +73,16 @@ pub mod subscriptions;
 // as dead code — never wired into any daemon main loop.)
 
 pub mod focus_input;
+pub mod gift_events;
 pub mod homeostasis;
+pub mod journey;
 pub mod neuromod_read;
 pub mod observer_mask;
 pub mod publish_throttle;
 pub mod pulse_watch;
 pub mod restoring_cfg;
 pub mod sensor_cache_read;
+pub mod up_leg_masks;
 
 pub use crate::adoption::{
     decode_adoption_ack_payload, decode_adoption_request_payload, encode_adoption_ack_payload,
@@ -134,6 +137,14 @@ pub use crate::subscriptions::{
 };
 
 // ── C-S6 re-exports (observer mask + sensor cache) ──
+pub use crate::gift_events::{
+    decode_gift_at_spirit, decode_snapshots, encode_body_balance_gift, encode_mind_balance_gift,
+    GiftAtSpiritIn, BODY_BALANCE_GIFT_TOPIC, MIND_BALANCE_GIFT_TOPIC,
+};
+pub use crate::journey::{
+    BodyJourneyDigest, JourneyAccumulator, JourneyTickInputs, MindJourneyDigest, TrinitySide,
+    BODY_GIFT_WEIGHTS, JOURNEY_SAMPLE_STRIDE_TICKS, JOURNEY_SNAPSHOT_RING_LEN, MIND_GIFT_WEIGHTS,
+};
 pub use crate::observer_mask::{
     extract_outer_spirit_content, mask_observer_dims_in_place, observer_dims_are_zero,
     CONTENT_DIM_COUNT, OBSERVER_BYTE_END, OBSERVER_BYTE_START, OBSERVER_DIM_COUNT,
@@ -143,3 +154,4 @@ pub use crate::pulse_watch::{BalancedPulseEdges, PulseClockRole, PulseEdges, Pul
 pub use crate::sensor_cache_read::{
     age_seconds, current_wall_ns, read_sensor_cache, SensorCacheRead,
 };
+pub use crate::up_leg_masks::{BODY_FLAG_INNER, BODY_FLAG_OUTER, MIND_FLAG_INNER, MIND_FLAG_OUTER};

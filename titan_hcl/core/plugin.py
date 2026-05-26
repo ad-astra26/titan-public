@@ -1102,6 +1102,42 @@ class TitanHCL:
             critical_data_writer=False,
         ))
 
+        # journey_persistence_worker — P0.5 / D-SPEC-131 §G5.1 (PLAN
+        # §6.5.6). Sole L2 consumer of BODY_BALANCE_GIFT + MIND_BALANCE_GIFT
+        # events published by the body/mind Rust daemons on their own
+        # sphere clock's balanced rising-edge (sub-1% of Schumann ticks).
+        # Translates each gift to one row of `trinity_journey_gifts` in
+        # consciousness.db (already §24 Arweave-backed → inherits sovereignty).
+        # Best-effort delivery: SQL or queue overflow → warn-and-drop; not
+        # load-bearing for any tick.
+        from titan_hcl.modules.journey_persistence_worker import (
+            journey_persistence_worker_main,
+        )
+        _journey_cfg = {
+            "info_banner": self._full_config.get("info_banner", {}),
+            "consciousness_db": self._full_config.get(
+                "memory_and_storage", {}
+            ).get("consciousness_db", "./data/consciousness.db"),
+        }
+        self.guardian.register(ModuleSpec(
+            name="journey_persistence",
+            layer="L2",
+            entry_fn=journey_persistence_worker_main,
+            config=_journey_cfg,
+            rss_limit_mb=60,
+            autostart=True,
+            lazy=False,
+            heartbeat_timeout=60.0,
+            broadcast_topics=[
+                bus.BODY_BALANCE_GIFT,
+                bus.MIND_BALANCE_GIFT,
+                bus.MODULE_SHUTDOWN,
+                bus.SAVE_NOW,
+            ],
+            start_method="spawn" if _spawn_grad else "fork",
+            critical_data_writer=False,
+        ))
+
         # life_force_worker — extracted per rFP_titan_hcl_l2_separation_strategy §4.G
         # + D-SPEC-57 (v1.8.3, 2026-05-15). Maker-greenlit Q1-Q6 inline.
         # Hosts LifeForceEngine (Chi Λ 3×3 Trinity vitality math) extracted

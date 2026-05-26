@@ -60,6 +60,13 @@ pub const INNER_SPIRIT_TOPICS: &[&str] = &[
     // Phase 0 / D-SPEC-97: small filter_down fires once per kernel epoch
     // (Rust-native), NOT per Schumann tick.
     "KERNEL_EPOCH_TICK",
+    // P0.5 / D-SPEC-131 §G5.1 UP-leg gift: inner_body + inner_mind publish
+    // a meaning-mapped journey digest on each balanced PulseEvent (sub-1%
+    // of Schumann ticks). Inner-spirit applies it via the per-dim Q/L/D
+    // mask in titan-trinity-daemon::up_leg_masks. Outer gifts filtered by
+    // payload `side` at decode time (sovereign-half lock per PLAN §6.5.1).
+    "BODY_BALANCE_GIFT",
+    "MIND_BALANCE_GIFT",
 ];
 
 /// SPEC §9.A REQUIRED bus subscriptions for `titan-outer-body-rs`.
@@ -91,6 +98,9 @@ pub const OUTER_SPIRIT_TOPICS: &[&str] = &[
     // Phase 0 / D-SPEC-97: small filter_down fires once per kernel epoch
     // (Rust-native), NOT per Schumann tick.
     "KERNEL_EPOCH_TICK",
+    // P0.5 / D-SPEC-131 §G5.1 UP-leg gift — outer mirror (see inner above).
+    "BODY_BALANCE_GIFT",
+    "MIND_BALANCE_GIFT",
 ];
 
 /// Connect a daemon to the main bus + subscribe to its REQUIRED topics
@@ -366,14 +376,15 @@ mod tests {
 
     #[test]
     fn topic_lists_match_spec_9a() {
-        // SPEC §9.A inner daemons: body / mind subscribe to 4; spirit to 2.
+        // SPEC §9.A inner daemons: body / mind subscribe to 5; spirit to 5
+        // (the original 3 + BODY_BALANCE_GIFT + MIND_BALANCE_GIFT per
+        // P0.5 / D-SPEC-131 §G5.1 UP-leg gift).
         assert_eq!(INNER_BODY_TOPICS.len(), 5);
         assert_eq!(INNER_MIND_TOPICS.len(), 5);
-        // spirit = SHUTDOWN + UNIFIED_SPIRIT_FILTER_DOWN + KERNEL_EPOCH_TICK (0C)
-        assert_eq!(INNER_SPIRIT_TOPICS.len(), 3);
+        assert_eq!(INNER_SPIRIT_TOPICS.len(), 5);
         assert_eq!(OUTER_BODY_TOPICS.len(), 5);
         assert_eq!(OUTER_MIND_TOPICS.len(), 5);
-        assert_eq!(OUTER_SPIRIT_TOPICS.len(), 3);
+        assert_eq!(OUTER_SPIRIT_TOPICS.len(), 5);
     }
 
     #[test]
@@ -383,6 +394,19 @@ mod tests {
         // TRINITY_SUBSTRATE_TOPOLOGY_UPDATED from inner-spirit's REQUIRED.
         assert!(!INNER_SPIRIT_TOPICS.contains(&"TRINITY_SUBSTRATE_TOPOLOGY_UPDATED"));
         assert!(!INNER_SPIRIT_TOPICS.contains(&"INNER_SPIRIT_FILTER_DOWN"));
+    }
+
+    #[test]
+    fn spirit_daemons_subscribe_to_balance_gifts() {
+        // P0.5 / D-SPEC-131: spirit daemons receive both body + mind gifts
+        // (sovereign-half filtered by payload `side` at decode time).
+        assert!(INNER_SPIRIT_TOPICS.contains(&"BODY_BALANCE_GIFT"));
+        assert!(INNER_SPIRIT_TOPICS.contains(&"MIND_BALANCE_GIFT"));
+        assert!(OUTER_SPIRIT_TOPICS.contains(&"BODY_BALANCE_GIFT"));
+        assert!(OUTER_SPIRIT_TOPICS.contains(&"MIND_BALANCE_GIFT"));
+        // body/mind daemons do NOT subscribe to the gifts (they're publishers).
+        assert!(!INNER_BODY_TOPICS.contains(&"BODY_BALANCE_GIFT"));
+        assert!(!INNER_MIND_TOPICS.contains(&"MIND_BALANCE_GIFT"));
     }
 
     #[test]

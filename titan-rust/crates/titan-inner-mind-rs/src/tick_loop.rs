@@ -19,10 +19,12 @@ use titan_state::Slot;
 use titan_trinity_daemon::{
     apply_multipliers, compose_focus_into_enrichment, compose_multipliers_default,
     decode_filter_down_payload, decode_local_filter_down_payload, encode_floats,
-    load_checkpoint_for_part, load_restoring_cfg, observe, open_focus_input_if_present,
-    open_neuromod_slot_if_present, read_focus_nudge, read_neuromod_gain, stateful_update,
-    write_checkpoint_for_part, CheckpointSnapshot, ContentGate, DriftAggregator, FiringSlotWriter,
-    FocusPart, GroundUpEnricher, Layer, RestoringCfg, Side, INNER_MIND_TOPICS,
+    encode_mind_balance_gift, load_checkpoint_for_part, load_restoring_cfg, observe,
+    open_focus_input_if_present, open_neuromod_slot_if_present, read_focus_nudge,
+    read_neuromod_gain, stateful_update, write_checkpoint_for_part, BalancedPulseEdges,
+    CheckpointSnapshot, ContentGate, DriftAggregator, FiringSlotWriter, FocusPart,
+    GroundUpEnricher, JourneyAccumulator, JourneyTickInputs, Layer, PulseClockRole, PulseWatcher,
+    RestoringCfg, Side, TrinitySide, INNER_MIND_TOPICS, MIND_BALANCE_GIFT_TOPIC, MIND_GIFT_WEIGHTS,
 };
 
 /// §G5.2 item 4 checkpoint write cadence. Inner-mind ticks @ 23.49 Hz so
@@ -232,6 +234,14 @@ async fn run_tick_loop(
     let mut focus_input_slot = open_focus_input_if_present(&shm_dir);
     let focus_input_path = shm_dir.join("focus_input.bin");
 
+    // P0.5 / D-SPEC-131 §G5.1 UP-leg balance-gift state (mirror of inner-body
+    // wiring): SHM-direct PulseWatcher detects the inner_mind clock balanced
+    // rising-edge; the JourneyAccumulator<15> tracks per-cycle qualitative
+    // aggregates (coherence climb, polarity dynamics, direction stability)
+    // that feed the MIND_BALANCE_GIFT digest.
+    let mut pulse_watcher = PulseWatcher::open(&shm_dir);
+    let mut journey_acc: JourneyAccumulator<MIND_DIMS> = JourneyAccumulator::new();
+
     // Per master plan §7 + C-S3 PLAN §1.1 #2: Schumann timer wheels live in
     // titan-schumann (canonical shared library for trinity daemons).
     let epoch_t0 = tokio::time::Instant::now();
@@ -284,9 +294,16 @@ async fn run_tick_loop(
                             focus_input_slot = Some(slot);
                         }
                     }
+                    if !pulse_watcher.is_open() && tick_count.is_multiple_of(retry_every_n) {
+                        pulse_watcher.retry_open(&shm_dir);
+                        if pulse_watcher.is_open() {
+                            info!(event = "PULSE_WATCH_OPENED_LATE", tick = tick_count);
+                        }
+                    }
                     if tick_count.is_multiple_of(retry_every_n) {
                         cfg = load_restoring_cfg(&shm_dir, Layer::Mind);
                     }
+                    let (_pulse_edges, balanced_pulse_edges) = pulse_watcher.tick_with_balanced();
                     let drift_pct = tick_event.jitter_ns() as f64 / tick_event.period_ns as f64;
                     drift_agg.observe(drift_pct, tick_event.jitter_ns(), tick_event.epoch);
                     if let Err(e) = run_one_tick(
@@ -295,6 +312,7 @@ async fn run_tick_loop(
                         &mut firing_writer, &mut prev, &mut prev2,
                         &mut cfg, neuromod_slot.as_ref(), focus_input_slot.as_ref(),
                         &mut last_obs_restored,
+                        &mut journey_acc, &balanced_pulse_edges,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
@@ -353,6 +371,8 @@ async fn run_one_tick(
     neuromod_slot: Option<&Slot>,
     focus_input_slot: Option<&Slot>,
     last_obs_restored: &mut Option<titan_trinity_daemon::LayerObs>,
+    journey_acc: &mut JourneyAccumulator<MIND_DIMS>,
+    balanced_pulse_edges: &BalancedPulseEdges,
 ) -> Result<()> {
     // raw[t] = un-enriched 15D sensor reading (§G5.2 drive target).
     let raw = read_sensor_cache(sensor_cache)?;
@@ -421,6 +441,37 @@ async fn run_one_tick(
     *prev2 = *prev;
     *prev = mind_state;
     let mind = mind_state;
+
+    // P0.5 / D-SPEC-131 §G5.1 UP-leg: track this tick's journey + emit a
+    // MIND_BALANCE_GIFT on this daemon's own clock balanced rising-edge.
+    let tick_ts = now_secs();
+    journey_acc.tick(JourneyTickInputs {
+        x: &mind,
+        obs,
+        now_secs: tick_ts as f32,
+    });
+    if balanced_pulse_edges[PulseClockRole::InnerMind.index()] {
+        journey_acc.mark_balanced(obs);
+        if let Some(digest) = journey_acc.finalize_mind_gift(&MIND_GIFT_WEIGHTS) {
+            let payload =
+                encode_mind_balance_gift::<MIND_DIMS>(TrinitySide::Inner, &digest, tick_ts);
+            if let Err(e) = bus
+                .publish(MIND_BALANCE_GIFT_TOPIC, Some("all"), Some(payload))
+                .await
+            {
+                warn!(err = ?e, "publish MIND_BALANCE_GIFT failed (continuing)");
+            } else {
+                debug!(
+                    event = "MIND_BALANCE_GIFT_EMITTED",
+                    side = "inner",
+                    amplitude = digest.gift_amplitude,
+                    cycle_s = digest.cycle_duration_s,
+                    ticks = digest.cycle_tick_count,
+                );
+            }
+        }
+        journey_acc.reset_for_next_cycle();
+    }
 
     let bytes = encode_floats::<MIND_DIMS>(&mind);
 

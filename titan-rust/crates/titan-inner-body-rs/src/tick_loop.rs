@@ -27,11 +27,13 @@ use titan_schumann::{SchumannGenerator, SchumannRole};
 use titan_state::Slot;
 use titan_trinity_daemon::{
     apply_multipliers, compose_focus_into_enrichment, compose_multipliers_default,
-    decode_filter_down_payload, decode_local_filter_down_payload, encode_floats,
-    load_checkpoint_for_part, load_restoring_cfg, observe, open_focus_input_if_present,
-    open_neuromod_slot_if_present, read_focus_nudge, read_neuromod_gain, stateful_update,
-    write_checkpoint_for_part, CheckpointSnapshot, ContentGate, DriftAggregator, FiringSlotWriter,
-    FocusPart, GroundUpEnricher, Layer, RestoringCfg, Side, INNER_BODY_TOPICS,
+    decode_filter_down_payload, decode_local_filter_down_payload, encode_body_balance_gift,
+    encode_floats, load_checkpoint_for_part, load_restoring_cfg, observe,
+    open_focus_input_if_present, open_neuromod_slot_if_present, read_focus_nudge,
+    read_neuromod_gain, stateful_update, write_checkpoint_for_part, BalancedPulseEdges,
+    CheckpointSnapshot, ContentGate, DriftAggregator, FiringSlotWriter, FocusPart,
+    GroundUpEnricher, JourneyAccumulator, JourneyTickInputs, Layer, PulseClockRole, PulseWatcher,
+    RestoringCfg, Side, TrinitySide, BODY_BALANCE_GIFT_TOPIC, BODY_GIFT_WEIGHTS, INNER_BODY_TOPICS,
 };
 
 /// §G5.2 item 4 checkpoint write cadence. Inner-body ticks @ 7.83 Hz so 80 ticks
@@ -283,6 +285,15 @@ async fn run_tick_loop(
     let mut focus_input_slot = open_focus_input_if_present(&shm_dir);
     let focus_input_path = shm_dir.join("focus_input.bin");
 
+    // P0.5 / D-SPEC-131 §G5.1 UP-leg balance-gift state. SHM-direct
+    // PulseWatcher reads `sphere_clocks.bin` per tick to detect the inner_body
+    // clock's balanced rising-edge — that's when the JourneyAccumulator
+    // finalises one cycle's BODY_BALANCE_GIFT digest, publishes it to spirit,
+    // and resets for the next cycle. First cycle after boot is suppressed
+    // by the accumulator (PLAN §6.5.2).
+    let mut pulse_watcher = PulseWatcher::open(&shm_dir);
+    let mut journey_acc: JourneyAccumulator<5> = JourneyAccumulator::new();
+
     // Per master plan §7 + C-S3 PLAN §1.1 #2: Schumann timer wheels live in
     // titan-schumann (substrate-owned shared library). Pinning epoch_t0 to
     // tokio::time::Instant::now() at daemon boot — phase relations across
@@ -344,11 +355,21 @@ async fn run_tick_loop(
                             focus_input_slot = Some(slot);
                         }
                     }
+                    if !pulse_watcher.is_open() && tick_count.is_multiple_of(retry_every_n) {
+                        pulse_watcher.retry_open(&shm_dir);
+                        if pulse_watcher.is_open() {
+                            info!(event = "PULSE_WATCH_OPENED_LATE", tick = tick_count);
+                        }
+                    }
                     // Refresh cfg from sidecar at the same retry cadence so a Python
                     // L2 re-publish (config reload) becomes visible without restart.
                     if tick_count.is_multiple_of(retry_every_n) {
                         cfg = load_restoring_cfg(&shm_dir, Layer::Body);
                     }
+                    // P0.5 / D-SPEC-131 SHM-direct pulse-edge read. The balanced
+                    // edge on the inner_body clock is what arms this daemon's
+                    // BODY_BALANCE_GIFT emission (PLAN §6.5).
+                    let (_pulse_edges, balanced_pulse_edges) = pulse_watcher.tick_with_balanced();
                     let drift_pct = tick_event.jitter_ns() as f64 / tick_event.period_ns as f64;
                     drift_agg.observe(drift_pct, tick_event.jitter_ns(), tick_event.epoch);
                     if let Err(e) = run_one_tick(
@@ -357,6 +378,7 @@ async fn run_tick_loop(
                         &mut firing_writer, &mut prev, &mut prev2,
                         &mut cfg, neuromod_slot.as_ref(), focus_input_slot.as_ref(),
                         &mut last_obs_restored,
+                        &mut journey_acc, &balanced_pulse_edges,
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
@@ -419,6 +441,8 @@ async fn run_one_tick(
     neuromod_slot: Option<&Slot>,
     focus_input_slot: Option<&Slot>,
     last_obs_restored: &mut Option<titan_trinity_daemon::LayerObs>,
+    journey_acc: &mut JourneyAccumulator<5>,
+    balanced_pulse_edges: &BalancedPulseEdges,
 ) -> Result<()> {
     // 1. Read sensor cache (raw 5D body input). This is `raw[t]` per §G5.2 —
     //    the un-enriched producer output that the spring/drive integrate.
@@ -503,6 +527,38 @@ async fn run_one_tick(
     *prev2 = *prev;
     *prev = body_state;
     let body = body_state; // the traveling state is what we publish
+
+    // 5c. P0.5 / D-SPEC-131 §G5.1 UP-leg: track this tick's journey + emit a
+    //     BODY_BALANCE_GIFT on this daemon's own clock balanced rising-edge.
+    //     PulseWatcher already read (edges, balanced_edges) before this tick;
+    //     the journey accumulator tracks the post-§G5.2 traveling tensor.
+    let tick_ts = now_secs();
+    journey_acc.tick(JourneyTickInputs {
+        x: &body,
+        obs,
+        now_secs: tick_ts as f32,
+    });
+    if balanced_pulse_edges[PulseClockRole::InnerBody.index()] {
+        journey_acc.mark_balanced(obs);
+        if let Some(digest) = journey_acc.finalize_body_gift(&BODY_GIFT_WEIGHTS) {
+            let payload = encode_body_balance_gift::<5>(TrinitySide::Inner, &digest, tick_ts);
+            if let Err(e) = bus
+                .publish(BODY_BALANCE_GIFT_TOPIC, Some("all"), Some(payload))
+                .await
+            {
+                warn!(err = ?e, "publish BODY_BALANCE_GIFT failed (continuing)");
+            } else {
+                debug!(
+                    event = "BODY_BALANCE_GIFT_EMITTED",
+                    side = "inner",
+                    amplitude = digest.gift_amplitude,
+                    cycle_s = digest.cycle_duration_s,
+                    ticks = digest.cycle_tick_count,
+                );
+            }
+        }
+        journey_acc.reset_for_next_cycle();
+    }
 
     // 6. Encode payload bytes.
     let bytes = encode_floats::<5>(&body);
