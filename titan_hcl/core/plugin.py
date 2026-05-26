@@ -1313,6 +1313,12 @@ class TitanHCL:
                 # association_bundles). Post-seal contract hook in
                 # timechain_v2.Mempool/BlockBuilder publishes.
                 bus.MAINTAIN_BUNDLE,
+                # Phase 4 §P4.G: dream-boundary consolidation pass trigger.
+                # dream_state_worker emits this on sleep/wake transitions
+                # (v1.8.2 D-SPEC-56 canonical producer). synthesis_worker is
+                # an INDEPENDENT listener (INV-11 restart-isolation; does
+                # not attach to cognitive_worker's off-tick suite).
+                bus.DREAM_STATE_CHANGED,
                 bus.KERNEL_EPOCH_TICK,
                 bus.MODULE_SHUTDOWN,
             ],
