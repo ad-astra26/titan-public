@@ -51,12 +51,13 @@ use titan_state::Slot;
 use titan_trinity_daemon::{
     apply_multipliers, compose_focus_into_enrichment, compute_nudge_amplitude,
     decode_extreme_imbalance, decode_gift_at_spirit, encode_corrective_nudge, encode_floats,
-    load_checkpoint_for_part, load_restoring_cfg, observe, open_focus_input_if_present,
-    open_neuromod_slot_if_present, read_dim_slice, read_focus_nudge, read_neuromod_gain,
-    read_sensor_cache, stateful_update, write_checkpoint_for_part, CheckpointSnapshot, ContentGate,
-    ExtremeImbalanceIn, FiringSlotWriter, FocusPart, Layer, PolarityHomeostatCfg, PublishThrottle,
-    PulseClockRole, PulseWatcher, RestoringCfg, SensorCacheRead, TrinitySide, BODY_FLAG_OUTER,
-    CONTENT_DIM_COUNT, CORRECTIVE_NUDGE_TOPIC, MIND_FLAG_OUTER, OUTER_SPIRIT_TOPICS,
+    load_checkpoint_for_part, load_restoring_cfg, observe, open_chi_slot_if_present,
+    open_focus_input_if_present, open_neuromod_slot_if_present, read_chi_health, read_dim_slice,
+    read_focus_nudge, read_neuromod_gain, read_sensor_cache, retry_open_chi_slot, stateful_update,
+    write_checkpoint_for_part, CheckpointSnapshot, ContentGate, ExtremeImbalanceIn,
+    FiringSlotWriter, FocusPart, Layer, PolarityHomeostatCfg, PublishThrottle, PulseClockRole,
+    PulseWatcher, RestoringCfg, SensorCacheRead, TrinitySide, BODY_FLAG_OUTER, CONTENT_DIM_COUNT,
+    CORRECTIVE_NUDGE_TOPIC, MIND_FLAG_OUTER, OUTER_SPIRIT_TOPICS,
 };
 
 /// §G5.1 UP-leg (PLAN §4): per-content-dim additive bonus added to spirit's
@@ -395,6 +396,8 @@ async fn run_tick_loop(
     let neuromod_path = shm_dir.join("neuromod_state.bin");
     let mut focus_input_slot = open_focus_input_if_present(&shm_dir);
     let focus_input_path = shm_dir.join("focus_input.bin");
+    // P0.6-C / D-SPEC-132 §6.6.4: read chi.total from chi_state.bin (outer mirror).
+    let mut chi_slot = open_chi_slot_if_present(&shm_dir);
     // §G5.1 P0-0a (PLAN §4): SHM-direct pulse-edge detector for the small
     // filter_down DOWN-leg trigger + the UP-leg snapshot bonus.
     let mut pulse_watcher = PulseWatcher::open(&shm_dir);
@@ -448,6 +451,12 @@ async fn run_tick_loop(
                             info!(event = "PULSE_WATCH_OPENED_LATE", tick = tick_count);
                         }
                     }
+                    if chi_slot.is_none() && tick_count.is_multiple_of(retry_every_n) {
+                        retry_open_chi_slot(&mut chi_slot, &shm_dir);
+                        if chi_slot.is_some() {
+                            info!(event = "CHI_STATE_OPENED_LATE", tick = tick_count);
+                        }
+                    }
                     if tick_count.is_multiple_of(retry_every_n) {
                         cfg = load_restoring_cfg(&shm_dir, Layer::Spirit);
                     }
@@ -463,6 +472,7 @@ async fn run_tick_loop(
                         &sensor_cache_path, &mut firing_writer, &mut prev, &mut prev2,
                         &mut cfg, neuromod_slot.as_ref(), focus_input_slot.as_ref(),
                         &pulse_edges, &balanced_pulse_edges, &mut last_obs_restored,
+                        chi_slot.as_ref(),
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
@@ -531,6 +541,7 @@ async fn run_one_tick(
     _pulse_edges: &[bool; 6],
     balanced_pulse_edges: &[bool; 6],
     last_obs_restored: &mut Option<titan_trinity_daemon::LayerObs>,
+    chi_slot: Option<&Slot>,
 ) -> Result<()> {
     // 1+2. Observer Principle reads (G8) — sibling outer_body +
     //      outer_mind. Sprint 1 closure (rFP follow-up 2026-05-12):
@@ -687,7 +698,8 @@ async fn run_one_tick(
         } else {
             PolarityHomeostatCfg::for_mind()
         };
-        let chi_health = 1.0_f32;
+        // P0.6-C-bis: chi_health from chi_state.bin SHM (graceful default 1.0).
+        let chi_health = read_chi_health(chi_slot);
         let threshold = ev.sigma_multiplier * 0.1;
         let base_gain = 0.05_f32;
         let amp = compute_nudge_amplitude(

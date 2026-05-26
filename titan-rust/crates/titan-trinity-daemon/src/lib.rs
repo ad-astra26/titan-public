@@ -72,6 +72,7 @@ pub mod subscriptions;
 // unchanged. (The pre-D2 `jittered_tick` ticker was removed D-SPEC-100
 // as dead code — never wired into any daemon main loop.)
 
+pub mod chi_read;
 pub mod corrective_events;
 pub mod focus_input;
 pub mod gift_events;
@@ -139,6 +140,10 @@ pub use crate::subscriptions::{
 };
 
 // ── C-S6 re-exports (observer mask + sensor cache) ──
+pub use crate::chi_read::{
+    open_if_present as open_chi_slot_if_present, read_chi_health,
+    retry_open as retry_open_chi_slot, CHI_HEALTH_DEFAULT,
+};
 pub use crate::corrective_events::{
     compute_nudge_amplitude, decode_corrective_nudge, decode_extreme_imbalance,
     encode_corrective_nudge, encode_extreme_imbalance, CorrectiveNudgeIn, ExtremeImbalanceIn,

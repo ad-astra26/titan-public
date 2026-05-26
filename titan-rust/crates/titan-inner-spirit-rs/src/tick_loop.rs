@@ -72,11 +72,12 @@ use titan_trinity_daemon::{
     apply_multipliers, compose_focus_into_enrichment, compute_nudge_amplitude,
     decode_extreme_imbalance, decode_filter_down_payload, decode_gift_at_spirit,
     encode_corrective_nudge, encode_floats, load_checkpoint_for_part, load_restoring_cfg, observe,
-    open_focus_input_if_present, open_neuromod_slot_if_present, read_dim_slice, read_focus_nudge,
-    read_neuromod_gain, stateful_update, write_checkpoint_for_part, CheckpointSnapshot,
-    ContentGate, DriftAggregator, ExtremeImbalanceIn, FiringSlotWriter, FocusPart, Layer,
-    PolarityHomeostatCfg, PulseClockRole, PulseWatcher, RestoringCfg, TrinitySide, BODY_FLAG_INNER,
-    CORRECTIVE_NUDGE_TOPIC, INNER_SPIRIT_TOPICS, MIND_FLAG_INNER,
+    open_chi_slot_if_present, open_focus_input_if_present, open_neuromod_slot_if_present,
+    read_chi_health, read_dim_slice, read_focus_nudge, read_neuromod_gain, retry_open_chi_slot,
+    stateful_update, write_checkpoint_for_part, CheckpointSnapshot, ContentGate, DriftAggregator,
+    ExtremeImbalanceIn, FiringSlotWriter, FocusPart, Layer, PolarityHomeostatCfg, PulseClockRole,
+    PulseWatcher, RestoringCfg, TrinitySide, BODY_FLAG_INNER, CORRECTIVE_NUDGE_TOPIC,
+    INNER_SPIRIT_TOPICS, MIND_FLAG_INNER,
 };
 
 /// §G5.2 item 4 checkpoint cadence. Inner-spirit ticks @ 70.47 Hz so 720
@@ -361,6 +362,12 @@ async fn run_tick_loop(
     // §G5.2 item 2 + §G12 — FOCUS cascade nudge slot.
     let mut focus_input_slot = open_focus_input_if_present(&shm_dir);
     let focus_input_path = shm_dir.join("focus_input.bin");
+    // P0.6-C / D-SPEC-132 §6.6.4: read chi.total from chi_state.bin to drive
+    // the metabolic factor `1/max(0.1, chi)` in the CORRECTIVE_NUDGE
+    // amplitude formula. Graceful degradation: absent slot → CHI_HEALTH_DEFAULT
+    // (1.0) so the amplifier no-ops; lazy retry-open at the same cadence as
+    // other sidecars (substrate may boot after the daemon).
+    let mut chi_slot = open_chi_slot_if_present(&shm_dir);
     // §G5.1 Phase 0a (PLAN §4): SHM-direct pulse-edge detector on
     // `sphere_clocks.bin`. DOWN-leg small filter_down fires on inner_spirit
     // rising-edge (replaces the old KERNEL_EPOCH_TICK arm — no shim). UP-leg
@@ -426,6 +433,12 @@ async fn run_tick_loop(
                             info!(event = "PULSE_WATCH_OPENED_LATE", tick = tick_count);
                         }
                     }
+                    if chi_slot.is_none() && tick_count.is_multiple_of(retry_every_n) {
+                        retry_open_chi_slot(&mut chi_slot, &shm_dir);
+                        if chi_slot.is_some() {
+                            info!(event = "CHI_STATE_OPENED_LATE", tick = tick_count);
+                        }
+                    }
                     if tick_count.is_multiple_of(retry_every_n) {
                         cfg = load_restoring_cfg(&shm_dir, Layer::Spirit);
                     }
@@ -443,6 +456,7 @@ async fn run_tick_loop(
                         &mut firing_writer, &mut prev, &mut prev2,
                         &mut cfg, neuromod_slot.as_ref(), focus_input_slot.as_ref(),
                         &pulse_edges, &balanced_pulse_edges, &mut last_obs_restored,
+                        chi_slot.as_ref(),
                     ).await {
                         warn!(err = ?e, "tick failed (continuing)");
                     }
@@ -507,6 +521,7 @@ async fn run_one_tick(
     _pulse_edges: &[bool; 6],
     balanced_pulse_edges: &[bool; 6],
     last_obs_restored: &mut Option<titan_trinity_daemon::LayerObs>,
+    chi_slot: Option<&Slot>,
 ) -> Result<()> {
     // 1. Observer Principle G8: read sibling body + mind slots.
     let body = read_dim_slice::<5>(body_slot).map_err(|e| anyhow!("read body: {e}"))?;
@@ -638,10 +653,10 @@ async fn run_one_tick(
         } else {
             PolarityHomeostatCfg::for_mind()
         };
-        // Spirit reads chi from chi_state.bin once available; default to
-        // 1.0 (healthy) for now — graceful degradation, low-chi amplifier
-        // still works in the steady state.
-        let chi_health = 1.0_f32;
+        // P0.6-C-bis: chi_health sourced from chi_state.bin SHM (§7.1).
+        // Absent / unreadable slot → CHI_HEALTH_DEFAULT (1.0) per
+        // chi_read::read_chi_health graceful degradation.
+        let chi_health = read_chi_health(chi_slot);
         let threshold = ev.sigma_multiplier * 0.1; // approx std at fire-edge
         let base_gain = 0.05_f32;
         let amp = compute_nudge_amplitude(

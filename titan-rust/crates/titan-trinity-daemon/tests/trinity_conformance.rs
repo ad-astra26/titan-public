@@ -921,6 +921,150 @@ fn conformance_p0_5_spirit_subscribes_to_balance_gifts() {
     assert!(OUTER_SPIRIT_TOPICS.contains(&"MIND_BALANCE_GIFT"));
 }
 
+// ── P0.6-C / D-SPEC-132 — PolarityHomeostat + corrective events ──────────────
+
+// G6.6-cold-start-no-fire: warmup ticks at modest |polarity| must not fire.
+#[test]
+fn conformance_p0_6_c_polarity_homeostat_warmup_no_fire() {
+    // PLAN §6.6.3 + Cold-start variance=0.0625 default: at sigma_init=2.5 the
+    // initial threshold ≈ 0.625; any |polarity| < 0.6 with no streak should
+    // NOT fire even before EMAs converge.
+    use titan_trinity_daemon::{PolarityHomeostat, PolarityHomeostatCfg};
+    let mut h = PolarityHomeostat::<5>::new(PolarityHomeostatCfg::for_body());
+    let x = [0.5_f32; 5];
+    for _ in 0..50 {
+        assert!(
+            h.tick(0.5, &x).is_none(),
+            "warmup at |polarity|=0.5 must not fire (threshold ~0.625)"
+        );
+    }
+}
+
+// G6.6-sustained-extreme-fires: streak ≥ duration_threshold → fire.
+#[test]
+fn conformance_p0_6_c_sustained_extreme_fires_after_duration() {
+    use titan_trinity_daemon::{PolarityHomeostat, PolarityHomeostatCfg};
+    let mut cfg = PolarityHomeostatCfg::for_body();
+    cfg.baseline_lr = 0.05;
+    cfg.variance_lr = 0.05;
+    cfg.sigma_init = 2.0;
+    cfg.sigma_max = 2.0;
+    cfg.min_dur_ticks = 5;
+    cfg.k_dur = 1.0;
+    let mut h = PolarityHomeostat::<5>::new(cfg);
+    let x_calm = [0.5_f32; 5];
+    for _ in 0..200 {
+        h.tick(0.1, &x_calm);
+    }
+    let mut x_spike = [0.5_f32; 5];
+    x_spike[3] = 0.95;
+    let mut fired = None;
+    for _ in 0..50 {
+        if let Some(ev) = h.tick(0.9, &x_spike) {
+            fired = Some(ev);
+            break;
+        }
+    }
+    let ev = fired.expect("sustained extreme should fire after min_dur_ticks");
+    assert_eq!(ev.dominant_dim_idx, 3, "argmax dim is the protagonist");
+    assert!(ev.duration_ticks >= 5);
+    assert!(ev.polarity_at_fire > 0.5);
+}
+
+// G6.6-sigma-bounded: σ stays in [σ_min, σ_max] under construction.
+#[test]
+fn conformance_p0_6_c_sigma_bounded_to_cfg() {
+    use titan_trinity_daemon::{PolarityHomeostat, PolarityHomeostatCfg};
+    let mut cfg = PolarityHomeostatCfg::for_body();
+    cfg.sigma_init = 99.0; // out-of-bounds init
+    cfg.sigma_min = 1.5;
+    cfg.sigma_max = 4.0;
+    let h = PolarityHomeostat::<3>::new(cfg);
+    let t = h.telemetry();
+    assert!(t.sigma_multiplier <= 4.0 + 1e-6);
+    assert!(t.sigma_multiplier >= 1.5 - 1e-6);
+}
+
+// G6.6-extreme-event-roundtrip: encode/decode preserves all fields.
+#[test]
+fn conformance_p0_6_c_extreme_imbalance_roundtrip() {
+    use titan_trinity_daemon::{
+        decode_extreme_imbalance, encode_extreme_imbalance, ExtremeImbalanceEvent, TrinitySide,
+    };
+    let ev = ExtremeImbalanceEvent {
+        dominant_dim_idx: 7,
+        dominant_dim_value: 0.92,
+        polarity_at_fire: 0.74,
+        polarity_sign: -1.0,
+        duration_ticks: 99,
+        sigma_multiplier: 2.7,
+        extreme_event_count_lifetime: 42,
+    };
+    let payload = encode_extreme_imbalance("mind", TrinitySide::Outer, &ev, 1.5);
+    let dec = decode_extreme_imbalance(&payload).unwrap();
+    assert_eq!(dec.src, "mind");
+    assert_eq!(dec.side, TrinitySide::Outer);
+    assert_eq!(dec.dominant_dim_idx, 7);
+    assert!((dec.polarity_sign - (-1.0)).abs() < 1e-5);
+    assert!((dec.sigma_multiplier - 2.7).abs() < 1e-5);
+    assert!((dec.ts - 1.5).abs() < 1e-3);
+}
+
+// G6.6-nudge-event-roundtrip: encode/decode preserves target + nudge.
+#[test]
+fn conformance_p0_6_c_corrective_nudge_roundtrip() {
+    use titan_trinity_daemon::{decode_corrective_nudge, encode_corrective_nudge, TrinitySide};
+    let payload = encode_corrective_nudge("body", TrinitySide::Inner, 4, -0.075, 0.075, 99.5);
+    let dec = decode_corrective_nudge(&payload).unwrap();
+    assert_eq!(dec.target_src, "body");
+    assert_eq!(dec.target_side, TrinitySide::Inner);
+    assert_eq!(dec.target_dim_idx, 4);
+    assert!((dec.nudge_value - (-0.075)).abs() < 1e-6);
+    assert!((dec.intensity - 0.075).abs() < 1e-6);
+}
+
+// G6.6-nudge-amplitude-formula: compute_nudge_amplitude respects all 3 factors.
+#[test]
+fn conformance_p0_6_c_nudge_amplitude_formula() {
+    // PLAN §6.6.4: nudge_amp = base_gain × excess × (1/max(0.1, chi))
+    //                         × (1 + atan(rate / rate_target_upper))
+    use titan_trinity_daemon::compute_nudge_amplitude;
+    let baseline = 0.1;
+    let threshold = 0.2;
+    // Floor at zero — no excess → no amp.
+    let zero = compute_nudge_amplitude(0.3, baseline, threshold, 1.0, 5.0, 50.0, 0.1);
+    assert!(zero.abs() < 1e-6, "zero excess → zero amp");
+    // Bigger excess → bigger amp.
+    let small = compute_nudge_amplitude(0.55, baseline, threshold, 1.0, 5.0, 50.0, 0.1);
+    let big = compute_nudge_amplitude(0.9, baseline, threshold, 1.0, 5.0, 50.0, 0.1);
+    assert!(big > small);
+    // Lower chi → bigger amp (metabolic factor 1/max(0.1, chi)).
+    let healthy = compute_nudge_amplitude(0.6, baseline, threshold, 1.0, 5.0, 50.0, 0.1);
+    let failing = compute_nudge_amplitude(0.6, baseline, threshold, 0.1, 5.0, 50.0, 0.1);
+    assert!(failing > healthy, "low chi → stronger correction");
+    // Higher rate → bigger amp (chronicity factor).
+    let fresh = compute_nudge_amplitude(0.6, baseline, threshold, 1.0, 0.0, 50.0, 0.1);
+    let chronic = compute_nudge_amplitude(0.6, baseline, threshold, 1.0, 100.0, 50.0, 0.1);
+    assert!(chronic > fresh, "chronic offender → escalating amp");
+}
+
+// G6.6-subscriptions: spirit + body/mind topic lists carry the new events.
+#[test]
+fn conformance_p0_6_c_topic_subscriptions_for_corrective_events() {
+    use titan_trinity_daemon::{
+        INNER_BODY_TOPICS, INNER_MIND_TOPICS, INNER_SPIRIT_TOPICS, OUTER_BODY_TOPICS,
+        OUTER_MIND_TOPICS, OUTER_SPIRIT_TOPICS,
+    };
+    // Spirit daemons subscribe to EXTREME_IMBALANCE_DETECTED.
+    assert!(INNER_SPIRIT_TOPICS.contains(&"EXTREME_IMBALANCE_DETECTED"));
+    assert!(OUTER_SPIRIT_TOPICS.contains(&"EXTREME_IMBALANCE_DETECTED"));
+    // Body/mind daemons subscribe to CORRECTIVE_NUDGE.
+    assert!(INNER_BODY_TOPICS.contains(&"CORRECTIVE_NUDGE"));
+    assert!(INNER_MIND_TOPICS.contains(&"CORRECTIVE_NUDGE"));
+    assert!(OUTER_BODY_TOPICS.contains(&"CORRECTIVE_NUDGE"));
+    assert!(OUTER_MIND_TOPICS.contains(&"CORRECTIVE_NUDGE"));
+}
+
 // G5.1-gift-mask-applied-by-kernel: BODY_FLAG_INNER * amp lands on correct dims.
 #[test]
 fn conformance_p0_5_gift_mask_applied_to_enrichment() {

@@ -289,6 +289,40 @@ class ConsciousnessDB:
             "CREATE INDEX IF NOT EXISTS idx_gifts_part_side "
             "ON trinity_journey_gifts(source_part, side)"
         )
+        # P0.6-C / D-SPEC-132 §6.6 PolarityHomeostat persistence per
+        # PLAN_trinity_homeostasis_p0 §6.6.6. One row per
+        # EXTREME_IMBALANCE_DETECTED → CORRECTIVE_NUDGE pair (body/mind daemon
+        # fires + spirit answers in one event chain). 1–50 events/day per
+        # part per-Titan target rate (PolarityHomeostatCfg defaults), so row
+        # volume is well below epochs[] / trinity_journey_gifts[] cadence.
+        # Inherits Arweave coverage via §24 sovereign-backup chain (same
+        # consciousness.db chain that already protects epochs + gifts).
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS trinity_corrective_events (
+                event_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp             REAL NOT NULL,
+                titan_id              TEXT NOT NULL,
+                source_part           TEXT NOT NULL,
+                side                  TEXT NOT NULL,
+                dominant_dim_idx      INTEGER NOT NULL,
+                dominant_dim_value    REAL NOT NULL,
+                polarity_at_fire      REAL NOT NULL,
+                polarity_sign         REAL NOT NULL,
+                duration_ticks        INTEGER NOT NULL,
+                sigma_multiplier      REAL NOT NULL,
+                lifetime_event_count  INTEGER NOT NULL,
+                nudge_value           REAL,
+                nudge_intensity       REAL,
+                nudge_ts              REAL
+            )
+        """)
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_corrective_ts ON trinity_corrective_events(timestamp)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_corrective_part_side "
+            "ON trinity_corrective_events(source_part, side)"
+        )
         self._conn.commit()
 
     def insert_trinity_journey_gift(
@@ -328,6 +362,130 @@ class ConsciousnessDB:
             ),
             table="trinity_journey_gifts",
         )
+
+    def insert_trinity_corrective_event(
+        self,
+        *,
+        timestamp: float,
+        titan_id: str,
+        source_part: str,
+        side: str,
+        dominant_dim_idx: int,
+        dominant_dim_value: float,
+        polarity_at_fire: float,
+        polarity_sign: float,
+        duration_ticks: int,
+        sigma_multiplier: float,
+        lifetime_event_count: int,
+        nudge_value: Optional[float] = None,
+        nudge_intensity: Optional[float] = None,
+        nudge_ts: Optional[float] = None,
+    ) -> None:
+        """Persist one §6.6.3 EXTREME_IMBALANCE_DETECTED row.
+
+        The matching CORRECTIVE_NUDGE fields (nudge_*) are optionally populated
+        on first INSERT if the corrective worker has both events buffered;
+        otherwise they are filled later via [`update_corrective_nudge_fields`]
+        when the spirit-side CORRECTIVE_NUDGE arrives. Keeping nudge_* nullable
+        lets the persistence worker drop straggler/orphan events without
+        blocking on bus ordering.
+        """
+        self._route_write(
+            """INSERT INTO trinity_corrective_events
+               (timestamp, titan_id, source_part, side, dominant_dim_idx,
+                dominant_dim_value, polarity_at_fire, polarity_sign,
+                duration_ticks, sigma_multiplier, lifetime_event_count,
+                nudge_value, nudge_intensity, nudge_ts)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                timestamp, titan_id, source_part, side, dominant_dim_idx,
+                dominant_dim_value, polarity_at_fire, polarity_sign,
+                duration_ticks, sigma_multiplier, lifetime_event_count,
+                nudge_value, nudge_intensity, nudge_ts,
+            ),
+            table="trinity_corrective_events",
+        )
+
+    def update_corrective_nudge_fields(
+        self,
+        *,
+        source_part: str,
+        side: str,
+        dominant_dim_idx: int,
+        nudge_value: float,
+        nudge_intensity: float,
+        nudge_ts: float,
+        match_within_seconds: float = 5.0,
+    ) -> bool:
+        """Best-effort: fill nudge_* fields on the most recent corrective
+        event matching (source_part, side, dominant_dim_idx) within the last
+        `match_within_seconds`. Used by the persistence worker to pair a
+        CORRECTIVE_NUDGE with its preceding EXTREME_IMBALANCE_DETECTED when
+        events arrive in a 2-step bus exchange.
+
+        Returns True if a row was updated, False otherwise.
+        """
+        # Find most recent matching event_id with empty nudge_* fields.
+        row = self._conn.execute(
+            """SELECT event_id FROM trinity_corrective_events
+               WHERE source_part = ? AND side = ? AND dominant_dim_idx = ?
+                 AND nudge_value IS NULL
+                 AND timestamp >= ?
+               ORDER BY event_id DESC LIMIT 1""",
+            (source_part, side, dominant_dim_idx, nudge_ts - match_within_seconds),
+        ).fetchone()
+        if row is None:
+            return False
+        event_id = row[0]
+        self._route_write(
+            """UPDATE trinity_corrective_events
+               SET nudge_value = ?, nudge_intensity = ?, nudge_ts = ?
+               WHERE event_id = ?""",
+            (nudge_value, nudge_intensity, nudge_ts, event_id),
+            table="trinity_corrective_events",
+        )
+        return True
+
+    def recent_trinity_corrective_events(
+        self,
+        *,
+        limit: int = 100,
+        source_part: Optional[str] = None,
+        side: Optional[str] = None,
+    ) -> List[dict]:
+        """Return recent corrective events (newest-first). Used by the
+        `/v6/trinity/polarity_homeostat` endpoint + §6.6.7 verify gate."""
+        where: List[str] = []
+        params: List = []
+        if source_part is not None:
+            where.append("source_part = ?")
+            params.append(source_part)
+        if side is not None:
+            where.append("side = ?")
+            params.append(side)
+        clause = " WHERE " + " AND ".join(where) if where else ""
+        params.append(int(limit))
+        sql = (
+            "SELECT event_id, timestamp, titan_id, source_part, side, dominant_dim_idx, "
+            "dominant_dim_value, polarity_at_fire, polarity_sign, duration_ticks, "
+            "sigma_multiplier, lifetime_event_count, nudge_value, nudge_intensity, "
+            "nudge_ts FROM trinity_corrective_events" + clause +
+            " ORDER BY event_id DESC LIMIT ?"
+        )
+        rows = self._conn.execute(sql, params).fetchall()
+        out: List[dict] = []
+        for r in rows:
+            out.append({
+                "event_id": r[0], "timestamp": r[1], "titan_id": r[2],
+                "source_part": r[3], "side": r[4],
+                "dominant_dim_idx": r[5], "dominant_dim_value": r[6],
+                "polarity_at_fire": r[7], "polarity_sign": r[8],
+                "duration_ticks": r[9], "sigma_multiplier": r[10],
+                "lifetime_event_count": r[11],
+                "nudge_value": r[12], "nudge_intensity": r[13],
+                "nudge_ts": r[14],
+            })
+        return out
 
     def recent_trinity_journey_gifts(
         self,
