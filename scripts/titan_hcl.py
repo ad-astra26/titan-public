@@ -22,17 +22,6 @@ import signal
 # Ensure project root is on path
 sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), "..")))
 
-# ── INV-PROC-1 (SPEC §11.B.4 / D-SPEC-135 / v1.62.0): set ps identity as
-# first I/O after import resolution so `ps -ef` distinguishes the L2 plugin
-# from `titan_hcl_api` (L3) and `guardian_hcl` (L1). Same soft-fallback
-# pattern as `titan_hcl/persistence_entry.py:48` — setproctitle absence is
-# observability degradation, not a functional fault.
-try:
-    import setproctitle as _spt
-    _spt.setproctitle("titan_hcl")
-except ImportError:
-    pass
-
 # ── tracemalloc: must start BEFORE any titan_hcl imports ──────────
 # Captures all Python allocations from this point forward (including imports).
 # Config-gated: reads [profiling].tracemalloc_enabled from titan_params.toml.
