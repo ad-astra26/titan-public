@@ -66,18 +66,11 @@ def make_outer_body_provider(ctx: OuterSourceContext,
     def provider() -> dict:
         sources = assemble_outer_sources(keys, ctx)
         now = time.time()
-        # entropy[68] + thermal[69] minutes-scale rate-of-change breath
-        # (D-SPEC-101) + P0.6-B re-grounding (D-SPEC-104 pattern): also feed
-        # proprioception[66] + somatosensation[67] LEVELS into the same
-        # ChangeBreathTracker so they breathe on their own rate-of-change
-        # rather than the flat composite-of-composites that audit
-        # 2026-05-25 found stuck near zero variance fleet-wide.
+        # entropy[68] + thermal[69] minutes-scale rate-of-change breath.
         _net = sources.get("network_monitor_stats") or {}
         _sys = sources.get("system_sensor_stats") or {}
         _hl = sources.get("hormone_levels") or {}
         _ag = sources.get("agency_stats") or {}
-        _hs = sources.get("helper_statuses") or {}
-        _tx = sources.get("tx_latency_stats") or {}
         _tot = float(_ag.get("total_actions", 0.0) or 0.0)
         _fail = float(_ag.get("failed_actions", 0.0) or 0.0)
         _err_rate = 1.0 - ((_tot - _fail) / _tot) if _tot > 0 else 0.0
@@ -89,26 +82,8 @@ def make_outer_body_provider(ctx: OuterSourceContext,
         _thermal = (0.35 * float(_sys.get("cpu_thermal", 0.5) or 0.5)
                     + 0.25 * float(_sys.get("circadian_phase", 0.5) or 0.5)
                     + 0.40 * _hormonal_heat)
-        # P0.6-B re-grounding (D-SPEC-104 / Maker call 2026-05-26):
-        # proprioception level = current composite weight (peer_entropy +
-        # helper_health + bus_module_diversity); somatosensation level =
-        # current composite (tx_lat_norm + cpu_spikes), dropping the
-        # self-referential `current_ob2` term that caused decay-to-0.5 trap.
-        _peer_entropy = float(_net.get("peer_entropy", 0.5) or 0.5)
-        _total_helpers = max(1, len(_hs)) if isinstance(_hs, dict) else 1
-        _avail = sum(1 for s in (_hs.values() if isinstance(_hs, dict) else []) if s == "available")
-        _helper_health = _avail / _total_helpers if _total_helpers > 0 else 0.5
-        _bus_div = float(_net.get("bus_module_diversity", 0.5) or 0.5)
-        _proprioception = 0.5 * _peer_entropy + 0.3 * _helper_health + 0.2 * _bus_div
-        _tx_lat_norm = float(_tx.get("normalized", 0.5) or 0.5)
-        _cpu_spikes = float(_sys.get("cpu_spike_rate", 0.0) or 0.0)
-        _somatosensation = 0.6 * _tx_lat_norm + 0.4 * _cpu_spikes
         sources["outer_body_change"] = change_tracker.update(
-            now, {
-                "entropy": _entropy, "thermal": _thermal,
-                "proprioception": _proprioception,
-                "somatosensation": _somatosensation,
-            })
+            now, {"entropy": _entropy, "thermal": _thermal})
         # interoception[65] = π-heartbeat 24h HRV.
         try:
             _pi = ctx.shm_bank.read_pi_heartbeat()
@@ -132,15 +107,6 @@ def make_outer_mind_provider(ctx: OuterSourceContext,
     keys = set(source_keys)
     willing_tracker = ExpressionWindowTracker(modalities=(
         "action", "social", "creative", "protective", "exploration"))
-    # P0.6-B re-grounding (D-SPEC-104 / Maker call 2026-05-26): track
-    # thinking[1] (outer_mind[71] in 132D state_vector) as a rate-of-change
-    # of its composite source-aggregate. Audit 2026-05-25 found std=0.007
-    # fleet-wide — the lowest of all 40 BMS dims, because the input
-    # (memory.directive_alignment + meta_cgn.knowledge_helpful + vocab + gini)
-    # is a slow-aggregate over hours. ChangeBreathTracker breathes on |Δ|/dt
-    # so the dim reflects "is the agentic-alignment system moving?", not its
-    # absolute level (which lives in a separate slow-evolution surface).
-    outer_mind_change_tracker = ChangeBreathTracker()
 
     def provider() -> dict:
         sources = assemble_outer_sources(keys, ctx)
@@ -150,7 +116,6 @@ def make_outer_mind_provider(ctx: OuterSourceContext,
         _ov = sources.get("output_verifier_stats") or {}
         _mc = sources.get("meta_cgn_stats") or {}
         _lang = sources.get("language_stats") or {}
-        _mem = sources.get("memory_stats") or {}
         _vocab = float(_lang.get("vocab_total", 0.0) or 0.0)
         sources["willing_window"] = willing_tracker.update(now, {
             "action": float(_ag.get("total_actions", 0.0) or 0.0),
@@ -159,21 +124,6 @@ def make_outer_mind_provider(ctx: OuterSourceContext,
             "protective": float(_ov.get("rejected_count", 0.0) or 0.0),
             "exploration": _vocab + float(_mc.get("primitives_grounded", 0.0) or 0.0),
         })
-        # outer_mind[71] = thinking[1] composite level fed into ChangeBreathTracker.
-        # Same composite the Rust formula uses, packaged as a single scalar level
-        # so its rate-of-change becomes the new dim value (D-SPEC-104 pattern).
-        _mc_kh = float(_mc.get("knowledge_helpful_ratio", 0.5) or 0.5)
-        _mc_gini = float(_mc.get("usage_gini", 0.5) or 0.5)
-        _mem_dir = float(_mem.get("directive_alignment", 0.5) or 0.5)
-        _vocab_conf = float(_lang.get("avg_confidence", 0.5) or 0.5)
-        _thinking_1_level = (
-            0.35 * _mem_dir
-            + 0.25 * _mc_kh
-            + 0.20 * _vocab_conf
-            + 0.20 * (1.0 - _mc_gini)
-        )
-        sources["outer_mind_change"] = outer_mind_change_tracker.update(
-            now, {"thinking_1": _thinking_1_level})
         return sources
 
     return provider

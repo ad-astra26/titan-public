@@ -81,11 +81,6 @@ _T = (
      None, None, (), (), False, "/v4/sensors"),
     ("/v6/trinity/agency", "GET", "get_v3_agency", "trinity", "readout",
      "agency.get_stats", None, ("agency_state.bin",), ("agency_worker",), False, "/v3/agency"),
-    # P0.6-C / D-SPEC-132 §6.6.6 PolarityHomeostat telemetry — reads recent
-    # trinity_corrective_events rows from consciousness.db + computes per
-    # (source_part, side) summary stats (count, rate, sigma_avg, etc.).
-    ("/v6/trinity/polarity-homeostat", "GET", "get_v6_polarity_homeostat", "trinity", "readout",
-     None, None, (), ("corrective_events_persistence",), False, None),
 
     # ── nervous-system ───────────────────────────────────────────────────
     ("/v6/nervous-system", "GET", "get_v4_nervous_system", "nervous-system", "readout",

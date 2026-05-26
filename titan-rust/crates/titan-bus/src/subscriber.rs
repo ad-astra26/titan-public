@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use titan_core::bus_specs::Priority;
 use titan_core::constants::BUS_SLOW_CONSUMER_DROP_RATE_RATIO;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 
 use crate::ring::{BoundedRing, EnqueueOutcome, Envelope, RingError};
 
@@ -128,21 +128,65 @@ pub struct BrokerSubscriber {
     /// 2026-05-25 fleet-wide).
     pub closed: bool,
 
-    /// Per-subscriber wake notify. Fired by:
+    /// Per-subscriber **data-wake** notify (SPEC §8.0.quat data-wake primitive).
+    /// Edge-triggered wake signal, fired ONLY when new bytes need to leave
+    /// this subscriber's ring:
     ///
-    /// 1. fanout (broker.rs) when a new message lands in this sub's ring
-    ///    → wakes `run_send_loop_via_map` to flush.
-    /// 2. [`signal_close`](Self::signal_close) when shutdown is requested
-    ///    → wakes BOTH `run_send_loop_via_map` AND `run_recv_loop`
-    ///    (which selects on this notify alongside its read_exact),
-    ///    ensuring both tasks exit promptly so the connection_handler
-    ///    purges the map entry instead of leaving a zombie subscriber.
+    /// 1. fanout (`broker.rs`) — after enqueueing a message into the sub's
+    ///    ring, calls `notify.notify_one()` to wake `run_send_loop_via_map`
+    ///    so it drains.
+    /// 2. heartbeat (`heartbeat.rs`) — after enqueueing a `BUS_PING`, same
+    ///    `notify.notify_one()`.
+    /// 3. [`signal_close`](Self::signal_close) — fires `notify.notify_waiters()`
+    ///    as defense-in-depth wake (so a send_loop sleeping in
+    ///    `notify.notified().await` wakes up, observes `sub.closed`, and
+    ///    returns). This is **belt-and-suspenders** — the authoritative
+    ///    close signal is [`close_tx`](Self::close_tx); the notify wake just
+    ///    avoids a wait until the next legitimate message.
     ///
-    /// Cloned into the broker's `notify_per_sub` map at subscriber-creation
-    /// time (handle_connection) so fanout can reach it without re-locking
-    /// the subs map. The Arc<Notify> shared identity means firing on EITHER
-    /// reference wakes all listeners.
+    /// **recv_loop MUST NOT listen to this primitive** (SPEC §8.0.quat
+    /// invariant 2). Cloned into the broker's `notify_per_sub` map at
+    /// subscriber-creation time (handle_connection) so fanout reaches it
+    /// without re-locking the subs map.
+    ///
+    /// **Why this primitive is edge-triggered (and safe)**: legitimate
+    /// data wakes are best-effort — losing one wake is harmless because
+    /// the next published message re-wakes. The bug that motivated
+    /// SPEC §8.0.quat / D-SPEC-131 was the OLD design's reuse of this
+    /// notify for shutdown signaling, where its edge-triggered wake +
+    /// undefined-choice-of-waiter `notify_one` semantics caused recv_loop
+    /// to be probabilistically woken by every fanout tick → recv_loop
+    /// exited thinking it was a shutdown → cascade. The fix is the
+    /// `close_tx` watch channel below.
     pub notify: Arc<Notify>,
+
+    /// Per-subscriber **close-state** channel (SPEC §8.0.quat close-state
+    /// primitive). **Level-triggered** state broadcast: once
+    /// [`signal_close`](Self::signal_close) calls `close_tx.send(true)`,
+    /// every present and future `watch::Receiver` derived from this
+    /// sender observes the `true` value via `close_rx.wait_for(|v| *v)`.
+    ///
+    /// Subscribers (one each):
+    ///
+    /// 1. `run_recv_loop` (`server.rs`) — `tokio::select!` arm
+    ///    `close_rx.wait_for(|v| *v)` cancels the in-progress
+    ///    `read_half.read_exact(...)` and returns.
+    /// 2. `run_send_loop_via_map` (`broker.rs`) — same select arm
+    ///    cancels the in-progress `notify.notified().await` and returns.
+    ///
+    /// **Level-triggered correctness**: if `signal_close()` fires BEFORE
+    /// a task subscribes a receiver, the receiver's first `.wait_for(...)`
+    /// call observes `true` immediately. This eliminates the H1
+    /// miss-the-wake race documented in
+    /// `titan-docs/HANDOFF_broker_silent_hang_continuation_20260526.md §7`.
+    ///
+    /// **Why a separate primitive from `notify`** — the two carry
+    /// unrelated semantics ("there's new data to flush" vs "you should
+    /// exit"). Reusing one edge-triggered primitive for both with
+    /// `notify_one` semantics (undefined choice-of-waiter) caused
+    /// BUG-AGNO-SILENT-HANG cascade. See SPEC §8.0.quat for the
+    /// invariant text + audit boundaries.
+    pub close_tx: watch::Sender<bool>,
 
     /// `true` once this connection has sent at least one `BUS_SUBSCRIBE`
     /// frame. Distinguishes a **pre-subscribe** anon (just connected, not
@@ -162,6 +206,7 @@ impl BrokerSubscriber {
     /// New subscriber with default ring sizes.
     pub fn new(name: impl Into<String>) -> Self {
         let now = SystemTime::now();
+        let (close_tx, _) = watch::channel(false);
         Self {
             name: name.into(),
             aliases: HashSet::new(),
@@ -176,6 +221,7 @@ impl BrokerSubscriber {
             last_window_reset_ts: now,
             closed: false,
             notify: Arc::new(Notify::new()),
+            close_tx,
             has_subscribed: false,
         }
     }
@@ -183,6 +229,7 @@ impl BrokerSubscriber {
     /// New subscriber with custom ring sizes (used by tests).
     pub fn with_ring(name: impl Into<String>, ring: BoundedRing) -> Self {
         let now = SystemTime::now();
+        let (close_tx, _) = watch::channel(false);
         Self {
             name: name.into(),
             aliases: HashSet::new(),
@@ -197,41 +244,89 @@ impl BrokerSubscriber {
             last_window_reset_ts: now,
             closed: false,
             notify: Arc::new(Notify::new()),
+            close_tx,
             has_subscribed: false,
         }
     }
 
-    /// Mark this subscriber closed AND wake both `run_recv_loop` (via
-    /// `tokio::select!` on `self.notify`) and `run_send_loop_via_map`
-    /// (via existing `notify.notified()` wait) so they exit promptly.
+    /// Mark this subscriber closed AND wake both `run_recv_loop` and
+    /// `run_send_loop_via_map` so they exit promptly via the two-primitive
+    /// signal split mandated by SPEC §8.0.quat / D-SPEC-131.
     ///
-    /// **Why this method exists** — BUG-AGNO-SILENT-HANG fix
-    /// (2026-05-25): direct `closed = true` assignment without
-    /// notifying left `run_recv_loop` blocked in `read_half.read_exact`
-    /// forever (the underlying socket was half-open — broker stopped
-    /// pulling but hadn't closed write_half). The recv_task never
-    /// exited → `tokio::join!(recv_task, send_task)` in
-    /// `handle_connection` never completed → subscriber stayed in the
-    /// map with `closed=true` → every fanout to `dst=<sub.name>`
-    /// silent-skipped (broker.rs:663). Result: silent zombie
-    /// subscriber. Observed on T2 fleet-wide 2026-05-25 after chat #1
-    /// succeeded → chat #2+ vanished without trace until manual
-    /// restart. Same class as
-    /// `project_sphere_pulse_not_reaching_broker_freeze_20260522`.
+    /// **Effect:**
+    ///
+    /// 1. Sets `self.closed = true` (in-memory authoritative flag).
+    /// 2. `self.close_tx.send(true)` — **level-triggered** state broadcast.
+    ///    Every present + future receiver derived from `close_tx` observes
+    ///    `true` via `wait_for(|v| *v)`. This is the authoritative shutdown
+    ///    signal for recv_loop + send_loop. Survives the H1 miss-the-wake
+    ///    race (late awaiter sees the current value).
+    /// 3. `self.notify.notify_waiters()` — defense-in-depth edge wake so
+    ///    any send_loop currently sleeping in `notify.notified().await`
+    ///    returns immediately (instead of waiting for the next legitimate
+    ///    data publication). recv_loop is NOT registered on this primitive
+    ///    so the wake cannot falsely terminate it.
+    ///
+    /// **Why both primitives are fired** — per SPEC §8.0.quat invariant 4:
+    /// the close_tx is authoritative (level-triggered, never lost), the
+    /// notify_waiters is a wake-up optimization. Either primitive alone
+    /// would not satisfy: close_tx alone leaves send_loop sleeping until
+    /// its next select tick (which is fine — wait_for(true) wakes it via
+    /// the watch channel's internal notify); notify alone has the
+    /// edge-triggered + dual-purpose problems that caused
+    /// BUG-AGNO-SILENT-HANG (D-SPEC-131 root cause).
+    ///
+    /// **History** — D-SPEC-130 (2026-05-25) introduced `signal_close()` to
+    /// fix the original silent-zombie bug (direct `closed = true` left
+    /// `run_recv_loop` blocked in `read_half.read_exact` forever — see
+    /// `BrokerSubscriber.closed` field docstring). The D-SPEC-130 version
+    /// used `notify.notify_waiters()` to wake BOTH recv_loop (via select)
+    /// and send_loop. That re-purpose of the data-wake `notify` for
+    /// shutdown signaling was the D-SPEC-131 root cause: `notify.notify_one()`
+    /// from fanout/heartbeat could probabilistically wake recv_loop instead
+    /// of send_loop, killing the connection during normal traffic. The
+    /// D-SPEC-131 fix splits the primitives: `notify` reverts to its
+    /// pure data-wake role (send_loop only listens), `close_tx` is the
+    /// authoritative close-state channel (both loops listen).
     ///
     /// **All call sites must use this method.** Direct `closed = true`
     /// is forbidden going forward (the field is `pub` only because
     /// existing tests construct it directly; production code must
     /// route through `signal_close`).
     ///
-    /// Idempotent: safe to call multiple times.
+    /// Idempotent: safe to call multiple times (`watch::Sender::send` is
+    /// a no-op when the value is unchanged; `notify_waiters` on no waiters
+    /// is also a no-op).
     pub fn signal_close(&mut self) {
         self.closed = true;
-        // notify_waiters() wakes ALL pending listeners on this notify
-        // (send_loop + recv_loop in select). notify_one() would only
-        // wake one — we explicitly want both tasks to observe the
-        // closed flag and exit.
+        // Authoritative close signal — level-triggered. `send_replace`
+        // updates the watch's stored value AND notifies receivers
+        // **regardless of whether any receivers currently exist** (unlike
+        // `send` which returns Err and DOES NOT UPDATE the value when
+        // receivers=0). Using `send_replace` is load-bearing for the
+        // late-subscriber semantics required by SPEC §8.0.quat: a
+        // receiver created AFTER `signal_close()` fires (e.g. during
+        // reconnect race) MUST still observe `true` via `wait_for(|v| *v)`.
+        // With `send`, the value would silently stay `false` if no
+        // receivers existed at fire time → late awaiter blocks forever
+        // → H1 race re-introduced.
+        let _ = self.close_tx.send_replace(true);
+        // Defense-in-depth wake for any send_loop currently sleeping
+        // in notify.notified().await. recv_loop does NOT listen to this
+        // primitive (SPEC §8.0.quat invariant 2) so this cannot
+        // falsely terminate recv_loop.
         self.notify.notify_waiters();
+    }
+
+    /// Subscribe a fresh `watch::Receiver<bool>` to observe the close
+    /// state. Subscribers MUST use `close_rx.wait_for(|v| *v)` to wait
+    /// for shutdown (level-triggered — resolves immediately if already
+    /// closed at subscribe time).
+    ///
+    /// Used by `handle_connection` to give recv_task + send_task each
+    /// their own receiver.
+    pub fn subscribe_close(&self) -> watch::Receiver<bool> {
+        self.close_tx.subscribe()
     }
 
     /// Enqueue a message, applying P1 coalesce-by-(src,type) when applicable.
@@ -533,19 +628,21 @@ mod tests {
         assert_ne!(pre.has_subscribed, subscribed_empty.has_subscribed);
     }
 
-    // ── BUG-AGNO-SILENT-HANG fix tests (2026-05-25) ──────────────
+    // ── BUG-AGNO-SILENT-HANG fix tests ───────────────────────────
+    // D-SPEC-130 (2026-05-25): signal_close API.
+    // D-SPEC-131 (2026-05-26): two-primitive split (close_tx + notify).
 
     #[tokio::test]
-    async fn signal_close_marks_closed_and_wakes_notify() {
-        // Smoking-gun test for BUG-AGNO-SILENT-HANG:
-        // signal_close MUST both mark closed AND wake any task
-        // awaiting the per-sub notify. Without the wake, recv_loop
-        // stays blocked in read_exact forever → silent zombie.
+    async fn signal_close_marks_closed_and_wakes_send_loop_notify() {
+        // signal_close MUST mark closed AND fire the defense-in-depth
+        // notify wake so a send_loop sleeping in notify.notified()
+        // returns immediately. recv_loop is NOT a notify listener
+        // per SPEC §8.0.quat invariant 2.
         let mut sub = BrokerSubscriber::new("agno_worker");
         assert!(!sub.closed);
         let notify_ref = sub.notify.clone();
 
-        // Spawn a "fake recv_loop" that awaits the notify.
+        // Spawn a "fake send_loop" that awaits notify.
         let woken = std::sync::Arc::new(tokio::sync::Mutex::new(false));
         let woken_clone = woken.clone();
         let task = tokio::spawn(async move {
@@ -553,19 +650,16 @@ mod tests {
             *woken_clone.lock().await = true;
         });
 
-        // Give the spawned task a chance to start awaiting.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Fire signal_close — should mark closed AND wake the task.
         sub.signal_close();
         assert!(sub.closed);
 
-        // Wait for the task to observe the notification.
         tokio::time::timeout(Duration::from_millis(200), task)
             .await
             .expect(
-                "recv_loop equivalent did not wake within 200ms — \
-                 BUG-AGNO-SILENT-HANG regression: signal_close not waking notify",
+                "send_loop equivalent did not wake within 200ms — \
+                 signal_close not firing defense-in-depth notify",
             )
             .unwrap();
         assert!(*woken.lock().await);
@@ -575,20 +669,96 @@ mod tests {
     async fn signal_close_is_idempotent() {
         // Repeated signal_close must be safe (heartbeat may fire it
         // again on subsequent ticks while purge is in flight).
+        // watch::Sender::send is a no-op when the value is unchanged;
+        // notify.notify_waiters() on no listeners is also a no-op.
         let mut sub = BrokerSubscriber::new("worker");
         sub.signal_close();
         sub.signal_close();
         sub.signal_close();
         assert!(sub.closed);
-        // No panic = pass.
+        assert!(*sub.close_tx.borrow());
     }
 
     #[tokio::test]
-    async fn signal_close_wakes_multiple_waiters() {
-        // Both send_loop AND recv_loop wait on the same per-sub
-        // notify. signal_close MUST wake BOTH (notify_waiters, not
-        // notify_one) — otherwise one of them stays blocked forever
-        // → silent zombie state returns.
+    async fn signal_close_sets_close_tx_to_true() {
+        // SPEC §8.0.quat: signal_close MUST set close_tx to true so
+        // both recv_loop and send_loop's wait_for(|v| *v) resolve.
+        let mut sub = BrokerSubscriber::new("worker");
+        let mut rx = sub.subscribe_close();
+        assert!(!*rx.borrow_and_update());
+
+        sub.signal_close();
+
+        // Level-triggered: rx should now see true.
+        let closed = tokio::time::timeout(Duration::from_millis(200), rx.wait_for(|v| *v))
+            .await
+            .expect("close_rx.wait_for(true) did not resolve within 200ms")
+            .unwrap();
+        assert!(*closed);
+    }
+
+    #[tokio::test]
+    async fn close_tx_is_level_triggered_late_subscriber_sees_closed() {
+        // D-SPEC-131 H1 fix: a receiver subscribed AFTER signal_close()
+        // fires MUST still observe closed=true via wait_for(|v| *v).
+        // Edge-triggered primitives (Notify) would lose this signal —
+        // hence the watch::Sender level-triggered design.
+        let mut sub = BrokerSubscriber::new("worker");
+        sub.signal_close();
+
+        // Subscribe AFTER the close — late awaiter must see the state.
+        let mut rx = sub.subscribe_close();
+
+        let closed = tokio::time::timeout(Duration::from_millis(100), rx.wait_for(|v| *v))
+            .await
+            .expect(
+                "late close_rx subscriber did not see closed=true — \
+             SPEC §8.0.quat H1 race regression",
+            )
+            .unwrap();
+        assert!(*closed);
+    }
+
+    #[tokio::test]
+    async fn data_wake_notify_does_not_trigger_close_rx() {
+        // SPEC §8.0.quat invariant 2: data-wake notify and close-state
+        // watch are DISTINCT primitives. Firing the data-wake notify
+        // (as fanout + heartbeat do via notify.notify_one() / .notify_waiters())
+        // MUST NOT cause a close-state receiver's wait_for(|v| *v) to
+        // resolve. This is the regression test for D-SPEC-131 (recv_loop
+        // was being killed by stray notify wakes under the old design).
+        let sub = BrokerSubscriber::new("worker");
+        let notify = sub.notify.clone();
+        let mut close_rx = sub.subscribe_close();
+
+        // Spawn a task that races a data-wake fire vs the close_rx.
+        let task = tokio::spawn(async move {
+            tokio::select! {
+                _ = close_rx.wait_for(|v| *v) => "closed_unexpectedly",
+                _ = tokio::time::sleep(Duration::from_millis(150)) => "timed_out_correctly",
+            }
+        });
+
+        // Fire data-wake notify several times — should NOT influence close_rx.
+        for _ in 0..10 {
+            notify.notify_one();
+            notify.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let outcome = task.await.unwrap();
+        assert_eq!(
+            outcome, "timed_out_correctly",
+            "data-wake notify leaked into close_rx — SPEC §8.0.quat regression"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_close_wakes_multiple_send_loop_waiters() {
+        // notify.notify_waiters() in signal_close wakes ALL pending
+        // notify listeners (multiple send_loop instances during
+        // hypothetical reconnect / race). Cross-check that the
+        // defense-in-depth wake still functions.
         let mut sub = BrokerSubscriber::new("worker");
         let n1 = sub.notify.clone();
         let n2 = sub.notify.clone();
@@ -615,21 +785,22 @@ mod tests {
             t2.await.unwrap();
         })
         .await
-        .expect(
-            "notify_waiters() did not wake both listeners — \
-             BUG-AGNO-SILENT-HANG regression",
-        );
+        .expect("notify_waiters() did not wake both listeners");
 
-        assert_eq!(*counter.lock().await, 2, "expected both waiters to wake");
+        assert_eq!(*counter.lock().await, 2);
     }
 
     #[test]
-    fn new_subscriber_has_fresh_notify() {
-        // Each subscriber gets its own Notify — firing one does NOT
-        // wake another's listeners.
+    fn new_subscriber_has_fresh_notify_and_close_tx() {
+        // Each subscriber gets its own Notify AND its own watch::Sender.
         let sub_a = BrokerSubscriber::new("a");
         let sub_b = BrokerSubscriber::new("b");
-        // Different Arc identities.
         assert!(!Arc::ptr_eq(&sub_a.notify, &sub_b.notify));
+        // close_tx is its own Sender; subscribing each gives independent
+        // receivers (no cross-talk).
+        let mut rx_a = sub_a.subscribe_close();
+        let mut rx_b = sub_b.subscribe_close();
+        assert!(!*rx_a.borrow_and_update());
+        assert!(!*rx_b.borrow_and_update());
     }
 }
