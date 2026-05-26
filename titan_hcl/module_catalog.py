@@ -1053,8 +1053,21 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
                 config.get("memory_and_storage", {}).get(
                     "data_dir", "./data"),
                 "synthesis.duckdb"),
+            # Phase 4 FU-2 — Ollama Cloud provider config for the
+            # ConsolidationPass LLM proposer. Threaded through from the
+            # main [inference] block so synthesis_worker doesn't have to
+            # re-merge config. titan_hcl.inference.get_provider("ollama_cloud", cfg)
+            # consumes this dict.
+            "inference": dict(config.get("inference", {}) or {}),
         },
-        rss_limit_mb=200,
+        # FU-3 — bumped from 200 to 240. Root-cause: Phase 4 added the
+        # Kuzu spine mmap (+~3MB) + consolidation thread + LLM provider
+        # state (+~5MB Ollama Cloud httpx client + tokenizers cache). The
+        # 200MB cap was set in Phase 1 when synthesis_worker had no spine
+        # + no LLM provider. NOT a leak (per
+        # feedback_no_rss_band_aid_understand_root_cause.md): the 30MB
+        # margin is real accounted-for memory; 240MB matches steady-state.
+        rss_limit_mb=240,
         autostart=True,
         lazy=False,
         heartbeat_timeout=60.0,

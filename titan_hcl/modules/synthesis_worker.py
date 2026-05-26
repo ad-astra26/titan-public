@@ -758,24 +758,40 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 _initial_exp_err,
             )
 
-        # LLM provider — best-effort. Falls back to all-reject proposer
-        # when the inference module isn't importable / configured.
+        # Phase 4 FU-2 — Ollama Cloud LLM proposer for ConsolidationPass.
+        # The synthesis worker's ModuleSpec config carries the [inference]
+        # block; we construct an OllamaCloudProvider via the existing
+        # factory + wrap it with make_default_llm_propose. Best-effort —
+        # missing API key or import failure degrades to the all-reject
+        # proposer so the pass still runs (mines TXs + anchors summary
+        # for audit), just produces no spine writes.
         propose_fn = None
+        inference_cfg = (config or {}).get("inference", {}) or {}
         try:
-            from titan_hcl import inference as _inference_mod
-            # Resolve provider via the existing get_provider surface; the
-            # specific model + cfg are part of the broader inference setup
-            # this worker doesn't own. If provider construction fails the
-            # proposer falls through to the no-op.
-            provider = getattr(_inference_mod, "get_default_provider", None)
-            if callable(provider):
-                p = provider()  # may raise if not configured
-                propose_fn = make_default_llm_propose(p)
+            from titan_hcl.inference import get_provider as _get_provider
+            api_key = inference_cfg.get("ollama_cloud_api_key", "") or ""
+            if api_key:
+                provider = _get_provider("ollama_cloud", inference_cfg)
+                propose_fn = make_default_llm_propose(provider)
+                model = inference_cfg.get(
+                    "ollama_cloud_model", "") or "default"
+                logger.info(
+                    "[synthesis_worker] Ollama Cloud LLM proposer wired "
+                    "(model=%s) — ConsolidationPass will make real "
+                    "NEW/VERSION_BUMP/REJECT verdicts",
+                    model,
+                )
+            else:
+                logger.info(
+                    "[synthesis_worker] [inference] ollama_cloud_api_key "
+                    "missing — ConsolidationPass falls back to all-reject "
+                    "proposer (pass summary TXs still anchored)",
+                )
         except Exception as e:
-            logger.info(
-                "[synthesis_worker] LLM proposer unavailable at boot (%s) — "
-                "consolidation will run with all-reject proposer until "
-                "provider is wired; pass-summary TXs still anchored",
+            logger.warning(
+                "[synthesis_worker] Ollama Cloud provider construction "
+                "failed (%s) — ConsolidationPass falls back to all-reject "
+                "proposer until provider is fixed",
                 e,
             )
         if propose_fn is None:
