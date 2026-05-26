@@ -243,14 +243,6 @@ MAINTAIN_BUNDLE = "MAINTAIN_BUNDLE"
 # if the initiator's reply subscription transiently lapses during reload.
 MODULE_RELOAD_REQUEST = "MODULE_RELOAD_REQUEST"
 MODULE_RELOAD_ACK = "MODULE_RELOAD_ACK"
-# Phase 6 (SPEC §11.B.4 / D-SPEC-135 / v1.62.0) — GuardianHCLClient (thin
-# bus client in titan_hcl process) forwards lifecycle mutations to
-# guardian_hcl via these targeted messages. guardian_hcl subscribes via
-# scripts/guardian_hcl.py:_handle_module_lifecycle_requests and invokes
-# Guardian.{start, stop, restart_module} on receipt.
-MODULE_START_REQUEST = "MODULE_START_REQUEST"
-MODULE_STOP_REQUEST = "MODULE_STOP_REQUEST"
-MODULE_RESTART_REQUEST = "MODULE_RESTART_REQUEST"
 EPOCH_TICK = "EPOCH_TICK"
 
 # Phase C C-S7 (2026-05-05) — supervision messages per SPEC §8.1 +

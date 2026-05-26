@@ -16,20 +16,7 @@ MODULE_RESTART_REQUEST, SUPERVISION_*), not Python imports. The imports
 below remain for legacy in-process callers until the standalone process
 cutover (chunk 6F) replaces them with thin bus clients.
 """
-from titan_hcl.guardian_hcl.core import (
-    DEFAULT_RSS_LIMIT_MB,
-    HEARTBEAT_INTERVAL,
-    HEARTBEAT_TIMEOUT,
-    MAX_RESTARTS_IN_WINDOW,
-    MAX_STARVED_CYCLES,
-    MIN_CPU_DELTA_FOR_ALIVE,
-    REENABLE_COOLDOWN_S,
-    RESTART_BACKOFF_BASE,
-    RESTART_WINDOW_SECONDS,
-    SUSTAINED_UPTIME_RESET,
-    Guardian,
-    _module_wrapper,
-)
+from titan_hcl.guardian_hcl.core import Guardian, _module_wrapper
 from titan_hcl.guardian_hcl.module_registry import (
     ModuleState,
     ModuleSpec,
@@ -50,17 +37,4 @@ __all__ = [
     "ReloadState",
     "_module_wrapper",
     "_append_meta_cgn_emission_log",
-    # Heartbeat / restart-window tunables re-exported for legacy callers
-    # (tests, arch_map). Pre-6C carve these were attributes on
-    # titan_hcl.guardian module-level; restored at package-level here.
-    "DEFAULT_RSS_LIMIT_MB",
-    "HEARTBEAT_INTERVAL",
-    "HEARTBEAT_TIMEOUT",
-    "MAX_RESTARTS_IN_WINDOW",
-    "MAX_STARVED_CYCLES",
-    "MIN_CPU_DELTA_FOR_ALIVE",
-    "REENABLE_COOLDOWN_S",
-    "RESTART_BACKOFF_BASE",
-    "RESTART_WINDOW_SECONDS",
-    "SUSTAINED_UPTIME_RESET",
 ]

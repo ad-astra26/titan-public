@@ -32,7 +32,7 @@ from ..bus import (
     LLM_SCORE_RESPONSE,
     make_msg,
 )
-from ..guardian_hcl import Guardian
+from ..guardian import Guardian
 
 logger = logging.getLogger(__name__)
 
