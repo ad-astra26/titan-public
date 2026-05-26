@@ -26,7 +26,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from titan_hcl.bus import DivineBus
-from titan_hcl.guardian import Guardian, ModuleSpec
+from titan_hcl.guardian_hcl import Guardian, ModuleSpec
 
 
 def _entry_fn(*args, **kwargs):
@@ -173,7 +173,7 @@ def test_b3_cleanup_seam_documented():
     """
     import inspect
 
-    from titan_hcl import guardian as g_mod
+    from titan_hcl import guardian_hcl as g_mod
 
     src = inspect.getsource(g_mod._start_module if hasattr(g_mod, "_start_module") else g_mod.Guardian)
     assert ("B.3 Stage 1" in src

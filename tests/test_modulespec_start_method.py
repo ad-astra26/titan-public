@@ -21,7 +21,7 @@ import pickle
 
 import pytest
 
-from titan_hcl.guardian import ModuleSpec
+from titan_hcl.guardian_hcl import ModuleSpec
 
 
 def _noop():
@@ -104,7 +104,7 @@ def test_unknown_method_in_get_context_raises():
 def test_guardian_register_accepts_spawn_spec():
     """Guardian.register() doesn't reject spawn-method specs."""
     from titan_hcl.bus import DivineBus
-    from titan_hcl.guardian import Guardian
+    from titan_hcl.guardian_hcl import Guardian
 
     bus = DivineBus(maxsize=100)
     g = Guardian(bus)

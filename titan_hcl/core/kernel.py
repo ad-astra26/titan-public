@@ -50,7 +50,10 @@ from titan_hcl.bus import (
     DivineBus,
     make_msg,
 )
-from titan_hcl.guardian import Guardian
+# Phase 6 / D-SPEC-135 / v1.62.0: Guardian moved to a separate process
+# (scripts/guardian_hcl.py). The kernel holds a thin bus client mirroring
+# Guardian's public surface — see titan_hcl/guardian_hcl_client.py.
+from titan_hcl.guardian_hcl_client import GuardianHCLClient
 
 logger = logging.getLogger(__name__)
 
@@ -369,6 +372,11 @@ KERNEL_RPC_EXPOSED_METHODS: frozenset[str] = frozenset({
     # (direct attribute access on TitanHCL); fails through kernel_rpc
     # proxy when api_process_separation_enabled=true (production path).
     "metabolism.evaluate_gate",
+    # MEDITATION-WORK-RPC-SYNC-AUDIT (2026-05-26) — async sibling exposed
+    # for the FastAPI endpoint `metabolism_evaluate_gate()` in dashboard.py.
+    # Per SPEC Preamble G19, async callers MUST use the async sibling;
+    # the kernel_rpc proxy needs the method allowlisted same as the sync.
+    "metabolism.evaluate_gate_async",
     "metabolism.get_metabolic_tier",
     "metabolism.get_gates_enforced",
     "metabolism.get_last_gate_decision_reason",
@@ -501,17 +509,20 @@ class TitanKernel:
             titan_id=self._titan_id, config=self._config,
         )
 
-        # ── Guardian ─────────────────────────────────────────────────
-        # [guardian] toml plumbed 2026-04-16 (dead-wiring audit). Section
-        # reaches Guardian which reads heartbeat_timeout_default /
-        # max_restarts_in_window / restart_window / sustained_uptime_reset
-        # with module constants as fallbacks.
-        self.guardian = Guardian(self.bus, config=self._config.get("guardian", {}))
-        # Microkernel v2 Phase A retrofit (2026-04-27): wire kernel ref into
-        # Guardian so its start() / restart() consult is_shadow_swap_active().
-        # Prevents proxy-driven lazy-starts from resurrecting workers mid-swap
-        # (which would re-acquire DB locks → fail shadow_boot).
-        self.guardian._kernel_ref = self
+        # ── Guardian (Phase 6 / D-SPEC-135 / v1.62.0) ────────────────
+        # Pre-Phase-6: `self.guardian = Guardian(self.bus, config=...)` —
+        # in-process L1 supervisor that constructed workers via mp.Process,
+        # held a kernel back-reference for shadow-swap interlock, drained
+        # worker send queues, and ran monitor_tick on the kernel event loop.
+        # Phase 6: Guardian lives in a SEPARATE PROCESS (scripts/guardian_hcl.py)
+        # spawned by titan-kernel-rs. The kernel holds a thin bus client that
+        # forwards lifecycle mutations (start/stop/restart/reload) to
+        # guardian_hcl via dst="guardian_hcl_lifecycle"/dst="guardian" and
+        # serves status reads from a cache populated by MODULE_*+SUPERVISION_*
+        # events. _kernel_ref no longer applies — cross-process swap interlock
+        # would need a bus-mediated protocol; left as a no-op pending a
+        # follow-on RFP. INV-PROC-2.
+        self.guardian = GuardianHCLClient(self.bus)
         # Shadow-swap completion signaling — endpoints / proxies block on this
         # event during a swap and resume when orchestrator finishes (success
         # or rollback). Initial state: set (no swap in flight = "done").
@@ -630,15 +641,24 @@ class TitanKernel:
         Called from TitanHCL.boot() per PLAN §3 D10 boot-order
         invariants.
         """
-        # ── Wire bus poll function for synchronous proxy requests ───
-        # Guardian drains worker send queues whenever the bus needs to
-        # dispatch a pending proxy QUERY/RESPONSE. Non-blocking.
+        # ── bus poll hook — Phase 6 (D-SPEC-135) ─────────────────────
+        # Pre-Phase-6: `bus._poll_fn = self.guardian.drain_send_queues`
+        # drained worker→bus queues whenever the bus needed to dispatch a
+        # pending proxy QUERY/RESPONSE. Under Phase 6 worker send queues
+        # live in guardian_hcl process — kernel has no queues to drain.
+        # GuardianHCLClient.drain_send_queues is a no-op preserving the
+        # contract for any residual hook callers.
         self.bus._poll_fn = self.guardian.drain_send_queues
 
         loop = asyncio.get_event_loop()
 
-        # Guardian health monitor tick (every 1s, offloaded to thread)
-        loop.create_task(self._guardian_loop())
+        # ── L0 SHM publisher loop (Phase 6 — _guardian_loop carved) ──
+        # Phase 6: Guardian.monitor_tick + drain_send_queues moved to
+        # scripts/guardian_hcl.py. Guardian state publisher (G21 single
+        # writer of guardian_state.bin) ALSO moved there. The kernel still
+        # owns soul_state.bin + network_state.bin publication — that lives
+        # in _l0_state_publish_loop now.
+        loop.create_task(self._l0_state_publish_loop())
 
         # Kernel heartbeat publisher (every 10s)
         loop.create_task(self._heartbeat_loop())
@@ -735,16 +755,19 @@ class TitanKernel:
         logger.info("[TitanKernel] Async boot complete — L0 loops running")
 
     def start_modules(self) -> None:
-        """Start Guardian-supervised autostart modules.
+        """No-op under Phase 6 (D-SPEC-135).
 
-        Called by TitanHCL.boot() AFTER _register_modules so that every
-        ModuleSpec is known to Guardian before any child processes launch.
+        Pre-Phase-6: this called `guardian.start_all()` which spawned every
+        autostart=True ModuleSpec via mp.Process inside the kernel process.
+        Phase 6 moves the catalog + start_all() to guardian_hcl process —
+        that process autostarts modules itself at its own boot (scripts/
+        guardian_hcl.py:run). Plugin.boot() still calls start_modules()
+        for surface compatibility; we keep it as a no-op so the boot
+        sequence comment in plugin.py stays load-bearing.
         """
-        self.guardian.start_all()
         logger.info(
-            "[TitanKernel] Modules started: %s",
-            list(self.guardian._modules.keys()),
-        )
+            "[TitanKernel] start_modules() is a no-op under Phase 6 — "
+            "guardian_hcl owns autostart.")
 
     async def shutdown(self, reason: str = "shutdown") -> None:
         """Graceful L0 stop — signal shm writer threads, stop disk health,
@@ -791,75 +814,47 @@ class TitanKernel:
     # Private L0 loops (event-loop tasks)
     # ------------------------------------------------------------------
 
-    async def _guardian_loop(self) -> None:
-        """Periodically call Guardian monitor tick + drain worker send queues.
+    async def _l0_state_publish_loop(self) -> None:
+        """Publish kernel-owned L0 SHM state slots at 1 Hz.
 
-        CRITICAL: Guardian work is inherently blocking (subprocess joins,
-        queue cleanup, SAVE_NOW waits up to 30s, SIGTERM waits up to 15s).
-        If these ran directly on the asyncio event loop, any worker-cleanup
-        pathology would freeze uvicorn, the bus dispatcher, and every other
-        coroutine — exactly the cascade observed 2026-04-14 on T1 when a
-        Guardian cleanup deadlocked for 31+ minutes. We therefore offload
-        monitor_tick to a worker thread so the event loop remains responsive
-        no matter what Guardian is doing. drain_send_queues is fast and
-        stays on-loop for lowest latency.
+        Phase 6 (D-SPEC-135, v1.62.0): the legacy _guardian_loop was carved.
+        Guardian.monitor_tick + drain_send_queues + guardian_state.bin
+        publication moved to scripts/guardian_hcl.py. The kernel still owns
+        soul_state.bin + network_state.bin (parent-process secrets and RPC
+        state) — those publish here on the same 1 Hz cadence.
+
+        G21 single-writer is preserved: only this loop writes soul_state.bin
+        + network_state.bin; only guardian_hcl writes guardian_state.bin.
         """
-        # Phase A.4 (D-SPEC-70 v1.10.0) — kernel publishes soul_state.bin
-        # and guardian_state.bin SHM slots so api_subprocess reads canonical
-        # SHM per Preamble G18 (replaces soul.state / guardian.status
-        # bus-cache lookups). Both are titan_HCL-owned (parent process)
-        # per SPEC §1 glossary. G21 single-writer enforced here — only
-        # the kernel monitor_tick path writes these slots.
         soul_pub = None
-        guardian_pub = None
         network_pub = None
         try:
-            from titan_hcl.logic.soul_state_publisher import (
-                SoulStatePublisher,
-            )
-            from titan_hcl.logic.guardian_state_publisher import (
-                GuardianStatePublisher,
-            )
-            from titan_hcl.logic.network_state_publisher import (
-                NetworkStatePublisher,
-            )
-            from titan_hcl.core.state_registry import (
-                resolve_titan_id as _resolve_tid_a4_k,
-            )
+            from titan_hcl.logic.soul_state_publisher import SoulStatePublisher
+            from titan_hcl.logic.network_state_publisher import NetworkStatePublisher
+            from titan_hcl.core.state_registry import resolve_titan_id as _resolve_tid_a4_k
             _a4_tid_k = _resolve_tid_a4_k()
             soul_pub = SoulStatePublisher(titan_id=_a4_tid_k)
-            guardian_pub = GuardianStatePublisher(titan_id=_a4_tid_k)
             network_pub = NetworkStatePublisher(titan_id=_a4_tid_k)
             soul_pub.publish(self.soul)  # cold-boot first publish
-            guardian_pub.publish(self.guardian)
             network_pub.publish(self.network)
             logger.info(
-                "[TitanKernel] Phase A.4 publishers attached: "
-                "soul_state + guardian_state + network_state "
-                "(G21 single-writer; "
-                "rFP_phase_c_state_read_unification_l0_l1_canonical)")
+                "[TitanKernel] Phase 6 L0 SHM publishers attached: "
+                "soul_state + network_state (G21 single-writer). "
+                "guardian_state.bin owned by guardian_hcl process.")
         except Exception as _err:
             logger.warning(
-                "[TitanKernel] Phase A.4 publisher init failed: %s — "
+                "[TitanKernel] L0 SHM publisher init failed: %s — "
                 "api_subprocess will read cold-boot stubs from those slots",
                 _err)
 
         while True:
             try:
-                await asyncio.to_thread(self.guardian.monitor_tick)
-                routed = self.guardian.drain_send_queues()
-                if routed > 0:
-                    logger.debug("[TitanKernel] Routed %d messages from workers", routed)
-                # Phase A.4 — publish parent-process state slots each tick
-                # (1Hz cadence matches existing kernel snapshot rate).
                 if soul_pub is not None:
                     soul_pub.publish(self.soul)
-                if guardian_pub is not None:
-                    guardian_pub.publish(self.guardian)
                 if network_pub is not None:
                     network_pub.publish(self.network)
             except Exception as e:
-                logger.error("[TitanKernel] Guardian tick error: %s", e)
+                logger.error("[TitanKernel] L0 state publish error: %s", e)
             await asyncio.sleep(1.0)
 
     async def _heartbeat_loop(self) -> None:

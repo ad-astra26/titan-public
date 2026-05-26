@@ -32,7 +32,7 @@ from titan_hcl.bus import (
     DivineBus,
     make_msg,
 )
-from titan_hcl.guardian import (
+from titan_hcl.guardian_hcl import (
     Guardian,
     ModuleInfo,
     ModuleSpec,
@@ -197,7 +197,7 @@ def test_cleanup_adopted_dead_pid_is_noop():
     info.state = ModuleState.RUNNING
 
     # Mock os.kill so we don't actually try to SIGTERM init.
-    with patch("titan_hcl.guardian.os.kill") as m_kill:
+    with patch("titan_hcl.guardian_hcl.core.os.kill") as m_kill:
         m_kill.side_effect = ProcessLookupError()
         g._kill_adopted_process(info, "zombie")
     # ProcessLookupError → returns without escalating to SIGKILL
@@ -221,9 +221,9 @@ def test_cleanup_adopted_escalates_to_sigkill_after_grace():
         if sig == signal.SIGKILL:
             raise ProcessLookupError()  # finally gone after SIGKILL
 
-    with patch("titan_hcl.guardian.os.kill", side_effect=fake_kill), \
-         patch("titan_hcl.guardian.time.sleep"), \
-         patch("titan_hcl.guardian.time.time", side_effect=[0, 0.5, 1.0, 1.5, 2.5]):
+    with patch("titan_hcl.guardian_hcl.core.os.kill", side_effect=fake_kill), \
+         patch("titan_hcl.guardian_hcl.core.time.sleep"), \
+         patch("titan_hcl.guardian_hcl.core.time.time", side_effect=[0, 0.5, 1.0, 1.5, 2.5]):
         g._kill_adopted_process(info, "stubborn")
     # Should have called SIGTERM, then SIGKILL after grace
     sigs = [c[1] for c in call_log]
