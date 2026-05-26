@@ -7998,98 +7998,28 @@ async def get_v4_meta_teacher_status(request: Request):
                 "source_age_s": round(shm_age_s, 3),
             })
 
-        # ── Cold-boot fallback: file scan ────────────────────────────
-        # SHM not ready yet (first publish takes ~1s after worker init) OR
-        # missing F5 fields (post-deploy boundary before new worker landed).
-        # Read files as a one-time bootstrap; once the worker's publisher
-        # fires we'll be back on the SHM hot path.
-        import glob as _glob
-        import json as _json
-        now = _time.time()
-        cutoff = now - 86400.0
-        scan_floor_mtime = now - (25.0 * 3600.0)
-        cat_counts: dict[str, int] = {}
-        scores_24h: list[float] = []
-        critiques_24h = 0
-        ok_24h = 0
-        failed_24h = 0
-        if _os.path.isdir(mt_dir):
-            for fpath in sorted(_glob.glob(
-                    _os.path.join(mt_dir, "critiques.*.jsonl"))):
-                try:
-                    if _os.path.getmtime(fpath) < scan_floor_mtime:
-                        continue
-                    with open(fpath) as f:
-                        for line in f:
-                            try:
-                                e = _json.loads(line)
-                            except Exception:
-                                continue
-                            if float(e.get("ts", 0)) < cutoff:
-                                continue
-                            critiques_24h += 1
-                            if e.get("llm_ok"):
-                                ok_24h += 1
-                            else:
-                                failed_24h += 1
-                            scores_24h.append(
-                                float(e.get("quality_score", 0.5)))
-                            for cat in (e.get("critique_categories") or []):
-                                cat_counts[cat] = cat_counts.get(cat, 0) + 1
-                except Exception:
-                    continue
-        avg_q_24h = (sum(scores_24h) / len(scores_24h)) if scores_24h else 0.0
-        top_cats = sorted(cat_counts.items(), key=lambda x: -x[1])[:5]
-
-        adoption: dict[str, float] = {}
-        prompt_version_on_disk: int = 1
-        adoption_path = _os.path.join(mt_dir, "adoption_metrics.json")
-        if _os.path.exists(adoption_path):
-            try:
-                with open(adoption_path) as f:
-                    raw = _json.load(f) or {}
-                if isinstance(raw, dict) and "_prompt_version" in raw:
-                    prompt_version_on_disk = int(raw.get("_prompt_version", 1))
-                    by_domain = raw.get("by_domain", {})
-                    if isinstance(by_domain, dict):
-                        adoption = {
-                            str(k): float(v)
-                            for k, v in by_domain.items()
-                            if isinstance(v, (int, float))
-                        }
-                elif isinstance(raw, dict):
-                    adoption = {
-                        str(k): float(v)
-                        for k, v in raw.items()
-                        if isinstance(v, (int, float))
-                    }
-            except Exception:
-                pass
-        adoption_overall = (
-            sum(adoption.values()) / len(adoption)) if adoption else 0.0
-
-        journal_path = _os.path.join(mt_dir, "teaching_journal.jsonl")
-        cold_topics = 0
-        still_needs_push_count = 0
-        if _os.path.exists(journal_path):
-            try:
-                last_rows: dict[str, dict] = {}
-                with open(journal_path) as f:
-                    for line in f:
-                        try:
-                            r = _json.loads(line)
-                        except Exception:
-                            continue
-                        tk = r.get("topic_key")
-                        if not isinstance(tk, str):
-                            continue
-                        last_rows[tk] = r
-                cold_topics = len(last_rows)
-                still_needs_push_count = sum(
-                    1 for r in last_rows.values() if r.get("still_needs_push"))
-            except Exception:
-                pass
-
+        # ── Cold-boot path: SHM not ready yet ────────────────────────
+        # Reached when (a) SHM payload is missing entirely (worker hasn't
+        # attached its publisher yet — typically ~5s after process start
+        # OR a post-deploy boundary), (b) SHM payload predates this F5
+        # extension (no `critiques_24h` key — readers tolerate it per the
+        # variable-msgpack contract), or (c) SHM is stale beyond the
+        # 120s threshold (worker stopped publishing).
+        #
+        # Per `feedback_implement_rfp_fully_no_simplifications_no_deferrals`
+        # the *correct* behaviour here is NOT to file-scan a 50 MB journal
+        # on the hot path (that's the very problem F5 closed) but to
+        # surface the warming state honestly. The G21 owner — the worker
+        # — is the canonical source for the F5 fields; the api process
+        # cannot meaningfully reconstruct them without the worker's
+        # in-memory TeacherMemory snapshot. Return immediately with the
+        # static config + zeroed F5 fields and `source: "warming"` so
+        # callers can retry; sub-millisecond response.
+        #
+        # In production this window is ~the first 5 seconds after a
+        # restart (between api /health=200 and the worker's first
+        # `publisher.publish(...)` call); steady-state requests land on
+        # the SHM hot path above.
         return _ok({
             "enabled": bool(cfg.get("enabled", False)),
             "sample_mode": cfg.get("sample_mode", "uncertainty_plus_random"),
@@ -8098,24 +8028,25 @@ async def get_v4_meta_teacher_status(request: Request):
             "reward_weight_config": float(cfg.get("reward_weight", 0.05)),
             "reward_weight_cap": float(cfg.get("reward_weight_cap", 0.30)),
             "grounding_weight": float(cfg.get("grounding_weight", 0.15)),
-            "critiques_24h": critiques_24h,
-            "llm_ok_24h": ok_24h,
-            "llm_failed_24h": failed_24h,
-            "avg_quality_score_24h": round(avg_q_24h, 3),
-            "top_critique_categories": top_cats,
-            "adoption_prompt_version": prompt_version_on_disk,
-            "adoption_rate_by_domain": {
-                k: round(float(v), 3) for k, v in adoption.items()},
-            "adoption_rate_overall": round(adoption_overall, 3),
+            "critiques_24h": 0,
+            "llm_ok_24h": 0,
+            "llm_failed_24h": 0,
+            "avg_quality_score_24h": 0.0,
+            "top_critique_categories": [],
+            "adoption_prompt_version": 0,
+            "adoption_rate_by_domain": {},
+            "adoption_rate_overall": 0.0,
             "critiques_dir": mt_dir,
             "content_awareness_enabled": bool(
                 cfg.get("content_awareness_enabled", True)),
             "teaching_memory_enabled": bool(
                 cfg.get("teaching_memory_enabled", False)),
-            "memory_cold_tier_topics": cold_topics,
-            "memory_still_needs_push_count": still_needs_push_count,
-            "source": "file.fallback",
+            "memory_cold_tier_topics": 0,
+            "memory_still_needs_push_count": 0,
+            # Provenance — callers should retry after ~5s for live data.
+            "source": "warming",
             "source_age_s": round(shm_age_s, 3) if shm_age_s > 0 else None,
+            "retry_after_s": 5,
         })
     except Exception as e:
         logger.error("[Dashboard] /v4/meta-teacher/status error: %s", e)
