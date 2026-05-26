@@ -1435,7 +1435,18 @@ async def metabolism_evaluate_gate(
         # reads use callable-shaped getters so the kernel_rpc proxy fires real
         # RPC roundtrips (attribute access alone returns an unresolved
         # _RPCRemoteRef which is not JSON-serializable).
-        should_proceed, rate_mult = met.evaluate_gate(feature, caller=caller or feature)
+        #
+        # MEDITATION-WORK-RPC-SYNC-AUDIT (2026-05-26): switched to the async
+        # sibling. The sync `evaluate_gate()` routes through MetabolismProxy.
+        # `_work_rpc_sync` (metabolism_proxy.py:333) whose in-loop fallback
+        # at the wire layer calls blocking `bus.request` — which would block
+        # this async FastAPI endpoint's event loop on every gate evaluation.
+        # Per SPEC Preamble G19 (no sync bus.request for state in async
+        # contexts; async ≤5s work-RPC only), async callers MUST use the
+        # async sibling. `evaluate_gate_async()` is the documented mirror at
+        # metabolism_proxy.py:382 and uses `_work_rpc_async()` end-to-end.
+        should_proceed, rate_mult = await met.evaluate_gate_async(
+            feature, caller=caller or feature)
         return _ok({
             "should_proceed": should_proceed,
             "rate_multiplier": rate_mult,
