@@ -10,19 +10,6 @@ class TestOuterMindTensor15D:
         result = collect_outer_mind_15d([0.5] * 5)
         assert len(result) == 15
 
-    @pytest.mark.skip(reason=(
-        "POST-PHASE-C-STALE-TEST-HYGIENE (2026-05-26): outer_mind 15D dim "
-        "source mix re-grounded per SPEC §23.8 (15D) + D-SPEC-101 v1.39.0 "
-        "(short-window self-observation variance) + D-SPEC-89 v1.28.0 "
-        "(trinity dim formula source reframe to widen substrate signal). "
-        "Legacy assertion expected result[1]/[4] > 0.7 from a single "
-        "assessment_stats injection; current SPEC §23.8 derives knowledge "
-        "retrieval / communication clarity from multi-source substrate "
-        "(mean_score is one of several inputs, not the dominant signal). "
-        "Live behavior verified via /v6/trinity/outer + arch_map services. "
-        "Re-enable once §23.8 dim-source mix is replayed into a fresh "
-        "fixture (separate session, scope = test rewrite not code change)."
-    ))
     def test_thinking_from_assessment(self):
         from titan_hcl.logic.outer_mind_tensor import collect_outer_mind_15d
         result = collect_outer_mind_15d(
@@ -50,16 +37,6 @@ class TestOuterMindTensor15D:
         )
         assert result_active[13] > result_quiet[13]  # Protective response dim
 
-    @pytest.mark.skip(reason=(
-        "POST-PHASE-C-STALE-TEST-HYGIENE (2026-05-26): outer_mind willing-block "
-        "dims now use 24h smoothing + rate-counter persistence per D-SPEC-87 "
-        "v1.27.0 (closes Phase 3 of outer-mind willing redesign). A single "
-        "fixture call with `per_window=8/4/3` no longer crosses the 0.5 "
-        "threshold because the smoothed rate accumulator starts at 0. "
-        "Live behavior verified via /v6/trinity/outer (action/creative/"
-        "exploration rates flowing fleet-wide). Re-enable once a "
-        "rate-counter-aware fixture is added (test rewrite, not code change)."
-    ))
     def test_willing_from_actions(self):
         from titan_hcl.logic.outer_mind_tensor import collect_outer_mind_15d
         result = collect_outer_mind_15d(

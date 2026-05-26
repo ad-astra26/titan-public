@@ -309,28 +309,17 @@ def test_all_outcome_computers_respect_signed_bounds(computer, args):
 # ──────────────────────────────────────────────────────────────────────
 
 def test_four_new_meta_service_endpoints_registered():
-    """All 5 Session 2 meta-service endpoints registered on the v6 cognition router.
-
-    Repointed 2026-05-26 (POST-PHASE-C-STALE-TEST-HYGIENE): Phase E
-    (D-SPEC-115 / v1.51.0) consolidated every legacy `/v4/*` endpoint into
-    the `api/v6` single readout roof. The legacy `/v4/meta-service*`
-    handlers in `dashboard.py:7631+` are no longer registered with
-    `@router.get(...)` decorators — they are invoked via the v6 route
-    table in `titan_hcl/api/v6.py:171-180`.
-
-    SPEC anchor: D-SPEC-115 (SPEC §21 — Phase E api/v6 single readout roof)
-    enforced via `arch_map api-manifest` (INV-9 gate, see SPEC §7 invariants).
-    """
-    from titan_hcl.api.v6 import router as v6_router
-    v6_paths = {r.path for r in v6_router.routes if hasattr(r, "path")}
+    """All 4 Session 2 endpoints registered on the dashboard router."""
+    from titan_hcl.api.dashboard import router
+    paths = {r.path for r in router.routes if hasattr(r, "path")}
     for p in (
-        "/v6/cognition/meta-service",            # Session 1
-        "/v6/cognition/meta-service/queue",       # Session 2
-        "/v6/cognition/meta-service/recruitment", # Session 2
-        "/v6/cognition/meta-service/rewards",     # Session 2
-        "/v6/cognition/meta-service/timechain",   # Session 2
+        "/v4/meta-service",           # Session 1
+        "/v4/meta-service/queue",      # Session 2
+        "/v4/meta-service/recruitment", # Session 2
+        "/v4/meta-service/rewards",    # Session 2
+        "/v4/meta-service/timechain",  # Session 2
     ):
-        assert p in v6_paths, f"Missing v6 endpoint: {p}"
+        assert p in paths, f"Missing endpoint: {p}"
 
 
 # ──────────────────────────────────────────────────────────────────────
