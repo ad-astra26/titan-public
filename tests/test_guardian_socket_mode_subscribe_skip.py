@@ -173,7 +173,7 @@ def test_b3_cleanup_seam_documented():
     """
     import inspect
 
-    from titan_hcl import guardian as g_mod
+    from titan_hcl import guardian_hcl as g_mod
 
     src = inspect.getsource(g_mod._start_module if hasattr(g_mod, "_start_module") else g_mod.Guardian)
     assert ("B.3 Stage 1" in src

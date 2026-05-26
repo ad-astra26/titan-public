@@ -157,7 +157,7 @@ def test_save_done_for_target_module_still_breaks_loop():
     the original semantics."""
     # Verify the SAVE_DONE branch is unchanged by inspecting source.
     import inspect
-    from titan_hcl import guardian as g_mod
+    from titan_hcl import guardian_hcl as g_mod
     src = inspect.getsource(g_mod.Guardian.stop)
     # The SAVE_DONE check + break is in the loop
     assert "save_done_seen = True" in src
