@@ -1,6 +1,8 @@
 """EngineRecall — contract-driven episodic recall.
 
-Synthesis Engine Phase 2 (PLAN_synthesis_engine_Phase2.md §2D, D-P2-1).
+Synthesis Engine Phase 2 (PLAN_synthesis_engine_Phase2.md §2D, D-P2-1)
++ Phase 3 (PLAN_synthesis_engine_Phase3.md P3.D — granularity-aware
+retrieval, D-SPEC-127).
 
 The recall pipeline is encoded END-TO-END inside the
 `actr_episodic_recall_helper` contract (PLAN §2C.a). EngineRecall is the
@@ -9,20 +11,33 @@ thin coordinator that:
   1. embeds the query text (caller-supplied embedder; SPEC-correct per
      arch §3.5 — RuleEvaluator stays model-free, D-P2-3),
   2. loads the contract,
-  3. invokes `RuleEvaluator.evaluate(rules, ctx, initial_variables=...)`
-     with `$query_embedding` + `$current_chat_tx` pre-seeded,
-  4. consumes the `rank_composite` action by:
+  3. **(Phase 3 P3.D)** augments the rule list with a granularity-scoped
+     FORK_READ when the caller requests `granularity={turn,topic,session}`,
+  4. invokes `RuleEvaluator.evaluate(rules, ctx, initial_variables=...)`
+     with `$query_embedding` + `$current_chat_tx` (+ P3 `$granularity_tag`)
+     pre-seeded,
+  5. consumes the `rank_composite` action by:
        - merging the candidate-source $vars (e.g. $base + $semantic +
-         $threaded) — dedup by tx_hash,
+         $threaded + P3 $granularity_filtered) — dedup by tx_hash,
        - building `Candidate` objects (cosine from FAISS score if
          present, else default; importance default 0.5 per arch §5.3),
        - running `composite_score()` with the contract-supplied weights,
-  5. returns the top-K ScoredCandidate-equivalent dicts.
+  6. returns the top-K ScoredCandidate-equivalent dicts.
 
-Contract-driven design (D-P2-1): Maker tunes ranking end-to-end by
-editing the JSON + re-signing — no Python change needed. Adding new
-candidate sources (a fourth fork to search, a new cross-ref via_field)
-is purely a JSON edit.
+**Granularity (arch §7 — P3.D):** `{turn, topic, session}` as a
+query-time parameter (arch §7: "no extra storage"). EngineRecall
+augments the contract rule list with a conditional FORK_READ scoped to
+the granularity tag (`chat:<chat_id>` for turn/session, `topic:<X>`
+for topic). The candidate source `$granularity_filtered` is added to
+`candidates_from` only when granularity is requested — base contract
+JSON unchanged, granularity-less callers see legacy P2 semantics
+byte-identical.
+
+Contract-driven design (D-P2-1 / INV-Syn-6): Maker tunes ranking
+end-to-end by editing the JSON + re-signing. Granularity is a
+*parametric extension by the consumer* (the recipe lives in the
+contract; granularity prunes to a runtime context the contract can't
+know ahead of time).
 
 Source-of-truth for contracts: this class reads them DIRECTLY from
 `titan_hcl/contracts/meta_cognitive/*.json` (not from the meta-fork
@@ -64,6 +79,32 @@ HELPER_CONTRACT_ID = "actr_episodic_recall_helper"
 # only so a test fixture can reference the canonical names.
 DEFAULT_CANDIDATES_FROM = ("$base", "$semantic", "$threaded")
 DEFAULT_K = 8
+
+# Phase 3 P3.D — granularity-aware retrieval constants.
+GRANULARITY_TURN = "turn"
+GRANULARITY_TOPIC = "topic"
+GRANULARITY_SESSION = "session"
+_VALID_GRANULARITIES = frozenset(
+    {GRANULARITY_TURN, GRANULARITY_TOPIC, GRANULARITY_SESSION})
+
+# $var used by the granularity-augmented FORK_READ. Public constant so
+# tests + a future Maker-tuned contract version can reference it.
+GRANULARITY_SOURCE_VAR = "$granularity_filtered"
+# Recency window (hours) for the granularity-scoped FORK_READ. Tighter
+# than the default `$base` 168h because granularity = "this conversation
+# / this topic, recent". Maker-tunable via the contract once promoted.
+GRANULARITY_DEFAULT_WINDOW_H = {
+    GRANULARITY_TURN: 24,     # "this turn" → last 24h of this chat
+    GRANULARITY_TOPIC: 168,   # "this topic" → 1 week of the topic
+    GRANULARITY_SESSION: 720, # "this session" → 30 days of chat_id
+}
+# Per-granularity row cap. Turn is the tightest (most recent few);
+# session opens the widest aperture.
+GRANULARITY_DEFAULT_LIMIT = {
+    GRANULARITY_TURN: 10,
+    GRANULARITY_TOPIC: 30,
+    GRANULARITY_SESSION: 50,
+}
 
 
 # ── Recall result row (engine API) ───────────────────────────────────────
@@ -174,8 +215,29 @@ class EngineRecall:
         *,
         current_chat_tx: Optional[str] = None,
         k: int = DEFAULT_K,
+        # Phase 3 P3.D — granularity-aware retrieval (arch §7).
+        granularity: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        topic_tag: Optional[str] = None,
     ) -> Optional[list[RecallResult]]:
         """Contract-driven episodic recall.
+
+        Args:
+            query_text: text to embed for SEARCH cosine.
+            current_chat_tx: pivot tx_hash for CROSS_REF threading
+                (P2 behavior — pre-existing).
+            k: max results to return (post-composite-rank cap).
+            granularity: P3.D — one of `{"turn", "topic", "session"}`
+                or None (default). When set, augments the contract's
+                rule list with a granularity-scoped FORK_READ source
+                and includes it in the rank_composite candidate set.
+                Unknown values are treated as None with a WARN log.
+            chat_id: required when granularity in {turn, session} —
+                the session whose TXs the scoped FORK_READ filters to
+                (`tags_include=["chat:<chat_id>"]`).
+            topic_tag: required when granularity == "topic" — the
+                topic tag to scope to (auto-prefixed `topic:` if the
+                caller didn't include it).
 
         Returns:
             list[RecallResult] sorted by composite score descending, or
@@ -206,23 +268,46 @@ class EngineRecall:
             self._total_fallbacks += 1
             return None
 
-        # 2. Build the eval context + variable preamble.
+        # 2. Resolve the granularity tag + build augmented rule list.
+        #    None / unknown granularity → empty tag → no augmentation
+        #    (legacy P2 behavior byte-identical).
+        granularity_tag = _resolve_granularity_tag(
+            granularity, chat_id, topic_tag)
+        rules = list(contract["rules"])
+        if granularity_tag:
+            granularity_rule, gran_var = _build_granularity_rule(
+                granularity, granularity_tag)
+            rules.append(granularity_rule)
+            # The contract's OR-gate is the LAST rule (per
+            # actr_episodic_recall_helper convention). To include the
+            # new granularity source in the rank_composite action, we
+            # mutate the OR-gate's action.candidates_from to append
+            # gran_var. The OR clauses also gain an IF for length>=1
+            # so the OR fires when granularity alone yields rows.
+            _augment_or_gate(rules, gran_var)
+
+        # 3. Build the eval context + variable preamble.
         ctx = {
             "event": "retrieval_request",
             "query_text_len": len(query_text or ""),
             "k": k,
+            "granularity": granularity or "",
         }
         initial_vars: dict[str, Any] = {
             "$query_embedding": qe,
             "$current_chat_tx": current_chat_tx or "",
+            # Always seed even when unused — keeps the contract rule
+            # references resolvable when Maker later promotes the
+            # granularity hook into the JSON.
+            "$granularity_tag": granularity_tag,
         }
 
-        # 3. Evaluate via RuleEvaluator. The contract's binding rules
+        # 4. Evaluate via RuleEvaluator. The contract's binding rules
         #    (FORK_READ / SEARCH / CROSS_REF) populate variables; the
         #    final OR-gate emits the rank_composite action.
         try:
             action = self._evaluator.evaluate(
-                contract["rules"], ctx, initial_variables=initial_vars)
+                rules, ctx, initial_variables=initial_vars)
         except Exception as exc:
             logger.warning(
                 "[EngineRecall] contract evaluation failed: %s — fallback",
@@ -349,10 +434,129 @@ class EngineRecall:
         }
 
 
+def _resolve_granularity_tag(
+    granularity: Optional[str],
+    chat_id: Optional[str],
+    topic_tag: Optional[str],
+) -> str:
+    """Map P3.D granularity hint → the tag the FORK_READ filters on.
+
+    Returns "" (sentinel for "no augmentation, legacy P2 behavior")
+    when:
+      - granularity is None or unknown
+      - the required parameter for the granularity is missing
+        (turn/session need chat_id; topic needs topic_tag)
+
+    No exceptions; missing context logs DEBUG (not WARN — granularity
+    is opt-in and absent context is the legacy path, not an error).
+    """
+    if not granularity:
+        return ""
+    if granularity not in _VALID_GRANULARITIES:
+        logger.warning(
+            "[EngineRecall] unknown granularity %r — degrading to legacy "
+            "(valid: %s)", granularity, sorted(_VALID_GRANULARITIES))
+        return ""
+    if granularity in (GRANULARITY_TURN, GRANULARITY_SESSION):
+        if not chat_id:
+            logger.debug(
+                "[EngineRecall] granularity=%s but no chat_id — degrading",
+                granularity)
+            return ""
+        return f"chat:{chat_id}"
+    # GRANULARITY_TOPIC
+    if not topic_tag:
+        logger.debug(
+            "[EngineRecall] granularity=topic but no topic_tag — degrading")
+        return ""
+    # Auto-prefix `topic:` if the caller passed the bare topic.
+    return topic_tag if topic_tag.startswith("topic:") else f"topic:{topic_tag}"
+
+
+def _build_granularity_rule(
+    granularity: str, granularity_tag: str,
+) -> tuple[dict, str]:
+    """Construct the FORK_READ rule scoped to the granularity tag.
+
+    Returns (rule_dict, candidate_var_name). The rule reads from the
+    conversation fork constrained by `tags_include=[granularity_tag]`;
+    window + limit come from the per-granularity defaults
+    (`GRANULARITY_DEFAULT_WINDOW_H` / `GRANULARITY_DEFAULT_LIMIT`).
+    The result is stored in `GRANULARITY_SOURCE_VAR` (default
+    `$granularity_filtered`).
+    """
+    window_h = GRANULARITY_DEFAULT_WINDOW_H.get(granularity, 168)
+    limit = GRANULARITY_DEFAULT_LIMIT.get(granularity, 30)
+    rule = {
+        "op": "FORK_READ",
+        "fork": "conversation",
+        "filter": {"tags_include": [granularity_tag]},
+        "since_hours": window_h,
+        "limit": limit,
+        "store": GRANULARITY_SOURCE_VAR,
+    }
+    return rule, GRANULARITY_SOURCE_VAR
+
+
+def _augment_or_gate(rules: list, gran_var: str) -> None:
+    """Mutate the last OR-gate in `rules` to include gran_var.
+
+    Adds:
+      - a new IF clause `{"op":"IF","field":"<gran_var>.length",
+        "cmp":"GTE","value":1}` to the OR.clauses list, so the gate
+        fires when ONLY granularity matches yielded rows.
+      - the gran_var to action.candidates_from.
+
+    Idempotent on duplicate gran_var. Soft-fails silently if the
+    last rule is not an OR-gate with the expected shape — the
+    granularity source is then still computed but won't participate
+    in ranking (legacy P2 candidates dominate). Logs DEBUG on
+    soft-fail so the issue surfaces if a contract is restructured.
+    """
+    if not rules:
+        return
+    last = rules[-1]
+    if not isinstance(last, dict) or last.get("op") != "OR":
+        logger.debug(
+            "[EngineRecall] granularity augment: last rule is not OR — "
+            "leaving gate unchanged")
+        return
+    clauses = last.get("clauses")
+    then = last.get("then")
+    if not isinstance(clauses, list) or not isinstance(then, dict):
+        logger.debug(
+            "[EngineRecall] granularity augment: OR-gate has unexpected "
+            "shape — leaving unchanged")
+        return
+    cands = then.get("candidates_from")
+    if not isinstance(cands, list):
+        logger.debug(
+            "[EngineRecall] granularity augment: action has no list "
+            "candidates_from — leaving unchanged")
+        return
+    if gran_var in cands:
+        return  # already augmented (idempotent)
+    # Append the IF clause + the candidate var.
+    clauses.append({
+        "op": "IF",
+        "field": f"{gran_var}.length",
+        "cmp": "GTE",
+        "value": 1,
+    })
+    cands.append(gran_var)
+
+
 __all__ = [
     "EngineRecall",
     "RecallResult",
     "HELPER_CONTRACT_ID",
     "DEFAULT_CANDIDATES_FROM",
     "DEFAULT_K",
+    # P3.D
+    "GRANULARITY_TURN",
+    "GRANULARITY_TOPIC",
+    "GRANULARITY_SESSION",
+    "GRANULARITY_SOURCE_VAR",
+    "GRANULARITY_DEFAULT_WINDOW_H",
+    "GRANULARITY_DEFAULT_LIMIT",
 ]

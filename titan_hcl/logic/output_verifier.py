@@ -1021,27 +1021,57 @@ class OutputVerifier:
 
     # ── Utility ────────────────────────────────────────────────────
 
+    # arch §7 cap — chat turns rarely exceed 10 tool calls; cap revisits
+    # flagged in PLAN_synthesis_engine_Phase3.md surfaced-concerns #4.
+    _TOOL_CALLS_PER_TURN_CAP = 50
+
     def build_timechain_payload(self, result: OVGResult,
                                 prompt_text: str = "",
                                 *,
                                 user_id: str = "",
                                 chat_id: str = "",
                                 turn_index: int = 0,
-                                topic_tags: Optional[list] = None) -> dict:
+                                topic_tags: Optional[list] = None,
+                                tool_calls: Optional[list] = None,
+                                neuromods: Optional[dict] = None,
+                                embedding_hash: str = "",
+                                importance: float = 0.5) -> dict:
         """Build the TIMECHAIN_COMMIT payload for a verified/blocked output.
 
-        Phase 2 closure (D-SPEC-125 follow-up, 2026-05-25): brings the
-        pass-path conversation-fork TX into `ARCHITECTURE_synthesis_engine.md
-        §7` conformance. Adds normative content fields (`chat_id`,
-        `user_id_hash`, `turn_index`) and the arch §7 tag list
-        `["chat", f"chat:<id>", f"user:<hash>"] + topic_tags + [channel]`.
-        The `actr_user_conversation_bundle` standing contract (arch §12.3,
-        Phase 2 D-P2-5) consumes `user:<hash>` tags to maintain per-user
-        bundles in synthesis_worker's `association_bundles` table.
+        **Phase 3 (rFP §18 — episode model, D-SPEC-127):** brings the
+        pass-path conversation-fork TX into full `ARCHITECTURE_synthesis_engine.md
+        §7` content conformance. Adds the normative content carry that
+        the episode model + standing bundles + granularity-aware retrieval
+        all consume:
+
+            content = {
+              # P2 closure fields (kept — load-bearing for actr_user_conv_bundle):
+              chat_id, user_id_hash, turn_index, output_hash, prompt_hash,
+              signature, channel, checks, violation_type, titan_id,
+              # P3 fields (NEW — arch §7 normative carry):
+              user_msg, agent_response, tool_calls[], neuromods{},
+              embedding_hash (132D unified-spirit), importance, topic_tags[]
+            }
+
+        With `cas_payload_slimming_enabled=true` (P3.F flip), the
+        BlockBuilder slims this dict into CAS — the TX on-chain carries
+        only the hash + lean metadata; the body lives once in
+        `data/content_store/`. arch §16.2 "one canonical blob, addressed
+        once, referenced from many indices".
+
+        **Phase 2 closure carry-over (D-SPEC-125, 2026-05-25):** arch §7
+        tag list `["chat", f"chat:<id>", f"user:<hash>"] + topic_tags +
+        [channel]` unchanged. The `actr_user_conversation_bundle` standing
+        contract (arch §12.3, Phase 2 D-P2-5) consumes `user:<hash>` tags;
+        the **new** `actr_topic_conversation_bundle` (P3.E) consumes
+        `topic:<X>` tags identically — both populate
+        synthesis_worker's `association_bundles` table.
 
         Args:
             result:      OVGResult from verify_and_sign / verify_safety+sign.
-            prompt_text: Originating prompt (for prompt_hash audit field).
+            prompt_text: Originating prompt — surfaced inline as
+                         `content["user_msg"]` (P3) AND hashed as
+                         `prompt_hash` (existing audit field; both kept).
             user_id:     Raw user identifier (Privy `claims["sub"]`, "maker",
                          channel-synthesized id, etc.). Empty or "anonymous"
                          → no `user:` tag (anonymous traffic does NOT
@@ -1053,15 +1083,36 @@ class OutputVerifier:
                          tag; chat_id field still present in content
                          as empty string for schema stability).
             turn_index:  Turn number within the chat session (0 = first
-                         turn, +1 per agent reply).
-            topic_tags:  Optional caller-supplied topic-extraction tags.
-                         None / empty → omitted from tag list. Phase 4+
-                         topic-extraction pipeline populates these.
+                         turn, +1 per agent reply). P3.B replaces the P2
+                         placeholder `0` with a real per-session counter
+                         in agno PostHook.
+            topic_tags:  Topic-extractor output (P3.C —
+                         `llm_pipeline.topic_extractor`). Surfaces both as
+                         `topic:<X>` tags AND inline in `content["topic_tags"]`
+                         for self-describing payload. None / empty → omitted
+                         from tag list AND content carries `[]`.
+            tool_calls:  P3 §7 NEW. List of per-turn tool invocations,
+                         already shaped by the caller as
+                         `[{tool, args_hash, result_hash, latency_ms,
+                         exception}, ...]`. Capped at
+                         `_TOOL_CALLS_PER_TURN_CAP` per TX. None → empty list.
+            neuromods:   P3 §7 NEW. Snapshot from
+                         `synthesis.turn_snapshot.capture_turn_snapshot`
+                         — `{name: level}` for the 6 modulators (DA / 5HT
+                         / NE / ACh / Endorphin / GABA). None → empty dict.
+            embedding_hash: P3 §7 NEW. sha256 hex of the 132D unified-spirit
+                         vector at PostHook time (trinity full_130dt +
+                         journey curvature+density). Empty "" when SHM
+                         unavailable / partial. Used by §10 spreading
+                         activation in Phase 4.
+            importance:  P3 §7 NEW. Default 0.5 (arch §5.3 cold-start);
+                         lazy-scored in next dream cycle via bridge salience
+                         (rFP §20 Q2 / §24 reframe).
 
         Returns dict ready to publish to the bus as a TIMECHAIN_COMMIT
         message. Blocked path (result.passed=False) unchanged — routes
         to meta fork with `OVG_BLOCKED` event (no per-user bundling
-        intended for security alerts).
+        intended for security alerts; security TXs carry no §7 content).
         """
         if result.passed:
             # Arch §7 normative tag list. Order matters for visual log
@@ -1078,22 +1129,33 @@ class OutputVerifier:
             user_tag = hash_user_id(user_id)
             if user_tag:
                 tags.append(user_tag)
+            # Topic tags arrive from P3.C extractor pre-prefixed
+            # (`topic:<name>`); we trust the caller's namespace + only
+            # defend against non-string elements.
+            normalized_topic_tags: list[str] = []
             if topic_tags:
-                # Defensive: caller may pass non-string elements.
-                tags.extend(str(t) for t in topic_tags if t)
+                normalized_topic_tags = [str(t) for t in topic_tags if t]
+                tags.extend(normalized_topic_tags)
             if result.channel:
                 tags.append(result.channel)
+
+            # Tool-calls: cap + defensive shape coercion (never trust
+            # caller blindly inside OVG, which is the security surface).
+            capped_tool_calls: list = []
+            if tool_calls:
+                for tc in tool_calls[: self._TOOL_CALLS_PER_TURN_CAP]:
+                    if isinstance(tc, dict):
+                        capped_tool_calls.append(tc)
 
             return {
                 "fork": "conversation",
                 "thought_type": "conversation",
                 "source": "output_verifier",
                 "content": {
-                    # Arch §7 normative fields (NEW Phase 2 closure):
+                    # P2 closure fields (load-bearing — kept):
                     "chat_id": chat_id,
                     "user_id_hash": hash_user_id_raw(user_id),
                     "turn_index": int(turn_index),
-                    # Existing OVG audit fields (load-bearing — kept):
                     "output_hash": hashlib.sha256(
                         result.output_text.encode()).hexdigest(),
                     "prompt_hash": hashlib.sha256(
@@ -1103,6 +1165,14 @@ class OutputVerifier:
                     "checks": result.checks,
                     "violation_type": "none",
                     "titan_id": self._titan_id,
+                    # P3 §7 normative content carry (NEW):
+                    "user_msg": prompt_text or "",
+                    "agent_response": result.output_text or "",
+                    "tool_calls": capped_tool_calls,
+                    "neuromods": dict(neuromods) if neuromods else {},
+                    "embedding_hash": str(embedding_hash or ""),
+                    "importance": float(importance),
+                    "topic_tags": normalized_topic_tags,
                 },
                 "tags": tags,
                 "significance": 0.3,
