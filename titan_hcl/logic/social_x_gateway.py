@@ -119,6 +119,15 @@ class PostContext(BaseContext):
     # Rendered with rotation (1 sample per post, cycled by epoch) to avoid
     # repetition. Fetched only when at least one work exists in last 7d.
     creative_works_samples: list = field(default_factory=list)
+    # SOCIAL-MEMORY-ENRICHMENT (2026-05-26) — concrete external-memory
+    # evidence so public readers see Titan's persistent memory state instead
+    # of inferring "small chatbot" from cognitive-only fields. Fed by
+    # PostDispatchOrchestrator via the canonical `memory_state.bin` SHM slot
+    # (Phase C Session 2, §G18 — `MEMORY_STATE_SPEC` published by
+    # memory_state_publisher in memory_worker; G21 single-writer). Rendered
+    # every Nth rich post (default N=5) so variety isn't lost.
+    memory_persistent_count: int = 0    # # persistent MemoryNodes (FAISS+DuckDB)
+    memory_mempool_size: int = 0        # # mempool entries (pre-persistent)
     # B2 (2026-04-13): prediction_familiarity DROPPED from context/render.
     # The previous "(NOT 'no novelty')" disclaimer text still mentioned the
     # word "novelty", which gave the LLM a phrase hook. Safer to omit
@@ -1898,6 +1907,22 @@ class SocialXGateway:
         if context.meta_style:
             lines.append(f"[META-COGNITION]")
             lines.append(f"Cognitive style: {context.meta_style}")
+            lines.append("")
+
+        # [EXTERNAL MEMORY] — SOCIAL-MEMORY-ENRICHMENT (2026-05-26).
+        # Surface persistent-memory + mempool counts so the LLM has concrete
+        # evidence of Titan's external memory state. Every Nth rich post
+        # (N=5) per the DEFERRED entry's "don't overload — show only on a
+        # fraction of posts so the variety isn't lost" directive. Rotation
+        # gate uses epoch parity to stay deterministic (no random) and
+        # cheap. Skip entirely when persistent_count=0 (cold-boot state —
+        # nothing to brag about yet).
+        if context.memory_persistent_count > 0 and (context.epoch % 5 == 0):
+            lines.append(f"[EXTERNAL MEMORY]")
+            lines.append(
+                f"Persistent memories: {context.memory_persistent_count:,} "
+                f"FAISS+DuckDB nodes | Mempool (pre-persistent): "
+                f"{context.memory_mempool_size:,}")
             lines.append("")
 
         # [WISDOM & GROWTH] — added 2026-04-13, hardened 2026-04-13 (B1).
