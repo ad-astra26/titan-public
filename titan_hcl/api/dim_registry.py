@@ -273,6 +273,223 @@ _BLOCK_INPUT_NAMES: dict[str, list[str]] = {
 }
 
 
+# SPEC §2.6.A per-input-to-dim mapping — Maker-locked refinement.
+#
+# Block-level inputs_state flags ALL of a block's dims as PARTIAL when any
+# one input is absent. This produces false-positives — e.g. if
+# ``recovery_stats`` is absent on outer_spirit, only SAT[10]
+# ``recovery_speed`` actually depends on it, yet up to 45 dims get flagged.
+#
+# This map gives dim-precision: for each block, ``input_name → set of
+# block-relative dim indices`` that read this input in their formula. The
+# four-state classifier in ``arch_map dim-live`` uses this to ask: "for THIS
+# specific dim, are any of ITS specific inputs degraded?"
+#
+# Coverage: high-confidence subset derived from the tensor module formulas
+# (``titan_plugin/logic/{mind,spirit,outer_body,outer_mind,outer_spirit}_tensor.py``
+# + ``body_worker._collect_body_tensor``) and SPEC §23.x. Dims/inputs not
+# listed below are treated by the classifier as block-level fallback
+# (current behavior). This is a partial-coverage refinement — populating
+# the remaining mappings is additive and never breaks the classifier.
+#
+# Block-relative indices match each block's *_DIM_NAMES list above.
+_BLOCK_INPUT_TO_DIM_INDICES: dict[str, dict[str, set[int]]] = {
+    # inner_body 5D — all dims read from the single composite body_state
+    # (interoception, proprioception, somatosensation, entropy, thermal).
+    "inner_body": {
+        "body_state": {0, 1, 2, 3, 4},
+    },
+    # inner_mind 15D — per ``mind_tensor.collect_mind_15d`` formulas.
+    #   [0]  memory_depth        ← memory_stats (not in block inputs list;
+    #                              flows via current_5d) → none mapped here
+    #   [1]  social_cognition    ← interaction_quality
+    #   [2]  perceptual_thinking ← audio_state + visual_state composite
+    #   [3]  emotional_thinking  ← hormone_levels (emotional pressure)
+    #   [4]  conceptual_thinking ← assessment_quality
+    #   [5]  inner_hearing       ← audio_state
+    #   [6]  inner_touch         ← interaction_quality
+    #   [7]  inner_sight         ← visual_state
+    #   [8]  inner_taste         ← assessment_quality
+    #   [9]  inner_smell         ← ambient_change
+    #   [10] action_drive        ← hormone_levels.IMPULSE
+    #   [11] social_will         ← hormone_levels.EMPATHY
+    #   [12] creative_will       ← hormone_levels.CREATIVITY
+    #   [13] protective_will     ← hormone_levels.VIGILANCE
+    #   [14] growth_will         ← hormone_levels.CURIOSITY
+    "inner_mind": {
+        "audio_state":          {2, 5},
+        "interaction_quality":  {1, 6},
+        "visual_state":         {2, 7},
+        "assessment_quality":   {4, 8},
+        "ambient_change":       {9},
+        "hormone_levels":       {3, 10, 11, 12, 13, 14},
+    },
+    # outer_body 5D — per ``outer_body_tensor.collect_outer_body_5d`` and
+    # outer-body-rs ``tick_loop.rs`` (re-grounded D-SPEC-104):
+    #   [0] interoception   ← timechain_v2_stats (pi-heartbeat HRV)
+    #   [1] proprioception  ← change-rate of body_state composite
+    #   [2] somatosensation ← change-rate of body_state composite
+    #   [3] entropy         ← change-rate (system_sensor cpu_thermal +
+    #                        circadian)
+    #   [4] thermal         ← change-rate (system_sensor cpu_thermal)
+    # anchor_state + network_monitor + agency_stats + hormone_levels feed
+    # the composite via _gather_outer_sources; the rate-of-change Tracker
+    # observes the composite movement, so any of these absent could
+    # contribute to the change signal being flat.
+    "outer_body": {
+        "timechain_v2_stats": {0},
+        "system_sensor":      {3, 4},
+        "anchor_state":       {1, 2},
+        "network_monitor":    {1, 2},
+        "agency_stats":       {1, 2},
+        "hormone_levels":     {1, 2},
+        "circadian_stats":    {3},
+    },
+    # outer_mind 15D — per SPEC §23.8 + D-SPEC-89/104 reframes. Only the
+    # high-confidence subset is listed; remaining dims fall back to block-
+    # level (which is correct).
+    #   [0]  research_effectiveness   ← cgn_stats + memory_stats
+    #   [1]  knowledge_retrieval      ← memory_stats + knowledge_graph_stats
+    #   [2]  situational_awareness    ← events_teacher_stats
+    #                                   (felt_experiences_24h)
+    #   [3]  problem_solving          ← cgn_stats + reflex_stats
+    #   [4]  communication_clarity    ← language_stats + assessment_stats
+    #   [5]  social_temperature       ← social_x_gateway_stats
+    #   [6]  social_connection        ← social_x_gateway_stats
+    #   [7]  network_weather          ← bus_stats (kept here even though
+    #                                   bus_stats isn't in input names —
+    #                                   block-level fallback covers)
+    #   [8]  environmental_rhythm     ← circadian via outer_body composite
+    #   [9]  external_information_flow← social_x_gateway_stats + meta_cgn
+    #   [10] action_throughput        ← substrate activity (EMA)
+    #   [11] social_initiative        ← social_x_gateway_stats
+    #                                   (willing_window social_rate)
+    #   [12] creative_output          ← creative composite EMA
+    #   [13] protective_response      ← verifier_stats + jailbreak_stats
+    #                                   (willing_window protective_rate)
+    #   [14] exploration_drive        ← cgn_stats + meta_cgn_stats
+    "outer_mind": {
+        "events_teacher_stats":   {2},
+        "social_x_gateway_stats": {5, 6, 9, 11},
+        "language_stats":         {4},
+        "knowledge_graph_stats":  {1},
+        "memory_stats":           {0, 1},
+        "cgn_stats":              {0, 3, 14},
+        "meta_cgn_stats":         {9, 14},
+        "verifier_stats":         {4, 13},
+        "jailbreak_stats":        {13},
+        "reflex_stats":           {3},
+    },
+    # outer_spirit 45D — per SPEC §23.9 v1.37.0 + D-SPEC-104 reframes. Only
+    # the well-attested mappings are listed; remaining outer_spirit dims
+    # fall back to block-level (which is the current behavior).
+    #
+    # SAT (15):
+    #   [0]  world_recognition       ← rate-of-change of the other 44 dims
+    #   [1]  expressive_authenticity ← expression_window (variety+volume)
+    #   [2]  action_sovereignty      ← expression_window
+    #   [3]  boundary_enforcement    ← guardian_stats + jailbreak_alerts
+    #   [4]  operational_persistence ← uptime_ratio
+    #   [5]  origin_anchoring        ← anchor_state + timechain genesis
+    #   [6]  observable_growth       ← memory_growth_metrics
+    #   [7]  world_footprint         ← world_footprint_inputs
+    #   [8]  behavioral_consistency  ← action_stats
+    #   [9]  action_purity           ← sovereignty_ratio
+    #   [10] recovery_speed          ← recovery_stats   (THE canonical
+    #                                  example from SPEC line 5852)
+    #   [11] environmental_adaptation← assessment_stats (cpu_thermal-gated)
+    #   [12] distinctive_voice       ← expression_window
+    #   [13] transactional_integrity ← solana_stats
+    #   [14] operational_vitality    ← hormone_levels + uptime_ratio
+    # CHIT (15) — sub-block starts at idx 15:
+    #   [15] world_model_depth       ← cgn_stats + knowledge_graph_stats
+    #   [17] discernment_quality     ← output_verifier_stats
+    #   [21] knowledge_growth        ← memory_growth_metrics + cgn_stats
+    #   [22] information_quality     ← language_stats
+    #   [25] dream_recall            ← memory_stats (recall_ratio)
+    #   [26] circadian_alignment     ← deltas_24h / pi-pulse cadence
+    #   [28] causal_attribution      ← cgn_stats (chain success rate)
+    #   [29] self_trajectory         ← history (outer_spirit_trajectory)
+    # ANANDA (15) — sub-block starts at idx 30:
+    #   [32] creative_impact         ← creative_stats + expression_window
+    #   [34] aesthetic_quality       ← expression_window
+    #   [36] community_connection    ← social_stats
+    #   [37] capability_growth       ← memory_growth_metrics
+    #   [38] expression_reach        ← social_stats engagement
+    #   [40] graceful_rest           ← assessment_stats
+    #   [43] resource_appreciation   ← hormone_levels + life_force chi
+    #   [44] flow_state              ← action_stats (substrate_success_rate)
+    "outer_spirit": {
+        # SAT subset
+        "anchor_state":           {5},
+        "uptime_ratio":           {4, 14},
+        "sovereignty_ratio":      {9},
+        "recovery_stats":         {10},
+        "action_stats":           {8, 44},
+        "guardian_stats":         {3},
+        "jailbreak_alerts_stats": {3},
+        "solana_stats":           {13},
+        "world_footprint_inputs": {7},
+        "assessment_stats":       {11, 40},
+        "memory_growth_metrics":  {6, 21, 37},
+        # CHIT subset
+        "cgn_stats":              {15, 21, 28},
+        "knowledge_graph_stats":  {15},
+        "output_verifier_stats":  {17},
+        "language_stats":         {22},
+        "memory_stats":           {25},
+        "deltas_24h":             {26},
+        "history":                {29},
+        # ANANDA subset
+        "creative_stats":         {32},
+        "social_stats":           {36, 38},
+        "hormone_levels":         {14, 43},
+    },
+}
+
+
+def get_dims_for_block_input(block: str, input_name: str) -> set[int]:
+    """Return the block-relative dim indices that consume ``input_name``.
+
+    Empty set means either (a) ``input_name`` is not mapped (caller should
+    fall back to block-level), or (b) the input is documented but no dim
+    consumes it. Callers can distinguish via membership test on
+    ``_BLOCK_INPUT_TO_DIM_INDICES[block]``.
+    """
+    return set(_BLOCK_INPUT_TO_DIM_INDICES.get(block, {}).get(input_name, set()))
+
+
+def get_inputs_for_block_dim(block: str, block_dim_idx: int) -> set[str]:
+    """Return the input arg names that this specific dim's formula reads.
+
+    Computes the inverse of ``_BLOCK_INPUT_TO_DIM_INDICES``. Returns the set
+    of input arg names whose mapping includes ``block_dim_idx``. Empty set
+    means no mappings recorded yet for this dim — caller should fall back
+    to block-level (treat all block inputs as relevant).
+    """
+    out: set[str] = set()
+    for name, indices in _BLOCK_INPUT_TO_DIM_INDICES.get(block, {}).items():
+        if block_dim_idx in indices:
+            out.add(name)
+    return out
+
+
+def filter_inputs_state_for_dim(
+    block: str, block_dim_idx: int, block_inputs_state: dict[str, str]
+) -> dict[str, str]:
+    """Return only the entries in ``block_inputs_state`` that this dim reads.
+
+    If no per-dim mapping is recorded for ``(block, block_dim_idx)``, the
+    full block-level ``inputs_state`` is returned (conservative fallback —
+    preserves current classifier behavior so the SPEC §2.6.A refinement is
+    purely additive).
+    """
+    relevant = get_inputs_for_block_dim(block, block_dim_idx)
+    if not relevant:
+        return dict(block_inputs_state)
+    return {k: v for k, v in block_inputs_state.items() if k in relevant}
+
+
 @dataclass
 class DimFiringRecord:
     """Per-dim firing snapshot. Updated every time a tensor block fires.

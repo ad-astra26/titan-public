@@ -8888,6 +8888,14 @@ def _dim_live_classify_v2(record: dict,
     working when it was actually running on all-default inputs; PARTIAL
     more honestly captures that state. Strict-gate acceptance is now
     ALIVE-only (no @def credit).
+
+    SPEC §2.6.A refinement (added with the L4 housekeeping closure):
+    if the record carries a ``dim_inputs_state`` field (the subset of the
+    block's inputs_state that this *specific* dim actually consumes, per
+    ``dim_registry.filter_inputs_state_for_dim``), the PARTIAL verdict
+    splits diagnostically by setting an ``inputs_diag`` field on
+    ``record`` for callers that want the reason. The returned state
+    string is still one of the five — additive, never collapses ALIVE.
     """
     import math as _m
     val = record.get("last_value")
@@ -8912,6 +8920,35 @@ def _dim_live_classify_v2(record: dict,
             or float(seconds_since) > firing_window_s):
         return "SILENT"
     return "PARTIAL"
+
+
+def _dim_live_partial_reason(record: dict) -> str:
+    """Diagnostic refinement (SPEC §2.6.A) for PARTIAL classifications.
+
+    Reads ``dim_inputs_state`` if the caller pre-filtered the block's
+    ``inputs_state`` to only the inputs THIS dim consumes (via
+    ``dim_registry.filter_inputs_state_for_dim``). Returns:
+
+      "inputs_absent"    ← at least one of THIS dim's specific inputs is
+                            'absent' or 'default' — partiality is upstream
+                            wiring or a producer not yet populating data
+      "formula_collapse" ← all of THIS dim's specific inputs are 'real'
+                            yet the formula returns the SPEC default —
+                            issue is in the formula or composition, not
+                            upstream inputs
+      ""                 ← no per-dim subset available; classifier had
+                            to fall back to block-level
+
+    This eliminates the SPEC line 5852 false-positive class where a single
+    absent input was flagging up to 45 dims as PARTIAL.
+    """
+    diag_inputs = record.get("dim_inputs_state")
+    if not diag_inputs:
+        return ""
+    has_degraded = any(
+        state in ("absent", "default") for state in diag_inputs.values()
+    )
+    return "inputs_absent" if has_degraded else "formula_collapse"
 
 
 def _dim_live_state_marker(state: str) -> str:
@@ -9025,23 +9062,32 @@ def _dim_live_render_verbose(label: str, tensor: list[float],
     print(f"  {label}")
     if using_v2:
         print(f"  {'idx':>4s}  {'block':<13s}  {'name':<28s}  "
-              f"{'value':>7s}  {'default':>7s}  {'age_s':>7s}  state")
+              f"{'value':>7s}  {'default':>7s}  {'age_s':>7s}  "
+              f"state               reason")
     else:
         print(f"  {'idx':>4s}  {'block':<13s}  {'name':<28s}  "
               f"{'value':>7s}  {'default':>7s}  state")
-    print("  " + "-" * 90)
+    print("  " + "-" * 110)
     for entry in iter_registry():
         if using_v2:
             rec = sources[entry.full_index]
             v = rec.get("last_value")
             state = _dim_live_classify_v2(rec)
+            # SPEC §2.6.A: diagnose PARTIAL with per-dim input filter
+            # (eliminates the false-positive class where one absent block
+            # input flags up to 45 dims as PARTIAL).
+            reason = ""
+            if state == "PARTIAL":
+                reason = _dim_live_partial_reason(rec)
             age = rec.get("seconds_since_last_write")
             age_str = f"{float(age):>7.1f}" if age is not None else "      –"
             v_str = f"{float(v):>7.4f}" if isinstance(v, (int, float)) else "      –"
             marker = _dim_live_state_marker(state)
+            state_field = f"{marker} {state:<10s}"
             print(f"  {entry.full_index:>4d}  {entry.block:<13s}  "
                   f"{entry.name[:28]:<28s}  {v_str}  "
-                  f"{entry.default_value:>7.2f}  {age_str}  {marker} {state}")
+                  f"{entry.default_value:>7.2f}  {age_str}  {state_field}  "
+                  f"{reason}")
         else:
             v = tensor[entry.full_index]
             state = _dim_live_classify(v, entry.default_value)

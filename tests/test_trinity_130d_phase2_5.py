@@ -20,7 +20,11 @@ from titan_hcl.api.dim_registry import (
     DimFiringTracker,
     BlockFiringRecord,
     _BLOCK_INPUT_NAMES,
+    _BLOCK_INPUT_TO_DIM_INDICES,
     _classify_input,
+    filter_inputs_state_for_dim,
+    get_dims_for_block_input,
+    get_inputs_for_block_dim,
     get_firing_tracker,
     iter_registry,
     reset_firing_tracker,
@@ -820,3 +824,148 @@ class TestPhase25A2SHMRoundtrip:
         assert states["hormone_levels"] == "real"
         assert states["audio_state"] == "absent"
         assert states["interaction_quality"] == "default"
+
+
+# ── L4 / SPEC §2.6.A — per-input-to-dim mapping refinement ──────────────
+
+
+class TestL4PerInputToDimMapping:
+    """SPEC §2.6.A — closes the false-PARTIAL class where one absent block
+    input flags up to 45 dims (SPEC line 5852). Maker-locked refinement
+    introduced via the 2026-05-26 housekeeping closure.
+    """
+
+    def test_all_block_input_maps_reference_known_inputs(self):
+        # Every input name in _BLOCK_INPUT_TO_DIM_INDICES must also exist
+        # in _BLOCK_INPUT_NAMES for the same block — no stray names.
+        for block, input_map in _BLOCK_INPUT_TO_DIM_INDICES.items():
+            assert block in _BLOCK_INPUT_NAMES, (
+                f"unknown block in dim map: {block}")
+            known_inputs = set(_BLOCK_INPUT_NAMES[block])
+            for input_name in input_map:
+                assert input_name in known_inputs, (
+                    f"{block} maps unknown input '{input_name}' — must be in "
+                    f"_BLOCK_INPUT_NAMES")
+
+    def test_all_block_dim_indices_in_range(self):
+        # Each block-relative index in the input→dim map must be valid for
+        # that block's length.
+        block_len = {b: L for _, L, b in
+                     [(0, 5, "inner_body"), (5, 15, "inner_mind"),
+                      (20, 45, "inner_spirit"), (65, 5, "outer_body"),
+                      (70, 15, "outer_mind"), (85, 45, "outer_spirit")]}
+        for block, input_map in _BLOCK_INPUT_TO_DIM_INDICES.items():
+            L = block_len[block]
+            for input_name, indices in input_map.items():
+                for idx in indices:
+                    assert 0 <= idx < L, (
+                        f"{block}.{input_name} maps to block_dim_idx={idx} "
+                        f"which is out of range [0, {L})")
+
+    def test_recovery_stats_maps_only_to_recovery_speed(self):
+        # The canonical example from SPEC line 5852: recovery_stats
+        # absence on outer_spirit should ONLY flag SAT[10] recovery_speed,
+        # not all 45 dims.
+        dims = get_dims_for_block_input("outer_spirit", "recovery_stats")
+        assert dims == {10}, (
+            f"recovery_stats should map to {{10}}, got {dims}")
+
+    def test_inner_body_all_dims_consume_body_state(self):
+        # inner_body has a single composite input — all 5 dims read from it.
+        dims = get_dims_for_block_input("inner_body", "body_state")
+        assert dims == {0, 1, 2, 3, 4}
+
+    def test_inner_mind_audio_state_maps_to_inner_hearing(self):
+        # SPEC §23.5: audio_state feeds inner_hearing (block[5]) + the
+        # perceptual_thinking composite (block[2]).
+        dims = get_dims_for_block_input("inner_mind", "audio_state")
+        assert 5 in dims  # inner_hearing
+        assert dims.issubset({2, 5, 7})  # don't accept stray mappings
+
+    def test_inner_mind_hormone_levels_feeds_all_willing_dims(self):
+        # SPEC §23.5: hormone_levels.{IMPULSE,EMPATHY,CREATIVITY,
+        # VIGILANCE,CURIOSITY} drives willing[0:5] = block[10:15].
+        dims = get_dims_for_block_input("inner_mind", "hormone_levels")
+        assert {10, 11, 12, 13, 14}.issubset(dims), (
+            f"hormone_levels must feed all 5 willing dims; got {dims}")
+
+    def test_get_inputs_for_block_dim_inverse_consistency(self):
+        # The inverse map must agree with the forward map for every entry.
+        for block, input_map in _BLOCK_INPUT_TO_DIM_INDICES.items():
+            for input_name, indices in input_map.items():
+                for idx in indices:
+                    inputs_for_idx = get_inputs_for_block_dim(block, idx)
+                    assert input_name in inputs_for_idx, (
+                        f"inverse map broken: {block}.{input_name} maps to "
+                        f"{idx} but get_inputs_for_block_dim({block!r}, "
+                        f"{idx}) returned {inputs_for_idx}")
+
+    def test_unmapped_dim_returns_empty_set(self):
+        # A dim without a recorded mapping returns empty inputs — caller
+        # falls back to block-level (the conservative behavior).
+        # inner_body[3] entropy: not explicitly excluded by our minimal
+        # map, but for safety, validate that an obviously unmapped block_dim
+        # behaves correctly. Pick a block that doesn't exist:
+        assert get_inputs_for_block_dim("nonexistent_block", 0) == set()
+        assert get_dims_for_block_input("inner_mind", "nonexistent_input") == set()
+
+    def test_filter_inputs_state_subsets_correctly(self):
+        # recovery_stats absent on outer_spirit: only SAT[10] should
+        # surface that input in its filtered state. Pick a non-mapped dim
+        # (say outer_spirit[0] world_recognition) and verify it gets the
+        # full block fallback (conservative — no info loss vs. block-level
+        # classifier).
+        block_state = {
+            "recovery_stats": "absent",
+            "anchor_state": "real",
+            "sovereignty_ratio": "real",
+            "social_stats": "real",
+        }
+        # SAT[10] recovery_speed → sees recovery_stats (its specific input)
+        sat10 = filter_inputs_state_for_dim("outer_spirit", 10, block_state)
+        assert sat10 == {"recovery_stats": "absent"}, (
+            f"SAT[10] must filter to only its own input; got {sat10}")
+        # SAT[5] origin_anchoring → sees anchor_state (its specific input),
+        # NOT recovery_stats (different dim's input).
+        sat5 = filter_inputs_state_for_dim("outer_spirit", 5, block_state)
+        assert "anchor_state" in sat5
+        assert "recovery_stats" not in sat5, (
+            f"SAT[5] origin_anchoring must NOT see recovery_stats absence; "
+            f"got {sat5}")
+
+    def test_filter_inputs_state_falls_back_to_block_level_for_unmapped(self):
+        # Conservative fallback: an unmapped dim returns the full block
+        # state, preserving current classifier semantics.
+        block_state = {"a": "real", "b": "absent"}
+        # Use a deliberately out-of-our-map block_dim_idx (e.g.
+        # inner_spirit[44] transcendence_glimpse is in block but not in
+        # our minimal map). Should fall back to block-level.
+        full = filter_inputs_state_for_dim("inner_spirit", 44, block_state)
+        assert full == block_state
+
+    def test_partial_reason_classifier(self):
+        # Import the arch_map diagnostic (defined alongside the classifier).
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+        try:
+            from arch_map import _dim_live_partial_reason
+        finally:
+            sys.path.pop(0)
+
+        # Case 1: at least one specific input absent → "inputs_absent"
+        rec = {"dim_inputs_state": {"recovery_stats": "absent"}}
+        assert _dim_live_partial_reason(rec) == "inputs_absent"
+
+        # Case 2: all specific inputs real → "formula_collapse"
+        rec = {"dim_inputs_state": {"recovery_stats": "real",
+                                      "uptime_ratio": "real"}}
+        assert _dim_live_partial_reason(rec) == "formula_collapse"
+
+        # Case 3: no per-dim subset → "" (block-level fallback)
+        rec = {}
+        assert _dim_live_partial_reason(rec) == ""
+
+        # Case 4: "default" state counts as degraded (per L4 semantics)
+        rec = {"dim_inputs_state": {"interaction_quality": "default"}}
+        assert _dim_live_partial_reason(rec) == "inputs_absent"

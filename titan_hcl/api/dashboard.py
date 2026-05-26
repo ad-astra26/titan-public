@@ -5121,9 +5121,37 @@ async def get_v4_debug_dim_sources(request: Request, dim: str = ""):
                 if isinstance(last_value_ts, (int, float)) else None
             )
             meta = block_meta.get(entry.block) or {}
+            block_inputs_state = meta.get("inputs_state") or {}
             inputs_payload = []
-            for input_name, state in (meta.get("inputs_state") or {}).items():
+            for input_name, state in block_inputs_state.items():
                 inputs_payload.append({"name": input_name, "state": state})
+            # SPEC §2.6.A — per-input-to-dim filter (Maker-locked refinement).
+            # If dim_registry has a mapping for this dim, surface the subset
+            # of inputs_state THIS dim actually consumes — eliminates the
+            # block-level false-PARTIAL class where one absent input flags
+            # up to 45 dims (SPEC line 5852).
+            try:
+                from titan_hcl.api.dim_registry import (
+                    filter_inputs_state_for_dim,
+                    get_inputs_for_block_dim,
+                )
+                dim_relevant_inputs = get_inputs_for_block_dim(
+                    entry.block, entry.block_index)
+                if dim_relevant_inputs:
+                    dim_inputs_state = filter_inputs_state_for_dim(
+                        entry.block, entry.block_index, block_inputs_state)
+                    dim_inputs_payload = [
+                        {"name": n, "state": s}
+                        for n, s in dim_inputs_state.items()
+                    ]
+                else:
+                    # No per-dim mapping recorded — caller falls back to
+                    # block-level (the conservative current behavior).
+                    dim_inputs_state = None
+                    dim_inputs_payload = None
+            except Exception:
+                dim_inputs_state = None
+                dim_inputs_payload = None
             out.append({
                 "idx": entry.full_index,
                 "name": entry.name,
@@ -5138,6 +5166,11 @@ async def get_v4_debug_dim_sources(request: Request, dim: str = ""):
                 "block_last_call_ts": meta.get("block_last_call_ts"),
                 "block_source": meta.get("source", "unknown"),
                 "inputs": inputs_payload,
+                # SPEC §2.6.A: per-dim subset (None when mapping is absent,
+                # meaning the dim has not yet been mapped to its specific
+                # inputs — classifier falls back to block-level).
+                "dim_inputs": dim_inputs_payload,
+                "dim_inputs_state": dim_inputs_state,
             })
         return _ok({"dims": out, "total": len(out)})
     except Exception as e:
