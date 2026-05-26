@@ -138,15 +138,21 @@ def create_app(plugin, event_bus: EventBus, config: dict | None = None,
         # chat-specific timeouts live inside the agent itself.
         if path.startswith("/chat"):
             return await call_next(request)
-        # /v6/pitch/chat invokes the same agent pipeline as /chat (via a
-        # wallet-less route for the VC + hackathon pitch tour, per
-        # rFP_observatory_pitch_route.md §5). Same 3s-bypass rationale —
-        # an internal 60s timeout lives inside pitch_chat.run_chat().
-        # Legacy /v4/pitch-chat path also bypassed: it 308-redirects to
-        # /v6/pitch/chat (v6_deprecation), and the redirect response is
-        # itself sub-3s, but we keep the prefix here so the upstream call
-        # the client retries after the redirect lands in this branch.
-        if path.startswith("/v6/pitch/chat") or path.startswith("/v4/pitch-chat"):
+        # /v6/pitch/* — bypass the 3s "fast cached-state endpoint" budget
+        # for the entire pitch group:
+        #   - /chat invokes the same agent pipeline as /chat (wallet-less
+        #     pitch chat for VC + hackathon route, rFP §5; internal 60s
+        #     timeout lives inside pitch_chat.run_chat()).
+        #   - /witness-tail, /thinking-tail read observatory.db.event_log
+        #     which can be multi-GB on long-running Titans (T1 ~4.2 GB on
+        #     2026-05-26 — the sqlite SELECT, even wrapped in
+        #     asyncio.to_thread, can exceed 3s on first cold hit).
+        #   - /sessions, /sessions/{thread_id} walk data/pitch_sessions/
+        #     filesystem, also potentially >3s on slow disk.
+        # Legacy /v4/pitch-chat path also bypassed: 308-redirect itself is
+        # sub-3s but we keep the prefix so the post-redirect retry lands
+        # here too.
+        if path.startswith("/v6/pitch/") or path.startswith("/v4/pitch-chat"):
             return await call_next(request)
         # Spirit-RPC work endpoints — /v4/signal-concept, /v4/signal-co-
         # occurrence, /v4/social-relief — publish QUERY dst="spirit" via
