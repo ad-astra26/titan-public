@@ -368,41 +368,12 @@ class MeditationEpoch:
             )
 
             if tx_signature:
-                # H3 fix (MEDITATION-KUZU-COGNIFY-LATENCY, 2026-05-26):
-                # Parallelise the per-node migration via asyncio.gather so
-                # the dominant cost — the ~30s LLM call inside
-                # ``_cognify_engine.cognify_node`` (titan_hcl/core/
-                # direct_memory.py:651) — pipelines across promoted nodes
-                # instead of summing. Sequential migration cost was 60-100s
-                # for typical 2-3 promoted-node cycles; gather drops the
-                # tail to ~one cognify roundtrip.
-                #
-                # SPEC anchors:
-                #   * §G19 (Preamble) — work-RPC parallelism: cognify is
-                #     in ``phase_c_rpc_exemptions.yaml`` as a sanctioned
-                #     long-running async surface.
-                #   * §G21 (Preamble) — single-writer FAISS/Kuzu slots are
-                #     preserved: the synchronous FAISS embed/add/save
-                #     section inside ``_cognee_ingest`` (memory.py:944-946)
-                #     contains no await point, so it runs to completion
-                #     under the single-threaded asyncio loop before any
-                #     gathered sibling resumes.
-                #   * §25 (Outer Memory + Synthesis Engine) — meditation
-                #     migration is the canonical mempool→persistent
-                #     promotion pathway, latency targets in §10.H main
-                #     consciousness loop cadence view.
-                #
-                # NB: `promoted` contains distinct node_ids — no
-                # _node_store key collision across tasks. Empty list →
-                # `asyncio.gather()` returns [] cleanly.
-                await _asyncio_local.gather(*[
-                    self.memory.migrate_to_persistent(
+                for node, score, intensity in promoted:
+                    await self.memory.migrate_to_persistent(
                         node["id"], tx_signature, intensity,
                     )
-                    for node, _score, intensity in promoted
-                ])
                 logger.info(
-                    "[Meditation] Migrated %d nodes to persistent (tx=%s, parallel).",
+                    "[Meditation] Migrated %d nodes to persistent (tx=%s).",
                     len(promoted), tx_signature[:16] if tx_signature else "N/A",
                 )
 
