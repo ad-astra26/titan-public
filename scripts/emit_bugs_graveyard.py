@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Emit `titan-docs/BUGS_graveyard.md` — searchable archive of all closed bugs.
+"""DEPRECATED 2026-05-26: prefer `split_bugs_graveyard.py` (physically moves
+closed bodies out of BUGS.md). This script kept for the summary-index-only
+workflow; running it will OVERWRITE the physical-split output with a
+summary-only graveyard. Do not run unless you want that behavior.
+
+Emit `titan-docs/BUGS_graveyard.md` — searchable archive of all closed bugs.
 
 Reuses `tracker_indexer.parse_tracker` so the graveyard stays consistent with
 the canonical BUGS.md (the source of truth — full entry bodies live there).
