@@ -673,6 +673,78 @@ def _init_worker_plugin_and_agent(bus_client, config: dict[str, Any]):
     return worker_plugin, agent
 
 
+def _install_phase9_baseline_hook() -> None:
+    """Install SIGUSR1 → JSON-dump handler for Phase 9 Chunk 9A baseline.
+
+    Pure instrumentation. Starts tracemalloc(1 frame) so per-allocation
+    overhead stays minimal (<1% RSS / <2% CPU). On SIGUSR1 writes a JSON
+    snapshot to /tmp/agno_baseline_<pid>_<unix_ts>.json. Never raises into
+    the worker: any handler error logs to /tmp and returns. Idempotent —
+    safe to call repeatedly across hot-reloads (tracemalloc.start is a
+    no-op if already tracing).
+    """
+    import json
+    import os
+    import signal
+    import sys
+    import tracemalloc
+
+    if not tracemalloc.is_tracing():
+        tracemalloc.start(1)
+
+    def _handler(_signum, _frame) -> None:
+        try:
+            pid = os.getpid()
+            ts = time.time()
+            snap = tracemalloc.take_snapshot()
+            top = snap.statistics("lineno")[:20]
+            rss_kb = 0
+            try:
+                with open(f"/proc/{pid}/status") as fh:
+                    for line in fh:
+                        if line.startswith("VmRSS:"):
+                            rss_kb = int(line.split()[1])
+                            break
+            except Exception:
+                pass
+            cur, peak = tracemalloc.get_traced_memory()
+            out = {
+                "pid": pid,
+                "ts_unix": ts,
+                "rss_kb": rss_kb,
+                "tracemalloc_current_bytes": cur,
+                "tracemalloc_peak_bytes": peak,
+                "sys_modules_count": len(sys.modules),
+                "sys_modules": sorted(sys.modules.keys()),
+                "tracemalloc_top20": [
+                    {
+                        "file": str(s.traceback[0].filename),
+                        "line": s.traceback[0].lineno,
+                        "size_bytes": int(s.size),
+                        "count": int(s.count),
+                    }
+                    for s in top
+                ],
+            }
+            path = f"/tmp/agno_baseline_{pid}_{int(ts * 1000)}.json"
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(out, fh)
+            os.replace(tmp, path)
+        except Exception as exc:
+            try:
+                with open(
+                    f"/tmp/agno_baseline_error_{os.getpid()}_{int(time.time())}.log",
+                    "w",
+                ) as fh:
+                    import traceback as _tb
+                    fh.write(f"{exc}\n{_tb.format_exc()}")
+            except Exception:
+                pass
+
+    signal.signal(signal.SIGUSR1, _handler)
+
+
 def agno_worker_main(recv_queue, send_queue, name: str,
                      config: dict[str, Any]) -> None:
     """Entry function for the agno_worker L2 process.
@@ -690,6 +762,17 @@ def agno_worker_main(recv_queue, send_queue, name: str,
     """
     logger.info("[AgnoWorker] Boot")
     boot_start = time.time()
+
+    # ── Phase 9 Chunk 9A instrumentation — pure baseline capture ──
+    # Pre-Phase-9 RSS root-cause baseline per RFP §3F + per-discipline
+    # `feedback_eager_init_needs_rss_root_cause_first`. tracemalloc starts
+    # FIRST so it observes every subsequent allocation in worker boot. The
+    # SIGUSR1 handler is triggered by `scripts/agno_baseline.py` at the 5
+    # RFP-defined checkpoints {boot_complete, chat_1_in, chat_1_out,
+    # chat_5_out, chat_10_out} and writes a JSON snapshot to /tmp. Zero
+    # behavior change to chat handling. To be removed when Phase 9 closes
+    # (gated by RFP §3F.5 LOCK; see §3F.2 chunk 9A).
+    _install_phase9_baseline_hook()
 
     # ── asyncio loop owned by this worker (Agno is async-first) ──
     import asyncio
