@@ -24,8 +24,6 @@ import time
 from queue import Empty
 from titan_hcl.utils.silent_swallow import swallow_warn
 from titan_hcl import bus
-from titan_hcl.core.module_error_handler import with_error_envelope
-from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +157,6 @@ def _run_haov_pump(cgn, send_queue, name, stuck_timeout_s):
     return (expired, attempted, sent)
 
 
-@with_error_envelope(module_name="cgn", subsystem="entry", severity=_phase11_sev.FATAL)
 def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the CGN Cognitive Kernel process.
 

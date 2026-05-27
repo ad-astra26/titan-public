@@ -81,8 +81,6 @@ from titan_hcl.bus import (
 )
 from titan_hcl.logic.studio_state_publisher import StudioStatePublisher
 from titan_hcl.logic.studio_state_specs import STUDIO_STATE_SPEC
-from titan_hcl.core.module_error_handler import with_error_envelope
-from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -250,7 +248,6 @@ def _dispatch_render(coordinator, render_type: str, args: dict) -> dict:
         raise ValueError(f"unknown render type: {render_type!r}")
 
 
-@with_error_envelope(module_name="studio", subsystem="entry", severity=_phase11_sev.FATAL)
 def studio_worker_main(recv_queue, send_queue, name: str,
                        config: dict) -> None:
     """L2 module entry — Guardian supervised.

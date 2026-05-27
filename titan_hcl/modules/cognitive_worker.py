@@ -103,8 +103,6 @@ from titan_hcl._phase_c_constants import (
     COGNITIVE_EPOCH_MIN_INTERVAL_S,
     COGNITIVE_PERSIST_EVERY_N_EPOCHS,
 )
-from titan_hcl.core.module_error_handler import with_error_envelope
-from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -438,7 +436,6 @@ _COGNITIVE_WORKER_SUBSCRIBE_TOPICS = [
 
 # ARG ORDER (template-critical — see module docstring): every Guardian-spawned
 # L2 worker entry follows (recv_queue, send_queue, name, config).
-@with_error_envelope(module_name="cognitive_worker", subsystem="entry", severity=_phase11_sev.FATAL)
 def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the cognitive_worker subprocess.
 

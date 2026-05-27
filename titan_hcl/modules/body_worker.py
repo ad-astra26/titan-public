@@ -37,8 +37,6 @@ import time
 from collections import deque
 from enum import IntEnum
 from titan_hcl import bus
-from titan_hcl.core.module_error_handler import with_error_envelope
-from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +73,6 @@ _HISTORY_SIZE = 30  # ~5 minutes at 10s intervals
 _VELOCITY_WINDOW = 6  # compare last 6 readings (~1 min) for rate of change
 
 
-@with_error_envelope(module_name="body", subsystem="entry", severity=_phase11_sev.FATAL)
 def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the Body module process."""
     from queue import Empty
