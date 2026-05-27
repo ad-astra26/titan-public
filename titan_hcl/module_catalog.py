@@ -1070,6 +1070,12 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # re-merge config. titan_hcl.inference.get_provider("ollama_cloud", cfg)
             # consumes this dict.
             "inference": dict(config.get("inference", {}) or {}),
+            # Phase 5 (D-SPEC-PHASE5) — [synthesis] subtable threaded
+            # through so per-Titan overrides (~/.titan/microkernel_<id>.toml
+            # [synthesis] block) reach synthesis_worker_main. Currently
+            # consumed keys: `fork_gc_live` (bool; default False per
+            # Maker decision 2026-05-27 — dry-run until soak validates).
+            "synthesis": dict(config.get("synthesis", {}) or {}),
         },
         # FU-3 — bumped from 200 to 240. Root-cause: Phase 4 added the
         # Kuzu spine mmap (+~3MB) + consolidation thread + LLM provider
