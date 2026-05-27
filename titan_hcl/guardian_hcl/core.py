@@ -252,6 +252,14 @@ class Guardian(GuardianReloadMixin, GuardianDepActivationMixin):
         self._max_restarts_in_window = int(cfg.get("max_restarts_in_window", MAX_RESTARTS_IN_WINDOW))
         self._restart_window_seconds = float(cfg.get("restart_window", RESTART_WINDOW_SECONDS))
         self._sustained_uptime_reset = float(cfg.get("sustained_uptime_reset", SUSTAINED_UPTIME_RESET))
+        # Phase 9 Chunk 9L (RFP §3F.2.6) — wave-based boot to eliminate
+        # cold-boot CPU contention. ~40 autostart modules booting in parallel
+        # on a 4-core VPS oversubscribed CPU 5-6×, causing cascade
+        # heartbeat-timeouts (audit AUDIT_agno_chat_hang_diagnosis_20260527).
+        # Boot in waves of N (default 5 = roughly cores+1) so only a small
+        # group competes for CPU at a time. Tunable per-Titan via
+        # [guardian].boot_wave_size in titan_params.toml.
+        self._boot_wave_size = max(1, int(cfg.get("boot_wave_size", 5)))
 
     def register(self, spec: ModuleSpec) -> None:
         """Register a module specification. Does not start the module."""
@@ -1104,8 +1112,86 @@ class Guardian(GuardianReloadMixin, GuardianDepActivationMixin):
             info.restart_timestamps.clear()
             return self.start(name)
 
+    def _compute_boot_waves(self, names: list[str]) -> list[list[str]]:
+        """Phase 9 Chunk 9L — order autostart modules into dependency-correct
+        boot waves with light-first sorting inside each wave.
+
+        Algorithm:
+          1. Topological sort: a module ships in the first wave where ALL its
+             MODULE-kind dependencies (declared in ModuleSpec.dependencies
+             per SPEC §11.G) have already shipped.
+          2. Within a topo level, sort by (ModuleSpec.layer L1→L2→L3, then
+             name). L1 = infra primitives boot fastest → free CPU for L2/L3.
+          3. Batch into waves of `self._boot_wave_size`. Multiple waves can
+             live at the same topo level.
+
+        Cycle protection: §11.G.7 enforces DAG via arch_map; if a cycle is
+        still present at runtime, fall back to alphabetic and log WARN —
+        boot continues correctness-first.
+        """
+        name_set = set(names)
+        incoming: dict[str, set[str]] = {n: set() for n in names}
+        for n in names:
+            spec = self._modules[n].spec
+            for dep in spec.dependencies:
+                if dep.kind == DependencyKind.MODULE and dep.name in name_set:
+                    incoming[n].add(dep.name)
+
+        waves: list[list[str]] = []
+        remaining = set(names)
+        while remaining:
+            ready = [n for n in remaining if not (incoming[n] & remaining)]
+            if not ready:
+                logger.warning(
+                    "[Guardian] boot dep cycle detected among %s — "
+                    "flat-ordering remaining modules", sorted(remaining))
+                ready = sorted(remaining)
+            ready.sort(key=lambda n: (self._modules[n].spec.layer, n))
+            for i in range(0, len(ready), self._boot_wave_size):
+                waves.append(ready[i:i + self._boot_wave_size])
+            for n in ready:
+                remaining.discard(n)
+        return waves
+
+    def _wait_for_wave_ready(self, names: list[str],
+                             timeout: float) -> dict[str, str]:
+        """Phase 9 Chunk 9L — block until every name in the wave reaches
+        ModuleState.RUNNING with MODULE_READY observed, or until `timeout`
+        seconds elapse.
+
+        Returns {name: final_state} for telemetry. The caller proceeds to
+        the next wave regardless — Guardian's existing restart logic heals
+        any not-ready modules; we don't want a single slow worker to block
+        the whole fleet from booting.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            all_ready = True
+            for n in names:
+                info = self._modules.get(n)
+                if info is None:
+                    continue
+                if info.state != ModuleState.RUNNING or info.ready_time == 0:
+                    all_ready = False
+                    break
+            if all_ready:
+                break
+            time.sleep(0.5)
+        return {
+            n: (self._modules[n].state.value if n in self._modules else "missing")
+            for n in names
+        }
+
     def start_all(self) -> None:
-        """Start all modules that have autostart=True.
+        """Start all modules that have autostart=True — Phase 9 Chunk 9L
+        wave-based boot to avoid cold-boot CPU contention.
+
+        Modules are partitioned into waves (default 5/wave, configurable via
+        [guardian].boot_wave_size) honoring §11.G dependency ordering and
+        ModuleSpec.layer ascending. Each wave is started concurrently; the
+        next wave only begins after every member of the current wave
+        reaches ModuleState.RUNNING with MODULE_READY received, or that
+        wave's longest per-module heartbeat_timeout elapses.
 
         Microkernel v2 Phase B.2.1 (2026-04-27 PM): when env var
         TITAN_B2_1_ADOPTION_PENDING=1 is set (passed by the shadow_swap
@@ -1128,13 +1214,14 @@ class Guardian(GuardianReloadMixin, GuardianDepActivationMixin):
             os.environ.get("TITAN_B2_1_ADOPTION_PENDING", "") == "1"
         )
         skipped: list[str] = []
+        autostart_names: list[str] = []
         for name, info in self._modules.items():
             if not info.spec.autostart:
                 continue
             if adoption_pending and info.spec.start_method == "spawn":
                 skipped.append(name)
                 continue
-            self.start(name)
+            autostart_names.append(name)
         if skipped:
             logger.info(
                 "[Guardian] B.2.1 adoption-pending: skipped autostart for "
@@ -1142,6 +1229,50 @@ class Guardian(GuardianReloadMixin, GuardianDepActivationMixin):
                 "BUS_WORKER_ADOPT_REQUEST",
                 len(skipped), sorted(skipped),
             )
+
+        # Phase 9 Chunk 9L — wave layout + sequential wave boot.
+        waves = self._compute_boot_waves(autostart_names)
+        start_all_t0 = time.time()
+        logger.info(
+            "[Guardian] start_all: %d modules in %d wave(s) "
+            "(boot_wave_size=%d)",
+            len(autostart_names), len(waves), self._boot_wave_size,
+        )
+        for wave_idx, wave in enumerate(waves, start=1):
+            wave_t0 = time.time()
+            logger.info(
+                "[Guardian] wave %d/%d: starting %d module(s): %s",
+                wave_idx, len(waves), len(wave), wave,
+            )
+            for name in wave:
+                self.start(name)
+            # Per-wave timeout = longest per-module heartbeat_timeout in
+            # the wave, with a 90s floor so single-worker waves never
+            # block too briefly.
+            wave_timeout = max(
+                (self._modules[n].spec.heartbeat_timeout for n in wave),
+                default=90.0,
+            )
+            wave_timeout = max(wave_timeout, 90.0)
+            final = self._wait_for_wave_ready(wave, wave_timeout)
+            not_ready = [n for n, s in final.items() if s != "running"]
+            wave_elapsed = time.time() - wave_t0
+            if not_ready:
+                logger.warning(
+                    "[Guardian] wave %d/%d: %.1fs elapsed; %d not-ready: %s "
+                    "(advancing to next wave; restart logic will heal)",
+                    wave_idx, len(waves), wave_elapsed,
+                    len(not_ready), {n: final[n] for n in not_ready},
+                )
+            else:
+                logger.info(
+                    "[Guardian] wave %d/%d: all %d ready in %.1fs",
+                    wave_idx, len(waves), len(wave), wave_elapsed,
+                )
+        logger.info(
+            "[Guardian] start_all complete in %.1fs (%d wave(s))",
+            time.time() - start_all_t0, len(waves),
+        )
 
     def _module_ready_publish_loop(self) -> None:
         """1Hz loop: snapshot {name: state.value} for every module and

@@ -624,6 +624,16 @@ restart_window = 600.0
 # Affects: restart budget replenishment
 sustained_uptime_reset = 300.0
 
+# Phase 9 Chunk 9L (RFP §3F.2.6) — wave-based boot to eliminate cold-boot
+# CPU contention. ~40 autostart modules booting in parallel on a 4-core VPS
+# oversubscribed CPU 5-6×, causing cascade heartbeat-timeouts (audit
+# AUDIT_agno_chat_hang_diagnosis_20260527). Boot in waves of N (default 5
+# ≈ cores+1) so only a small group competes for CPU at a time. Within each
+# wave: dependency-ordered (§11.G) + layer-ascending (L1→L2→L3) + alphabetic.
+# Influences: cold-boot wall time vs cold-boot stability
+# Affects: heartbeat-timeout false-positives during fleet boot
+boot_wave_size = 5
+
 
 # ─── OUTER TRINITY (Expressive Metrics) ──────────────────────────
 # Baselines for normalizing Titan's external expression.
