@@ -96,8 +96,10 @@ def test_cache_hit_skips_linear_scan(tmp_path: Path) -> None:
     TimeChain._get_file_tip_height = _spy
     try:
         chain2 = TimeChain(data_dir=tmp_path, titan_id="T_TEST")
-        assert chain2.get_fork_tip(FORK_MAIN)[0] == 10, "tip preserved"
-        assert chain2.get_fork_tip(FORK_DECLARATIVE)[0] == 5
+        assert chain2.get_fork_tip(FORK_MAIN)[0] == 10, "tip preserved (genesis + 10)"
+        assert chain2.get_fork_tip(FORK_DECLARATIVE)[0] == 4, (
+            "tip preserved (0-indexed: 5 blocks → height 4)"
+        )
     finally:
         TimeChain._get_file_tip_height = orig
 
