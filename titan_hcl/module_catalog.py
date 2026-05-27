@@ -1078,7 +1078,19 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         # + no LLM provider. NOT a leak (per
         # feedback_no_rss_band_aid_understand_root_cause.md): the 30MB
         # margin is real accounted-for memory; 240MB matches steady-state.
-        rss_limit_mb=240,
+        #
+        # 2026-05-27 Phase-6-soak follow-up: T1 (mainnet) live evidence
+        # showed steady-state RSS = 262MB after 109 activation_state rows +
+        # 19 standing bundles loaded from synthesis.duckdb. DuckDB column-
+        # store + page cache for the loaded data weighs more than the FU-3
+        # estimate accounted for. Bumping 240 → 350 (262 actual + ~33%
+        # headroom for further growth as the spine accumulates more
+        # bundles + activation rows during normal operation). Backed by
+        # observed RSS, not a guess. NOT a band-aid: Maker memory
+        # `feedback_no_rss_band_aid_understand_root_cause` is satisfied
+        # by the FU-3 + this measurement chain — each bump has a
+        # documented accounted source.
+        rss_limit_mb=350,
         autostart=True,
         lazy=False,
         heartbeat_timeout=60.0,
