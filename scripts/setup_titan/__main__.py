@@ -17,7 +17,9 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from . import state as install_state
 from .modes import Mode, spec_for
+from .phases import run_phases
 from .preflight import run_preflight, summarize
 from .ui import ANSI, BRAND, HAZE, PULSE, GROWTH, METAL, DANGER, section, cprint
 
@@ -94,17 +96,20 @@ def cmd_install(args: argparse.Namespace) -> int:
         cprint(f"Preflight FAILED ({fails} blocking issue(s) above). Fix and re-run.", role="error", bold=True)
         return 1
 
-    section("Next")
     if args.dry_run:
-        cprint("--dry-run: preflight only. The wizard phases (config / toolchain / genesis / services / systemd) land in W1.b–W1.h.",
+        section("Next")
+        cprint("--dry-run: preflight only. Re-run without --dry-run to walk Phases 2-7.",
                role="text_muted")
         return 0
 
-    cprint("Preflight clean. The Textual wizard for the remaining phases lands in the next W1 sub-phase.",
-           role="warning")
-    cprint("Until then, run with --dry-run to validate the preflight on any candidate box.",
-           role="text_muted")
-    return 0
+    # Walk Phases 2-7 — Phase 4 (W1.c) + Phase 6 (W1.b) are real; Phase 5/7 are
+    # owned by W1.d/W1.e and emit a single 'warn' Result (skipped, not failed).
+    state = install_state.load()
+    state["setup_titan_version"] = __version__
+    state["install_root"] = str(repo_root)
+    install_state.save(state)
+    return run_phases(state=state, mode=mode, install_root=repo_root,
+                      default=args.default, minimal=args.minimal, skip_genesis=args.skip_genesis)
 
 
 # ── subcommands: stubs ─────────────────────────────────────────────────────

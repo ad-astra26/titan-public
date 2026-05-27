@@ -178,16 +178,45 @@ async def verify_maker_auth(request: Request):
     body = await request.body()
     message = f"{ts_str}:{body.decode('utf-8')}"
 
-    # Get maker pubkey from the plugin instance stored in app.state
+    # Get maker pubkey — try the SoulAccessor first (G18 SHM-direct), then
+    # fall back to plugin.soul._maker_pubkey for the legacy path. The original
+    # code referenced an undefined `titan_state` variable (pre-existing typo
+    # / incomplete refactor), which made every Ed25519-signed admin call
+    # crash with 500 NameError. MakerPanel had been silently using the
+    # internal-key bypass instead; the wallet-sig path was untested for
+    # months until /admin/pitch-sessions exercised it (2026-05-27).
     plugin = getattr(request.app.state, "titan_hcl", None)
     if plugin is None:
         raise HTTPException(status_code=503, detail="Titan plugin not initialized.")
 
     maker_pubkey_str = ""
-    if hasattr(plugin, "soul") and titan_state.soul:
-        mk = getattr(titan_state.soul, "_maker_pubkey", None)
-        if mk:
-            maker_pubkey_str = str(mk)
+    titan_state = getattr(request.app.state, "titan_state", None)
+    if titan_state is not None:
+        soul_accessor = getattr(titan_state, "soul", None)
+        if soul_accessor is not None:
+            try:
+                # SoulAccessor.maker_pubkey is a @property (not a method) —
+                # reads soul_state.bin SHM slot. Property access, NOT a call.
+                mk = soul_accessor.maker_pubkey
+                if mk:
+                    maker_pubkey_str = str(mk)
+            except Exception:
+                logger.debug("[Auth] soul_accessor.maker_pubkey lookup failed", exc_info=True)
+    if not maker_pubkey_str and hasattr(plugin, "soul") and plugin.soul:
+        # Legacy fallback — plugin.soul._maker_pubkey. In api_subprocess
+        # context `plugin` is an RPC proxy and bare attribute access
+        # returns an `_RPCRemoteRef`, whose str() repr is
+        # `<_RPCRemoteRef path=soul._maker_pubkey>` — NOT the pubkey.
+        # Resolve the ref by calling it (the proxy treats __call__ as a
+        # value fetch); if that doesn't yield a string, skip — the
+        # SoulAccessor path above is the canonical source.
+        try:
+            ref = plugin.soul._maker_pubkey
+            mk = ref() if callable(ref) else ref
+            if mk and not str(mk).startswith("<_RPCRemoteRef"):
+                maker_pubkey_str = str(mk)
+        except Exception:
+            logger.debug("[Auth] plugin.soul._maker_pubkey fallback failed", exc_info=True)
 
     if not maker_pubkey_str:
         raise HTTPException(
@@ -199,7 +228,16 @@ async def verify_maker_auth(request: Request):
     from titan_hcl.utils.crypto import verify_maker_signature
 
     if not verify_maker_signature(message, sig, maker_pubkey_str):
-        logger.warning("[Auth] Maker signature verification failed.")
+        logger.warning(
+            "[Auth] Maker signature verification failed. "
+            "expected_pubkey=%s message_len=%d message_preview=%r sig_preview=%s ts=%s body_len=%d",
+            maker_pubkey_str,
+            len(message),
+            message[:80],
+            sig[:24] if sig else "",
+            ts_str,
+            len(body),
+        )
         raise HTTPException(status_code=401, detail="Invalid signature.")
 
     logger.info("[Auth] Maker authenticated successfully.")

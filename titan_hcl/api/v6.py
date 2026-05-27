@@ -427,41 +427,6 @@ _T = (
      "synthesis", "readout", None, None, (), ("synthesis_worker",), False, None),
     ("/v6/synthesis/concepts/{concept_id}", "GET", "get_v6_synthesis_concept",
      "synthesis", "readout", None, None, (), ("synthesis_worker",), False, None),
-
-    # ── synthesis — Phase 5 §P5.I (D-SPEC-PHASE5 forthcoming) ────────────
-    # Hypothesis-fork lifecycle readouts. Source = data/forks_snapshot.json
-    # (synthesis_worker sole writer per INV-Syn-8). No legacy /v4 path.
-    # /v6/synthesis/forks/tombstones MUST be declared BEFORE the {fork_id}
-    # route so FastAPI's path matcher catches "tombstones" before the
-    # generic parameter route.
-    ("/v6/synthesis/forks", "GET", "get_v6_synthesis_forks", "synthesis",
-     "readout", None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/forks/summary", "GET", "get_v6_synthesis_fork_summary",
-     "synthesis", "readout", None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/forks/tombstones", "GET",
-     "get_v6_synthesis_fork_tombstones", "synthesis", "readout", None, None,
-     (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/forks/{fork_id}", "GET", "get_v6_synthesis_fork",
-     "synthesis", "readout", None, None, (), ("synthesis_worker",), False, None),
-
-    # ── synthesis — Phase 5 §P5.A-G fork-lifecycle write surface ─────────
-    # Fire-and-forget POST → SYNTHESIS_FORK_COMMAND bus event → synthesis_worker
-    # handles + eager-exports forks_snapshot.json. Order: sweep + each {fork_id}
-    # sub-route declared BEFORE the bare {fork_id} POST so static prefixes win
-    # FastAPI's path matching.
-    ("/v6/synthesis/forks", "POST", "post_v6_synthesis_forks", "synthesis",
-     "write", None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/forks/sweep", "POST", "post_v6_synthesis_fork_sweep",
-     "synthesis", "write", None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/forks/{fork_id}/record-exploration-tx", "POST",
-     "post_v6_synthesis_fork_record_exploration", "synthesis", "write",
-     None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/forks/{fork_id}/graduate-manual", "POST",
-     "post_v6_synthesis_fork_graduate_manual", "synthesis", "write",
-     None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/forks/{fork_id}/abandon", "POST",
-     "post_v6_synthesis_fork_abandon", "synthesis", "write",
-     None, None, (), ("synthesis_worker",), False, None),
 )
 
 

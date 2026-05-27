@@ -235,25 +235,6 @@ SYNTHESIS_RECOMPUTE_DONE = "SYNTHESIS_RECOMPUTE_DONE"
 # (single SELECT) per arch §12.2.
 MAINTAIN_BUNDLE = "MAINTAIN_BUNDLE"
 
-# Phase 5 §P5.A-G — hypothesis-fork lifecycle command-and-control surface.
-# Published by api process (POST /v6/synthesis/forks/*) on Maker-authenticated
-# requests; consumed by synthesis_worker (sole writer per INV-Syn-8).
-# Eventual-consistent: after the command lands, synthesis_worker exports a
-# fresh forks_snapshot.json before returning to the recv loop so the next
-# api GET reflects the new state (no 60s wait).
-#
-# Payload shape (op-discriminated):
-#   {op: "create",  intent: str, root_anchor?: str, parent_concept_id?: str,
-#                   request_id: str}
-#   {op: "record_exploration_tx", fork_id: str, tx_hash: str,
-#                   request_id: str}
-#   {op: "graduate_manual", fork_id: str, concept_name?: str, evidence_ref: str,
-#                   request_id: str}
-#   {op: "abandon", fork_id: str, reason?: str, request_id: str}
-#   {op: "sweep",   dry_run?: bool, request_id: str}
-SYNTHESIS_FORK_COMMAND = "SYNTHESIS_FORK_COMMAND"
-SYNTHESIS_FORK_COMMAND_RESULT = "SYNTHESIS_FORK_COMMAND_RESULT"
-
 # SPEC §8.3 Phase B (rFP_phase_c_bus_delivery_continuity_and_hot_reload §4):
 # per-module hot-reload protocol. REQUEST emitted by Maker CLI / future D9
 # Guardian; ACK emitted by parent Guardian with status transitions
