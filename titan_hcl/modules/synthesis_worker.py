@@ -74,7 +74,6 @@ from titan_hcl.bus import (
     MODULE_SHUTDOWN,
     SYNTHESIS_FORK_COMMAND,
     SYNTHESIS_FORK_COMMAND_RESULT,
-    SYNTHESIS_BUFFER_COMMAND,
     SYNTHESIS_RECOMPUTE_DONE,
     make_msg,
 )
@@ -1162,46 +1161,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         )
         synthesis_tool_plugs = {}
 
-    # ── Phase 7 §P7.A/H — ActrBufferStore wiring (D-SPEC-PHASE7) ─────────
-    # Sole writer of `actr_buffers` (INV-Syn-16). Constructed AFTER
-    # ActivationStore so it can share the existing synthesis.duckdb conn;
-    # soft-fail mirrors P5/P6 — if construction raises, buffers are a
-    # no-op for the session and synthesis_worker keeps running.
-    actr_buffer_store: Optional[Any] = None
-    buffers_snapshot_path = os.path.join(
-        os.environ.get("TITAN_DATA_DIR", "data"),
-        "buffers_snapshot.json",
-    )
-    try:
-        from titan_hcl.synthesis.buffer_store import ActrBufferStore
-        actr_buffer_store = ActrBufferStore(
-            duckdb_conn=store._conn,           # share synthesis.duckdb (INV-Syn-3)
-            snapshot_path=buffers_snapshot_path,
-        )
-        # Initial export so the snapshot file exists from boot — agno's
-        # BufferCache.hydrate + Observatory routes get a real (possibly
-        # empty) payload immediately. The 60s recompute does NOT need
-        # to re-export buffers (every set/clear already triggers an
-        # atomic export inside ActrBufferStore.persist/clear).
-        try:
-            actr_buffer_store.snapshot_export()
-            logger.info(
-                "[synthesis_worker] Phase 7 working-memory buffers ready — "
-                "store=ok, snapshot=%s",
-                buffers_snapshot_path,
-            )
-        except Exception as _bsx_err:
-            logger.warning(
-                "[synthesis_worker] initial buffers snapshot failed: %s",
-                _bsx_err,
-            )
-    except Exception as exc:
-        logger.warning(
-            "[synthesis_worker] Phase 7 ActrBufferStore wiring failed: %s — "
-            "working-memory buffers disabled this session",
-            exc, exc_info=True,
-        )
-
     def _maybe_run_consolidation_async(dream_start_ts: float) -> None:
         """Fire a ConsolidationPass in a worker thread; never blocks the
         bus loop. Rate-limited by dream window — second DREAM_STATE_CHANGED
@@ -1452,49 +1411,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                       name, "all", {
                           "request_id": request_id, "op": op, **result,
                       })
-                continue
-
-            if msg_type == SYNTHESIS_BUFFER_COMMAND:
-                # Phase 7 §P7.H — ACT-R working-memory buffer write surface.
-                # agno_worker (caller-side BufferCache) publishes set/clear
-                # commands; synthesis_worker is sole writer per INV-Syn-16.
-                # Soft-fail: bad ops + bad payloads are logged at WARN and
-                # dropped (no caller is waiting on a response — write-
-                # through is fire-and-forget per INV-Syn-17).
-                if actr_buffer_store is None:
-                    logger.debug(
-                        "[synthesis_worker] SYNTHESIS_BUFFER_COMMAND dropped "
-                        "— ActrBufferStore not wired this session"
-                    )
-                    continue
-                op = (payload.get("op") or "").lower()
-                chat_id = payload.get("chat_id") or ""
-                buf_name = payload.get("buffer_name") or ""
-                try:
-                    if op == "set":
-                        actr_buffer_store.persist(
-                            chat_id=chat_id,
-                            buffer_name=buf_name,
-                            content=payload.get("content") or "",
-                            concept_ids=payload.get("concept_ids") or [],
-                            ts=payload.get("ts"),
-                        )
-                    elif op == "clear":
-                        actr_buffer_store.clear(
-                            chat_id=chat_id, buffer_name=buf_name,
-                        )
-                    else:
-                        logger.warning(
-                            "[synthesis_worker] SYNTHESIS_BUFFER_COMMAND "
-                            "unknown op=%r (chat_id=%s buffer=%s) — dropping",
-                            op, chat_id, buf_name,
-                        )
-                except Exception as e:
-                    logger.warning(
-                        "[synthesis_worker] SYNTHESIS_BUFFER_COMMAND op=%s "
-                        "chat_id=%s buffer=%s failed: %s",
-                        op, chat_id, buf_name, e,
-                    )
                 continue
 
             if msg_type == DREAM_STATE_CHANGED:

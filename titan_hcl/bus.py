@@ -254,17 +254,6 @@ MAINTAIN_BUNDLE = "MAINTAIN_BUNDLE"
 SYNTHESIS_FORK_COMMAND = "SYNTHESIS_FORK_COMMAND"
 SYNTHESIS_FORK_COMMAND_RESULT = "SYNTHESIS_FORK_COMMAND_RESULT"
 
-# SPEC §25.6 / D-SPEC-PHASE7 (v1.66.0) — ACT-R working-memory buffer commands.
-# Emitted by agno_worker on every BufferCache.set/clear write-through;
-# synthesis_worker (sole writer per INV-Syn-16) persists the row to
-# `actr_buffers` on synthesis.duckdb + atomic-writes buffers_snapshot.json.
-# INV-4 single-canonical-write-path extends through this bus command —
-# no producer bypasses synthesis_worker as the sole writer.
-# Payload shapes:
-#   {op: "set",   chat_id, buffer_name, content, concept_ids, ts}
-#   {op: "clear", chat_id, buffer_name, ts}
-SYNTHESIS_BUFFER_COMMAND = "SYNTHESIS_BUFFER_COMMAND"
-
 # SPEC §8.3 Phase B (rFP_phase_c_bus_delivery_continuity_and_hot_reload §4):
 # per-module hot-reload protocol. REQUEST emitted by Maker CLI / future D9
 # Guardian; ACK emitted by parent Guardian with status transitions

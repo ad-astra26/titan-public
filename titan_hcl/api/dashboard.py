@@ -12230,14 +12230,3 @@ get_v6_synthesis_oracles_recent = get_synthesis_oracles_recent
 get_v6_synthesis_oracles_coverage = get_synthesis_oracles_coverage
 get_v6_synthesis_oracles_budget = get_synthesis_oracles_budget
 get_v6_synthesis_proofs_recent = get_synthesis_proofs_recent
-
-# Re-exports from titan_hcl/api/synthesis_buffer_handlers.py (P7.G) —
-# JSON-snapshot-backed reads of `data/buffers_snapshot.json`
-# (synthesis_worker is the sole writer per INV-Syn-16). Surfaces:
-# chat list, per-buffer read, recent writes, full snapshot.
-from titan_hcl.api.synthesis_buffer_handlers import (
-    get_v6_synthesis_buffers_list_chats,
-    get_v6_synthesis_buffers_read,
-    get_v6_synthesis_buffers_recent_writes,
-    get_v6_synthesis_buffers_snapshot,
-)
