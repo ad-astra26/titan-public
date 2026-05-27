@@ -61,6 +61,21 @@ class TimechainStatePublisher(BaseStatePublisher):
         total_blocks = int(getattr(tc, "total_blocks", 0) or 0)
         chi_spent_total = float(getattr(tc, "chi_spent_total", 0.0) or 0.0)
 
+        # Phase 11 W9 (2026-05-27) — publish genesis hash (16-char prefix)
+        # so OutputVerifier can read it via SHM instead of constructing its
+        # own TimeChain instance at agno_worker boot (the heavy ~169s
+        # cold-start that D-SPEC-138 eager-warmed was caused by exactly
+        # this redundant TimeChain.open). Consumers: OutputVerifier in
+        # agno_worker process + any other reader needing the genesis
+        # identifier. Empty string when genesis hasn't been written yet
+        # (cold-boot pre-genesis or chain corrupt).
+        genesis_hash_hex_16 = ""
+        try:
+            if getattr(tc, "has_genesis", False):
+                genesis_hash_hex_16 = tc.genesis_hash.hex()[:16]
+        except Exception:
+            pass
+
         # Fork summary — best-effort via mempool.get_pending_forks
         fork_summary: list[dict[str, Any]] = []
         try:
@@ -87,6 +102,7 @@ class TimechainStatePublisher(BaseStatePublisher):
             "tx_latency_samples": int(tx_lat.get("samples", 0) or 0),
             "tx_latency_median_s": float(tx_lat.get("median_s", 0.0) or 0.0),
             "tx_latency_p95_s": float(tx_lat.get("p95_s", 0.0) or 0.0),
+            "genesis_hash_hex_16": genesis_hash_hex_16,
             "ts": time.time(),
         }
 
@@ -103,5 +119,6 @@ class TimechainStatePublisher(BaseStatePublisher):
             "tx_latency_samples": 0,
             "tx_latency_median_s": 0.0,
             "tx_latency_p95_s": 0.0,
+            "genesis_hash_hex_16": "",
             "ts": time.time(),
         }

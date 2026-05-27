@@ -304,24 +304,45 @@ class OutputVerifier:
         except Exception as e:
             logger.warning("[OVG] Keypair load failed (signing disabled): %s", e)
 
-        # Phase 11 §11.I.5 (Chunk 11N follow-up, 2026-05-27) — DO NOT
-        # instantiate TimeChain in OVG.__init__. Maker direction this
-        # session: "OVG is active only when chat is going on or titan
-        # posting on X — this is simple class that does couple checks
-        # on post hook and signs (async) the reply. this is seconds work
-        # at most." Eager TimeChain.open() here (pre-fix) burned 169s on
-        # T3 cold boot opening the chain file just to copy
-        # `tc.genesis_hash.hex()[:16]` for a startup log line. That
-        # decision propagated through D-SPEC-138 (eager OVG warmup) which
-        # pushed the cost to boot — total cold boot was 212s, of which
-        # 169s was THIS line. OVG itself constructs in <10ms once this
-        # is removed; the chain genesis hash is now read lazily by
-        # `genesis_hash_hex` property if/when a consumer asks.
-        # Per `feedback_no_quick_patches_only_spec_correct_solutions`:
-        # this is the SPEC-correct root cause; D-SPEC-138 eager warmup
-        # becomes a no-op after this and can be retired in a follow-up.
+        # Phase 11 W9 (2026-05-27) — load genesis hash via SHM-direct
+        # read of `timechain_state.bin` (published by timechain_worker per
+        # Phase C Session 3 §4.B.9). Replaces the prior `TimeChain(data_dir)`
+        # instantiation which was a ~169s mainnet cold-start (50MB chain
+        # scan) and the load-bearing contributor to agno_worker boot
+        # latency. OVG only ever needed the genesis_hash prefix for the
+        # signature/verdict envelope — never the chain itself.
+        #
+        # Per Maker direction 2026-05-27: "OVG should bus-talk to
+        # timechain_worker instead of instantiating Timechain — completely
+        # unnecessary". SHM read (locked D1 / SPEC §11.I.5) is the
+        # zero-latency equivalent of the bus-RPC pattern.
+        #
+        # Failure path: SHM slot absent or genesis_hash empty (cold-boot
+        # pre-genesis or timechain_worker hasn't published yet) — leave
+        # `self._genesis_hash = ""` like the legacy path did on TimeChain
+        # construction failure. OVG is fully functional without it;
+        # the hash is decorative on the signature envelope.
         self._genesis_hash = ""
-        self._data_dir = data_dir  # stashed for lazy genesis read below
+        try:
+            from titan_hcl.core.state_registry import (
+                StateRegistryReader, resolve_shm_root, resolve_titan_id,
+            )
+            from titan_hcl.logic.session3_state_specs import (
+                TIMECHAIN_STATE_SPEC,
+            )
+            import msgpack as _msgpack
+            _tid = resolve_titan_id()
+            _shm_root = resolve_shm_root(_tid)
+            _reader = StateRegistryReader(TIMECHAIN_STATE_SPEC, _shm_root)
+            _raw = _reader.read_variable()
+            _reader.close()
+            if _raw:
+                _d = _msgpack.unpackb(_raw, raw=False)
+                if isinstance(_d, dict):
+                    self._genesis_hash = str(
+                        _d.get("genesis_hash_hex_16", "") or "")
+        except Exception:
+            pass
 
         # SPEC §23.8 D-SPEC-87 Phase 3.F wave 3a (2026-05-18) — rejection
         # counters consumed by outer_mind willing[13] protective_response.
