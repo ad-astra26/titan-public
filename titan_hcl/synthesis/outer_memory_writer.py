@@ -235,3 +235,155 @@ class OuterMemoryWriter:
         )
         self.emit(event)
         return anchor_tx
+
+    # ── Phase 5 — hypothesis-fork graduation + tombstone (§P5.E / §P5.G) ─
+
+    def write_concept_version_with_proof(
+        self,
+        *,
+        concept_id: str,
+        version: int,
+        name: str,
+        memory_type: str,
+        parent_version_tx: Optional[str],
+        composed_from: list[tuple[str, int]],
+        derivation_evidence: list[str],
+        groundedness: float,
+        derivation_merkle_root: str,
+        oracle_verdict: dict,
+        significance: float = 0.85,
+        novelty: float = 0.7,
+        coherence: float = 0.9,
+    ) -> tuple[str, str]:
+        """Phase 5 graduation-path write — extends `write_concept_version` with
+        a mandatory `derivation_merkle_root` (the Merkle root of the
+        graduating hypothesis fork's exploration TXs, §P5.E) AND emits a
+        companion `oracle_verdict` TX so the verification itself is anchored
+        (arch §11.1: "the verdict itself is anchored on the Timechain —
+        verification is provenanced, not just the attempt").
+
+        Returns `(concept_anchor_tx, oracle_verdict_tx)`.
+
+        Both TXs ride the same fork as the concept-version (declarative /
+        procedural / episodic / meta) so retrieval that walks the concept
+        spine surfaces the proof + verdict alongside the concept itself —
+        the audit trail is co-located with the claim.
+
+        Significance / novelty / coherence default *higher* than the
+        Phase-4 `write_concept_version` because a graduated concept-version
+        is *earned* (oracle-verified or used-counted ≥3) — semantically
+        more valuable than a consolidation-pass-proposed bump.
+        """
+        # Step 1: anchor the concept-version TX with the Merkle root.
+        anchor_tx = self.write_concept_version(
+            concept_id=concept_id, version=version, name=name,
+            memory_type=memory_type, parent_version_tx=parent_version_tx,
+            composed_from=composed_from,
+            derivation_evidence=derivation_evidence,
+            groundedness=groundedness,
+            derivation_merkle_root=derivation_merkle_root,
+            significance=significance, novelty=novelty, coherence=coherence,
+        )
+
+        # Step 2: anchor the OracleVerdict TX. Per arch §11.1 every verdict
+        # is on-chain so a future Titan can audit "WHY did v(n+1) graduate?".
+        fork = _CONCEPT_VERSION_FORK_BY_MEMORY_TYPE[memory_type]
+        verdict_content = {
+            "concept_id": concept_id,
+            "concept_version": int(version),
+            "concept_anchor_tx": anchor_tx,
+            "derivation_merkle_root": derivation_merkle_root,
+            "oracle_id": str(oracle_verdict.get("oracle_id", "")),
+            "verdict": str(oracle_verdict.get("verdict", "unknown")),
+            "evidence_ref": str(oracle_verdict.get("evidence_ref", "")),
+            "cost": float(oracle_verdict.get("cost", 0.0)),
+            "latency_ms": int(oracle_verdict.get("latency_ms", 0)),
+            "ts": float(oracle_verdict.get("ts", time.time())),
+        }
+        verdict_hash = _canonical_concept_content_hash(verdict_content)
+        verdict_tags = [
+            "oracle_verdict",
+            f"concept:{concept_id}",
+            f"v:{int(version)}",
+            f"oracle:{verdict_content['oracle_id']}",
+        ]
+        verdict_event = OuterMemoryEvent(
+            fork=fork,
+            thought_type="oracle_verdict",
+            source=self._src,
+            content=verdict_content,
+            tags=verdict_tags,
+            significance=0.6,
+            novelty=0.3,
+            coherence=0.9,
+        )
+        self.emit(verdict_event)
+        return anchor_tx, verdict_hash
+
+    def write_tombstone(
+        self,
+        *,
+        fork_id: str,
+        root_anchor: Optional[str],
+        intent: str,
+        explored_from: float,
+        explored_to: float,
+        exploration_root: str,
+        abandonment_reason: str,
+        reference_count_pruned: int,
+        significance: float = 0.45,
+        novelty: float = 0.25,
+        coherence: float = 0.7,
+    ) -> str:
+        """Phase 5 abandonment — emits a permanent canonical TX on the
+        `meta` fork carrying the scar of an abandoned hypothesis exploration.
+
+        Arch §9.3 + INV-Syn-9 (proposed): the tombstone is **canonical** even
+        though the fork's exploration TXs are not. It is the verifiable scar
+        — a future Titan can ask "what did I once explore here?" and get a
+        Merkle proof of the (now-deleted) TX list via `exploration_root`.
+
+        Routed to the `meta` fork because tombstones are meta-cognitive
+        events (records *about* Titan's exploration history), not domain
+        knowledge in declarative/procedural/episodic. Same metabolic budget
+        rule as other meta TXs (chain payload < 1 KB per arch §16.1).
+
+        Returns the canonical content-hash of the tombstone TX (deterministic
+        SHA-256 of the canonical JSON of the content payload, same shape as
+        write_concept_version's return).
+
+        `intent` is truncated to 256 chars on-chain to keep payload bounded;
+        the full text is preserved in the DuckDB hypothesis_forks row pre-GC.
+        """
+        truncated_intent = intent[:256]
+        content = {
+            "fork_id": fork_id,
+            "root_anchor": root_anchor,
+            "intent": truncated_intent,
+            "explored_from": float(explored_from),
+            "explored_to": float(explored_to),
+            "exploration_root": exploration_root,
+            "abandonment_reason": abandonment_reason,
+            "reference_count_pruned": int(reference_count_pruned),
+            "created_at": time.time(),
+        }
+        tombstone_tx = _canonical_concept_content_hash(content)
+        tags = [
+            "fork_tombstone",
+            f"fork:{fork_id}",
+            f"reason:{abandonment_reason}",
+        ]
+        if root_anchor:
+            tags.append(f"root:{root_anchor[:16]}")
+        event = OuterMemoryEvent(
+            fork="meta",
+            thought_type="fork_tombstone",
+            source=self._src,
+            content=content,
+            tags=tags,
+            significance=significance,
+            novelty=novelty,
+            coherence=coherence,
+        )
+        self.emit(event)
+        return tombstone_tx
