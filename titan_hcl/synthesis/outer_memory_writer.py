@@ -444,6 +444,85 @@ class OuterMemoryWriter:
         self.emit(event)
         return anchor_tx
 
+    def write_tool_call(
+        self,
+        *,
+        tool_id: str,
+        args: dict,
+        success: bool,
+        result_summary: str,
+        result_full_hash: Optional[str] = None,
+        latency_ms: int = 0,
+        scored_by: Optional[str] = None,         # INV-Syn-15: "oracle"|"llm"|None
+        parent_chat_tx: Optional[str] = None,    # links to the chat turn that triggered the tool call
+        parent_goal: Optional[str] = None,
+        parent_skill_id: Optional[str] = None,
+        significance: float = 0.35,
+        novelty: float = 0.25,
+        coherence: float = 0.7,
+    ) -> str:
+        """Phase 6 / §P6.I — anchor a tool invocation as a procedural-fork TX.
+
+        Every tool call routed through a `ToolPlug` lands here. The
+        ``scored_by`` field is the §A.6 coverage instrumentation
+        (INV-Syn-15):
+
+          * ``"oracle"`` — a TruthOraclePlug.verify() returned a
+            non-`unknown` verdict for this call's outcome (oracle-scored).
+          * ``"llm"`` — Phase-8 dream-time skill miner's LLM-judge
+            fallback supplied the success signal.
+          * ``None`` — neither (unscored at write time; Phase 8 miner may
+            score later via a follow-up TX).
+
+        Phase 6 ships scored_by=None at call time + a companion oracle
+        verdict path (P6.F OracleRouter) updates it via the companion
+        verdict batch. Phase 8 wires the LLM-judge fallback.
+
+        Returns the SHA-256 content-hash of the tool-call payload.
+
+        Tags: ["tool_call", "tool:<tool_id>", "scored_by:<v>" (if set),
+               "scored_by:none" (if unset)]
+        Content: full invocation record + scored_by field.
+        """
+        content = {
+            "tool_id": tool_id,
+            "args": args,
+            "success": bool(success),
+            "result_summary": result_summary[:512] if result_summary else "",
+            "latency_ms": int(latency_ms),
+            "ts": time.time(),
+            "scored_by": scored_by,
+        }
+        if result_full_hash:
+            content["result_full_hash"] = result_full_hash
+        if parent_chat_tx:
+            content["parent_chat_tx"] = parent_chat_tx
+        if parent_goal:
+            content["parent_goal"] = parent_goal
+        if parent_skill_id:
+            content["parent_skill_id"] = parent_skill_id
+
+        anchor_tx = _canonical_concept_content_hash(content)
+        tags = [
+            "tool_call",
+            f"tool:{tool_id}",
+            f"scored_by:{scored_by if scored_by else 'none'}",
+        ]
+        if parent_chat_tx:
+            tags.append(f"chat:{parent_chat_tx[:16]}")
+        event = OuterMemoryEvent(
+            fork="procedural",
+            thought_type="tool_call",
+            source=self._src,
+            content=content,
+            tags=tags,
+            significance=significance,
+            novelty=novelty,
+            coherence=coherence,
+        )
+        self.emit(event)
+        return anchor_tx
+
     def write_oracle_verdict_batch(
         self,
         *,
