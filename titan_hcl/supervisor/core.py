@@ -187,8 +187,48 @@ class Supervisor:
             if info.reload_in_flight:
                 continue
 
-            # 2. Process liveness check.
-            if info.process and not info.process.is_alive():
+            # 2. Process liveness check — in-process vs cross-process paths.
+            # In-process: info.process is an mp.Process, use is_alive().
+            # Cross-process (11E.b.2 / kernel-rs peer-spawn): info.process is
+            # None because this Supervisor's Orchestrator instance never
+            # spawned anything; the worker lives in a separate process tree
+            # (spawned by titan_hcl). Read PID from the worker's SHM slot
+            # and check os.kill(pid, 0) for liveness.
+            if info.process is None:
+                # Cross-process liveness: read PID from SHM, check signal-0.
+                _live_pid = 0
+                try:
+                    _bank2 = orch._ensure_module_state_reader_bank()
+                    if _bank2 is not None:
+                        _entry2 = _bank2.read(name)
+                        if _entry2 is not None:
+                            _live_pid = int(_entry2.pid or 0)
+                except Exception:  # noqa: BLE001
+                    _live_pid = 0
+                if _live_pid > 0:
+                    import os as _os, errno as _errno
+                    try:
+                        _os.kill(_live_pid, 0)
+                        # Process exists — fall through to heartbeat check.
+                    except OSError as _ke:
+                        if _ke.errno == _errno.ESRCH:
+                            logger.warning(
+                                "[Supervisor] Module '%s' pid=%d not alive "
+                                "(cross-process os.kill ESRCH)",
+                                name, _live_pid)
+                            self.bus.publish(make_msg(
+                                MODULE_CRASHED, "supervisor", "core",
+                                {"module": name, "exitcode": None,
+                                 "source": "shm_pid_dead"}))
+                            if info.spec.restart_on_crash:
+                                self.publish_module_restart_request(
+                                    name, reason="shm_pid_dead")
+                            continue
+                        # EPERM means process exists but is owned by another
+                        # uid (foreign reparenting) — treat as alive.
+                # No PID yet (worker hasn't booted) — skip liveness check
+                # this tick; heartbeat-staleness will catch it.
+            elif not info.process.is_alive():
                 with orch._module_lock:
                     if info.process and not info.process.is_alive():
                         exitcode = info.process.exitcode
