@@ -462,26 +462,6 @@ _T = (
     ("/v6/synthesis/forks/{fork_id}/abandon", "POST",
      "post_v6_synthesis_fork_abandon", "synthesis", "write",
      None, None, (), ("synthesis_worker",), False, None),
-
-    # ── synthesis — Phase 6 §P6.K oracle + proof readout ─────────────────
-    # All 5 routes read data/oracles_snapshot.json (exported every 60s by
-    # synthesis_worker via OracleSnapshotExporter); soft-fail to empty
-    # payload + snapshot status when the file is missing/stale/corrupt.
-    ("/v6/synthesis/oracles/router", "GET",
-     "get_v6_synthesis_oracles_router", "synthesis", "readout",
-     None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/oracles/recent", "GET",
-     "get_v6_synthesis_oracles_recent", "synthesis", "readout",
-     None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/oracles/coverage", "GET",
-     "get_v6_synthesis_oracles_coverage", "synthesis", "readout",
-     None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/oracles/budget", "GET",
-     "get_v6_synthesis_oracles_budget", "synthesis", "readout",
-     None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/proofs/recent", "GET",
-     "get_v6_synthesis_proofs_recent", "synthesis", "readout",
-     None, None, (), ("synthesis_worker",), False, None),
 )
 
 
