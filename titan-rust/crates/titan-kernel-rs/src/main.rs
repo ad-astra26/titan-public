@@ -87,14 +87,22 @@ async fn main() -> ExitCode {
     let skip_python = std::env::var("TITAN_KERNEL_SKIP_PYTHON")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    // Phase 11 §11.I.1 / D-SPEC-141 — production also peer-spawns
-    // scripts/titan_hcl.py (orchestrator) + scripts/titan_hcl_api.py
-    // (api) as siblings to guardian_hcl. Same TITAN_KERNEL_SKIP_PYTHON
-    // env gate disables all three for tests.
+    // Phase 11 §11.I.1 / D-SPEC-141 — kernel-rs CAN peer-spawn titan_hcl
+    // + titan_hcl_api as siblings to guardian_hcl. Gated on a separate env
+    // var (default OFF) until the Python side ships: scripts/titan_hcl.py
+    // rewritten as the orchestrator entry (currently the Agno-launcher
+    // for the L2 plugin) AND scripts/guardian_hcl.py stops Popen'ing
+    // titan_hcl AND scripts/titan_hcl_api.py exists. Flipping ON
+    // prematurely would double-spawn titan_hcl (kernel + guardian). After
+    // the Python rewrite cascades T3 → T2 → T1 green, the gate flips on
+    // by default + this env var goes away.
+    let peer_spawn_python = std::env::var("TITAN_KERNEL_PEER_SPAWN_PYTHON")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let options = KernelRunOptions {
         spawn_guardian_hcl: !skip_python,
-        spawn_titan_hcl: !skip_python,
-        spawn_titan_hcl_api: !skip_python,
+        spawn_titan_hcl: !skip_python && peer_spawn_python,
+        spawn_titan_hcl_api: !skip_python && peer_spawn_python,
         ..KernelRunOptions::default()
     };
 
