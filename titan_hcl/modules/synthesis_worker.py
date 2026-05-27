@@ -954,6 +954,13 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             concept_store=concept_store,
             outer_memory_writer=writer,
             activation_store=store,      # ActivationStore from above
+            # P8.X (D-SPEC-PHASE8 fold-in): write-through snapshot path so
+            # every create/record/graduate/abandon synchronously refreshes
+            # forks_snapshot.json. Closes the "new fork visible in snapshot
+            # never appeared after 6s" P5 cascade flake. The 60s recompute-
+            # loop snapshot stays as a heartbeat but is no longer load-
+            # bearing for visibility.
+            snapshot_path=forks_snapshot_path,
         )
 
         # Wire forks snapshot exporter into the recompute loop's late-bind
