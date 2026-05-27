@@ -290,7 +290,14 @@ def _publish_fork_command(request: Request, payload: dict) -> dict:
     request_id = uuid.uuid4().hex
     full_payload = {"request_id": request_id, **payload}
     try:
-        titan_state = request.app.state.titan
+        titan_state = getattr(request.app.state, "titan_state", None)
+        if titan_state is None:
+            # Fallback for older mount points that may carry the attr as
+            # `titan` (mirrors the legacy POST /v4/timechain/test-commit
+            # pattern in dashboard.py for cross-version compatibility).
+            titan_state = getattr(request.app.state, "titan", None)
+        if titan_state is None:
+            return {"ok": False, "error": "titan_state_unavailable: app.state has no titan_state or titan attribute"}
     except Exception as e:
         return {"ok": False, "error": f"titan_state_unavailable: {e}"}
     try:
