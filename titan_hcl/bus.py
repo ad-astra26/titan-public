@@ -285,6 +285,22 @@ SYNTHESIS_FORK_COMMAND_RESULT = "SYNTHESIS_FORK_COMMAND_RESULT"
 #   {op: "clear", chat_id, buffer_name, ts}
 SYNTHESIS_BUFFER_COMMAND = "SYNTHESIS_BUFFER_COMMAND"
 
+# Phase 8 §P8.I (D-SPEC-PHASE8): meta-fork bus events surfacing the
+# procedural pipeline + skill miner lifecycle. Synthesis_worker is the
+# sole emitter for all of these except META_SKILL_COMPILATION_CANDIDATE
+# which the actr_procedural_skill_proposer SC emits at dream_boundary
+# to wake the ProceduralMiner.
+META_SKILL_COMPILATION_CANDIDATE = "META_SKILL_COMPILATION_CANDIDATE"
+META_SKILL_COMPILED = "META_SKILL_COMPILED"
+META_SKILL_VERIFIED = "META_SKILL_VERIFIED"
+META_SKILL_REJECTED = "META_SKILL_REJECTED"
+META_SKILL_SOFT_RETIRED = "META_SKILL_SOFT_RETIRED"
+# Phase 8 fold-in (P8.Y / P7 CGN lexicon exporter): emitted by cgn_worker
+# on every CGN vocabulary mutation event + on 5-min snapshot exporter
+# cadence; agno_worker subscribes to refresh its in-process lexicon cache
+# so the P7 _ground_for_goal_hook returns real concept_ids.
+CGN_LEXICON_UPDATED = "CGN_LEXICON_UPDATED"
+
 # SPEC §8.3 Phase B (rFP_phase_c_bus_delivery_continuity_and_hot_reload §4):
 # per-module hot-reload protocol. REQUEST emitted by Maker CLI / future D9
 # Guardian; ACK emitted by parent Guardian with status transitions
