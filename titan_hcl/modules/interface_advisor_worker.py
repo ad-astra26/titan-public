@@ -34,8 +34,7 @@ Bus publications (all non-blocking per §8.0.ter D-SPEC-48):
   • RATE_LIMIT       — on rate exceeded, dst=source from payload; payload =
                        advisor.check() feedback dict
   • MODULE_HEARTBEAT — every 30s (daemon thread)
-  • (Phase 11 §11.I.2 D2: legacy boot-signal bus emit DELETED — SHM
-     slot `module_<name>_state.bin` state=booted is the contract)
+  • MODULE_READY     — on first SHM publish complete
 
 Persisted state: none — sliding-window deques are volatile by design
 (60s rolling window — restart loses ≤60s of rate history; next IMPULSE
@@ -71,7 +70,7 @@ from titan_hcl._phase_c_constants import (
 from titan_hcl.bus import (
     IMPULSE_RECEIVED,
     MODULE_HEARTBEAT,
-    MODULE_PROBE_REQUEST,
+    MODULE_READY,
     MODULE_SHUTDOWN,
     RATE_LIMIT,
     make_msg,
@@ -88,13 +87,6 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL_S = 30.0
 
 
-# Phase 11 §11.I.5 (Chunk 11N) — module-level readiness sentinel; gates
-# SHM-slot heartbeat() (legacy bus heartbeat fires unconditionally for
-# the boot window so guardian_HCL's stale-heartbeat detector doesn't
-# kill a slow boot).
-_WORKER_READY: bool = False
-
-
 def _send(send_queue, msg_type: str, src: str, dst: str,
           payload: dict, rid: Optional[str] = None) -> None:
     """Non-blocking publish helper (§8.0.ter D-SPEC-48)."""
@@ -107,22 +99,10 @@ def _send(send_queue, msg_type: str, src: str, dst: str,
 
 
 def _heartbeat_loop(send_queue, name: str,
-                    stop_event: threading.Event,
-                    state_writer: Optional[object] = None) -> None:
-    """Daemon thread — MODULE_HEARTBEAT every 30s.
-
-    Phase 11 §11.I.5: also publishes state_writer.heartbeat() on the SHM
-    slot once `_WORKER_READY` is True so guardian_HCL's SHM-staleness
-    detector + observatory `/v6/readiness` see fresh data on the same
-    cadence as the legacy bus path. SHM writes are best-effort.
-    """
+                    stop_event: threading.Event) -> None:
+    """Daemon thread — MODULE_HEARTBEAT every 30s."""
     while not stop_event.is_set():
         _send(send_queue, MODULE_HEARTBEAT, name, "guardian", {})
-        if state_writer is not None and _WORKER_READY:
-            try:
-                state_writer.heartbeat()
-            except Exception:  # noqa: BLE001 — never crash the heartbeat
-                pass
         stop_event.wait(HEARTBEAT_INTERVAL_S)
 
 
@@ -136,8 +116,8 @@ def interface_advisor_worker_main(recv_queue, send_queue, name: str,
          (composes InterfaceAdvisor)
       2. Start heartbeat thread (daemon, 30s cadence)
       3. Cold-boot SHM publish (empty rates dict + INITIAL_LIMITS)
-      4. Phase 11 §11.I.2 — SHM slot state=booted (parent's
-         InterfaceAdvisorStateReader can now SHM-read defaults)
+      4. Emit MODULE_READY (parent's InterfaceAdvisorStateReader can
+         now SHM-read defaults)
       5. Main loop: drain recv_queue, dispatch by msg_type:
            - IMPULSE_RECEIVED  → advisor.check(msg_type, source);
                                  if rate exceeded, emit RATE_LIMIT to
@@ -145,9 +125,6 @@ def interface_advisor_worker_main(recv_queue, send_queue, name: str,
                                  INTERFACE_ADVISOR_RATE_REFRESH_CADENCE_S
            - MODULE_SHUTDOWN   → graceful exit
     """
-    global _WORKER_READY
-    _WORKER_READY = False
-
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = resolve_titan_id(config.get("titan_id") if config else None)
 
@@ -156,54 +133,27 @@ def interface_advisor_worker_main(recv_queue, send_queue, name: str,
         "(SPEC v1.8.5 §9.B / D-SPEC-59 / rFP §4.H)",
         titan_id, name)
 
-    # ── Phase 11 §11.I.5 (Chunk 11N) — SHM state-slot writer ──
-    # Construct BEFORE slow init so the slot publishes state="starting"
-    # immediately; titan_hcl's 1Hz SHM poll then sees liveness during the
-    # cold-boot window. Heartbeat thread started immediately below so
-    # last_heartbeat stays fresh during cold-boot window before slot=booted.
-    _state_writer = None
-    try:
-        from titan_hcl.core.module_state import (
-            BootPriority,
-            ModuleStateWriter,
-        )
-        _state_writer = ModuleStateWriter(
-            module_name=name,
-            layer="L2",
-            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
-        )
-        _state_writer.write_state("starting")
-    except Exception as _sw_err:  # noqa: BLE001
-        logger.warning(
-            "[InterfaceAdvisorWorker] Phase 11 ModuleStateWriter init failed: %s",
-            _sw_err)
+    publisher = InterfaceAdvisorStatePublisher(titan_id)
 
     stop_event = threading.Event()
     hb_thread = threading.Thread(
-        target=_heartbeat_loop,
-        args=(send_queue, name, stop_event, _state_writer),
+        target=_heartbeat_loop, args=(send_queue, name, stop_event),
         daemon=True, name=f"interface-advisor-hb-{name}")
     hb_thread.start()
 
-    publisher = InterfaceAdvisorStatePublisher(titan_id)
-
-    # Cold-boot first SHM publish; readers can now mmap.
+    # Cold-boot first publish before MODULE_READY — readers can now mmap.
     publisher.publish()
 
-    # ── Phase 11 §11.I.2 — slot transition: starting → booted ──
-    _WORKER_READY = True
-    if _state_writer is not None:
-        try:
-            _state_writer.write_state("booted")
-        except Exception as _swb_err:  # noqa: BLE001
-            logger.warning(
-                "[InterfaceAdvisorWorker] Phase 11 write_state(booted) failed: %s",
-                _swb_err)
-
+    _send(send_queue, MODULE_READY, name, "guardian", {
+        "titan_id": titan_id,
+        "module": "interface_advisor_worker",
+        "version": "1.8.5",
+        "schema_version": 1,
+        "spec_ref": "D-SPEC-59",
+    })
     logger.info(
-        "[InterfaceAdvisorWorker] boot complete — Phase 11 SHM slot=booted "
-        "(awaiting MODULE_PROBE_REQUEST); interface_advisor_state.bin "
-        "initialized with cold defaults")
+        "[InterfaceAdvisorWorker] MODULE_READY emitted — "
+        "interface_advisor_state.bin SHM initialized with cold defaults")
 
     # Counters for heartbeat observability.
     impulse_count = 0
@@ -238,25 +188,6 @@ def interface_advisor_worker_main(recv_queue, send_queue, name: str,
             payload = msg.get("payload", {}) if isinstance(msg, dict) else {}
             if not isinstance(payload, dict):
                 payload = {}
-
-            # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ──
-            if msg_type == MODULE_PROBE_REQUEST and _state_writer is not None:
-                try:
-                    from titan_hcl.core.probe_dispatcher import (
-                        handle_module_probe_request,
-                    )
-                    handle_module_probe_request(
-                        msg,
-                        probe_fn=None,
-                        send_queue=send_queue,
-                        module_name=name,
-                        state_writer=_state_writer,
-                    )
-                except Exception as _probe_err:  # noqa: BLE001
-                    logger.warning(
-                        "[InterfaceAdvisorWorker] MODULE_PROBE_REQUEST handler "
-                        "failed: %s", _probe_err)
-                continue
 
             if msg_type == IMPULSE_RECEIVED:
                 impulse_count += 1

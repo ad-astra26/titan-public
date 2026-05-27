@@ -35,14 +35,6 @@ from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
-
-# Phase 11 §11.I.5 (Chunk 11N) — module-level readiness sentinel; gates
-# SHM-slot heartbeat() (legacy bus heartbeat fires unconditionally for
-# the boot window so guardian_HCL's stale-heartbeat detector doesn't
-# kill a slow boot — Sage init + DB schema + routing learner can be 5-10s).
-_WORKER_READY: bool = False
-
-
 # ── Knowledge concepts table schema ──────────────────────────────────
 
 _KNOWLEDGE_SCHEMA = """
@@ -85,9 +77,6 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         name: module name ("knowledge")
         config: dict from merged [knowledge] + [inference] + [stealth_sage]
     """
-    global _WORKER_READY
-    _WORKER_READY = False
-
     project_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", ".."))
     if project_root not in sys.path:
@@ -95,29 +84,6 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
 
     logger.info("[KnowledgeWorker] Initializing Knowledge Gatherer...")
     init_start = time.time()
-
-    # ── Phase 11 §11.I.5 (Chunk 11N) — SHM state-slot writer ──
-    # Constructed BEFORE the slow Sage + DB + routing-learner init so the
-    # slot publishes state="starting" immediately. The heartbeat thread
-    # below sends SHM heartbeat once _WORKER_READY is True (after boot
-    # completes), but the bus heartbeat fires unconditionally for the
-    # boot window.
-    _state_writer = None
-    try:
-        from titan_hcl.core.module_state import (
-            BootPriority,
-            ModuleStateWriter,
-        )
-        _state_writer = ModuleStateWriter(
-            module_name=name,
-            layer="L3",
-            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
-        )
-        _state_writer.write_state("starting")
-    except Exception as _sw_err:  # noqa: BLE001
-        logger.warning(
-            "[KnowledgeWorker] Phase 11 ModuleStateWriter init failed: %s",
-            _sw_err)
 
     # ── Database setup (auto-migration) ────────────────────────────────
     db_path = config.get("db_path", "data/inner_memory.db")
@@ -351,12 +317,6 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
     def _heartbeat_loop():
         while not _hb_stop.is_set():
             _send_heartbeat(send_queue, name)
-            # Phase 11 §11.I.5 — SHM heartbeat once worker is ready.
-            if _state_writer is not None and _WORKER_READY:
-                try:
-                    _state_writer.heartbeat()
-                except Exception:  # noqa: BLE001 — never crash the heartbeat
-                    pass
             _hb_stop.wait(15.0)
 
     _hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True,
@@ -366,17 +326,7 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
     init_ms = (time.time() - init_start) * 1000
     logger.info("[KnowledgeWorker] Ready in %.0fms (sage=%s, db=%s)",
                 init_ms, "OK" if sage else "DISABLED", db_path)
-
-    # ── Phase 11 §11.I.2 — slot transition: starting → booted ──
-    # (legacy boot-signal bus emit deleted per locked D2 / no-shim policy)
-    _WORKER_READY = True
-    if _state_writer is not None:
-        try:
-            _state_writer.write_state("booted")
-        except Exception as _swb_err:  # noqa: BLE001
-            logger.warning(
-                "[KnowledgeWorker] Phase 11 write_state(booted) failed: %s",
-                _swb_err)
+    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
 
     # ── F-phase (rFP §16.3): Meta-Reasoning Consumer Service wire ────
     # Session 2 wire-now-gate-later: request at action-dispatch time,
@@ -431,25 +381,6 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
 
         msg_type = msg.get("type", "")
         payload = msg.get("payload", {})
-
-        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ──
-        if msg_type == bus.MODULE_PROBE_REQUEST and _state_writer is not None:
-            try:
-                from titan_hcl.core.probe_dispatcher import (
-                    handle_module_probe_request,
-                )
-                handle_module_probe_request(
-                    msg,
-                    probe_fn=None,
-                    send_queue=send_queue,
-                    module_name=name,
-                    state_writer=_state_writer,
-                )
-            except Exception as _probe_err:  # noqa: BLE001
-                logger.warning(
-                    "[KnowledgeWorker] MODULE_PROBE_REQUEST handler failed: %s",
-                    _probe_err)
-            continue
 
         # Heartbeat
         now = time.time()

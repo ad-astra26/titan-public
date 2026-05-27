@@ -60,20 +60,8 @@ def _send_msg(send_queue, msg_type, src, dst, payload, rid=None):
 _last_hb_ts: float = 0.0
 
 
-# Phase 11 §11.I.5 (Chunk 11N) — module-level readiness sentinel; gates
-# SHM-slot heartbeat() (legacy bus heartbeat fires unconditionally for
-# the boot window so guardian_HCL's stale-heartbeat detector doesn't
-# kill a slow boot).
-_WORKER_READY: bool = False
-
-
-def _send_heartbeat(send_queue, name: str,
-                    state_writer: Optional[object] = None) -> None:
-    """Send MODULE_HEARTBEAT to Guardian (throttled to ≤1 per 3s).
-
-    Phase 11 §11.I.5: also publishes state_writer.heartbeat() on the SHM
-    slot once _WORKER_READY is True. SHM writes are best-effort.
-    """
+def _send_heartbeat(send_queue, name: str) -> None:
+    """Send MODULE_HEARTBEAT to Guardian (throttled to ≤1 per 3s)."""
     global _last_hb_ts
     now = time.time()
     if now - _last_hb_ts < 3.0:
@@ -92,11 +80,6 @@ def _send_heartbeat(send_queue, name: str,
         })
     except Exception:
         pass
-    if state_writer is not None and _WORKER_READY:
-        try:
-            state_writer.heartbeat()
-        except Exception:  # noqa: BLE001 — never crash the heartbeat
-            pass
 
 
 def _load_adoption_state(data_dir: str, current_version: int) -> dict:
@@ -285,34 +268,10 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
         config: dict with keys from [meta_teacher] TOML section + inherited
                 [inference] credentials + data_dir
     """
-    global _WORKER_READY
-    _WORKER_READY = False
-
     project_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", ".."))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
-
-    # ── Phase 11 §11.I.5 (Chunk 11N) — SHM state-slot writer ──
-    # Constructed BEFORE the slow MetaTeacher + Memory + Voice + Peer init
-    # so the slot publishes state="starting" immediately. Heartbeats during
-    # boot keep the slot's last_heartbeat fresh.
-    _state_writer = None
-    try:
-        from titan_hcl.core.module_state import (
-            BootPriority,
-            ModuleStateWriter,
-        )
-        _state_writer = ModuleStateWriter(
-            module_name=name,
-            layer="L2",
-            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
-        )
-        _state_writer.write_state("starting")
-    except Exception as _sw_err:  # noqa: BLE001
-        logger.warning(
-            "[MetaTeacher] Phase 11 ModuleStateWriter init failed: %s",
-            _sw_err)
 
     from titan_hcl.logic.meta_teacher import MetaTeacher, build_system_prompt
     from titan_hcl.logic.meta_teacher_prompts import (
@@ -440,7 +399,7 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
 
     def _heartbeat_loop():
         while not _hb_stop.is_set():
-            _send_heartbeat(send_queue, name, state_writer=_state_writer)
+            _send_heartbeat(send_queue, name)
             # Phase A.4 — refresh meta_teacher_state.bin every heartbeat (30s)
             # so readers see fresh ts even if no critiques arrived recently.
             # rFP_teachers_update F5: also threads teacher_memory through so
@@ -667,19 +626,12 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
             teacher_voice.snapshot().get("applied_count", 0),
             str(update.get("reasoning") or "")[:80])
 
-    # ── Phase 11 §11.I.2 — slot transition: starting → booted ──
-    # (legacy boot-signal bus emit deleted per locked D2 / no-shim policy)
-    _WORKER_READY = True
-    if _state_writer is not None:
-        try:
-            _state_writer.write_state("booted")
-        except Exception as _swb_err:  # noqa: BLE001
-            logger.warning(
-                "[MetaTeacher] Phase 11 write_state(booted) failed: %s",
-                _swb_err)
-    logger.info(
-        "[MetaTeacher] Ready — subscribed on META_CHAIN_COMPLETE "
-        "(Phase 11 SHM slot=booted; awaiting MODULE_PROBE_REQUEST)")
+    # Signal Guardian: worker finished init, ready for messages. Guardian
+    # flips state STARTING → RUNNING on this message (visible in /health
+    # guardian_status block). Without this, the module stays STARTING
+    # forever even though heartbeats flow normally.
+    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
+    logger.info("[MetaTeacher] Ready — subscribed on META_CHAIN_COMPLETE")
 
     # ── Main loop ────────────────────────────────────────────────────
     # ── Microkernel v2 Phase B.1 §6 — readiness/hibernate reporter ──
@@ -692,7 +644,7 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
     )
 
     while True:
-        _send_heartbeat(send_queue, name, state_writer=_state_writer)
+        _send_heartbeat(send_queue, name)
 
         # Periodic persistence + Phase B/C/D housekeeping (info + archive +
         # voice self-assess + peer query log rotation).
@@ -726,25 +678,6 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
 
         msg_type = msg.get("type", "")
         payload = msg.get("payload", {}) or {}
-
-        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ──
-        if msg_type == bus.MODULE_PROBE_REQUEST and _state_writer is not None:
-            try:
-                from titan_hcl.core.probe_dispatcher import (
-                    handle_module_probe_request,
-                )
-                handle_module_probe_request(
-                    msg,
-                    probe_fn=None,
-                    send_queue=send_queue,
-                    module_name=name,
-                    state_writer=_state_writer,
-                )
-            except Exception as _probe_err:  # noqa: BLE001
-                logger.warning(
-                    "[MetaTeacher] MODULE_PROBE_REQUEST handler failed: %s",
-                    _probe_err)
-            continue
 
         # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────
         if _b1_reporter.handles(msg_type):

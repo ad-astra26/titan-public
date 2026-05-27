@@ -59,13 +59,6 @@ from titan_hcl.errors import Severity as _phase11_sev
 logger = logging.getLogger(__name__)
 
 
-# Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel.
-# Flipped True after EmotCGN init + SHM mirror first write complete. Gates
-# SHM-slot heartbeat so titan_hcl's 1Hz poll sees real liveness, not the
-# boot-time "subscribed-but-not-warm" lie.
-_WORKER_READY: bool = False
-
-
 @with_error_envelope(module_name="emot_cgn", subsystem="entry", severity=_phase11_sev.FATAL)
 def emot_cgn_worker_main(recv_queue, send_queue, name: str,
                          config: dict) -> None:
@@ -79,36 +72,11 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
     """
     from queue import Empty
 
-    # Phase 11 §11.I.5 (Chunk 11N) — readiness flag reset per entry.
-    global _WORKER_READY
-    _WORKER_READY = False
-
     # Project root for imports (same pattern as language_worker)
     project_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", ".."))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
-
-    # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21 per worker) ──
-    # Constructed BEFORE slow EmotCGN init so the slot publishes state="starting"
-    # immediately. Heartbeat thread (started below) keeps last_heartbeat fresh
-    # during init so guardian_hcl's staleness detector doesn't kill mid-boot.
-    _state_writer = None
-    try:
-        from titan_hcl.core.module_state import (
-            BootPriority,
-            ModuleStateWriter,
-        )
-        _state_writer = ModuleStateWriter(
-            module_name="emot_cgn",
-            layer="L2",
-            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
-        )
-        _state_writer.write_state("starting")
-    except Exception as _sw_err:  # noqa: BLE001
-        logger.warning(
-            "[EmotCGNWorker] Phase 11 ModuleStateWriter init failed "
-            "(continuing on legacy path): %s", _sw_err)
 
     logger.info("[EmotCGNWorker] Initializing emotion subsystem...")
     init_start = time.time()
@@ -499,20 +467,7 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
                 init_ms, titan_id, emot_cgn._status,
                 len(emot_cgn._primitives), shm_state_path, shm_bundle_path)
 
-    # Phase 11 §11.I.2 — slot transition: starting → booted (D-SPEC-141 / v1.65.0).
-    # MODULE_READY bus emit DELETED per locked D2 (no shim, no dual-publish).
-    # SHM slot is the contract; titan_hcl's 1Hz poll detects "booted" and
-    # dispatches MODULE_PROBE_REQUEST → handler below transitions slot to "running".
-    _WORKER_READY = True
-    if _state_writer is not None:
-        try:
-            _state_writer.write_state("booted")
-            logger.info(
-                "[EmotCGNWorker] Phase 11 §11.I.2 — SHM slot state=booted "
-                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
-        except Exception as _swb_err:  # noqa: BLE001
-            logger.warning(
-                "[EmotCGNWorker] Phase 11 write_state(booted) failed: %s", _swb_err)
+    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
 
     # ── F-phase (rFP §16.7): Meta-Reasoning Consumer Service wire ────
     # Session 2 wire-now-gate-later. Meta returns not_yet_implemented;
@@ -546,21 +501,11 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
             _emh_err)
 
     # ── Background heartbeat thread (prevents Guardian timeout) ──────
-    # Phase 11 §11.I.5: ALSO publishes _state_writer.heartbeat() on the
-    # SHM slot so guardian_hcl's staleness detector + observatory's
-    # /v6/readiness see fresh data on the same cadence. SHM writes are
-    # gated by _WORKER_READY so the slot stays in "starting"/"booted"
-    # until probe passes.
     _hb_stop = threading.Event()
 
     def _heartbeat_loop():
         while not _hb_stop.is_set():
             _send_heartbeat(send_queue, name)
-            if _state_writer is not None and _WORKER_READY:
-                try:
-                    _state_writer.heartbeat()
-                except Exception:  # noqa: BLE001
-                    pass
             _hb_stop.wait(30.0)
 
     hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True,
@@ -680,25 +625,6 @@ def emot_cgn_worker_main(recv_queue, send_queue, name: str,
 
         msg_type = msg.get("type", "")
         payload = msg.get("payload", {}) or {}
-
-        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────────
-        if msg_type == bus.MODULE_PROBE_REQUEST and _state_writer is not None:
-            try:
-                from titan_hcl.core.probe_dispatcher import (
-                    handle_module_probe_request,
-                )
-                handle_module_probe_request(
-                    msg,
-                    probe_fn=None,
-                    send_queue=send_queue,
-                    module_name=name,
-                    state_writer=_state_writer,
-                )
-            except Exception as _probe_err:  # noqa: BLE001
-                logger.warning(
-                    "[EmotCGNWorker] MODULE_PROBE_REQUEST handler failed: %s",
-                    _probe_err)
-            continue
 
         # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────
         if _b1_reporter.handles(msg_type):

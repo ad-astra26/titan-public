@@ -17,7 +17,7 @@ Closes the T3 SPEAK quality regression observed since 2026-05-10 deploy
 
 # Boot signals
 
-  → (MODULE_READY retired — Phase 11 §11.I.2 SHM slot state=booted is the contract)
+  → `MODULE_READY`        — once on boot (guardian_HCL)
   → `MODULE_HEARTBEAT`    — every HEARTBEAT_INTERVAL_S (10s per SPEC §10.B)
 
 # Subscribed types (SPEC §9.B `outer_interface_worker` row + §2.A.3):
@@ -67,7 +67,7 @@ import sys
 import threading
 import time
 from queue import Empty
-from typing import Any, Optional
+from typing import Optional
 
 from titan_hcl import bus
 from titan_hcl.core.module_error_handler import with_error_envelope
@@ -77,11 +77,6 @@ logger = logging.getLogger("outer_interface_worker")
 
 # Module name (matches Guardian registry per SPEC §9.B v1.2.1 outer_interface_worker row).
 MODULE_NAME = "outer_interface_worker"
-
-# Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel
-# mirrored to per-process SHM slot via ModuleStateWriter. Set False at
-# import; flipped True after OuterInterface init + publisher start.
-_WORKER_READY: bool = False
 
 # Cadence + lifecycle constants (defaults — per-titan overridable via [outer_interface]).
 HEARTBEAT_INTERVAL_S = 10.0           # SPEC §10.B MODULE_HEARTBEAT_INTERVAL_S
@@ -138,15 +133,8 @@ def _send_msg(send_queue, msg_type: str, src: str, dst: str, payload: dict,
         pass
 
 
-def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None,
-                    state_writer: Optional[Any] = None) -> None:
-    """Emit MODULE_HEARTBEAT to guardian_HCL with current RSS.
-
-    Phase 11 §11.I.5 (Chunk 11N): also publishes ModuleStateWriter.heartbeat()
-    on the SHM slot when `state_writer` is provided AND `_WORKER_READY` is
-    True so guardian_HCL's SHM-staleness detector + observatory /v6/readiness
-    see fresh data on the same cadence as the legacy bus path.
-    """
+def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None) -> None:
+    """Emit MODULE_HEARTBEAT to guardian_HCL with current RSS."""
     try:
         import resource
         rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
@@ -157,15 +145,9 @@ def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None,
     if extra:
         payload.update(extra)
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", payload)
-    if state_writer is not None and _WORKER_READY:
-        try:
-            state_writer.heartbeat()
-        except Exception:  # noqa: BLE001 — never crash heartbeat
-            pass
 
 
-def _heartbeat_loop(recv_queue, send_queue, name: str, *, flag_off: bool,
-                    state_writer: Optional[Any] = None) -> None:
+def _heartbeat_loop(recv_queue, send_queue, name: str, *, flag_off: bool) -> None:
     """Heartbeat-only loop for flag-off / defensive-noop branches.
 
     Exits cleanly on MODULE_SHUTDOWN. No OuterInterface init, no dispatcher,
@@ -174,18 +156,12 @@ def _heartbeat_loop(recv_queue, send_queue, name: str, *, flag_off: bool,
         normally skips registration entirely in that mode);
       • microkernel.l0_rust_enabled = false (legacy spirit_worker_main
         owns OuterInterface).
-
-    Phase 11 §11.I.5: also handles MODULE_PROBE_REQUEST via the supplied
-    state_writer so flag-off no-op workers still answer probes from
-    titan_hcl (probe gets trivial-pass since worker is intentionally
-    idle).
     """
     last_heartbeat_ts = 0.0
     while True:
         now = time.time()
         if now - last_heartbeat_ts >= HEARTBEAT_INTERVAL_S:
-            _send_heartbeat(send_queue, name, extra={"flag_off_noop": flag_off},
-                            state_writer=state_writer)
+            _send_heartbeat(send_queue, name, extra={"flag_off_noop": flag_off})
             last_heartbeat_ts = now
         try:
             msg = recv_queue.get(timeout=POLL_INTERVAL_S)
@@ -193,22 +169,7 @@ def _heartbeat_loop(recv_queue, send_queue, name: str, *, flag_off: bool,
             continue
         except Exception:
             continue
-        mtype = msg.get("type") if isinstance(msg, dict) else None
-        if mtype == bus.MODULE_PROBE_REQUEST and state_writer is not None:
-            try:
-                from titan_hcl.core.probe_dispatcher import (
-                    handle_module_probe_request,
-                )
-                handle_module_probe_request(
-                    msg, probe_fn=None, send_queue=send_queue,
-                    module_name=name, state_writer=state_writer,
-                )
-            except Exception as _probe_err:  # noqa: BLE001
-                logger.warning(
-                    "[OuterInterfaceWorker] MODULE_PROBE_REQUEST handler "
-                    "failed (flag_off branch): %s", _probe_err)
-            continue
-        if mtype == bus.MODULE_SHUTDOWN:
+        if msg.get("type") == bus.MODULE_SHUTDOWN:
             logger.info(
                 "[OuterInterfaceWorker] Shutdown received (flag_off branch)")
             return
@@ -309,10 +270,6 @@ def outer_interface_worker_main(recv_queue, send_queue, name: str, config: dict)
     except Exception as _err:
         logger.debug("[OuterInterfaceWorker] pdeathsig install skipped: %s", _err)
 
-    # Phase 11 §11.I.5 (Chunk 11N) — reset module-level readiness sentinel.
-    global _WORKER_READY
-    _WORKER_READY = False
-
     # Canonical titan_id resolution (per feedback_titan_id_canonical_resolve.md
     # — SPEC §23.17 R-PORT-1; T2/T3 deployments may have missing
     # info_banner.titan_id, fall back to resolve_titan_id() which probes
@@ -324,27 +281,6 @@ def outer_interface_worker_main(recv_queue, send_queue, name: str, config: dict)
         or "T1"
     )
     boot_ts = time.time()
-
-    # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21) ──
-    # Built BEFORE the flag-gate checks + OuterInterface init so all
-    # boot exit paths (flag-off, init-fail, happy) can transition the
-    # slot through starting → booted.
-    _state_writer = None
-    try:
-        from titan_hcl.core.module_state import (
-            BootPriority,
-            ModuleStateWriter,
-        )
-        _state_writer = ModuleStateWriter(
-            module_name=name,
-            layer="L2",
-            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
-        )
-        _state_writer.write_state("starting")
-    except Exception as _sw_err:  # noqa: BLE001
-        logger.warning(
-            "[OuterInterfaceWorker] Phase 11 ModuleStateWriter init failed "
-            "(continuing — SHM slot disabled): %s", _sw_err)
 
     # === BOILERPLATE: flag-gated activation ===
     # Two flags gate this worker's behavior:
@@ -364,19 +300,11 @@ def outer_interface_worker_main(recv_queue, send_queue, name: str, config: dict)
             "[OuterInterfaceWorker] microkernel.l0_rust_enabled=false — "
             "legacy spirit_worker_main owns OuterInterface in this mode. "
             "Entering heartbeat-only no-op loop.")
-        # Phase 11 §11.I.2 — flag-off branch transitions SHM slot to booted
-        # immediately (worker is intentionally idle, but must still answer
-        # probes). Legacy MODULE_READY bus emit retired per locked D2.
-        _WORKER_READY = True
-        if _state_writer is not None:
-            try:
-                _state_writer.write_state("booted")
-            except Exception as _swb_err:  # noqa: BLE001
-                logger.warning(
-                    "[OuterInterfaceWorker] Phase 11 write_state(booted) "
-                    "(flag_off l0_rust=false) failed: %s", _swb_err)
-        _heartbeat_loop(recv_queue, send_queue, name, flag_off=True,
-                        state_writer=_state_writer)
+        _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
+            "titan_id": titan_id, "ts": boot_ts, "flag_off_noop": True,
+            "chunk": "A4", "reason": "l0_rust_enabled=false",
+        })
+        _heartbeat_loop(recv_queue, send_queue, name, flag_off=True)
         return
 
     if not (worker_enabled and oi_section_enabled):
@@ -384,16 +312,11 @@ def outer_interface_worker_main(recv_queue, send_queue, name: str, config: dict)
             "[OuterInterfaceWorker] worker_enabled=%s outer_interface.enabled=%s "
             "— entering heartbeat-only no-op loop.",
             worker_enabled, oi_section_enabled)
-        _WORKER_READY = True
-        if _state_writer is not None:
-            try:
-                _state_writer.write_state("booted")
-            except Exception as _swb_err:  # noqa: BLE001
-                logger.warning(
-                    "[OuterInterfaceWorker] Phase 11 write_state(booted) "
-                    "(flag_off worker_disabled) failed: %s", _swb_err)
-        _heartbeat_loop(recv_queue, send_queue, name, flag_off=True,
-                        state_writer=_state_writer)
+        _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
+            "titan_id": titan_id, "ts": boot_ts, "flag_off_noop": True,
+            "chunk": "A4", "reason": "worker_disabled",
+        })
+        _heartbeat_loop(recv_queue, send_queue, name, flag_off=True)
         return
 
     logger.info(
@@ -409,18 +332,11 @@ def outer_interface_worker_main(recv_queue, send_queue, name: str, config: dict)
         logger.warning(
             "[OuterInterfaceWorker] OuterInterface init returned None — "
             "entering defensive heartbeat loop.")
-        # Phase 11 §11.I.2 — init-failure branch transitions slot to
-        # `unhealthy` so titan_hcl + observatory surface the degraded
-        # state rather than treating it as a healthy boot.
-        if _state_writer is not None:
-            try:
-                _state_writer.write_state("unhealthy")
-            except Exception as _swb_err:  # noqa: BLE001
-                logger.warning(
-                    "[OuterInterfaceWorker] Phase 11 write_state(unhealthy) "
-                    "(init_failed) failed: %s", _swb_err)
-        _heartbeat_loop(recv_queue, send_queue, name, flag_off=True,
-                        state_writer=_state_writer)
+        _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
+            "titan_id": titan_id, "ts": boot_ts, "flag_off_noop": True,
+            "chunk": "A4", "reason": "outer_interface_init_failed",
+        })
+        _heartbeat_loop(recv_queue, send_queue, name, flag_off=True)
         return
 
     # state_refs dict for snapshot publishers (A7) — populated here so the
@@ -469,20 +385,15 @@ def outer_interface_worker_main(recv_queue, send_queue, name: str, config: dict)
     )
     _publisher_thread.start()
 
-    # ── Phase 11 §11.I.2 — slot transition: starting → booted ─────────
-    # Replaces the legacy MODULE_READY bus emit per locked D2 — the SHM
-    # slot state=booted is the contract.
-    _WORKER_READY = True
-    if _state_writer is not None:
-        try:
-            _state_writer.write_state("booted")
-            logger.info(
-                "[OuterInterfaceWorker] Phase 11 §11.I.2 — SHM slot "
-                "state=booted (awaiting MODULE_PROBE_REQUEST from titan_hcl)")
-        except Exception as _swb_err:  # noqa: BLE001
-            logger.warning(
-                "[OuterInterfaceWorker] Phase 11 write_state(booted) "
-                "failed: %s", _swb_err)
+    # Signal MODULE_READY to guardian_HCL.
+    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
+        "titan_id": titan_id, "ts": boot_ts, "chunk": "A7",
+        "save_recipes_every_s": save_recipes_every_s,
+        "self_exploration_cadence_s": self_exploration_cadence_s,
+        "publisher_cadence_s": publisher_cadence_s,
+        "kin_signature_cadence_s": kin_signature_cadence_s,
+        "kin_society_cadence_s": kin_society_cadence_s,
+    })
     logger.info(
         "[OuterInterfaceWorker] online — publisher cadences: "
         "stats=%.2fs kin_sig=%.2fs kin_soc=%.2fs self_explore=%.2fs save_recipes=%.0fs",
@@ -500,7 +411,7 @@ def outer_interface_worker_main(recv_queue, send_queue, name: str, config: dict)
 
         # Periodic heartbeat.
         if now - last_heartbeat_ts >= HEARTBEAT_INTERVAL_S:
-            _send_heartbeat(send_queue, name, state_writer=_state_writer)
+            _send_heartbeat(send_queue, name)
             last_heartbeat_ts = now
 
         # Pull next message (poll-timeout for heartbeat tick).
@@ -512,25 +423,6 @@ def outer_interface_worker_main(recv_queue, send_queue, name: str, config: dict)
             continue
 
         msg_type = msg.get("type")
-
-        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ────────
-        if msg_type == bus.MODULE_PROBE_REQUEST:
-            try:
-                from titan_hcl.core.probe_dispatcher import (
-                    handle_module_probe_request,
-                )
-                handle_module_probe_request(
-                    msg,
-                    probe_fn=None,
-                    send_queue=send_queue,
-                    module_name=name,
-                    state_writer=_state_writer,
-                )
-            except Exception as _probe_err:  # noqa: BLE001
-                logger.warning(
-                    "[OuterInterfaceWorker] MODULE_PROBE_REQUEST handler "
-                    "failed: %s", _probe_err)
-            continue
 
         # B.2.1 supervision-transfer dispatch (matches hormonal_worker:302-307).
         try:

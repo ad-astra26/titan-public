@@ -432,14 +432,6 @@ def run() -> int:
         lifecycle_t = _handle_module_lifecycle_requests(bus, guardian, stop_event)
 
         # ── Boot autostart modules ───────────────────────────────────
-        # Phase 11 §11.I.7 / G21 single-writer (D-SPEC-141) — mark this
-        # process as the canonical writer of titan_hcl_state.bin so the
-        # Orchestrator's _ensure_titan_hcl_state_writer creates the writer
-        # here and ONLY here. Non-canonical processes (api subprocess
-        # mini-orchestrators, test fixtures) inherit the absence of this
-        # env var and silently skip the publish, eliminating the slot
-        # clobbering observed live 2026-05-27.
-        os.environ["TITAN_HCL_STATE_WRITER_CANONICAL"] = "1"
         guardian.start_all()
         logger.info(
             "[guardian_hcl] start_all complete — modules: %s",
@@ -473,17 +465,16 @@ def run() -> int:
         logger.info("[guardian_hcl] titan_hcl spawned (pid=%d)", titan_hcl_proc.pid)
 
         # ── Main supervision loop ────────────────────────────────────
-        # Phase 11 §11.I.1 / D-SPEC-141 — supervisory loop owned by Supervisor
-        # (per locked D5). supervisor.monitor_tick() drains orchestrator's
-        # bus queue, then runs fault detection + RSS budget enforcement,
-        # publishing MODULE_RESTART_REQUEST on fault (translated back to
-        # orchestrator.restart_module by the lifecycle subscriber thread).
-        # drain_send_queues remains on the orchestrator (spawn-side concern).
-        logger.info("[guardian_hcl] supervision loop entered (Supervisor-driven, Phase 11 §11.I.1)")
+        # 1 Hz monitor tick + drain_send_queues. drain_send_queues is a
+        # no-op when workers communicate via socket (which they do under
+        # has_socket_broker=True / l0_rust_enabled=true), but the call is
+        # still safe + serves legacy mp.Queue fallback.
+        logger.info("[guardian_hcl] supervision loop entered")
         while not stop_event.is_set():
             try:
-                supervisor.monitor_tick()
+                guardian.monitor_tick()
                 guardian.drain_send_queues()
+                guardian._process_guardian_messages()
             except Exception as e:  # noqa: BLE001
                 logger.error("[guardian_hcl] supervision tick error: %s", e, exc_info=True)
             stop_event.wait(timeout=1.0)

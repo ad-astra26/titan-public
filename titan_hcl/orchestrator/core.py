@@ -1341,33 +1341,14 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
     def _ensure_titan_hcl_state_writer(self):
         """Lazy-construct the orchestrator's own SHM state writer.
 
-        Per SPEC G21 (one slot, one writer): only the canonical orchestrator
-        process writes `titan_hcl_state.bin`. Any other process that
-        constructs an Orchestrator (e.g. the api subprocess's mini-
-        orchestrator, test fixtures, sub-supervisors) is rejected by env-var
-        gate `TITAN_HCL_STATE_WRITER_CANONICAL=1` — set ONLY by
-        scripts/guardian_hcl.py (today the canonical orchestrator owner;
-        post-11E.b.2 physical split, scripts/titan_hcl.py) before calling
-        start_all. Non-canonical callers get None back and silently skip
-        the publish, leaving the slot to the canonical writer.
-
         Returns None on first-call failure (test fixtures, missing
-        /dev/shm, non-canonical process) so start_all() proceeds without
-        publishing `fleet_ready` (kernel-rs falls back to its existing
+        /dev/shm) so start_all() proceeds without publishing
+        `fleet_ready` (kernel-rs falls back to its existing
         process-health gate).
         """
         existing = getattr(self, "_titan_hcl_state_writer", None)
         if existing is not None:
             return existing
-        # G21 single-writer enforcement.
-        if os.environ.get("TITAN_HCL_STATE_WRITER_CANONICAL", "") != "1":
-            logger.info(
-                "[Orchestrator] titan_hcl_state.bin writer suppressed: "
-                "TITAN_HCL_STATE_WRITER_CANONICAL!=1 in this process "
-                "(G21 single-writer — only the canonical orchestrator "
-                "publishes fleet_ready)")
-            self._titan_hcl_state_writer = None
-            return None
         try:
             from titan_hcl.core.titan_hcl_state import TitanHclStateWriter
             from titan_hcl.core.state_registry import resolve_titan_id
@@ -1715,28 +1696,138 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                     "auto-restart back online")
 
     def monitor_tick(self) -> None:
-        """Phase 11 §11.I.1 — supervisory loop relocated to Supervisor.
-
-        The actual supervisory logic (heartbeat-staleness detection, process
-        liveness check, RSS budget enforcement, re-enable cooldown, fault
-        restart-triggering via MODULE_RESTART_REQUEST per locked D5) now
-        lives in `titan_hcl.supervisor.core.Supervisor.monitor_tick`. This
-        Orchestrator method is preserved as a thin delegation for back-compat
-        with existing tests and callers (`scripts/guardian_hcl.py`,
-        `tests/test_v3_core.py`, etc.); it lazily constructs an internal
-        Supervisor on first call.
-
-        In 11E.b.2 (kernel-rs peer-spawn), the Supervisor runs in its own
-        process; this method goes away entirely (callers will already be
-        on `supervisor.monitor_tick()` via the preferred path used by
-        `scripts/guardian_hcl.py`'s explicit `Supervisor` construction).
         """
-        supervisor = getattr(self, "_internal_supervisor", None)
-        if supervisor is None:
-            from titan_hcl.supervisor import Supervisor
-            supervisor = Supervisor(self.bus, self, config=self._config_raw if hasattr(self, "_config_raw") else None)
-            self._internal_supervisor = supervisor
-        supervisor.monitor_tick()
+        Called periodically by Core to check module health.
+        Processes heartbeats, checks RSS, restarts dead modules.
+        Thread-safe: acquires _module_lock for state mutations.
+        """
+        if self._stop_requested:
+            return
+
+        # Process incoming messages on guardian queue
+        self._process_guardian_messages()
+
+        now = time.time()
+        for name, info in self._modules.items():
+            # Auto-re-enable disabled modules after cooldown period
+            if info.state == ModuleState.DISABLED and info.disabled_at > 0:
+                elapsed = now - info.disabled_at
+                if elapsed >= REENABLE_COOLDOWN_S:
+                    logger.info("[Guardian] Auto-re-enabling module '%s' after %.0fs cooldown", name, elapsed)
+                    self.enable(name)
+                continue
+
+            if info.state not in (ModuleState.RUNNING, ModuleState.STARTING):
+                continue
+
+            # SPEC §11.B.3 (Phase B, D-SPEC-49) — supervision suppression
+            # contract. While reload_in_flight=True, the reload
+            # orchestrator owns lifecycle decisions for this module's
+            # OLD pid (heartbeat-timeout, RSS-overflow, dead-process
+            # restart paths are ALL skipped). The orchestrator-level
+            # timeout (MODULE_RELOAD_DEFAULT_TIMEOUT_S=30s) bounds this
+            # window. Liveness is still observed (rss, last_heartbeat
+            # updated by _process_guardian_messages); only restart
+            # initiation is suppressed.
+            if info.reload_in_flight:
+                continue
+
+            # Check if process is still alive
+            if info.process and not info.process.is_alive():
+                with self._module_lock:
+                    # Re-check under lock (process may have been restarted by proxy thread)
+                    if info.process and not info.process.is_alive():
+                        exitcode = info.process.exitcode
+                        logger.warning("[Guardian] Module '%s' died (exitcode=%s)", name, exitcode)
+                        info.state = ModuleState.CRASHED
+                        self.bus.publish(make_msg(MODULE_CRASHED, "guardian", "core", {
+                            "module": name, "exitcode": exitcode,
+                        }))
+                        if info.spec.restart_on_crash:
+                            # Option B (2026-05-02) — async to keep monitor_tick responsive
+                            self.restart_async(name, reason=f"died_exitcode_{exitcode}")
+                continue
+
+            # Heartbeat timeout check — CPU-aware (2026-04-21).
+            #
+            # Wallclock heartbeat alone misclassifies CPU-starved modules
+            # as deadlocked. On shared T2/T3 VPS during iter-3 ARC runs,
+            # the media module's heartbeat thread was preempted >180s
+            # repeatedly even though the module itself was making progress.
+            # Restart loops every 3 min added MORE CPU pressure, worsening
+            # the cascade.
+            #
+            # Algorithm: when wallclock timeout fires, sample /proc/<pid>/stat
+            # CPU time. If CPU grew since last sample → module is alive
+            # but starved → log + skip restart + count cycle. After
+            # MAX_STARVED_CYCLES consecutive starved cycles, force restart
+            # anyway (gives up — bounded grace prevents runaway hang).
+            if info.state == ModuleState.RUNNING:
+                hb_timeout = info.spec.heartbeat_timeout
+                if now - info.last_heartbeat > hb_timeout:
+                    cpu_now = self._get_cpu_time_seconds(info.pid) if info.pid else 0.0
+                    cpu_grew = (info.last_cpu_time > 0.0
+                                and cpu_now - info.last_cpu_time >= MIN_CPU_DELTA_FOR_ALIVE)
+                    if cpu_grew and info.consecutive_starved_cycles < MAX_STARVED_CYCLES:
+                        info.consecutive_starved_cycles += 1
+                        logger.warning(
+                            "[Guardian] Module '%s' heartbeat timeout (%.1fs > %.0fs) but "
+                            "CPU grew +%.2fs — alive-but-starved cycle %d/%d, deferring restart",
+                            name, now - info.last_heartbeat, hb_timeout,
+                            cpu_now - info.last_cpu_time,
+                            info.consecutive_starved_cycles, MAX_STARVED_CYCLES)
+                        info.last_cpu_time = cpu_now
+                        info.last_cpu_sample_ts = now
+                        continue
+                    # Either CPU didn't grow (truly stuck) or we exhausted grace cycles.
+                    reason = ("heartbeat_timeout_starved_grace_exhausted"
+                              if info.consecutive_starved_cycles >= MAX_STARVED_CYCLES
+                              else "heartbeat_timeout")
+                    # Microkernel v2 Phase A §A.5 — L1 crashes are architecturally
+                    # unexpected (Trinity daemons should be rock-solid); log at
+                    # ERROR level so they surface distinctly from L2/L3 restarts.
+                    lvl = logging.ERROR if info.spec.layer == "L1" else logging.WARNING
+                    logger.log(lvl,
+                               "[Guardian] Module '%s' [%s] heartbeat timeout (%.1fs > %.0fs limit) — restart reason=%s",
+                               name, info.spec.layer, now - info.last_heartbeat, hb_timeout, reason)
+                    with self._module_lock:
+                        info.state = ModuleState.UNHEALTHY
+                        info.consecutive_starved_cycles = 0
+                    if info.spec.restart_on_crash:
+                        # Option B (2026-05-02) — async; restart() acquires
+                        # _module_lock itself, so leaving the lock here is
+                        # safe (in fact it lets monitor_tick continue while
+                        # the restart waits for SAVE_DONE).
+                        self.restart_async(name, reason=reason)
+                    continue
+                # Heartbeat fresh — refresh CPU sample so next timeout check
+                # has a recent baseline (window ≈ monitor_tick interval, ~5s).
+                # Without this, last_cpu_time would be sampled only at boot
+                # and at recovery, making the cpu_grew comparison stale.
+                if info.pid:
+                    info.last_cpu_time = self._get_cpu_time_seconds(info.pid)
+                    info.last_cpu_sample_ts = now
+                if info.consecutive_starved_cycles > 0:
+                    info.consecutive_starved_cycles = 0
+
+            # Reset restart count after sustained uptime
+            if info.state == ModuleState.RUNNING and info.ready_time > 0:
+                if now - info.ready_time > self._sustained_uptime_reset and info.restart_count > 0:
+                    logger.info("[Guardian] Module '%s' sustained uptime %.0fs — resetting restart count",
+                                name, now - info.ready_time)
+                    info.restart_count = 0
+                    info.restart_timestamps.clear()
+
+            # RSS check
+            if info.pid:
+                rss = self._get_rss_mb(info.pid)
+                info.rss_mb = rss
+                if rss > info.spec.rss_limit_mb:
+                    logger.warning("[Guardian] Module '%s' RSS %.0fMB > limit %dMB",
+                                   name, rss, info.spec.rss_limit_mb)
+                    if info.spec.restart_on_crash:
+                        # Option B (2026-05-02) — async restart
+                        self.restart_async(name, reason=f"rss_{rss:.0f}mb")
 
     def _process_guardian_messages(self) -> None:
         """Drain guardian queue and process control messages."""

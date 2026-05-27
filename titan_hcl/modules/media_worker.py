@@ -27,18 +27,11 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Optional
 from titan_hcl import bus
 from titan_hcl.core.module_error_handler import with_error_envelope
 from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
-
-
-# Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel
-# mirrored to per-process SHM slot via ModuleStateWriter. Set False at
-# import; flipped True after the queue_dir bootstrap completes.
-_WORKER_READY: bool = False
 
 # Supported formats
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff"}
@@ -79,49 +72,13 @@ def media_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-    # Phase 11 §11.I.5 (Chunk 11N) — reset module-level readiness sentinel.
-    global _WORKER_READY
-    _WORKER_READY = False
-
-    # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21) ──
-    # Built BEFORE the queue_dir bootstrap so titan_hcl's 1Hz SHM poll
-    # sees the worker is alive while it warms.
-    _state_writer = None
-    try:
-        from titan_hcl.core.module_state import (
-            BootPriority,
-            ModuleStateWriter,
-        )
-        _state_writer = ModuleStateWriter(
-            module_name=name,
-            layer="L3",
-            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
-        )
-        _state_writer.write_state("starting")
-    except Exception as _sw_err:  # noqa: BLE001
-        logger.warning(
-            "[MediaWorker] Phase 11 ModuleStateWriter init failed "
-            "(continuing — SHM slot disabled): %s", _sw_err)
-
     queue_dir = config.get("queue_dir", os.path.join(project_root, "data", "media_queue"))
     os.makedirs(queue_dir, exist_ok=True)
 
     logger.info("[MediaWorker] Pure math perception engine online, queue: %s", queue_dir)
 
-    # ── Phase 11 §11.I.2 — slot transition: starting → booted ─────────
-    # Legacy MODULE_READY bus emit retired per locked D2 — the SHM slot
-    # state=booted is the contract.
-    _WORKER_READY = True
-    if _state_writer is not None:
-        try:
-            _state_writer.write_state("booted")
-            logger.info(
-                "[MediaWorker] Phase 11 §11.I.2 — SHM slot state=booted "
-                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
-        except Exception as _swb_err:  # noqa: BLE001
-            logger.warning(
-                "[MediaWorker] Phase 11 write_state(booted) failed: %s",
-                _swb_err)
+    # Signal ready
+    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
 
     last_scan = 0.0
     scan_interval = 10.0  # Check queue every 10s
@@ -142,7 +99,7 @@ def media_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         # the 3s get() window would starve the Empty path and prevent heartbeats
         # from ever reaching Guardian, causing the 180s heartbeat-timeout restart
         # loop observed after rFP #2 landed. 2026-04-15 diagnosis.
-        _send_heartbeat(send_queue, name, state_writer=_state_writer)
+        _send_heartbeat(send_queue, name)
 
         try:
             msg = recv_queue.get(timeout=3.0)
@@ -156,25 +113,6 @@ def media_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             break
 
         msg_type = msg.get("type", "")
-
-        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ────────
-        if msg_type == bus.MODULE_PROBE_REQUEST:
-            try:
-                from titan_hcl.core.probe_dispatcher import (
-                    handle_module_probe_request,
-                )
-                handle_module_probe_request(
-                    msg,
-                    probe_fn=None,
-                    send_queue=send_queue,
-                    module_name=name,
-                    state_writer=_state_writer,
-                )
-            except Exception as _probe_err:  # noqa: BLE001
-                logger.warning(
-                    "[MediaWorker] MODULE_PROBE_REQUEST handler "
-                    "failed: %s", _probe_err)
-            continue
 
         # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────
         if _b1_reporter.handles(msg_type):
@@ -652,15 +590,7 @@ def _send_response(send_queue, src: str, dst: str, payload: dict, rid: str) -> N
 _last_hb_ts: float = 0.0
 
 
-def _send_heartbeat(send_queue, name: str,
-                    state_writer: Optional[Any] = None) -> None:
-    """Throttled (3s min) heartbeat.
-
-    Phase 11 §11.I.5 (Chunk 11N): also publishes ModuleStateWriter.heartbeat()
-    on the SHM slot when `state_writer` is provided AND `_WORKER_READY` is
-    True so guardian_HCL's SHM-staleness detector + observatory /v6/readiness
-    see fresh data on the same cadence as the legacy bus path.
-    """
+def _send_heartbeat(send_queue, name: str) -> None:
     global _last_hb_ts
     now = time.time()
     if now - _last_hb_ts < 3.0:
@@ -672,8 +602,3 @@ def _send_heartbeat(send_queue, name: str,
     except Exception:
         rss_mb = 0
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", {"rss_mb": round(rss_mb, 1)})
-    if state_writer is not None and _WORKER_READY:
-        try:
-            state_writer.heartbeat()
-        except Exception:  # noqa: BLE001 — never crash heartbeat
-            pass

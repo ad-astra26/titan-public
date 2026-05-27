@@ -15,8 +15,7 @@ Owns under `microkernel.l0_rust_enabled=true`:
 
 # Boot signals
 
-  (Phase 11 §11.I.2 D2: legacy boot-signal bus emit DELETED — SHM slot
-   `module_self_reflection_worker_state.bin` state=booted is the contract)
+  → MODULE_READY                — once on boot (guardian_HCL)
   → MODULE_HEARTBEAT            — every HEARTBEAT_INTERVAL_S (10s per SPEC §10.B)
 
 # Subscribed types (SPEC §9.B self_reflection_worker Bus subscriptions row):
@@ -126,15 +125,7 @@ _SELF_REFLECTION_WORKER_SUBSCRIBE_TOPICS: list[str] = [
     # inner_self_insight.bin SHM slot for cognitive_worker's next tick.
     # Closes F-8 fleet-wide.
     bus.META_INTROSPECT_REQUEST,
-    bus.MODULE_PROBE_REQUEST,          # Phase 11 §11.I.3 probe handler
 ]
-
-
-# Phase 11 §11.I.5 (Chunk 11N) — module-level readiness sentinel; gates
-# SHM-slot heartbeat() (legacy bus heartbeat fires unconditionally for
-# the boot window so guardian_HCL's stale-heartbeat detector doesn't
-# kill a slow boot).
-_WORKER_READY: bool = False
 
 
 def _send_msg(send_queue, msg_type: str, src: str, dst: str, payload: dict,
@@ -150,13 +141,8 @@ def _send_msg(send_queue, msg_type: str, src: str, dst: str, payload: dict,
         pass
 
 
-def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None,
-                    state_writer: Optional[object] = None) -> None:
-    """Emit MODULE_HEARTBEAT to guardian_HCL with current RSS.
-
-    Phase 11 §11.I.5: also publishes state_writer.heartbeat() on the SHM
-    slot once _WORKER_READY is True. SHM writes are best-effort.
-    """
+def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None) -> None:
+    """Emit MODULE_HEARTBEAT to guardian_HCL with current RSS."""
     try:
         import resource
         rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
@@ -167,15 +153,9 @@ def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None,
     if extra:
         payload.update(extra)
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", payload)
-    if state_writer is not None and _WORKER_READY:
-        try:
-            state_writer.heartbeat()
-        except Exception:  # noqa: BLE001 — never crash the heartbeat
-            pass
 
 
-def _heartbeat_loop(recv_queue, send_queue, name: str, *, flag_off: bool,
-                    state_writer: Optional[object] = None) -> None:
+def _heartbeat_loop(recv_queue, send_queue, name: str, *, flag_off: bool) -> None:
     """Heartbeat-only loop for flag-off / defensive-noop branches.
 
     Used when:
@@ -190,9 +170,7 @@ def _heartbeat_loop(recv_queue, send_queue, name: str, *, flag_off: bool,
     while True:
         now = time.time()
         if now - last_heartbeat_ts >= HEARTBEAT_INTERVAL_S:
-            _send_heartbeat(
-                send_queue, name, extra={"flag_off_noop": flag_off},
-                state_writer=state_writer)
+            _send_heartbeat(send_queue, name, extra={"flag_off_noop": flag_off})
             last_heartbeat_ts = now
         try:
             msg = recv_queue.get(timeout=POLL_INTERVAL_S)
@@ -200,26 +178,7 @@ def _heartbeat_loop(recv_queue, send_queue, name: str, *, flag_off: bool,
             continue
         except Exception:
             continue
-        _mt = msg.get("type")
-        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler (flag-off branch) ──
-        if _mt == bus.MODULE_PROBE_REQUEST and state_writer is not None:
-            try:
-                from titan_hcl.core.probe_dispatcher import (
-                    handle_module_probe_request,
-                )
-                handle_module_probe_request(
-                    msg,
-                    probe_fn=None,
-                    send_queue=send_queue,
-                    module_name=name,
-                    state_writer=state_writer,
-                )
-            except Exception as _probe_err:  # noqa: BLE001
-                logger.warning(
-                    "[SelfReflectionWorker] MODULE_PROBE_REQUEST handler failed: %s",
-                    _probe_err)
-            continue
-        if _mt == bus.MODULE_SHUTDOWN:
+        if msg.get("type") == bus.MODULE_SHUTDOWN:
             logger.info(
                 "[SelfReflectionWorker] Shutdown received (flag_off branch)")
             return
@@ -374,9 +333,6 @@ def self_reflection_worker_main(recv_queue, send_queue, name: str,
         logger.debug(
             "[SelfReflectionWorker] pdeathsig install skipped: %s", _err)
 
-    global _WORKER_READY
-    _WORKER_READY = False
-
     # Canonical titan_id resolution.
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = (
@@ -385,27 +341,6 @@ def self_reflection_worker_main(recv_queue, send_queue, name: str,
         or "T1"
     )
     boot_ts = time.time()
-
-    # ── Phase 11 §11.I.5 (Chunk 11N) — SHM state-slot writer ──
-    # Constructed BEFORE the slow flag-resolution + 3-engine init so the
-    # slot publishes state="starting" immediately. Heartbeats keep
-    # last_heartbeat fresh during the cold-boot window.
-    _state_writer = None
-    try:
-        from titan_hcl.core.module_state import (
-            BootPriority,
-            ModuleStateWriter,
-        )
-        _state_writer = ModuleStateWriter(
-            module_name=name,
-            layer="L2",
-            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
-        )
-        _state_writer.write_state("starting")
-    except Exception as _sw_err:  # noqa: BLE001
-        logger.warning(
-            "[SelfReflectionWorker] Phase 11 ModuleStateWriter init failed: %s",
-            _sw_err)
 
     # === BOILERPLATE: two-flag gating ===
     microkernel_cfg = (config or {}).get("microkernel", {}) or {}
@@ -421,15 +356,11 @@ def self_reflection_worker_main(recv_queue, send_queue, name: str,
             "legacy spirit_worker_main owns SelfReasoning + CodingExplorer; "
             "PredictionEngine stays in cognitive_worker (Track 1 drift state). "
             "Entering heartbeat-only no-op loop.")
-        # Phase 11 §11.I.2 — slot=booted (no-op branch is "booted, idle")
-        _WORKER_READY = True
-        if _state_writer is not None:
-            try:
-                _state_writer.write_state("booted")
-            except Exception:  # noqa: BLE001
-                pass
-        _heartbeat_loop(recv_queue, send_queue, name, flag_off=True,
-                        state_writer=_state_writer)
+        _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
+            "titan_id": titan_id, "ts": boot_ts, "flag_off_noop": True,
+            "chunk": "B3", "reason": "l0_rust_enabled=false",
+        })
+        _heartbeat_loop(recv_queue, send_queue, name, flag_off=True)
         return
 
     if not (worker_enabled and sr_section_enabled):
@@ -437,15 +368,11 @@ def self_reflection_worker_main(recv_queue, send_queue, name: str,
             "[SelfReflectionWorker] worker_enabled=%s self_reflection.enabled=%s "
             "— entering heartbeat-only no-op loop.",
             worker_enabled, sr_section_enabled)
-        # Phase 11 §11.I.2 — slot=booted (no-op branch is "booted, idle")
-        _WORKER_READY = True
-        if _state_writer is not None:
-            try:
-                _state_writer.write_state("booted")
-            except Exception:  # noqa: BLE001
-                pass
-        _heartbeat_loop(recv_queue, send_queue, name, flag_off=True,
-                        state_writer=_state_writer)
+        _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
+            "titan_id": titan_id, "ts": boot_ts, "flag_off_noop": True,
+            "chunk": "B3", "reason": "worker_disabled",
+        })
+        _heartbeat_loop(recv_queue, send_queue, name, flag_off=True)
         return
 
     logger.info(
@@ -464,18 +391,11 @@ def self_reflection_worker_main(recv_queue, send_queue, name: str,
         logger.warning(
             "[SelfReflectionWorker] all 3 engines failed to init — "
             "entering defensive heartbeat loop.")
-        # Phase 11 §11.I.2 — slot=unhealthy is more honest than booted here;
-        # downstream probe will report degraded. Use booted to remain
-        # available for shutdown/probe RPC; the engine fault is surfaced via
-        # absence of *_STATS_UPDATED publications.
-        _WORKER_READY = True
-        if _state_writer is not None:
-            try:
-                _state_writer.write_state("booted")
-            except Exception:  # noqa: BLE001
-                pass
-        _heartbeat_loop(recv_queue, send_queue, name, flag_off=True,
-                        state_writer=_state_writer)
+        _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
+            "titan_id": titan_id, "ts": boot_ts, "flag_off_noop": True,
+            "chunk": "B3", "reason": "all_engines_init_failed",
+        })
+        _heartbeat_loop(recv_queue, send_queue, name, flag_off=True)
         return
 
     # state_refs dict — template-canonical shape for B5 dispatcher + B7
@@ -525,18 +445,21 @@ def self_reflection_worker_main(recv_queue, send_queue, name: str,
     )
     _publisher_thread.start()
 
-    # ── Phase 11 §11.I.2 — slot transition: starting → booted ──
-    # (legacy boot-signal bus emit deleted per locked D2 / no-shim policy)
+    # Signal MODULE_READY to guardian_HCL.
     sandbox_status = ("active" if coding_explorer is not None
                       and coding_explorer._sandbox is not None else "absent")
-    _WORKER_READY = True
-    if _state_writer is not None:
-        try:
-            _state_writer.write_state("booted")
-        except Exception as _swb_err:  # noqa: BLE001
-            logger.warning(
-                "[SelfReflectionWorker] Phase 11 write_state(booted) failed: %s",
-                _swb_err)
+    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
+        "titan_id": titan_id, "ts": boot_ts, "chunk": "B7",
+        "engines": {
+            "self_reasoning": self_reasoning is not None,
+            "coding_explorer": coding_explorer is not None,
+            "prediction_engine": prediction_engine is not None,
+        },
+        "sandbox": sandbox_status,
+        "publisher_cadence_s": publisher_cadence_s,
+        "coding_publisher_cadence_s": coding_publisher_cadence_s,
+        "prediction_publisher_cadence_s": prediction_publisher_cadence_s,
+    })
     logger.info(
         "[SelfReflectionWorker] online — SelfReasoning=%s + CodingExplorer=%s "
         "+ PredictionEngine=%s booted (sandbox=%s)",
@@ -548,14 +471,14 @@ def self_reflection_worker_main(recv_queue, send_queue, name: str,
     # dream_start / dream_end handlers per rFP §2.B.5); B6 wires the sandbox
     # lifecycle (30s health + 60s orphan); B7 wires the cadence-driven +
     # on-event publishers. Until then, drain recv_queue and act only on
-    # MODULE_SHUTDOWN. The skeleton sets SHM slot=booted + heartbeats so
+    # MODULE_SHUTDOWN. The skeleton emits MODULE_READY + heartbeats so
     # guardian classifies us as online during the soak between B3 and B5.
     last_heartbeat_ts = 0.0
     while True:
         now = time.time()
 
         if now - last_heartbeat_ts >= HEARTBEAT_INTERVAL_S:
-            _send_heartbeat(send_queue, name, state_writer=_state_writer)
+            _send_heartbeat(send_queue, name)
             last_heartbeat_ts = now
 
         # Sandbox subprocess lifecycle polled cadences (chunk B6 per
@@ -579,25 +502,6 @@ def self_reflection_worker_main(recv_queue, send_queue, name: str,
             continue
 
         msg_type = msg.get("type")
-
-        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ──
-        if msg_type == bus.MODULE_PROBE_REQUEST and _state_writer is not None:
-            try:
-                from titan_hcl.core.probe_dispatcher import (
-                    handle_module_probe_request,
-                )
-                handle_module_probe_request(
-                    msg,
-                    probe_fn=None,
-                    send_queue=send_queue,
-                    module_name=name,
-                    state_writer=_state_writer,
-                )
-            except Exception as _probe_err:  # noqa: BLE001
-                logger.warning(
-                    "[SelfReflectionWorker] MODULE_PROBE_REQUEST handler failed: %s",
-                    _probe_err)
-            continue
 
         # B.2.1 supervision-transfer dispatch.
         try:

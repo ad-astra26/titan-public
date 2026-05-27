@@ -50,7 +50,7 @@ Bus publications (non-blocking per §8.0.ter D-SPEC-48):
   • SOCIAL_CATALYST(type=dream_summary, dst="social")
   • EPOCH_TICK                  (post-completion, dst="all" + "timechain")
   • MODULE_HEARTBEAT            (every 30s)
-  • (MODULE_READY retired — Phase 11 §11.I.2 SHM slot state=booted is the contract)
+  • MODULE_READY                (on init complete after watchdog self_test pass)
 
 Persisted state: data/meditation_state.json (tracker dict — counts +
 last_epoch + last_ts persist across restart).
@@ -94,7 +94,7 @@ from titan_hcl.bus import (
     MEDITATION_RECOVERY_TIER_2,
     MEDITATION_REQUEST,
     MODULE_HEARTBEAT,
-    MODULE_PROBE_REQUEST,
+    MODULE_READY,
     MODULE_SHUTDOWN,
     QUERY,
     SAVE_NOW,
@@ -107,14 +107,6 @@ from titan_hcl.core.module_error_handler import with_error_envelope
 from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
-
-
-# Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel.
-# Flipped True after MeditationStatePublisher + Watchdog self_test pass +
-# SHM readers + first publish complete. Gates SHM-slot heartbeat so
-# titan_hcl's 1Hz poll sees real liveness rather than the boot-time
-# "subscribed-but-not-warm" lie.
-_WORKER_READY: bool = False
 
 
 HEARTBEAT_INTERVAL_S = 30.0
@@ -135,24 +127,10 @@ def _send(send_queue, msg_type: str, src: str, dst: str,
             msg_type, dst, e)
 
 
-def _heartbeat_loop(send_queue, name: str, stop_event: threading.Event,
-                    state_writer: Optional[Any] = None) -> None:
-    """Daemon thread — MODULE_HEARTBEAT every 30s.
-
-    Phase 11 §11.I.5 (Chunk 11N): also publishes
-    ModuleStateWriter.heartbeat() on the SHM slot when `state_writer` is
-    provided so guardian_hcl's SHM-staleness detector + observatory
-    `/v6/readiness` see fresh data. SHM heartbeat suppressed while
-    `_WORKER_READY` is False so the slot stays in "starting"/"booted"
-    until the worker is genuinely serving.
-    """
+def _heartbeat_loop(send_queue, name: str, stop_event: threading.Event) -> None:
+    """Daemon thread — MODULE_HEARTBEAT every 30s."""
     while not stop_event.is_set():
         _send(send_queue, MODULE_HEARTBEAT, name, "guardian", {})
-        if state_writer is not None and _WORKER_READY:
-            try:
-                state_writer.heartbeat()
-            except Exception:  # noqa: BLE001
-                pass
         stop_event.wait(HEARTBEAT_INTERVAL_S)
 
 
@@ -852,7 +830,7 @@ def meditation_worker_main(recv_queue, send_queue, name: str,
       4. Build SHM readers for emergent driver inputs
       5. Start heartbeat thread + orchestrator thread
       6. First SHM publish (cold defaults restored from disk)
-      7. Phase 11 §11.I.2 — transition SHM slot starting→booted (no MODULE_READY emit, after self_test pass)
+      7. Emit MODULE_READY (only after self_test pass)
       8. Main loop: drain recv_queue, dispatch:
            - QUERY (rid match) → in_flight.resolve (orchestrator awaits)
            - RESPONSE (rid match) → in_flight.resolve
@@ -862,10 +840,6 @@ def meditation_worker_main(recv_queue, send_queue, name: str,
            - KERNEL_EPOCH_TICK → emergent driver check + watchdog check + 1Hz SHM republish
            - SAVE_NOW / MODULE_SHUTDOWN → persist tracker + (shutdown only) exit
     """
-    # Phase 11 §11.I.5 (Chunk 11N) — readiness flag reset per entry.
-    global _WORKER_READY
-    _WORKER_READY = False
-
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = resolve_titan_id(config.get("titan_id") if config else None)
 
@@ -873,28 +847,6 @@ def meditation_worker_main(recv_queue, send_queue, name: str,
         "[MeditationWorker] booting — titan_id=%s name=%s "
         "(SPEC v1.8.3 §9.B / D-SPEC-57 / rFP §4.D)",
         titan_id, name)
-
-    # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21 per worker) ──
-    # Constructed BEFORE slow Watchdog self_test + SHM readers init so the
-    # slot publishes state="starting" immediately. Heartbeat thread (started
-    # below) calls state_writer.heartbeat() so guardian_hcl staleness
-    # detector survives the boot window.
-    _state_writer = None
-    try:
-        from titan_hcl.core.module_state import (
-            BootPriority,
-            ModuleStateWriter,
-        )
-        _state_writer = ModuleStateWriter(
-            module_name="meditation",
-            layer="L2",
-            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
-        )
-        _state_writer.write_state("starting")
-    except Exception as _sw_err:  # noqa: BLE001
-        logger.warning(
-            "[MeditationWorker] Phase 11 ModuleStateWriter init failed "
-            "(continuing on legacy path): %s", _sw_err)
 
     # ── Load [meditation] config from titan_params.toml ────────────
     med_cfg: dict[str, Any] = {}
@@ -1003,11 +955,8 @@ def meditation_worker_main(recv_queue, send_queue, name: str,
     in_flight = _InFlightRegistry()
     orch_state = _OrchestratorState()
 
-    # Phase 11 §11.I.5 — pass state_writer so heartbeat thread mirrors
-    # MODULE_HEARTBEAT to the SHM slot once _WORKER_READY flips True.
     hb_thread = threading.Thread(
-        target=_heartbeat_loop,
-        args=(send_queue, name, stop_event, _state_writer),
+        target=_heartbeat_loop, args=(send_queue, name, stop_event),
         daemon=True, name=f"meditation-hb-{name}")
     hb_thread.start()
 
@@ -1020,24 +969,18 @@ def meditation_worker_main(recv_queue, send_queue, name: str,
     # ── First SHM publish (cold defaults + restored counts) ─────────
     publisher.publish()
 
-    # Phase 11 §11.I.2 — slot transition: starting → booted (D-SPEC-141 / v1.65.0).
-    # MODULE_READY bus emit DELETED per locked D2 (no shim, no dual-publish).
-    # SHM slot is the contract; titan_hcl's 1Hz poll detects "booted" and
-    # dispatches MODULE_PROBE_REQUEST → handler below transitions slot to "running".
-    _WORKER_READY = True
-    if _state_writer is not None:
-        try:
-            _state_writer.write_state("booted")
-            logger.info(
-                "[MeditationWorker] Phase 11 §11.I.2 — SHM slot state=booted "
-                "(awaiting MODULE_PROBE_REQUEST from titan_hcl) — "
-                "meditation_state.bin SHM initialized "
-                "(count=%d, in_meditation=False, phase=idle)",
-                publisher.get_count())
-        except Exception as _swb_err:  # noqa: BLE001
-            logger.warning(
-                "[MeditationWorker] Phase 11 write_state(booted) failed: %s",
-                _swb_err)
+    _send(send_queue, MODULE_READY, name, "guardian", {
+        "titan_id": titan_id,
+        "module": "meditation_worker",
+        "version": "1.8.3",
+        "schema_version": MEDITATION_STATE_SCHEMA_VERSION,
+        "spec_ref": "D-SPEC-57",
+        "restored_count": publisher.get_count(),
+    })
+    logger.info(
+        "[MeditationWorker] MODULE_READY emitted — meditation_state.bin SHM "
+        "initialized (count=%d, in_meditation=False, phase=idle)",
+        publisher.get_count())
 
     # ── Counters ─────────────────────────────────────────────────────
     request_count = 0
@@ -1272,25 +1215,6 @@ def meditation_worker_main(recv_queue, send_queue, name: str,
             payload = msg.get("payload", {}) if isinstance(msg, dict) else {}
             if not isinstance(payload, dict):
                 payload = {}
-
-            # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────
-            if msg_type == MODULE_PROBE_REQUEST and _state_writer is not None:
-                try:
-                    from titan_hcl.core.probe_dispatcher import (
-                        handle_module_probe_request,
-                    )
-                    handle_module_probe_request(
-                        msg,
-                        probe_fn=None,
-                        send_queue=send_queue,
-                        module_name=name,
-                        state_writer=_state_writer,
-                    )
-                except Exception as _probe_err:  # noqa: BLE001
-                    logger.warning(
-                        "[MeditationWorker] MODULE_PROBE_REQUEST handler "
-                        "failed: %s", _probe_err)
-                continue
 
             if msg_type == MEDITATION_REQUEST:
                 request_count += 1

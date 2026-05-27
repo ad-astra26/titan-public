@@ -48,7 +48,7 @@ Bus publications (non-blocking per §8.0.ter D-SPEC-48):
                               plugin's v4_bridge_loop subscribes via V4_EVENT_TYPES
                               filter + re-emits each message as a chat_handler QUERY)
   • MODULE_HEARTBEAT      — every 30s
-  • (MODULE_READY retired — Phase 11 §11.I.2 SHM slot state=booted is the contract)
+  • MODULE_READY          — on first dream_state.bin SHM write completion
 
 Persisted state: none — queue is volatile by design; dream_state.bin is
 in /dev/shm.
@@ -95,7 +95,7 @@ from titan_hcl.bus import (
     DREAMING_STATE_UPDATED,
     KERNEL_EPOCH_TICK,
     MODULE_HEARTBEAT,
-    MODULE_PROBE_REQUEST,
+    MODULE_READY,
     MODULE_SHUTDOWN,
     make_msg,
 )
@@ -107,15 +107,6 @@ logger = logging.getLogger(__name__)
 
 
 HEARTBEAT_INTERVAL_S = 30.0
-
-
-# Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel
-# mirrored to the per-process SHM slot (`module_dream_state_state.bin`) via
-# ModuleStateWriter. Set False at import; flipped True after first SHM
-# publish completes. Until True, the heartbeat thread skips
-# `state_writer.heartbeat()` so the slot stays at state="starting"/"booted"
-# rather than prematurely asserting "running".
-_WORKER_READY: bool = False
 
 
 def _send(send_queue, msg_type: str, src: str, dst: str,
@@ -130,22 +121,10 @@ def _send(send_queue, msg_type: str, src: str, dst: str,
             msg_type, dst, e)
 
 
-def _heartbeat_loop(send_queue, name: str, stop_event: threading.Event,
-                    state_writer: Optional[Any] = None) -> None:
-    """Daemon thread — MODULE_HEARTBEAT every 30s.
-
-    Phase 11 §11.I.5 (Chunk 11N): also publishes ModuleStateWriter.heartbeat()
-    on the SHM slot when `state_writer` is provided AND `_WORKER_READY` is
-    True so guardian_HCL's SHM-staleness detector + observatory
-    /v6/readiness see fresh data on the same cadence as the legacy bus path.
-    """
+def _heartbeat_loop(send_queue, name: str, stop_event: threading.Event) -> None:
+    """Daemon thread — MODULE_HEARTBEAT every 30s."""
     while not stop_event.is_set():
         _send(send_queue, MODULE_HEARTBEAT, name, "guardian", {})
-        if state_writer is not None and _WORKER_READY:
-            try:
-                state_writer.heartbeat()
-            except Exception:  # noqa: BLE001 — never crash heartbeat
-                pass
         stop_event.wait(HEARTBEAT_INTERVAL_S)
 
 
@@ -185,8 +164,8 @@ def dream_state_worker_main(recv_queue, send_queue, name: str,
       1. Resolve titan_id, build DreamStatePublisher (lazy attach to SHM slot)
       2. Start heartbeat thread (daemon, 30s cadence)
       3. First SHM publish (cold defaults — is_dreaming=False, state="awake")
-      4. Transition SHM slot starting → booted (Phase 11 §11.I.2 contract;
-         readers can now trust the slot is initialized)
+      4. Emit MODULE_READY (only after first SHM write completes — readers
+         can now trust the slot is initialized)
       5. Main loop: drain recv_queue, dispatch by msg_type:
            - DREAMING_STATE_UPDATED → update publisher, detect transition,
              on transition emit DREAM_STATE_CHANGED (dual-target all + timechain)
@@ -197,12 +176,6 @@ def dream_state_worker_main(recv_queue, send_queue, name: str,
            - KERNEL_EPOCH_TICK → republish SHM (1.0 Hz dual-trigger)
            - MODULE_SHUTDOWN → graceful exit
     """
-    # Phase 11 §11.I.5 (Chunk 11N) — reset module-level readiness sentinel
-    # on every entry (fork-mode re-entries inherit parent's True;
-    # spawn-mode re-spawns get fresh False; explicit reset covers both).
-    global _WORKER_READY
-    _WORKER_READY = False
-
     # Resolve titan_id (per feedback_titan_id_canonical_resolve.md — SPEC §23.17 R-PORT-1).
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = resolve_titan_id(config.get("titan_id") if config else None)
@@ -212,27 +185,6 @@ def dream_state_worker_main(recv_queue, send_queue, name: str,
         "(SPEC v1.8.2 §9.B / D-SPEC-56 / rFP §4.I)",
         titan_id, name)
 
-    # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21) ──
-    # Built BEFORE the slow init so titan_hcl's 1Hz SHM poll sees the
-    # worker is alive while it warms. Heartbeat thread (started below)
-    # keeps `last_heartbeat` fresh during boot.
-    _state_writer = None
-    try:
-        from titan_hcl.core.module_state import (
-            BootPriority,
-            ModuleStateWriter,
-        )
-        _state_writer = ModuleStateWriter(
-            module_name=name,
-            layer="L2",
-            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
-        )
-        _state_writer.write_state("starting")
-    except Exception as _sw_err:  # noqa: BLE001
-        logger.warning(
-            "[DreamStateWorker] Phase 11 ModuleStateWriter init failed "
-            "(continuing — SHM slot disabled): %s", _sw_err)
-
     publisher = DreamStatePublisher(titan_id)
 
     # Inbox: thread-safe deque (only the main loop appends/drains, but the
@@ -240,37 +192,25 @@ def dream_state_worker_main(recv_queue, send_queue, name: str,
     inbox: deque[dict[str, Any]] = deque(maxlen=DREAM_INBOX_MAX_ENTRIES)
     inbox_lock = threading.Lock()
 
-    # ── Phase 11 §11.I.5 — heartbeat thread BEFORE slow init ──
-    # The thread sends MODULE_HEARTBEAT on the bus (legacy Guardian path) AND
-    # publishes _state_writer.heartbeat() on the SHM slot (Phase 11 contract)
-    # once `_WORKER_READY` flips True.
+    # Heartbeat thread.
     stop_event = threading.Event()
     hb_thread = threading.Thread(
-        target=_heartbeat_loop,
-        args=(send_queue, name, stop_event, _state_writer),
+        target=_heartbeat_loop, args=(send_queue, name, stop_event),
         daemon=True, name=f"dream-state-hb-{name}")
     hb_thread.start()
 
-    # Cold-boot first publish — readers can now mmap.
+    # Cold-boot first publish before MODULE_READY — readers can now mmap.
     publisher.publish()
 
-    # ── Phase 11 §11.I.2 — slot transition: starting → booted ─────────
-    # SHM slot is initialized + first publish completed. The legacy
-    # MODULE_READY bus emit is retired per locked D2 — the SHM slot
-    # state=booted is the contract.
-    _WORKER_READY = True
-    if _state_writer is not None:
-        try:
-            _state_writer.write_state("booted")
-            logger.info(
-                "[DreamStateWorker] Phase 11 §11.I.2 — SHM slot state=booted "
-                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
-        except Exception as _swb_err:  # noqa: BLE001
-            logger.warning(
-                "[DreamStateWorker] Phase 11 write_state(booted) failed: %s",
-                _swb_err)
+    _send(send_queue, MODULE_READY, name, "guardian", {
+        "titan_id": titan_id,
+        "module": "dream_state_worker",
+        "version": "1.8.2",
+        "schema_version": 1,
+        "spec_ref": "D-SPEC-56",
+    })
     logger.info(
-        "[DreamStateWorker] boot complete — dream_state.bin SHM "
+        "[DreamStateWorker] MODULE_READY emitted — dream_state.bin SHM "
         "initialized with cold defaults (is_dreaming=False, state=awake)")
 
     # Counters for heartbeat observability.
@@ -311,25 +251,6 @@ def dream_state_worker_main(recv_queue, send_queue, name: str,
             payload = msg.get("payload", {}) if isinstance(msg, dict) else {}
             if not isinstance(payload, dict):
                 payload = {}
-
-            # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ────────
-            if msg_type == MODULE_PROBE_REQUEST:
-                try:
-                    from titan_hcl.core.probe_dispatcher import (
-                        handle_module_probe_request,
-                    )
-                    handle_module_probe_request(
-                        msg,
-                        probe_fn=None,
-                        send_queue=send_queue,
-                        module_name=name,
-                        state_writer=_state_writer,
-                    )
-                except Exception as _probe_err:  # noqa: BLE001
-                    logger.warning(
-                        "[DreamStateWorker] MODULE_PROBE_REQUEST handler "
-                        "failed: %s", _probe_err)
-                continue
 
             if msg_type == DREAMING_STATE_UPDATED:
                 dreaming_state_updated_count += 1

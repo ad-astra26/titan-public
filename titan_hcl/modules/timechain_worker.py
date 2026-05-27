@@ -41,24 +41,6 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-    # ── Phase 11 §11.I.5 — SHM state-slot writer (G21 per worker) ──
-    # Created BEFORE the slow TimeChain + integrity init so the slot
-    # publishes state="starting" immediately and heartbeats keep
-    # last_heartbeat fresh during boot (~30s+ integrity scan).
-    _phase11_worker_ready = {"ready": False}
-    _state_writer = None
-    try:
-        from titan_hcl.core.module_state import BootPriority, ModuleStateWriter
-        _state_writer = ModuleStateWriter(
-            module_name="timechain",
-            layer="L2",
-            boot_priority=BootPriority.MANDATORY,
-        )
-        _state_writer.write_state("starting")
-    except Exception as _sw_err:  # noqa: BLE001
-        logger.warning(
-            "[TimeChain] Phase 11 ModuleStateWriter init failed: %s", _sw_err)
-
     # ── Heartbeat helper (Phase E Fix 2: throttled to 3s min interval) ──
     _hb_state = {"last": 0.0}
 
@@ -74,12 +56,6 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
             rss_mb = 0
         send_queue.put({"type": bus.MODULE_HEARTBEAT, "src": name, "dst": "guardian",
                         "payload": {"rss_mb": round(rss_mb, 1)}, "ts": time.time()})
-        # Phase 11 §11.I.5 — SHM heartbeat alongside bus heartbeat.
-        if _state_writer is not None:
-            try:
-                _state_writer.heartbeat()
-            except Exception:
-                pass
 
     def _send_msg(msg_type, dst, payload):
         send_queue.put({"type": msg_type, "src": name, "dst": dst,
@@ -234,20 +210,9 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 "checkpoint_interval=%ds",
                 enabled, orchestrator is not None, heartbeat_interval, checkpoint_time_interval)
 
-    # Phase 11 §11.I.2 — MODULE_READY bus-emit deleted per locked D2.
-    # SHM slot transitions starting → booted; titan_hcl's 1Hz SHM poll
-    # dispatches MODULE_PROBE_REQUEST after seeing this.
-    _phase11_worker_ready["ready"] = True
-    if _state_writer is not None:
-        try:
-            _state_writer.write_state("booted")
-            logger.info(
-                "[TimeChain] Phase 11 §11.I.2 — SHM slot state=booted "
-                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
-        except Exception as _swb_err:  # noqa: BLE001
-            logger.warning(
-                "[TimeChain] Phase 11 write_state(booted) failed: %s",
-                _swb_err)
+    # Tell Guardian we're ready
+    send_queue.put({"type": bus.MODULE_READY, "src": name, "dst": "guardian",
+                    "payload": {}, "ts": time.time()})
 
     # ── Startup integrity check ──
     _integrity_interval = 6 * 3600  # Check every 6 hours
@@ -443,25 +408,6 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         # ── Microkernel v2 Phase B.2.1 — supervision-transfer dispatch ──
         from titan_hcl.core import worker_swap_handler as _swap
         if _swap.maybe_dispatch_swap_msg(msg):
-            continue
-
-        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────
-        if msg_type == bus.MODULE_PROBE_REQUEST and _state_writer is not None:
-            try:
-                from titan_hcl.core.probe_dispatcher import (
-                    handle_module_probe_request,
-                )
-                handle_module_probe_request(
-                    msg,
-                    probe_fn=None,  # trivial pass-through per §11.I.2
-                    send_queue=send_queue,
-                    module_name=name,
-                    state_writer=_state_writer,
-                )
-            except Exception as _phb_err:  # noqa: BLE001
-                logger.warning(
-                    "[TimeChain] Phase 11 probe handler raised: %s",
-                    _phb_err)
             continue
 
         if msg_type == bus.MODULE_SHUTDOWN:

@@ -30,14 +30,6 @@ from titan_hcl.errors import Severity as _phase11_sev
 logger = logging.getLogger(__name__)
 
 
-# Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel.
-# Flipped True after CGN load + SHM writer init complete. Gates SHM
-# slot heartbeat: while False, the slot stays at state="starting"/"booted"
-# so titan_hcl's 1Hz SHM poll + MODULE_PROBE_REQUEST dispatcher see real
-# liveness rather than a boot-time "subscribed-but-not-warm" lie.
-_WORKER_READY: bool = False
-
-
 # ─────────────────────────────────────────────────────────────────────
 # CODE-AUTHORITATIVE CONSUMER MANIFEST (A5 — 2026-04-21)
 # ─────────────────────────────────────────────────────────────────────
@@ -177,12 +169,6 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         name: module name ("cgn")
         config: dict from [cgn] config section
     """
-    # Phase 11 §11.I.5 (Chunk 11N) — module-level readiness flag reset on
-    # every entry (fork-mode re-entries inherit parent's True; spawn-mode
-    # re-spawns get fresh False; explicit reset covers both).
-    global _WORKER_READY
-    _WORKER_READY = False
-
     project_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", ".."))
     if project_root not in sys.path:
@@ -190,29 +176,6 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
     logger.info("[CGNWorker] Initializing Cognitive Kernel...")
     init_start = time.time()
-
-    # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21 per worker) ──
-    # Constructed BEFORE slow CGN init so the slot publishes state="starting"
-    # immediately. state_writer.heartbeat() (via _send_heartbeat below) keeps
-    # the slot's last_heartbeat fresh during init so guardian_hcl's staleness
-    # detector doesn't kill the worker mid-boot. Transition to "booted" happens
-    # after CGN load + SHM writer init completes (search for _state_writer.write_state("booted")).
-    _state_writer = None
-    try:
-        from titan_hcl.core.module_state import (
-            BootPriority,
-            ModuleStateWriter,
-        )
-        _state_writer = ModuleStateWriter(
-            module_name="cgn",
-            layer="L2",
-            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
-        )
-        _state_writer.write_state("starting")
-    except Exception as _sw_err:  # noqa: BLE001
-        logger.warning(
-            "[CGNWorker] Phase 11 ModuleStateWriter init failed "
-            "(continuing on legacy path): %s", _sw_err)
 
     # ── Load CGN ────────────────────────────────────────────────────────
     from titan_hcl.logic.cgn import (
@@ -543,21 +506,7 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 "shm=%s)", init_ms,
                 list(cgn._consumers.keys()),
                 cgn._buffer.size(), shm_path)
-
-    # Phase 11 §11.I.2 — slot transition: starting → booted (D-SPEC-141 / v1.65.0).
-    # MODULE_READY bus emit DELETED per locked D2 (no shim, no dual-publish).
-    # SHM slot is the contract; titan_hcl's 1Hz poll detects "booted" and
-    # dispatches MODULE_PROBE_REQUEST → handler below transitions slot to "running".
-    _WORKER_READY = True
-    if _state_writer is not None:
-        try:
-            _state_writer.write_state("booted")
-            logger.info(
-                "[CGNWorker] Phase 11 §11.I.2 — SHM slot state=booted "
-                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
-        except Exception as _swb_err:  # noqa: BLE001
-            logger.warning(
-                "[CGNWorker] Phase 11 write_state(booted) failed: %s", _swb_err)
+    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
 
     # ── Main loop ──────────────────────────────────────────────────────
     # ── Microkernel v2 Phase B.1 §6 — readiness/hibernate reporter ──
@@ -639,14 +588,6 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         except Empty:
             # Heartbeat on idle
             _send_heartbeat(send_queue, name)
-            # Phase 11 §11.I.5 — SHM-slot heartbeat sidecar (guardian_hcl
-            # staleness detector + observatory /v6/readiness consume this).
-            # Suppressed until _WORKER_READY so slot stays starting/booted.
-            if _state_writer is not None and _WORKER_READY:
-                try:
-                    _state_writer.heartbeat()
-                except Exception:  # noqa: BLE001
-                    pass
             _last_heartbeat = time.time()
             # Periodic stats publish ALSO on the idle path (Phase C — see
             # _maybe_publish_cgn_stats docstring; idle is the common case on a
@@ -657,38 +598,10 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         msg_type = msg.get("type", "")
         payload = msg.get("payload", {})
 
-        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────────
-        # titan_hcl dispatches this after detecting our SHM slot transitioned
-        # to "booted". probe_dispatcher.handle_module_probe_request writes
-        # state="probing", runs probe_fn (None=trivial-pass), then writes
-        # state="running" or "unhealthy" and publishes MODULE_PROBE_RESPONSE.
-        if msg_type == bus.MODULE_PROBE_REQUEST and _state_writer is not None:
-            try:
-                from titan_hcl.core.probe_dispatcher import (
-                    handle_module_probe_request,
-                )
-                handle_module_probe_request(
-                    msg,
-                    probe_fn=None,
-                    send_queue=send_queue,
-                    module_name=name,
-                    state_writer=_state_writer,
-                )
-            except Exception as _probe_err:  # noqa: BLE001
-                logger.warning(
-                    "[CGNWorker] MODULE_PROBE_REQUEST handler failed: %s",
-                    _probe_err)
-            continue
-
         # ── Heartbeat check ──
         now = time.time()
         if now - _last_heartbeat > _heartbeat_interval:
             _send_heartbeat(send_queue, name)
-            if _state_writer is not None and _WORKER_READY:
-                try:
-                    _state_writer.heartbeat()
-                except Exception:  # noqa: BLE001
-                    pass
             _last_heartbeat = now
 
         # CGN_STATS_UPDATED + cgn_engine_state periodic publish (30s) — also on

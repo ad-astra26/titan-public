@@ -46,10 +46,6 @@ from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger("warning_monitor")
 
-# Phase 11 §11.I.3/§11.I.5 — module-level readiness sentinel; SHM heartbeat
-# is suppressed until the worker has finished in-process scaffolding.
-_WORKER_READY: bool = False
-
 # ── Config defaults (overridable via worker config dict) ─────────────
 DEFAULT_BRAIN_LOG_PATH = "/tmp/titan_brain.log"
 DEFAULT_STATE_PATH = "data/warning_monitor/state.json"
@@ -122,24 +118,6 @@ def warning_monitor_worker_main(recv_queue, send_queue, name: str,
     """
     logger.info("[WarningMonitor] Starting (pid=%d)", os.getpid())
 
-    global _WORKER_READY
-    _WORKER_READY = False
-
-    # ── Phase 11 §11.I.5 — SHM state-slot writer (G21 per worker) ──
-    _state_writer = None
-    try:
-        from titan_hcl.core.module_state import BootPriority, ModuleStateWriter
-        _state_writer = ModuleStateWriter(
-            module_name="warning_monitor",
-            layer="L3",
-            boot_priority=BootPriority.MANDATORY,
-        )
-        _state_writer.write_state("starting")
-    except Exception as _sw_err:  # noqa: BLE001
-        logger.warning(
-            "[WarningMonitor] Phase 11 ModuleStateWriter init failed: %s",
-            _sw_err)
-
     # ── Resolve config ───────────────────────────────────────────────
     cfg = dict(config or {})
     brain_log_path = cfg.get("brain_log_path", DEFAULT_BRAIN_LOG_PATH)
@@ -207,20 +185,11 @@ def warning_monitor_worker_main(recv_queue, send_queue, name: str,
 
     _resync_tail()
 
-    # Phase 11 §11.I.2 — MODULE_READY bus-emit deleted per locked D2.
-    # SHM slot transitions starting → booted; titan_hcl's 1Hz SHM poll
-    # dispatches MODULE_PROBE_REQUEST after seeing this.
-    _WORKER_READY = True
-    if _state_writer is not None:
-        try:
-            _state_writer.write_state("booted")
-        except Exception as _swb_err:  # noqa: BLE001
-            logger.warning(
-                "[WarningMonitor] Phase 11 write_state(booted) failed: %s",
-                _swb_err)
+    # ── Send MODULE_READY ────────────────────────────────────────────
+    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
     logger.info(
-        "[WarningMonitor] Phase 11 §11.I.2 — SHM slot state=booted — "
-        "brain_log=%s state=%s persist_interval=%ds rate_spike_threshold=%d/min",
+        "[WarningMonitor] Ready — brain_log=%s state=%s persist_interval=%ds "
+        "rate_spike_threshold=%d/min",
         brain_log_path, state_path, persist_interval_s, rate_spike_threshold,
     )
 
@@ -240,26 +209,7 @@ def warning_monitor_worker_main(recv_queue, send_queue, name: str,
                     # ── Microkernel v2 Phase B.2.1 — supervision-transfer dispatch ──
                     if _swap.maybe_dispatch_swap_msg(msg):
                         continue
-                    _mt = msg.get("type")
-                    # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ──
-                    if _mt == bus.MODULE_PROBE_REQUEST and _state_writer is not None:
-                        try:
-                            from titan_hcl.core.probe_dispatcher import (
-                                handle_module_probe_request,
-                            )
-                            handle_module_probe_request(
-                                msg,
-                                probe_fn=None,
-                                send_queue=send_queue,
-                                module_name=name,
-                                state_writer=_state_writer,
-                            )
-                        except Exception as _phb_err:  # noqa: BLE001
-                            logger.warning(
-                                "[WarningMonitor] Phase 11 probe handler "
-                                "raised: %s", _phb_err)
-                        continue
-                    if _mt == bus.SILENT_SWALLOW_REPORT:
+                    if msg.get("type") == bus.SILENT_SWALLOW_REPORT:
                         _ingest_swallow_report(aggregated, msg.get("payload") or {})
             except Exception:
                 pass  # queue.Empty or similar — normal
@@ -323,16 +273,11 @@ def warning_monitor_worker_main(recv_queue, send_queue, name: str,
                 _maybe_rotate_events_log(events_path)
                 last_persist = now
 
-            # 4. Heartbeat (bus + Phase 11 SHM)
+            # 4. Heartbeat
             if now - last_heartbeat > heartbeat_interval_s:
                 _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian",
                           {"keys": len(aggregated),
                            "recent_count": len(recent_events)})
-                if _state_writer is not None and _WORKER_READY:
-                    try:
-                        _state_writer.heartbeat()
-                    except Exception:
-                        pass
                 last_heartbeat = now
 
         except Exception as e:

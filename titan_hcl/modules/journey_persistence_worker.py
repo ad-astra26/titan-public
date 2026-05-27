@@ -18,8 +18,7 @@ Bus subscriptions:
              MODULE_SHUTDOWN, SAVE_NOW.
 
 Bus publications:
-  - MODULE_HEARTBEAT / MODULE_SHUTDOWN (standard per §11; legacy MODULE_READY
-    retired per Phase 11 §11.I.2 — SHM slot state=booted is the contract).
+  - MODULE_READY / MODULE_HEARTBEAT / MODULE_SHUTDOWN (standard per §11).
 
 Best-effort delivery: gift events are enrichment + journey-history, NOT
 load-bearing for any tick. Queue overflow → drop oldest (per PLAN
@@ -43,13 +42,6 @@ logger = logging.getLogger(__name__)
 
 _HEARTBEAT_INTERVAL_S = 10.0
 _POLL_INTERVAL_S = 0.2
-
-
-# Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel
-# mirrored to per-process SHM slot via ModuleStateWriter. Set False at
-# import; flipped True after DB connect attempt completes (whether or
-# not the DB connected — worker stays alive in DB-disconnected mode).
-_WORKER_READY: bool = False
 
 _JOURNEY_PERSISTENCE_SUBSCRIBE_TOPICS: list[str] = [
     bus.BODY_BALANCE_GIFT,
@@ -75,9 +67,7 @@ def _send_msg(send_queue, msg_type: str, src: str, dst: str,
         pass
 
 
-def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None,
-                    state_writer: Optional[Any] = None) -> None:
-    """MODULE_HEARTBEAT to guardian_HCL + SHM state-slot heartbeat (Phase 11)."""
+def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None) -> None:
     try:
         import resource
         rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
@@ -87,11 +77,6 @@ def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None,
     if extra:
         payload.update(extra)
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", payload)
-    if state_writer is not None and _WORKER_READY:
-        try:
-            state_writer.heartbeat()
-        except Exception:  # noqa: BLE001 — never crash heartbeat
-            pass
 
 
 def _u8_quantise_seq(values, *, n: int) -> bytes:
@@ -223,33 +208,11 @@ def journey_persistence_worker_main(recv_queue, send_queue, name: str,
     except Exception as _err:
         logger.debug("[JourneyPersistence] pdeathsig install skipped: %s", _err)
 
-    # Phase 11 §11.I.5 (Chunk 11N) — reset module-level readiness sentinel.
-    global _WORKER_READY
-    _WORKER_READY = False
-
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = (
         (config.get("info_banner", {}) or {}).get("titan_id")
         or resolve_titan_id()
     )
-
-    # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21) ──
-    _state_writer = None
-    try:
-        from titan_hcl.core.module_state import (
-            BootPriority,
-            ModuleStateWriter,
-        )
-        _state_writer = ModuleStateWriter(
-            module_name=name,
-            layer="L2",
-            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
-        )
-        _state_writer.write_state("starting")
-    except Exception as _sw_err:  # noqa: BLE001
-        logger.warning(
-            "[JourneyPersistence] Phase 11 ModuleStateWriter init failed "
-            "(continuing — SHM slot disabled): %s", _sw_err)
 
     db_path = config.get("consciousness_db", "./data/consciousness.db")
     db = None
@@ -264,19 +227,10 @@ def journey_persistence_worker_main(recv_queue, send_queue, name: str,
                      "restart to resume persistence.",
                      _err, exc_info=True)
 
-    # ── Phase 11 §11.I.2 — slot transition: starting → booted ─────────
-    # Legacy MODULE_READY bus emit retired per locked D2. The worker
-    # stays alive even when db is None (warned mode), so the slot still
-    # transitions to "booted" — DB-disconnected mode is operational, just
-    # degraded (every gift dropped with WARN).
-    _WORKER_READY = True
-    if _state_writer is not None:
-        try:
-            _state_writer.write_state("booted")
-        except Exception as _swb_err:  # noqa: BLE001
-            logger.warning(
-                "[JourneyPersistence] Phase 11 write_state(booted) failed: %s",
-                _swb_err)
+    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
+        "titan_id": titan_id, "ts": time.time(), "db_path": db_path,
+        "db_connected": db is not None,
+    })
     logger.info("[JourneyPersistence] Booted (titan_id=%s, db=%s)",
                 titan_id, "connected" if db else "disconnected")
 
@@ -292,7 +246,7 @@ def journey_persistence_worker_main(recv_queue, send_queue, name: str,
                 "gifts_persisted": gifts_persisted,
                 "gifts_skipped_schema": gifts_skipped_schema,
                 "gifts_skipped_db": gifts_skipped_db,
-            }, state_writer=_state_writer)
+            })
             last_heartbeat = now
 
         try:
@@ -310,25 +264,6 @@ def journey_persistence_worker_main(recv_queue, send_queue, name: str,
             pass
 
         msg_type = msg.get("type") if isinstance(msg, dict) else None
-
-        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ────────
-        if msg_type == bus.MODULE_PROBE_REQUEST:
-            try:
-                from titan_hcl.core.probe_dispatcher import (
-                    handle_module_probe_request,
-                )
-                handle_module_probe_request(
-                    msg,
-                    probe_fn=None,
-                    send_queue=send_queue,
-                    module_name=name,
-                    state_writer=_state_writer,
-                )
-            except Exception as _probe_err:  # noqa: BLE001
-                logger.warning(
-                    "[JourneyPersistence] MODULE_PROBE_REQUEST handler "
-                    "failed: %s", _probe_err)
-            continue
 
         if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[JourneyPersistence] MODULE_SHUTDOWN received — exiting")

@@ -632,13 +632,13 @@ async def get_v6_readiness(request: Request) -> JSONResponse:
     latency, safe to poll at 1Hz from the Observatory.
     """
     from titan_hcl.core.module_state import ModuleStateReaderBank
-    from titan_hcl.core.state_registry import resolve_shm_root, resolve_titan_id
+    from titan_hcl.core.state_registry import resolve_titan_id
     from titan_hcl.core.titan_hcl_state import TitanHclStateReader
 
     titan_id = resolve_titan_id()
     body: dict[str, object] = {"ok": True}
 
-    # 1. Orchestrator-owned slot (titan_hcl_state.bin).
+    # 1. Orchestrator-owned slot.
     try:
         fleet_reader = TitanHclStateReader(titan_id=titan_id)
         fleet_entry = fleet_reader.read()
@@ -651,93 +651,54 @@ async def get_v6_readiness(request: Request) -> JSONResponse:
     else:
         body["fleet"] = None
 
-    # 2. Per-module SHM slots — G18-aligned discovery: SHM is the source of
-    #    truth (per locked D1 Phase 11 §11.I.5). We discover the module set
-    #    by scanning `/dev/shm/titan_<id>/module_<name>_state.bin` — every
-    #    worker that has booted (state≥"starting") will have its slot
-    #    present. This avoids two failure modes that the prior code hit live:
-    #      (a) `_modules.keys()` via the api-side kernel-RPC proxy raises
-    #          `MethodNotExposed` under Phase 6 D-SPEC-135 process split.
-    #      (b) the manifest-producer fallback included literal placeholder
-    #          strings like `"<each_worker>"` because the manifest registers
-    #          per-route producer columns containing template tokens, not
-    #          a canonical module roster.
-    #
-    #    Workers that haven't booted yet contribute no slot — they're listed
-    #    as `state="not_booted"` via the manifest's discovered producer set,
-    #    minus any placeholder tokens (filtered: angle-bracket names).
-    try:
-        shm_root = resolve_shm_root(titan_id)
-        slot_names: list[str] = []
-        if shm_root.exists():
-            for p in shm_root.glob("module_*_state.bin"):
-                base = p.name
-                # `module_<name>_state.bin` → extract `<name>`
-                if base.startswith("module_") and base.endswith("_state.bin"):
-                    name = base[len("module_"):-len("_state.bin")]
-                    if name:
-                        slot_names.append(name)
-        slot_names_set = set(slot_names)
-    except Exception:  # noqa: BLE001
-        slot_names = []
-        slot_names_set = set()
-
-    # Manifest-derived candidate set for not-yet-booted modules — filter
-    # placeholder tokens (anything containing `<`/`>` is a template literal
-    # like `<each_worker>`, not a real module name).
-    manifest_names: set[str] = set()
-    try:
-        for row in _m.as_rows():
+    # 2. Per-module SHM slots — driven by the live orchestrator's module
+    #    registry when available (avoids returning stale module lists
+    #    after a hot-reload). Falls back to the manifest's discovered
+    #    module set if the orchestrator handle isn't reachable from the
+    #    api process (titan_hcl_api may be a peer per 11E.b.2).
+    # In the Phase 6 (D-SPEC-135) split, `titan_hcl_obj` from
+    # `app.state.titan_hcl` is a thin kernel-RPC proxy in the api
+    # subprocess — accessing `.guardian._modules.keys()` triggers a
+    # MethodNotExposed RPC failure. Wrap in try/except so the route
+    # gracefully falls back to the manifest-derived module set below.
+    module_names: list[str] = []
+    titan_hcl_obj = getattr(request.app.state, "titan_hcl", None)
+    if titan_hcl_obj is not None:
+        try:
+            orch = getattr(titan_hcl_obj, "guardian", None) or getattr(
+                titan_hcl_obj, "orchestrator", None)
+            if orch is not None and hasattr(orch, "_modules"):
+                module_names = sorted(orch._modules.keys())
+        except Exception:  # noqa: BLE001
+            module_names = []
+    if not module_names:
+        # Fallback: derive from the manifest's distinct producer set.
+        rows = _m.as_rows()
+        seen: set[str] = set()
+        for row in rows:
             for prod in row.get("producers") or ():
-                if prod and "<" not in prod and ">" not in prod:
-                    manifest_names.add(prod)
-    except Exception:  # noqa: BLE001
-        pass
-
-    all_module_names: list[str] = sorted(slot_names_set | manifest_names)
+                if prod and prod not in seen:
+                    seen.add(prod)
+        module_names = sorted(seen)
 
     bank = ModuleStateReaderBank(titan_id=titan_id)
     modules_payload: list[dict[str, object]] = []
-    running_count = 0
-    booted_count = 0
-    starting_count = 0
-    unhealthy_count = 0
-    not_booted_count = 0
     try:
-        for name in all_module_names:
-            entry = None
-            if name in slot_names_set:
-                try:
-                    entry = bank.read(name)
-                except Exception:  # noqa: BLE001
-                    entry = None
+        for name in module_names:
+            try:
+                entry = bank.read(name)
+            except Exception:  # noqa: BLE001
+                entry = None
             if entry is None:
-                modules_payload.append({"name": name, "state": "not_booted"})
-                not_booted_count += 1
+                modules_payload.append({"name": name, "state": "unknown"})
             else:
-                payload = entry.as_wire_dict()
-                modules_payload.append(payload)
-                st = str(payload.get("state", ""))
-                if st == "running":
-                    running_count += 1
-                elif st == "booted":
-                    booted_count += 1
-                elif st == "starting":
-                    starting_count += 1
-                elif st in ("unhealthy", "crashed", "disabled"):
-                    unhealthy_count += 1
+                modules_payload.append(entry.as_wire_dict())
     finally:
         bank.close()
     body["modules"] = modules_payload
     body["module_count"] = len(modules_payload)
-    body["module_running_count"] = running_count
-    body["module_state_summary"] = {
-        "running": running_count,
-        "booted": booted_count,
-        "starting": starting_count,
-        "unhealthy_or_crashed": unhealthy_count,
-        "not_booted": not_booted_count,
-    }
+    body["module_running_count"] = sum(
+        1 for m in modules_payload if m.get("state") == "running")
 
     return JSONResponse(body)
 
@@ -762,26 +723,33 @@ async def get_v6_errors(request: Request) -> JSONResponse:
     SHM-direct contract Phase 11 standardizes.
     """
     from titan_hcl.core.module_state import ModuleStateReaderBank
-    from titan_hcl.core.state_registry import resolve_shm_root, resolve_titan_id
+    from titan_hcl.core.state_registry import resolve_titan_id
 
     titan_id = resolve_titan_id()
 
-    # G18-aligned: discover modules via SHM slot scan (same as /v6/readiness
-    # above — single source of truth). Filter manifest-derived candidates
-    # to exclude placeholder template tokens like `<each_worker>`.
-    try:
-        shm_root = resolve_shm_root(titan_id)
-        slot_names: list[str] = []
-        if shm_root.exists():
-            for p in shm_root.glob("module_*_state.bin"):
-                base = p.name
-                if base.startswith("module_") and base.endswith("_state.bin"):
-                    name = base[len("module_"):-len("_state.bin")]
-                    if name:
-                        slot_names.append(name)
-    except Exception:  # noqa: BLE001
-        slot_names = []
-    module_names: list[str] = sorted(set(slot_names))
+    # In the Phase 6 (D-SPEC-135) split, `titan_hcl_obj` from
+    # `app.state.titan_hcl` is a thin kernel-RPC proxy in the api
+    # subprocess — accessing `.guardian._modules.keys()` triggers a
+    # MethodNotExposed RPC failure. Wrap in try/except so the route
+    # gracefully falls back to the manifest-derived module set below.
+    module_names: list[str] = []
+    titan_hcl_obj = getattr(request.app.state, "titan_hcl", None)
+    if titan_hcl_obj is not None:
+        try:
+            orch = getattr(titan_hcl_obj, "guardian", None) or getattr(
+                titan_hcl_obj, "orchestrator", None)
+            if orch is not None and hasattr(orch, "_modules"):
+                module_names = sorted(orch._modules.keys())
+        except Exception:  # noqa: BLE001
+            module_names = []
+    if not module_names:
+        rows = _m.as_rows()
+        seen: set[str] = set()
+        for row in rows:
+            for prod in row.get("producers") or ():
+                if prod and prod not in seen:
+                    seen.add(prod)
+        module_names = sorted(seen)
 
     bank = ModuleStateReaderBank(titan_id=titan_id)
     errors: list[dict[str, object]] = []
