@@ -141,13 +141,6 @@ ACTIVATION_SNAPSHOT_NAME = "activation_snapshot.json"
 # reads MUST go through this snapshot.
 SPINE_SNAPSHOT_NAME = "spine_snapshot.json"
 
-# Phase 5 §P5.I — hypothesis-fork cross-process read surface. Mirrors
-# SPINE_SNAPSHOT_NAME (Phase 4 FU-1) for the same reason: synthesis_worker
-# is the sole writer (INV-Syn-8) to hypothesis_forks DuckDB + HypothesisFork
-# Kuzu nodes; the api process reads this JSON snapshot, never the DBs
-# directly.
-FORKS_SNAPSHOT_NAME = "forks_snapshot.json"
-
 # Phase 1 plug-registry container — instantiated empty; concrete plugs land
 # per phase per arch §3.3.
 _PLUG_KINDS = ("substrate", "truth_oracle", "meaning_oracle", "proof", "tool")
@@ -446,8 +439,6 @@ def _recompute_loop(store: "ActivationStore",
                     snapshot_path: str,
                     bundle_snapshot_path: str,
                     spine_exporter_holder: dict,
-                    fork_exporter_holder: dict,
-                    fork_activation_updater_holder: dict,
                     send_queue, name: str,
                     interval_s: float,
                     stop_event: threading.Event,
@@ -490,25 +481,6 @@ def _recompute_loop(store: "ActivationStore",
                 logger.debug(
                     "[synthesis_worker] spine_exporter call failed: %s",
                     _spine_exp_err,
-                )
-            # Phase 5 §P5.C — push current B_i for every open fork into
-            # hypothesis_forks.activation so find_below_floor() reflects
-            # live activation. The updater is late-bound at fork-store
-            # wire time (default no-op so the loop fires before P5 wiring).
-            try:
-                fork_activation_updater_holder["fn"]()
-            except Exception as _fork_act_err:
-                logger.debug(
-                    "[synthesis_worker] fork_activation_updater call failed: "
-                    "%s", _fork_act_err,
-                )
-            # Phase 5 §P5.I — forks_snapshot.json for cross-process api reads.
-            try:
-                fork_exporter_holder["fn"]()
-            except Exception as _fork_exp_err:
-                logger.debug(
-                    "[synthesis_worker] fork_exporter call failed: %s",
-                    _fork_exp_err,
                 )
             status_writer.publish(
                 last_consistent_event_ts=now,
@@ -602,9 +574,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # Phase 4 FU-1 — Kuzu Concept-spine cross-process read surface.
     spine_snapshot_path = os.path.join(
         os.path.dirname(db_path) or ".", SPINE_SNAPSHOT_NAME)
-    # Phase 5 §P5.I — hypothesis-forks cross-process read surface.
-    forks_snapshot_path = os.path.join(
-        os.path.dirname(db_path) or ".", FORKS_SNAPSHOT_NAME)
 
     # Lock around the in-mem activation cache for the recv-loop ↔
     # recompute-loop interleave. record_access is cheap; the lock holds
@@ -623,17 +592,11 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # no-op so the recompute loop fires safely before the ConceptStore is
     # ready. The consolidation wiring below sets the real exporter.
     spine_exporter_holder: dict = {"fn": lambda: None}
-    # Phase 5 §P5.I — forks exporter + activation updater holders
-    # (same late-bound pattern; HypothesisForkStore wires real callables
-    # once it has been constructed; both default to no-op).
-    fork_exporter_holder: dict = {"fn": lambda: None}
-    fork_activation_updater_holder: dict = {"fn": lambda: None}
 
     rc_thread = threading.Thread(
         target=_recompute_loop,
         args=(store, bundle_store, status_writer, snapshot_path,
               bundle_snapshot_path, spine_exporter_holder,
-              fork_exporter_holder, fork_activation_updater_holder,
               send_queue, name,
               interval_s, stop_event, cache_lock),
         daemon=True, name=f"synthesis-recompute-{name}")
@@ -855,102 +818,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             exc, exc_info=True,
         )
 
-    # ── Phase 5 §P5.A–P5.H — HypothesisForkStore + ForkGC wiring ────────
-    # Constructed AFTER ConceptStore / OuterMemoryWriter are wired so it
-    # can reuse them for graduation paths (INV-10 / INV-Syn-11). Soft-fail
-    # if any dependency is missing: forks become a no-op for the session,
-    # synthesis_worker keeps running.
-    hypothesis_fork_store: Optional[Any] = None
-    fork_gc: Optional[Any] = None
-    try:
-        if (kuzu_graph_obj is None
-                or concept_store is None
-                or 'writer' not in locals()):
-            raise RuntimeError(
-                "missing dependency: kuzu_graph / concept_store / writer "
-                "not wired — hypothesis-fork lifecycle disabled this session"
-            )
-        from titan_hcl.synthesis.hypothesis_fork_store import (
-            HypothesisForkStore,
-        )
-        from titan_hcl.synthesis.fork_gc import ForkGC
-
-        hypothesis_fork_store = HypothesisForkStore(
-            duckdb_conn=store._conn,    # same DuckDB conn as ActivationStore
-            kuzu_graph=kuzu_graph_obj,
-            concept_store=concept_store,
-            outer_memory_writer=writer,
-            activation_store=store,      # ActivationStore from above
-        )
-
-        # Wire forks snapshot exporter into the recompute loop's late-bind
-        # slot — the next 60s tick begins writing forks_snapshot.json.
-        fork_exporter_holder["fn"] = (
-            lambda: hypothesis_fork_store.export_snapshot(forks_snapshot_path)
-        )
-        # Initial export so the snapshot is non-empty/present immediately.
-        try:
-            initial_forks = hypothesis_fork_store.export_snapshot(
-                forks_snapshot_path,
-            )
-            logger.info(
-                "[synthesis_worker] initial forks snapshot exported "
-                "(%d fork rows) → %s",
-                initial_forks, forks_snapshot_path,
-            )
-        except Exception as _initial_fexp_err:
-            logger.warning(
-                "[synthesis_worker] initial forks snapshot failed: %s",
-                _initial_fexp_err,
-            )
-
-        # Wire per-tick fork-activation pusher: for every open fork, look
-        # up its current B_i in the ActivationStore cache and persist via
-        # hypothesis_fork_store.update_activation. Cheap because the open-
-        # fork count is bounded (active probationary set is small —
-        # graduation/abandonment removes them).
-        def _push_fork_activations() -> None:
-            if hypothesis_fork_store is None:
-                return
-            with cache_lock:
-                fork_ids = [
-                    f.fork_id for f in hypothesis_fork_store.list_active()
-                ]
-                bi_map = store.bulk_base_level(
-                    [f"fork:{fid}" for fid in fork_ids]
-                )
-            for fid in fork_ids:
-                bi = bi_map.get(f"fork:{fid}")
-                if bi is None:
-                    continue
-                hypothesis_fork_store.update_activation(fid, bi)
-        fork_activation_updater_holder["fn"] = _push_fork_activations
-
-        fork_gc = ForkGC(
-            fork_store=hypothesis_fork_store,
-            synthesis_duckdb_conn=store._conn,
-            kuzu_graph=kuzu_graph_obj,
-            activation_store=store,
-            memory_db_conn=None,   # Phase 5 v1: synthesis.duckdb scope only
-        )
-        logger.info(
-            "[synthesis_worker] HypothesisForkStore + ForkGC ready — "
-            "DREAM_STATE_CHANGED subscription will trigger nightly sweep",
-        )
-    except Exception as exc:
-        logger.warning(
-            "[synthesis_worker] HypothesisForkStore wiring failed: %s — "
-            "hypothesis-fork lifecycle disabled this session",
-            exc, exc_info=True,
-        )
-
-    # Sweep mode: per Maker decision 2026-05-27 + PLAN §P5.H, first 24h
-    # of T3 soak runs in dry-run. Production behavior is set by the
-    # `phase5.fork_gc_live` config flag (default False; flip after soak).
-    fork_gc_live_mode: bool = bool(
-        (config or {}).get("synthesis", {}).get("fork_gc_live", False)
-    )
-
     def _maybe_run_consolidation_async(dream_start_ts: float) -> None:
         """Fire a ConsolidationPass in a worker thread; never blocks the
         bus loop. Rate-limited by dream window — second DREAM_STATE_CHANGED
@@ -994,48 +861,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
 
         threading.Thread(
             target=_run, name="synthesis-consolidation",
-            daemon=True,
-        ).start()
-
-    # Phase 5 §P5.H — nightly ForkGC sweep, dream-boundary triggered.
-    # Same rate-limit / threading pattern as consolidation: never blocks
-    # the bus loop. Fires AFTER consolidation_pass (sequencing isn't
-    # critical — both are independent — but the consolidation pass may
-    # mark new graduated/abandoned forks that the sweep then handles).
-    last_fork_sweep_started_ts: float = 0.0
-    fork_sweep_lock = threading.Lock()
-
-    def _maybe_run_fork_gc_async(dream_start_ts: float) -> None:
-        nonlocal last_fork_sweep_started_ts
-        if fork_gc is None:
-            return
-        with fork_sweep_lock:
-            if dream_start_ts <= last_fork_sweep_started_ts:
-                logger.debug(
-                    "[synthesis_worker] fork_gc already swept for dream "
-                    "window %.3f — skipping", dream_start_ts,
-                )
-                return
-            last_fork_sweep_started_ts = dream_start_ts
-
-        def _run_sweep():
-            try:
-                report = fork_gc.sweep(dry_run=not fork_gc_live_mode)
-                logger.info(
-                    "[synthesis_worker] fork_gc sweep done — visited=%d "
-                    "pruned=%d skipped=%d dropped=%d dry_run=%s",
-                    report.forks_visited, report.forks_pruned,
-                    report.forks_skipped, report.total_nodes_dropped,
-                    report.dry_run,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[synthesis_worker] fork_gc sweep crashed: %s",
-                    e, exc_info=True,
-                )
-
-        threading.Thread(
-            target=_run_sweep, name="synthesis-fork-gc",
             daemon=True,
         ).start()
 
@@ -1126,11 +951,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         dream_start_ts,
                     )
                     _maybe_run_consolidation_async(dream_start_ts)
-                    # Phase 5 §P5.H — fire the nightly ForkGC sweep on the
-                    # SAME dream-boundary tick. Independent thread; the
-                    # rate-limit inside _maybe_run_fork_gc_async ensures
-                    # at most 1 sweep per dream window.
-                    _maybe_run_fork_gc_async(dream_start_ts)
                 else:
                     logger.debug(
                         "[synthesis_worker] DREAM_STATE_CHANGED dreaming=False "

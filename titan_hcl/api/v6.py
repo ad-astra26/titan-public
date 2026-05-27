@@ -427,22 +427,6 @@ _T = (
      "synthesis", "readout", None, None, (), ("synthesis_worker",), False, None),
     ("/v6/synthesis/concepts/{concept_id}", "GET", "get_v6_synthesis_concept",
      "synthesis", "readout", None, None, (), ("synthesis_worker",), False, None),
-
-    # ── synthesis — Phase 5 §P5.I (D-SPEC-PHASE5 forthcoming) ────────────
-    # Hypothesis-fork lifecycle readouts. Source = data/forks_snapshot.json
-    # (synthesis_worker sole writer per INV-Syn-8). No legacy /v4 path.
-    # /v6/synthesis/forks/tombstones MUST be declared BEFORE the {fork_id}
-    # route so FastAPI's path matcher catches "tombstones" before the
-    # generic parameter route.
-    ("/v6/synthesis/forks", "GET", "get_v6_synthesis_forks", "synthesis",
-     "readout", None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/forks/summary", "GET", "get_v6_synthesis_fork_summary",
-     "synthesis", "readout", None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/forks/tombstones", "GET",
-     "get_v6_synthesis_fork_tombstones", "synthesis", "readout", None, None,
-     (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/forks/{fork_id}", "GET", "get_v6_synthesis_fork",
-     "synthesis", "readout", None, None, (), ("synthesis_worker",), False, None),
 )
 
 
