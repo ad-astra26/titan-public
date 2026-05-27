@@ -25,6 +25,45 @@ from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
+# Phase 11 §11.I.3/§11.I.5 — module-level readiness sentinel; SHM heartbeat
+# is suppressed until the worker has finished in-process scaffolding.
+_WORKER_READY: bool = False
+
+
+def _phase11_hb_loop(send_queue, name: str, stop_event: threading.Event,
+                     state_writer) -> None:
+    """Phase 11 §11.I.5 — bus + SHM heartbeat (boot-window cover).
+
+    Runs alongside the recv-loop's existing 10s `_send_heartbeat` cadence.
+    This loop's sole purpose is to keep the SHM slot's `last_heartbeat` fresh
+    during the ~30-60s memory backend init (FAISS+Kuzu+DuckDB) so guardian's
+    SHM-staleness detector doesn't kill the worker mid-boot. Once init
+    completes and _WORKER_READY flips True, the main loop's heartbeat takes
+    over SHM republishing too — but this loop keeps running harmlessly."""
+    while not stop_event.is_set():
+        try:
+            send_queue.put_nowait({
+                "type": bus.MODULE_HEARTBEAT, "src": name, "dst": "guardian",
+                "payload": {"alive": True, "boot_cover": True},
+                "ts": time.time(),
+            })
+        except Exception:
+            pass
+        if state_writer is not None and _WORKER_READY:
+            try:
+                state_writer.heartbeat()
+            except Exception:
+                pass
+        elif state_writer is not None:
+            # During boot we still want the SHM slot's last_heartbeat refreshed
+            # (state stays "starting"); heartbeat() republishes the current
+            # state value which is "starting" here.
+            try:
+                state_writer.heartbeat()
+            except Exception:
+                pass
+        stop_event.wait(10.0)
+
 
 @with_error_envelope(module_name="memory", subsystem="entry", severity=_phase11_sev.FATAL)
 def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
@@ -45,6 +84,35 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
     logger.info("[MemoryWorker] Initializing TieredMemoryGraph...")
     init_start = time.time()
+
+    global _WORKER_READY
+    _WORKER_READY = False
+
+    # ── Phase 11 §11.I.5 — SHM state-slot writer (G21 per worker) ──
+    # Created BEFORE the slow ~30-60s TieredMemoryGraph init so the slot
+    # publishes state="starting" immediately and the boot-cover heartbeat
+    # thread below keeps last_heartbeat fresh during init.
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import BootPriority, ModuleStateWriter
+        _state_writer = ModuleStateWriter(
+            module_name="memory",
+            layer="L2",
+            boot_priority=BootPriority.MANDATORY,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[MemoryWorker] Phase 11 ModuleStateWriter init failed: %s",
+            _sw_err)
+
+    # Phase 11 boot-cover heartbeat thread (started BEFORE slow init).
+    _phase11_hb_stop = threading.Event()
+    _phase11_hb_thread = threading.Thread(
+        target=_phase11_hb_loop,
+        args=(send_queue, name, _phase11_hb_stop, _state_writer),
+        daemon=True, name=f"memory-phase11-hb-{name}")
+    _phase11_hb_thread.start()
 
     # Synthesis Engine Phase 1 (D-SPEC-123 / SPEC v1.56.0 §25): inject a
     # bus_emit callable so TieredMemoryGraph._cognee_search can emit
@@ -83,8 +151,8 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                              max_retries, e, exc_info=True)
                 sys.exit(1)  # non-zero exit so Guardian knows this was a failure
 
-    # Signal ready
-    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
+    # Phase 11 §11.I.2 — MODULE_READY bus-emit deleted per locked D2.
+    # The SHM slot state=booted transition below is the contract now.
 
     # Main message loop with async support
     import asyncio
@@ -97,6 +165,20 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         logger.info("[MemoryWorker] Memory backend initialized: %s", "ready" if backend_ok else "unavailable")
     except Exception as e:
         logger.warning("[MemoryWorker] Memory backend init failed: %s", e)
+
+    # Phase 11 §11.I.2 — slot transition: starting → booted (in-process
+    # scaffolding complete, backend init attempted).
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+            logger.info(
+                "[MemoryWorker] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[MemoryWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
 
     last_heartbeat = time.time()
     last_status_publish = 0.0
@@ -494,6 +576,25 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
         msg_type = msg.get("type", "")
 
+        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────
+        if msg_type == bus.MODULE_PROBE_REQUEST and _state_writer is not None:
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg,
+                    probe_fn=None,  # trivial pass-through per §11.I.2
+                    send_queue=send_queue,
+                    module_name=name,
+                    state_writer=_state_writer,
+                )
+            except Exception as _phb_err:  # noqa: BLE001
+                logger.warning(
+                    "[MemoryWorker] Phase 11 probe handler raised: %s",
+                    _phb_err)
+            continue
+
         # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────────
         if _b1_reporter.handles(msg_type):
             _b1_reporter.handle(msg)
@@ -571,6 +672,7 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     logger.info("[MemoryWorker] Exiting — router shutdown starting")
     router.shutdown(timeout=5.0)
     _periodic_stop.set()
+    _phase11_hb_stop.set()
     loop.close()
     logger.info("[MemoryWorker] Exit complete")
 

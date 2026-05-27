@@ -34,6 +34,11 @@ logger = logging.getLogger(__name__)
 _HEARTBEAT_INTERVAL_S = 10.0
 _POLL_INTERVAL_S = 0.2
 
+
+# Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel
+# mirrored to per-process SHM slot via ModuleStateWriter.
+_WORKER_READY: bool = False
+
 _CORRECTIVE_PERSISTENCE_SUBSCRIBE_TOPICS: list[str] = [
     bus.EXTREME_IMBALANCE_DETECTED,
     bus.CORRECTIVE_NUDGE,
@@ -53,7 +58,9 @@ def _send_msg(send_queue, msg_type: str, src: str, dst: str,
         pass
 
 
-def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None) -> None:
+def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None,
+                    state_writer: Optional[Any] = None) -> None:
+    """MODULE_HEARTBEAT + Phase 11 SHM state-slot heartbeat."""
     try:
         import resource
         rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
@@ -63,6 +70,11 @@ def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None) -> None
     if extra:
         payload.update(extra)
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", payload)
+    if state_writer is not None and _WORKER_READY:
+        try:
+            state_writer.heartbeat()
+        except Exception:  # noqa: BLE001 — never crash heartbeat
+            pass
 
 
 def _decode_extreme(msg: dict) -> Optional[Dict[str, Any]]:
@@ -144,11 +156,33 @@ def corrective_events_persistence_worker_main(recv_queue, send_queue, name: str,
     except Exception as _err:
         logger.debug("[CorrectiveEventsPersistence] pdeathsig skipped: %s", _err)
 
+    # Phase 11 §11.I.5 (Chunk 11N) — reset module-level readiness sentinel.
+    global _WORKER_READY
+    _WORKER_READY = False
+
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = (
         (config.get("info_banner", {}) or {}).get("titan_id")
         or resolve_titan_id()
     )
+
+    # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21) ──
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority,
+            ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name=name,
+            layer="L2",
+            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[CorrectiveEventsPersistence] Phase 11 ModuleStateWriter init "
+            "failed (continuing — SHM slot disabled): %s", _sw_err)
 
     db_path = config.get("consciousness_db", "./data/consciousness.db")
     db = None
@@ -161,10 +195,16 @@ def corrective_events_persistence_worker_main(recv_queue, send_queue, name: str,
                      "events dropped (warned). Fix + restart to resume.",
                      _err, exc_info=True)
 
-    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
-        "titan_id": titan_id, "ts": time.time(), "db_path": db_path,
-        "db_connected": db is not None,
-    })
+    # ── Phase 11 §11.I.2 — slot transition: starting → booted ─────────
+    # Legacy MODULE_READY bus emit retired per locked D2.
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[CorrectiveEventsPersistence] Phase 11 write_state(booted) "
+                "failed: %s", _swb_err)
     logger.info("[CorrectiveEventsPersistence] Booted (titan_id=%s, db=%s)",
                 titan_id, "connected" if db else "disconnected")
 
@@ -184,7 +224,7 @@ def corrective_events_persistence_worker_main(recv_queue, send_queue, name: str,
                 "nudges_orphan": nudges_orphan,
                 "schema_skipped": schema_skipped,
                 "db_skipped": db_skipped,
-            })
+            }, state_writer=_state_writer)
             last_heartbeat = now
 
         try:
@@ -202,6 +242,25 @@ def corrective_events_persistence_worker_main(recv_queue, send_queue, name: str,
             pass
 
         msg_type = msg.get("type") if isinstance(msg, dict) else None
+
+        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ────────
+        if msg_type == bus.MODULE_PROBE_REQUEST:
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg,
+                    probe_fn=None,
+                    send_queue=send_queue,
+                    module_name=name,
+                    state_writer=_state_writer,
+                )
+            except Exception as _probe_err:  # noqa: BLE001
+                logger.warning(
+                    "[CorrectiveEventsPersistence] MODULE_PROBE_REQUEST "
+                    "handler failed: %s", _probe_err)
+            continue
 
         if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[CorrectiveEventsPersistence] MODULE_SHUTDOWN — exiting")

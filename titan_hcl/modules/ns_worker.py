@@ -678,6 +678,13 @@ def _handle_action_result(
         logger.warning("[NSWorker] ACTION_RESULT handling failed: %s", e)
 
 
+# Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel.
+# Flipped True after NeuralNervousSystem + (optional) IMPULSE pipeline init
+# complete. Gates SHM-slot heartbeat so titan_hcl's 1Hz poll sees real
+# liveness rather than the boot-time "subscribed-but-not-warm" lie.
+_WORKER_READY: bool = False
+
+
 @with_error_envelope(module_name="ns_module", subsystem="entry", severity=_phase11_sev.FATAL)
 def ns_worker_main(
     recv_queue,
@@ -694,10 +701,36 @@ def ns_worker_main(
         config: full config dict — used for titan_id, neural_nervous_system
             config, and the microkernel.shm_ns_enabled flag.
     """
+    # Phase 11 §11.I.5 (Chunk 11N) — readiness flag reset per entry.
+    global _WORKER_READY
+    _WORKER_READY = False
+
     project_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", ".."))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
+
+    # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21 per worker) ──
+    # Constructed BEFORE slow NeuralNervousSystem init so the slot publishes
+    # state="starting" immediately. In-loop heartbeat (below) calls
+    # _state_writer.heartbeat() each cycle so guardian_hcl's staleness
+    # detector doesn't kill mid-boot.
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority,
+            ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name="ns_module",
+            layer="L2",
+            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[NSWorker] Phase 11 ModuleStateWriter init failed "
+            "(continuing on legacy path): %s", _sw_err)
 
     full_config = config or {}
     # rFP_trinity_130d_phase2_5_closure §4 (2026-05-08): use canonical
@@ -759,14 +792,20 @@ def ns_worker_main(
     last_urgencies: dict[str, float] = {n: 0.0 for n in NS_PROGRAM_NAMES}
 
     boot_ts = time.time()
-    try:
-        send_queue.put({
-            "type": bus.MODULE_READY, "src": name, "dst": "guardian",
-            "payload": {"titan_id": titan_id, "ts": boot_ts},
-            "ts": boot_ts,
-        })
-    except Exception:
-        pass
+    # Phase 11 §11.I.2 — slot transition: starting → booted (D-SPEC-141 / v1.65.0).
+    # MODULE_READY bus emit DELETED per locked D2 (no shim, no dual-publish).
+    # SHM slot is the contract; titan_hcl's 1Hz poll detects "booted" and
+    # dispatches MODULE_PROBE_REQUEST → handler below transitions slot to "running".
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+            logger.info(
+                "[NSWorker] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[NSWorker] Phase 11 write_state(booted) failed: %s", _swb_err)
     if hasattr(bus, "NS_READY"):
         try:
             send_queue.put({
@@ -843,6 +882,12 @@ def ns_worker_main(
                 })
             except Exception:
                 pass
+            # Phase 11 §11.I.5 — SHM-slot heartbeat sidecar.
+            if _state_writer is not None and _WORKER_READY:
+                try:
+                    _state_writer.heartbeat()
+                except Exception:  # noqa: BLE001
+                    pass
             last_heartbeat_ts = now
 
         try:
@@ -853,6 +898,25 @@ def ns_worker_main(
             continue
 
         msg_type = msg.get("type")
+
+        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────────
+        if msg_type == bus.MODULE_PROBE_REQUEST and _state_writer is not None:
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg,
+                    probe_fn=None,
+                    send_queue=send_queue,
+                    module_name=name,
+                    state_writer=_state_writer,
+                )
+            except Exception as _probe_err:  # noqa: BLE001
+                logger.warning(
+                    "[NSWorker] MODULE_PROBE_REQUEST handler failed: %s",
+                    _probe_err)
+            continue
 
         try:
             from titan_hcl.core import worker_swap_handler as _swap

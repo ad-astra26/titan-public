@@ -472,6 +472,13 @@ def _drive_evaluate_all(
 # ── Main entry ────────────────────────────────────────────────────────
 
 
+# Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel.
+# Flipped True after ExpressionManager + HormonalShmReader + state publisher
+# init complete. Gates SHM-slot heartbeat so titan_hcl's 1Hz poll sees real
+# liveness rather than the boot-time "subscribed-but-not-warm" lie.
+_WORKER_READY: bool = False
+
+
 @with_error_envelope(module_name="expression_worker", subsystem="entry", severity=_phase11_sev.FATAL)
 def expression_worker_main(recv_queue, send_queue, name: str,
                            config: dict) -> None:
@@ -485,11 +492,37 @@ def expression_worker_main(recv_queue, send_queue, name: str,
     + EXPRESSION_COMPOSITES_UPDATED at 5s coalesced + composite ledger to
     expression_composites_state.bin at 1 Hz.
     """
+    # Phase 11 §11.I.5 (Chunk 11N) — readiness flag reset per entry.
+    global _WORKER_READY
+    _WORKER_READY = False
+
     # === BOILERPLATE: spawn-mode sys.path bootstrap ===
     project_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", ".."))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
+
+    # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21 per worker) ──
+    # Constructed BEFORE slow ExpressionManager + HormonalShmReader init so
+    # the slot publishes state="starting" immediately. Periodic + heartbeat
+    # paths republish state_writer.heartbeat() so guardian_hcl staleness
+    # detector survives the boot window.
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority,
+            ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name="expression_worker",
+            layer="L2",
+            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[ExpressionWorker] Phase 11 ModuleStateWriter init failed "
+            "(continuing on legacy path): %s", _sw_err)
 
     # Build subscribe-topics list, conditionally adding optionals if the
     # bus.py constants exist (forward-compat per template).
@@ -589,10 +622,21 @@ def expression_worker_main(recv_queue, send_queue, name: str,
     # arrived yet (cold start) — publisher falls back to defaults.
     _translator_stats_cache: dict | None = None
 
-    # MODULE_READY + EXPRESSION_WORKER_READY (informational).
-    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
-        "titan_id": titan_id, "ts": boot_ts,
-    })
+    # Phase 11 §11.I.2 — slot transition: starting → booted (D-SPEC-141 / v1.65.0).
+    # MODULE_READY bus emit DELETED per locked D2 (no shim, no dual-publish).
+    # EXPRESSION_WORKER_READY remains as a peer-broadcast (not a guardian
+    # readiness probe — informational only).
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+            logger.info(
+                "[ExpressionWorker] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[ExpressionWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
     if hasattr(bus, "EXPRESSION_WORKER_READY"):
         _send_msg(send_queue, bus.EXPRESSION_WORKER_READY, name, "all", {
             "titan_id": titan_id, "ts": boot_ts,
@@ -701,6 +745,12 @@ def expression_worker_main(recv_queue, send_queue, name: str,
         now = time.time()
         if now - last_heartbeat > _HEARTBEAT_INTERVAL_S:
             _send_heartbeat(send_queue, name)
+            # Phase 11 §11.I.5 — SHM-slot heartbeat sidecar.
+            if _state_writer is not None and _WORKER_READY:
+                try:
+                    _state_writer.heartbeat()
+                except Exception:  # noqa: BLE001
+                    pass
             last_heartbeat = now
 
         try:
@@ -710,6 +760,27 @@ def expression_worker_main(recv_queue, send_queue, name: str,
         except (KeyboardInterrupt, SystemExit):
             break
 
+        msg_type = msg.get("type", "")
+
+        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────────
+        if msg_type == bus.MODULE_PROBE_REQUEST and _state_writer is not None:
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg,
+                    probe_fn=None,
+                    send_queue=send_queue,
+                    module_name=name,
+                    state_writer=_state_writer,
+                )
+            except Exception as _probe_err:  # noqa: BLE001
+                logger.warning(
+                    "[ExpressionWorker] MODULE_PROBE_REQUEST handler failed: %s",
+                    _probe_err)
+            continue
+
         # B.2.1 supervision-transfer dispatch (boilerplate).
         try:
             from titan_hcl.core import worker_swap_handler as _swap
@@ -717,8 +788,6 @@ def expression_worker_main(recv_queue, send_queue, name: str,
                 continue
         except Exception:
             pass
-
-        msg_type = msg.get("type", "")
 
         if msg_type == bus.MODULE_SHUTDOWN:
             logger.info(

@@ -39,7 +39,7 @@ Bus subscriptions (REQUIRED):
 
 Bus publications (all non-blocking per §8.0.ter D-SPEC-48):
   • MODULE_HEARTBEAT (every 30s)
-  • MODULE_READY (on first state load complete)
+  • (MODULE_READY retired Phase 11 §11.I.2 — SHM slot state=booted is the contract)
 
 Persisted state: data/sovereignty_state.json (atomic-write via temp+rename
 per §11.H.2; schema unchanged from pre-carve).
@@ -70,7 +70,7 @@ from typing import Any, Optional
 
 from titan_hcl.bus import (
     MODULE_HEARTBEAT,
-    MODULE_READY,
+    MODULE_PROBE_REQUEST,
     MODULE_SHUTDOWN,
     SOVEREIGNTY_CONFIRM_MAKER,
     SOVEREIGNTY_EPOCH,
@@ -87,6 +87,11 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL_S = 30.0
 CRITERIA_SNAPSHOT_EVERY_N_EPOCHS = 100  # every ~1000 actual epochs (10:1 sampled)
 
+# Phase 11 §11.I.3/§11.I.5 — module-level readiness sentinel consumed by
+# this worker's heartbeat thread (SHM heartbeat is suppressed until the
+# worker has finished in-process scaffolding).
+_WORKER_READY: bool = False
+
 
 def _send(send_queue, msg_type: str, src: str, dst: str,
           payload: dict, rid: Optional[str] = None) -> None:
@@ -100,10 +105,20 @@ def _send(send_queue, msg_type: str, src: str, dst: str,
             msg_type, dst, e)
 
 
-def _heartbeat_loop(send_queue, name: str, stop_event: threading.Event) -> None:
-    """Daemon thread — MODULE_HEARTBEAT every 30s."""
+def _heartbeat_loop(send_queue, name: str, stop_event: threading.Event,
+                    state_writer: Optional[Any] = None) -> None:
+    """Phase 11 §11.I.5 — bus MODULE_HEARTBEAT + SHM state-slot heartbeat.
+
+    Bus heartbeat fires always (legacy Guardian path load-bears during boot).
+    SHM heartbeat is suppressed until _WORKER_READY is True so the slot stays
+    at state="starting"/"booted" until the worker is actually serving."""
     while not stop_event.is_set():
         _send(send_queue, MODULE_HEARTBEAT, name, "guardian", {})
+        if state_writer is not None and _WORKER_READY:
+            try:
+                state_writer.heartbeat()
+            except Exception:
+                pass
         stop_event.wait(HEARTBEAT_INTERVAL_S)
 
 
@@ -116,7 +131,7 @@ def sovereignty_worker_main(recv_queue, send_queue, name: str,
       1. Instantiate SovereigntyTracker (loads data/sovereignty_state.json
          if present; sub-µs cold-bootstrap if not)
       2. Start heartbeat thread (daemon, 30s cadence)
-      3. Emit MODULE_READY (tracker is now consuming bus events)
+      3. Write SHM slot state=booted (Phase 11 §11.I.2 — MODULE_READY retired)
       4. Main loop: drain recv_queue, dispatch by msg_type:
            - SOVEREIGNTY_EPOCH                 → tracker.record_epoch(...)
            - SOVEREIGNTY_CONFIRM_MAKER         → tracker.confirm_maker()
@@ -127,6 +142,35 @@ def sovereignty_worker_main(recv_queue, send_queue, name: str,
         "[SovereigntyWorker] booting — name=%s "
         "(SPEC v1.8.3 §9.B / D-SPEC-57 / rFP §4.L)", name)
 
+    global _WORKER_READY
+    _WORKER_READY = False
+
+    # ── Phase 11 §11.I.5 — SHM state-slot writer (G21 per worker) ──
+    # Created BEFORE the slow init so the slot publishes state="starting"
+    # immediately and heartbeats keep last_heartbeat fresh during boot.
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import BootPriority, ModuleStateWriter
+        _state_writer = ModuleStateWriter(
+            module_name="sovereignty",
+            layer="L2",
+            boot_priority=BootPriority.MANDATORY,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[SovereigntyWorker] Phase 11 ModuleStateWriter init failed: %s",
+            _sw_err)
+
+    # Heartbeat thread — started BEFORE slow init so SHM `last_heartbeat`
+    # stays fresh during boot (SHM publish gated by _WORKER_READY).
+    stop_event = threading.Event()
+    hb_thread = threading.Thread(
+        target=_heartbeat_loop,
+        args=(send_queue, name, stop_event, _state_writer),
+        daemon=True, name=f"sovereignty-hb-{name}")
+    hb_thread.start()
+
     tracker = SovereigntyTracker()
     logger.info(
         "[SovereigntyWorker] tracker loaded — mode=%s great_cycle=%d "
@@ -135,23 +179,18 @@ def sovereignty_worker_main(recv_queue, send_queue, name: str,
         tracker._total_great_pulses, tracker._developmental_age,
         tracker._maker_confirmed)
 
-    # Heartbeat thread.
-    stop_event = threading.Event()
-    hb_thread = threading.Thread(
-        target=_heartbeat_loop, args=(send_queue, name, stop_event),
-        daemon=True, name=f"sovereignty-hb-{name}")
-    hb_thread.start()
-
-    _send(send_queue, MODULE_READY, name, "guardian", {
-        "module": "sovereignty_worker",
-        "version": "1.8.3",
-        "spec_ref": "D-SPEC-57",
-        "sovereignty_mode": tracker._sovereignty_mode,
-        "great_cycle": tracker._great_cycle,
-    })
-    logger.info(
-        "[SovereigntyWorker] MODULE_READY emitted — accepting "
-        "SOVEREIGNTY_EPOCH / CONFIRM_MAKER / INCREMENT_GREAT_CYCLE")
+    # Phase 11 §11.I.2 — slot transition: starting → booted.
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+            logger.info(
+                "[SovereigntyWorker] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[SovereigntyWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
 
     # Counters for heartbeat observability.
     epoch_count = 0
@@ -172,6 +211,25 @@ def sovereignty_worker_main(recv_queue, send_queue, name: str,
             payload = msg.get("payload", {}) if isinstance(msg, dict) else {}
             if not isinstance(payload, dict):
                 payload = {}
+
+            # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────
+            if msg_type == MODULE_PROBE_REQUEST and _state_writer is not None:
+                try:
+                    from titan_hcl.core.probe_dispatcher import (
+                        handle_module_probe_request,
+                    )
+                    handle_module_probe_request(
+                        msg,
+                        probe_fn=None,  # trivial pass-through per §11.I.2
+                        send_queue=send_queue,
+                        module_name=name,
+                        state_writer=_state_writer,
+                    )
+                except Exception as _phb_err:  # noqa: BLE001
+                    logger.warning(
+                        "[SovereigntyWorker] Phase 11 probe handler raised: %s",
+                        _phb_err)
+                continue
 
             if msg_type == SOVEREIGNTY_EPOCH:
                 # Payload schema (spirit_worker.py:3845-3851):

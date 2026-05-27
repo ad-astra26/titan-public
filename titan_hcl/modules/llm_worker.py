@@ -18,6 +18,14 @@ from titan_hcl.errors import Severity as _phase11_sev
 logger = logging.getLogger(__name__)
 
 
+# Phase 11 §11.I.3/§11.I.5 — module-level readiness sentinel mirrored to
+# `module_llm_state.bin` via ModuleStateWriter so titan_hcl's 1Hz SHM
+# poll + the orchestrator's MODULE_PROBE_REQUEST dispatcher see real
+# liveness. Flipped True only after the inference provider construct
+# completes.
+_WORKER_READY: bool = False
+
+
 @with_error_envelope(module_name="llm", subsystem="entry", severity=_phase11_sev.FATAL)
 def llm_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """
@@ -31,12 +39,35 @@ def llm_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """
     from queue import Empty
 
+    # Phase 11 §11.I.5 — reset module-level readiness flag.
+    global _WORKER_READY
+    _WORKER_READY = False
+
     project_root = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
     logger.info("[LLMWorker] Initializing inference subsystem...")
     init_start = time.time()
+
+    # ── Phase 11 §11.I.5 — SHM state-slot writer (G21 single-writer) ──
+    # Constructed BEFORE inference-provider init so the slot publishes
+    # state="starting" immediately. The heartbeat thread below publishes
+    # state_writer.heartbeat() once _WORKER_READY flips True.
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority, ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name=name, layer="L3",
+            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[LLMWorker] Phase 11 ModuleStateWriter init failed "
+            "(continuing — SHM slot will be absent): %s", _sw_err)
 
     # D-SPEC-72 (SPEC v1.17.0 §9.F.1) — construct via canonical
     # provider abstraction. `titan_hcl/utils/ollama_cloud.py` was
@@ -89,8 +120,19 @@ def llm_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             "api_subprocess will read cold-boot stubs from llm_state",
             _err)
 
-    # Signal ready
-    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
+    # ── Phase 11 §11.I.2 — SHM slot transition starting → booted ─────
+    # MODULE_READY bus emit DELETED per D-SPEC-141 / v1.65.0 locked D2.
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+            logger.info(
+                "[LLMWorker] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[LLMWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
 
     import asyncio
     loop = asyncio.new_event_loop()
@@ -101,6 +143,11 @@ def llm_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     _hb_stop = threading.Event()
 
     def _heartbeat_loop():
+        """Phase 11 §11.I.5: bus MODULE_HEARTBEAT + SHM state_writer
+        heartbeat run on the same 30s cadence so guardian_hcl's SHM-
+        staleness detector + observatory /v6/readiness see fresh data
+        while the inference provider's per-request latency may exceed
+        the heartbeat interval."""
         while not _hb_stop.is_set():
             _send_heartbeat(send_queue, name)
             # Phase A.4 — refresh llm_state.bin every heartbeat (30s) so
@@ -109,6 +156,12 @@ def llm_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 try:
                     llm_state_publisher.publish(dict(llm_stats))
                 except Exception:
+                    pass
+            # Phase 11 §11.I.5 — SHM slot heartbeat sidecar.
+            if _state_writer is not None and _WORKER_READY:
+                try:
+                    _state_writer.heartbeat()
+                except Exception:  # noqa: BLE001 — never crash heartbeat
                     pass
             _hb_stop.wait(30.0)
 
@@ -145,6 +198,22 @@ def llm_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         # ── Microkernel v2 Phase B.2.1 — supervision-transfer dispatch ──
         from titan_hcl.core import worker_swap_handler as _swap
         if _swap.maybe_dispatch_swap_msg(msg):
+            continue
+
+        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────────
+        if msg_type == "MODULE_PROBE_REQUEST":
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg, send_queue=send_queue, module_name=name,
+                    state_writer=_state_writer, probe_fn=None,
+                )
+            except Exception as _probe_err:  # noqa: BLE001
+                logger.warning(
+                    "[LLMWorker] MODULE_PROBE_REQUEST handler failed: %s",
+                    _probe_err)
             continue
 
         if msg_type == bus.MODULE_SHUTDOWN:

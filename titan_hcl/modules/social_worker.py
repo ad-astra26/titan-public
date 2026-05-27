@@ -10,7 +10,8 @@ X-posting code (SocialXGateway boot + ArchetypeDispatcher + SocialPressureMeter
 ACTIVE UNDER: ``microkernel.social_worker_enabled = true`` ONLY.
 Under the flag = false, the legacy ``spirit_worker`` (or its slim shim) owns
 the X-posting code path per Maker D3(b) parity discipline. social_worker exits
-early (after MODULE_READY) so no double-poster work runs simultaneously.
+early (Phase 11: after SHM slot=booted; legacy boot-signal emit deleted per
+locked D2 / no-shim policy) so no double-poster work runs simultaneously.
 
 Owns (after chunks 9B-9F land):
   - ``SocialXGateway`` (X/Twitter posting; `titan_hcl/logic/social_x_gateway.py`)
@@ -106,7 +107,16 @@ _SOCIAL_WORKER_SUBSCRIBE_TOPICS = [
     # preserves SOLE-sanctioned-X-path — health_monitor never instantiates
     # a second SocialXGateway in its own process.
     bus.HEAL_REQUEST,
+    # Phase 11 §11.I.3 probe handler.
+    bus.MODULE_PROBE_REQUEST,
 ]
+
+
+# Phase 11 §11.I.5 (Chunk 11N) — module-level readiness sentinel; gates
+# SHM-slot heartbeat() (legacy bus heartbeat fires unconditionally for
+# the boot window so guardian_HCL's stale-heartbeat detector doesn't
+# kill a slow boot).
+_WORKER_READY: bool = False
 
 
 @with_error_envelope(module_name="social_worker", subsystem="entry", severity=_phase11_sev.FATAL)
@@ -143,8 +153,31 @@ def social_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     except Exception as _err:
         logger.debug("[SocialWorker] pdeathsig install skipped: %s", _err)
 
+    global _WORKER_READY
+    _WORKER_READY = False
+
     titan_id = resolve_titan_id()
     boot_ts = time.time()
+
+    # ── Phase 11 §11.I.5 (Chunk 11N) — SHM state-slot writer ──
+    # Constructed BEFORE flag-resolution + slow gateway init so the slot
+    # publishes state="starting" immediately.
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority,
+            ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name=name,
+            layer="L2",
+            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[SocialWorker] Phase 11 ModuleStateWriter init failed: %s",
+            _sw_err)
 
     # === Flag-gated activation ===
     # Under social_worker_enabled=false: spirit_worker (or its slim shim) owns
@@ -157,11 +190,15 @@ def social_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             "[SocialWorker] microkernel.social_worker_enabled=false — "
             "legacy spirit_worker owns X-posting in this mode. "
             "Entering heartbeat-only no-op loop.")
-        _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
-            "titan_id": titan_id, "ts": boot_ts, "flag_off_noop": True,
-            "chunk": "9A",
-        })
-        _heartbeat_loop(recv_queue, send_queue, name, flag_off=True)
+        # Phase 11 §11.I.2 — slot=booted (legacy boot-signal emit deleted).
+        _WORKER_READY = True
+        if _state_writer is not None:
+            try:
+                _state_writer.write_state("booted")
+            except Exception:  # noqa: BLE001
+                pass
+        _heartbeat_loop(recv_queue, send_queue, name, flag_off=True,
+                        state_writer=_state_writer)
         return
 
     logger.info(
@@ -190,11 +227,16 @@ def social_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         canonical_poller, titan_id,
     )
 
-    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
-        "titan_id": titan_id, "ts": boot_ts,
-        "chunk": "9E",
-        "is_canonical_poller": is_canonical_poller,
-    })
+    # ── Phase 11 §11.I.2 — slot transition: starting → booted ──
+    # (legacy boot-signal bus emit deleted per locked D2 / no-shim policy)
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[SocialWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
 
     # === SHM state publisher (chunk 9E) ===
     # 1Hz daemon thread writing social_x_state.bin per G21 single-writer rule.
@@ -217,7 +259,8 @@ def social_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         is_canonical_poller=is_canonical_poller)
 
     # === Main loop with bus dispatcher (chunks 9A skeleton + 9D dispatcher) ===
-    _main_loop(recv_queue, send_queue, name, state_refs, config)
+    _main_loop(recv_queue, send_queue, name, state_refs, config,
+               state_writer=_state_writer)
 
 
 def _init_post_dispatch_orchestrator(state_refs: dict, name: str,
@@ -304,7 +347,8 @@ def _start_state_publisher(state_refs: dict, titan_id: str) -> None:
                 "(slot=social_x_state, 1Hz)")
 
 
-def _heartbeat_loop(recv_queue, send_queue, name: str, *, flag_off: bool) -> None:
+def _heartbeat_loop(recv_queue, send_queue, name: str, *, flag_off: bool,
+                    state_writer: object | None = None) -> None:
     """Heartbeat-only main loop — handles MODULE_SHUTDOWN cleanly. Used under
     flag-false (no-op mode). Chunk 9A scope."""
     last_heartbeat = 0.0
@@ -315,20 +359,39 @@ def _heartbeat_loop(recv_queue, send_queue, name: str, *, flag_off: bool) -> Non
         if now - last_heartbeat >= _HEARTBEAT_INTERVAL_S:
             _send_heartbeat(send_queue, name, extra={
                 "flag_off": flag_off, "chunk": "9A",
-            })
+            }, state_writer=state_writer)
             last_heartbeat = now
         try:
             msg = recv_queue.get(timeout=_POLL_INTERVAL_S)
         except Empty:
             continue
         msg_type = msg.get("type") if isinstance(msg, dict) else None
+        # Phase 11 §11.I.3 probe handler (flag-off branch).
+        if msg_type == bus.MODULE_PROBE_REQUEST and state_writer is not None:
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg,
+                    probe_fn=None,
+                    send_queue=send_queue,
+                    module_name=name,
+                    state_writer=state_writer,
+                )
+            except Exception as _probe_err:  # noqa: BLE001
+                logger.warning(
+                    "[SocialWorker] MODULE_PROBE_REQUEST handler failed: %s",
+                    _probe_err)
+            continue
         if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[SocialWorker] MODULE_SHUTDOWN received — exiting.")
             shutdown_requested = True
 
 
 def _main_loop(recv_queue, send_queue, name: str, state_refs: dict,
-               config: dict | None = None) -> None:
+               config: dict | None = None,
+               state_writer: object | None = None) -> None:
     """Active main loop with bus dispatcher. Chunk 9D adds catalyst event
     handling. Chunks 9F/9N/9O extend with publishers + polling subscribers.
     Chunk 9G/9H consume archetype dispatch + Observatory state.
@@ -391,7 +454,7 @@ def _main_loop(recv_queue, send_queue, name: str, state_refs: dict,
                 "gateway_alive": state_refs.get("social_x_gateway") is not None,
                 "meter_alive": meter is not None,
                 "orchestrator_alive": orchestrator is not None,
-            })
+            }, state_writer=state_writer)
             last_heartbeat = now
 
         # Post-dispatch tick — chunk 9Q. Inline-runs the migrated
@@ -454,6 +517,24 @@ def _main_loop(recv_queue, send_queue, name: str, state_refs: dict,
             continue
 
         msg_type = msg.get("type") if isinstance(msg, dict) else None
+        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ──
+        if msg_type == bus.MODULE_PROBE_REQUEST and state_writer is not None:
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg,
+                    probe_fn=None,
+                    send_queue=send_queue,
+                    module_name=name,
+                    state_writer=state_writer,
+                )
+            except Exception as _probe_err:  # noqa: BLE001
+                logger.warning(
+                    "[SocialWorker] MODULE_PROBE_REQUEST handler failed: %s",
+                    _probe_err)
+            continue
         if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[SocialWorker] MODULE_SHUTDOWN received — exiting.")
             shutdown_requested = True
@@ -866,12 +947,22 @@ def _send_msg(send_queue, msg_type: str, src: str, dst: str,
         logger.debug("[SocialWorker] _send_msg(%s) failed: %s", msg_type, _err)
 
 
-def _send_heartbeat(send_queue, name: str, extra: dict | None = None) -> None:
-    """Emit MODULE_HEARTBEAT for guardian liveness."""
+def _send_heartbeat(send_queue, name: str, extra: dict | None = None,
+                    state_writer: object | None = None) -> None:
+    """Emit MODULE_HEARTBEAT for guardian liveness.
+
+    Phase 11 §11.I.5: also publishes state_writer.heartbeat() on the SHM
+    slot once _WORKER_READY is True. SHM writes are best-effort.
+    """
     payload = {"ts": time.time()}
     if extra:
         payload.update(extra)
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", payload)
+    if state_writer is not None and _WORKER_READY:
+        try:
+            state_writer.heartbeat()
+        except Exception:  # noqa: BLE001 — never crash the heartbeat
+            pass
 
 
 # ── SPEC v1.12.0 §9.B health_monitor_worker — D-SPEC-67 HEAL_REQUEST handler ──

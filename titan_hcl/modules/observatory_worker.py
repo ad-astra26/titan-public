@@ -43,7 +43,7 @@ Bus subscriptions (broadcast_topics on ModuleSpec):
 Bus publications (non-blocking per §8.0.ter D-SPEC-48):
   • OBSERVATORY_EVENT (dst="api") — per translated event
   • MODULE_HEARTBEAT (every 30s)
-  • MODULE_READY (on boot, after ShmReaderBank + ObservatoryDB construct)
+  • (MODULE_READY retired Phase 11 §11.I.2 — SHM slot state=booted is the contract)
 
 Persisted state: none in SHM (writes go to ObservatoryDB via observatory_writer).
 
@@ -77,7 +77,7 @@ from titan_hcl.bus import (
     GREAT_PULSE,
     HORMONE_FIRED,
     MODULE_HEARTBEAT,
-    MODULE_READY,
+    MODULE_PROBE_REQUEST,
     MODULE_SHUTDOWN,
     NEUROMOD_UPDATE,
     OBSERVATORY_EVENT,
@@ -91,6 +91,10 @@ logger = logging.getLogger(__name__)
 
 HEARTBEAT_INTERVAL_S = 30.0
 DEFAULT_SNAPSHOT_INTERVAL_S = 60
+
+# Phase 11 §11.I.3/§11.I.5 — module-level readiness sentinel; SHM heartbeat
+# is suppressed until the worker has finished in-process scaffolding.
+_WORKER_READY: bool = False
 
 # The broadcast event types this worker bridges to OBSERVATORY_EVENT. Kept as
 # a module constant so the ModuleSpec.broadcast_topics + the CI parity test
@@ -119,10 +123,20 @@ def _send(send_queue, msg_type: str, src: str, dst: str,
             "[ObservatoryWorker] _send %s → %s failed: %s", msg_type, dst, e)
 
 
-def _heartbeat_loop(send_queue, name: str, stop_event: threading.Event) -> None:
-    """Daemon thread — MODULE_HEARTBEAT every 30s."""
+def _heartbeat_loop(send_queue, name: str, stop_event: threading.Event,
+                    state_writer: Optional[Any] = None) -> None:
+    """Phase 11 §11.I.5 — bus MODULE_HEARTBEAT + SHM state-slot heartbeat.
+
+    Bus heartbeat fires always. SHM heartbeat is suppressed until
+    _WORKER_READY is True so the slot stays at state="starting"/"booted"
+    until the worker is actually serving."""
     while not stop_event.is_set():
         _send(send_queue, MODULE_HEARTBEAT, name, "guardian", {})
+        if state_writer is not None and _WORKER_READY:
+            try:
+                state_writer.heartbeat()
+            except Exception:
+                pass
         stop_event.wait(HEARTBEAT_INTERVAL_S)
 
 
@@ -327,7 +341,7 @@ def observatory_worker_main(recv_queue, send_queue, name: str,
          reader) + ObservatoryDB (per-process singleton, auto-wires the
          observatory_writer client per [persistence_observatory]).
       2. Start heartbeat thread (30s) + snapshot thread (interval cadence).
-      3. Emit MODULE_READY.
+      3. Write SHM slot state=booted (Phase 11 §11.I.2 — MODULE_READY retired).
       4. Main loop: drain recv_queue, translate V4 events → OBSERVATORY_EVENT,
          handle MODULE_SHUTDOWN.
     """
@@ -346,17 +360,36 @@ def observatory_worker_main(recv_queue, send_queue, name: str,
         "(RFP_phase_c_titan_hcl_cleanup Phase A+B / §9.B)",
         titan_id, name, interval_s)
 
+    global _WORKER_READY
+    _WORKER_READY = False
+
+    # ── Phase 11 §11.I.5 — SHM state-slot writer (G21 per worker) ──
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import BootPriority, ModuleStateWriter
+        _state_writer = ModuleStateWriter(
+            module_name="observatory",
+            layer="L3",
+            boot_priority=BootPriority.MANDATORY,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[ObservatoryWorker] Phase 11 ModuleStateWriter init failed: %s",
+            _sw_err)
+
+    stop_event = threading.Event()
+    hb_thread = threading.Thread(
+        target=_heartbeat_loop,
+        args=(send_queue, name, stop_event, _state_writer),
+        daemon=True, name=f"observatory-hb-{name}")
+    hb_thread.start()
+
     from titan_hcl.api.shm_reader_bank import ShmReaderBank
     from titan_hcl.utils.observatory_db import get_observatory_db
 
     shm_bank = ShmReaderBank(titan_id=titan_id)
     obs_db = get_observatory_db()
-
-    stop_event = threading.Event()
-    hb_thread = threading.Thread(
-        target=_heartbeat_loop, args=(send_queue, name, stop_event),
-        daemon=True, name=f"observatory-hb-{name}")
-    hb_thread.start()
 
     snap_thread = threading.Thread(
         target=_snapshot_loop,
@@ -364,16 +397,18 @@ def observatory_worker_main(recv_queue, send_queue, name: str,
         daemon=True, name=f"observatory-snap-{name}")
     snap_thread.start()
 
-    _send(send_queue, MODULE_READY, name, "guardian", {
-        "titan_id": titan_id,
-        "module": "observatory_worker",
-        "version": "1.0.0",
-        "schema_version": 1,
-        "spec_ref": "RFP_phase_c_titan_hcl_cleanup",
-    })
-    logger.info(
-        "[ObservatoryWorker] MODULE_READY emitted — event bridge + snapshot "
-        "loop (interval=%ds) active", interval_s)
+    # Phase 11 §11.I.2 — slot transition: starting → booted.
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+            logger.info(
+                "[ObservatoryWorker] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(event bridge + snapshot loop interval=%ds active)", interval_s)
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[ObservatoryWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
 
     events_bridged = 0
     unknown_count = 0
@@ -392,6 +427,25 @@ def observatory_worker_main(recv_queue, send_queue, name: str,
             payload = msg.get("payload", {}) if isinstance(msg, dict) else {}
             if not isinstance(payload, dict):
                 payload = {}
+
+            # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────
+            if msg_type == MODULE_PROBE_REQUEST and _state_writer is not None:
+                try:
+                    from titan_hcl.core.probe_dispatcher import (
+                        handle_module_probe_request,
+                    )
+                    handle_module_probe_request(
+                        msg,
+                        probe_fn=None,  # trivial pass-through per §11.I.2
+                        send_queue=send_queue,
+                        module_name=name,
+                        state_writer=_state_writer,
+                    )
+                except Exception as _phb_err:  # noqa: BLE001
+                    logger.warning(
+                        "[ObservatoryWorker] Phase 11 probe handler raised: %s",
+                        _phb_err)
+                continue
 
             if msg_type == MODULE_SHUTDOWN:
                 logger.info(
