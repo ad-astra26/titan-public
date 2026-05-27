@@ -237,20 +237,22 @@ def test_supervisor_forwards_layer_stats():
     assert stats["L3"]["total"] == 1
 
 
-def test_supervisor_monitor_tick_delegates_to_orchestrator():
-    """11E.b.1 surface — monitor_tick forwards to orchestrator. The
-    full SHM-poll body lands in 11E.b.2 alongside kernel-rs peer-spawn."""
+def test_supervisor_monitor_tick_owns_supervisory_loop():
+    """Phase 11 §11.I.1 / D-SPEC-141 — supervisor.monitor_tick OWNS the
+    supervisory loop (heartbeat-staleness, RSS budget, restart trigger
+    via MODULE_RESTART_REQUEST per locked D5). Per Maker 2026-05-27 "no
+    backward compatibility": Orchestrator.monitor_tick was DELETED;
+    callers MUST construct a Supervisor.
+    """
     bus = DivineBus()
     orchestrator = Orchestrator(bus)
     supervisor = Supervisor(bus, orchestrator)
 
-    call_count = [0]
-    original_tick = orchestrator.monitor_tick
-
-    def counted_tick():
-        call_count[0] += 1
-        return original_tick()
-
-    orchestrator.monitor_tick = counted_tick  # type: ignore[method-assign]
+    # Should be a clean no-op when there are no modules.
     supervisor.monitor_tick()
-    assert call_count[0] == 1
+
+    # And Orchestrator.monitor_tick must NOT exist any more (locked direction).
+    assert not hasattr(orchestrator, "monitor_tick"), (
+        "Orchestrator.monitor_tick must remain DELETED per Maker locked "
+        "direction (no backward compatibility) — supervisory loop lives "
+        "only on Supervisor.")

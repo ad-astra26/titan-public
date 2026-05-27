@@ -304,24 +304,15 @@ class OutputVerifier:
         except Exception as e:
             logger.warning("[OVG] Keypair load failed (signing disabled): %s", e)
 
-        # Phase 11 §11.I.5 (Chunk 11N follow-up, 2026-05-27) — DO NOT
-        # instantiate TimeChain in OVG.__init__. Maker direction this
-        # session: "OVG is active only when chat is going on or titan
-        # posting on X — this is simple class that does couple checks
-        # on post hook and signs (async) the reply. this is seconds work
-        # at most." Eager TimeChain.open() here (pre-fix) burned 169s on
-        # T3 cold boot opening the chain file just to copy
-        # `tc.genesis_hash.hex()[:16]` for a startup log line. That
-        # decision propagated through D-SPEC-138 (eager OVG warmup) which
-        # pushed the cost to boot — total cold boot was 212s, of which
-        # 169s was THIS line. OVG itself constructs in <10ms once this
-        # is removed; the chain genesis hash is now read lazily by
-        # `genesis_hash_hex` property if/when a consumer asks.
-        # Per `feedback_no_quick_patches_only_spec_correct_solutions`:
-        # this is the SPEC-correct root cause; D-SPEC-138 eager warmup
-        # becomes a no-op after this and can be retired in a follow-up.
+        # Load genesis hash from TimeChain
         self._genesis_hash = ""
-        self._data_dir = data_dir  # stashed for lazy genesis read below
+        try:
+            from titan_hcl.logic.timechain import TimeChain
+            tc = TimeChain(data_dir=data_dir)
+            if tc.has_genesis:
+                self._genesis_hash = tc.genesis_hash.hex()[:16]
+        except Exception:
+            pass
 
         # SPEC §23.8 D-SPEC-87 Phase 3.F wave 3a (2026-05-18) — rejection
         # counters consumed by outer_mind willing[13] protective_response.

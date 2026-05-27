@@ -35,7 +35,8 @@ Bus publications:
   - SOCIAL_INTERACTION_RECORDED         (per record_interaction write)
   - SOCIAL_DONATION_RECORDED            (per record_donation write)
   - SOCIAL_INSPIRATION_RECORDED         (per record_inspiration write)
-  - MODULE_READY / MODULE_HEARTBEAT / MODULE_SHUTDOWN (standard per §11)
+  - MODULE_HEARTBEAT / MODULE_SHUTDOWN (Phase 11 §11.I.2 D2:
+    legacy boot-signal emit DELETED — SHM slot state=booted is the contract)
 
 Closes BUG-MINDPROXY-MISSING-RECORD-INTERACTION-ASYNC-20260514 (chat
 post-hook AttributeError fleet-wide silently breaking KnownUserResolver
@@ -53,9 +54,9 @@ docstring in worker_bus_bootstrap.py shows wrong order — do not follow.
 
 Implementation reference: cognitive_worker.py (CANONICAL L2 WORKER
 TEMPLATE) for `=== BOILERPLATE ===` sections (spawn-mode sys.path
-bootstrap, setup_worker_bus, pdeathsig install, MODULE_READY emit,
-heartbeat) + memory_worker.py `_periodic_publish_loop` for the 1Hz
-SHM publisher thread.
+bootstrap, setup_worker_bus, pdeathsig install, Phase 11 SHM-slot
+state="booted", heartbeat) + memory_worker.py `_periodic_publish_loop`
+for the 1Hz SHM publisher thread.
 """
 from __future__ import annotations
 
@@ -91,7 +92,15 @@ _SOCIAL_GRAPH_WORKER_SUBSCRIBE_TOPICS: list[str] = [
     bus.QUERY,                  # SocialGraphProxy dispatch (dst=social_graph)
     bus.MODULE_SHUTDOWN,        # clean shutdown
     bus.SAVE_NOW,               # B.1 shadow_swap orchestrator (WAL checkpoint)
+    bus.MODULE_PROBE_REQUEST,   # Phase 11 §11.I.3 probe handler
 ]
+
+
+# Phase 11 §11.I.5 (Chunk 11N) — module-level readiness sentinel; gates
+# SHM-slot heartbeat() (legacy bus heartbeat fires unconditionally for
+# the boot window so guardian_HCL's stale-heartbeat detector doesn't
+# kill a slow boot).
+_WORKER_READY: bool = False
 
 
 # ── Lifecycle helpers ─────────────────────────────────────────────────
@@ -110,8 +119,13 @@ def _send_msg(send_queue, msg_type: str, src: str, dst: str, payload: dict,
         pass
 
 
-def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None) -> None:
-    """Emit MODULE_HEARTBEAT to guardian_HCL with current RSS."""
+def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None,
+                    state_writer: Optional[object] = None) -> None:
+    """Emit MODULE_HEARTBEAT to guardian_HCL with current RSS.
+
+    Phase 11 §11.I.5: also publishes state_writer.heartbeat() on the SHM
+    slot once _WORKER_READY is True. SHM writes are best-effort.
+    """
     try:
         import resource
         rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
@@ -121,6 +135,11 @@ def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None) -> None
     if extra:
         payload.update(extra)
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", payload)
+    if state_writer is not None and _WORKER_READY:
+        try:
+            state_writer.heartbeat()
+        except Exception:  # noqa: BLE001 — never crash the heartbeat
+            pass
 
 
 def _send_response(send_queue, src_name: str, dst: str, payload: dict,
@@ -219,6 +238,9 @@ def social_graph_worker_main(recv_queue, send_queue, name: str,
         logger.debug(
             "[SocialGraphWorker] pdeathsig install skipped: %s", _err)
 
+    global _WORKER_READY
+    _WORKER_READY = False
+
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = (
         (config.get("info_banner", {}) or {}).get("titan_id")
@@ -229,6 +251,26 @@ def social_graph_worker_main(recv_queue, send_queue, name: str,
     logger.info(
         "[SocialGraphWorker] Booting (titan_id=%s) — rFP §4.P + D-SPEC-50",
         titan_id)
+
+    # ── Phase 11 §11.I.5 (Chunk 11N) — SHM state-slot writer ──
+    # Constructed BEFORE the slow SocialGraph init so the slot publishes
+    # state="starting" immediately.
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority,
+            ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name=name,
+            layer="L2",
+            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[SocialGraphWorker] Phase 11 ModuleStateWriter init failed: %s",
+            _sw_err)
 
     # === MODULE-SPECIFIC: SocialGraph init ===
     db_path = _resolve_db_path(config)
@@ -253,10 +295,16 @@ def social_graph_worker_main(recv_queue, send_queue, name: str,
             "absent slot + use cold defaults): %s",
             _shm_err, exc_info=True)
 
-    # MODULE_READY (guardian boot signal) + SOCIAL_GRAPH_READY (informational)
-    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
-        "titan_id": titan_id, "ts": boot_ts,
-    })
+    # ── Phase 11 §11.I.2 — slot transition: starting → booted ──
+    # (legacy boot-signal bus emit deleted per locked D2 / no-shim policy)
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[SocialGraphWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
     _send_msg(send_queue, bus.SOCIAL_GRAPH_READY, name, "all", {
         "titan_id": titan_id, "ts": boot_ts,
     })
@@ -303,7 +351,7 @@ def social_graph_worker_main(recv_queue, send_queue, name: str,
     while True:
         now = time.time()
         if now - last_heartbeat > _HEARTBEAT_INTERVAL_S:
-            _send_heartbeat(send_queue, name)
+            _send_heartbeat(send_queue, name, state_writer=_state_writer)
             last_heartbeat = now
 
         try:
@@ -313,6 +361,27 @@ def social_graph_worker_main(recv_queue, send_queue, name: str,
         except (KeyboardInterrupt, SystemExit):
             break
 
+        msg_type = msg.get("type", "")
+
+        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ──
+        if msg_type == bus.MODULE_PROBE_REQUEST and _state_writer is not None:
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg,
+                    probe_fn=None,
+                    send_queue=send_queue,
+                    module_name=name,
+                    state_writer=_state_writer,
+                )
+            except Exception as _probe_err:  # noqa: BLE001
+                logger.warning(
+                    "[SocialGraphWorker] MODULE_PROBE_REQUEST handler failed: %s",
+                    _probe_err)
+            continue
+
         # B.2.1 supervision-transfer dispatch
         try:
             from titan_hcl.core import worker_swap_handler as _swap
@@ -320,8 +389,6 @@ def social_graph_worker_main(recv_queue, send_queue, name: str,
                 continue
         except Exception:
             pass  # swap handler not installed — fine
-
-        msg_type = msg.get("type", "")
 
         if msg_type == bus.MODULE_SHUTDOWN:
             logger.info(

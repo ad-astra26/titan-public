@@ -35,7 +35,7 @@ Bus publications (non-blocking per §8.0.ter D-SPEC-48):
   • STUDIO_RENDER_COMPLETED — per render (dst="all"; request_id in payload
                               for D-SPEC-46 Future-registry resolution)
   • MODULE_HEARTBEAT        — every 30s
-  • MODULE_READY            — on first studio_state.bin SHM write completion
+  • (MODULE_READY retired — Phase 11 §11.I.2 SHM slot state=booted is the contract)
 
 Persisted state: data/studio_exports/{meditation,epoch,eureka}/*.{png,wav,json}
 — creative artifacts under GFS-retention pruning. studio_state.bin in /dev/shm.
@@ -71,7 +71,7 @@ from titan_hcl import bus
 from titan_hcl.bus import (
     KERNEL_EPOCH_TICK,
     MODULE_HEARTBEAT,
-    MODULE_READY,
+    MODULE_PROBE_REQUEST,
     MODULE_SHUTDOWN,
     SAVE_NOW,
     STUDIO_RENDER_COMPLETED,
@@ -90,6 +90,12 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL_S = 30.0
 MAX_CONCURRENT_RENDERS = 2  # ThreadPoolExecutor cap — avoids GPU/disk thrash
 GALLERY_QUERY_TIMEOUT_S = 2.0  # work-RPC ≤2s per G19
+
+
+# Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel
+# mirrored to the per-process SHM slot via ModuleStateWriter. Set False at
+# import time; flipped True after StudioCoordinator + publisher init.
+_WORKER_READY: bool = False
 
 
 # Valid render types per SPEC §8.7 STUDIO_RENDER_REQUEST schema.
@@ -128,8 +134,15 @@ def _send_response(send_queue, src_name: str, dst: str, payload: dict,
 
 
 def _heartbeat_loop(send_queue, name: str, stop_event: threading.Event,
-                    stats_ref: dict) -> None:
-    """Daemon thread — MODULE_HEARTBEAT every 30s with render-volume stats."""
+                    stats_ref: dict,
+                    state_writer: Optional[Any] = None) -> None:
+    """Daemon thread — MODULE_HEARTBEAT every 30s with render-volume stats.
+
+    Phase 11 §11.I.5 (Chunk 11N): also publishes ModuleStateWriter.heartbeat()
+    on the SHM slot when `state_writer` is provided AND `_WORKER_READY` is
+    True so guardian_HCL's SHM-staleness detector + observatory /v6/readiness
+    see fresh data on the same cadence as the legacy bus path.
+    """
     while not stop_event.is_set():
         _send(send_queue, MODULE_HEARTBEAT, name, "guardian", {
             "alive": True,
@@ -139,6 +152,11 @@ def _heartbeat_loop(send_queue, name: str, stop_event: threading.Event,
             "renders_failed": stats_ref.get("renders_failed", 0),
             "in_flight": stats_ref.get("in_flight", 0),
         })
+        if state_writer is not None and _WORKER_READY:
+            try:
+                state_writer.heartbeat()
+            except Exception:  # noqa: BLE001 — never crash heartbeat
+                pass
         stop_event.wait(HEARTBEAT_INTERVAL_S)
 
 
@@ -259,8 +277,11 @@ def studio_worker_main(recv_queue, send_queue, name: str,
       1. Resolve titan_id, read [expressive] + [inference] config
       2. Build StudioCoordinator (with _HaikuLLMBridge wired to _ollama_cloud)
       3. Build StudioStatePublisher (initial dir scan + first SHM write)
-      4. Emit STUDIO_WORKER_READY + MODULE_READY
-      5. Start heartbeat thread (30s)
+      4. Emit STUDIO_WORKER_READY + transition SHM slot starting → booted
+         (Phase 11 §11.I.2; legacy MODULE_READY retired per locked D2)
+      5. Start heartbeat thread (30s) — actually started EARLY before
+         StudioCoordinator init so the SHM-slot last_heartbeat stays fresh
+         during the slow coordinator + publisher boot window
       6. Main loop: drain recv_queue, dispatch by msg_type:
            - STUDIO_RENDER_REQUEST → submit to render ThreadPoolExecutor;
              on completion publish STUDIO_RENDER_COMPLETED + record + SHM
@@ -269,6 +290,10 @@ def studio_worker_main(recv_queue, send_queue, name: str,
            - SAVE_NOW → refresh_counts + publish SHM (forced)
            - MODULE_SHUTDOWN → graceful exit (wait in-flight ≤ grace, then kill)
     """
+    # Phase 11 §11.I.5 (Chunk 11N) — reset module-level readiness sentinel.
+    global _WORKER_READY
+    _WORKER_READY = False
+
     # Resolve titan_id (feedback_titan_id_canonical_resolve.md — SPEC §23.17 R-PORT-1)
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = resolve_titan_id(
@@ -278,6 +303,51 @@ def studio_worker_main(recv_queue, send_queue, name: str,
         "[StudioWorker] booting — titan_id=%s name=%s "
         "(SPEC v1.8.3 §9.B / D-SPEC-57 / rFP §4.K)",
         titan_id, name)
+
+    # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21) ──
+    # Built BEFORE the slow StudioCoordinator init so titan_hcl's 1Hz SHM
+    # poll sees the worker is alive while it warms.
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority,
+            ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name=name,
+            layer="L2",
+            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[StudioWorker] Phase 11 ModuleStateWriter init failed "
+            "(continuing — SHM slot disabled): %s", _sw_err)
+
+    # Stats dict shared with heartbeat thread (forward-declared so the
+    # early-start heartbeat closure can reference it before render loop
+    # mutates it). Phase 11 §11.I.5 — heartbeat needs to start BEFORE the
+    # slow StudioCoordinator + StudioStatePublisher init.
+    stats: dict[str, int] = {
+        "renders_total": 0,
+        "renders_success": 0,
+        "renders_failed": 0,
+        "in_flight": 0,
+        "kernel_ticks": 0,
+        "gallery_queries": 0,
+    }
+    stats_lock = threading.Lock()
+
+    # ── Heartbeat daemon — started EARLY (Phase 11 §11.I.5) ──
+    stop_event = threading.Event()
+    hb_thread = threading.Thread(
+        target=_heartbeat_loop,
+        args=(send_queue, name, stop_event, stats, _state_writer),
+        daemon=True, name=f"studio-hb-{name}")
+    hb_thread.start()
+    logger.info(
+        "[StudioWorker] Heartbeat thread started EARLY (Phase 11 §11.I.5 — "
+        "bus + SHM cadence covers slow StudioCoordinator boot)")
 
     # ── StudioCoordinator init (replicates plugin.py:_wire_studio inline) ──
     from titan_hcl.expressive.studio import StudioCoordinator
@@ -341,17 +411,6 @@ def studio_worker_main(recv_queue, send_queue, name: str,
         thread_name_prefix=f"studio-render-{name}",
     )
 
-    # Stats dict shared with heartbeat thread (read-only there).
-    stats: dict[str, int] = {
-        "renders_total": 0,
-        "renders_success": 0,
-        "renders_failed": 0,
-        "in_flight": 0,
-        "kernel_ticks": 0,
-        "gallery_queries": 0,
-    }
-    stats_lock = threading.Lock()
-
     # ── STUDIO_WORKER_READY (one-shot lifecycle event) ──
     _send(send_queue, STUDIO_WORKER_READY, name, "guardian", {
         "schema_version": STUDIO_STATE_SPEC.schema_version,
@@ -359,25 +418,24 @@ def studio_worker_main(recv_queue, send_queue, name: str,
         "ts": time.time(),
     })
 
-    # ── MODULE_READY (Guardian boot-tracking — emitted after first SHM write) ──
-    _send(send_queue, MODULE_READY, name, "guardian", {
-        "titan_id": titan_id,
-        "module": "studio_worker",
-        "version": "1.8.3",
-        "schema_version": STUDIO_STATE_SPEC.schema_version,
-        "spec_ref": "D-SPEC-57",
-    })
-
-    # ── Heartbeat daemon ──
-    stop_event = threading.Event()
-    hb_thread = threading.Thread(
-        target=_heartbeat_loop, args=(send_queue, name, stop_event, stats),
-        daemon=True, name=f"studio-hb-{name}")
-    hb_thread.start()
+    # ── Phase 11 §11.I.2 — slot transition: starting → booted ─────────
+    # Replaces the legacy MODULE_READY bus emit per locked D2 — the SHM
+    # slot state=booted is the contract.
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+            logger.info(
+                "[StudioWorker] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[StudioWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
 
     logger.info(
-        "[StudioWorker] boot complete — STUDIO_WORKER_READY + MODULE_READY emitted; "
-        "render_pool=%d workers; ready to serve renders.",
+        "[StudioWorker] boot complete — STUDIO_WORKER_READY emitted + SHM "
+        "slot booted; render_pool=%d workers; ready to serve renders.",
         MAX_CONCURRENT_RENDERS)
 
     # ── Render completion callback (runs on pool worker thread) ──
@@ -458,6 +516,25 @@ def studio_worker_main(recv_queue, send_queue, name: str,
             payload = msg.get("payload", {}) if isinstance(msg, dict) else {}
             if not isinstance(payload, dict):
                 payload = {}
+
+            # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ────────
+            if msg_type == MODULE_PROBE_REQUEST:
+                try:
+                    from titan_hcl.core.probe_dispatcher import (
+                        handle_module_probe_request,
+                    )
+                    handle_module_probe_request(
+                        msg,
+                        probe_fn=None,
+                        send_queue=send_queue,
+                        module_name=name,
+                        state_writer=_state_writer,
+                    )
+                except Exception as _probe_err:  # noqa: BLE001
+                    logger.warning(
+                        "[StudioWorker] MODULE_PROBE_REQUEST handler "
+                        "failed: %s", _probe_err)
+                continue
 
             if msg_type == STUDIO_RENDER_REQUEST:
                 with stats_lock:

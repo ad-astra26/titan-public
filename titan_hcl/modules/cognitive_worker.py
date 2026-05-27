@@ -113,6 +113,15 @@ _HEARTBEAT_INTERVAL_S = 10.0
 # Main loop poll cadence (kept tight so MODULE_SHUTDOWN is responsive).
 _POLL_INTERVAL_S = 0.2
 
+# Phase 11 §11.I.3/§11.I.5 — module-level readiness sentinel; SHM heartbeat
+# is suppressed until the worker has finished in-process scaffolding.
+_WORKER_READY: bool = False
+
+# Phase 11 §11.I.5 — process-global ModuleStateWriter ref. Set in
+# cognitive_worker_main; consumed by _send_heartbeat so the SHM heartbeat
+# rides alongside the bus heartbeat on the same cadence.
+_STATE_WRITER = None
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Session 3 CGN_KNOWLEDGE_REQ response builders
@@ -512,6 +521,27 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
     )
     boot_ts = time.time()
 
+    global _WORKER_READY, _STATE_WRITER
+    _WORKER_READY = False
+
+    # ── Phase 11 §11.I.5 — SHM state-slot writer (G21 per worker) ──
+    # Created BEFORE flag check + slow engine init so the slot publishes
+    # state="starting" immediately; _send_heartbeat refreshes last_heartbeat
+    # during boot to keep guardian's staleness detector at bay.
+    try:
+        from titan_hcl.core.module_state import BootPriority, ModuleStateWriter
+        _STATE_WRITER = ModuleStateWriter(
+            module_name="cognitive_worker",
+            layer="L2",
+            boot_priority=BootPriority.MANDATORY,
+        )
+        _STATE_WRITER.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        _STATE_WRITER = None
+        logger.warning(
+            "[CognitiveWorker] Phase 11 ModuleStateWriter init failed: %s",
+            _sw_err)
+
     # === BOILERPLATE: optional flag-gated activation ===
     # Workers that have a legacy parallel code path (cognitive_worker
     # under l0_rust=false → legacy spirit_worker_main; future
@@ -528,10 +558,19 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
             "[CognitiveWorker] microkernel.l0_rust_enabled=false — "
             "legacy spirit_worker_main owns cognitive engines in this mode. "
             "Entering heartbeat-only no-op loop.")
-        _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
-            "titan_id": titan_id, "ts": boot_ts, "flag_off_noop": True,
-            "chunk": "8E",
-        })
+        # Phase 11 §11.I.2 — MODULE_READY bus-emit deleted per locked D2;
+        # SHM slot transitions starting → booted (flag-off no-op flavor).
+        _WORKER_READY = True
+        if _STATE_WRITER is not None:
+            try:
+                _STATE_WRITER.write_state("booted")
+                logger.info(
+                    "[CognitiveWorker] Phase 11 §11.I.2 — SHM slot state=booted "
+                    "(flag_off no-op branch)")
+            except Exception as _swb_err:  # noqa: BLE001
+                logger.warning(
+                    "[CognitiveWorker] Phase 11 write_state(booted) failed "
+                    "(flag_off branch): %s", _swb_err)
         _heartbeat_loop(recv_queue, send_queue, name, flag_off=True)
         return
 
@@ -735,10 +774,20 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         state_refs["observable_engine"] is not None,
     )
 
-    # Signal MODULE_READY to guardian_HCL.
-    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
-        "titan_id": titan_id, "ts": boot_ts, "chunk": "8G",
-    })
+    # Phase 11 §11.I.2 — MODULE_READY bus-emit deleted per locked D2.
+    # SHM slot transitions starting → booted; titan_hcl's 1Hz SHM poll
+    # dispatches MODULE_PROBE_REQUEST after seeing this.
+    _WORKER_READY = True
+    if _STATE_WRITER is not None:
+        try:
+            _STATE_WRITER.write_state("booted")
+            logger.info(
+                "[CognitiveWorker] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[CognitiveWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
     logger.info("[CognitiveWorker] online")
 
     # === MODULE-SPECIFIC: launch snapshot publisher daemon threads (chunk 8H) ===
@@ -856,6 +905,25 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
             continue
 
         msg_type = msg.get("type")
+
+        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────
+        if msg_type == bus.MODULE_PROBE_REQUEST and _STATE_WRITER is not None:
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg,
+                    probe_fn=None,  # trivial pass-through per §11.I.2
+                    send_queue=send_queue,
+                    module_name=name,
+                    state_writer=_STATE_WRITER,
+                )
+            except Exception as _phb_err:  # noqa: BLE001
+                logger.warning(
+                    "[CognitiveWorker] Phase 11 probe handler raised: %s",
+                    _phb_err)
+            continue
 
         # Phase B.1 shadow swap dispatch.
         if _b1_reporter is not None and _b1_reporter.handles(msg_type):
@@ -4972,6 +5040,9 @@ def _heartbeat_loop(recv_queue, send_queue, name: str, *, flag_off: bool) -> Non
     """Heartbeat-only loop for the l0_rust_enabled=false defensive branch.
 
     Exits cleanly on MODULE_SHUTDOWN. No engine init, no dispatcher.
+    Phase 11 §11.I.3 — also handles MODULE_PROBE_REQUEST via the trivial
+    pass-through contract (flag_off worker is "ready" by definition: it
+    has nothing to init).
     """
     last_heartbeat_ts = 0.0
     while True:
@@ -4985,13 +5056,33 @@ def _heartbeat_loop(recv_queue, send_queue, name: str, *, flag_off: bool) -> Non
             continue
         except Exception:
             continue
-        if msg.get("type") == bus.MODULE_SHUTDOWN:
+        msg_type = msg.get("type") if isinstance(msg, dict) else None
+        if msg_type == bus.MODULE_PROBE_REQUEST and _STATE_WRITER is not None:
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg, probe_fn=None, send_queue=send_queue,
+                    module_name=name, state_writer=_STATE_WRITER,
+                )
+            except Exception as _phb_err:  # noqa: BLE001
+                logger.warning(
+                    "[CognitiveWorker] Phase 11 probe handler (flag_off) "
+                    "raised: %s", _phb_err)
+            continue
+        if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[CognitiveWorker] Shutdown received (flag_off branch)")
             return
 
 
 def _send_heartbeat(send_queue, name: str, extra: dict | None = None) -> None:
-    """Emit MODULE_HEARTBEAT to guardian_HCL with current RSS."""
+    """Emit MODULE_HEARTBEAT to guardian_HCL with current RSS.
+
+    Phase 11 §11.I.5 — also publishes ModuleStateWriter.heartbeat() on the SHM
+    state slot when _STATE_WRITER is set AND _WORKER_READY is True (gate keeps
+    the slot in state="starting"/"booted" until in-process scaffolding done).
+    """
     try:
         import resource
         rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
@@ -5002,6 +5093,13 @@ def _send_heartbeat(send_queue, name: str, extra: dict | None = None) -> None:
     if extra:
         payload.update(extra)
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", payload)
+    if _STATE_WRITER is not None:
+        try:
+            # During boot we still refresh last_heartbeat (state stays
+            # "starting" until _WORKER_READY flips); republishes current state.
+            _STATE_WRITER.heartbeat()
+        except Exception:
+            pass
 
 
 def _send_msg(send_queue, msg_type: str, src: str, dst: str, payload: dict,

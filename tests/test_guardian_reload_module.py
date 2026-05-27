@@ -35,6 +35,7 @@ from titan_hcl.bus import (
     MODULE_RELOAD_REQUEST,
     make_msg,
 )
+from titan_hcl.supervisor import Supervisor  # Phase 11 §11.I.1 supervisor split
 from titan_hcl.guardian_hcl import (
     Guardian,
     ModuleInfo,
@@ -154,7 +155,7 @@ def test_monitor_tick_skips_dead_process_restart_during_reload():
     # Mock restart_async to detect any unwanted invocation
     g.restart_async = MagicMock()
 
-    g.monitor_tick()
+    Supervisor(g.bus, g).monitor_tick()
     g.restart_async.assert_not_called(), (
         "monitor_tick must NOT issue restart for reload-in-flight module"
     )
@@ -168,7 +169,7 @@ def test_monitor_tick_skips_heartbeat_timeout_restart_during_reload():
     info.last_heartbeat = time.time() - 999.0
     g.restart_async = MagicMock()
 
-    g.monitor_tick()
+    Supervisor(g.bus, g).monitor_tick()
     g.restart_async.assert_not_called()
     g.stop_all()
 

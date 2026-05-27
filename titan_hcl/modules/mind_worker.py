@@ -49,6 +49,16 @@ from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
+
+# Phase 11 §11.I.3/§11.I.5 — module-level readiness sentinel; mirrored to
+# `module_mind_state.bin` via ModuleStateWriter so titan_hcl's 1Hz SHM
+# poll + the orchestrator's MODULE_PROBE_REQUEST dispatcher see real
+# liveness. Under `l0_rust_enabled=true` mind_worker runs as a SHADOW
+# providing sensor_cache_inner_mind.bin input — the SHM slot tracks the
+# Python shadow lifecycle, not the Rust daemon's.
+_WORKER_READY: bool = False
+_state_writer = None  # type: ignore[assignment]
+
 # Sub-sense decay: media digest features decay over time (half-life 30 min)
 _DIGEST_HALFLIFE_S = 1800.0
 _SUB_WEIGHT_A = 0.5
@@ -134,11 +144,31 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the Mind module process."""
     from queue import Empty
 
+    # Phase 11 §11.I.5 — reset module-level readiness flags.
+    global _WORKER_READY, _state_writer
+    _WORKER_READY = False
+    _state_writer = None
+
     project_root = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
     logger.info("[MindWorker] Initializing 5DT cognitive sensors...")
+
+    # ── Phase 11 §11.I.5 — SHM state-slot writer (G21 single-writer) ──
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority, ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name=name, layer="L1",
+            boot_priority=BootPriority.MANDATORY,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[MindWorker] Phase 11 ModuleStateWriter init failed "
+            "(continuing — SHM slot will be absent): %s", _sw_err)
 
     # Boot MoodEngine (needs a metabolism stub for standalone operation)
     mood_engine = None
@@ -284,8 +314,22 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             refresh_threads = []
             shm_writer_thread = None
 
-    # Signal ready
-    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
+    # ── Phase 11 §11.I.2 — SHM slot transition starting → booted ─────
+    # MODULE_READY bus emit DELETED per D-SPEC-141 / v1.65.0 locked D2.
+    # mind_worker is a shadow under l0_rust_enabled=true (Rust owns
+    # inner_mind_15d.bin); the SHM slot tracks the Python shadow's
+    # lifecycle so the orchestrator can probe it independently.
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+            logger.info(
+                "[MindWorker] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[MindWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
     logger.info("[MindWorker] 5DT cognitive sensors online (fast=%s)",
                 bool(sensor_cache))
 
@@ -380,6 +424,22 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         # ── Microkernel v2 Phase B.2.1 — supervision-transfer dispatch ──
         from titan_hcl.core import worker_swap_handler as _swap
         if _swap.maybe_dispatch_swap_msg(msg):
+            continue
+
+        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────────
+        if msg_type == "MODULE_PROBE_REQUEST":
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg, send_queue=send_queue, module_name=name,
+                    state_writer=_state_writer, probe_fn=None,
+                )
+            except Exception as _probe_err:  # noqa: BLE001
+                logger.warning(
+                    "[MindWorker] MODULE_PROBE_REQUEST handler failed: %s",
+                    _probe_err)
             continue
 
         if msg_type == bus.MODULE_SHUTDOWN:
@@ -1131,6 +1191,13 @@ _last_hb_ts: float = 0.0
 
 
 def _send_heartbeat(send_queue, name: str) -> None:
+    """Send MODULE_HEARTBEAT on bus + Phase 11 SHM-slot heartbeat sidecar.
+
+    Phase 11 §11.I.5 — when `_state_writer` is set AND `_WORKER_READY` is
+    True, also publish `state_writer.heartbeat()` so guardian_hcl's
+    SHM-staleness detector + observatory /v6/readiness see fresh data on
+    the same cadence as the legacy bus path. SHM publish is best-effort.
+    """
     global _last_hb_ts
     now = time.time()
     if now - _last_hb_ts < 3.0:
@@ -1142,6 +1209,11 @@ def _send_heartbeat(send_queue, name: str) -> None:
     except Exception:
         rss_mb = 0
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", {"rss_mb": round(rss_mb, 1)})
+    if _state_writer is not None and _WORKER_READY:
+        try:
+            _state_writer.heartbeat()
+        except Exception:  # noqa: BLE001 — never crash the heartbeat
+            pass
 
 
 # ── S7 §L1 fast-path helpers ────────────────────────────────────────

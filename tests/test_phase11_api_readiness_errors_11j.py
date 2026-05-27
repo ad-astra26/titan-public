@@ -94,12 +94,18 @@ def test_v6_readiness_returns_fleet_and_modules(tmp_path, monkeypatch):
         assert body["ok"] is True
         assert body["fleet"]["fleet_ready"] is True
         assert body["fleet"]["boot_phase"] == "phase_a_done"
-        # Modules: alpha + beta have slots; gamma falls back to "unknown".
+        # Modules: per locked D1 / SPEC §11.I.5, /v6/readiness now discovers
+        # modules via SHM-slot scan + manifest filter (G18 source of truth) —
+        # NOT via the orchestrator-proxy's _modules dict (which was unreliable
+        # under D-SPEC-135 process split). alpha + beta have slots; gamma
+        # has NO slot AND is not in the v6 manifest, so it doesn't appear.
         names = {m["name"]: m for m in body["modules"]}
         assert "alpha" in names and names["alpha"]["state"] == "running"
         assert "beta" in names and names["beta"]["state"] == "starting"
-        assert "gamma" in names and names["gamma"]["state"] == "unknown"
-        assert body["module_count"] == 3
+        assert "gamma" not in names
+        # Aggregate state summary (new in 11W1).
+        assert body["module_state_summary"]["running"] == 1
+        assert body["module_state_summary"]["starting"] == 1
         assert body["module_running_count"] == 1
     finally:
         fleet_writer.close()
@@ -119,10 +125,21 @@ def test_v6_readiness_handles_missing_fleet_slot(tmp_path, monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert body["ok"] is True
-    # fleet is None — no slot exists.
+    # fleet is None — no titan_hcl_state.bin slot exists yet.
     assert body["fleet"] is None
-    # alpha has no SHM either → state="unknown"
-    assert body["modules"][0]["state"] == "unknown"
+    # alpha has no SHM slot. Per locked D1 / SPEC §11.I.5 the route discovers
+    # modules via (a) /dev/shm scan + (b) manifest producer set (which lists
+    # every worker known to the v6 surface). The manifest contributes a
+    # not_booted entry for each — alpha wouldn't appear unless it's in the
+    # manifest, but other workers' candidate names DO appear as not_booted
+    # (since no slot has been written yet). The contract we test here is:
+    # no 5xx + the response shape is well-formed + zero running modules.
+    assert isinstance(body["modules"], list)
+    assert body["module_running_count"] == 0
+    assert body["module_state_summary"]["running"] == 0
+    # Every entry from the manifest-derived candidates is not_booted.
+    for m in body["modules"]:
+        assert m["state"] == "not_booted", m
 
 
 # ── 3. /v6/errors ────────────────────────────────────────────────────

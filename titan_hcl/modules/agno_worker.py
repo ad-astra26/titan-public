@@ -26,7 +26,7 @@ Bus publications (non-blocking per §8.0.ter D-SPEC-48):
   • CHAT_RESPONSE           — per chat (correlation_id matches REQUEST.rid)
   • CHAT_STREAM_CHUNK       — per token chunk during SSE streaming (NEW)
   • MODULE_HEARTBEAT        — every 30s
-  • MODULE_READY            — on first agno_state.bin SHM write completion
+  • (MODULE_READY retired — Phase 11 §11.I.2 SHM slot state=booted is the contract)
 
 See:
   - SPEC v1.17.0 §9.B `agno_worker` block (Chunk D drafts)
@@ -57,7 +57,6 @@ from titan_hcl.bus import (
     DREAM_INBOX_REPLAY,
     KERNEL_EPOCH_TICK,
     MODULE_HEARTBEAT,
-    MODULE_READY,
     MODULE_SHUTDOWN,
     SAVE_NOW,
     make_msg,
@@ -1124,7 +1123,8 @@ def agno_worker_main(recv_queue, send_queue, name: str,
     try:
         publisher = AgnoStatePublisher(name=name)
         publisher.publish(stats)
-        _send(send_queue, MODULE_READY, name, "guardian", {})
+        # Phase 11 §11.I.2 — MODULE_READY deleted per locked D2
+        # (SHM slot state=booted is the contract now)
     except Exception as e:
         publisher = None
         logger.warning(

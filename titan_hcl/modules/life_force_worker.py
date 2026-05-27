@@ -41,7 +41,9 @@ Bus publications:
                               edge-debounced reset ≤0.6)
   - NEUROMOD_EXTERNAL_NUDGE  (per evaluate, source="life_force_chi_health" —
                               closes §4.Q D-SPEC-54 orphan nudge)
-  - MODULE_READY / MODULE_HEARTBEAT / MODULE_SHUTDOWN (standard per §11)
+  - MODULE_HEARTBEAT / MODULE_SHUTDOWN (standard per §11; legacy MODULE_READY
+                              retired per Phase 11 §11.I.2 — SHM slot
+                              state=booted is the contract)
 
 SHM reads:
   - life_force_inputs.bin (cognitive_worker is G21 writer; this worker
@@ -85,6 +87,12 @@ from titan_hcl.errors import Severity as _phase11_sev
 logger = logging.getLogger(__name__)
 
 MODULE_NAME = "life_force"
+
+# Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel
+# mirrored to per-process SHM slot via ModuleStateWriter. Heartbeat
+# publishes to the SHM slot only once True so slot stays at
+# "starting"/"booted" during boot window.
+_WORKER_READY: bool = False
 
 # Cadence + lifecycle constants.
 _HEARTBEAT_INTERVAL_S = 10.0            # SPEC §10.B MODULE_HEARTBEAT_INTERVAL_S
@@ -130,8 +138,14 @@ def _send_msg(send_queue, msg_type: str, src: str, dst: str, payload: dict,
         pass
 
 
-def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None) -> None:
-    """Emit MODULE_HEARTBEAT to guardian_HCL with current RSS."""
+def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None,
+                    state_writer: Optional[Any] = None) -> None:
+    """Emit MODULE_HEARTBEAT to guardian_HCL with current RSS.
+
+    Phase 11 §11.I.5 (Chunk 11N): also publishes ModuleStateWriter.heartbeat()
+    on the SHM slot when `state_writer` is provided AND `_WORKER_READY`
+    is True (the SHM slot stays at state="starting"/"booted" until then).
+    """
     try:
         import resource
         rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
@@ -141,6 +155,11 @@ def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None) -> None
     if extra:
         payload.update(extra)
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", payload)
+    if state_writer is not None and _WORKER_READY:
+        try:
+            state_writer.heartbeat()
+        except Exception:  # noqa: BLE001 — never crash heartbeat
+            pass
 
 
 def _send_response(send_queue, src_name: str, dst: str, payload: dict,
@@ -298,6 +317,11 @@ def life_force_worker_main(recv_queue, send_queue, name: str,
         logger.debug(
             "[LifeForceWorker] pdeathsig install skipped: %s", _err)
 
+    # Phase 11 §11.I.5 (Chunk 11N) — reset module-level readiness sentinel
+    # on every entry.
+    global _WORKER_READY
+    _WORKER_READY = False
+
     from titan_hcl.core.state_registry import (
         StateRegistryReader, ensure_shm_root, resolve_titan_id,
     )
@@ -310,6 +334,24 @@ def life_force_worker_main(recv_queue, send_queue, name: str,
     logger.info(
         "[LifeForceWorker] Booting (titan_id=%s) — rFP §4.G + D-SPEC-57",
         titan_id)
+
+    # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21) ──
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority,
+            ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name=name,
+            layer="L2",
+            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[LifeForceWorker] Phase 11 ModuleStateWriter init failed "
+            "(continuing — SHM slot disabled): %s", _sw_err)
 
     # === MODULE-SPECIFIC: LifeForceEngine init + persistence restore ===
     engine = _init_life_force_engine(config)
@@ -351,11 +393,19 @@ def life_force_worker_main(recv_queue, send_queue, name: str,
             "publishes",
             _r_err, exc_info=True)
 
-    # MODULE_READY (guardian boot signal).
-    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
-        "titan_id": titan_id, "ts": boot_ts,
-        "state": getattr(engine, "_state", "HEALTHY"),
-    })
+    # ── Phase 11 §11.I.2 — slot transition: starting → booted ─────────
+    # Legacy MODULE_READY bus emit retired per locked D2.
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+            logger.info(
+                "[LifeForceWorker] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[LifeForceWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
 
     # Mutable closure cells (worker state shared across recv loop + thread).
     latest_chi: dict = {"result": None}    # most recent evaluate() output
@@ -421,7 +471,8 @@ def life_force_worker_main(recv_queue, send_queue, name: str,
                 "fatigue_emits": fatigue_emit_count["value"],
                 "is_dreaming": is_dreaming_box["value"],
             }
-            _send_heartbeat(send_queue, name, extra=stats_extra)
+            _send_heartbeat(send_queue, name, extra=stats_extra,
+                            state_writer=_state_writer)
             last_heartbeat = now
 
         try:
@@ -440,6 +491,25 @@ def life_force_worker_main(recv_queue, send_queue, name: str,
             pass
 
         msg_type = msg.get("type", "")
+
+        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ────────
+        if msg_type == bus.MODULE_PROBE_REQUEST:
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg,
+                    probe_fn=None,
+                    send_queue=send_queue,
+                    module_name=name,
+                    state_writer=_state_writer,
+                )
+            except Exception as _probe_err:  # noqa: BLE001
+                logger.warning(
+                    "[LifeForceWorker] MODULE_PROBE_REQUEST handler "
+                    "failed: %s", _probe_err)
+            continue
 
         if msg_type == bus.MODULE_SHUTDOWN:
             logger.info(

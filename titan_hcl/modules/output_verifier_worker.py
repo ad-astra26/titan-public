@@ -39,6 +39,10 @@ logger = logging.getLogger("output_verifier")
 _HEARTBEAT_INTERVAL_S = 30.0
 _STATS_PUBLISH_INTERVAL_S = 60.0
 
+# Phase 11 §11.I.3/§11.I.5 — module-level readiness sentinel; SHM heartbeat
+# is suppressed until the worker has finished in-process scaffolding.
+_WORKER_READY: bool = False
+
 
 @with_error_envelope(module_name="output_verifier", subsystem="entry", severity=_phase11_sev.FATAL)
 def output_verifier_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
@@ -70,6 +74,27 @@ def output_verifier_worker_main(recv_queue, send_queue, name: str, config: dict)
     logger.info("[OutputVerifierWorker] Booting — titan_id=%s, tc_dir=%s",
                 titan_id, tc_dir)
 
+    global _WORKER_READY
+    _WORKER_READY = False
+
+    # ── Phase 11 §11.I.5 — SHM state-slot writer (G21 per worker) ──
+    # Created BEFORE the slow OutputVerifier init so the slot publishes
+    # state="starting" immediately and the periodic heartbeat below keeps
+    # last_heartbeat fresh during boot.
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import BootPriority, ModuleStateWriter
+        _state_writer = ModuleStateWriter(
+            module_name="output_verifier",
+            layer="L2",
+            boot_priority=BootPriority.MANDATORY,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[OutputVerifierWorker] Phase 11 ModuleStateWriter init failed: %s",
+            _sw_err)
+
     try:
         from titan_hcl.logic.output_verifier import OutputVerifier
         verifier = OutputVerifier(
@@ -78,16 +103,23 @@ def output_verifier_worker_main(recv_queue, send_queue, name: str, config: dict)
         logger.error("[OutputVerifierWorker] OutputVerifier init failed: %s — exiting", e)
         return
 
-    # Boot signals: MODULE_READY → Guardian flips state to RUNNING (without
-    # this, /health shows the worker as DEGRADED forever). OUTPUT_VERIFIER_READY
-    # is a separate broadcast for any consumer that wants to know the worker
-    # is live (parent-side proxy uses it to mark itself bus-routed).
+    # Phase 11 §11.I.2 — slot transition: starting → booted.
+    # MODULE_READY bus-emit deleted per locked D2 (no shim).
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+            logger.info(
+                "[OutputVerifierWorker] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[OutputVerifierWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
+
+    # OUTPUT_VERIFIER_READY remains — separate broadcast for parent-side proxy
+    # to mark itself bus-routed (distinct from Phase 11 MODULE_READY contract).
     try:
-        send_queue.put({
-            "type": bus.MODULE_READY, "src": name, "dst": "guardian",
-            "payload": {"titan_id": titan_id, "ts": time.time()},
-            "ts": time.time(),
-        })
         send_queue.put({
             "type": bus.OUTPUT_VERIFIER_READY, "src": name, "dst": "all",
             "payload": {"titan_id": titan_id, "ts": time.time()},
@@ -124,7 +156,7 @@ def output_verifier_worker_main(recv_queue, send_queue, name: str, config: dict)
             _pub_init_err, exc_info=True)
 
     while True:
-        # Periodic heartbeat (Guardian liveness)
+        # Periodic heartbeat (Guardian liveness + Phase 11 SHM heartbeat)
         now = time.time()
         if now - last_heartbeat >= _HEARTBEAT_INTERVAL_S:
             try:
@@ -135,6 +167,11 @@ def output_verifier_worker_main(recv_queue, send_queue, name: str, config: dict)
                 })
             except Exception:
                 pass
+            if _state_writer is not None and _WORKER_READY:
+                try:
+                    _state_writer.heartbeat()
+                except Exception:
+                    pass
             last_heartbeat = now
 
         # Periodic stats publish (kernel snapshot consumes this)
@@ -175,6 +212,25 @@ def output_verifier_worker_main(recv_queue, send_queue, name: str, config: dict)
         # missing original 15-worker wiring).
         from titan_hcl.core import worker_swap_handler as _swap
         if _swap.maybe_dispatch_swap_msg(msg):
+            continue
+
+        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────
+        if msg_type == bus.MODULE_PROBE_REQUEST and _state_writer is not None:
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg,
+                    probe_fn=None,  # trivial pass-through per §11.I.2
+                    send_queue=send_queue,
+                    module_name=name,
+                    state_writer=_state_writer,
+                )
+            except Exception as _phb_err:  # noqa: BLE001
+                logger.warning(
+                    "[OutputVerifierWorker] Phase 11 probe handler raised: %s",
+                    _phb_err)
             continue
 
         if msg_type == bus.MODULE_SHUTDOWN:

@@ -230,14 +230,14 @@ def test_cross_process_ipc():
     assert routed >= 1, f"MODULE_READY not received (routed={routed})"
 
     # Guardian processes the ready message from bus
-    g.monitor_tick()
+    Supervisor(g.bus, g).monitor_tick()
     info = g._modules["echo"]
     # State may still be STARTING if the MODULE_READY was routed to guardian's
     # bus queue but not processed yet. Run another tick.
     if info.state != ModuleState.RUNNING:
         time.sleep(0.5)
         g.drain_send_queues()
-        g.monitor_tick()
+        Supervisor(g.bus, g).monitor_tick()
     assert info.state in (ModuleState.RUNNING, ModuleState.STARTING)
 
     # Send a QUERY through the bus to the echo worker
@@ -454,7 +454,7 @@ def test_mind_proxy_routes_to_worker():
             break
     assert routed >= 1, "MODULE_READY not received"
 
-    guardian.monitor_tick()
+    Supervisor(guardian.bus, guardian).monitor_tick()
 
     # Create MindProxy and query mood
     from titan_hcl.proxies.mind_proxy import MindProxy
@@ -503,7 +503,7 @@ def test_body_proxy_routes_to_worker():
     # Process ready message
     for _ in range(3):
         guardian.drain_send_queues()
-        guardian.monitor_tick()
+        Supervisor(guardian.bus, guardian).monitor_tick()
         time.sleep(0.2)
 
     # Create BodyProxy and query tensor

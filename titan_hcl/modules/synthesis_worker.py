@@ -38,7 +38,7 @@ Bus subscriptions:
 
 Bus publications (non-blocking per §8.0.ter D-SPEC-48):
   • MODULE_HEARTBEAT         — every 30s
-  • MODULE_READY             — once at boot (after DuckDB + SHM writer init)
+  • (MODULE_READY retired — Phase 11 §11.I.2 SHM slot state=booted is the contract)
   • SYNTHESIS_RECOMPUTE_DONE — every 60s, observability only
 
 Periodic work pattern: per
@@ -70,7 +70,7 @@ from titan_hcl.bus import (
     MAINTAIN_BUNDLE,
     MEMORY_RETRIEVAL_USED,
     MODULE_HEARTBEAT,
-    MODULE_READY,
+    MODULE_PROBE_REQUEST,
     MODULE_SHUTDOWN,
     SYNTHESIS_FORK_COMMAND,
     SYNTHESIS_FORK_COMMAND_RESULT,
@@ -122,6 +122,14 @@ def _set_engine_recall(er: Optional[EngineRecall]) -> None:
         _engine_recall_singleton = er
 
 logger = logging.getLogger(__name__)
+
+
+# Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel.
+# Flipped True after ActivationStore + StandingBundleStore + EngineRecall init
+# complete. Gates SHM-slot heartbeat (see _heartbeat_loop) so titan_hcl's
+# 1Hz SHM poll + MODULE_PROBE_REQUEST dispatcher see real liveness.
+_WORKER_READY: bool = False
+
 
 HEARTBEAT_INTERVAL_S = 30.0
 RECOMPUTE_INTERVAL_S = 60.0          # arch §5.2 60s recompute cadence
@@ -438,10 +446,24 @@ def _send(send_queue, msg_type: str, src: str, dst: str,
 
 
 def _heartbeat_loop(send_queue, name: str,
-                    stop_event: threading.Event) -> None:
-    """Daemon thread — MODULE_HEARTBEAT every 30s."""
+                    stop_event: threading.Event,
+                    state_writer: Optional[Any] = None) -> None:
+    """Daemon thread — MODULE_HEARTBEAT every 30s.
+
+    Phase 11 §11.I.5 (Chunk 11N): also publishes
+    ModuleStateWriter.heartbeat() on the SHM slot when `state_writer` is
+    provided so guardian_hcl's SHM-staleness detector + observatory
+    `/v6/readiness` see fresh data. SHM heartbeat suppressed while
+    `_WORKER_READY` is False so the slot stays in "starting"/"booted"
+    until the recv-loop probe handler transitions it to "running".
+    """
     while not stop_event.is_set():
         _send(send_queue, MODULE_HEARTBEAT, name, "guardian", {})
+        if state_writer is not None and _WORKER_READY:
+            try:
+                state_writer.heartbeat()
+            except Exception:  # noqa: BLE001
+                pass
         stop_event.wait(HEARTBEAT_INTERVAL_S)
 
 
@@ -566,14 +588,40 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
          activation_state) + SynthStatusWriter (synth_status.bin SHM) +
          PlugRegistry (empty in Phase 1).
       2. Start heartbeat thread (30s) + recompute thread (60s).
-      3. Emit MODULE_READY.
+      3. Phase 11 §11.I.2 — transition SHM slot starting→booted (no MODULE_READY emit).
       4. Main loop: drain recv_queue, route MEMORY_RETRIEVAL_USED to
          store.record_access (INV-Syn-5), handle MODULE_SHUTDOWN.
     """
+    # Phase 11 §11.I.5 (Chunk 11N) — readiness flag reset per entry.
+    global _WORKER_READY
+    _WORKER_READY = False
+
     from titan_hcl.core.state_registry import resolve_titan_id
 
     titan_id = resolve_titan_id(
         (config or {}).get("titan_id") if config else None)
+
+    # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21 per worker) ──
+    # Constructed BEFORE the slow DuckDB + Kuzu + EngineRecall init so the
+    # slot publishes state="starting" immediately. The heartbeat thread
+    # (started below) calls state_writer.heartbeat() every 30s so
+    # guardian_hcl's SHM-staleness detector doesn't kill the worker mid-boot.
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority,
+            ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name="synthesis",
+            layer="L2",
+            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[synthesis_worker] Phase 11 ModuleStateWriter init failed "
+            "(continuing on legacy path): %s", _sw_err)
 
     # DuckDB path — synthesis_worker owns its OWN file (not titan_memory.duckdb)
     # per G21 / INV-Syn-3 to avoid the cross-worker R/W lock conflict
@@ -629,8 +677,11 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     cache_lock = threading.Lock()
 
     stop_event = threading.Event()
+    # Phase 11 §11.I.5 — pass state_writer so heartbeat thread mirrors
+    # MODULE_HEARTBEAT to the SHM slot once _WORKER_READY flips True.
     hb_thread = threading.Thread(
-        target=_heartbeat_loop, args=(send_queue, name, stop_event),
+        target=_heartbeat_loop,
+        args=(send_queue, name, stop_event, _state_writer),
         daemon=True, name=f"synthesis-hb-{name}")
     hb_thread.start()
 
@@ -726,22 +777,24 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             "recall surface will return None (caller falls back)",
             exc, exc_info=True)
 
-    _send(send_queue, MODULE_READY, name, "guardian", {
-        "titan_id": titan_id,
-        "module": "synthesis_worker",
-        "version": "1.2.0",
-        "schema_version": 1,
-        "spec_ref": "SPEC §25 / D-SPEC-123 + PLAN_synthesis_engine_Phase2.md §2B+2D",
-        "plug_counts": registry.counts(),
-        "items_tracked_at_boot": store.items_tracked(),
-        "bundles_tracked_at_boot": bundle_store.entities_tracked(),
-        "engine_recall_ready": engine_recall is not None,
-    })
-    logger.info(
-        "[synthesis_worker] MODULE_READY emitted — items_at_boot=%d "
-        "bundles_at_boot=%d plug_counts=%s",
-        store.items_tracked(), bundle_store.entities_tracked(),
-        registry.counts())
+    # Phase 11 §11.I.2 — slot transition: starting → booted (D-SPEC-141 / v1.65.0).
+    # MODULE_READY bus emit DELETED per locked D2 (no shim, no dual-publish).
+    # SHM slot is the contract; titan_hcl's 1Hz poll detects "booted" and
+    # dispatches MODULE_PROBE_REQUEST → handler below transitions slot to "running".
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+            logger.info(
+                "[synthesis_worker] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(awaiting MODULE_PROBE_REQUEST from titan_hcl) — "
+                "items_at_boot=%d bundles_at_boot=%d plug_counts=%s",
+                store.items_tracked(), bundle_store.entities_tracked(),
+                registry.counts())
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[synthesis_worker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
 
     events_recorded = 0
     bundles_maintained = 0
@@ -1310,6 +1363,25 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             payload = msg.get("payload", {}) if isinstance(msg, dict) else {}
             if not isinstance(payload, dict):
                 payload = {}
+
+            # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────
+            if msg_type == MODULE_PROBE_REQUEST and _state_writer is not None:
+                try:
+                    from titan_hcl.core.probe_dispatcher import (
+                        handle_module_probe_request,
+                    )
+                    handle_module_probe_request(
+                        msg,
+                        probe_fn=None,
+                        send_queue=send_queue,
+                        module_name=name,
+                        state_writer=_state_writer,
+                    )
+                except Exception as _probe_err:  # noqa: BLE001
+                    logger.warning(
+                        "[synthesis_worker] MODULE_PROBE_REQUEST handler "
+                        "failed: %s", _probe_err)
+                continue
 
             if msg_type == MODULE_SHUTDOWN:
                 logger.info(

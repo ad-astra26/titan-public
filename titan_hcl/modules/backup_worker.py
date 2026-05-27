@@ -51,6 +51,13 @@ logger = logging.getLogger(__name__)
 _last_hb_ts: float = 0.0
 
 
+# Phase 11 §11.I.5 (Chunk 11N) — module-level readiness sentinel; gates
+# SHM-slot heartbeat() (legacy bus heartbeat fires unconditionally for
+# the boot window so guardian_HCL's stale-heartbeat detector doesn't
+# kill a slow boot — backup_worker boot can be 10-20s on cold dry-run).
+_WORKER_READY: bool = False
+
+
 @with_error_envelope(module_name="backup", subsystem="entry", severity=_phase11_sev.FATAL)
 def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the Backup Worker subprocess.
@@ -61,6 +68,9 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         name: Guardian module name ("backup")
         config: full config dict (rFP Phase 3 reads [backup] section from here)
     """
+    global _WORKER_READY
+    _WORKER_READY = False
+
     project_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", ".."))
     if project_root not in sys.path:
@@ -68,6 +78,26 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
     logger.info("[BackupWorker] Initializing...")
     init_start = time.time()
+
+    # ── Phase 11 §11.I.5 (Chunk 11N) — SHM state-slot writer ──
+    # Constructed BEFORE the slow RebirthBackup init + dry-run cascade so
+    # the slot publishes state="starting" immediately. Heartbeats keep
+    # last_heartbeat fresh during the cold-boot window.
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority,
+            ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name=name,
+            layer="L3",
+            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[BackupWorker] Phase 11 ModuleStateWriter init failed: %s", _sw_err)
 
     # Unwrap config — arrives as the full config dict from v5_core
     full_config = config or {}
@@ -186,8 +216,16 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     logger.info("[BackupWorker] Ready in %.1fs (local_dir=%s, mode=%s)",
                 boot_elapsed, local_dir, mode)
 
-    # Signal ready (Guardian convention)
-    _send(send_queue, "MODULE_READY", name, "guardian", {})
+    # ── Phase 11 §11.I.2 — slot transition: starting → booted ──
+    # (legacy boot-signal bus emit deleted per locked D2 / no-shim policy)
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[BackupWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
     _send(send_queue, "BACKUP_WORKER_READY", name, "all", {
         "titan_id": titan_id,
         "mode": mode,
@@ -238,7 +276,7 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             msg = recv_queue.get(timeout=5.0)
         except Empty:
             if time.time() - last_heartbeat > 10.0:
-                _send_heartbeat(send_queue, name)
+                _send_heartbeat(send_queue, name, state_writer=_state_writer)
                 last_heartbeat = time.time()
             # Periodic in-loop runway check (I6 also writes daily telemetry via cron)
             if (mode == "mainnet_arweave"
@@ -251,6 +289,25 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             break
 
         msg_type = msg.get("type", "")
+
+        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ──
+        if msg_type == bus.MODULE_PROBE_REQUEST and _state_writer is not None:
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg,
+                    probe_fn=None,
+                    send_queue=send_queue,
+                    module_name=name,
+                    state_writer=_state_writer,
+                )
+            except Exception as _probe_err:  # noqa: BLE001
+                logger.warning(
+                    "[BackupWorker] MODULE_PROBE_REQUEST handler failed: %s",
+                    _probe_err)
+            continue
 
         # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────
         if _b1_reporter.handles(msg_type):
@@ -271,11 +328,11 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
         try:
             if msg_type == bus.MEDITATION_COMPLETE:
-                _send_heartbeat(send_queue, name)  # keep alive during backup
+                _send_heartbeat(send_queue, name, state_writer=_state_writer)
                 _handle_meditation(state, msg)
                 last_heartbeat = time.time()
             elif msg_type == bus.BACKUP_TRIGGER_MANUAL:
-                _send_heartbeat(send_queue, name)
+                _send_heartbeat(send_queue, name, state_writer=_state_writer)
                 _handle_manual(state, msg)
                 last_heartbeat = time.time()
             # Ignore other msg types — don't complain (bus delivers many)
@@ -801,8 +858,13 @@ def _send(send_queue, msg_type: str, src: str, dst: str, payload: dict,
             record_send_drop(src, dst, msg_type)
 
 
-def _send_heartbeat(send_queue, name: str) -> None:
-    """Heartbeat to Guardian (≤1 per 3s, matches memory_worker)."""
+def _send_heartbeat(send_queue, name: str,
+                    state_writer: Optional[object] = None) -> None:
+    """Heartbeat to Guardian (≤1 per 3s, matches memory_worker).
+
+    Phase 11 §11.I.5: also publishes state_writer.heartbeat() on the SHM
+    slot once _WORKER_READY is True. SHM writes are best-effort.
+    """
     global _last_hb_ts
     now = time.time()
     if now - _last_hb_ts < 3.0:
@@ -815,3 +877,8 @@ def _send_heartbeat(send_queue, name: str) -> None:
         rss_mb = 0
     _send(send_queue, "MODULE_HEARTBEAT", name, "guardian",
           {"rss_mb": round(rss_mb, 1)})
+    if state_writer is not None and _WORKER_READY:
+        try:
+            state_writer.heartbeat()
+        except Exception:  # noqa: BLE001 — never crash the heartbeat
+            pass

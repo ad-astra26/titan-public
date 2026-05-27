@@ -20,7 +20,10 @@ Bus protocol:
               "notices": []
             })
             REFLEX_READY (titan_id, ts) — once on boot
-            MODULE_READY/MODULE_HEARTBEAT — Guardian state machine
+            MODULE_HEARTBEAT — Guardian state machine
+            (MODULE_READY emit RETIRED 2026-05-27 per Phase 11
+            D-SPEC-141 / v1.65.0 locked D2 — readiness now flows via
+            module_reflex_state.bin SHM slot + MODULE_PROBE_REQUEST)
 
 When `microkernel.a8_reflex_subprocess_enabled=false` (default), this
 worker is NOT autostarted by Guardian — the parent's reflex_collector
@@ -49,6 +52,14 @@ logger = logging.getLogger("reflex")
 _HEARTBEAT_INTERVAL_S = 30.0
 
 
+# Phase 11 §11.I.3/§11.I.5 — module-level readiness sentinel mirrored to
+# `module_reflex_state.bin` via ModuleStateWriter so titan_hcl's 1Hz SHM
+# poll + the orchestrator's MODULE_PROBE_REQUEST dispatcher see real
+# liveness. Flipped True only after the ReflexCollector aggregator is
+# constructed.
+_WORKER_READY: bool = False
+
+
 @with_error_envelope(module_name="reflex", subsystem="entry", severity=_phase11_sev.FATAL)
 def reflex_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the Reflex worker subprocess.
@@ -59,10 +70,30 @@ def reflex_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         name: Guardian module name (must equal "reflex")
         config: full config dict — used for titan_id + reflex params.
     """
+    # Phase 11 §11.I.5 — reset module-level readiness flag.
+    global _WORKER_READY
+    _WORKER_READY = False
+
     project_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", ".."))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
+
+    # ── Phase 11 §11.I.5 — SHM state-slot writer (G21 single-writer) ──
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority, ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name=name, layer="L3",
+            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[ReflexWorker] Phase 11 ModuleStateWriter init failed "
+            "(continuing — SHM slot will be absent): %s", _sw_err)
 
     full_config = config or {}
     from titan_hcl.core.state_registry import resolve_titan_id
@@ -84,13 +115,21 @@ def reflex_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         logger.error("[ReflexWorker] aggregator init failed: %s — exiting", e)
         return
 
-    # Boot signals
+    # ── Phase 11 §11.I.2 — SHM slot transition starting → booted ─────
+    # MODULE_READY bus emit DELETED per D-SPEC-141 / v1.65.0 locked D2.
+    # REFLEX_READY broadcast retained — domain event for subscribers.
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+            logger.info(
+                "[ReflexWorker] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[ReflexWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
     try:
-        send_queue.put({
-            "type": bus.MODULE_READY, "src": name, "dst": "guardian",
-            "payload": {"titan_id": titan_id, "ts": time.time()},
-            "ts": time.time(),
-        })
         send_queue.put({
             "type": bus.REFLEX_READY, "src": name, "dst": "all",
             "payload": {"titan_id": titan_id, "ts": time.time()},
@@ -119,6 +158,14 @@ def reflex_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 })
             except Exception:
                 pass
+            # Phase 11 §11.I.5 — SHM slot heartbeat sidecar (same cadence
+            # as the legacy bus path so guardian_hcl's SHM-staleness
+            # detector sees fresh data).
+            if _state_writer is not None and _WORKER_READY:
+                try:
+                    _state_writer.heartbeat()
+                except Exception:  # noqa: BLE001 — never crash heartbeat
+                    pass
             last_heartbeat = now
 
         try:
@@ -136,6 +183,22 @@ def reflex_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         # missing original 15-worker wiring).
         from titan_hcl.core import worker_swap_handler as _swap
         if _swap.maybe_dispatch_swap_msg(msg):
+            continue
+
+        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────────
+        if msg_type == "MODULE_PROBE_REQUEST":
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg, send_queue=send_queue, module_name=name,
+                    state_writer=_state_writer, probe_fn=None,
+                )
+            except Exception as _probe_err:  # noqa: BLE001
+                logger.warning(
+                    "[ReflexWorker] MODULE_PROBE_REQUEST handler "
+                    "failed: %s", _probe_err)
             continue
 
         if msg_type == bus.MODULE_SHUTDOWN:

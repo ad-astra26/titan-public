@@ -180,6 +180,12 @@ def _maybe_get_writer(spec, titan_id: str):
         return None
 
 
+# Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel.
+# Flipped True after HormonalSystem init + state load + SHM writer ready.
+# Gates SHM-slot heartbeat so titan_hcl's 1Hz poll sees real liveness.
+_WORKER_READY: bool = False
+
+
 @with_error_envelope(module_name="hormonal_module", subsystem="entry", severity=_phase11_sev.FATAL)
 def hormonal_worker_main(
     recv_queue,
@@ -196,10 +202,35 @@ def hormonal_worker_main(
         config: full config dict — used for titan_id, hormonal_pressure config,
             and the microkernel.shm_hormonal_enabled flag.
     """
+    # Phase 11 §11.I.5 (Chunk 11N) — readiness flag reset per entry.
+    global _WORKER_READY
+    _WORKER_READY = False
+
     project_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", ".."))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
+
+    # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21 per worker) ──
+    # Constructed BEFORE slow HormonalSystem init so the slot publishes
+    # state="starting" immediately. In-loop heartbeat calls
+    # _state_writer.heartbeat() so guardian_hcl staleness detector survives boot.
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority,
+            ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name="hormonal_module",
+            layer="L2",
+            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[HormonalWorker] Phase 11 ModuleStateWriter init failed "
+            "(continuing on legacy path): %s", _sw_err)
 
     full_config = config or {}
     # rFP_trinity_130d_phase2_5_closure §4 (2026-05-08): use canonical
@@ -244,14 +275,19 @@ def hormonal_worker_main(
 
     # Boot signals (per reflex_worker.py:81-93 pattern).
     boot_ts = time.time()
-    try:
-        send_queue.put({
-            "type": bus.MODULE_READY, "src": name, "dst": "guardian",
-            "payload": {"titan_id": titan_id, "ts": boot_ts},
-            "ts": boot_ts,
-        })
-    except Exception:
-        pass
+    # Phase 11 §11.I.2 — slot transition: starting → booted (D-SPEC-141 / v1.65.0).
+    # MODULE_READY bus emit DELETED per locked D2 (no shim, no dual-publish).
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+            logger.info(
+                "[HormonalWorker] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[HormonalWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
     if hasattr(bus, "HORMONAL_READY"):
         try:
             send_queue.put({
@@ -325,6 +361,12 @@ def hormonal_worker_main(
                 })
             except Exception:
                 pass
+            # Phase 11 §11.I.5 — SHM-slot heartbeat sidecar.
+            if _state_writer is not None and _WORKER_READY:
+                try:
+                    _state_writer.heartbeat()
+                except Exception:  # noqa: BLE001
+                    pass
             last_heartbeat_ts = now
 
         # Pull next bus message (or timeout for heartbeat loop).
@@ -336,6 +378,25 @@ def hormonal_worker_main(
             continue
 
         msg_type = msg.get("type")
+
+        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────────
+        if msg_type == bus.MODULE_PROBE_REQUEST and _state_writer is not None:
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg,
+                    probe_fn=None,
+                    send_queue=send_queue,
+                    module_name=name,
+                    state_writer=_state_writer,
+                )
+            except Exception as _probe_err:  # noqa: BLE001
+                logger.warning(
+                    "[HormonalWorker] MODULE_PROBE_REQUEST handler failed: %s",
+                    _probe_err)
+            continue
 
         # B.2.1 supervision-transfer dispatch (mirrors reflex_worker:130-132).
         try:

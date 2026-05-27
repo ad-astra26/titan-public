@@ -30,6 +30,7 @@ from titan_hcl.core.shadow_orchestrator import (
     _revive_guardian_after_unwind,
 )
 from titan_hcl.guardian_hcl import Guardian, ModuleSpec
+from titan_hcl.supervisor import Supervisor  # Phase 11 §11.I.1 supervisor split
 
 
 def _noop_entry(*args, **kwargs):  # pragma: no cover
@@ -65,7 +66,7 @@ def test_resume_after_stop_all_re_enables_monitor_tick():
     # Simulate stop_all having run
     g._stop_requested = True
     # monitor_tick should early-return while paused
-    g.monitor_tick()  # no exception, no work done
+    Supervisor(g.bus, g).monitor_tick()  # no exception, no work done
 
     g.resume()
     # Now monitor_tick should NOT early-return (does its normal work)

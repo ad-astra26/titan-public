@@ -45,7 +45,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutTimeout
 from pathlib import Path
 from queue import Empty
-from typing import Optional
+from typing import Any, Optional
 
 from titan_hcl import bus
 from titan_hcl.bus import (
@@ -55,7 +55,6 @@ from titan_hcl.bus import (
     HEALTH_HEAL_ATTEMPT,
     HEALTH_HEAL_FAILED,
     MODULE_HEARTBEAT,
-    MODULE_READY,
     MODULE_SHUTDOWN,
     make_msg,
 )
@@ -346,12 +345,35 @@ def _send(send_queue, msg_type: str, src: str, dst: str,
             msg_type, dst, e)
 
 
+# Phase 11 §11.I.3/§11.I.5 — module-level readiness sentinel mirrored to
+# the SHM slot (`module_health_monitor_state.bin`) via ModuleStateWriter so
+# titan_hcl's 1Hz SHM poll + the orchestrator's MODULE_PROBE_REQUEST
+# dispatcher see real liveness rather than a boot-time "subscribed-but-
+# not-warm" lie. Flipped True only after plugin discovery + state load
+# complete.
+_WORKER_READY: bool = False
+
+
 def _heartbeat_loop(send_queue, name: str,
-                     stop_event: threading.Event) -> None:
-    """Daemon thread — MODULE_HEARTBEAT every 30s."""
+                     stop_event: threading.Event,
+                     state_writer: Optional[Any] = None) -> None:
+    """Daemon thread — MODULE_HEARTBEAT every 30s.
+
+    Phase 11 §11.I.5: also publishes ModuleStateWriter.heartbeat() on the
+    SHM slot when `state_writer` is provided AND `_WORKER_READY` is True,
+    so guardian_hcl's SHM-staleness detector + observatory /v6/readiness
+    see fresh data on the same cadence as the legacy bus path. During the
+    boot window the slot keeps state="starting"/"booted" instead of
+    prematurely asserting state="running".
+    """
     while not stop_event.is_set():
         _send(send_queue, MODULE_HEARTBEAT, name, "guardian",
               {"ts": time.time()})
+        if state_writer is not None and _WORKER_READY:
+            try:
+                state_writer.heartbeat()
+            except Exception:  # noqa: BLE001 — never crash the heartbeat
+                pass
         stop_event.wait(HEARTBEAT_INTERVAL_S)
 
 
@@ -521,9 +543,15 @@ def health_monitor_worker_main(recv_queue, send_queue, name: str,
       4. discover plugins, filter by applies_on, instantiate.
       5. load state.json (restores schedule + heal history).
       6. start heartbeat thread (30s).
-      7. emit MODULE_READY.
+      7. Phase 11 §11.I.2 — SHM slot state=booted (replaces legacy
+         MODULE_READY bus emit per D-SPEC-141 / v1.65.0 locked D2).
       8. main tick loop: per-plugin scheduler + bus drain.
     """
+    # Phase 11 §11.I.5 — reset module-level readiness sentinel for both
+    # fork-mode (parent's True is inherited) and spawn-mode (fresh False).
+    global _WORKER_READY
+    _WORKER_READY = False
+
     # === BOILERPLATE: spawn-mode sys.path bootstrap ===
     project_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -556,6 +584,36 @@ def health_monitor_worker_main(recv_queue, send_queue, name: str,
     titan_id = resolve_titan_id()
     boot_ts = time.time()
 
+    # ── Phase 11 §11.I.5 — SHM state-slot writer (G21 single-writer) ──
+    # Constructed BEFORE plugin discovery + state load so the slot
+    # publishes state="starting" immediately. titan_hcl's 1Hz SHM poll
+    # sees the worker is alive while it warms. health_monitor is
+    # MANDATORY per §3H.10 — it MUST be alive before any worker errors
+    # emit so the L3 self-heal pipeline can react.
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority, ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name=name, layer="L3",
+            boot_priority=BootPriority.MANDATORY,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[HealthMonitor] Phase 11 ModuleStateWriter init failed "
+            "(continuing — SHM slot will be absent): %s", _sw_err)
+
+    # === Heartbeat thread (started EARLY per Phase 11 §11.I.5 — covers ==
+    # === the slow plugin-discovery boot window with both bus + SHM) ===
+    stop_event = threading.Event()
+    hb_thread = threading.Thread(
+        target=_heartbeat_loop,
+        args=(send_queue, name, stop_event, _state_writer),
+        daemon=True, name="health-monitor-heartbeat")
+    hb_thread.start()
+
     # === Plugin discovery + state load ===
     plugins = _discover_plugins(titan_id, config)
     state_path = _state_dir() / _STATE_FILE
@@ -584,19 +642,22 @@ def health_monitor_worker_main(recv_queue, send_queue, name: str,
         titan_id, len(runtimes),
         sorted(runtimes.keys()))
 
-    # === Heartbeat thread ===
-    stop_event = threading.Event()
-    hb_thread = threading.Thread(
-        target=_heartbeat_loop, args=(send_queue, name, stop_event),
-        daemon=True, name="health-monitor-heartbeat")
-    hb_thread.start()
-
-    # === MODULE_READY ===
-    _send(send_queue, MODULE_READY, name, "guardian", {
-        "titan_id": titan_id, "ts": boot_ts,
-        "plugin_count": len(runtimes),
-        "plugins": sorted(runtimes.keys()),
-    })
+    # === Phase 11 §11.I.2 — SHM slot transition starting → booted ====
+    # (heartbeat thread already started above before plugin discovery)
+    # MODULE_READY bus emit DELETED per D-SPEC-141 / v1.65.0 locked D2.
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+            logger.info(
+                "[HealthMonitor] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(awaiting MODULE_PROBE_REQUEST from titan_hcl) "
+                "titan_id=%s plugin_count=%d",
+                titan_id, len(runtimes))
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[HealthMonitor] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
 
     # === Bounded executor for check() runs ===
     # max_workers=4 — small bound; checks are 30s-capped, one per plugin
@@ -730,6 +791,21 @@ def health_monitor_worker_main(recv_queue, send_queue, name: str,
                         "exiting cleanly.")
                     shutdown_requested = True
                     break
+                # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────
+                if msg_type == "MODULE_PROBE_REQUEST":
+                    try:
+                        from titan_hcl.core.probe_dispatcher import (
+                            handle_module_probe_request,
+                        )
+                        handle_module_probe_request(
+                            msg, send_queue=send_queue, module_name=name,
+                            state_writer=_state_writer, probe_fn=None,
+                        )
+                    except Exception as _probe_err:  # noqa: BLE001
+                        logger.warning(
+                            "[HealthMonitor] MODULE_PROBE_REQUEST handler "
+                            "failed: %s", _probe_err)
+                    continue
                 if msg_type == HEAL_RESULT:
                     payload = msg.get("payload") or {}
                     plugin_name = payload.get("plugin")

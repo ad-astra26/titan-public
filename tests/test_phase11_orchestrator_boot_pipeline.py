@@ -166,6 +166,10 @@ def test_start_all_writes_fleet_ready_to_titan_hcl_state(tmp_path,
     guardian_hcl + observatory can read it."""
     monkeypatch.setenv("TITAN_SHM_ROOT", str(tmp_path))
     monkeypatch.setenv("TITAN_ID", "test")
+    # G21 single-writer gate (per orchestrator._ensure_titan_hcl_state_writer):
+    # only the canonical orchestrator process may publish titan_hcl_state.bin.
+    # Tests exercising the canonical path must opt in.
+    monkeypatch.setenv("TITAN_HCL_STATE_WRITER_CANONICAL", "1")
 
     o = _make_orch()
     o.register(_spec("a", autostart=True, boot_priority="mandatory"))
@@ -195,6 +199,7 @@ def test_start_all_publishes_phase_a_done_before_phase_b_finishes(
     fleet_optional_ready)."""
     monkeypatch.setenv("TITAN_SHM_ROOT", str(tmp_path))
     monkeypatch.setenv("TITAN_ID", "test")
+    monkeypatch.setenv("TITAN_HCL_STATE_WRITER_CANONICAL", "1")
 
     o = _make_orch(post_boot_stagger_delay_s=10.0)  # never finishes in test
     o.register(_spec("a", autostart=True, boot_priority="mandatory"))

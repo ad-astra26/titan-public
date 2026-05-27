@@ -34,7 +34,9 @@ Bus publications:
   - METABOLIC_TIER_CHANGED              (on every tier transition)
   - GATE_DECISION_RECORDED              (per evaluate_gate call)
   - METABOLIC_STATS_UPDATED             (1Hz coalesced; bulk via SHM)
-  - MODULE_READY / MODULE_HEARTBEAT / MODULE_SHUTDOWN (standard per §11)
+  - MODULE_HEARTBEAT / MODULE_SHUTDOWN  (standard per §11; legacy MODULE_READY
+                                         retired per Phase 11 §11.I.2 — SHM
+                                         slot state=booted is the contract)
 
 Implementation reference: social_graph_worker.py (CANONICAL §9.B
 TEMPLATE) for `=== BOILERPLATE ===` sections + memory_worker.py
@@ -73,6 +75,13 @@ logger = logging.getLogger(__name__)
 
 # Module name (matches Guardian registry per SPEC §9.B v1.7.2).
 MODULE_NAME = "metabolism"
+
+# Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel
+# mirrored to the per-process SHM slot via ModuleStateWriter. Set False at
+# import time; flipped True after MetabolismController + SHM publisher
+# init complete. Heartbeat publishes to the SHM slot only once True so the
+# slot stays at "starting"/"booted" during the slow boot window.
+_WORKER_READY: bool = False
 
 # Cadence + lifecycle constants.
 _HEARTBEAT_INTERVAL_S = 10.0            # SPEC §10.B MODULE_HEARTBEAT_INTERVAL_S
@@ -117,8 +126,15 @@ def _send_msg(send_queue, msg_type: str, src: str, dst: str, payload: dict,
         pass
 
 
-def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None) -> None:
-    """Emit MODULE_HEARTBEAT to guardian_HCL with current RSS."""
+def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None,
+                    state_writer: Optional[Any] = None) -> None:
+    """Emit MODULE_HEARTBEAT to guardian_HCL with current RSS.
+
+    Phase 11 §11.I.5 (Chunk 11N): also publishes ModuleStateWriter.heartbeat()
+    on the SHM slot when `state_writer` is provided AND `_WORKER_READY` is
+    True so guardian_HCL's SHM-staleness detector + observatory
+    /v6/readiness see fresh data on the same cadence as the legacy bus path.
+    """
     try:
         import resource
         rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
@@ -128,6 +144,11 @@ def _send_heartbeat(send_queue, name: str, extra: Optional[dict] = None) -> None
     if extra:
         payload.update(extra)
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian", payload)
+    if state_writer is not None and _WORKER_READY:
+        try:
+            state_writer.heartbeat()
+        except Exception:  # noqa: BLE001 — never crash heartbeat
+            pass
 
 
 def _send_response(send_queue, src_name: str, dst: str, payload: dict,
@@ -379,6 +400,12 @@ def metabolism_worker_main(recv_queue, send_queue, name: str,
         logger.debug(
             "[MetabolismWorker] pdeathsig install skipped: %s", _err)
 
+    # Phase 11 §11.I.5 (Chunk 11N) — reset module-level readiness sentinel
+    # on every entry (fork-mode re-entries inherit parent's True;
+    # spawn-mode re-spawns get fresh False; explicit reset covers both).
+    global _WORKER_READY
+    _WORKER_READY = False
+
     from titan_hcl.core.state_registry import resolve_titan_id
     titan_id = (
         (config.get("info_banner", {}) or {}).get("titan_id")
@@ -389,6 +416,26 @@ def metabolism_worker_main(recv_queue, send_queue, name: str,
     logger.info(
         "[MetabolismWorker] Booting (titan_id=%s) — rFP §4.J + D-SPEC-51",
         titan_id)
+
+    # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21) ──
+    # Built BEFORE the slow MetabolismController init so titan_hcl's 1Hz
+    # SHM poll sees the worker is alive while it warms.
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority,
+            ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name=name,
+            layer="L2",
+            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[MetabolismWorker] Phase 11 ModuleStateWriter init failed "
+            "(continuing — SHM slot disabled): %s", _sw_err)
 
     # === MODULE-SPECIFIC: MetabolismController init ===
     metabolism = _init_metabolism(config, titan_id=titan_id)
@@ -417,11 +464,21 @@ def metabolism_worker_main(recv_queue, send_queue, name: str,
             "absent slot + use cold defaults): %s",
             _shm_err, exc_info=True)
 
-    # MODULE_READY (guardian boot signal). No dedicated METABOLISM_READY —
-    # /v4/metabolism endpoint just reads SHM with cold-default tolerance.
-    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {
-        "titan_id": titan_id, "ts": boot_ts, "tier": last_published_tier["tier"],
-    })
+    # ── Phase 11 §11.I.2 — slot transition: starting → booted ─────────
+    # Replaces the legacy MODULE_READY bus emit per locked D2 — the SHM
+    # slot state=booted is the contract. /v4/metabolism endpoint reads
+    # metabolism_state.bin SHM with cold-default tolerance.
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+            logger.info(
+                "[MetabolismWorker] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[MetabolismWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
 
     # === MODULE-SPECIFIC: 1 Hz SHM publisher thread + tier-transition detector ===
     _periodic_stop = threading.Event()
@@ -493,7 +550,7 @@ def metabolism_worker_main(recv_queue, send_queue, name: str,
             _send_heartbeat(send_queue, name, extra={
                 "tier": last_published_tier["tier"],
                 "gate_ring_size": len(gate_ring),
-            })
+            }, state_writer=_state_writer)
             last_heartbeat = now
 
         try:
@@ -512,6 +569,25 @@ def metabolism_worker_main(recv_queue, send_queue, name: str,
             pass
 
         msg_type = msg.get("type", "")
+
+        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ────────
+        if msg_type == bus.MODULE_PROBE_REQUEST:
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg,
+                    probe_fn=None,
+                    send_queue=send_queue,
+                    module_name=name,
+                    state_writer=_state_writer,
+                )
+            except Exception as _probe_err:  # noqa: BLE001
+                logger.warning(
+                    "[MetabolismWorker] MODULE_PROBE_REQUEST handler "
+                    "failed: %s", _probe_err)
+            continue
 
         if msg_type == bus.MODULE_SHUTDOWN:
             logger.info(

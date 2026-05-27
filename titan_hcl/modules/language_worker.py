@@ -36,6 +36,13 @@ from titan_hcl.errors import Severity as _phase11_sev
 logger = logging.getLogger(__name__)
 
 
+# Phase 11 §11.I.5 (Chunk 11N) — module-level readiness sentinel; gates
+# SHM-slot heartbeat() (legacy bus heartbeat fires unconditionally for
+# the boot window so guardian_HCL's stale-heartbeat detector doesn't
+# kill a slow boot).
+_WORKER_READY: bool = False
+
+
 # ── Phase D.1 — META_LANGUAGE reward helpers ───────────────────────────
 def _count_grounded_words(db_path: str) -> int:
     """Count words with confidence >= 0.3 (grounded threshold).
@@ -157,6 +164,9 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
     """
     from queue import Empty
 
+    global _WORKER_READY
+    _WORKER_READY = False
+
     # Project root for imports
     project_root = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
     if project_root not in sys.path:
@@ -164,6 +174,28 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
 
     logger.info("[LanguageWorker] Initializing language subsystem...")
     init_start = time.time()
+
+    # ── Phase 11 §11.I.5 (Chunk 11N) — SHM state-slot writer ──
+    # Constructed BEFORE the slow CompositionEngine / LanguageTeacher /
+    # PatternLibrary / vocab init so the slot publishes state="starting"
+    # immediately. The heartbeat thread below keeps last_heartbeat fresh
+    # during the cold-boot window.
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority,
+            ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name=name,
+            layer="L2",
+            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[LanguageWorker] Phase 11 ModuleStateWriter init failed: %s",
+            _sw_err)
 
     # ── Load per-Titan configuration ─────────────────────────────────
     from titan_hcl.logic.language_config import load_config
@@ -529,8 +561,16 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                 "GV" if grammar_validator else "-",
                 "ON" if cgn else "OFF")
 
-    # ── Signal ready to Guardian ─────────────────────────────────────
-    _send_msg(send_queue, bus.MODULE_READY, name, "guardian", {})
+    # ── Phase 11 §11.I.2 — slot transition: starting → booted ──
+    # (legacy boot-signal bus emit deleted per locked D2 / no-shim policy)
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[LanguageWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
 
     # Phase C Session 4 (rFP §4.B.7) — SHM-direct language_state.bin +
     # events_teacher_state.bin publishers. Closes the LANGUAGE_STATS_UPDATE
@@ -572,7 +612,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
 
     def _heartbeat_loop():
         while not _hb_stop.is_set():
-            _send_heartbeat(send_queue, name)
+            _send_heartbeat(send_queue, name, state_writer=_state_writer)
             _hb_stop.wait(30.0)
 
     hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True,
@@ -601,7 +641,7 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
         # elif chain without matching any explicit msg_type would starve the
         # Empty path AND skip every explicit per-msg heartbeat call. See
         # media_worker.py Option A fix 2026-04-15 + worker audit.
-        _send_heartbeat(send_queue, name)
+        _send_heartbeat(send_queue, name, state_writer=_state_writer)
 
         msg = None
         try:
@@ -1127,6 +1167,25 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
 
 
         msg_type = msg.get("type", "")
+
+        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ──
+        if msg_type == bus.MODULE_PROBE_REQUEST and _state_writer is not None:
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg,
+                    probe_fn=None,
+                    send_queue=send_queue,
+                    module_name=name,
+                    state_writer=_state_writer,
+                )
+            except Exception as _probe_err:  # noqa: BLE001
+                logger.warning(
+                    "[LanguageWorker] MODULE_PROBE_REQUEST handler failed: %s",
+                    _probe_err)
+            continue
 
         # ── Control messages ─────────────────────────────────────────
         # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────
@@ -3235,8 +3294,13 @@ def _send_response(send_queue, src: str, dst: str,
 _last_hb_ts: float = 0.0
 
 
-def _send_heartbeat(send_queue, name: str) -> None:
-    """Send heartbeat to Guardian with RSS info (throttled to ≤1 per 3s)."""
+def _send_heartbeat(send_queue, name: str,
+                    state_writer: object | None = None) -> None:
+    """Send heartbeat to Guardian with RSS info (throttled to ≤1 per 3s).
+
+    Phase 11 §11.I.5: also publishes state_writer.heartbeat() on the SHM
+    slot once _WORKER_READY is True. SHM writes are best-effort.
+    """
     global _last_hb_ts
     now = time.time()
     if now - _last_hb_ts < 3.0:
@@ -3249,3 +3313,8 @@ def _send_heartbeat(send_queue, name: str) -> None:
         rss_mb = 0
     _send_msg(send_queue, bus.MODULE_HEARTBEAT, name, "guardian",
               {"rss_mb": round(rss_mb, 1)})
+    if state_writer is not None and _WORKER_READY:
+        try:
+            state_writer.heartbeat()
+        except Exception:  # noqa: BLE001 — never crash the heartbeat
+            pass

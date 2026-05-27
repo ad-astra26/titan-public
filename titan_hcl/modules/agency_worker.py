@@ -14,7 +14,9 @@ Bus protocol:
     "handle_intent"|"dispatch_from_nervous_signals"|"assess"|
     "agency_stats"|"assessment_stats")
   EMITS:    RESPONSE(dst=requester, payload=action_result|list|assessment|stats)
-            MODULE_READY (dst="guardian") — once on boot
+            (MODULE_READY emit RETIRED 2026-05-27 per Phase 11
+            D-SPEC-141 / v1.65.0 locked D2 — readiness now flows via
+            module_agency_worker_state.bin SHM slot + MODULE_PROBE_REQUEST)
             AGENCY_READY (dst="all") — once on boot, marks proxy bus-routed
             AGENCY_STATS (dst="all") — every 60s, refreshes proxy cache
             ASSESSMENT_STATS (dst="all") — every 60s, refreshes proxy cache
@@ -48,6 +50,14 @@ logger = logging.getLogger("agency_worker")
 
 _HEARTBEAT_INTERVAL_S = 30.0
 _STATS_PUBLISH_INTERVAL_S = 60.0
+
+
+# Phase 11 §11.I.3/§11.I.5 — module-level readiness sentinel mirrored to
+# `module_agency_worker_state.bin` via ModuleStateWriter so titan_hcl's
+# 1Hz SHM poll + the orchestrator's MODULE_PROBE_REQUEST dispatcher see
+# real liveness. Flipped True only after helper-registry + AgencyModule
+# + SelfAssessment construct cleanly.
+_WORKER_READY: bool = False
 
 
 def _build_llm_fn(inference_cfg: dict, *, api_base: str = "http://127.0.0.1:7777",
@@ -342,10 +352,34 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 + knowledge_pipeline + info_banner + memory_and_storage
                 sections through to the helpers + LLM fn.
     """
+    # Phase 11 §11.I.5 — reset module-level readiness flag.
+    global _WORKER_READY
+    _WORKER_READY = False
+
     project_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", ".."))
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
+
+    # ── Phase 11 §11.I.5 — SHM state-slot writer (G21 single-writer) ──
+    # Constructed BEFORE helper-registry/AgencyModule/SelfAssessment init
+    # so the slot publishes state="starting" immediately. The periodic
+    # heartbeat branch below publishes state_writer.heartbeat() once
+    # _WORKER_READY flips True.
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority, ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name=name, layer="L3",
+            boot_priority=BootPriority.OPTIONAL_POST_BOOT,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[AgencyWorker] Phase 11 ModuleStateWriter init failed "
+            "(continuing — SHM slot will be absent): %s", _sw_err)
 
     full_config = config or {}
     from titan_hcl.core.state_registry import resolve_titan_id
@@ -388,17 +422,22 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     logger.info("[AgencyWorker] Booted: %d helpers (%s)",
                 helper_count, registry.list_all_names())
 
-    # Boot signals: MODULE_READY → Guardian flips state to RUNNING
-    # (without this, /health shows the worker DEGRADED forever — same
-    # bug A.8.3 hot-fixed in commit 9406f13f). AGENCY_READY broadcast
-    # marks proxy bus-routed for any consumer that wants to confirm.
+    # ── Phase 11 §11.I.2 — SHM slot transition starting → booted ─────
+    # MODULE_READY bus emit DELETED per D-SPEC-141 / v1.65.0 locked D2.
+    # AGENCY_READY broadcast retained — domain event marking proxy
+    # bus-routed; consumed by parent _agency_loop wiring.
+    _WORKER_READY = True
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+            logger.info(
+                "[AgencyWorker] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[AgencyWorker] Phase 11 write_state(booted) failed: %s",
+                _swb_err)
     try:
-        send_queue.put({
-            "type": bus.MODULE_READY, "src": name, "dst": "guardian",
-            "payload": {"titan_id": titan_id, "helper_count": helper_count,
-                        "ts": time.time()},
-            "ts": time.time(),
-        })
         send_queue.put({
             "type": bus.AGENCY_READY, "src": name, "dst": "all",
             "payload": {"titan_id": titan_id, "helper_count": helper_count,
@@ -472,6 +511,14 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 })
             except Exception:
                 pass
+            # Phase 11 §11.I.5 — SHM slot heartbeat sidecar (same cadence
+            # as the legacy bus path so guardian_hcl's SHM-staleness
+            # detector + observatory /v6/readiness see fresh data).
+            if _state_writer is not None and _WORKER_READY:
+                try:
+                    _state_writer.heartbeat()
+                except Exception:  # noqa: BLE001 — never crash heartbeat
+                    pass
             last_heartbeat = now
 
         # Periodic stats publish — refreshes proxy cached attrs in parent
@@ -509,6 +556,22 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         # this newer worker — original 15-worker wiring predates A.8.6).
         from titan_hcl.core import worker_swap_handler as _swap
         if _swap.maybe_dispatch_swap_msg(msg):
+            continue
+
+        # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────────
+        if msg_type == "MODULE_PROBE_REQUEST":
+            try:
+                from titan_hcl.core.probe_dispatcher import (
+                    handle_module_probe_request,
+                )
+                handle_module_probe_request(
+                    msg, send_queue=send_queue, module_name=name,
+                    state_writer=_state_writer, probe_fn=None,
+                )
+            except Exception as _probe_err:  # noqa: BLE001
+                logger.warning(
+                    "[AgencyWorker] MODULE_PROBE_REQUEST handler "
+                    "failed: %s", _probe_err)
             continue
 
         if msg_type == bus.MODULE_SHUTDOWN:
