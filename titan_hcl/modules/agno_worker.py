@@ -50,6 +50,7 @@ from typing import Any, Optional
 from titan_hcl import bus
 from titan_hcl.bus import (
     AGNO_WORKER_READY,
+    CGN_LEXICON_UPDATED,
     CHAT_REQUEST,
     CHAT_RESPONSE,
     CHAT_STREAM_CHUNK,
@@ -220,6 +221,26 @@ def _ground_for_goal_hook(plugin: Any, text: str) -> list[str]:
         return out
     except Exception:
         return []
+
+
+def _load_cgn_lexicon(plugin: Any) -> int:
+    """P8.Y fold-in: load `data/cgn_lexicon_snapshot.json` into
+    `plugin.cgn_lexicon` so `_ground_for_goal_hook` returns real
+    concept_ids instead of `[]`.
+
+    Soft-fail: missing snapshot → leaves plugin.cgn_lexicon empty
+    (current production behavior, no regression). Called at boot
+    + on CGN_LEXICON_UPDATED bus event."""
+    try:
+        from titan_hcl.cgn.lexicon_exporter import load_lexicon_snapshot
+        lex = load_lexicon_snapshot()
+        if not isinstance(lex, dict):
+            return 0
+        plugin.cgn_lexicon = lex
+        return len(lex)
+    except Exception as e:
+        logger.debug("[AgnoWorker] _load_cgn_lexicon failed: %s", e)
+        return 0
 
 
 def _send(send_queue, msg_type: str, src: str, dst: str,
@@ -1119,6 +1140,30 @@ def agno_worker_main(recv_queue, send_queue, name: str,
                 _bc_err,
             )
 
+    # ── Phase 8.Y fold-in: CGN lexicon loader ───────────────────────
+    # Reads data/cgn_lexicon_snapshot.json into plugin.cgn_lexicon so
+    # `_ground_for_goal_hook` returns real concept_ids instead of `[]`.
+    # Soft-fail: missing snapshot = lexicon stays empty (no regression
+    # vs pre-P8.Y).
+    try:
+        _lex_size = _load_cgn_lexicon(worker_plugin)
+        if _lex_size > 0:
+            logger.info(
+                "[AgnoWorker] Phase 8.Y CGN lexicon loaded — %d entries",
+                _lex_size,
+            )
+        else:
+            logger.info(
+                "[AgnoWorker] Phase 8.Y CGN lexicon not yet exported "
+                "(empty/missing); _ground_for_goal_hook will return [] "
+                "until cgn_worker fires CGN_LEXICON_UPDATED"
+            )
+    except Exception as _lex_err:
+        logger.debug(
+            "[AgnoWorker] Phase 8.Y CGN lexicon boot-load failed: %s",
+            _lex_err,
+        )
+
     # ── SHM publisher (G21 single-writer for agno_state.bin) ──
     try:
         publisher = AgnoStatePublisher(name=name)
@@ -1198,6 +1243,23 @@ def agno_worker_main(recv_queue, send_queue, name: str,
             if msg_type == MODULE_SHUTDOWN:
                 logger.info("[AgnoWorker] Shutdown requested")
                 break
+
+            # P8.Y fold-in: cgn_worker emits this on every grounding mutation
+            # + 5-min snapshot cadence. Refresh the in-process lexicon so
+            # `_ground_for_goal_hook` always returns the freshest concept_ids.
+            if msg_type == CGN_LEXICON_UPDATED:
+                try:
+                    new_size = _load_cgn_lexicon(worker_plugin)
+                    logger.debug(
+                        "[AgnoWorker] CGN_LEXICON_UPDATED — lexicon now %d entries",
+                        new_size,
+                    )
+                except Exception as _lu_err:
+                    logger.debug(
+                        "[AgnoWorker] CGN_LEXICON_UPDATED handler failed: %s",
+                        _lu_err,
+                    )
+                continue
 
             if msg_type == SAVE_NOW:
                 if publisher:
