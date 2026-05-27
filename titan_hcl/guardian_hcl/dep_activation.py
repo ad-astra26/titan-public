@@ -4,7 +4,7 @@ titan_hcl.guardian_hcl.guardiandepactivation — D-SPEC-90 §11.G.2.5 dep-activa
 Carved from titan_hcl/guardian.py by scripts/_phase6_carve_guardian.py per
 SPEC §11.B.4 / D-SPEC-135 / v1.62.0. See SPEC §11.G + D-SPEC-90.
 
-Mixed into class Guardian(GuardianReloadMixin, GuardianDepActivationMixin)
+Mixed into class Guardian(OrchestratorReloadMixin, GuardianDepActivationMixin)
 in core.py — `self` attributes (.bus, ._modules, ._reload_lock, etc.) come
 from Guardian.__init__. Method bodies move verbatim — no logic change.
 """
