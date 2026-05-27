@@ -87,10 +87,9 @@ class TitanResults:
     p2: list[CheckResult] = field(default_factory=list)
     p3: list[CheckResult] = field(default_factory=list)
     p4: list[CheckResult] = field(default_factory=list)
-    p5: list[CheckResult] = field(default_factory=list)
 
     def all_checks(self) -> list[CheckResult]:
-        return self.p0 + self.p1 + self.p2 + self.p3 + self.p4 + self.p5
+        return self.p0 + self.p1 + self.p2 + self.p3 + self.p4
 
     def any_failed(self) -> bool:
         return any(c.status == "FAIL" for c in self.all_checks())
@@ -617,190 +616,6 @@ def check_p4(titan: Titan, baseline: dict) -> list[CheckResult]:
 
 
 # ---------------------------------------------------------------------------
-# Phase 5 fleet check — hypothesis-fork lifecycle smoke (P5.J)
-# ---------------------------------------------------------------------------
-
-
-def check_p5(titan: Titan, baseline: dict) -> list[CheckResult]:
-    """8 structural-presence checks for Phase 5 hypothesis forks + GC.
-    Per `PLAN_synthesis_engine_Phase5.md §P5.J`.
-
-    Smoke-test only: asserts the Phase 5 surfaces are mounted + populated
-    + reachable. Behavioral correctness is verified by §P5.L
-    `scripts/synthesis_p0_p5_live_runtime_e2e.py` (the full HTTP
-    end-to-end lifecycle gate).
-    """
-    results: list[CheckResult] = []
-
-    # P5.1 — Kuzu HypothesisFork table reachable + populated (may be 0 on
-    # a fresh fleet — that's a WARN not a FAIL).
-    fork_count = _kuzu_count(titan, "MATCH (f:HypothesisFork) RETURN COUNT(f)")
-    if fork_count is None:
-        results.append(CheckResult(
-            "P5.kuzu-fork-table-active", "WARN",
-            "Kuzu HypothesisFork probe failed (graph not reachable)"))
-    else:
-        results.append(CheckResult(
-            "P5.kuzu-fork-table-active", "PASS",
-            f"{fork_count} HypothesisFork row(s) in spine"))
-
-    # P5.2 — hypothesis_forks DuckDB table exists (lazy probe: query via
-    # the API for the summary endpoint; if it returns 200, the table is
-    # present on synthesis.duckdb).
-    rc, out, _err = run_cmd(
-        titan.host,
-        f"curl -sS -m 10 http://localhost:{titan.api_port}/v6/synthesis/forks/summary "
-        f"|| echo '{{}}'",
-        timeout=15.0,
-    )
-    try:
-        parsed = json.loads(out.strip() or "{}")
-        if parsed.get("ok") and isinstance(parsed.get("summary"), dict):
-            results.append(CheckResult(
-                "P5.duckdb-forks-table-active", "PASS",
-                f"summary={parsed['summary']}"))
-        else:
-            results.append(CheckResult(
-                "P5.duckdb-forks-table-active", "WARN",
-                f"summary endpoint did not return expected shape: {parsed}"))
-    except (ValueError, json.JSONDecodeError):
-        results.append(CheckResult(
-            "P5.duckdb-forks-table-active", "WARN",
-            "summary endpoint not parseable"))
-
-    # P5.3 — forks_snapshot.json present + fresh (mirrors P1 activation
-    # snapshot freshness check).
-    s = stat_remote(
-        titan.host, f"{titan.titan_dir}/data/forks_snapshot.json",
-    )
-    if s is None:
-        results.append(CheckResult(
-            "P5.forks-snapshot-present", "WARN",
-            "forks_snapshot.json missing (synthesis_worker hasn't exported "
-            "yet, or HypothesisForkStore wiring failed)"))
-    else:
-        age = int(time.time()) - s["mtime"]
-        if age < 600:
-            results.append(CheckResult(
-                "P5.forks-snapshot-present", "PASS",
-                f"snapshot fresh ({age}s old, {s['size']}b)"))
-        else:
-            results.append(CheckResult(
-                "P5.forks-snapshot-present", "WARN",
-                f"snapshot stale ({age}s old)"))
-
-    # P5.4 — /v6/synthesis/forks endpoint mounted (HTTP 200).
-    rc, out, _err = run_cmd(
-        titan.host,
-        f"curl -sS -m 10 -o /dev/null -w '%{{http_code}}' "
-        f"http://localhost:{titan.api_port}/v6/synthesis/forks",
-        timeout=15.0,
-    )
-    status_code = out.strip()
-    if status_code == "200":
-        results.append(CheckResult(
-            "P5.forks-list-endpoint-mounted", "PASS",
-            f"GET /v6/synthesis/forks → 200"))
-    else:
-        results.append(CheckResult(
-            "P5.forks-list-endpoint-mounted", "FAIL",
-            f"GET /v6/synthesis/forks → {status_code}"))
-
-    # P5.5 — /v6/synthesis/forks/tombstones endpoint mounted.
-    rc, out, _err = run_cmd(
-        titan.host,
-        f"curl -sS -m 10 -o /dev/null -w '%{{http_code}}' "
-        f"http://localhost:{titan.api_port}/v6/synthesis/forks/tombstones",
-        timeout=15.0,
-    )
-    status_code = out.strip()
-    if status_code == "200":
-        results.append(CheckResult(
-            "P5.forks-tombstones-endpoint-mounted", "PASS",
-            f"GET /v6/synthesis/forks/tombstones → 200"))
-    else:
-        results.append(CheckResult(
-            "P5.forks-tombstones-endpoint-mounted", "FAIL",
-            f"GET /v6/synthesis/forks/tombstones → {status_code}"))
-
-    # P5.6 — synthesis_worker boot log mentions HypothesisForkStore ready.
-    rc, out, _err = run_cmd(
-        titan.host,
-        f"journalctl -u {titan.journal_unit} --since '1 hour ago' --no-pager "
-        f"2>/dev/null | grep 'HypothesisForkStore + ForkGC ready' "
-        f"| tail -1 || echo ''",
-        timeout=15.0,
-    )
-    if "HypothesisForkStore + ForkGC ready" in out:
-        results.append(CheckResult(
-            "P5.worker-boot-log-ready", "PASS",
-            "journalctl saw HypothesisForkStore + ForkGC ready"))
-    else:
-        results.append(CheckResult(
-            "P5.worker-boot-log-ready", "WARN",
-            "boot-log 'ready' line not seen in last hour (worker may not "
-            "have restarted post-deploy)"))
-
-    # P5.7 — INV-10 hard test still passing in worktree (uses pytest;
-    # short-circuit to WARN if test_env not available on remote).
-    rc, out, _err = run_cmd(
-        titan.host,
-        f"cd {titan.titan_dir} && "
-        f"source test_env/bin/activate 2>/dev/null && "
-        f"python -m pytest tests/test_phase4_concept_store.py::"
-        f"test_bump_version_inserts_new_row_without_mutating_parent "
-        f"-p no:anchorpy -q 2>&1 | tail -3 || echo 'TEST_ENV_MISSING'",
-        timeout=60.0,
-    )
-    if "TEST_ENV_MISSING" in out:
-        results.append(CheckResult(
-            "P5.inv10-hard-test-still-green", "SKIP",
-            "test_env not accessible on target"))
-    elif "passed" in out.lower():
-        results.append(CheckResult(
-            "P5.inv10-hard-test-still-green", "PASS",
-            "INV-10 hard test passed"))
-    else:
-        results.append(CheckResult(
-            "P5.inv10-hard-test-still-green", "FAIL",
-            f"INV-10 hard test failed or did not run: {out[-200:]}"))
-
-    # P5.8 — fork_class="hypothesis" exclusion from Arweave staging.
-    # Arweave staging is a future addition; until then this is informational.
-    arweave_path = f"{titan.titan_dir}/data/arweave/staged_next.json"
-    s_arweave = stat_remote(titan.host, arweave_path)
-    if s_arweave is None:
-        results.append(CheckResult(
-            "P5.arweave-fork-class-exclusion", "SKIP",
-            "Arweave staging file absent (Phase 5 v1 ships TX-metadata "
-            "marker only; encoder-boundary filter wires when Arweave "
-            "tier ships per project_phase5_sovereign_backup_redesign)"))
-    else:
-        try:
-            staged = json.loads(
-                read_remote_file(titan.host, arweave_path) or b"{}"
-            )
-            txs = staged.get("transactions") or []
-            hyp_class = [t for t in txs if t.get("fork_class") == "hypothesis"]
-            if hyp_class:
-                results.append(CheckResult(
-                    "P5.arweave-fork-class-exclusion", "FAIL",
-                    f"{len(hyp_class)} hypothesis-class TXs in Arweave staging "
-                    "(must be excluded per §9.2)"))
-            else:
-                results.append(CheckResult(
-                    "P5.arweave-fork-class-exclusion", "PASS",
-                    f"0 hypothesis-class TXs in Arweave staging "
-                    f"({len(txs)} canonical TXs staged)"))
-        except (ValueError, json.JSONDecodeError):
-            results.append(CheckResult(
-                "P5.arweave-fork-class-exclusion", "WARN",
-                "Arweave staging file present but unparseable"))
-
-    return results
-
-
-# ---------------------------------------------------------------------------
 # Baseline capture (pre-chat) — needed for delta checks
 # ---------------------------------------------------------------------------
 
@@ -897,14 +712,13 @@ def run_titan(titan: Titan) -> TitanResults:
     res.p2.extend(check_p2(titan, base))
     res.p3.extend(check_p3(titan, base))
     res.p4.extend(check_p4(titan, base))
-    res.p5.extend(check_p5(titan, base))
     return res
 
 
 def print_summary(all_results: list[TitanResults]) -> int:
     """Print summary matrix. Return exit code (0 = no FAIL, 1 = at least one FAIL)."""
     print("\n" + "=" * 70)
-    print(" SYNTHESIS P0-P5 FLEET E2E SUMMARY")
+    print(" SYNTHESIS P0-P4 FLEET E2E SUMMARY")
     print("=" * 70)
     total_fail = 0
     total_warn = 0
@@ -913,7 +727,7 @@ def print_summary(all_results: list[TitanResults]) -> int:
     for r in all_results:
         print(f"\n  [{r.titan}]")
         for phase, checks in [("P0", r.p0), ("P1", r.p1), ("P2", r.p2),
-                              ("P3", r.p3), ("P4", r.p4), ("P5", r.p5)]:
+                              ("P3", r.p3), ("P4", r.p4)]:
             for c in checks:
                 glyph = {"PASS": "✓", "WARN": "⚠", "FAIL": "✗", "SKIP": "·"}.get(c.status, "?")
                 print(f"    {glyph} {phase}/{c.name:<40} {c.status:<5} {c.detail}")

@@ -12184,31 +12184,3 @@ from titan_hcl.api.synthesis_concept_handlers import (
 get_v6_synthesis_concepts = get_synthesis_concepts
 get_v6_synthesis_concept = get_synthesis_concept
 get_v6_synthesis_concepts_heatmap = get_synthesis_concepts_heatmap
-
-
-# ─── Phase 5 §P5.I — hypothesis-fork lifecycle endpoints ──────────────
-# Re-exports from titan_hcl/api/synthesis_fork_handlers.py — JSON-snapshot-
-# backed reads of `data/forks_snapshot.json` (synthesis_worker is the sole
-# writer per INV-Syn-8; the api process must NOT open synthesis.duckdb
-# directly because DuckDB 1.5+ exclusive-lock against the active writer).
-from titan_hcl.api.synthesis_fork_handlers import (
-    get_synthesis_forks,
-    get_synthesis_fork,
-    get_synthesis_fork_tombstones,
-    get_synthesis_fork_summary,
-    post_synthesis_forks,
-    post_synthesis_fork_record_exploration,
-    post_synthesis_fork_graduate_manual,
-    post_synthesis_fork_abandon,
-    post_synthesis_fork_sweep,
-)
-
-get_v6_synthesis_forks = get_synthesis_forks
-get_v6_synthesis_fork = get_synthesis_fork
-get_v6_synthesis_fork_tombstones = get_synthesis_fork_tombstones
-get_v6_synthesis_fork_summary = get_synthesis_fork_summary
-post_v6_synthesis_forks = post_synthesis_forks
-post_v6_synthesis_fork_record_exploration = post_synthesis_fork_record_exploration
-post_v6_synthesis_fork_graduate_manual = post_synthesis_fork_graduate_manual
-post_v6_synthesis_fork_abandon = post_synthesis_fork_abandon
-post_v6_synthesis_fork_sweep = post_synthesis_fork_sweep
