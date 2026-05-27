@@ -21,10 +21,13 @@ import time
 from typing import Any
 from titan_hcl.utils.silent_swallow import swallow_warn
 from titan_hcl import bus
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
 
+@with_error_envelope(module_name="imw", subsystem="entry", severity=_phase11_sev.FATAL)
 def imw_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main entry — runs until SIGTERM / SHUTDOWN message / crash.
 

@@ -68,6 +68,8 @@ from queue import Empty
 from typing import Any, Optional
 
 from titan_hcl import bus
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +184,7 @@ def _init_social_graph(db_path: str):
 # ── Main entry ────────────────────────────────────────────────────────
 
 
+@with_error_envelope(module_name="social_graph", subsystem="entry", severity=_phase11_sev.FATAL)
 def social_graph_worker_main(recv_queue, send_queue, name: str,
                              config: dict) -> None:
     """Main loop for the social_graph_worker subprocess.

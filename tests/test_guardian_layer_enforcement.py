@@ -55,7 +55,7 @@ def _seed_running_module(guardian, name, layer, hb_age_s=999):
 def test_l1_heartbeat_timeout_logs_at_error(guardian, caplog):
     """L1 module (Trinity daemon) crash logs at ERROR."""
     _seed_running_module(guardian, name="body", layer="L1")
-    with caplog.at_level(logging.WARNING, logger="titan_hcl.guardian_hcl"):
+    with caplog.at_level(logging.WARNING, logger="titan_hcl.orchestrator"):
         guardian.monitor_tick()
     # The heartbeat-timeout log entry should be ERROR level with L1 tag
     error_records = [
@@ -71,7 +71,7 @@ def test_l1_heartbeat_timeout_logs_at_error(guardian, caplog):
 def test_l2_heartbeat_timeout_logs_at_warning(guardian, caplog):
     """L2 module crash logs at WARNING (not elevated)."""
     _seed_running_module(guardian, name="memory", layer="L2")
-    with caplog.at_level(logging.WARNING, logger="titan_hcl.guardian_hcl"):
+    with caplog.at_level(logging.WARNING, logger="titan_hcl.orchestrator"):
         guardian.monitor_tick()
     warn_records = [
         r for r in caplog.records
@@ -85,7 +85,7 @@ def test_l2_heartbeat_timeout_logs_at_warning(guardian, caplog):
 def test_l3_heartbeat_timeout_logs_at_warning(guardian, caplog):
     """L3 module crash logs at WARNING (not elevated)."""
     _seed_running_module(guardian, name="llm", layer="L3")
-    with caplog.at_level(logging.WARNING, logger="titan_hcl.guardian_hcl"):
+    with caplog.at_level(logging.WARNING, logger="titan_hcl.orchestrator"):
         guardian.monitor_tick()
     warn_records = [
         r for r in caplog.records
@@ -98,7 +98,7 @@ def test_l3_heartbeat_timeout_logs_at_warning(guardian, caplog):
 
 def test_register_log_includes_layer(guardian, caplog):
     """Guardian.register() log line includes the layer tag."""
-    with caplog.at_level(logging.INFO, logger="titan_hcl.guardian_hcl"):
+    with caplog.at_level(logging.INFO, logger="titan_hcl.orchestrator"):
         guardian.register(ModuleSpec(
             name="spirit", entry_fn=_noop_entry, layer="L1"))
     reg_records = [r for r in caplog.records

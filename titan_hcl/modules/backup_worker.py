@@ -41,6 +41,8 @@ from queue import Empty
 from typing import Optional
 from titan_hcl.utils.silent_swallow import swallow_warn
 from titan_hcl import bus
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,7 @@ logger = logging.getLogger(__name__)
 _last_hb_ts: float = 0.0
 
 
+@with_error_envelope(module_name="backup", subsystem="entry", severity=_phase11_sev.FATAL)
 def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the Backup Worker subprocess.
 

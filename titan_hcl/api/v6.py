@@ -506,6 +506,34 @@ def _wire() -> None:
 _wire()
 
 
+# Phase 11 §11.I.5 / D-SPEC-141 (Chunk 11J) — register the two new
+# readouts in the manifest so /v6/manifest's drift check stays clean.
+# The shm_slots/producers columns make the lineage explicit:
+#   /v6/readiness reads titan_hcl_state.bin (orchestrator/titan_hcl) +
+#     module_<name>_state.bin × N (each worker is the G21 writer of its
+#     own slot per §11.I.5).
+#   /v6/errors reads module_<name>_state.bin × N (same writers) — and
+#     forward-compats `errors_state.bin` (observatory_worker) once that
+#     writer ships.
+_m.register(RouteSpec(
+    path="/v6/readiness", method="GET", group="phase11", kind="readout",
+    summary="Phase 11 fleet readiness snapshot — titan_hcl_state.bin + every "
+            "module_<name>_state.bin per §11.I.5.",
+    accessor=None, command=None,
+    shm_slots=("titan_hcl_state.bin", "module_<name>_state.bin"),
+    producers=("titan_hcl", "<each_worker>"), rpc=False, replaces=(),
+))
+_m.register(RouteSpec(
+    path="/v6/errors", method="GET", group="phase11", kind="readout",
+    summary="Phase 11 ModuleError envelope readout — per-module last_error "
+            "from SHM slots + forward-compat errors_state.bin history.",
+    accessor=None, command=None,
+    shm_slots=("module_<name>_state.bin", "errors_state.bin"),
+    producers=("<each_worker>", "observatory_worker"),
+    rpc=False, replaces=(),
+))
+
+
 # ── /v6/manifest — the route→accessor→slot→producer source-of-truth ──────────
 @router.get("/v6/manifest")
 async def get_v6_manifest(request: Request) -> JSONResponse:
@@ -567,3 +595,157 @@ def _slot_age_seconds(shm, slot: str) -> float | None:
     except Exception:
         pass
     return None
+
+
+# ── /v6/readiness — Phase 11 §11.I.5 / D-SPEC-141 (Chunk 11J) ────────────────
+
+
+@router.get("/v6/readiness")
+async def get_v6_readiness(request: Request) -> JSONResponse:
+    """Phase 11 §11.I.5 — fleet readiness snapshot.
+
+    Reads:
+      * `titan_hcl_state.bin` (orchestrator-owned, G21 single-writer)
+        for fleet_ready / fleet_optional_ready / boot_phase / counts /
+        timestamps.
+      * Every per-module `module_<name>_state.bin` slot via
+        `ModuleStateReaderBank` — returns state, last_heartbeat,
+        last_probe_result, last_error per module.
+
+    No bus call, no orchestrator round-trip: all SHM reads, sub-ms
+    latency, safe to poll at 1Hz from the Observatory.
+    """
+    from titan_hcl.core.module_state import ModuleStateReaderBank
+    from titan_hcl.core.state_registry import resolve_titan_id
+    from titan_hcl.core.titan_hcl_state import TitanHclStateReader
+
+    titan_id = resolve_titan_id()
+    body: dict[str, object] = {"ok": True}
+
+    # 1. Orchestrator-owned slot.
+    try:
+        fleet_reader = TitanHclStateReader(titan_id=titan_id)
+        fleet_entry = fleet_reader.read()
+        fleet_reader.close()
+    except Exception as e:  # noqa: BLE001
+        fleet_entry = None
+        body["fleet_read_error"] = str(e)
+    if fleet_entry is not None:
+        body["fleet"] = fleet_entry.as_wire_dict()
+    else:
+        body["fleet"] = None
+
+    # 2. Per-module SHM slots — driven by the live orchestrator's module
+    #    registry when available (avoids returning stale module lists
+    #    after a hot-reload). Falls back to the manifest's discovered
+    #    module set if the orchestrator handle isn't reachable from the
+    #    api process (titan_hcl_api may be a peer per 11E.b.2).
+    module_names: list[str] = []
+    titan_hcl_obj = getattr(request.app.state, "titan_hcl", None)
+    if titan_hcl_obj is not None:
+        orch = getattr(titan_hcl_obj, "guardian", None) or getattr(
+            titan_hcl_obj, "orchestrator", None)
+        if orch is not None and hasattr(orch, "_modules"):
+            module_names = sorted(orch._modules.keys())
+    if not module_names:
+        # Fallback: derive from the manifest's distinct producer set.
+        rows = _m.as_rows()
+        seen: set[str] = set()
+        for row in rows:
+            for prod in row.get("producers") or ():
+                if prod and prod not in seen:
+                    seen.add(prod)
+        module_names = sorted(seen)
+
+    bank = ModuleStateReaderBank(titan_id=titan_id)
+    modules_payload: list[dict[str, object]] = []
+    try:
+        for name in module_names:
+            try:
+                entry = bank.read(name)
+            except Exception:  # noqa: BLE001
+                entry = None
+            if entry is None:
+                modules_payload.append({"name": name, "state": "unknown"})
+            else:
+                modules_payload.append(entry.as_wire_dict())
+    finally:
+        bank.close()
+    body["modules"] = modules_payload
+    body["module_count"] = len(modules_payload)
+    body["module_running_count"] = sum(
+        1 for m in modules_payload if m.get("state") == "running")
+
+    return JSONResponse(body)
+
+
+# ── /v6/errors — Phase 11 §11.I.5 / D-SPEC-141 (Chunk 11J) ──────────────────
+
+
+@router.get("/v6/errors")
+async def get_v6_errors(request: Request) -> JSONResponse:
+    """Phase 11 §11.I.5 — queryable ModuleError envelope history.
+
+    Each per-module SHM slot carries its `last_error` ModuleError
+    envelope (when present). This route surfaces the snapshot of every
+    module that currently reports a non-null `last_error`, sorted by
+    error timestamp (descending — newest first).
+
+    The fleet-wide error timeline (history beyond `last_error`) lands
+    once `observatory_worker` ships its `errors_state.bin` writer per
+    §11.I.5 — that source then folds into this same route under a
+    `history: [...]` key. For now the surface is per-module
+    most-recent-error: a useful operator readout that maps 1:1 to the
+    SHM-direct contract Phase 11 standardizes.
+    """
+    from titan_hcl.core.module_state import ModuleStateReaderBank
+    from titan_hcl.core.state_registry import resolve_titan_id
+
+    titan_id = resolve_titan_id()
+
+    module_names: list[str] = []
+    titan_hcl_obj = getattr(request.app.state, "titan_hcl", None)
+    if titan_hcl_obj is not None:
+        orch = getattr(titan_hcl_obj, "guardian", None) or getattr(
+            titan_hcl_obj, "orchestrator", None)
+        if orch is not None and hasattr(orch, "_modules"):
+            module_names = sorted(orch._modules.keys())
+    if not module_names:
+        rows = _m.as_rows()
+        seen: set[str] = set()
+        for row in rows:
+            for prod in row.get("producers") or ():
+                if prod and prod not in seen:
+                    seen.add(prod)
+        module_names = sorted(seen)
+
+    bank = ModuleStateReaderBank(titan_id=titan_id)
+    errors: list[dict[str, object]] = []
+    try:
+        for name in module_names:
+            try:
+                entry = bank.read(name)
+            except Exception:  # noqa: BLE001
+                continue
+            if entry is None or entry.last_error is None:
+                continue
+            envelope = entry.last_error.as_wire_dict()
+            envelope["state"] = entry.state
+            envelope["pid"] = entry.pid
+            envelope["restart_count"] = entry.restart_count
+            envelope["error_count_24h"] = entry.error_count_24h
+            errors.append(envelope)
+    finally:
+        bank.close()
+    # Newest first by envelope ts.
+    errors.sort(key=lambda e: float(e.get("ts", 0.0)), reverse=True)
+
+    return JSONResponse({
+        "ok": True,
+        "error_count": len(errors),
+        "errors": errors,
+        # Forward-compat placeholder: when observatory_worker lands its
+        # errors_state.bin writer per §11.I.5, this key carries the
+        # rolling history beyond per-module last_error.
+        "history": [],
+    })

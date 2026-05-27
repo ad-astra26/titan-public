@@ -84,6 +84,8 @@ from titan_hcl.bus import (
     SPHERE_PULSE,
     make_msg,
 )
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -315,6 +317,7 @@ def _snapshot_loop(shm_bank, obs_db, interval_s: int,
         stop_event.wait(interval_s)
 
 
+@with_error_envelope(module_name="observatory", subsystem="entry", severity=_phase11_sev.FATAL)
 def observatory_worker_main(recv_queue, send_queue, name: str,
                             config: dict) -> None:
     """L3 module entry — Guardian supervised.

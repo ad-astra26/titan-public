@@ -44,6 +44,8 @@ import time
 from collections import deque
 from datetime import datetime
 from titan_hcl import bus
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +129,7 @@ class _SocialGraphStatsShmReader:
             }
 
 
+@with_error_envelope(module_name="mind", subsystem="entry", severity=_phase11_sev.FATAL)
 def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the Mind module process."""
     from queue import Empty

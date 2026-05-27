@@ -79,6 +79,8 @@ from titan_hcl._phase_c_constants import (
     LIFE_FORCE_FATIGUE_THRESHOLD,
     LIFE_FORCE_MEDITATION_RECOVERY_FACTOR,
 )
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +258,7 @@ def _save_persisted(engine) -> None:
 # ── Main entry ────────────────────────────────────────────────────────
 
 
+@with_error_envelope(module_name="life_force", subsystem="entry", severity=_phase11_sev.FATAL)
 def life_force_worker_main(recv_queue, send_queue, name: str,
                            config: dict) -> None:
     """Main loop for the life_force_worker subprocess.

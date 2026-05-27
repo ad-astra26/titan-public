@@ -291,12 +291,19 @@ async def _run_reflex_arc(plugin, prompt_text: str, user_id: str = "") -> str:
         mind_tensor = [0.5] * 5
         spirit_tensor = [0.5] * 5
 
-    # 3. Compute Intuition signals from all three workers (pure functions)
-    from titan_hcl.modules.body_worker import _compute_body_reflex_intuition
-    from titan_hcl.modules.mind_worker import _compute_mind_reflex_intuition
-    # D-SPEC-116: _compute_spirit_reflex_intuition is defined in spirit_loop
-    # (was re-imported via the now-deleted spirit_worker module).
-    from titan_hcl.modules.spirit_loop import _compute_spirit_reflex_intuition
+    # 3. Compute Intuition signals from all three workers (pure functions).
+    # Phase 11 §11.I.5 / Chunk 11K (folded from Phase 9 9C) — these are
+    # imported via `titan_hcl.logic.reflex_intuition` rather than from
+    # each `titan_hcl.modules.*_worker` directly. Under SPEC §11.B.4 +
+    # the Phase 11 orchestrator/supervisor split, agno_hooks must not
+    # reach into worker bodies — that re-introduces the boot-time
+    # transitive-import cost Phase 11 is designed to eliminate. See the
+    # logic/reflex_intuition module docstring for the migration arc.
+    from titan_hcl.logic.reflex_intuition import (
+        _compute_body_reflex_intuition,
+        _compute_mind_reflex_intuition,
+        _compute_spirit_reflex_intuition,
+    )
 
     all_signals = []
     all_signals.extend(_compute_body_reflex_intuition(features, body_tensor))
