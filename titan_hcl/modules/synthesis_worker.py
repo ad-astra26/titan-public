@@ -1258,6 +1258,263 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             exc, exc_info=True,
         )
 
+    # ── Phase 8 §P8.A-G — Procedural pipeline (D-SPEC-PHASE8) ──────────
+    # Constructs: ProceduralSkillStore (INV-Syn-19) → SkillVerifier
+    # (INV-Syn-20) → LLMJudge (INV-Syn-21) → ProceduralMiner. Each is
+    # independent; partial wiring failures leave the rest functional.
+    procedural_skill_store: Optional[Any] = None
+    skill_verifier: Optional[Any] = None
+    llm_judge: Optional[Any] = None
+    procedural_miner: Optional[Any] = None
+
+    skill_cfg = (config or {}).get("synthesis", {}).get("skill", {}) or {}
+    _data_dir = os.environ.get("TITAN_DATA_DIR", "data")
+    skills_faiss_path = os.path.join(_data_dir, "skills_vectors.faiss")
+    skills_snapshot_path = os.path.join(_data_dir, "skills_snapshot.json")
+    chain_dir = os.path.join(_data_dir, "timechain")
+
+    def _skill_soft_retire_emit(skill_id: str, utility: float) -> None:
+        try:
+            _send(send_queue, "META_SKILL_SOFT_RETIRED", name, "all", {
+                "skill_id": skill_id, "utility_score": float(utility),
+            })
+        except Exception as e:
+            logger.debug("[synthesis_worker] soft_retire emit failed: %s", e)
+
+    try:
+        from titan_hcl.synthesis.skill_store import ProceduralSkillStore
+
+        def _skill_embedder(text: str):
+            try:
+                from fastembed import TextEmbedding
+                import numpy as np
+                if not hasattr(_skill_embedder, "_model"):
+                    _skill_embedder._model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+                vecs = list(_skill_embedder._model.embed([text]))
+                v = np.array(vecs[0], dtype=np.float32)
+                norm = np.linalg.norm(v)
+                if norm > 0:
+                    v /= norm
+                return v
+            except Exception as e:
+                logger.debug("[synthesis_worker] skill_embedder failed: %s", e)
+                return None
+
+        procedural_skill_store = ProceduralSkillStore(
+            duckdb_conn=store._conn,
+            faiss_path=skills_faiss_path,
+            snapshot_path=skills_snapshot_path,
+            embedder=_skill_embedder,
+            soft_retire_floor=float(skill_cfg.get("soft_retire_floor", -0.5)),
+            on_soft_retire=_skill_soft_retire_emit,
+        )
+        procedural_skill_store.snapshot_export()
+        logger.info(
+            "[synthesis_worker] Phase 8 ProceduralSkillStore ready — "
+            "faiss=%s snapshot=%s", skills_faiss_path, skills_snapshot_path,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[synthesis_worker] Phase 8 ProceduralSkillStore wiring failed: %s",
+            exc, exc_info=True,
+        )
+
+    if procedural_skill_store is not None:
+        try:
+            from titan_hcl.synthesis.procedural_tx_reader import ChainContentHashReader
+            from titan_hcl.synthesis.skill_verifier import SkillVerifier
+            _chain_content_reader = ChainContentHashReader(chain_dir=chain_dir)
+
+            def _skill_lifecycle_emit(ev: str, payload: dict) -> None:
+                try:
+                    _send(send_queue, ev, name, "all", payload)
+                except Exception:
+                    pass
+
+            skill_verifier = SkillVerifier(
+                skill_store=procedural_skill_store,
+                chain_reader=_chain_content_reader,
+                outer_memory_writer=writer,
+                bus_emit=_skill_lifecycle_emit,
+            )
+            logger.info("[synthesis_worker] Phase 8 SkillVerifier ready (INV-Syn-20)")
+        except Exception as exc:
+            logger.warning(
+                "[synthesis_worker] Phase 8 SkillVerifier wiring failed: %s",
+                exc, exc_info=True,
+            )
+
+    if procedural_skill_store is not None:
+        try:
+            from titan_hcl.synthesis.llm_judge import LLMJudge
+            from titan_hcl.synthesis.procedural_tx_reader import default_procedural_tool_call_reader
+
+            def _llm_judge_call(prompt: str, timeout_s: float) -> str:
+                try:
+                    from titan_hcl.inference import get_provider as _get_provider
+                    provider = _get_provider("ollama_cloud", (config or {}).get("inference", {}) or {})
+                    fn = getattr(provider, "generate", None) or getattr(provider, "complete", None)
+                    if fn is None:
+                        return ""
+                    out = fn(prompt, max_tokens=300, temperature=0.2)
+                    if isinstance(out, str):
+                        return out
+                    return getattr(out, "text", "") or str(out or "")
+                except Exception as e:
+                    logger.debug("[synthesis_worker] llm_judge provider failed: %s", e)
+                    return ""
+
+            def _judge_bus_emit(ev: str, payload: dict) -> None:
+                try:
+                    _send(send_queue, ev, name, "all", payload)
+                except Exception:
+                    pass
+
+            llm_judge = LLMJudge(
+                tool_call_reader=lambda since_ts, lim: default_procedural_tool_call_reader(
+                    since_ts, lim, chain_dir=chain_dir,
+                ),
+                llm_provider=_llm_judge_call,
+                outer_memory_writer=writer,
+                model_id=(config or {}).get("inference", {}).get("ollama_cloud_model") or "ollama_cloud_deepseek",
+                bus_emit=_judge_bus_emit,
+                per_pass_cap=int(skill_cfg.get("llm_judge_per_pass_cap", 200)),
+                timeout_s=float(skill_cfg.get("llm_judge_timeout_s", 30.0)),
+            )
+            logger.info("[synthesis_worker] Phase 8 LLMJudge ready (INV-Syn-21)")
+        except Exception as exc:
+            logger.warning(
+                "[synthesis_worker] Phase 8 LLMJudge wiring failed: %s",
+                exc, exc_info=True,
+            )
+
+    if procedural_skill_store is not None:
+        try:
+            from titan_hcl.synthesis.procedural_miner import ProceduralMiner
+            from titan_hcl.synthesis.procedural_tx_reader import default_procedural_tool_call_reader
+
+            def _miner_llm_propose(cluster_meta: dict, kind: str):
+                try:
+                    from titan_hcl.inference import get_provider as _get_provider
+                    provider = _get_provider("ollama_cloud", (config or {}).get("inference", {}) or {})
+                    fn = getattr(provider, "generate", None) or getattr(provider, "complete", None)
+                    if fn is None:
+                        return None
+                    seq_str = " → ".join(
+                        f"{tool}({args_shape})" for tool, args_shape in cluster_meta.get("sequence", [])
+                    )
+                    prompt = (
+                        f"Abstract this recurrent tool-call sequence ({kind}) into a parametrized skill. "
+                        f"Output STRICT JSON with keys nl_description (string), executable_spec (object), "
+                        f"preconditions (list), postconditions (list). Sequence: {seq_str}. "
+                        f"Occurrence count: {cluster_meta.get('occurrence_count')}. Kind: {kind}. "
+                        f"If kind==negative, nl_description should start with "
+                        f"'Approach X fails for task-shape Y'."
+                    )
+                    raw = fn(prompt, max_tokens=600, temperature=0.3)
+                    text = raw if isinstance(raw, str) else (getattr(raw, "text", "") or str(raw or ""))
+                    if not text:
+                        return None
+                    start = text.find("{")
+                    end = text.rfind("}")
+                    if start < 0 or end <= start:
+                        return None
+                    return json.loads(text[start:end + 1])
+                except Exception as e:
+                    logger.debug("[synthesis_worker] miner_llm_propose failed: %s", e)
+                    return None
+
+            def _miner_bus_emit(ev: str, payload: dict) -> None:
+                try:
+                    _send(send_queue, ev, name, "all", payload)
+                except Exception:
+                    pass
+
+            procedural_miner = ProceduralMiner(
+                skill_store=procedural_skill_store,
+                tool_call_reader=lambda since, lim: default_procedural_tool_call_reader(
+                    since, lim, chain_dir=chain_dir,
+                ),
+                llm_proposer=_miner_llm_propose,
+                outer_memory_writer=writer,
+                bus_emit=_miner_bus_emit,
+                window_hours=int(skill_cfg.get("miner_window_hours", 168)),
+                min_seq_len=int(skill_cfg.get("miner_min_seq_len", 2)),
+                max_seq_len=int(skill_cfg.get("miner_max_seq_len", 8)),
+                min_occurrences=int(skill_cfg.get("miner_min_occurrences", 3)),
+                max_skills_per_pass=int(skill_cfg.get("miner_max_skills_per_pass", 10)),
+            )
+            logger.info("[synthesis_worker] Phase 8 ProceduralMiner ready")
+        except Exception as exc:
+            logger.warning(
+                "[synthesis_worker] Phase 8 ProceduralMiner wiring failed: %s",
+                exc, exc_info=True,
+            )
+
+    # Phase 8 dream dispatchers — judge BEFORE miner (INV-Syn-21).
+    last_llm_judge_started_ts: float = 0.0
+    llm_judge_lock = threading.Lock()
+
+    def _maybe_run_llm_judge_async(dream_start_ts: float) -> None:
+        nonlocal last_llm_judge_started_ts
+        if llm_judge is None:
+            return
+        with llm_judge_lock:
+            if dream_start_ts <= last_llm_judge_started_ts:
+                return
+            last_llm_judge_started_ts = dream_start_ts
+        window_hours = int(skill_cfg.get("miner_window_hours", 168))
+        since_ts = dream_start_ts - window_hours * 3600.0
+
+        def _run_judge():
+            try:
+                summary = llm_judge.score_window(since_ts=since_ts)
+                logger.info(
+                    "[synthesis_worker] llm_judge done — tool_calls=%d "
+                    "unscored=%d scored=%d llm_calls=%d failures=%d",
+                    summary.get("tool_calls_in_window", 0),
+                    summary.get("unscored_in_window", 0),
+                    summary.get("scored_now", 0),
+                    summary.get("llm_calls", 0),
+                    summary.get("llm_failures", 0),
+                )
+            except Exception as e:
+                logger.warning("[synthesis_worker] llm_judge crashed: %s", e, exc_info=True)
+
+        threading.Thread(target=_run_judge, name="synthesis-llm-judge", daemon=True).start()
+
+    last_miner_started_ts: float = 0.0
+    miner_lock = threading.Lock()
+
+    def _maybe_run_procedural_miner_async(dream_start_ts: float) -> None:
+        nonlocal last_miner_started_ts
+        if procedural_miner is None:
+            return
+        with miner_lock:
+            if dream_start_ts <= last_miner_started_ts:
+                return
+            last_miner_started_ts = dream_start_ts
+
+        def _run_miner():
+            try:
+                summary = procedural_miner.mine_pass(
+                    dream_pass_id=f"dream_{int(dream_start_ts)}",
+                )
+                logger.info(
+                    "[synthesis_worker] procedural_miner done — txs=%d "
+                    "recurrent=%d positive=%d negative=%d llm_calls=%d failures=%d",
+                    summary.get("txs_scanned", 0),
+                    summary.get("clusters_recurrent", 0),
+                    summary.get("positive_skills_compiled", 0),
+                    summary.get("negative_skills_compiled", 0),
+                    summary.get("llm_calls", 0),
+                    summary.get("llm_failures", 0),
+                )
+            except Exception as e:
+                logger.warning("[synthesis_worker] procedural_miner crashed: %s", e, exc_info=True)
+
+        threading.Thread(target=_run_miner, name="synthesis-procedural-miner", daemon=True).start()
+
     def _maybe_run_consolidation_async(dream_start_ts: float) -> None:
         """Fire a ConsolidationPass in a worker thread; never blocks the
         bus loop. Rate-limited by dream window — second DREAM_STATE_CHANGED
@@ -1589,12 +1846,20 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         "ts=%.3f — scheduling consolidation pass",
                         dream_start_ts,
                     )
+                    # Phase 8 (INV-Syn-21) — LLM judge runs FIRST so the
+                    # procedural miner sees a fully-scored window. Both run
+                    # in independent threads; rate-limits inside each dispatcher
+                    # ensure ≤ 1 of each per dream window.
+                    _maybe_run_llm_judge_async(dream_start_ts)
                     _maybe_run_consolidation_async(dream_start_ts)
                     # Phase 5 §P5.H — fire the nightly ForkGC sweep on the
                     # SAME dream-boundary tick. Independent thread; the
                     # rate-limit inside _maybe_run_fork_gc_async ensures
                     # at most 1 sweep per dream window.
                     _maybe_run_fork_gc_async(dream_start_ts)
+                    # Phase 8 (P8.G) — procedural miner runs AFTER the judge
+                    # so its FORK_READ sees the just-anchored scored_by patches.
+                    _maybe_run_procedural_miner_async(dream_start_ts)
                 else:
                     logger.debug(
                         "[synthesis_worker] DREAM_STATE_CHANGED dreaming=False "
