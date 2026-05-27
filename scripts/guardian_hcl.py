@@ -35,6 +35,19 @@ import time
 # Ensure project root is on path
 sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), "..")))
 
+# ── Phase 11 §11.I.5 / Chunk 11L — MALLOC_ARENA_MAX defensive default ──
+# kernel-rs already sets this via build_child_env (titan-kernel-rs/spawn.rs:116)
+# when it spawns guardian_hcl, so this `setdefault` is a no-op in the
+# production fleet boot path. It load-bears under three independent
+# scenarios where guardian_hcl boots WITHOUT the kernel-rs env:
+#   (1) standalone dev runs (`python scripts/guardian_hcl.py`)
+#   (2) systemd unit overrides that strip kernel-spawned env
+#   (3) tests / fixtures that import scripts/guardian_hcl.py directly
+# Children spawned via subprocess.Popen / multiprocessing.Process
+# inherit this value transparently → fleet-wide glibc arena cap of 2
+# (RFP §3F.2.7 9F folded into Phase 11 §3H.2).
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+
 # ── INV-PROC-1 (SPEC §11.B.4 / D-SPEC-135 / v1.62.0): set ps identity as
 # first I/O after import resolution so `ps -ef` distinguishes the L1 supervisor
 # from `titan_hcl` (L2 plugin) and `titan_hcl_api` (L3). Same soft-fallback
