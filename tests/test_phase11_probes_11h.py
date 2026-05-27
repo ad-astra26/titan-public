@@ -93,14 +93,27 @@ def test_each_probe_importable_under_canonical_name():
 # ── 2. Each probe returns ok ≤ budget ────────────────────────────────
 
 
-# Probes with REAL bodies (Chunk 11N onwards) — readiness sentinels live on
-# the worker module and must be flipped True before the probe returns ok.
-# Shells return ok unconditionally so they don't need anything.
+# Probes with REAL bodies (Chunk 11N + W4 subagent sweep) — readiness
+# sentinels live on the worker module and must be flipped True before the
+# probe returns ok. Per the W3 sweep (commit 58761482), every worker
+# exposes a `_WORKER_READY` module-level bool that flips True after its
+# in-process scaffolding (Agent construction / FAISS load / Ed25519 keys /
+# NN warmup / etc.) completes. agno_worker uses two sentinels because its
+# boot has two independent stages.
 _REAL_PROBE_SENTINELS: dict[str, list[tuple[str, str]]] = {
     "agno_worker": [
         ("titan_hcl.modules.agno_worker", "_AGENT_READY"),
         ("titan_hcl.modules.agno_worker", "_OVG_READY"),
     ],
+    "cognitive_worker": [("titan_hcl.modules.cognitive_worker", "_WORKER_READY")],
+    "memory": [("titan_hcl.modules.memory_worker", "_WORKER_READY")],
+    "cgn": [("titan_hcl.modules.cgn_worker", "_WORKER_READY")],
+    "synthesis": [("titan_hcl.modules.synthesis_worker", "_WORKER_READY")],
+    "observatory": [("titan_hcl.modules.observatory_worker", "_WORKER_READY")],
+    "social_worker": [("titan_hcl.modules.social_worker", "_WORKER_READY")],
+    "expression_worker": [("titan_hcl.modules.expression_worker", "_WORKER_READY")],
+    "meditation": [("titan_hcl.modules.meditation_worker", "_WORKER_READY")],
+    "output_verifier": [("titan_hcl.modules.output_verifier_worker", "_WORKER_READY")],
 }
 
 
