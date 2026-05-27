@@ -911,6 +911,222 @@ class TitanKnowledgeGraph:
         )
         return ordered[offset : offset + limit]
 
+    # ── Phase 5 — HypothesisFork node + EXPLORES edge helpers ─────────
+    #
+    # The HypothesisFork table + EXPLORES rel were declared in Phase 4
+    # (`kuzu_spine_schema.py`) but empty. Phase 5 populates them via the
+    # primitives below. All write ops are funnelled through HypothesisForkStore
+    # (INV-Syn-8); these are the bare Kuzu helpers it calls.
+
+    def fork_create_node(
+        self, fork_id: str, root_anchor: str, activation: float, status: str,
+    ) -> bool:
+        """INSERT one HypothesisFork row. Returns True on insert, False on
+        duplicate. `root_anchor` is the empty string ("") for net-new forks
+        (Kuzu STRING is non-nullable by Phase 4 DDL; we use "" to mean ∅)."""
+        try:
+            self._conn.execute(
+                "CREATE (f:HypothesisFork {fork_id: $fid, root_anchor: $ra, "
+                "activation: $a, status: $s})",
+                {"fid": fork_id, "ra": root_anchor or "",
+                 "a": float(activation), "s": status},
+            )
+            return True
+        except Exception as e:
+            msg = str(e).lower()
+            if (
+                "primary key" in msg or "duplicate" in msg
+                or "constraint" in msg or "violates" in msg
+            ):
+                return False
+            logger.warning(
+                "[KnowledgeGraph] fork_create_node(%s) failed: %s",
+                fork_id, e,
+            )
+            raise
+
+    def fork_get_node(self, fork_id: str) -> dict | None:
+        """Return row dict for fork_id or None."""
+        try:
+            qr = self._conn.execute(
+                "MATCH (f:HypothesisFork {fork_id: $fid}) "
+                "RETURN f.fork_id, f.root_anchor, f.activation, f.status",
+                {"fid": fork_id},
+            )
+            if not qr.has_next():
+                return None
+            row = qr.get_next()
+            return {
+                "fork_id": row[0],
+                "root_anchor": row[1] or None,
+                "activation": float(row[2]),
+                "status": row[3],
+            }
+        except Exception as e:
+            logger.debug(
+                "[KnowledgeGraph] fork_get_node(%s) failed: %s", fork_id, e,
+            )
+            return None
+
+    def fork_update_status(
+        self, fork_id: str, status: str, activation: float | None = None,
+    ) -> bool:
+        """Update mutable columns on a HypothesisFork row. `status` always
+        updated; `activation` optional. Returns True on update, False if the
+        row is missing.
+
+        Allowed by INV-Syn-8: HypothesisFork is a *probationary index row*
+        (not canonical chain data) — its status + activation are derived
+        metrics that may be updated by the sole writer. INV-3 says canonical
+        data is never deleted; fork-node rows are NOT canonical (only their
+        tombstone TXs on graduation/abandonment are).
+        """
+        if self.fork_get_node(fork_id) is None:
+            return False
+        try:
+            if activation is not None:
+                self._conn.execute(
+                    "MATCH (f:HypothesisFork {fork_id: $fid}) "
+                    "SET f.status = $s, f.activation = $a",
+                    {"fid": fork_id, "s": status, "a": float(activation)},
+                )
+            else:
+                self._conn.execute(
+                    "MATCH (f:HypothesisFork {fork_id: $fid}) SET f.status = $s",
+                    {"fid": fork_id, "s": status},
+                )
+            return True
+        except Exception as e:
+            logger.warning(
+                "[KnowledgeGraph] fork_update_status(%s,%s) failed: %s",
+                fork_id, status, e,
+            )
+            return False
+
+    def fork_delete_node(self, fork_id: str) -> bool:
+        """DETACH DELETE a HypothesisFork row + all its incident EXPLORES
+        edges. Used by the cascade-GC sweep after the lifecycle ends
+        (graduated or abandoned) — the row is no longer needed as a hot
+        index; the canonical record lives in the chain (graduation TX or
+        tombstone TX). Returns True if a row was deleted."""
+        if self.fork_get_node(fork_id) is None:
+            return False
+        try:
+            self._conn.execute(
+                "MATCH (f:HypothesisFork {fork_id: $fid}) DETACH DELETE f",
+                {"fid": fork_id},
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "[KnowledgeGraph] fork_delete_node(%s) failed: %s", fork_id, e,
+            )
+            return False
+
+    def fork_add_explores_edge(
+        self, fork_id: str, concept_id: str, version: int,
+    ) -> bool:
+        """Create an EXPLORES edge from a HypothesisFork to a Concept row.
+        Both endpoints must exist. Returns False if either is missing or the
+        edge already exists (idempotent on duplicates)."""
+        if self.fork_get_node(fork_id) is None:
+            return False
+        if self.spine_get_concept_version(concept_id, version) is None:
+            return False
+        concept_pk = self._spine_pk(concept_id, version)
+        try:
+            self._conn.execute(
+                "MATCH (f:HypothesisFork {fork_id: $fid}), "
+                "(c:Concept {pk: $cpk}) "
+                "CREATE (f)-[:EXPLORES]->(c)",
+                {"fid": fork_id, "cpk": concept_pk},
+            )
+            return True
+        except Exception as e:
+            msg = str(e).lower()
+            if "duplicate" in msg or "constraint" in msg:
+                return False
+            logger.warning(
+                "[KnowledgeGraph] fork_add_explores_edge(%s → %s v%d) failed: %s",
+                fork_id, concept_id, version, e,
+            )
+            return False
+
+    def fork_list_all(self, status: str | None = None) -> list[dict]:
+        """Return all HypothesisFork rows, optionally filtered by status.
+        Cheap because the table is GC-bounded (graduated/abandoned rows are
+        DETACH DELETE'd by the nightly sweep)."""
+        try:
+            if status is not None:
+                qr = self._conn.execute(
+                    "MATCH (f:HypothesisFork) WHERE f.status = $s "
+                    "RETURN f.fork_id, f.root_anchor, f.activation, f.status",
+                    {"s": status},
+                )
+            else:
+                qr = self._conn.execute(
+                    "MATCH (f:HypothesisFork) "
+                    "RETURN f.fork_id, f.root_anchor, f.activation, f.status"
+                )
+            out: list[dict] = []
+            while qr.has_next():
+                row = qr.get_next()
+                out.append({
+                    "fork_id": row[0],
+                    "root_anchor": row[1] or None,
+                    "activation": float(row[2]),
+                    "status": row[3],
+                })
+            return out
+        except Exception as e:
+            logger.debug(
+                "[KnowledgeGraph] fork_list_all(status=%r) failed: %s",
+                status, e,
+            )
+            return []
+
+    def fork_count(self, status: str | None = None) -> int:
+        """Count HypothesisFork rows, optionally by status. Cheap; used by
+        the fleet E2E test §P5.J.1 check + Observatory metrics."""
+        try:
+            if status is not None:
+                qr = self._conn.execute(
+                    "MATCH (f:HypothesisFork) WHERE f.status = $s "
+                    "RETURN COUNT(f)",
+                    {"s": status},
+                )
+            else:
+                qr = self._conn.execute(
+                    "MATCH (f:HypothesisFork) RETURN COUNT(f)"
+                )
+            if qr.has_next():
+                return int(qr.get_next()[0])
+        except Exception as e:
+            logger.debug("[KnowledgeGraph] fork_count failed: %s", e)
+        return 0
+
+    def fork_explores_targets(self, fork_id: str) -> list[tuple[str, int]]:
+        """Return the (concept_id, version) tuples the given fork EXPLORES.
+        Used by the cascade-GC predicate's "sole-inbound" check and by
+        repair-fork graduation to resolve the parent concept."""
+        try:
+            qr = self._conn.execute(
+                "MATCH (f:HypothesisFork {fork_id: $fid})-[:EXPLORES]->(c:Concept) "
+                "RETURN c.concept_id, c.version",
+                {"fid": fork_id},
+            )
+            out: list[tuple[str, int]] = []
+            while qr.has_next():
+                row = qr.get_next()
+                out.append((row[0], int(row[1])))
+            return out
+        except Exception as e:
+            logger.debug(
+                "[KnowledgeGraph] fork_explores_targets(%s) failed: %s",
+                fork_id, e,
+            )
+            return []
+
     def close(self):
         del self._conn
         del self._db
