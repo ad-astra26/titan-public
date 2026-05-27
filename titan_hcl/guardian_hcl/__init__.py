@@ -7,7 +7,7 @@ Public surface re-exports preserved so existing call sites keep working:
 
 Internal organization:
     core.py             — class Guardian (lifecycle, monitor_tick, supervision)
-    reload.py [MOVED to titan_hcl/reload.py per Phase 11 §11.I.6 / D-SPEC-141 / locked D6] — OrchestratorReloadMixin (D-SPEC-50 reload_module + 7-step seq)
+    reload.py           — GuardianReloadMixin (D-SPEC-50 reload_module + 7-step seq)
     dep_activation.py   — GuardianDepActivationMixin (D-SPEC-90 §11.G.2.5)
     module_registry.py  — ModuleState / ModuleSpec / ModuleInfo / ReloadState
 
@@ -37,12 +37,12 @@ from titan_hcl.guardian_hcl.module_registry import (
     ReloadState,
     _append_meta_cgn_emission_log,
 )
-from titan_hcl.reload import OrchestratorReloadMixin
+from titan_hcl.guardian_hcl.reload import GuardianReloadMixin
 from titan_hcl.guardian_hcl.dep_activation import GuardianDepActivationMixin
 
 __all__ = [
     "Guardian",
-    "OrchestratorReloadMixin",
+    "GuardianReloadMixin",
     "GuardianDepActivationMixin",
     "ModuleState",
     "ModuleSpec",
