@@ -100,8 +100,6 @@ from titan_hcl.bus import (
     make_msg,
 )
 from titan_hcl.logic.dream_state_publisher import DreamStatePublisher
-from titan_hcl.core.module_error_handler import with_error_envelope
-from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +153,6 @@ def _validate_enqueue_payload(payload: Any) -> Optional[dict[str, Any]]:
         return None
 
 
-@with_error_envelope(module_name="dream_state", subsystem="entry", severity=_phase11_sev.FATAL)
 def dream_state_worker_main(recv_queue, send_queue, name: str,
                             config: dict) -> None:
     """L2 module entry — Guardian supervised.

@@ -30,13 +30,10 @@ import os
 import sys
 import time
 from titan_hcl import bus
-from titan_hcl.core.module_error_handler import with_error_envelope
-from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
 
-@with_error_envelope(module_name="recorder", subsystem="entry", severity=_phase11_sev.FATAL)
 def recorder_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """
     Main loop for the RL module process.

@@ -31,8 +31,6 @@ import time
 from queue import Empty
 from typing import Optional
 from titan_hcl import bus
-from titan_hcl.core.module_error_handler import with_error_envelope
-from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger("output_verifier")
 
@@ -40,7 +38,6 @@ _HEARTBEAT_INTERVAL_S = 30.0
 _STATS_PUBLISH_INTERVAL_S = 60.0
 
 
-@with_error_envelope(module_name="output_verifier", subsystem="entry", severity=_phase11_sev.FATAL)
 def output_verifier_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the OutputVerifier worker subprocess.
 

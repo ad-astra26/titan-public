@@ -41,8 +41,6 @@ import time
 from queue import Empty
 from typing import Any, Optional
 from titan_hcl import bus
-from titan_hcl.core.module_error_handler import with_error_envelope
-from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger("agency_worker")
 
@@ -329,7 +327,6 @@ def _maybe_emit_onchain_anchor_catalyst(
             _err)
 
 
-@with_error_envelope(module_name="agency_worker", subsystem="entry", severity=_phase11_sev.FATAL)
 def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the Agency worker subprocess.
 

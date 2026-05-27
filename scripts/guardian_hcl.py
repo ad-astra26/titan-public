@@ -35,19 +35,6 @@ import time
 # Ensure project root is on path
 sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), "..")))
 
-# ── Phase 11 §11.I.5 / Chunk 11L — MALLOC_ARENA_MAX defensive default ──
-# kernel-rs already sets this via build_child_env (titan-kernel-rs/spawn.rs:116)
-# when it spawns guardian_hcl, so this `setdefault` is a no-op in the
-# production fleet boot path. It load-bears under three independent
-# scenarios where guardian_hcl boots WITHOUT the kernel-rs env:
-#   (1) standalone dev runs (`python scripts/guardian_hcl.py`)
-#   (2) systemd unit overrides that strip kernel-spawned env
-#   (3) tests / fixtures that import scripts/guardian_hcl.py directly
-# Children spawned via subprocess.Popen / multiprocessing.Process
-# inherit this value transparently → fleet-wide glibc arena cap of 2
-# (RFP §3F.2.7 9F folded into Phase 11 §3H.2).
-os.environ.setdefault("MALLOC_ARENA_MAX", "2")
-
 # ── INV-PROC-1 (SPEC §11.B.4 / D-SPEC-135 / v1.62.0): set ps identity as
 # first I/O after import resolution so `ps -ef` distinguishes the L1 supervisor
 # from `titan_hcl` (L2 plugin) and `titan_hcl_api` (L3). Same soft-fallback
@@ -399,25 +386,14 @@ def run() -> int:
         bus, client = _build_bus_and_client(titan_id, config)
         logger.info("[guardian_hcl] bus client connected (name=guardian)")
 
-        # ── Orchestrator + Supervisor instances ──────────────────────
-        # Phase 11 §11.I.1 (D-SPEC-141 / v1.65.0) — orchestrator/supervisor
-        # role split. For 11E.b.1 both classes are co-resident in this same
-        # process (the kernel-rs peer-spawn that physically separates them
-        # lands in 11E.b.2). The `guardian` name is kept locally for the
-        # downstream calls below because they currently use orchestrator
-        # methods directly (start_all, monitor_tick, etc.); the Supervisor's
-        # bus-mediated D5 path is wired but not yet exercised in 11E.b.1.
-        from titan_hcl.orchestrator import Orchestrator
-        from titan_hcl.supervisor import Supervisor
-        guardian = Orchestrator(bus, config=config.get("guardian", {}))
+        # ── Guardian instance ────────────────────────────────────────
+        from titan_hcl.guardian_hcl import Guardian
+        guardian = Guardian(bus, config=config.get("guardian", {}))
         # _kernel_ref = None: cross-process swap interlock degrades to no-op
-        # (per Orchestrator.start docstring "None in legacy mode → swap
-        # interlock degrades to no-op").
+        # (per Guardian.start docstring "None in legacy mode → swap interlock
+        # degrades to no-op").
         guardian._kernel_ref = None
-        supervisor = Supervisor(bus, guardian, config=config.get("guardian", {}))
-        logger.info(
-            "[guardian_hcl] Orchestrator + Supervisor instances constructed "
-            "(Phase 11 §11.I.1 / D-SPEC-141 single-process co-resident)")
+        logger.info("[guardian_hcl] Guardian instance constructed")
 
         # ── Module catalog (51 ModuleSpec registrations) ─────────────
         from titan_hcl.module_catalog import build_catalog

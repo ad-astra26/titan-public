@@ -94,8 +94,6 @@ from queue import Empty
 from typing import Any, Optional
 
 from titan_hcl import bus
-from titan_hcl.core.module_error_handler import with_error_envelope
-from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -472,7 +470,6 @@ def _drive_evaluate_all(
 # ── Main entry ────────────────────────────────────────────────────────
 
 
-@with_error_envelope(module_name="expression_worker", subsystem="entry", severity=_phase11_sev.FATAL)
 def expression_worker_main(recv_queue, send_queue, name: str,
                            config: dict) -> None:
     """Main loop for the expression_worker subprocess.
