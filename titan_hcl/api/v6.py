@@ -656,13 +656,21 @@ async def get_v6_readiness(request: Request) -> JSONResponse:
     #    after a hot-reload). Falls back to the manifest's discovered
     #    module set if the orchestrator handle isn't reachable from the
     #    api process (titan_hcl_api may be a peer per 11E.b.2).
+    # In the Phase 6 (D-SPEC-135) split, `titan_hcl_obj` from
+    # `app.state.titan_hcl` is a thin kernel-RPC proxy in the api
+    # subprocess — accessing `.guardian._modules.keys()` triggers a
+    # MethodNotExposed RPC failure. Wrap in try/except so the route
+    # gracefully falls back to the manifest-derived module set below.
     module_names: list[str] = []
     titan_hcl_obj = getattr(request.app.state, "titan_hcl", None)
     if titan_hcl_obj is not None:
-        orch = getattr(titan_hcl_obj, "guardian", None) or getattr(
-            titan_hcl_obj, "orchestrator", None)
-        if orch is not None and hasattr(orch, "_modules"):
-            module_names = sorted(orch._modules.keys())
+        try:
+            orch = getattr(titan_hcl_obj, "guardian", None) or getattr(
+                titan_hcl_obj, "orchestrator", None)
+            if orch is not None and hasattr(orch, "_modules"):
+                module_names = sorted(orch._modules.keys())
+        except Exception:  # noqa: BLE001
+            module_names = []
     if not module_names:
         # Fallback: derive from the manifest's distinct producer set.
         rows = _m.as_rows()
@@ -719,13 +727,21 @@ async def get_v6_errors(request: Request) -> JSONResponse:
 
     titan_id = resolve_titan_id()
 
+    # In the Phase 6 (D-SPEC-135) split, `titan_hcl_obj` from
+    # `app.state.titan_hcl` is a thin kernel-RPC proxy in the api
+    # subprocess — accessing `.guardian._modules.keys()` triggers a
+    # MethodNotExposed RPC failure. Wrap in try/except so the route
+    # gracefully falls back to the manifest-derived module set below.
     module_names: list[str] = []
     titan_hcl_obj = getattr(request.app.state, "titan_hcl", None)
     if titan_hcl_obj is not None:
-        orch = getattr(titan_hcl_obj, "guardian", None) or getattr(
-            titan_hcl_obj, "orchestrator", None)
-        if orch is not None and hasattr(orch, "_modules"):
-            module_names = sorted(orch._modules.keys())
+        try:
+            orch = getattr(titan_hcl_obj, "guardian", None) or getattr(
+                titan_hcl_obj, "orchestrator", None)
+            if orch is not None and hasattr(orch, "_modules"):
+                module_names = sorted(orch._modules.keys())
+        except Exception:  # noqa: BLE001
+            module_names = []
     if not module_names:
         rows = _m.as_rows()
         seen: set[str] = set()
