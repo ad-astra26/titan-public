@@ -3146,6 +3146,33 @@ S   = 2.0   # spreading-activation S constant per arch §5.3
 cgn_history_window_turns = 3   # last N turns of CGN concept_ids
 max_buffer_entities      = 20  # hard cap on union size
 
+# ── Phase 6 — Oracle middleware (D-SPEC-PHASE6, 2026-05-27) ────────
+# Governs INV-Syn-13 metabolic gate + INV-Syn-14 ZK opt-in trigger.
+# Free oracles (coding_sandbox, pure math, sovereign-light-node TARGET)
+# bypass this gate. Metered oracles admit IFF
+#   admit_score = importance × (balance_sol / balance_sol_baseline)
+#   AND admit_score ≥ admit_threshold
+#   AND daily_remaining[oracle_id] ≥ claim.cost_estimate_sol
+# Gate-denied claims still produce an anchored OracleVerdict(verdict="unknown",
+# evidence_ref="metabolic_gate_denied") so the rejection is auditable.
+[synthesis.oracle]
+balance_sol_baseline = 1.0    # per-Titan reference balance; below baseline tightens linearly
+admit_threshold      = 0.15   # admit_score must clear this to invoke a metered oracle
+
+# Per-oracle daily SOL spend caps (INV-Syn-13). Enforced even when admit_score passes.
+# Keys are oracle_id strings as registered by TruthOraclePlug instances.
+[synthesis.oracle.daily_sol_budget]
+helius_rpc = 0.1
+web_api    = 0.1
+x_api      = 0.1
+zk_prover  = 0.1
+
+# INV-Syn-14 privacy domain whitelist. OracleClaim.domain values in this list
+# auto-promote proof strategy to "zk"; everything else uses Merkle by default.
+# Per-fork ZK opt-in lives on HypothesisFork.proof_strategy column (new in P6.G).
+[synthesis.oracle.zk]
+privacy_domains = ["private_user_data", "user_pii", "private_transaction"]
+
 [microkernel]
 
 # ── Memory hygiene daemon (2026-05-01) ─────────────────────────────
