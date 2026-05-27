@@ -93,22 +93,45 @@ def test_each_probe_importable_under_canonical_name():
 # ── 2. Each probe returns ok ≤ budget ────────────────────────────────
 
 
+# Probes with REAL bodies (Chunk 11N onwards) — readiness sentinels live on
+# the worker module and must be flipped True before the probe returns ok.
+# Shells return ok unconditionally so they don't need anything.
+_REAL_PROBE_SENTINELS: dict[str, list[tuple[str, str]]] = {
+    "agno_worker": [
+        ("titan_hcl.modules.agno_worker", "_AGENT_READY"),
+        ("titan_hcl.modules.agno_worker", "_OVG_READY"),
+    ],
+}
+
+
+def _set_worker_sentinels(name: str, value: bool) -> None:
+    import importlib
+    for mod_path, attr in _REAL_PROBE_SENTINELS.get(name, []):
+        mod = importlib.import_module(mod_path)
+        setattr(mod, attr, value)
+
+
 @pytest.mark.parametrize("name,probe_fn", list(PROBE_REGISTRY.items()))
 def test_probe_returns_ok_under_budget(name: str, probe_fn):
-    """Per SPEC §11.I.3 budget ≤2s. Shell probes complete in ~µs;
-    this test forces a per-probe regression gate."""
-    t0 = time.perf_counter()
-    result = probe_fn(None)
-    elapsed_s = time.perf_counter() - t0
-    assert isinstance(result, ProbeResult), (
-        f"Probe {name!r} must return a ProbeResult; got {type(result).__name__}")
-    assert result.ok is True, (
-        f"Probe {name!r} shell must return ok=True; got {result}")
-    assert elapsed_s < PROBE_TIMEOUT_S, (
-        f"Probe {name!r} took {elapsed_s:.3f}s > {PROBE_TIMEOUT_S}s budget")
-    # The probe must record a real latency (used by orchestrator-side
-    # histograms even on the shell path).
-    assert result.latency_ms >= 0.0
+    """Per SPEC §11.I.3 budget ≤2s. Probes with real bodies (per the
+    11N migration) need their module-level readiness sentinels flipped
+    True; shells return ok unconditionally."""
+    _set_worker_sentinels(name, True)
+    try:
+        t0 = time.perf_counter()
+        result = probe_fn(None)
+        elapsed_s = time.perf_counter() - t0
+        assert isinstance(result, ProbeResult), (
+            f"Probe {name!r} must return a ProbeResult; got {type(result).__name__}")
+        assert result.ok is True, (
+            f"Probe {name!r} should return ok=True with sentinels True; got {result}")
+        assert elapsed_s < PROBE_TIMEOUT_S, (
+            f"Probe {name!r} took {elapsed_s:.3f}s > {PROBE_TIMEOUT_S}s budget")
+        # The probe must record a real latency (used by orchestrator-side
+        # histograms even on the shell path).
+        assert result.latency_ms >= 0.0
+    finally:
+        _set_worker_sentinels(name, False)
 
 
 # ── 3. End-to-end via worker-side handler ────────────────────────────
@@ -122,6 +145,7 @@ def test_probe_through_worker_side_handler(
     to the SHM slot AND emits MODULE_PROBE_RESPONSE to the send queue."""
     monkeypatch.setenv("TITAN_SHM_ROOT", str(tmp_path))
     monkeypatch.setenv("TITAN_ID", "test_h")
+    _set_worker_sentinels(name, True)
     writer = ModuleStateWriter(
         module_name=name, layer="L2",
         boot_priority=BootPriority.MANDATORY, titan_id="test_h", pid=12345,
@@ -151,6 +175,37 @@ def test_probe_through_worker_side_handler(
         assert resp["payload"]["result"]["ok"] is True
     finally:
         writer.close()
+        _set_worker_sentinels(name, False)
+
+
+def test_agno_probe_fails_when_sentinels_cold():
+    """Chunk 11N — agno probe with cold sentinels returns ok=False +
+    a ModuleError envelope explaining which sentinel is still False, so
+    /v6/errors makes the cause obvious."""
+    from titan_hcl.modules import agno_worker as _a
+    _a._AGENT_READY = False
+    _a._OVG_READY = False
+    result = agno_worker_probe(None)
+    assert result.ok is False
+    assert result.error_envelope is not None
+    assert "_AGENT_READY" in result.error_envelope.message
+    assert "_OVG_READY" in result.error_envelope.message
+
+
+def test_agno_probe_fails_when_only_agent_ready():
+    """Half-warm worker — Agent built but OVG didn't warm — still fails."""
+    from titan_hcl.modules import agno_worker as _a
+    _a._AGENT_READY = True
+    _a._OVG_READY = False
+    try:
+        result = agno_worker_probe(None)
+        assert result.ok is False
+        assert result.error_envelope is not None
+        assert "_OVG_READY" in result.error_envelope.message
+        assert "_AGENT_READY" not in result.error_envelope.message
+    finally:
+        _a._AGENT_READY = False
+        _a._OVG_READY = False
 
 
 # ── 4. Catalog wiring (build_catalog attaches probe_fn) ──────────────

@@ -539,7 +539,16 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         rss_limit_mb=1000,
         autostart=True,
         lazy=False,
-        heartbeat_timeout=60.0,  # Background heartbeat thread bypasses arun delays
+        # Phase 11 §11.I.5 (Chunk 11N) — bumped 60 → 180 because the
+        # legitimate cold-boot path is Agent build (~30s) + eager OVG
+        # warmup (~30s on T2/T3 devnet, ~130s on T1 mainnet 50MB chain).
+        # The 60s budget cut it too fine — observed heartbeat-timeout
+        # restart loop on T3 cascade 2026-05-27. 180s gives 3× cold-boot
+        # headroom while keeping a tight cap on truly-stuck workers
+        # (active SHM heartbeat starts BEFORE Agent build per Phase 11
+        # §11.I.5, so this is a defense-in-depth bound — the SHM-direct
+        # probe in §11.I.3 is the primary readiness check).
+        heartbeat_timeout=180.0,
         broadcast_topics=[
             _bus_constants.CHAT_REQUEST,
             _bus_constants.CHAT_STREAM_REQUEST,

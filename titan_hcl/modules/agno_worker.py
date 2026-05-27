@@ -70,6 +70,18 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL_S = 30.0
 SHM_REPUBLISH_INTERVAL_S = 1.0  # dual-trigger: on tick + on completion
 
+
+# Phase 11 §11.I.3 / §11.I.5 (Chunk 11N) — module-level readiness sentinel
+# consumed by `titan_hcl.probes.agno.agno_worker_probe`. Set False at module
+# import time; flipped True after BOTH Agent construction AND eager OVG
+# warmup complete. Mirrored to the per-process SHM slot
+# (`module_agno_worker_state.bin`) via ModuleStateWriter so titan_hcl's
+# 1Hz SHM poll + the orchestrator's MODULE_PROBE_REQUEST dispatcher see
+# real liveness rather than the boot-time "subscribed-but-not-warm" lie
+# that broke /chat on the T3 cascade 2026-05-27.
+_AGENT_READY: bool = False
+_OVG_READY: bool = False
+
 # ── ζ.5 per-tier model routing (D-SPEC-79, 2026-05-18) ─────────────
 # Agno's agent.arun() does NOT accept a per-call `model=` override — the
 # model identity is read from `agent.model.id` at the moment the upstream
@@ -225,8 +237,17 @@ def _send(send_queue, msg_type: str, src: str, dst: str,
 
 def _heartbeat_loop(send_queue, name: str,
                     stop_event: threading.Event,
-                    stats_ref: dict) -> None:
-    """Daemon thread — MODULE_HEARTBEAT every 30s with chat-volume stats."""
+                    stats_ref: dict,
+                    state_writer: Optional[Any] = None) -> None:
+    """Daemon thread — MODULE_HEARTBEAT every 30s with chat-volume stats.
+
+    Phase 11 §11.I.5 (Chunk 11N): also publishes ModuleStateWriter.heartbeat()
+    on the SHM slot when `state_writer` is provided so guardian_hcl's
+    SHM-staleness detector + observatory `/v6/readiness` see fresh data
+    on the same cadence as the legacy bus path. SHM writes are best-effort —
+    failures degrade gracefully (legacy bus heartbeat still load-bears
+    Guardian's existing staleness check).
+    """
     while not stop_event.is_set():
         _send(send_queue, MODULE_HEARTBEAT, name, "guardian", {
             "alive": True,
@@ -236,6 +257,15 @@ def _heartbeat_loop(send_queue, name: str,
             "last_chat_ts": stats_ref.get("last_chat_ts", 0.0),
             "in_flight": stats_ref.get("in_flight", 0),
         })
+        if state_writer is not None and _AGENT_READY and _OVG_READY:
+            try:
+                # heartbeat() republishes with state="running" — only
+                # valid once both sentinels are True. During the boot
+                # window the slot retains state="starting" or "booted"
+                # (set explicitly via write_state at the relevant points).
+                state_writer.heartbeat()
+            except Exception:  # noqa: BLE001 — never crash the heartbeat
+                pass
         stop_event.wait(HEARTBEAT_INTERVAL_S)
 
 
@@ -860,8 +890,44 @@ def agno_worker_main(recv_queue, send_queue, name: str,
         config:     dict — typically merged [agent] + [inference] config
                     from config.toml.
     """
+    # Phase 11 §11.I.5 (Chunk 11N) — module-level readiness flags reset on
+    # every entry (fork-mode re-entries inherit parent's True; spawn-mode
+    # re-spawns get fresh False; explicit reset covers both).
+    global _AGENT_READY, _OVG_READY
+    _AGENT_READY = False
+    _OVG_READY = False
+
     logger.info("[AgnoWorker] Boot")
     boot_start = time.time()
+
+    # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21 per worker) ──
+    # Constructed BEFORE the slow Agent + OVG init so:
+    #   1. The slot publishes state="starting" immediately — titan_hcl's
+    #      1Hz SHM poll sees the worker is alive while it warms.
+    #   2. `state_writer.heartbeat()` keeps the slot's `last_heartbeat`
+    #      fresh during the ~30s Agent build + ~30s OVG warmup so
+    #      guardian_hcl's staleness detector doesn't kill the worker
+    #      mid-boot (the SPEC-correct fix for the heartbeat-timeout-on-
+    #      slow-boot live regression observed T3 cascade 2026-05-27).
+    # The `_phase11_state` ref is also stashed below on the heartbeat thread
+    # so the periodic loop can publish heartbeats to BOTH the bus (legacy)
+    # and the SHM slot (Phase 11 §11.I.5 contract).
+    _state_writer = None
+    try:
+        from titan_hcl.core.module_state import (
+            BootPriority,
+            ModuleStateWriter,
+        )
+        _state_writer = ModuleStateWriter(
+            module_name=name,
+            layer="L2",
+            boot_priority=BootPriority.MANDATORY,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        logger.warning(
+            "[AgnoWorker] Phase 11 ModuleStateWriter init failed "
+            "(continuing on legacy MODULE_READY path): %s", _sw_err)
 
     # ── Phase 9 Chunk 9A instrumentation — pure baseline capture ──
     # Pre-Phase-9 RSS root-cause baseline per RFP §3F + per-discipline
@@ -887,6 +953,17 @@ def agno_worker_main(recv_queue, send_queue, name: str,
     # full bus client into worker subprocesses is a Chunk-K hardening pass.
     bus_client = _build_worker_bus_client(send_queue, recv_queue, name)
 
+    # ── Phase 11 §11.I.5 — start heartbeat EARLY (before Agent build) ──
+    # The legacy heartbeat thread used to start AFTER Agent + OVG warmup
+    # completed (~60-90s in). Under Guardian's 60s `heartbeat_timeout`
+    # default that meant agno was killed on EVERY cold boot before its
+    # first heartbeat fired — the heartbeat-timeout restart loop observed
+    # T3 cascade 2026-05-27. Starting the heartbeat HERE (before the slow
+    # init) is the SPEC-correct fix: liveness is asserted during boot,
+    # state transitions to "running" only after probe passes per §11.I.2.
+    # The local `stats` dict is constructed below; we forward-declare it
+    # so the heartbeat closure can reference it.
+
     # ── Stats reference shared with heartbeat thread ──
     # D-SPEC-76 (SPEC v1.18.0) — `_session_cache_capacity` is read by
     # _handle_chat_request for LRU eviction; configurable via
@@ -907,6 +984,25 @@ def agno_worker_main(recv_queue, send_queue, name: str,
         "session_misses": 0,
     }
 
+    # ── Phase 11 §11.I.5 — heartbeat thread BEFORE the slow init ──
+    # See block at line ~949 for rationale. The thread sends MODULE_HEARTBEAT
+    # on the bus (legacy Guardian path) AND publishes _state_writer.heartbeat()
+    # on the SHM slot (Phase 11 contract). Until _AGENT_READY + _OVG_READY
+    # are True, the SHM-heartbeat is suppressed inside _heartbeat_loop so
+    # the slot stays in `starting` / `booted` rather than prematurely
+    # asserting `running`.
+    hb_stop = threading.Event()
+    hb_thread = threading.Thread(
+        target=_heartbeat_loop,
+        args=(send_queue, name, hb_stop, stats, _state_writer),
+        daemon=True, name="agno-heartbeat",
+    )
+    hb_thread.start()
+    logger.info(
+        "[AgnoWorker] Heartbeat thread started EARLY (Phase 11 §11.I.5 — "
+        "bus + SHM cadence covers slow Agent+OVG boot window)"
+    )
+
     # ── WorkerPlugin + Agent construction ──
     worker_plugin: Optional[Any] = None
     agent: Optional[Any] = None
@@ -914,6 +1010,7 @@ def agno_worker_main(recv_queue, send_queue, name: str,
         worker_plugin, agent = _init_worker_plugin_and_agent(bus_client, config)
         logger.info("[AgnoWorker] Agent constructed in %.0fms",
                     (time.time() - boot_start) * 1000)
+        _AGENT_READY = (agent is not None and worker_plugin is not None)
     except Exception as e:
         logger.exception(
             "[AgnoWorker] Agent construction failed — chat handler will "
@@ -942,6 +1039,7 @@ def agno_worker_main(recv_queue, send_queue, name: str,
                 "D-SPEC-138; closes first-chat cold-start cascade)",
                 (time.time() - ovg_start) * 1000,
             )
+            _OVG_READY = True
         except Exception as _ovg_err:
             # Defense-in-depth: if eager init fails, the lazy-init path
             # still works on first chat. The warning surfaces the regression
@@ -951,6 +1049,25 @@ def agno_worker_main(recv_queue, send_queue, name: str,
                 "on first chat — first-chat latency will spike): %s",
                 _ovg_err,
             )
+            # _OVG_READY stays False — probe will fail-fast rather than
+            # claim a half-ready worker can serve.
+
+    # ── Phase 11 §11.I.2 — slot transition: starting → booted ──────────
+    # Both Agent + OVG eager warmup have completed (or soft-failed with
+    # graceful degradation). Worker now signals "in-process scaffolding
+    # done; ready to be probed". titan_hcl's 1Hz SHM poll detects this
+    # transition + dispatches MODULE_PROBE_REQUEST. The handler below in
+    # the recv loop runs the probe and transitions slot → "running".
+    if _state_writer is not None and _AGENT_READY:
+        try:
+            _state_writer.write_state("booted")
+            logger.info(
+                "[AgnoWorker] Phase 11 §11.I.2 — SHM slot state=booted "
+                "(awaiting MODULE_PROBE_REQUEST from titan_hcl)")
+        except Exception as _swb_err:  # noqa: BLE001
+            logger.warning(
+                "[AgnoWorker] Phase 11 write_state(booted) failed "
+                "(continuing on legacy MODULE_READY path): %s", _swb_err)
 
     # ── Phase 7 §P7.C/E — BufferCache wiring (D-SPEC-PHASE7) ─────────────
     # Per-chat in-mem cache + write-through bus emit. Sole DuckDB writer of
@@ -1024,17 +1141,7 @@ def agno_worker_main(recv_queue, send_queue, name: str,
         save_state_cb=_b1_save_state,
     )
 
-    # ── Heartbeat daemon thread ──
-    hb_stop = threading.Event()
-    hb_thread = threading.Thread(
-        target=_heartbeat_loop,
-        args=(send_queue, name, hb_stop, stats),
-        daemon=True, name="agno-heartbeat",
-    )
-    hb_thread.start()
-    logger.info(
-        "[AgnoWorker] Heartbeat thread started (30s interval)"
-    )
+    # ── (heartbeat thread was started EARLIER above per Phase 11 §11.I.5) ──
 
     # ── AGNO_WORKER_READY broadcast (boot signal for guardian + observers) ──
     _send(send_queue, AGNO_WORKER_READY, name, "all", {
@@ -1102,6 +1209,36 @@ def agno_worker_main(recv_queue, send_queue, name: str,
                 if publisher:
                     publisher.publish(stats)
                     last_shm_publish = time.time()
+                continue
+
+            # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ─────────
+            # titan_hcl dispatches this after detecting our SHM slot
+            # transitioned to "booted". `handle_module_probe_request`:
+            #   1. Writes state="probing" to our SHM slot
+            #   2. Invokes agno_worker_probe(bus_client) which inspects
+            #      _AGENT_READY + _OVG_READY module-level sentinels
+            #   3. Writes state="running" + last_probe_result on pass,
+            #      OR state="unhealthy" + last_error envelope on fail
+            #   4. Publishes MODULE_PROBE_RESPONSE(probe_id, result) back
+            from titan_hcl.bus import MODULE_PROBE_REQUEST
+            if msg_type == MODULE_PROBE_REQUEST and _state_writer is not None:
+                try:
+                    from titan_hcl.core.probe_dispatcher import (
+                        handle_module_probe_request,
+                    )
+                    from titan_hcl.probes.agno import agno_worker_probe
+                    handle_module_probe_request(
+                        msg,
+                        probe_fn=agno_worker_probe,
+                        send_queue=send_queue,
+                        module_name=name,
+                        state_writer=_state_writer,
+                        bus_client=bus_client,
+                    )
+                except Exception as _phb_err:  # noqa: BLE001
+                    logger.warning(
+                        "[AgnoWorker] Phase 11 probe handler raised: %s",
+                        _phb_err)
                 continue
 
             # ── Chat dispatch via Agno Agent (C2) ──
