@@ -673,108 +673,6 @@ def _init_worker_plugin_and_agent(bus_client, config: dict[str, Any]):
     return worker_plugin, agent
 
 
-def _install_phase9_baseline_hook() -> None:
-    """Install file-flag → JSON-dump daemon thread for Phase 9 Chunk 9A.
-
-    Pure instrumentation. Starts tracemalloc(1 frame) so per-allocation
-    overhead stays minimal (<1% RSS / <2% CPU). A daemon thread polls for
-    /tmp/agno_baseline_request_<pid> every 0.5s; when the flag file
-    appears, captures a snapshot, writes
-    /tmp/agno_baseline_<pid>_<unix_ts_ms>.json, deletes the flag.
-
-    Rationale for thread over SIGUSR1: when the main thread is blocked in
-    a C extension (LLM client socket read, bus publish), Python defers
-    SIGUSR1 delivery indefinitely — confirmed live on T3 2026-05-27 where
-    dumps arrived 3+ minutes after the signal. The daemon thread runs
-    free of main-thread state and responds within 0.5s even if main is
-    fully hung. Never raises into the worker: any error logs to /tmp.
-    Idempotent: tracemalloc.start is a no-op if already tracing;
-    duplicate thread launch is guarded by module-global flag.
-    """
-    import json
-    import os
-    import sys
-    import threading
-    import tracemalloc
-
-    if not tracemalloc.is_tracing():
-        tracemalloc.start(1)
-
-    # Guard against double-launch across hot-reload
-    if getattr(_install_phase9_baseline_hook, "_running", False):
-        return
-    _install_phase9_baseline_hook._running = True  # type: ignore[attr-defined]
-
-    pid = os.getpid()
-    request_path = f"/tmp/agno_baseline_request_{pid}"
-
-    def _write_dump() -> None:
-        try:
-            ts = time.time()
-            snap = tracemalloc.take_snapshot()
-            top = snap.statistics("lineno")[:20]
-            rss_kb = 0
-            try:
-                with open(f"/proc/{pid}/status") as fh:
-                    for line in fh:
-                        if line.startswith("VmRSS:"):
-                            rss_kb = int(line.split()[1])
-                            break
-            except Exception:
-                pass
-            cur, peak = tracemalloc.get_traced_memory()
-            out = {
-                "pid": pid,
-                "ts_unix": ts,
-                "rss_kb": rss_kb,
-                "tracemalloc_current_bytes": cur,
-                "tracemalloc_peak_bytes": peak,
-                "sys_modules_count": len(sys.modules),
-                "sys_modules": sorted(sys.modules.keys()),
-                "tracemalloc_top20": [
-                    {
-                        "file": str(s.traceback[0].filename),
-                        "line": s.traceback[0].lineno,
-                        "size_bytes": int(s.size),
-                        "count": int(s.count),
-                    }
-                    for s in top
-                ],
-            }
-            out_path = f"/tmp/agno_baseline_{pid}_{int(ts * 1000)}.json"
-            tmp = out_path + ".tmp"
-            with open(tmp, "w") as fh:
-                json.dump(out, fh)
-            os.replace(tmp, out_path)
-        except Exception as exc:
-            try:
-                with open(
-                    f"/tmp/agno_baseline_error_{pid}_{int(time.time())}.log", "w",
-                ) as fh:
-                    import traceback as _tb
-                    fh.write(f"{exc}\n{_tb.format_exc()}")
-            except Exception:
-                pass
-
-    def _watcher_loop() -> None:
-        while True:
-            try:
-                if os.path.exists(request_path):
-                    try:
-                        os.unlink(request_path)
-                    except OSError:
-                        pass
-                    _write_dump()
-            except Exception:
-                pass
-            time.sleep(0.5)
-
-    t = threading.Thread(
-        target=_watcher_loop, daemon=True, name="phase9-baseline-watcher",
-    )
-    t.start()
-
-
 def agno_worker_main(recv_queue, send_queue, name: str,
                      config: dict[str, Any]) -> None:
     """Entry function for the agno_worker L2 process.
@@ -792,17 +690,6 @@ def agno_worker_main(recv_queue, send_queue, name: str,
     """
     logger.info("[AgnoWorker] Boot")
     boot_start = time.time()
-
-    # ── Phase 9 Chunk 9A instrumentation — pure baseline capture ──
-    # Pre-Phase-9 RSS root-cause baseline per RFP §3F + per-discipline
-    # `feedback_eager_init_needs_rss_root_cause_first`. tracemalloc starts
-    # FIRST so it observes every subsequent allocation in worker boot. The
-    # SIGUSR1 handler is triggered by `scripts/agno_baseline.py` at the 5
-    # RFP-defined checkpoints {boot_complete, chat_1_in, chat_1_out,
-    # chat_5_out, chat_10_out} and writes a JSON snapshot to /tmp. Zero
-    # behavior change to chat handling. To be removed when Phase 9 closes
-    # (gated by RFP §3F.5 LOCK; see §3F.2 chunk 9A).
-    _install_phase9_baseline_hook()
 
     # ── asyncio loop owned by this worker (Agno is async-first) ──
     import asyncio

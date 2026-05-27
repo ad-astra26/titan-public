@@ -178,31 +178,14 @@ async def verify_maker_auth(request: Request):
     body = await request.body()
     message = f"{ts_str}:{body.decode('utf-8')}"
 
-    # Get maker pubkey — try the SoulAccessor first (G18 SHM-direct), then
-    # fall back to plugin.soul._maker_pubkey for the legacy path. The original
-    # code referenced an undefined `titan_state` variable (pre-existing typo
-    # / incomplete refactor), which made every Ed25519-signed admin call
-    # crash with 500 NameError. MakerPanel had been silently using the
-    # internal-key bypass instead; the wallet-sig path was untested for
-    # months until /admin/pitch-sessions exercised it (2026-05-27).
+    # Get maker pubkey from the plugin instance stored in app.state
     plugin = getattr(request.app.state, "titan_hcl", None)
     if plugin is None:
         raise HTTPException(status_code=503, detail="Titan plugin not initialized.")
 
     maker_pubkey_str = ""
-    titan_state = getattr(request.app.state, "titan_state", None)
-    if titan_state is not None:
-        soul_accessor = getattr(titan_state, "soul", None)
-        if soul_accessor is not None:
-            try:
-                mk = soul_accessor.maker_pubkey()
-                if mk:
-                    maker_pubkey_str = str(mk)
-            except Exception:
-                logger.debug("[Auth] soul_accessor.maker_pubkey() failed", exc_info=True)
-    if not maker_pubkey_str and hasattr(plugin, "soul") and plugin.soul:
-        # Legacy fallback — plugin.soul._maker_pubkey direct attribute.
-        mk = getattr(plugin.soul, "_maker_pubkey", None)
+    if hasattr(plugin, "soul") and titan_state.soul:
+        mk = getattr(titan_state.soul, "_maker_pubkey", None)
         if mk:
             maker_pubkey_str = str(mk)
 
