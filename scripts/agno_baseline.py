@@ -520,9 +520,12 @@ def main() -> int:
                     help="If agno_worker runs on a remote host, ssh user@host "
                          "to use for pgrep / /proc reads / SIGUSR1 / /tmp file "
                          "reads. Default: local (T1).")
-    ap.add_argument("--output", default="data/audits/agno_baseline_pre_phase9.json",
+    ap.add_argument("--output", default="titan-docs/audits/agno_baseline_pre_phase9.json",
                     help="Destination JSON path (overwritten — Maker-reviewed "
-                         "single source of truth for Phase 9 baseline)")
+                         "single source of truth for Phase 9 baseline). The "
+                         "default lands in titan-docs/audits/ alongside "
+                         "AUDIT_spirit_loop_function_ownership.md and other "
+                         "audit artifacts; data/ is gitignored.")
     ap.add_argument("--user-id", default=DEFAULT_USER_ID,
                     help=f"X-Titan-User-Id header value (default {DEFAULT_USER_ID})")
     ap.add_argument("--channel", default=DEFAULT_CHANNEL,
