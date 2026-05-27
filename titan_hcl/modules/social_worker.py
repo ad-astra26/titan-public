@@ -61,6 +61,8 @@ from queue import Empty
 
 from titan_hcl import bus
 from titan_hcl.core.state_registry import resolve_titan_id
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +109,7 @@ _SOCIAL_WORKER_SUBSCRIBE_TOPICS = [
 ]
 
 
+@with_error_envelope(module_name="social_worker", subsystem="entry", severity=_phase11_sev.FATAL)
 def social_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the social_worker subprocess.
 

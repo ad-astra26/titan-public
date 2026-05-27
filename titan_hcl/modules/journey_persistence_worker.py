@@ -35,6 +35,8 @@ from queue import Empty
 from typing import Any, Dict, Optional
 
 from titan_hcl import bus
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +177,7 @@ def _decode_gift_event(msg: dict, *, expected_part: str) -> Optional[Dict[str, A
     }
 
 
+@with_error_envelope(module_name="journey_persistence", subsystem="entry", severity=_phase11_sev.FATAL)
 def journey_persistence_worker_main(recv_queue, send_queue, name: str,
                                     config: dict) -> None:
     """Main loop for the journey_persistence_worker subprocess.

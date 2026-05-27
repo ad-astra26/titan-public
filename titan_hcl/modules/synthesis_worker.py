@@ -91,6 +91,8 @@ from titan_hcl.synthesis.standing_store import (
     StandingBundleStore,
 )
 from titan_hcl.synthesis.recall import EngineRecall
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 # Process-local EngineRecall singleton (PLAN §2D). Constructed during
 # synthesis_worker_main boot; exposed via get_engine_recall() so future
@@ -544,6 +546,7 @@ def _recompute_loop(store: "ActivationStore",
         stop_event.wait(remaining)
 
 
+@with_error_envelope(module_name="synthesis", subsystem="entry", severity=_phase11_sev.FATAL)
 def synthesis_worker_main(recv_queue, send_queue, name: str,
                           config: dict) -> None:
     """L2 module entry — Guardian supervised.

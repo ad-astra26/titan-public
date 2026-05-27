@@ -24,6 +24,8 @@ from queue import Empty
 from typing import Optional
 from titan_hcl.utils.silent_swallow import swallow_warn
 from titan_hcl import bus
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +257,7 @@ async def _call_llm(api_base, internal_key, model, system_prompt, user_prompt, t
         return ""
 
 
+@with_error_envelope(module_name="meta_teacher", subsystem="entry", severity=_phase11_sev.FATAL)
 def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the Meta-Teacher module process.
 
