@@ -66,6 +66,8 @@ from titan_hcl.health import (
     HealthCheckPlugin,
     HealthResult,
 )
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger("health_monitor_worker")
 
@@ -507,6 +509,7 @@ def _check_pending_heal_timeouts(
 # ── Main loop ────────────────────────────────────────────────────────
 
 
+@with_error_envelope(module_name="health_monitor", subsystem="entry", severity=_phase11_sev.FATAL)
 def health_monitor_worker_main(recv_queue, send_queue, name: str,
                                 config: dict) -> None:
     """L3 module entry — Guardian supervised.

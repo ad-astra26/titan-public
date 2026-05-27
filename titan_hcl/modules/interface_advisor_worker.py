@@ -78,6 +78,8 @@ from titan_hcl.bus import (
 from titan_hcl.logic.interface_advisor_publisher import (
     InterfaceAdvisorStatePublisher,
 )
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +106,7 @@ def _heartbeat_loop(send_queue, name: str,
         stop_event.wait(HEARTBEAT_INTERVAL_S)
 
 
+@with_error_envelope(module_name="interface_advisor", subsystem="entry", severity=_phase11_sev.FATAL)
 def interface_advisor_worker_main(recv_queue, send_queue, name: str,
                                   config: dict) -> None:
     """L2 module entry — Guardian supervised.

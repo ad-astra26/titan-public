@@ -91,6 +91,8 @@ from titan_hcl.synthesis.standing_store import (
     StandingBundleStore,
 )
 from titan_hcl.synthesis.recall import EngineRecall
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 # Process-local EngineRecall singleton (PLAN §2D). Constructed during
 # synthesis_worker_main boot; exposed via get_engine_recall() so future
@@ -450,7 +452,6 @@ def _recompute_loop(store: "ActivationStore",
                     spine_exporter_holder: dict,
                     fork_exporter_holder: dict,
                     fork_activation_updater_holder: dict,
-                    oracle_exporter_holder: dict,
                     send_queue, name: str,
                     interval_s: float,
                     stop_event: threading.Event,
@@ -513,14 +514,6 @@ def _recompute_loop(store: "ActivationStore",
                     "[synthesis_worker] fork_exporter call failed: %s",
                     _fork_exp_err,
                 )
-            # Phase 6 §P6.K — oracles_snapshot.json for cross-process api reads.
-            try:
-                oracle_exporter_holder["fn"]()
-            except Exception as _ora_exp_err:
-                logger.debug(
-                    "[synthesis_worker] oracle_exporter call failed: %s",
-                    _ora_exp_err,
-                )
             status_writer.publish(
                 last_consistent_event_ts=now,
                 last_recompute_ts=now,
@@ -553,6 +546,7 @@ def _recompute_loop(store: "ActivationStore",
         stop_event.wait(remaining)
 
 
+@with_error_envelope(module_name="synthesis", subsystem="entry", severity=_phase11_sev.FATAL)
 def synthesis_worker_main(recv_queue, send_queue, name: str,
                           config: dict) -> None:
     """L2 module entry — Guardian supervised.
@@ -639,17 +633,12 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # once it has been constructed; both default to no-op).
     fork_exporter_holder: dict = {"fn": lambda: None}
     fork_activation_updater_holder: dict = {"fn": lambda: None}
-    # Phase 6 §P6.K — oracle snapshot exporter holder (same late-bound
-    # pattern; Phase 6 wiring sets the real exporter callable once
-    # OracleRouter/SpendStore/GateConfig are ready).
-    oracle_exporter_holder: dict = {"fn": lambda: None}
 
     rc_thread = threading.Thread(
         target=_recompute_loop,
         args=(store, bundle_store, status_writer, snapshot_path,
               bundle_snapshot_path, spine_exporter_holder,
               fork_exporter_holder, fork_activation_updater_holder,
-              oracle_exporter_holder,
               send_queue, name,
               interval_s, stop_event, cache_lock),
         daemon=True, name=f"synthesis-recompute-{name}")
@@ -966,200 +955,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     fork_gc_live_mode: bool = bool(
         (config or {}).get("synthesis", {}).get("fork_gc_live", False)
     )
-
-    # ── Phase 6 §P6.A–K — Oracle middleware + proof middleware + CGN ─────
-    # MeaningOraclePlug + 4 ToolPlugs + coverage analyzer + snapshot
-    # exporter. Soft-fail: if any dependency is missing the worker keeps
-    # running with Phase 6 disabled this session (matches the P5 pattern).
-    oracle_router: Optional[Any] = None
-    proof_registry: Optional[Any] = None
-    cgn_meaning_oracle: Optional[Any] = None
-    oracle_snapshot_exporter: Optional[Any] = None
-    try:
-        if 'writer' not in locals() or writer is None:
-            raise RuntimeError(
-                "missing dependency: OuterMemoryWriter not wired — "
-                "Phase 6 oracle/proof middleware disabled this session"
-            )
-        from titan_hcl.synthesis.oracle_gate import (
-            OracleGate, build_gate_config, ensure_oracle_daily_spend_table,
-            zk_privacy_domains,
-        )
-        from titan_hcl.synthesis.oracle_router import (
-            OracleRouter, OracleSpendStore,
-        )
-        from titan_hcl.synthesis.oracle_coverage import CoverageAnalyzer
-        from titan_hcl.synthesis.oracle_snapshot import OracleSnapshotExporter
-        from titan_hcl.synthesis.proofs.merkle_proof import MerkleProofStrategy
-        from titan_hcl.synthesis.proofs.zk_proof import ZKProofStrategy
-        from titan_hcl.synthesis.proofs.registry import ProofStrategyRegistry
-        from titan_hcl.synthesis.cgn_meaning_oracle import CGNMeaningOracle
-        from titan_hcl.synthesis.oracles.coding_sandbox_oracle import (
-            CodingSandboxOracle,
-        )
-        from titan_hcl.synthesis.oracles.solana_rpc_oracle import SolanaRpcOracle
-        from titan_hcl.synthesis.oracles.web_api_oracle import WebApiOracle
-        from titan_hcl.synthesis.oracles.x_oracle import XOracle
-        from titan_hcl.synthesis.tools.coding_sandbox_tool import (
-            CodingSandboxTool,
-        )
-        from titan_hcl.synthesis.tools.events_teacher_tool import (
-            EventsTeacherTool,
-        )
-        from titan_hcl.synthesis.tools.knowledge_tool import KnowledgeTool
-        from titan_hcl.synthesis.tools.x_research_tool import XResearchTool
-
-        # Merged config (the worker received `config` from the kernel).
-        gate_config = build_gate_config(config or {})
-        gate = OracleGate(gate_config)
-
-        # Spend store shares the synthesis_worker's existing DuckDB
-        # connection (INV-Syn-3 sole writer).
-        ensure_oracle_daily_spend_table(store._conn)
-        spend_store = OracleSpendStore(store._conn)
-
-        # Balance provider — best-effort; gate_config.balance_sol_baseline
-        # ensures sensible behavior when balance lookup degrades. The
-        # synthesis_worker is a subprocess so we cannot directly reach
-        # TitanHCL.network — use a config-supplied callable or fall back
-        # to a static 1.0 (= baseline; admit_score = importance).
-        def _balance_lookup() -> float:
-            try:
-                # network_state.bin carries balance_sol (G18 SHM read);
-                # placeholder static for now — synthesis_worker boot
-                # extension can wire ShmReaderBank in a follow-up.
-                return float(
-                    (config or {}).get("synthesis", {}).get("balance_sol_fallback", 1.0)
-                )
-            except Exception:
-                return 1.0
-
-        oracle_router = OracleRouter(
-            gate=gate,
-            spend_store=spend_store,
-            outer_memory_writer=writer,
-            balance_provider=_balance_lookup,
-        )
-
-        # Proof strategy registry — Merkle default; ZK injected via the
-        # ZK Vault commit/verify functions. Phase 6 v1 leaves the ZK
-        # callables as no-ops (they raise if invoked); ZK fires only
-        # when INV-Syn-14 triggers AND the worker has wired the ZK
-        # Vault submitter via a follow-up integration commit.
-        proof_registry = ProofStrategyRegistry(
-            merkle=MerkleProofStrategy(),
-            zk=ZKProofStrategy(),
-            privacy_domains=zk_privacy_domains(config or {}),
-        )
-
-        # CGN meaning oracle — concept_reader bound to ConceptStore;
-        # cgn_grounder reserved for the bus-RPC follow-up (returns None
-        # for now → degraded grounding per the P6.H defensive contract).
-        def _concept_reader(concept_id: str, version: int):
-            if concept_store is None:
-                return None
-            try:
-                # ConceptStore exposes spine reads via its _read_spine_*
-                # methods (P4); we use the public read_concept_strands
-                # helper if present, else fall back to the registry
-                # ensure_grounded for shape compatibility.
-                getter = getattr(concept_store, "read_spine_strands", None)
-                if callable(getter):
-                    return getter(concept_id, version)
-            except Exception:
-                logger.exception("[synthesis_worker] concept_reader failed")
-            return None
-
-        cgn_meaning_oracle = CGNMeaningOracle(
-            concept_reader=_concept_reader,
-        )
-
-        # Concrete truth oracles
-        sandbox_oracle = CodingSandboxOracle()
-        solana_oracle = SolanaRpcOracle(
-            rpc_url=(config or {}).get("network", {}).get("premium_rpc_url"),
-            fallback_urls=list((config or {}).get("network", {}).get("public_rpc_urls", [])),
-        )
-        web_api_oracle = WebApiOracle()  # default search_fn + judge_fn
-        # x_oracle / x_research need a real SocialXGateway instance — best-
-        # effort wire from existing plugin path (if available via config).
-        # Sandbox-as-tool and sandbox-as-oracle share the same helper.
-
-        # Register truth oracles with the router.
-        oracle_router.register(sandbox_oracle)
-        oracle_router.register(solana_oracle)
-        oracle_router.register(web_api_oracle)
-        oracle_router.register(cgn_meaning_oracle)  # MeaningOraclePlug — for /v6/synthesis/oracles/router visibility
-
-        # Coverage analyzer — readers default to no-op; integration
-        # boot can wire them to the chain index DB in a follow-up.
-        coverage_analyzer = CoverageAnalyzer()
-
-        # Snapshot exporter — wired to the 60s tick via a holder pattern
-        # (mirrors forks_snapshot pattern). Buffers for recent verdicts
-        # + proofs are constructed here so the router/proof paths can
-        # push entries when they fire.
-        recent_verdict_buffer: list = []
-        recent_proof_buffer: list = []
-        oracle_snapshot_path = os.path.join(
-            os.environ.get("TITAN_DATA_DIR", "data"),
-            "oracles_snapshot.json",
-        )
-        oracle_snapshot_exporter = OracleSnapshotExporter(
-            router=oracle_router,
-            spend_store=spend_store,
-            gate_config=gate_config,
-            coverage_analyzer=coverage_analyzer,
-            snapshot_path=oracle_snapshot_path,
-            recent_verdict_buffer=recent_verdict_buffer,
-            recent_proof_buffer=recent_proof_buffer,
-        )
-
-        # Initial export so the file exists from boot — Observatory
-        # routes get a real (possibly empty) payload immediately.
-        try:
-            oracle_snapshot_exporter.export()
-            logger.info(
-                "[synthesis_worker] initial oracle snapshot exported → %s",
-                oracle_snapshot_path,
-            )
-        except Exception as _osx_err:
-            logger.warning(
-                "[synthesis_worker] initial oracle snapshot failed: %s",
-                _osx_err,
-            )
-
-        # Wire the exporter into the 60s recompute tick.
-        oracle_exporter_holder["fn"] = lambda: oracle_snapshot_exporter.export()
-
-        # ToolPlugs — same OuterMemoryWriter (so procedural TXs anchor
-        # via the single canonical write path per INV-4); router is
-        # passed in so companion-verdict triggers fire.
-        sandbox_tool = CodingSandboxTool(
-            writer=writer, router=oracle_router, oracle=sandbox_oracle,
-        )
-        events_teacher_tool = EventsTeacherTool(writer=writer, router=oracle_router)
-        knowledge_tool = KnowledgeTool(writer=writer, router=oracle_router)
-        # x_research_tool needs a gateway — leave unwired here; the
-        # main plugin (TitanHCL) constructs it with the live
-        # SocialXGateway. agno_tools fall-back gracefully when missing.
-        synthesis_tool_plugs = {
-            "coding_sandbox": sandbox_tool,
-            "events_teacher": events_teacher_tool,
-            "knowledge": knowledge_tool,
-        }
-        logger.info(
-            "[synthesis_worker] Phase 6 oracle/proof middleware ready — "
-            "router=%d plugs, proof_registry=Merkle+ZK, exporter=on",
-            len(oracle_router.registered_oracles()),
-        )
-    except Exception as exc:
-        logger.warning(
-            "[synthesis_worker] Phase 6 wiring failed: %s — "
-            "oracle/proof middleware disabled this session",
-            exc, exc_info=True,
-        )
-        synthesis_tool_plugs = {}
 
     def _maybe_run_consolidation_async(dream_start_ts: float) -> None:
         """Fire a ConsolidationPass in a worker thread; never blocks the

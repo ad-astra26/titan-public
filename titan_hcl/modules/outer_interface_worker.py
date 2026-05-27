@@ -70,6 +70,8 @@ from queue import Empty
 from typing import Optional
 
 from titan_hcl import bus
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger("outer_interface_worker")
 
@@ -229,6 +231,7 @@ def _init_outer_interface(config: dict, titan_id: str):
 
 # ARG ORDER (template-canonical — see cognitive_worker.py:135-137): every
 # Guardian-spawned L2 worker entry follows (recv_queue, send_queue, name, config).
+@with_error_envelope(module_name="outer_interface_worker", subsystem="entry", severity=_phase11_sev.FATAL)
 def outer_interface_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the outer_interface_worker subprocess.
 
