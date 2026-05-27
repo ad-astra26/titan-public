@@ -12212,3 +12212,21 @@ post_v6_synthesis_fork_record_exploration = post_synthesis_fork_record_explorati
 post_v6_synthesis_fork_graduate_manual = post_synthesis_fork_graduate_manual
 post_v6_synthesis_fork_abandon = post_synthesis_fork_abandon
 post_v6_synthesis_fork_sweep = post_synthesis_fork_sweep
+
+# Re-exports from titan_hcl/api/synthesis_oracle_handlers.py (P6.K) —
+# JSON-snapshot-backed reads of `data/oracles_snapshot.json`
+# (synthesis_worker is the sole writer per INV-Syn-3). Surfaces:
+# router state, recent verdicts, A.6 coverage, daily budget, recent proofs.
+from titan_hcl.api.synthesis_oracle_handlers import (
+    get_synthesis_oracles_router,
+    get_synthesis_oracles_recent,
+    get_synthesis_oracles_coverage,
+    get_synthesis_oracles_budget,
+    get_synthesis_proofs_recent,
+)
+
+get_v6_synthesis_oracles_router = get_synthesis_oracles_router
+get_v6_synthesis_oracles_recent = get_synthesis_oracles_recent
+get_v6_synthesis_oracles_coverage = get_synthesis_oracles_coverage
+get_v6_synthesis_oracles_budget = get_synthesis_oracles_budget
+get_v6_synthesis_proofs_recent = get_synthesis_proofs_recent

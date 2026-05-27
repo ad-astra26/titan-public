@@ -2,7 +2,7 @@
 titan_hcl.guardian_hcl.core — Guardian L1 supervisor class.
 
 Carved from titan_hcl/guardian.py by scripts/_phase6_carve_guardian.py per
-SPEC §11.B.4 / D-SPEC-135 / v1.62.0. Guardian = OrchestratorReloadMixin +
+SPEC §11.B.4 / D-SPEC-135 / v1.62.0. Guardian = GuardianReloadMixin +
 GuardianDepActivationMixin + remaining lifecycle methods. Dataclasses
 (ModuleState/ModuleSpec/ModuleInfo/ReloadState) live in module_registry.
 Public API surface frozen as bus messages per RFP §3C.3 6C.
@@ -110,11 +110,11 @@ from titan_hcl.guardian_hcl.module_registry import (
     ReloadState,
     _append_meta_cgn_emission_log,
 )
-from titan_hcl.reload import OrchestratorReloadMixin
+from titan_hcl.guardian_hcl.reload import GuardianReloadMixin
 from titan_hcl.guardian_hcl.dep_activation import GuardianDepActivationMixin
 
 
-class Guardian(OrchestratorReloadMixin, GuardianDepActivationMixin):
+class Guardian(GuardianReloadMixin, GuardianDepActivationMixin):
     """
     Supervises module processes — starts, monitors, restarts.
 

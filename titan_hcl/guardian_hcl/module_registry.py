@@ -106,12 +106,6 @@ MAX_STARVED_CYCLES = 5          # how many consecutive starved-but-alive cycles 
 class ModuleState(Enum):
     STOPPED = "stopped"
     STARTING = "starting"
-    # Phase 11 (SPEC §11.I.2 / D-SPEC-141): worker has finished in-process
-    # scaffolding; titan_hcl will detect this state via 1Hz SHM poll and
-    # dispatch MODULE_PROBE_REQUEST.
-    BOOTED = "booted"
-    # Phase 11: worker received MODULE_PROBE_REQUEST and is running probe_fn.
-    PROBING = "probing"
     RUNNING = "running"
     UNHEALTHY = "unhealthy"
     CRASHED = "crashed"
@@ -182,27 +176,6 @@ class ModuleSpec:
     # commits populate per-module (e.g., social_module.dependencies =
     # [Dependency("x_api_reachable", EXTERNAL_SVC, SOFT, ...)]).
     dependencies: list[Dependency] = field(default_factory=list)
-    # Phase 11 (SPEC §11.I.3 / D-SPEC-141): optional per-module readiness probe.
-    # When None, the module gets a trivial pass-through probe
-    # (`lambda bus: ProbeResult.ok_()`) — legacy modules require no migration
-    # to remain compatible. When provided, must complete ≤2s wall time + must
-    # be pure observation (no state mutation, no main-thread locks, no asyncio
-    # block). Probes run on a titan_hcl-side thread; communicate with target
-    # worker via MODULE_PROBE_REQUEST/RESPONSE bus-RPC pair.
-    # Signature: `Callable[[BusClient], titan_hcl.core.module_state.ProbeResult]`.
-    # Populated per-worker in Chunk 11H (10 heaviest workers).
-    probe_fn: Optional[Callable] = None
-    # Phase 11 (SPEC §11.I.8 / D-SPEC-141): per-module boot-priority partition.
-    # - MANDATORY:          part of Phase A; gates fleet_ready=true SHM publication.
-    # - OPTIONAL_POST_BOOT: scheduled in Phase B background after fleet ready.
-    # - LAZY:               never auto-started; pre-activated via §11.G.2.5
-    #                       ENSURE_RUNNING from a consumer dep.
-    # New modules default to MANDATORY (preserves current pre-Phase-11
-    # behaviour). Today's `lazy=True` migrates 1:1 to LAZY in Chunk 11G.
-    # Stored as a string here to avoid an import cycle into core.module_state;
-    # canonical values match BootPriority enum values
-    # ("mandatory" / "post_boot" / "lazy"). Validation lives in 11F orchestrator.
-    boot_priority: str = "mandatory"
 
 
 @dataclass
