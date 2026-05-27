@@ -44,36 +44,6 @@ from titan_hcl.supervision import (
 logger = logging.getLogger(__name__)
 
 
-def _mod_dep(name: str) -> Dependency:
-    """Phase 11 §11.I.8 / D-SPEC-141 (Chunk 11G) — declare an
-    ENSURE_RUNNING critical MODULE dep. Used by the §3H.10 dep matrix
-    population below.
-
-    Equivalent to:
-        Dependency(
-            name=name,
-            kind=DependencyKind.MODULE,
-            severity=DependencySeverity.CRITICAL,
-            action=DependencyAction.ENSURE_RUNNING,
-        )
-
-    Honoured by:
-      - Orchestrator._compute_boot_order — topological sort respects
-        MODULE-kind deps so a child only spawns after its parent reaches
-        the boot order.
-      - OrchestratorDepActivationMixin._activate_dependencies (§11.G.2.5
-        D-SPEC-90) — recursive `start()` of any STOPPED dep before the
-        dependent spawns; bounded by
-        SUPERVISION_DEPENDENCY_ACTIVATION_TIMEOUT_S (30s).
-    """
-    return Dependency(
-        name=name,
-        kind=DependencyKind.MODULE,
-        severity=DependencySeverity.CRITICAL,
-        action=DependencyAction.ENSURE_RUNNING,
-    )
-
-
 def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     """Register the full Titan module catalog with Guardian. See module docstring."""
     from titan_hcl.modules.memory_worker import memory_worker_main
@@ -138,8 +108,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         # never does) → /health stays DEGRADED forever for 5 IMW writers.
         # spawn forces a fresh interpreter; no inherited lock state.
         start_method="spawn",
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="mandatory",
     ))
 
     # Output Verifier Worker — L2 §A.8.3 subprocess extraction.
@@ -171,12 +139,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         reply_only=True,
         start_method="spawn" if _spawn_grad else "fork",
         b2_1_swap_critical=False,  # not on hot ARC path; respawn-OK
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="mandatory",
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
-        dependencies=[
-            _mod_dep('timechain'),
-        ],
     ))
 
     # Phase A.S8 outer_{body,mind,spirit} Python workers RETIRED (Phase C
@@ -216,8 +178,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         reply_only=True,
         start_method="spawn" if _spawn_grad else "fork",
         b2_1_swap_critical=False,  # per-call processor; respawn-OK
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     # Agency Worker — L3 §A.8.6 subprocess extraction.
@@ -256,8 +216,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         reply_only=True,
         start_method="spawn" if _spawn_grad else "fork",
         b2_1_swap_critical=False,  # impulse decoder is not on swap critical path
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     # Warning Monitor Worker — Pattern C force multiplier (rFP-less
@@ -287,8 +245,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         broadcast_topics=[_bus_constants.SILENT_SWALLOW_REPORT],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         b2_1_swap_critical=False,  # M5: light-state worker; respawn-OK
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="mandatory",
     ))
 
     # health_monitor_worker — SPEC v1.12.0 §9.B + D-SPEC-67
@@ -318,8 +274,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         broadcast_topics=[_bus_constants.MODULE_SHUTDOWN],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="mandatory",
     ))
 
     # Observatory Writer Service — second IMW instance for observatory.db.
@@ -363,8 +317,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         # multi-threaded asyncio + heartbeat + bus-watcher; fork from
         # multi-threaded guardian_hcl deadlocks on inherited locks).
         start_method="spawn",
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     # ─────────────────────────────────────────────────────────────────
@@ -419,19 +371,11 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         entry_fn=memory_worker_main,
         config=memory_config,
         rss_limit_mb=2000,  # FAISS + Kuzu + DuckDB: ~1100-1200MB steady on T1 (40min uptime). VmRSS includes mmap'd DB pages from page cache, which inflates the reading on rapid restarts. Old 1400MB limit was sized for the Cognee era and caused T2 doom-loop.
-        # Phase 11 §11.I.8 / Chunk 11G (§3H.10) — memory was lazy=True under
-        # the pre-Phase-11 catalog (started on first MemoryProxy use). The
-        # §3H.10 matrix PROMOTES it to MANDATORY because /chat + dream + recall
-        # all need it before fleet_ready latches; a lazy first-spawn during
-        # the first /chat re-introduces the timechain-scan-style cold-boot
-        # latency that Phase 11 is designed to eliminate.
-        autostart=True,
-        lazy=False,
+        autostart=False,
+        lazy=True,
         heartbeat_timeout=120.0,  # Memory queries can block for 30s+
         reply_only=True,  # Memory only needs targeted QUERY messages, not broadcasts
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="mandatory",
     ))
 
     # RL/Sage module (TorchRL — ~2500MB with mmap)
@@ -459,8 +403,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         lazy=not _a8_sage_subproc_enabled,   # §A.8.7: eager when flag-on
         broadcast_topics=[_bus_constants.SAGE_RECORD_TRANSITION],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     # LLM/Inference module (Agno agent — ~500MB)
@@ -478,8 +420,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         heartbeat_timeout=120.0,  # LLM calls can block 30s+; match Spirit/Memory timeout
         broadcast_topics=[_bus_constants.LLM_TEACHER_REQUEST],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     # SPEC v1.17.0 / D-SPEC-72 — agno_worker hosts the Agno Agent + chat
@@ -553,14 +493,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=True,  # data/agno_sessions.db is critical-data per §11.H
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="mandatory",
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
-        dependencies=[
-            _mod_dep('memory'),
-            _mod_dep('output_verifier'),
-            _mod_dep('timechain'),
-        ],
     ))
 
     # Body module (5DT somatic sensors — lightweight, always-on)
@@ -595,8 +527,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             _bus_constants.CONVERSATION_STIMULUS, _bus_constants.INTERFACE_INPUT,
         ],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="mandatory",
     ))
 
     # Mind module (MoodEngine, SocialGraph — ~200MB)
@@ -624,8 +554,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             _bus_constants.SENSE_VISUAL, _bus_constants.SENSE_AUDIO,
         ],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="mandatory",
     ))
 
     # Spirit module (Consciousness + V4 Sphere Clocks + Enrichment + Neural NS + Experience Orchestrator)
@@ -700,12 +628,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # state=starting. Mirrors the worker-side topics= passed to
             # setup_worker_bus inside cognitive_worker_main.
             broadcast_topics=_COGNITIVE_WORKER_SUBSCRIBE_TOPICS,
-            # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-            boot_priority="mandatory",
-            # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
-            dependencies=[
-                _mod_dep('memory'),
-            ],
         ))
 
         # expression_worker (L2) — §4.B Track 3 extraction
@@ -735,12 +657,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             heartbeat_timeout=60.0,
             broadcast_topics=_EXPRESSION_WORKER_SUBSCRIBE_TOPICS,
             start_method="spawn" if _spawn_grad else "fork",
-            # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-            boot_priority="post_boot",
-            # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
-            dependencies=[
-                _mod_dep('cognitive_worker'),
-            ],
         ))
 
         # outer_interface_worker (L2) — Track 2 of
@@ -782,8 +698,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
                 ],
                 b2_1_swap_critical=False,
                 start_method="spawn" if _spawn_grad else "fork",
-                # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-                boot_priority="post_boot",
             ))
 
         # self_reflection_worker (L2) — Track 2 of
@@ -830,12 +744,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
                 ],
                 b2_1_swap_critical=True,
                 start_method="spawn" if _spawn_grad else "fork",
-                # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-                boot_priority="post_boot",
-                # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
-                dependencies=[
-                    _mod_dep('cognitive_worker'),
-                ],
             ))
 
     # social_worker (L2) — Phase C-S9 (chunks 9A-9K shipped 2026-05-12).
@@ -877,12 +785,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
                 _bus_constants.ENGAGEMENT_SNAPSHOT_TAKEN,
             ],
             start_method="spawn" if _spawn_grad else "fork",
-            # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-            boot_priority="post_boot",
-            # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
-            dependencies=[
-                _mod_dep('social_graph'),
-            ],
         ))
 
     # social_graph_worker — extracted from mind_worker per
@@ -916,8 +818,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=True,
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     # metabolism_worker — extracted from titan_HCL inline wire per
@@ -952,8 +852,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     # journey_persistence_worker — P0.5 / D-SPEC-131 §G5.1 (PLAN
@@ -999,8 +897,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     # corrective_events_persistence_worker — P0.6-C / D-SPEC-132 §6.6.6
@@ -1031,8 +927,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     # life_force_worker — extracted per rFP_titan_hcl_l2_separation_strategy §4.G
@@ -1071,8 +965,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     # studio_worker — extracted per rFP_titan_hcl_l2_separation_strategy §4.K
@@ -1110,8 +1002,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     # dream_state_worker — extracted per rFP_titan_hcl_l2_separation_strategy §4.I
@@ -1148,8 +1038,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     # synthesis_worker — Synthesis Engine Phase 1 (D-SPEC-123, SPEC v1.56.0
@@ -1238,13 +1126,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
-        dependencies=[
-            _mod_dep('timechain'),
-            _mod_dep('memory'),
-        ],
     ))
 
     # observatory_worker — extracted per RFP_phase_c_titan_hcl_cleanup
@@ -1284,8 +1165,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="mandatory",
     ))
 
     # meditation_worker — extracted per rFP_titan_hcl_l2_separation_strategy §4.D
@@ -1337,15 +1216,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
                 action=DependencyAction.ENSURE_RUNNING,
                 check=lambda: guardian.is_running("memory"),
             ),
-            # Phase 11 §11.I.8 / Chunk 11G — §3H.10 adds timechain to
-            # meditation's deps (meditation persists its anchor block via
-            # TimeChain on every cycle close).
-            _mod_dep("timechain"),
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     # sovereignty_worker — extracted per rFP_titan_hcl_l2_separation_strategy
@@ -1375,12 +1248,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="mandatory",
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
-        dependencies=[
-            _mod_dep('timechain'),
-        ],
     ))
 
     # interface_advisor_worker — extracted per rFP_titan_hcl_l2_separation
@@ -1413,8 +1280,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=False,
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     # Phase A+B compatibility (2026-05-08, rFP_trinity_130d_phase2_5_closure):
@@ -1508,8 +1373,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             heartbeat_timeout=60.0,
             start_method="spawn" if _spawn_grad else "fork",
             broadcast_topics=_NS_WORKER_BROADCAST_TOPICS,
-            # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-            boot_priority="post_boot",
         ))
     if _mk.get("shm_neuromod_enabled", True):
         guardian.register(ModuleSpec(
@@ -1523,8 +1386,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             heartbeat_timeout=60.0,
             start_method="spawn" if _spawn_grad else "fork",
             broadcast_topics=_STATE_WORKER_BROADCAST_TOPICS,
-            # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-            boot_priority="post_boot",
         ))
     if _mk.get("shm_hormonal_enabled", True):
         guardian.register(ModuleSpec(
@@ -1538,8 +1399,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             heartbeat_timeout=60.0,
             start_method="spawn" if _spawn_grad else "fork",
             broadcast_topics=_HORMONAL_WORKER_BROADCAST_TOPICS,
-            # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-            boot_priority="post_boot",
         ))
 
     # Media module (image/audio perception — lazy, starts on first media)
@@ -1564,8 +1423,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         reply_only=True,
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         b2_1_swap_critical=False,  # M5: light-state worker; respawn-OK
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     # Language module (composition, teaching, vocabulary — higher cognitive)
@@ -1603,12 +1460,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             _bus_constants.WORD_PERTURBATION_HINT,
         ],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
-        dependencies=[
-            _mod_dep('llm'),
-        ],
     ))
 
     # Meta-Reasoning Teacher (rFP_titan_meta_reasoning_teacher.md)
@@ -1645,12 +1496,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         # one broadcast type (META_CHAIN_COMPLETE).
         broadcast_topics=[_bus_constants.META_CHAIN_COMPLETE],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
-        dependencies=[
-            _mod_dep('llm'),
-        ],
     ))
 
     # CGN Cognitive Kernel (shared V(s) + per-consumer Q(s,a) + HAOV + Sigma)
@@ -1686,8 +1531,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             _bus_constants.CGN_KNOWLEDGE_REQ,
         ],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     # Knowledge Worker (4th CGN consumer — knowledge acquisition + Stealth Sage)
@@ -1735,8 +1578,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             _bus_constants.KNOWLEDGE_SEARCH, _bus_constants.KNOWLEDGE_CONCEPTS_FOR_PERSON,
         ],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     # TimeChain — Proof of Thought memory chain
@@ -1773,8 +1614,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             _bus_constants.CONTRACT_PROPOSE, _bus_constants.CONTRACT_APPROVE, _bus_constants.CONTRACT_VETO,
         ],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="mandatory",
     ))
 
     # Backup Worker — promoted from TitanCore._backup_loop per
@@ -1818,12 +1657,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         broadcast_topics=[
             _bus_constants.MEDITATION_COMPLETE,
             _bus_constants.BACKUP_TRIGGER_MANUAL,
-        ],
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
-        dependencies=[
-            _mod_dep('timechain'),
         ],
     ))
 
@@ -1897,8 +1730,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             _bus_constants.PI_PHASE_UPDATE,          # cognitive_worker → emot_cgn (NEW v1.9.5)
         ],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="post_boot",
     ))
 
     logger.info("[TitanHCL] Registered %d supervised modules", len(guardian._modules))
@@ -1989,45 +1820,7 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         # §8.2 v1.4.0 D-SPEC-42), reply_only=True is the contracted
         # silent-skip path — the WARN's own remedy text.
         reply_only=True,
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="mandatory",
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
-        dependencies=[
-            _mod_dep('agno_worker'),
-            _mod_dep('memory'),
-        ],
     ))
     logger.info(
         "[guardian_hcl] titan_hcl_api registered as L3 module "
         "(name=titan_hcl_api, start_method=spawn, INV-PROC-1+4+5)")
-
-    # ── Phase 11 §11.I.3 / Chunk 11H — wire per-module probes ────────
-    # Attach probe_fn for the 10 heaviest workers per RFP §3H.2. Other
-    # modules keep `probe_fn=None` → the worker-side handler returns
-    # ProbeResult.ok_() per §11.I.2 trivial-pass contract. Done as a
-    # post-registration mutation (rather than 10 inline `probe_fn=` kwarg
-    # additions) so the matrix-driven application is a single audit unit
-    # alongside the §3H.10 dep matrix above (Chunk 11G).
-    #
-    # Bodies are shell-pass in 11H (Chunk 11H scope); each worker's real
-    # liveness body lands in 11I when the worker's recv-loop adopts
-    # handle_module_probe_request + the worker exposes the module-level
-    # sentinels the probe inspects.
-    from titan_hcl.probes import PROBE_REGISTRY
-    _probe_misses: list[str] = []
-    for _probe_name, _probe_fn in PROBE_REGISTRY.items():
-        info = guardian._modules.get(_probe_name)
-        if info is None:
-            _probe_misses.append(_probe_name)
-            continue
-        info.spec.probe_fn = _probe_fn
-    if _probe_misses:
-        logger.warning(
-            "[guardian_hcl] Phase 11 §11.I.3 / 11H probe wiring: %d "
-            "modules not registered in catalog (flag-gated off?) — "
-            "skipping probe attachment: %s",
-            len(_probe_misses), sorted(_probe_misses))
-    logger.info(
-        "[guardian_hcl] Phase 11 §11.I.3 / 11H probes wired on %d/10 "
-        "heaviest workers (per RFP §3H.2)",
-        len(PROBE_REGISTRY) - len(_probe_misses))

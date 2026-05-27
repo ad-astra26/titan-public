@@ -41,8 +41,6 @@ import time
 from collections import defaultdict, deque
 from pathlib import Path
 from titan_hcl import bus
-from titan_hcl.core.module_error_handler import with_error_envelope
-from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger("warning_monitor")
 
@@ -109,7 +107,6 @@ def _send_msg(send_queue, msg_type: str, src: str, dst: str, payload: dict):
         logger.warning("[WarningMonitor] send_queue put_nowait failed: %s", e)
 
 
-@with_error_envelope(module_name="warning_monitor", subsystem="entry", severity=_phase11_sev.FATAL)
 def warning_monitor_worker_main(recv_queue, send_queue, name: str,
                                 config: dict) -> None:
     """Worker entrypoint, matching the Guardian ModuleSpec signature

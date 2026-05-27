@@ -30,8 +30,6 @@ from titan_hcl.synthesis.outer_memory_writer import (
     OuterMemoryEvent,
     OuterMemoryWriter,
 )
-from titan_hcl.core.module_error_handler import with_error_envelope
-from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +65,6 @@ _MIN_KEYWORD_OVERLAP = 0.15    # At least 15% of query words in summary
 _MAX_SUMMARY_LENGTH = 3000     # Reject overly long (likely garbage)
 
 
-@with_error_envelope(module_name="knowledge", subsystem="entry", severity=_phase11_sev.FATAL)
 def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the Knowledge Worker process.
 

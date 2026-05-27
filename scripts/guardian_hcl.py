@@ -386,25 +386,14 @@ def run() -> int:
         bus, client = _build_bus_and_client(titan_id, config)
         logger.info("[guardian_hcl] bus client connected (name=guardian)")
 
-        # ── Orchestrator + Supervisor instances ──────────────────────
-        # Phase 11 §11.I.1 (D-SPEC-141 / v1.65.0) — orchestrator/supervisor
-        # role split. For 11E.b.1 both classes are co-resident in this same
-        # process (the kernel-rs peer-spawn that physically separates them
-        # lands in 11E.b.2). The `guardian` name is kept locally for the
-        # downstream calls below because they currently use orchestrator
-        # methods directly (start_all, monitor_tick, etc.); the Supervisor's
-        # bus-mediated D5 path is wired but not yet exercised in 11E.b.1.
-        from titan_hcl.orchestrator import Orchestrator
-        from titan_hcl.supervisor import Supervisor
-        guardian = Orchestrator(bus, config=config.get("guardian", {}))
+        # ── Guardian instance ────────────────────────────────────────
+        from titan_hcl.guardian_hcl import Guardian
+        guardian = Guardian(bus, config=config.get("guardian", {}))
         # _kernel_ref = None: cross-process swap interlock degrades to no-op
-        # (per Orchestrator.start docstring "None in legacy mode → swap
-        # interlock degrades to no-op").
+        # (per Guardian.start docstring "None in legacy mode → swap interlock
+        # degrades to no-op").
         guardian._kernel_ref = None
-        supervisor = Supervisor(bus, guardian, config=config.get("guardian", {}))
-        logger.info(
-            "[guardian_hcl] Orchestrator + Supervisor instances constructed "
-            "(Phase 11 §11.I.1 / D-SPEC-141 single-process co-resident)")
+        logger.info("[guardian_hcl] Guardian instance constructed")
 
         # ── Module catalog (51 ModuleSpec registrations) ─────────────
         from titan_hcl.module_catalog import build_catalog

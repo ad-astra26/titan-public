@@ -173,8 +173,6 @@ async def _route_model_for_tier(agent, worker_plugin, prompt_text: str):
 from titan_hcl._phase_c_constants import (
     AGNO_SESSION_CACHE_DEFAULT_CAPACITY as DEFAULT_AGNO_SESSION_CACHE_CAPACITY,
 )
-from titan_hcl.core.module_error_handler import with_error_envelope
-from titan_hcl.errors import Severity as _phase11_sev
 
 
 def _send(send_queue, msg_type: str, src: str, dst: str,
@@ -777,7 +775,6 @@ def _install_phase9_baseline_hook() -> None:
     t.start()
 
 
-@with_error_envelope(module_name="agno_worker", subsystem="entry", severity=_phase11_sev.FATAL)
 def agno_worker_main(recv_queue, send_queue, name: str,
                      config: dict[str, Any]) -> None:
     """Entry function for the agno_worker L2 process.
