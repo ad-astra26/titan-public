@@ -62,6 +62,17 @@ pub struct SpawnConfig {
     /// Phase 6 / D-SPEC-135: gates `scripts/guardian_hcl.py` (was
     /// `spawn_python_main` gating `scripts/titan_hcl.py --server`).
     pub spawn_guardian_hcl: bool,
+    /// Phase 11 §11.I.1 / D-SPEC-141 — `true` = kernel-rs spawns
+    /// `scripts/titan_hcl.py` as the L2 orchestrator process peer to
+    /// guardian_hcl (instead of guardian_hcl Popen-spawning it as a
+    /// child). Per Maker 2026-05-27 "we are migrating fully to titanhcl
+    /// as orchestrator and guardian hcl as supervisor and kernell
+    /// spawning titanhcl, guardianhcl and api".
+    pub spawn_titan_hcl: bool,
+    /// Phase 11 §11.I.1 — `true` = kernel-rs spawns
+    /// `scripts/titan_hcl_api.py` as the L3 api peer (instead of
+    /// guardian.start_all spawning it as a Guardian-supervised module).
+    pub spawn_titan_hcl_api: bool,
 }
 
 impl SpawnConfig {
@@ -136,6 +147,12 @@ pub struct SpawnedChildren {
     /// `python_main` gating `titan_hcl.py --server`. Field name retained
     /// for binary-on-disk handle compatibility.
     pub python_main: Mutex<Option<Child>>,
+    /// Phase 11 §11.I.1 — Python L2 orchestrator `titan_hcl` (peer to
+    /// guardian_hcl, not its child).
+    pub titan_hcl: Mutex<Option<Child>>,
+    /// Phase 11 §11.I.1 — Python L3 `titan_hcl_api` (peer to titan_hcl
+    /// + guardian_hcl, not a Guardian-supervised module).
+    pub titan_hcl_api: Mutex<Option<Child>>,
 }
 
 impl SpawnedChildren {
@@ -144,6 +161,8 @@ impl SpawnedChildren {
         Arc::new(Self {
             substrate: Mutex::new(None),
             python_main: Mutex::new(None),
+            titan_hcl: Mutex::new(None),
+            titan_hcl_api: Mutex::new(None),
         })
     }
 
@@ -156,7 +175,17 @@ impl SpawnedChildren {
         }
         if let Some(mut child) = self.python_main.lock().take() {
             let pid = child.id();
-            info!(pid, "kernel: sending SIGTERM to python_main");
+            info!(pid, "kernel: sending SIGTERM to guardian_hcl (python_main)");
+            let _ = child.start_kill();
+        }
+        if let Some(mut child) = self.titan_hcl.lock().take() {
+            let pid = child.id();
+            info!(pid, "kernel: sending SIGTERM to titan_hcl");
+            let _ = child.start_kill();
+        }
+        if let Some(mut child) = self.titan_hcl_api.lock().take() {
+            let pid = child.id();
+            info!(pid, "kernel: sending SIGTERM to titan_hcl_api");
             let _ = child.start_kill();
         }
     }
@@ -167,6 +196,8 @@ impl Default for SpawnedChildren {
         Self {
             substrate: Mutex::new(None),
             python_main: Mutex::new(None),
+            titan_hcl: Mutex::new(None),
+            titan_hcl_api: Mutex::new(None),
         }
     }
 }
@@ -263,6 +294,118 @@ pub fn spawn_guardian_hcl(config: &SpawnConfig) -> Result<Option<Child>, SpawnEr
     Ok(Some(child))
 }
 
+/// Spawn `python -u scripts/titan_hcl.py` per Phase 11 §11.I.1 / D-SPEC-141.
+/// Per Maker 2026-05-27 — titan_hcl runs the orchestrator (start_all, module
+/// spawn, probe dispatch, hot-reload, dep activation) as a kernel-rs peer
+/// child to guardian_hcl. Returns Ok(None) if spawn_titan_hcl=false (tests).
+pub fn spawn_titan_hcl(config: &SpawnConfig) -> Result<Option<Child>, SpawnError> {
+    if !config.spawn_titan_hcl {
+        return Ok(None);
+    }
+    let python = config
+        .python_executable
+        .as_ref()
+        .ok_or_else(|| SpawnError::SpawnFailed {
+            binary: "python".into(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "python_executable not configured",
+            ),
+        })?;
+    let cwd = config
+        .python_cwd
+        .as_ref()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let mut env = config.build_child_env("titan_hcl");
+    // G21 single-writer: only titan_hcl publishes titan_hcl_state.bin.
+    env.insert("TITAN_HCL_STATE_WRITER_CANONICAL".into(), "1".into());
+    for key in ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TZ"] {
+        if let Ok(v) = std::env::var(key) {
+            env.entry(key.into()).or_insert(v);
+        }
+    }
+
+    let mut cmd = Command::new(python);
+    cmd.arg("-u")
+        .arg("scripts/titan_hcl.py")
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(env)
+        .kill_on_drop(false);
+
+    info!(
+        python = ?python,
+        cwd = ?cwd,
+        titan_id = %config.titan_id,
+        "kernel: spawning python -u scripts/titan_hcl.py per Phase 11 §11.I.1 (D-SPEC-141)"
+    );
+
+    let child = cmd.spawn().map_err(|source| {
+        warn!(err = ?source, "titan_hcl spawn failed");
+        SpawnError::SpawnFailed {
+            binary: python.to_string_lossy().into_owned(),
+            source,
+        }
+    })?;
+    Ok(Some(child))
+}
+
+/// Spawn `python -u scripts/titan_hcl_api.py` per Phase 11 §11.I.1.
+/// Per Maker 2026-05-27 — the api runs as a kernel-rs peer to titan_hcl
+/// + guardian_hcl, not as a Guardian-supervised module. Returns Ok(None)
+/// if spawn_titan_hcl_api=false (tests).
+pub fn spawn_titan_hcl_api(config: &SpawnConfig) -> Result<Option<Child>, SpawnError> {
+    if !config.spawn_titan_hcl_api {
+        return Ok(None);
+    }
+    let python = config
+        .python_executable
+        .as_ref()
+        .ok_or_else(|| SpawnError::SpawnFailed {
+            binary: "python".into(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "python_executable not configured",
+            ),
+        })?;
+    let cwd = config
+        .python_cwd
+        .as_ref()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let mut env = config.build_child_env("titan_hcl_api");
+    for key in ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TZ"] {
+        if let Ok(v) = std::env::var(key) {
+            env.entry(key.into()).or_insert(v);
+        }
+    }
+
+    let mut cmd = Command::new(python);
+    cmd.arg("-u")
+        .arg("scripts/titan_hcl_api.py")
+        .current_dir(&cwd)
+        .env_clear()
+        .envs(env)
+        .kill_on_drop(false);
+
+    info!(
+        python = ?python,
+        cwd = ?cwd,
+        titan_id = %config.titan_id,
+        "kernel: spawning python -u scripts/titan_hcl_api.py per Phase 11 §11.I.1 (D-SPEC-141)"
+    );
+
+    let child = cmd.spawn().map_err(|source| {
+        warn!(err = ?source, "titan_hcl_api spawn failed");
+        SpawnError::SpawnFailed {
+            binary: python.to_string_lossy().into_owned(),
+            source,
+        }
+    })?;
+    Ok(Some(child))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +424,8 @@ mod tests {
             python_executable: None,
             python_cwd: None,
             spawn_guardian_hcl: false,
+            spawn_titan_hcl: false,
+            spawn_titan_hcl_api: false,
         }
     }
 
@@ -319,6 +464,20 @@ mod tests {
     fn spawn_guardian_hcl_returns_none_when_disabled() {
         let cfg = test_config();
         let result = spawn_guardian_hcl(&cfg).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn spawn_titan_hcl_returns_none_when_disabled() {
+        let cfg = test_config();
+        let result = spawn_titan_hcl(&cfg).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn spawn_titan_hcl_api_returns_none_when_disabled() {
+        let cfg = test_config();
+        let result = spawn_titan_hcl_api(&cfg).unwrap();
         assert!(result.is_none());
     }
 }

@@ -89,8 +89,16 @@ impl KernelError {
 pub struct KernelRunOptions {
     /// `false` → skip spawning the substrate placeholder (tests).
     pub spawn_substrate: bool,
-    /// `false` → skip spawning `python -m titan_hcl` (tests).
+    /// `false` → skip spawning `python -u scripts/guardian_hcl.py` (tests).
     pub spawn_guardian_hcl: bool,
+    /// Phase 11 §11.I.1 — `false` → skip spawning
+    /// `python -u scripts/titan_hcl.py` (tests). Production main.rs
+    /// flips TRUE per Phase 11 peer-spawn architecture.
+    pub spawn_titan_hcl: bool,
+    /// Phase 11 §11.I.1 — `false` → skip spawning
+    /// `python -u scripts/titan_hcl_api.py` (tests). Production main.rs
+    /// flips TRUE so api becomes a kernel-rs peer to titan_hcl + guardian_hcl.
+    pub spawn_titan_hcl_api: bool,
     /// Path to the substrate placeholder binary. None → use a default
     /// resolved relative to `target/debug/`.
     pub substrate_binary: Option<PathBuf>,
@@ -102,10 +110,12 @@ impl Default for KernelRunOptions {
     fn default() -> Self {
         Self {
             spawn_substrate: true,
-            // spawn_guardian_hcl defaults FALSE so test fixtures don't have to
-            // tear down a Python child. PRODUCTION main.rs explicitly flips
-            // this to TRUE per Phase C C-S7 activation prep + SPEC §10.A B9.
+            // spawn_*_hcl* default FALSE so test fixtures don't have to
+            // tear down Python children. PRODUCTION main.rs explicitly flips
+            // these to TRUE per Phase 11 §11.I.1 peer-spawn architecture.
             spawn_guardian_hcl: false,
+            spawn_titan_hcl: false,
+            spawn_titan_hcl_api: false,
             substrate_binary: None,
             auto_shutdown_after: None,
         }
@@ -289,6 +299,8 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
             .map(PathBuf::from),
         python_cwd: std::env::current_dir().ok(),
         spawn_guardian_hcl: options.spawn_guardian_hcl,
+        spawn_titan_hcl: options.spawn_titan_hcl,
+        spawn_titan_hcl_api: options.spawn_titan_hcl_api,
     };
 
     // Phase C C-S7 Gap B (2026-05-05): wire substrate + python_main spawns
@@ -359,11 +371,49 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
         info!("B9 python_main spawn skipped (default off)");
     }
 
+    // B9.b: Phase 11 §11.I.1 / D-SPEC-141 — kernel-rs peer-spawns
+    // titan_hcl (orchestrator) + titan_hcl_api as siblings to
+    // guardian_hcl. Per Maker 2026-05-27 — no parent-child relationship
+    // between the three Python processes; each is a kernel-rs peer.
+    // Spawn directly via spawn::spawn_titan_hcl / spawn_titan_hcl_api
+    // (not via KernelChildSupervisor) for the initial Phase 11 land —
+    // supervised respawn wiring follows in a Phase 11.x cleanup pass.
+    if options.spawn_titan_hcl {
+        info!(
+            event = "BOOT_B9b_SPAWN_TITAN_HCL",
+            "B9.b spawning titan_hcl (Phase 11 peer)"
+        );
+        match crate::spawn::spawn_titan_hcl(&spawn_config) {
+            Ok(Some(child)) => {
+                *children.titan_hcl.lock() = Some(child);
+                info!("B9.b titan_hcl spawned");
+            }
+            Ok(None) => info!("B9.b titan_hcl spawn returned None (disabled)"),
+            Err(e) => warn!(err = ?e, "B9.b titan_hcl spawn failed; continuing"),
+        }
+    }
+    if options.spawn_titan_hcl_api {
+        info!(
+            event = "BOOT_B9c_SPAWN_TITAN_HCL_API",
+            "B9.c spawning titan_hcl_api (Phase 11 peer)"
+        );
+        match crate::spawn::spawn_titan_hcl_api(&spawn_config) {
+            Ok(Some(child)) => {
+                *children.titan_hcl_api.lock() = Some(child);
+                info!("B9.c titan_hcl_api spawned");
+            }
+            Ok(None) => info!("B9.c titan_hcl_api spawn returned None (disabled)"),
+            Err(e) => warn!(err = ?e, "B9.c titan_hcl_api spawn failed; continuing"),
+        }
+    }
+
     info!(
         event = "BOOT_COMPLETE",
         boot_generation,
         spawned_substrate = options.spawn_substrate,
         spawned_python = options.spawn_guardian_hcl,
+        spawned_titan_hcl = options.spawn_titan_hcl,
+        spawned_titan_hcl_api = options.spawn_titan_hcl_api,
         "kernel boot complete; entering steady state"
     );
 

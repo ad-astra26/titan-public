@@ -87,8 +87,14 @@ async fn main() -> ExitCode {
     let skip_python = std::env::var("TITAN_KERNEL_SKIP_PYTHON")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    // Phase 11 §11.I.1 / D-SPEC-141 — production also peer-spawns
+    // scripts/titan_hcl.py (orchestrator) + scripts/titan_hcl_api.py
+    // (api) as siblings to guardian_hcl. Same TITAN_KERNEL_SKIP_PYTHON
+    // env gate disables all three for tests.
     let options = KernelRunOptions {
         spawn_guardian_hcl: !skip_python,
+        spawn_titan_hcl: !skip_python,
+        spawn_titan_hcl_api: !skip_python,
         ..KernelRunOptions::default()
     };
 
