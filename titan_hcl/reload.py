@@ -1,27 +1,25 @@
 """
-titan_hcl.guardian_hcl.guardianreload — D-SPEC-50 §8.3 per-module hot-reload (7-step sequence + pid-targeting + rollback).
+titan_hcl.reload — D-SPEC-50 §8.3 per-module hot-reload (7-step sequence + pid-targeting + rollback).
 
-Carved from titan_hcl/guardian.py by scripts/_phase6_carve_guardian.py per
-SPEC §11.B.4 / D-SPEC-135 / v1.62.0. See SPEC §8.3 + §11.B.3 + §11.B.3.1 + D-SPEC-50 / D-SPEC-93.
+See SPEC §8.3 + §11.B.3 + §11.B.3.1 + D-SPEC-50 / D-SPEC-93.
 
-Mixed into class Guardian(GuardianReloadMixin, GuardianDepActivationMixin)
-in core.py — `self` attributes (.bus, ._modules, ._reload_lock, etc.) come
-from Guardian.__init__. Method bodies move verbatim — no logic change.
+Mixed into class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin)
+in `titan_hcl/orchestrator/core.py` — `self` attributes (.bus, ._modules,
+._reload_lock, etc.) come from Orchestrator.__init__.
+
+Phase 11 §11.I.6 relocation (D-SPEC-141 / v1.65.0): this file moved from
+titan_hcl/guardian_hcl/reload.py → titan_hcl/reload.py per locked D6 so
+hot-reload spawn becomes owned by titan_hcl orchestrator rather than the
+guardian_hcl supervisor. Class renamed GuardianReloadMixin →
+OrchestratorReloadMixin same commit (11E.a).
+
+Phase 11 §11.I.1 follow-up (11E.b.1): the host class renamed from
+`Guardian` to `Orchestrator` and the dep-activation mixin renamed from
+`GuardianDepActivationMixin` to `OrchestratorDepActivationMixin`. The
+back-compat alias `Guardian = Orchestrator` keeps every legacy callsite
+working unchanged.
 """
-"""
-Guardian — Module supervisor for Titan V4.0 microkernel.
-
-Manages the lifecycle of supervised module processes:
-  - Start/stop/restart individual modules
-  - Monitor heartbeats (kill/restart on timeout)
-  - Track RSS per module (restart on threshold breach)
-  - Provide module status to Core via the Divine Bus
-  - Sliding-window restart tracking (prevents infinite restart loops)
-  - Per-module heartbeat timeout (Spirit needs longer for heavy V4 work)
-
-Each module runs as a separate multiprocessing.Process with its own
-memory space, communicating exclusively through the Divine Bus.
-"""
+from __future__ import annotations  # PEP-563 lazy annotations (Phase 11 §11.I.6 circular-import break)
 import asyncio
 import logging
 import os
@@ -104,14 +102,33 @@ MAX_STARVED_CYCLES = 5          # how many consecutive starved-but-alive cycles 
 
 
 
-from titan_hcl.guardian_hcl.module_registry import (
-    ModuleInfo,
-    ModuleSpec,
-    ModuleState,
-    ReloadState,
-)
+# Phase 11 §11.I.6 / D-SPEC-141: this file was relocated from
+# titan_hcl/guardian_hcl/reload.py per locked D6. To break the import cycle
+# (titan_hcl.guardian_hcl/__init__.py imports core.py → core.py imports
+# OrchestratorReloadMixin from here → here imports module_registry from
+# the still-initializing guardian_hcl package), the module_registry symbols
+# (ModuleInfo, ModuleSpec, ModuleState, ReloadState) are imported via
+# TYPE_CHECKING for type hints + lazy local imports inside the methods that
+# construct or compare against them.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from titan_hcl.orchestrator.module_registry import (
+        ModuleInfo,
+        ModuleSpec,
+        ModuleState,
+        ReloadState,
+    )
 
-class GuardianReloadMixin:
+
+def _mr_symbols():
+    """Return (ModuleInfo, ModuleSpec, ModuleState, ReloadState) lazily."""
+    from titan_hcl.orchestrator.module_registry import (
+        ModuleInfo, ModuleSpec, ModuleState, ReloadState,
+    )
+    return ModuleInfo, ModuleSpec, ModuleState, ReloadState
+
+
+class OrchestratorReloadMixin:
     """Mixin providing D-SPEC-50 §8.3 per-module hot-reload (7-step sequence + pid-targeting + rollback) — see See SPEC §8.3 + §11.B.3 + §11.B.3.1 + D-SPEC-50 / D-SPEC-93.."""
 
     async def reload_module(self, module_name: str,
@@ -162,6 +179,11 @@ class GuardianReloadMixin:
         `_reloads_in_flight` entry in `finally` so supervision authority
         is always recoverable.
         """
+        # Phase 11 §11.I.6: lazy import to break the
+        # titan_hcl.reload ↔ titan_hcl.guardian_hcl circular import.
+        from titan_hcl.orchestrator.module_registry import (
+            ModuleState, ReloadState,
+        )
         started_ts = time.time()
 
         # ── Step 1: validate + register reload state ──────────────────

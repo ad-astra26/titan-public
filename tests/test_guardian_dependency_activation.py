@@ -301,10 +301,13 @@ def test_dep_never_reaches_ready_logs_warning_and_continues(caplog):
     The wait is normally 30s; this test shortens it to 1s via monkeypatching
     to keep test runtime sane.
     """
-    # Post-Phase-6 carve (D-SPEC-135 / v1.62.0 / §11.B.4): the dep-activation
-    # constant is read from the GuardianDepActivationMixin's own module
-    # namespace, not from the package init. Patch at the leaf module.
-    import titan_hcl.guardian_hcl.dep_activation as guardian_mod
+    # Post-Phase-11 carve (D-SPEC-141 / v1.65.0 / §11.I.1): the dep-activation
+    # constant is read from the OrchestratorDepActivationMixin's own module
+    # namespace, not from the package init. Patch at the leaf module — which
+    # moved from `titan_hcl.guardian_hcl.dep_activation` to
+    # `titan_hcl.orchestrator.dep_activation` per the orchestrator/supervisor
+    # role split.
+    import titan_hcl.orchestrator.dep_activation as guardian_mod
 
     g = _make_guardian()
     g.register(_spec("dep_target"))  # stays STOPPED throughout
@@ -323,7 +326,7 @@ def test_dep_never_reaches_ready_logs_warning_and_continues(caplog):
     original_timeout = guardian_mod.SUPERVISION_DEPENDENCY_ACTIVATION_TIMEOUT_S
     try:
         guardian_mod.SUPERVISION_DEPENDENCY_ACTIVATION_TIMEOUT_S = 1.0
-        with caplog.at_level("WARNING", logger="titan_hcl.guardian_hcl"):
+        with caplog.at_level("WARNING", logger="titan_hcl.orchestrator"):
             t0 = time.time()
             g._activate_dependencies("dependent")
             elapsed = time.time() - t0
