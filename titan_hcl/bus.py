@@ -206,6 +206,26 @@ MODULE_HEARTBEAT = "MODULE_HEARTBEAT"
 MODULE_SHUTDOWN = "MODULE_SHUTDOWN"
 MODULE_CRASHED = "MODULE_CRASHED"
 
+# Phase 11 (SPEC §11.I / D-SPEC-141 / v1.65.0):
+# MODULE_ERROR is the SINGLE structured-error topic — every worker / helper /
+# provider that raises publishes a ModuleError envelope here (P1, dst="all",
+# non-blocking per §8.0.ter). Subscribers: guardian_hcl (restart decisions),
+# warning_monitor (trend detection), observatory_worker (errors_state.bin SHM).
+# Wire payload = ModuleError.as_wire_dict() (see titan_hcl/errors.py).
+MODULE_ERROR = "MODULE_ERROR"
+# Backpressure notification — broker rate-limits per-module ModuleError emissions
+# to 10/s when sustained rate exceeds 100/s (per RFP §3H.3); this event signals
+# the flood-state to observers so they can render degraded-mode UX.
+MODULE_ERROR_FLOOD = "MODULE_ERROR_FLOOD"
+# Probe contract per §11.I.2/§11.I.3 — bus-RPC, not state propagation.
+# titan_hcl polls per-module SHM slots at 1Hz; on state=BOOTED it dispatches
+# MODULE_PROBE_REQUEST(name, probe_id) to the worker (P0, dst=worker). Worker
+# runs its probe_fn, writes state=RUNNING/UNHEALTHY + last_probe_result to its
+# SHM slot, AND replies MODULE_PROBE_RESPONSE(probe_id, result: ProbeResult)
+# correlation_id-routed back to titan_hcl. Both signals must agree (SHM + RPC).
+MODULE_PROBE_REQUEST = "MODULE_PROBE_REQUEST"
+MODULE_PROBE_RESPONSE = "MODULE_PROBE_RESPONSE"
+
 # Synthesis Engine Phase 1 (D-SPEC-123 / SPEC v1.56.0 §25):
 # MEMORY_RETRIEVAL_USED is the use-gated activation event (INV-Syn-5): emitted
 # by retrieval consumers (Phase 1.5+ producers: agno post-hook, RECALL ops)
@@ -2084,6 +2104,129 @@ def emit_experience_record(
     except Exception as e:
         swallow_warn("[emit_experience_record] failed", e,
                      key="bus.emit_experience_record")
+        return False
+
+
+# ----------------------------------------------------------------------
+# publish_module_error — Phase 11 / SPEC §11.I.4 typed-error envelope
+# ----------------------------------------------------------------------
+# Single structured-error path per locked D-SPEC-141. Producers wrap exceptions
+# either via `@with_error_envelope` (Chunk 11C decorator) or call this helper
+# directly. Rate-gated to 100 envelopes/s per (module_name, error_code) tuple;
+# excess emissions are dropped + counted, and the first drop in a 1s window
+# triggers MODULE_ERROR_FLOOD notification so observers can render degraded UX.
+#
+# Wire contract: msgpack-serializable ModuleError.as_wire_dict() on topic
+# MODULE_ERROR (P1, dst="all", non-blocking per §8.0.ter).
+
+# Per-(module_name, error_code) rate-gate state.
+_module_error_rate_lock = _threading.Lock()
+_module_error_last_window_ts: dict[tuple, float] = {}  # (module_name, error_code) → window start
+_module_error_window_count: dict[tuple, int] = {}      # (module_name, error_code) → count in window
+_module_error_flood_last_emit: dict[tuple, float] = {} # (module_name, error_code) → last MODULE_ERROR_FLOOD ts
+MODULE_ERROR_RATE_WINDOW_S: float = 1.0
+MODULE_ERROR_RATE_LIMIT_PER_WINDOW: int = 100  # 100/s sustained; excess dropped
+MODULE_ERROR_FLOOD_NOTIFY_MIN_INTERVAL_S: float = 5.0  # don't spam flood notifications
+
+
+def publish_module_error(sender, error) -> bool:
+    """Publish a ModuleError envelope on the MODULE_ERROR topic.
+
+    Args:
+        sender: Either a worker send_queue (has `put_nowait`) OR a DivineBus /
+                bus-client (has `publish`). Duck-typed dispatch matches the
+                existing emit_* helper convention in this module.
+        error:  A `titan_hcl.errors.ModuleError` instance.
+
+    Returns:
+        True if the envelope was sent, False if rate-gated or send failed.
+
+    Rate-gating (RFP §3H.3):
+        Up to MODULE_ERROR_RATE_LIMIT_PER_WINDOW emissions per
+        (module_name, error_code) per MODULE_ERROR_RATE_WINDOW_S. Excess
+        emissions are dropped silently. The first drop in a window
+        publishes one MODULE_ERROR_FLOOD notification (subject to a
+        MODULE_ERROR_FLOOD_NOTIFY_MIN_INTERVAL_S debounce per same tuple).
+    """
+    # Import here to avoid a hard import cycle (errors.py is leaf; bus.py is core).
+    from .errors import ModuleError as _ME
+
+    if not isinstance(error, _ME):
+        # Defensive: refuse to publish anything that isn't a ModuleError.
+        # This guards against the common "I called publish_module_error
+        # with a raw dict" mistake.
+        return False
+
+    now = time.time()
+    key = (error.module_name, error.error_code)
+
+    # 1. Rate gate (per-(module, error_code) sliding 1s window).
+    with _module_error_rate_lock:
+        window_start = _module_error_last_window_ts.get(key, 0.0)
+        if now - window_start >= MODULE_ERROR_RATE_WINDOW_S:
+            # Window rolled — reset.
+            _module_error_last_window_ts[key] = now
+            _module_error_window_count[key] = 0
+            window_start = now
+        _module_error_window_count[key] = _module_error_window_count.get(key, 0) + 1
+        over_limit = _module_error_window_count[key] > MODULE_ERROR_RATE_LIMIT_PER_WINDOW
+        last_flood_ts = _module_error_flood_last_emit.get(key, 0.0)
+        should_notify_flood = (
+            over_limit
+            and (now - last_flood_ts) >= MODULE_ERROR_FLOOD_NOTIFY_MIN_INTERVAL_S
+        )
+        if should_notify_flood:
+            _module_error_flood_last_emit[key] = now
+
+    # 2. Optional flood notification (one per debounce window).
+    if should_notify_flood:
+        flood_msg = {
+            "type": MODULE_ERROR_FLOOD,
+            "src": error.module_name,
+            "dst": "all",
+            "ts": now,
+            "rid": None,
+            "payload": {
+                "module_name": error.module_name,
+                "error_code": error.error_code,
+                "count_in_window": int(_module_error_window_count[key]),
+                "window_s": float(MODULE_ERROR_RATE_WINDOW_S),
+                "limit_per_window": int(MODULE_ERROR_RATE_LIMIT_PER_WINDOW),
+            },
+        }
+        try:
+            if hasattr(sender, "put_nowait"):
+                sender.put_nowait(flood_msg)
+            elif hasattr(sender, "publish"):
+                sender.publish(flood_msg)
+        except Exception as e:
+            swallow_warn("[publish_module_error] flood-notify drop", e,
+                         key="bus.publish_module_error_flood")
+
+    # 3. Drop the envelope if over limit.
+    if over_limit:
+        return False
+
+    # 4. Publish the envelope on MODULE_ERROR (P1, dst="all", non-blocking).
+    msg = {
+        "type": MODULE_ERROR,
+        "src": error.module_name,
+        "dst": "all",
+        "ts": error.ts,
+        "rid": error.correlation_id,
+        "payload": error.as_wire_dict(),
+    }
+    try:
+        if hasattr(sender, "put_nowait"):
+            sender.put_nowait(msg)
+        elif hasattr(sender, "publish"):
+            sender.publish(msg)
+        else:
+            return False
+        return True
+    except Exception as e:
+        swallow_warn("[publish_module_error] send failed", e,
+                     key="bus.publish_module_error")
         return False
 
 
