@@ -432,6 +432,14 @@ def run() -> int:
         lifecycle_t = _handle_module_lifecycle_requests(bus, guardian, stop_event)
 
         # ── Boot autostart modules ───────────────────────────────────
+        # Phase 11 §11.I.7 / G21 single-writer (D-SPEC-141) — mark this
+        # process as the canonical writer of titan_hcl_state.bin so the
+        # Orchestrator's _ensure_titan_hcl_state_writer creates the writer
+        # here and ONLY here. Non-canonical processes (api subprocess
+        # mini-orchestrators, test fixtures) inherit the absence of this
+        # env var and silently skip the publish, eliminating the slot
+        # clobbering observed live 2026-05-27.
+        os.environ["TITAN_HCL_STATE_WRITER_CANONICAL"] = "1"
         guardian.start_all()
         logger.info(
             "[guardian_hcl] start_all complete — modules: %s",

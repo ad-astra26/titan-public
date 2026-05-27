@@ -1341,14 +1341,33 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
     def _ensure_titan_hcl_state_writer(self):
         """Lazy-construct the orchestrator's own SHM state writer.
 
+        Per SPEC G21 (one slot, one writer): only the canonical orchestrator
+        process writes `titan_hcl_state.bin`. Any other process that
+        constructs an Orchestrator (e.g. the api subprocess's mini-
+        orchestrator, test fixtures, sub-supervisors) is rejected by env-var
+        gate `TITAN_HCL_STATE_WRITER_CANONICAL=1` — set ONLY by
+        scripts/guardian_hcl.py (today the canonical orchestrator owner;
+        post-11E.b.2 physical split, scripts/titan_hcl.py) before calling
+        start_all. Non-canonical callers get None back and silently skip
+        the publish, leaving the slot to the canonical writer.
+
         Returns None on first-call failure (test fixtures, missing
-        /dev/shm) so start_all() proceeds without publishing
-        `fleet_ready` (kernel-rs falls back to its existing
+        /dev/shm, non-canonical process) so start_all() proceeds without
+        publishing `fleet_ready` (kernel-rs falls back to its existing
         process-health gate).
         """
         existing = getattr(self, "_titan_hcl_state_writer", None)
         if existing is not None:
             return existing
+        # G21 single-writer enforcement.
+        if os.environ.get("TITAN_HCL_STATE_WRITER_CANONICAL", "") != "1":
+            logger.info(
+                "[Orchestrator] titan_hcl_state.bin writer suppressed: "
+                "TITAN_HCL_STATE_WRITER_CANONICAL!=1 in this process "
+                "(G21 single-writer — only the canonical orchestrator "
+                "publishes fleet_ready)")
+            self._titan_hcl_state_writer = None
+            return None
         try:
             from titan_hcl.core.titan_hcl_state import TitanHclStateWriter
             from titan_hcl.core.state_registry import resolve_titan_id
