@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import threading
 import time
 from collections import OrderedDict as _OrderedDict
@@ -174,39 +173,8 @@ async def _route_model_for_tier(agent, worker_plugin, prompt_text: str):
 from titan_hcl._phase_c_constants import (
     AGNO_SESSION_CACHE_DEFAULT_CAPACITY as DEFAULT_AGNO_SESSION_CACHE_CAPACITY,
 )
-
-
-def _ground_for_goal_hook(plugin: Any, text: str) -> list[str]:
-    """Lightweight CGN lexicon-cache word-grounding for INV-Syn-17.
-
-    Reads `plugin.cgn_lexicon` if present (a dict[str, str] mapping
-    lowercase tokens to concept_ids; populated by an out-of-band loader
-    that reads `data/cgn_lexicon_snapshot.json` — Phase 7+ optional).
-    No cross-process call; if the cache is missing or any token isn't
-    in it, the corresponding concept_id is simply omitted from the
-    return list. Returns [] on any error.
-
-    Output capped at 20 to keep the goal-buffer payload small.
-    """
-    try:
-        if not text:
-            return []
-        lex = getattr(plugin, "cgn_lexicon", None)
-        if not isinstance(lex, dict) or not lex:
-            return []
-        tokens = [t.lower().strip(".,!?:;()[]\"'") for t in text.split() if len(t) > 2]
-        out: list[str] = []
-        seen: set[str] = set()
-        for t in tokens:
-            cid = lex.get(t)
-            if cid and cid not in seen:
-                out.append(cid)
-                seen.add(cid)
-                if len(out) >= 20:
-                    break
-        return out
-    except Exception:
-        return []
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 
 def _send(send_queue, msg_type: str, src: str, dst: str,
@@ -424,39 +392,6 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
         # api/chat.py assignments at L155-160 in the parent path)
         worker_plugin._current_user_id = user_id
         worker_plugin._pre_chat_user_id = user_id
-        # Phase 7 (D-SPEC-PHASE7): expose session_id so agno_tools'
-        # _resolve_chat_id can construct f"{user_id}:{session_id}" for the
-        # BufferCache call. Mirrors _current_user_id pattern above.
-        worker_plugin._current_session_id = session_id
-
-        # ── Pre-LLM goal hook (Phase 7 / INV-Syn-17) ────────────────────
-        # Write {text, concept_ids, ts} into the `goal` buffer and the
-        # latest user message into the `perception` buffer BEFORE
-        # agent.arun. Non-blocking + soft-fail per INV-Syn-17: any
-        # exception logs at DEBUG and chat continues normally.
-        try:
-            _bc = getattr(worker_plugin, "synthesis_buffer_cache", None)
-            if _bc is not None and message_text:
-                _chat_id = f"{user_id}:{session_id}"
-                _concept_ids = _ground_for_goal_hook(
-                    worker_plugin, message_text,
-                )
-                _bc.set(
-                    _chat_id, "goal",
-                    content=message_text[:8192],
-                    concept_ids=_concept_ids,
-                )
-                # Perception buffer = latest raw user input (arch §14).
-                _bc.set(
-                    _chat_id, "perception",
-                    content=message_text[:8192],
-                    concept_ids=_concept_ids,
-                )
-        except Exception as _hook_err:
-            logger.debug(
-                "[AgnoWorker] pre-LLM goal hook error (proceeding to "
-                "chat path normally): %s", _hook_err,
-            )
 
         # ── Run Agno agent (ζ.5 per-tier model routing) ──
         # _route_model_for_tier classifies the prompt, swaps agent.model.id
@@ -842,6 +777,7 @@ def _install_phase9_baseline_hook() -> None:
     t.start()
 
 
+@with_error_envelope(module_name="agno_worker", subsystem="entry", severity=_phase11_sev.FATAL)
 def agno_worker_main(recv_queue, send_queue, name: str,
                      config: dict[str, Any]) -> None:
     """Entry function for the agno_worker L2 process.
@@ -947,57 +883,6 @@ def agno_worker_main(recv_queue, send_queue, name: str,
                 "[AgnoWorker] OVG eager-init failed (lazy retry will run "
                 "on first chat — first-chat latency will spike): %s",
                 _ovg_err,
-            )
-
-    # ── Phase 7 §P7.C/E — BufferCache wiring (D-SPEC-PHASE7) ─────────────
-    # Per-chat in-mem cache + write-through bus emit. Sole DuckDB writer of
-    # actr_buffers remains synthesis_worker (INV-Syn-16); this cache is a
-    # caller-side optimization. Soft-fail mirrors the OVG warmup pattern:
-    # if construction fails, the agno tools + pre-LLM goal hook degrade
-    # to no-op and chat keeps working (INV-Syn-17).
-    if worker_plugin is not None:
-        try:
-            from titan_hcl.synthesis.buffer_cache import (
-                BufferCache, DEFAULT_HYDRATION_WARM_THRESHOLD_S,
-            )
-            from titan_hcl.bus import SYNTHESIS_BUFFER_COMMAND
-
-            _buffers_cfg = (
-                (config or {}).get("synthesis", {}).get("buffers", {}) or {}
-            )
-            _warm_s = float(_buffers_cfg.get(
-                "hydration_warm_threshold_s",
-                DEFAULT_HYDRATION_WARM_THRESHOLD_S,
-            ))
-            _buffers_snapshot = os.path.join(
-                os.environ.get("TITAN_DATA_DIR", "data"),
-                "buffers_snapshot.json",
-            )
-
-            def _emit_buffer_command(payload: dict) -> None:
-                """Publish SYNTHESIS_BUFFER_COMMAND on the kernel bus
-                (dst='synthesis'). Soft-fail handled inside BufferCache."""
-                _send(
-                    send_queue, SYNTHESIS_BUFFER_COMMAND, name,
-                    "synthesis", payload,
-                )
-
-            buffer_cache = BufferCache(
-                bus_emit=_emit_buffer_command,
-                snapshot_path=_buffers_snapshot,
-                hydration_warm_threshold_s=_warm_s,
-            )
-            worker_plugin.synthesis_buffer_cache = buffer_cache
-            logger.info(
-                "[AgnoWorker] Phase 7 BufferCache ready — snapshot=%s "
-                "warm_threshold_s=%.0f",
-                _buffers_snapshot, _warm_s,
-            )
-        except Exception as _bc_err:
-            logger.warning(
-                "[AgnoWorker] Phase 7 BufferCache wiring failed (chat works "
-                "but buffer tools + goal hook are no-ops): %s",
-                _bc_err,
             )
 
     # ── SHM publisher (G21 single-writer for agno_state.bin) ──

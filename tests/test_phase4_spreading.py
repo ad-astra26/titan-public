@@ -1,16 +1,8 @@
 """Phase 4 — spreading-activation `w_s` enablement tests (§P4.F).
 
-After Phase 7 (D-SPEC-PHASE7) the buffer-entity source is the real
-`ActrBufferStore.buffer_entities(chat_id)` per INV-Syn-18 — BufferStub
-was deleted per `feedback_no_shim_old_path_must_be_deleted.md`. The
-spreading + composite_score machinery itself is unchanged from P4 so
-this file retains its `make_kuzu_spreading_lookup` coverage; the
-BufferStub-specific tests are replaced with equivalent
-ActrBufferStore.buffer_entities tests below.
-
 Covers:
-- ActrBufferStore.buffer_entities precedence + dedup + cap (P7 successor
-  to BufferStub.current_entities)
+- buffer_stub source: topic_tags + extras + CGN history with proper
+  precedence, dedup, and cap
 - _candidate_id_to_concept_id parses concept-keyed item_ids correctly
 - make_kuzu_spreading_lookup pre-computes the reachable map
 - spreading contribution formula `S - ln(fan_j)` matches arch §5.3
@@ -26,11 +18,10 @@ import math
 import os
 import tempfile
 
-import duckdb
 import pytest
 
 from titan_hcl.core.direct_memory import TitanKnowledgeGraph
-from titan_hcl.synthesis.buffer_store import ActrBufferStore
+from titan_hcl.synthesis.buffer_stub import BufferStub, _strip_tag_prefix
 from titan_hcl.synthesis.composite_score import (
     Candidate,
     _candidate_id_to_concept_id,
@@ -41,97 +32,72 @@ from titan_hcl.synthesis.concept_store import ConceptStore
 from titan_hcl.synthesis.outer_memory_writer import OuterMemoryWriter
 
 
-# ── ActrBufferStore.buffer_entities (P7 successor to BufferStub) ──
+# ── BufferStub ──────────────────────────────────────────────────────
 
 
-@pytest.fixture()
-def actr_store(tmp_path):
-    """In-memory ActrBufferStore for buffer-entities tests."""
-    conn = duckdb.connect(":memory:")
-    return ActrBufferStore(
-        duckdb_conn=conn,
-        snapshot_path=str(tmp_path / "buffers_snapshot.json"),
-    )
+def test_strip_tag_prefix_handles_known_prefixes():
+    assert _strip_tag_prefix("topic:linux_terminal") == "linux_terminal"
+    assert _strip_tag_prefix("concept:metaplex_nft_minting") == "metaplex_nft_minting"
+    assert _strip_tag_prefix("concept:metaplex_nft_minting:v5") == "metaplex_nft_minting"
+    assert _strip_tag_prefix("bare_concept") == "bare_concept"
 
 
-def test_buffer_entities_goal_takes_precedence(actr_store):
-    """INV-Syn-18: goal → perception → retrieval → imaginal precedence.
-
-    The ordering matches ACT-R's intuition: explicit goal beats incidental
-    observation; retrieved memories beat freeform scratchpad."""
-    chat_id = "alice:s1"
-    actr_store.persist(
-        chat_id=chat_id, buffer_name="imaginal",
-        content="thinking", concept_ids=["draft_idea"],
+def test_buffer_stub_topic_tags_take_precedence():
+    """Topic tags from the in-flight chat TX come first (most recently
+    relevant). Order is preserved."""
+    s = BufferStub(cgn_handle=None, max_entities=20)
+    entities = s.current_entities(
+        topic_tags=["topic:linux_terminal", "topic:ssh"],
+        extra_concepts=["solana_rpc"],
     )
-    actr_store.persist(
-        chat_id=chat_id, buffer_name="goal",
-        content="debug", concept_ids=["rust_panic", "debugging"],
-    )
-    actr_store.persist(
-        chat_id=chat_id, buffer_name="perception",
-        content="msg", concept_ids=["user_input"],
-    )
-    actr_store.persist(
-        chat_id=chat_id, buffer_name="retrieval",
-        content="recall", concept_ids=["past_fix"],
-    )
-    entities = actr_store.buffer_entities(chat_id)
-    # First two slots come from `goal`, in their persisted order.
-    assert entities[:2] == ["rust_panic", "debugging"]
-    # Then perception, then retrieval, then imaginal.
-    assert "user_input" in entities
-    assert entities.index("user_input") < entities.index("past_fix")
-    assert entities.index("past_fix") < entities.index("draft_idea")
+    assert entities[:3] == ["linux_terminal", "ssh", "solana_rpc"]
 
 
-def test_buffer_entities_dedup_preserves_first_occurrence(actr_store):
-    chat_id = "alice:s2"
-    actr_store.persist(
-        chat_id=chat_id, buffer_name="goal",
-        content="g", concept_ids=["a", "b"],
+def test_buffer_stub_dedup_preserves_first_occurrence():
+    s = BufferStub(cgn_handle=None, max_entities=20)
+    entities = s.current_entities(
+        topic_tags=["topic:a", "topic:b"],
+        extra_concepts=["a", "c"],   # "a" already present
     )
-    actr_store.persist(
-        chat_id=chat_id, buffer_name="retrieval",
-        content="r", concept_ids=["a", "c"],   # "a" already in goal
-    )
-    entities = actr_store.buffer_entities(chat_id)
     assert entities == ["a", "b", "c"]
 
 
-def test_buffer_entities_cap_respected(actr_store):
-    chat_id = "alice:s3"
-    actr_store.persist(
-        chat_id=chat_id, buffer_name="goal",
-        content="g", concept_ids=[f"c{i}" for i in range(10)],
+def test_buffer_stub_cap_respected():
+    s = BufferStub(cgn_handle=None, max_entities=3)
+    entities = s.current_entities(
+        topic_tags=[f"topic:c{i}" for i in range(10)],
     )
-    entities = actr_store.buffer_entities(chat_id, cap=3)
     assert entities == ["c0", "c1", "c2"]
 
 
-def test_buffer_entities_empty_chat_returns_empty(actr_store):
-    assert actr_store.buffer_entities("ghost:never_existed") == []
+def test_buffer_stub_cgn_history_fallback():
+    """A CGN-shaped handle's _concept_journeys is sampled when supplied."""
+
+    class FakeCGN:
+        _concept_journeys = {
+            "old_concept":   {"last_seen": 10.0},
+            "fresh_concept": {"last_seen": 100.0},
+            "mid_concept":   {"last_seen": 50.0},
+        }
+
+    s = BufferStub(cgn_handle=FakeCGN(), history_window_turns=1, max_entities=20)
+    entities = s.current_entities()
+    # Sorted by last_seen DESC.
+    assert entities[0] == "fresh_concept"
+    assert entities[1] == "mid_concept"
+    assert entities[2] == "old_concept"
 
 
-def test_buffer_entities_skips_malformed_concept_ids(actr_store):
-    """If concept_ids in storage are corrupted to non-strings, skip them
-    instead of crashing the spreading-activation lookup."""
-    chat_id = "alice:s4"
-    actr_store.persist(
-        chat_id=chat_id, buffer_name="goal",
-        content="g", concept_ids=["valid_id"],
-    )
-    # Manually inject a malformed row (simulates upstream corruption).
-    import json
-    actr_store._db.execute(
-        "INSERT OR REPLACE INTO actr_buffers "
-        "(chat_id, buffer_name, content, concept_ids, embedding_hash, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        [chat_id, "imaginal", "x", "not-a-json-array", "h", 100.0],
-    )
-    entities = actr_store.buffer_entities(chat_id)
-    # The valid goal concept survives; the corrupted imaginal row degrades silently.
-    assert entities == ["valid_id"]
+def test_buffer_stub_cgn_handle_with_bad_shape_silently_degrades():
+    """If CGN's internal shape isn't what we expect, the buffer-stub must
+    not raise — it just returns whatever it can without the CGN contribution."""
+
+    class BrokenCGN:
+        _concept_journeys = ["not", "a", "dict"]  # wrong shape
+
+    s = BufferStub(cgn_handle=BrokenCGN(), max_entities=10)
+    entities = s.current_entities(topic_tags=["topic:safe"])
+    assert entities == ["safe"]
 
 
 # ── _candidate_id_to_concept_id ─────────────────────────────────────
@@ -296,20 +262,11 @@ def test_composite_score_with_kuzu_spreading_outranks_p1_baseline(graph_with_spi
     assert p4_scores["mem:99999"] == pytest.approx(base_scores["mem:99999"])
 
 
-def test_actr_buffer_store_to_spreading_lookup_pipeline(graph_with_spine, tmp_path):
-    """P7 glue test: ActrBufferStore.buffer_entities → make_kuzu_spreading_lookup
-    → composite_score. Replaces the pre-P7 BufferStub pipeline test."""
-    conn = duckdb.connect(":memory:")
-    store = ActrBufferStore(
-        duckdb_conn=conn,
-        snapshot_path=str(tmp_path / "snap.json"),
-    )
-    chat_id = "alice:pipeline"
-    store.persist(
-        chat_id=chat_id, buffer_name="goal",
-        content="unix question", concept_ids=["unix_shell"],
-    )
-    buf = store.buffer_entities(chat_id)
+def test_buffer_stub_to_spreading_lookup_pipeline(graph_with_spine):
+    """Glue test: BufferStub → make_kuzu_spreading_lookup → composite_score.
+    The full P4.F pipeline that EngineRecall will run."""
+    bs = BufferStub(cgn_handle=None, max_entities=20)
+    buf = bs.current_entities(topic_tags=["topic:unix_shell"])
     assert buf == ["unix_shell"]
 
     spreading = make_kuzu_spreading_lookup(graph_with_spine, buf, S=2.0)

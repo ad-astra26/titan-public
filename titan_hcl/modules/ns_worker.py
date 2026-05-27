@@ -104,6 +104,8 @@ import numpy as np
 
 from titan_hcl import bus
 from titan_hcl.logic.emot_bundle_protocol import NS_PROGRAMS
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger("ns")
 
@@ -676,6 +678,7 @@ def _handle_action_result(
         logger.warning("[NSWorker] ACTION_RESULT handling failed: %s", e)
 
 
+@with_error_envelope(module_name="ns_module", subsystem="entry", severity=_phase11_sev.FATAL)
 def ns_worker_main(
     recv_queue,
     send_queue,

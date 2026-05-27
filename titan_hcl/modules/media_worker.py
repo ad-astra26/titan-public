@@ -28,6 +28,8 @@ import sys
 import time
 from pathlib import Path
 from titan_hcl import bus
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,7 @@ def _get_audio_perception():
     return _audio_perception
 
 
+@with_error_envelope(module_name="media", subsystem="entry", severity=_phase11_sev.FATAL)
 def media_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the Media module process."""
     from queue import Empty

@@ -71,6 +71,8 @@ from queue import Empty
 import numpy as np
 
 from titan_hcl import bus
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger("neuromod")
 
@@ -381,6 +383,7 @@ def _apply_external_nudge_payload(neuromod_system, payload: dict) -> bool:
         return False
 
 
+@with_error_envelope(module_name="neuromod_module", subsystem="entry", severity=_phase11_sev.FATAL)
 def neuromod_worker_main(
     recv_queue,
     send_queue,

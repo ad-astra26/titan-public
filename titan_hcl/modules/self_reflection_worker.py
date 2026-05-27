@@ -79,6 +79,8 @@ from queue import Empty
 from typing import Optional
 
 from titan_hcl import bus
+from titan_hcl.core.module_error_handler import with_error_envelope
+from titan_hcl.errors import Severity as _phase11_sev
 
 logger = logging.getLogger("self_reflection_worker")
 
@@ -294,6 +296,7 @@ def _init_prediction_engine(config: dict):
 
 # ARG ORDER (template-canonical): every Guardian-spawned L2 worker entry
 # follows (recv_queue, send_queue, name, config).
+@with_error_envelope(module_name="self_reflection_worker", subsystem="entry", severity=_phase11_sev.FATAL)
 def self_reflection_worker_main(recv_queue, send_queue, name: str,
                                   config: dict) -> None:
     """Main loop for the self_reflection_worker subprocess.

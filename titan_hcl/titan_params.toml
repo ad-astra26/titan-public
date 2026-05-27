@@ -3137,14 +3137,14 @@ w_r = 1.0   # cosine similarity
 w_p = 1.0   # importance(i)
 S   = 2.0   # spreading-activation S constant per arch §5.3
 
-# ── Phase 7 — Working-memory buffers (D-SPEC-PHASE7, 2026-05-27) ──
-# Governs INV-Syn-16/17/18 — `actr_buffers` sole-writer + non-blocking
-# pre-LLM goal hook + spreading-activation source = union of concept_ids
-# across the 4 buffer rows for chat_id. BufferStub deleted in P7 per
-# `feedback_no_shim_old_path_must_be_deleted.md`.
-[synthesis.buffers]
-max_entities                = 20   # INV-Syn-18 cap on buffer-entity union
-hydration_warm_threshold_s  = 3600 # cold chats > this stay un-hydrated
+# Buffer-entity stub source for spreading-activation lookup. P4 ships a
+# stub source consisting of the in-flight chat-TX topic_tags plus the
+# last-N-turns CGN concept_ids touched. Phase 7 replaces with the real
+# actr_buffers table; the swap is a single import-source change in
+# titan_hcl/synthesis/buffer_stub.py — config stays.
+[synthesis.buffer_stub]
+cgn_history_window_turns = 3   # last N turns of CGN concept_ids
+max_buffer_entities      = 20  # hard cap on union size
 
 # ── Phase 6 — Oracle middleware (D-SPEC-PHASE6, 2026-05-27) ────────
 # Governs INV-Syn-13 metabolic gate + INV-Syn-14 ZK opt-in trigger.
