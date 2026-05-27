@@ -1764,7 +1764,31 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             # anyway (gives up — bounded grace prevents runaway hang).
             if info.state == ModuleState.RUNNING:
                 hb_timeout = info.spec.heartbeat_timeout
-                if now - info.last_heartbeat > hb_timeout:
+                # Phase 11 §11.I.5 / locked D1 (SPEC D-SPEC-141) —
+                # supervisor staleness check consults the worker's SHM slot
+                # `last_heartbeat` field in addition to the legacy bus
+                # MODULE_HEARTBEAT path. Workers migrated to ModuleStateWriter
+                # may have stopped sending bus MODULE_HEARTBEAT (per the
+                # Phase 11 contract) and only update their SHM slot — without
+                # this read the supervisor would heartbeat-timeout-kill them
+                # while they're actually alive. We take the MAX of the two
+                # signals: whichever path is fresher keeps the worker alive.
+                # Once the cascade lands fleet-wide and bus MODULE_HEARTBEAT
+                # is fully retired in workers (follow-up cleanup commit), the
+                # bus update site in _process_guardian_messages goes away
+                # and this read becomes the sole source of truth.
+                effective_last_heartbeat = info.last_heartbeat
+                try:
+                    _bank = self._ensure_module_state_reader_bank()
+                    if _bank is not None:
+                        _entry = _bank.read(name)
+                        if _entry is not None and _entry.last_heartbeat > 0.0:
+                            if _entry.last_heartbeat > effective_last_heartbeat:
+                                effective_last_heartbeat = _entry.last_heartbeat
+                except Exception:  # noqa: BLE001 — SHM read must never crash supervisor
+                    pass
+
+                if now - effective_last_heartbeat > hb_timeout:
                     cpu_now = self._get_cpu_time_seconds(info.pid) if info.pid else 0.0
                     cpu_grew = (info.last_cpu_time > 0.0
                                 and cpu_now - info.last_cpu_time >= MIN_CPU_DELTA_FOR_ALIVE)
@@ -1773,7 +1797,7 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                         logger.warning(
                             "[Guardian] Module '%s' heartbeat timeout (%.1fs > %.0fs) but "
                             "CPU grew +%.2fs — alive-but-starved cycle %d/%d, deferring restart",
-                            name, now - info.last_heartbeat, hb_timeout,
+                            name, now - effective_last_heartbeat, hb_timeout,
                             cpu_now - info.last_cpu_time,
                             info.consecutive_starved_cycles, MAX_STARVED_CYCLES)
                         info.last_cpu_time = cpu_now
@@ -1789,7 +1813,7 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                     lvl = logging.ERROR if info.spec.layer == "L1" else logging.WARNING
                     logger.log(lvl,
                                "[Guardian] Module '%s' [%s] heartbeat timeout (%.1fs > %.0fs limit) — restart reason=%s",
-                               name, info.spec.layer, now - info.last_heartbeat, hb_timeout, reason)
+                               name, info.spec.layer, now - effective_last_heartbeat, hb_timeout, reason)
                     with self._module_lock:
                         info.state = ModuleState.UNHEALTHY
                         info.consecutive_starved_cycles = 0
