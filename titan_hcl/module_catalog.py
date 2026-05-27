@@ -1113,6 +1113,14 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # an INDEPENDENT listener (INV-11 restart-isolation; does
             # not attach to cognitive_worker's off-tick suite).
             _bus_constants.DREAM_STATE_CHANGED,
+            # Phase 5 (D-SPEC-PHASE5): hypothesis-fork lifecycle command
+            # surface. POST /v6/synthesis/forks/* endpoints publish this
+            # to the bus (dst="synthesis") and the worker dispatches
+            # create/record_exploration_tx/graduate_manual/abandon/sweep
+            # ops to HypothesisForkStore (sole writer per INV-Syn-8). The
+            # worker emits SYNTHESIS_FORK_COMMAND_RESULT carrying
+            # request_id so callers can correlate.
+            _bus_constants.SYNTHESIS_FORK_COMMAND,
             _bus_constants.KERNEL_EPOCH_TICK,
             _bus_constants.MODULE_SHUTDOWN,
         ],
