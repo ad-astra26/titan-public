@@ -482,6 +482,22 @@ _T = (
     ("/v6/synthesis/proofs/recent", "GET",
      "get_v6_synthesis_proofs_recent", "synthesis", "readout",
      None, None, (), ("synthesis_worker",), False, None),
+    # Phase 7 (D-SPEC-PHASE7, 2026-05-27): ACT-R working-memory buffer
+    # surface. Reads buffers_snapshot.json (written atomically by
+    # synthesis_worker via ActrBufferStore — sole writer per INV-Syn-16).
+    # Soft-fail to empty payload + snapshot status on missing/stale/corrupt.
+    ("/v6/synthesis/buffers/list_chats", "GET",
+     "get_v6_synthesis_buffers_list_chats", "synthesis", "readout",
+     None, None, (), ("synthesis_worker",), False, None),
+    ("/v6/synthesis/buffers/read", "GET",
+     "get_v6_synthesis_buffers_read", "synthesis", "readout",
+     None, None, (), ("synthesis_worker",), False, None),
+    ("/v6/synthesis/buffers/recent_writes", "GET",
+     "get_v6_synthesis_buffers_recent_writes", "synthesis", "readout",
+     None, None, (), ("synthesis_worker",), False, None),
+    ("/v6/synthesis/buffers/snapshot", "GET",
+     "get_v6_synthesis_buffers_snapshot", "synthesis", "readout",
+     None, None, (), ("synthesis_worker",), False, None),
 )
 
 

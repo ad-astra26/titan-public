@@ -1233,6 +1233,11 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # worker emits SYNTHESIS_FORK_COMMAND_RESULT carrying
             # request_id so callers can correlate.
             _bus_constants.SYNTHESIS_FORK_COMMAND,
+            # Phase 7 (D-SPEC-PHASE7): working-memory buffer command surface.
+            # agno_worker publishes this on every BufferCache write-through;
+            # synthesis_worker (sole writer per INV-Syn-16) persists the row
+            # to `actr_buffers` + atomic-writes buffers_snapshot.json.
+            _bus_constants.SYNTHESIS_BUFFER_COMMAND,
             _bus_constants.KERNEL_EPOCH_TICK,
             _bus_constants.MODULE_SHUTDOWN,
         ],
