@@ -162,10 +162,10 @@ def _check_p0_baseline(report: RunReport, base: str) -> None:
     """P0 — CAS substrate + payload slimming alive."""
 
     def _api_reachable():
-        code, _ = _http_get(f"{base}/v6/health")
-        return code == 200, f"GET /v6/health → {code}"
+        code, _ = _http_get(f"{base}/health")
+        return code == 200, f"GET /health → {code}"
 
-    _check(report, "api reachable (GET /v6/health → 200)", "P0", _api_reachable)
+    _check(report, "api reachable (GET /health → 200)", "P0", _api_reachable)
 
 
 def _check_p1_baseline(report: RunReport, base: str) -> None:
@@ -489,7 +489,9 @@ def _check_invariants(report: RunReport, base: str) -> None:
         if code != 200:
             return False, f"GET /v6/manifest → {code}"
         routes = body.get("routes") or []
-        paths = {r.get("path") for r in routes}
+        # v6/manifest exposes the route URL on the `route` field (not `path`)
+        # — see titan_hcl/api/v6_manifest.py:RouteSpec.as_row().
+        paths = {r.get("route") for r in routes}
         expected = {
             "/v6/synthesis/forks",
             "/v6/synthesis/forks/summary",
@@ -602,13 +604,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     reports: list[RunReport] = []
     for t in targets:
         # Quick reachability probe before running the full suite.
-        code, _ = _http_get(f"{t.base_url}/v6/health", timeout=5.0)
+        code, _ = _http_get(f"{t.base_url}/health", timeout=5.0)
         if code != 200:
-            print(f"[!] {t.name} not reachable: {t.base_url}/v6/health → {code}")
+            print(f"[!] {t.name} not reachable: {t.base_url}/health → {code}")
             r = RunReport(target=t.name, base_url=t.base_url,
                           started_at=time.time())
             r.add(Check("api reachability", "P0", False,
-                        f"GET /v6/health → {code}"))
+                        f"GET /health → {code}"))
             r.finished_at = time.time()
             reports.append(r)
             continue

@@ -402,7 +402,9 @@ class TimeChain:
                     tip_height   INTEGER DEFAULT 0,
                     tip_hash     BLOB,
                     topic        TEXT,
-                    compacted    INTEGER DEFAULT 0
+                    compacted    INTEGER DEFAULT 0,
+                    cached_file_mtime REAL DEFAULT 0,
+                    cached_file_size  INTEGER DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -414,18 +416,57 @@ class TimeChain:
                     fork_tips      TEXT NOT NULL
                 );
             """)
+            # Phase 9 Chunk 9K — fork-state cache columns (idempotent migration
+            # for pre-9K databases where CREATE TABLE IF NOT EXISTS above only
+            # creates the table on fresh installs).
+            for col_decl in (
+                "cached_file_mtime REAL DEFAULT 0",
+                "cached_file_size INTEGER DEFAULT 0",
+            ):
+                col_name = col_decl.split()[0]
+                try:
+                    conn.execute(f"ALTER TABLE fork_registry ADD COLUMN {col_decl}")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column name" not in str(e).lower():
+                        raise
             conn.commit()
         finally:
             conn.close()
+
+    def _refresh_fork_cache(self, conn: sqlite3.Connection, fork_id: int,
+                            path: Path) -> None:
+        """Phase 9 Chunk 9K — stamp the file's current mtime+size into
+        fork_registry so the next `_load_fork_state` can skip the linear scan.
+
+        Called from every tip-update path (add_block, reconcile, _update_fork_tip)
+        right after the chain-file append commits, so the cache stays in lock
+        step with the file. Best-effort — failure logs at debug and falls
+        through to the next-boot scan path (no correctness risk; just per-boot
+        perf regression).
+        """
+        try:
+            st = path.stat()
+            conn.execute(
+                "UPDATE fork_registry SET cached_file_mtime=?, cached_file_size=? "
+                "WHERE fork_id=?",
+                (float(st.st_mtime), int(st.st_size), fork_id),
+            )
+        except (OSError, sqlite3.Error) as exc:
+            logger.debug(
+                "[TimeChain] cache refresh fork=%d skipped: %s", fork_id, exc,
+            )
 
     def _load_fork_state(self):
         """Load fork tips and tag counts from index DB, reconcile with chain files."""
         conn = sqlite3.connect(str(self._index_db_path))
         try:
+            # Phase 9 Chunk 9K — read cache columns alongside tip metadata.
             rows = conn.execute(
-                "SELECT fork_id, tip_height, tip_hash FROM fork_registry"
+                "SELECT fork_id, tip_height, tip_hash, "
+                "cached_file_mtime, cached_file_size FROM fork_registry"
             ).fetchall()
-            for fork_id, height, tip_hash in rows:
+            cache_meta: dict[int, tuple[float, int]] = {}
+            for fork_id, height, tip_hash, cached_mtime, cached_size in rows:
                 # Fix genesis-era bug: tip_height=0 with NULL hash means "no blocks"
                 if height == 0 and tip_hash is None:
                     self._fork_tips[fork_id] = (-1, GENESIS_PREV_HASH)
@@ -434,12 +475,33 @@ class TimeChain:
                         (fork_id,))
                 else:
                     self._fork_tips[fork_id] = (height, tip_hash or GENESIS_PREV_HASH)
+                cache_meta[fork_id] = (float(cached_mtime or 0), int(cached_size or 0))
 
             # Reconcile: verify chain file tip matches index tip
+            cache_hits = 0
+            cache_misses = 0
+            scan_t0 = time.time()
             for fork_id, (idx_height, idx_hash) in list(self._fork_tips.items()):
                 path = self._get_chain_file_path(fork_id)
                 if not path.exists():
                     continue
+                # Phase 9 Chunk 9K — cache hit check. If the file's current
+                # mtime+size match the cached values, the sqlite tip is
+                # authoritative and we skip the O(file bytes) linear scan that
+                # was the per-boot bottleneck (140s observed on T1's 197 MB
+                # chain_episodic.bin). Fall through to the scan only on stale
+                # mtime or cold-recovery (cached_mtime==0).
+                cached_mtime, cached_size = cache_meta.get(fork_id, (0.0, 0))
+                if cached_mtime > 0:
+                    try:
+                        st = path.stat()
+                        if (abs(st.st_mtime - cached_mtime) < 0.001
+                                and st.st_size == cached_size):
+                            cache_hits += 1
+                            continue
+                    except OSError:
+                        pass
+                cache_misses += 1
                 file_tip = self._get_file_tip_height(path)
                 if file_tip is not None and file_tip != idx_height:
                     gap = abs(file_tip - idx_height)
@@ -462,7 +524,27 @@ class TimeChain:
                             "UPDATE fork_registry SET tip_height=?, tip_hash=? "
                             "WHERE fork_id=?",
                             (file_tip, new_hash, fork_id))
+                        # 9K — refresh cache after a fresh scan so next boot
+                        # can short-circuit.
+                        self._refresh_fork_cache(conn, fork_id, path)
                         conn.commit()
+                # 9K — on cache HIT (no scan needed) the existing cache row is
+                # still valid; no refresh needed. On cache MISS without a tip
+                # mismatch, we DID scan via _get_file_tip_height above — stamp
+                # the cache so next boot skips the scan.
+                if cache_meta.get(fork_id, (0.0, 0))[0] == 0 or (
+                    cached_mtime > 0 and
+                    (file_tip is None or file_tip == idx_height)
+                ):
+                    self._refresh_fork_cache(conn, fork_id, path)
+                    conn.commit()
+
+            # 9K — boot perf telemetry
+            _scan_ms = int((time.time() - scan_t0) * 1000)
+            logger.info(
+                "[TimeChain] fork-state load: cache_hits=%d misses=%d scan_ms=%d",
+                cache_hits, cache_misses, _scan_ms,
+            )
 
             # Count total blocks
             row = conn.execute("SELECT COUNT(*) FROM block_index").fetchone()
@@ -837,6 +919,10 @@ class TimeChain:
                 UPDATE fork_registry SET tip_height = ?, tip_hash = ?
                 WHERE fork_id = ?
             """, (height, block_hash, fork_id))
+            # Phase 9 Chunk 9K — stamp cache so next boot skips file scan.
+            self._refresh_fork_cache(
+                conn, fork_id, self._get_chain_file_path(fork_id),
+            )
             conn.commit()
         except Exception as e:
             logger.error("[TimeChain] Atomic index+tip failed fork=%d height=%d: %s",
@@ -899,6 +985,10 @@ class TimeChain:
                 UPDATE fork_registry SET tip_height = ?, tip_hash = ?
                 WHERE fork_id = ?
             """, (height, block_hash, fork_id))
+            # Phase 9 Chunk 9K — stamp cache so next boot skips file scan.
+            self._refresh_fork_cache(
+                conn, fork_id, self._get_chain_file_path(fork_id),
+            )
             conn.commit()
         finally:
             conn.close()

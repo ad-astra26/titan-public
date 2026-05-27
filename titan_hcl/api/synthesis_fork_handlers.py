@@ -33,6 +33,8 @@ import os
 import time
 from typing import Optional
 
+from fastapi import Request
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_SNAPSHOT_PATH = "data/forks_snapshot.json"
@@ -278,7 +280,7 @@ def get_synthesis_fork_summary() -> dict:
 # convention enforced by the route — body shape is op-discriminated.
 
 
-def _publish_fork_command(request, payload: dict) -> dict:
+def _publish_fork_command(request: Request, payload: dict) -> dict:
     """Helper: publish SYNTHESIS_FORK_COMMAND on the kernel bus. `request`
     is the FastAPI Request from the calling endpoint (carries titan_state
     in app.state). Returns the standard `{ok, request_id}` response shape."""
@@ -304,7 +306,7 @@ def _publish_fork_command(request, payload: dict) -> dict:
     return {"ok": True, "request_id": request_id, "accepted": True}
 
 
-async def post_synthesis_forks(request):
+async def post_synthesis_forks(request: Request):
     """POST /v6/synthesis/forks — create a hypothesis fork.
 
     Body:
@@ -329,7 +331,7 @@ async def post_synthesis_forks(request):
     return _publish_fork_command(request, payload)
 
 
-async def post_synthesis_fork_record_exploration(request, fork_id: str):
+async def post_synthesis_fork_record_exploration(request: Request, fork_id: str):
     """POST /v6/synthesis/forks/{fork_id}/record-exploration-tx.
 
     Body: {tx_hash: str}
@@ -348,7 +350,7 @@ async def post_synthesis_fork_record_exploration(request, fork_id: str):
     })
 
 
-async def post_synthesis_fork_graduate_manual(request, fork_id: str):
+async def post_synthesis_fork_graduate_manual(request: Request, fork_id: str):
     """POST /v6/synthesis/forks/{fork_id}/graduate-manual.
 
     Body: {concept_name?: str, evidence_ref?: str}
@@ -370,7 +372,7 @@ async def post_synthesis_fork_graduate_manual(request, fork_id: str):
     })
 
 
-async def post_synthesis_fork_abandon(request, fork_id: str):
+async def post_synthesis_fork_abandon(request: Request, fork_id: str):
     """POST /v6/synthesis/forks/{fork_id}/abandon.
 
     Body: {reason?: str}
@@ -386,7 +388,7 @@ async def post_synthesis_fork_abandon(request, fork_id: str):
     })
 
 
-async def post_synthesis_fork_sweep(request):
+async def post_synthesis_fork_sweep(request: Request):
     """POST /v6/synthesis/forks/sweep — manual ForkGC sweep trigger.
 
     Body: {dry_run?: bool}  (defaults to synthesis.fork_gc_live config inversion)
