@@ -109,7 +109,8 @@ def cmd_install(args: argparse.Namespace) -> int:
     state["install_root"] = str(repo_root)
     install_state.save(state)
     return run_phases(state=state, mode=mode, install_root=repo_root,
-                      default=args.default, minimal=args.minimal, skip_genesis=args.skip_genesis)
+                      default=args.default, minimal=args.minimal, skip_genesis=args.skip_genesis,
+                      tag=args.tag, build_rust=args.build_rust)
 
 
 # ── subcommands: stubs ─────────────────────────────────────────────────────
@@ -162,6 +163,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Skip optional research stack (Crawl4AI, Unstructured, Playwright).")
     pi.add_argument("--skip-genesis", action="store_true",
                     help="Skip the Genesis Ceremony.")
+    pi.add_argument("--tag", default=None,
+                    help="Release tag the binaries are fetched from (e.g. v0.0.1). "
+                         "Forwarded by the bootstrap; needed unless --build-rust.")
+    pi.add_argument("--build-rust", action="store_true",
+                    help="Compile the 9 Rust daemons from titan-rust/ source instead of "
+                         "downloading them (the fully-sovereign path; needs cargo + musl).")
     pi.add_argument("--resume", action="store_true",
                     help="Resume from the last completed phase (per ~/.titan/install_state.json).")
     pi.add_argument("--dry-run", action="store_true",
