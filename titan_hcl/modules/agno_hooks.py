@@ -1925,6 +1925,7 @@ def create_post_hook(plugin):
                             "(falling back to 0)", _ti_err)
                         _ovg_turn_index = 0
                 _ovg_turn_index = int(_ovg_turn_index or 0)
+                _ph_stage("ovg_after_turnindex")
 
                 # Phase 3 §7 normative content carry: felt-state snapshot
                 # + tool-calls extraction. Both soft-fail to empty/zero
@@ -1937,8 +1938,10 @@ def create_post_hook(plugin):
                         capture_turn_snapshot, extract_tool_calls,
                     )
                     _p3_snapshot = capture_turn_snapshot()
+                    _ph_stage("ovg_after_snapshot")
                     _p3_tool_calls = extract_tool_calls(
                         getattr(run_output, "tools", None))
+                    _ph_stage("ovg_after_toolcalls")
                 except Exception as _p3_err:
                     logger.warning(
                         "[PostHook:P3] turn snapshot/tool-call extraction "
@@ -1959,6 +1962,7 @@ def create_post_hook(plugin):
                     logger.warning(
                         "[PostHook:P3] topic-tag extraction failed "
                         "(non-blocking): %s", _tx_err)
+                _ph_stage("ovg_after_topictags")
 
                 from titan_hcl.llm_pipeline.verifier import verify_post_async
                 _ph_stage("ovg_pre_verify")
