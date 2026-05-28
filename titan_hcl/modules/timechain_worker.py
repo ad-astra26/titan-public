@@ -155,6 +155,10 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
     _last_neuromods = {}
     _is_dreaming = False
     _v2_last_tick = time.time()
+    # Trinity on-chain anchoring (rFP §3G Phase 10F restore) — lazy SHM bank +
+    # periodic-check timer. anchoring itself is gated by config["anchor_enabled"].
+    _anchor_bank = None
+    _anchor_last_check = 0.0
 
     # Fork name lookup
     fork_name_map = {
@@ -484,6 +488,39 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 _v2_last_tick = time.time()
             except Exception as e:
                 logger.error("[TimeChain] v2 tick error: %s", e, exc_info=True)
+
+        # ── Trinity on-chain anchoring (rFP §3G Phase 10F restore) ──────────
+        # Periodic check (every 30s). Dropped at the D8-3 spirit_worker gutting
+        # (zero invoker since); re-homed here as timechain_worker owns on-chain
+        # ops. Internal gating (curvature-EMA outlier + ≥5000 new TimeChain
+        # blocks) makes actual anchoring rare (~4/day). Gated by
+        # config["anchor_enabled"] (default False) — checked BEFORE any SHM read
+        # or SOL TX, so disabled-anchoring costs nothing.
+        if config.get("anchor_enabled", False) and (time.time() - _anchor_last_check) >= 30.0:
+            _anchor_last_check = time.time()
+            try:
+                if _anchor_bank is None:
+                    from titan_hcl.api.shm_reader_bank import ShmReaderBank
+                    from titan_hcl.core.state_registry import resolve_titan_id
+                    _anchor_bank = ShmReaderBank(titan_id=resolve_titan_id())
+                from titan_hcl.logic.trinity_anchor import maybe_anchor_trinity
+                _tri = _anchor_bank.read_trinity() or {}
+                _journey = _tri.get("journey", {}) or {}
+                _epoch_pl = _anchor_bank.read_epoch() or {}
+                _consciousness = {"latest_epoch": {
+                    "epoch_id": int(_epoch_pl.get("epoch", _current_epoch) or 0),
+                    "curvature": float(_journey.get("curvature", 0.0)),
+                    "density": float(_journey.get("density", 1.0)),
+                }}
+                _full = _tri.get("full_130dt") or []
+                _spirit5 = [float(x) for x in _full[:5]] if len(_full) >= 5 else [0.5] * 5
+                _body_pl = _anchor_bank.read_inner_body_5d() or {}
+                _mind_pl = _anchor_bank.read_inner_mind_15d() or {}
+                _body5 = [float(x) for x in (_body_pl.get("values") or [0.5] * 5)][:5]
+                _mind5 = [float(x) for x in (_mind_pl.get("values") or [0.5] * 15)][:5]
+                maybe_anchor_trinity(_consciousness, config, _body5, _mind5, _spirit5)
+            except Exception as _anc_err:
+                logger.debug("[TimeChain] trinity anchor check failed: %s", _anc_err)
 
         # ── TIMECHAIN_COMMIT — main write path ──
         if msg_type == bus.TIMECHAIN_COMMIT:

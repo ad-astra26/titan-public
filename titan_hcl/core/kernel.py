@@ -1853,7 +1853,7 @@ class TitanKernel:
         change-edge (e.g. metabolism tier re-evaluation).
 
         Uses the SYNC solana.rpc.api.Client (same pattern as
-        spirit_loop._maybe_anchor_trinity:L988) — NOT the async
+        logic.trinity_anchor.maybe_anchor_trinity) — NOT the async
         HybridNetworkClient — because event loops can't be safely shared
         across threads. The async client gets bound to whichever loop
         first calls it; running it from a freshly-spawned thread loop
