@@ -511,6 +511,7 @@ class TieredMemoryGraph:
                     self._bus_emit("MEMORY_RETRIEVAL_USED", {
                         "item_id": f"mem:{nid}",
                         "ts": now,
+                        "used_by_llm": False,  # INV-Syn-23: surfaced, not yet cited
                     })
                 except Exception as _emit_err:
                     logger.debug(
@@ -608,16 +609,19 @@ class TieredMemoryGraph:
                     w_r=self._synth_w_r,
                     w_p=self._synth_w_p,
                 )
-                # USE-gated emit per INV-Syn-5: every returned item is
-                # treated as "used" for Phase 1 — the strict "LLM cited"
-                # gate per arch §5.4 lands in Phase 9 meta-reasoning
-                # integration (rFP §18). Cheap fire-and-forget.
+                # SURFACED emit (INV-Syn-23 strict gate, Phase 9): retrieval-time
+                # producers emit used_by_llm=False — the item was surfaced into
+                # context, not yet cited. The post-LLM CitedUseDetector (agno) is
+                # the SOLE emitter of used_by_llm=True. synthesis_worker only
+                # reinforces (record_access) on True; False = surfaced_count
+                # telemetry. Cheap fire-and-forget.
                 now = time.time()
                 for sc in scored:
                     try:
                         self._bus_emit("MEMORY_RETRIEVAL_USED", {
                             "item_id": sc.candidate.item_id,
                             "ts": now,
+                            "used_by_llm": False,
                         })
                     except Exception as emit_err:
                         logger.debug(

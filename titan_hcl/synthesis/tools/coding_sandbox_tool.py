@@ -36,8 +36,10 @@ class CodingSandboxTool(ToolPlugBase):
         router=None,
         helper: Optional[CodingSandboxHelper] = None,
         oracle: Optional[CodingSandboxOracle] = None,
+        skill_outcome_sink=None,
     ):
-        super().__init__(writer=writer, router=router)
+        super().__init__(writer=writer, router=router,
+                         skill_outcome_sink=skill_outcome_sink)
         self._helper = helper or CodingSandboxHelper()
         # If an oracle wrapper was supplied (P6.B), share its helper so
         # both surfaces hit the same subprocess pool. Else build one over

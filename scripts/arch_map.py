@@ -2354,87 +2354,82 @@ def run_health_checks(base_url: str = "http://127.0.0.1:7777", label: str = "T1 
     else:
         fail(f"Chi crashed or unavailable (total={chi_total})")
 
-    # ── 8. No module crashes (Phase 11 §11.I.2 authoritative source) ──────
-    # Module lifecycle state lives in module_<name>_state.bin (SPEC §11.I.2,
-    # locked D1/D2) and is exposed authoritatively at /v6/readiness (the API
-    # reads those slots server-side via ModuleStateReaderBank). The legacy
-    # /health → v3.guardian_status field is the vestigial monolith-era guardian
-    # view; under Phase 11 it reports every module "stopped" (the guardian peer
-    # no longer owns module lifecycle), so reading it gave a false 0/N running.
-    # Lifecycle states: starting → booted → probing → running, plus terminal
-    # unhealthy / crashed / disabled and the never-spawned not_booted (lazy).
+    # ── 8. No Guardian module crashes ─────────────────────────────────
+    # 2026-04-08 (later) audit fix: replaced "still booting (likely)" warning
+    # which masked real crash loops on T3 (cgn/knowledge crash-looping for 1h+
+    # were reported as "still booting"). New logic uses Guardian's restart_count
+    # and uptime to distinguish three cases:
+    #   1. STARTING + low restart_count → genuine boot, WAIT and re-check
+    #   2. DISABLED with restart_count ≥ 5 → CRASH LOOP, FAIL with diagnosis
+    #   3. DISABLED with low restart count → cooldown after few crashes, WARN
+    # Heavy boot modules have larger boot windows but the same crash detection.
+    HEAVY_BOOT_MODULES = {"cgn", "knowledge", "memory"}
+    HEAVY_BOOT_GRACE_S = 600     # 10 min for heavy modules to come online
+    LIGHT_BOOT_GRACE_S = 60      # 1 min for light modules
     CRASH_LOOP_THRESHOLD = 5     # restart_count ≥ 5 = definite crash loop
 
-    readiness = _unwrap(_health_get(base_url, "/v6/readiness"))
-    modules = (readiness or {}).get("modules", [])
-    if modules:
-        summary = readiness.get("module_state_summary", {}) or {}
-        fleet = readiness.get("fleet", {}) or {}
-        boot_phase = fleet.get("boot_phase", "?")
-        active = 0             # modules in state=running
-        total = 0              # modules expected up (excludes lazy/disabled)
-        starting = []          # booting (starting/booted/probing)
-        crash_loops = []       # crashed/unhealthy with high restart_count
-        unhealthy = []         # crashed/unhealthy, low restart_count
+    v3_data = health_data.get("v3", {})
+    guardian_status = v3_data.get("guardian_status", {})
+    if guardian_status:
+        active = 0
+        starting = []          # genuinely booting
+        crash_loops = []       # disabled with high restart_count
+        cooldown = []          # disabled with low restart_count (transient)
+        unhealthy = []         # heartbeat-overdue but not yet disabled
         recently_unstable = [] # running but with recent restarts
-        missing = []           # mandatory/post_boot in roster but not_booted
-        lazy_down = 0          # boot_priority=lazy, intentionally unspawned
-        for m in modules:
-            name = m.get("name", "?")
-            state = (m.get("state") or "unknown").lower()
-            restart_count = m.get("restart_count", 0) or 0
-            bp = (m.get("boot_priority") or "").lower()
-            # not_booted / disabled = down. Under the §11.I.5 roster contract a
-            # not_booted entry is a genuine roster module with no live slot:
-            # lazy = expected down (informational); mandatory/post_boot = it
-            # SHOULD be running → surface it.
-            if state in ("not_booted", "disabled", "stopped"):
-                if bp == "lazy":
-                    lazy_down += 1
-                else:
-                    missing.append(f"{name}({bp or 'expected'})")
+        total = 0
+        for mod_name, mod_info in guardian_status.items():
+            state = mod_info.get("state", "unknown")
+            # rl and llm are intentionally stopped — skip them
+            if state == "stopped" and mod_name in ("rl", "llm"):
                 continue
             total += 1
+            restart_count = mod_info.get("restart_count", 0)
+            uptime = mod_info.get("uptime", 0)
+            grace = HEAVY_BOOT_GRACE_S if mod_name in HEAVY_BOOT_MODULES else LIGHT_BOOT_GRACE_S
+
             if state == "running":
                 active += 1
+                # Recent restarts on a running module = warning sign
                 if restart_count >= 3:
-                    recently_unstable.append(f"{name}(restarts={restart_count})")
-            elif state in ("starting", "booted", "probing"):
-                starting.append(f"{name}({state})")
-            elif state in ("crashed", "unhealthy"):
-                if restart_count >= CRASH_LOOP_THRESHOLD:
-                    crash_loops.append(f"{name}(restarts={restart_count})")
+                    recently_unstable.append(f"{mod_name}(restarts={restart_count})")
+            elif state == "starting":
+                # Distinguish: genuine boot vs stuck-in-starting
+                if uptime < grace:
+                    starting.append(mod_name)
                 else:
-                    err = m.get("last_error")
-                    tag = f",err={err}" if err else ""
-                    unhealthy.append(f"{name}({state},restarts={restart_count}{tag})")
+                    # Stuck in STARTING for longer than grace = crash loop pattern
+                    crash_loops.append(f"{mod_name}(stuck_starting={uptime:.0f}s)")
+            elif state == "disabled":
+                if restart_count >= CRASH_LOOP_THRESHOLD:
+                    crash_loops.append(f"{mod_name}(restarts={restart_count})")
+                else:
+                    cooldown.append(f"{mod_name}(restarts={restart_count})")
+            elif state == "unhealthy":
+                unhealthy.append(mod_name)
 
-        lazy_note = f", {lazy_down} lazy (on-demand)" if lazy_down else ""
         # Decide overall status (worst-case wins)
         if crash_loops:
             fail(f"CRASH LOOP detected: {', '.join(crash_loops)} "
-                 f"({active}/{total} running{lazy_note}) — check logs for stop "
-                 f"reason (rss limit, heartbeat timeout, exception)")
+                 f"({active}/{total} running) — check logs for stop reason "
+                 f"(rss limit, heartbeat timeout, exception)")
+        elif cooldown:
+            fail(f"Modules DISABLED in cooldown: {', '.join(cooldown)} "
+                 f"({active}/{total} running) — Guardian will retry, but recent "
+                 f"crashes need investigation")
         elif unhealthy:
-            fail(f"Modules CRASHED/UNHEALTHY: {', '.join(unhealthy)} "
-                 f"({active}/{total} running{lazy_note}) — supervisor will retry, "
-                 f"but recent crashes need investigation")
-        elif missing:
-            fail(f"Modules MISSING (in roster, never booted): "
-                 f"{', '.join(missing)} ({active}/{total} running{lazy_note}) — "
-                 f"mandatory/post_boot module has no live slot")
+            warn(f"Modules UNHEALTHY: {', '.join(unhealthy)} "
+                 f"({active}/{total} running) — heartbeat overdue but not yet disabled")
         elif starting:
-            warn(f"Modules booting: {', '.join(starting)} ({active}/{total} "
-                 f"running{lazy_note}, boot_phase={boot_phase}) — re-run in 30s "
-                 f"to verify they reach RUNNING")
+            warn(f"Modules booting: {', '.join(starting)} ({active}/{total} running) — "
+                 f"under grace period, re-run in 30s to verify they reach RUNNING")
         elif recently_unstable:
             warn(f"Modules running but unstable: {', '.join(recently_unstable)} "
-                 f"({active}/{total} running{lazy_note}) — recent restarts, "
-                 f"monitor for sustained uptime")
+                 f"({active}/{total} running) — recent restarts, monitor for sustained uptime")
         else:
-            ok(f"No module crashes ({active}/{total} running{lazy_note})")
+            ok(f"No module crashes ({active}/{total} active)")
     else:
-        warn("Module readiness unavailable (/v6/readiness returned no modules)")
+        warn("Guardian status not available in /health response")
 
     # ── 9. Dreaming system tracking ───────────────────────────────────
     dreaming = trinity2_resp.get("dreaming", {})
@@ -9401,31 +9396,17 @@ def main():
         show_params(graph)
 
     elif cmd == "health":
-        _HEALTH_URLS = {
-            "T1": ("http://127.0.0.1:7777", "T1 (localhost:7777)"),
-            "T2": ("http://10.135.0.6:7777", "T2 (10.135.0.6:7777)"),
-            "T3": ("http://10.135.0.6:7778", "T3 (10.135.0.6:7778)"),
-        }
-        # `--titan T1|T2|T3` selects a single Titan; `--t1/--t2/--t3` are
-        # legacy aliases; `--all` runs all three. Bare `health` = T1 only.
-        _sel: list[str] = []
-        if "--titan" in sys.argv:
-            _i = sys.argv.index("--titan")
-            if _i + 1 < len(sys.argv):
-                _sel.append(sys.argv[_i + 1].upper())
-        for _t in ("T1", "T2", "T3"):
-            if f"--{_t.lower()}" in sys.argv:
-                _sel.append(_t)
         if "--all" in sys.argv:
-            _sel = ["T1", "T2", "T3"]
-        if not _sel:
-            _sel = ["T1"]
-        for _t in dict.fromkeys(_sel):  # de-dup, preserve order
-            if _t not in _HEALTH_URLS:
-                print(f"  ✗ Unknown Titan '{_t}' (expected T1|T2|T3)")
-                continue
-            _url, _label = _HEALTH_URLS[_t]
-            run_health_checks(_url, _label)
+            # All 3 Titans
+            run_health_checks("http://127.0.0.1:7777", "T1 (localhost:7777)")
+            run_health_checks("http://10.135.0.6:7777", "T2 (10.135.0.6:7777)")
+            run_health_checks("http://10.135.0.6:7778", "T3 (10.135.0.6:7778)")
+        else:
+            run_health_checks("http://127.0.0.1:7777", "T1 (localhost:7777)")
+            if "--t2" in sys.argv:
+                run_health_checks("http://10.135.0.6:7777", "T2 (10.135.0.6:7777)")
+            if "--t3" in sys.argv:
+                run_health_checks("http://10.135.0.6:7778", "T3 (10.135.0.6:7778)")
 
     elif cmd == "dim-live":
         run_dim_live(sys.argv[2:])
