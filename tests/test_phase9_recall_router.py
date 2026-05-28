@@ -114,3 +114,68 @@ def test_evaluator_failure_returns_none():
     er = EngineRecall(rule_evaluator=_BoomEval(),
                       activation_lookup=lambda ids: {}, embedder=None)
     assert er.recall("q", granularity=GRANULARITY_ARCHIVE) is None
+
+
+# ── meta_resolvers EngineRecall wrapper (INV-Syn-22 routing) ───────────
+
+import asyncio
+
+from titan_hcl.logic.meta_resolvers import _make_engine_recall_resolver
+
+
+class _FakeEngine:
+    def __init__(self, results):
+        self._results = results
+        self.calls = []
+
+    def recall(self, query, *, granularity=None, **kw):
+        self.calls.append((query, granularity))
+        return self._results
+
+
+async def _legacy(name, ctx):
+    return {"success": True, "output": "LEGACY", "recruiter": "x", "reason": "legacy"}
+
+
+def test_resolver_routes_through_engine_on_hit():
+    eng = _FakeEngine(results=[{"tx_hash": "t1", "score": 0.9}])
+    r = _make_engine_recall_resolver(
+        category="chain_archive", granularity="archive",
+        engine_recall=eng, legacy_resolver=_legacy, soft_fallback=True)
+    out = asyncio.get_event_loop().run_until_complete(
+        r("query", {"query_text": "metaplex bug"}))
+    assert out["success"] is True
+    assert out["reason"] == "engine_recall:archive"
+    assert eng.calls == [("metaplex bug", "archive")]
+
+
+def test_resolver_soft_fallback_on_none():
+    eng = _FakeEngine(results=None)
+    r = _make_engine_recall_resolver(
+        category="chain_archive", granularity="archive",
+        engine_recall=eng, legacy_resolver=_legacy, soft_fallback=True)
+    out = asyncio.get_event_loop().run_until_complete(
+        r("query", {"query_text": "x"}))
+    assert out["output"] == "LEGACY"
+
+
+def test_resolver_no_fallback_returns_empty_when_disabled():
+    eng = _FakeEngine(results=None)
+    r = _make_engine_recall_resolver(
+        category="semantic_graph", granularity="concept",
+        engine_recall=eng, legacy_resolver=_legacy, soft_fallback=False)
+    out = asyncio.get_event_loop().run_until_complete(
+        r("query", {"query_text": "x"}))
+    assert out["success"] is False
+    assert out["reason"] == "engine_recall_empty:concept"
+
+
+def test_resolver_empty_query_falls_back():
+    eng = _FakeEngine(results=[{"tx_hash": "t1"}])
+    r = _make_engine_recall_resolver(
+        category="episodic_memory", granularity="turn",
+        engine_recall=eng, legacy_resolver=_legacy, soft_fallback=True)
+    out = asyncio.get_event_loop().run_until_complete(r("query", {}))
+    # no query text → engine not called → legacy fallback
+    assert out["output"] == "LEGACY"
+    assert eng.calls == []

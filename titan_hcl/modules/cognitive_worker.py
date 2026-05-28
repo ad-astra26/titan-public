@@ -659,16 +659,60 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
             _pending_reg = (state_refs["_meta_service"].pending_registry
                             if state_refs["_meta_service"] is not None
                             else None)
+            # Phase 9 INV-Syn-22: build the read-only EngineRecall recall reader
+            # so meta-reasoning RECALL resolves in-process (no sync bus.request).
+            # Defensive: any failure → engine_recall=None → pure legacy dispatch
+            # (zero regression). Embedder/faiss/kuzu read handles are not wired
+            # in cognitive_worker yet, so embedding-dependent granularities
+            # (turn/concept) soft-fall-back to the legacy resolver during the
+            # parity-soak window (recall_parity_soft_fallback); archive routes
+            # through the engine today.
+            _engine_recall = None
+            _recall_enabled = True
+            _recall_soft_fallback = True
+            try:
+                from titan_hcl.synthesis.bridge_recall import BridgeRecall
+                from titan_hcl.synthesis.recall_reader import build_recall_reader
+                _meta_cfg = {}
+                try:
+                    import tomllib as _toml
+                    _pp = os.path.join(
+                        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "titan_params.toml")
+                    with open(_pp, "rb") as _f:
+                        _meta_cfg = (_toml.load(_f)
+                                     .get("synthesis", {}).get("meta", {}))
+                except Exception:
+                    _meta_cfg = {}
+                _recall_enabled = bool(_meta_cfg.get("recall_engine_enabled", True))
+                _recall_soft_fallback = bool(
+                    _meta_cfg.get("recall_parity_soft_fallback", True))
+                if _recall_enabled:
+                    _data_dir = os.environ.get("TITAN_DATA_DIR", "data")
+                    _engine_recall = build_recall_reader(
+                        data_dir=_data_dir,
+                        bridge_recall=BridgeRecall(),
+                    )
+            except Exception as _er_err:
+                logger.warning(
+                    "[CognitiveWorker] INV-Syn-22 recall reader build failed: "
+                    "%s — RECALL stays on legacy dispatch", _er_err)
+                _engine_recall = None
             _rr = _rdr(
                 state_refs["_meta_recruitment"],
                 send_queue=send_queue,
                 pending_registry=_pending_reg,
+                engine_recall=_engine_recall,
+                recall_engine_enabled=_recall_enabled,
+                recall_soft_fallback=_recall_soft_fallback,
             )
             logger.info(
                 "[CognitiveWorker] Session 3 resolvers bound: %d/%d "
-                "(pending_registry=%s)",
+                "(pending_registry=%s, RECALL operator=%s)",
                 sum(1 for v in _rr.values() if v), len(_rr),
-                "wired" if _pending_reg is not None else "None")
+                "wired" if _pending_reg is not None else "None",
+                "EngineRecall (INV-Syn-22)" if _engine_recall is not None
+                else "legacy")
         except Exception as _rdr_err:
             logger.warning(
                 "[CognitiveWorker] Session 3 resolver registration failed: %s",
