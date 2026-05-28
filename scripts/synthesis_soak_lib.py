@@ -58,6 +58,9 @@ SEND_RETRIES = 6              # retry a failed send (rides an agno cold-restart)
 SEND_BACKOFF_S = 10.0         # base backoff between send retries (10,20,30,40,50s)
 CHECKPOINT_EVERY_TURNS = 1    # checkpoint after every turn (cheap, durable)
 HEALTH_RECOVERY_MAX_S = 360.0 # on send failure, wait up to 6 min for /health to recover
+AGNO_RESETTLE_S = 300.0       # on detected agno restart, pause SENDING to that Titan
+                              # 5 min so agno can resettle (reload fastembed + warm)
+                              # before we hammer it again (Maker 2026-05-28)
 
 # Remote per-worker RSS probe (runs on the VPS via `ssh host python3 -c`).
 # Attributes each titan_hcl process to T2/T3 by /proc/<pid>/cwd, captures VmRSS +
@@ -322,10 +325,13 @@ def _ssh_worker_rss() -> dict:
         return {"error": f"{type(e).__name__}: {e}"[:160]}
 
 
-async def _rss_sampler(run_dir: str, intended_end: float, stop: asyncio.Event):
+async def _rss_sampler(run_dir: str, intended_end: float, stop: asyncio.Event,
+                       backoff_until: dict):
     """Fine-grained per-worker RSS curve (60s). One record covers both Titans.
     Detects agno restarts (PID change / RSS drop on the heaviest worker) — the
-    precise root-cause signal for the agno-RSS→1GB→GuardianHCL-restart pattern."""
+    precise root-cause signal for the agno-RSS→1GB→GuardianHCL-restart pattern.
+    On a detected restart, sets `backoff_until[target]` so the driver pauses
+    SENDING to that Titan for AGNO_RESETTLE_S (let agno reload + warm)."""
     path = os.path.join(run_dir, "worker_rss.jsonl")
     prev_heaviest: dict = {}  # target → (pid, rss_mb)
     while not stop.is_set() and _now() < intended_end:
@@ -347,6 +353,11 @@ async def _rss_sampler(run_dir: str, intended_end: float, stop: asyncio.Event):
                 logger.warning("[%s] heaviest-worker RESTART detected (pid %s→%s, "
                                "rss %.0f→%.0f MB, agno=%s)", t, old[0], cur[0],
                                old[1], cur[1], tinfo.get("heaviest_is_agno"))
+                # Pause sending to this Titan so agno can resettle before we
+                # hammer it again (Maker 2026-05-28). Polling/telemetry continue.
+                backoff_until[t] = _now() + AGNO_RESETTLE_S
+                logger.warning("[%s] agno-resettle backoff — pausing sends %.0fs",
+                               t, AGNO_RESETTLE_S)
             prev_heaviest[t] = cur
         _append_jsonl(path, rec)
         try:
@@ -443,13 +454,27 @@ class Checkpoint:
 
 # ── Driver ───────────────────────────────────────────────────────────────────
 async def _driver(target: str, api_base: str, internal_key: str, client: httpx.AsyncClient,
-                  chat_log_path: str, cp: Checkpoint, intended_end: float, stop: asyncio.Event):
+                  chat_log_path: str, cp: Checkpoint, intended_end: float, stop: asyncio.Event,
+                  backoff_until: dict):
     """Per-target conversation driver. Round-robins the tracks; each track keeps a
-    cursor (resumable). Recurrence tracks loop their missions (repeat shapes)."""
+    cursor (resumable). Recurrence tracks loop their missions (repeat shapes).
+    Honors `backoff_until[target]` — after a detected agno restart, pauses sends so
+    agno can resettle (the RSS sampler sets it)."""
     cp.cursors.setdefault(target, {t.name: 0 for t in TRACKS})
     cp.turns_sent.setdefault(target, 0)
     track_idx = 0
     while not stop.is_set() and _now() < intended_end:
+        # Agno-resettle backoff: if a restart was just detected for this Titan,
+        # hold sends until agno has had AGNO_RESETTLE_S to reload + warm.
+        settle = backoff_until.get(target, 0.0)
+        if _now() < settle:
+            wait_s = settle - _now()
+            logger.info("[%s] settling after agno restart — holding sends %.0fs", target, wait_s)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=wait_s)
+            except asyncio.TimeoutError:
+                pass
+            continue
         track = TRACKS[track_idx % len(TRACKS)]
         track_idx += 1
         cursor = cp.cursors[target].get(track.name, 0)
@@ -619,18 +644,21 @@ async def run(*, duration: int, internal_key: str, targets: Optional[list[str]] 
     except (NotImplementedError, RuntimeError):
         pass  # add_signal_handler unsupported on this platform — fall back to default
     clients: dict[str, httpx.AsyncClient] = {}
+    backoff_until: dict[str, float] = {}  # target → epoch; sender pauses until then
     tasks = []
     for t in tgts:
         api_base = TARGETS[t]
         clients[t] = httpx.AsyncClient(timeout=120.0)
         chat_log = os.path.join(run_dir, f"chat_{t}.jsonl")
         tele_log = os.path.join(run_dir, f"telemetry_{t}.jsonl")
-        tasks.append(_driver(t, api_base, internal_key, clients[t], chat_log, cp, intended_end, stop))
+        tasks.append(_driver(t, api_base, internal_key, clients[t], chat_log, cp,
+                             intended_end, stop, backoff_until))
         tasks.append(_poller(t, api_base, clients[t], tele_log, intended_end, stop))
 
     # One per-worker RSS sampler (covers both Titans in a single SSH; 60s cadence)
-    # — the precise agno-RSS-growth + restart-detection stream.
-    tasks.append(_rss_sampler(run_dir, intended_end, stop))
+    # — the precise agno-RSS-growth + restart-detection stream; sets backoff_until
+    # on a detected restart so the driver pauses sends while agno resettles.
+    tasks.append(_rss_sampler(run_dir, intended_end, stop, backoff_until))
 
     logger.info("Synthesis soak: targets=%s run_dir=%s ends_in=%.0fs",
                 tgts, run_dir, intended_end - _now())
