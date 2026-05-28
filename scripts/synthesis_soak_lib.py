@@ -52,10 +52,58 @@ VPS_SSH_HOST = "root@10.135.0.6"
 
 # ── Pacing ────────────────────────────────────────────────────────────────
 TURN_INTERVAL_S = 45.0        # one conversation turn per target every ~45s
-POLL_INTERVAL_S = 300.0       # telemetry snapshot every 5 min
-SEND_RETRIES = 4              # retry a failed send (Titan may be mid-restart)
-SEND_BACKOFF_S = 8.0          # base backoff between send retries
+POLL_INTERVAL_S = 300.0       # full /v6/synthesis/* telemetry snapshot every 5 min
+RSS_SAMPLE_INTERVAL_S = 60.0  # per-worker RSS sample every 60s (fine growth curve)
+SEND_RETRIES = 6              # retry a failed send (rides an agno cold-restart)
+SEND_BACKOFF_S = 10.0         # base backoff between send retries (10,20,30,40,50s)
 CHECKPOINT_EVERY_TURNS = 1    # checkpoint after every turn (cheap, durable)
+HEALTH_RECOVERY_MAX_S = 360.0 # on send failure, wait up to 6 min for /health to recover
+
+# Remote per-worker RSS probe (runs on the VPS via `ssh host python3 -c`).
+# Attributes each titan_hcl process to T2/T3 by /proc/<pid>/cwd, captures VmRSS +
+# PID + start-time (a PID change / RSS drop = a Guardian restart — esp. agno_worker
+# crossing its ~1GB limit), and confirms the heaviest worker is agno by checking
+# its maps for the fastembed/onnx embedding libs. Maker's observed pattern:
+# agno RSS grows slowly under multi-hour load → exceeds 1GB → GuardianHCL restarts.
+_WORKER_RSS_PROBE = r'''
+import os, glob, json
+DIRMAP = {"/home/antigravity/projects/titan": "T2", "/home/antigravity/projects/titan3": "T3"}
+out = {"T2": {"procs": [], "total_kb": 0}, "T3": {"procs": [], "total_kb": 0}}
+for pd in glob.glob("/proc/[0-9]*"):
+    pid = pd.rsplit("/", 1)[-1]
+    try:
+        cwd = os.readlink(pd + "/cwd")
+        t = DIRMAP.get(cwd)
+        if not t:
+            continue
+        comm = open(pd + "/comm").read().strip().lower()
+        if "titan" not in comm:
+            continue
+        rss = 0
+        for line in open(pd + "/status"):
+            if line.startswith("VmRSS"):
+                rss = int(line.split()[1]); break
+        start = open(pd + "/stat").read().split()[21]
+        out[t]["procs"].append({"pid": int(pid), "rss_kb": rss, "start": int(start)})
+        out[t]["total_kb"] += rss
+    except Exception:
+        continue
+for t in out:
+    out[t]["procs"].sort(key=lambda p: p["rss_kb"], reverse=True)
+    out[t]["proc_count"] = len(out[t]["procs"])
+    out[t]["total_mb"] = round(out[t]["total_kb"] / 1024, 1)
+    if out[t]["procs"]:
+        hp = out[t]["procs"][0]
+        out[t]["heaviest_pid"] = hp["pid"]
+        out[t]["heaviest_rss_mb"] = round(hp["rss_kb"] / 1024, 1)
+        try:
+            mp = open("/proc/%d/maps" % hp["pid"]).read()
+            out[t]["heaviest_is_agno"] = any(x in mp for x in ("onnxruntime", "fastembed", "tokenizers"))
+        except Exception:
+            out[t]["heaviest_is_agno"] = None
+    out[t]["procs"] = out[t]["procs"][:8]  # top-8 by RSS
+print(json.dumps(out))
+'''
 
 # Telemetry readout surface (GET; each soft-fails independently).
 TELEMETRY_ENDPOINTS = [
@@ -214,6 +262,12 @@ async def _send_with_retry(client, api_base, internal_key, user_id, session_id, 
         # transient (conn/timeout/5xx) → backoff + retry
         if attempt < SEND_RETRIES:
             await asyncio.sleep(SEND_BACKOFF_S * attempt)
+    # All retries failed — likely a Titan/agno restart (Guardian killed agno at
+    # its RSS ceiling). Wait for /health to recover, then make ONE final attempt
+    # so the turn survives the restart rather than being lost.
+    if await _await_health(client, api_base):
+        logger.info("[recovery] %s health recovered — retrying turn", api_base)
+        result = await _send_chat(client, api_base, internal_key, user_id, session_id, message)
     return result
 
 
@@ -248,6 +302,73 @@ def _ssh_resource_probe() -> dict:
         return {"loadavg": load, "mem_swap_mb": memlines}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"[:120]}
+
+
+def _ssh_worker_rss() -> dict:
+    """Per-worker RSS for T2 + T3 via the remote probe (one SSH gets both Titans).
+    Soft-fail → {} so a flaky SSH never stops the soak."""
+    try:
+        # Pipe the probe via STDIN to remote `python3` (reads script from stdin) —
+        # avoids SSH remote-shell word-splitting of a multiline `-c` argument.
+        out = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=no",
+             VPS_SSH_HOST, "python3", "-"],
+            input=_WORKER_RSS_PROBE, capture_output=True, text=True, timeout=25,
+        )
+        if out.returncode != 0:
+            return {"error": (out.stderr or "ssh_rss_failed")[:160]}
+        return json.loads(out.stdout.strip())
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"[:160]}
+
+
+async def _rss_sampler(run_dir: str, intended_end: float, stop: asyncio.Event):
+    """Fine-grained per-worker RSS curve (60s). One record covers both Titans.
+    Detects agno restarts (PID change / RSS drop on the heaviest worker) — the
+    precise root-cause signal for the agno-RSS→1GB→GuardianHCL-restart pattern."""
+    path = os.path.join(run_dir, "worker_rss.jsonl")
+    prev_heaviest: dict = {}  # target → (pid, rss_mb)
+    while not stop.is_set() and _now() < intended_end:
+        rss = await asyncio.get_event_loop().run_in_executor(None, _ssh_worker_rss)
+        rec = {"ts": _utc(), "epoch": _now(), "rss": rss, "restart_events": []}
+        # Restart detection on the heaviest (likely-agno) worker per Titan.
+        for t in ("T2", "T3"):
+            tinfo = rss.get(t) if isinstance(rss, dict) else None
+            if not isinstance(tinfo, dict) or "heaviest_pid" not in tinfo:
+                continue
+            cur = (tinfo.get("heaviest_pid"), tinfo.get("heaviest_rss_mb", 0.0))
+            old = prev_heaviest.get(t)
+            if old and (old[0] != cur[0] or (old[1] - cur[1]) > 300):
+                rec["restart_events"].append({
+                    "target": t, "old_pid": old[0], "new_pid": cur[0],
+                    "old_rss_mb": old[1], "new_rss_mb": cur[1],
+                    "is_agno": tinfo.get("heaviest_is_agno"),
+                })
+                logger.warning("[%s] heaviest-worker RESTART detected (pid %s→%s, "
+                               "rss %.0f→%.0f MB, agno=%s)", t, old[0], cur[0],
+                               old[1], cur[1], tinfo.get("heaviest_is_agno"))
+            prev_heaviest[t] = cur
+        _append_jsonl(path, rec)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=RSS_SAMPLE_INTERVAL_S)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _await_health(client: httpx.AsyncClient, api_base: str) -> bool:
+    """On a send failure (likely a Titan/agno restart), poll /health until it
+    recovers (up to HEALTH_RECOVERY_MAX_S) so the driver rides the restart rather
+    than burning the turn. Returns True if it came back, False on timeout."""
+    deadline = _now() + HEALTH_RECOVERY_MAX_S
+    while _now() < deadline:
+        try:
+            r = await client.get(f"{api_base}/health")
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(10.0)
+    return False
 
 
 async def _poller(target: str, api_base: str, client: httpx.AsyncClient,
@@ -433,6 +554,12 @@ async def dry_run(*, internal_key: str, targets: Optional[list[str]] = None) -> 
                   f"{'✓' if (h_ok and m_ok) else '✗'}")
     res = await asyncio.get_event_loop().run_in_executor(None, _ssh_resource_probe)
     print(f"[dry-run] VPS resource probe: {res}")
+    rss = await asyncio.get_event_loop().run_in_executor(None, _ssh_worker_rss)
+    for t in ("T2", "T3"):
+        ti = rss.get(t, {}) if isinstance(rss, dict) else {}
+        print(f"[dry-run] {t} worker RSS: total={ti.get('total_mb')}MB "
+              f"procs={ti.get('proc_count')} heaviest={ti.get('heaviest_rss_mb')}MB "
+              f"(agno_confirmed={ti.get('heaviest_is_agno')})")
     print(f"[dry-run] {'PASS' if ok_all else 'FAIL'} — harness ready" if ok_all
           else "[dry-run] FAIL — a target /health or /metrics did not answer")
     return 0 if ok_all else 1
@@ -489,6 +616,10 @@ async def run(*, duration: int, internal_key: str, targets: Optional[list[str]] 
         tele_log = os.path.join(run_dir, f"telemetry_{t}.jsonl")
         tasks.append(_driver(t, api_base, internal_key, clients[t], chat_log, cp, intended_end, stop))
         tasks.append(_poller(t, api_base, clients[t], tele_log, intended_end, stop))
+
+    # One per-worker RSS sampler (covers both Titans in a single SSH; 60s cadence)
+    # — the precise agno-RSS-growth + restart-detection stream.
+    tasks.append(_rss_sampler(run_dir, intended_end, stop))
 
     logger.info("Synthesis soak: targets=%s run_dir=%s ends_in=%.0fs",
                 tgts, run_dir, intended_end - _now())
