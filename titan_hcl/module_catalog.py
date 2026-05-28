@@ -506,6 +506,12 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # classifier fell through to "passthrough" with all features on —
     # which defeated the whole point of ζ.1 feature gating.
     _agno_cfg["chat"] = config.get("chat", {})
+    # Phase 8 (D-SPEC-PHASE8) — propagate [synthesis] so agno_worker's
+    # delegate_live wiring (config[synthesis][skill][delegate_live]) sees the
+    # per-Titan ~/.titan/microkernel_<id>.toml override. Without this the
+    # agno tool's match_procedural_skill always reads the config default
+    # (False) — the T3 canary's delegate_live=true never takes effect.
+    _agno_cfg["synthesis"] = config.get("synthesis", {})
     guardian.register(ModuleSpec(
         name="agno_worker",
         layer="L2",  # Microkernel v2 §A.5 — L2 module (chat pipeline owner)
