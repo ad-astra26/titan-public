@@ -112,67 +112,6 @@ def verify_directives(
         return False
 
 
-# Hash-keyed parse cache: {constitution_hash: [directive strings]}. The
-# constitution is tiny (~7 KB) so the read+sha256 is microseconds, but keying
-# the parsed result on the hash means we only re-parse when the file actually
-# changes (and a changed file with a stale signature is caught by
-# verify_directives, the caller's tamper gate).
-_PRIME_DIRECTIVES_CACHE: dict = {}
-
-
-def get_prime_directives(
-    constitution_path: str = CONSTITUTION_PATH,
-    signature_file: str = SIGNATURE_FILE,
-) -> list[str]:
-    """Return the Prime Directives as a list of strings, read DIRECTLY from the
-    signed constitution file — no bus-RPC.
-
-    Security: the constitution's integrity is verified (hash == signed hash)
-    before the parsed directives are returned, so a tampered/MITM'd file yields
-    `[]` rather than injecting forged directives into the LLM context. The
-    caller (pre-hook) ALSO runs verify_directives at the top as the hard tamper
-    gate; this is the in-band confirmation for the read itself.
-
-    Subsecond (local file read + sha256 + one-time parse, then hash-cached).
-    Parses the `## Prime Directives` section: each `* **Name**: text` /
-    `- text` bullet becomes one directive string (markdown bullet stripped).
-    """
-    try:
-        if not (os.path.exists(constitution_path) and os.path.exists(signature_file)):
-            return []
-        current_hash = compute_constitution_hash(constitution_path)
-        stored = get_stored_hash(signature_file)
-        if not stored or current_hash != stored:
-            # Integrity mismatch — never return forged directives.
-            logger.error(
-                "[DirectiveSigner] get_prime_directives: hash mismatch "
-                "(constitution tampered or unsigned) — returning empty")
-            return []
-        cached = _PRIME_DIRECTIVES_CACHE.get(current_hash)
-        if cached is not None:
-            return cached
-        text = Path(constitution_path).read_text(encoding="utf-8")
-        directives: list[str] = []
-        in_section = False
-        for raw in text.splitlines():
-            line = raw.strip()
-            if line.startswith("## "):
-                # Enter on the Prime Directives heading, exit on the next H2.
-                in_section = line.lower().startswith("## prime directive")
-                continue
-            if not in_section:
-                continue
-            if line == "---":
-                break  # section terminator
-            if line.startswith(("* ", "- ")):
-                directives.append(line[2:].strip())
-        _PRIME_DIRECTIVES_CACHE[current_hash] = directives
-        return directives
-    except Exception as e:  # noqa: BLE001 — directives are best-effort on the hot path
-        logger.error("[DirectiveSigner] get_prime_directives failed: %s", e)
-        return []
-
-
 def get_stored_hash(signature_file: str = SIGNATURE_FILE) -> Optional[str]:
     """Get the stored constitution hash without full verification."""
     try:

@@ -514,6 +514,28 @@ _T = (
     ("/v6/synthesis/skills/coverage", "GET",
      "get_v6_synthesis_skills_coverage", "synthesis", "readout",
      None, None, (), ("synthesis_worker",), False, None),
+    # Phase 10 (D-SPEC-PHASE10) — observatory + metrics. Read-only over
+    # data/synthesis_metrics_snapshot.json (INV-Syn-25, observation-only).
+    ("/v6/synthesis/metrics", "GET",
+     "get_v6_synthesis_metrics", "synthesis", "readout",
+     None, None, (), ("synthesis_worker",), False, None),
+    ("/v6/synthesis/metrics/sovereignty", "GET",
+     "get_v6_synthesis_metrics_sovereignty", "synthesis", "readout",
+     None, None, (), ("synthesis_worker",), False, None),
+    ("/v6/synthesis/metrics/groundedness", "GET",
+     "get_v6_synthesis_metrics_groundedness", "synthesis", "readout",
+     None, None, (), ("synthesis_worker",), False, None),
+    ("/v6/synthesis/metrics/retrieval", "GET",
+     "get_v6_synthesis_metrics_retrieval", "synthesis", "readout",
+     None, None, (), ("synthesis_worker",), False, None),
+    ("/v6/synthesis/metrics/chain-growth", "GET",
+     "get_v6_synthesis_metrics_chain_growth", "synthesis", "readout",
+     None, None, (), ("synthesis_worker",), False, None),
+    # Phase 9 INV-Syn-24 — explicit Tier-2 user-feedback producer. POST →
+    # publishes USER_FEEDBACK_SIGNAL; synthesis_worker applies the override.
+    ("/v6/synthesis/feedback", "POST",
+     "post_v6_synthesis_feedback", "synthesis", "write",
+     None, None, (), ("synthesis_worker",), False, None),
 )
 
 

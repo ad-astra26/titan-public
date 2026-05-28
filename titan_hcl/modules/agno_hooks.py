@@ -814,31 +814,27 @@ def create_pre_hook(plugin):
             logger.debug("[PreHook] Recall perturbation failed: %s", _rp_err)
 
         _ph_stage("after_user_memory_and_perturbation")
-        # 2. Prime Directives — read DIRECTLY from the signed, integrity-verified
-        # constitution file (titan_constitution.md), NOT via a bus-RPC.
-        #
-        # Prime directives are Titan's anti-jailbreak / anti-hallucination
-        # safeguard and MUST be injected into every LLM call. The prior path
-        # (`plugin.soul.get_active_directives()`) was a bus-RPC to the soul
-        # module that cost ~5s on T1 — the single largest pre-hook stall, paid
-        # on every chat including a bare "hello". The directives' canonical
-        # source is the SIGNED constitution (verify_directives at the top of
-        # this hook already confirms its hash matches the stored signature each
-        # call — MITM/tamper-proof). get_prime_directives() reads + parses the
-        # `## Prime Directives` section from that same verified file: subsecond
-        # (local read + sha256 + hash-cached parse), zero bus traffic, and
-        # returns [] on any integrity mismatch so a forged file can never inject
-        # fake directives. (Maker direction 2026-05-28.)
+        # 2. Prime Directives from on-chain Soul NFT
+        # Phase 2 Chunk γ-ext (D-SPEC-78, 2026-05-18) — 5-minute cache.
+        # `plugin.soul.get_active_directives()` is a bus-RPC to the soul
+        # module that takes ~5s on T1. Directives only change when the
+        # Maker updates the on-chain Soul NFT (rare; hours-to-days
+        # cadence). 5-minute TTL is safe + saves 5s per chat.
         # ζ.1: every tier has "directives" (security feature) — never gated
         # off in practice. Check kept defensive in case a future tier omits.
         directives = []
         if "directives" in active_features:
-            try:
-                from titan_hcl.utils.directive_signer import get_prime_directives
-                directives = get_prime_directives()
-            except Exception as e:
-                logger.warning("[PreHook] Directive read failed: %s", e)
-                directives = []
+            directives = _pre_hook_cache_get("active_directives")
+            if directives is None:
+                try:
+                    directives = await plugin.soul.get_active_directives()
+                except Exception as e:
+                    logger.warning("[PreHook] Directive fetch failed: %s", e)
+                    directives = []
+                # Cache with longer TTL (5 min) — directives change rarely.
+                # Use a custom set-with-ttl so we don't disturb the 30s default.
+                _pre_hook_cache_set_with_ttl(
+                    "active_directives", directives, ttl_s=300.0)
         _ph_stage("after_directives_fetch")
 
         # 3. Build state tensor for Gatekeeper (reuse recorder's cached embedder)
@@ -1906,33 +1902,12 @@ def create_post_hook(plugin):
                 # still wins if explicitly supplied". `session` is the production
                 # path. The `agent.session_id` fallback covers any other Agno
                 # versions or in-process overrides.
-                # Agno 2.x `session` kwarg is the AgentSession OBJECT, not a
-                # string — extract its `.session_id`. Using the object directly
-                # str-ifies the entire AgentSession repr (session_data +
-                # metrics, multi-KB) as the chat_id, which (a) bloated
-                # conversation_turn_index.json to ~1GB → json.load OOM/25s on
-                # the chat path, and (b) poisoned the TimeChain `chat:<id>` tag.
-                _ovg_session = kwargs.get("session")
-                _ovg_session_id = (
-                    getattr(_ovg_session, "session_id", None)
-                    if _ovg_session is not None
-                    and not isinstance(_ovg_session, str)
-                    else _ovg_session
-                )
                 _ovg_chat_id = (
                     kwargs.get("session_id")
-                    or _ovg_session_id
+                    or kwargs.get("session")
                     or getattr(agent, "session_id", "")
                     or ""
                 )
-                # Hard guard: chat_id must be a short opaque id, never a blob.
-                _ovg_chat_id = str(_ovg_chat_id or "")
-                if len(_ovg_chat_id) > 256:
-                    logger.warning(
-                        "[PostHook] oversized chat_id (%d chars) — truncating; "
-                        "upstream session kwarg is not a plain id",
-                        len(_ovg_chat_id))
-                    _ovg_chat_id = _ovg_chat_id[:256]
                 # Phase 3 (D-SPEC-127): turn_index now resolves through
                 # synthesis.turn_index_store (P3.B) — caller kwarg still
                 # wins if explicitly supplied (preserves test injection +
@@ -1950,7 +1925,6 @@ def create_post_hook(plugin):
                             "(falling back to 0)", _ti_err)
                         _ovg_turn_index = 0
                 _ovg_turn_index = int(_ovg_turn_index or 0)
-                _ph_stage("ovg_after_turnindex")
 
                 # Phase 3 §7 normative content carry: felt-state snapshot
                 # + tool-calls extraction. Both soft-fail to empty/zero
@@ -1963,10 +1937,8 @@ def create_post_hook(plugin):
                         capture_turn_snapshot, extract_tool_calls,
                     )
                     _p3_snapshot = capture_turn_snapshot()
-                    _ph_stage("ovg_after_snapshot")
                     _p3_tool_calls = extract_tool_calls(
                         getattr(run_output, "tools", None))
-                    _ph_stage("ovg_after_toolcalls")
                 except Exception as _p3_err:
                     logger.warning(
                         "[PostHook:P3] turn snapshot/tool-call extraction "
@@ -1987,10 +1959,8 @@ def create_post_hook(plugin):
                     logger.warning(
                         "[PostHook:P3] topic-tag extraction failed "
                         "(non-blocking): %s", _tx_err)
-                _ph_stage("ovg_after_topictags")
 
                 from titan_hcl.llm_pipeline.verifier import verify_post_async
-                _ph_stage("ovg_pre_verify")
                 _verified = await verify_post_async(
                     response_text,
                     channel="chat",
@@ -2012,7 +1982,6 @@ def create_post_hook(plugin):
                     embedding_hash=_p3_snapshot.get("embedding_hash", ""),
                     importance=_p3_snapshot.get("importance", 0.5),
                 )
-                _ph_stage("ovg_post_verify")
                 response_text = _verified.text
                 if hasattr(run_output, 'content'):
                     run_output.content = response_text

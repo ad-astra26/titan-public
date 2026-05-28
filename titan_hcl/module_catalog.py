@@ -1292,6 +1292,13 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             _bus_constants.META_SKILL_VERIFIED,
             _bus_constants.META_SKILL_REJECTED,
             _bus_constants.META_SKILL_SOFT_RETIRED,
+            # Phase 9 (D-SPEC-PHASE9): SKILL_REPAIR_FORK_SPAWNED is emitted BY
+            # synthesis_worker (SkillFailureTracker, §9.3) — listed so agno +
+            # Observatory can opt in. USER_FEEDBACK_SIGNAL is emitted by
+            # agno_worker on explicit thumbs-up/down; synthesis_worker is the
+            # sole consumer (INV-Syn-24 Tier-2 override via UserFeedbackOverride).
+            _bus_constants.SKILL_REPAIR_FORK_SPAWNED,
+            _bus_constants.USER_FEEDBACK_SIGNAL,
             _bus_constants.KERNEL_EPOCH_TICK,
             _bus_constants.MODULE_SHUTDOWN,
         ],

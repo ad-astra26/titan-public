@@ -175,17 +175,6 @@ def create_agent(plugin: Any, agent_config: Optional[dict] = None):
         tool_call_limit=3,
         store_media=False,
         store_tool_messages=False,
-        #   search_knowledge=False     — Titan supplies all knowledge via the
-        #                               pre-hook's additional_context; no Agno
-        #                               knowledge base is attached (knowledge=
-        #                               unset), so the default True is a no-op
-        #                               we make explicit per agno_reference.md §2.
-        #   compress_tool_results=True — research/art/audio tool outputs are
-        #                               large; compressing them shrinks the
-        #                               context fed to the next round-trip
-        #                               (faster follow-up LLM call + less RSS).
-        search_knowledge=False,
-        compress_tool_results=True,
     )
 
     # ζ.5 (D-SPEC-79, 2026-05-18) — stash provider on plugin so the per-tier
