@@ -3209,23 +3209,6 @@ soft_retire_floor          = -0.5   # below → META_SKILL_SOFT_RETIRED log; row
 # match_procedural_skill always returns null (dry-run).
 delegate_live              = false  # default OFF for safety; flip per-Titan
 
-[synthesis.meta]
-# Phase 9 (D-SPEC-PHASE9) — meta-reasoning integration + strict gate + repair
-# forks + Tier-2. Override per-Titan via ~/.titan/microkernel_<id>.toml.
-recall_engine_enabled         = true   # INV-Syn-22 — route RECALL through EngineRecall
-cited_use_concept_overlap_min = 1      # INV-Syn-23 strict-gate concept-overlap threshold
-cited_use_min_token_len       = 4      # INV-Syn-23 substring-match min token length
-repair_fork_failure_threshold = 3      # §9.3 / §11.5 consecutive-failure threshold
-user_feedback_delta           = 0.15   # INV-Syn-24 Tier-2 utility delta (vs 0.05 oracle)
-recall_parity_soft_fallback   = true   # legacy-resolver fallback during parity soak ONLY
-
-[synthesis.metrics]
-# Phase 10 (D-SPEC-PHASE10) — observatory + metrics (INV-Syn-25, observation only).
-sovereignty_windows           = ["24h", "7d", "all"]  # rolling windows for the headline ratio
-retrieval_latency_ring_size   = 1000   # perf-span ring length per recall reader
-groundedness_heatmap_top_n    = 50     # top-N concepts in the groundedness heatmap
-metrics_snapshot_enabled      = true   # emit synthesis_metrics_snapshot.json
-
 [microkernel]
 
 # ── Memory hygiene daemon (2026-05-01) ─────────────────────────────

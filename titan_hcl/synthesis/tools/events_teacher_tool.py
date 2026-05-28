@@ -57,10 +57,8 @@ class EventsTeacherTool(ToolPlugBase):
         writer,
         router=None,
         invoke_fn: EventsTeacherInvokeFn = _default_invoke_fn,
-        skill_outcome_sink=None,
     ):
-        super().__init__(writer=writer, router=router,
-                         skill_outcome_sink=skill_outcome_sink)
+        super().__init__(writer=writer, router=router)
         self._invoke_fn = invoke_fn
 
     def _execute(self, call: ToolCall) -> dict:
