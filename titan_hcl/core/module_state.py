@@ -348,6 +348,12 @@ class ModuleStateWriter:
             if last_error is not None:
                 self._last_error = last_error
             self._current_state = state
+            # A state write is itself a liveness signal — refresh last_heartbeat
+            # so a freshly-probed module (state→running) doesn't read as stale
+            # (last_heartbeat=0 → now-0 ≫ timeout → instant false heartbeat_timeout
+            # restart, before the heartbeat daemon's first tick). Live T1 boot
+            # crawl 2026-05-28: every module oscillated running↔booted on this.
+            self._last_heartbeat = now
             ver = self._publish_locked(state)
         # Bring up the heartbeat daemon once the worker has begun its lifecycle
         # (first write_state, typically "starting"). Started outside the lock so

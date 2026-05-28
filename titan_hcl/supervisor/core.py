@@ -281,8 +281,12 @@ class Supervisor:
                 continue
 
             # Heartbeat-staleness (CPU-aware grace) — only for a live RUNNING
-            # process that passed the liveness check above.
-            if fault_reason is None and sstate == "running" and spid > 0:
+            # process that passed the liveness check above. shb > 0 guard: a
+            # last_heartbeat of 0 means "not yet heartbeated" (just transitioned
+            # to running), NOT stale — without it, now-0 ≫ timeout falsely fires
+            # an instant heartbeat_timeout on every freshly-probed module. Real
+            # death is caught by the pid-liveness check above, not here.
+            if fault_reason is None and sstate == "running" and spid > 0 and shb > 0:
                 hb_timeout = info.spec.heartbeat_timeout
                 if now - shb > hb_timeout:
                     cpu_now = orch._get_cpu_time_seconds(spid)
