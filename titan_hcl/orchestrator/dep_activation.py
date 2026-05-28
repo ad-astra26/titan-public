@@ -216,19 +216,16 @@ class OrchestratorDepActivationMixin:
             # block in start()), so no deadlock.
             self.start(dep.name)
 
-            # Wait for dep to reach RUNNING + ready_time > 0 (MODULE_READY
-            # observed by Guardian's main loop). Bounded by
-            # SUPERVISION_DEPENDENCY_ACTIVATION_TIMEOUT_S (30s).
-            became_ready = False
-            deadline = time.time() + SUPERVISION_DEPENDENCY_ACTIVATION_TIMEOUT_S
-            while time.time() < deadline:
-                cur = self._modules.get(dep.name)
-                if (cur is not None
-                        and cur.state == ModuleState.RUNNING
-                        and cur.ready_time > 0.0):
-                    became_ready = True
-                    break
-                time.sleep(0.2)
+            # Phase 11 §11.I.2: readiness is SHM-driven. Reuse the canonical
+            # probe-gated wait — it dispatches MODULE_PROBE_REQUEST, polls the
+            # dep's own SHM slot for state=running, and mirrors RUNNING +
+            # ready_time into ModuleInfo. The legacy MODULE_READY→info.state
+            # path this used to poll was DELETED per D1/D2; without this the
+            # dep wait ALWAYS timed out (~90s per dependency on cold boot —
+            # live T1 18-min boot 2026-05-28).
+            became_ready = self._wait_for_module_running(
+                dep.name,
+                timeout_s=SUPERVISION_DEPENDENCY_ACTIVATION_TIMEOUT_S)
 
             if not became_ready:
                 logger.warning(
