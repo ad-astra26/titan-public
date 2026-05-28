@@ -1739,24 +1739,13 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             1 for n, info in self._modules.items()
             if (info.spec.boot_priority or "").lower() == "lazy")
 
-        # Canonical module roster (§11.I.5) — every module the orchestrator
-        # manages, with its boot_priority. Published once here so /v6/readiness
-        # has an authoritative "expected" set to diff against live SHM slots,
-        # instead of guessing from the API route manifest's producer column
-        # (which injected phantom not_booted entries: rust substrate procs,
-        # kernel peers, and `_worker`-suffixed aliases of running modules).
-        roster = tuple(
-            (name, (info.spec.boot_priority or "mandatory").lower())
-            for name, info in self._modules.items())
-
         writer = self._ensure_titan_hcl_state_writer()
         if writer is not None:
             writer.update(
                 boot_phase="booting_a",
                 mandatory_total=len(mandatory),
                 post_boot_total=len(post_boot),
-                lazy_total=lazy_total,
-                roster=roster)
+                lazy_total=lazy_total)
 
         # Continuous probe poller live BEFORE the first spawn so it drives
         # every wave's booted→running concurrently (SPEC §11.I.7 / RFP 11D).
