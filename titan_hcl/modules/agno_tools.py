@@ -529,8 +529,10 @@ def create_tools(plugin):
         top = results[0]
         # Synthesis reader already applied the delegate gate before returning;
         # we just re-check the cascade-flag here (operator's per-Titan toggle).
+        # Default False = conservative dry-run when the attr is unset (agno
+        # boot wires it from config; an unwired plugin must NOT auto-delegate).
         delegate_live = bool(
-            getattr(plugin, "synthesis_delegate_live", True)
+            getattr(plugin, "synthesis_delegate_live", False)
         )
         if not delegate_live:
             return "no match"
