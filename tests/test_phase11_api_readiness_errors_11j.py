@@ -127,19 +127,56 @@ def test_v6_readiness_handles_missing_fleet_slot(tmp_path, monkeypatch):
     assert body["ok"] is True
     # fleet is None — no titan_hcl_state.bin slot exists yet.
     assert body["fleet"] is None
-    # alpha has no SHM slot. Per locked D1 / SPEC §11.I.5 the route discovers
-    # modules via (a) /dev/shm scan + (b) manifest producer set (which lists
-    # every worker known to the v6 surface). The manifest contributes a
-    # not_booted entry for each — alpha wouldn't appear unless it's in the
-    # manifest, but other workers' candidate names DO appear as not_booted
-    # (since no slot has been written yet). The contract we test here is:
-    # no 5xx + the response shape is well-formed + zero running modules.
+    # Per SPEC §11.I.5 (schema v2): the "expected" set is the orchestrator's
+    # roster, published INTO titan_hcl_state.bin. With no fleet slot there is no
+    # roster, so the route reports only modules that have a live SHM slot. No
+    # slot + no roster ⇒ empty module list. (This intentionally REPLACES the old
+    # API-route-manifest producer union, which manufactured phantom not_booted
+    # entries for rust procs, kernel peers, and `_worker` aliases.)
     assert isinstance(body["modules"], list)
+    assert body["modules"] == []
     assert body["module_running_count"] == 0
     assert body["module_state_summary"]["running"] == 0
-    # Every entry from the manifest-derived candidates is not_booted.
-    for m in body["modules"]:
-        assert m["state"] == "not_booted", m
+    assert body["module_state_summary"]["not_booted"] == 0
+
+
+def test_v6_readiness_not_booted_from_roster(tmp_path, monkeypatch):
+    """§11.I.5 schema v2 — a module in the orchestrator-published roster that
+    has no live SHM slot is reported `not_booted` with its boot_priority; a
+    name NOT in the roster (and with no slot) never appears (no phantoms)."""
+    monkeypatch.setenv("TITAN_SHM_ROOT", str(tmp_path))
+    monkeypatch.setenv("TITAN_ID", "test_jr")
+
+    # Roster declares alpha (running, will have a slot) + delta (no slot).
+    fleet_writer = TitanHclStateWriter(titan_id="test_jr")
+    fleet_writer.update(
+        fleet_ready=False, boot_phase="booting_a",
+        mandatory_total=1, post_boot_total=1,
+        roster=(("alpha", "mandatory"), ("delta", "post_boot")))
+    w_a = ModuleStateWriter(
+        module_name="alpha", layer="L2",
+        boot_priority=BootPriority.MANDATORY, titan_id="test_jr", pid=111)
+    w_a.write_state("running")
+
+    app = _app_with_v6_router(["alpha", "delta"])
+    try:
+        with TestClient(app) as client:
+            resp = client.get("/v6/readiness")
+        assert resp.status_code == 200
+        body = resp.json()
+        names = {m["name"]: m for m in body["modules"]}
+        assert names["alpha"]["state"] == "running"
+        # delta is in the roster but has no slot → genuine not_booted, carrying
+        # its declared boot_priority for operator triage.
+        assert names["delta"]["state"] == "not_booted"
+        assert names["delta"]["boot_priority"] == "post_boot"
+        # Nothing outside {roster ∪ live-slots} appears (no manifest phantoms).
+        assert set(names) == {"alpha", "delta"}
+        assert body["module_running_count"] == 1
+        assert body["module_state_summary"]["not_booted"] == 1
+    finally:
+        fleet_writer.close()
+        w_a.close()
 
 
 # ── 3. /v6/errors ────────────────────────────────────────────────────

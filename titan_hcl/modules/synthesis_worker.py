@@ -76,7 +76,6 @@ from titan_hcl.bus import (
     SYNTHESIS_FORK_COMMAND_RESULT,
     SYNTHESIS_BUFFER_COMMAND,
     SYNTHESIS_RECOMPUTE_DONE,
-    USER_FEEDBACK_SIGNAL,
     make_msg,
 )
 from titan_hcl.synthesis.activation import (
@@ -477,7 +476,6 @@ def _recompute_loop(store: "ActivationStore",
                     fork_exporter_holder: dict,
                     fork_activation_updater_holder: dict,
                     oracle_exporter_holder: dict,
-                    metrics_exporter_holder: dict,
                     send_queue, name: str,
                     interval_s: float,
                     stop_event: threading.Event,
@@ -547,14 +545,6 @@ def _recompute_loop(store: "ActivationStore",
                 logger.debug(
                     "[synthesis_worker] oracle_exporter call failed: %s",
                     _ora_exp_err,
-                )
-            # Phase 10 §P10.B — synthesis_metrics_snapshot.json (observation-only).
-            try:
-                metrics_exporter_holder["fn"]()
-            except Exception as _met_exp_err:
-                logger.debug(
-                    "[synthesis_worker] metrics_exporter call failed: %s",
-                    _met_exp_err,
                 )
             status_writer.publish(
                 last_consistent_event_ts=now,
@@ -708,16 +698,13 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # pattern; Phase 6 wiring sets the real exporter callable once
     # OracleRouter/SpendStore/GateConfig are ready).
     oracle_exporter_holder: dict = {"fn": lambda: None}
-    # Phase 10 §P10.B — metrics snapshot exporter holder (late-bound; set to
-    # MetricsAggregator.export once the meter + aggregator are constructed).
-    metrics_exporter_holder: dict = {"fn": lambda: None}
 
     rc_thread = threading.Thread(
         target=_recompute_loop,
         args=(store, bundle_store, status_writer, snapshot_path,
               bundle_snapshot_path, spine_exporter_holder,
               fork_exporter_holder, fork_activation_updater_holder,
-              oracle_exporter_holder, metrics_exporter_holder,
+              oracle_exporter_holder,
               send_queue, name,
               interval_s, stop_event, cache_lock),
         daemon=True, name=f"synthesis-recompute-{name}")
@@ -809,8 +796,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 "[synthesis_worker] Phase 11 write_state(booted) failed: %s",
                 _swb_err)
 
-    events_recorded = 0      # used_by_llm=True → record_access (INV-Syn-23)
-    events_surfaced = 0      # used_by_llm=False → surfaced-not-cited telemetry
+    events_recorded = 0
     bundles_maintained = 0
 
     # ── Phase 4 §P4.G — dream-boundary consolidation pass wiring ──────
@@ -1045,40 +1031,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         (config or {}).get("synthesis", {}).get("fork_gc_live", False)
     )
 
-    # ── Phase 9 P9.D — skill-outcome sink (late-bound) ──────────────────
-    # The ToolPlugs (built in the Phase 6 block below) need a skill-outcome
-    # callback, but skill_store + SkillFailureTracker are built later (Phase 8
-    # block). Use a late-bound holder the sink closes over; fill it after the
-    # Phase 8 block constructs the store + tracker. When unfilled (skill store
-    # disabled), the sink is a no-op. Closes the P8 increment_* gap + drives
-    # repair-fork-on-failure (§9.3 / INV-Syn-24 not — this is the failure loop).
-    _skill_outcome_holder: dict = {"store": None, "tracker": None, "meter": None}
-
-    def _skill_outcome_sink(skill_id: str, success: bool) -> None:
-        _st = _skill_outcome_holder.get("store")
-        _tr = _skill_outcome_holder.get("tracker")
-        _mt = _skill_outcome_holder.get("meter")
-        if _st is not None:
-            try:
-                if success:
-                    _st.increment_success(skill_id)
-                else:
-                    _st.increment_failure(skill_id)
-            except Exception as _se:
-                logger.debug("[synthesis_worker] skill utility update failed: %s", _se)
-        if _tr is not None:
-            try:
-                _tr.record_outcome(skill_id, success=success)
-            except Exception as _te:
-                logger.debug("[synthesis_worker] failure tracker failed: %s", _te)
-        # Phase 10 — a successful delegated skill is a recall-satisfied moment.
-        if _mt is not None and success:
-            try:
-                _mt.record_knowledge_moment()
-                _mt.record_recall_satisfied(kind="skill_delegation")
-            except Exception:
-                pass
-
     # ── Phase 6 §P6.A–K — Oracle middleware + proof middleware + CGN ─────
     # MeaningOraclePlug + 4 ToolPlugs + coverage analyzer + snapshot
     # exporter. Soft-fail: if any dependency is missing the worker keeps
@@ -1249,16 +1201,9 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         # passed in so companion-verdict triggers fire.
         sandbox_tool = CodingSandboxTool(
             writer=writer, router=oracle_router, oracle=sandbox_oracle,
-            skill_outcome_sink=_skill_outcome_sink,
         )
-        events_teacher_tool = EventsTeacherTool(
-            writer=writer, router=oracle_router,
-            skill_outcome_sink=_skill_outcome_sink,
-        )
-        knowledge_tool = KnowledgeTool(
-            writer=writer, router=oracle_router,
-            skill_outcome_sink=_skill_outcome_sink,
-        )
+        events_teacher_tool = EventsTeacherTool(writer=writer, router=oracle_router)
+        knowledge_tool = KnowledgeTool(writer=writer, router=oracle_router)
         # x_research_tool needs a gateway — leave unwired here; the
         # main plugin (TitanHCL) constructs it with the live
         # SocialXGateway. agno_tools fall-back gracefully when missing.
@@ -1513,121 +1458,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 exc, exc_info=True,
             )
 
-    # ── Phase 9 P9.D/P9.E — repair-fork-on-failure + Tier-2 override ────
-    # SkillFailureTracker (consumes the skill-outcome sink → spawns a repair
-    # fork at N consecutive failures, §9.3) + UserFeedbackOverride (INV-Syn-24).
-    # Soft-fail; filled into the late-bound _skill_outcome_holder so the
-    # ToolPlugs' sink (built earlier) drives them.
-    skill_failure_tracker: Optional[Any] = None
-    user_feedback_override: Optional[Any] = None
-    meta_cfg = dict((config or {}).get("synthesis", {}).get("meta", {}) or {})
-    if procedural_skill_store is not None:
-        try:
-            from titan_hcl.synthesis.skill_failure_tracker import SkillFailureTracker
-            from titan_hcl.synthesis.user_feedback import UserFeedbackOverride
-
-            def _tracker_bus_emit(ev: str, payload: dict) -> None:
-                try:
-                    _send(send_queue, ev, name, "all", payload)
-                except Exception:
-                    pass
-
-            # concept_resolver: map a compiled skill → its parent canonical
-            # concept for a repair-fork root. P8 skills compile from tool-call
-            # TXs (no direct skill→concept edge yet), so v1 returns None →
-            # net-new exploration fork ("repair_skill:<id>") per §9.3 (∅ root).
-            # Refinement: root at the spine concept once a skill→concept link
-            # exists.
-            def _skill_concept_resolver(skill_id: str):
-                return None
-
-            if hypothesis_fork_store is not None:
-                skill_failure_tracker = SkillFailureTracker(
-                    fork_store=hypothesis_fork_store,
-                    concept_resolver=_skill_concept_resolver,
-                    bus_emit=_tracker_bus_emit,
-                    failure_threshold=int(
-                        meta_cfg.get("repair_fork_failure_threshold", 3)),
-                )
-            user_feedback_override = UserFeedbackOverride(
-                outer_memory_writer=writer,
-                skill_store=procedural_skill_store,
-                user_feedback_delta=float(meta_cfg.get("user_feedback_delta", 0.15)),
-            )
-            # Fill the late-bound holder so the ToolPlug skill-outcome sink
-            # (built in the Phase 6 block) now drives the P8 utility loop +
-            # the failure tracker.
-            _skill_outcome_holder["store"] = procedural_skill_store
-            _skill_outcome_holder["tracker"] = skill_failure_tracker
-            logger.info(
-                "[synthesis_worker] Phase 9 repair-fork + Tier-2 override ready "
-                "(failure_threshold=%s, feedback_delta=%s, tracker=%s)",
-                meta_cfg.get("repair_fork_failure_threshold", 3),
-                meta_cfg.get("user_feedback_delta", 0.15),
-                "on" if skill_failure_tracker is not None else "off(no fork store)",
-            )
-        except Exception as exc:
-            logger.warning(
-                "[synthesis_worker] Phase 9 P9.D/E wiring failed: %s — "
-                "repair-fork + Tier-2 disabled this session", exc, exc_info=True,
-            )
-
-    # ── Phase 10 §P10.A/B — Observatory metrics (D-SPEC-PHASE10) ────────
-    # SovereigntyRatioMeter (headline) + MetricsAggregator (full bundle →
-    # synthesis_metrics_snapshot.json at the recompute tail). INV-Syn-25:
-    # observation only. Soft-fail. The meter is recorded from the two
-    # unambiguous signals synthesis_worker sees: a cited recall
-    # (used_by_llm=True) and a delegated-skill success (skill_outcome_sink);
-    # surfaced-not-cited marks a knowledge_moment only. (v1 is item-granular;
-    # per-turn denominators are a refinement — the B.6 gate is the trend.)
-    sovereignty_meter: Optional[Any] = None
-    metrics_aggregator: Optional[Any] = None
-    retrieval_latency_ring: Optional[Any] = None
-    metrics_cfg = dict((config or {}).get("synthesis", {}).get("metrics", {}) or {})
-    if bool(metrics_cfg.get("metrics_snapshot_enabled", True)):
-        try:
-            from titan_hcl.synthesis.sovereignty_meter import SovereigntyRatioMeter
-            from titan_hcl.synthesis.metrics_aggregator import (
-                LatencyRing, MetricsAggregator,
-            )
-            sovereignty_meter = SovereigntyRatioMeter(
-                windows=list(metrics_cfg.get("sovereignty_windows", ["24h", "7d", "all"])),
-            )
-            retrieval_latency_ring = LatencyRing(
-                maxlen=int(metrics_cfg.get("retrieval_latency_ring_size", 1000)))
-
-            def _chi_stats_provider() -> dict:
-                # Best-effort chi-budget compliance readout (B.5).
-                try:
-                    ev = getattr(engine_recall, "_evaluator", None)
-                    if ev is not None and hasattr(ev, "get_stats"):
-                        return dict(ev.get_stats() or {})
-                except Exception:
-                    pass
-                return {}
-
-            metrics_snapshot_path = os.path.join(
-                os.environ.get("TITAN_DATA_DIR", "data"),
-                "synthesis_metrics_snapshot.json")
-            metrics_aggregator = MetricsAggregator(
-                sovereignty_meter=sovereignty_meter,
-                snapshot_path=metrics_snapshot_path,
-                data_dir=os.environ.get("TITAN_DATA_DIR", "data"),
-                latency_ring=retrieval_latency_ring,
-                chi_stats_provider=_chi_stats_provider,
-                groundedness_top_n=int(metrics_cfg.get("groundedness_heatmap_top_n", 50)),
-            )
-            metrics_aggregator.export()  # initial snapshot from boot
-            metrics_exporter_holder["fn"] = lambda: metrics_aggregator.export()
-            _skill_outcome_holder["meter"] = sovereignty_meter
-            logger.info(
-                "[synthesis_worker] Phase 10 metrics ready — sovereignty meter "
-                "+ aggregator, snapshot=%s", metrics_snapshot_path)
-        except Exception as exc:
-            logger.warning(
-                "[synthesis_worker] Phase 10 metrics wiring failed: %s — "
-                "observability disabled this session", exc, exc_info=True)
-
     # Phase 8 dream dispatchers — judge BEFORE miner (INV-Syn-21).
     last_llm_judge_started_ts: float = 0.0
     llm_judge_lock = threading.Lock()
@@ -1831,54 +1661,9 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 ts = payload.get("ts")
                 if not isinstance(item_id, str) or not isinstance(ts, (int, float)):
                     continue
-                # INV-Syn-23 strict cited gate (Phase 9): reinforce ONLY items
-                # the LLM actually cited (used_by_llm=True, set by the agno
-                # CitedUseDetector). Surfaced-not-cited (False / legacy-missing)
-                # is telemetry-only — no record_access, no rich-get-richer
-                # runaway (rFP §240). The actr_working_memory_decay contract is
-                # the SPEC-correct authority; this gate makes the producer honest.
-                if payload.get("used_by_llm") is True:
-                    with cache_lock:
-                        store.record_access(item_id, float(ts))
-                    events_recorded += 1
-                    # Phase 10 — a cited recall is a recall-satisfied moment.
-                    if sovereignty_meter is not None:
-                        try:
-                            sovereignty_meter.record_knowledge_moment(float(ts))
-                            sovereignty_meter.record_recall_satisfied(
-                                kind="cited_recall", ts=float(ts))
-                        except Exception:
-                            pass
-                else:
-                    events_surfaced += 1
-                    # Surfaced-not-cited: a knowledge moment that recall did
-                    # not satisfy (the LLM re-derived instead).
-                    if sovereignty_meter is not None:
-                        try:
-                            sovereignty_meter.record_knowledge_moment(float(ts))
-                        except Exception:
-                            pass
-                continue
-
-            if msg_type == USER_FEEDBACK_SIGNAL:
-                # Phase 9 INV-Syn-24 — Tier-2 explicit user feedback override.
-                if user_feedback_override is None:
-                    continue
-                _tc_tx = payload.get("tool_call_tx")
-                _verdict = payload.get("verdict")
-                if not isinstance(_tc_tx, str) or not _tc_tx:
-                    continue
-                try:
-                    user_feedback_override.apply(
-                        tool_call_tx=_tc_tx,
-                        verdict=str(_verdict or ""),
-                        skill_id=payload.get("skill_id"),
-                        source=str(payload.get("source", "explicit")),
-                    )
-                except Exception as _uf_err:
-                    logger.warning(
-                        "[synthesis_worker] user feedback override failed: %s",
-                        _uf_err)
+                with cache_lock:
+                    store.record_access(item_id, float(ts))
+                events_recorded += 1
                 continue
 
             if msg_type == MAINTAIN_BUNDLE:

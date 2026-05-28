@@ -58,16 +58,9 @@ class ToolPlugBase:
         *,
         writer: "OuterMemoryWriter",
         router: Optional["OracleRouter"] = None,
-        skill_outcome_sink=None,
     ):
         self._writer = writer
         self._router = router
-        # Phase 9 (P9.D): callable `(skill_id: str, success: bool) -> None`.
-        # Invoked when a delegated skill's tool call resolves, so the
-        # synthesis_worker can run the P8 utility loop (increment_success/
-        # failure) + the SkillFailureTracker (repair-fork-on-failure, §9.3).
-        # Also closes the P8 gap: increment_success/failure had no live caller.
-        self._skill_outcome_sink = skill_outcome_sink
 
     def capabilities(self) -> list[str]:
         return list(self._capabilities)
@@ -128,17 +121,6 @@ class ToolPlugBase:
         except Exception:
             logger.exception("[%s] write_tool_call failed", self.__class__.__name__)
             parent_tx = None
-
-        # Phase 9 P9.D — feed the skill-outcome loop when this tool call was a
-        # delegated compiled skill. Closes the P8 utility loop (increment_*) +
-        # drives the SkillFailureTracker (repair-fork-on-failure, §9.3). Soft.
-        if call.parent_skill_id and self._skill_outcome_sink is not None:
-            try:
-                self._skill_outcome_sink(call.parent_skill_id, success)
-            except Exception:
-                logger.exception(
-                    "[%s] skill_outcome_sink raised", self.__class__.__name__,
-                )
 
         # Trigger companion verdict if the tool exposes an oracle surface AND
         # the subclass supplies a `_companion_claim_for(call, raw)` mapping.
