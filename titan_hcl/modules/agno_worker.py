@@ -1164,32 +1164,6 @@ def agno_worker_main(recv_queue, send_queue, name: str,
             _lex_err,
         )
 
-    # ── Phase 8.F — delegate_live cascade flag (D-SPEC-PHASE8) ──────
-    # The `match_procedural_skill` agno tool only invokes a compiled skill
-    # when delegate_live is True. Config default = false (safety); per-Titan
-    # override via ~/.titan/microkernel_<id>.toml [synthesis.skill]
-    # delegate_live = true (T3 canary). Wire config → plugin attr so the
-    # tool's `getattr(plugin, "synthesis_delegate_live", ...)` resolves the
-    # operator's intent (NOT the getattr default). Dry-run (false) means
-    # the tool returns "no match" even when a skill matches.
-    try:
-        _skill_cfg = (config or {}).get("synthesis", {}).get("skill", {}) or {}
-        worker_plugin.synthesis_delegate_live = bool(
-            _skill_cfg.get("delegate_live", False)
-        )
-        logger.info(
-            "[AgnoWorker] Phase 8 delegate_live=%s (skill invocation %s)",
-            worker_plugin.synthesis_delegate_live,
-            "LIVE" if worker_plugin.synthesis_delegate_live else "DRY-RUN",
-        )
-    except Exception as _dl_err:
-        # Conservative fallback: dry-run on any config error.
-        worker_plugin.synthesis_delegate_live = False
-        logger.debug(
-            "[AgnoWorker] delegate_live config read failed (%s) — defaulting DRY-RUN",
-            _dl_err,
-        )
-
     # ── SHM publisher (G21 single-writer for agno_state.bin) ──
     try:
         publisher = AgnoStatePublisher(name=name)
