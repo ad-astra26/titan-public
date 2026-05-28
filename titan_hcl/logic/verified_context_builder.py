@@ -808,11 +808,13 @@ class VerifiedContextBuilder:
         all_records.sort(key=lambda r: (r.confidence, r.timestamp), reverse=True)
         records = all_records[:max_records]
 
-        # Synthesis Engine Phase 1 — emit MEMORY_RETRIEVAL_USED per returned
-        # record so synthesis_worker records access (INV-Syn-5 use-gated
-        # reinforcement). Item-id namespace `vcb:<db_ref>` keeps VCB items
-        # distinguishable from `mem:<id>` (memory_nodes from _cognee_search).
-        # Fire-and-forget; failures degrade silently.
+        # Synthesis Engine Phase 1 → Phase 9 strict gate (INV-Syn-23): emit
+        # MEMORY_RETRIEVAL_USED per returned record with used_by_llm=False — the
+        # record was SURFACED into context, not yet cited. The post-LLM
+        # CitedUseDetector (agno) is the sole emitter of used_by_llm=True;
+        # synthesis_worker reinforces (record_access) only on True. Item-id
+        # namespace `vcb:<db_ref>` keeps VCB items distinguishable from
+        # `mem:<id>` (memory_nodes from _cognee_search). Fire-and-forget.
         if self._bus_emit is not None and records:
             now = time.time()
             for rec in records:
@@ -822,6 +824,7 @@ class VerifiedContextBuilder:
                     self._bus_emit("MEMORY_RETRIEVAL_USED", {
                         "item_id": f"vcb:{rec.db_ref}",
                         "ts": now,
+                        "used_by_llm": False,
                     })
                 except Exception as _emit_err:
                     logger.debug(
