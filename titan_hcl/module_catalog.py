@@ -430,8 +430,12 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         heartbeat_timeout=120.0,  # Memory queries can block for 30s+
         reply_only=True,  # Memory only needs targeted QUERY messages, not broadcasts
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="mandatory",
+        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority. Maker 2026-05-28:
+        # HEAVY worker (FAISS/Kuzu/DuckDB cold-load) → Phase B so it doesn't gate
+        # fleet_ready or pile cold-import CPU on mandatory boot. Consumers read
+        # memory_state SHM (graceful-empty until it boots); boot cap bounds the
+        # Phase B spike.
+        boot_priority="post_boot",
     ))
 
     # RL/Sage module (TorchRL — ~2500MB with mmap)
@@ -578,8 +582,10 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=True,  # data/agno_sessions.db is critical-data per §11.H
-        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-        boot_priority="mandatory",
+        # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority. Maker 2026-05-28:
+        # HEAVY worker (agno framework + LLM agent build) → Phase B so chat
+        # readiness doesn't gate fleet_ready; the boot cap bounds its spike.
+        boot_priority="post_boot",
         # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
         dependencies=[
             _mod_dep('memory'),
@@ -725,8 +731,11 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # state=starting. Mirrors the worker-side topics= passed to
             # setup_worker_bus inside cognitive_worker_main.
             broadcast_topics=_COGNITIVE_WORKER_SUBSCRIBE_TOPICS,
-            # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
-            boot_priority="mandatory",
+            # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority. Maker
+            # 2026-05-28: HEAVY worker (269KB, torch reasoning engine cold-load)
+            # → Phase B so it doesn't gate fleet_ready or pile cold-import CPU on
+            # mandatory boot; the boot concurrency cap bounds its spike.
+            boot_priority="post_boot",
             # Phase 11 §11.I.8 / Chunk 11G — §3H.10 dep matrix:
             dependencies=[
                 _mod_dep('memory'),
