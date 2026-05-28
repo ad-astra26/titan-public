@@ -390,6 +390,82 @@ def _make_timechain_resolver(send_queue, pending_registry) -> Callable:
     )
 
 
+# ── Phase 9 (INV-Syn-22): RECALL → EngineRecall in-process routing ────
+
+# Map the legacy resolver categories onto EngineRecall granularities (arch
+# §13.2). These three categories carry the §13.2 RECALL sub-modes that have a
+# direct EngineRecall granularity equivalent: episodic_specific→turn,
+# semantic_neighbors→concept, chain_archive→archive. (procedural + autobiographical
+# granularities are reachable directly on EngineRecall; they have no bus-resolver
+# category to wrap here.)
+_GRANULARITY_BY_CATEGORY: Dict[str, str] = {
+    "episodic_memory": "turn",
+    "semantic_graph": "concept",
+    "chain_archive": "archive",
+}
+
+
+def _query_text_from_ctx(ctx: Optional[dict]) -> str:
+    ctx = ctx or {}
+    for key in ("query_text", "payload_snippet", "topic", "question"):
+        v = ctx.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+    return ""
+
+
+def _make_engine_recall_resolver(
+    *,
+    category: str,
+    granularity: str,
+    engine_recall: Any,
+    legacy_resolver: Callable,
+    soft_fallback: bool,
+) -> Callable:
+    """Wrap a legacy bus-dispatch resolver so RECALL resolves in-process through
+    the SC-op-backed EngineRecall first (INV-Syn-22). On a None result (engine
+    disabled / no embedder / fork empty / failure) the wrapper falls back to the
+    legacy bus resolver ONLY while `soft_fallback` is True (the parity-soak
+    window; removed at cascade-close). EngineRecall.recall is sync + in-process
+    (read-only handles, watermark-gated activation — NO sync bus.request)."""
+
+    async def _resolve(name: str, ctx: Optional[dict] = None) -> Dict[str, Any]:
+        recruiter = f"{category}.{(name or '').strip()}" if name else category
+        query = _query_text_from_ctx(ctx)
+        results = None
+        if query:
+            try:
+                results = engine_recall.recall(query, granularity=granularity)
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.warning(
+                    "[meta_resolvers] EngineRecall(%s) raised: %s",
+                    granularity, exc,
+                )
+                results = None
+        if results is not None:
+            import dataclasses
+            out = [
+                dataclasses.asdict(r) if dataclasses.is_dataclass(r) else r
+                for r in results
+            ]
+            return {
+                "success": True,
+                "output": out,
+                "recruiter": recruiter,
+                "reason": f"engine_recall:{granularity}",
+            }
+        if soft_fallback:
+            return await legacy_resolver(name, ctx)
+        return {
+            "success": False,
+            "output": None,
+            "recruiter": recruiter,
+            "reason": f"engine_recall_empty:{granularity}",
+        }
+
+    return _resolve
+
+
 # ── Category factory map ──────────────────────────────────────────────
 
 
@@ -415,6 +491,14 @@ def register_default_resolvers(
     # reasoning_engine; unused in Session 3 dispatch (all categories now
     # use bus dispatch instead of in-process engine references).
     reasoning_engine: Any = None,
+    # Phase 9 (INV-Syn-22): the cognitive_worker's read-only EngineRecall.
+    # When provided + recall_engine_enabled, the episodic_memory / semantic_graph
+    # / chain_archive categories resolve RECALL in-process through EngineRecall,
+    # falling back to the legacy bus resolver while recall_soft_fallback is True
+    # (the parity-soak window). When None, legacy dispatch is unchanged.
+    engine_recall: Any = None,
+    recall_engine_enabled: bool = True,
+    recall_soft_fallback: bool = True,
 ) -> Dict[str, bool]:
     """Bind Session 3 live-dispatch resolvers to the MetaRecruitment catalog.
     Returns dict {category: registered_bool}.
@@ -452,18 +536,36 @@ def register_default_resolvers(
             registered[category] = True
         return registered
 
+    use_engine = engine_recall is not None and recall_engine_enabled
     for category, factory in _CATEGORY_FACTORIES.items():
         try:
             resolver = factory(
                 send_queue=send_queue,
                 pending_registry=pending_registry,
             )
+            # Phase 9 INV-Syn-22: route RECALL categories through EngineRecall
+            # in-process, with parity-soak fallback to the legacy resolver.
+            if use_engine and category in _GRANULARITY_BY_CATEGORY:
+                resolver = _make_engine_recall_resolver(
+                    category=category,
+                    granularity=_GRANULARITY_BY_CATEGORY[category],
+                    engine_recall=engine_recall,
+                    legacy_resolver=resolver,
+                    soft_fallback=recall_soft_fallback,
+                )
             recruitment.register_resolver(category, resolver)
             registered[category] = True
         except Exception as e:
             logger.warning(
                 "[meta_resolvers] register %s failed: %s", category, e)
             registered[category] = False
+
+    if use_engine:
+        logger.info(
+            "[meta_resolvers] INV-Syn-22: RECALL operator wired to EngineRecall "
+            "for %s (soft_fallback=%s)",
+            sorted(_GRANULARITY_BY_CATEGORY.keys()), recall_soft_fallback,
+        )
 
     logger.info(
         "[meta_resolvers] Session 3 LIVE resolver registration: %d/%d "

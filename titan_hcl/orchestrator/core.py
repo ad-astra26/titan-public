@@ -1739,41 +1739,13 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             1 for n, info in self._modules.items()
             if (info.spec.boot_priority or "").lower() == "lazy")
 
-        # Canonical module roster (§11.I.5) — the set the orchestrator manages
-        # as fleet: autostart modules (brought up at boot) + lazy modules
-        # (brought up on-demand per §11.G.2.5). Published once here so
-        # /v6/readiness has an authoritative "expected" set to diff against live
-        # SHM slots, instead of guessing from the API route manifest's producer
-        # column (which injected phantom not_booted entries: rust substrate
-        # procs, kernel peers, and `_worker`-suffixed aliases of running
-        # modules). Config-disabled modules (autostart=False, not lazy — e.g.
-        # the persistence-writer daemons gated by persistence.enabled) are NOT
-        # expected to run, so they are excluded: their absence is intentional,
-        # not a not_booted failure.
-        roster = tuple(
-            (name, (info.spec.boot_priority or "mandatory").lower())
-            for name, info in self._modules.items()
-            if (info.spec.autostart
-                or (info.spec.boot_priority or "").lower() == "lazy")
-            and getattr(info.spec, "reports_lifecycle_slot", True))
-
-        # Readiness totals are roster-based (lifecycle-reporting modules) — NOT
-        # len(mandatory)/len(post_boot), which include the imw-class persistence
-        # writers that are spawned but never write a running slot. Counting them
-        # in the denominator pinned mandatory_ready below mandatory_total
-        # forever (e.g. 9/12). The boot partition above is unchanged — writers
-        # still spawn; they're just absent from the readiness ready/total math.
-        _roster_mandatory_total = sum(1 for _, p in roster if p == "mandatory")
-        _roster_post_boot_total = sum(1 for _, p in roster if p == "post_boot")
-
         writer = self._ensure_titan_hcl_state_writer()
         if writer is not None:
             writer.update(
                 boot_phase="booting_a",
-                mandatory_total=_roster_mandatory_total,
-                post_boot_total=_roster_post_boot_total,
-                lazy_total=lazy_total,
-                roster=roster)
+                mandatory_total=len(mandatory),
+                post_boot_total=len(post_boot),
+                lazy_total=lazy_total)
 
         # Continuous probe poller live BEFORE the first spawn so it drives
         # every wave's booted→running concurrently (SPEC §11.I.7 / RFP 11D).
