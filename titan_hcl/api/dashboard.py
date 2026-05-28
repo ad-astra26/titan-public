@@ -12241,14 +12241,3 @@ from titan_hcl.api.synthesis_buffer_handlers import (
     get_v6_synthesis_buffers_recent_writes,
     get_v6_synthesis_buffers_snapshot,
 )
-
-# Re-exports from titan_hcl/api/synthesis_skill_handlers.py (P8.H) —
-# JSON-snapshot-backed reads of `data/skills_snapshot.json`
-# (synthesis_worker is the sole writer per INV-Syn-19). Surfaces:
-# skill list, per-skill detail, recent mining passes, §A.6 coverage.
-from titan_hcl.api.synthesis_skill_handlers import (
-    get_v6_synthesis_skills_list,
-    get_v6_synthesis_skills_detail,
-    get_v6_synthesis_skills_recent,
-    get_v6_synthesis_skills_coverage,
-)

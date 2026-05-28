@@ -1,57 +1,60 @@
 #!/usr/bin/env python3
 """
-guardian_hcl.py — Titan L1 supervisor standalone process (Phase 6 / D-SPEC-135 / v1.62.0).
+guardian_hcl.py — Titan L1 supervisor peer process (Phase 11 §11.I.1 / D-SPEC-141 / v1.65.0).
 
 INV-PROC-1: ps identity = `guardian_hcl` (setproctitle first I/O).
-INV-PROC-3: this process boots BEFORE titan_hcl and titan_hcl_api; spawns and
-            supervises them as L2/L3 children alongside the rest of the module
-            catalog (per SPEC §11.B.4).
-INV-PROC-5: independent crash domain — kill -9 titan_hcl does not affect
-            guardian_hcl, and vice versa. titan_hcl_api stays UP through
-            titan_hcl restart.
+INV-PROC-3: kernel-rs spawns guardian_hcl as a peer to titan_hcl + titan_hcl_api
+            (NOT as their parent). Independent crash domain — kill -9 titan_hcl
+            does not affect guardian_hcl, and vice versa.
+INV-PROC-5: titan_hcl_api stays UP through titan_hcl restart.
+
+Phase 11 §11.I.1 split — what lives where:
+
+  Orchestrator (lives in `scripts/titan_hcl.py`):
+    - register / start / stop / restart_module / start_all
+    - lifecycle subscriber for MODULE_*_REQUEST
+    - module spawn + Phase A/B pipeline + probe dispatch + hot-reload
+    - fleet_ready SHM publish (G21 single-writer)
+
+  Supervisor (this process):
+    - heartbeat-stale + RSS + PID-dead fault detection
+    - publishes MODULE_RESTART_REQUEST(dst="guardian_hcl_lifecycle")
+    - holds a metadata-only Orchestrator instance for ModuleSpec lookups
+      (heartbeat_timeout, layer, rss_limit_mb, restart_on_crash, …)
 
 Architecture (SPEC §9.B guardian_hcl block):
   - kernel-rs (Rust L0) spawns scripts/guardian_hcl.py
   - guardian_hcl opens a BusSocketClient to the Rust broker
-    (/tmp/titan_bus_<id>.sock) under name "guardian"
-  - guardian_hcl loads the canonical module catalog
-    (titan_hcl/module_catalog.py:build_catalog) — 51 ModuleSpec registrations
-    moved verbatim from titan_hcl/core/plugin.py:_register_modules
-  - guardian_hcl runs Guardian.start_all() to spawn autostart modules and
-    drives the supervision loop (Guardian.monitor_tick at 1 Hz)
-
-Workers connect to the same broker via setup_worker_bus → BusSocketClient
-in worker_bus_bootstrap.py. The kernel-rs broker fans messages across
-processes by subscriber name (Phase B.2 IPC dual-mode, l0_rust_enabled=true).
+    (/tmp/titan_bus_<id>.sock) under name "guardian" so MODULE_HEARTBEAT
+    / MODULE_READY / MODULE_CRASHED / BUS_PEER_DIED fan out to BOTH
+    titan_hcl (Orchestrator) and this process (Supervisor) — the broker
+    delivers targeted dst="guardian" frames to every subscriber whose
+    name matches (titan-rust/.../broker.rs:653).
+  - build_catalog populates `Orchestrator._modules` with ModuleSpec rows
+    so Supervisor.monitor_tick has the heartbeat_timeout / rss_limit_mb
+    metadata it needs. start_all is NOT called here — titan_hcl spawns
+    the workers; this process just observes their bus events.
 """
-import asyncio
 import logging
 import os
 import signal
 import sys
 import threading
-import time
 
 # Ensure project root is on path
 sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), "..")))
 
 # ── Phase 11 §11.I.5 / Chunk 11L — MALLOC_ARENA_MAX defensive default ──
-# kernel-rs already sets this via build_child_env (titan-kernel-rs/spawn.rs:116)
+# kernel-rs already sets this via build_child_env (titan-kernel-rs/spawn.rs:127)
 # when it spawns guardian_hcl, so this `setdefault` is a no-op in the
 # production fleet boot path. It load-bears under three independent
 # scenarios where guardian_hcl boots WITHOUT the kernel-rs env:
 #   (1) standalone dev runs (`python scripts/guardian_hcl.py`)
 #   (2) systemd unit overrides that strip kernel-spawned env
 #   (3) tests / fixtures that import scripts/guardian_hcl.py directly
-# Children spawned via subprocess.Popen / multiprocessing.Process
-# inherit this value transparently → fleet-wide glibc arena cap of 2
-# (RFP §3F.2.7 9F folded into Phase 11 §3H.2).
 os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
-# ── INV-PROC-1 (SPEC §11.B.4 / D-SPEC-135 / v1.62.0): set ps identity as
-# first I/O after import resolution so `ps -ef` distinguishes the L1 supervisor
-# from `titan_hcl` (L2 plugin) and `titan_hcl_api` (L3). Same soft-fallback
-# pattern as scripts/titan_hcl.py:30-34.
+# ── INV-PROC-1: ps identity ──────────────────────────────────────────
 try:
     import setproctitle as _spt
     _spt.setproctitle("guardian_hcl")
@@ -74,16 +77,18 @@ def setup_logging() -> None:
     )
 
 
+_pid_lock_fd = None  # Module-level for finally-release
+
+
 def _acquire_pid_lock(titan_id: str) -> bool:
     """Prevent multiple guardian_hcl instances per Titan via fcntl.flock.
 
-    Mirrors scripts/titan_hcl.py:_acquire_pid_lock — same defensive
-    O_RDWR|O_CREAT (no truncate-before-lock) pattern. PID file lives at
-    data/guardian_hcl_<titan_id>.pid so T1+T2+T3 can share /dev/shm + data
-    without colliding on a shared lock.
+    Defensive O_RDWR|O_CREAT (no truncate-before-lock) pattern mirroring
+    scripts/titan_hcl.py:_acquire_pid_lock — preserves live PID info on
+    contention so the abort message is diagnosable.
     """
     import fcntl
-    global _pid_lock_fd  # noqa: PLW0603
+    global _pid_lock_fd
 
     pid_path = os.path.join(
         os.path.dirname(__file__), "..", "data",
@@ -118,13 +123,10 @@ def _acquire_pid_lock(titan_id: str) -> bool:
         return False
 
 
-_pid_lock_fd = None  # Module-level for finally-release
-
-
 def _release_pid_lock(titan_id: str) -> None:
     """Release PID lock and remove file on clean shutdown."""
     import fcntl
-    global _pid_lock_fd  # noqa: PLW0603
+    global _pid_lock_fd
 
     if _pid_lock_fd is not None:
         try:
@@ -145,142 +147,22 @@ def _release_pid_lock(titan_id: str) -> None:
         pass
 
 
-def _build_bus_and_client(titan_id: str, config: dict):
-    """Construct DivineBus + outbound BusSocketClient mirroring kernel pattern.
-
-    Mirrors TitanKernel._start_bus_socket_clients but for the guardian_hcl
-    process. Returns (bus, client, identity_secret) tuple.
-
-    The DivineBus serves as the in-process hub for Guardian's local subscribers
-    (the "guardian" subscription registered in Guardian.__init__). The
-    BusSocketClient connects to the Rust broker so:
-      • Workers publishing dst="guardian" reach Guardian via broker fan-out
-      • Guardian's outbound bus.publish() reaches the broker via attached client
-    """
-    from titan_hcl.bus import DivineBus
-    from titan_hcl.core.bus_authkey import derive_bus_authkey
-    from titan_hcl.core.bus_socket import BusSocketClient, bus_sock_path
-    from titan_hcl.core.worker_bus_bootstrap import _try_load_identity_secret
-
-    network_cfg = config.get("network", {})
-    wallet_path = network_cfg.get(
-        "wallet_keypair_path", "data/titan_identity_keypair.json")
-    if not os.path.isabs(wallet_path):
-        wallet_path = os.path.normpath(
-            os.path.join(os.path.dirname(__file__), "..", wallet_path))
-
-    identity_secret = _try_load_identity_secret(wallet_path)
-    if identity_secret is None:
-        raise RuntimeError(
-            f"guardian_hcl cannot start — identity keypair unreadable at "
-            f"'{wallet_path}'. Phase C broker requires the Solana keypair "
-            f"to derive the bus authkey (HKDF-SHA256).")
-
-    authkey = derive_bus_authkey(identity_secret)
-    # bus_sock_path returns a pathlib.Path; coerce to str so env-var
-    # assignments + BusSocketClient (which accepts either, but we set
-    # os.environ below which requires str) are happy.
-    sock_path = str(bus_sock_path(titan_id))
-
-    bus = DivineBus(maxsize=10000)
-
-    # guardian_hcl's connection to the broker. Subscribes to the L1 supervision
-    # topic set per SPEC §9.B guardian_hcl block. broadcast_topics enumerates
-    # the broadcast types Guardian consumes; targeted dst="guardian" messages
-    # bypass the broadcast filter and are routed by name.
-    from titan_hcl.bus import (
-        MODULE_HEARTBEAT, MODULE_READY, MODULE_SHUTDOWN, MODULE_CRASHED,
-        MODULE_RELOAD_REQUEST, BUS_WORKER_ADOPT_REQUEST, BUS_PEER_DIED,
-    )
-    broadcast_topics = [
-        MODULE_HEARTBEAT, MODULE_READY, MODULE_SHUTDOWN, MODULE_CRASHED,
-        MODULE_RELOAD_REQUEST, BUS_WORKER_ADOPT_REQUEST, BUS_PEER_DIED,
-    ]
-
-    client = BusSocketClient(
-        titan_id=titan_id,
-        authkey=authkey,
-        name="guardian",  # the canonical L1 supervisor subscriber name
-        sock_path=sock_path,
-        topics=broadcast_topics,
-        reply_only=False,
-    )
-    client.start()
-    bus.attach_client(client)
-
-    # Set env vars so any subprocess fork inherits broker context.
-    from titan_hcl.core.worker_bus_bootstrap import (
-        ENV_BUS_SOCKET_PATH, ENV_BUS_TITAN_ID, ENV_BUS_KEYPAIR_PATH,
-    )
-    # os.environ requires str values; sock_path + wallet_path may be
-    # pathlib.PosixPath after the D-SPEC-135 refactor. Coerce explicitly
-    # so a PosixPath caller doesn't fail with `TypeError: str expected,
-    # not PosixPath` (caught 2026-05-26 during T1 restart).
-    os.environ[ENV_BUS_SOCKET_PATH] = str(sock_path)
-    os.environ[ENV_BUS_TITAN_ID] = str(titan_id)
-    os.environ[ENV_BUS_KEYPAIR_PATH] = str(wallet_path)
-
-    return bus, client
-
-
-def _start_inbound_dispatcher(bus, client, stop_event: threading.Event) -> threading.Thread:
-    """Drain the BusSocketClient inbound deque into the local DivineBus.
-
-    Mirrors TitanKernel._bus_client_inbound_dispatcher (kernel.py). Inbound
-    messages arrive on `client._inbound: deque` (protected by
-    `client._inbound_lock` + signalled via `client._wake_cond`). We block
-    on `_wake_cond.wait_for(predicate)` until data is available OR the
-    client is stopping, then drain everything pending and re-publish each
-    on the local DivineBus via `publish_in_process` (no broker echo).
-
-    The previous implementation called `client.inbound_q.get(...)` —
-    BusSocketClient has NO `inbound_q` attribute, so the `.get(...)` raised
-    AttributeError every iteration, caught by `except Exception: continue`,
-    and the dispatcher silently looped forever doing nothing. Workers' MODULE_READY
-    and MODULE_HEARTBEAT events arrived at the BusSocketClient but were never
-    relayed to Guardian → Guardian's internal `_modules[name].state` stayed
-    at the post-spawn STARTING value forever → GuardianStatePublisher wrote
-    state="starting" into guardian_state.bin → /health saw 44 modules DEGRADED.
-    Live-found on T3 cascade verification 2026-05-26.
-    """
-    logger = logging.getLogger(__name__)
-    inbound_lock = client._inbound_lock
-    wake_cond = client._wake_cond
-    inbound_deque = client._inbound
-    stop_evt = client._stop_event  # client's own stop
-
-    def _loop():
-        predicate = lambda: bool(inbound_deque) or stop_evt.is_set() or stop_event.is_set()
-        while not stop_event.is_set():
-            with inbound_lock:
-                wake_cond.wait_for(predicate, timeout=1.0)
-                # Drain everything pending under the lock — fast deque pop
-                drained = list(inbound_deque)
-                inbound_deque.clear()
-            for msg in drained:
-                try:
-                    bus.publish_in_process(msg)
-                except Exception as e:  # noqa: BLE001
-                    logger.debug("[guardian_hcl] inbound re-publish error: %s", e)
-
-    t = threading.Thread(
-        target=_loop, name="guardian-hcl-inbound", daemon=True)
-    t.start()
-    return t
-
-
-def _publish_guardian_state(guardian, titan_id: str, stop_event: threading.Event) -> threading.Thread:
+def _publish_guardian_state(orchestrator, titan_id: str, stop_event: threading.Event) -> threading.Thread:
     """Publish guardian_state.bin SHM slot at 1 Hz (Phase A.4 / D-SPEC-70).
 
-    Migrated from TitanKernel._guardian_loop — under Phase 6, guardian_hcl
-    is the canonical writer of guardian_state.bin (G21 single-writer). The
-    api_subprocess + arch_map continue to read this slot unchanged.
+    Phase 11 §11.I.1 / D-SPEC-141: under the split, guardian_hcl remains
+    the canonical writer of guardian_state.bin (G21 single-writer). The
+    orchestrator reference here is the metadata-only instance — its
+    _modules dict is populated by build_catalog + updated by bus events
+    received via the "guardian" subscription, so GuardianStatePublisher
+    sees the same {name: state} view the live Orchestrator in titan_hcl
+    publishes via its own per-module SHM slots.
     """
     pub = None
     try:
         from titan_hcl.logic.guardian_state_publisher import GuardianStatePublisher
         pub = GuardianStatePublisher(titan_id=titan_id)
-        pub.publish(guardian)  # cold-boot first publish
+        pub.publish(orchestrator)
         logging.getLogger(__name__).info(
             "[guardian_hcl] GuardianStatePublisher attached (G21 single-writer)")
     except Exception as e:  # noqa: BLE001
@@ -292,7 +174,7 @@ def _publish_guardian_state(guardian, titan_id: str, stop_event: threading.Event
         while not stop_event.is_set():
             try:
                 if pub is not None:
-                    pub.publish(guardian)
+                    pub.publish(orchestrator)
             except Exception as e:  # noqa: BLE001
                 logging.getLogger(__name__).debug(
                     "[guardian_hcl] state publish error: %s", e)
@@ -300,62 +182,6 @@ def _publish_guardian_state(guardian, titan_id: str, stop_event: threading.Event
 
     t = threading.Thread(
         target=_loop, name="guardian-hcl-state-publish", daemon=True)
-    t.start()
-    return t
-
-
-def _handle_module_lifecycle_requests(bus, guardian, stop_event: threading.Event) -> threading.Thread:
-    """Subscribe to MODULE_*_REQUEST messages from GuardianHCLClient in plugin process.
-
-    Phase 6 § 3C.3 6F bus contract:
-      - MODULE_START_REQUEST   {name}                 → guardian.start(name)
-      - MODULE_STOP_REQUEST    {name, reason}         → guardian.stop(name, reason)
-      - MODULE_RESTART_REQUEST {name, reason, **kw}   → guardian.restart_module(name, reason, **kw)
-      - MODULE_RELOAD_REQUEST already handled by Guardian._process_guardian_messages
-    """
-    from titan_hcl.bus import (
-        MODULE_START_REQUEST, MODULE_STOP_REQUEST, MODULE_RESTART_REQUEST,
-    )
-    q = bus.subscribe(
-        "guardian_hcl_lifecycle",
-        types=[MODULE_START_REQUEST, MODULE_STOP_REQUEST, MODULE_RESTART_REQUEST],
-        reply_only=True,
-    )
-
-    def _loop():
-        from queue import Empty
-        while not stop_event.is_set():
-            try:
-                msg = q.get(timeout=0.5)
-            except Empty:
-                continue
-            except Exception:
-                continue
-            mtype = msg.get("type")
-            payload = msg.get("payload", {}) or {}
-            name = payload.get("name")
-            if not name:
-                continue
-            try:
-                if mtype == MODULE_START_REQUEST:
-                    guardian.start(name)
-                elif mtype == MODULE_STOP_REQUEST:
-                    guardian.stop(name, reason=payload.get("reason", "requested"))
-                elif mtype == MODULE_RESTART_REQUEST:
-                    extra = {k: v for k, v in payload.items()
-                             if k not in ("name", "reason")}
-                    guardian.restart_module(
-                        name,
-                        reason=payload.get("reason", "requested"),
-                        **extra,
-                    )
-            except Exception as e:  # noqa: BLE001
-                logging.getLogger(__name__).warning(
-                    "[guardian_hcl] lifecycle request %s for '%s' failed: %s",
-                    mtype, name, e)
-
-    t = threading.Thread(
-        target=_loop, name="guardian-hcl-lifecycle", daemon=True)
     t.start()
     return t
 
@@ -376,7 +202,7 @@ def run() -> int:
     if not _acquire_pid_lock(titan_id):
         return 1
 
-    # ── Process group leader so SIGTERM cascades to all module children ──
+    # ── Process group leader (kept for legacy SIGTERM forwarding) ────
     try:
         os.setpgrp()
     except OSError:
@@ -393,121 +219,81 @@ def run() -> int:
 
     bus = None
     client = None
-    guardian = None
+    orchestrator = None
     try:
         # ── Bus client to Rust broker ────────────────────────────────
-        bus, client = _build_bus_and_client(titan_id, config)
+        # Subscribes as "guardian" so the broker fans MODULE_HEARTBEAT /
+        # MODULE_READY / MODULE_CRASHED / BUS_PEER_DIED to BOTH this
+        # process (Supervisor) AND titan_hcl (Orchestrator). Each
+        # process's local DivineBus subscribers receive their own copy
+        # via its inbound dispatcher → publish_in_process path.
+        from titan_hcl.bus import (
+            MODULE_HEARTBEAT, MODULE_READY, MODULE_SHUTDOWN, MODULE_CRASHED,
+            MODULE_RELOAD_REQUEST, BUS_WORKER_ADOPT_REQUEST, BUS_PEER_DIED,
+        )
+        from scripts._titan_bus_client_helpers import (
+            build_bus_and_client, start_inbound_dispatcher,
+        )
+        bus, client = build_bus_and_client(
+            titan_id, config,
+            subscriber_name="guardian",
+            broadcast_topics=[
+                MODULE_HEARTBEAT, MODULE_READY, MODULE_SHUTDOWN, MODULE_CRASHED,
+                MODULE_RELOAD_REQUEST, BUS_WORKER_ADOPT_REQUEST, BUS_PEER_DIED,
+            ],
+            reply_only=False,
+        )
         logger.info("[guardian_hcl] bus client connected (name=guardian)")
 
-        # ── Orchestrator + Supervisor instances ──────────────────────
-        # Phase 11 §11.I.1 (D-SPEC-141 / v1.65.0) — orchestrator/supervisor
-        # role split. For 11E.b.1 both classes are co-resident in this same
-        # process (the kernel-rs peer-spawn that physically separates them
-        # lands in 11E.b.2). The `guardian` name is kept locally for the
-        # downstream calls below because they currently use orchestrator
-        # methods directly (start_all, monitor_tick, etc.); the Supervisor's
-        # bus-mediated D5 path is wired but not yet exercised in 11E.b.1.
+        # ── Orchestrator (metadata-only) + Supervisor ────────────────
+        # Phase 11 §11.I.1 / D-SPEC-141: in this peer-spawn topology the
+        # Orchestrator here NEVER calls start_all — titan_hcl owns spawn.
+        # build_catalog still runs so `_modules` carries the ModuleSpec
+        # rows the Supervisor.monitor_tick consults for heartbeat_timeout,
+        # rss_limit_mb, layer, restart_on_crash. State transitions arrive
+        # via bus events (MODULE_READY → info.pid, MODULE_HEARTBEAT →
+        # info.last_heartbeat) handled by `_process_guardian_messages`
+        # at the top of monitor_tick.
         from titan_hcl.orchestrator import Orchestrator
         from titan_hcl.supervisor import Supervisor
-        guardian = Orchestrator(bus, config=config.get("guardian", {}))
-        # _kernel_ref = None: cross-process swap interlock degrades to no-op
-        # (per Orchestrator.start docstring "None in legacy mode → swap
-        # interlock degrades to no-op").
-        guardian._kernel_ref = None
-        supervisor = Supervisor(bus, guardian, config=config.get("guardian", {}))
+        orchestrator = Orchestrator(bus, config=config.get("guardian", {}))
+        orchestrator._kernel_ref = None
+        supervisor = Supervisor(bus, orchestrator, config=config.get("guardian", {}))
         logger.info(
-            "[guardian_hcl] Orchestrator + Supervisor instances constructed "
-            "(Phase 11 §11.I.1 / D-SPEC-141 single-process co-resident)")
+            "[guardian_hcl] Orchestrator (metadata-only) + Supervisor "
+            "constructed (Phase 11 §11.I.1 peer-spawn)")
 
         # ── Module catalog (51 ModuleSpec registrations) ─────────────
         from titan_hcl.module_catalog import build_catalog
-        build_catalog(bus, guardian, config, titan_id=titan_id)
+        build_catalog(bus, orchestrator, config, titan_id=titan_id)
         logger.info(
-            "[guardian_hcl] module catalog built — %d modules registered",
-            len(guardian._modules))
+            "[guardian_hcl] module catalog built — %d modules registered "
+            "(metadata only; titan_hcl owns spawn)",
+            len(orchestrator._modules))
 
         # ── Background loops ─────────────────────────────────────────
-        inbound_t = _start_inbound_dispatcher(bus, client, stop_event)
-        state_t = _publish_guardian_state(guardian, titan_id, stop_event)
-        lifecycle_t = _handle_module_lifecycle_requests(bus, guardian, stop_event)
-
-        # ── Boot autostart modules ───────────────────────────────────
-        # Phase 11 §11.I.7 / G21 single-writer (D-SPEC-141) — mark this
-        # process as the canonical writer of titan_hcl_state.bin so the
-        # Orchestrator's _ensure_titan_hcl_state_writer creates the writer
-        # here and ONLY here. Non-canonical processes (api subprocess
-        # mini-orchestrators, test fixtures) inherit the absence of this
-        # env var and silently skip the publish, eliminating the slot
-        # clobbering observed live 2026-05-27.
-        os.environ["TITAN_HCL_STATE_WRITER_CANONICAL"] = "1"
-        guardian.start_all()
-        logger.info(
-            "[guardian_hcl] start_all complete — modules: %s",
-            list(guardian._modules.keys()))
-
-        # ── Spawn titan_hcl (L2 plugin process) ──────────────────────
-        # SPEC §11.B.4 / D-SPEC-135 / v1.62.0 — guardian_hcl is the parent
-        # of titan_hcl per INV-PROC-3. titan_hcl runs the TitanKernel +
-        # TitanHCL plugin: kernel_rpc server (api needs this), proxies,
-        # agency/sovereignty/meditation coordination loops, FastAPI when
-        # api_process_separation is off, etc. We spawn via subprocess.Popen
-        # so titan_hcl gets its own clean process tree and inherits the
-        # broker env vars set by _build_bus_and_client (titan_hcl's
-        # BusSocketClient picks them up via the kernel boot path).
-        import subprocess
-        repo_root = os.path.normpath(os.path.join(
-            os.path.dirname(__file__), ".."))
-        titan_hcl_cmd = [
-            sys.executable, "-u",
-            os.path.join(repo_root, "scripts", "titan_hcl.py"),
-            "--server",
-        ]
-        logger.info("[guardian_hcl] spawning titan_hcl: %s", " ".join(titan_hcl_cmd))
-        titan_hcl_proc = subprocess.Popen(
-            titan_hcl_cmd,
-            cwd=repo_root,
-            env={**os.environ, "TITAN_BUS_SOCKET_PATH": os.environ.get(
-                "TITAN_BUS_SOCKET_PATH", "")},
-            stdout=None, stderr=None,
-        )
-        logger.info("[guardian_hcl] titan_hcl spawned (pid=%d)", titan_hcl_proc.pid)
+        start_inbound_dispatcher(bus, client, stop_event)
+        _publish_guardian_state(orchestrator, titan_id, stop_event)
 
         # ── Main supervision loop ────────────────────────────────────
-        # Phase 11 §11.I.1 / D-SPEC-141 — supervisory loop owned by Supervisor
-        # (per locked D5). supervisor.monitor_tick() drains orchestrator's
-        # bus queue, then runs fault detection + RSS budget enforcement,
-        # publishing MODULE_RESTART_REQUEST on fault (translated back to
-        # orchestrator.restart_module by the lifecycle subscriber thread).
-        # drain_send_queues remains on the orchestrator (spawn-side concern).
+        # Phase 11 §11.I.1 — supervisor.monitor_tick drains the
+        # orchestrator's bus queue (BUS_PEER_DIED + MODULE_HEARTBEAT +
+        # MODULE_READY + BUS_WORKER_ADOPT_REQUEST + MODULE_RELOAD_REQUEST),
+        # then runs fault detection + RSS budget enforcement. On fault it
+        # publishes MODULE_RESTART_REQUEST(dst="guardian_hcl_lifecycle")
+        # which the lifecycle subscriber in titan_hcl translates back
+        # into orchestrator.restart_module via _start_lifecycle_subscriber.
+        # drain_send_queues remains a no-op here (no workers were spawned
+        # by this orchestrator; info.send_queue is None for all modules).
         logger.info("[guardian_hcl] supervision loop entered (Supervisor-driven, Phase 11 §11.I.1)")
         while not stop_event.is_set():
             try:
                 supervisor.monitor_tick()
-                guardian.drain_send_queues()
             except Exception as e:  # noqa: BLE001
                 logger.error("[guardian_hcl] supervision tick error: %s", e, exc_info=True)
             stop_event.wait(timeout=1.0)
 
-        logger.info("[guardian_hcl] supervision loop exited — stopping modules")
-        try:
-            guardian.stop_all(reason="shutdown")
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[guardian_hcl] stop_all error: %s", e)
-
-        # Terminate titan_hcl child cleanly
-        try:
-            if titan_hcl_proc.poll() is None:
-                logger.info("[guardian_hcl] terminating titan_hcl child (pid=%d)",
-                            titan_hcl_proc.pid)
-                titan_hcl_proc.terminate()
-                try:
-                    titan_hcl_proc.wait(timeout=10.0)
-                except subprocess.TimeoutExpired:
-                    logger.warning("[guardian_hcl] titan_hcl did not exit in 10s — SIGKILL")
-                    titan_hcl_proc.kill()
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[guardian_hcl] titan_hcl shutdown error: %s", e)
-
+        logger.info("[guardian_hcl] supervision loop exited")
         return 0
 
     except Exception as e:  # noqa: BLE001
@@ -516,11 +302,14 @@ def run() -> int:
 
     finally:
         try:
-            if guardian is not None:
-                # _module_ready_publisher thread + restart_executor cleanup
-                guardian._module_ready_publisher_stop.set()
+            if orchestrator is not None:
+                # _module_ready_publisher thread + restart_executor cleanup.
+                # restart_executor is dormant here (no restart_module calls
+                # ever route to this orchestrator) but the ThreadPoolExecutor
+                # was instantiated in __init__ so close it cleanly.
+                orchestrator._module_ready_publisher_stop.set()
                 try:
-                    guardian._restart_executor.shutdown(wait=False)
+                    orchestrator._restart_executor.shutdown(wait=False)
                 except Exception:
                     pass
         except Exception:

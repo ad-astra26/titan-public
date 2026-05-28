@@ -569,36 +569,6 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         save_state_cb=_b1_save_state,
     )
 
-    # ── Phase 8.Y fold-in: lexicon snapshot exporter (D-SPEC-PHASE8) ────
-    # Writes data/cgn_lexicon_snapshot.json on a 5-min cadence + emits
-    # CGN_LEXICON_UPDATED so agno_worker refreshes its `plugin.cgn_lexicon`
-    # cache (P7 `_ground_for_goal_hook` becomes able to return real
-    # concept_ids). Soft-fail throughout.
-    _LEXICON_EXPORT_INTERVAL_S = 300.0  # 5 minutes
-    _last_lexicon_export = 0.0
-
-    def _maybe_export_lexicon_snapshot() -> None:
-        nonlocal _last_lexicon_export
-        now_ts = time.time()
-        if now_ts - _last_lexicon_export < _LEXICON_EXPORT_INTERVAL_S:
-            return
-        _last_lexicon_export = now_ts
-        try:
-            from titan_hcl.cgn.lexicon_exporter import export_lexicon
-            payload = export_lexicon()
-            if payload is None:
-                return
-            _send_msg(send_queue, bus.CGN_LEXICON_UPDATED, name, "all", {
-                "ts": payload.get("ts", now_ts),
-                "lexicon_size": payload.get("lexicon_size", 0),
-            })
-            logger.debug(
-                "[CGNWorker] cgn_lexicon_snapshot exported — size=%d",
-                payload.get("lexicon_size", 0),
-            )
-        except Exception as e:
-            logger.debug("[CGNWorker] lexicon export failed: %s", e)
-
     def _maybe_publish_cgn_stats() -> None:
         """Periodic (30s) publish of CGN_STATS_UPDATED + cgn_engine_state SHM.
         Phase C dissolution (2026-05-22): called from BOTH the idle (Empty) path
@@ -682,7 +652,6 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             # _maybe_publish_cgn_stats docstring; idle is the common case on a
             # low-traffic Titan, where the in-message-path block never ran).
             _maybe_publish_cgn_stats()
-            _maybe_export_lexicon_snapshot()
             continue
 
         msg_type = msg.get("type", "")
@@ -725,8 +694,6 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         # CGN_STATS_UPDATED + cgn_engine_state periodic publish (30s) — also on
         # the message path (high-traffic case). See _maybe_publish_cgn_stats.
         _maybe_publish_cgn_stats()
-        # P8.Y fold-in: lexicon snapshot export on 5-min cadence
-        _maybe_export_lexicon_snapshot()
 
         # ── CGN_TRANSITION — experience from any consumer ──────────
         if msg_type == "CGN_TRANSITION":

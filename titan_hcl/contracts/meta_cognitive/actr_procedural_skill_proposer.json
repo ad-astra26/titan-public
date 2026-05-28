@@ -1,29 +1,19 @@
 {
   "contract_id": "actr_procedural_skill_proposer",
-  "version": 2,
+  "version": 1,
   "contract_type": "genesis",
   "author": "titan",
-  "description": "ACT-R skill-compilation proposer (arch §13.3 / §8.4, PLAN_synthesis_engine_Phase8.md §P8.E, D-SPEC-PHASE8). Phase 8 graduates this from the P2 TIMER stub into a real dream-boundary trigger: FORK_READ the last 168h of procedural-fork tool-call TXs filtered to scored_by ∈ {oracle, llm} (Tier-1-verified per INV-Syn-15), then emit META_SKILL_COMPILATION_CANDIDATE when ≥ (miner_min_seq_len × miner_min_occurrences) traces accumulate — the minimum material the ProceduralMiner needs to find one recurrent sequence. The actual recurrence detection lives in synthesis/procedural_miner.py (canonicalize_call + cluster_sequences + filter_recurrent); this contract is the upstream gate that wakes the miner, NOT the matcher itself (arch §13.2 separation of concerns; RuleEvaluator stays model-free per D-P2-3).",
+  "description": "ACT-R skill-compilation proposer (arch §12.3, PLAN_synthesis_engine_Phase2.md §2C.b, D-P2-8). Ships as a TIMER in Phase 2: at the dream boundary / genesis seal, FORK_READ the last 168h of procedural-fork TXs; if ≥10 traces accumulated, emit META_SKILL_COMPILATION_CANDIDATE so the (Phase 8) skill miner wakes and does the actual tool-call-shape grouping + recurrence detection (the matcher itself stays Phase 8 per arch §8.4 — the contract here is the TRIGGER that gates the wake, NOT the matcher). The GROUP_BY op landed in PLAN §2A is what Phase 8 will use INSIDE the miner; the count threshold here is the upstream gate.",
   "rules": [
+    {"op": "FORK_READ", "fork": "procedural", "since_hours": 168, "limit": 500, "store": "$traces"},
     {
-      "op": "FORK_READ",
-      "fork": "procedural",
-      "filter": {"thought_type": "tool_call", "scored_by_in": ["oracle", "llm"]},
-      "since_hours": 168,
-      "limit": 5000,
-      "store": "$tier1_traces"
-    },
-    {
-      "op": "IF", "field": "$tier1_traces.length", "cmp": "GTE", "value": 6,
+      "op": "IF", "field": "$traces.length", "cmp": "GTE", "value": 10,
       "then": {
         "action": "emit",
         "event": "META_SKILL_COMPILATION_CANDIDATE",
         "data": {
           "reason": "dream_boundary_skill_scan",
-          "phase": "p8_skill_miner_20260527",
-          "min_seq_len": 2,
-          "min_occurrences": 3,
-          "trace_count_var": "$tier1_traces.length"
+          "phase": "p2_actr_defaults_20260524"
         }
       }
     }
@@ -31,5 +21,5 @@
   "triggers": ["genesis_seal", "dream_boundary"],
   "fork_scope": "procedural",
   "status": "active",
-  "phase": "p8_skill_miner_20260527"
+  "phase": "p2_actr_defaults_20260524"
 }

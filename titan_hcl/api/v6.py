@@ -498,22 +498,6 @@ _T = (
     ("/v6/synthesis/buffers/snapshot", "GET",
      "get_v6_synthesis_buffers_snapshot", "synthesis", "readout",
      None, None, (), ("synthesis_worker",), False, None),
-    # Phase 8 (D-SPEC-PHASE8, 2026-05-27): procedural skill miner readout.
-    # Reads skills_snapshot.json (written atomically by synthesis_worker
-    # via ProceduralSkillStore — sole writer per INV-Syn-19). Coverage
-    # route derives §A.6 readout from the chain index (read-only sqlite).
-    ("/v6/synthesis/skills", "GET",
-     "get_v6_synthesis_skills_list", "synthesis", "readout",
-     None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/skills/detail", "GET",
-     "get_v6_synthesis_skills_detail", "synthesis", "readout",
-     None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/skills/recent", "GET",
-     "get_v6_synthesis_skills_recent", "synthesis", "readout",
-     None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/skills/coverage", "GET",
-     "get_v6_synthesis_skills_coverage", "synthesis", "readout",
-     None, None, (), ("synthesis_worker",), False, None),
 )
 
 

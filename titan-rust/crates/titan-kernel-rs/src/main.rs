@@ -87,22 +87,19 @@ async fn main() -> ExitCode {
     let skip_python = std::env::var("TITAN_KERNEL_SKIP_PYTHON")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    // Phase 11 §11.I.1 / D-SPEC-141 — kernel-rs CAN peer-spawn titan_hcl
-    // + titan_hcl_api as siblings to guardian_hcl. Gated on a separate env
-    // var (default OFF) until the Python side ships: scripts/titan_hcl.py
-    // rewritten as the orchestrator entry (currently the Agno-launcher
-    // for the L2 plugin) AND scripts/guardian_hcl.py stops Popen'ing
-    // titan_hcl AND scripts/titan_hcl_api.py exists. Flipping ON
-    // prematurely would double-spawn titan_hcl (kernel + guardian). After
-    // the Python rewrite cascades T3 → T2 → T1 green, the gate flips on
-    // by default + this env var goes away.
-    let peer_spawn_python = std::env::var("TITAN_KERNEL_PEER_SPAWN_PYTHON")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    // Phase 11 §11.I.1 / D-SPEC-141 — kernel-rs peer-spawns titan_hcl +
+    // titan_hcl_api as siblings to guardian_hcl. Python side shipped:
+    //   * scripts/titan_hcl.py owns Orchestrator + start_all + lifecycle
+    //   * scripts/guardian_hcl.py reduced to Supervisor (no Popen)
+    //   * scripts/titan_hcl_api.py is the L3 peer entry-point
+    // INV-PROC-3 / INV-PROC-5 hold: independent crash domains, titan_hcl_api
+    // stays UP through titan_hcl restart. TITAN_KERNEL_SKIP_PYTHON remains
+    // the test-only escape hatch (rFP_phase_c_bus_authkey_contract_fix §3
+    // cross-language integration tests).
     let options = KernelRunOptions {
         spawn_guardian_hcl: !skip_python,
-        spawn_titan_hcl: !skip_python && peer_spawn_python,
-        spawn_titan_hcl_api: !skip_python && peer_spawn_python,
+        spawn_titan_hcl: !skip_python,
+        spawn_titan_hcl_api: !skip_python,
         ..KernelRunOptions::default()
     };
 
