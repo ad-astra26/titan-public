@@ -814,27 +814,31 @@ def create_pre_hook(plugin):
             logger.debug("[PreHook] Recall perturbation failed: %s", _rp_err)
 
         _ph_stage("after_user_memory_and_perturbation")
-        # 2. Prime Directives from on-chain Soul NFT
-        # Phase 2 Chunk γ-ext (D-SPEC-78, 2026-05-18) — 5-minute cache.
-        # `plugin.soul.get_active_directives()` is a bus-RPC to the soul
-        # module that takes ~5s on T1. Directives only change when the
-        # Maker updates the on-chain Soul NFT (rare; hours-to-days
-        # cadence). 5-minute TTL is safe + saves 5s per chat.
+        # 2. Prime Directives — read DIRECTLY from the signed, integrity-verified
+        # constitution file (titan_constitution.md), NOT via a bus-RPC.
+        #
+        # Prime directives are Titan's anti-jailbreak / anti-hallucination
+        # safeguard and MUST be injected into every LLM call. The prior path
+        # (`plugin.soul.get_active_directives()`) was a bus-RPC to the soul
+        # module that cost ~5s on T1 — the single largest pre-hook stall, paid
+        # on every chat including a bare "hello". The directives' canonical
+        # source is the SIGNED constitution (verify_directives at the top of
+        # this hook already confirms its hash matches the stored signature each
+        # call — MITM/tamper-proof). get_prime_directives() reads + parses the
+        # `## Prime Directives` section from that same verified file: subsecond
+        # (local read + sha256 + hash-cached parse), zero bus traffic, and
+        # returns [] on any integrity mismatch so a forged file can never inject
+        # fake directives. (Maker direction 2026-05-28.)
         # ζ.1: every tier has "directives" (security feature) — never gated
         # off in practice. Check kept defensive in case a future tier omits.
         directives = []
         if "directives" in active_features:
-            directives = _pre_hook_cache_get("active_directives")
-            if directives is None:
-                try:
-                    directives = await plugin.soul.get_active_directives()
-                except Exception as e:
-                    logger.warning("[PreHook] Directive fetch failed: %s", e)
-                    directives = []
-                # Cache with longer TTL (5 min) — directives change rarely.
-                # Use a custom set-with-ttl so we don't disturb the 30s default.
-                _pre_hook_cache_set_with_ttl(
-                    "active_directives", directives, ttl_s=300.0)
+            try:
+                from titan_hcl.utils.directive_signer import get_prime_directives
+                directives = get_prime_directives()
+            except Exception as e:
+                logger.warning("[PreHook] Directive read failed: %s", e)
+                directives = []
         _ph_stage("after_directives_fetch")
 
         # 3. Build state tensor for Gatekeeper (reuse recorder's cached embedder)
