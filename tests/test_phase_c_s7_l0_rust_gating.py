@@ -422,40 +422,43 @@ class TestKernelSupervisorWiring:
     production AND wire kernel→substrate + kernel→python_main +
     substrate→unified-spirit through the titan-core Supervisor framework."""
 
-    def test_main_rs_flips_spawn_python_to_true(self):
-        """main.rs constructs KernelRunOptions so production boot spawns
-        titan_HCL (Gap A).
+    def test_main_rs_peer_spawns_python_plugin(self):
+        """main.rs constructs KernelRunOptions so production boot peer-spawns
+        the Python plugin (Gap A — updated for Phase 11 §11.I.1 peer-spawn).
 
-        Production must spawn Python by default. The implementation derives
-        the flag from `!std::env::var("TITAN_KERNEL_SKIP_PYTHON")` so
-        cross-language integration tests can opt out by setting that env
-        var — production never sets it, so production gets spawn_python=true.
+        Phase 11 (D-SPEC-141, commit cf3dc86e) replaced the single
+        `spawn_python` flag with the peer-spawn trio: the kernel spawns
+        `titan_hcl` (Orchestrator + start_all + L2/L3 modules), `guardian_hcl`
+        (Supervisor) and `titan_hcl_api` (L3) as siblings. Production must
+        spawn them by default; cross-language integration tests opt out via
+        `TITAN_KERNEL_SKIP_PYTHON=1`, so the flags derive from `!skip_python`.
+        Without this the kernel boots the Rust tree but never spawns the Python
+        orchestrator → Titan brain-dead under l0_rust=true.
 
-        This test accepts either form:
-          - Literal `spawn_python: true` (simple production-only main.rs)
-          - `spawn_python: !skip_python` (current production main.rs with
-            opt-out env var for integration tests)
+        Accepts the literal `true` or the `!skip_python` opt-out form.
         """
         src = _read_source("titan-rust/crates/titan-kernel-rs/src/main.rs")
-        # Accept literal `true` OR the `!skip_python` opt-out pattern (which
-        # defaults to true when TITAN_KERNEL_SKIP_PYTHON is unset).
+        # The orchestrator (titan_hcl) IS the Python plugin that runs Guardian
+        # /L2/L3 + start_all. Accept literal `true` OR the `!skip_python`
+        # opt-out (defaults to true when TITAN_KERNEL_SKIP_PYTHON is unset).
         m_literal = re.search(
-            r'KernelRunOptions\s*\{[^}]*spawn_python:\s*true',
+            r'KernelRunOptions\s*\{[^}]*spawn_titan_hcl:\s*true',
             src,
             re.DOTALL,
         )
         m_optout = re.search(
-            r'KernelRunOptions\s*\{[^}]*spawn_python:\s*!\s*skip_python',
+            r'KernelRunOptions\s*\{[^}]*spawn_titan_hcl:\s*!\s*skip_python',
             src,
             re.DOTALL,
         )
         assert m_literal is not None or m_optout is not None, (
-            "main.rs must set spawn_python=true on the production "
-            "KernelRunOptions (Phase C C-S7 Gap A — without this the "
-            "kernel boots Rust tree but never spawns the Python plugin, "
-            "leaving Titan brain-dead under l0_rust=true). Accepted "
-            "patterns: `spawn_python: true` OR `spawn_python: !skip_python` "
-            "with TITAN_KERNEL_SKIP_PYTHON env var opt-out."
+            "main.rs must peer-spawn the Python plugin in production "
+            "(Phase 11 §11.I.1 / D-SPEC-141 — `spawn_titan_hcl: !skip_python` "
+            "on the production KernelRunOptions). Without it the kernel boots "
+            "the Rust tree but never spawns the Python orchestrator, leaving "
+            "Titan brain-dead under l0_rust=true. Accepted: `spawn_titan_hcl: "
+            "true` OR `spawn_titan_hcl: !skip_python` with "
+            "TITAN_KERNEL_SKIP_PYTHON opt-out."
         )
 
     def test_kernel_supervisor_module_exists(self):

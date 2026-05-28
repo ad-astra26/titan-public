@@ -317,6 +317,28 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         # publication (kernel-rs falls back to its existing process-health
         # check). See `feedback_phase_c_async_only_state_lookup`.
         self._titan_hcl_state_writer = None  # set lazily on first phase write
+        # Phase 11 §11.I.7 / RFP §3H Chunk 11D — continuous 1Hz SHM probe
+        # poller. THE single, always-on prober: reads every registered module
+        # slot at 1Hz and, on observing state=BOOTED, dispatches
+        # MODULE_PROBE_REQUEST (worker → probing → running). Covers cold-boot,
+        # post-restart, AND lazy-activation with one mechanism — the piece
+        # whose absence left workers stuck `booted` forever (live T1
+        # 2026-05-28: 30/40 modules alive+heartbeating but never promoted
+        # because the ONLY prober was the per-module boot wait). Started in
+        # start_all (only the titan_hcl orchestrator calls start_all;
+        # guardian_hcl never does, so the poller never runs in the supervisor
+        # process → no double-probe). Stopped in stop_all.
+        self._probe_poll_interval_s: float = max(
+            0.2, float(cfg.get("probe_poll_interval_s", 1.0)))
+        # Per-module re-fire window: a worker that missed the first probe (bus
+        # subscribe bootstrap race) gets re-probed, but we never flood. Cleared
+        # the instant a slot leaves `booted` so a future re-boot re-probes
+        # promptly.
+        self._probe_refire_interval_s: float = max(
+            1.0, float(cfg.get("probe_refire_interval_s", 3.0)))
+        self._probe_dispatched_at: dict[str, float] = {}
+        self._probe_poller_stop = threading.Event()
+        self._probe_poller_thread: Optional[threading.Thread] = None
 
     def register(self, spec: ModuleSpec) -> None:
         """Register a module specification. Does not start the module."""
@@ -1061,6 +1083,26 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             "error": None,
         }
 
+    def _write_disabled_to_slot(self, name: str) -> None:
+        """Publish the terminal `disabled` state to a module's SHM slot after
+        the orchestrator disables it (SPEC §11.I.4).
+
+        The worker was just stopped (pid dead) so this is G21-safe. Without it,
+        guardian_hcl's 1Hz SHM poll keeps reading the slot's stale
+        `running`/`booted` + dead pid → endlessly re-requests restarts of a
+        module the orchestrator already gave up on. Writing `disabled` makes the
+        supervisor skip it cleanly (`sstate in ('stopped','disabled') → continue`).
+        """
+        try:
+            from titan_hcl.core.module_state import write_terminal_module_state
+            from titan_hcl.core.state_registry import resolve_titan_id
+            write_terminal_module_state(
+                name, "disabled", titan_id=resolve_titan_id())
+        except Exception as e:  # noqa: BLE001 — best-effort terminal write
+            logger.debug(
+                "[Orchestrator] disabled-slot write for '%s' failed: %s",
+                name, e)
+
     def _handle_escalation(
         self, name: str, info: "ModuleInfo", reason: str, now: float,
     ) -> None:
@@ -1144,6 +1186,7 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             self.stop(name, reason="escalation_terminate")
             info.state = ModuleState.DISABLED
             info.disabled_at = now
+            self._write_disabled_to_slot(name)
             self.bus.publish(make_msg(MODULE_CRASHED, "guardian", "core", {
                 "module": name, "reason": "escalation_terminate",
                 "restarts": len(info.restart_timestamps),
@@ -1154,6 +1197,7 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             self.stop(name, reason="escalation_halt")
             info.state = ModuleState.DISABLED
             info.disabled_at = now
+            self._write_disabled_to_slot(name)
             self.bus.publish(make_msg(MODULE_CRASHED, "guardian", "core", {
                 "module": name, "reason": "escalation_halt",
                 "restarts": len(info.restart_timestamps),
@@ -1264,6 +1308,196 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 mandatory.append(n)
         return mandatory, post_boot, lazy
 
+    # ── Phase 11 §11.I.7 / RFP 11D — continuous probe poller (sole prober) ──
+
+    def _maybe_dispatch_probe(self, name: str, sstate: str, now: float) -> None:
+        """Dispatch MODULE_PROBE_REQUEST to `name` iff its slot is at `booted`
+        and the per-module re-fire window has elapsed (SPEC §11.I.2 / §11.I.7).
+
+        Shared by the continuous poller AND `_wait_for_module_running` /
+        `_wait_for_wave_running` via the single `self._probe_dispatched_at`
+        throttle map, so the two paths can never double-probe: whichever fires
+        first stamps the timestamp; the other respects the window. Fire-and-
+        forget publish (non-blocking, §8.0.ter); the SHM slot's transition to
+        `running` is the authoritative readiness signal (locked D1), so no bus
+        reply is awaited here.
+        """
+        if sstate != "booted":
+            # Not awaiting a probe (starting / probing / running / terminal):
+            # clear the marker so a future re-boot of this slot re-probes
+            # without waiting out a stale window.
+            self._probe_dispatched_at.pop(name, None)
+            return
+        last = self._probe_dispatched_at.get(name, 0.0)
+        if now - last < self._probe_refire_interval_s:
+            return
+        self._probe_dispatched_at[name] = now
+        try:
+            self.bus.publish(make_msg(
+                MODULE_PROBE_REQUEST, "titan_hcl", name,
+                {"name": name, "probe_id": uuid.uuid4().hex}))
+        except Exception:  # noqa: BLE001 — probe publish must never crash poll
+            pass
+
+    def _ensure_probe_poller_started(self) -> None:
+        """Start the continuous 1Hz probe poller thread once (idempotent).
+
+        Called at the top of start_all. Only the titan_hcl orchestrator process
+        calls start_all, so the poller is exclusive to it (guardian_hcl builds a
+        metadata-only Orchestrator and never calls start_all → never probes).
+        """
+        if (self._probe_poller_thread is not None
+                and self._probe_poller_thread.is_alive()):
+            return
+        self._probe_poller_stop.clear()
+        t = threading.Thread(
+            target=self._probe_poll_loop,
+            name="orchestrator-probe-poller",
+            daemon=True,
+        )
+        self._probe_poller_thread = t
+        t.start()
+        logger.info(
+            "[Orchestrator] probe poller started — 1Hz SHM scan, probes any "
+            "module observed at state=booted (SPEC §11.I.7 / RFP 11D)")
+
+    def _probe_poll_loop(self) -> None:
+        """1Hz loop: SPEC §11.I.7 'titan_hcl detects BOOTED via 1Hz SHM poll →
+        emits MODULE_PROBE_REQUEST', applied continuously (boot + steady-state).
+        Also refreshes titan_hcl_state.bin live fleet counters (Fix 4). Errors
+        are swallowed + throttled — the poller must NEVER die (a dead poller =
+        modules stuck booted again)."""
+        bank = self._ensure_module_state_reader_bank()
+        if bank is None:
+            logger.info(
+                "[Orchestrator] probe poller idle — no SHM reader bank "
+                "(test fixture / no /dev/shm); modules self-attest via boot wait")
+            return
+        last_err_log = 0.0
+        while not self._probe_poller_stop.wait(self._probe_poll_interval_s):
+            try:
+                self._probe_poll_tick(bank)
+            except Exception as exc:  # noqa: BLE001
+                now = time.time()
+                if now - last_err_log > 60.0:
+                    logger.warning(
+                        "[Orchestrator] probe poll tick failed: %s", exc)
+                    last_err_log = now
+
+    def _probe_poll_tick(self, bank) -> None:
+        """One poll pass: probe every `booted` slot + recompute live fleet
+        counters from SHM truth (kills the boot-tally vs SHM divergence)."""
+        now = time.time()
+        mandatory_running = 0
+        post_boot_running = 0
+        for name, info in list(self._modules.items()):
+            # Intentionally-down modules own no live slot to probe.
+            if info.state == ModuleState.DISABLED:
+                continue
+            try:
+                entry = bank.read(name)
+            except Exception:  # noqa: BLE001 — a bad read must not stop the scan
+                entry = None
+            sstate = (entry.state if entry is not None else "") or ""
+            # Fix 1 — probe any booted slot (boot, post-restart, lazy-activate).
+            self._maybe_dispatch_probe(name, sstate, now)
+            # Fix 4 — live fleet counters from SHM, not boot-time tally.
+            if sstate == "running":
+                bp = (info.spec.boot_priority or "mandatory").lower()
+                if bp == "mandatory":
+                    mandatory_running += 1
+                elif bp == "post_boot":
+                    post_boot_running += 1
+        writer = getattr(self, "_titan_hcl_state_writer", None)
+        if writer is not None:
+            try:
+                # Only the live counters — fleet_ready / boot_phase remain the
+                # boot-phase latches set by start_all / _run_phase_b.
+                writer.update(
+                    mandatory_ready=mandatory_running,
+                    post_boot_ready=post_boot_running)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ── Phase 11 §11.I.7 / RFP 11F — wave-based boot ──────────────────────
+
+    def _compute_boot_waves(self, names: list[str]) -> list[list[str]]:
+        """Topological *levels* (waves) for wave-based boot per RFP 11F.
+
+        Same algorithm as `_compute_boot_order` but returns each topo level as
+        its own group (layer-ascending + alphabetic within) instead of one flat
+        list. Modules in a wave have all their MODULE deps satisfied by prior
+        waves, so they boot CONCURRENTLY; the next wave waits for this one to
+        reach RUNNING. With deps mostly undeclared this collapses to a single
+        wave (all modules boot in parallel) — exactly the fast staggered-
+        parallel behaviour Phase 9 9L had, now probe-gated.
+        """
+        name_set = set(names)
+        incoming: dict[str, set[str]] = {n: set() for n in names}
+        for n in names:
+            spec = self._modules[n].spec
+            for dep in spec.dependencies:
+                if dep.kind == DependencyKind.MODULE and dep.name in name_set:
+                    incoming[n].add(dep.name)
+        waves: list[list[str]] = []
+        remaining = set(names)
+        while remaining:
+            ready = [n for n in remaining if not (incoming[n] & remaining)]
+            if not ready:
+                logger.warning(
+                    "[Orchestrator] boot dep cycle among %s — collapsing to "
+                    "one flat wave", sorted(remaining))
+                ready = sorted(remaining)
+            ready.sort(key=lambda n: (self._modules[n].spec.layer, n))
+            waves.append(ready)
+            for n in ready:
+                remaining.discard(n)
+        return waves
+
+    def _wait_for_wave_running(
+        self, names: list[str], timeout_s: float,
+    ) -> int:
+        """Wait until every module in `names` shows state=running in SHM (or
+        timeout). The continuous poller drives booted→running concurrently;
+        this just observes + mirrors SHM truth into in-process ModuleInfo. Also
+        nudges a probe per pass (shared throttle → no double-probe) so wave
+        readiness never depends on poll-loop timing. Returns the count that
+        reached RUNNING.
+        """
+        bank = self._ensure_module_state_reader_bank()
+        if bank is None:
+            return len(names)  # no SHM (tests) — assume ready so boot proceeds
+        deadline = time.time() + timeout_s
+        pending = set(names)
+        ready: set[str] = set()
+        while pending and time.time() < deadline:
+            now = time.time()
+            for name in list(pending):
+                info = self._modules.get(name)
+                if info is None:
+                    pending.discard(name)
+                    continue
+                try:
+                    entry = bank.read(name)
+                except Exception:  # noqa: BLE001
+                    entry = None
+                sstate = (entry.state if entry is not None else "") or ""
+                self._maybe_dispatch_probe(name, sstate, now)
+                if sstate == "running":
+                    info.state = ModuleState.RUNNING
+                    if info.ready_time == 0.0:
+                        info.ready_time = now
+                    ready.add(name)
+                    pending.discard(name)
+                elif sstate in ("disabled", "crashed"):
+                    # Terminal for boot purposes — stop waiting (supervisor owns
+                    # recovery). `unhealthy` is NOT terminal: the poller keeps
+                    # re-probing; a transient probe failure may still recover.
+                    pending.discard(name)
+            if pending:
+                time.sleep(0.1)
+        return len(ready)
+
     def _wait_for_module_running(
         self,
         name: str,
@@ -1288,7 +1522,6 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         False. False does NOT stop the boot — the supervisor's SHM
         liveness/heartbeat detector catches a truly-stuck worker post-boot.
         """
-        import uuid as _uuid
         deadline = time.time() + (timeout_s if timeout_s is not None
                                   else self._probe_wait_timeout_s)
         reader_bank = self._ensure_module_state_reader_bank()
@@ -1297,7 +1530,6 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             # canonical path. Treat as ready so boot proceeds; real fleets
             # always have SHM provisioned.
             return True
-        last_probe = 0.0
         while time.time() < deadline:
             info = self._modules.get(name)
             if info is None:
@@ -1313,17 +1545,11 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 if info.ready_time == 0.0:
                     info.ready_time = time.time()
                 return True
-            # Dispatch the probe once the worker is booted + awaiting it.
-            # Re-fire every 2s to cover the subscribe bootstrap race.
-            now = time.time()
-            if sstate == "booted" and (now - last_probe) >= 2.0:
-                last_probe = now
-                try:
-                    self.bus.publish(make_msg(
-                        MODULE_PROBE_REQUEST, "titan_hcl", name,
-                        {"name": name, "probe_id": _uuid.uuid4().hex}))
-                except Exception:  # noqa: BLE001
-                    pass
+            # Drive the probe via the shared dispatcher (same throttle map as
+            # the continuous poller → no double-probe). Used by dep-activation
+            # (§11.G.2.5) + reload (§11.I.6) which may run before/independent of
+            # a steady-state poll; the poller covers everything else.
+            self._maybe_dispatch_probe(name, sstate or "", time.time())
             time.sleep(0.1)
         return False
 
@@ -1490,34 +1716,43 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 post_boot_total=len(post_boot),
                 lazy_total=lazy_total)
 
-        # Phase A — MANDATORY.
+        # Continuous probe poller live BEFORE the first spawn so it drives
+        # every wave's booted→running concurrently (SPEC §11.I.7 / RFP 11D).
+        self._ensure_probe_poller_started()
+
+        # Phase A — MANDATORY (wave-based per RFP 11F).
         phase_a_t0 = time.time()
-        mandatory_order = self._compute_boot_order(mandatory)
+        waves = self._compute_boot_waves(mandatory)
         logger.info(
-            "[Orchestrator] Phase A (MANDATORY) start: %d modules; "
-            "stagger %.1fs; probe wait ≤%.0fs per module",
-            len(mandatory_order), self._boot_stagger_delay_s,
+            "[Orchestrator] Phase A (MANDATORY) start: %d modules in %d "
+            "dep-wave(s); stagger %.1fs; wave wait ≤%.0fs",
+            len(mandatory), len(waves), self._boot_stagger_delay_s,
             self._probe_wait_timeout_s)
         ready_count = 0
-        for idx, name in enumerate(mandatory_order, start=1):
-            if idx > 1 and self._boot_stagger_delay_s > 0:
-                time.sleep(self._boot_stagger_delay_s)
-            self.start(name)
-            ok = self._wait_for_module_running(name)
-            if ok:
-                ready_count += 1
-            else:
+        for wi, wave in enumerate(waves, start=1):
+            # Spawn the whole wave (staggered to avoid a cold-import CPU spike),
+            # then wait for it to reach RUNNING CONCURRENTLY — not one module at
+            # a time. The poller probes each module as it hits `booted`.
+            for si, name in enumerate(wave):
+                if (wi > 1 or si > 0) and self._boot_stagger_delay_s > 0:
+                    time.sleep(self._boot_stagger_delay_s)
+                self.start(name)
+            wave_ready = self._wait_for_wave_running(
+                wave, self._probe_wait_timeout_s)
+            ready_count += wave_ready
+            if wave_ready < len(wave):
                 logger.warning(
-                    "[Orchestrator] Phase A module '%s' did not reach "
-                    "RUNNING in %.0fs — proceeding (supervisor will "
-                    "monitor)", name, self._probe_wait_timeout_s)
+                    "[Orchestrator] Phase A wave %d/%d: %d/%d modules RUNNING "
+                    "in ≤%.0fs — proceeding (poller keeps probing; supervisor "
+                    "monitors)", wi, len(waves), wave_ready, len(wave),
+                    self._probe_wait_timeout_s)
             if writer is not None:
                 writer.update(mandatory_ready=ready_count)
         phase_a_dt = time.time() - phase_a_t0
         logger.info(
             "[Orchestrator] Phase A complete in %.1fs — %d/%d MANDATORY "
             "modules RUNNING; publishing fleet_ready",
-            phase_a_dt, ready_count, len(mandatory_order))
+            phase_a_dt, ready_count, len(mandatory))
         if writer is not None:
             writer.update(
                 fleet_ready=True,
@@ -1560,34 +1795,38 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         writer = self._ensure_titan_hcl_state_writer()
         if writer is not None:
             writer.update(boot_phase="booting_b")
-        order = self._compute_boot_order(names)
+        # Poller is already live from Phase A; ensure it (defensive) so post-
+        # boot waves get probed too.
+        self._ensure_probe_poller_started()
+        waves = self._compute_boot_waves(names)
         t0 = time.time()
         ready_count = 0
-        for idx, name in enumerate(order, start=1):
-            if idx > 1 and self._post_boot_stagger_delay_s > 0:
-                time.sleep(self._post_boot_stagger_delay_s)
-            try:
-                self.start(name)
-            except Exception as e:  # noqa: BLE001
+        for wi, wave in enumerate(waves, start=1):
+            for si, name in enumerate(wave):
+                if (wi > 1 or si > 0) and self._post_boot_stagger_delay_s > 0:
+                    time.sleep(self._post_boot_stagger_delay_s)
+                try:
+                    self.start(name)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "[Orchestrator] Phase B module '%s' spawn raised %s — "
+                        "marking degraded + continuing", name, e)
+            wave_ready = self._wait_for_wave_running(
+                wave, self._probe_wait_timeout_s)
+            ready_count += wave_ready
+            if wave_ready < len(wave):
                 logger.warning(
-                    "[Orchestrator] Phase B module '%s' spawn raised %s — "
-                    "marking degraded + continuing", name, e)
-                continue
-            ok = self._wait_for_module_running(name)
-            if ok:
-                ready_count += 1
-            else:
-                logger.warning(
-                    "[Orchestrator] Phase B module '%s' did not reach "
-                    "RUNNING in %.0fs — continuing (degraded)",
-                    name, self._probe_wait_timeout_s)
+                    "[Orchestrator] Phase B wave %d/%d: %d/%d modules RUNNING "
+                    "in ≤%.0fs — continuing (degraded; poller keeps probing)",
+                    wi, len(waves), wave_ready, len(wave),
+                    self._probe_wait_timeout_s)
             if writer is not None:
                 writer.update(post_boot_ready=ready_count)
         dt = time.time() - t0
         logger.info(
             "[Orchestrator] Phase B complete in %.1fs — %d/%d "
             "OPTIONAL_POST_BOOT modules RUNNING; publishing "
-            "fleet_optional_ready", dt, ready_count, len(order))
+            "fleet_optional_ready", dt, ready_count, len(names))
         if writer is not None:
             writer.update(
                 fleet_optional_ready=True,
@@ -1626,6 +1865,11 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
     def stop_all(self, reason: str = "shutdown") -> None:
         """Gracefully stop all running modules."""
         self._stop_requested = True
+        # Stop the continuous probe poller (Phase 11 §11.I.7 / RFP 11D).
+        try:
+            self._probe_poller_stop.set()
+        except Exception:
+            pass
         # Stop module-ready SHM publisher.
         try:
             self._module_ready_publisher_stop.set()

@@ -24,6 +24,7 @@ is tiny) but uses the same `variable_size=True` pattern as
 """
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -130,6 +131,13 @@ class TitanHclStateWriter:
         self._writer = StateRegistryWriter(self._spec, shm_root)
         self._entry: TitanHclStateEntry = TitanHclStateEntry(
             boot_started_at=time.time())
+        # Phase 11 §11.I.7 — update() is called from multiple orchestrator
+        # threads (start_all boot thread, Phase B thread, the 1Hz probe poller
+        # refreshing live counters). The read-modify-write below MUST be atomic,
+        # else a racing counter-only update can clobber the fleet_ready=True
+        # latch back to False (kernel-rs/api read fleet_ready). One process is
+        # the writer (G21); this lock serializes its threads.
+        self._lock = threading.Lock()
         self._publish()
 
     @property
@@ -154,40 +162,41 @@ class TitanHclStateWriter:
         First-true transitions of fleet_ready / fleet_optional_ready also
         latch their wall-clock timestamps.
         """
-        now = time.time()
-        new = TitanHclStateEntry(
-            fleet_ready=(self._entry.fleet_ready if fleet_ready is None
-                         else bool(fleet_ready)),
-            fleet_optional_ready=(self._entry.fleet_optional_ready
-                                  if fleet_optional_ready is None
-                                  else bool(fleet_optional_ready)),
-            boot_phase=(self._entry.boot_phase if boot_phase is None
-                        else str(boot_phase)),
-            mandatory_total=(self._entry.mandatory_total
-                             if mandatory_total is None
-                             else int(mandatory_total)),
-            mandatory_ready=(self._entry.mandatory_ready
-                             if mandatory_ready is None
-                             else int(mandatory_ready)),
-            post_boot_total=(self._entry.post_boot_total
-                             if post_boot_total is None
-                             else int(post_boot_total)),
-            post_boot_ready=(self._entry.post_boot_ready
-                             if post_boot_ready is None
-                             else int(post_boot_ready)),
-            lazy_total=(self._entry.lazy_total if lazy_total is None
-                        else int(lazy_total)),
-            boot_started_at=self._entry.boot_started_at,
-            fleet_ready_at=(now if (fleet_ready and not self._entry.fleet_ready)
-                            else self._entry.fleet_ready_at),
-            fleet_optional_ready_at=(
-                now if (fleet_optional_ready
-                        and not self._entry.fleet_optional_ready)
-                else self._entry.fleet_optional_ready_at),
-        )
-        self._entry = new
-        self._publish()
-        return new
+        with self._lock:
+            now = time.time()
+            new = TitanHclStateEntry(
+                fleet_ready=(self._entry.fleet_ready if fleet_ready is None
+                             else bool(fleet_ready)),
+                fleet_optional_ready=(self._entry.fleet_optional_ready
+                                      if fleet_optional_ready is None
+                                      else bool(fleet_optional_ready)),
+                boot_phase=(self._entry.boot_phase if boot_phase is None
+                            else str(boot_phase)),
+                mandatory_total=(self._entry.mandatory_total
+                                 if mandatory_total is None
+                                 else int(mandatory_total)),
+                mandatory_ready=(self._entry.mandatory_ready
+                                 if mandatory_ready is None
+                                 else int(mandatory_ready)),
+                post_boot_total=(self._entry.post_boot_total
+                                 if post_boot_total is None
+                                 else int(post_boot_total)),
+                post_boot_ready=(self._entry.post_boot_ready
+                                 if post_boot_ready is None
+                                 else int(post_boot_ready)),
+                lazy_total=(self._entry.lazy_total if lazy_total is None
+                            else int(lazy_total)),
+                boot_started_at=self._entry.boot_started_at,
+                fleet_ready_at=(now if (fleet_ready and not self._entry.fleet_ready)
+                                else self._entry.fleet_ready_at),
+                fleet_optional_ready_at=(
+                    now if (fleet_optional_ready
+                            and not self._entry.fleet_optional_ready)
+                    else self._entry.fleet_optional_ready_at),
+            )
+            self._entry = new
+            self._publish()
+            return new
 
     def _publish(self) -> int:
         payload = msgpack.packb(self._entry.as_wire_dict(), use_bin_type=True)

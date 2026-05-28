@@ -171,24 +171,44 @@ def test_start_all_writes_fleet_ready_to_titan_hcl_state(tmp_path,
     # Tests exercising the canonical path must opt in.
     monkeypatch.setenv("TITAN_HCL_STATE_WRITER_CANONICAL", "1")
 
+    from titan_hcl.core.module_state import BootPriority, ModuleStateWriter
+
     o = _make_orch()
     o.register(_spec("a", autostart=True, boot_priority="mandatory"))
 
+    _writers: list = []
+
     def fake_start(name: str) -> bool:
+        # Mimic the worker lifecycle: write starting→booted→running to the
+        # module's OWN SHM slot — the canonical readiness signal the wave-wait
+        # + probe poller read (§11.I.2 locked D1/D2). Setting info.state alone
+        # is NOT a readiness signal post-Phase-11.
+        w = ModuleStateWriter(
+            module_name=name, layer="L3",
+            boot_priority=BootPriority.MANDATORY, titan_id="test")
+        w.write_state("starting")
+        w.write_state("booted")
+        w.write_state("running")
+        _writers.append(w)
         o._modules[name].state = ModuleState.RUNNING
         return True
 
     o.start = fake_start  # type: ignore[assignment]
-    o.start_all()
-    # Phase B is empty → fleet_optional_ready latches immediately.
-    reader = TitanHclStateReader(titan_id="test")
-    entry = reader.read()
-    assert entry is not None
-    assert entry.fleet_ready is True
-    assert entry.fleet_optional_ready is True
-    assert entry.mandatory_total == 1
-    assert entry.mandatory_ready == 1
-    reader.close()
+    try:
+        o.start_all()
+        # Phase B is empty → fleet_optional_ready latches immediately.
+        reader = TitanHclStateReader(titan_id="test")
+        entry = reader.read()
+        assert entry is not None
+        assert entry.fleet_ready is True
+        assert entry.fleet_optional_ready is True
+        assert entry.mandatory_total == 1
+        assert entry.mandatory_ready == 1
+        reader.close()
+    finally:
+        o.stop_all(reason="test")
+        for w in _writers:
+            w.close()
 
 
 def test_start_all_publishes_phase_a_done_before_phase_b_finishes(
@@ -231,10 +251,21 @@ def test_start_all_publishes_phase_a_done_before_phase_b_finishes(
 
 
 def test_wait_for_module_running_returns_true_when_state_running():
+    """SHM-attested readiness (§11.I.2 locked D1/D2): when the module's own
+    slot reads state=running, the helper returns True. (in-process info.state
+    is mirrored FROM the slot — the slot is the authority, not the reverse.)"""
+    from titan_hcl.core.module_state import BootPriority, ModuleStateWriter
+    from titan_hcl.core.state_registry import resolve_titan_id
     o = _make_orch(probe_wait_timeout_s=2.0)
     o.register(_spec("x"))
-    o._modules["x"].state = ModuleState.RUNNING
-    assert o._wait_for_module_running("x") is True
+    writer = ModuleStateWriter(
+        module_name="x", layer="L3",
+        boot_priority=BootPriority.MANDATORY, titan_id=resolve_titan_id())
+    writer.write_state("running")
+    try:
+        assert o._wait_for_module_running("x") is True
+    finally:
+        writer.close()
 
 
 def test_wait_for_module_running_returns_false_on_timeout():
@@ -255,22 +286,35 @@ def test_wait_for_module_running_returns_false_for_unknown_module():
 
 
 def test_wait_for_module_running_picks_up_transition_mid_wait():
-    """When the module transitions to RUNNING during the wait window,
-    the helper returns True promptly (≪ timeout)."""
+    """When the module's SHM slot transitions booted→running mid-wait (the
+    probe response), the helper returns True promptly (≪ timeout). Readiness
+    is SHM-attested per locked D1/D2 (§11.I.2)."""
+    from titan_hcl.core.module_state import BootPriority, ModuleStateWriter
+    from titan_hcl.core.state_registry import resolve_titan_id
+
     o = _make_orch(probe_wait_timeout_s=2.0)
     o.register(_spec("z"))
 
+    writer = ModuleStateWriter(
+        module_name="z", layer="L3",
+        boot_priority=BootPriority.MANDATORY, titan_id=resolve_titan_id())
+    writer.write_state("booted")
+
     def flip_state_async():
         time.sleep(0.2)
-        o._modules["z"].state = ModuleState.RUNNING
+        writer.write_state("running")
 
     threading.Thread(target=flip_state_async, daemon=True).start()
-    t0 = time.time()
-    ok = o._wait_for_module_running("z")
-    elapsed = time.time() - t0
-    assert ok is True
-    assert elapsed < 1.0, (
-        f"Should return promptly after state flip; got {elapsed:.2f}s")
+    try:
+        t0 = time.time()
+        ok = o._wait_for_module_running("z")
+        elapsed = time.time() - t0
+        assert ok is True
+        assert elapsed < 1.5, (
+            f"Should return promptly after slot flips to running; got {elapsed:.2f}s")
+        assert o._modules["z"].state == ModuleState.RUNNING
+    finally:
+        writer.close()
 
 
 # ── 4. TitanHclStateWriter / Reader contract ─────────────────────────

@@ -23,7 +23,7 @@ import enum
 import logging
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -431,6 +431,78 @@ class ModuleStateWriter:
             self._writer.close()
         except Exception:
             pass
+
+
+# ── Orchestrator-side terminal write (NON-worker, dead-worker only) ───────────
+
+def write_terminal_module_state(
+    module_name: str,
+    state: str,
+    *,
+    titan_id: Optional[str] = None,
+    last_error: Optional[ModuleError] = None,
+) -> bool:
+    """One-shot write of a TERMINAL state to a module's SHM slot from the
+    orchestrator (a NON-worker process), per SPEC §11.I.4.
+
+    The worker is normally the G21 single-writer of its own slot. But when
+    titan_hcl DISABLES a module after an escalation it has already STOPPED the
+    worker (pid dead) — yet nothing has written the terminal `disabled` state
+    to the slot, so guardian_hcl's 1Hz SHM poll keeps reading the stale
+    `running`/`booted`+dead-pid and re-requesting restarts forever. This helper
+    lets the orchestrator publish the terminal state ONCE. G21 is preserved:
+    the only live writer (the worker) is already gone before this is called.
+
+    Unlike `ModuleStateWriter`, NO heartbeat daemon is started — the slot is
+    terminal and must not look "fresh". Reads the current slot to preserve the
+    identity/telemetry fields, flips `state` (+ optional `last_error`), and
+    republishes a single complete entry.
+
+    Returns True on success, False on any failure (best-effort — a failed
+    terminal write degrades to the pre-fix behaviour, never crashes the caller).
+    """
+    try:
+        prev: Optional[ModuleStateEntry] = None
+        try:
+            _r = ModuleStateReader(module_name=module_name, titan_id=titan_id)
+            prev = _r.read()
+            _r.close()
+        except Exception:
+            prev = None
+        now = time.time()
+        if prev is not None:
+            entry = replace(
+                prev,
+                state=str(state),
+                last_error=last_error if last_error is not None else prev.last_error,
+                last_heartbeat=now,
+                written_at=now,
+            )
+        else:
+            entry = ModuleStateEntry(
+                name=module_name,
+                layer="L3",
+                boot_priority=BootPriority.MANDATORY,
+                state=str(state),
+                last_error=last_error,
+                last_heartbeat=now,
+            )
+        spec = make_module_state_registry_spec(module_name)
+        shm_root: Path = ensure_shm_root(titan_id)
+        writer = StateRegistryWriter(spec, shm_root)
+        try:
+            writer.write_variable(msgpack.packb(entry.as_wire_dict(), use_bin_type=True))
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        return True
+    except Exception as e:  # noqa: BLE001 — best-effort terminal write
+        logger.warning(
+            "[module_state] write_terminal_module_state(%s, %s) failed: %s",
+            module_name, state, e)
+        return False
 
 
 # ── Cross-process reader (titan_hcl / guardian_hcl / observatory / api) ───────
