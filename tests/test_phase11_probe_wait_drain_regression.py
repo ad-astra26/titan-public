@@ -1,28 +1,26 @@
 """
-Regression test for 11F probe-wait queue-drain.
+Regression test for 11F/§11.I.2 probe-driven readiness.
 
-Live-discovered 2026-05-27 T3 deploy: during `start_all()`, the supervision
-loop's `_process_guardian_messages` hasn't yet started (scripts/guardian_hcl.py
-only enters the supervision tick AFTER start_all returns). Workers' MODULE_READY
-broadcasts therefore piled up in the guardian queue without ever updating
-`info.state`. Every un-migrated worker (which is most of the fleet pre-11I)
-timed out at the full probe budget (~30s × 16 mandatory = ~8 minutes).
+Phase 11 §11.I.2 (locked D1/D2): the legacy MODULE_READY bus path is DELETED.
+`_wait_for_module_running` is now SHM-only:
 
-Fix: `_wait_for_module_running` drains `_process_guardian_messages` each poll
-iteration so the legacy MODULE_READY → info.state path actually fires within
-the probe-wait window.
+  1. It polls the worker's `module_<name>_state.bin` slot.
+  2. When it observes `state=booted` it publishes MODULE_PROBE_REQUEST
+     (non-blocking) to drive the worker through probing→running.
+  3. On observed `state=running` it mirrors RUNNING into the in-process
+     ModuleInfo (state + ready_time) and returns True.
 
-This test pins the drain so a future refactor doesn't silently regress
-the back-compat boot path.
+These tests pin the SHM contract so a future refactor can't silently
+reintroduce the MODULE_READY bus dependency.
 """
 from __future__ import annotations
 
 import threading
 import time
 
-import pytest
-
 from titan_hcl.bus import DivineBus
+from titan_hcl.core.module_state import BootPriority, ModuleStateWriter
+from titan_hcl.core.state_registry import resolve_titan_id
 from titan_hcl.orchestrator import ModuleSpec, ModuleState, Orchestrator
 
 
@@ -30,62 +28,74 @@ def _dummy_entry(*_a, **_kw) -> None:
     pass
 
 
-def test_wait_for_module_running_drains_guardian_queue_inline():
-    """When MODULE_READY is published while start_all is mid-walk (the
-    supervision tick hasn't started yet), `_wait_for_module_running` must
-    inline-drain it so info.state transitions to RUNNING within the
-    probe-wait window."""
+def test_wait_for_module_running_reaches_running_via_shm():
+    """When the worker's SHM slot transitions booted→running (the probe
+    response), `_wait_for_module_running` returns True and mirrors RUNNING
+    into the in-process ModuleInfo — no MODULE_READY bus event involved."""
     bus = DivineBus()
     orch = Orchestrator(bus, config={
         "boot_stagger_delay_s": 0.0,
-        "probe_wait_timeout_s": 2.0,
+        "probe_wait_timeout_s": 3.0,
         "phase_11_pipeline_enabled": True,
     })
     orch.register(ModuleSpec(name="x", entry_fn=_dummy_entry, layer="L2"))
 
-    # Simulate a worker that publishes MODULE_READY shortly after spawn.
-    # (Real workers do this from their entry_fn after init.)
-    from titan_hcl.bus import MODULE_READY, make_msg
+    titan_id = resolve_titan_id()
+    writer = ModuleStateWriter(
+        module_name="x", layer="L2",
+        boot_priority=BootPriority.MANDATORY, titan_id=titan_id)
+    writer.write_state("starting")
+    writer.write_state("booted")
 
-    def fake_worker():
-        time.sleep(0.2)
-        bus.publish(make_msg(
-            MODULE_READY, src="x", dst="guardian", payload={},
-        ))
+    # Simulate the worker's probe handler driving the slot to running shortly
+    # after the orchestrator dispatches MODULE_PROBE_REQUEST.
+    def fake_probe_response():
+        time.sleep(0.3)
+        writer.write_state("running")
 
-    threading.Thread(target=fake_worker, daemon=True).start()
+    threading.Thread(target=fake_probe_response, daemon=True).start()
 
-    t0 = time.time()
-    ok = orch._wait_for_module_running("x")
-    elapsed = time.time() - t0
+    try:
+        t0 = time.time()
+        ok = orch._wait_for_module_running("x")
+        elapsed = time.time() - t0
 
-    assert ok is True, (
-        "MODULE_READY arrived but _wait_for_module_running returned False — "
-        "the inline drain regressed; legacy boot path no longer works.")
-    # Should return promptly after MODULE_READY arrives, not at the full
-    # timeout. 1.5s leaves comfortable headroom.
-    assert elapsed < 1.5, (
-        f"Probe-wait drained successfully but took {elapsed:.2f}s — slower "
-        f"than expected. The inline drain may be missing.")
-    assert orch._modules["x"].state == ModuleState.RUNNING
+        assert ok is True, (
+            "SHM slot reached state=running but _wait_for_module_running "
+            "returned False — the SHM readiness path regressed.")
+        assert elapsed < 2.5, (
+            f"Returned True but took {elapsed:.2f}s — slower than expected.")
+        assert orch._modules["x"].state == ModuleState.RUNNING
+        assert orch._modules["x"].ready_time > 0.0
+    finally:
+        writer.close()
 
 
-def test_wait_for_module_running_still_times_out_for_silent_worker():
-    """If MODULE_READY never arrives, the probe-wait still bounds at
-    the timeout (no infinite block from the drain change)."""
+def test_wait_for_module_running_times_out_for_silent_worker():
+    """If the slot never reaches running (worker stuck booted), the probe-wait
+    bounds at the timeout and returns False (no infinite block)."""
     bus = DivineBus()
     orch = Orchestrator(bus, config={
         "boot_stagger_delay_s": 0.0,
-        "probe_wait_timeout_s": 0.3,
+        "probe_wait_timeout_s": 0.5,
         "phase_11_pipeline_enabled": True,
     })
     orch.register(ModuleSpec(name="silent", entry_fn=_dummy_entry, layer="L2"))
 
-    t0 = time.time()
-    ok = orch._wait_for_module_running("silent")
-    elapsed = time.time() - t0
+    titan_id = resolve_titan_id()
+    writer = ModuleStateWriter(
+        module_name="silent", layer="L2",
+        boot_priority=BootPriority.MANDATORY, titan_id=titan_id)
+    writer.write_state("starting")
+    writer.write_state("booted")  # never advances to running
 
-    assert ok is False
-    assert 0.2 < elapsed < 1.0, (
-        f"Timeout should fire near 0.3s; got {elapsed:.2f}s — drain may be "
-        f"introducing blocking calls.")
+    try:
+        t0 = time.time()
+        ok = orch._wait_for_module_running("silent")
+        elapsed = time.time() - t0
+
+        assert ok is False
+        assert 0.4 < elapsed < 1.5, (
+            f"Timeout should fire near 0.5s; got {elapsed:.2f}s.")
+    finally:
+        writer.close()

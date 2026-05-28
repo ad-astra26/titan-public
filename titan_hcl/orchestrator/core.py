@@ -65,7 +65,7 @@ from titan_hcl.bus import (
     DivineBus,
     MODULE_CRASHED,
     MODULE_HEARTBEAT,
-    MODULE_READY,
+    MODULE_PROBE_REQUEST,
     MODULE_RELOAD_ACK,
     MODULE_RELOAD_REQUEST,
     MODULE_SHUTDOWN,
@@ -175,7 +175,6 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             "guardian",
             types=[
                 MODULE_HEARTBEAT,
-                MODULE_READY,
                 MODULE_SHUTDOWN,
                 BUS_WORKER_ADOPT_REQUEST,
                 # Phase B.2 §D9 (2026-05-02) — broker → Guardian peer-death
@@ -777,19 +776,6 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                                 _info.rss_mb = _rss
                             inline_processed += 1
                         continue  # don't stash; consumed inline
-                    if _mt == MODULE_READY:
-                        _src = m.get("src", "")
-                        _info = self._modules.get(_src)
-                        if _info is not None:
-                            _info.state = ModuleState.RUNNING
-                            _info.last_heartbeat = time.time()
-                            _info.ready_time = time.time()
-                            logger.info(
-                                "[Guardian] Module '%s' is READY (pid=%s, "
-                                "restarts=%d) [inline-during-SAVE_NOW]",
-                                _src, _info.pid, _info.restart_count)
-                            inline_processed += 1
-                        continue  # don't stash; consumed inline
                     # Other types (rare during SAVE_NOW): stash for re-publish
                     drained_msgs.append(m)
                 # Re-publish remaining drained messages so we don't lose them
@@ -1283,56 +1269,59 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         name: str,
         timeout_s: Optional[float] = None,
     ) -> bool:
-        """Phase 11 §11.I.7 — block (briefly) until the module reaches
-        `state=RUNNING`.
+        """Phase 11 §11.I.2/§11.I.7 — drive the module through the probe
+        contract and block until its SHM slot reports `state=running`.
 
-        Two readiness paths are honoured (back-compat for the 11F → 11I
-        migration window):
-          1. Worker writes its own `module_<name>_state.bin` slot
-             (Phase 11 §11.I.5 / 11I migration). We poll the slot at
-             10 Hz looking for state="running".
-          2. Worker emits MODULE_READY on the bus (legacy / pre-11I).
-             `_process_guardian_messages` updates `info.state = RUNNING`
-             + `info.ready_time` — we poll the in-process info dict.
+        SHM is the SOLE readiness source (locked D1/D2 — the legacy
+        MODULE_READY bus path is DELETED). Mechanics:
+          1. Poll the worker's `module_<name>_state.bin` slot at 10 Hz.
+          2. When the worker reaches `state=booted` it is awaiting a probe;
+             we publish MODULE_PROBE_REQUEST (non-blocking, §8.0.ter, dst=worker).
+             The worker's `handle_module_probe_request` runs its probe_fn (or
+             trivial pass per §11.I.2) and writes `probing→running` to its OWN
+             slot. We re-fire every 2s to beat the subscribe bootstrap race.
+          3. On observed `state=running` we mirror it into the in-process
+             ModuleInfo (state + ready_time) so the rest of the orchestrator
+             stays consistent WITHOUT any bus broadcast.
 
-        Per §11.I.2: modules without a probe_fn get a trivial pass-through
-        probe in 11I. Until then, the in-process info-dict path keeps
-        existing tests + workers green.
-
-        Returns True if the module reached RUNNING within the timeout,
-        False otherwise. False does NOT stop the boot — the orchestrator
-        logs a WARN and proceeds (the supervisor's heartbeat-stale
-        detector will catch a truly-stuck worker post-boot).
+        Returns True if the slot reached RUNNING within the timeout, else
+        False. False does NOT stop the boot — the supervisor's SHM
+        liveness/heartbeat detector catches a truly-stuck worker post-boot.
         """
+        import uuid as _uuid
         deadline = time.time() + (timeout_s if timeout_s is not None
                                   else self._probe_wait_timeout_s)
         reader_bank = self._ensure_module_state_reader_bank()
-        # Phase 11 §11.I.7 — during start_all() the supervision loop's
-        # `_process_guardian_messages` has not yet started (scripts/guardian_hcl.py
-        # only enters the supervision tick AFTER start_all returns). Workers'
-        # MODULE_READY broadcasts therefore pile up in the guardian queue
-        # without ever updating `info.state`. We drain the queue inline so
-        # the legacy ready path (path 2 above) actually fires within the
-        # probe-wait window. Without this drain, every un-migrated worker
-        # times out at the full probe budget even when MODULE_READY arrived
-        # in ms.
-        process_msgs = getattr(self, "_process_guardian_messages", None)
+        if reader_bank is None:
+            # No SHM (test fixtures without /dev/shm): cannot verify via the
+            # canonical path. Treat as ready so boot proceeds; real fleets
+            # always have SHM provisioned.
+            return True
+        last_probe = 0.0
         while time.time() < deadline:
             info = self._modules.get(name)
             if info is None:
                 return False
-            if info.state == ModuleState.RUNNING:
+            try:
+                entry = reader_bank.read(name)
+            except Exception:  # noqa: BLE001
+                entry = None
+            sstate = entry.state if entry is not None else None
+            if sstate == "running":
+                # Mirror SHM truth into the in-process info dict (no bus event).
+                info.state = ModuleState.RUNNING
+                if info.ready_time == 0.0:
+                    info.ready_time = time.time()
                 return True
-            if reader_bank is not None:
+            # Dispatch the probe once the worker is booted + awaiting it.
+            # Re-fire every 2s to cover the subscribe bootstrap race.
+            now = time.time()
+            if sstate == "booted" and (now - last_probe) >= 2.0:
+                last_probe = now
                 try:
-                    entry = reader_bank.read(name)
-                except Exception:  # noqa: BLE001
-                    entry = None
-                if entry is not None and entry.state == "running":
-                    return True
-            if process_msgs is not None:
-                try:
-                    process_msgs()
+                    self.bus.publish(make_msg(
+                        MODULE_PROBE_REQUEST, "titan_hcl", name,
+                        {"name": name, "probe_id": _uuid.uuid4().hex}))
                 except Exception:  # noqa: BLE001
                     pass
             time.sleep(0.1)
@@ -1752,28 +1741,7 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             msg_type = msg.get("type")
             src = msg.get("src", "")
 
-            if msg_type == MODULE_READY:
-                info = self._modules.get(src)
-                if info:
-                    info.state = ModuleState.RUNNING
-                    info.last_heartbeat = time.time()
-                    info.ready_time = time.time()
-                    # Do NOT reset restart_count here — only after sustained uptime
-                    logger.info("[Guardian] Module '%s' is READY (pid=%s, restarts=%d)",
-                                src, info.pid, info.restart_count)
-                # SPEC §11.B.3 (D-SPEC-49) — if this MODULE_READY corresponds
-                # to an in-flight reload's NEW pid, route to the orchestrator
-                # so it can complete the reload. Non-blocking put (drop
-                # silently on overflow — at most 1 MODULE_READY per reload
-                # is meaningful; the queue is sized for it).
-                rs = self._reloads_in_flight.get(src)
-                if rs is not None:
-                    try:
-                        rs.ready_q.put_nowait(msg)
-                    except _queue_mod.Full:
-                        pass
-
-            elif msg_type == MODULE_HEARTBEAT:
+            if msg_type == MODULE_HEARTBEAT:
                 info = self._modules.get(src)
                 if info:
                     info.last_heartbeat = time.time()

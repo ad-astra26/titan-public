@@ -176,13 +176,11 @@ def setup_worker_bus(name: str, recv_q, send_q,
         # orthogonal to authkey derivation.
         authkey = derive_bus_authkey(secret)
 
-        # SPEC §8.0.bis worker contract C2: re-emit MODULE_READY after
-        # every successful BUS_SUBSCRIBE handshake (initial boot + every
-        # reconnect). Closes the bootstrap-race class fleet-wide without
-        # per-worker patches — every Python worker spawning through
-        # `setup_worker_bus()` auto-gets the contract. Guardian's
-        # MODULE_READY handler treats re-emit on state=running as no-op.
-        # Per Phase A of rFP_phase_c_bus_delivery_continuity_and_hot_reload.
+        # Phase 11 §11.I.2 (locked D1/D2): the legacy MODULE_READY bus emit is
+        # DELETED. Readiness is SHM-only — the worker writes state=booted to its
+        # own module_<name>_state.bin slot and titan_hcl drives it to running via
+        # the MODULE_PROBE_REQUEST contract. This callback now only handles the
+        # Phase B reload ADOPTION_REQUEST emit.
         #
         # SPEC §11.B.3 Phase B (D-SPEC-49): when this worker was spawned
         # by Guardian.reload_module() (phase_b_reload_swap_id set on
@@ -196,10 +194,10 @@ def setup_worker_bus(name: str, recv_q, send_q,
 
         def _re_emit_module_ready() -> None:
             from titan_hcl import bus as _bus_constants
-            # Phase B reload context: emit ADOPTION_REQUEST BEFORE
-            # MODULE_READY on the very first subscribe-ack only. Guardian's
-            # _process_guardian_messages routes it to the reload orchestrator's
-            # adoption_q when name+pid match the in-flight reload state.
+            # Phase B reload context: emit ADOPTION_REQUEST on the very first
+            # subscribe-ack only. Guardian's _process_guardian_messages routes
+            # it to the reload orchestrator's adoption_q when name+pid match the
+            # in-flight reload state. (No MODULE_READY emit — deleted per D1/D2.)
             if _swap_id is not None and _first_subscribe_ack[0]:
                 _first_subscribe_ack[0] = False
                 try:
@@ -228,19 +226,6 @@ def setup_worker_bus(name: str, recv_q, send_q,
                         "[worker_bus_bootstrap] worker '%s' Phase B "
                         "ADOPTION_REQUEST publish failed:",
                         name, exc_info=True)
-            try:
-                client_ref.publish({
-                    "type": _bus_constants.MODULE_READY,
-                    "src": name,
-                    "dst": "guardian",
-                    "payload": {"src": name, "ts": time.time()},
-                })
-            except Exception:  # noqa: BLE001
-                # NEVER crash on heartbeat re-emit — log and continue.
-                logger.warning(
-                    "[worker_bus_bootstrap] worker '%s' MODULE_READY "
-                    "re-emit failed (will retry on next reconnect): ",
-                    name, exc_info=True)
 
         # client_ref is a forward reference: the callback closes over
         # the client object that's created on the next line. Set after

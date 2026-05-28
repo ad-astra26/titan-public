@@ -43,7 +43,6 @@ from typing import Any
 
 from titan_hcl.bus import (
     MODULE_HEARTBEAT,
-    MODULE_READY,
     OBSERVATORY_EVENT,
     make_msg,
 )
@@ -329,10 +328,9 @@ def api_subprocess_main(recv_queue, send_queue, name: str, config: dict) -> None
                      chat_bridge_bus=chat_bridge_client,
                      agno_bridge=agno_bridge_client)
 
-    # 7. Start uvicorn — this is where we publish MODULE_READY (right
-    # before starting serve, since serve() blocks).
-    _send_msg(send_queue, MODULE_READY, name, "guardian", {})
-
+    # 7. Start uvicorn (serve() blocks). Phase 11 §11.I.2 (D1/D2): legacy
+    # MODULE_READY emit DELETED — api readiness is its SHM slot (api_main
+    # ModuleStateWriter), not a bus broadcast.
     import uvicorn
     host = api_cfg.get("host", "0.0.0.0")
     # B.1 §7 — TITAN_API_PORT env var override for shadow kernel boot

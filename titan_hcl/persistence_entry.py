@@ -42,7 +42,7 @@ def imw_main(recv_queue, send_queue, name: str, config: dict) -> None:
     from queue import Empty
     from titan_hcl.persistence.config import IMWConfig
     from titan_hcl.persistence.writer_service import IMWDaemon
-    from titan_hcl.bus import MODULE_CRASHED, MODULE_HEARTBEAT, MODULE_READY, make_msg
+    from titan_hcl.bus import MODULE_CRASHED, MODULE_HEARTBEAT, make_msg
 
     # Set process title so `ps aux` shows e.g. [imw_writer] / [observatory_writer]
     # instead of all writers blending into "python -u titan_hcl". Optional —
@@ -146,11 +146,8 @@ def imw_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
     async def _run():
         await daemon.start()
-        try:
-            send_queue.put(make_msg(MODULE_READY, name, "guardian", {}))
-        except Exception as _swallow_exc:
-            swallow_warn("[persistence_entry] _run: send_queue.put(make_msg(MODULE_READY, name, 'guardian', {}))", _swallow_exc,
-                         key='persistence_entry._run.line117', throttle=100)
+        # Phase 11 §11.I.2 (D1/D2): legacy MODULE_READY emit DELETED — readiness
+        # is SHM-only via the per-module state slot + probe contract.
         try:
             while not stop_event.is_set():
                 await asyncio.sleep(0.5)
