@@ -98,55 +98,18 @@ def api_subprocess_main(recv_queue, send_queue, name: str, config: dict) -> None
     logger.info("[ApiSubprocess] starting (titan_id=%s, pid=%d)",
                 titan_id, os.getpid())
 
-    # 2. kernel_rpc — LAZY, non-blocking (Phase 11 §11.I.1 standalone L3).
-    #
-    # The api is a true standalone L3 (INV-PROC-5): it binds uvicorn and
-    # serves SHM-direct reads (Preamble G18) WITHOUT waiting for L2. The
-    # kernel_rpc connection is the L3→L2 bridge used ONLY by mutating /
-    # residual `plugin_proxy` endpoints; per INV-PROC-5 those transiently
-    # fail until L2 (titan_hcl) is up, while state reads stay 200.
-    #
-    # Why this MUST be lazy under kernel-rs peer-spawn: kernel_rpc binds
-    # inside TitanHCL.boot() which runs AFTER titan_hcl's orchestrator
-    # start_all (minutes of worker dependency waves). The api is spawned
-    # by kernel-rs at T+0, so a blocking connect would either time out and
-    # exit (the old `return # Guardian will restart us` is dead — the api
-    # is a kernel-rs peer now, nothing respawns it) or pin the whole API
-    # offline for the entire L2 boot. `get_plugin_proxy()` does NOT touch
-    # the socket — the proxy only dials on first `.call()`, and we
-    # establish the connection in a background thread that retries until
-    # L2's kernel_rpc server binds.
+    # 2. Connect to kernel RPC
     from titan_hcl.core.kernel_rpc import KernelRPCClient
     rpc_client = KernelRPCClient(
         titan_id=titan_id, connect_timeout_s=KERNEL_CONNECT_TIMEOUT_S)
+    try:
+        rpc_client.connect()
+    except Exception as e:
+        logger.error(
+            "[ApiSubprocess] kernel_rpc connect failed: %s", e, exc_info=True)
+        return  # Guardian will restart us
     plugin_proxy = rpc_client.get_plugin_proxy()
-
-    _rpc_connect_stop = threading.Event()
-
-    def _kernel_rpc_connect_loop():
-        attempt = 0
-        while not _rpc_connect_stop.is_set():
-            attempt += 1
-            try:
-                rpc_client.connect()
-                logger.info(
-                    "[ApiSubprocess] kernel_rpc connected (attempt %d) — "
-                    "mutating/plugin-proxy endpoints now live", attempt)
-                return
-            except Exception as e:  # noqa: BLE001
-                logger.info(
-                    "[ApiSubprocess] kernel_rpc not ready yet (attempt %d): "
-                    "%s — serving SHM-direct reads meanwhile, retrying in 5s",
-                    attempt, e)
-                _rpc_connect_stop.wait(5.0)
-
-    _rpc_connect_thread = threading.Thread(
-        target=_kernel_rpc_connect_loop, daemon=True,
-        name="api-kernel-rpc-connect")
-    _rpc_connect_thread.start()
-    logger.info(
-        "[ApiSubprocess] kernel_rpc connect deferred to background thread "
-        "(standalone L3 — uvicorn + SHM reads do not block on L2)")
+    logger.info("[ApiSubprocess] connected to kernel_rpc")
 
     # TitanStateAccessor — primary state read object. All sub-accessors
     # are SHM-direct per Preamble G18 (D-SPEC-71 Phase A + D-SPEC-78 Phase B
@@ -371,7 +334,6 @@ def api_subprocess_main(recv_queue, send_queue, name: str, config: dict) -> None
     finally:
         _hb_stop.set()
         _bus_stop.set()
-        _rpc_connect_stop.set()
         try:
             rpc_client.close()
         except Exception:

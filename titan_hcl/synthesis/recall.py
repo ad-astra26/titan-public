@@ -148,6 +148,10 @@ class EngineRecall:
         # cross-process readers — INV-Syn-4 / G18). None disables concept-
         # granularity recall (returns None — caller falls back).
         kuzu_reader: Optional[Any] = None,
+        # Phase 8 §P8.D — procedural reader for granularity="procedural"
+        # recall. ProceduralSkillReader (in synthesis_worker) or BridgeRecall
+        # wrapper (cross-process). None disables that granularity.
+        procedural_reader: Optional[Any] = None,
     ) -> None:
         """
         Args:
@@ -174,6 +178,7 @@ class EngineRecall:
         self._activation_lookup = activation_lookup
         self._embedder = embedder
         self._kuzu_reader = kuzu_reader
+        self._procedural_reader = procedural_reader
         if contracts_dir is None:
             here = os.path.dirname(os.path.abspath(__file__))
             # titan_hcl/synthesis → titan_hcl/contracts/meta_cognitive
@@ -273,6 +278,47 @@ class EngineRecall:
             else:
                 self._total_contract_hits += 1
             return results
+
+        # Phase 8 §P8.D — procedural-granularity recall. Bypasses the
+        # contract pipeline (the result type is per-skill, not per-TX —
+        # `procedural_skills` is its own index by arch §8.1). Uses the
+        # injected procedural_reader (binds to ProceduralSkillStore in
+        # synthesis_worker); None disables this granularity (returns
+        # None, caller falls back to per-TX recall).
+        if granularity == "procedural":
+            if self._procedural_reader is None:
+                logger.debug(
+                    "[EngineRecall] procedural granularity requested but "
+                    "procedural_reader is None — caller falls back",
+                )
+                self._total_fallbacks += 1
+                return None
+            try:
+                skill_rows = self._procedural_reader.recall(query_text, k=k)
+            except Exception as e:
+                logger.warning(
+                    "[EngineRecall] procedural_reader raised: %s — fallback", e,
+                )
+                self._total_fallbacks += 1
+                return None
+            if not skill_rows:
+                self._total_fallbacks += 1
+                return []
+            self._total_contract_hits += 1
+            # Map procedural skill dicts onto uniform RecallResult shape so
+            # downstream callers (engine, agno tool) handle one type.
+            return [
+                RecallResult(
+                    tx_hash=row.get("skill_id", ""),
+                    score=float(row.get("match_score") or 0.0),
+                    fork="procedural_skill",
+                    source="synthesis_procedural_skill",
+                    summary=row.get("name") or row.get("nl_description") or "",
+                    cosine=float(row.get("cosine_surrogate") or 0.0),
+                    importance=float(row.get("utility_score") or 0.0),
+                )
+                for row in skill_rows
+            ]
 
         if not self._embedder:
             logger.debug("[EngineRecall] no embedder injected — fallback")

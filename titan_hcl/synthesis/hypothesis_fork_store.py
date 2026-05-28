@@ -197,6 +197,14 @@ class HypothesisForkStore:
         activation_floor: float = DEFAULT_ACTIVATION_FLOOR,
         ttl_window_sec: float = DEFAULT_WINDOW_SEC,
         clock: Any = time.time,
+        # P8.X (D-SPEC-PHASE8 fold-in): write-through snapshot path. When set,
+        # every lifecycle mutator (create/record/graduate/abandon) calls
+        # `export_snapshot(snapshot_path)` synchronously after the DuckDB
+        # transaction commits. Closes the "new fork visible in snapshot
+        # never appeared after 6s" P5 cascade flake (the 60s recompute-loop
+        # snapshot stays as a heartbeat but is no longer load-bearing for
+        # visibility). Mirrors the P7 ActrBufferStore.persist() pattern.
+        snapshot_path: Optional[str] = None,
     ):
         self._db = duckdb_conn
         self._graph = kuzu_graph
@@ -206,6 +214,7 @@ class HypothesisForkStore:
         self._floor = float(activation_floor)
         self._window = float(ttl_window_sec)
         self._clock = clock
+        self._snapshot_path = snapshot_path
         # Exploration-TX tracker: in-memory map of fork_id -> list[tx_hash].
         # Populated by `record_exploration_tx()` (called by the synthesis
         # engine when it anchors a TX inside a fork) and consumed at
@@ -390,6 +399,8 @@ class HypothesisForkStore:
             (root_anchor[:16] + "...") if root_anchor else "∅",
             intent[:64],
         )
+        # P8.X write-through: closes P5 cascade flake (snapshot lag on create)
+        self._maybe_write_through_snapshot()
         return fork_id
 
     def record_exploration_tx(self, fork_id: str, tx_hash: str) -> None:
@@ -422,6 +433,8 @@ class HypothesisForkStore:
                 "write failed: %s — in-memory list preserved",
                 fork_id, tx_hash, e,
             )
+        # P8.X write-through: closes P5 cascade flake (snapshot lag on record)
+        self._maybe_write_through_snapshot()
 
     def graduate_oracle(
         self,
@@ -584,6 +597,8 @@ class HypothesisForkStore:
             fork_id, reason, tombstone_tx[:16], exploration_root[:16],
             len(exploration_tx_list),
         )
+        # P8.X write-through: closes P5 cascade flake (snapshot lag on abandon)
+        self._maybe_write_through_snapshot()
         return tombstone_tx
 
     # ── Public surface — FORK_READ observer (P5.F) ────────────────────
@@ -764,6 +779,20 @@ class HypothesisForkStore:
             )
 
     # ── Snapshot export (cross-process read surface — mirrors P4 FU-1) ─
+
+    def _maybe_write_through_snapshot(self) -> None:
+        """P8.X write-through: if `snapshot_path` was supplied at construction,
+        export the snapshot synchronously after a lifecycle mutator commits.
+        Soft-fail — logs WARN; never raises (export errors must not block
+        the caller's transaction)."""
+        if not self._snapshot_path:
+            return
+        try:
+            self.export_snapshot(self._snapshot_path)
+        except Exception as e:
+            logger.warning(
+                "[HypothesisForkStore] write-through snapshot export failed: %s", e,
+            )
 
     def export_snapshot(self, snapshot_path: str) -> int:
         """Atomic JSON export of all hypothesis_forks rows + summary stats.
@@ -968,6 +997,8 @@ class HypothesisForkStore:
             new_concept_id, new_version, concept_anchor_tx[:16],
             oracle_verdict.get("oracle_id", "?"),
         )
+        # P8.X write-through: closes P5 cascade flake (snapshot lag on graduate)
+        self._maybe_write_through_snapshot()
         return concept_anchor_tx
 
 

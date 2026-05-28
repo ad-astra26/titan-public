@@ -406,13 +406,8 @@ def memory_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     # (200 items × keyword match + graph stats). RPC requests piled up +
     # timed out (worker eventually processed them but caller already gave
     # up). Mirrors spirit_loop's snapshot-builder thread pattern.
-    # NOTE: `threading` is imported at module level (line 13). A redundant
-    # function-local `import threading` here used to shadow it, making
-    # `threading` a local var for the WHOLE function — so the Phase 11
-    # boot-cover heartbeat at line ~110 (added later, BEFORE this point)
-    # raised UnboundLocalError "cannot access local variable 'threading'"
-    # and crash-looped memory on every boot (live T3 2026-05-28). Use the
-    # module-level import; do not re-import locally.
+    import threading
+
     _periodic_stop = threading.Event()
 
     # ── Phase A: in-flight registry + write_lock allocated EARLY ───────

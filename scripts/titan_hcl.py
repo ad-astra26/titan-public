@@ -18,7 +18,6 @@ import logging
 import os
 import sys
 import signal
-import threading
 
 # Ensure project root is on path
 sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), "..")))
@@ -239,78 +238,6 @@ def _resolve_asyncio_pool_size(config: dict | None = None) -> int:
         return 16
 
 
-_orchestrator_stop_event = None  # threading.Event set in finally to halt helper threads
-_orchestrator_client = None      # BusSocketClient stopped in finally
-_orchestrator_ref = None         # Orchestrator instance stopped in finally
-
-
-def _start_lifecycle_subscriber(bus, orchestrator, stop_event):
-    """Subscribe to MODULE_*_REQUEST messages and dispatch to Orchestrator.
-
-    Phase 11 §11.I.1 / D-SPEC-141: moved here from `scripts/guardian_hcl.py`
-    because the Orchestrator now lives in `titan_hcl` post-split. The
-    Supervisor in guardian_hcl emits MODULE_RESTART_REQUEST(dst=
-    "guardian_hcl_lifecycle"); titan_hcl's "guardian" BusSocketClient (which
-    ALSO matches guardian_hcl_lifecycle? — no, it doesn't) receives
-    *broadcast* and dst="guardian" messages. To keep MODULE_RESTART_REQUEST
-    routable in the split topology, the Supervisor's publish target keeps
-    the legacy dst (`guardian_hcl_lifecycle`) and we mount a local
-    DivineBus subscriber here — the inbound dispatcher re-publishes every
-    inbound frame into the local DivineBus regardless of original dst, so
-    a local types=[MODULE_*_REQUEST] subscriber catches everything that
-    reached this process via the broker (broker routes by name+alias; we
-    register `guardian_hcl_lifecycle` as an alias on the bus client
-    elsewhere — see build_bus_and_client's BusSocketClient construction).
-    """
-    import logging as _logging
-    from queue import Empty
-    from titan_hcl.bus import (
-        MODULE_START_REQUEST, MODULE_STOP_REQUEST, MODULE_RESTART_REQUEST,
-    )
-    log = _logging.getLogger(__name__)
-    q = bus.subscribe(
-        "guardian_hcl_lifecycle",
-        types=[MODULE_START_REQUEST, MODULE_STOP_REQUEST, MODULE_RESTART_REQUEST],
-        reply_only=True,
-    )
-
-    def _loop():
-        while not stop_event.is_set():
-            try:
-                msg = q.get(timeout=0.5)
-            except Empty:
-                continue
-            except Exception:
-                continue
-            mtype = msg.get("type")
-            payload = msg.get("payload", {}) or {}
-            name = payload.get("name")
-            if not name:
-                continue
-            try:
-                if mtype == MODULE_START_REQUEST:
-                    orchestrator.start(name)
-                elif mtype == MODULE_STOP_REQUEST:
-                    orchestrator.stop(name, reason=payload.get("reason", "requested"))
-                elif mtype == MODULE_RESTART_REQUEST:
-                    extra = {k: v for k, v in payload.items()
-                             if k not in ("name", "reason")}
-                    orchestrator.restart_module(
-                        name,
-                        reason=payload.get("reason", "requested"),
-                        **extra,
-                    )
-            except Exception as e:  # noqa: BLE001
-                log.warning(
-                    "[titan_hcl] lifecycle request %s for '%s' failed: %s",
-                    mtype, name, e)
-
-    t = threading.Thread(
-        target=_loop, name="titan-hcl-lifecycle", daemon=True)
-    t.start()
-    return t
-
-
 async def run(health_only: bool = False, server_only: bool = False,
               restore_from: str | None = None, shadow_port: int | None = None):
     """Boot the Titan and enter the main loop.
@@ -349,97 +276,6 @@ async def run(health_only: bool = False, server_only: bool = False,
         wallet_path = cfg.get("network", {}).get("wallet_keypair_path", wallet_path)
     except Exception:
         cfg = {}
-
-    # ── Phase 11 §11.I.1 / D-SPEC-141 — Orchestrator boot (peer-spawn) ──
-    # Pre-Phase-11 the Orchestrator + start_all + lifecycle subscriber
-    # lived in scripts/guardian_hcl.py (which then Popen'd this script as
-    # the L2 plugin). Under kernel-rs peer-spawn (titan_hcl is now a
-    # kernel-rs child, sibling to guardian_hcl), the Orchestrator moves
-    # HERE: this process owns module spawn + start_all + the
-    # MODULE_*_REQUEST lifecycle subscriber. guardian_hcl is reduced to
-    # the Supervisor role (fault detection + restart trigger). The kernel
-    # below builds its own DivineBus + "titan_HCL" BusSocketClient
-    # connection — that's the proxy-reply transport, separate from the
-    # orchestrator bus constructed here (broker fans by client name; the
-    # two connections coexist on the same Unix socket without conflict).
-    from titan_hcl.config_loader import load_titan_config as _load_cfg
-    from titan_hcl.core.state_registry import resolve_titan_id as _resolve_id
-    from titan_hcl.bus import (
-        MODULE_HEARTBEAT, MODULE_READY, MODULE_SHUTDOWN, MODULE_CRASHED,
-        MODULE_RELOAD_REQUEST, BUS_WORKER_ADOPT_REQUEST, BUS_PEER_DIED,
-    )
-    from scripts._titan_bus_client_helpers import (
-        build_bus_and_client as _build_bus_and_client,
-        start_inbound_dispatcher as _start_inbound_dispatcher,
-    )
-    _orch_cfg = _load_cfg()
-    _orch_titan_id = _resolve_id()
-    _orch_stop = threading.Event()
-    _orch_broadcast = [
-        MODULE_HEARTBEAT, MODULE_READY, MODULE_SHUTDOWN, MODULE_CRASHED,
-        MODULE_RELOAD_REQUEST, BUS_WORKER_ADOPT_REQUEST, BUS_PEER_DIED,
-    ]
-    _orch_bus, _orch_client = _build_bus_and_client(
-        _orch_titan_id, _orch_cfg,
-        subscriber_name="guardian",
-        broadcast_topics=_orch_broadcast,
-        reply_only=False,
-    )
-    # Phase 11 §11.I.1 routing fix — the Supervisor (guardian_hcl process)
-    # publishes MODULE_RESTART_REQUEST with dst="guardian_hcl_lifecycle".
-    # The lifecycle subscriber now lives HERE (titan_hcl), so register
-    # "guardian_hcl_lifecycle" as a broker alias on this connection — the
-    # broker then fans dst="guardian_hcl_lifecycle" frames to this client
-    # (alongside dst="guardian"). Without this the restart request hits no
-    # subscriber and Supervisor re-fires every tick (memory restart storm
-    # observed live T3 2026-05-28). subscribe_alias persists across
-    # reconnects (bus_socket.py:709).
-    _orch_client.subscribe_alias("guardian_hcl_lifecycle")
-    logging.info(
-        "[titan_hcl] orchestrator bus client connected "
-        "(name=guardian, alias=guardian_hcl_lifecycle)")
-
-    from titan_hcl.orchestrator import Orchestrator
-    from titan_hcl.module_catalog import build_catalog
-    _orchestrator = Orchestrator(_orch_bus, config=_orch_cfg.get("guardian", {}))
-    # _kernel_ref = None: cross-process swap interlock degrades to no-op
-    # (per Orchestrator.start docstring "None in legacy mode → swap
-    # interlock degrades to no-op"). The TitanKernel constructed below
-    # is its OWN process-local kernel ref; the cross-process shadow
-    # swap interlock isn't applicable to this orchestrator path because
-    # the workers live as siblings in the kernel-rs process tree.
-    _orchestrator._kernel_ref = None
-
-    # Phase 11 §11.I.7 / G21 single-writer (D-SPEC-141) — mark this
-    # process as the canonical writer of titan_hcl_state.bin so the
-    # Orchestrator's _ensure_titan_hcl_state_writer creates the writer
-    # here and ONLY here. Non-canonical processes (api subprocess
-    # mini-orchestrators, test fixtures) inherit the absence of this
-    # env var and silently skip the publish, eliminating the slot
-    # clobbering observed live 2026-05-27. Moved from guardian_hcl.py
-    # as part of the Phase 11 final split (this process now owns
-    # start_all, so it MUST own the canonical state writer).
-    os.environ["TITAN_HCL_STATE_WRITER_CANONICAL"] = "1"
-
-    build_catalog(_orch_bus, _orchestrator, _orch_cfg, titan_id=_orch_titan_id)
-    logging.info(
-        "[titan_hcl] module catalog built — %d modules registered",
-        len(_orchestrator._modules))
-
-    _start_inbound_dispatcher(_orch_bus, _orch_client, _orch_stop)
-    _start_lifecycle_subscriber(_orch_bus, _orchestrator, _orch_stop)
-
-    _orchestrator.start_all()
-    logging.info(
-        "[titan_hcl] start_all complete — modules: %s",
-        list(_orchestrator._modules.keys()))
-
-    # Stash for the `finally` block at the bottom of run() so shutdown
-    # tears down workers + bus client cleanly.
-    global _orchestrator_stop_event, _orchestrator_client, _orchestrator_ref
-    _orchestrator_stop_event = _orch_stop
-    _orchestrator_client = _orch_client
-    _orchestrator_ref = _orchestrator
 
     # ── Guardian Microkernel Boot (kernel/plugin split) ──────────────
     # Phase C is the SOLE boot path. The legacy TitanCore monolith
@@ -577,33 +413,10 @@ async def run(health_only: bool = False, server_only: bool = False,
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
-        # Phase 11 §11.I.1 / D-SPEC-141 — Orchestrator owns module
-        # lifecycle in this process post-split. core.guardian (the L2
-        # plugin's GuardianHCLClient proxy) only emits bus requests, so
-        # the authoritative stop_all lives on the local orchestrator
-        # instance constructed at run() start (stashed into module-level
-        # globals earlier via the single `global` declaration there).
-        if _orchestrator_ref is not None:
-            try:
-                logging.info("Stopping orchestrator modules...")
-                _orchestrator_ref.stop_all(reason="shutdown")
-            except Exception as _e:  # noqa: BLE001
-                logging.warning("orchestrator stop_all error: %s", _e)
-            try:
-                _orchestrator_ref._module_ready_publisher_stop.set()
-            except Exception:
-                pass
-            try:
-                _orchestrator_ref._restart_executor.shutdown(wait=False)
-            except Exception:
-                pass
-        if _orchestrator_stop_event is not None:
-            _orchestrator_stop_event.set()
-        if _orchestrator_client is not None:
-            try:
-                _orchestrator_client.stop()
-            except Exception:
-                pass
+        # Clean shutdown: stop all Guardian child processes
+        if hasattr(core, 'guardian') and core.guardian:
+            logging.info("Stopping Guardian modules...")
+            core.guardian.stop_all(reason="shutdown")
         logging.info("Titan session ended.")
 
 
