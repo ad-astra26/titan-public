@@ -475,6 +475,91 @@ def create_tools(plugin):
             logger.debug("query_retrieval buffer write failed: %s", e)
         return summary
 
+    # ------------------------------------------------------------------
+    # Phase 8 — match_procedural_skill (P8.F / INV-Syn-20)
+    # ------------------------------------------------------------------
+    async def match_procedural_skill(goal_text: str) -> str:
+        """
+        Look up a compiled procedural skill matching your current goal.
+
+        This is your shortcut from "I need to do X" to "I've done X before
+        successfully Y times, here's the recipe." Returns either the
+        top-matching skill's metadata (you decide whether to invoke its
+        executable_spec parameterized by current context) or "no match"
+        (continue with un-delegated reasoning).
+
+        The skill is ONLY returned when it passes the delegate gate:
+        utility_score above the soft-retire floor, match_score above the
+        composite threshold, and verified_at IS NOT NULL (skill has
+        passed first-invocation lineage re-verification — INV-Syn-20).
+
+        Args:
+            goal_text: Natural-language description of what you're trying
+                to do (e.g. "deploy a Solana NFT", "build a cosmetic website").
+
+        Returns:
+            JSON-string summary of the top skill {skill_id, name,
+            nl_description, executable_spec, match_score, utility_score,
+            success_count, failure_count} when delegate gate passes;
+            "no match" when nothing matches; "synthesis not wired" when
+            EngineRecall isn't available (early-boot / test).
+        """
+        import json as _json
+        recall = getattr(plugin, "engine_recall", None)
+        if recall is None:
+            return "synthesis not wired"
+        try:
+            results = await asyncio.to_thread(
+                recall.recall, goal_text, granularity="procedural", top_k=1,
+            )
+        except TypeError:
+            # Older recall signature may not accept top_k; retry with k=
+            try:
+                results = await asyncio.to_thread(
+                    recall.recall, goal_text, granularity="procedural", k=1,
+                )
+            except Exception as e:
+                logger.debug("match_procedural_skill recall failed: %s", e)
+                return "no match"
+        except Exception as e:
+            logger.debug("match_procedural_skill recall failed: %s", e)
+            return "no match"
+        if not results:
+            return "no match"
+        top = results[0]
+        # Synthesis reader already applied the delegate gate before returning;
+        # we just re-check the cascade-flag here (operator's per-Titan toggle).
+        delegate_live = bool(
+            getattr(plugin, "synthesis_delegate_live", True)
+        )
+        if not delegate_live:
+            return "no match"
+        # RecallResult shape — extract skill metadata fields. Fall back to
+        # safe defaults when the upstream shape changes.
+        skill_meta = {
+            "skill_id": getattr(top, "tx_hash", ""),
+            "name": getattr(top, "summary", ""),
+            "match_score": float(getattr(top, "score", 0.0) or 0.0),
+            "utility_score": float(getattr(top, "importance", 0.0) or 0.0),
+        }
+        # For richer fields (executable_spec, success/failure counts), look
+        # up the full skill row through the synthesis store proxy if exposed.
+        store = getattr(plugin, "skill_store", None)
+        if store is not None and skill_meta["skill_id"]:
+            try:
+                full = await asyncio.to_thread(store.read_skill, skill_meta["skill_id"])
+                if full is not None:
+                    skill_meta["nl_description"] = full.get("nl_description", "")
+                    skill_meta["executable_spec"] = full.get("executable_spec", {})
+                    skill_meta["success_count"] = int(full.get("success_count") or 0)
+                    skill_meta["failure_count"] = int(full.get("failure_count") or 0)
+            except Exception as e:
+                logger.debug("match_procedural_skill store lookup failed: %s", e)
+        try:
+            return _json.dumps(skill_meta, ensure_ascii=False)
+        except Exception:
+            return f"match: {skill_meta.get('skill_id')}"
+
     return [
         coding_sandbox,    # P6.I — closes arch §11.3 gap (sandbox now invoked by outer self)
         research,          # P6.I — routes through KnowledgeTool when wired
@@ -486,4 +571,5 @@ def create_tools(plugin):
         write_buffer,      # P7.D — ACT-R buffer write (INV-Syn-16/17)
         clear_buffer,      # P7.D — ACT-R buffer clear (INV-Syn-16)
         query_retrieval,   # P7.D — recall + retrieval buffer populate
+        match_procedural_skill,  # P8.F — INV-Syn-20 skill match (delegate-gated)
     ]

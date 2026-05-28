@@ -559,6 +559,16 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # buffered during dream) — moved from the retired parent
             # _v4_event_bridge_loop. dream_state_worker broadcasts it dst="all".
             _bus_constants.DREAM_INBOX_REPLAY,
+            # Phase 8 (D-SPEC-PHASE8): agno_worker subscribes to skill-
+            # lifecycle events for cosmetic log + match-tool refresh
+            # signals. META_SKILL_REJECTED is load-bearing — a delegated
+            # skill that mid-flight gets rejected should NOT keep firing.
+            _bus_constants.META_SKILL_COMPILED,
+            _bus_constants.META_SKILL_REJECTED,
+            # Phase 8 fold-in (P8.Y): CGN lexicon snapshot refresh. agno
+            # refreshes plugin.cgn_lexicon on this event so the P7
+            # _ground_for_goal_hook returns real concept_ids.
+            _bus_constants.CGN_LEXICON_UPDATED,
         ],
         start_method="spawn" if _spawn_grad else "fork",
         critical_data_writer=True,  # data/agno_sessions.db is critical-data per §11.H
@@ -1247,6 +1257,19 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # synthesis_worker (sole writer per INV-Syn-16) persists the row
             # to `actr_buffers` + atomic-writes buffers_snapshot.json.
             _bus_constants.SYNTHESIS_BUFFER_COMMAND,
+            # Phase 8 (D-SPEC-PHASE8): procedural skill miner + verifier
+            # lifecycle. META_SKILL_COMPILATION_CANDIDATE wakes the miner
+            # at dream_boundary (emitted by actr_procedural_skill_proposer
+            # SC). META_SKILL_COMPILED / VERIFIED / REJECTED / SOFT_RETIRED
+            # are emitted BY synthesis_worker — listed here so subscribers
+            # (agno_worker, Observatory) can opt into them. CGN_LEXICON_UPDATED
+            # is emitted by cgn_worker; synthesis_worker subscribes only for
+            # observability (does not consume).
+            _bus_constants.META_SKILL_COMPILATION_CANDIDATE,
+            _bus_constants.META_SKILL_COMPILED,
+            _bus_constants.META_SKILL_VERIFIED,
+            _bus_constants.META_SKILL_REJECTED,
+            _bus_constants.META_SKILL_SOFT_RETIRED,
             _bus_constants.KERNEL_EPOCH_TICK,
             _bus_constants.MODULE_SHUTDOWN,
         ],
@@ -1698,6 +1721,10 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             "CGN_CONSOLIDATE", "CGN_SURPRISE",
             _bus_constants.CGN_HAOV_VERIFY_RSP, _bus_constants.CGN_INFERENCE_REQ,
             _bus_constants.CGN_KNOWLEDGE_REQ,
+            # Phase 8 fold-in (P8.Y): CGN_LEXICON_UPDATED — cgn_worker
+            # is the SOLE emitter. Listed here so the bus broker doesn't
+            # silently drop the topic. Payload: {ts, lexicon_size, snapshot_path}.
+            _bus_constants.CGN_LEXICON_UPDATED,
         ],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
