@@ -125,24 +125,26 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 def cmd_diagnostic(args: argparse.Namespace) -> int:
     banner()
-    cprint("`setup_titan diagnostic` — user-friendly health report.", role="text_strong", bold=True)
-    cprint("Lands in W1 — sub-phase diagnostic (wraps titan_diagnostics + arch_map health).", role="warning")
-    cprint("Today: `python scripts/arch_map.py health --all` (dev-facing output).", role="text_muted")
-    return 2
+    from .manage import run_diagnostic
+    return run_diagnostic()
+
+
+def cmd_upgrade(args: argparse.Namespace) -> int:
+    banner()
+    from .manage import run_upgrade
+    return run_upgrade(tag=args.tag, build_rust=args.build_rust)
 
 
 def cmd_repair(args: argparse.Namespace) -> int:
     banner()
-    cprint("`setup_titan repair` — idempotent re-run / fix detected problems.", role="text_strong", bold=True)
-    cprint("Lands in W1 — sub-phase repair. Not yet implemented.", role="warning")
-    return 2
+    from .manage import run_repair
+    return run_repair()
 
 
 def cmd_uninstall(args: argparse.Namespace) -> int:
     banner()
-    cprint("`setup_titan uninstall` — clean removal.", role="text_strong", bold=True)
-    cprint("Lands in W1 — sub-phase uninstall. Not yet implemented.", role="warning")
-    return 2
+    from .manage import run_uninstall
+    return run_uninstall(purge=args.purge, assume_yes=args.yes)
 
 
 # ── argparse wiring ────────────────────────────────────────────────────────
@@ -177,8 +179,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("config",     help="Browse/edit config.toml + DNA params (TUI)").set_defaults(func=cmd_config)
     sub.add_parser("diagnostic", help="User-friendly live health report").set_defaults(func=cmd_diagnostic)
-    sub.add_parser("repair",     help="Idempotent re-run / fix detected problems").set_defaults(func=cmd_repair)
-    sub.add_parser("uninstall",  help="Clean removal").set_defaults(func=cmd_uninstall)
+
+    pu = sub.add_parser("upgrade", help="In-place upgrade: git pull @ tag + refresh binaries + restart")
+    pu.add_argument("--tag", default=None, help="Release tag to upgrade to (e.g. v0.0.2).")
+    pu.add_argument("--build-rust", action="store_true",
+                    help="Compile the Rust daemons from source instead of downloading.")
+    pu.set_defaults(func=cmd_upgrade)
+
+    sub.add_parser("repair",     help="Idempotent heal: regenerate unit + restart").set_defaults(func=cmd_repair)
+
+    px = sub.add_parser("uninstall", help="Clean removal (keeps data/ unless --purge)")
+    px.add_argument("--purge", action="store_true",
+                    help="ALSO delete data/ + ~/.titan/ (identity loss — irreversible without your shard).")
+    px.add_argument("--yes", action="store_true", help="Skip the purge confirmation prompt.")
+    px.set_defaults(func=cmd_uninstall)
     return p
 
 
