@@ -20,6 +20,8 @@ detail + traceback frames).
 from __future__ import annotations
 
 import enum
+import logging
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -36,6 +38,15 @@ from .state_registry import (
     resolve_shm_root,
 )
 from ..errors import ModuleError
+
+logger = logging.getLogger("titan.module_state")
+
+# Centralized heartbeat-daemon cadence. SPEC §11.I.5: worker ~30s heartbeat,
+# guardian_hcl staleness timeout 60-180s. A dedicated daemon ticking every
+# 15s gives ≥4× margin under the tightest (60s) timeout even if the daemon
+# thread itself is briefly CPU-starved — the whole point is that liveness no
+# longer depends on the worker's main loop being unblocked (§11.B.2).
+_HEARTBEAT_DAEMON_INTERVAL_S = 15.0
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -273,6 +284,21 @@ class ModuleStateWriter:
         self._last_heartbeat: float = 0.0
         self._restart_count: int = 0
         self._error_count_24h: int = 0
+        # Current state + last probe/error, tracked so the centralized
+        # heartbeat daemon can re-publish WITHOUT mutating the state machine
+        # (heartbeat must preserve state, not force "running").
+        self._current_state: Optional[str] = None
+        self._last_probe_result: Optional[ProbeResult] = None
+        self._last_error: Optional[ModuleError] = None
+        # Single intra-process write lock (G21: one process is the writer;
+        # main thread + heartbeat daemon both publish, so serialize them).
+        self._write_lock = threading.Lock()
+        # Daemon heartbeat thread — lazily started on first write_state() so
+        # every worker that owns a slot gets robust, main-loop-independent
+        # liveness (SPEC §11.B.2 / §11.I.5) without per-worker boilerplate.
+        self._hb_stop = threading.Event()
+        self._hb_thread: Optional[threading.Thread] = None
+        self._hb_interval: float = _HEARTBEAT_DAEMON_INTERVAL_S
 
     @property
     def module_name(self) -> str:
@@ -304,15 +330,33 @@ class ModuleStateWriter:
         Returns:
             new version (monotonic per slot, used by readers to detect updates).
         """
-        now = time.time()
-        if state == "booted" and self._booted_at == 0.0:
-            self._booted_at = now
-        if state == "running" and self._running_at == 0.0:
-            self._running_at = now
-        if restart_count is not None:
-            self._restart_count = int(restart_count)
-        if error_count_24h is not None:
-            self._error_count_24h = int(error_count_24h)
+        state = str(state)
+        with self._write_lock:
+            now = time.time()
+            if state == "booted" and self._booted_at == 0.0:
+                self._booted_at = now
+            if state == "running" and self._running_at == 0.0:
+                self._running_at = now
+            if restart_count is not None:
+                self._restart_count = int(restart_count)
+            if error_count_24h is not None:
+                self._error_count_24h = int(error_count_24h)
+            # Sticky: last_probe_result / last_error persist across plain
+            # heartbeats and state writes that don't carry a fresh one.
+            if last_probe_result is not None:
+                self._last_probe_result = last_probe_result
+            if last_error is not None:
+                self._last_error = last_error
+            self._current_state = state
+            ver = self._publish_locked(state)
+        # Bring up the heartbeat daemon once the worker has begun its lifecycle
+        # (first write_state, typically "starting"). Started outside the lock so
+        # we never hold it across thread creation.
+        self._ensure_heartbeat_daemon()
+        return ver
+
+    def _publish_locked(self, state: str) -> int:
+        """Serialize + write the slot entry. Caller MUST hold self._write_lock."""
         entry = ModuleStateEntry(
             name=self._module_name,
             layer=self._layer,
@@ -323,34 +367,60 @@ class ModuleStateWriter:
             booted_at=self._booted_at,
             running_at=self._running_at,
             last_heartbeat=self._last_heartbeat,
-            last_probe_result=last_probe_result,
-            last_error=last_error,
+            last_probe_result=self._last_probe_result,
+            last_error=self._last_error,
             restart_count=self._restart_count,
             error_count_24h=self._error_count_24h,
         )
         payload = msgpack.packb(entry.as_wire_dict(), use_bin_type=True)
         return self._writer.write_variable(payload)
 
-    def heartbeat(self) -> int:
-        """Update `last_heartbeat` without changing the state.
+    def _ensure_heartbeat_daemon(self) -> None:
+        """Start the daemon heartbeat thread once (idempotent). The daemon keeps
+        `last_heartbeat` fresh independent of the worker's main loop so a busy
+        or briefly-starved main loop never trips a false heartbeat_timeout
+        restart (the cascade root cause). SPEC §11.B.2 / §11.I.5."""
+        if self._hb_thread is not None or self._hb_stop.is_set():
+            return
+        t = threading.Thread(
+            target=self._heartbeat_loop,
+            name=f"hb-{self._module_name}",
+            daemon=True,
+        )
+        self._hb_thread = t
+        t.start()
 
-        Per SPEC §11.I.5: guardian_hcl staleness check reads this field via
-        1Hz SHM-slot poll. Typical worker cadence is ~30s; faster cadence
-        wastes IPC, slower risks false-staleness restarts.
+    def _heartbeat_loop(self) -> None:
+        while not self._hb_stop.wait(self._hb_interval):
+            try:
+                self.heartbeat()
+            except Exception as exc:  # daemon must never die silently
+                logger.debug(
+                    "[module_state] heartbeat daemon '%s' failed: %s",
+                    self._module_name, exc)
+
+    def heartbeat(self) -> int:
+        """Bump `last_heartbeat`, PRESERVING the current state.
+
+        Per SPEC §11.I.5: guardian_hcl's staleness check reads this field via
+        1Hz SHM poll. Critically this re-publishes with the worker's ACTUAL
+        current state — it must never force "running" (a heartbeat during
+        boot/probe/unhealthy must not falsely advance the state machine). If
+        no state has been written yet, this is a no-op.
         """
-        self._last_heartbeat = time.time()
-        # We need the current state to re-publish; readers see the same state
-        # value with a new written_at + last_heartbeat. We don't track the
-        # current state in this object (writer is intentionally stateless wrt
-        # current state to avoid drift) — caller passes it explicitly via
-        # write_state(...) when the state is known. heartbeat() re-publishes
-        # with state="running" (the only state during which a worker actively
-        # heartbeats); workers in other states should NOT be calling
-        # heartbeat() under SPEC §11.I.5 contract.
-        return self.write_state("running")
+        with self._write_lock:
+            if self._current_state is None:
+                return -1
+            self._last_heartbeat = time.time()
+            return self._publish_locked(self._current_state)
 
     def close(self) -> None:
-        """Release the underlying mmap. Idempotent."""
+        """Stop the heartbeat daemon + release the mmap. Idempotent."""
+        self._hb_stop.set()
+        t = self._hb_thread
+        if (t is not None and t.is_alive()
+                and t is not threading.current_thread()):
+            t.join(timeout=2.0)
         try:
             self._writer.close()
         except Exception:

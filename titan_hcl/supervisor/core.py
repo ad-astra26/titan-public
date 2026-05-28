@@ -239,24 +239,22 @@ class Supervisor:
             spid = int(entry.pid or 0)
             shb = float(entry.last_heartbeat or 0.0)
 
-            # Recovering / transitional states. STARTING→BOOTED→PROBING is the
-            # orchestrator-owned boot+probe progression AND exactly where a
-            # just-restarted module sits — so treating these as "do not
-            # restart" is the primary cascade dedup (the worker rewrites
-            # STARTING into its slot the moment it respawns). STOPPED/DISABLED
-            # are intentional. We still clear any stale restart-request marker
-            # once the module is observed transitioning (it's being honored).
-            if sstate in ("starting", "booted", "probing", "stopped",
-                          "disabled"):
+            # STOPPED / DISABLED are intentional — never police them.
+            if sstate in ("stopped", "disabled"):
                 continue
 
-            # ── Fault detection (state == running | unhealthy | crashed) ──
+            # ── Fault detection ──
             fault_reason: Optional[str] = None
-            if sstate == "crashed":
-                fault_reason = "shm_state_crashed"
-            elif sstate == "unhealthy":
-                fault_reason = "shm_state_unhealthy"
-            elif spid > 0:
+
+            # Liveness FIRST, for ALL live-intent states. A dead pid is CRASHED
+            # from ANY state per SPEC §11.I.2 ("* → CRASHED"). This is checked
+            # even for the transitional STARTING/BOOTED/PROBING states so a
+            # module that dies mid-boot (e.g. blocked in a boot task, then
+            # killed) is detected and restarted instead of being left stuck in
+            # a transitional state forever — the supervisor used to `continue`
+            # past these states and never noticed the death (live T1 bug
+            # 2026-05-28: backup/meta_teacher stuck 'starting' after dying).
+            if spid > 0:
                 import os as _os
                 import errno as _errno
                 try:
@@ -265,6 +263,22 @@ class Supervisor:
                     if _ke.errno == _errno.ESRCH:
                         fault_reason = "shm_pid_dead"
                     # EPERM → exists under another uid → treat as alive.
+
+            # Explicit terminal/degraded states (only if pid wasn't already dead).
+            if fault_reason is None and sstate == "crashed":
+                fault_reason = "shm_state_crashed"
+            elif fault_reason is None and sstate == "unhealthy":
+                fault_reason = "shm_state_unhealthy"
+
+            # Transitional states (starting/booted/probing) legitimately have
+            # not reached steady-state heartbeat/RSS — they are the
+            # orchestrator-owned boot+probe progression + the just-restarted
+            # window (primary cascade dedup). They are policed for a DEAD PID
+            # only (above); heartbeat-staleness and RSS checks below apply to
+            # RUNNING only. So a still-booting live module is never restarted
+            # for a not-yet-fresh heartbeat.
+            if sstate in ("starting", "booted", "probing") and fault_reason is None:
+                continue
 
             # Heartbeat-staleness (CPU-aware grace) — only for a live RUNNING
             # process that passed the liveness check above.
