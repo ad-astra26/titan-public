@@ -1970,28 +1970,36 @@ def create_post_hook(plugin):
                 response_text = _verified.text
                 if hasattr(run_output, 'content'):
                     run_output.content = response_text
-                # When safety PASSED, sign_task is in flight. Await it here
-                # so agno_worker's CHAT_RESPONSE carries the signed headers.
-                # The concurrent-sign latency win materializes in Chunk C's
-                # SSE path; in the buffered path we still want signed
-                # results before publishing the single CHAT_RESPONSE frame.
+                # Maker 2026-05-28 — do NOT await the OVG sign + TimeChain
+                # commit on the /chat response path. verify_post_async already
+                # ran the SAFETY check (which gated response_text above); the
+                # sign_task is the audit-trail commit (Ed25519 + TimeChain
+                # CONVERSATION-fork via a cross-process OVG-proxy RPC) that cost
+                # hundreds-of-ms-to-seconds on every reply. Fire-and-forget it:
+                # the response returns immediately, the commit completes async
+                # on the loop. A done-callback fills the signature/merkle into
+                # the VerifiedResult so later reads (and the SSE path) still
+                # surface it; plugin._last_ovg_result holds the reference so the
+                # Task is not GC'd before it resolves.
                 if _verified.sign_task is not None:
-                    try:
-                        _signed = await _verified.sign_task
-                        if _signed is not None and _signed.signed:
-                            _verified.signature = _signed.signature
-                            _verified.merkle_root = _signed.merkle_root
-                            _verified.block_height = _signed.block_height
-                            _verified.ovg_data.update({
-                                "signature": _signed.signature,
-                                "merkle_root": _signed.merkle_root,
-                                "block_height": _signed.block_height,
-                            })
-                            _verified.timechain_committed = True
-                    except Exception as _sign_err:
-                        logger.warning(
-                            "[PostHook:OVG] sign_task await failed (non-blocking): %s",
-                            _sign_err)
+                    def _attach_signed(_task, _vr=_verified):
+                        try:
+                            _signed = _task.result()
+                            if _signed is not None and _signed.signed:
+                                _vr.signature = _signed.signature
+                                _vr.merkle_root = _signed.merkle_root
+                                _vr.block_height = _signed.block_height
+                                _vr.ovg_data.update({
+                                    "signature": _signed.signature,
+                                    "merkle_root": _signed.merkle_root,
+                                    "block_height": _signed.block_height,
+                                })
+                                _vr.timechain_committed = True
+                        except Exception as _sign_err:  # noqa: BLE001
+                            logger.warning(
+                                "[PostHook:OVG] background sign_task failed "
+                                "(non-blocking): %s", _sign_err)
+                    _verified.sign_task.add_done_callback(_attach_signed)
                 _ovg_result = _verified
                 # Store for /chat API to pick up (headers + structured body).
                 # We attach the full VerifiedResult; agno_worker reads
