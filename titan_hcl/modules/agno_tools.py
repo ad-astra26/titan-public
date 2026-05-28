@@ -473,25 +473,6 @@ def create_tools(plugin):
             )
         except Exception as e:
             logger.debug("query_retrieval buffer write failed: %s", e)
-        # Phase 9 INV-Syn-23: record the surfaced item so the post-LLM
-        # CitedUseDetector (agno_worker._handle_chat_request) can decide whether
-        # the response actually cited it → emit MEMORY_RETRIEVAL_USED with the
-        # correct used_by_llm flag. Keyed by chat_id; the hook pops + clears.
-        try:
-            _item_id = getattr(top, "tx_hash", "") or ""
-            if _item_id:
-                _reg = getattr(plugin, "_last_surfaced_items", None)
-                if _reg is None:
-                    _reg = {}
-                    plugin._last_surfaced_items = _reg
-                _reg.setdefault(chat_id, []).append({
-                    "item_id": _item_id,
-                    "title": summary[:120],
-                    "content_snippet": summary[:512],
-                    "concept_ids": cids,
-                })
-        except Exception as e:
-            logger.debug("query_retrieval surfaced-item capture failed: %s", e)
         return summary
 
     # ------------------------------------------------------------------

@@ -312,36 +312,6 @@ class ProceduralSkillStore:
         """utility_score -= UTILITY_DELTA (clamped); failure_count += 1; last_used=now."""
         self._adjust_utility(skill_id, success=False)
 
-    def apply_utility_delta(self, skill_id: str, delta: float) -> Optional[float]:
-        """Apply an arbitrary utility delta (clamped to [-1,1]) WITHOUT bumping
-        success/failure counts. Phase 9 / INV-Syn-24: the Tier-2 user-feedback
-        override uses a larger delta (default 0.15) than the 0.05 invocation
-        delta — and it is an override signal, not an invocation outcome, so the
-        counts stay untouched. Returns the new utility (or None for an unknown
-        skill_id). Snapshot-exported."""
-        if not skill_id:
-            raise ValueError("skill_id must be non-empty")
-        with self._lock:
-            rows = self._db.execute(
-                "SELECT utility_score FROM procedural_skills WHERE skill_id = ?",
-                [skill_id],
-            ).fetchall()
-            if not rows:
-                logger.warning(
-                    "[ProceduralSkillStore] apply_utility_delta for unknown "
-                    "skill_id=%s", skill_id,
-                )
-                return None
-            current = float(rows[0][0] if rows[0][0] is not None else DEFAULT_UTILITY_SCORE)
-            new_utility = max(-1.0, min(1.0, current + float(delta)))
-            self._db.execute(
-                "UPDATE procedural_skills SET utility_score = ? WHERE skill_id = ?",
-                [new_utility, skill_id],
-            )
-            self._utility_updates += 1
-        self.snapshot_export()
-        return new_utility
-
     def _adjust_utility(self, skill_id: str, *, success: bool) -> None:
         if not skill_id:
             raise ValueError("skill_id must be non-empty")
