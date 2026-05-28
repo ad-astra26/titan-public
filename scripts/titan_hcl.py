@@ -293,12 +293,19 @@ def _start_lifecycle_subscriber(bus, orchestrator, stop_event):
                 elif mtype == MODULE_STOP_REQUEST:
                     orchestrator.stop(name, reason=payload.get("reason", "requested"))
                 elif mtype == MODULE_RESTART_REQUEST:
-                    extra = {k: v for k, v in payload.items()
-                             if k not in ("name", "reason")}
-                    orchestrator.restart_module(
+                    # Use restart_ASYNC (not restart_module): it dedups via
+                    # _restarts_in_flight (drops duplicate requests while a
+                    # restart is mid-stop) AND runs on the _restart_executor
+                    # so this subscriber thread never blocks ~30s in a
+                    # synchronous restart() — both are load-bearing against
+                    # the Supervisor→orchestrator restart cascade (a blocked
+                    # subscriber lets requests pile up serially). The
+                    # start_method override carried by restart_module isn't
+                    # used on the supervisor-fault path (Maker CLI reload uses
+                    # a separate route).
+                    orchestrator.restart_async(
                         name,
                         reason=payload.get("reason", "requested"),
-                        **extra,
                     )
             except Exception as e:  # noqa: BLE001
                 log.warning(

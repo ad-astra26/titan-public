@@ -3173,25 +3173,6 @@ zk_prover  = 0.1
 [synthesis.oracle.zk]
 privacy_domains = ["private_user_data", "user_pii", "private_transaction"]
 
-# ── Phase 8 — Procedural skill miner + invocation (D-SPEC-PHASE8) ────────
-# INV-Syn-19 / INV-Syn-20 / INV-Syn-21 — see arch §23 added knobs block.
-# Q4 soft-retire-only: skills NEVER deleted; utility decays via these gates.
-[synthesis.skill]
-utility_floor              = 0.3    # INV-Syn-20 delegate gate (skill below this → match returns null)
-match_floor                = 0.65   # INV-Syn-20 delegate gate (composite score over skills_vectors.faiss)
-miner_window_hours         = 168    # rFP §11.4 "last 7d" mining window
-miner_min_seq_len          = 2      # rFP §11.4 "len ≥2"
-miner_min_occurrences      = 3      # rFP §11.4 "≥3 occurrences"
-miner_max_skills_per_pass  = 10     # bounds LLM cost per dream window
-miner_max_seq_len          = 8      # sliding-window upper bound
-llm_judge_per_pass_cap     = 200    # INV-Syn-21 per-dream-pass scoring cap
-llm_judge_timeout_s        = 30.0   # INV-Syn-21 per-TX LLM timeout
-soft_retire_floor          = -0.5   # below → META_SKILL_SOFT_RETIRED log; row stays per Q4
-# Per-Titan cascade flag (T3 canary=true, T2/T1=false until soak confirms).
-# Override via ~/.titan/microkernel_<id>.toml [synthesis.skill]. When false,
-# match_procedural_skill always returns null (dry-run).
-delegate_live              = false  # default OFF for safety; flip per-Titan
-
 [microkernel]
 
 # ── Memory hygiene daemon (2026-05-01) ─────────────────────────────

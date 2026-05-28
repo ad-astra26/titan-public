@@ -63,6 +63,15 @@ _MIN_CPU_DELTA_FOR_ALIVE: Optional[float] = None
 _MAX_STARVED_CYCLES: Optional[int] = None
 _REENABLE_COOLDOWN_S: Optional[float] = None
 
+# Cascade guard (Phase 11 §11.I.2). Min seconds between successive
+# MODULE_RESTART_REQUESTs for the SAME module. Must comfortably exceed a
+# normal stop(SAVE_NOW ≤30s)+respawn+first-SHM-write so the worker has
+# rewritten STARTING into its slot (→ state-machine dedup takes over) before
+# this backstop expires. 90s covers memory's ~52s cold boot + 30s stop with
+# headroom, and stays under the orchestrator's max_restarts window (600s) so
+# a genuine crash-loop still escalates → DISABLED.
+_RESTART_REQUEST_COOLDOWN_S: float = 90.0
+
 
 def _load_constants() -> None:
     global _MIN_CPU_DELTA_FOR_ALIVE, _MAX_STARVED_CYCLES, _REENABLE_COOLDOWN_S
@@ -99,6 +108,16 @@ class Supervisor:
         self.bus = bus
         self.orchestrator = orchestrator
         self._config = config or {}
+        # Phase 11 §11.I.2 cascade guard — per-module timestamp of the last
+        # MODULE_RESTART_REQUEST we published. A restart needs ~stop(30s
+        # SAVE_NOW)+respawn+boot before the worker rewrites a fresh STARTING
+        # state into its SHM slot. Re-requesting at 1 Hz during that window
+        # floods the orchestrator's lifecycle queue → serial 30s restart
+        # backlog that never drains (live T1 storm 2026-05-28). We suppress
+        # re-requests for RESTART_REQUEST_COOLDOWN_S; the SHM state-machine
+        # (STARTING/BOOTED/PROBING suppression) is the primary dedup, this is
+        # the backstop for the pid-write race.
+        self._restart_requested_at: dict[str, float] = {}
 
     # ── D5 restart-trigger emission ──────────────────────────────────────────
 
@@ -168,8 +187,22 @@ class Supervisor:
         orch._process_guardian_messages()
 
         now = time.time()
+        # SPEC §11.I.2 (D-SPEC-141) — the per-module SHM slot
+        # (module_<name>_state.bin, ModuleStateWriter) is the AUTHORITATIVE
+        # source for state/pid/last_heartbeat. We do NOT consult the legacy
+        # in-memory `info.state` (which is fed by the retired MODULE_READY
+        # bus broadcast via _process_guardian_messages) for health/restart
+        # decisions — D1/D2: "NO bus broadcasts for state transitions". The
+        # bus drain above still services adopt/reload (spawn-side) paths.
+        bank = None
+        try:
+            bank = orch._ensure_module_state_reader_bank()
+        except Exception:  # noqa: BLE001
+            bank = None
+
         for name, info in orch._modules.items():
-            # 1. Auto-re-enable disabled modules after cooldown.
+            # 1. Auto-re-enable disabled modules after cooldown (orchestrator
+            # lifecycle state, not a SHM-slot transition).
             if info.state == ModuleState.DISABLED and info.disabled_at > 0:
                 elapsed = now - info.disabled_at
                 if elapsed >= _REENABLE_COOLDOWN_S:
@@ -179,165 +212,136 @@ class Supervisor:
                     orch.enable(name)
                 continue
 
-            if info.state not in (ModuleState.RUNNING, ModuleState.STARTING):
-                continue
-
             # SPEC §11.B.3 (D-SPEC-49) — supervision suppressed during
             # reload-in-flight; orchestrator owns lifecycle of OLD pid.
             if info.reload_in_flight:
                 continue
 
-            # 2. Process liveness check — in-process vs cross-process paths.
-            # In-process: info.process is an mp.Process, use is_alive().
-            # Cross-process (11E.b.2 / kernel-rs peer-spawn): info.process is
-            # None because this Supervisor's Orchestrator instance never
-            # spawned anything; the worker lives in a separate process tree
-            # (spawned by titan_hcl). Read PID from the worker's SHM slot
-            # and check os.kill(pid, 0) for liveness.
-            if info.process is None:
-                # Cross-process liveness: read PID from SHM, check signal-0.
-                _live_pid = 0
-                try:
-                    _bank2 = orch._ensure_module_state_reader_bank()
-                    if _bank2 is not None:
-                        _entry2 = _bank2.read(name)
-                        if _entry2 is not None:
-                            _live_pid = int(_entry2.pid or 0)
-                except Exception:  # noqa: BLE001
-                    _live_pid = 0
-                if _live_pid > 0:
-                    import os as _os, errno as _errno
-                    try:
-                        _os.kill(_live_pid, 0)
-                        # Process exists — fall through to heartbeat check.
-                    except OSError as _ke:
-                        if _ke.errno == _errno.ESRCH:
-                            logger.warning(
-                                "[Supervisor] Module '%s' pid=%d not alive "
-                                "(cross-process os.kill ESRCH)",
-                                name, _live_pid)
-                            self.bus.publish(make_msg(
-                                MODULE_CRASHED, "supervisor", "core",
-                                {"module": name, "exitcode": None,
-                                 "source": "shm_pid_dead"}))
-                            if info.spec.restart_on_crash:
-                                self.publish_module_restart_request(
-                                    name, reason="shm_pid_dead")
-                            continue
-                        # EPERM means process exists but is owned by another
-                        # uid (foreign reparenting) — treat as alive.
-                # No PID yet (worker hasn't booted) — skip liveness check
-                # this tick; heartbeat-staleness will catch it.
-            elif not info.process.is_alive():
-                with orch._module_lock:
-                    if info.process and not info.process.is_alive():
-                        exitcode = info.process.exitcode
-                        logger.warning(
-                            "[Supervisor] Module '%s' died (exitcode=%s)",
-                            name, exitcode)
-                        info.state = ModuleState.CRASHED
-                        self.bus.publish(make_msg(
-                            MODULE_CRASHED, "supervisor", "core",
-                            {"module": name, "exitcode": exitcode}))
-                        if info.spec.restart_on_crash:
-                            self.publish_module_restart_request(
-                                name, reason=f"died_exitcode_{exitcode}")
+            # Modules the orchestrator never autostarted / deliberately stopped
+            # have no live slot to police.
+            if not info.spec.autostart and info.state in (
+                    ModuleState.STOPPED, ModuleState.DISABLED):
                 continue
 
-            # 3. Heartbeat-timeout check (CPU-aware, 2026-04-21).
-            #
-            # Phase 11 §11.I.5 / locked D1: read the worker's SHM slot
-            # `last_heartbeat` field and take the MAX of (SHM, bus) signals.
-            # Workers migrated to the Phase 11 ModuleStateWriter contract
-            # may stop sending bus MODULE_HEARTBEAT and only update their
-            # SHM slot; without this read they'd be killed mid-cascade.
-            # Once W3 cascade lands fleet-wide and bus MODULE_HEARTBEAT is
-            # retired in workers, `info.last_heartbeat` becomes dead and
-            # this collapses to SHM-only.
-            if info.state == ModuleState.RUNNING:
-                hb_timeout = info.spec.heartbeat_timeout
-                effective_last_heartbeat = info.last_heartbeat
+            # ── Authoritative health read from the SHM slot ──
+            entry = None
+            if bank is not None:
                 try:
-                    _bank = orch._ensure_module_state_reader_bank()
-                    if _bank is not None:
-                        _entry = _bank.read(name)
-                        if _entry is not None and _entry.last_heartbeat > 0.0:
-                            if _entry.last_heartbeat > effective_last_heartbeat:
-                                effective_last_heartbeat = _entry.last_heartbeat
-                except Exception:  # noqa: BLE001 — SHM read must never crash
-                    pass
+                    entry = bank.read(name)
+                except Exception:  # noqa: BLE001 — SHM read must never crash tick
+                    entry = None
+            if entry is None:
+                # No slot yet: worker hasn't begun writing (pre-boot) or this
+                # module doesn't use ModuleStateWriter. Nothing to assess.
+                continue
 
-                if now - effective_last_heartbeat > hb_timeout:
-                    cpu_now = (orch._get_cpu_time_seconds(info.pid)
-                               if info.pid else 0.0)
+            sstate = entry.state or ""
+            spid = int(entry.pid or 0)
+            shb = float(entry.last_heartbeat or 0.0)
+
+            # Recovering / transitional states. STARTING→BOOTED→PROBING is the
+            # orchestrator-owned boot+probe progression AND exactly where a
+            # just-restarted module sits — so treating these as "do not
+            # restart" is the primary cascade dedup (the worker rewrites
+            # STARTING into its slot the moment it respawns). STOPPED/DISABLED
+            # are intentional. We still clear any stale restart-request marker
+            # once the module is observed transitioning (it's being honored).
+            if sstate in ("starting", "booted", "probing", "stopped",
+                          "disabled"):
+                continue
+
+            # ── Fault detection (state == running | unhealthy | crashed) ──
+            fault_reason: Optional[str] = None
+            if sstate == "crashed":
+                fault_reason = "shm_state_crashed"
+            elif sstate == "unhealthy":
+                fault_reason = "shm_state_unhealthy"
+            elif spid > 0:
+                import os as _os
+                import errno as _errno
+                try:
+                    _os.kill(spid, 0)  # liveness: signal-0
+                except OSError as _ke:
+                    if _ke.errno == _errno.ESRCH:
+                        fault_reason = "shm_pid_dead"
+                    # EPERM → exists under another uid → treat as alive.
+
+            # Heartbeat-staleness (CPU-aware grace) — only for a live RUNNING
+            # process that passed the liveness check above.
+            if fault_reason is None and sstate == "running" and spid > 0:
+                hb_timeout = info.spec.heartbeat_timeout
+                if now - shb > hb_timeout:
+                    cpu_now = orch._get_cpu_time_seconds(spid)
                     cpu_grew = (info.last_cpu_time > 0.0
                                 and cpu_now - info.last_cpu_time
                                 >= _MIN_CPU_DELTA_FOR_ALIVE)
-                    if (cpu_grew
-                            and info.consecutive_starved_cycles
+                    if (cpu_grew and info.consecutive_starved_cycles
                             < _MAX_STARVED_CYCLES):
                         info.consecutive_starved_cycles += 1
-                        logger.warning(
-                            "[Supervisor] Module '%s' heartbeat timeout "
-                            "(%.1fs > %.0fs) but CPU grew +%.2fs — "
-                            "alive-but-starved cycle %d/%d, deferring restart",
-                            name, now - effective_last_heartbeat, hb_timeout,
-                            cpu_now - info.last_cpu_time,
-                            info.consecutive_starved_cycles,
-                            _MAX_STARVED_CYCLES)
                         info.last_cpu_time = cpu_now
                         info.last_cpu_sample_ts = now
-                        continue
-                    # Stuck or grace exhausted.
-                    reason = ("heartbeat_timeout_starved_grace_exhausted"
-                              if info.consecutive_starved_cycles
-                              >= _MAX_STARVED_CYCLES
-                              else "heartbeat_timeout")
-                    # L1 crashes are architecturally unexpected — log ERROR.
-                    lvl = (logging.ERROR if info.spec.layer == "L1"
-                           else logging.WARNING)
-                    logger.log(
-                        lvl,
-                        "[Supervisor] Module '%s' [%s] heartbeat timeout "
-                        "(%.1fs > %.0fs limit) — restart reason=%s",
-                        name, info.spec.layer,
-                        now - effective_last_heartbeat, hb_timeout, reason)
-                    with orch._module_lock:
-                        info.state = ModuleState.UNHEALTHY
-                        info.consecutive_starved_cycles = 0
-                    if info.spec.restart_on_crash:
-                        self.publish_module_restart_request(
-                            name, reason=reason)
-                    continue
-                # Heartbeat fresh — refresh CPU sample baseline.
-                if info.pid:
-                    info.last_cpu_time = orch._get_cpu_time_seconds(info.pid)
+                        logger.warning(
+                            "[Supervisor] Module '%s' heartbeat stale "
+                            "(%.1fs > %.0fs) but CPU grew +%.2fs — alive-but-"
+                            "starved cycle %d/%d, deferring restart",
+                            name, now - shb, hb_timeout,
+                            cpu_now - info.last_cpu_time,
+                            info.consecutive_starved_cycles, _MAX_STARVED_CYCLES)
+                    else:
+                        fault_reason = (
+                            "heartbeat_timeout_starved_grace_exhausted"
+                            if info.consecutive_starved_cycles
+                            >= _MAX_STARVED_CYCLES else "heartbeat_timeout")
+                else:
+                    # Fresh heartbeat — refresh CPU baseline + reset starve +
+                    # clear any restart-request marker (module recovered).
+                    info.last_cpu_time = orch._get_cpu_time_seconds(spid)
                     info.last_cpu_sample_ts = now
-                if info.consecutive_starved_cycles > 0:
                     info.consecutive_starved_cycles = 0
+                    self._restart_requested_at.pop(name, None)
+                    # Reset restart count after sustained uptime.
+                    if (info.ready_time > 0
+                            and now - info.ready_time > orch._sustained_uptime_reset
+                            and info.restart_count > 0):
+                        info.restart_count = 0
+                        info.restart_timestamps.clear()
 
-            # 4. Reset restart count after sustained uptime.
-            if info.state == ModuleState.RUNNING and info.ready_time > 0:
-                if (now - info.ready_time > orch._sustained_uptime_reset
-                        and info.restart_count > 0):
-                    logger.info(
-                        "[Supervisor] Module '%s' sustained uptime %.0fs — "
-                        "resetting restart count",
-                        name, now - info.ready_time)
-                    info.restart_count = 0
-                    info.restart_timestamps.clear()
-
-            # 5. RSS budget check.
-            if info.pid:
-                rss = orch._get_rss_mb(info.pid)
+            # ── RSS budget (live RUNNING only) ──
+            if fault_reason is None and sstate == "running" and spid > 0:
+                rss = orch._get_rss_mb(spid)
                 info.rss_mb = rss
                 if rss > info.spec.rss_limit_mb:
-                    logger.warning(
-                        "[Supervisor] Module '%s' RSS %.0fMB > limit %dMB",
-                        name, rss, info.spec.rss_limit_mb)
-                    if info.spec.restart_on_crash:
-                        self.publish_module_restart_request(
-                            name, reason=f"rss_{rss:.0f}mb")
+                    fault_reason = f"rss_{rss:.0f}mb"
+
+            if fault_reason is None:
+                continue
+
+            # ── Restart-request emission with cooldown dedup ──
+            # The SHM state-machine suppression above is the primary dedup;
+            # this cooldown is the backstop for the window between publishing
+            # the request and the worker rewriting STARTING into its slot
+            # (stop+respawn+first-write ≈ tens of seconds). Without it the
+            # 1 Hz tick re-fires every second → serial 30s restart backlog
+            # (live T1 storm 2026-05-28).
+            if not info.spec.restart_on_crash:
+                continue
+            last_req = self._restart_requested_at.get(name, 0.0)
+            if now - last_req < _RESTART_REQUEST_COOLDOWN_S:
+                continue
+            self._restart_requested_at[name] = now
+            if fault_reason in ("shm_pid_dead", "shm_state_crashed"):
+                self.bus.publish(make_msg(
+                    MODULE_CRASHED, "supervisor", "core",
+                    {"module": name, "exitcode": None, "source": fault_reason}))
+            lvl = (logging.ERROR if info.spec.layer == "L1"
+                   else logging.WARNING)
+            logger.log(
+                lvl,
+                "[Supervisor] Module '%s' [%s] fault=%s (shm_state=%s pid=%d "
+                "hb_age=%.1fs) — requesting restart",
+                name, info.spec.layer, fault_reason, sstate, spid,
+                (now - shb) if shb > 0 else -1.0)
+            self.publish_module_restart_request(name, reason=fault_reason)
 
     # ── Status forwarders ────────────────────────────────────────────────────
 
