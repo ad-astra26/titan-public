@@ -60,50 +60,18 @@ def entry(recv_queue, send_queue, name: str, config: dict) -> None:
         _state_writer = None
 
     from titan_hcl.api.api_subprocess import api_subprocess_main
-    # Surface "booted" pre-delegate so the SHM slot transitions out of
-    # "starting" early.
+    # The api_subprocess_main run loop reaches "booted" after KernelRPCClient
+    # is wired (~5s into entry) and "running" after uvicorn binds the port
+    # (~15-30s further). Surface "booted" pre-delegate so the SHM slot
+    # transitions out of "starting" early; api_subprocess_main itself emits
+    # MODULE_READY on uvicorn-up which (under legacy bus-only liveness) is
+    # the canonical readiness signal — Supervisor uses the MAX(SHM, bus)
+    # heartbeat per §11.I.5.
     if _state_writer is not None:
         try:
             _state_writer.write_state("booted")
         except Exception:
             pass
-        # Self-attest "running" once uvicorn is actually serving. The api is a
-        # kernel-spawned PEER, not an orchestrator-probed worker — nothing
-        # dispatches MODULE_PROBE_REQUEST to it, and the legacy MODULE_READY
-        # readiness signal this used to rely on is DELETED (Phase 11 D1/D2). So
-        # without this it sits at "booted" forever (functional, but
-        # /v6/readiness under-counts it → 39/40). A daemon thread polls the
-        # api's OWN /health until 200 (uvicorn bound + app up) then writes
-        # "running" to its slot, mirroring how the Rust L0/L1 daemons
-        # self-attest. Daemon thread because api_subprocess_main blocks on
-        # uvicorn; the ModuleStateWriter heartbeat daemon then keeps it fresh.
-        import threading as _threading
-
-        def _self_attest_running() -> None:
-            import os as _os
-            import time as _time
-            import urllib.request as _url
-            try:
-                from titan_hcl.config_loader import load_titan_config as _ltc
-                _port = int(_os.environ.get("TITAN_API_PORT")
-                            or _ltc().get("api", {}).get("port", 7777))
-            except Exception:  # noqa: BLE001
-                _port = int(_os.environ.get("TITAN_API_PORT", "7777"))
-            _hc = f"http://127.0.0.1:{_port}/health"
-            _deadline = _time.time() + 180.0  # uvicorn bind + kernel_rpc connect
-            while _time.time() < _deadline:
-                try:
-                    with _url.urlopen(_hc, timeout=3) as _r:
-                        if getattr(_r, "status", None) == 200 or _r.getcode() == 200:
-                            _state_writer.write_state("running")
-                            return
-                except Exception:  # noqa: BLE001
-                    pass
-                _time.sleep(2.0)
-
-        _threading.Thread(
-            target=_self_attest_running,
-            name="api-self-attest-running", daemon=True).start()
     api_subprocess_main(recv_queue, send_queue, name, config)
 
 
