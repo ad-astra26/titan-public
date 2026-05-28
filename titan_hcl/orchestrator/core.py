@@ -290,14 +290,6 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         # CPU pressure on top of an already-serving fleet.
         self._post_boot_stagger_delay_s = max(
             0.0, float(cfg.get("post_boot_stagger_delay_s", 5.0)))
-        # Phase 11 §11.I.7 boot concurrency cap (Maker 2026-05-28). Non-blocking
-        # concurrent boot can oversubscribe a small box (cold imports of torch /
-        # models all at once → load 20-32 on the 4-core T1 box). This bounds the
-        # number of modules IN-FLIGHT (spawned but not yet state=running) at
-        # once; the 1Hz probe poller drives in-flight→running, freeing a slot
-        # for the next spawn. Caps the cold-boot CPU spike (≈cap concurrent
-        # cold-boots) while keeping full boot under ~3 min. 0 = uncapped.
-        self._boot_concurrency_cap = int(cfg.get("boot_concurrency_cap", 8))
         # Phase 11 §11.I.3 — per-module probe-wait budget. After spawn, the
         # orchestrator polls the worker's `module_<name>_state.bin` slot
         # waiting for state=RUNNING. Workers without a SHM writer (legacy,
@@ -440,19 +432,8 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             )
             return True
 
-    def start(self, name: str, activate_deps: bool = True) -> bool:
-        """Start a specific module process. Thread-safe via _module_lock.
-
-        `activate_deps` (default True) runs the §11.G.2.5 ENSURE_RUNNING
-        dep-activation, which BLOCKS up to SUPERVISION_DEPENDENCY_ACTIVATION_
-        TIMEOUT_S per critical dep waiting for it to reach RUNNING. That wait is
-        correct for LAZY / on-demand (proxy-driven) starts where the caller
-        needs the dep available NOW. During the COORDINATED boot pipeline
-        (start_all), the orchestrator already spawns every module in dep+layer
-        topo order and the 1Hz probe poller drives them all booted→running
-        concurrently — so the boot path passes `activate_deps=False` to avoid
-        serializing the otherwise-concurrent boot on per-dep 30s waits (the
-        cause of the ~90s Phase A on cold 4-core boot, Maker 2026-05-28)."""
+    def start(self, name: str) -> bool:
+        """Start a specific module process. Thread-safe via _module_lock."""
         # Microkernel v2 Phase A retrofit (2026-04-27): autonomous swap
         # interlock. If a shadow swap is in flight, block the calling
         # thread until the swap completes — prevents proxy lazy-starts
@@ -481,10 +462,8 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         # _module_lock so the recursive start(dep_name) call below does not
         # deadlock on its own lock re-acquire. DAG-acyclicity is enforced by
         # SPEC §11.G.7 (arch_map verify --check-deps); recursive activation
-        # terminates by induction on DAG depth. Skipped on the boot path
-        # (activate_deps=False) — see start() docstring.
-        if activate_deps:
-            self._activate_dependencies(name)
+        # terminates by induction on DAG depth.
+        self._activate_dependencies(name)
 
         with self._module_lock:
             info = self._modules.get(name)
@@ -1442,6 +1421,39 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
 
     # ── Phase 11 §11.I.7 / RFP 11F — wave-based boot ──────────────────────
 
+    def _compute_boot_waves(self, names: list[str]) -> list[list[str]]:
+        """Topological *levels* (waves) for wave-based boot per RFP 11F.
+
+        Same algorithm as `_compute_boot_order` but returns each topo level as
+        its own group (layer-ascending + alphabetic within) instead of one flat
+        list. Modules in a wave have all their MODULE deps satisfied by prior
+        waves, so they boot CONCURRENTLY; the next wave waits for this one to
+        reach RUNNING. With deps mostly undeclared this collapses to a single
+        wave (all modules boot in parallel) — exactly the fast staggered-
+        parallel behaviour Phase 9 9L had, now probe-gated.
+        """
+        name_set = set(names)
+        incoming: dict[str, set[str]] = {n: set() for n in names}
+        for n in names:
+            spec = self._modules[n].spec
+            for dep in spec.dependencies:
+                if dep.kind == DependencyKind.MODULE and dep.name in name_set:
+                    incoming[n].add(dep.name)
+        waves: list[list[str]] = []
+        remaining = set(names)
+        while remaining:
+            ready = [n for n in remaining if not (incoming[n] & remaining)]
+            if not ready:
+                logger.warning(
+                    "[Orchestrator] boot dep cycle among %s — collapsing to "
+                    "one flat wave", sorted(remaining))
+                ready = sorted(remaining)
+            ready.sort(key=lambda n: (self._modules[n].spec.layer, n))
+            waves.append(ready)
+            for n in ready:
+                remaining.discard(n)
+        return waves
+
     def _wait_for_wave_running(
         self, names: list[str], timeout_s: float,
     ) -> int:
@@ -1485,49 +1497,6 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             if pending:
                 time.sleep(0.1)
         return len(ready)
-
-    def _spawn_capped(
-        self, order: list[str], stagger: float, ready_timeout: float,
-    ) -> int:
-        """Spawn `order` (dep+layer topo) with BOUNDED CONCURRENCY, then wait
-        for all to reach RUNNING (Maker 2026-05-28).
-
-        Never more than `self._boot_concurrency_cap` modules are IN-FLIGHT
-        (spawned but not yet state=running) at once: the 1Hz probe poller drives
-        in-flight→running, and as each reaches running it frees a slot for the
-        next spawn. This bounds the cold-boot CPU spike on a small box while
-        keeping full boot fast. The gate has a bounded wait (`ready_timeout`) so
-        a single stuck module can never deadlock the boot. Returns count RUNNING.
-
-        cap <= 0 → uncapped (spawn all staggered). bank is None (test fixtures,
-        no /dev/shm) → uncapped (the gate is a no-op there).
-        """
-        bank = self._ensure_module_state_reader_bank()
-        cap = self._boot_concurrency_cap
-
-        def _running(n: str) -> bool:
-            if bank is None:
-                return True
-            try:
-                e = bank.read(n)
-                return bool(e) and e.state == "running"
-            except Exception:  # noqa: BLE001
-                return False
-
-        spawned: list[str] = []
-        for name in order:
-            # Gate: bound in-flight (spawned, not yet running) to `cap`. Bounded
-            # by ready_timeout so a stuck module can't stall the whole boot.
-            if cap > 0 and bank is not None:
-                gate_deadline = time.time() + ready_timeout
-                while (time.time() < gate_deadline
-                       and sum(1 for n in spawned if not _running(n)) >= cap):
-                    time.sleep(0.3)
-            if spawned and stagger > 0:
-                time.sleep(stagger)
-            self.start(name, activate_deps=False)  # poller drives readiness
-            spawned.append(name)
-        return self._wait_for_wave_running(order, ready_timeout)
 
     def _wait_for_module_running(
         self,
@@ -1751,38 +1720,39 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         # every wave's booted→running concurrently (SPEC §11.I.7 / RFP 11D).
         self._ensure_probe_poller_started()
 
-        # Phase A — MANDATORY (non-blocking CONCURRENT boot — Maker 2026-05-28).
-        # Spawn ALL mandatory modules staggered in dep+layer order WITHOUT
-        # blocking between dependency waves; the continuous probe poller drives
-        # every slot booted→running concurrently. Then ONE bounded readiness
-        # wait for the whole mandatory set before publishing fleet_ready —
-        # replacing the 3 sequential per-wave blocking waits that cost ~90s on
-        # cold 4-core boot (the slowest module governed each wave, serially).
-        # Dependency correctness holds via the topo+layer spawn ORDER + start()'s
-        # recursive _activate_dependencies; the poller + supervisor finish any
-        # straggler past the readiness wait. Restores monolith-class concurrent
-        # boot while keeping Phase 11 probe-verified readiness.
+        # Phase A — MANDATORY (wave-based per RFP 11F).
         phase_a_t0 = time.time()
-        order = self._compute_boot_order(mandatory)
+        waves = self._compute_boot_waves(mandatory)
         logger.info(
-            "[Orchestrator] Phase A (MANDATORY) start: %d modules CONCURRENT "
-            "(dep+layer order); stagger %.1fs; cap %d in-flight; readiness wait "
-            "≤%.0fs", len(order), self._boot_stagger_delay_s,
-            self._boot_concurrency_cap, self._probe_wait_timeout_s)
-        ready_count = self._spawn_capped(
-            order, self._boot_stagger_delay_s, self._probe_wait_timeout_s)
+            "[Orchestrator] Phase A (MANDATORY) start: %d modules in %d "
+            "dep-wave(s); stagger %.1fs; wave wait ≤%.0fs",
+            len(mandatory), len(waves), self._boot_stagger_delay_s,
+            self._probe_wait_timeout_s)
+        ready_count = 0
+        for wi, wave in enumerate(waves, start=1):
+            # Spawn the whole wave (staggered to avoid a cold-import CPU spike),
+            # then wait for it to reach RUNNING CONCURRENTLY — not one module at
+            # a time. The poller probes each module as it hits `booted`.
+            for si, name in enumerate(wave):
+                if (wi > 1 or si > 0) and self._boot_stagger_delay_s > 0:
+                    time.sleep(self._boot_stagger_delay_s)
+                self.start(name)
+            wave_ready = self._wait_for_wave_running(
+                wave, self._probe_wait_timeout_s)
+            ready_count += wave_ready
+            if wave_ready < len(wave):
+                logger.warning(
+                    "[Orchestrator] Phase A wave %d/%d: %d/%d modules RUNNING "
+                    "in ≤%.0fs — proceeding (poller keeps probing; supervisor "
+                    "monitors)", wi, len(waves), wave_ready, len(wave),
+                    self._probe_wait_timeout_s)
+            if writer is not None:
+                writer.update(mandatory_ready=ready_count)
         phase_a_dt = time.time() - phase_a_t0
-        if ready_count < len(order):
-            logger.warning(
-                "[Orchestrator] Phase A: %d/%d MANDATORY RUNNING in %.1fs "
-                "(readiness wait ≤%.0fs) — publishing fleet_ready; poller keeps "
-                "probing stragglers", ready_count, len(order), phase_a_dt,
-                self._probe_wait_timeout_s)
-        else:
-            logger.info(
-                "[Orchestrator] Phase A complete in %.1fs — %d/%d MANDATORY "
-                "RUNNING; publishing fleet_ready",
-                phase_a_dt, ready_count, len(order))
+        logger.info(
+            "[Orchestrator] Phase A complete in %.1fs — %d/%d MANDATORY "
+            "modules RUNNING; publishing fleet_ready",
+            phase_a_dt, ready_count, len(mandatory))
         if writer is not None:
             writer.update(
                 fleet_ready=True,
@@ -1825,23 +1795,38 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         writer = self._ensure_titan_hcl_state_writer()
         if writer is not None:
             writer.update(boot_phase="booting_b")
-        # Poller is already live from Phase A; ensure it (defensive).
+        # Poller is already live from Phase A; ensure it (defensive) so post-
+        # boot waves get probed too.
         self._ensure_probe_poller_started()
-        # Non-blocking CONCURRENT post-boot (Maker 2026-05-28): spawn all
-        # post-boot modules staggered in dep+layer order, then ONE readiness
-        # wait (poller drives booted→running concurrently). Mirrors Phase A.
-        order = self._compute_boot_order(names)
+        waves = self._compute_boot_waves(names)
         t0 = time.time()
-        # Bounded-concurrency spawn (cap shared with Phase A) — Phase B is the
-        # heavy set (incl. memory/agno/cognitive moved here), so the cap is what
-        # keeps the post-boot cold-import spike off the already-serving fleet.
-        ready_count = self._spawn_capped(
-            order, self._post_boot_stagger_delay_s, self._probe_wait_timeout_s)
+        ready_count = 0
+        for wi, wave in enumerate(waves, start=1):
+            for si, name in enumerate(wave):
+                if (wi > 1 or si > 0) and self._post_boot_stagger_delay_s > 0:
+                    time.sleep(self._post_boot_stagger_delay_s)
+                try:
+                    self.start(name)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "[Orchestrator] Phase B module '%s' spawn raised %s — "
+                        "marking degraded + continuing", name, e)
+            wave_ready = self._wait_for_wave_running(
+                wave, self._probe_wait_timeout_s)
+            ready_count += wave_ready
+            if wave_ready < len(wave):
+                logger.warning(
+                    "[Orchestrator] Phase B wave %d/%d: %d/%d modules RUNNING "
+                    "in ≤%.0fs — continuing (degraded; poller keeps probing)",
+                    wi, len(waves), wave_ready, len(wave),
+                    self._probe_wait_timeout_s)
+            if writer is not None:
+                writer.update(post_boot_ready=ready_count)
         dt = time.time() - t0
         logger.info(
             "[Orchestrator] Phase B complete in %.1fs — %d/%d "
             "OPTIONAL_POST_BOOT modules RUNNING; publishing "
-            "fleet_optional_ready", dt, ready_count, len(order))
+            "fleet_optional_ready", dt, ready_count, len(names))
         if writer is not None:
             writer.update(
                 fleet_optional_ready=True,

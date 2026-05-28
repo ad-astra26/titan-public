@@ -635,23 +635,6 @@ sustained_uptime_reset = 300.0
 # Affects: heartbeat-timeout false-positives during fleet boot
 boot_stagger_delay_s = 1.5
 
-# Phase 11 §11.I.7/§11.I.8 boot-speed tuning (2026-05-28). The continuous
-# probe poller (RFP 11D) drives every `booted` slot → `running` at 1Hz, so the
-# boot pipeline no longer needs to BLOCK for the full per-module probe budget on
-# each wave — §11.I.7 explicitly allows the next wave to proceed "or per-module
-# probe timeout" and the poller finishes any straggler. These two knobs restore
-# monolith-class boot speed (~2 min full) lost when Phase 11 added blocking
-# waves + a conservative 5s post-boot stagger:
-#   * probe_wait_timeout_s — per-wave readiness wait cap (poller backstops).
-#     30s blocked ~80s across 3 mandatory waves on cold 4-core boot; 15s halves
-#     it. _wait_for_module_running (dep-activation/reload) uses this same budget.
-#   * post_boot_stagger_delay_s — spacing between Phase B (OPTIONAL_POST_BOOT)
-#     spawns. 5s × 29 = 145s of pure delay; 1.5s (= mandatory stagger, proven
-#     safe at 9L) cuts Phase B to ~44s. CPU-spike risk is low now that the
-#     heartbeat cascade is fixed (centralized ModuleStateWriter daemon).
-probe_wait_timeout_s = 15.0
-post_boot_stagger_delay_s = 1.5
-
 
 # ─── OUTER TRINITY (Expressive Metrics) ──────────────────────────
 # Baselines for normalizing Titan's external expression.
