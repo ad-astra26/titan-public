@@ -53,7 +53,18 @@ logger = logging.getLogger(__name__)
 
 
 HEARTBEAT_INTERVAL_S = 30.0
-KERNEL_CONNECT_TIMEOUT_S = 30.0
+# Phase 11 §11.I.1 / D-SPEC-141 — under kernel-rs peer-spawn the api is
+# launched at T+0 (sibling to titan_hcl), but kernel_rpc only binds inside
+# TitanHCL.boot() which runs AFTER titan_hcl's orchestrator start_all
+# (worker dependency waves). The legacy 30s window was calibrated for the
+# OLD topology where guardian spawned the api LATE (after its agno+memory
+# deps were READY, ~when kernel_rpc was already up). At T+0 the api must
+# wait out the full plugin-boot path, so 30s is too short and the api
+# would die (the `return` below assumed Guardian would respawn it — it
+# won't, the api is now a kernel-rs peer, not a Guardian module). 300s
+# comfortably covers a cold-boot start_all + plugin boot even on a
+# loaded VPS (observed worst-case ~270s during the T3 cascade).
+KERNEL_CONNECT_TIMEOUT_S = 300.0
 
 
 def _send_msg(send_queue, msg_type: str, src: str, dst: str,
@@ -106,8 +117,14 @@ def api_subprocess_main(recv_queue, send_queue, name: str, config: dict) -> None
         rpc_client.connect()
     except Exception as e:
         logger.error(
-            "[ApiSubprocess] kernel_rpc connect failed: %s", e, exc_info=True)
-        return  # Guardian will restart us
+            "[ApiSubprocess] kernel_rpc connect failed after %ss: %s",
+            KERNEL_CONNECT_TIMEOUT_S, e, exc_info=True)
+        # Phase 11 §11.I.1: the api is a kernel-rs peer now (not a
+        # Guardian-supervised module), so nothing respawns it on exit.
+        # The 240s connect window above should make this path unreachable
+        # on a healthy boot; if reached, exit non-zero so kernel-rs's
+        # supervision log records the failure for the operator.
+        raise SystemExit(1)
     plugin_proxy = rpc_client.get_plugin_proxy()
     logger.info("[ApiSubprocess] connected to kernel_rpc")
 
