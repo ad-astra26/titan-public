@@ -1757,12 +1757,21 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 or (info.spec.boot_priority or "").lower() == "lazy")
             and getattr(info.spec, "reports_lifecycle_slot", True))
 
+        # Readiness totals are roster-based (lifecycle-reporting modules) — NOT
+        # len(mandatory)/len(post_boot), which include the imw-class persistence
+        # writers that are spawned but never write a running slot. Counting them
+        # in the denominator pinned mandatory_ready below mandatory_total
+        # forever (e.g. 9/12). The boot partition above is unchanged — writers
+        # still spawn; they're just absent from the readiness ready/total math.
+        _roster_mandatory_total = sum(1 for _, p in roster if p == "mandatory")
+        _roster_post_boot_total = sum(1 for _, p in roster if p == "post_boot")
+
         writer = self._ensure_titan_hcl_state_writer()
         if writer is not None:
             writer.update(
                 boot_phase="booting_a",
-                mandatory_total=len(mandatory),
-                post_boot_total=len(post_boot),
+                mandatory_total=_roster_mandatory_total,
+                post_boot_total=_roster_post_boot_total,
                 lazy_total=lazy_total,
                 roster=roster)
 
