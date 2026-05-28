@@ -33,6 +33,7 @@ import os
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 from contextlib import suppress
 from datetime import datetime, timezone
@@ -205,13 +206,6 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     with suppress(Exception):
         loop.run_until_complete(backup.check_on_boot())
 
-    # rFP I4 — dry-run on boot (build tarball + validate, no upload)
-    if dry_run_on_boot:
-        try:
-            _dry_run(backup, local_dir, tarball_validate)
-        except Exception as e:
-            logger.warning("[BackupWorker] Dry-run failed: %s", e)
-
     boot_elapsed = time.time() - init_start
     logger.info("[BackupWorker] Ready in %.1fs (local_dir=%s, mode=%s)",
                 boot_elapsed, local_dir, mode)
@@ -226,6 +220,22 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             logger.warning(
                 "[BackupWorker] Phase 11 write_state(booted) failed: %s",
                 _swb_err)
+
+    # rFP I4 — boot dry-run (build tarball + validate, no upload). Maker
+    # 2026-05-28: moved to a background daemon thread. It builds a FULL tar.gz
+    # of data/ (~22GB → ~444s) which previously ran SYNCHRONOUSLY before the
+    # `booted` transition, leaving backup stuck `starting` for ~7min on every
+    # boot. It is pure pre-flight validation (no upload) so it must NOT gate
+    # readiness — the slot now reaches booted→running in seconds while the
+    # dry-run completes in the background.
+    if dry_run_on_boot:
+        def _bg_dry_run() -> None:
+            try:
+                _dry_run(backup, local_dir, tarball_validate)
+            except Exception as _dr_err:  # noqa: BLE001
+                logger.warning("[BackupWorker] Dry-run failed: %s", _dr_err)
+        threading.Thread(
+            target=_bg_dry_run, name="backup-boot-dry-run", daemon=True).start()
     _send(send_queue, "BACKUP_WORKER_READY", name, "all", {
         "titan_id": titan_id,
         "mode": mode,

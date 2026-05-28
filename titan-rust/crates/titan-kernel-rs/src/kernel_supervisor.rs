@@ -51,16 +51,49 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use crate::spawn::{spawn_guardian_hcl, spawn_substrate, SpawnConfig, SpawnError};
+use crate::spawn::{
+    spawn_guardian_hcl, spawn_substrate, spawn_titan_hcl, spawn_titan_hcl_api, SpawnConfig,
+    SpawnError,
+};
 use crate::supervision_log::{JsonlSupervisionPublisher, SupervisionLogError};
 
 /// Canonical child name for the trinity-substrate (titan-trinity-rs)
 /// child. MUST match SPEC §9.A.
 pub const CHILD_NAME_SUBSTRATE: &str = "trinity-substrate";
 
-/// Canonical child name for the Python plugin (`python -m titan_hcl`)
-/// child. MUST match SPEC §9.B titan_HCL row.
+/// Canonical child name for the guardian_hcl (L1 supervisor) Python peer.
+/// Historically "titan_HCL" (the supervised "python" child); kept stable for
+/// the supervision.jsonl audit trail. MUST match SPEC §9.B.
 pub const CHILD_NAME_PYTHON: &str = "titan_HCL";
+
+/// Phase 11 §11.I.1 / §11.B.4 — the titan_hcl (L2 orchestrator) Python peer.
+pub const CHILD_NAME_TITAN_HCL: &str = "titan_hcl";
+
+/// Phase 11 §11.I.1 / §11.B.4 — the titan_hcl_api (L3) Python peer.
+pub const CHILD_NAME_TITAN_HCL_API: &str = "titan_hcl_api";
+
+/// Which spawn function respawns a given supervised child (Phase 11.x — kernel
+/// now supervises all 3 Python peers + substrate; each must respawn via its
+/// OWN spawn fn, not a single hardcoded one). Normalizes the substrate spawn
+/// (`Result<Child>`) to the python peers' `Result<Option<Child>>` shape.
+#[derive(Clone, Copy, Debug)]
+enum RespawnKind {
+    Substrate,
+    GuardianHcl,
+    TitanHcl,
+    TitanHclApi,
+}
+
+impl RespawnKind {
+    fn spawn(self, cfg: &SpawnConfig) -> Result<Option<Child>, SpawnError> {
+        match self {
+            RespawnKind::Substrate => spawn_substrate(cfg).map(Some),
+            RespawnKind::GuardianHcl => spawn_guardian_hcl(cfg),
+            RespawnKind::TitanHcl => spawn_titan_hcl(cfg),
+            RespawnKind::TitanHclApi => spawn_titan_hcl_api(cfg),
+        }
+    }
+}
 
 /// Errors during kernel-supervisor setup.
 #[derive(Debug, Error)]
@@ -143,6 +176,13 @@ impl KernelChildSupervisor {
         // + observatory.db etc. Their shutdown discipline matters per §11.H.
         sup.register_child(ChildSpec::new(CHILD_NAME_SUBSTRATE).critical_data_writer())?;
         sup.register_child(ChildSpec::new(CHILD_NAME_PYTHON).critical_data_writer())?;
+        // Phase 11.x — titan_hcl (L2 orchestrator) + titan_hcl_api (L3) are
+        // kernel peers too; register them so the kernel watches + respawns them
+        // (previously fire-and-forget spawned → zombied on death). titan_hcl is
+        // a critical-data writer (inner_memory.db etc.); the api is read-only
+        // SHM-direct (state reads survive its restart) so not critical-data.
+        sup.register_child(ChildSpec::new(CHILD_NAME_TITAN_HCL).critical_data_writer())?;
+        sup.register_child(ChildSpec::new(CHILD_NAME_TITAN_HCL_API))?;
 
         Ok(Arc::new(Self {
             supervisor: Arc::new(Mutex::new(sup)),
@@ -191,7 +231,7 @@ impl KernelChildSupervisor {
             .mark_running(CHILD_NAME_SUBSTRATE, pid)?;
         let this = Arc::clone(self);
         let handle = self.runtime.spawn(async move {
-            this.watch_loop(CHILD_NAME_SUBSTRATE, child, /*is_python=*/ false)
+            this.watch_loop(CHILD_NAME_SUBSTRATE, child, RespawnKind::Substrate)
                 .await;
         });
         Ok(handle)
@@ -224,7 +264,72 @@ impl KernelChildSupervisor {
             .mark_running(CHILD_NAME_PYTHON, pid)?;
         let this = Arc::clone(self);
         let handle = self.runtime.spawn(async move {
-            this.watch_loop(CHILD_NAME_PYTHON, child, /*is_python=*/ true)
+            this.watch_loop(CHILD_NAME_PYTHON, child, RespawnKind::GuardianHcl)
+                .await;
+        });
+        Ok(Some(handle))
+    }
+
+    /// Spawn titan_hcl (L2 orchestrator) + start its watch task (Phase 11.x).
+    pub fn spawn_and_watch_titan_hcl(
+        self: &Arc<Self>,
+    ) -> Result<Option<JoinHandle<()>>, KernelSupervisorError> {
+        let child_opt =
+            spawn_titan_hcl(&self.spawn_config).map_err(|source| KernelSupervisorError::Spawn {
+                child: CHILD_NAME_TITAN_HCL.to_string(),
+                source,
+            })?;
+        let child = match child_opt {
+            Some(c) => c,
+            None => {
+                info!("kernel_supervisor: titan_hcl spawn disabled (test mode)");
+                return Ok(None);
+            }
+        };
+        let pid = child.id().unwrap_or(0);
+        info!(
+            event = "KERNEL_SUPERVISOR_TITAN_HCL_SPAWNED",
+            pid, "titan_hcl spawned + supervision attached"
+        );
+        self.supervisor
+            .lock()
+            .mark_running(CHILD_NAME_TITAN_HCL, pid)?;
+        let this = Arc::clone(self);
+        let handle = self.runtime.spawn(async move {
+            this.watch_loop(CHILD_NAME_TITAN_HCL, child, RespawnKind::TitanHcl)
+                .await;
+        });
+        Ok(Some(handle))
+    }
+
+    /// Spawn titan_hcl_api (L3) + start its watch task (Phase 11.x).
+    pub fn spawn_and_watch_titan_hcl_api(
+        self: &Arc<Self>,
+    ) -> Result<Option<JoinHandle<()>>, KernelSupervisorError> {
+        let child_opt = spawn_titan_hcl_api(&self.spawn_config).map_err(|source| {
+            KernelSupervisorError::Spawn {
+                child: CHILD_NAME_TITAN_HCL_API.to_string(),
+                source,
+            }
+        })?;
+        let child = match child_opt {
+            Some(c) => c,
+            None => {
+                info!("kernel_supervisor: titan_hcl_api spawn disabled (test mode)");
+                return Ok(None);
+            }
+        };
+        let pid = child.id().unwrap_or(0);
+        info!(
+            event = "KERNEL_SUPERVISOR_TITAN_HCL_API_SPAWNED",
+            pid, "titan_hcl_api spawned + supervision attached"
+        );
+        self.supervisor
+            .lock()
+            .mark_running(CHILD_NAME_TITAN_HCL_API, pid)?;
+        let this = Arc::clone(self);
+        let handle = self.runtime.spawn(async move {
+            this.watch_loop(CHILD_NAME_TITAN_HCL_API, child, RespawnKind::TitanHclApi)
                 .await;
         });
         Ok(Some(handle))
@@ -232,7 +337,7 @@ impl KernelChildSupervisor {
 
     /// Per-child watch loop: await child exit, classify, decide, respawn
     /// or escalate per SPEC §11.B.
-    async fn watch_loop(self: Arc<Self>, name: &'static str, mut child: Child, is_python: bool) {
+    async fn watch_loop(self: Arc<Self>, name: &'static str, mut child: Child, kind: RespawnKind) {
         loop {
             let pid = child.id().unwrap_or(0);
             let wait_result = child.wait().await;
@@ -283,23 +388,16 @@ impl KernelChildSupervisor {
                         delay_ms = delay.as_millis() as u64,
                         "respawning child"
                     );
-                    // Re-spawn via the same spawn function used at boot.
-                    let respawn = if is_python {
-                        match spawn_guardian_hcl(&self.spawn_config) {
-                            Ok(Some(c)) => Some(c),
-                            Ok(None) => None,
-                            Err(e) => {
-                                error!(err = ?e, "python respawn failed");
-                                None
-                            }
-                        }
-                    } else {
-                        match spawn_substrate(&self.spawn_config) {
-                            Ok(c) => Some(c),
-                            Err(e) => {
-                                error!(err = ?e, "substrate respawn failed");
-                                None
-                            }
+                    // Re-spawn via the child's OWN spawn function (Phase 11.x —
+                    // was a single hardcoded spawn_guardian_hcl for any python
+                    // child, which would have respawned titan_hcl/api as
+                    // guardian_hcl; RespawnKind routes each to its own fn).
+                    let respawn = match kind.spawn(&self.spawn_config) {
+                        Ok(Some(c)) => Some(c),
+                        Ok(None) => None,
+                        Err(e) => {
+                            error!(err = ?e, child = name, "respawn failed");
+                            None
                         }
                     };
                     match respawn {

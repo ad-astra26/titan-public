@@ -327,6 +327,8 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
 
     let mut substrate_watch_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut python_watch_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut titan_hcl_watch_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut titan_hcl_api_watch_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     if options.spawn_substrate {
         info!(
@@ -372,21 +374,21 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
     }
 
     // B9.b: Phase 11 §11.I.1 / D-SPEC-141 — kernel-rs peer-spawns
-    // titan_hcl (orchestrator) + titan_hcl_api as siblings to
-    // guardian_hcl. Per Maker 2026-05-27 — no parent-child relationship
-    // between the three Python processes; each is a kernel-rs peer.
-    // Spawn directly via spawn::spawn_titan_hcl / spawn_titan_hcl_api
-    // (not via KernelChildSupervisor) for the initial Phase 11 land —
-    // supervised respawn wiring follows in a Phase 11.x cleanup pass.
+    // titan_hcl (orchestrator) + titan_hcl_api as siblings to guardian_hcl.
+    // Phase 11.x (Maker 2026-05-28): SUPERVISED via KernelChildSupervisor
+    // (was fire-and-forget direct spawn → zombied on death). The supervisor
+    // now watches + respawns all 3 Python peers via their own spawn fns, so
+    // `kill -9 titan_hcl|titan_hcl_api` self-recovers (INV-PROC-5). Shutdown
+    // is via PDEATHSIG (§11.C.1) like substrate/guardian, not children.sigterm.
     if options.spawn_titan_hcl {
         info!(
             event = "BOOT_B9b_SPAWN_TITAN_HCL",
-            "B9.b spawning titan_hcl (Phase 11 peer)"
+            "B9.b spawning titan_hcl (Phase 11 peer, supervised)"
         );
-        match crate::spawn::spawn_titan_hcl(&spawn_config) {
-            Ok(Some(child)) => {
-                *children.titan_hcl.lock() = Some(child);
-                info!("B9.b titan_hcl spawned");
+        match kernel_supervisor.spawn_and_watch_titan_hcl() {
+            Ok(Some(handle)) => {
+                titan_hcl_watch_handle = Some(handle);
+                info!("B9.b titan_hcl watch task running");
             }
             Ok(None) => info!("B9.b titan_hcl spawn returned None (disabled)"),
             Err(e) => warn!(err = ?e, "B9.b titan_hcl spawn failed; continuing"),
@@ -395,12 +397,12 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
     if options.spawn_titan_hcl_api {
         info!(
             event = "BOOT_B9c_SPAWN_TITAN_HCL_API",
-            "B9.c spawning titan_hcl_api (Phase 11 peer)"
+            "B9.c spawning titan_hcl_api (Phase 11 peer, supervised)"
         );
-        match crate::spawn::spawn_titan_hcl_api(&spawn_config) {
-            Ok(Some(child)) => {
-                *children.titan_hcl_api.lock() = Some(child);
-                info!("B9.c titan_hcl_api spawned");
+        match kernel_supervisor.spawn_and_watch_titan_hcl_api() {
+            Ok(Some(handle)) => {
+                titan_hcl_api_watch_handle = Some(handle);
+                info!("B9.c titan_hcl_api watch task running");
             }
             Ok(None) => info!("B9.c titan_hcl_api spawn returned None (disabled)"),
             Err(e) => warn!(err = ?e, "B9.c titan_hcl_api spawn failed; continuing"),
@@ -467,6 +469,12 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
             let _ = h.await;
         }
         if let Some(h) = python_watch_handle {
+            let _ = h.await;
+        }
+        if let Some(h) = titan_hcl_watch_handle {
+            let _ = h.await;
+        }
+        if let Some(h) = titan_hcl_api_watch_handle {
             let _ = h.await;
         }
     })
