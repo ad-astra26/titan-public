@@ -21,19 +21,6 @@ from titan_hcl import bus
 logger = logging.getLogger(__name__)
 
 
-def _ph_rss_mb() -> int:
-    """Resident-set size of THIS process (agno_worker) in MB. Diagnostic for
-    the chat-time RSS growth (rFP §9.1) — emitted per _ph_stage so the
-    pre/post hook stage logs show exactly where RSS balloons. Cheap
-    (/proc/self/statm read). Returns 0 on any failure (non-Linux / no /proc)."""
-    try:
-        with open("/proc/self/statm", "r") as _f:
-            _rss_pages = int(_f.read().split()[1])
-        return _rss_pages * 4096 // (1024 * 1024)  # pages→bytes→MB (4KB pages)
-    except Exception:  # noqa: BLE001
-        return 0
-
-
 # ─────────────────────────────────────────────────────────────────────
 # Phase 2 Chunk γ (D-SPEC-78, 2026-05-18) — PreHook TTL cache.
 # ─────────────────────────────────────────────────────────────────────
@@ -471,8 +458,7 @@ def create_pre_hook(plugin):
         _ph_t0 = _ph_time.monotonic()
         def _ph_stage(name: str) -> None:
             elapsed_ms = int((_ph_time.monotonic() - _ph_t0) * 1000)
-            logger.info("[PreHook:t] stage=%s t+%dms rss=%dMB",
-                        name, elapsed_ms, _ph_rss_mb())
+            logger.info("[PreHook:t] stage=%s t+%dms", name, elapsed_ms)
         _ph_stage("entry")
 
         # ── PRIME DIRECTIVE VERIFICATION — before ANY LLM processing ──
@@ -1792,8 +1778,7 @@ def create_post_hook(plugin):
         _ph_t0 = _ph_time.monotonic()
         def _ph_stage(name: str) -> None:
             elapsed_ms = int((_ph_time.monotonic() - _ph_t0) * 1000)
-            logger.info("[PostHook:t] stage=%s t+%dms rss=%dMB",
-                        name, elapsed_ms, _ph_rss_mb())
+            logger.info("[PostHook:t] stage=%s t+%dms", name, elapsed_ms)
         _ph_stage("entry")
 
         # Extract prompt and response from RunOutput
