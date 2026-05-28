@@ -852,7 +852,10 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
     # tolerates None entries, so engines that failed to init at boot are
     # cleanly skipped.
     try:
-        from titan_hcl.modules.spirit_loop import start_snapshot_builder_threads
+        # Phase 10E — snapshot builders relocated out of the retiring spirit_loop
+        # into logic/snapshot_builders.py (driven here; they read cognitive_worker's
+        # in-process engine objects via state_refs).
+        from titan_hcl.logic.snapshot_builders import start_snapshot_builder_threads
         start_snapshot_builder_threads(
             state_refs, config, send_queue=send_queue, name=name)
         logger.info(
