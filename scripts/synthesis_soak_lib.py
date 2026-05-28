@@ -607,6 +607,17 @@ async def run(*, duration: int, internal_key: str, targets: Optional[list[str]] 
         return 0
 
     stop = asyncio.Event()
+    # Graceful stop: SIGINT/SIGTERM set the stop event so drivers + pollers exit
+    # their wait_for, gather returns, and the `finally` saves the checkpoint +
+    # closes clients. (Resume also works from a hard kill via the per-turn
+    # checkpoint, but this guarantees a clean checkpoint-on-stop for ops.)
+    try:
+        loop = asyncio.get_running_loop()
+        import signal as _sig
+        for _s in (_sig.SIGINT, _sig.SIGTERM):
+            loop.add_signal_handler(_s, stop.set)
+    except (NotImplementedError, RuntimeError):
+        pass  # add_signal_handler unsupported on this platform — fall back to default
     clients: dict[str, httpx.AsyncClient] = {}
     tasks = []
     for t in tgts:
