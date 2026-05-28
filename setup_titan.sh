@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# setup_titan.sh — thin bootstrap for a sovereign Titan install (W1.h).
+#
+# Philosophy: THIN bootstrap, FAT audited wizard. The only thing a stranger
+# runs sight-unseen is this ~100-line script; it merely (1) checks the host can
+# run Titan, (2) clones the PUBLIC repo at a pinned ref, and (3) hands off to
+# the reviewed, versioned in-repo wizard (`python3 -m scripts.setup_titan`).
+# Everything consequential lives in code you can read on GitHub before trusting.
+#
+#   curl -fsSL https://raw.githubusercontent.com/ad-astra26/titan-public/main/setup_titan.sh | bash
+#   # pass wizard args after `--`:
+#   curl -fsSL .../setup_titan.sh | bash -s -- --default
+#
+# Flags (consumed here): --tag <ref>  --dir <path>  --help
+# All other args are forwarded verbatim to `setup_titan install`.
+set -euo pipefail
+
+PUBLIC_REPO="https://github.com/ad-astra26/titan-public.git"
+DEFAULT_REF="main"            # release tags pin vX.Y.Z; main is the rolling alpha
+DEFAULT_DIR="${HOME}/titan"
+MIN_PY_MINOR=11               # require Python 3.11+
+
+# ── brand-ish output (no deps) ──────────────────────────────────────────────
+_haze()  { printf '\033[38;2;229;199;158m%s\033[0m\n' "$*"; }
+_grow()  { printf '\033[38;2;119;204;204m%s\033[0m\n' "$*"; }
+_warn()  { printf '\033[38;2;229;199;158m⚠ %s\033[0m\n' "$*" >&2; }
+_die()   { printf '\033[38;2;255;107;107m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+setup_titan.sh — bootstrap a sovereign Titan.
+
+  --tag <ref>   git ref to clone (default: ${DEFAULT_REF}; a release uses vX.Y.Z)
+  --dir <path>  install directory (default: ${DEFAULT_DIR})
+  --help        this message
+
+Any other flags are passed to the wizard, e.g.:
+  setup_titan.sh --default
+  setup_titan.sh --tag v0.0.1 --dir ~/mytitan --mode local
+EOF
+}
+
+REF="$DEFAULT_REF"
+DIR="$DEFAULT_DIR"
+WIZARD_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --tag) REF="${2:?--tag needs a value}"; shift 2 ;;
+        --dir) DIR="${2:?--dir needs a value}"; shift 2 ;;
+        --help|-h) usage; exit 0 ;;
+        *) WIZARD_ARGS+=("$1"); shift ;;
+    esac
+done
+
+# ── self-integrity hint (checksum) ──────────────────────────────────────────
+# When run from a file we can show our own sha256 so it can be matched against
+# the value published in the GitHub Release notes. Piped via curl, $0 is bash,
+# so we print the verify recipe instead of a misleading hash.
+if [[ -f "${BASH_SOURCE[0]}" ]] && command -v sha256sum >/dev/null 2>&1; then
+    _haze "setup_titan.sh sha256: $(sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1)"
+else
+    _haze "To verify this bootstrap before trusting it:"
+    echo "  curl -fsSLO https://raw.githubusercontent.com/ad-astra26/titan-public/${REF}/setup_titan.sh"
+    echo "  sha256sum setup_titan.sh   # compare against the release notes, then: bash setup_titan.sh"
+fi
+
+# ── 1. host preflight (the wizard re-checks in depth; this is the floor) ─────
+[[ "$(uname -s)" == "Linux" ]] || _die "Titan requires Linux (got $(uname -s))."
+if [[ -r /etc/os-release ]]; then
+    . /etc/os-release
+    case "${ID:-}:${ID_LIKE:-}" in
+        *debian*|*ubuntu*) : ;;
+        *) _warn "Tested on Debian/Ubuntu; '${ID:-unknown}' may need manual deps." ;;
+    esac
+fi
+
+command -v git    >/dev/null 2>&1 || _die "git not found. Install it: sudo apt install -y git"
+command -v sudo   >/dev/null 2>&1 || _warn "sudo not found — the systemd install phase will fail without it."
+command -v python3 >/dev/null 2>&1 || _die "python3 not found. Install Python ${MIN_PY_MINOR}+: sudo apt install -y python3 python3-venv"
+
+PY_MINOR="$(python3 -c 'import sys; print(sys.version_info.minor)')"
+PY_MAJOR="$(python3 -c 'import sys; print(sys.version_info.major)')"
+[[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -ge "$MIN_PY_MINOR" ]] || \
+    _die "Python 3.${MIN_PY_MINOR}+ required (found ${PY_MAJOR}.${PY_MINOR})."
+
+# ── 2. clone (or update) the PUBLIC repo at the pinned ref ───────────────────
+if [[ -d "$DIR/.git" ]]; then
+    _warn "Existing checkout at $DIR — fetching '${REF}' (your data/ + identity are never touched by git)."
+    git -C "$DIR" fetch --depth 1 origin "$REF"
+    git -C "$DIR" checkout -q FETCH_HEAD
+elif [[ -e "$DIR" ]]; then
+    _die "$DIR exists but is not a git checkout. Move it aside or pass --dir."
+else
+    _grow "Cloning Titan ($REF) → $DIR"
+    git clone --depth 1 --branch "$REF" "$PUBLIC_REPO" "$DIR" 2>/dev/null \
+        || git clone --depth 1 "$PUBLIC_REPO" "$DIR"   # fallback: default branch if ref is a SHA
+fi
+
+# ── 3. hand off to the audited, versioned wizard ────────────────────────────
+cd "$DIR"
+_grow "Handing off to the Titan setup wizard…"
+exec python3 -m scripts.setup_titan install "${WIZARD_ARGS[@]}"

@@ -71,23 +71,26 @@ class SageEncoder:
 
     @property
     def action_embedder(self):
-        """Lazy fastembed accessor (Phase 13 §3J.1). Replaces the
-        sentence_transformers path, whose import was broken fleet-wide
-        (torch/torchvision ABI mismatch) → silent zero vectors. fastembed
-        (ONNX, 384-d) imports cleanly + has no torch dependency. Cached after
-        first access; failure cached as None (callers still soft-fall to zeros
-        on the hot path, but the boot self_test fails LOUD)."""
+        """Lazy SentenceTransformer accessor — identical semantics to
+        SageRecorder.action_embedder (cached after first access; failure
+        also cached as None to skip retry). See recorder property for
+        rationale."""
         if self._action_embedder_cache is _LAZY_SENTINEL:
             try:
-                from titan_hcl.utils.text_embedder import get_text_embedder
-                self._action_embedder_cache = get_text_embedder()
+                from sentence_transformers import SentenceTransformer
+                self._action_embedder_cache = SentenceTransformer('all-MiniLM-L6-v2')
                 logging.info(
-                    "[SageEncoder] Lazy-initialized fastembed embedder "
-                    "(BAAI/bge-small-en-v1.5, 384-d) on first access.")
+                    "[SageEncoder] Lazy-initialized SentenceTransformer "
+                    "(all-MiniLM-L6-v2) on first access.")
+            except ImportError:
+                logging.warning(
+                    "[SageEncoder] 'sentence_transformers' not installed. "
+                    "Action vectors will default to zero.")
+                self._action_embedder_cache = None
             except Exception as e:
                 logging.error(
-                    "[SageEncoder] fastembed load failed: %s — action vectors "
-                    "will default to zero (CHECK fastembed install).", e)
+                    "[SageEncoder] SentenceTransformer load failed: %s — "
+                    "action vectors will default to zero.", e)
                 self._action_embedder_cache = None
         return self._action_embedder_cache
 
@@ -190,25 +193,29 @@ class SageRecorder:
 
     @property
     def action_embedder(self):
-        """Lazy fastembed accessor (Phase 13 §3J.1).
+        """Lazy SentenceTransformer accessor.
 
-        Loads `BAAI/bge-small-en-v1.5` (fastembed/ONNX, 384-d) on first access.
-        Replaces sentence_transformers, whose import was broken fleet-wide
-        (torch/torchvision ABI mismatch) → silent zero action vectors that
-        poisoned IQL training. Returns None only on a genuine fastembed load
-        failure (now LOUD via the boot self_test, not silent).
+        Loads `all-MiniLM-L6-v2` on first access. Returns None if
+        sentence_transformers is not installed, in which case
+        record_transition's downstream path falls back to a zero
+        action vector (preserved behavior).
         """
         if self._action_embedder_cache is _LAZY_SENTINEL:
             try:
-                from titan_hcl.utils.text_embedder import get_text_embedder
-                self._action_embedder_cache = get_text_embedder()
+                from sentence_transformers import SentenceTransformer
+                self._action_embedder_cache = SentenceTransformer('all-MiniLM-L6-v2')
                 logging.info(
-                    "[SageRecorder] Lazy-initialized fastembed embedder "
-                    "(BAAI/bge-small-en-v1.5, 384-d) on first access.")
+                    "[SageRecorder] Lazy-initialized SentenceTransformer "
+                    "(all-MiniLM-L6-v2) on first access.")
+            except ImportError:
+                logging.warning(
+                    "[SageRecorder] 'sentence_transformers' not installed. "
+                    "Action vectors will default to zero.")
+                self._action_embedder_cache = None
             except Exception as e:
                 logging.error(
-                    "[SageRecorder] fastembed load failed: %s — action vectors "
-                    "will default to zero (CHECK fastembed install).", e)
+                    "[SageRecorder] SentenceTransformer load failed: %s — "
+                    "action vectors will default to zero.", e)
                 self._action_embedder_cache = None
         return self._action_embedder_cache
 

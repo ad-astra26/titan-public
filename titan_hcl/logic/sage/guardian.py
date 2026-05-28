@@ -60,14 +60,11 @@ class SageGuardian:
         # we generate embeddings and slice/project them if necessary, 
         # or use standard embeddings. For fast inference, sentence_transformers is best.
         try:
-            # Phase 13 §3J.1 — fastembed (ONNX, 384-d) replaces the broken
-            # sentence_transformers import (torch/torchvision ABI mismatch that
-            # silently DISABLED Tier-2 semantic directive similarity fleet-wide).
-            from titan_hcl.utils.text_embedder import get_text_embedder
-            self.embedder = get_text_embedder()
-        except Exception as e:
-            logging.warning("[Guardian] fastembed embedder init failed (%s). "
-                            "Tier 2 semantic similarity will be disabled.", e)
+            from sentence_transformers import SentenceTransformer
+            # all-MiniLM-L6-v2 is small, extremely fast, producing 384-dim embeddings
+            self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
+        except ImportError:
+            logging.warning("[Guardian] 'sentence_transformers' not installed. Tier 2 semantic similarity will be disabled.")
             self.embedder = None
 
         self._load_restricted_keywords()
