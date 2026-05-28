@@ -2421,6 +2421,85 @@ def _dispatch_dream_consolidate(state_refs: dict, payload: dict) -> None:
         consolidate(payload)
 
 
+def _run_dream_bridge(state_refs: dict, neuromod_reader, send_queue, name: str) -> None:
+    """Bridge A (rFP §3G Phase 10G restore) — harvest crystallized inner events
+    on the dreaming→waking falling edge and inject them into the outer memory
+    graph, felt-tagged for Bridge B recall perturbation.
+
+    This orchestration loop was DROPPED at the D8-3 spirit→cognitive migration
+    (the spirit_worker END_DREAMING handler that invoked the harvest was deleted
+    and never re-homed; zero invoker since). cognitive_worker owns the
+    DreamingEngine + chain_archive + meta_wisdom engines, so it is the correct
+    Phase C home. Harvest body lives in logic/dream_bridge.py (pure sqlite reads).
+
+    Read-only on engines + non-blocking bus emits; never raises into the epoch
+    driver (a missing engine degrades gracefully — a skipped dream bridge is
+    recoverable, not critical state).
+    """
+    from titan_hcl.logic.dream_bridge import harvest_dream_memories
+
+    coordinator = state_refs.get("coordinator")
+    dreaming = getattr(coordinator, "dreaming", None) if coordinator else None
+    dream_cycle = int(getattr(dreaming, "_cycle_count", 0) or 0)
+    chain_archive = state_refs.get("chain_archive")
+    meta_wisdom = state_refs.get("meta_wisdom")
+    cgn_db_path = os.path.join("data", "inner_memory.db")
+
+    # Felt-state snapshot (neuromods + emotion) stored as neuromod_context so
+    # Bridge B can re-experience the somatic state at injection time.
+    levels = {}
+    try:
+        levels = (neuromod_reader() or {}) if neuromod_reader else {}
+    except Exception:
+        levels = {}
+    emotion = "neutral"
+    emotion_conf = 0.0
+    try:
+        _inner = getattr(coordinator, "inner", None) if coordinator else None
+        emotion = str(getattr(_inner, "_current_emotion", emotion) or emotion)
+        emotion_conf = float(getattr(_inner, "_emotion_confidence", 0.0) or 0.0)
+    except Exception:
+        pass
+    felt = {k: round(float(v), 4) for k, v in levels.items()
+            if isinstance(v, (int, float))}
+    felt["emotion"] = emotion
+    felt["emotion_confidence"] = round(emotion_conf, 4)
+    felt["dream_cycle"] = dream_cycle
+    felt["ts"] = time.time()
+
+    memories, chain_ids = harvest_dream_memories(
+        chain_archive, meta_wisdom, felt, cgn_db_path, dream_cycle)
+
+    for mem in memories:
+        _send_msg(send_queue, bus.MEMORY_ADD, name, "memory", {
+            "text": mem["text"],
+            "source": mem.get("source", "dream_consolidation"),
+            "weight": float(mem.get("weight", 2.0)),
+            "neuromod_context": mem.get("neuromod_context"),
+        })
+
+    # Mark the harvested reasoning chains consolidated so they aren't re-injected.
+    if chain_ids and chain_archive is not None:
+        try:
+            chain_archive.mark_consolidated(chain_ids)
+        except Exception as _mc_err:
+            logger.debug("[DreamBridge] mark_consolidated failed: %s", _mc_err)
+
+    # Feed the msl dream-bridge metric (consumed by the dashboard bridge count).
+    _msl = state_refs.get("msl")
+    if _msl is not None and hasattr(_msl, "record_dream_bridge"):
+        try:
+            _msl.record_dream_bridge(len(memories))
+        except Exception as _msl_err:
+            logger.debug("[DreamBridge] msl.record_dream_bridge failed: %s", _msl_err)
+
+    if memories:
+        logger.info(
+            "[DreamBridge] dream-end harvest: injected %d memories "
+            "(cycle=%d, chains_marked=%d)",
+            len(memories), dream_cycle, len(chain_ids))
+
+
 def _dispatch_experience_record(state_refs: dict, payload: dict) -> None:
     """EXPERIENCE_RECORD consumer — Record stage of the ExperienceOrchestrator
     Record→Distill→Bias loop (rFP_experience_distillation_phase_c_restoration_and_
@@ -2976,6 +3055,22 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
         except Exception as _dm_err:
             logger.debug("[DreamingMeta] dream-entry consult skipped: %s", _dm_err)
     state_refs["_dreaming_meta_was_dreaming"] = _epoch_is_dreaming
+
+    # ── Dream Bridge A (rFP §3G Phase 10G restore) ──────────────────────
+    # Symmetric to the DreamingMeta rising-edge consult above: on the
+    # dreaming→waking FALLING EDGE (dream just ended), harvest crystallized
+    # inner events (wisdom / eureka chains / CGN milestones / compositions /
+    # social) and inject them into the outer memory graph, felt-tagged for
+    # Bridge B recall perturbation. This loop was dropped at the D8-3
+    # spirit_worker gutting (zero invoker since); restored here per Maker
+    # (2026-05-28). Read-only + non-blocking emits; fires once per cycle.
+    if state_refs.get("_dream_bridge_was_dreaming", False) and not _epoch_is_dreaming:
+        try:
+            _run_dream_bridge(state_refs, neuromod_reader, send_queue, name)
+        except Exception as _db_err:
+            logger.warning("[DreamBridge] dream-end harvest/inject failed: %s",
+                           _db_err, exc_info=True)
+    state_refs["_dream_bridge_was_dreaming"] = _epoch_is_dreaming
 
     # 3. Read NEUROMOD_STATE shm slot + drive coordinator.update_neuromodulators.
     if neuromod_reader is not None and coordinator is not None:
