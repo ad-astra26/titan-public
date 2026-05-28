@@ -1114,6 +1114,30 @@ def agno_worker_main(recv_queue, send_queue, name: str,
             # _OVG_READY stays False — probe will fail-fast rather than
             # claim a half-ready worker can serve.
 
+    # ── Phase 13 §3J.1/§3J.2 — eager-warm the text embedder (fastembed) ──
+    # Same anti-pattern correction as the OVG warm above (D-SPEC-138): the
+    # reasoning-tier gatekeeper `state_tensor` embed (PreHook) calls
+    # `worker_plugin.recorder.action_embedder.encode(...)` → get_text_embedder().
+    # Warming it here keeps the fastembed cold load (~3.5s settled, far worse
+    # under boot contention) OFF the first reasoning chat's critical path, and
+    # the fail-loud self_test ensures the zero-vector regression (§3J.1) can
+    # never return silently. fastembed is ONNX — adds NO torch to agno.
+    try:
+        from titan_hcl.utils.text_embedder import self_test as _emb_self_test
+        _emb_t0 = time.time()
+        if _emb_self_test():
+            logger.info(
+                "[AgnoWorker] text embedder warmed in %.0fms (fastembed eager "
+                "init at boot — Phase 13 §3J.1)", (time.time() - _emb_t0) * 1000)
+        else:
+            logger.error(
+                "[AgnoWorker] text embedder SELF-TEST FAILED at boot — "
+                "embeddings degraded; CHECK fastembed install (§3J.1)")
+    except Exception as _emb_err:  # noqa: BLE001
+        logger.warning(
+            "[AgnoWorker] embedder eager-warm failed (lazy retry on first "
+            "chat — first reasoning-chat latency will spike): %s", _emb_err)
+
     # ── Phase 11 §11.I.2 — slot transition: starting → booted ──────────
     # Both Agent + OVG eager warmup have completed (or soft-failed with
     # graceful degradation). Worker now signals "in-process scaffolding
