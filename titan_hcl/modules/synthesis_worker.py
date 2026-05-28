@@ -796,8 +796,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 "[synthesis_worker] Phase 11 write_state(booted) failed: %s",
                 _swb_err)
 
-    events_recorded = 0      # used_by_llm=True → record_access (INV-Syn-23)
-    events_surfaced = 0      # used_by_llm=False → surfaced-not-cited telemetry
+    events_recorded = 0
     bundles_maintained = 0
 
     # ── Phase 4 §P4.G — dream-boundary consolidation pass wiring ──────
@@ -1662,18 +1661,9 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 ts = payload.get("ts")
                 if not isinstance(item_id, str) or not isinstance(ts, (int, float)):
                     continue
-                # INV-Syn-23 strict cited gate (Phase 9): reinforce ONLY items
-                # the LLM actually cited (used_by_llm=True, set by the agno
-                # CitedUseDetector). Surfaced-not-cited (False / legacy-missing)
-                # is telemetry-only — no record_access, no rich-get-richer
-                # runaway (rFP §240). The actr_working_memory_decay contract is
-                # the SPEC-correct authority; this gate makes the producer honest.
-                if payload.get("used_by_llm") is True:
-                    with cache_lock:
-                        store.record_access(item_id, float(ts))
-                    events_recorded += 1
-                else:
-                    events_surfaced += 1
+                with cache_lock:
+                    store.record_access(item_id, float(ts))
+                events_recorded += 1
                 continue
 
             if msg_type == MAINTAIN_BUNDLE:

@@ -41,9 +41,13 @@ from .state_registry import (
     resolve_shm_root,
 )
 
-# 4 KB is plenty for a fixed-shape dict of ~10 fields + a few counters.
-TITAN_HCL_STATE_PAYLOAD_BYTES: int = 4 * 1024
-TITAN_HCL_STATE_SCHEMA_VERSION: int = 1
+# 8 KB holds the fixed-shape counter dict + the canonical module roster
+# (~44 name→boot_priority pairs ≈ 1.5 KB msgpack; 8 KB leaves ample headroom).
+TITAN_HCL_STATE_PAYLOAD_BYTES: int = 8 * 1024
+# v2 (2026-05-28): added `roster` — the orchestrator-published canonical module
+# set (§11.I.5). Readiness compares it against live slots; replaces the API
+# route-manifest producer union that polluted not_booted with phantom names.
+TITAN_HCL_STATE_SCHEMA_VERSION: int = 2
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,13 @@ class TitanHclStateEntry:
     post_boot_total: int = 0
     post_boot_ready: int = 0
     lazy_total: int = 0
+    # Canonical module roster the orchestrator manages: (name, boot_priority)
+    # pairs, set once after build_catalog. §11.I.5 readiness uses this as the
+    # authoritative "expected" set — a module in the roster with no live
+    # `module_<name>_state.bin` slot is genuinely not_booted; nothing outside
+    # the roster (rust substrate procs, kernel peers, route-manifest producer
+    # aliases) can manufacture a phantom not_booted entry.
+    roster: tuple = ()
     boot_started_at: float = 0.0
     fleet_ready_at: float = 0.0
     fleet_optional_ready_at: float = 0.0
@@ -78,6 +89,7 @@ class TitanHclStateEntry:
             "post_boot_total": int(self.post_boot_total),
             "post_boot_ready": int(self.post_boot_ready),
             "lazy_total": int(self.lazy_total),
+            "roster": {str(name): str(prio) for name, prio in self.roster},
             "boot_started_at": float(self.boot_started_at),
             "fleet_ready_at": float(self.fleet_ready_at),
             "fleet_optional_ready_at": float(self.fleet_optional_ready_at),
@@ -87,6 +99,11 @@ class TitanHclStateEntry:
 
     @classmethod
     def from_wire_dict(cls, d: dict[str, Any]) -> "TitanHclStateEntry":
+        raw_roster = d.get("roster") or {}
+        if isinstance(raw_roster, dict):
+            roster = tuple((str(k), str(v)) for k, v in raw_roster.items())
+        else:  # tolerate a list-of-pairs encoding
+            roster = tuple((str(p[0]), str(p[1])) for p in raw_roster if len(p) >= 2)
         return cls(
             fleet_ready=bool(d.get("fleet_ready", False)),
             fleet_optional_ready=bool(d.get("fleet_optional_ready", False)),
@@ -96,6 +113,7 @@ class TitanHclStateEntry:
             post_boot_total=int(d.get("post_boot_total", 0)),
             post_boot_ready=int(d.get("post_boot_ready", 0)),
             lazy_total=int(d.get("lazy_total", 0)),
+            roster=roster,
             boot_started_at=float(d.get("boot_started_at", 0.0)),
             fleet_ready_at=float(d.get("fleet_ready_at", 0.0)),
             fleet_optional_ready_at=float(d.get("fleet_optional_ready_at", 0.0)),
@@ -155,6 +173,7 @@ class TitanHclStateWriter:
         post_boot_total: Optional[int] = None,
         post_boot_ready: Optional[int] = None,
         lazy_total: Optional[int] = None,
+        roster: Optional[tuple] = None,
     ) -> TitanHclStateEntry:
         """Mutate the in-memory entry then publish to SHM.
 
@@ -186,6 +205,8 @@ class TitanHclStateWriter:
                                  else int(post_boot_ready)),
                 lazy_total=(self._entry.lazy_total if lazy_total is None
                             else int(lazy_total)),
+                roster=(self._entry.roster if roster is None
+                        else tuple((str(n), str(p)) for n, p in roster)),
                 boot_started_at=self._entry.boot_started_at,
                 fleet_ready_at=(now if (fleet_ready and not self._entry.fleet_ready)
                                 else self._entry.fleet_ready_at),

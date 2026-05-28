@@ -301,20 +301,6 @@ META_SKILL_SOFT_RETIRED = "META_SKILL_SOFT_RETIRED"
 # so the P7 _ground_for_goal_hook returns real concept_ids.
 CGN_LEXICON_UPDATED = "CGN_LEXICON_UPDATED"
 
-# Phase 9 §P9.F (D-SPEC-PHASE9): meta-reasoning integration + repair forks.
-# SKILL_REPAIR_FORK_SPAWNED — emitted by synthesis_worker's SkillFailureTracker
-# when a delegated skill hits N consecutive failures (§9.3 / §11.5); payload =
-#     {"skill_id", "fork_id", "parent_concept_id", "root_anchor", "kind",
-#      "consecutive_failures", "ts"}. agno_worker subscribes (log surface).
-# USER_FEEDBACK_SIGNAL — emitted by agno_worker on explicit user thumbs-up/down
-# (INV-Syn-24 Tier-2); payload =
-#     {"tool_call_tx", "verdict": "positive"|"negative", "source": "explicit",
-#      "skill_id"?, "ts"}. Single consumer = synthesis_worker (UserFeedbackOverride).
-# NOTE (INV-Syn-23): MEMORY_RETRIEVAL_USED now carries `used_by_llm: bool` — only
-# True triggers record_access reinforcement; False = surfaced-not-cited telemetry.
-SKILL_REPAIR_FORK_SPAWNED = "SKILL_REPAIR_FORK_SPAWNED"
-USER_FEEDBACK_SIGNAL = "USER_FEEDBACK_SIGNAL"
-
 # SPEC §8.3 Phase B (rFP_phase_c_bus_delivery_continuity_and_hot_reload §4):
 # per-module hot-reload protocol. REQUEST emitted by Maker CLI / future D9
 # Guardian; ACK emitted by parent Guardian with status transitions
