@@ -41,7 +41,9 @@ from __future__ import annotations
 
 from titan_hcl.modules.body_worker import _compute_body_reflex_intuition
 from titan_hcl.modules.mind_worker import _compute_mind_reflex_intuition
-from titan_hcl.modules.spirit_loop import _compute_spirit_reflex_intuition
+# Phase 10C — spirit reflex relocated out of the retiring spirit_loop module
+# into logic/spirit_helpers.py (pure, torch/cgn-free import surface).
+from titan_hcl.logic.spirit_helpers import _compute_spirit_reflex_intuition
 
 # Public-by-convention re-exports.
 compute_body_reflex_intuition = _compute_body_reflex_intuition

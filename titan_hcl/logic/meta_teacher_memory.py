@@ -116,16 +116,13 @@ class _EmbedIndex:
             return
         self._init_attempted = True
         try:
-            # Phase 13 §3J.1 — fastembed (ONNX, 384-d) replaces the broken
-            # sentence_transformers import (torch/torchvision ABI mismatch →
-            # silent zeros). Same 384-d, so ST_EMBED_DIM downstream is unchanged.
-            from titan_hcl.utils.text_embedder import get_text_embedder
+            from sentence_transformers import SentenceTransformer  # lazy
             import numpy as _np
-            self._model = get_text_embedder()
+            self._model = SentenceTransformer(ST_MODEL_NAME)
             self._np = _np
             self._available = True
-            logger.info("[TeacherMemory] Embedding model loaded: fastembed "
-                        "(BAAI/bge-small-en-v1.5, dim=%d)", ST_EMBED_DIM)
+            logger.info("[TeacherMemory] Embedding model loaded: %s (dim=%d)",
+                        ST_MODEL_NAME, ST_EMBED_DIM)
         except Exception as e:
             logger.warning(
                 "[TeacherMemory] Embedding init failed (retrieval disabled): %s",

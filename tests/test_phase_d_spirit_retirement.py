@@ -32,11 +32,23 @@ def test_spirit_worker_module_deleted():
 
 
 def test_spirit_loop_preserved():
-    """spirit_loop.py is KEPT (live imports: _init_consciousness,
-    _run_consciousness_epoch, _compute_spirit_reflex_intuition, …)."""
+    """spirit_loop.py is KEPT pending Phase 10D (live imports:
+    _init_consciousness, _run_consciousness_epoch, …).
+
+    Phase 10C (rFP §3G) relocated the pure spirit reflex helper to
+    ``logic/spirit_helpers.py`` — it must now live there (torch/cgn-free
+    import surface) and NO LONGER on spirit_loop. reflex_intuition re-exports
+    it for agno_hooks.
+    """
     assert importlib.util.find_spec("titan_hcl.modules.spirit_loop") is not None
     from titan_hcl.modules import spirit_loop
-    assert callable(spirit_loop._compute_spirit_reflex_intuition)
+    assert callable(spirit_loop._run_consciousness_epoch)
+    # Phase 10C — spirit reflex moved out of spirit_loop into spirit_helpers.
+    from titan_hcl.logic.spirit_helpers import _compute_spirit_reflex_intuition
+    assert callable(_compute_spirit_reflex_intuition)
+    assert not hasattr(spirit_loop, "_compute_spirit_reflex_intuition")
+    from titan_hcl.logic.reflex_intuition import _compute_spirit_reflex_intuition as _via_reflex
+    assert _via_reflex is _compute_spirit_reflex_intuition
     # Dead TITAN_SELF/V5 chain removed.
     assert not hasattr(spirit_loop, "observe_topology")
     assert not hasattr(spirit_loop, "compose_and_emit_titan_self")
