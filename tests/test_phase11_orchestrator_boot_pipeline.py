@@ -123,7 +123,7 @@ def test_start_all_calls_phase_a_modules_synchronously_in_dep_order():
     # the probe-wait helper returns immediately without polling SHM).
     call_order: list[str] = []
 
-    def fake_start(name: str) -> bool:
+    def fake_start(name: str, activate_deps: bool = True) -> bool:
         call_order.append(name)
         o._modules[name].state = ModuleState.RUNNING
         return True
@@ -148,7 +148,7 @@ def test_start_all_legacy_flat_walk_when_phase_11_disabled():
 
     call_order: list[str] = []
 
-    def fake_start(name: str) -> bool:
+    def fake_start(name: str, activate_deps: bool = True) -> bool:
         call_order.append(name)
         o._modules[name].state = ModuleState.RUNNING
         return True
@@ -178,7 +178,7 @@ def test_start_all_writes_fleet_ready_to_titan_hcl_state(tmp_path,
 
     _writers: list = []
 
-    def fake_start(name: str) -> bool:
+    def fake_start(name: str, activate_deps: bool = True) -> bool:
         # Mimic the worker lifecycle: write starting→booted→running to the
         # module's OWN SHM slot — the canonical readiness signal the wave-wait
         # + probe poller read (§11.I.2 locked D1/D2). Setting info.state alone
@@ -225,7 +225,7 @@ def test_start_all_publishes_phase_a_done_before_phase_b_finishes(
     o.register(_spec("a", autostart=True, boot_priority="mandatory"))
     o.register(_spec("b", autostart=True, boot_priority="post_boot"))
 
-    def fake_start(name: str) -> bool:
+    def fake_start(name: str, activate_deps: bool = True) -> bool:
         # Mandatory reaches RUNNING fast; post_boot never gets there
         # within this test (we just care that fleet_ready latches early).
         if name == "a":
