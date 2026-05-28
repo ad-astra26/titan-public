@@ -27,7 +27,6 @@ from . import state as install_state
 from .comms import run_comms_phase
 from .inference import run_inference_phase
 from .genesis_runner import run_genesis_phase
-from .systemd_runner import run_systemd_phase
 from .modes import Mode, spec_for
 from .preflight import Result, summarize
 from .ui import HAZE, ANSI, PULSE, GROWTH, METAL, DANGER, cprint, section
@@ -204,7 +203,8 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
          lambda: ([Result("genesis", "warn", "--skip-genesis requested.")] if skip_genesis
                   else run_genesis_phase(install_root, mode, venv_python=venv_python(install_root)))),
         (PhaseDef("phase_7", "Systemd install + first start + health", "W1.e", None),
-         lambda: run_systemd_phase(state, install_root, mode, default=default)),
+         lambda: [Result("systemd", "warn", "Phase 7 owned by W1.e (not yet implemented).",
+                         "Systemd unit install + first-start + health gate land in the next sub-phase.")]),
     ]
 
     for phase, run in phases:
@@ -229,6 +229,6 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
         install_state.mark_phase(state, phase.id, "done", action=phase.title)
         cprint(f"  ✓ {phase.title} complete.", role="success")
 
-    cprint("\nAll phases complete. Titan is installed, enabled, and (if genesis ran) running.",
-           role="success", bold=True)
+    cprint("\nAll implemented phases complete. Pending: Phase 5 (W1.d), Phase 7 (W1.e).",
+           role="text_strong", bold=True)
     return 0
