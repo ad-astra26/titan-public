@@ -385,7 +385,19 @@ async def run(health_only: bool = False, server_only: bool = False,
         broadcast_topics=_orch_broadcast,
         reply_only=False,
     )
-    logging.info("[titan_hcl] orchestrator bus client connected (name=guardian)")
+    # Phase 11 §11.I.1 routing fix — the Supervisor (guardian_hcl process)
+    # publishes MODULE_RESTART_REQUEST with dst="guardian_hcl_lifecycle".
+    # The lifecycle subscriber now lives HERE (titan_hcl), so register
+    # "guardian_hcl_lifecycle" as a broker alias on this connection — the
+    # broker then fans dst="guardian_hcl_lifecycle" frames to this client
+    # (alongside dst="guardian"). Without this the restart request hits no
+    # subscriber and Supervisor re-fires every tick (memory restart storm
+    # observed live T3 2026-05-28). subscribe_alias persists across
+    # reconnects (bus_socket.py:709).
+    _orch_client.subscribe_alias("guardian_hcl_lifecycle")
+    logging.info(
+        "[titan_hcl] orchestrator bus client connected "
+        "(name=guardian, alias=guardian_hcl_lifecycle)")
 
     from titan_hcl.orchestrator import Orchestrator
     from titan_hcl.module_catalog import build_catalog

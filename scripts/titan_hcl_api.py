@@ -106,6 +106,16 @@ def run() -> int:
     legacy_recv = mp.Queue()
     legacy_send = mp.Queue()
 
+    # kernel-rs spawns this peer directly and seeds only the CANONICAL
+    # broker env vars (TITAN_KERNEL_BUS_SOCKET_PATH + TITAN_BUS_TITAN_ID).
+    # setup_worker_bus reads the legacy TITAN_BUS_SOCKET_PATH +
+    # TITAN_BUS_KEYPAIR_PATH names — under the old guardian-spawns-workers
+    # topology those were seeded into the parent env and inherited; the
+    # kernel-rs peer never ran that path, so seed them now from config +
+    # bus_sock_path(titan_id). (Live T3 fix 2026-05-28.)
+    from scripts._titan_bus_client_helpers import seed_broker_env
+    seed_broker_env(titan_id, cfg)
+
     from titan_hcl.core.worker_bus_bootstrap import setup_worker_bus
     bus_client = None
     try:

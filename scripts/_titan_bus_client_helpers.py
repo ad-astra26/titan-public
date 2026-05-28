@@ -23,6 +23,40 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def _resolve_wallet_path(config: dict) -> str:
+    """Resolve the identity keypair path from config, absolutized to repo root."""
+    network_cfg = config.get("network", {})
+    wallet_path = network_cfg.get(
+        "wallet_keypair_path", "data/titan_identity_keypair.json")
+    if not os.path.isabs(wallet_path):
+        wallet_path = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", wallet_path))
+    return wallet_path
+
+
+def seed_broker_env(titan_id: str, config: dict) -> None:
+    """Seed the legacy broker env vars that `setup_worker_bus` reads.
+
+    kernel-rs `build_child_env` (spawn.rs) sets the CANONICAL names
+    (TITAN_KERNEL_BUS_SOCKET_PATH + TITAN_BUS_TITAN_ID alias) but NOT
+    TITAN_BUS_SOCKET_PATH / TITAN_BUS_KEYPAIR_PATH. Under the legacy
+    guardian-spawns-workers topology those were seeded into the parent
+    env by `_build_bus_and_client` and inherited by every mp.Process
+    worker. A kernel-rs peer (titan_hcl_api) spawned DIRECTLY by the
+    kernel never ran that path, so `setup_worker_bus` hard-failed on
+    "missing TITAN_BUS_SOCKET_PATH,TITAN_BUS_KEYPAIR_PATH" (live T3
+    2026-05-28). Seed them here from config + bus_sock_path(titan_id)
+    so the canonical worker bus bootstrap works for the api peer too.
+    """
+    from titan_hcl.core.bus_socket import bus_sock_path
+    from titan_hcl.core.worker_bus_bootstrap import (
+        ENV_BUS_SOCKET_PATH, ENV_BUS_TITAN_ID, ENV_BUS_KEYPAIR_PATH,
+    )
+    os.environ[ENV_BUS_SOCKET_PATH] = str(bus_sock_path(titan_id))
+    os.environ[ENV_BUS_TITAN_ID] = str(titan_id)
+    os.environ[ENV_BUS_KEYPAIR_PATH] = str(_resolve_wallet_path(config))
+
+
 def build_bus_and_client(
     titan_id: str,
     config: dict,
@@ -53,12 +87,7 @@ def build_bus_and_client(
     from titan_hcl.core.bus_socket import BusSocketClient, bus_sock_path
     from titan_hcl.core.worker_bus_bootstrap import _try_load_identity_secret
 
-    network_cfg = config.get("network", {})
-    wallet_path = network_cfg.get(
-        "wallet_keypair_path", "data/titan_identity_keypair.json")
-    if not os.path.isabs(wallet_path):
-        wallet_path = os.path.normpath(
-            os.path.join(os.path.dirname(__file__), "..", wallet_path))
+    wallet_path = _resolve_wallet_path(config)
 
     identity_secret = _try_load_identity_secret(wallet_path)
     if identity_secret is None:
