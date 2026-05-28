@@ -665,7 +665,8 @@ class TestPythonGuardianSupervisionEmit:
         assert info.last_escalation_id is None
 
     def test_guardian_imports_supervision_messages(self):
-        src = _read_source("titan_hcl/guardian.py")
+        # Phase 11 split (§11.I): guardian.py → orchestrator/core.py.
+        src = _read_source("titan_hcl/orchestrator/core.py")
         # All 6 SUPERVISION_* constants imported from .bus
         for const_name in (
             "SUPERVISION_CHILD_DOWN",
@@ -676,12 +677,13 @@ class TestPythonGuardianSupervisionEmit:
             "SUPERVISION_ESCALATION",
         ):
             assert const_name in src, (
-                f"guardian.py must import {const_name} for cross-language "
-                "SUPERVISION emit (SPEC §11.G.4 + §11.G.6)"
+                f"orchestrator/core.py must import {const_name} for "
+                "cross-language SUPERVISION emit (SPEC §11.G.4 + §11.G.6)"
             )
 
     def test_guardian_restart_emits_child_down_and_restarted(self):
-        src = _read_source("titan_hcl/guardian.py")
+        # Phase 11 split (§11.I): guardian.py → orchestrator/core.py.
+        src = _read_source("titan_hcl/orchestrator/core.py")
         # restart() must publish SUPERVISION_CHILD_DOWN before stop + start
         # AND SUPERVISION_CHILD_RESTARTED after successful start.
         # Pattern: both message types appear inside restart() body.
@@ -702,7 +704,10 @@ class TestPythonGuardianSupervisionEmit:
         )
 
     def test_guardian_handles_escalation_per_spec(self):
-        src = _read_source("titan_hcl/guardian.py")
+        # Post Phase 11 split (§11.I): escalation handling lives in the
+        # titan_hcl orchestrator (guardian.py was split into orchestrator/ +
+        # supervisor/).
+        src = _read_source("titan_hcl/orchestrator/core.py")
         # _handle_escalation must use kernel_default_decision (in-process)
         # + emit SUPERVISION_ESCALATION + handle all 3 EscalationDecision
         # variants per SPEC §11.B.1.
@@ -717,10 +722,19 @@ class TestPythonGuardianSupervisionEmit:
         assert "kernel_default_decision" in body
         assert "EscalationDecision.CONTINUE" in body
         assert "EscalationDecision.TERMINATE" in body
-        # Must call os._exit(64) on Terminate per SPEC §11.B.1 step 6b.
-        assert "os._exit(64)" in body, (
-            "Terminate decision must exit Python plugin with code 64 "
-            "(SPEC §11.B.1 step 6b + §15 escalation range)"
+        # Phase 11 (§11.I): the orchestrator must NOT self-terminate on a
+        # module escalation — only the kernel (L0) may recycle the orchestrator
+        # peer. A TERMINATE decision disables the offending module locally and
+        # relies on the emitted SUPERVISION_ESCALATION to signal the kernel.
+        assert "os._exit(64)" not in body, (
+            "Orchestrator must NOT os._exit(64) on a module escalation — that "
+            "would kill all sibling modules. Only the kernel may recycle the "
+            "orchestrator (SPEC §11.I role split supersedes §11.B.1 step 6b "
+            "self-terminate for the Python orchestrator)."
+        )
+        assert "ModuleState.DISABLED" in body, (
+            "TERMINATE decision must disable the offending module locally "
+            "instead of terminating the orchestrator process."
         )
 
 

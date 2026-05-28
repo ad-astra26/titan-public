@@ -812,7 +812,16 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                                 name, save_timeout)
 
             # ── Phase 2: shutdown signal via bus ──
-            self.bus.publish(make_msg(MODULE_SHUTDOWN, "guardian", name, {"reason": reason}))
+            # D-SPEC-93 / §11.B.3.1 pid-targeting: pin the shutdown to the OLD
+            # pid so a freshly-spawned same-name worker — which subscribes
+            # under the same dst=name and may receive this still-buffered frame
+            # after it boots — DROPS it (bus_socket._handle_inbound) instead of
+            # self-exiting on a restart it is not the target of. Without this,
+            # restart = stop(broadcast SHUTDOWN) → start(new pid) → new pid
+            # honors the old SHUTDOWN → exits → heartbeat stale → restart loop.
+            # Mirrors reload.py's targeted shutdown.
+            self.bus.publish(make_msg(MODULE_SHUTDOWN, "guardian", name, {
+                "reason": reason, "target_pid": info.process.pid}))
 
             # SIGTERM first — bumped 5s → 15s 2026-04-13 to give post-loop
             # cleanup enough time to complete (FAISS save can take 3-5s alone).
@@ -1072,11 +1081,15 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         """SPEC §11.B.1 escalation handshake. In-process short-circuit via
         kernel_default_decision (same as Rust kernel's kernel-self path).
 
-        Emits SUPERVISION_ESCALATION (audit record) then applies the policy
-        decision directly:
+        Emits SUPERVISION_ESCALATION (audit record + kernel signal) then
+        applies the policy decision directly:
           - CONTINUE → reset counter; module retries on next monitor_tick
-          - TERMINATE → exit the entire Python plugin with code 64; Rust
-            kernel cascades a fresh plugin per SPEC §11.B.1 step 6b
+          - TERMINATE → disable the offending module locally and signal the
+            kernel via SUPERVISION_ESCALATION. The orchestrator NEVER
+            self-terminates: per the Phase 11 role split (§11.I) only the
+            kernel (L0, Rust) may kill/restart the titan_hcl orchestrator peer;
+            self-exiting here would take down all sibling modules. (Supersedes
+            the pre-split exit-64 self-terminate reading of §11.B.1 step 6b.)
           - HALT → disable module; Maker must intervene
         """
         import uuid
@@ -1127,18 +1140,30 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 "[Guardian] Continue policy — resetting restart counter "
                 "for '%s'; will retry on next monitor_tick", name)
         elif decision == EscalationDecision.TERMINATE:
-            # SPEC §11.B.1 step 6b: supervisor terminates self with exit 64.
-            # For Python guardian, "self" = the entire Python plugin process.
-            # Rust kernel will see the plugin exit and cascade a fresh
-            # respawn per its own SPEC §11.0 row 4.
+            # Phase 11 role split (§11.I): the titan_hcl orchestrator has NO
+            # authority to terminate itself on a module escalation — doing so
+            # would take down all sibling modules. Only the kernel (L0, Rust)
+            # may kill/restart the orchestrator peer. The SUPERVISION_ESCALATION
+            # emitted above IS the kernel's signal; the orchestrator's local
+            # action is to disable the offending module so it stops looping.
+            # The kernel, as sole owner of orchestrator lifecycle, recycles the
+            # peer if its own policy decides to. (Supersedes the legacy
+            # exit-64 "supervisor terminates self" reading of §11.B.1
+            # step 6b, which predates the orchestrator/supervisor split.)
             logger.critical(
-                "[Guardian] Terminate policy — Python plugin will exit "
-                "with code 64 (escalation cascade per SPEC §11.B.1 step 6b)")
+                "[Guardian] Terminate escalation for '%s' [%s] — disabling "
+                "module locally; orchestrator does NOT self-exit (kernel holds "
+                "sole authority to recycle the orchestrator per §11.I). "
+                "escalation_id=%s", name, info.spec.layer, escalation_id)
             self.stop(name, reason="escalation_terminate")
-            # os._exit bypasses atexit handlers; sys.exit raises SystemExit
-            # which can be caught. Use os._exit to ensure deterministic
-            # cascade behavior.
-            os._exit(64)
+            info.state = ModuleState.DISABLED
+            info.disabled_at = now
+            self.bus.publish(make_msg(MODULE_CRASHED, "guardian", "core", {
+                "module": name, "reason": "escalation_terminate",
+                "restarts": len(info.restart_timestamps),
+                "window_seconds": self._restart_window_seconds,
+                "escalation_id": escalation_id,
+            }))
         else:  # HALT
             self.stop(name, reason="escalation_halt")
             info.state = ModuleState.DISABLED

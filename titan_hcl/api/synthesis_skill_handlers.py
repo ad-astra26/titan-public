@@ -36,6 +36,7 @@ Soft-fail contract: missing / stale / corrupt snapshot → 200 with
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -180,45 +181,49 @@ async def get_v6_synthesis_skills_recent(request: Request):
     Response shape:
         {ok, source, passes: [{tx_hash, ts, ...summary fields}, ...]}
     """
-    path = _resolve_index_db_path()
-    passes: list[dict] = []
-    if not os.path.exists(path):
-        return {"ok": True, "source": "no_index_db", "passes": []}
-    try:
-        conn = sqlite3.connect(
-            f"file:{path}?mode=ro&immutable=0", uri=True, timeout=5.0,
-        )
-        conn.row_factory = sqlite3.Row
-    except Exception as e:
-        logger.debug("[synthesis_skill_handlers] index open failed: %s", e)
-        return {"ok": True, "source": "index_open_failed", "passes": []}
-    try:
-        cur = conn.execute(
-            "SELECT block_hash, fork_id, block_height, timestamp, thought_type, tags "
-            "FROM block_index "
-            "WHERE thought_type = 'skill_mining_pass' "
-            "ORDER BY timestamp DESC LIMIT ?",
-            [RECENT_PASSES_LIMIT],
-        )
-        for row in cur.fetchall():
-            bh = row["block_hash"]
-            tx_hash = bh.hex() if isinstance(bh, bytes) else str(bh)
-            passes.append({
-                "tx_hash": tx_hash,
-                "block_height": int(row["block_height"]),
-                "ts": float(row["timestamp"]),
-                "fork_id": int(row["fork_id"]),
-                "thought_type": row["thought_type"],
-                "tags_raw": row["tags"],
-            })
-    except sqlite3.Error as e:
-        logger.debug("[synthesis_skill_handlers] passes query failed: %s", e)
-    finally:
+    def _impl() -> dict:
+        path = _resolve_index_db_path()
+        passes: list[dict] = []
+        if not os.path.exists(path):
+            return {"ok": True, "source": "no_index_db", "passes": []}
         try:
-            conn.close()
-        except Exception:
-            pass
-    return {"ok": True, "source": "block_index", "passes": passes}
+            conn = sqlite3.connect(
+                f"file:{path}?mode=ro&immutable=0", uri=True, timeout=5.0,
+            )
+            conn.row_factory = sqlite3.Row
+        except Exception as e:
+            logger.debug("[synthesis_skill_handlers] index open failed: %s", e)
+            return {"ok": True, "source": "index_open_failed", "passes": []}
+        try:
+            cur = conn.execute(
+                "SELECT block_hash, fork_id, block_height, timestamp, thought_type, tags "
+                "FROM block_index "
+                "WHERE thought_type = 'skill_mining_pass' "
+                "ORDER BY timestamp DESC LIMIT ?",
+                [RECENT_PASSES_LIMIT],
+            )
+            for row in cur.fetchall():
+                bh = row["block_hash"]
+                tx_hash = bh.hex() if isinstance(bh, bytes) else str(bh)
+                passes.append({
+                    "tx_hash": tx_hash,
+                    "block_height": int(row["block_height"]),
+                    "ts": float(row["timestamp"]),
+                    "fork_id": int(row["fork_id"]),
+                    "thought_type": row["thought_type"],
+                    "tags_raw": row["tags"],
+                })
+        except sqlite3.Error as e:
+            logger.debug("[synthesis_skill_handlers] passes query failed: %s", e)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return {"ok": True, "source": "block_index", "passes": passes}
+
+    # Sync sqlite3 I/O off the event loop (§8.0.ter spirit — never block the loop).
+    return await asyncio.to_thread(_impl)
 
 
 async def get_v6_synthesis_skills_coverage(request: Request):
@@ -232,7 +237,6 @@ async def get_v6_synthesis_skills_coverage(request: Request):
         {ok, source, window_hours, denominator, numerator,
          coverage_ratio, scored_by_breakdown}
     """
-    path = _resolve_index_db_path()
     out_base = {
         "ok": True,
         "window_hours": COVERAGE_WINDOW_HOURS,
@@ -241,63 +245,69 @@ async def get_v6_synthesis_skills_coverage(request: Request):
         "coverage_ratio": 0.0,
         "scored_by_breakdown": {"oracle": 0, "llm": 0, "null": 0},
     }
-    if not os.path.exists(path):
-        return {**out_base, "source": "no_index_db"}
 
-    since_ts = time.time() - COVERAGE_WINDOW_HOURS * 3600.0
-    try:
-        conn = sqlite3.connect(
-            f"file:{path}?mode=ro&immutable=0", uri=True, timeout=5.0,
-        )
-        conn.row_factory = sqlite3.Row
-    except Exception:
-        return {**out_base, "source": "index_open_failed"}
+    def _impl() -> dict:
+        path = _resolve_index_db_path()
+        if not os.path.exists(path):
+            return {**out_base, "source": "no_index_db"}
 
-    try:
-        # Coverage is derived from the `tags` blob the chain writer
-        # stores per block. write_tool_call sets tags including
-        # `scored_by:oracle|llm|none`. We rely on substring match — the
-        # tag list is a small JSON array per row so the SQL LIKE is
-        # cheap (no full chain_*.bin walk).
-        cur = conn.execute(
-            "SELECT tags FROM block_index "
-            "WHERE thought_type = 'tool_call' AND timestamp > ? "
-            "LIMIT 50000",
-            [since_ts],
-        )
-        denom = 0
-        oracle_n = 0
-        llm_n = 0
-        null_n = 0
-        for row in cur.fetchall():
-            tags_raw = row["tags"] or ""
-            denom += 1
-            if "scored_by:oracle" in tags_raw:
-                oracle_n += 1
-            elif "scored_by:llm" in tags_raw:
-                llm_n += 1
-            else:
-                # 'scored_by:none' OR no scored_by tag at all
-                null_n += 1
-        numerator = oracle_n + llm_n
-        ratio = (numerator / denom) if denom else 0.0
-        return {
-            **out_base,
-            "source": "block_index",
-            "denominator": denom,
-            "numerator": numerator,
-            "coverage_ratio": float(ratio),
-            "scored_by_breakdown": {
-                "oracle": oracle_n,
-                "llm": llm_n,
-                "null": null_n,
-            },
-        }
-    except sqlite3.Error as e:
-        logger.debug("[synthesis_skill_handlers] coverage query failed: %s", e)
-        return {**out_base, "source": "coverage_query_failed"}
-    finally:
+        since_ts = time.time() - COVERAGE_WINDOW_HOURS * 3600.0
         try:
-            conn.close()
+            conn = sqlite3.connect(
+                f"file:{path}?mode=ro&immutable=0", uri=True, timeout=5.0,
+            )
+            conn.row_factory = sqlite3.Row
         except Exception:
-            pass
+            return {**out_base, "source": "index_open_failed"}
+
+        try:
+            # Coverage is derived from the `tags` blob the chain writer
+            # stores per block. write_tool_call sets tags including
+            # `scored_by:oracle|llm|none`. We rely on substring match — the
+            # tag list is a small JSON array per row so the SQL LIKE is
+            # cheap (no full chain_*.bin walk).
+            cur = conn.execute(
+                "SELECT tags FROM block_index "
+                "WHERE thought_type = 'tool_call' AND timestamp > ? "
+                "LIMIT 50000",
+                [since_ts],
+            )
+            denom = 0
+            oracle_n = 0
+            llm_n = 0
+            null_n = 0
+            for row in cur.fetchall():
+                tags_raw = row["tags"] or ""
+                denom += 1
+                if "scored_by:oracle" in tags_raw:
+                    oracle_n += 1
+                elif "scored_by:llm" in tags_raw:
+                    llm_n += 1
+                else:
+                    # 'scored_by:none' OR no scored_by tag at all
+                    null_n += 1
+            numerator = oracle_n + llm_n
+            ratio = (numerator / denom) if denom else 0.0
+            return {
+                **out_base,
+                "source": "block_index",
+                "denominator": denom,
+                "numerator": numerator,
+                "coverage_ratio": float(ratio),
+                "scored_by_breakdown": {
+                    "oracle": oracle_n,
+                    "llm": llm_n,
+                    "null": null_n,
+                },
+            }
+        except sqlite3.Error as e:
+            logger.debug("[synthesis_skill_handlers] coverage query failed: %s", e)
+            return {**out_base, "source": "coverage_query_failed"}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    # Sync sqlite3 I/O off the event loop (§8.0.ter spirit — never block the loop).
+    return await asyncio.to_thread(_impl)
