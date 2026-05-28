@@ -57,7 +57,6 @@ from titan_hcl.bus import (
     CHAT_STREAM_REQUEST,
     DREAM_INBOX_REPLAY,
     KERNEL_EPOCH_TICK,
-    MEMORY_RETRIEVAL_USED,
     MODULE_HEARTBEAT,
     MODULE_SHUTDOWN,
     SAVE_NOW,
@@ -536,47 +535,6 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
 
     finally:
         stats_ref["in_flight"] = max(0, stats_ref.get("in_flight", 0) - 1)
-
-    # ── Phase 9 strict cited gate (INV-Syn-23) ──
-    # Post-LLM, decide which surfaced retrieval items the response actually
-    # cited (heuristic, no extra LLM call). Emit MEMORY_RETRIEVAL_USED per
-    # surfaced item — used_by_llm=True for cited (→ synthesis_worker
-    # record_access reinforcement), False for surfaced-not-cited (telemetry).
-    # Non-blocking soft-fail per INV-Syn-17: chat NEVER fails on a gate error.
-    try:
-        _reg = getattr(worker_plugin, "_last_surfaced_items", None)
-        _chat_id = f"{user_id}:{session_id}"
-        _surfaced = _reg.pop(_chat_id, []) if isinstance(_reg, dict) else []
-        if _surfaced and response_text:
-            from titan_hcl.synthesis.cited_use import (
-                CitedUseDetector, SurfacedItem,
-            )
-            _detector = getattr(worker_plugin, "_cited_use_detector", None)
-            if _detector is None:
-                _detector = CitedUseDetector()
-                worker_plugin._cited_use_detector = _detector
-            _items = [
-                SurfacedItem(
-                    item_id=s.get("item_id", ""),
-                    title=s.get("title", ""),
-                    content_snippet=s.get("content_snippet", ""),
-                    concept_ids=s.get("concept_ids", []) or [],
-                )
-                for s in _surfaced if s.get("item_id")
-            ]
-            _cited = set(_detector.detect(
-                response_text=response_text, surfaced_items=_items,
-            ))
-            _now = time.time()
-            for _it in _items:
-                _send(send_queue, MEMORY_RETRIEVAL_USED, name, "all", {
-                    "item_id": _it.item_id,
-                    "ts": _now,
-                    "used_by_llm": _it.item_id in _cited,
-                })
-    except Exception as _cu_err:
-        logger.debug(
-            "[AgnoWorker] cited-use gate error (chat unaffected): %s", _cu_err)
 
     # ── Assemble CHAT_RESPONSE payload ──
     # D-SPEC-74 (SPEC v1.18.0): _last_ovg_result is now a VerifiedResult

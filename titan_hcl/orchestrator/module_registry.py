@@ -205,6 +205,16 @@ class ModuleSpec:
     # canonical values match BootPriority enum values
     # ("mandatory" / "post_boot" / "lazy"). Validation lives in 11F orchestrator.
     boot_priority: str = "mandatory"
+    # Phase 11 §11.I.5 (2026-05-28): does this module publish a
+    # `module_<name>_state.bin` lifecycle slot (STARTING→BOOTED→PROBING→
+    # RUNNING)? Default True — standard supervised workers do. False for the
+    # imw-class persistence-writer daemons (imw / observatory_writer / the
+    # universal-sqlite-writer loop): they're reply_only Unix-socket daemons
+    # supervised via socket-heartbeat, NOT the SHM lifecycle, so they never
+    # write a slot. Such modules are EXCLUDED from the /v6/readiness roster —
+    # else they'd read as a permanent not_booted (running fine, just not
+    # lifecycle-slot-reporting) and trip a false "mandatory MISSING".
+    reports_lifecycle_slot: bool = True
 
 
 @dataclass

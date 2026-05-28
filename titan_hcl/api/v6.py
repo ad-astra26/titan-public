@@ -514,23 +514,6 @@ _T = (
     ("/v6/synthesis/skills/coverage", "GET",
      "get_v6_synthesis_skills_coverage", "synthesis", "readout",
      None, None, (), ("synthesis_worker",), False, None),
-    # Phase 10 (D-SPEC-PHASE10) — observatory + metrics. Read-only over
-    # data/synthesis_metrics_snapshot.json (INV-Syn-25, observation-only).
-    ("/v6/synthesis/metrics", "GET",
-     "get_v6_synthesis_metrics", "synthesis", "readout",
-     None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/metrics/sovereignty", "GET",
-     "get_v6_synthesis_metrics_sovereignty", "synthesis", "readout",
-     None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/metrics/groundedness", "GET",
-     "get_v6_synthesis_metrics_groundedness", "synthesis", "readout",
-     None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/metrics/retrieval", "GET",
-     "get_v6_synthesis_metrics_retrieval", "synthesis", "readout",
-     None, None, (), ("synthesis_worker",), False, None),
-    ("/v6/synthesis/metrics/chain-growth", "GET",
-     "get_v6_synthesis_metrics_chain_growth", "synthesis", "readout",
-     None, None, (), ("synthesis_worker",), False, None),
 )
 
 
@@ -715,19 +698,20 @@ async def get_v6_readiness(request: Request) -> JSONResponse:
         slot_names = []
         slot_names_set = set()
 
-    # Manifest-derived candidate set for not-yet-booted modules — filter
-    # placeholder tokens (anything containing `<`/`>` is a template literal
-    # like `<each_worker>`, not a real module name).
-    manifest_names: set[str] = set()
-    try:
-        for row in _m.as_rows():
-            for prod in row.get("producers") or ():
-                if prod and "<" not in prod and ">" not in prod:
-                    manifest_names.add(prod)
-    except Exception:  # noqa: BLE001
-        pass
+    # Authoritative "expected" roster — the orchestrator publishes the canonical
+    # module set (name → boot_priority) into titan_hcl_state.bin (§11.I.5, schema
+    # v2). A roster module with no live slot is genuinely not_booted. This
+    # REPLACES the prior API-route-manifest producer union, which polluted
+    # not_booted with phantom names (rust substrate procs, kernel peers, and
+    # `_worker`-suffixed aliases of modules already running under their short
+    # name). Graceful fallback: if the roster is absent (writer not yet up, or a
+    # pre-v2 slot still in SHM mid-rollout), report only live slots — never
+    # resurrect the phantom-prone manifest union.
+    roster_map: dict[str, str] = {}
+    if fleet_entry is not None:
+        roster_map = {str(n): str(p) for n, p in (fleet_entry.roster or ())}
 
-    all_module_names: list[str] = sorted(slot_names_set | manifest_names)
+    all_module_names: list[str] = sorted(slot_names_set | set(roster_map))
 
     bank = ModuleStateReaderBank(titan_id=titan_id)
     modules_payload: list[dict[str, object]] = []
@@ -745,7 +729,11 @@ async def get_v6_readiness(request: Request) -> JSONResponse:
                 except Exception:  # noqa: BLE001
                     entry = None
             if entry is None:
-                modules_payload.append({"name": name, "state": "not_booted"})
+                nb_payload: dict[str, object] = {
+                    "name": name, "state": "not_booted"}
+                if name in roster_map:
+                    nb_payload["boot_priority"] = roster_map[name]
+                modules_payload.append(nb_payload)
                 not_booted_count += 1
             else:
                 payload = entry.as_wire_dict()

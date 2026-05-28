@@ -12252,15 +12252,3 @@ from titan_hcl.api.synthesis_skill_handlers import (
     get_v6_synthesis_skills_recent,
     get_v6_synthesis_skills_coverage,
 )
-# Re-exports from synthesis_metrics_handlers.py (P10.C, D-SPEC-PHASE10) —
-# JSON-snapshot-backed reads of `data/synthesis_metrics_snapshot.json`
-# (INV-Syn-25, observation-only). Surfaces: full bundle, sovereignty ratio
-# (headline B.6), groundedness heatmap, retrieval p99 (B.4) + chi (B.5),
-# chain-growth (B.7).
-from titan_hcl.api.synthesis_metrics_handlers import (
-    get_v6_synthesis_metrics,
-    get_v6_synthesis_metrics_sovereignty,
-    get_v6_synthesis_metrics_groundedness,
-    get_v6_synthesis_metrics_retrieval,
-    get_v6_synthesis_metrics_chain_growth,
-)
