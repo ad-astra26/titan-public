@@ -38,7 +38,40 @@ def entry(recv_queue, send_queue, name: str, config: dict) -> None:
     except ImportError:
         pass
 
+    # Phase 11 §11.I.5 — populate the api module's SHM state slot so
+    # /v6/readiness counts it toward mandatory_ready (W3 sweep / commit
+    # 58761482 skipped this entry because api_main.py lives under
+    # titan_hcl/api/ rather than titan_hcl/modules/). Same pattern as
+    # the 39 worker entries. Logged-and-tolerated init failure so a
+    # missing SHM root doesn't take down the api process.
+    try:
+        from titan_hcl.core.module_state import BootPriority, ModuleStateWriter
+        _state_writer = ModuleStateWriter(
+            module_name="api",
+            layer="L3",
+            boot_priority=BootPriority.MANDATORY,
+        )
+        _state_writer.write_state("starting")
+    except Exception as _sw_err:  # noqa: BLE001
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "[titan_hcl_api] Phase 11 ModuleStateWriter init failed "
+            "(continuing on legacy MODULE_READY path): %s", _sw_err)
+        _state_writer = None
+
     from titan_hcl.api.api_subprocess import api_subprocess_main
+    # The api_subprocess_main run loop reaches "booted" after KernelRPCClient
+    # is wired (~5s into entry) and "running" after uvicorn binds the port
+    # (~15-30s further). Surface "booted" pre-delegate so the SHM slot
+    # transitions out of "starting" early; api_subprocess_main itself emits
+    # MODULE_READY on uvicorn-up which (under legacy bus-only liveness) is
+    # the canonical readiness signal — Supervisor uses the MAX(SHM, bus)
+    # heartbeat per §11.I.5.
+    if _state_writer is not None:
+        try:
+            _state_writer.write_state("booted")
+        except Exception:
+            pass
     api_subprocess_main(recv_queue, send_queue, name, config)
 
 

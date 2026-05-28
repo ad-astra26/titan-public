@@ -2006,7 +2006,15 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         # HOST-OOM thread). Real fix needs heap-dump on stable
         # api process to identify allocator hotspots.
         rss_limit_mb=800,
-        autostart=True,
+        # Phase 11 §11.I.1 / D-SPEC-141 — api is now a kernel-rs peer
+        # spawned via `scripts/titan_hcl_api.py` (INV-PROC-3 / INV-PROC-5,
+        # independent crash domain from titan_hcl). The ModuleSpec stays
+        # in the catalog so Supervisor.monitor_tick has the heartbeat /
+        # rss / layer / restart_on_crash metadata to track it, and so
+        # /v6/* readouts continue to enumerate it. autostart=False stops
+        # this Orchestrator from spawning the api as a Guardian-supervised
+        # child (which would race with the kernel-rs peer-spawn).
+        autostart=False,
         lazy=False,
         heartbeat_timeout=60.0,
         layer="L3",

@@ -455,13 +455,22 @@ class KernelRPCClient:
             )
 
         authkey = authkey_path.read_bytes()
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.connect(str(sock_path))
-
-        # HMAC handshake
-        challenge = _recv_exact(self._sock, CHALLENGE_SIZE)
+        # Build + handshake on a LOCAL socket, then expose self._sock only
+        # after the handshake completes. Under the Phase 11 standalone-L3
+        # api (api_subprocess), connect() runs in a background thread while
+        # uvicorn request handlers call `.call()` concurrently. If self._sock
+        # were assigned before the HMAC exchange, a concurrent call() could
+        # send a request frame into the challenge/response window → the
+        # server reads it as the HMAC → auth failure. Atomic late-assign
+        # closes that race (call() sees either None → "not connected" or a
+        # fully-handshaked socket).
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(str(sock_path))
+        challenge = _recv_exact(sock, CHALLENGE_SIZE)
         response = _compute_hmac(authkey, challenge)
-        self._sock.sendall(response)
+        sock.sendall(response)
+        with self._lock:
+            self._sock = sock
         # No explicit ack — first successful request implies auth passed.
         logger.info("[KernelRPCClient] connected + handshaked at %s", sock_path)
 
