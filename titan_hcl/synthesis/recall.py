@@ -84,16 +84,8 @@ DEFAULT_K = 8
 GRANULARITY_TURN = "turn"
 GRANULARITY_TOPIC = "topic"
 GRANULARITY_SESSION = "session"
-# Phase 9 §13.2 — RECALL sub-mode granularities (FORK_READ-based, no embedder).
-# archive          → RECALL.chain_archive          → FORK_READ(meta) + CROSS_REF
-# autobiographical → RECALL.autobiographical_relevant → FORK_READ(main genesis) + DIFF
-GRANULARITY_ARCHIVE = "archive"
-GRANULARITY_AUTOBIOGRAPHICAL = "autobiographical"
 _VALID_GRANULARITIES = frozenset(
     {GRANULARITY_TURN, GRANULARITY_TOPIC, GRANULARITY_SESSION})
-# Default recency windows (hours) for the FORK_READ-based modes.
-ARCHIVE_WINDOW_H = 720           # meta-fork archive: 30d
-AUTOBIOGRAPHICAL_WINDOW_H = 8760  # genesis self-journey: ~1y
 
 # $var used by the granularity-augmented FORK_READ. Public constant so
 # tests + a future Maker-tuned contract version can reference it.
@@ -328,27 +320,6 @@ class EngineRecall:
                 for row in skill_rows
             ]
 
-        # Phase 9 §13.2 — FORK_READ-based RECALL sub-modes (INV-Syn-22). These
-        # bypass the embedder + helper-contract path: they read a fork directly
-        # (meta archive / FORK_MAIN genesis) and rank by activation + importance
-        # (cosine defaults to 0.5 — recency/frequency carries the ranking).
-        if granularity == GRANULARITY_ARCHIVE:
-            results = self._fork_scoped_recall(
-                fork="meta", k=k, current_chat_tx=current_chat_tx,
-                with_cross_ref=True, since_hours=ARCHIVE_WINDOW_H,
-                src_label="synthesis_archive",
-            )
-            self._tally(results)
-            return results
-        if granularity == GRANULARITY_AUTOBIOGRAPHICAL:
-            results = self._fork_scoped_recall(
-                fork="main", k=k, current_chat_tx=current_chat_tx,
-                with_cross_ref=False, since_hours=AUTOBIOGRAPHICAL_WINDOW_H,
-                src_label="synthesis_autobiographical",
-            )
-            self._tally(results)
-            return results
-
         if not self._embedder:
             logger.debug("[EngineRecall] no embedder injected — fallback")
             self._total_fallbacks += 1
@@ -441,76 +412,6 @@ class EngineRecall:
         # 4. Consume rank_composite — merge candidate $vars + dedup +
         #    score + return top-K.
         return self._consume_rank_composite(action, k)
-
-    # ── Phase 9 FORK_READ-based RECALL sub-modes (INV-Syn-22) ──────────
-
-    def _tally(self, results: Optional[list]) -> None:
-        if results is None:
-            self._total_fallbacks += 1
-        else:
-            self._total_contract_hits += 1
-
-    def _fork_scoped_recall(
-        self,
-        *,
-        fork: str,
-        k: int,
-        current_chat_tx: Optional[str],
-        with_cross_ref: bool,
-        since_hours: int,
-        src_label: str,
-    ) -> Optional[list[RecallResult]]:
-        """RECALL.chain_archive / .autobiographical_relevant (§13.2).
-
-        Runs a FORK_READ on `fork` (+ optional CROSS_REF threading through the
-        current chat TX), then ranks the rows by the ACT-R composite (activation
-        + importance; cosine defaults to 0.5 since there is no query embedding —
-        archive/autobiographical recall is recency/frequency-driven). Reuses the
-        evaluator's binding-op machinery + `_consume_rank_composite`. Returns
-        None on evaluator failure (caller falls back); [] when the fork is empty.
-        """
-        src_var = "$fork_scoped_src"
-        rules: list[dict] = [{
-            "op": "FORK_READ", "fork": fork,
-            "since_hours": since_hours, "limit": 50, "store": src_var,
-        }]
-        candidates_from = [src_var]
-        initial_vars: dict[str, Any] = {"$current_chat_tx": current_chat_tx or ""}
-        if with_cross_ref and current_chat_tx:
-            xref_var = "$fork_scoped_xref"
-            rules.append({
-                "op": "CROSS_REF", "tx_hash": "$current_chat_tx",
-                "via_field": "parent_chat_tx", "limit": 20, "store": xref_var,
-            })
-            candidates_from.append(xref_var)
-
-        ctx = {"event": "retrieval_request", "k": k}
-        try:
-            # Binding ops populate the evaluator's $vars; no action fires (we
-            # synthesize the rank_composite action ourselves below).
-            self._evaluator.evaluate(rules, ctx, initial_variables=initial_vars)
-        except Exception as exc:
-            logger.warning(
-                "[EngineRecall] %s fork-scoped eval failed: %s — fallback",
-                src_label, exc, exc_info=True,
-            )
-            return None
-
-        action = {
-            "action": "rank_composite",
-            "candidates_from": candidates_from,
-            "weights": {
-                "w_b": DEFAULT_W_B, "w_s": DEFAULT_W_S,
-                "w_r": DEFAULT_W_R, "w_p": DEFAULT_W_P,
-            },
-            "limit": k,
-        }
-        results = self._consume_rank_composite(action, k)
-        # Stamp the RECALL-mode label for observability (which sub-mode produced
-        # this result), overriding the per-row producer source.
-        for r in results:
-            r.source = src_label
-        return results
 
     # ── action consumption ────────────────────────────────────────────
 
@@ -816,8 +717,6 @@ __all__ = [
     "GRANULARITY_TURN",
     "GRANULARITY_TOPIC",
     "GRANULARITY_SESSION",
-    "GRANULARITY_ARCHIVE",
-    "GRANULARITY_AUTOBIOGRAPHICAL",
     "GRANULARITY_SOURCE_VAR",
     "GRANULARITY_DEFAULT_WINDOW_H",
     "GRANULARITY_DEFAULT_LIMIT",

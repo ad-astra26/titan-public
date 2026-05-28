@@ -223,30 +223,50 @@ cmd_status() {
 }
 
 cmd_health() {
-    local resp
+    local resp readiness
     resp=$(_titan_curl /health 8)
-    echo "${resp}" | python3 -c "
-import sys, json
+    # Module-running count comes from /v6/readiness (Phase 11 §11.I.5 — reads
+    # the authoritative module_<name>_state.bin slots + orchestrator roster).
+    # The legacy /health v3.guardian_status field is the vestigial monolith-era
+    # guardian view (reports every module 'stopped' under Phase 11) — NOT used.
+    readiness=$(_titan_curl /v6/readiness 8)
+    READINESS_JSON="${readiness}" python3 -c "
+import sys, json, os
 try:
     d = json.load(sys.stdin).get('data', {})
 except Exception as e:
     print(f'  ✗ Failed to parse /health: {e}')
     sys.exit(1)
 v3 = d.get('v3', {})
-g = v3.get('guardian_status', {})
-running = sum(1 for _,i in g.items() if i.get('state') == 'running')
 sub = d.get('subsystems', {})
 active = sum(1 for _,s in sub.items() if s == 'ACTIVE')
 bus = v3.get('bus_stats', {})
 v = d.get('vault', {})
+# Authoritative module count from /v6/readiness.
+mod_line = '  Modules: (readiness unavailable)'
+try:
+    rj = json.loads(os.environ.get('READINESS_JSON') or '{}')
+    rd = rj.get('data', rj)
+    summ = rd.get('module_state_summary', {}) or {}
+    running = rd.get('module_running_count', summ.get('running', 0))
+    fleet = rd.get('fleet') or {}
+    expected = (fleet.get('mandatory_total', 0) or 0) + (fleet.get('post_boot_total', 0) or 0)
+    extra = []
+    for k in ('booted','starting','unhealthy_or_crashed','not_booted'):
+        if summ.get(k):
+            extra.append(f'{k}={summ[k]}')
+    suffix = ('  [' + ', '.join(extra) + ']') if extra else ''
+    mod_line = f'  Modules: {running}/{expected or running} running (boot_phase={fleet.get(\"boot_phase\",\"?\")}){suffix}'
+except Exception as e:
+    mod_line = f'  Modules: (readiness parse error: {e})'
 print(f'  Status: {d.get(\"status\")}')
 print(f'  Boot time: {v3.get(\"boot_time\")}s')
-print(f'  Guardian modules: {running}/{len(g)} running')
+print(mod_line)
 print(f'  Subsystems: {active}/{len(sub)} ACTIVE')
 print(f'  Bus: pub={bus.get(\"published\",\"?\")} routed={bus.get(\"routed\",\"?\")} dropped={bus.get(\"dropped\",\"?\")}')
 print(f'  Vault: commits={v.get(\"commit_count\",\"?\")}, sovereignty={v.get(\"sovereignty_pct\",\"?\")}%')
 print(f'  SOL: {d.get(\"sol_balance\",\"?\")}')
-"
+" <<< "${resp}"
 }
 
 cmd_start() {

@@ -76,7 +76,6 @@ from titan_hcl.bus import (
     SYNTHESIS_FORK_COMMAND_RESULT,
     SYNTHESIS_BUFFER_COMMAND,
     SYNTHESIS_RECOMPUTE_DONE,
-    USER_FEEDBACK_SIGNAL,
     make_msg,
 )
 from titan_hcl.synthesis.activation import (
@@ -797,8 +796,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 "[synthesis_worker] Phase 11 write_state(booted) failed: %s",
                 _swb_err)
 
-    events_recorded = 0      # used_by_llm=True → record_access (INV-Syn-23)
-    events_surfaced = 0      # used_by_llm=False → surfaced-not-cited telemetry
+    events_recorded = 0
     bundles_maintained = 0
 
     # ── Phase 4 §P4.G — dream-boundary consolidation pass wiring ──────
@@ -1033,32 +1031,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         (config or {}).get("synthesis", {}).get("fork_gc_live", False)
     )
 
-    # ── Phase 9 P9.D — skill-outcome sink (late-bound) ──────────────────
-    # The ToolPlugs (built in the Phase 6 block below) need a skill-outcome
-    # callback, but skill_store + SkillFailureTracker are built later (Phase 8
-    # block). Use a late-bound holder the sink closes over; fill it after the
-    # Phase 8 block constructs the store + tracker. When unfilled (skill store
-    # disabled), the sink is a no-op. Closes the P8 increment_* gap + drives
-    # repair-fork-on-failure (§9.3 / INV-Syn-24 not — this is the failure loop).
-    _skill_outcome_holder: dict = {"store": None, "tracker": None}
-
-    def _skill_outcome_sink(skill_id: str, success: bool) -> None:
-        _st = _skill_outcome_holder.get("store")
-        _tr = _skill_outcome_holder.get("tracker")
-        if _st is not None:
-            try:
-                if success:
-                    _st.increment_success(skill_id)
-                else:
-                    _st.increment_failure(skill_id)
-            except Exception as _se:
-                logger.debug("[synthesis_worker] skill utility update failed: %s", _se)
-        if _tr is not None:
-            try:
-                _tr.record_outcome(skill_id, success=success)
-            except Exception as _te:
-                logger.debug("[synthesis_worker] failure tracker failed: %s", _te)
-
     # ── Phase 6 §P6.A–K — Oracle middleware + proof middleware + CGN ─────
     # MeaningOraclePlug + 4 ToolPlugs + coverage analyzer + snapshot
     # exporter. Soft-fail: if any dependency is missing the worker keeps
@@ -1229,16 +1201,9 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         # passed in so companion-verdict triggers fire.
         sandbox_tool = CodingSandboxTool(
             writer=writer, router=oracle_router, oracle=sandbox_oracle,
-            skill_outcome_sink=_skill_outcome_sink,
         )
-        events_teacher_tool = EventsTeacherTool(
-            writer=writer, router=oracle_router,
-            skill_outcome_sink=_skill_outcome_sink,
-        )
-        knowledge_tool = KnowledgeTool(
-            writer=writer, router=oracle_router,
-            skill_outcome_sink=_skill_outcome_sink,
-        )
+        events_teacher_tool = EventsTeacherTool(writer=writer, router=oracle_router)
+        knowledge_tool = KnowledgeTool(writer=writer, router=oracle_router)
         # x_research_tool needs a gateway — leave unwired here; the
         # main plugin (TitanHCL) constructs it with the live
         # SocialXGateway. agno_tools fall-back gracefully when missing.
@@ -1493,65 +1458,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 exc, exc_info=True,
             )
 
-    # ── Phase 9 P9.D/P9.E — repair-fork-on-failure + Tier-2 override ────
-    # SkillFailureTracker (consumes the skill-outcome sink → spawns a repair
-    # fork at N consecutive failures, §9.3) + UserFeedbackOverride (INV-Syn-24).
-    # Soft-fail; filled into the late-bound _skill_outcome_holder so the
-    # ToolPlugs' sink (built earlier) drives them.
-    skill_failure_tracker: Optional[Any] = None
-    user_feedback_override: Optional[Any] = None
-    meta_cfg = dict((config or {}).get("synthesis", {}).get("meta", {}) or {})
-    if procedural_skill_store is not None:
-        try:
-            from titan_hcl.synthesis.skill_failure_tracker import SkillFailureTracker
-            from titan_hcl.synthesis.user_feedback import UserFeedbackOverride
-
-            def _tracker_bus_emit(ev: str, payload: dict) -> None:
-                try:
-                    _send(send_queue, ev, name, "all", payload)
-                except Exception:
-                    pass
-
-            # concept_resolver: map a compiled skill → its parent canonical
-            # concept for a repair-fork root. P8 skills compile from tool-call
-            # TXs (no direct skill→concept edge yet), so v1 returns None →
-            # net-new exploration fork ("repair_skill:<id>") per §9.3 (∅ root).
-            # Refinement: root at the spine concept once a skill→concept link
-            # exists.
-            def _skill_concept_resolver(skill_id: str):
-                return None
-
-            if hypothesis_fork_store is not None:
-                skill_failure_tracker = SkillFailureTracker(
-                    fork_store=hypothesis_fork_store,
-                    concept_resolver=_skill_concept_resolver,
-                    bus_emit=_tracker_bus_emit,
-                    failure_threshold=int(
-                        meta_cfg.get("repair_fork_failure_threshold", 3)),
-                )
-            user_feedback_override = UserFeedbackOverride(
-                outer_memory_writer=writer,
-                skill_store=procedural_skill_store,
-                user_feedback_delta=float(meta_cfg.get("user_feedback_delta", 0.15)),
-            )
-            # Fill the late-bound holder so the ToolPlug skill-outcome sink
-            # (built in the Phase 6 block) now drives the P8 utility loop +
-            # the failure tracker.
-            _skill_outcome_holder["store"] = procedural_skill_store
-            _skill_outcome_holder["tracker"] = skill_failure_tracker
-            logger.info(
-                "[synthesis_worker] Phase 9 repair-fork + Tier-2 override ready "
-                "(failure_threshold=%s, feedback_delta=%s, tracker=%s)",
-                meta_cfg.get("repair_fork_failure_threshold", 3),
-                meta_cfg.get("user_feedback_delta", 0.15),
-                "on" if skill_failure_tracker is not None else "off(no fork store)",
-            )
-        except Exception as exc:
-            logger.warning(
-                "[synthesis_worker] Phase 9 P9.D/E wiring failed: %s — "
-                "repair-fork + Tier-2 disabled this session", exc, exc_info=True,
-            )
-
     # Phase 8 dream dispatchers — judge BEFORE miner (INV-Syn-21).
     last_llm_judge_started_ts: float = 0.0
     llm_judge_lock = threading.Lock()
@@ -1755,39 +1661,9 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 ts = payload.get("ts")
                 if not isinstance(item_id, str) or not isinstance(ts, (int, float)):
                     continue
-                # INV-Syn-23 strict cited gate (Phase 9): reinforce ONLY items
-                # the LLM actually cited (used_by_llm=True, set by the agno
-                # CitedUseDetector). Surfaced-not-cited (False / legacy-missing)
-                # is telemetry-only — no record_access, no rich-get-richer
-                # runaway (rFP §240). The actr_working_memory_decay contract is
-                # the SPEC-correct authority; this gate makes the producer honest.
-                if payload.get("used_by_llm") is True:
-                    with cache_lock:
-                        store.record_access(item_id, float(ts))
-                    events_recorded += 1
-                else:
-                    events_surfaced += 1
-                continue
-
-            if msg_type == USER_FEEDBACK_SIGNAL:
-                # Phase 9 INV-Syn-24 — Tier-2 explicit user feedback override.
-                if user_feedback_override is None:
-                    continue
-                _tc_tx = payload.get("tool_call_tx")
-                _verdict = payload.get("verdict")
-                if not isinstance(_tc_tx, str) or not _tc_tx:
-                    continue
-                try:
-                    user_feedback_override.apply(
-                        tool_call_tx=_tc_tx,
-                        verdict=str(_verdict or ""),
-                        skill_id=payload.get("skill_id"),
-                        source=str(payload.get("source", "explicit")),
-                    )
-                except Exception as _uf_err:
-                    logger.warning(
-                        "[synthesis_worker] user feedback override failed: %s",
-                        _uf_err)
+                with cache_lock:
+                    store.record_access(item_id, float(ts))
+                events_recorded += 1
                 continue
 
             if msg_type == MAINTAIN_BUNDLE:

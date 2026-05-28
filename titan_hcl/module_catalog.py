@@ -140,6 +140,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         start_method="spawn",
         # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
         boot_priority="mandatory",
+        # imw is a reply_only Unix-socket persistence daemon — no SHM lifecycle
+        # slot (§11.I.5); excluded from the /v6/readiness roster.
+        reports_lifecycle_slot=False,
     ))
 
     # Output Verifier Worker — L2 §A.8.3 subprocess extraction.
@@ -365,6 +368,8 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         start_method="spawn",
         # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.
         boot_priority="post_boot",
+        # Unix-socket persistence daemon — no SHM lifecycle slot (§11.I.5).
+        reports_lifecycle_slot=False,
     ))
 
     # ─────────────────────────────────────────────────────────────────
@@ -406,6 +411,8 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # Phase 6 / D-SPEC-135: spawn-mode (same rationale as 'imw' /
             # 'observatory_writer' above).
             start_method="spawn",
+            # Unix-socket persistence daemon — no SHM lifecycle slot (§11.I.5).
+            reports_lifecycle_slot=False,
         ))
 
     # Memory module (FAISS + Kuzu + DuckDB)
@@ -1285,13 +1292,6 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             _bus_constants.META_SKILL_VERIFIED,
             _bus_constants.META_SKILL_REJECTED,
             _bus_constants.META_SKILL_SOFT_RETIRED,
-            # Phase 9 (D-SPEC-PHASE9): SKILL_REPAIR_FORK_SPAWNED is emitted BY
-            # synthesis_worker (SkillFailureTracker, §9.3) — listed so agno +
-            # Observatory can opt in. USER_FEEDBACK_SIGNAL is emitted by
-            # agno_worker on explicit thumbs-up/down; synthesis_worker is the
-            # sole consumer (INV-Syn-24 Tier-2 override via UserFeedbackOverride).
-            _bus_constants.SKILL_REPAIR_FORK_SPAWNED,
-            _bus_constants.USER_FEEDBACK_SIGNAL,
             _bus_constants.KERNEL_EPOCH_TICK,
             _bus_constants.MODULE_SHUTDOWN,
         ],
