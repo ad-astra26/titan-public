@@ -57,6 +57,16 @@ logger = logging.getLogger(__name__)
 # evicts least-recently-touched once the cap is hit.
 MAX_TRACKED_SESSIONS = 5000
 
+# A chat_id is a short opaque session id; anything longer is a misuse (e.g. a
+# serialized object repr). Clamp on write so the backing file can't bloat.
+MAX_CHAT_ID_LEN = 256
+
+# If the on-disk state file is larger than this, refuse to json.load it (a
+# healthy file is <200 KB even at MAX_TRACKED_SESSIONS). A bloated file means a
+# bad key leaked in historically; loading it would OOM the chat path. Start
+# fresh + let _persist rewrite a clean capped file.
+MAX_STATE_FILE_BYTES = 8 * 1024 * 1024  # 8 MB — ~40x healthy worst case
+
 # Default state-file location. Caller (synthesis_worker boot or
 # agno_hooks) may override via `set_state_path`.
 _DEFAULT_STATE_PATH = os.path.join("data", "conversation_turn_index.json")
@@ -98,6 +108,15 @@ def _ensure_loaded() -> None:
     if not os.path.exists(_state_path):
         return
     try:
+        _sz = os.path.getsize(_state_path)
+        if _sz > MAX_STATE_FILE_BYTES:
+            logger.error(
+                "[turn_index_store] state file %s is %d bytes (> %d cap) — "
+                "refusing to json.load (would OOM the chat path); starting "
+                "fresh. A bad oversized key bloated it historically; _persist "
+                "will rewrite a clean capped file on next write.",
+                _state_path, _sz, MAX_STATE_FILE_BYTES)
+            return
         with open(_state_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
@@ -172,6 +191,17 @@ def next_turn_index(chat_id: str) -> int:
     cid = str(chat_id or "")
     if not cid:
         return 0
+    # Defense-in-depth: a chat_id must be a short opaque session id. If a
+    # caller ever passes a serialized object (e.g. an Agno AgentSession repr,
+    # which bloated this file to ~1GB → json.load OOM on the chat path), clamp
+    # the key so a single bad caller can never blow up the backing file again.
+    # The COUNT cap (MAX_TRACKED_SESSIONS) does not bound key SIZE on its own.
+    if len(cid) > MAX_CHAT_ID_LEN:
+        logger.warning(
+            "[turn_index_store] oversized chat_id (%d chars) — clamping to %d; "
+            "caller should pass a plain session id, not an object repr",
+            len(cid), MAX_CHAT_ID_LEN)
+        cid = cid[:MAX_CHAT_ID_LEN]
     with _cache_lock:
         _ensure_loaded()
         if cid in _cache:

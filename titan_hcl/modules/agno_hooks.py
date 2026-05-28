@@ -1902,12 +1902,33 @@ def create_post_hook(plugin):
                 # still wins if explicitly supplied". `session` is the production
                 # path. The `agent.session_id` fallback covers any other Agno
                 # versions or in-process overrides.
+                # Agno 2.x `session` kwarg is the AgentSession OBJECT, not a
+                # string — extract its `.session_id`. Using the object directly
+                # str-ifies the entire AgentSession repr (session_data +
+                # metrics, multi-KB) as the chat_id, which (a) bloated
+                # conversation_turn_index.json to ~1GB → json.load OOM/25s on
+                # the chat path, and (b) poisoned the TimeChain `chat:<id>` tag.
+                _ovg_session = kwargs.get("session")
+                _ovg_session_id = (
+                    getattr(_ovg_session, "session_id", None)
+                    if _ovg_session is not None
+                    and not isinstance(_ovg_session, str)
+                    else _ovg_session
+                )
                 _ovg_chat_id = (
                     kwargs.get("session_id")
-                    or kwargs.get("session")
+                    or _ovg_session_id
                     or getattr(agent, "session_id", "")
                     or ""
                 )
+                # Hard guard: chat_id must be a short opaque id, never a blob.
+                _ovg_chat_id = str(_ovg_chat_id or "")
+                if len(_ovg_chat_id) > 256:
+                    logger.warning(
+                        "[PostHook] oversized chat_id (%d chars) — truncating; "
+                        "upstream session kwarg is not a plain id",
+                        len(_ovg_chat_id))
+                    _ovg_chat_id = _ovg_chat_id[:256]
                 # Phase 3 (D-SPEC-127): turn_index now resolves through
                 # synthesis.turn_index_store (P3.B) — caller kwarg still
                 # wins if explicitly supplied (preserves test injection +
