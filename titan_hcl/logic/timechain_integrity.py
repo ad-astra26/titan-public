@@ -59,39 +59,6 @@ class ChainIntegrity:
                  titan_id: str = "T1"):
         self._data_dir = Path(data_dir)
         self._titan_id = titan_id
-        # Phase 14 / INV-Syn-26 — chain-local id→name label cache. Fork ids are
-        # chain-local, so a label must come from THIS chain's fork_registry, not
-        # the static FORK_NAMES map (which would mislabel a relocated primary
-        # like `conversation` on T2/T3).
-        self._fork_label_cache: dict[int, str] = {}
-
-    def _resolve_fork_name(self, fork_id: int) -> str:
-        """Chain-local id→name via this chain's fork_registry (INV-Syn-26).
-
-        Falls back to the `sc_<id>` synthetic label when the id is absent from
-        the registry (a bare sidechain file with no row).
-        """
-        if fork_id in self._fork_label_cache:
-            return self._fork_label_cache[fork_id]
-        label = f"sc_{fork_id}"
-        db_path = self._data_dir / "index.db"
-        if db_path.exists():
-            try:
-                import sqlite3
-                conn = sqlite3.connect(str(db_path), timeout=2.0)
-                try:
-                    row = conn.execute(
-                        "SELECT fork_name FROM fork_registry WHERE fork_id = ? LIMIT 1",
-                        (fork_id,)
-                    ).fetchone()
-                    if row is not None:
-                        label = str(row[0])
-                finally:
-                    conn.close()
-            except sqlite3.Error:
-                pass
-        self._fork_label_cache[fork_id] = label
-        return label
 
     # ══════════════════════════════════════════════════════════════════
     # DETECTION — Find exactly where corruption starts
@@ -106,10 +73,10 @@ class ChainIntegrity:
         """
         from titan_hcl.logic.timechain import (
             HEADER_SIZE, CROSS_REF_SIZE, GENESIS_PREV_HASH,
-            FORK_MAIN, BlockHeader, sha256,
+            FORK_MAIN, FORK_NAMES, BlockHeader, sha256,
         )
 
-        fork_name = self._resolve_fork_name(fork_id)
+        fork_name = FORK_NAMES.get(fork_id, f"sc_{fork_id}")
         path = self._get_chain_file_path(fork_id)
 
         if not path.exists():
@@ -270,11 +237,11 @@ class ChainIntegrity:
         5. Rebuild index for affected blocks
         """
         from titan_hcl.logic.timechain import (
-            HEADER_SIZE, CROSS_REF_SIZE, BlockHeader,
+            HEADER_SIZE, CROSS_REF_SIZE, FORK_NAMES, BlockHeader,
             BlockPayload, Block, sha256,
         )
 
-        fork_name = self._resolve_fork_name(fork_id)
+        fork_name = FORK_NAMES.get(fork_id, f"sc_{fork_id}")
         local_path = self._get_chain_file_path(fork_id)
         backup_path = Path(backup_data_dir) / local_path.name
 
@@ -386,10 +353,10 @@ class ChainIntegrity:
         6. META block documenting the reorg
         """
         from titan_hcl.logic.timechain import (
-            TimeChain, BlockPayload, sha256,
+            TimeChain, FORK_NAMES, FORK_META, BlockPayload, sha256,
         )
 
-        fork_name = self._resolve_fork_name(fork_id)
+        fork_name = FORK_NAMES.get(fork_id, f"sc_{fork_id}")
         local_path = self._get_chain_file_path(fork_id)
         corrupt_h = corruption.corruption_height
 
@@ -505,10 +472,10 @@ class ChainIntegrity:
         """
         from titan_hcl.logic.timechain import (
             TimeChain, FORK_DECLARATIVE, FORK_PROCEDURAL, FORK_EPISODIC,
-            BlockPayload,
+            FORK_NAMES, BlockPayload,
         )
 
-        fork_name = self._resolve_fork_name(fork_id)
+        fork_name = FORK_NAMES.get(fork_id, f"sc_{fork_id}")
         logger.info("[Integrity] Tier 3: Reconciling orphans for %s", fork_name)
 
         tc = TimeChain(data_dir=str(self._data_dir), titan_id=self._titan_id)
@@ -875,11 +842,11 @@ class ChainIntegrity:
                              orphans_recommitted: int = 0):
         """Commit a META block documenting the repair."""
         from titan_hcl.logic.timechain import (
-            TimeChain, BlockPayload,
+            TimeChain, FORK_META, BlockPayload, FORK_NAMES,
         )
 
         tc = TimeChain(data_dir=str(self._data_dir), titan_id=self._titan_id)
-        fork_name = self._resolve_fork_name(fork_id)
+        fork_name = FORK_NAMES.get(fork_id, f"sc_{fork_id}")
 
         content = {
             "event": "CHAIN_REPAIR",
@@ -909,7 +876,7 @@ class ChainIntegrity:
                      "5HT": 0.5, "GABA": 0.2, "endorphin": 0.3}
 
         block = tc.commit_block(
-            fork_id=tc.resolve_fork_id("meta"),  # Phase 14 / INV-Syn-26 chain-local
+            fork_id=FORK_META,
             epoch_id=0,
             payload=payload,
             pot_nonce=0,

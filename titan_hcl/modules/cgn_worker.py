@@ -577,6 +577,18 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     _LEXICON_EXPORT_INTERVAL_S = 300.0  # 5 minutes
     _last_lexicon_export = 0.0
 
+    # ── Periodic cgn_state.pt disk checkpoint (CRITICAL persistence) ──
+    # cgn_state.pt was otherwise written ONLY on dream consolidation
+    # (CGN_CONSOLIDATE) + graceful SAVE_NOW/MODULE_SHUTDOWN. Under shm_pid_dead
+    # restart churn the worker dies before any of those fire, so ALL learning
+    # since the last dream (groundings, consolidations, value_net, consumer_freq)
+    # was lost on every restart — cgn_state.pt was observed frozen for 1.5 days
+    # across the fleet. This time-gated checkpoint makes persistence independent
+    # of graceful shutdown (loses at most the interval on an ungraceful death).
+    # Time-gated (not per-consolidation) to bound torch.save frequency.
+    _STATE_CHECKPOINT_INTERVAL_S = 300.0  # 5 min
+    _last_state_checkpoint = time.time()  # first checkpoint ~5min after boot
+
     def _maybe_export_lexicon_snapshot() -> None:
         nonlocal _last_lexicon_export
         now_ts = time.time()
@@ -632,6 +644,24 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         except Exception as _csp_err:
             logger.debug("[CGNWorker] CGN_STATS_UPDATED publish: %s", _csp_err)
 
+    def _maybe_checkpoint_state() -> None:
+        """Periodic cgn_state.pt disk checkpoint (every _STATE_CHECKPOINT_INTERVAL_S).
+        Called from BOTH the idle (Empty) path AND the message path so it fires
+        regardless of inbound traffic (avoids the recv_queue_except_empty trap).
+        This is the robust persistence guarantee: cgn survives an ungraceful
+        (shm_pid_dead / SIGKILL) death losing at most one interval, rather than
+        reverting to the last dream-consolidation snapshot."""
+        nonlocal _last_state_checkpoint
+        now_ts = time.time()
+        if now_ts - _last_state_checkpoint < _STATE_CHECKPOINT_INTERVAL_S:
+            return
+        _last_state_checkpoint = now_ts
+        try:
+            cgn._save_state()
+        except Exception as _ckpt_err:  # noqa: BLE001
+            logger.warning(
+                "[CGNWorker] periodic state checkpoint failed: %s", _ckpt_err)
+
     while True:
         # H.3 (2026-04-28): periodic HAOV test pump. Runs at fixed cadence
         # regardless of inbound message activity. Decouples test-trigger
@@ -683,6 +713,7 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             # low-traffic Titan, where the in-message-path block never ran).
             _maybe_publish_cgn_stats()
             _maybe_export_lexicon_snapshot()
+            _maybe_checkpoint_state()
             continue
 
         msg_type = msg.get("type", "")
@@ -727,6 +758,8 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         _maybe_publish_cgn_stats()
         # P8.Y fold-in: lexicon snapshot export on 5-min cadence
         _maybe_export_lexicon_snapshot()
+        # CRITICAL persistence: periodic cgn_state.pt disk checkpoint
+        _maybe_checkpoint_state()
 
         # ── CGN_TRANSITION — experience from any consumer ──────────
         if msg_type == "CGN_TRANSITION":
@@ -1041,6 +1074,33 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         # ── Microkernel v2 Phase B.2.1 — supervision-transfer dispatch ──
         from titan_hcl.core import worker_swap_handler as _swap
         if _swap.maybe_dispatch_swap_msg(msg):
+            continue
+
+        elif msg_type == bus.SAVE_NOW:
+            # Graceful checkpoint requested by orchestrator stop(save_first=True)
+            # before a restart (SAVE_NOW → SAVE_DONE → SIGTERM). cgn previously
+            # had NO SAVE_NOW handler (every other persistence worker does), so
+            # the Guardian's save_first was a silent no-op for cgn → all learning
+            # lost on graceful restart. Emit SAVE_DONE{module,request_id} so the
+            # orchestrator doesn't block the full save_timeout waiting on us.
+            _save_rid = (payload or {}).get("request_id")
+            _save_t0 = time.time()
+            _save_ok, _save_errs = True, 0
+            try:
+                cgn._save_state()
+                _write_full_shm(cgn, shm_writer)
+            except Exception as _save_now_err:  # noqa: BLE001
+                _save_ok, _save_errs = False, 1
+                logger.warning(
+                    "[CGNWorker] SAVE_NOW checkpoint failed: %s", _save_now_err)
+            try:
+                _send_msg(send_queue, bus.SAVE_DONE, name, "guardian", {
+                    "module": name, "request_id": _save_rid,
+                    "saved": _save_ok, "errors": _save_errs,
+                    "duration_ms": int((time.time() - _save_t0) * 1000),
+                })
+            except Exception:  # noqa: BLE001
+                pass
             continue
 
         elif msg_type == bus.MODULE_SHUTDOWN:

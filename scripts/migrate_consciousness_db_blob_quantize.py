@@ -65,18 +65,13 @@ DRIFT_VECTOR_DIM = 9     # 9D drift
 TRAJ_VECTOR_DIM = 9      # 9D trajectory
 
 
-def pack_f32(vals: list[float], target_dim: int = None) -> bytes:
-    """Pack signed floats as f32 LE BLOB at the row's EXACT length — pure
-    TEXT→BLOB encoding, NO pad/clip (SPEC §11.H.1.bis + consciousness.pack_vector).
-
-    Preserving exact dims is load-bearing: the live writer packs the full
-    `state.to_list()` (currently 132D = 130D trinity + meta tail at [130:132]
-    which MSL attention reads), so migrated rows MUST keep the same arity or
-    old rows (clipped to 130D) would mismatch new writes + drop the meta tail.
-    Legacy 9D/67D-era rows are preserved as-is; the consciousness reader
-    unpacks `len(blob)//4` floats per row and downstream consumers pad/slice.
-    `target_dim` is accepted but ignored (kept for call-site compatibility)."""
-    return struct.pack(f"<{len(vals)}f", *(float(v) for v in vals))
+def pack_f32(vals: list[float], target_dim: int) -> bytes:
+    """Pack signed floats as f32 LE BLOB; pad/clip to target_dim. Lossless."""
+    if len(vals) < target_dim:
+        vals = list(vals) + [0.0] * (target_dim - len(vals))
+    elif len(vals) > target_dim:
+        vals = vals[:target_dim]
+    return struct.pack(f"<{target_dim}f", *vals)
 
 
 def main() -> int:
@@ -163,9 +158,9 @@ def main() -> int:
             epoch_id          INTEGER PRIMARY KEY,
             timestamp         REAL NOT NULL,
             block_hash        TEXT NOT NULL DEFAULT '',
-            state_vector      BLOB NOT NULL,      -- 520B (SPEC §11.H.1.bis, lossless 130D × f32)
-            drift_vector      BLOB NOT NULL,      -- 36B
-            trajectory_vector BLOB NOT NULL,      -- 36B
+            state_vector_f32  BLOB NOT NULL,      -- 520B (D-SPEC-127, lossless 130D × f32)
+            drift_vector_f32  BLOB NOT NULL,      -- 36B
+            trajectory_vector_f32 BLOB NOT NULL,  -- 36B
             journey_x         REAL NOT NULL,
             journey_y         REAL NOT NULL,
             journey_z         REAL NOT NULL,
