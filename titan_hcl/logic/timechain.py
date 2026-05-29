@@ -307,12 +307,6 @@ class TimeChain:
         # Fork tip cache: fork_id -> (height, hash)
         self._fork_tips: dict[int, tuple[int, bytes]] = {}
 
-        # Phase 14 / INV-Syn-26 — chain-local fork NAME → id index. Fork ids are
-        # local to this chain's fork_registry; this is the sole sanctioned
-        # name→id authority (see resolve_fork_id). Built in _load_fork_state,
-        # kept in lock-step on every primary (re)seed + sidechain create.
-        self._fork_name_to_id: dict[str, int] = {}
-
         # Tag frequency tracking for auto-sidechain
         self._tag_counts: dict[int, dict[str, int]] = {}
 
@@ -326,13 +320,37 @@ class TimeChain:
         # Load fork registry and tip state from index
         self._load_fork_state()
 
-        # Phase 14 / INV-Syn-26 — idempotent, additive (re)seed of every primary
-        # fork on EVERY boot. Materializes any primary missing from this chain's
-        # fork_registry (e.g. the `conversation` fork on chains born before
-        # FORK_CONVERSATION=5 existed, where a genesis-era sidechain grabbed slot
-        # 5) at the next free id, NEVER clobbering an occupant. Generalizes the
-        # former B.1 system-fork-only migration (FORK_SYSTEM is in FORK_NAMES).
-        self._register_primary_forks(time.time())
+        # Microkernel v2 Phase B.1 §10 — idempotent system-fork migration
+        # for existing chains created before FORK_SYSTEM was added.
+        # No-op for chains where it's already registered (genesis path
+        # auto-registers all FORK_NAMES).
+        self._ensure_system_fork_registered()
+
+    def _ensure_system_fork_registered(self):
+        """Idempotent registration of FORK_SYSTEM for existing chains.
+
+        New chains (genesis path) auto-register all FORK_NAMES via
+        _register_primary_forks. This method covers chains that
+        existed before FORK_SYSTEM was added (T1/T2/T3 in production).
+        Safe to call repeatedly — INSERT OR IGNORE.
+        """
+        if FORK_SYSTEM in self._fork_tips:
+            return
+        conn = sqlite3.connect(str(self._index_db_path))
+        try:
+            ts = time.time()
+            conn.execute("""
+                INSERT OR IGNORE INTO fork_registry
+                (fork_id, fork_name, fork_type, parent_fork, parent_block,
+                 created_at, tip_height, tip_hash, topic, compacted)
+                VALUES (?, ?, 'primary', 0, 0, ?, -1, NULL, NULL, 0)
+            """, (FORK_SYSTEM, FORK_NAMES[FORK_SYSTEM], ts))
+            conn.commit()
+            self._fork_tips[FORK_SYSTEM] = (-1, GENESIS_PREV_HASH)
+            logger.info("[TimeChain] FORK_SYSTEM (id=%d) registered "
+                        "(B.1 substrate-event fork)", FORK_SYSTEM)
+        finally:
+            conn.close()
 
     # ── Database Init ──────────────────────────────────────────────────
 
@@ -547,15 +565,6 @@ class TimeChain:
                     except Exception:
                         pass
                 self._tag_counts[fork_id] = counts
-
-            # Phase 14 / INV-Syn-26 — build the chain-local fork NAME → id index
-            # from the authoritative fork_registry (covers primaries AND
-            # sidechains). resolve_fork_id() reads this in O(1).
-            self._fork_name_to_id = {
-                name: fid for fid, name in conn.execute(
-                    "SELECT fork_id, fork_name FROM fork_registry"
-                ).fetchall()
-            }
         finally:
             conn.close()
 
@@ -626,198 +635,21 @@ class TimeChain:
         return block
 
     def _register_primary_forks(self, created_at: float):
-        """Idempotently, additively (re)seed every primary fork by NAME.
-
-        Phase 14 / INV-Syn-26. Fork ids are CHAIN-LOCAL. For each canonical
-        primary in FORK_NAMES:
-          - a row with that fork_name already exists → keep it (idempotent), at
-            its canonical id OR a previously-relocated one;
-          - its canonical id is FREE → create the primary there (the happy path
-            for a freshly-born chain);
-          - its canonical id is OCCUPIED by a DIFFERENT fork (a genesis-era
-            sidechain that grabbed the slot before the constant existed) →
-            create the primary at the NEXT FREE id and record the real id.
-
-        NEVER updates or deletes an occupant — sovereign data (INV-3 /
-        directive_memory_preservation). This is the additive self-heal that
-        finally materializes the `conversation` fork on chains (T2/T3) born
-        before FORK_CONVERSATION=5 existed. Safe to call on every boot.
-        """
+        """Register the 5 primary forks in the fork registry."""
         conn = sqlite3.connect(str(self._index_db_path))
         try:
-            existing = conn.execute(
-                "SELECT fork_id, fork_name FROM fork_registry"
-            ).fetchall()
-            name_to_id = {name: fid for fid, name in existing}
-            occupied_ids = {fid for fid, _ in existing}
-
-            for canonical_id, fork_name in FORK_NAMES.items():
-                if fork_name in name_to_id:
-                    # Present already (canonical or relocated id) — idempotent keep.
-                    fid = name_to_id[fork_name]
-                else:
-                    if canonical_id not in occupied_ids:
-                        fid = canonical_id
-                    else:
-                        # Canonical slot taken by a non-primary fork; relocate
-                        # additively to the next free id (never clobber).
-                        fid = max(FORK_SIDECHAIN_START, max(occupied_ids) + 1)
-                        logger.warning(
-                            "[TimeChain] primary fork '%s' canonical id=%d "
-                            "occupied; reseeding at next free id=%d "
-                            "(chain-local, INV-Syn-26)",
-                            fork_name, canonical_id, fid)
-                    conn.execute("""
-                        INSERT INTO fork_registry
-                        (fork_id, fork_name, fork_type, parent_fork, parent_block,
-                         created_at, tip_height, tip_hash, topic, compacted)
-                        VALUES (?, ?, 'primary', 0, 0, ?, -1, NULL, NULL, 0)
-                    """, (fid, fork_name, created_at))
-                    occupied_ids.add(fid)
-                    name_to_id[fork_name] = fid
-                    logger.info(
-                        "[TimeChain] primary fork '%s' registered at id=%d",
-                        fork_name, fid)
-
-                # Keep the in-memory caches in lock step.
-                self._fork_name_to_id[fork_name] = fid
-                if fid not in self._fork_tips:
-                    self._fork_tips[fid] = (-1, GENESIS_PREV_HASH)
+            for fork_id, fork_name in FORK_NAMES.items():
+                conn.execute("""
+                    INSERT OR IGNORE INTO fork_registry
+                    (fork_id, fork_name, fork_type, parent_fork, parent_block,
+                     created_at, tip_height, tip_hash, topic, compacted)
+                    VALUES (?, ?, 'primary', 0, 0, ?, -1, NULL, NULL, 0)
+                """, (fork_id, fork_name, created_at))
+                if fork_id not in self._fork_tips:
+                    self._fork_tips[fork_id] = (-1, GENESIS_PREV_HASH)
             conn.commit()
         finally:
             conn.close()
-
-    # ── Chain-local fork resolution (Phase 14 / INV-Syn-26) ─────────────
-
-    def resolve_fork_id(self, name: str) -> Optional[int]:
-        """Resolve a fork NAME to its chain-local id (INV-Syn-26).
-
-        Fork ids are chain-local; this is the SOLE sanctioned name→id authority
-        for primary forks (and works for sidechain names too). O(1) from the
-        in-memory index, with a one-shot SQLite fallback that warms the cache on
-        a miss. Returns None for an unknown name — the caller decides the
-        fallback (NEVER substitute a hardcoded FORK_* int).
-        """
-        fid = self._fork_name_to_id.get(name)
-        if fid is not None:
-            return fid
-        conn = sqlite3.connect(str(self._index_db_path))
-        try:
-            row = conn.execute(
-                "SELECT fork_id FROM fork_registry WHERE fork_name = ? LIMIT 1",
-                (name,)
-            ).fetchone()
-        finally:
-            conn.close()
-        if row is not None:
-            self._fork_name_to_id[name] = row[0]
-            return row[0]
-        return None
-
-    def resolve_fork_name(self, fork_id: int) -> Optional[str]:
-        """Reverse of resolve_fork_id — chain-local id → name via fork_registry."""
-        for name, fid in self._fork_name_to_id.items():
-            if fid == fork_id:
-                return name
-        conn = sqlite3.connect(str(self._index_db_path))
-        try:
-            row = conn.execute(
-                "SELECT fork_name FROM fork_registry WHERE fork_id = ? LIMIT 1",
-                (fork_id,)
-            ).fetchone()
-        finally:
-            conn.close()
-        if row is not None:
-            self._fork_name_to_id[row[0]] = fork_id
-            return row[0]
-        return None
-
-    # Phase 14 §3K.3.C — legacy-conversation provenance anchor.
-    _CONVERSATION_ANCHOR_SOURCE = "phase14_conversation_anchor"
-    _CONVERSATION_CHAT_MARKERS = ("verified_output", "chat")
-
-    def write_conversation_legacy_anchor(self) -> Optional["Block"]:
-        """Phase 14 §3K.3.C — additive cross-ref provenance anchor (idempotent).
-
-        On a chain where the `conversation` primary was reseeded to a RELOCATED
-        id (T2/T3 — fork 5 was held by a genesis-era sidechain, INV-Syn-26), the
-        genuine historical chat blocks (tags ⊇ verified_output|chat) physically
-        live in the legacy fork 5. This appends a SINGLE provenance-anchor block
-        to the new conversation fork recording the legacy chat set (block hashes
-        + merkle root + count + height range) + cross-refs into fork 5.
-
-        ADDITIVE + IDEMPOTENT + sovereign-safe: never deletes/moves data
-        (`directive_memory_preservation`); skips if an anchor already exists;
-        a verified no-op on T1 (conversation == canonical id 5 — no relocation)
-        and on fresh chains (no legacy occupant). Recall still reads the new
-        fork; the anchor is provenance — a future reader can prove + locate the
-        pre-Phase-14 chat history. Single-writer: only the timechain_worker
-        (sole TimeChain owner) calls this, once, at boot after genesis.
-
-        Returns the committed anchor Block, or None when there is nothing to do.
-        """
-        conv_id = self.resolve_fork_id("conversation")
-        if conv_id is None or conv_id == FORK_CONVERSATION:
-            return None  # absent, or canonical id 5 (T1-correct) — no relocation
-        conn = sqlite3.connect(str(self._index_db_path))
-        try:
-            # Idempotency — already anchored?
-            done = conn.execute(
-                "SELECT 1 FROM block_index WHERE fork_id=? AND source=? LIMIT 1",
-                (conv_id, self._CONVERSATION_ANCHOR_SOURCE)).fetchone()
-            if done:
-                return None
-            # Genuine historical chat in the legacy slot (FORK_CONVERSATION=5).
-            rows = conn.execute(
-                "SELECT block_hash, block_height, tags FROM block_index "
-                "WHERE fork_id=? ORDER BY block_height", (FORK_CONVERSATION,)
-            ).fetchall()
-        finally:
-            conn.close()
-        chat = [(bytes(bh), int(h)) for (bh, h, tags) in rows
-                if any(m in (tags or "") for m in self._CONVERSATION_CHAT_MARKERS)]
-        if not chat:
-            return None  # nothing genuinely-conversation in the legacy fork
-        hashes = [bh for bh, _ in chat]
-        heights = [h for _, h in chat]
-        # Binary merkle fold over the legacy chat block hashes.
-        layer = list(hashes)
-        while len(layer) > 1:
-            layer = [sha256(layer[i] + (layer[i + 1] if i + 1 < len(layer) else layer[i]))
-                     for i in range(0, len(layer), 2)]
-        merkle_root = layer[0].hex()
-        payload = BlockPayload(
-            thought_type="meta",
-            source=self._CONVERSATION_ANCHOR_SOURCE,
-            content={
-                "kind": "conversation_legacy_anchor",
-                "spec": "Phase 14 §3K.3.C / INV-Syn-26",
-                "legacy_fork_id": FORK_CONVERSATION,
-                "legacy_fork_name": self.resolve_fork_name(FORK_CONVERSATION),
-                "new_conversation_fork_id": conv_id,
-                "chat_block_count": len(chat),
-                "height_range": [min(heights), max(heights)],
-                "merkle_root": merkle_root,
-                "chat_block_hashes": [h.hex() for h in hashes],
-                "tag_markers": list(self._CONVERSATION_CHAT_MARKERS),
-                "note": ("Historical chat misrouted into the legacy fork before "
-                         "INV-Syn-26. Additive provenance — never deleted/moved."),
-            },
-            significance=1.0,
-            confidence=1.0,
-            tags=["conversation_legacy_anchor", "conversation", "phase14"],
-        )
-        refs = [CrossRef(fork_id=FORK_CONVERSATION, block_height=min(heights)),
-                CrossRef(fork_id=FORK_CONVERSATION, block_height=max(heights))]
-        block = self.commit_block(
-            fork_id=conv_id, epoch_id=0, payload=payload, pot_nonce=1,
-            chi_spent=0.0, neuromod_state={}, cross_refs=refs)
-        if block:
-            logger.info(
-                "[TimeChain] conversation legacy anchor committed → fork %d "
-                "height %d (%d legacy chat blocks, merkle %s, INV-Syn-26 §3K.3.C)",
-                conv_id, block.header.block_height, len(chat), merkle_root[:16])
-        return block
 
     @property
     def has_genesis(self) -> bool:
@@ -1233,39 +1065,11 @@ class TimeChain:
         1. prev_hash chains correctly
         2. payload_hash matches actual payload
 
-        Returns (valid, error_message). Full verification from genesis —
-        thin wrapper over verify_fork_incremental(resume=None).
-        """
-        valid, msg, _ = self.verify_fork_incremental(fork_id, resume=None)
-        # resume=None never yields the valid=None "retry full" signal.
-        return (bool(valid), msg)
-
-    def verify_fork_incremental(
-        self, fork_id: int, resume: dict | None = None,
-    ) -> tuple[bool | None, str, dict | None]:
-        """Resumable fork verify (D-SPEC-143 F2 — incremental tc-verify warmer).
-
-        ``resume=None`` → full verify from genesis (byte-identical to the
-        historical verify_fork). ``resume={offset, height, prev_hash,
-        height_offset}`` (a prior return value) → seek to that previously-
-        verified tip and hash ONLY blocks appended since — turning the 60s
-        full re-hash of the whole (e.g. 100 MB) fork into a tiny delta scan.
-
-        Returns ``(valid, msg, new_resume)``:
-          - ``valid=True``  → fork valid through ``new_resume["height"]`` blocks;
-            cache ``new_resume`` for the next incremental call.
-          - ``valid=False`` → integrity failure (tamper / chain break / truncation).
-          - ``valid=None``  → the resume cache is inconsistent with the file
-            (shrank / rewrote / offset past EOF / malformed) — NOT a tamper
-            verdict; the caller must retry with ``resume=None`` (full verify).
-
-        Append-only chains never rewrite committed bytes, so resuming from a
-        byte offset is sound: a fork-reorg/compaction shrinks the file, which
-        the offset>EOF guard catches → full re-verify fallback.
+        Returns (valid, error_message).
         """
         path = self._get_chain_file_path(fork_id)
         if not path.exists():
-            return True, "Fork file does not exist (no blocks)", None
+            return True, "Fork file does not exist (no blocks)"
 
         prev_hash = GENESIS_PREV_HASH
         # For non-main forks, first block's prev_hash = genesis hash
@@ -1274,41 +1078,15 @@ class TimeChain:
 
         height = 0
         height_offset = 0  # Non-zero for forks with genesis-era off-by-one
-        start_offset = 0
-        if resume is not None:
-            try:
-                r_off = int(resume["offset"])
-                r_height = int(resume["height"])
-                r_prev = resume["prev_hash"]
-                r_hoff = int(resume.get("height_offset", 0))
-            except (KeyError, TypeError, ValueError):
-                return None, "resume cache malformed — full re-verify needed", None
-            if not isinstance(r_prev, (bytes, bytearray)) or r_off < 0:
-                return None, "resume cache malformed — full re-verify needed", None
-            try:
-                fsize = path.stat().st_size
-            except OSError as _e:
-                return None, f"stat failed ({_e}) — full re-verify needed", None
-            if r_off > fsize:
-                # file shrank / rewrote (reorg / compaction) → cache stale
-                return None, "resume offset past EOF — full re-verify needed", None
-            start_offset = r_off
-            height = r_height
-            prev_hash = bytes(r_prev)
-            height_offset = r_hoff
-
-        end_offset = start_offset
         try:
             with open(path, "rb") as f:
-                if start_offset:
-                    f.seek(start_offset)
                 while True:
                     pos = f.tell()
                     header_data = f.read(HEADER_SIZE)
                     if len(header_data) == 0:
                         break  # EOF
                     if len(header_data) < HEADER_SIZE:
-                        return False, f"Truncated header at height {height}", None
+                        return False, f"Truncated header at height {height}"
 
                     header = BlockHeader.from_bytes(header_data)
 
@@ -1321,7 +1099,7 @@ class TimeChain:
                     if header.block_height != height + height_offset:
                         return False, (f"Height mismatch at pos {pos}: "
                                       f"expected {height + height_offset}, "
-                                      f"got {header.block_height}"), None
+                                      f"got {header.block_height}")
 
                     # Verify prev_hash chain
                     if height == 0 and fork_id == FORK_MAIN:
@@ -1338,7 +1116,7 @@ class TimeChain:
                         return False, (f"Chain break at height {height}: "
                                       f"prev_hash mismatch (expected "
                                       f"{expected_prev.hex()[:12]}..., got "
-                                      f"{header.prev_hash.hex()[:12]}...)"), None
+                                      f"{header.prev_hash.hex()[:12]}...)")
 
                     # Read cross-refs (skip)
                     f.read(header.cross_ref_count * CROSS_REF_SIZE)
@@ -1346,29 +1124,22 @@ class TimeChain:
                     # Read payload and verify hash
                     len_data = f.read(4)
                     if len(len_data) < 4:
-                        return False, f"Truncated payload length at height {height}", None
+                        return False, f"Truncated payload length at height {height}"
                     payload_len = struct.unpack(">I", len_data)[0]
                     payload_data = f.read(payload_len)
                     if len(payload_data) < payload_len:
-                        return False, f"Truncated payload at height {height}", None
+                        return False, f"Truncated payload at height {height}"
 
                     if sha256(payload_data) != header.payload_hash:
-                        return False, f"Payload tampered at height {height}", None
+                        return False, f"Payload tampered at height {height}"
 
                     prev_hash = sha256(header_data)
                     height += 1
-                    end_offset = f.tell()
 
         except Exception as e:
-            return False, f"Verification error: {e}", None
+            return False, f"Verification error: {e}"
 
-        new_resume = {
-            "offset": end_offset,
-            "height": height,
-            "prev_hash": prev_hash,
-            "height_offset": height_offset,
-        }
-        return True, f"Fork {fork_id} valid ({height} blocks)", new_resume
+        return True, f"Fork {fork_id} valid ({height} blocks)"
 
     def verify_all(self) -> tuple[bool, list[str]]:
         """Verify all forks. Returns (all_valid, list_of_results)."""
@@ -1491,8 +1262,6 @@ class TimeChain:
             conn.commit()
 
             self._fork_tips[new_id] = (-1, self.genesis_hash)
-            # Phase 14 / INV-Syn-26 — keep the chain-local name→id index current.
-            self._fork_name_to_id[f"topic:{topic}"] = new_id
             logger.info("[TimeChain] Auto-sidechain created: fork=%d topic=%s "
                        "parent=%d", new_id, topic, parent_fork)
             return new_id
@@ -1794,8 +1563,8 @@ class TimeChain:
             conn.execute("PRAGMA synchronous=NORMAL")
 
             # 2. Wipe stale block_index + checkpoints. Leave fork_registry
-            #    intact — _register_primary_forks is idempotent + additive so
-            #    it's safe whether rows exist or not (Phase 14 / INV-Syn-26).
+            #    intact — _register_primary_forks below uses INSERT OR IGNORE
+            #    so it's safe whether rows exist or not.
             conn.executescript(
                 "DELETE FROM block_index; DELETE FROM checkpoints;"
             )
@@ -1804,25 +1573,26 @@ class TimeChain:
             # 3. Reset in-memory state
             self._total_blocks = 0
             self._fork_tips = {}
-        finally:
-            conn.close()
 
-        # 4. Ensure all primary forks are registered (idempotent + additive,
-        #    chain-local per INV-Syn-26 — relocates a primary whose canonical
-        #    id is occupied rather than silently skipping it). Without this,
-        #    fresh DBs (post-corruption + recreate) would only have FORK_SYSTEM
-        #    in fork_registry, leaving _load_fork_state blind to forks 0..5
-        #    even with their blocks indexed in block_index. Maintains the
-        #    chain-local name→id index too.
-        self._register_primary_forks(time.time())
+            # 4. Ensure all primary forks are registered (idempotent).
+            #    Without this, fresh DBs (post-corruption + recreate)
+            #    would only have FORK_SYSTEM in fork_registry, leaving
+            #    _load_fork_state blind to forks 0..5 even with their
+            #    blocks indexed in block_index.
+            now = time.time()
+            for fork_id, fork_name in FORK_NAMES.items():
+                conn.execute(
+                    "INSERT OR IGNORE INTO fork_registry "
+                    "(fork_id, fork_name, fork_type, parent_fork, parent_block, "
+                    " created_at, tip_height, tip_hash, topic, compacted) "
+                    "VALUES (?, ?, 'primary', 0, 0, ?, -1, NULL, NULL, 0)",
+                    (fork_id, fork_name, now),
+                )
+                if fork_id not in self._fork_tips:
+                    self._fork_tips[fork_id] = (-1, GENESIS_PREV_HASH)
+            conn.commit()
 
-        # 5. Re-open the bulk-load connection for the block scan.
-        conn = sqlite3.connect(str(self._index_db_path))
-        try:
-            conn.execute("PRAGMA busy_timeout=10000")
-            conn.execute("PRAGMA synchronous=NORMAL")
-
-            # 6. Scan all chain files into memory, collecting INSERT rows
+            # 5. Scan all chain files into memory, collecting INSERT rows
             #    + tracking max-height per fork.
             block_rows: list[tuple] = []
             tip_per_fork: dict[int, tuple[int, bytes]] = {}

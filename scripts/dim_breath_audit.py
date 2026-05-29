@@ -71,15 +71,14 @@ def fetch_window(db_path: str, window_seconds: int) -> list[list[float]]:
     cutoff = time.time() - window_seconds
     db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     rows = []
-    from titan_hcl.logic.consciousness import unpack_vector
     for (sv,) in db.execute("SELECT state_vector FROM epochs WHERE timestamp >= ?", (cutoff,)):
         try:
-            v = unpack_vector(sv)  # SPEC §11.H.1.bis: BLOB f32-LE or TEXT-JSON
+            v = json.loads(sv or "[]")
             # Need 130+ dims to cover the full inner+outer spirit ranges
             # under --scope=all / spirit; bms-only still requires ≥85.
             if len(v) >= 85:
                 rows.append(v)
-        except Exception:
+        except json.JSONDecodeError:
             continue
     db.close()
     return rows

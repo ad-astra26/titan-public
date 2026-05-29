@@ -74,9 +74,8 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Linux prctl constants — kernel API stable since 2.6.
+# Linux prctl constant — kernel API stable since 2.6.
 _PR_SET_PDEATHSIG = 1
-_PR_SET_NAME = 15  # sets the thread/process `comm` (≤15 bytes + NUL)
 
 # B.2.1: bus-as-supervision timeout — worker self-SIGTERMs if relaxed-mode
 # AND ppid==1 AND bus has been unreachable for this many seconds. Tunable
@@ -129,38 +128,6 @@ class WatcherState:
     def mark_bus_healthy(self) -> None:
         """Called by worker_swap_handler when bus client reports reconnect."""
         self._bus_unreachable_since = None
-
-
-def set_proc_name(name: str) -> bool:
-    """Set this process's `comm` (the ≤15-char name shown by `top`, `htop`,
-    `/proc/<pid>/comm`, `ps -o comm`) via `prctl(PR_SET_NAME)`.
-
-    Part of INV-PROC-7 (WORKER-SELF-IDENTITY, D-SPEC-143): spawned L2 workers
-    set `comm = "titan:<name>"` truncated to 15 bytes so external probes
-    (RSS/CPU attribution, the synthesis-soak fd-probe, crash diagnosis) read
-    the worker identity directly from `/proc` with zero heuristics — even when
-    the API + SHM slots are down. Complements `setproctitle()` (which sets the
-    longer argv-area title `titan_hcl:<name>` for `ps`/`py-spy`).
-
-    Returns True on success; False on any failure (non-Linux, libc unavailable,
-    prctl rejected) — logged at DEBUG, never raises. Best-effort identity, not
-    load-bearing for correctness.
-    """
-    try:
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    except OSError:
-        logger.debug("[worker_lifecycle] libc.so.6 unavailable — skipping prctl(PR_SET_NAME)")
-        return False
-
-    # comm is capped at 15 bytes + NUL by the kernel; encode then truncate on
-    # a byte boundary (not a char boundary) so multibyte names don't corrupt.
-    comm = (f"titan:{name}").encode("utf-8", "replace")[:15]
-    rc = libc.prctl(_PR_SET_NAME, ctypes.c_char_p(comm), 0, 0, 0)
-    if rc != 0:
-        errno = ctypes.get_errno()
-        logger.debug("[worker_lifecycle] prctl(PR_SET_NAME) rc=%d errno=%d", rc, errno)
-        return False
-    return True
 
 
 def install_parent_death_signal(sig: int = signal.SIGTERM) -> bool:
