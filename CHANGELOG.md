@@ -42,6 +42,44 @@ _(curate as you go; lifted into the next versioned section at release time)_
 
 ---
 
+## v0.0.2 — 2026-05-29 (pre-release)
+
+_Turnkey fresh-install hardening. The first live fresh-box test of `v0.0.1`
+proved the pipeline but surfaced real-world gaps that left a newborn Titan
+booted-but-unconfigured. `v0.0.2` closes them so `curl … | bash` yields a
+fully-configured, **chat-ready** Titan with no manual post-install wiring._
+
+### Fixed
+
+- **Complete runtime dependencies.** `pyproject.toml` now declares the full
+  set a Titan actually imports — most importantly the **`agno`** chat framework
+  (with its `openai` + `sqlite` extras) plus `numpy`, `scipy`, `scikit-learn`,
+  `aiohttp`, `python-telegram-bot`, `psutil`, `msgpack`, and more — so a fresh
+  `pip install` boots the brain with no missing modules. torch resolves to the
+  light CPU wheel (no multi-GB CUDA stack) on servers.
+- **`config.toml` is seeded automatically** from the bundled example (it's the
+  required base config), and a random chat-auth key (`[api].internal_key`) is
+  generated into `~/.titan/secrets.toml`.
+- **Credentials are written where the runtime reads them** — secrets land in the
+  correct `secrets.toml` sections (`[inference]`, `[channels]`, …) and the chosen
+  inference provider is recorded in `config.toml`, so inference / chat / Telegram
+  work out of the box.
+- **systemd unit is more resilient on small (2 vCPU / 4 GB) boxes** — a more
+  forgiving start/restart policy rides out the cold-boot startup race.
+
+### Added
+
+- **Ollama Cloud as a first-class inference choice** in the wizard (alongside
+  local Ollama and OpenRouter) — a hosted, OpenAI-compatible provider; you supply
+  your key at setup so the Titan can chat the moment it boots.
+
+### SPEC
+
+- Embodies the same architecture line as `v0.0.1` (Phase C microkernel); this is
+  an install/packaging release — no on-chain or kernel behavior change.
+
+---
+
 ## v0.0.1 — 2026-05-28 (pre-release)
 
 _The first tagged public release — a pre-release cut to validate the full
