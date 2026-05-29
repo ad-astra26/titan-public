@@ -23,8 +23,8 @@ for the Anchor toolchain + Solana CLI + Rust build artifacts.
 
 | OS | Status | Notes |
 |----|--------|-------|
-| **Ubuntu 22.04 LTS** | ✅ primary | T1 / T2 / T3 all run here. The recommended platform. |
-| **Ubuntu 24.04 LTS** | ✅ supported | Tested clean install end-to-end. |
+| **Ubuntu 24.04 LTS** | ✅ **recommended** | Native Python 3.12 — `setup_titan` runs end-to-end with no backports. The reference platform. |
+| **Ubuntu 22.04 LTS** | ⚠ needs Python backport | Ships Python 3.10; Titan requires 3.11+. The fleet (T1/T2/T3) runs here via a 3.12 venv, but a fresh `setup_titan` install needs a deadsnakes 3.11+ backport first. Prefer 24.04. |
 | **Debian 12** | ✅ supported | Tested clean install end-to-end. |
 | Ubuntu 20.04 LTS | ⚠ deprecated | Python 3.12 not native; requires backports. Avoid. |
 | Fedora 39+ | ⚠ unsupported | Likely works (Python + Rust + Solana all available) but untested. |

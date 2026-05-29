@@ -64,24 +64,44 @@ else
     echo "  sha256sum setup_titan.sh   # compare against the release notes, then: bash setup_titan.sh"
 fi
 
-# ── 1. host preflight (the wizard re-checks in depth; this is the floor) ─────
+# ── 1. host preflight + OS prerequisites ────────────────────────────────────
+# A truly fresh cloud image has neither git nor python3-venv nor a C toolchain,
+# so the bootstrap installs them — the wizard's deeper preflight then runs on a
+# box that can actually build the venv. (Surfaced by real-world testing on a
+# stock Ubuntu box, 2026-05-29.)
 [[ "$(uname -s)" == "Linux" ]] || _die "Titan requires Linux (got $(uname -s))."
+IS_APT=""
 if [[ -r /etc/os-release ]]; then
     . /etc/os-release
     case "${ID:-}:${ID_LIKE:-}" in
-        *debian*|*ubuntu*) : ;;
+        *debian*|*ubuntu*) IS_APT=1 ;;
         *) _warn "Tested on Debian/Ubuntu; '${ID:-unknown}' may need manual deps." ;;
     esac
 fi
 
-command -v git    >/dev/null 2>&1 || _die "git not found. Install it: sudo apt install -y git"
-command -v sudo   >/dev/null 2>&1 || _warn "sudo not found — the systemd install phase will fail without it."
-command -v python3 >/dev/null 2>&1 || _die "python3 not found. Install Python ${MIN_PY_MINOR}+: sudo apt install -y python3 python3-venv"
+# Run a command as root: directly if already root, else via sudo.
+_root() { if [[ "$(id -u)" -eq 0 ]]; then "$@"; else sudo "$@"; fi; }
+
+if [[ -n "$IS_APT" ]]; then
+    if [[ "$(id -u)" -ne 0 ]] && ! command -v sudo >/dev/null 2>&1; then
+        _die "Need root or sudo to install prerequisites (git, python3-venv, build tools)."
+    fi
+    _grow "Installing OS prerequisites (git, python3-venv, python3-dev, build-essential)…"
+    _root apt-get update -y >/dev/null 2>&1 || _warn "apt-get update had warnings (continuing)."
+    _root apt-get install -y git python3 python3-venv python3-dev build-essential ca-certificates \
+        || _die "Failed to install prerequisites. Install manually then re-run: git python3-venv python3-dev build-essential"
+fi
+
+command -v git     >/dev/null 2>&1 || _die "git not found (prerequisite install failed)."
+command -v python3 >/dev/null 2>&1 || _die "python3 not found (prerequisite install failed)."
+[[ "$(id -u)" -eq 0 ]] || command -v sudo >/dev/null 2>&1 || \
+    _warn "Not root and sudo missing — the systemd install phase will fail."
 
 PY_MINOR="$(python3 -c 'import sys; print(sys.version_info.minor)')"
 PY_MAJOR="$(python3 -c 'import sys; print(sys.version_info.major)')"
-[[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -ge "$MIN_PY_MINOR" ]] || \
-    _die "Python 3.${MIN_PY_MINOR}+ required (found ${PY_MAJOR}.${PY_MINOR})."
+[[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -ge "$MIN_PY_MINOR" ]] || _die \
+"Python 3.${MIN_PY_MINOR}+ required (found ${PY_MAJOR}.${PY_MINOR}). \
+Ubuntu 24.04+ ships 3.12 natively; on 22.04 (3.10) add a Python 3.11+ backport (deadsnakes) first."
 
 # ── 2. clone (or update) the PUBLIC repo at the pinned ref ───────────────────
 if [[ -d "$DIR/.git" ]]; then
