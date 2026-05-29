@@ -77,57 +77,18 @@ CODE_AUTHORITATIVE_CONSUMERS = frozenset({
 # CGN_TRANSITION outcome handler and the periodic test pump (_run_haov_pump).
 # Routes CGN_HAOV_VERIFY_REQ to the worker that owns the consumer's
 # verifier branch. All 9 registered consumers covered (zero silent drops).
-# HAOV verify routing — ONLY the consumers with a live specialist verifier for
-# their topic-ful CONCEPT-GROUNDING hypotheses. IMPASSE-sourced hypotheses
-# (the dominant class, all consumers) are verified in-process by
-# `cgn.verify_impasse_resolution` (see `_local_haov_verify`) and never routed
-# here. Per rFP_haov_efficacy_closure (F4): the 7 prior `"spirit"` entries
-# black-holed verification after the 2026-05-16 spirit retirement (spirit has no
-# CGN_HAOV_VERIFY_REQ subscriber) — they are removed. Consumers absent from this
-# map fall through to in-process verification. `dreaming` was a phantom entry
-# (never registered) and is dropped.
 _HAOV_DEST_MAP = {
     "language": "language",
+    "social": "spirit",
+    "reasoning": "spirit",
     "knowledge": "knowledge",
+    "coding": "spirit",
+    "self_model": "spirit",
     "emotional": "emot_cgn",
+    "meta": "spirit",
+    "reasoning_strategy": "spirit",
+    "dreaming": "spirit",
 }
-
-
-def _local_haov_verify(cgn, tracker, consumer):
-    """Verify a tracker's active HAOV test IN-PROCESS when no live bus verifier
-    applies. Returns True if handled here (caller must NOT emit a bus verify).
-
-    Two cases verify locally (per rFP_haov_efficacy_closure, Option A):
-      1. IMPASSE-sourced hypotheses (`source == "soar_impasse"`, any consumer) —
-         verified by `cgn.verify_impasse_resolution` (reward-trend resolution).
-         This is the dominant class and the fix for F4 (dead `"spirit"` routing).
-      2. CONCEPT-GROUNDING hypotheses for consumers with no specialist verifier
-         (not in `_HAOV_DEST_MAP`) — fall back to a reward-based check instead of
-         black-holing. Consumers WITH a specialist verifier
-         (language/knowledge/emot_cgn) return False so the caller routes via bus.
-    """
-    at = tracker._active_test
-    if not at or not isinstance(at, dict):
-        return False
-    h = at.get("hypothesis")
-    if h is None:
-        return False
-    if getattr(h, "source", "") == "soar_impasse":
-        imp_type = ""
-        if isinstance(getattr(h, "action_context", None), dict):
-            imp_type = h.action_context.get("impasse_type", "")
-        if not imp_type and "_impasse_" in getattr(h, "rule", ""):
-            imp_type = h.rule.split("_impasse_", 1)[1]
-        _confirmed, reward = cgn.verify_impasse_resolution(consumer, imp_type)
-        tracker.verify(getattr(h, "action_context", {}), {}, reward)
-        return True
-    if consumer in _HAOV_DEST_MAP:
-        return False  # live specialist verifier — caller routes via bus
-    # Concept-grounding hypothesis, no specialist verifier → reward-based local.
-    pre = at.get("pre_observation", {}) or {}
-    reward = float(pre.get("reward", 0.0)) if isinstance(pre, dict) else 0.0
-    tracker.verify(getattr(h, "action_context", {}), {}, reward)
-    return True
 
 
 def _run_haov_pump(cgn, send_queue, name, stuck_timeout_s):
@@ -164,19 +125,10 @@ def _run_haov_pump(cgn, send_queue, name, stuck_timeout_s):
             if not test_ctx:
                 continue
 
-            # 2b. In-process verification — impasse hypotheses (any consumer) +
-            # consumers with no specialist verifier. Fixes F4 (dead "spirit"
-            # routing) per rFP_haov_efficacy_closure: no bus round-trip, no
-            # dead dst. Counts as a completed verification.
-            if _local_haov_verify(cgn, tracker, consumer_name):
-                continue
-
-            # 3. Concept-grounding hypothesis → route to a LIVE specialist verifier.
-            dest = _HAOV_DEST_MAP.get(consumer_name)
-            if dest is None:
-                continue  # no specialist verifier; local path handles these
+            # 3. Stamp + route + emit
             if tracker._active_test is not None:
                 tracker._active_test["ts"] = now
+            dest = _HAOV_DEST_MAP.get(consumer_name, consumer_name)
 
             # Pre-emit guard for consumer="knowledge": knowledge_worker
             # expects test_ctx.topic/concept to query knowledge_concepts.
@@ -625,18 +577,6 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     _LEXICON_EXPORT_INTERVAL_S = 300.0  # 5 minutes
     _last_lexicon_export = 0.0
 
-    # ── Periodic cgn_state.pt disk checkpoint (CRITICAL persistence) ──
-    # cgn_state.pt was otherwise written ONLY on dream consolidation
-    # (CGN_CONSOLIDATE) + graceful SAVE_NOW/MODULE_SHUTDOWN. Under shm_pid_dead
-    # restart churn the worker dies before any of those fire, so ALL learning
-    # since the last dream (groundings, consolidations, value_net, consumer_freq)
-    # was lost on every restart — cgn_state.pt was observed frozen for 1.5 days
-    # across the fleet. This time-gated checkpoint makes persistence independent
-    # of graceful shutdown (loses at most the interval on an ungraceful death).
-    # Time-gated (not per-consolidation) to bound torch.save frequency.
-    _STATE_CHECKPOINT_INTERVAL_S = 300.0  # 5 min
-    _last_state_checkpoint = time.time()  # first checkpoint ~5min after boot
-
     def _maybe_export_lexicon_snapshot() -> None:
         nonlocal _last_lexicon_export
         now_ts = time.time()
@@ -692,24 +632,6 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         except Exception as _csp_err:
             logger.debug("[CGNWorker] CGN_STATS_UPDATED publish: %s", _csp_err)
 
-    def _maybe_checkpoint_state() -> None:
-        """Periodic cgn_state.pt disk checkpoint (every _STATE_CHECKPOINT_INTERVAL_S).
-        Called from BOTH the idle (Empty) path AND the message path so it fires
-        regardless of inbound traffic (avoids the recv_queue_except_empty trap).
-        This is the robust persistence guarantee: cgn survives an ungraceful
-        (shm_pid_dead / SIGKILL) death losing at most one interval, rather than
-        reverting to the last dream-consolidation snapshot."""
-        nonlocal _last_state_checkpoint
-        now_ts = time.time()
-        if now_ts - _last_state_checkpoint < _STATE_CHECKPOINT_INTERVAL_S:
-            return
-        _last_state_checkpoint = now_ts
-        try:
-            cgn._save_state()
-        except Exception as _ckpt_err:  # noqa: BLE001
-            logger.warning(
-                "[CGNWorker] periodic state checkpoint failed: %s", _ckpt_err)
-
     while True:
         # H.3 (2026-04-28): periodic HAOV test pump. Runs at fixed cadence
         # regardless of inbound message activity. Decouples test-trigger
@@ -761,7 +683,6 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             # low-traffic Titan, where the in-message-path block never ran).
             _maybe_publish_cgn_stats()
             _maybe_export_lexicon_snapshot()
-            _maybe_checkpoint_state()
             continue
 
         msg_type = msg.get("type", "")
@@ -806,8 +727,6 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         _maybe_publish_cgn_stats()
         # P8.Y fold-in: lexicon snapshot export on 5-min cadence
         _maybe_export_lexicon_snapshot()
-        # CRITICAL persistence: periodic cgn_state.pt disk checkpoint
-        _maybe_checkpoint_state()
 
         # ── CGN_TRANSITION — experience from any consumer ──────────
         if msg_type == "CGN_TRANSITION":
@@ -840,27 +759,25 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                             "observation": payload.get("outcome_context", {}),
                         })
                         if _test_ctx:
-                            # In-process verify first (impasse hypotheses + no-
-                            # specialist consumers) — fixes F4 dead-routing.
-                            if _local_haov_verify(
-                                    cgn, _haov_tracker, _haov_consumer):
-                                pass  # verified locally; no bus emit
-                            else:
-                                # Concept-grounding → live specialist verifier only.
-                                _haov_dest = _HAOV_DEST_MAP.get(_haov_consumer)
-                                if _haov_dest is not None:
-                                    if _haov_tracker._active_test is not None:
-                                        _haov_tracker._active_test["ts"] = time.time()
-                                    _send_msg(send_queue, bus.CGN_HAOV_VERIFY_REQ,
-                                              name, _haov_dest, {
-                                        "consumer": _haov_consumer,
-                                        "test_ctx": _test_ctx,
-                                        "obs_before": payload.get("outcome_context", {}),
-                                        "hypothesis": _haov_tracker._active_test[
-                                            "hypothesis"].rule if _haov_tracker._active_test else "",
-                                    })
-                                    logger.debug("[CGNWorker] HAOV test → %s: %s",
-                                                 _haov_dest, _test_ctx)
+                            # Route to correct bus module (consumer→module mapping)
+                            # H.2 (2026-04-28): added 5 missing dest entries
+                            # for consumers that had silent test routing.
+                            _haov_dest = _HAOV_DEST_MAP.get(
+                                _haov_consumer, _haov_consumer)
+                            # H.3 (2026-04-28): timestamp active_test for
+                            # stuck-test expiry by pump.
+                            if _haov_tracker._active_test is not None:
+                                _haov_tracker._active_test["ts"] = time.time()
+                            _send_msg(send_queue, bus.CGN_HAOV_VERIFY_REQ,
+                                      name, _haov_dest, {
+                                "consumer": _haov_consumer,
+                                "test_ctx": _test_ctx,
+                                "obs_before": payload.get("outcome_context", {}),
+                                "hypothesis": _haov_tracker._active_test[
+                                    "hypothesis"].rule if _haov_tracker._active_test else "",
+                            })
+                            logger.debug("[CGNWorker] HAOV test → %s: %s",
+                                         _haov_dest, _test_ctx)
                 else:
                     # New transition — buffer it
                     t = CGNTransition(
@@ -1124,33 +1041,6 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         # ── Microkernel v2 Phase B.2.1 — supervision-transfer dispatch ──
         from titan_hcl.core import worker_swap_handler as _swap
         if _swap.maybe_dispatch_swap_msg(msg):
-            continue
-
-        elif msg_type == bus.SAVE_NOW:
-            # Graceful checkpoint requested by orchestrator stop(save_first=True)
-            # before a restart (SAVE_NOW → SAVE_DONE → SIGTERM). cgn previously
-            # had NO SAVE_NOW handler (every other persistence worker does), so
-            # the Guardian's save_first was a silent no-op for cgn → all learning
-            # lost on graceful restart. Emit SAVE_DONE{module,request_id} so the
-            # orchestrator doesn't block the full save_timeout waiting on us.
-            _save_rid = (payload or {}).get("request_id")
-            _save_t0 = time.time()
-            _save_ok, _save_errs = True, 0
-            try:
-                cgn._save_state()
-                _write_full_shm(cgn, shm_writer)
-            except Exception as _save_now_err:  # noqa: BLE001
-                _save_ok, _save_errs = False, 1
-                logger.warning(
-                    "[CGNWorker] SAVE_NOW checkpoint failed: %s", _save_now_err)
-            try:
-                _send_msg(send_queue, bus.SAVE_DONE, name, "guardian", {
-                    "module": name, "request_id": _save_rid,
-                    "saved": _save_ok, "errors": _save_errs,
-                    "duration_ms": int((time.time() - _save_t0) * 1000),
-                })
-            except Exception:  # noqa: BLE001
-                pass
             continue
 
         elif msg_type == bus.MODULE_SHUTDOWN:

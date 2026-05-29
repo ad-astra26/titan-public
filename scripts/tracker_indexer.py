@@ -21,7 +21,6 @@ Output is deterministic + idempotent: same input → byte-identical output.
 from __future__ import annotations
 
 import argparse
-import datetime
 import re
 import sys
 from dataclasses import dataclass
@@ -43,15 +42,6 @@ class TrackerConfig:
     slug_re: re.Pattern
     # Display title for the index file
     title: str
-    # Optional graveyard file: where `--archive` relocates closed-entry bodies.
-    # None → tracker keeps closed entries in-file (e.g. BUGS in-file Graveyard).
-    archive_path: Path | None = None
-
-
-# Statuses that render_index treats as ACTIVE (everything else is closed).
-# Single source of truth shared by render + archive so the two never disagree.
-OPEN_STATUSES = {"OPEN", "INVESTIGATING", "MITIGATED", "DEFERRED",
-                 "AWAITING-OBS", "FIX-SHIPPED", "REVIEW-NEEDED"}
 
 TRACKERS: dict[str, TrackerConfig] = {
     "bugs": TrackerConfig(
@@ -74,7 +64,6 @@ TRACKERS: dict[str, TrackerConfig] = {
         index_path=REPO_ROOT / "titan-docs" / "DEFERRED_index.md",
         slug_re=re.compile(r"^### (~~)?(?P<slug>[A-Z][A-Z0-9a-z _/\-]+?)(~~)?\s*(?:—|–|-) "),
         title="Titan DEFERRED Index",
-        archive_path=REPO_ROOT / "titan-docs" / "finished" / "DEFERRED_FINISHED.md",
     ),
 }
 
@@ -128,31 +117,15 @@ EMOJI_TO_SEV = {"🔴": "CRITICAL", "🟠": "HIGH", "🟡": "MEDIUM", "🟢": "L
 
 
 def classify(header: str) -> tuple[str, str, str]:
-    """Return (status, severity, date).
-
-    Status resolution uses EARLIEST-occurrence rather than list-priority: the
-    first status keyword to appear in the text is the canonical status; any
-    later keyword is prose about a dependency (e.g. a DEFERRED entry whose
-    `**Status:**` line notes an upstream rFP was "SHIPPED"). STATUS_PATTERNS
-    order is only a tiebreaker when two keywords share the same index. This
-    prevents the prose-keyword bleed that previously mis-marked active entries
-    closed (DEFERRED → SHIPPED) — e.g. CODING-EXPLORER-ACTIVATION,
-    CGN-KNOWLEDGE-SOCIAL.
-    """
+    """Return (status, severity, date)."""
     status = "OPEN"
-    # Strikethrough = closed (default unless a keyword resolves more specifically)
+    # Strikethrough = closed (default RESOLVED unless something more specific matched)
     if "~~" in header:
         status = "CLOSED"
-    best_idx: int | None = None
     for pat, label in STATUS_PATTERNS:
-        idx = header.find(pat)
-        if idx == -1:
-            continue
-        # Strictly-smaller wins; equal index keeps the higher-priority (earlier
-        # in STATUS_PATTERNS) label since we iterate in priority order.
-        if best_idx is None or idx < best_idx:
-            best_idx = idx
+        if pat in header:
             status = label
+            break
     sev = ""
     m = SEVERITY_WORD_RE.search(header)
     if m:
@@ -311,41 +284,11 @@ def parse_tracker(cfg: TrackerConfig) -> list[Entry]:
                                        header=ln, status=status,
                                        severity=sev, date=date, title=title))
 
-    # 3. Body-header parse — the full set of `### ` entries (active region;
-    #    graveyard `### ✅ BUG-` headers do NOT match slug_re so they're skipped).
-    body_entries = _parse_body_headers(cfg, lines)
-
-    # If we got table entries, that IS the canonical entry list — BUT a body
-    # `### BUG-` section with NO matching table row must not silently vanish
-    # from the count. The table-authoritative inversion (above) closed the
-    # "body not strikethrough'd despite table FIXED" drift, but opened the
-    # mirror drift: an active body section nobody added a table row for is
-    # invisible. Detect those orphans, fold them in from their body
-    # **Status:** line, and warn loudly so a real table row gets added.
+    # If we got table entries, that IS the canonical entry list. Return.
     if table_entries:
-        table_canon = {_canon_slug(e.slug) for e in table_entries}
-        orphans = [e for e in body_entries if _canon_slug(e.slug) not in table_canon]
-        if orphans:
-            slugs = ", ".join(e.slug for e in orphans)
-            plural = "entry" if len(orphans) == 1 else "entries"
-            print(f"warning: {cfg.name}: {len(orphans)} body {plural} missing a top-table "
-                  f"row — auto-included from the body **Status:** line so the count stays "
-                  f"honest: {slugs}. Add a table row to make the registry authoritative.",
-                  file=sys.stderr)
-        return table_entries + orphans
+        return table_entries
 
-    # No top table (e.g. DEFERRED) → body-header parse is canonical.
-    return body_entries
-
-
-def _canon_slug(slug: str) -> str:
-    """Normalize a slug for table↔body joining: drop BUG-/OBS- prefix + -YYYYMMDD suffix."""
-    c = re.sub(r"^(BUG-|OBS-)", "", slug)
-    return re.sub(r"-20\d{6}$", "", c)
-
-
-def _parse_body_headers(cfg: TrackerConfig, lines: list[str]) -> list[Entry]:
-    """Parse every `### ` entry header + its `**Status:**` line into Entries."""
+    # 3. No top table (e.g. DEFERRED) → fall back to body-header parsing
     entries: list[Entry] = []
     for i, line in enumerate(lines, start=1):
         if not line.startswith("### "):
@@ -366,7 +309,7 @@ def _parse_body_headers(cfg: TrackerConfig, lines: list[str]) -> list[Entry]:
             ln = lines[j]
             if ln.startswith("### "):
                 break
-            sm = re.match(r"\s*[-*>]*\s*\*\*Status:\*\*\s*(.+)$", ln)
+            sm = re.match(r"\s*[-*]?\s*\*\*Status:\*\*\s*(.+)$", ln)
             if sm:
                 s, _, d = classify(sm.group(1).strip())
                 if s != "OPEN":
@@ -384,7 +327,9 @@ def _parse_body_headers(cfg: TrackerConfig, lines: list[str]) -> list[Entry]:
 # ─── Rendering ─────────────────────────────────────────────────────────────
 
 def render_index(cfg: TrackerConfig, entries: list[Entry]) -> str:
-    open_e = [e for e in entries if e.status in OPEN_STATUSES]
+    open_e = [e for e in entries if e.status in {"OPEN", "INVESTIGATING", "MITIGATED",
+                                                  "DEFERRED", "AWAITING-OBS",
+                                                  "FIX-SHIPPED", "REVIEW-NEEDED"}]
     closed_e = [e for e in entries if e not in open_e]
     total_lines = cfg.body_path.read_text().count("\n") + 1
 
@@ -461,7 +406,9 @@ def cmd_emit_one(cfg: TrackerConfig) -> int:
     entries = parse_tracker(cfg)
     text = render_index(cfg, entries)
     cfg.index_path.write_text(text)
-    open_n = sum(1 for e in entries if e.status in OPEN_STATUSES)
+    open_n = sum(1 for e in entries if e.status not in {"FIXED", "PASSED", "RESOLVED",
+        "CLOSED", "SHIPPED", "SUPERSEDED", "WONTFIX", "ARCHIVED", "REALIZED",
+        "MIGRATED", "MIGRATED→BUGS", "MIGRATED→OBS", "RESOLVED-UNNECESSARY"})
     print(f"wrote {cfg.index_path.relative_to(REPO_ROOT)} ({len(entries)} entries, {open_n} active)")
     return 0
 
@@ -481,112 +428,6 @@ def cmd_check_one(cfg: TrackerConfig) -> int:
     return 0
 
 
-# ─── Archive (move closed entry bodies to the graveyard file) ───────────────
-
-def _entry_block_bounds(lines: list[str]) -> dict[int, int]:
-    """Map each `### ` entry-header line-index → exclusive end-index of its block.
-
-    A block runs from its `### ` header up to (not including) the next `### `
-    or `## ` header, or EOF. Trailing `---` separators + blank lines between an
-    entry and the next header therefore travel WITH that entry on removal,
-    keeping the remaining document well-formed.
-    """
-    boundaries = [i for i, l in enumerate(lines)
-                  if l.startswith("### ") or l.startswith("## ")]
-    boundaries.append(len(lines))
-    bounds: dict[int, int] = {}
-    for i, l in enumerate(lines):
-        if l.startswith("### "):
-            bounds[i] = next(b for b in boundaries if b > i)
-    return bounds
-
-
-def cmd_archive(cfg: TrackerConfig, dry_run: bool = False,
-                date_str: str | None = None) -> int:
-    """Relocate every closed-status entry body from the tracker into its
-    graveyard file, then regenerate the index. Opt-in + reviewable (produces a
-    git diff); deliberately NOT a side-effect of --emit-index so that index
-    generation stays read-only + idempotent for the pre-commit drift gate."""
-    if cfg.archive_path is None:
-        print(f"error: tracker '{cfg.name}' has no archive_path configured "
-              f"(it keeps closed entries in-file)", file=sys.stderr)
-        return 2
-
-    entries = parse_tracker(cfg)
-    lines = cfg.body_path.read_text().splitlines()
-    bounds = _entry_block_bounds(lines)
-
-    # Closed entries that map cleanly to a `### ` block, in document order.
-    closed = sorted(
-        (e for e in entries
-         if e.status not in OPEN_STATUSES and (e.line - 1) in bounds),
-        key=lambda e: e.line)
-    if not closed:
-        print("no closed entries to archive")
-        return 0
-
-    date_str = date_str or datetime.date.today().isoformat()
-
-    # Build the archived-blocks markdown + the set of line indices to drop.
-    drop: set[int] = set()
-    archived_md: list[str] = []
-    summary: list[str] = []
-    for e in closed:
-        start = e.line - 1
-        end = bounds[start]
-        block = lines[start:end]
-        # Strip trailing blank lines + a lone trailing `---` for a clean append.
-        while block and (block[-1].strip() == "" or block[-1].strip() == "---"):
-            block.pop()
-        archived_md.append(f"### {e.slug} — archived {date_str} (was {e.status})")
-        archived_md.append("")
-        archived_md.extend(block)
-        archived_md.append("")
-        archived_md.append("---")
-        archived_md.append("")
-        drop.update(range(start, end))
-        summary.append(f"  • {e.slug}  [{e.status}]")
-
-    if dry_run:
-        print(f"[dry-run] would archive {len(closed)} closed entr"
-              f"{'y' if len(closed) == 1 else 'ies'} "
-              f"from {cfg.body_path.name} → {cfg.archive_path.name}:")
-        print("\n".join(summary))
-        return 0
-
-    # 1. Append blocks to the graveyard file (create if absent).
-    grave = cfg.archive_path
-    grave_text = grave.read_text() if grave.exists() else f"# {cfg.title} — Graveyard\n"
-    if not grave_text.endswith("\n"):
-        grave_text += "\n"
-    banner = (f"\n## 🪦 Archived {date_str} "
-              f"(auto-moved from {cfg.body_path.name} by tracker_indexer --archive)\n\n")
-    grave.write_text(grave_text + banner + "\n".join(archived_md) + "\n")
-
-    # 2. Rewrite the source with closed blocks removed + separator normalisation.
-    kept = [l for i, l in enumerate(lines) if i not in drop]
-    cleaned: list[str] = []
-    for ln in kept:
-        # Collapse a `---` that immediately follows another `---` (only blanks
-        # between) and runs of >2 blank lines left behind by removed blocks.
-        if ln.strip() == "---":
-            prev_nonblank = next((c for c in reversed(cleaned) if c.strip() != ""), None)
-            if prev_nonblank == "---":
-                continue
-        if ln.strip() == "" and cleaned[-2:] == ["", ""]:
-            continue
-        cleaned.append(ln)
-    cfg.body_path.write_text("\n".join(cleaned).rstrip("\n") + "\n")
-
-    # 3. Regenerate the index off the now-trimmed body.
-    cmd_emit_one(cfg)
-    print(f"archived {len(closed)} closed entr"
-          f"{'y' if len(closed) == 1 else 'ies'} "
-          f"→ {cfg.archive_path.relative_to(REPO_ROOT)}:")
-    print("\n".join(summary))
-    return 0
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     g = ap.add_mutually_exclusive_group(required=True)
@@ -594,13 +435,8 @@ def main() -> int:
     g.add_argument("--check", metavar="FILE", help="exit non-zero if index file is stale")
     g.add_argument("--emit-all", action="store_true", help="regenerate every registered tracker index")
     g.add_argument("--check-all", action="store_true", help="drift gate for all registered trackers")
-    g.add_argument("--archive", metavar="FILE", help="move closed-status entry bodies to the tracker's graveyard file + regenerate index")
-    ap.add_argument("--dry-run", action="store_true", help="with --archive: list what would move, write nothing")
-    ap.add_argument("--date", metavar="YYYY-MM-DD", help="with --archive: archive-date stamp (default: today)")
     args = ap.parse_args()
 
-    if args.archive:
-        return cmd_archive(find_config(args.archive), dry_run=args.dry_run, date_str=args.date)
     if args.emit_index:
         return cmd_emit_one(find_config(args.emit_index))
     if args.check:

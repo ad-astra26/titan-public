@@ -1,5 +1,0 @@
-# Hide the unlisted pitch routes from public crawlers — these are
-# token-gated and shared deliberately. See
-# titan-docs/rFP_observatory_pitch_route.md §2.
-User-agent: *
-Disallow: /v/

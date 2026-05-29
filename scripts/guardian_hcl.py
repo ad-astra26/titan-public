@@ -61,15 +61,6 @@ try:
 except ImportError:
     pass
 
-# Native-crash visibility (SPEC §11.I.4) — dump a C+Python traceback to
-# stderr→journal on a fatal native signal (SIGSEGV/SIGABRT/SIGBUS/SIGFPE);
-# the @with_error_envelope cascade only catches Python exceptions, not signals.
-try:
-    import faulthandler as _faulthandler
-    _faulthandler.enable()
-except Exception:
-    pass
-
 
 def setup_logging() -> None:
     """Configure logging based on merged config plugin_log_level."""

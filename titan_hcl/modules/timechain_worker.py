@@ -143,19 +143,6 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                     "genesis=%s", titan_id, tc.total_blocks,
                     tc.genesis_hash.hex()[:16])
 
-    # Phase 14 §3K.3.C — one-shot, idempotent, additive provenance anchor for
-    # legacy chat misrouted into fork 5 on chains where `conversation` was
-    # reseeded to a relocated id (T2/T3). No-op on T1 / fresh chains / already
-    # anchored. Single-writer: only this worker (sole TimeChain owner) writes it.
-    try:
-        _anchor = tc.write_conversation_legacy_anchor()
-        if _anchor is not None:
-            logger.info("[TimeChain] §3K.3.C conversation legacy anchor sealed "
-                        "at height %d", _anchor.header.block_height)
-    except Exception as _anchor_err:  # noqa: BLE001 — never block boot
-        logger.warning("[TimeChain] conversation legacy anchor skipped: %s",
-                       _anchor_err)
-
     _send_heartbeat()
 
     # ── State tracking ──
