@@ -14176,26 +14176,6 @@ def run_timechain_diagnostics(all_titans: bool = True):
                 names = ", ".join(f.get("name", "?") for _, f in inactive)
                 print(f"    Inactive:    {names} (waiting for first block)")
 
-            # ── 1b. Fork completeness + name-resolvability (Phase 14 / INV-Syn-26) ──
-            # Every chain MUST carry all 6 primary forks, each resolvable BY
-            # NAME via fork_registry (fork ids are chain-local). This is the
-            # automated fleet check the Timechain Guardian enforces in-process;
-            # surfaced here for the session-startup sweep. A missing primary is
-            # the BUG-FORK-CONVERSATION-MISSING-T2T3 class.
-            PRIMARY_NAMES = ("main", "declarative", "procedural", "episodic",
-                             "meta", "conversation")
-            name_to_id = {f.get("name"): fid for fid, f in fork_data.items()}
-            missing_primaries = [n for n in PRIMARY_NAMES if n not in name_to_id]
-            if not missing_primaries:
-                conv_id = name_to_id.get("conversation")
-                reloc = "" if str(conv_id) == "5" else f" (conversation@{conv_id} — chain-local)"
-                print(f"    FORK COMPLETENESS: ✓ all 6 primaries name-resolvable"
-                      f"{reloc}")
-            else:
-                print(f"    FORK COMPLETENESS: ⚠ MISSING primaries by name: "
-                      f"{missing_primaries} — INV-Syn-26 violation "
-                      f"(reseed on next boot / guardian heal)")
-
             # ── 2. Chain Integrity ──
             try:
                 vresp = requests.get(f"{url}/v4/timechain/verify", timeout=15)
