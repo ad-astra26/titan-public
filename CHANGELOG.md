@@ -42,6 +42,27 @@ _(curate as you go; lifted into the next versioned section at release time)_
 
 ---
 
+## v0.0.4 — 2026-05-29 (pre-release)
+
+_Out-of-box Observatory fix. `v0.0.3` shipped the Observatory bundle but its
+internal proxy targeted `localhost` (which resolves to IPv6 `::1`) while the
+Titan API binds IPv4 `127.0.0.1` — so the UI loaded but couldn't read the
+Titan's data until manually patched. `v0.0.4` rebuilds the bundle with the
+IPv4 fix so the Observatory shows live data immediately._
+
+### Fixed
+
+- **Observatory reads the local Titan out of the box** — `next.config` rewrites
+  and the chat/pitch proxies now target `127.0.0.1:7777` (was `localhost`, which
+  resolved to `::1` and got `ECONNREFUSED`). The `/v6`, `/health`, `/status`,
+  `/api/chat`, and `/media` proxies all work immediately after install.
+
+### SPEC
+
+- Install/packaging release; no on-chain or kernel behavior change.
+
+---
+
 ## v0.0.3 — 2026-05-29 (pre-release)
 
 _Validated live on a fresh DigitalOcean 2 vCPU / 4 GB box: `v0.0.2` installed,
