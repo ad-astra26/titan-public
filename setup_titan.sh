@@ -122,4 +122,13 @@ _grow "Handing off to the Titan setup wizard…"
 # Forward the resolved ref as --tag so the binary-fetch phase pulls the matching
 # release assets (a vX.Y.Z release). The wizard still accepts --build-rust to
 # compile from source instead.
-exec python3 -m scripts.setup_titan install --tag "$REF" "${WIZARD_ARGS[@]}"
+#
+# When invoked via `curl … | bash`, this script's stdin IS the piped script, so
+# the wizard's interactive prompts (inference key, Telegram token, mainnet burn)
+# would hit EOF. Reattach stdin to the controlling terminal so prompts work;
+# fall back to inherited stdin when there's no tty (headless/automated runs).
+if [[ -r /dev/tty ]]; then
+    exec python3 -m scripts.setup_titan install --tag "$REF" "${WIZARD_ARGS[@]}" < /dev/tty
+else
+    exec python3 -m scripts.setup_titan install --tag "$REF" "${WIZARD_ARGS[@]}"
+fi

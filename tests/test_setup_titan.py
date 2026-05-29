@@ -8,6 +8,7 @@ Pure-logic coverage — no live network, no systemd, no real config files
 from __future__ import annotations
 
 import sys
+import json
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ import pytest
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / "scripts"))
 
-from setup_titan import binaries, config_model as cm, systemd_runner  # noqa: E402
+from setup_titan import binaries, config_model as cm, genesis_runner, systemd_runner  # noqa: E402
 from setup_titan.__main__ import build_parser  # noqa: E402
 from setup_titan.modes import Mode  # noqa: E402
 
@@ -113,6 +114,29 @@ def test_binaries_phase_skips_when_present(tmp_path: Path):
         (bd / d).write_text("stub")
     res = binaries.run_binaries_phase(tmp_path, tag="main", build_rust=False)
     assert res[0].severity == "ok" and "already present" in res[0].detail
+
+
+# ── genesis_runner: bootable-identity materialization (the #6 fix) ────────────
+
+
+def test_materialize_bootable_identity_from_authority(tmp_path: Path):
+    # genesis (kept plaintext) leaves authority.json + data/genesis_record.json
+    (tmp_path / "authority.json").write_text("[1,2,3,4]")
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "genesis_record.json").write_text('{"titan_pubkey": "ZeFUoD…"}')
+    res = genesis_runner._materialize_bootable_identity(tmp_path)
+    assert res[0].severity == "ok"
+    kp = genesis_runner.keypair_path(tmp_path)
+    assert kp.exists() and kp.read_text() == "[1,2,3,4]"
+    assert oct(kp.stat().st_mode)[-3:] == "600"          # 0600 like T2/T3
+    assert not (tmp_path / "authority.json").exists()     # stray root copy wiped
+    ident = json.loads(genesis_runner.identity_path(tmp_path).read_text())
+    assert ident["titan_id"] == "T1" and ident["titan_pubkey"] == "ZeFUoD…"
+
+
+def test_materialize_fails_without_keypair(tmp_path: Path):
+    res = genesis_runner._materialize_bootable_identity(tmp_path)
+    assert res[0].severity == "fail" and "no plaintext keypair" in res[0].detail
 
 
 # ── systemd_runner ───────────────────────────────────────────────────────────
