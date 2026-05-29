@@ -641,14 +641,15 @@ class TitanKernel:
         Called from TitanHCL.boot() per PLAN §3 D10 boot-order
         invariants.
         """
-        # ── bus poll hook — Phase 6 (D-SPEC-135) ─────────────────────
+        # ── bus poll hook — RETIRED Phase 10K (rFP §3G) ──────────────
         # Pre-Phase-6: `bus._poll_fn = self.guardian.drain_send_queues`
         # drained worker→bus queues whenever the bus needed to dispatch a
-        # pending proxy QUERY/RESPONSE. Under Phase 6 worker send queues
-        # live in guardian_hcl process — kernel has no queues to drain.
-        # GuardianHCLClient.drain_send_queues is a no-op preserving the
-        # contract for any residual hook callers.
-        self.bus._poll_fn = self.guardian.drain_send_queues
+        # pending proxy QUERY/RESPONSE. Under Phase 6 worker send queues live
+        # in guardian_hcl process — the kernel has no queues to drain, and
+        # GuardianHCLClient.drain_send_queues became a no-op. The hookup is now
+        # removed entirely: `bus._poll_fn` defaults to None and the bus drain
+        # loop (bus.py:1585 `if self._poll_fn:`) is None-guarded, so dropping it
+        # is a behavior-preserving cleanup.
 
         loop = asyncio.get_event_loop()
 
