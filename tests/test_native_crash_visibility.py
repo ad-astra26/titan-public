@@ -44,9 +44,12 @@ def test_module_wrapper_enables_faulthandler_before_entry():
     (so it covers the whole worker lifetime, before heavy imports)."""
     src = _src("titan_hcl/orchestrator/core.py")
     wi = src.index("def _module_wrapper")
-    body = src[wi:wi + 2500]
-    assert "_faulthandler.enable()" in body, (
-        "_module_wrapper must enable faulthandler at the top of the child process")
+    # Must be enabled BEFORE the worker does any real work — use the logging
+    # setup as the stable "work begins" marker (robust to other first-I/O
+    # blocks like INV-PROC-7 identity landing alongside it).
+    prefix = src[wi:src.index("Configure logging for child process", wi)]
+    assert "_faulthandler.enable()" in prefix, (
+        "_module_wrapper must enable faulthandler before the worker begins work")
 
 
 def test_orchestrator_stop_logs_dead_worker_exit_code():
