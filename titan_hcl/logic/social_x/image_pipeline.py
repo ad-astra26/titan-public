@@ -226,13 +226,17 @@ def upload_media_via_gateway(gateway, file_path: str) -> str:
         return ""
 
     api_key = cfg.get("api_key", "")
-    session = gateway._refreshed_session or cfg.get("auth_session", "")
-    proxy = cfg.get("webshare_static_url", "")
+    # _load_config exposes the live login cookies under "session" and the
+    # proxy under "proxy" (these are the SAME values the post path uses and
+    # that make create_tweet succeed). The old code read "auth_session" /
+    # "webshare_static_url" — keys that DON'T exist in the returned dict — so
+    # session/proxy were always empty → "missing api_key/session" → the
+    # receipt card silently skipped → text-only posts (2026-05-29 fix).
+    session = (gateway._refreshed_session or cfg.get("session", "")
+               or cfg.get("auth_session", ""))
+    proxy = cfg.get("proxy", "") or cfg.get("webshare_static_url", "")
     if api_key and not session:
-        # Media upload runs INSIDE the post path BEFORE create_tweet primes
-        # the gateway session, so `_refreshed_session` is often empty here →
-        # the card silently skipped → text-only posts (2026-05-29). Refresh
-        # proactively so the receipt card actually attaches.
+        # Last-resort refresh if no session anywhere (rare).
         try:
             session = gateway._refresh_session(api_key, proxy) or ""
             if session:
@@ -244,7 +248,12 @@ def upload_media_via_gateway(gateway, file_path: str) -> str:
         return ""
 
     import httpx
-    url = "https://api.twitterapi.io/twitter/media/upload"
+    # twitterapi.io media endpoint = /twitter/upload_media_v2 (multipart:
+    # file + login_cookies + proxy → {media_id}). The old "twitter/media/upload"
+    # path 404'd ('detail: Not Found') so image attachment NEVER worked —
+    # every archetype image silently fell back to text-only. (Per the
+    # twitterapi.io OpenAPI spec, verified 2026-05-29.)
+    url = "https://api.twitterapi.io/twitter/upload_media_v2"
     headers = {"X-API-Key": api_key}
 
     try:

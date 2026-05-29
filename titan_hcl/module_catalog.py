@@ -1841,6 +1841,9 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # Contract events (6)
             _bus_constants.CONTRACT_DEPLOY, _bus_constants.CONTRACT_LIST, _bus_constants.CONTRACT_STATUS,
             _bus_constants.CONTRACT_PROPOSE, _bus_constants.CONTRACT_APPROVE, _bus_constants.CONTRACT_VETO,
+            # Phase 14 §9.B — timechain_guardian heal path: owning worker for
+            # HEAL_REQUEST(action="reseed_primary_fork") → idempotent reseed.
+            _bus_constants.HEAL_REQUEST,
         ],
         start_method="spawn" if _spawn_grad else "fork",  # B.2.1 graduation
         # Phase 11 §11.I.8 / Chunk 11G — §3H.10 boot priority.

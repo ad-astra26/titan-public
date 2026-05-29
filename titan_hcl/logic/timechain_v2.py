@@ -40,14 +40,15 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Fork name → fork_id mapping (matches timechain.py constants)
+# Canonical-id SEED DEFAULTS for primary forks (Phase 14 / INV-Syn-26).
+# Fork ids are CHAIN-LOCAL — this map is NOT a resolution authority; it only
+# records the canonical id offered to a freshly-born chain. All name→id
+# resolution goes through the chain's fork_registry via
+# `RuleEvaluator._resolve_fork_id` / `TimeChain.resolve_fork_id`.
 FORK_IDS = {
     "main": 0, "declarative": 1, "procedural": 2,
     "episodic": 3, "meta": 4, "conversation": 5,
 }
-# Reverse lookup — used by Phase 2 SC ops to annotate result rows with
-# fork-name for the contract author's convenience.
-_FORK_BY_ID = {v: k for k, v in FORK_IDS.items()}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -434,7 +435,7 @@ class ContractStore:
         try:
             blocks = self._tc.query_blocks(
                 thought_type="contract_deploy",
-                fork_id=FORK_IDS.get("meta", 4),
+                fork_id=self._tc.resolve_fork_id("meta"),
                 limit=500)
             loaded = 0
             for b in blocks:
@@ -504,7 +505,7 @@ class ContractStore:
         )
 
         block = self._tc.commit_block(
-            fork_id=FORK_IDS.get("meta", 4),
+            fork_id=self._tc.resolve_fork_id("meta"),
             epoch_id=0,  # Will be set by commit_block
             payload=payload,
             pot_nonce=1,  # Contracts bypass PoT (sovereignty is via Ed25519)
@@ -791,7 +792,7 @@ class ContractStore:
                               contract.contract_type, "builtin"],
                     )
                     self._tc.commit_block(
-                        fork_id=FORK_IDS.get("meta", 4),
+                        fork_id=self._tc.resolve_fork_id("meta"),
                         epoch_id=0,
                         payload=payload,
                         pot_nonce=1,
@@ -1010,7 +1011,7 @@ class ContractStore:
                           "meta_cognitive", "tuning_012_v2"],
                 )
                 self._tc.commit_block(
-                    fork_id=FORK_IDS.get("meta", 4),
+                    fork_id=self._tc.resolve_fork_id("meta"),
                     epoch_id=0,
                     payload=payload,
                     pot_nonce=1,
@@ -1131,6 +1132,12 @@ class RuleEvaluator:
         # Per-instance aggregated stats (for ContractStore.get_stats()).
         self._total_chi_spent: float = 0.0
         self._total_evaluations: int = 0
+        # Phase 14 / INV-Syn-26 — chain-local fork NAME→id resolution cache.
+        # The injected index_db IS this chain's fork_registry authority, so we
+        # resolve fork names against it directly instead of the static FORK_IDS
+        # map (which assumes globally-fixed ids — false; ids are chain-local).
+        self._fork_id_cache: dict[str, Optional[int]] = {}
+        self._fork_name_cache: dict[int, Optional[str]] = {}
         self._total_chi_exhausted: int = 0
         # Snapshot of the final `variables` dict from the most recent
         # evaluate() call (Phase 2 D-P2-1 — EngineRecall consumes this to
@@ -1464,6 +1471,47 @@ class RuleEvaluator:
         "thought_type", "source", "significance", "chi_spent", "epoch_id",
     )
 
+    def _resolve_fork_id(self, name: str) -> Optional[int]:
+        """Chain-local fork NAME→id via this chain's fork_registry (INV-Syn-26).
+
+        Fork ids are chain-local; resolve against the injected index_db's
+        fork_registry, NEVER the static FORK_IDS map. Cached per instance.
+        Returns None for an unknown name (caller returns []).
+        """
+        if name in self._fork_id_cache:
+            return self._fork_id_cache[name]
+        fid: Optional[int] = None
+        if self._index_db is not None:
+            try:
+                row = self._index_db.execute(
+                    "SELECT fork_id FROM fork_registry WHERE fork_name = ? LIMIT 1",
+                    (name,)
+                ).fetchone()
+                if row is not None:
+                    fid = int(row[0])
+            except Exception as e:
+                logger.debug("[RuleEval] fork-id resolve %r failed: %s", name, e)
+        self._fork_id_cache[name] = fid
+        return fid
+
+    def _resolve_fork_name(self, fork_id: int) -> Optional[str]:
+        """Reverse of _resolve_fork_id — chain-local id→name via fork_registry."""
+        if fork_id in self._fork_name_cache:
+            return self._fork_name_cache[fork_id]
+        name: Optional[str] = None
+        if self._index_db is not None:
+            try:
+                row = self._index_db.execute(
+                    "SELECT fork_name FROM fork_registry WHERE fork_id = ? LIMIT 1",
+                    (fork_id,)
+                ).fetchone()
+                if row is not None:
+                    name = str(row[0])
+            except Exception as e:
+                logger.debug("[RuleEval] fork-name resolve %d failed: %s", fork_id, e)
+        self._fork_name_cache[fork_id] = name
+        return name
+
     def _exec_fork_read(self, rule: dict, ctx: dict, variables: dict) -> list[dict]:
         """FORK_READ — cross-fork query on `data/timechain/index.db` (arch §12.1).
 
@@ -1476,7 +1524,7 @@ class RuleEvaluator:
             logger.debug("[RuleEval/FORK_READ] no index_db injected — returning []")
             return []
         fork = rule.get("fork", "")
-        fork_id = FORK_IDS.get(fork) if fork else None
+        fork_id = self._resolve_fork_id(fork) if fork else None
         if fork and fork_id is None:
             logger.warning("[RuleEval/FORK_READ] unknown fork %r — returning []", fork)
             return []
@@ -1543,7 +1591,7 @@ class RuleEvaluator:
                 # Resolve fork_id → fork name for caller convenience.
                 fid = d.get("fork_id")
                 if fid is not None:
-                    d["fork"] = _FORK_BY_ID.get(int(fid), str(fid))
+                    d["fork"] = self._resolve_fork_name(int(fid)) or str(fid)
                 rows.append(d)
             return rows
         except Exception as e:
@@ -1577,7 +1625,8 @@ class RuleEvaluator:
         conds = ["cross_refs LIKE ?"]
         params: list = [f"%{tx_hash_str}%"]
         if in_forks:
-            fork_ids = [FORK_IDS[f] for f in in_forks if f in FORK_IDS]
+            fork_ids = [fid for fid in (self._resolve_fork_id(f) for f in in_forks)
+                        if fid is not None]
             if fork_ids:
                 placeholders = ",".join("?" * len(fork_ids))
                 conds.append(f"fork_id IN ({placeholders})")
@@ -1601,7 +1650,7 @@ class RuleEvaluator:
                     d["block_hash"] = bytes(bh).hex()
                 fid = d.get("fork_id")
                 if fid is not None:
-                    d["fork"] = _FORK_BY_ID.get(int(fid), str(fid))
+                    d["fork"] = self._resolve_fork_name(int(fid)) or str(fid)
                 d["via_field"] = via_field
                 rows.append(d)
             return rows
@@ -2398,12 +2447,17 @@ class BlockBuilder:
         block_hash_hex = block.block_hash.hex() if block else ""
         block_height = block.header.block_height if block else 0
 
+        # Phase 14 / INV-Syn-26 — chain-local id (covers primary + sidechain
+        # names); -1 sentinel only when truly unknown.
+        _fid = self._tc.resolve_fork_id(fork_name)
+        _fid = _fid if _fid is not None else -1
+
         for tx in all_txs:
             tags = list(tx.tags or [])
             ctx = {
                 "event": "tx_sealed",
                 "fork": fork_name,
-                "fork_id": FORK_IDS.get(fork_name, -1),
+                "fork_id": _fid,
                 "thought_type": tx.tx_type,
                 "source": tx.source,
                 "significance": tx.significance,
@@ -2539,7 +2593,9 @@ class BlockBuilder:
         if not all_txs:
             return None
 
-        fork_id = FORK_IDS.get(fork_name)
+        # Phase 14 / INV-Syn-26 — resolve the primary by NAME chain-locally;
+        # fall back to topic-sidechain lookup for bare topic names.
+        fork_id = self._tc.resolve_fork_id(fork_name)
         if fork_id is None:
             # Try sidechain lookup
             fork_id = self._tc.get_sidechain_for_topic(fork_name)
@@ -2855,7 +2911,7 @@ class GenesisChain:
         )
 
         block = self._tc.commit_block(
-            fork_id=self.FORK_MAIN,
+            fork_id=self._tc.resolve_fork_id("main"),  # Phase 14 / INV-Syn-26 chain-local
             epoch_id=current_epoch,
             payload=payload,
             pot_nonce=pot_nonce,
@@ -3018,7 +3074,7 @@ class TimeChainOrchestrator:
         and prime directives as the foundational block on FORK_MAIN.
         This block is the anchor for restoration and sovereignty proof.
         """
-        from titan_hcl.logic.timechain import FORK_MAIN, BlockPayload
+        from titan_hcl.logic.timechain import BlockPayload
 
         # Check flag file first (fastest, survives index rebuilds)
         _birth_flag = os.path.join(self._data_dir, ".birth_block_created")
@@ -3033,7 +3089,7 @@ class TimeChainOrchestrator:
             _row = _conn.execute(
                 "SELECT block_height FROM block_index "
                 "WHERE fork_id = ? AND thought_type = 'birth' LIMIT 1",
-                (FORK_MAIN,)).fetchone()
+                (self._tc.resolve_fork_id("main"),)).fetchone()
             _conn.close()
             if _row:
                 logger.info("[Orchestrator] Birth block exists at height %d", _row[0])
@@ -3097,7 +3153,7 @@ class TimeChainOrchestrator:
 
         # Birth timestamp from existing genesis block or now
         try:
-            genesis_block = self._tc.get_block(FORK_MAIN, 0)
+            genesis_block = self._tc.get_block(self._tc.resolve_fork_id("main"), 0)
             if genesis_block:
                 content["born"] = genesis_block.header.timestamp
         except Exception:
@@ -3114,7 +3170,7 @@ class TimeChainOrchestrator:
                 tags=["birth", "identity", "sovereign"],
             )
             block = self._tc.commit_block(
-                fork_id=FORK_MAIN,
+                fork_id=self._tc.resolve_fork_id("main"),  # Phase 14 / INV-Syn-26 chain-local
                 epoch_id=0,
                 payload=payload,
                 pot_nonce=0,
@@ -3385,7 +3441,7 @@ class TimeChainOrchestrator:
 
     def recall(self, query: "RecallQuery") -> list[dict]:
         """Query blocks from TimeChain index. Returns list of block metadata."""
-        fork_id = FORK_IDS.get(query.fork) if query.fork else None
+        fork_id = self._tc.resolve_fork_id(query.fork) if query.fork else None
         epoch_range = None
         if query.since_epoch:
             epoch_range = (query.since_epoch, 999_999_999)
@@ -3589,7 +3645,7 @@ class TimeChainOrchestrator:
 
     def aggregate(self, query: "AggregateQuery") -> float:
         """Aggregate over blocks via direct SQL on index. Efficient."""
-        fork_id = FORK_IDS.get(query.fork) if query.fork else None
+        fork_id = self._tc.resolve_fork_id(query.fork) if query.fork else None
         epoch_start = 0
         if query.since_hours and query.since_hours > 0:
             epoch_start = max(0, self._current_epoch - int(query.since_hours * 1600))
@@ -4005,9 +4061,11 @@ def _sample_block_height(index_db_path: str) -> Optional[int]:
     try:
         conn = sqlite3.connect(index_db_path, timeout=1.0)
         try:
+            # Phase 14 / INV-Syn-26 — resolve 'main' chain-locally via this
+            # chain's fork_registry rather than the static FORK_IDS map.
             row = conn.execute(
-                "SELECT COUNT(*) FROM block_index WHERE fork_id = ?",
-                (FORK_IDS["main"],),
+                "SELECT COUNT(*) FROM block_index WHERE fork_id = "
+                "(SELECT fork_id FROM fork_registry WHERE fork_name='main' LIMIT 1)",
             ).fetchone()
             return int(row[0]) if row else None
         finally:
