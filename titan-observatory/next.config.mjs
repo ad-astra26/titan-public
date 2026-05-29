@@ -5,6 +5,12 @@ const nextConfig = {
   // keeps serving from the current .next/ — atomic swap at the end gives
   // ~3s of downtime instead of ~5min. See scripts/observatory_deploy.sh.
   distDir: process.env.NEXT_DIST_DIR || '.next',
+  // Env-gated standalone output: CI/release builds set NEXT_STANDALONE=1 to emit
+  // a self-contained .next/standalone/server.js (+ traced minimal node_modules)
+  // that ships in the GitHub Release and runs with plain `node server.js` — no
+  // build (and no full node_modules) on the user's box. Left undefined for the
+  // fleet's normal `next start` deploy (observatory_deploy.sh) so nothing breaks.
+  output: process.env.NEXT_STANDALONE === '1' ? 'standalone' : undefined,
   images: {
     // Titan API origins serve creative-work images:
     //   prod  https://iamtitan.tech/...   (via nginx)
