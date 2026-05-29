@@ -284,11 +284,41 @@ def parse_tracker(cfg: TrackerConfig) -> list[Entry]:
                                        header=ln, status=status,
                                        severity=sev, date=date, title=title))
 
-    # If we got table entries, that IS the canonical entry list. Return.
-    if table_entries:
-        return table_entries
+    # 3. Body-header parse — the full set of `### ` entries (active region;
+    #    graveyard `### ✅ BUG-` headers do NOT match slug_re so they're skipped).
+    body_entries = _parse_body_headers(cfg, lines)
 
-    # 3. No top table (e.g. DEFERRED) → fall back to body-header parsing
+    # If we got table entries, that IS the canonical entry list — BUT a body
+    # `### BUG-` section with NO matching table row must not silently vanish
+    # from the count. The table-authoritative inversion (above) closed the
+    # "body not strikethrough'd despite table FIXED" drift, but opened the
+    # mirror drift: an active body section nobody added a table row for is
+    # invisible. Detect those orphans, fold them in from their body
+    # **Status:** line, and warn loudly so a real table row gets added.
+    if table_entries:
+        table_canon = {_canon_slug(e.slug) for e in table_entries}
+        orphans = [e for e in body_entries if _canon_slug(e.slug) not in table_canon]
+        if orphans:
+            slugs = ", ".join(e.slug for e in orphans)
+            plural = "entry" if len(orphans) == 1 else "entries"
+            print(f"warning: {cfg.name}: {len(orphans)} body {plural} missing a top-table "
+                  f"row — auto-included from the body **Status:** line so the count stays "
+                  f"honest: {slugs}. Add a table row to make the registry authoritative.",
+                  file=sys.stderr)
+        return table_entries + orphans
+
+    # No top table (e.g. DEFERRED) → body-header parse is canonical.
+    return body_entries
+
+
+def _canon_slug(slug: str) -> str:
+    """Normalize a slug for table↔body joining: drop BUG-/OBS- prefix + -YYYYMMDD suffix."""
+    c = re.sub(r"^(BUG-|OBS-)", "", slug)
+    return re.sub(r"-20\d{6}$", "", c)
+
+
+def _parse_body_headers(cfg: TrackerConfig, lines: list[str]) -> list[Entry]:
+    """Parse every `### ` entry header + its `**Status:**` line into Entries."""
     entries: list[Entry] = []
     for i, line in enumerate(lines, start=1):
         if not line.startswith("### "):
@@ -309,7 +339,7 @@ def parse_tracker(cfg: TrackerConfig) -> list[Entry]:
             ln = lines[j]
             if ln.startswith("### "):
                 break
-            sm = re.match(r"\s*[-*]?\s*\*\*Status:\*\*\s*(.+)$", ln)
+            sm = re.match(r"\s*[-*>]*\s*\*\*Status:\*\*\s*(.+)$", ln)
             if sm:
                 s, _, d = classify(sm.group(1).strip())
                 if s != "OPEN":
