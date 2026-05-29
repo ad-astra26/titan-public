@@ -1449,6 +1449,7 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         mandatory_running = 0
         post_boot_running = 0
         roster_priority = getattr(self, "_roster_priority", {})
+        live_pids: dict[str, int] = {}  # D-SPEC-143 — name→live pid from slot
         for name, info in list(self._modules.items()):
             # Intentionally-down modules own no live slot to probe.
             if info.state == ModuleState.DISABLED:
@@ -1458,6 +1459,8 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             except Exception:  # noqa: BLE001 — a bad read must not stop the scan
                 entry = None
             sstate = (entry.state if entry is not None else "") or ""
+            if entry is not None and getattr(entry, "pid", 0):
+                live_pids[name] = int(entry.pid)
             # Fix 1 — probe any booted slot (boot, post-restart, lazy-activate).
             self._maybe_dispatch_probe(name, sstate, now)
             # Fix 4 — live fleet counters from SHM, scoped to the published
@@ -1473,11 +1476,18 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         writer = getattr(self, "_titan_hcl_state_writer", None)
         if writer is not None:
             try:
-                # Only the live counters — fleet_ready / boot_phase remain the
-                # boot-phase latches set by start_all / _run_phase_b.
+                # Live counters + roster-pid refresh (INV-PROC-7 part b / §11.I.5):
+                # rebuild the roster 3-tuples from the stashed name→priority map
+                # plus this tick's live slot pids (0 until a worker writes its
+                # STARTING pid). fleet_ready / boot_phase remain the boot-phase
+                # latches set by start_all / _run_phase_b.
+                roster3 = tuple(
+                    (n, p, live_pids.get(n, 0))
+                    for n, p in roster_priority.items())
                 writer.update(
                     mandatory_ready=mandatory_running,
-                    post_boot_ready=post_boot_running)
+                    post_boot_ready=post_boot_running,
+                    roster=roster3 if roster3 else None)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -2510,6 +2520,25 @@ def _module_wrapper(entry_fn: Callable, name: str, recv_queue, send_queue,
     takes the spawn-mode "true outlive" path or the fork-mode improved-B.1
     fallback (worker dies with old kernel, shadow's Guardian respawns it).
     """
+    # INV-PROC-7 (WORKER-SELF-IDENTITY, D-SPEC-143): per-worker process identity
+    # as the FIRST I/O in the common child entry. (a) setproctitle → full
+    # ps/top/py-spy title `titan_hcl:<name>`; (b) prctl(PR_SET_NAME) → ≤15-char
+    # /proc/<pid>/comm `titan:<name>`. So external probes (RSS/CPU attribution,
+    # the synthesis-soak fd-probe, crash diagnosis) read the worker name directly
+    # from /proc — zero heuristics, no dependency on the API or SHM slots being
+    # live. Graceful no-op if setproctitle/prctl unavailable (matches
+    # persistence_entry.py:52). Set before install_full_protection() below.
+    try:
+        import setproctitle as _spt
+        _spt.setproctitle(f"titan_hcl:{name}")
+    except Exception:  # noqa: BLE001 — identity is best-effort, never fatal
+        pass
+    try:
+        from titan_hcl.core.worker_lifecycle import set_proc_name
+        set_proc_name(name)
+    except Exception:  # noqa: BLE001 — identity is best-effort, never fatal
+        pass
+
     # ── Native-crash visibility (SPEC §11.I.4 error cascade) ──
     # The @with_error_envelope cascade only catches Python EXCEPTIONS. A fatal
     # NATIVE signal (SIGSEGV/SIGABRT/SIGBUS/SIGFPE — e.g. a crash deep in a
