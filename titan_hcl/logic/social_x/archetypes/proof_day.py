@@ -40,50 +40,72 @@ def _read_json_file(path: str) -> Any:
         return None
 
 
+def _latest_unified_event(titan_id: str) -> dict:
+    """Latest event from the SPEC §24.3 unified manifest — the CANONICAL
+    backup truth (Arweave tx_ids + per-tier merkle + on-chain zk_commit_tx,
+    chained via prev_event_id).
+
+    2026-05-29: proof_day's three sources were repointed here from the
+    retired legacy files (`backup_anchor_chain_<id>.json`,
+    `timechain/arweave_manifest_<id>.json`, `zk_vault_snapshots_<id>.json`).
+    The new unified_v2 pipeline NEVER wrote those legacy files, so proof_day
+    abstained every day ("no anchor in chain file") and never posted — the
+    real reason "proof_day never went live". No legacy fallback (SPEC §24.3
+    is the source of truth; §24.7.a).
+    """
+    data = _read_json_file(f"data/backup_unified_manifest_{titan_id}.json")
+    if not isinstance(data, dict):
+        return {}
+    events = data.get("events") or []
+    return events[-1] if events else {}
+
+
 def _latest_anchor(titan_id: str) -> dict:
-    """Most recent entry in backup_anchor_chain_<titan_id>.json. Empty dict
-    if file missing/corrupt or no entries."""
-    data = _read_json_file(f"data/backup_anchor_chain_{titan_id}.json")
-    if isinstance(data, dict):
-        anchors = data.get("anchors") or []
-    elif isinstance(data, list):
-        anchors = data
-    else:
-        anchors = []
-    return anchors[-1] if anchors else {}
+    """Latest unified event mapped to the anchor shape find_candidate expects
+    (Solana memo tx + archive hash + total size + chain prev)."""
+    ev = _latest_unified_event(titan_id)
+    if not ev:
+        return {}
+    p = ev.get("personality", {}) or {}
+    t = ev.get("timechain", {}) or {}
+    s = ev.get("soul", {}) or {}
+    size_mb = (int(p.get("size_bytes", 0)) + int(t.get("size_bytes", 0))
+               + int(s.get("size_bytes", 0))) / (1024 * 1024)
+    tiers = "personality+timechain" + ("+soul" if ev.get("soul") else "")
+    return {
+        "archive_hash": p.get("merkle_root", ""),
+        "ts": ev.get("ts_unix"),
+        "size_mb": round(size_mb, 1),
+        "backup_type": tiers,
+        "tx": ev.get("zk_commit_tx", ""),          # Solana v=2 memo tx (§24.7)
+        "prev_anchor_hash": ev.get("prev_event_id") or "genesis",
+    }
 
 
 def _latest_arweave(titan_id: str) -> dict:
-    """Most recent entry in timechain/arweave_manifest_<titan_id>.json (with
-    legacy fallback to the unsuffixed file). Empty dict if missing."""
-    primary = f"data/timechain/arweave_manifest_{titan_id}.json"
-    legacy = "data/timechain/arweave_manifest.json"
-    data = _read_json_file(primary) or _read_json_file(legacy)
-    if not isinstance(data, dict):
+    """Latest unified event's personality tier → Arweave proof shape."""
+    ev = _latest_unified_event(titan_id)
+    if not ev:
         return {}
-    snapshots = data.get("snapshots") or []
-    return snapshots[-1] if snapshots else {}
+    p = ev.get("personality", {}) or {}
+    return {
+        "tx_id": p.get("tx_id", ""),
+        "merkle_root": p.get("merkle_root", ""),
+        "size_bytes": int(p.get("size_bytes", 0)),
+    }
 
 
 def _latest_vault_snapshot(titan_id: str) -> dict:
-    """Most recent entry in zk_vault_snapshots_<titan_id>.json."""
-    data = _read_json_file(f"data/zk_vault_snapshots_{titan_id}.json")
-    if isinstance(data, dict):
-        snaps = data.get("snapshots") or []
-    elif isinstance(data, list):
-        snaps = data
-    else:
-        snaps = []
-    return snaps[-1] if snaps else {}
+    """Latest unified event's on-chain ZK Vault commit (the v=2 memo tx)."""
+    ev = _latest_unified_event(titan_id)
+    return {"tx_sig": ev.get("zk_commit_tx", "")} if ev else {}
 
 
 def _vault_commit_count(titan_id: str) -> int:
-    """Total ZK Vault snapshots for this Titan."""
-    data = _read_json_file(f"data/zk_vault_snapshots_{titan_id}.json")
+    """Total backup events in the unified manifest (= on-chain commits)."""
+    data = _read_json_file(f"data/backup_unified_manifest_{titan_id}.json")
     if isinstance(data, dict):
-        return len(data.get("snapshots") or [])
-    if isinstance(data, list):
-        return len(data)
+        return len(data.get("events") or [])
     return 0
 
 
