@@ -8504,7 +8504,7 @@ def _acquire_backup_verify_fetchers(titan_id: str):
     """Return (arweave_fetch_async, memo_fetch_async) or None.
 
     Wires:
-      - ArweaveStore.download_file as arweave_fetch
+      - ArweaveStore.fetch as arweave_fetch
       - SolanaClient.get_memo_for_tx as memo_fetch (Phase 11 will land
         this helper on the network client; for now this returns None if
         the helper isn't present and the caller halts cleanly with a
@@ -8529,9 +8529,13 @@ def _acquire_backup_verify_fetchers(titan_id: str):
         store = ArweaveStore(keypair_path=kp, network="mainnet")
 
         async def _arweave_fetch(tx_id: str) -> bytes:
-            data = await store.download_file(tx_id)
+            # ArweaveStore exposes `fetch()` (HTTP GET from the gateway →
+            # bytes), NOT `download_file` — the prior name was a phantom that
+            # made every `verify --allbackups` / restore fetch raise
+            # AttributeError (producer/consumer name mismatch, 2026-05-29).
+            data = await store.fetch(tx_id)
             if data is None:
-                raise RuntimeError(f"Arweave download returned None for {tx_id}")
+                raise RuntimeError(f"Arweave fetch returned None for {tx_id}")
             return data
 
         async def _memo_fetch(sig: str) -> str:

@@ -387,9 +387,14 @@ class ArweaveStore:
                 return local_path.read_bytes()
             return None
 
-        # Mainnet: fetch from Arweave gateway
+        # Mainnet: fetch from Arweave gateway.
+        # follow_redirects=True is REQUIRED — the gateway 302-redirects
+        # {tx_id} to its content-addressed subdomain; without following,
+        # every fetch (and thus every restore + verify) got a 302 and
+        # returned None (2026-05-29). Larger timeout for multi-hundred-MB
+        # baseline tarballs.
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
                 resp = await client.get(f"{ARWEAVE_GATEWAY}/{tx_id}")
                 if resp.status_code == 200:
                     return resp.content
