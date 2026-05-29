@@ -49,7 +49,7 @@ class WorkingMemory:
     Item types:
     - active_word: Currently learning/using word
     - active_goal: Current goal from hormonal drive
-    - active_experience: Recalled experience from the experience orchestrator
+    - active_experience: Recalled experience from ex_mem
     - conversation_context: Who am I talking to?
     - dominant_emotion: Current strongest hormone
     - active_dream: Recently recalled dream insight

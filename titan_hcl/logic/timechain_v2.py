@@ -2911,7 +2911,7 @@ class GenesisChain:
         )
 
         block = self._tc.commit_block(
-            fork_id=self.FORK_MAIN,
+            fork_id=self._tc.resolve_fork_id("main"),  # Phase 14 / INV-Syn-26 chain-local
             epoch_id=current_epoch,
             payload=payload,
             pot_nonce=pot_nonce,
@@ -3074,7 +3074,7 @@ class TimeChainOrchestrator:
         and prime directives as the foundational block on FORK_MAIN.
         This block is the anchor for restoration and sovereignty proof.
         """
-        from titan_hcl.logic.timechain import FORK_MAIN, BlockPayload
+        from titan_hcl.logic.timechain import BlockPayload
 
         # Check flag file first (fastest, survives index rebuilds)
         _birth_flag = os.path.join(self._data_dir, ".birth_block_created")
@@ -3089,7 +3089,7 @@ class TimeChainOrchestrator:
             _row = _conn.execute(
                 "SELECT block_height FROM block_index "
                 "WHERE fork_id = ? AND thought_type = 'birth' LIMIT 1",
-                (FORK_MAIN,)).fetchone()
+                (self._tc.resolve_fork_id("main"),)).fetchone()
             _conn.close()
             if _row:
                 logger.info("[Orchestrator] Birth block exists at height %d", _row[0])
@@ -3153,7 +3153,7 @@ class TimeChainOrchestrator:
 
         # Birth timestamp from existing genesis block or now
         try:
-            genesis_block = self._tc.get_block(FORK_MAIN, 0)
+            genesis_block = self._tc.get_block(self._tc.resolve_fork_id("main"), 0)
             if genesis_block:
                 content["born"] = genesis_block.header.timestamp
         except Exception:
@@ -3170,7 +3170,7 @@ class TimeChainOrchestrator:
                 tags=["birth", "identity", "sovereign"],
             )
             block = self._tc.commit_block(
-                fork_id=FORK_MAIN,
+                fork_id=self._tc.resolve_fork_id("main"),  # Phase 14 / INV-Syn-26 chain-local
                 epoch_id=0,
                 payload=payload,
                 pot_nonce=0,
