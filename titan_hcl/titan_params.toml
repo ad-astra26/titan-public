@@ -1981,12 +1981,7 @@ balance_half_life_epochs = 50.0    # sustained-calm EMA half-life (rewards a hel
 agitation_norm = 1.0               # normalizer: balance = 1 − mean|gain−1|/agitation_norm
 debt_onset_epochs = 1500           # epochs since last meditation before debt ramps (mirror sleep debt)
 debt_ramp_epochs = 900             # debt ramp width — biases drive toward firing as overdue grows
-max_interval_seconds = 21600       # HARD cadence CEILING (≈6h) — force-fire if overdue, guarantees ≥~4×/day
-min_interval_seconds = 14400       # TIME FLOOR (4h) — emergent onset CANNOT fire before this. Meditation is the
-                                   # SPARSE ~4×/day event (dreaming is the frequent one). Added 2026-05-29 after
-                                   # the epoch-only gate (min_interval_epochs=1500, calibrated for 7s/epoch) fired
-                                   # ~every 30min because the live epoch tick runs ~3Hz (≈21× faster than assumed)
-                                   # → see the epoch-rate fix. Time gating is robust to epoch-rate drift.
+max_interval_seconds = 21600       # HARD cadence floor (≈6h) — guarantees ~4×/day regardless of neuromod state
 meditation_inertia_seconds = 1800  # refractory after a completed meditation (mirror dreaming wake-inertia)
 
 # ── Self-healing watchdog (rFP_self_healing_meditation_cadence.md Phase 1+2)

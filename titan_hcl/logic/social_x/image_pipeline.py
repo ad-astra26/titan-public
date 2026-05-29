@@ -228,17 +228,6 @@ def upload_media_via_gateway(gateway, file_path: str) -> str:
     api_key = cfg.get("api_key", "")
     session = gateway._refreshed_session or cfg.get("auth_session", "")
     proxy = cfg.get("webshare_static_url", "")
-    if api_key and not session:
-        # Media upload runs INSIDE the post path BEFORE create_tweet primes
-        # the gateway session, so `_refreshed_session` is often empty here →
-        # the card silently skipped → text-only posts (2026-05-29). Refresh
-        # proactively so the receipt card actually attaches.
-        try:
-            session = gateway._refresh_session(api_key, proxy) or ""
-            if session:
-                logger.info("[image_pipeline] upload_media: refreshed session for media upload")
-        except Exception as e:
-            logger.warning("[image_pipeline] upload_media: session refresh failed: %s", e)
     if not (api_key and session):
         logger.warning("[image_pipeline] upload_media: missing api_key/session — skipping")
         return ""
