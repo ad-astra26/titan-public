@@ -10975,14 +10975,9 @@ async def get_v4_cgn_haov_stats(request: Request):
         state_path = "data/cgn/cgn_state.pt"
 
         haov_data = {}
-        consumer_freq = {}
         if os.path.exists(haov_json_path):
             with open(haov_json_path) as _hf:
                 haov_data = _json.load(_hf)
-            # Reserved key carries per-consumer record_outcome call counts —
-            # pop before iterating so it isn't mistaken for a consumer
-            # (BUG-CGN-CONSUMER-FREQ-INVISIBLE-VIA-API-SIDECAR-20260526).
-            consumer_freq = haov_data.pop("_consumer_freq", {})
         elif os.path.exists(state_path):
             # Fallback: use pickle to read .pt file without importing torch
             import pickle
@@ -10990,11 +10985,10 @@ async def get_v4_cgn_haov_stats(request: Request):
                 try:
                     state = pickle.load(_sf)
                     haov_data = state.get("haov", {})
-                    consumer_freq = state.get("consumer_freq", {})
                 except Exception:
-                    return _ok({"consumers": {}, "consumer_freq": {}, "note": "CGN state unreadable without torch"})
+                    return _ok({"consumers": {}, "note": "CGN state unreadable without torch"})
         else:
-            return _ok({"consumers": {}, "consumer_freq": {}, "note": "CGN state not yet saved"})
+            return _ok({"consumers": {}, "note": "CGN state not yet saved"})
 
         result = {}
         for consumer, hdata in haov_data.items():
@@ -11035,7 +11029,7 @@ async def get_v4_cgn_haov_stats(request: Request):
                 ],
             }
 
-        return _ok({"consumers": result, "consumer_freq": dict(consumer_freq)})
+        return _ok({"consumers": result})
     except Exception as e:
         logger.error("[Dashboard] /v4/cgn-haov-stats error: %s", e)
         return _error(str(e))
