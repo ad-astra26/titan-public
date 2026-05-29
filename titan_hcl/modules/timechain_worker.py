@@ -121,6 +121,8 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
     # ── Initialize TimeChain ──
     from titan_hcl.logic.timechain import (
         TimeChain, BlockPayload, CrossRef,
+        FORK_MAIN, FORK_DECLARATIVE, FORK_PROCEDURAL,
+        FORK_EPISODIC, FORK_META, FORK_CONVERSATION, FORK_NAMES,
     )
     from titan_hcl.logic.proof_of_thought import PoTValidator
 
@@ -158,8 +160,24 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
     _anchor_bank = None
     _anchor_last_check = 0.0
 
-    # Phase 14 / INV-Syn-26 — fork name↔id resolution goes through the chain's
-    # registry (tc.resolve_fork_id / tc.resolve_fork_name), never static maps.
+    # Fork name lookup
+    fork_name_map = {
+        FORK_MAIN: "main",
+        FORK_DECLARATIVE: "declarative",
+        FORK_PROCEDURAL: "procedural",
+        FORK_EPISODIC: "episodic",
+        FORK_META: "meta",
+        FORK_CONVERSATION: "conversation",
+    }
+
+    fork_id_map = {
+        "main": FORK_MAIN,
+        "declarative": FORK_DECLARATIVE,
+        "procedural": FORK_PROCEDURAL,
+        "episodic": FORK_EPISODIC,
+        "meta": FORK_META,
+        "conversation": FORK_CONVERSATION,
+    }
 
     # ── TimeChain v2 Orchestrator (mempool + genesis chain) ──
     orchestrator = None
@@ -350,7 +368,9 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         if msg_type in (bus.SYSTEM_UPGRADE_QUEUED, bus.SYSTEM_UPGRADE_STARTING,
                         bus.SYSTEM_RESUMED, bus.SYSTEM_UPGRADE_PENDING_DEFERRED):
             try:
-                from titan_hcl.logic.timechain import BlockPayload as _BP
+                from titan_hcl.logic.timechain import (
+                    BlockPayload as _BP, FORK_SYSTEM as _FORK_SYSTEM,
+                )
                 payload_b1 = msg.get("payload", {}) or {}
                 event_id = payload_b1.get("event_id", "")
                 content = {
@@ -364,7 +384,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                     "elapsed_seconds": payload_b1.get("elapsed_seconds", 0.0),
                 }
                 tc.commit_block(
-                    fork_id=tc.resolve_fork_id("system"), epoch_id=_current_epoch,
+                    fork_id=_FORK_SYSTEM, epoch_id=_current_epoch,
                     payload=_BP(thought_type="system",
                                 source="shadow_swap",
                                 content=content,
@@ -386,7 +406,9 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
 
         if msg_type == bus.SYSTEM_UPGRADE_THOUGHT:
             try:
-                from titan_hcl.logic.timechain import BlockPayload as _BP
+                from titan_hcl.logic.timechain import (
+                    BlockPayload as _BP, FORK_EPISODIC as _FORK_EPISODIC,
+                )
                 payload_b1 = msg.get("payload", {}) or {}
                 event_id = payload_b1.get("event_id", "")
                 content = {
@@ -398,7 +420,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                     "gap_seconds": payload_b1.get("gap_seconds"),
                 }
                 tc.commit_block(
-                    fork_id=tc.resolve_fork_id("episodic"), epoch_id=_current_epoch,
+                    fork_id=_FORK_EPISODIC, epoch_id=_current_epoch,
                     payload=_BP(thought_type="episodic",
                                 source="spirit",
                                 content=content,
@@ -444,14 +466,6 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                 logger.warning(
                     "[TimeChain] Phase 11 probe handler raised: %s",
                     _phb_err)
-            continue
-
-        # Phase 14 §9.B — timechain_guardian heal path. health_monitor_worker
-        # emits HEAL_REQUEST(dst="timechain_worker") when the guardian's
-        # fork_completeness layer finds a missing primary. We run the idempotent
-        # additive reseed against the live tc and reply HEAL_RESULT.
-        if msg_type == bus.HEAL_REQUEST:
-            _handle_heal_request(tc, payload, send_queue, name)
             continue
 
         if msg_type == bus.MODULE_SHUTDOWN:
@@ -527,7 +541,7 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                                 src, payload.get("fork", "?"),
                                 payload.get("thought_type", "?"))
                     _handle_commit(tc, pot_validator, payload, src, _current_epoch,
-                                   send_queue, name)
+                                   fork_id_map, fork_name_map, send_queue, name)
                     _blocks_since_checkpoint += 1
 
                     # Check block-count checkpoint trigger
@@ -862,71 +876,13 @@ def timechain_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
 
 # ── Handler Functions ──────────────────────────────────────────────────
 
-def _handle_heal_request(tc, payload, send_queue, name):
-    """Dispatch HEAL_REQUEST(dst="timechain_worker") — Phase 14 §9.B.
-
-    Per the SPEC §9.B HEAL_REQUEST/HEAL_RESULT contract: replies
-    HEAL_RESULT(dst="health_monitor") with success + reason; correlation_id
-    echoed verbatim.
-
-    Supported action:
-      - "reseed_primary_fork" — run the idempotent, additive reseed
-        (tc._register_primary_forks). Purely additive: creates any missing
-        primary at the next free id, NEVER touches existing rows (the one
-        self-heal we trust per INV-Syn-26). success=True iff all 6 primaries
-        resolve by name afterward.
-
-    Unknown actions reply success=False reason="unknown_action_<name>".
-    """
-    correlation_id = str(payload.get("correlation_id", ""))
-    action = str(payload.get("action", ""))
-    plugin_name = str(payload.get("plugin", ""))
-
-    def _reply(success: bool, reason: str) -> None:
-        send_queue.put({
-            "type": bus.HEAL_RESULT, "src": name, "dst": "health_monitor",
-            "payload": {
-                "plugin": plugin_name,
-                "action": action,
-                "success": success,
-                "reason": reason,
-                "correlation_id": correlation_id,
-                "ts": time.time(),
-            },
-        })
-
-    if action != "reseed_primary_fork":
-        logger.warning("[TimeChain] HEAL_REQUEST unknown action=%r plugin=%s",
-                       action, plugin_name)
-        _reply(False, f"unknown_action_{action}")
-        return
-
-    try:
-        tc._register_primary_forks(time.time())
-        primaries = ("main", "declarative", "procedural", "episodic", "meta",
-                     "conversation")
-        missing = [n for n in primaries if tc.resolve_fork_id(n) is None]
-        if missing:
-            _reply(False, f"reseed_incomplete_missing={missing}")
-            logger.error("[TimeChain] reseed_primary_fork still missing: %s",
-                         missing)
-        else:
-            _reply(True, "all_6_primaries_resolvable")
-            logger.info("[TimeChain] reseed_primary_fork heal OK — "
-                        "all 6 primaries name-resolvable")
-    except Exception as e:  # noqa: BLE001
-        logger.error("[TimeChain] reseed_primary_fork heal failed: %s", e)
-        _reply(False, f"reseed_exception:{type(e).__name__}")
-
-
 def _handle_commit(tc, pot_validator, payload, src, current_epoch,
-                   send_queue, name):
+                   fork_id_map, fork_name_map, send_queue, name):
     """Handle a TIMECHAIN_COMMIT message — validate PoT and commit block."""
     from titan_hcl.logic.timechain import BlockPayload, CrossRef
 
     fork_name = payload.get("fork", "declarative")
-    # Phase 14 / INV-Syn-26 — resolve the primary by NAME chain-locally.
-    fork_id = tc.resolve_fork_id(fork_name)
+    fork_id = fork_id_map.get(fork_name)
 
     # Check if it's a sidechain target
     if fork_id is None:
@@ -935,7 +891,7 @@ def _handle_commit(tc, pot_validator, payload, src, current_epoch,
             fork_id = sidechain_id
             fork_name = "sidechain"
         else:
-            fork_id = tc.resolve_fork_id("declarative")  # fallback
+            fork_id = fork_id_map.get("declarative", 1)  # fallback
 
     # Extract PoT inputs
     neuromods = payload.get("neuromods", {})
@@ -1042,7 +998,7 @@ def _handle_commit(tc, pot_validator, payload, src, current_epoch,
 
 def _do_heartbeat(tc, epoch_payload, current_epoch, send_queue, name):
     """Commit a heartbeat block to the main chain."""
-    from titan_hcl.logic.timechain import BlockPayload
+    from titan_hcl.logic.timechain import BlockPayload, FORK_MAIN
 
     payload = BlockPayload(
         thought_type="main",
@@ -1060,7 +1016,7 @@ def _do_heartbeat(tc, epoch_payload, current_epoch, send_queue, name):
 
     neuromods = epoch_payload.get("neuromods", {})
     block = tc.commit_block(
-        fork_id=tc.resolve_fork_id("main"),
+        fork_id=FORK_MAIN,
         epoch_id=current_epoch,
         payload=payload,
         pot_nonce=1,  # heartbeats always pass
@@ -1077,7 +1033,7 @@ def _do_heartbeat(tc, epoch_payload, current_epoch, send_queue, name):
 def _do_dream_event(tc, is_dreaming, current_epoch, payload,
                     send_queue, name):
     """Commit dream start/end to episodic fork."""
-    from titan_hcl.logic.timechain import BlockPayload
+    from titan_hcl.logic.timechain import BlockPayload, FORK_EPISODIC
 
     event_type = "dream_start" if is_dreaming else "dream_end"
     block_payload = BlockPayload(
@@ -1092,7 +1048,7 @@ def _do_dream_event(tc, is_dreaming, current_epoch, payload,
     )
 
     block = tc.commit_block(
-        fork_id=tc.resolve_fork_id("episodic"),
+        fork_id=FORK_EPISODIC,
         epoch_id=current_epoch,
         payload=block_payload,
         pot_nonce=1,  # dream events always committed
@@ -1143,7 +1099,7 @@ def _do_dream_compaction(tc, current_epoch, send_queue, name):
 
 def _do_expression_event(tc, composite, payload, current_epoch):
     """Commit ART/MUSIC expression to episodic fork."""
-    from titan_hcl.logic.timechain import BlockPayload
+    from titan_hcl.logic.timechain import BlockPayload, FORK_EPISODIC
 
     block_payload = BlockPayload(
         thought_type="episodic",
@@ -1158,7 +1114,7 @@ def _do_expression_event(tc, composite, payload, current_epoch):
     )
 
     block = tc.commit_block(
-        fork_id=tc.resolve_fork_id("episodic"),
+        fork_id=FORK_EPISODIC,
         epoch_id=current_epoch,
         payload=block_payload,
         pot_nonce=1,

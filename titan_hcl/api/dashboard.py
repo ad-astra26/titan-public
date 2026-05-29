@@ -3225,13 +3225,11 @@ async def get_consciousness_history(
                FROM epochs ORDER BY epoch_id DESC LIMIT ?""",
             (limit,),
         )
-        from titan_hcl.logic.consciousness import unpack_vector
         epochs = []
         for row in rows:
-            # SPEC §11.H.1.bis dual-read: BLOB f32-LE (new) or TEXT-JSON (legacy)
-            sv = unpack_vector(row[2])
-            drift = unpack_vector(row[3])
-            traj = unpack_vector(row[4])
+            sv = _json.loads(row[2]) if isinstance(row[2], str) else row[2]
+            drift = _json.loads(row[3]) if isinstance(row[3], str) else row[3]
+            traj = _json.loads(row[4]) if isinstance(row[4], str) else row[4]
             dims = {}
             for i, dim_name in enumerate(STATE_DIMS):
                 if i < len(sv):
@@ -9959,8 +9957,10 @@ async def kin_exchange(request: Request):
                 "SELECT state_vector FROM epochs ORDER BY epoch_id DESC LIMIT 1",
                 fetch="one")
             if _c_row and _c_row[0]:
-                from titan_hcl.logic.consciousness import unpack_vector
-                _sv = unpack_vector(_c_row[0])  # SPEC §11.H.1.bis dual-read
+                _raw_sv = _c_row[0]
+                if isinstance(_raw_sv, str):
+                    _raw_sv = json.loads(_raw_sv)
+                _sv = _raw_sv if isinstance(_raw_sv, list) else []
         except Exception:
             pass
         my_body = _sv[0:5] if len(_sv) >= 5 else [0.5] * 5
@@ -10147,8 +10147,10 @@ async def _get_dialogue_state() -> tuple:
             "SELECT state_vector FROM epochs ORDER BY epoch_id DESC LIMIT 1",
             fetch="one")
         if _dc_row and _dc_row[0]:
-            from titan_hcl.logic.consciousness import unpack_vector
-            felt_state = unpack_vector(_dc_row[0])  # SPEC §11.H.1.bis dual-read
+            _raw = _dc_row[0]
+            if isinstance(_raw, str):
+                _raw = json.loads(_raw)
+            felt_state = _raw if isinstance(_raw, list) else []
     except Exception:
         pass
 
@@ -11375,7 +11377,7 @@ async def get_v4_developmental_timeline(request: Request, days: int = 30):
     def _fetch():
         tc = _get_cached_tc()
         blocks = tc.query_blocks(
-            thought_type="genesis", fork_id=tc.resolve_fork_id("main"),
+            thought_type="genesis", fork_id=0,
             limit=min(days * 10, 500))
         timeline = []
         for b in blocks:
@@ -11435,7 +11437,7 @@ async def get_v4_timechain_contracts(request: Request,
     def _fetch():
         tc = _get_cached_tc()
         blocks = tc.query_blocks(
-            thought_type="contract_deploy", fork_id=tc.resolve_fork_id("meta"), limit=200)
+            thought_type="contract_deploy", fork_id=4, limit=200)
         seen = {}
         for b in blocks:
             try:
@@ -11529,7 +11531,7 @@ async def get_v4_contracts_pending(request: Request):
     def _fetch():
         tc = _get_cached_tc()
         blocks = tc.query_blocks(
-            thought_type="contract_deploy", fork_id=tc.resolve_fork_id("meta"), limit=200)
+            thought_type="contract_deploy", fork_id=4, limit=200)
         pending = []
         for b in blocks:
             try:
@@ -11659,12 +11661,8 @@ async def get_v4_timechain_verify_block(request: Request, height: int):
     """
     try:
         tc = _get_cached_tc()
-        # Phase 14 / INV-Syn-26 — resolve the conversation fork by NAME
-        # chain-locally (its id is 5 on T1 but chain-local elsewhere).
-        conversation_fork_id = tc.resolve_fork_id("conversation")
-        if conversation_fork_id is None:
-            return _error("conversation fork not present on this chain", code=404)
-        block = tc.get_block(conversation_fork_id, height)
+        from titan_hcl.logic.timechain import FORK_CONVERSATION
+        block = tc.get_block(FORK_CONVERSATION, height)
         if not block:
             return _error(f"Conversation block #{height} not found", code=404)
 
@@ -11687,7 +11685,7 @@ async def get_v4_timechain_verify_block(request: Request, height: int):
             "genesis_hash": status.get("genesis_hash", ""),
             "merkle_root": status.get("merkle_root", ""),
             "fork": "conversation",
-            "fork_id": conversation_fork_id,
+            "fork_id": FORK_CONVERSATION,
         })
     except Exception as e:
         logger.error("[Dashboard] /v4/timechain/verify/%d error: %s", height, e)
