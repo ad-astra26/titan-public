@@ -40,9 +40,45 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+# Marker substring on every backup snapshot path. Recognized by the
+# backup-scope skip-lists (titan_hcl/logic/backup.py: _tier_specs_from_paths
+# IGNORE_SUFFIXES + _BACKUP_SKIP_PATTERNS) and by sweep_orphan_snapshots().
+BKSNAP_MARKER = ".bksnap."
+# Dedicated out-of-source-tree scratch dir name (a child of the data root).
+# CRITICAL: snapshots must NOT live inside a backed-up source dir, or the
+# next event's rglob re-snapshots them (.bksnap.X.bksnap.Y …) and the
+# orphan set grows exponentially — the cause of the 340,445-orphan /
+# 358 GB-phantom-scope incident (2026-05-29). A child of data/ stays on
+# the same filesystem (so os.link still works) but is outside every
+# PERSONALITY_PATHS / WEEKLY_EXTRA_PATHS entry (those are data/<subdir>/),
+# so rglob never walks into it.
+_SCRATCH_DIRNAME = ".bksnap_scratch"
+
+
+def _scratch_dir_for(current_path: str) -> str:
+    """Resolve a same-filesystem scratch dir for `current_path`'s snapshot.
+
+    Anchors on the nearest ancestor named `data` (the Titan data root) and
+    returns `<data_root>/.bksnap_scratch`, created if absent. Falls back to
+    the source dir's parent if no `data` ancestor exists (keeps same fs).
+    """
+    p = os.path.abspath(current_path)
+    parts = p.split(os.sep)
+    if "data" in parts:
+        # last 'data' component is the data root for this path
+        i = len(parts) - 1 - parts[::-1].index("data")
+        data_root = os.sep.join(parts[: i + 1]) or os.sep
+    else:
+        data_root = os.path.dirname(os.path.dirname(p)) or os.path.dirname(p)
+    scratch = os.path.join(data_root, _SCRATCH_DIRNAME)
+    os.makedirs(scratch, exist_ok=True)
+    return scratch
 
 
 def _race_safe_snapshot(current_path: str) -> tuple[str, bool]:
@@ -64,14 +100,15 @@ def _race_safe_snapshot(current_path: str) -> tuple[str, bool]:
       3. On any other OSError, fall back to returning the source path
          directly (preserving prior behavior — the race-window failure
          was already rare; better to ship the file than degrade backup).
+
+    Snapshots live in `<data_root>/.bksnap_scratch` — OUT of the source
+    tree (2026-05-29 fix) so a leaked snapshot can never be re-snapshotted
+    by the next event's directory walk.
     """
-    # Place the snapshot beside the source so we stay on the same
-    # filesystem (avoids EXDEV in practice). Suffix marks it as backup-
-    # owned so a sweeper would recognize the intent.
-    src_dir = os.path.dirname(current_path) or "."
     src_base = os.path.basename(current_path)
+    scratch_dir = _scratch_dir_for(current_path)
     fd, snap_path = tempfile.mkstemp(
-        prefix=f".{src_base}.bksnap.", dir=src_dir)
+        prefix=f"{src_base}{BKSNAP_MARKER}", dir=scratch_dir)
     os.close(fd)
     os.unlink(snap_path)   # mkstemp leaves an empty file; remove before link
 
@@ -105,6 +142,43 @@ def _race_safe_snapshot(current_path: str) -> tuple[str, bool]:
         except OSError:
             pass
         raise
+
+
+def sweep_orphan_snapshots(data_root: str = "data",
+                           max_age_s: float = 3600.0) -> int:
+    """Remove leaked backup snapshots from the scratch dir.
+
+    A snapshot is normally unlinked by pack_event_tarball (patch_owned).
+    An abnormal termination mid-pack (RSS-kill, crash) can leak one into
+    `<data_root>/.bksnap_scratch`. This sweep removes snapshot files older
+    than `max_age_s` (so it never races a live event's in-flight snapshot).
+    Hardlink removal only drops the extra name; the canonical source inode
+    is untouched. Returns the number of orphans removed. Best-effort: never
+    raises.
+
+    Called at backup_worker boot. Defensively also sweeps any stray
+    in-tree `.bksnap.` files left by the pre-2026-05-29 in-source-dir
+    placement (one-shot migration safety; the new code never creates them).
+    """
+    removed = 0
+    now = time.time()
+    scratch = os.path.join(data_root, _SCRATCH_DIRNAME)
+    try:
+        if os.path.isdir(scratch):
+            for name in os.listdir(scratch):
+                if BKSNAP_MARKER not in name:
+                    continue
+                fp = os.path.join(scratch, name)
+                try:
+                    if now - os.path.getmtime(fp) < max_age_s:
+                        continue
+                    os.unlink(fp)
+                    removed += 1
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return removed
 
 
 def _sha256_file(path: str) -> str:

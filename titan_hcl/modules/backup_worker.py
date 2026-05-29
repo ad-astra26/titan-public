@@ -206,6 +206,24 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     with suppress(Exception):
         loop.run_until_complete(backup.check_on_boot())
 
+    # 2026-05-29 — sweep leaked backup-snapshot hardlinks. A snapshot is
+    # normally unlinked by pack_event_tarball, but an abnormal mid-pack
+    # termination (RSS-kill, crash) leaks one into data/.bksnap_scratch.
+    # Bounded best-effort sweep at boot keeps the orphan set from growing.
+    # (The exponential blowup that produced 340,445 orphans is fixed at the
+    # source — snapshots now live out of the backed-up tree — this is the
+    # belt-and-suspenders hygiene pass.)
+    with suppress(Exception):
+        from titan_hcl.logic.diff_encoders.full_ship import (
+            sweep_orphan_snapshots,
+        )
+        swept = sweep_orphan_snapshots(
+            data_root=str(local_dir.parent) if local_dir.name == "backups"
+            else "data")
+        if swept:
+            logger.info("[BackupWorker] Swept %d orphan backup snapshot(s)",
+                        swept)
+
     boot_elapsed = time.time() - init_start
     logger.info("[BackupWorker] Ready in %.1fs (local_dir=%s, mode=%s)",
                 boot_elapsed, local_dir, mode)
@@ -663,6 +681,34 @@ def _handle_manual(state: dict, msg: dict) -> None:
 
     t0 = time.time()
     try:
+        # Maker policy 2026-05-23 (D-SPEC-123 follow-up): when unified_v2 owns
+        # backups, a Maker-forced trigger runs ONE unified diff/baseline event
+        # (atomic personality+timechain, +soul on Sunday) — NOT the legacy
+        # per-type full-tarball upload (~50MB), which is the SOL-drain path now
+        # retired everywhere unified_v2 is enabled. The `type` param is
+        # informational under unified_v2 (events are atomic, not per-type).
+        if backup._unified_v2_enabled():
+            weekday = datetime.now(timezone.utc).weekday()
+            shipped = loop.run_until_complete(
+                backup._run_unified_event_v2(weekday=weekday))
+            dur = time.time() - t0
+            _send(send_queue, "BACKUP_SUCCEEDED", name, "all", {
+                "trigger": "manual", "type": "unified_v2",
+                "requested_type": backup_type, "shipped": bool(shipped),
+                "duration_s": round(dur, 2),
+            })
+            logger.info(
+                "[BackupWorker] Manual unified_v2 event: shipped=%s in %.1fs "
+                "(requested type=%s ignored — unified events are atomic)",
+                shipped, dur, backup_type)
+            if rid:
+                _send(send_queue, "RESPONSE", name, src, {
+                    "ok": True,
+                    "result": {"unified_v2": True, "shipped": bool(shipped),
+                               "note": ("event shipped" if shipped else
+                                        "clean no-op: nothing changed or arweave gate off")},
+                }, rid=rid)
+            return
         if backup_type == "personality":
             result = loop.run_until_complete(backup.upload_personality_to_arweave())
         elif backup_type == "soul":
