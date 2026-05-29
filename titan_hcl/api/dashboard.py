@@ -3225,11 +3225,13 @@ async def get_consciousness_history(
                FROM epochs ORDER BY epoch_id DESC LIMIT ?""",
             (limit,),
         )
+        from titan_hcl.logic.consciousness import unpack_vector
         epochs = []
         for row in rows:
-            sv = _json.loads(row[2]) if isinstance(row[2], str) else row[2]
-            drift = _json.loads(row[3]) if isinstance(row[3], str) else row[3]
-            traj = _json.loads(row[4]) if isinstance(row[4], str) else row[4]
+            # SPEC §11.H.1.bis dual-read: BLOB f32-LE (new) or TEXT-JSON (legacy)
+            sv = unpack_vector(row[2])
+            drift = unpack_vector(row[3])
+            traj = unpack_vector(row[4])
             dims = {}
             for i, dim_name in enumerate(STATE_DIMS):
                 if i < len(sv):
@@ -9957,10 +9959,8 @@ async def kin_exchange(request: Request):
                 "SELECT state_vector FROM epochs ORDER BY epoch_id DESC LIMIT 1",
                 fetch="one")
             if _c_row and _c_row[0]:
-                _raw_sv = _c_row[0]
-                if isinstance(_raw_sv, str):
-                    _raw_sv = json.loads(_raw_sv)
-                _sv = _raw_sv if isinstance(_raw_sv, list) else []
+                from titan_hcl.logic.consciousness import unpack_vector
+                _sv = unpack_vector(_c_row[0])  # SPEC §11.H.1.bis dual-read
         except Exception:
             pass
         my_body = _sv[0:5] if len(_sv) >= 5 else [0.5] * 5
@@ -10147,10 +10147,8 @@ async def _get_dialogue_state() -> tuple:
             "SELECT state_vector FROM epochs ORDER BY epoch_id DESC LIMIT 1",
             fetch="one")
         if _dc_row and _dc_row[0]:
-            _raw = _dc_row[0]
-            if isinstance(_raw, str):
-                _raw = json.loads(_raw)
-            felt_state = _raw if isinstance(_raw, list) else []
+            from titan_hcl.logic.consciousness import unpack_vector
+            felt_state = unpack_vector(_dc_row[0])  # SPEC §11.H.1.bis dual-read
     except Exception:
         pass
 
@@ -11169,16 +11167,46 @@ async def get_v4_timechain_blocks(request: Request, fork: int = 0,
 # Same fix template as /v4/timechain/status: separate warmer thread (verify
 # is more expensive than status, so longer interval — 60s) + bounded
 # cold-boot fallback.
+#
+# D-SPEC-143 F2 (2026-05-29): the warmer was the api's #1 CPU consumer —
+# profiling showed it re-hashing the ENTIRE ~200 MB chain (verify_all → sha256
+# every fork) every 60s; cost grew with the chain (data-growth regression). Now
+# INCREMENTAL: per fork, resume from the previously-verified tip (cached in
+# _tc_verify_resume) and hash only blocks appended since. Unchanged forks cost
+# one seek + a 0-byte read. Full re-verify fallback on any resume inconsistency
+# (file shrank/rewrote → valid=None). Same output shape as verify_all.
 _tc_verify_cache: dict = {"data": None, "updated_at": 0.0}
+_tc_verify_resume: dict = {}  # fork_id -> resume {offset,height,prev_hash,height_offset}
 _TC_VERIFY_WARMER_INTERVAL_S = 60.0
 _tc_verify_warmer_started = {"flag": False}
 
 
 def _build_tc_verify_snapshot_sync() -> dict:
-    """Synchronous builder — chain integrity verification."""
+    """Synchronous builder — chain integrity verification (incremental, F2)."""
     tc = _get_cached_tc()
-    valid, results = tc.verify_all()
-    return {"valid": valid, "results": results}
+    fork_ids = sorted(getattr(tc, "_fork_tips", {}).keys())
+    if not fork_ids or not hasattr(tc, "verify_fork_incremental"):
+        # No fork registry / older TimeChain — full verify_all (safe fallback).
+        valid, results = tc.verify_all()
+        return {"valid": valid, "results": results}
+    from titan_hcl.logic.timechain import FORK_NAMES
+    results: list[str] = []
+    all_valid = True
+    for fork_id in fork_ids:
+        resume = _tc_verify_resume.get(fork_id)
+        valid, msg, new_resume = tc.verify_fork_incremental(fork_id, resume)
+        if valid is None:
+            # resume cache stale (file shrank/rewrote) → full re-verify this fork
+            _tc_verify_resume.pop(fork_id, None)
+            valid, msg, new_resume = tc.verify_fork_incremental(fork_id, None)
+        if valid and new_resume is not None:
+            _tc_verify_resume[fork_id] = new_resume
+        elif not valid:
+            _tc_verify_resume.pop(fork_id, None)  # never cache a failed tip
+            all_valid = False
+        results.append(
+            f"Fork {fork_id} ({FORK_NAMES.get(fork_id, f'sc_{fork_id}')}): {msg}")
+    return {"valid": all_valid, "results": results}
 
 
 def _start_tc_verify_warmer() -> None:

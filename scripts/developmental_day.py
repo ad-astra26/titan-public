@@ -288,14 +288,12 @@ class TelemetryCollector:
             epochs = history.get("epochs", [])
             state_vector = []
             if epochs:
-                sv_str = epochs[0].get("state_vector", "[]")
-                if isinstance(sv_str, str):
-                    try:
-                        state_vector = json.loads(sv_str)
-                    except json.JSONDecodeError:
-                        state_vector = []
-                elif isinstance(sv_str, list):
-                    state_vector = sv_str
+                # SPEC §11.H.1.bis dual-read: TEXT-JSON, BLOB f32-LE, or already-list
+                from titan_hcl.logic.consciousness import unpack_vector
+                try:
+                    state_vector = unpack_vector(epochs[0].get("state_vector"))
+                except Exception:
+                    state_vector = []
 
             # Extract layer coherences + tensor data
             snapshot = {
