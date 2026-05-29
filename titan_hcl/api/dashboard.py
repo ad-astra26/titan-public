@@ -10977,14 +10977,9 @@ async def get_v4_cgn_haov_stats(request: Request):
         state_path = "data/cgn/cgn_state.pt"
 
         haov_data = {}
-        consumer_freq = {}
         if os.path.exists(haov_json_path):
             with open(haov_json_path) as _hf:
                 haov_data = _json.load(_hf)
-            # Reserved key carries per-consumer record_outcome call counts —
-            # pop before iterating so it isn't mistaken for a consumer
-            # (BUG-CGN-CONSUMER-FREQ-INVISIBLE-VIA-API-SIDECAR-20260526).
-            consumer_freq = haov_data.pop("_consumer_freq", {})
         elif os.path.exists(state_path):
             # Fallback: use pickle to read .pt file without importing torch
             import pickle
@@ -10992,11 +10987,10 @@ async def get_v4_cgn_haov_stats(request: Request):
                 try:
                     state = pickle.load(_sf)
                     haov_data = state.get("haov", {})
-                    consumer_freq = state.get("consumer_freq", {})
                 except Exception:
-                    return _ok({"consumers": {}, "consumer_freq": {}, "note": "CGN state unreadable without torch"})
+                    return _ok({"consumers": {}, "note": "CGN state unreadable without torch"})
         else:
-            return _ok({"consumers": {}, "consumer_freq": {}, "note": "CGN state not yet saved"})
+            return _ok({"consumers": {}, "note": "CGN state not yet saved"})
 
         result = {}
         for consumer, hdata in haov_data.items():
@@ -11037,7 +11031,7 @@ async def get_v4_cgn_haov_stats(request: Request):
                 ],
             }
 
-        return _ok({"consumers": result, "consumer_freq": dict(consumer_freq)})
+        return _ok({"consumers": result})
     except Exception as e:
         logger.error("[Dashboard] /v4/cgn-haov-stats error: %s", e)
         return _error(str(e))
@@ -11175,16 +11169,46 @@ async def get_v4_timechain_blocks(request: Request, fork: int = 0,
 # Same fix template as /v4/timechain/status: separate warmer thread (verify
 # is more expensive than status, so longer interval — 60s) + bounded
 # cold-boot fallback.
+#
+# D-SPEC-143 F2 (2026-05-29): the warmer was the api's #1 CPU consumer —
+# profiling showed it re-hashing the ENTIRE ~200 MB chain (verify_all → sha256
+# every fork) every 60s; cost grew with the chain (data-growth regression). Now
+# INCREMENTAL: per fork, resume from the previously-verified tip (cached in
+# _tc_verify_resume) and hash only blocks appended since. Unchanged forks cost
+# one seek + a 0-byte read. Full re-verify fallback on any resume inconsistency
+# (file shrank/rewrote → valid=None). Same output shape as verify_all.
 _tc_verify_cache: dict = {"data": None, "updated_at": 0.0}
+_tc_verify_resume: dict = {}  # fork_id -> resume {offset,height,prev_hash,height_offset}
 _TC_VERIFY_WARMER_INTERVAL_S = 60.0
 _tc_verify_warmer_started = {"flag": False}
 
 
 def _build_tc_verify_snapshot_sync() -> dict:
-    """Synchronous builder — chain integrity verification."""
+    """Synchronous builder — chain integrity verification (incremental, F2)."""
     tc = _get_cached_tc()
-    valid, results = tc.verify_all()
-    return {"valid": valid, "results": results}
+    fork_ids = sorted(getattr(tc, "_fork_tips", {}).keys())
+    if not fork_ids or not hasattr(tc, "verify_fork_incremental"):
+        # No fork registry / older TimeChain — full verify_all (safe fallback).
+        valid, results = tc.verify_all()
+        return {"valid": valid, "results": results}
+    from titan_hcl.logic.timechain import FORK_NAMES
+    results: list[str] = []
+    all_valid = True
+    for fork_id in fork_ids:
+        resume = _tc_verify_resume.get(fork_id)
+        valid, msg, new_resume = tc.verify_fork_incremental(fork_id, resume)
+        if valid is None:
+            # resume cache stale (file shrank/rewrote) → full re-verify this fork
+            _tc_verify_resume.pop(fork_id, None)
+            valid, msg, new_resume = tc.verify_fork_incremental(fork_id, None)
+        if valid and new_resume is not None:
+            _tc_verify_resume[fork_id] = new_resume
+        elif not valid:
+            _tc_verify_resume.pop(fork_id, None)  # never cache a failed tip
+            all_valid = False
+        results.append(
+            f"Fork {fork_id} ({FORK_NAMES.get(fork_id, f'sc_{fork_id}')}): {msg}")
+    return {"valid": all_valid, "results": results}
 
 
 def _start_tc_verify_warmer() -> None:

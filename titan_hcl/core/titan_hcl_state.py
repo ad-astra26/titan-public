@@ -42,12 +42,20 @@ from .state_registry import (
 )
 
 # 8 KB holds the fixed-shape counter dict + the canonical module roster
-# (~44 name→boot_priority pairs ≈ 1.5 KB msgpack; 8 KB leaves ample headroom).
+# (~44 (name, boot_priority, pid) triples ≈ 1.6 KB msgpack; 8 KB leaves headroom).
 TITAN_HCL_STATE_PAYLOAD_BYTES: int = 8 * 1024
-# v2 (2026-05-28): added `roster` — the orchestrator-published canonical module
-# set (§11.I.5). Readiness compares it against live slots; replaces the API
-# route-manifest producer union that polluted not_booted with phantom names.
+# CONTAINER byte-layout version (state_registry slot header, bytes [8:12]; readers
+# reject on mismatch per state_registry.py:439). UNCHANGED at 2 — the roster-pid
+# addition (D-SPEC-143) is a msgpack PAYLOAD change inside the same variable-size
+# container, NOT a container-layout change, so bumping this would only risk a
+# stale-/dev/shm-header schema_mismatch on rollout for no benefit.
 TITAN_HCL_STATE_SCHEMA_VERSION: int = 2
+# PAYLOAD logical-schema version (advertised inside the msgpack, informational —
+# from_wire_dict reads it tolerantly, never rejects). v2 = roster as
+# (name, boot_priority); v3 (D-SPEC-143 / SPEC §11.I.5, INV-PROC-7 part b) =
+# roster as (name, boot_priority, pid). from_wire_dict reads dict/2-tuple/3-tuple
+# encodings → always normalizes to 3-tuples (missing pid → 0).
+TITAN_HCL_STATE_PAYLOAD_VERSION: int = 3
 
 
 @dataclass(frozen=True)
@@ -66,17 +74,20 @@ class TitanHclStateEntry:
     post_boot_total: int = 0
     post_boot_ready: int = 0
     lazy_total: int = 0
-    # Canonical module roster the orchestrator manages: (name, boot_priority)
-    # pairs, set once after build_catalog. §11.I.5 readiness uses this as the
-    # authoritative "expected" set — a module in the roster with no live
-    # `module_<name>_state.bin` slot is genuinely not_booted; nothing outside
+    # Canonical module roster the orchestrator manages: (name, boot_priority,
+    # pid) triples (v3 / D-SPEC-143; v2 was (name, boot_priority)). Set after
+    # build_catalog with pid=0 (pids unknown until STARTING), then refreshed by
+    # the 1Hz readiness poller from each live `module_<name>_state.bin.pid`.
+    # §11.I.5 readiness uses this as the authoritative "expected" set — a module
+    # in the roster with no live slot is genuinely not_booted; nothing outside
     # the roster (rust substrate procs, kernel peers, route-manifest producer
-    # aliases) can manufacture a phantom not_booted entry.
+    # aliases) can manufacture a phantom not_booted entry. The pid gives a
+    # single-read authoritative name→pid map (INV-PROC-7 part b).
     roster: tuple = ()
     boot_started_at: float = 0.0
     fleet_ready_at: float = 0.0
     fleet_optional_ready_at: float = 0.0
-    schema_version: int = TITAN_HCL_STATE_SCHEMA_VERSION
+    schema_version: int = TITAN_HCL_STATE_PAYLOAD_VERSION
     written_at: float = field(default_factory=time.time)
 
     def as_wire_dict(self) -> dict[str, Any]:
@@ -89,7 +100,9 @@ class TitanHclStateEntry:
             "post_boot_total": int(self.post_boot_total),
             "post_boot_ready": int(self.post_boot_ready),
             "lazy_total": int(self.lazy_total),
-            "roster": {str(name): str(prio) for name, prio in self.roster},
+            # v3: list-of-triples [name, prio, pid]. Old (v2) readers that hit
+            # their list-of-pairs branch read (name, prio) and ignore pid → safe.
+            "roster": [[str(n), str(p), int(pid)] for n, p, pid in self.roster],
             "boot_started_at": float(self.boot_started_at),
             "fleet_ready_at": float(self.fleet_ready_at),
             "fleet_optional_ready_at": float(self.fleet_optional_ready_at),
@@ -100,10 +113,12 @@ class TitanHclStateEntry:
     @classmethod
     def from_wire_dict(cls, d: dict[str, Any]) -> "TitanHclStateEntry":
         raw_roster = d.get("roster") or {}
-        if isinstance(raw_roster, dict):
-            roster = tuple((str(k), str(v)) for k, v in raw_roster.items())
-        else:  # tolerate a list-of-pairs encoding
-            roster = tuple((str(p[0]), str(p[1])) for p in raw_roster if len(p) >= 2)
+        if isinstance(raw_roster, dict):  # v2 dict {name: prio} → pid=0
+            roster = tuple((str(k), str(v), 0) for k, v in raw_roster.items())
+        else:  # list encoding — v2 2-tuples (pid=0) or v3 3-tuples
+            roster = tuple(
+                (str(p[0]), str(p[1]), int(p[2]) if len(p) >= 3 else 0)
+                for p in raw_roster if len(p) >= 2)
         return cls(
             fleet_ready=bool(d.get("fleet_ready", False)),
             fleet_optional_ready=bool(d.get("fleet_optional_ready", False)),
@@ -117,7 +132,7 @@ class TitanHclStateEntry:
             boot_started_at=float(d.get("boot_started_at", 0.0)),
             fleet_ready_at=float(d.get("fleet_ready_at", 0.0)),
             fleet_optional_ready_at=float(d.get("fleet_optional_ready_at", 0.0)),
-            schema_version=int(d.get("schema_version", TITAN_HCL_STATE_SCHEMA_VERSION)),
+            schema_version=int(d.get("schema_version", TITAN_HCL_STATE_PAYLOAD_VERSION)),
             written_at=float(d.get("written_at", time.time())),
         )
 
@@ -205,8 +220,12 @@ class TitanHclStateWriter:
                                  else int(post_boot_ready)),
                 lazy_total=(self._entry.lazy_total if lazy_total is None
                             else int(lazy_total)),
+                # Normalize to (name, prio, pid) triples; tolerate 2-tuples
+                # from callers that don't yet supply pid (→ pid=0).
                 roster=(self._entry.roster if roster is None
-                        else tuple((str(n), str(p)) for n, p in roster)),
+                        else tuple(
+                            (str(t[0]), str(t[1]), int(t[2]) if len(t) >= 3 else 0)
+                            for t in roster)),
                 boot_started_at=self._entry.boot_started_at,
                 fleet_ready_at=(now if (fleet_ready and not self._entry.fleet_ready)
                                 else self._entry.fleet_ready_at),

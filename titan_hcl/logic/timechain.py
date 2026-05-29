@@ -1065,11 +1065,39 @@ class TimeChain:
         1. prev_hash chains correctly
         2. payload_hash matches actual payload
 
-        Returns (valid, error_message).
+        Returns (valid, error_message). Full verification from genesis —
+        thin wrapper over verify_fork_incremental(resume=None).
+        """
+        valid, msg, _ = self.verify_fork_incremental(fork_id, resume=None)
+        # resume=None never yields the valid=None "retry full" signal.
+        return (bool(valid), msg)
+
+    def verify_fork_incremental(
+        self, fork_id: int, resume: dict | None = None,
+    ) -> tuple[bool | None, str, dict | None]:
+        """Resumable fork verify (D-SPEC-143 F2 — incremental tc-verify warmer).
+
+        ``resume=None`` → full verify from genesis (byte-identical to the
+        historical verify_fork). ``resume={offset, height, prev_hash,
+        height_offset}`` (a prior return value) → seek to that previously-
+        verified tip and hash ONLY blocks appended since — turning the 60s
+        full re-hash of the whole (e.g. 100 MB) fork into a tiny delta scan.
+
+        Returns ``(valid, msg, new_resume)``:
+          - ``valid=True``  → fork valid through ``new_resume["height"]`` blocks;
+            cache ``new_resume`` for the next incremental call.
+          - ``valid=False`` → integrity failure (tamper / chain break / truncation).
+          - ``valid=None``  → the resume cache is inconsistent with the file
+            (shrank / rewrote / offset past EOF / malformed) — NOT a tamper
+            verdict; the caller must retry with ``resume=None`` (full verify).
+
+        Append-only chains never rewrite committed bytes, so resuming from a
+        byte offset is sound: a fork-reorg/compaction shrinks the file, which
+        the offset>EOF guard catches → full re-verify fallback.
         """
         path = self._get_chain_file_path(fork_id)
         if not path.exists():
-            return True, "Fork file does not exist (no blocks)"
+            return True, "Fork file does not exist (no blocks)", None
 
         prev_hash = GENESIS_PREV_HASH
         # For non-main forks, first block's prev_hash = genesis hash
@@ -1078,15 +1106,41 @@ class TimeChain:
 
         height = 0
         height_offset = 0  # Non-zero for forks with genesis-era off-by-one
+        start_offset = 0
+        if resume is not None:
+            try:
+                r_off = int(resume["offset"])
+                r_height = int(resume["height"])
+                r_prev = resume["prev_hash"]
+                r_hoff = int(resume.get("height_offset", 0))
+            except (KeyError, TypeError, ValueError):
+                return None, "resume cache malformed — full re-verify needed", None
+            if not isinstance(r_prev, (bytes, bytearray)) or r_off < 0:
+                return None, "resume cache malformed — full re-verify needed", None
+            try:
+                fsize = path.stat().st_size
+            except OSError as _e:
+                return None, f"stat failed ({_e}) — full re-verify needed", None
+            if r_off > fsize:
+                # file shrank / rewrote (reorg / compaction) → cache stale
+                return None, "resume offset past EOF — full re-verify needed", None
+            start_offset = r_off
+            height = r_height
+            prev_hash = bytes(r_prev)
+            height_offset = r_hoff
+
+        end_offset = start_offset
         try:
             with open(path, "rb") as f:
+                if start_offset:
+                    f.seek(start_offset)
                 while True:
                     pos = f.tell()
                     header_data = f.read(HEADER_SIZE)
                     if len(header_data) == 0:
                         break  # EOF
                     if len(header_data) < HEADER_SIZE:
-                        return False, f"Truncated header at height {height}"
+                        return False, f"Truncated header at height {height}", None
 
                     header = BlockHeader.from_bytes(header_data)
 
@@ -1099,7 +1153,7 @@ class TimeChain:
                     if header.block_height != height + height_offset:
                         return False, (f"Height mismatch at pos {pos}: "
                                       f"expected {height + height_offset}, "
-                                      f"got {header.block_height}")
+                                      f"got {header.block_height}"), None
 
                     # Verify prev_hash chain
                     if height == 0 and fork_id == FORK_MAIN:
@@ -1116,7 +1170,7 @@ class TimeChain:
                         return False, (f"Chain break at height {height}: "
                                       f"prev_hash mismatch (expected "
                                       f"{expected_prev.hex()[:12]}..., got "
-                                      f"{header.prev_hash.hex()[:12]}...)")
+                                      f"{header.prev_hash.hex()[:12]}...)"), None
 
                     # Read cross-refs (skip)
                     f.read(header.cross_ref_count * CROSS_REF_SIZE)
@@ -1124,22 +1178,29 @@ class TimeChain:
                     # Read payload and verify hash
                     len_data = f.read(4)
                     if len(len_data) < 4:
-                        return False, f"Truncated payload length at height {height}"
+                        return False, f"Truncated payload length at height {height}", None
                     payload_len = struct.unpack(">I", len_data)[0]
                     payload_data = f.read(payload_len)
                     if len(payload_data) < payload_len:
-                        return False, f"Truncated payload at height {height}"
+                        return False, f"Truncated payload at height {height}", None
 
                     if sha256(payload_data) != header.payload_hash:
-                        return False, f"Payload tampered at height {height}"
+                        return False, f"Payload tampered at height {height}", None
 
                     prev_hash = sha256(header_data)
                     height += 1
+                    end_offset = f.tell()
 
         except Exception as e:
-            return False, f"Verification error: {e}"
+            return False, f"Verification error: {e}", None
 
-        return True, f"Fork {fork_id} valid ({height} blocks)"
+        new_resume = {
+            "offset": end_offset,
+            "height": height,
+            "prev_hash": prev_hash,
+            "height_offset": height_offset,
+        }
+        return True, f"Fork {fork_id} valid ({height} blocks)", new_resume
 
     def verify_all(self) -> tuple[bool, list[str]]:
         """Verify all forks. Returns (all_valid, list_of_results)."""
