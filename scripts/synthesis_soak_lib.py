@@ -561,7 +561,9 @@ async def _tool_preflight(client: httpx.AsyncClient, api_base: str,
     async def _cov() -> int:
         try:
             r = await client.get(f"{api_base}/v6/synthesis/skills/coverage")
-            return int(((r.json() or {}).get("coverage") or {}).get("total_tool_call_txs", 0))
+            # skills/coverage returns a flat {denominator, numerator, ...} shape
+            # (the `coverage.total_tool_call_txs` wrapper is on oracles/coverage).
+            return int((r.json() or {}).get("denominator", 0))
         except Exception:
             return -1
     before = await _cov()
