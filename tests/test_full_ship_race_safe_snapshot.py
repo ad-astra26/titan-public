@@ -21,15 +21,23 @@ from titan_hcl.logic import backup_event_tarball
 
 
 def test_encode_diff_returns_owned_snapshot_not_source(tmp_path):
-    """patch_path must NOT be the source path — it must be a snapshot."""
+    """patch_path must NOT be the source path — it must be a snapshot.
+
+    2026-05-29: the snapshot must also live OUTSIDE the source directory
+    (in a .bksnap_scratch dir), so a leaked snapshot can never be
+    re-snapshotted by the next event's directory walk — the exponential
+    blowup that produced 340,445 orphan hardlinks / 358 GB phantom scope.
+    """
     source = tmp_path / "rolling_source.json"
     source.write_text('{"x": 1}')
     dd = full_ship.encode_diff(str(source))
     assert dd["patch_path"] != str(source)
     assert dd["patch_owned"] is True
-    # Snapshot file exists; sits in the same directory as source.
     assert os.path.exists(dd["patch_path"])
-    assert os.path.dirname(dd["patch_path"]) == str(tmp_path)
+    # Snapshot is OUT of the source dir (regression guard for the orphan blowup).
+    assert os.path.dirname(dd["patch_path"]) != str(tmp_path)
+    assert full_ship._SCRATCH_DIRNAME in dd["patch_path"]
+    assert full_ship.BKSNAP_MARKER in os.path.basename(dd["patch_path"])
 
 
 def test_snapshot_survives_source_deletion(tmp_path):
@@ -150,6 +158,37 @@ def test_pack_event_tarball_skips_missing_patch_path_no_raise(tmp_path):
     assert info["files_skipped_vanished"] == 1      # patch_path-vanished guard fired
     assert "good.json" in info["packed_arc_names"]
     assert "vanished.json" not in info["packed_arc_names"]
+
+
+def test_sweep_orphan_snapshots_removes_aged_orphans(tmp_path):
+    """sweep_orphan_snapshots removes aged .bksnap orphans from the scratch
+    dir while leaving canonical sources (and fresh in-flight snapshots)
+    untouched. Hardlink removal must not affect the source inode."""
+    import time as _t
+
+    data_root = tmp_path / "data"
+    src_dir = data_root / "neural_nervous_system"
+    src_dir.mkdir(parents=True)
+    source = src_dir / "reward_log.jsonl"
+    source.write_text("real data")
+
+    # Encode → creates an owned snapshot in data/.bksnap_scratch.
+    dd = full_ship.encode_diff(str(source))
+    assert os.path.exists(dd["patch_path"])
+    scratch = data_root / full_ship._SCRATCH_DIRNAME
+    assert scratch.is_dir()
+
+    # Fresh snapshot (age 0) must survive a sweep with a 1h floor.
+    assert full_ship.sweep_orphan_snapshots(str(data_root), max_age_s=3600.0) == 0
+    assert os.path.exists(dd["patch_path"])
+
+    # Age it past the floor → swept; canonical source untouched.
+    old = _t.time() - 7200
+    os.utime(dd["patch_path"], (old, old))
+    removed = full_ship.sweep_orphan_snapshots(str(data_root), max_age_s=3600.0)
+    assert removed == 1
+    assert not os.path.exists(dd["patch_path"])
+    assert source.exists() and source.read_text() == "real data"
 
 
 def test_full_ship_roundtrip_unchanged(tmp_path):
