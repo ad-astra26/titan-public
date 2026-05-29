@@ -16,7 +16,6 @@ status via state.mark_phase, and halts on any 'fail' Result.
 """
 from __future__ import annotations
 
-import getpass
 import os
 import subprocess
 import sys
@@ -30,7 +29,6 @@ from .comms import run_comms_phase
 from .config_seed import run_config_seed_phase
 from .inference import run_inference_phase
 from .genesis_runner import run_genesis_phase
-from .observatory import run_observatory_phase
 from .systemd_runner import run_systemd_phase
 from .modes import Mode, spec_for
 from .preflight import Result, summarize
@@ -215,15 +213,12 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
         (PhaseDef("phase_4", "Inference autodetect", "W1.c", None),
          lambda: run_inference_phase(default=default, install_root=install_root)),
         (PhaseDef("phase_5", "Comms (Telegram / X / Observatory)", "W1.d", None),
-         lambda: run_comms_phase(default=default, state=state)),
+         lambda: run_comms_phase(default=default)),
         (PhaseDef("phase_6", "Genesis ceremony", "W1.b", None),
          lambda: ([Result("genesis", "warn", "--skip-genesis requested.")] if skip_genesis
                   else run_genesis_phase(install_root, mode, venv_python=venv_python(install_root)))),
         (PhaseDef("phase_7", "Systemd install + first start + health", "W1.e", None),
          lambda: run_systemd_phase(state, install_root, mode, default=default)),
-        (PhaseDef("phase_obs", "Observatory web UI (opt-in)", "W1.d", None),
-         lambda: run_observatory_phase(state, install_root, tag=tag or "main",
-                                       user=getpass.getuser())),
     ]
 
     for phase, run in phases:
