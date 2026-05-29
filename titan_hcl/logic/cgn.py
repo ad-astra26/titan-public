@@ -824,11 +824,16 @@ class ConceptGroundingNetwork:
 
     # ── SOAR Impasse Detection ─────────────────────────────────────────
 
-    def detect_impasse(self, consumer: str) -> Optional[dict]:
+    def detect_impasse(self, consumer: str,
+                       form_hypothesis: bool = True) -> Optional[dict]:
         """SOAR-inspired impasse detection for a consumer.
 
         Returns impasse dict or None. When impasse is detected AND
-        HAOV tracker exists, generates targeted hypothesis.
+        ``form_hypothesis`` AND a HAOV tracker exists, generates a targeted
+        hypothesis (the SOAR→HAOV bridge). Pass ``form_hypothesis=False`` for a
+        pure, side-effect-free check (used by the generic impasse-resolution
+        verifier `verify_impasse_resolution`, which must not spawn new
+        hypotheses while confirming an existing one).
 
         Impasse types:
           stuck — no positive reward in recent window (reasoning)
@@ -847,7 +852,7 @@ class ConceptGroundingNetwork:
             severity = 1.0 - (len([t for t in recent if t.reward > 0.01]) / len(recent))
             result = {"type": "stuck", "severity": severity, "consumer": consumer}
             # SOAR → HAOV bridge: generate subgoal hypothesis
-            if consumer in self._haov_trackers:
+            if form_hypothesis and consumer in self._haov_trackers:
                 self._haov_trackers[consumer].hypothesize_from_impasse(result)
             return result
 
@@ -861,7 +866,7 @@ class ConceptGroundingNetwork:
             if max(dominant_rewards) - min(dominant_rewards) < 0.02:
                 result = {"type": "plateau", "concept": dominant[0],
                           "consumer": consumer, "repetitions": dominant[1]}
-                if consumer in self._haov_trackers:
+                if form_hypothesis and consumer in self._haov_trackers:
                     self._haov_trackers[consumer].hypothesize_from_impasse(result)
                 return result
 
@@ -878,6 +883,38 @@ class ConceptGroundingNetwork:
                 return result
 
         return None
+
+    def verify_impasse_resolution(self, consumer: str,
+                                  impasse_type: str) -> Tuple[bool, float]:
+        """Generic in-process verifier for impasse-sourced HAOV hypotheses.
+
+        An impasse hypothesis (`source="soar_impasse"`, rule
+        `<consumer>_impasse_<type>`) predicts the impasse will resolve. It is
+        consumer-AGNOSTIC and answerable directly from the CGN transition
+        buffer — no bus round-trip, no per-consumer verifier module. This is the
+        SPEC-correct home for impasse verification per
+        `rFP_haov_efficacy_closure` (the per-consumer bus verifiers —
+        language/knowledge/emot_cgn — handle only topic-ful concept-grounding
+        hypotheses). It replaces the dead `_HAOV_DEST_MAP → "spirit"` routing
+        that black-holed verification for 6 consumers after the spirit
+        retirement.
+
+        Confirmed (with a recovery-magnitude reward) when the consumer is no
+        longer in the impasse type that spawned the hypothesis; falsified
+        (reward 0) while it persists. Uses a side-effect-free
+        ``detect_impasse(form_hypothesis=False)`` so verification never spawns
+        fresh hypotheses.
+        """
+        current = self.detect_impasse(consumer, form_hypothesis=False)
+        if current is None or current.get("type") != impasse_type:
+            # Impasse cleared (or morphed to a different type) → resolved.
+            recent = self._buffer.get_consumer_transitions(consumer, max_count=20)
+            rewarded = [t for t in recent if t.reward > 0.05]
+            reward = ((sum(t.reward for t in rewarded) / len(rewarded))
+                      if rewarded else 0.3)
+            return True, min(1.0, max(0.1, reward))
+        # Still in the same impasse → prediction not (yet) borne out.
+        return False, 0.0
 
     # ── Social Policy Inference ──────────────────────────────────────────
 
