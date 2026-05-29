@@ -275,17 +275,10 @@ class TestChunk8M5SnapshotShmFallback(unittest.TestCase):
         self.assertEqual(topo.get("observables_30d"), [0.0] * 30)
         self.assertIn("head", topo.get("observables_dict", {}))
 
-    def test_trinity_snapshot_uses_shm_when_engines_none(self):
-        from titan_hcl.logic.snapshot_builders import build_trinity_snapshot
-        snap = build_trinity_snapshot({
-            "coordinator": _StubCoord(),
-            "body_state": {"values": [0.5] * 5},
-            "mind_state": {"values": [0.5] * 5},
-            "consciousness": None,
-        }, {})
-        self.assertIn("sphere_clock", snap)
-        self.assertIn("unified_spirit", snap)
-        self.assertEqual(snap["self_162d"]["journey"]["curvature"], 0.1)
+    # test_trinity_snapshot_uses_shm_when_engines_none REMOVED (D-SPEC-143):
+    # build_trinity_snapshot was deleted — it fed an orphaned 4Hz cache (no
+    # reader). The dashboard now serves trinity SHM-direct via TitanStateAccessor
+    # (/v6/trinity/* → trinity_state.bin), covered by the api readout tests.
 
 
 # ─────────────────────────────────────────────────────────────────────
