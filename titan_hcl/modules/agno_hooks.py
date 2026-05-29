@@ -894,7 +894,7 @@ def create_pre_hook(plugin):
         if ("gatekeeper_state" in active_features and plugin.gatekeeper is not None
                 and hasattr(plugin.gatekeeper, "decide_execution_mode_from_prompt")):
             try:
-                mode, adv, text, obs_vec = plugin.gatekeeper.decide_execution_mode_from_prompt(
+                mode, adv, text, obs_vec = await plugin.gatekeeper.decide_execution_mode_from_prompt(
                     prompt_text)
                 plugin._last_observation_vector = obs_vec
             except Exception as _gk_err:
@@ -1217,7 +1217,7 @@ def create_pre_hook(plugin):
                     import httpx as _cgn_httpx
                     import asyncio as _cgn_asyncio
                     _cgn_resp = await _cgn_asyncio.to_thread(
-                        lambda: _cgn_httpx.get("http://127.0.0.1:7777/v4/language-grounding", timeout=3))
+                        lambda: _cgn_httpx.get("http://127.0.0.1:7777/v6/language/grounding", timeout=3))
                     if _cgn_resp.status_code == 200:
                         _cgn = _cgn_resp.json().get("data", {})
                         _grounded = _cgn.get("grounded", 0)
@@ -1314,7 +1314,7 @@ def create_pre_hook(plugin):
                             }
                             _cgn_resp = await _cgn_asyncio.to_thread(
                                 lambda: _cgn_httpx.get(
-                                    "http://127.0.0.1:7777/v4/cgn-social-action",
+                                    "http://127.0.0.1:7777/v6/cognition/cgn-social-action",
                                     params=_cgn_params, timeout=3))
                             if _cgn_resp.status_code == 200:
                                 _cgn_data = _cgn_resp.json().get("data", {})

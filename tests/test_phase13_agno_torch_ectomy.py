@@ -27,13 +27,17 @@ def test_prehook_no_local_encode_or_projection():
 
 def test_prehook_uses_host_side_decide():
     src = _src("titan_hcl/modules/agno_hooks.py")
-    assert "decide_execution_mode_from_prompt(" in src, \
-        "agno must route the gatekeeper encode host-side via the proxy"
+    # Must AWAIT it — the agno-side bus is async-only (_WorkerBusClient has no
+    # sync `request`); a non-awaited/sync call regressed it (2026-05-29).
+    assert "await plugin.gatekeeper.decide_execution_mode_from_prompt(" in src, \
+        "agno must AWAIT the host-side gatekeeper decide (async work-RPC, G19)"
 
 
 def test_rl_proxy_has_host_side_method():
     src = _src("titan_hcl/proxies/rl_proxy.py")
-    assert "def decide_execution_mode_from_prompt(" in src
+    # Must be async + use request_async — the agno bus (_WorkerBusClient) has NO
+    # sync `request`; the sync path failed every chat with AttributeError.
+    assert "async def decide_execution_mode_from_prompt(" in src
     assert "encode_host_side" in src
 
 

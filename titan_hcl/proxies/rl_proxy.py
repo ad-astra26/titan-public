@@ -182,24 +182,28 @@ class RLProxy:
             body.get("decoded_text", "") or "",
         )
 
-    def decide_execution_mode_from_prompt(self, raw_prompt: str) -> tuple:
+    async def decide_execution_mode_from_prompt(self, raw_prompt: str) -> tuple:
         """Phase 13 §3J.3 (torch-ectomy agno): host-side encode + decide.
 
         Sends ONLY the raw prompt; the recorder (a torch-host) does the embed +
         projection + decision, so the CALLER (agno) carries no torch. Returns
         (mode, advantage, decoded_text, observation_vector) — the 3072-d obs is
         returned so the caller's post-hook RL recording keeps the real obs.
-        Hard-fail → ("Shadow", 0.0, "", None) so the chat path never breaks."""
+        Hard-fail → ("Shadow", 0.0, "", None) so the chat path never breaks.
+
+        ASYNC work-RPC (G19): uses `request_async` — the agno-side bus is a
+        `_WorkerBusClient` which exposes NO sync `request`; calling it from the
+        async pre-hook also must never block the event loop. Mirrors `dream()`."""
         self._ensure_started()
-        reply = self._bus.request(
+        reply = await self._bus.request_async(
             "rl_proxy", "recorder",
             {
                 "action": "decide_execution_mode",
                 "encode_host_side": True,
                 "raw_prompt": raw_prompt,
             },
-            timeout=self._GATE_TIMEOUT_S,
-            reply_queue=self._reply_queue,
+            self._GATE_TIMEOUT_S,
+            self._reply_queue,
         )
         if not reply:
             logger.warning("[RLProxy] decide_from_prompt timeout — Shadow fallback")
