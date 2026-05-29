@@ -246,13 +246,6 @@ class PostDispatchOrchestrator:
         dreaming_block = bank.read_dream_state() or {}
         expression_payload = bank.read_expression_state() or {}
         mind = bank.read_mind_state() or {}
-        # MSL self-model slot (msl_state.bin, published by cognitive_worker
-        # via MSLStatePublisher). The CANONICAL source for I-confidence +
-        # concept confidences — mind_state does NOT carry them (i_confidence
-        # was read from `mind` → always 0.0 → posts publicly reported
-        # "I-confidence: 0.000" while the real grounded value is ~0.95).
-        # 2026-05-29 fix; same class as the sovereignty=0.0 live-signal gap.
-        msl = bank.read_msl_state() or {}
         lang = bank.read_language_state() or {}
         social_perception = bank.read_social_perception_state() or {}
         # D-SPEC-85 v1.25.0 — consciousness_age slot carries Titan's
@@ -303,9 +296,9 @@ class PostDispatchOrchestrator:
         drift = float(unified.get("last_drift", 0.0) or 0.0)
         trajectory = float(unified.get("last_trajectory", 0.0) or 0.0)
 
-        i_confidence = float(msl.get("i_confidence", 0.0) or 0.0)
+        i_confidence = float(mind.get("i_confidence", 0.0) or 0.0)
         concept_confidences = dict(
-            msl.get("concept_confidences") or {})
+            mind.get("concept_confidences") or {})
         attention_entropy = float(
             mind.get("attention_entropy", 0.0) or 0.0)
 
