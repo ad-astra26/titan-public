@@ -11375,7 +11375,7 @@ async def get_v4_developmental_timeline(request: Request, days: int = 30):
     def _fetch():
         tc = _get_cached_tc()
         blocks = tc.query_blocks(
-            thought_type="genesis", fork_id=tc.resolve_fork_id("main"),
+            thought_type="genesis", fork_id=0,
             limit=min(days * 10, 500))
         timeline = []
         for b in blocks:
@@ -11435,7 +11435,7 @@ async def get_v4_timechain_contracts(request: Request,
     def _fetch():
         tc = _get_cached_tc()
         blocks = tc.query_blocks(
-            thought_type="contract_deploy", fork_id=tc.resolve_fork_id("meta"), limit=200)
+            thought_type="contract_deploy", fork_id=4, limit=200)
         seen = {}
         for b in blocks:
             try:
@@ -11529,7 +11529,7 @@ async def get_v4_contracts_pending(request: Request):
     def _fetch():
         tc = _get_cached_tc()
         blocks = tc.query_blocks(
-            thought_type="contract_deploy", fork_id=tc.resolve_fork_id("meta"), limit=200)
+            thought_type="contract_deploy", fork_id=4, limit=200)
         pending = []
         for b in blocks:
             try:
@@ -11659,12 +11659,8 @@ async def get_v4_timechain_verify_block(request: Request, height: int):
     """
     try:
         tc = _get_cached_tc()
-        # Phase 14 / INV-Syn-26 — resolve the conversation fork by NAME
-        # chain-locally (its id is 5 on T1 but chain-local elsewhere).
-        conversation_fork_id = tc.resolve_fork_id("conversation")
-        if conversation_fork_id is None:
-            return _error("conversation fork not present on this chain", code=404)
-        block = tc.get_block(conversation_fork_id, height)
+        from titan_hcl.logic.timechain import FORK_CONVERSATION
+        block = tc.get_block(FORK_CONVERSATION, height)
         if not block:
             return _error(f"Conversation block #{height} not found", code=404)
 
@@ -11687,7 +11683,7 @@ async def get_v4_timechain_verify_block(request: Request, height: int):
             "genesis_hash": status.get("genesis_hash", ""),
             "merkle_root": status.get("merkle_root", ""),
             "fork": "conversation",
-            "fork_id": conversation_fork_id,
+            "fork_id": FORK_CONVERSATION,
         })
     except Exception as e:
         logger.error("[Dashboard] /v4/timechain/verify/%d error: %s", height, e)

@@ -307,12 +307,6 @@ class TimeChain:
         # Fork tip cache: fork_id -> (height, hash)
         self._fork_tips: dict[int, tuple[int, bytes]] = {}
 
-        # Phase 14 / INV-Syn-26 — chain-local fork NAME → id index. Fork ids are
-        # local to this chain's fork_registry; this is the sole sanctioned
-        # name→id authority (see resolve_fork_id). Built in _load_fork_state,
-        # kept in lock-step on every primary (re)seed + sidechain create.
-        self._fork_name_to_id: dict[str, int] = {}
-
         # Tag frequency tracking for auto-sidechain
         self._tag_counts: dict[int, dict[str, int]] = {}
 
@@ -326,13 +320,37 @@ class TimeChain:
         # Load fork registry and tip state from index
         self._load_fork_state()
 
-        # Phase 14 / INV-Syn-26 — idempotent, additive (re)seed of every primary
-        # fork on EVERY boot. Materializes any primary missing from this chain's
-        # fork_registry (e.g. the `conversation` fork on chains born before
-        # FORK_CONVERSATION=5 existed, where a genesis-era sidechain grabbed slot
-        # 5) at the next free id, NEVER clobbering an occupant. Generalizes the
-        # former B.1 system-fork-only migration (FORK_SYSTEM is in FORK_NAMES).
-        self._register_primary_forks(time.time())
+        # Microkernel v2 Phase B.1 §10 — idempotent system-fork migration
+        # for existing chains created before FORK_SYSTEM was added.
+        # No-op for chains where it's already registered (genesis path
+        # auto-registers all FORK_NAMES).
+        self._ensure_system_fork_registered()
+
+    def _ensure_system_fork_registered(self):
+        """Idempotent registration of FORK_SYSTEM for existing chains.
+
+        New chains (genesis path) auto-register all FORK_NAMES via
+        _register_primary_forks. This method covers chains that
+        existed before FORK_SYSTEM was added (T1/T2/T3 in production).
+        Safe to call repeatedly — INSERT OR IGNORE.
+        """
+        if FORK_SYSTEM in self._fork_tips:
+            return
+        conn = sqlite3.connect(str(self._index_db_path))
+        try:
+            ts = time.time()
+            conn.execute("""
+                INSERT OR IGNORE INTO fork_registry
+                (fork_id, fork_name, fork_type, parent_fork, parent_block,
+                 created_at, tip_height, tip_hash, topic, compacted)
+                VALUES (?, ?, 'primary', 0, 0, ?, -1, NULL, NULL, 0)
+            """, (FORK_SYSTEM, FORK_NAMES[FORK_SYSTEM], ts))
+            conn.commit()
+            self._fork_tips[FORK_SYSTEM] = (-1, GENESIS_PREV_HASH)
+            logger.info("[TimeChain] FORK_SYSTEM (id=%d) registered "
+                        "(B.1 substrate-event fork)", FORK_SYSTEM)
+        finally:
+            conn.close()
 
     # ── Database Init ──────────────────────────────────────────────────
 
@@ -547,15 +565,6 @@ class TimeChain:
                     except Exception:
                         pass
                 self._tag_counts[fork_id] = counts
-
-            # Phase 14 / INV-Syn-26 — build the chain-local fork NAME → id index
-            # from the authoritative fork_registry (covers primaries AND
-            # sidechains). resolve_fork_id() reads this in O(1).
-            self._fork_name_to_id = {
-                name: fid for fid, name in conn.execute(
-                    "SELECT fork_id, fork_name FROM fork_registry"
-                ).fetchall()
-            }
         finally:
             conn.close()
 
@@ -626,111 +635,21 @@ class TimeChain:
         return block
 
     def _register_primary_forks(self, created_at: float):
-        """Idempotently, additively (re)seed every primary fork by NAME.
-
-        Phase 14 / INV-Syn-26. Fork ids are CHAIN-LOCAL. For each canonical
-        primary in FORK_NAMES:
-          - a row with that fork_name already exists → keep it (idempotent), at
-            its canonical id OR a previously-relocated one;
-          - its canonical id is FREE → create the primary there (the happy path
-            for a freshly-born chain);
-          - its canonical id is OCCUPIED by a DIFFERENT fork (a genesis-era
-            sidechain that grabbed the slot before the constant existed) →
-            create the primary at the NEXT FREE id and record the real id.
-
-        NEVER updates or deletes an occupant — sovereign data (INV-3 /
-        directive_memory_preservation). This is the additive self-heal that
-        finally materializes the `conversation` fork on chains (T2/T3) born
-        before FORK_CONVERSATION=5 existed. Safe to call on every boot.
-        """
+        """Register the 5 primary forks in the fork registry."""
         conn = sqlite3.connect(str(self._index_db_path))
         try:
-            existing = conn.execute(
-                "SELECT fork_id, fork_name FROM fork_registry"
-            ).fetchall()
-            name_to_id = {name: fid for fid, name in existing}
-            occupied_ids = {fid for fid, _ in existing}
-
-            for canonical_id, fork_name in FORK_NAMES.items():
-                if fork_name in name_to_id:
-                    # Present already (canonical or relocated id) — idempotent keep.
-                    fid = name_to_id[fork_name]
-                else:
-                    if canonical_id not in occupied_ids:
-                        fid = canonical_id
-                    else:
-                        # Canonical slot taken by a non-primary fork; relocate
-                        # additively to the next free id (never clobber).
-                        fid = max(FORK_SIDECHAIN_START, max(occupied_ids) + 1)
-                        logger.warning(
-                            "[TimeChain] primary fork '%s' canonical id=%d "
-                            "occupied; reseeding at next free id=%d "
-                            "(chain-local, INV-Syn-26)",
-                            fork_name, canonical_id, fid)
-                    conn.execute("""
-                        INSERT INTO fork_registry
-                        (fork_id, fork_name, fork_type, parent_fork, parent_block,
-                         created_at, tip_height, tip_hash, topic, compacted)
-                        VALUES (?, ?, 'primary', 0, 0, ?, -1, NULL, NULL, 0)
-                    """, (fid, fork_name, created_at))
-                    occupied_ids.add(fid)
-                    name_to_id[fork_name] = fid
-                    logger.info(
-                        "[TimeChain] primary fork '%s' registered at id=%d",
-                        fork_name, fid)
-
-                # Keep the in-memory caches in lock step.
-                self._fork_name_to_id[fork_name] = fid
-                if fid not in self._fork_tips:
-                    self._fork_tips[fid] = (-1, GENESIS_PREV_HASH)
+            for fork_id, fork_name in FORK_NAMES.items():
+                conn.execute("""
+                    INSERT OR IGNORE INTO fork_registry
+                    (fork_id, fork_name, fork_type, parent_fork, parent_block,
+                     created_at, tip_height, tip_hash, topic, compacted)
+                    VALUES (?, ?, 'primary', 0, 0, ?, -1, NULL, NULL, 0)
+                """, (fork_id, fork_name, created_at))
+                if fork_id not in self._fork_tips:
+                    self._fork_tips[fork_id] = (-1, GENESIS_PREV_HASH)
             conn.commit()
         finally:
             conn.close()
-
-    # ── Chain-local fork resolution (Phase 14 / INV-Syn-26) ─────────────
-
-    def resolve_fork_id(self, name: str) -> Optional[int]:
-        """Resolve a fork NAME to its chain-local id (INV-Syn-26).
-
-        Fork ids are chain-local; this is the SOLE sanctioned name→id authority
-        for primary forks (and works for sidechain names too). O(1) from the
-        in-memory index, with a one-shot SQLite fallback that warms the cache on
-        a miss. Returns None for an unknown name — the caller decides the
-        fallback (NEVER substitute a hardcoded FORK_* int).
-        """
-        fid = self._fork_name_to_id.get(name)
-        if fid is not None:
-            return fid
-        conn = sqlite3.connect(str(self._index_db_path))
-        try:
-            row = conn.execute(
-                "SELECT fork_id FROM fork_registry WHERE fork_name = ? LIMIT 1",
-                (name,)
-            ).fetchone()
-        finally:
-            conn.close()
-        if row is not None:
-            self._fork_name_to_id[name] = row[0]
-            return row[0]
-        return None
-
-    def resolve_fork_name(self, fork_id: int) -> Optional[str]:
-        """Reverse of resolve_fork_id — chain-local id → name via fork_registry."""
-        for name, fid in self._fork_name_to_id.items():
-            if fid == fork_id:
-                return name
-        conn = sqlite3.connect(str(self._index_db_path))
-        try:
-            row = conn.execute(
-                "SELECT fork_name FROM fork_registry WHERE fork_id = ? LIMIT 1",
-                (fork_id,)
-            ).fetchone()
-        finally:
-            conn.close()
-        if row is not None:
-            self._fork_name_to_id[row[0]] = fork_id
-            return row[0]
-        return None
 
     @property
     def has_genesis(self) -> bool:
@@ -1404,8 +1323,6 @@ class TimeChain:
             conn.commit()
 
             self._fork_tips[new_id] = (-1, self.genesis_hash)
-            # Phase 14 / INV-Syn-26 — keep the chain-local name→id index current.
-            self._fork_name_to_id[f"topic:{topic}"] = new_id
             logger.info("[TimeChain] Auto-sidechain created: fork=%d topic=%s "
                        "parent=%d", new_id, topic, parent_fork)
             return new_id
@@ -1707,8 +1624,8 @@ class TimeChain:
             conn.execute("PRAGMA synchronous=NORMAL")
 
             # 2. Wipe stale block_index + checkpoints. Leave fork_registry
-            #    intact — _register_primary_forks is idempotent + additive so
-            #    it's safe whether rows exist or not (Phase 14 / INV-Syn-26).
+            #    intact — _register_primary_forks below uses INSERT OR IGNORE
+            #    so it's safe whether rows exist or not.
             conn.executescript(
                 "DELETE FROM block_index; DELETE FROM checkpoints;"
             )
@@ -1717,25 +1634,26 @@ class TimeChain:
             # 3. Reset in-memory state
             self._total_blocks = 0
             self._fork_tips = {}
-        finally:
-            conn.close()
 
-        # 4. Ensure all primary forks are registered (idempotent + additive,
-        #    chain-local per INV-Syn-26 — relocates a primary whose canonical
-        #    id is occupied rather than silently skipping it). Without this,
-        #    fresh DBs (post-corruption + recreate) would only have FORK_SYSTEM
-        #    in fork_registry, leaving _load_fork_state blind to forks 0..5
-        #    even with their blocks indexed in block_index. Maintains the
-        #    chain-local name→id index too.
-        self._register_primary_forks(time.time())
+            # 4. Ensure all primary forks are registered (idempotent).
+            #    Without this, fresh DBs (post-corruption + recreate)
+            #    would only have FORK_SYSTEM in fork_registry, leaving
+            #    _load_fork_state blind to forks 0..5 even with their
+            #    blocks indexed in block_index.
+            now = time.time()
+            for fork_id, fork_name in FORK_NAMES.items():
+                conn.execute(
+                    "INSERT OR IGNORE INTO fork_registry "
+                    "(fork_id, fork_name, fork_type, parent_fork, parent_block, "
+                    " created_at, tip_height, tip_hash, topic, compacted) "
+                    "VALUES (?, ?, 'primary', 0, 0, ?, -1, NULL, NULL, 0)",
+                    (fork_id, fork_name, now),
+                )
+                if fork_id not in self._fork_tips:
+                    self._fork_tips[fork_id] = (-1, GENESIS_PREV_HASH)
+            conn.commit()
 
-        # 5. Re-open the bulk-load connection for the block scan.
-        conn = sqlite3.connect(str(self._index_db_path))
-        try:
-            conn.execute("PRAGMA busy_timeout=10000")
-            conn.execute("PRAGMA synchronous=NORMAL")
-
-            # 6. Scan all chain files into memory, collecting INSERT rows
+            # 5. Scan all chain files into memory, collecting INSERT rows
             #    + tracking max-height per fork.
             block_rows: list[tuple] = []
             tip_per_fork: dict[int, tuple[int, bytes]] = {}
