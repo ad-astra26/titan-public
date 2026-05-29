@@ -1,19 +1,13 @@
 """titan_hcl/logic/snapshot_builders.py — observatory snapshot builders.
 
 rFP §3G Phase 10E — relocated out of the retiring ``modules/spirit_loop.py``.
-Builds the coordinator observatory snapshot from the IN-PROCESS engine objects
-passed via ``state_refs`` (coordinator.get_stats() etc.) — NOT pure SHM reads,
-so it must run in the process that owns those engines. cognitive_worker (the
-post-D8-3 consciousness + engine owner) drives it: it calls
-``start_snapshot_builder_threads`` at boot (the coord thread keeps
-``_COORD_SNAPSHOT_CACHE`` warm + publishes the ``*_UPDATED`` bus events via
-``_publish_coord_subdomains`` + the SHM spirit-state publisher tick).
-
-D-SPEC-143 profiling (2026-05-29): the former trinity + nervous-system 4 Hz
-builders were REMOVED — they were orphaned (only reader was spirit_worker's
-retired QueryThread; the dashboard reads trinity/NS SHM-direct via
-TitanStateAccessor per G18) and were cognitive_worker's #1 CPU consumer. Only
-the coordinator builder (2.5s, live bus fan-out) remains.
+These build the coordinator / trinity / nervous-system observatory snapshots
+from the IN-PROCESS engine objects passed via ``state_refs`` (coordinator
+.get_stats() etc.) — they are NOT pure SHM reads, so they must run in the
+process that owns those engines. cognitive_worker (the post-D8-3 consciousness
++ engine owner) drives them: it calls ``start_snapshot_builder_threads`` at boot
+(the threads keep the ``_*_SNAPSHOT_CACHE`` dicts warm + publish ``*_UPDATED``
+bus events + the SHM spirit-state publisher tick).
 
 (The RFP originally named observatory_worker as the home, but that is a separate
 process with no access to cognitive_worker's in-process engine objects — see
@@ -34,19 +28,24 @@ logger = logging.getLogger(__name__)
 
 
 _COORD_SNAPSHOT_CACHE: dict = {"data": None, "ts": 0.0}
-# _TRINITY_SNAPSHOT_CACHE / _NS_SNAPSHOT_CACHE removed (D-SPEC-143 profiling) —
-# their 4 Hz builders were orphaned (reader = retired spirit_worker QueryThread;
-# dashboard reads SHM-direct). See start_snapshot_builder_threads.
+_TRINITY_SNAPSHOT_CACHE: dict = {"data": None, "ts": 0.0}
+_NS_SNAPSHOT_CACHE: dict = {"data": None, "ts": 0.0}
 
 # Builder thread cadence: seconds of sleep BETWEEN builds (cycle ≈ build_time + interval).
 # Coord build is heaviest (~1-1.5s observed on T1), so 2.5s gives ~4s cycle.
+# Trinity + NS builds are fast (<50ms) so 0.25s gives sub-second cycle.
 _COORD_SNAPSHOT_BUILDER_INTERVAL = 2.5
+_TRINITY_SNAPSHOT_BUILDER_INTERVAL = 0.25
+_NS_SNAPSHOT_BUILDER_INTERVAL = 0.25
 _SPIRIT_STATE_PUBLISHER_INTERVAL = 1.0  # SPEC §7.1 — 1 Hz for hormone_fires/impulse_engine_state/consciousness_state slots (rFP_phase_c_async_shm_consumer_migration §4.B.1)
 _SNAPSHOT_BUILDER_ERROR_BACKOFF = 2.0  # sleep on exception (avoid CPU burn + log flood)
 
-# Legacy TTL kept as compatibility shim for the coord QueryThread cold-boot
-# window. (Trinity/NS TTLs removed with their orphaned builders — D-SPEC-143.)
+# Legacy TTL kept as compatibility shim for the QueryThread fast-path in
+# spirit_worker.py (still used for cold-boot window before builder populates
+# cache). Effectively unused once builders are running.
 _COORD_SNAPSHOT_TTL = 30.0
+_TRINITY_SNAPSHOT_TTL = 30.0
+_NS_SNAPSHOT_TTL = 30.0
 
 
 def build_coordinator_snapshot(state_refs: dict) -> dict | None:
@@ -425,6 +424,113 @@ def build_coordinator_snapshot(state_refs: dict) -> dict | None:
     return _sanitize_dict_keys(stats)
 
 
+def build_trinity_snapshot(state_refs: dict, config: dict) -> dict:
+    """Build the trinity stats dict. Always returns a dict (uses defaults if refs missing)."""
+    body_state = state_refs.get("body_state", {})
+    mind_state = state_refs.get("mind_state", {})
+    consciousness = state_refs.get("consciousness")
+    filter_down = state_refs.get("filter_down")
+    intuition = state_refs.get("intuition")
+    impulse_engine = state_refs.get("impulse_engine")
+    sphere_clock = state_refs.get("sphere_clock")
+    resonance = state_refs.get("resonance")
+    unified_spirit = state_refs.get("unified_spirit")
+    inner_state = state_refs.get("inner_state")
+    spirit_state = state_refs.get("spirit_state")
+
+    # Phase 10D consumer-fix: spirit 5D tensor from the Rust trinity SHM slot
+    # (full_130dt[:5] = WHO/WHY/WHAT + body/mind scalars), the canonical live
+    # source — replaces the retired _collect_spirit_tensor (deleted in 10D).
+    # Falls back to neutral 5D if SHM unavailable (cold boot / no bank).
+    tensor = [0.5] * 5
+    _bank = state_refs.get("_shm_reader_bank")
+    if _bank is not None:
+        try:
+            _tri = _bank.read_trinity() or {}
+            _full = _tri.get("full_130dt") or []
+            if len(_full) >= 5:
+                tensor = [float(x) for x in _full[:5]]
+        except Exception:
+            pass
+    response = {
+        "spirit_tensor": tensor,
+        "body_values": body_state.get("values", [0.5] * 5),
+        "mind_values": mind_state.get("values", [0.5] * 5),
+        "body_center_dist": body_state.get("center_dist", 0),
+        "mind_center_dist": mind_state.get("center_dist", 0),
+    }
+    if consciousness and consciousness.get("latest_epoch"):
+        response["consciousness"] = consciousness["latest_epoch"]
+    try:
+        from titan_hcl.logic.middle_path import middle_path_loss
+        body_vals = body_state.get("values", [0.5] * 5)
+        mind_vals = mind_state.get("values", [0.5] * 5)
+        response["middle_path_loss"] = round(
+            middle_path_loss(body_vals, mind_vals, tensor), 4)
+    except Exception as _swallow_exc:
+        swallow_warn('[modules.spirit_loop] build_trinity_snapshot: from titan_hcl.logic.middle_path import middle_path_loss', _swallow_exc,
+                     key='modules.spirit_loop.build_trinity_snapshot.line1709', throttle=100)
+    if filter_down:
+        response["filter_down"] = filter_down.get_stats()
+    if intuition:
+        response["intuition"] = intuition.get_stats()
+    if impulse_engine:
+        response["impulse_engine"] = impulse_engine.get_stats()
+    if sphere_clock:
+        response["sphere_clock"] = sphere_clock.get_stats()
+    if resonance:
+        response["resonance"] = resonance.get_stats()
+    if unified_spirit:
+        response["unified_spirit"] = unified_spirit.get_stats()
+    # chunk 8M.5 — shm-fallback path under l0_rust_enabled=true. Engines
+    # above are None in that mode (titan-trinity-rs / titan-unified-spirit-rs
+    # own the truth); cognitive_worker has injected shm-read snapshots
+    # onto the coordinator. Apply when the legacy block didn't populate.
+    coordinator = state_refs.get("coordinator")
+    if coordinator is not None:
+        if "sphere_clock" not in response:
+            _sc = getattr(coordinator, "_sphere_clocks_snapshot", None)
+            if _sc is not None:
+                response["sphere_clock"] = _sc
+        if "unified_spirit" not in response:
+            _us = getattr(coordinator, "_self_162d_snapshot", None)
+            if _us is not None:
+                response["unified_spirit"] = _us
+                response["self_162d"] = _us
+        # resonance has no Rust shm slot today (per SPEC §1096 list);
+        # legacy engine remains the only producer. Leave key absent.
+    if inner_state:
+        response["observables"] = inner_state.observables
+        response["inner_state"] = inner_state.snapshot()
+    if spirit_state:
+        response["spirit_state"] = spirit_state.snapshot()
+    # Sanitize the whole trinity payload before it crosses the bus broker —
+    # subsystem get_stats() (filter_down, intuition, sphere_clock, resonance,
+    # unified_spirit) and inner_state.observables can contain tuple/int dict
+    # keys that msgpack strict_map_key=True rejects on unpack. Yesterday's
+    # 885570d4 only covered build_coordinator_snapshot; trinity + NS were
+    # sibling paths that still leaked. Closes BUG-BUS-IPC-SPIRIT-MALFORMED-
+    # FRAME-20260428 third occurrence (trinity path).
+    from titan_hcl.logic.spirit_state import _sanitize_dict_keys
+    return _sanitize_dict_keys(response)
+
+
+def build_nervous_system_snapshot(state_refs: dict) -> dict | None:
+    """Build the NS stats dict. Returns None if no NS available."""
+    neural_nervous_system = state_refs.get("neural_nervous_system")
+    coordinator = state_refs.get("coordinator")
+    from titan_hcl.logic.spirit_state import _sanitize_dict_keys
+    if neural_nervous_system:
+        return _sanitize_dict_keys(neural_nervous_system.get_stats())
+    if coordinator and coordinator.nervous_system:
+        return {
+            "version": "v4_vm",
+            "programs": list(coordinator.nervous_system.programs.keys())
+                if hasattr(coordinator.nervous_system, 'programs') else [],
+        }
+    return None
+
+
 def start_snapshot_builder_threads(state_refs: dict, config: dict,
                                     send_queue=None, name: str = "spirit") -> None:
     """Launch 3 daemon threads that keep the heavy snapshot caches fresh.
@@ -604,21 +710,22 @@ def start_snapshot_builder_threads(state_refs: dict, config: dict,
               _COORD_SNAPSHOT_BUILDER_INTERVAL),
         daemon=True, name="coord-snapshot-builder",
     ).start()
-    # D-SPEC-143 profiling (2026-05-29): the trinity + nervous-system snapshot
-    # builders that ran here at 4 Hz (0.25s) were the #1 CPU consumer of
-    # cognitive_worker (~44% via py-spy) — yet they were ORPHANED. Their only
-    # ever reader was spirit_worker's `_handle_query` QueryThread (retired:
-    # spirit_worker deleted D-SPEC-116, spirit_loop deleted Phase 10). The
-    # dashboard now serves trinity + nervous-system SHM-direct via
-    # TitanStateAccessor (`/v6/trinity/*`→trinity_state.bin,
-    # `/v6/nervous-system`→titanvm_registers.bin, Preamble G18) — it never read
-    # `_TRINITY_SNAPSHOT_CACHE` / `_NS_SNAPSHOT_CACHE`. So both builders rebuilt
-    # caches nobody reads, 8 builds/sec. REMOVED (no shim per
-    # `feedback_no_shim_old_path_must_be_deleted`) along with build_trinity_snapshot
-    # / build_nervous_system_snapshot. The LIVE coord builder above (2.5s — its
-    # `_publish_coord_subdomains` *_UPDATED bus fan-out is consumed by titan_hcl
-    # parent / self_reflection / observatory) is UNAFFECTED. See
-    # titan-docs/notes/profiling_findings_20260529.md F1.
+    threading.Thread(
+        target=_builder_loop,
+        args=("trinity",
+              lambda: build_trinity_snapshot(state_refs, config),
+              _TRINITY_SNAPSHOT_CACHE,
+              _TRINITY_SNAPSHOT_BUILDER_INTERVAL),
+        daemon=True, name="trinity-snapshot-builder",
+    ).start()
+    threading.Thread(
+        target=_builder_loop,
+        args=("ns",
+              lambda: build_nervous_system_snapshot(state_refs),
+              _NS_SNAPSHOT_CACHE,
+              _NS_SNAPSHOT_BUILDER_INTERVAL),
+        daemon=True, name="ns-snapshot-builder",
+    ).start()
 
     # Phase B.5 (rFP_phase_c_state_read_unification_l0_l1_canonical §B.5,
     # 2026-05-18) — SpiritStatePublisher + SpiritSupplementalStatePublisher
@@ -679,8 +786,10 @@ def start_snapshot_builder_threads(state_refs: dict, config: dict,
             _publisher_boot_err, exc_info=True)
 
     logger.info(
-        "[SpiritLoop] Coordinator snapshot builder thread started — "
-        "rebuild every %.2fs (trinity/NS builders removed D-SPEC-143)",
-        _COORD_SNAPSHOT_BUILDER_INTERVAL)
+        "[SpiritLoop] Snapshot builder threads started — "
+        "coord/trinity/ns rebuild every %.2f/%.2f/%.2fs",
+        _COORD_SNAPSHOT_BUILDER_INTERVAL,
+        _TRINITY_SNAPSHOT_BUILDER_INTERVAL,
+        _NS_SNAPSHOT_BUILDER_INTERVAL)
 
 

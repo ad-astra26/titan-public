@@ -153,22 +153,6 @@ class ProofDayArchetype(ArchetypeBase):
         titan_id = getattr(context, "titan_id", "")
         if titan_id != "T1":
             return None
-
-        # Cold-cache guard (2026-05-29): proof_day is a public on-chain proof —
-        # it must NEVER broadcast stale post-restart zeros. The MSL self-state
-        # (msl_state.bin) + consciousness_age slots are republished by
-        # cognitive_worker ~30s AFTER boot, so a proof_day firing inside that
-        # window reads i_confidence=0.0 + age=0 → "I-confidence 0.000 · age 0"
-        # went out publicly. Defer until the live self-state is warm; the next
-        # dispatch cycle re-fires with real values (i_confidence ~0.95).
-        _iconf = float(getattr(context, "i_confidence", 0.0) or 0.0)
-        _age = int(getattr(context, "consciousness_age", 0) or 0)
-        if _iconf <= 0.0 or _age <= 0:
-            logger.info(
-                "[proof_day] self-state COLD (i_confidence=%.3f age=%d) — "
-                "deferring until warm (post-restart cache window); will re-fire "
-                "next dispatch", _iconf, _age)
-            return None
         if self.already_posted_today(titan_id=titan_id):
             return None
 
