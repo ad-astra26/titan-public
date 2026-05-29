@@ -143,6 +143,24 @@ def test_read_secret_roundtrip_and_missing(tmp_path: Path):
     assert inference.read_secret("api", "absent", path=sp) is None
 
 
+@pytest.mark.parametrize("provider,secret_key", [
+    ("ollama_cloud", "ollama_cloud_api_key"),
+    ("openrouter", "openrouter_api_key"),
+])
+def test_wire_cloud_key_writes_sectioned_secret_and_sets_provider(tmp_path: Path, provider, secret_key):
+    # mini repo with a seeded config.toml carrying an [inference] provider key
+    (tmp_path / "titan_hcl").mkdir()
+    (tmp_path / "titan_hcl" / "config.toml").write_text(
+        "[inference]\ninference_provider = \"venice\"\n")
+    sp = tmp_path / "secrets.toml"
+    res = inference._wire_cloud_key(tmp_path, provider, "K" * 40, secrets_path=sp)
+    assert all(r.severity == "ok" for r in res)
+    import tomllib as _t
+    assert _t.load(open(sp, "rb"))["inference"][secret_key] == "K" * 40
+    cfg = {e.dotted: e.raw_value for e in cm.parse_toml_with_comments(tmp_path / "titan_hcl" / "config.toml")}
+    assert cfg["inference.inference_provider"] == f'"{provider}"'
+
+
 # ── config_seed: required config.toml + minted internal_key (the #8 fix) ──────
 
 

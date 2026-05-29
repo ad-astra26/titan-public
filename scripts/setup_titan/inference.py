@@ -153,6 +153,22 @@ def prompt_openrouter_key(prompt_fn=input) -> str:
         print(f"    that doesn't look like an OpenRouter key (expected '{OPENROUTER_KEY_PREFIX}…' with ≥8 more chars)")
 
 
+def prompt_ollama_cloud_key(prompt_fn=input) -> str:
+    """Prompt for an Ollama Cloud API key (https://ollama.com → API keys).
+
+    Ollama Cloud keys are opaque tokens (no fixed prefix); accept any long,
+    space-free string. `prompt_fn` injected for tests.
+    """
+    while True:
+        try:
+            ans = prompt_fn("  Ollama Cloud API key (from https://ollama.com → API keys): ").strip()
+        except EOFError:
+            raise SystemExit("setup_titan: stdin closed during Ollama Cloud key prompt")
+        if len(ans) >= 20 and " " not in ans:
+            return ans
+        print("    that doesn't look like an Ollama Cloud key (expected a long token, no spaces)")
+
+
 # ── Phase 4 body ───────────────────────────────────────────────────────────
 
 
@@ -201,14 +217,33 @@ def _wire_local_ollama(install_root: Path) -> list[Result]:
     return res
 
 
+def _wire_cloud_key(install_root: Path, provider: str, key: str,
+                    secrets_path: Path) -> list[Result]:
+    """Persist a hosted-provider key (secrets.toml [inference]) + set the provider
+    (config.toml [inference]). `provider` ∈ {'ollama_cloud','openrouter'}."""
+    secret_key = "ollama_cloud_api_key" if provider == "ollama_cloud" else "openrouter_api_key"
+    label = "Ollama Cloud" if provider == "ollama_cloud" else "OpenRouter"
+    upsert_secret("inference", secret_key, key, path=secrets_path)
+    misses = _set_inference_config(install_root, inference_provider=provider)
+    res = [Result("inference", "ok",
+                  f"{label} key → {secrets_path} [inference] (0600); provider → config.toml")]
+    if misses:
+        res.append(Result("inference_cfg", "warn", f"could not set in config.toml: {', '.join(misses)}",
+                          f"Set via `setup_titan config --set inference.inference_provider={provider}`."))
+    return res
+
+
 def run_inference_phase(*, default: bool, install_root: Path,
                         secrets_path: Path = SECRETS_PATH) -> list[Result]:
     """Phase 4 — pick provider; secret keys → secrets.toml [inference], the
     (non-secret) provider/base_url/model selection → config.toml [inference].
 
-    `--default` skips interactive confirmation when local Ollama is reachable;
-    interactive mode asks before falling through (user can force OpenRouter even
-    with local Ollama present).
+    Order: (1) if a local Ollama is reachable, offer it (no key — most sovereign);
+    (2) otherwise choose a HOSTED provider — Ollama Cloud (the fleet default) or
+    OpenRouter. Both require the user's own API key (even OpenRouter's free tier
+    needs one), so we collect it now — a Titan must be able to chat the moment it
+    boots. `--default` auto-accepts a reachable local Ollama; the hosted choice is
+    always interactive because a key is unavoidable.
     """
     alive = ollama_alive()
     if alive:
@@ -224,13 +259,16 @@ def run_inference_phase(*, default: bool, install_root: Path,
                    role="success")
             return _wire_local_ollama(install_root)
 
-    cprint("  Falling back to OpenRouter (cloud-hosted; requires API key).", role="warning")
-    key = prompt_openrouter_key()
-    upsert_secret("inference", "openrouter_api_key", key, path=secrets_path)
-    misses = _set_inference_config(install_root, inference_provider="openrouter")
-    res = [Result("inference", "ok", f"OpenRouter key → {secrets_path} [inference] (0600); "
-                  f"provider → config.toml")]
-    if misses:
-        res.append(Result("inference_cfg", "warn", f"could not set in config.toml: {', '.join(misses)}",
-                          "Set provider via `setup_titan config --set inference.inference_provider=openrouter`."))
-    return res
+    # No usable local Ollama → choose a hosted provider (both need the user's key).
+    cprint("  No local Ollama in use — choose a hosted inference provider:", role="text_strong")
+    cprint("    [1] Ollama Cloud  (ollama.com — hosted, OpenAI-compatible; the fleet default)",
+           role="text_muted")
+    cprint("    [2] OpenRouter    (openrouter.ai — many models incl. a rate-limited free tier)",
+           role="text_muted")
+    try:
+        choice = (input("  Provider [1/2, default 1]: ").strip() or "1")
+    except EOFError:
+        raise SystemExit("setup_titan: stdin closed during inference provider choice")
+    if choice == "2":
+        return _wire_cloud_key(install_root, "openrouter", prompt_openrouter_key(), secrets_path)
+    return _wire_cloud_key(install_root, "ollama_cloud", prompt_ollama_cloud_key(), secrets_path)
