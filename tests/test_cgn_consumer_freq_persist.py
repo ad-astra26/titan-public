@@ -69,3 +69,32 @@ def test_consumer_freq_empty_is_safe(cgn_in_tmpdir):
     fresh = ConceptGroundingNetwork(state_dir=state_dir)
     fresh._load_state()
     assert fresh._consumer_freq == {}
+
+
+def test_haov_sidecar_includes_consumer_freq(cgn_in_tmpdir):
+    """The torch-free JSON sidecar (read by the api/v6 cgn-haov-stats
+    handler) must carry consumer_freq under the reserved "_consumer_freq"
+    key — otherwise /v6/cognition/cgn-haov-stats reports {} for it even
+    though the in-memory counter is healthy
+    (BUG-CGN-CONSUMER-FREQ-INVISIBLE-VIA-API-SIDECAR-20260526)."""
+    import json
+    import os
+
+    cgn, state_dir = cgn_in_tmpdir
+    cgn._consumer_freq["test_reader"] = 312
+    cgn._consumer_freq["test_writer"] = 9
+    cgn._save_state()
+
+    sidecar = os.path.join(state_dir, "haov_stats.json")
+    assert os.path.exists(sidecar), "sidecar should be written when consumer_freq is populated"
+    with open(sidecar) as fh:
+        payload = json.load(fh)
+
+    assert "_consumer_freq" in payload, "sidecar dropped consumer_freq"
+    assert payload["_consumer_freq"].get("test_reader") == 312
+    assert payload["_consumer_freq"].get("test_writer") == 9
+
+    # The reserved key must not collide with a real consumer name so the
+    # API reader's pop()-before-iterate stays correct.
+    assert not payload["_consumer_freq"].get("stats"), (
+        "_consumer_freq must be a flat consumer→count map, not a HAOV entry")

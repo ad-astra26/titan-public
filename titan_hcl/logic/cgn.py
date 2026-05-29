@@ -1433,13 +1433,19 @@ class ConceptGroundingNetwork:
             logger.info("[CGN] State saved: %d consumers, %d buffer entries",
                         len(state["consumers"]), len(buf_transitions))
 
-            # Save HAOV stats as JSON sidecar (torch-free API access)
-            if state.get("haov"):
+            # Save HAOV stats + consumer_freq as JSON sidecar (torch-free API
+            # access). consumer_freq rides under the reserved "_consumer_freq"
+            # key so the flat per-consumer HAOV map stays unambiguous — the API
+            # reader pops it before iterating consumers
+            # (BUG-CGN-CONSUMER-FREQ-INVISIBLE-VIA-API-SIDECAR-20260526).
+            if state.get("haov") or state.get("consumer_freq"):
                 import json as _json
+                payload = dict(state.get("haov") or {})
+                payload["_consumer_freq"] = dict(state.get("consumer_freq") or {})
                 haov_path = os.path.join(self._state_dir, "haov_stats.json")
                 try:
                     with open(haov_path, "w") as _hf:
-                        _json.dump(state["haov"], _hf)
+                        _json.dump(payload, _hf)
                 except Exception:
                     pass  # Non-critical
         except Exception as e:
