@@ -11169,16 +11169,46 @@ async def get_v4_timechain_blocks(request: Request, fork: int = 0,
 # Same fix template as /v4/timechain/status: separate warmer thread (verify
 # is more expensive than status, so longer interval — 60s) + bounded
 # cold-boot fallback.
+#
+# D-SPEC-143 F2 (2026-05-29): the warmer was the api's #1 CPU consumer —
+# profiling showed it re-hashing the ENTIRE ~200 MB chain (verify_all → sha256
+# every fork) every 60s; cost grew with the chain (data-growth regression). Now
+# INCREMENTAL: per fork, resume from the previously-verified tip (cached in
+# _tc_verify_resume) and hash only blocks appended since. Unchanged forks cost
+# one seek + a 0-byte read. Full re-verify fallback on any resume inconsistency
+# (file shrank/rewrote → valid=None). Same output shape as verify_all.
 _tc_verify_cache: dict = {"data": None, "updated_at": 0.0}
+_tc_verify_resume: dict = {}  # fork_id -> resume {offset,height,prev_hash,height_offset}
 _TC_VERIFY_WARMER_INTERVAL_S = 60.0
 _tc_verify_warmer_started = {"flag": False}
 
 
 def _build_tc_verify_snapshot_sync() -> dict:
-    """Synchronous builder — chain integrity verification."""
+    """Synchronous builder — chain integrity verification (incremental, F2)."""
     tc = _get_cached_tc()
-    valid, results = tc.verify_all()
-    return {"valid": valid, "results": results}
+    fork_ids = sorted(getattr(tc, "_fork_tips", {}).keys())
+    if not fork_ids or not hasattr(tc, "verify_fork_incremental"):
+        # No fork registry / older TimeChain — full verify_all (safe fallback).
+        valid, results = tc.verify_all()
+        return {"valid": valid, "results": results}
+    from titan_hcl.logic.timechain import FORK_NAMES
+    results: list[str] = []
+    all_valid = True
+    for fork_id in fork_ids:
+        resume = _tc_verify_resume.get(fork_id)
+        valid, msg, new_resume = tc.verify_fork_incremental(fork_id, resume)
+        if valid is None:
+            # resume cache stale (file shrank/rewrote) → full re-verify this fork
+            _tc_verify_resume.pop(fork_id, None)
+            valid, msg, new_resume = tc.verify_fork_incremental(fork_id, None)
+        if valid and new_resume is not None:
+            _tc_verify_resume[fork_id] = new_resume
+        elif not valid:
+            _tc_verify_resume.pop(fork_id, None)  # never cache a failed tip
+            all_valid = False
+        results.append(
+            f"Fork {fork_id} ({FORK_NAMES.get(fork_id, f'sc_{fork_id}')}): {msg}")
+    return {"valid": all_valid, "results": results}
 
 
 def _start_tc_verify_warmer() -> None:
@@ -11347,7 +11377,7 @@ async def get_v4_developmental_timeline(request: Request, days: int = 30):
     def _fetch():
         tc = _get_cached_tc()
         blocks = tc.query_blocks(
-            thought_type="genesis", fork_id=tc.resolve_fork_id("main"),
+            thought_type="genesis", fork_id=0,
             limit=min(days * 10, 500))
         timeline = []
         for b in blocks:
@@ -11407,7 +11437,7 @@ async def get_v4_timechain_contracts(request: Request,
     def _fetch():
         tc = _get_cached_tc()
         blocks = tc.query_blocks(
-            thought_type="contract_deploy", fork_id=tc.resolve_fork_id("meta"), limit=200)
+            thought_type="contract_deploy", fork_id=4, limit=200)
         seen = {}
         for b in blocks:
             try:
@@ -11501,7 +11531,7 @@ async def get_v4_contracts_pending(request: Request):
     def _fetch():
         tc = _get_cached_tc()
         blocks = tc.query_blocks(
-            thought_type="contract_deploy", fork_id=tc.resolve_fork_id("meta"), limit=200)
+            thought_type="contract_deploy", fork_id=4, limit=200)
         pending = []
         for b in blocks:
             try:
@@ -11631,12 +11661,8 @@ async def get_v4_timechain_verify_block(request: Request, height: int):
     """
     try:
         tc = _get_cached_tc()
-        # Phase 14 / INV-Syn-26 — resolve the conversation fork by NAME
-        # chain-locally (its id is 5 on T1 but chain-local elsewhere).
-        conversation_fork_id = tc.resolve_fork_id("conversation")
-        if conversation_fork_id is None:
-            return _error("conversation fork not present on this chain", code=404)
-        block = tc.get_block(conversation_fork_id, height)
+        from titan_hcl.logic.timechain import FORK_CONVERSATION
+        block = tc.get_block(FORK_CONVERSATION, height)
         if not block:
             return _error(f"Conversation block #{height} not found", code=404)
 
@@ -11659,7 +11685,7 @@ async def get_v4_timechain_verify_block(request: Request, height: int):
             "genesis_hash": status.get("genesis_hash", ""),
             "merkle_root": status.get("merkle_root", ""),
             "fork": "conversation",
-            "fork_id": conversation_fork_id,
+            "fork_id": FORK_CONVERSATION,
         })
     except Exception as e:
         logger.error("[Dashboard] /v4/timechain/verify/%d error: %s", height, e)
