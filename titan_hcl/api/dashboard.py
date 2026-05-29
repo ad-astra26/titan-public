@@ -3225,11 +3225,13 @@ async def get_consciousness_history(
                FROM epochs ORDER BY epoch_id DESC LIMIT ?""",
             (limit,),
         )
+        from titan_hcl.logic.consciousness import unpack_vector
         epochs = []
         for row in rows:
-            sv = _json.loads(row[2]) if isinstance(row[2], str) else row[2]
-            drift = _json.loads(row[3]) if isinstance(row[3], str) else row[3]
-            traj = _json.loads(row[4]) if isinstance(row[4], str) else row[4]
+            # SPEC §11.H.1.bis dual-read: BLOB f32-LE (new) or TEXT-JSON (legacy)
+            sv = unpack_vector(row[2])
+            drift = unpack_vector(row[3])
+            traj = unpack_vector(row[4])
             dims = {}
             for i, dim_name in enumerate(STATE_DIMS):
                 if i < len(sv):
@@ -9957,10 +9959,8 @@ async def kin_exchange(request: Request):
                 "SELECT state_vector FROM epochs ORDER BY epoch_id DESC LIMIT 1",
                 fetch="one")
             if _c_row and _c_row[0]:
-                _raw_sv = _c_row[0]
-                if isinstance(_raw_sv, str):
-                    _raw_sv = json.loads(_raw_sv)
-                _sv = _raw_sv if isinstance(_raw_sv, list) else []
+                from titan_hcl.logic.consciousness import unpack_vector
+                _sv = unpack_vector(_c_row[0])  # SPEC §11.H.1.bis dual-read
         except Exception:
             pass
         my_body = _sv[0:5] if len(_sv) >= 5 else [0.5] * 5
@@ -10147,10 +10147,8 @@ async def _get_dialogue_state() -> tuple:
             "SELECT state_vector FROM epochs ORDER BY epoch_id DESC LIMIT 1",
             fetch="one")
         if _dc_row and _dc_row[0]:
-            _raw = _dc_row[0]
-            if isinstance(_raw, str):
-                _raw = json.loads(_raw)
-            felt_state = _raw if isinstance(_raw, list) else []
+            from titan_hcl.logic.consciousness import unpack_vector
+            felt_state = unpack_vector(_dc_row[0])  # SPEC §11.H.1.bis dual-read
     except Exception:
         pass
 

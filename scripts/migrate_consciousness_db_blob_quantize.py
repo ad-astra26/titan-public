@@ -158,9 +158,9 @@ def main() -> int:
             epoch_id          INTEGER PRIMARY KEY,
             timestamp         REAL NOT NULL,
             block_hash        TEXT NOT NULL DEFAULT '',
-            state_vector_f32  BLOB NOT NULL,      -- 520B (D-SPEC-127, lossless 130D × f32)
-            drift_vector_f32  BLOB NOT NULL,      -- 36B
-            trajectory_vector_f32 BLOB NOT NULL,  -- 36B
+            state_vector      BLOB NOT NULL,      -- 520B (SPEC §11.H.1.bis, lossless 130D × f32)
+            drift_vector      BLOB NOT NULL,      -- 36B
+            trajectory_vector BLOB NOT NULL,      -- 36B
             journey_x         REAL NOT NULL,
             journey_y         REAL NOT NULL,
             journey_z         REAL NOT NULL,
