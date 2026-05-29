@@ -74,11 +74,9 @@ async def gather_felt_state_and_vocab(
             fetch="one",
         )
         if row and row[0]:
-            raw = row[0]
-            if isinstance(raw, str):
-                raw = json.loads(raw)
-            if isinstance(raw, list):
-                felt_state = raw
+            # SPEC §11.H.1.bis dual-read: BLOB f32-LE (new) or TEXT-JSON (legacy)
+            from titan_hcl.logic.consciousness import unpack_vector
+            felt_state = unpack_vector(row[0])
     except Exception as e:
         logger.debug(
             "[llm_pipeline.state_gather] felt_state read failed: %s", e

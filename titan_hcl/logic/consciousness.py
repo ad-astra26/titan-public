@@ -16,11 +16,43 @@ import json
 import logging
 import math
 import sqlite3
+import struct
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from titan_hcl.utils.silent_swallow import swallow_warn
+
+
+# ── SPEC §11.H.1.bis — consciousness.db row-vector BLOB f32-LE encoding ──
+# epochs.{state_vector,drift_vector,trajectory_vector} are stored as
+# little-endian IEEE-754 single-precision (f32), N×4 bytes, no header — an
+# ~84% size reduction vs the legacy TEXT-JSON encoding (T1 4.75G→0.74G).
+# Canonical column NAMES are unchanged (no `_f32` suffix) so the writer never
+# hits "no such column" (the bug that rolled back the 2026-05-26 attempt).
+# `unpack_vector` is a PERMANENT dual-read (BLOB new / TEXT-JSON legacy) so a
+# DB with mixed rows — or a pre-migration rollback — reads cleanly with no
+# lockstep requirement. Canonical refs: SPEC §11.H.1.bis, §G3 (130D layout).
+def pack_vector(vec) -> bytes:
+    """Pack a float vector → little-endian f32 BLOB (SPEC §11.H.1.bis)."""
+    vals = [float(x) for x in vec]
+    return struct.pack(f"<{len(vals)}f", *vals)
+
+
+def unpack_vector(raw) -> List[float]:
+    """Vector column → List[float]. Dual-read: BLOB f32-LE (new) OR TEXT-JSON
+    (legacy / rollback). Tolerant of None/empty + already-decoded lists."""
+    if raw is None:
+        return []
+    if isinstance(raw, (bytes, bytearray)):
+        if len(raw) % 4 != 0:
+            raise ValueError(
+                f"consciousness vector BLOB len {len(raw)} not a multiple of 4 "
+                "(corrupt f32 pack — SPEC §11.H.1.bis)")
+        return list(struct.unpack(f"<{len(raw) // 4}f", raw))
+    if isinstance(raw, str):
+        return json.loads(raw)
+    return list(raw)  # already a list/tuple (defensive)
 
 logger = logging.getLogger("consciousness")
 
@@ -247,9 +279,9 @@ class ConsciousnessDB:
                 epoch_id      INTEGER PRIMARY KEY,
                 timestamp     REAL NOT NULL,
                 block_hash    TEXT NOT NULL DEFAULT '',
-                state_vector  TEXT NOT NULL,
-                drift_vector  TEXT NOT NULL,
-                trajectory_vector TEXT NOT NULL,
+                state_vector  BLOB NOT NULL,
+                drift_vector  BLOB NOT NULL,
+                trajectory_vector BLOB NOT NULL,
                 journey_x     REAL NOT NULL,
                 journey_y     REAL NOT NULL,
                 journey_z     REAL NOT NULL,
@@ -542,8 +574,8 @@ class ConsciousnessDB:
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 rec.epoch_id, rec.timestamp, rec.block_hash,
-                json.dumps(rec.state_vector), json.dumps(rec.drift_vector),
-                json.dumps(rec.trajectory_vector),
+                pack_vector(rec.state_vector), pack_vector(rec.drift_vector),
+                pack_vector(rec.trajectory_vector),
                 rec.journey_point[0], rec.journey_point[1], rec.journey_point[2],
                 rec.curvature, rec.density, rec.distillation, rec.anchored_tx,
             ),
@@ -562,8 +594,8 @@ class ConsciousnessDB:
         for r in reversed(rows):  # chronological order
             results.append(EpochRecord(
                 epoch_id=r[0], timestamp=r[1], block_hash=r[2],
-                state_vector=json.loads(r[3]), drift_vector=json.loads(r[4]),
-                trajectory_vector=json.loads(r[5]),
+                state_vector=unpack_vector(r[3]), drift_vector=unpack_vector(r[4]),
+                trajectory_vector=unpack_vector(r[5]),
                 journey_point=(r[6], r[7], r[8]),
                 curvature=r[9], density=r[10],
                 distillation=r[11], anchored_tx=r[12],

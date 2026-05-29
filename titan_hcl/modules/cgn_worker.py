@@ -77,57 +77,18 @@ CODE_AUTHORITATIVE_CONSUMERS = frozenset({
 # CGN_TRANSITION outcome handler and the periodic test pump (_run_haov_pump).
 # Routes CGN_HAOV_VERIFY_REQ to the worker that owns the consumer's
 # verifier branch. All 9 registered consumers covered (zero silent drops).
-# HAOV verify routing — ONLY the consumers with a live specialist verifier for
-# their topic-ful CONCEPT-GROUNDING hypotheses. IMPASSE-sourced hypotheses
-# (the dominant class, all consumers) are verified in-process by
-# `cgn.verify_impasse_resolution` (see `_local_haov_verify`) and never routed
-# here. Per rFP_haov_efficacy_closure (F4): the 7 prior `"spirit"` entries
-# black-holed verification after the 2026-05-16 spirit retirement (spirit has no
-# CGN_HAOV_VERIFY_REQ subscriber) — they are removed. Consumers absent from this
-# map fall through to in-process verification. `dreaming` was a phantom entry
-# (never registered) and is dropped.
 _HAOV_DEST_MAP = {
     "language": "language",
+    "social": "spirit",
+    "reasoning": "spirit",
     "knowledge": "knowledge",
+    "coding": "spirit",
+    "self_model": "spirit",
     "emotional": "emot_cgn",
+    "meta": "spirit",
+    "reasoning_strategy": "spirit",
+    "dreaming": "spirit",
 }
-
-
-def _local_haov_verify(cgn, tracker, consumer):
-    """Verify a tracker's active HAOV test IN-PROCESS when no live bus verifier
-    applies. Returns True if handled here (caller must NOT emit a bus verify).
-
-    Two cases verify locally (per rFP_haov_efficacy_closure, Option A):
-      1. IMPASSE-sourced hypotheses (`source == "soar_impasse"`, any consumer) —
-         verified by `cgn.verify_impasse_resolution` (reward-trend resolution).
-         This is the dominant class and the fix for F4 (dead `"spirit"` routing).
-      2. CONCEPT-GROUNDING hypotheses for consumers with no specialist verifier
-         (not in `_HAOV_DEST_MAP`) — fall back to a reward-based check instead of
-         black-holing. Consumers WITH a specialist verifier
-         (language/knowledge/emot_cgn) return False so the caller routes via bus.
-    """
-    at = tracker._active_test
-    if not at or not isinstance(at, dict):
-        return False
-    h = at.get("hypothesis")
-    if h is None:
-        return False
-    if getattr(h, "source", "") == "soar_impasse":
-        imp_type = ""
-        if isinstance(getattr(h, "action_context", None), dict):
-            imp_type = h.action_context.get("impasse_type", "")
-        if not imp_type and "_impasse_" in getattr(h, "rule", ""):
-            imp_type = h.rule.split("_impasse_", 1)[1]
-        _confirmed, reward = cgn.verify_impasse_resolution(consumer, imp_type)
-        tracker.verify(getattr(h, "action_context", {}), {}, reward)
-        return True
-    if consumer in _HAOV_DEST_MAP:
-        return False  # live specialist verifier — caller routes via bus
-    # Concept-grounding hypothesis, no specialist verifier → reward-based local.
-    pre = at.get("pre_observation", {}) or {}
-    reward = float(pre.get("reward", 0.0)) if isinstance(pre, dict) else 0.0
-    tracker.verify(getattr(h, "action_context", {}), {}, reward)
-    return True
 
 
 def _run_haov_pump(cgn, send_queue, name, stuck_timeout_s):
@@ -164,19 +125,10 @@ def _run_haov_pump(cgn, send_queue, name, stuck_timeout_s):
             if not test_ctx:
                 continue
 
-            # 2b. In-process verification — impasse hypotheses (any consumer) +
-            # consumers with no specialist verifier. Fixes F4 (dead "spirit"
-            # routing) per rFP_haov_efficacy_closure: no bus round-trip, no
-            # dead dst. Counts as a completed verification.
-            if _local_haov_verify(cgn, tracker, consumer_name):
-                continue
-
-            # 3. Concept-grounding hypothesis → route to a LIVE specialist verifier.
-            dest = _HAOV_DEST_MAP.get(consumer_name)
-            if dest is None:
-                continue  # no specialist verifier; local path handles these
+            # 3. Stamp + route + emit
             if tracker._active_test is not None:
                 tracker._active_test["ts"] = now
+            dest = _HAOV_DEST_MAP.get(consumer_name, consumer_name)
 
             # Pre-emit guard for consumer="knowledge": knowledge_worker
             # expects test_ctx.topic/concept to query knowledge_concepts.
@@ -807,27 +759,25 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                             "observation": payload.get("outcome_context", {}),
                         })
                         if _test_ctx:
-                            # In-process verify first (impasse hypotheses + no-
-                            # specialist consumers) — fixes F4 dead-routing.
-                            if _local_haov_verify(
-                                    cgn, _haov_tracker, _haov_consumer):
-                                pass  # verified locally; no bus emit
-                            else:
-                                # Concept-grounding → live specialist verifier only.
-                                _haov_dest = _HAOV_DEST_MAP.get(_haov_consumer)
-                                if _haov_dest is not None:
-                                    if _haov_tracker._active_test is not None:
-                                        _haov_tracker._active_test["ts"] = time.time()
-                                    _send_msg(send_queue, bus.CGN_HAOV_VERIFY_REQ,
-                                              name, _haov_dest, {
-                                        "consumer": _haov_consumer,
-                                        "test_ctx": _test_ctx,
-                                        "obs_before": payload.get("outcome_context", {}),
-                                        "hypothesis": _haov_tracker._active_test[
-                                            "hypothesis"].rule if _haov_tracker._active_test else "",
-                                    })
-                                    logger.debug("[CGNWorker] HAOV test → %s: %s",
-                                                 _haov_dest, _test_ctx)
+                            # Route to correct bus module (consumer→module mapping)
+                            # H.2 (2026-04-28): added 5 missing dest entries
+                            # for consumers that had silent test routing.
+                            _haov_dest = _HAOV_DEST_MAP.get(
+                                _haov_consumer, _haov_consumer)
+                            # H.3 (2026-04-28): timestamp active_test for
+                            # stuck-test expiry by pump.
+                            if _haov_tracker._active_test is not None:
+                                _haov_tracker._active_test["ts"] = time.time()
+                            _send_msg(send_queue, bus.CGN_HAOV_VERIFY_REQ,
+                                      name, _haov_dest, {
+                                "consumer": _haov_consumer,
+                                "test_ctx": _test_ctx,
+                                "obs_before": payload.get("outcome_context", {}),
+                                "hypothesis": _haov_tracker._active_test[
+                                    "hypothesis"].rule if _haov_tracker._active_test else "",
+                            })
+                            logger.debug("[CGNWorker] HAOV test → %s: %s",
+                                         _haov_dest, _test_ctx)
                 else:
                     # New transition — buffer it
                     t = CGNTransition(
