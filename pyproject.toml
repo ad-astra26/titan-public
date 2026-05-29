@@ -30,8 +30,13 @@ dependencies = [
     "scikit-learn>=1.3.0",            # Clustering / meta-cognition analytics
 
     # Cognitive / Agent runtime
-    "agno[openai,sqlite]>=2.5.0",     # Agent framework (chat). [openai]→OpenRouter/OpenAILike models;
+    "agno[openai,sqlite]==2.6.9",     # Agent framework (chat). [openai]→OpenRouter/OpenAILike models;
                                         # [sqlite]→sqlalchemy for AsyncSqliteDb chat sessions.
+                                        # PINNED EXACT (was >=2.5.0, which floated → fresh installs
+                                        # pulled untested versions). 2.6.9 smoke-verified compatible
+                                        # with our surface (6 imports + Agent kwargs + guardrail +
+                                        # stream/stream_events). See AUDIT_agno_keep_vs_lean_20260529.md.
+                                        # Bump deliberately + smoke-test; never float.
     "aiosqlite>=0.20.0",              # async SQLite driver for agno's AsyncSqliteDb (NOT pulled by agno[sqlite])
     "pydantic>=2.5.0",                # Schemas (also a base dep of agno + fastapi; declared explicitly)
 
