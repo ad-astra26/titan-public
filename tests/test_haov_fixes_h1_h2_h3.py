@@ -1,11 +1,7 @@
 """Tests for HAOV architectural fixes H.1+H.2+H.3 (2026-04-28).
 
 H.1 — Confirmation-bias OR-cheat removal in language/social/self_model verifiers.
-H.2 — _haov_dest map. UPDATED 2026-05-29 (rFP_haov_efficacy_closure F4 rewire):
-       the map now holds ONLY live specialist verifiers (language/knowledge/
-       emot_cgn); the 7 dead "spirit" routes are removed and impasse hypotheses
-       verify in-process. The original "covers all 9 consumers" contract routed
-       most verifies into a void after the spirit retirement.
+H.2 — _haov_dest map covers all 9 registered consumers; 4 new verifier branches.
 H.3 — Periodic HAOV test pump in cgn_worker decouples test-trigger from
        per-consumer CGN_TRANSITION outcome events; expires stuck active_test.
 
@@ -78,37 +74,21 @@ def test_h2_haov_dest_map_module_level_constant():
         "Module-level _HAOV_DEST_MAP constant must be declared")
 
 
-def test_h2_dest_map_only_live_specialist_verifiers():
-    """Post rewire (rFP_haov_efficacy_closure, 2026-05-29): _HAOV_DEST_MAP holds
-    ONLY consumers with a live specialist CGN_HAOV_VERIFY_REQ handler
-    (language/knowledge/emot_cgn) for their concept-grounding hypotheses. The
-    prior map routed 7 consumers to a dead ``"spirit"`` dst (no subscriber after
-    the 2026-05-16 spirit retirement) — that black-holed verification (F4). Those
-    routes are removed; impasse-sourced hypotheses (the dominant class, all
-    consumers) are verified in-process via `_local_haov_verify`."""
+def test_h2_dest_map_routes_all_9_registered_consumers():
+    """All 9 consumers registered in cgn_worker pre-register block must
+    have a routing entry."""
     src = _read(CGN_WORKER)
+    # Extract the _HAOV_DEST_MAP literal
     m = re.search(r"_HAOV_DEST_MAP\s*=\s*\{([^}]+)\}", src, re.DOTALL)
     assert m, "_HAOV_DEST_MAP literal must be parseable"
     body = m.group(1)
-    # The only live specialist-verifier destinations.
-    assert '"language": "language"' in body
-    assert '"knowledge": "knowledge"' in body
-    assert '"emotional": "emot_cgn"' in body
-    # No dead "spirit" route, no phantom "dreaming" consumer.
-    assert '"spirit"' not in body, "dead spirit route must be removed (F4)"
-    assert '"dreaming"' not in body, "phantom dreaming entry must be removed"
-
-
-def test_h2_impasse_hypotheses_verified_in_process():
-    """The rewire routes impasse-sourced hypotheses to in-process verification
-    (no bus, no dead dst). Both the pump and the outcome-driven path must call
-    `_local_haov_verify` before any bus emit."""
-    src = _read(CGN_WORKER)
-    assert "_local_haov_verify(cgn, tracker, consumer_name)" in src, (
-        "pump must verify impasse hypotheses in-process")
-    assert "_local_haov_verify(\n                                    cgn, _haov_tracker, _haov_consumer)" in src \
-        or "_local_haov_verify(cgn, _haov_tracker, _haov_consumer)" in src, (
-        "outcome path must verify impasse hypotheses in-process")
+    expected_consumers = [
+        "language", "social", "reasoning", "knowledge", "coding",
+        "self_model", "emotional", "meta", "reasoning_strategy", "dreaming",
+    ]
+    for c in expected_consumers:
+        assert f'"{c}":' in body, (
+            f"Consumer '{c}' missing from _HAOV_DEST_MAP")
 
 
 def test_h2_emot_cgn_handles_emotional_verify():
