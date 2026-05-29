@@ -102,8 +102,21 @@ for pd in glob.glob("/proc/[0-9]*"):
             if line.startswith("VmRSS"):
                 rss = int(line.split()[1]); break
         start = open(pd + "/stat").read().split()[21]
+        # INV-PROC-7 (D-SPEC-143): workers self-identify. setproctitle writes
+        # argv[0] = "titan_hcl:<name>" (read via /proc/<pid>/cmdline); PR_SET_NAME
+        # writes comm = "titan:<name>". Prefer cmdline (full name, untruncated);
+        # fall back to comm. None for the parent ("titan_hcl", no colon).
+        worker = None
+        try:
+            argv0 = open(pd + "/cmdline", "rb").read().split(b"\x00")[0].decode("utf-8", "replace")
+            if argv0.startswith("titan_hcl:"):
+                worker = argv0[len("titan_hcl:"):]
+        except Exception:
+            pass
+        if worker is None and comm.startswith("titan:"):
+            worker = comm[len("titan:"):]
         out[t]["procs"].append({"pid": int(pid), "rss_kb": rss, "start": int(start),
-                                "is_agno": _is_agno(pd)})
+                                "is_agno": _is_agno(pd), "worker": worker})
         out[t]["total_kb"] += rss
     except Exception:
         continue

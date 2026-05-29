@@ -729,9 +729,17 @@ async def get_v6_readiness(request: Request) -> JSONResponse:
     # name). Graceful fallback: if the roster is absent (writer not yet up, or a
     # pre-v2 slot still in SHM mid-rollout), report only live slots — never
     # resurrect the phantom-prone manifest union.
+    # Roster entries are (name, boot_priority, pid) triples (schema v3 /
+    # D-SPEC-143); tolerate legacy 2-tuples (pid absent → 0) for forward/back
+    # compat during rollout. roster_pid gives the single-read name→pid map
+    # (INV-PROC-7 part b).
     roster_map: dict[str, str] = {}
+    roster_pid: dict[str, int] = {}
     if fleet_entry is not None:
-        roster_map = {str(n): str(p) for n, p in (fleet_entry.roster or ())}
+        for _t in (fleet_entry.roster or ()):
+            _n = str(_t[0])
+            roster_map[_n] = str(_t[1])
+            roster_pid[_n] = int(_t[2]) if len(_t) >= 3 else 0
 
     all_module_names: list[str] = sorted(slot_names_set | set(roster_map))
 
@@ -755,6 +763,8 @@ async def get_v6_readiness(request: Request) -> JSONResponse:
                     "name": name, "state": "not_booted"}
                 if name in roster_map:
                     nb_payload["boot_priority"] = roster_map[name]
+                if roster_pid.get(name):
+                    nb_payload["pid"] = roster_pid[name]
                 modules_payload.append(nb_payload)
                 not_booted_count += 1
             else:
@@ -771,7 +781,17 @@ async def get_v6_readiness(request: Request) -> JSONResponse:
                     unhealthy_count += 1
     finally:
         bank.close()
+    # Single-read authoritative name→pid map (INV-PROC-7 part b / §11.I.5). Live
+    # slot pid wins over the roster pid (slot is worker-written, freshest);
+    # roster pid covers modules whose live slot wasn't read this pass. Only
+    # non-zero pids are surfaced.
+    module_pids: dict[str, int] = {}
+    for _m in modules_payload:
+        _pid = int(_m.get("pid") or 0)
+        if _pid:
+            module_pids[str(_m.get("name"))] = _pid
     body["modules"] = modules_payload
+    body["module_pids"] = module_pids
     body["module_count"] = len(modules_payload)
     body["module_running_count"] = running_count
     body["module_state_summary"] = {
