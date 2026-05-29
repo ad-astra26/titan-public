@@ -180,19 +180,47 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             logger.warning("[BackupWorker] ArweaveStore init failed: %s — local_only", e)
             mode = "local_only"
 
+    # ZK-Vault network client (SPEC §24.7 + D-SPEC-BACKUP-ZK-INPROC-CLIENT,
+    # 2026-05-29). The backup subprocess ALREADY holds the Titan identity
+    # keypair in-process (ArweaveStore signs every Irys upload with it), so an
+    # in-process HybridNetworkClient for the event_merkle_root memo adds NO new
+    # key exposure — unlike memory_worker, which keeps the *deployer* keypair in
+    # the kernel and delegates via ANCHOR_REQUEST. Without this, network_client
+    # stayed None → commit_event_merkle_to_zk_vault always returned None → the
+    # unified_v2 pipeline uploaded tarballs then FAILED at the ZK commit on
+    # EVERY event ("ZK Vault commit returned None") → no manifest ever
+    # finalized + paid-but-orphaned uploads. Wired only in mainnet_arweave mode
+    # (T1); local_only T2/T3 do not commit to mainnet. Violates no G18–G22 (a
+    # direct Solana call is neither a bus.request, SHM write, nor sync-RPC).
+    backup_network = None
+    if mode == "mainnet_arweave":
+        try:
+            from titan_hcl.core.network import HybridNetworkClient
+            backup_network = HybridNetworkClient(config=net_cfg)
+            logger.info(
+                "[BackupWorker] ZK-Vault network client wired (in-process, "
+                "identity keypair; SPEC §24.7)")
+        except Exception as e:
+            logger.warning(
+                "[BackupWorker] ZK-Vault network client init failed: %s — "
+                "event_merkle_root commits will be skipped (events won't "
+                "finalize)", e)
+            backup_network = None
+
     # Build RebirthBackup (rFP BUG-2 correct signature + BUG-5 injection)
     try:
         from titan_hcl.logic.backup import RebirthBackup
         backup = RebirthBackup(
-            network_client=None,  # subprocess: no direct Solana client; anchor + NFT mint are best-effort
+            network_client=backup_network,  # §24.7 in-process ZK-Vault client (mainnet_arweave only)
             config=full_config.get("memory_and_storage", {}),
             titan_id=titan_id,
             arweave_store=arweave_store,
             full_config=full_config,
         )
         logger.info(
-            "[BackupWorker] RebirthBackup ready (titan_id=%s, arweave=%s)",
+            "[BackupWorker] RebirthBackup ready (titan_id=%s, arweave=%s, zk_network=%s)",
             titan_id, "wired" if arweave_store else "none",
+            "wired" if backup_network else "none",
         )
     except Exception as e:
         logger.error("[BackupWorker] RebirthBackup init FAILED: %s", e, exc_info=True)
