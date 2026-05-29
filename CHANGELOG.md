@@ -42,6 +42,47 @@ _(curate as you go; lifted into the next versioned section at release time)_
 
 ---
 
+## v0.0.3 — 2026-05-29 (pre-release)
+
+_Validated live on a fresh DigitalOcean 2 vCPU / 4 GB box: `v0.0.2` installed,
+booted, and **chatted** end-to-end (Ollama Cloud, OVG-signed), with every
+persistent store growing. Driving that test surfaced four more real-world gaps,
+all fixed here, plus first-class Observatory support._
+
+### Fixed
+
+- **Boot no longer needs a Solana-CLI wallet.** The bus authkey keypair now
+  defaults to the Titan's own genesis identity (`data/titan_identity_keypair.json`,
+  what the kernel already uses) instead of `~/.config/solana/id.json`, and `~`
+  paths are expanded. A fresh sovereign install boots straight to a healthy brain.
+- **`curl … | bash` and piped/automated installs** no longer abort: the bootstrap
+  now falls back to inherited stdin when there's no controlling terminal (it
+  previously failed trying to open `/dev/tty`).
+- **`setup_titan diagnostic`** completes on a brand-new Titan (it crashed on the
+  ARC check when there was no ARC activity yet).
+
+### Added
+
+- **Ollama Cloud** is now a first-class inference choice in the wizard (the fleet
+  default; OpenRouter's free tier is rate-limited), so you can pick a hosted
+  provider that actually works at setup.
+- **Observatory web UI ships out of the box.** Opt in during setup and the
+  installer fetches a **prebuilt** bundle from the release (built in CI, not on
+  your box) and runs it on `http://127.0.0.1:3000`, reading your local Titan
+  automatically. (Front it with your own reverse proxy / TLS for remote access.)
+
+### Notes
+
+- The 4 GB tier comfortably runs a chatting Titan (~3.8 GB resident); the
+  Observatory adds headroom needs — the recommended 4 vCPU / 8 GB tier is advised
+  if you run both.
+
+### SPEC
+
+- Install/packaging release; no on-chain or kernel behavior change.
+
+---
+
 ## v0.0.2 — 2026-05-29 (pre-release)
 
 _Turnkey fresh-install hardening. The first live fresh-box test of `v0.0.1`
