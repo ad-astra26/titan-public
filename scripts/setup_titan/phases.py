@@ -26,6 +26,7 @@ from typing import Callable
 from . import state as install_state
 from .binaries import run_binaries_phase
 from .comms import run_comms_phase
+from .config_seed import run_config_seed_phase
 from .inference import run_inference_phase
 from .genesis_runner import run_genesis_phase
 from .systemd_runner import run_systemd_phase
@@ -159,12 +160,19 @@ def run_venv_phase(install_root: Path) -> list[Result]:
 
     cprint("  Installing Titan core dependencies (pip install -e .) — this can take several minutes…",
            role="text_strong")
+    # --extra-index-url whl/cpu: on a CPU-only server, PEP 440 ranks the
+    # `+cpu` local-version wheel ABOVE the PyPI default (CUDA) build, so torch
+    # resolves to the ~200MB CPU wheel instead of dragging in the ~5GB CUDA
+    # stack — which would blow a 4GB / small-disk min-tier box (RFP P3).
+    # The CPU index is additive: every non-torch package still comes from PyPI.
+    TORCH_CPU_INDEX = "https://download.pytorch.org/whl/cpu"
     try:
-        subprocess.check_call([str(pip), "install", "-e", str(install_root)])
+        subprocess.check_call([str(pip), "install", "--extra-index-url", TORCH_CPU_INDEX,
+                               "-e", str(install_root)])
     except subprocess.CalledProcessError as e:
         return [Result("pip", "fail", f"pip install exited {e.returncode}",
                        "Inspect the pip output above; common causes: network, missing build tools (gcc).")]
-    results.append(Result("pip", "ok", "core dependencies installed"))
+    results.append(Result("pip", "ok", "core dependencies installed (CPU torch wheel)"))
 
     py = venv_python(install_root)
     check_src = "import titan_hcl; import duckdb; import faiss; import torch; print('OK')"
@@ -200,8 +208,10 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
          lambda: run_venv_phase(install_root)),
         (PhaseDef("phase_bin", "Rust daemon binaries", "W1.b", None),
          lambda: run_binaries_phase(install_root, tag=tag or "main", build_rust=build_rust)),
+        (PhaseDef("phase_cfg", "Seed config.toml + chat auth key", "W1.f", None),
+         lambda: run_config_seed_phase(install_root)),
         (PhaseDef("phase_4", "Inference autodetect", "W1.c", None),
-         lambda: run_inference_phase(default=default)),
+         lambda: run_inference_phase(default=default, install_root=install_root)),
         (PhaseDef("phase_5", "Comms (Telegram / X / Observatory)", "W1.d", None),
          lambda: run_comms_phase(default=default)),
         (PhaseDef("phase_6", "Genesis ceremony", "W1.b", None),

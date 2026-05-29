@@ -89,8 +89,12 @@ def render_unit(*, install_root: Path, titan_id: str, user: str) -> str:
 Description=Titan Microkernel v2 (Phase C — Rust L0) — Titan {titan_id}
 After=network.target
 ConditionPathExists={keypair_path(install_root)}
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# Cold boot on a constrained box (2 vCPU / 4 GB min tier) can lose the daemon→bus
+# connect race: the kernel's bus broker (B4) needs a beat to bind the socket
+# before the 9 daemons dial it. The kernel's own supervisor recovers, but a tight
+# StartLimit would trip first and wedge the unit. Be forgiving: 10 starts / 10 min.
+StartLimitIntervalSec=600
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -114,7 +118,9 @@ ExecStopPost={cleanup}
 
 TimeoutStopSec=30
 Restart=on-failure
-RestartSec=5s
+# Give the bus broker room to bind its socket before daemons redial on a restart
+# (longer than the 5s default to damp the cold-boot connect race on min-tier).
+RestartSec=10s
 RestartPreventExitStatus=2 3 4 5 6
 
 StandardOutput=journal

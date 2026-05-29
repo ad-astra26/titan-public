@@ -20,20 +20,43 @@ dependencies = [
     "kuzu>=0.4.0",                      # Knowledge graph (Trinity-typed entities)
     "fastembed>=0.3.0",                 # Lightweight embeddings (bge-small-en-v1.5)
     "sentence-transformers>=4.0.0",     # Lightweight embeddings (all-MiniLM-L6-v2)
-    "torch>=2.0.0",                     # RL backbone (IQL Actor/Critic/Value networks)
+    "torch>=2.0.0",                     # RL backbone (IQL Actor/Critic/Value networks). NOTE:
+                                        # the installer adds --extra-index-url .../whl/cpu so this
+                                        # resolves to the light CPU wheel (no 5GB CUDA) on servers.
     "tensordict>=0.4.0",               # TorchRL data structures
     "torchrl>=0.4.0",                  # Offline RL (ReplayBuffer, IQLLoss)
+    "numpy>=1.26.0",                   # Pervasive (tensors, trinity vectors) — directly imported ~90×
+    "scipy>=1.11.0",                   # Cognition math (also transitive via sentence-transformers)
+    "scikit-learn>=1.3.0",            # Clustering / meta-cognition analytics
+
+    # Cognitive / Agent runtime
+    "agno[openai,sqlite]>=2.5.0",     # Agent framework (chat). [openai]→OpenRouter/OpenAILike models;
+                                        # [sqlite]→sqlalchemy for AsyncSqliteDb chat sessions.
+    "aiosqlite>=0.20.0",              # async SQLite driver for agno's AsyncSqliteDb (NOT pulled by agno[sqlite])
+    "pydantic>=2.5.0",                # Schemas (also a base dep of agno + fastapi; declared explicitly)
 
     # Blockchain (graceful degradation if absent)
     "solders>=0.21.0",                 # Solana primitives (Pubkey, Keypair, Instruction)
     "solana>=0.34.0",                  # Solana RPC client (AsyncClient)
     "cryptography>=42.0.0",           # AES-256-GCM encryption, PBKDF2 key derivation
+    "PyJWT>=2.8.0",                   # JWT auth (internal_key / Privy session validation)
 
     # API & Networking
     "fastapi>=0.110.0",               # Sovereign Observatory API
     "uvicorn>=0.27.0",                # ASGI server
     "httpx>=0.27.0",                  # Async HTTP (OpenRouter, TwitterAPI.io, SearXNG, Ollama, Shadow Drive)
+    "aiohttp>=3.9.0",                 # Async HTTP client (sage / social / streaming paths)
+    "requests>=2.31.0",              # Sync HTTP (RPC helpers, simple fetches)
     "websockets>=12.0",               # Real-time event stream (Observatory WebSocket)
+
+    # Comms — Telegram is the guaranteed channel (RFP locked decision)
+    "python-telegram-bot>=21.0",      # Telegram bot (the always-on comm channel)
+
+    # Process / runtime infrastructure
+    "psutil>=5.9.0",                  # Resource sensing (Guardian, health, metabolism)
+    "setproctitle>=1.3.0",           # Per-worker process titles (fleet observability)
+    "msgpack>=1.0.0",                # Bus frame serialization (Phase C state transport)
+    "zstandard>=0.22.0",             # Compression (timechain / backup substrate)
 
     # Expressive Engine
     "pillow>=10.2.0",                 # Procedural art (flow fields, L-systems, NFT composites)
@@ -41,6 +64,8 @@ dependencies = [
 
     # Config
     "tomli-w>=1.2.0",                 # TOML writer for ~/.titan/secrets.toml updates (session refresh)
+    "toml>=0.10.2",                  # TOML read/write helper (used across scripts + a few runtime paths)
+    "PyYAML>=6.0",                    # YAML config / RPC-exemption manifests
 ]
 
 # ── Optional Dependency Tiers ──────────────────────────────────────────────────
@@ -53,6 +78,14 @@ research = [
     "playwright>=1.42.0",             # Browser automation (needs: playwright install chromium)
     "unstructured[pdf,docx,pptx,xlsx]>=0.14.0",  # Document intelligence
     "ollama>=0.1.7",                  # Local LLM inference (distillation, haiku, scoring)
+    "html2text>=2024.2.26",           # HTML→markdown for scraped research pages (sage)
+]
+
+# ARC-AGI capability: the abstraction-and-reasoning challenge solver (opt-in).
+# Install: pip install openclaw-plugin-titan[arc]
+arc = [
+    "arcengine>=0.9.0",              # ARC-AGI-3 game engine client
+    "arc-agi>=0.9.0",               # ARC-AGI task primitives
 ]
 
 # Sovereign stack: ZK-Vault and Anchor program interaction
@@ -71,12 +104,14 @@ dev = [
     "python-pptx>=0.6.23",          # PPTX generation (test fixtures)
     "openpyxl>=3.1.2",              # XLSX generation (test fixtures)
     "qrcode>=7.4",                   # QR code for Shard 1 display in genesis ceremony
+    "libcst>=1.1.0",                # AST analysis for arch_map deep wiring scans
+    "matplotlib>=3.8.0",            # Plots for arch_map / telemetry analysis scripts
 ]
 
 # Everything: full sovereign deployment
 # Install: pip install openclaw-plugin-titan[full]
 full = [
-    "openclaw-plugin-titan[research,sovereign,dev]",
+    "openclaw-plugin-titan[research,sovereign,arc,dev]",
 ]
 
 # ── Entry Points ───────────────────────────────────────────────────────────────

@@ -156,3 +156,19 @@ def set_value(path: Path, lineno: int, new_raw: str) -> None:
 def find_entry(entries: list[Entry], dotted: str) -> list[Entry]:
     """All entries whose dotted path (or bare key) matches `dotted`."""
     return [e for e in entries if e.dotted == dotted or e.key == dotted]
+
+
+def set_by_dotted(path: Path, dotted: str, value: str) -> bool:
+    """Set an editable key identified by its dotted path (`section.key`).
+
+    Coerces `value` into the existing key's TOML shape (quoted string, bool,
+    number) so the file stays valid. Returns True if a unique editable entry
+    matched and was written, False otherwise (caller decides how to surface a
+    miss — e.g. the key may not exist in this config version).
+    """
+    matches = [e for e in find_entry(parse_toml_with_comments(path), dotted) if e.editable]
+    if not matches:
+        return False
+    e = matches[0]
+    set_value(path, e.lineno, coerce_like(e.raw_value, value))
+    return True

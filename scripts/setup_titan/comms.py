@@ -69,8 +69,8 @@ def run_comms_phase(*, default: bool) -> list[Result]:
         TELEGRAM_TOKEN_RE,
         "expected format: '<numeric_id>:<alphanumeric>' (≥30 char secret)",
     )
-    upsert_secret("telegram_bot_token", token)
-    results.append(Result("telegram", "ok", "bot token written"))
+    upsert_secret("channels", "telegram_bot_token", token)
+    results.append(Result("telegram", "ok", "bot token → secrets.toml [channels]"))
 
     # ── X (opt-in) ─────────────────────────────────────────────────────────
     if default or not _prompt_yes_no("Enable X (Twitter) posting? Needs twitterapi.io + Webshare.",
@@ -83,7 +83,7 @@ def run_comms_phase(*, default: bool) -> list[Result]:
             TWITTERAPI_KEY_RE,
             "expected UUID format: 8-4-4-4-12 hex chars",
         )
-        upsert_secret("twitterapi_io_key", key)
+        upsert_secret("stealth_sage", "twitterapi_io_key", key)
         cprint("  Webshare static-proxy URL (from https://www.webshare.io/proxy → static IPs).",
                role="text_muted")
         url = _prompt_until(
@@ -91,8 +91,9 @@ def run_comms_phase(*, default: bool) -> list[Result]:
             WEBSHARE_URL_RE,
             "expected format: http://user:pass@host:port/",
         )
-        upsert_secret("webshare_static_url", url)
-        results.append(Result("x_social", "ok", "twitterapi.io + Webshare keys written"))
+        upsert_secret("twitter_social", "webshare_static_url", url)
+        results.append(Result("x_social", "ok",
+                              "twitterapi.io → [stealth_sage], Webshare → [twitter_social]"))
 
     # ── Observatory (opt-in, info-only in v0.0.1) ─────────────────────────
     if default or not _prompt_yes_no("Enable Observatory web UI? (Heavier: nginx + TLS + domain.)",

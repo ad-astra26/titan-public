@@ -17,7 +17,14 @@ import pytest
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / "scripts"))
 
-from setup_titan import binaries, config_model as cm, genesis_runner, systemd_runner  # noqa: E402
+from setup_titan import (  # noqa: E402
+    binaries,
+    config_model as cm,
+    config_seed,
+    genesis_runner,
+    inference,
+    systemd_runner,
+)
 from setup_titan.__main__ import build_parser  # noqa: E402
 from setup_titan.modes import Mode  # noqa: E402
 
@@ -85,6 +92,93 @@ def test_set_value_preserves_comment_and_key(sample: Path):
     after = {x.dotted: x for x in cm.parse_toml_with_comments(sample)}
     assert after["mood_engine.update_interval_seconds"].raw_value == "43200"
     assert after["mood_engine.update_interval_seconds"].help == "6 hours (Meditation Cycle)"
+
+
+def test_set_by_dotted_quotes_string_and_misses_unknown(sample: Path):
+    assert cm.set_by_dotted(sample, "net.host", "http://example:9000") is True
+    by = {e.dotted: e for e in cm.parse_toml_with_comments(sample)}
+    assert by["net.host"].raw_value == '"http://example:9000"'
+    assert by["net.host"].help == "the host to bind"          # comment survives
+    assert cm.set_by_dotted(sample, "net.does_not_exist", "x") is False
+
+
+# ── inference: section-aware secrets upsert + read (the #9 fix) ───────────────
+
+import tomllib  # noqa: E402
+
+
+def test_upsert_secret_creates_section_then_replaces_in_place(tmp_path: Path):
+    sp = tmp_path / "secrets.toml"
+    inference.upsert_secret("inference", "openrouter_api_key", "sk-or-aaa", path=sp)
+    inference.upsert_secret("channels", "telegram_bot_token", "123:abc", path=sp)
+    # replace an existing key within its section (must not duplicate)
+    inference.upsert_secret("inference", "openrouter_api_key", "sk-or-bbb", path=sp)
+    data = tomllib.load(open(sp, "rb"))
+    assert data["inference"]["openrouter_api_key"] == "sk-or-bbb"
+    assert data["channels"]["telegram_bot_token"] == "123:abc"
+    assert sp.read_text().count("openrouter_api_key") == 1     # replaced, not appended
+    assert oct(sp.stat().st_mode)[-3:] == "600"
+
+
+def test_upsert_secret_appends_key_into_existing_section(tmp_path: Path):
+    sp = tmp_path / "secrets.toml"
+    inference.upsert_secret("inference", "openrouter_api_key", "sk-or-aaa", path=sp)
+    inference.upsert_secret("inference", "venice_api_key", "vv", path=sp)
+    data = tomllib.load(open(sp, "rb"))
+    assert data["inference"] == {"openrouter_api_key": "sk-or-aaa", "venice_api_key": "vv"}
+
+
+def test_upsert_secret_escapes_quotes(tmp_path: Path):
+    sp = tmp_path / "secrets.toml"
+    inference.upsert_secret("twitter_social", "webshare_static_url", 'http://u:p"x@h:1/', path=sp)
+    data = tomllib.load(open(sp, "rb"))
+    assert data["twitter_social"]["webshare_static_url"] == 'http://u:p"x@h:1/'
+
+
+def test_read_secret_roundtrip_and_missing(tmp_path: Path):
+    sp = tmp_path / "secrets.toml"
+    assert inference.read_secret("api", "internal_key", path=sp) is None   # no file
+    inference.upsert_secret("api", "internal_key", "tok", path=sp)
+    assert inference.read_secret("api", "internal_key", path=sp) == "tok"
+    assert inference.read_secret("api", "absent", path=sp) is None
+
+
+# ── config_seed: required config.toml + minted internal_key (the #8 fix) ──────
+
+
+def _mini_repo(tmp_path: Path) -> Path:
+    (tmp_path / "titan_hcl").mkdir()
+    (tmp_path / "titan_hcl" / "config.toml.example").write_text(
+        "[inference]\ninference_provider = \"ollama_cloud\"\n[api]\ninternal_key = \"\"\n")
+    return tmp_path
+
+
+def test_config_seed_copies_example_and_mints_key(tmp_path: Path):
+    root = _mini_repo(tmp_path)
+    sp = tmp_path / "secrets.toml"
+    res = config_seed.run_config_seed_phase(root, secrets_path=sp)
+    assert all(r.severity == "ok" for r in res)
+    assert config_seed.config_path(root).exists()                 # seeded
+    key = inference.read_secret("api", "internal_key", path=sp)
+    assert key and len(key) >= 32                                 # minted
+
+
+def test_config_seed_is_idempotent(tmp_path: Path):
+    root = _mini_repo(tmp_path)
+    sp = tmp_path / "secrets.toml"
+    config_seed.run_config_seed_phase(root, secrets_path=sp)
+    first = inference.read_secret("api", "internal_key", path=sp)
+    # second run must NOT clobber the existing config or regenerate the key
+    config_seed.config_path(root).write_text("[api]\ninternal_key = \"\"\n# user edit\n")
+    config_seed.run_config_seed_phase(root, secrets_path=sp)
+    assert inference.read_secret("api", "internal_key", path=sp) == first
+    assert "# user edit" in config_seed.config_path(root).read_text()
+
+
+def test_config_seed_fails_without_example(tmp_path: Path):
+    (tmp_path / "titan_hcl").mkdir()
+    res = config_seed.run_config_seed_phase(tmp_path, secrets_path=tmp_path / "s.toml")
+    assert res[0].severity == "fail"
 
 
 # ── binaries ─────────────────────────────────────────────────────────────────
