@@ -604,7 +604,7 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
 
     # === MODULE-SPECIFIC: consciousness DB + topology (chunk 8G epoch driver) ===
     try:
-        from titan_hcl.modules.spirit_loop import _init_consciousness
+        from titan_hcl.logic.consciousness_epoch import _init_consciousness  # Phase 10D
         state_refs["consciousness"] = _init_consciousness(config)
     except Exception as _err:
         logger.warning("[CognitiveWorker] _init_consciousness failed: %s", _err)
@@ -2741,7 +2741,7 @@ def _cognitive_epoch_loop(state_refs: dict, config: dict, send_queue,
     Future tuning: adaptive ramp-up under high arousal / ramp-down
     under quiescence; bounded by [MIN, MAX] per SPEC v0.2.0 constants.
     """
-    from titan_hcl.modules.spirit_loop import _run_consciousness_epoch
+    from titan_hcl.logic.consciousness_epoch import _run_consciousness_epoch
 
     consciousness = state_refs.get("consciousness")
     coordinator = state_refs.get("coordinator")
@@ -2814,7 +2814,7 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
           /v4/inner-trinity.coordinator.consciousness.epoch_number
           tracks the kernel-rs counter (was stuck at 0 per rFP §1.3).
     """
-    from titan_hcl.modules.spirit_loop import _run_consciousness_epoch
+    from titan_hcl.logic.consciousness_epoch import _run_consciousness_epoch
 
     # §4.Q (2026-05-15) — helper for emitting NEUROMOD_EXTERNAL_NUDGE bus
     # events to neuromod_worker. Defined at the top of _drive_one_epoch so
@@ -3156,7 +3156,7 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
         try:
             _run_consciousness_epoch(
                 consciousness, body_state_dict, mind_state_dict,
-                config, outer_state=outer_state_dict)
+                config, outer_state=outer_state_dict, shm_bank=shm_bank)
         except Exception as _err:
             logger.debug("[CognitiveWorker] _run_consciousness_epoch failed: %s", _err)
 

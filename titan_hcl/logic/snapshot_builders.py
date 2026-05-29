@@ -438,14 +438,20 @@ def build_trinity_snapshot(state_refs: dict, config: dict) -> dict:
     inner_state = state_refs.get("inner_state")
     spirit_state = state_refs.get("spirit_state")
 
-    # Phase 10E/10D coupling: _collect_spirit_tensor is shared infra still
-    # resident in spirit_loop (10D-deferred — consumed by both this snapshot
-    # builder AND _run_consciousness_epoch). 10D migrates it to a Rust-SHM read
-    # for ALL consumers atomically, then deletes it; until then this transitional
-    # import sources it from its current home. (No import cycle — spirit_loop
-    # does not import snapshot_builders.)
-    from titan_hcl.modules.spirit_loop import _collect_spirit_tensor
-    tensor = _collect_spirit_tensor(config, body_state, mind_state, consciousness)
+    # Phase 10D consumer-fix: spirit 5D tensor from the Rust trinity SHM slot
+    # (full_130dt[:5] = WHO/WHY/WHAT + body/mind scalars), the canonical live
+    # source — replaces the retired _collect_spirit_tensor (deleted in 10D).
+    # Falls back to neutral 5D if SHM unavailable (cold boot / no bank).
+    tensor = [0.5] * 5
+    _bank = state_refs.get("_shm_reader_bank")
+    if _bank is not None:
+        try:
+            _tri = _bank.read_trinity() or {}
+            _full = _tri.get("full_130dt") or []
+            if len(_full) >= 5:
+                tensor = [float(x) for x in _full[:5]]
+        except Exception:
+            pass
     response = {
         "spirit_tensor": tensor,
         "body_values": body_state.get("values", [0.5] * 5),

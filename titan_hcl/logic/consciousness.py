@@ -915,9 +915,10 @@ class ConsciousnessLoop:
             if self._bus is not None:
                 try:
                     from titan_hcl.bus import make_msg, TITAN_SELF_STATE
-                    # INTENTIONAL_BROADCAST: rFP #2 Phase 4 consumes the 162D inline
-                    # (spirit_loop._post_epoch_v5_filter_down); broadcast retained for
-                    # future kin-protocol "I AM" emission + external dashboards
+                    # INTENTIONAL_BROADCAST: the 162D filter_down V5 training is
+                    # owned by the Rust trinity daemons (trinity_value_net.rs) under
+                    # l0_rust_enabled; broadcast retained for future kin-protocol
+                    # "I AM" emission + external dashboards
                     # (DEFERRED: TITAN_SELF_STATE-CONSUMER-DECISION — Option C).
                     self._bus.publish(make_msg(
                         TITAN_SELF_STATE, "consciousness", "broadcast",

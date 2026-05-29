@@ -466,13 +466,11 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 logger.info("[MindWorker] FILTER_DOWN received: %s",
                             [round(m, 2) for m in severity_multipliers])
 
-        # Receive FOCUS nudges from Spirit PID controller
-        elif msg_type == bus.FOCUS_NUDGE:
-            new_nudges = msg.get("payload", {}).get("nudges")
-            if new_nudges and len(new_nudges) == 5:
-                focus_nudges = new_nudges
-                logger.debug("[MindWorker] FOCUS_NUDGE received: %s",
-                             [round(n, 3) for n in focus_nudges])
+        # Phase 10K (rFP §3G / audit §5.3): the FOCUS_NUDGE bus-consumer branch
+        # was removed — its sole producer (spirit_loop._run_focus) is deleted and
+        # the live focus path is focus_input.bin SHM (FocusPIDPublisher @7.83 Hz),
+        # which the Rust trinity daemons read + apply as the cascade directly. The
+        # bus message never arrives, so the handler was unreachable dead code.
 
         # Receive conversation stimulus → compute Mind reflex Intuition
         elif msg_type == bus.CONVERSATION_STIMULUS:

@@ -70,7 +70,8 @@ def test_consciousness_epoch_warns_on_67d_fallback(caplog):
     """If outer_state somehow has None extended fields when
     _run_consciousness_epoch runs, we log a WARNING (not silent
     INFO-only) so the symmetry violation is visible to scanners."""
-    from titan_hcl.modules import spirit_loop
+    # Phase 10D — _run_consciousness_epoch relocated spirit_loop → consciousness_epoch.
+    from titan_hcl.logic import consciousness_epoch
 
     # Build a minimal mock consciousness/topology/body/mind dict
     # sufficient to enter the function's `has_outer_extended` block.
@@ -102,9 +103,9 @@ def test_consciousness_epoch_warns_on_67d_fallback(caplog):
         "outer_spirit_45d": None,
     }
 
-    caplog.set_level(logging.WARNING, logger=spirit_loop.logger.name)
+    caplog.set_level(logging.WARNING, logger=consciousness_epoch.logger.name)
     try:
-        spirit_loop._run_consciousness_epoch(
+        consciousness_epoch._run_consciousness_epoch(
             consciousness, body_state, mind_state, config,
             outer_state=outer_state_broken,
         )
