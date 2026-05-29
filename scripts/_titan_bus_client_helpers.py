@@ -28,6 +28,10 @@ def _resolve_wallet_path(config: dict) -> str:
     network_cfg = config.get("network", {})
     wallet_path = network_cfg.get(
         "wallet_keypair_path", "data/titan_identity_keypair.json")
+    # Expand ~ FIRST: a "~/.config/solana/id.json" value is not os.path.isabs(),
+    # so without this it would be joined onto the repo root as a literal "~"
+    # path (ENXIO at load). expanduser makes it the real absolute home path.
+    wallet_path = os.path.expanduser(wallet_path)
     if not os.path.isabs(wallet_path):
         wallet_path = os.path.normpath(
             os.path.join(os.path.dirname(__file__), "..", wallet_path))

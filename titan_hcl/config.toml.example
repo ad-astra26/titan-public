@@ -62,8 +62,12 @@ public_rpc_urls = [
     "https://api.mainnet-beta.solana.com"
 ]
 premium_rpc_url = "https://devnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY"
-# Titan's sovereign identity keypair (Shamir-split, born 2026-04-06)
-wallet_keypair_path = "~/.config/solana/id.json"
+# Titan's sovereign identity keypair — the SAME keypair the Rust kernel derives
+# the bus authkey from (kernel.rs B2 uses data_dir/titan_identity_keypair.json),
+# so Python workers and the kernel agree on the HKDF authkey. Genesis writes this
+# file (local/devnet: plaintext; mainnet: provide your own keypair / restore).
+# A path beginning with ~ is expanded; a relative path resolves against the repo.
+wallet_keypair_path = "data/titan_identity_keypair.json"
 # Maker's REAL Solana mainnet address — anchored in GenesisNFT
 maker_pubkey = "YOUR_MAKER_PUBKEY"
 # Titan ZK-Vault program ID (deployed on mainnet 2026-04-06)
