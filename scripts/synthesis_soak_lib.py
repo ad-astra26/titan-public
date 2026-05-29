@@ -162,14 +162,10 @@ TRACKS: list[Track] = [
         persona="jake", user_id="@jakebuildsAI", session_id="synth_rec_jake",
         recurrence=True,
         description="Repeated coding-sandbox compute → skill compilation + delegation",
-        # NB: prompts MUST hit the REASONING tier to activate the 'tools' feature
-        # (config.toml [[chat.tiers]] reasoning regex: why|explain|how does|analyze|
-        # compare|can you help|figure). Casual-tier prompts get NO tools (run-2
-        # lesson — "compute 6*7" classified casual → sandbox never invoked).
         missions=[
-            "Can you help me figure out the factorial of {n}? Analyze it by running it in your coding sandbox and explain the exact integer result.",
-            "How would you compute the sum of the first {n} primes? Run it in your sandbox and explain how you got the number.",
-            "Can you analyze fibonacci({n})? Compute it in your sandbox and explain the value.",
+            "Use your coding sandbox to compute the factorial of {n} and show the exact integer result.",
+            "Run this in your sandbox: sum of the first {n} primes. Give the number.",
+            "In your sandbox, compute fibonacci({n}) and return just the value.",
         ],
     ),
     # RECALL — establish a distinctive fact, then ask Titan to recall it across
@@ -182,9 +178,9 @@ TRACKS: list[Track] = [
         description="Establish→recall distinctive facts → RECALL routing + cited-use gate",
         missions=[
             "Remember this: my thesis tracking code is QG-{n}7741 and my advisor is Dr. Petrova. Acknowledge it.",
-            "Can you help me recall — what was my thesis tracking code, and how does it relate to my advisor?",
+            "Earlier I gave you my thesis tracking code. What was it, and who is my advisor?",
             "My favorite decoherence constant this week is {n}.42 microseconds. Hold onto that.",
-            "Why did I mention that decoherence constant, and can you explain what my thesis tracking code was again?",
+            "What decoherence constant did I mention, and what's my thesis tracking code again?",
         ],
     ),
     # ORACLE — verifiable code/math claims → coding-sandbox truth oracle verdicts
@@ -195,8 +191,8 @@ TRACKS: list[Track] = [
         recurrence=True,
         description="Verifiable code → oracle verdict + scored_by coverage",
         missions=[
-            "Can you analyze whether this Python is correct? `def add(a,b): return a-b` — verify by running add({n}, 3) in your sandbox and explain why the name might mislead.",
-            "How would you verify whether {n} is prime? Analyze it in your sandbox and explain the check.",
+            "Is this Python correct? `def add(a,b): return a-b`  — verify by running add({n}, 3) in your sandbox and tell me if the name matches the behavior.",
+            "Verify with your sandbox whether {n} is prime, and show the check.",
         ],
     ),
     # CONCEPT — novel-topic deep dives → P4 concept spine growth + P5 hypothesis
@@ -207,10 +203,10 @@ TRACKS: list[Track] = [
         recurrence=True,
         description="Novel-topic dives → spine concepts + hypothesis forks",
         missions=[
-            "Can you explain something you've never analyzed before about glacier microbial ecosystems at {n}000m altitude? Why would they matter?",
-            "How do those microbes inform a theory of resilience? Analyze it and form a new idea.",
-            "Can you compare glacier microbes to your own sense of endurance? What concept emerges, and why?",
-            "Why might the resilience idea you formed change over time? Explain and refine it.",
+            "Tell me something you've never thought about before regarding glacier microbial ecosystems at {n}000m altitude.",
+            "Build on that — how would those microbes inform a theory of resilience? Form a new idea.",
+            "Connect glacier microbes to your own sense of endurance. What concept emerges?",
+            "Revisit the idea you formed about resilience — has it changed? Refine it.",
         ],
     ),
     # FEEDBACK — emotional persona that, after a tool/answer turn, drives an
@@ -222,9 +218,9 @@ TRACKS: list[Track] = [
         recurrence=True,
         description="Explicit Tier-2 user feedback → scored_by=user override",
         missions=[
-            "Baby Leo smiled today! Can you help me figure out how many days old he is if he was born {n}0 days ago? Analyze it in your sandbox.",
+            "Baby Leo smiled today! Can you compute how many days old he is if he was born {n}0 days ago? Use your sandbox.",
             "That was lovely, thank you. (I'll mark that one as helpful.)",
-            "Can you explain a gentle reflection on time passing, and analyze {n}*7 days into weeks for me in your sandbox?",
+            "Tell me a gentle reflection on time passing, and compute {n}*7 days into weeks for me.",
         ],
     ),
 ]
@@ -565,9 +561,8 @@ async def _tool_preflight(client: httpx.AsyncClient, api_base: str,
         except Exception:
             return -1
     before = await _cov()
-    res = await _send_chat(client, api_base, internal_key, "@preflight", "preflight",
-                           "Can you help me analyze whether 6 * 7 equals 42? Verify it by running it "
-                           "in your coding sandbox and explain the result.")
+    res = await _send_chat(client, api_base, internal_key, "@preflight",
+                           "preflight", "Use your coding sandbox to compute 6 * 7 and return only the number.")
     resp = (res.get("response") or "").lower()
     down = any(m in resp for m in _SANDBOX_DOWN_MARKERS)
     # Give the procedural TX + 60s recompute a moment to land in coverage.

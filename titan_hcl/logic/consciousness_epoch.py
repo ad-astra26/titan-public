@@ -31,6 +31,7 @@ import logging
 import math
 import os
 import time
+from pathlib import Path
 
 from titan_hcl.utils.silent_swallow import swallow_warn
 from titan_hcl.logic.spirit_helpers import _compute_trajectory
