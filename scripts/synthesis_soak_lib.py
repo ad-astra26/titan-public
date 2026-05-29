@@ -64,14 +64,29 @@ AGNO_RESETTLE_S = 300.0       # on detected agno restart, pause SENDING to that 
 
 # Remote per-worker RSS probe (runs on the VPS via `ssh host python3 -c`).
 # Attributes each titan_hcl process to T2/T3 by /proc/<pid>/cwd, captures VmRSS +
-# PID + start-time (a PID change / RSS drop = a Guardian restart — esp. agno_worker
-# crossing its ~1GB limit), and confirms the heaviest worker is agno by checking
-# its maps for the fastembed/onnx embedding libs. Maker's observed pattern:
-# agno RSS grows slowly under multi-hour load → exceeds 1GB → GuardianHCL restarts.
+# PID + start-time. agno_worker is identified PRECISELY by the data/agno_sessions.db
+# file descriptor it uniquely holds open — NOT by "heaviest proc with embedder libs",
+# because post-§3J several workers (agno, recorder, cgn) all carry fastembed/onnxruntime,
+# so the heaviest-with-libs heuristic flip-flops between them and fakes a restart.
+# A real agno restart = the agno pid disappears from the proc set (esp. on a >1GB
+# Guardian RSS-limit kill). All proc titles are "titan_hcl" (spawn), so the open-fd
+# discriminator is the only reliable per-module signal from outside the process.
 _WORKER_RSS_PROBE = r'''
 import os, glob, json
 DIRMAP = {"/home/antigravity/projects/titan": "T2", "/home/antigravity/projects/titan3": "T3"}
 out = {"T2": {"procs": [], "total_kb": 0}, "T3": {"procs": [], "total_kb": 0}}
+def _is_agno(pd):
+    # agno_worker is the sole holder of an open data/agno_sessions.db fd.
+    try:
+        for fd in os.listdir(pd + "/fd"):
+            try:
+                if "agno_sessions.db" in os.readlink(pd + "/fd/" + fd):
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return False
 for pd in glob.glob("/proc/[0-9]*"):
     pid = pd.rsplit("/", 1)[-1]
     try:
@@ -87,7 +102,8 @@ for pd in glob.glob("/proc/[0-9]*"):
             if line.startswith("VmRSS"):
                 rss = int(line.split()[1]); break
         start = open(pd + "/stat").read().split()[21]
-        out[t]["procs"].append({"pid": int(pid), "rss_kb": rss, "start": int(start)})
+        out[t]["procs"].append({"pid": int(pid), "rss_kb": rss, "start": int(start),
+                                "is_agno": _is_agno(pd)})
         out[t]["total_kb"] += rss
     except Exception:
         continue
@@ -99,11 +115,11 @@ for t in out:
         hp = out[t]["procs"][0]
         out[t]["heaviest_pid"] = hp["pid"]
         out[t]["heaviest_rss_mb"] = round(hp["rss_kb"] / 1024, 1)
-        try:
-            mp = open("/proc/%d/maps" % hp["pid"]).read()
-            out[t]["heaviest_is_agno"] = any(x in mp for x in ("onnxruntime", "fastembed", "tokenizers"))
-        except Exception:
-            out[t]["heaviest_is_agno"] = None
+        out[t]["heaviest_is_agno"] = hp.get("is_agno")
+    # The agno_worker proc (precise, fd-identified) — the real RSS-growth target.
+    agno = next((p for p in out[t]["procs"] if p.get("is_agno")), None)
+    out[t]["agno_pid"] = agno["pid"] if agno else None
+    out[t]["agno_rss_mb"] = round(agno["rss_kb"] / 1024, 1) if agno else None
     out[t]["procs"] = out[t]["procs"][:8]  # top-8 by RSS
 print(json.dumps(out))
 '''
@@ -339,32 +355,49 @@ async def _rss_sampler(run_dir: str, intended_end: float, stop: asyncio.Event,
     On a detected restart, sets `backoff_until[target]` so the driver pauses
     SENDING to that Titan for AGNO_RESETTLE_S (let agno reload + warm)."""
     path = os.path.join(run_dir, "worker_rss.jsonl")
-    prev_heaviest: dict = {}  # target → (pid, rss_mb)
+    prev_agno: dict = {}  # target → (pid, rss_mb)
     while not stop.is_set() and _now() < intended_end:
         rss = await asyncio.get_event_loop().run_in_executor(None, _ssh_worker_rss)
         rec = {"ts": _utc(), "epoch": _now(), "rss": rss, "restart_events": []}
-        # Restart detection on the heaviest (likely-agno) worker per Titan.
+        # Restart detection on the PRECISELY-identified agno_worker (fd-matched on
+        # agno_sessions.db), keyed on the agno pid DISAPPEARING from the proc set —
+        # not on "a different proc is heaviest" (which flip-flops between agno /
+        # recorder / cgn, all of which carry fastembed post-§3J → phantom restarts).
         for t in ("T2", "T3"):
             tinfo = rss.get(t) if isinstance(rss, dict) else None
-            if not isinstance(tinfo, dict) or "heaviest_pid" not in tinfo:
+            if not isinstance(tinfo, dict):
                 continue
-            cur = (tinfo.get("heaviest_pid"), tinfo.get("heaviest_rss_mb", 0.0))
-            old = prev_heaviest.get(t)
-            if old and (old[0] != cur[0] or (old[1] - cur[1]) > 300):
+            cur_pid = tinfo.get("agno_pid")
+            cur_rss = tinfo.get("agno_rss_mb") or 0.0
+            cur_pids = {p.get("pid") for p in (tinfo.get("procs") or [])}
+            old = prev_agno.get(t)
+            # Real restart: the tracked agno pid is gone (Guardian killed + respawned),
+            # or its RSS collapsed in-place. A new pid alone is NOT enough — only if
+            # the OLD one actually left the proc table.
+            disappeared = bool(old) and old[0] is not None and old[0] not in cur_pids
+            rss_collapsed = (bool(old) and old[0] == cur_pid
+                             and (old[1] - cur_rss) > 300)
+            if disappeared or rss_collapsed:
                 rec["restart_events"].append({
-                    "target": t, "old_pid": old[0], "new_pid": cur[0],
-                    "old_rss_mb": old[1], "new_rss_mb": cur[1],
-                    "is_agno": tinfo.get("heaviest_is_agno"),
+                    "target": t, "old_pid": old[0], "new_pid": cur_pid,
+                    "old_rss_mb": old[1], "new_rss_mb": cur_rss,
+                    "reason": "pid_disappeared" if disappeared else "rss_collapsed",
                 })
-                logger.warning("[%s] heaviest-worker RESTART detected (pid %s→%s, "
-                               "rss %.0f→%.0f MB, agno=%s)", t, old[0], cur[0],
-                               old[1], cur[1], tinfo.get("heaviest_is_agno"))
+                logger.warning("[%s] agno_worker RESTART detected (%s; pid %s→%s, "
+                               "rss %.0f→%.0f MB)", t,
+                               "pid disappeared" if disappeared else "rss collapsed",
+                               old[0], cur_pid, old[1], cur_rss)
                 # Pause sending to this Titan so agno can resettle before we
                 # hammer it again (Maker 2026-05-28). Polling/telemetry continue.
                 backoff_until[t] = _now() + AGNO_RESETTLE_S
                 logger.warning("[%s] agno-resettle backoff — pausing sends %.0fs",
                                t, AGNO_RESETTLE_S)
-            prev_heaviest[t] = cur
+            # Track the agno pid as long as it persists; adopt the new one only
+            # when the old has left (so the heaviest-flip never re-keys the tracker).
+            if old and old[0] in cur_pids:
+                prev_agno[t] = (old[0], cur_rss if old[0] == cur_pid else old[1])
+            elif cur_pid is not None:
+                prev_agno[t] = (cur_pid, cur_rss)
         _append_jsonl(path, rec)
         try:
             await asyncio.wait_for(stop.wait(), timeout=RSS_SAMPLE_INTERVAL_S)
