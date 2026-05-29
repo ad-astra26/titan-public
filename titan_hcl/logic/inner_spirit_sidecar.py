@@ -326,7 +326,7 @@ def start_inner_spirit_sensor_refresh(
         from titan_hcl.logic.expression_window_tracker import (
             ExpressionWindowTracker,
         )
-        from titan_hcl.logic.spirit_helpers import _load_birth_state  # Phase 10C relocation
+        from titan_hcl.modules.spirit_loop import _load_birth_state
         # Phase B.5 (2026-05-18): HORMONE_NAMES tuple migrated from the
         # retired spirit_proxy.py to spirit_state_specs.py as
         # SPIRIT_PROXY_LEGACY_HORMONE_NAMES — semantics unchanged

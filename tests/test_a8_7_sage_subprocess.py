@@ -494,7 +494,7 @@ def test_agno_hooks_no_longer_uses_hasattr_guard() -> None:
     guard silently disabled routing in V6. Removed in A.8.7 (None-guard
     replaces it for legacy fallback)."""
     import inspect
-    from titan_hcl import agno_hooks
+    from titan_hcl.modules import agno_hooks
     src = inspect.getsource(agno_hooks)
 
     # The guard string is gone — replaced with None check.

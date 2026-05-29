@@ -9,12 +9,12 @@ boot-time transitive-import cost the Phase 11 orchestrator is trying
 to eliminate.
 
 This module is the canonical IMPORT SURFACE for agno_hooks (and anyone
-else who needs the reflex intuition signals). Phase 10 (10C + 10J)
-completed the migration: the function BODIES now live in pure
-`logic/` modules — `logic/body_helpers.py`, `logic/mind_helpers.py`,
-`logic/spirit_helpers.py` — and each worker self-imports its helper back
-for its own internal callsite. This module imports directly from those
-`logic/` homes (no longer reaching into any worker module body).
+else who needs the reflex intuition signals). The function BODIES still
+live in their respective worker files because the workers themselves
+call them internally — `body_worker.py` / `mind_worker.py` /
+`spirit_loop.py`. Moving the bodies would force a second move when the
+workers shed the helpers; the re-export here is the load-bearing
+contract change.
 
 Pre-Phase-11 (the audit'd pattern):
 
@@ -39,13 +39,9 @@ a future no-shim sweep retires them.
 """
 from __future__ import annotations
 
-# Phase 10C/10J — all three reflex helpers now live in pure, torch/cgn-free
-# logic/ modules (extracted out of body_worker / mind_worker / spirit_loop).
-# This completes the SPEC §11.B.4 invariant: agno_hooks imports reflex intuition
-# ONLY via this logic surface, never from a titan_hcl.modules.*_worker body.
-from titan_hcl.logic.body_helpers import _compute_body_reflex_intuition
-from titan_hcl.logic.mind_helpers import _compute_mind_reflex_intuition
-from titan_hcl.logic.spirit_helpers import _compute_spirit_reflex_intuition
+from titan_hcl.modules.body_worker import _compute_body_reflex_intuition
+from titan_hcl.modules.mind_worker import _compute_mind_reflex_intuition
+from titan_hcl.modules.spirit_loop import _compute_spirit_reflex_intuition
 
 # Public-by-convention re-exports.
 compute_body_reflex_intuition = _compute_body_reflex_intuition

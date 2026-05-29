@@ -124,11 +124,80 @@ def test_collect_spirit_45d_with_none_inputs_matches_pre_bug11_behavior():
     assert chit_truth_seeking == 0.0
 
 
-# Phase 10D (rFP §3G): _publish_spirit_state DELETED — its 45D input-harvesting
-# (hormone levels/fires, sphere-clock pulses, etc.) is owned by the Rust trinity
-# daemons under l0_rust_enabled (inner_spirit_45d SHM slot). The two tests that
-# exercised that Python producer were removed here; the collect_spirit_45d +
-# _expression_intensity tests (logic/spirit_tensor) remain.
+def test_publish_spirit_state_signature_accepts_hormonal_kwargs():
+    """_publish_spirit_state now accepts neural_nervous_system, sphere_clock,
+    unified_spirit, e_mem kwargs. Signature check ensures callers don't
+    break when passing these."""
+    import inspect
+    from titan_hcl.modules.spirit_loop import _publish_spirit_state
+
+    sig = inspect.signature(_publish_spirit_state)
+    params = sig.parameters
+    assert "neural_nervous_system" in params, \
+        "BUG #11 fix: _publish_spirit_state must accept neural_nervous_system kwarg"
+    assert "sphere_clock" in params, \
+        "BUG #11 fix: _publish_spirit_state must accept sphere_clock kwarg"
+    assert "unified_spirit" in params, \
+        "BUG #11 fix: _publish_spirit_state must accept unified_spirit kwarg"
+    assert "e_mem" in params, \
+        "BUG #11 fix: _publish_spirit_state must accept e_mem kwarg"
+
+    # Defaults should be None (no behavior change for old callers)
+    assert params["neural_nervous_system"].default is None
+    assert params["sphere_clock"].default is None
+
+
+def test_publish_spirit_state_harvests_hormonal_state():
+    """End-to-end: _publish_spirit_state with real-ish mocks pulls hormone
+    levels + fires from neural_nervous_system._hormonal and passes them to
+    collect_spirit_45d. Verified by inspecting the SPIRIT_STATE payload's
+    values_45d — CHIT[7] (truth_seeking) should be non-zero after the fix."""
+    import queue
+    from titan_hcl.modules.spirit_loop import _publish_spirit_state
+
+    # Mock hormonal system
+    mock_hormone = MagicMock()
+    mock_hormone.fire_count = 10
+    mock_hormonal = MagicMock()
+    mock_hormonal.get_levels.return_value = {"DA": 0.6, "CURIOSITY": 0.8, "FOCUS": 0.7}
+    mock_hormonal._hormones = {"DA": mock_hormone, "CURIOSITY": mock_hormone}
+    mock_nns = MagicMock()
+    mock_nns._hormonal_enabled = True
+    mock_nns._hormonal = mock_hormonal
+
+    # Mock sphere clock
+    mock_clock = MagicMock()
+    mock_clock.pulse_count = 50
+    mock_clock.current_phase = 0.3
+    mock_sphere_clock = MagicMock()
+    mock_sphere_clock.clocks = {"body": mock_clock, "mind": mock_clock}
+
+    q = queue.Queue()
+    _publish_spirit_state(
+        send_queue=q,
+        name="test",
+        tensor=[0.5] * 5,
+        consciousness={"latest_epoch": {"epoch_count": 1000, "density": 0.5}},
+        body_state={"values": [0.5] * 5},
+        mind_state={"values": [0.5] * 5, "values_15d": [0.5] * 15},
+        neural_nervous_system=mock_nns,
+        sphere_clock=mock_sphere_clock,
+    )
+
+    # Drain queue — should have one SPIRIT_STATE message
+    msg = q.get_nowait()
+    assert msg["type"] == "SPIRIT_STATE"
+    payload = msg["payload"]
+    assert "values_45d" in payload
+    values_45d = payload["values_45d"]
+    assert len(values_45d) == 45
+
+    # CHIT[7] truth_seeking depends on CURIOSITY hormone level → 0.8 → should be > 0
+    assert values_45d[15 + 7] > 0, \
+        f"CHIT[7] truth_seeking should activate with CURIOSITY=0.8; got {values_45d[15+7]}"
+    # CHIT[11] temporal_awareness depends on sphere_clock pulse_count totals
+    assert values_45d[15 + 11] > 0, \
+        f"CHIT[11] temporal_awareness should activate with clock pulses; got {values_45d[15+11]}"
 
 
 def test_expression_intensity_falls_back_to_composites():

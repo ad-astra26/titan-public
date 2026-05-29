@@ -23,8 +23,8 @@ for the Anchor toolchain + Solana CLI + Rust build artifacts.
 
 | OS | Status | Notes |
 |----|--------|-------|
-| **Ubuntu 22.04 LTS** | ✅ primary | T1 / T2 / T3 all run here. The recommended platform. |
-| **Ubuntu 24.04 LTS** | ✅ supported | Tested clean install end-to-end. |
+| **Ubuntu 24.04 LTS** | ✅ **recommended** | Native Python 3.12 — `setup_titan` runs end-to-end with no backports. The reference platform. |
+| **Ubuntu 22.04 LTS** | ⚠ needs Python backport | Ships Python 3.10; Titan requires 3.11+. The fleet (T1/T2/T3) runs here via a 3.12 venv, but a fresh `setup_titan` install needs a deadsnakes 3.11+ backport first. Prefer 24.04. |
 | **Debian 12** | ✅ supported | Tested clean install end-to-end. |
 | Ubuntu 20.04 LTS | ⚠ deprecated | Python 3.12 not native; requires backports. Avoid. |
 | Fedora 39+ | ⚠ unsupported | Likely works (Python + Rust + Solana all available) but untested. |
@@ -41,19 +41,44 @@ you know what you're doing; you're on your own.
 
 ## Real-world profiles (the three reference Titans)
 
-| Titan | vCPU | RAM | Disk | Inference | Network | Notes |
-|-------|------|-----|------|-----------|---------|-------|
-| **T1 (mainnet)** | 8 | 16 GB | 60 GB | Ollama Cloud (deepseek-v3.1:671b) | Helius premium RPC | Localhost — same box as the dev environment |
-| **T2 (devnet)** | 2 of 4 shared | 4 of 8 shared | 25 GB share | OpenRouter | Helius devnet RPC | Co-resident with T3 on one VPS |
-| **T3 (devnet)** | 2 of 4 shared | 4 of 8 shared | 25 GB share | OpenRouter | Helius devnet RPC | Same VPS as T2 |
+Measured on the live fleet **2026-05-28** (see *Methodology* below).
 
-T2+T3 co-residence proves the **2 vCPU / 4 GB per-Titan minimum**
-holds for headless devnet operation including dreaming + meditation +
-on-chain anchoring.
+| Titan | Box vCPU | Box RAM | Titan resident RAM | Disk (data/) | Inference | Network | Notes |
+|-------|----------|---------|--------------------|--------------|-----------|---------|-------|
+| **T1 (mainnet)** | 4 | 8 GB | **~2.3 GB** | 26 GB | Ollama Cloud (deepseek-v3.1:671b) | Helius premium RPC | Has the box to itself **+ runs the Observatory** |
+| **T2 (devnet)** | 2 of 4 shared | 4 of 8 shared | ~2.3 GB | ~13 GB share | OpenRouter | Helius devnet RPC | Co-resident with T3 on one VPS |
+| **T3 (devnet)** | 2 of 4 shared | 4 of 8 shared | ~2.3 GB | ~13 GB share | OpenRouter | Helius devnet RPC | Same VPS as T2 |
 
-T1 with Observatory + local-loopback Ollama Cloud uses ~60% of its 16
-GB during normal operation, peaking to ~85% during deep dreams.
-That's why the *recommended* tier is 8 GB minimum.
+The headline number: **a single Titan's resident footprint is ~2.3 GB**
+(measured as the sum of its ~40 `titan_hcl` cognitive workers ≈ 2.32 GB
++ 9 Rust microkernel daemons ≈ 40 MB, with the brain fully up and
+`/health` returning 200). The **Observatory** web UI adds only ~60–65 MB
+server-side — it is almost entirely client-rendered Three.js.
+
+Two consequences for your sizing:
+
+- **The 4 GB minimum is real, not marketing.** ~2.3 GB Titan + ~0.5–1 GB
+  OS leaves working headroom on a 4 GB box for headless (Telegram-only)
+  operation. T2+T3 co-residence on one 4 vCPU / 8 GB box (two Titans ≈
+  4.6 GB resident) proves the **2 vCPU / 4 GB per-Titan minimum** holds
+  through dreaming, meditation, and on-chain anchoring.
+- **A full mainnet Titan + Observatory fits the *recommended* 4 vCPU /
+  8 GB tier with room to spare.** T1 — a real mainnet Titan plus the
+  Observatory — runs on exactly that box (a DigitalOcean `s-4vcpu-8gb`).
+  The recommended tier is recommended for comfort and dream-peak
+  headroom, not because the floor is higher than it looks.
+
+> **Methodology.** Box specs from `nproc` + `free -m`; per-Titan resident
+> RAM from summing RSS of the `titan_hcl` worker processes + `titan-*-rs`
+> daemons (`ps -eo rss,comm`); disk from `du -sh data/`. Captured during
+> normal operation, not a synthetic benchmark. **Caveat (why T2/T3 are the
+> cleaner reference):** T1 shares its box with the development environment,
+> ad-hoc builds, and live editor/agent sessions, so its *box-level* `free`
+> reading is noisy — the ~2.3 GB figure is the isolated Titan process-tree
+> sum, which that noise does not affect. A gold-standard per-process RSS
+> profile sampled over a clean 24 h window (no dev session) on a headless
+> T2/T3-class box remains the ideal future measurement; the numbers here
+> are conservative and already representative.
 
 ---
 
@@ -136,6 +161,7 @@ Any reputable provider works. Pricing/configuration as of May 2026:
 | Hetzner | CX32 | ~$9 | 4 | 8 GB | 80 GB | **Recommended tier**; works for full Titan + Observatory |
 | Hetzner | CCX13 | ~$14 | 2 | 8 GB | 80 GB | Dedicated CPU; smoother runtime than shared |
 | DigitalOcean | s-2vcpu-4gb | $24 | 2 | 4 GB | 80 GB | More expensive than Hetzner but better US presence |
+| DigitalOcean | s-4vcpu-8gb | ~$48 | 4 | 8 GB | 160 GB | **Proven** — T1 (full mainnet Titan + Observatory) runs here |
 | AWS Lightsail | 2GB | $10 | 2 | 2 GB | 60 GB | Tight on RAM; not recommended |
 | Linode | Nanode | $5 | 1 | 1 GB | 25 GB | Too small for Titan |
 | Vultr | High Perf 2vCPU | $12 | 2 | 4 GB | 64 GB | Works for minimum profile |

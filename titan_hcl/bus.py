@@ -58,12 +58,9 @@ logger = logging.getLogger(__name__)
 _KERNEL_INTERNAL_NAMES: frozenset[str] = frozenset({
     # Guardian self
     "guardian",
-    # Kernel control loops (titan_hcl/core/kernel.py:267-279,690).
-    # Phase 10K (rFP §3G): "meditation" + "sovereignty" removed — they became
-    # separate worker subprocesses (D-SPEC-57/60/64) with their own
-    # BusSocketClient; no kernel-side subscriber uses those names anymore
-    # (plugin.py:1441 confirms the sovereignty alias is retired).
-    "core", "kernel",
+    # Kernel control loops (titan_hcl/core/kernel.py:267-279,690 +
+    # legacy_core.py:55,59,67 — same logical bus names in both code paths)
+    "core", "meditation", "sovereignty", "kernel",
     # Plugin control loops (titan_hcl/core/plugin.py:1470,2099,2640 +
     # legacy_core.py:1193,1386,1848). NOTE: "agency" (NOT "agency_queue" —
     # the Python attr is `_agency_queue` but the bus name is "agency").

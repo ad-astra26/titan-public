@@ -258,7 +258,7 @@ class TestChunk8M5SnapshotShmFallback(unittest.TestCase):
     """Closes rFP §2.8 Gap H + §3.4."""
 
     def test_coordinator_snapshot_includes_shm_keys(self):
-        from titan_hcl.logic.snapshot_builders import build_coordinator_snapshot
+        from titan_hcl.modules.spirit_loop import build_coordinator_snapshot
         snap = build_coordinator_snapshot({"coordinator": _StubCoord()})
         self.assertIsNotNone(snap)
         for key in ("sphere_clocks", "chi", "unified_spirit", "self_162d",
@@ -269,14 +269,14 @@ class TestChunk8M5SnapshotShmFallback(unittest.TestCase):
         self.assertEqual(snap["chi"]["total"], 0.7)
 
     def test_topology_block_enriches_from_shm_when_observables_empty(self):
-        from titan_hcl.logic.snapshot_builders import build_coordinator_snapshot
+        from titan_hcl.modules.spirit_loop import build_coordinator_snapshot
         snap = build_coordinator_snapshot({"coordinator": _StubCoord()})
         topo = snap.get("topology") or {}
         self.assertEqual(topo.get("observables_30d"), [0.0] * 30)
         self.assertIn("head", topo.get("observables_dict", {}))
 
     def test_trinity_snapshot_uses_shm_when_engines_none(self):
-        from titan_hcl.logic.snapshot_builders import build_trinity_snapshot
+        from titan_hcl.modules.spirit_loop import build_trinity_snapshot
         snap = build_trinity_snapshot({
             "coordinator": _StubCoord(),
             "body_state": {"values": [0.5] * 5},

@@ -325,48 +325,8 @@ async def _run_reflex_arc(plugin, prompt_text: str, user_id: str = "") -> str:
     # Spirit Intuition needs consciousness + unified_spirit state
     consciousness_state = state_register.consciousness if state_register else {}
     consciousness = {"latest_epoch": consciousness_state} if consciousness_state else None
-
-    # rFP §3G Phase 10B — restore full reflex wiring. Pre-Phase-10 these were
-    # hardcoded `None`, leaving the spirit-velocity + sphere-clock-pulse
-    # branches (~40% of the logic) dead at runtime, so the observatory
-    # spirit-reflex route returned empty data fleet-wide. Source them from
-    # the Rust L0+L1 canonical SHM slots per ARCHITECTURE_trinity v0.2.2
-    # (D-SPEC-117): unified-spirit velocity/is_stale ← `unified_spirit_metadata`
-    # (NOT the legacy/flat `read_trinity` path — audit §5.5 caveat) and per-clock
-    # pulse counts ← `sphere_clocks`. Lightweight SimpleNamespace shims mimic
-    # the legacy attribute surface the pure function expects (`.velocity`,
-    # `.is_stale`; `.clocks` dict of objects exposing `.pulse_count`).
-    unified_spirit = None
-    sphere_clock = None
-    try:
-        from types import SimpleNamespace
-        bank = getattr(plugin, '_shm_reader_bank', None)
-        if bank is None:
-            from titan_hcl.api.shm_reader_bank import ShmReaderBank
-            bank = ShmReaderBank()
-            try:
-                plugin._shm_reader_bank = bank
-            except Exception:
-                pass
-        if bank is not None:
-            us_meta, clocks_pl = await asyncio.gather(
-                asyncio.to_thread(bank.read_unified_spirit_metadata),
-                asyncio.to_thread(bank.read_sphere_clocks),
-            )
-            if us_meta:
-                unified_spirit = SimpleNamespace(
-                    velocity=float(us_meta.get("velocity", 1.0)),
-                    is_stale=bool(us_meta.get("is_stale", False)),
-                )
-            clocks = (clocks_pl or {}).get("clocks") or {}
-            if clocks:
-                sphere_clock = SimpleNamespace(clocks={
-                    name: SimpleNamespace(pulse_count=float(c.get("pulse_count", 0.0)))
-                    for name, c in clocks.items()
-                })
-    except Exception as e:
-        logger.debug("[ReflexArc] spirit SHM shim build failed (degraded reflex): %s", e)
-
+    unified_spirit = None  # Would need actual object — use None for now
+    sphere_clock = None    # Would need actual object — use None for now
     body_state = {"values": body_tensor}
     mind_state = {"values": mind_tensor}
 
@@ -498,7 +458,8 @@ def create_pre_hook(plugin):
 
     async def titan_pre_hook(agent, run_input, **kwargs):
         """Titan pre-inference hook — memory recall + social recognition + directive injection + gatekeeper."""
-        import torch
+        # Phase 13 §3J.3 — NO `import torch` in agno: the gatekeeper encode moved
+        # host-side (recorder). agno carries zero torch (torch-ectomy, honors 9H).
         nonlocal _directive_verified, _directive_hash, _tier_classifier
 
         if plugin._limbo_mode:
@@ -881,51 +842,26 @@ def create_pre_hook(plugin):
                 directives = []
         _ph_stage("after_directives_fetch")
 
-        # 3. Build state tensor for Gatekeeper (reuse recorder's cached embedder)
-        # ζ.1: gated on "gatekeeper_state" — embedder.encode(convert_to_tensor=True)
-        # is a torch SYNC operation that runs on the asyncio loop (ζ.4 audit
-        # hot spot, agno_hooks.py:721). Greeting/casual/personal tiers skip
-        # this entirely; only reasoning tier pays the cost. RL gatekeeper
-        # only gets training data from reasoning interactions — acceptable
-        # trade per Maker greenlight 2026-05-18.
-        state_tensor = None
-        if "gatekeeper_state" in active_features:
-            try:
-                embedder = plugin.recorder.action_embedder
-                raw_emb = embedder.encode([prompt_text], convert_to_tensor=True)[0]
-                pad_size = 3072 - raw_emb.shape[0]
-                if pad_size > 0:
-                    padded = torch.cat([raw_emb, torch.zeros(pad_size, dtype=torch.float32, device=raw_emb.device)])
-                else:
-                    padded = raw_emb[:3072]
-                state_tensor = plugin.recorder.projection_layer(padded.unsqueeze(0)).squeeze(0)
-                # Store padded embedding for post-hook RL recording (real obs, not random)
-                plugin._last_observation_vector = padded.tolist()
-            except Exception:
-                state_tensor = torch.zeros(128)
-                plugin._last_observation_vector = None
-        else:
-            plugin._last_observation_vector = None
-
-        _ph_stage("after_state_tensor_embed")
-        # 4. Gatekeeper routing decision
-        # ── §A.8.7 (2026-04-28): RLProxy now provides decide_execution_mode,
-        # bus-routed to rl_worker's SageGatekeeper. The pre-A.8.7 `hasattr`
-        # guard silently skipped routing in V6 — restored unconditionally
-        # here. None-guard preserves graceful behavior for legacy parent
-        # path with `a8_sage_scholar_gatekeeper_subprocess_enabled=true`
-        # (where gatekeeper is None — chat falls through to Shadow/LLM).
-        # ζ.1: requires state_tensor → also gated on gatekeeper_state. When
-        # skipped, defaults flow through (mode="direct") and downstream mode
-        # dispatch falls into the LLM-narrate path unchanged.
+        # 3+4. Gatekeeper routing — Phase 13 §3J.3 host-side encode.
+        # The embed + projection (the torch work) now happens in the RECORDER
+        # (a designated torch-host) via `decide_execution_mode_from_prompt`, so
+        # agno carries NO torch. The 3072-d observation is returned for the
+        # post-hook RL recording (real obs preserved). Gated on "gatekeeper_state"
+        # (reasoning tier only); greeting/casual/personal tiers skip → mode=direct.
+        # RL gatekeeper only trains on reasoning interactions (Maker 2026-05-18).
         mode, adv, text = "direct", 0.5, ""
-        if "gatekeeper_state" in active_features and plugin.gatekeeper is not None and state_tensor is not None:
+        plugin._last_observation_vector = None
+        if ("gatekeeper_state" in active_features and plugin.gatekeeper is not None
+                and hasattr(plugin.gatekeeper, "decide_execution_mode_from_prompt")):
             try:
-                mode, adv, text = plugin.gatekeeper.decide_execution_mode(
-                    state_tensor, raw_prompt=prompt_text)
+                mode, adv, text, obs_vec = plugin.gatekeeper.decide_execution_mode_from_prompt(
+                    prompt_text)
+                plugin._last_observation_vector = obs_vec
             except Exception as _gk_err:
-                logger.warning("[PreHook] decide_execution_mode failed: %s", _gk_err)
+                logger.warning("[PreHook] decide_from_prompt failed: %s", _gk_err)
         plugin._last_execution_mode = mode
+
+        _ph_stage("after_gatekeeper_hostside")
 
         _ph_stage("after_gatekeeper")
         # 5. Build context injection based on routing mode

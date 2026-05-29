@@ -42,37 +42,46 @@ _(curate as you go; lifted into the next versioned section at release time)_
 
 ---
 
-## v0.0.1 — TBD
+## v0.0.1 — 2026-05-28 (pre-release)
 
-_The first tagged public release. Placeholder until the actual cut happens;
-`prep_release.sh v0.0.1` will move the relevant items from "[Unreleased]"
-into this section + replace TBD with the date._
+_The first tagged public release — a pre-release cut to validate the full
+install pipeline end-to-end on a fresh box. Formally blessed as the public
+alpha after the in-flight Synthesis Engine soak completes._
 
 ### Highlights
 
-- First public-release tooling end-to-end: setup-release RFP → docs scaffold
-  → Releases pipeline.
+- **The one-liner installer works end-to-end:** `curl … | bash` → guided
+  wizard → a running, sovereign Titan. The whole setup-release pipeline
+  (installer → docs → Releases → public sync) is live.
 
 ### What's in this release
 
-- **README + `docs/`** — front door + 20 user-facing docs (5 content-complete,
-  the rest well-structured outlines that fill in subsequent releases).
+- **`setup_titan` one-liner installer (W1, complete)** — thin `setup_titan.sh`
+  bootstrap → audited in-repo wizard: host preflight, 3 modes
+  (mainnet/devnet/local), venv + deps, Rust-daemon fetch (checksum-verified)
+  or `--build-rust`, inference auto-detect (Ollama → OpenRouter), Telegram +
+  optional X/Observatory, genesis ceremony + Shamir 2-of-3, systemd install +
+  health gate. Plus `config` / `diagnostic` / `upgrade` / `repair` /
+  `uninstall`.
+- **README + `docs/`** — front door + 18 content-complete user-facing docs,
+  including measured hardware profiles.
 - **Release pipeline** — push a `v*` tag on the public repo and a GitHub
-  Release lands automatically with 9 musl daemons + SHA256SUMS.
+  Release lands automatically with 9 musl daemons + SHA256SUMS (plus a
+  localhost-upload fast path).
 - **Public sync** — daily commit-preserving sync from dev to public, with
   gitleaks + grep gates HALTing on any finding.
 
 ### What's *not* yet in this release (deliberately deferred)
 
-- `setup_titan` one-liner installer (W1) — comes in a subsequent release.
-- Most `docs/` are scaffolds; full content fills land per-release as content
-  is written.
+- `--restore` (SSS 2-of-3 recovery flow) — W1.5, its own UX pass.
+- The full-screen Textual TUI wrapper — the CLI wizard is the canonical
+  engine; Textual polish lands post-v0.0.1.
 - Inference providers beyond Ollama + OpenRouter (OpenAI / Anthropic APIs)
   are tracked for later.
 
 ### SPEC version embodied
 
-`titan-docs/specs/SPEC_titan_architecture.md v1.59.0` (internal).
+`titan-docs/specs/SPEC_titan_architecture.md v1.68.0` (internal).
 
 ### Verifying the binaries
 

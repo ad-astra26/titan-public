@@ -250,10 +250,32 @@ def _handle_query(msg: dict, recorder, scholar, gatekeeper, send_queue, name: st
         if action in ("evaluate", "decide_execution_mode"):
             # §A.8.7: Gatekeeper.decide_execution_mode returns (mode, advantage,
             # decoded_text). Caller passes 128-D state_tensor + raw_prompt.
+            # Phase 13 §3J.3 (torch-ectomy agno): when `encode_host_side` is set,
+            # the recorder (a designated torch-host) does the embed + projection
+            # HERE from raw_prompt, so agno carries no torch. The 3072-d padded
+            # observation is returned so agno's post-hook RL recording keeps the
+            # real obs (round-trip; gatekeeper training loop unchanged).
             import torch
-            state = payload.get("state_tensor", payload.get("state", [0.0] * 128))
             raw_prompt = payload.get("raw_prompt", "")
-            state_tensor = torch.tensor(state, dtype=torch.float32)
+            observation_vector = None
+            if payload.get("encode_host_side"):
+                try:
+                    embedder = recorder.action_embedder
+                    raw_emb = embedder.encode([raw_prompt], convert_to_tensor=True)[0]
+                    pad_size = 3072 - raw_emb.shape[0]
+                    if pad_size > 0:
+                        padded = torch.cat([raw_emb, torch.zeros(
+                            pad_size, dtype=torch.float32, device=raw_emb.device)])
+                    else:
+                        padded = raw_emb[:3072]
+                    state_tensor = recorder.projection_layer(padded.unsqueeze(0)).squeeze(0)
+                    observation_vector = padded.tolist()
+                except Exception as _enc_err:
+                    logger.warning("[recorder] host-side encode failed: %s — Shadow", _enc_err)
+                    state_tensor = torch.zeros(128)
+            else:
+                state = payload.get("state_tensor", payload.get("state", [0.0] * 128))
+                state_tensor = torch.tensor(state, dtype=torch.float32)
             mode, advantage, decoded_text = gatekeeper.decide_execution_mode(
                 state_tensor, raw_prompt=raw_prompt,
             )
@@ -261,6 +283,7 @@ def _handle_query(msg: dict, recorder, scholar, gatekeeper, send_queue, name: st
                 "mode": mode,
                 "advantage": float(advantage),
                 "decoded_text": decoded_text,
+                "observation_vector": observation_vector,
                 "sovereignty_score": float(getattr(gatekeeper, "sovereignty_score", 0.0)),
             }, rid)
 

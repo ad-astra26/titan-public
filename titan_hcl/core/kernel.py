@@ -641,15 +641,14 @@ class TitanKernel:
         Called from TitanHCL.boot() per PLAN §3 D10 boot-order
         invariants.
         """
-        # ── bus poll hook — RETIRED Phase 10K (rFP §3G) ──────────────
+        # ── bus poll hook — Phase 6 (D-SPEC-135) ─────────────────────
         # Pre-Phase-6: `bus._poll_fn = self.guardian.drain_send_queues`
         # drained worker→bus queues whenever the bus needed to dispatch a
-        # pending proxy QUERY/RESPONSE. Under Phase 6 worker send queues live
-        # in guardian_hcl process — the kernel has no queues to drain, and
-        # GuardianHCLClient.drain_send_queues became a no-op. The hookup is now
-        # removed entirely: `bus._poll_fn` defaults to None and the bus drain
-        # loop (bus.py:1585 `if self._poll_fn:`) is None-guarded, so dropping it
-        # is a behavior-preserving cleanup.
+        # pending proxy QUERY/RESPONSE. Under Phase 6 worker send queues
+        # live in guardian_hcl process — kernel has no queues to drain.
+        # GuardianHCLClient.drain_send_queues is a no-op preserving the
+        # contract for any residual hook callers.
+        self.bus._poll_fn = self.guardian.drain_send_queues
 
         loop = asyncio.get_event_loop()
 
@@ -1854,7 +1853,7 @@ class TitanKernel:
         change-edge (e.g. metabolism tier re-evaluation).
 
         Uses the SYNC solana.rpc.api.Client (same pattern as
-        logic.trinity_anchor.maybe_anchor_trinity) — NOT the async
+        spirit_loop._maybe_anchor_trinity:L988) — NOT the async
         HybridNetworkClient — because event loops can't be safely shared
         across threads. The async client gets bound to whichever loop
         first calls it; running it from a freshly-spawned thread loop

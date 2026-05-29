@@ -182,6 +182,45 @@ class RLProxy:
             body.get("decoded_text", "") or "",
         )
 
+    def decide_execution_mode_from_prompt(self, raw_prompt: str) -> tuple:
+        """Phase 13 §3J.3 (torch-ectomy agno): host-side encode + decide.
+
+        Sends ONLY the raw prompt; the recorder (a torch-host) does the embed +
+        projection + decision, so the CALLER (agno) carries no torch. Returns
+        (mode, advantage, decoded_text, observation_vector) — the 3072-d obs is
+        returned so the caller's post-hook RL recording keeps the real obs.
+        Hard-fail → ("Shadow", 0.0, "", None) so the chat path never breaks."""
+        self._ensure_started()
+        reply = self._bus.request(
+            "rl_proxy", "recorder",
+            {
+                "action": "decide_execution_mode",
+                "encode_host_side": True,
+                "raw_prompt": raw_prompt,
+            },
+            timeout=self._GATE_TIMEOUT_S,
+            reply_queue=self._reply_queue,
+        )
+        if not reply:
+            logger.warning("[RLProxy] decide_from_prompt timeout — Shadow fallback")
+            return ("Shadow", 0.0, "", None)
+        body = reply.get("payload", {}) or {}
+        if "error" in body:
+            logger.warning("[RLProxy] decide_from_prompt worker error: %s", body["error"])
+            return ("Shadow", 0.0, "", None)
+        try:
+            sov = body.get("sovereignty_score")
+            if sov is not None:
+                self._stats_cache["sovereignty_score"] = float(sov)
+        except Exception:
+            pass
+        return (
+            body.get("mode", "Shadow"),
+            float(body.get("advantage", 0.0)),
+            body.get("decoded_text", "") or "",
+            body.get("observation_vector"),
+        )
+
     # ── §A.8.7 Scholar.dream (async-friendly, LLM-time-scale) ─────
 
     async def dream(self, epochs: int = 50, batch_size: int = 256) -> dict:

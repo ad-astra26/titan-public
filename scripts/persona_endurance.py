@@ -54,6 +54,12 @@ from solders.keypair import Keypair
 
 # ─── Paths ────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# `python scripts/persona_endurance.py` puts scripts/ on sys.path[0], where
+# scripts/titan_hcl.py (the agent entry) SHADOWS the titan_hcl package. Prepend
+# the repo root so the package wins, while keeping scripts/ reachable for the
+# synthesis_soak_lib sibling import (--synthesis mode).
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # scripts/ (sibling imports)
+sys.path.insert(0, str(PROJECT_ROOT))                       # repo root (titan_hcl pkg wins)
 CONFIG_PATH = PROJECT_ROOT / "titan_hcl" / "config.toml"
 LOG_DIR = PROJECT_ROOT / "data" / "logs" / "endurance"
 REPORT_DIR = PROJECT_ROOT / "data" / "endurance_reports"
@@ -1993,7 +1999,47 @@ async def async_main():
         "--v3", action="store_true",
         help="V3 mode: research-heavy, toned-down pacing, tool usage nudges",
     )
+    parser.add_argument(
+        "--synthesis", action="store_true",
+        help="Synthesis soak: engineered P0-P10 load + telemetry on T2/T3 (T1 excluded). "
+             "Crash/restart-resilient, checkpoint/resume, durable JSONL telemetry.",
+    )
+    parser.add_argument(
+        "--targets", type=str, default="T2,T3",
+        help="Synthesis-soak targets (default: T2,T3 — T1 mainnet is excluded by design)",
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume the most-recent synthesis soak toward its original intended end",
+    )
+    parser.add_argument(
+        "--dry-run-synthesis", action="store_true",
+        help="Read-only synthesis pre-flight (NO synthetic load): checkpoint round-trip "
+             "+ telemetry poll + resource probe on T2/T3. Proves the harness is ready.",
+    )
     args = parser.parse_args()
+
+    if args.dry_run_synthesis:
+        import synthesis_soak_lib as _soak
+        cfg = _load_config()
+        internal_key = cfg.get("api", {}).get("internal_key", "")
+        tgts = [t.strip().upper() for t in args.targets.split(",") if t.strip()]
+        rc = await _soak.dry_run(internal_key=internal_key, targets=tgts)
+        sys.exit(rc)
+
+    if args.synthesis:
+        import synthesis_soak_lib as _soak
+        cfg = _load_config()
+        internal_key = cfg.get("api", {}).get("internal_key", "")
+        if not internal_key:
+            logger.error("No internal_key in config.toml [api] — cannot drive /chat")
+            sys.exit(1)
+        tgts = [t.strip().upper() for t in args.targets.split(",") if t.strip()]
+        rc = await _soak.run(
+            duration=args.duration, internal_key=internal_key,
+            targets=tgts, resume=args.resume,
+        )
+        sys.exit(rc)
 
     if args.verify:
         await run_verify_only()
