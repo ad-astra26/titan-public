@@ -29,11 +29,14 @@ def create_tools(plugin):
     Each tool is an async function with a descriptive docstring (Agno uses these
     as the tool's schema description for the LLM).
 
-    Phase 6: if ``plugin.synthesis_tool_plugs`` is set (synthesis_worker has
-    constructed the ToolPlug registry), the tools below route invocations
+    Phase 6 (+ amendment, arch §11.3 / SPEC §25.5): if
+    ``plugin.synthesis_tool_plugs`` is set, the tools below route invocations
     through ``ToolPlug.invoke()`` so every call lands a procedural-fork TX
-    (INV-12). Falls back to the legacy direct-subsystem-call path when the
-    ToolPlug registry is not present (e.g. early-boot or test harness).
+    (INV-12). The registry is built in the process that INVOKES the plug —
+    chat-time tools (coding_sandbox) are constructed in agno_worker
+    (``_build_local_tool_plugs``); dream/autonomous tools in synthesis_worker.
+    Falls back to the legacy direct-subsystem-call path when the ToolPlug
+    registry is not present (e.g. early-boot or test harness).
 
     Args:
         plugin: Initialized TitanHCL instance.
@@ -41,9 +44,11 @@ def create_tools(plugin):
     Returns:
         List of async callables suitable for Agno Agent(tools=[...]).
     """
-    # Pull the ToolPlug registry off the plugin if present (synthesis_worker
-    # wires this at boot during P6.I integration). Each plug is keyed by
-    # tool_id matching the agno tool name.
+    # Pull the ToolPlug registry off the plugin if present. For agno-hosted
+    # chat tools this is wired locally at boot by agno_worker
+    # (_build_local_tool_plugs) — a worker cannot populate another process's
+    # plugin attr (Phase 6 amendment). Each plug is keyed by tool_id matching
+    # the agno tool name.
     tool_plugs = getattr(plugin, "synthesis_tool_plugs", {}) or {}
 
     def _invoke_tool_plug_sync(tool_id: str, args: dict, parent_chat_tx=None):

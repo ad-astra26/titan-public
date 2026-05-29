@@ -816,7 +816,41 @@ def _segment_for_stream(text: str, target_len: int = 200) -> list[str]:
     return segments
 
 
-def _init_worker_plugin_and_agent(bus_client, config: dict[str, Any]):
+def _build_local_tool_plugs(send_queue) -> dict:
+    """Build the chat-time ToolPlug registry IN the agno process (Phase 6
+    amendment, arch §11.3 / SPEC §25.5 — see HANDOFF + SPEC changelog).
+
+    ToolPlugs are instantiated in the process that INVOKES them: chat-time
+    tools live in agno_worker; dream/autonomous tools in synthesis_worker.
+    There is still ONE implementation per tool (INV-12) — it is merely
+    constructed where it executes. The canonical write path (INV-4) holds
+    because the plug anchors its procedural TX via OuterMemoryWriter →
+    TIMECHAIN_COMMIT regardless of host process.
+
+    Rationale for local (not bus-routed to synthesis_worker):
+      • cross-process — a worker cannot populate another process's plugin
+        attr, so the P6.I "synthesis_worker wires this at boot" framing
+        could not work for the agno-hosted chat tools;
+      • G19 — the coding sandbox runs up to 30s (its own AST-gated, 256MB
+        subprocess); a ≤5s work-RPC to synthesis_worker would blow the cap,
+        so execution stays local;
+      • §3J — the sandbox is a transient subprocess (verified torch-free at
+        import + construct), so it does NOT regress agno's lean RSS.
+
+    Scope: coding_sandbox only. `research` routes through `knowledge` when
+    present but falls back to the legacy sage path, and `events_teacher` /
+    `knowledge` require an injected bus-RPC invoke_fn to be functional
+    (a separate gap; not wired here) — only coding_sandbox is self-contained
+    and hard-fails when its plug is absent.
+    """
+    from titan_hcl.synthesis.outer_memory_writer import OuterMemoryWriter
+    from titan_hcl.synthesis.tools.coding_sandbox_tool import CodingSandboxTool
+
+    omw = OuterMemoryWriter(send_queue, "agno_worker")
+    return {"coding_sandbox": CodingSandboxTool(writer=omw)}
+
+
+def _init_worker_plugin_and_agent(bus_client, config: dict[str, Any], send_queue):
     """Construct WorkerPlugin + Agno Agent for this worker subprocess.
 
     Returns (worker_plugin, agent) tuple. Agent.arun() is the entry point
@@ -824,12 +858,26 @@ def _init_worker_plugin_and_agent(bus_client, config: dict[str, Any]):
 
     Construction order matters: hooks/tools/guardrails close over plugin
     references at create_agent time, so worker_plugin MUST be fully
-    initialised before create_agent runs.
+    initialised before create_agent runs — including synthesis_tool_plugs,
+    which agno_tools.create_tools reads off the plugin (Phase 6 amendment).
     """
     from titan_hcl.modules.agno_agent_factory import create_agent
     from titan_hcl.modules.agno_worker_plugin import WorkerPlugin
 
     worker_plugin = WorkerPlugin(bus_client=bus_client, config=config)
+    try:
+        worker_plugin.synthesis_tool_plugs = _build_local_tool_plugs(send_queue)
+        logger.info(
+            "[AgnoWorker] chat-time ToolPlugs wired locally: %s (Phase 6 "
+            "amendment — INV-4/INV-12 preserved via OuterMemoryWriter)",
+            sorted(worker_plugin.synthesis_tool_plugs.keys()),
+        )
+    except Exception as _tp_err:  # noqa: BLE001
+        logger.warning(
+            "[AgnoWorker] local ToolPlug wiring failed — coding_sandbox tool "
+            "will report 'not wired': %s", _tp_err, exc_info=True,
+        )
+        worker_plugin.synthesis_tool_plugs = {}
     agent = create_agent(worker_plugin, agent_config=config.get("agent"))
     return worker_plugin, agent
 
@@ -1069,7 +1117,7 @@ def agno_worker_main(recv_queue, send_queue, name: str,
     worker_plugin: Optional[Any] = None
     agent: Optional[Any] = None
     try:
-        worker_plugin, agent = _init_worker_plugin_and_agent(bus_client, config)
+        worker_plugin, agent = _init_worker_plugin_and_agent(bus_client, config, send_queue)
         logger.info("[AgnoWorker] Agent constructed in %.0fms",
                     (time.time() - boot_start) * 1000)
         _AGENT_READY = (agent is not None and worker_plugin is not None)
