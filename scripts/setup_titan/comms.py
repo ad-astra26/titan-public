@@ -51,12 +51,15 @@ def _prompt_until(question: str, pattern: re.Pattern[str], hint: str) -> str:
         cprint(f"    {hint}", role="warning")
 
 
-def run_comms_phase(*, default: bool) -> list[Result]:
+def run_comms_phase(*, default: bool, state: dict | None = None) -> list[Result]:
     """Phase 5 body — prompt for Telegram (required), X (opt-in), Observatory (opt-in).
 
     `--default`: still asks. Telegram cannot be auto-defaulted (no key to detect
     locally); X / Observatory in --default skip unless the user explicitly opts in.
+    Opting into Observatory sets ``state['observatory_enabled']`` so the later
+    Observatory phase fetches + runs the prebuilt bundle.
     """
+    state = state if state is not None else {}
     results: list[Result] = []
 
     # ── Telegram (required) ────────────────────────────────────────────────
@@ -95,19 +98,20 @@ def run_comms_phase(*, default: bool) -> list[Result]:
         results.append(Result("x_social", "ok",
                               "twitterapi.io → [stealth_sage], Webshare → [twitter_social]"))
 
-    # ── Observatory (opt-in, info-only in v0.0.1) ─────────────────────────
-    if default or not _prompt_yes_no("Enable Observatory web UI? (Heavier: nginx + TLS + domain.)",
-                                      default_yes=False):
+    # ── Observatory (opt-in — installs the prebuilt bundle after boot) ────
+    if default or not _prompt_yes_no(
+            "Enable the Observatory web UI? (prebuilt; runs on localhost:3000)",
+            default_yes=False):
+        state["observatory_enabled"] = False
         results.append(Result("observatory", "ok", "skipped (opt-in)"))
     else:
-        cprint("  Observatory enablement is config-driven. After install, edit:",
+        state["observatory_enabled"] = True
+        cprint("  Observatory will be fetched as a prebuilt bundle from the release and started",
                role="text_strong")
-        cprint("    titan_hcl/config.toml → [observatory] enabled = true", role="text_muted")
-        cprint("  …then arrange your reverse-proxy / TLS / domain. The Observatory listens on :3000.",
+        cprint("  on http://127.0.0.1:3000 after the Titan boots — it reads your local Titan via",
                role="text_muted")
-        cprint("  (Automated Observatory wiring lands in a future setup_titan release — W1.f.)",
-               role="warning")
-        results.append(Result("observatory", "warn",
-                              "opt-in noted; manual config.toml edit + reverse-proxy still required"))
+        cprint("  /v6. For remote access, put your own reverse-proxy / TLS in front of :3000.",
+               role="text_muted")
+        results.append(Result("observatory", "ok", "enabled — prebuilt bundle will install on :3000"))
 
     return results

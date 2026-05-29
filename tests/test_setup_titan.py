@@ -23,6 +23,7 @@ from setup_titan import (  # noqa: E402
     config_seed,
     genesis_runner,
     inference,
+    observatory,
     systemd_runner,
 )
 from setup_titan.__main__ import build_parser  # noqa: E402
@@ -268,6 +269,33 @@ def test_resolve_titan_id_falls_back_to_T1(tmp_path: Path):
     (tmp_path / "data").mkdir()
     (tmp_path / "data" / "titan_identity.json").write_text('{"titan_id": "T7"}')
     assert systemd_runner.resolve_install_titan_id(tmp_path) == "T7"
+
+
+# ── observatory (the #15 prebuilt-bundle phase) ──────────────────────────────
+
+
+def test_observatory_bundle_name_and_fetch_refuses_untagged(tmp_path: Path):
+    assert observatory.bundle_name("v0.0.3") == "titan-observatory-v0.0.3.tar.gz"
+    for ref in ("main", "HEAD", ""):
+        res = observatory.fetch_observatory_bundle(tmp_path, ref)
+        assert res[0].severity == "fail" and "no release tag" in res[0].detail
+
+
+def test_observatory_phase_skips_when_not_enabled(tmp_path: Path):
+    res = observatory.run_observatory_phase({}, tmp_path, tag="v0.0.3", user="bob")
+    assert res[0].severity == "ok" and "skipped" in res[0].detail
+    res2 = observatory.run_observatory_phase({"observatory_enabled": False}, tmp_path,
+                                             tag="v0.0.3", user="bob")
+    assert res2[0].severity == "ok" and "skipped" in res2[0].detail
+
+
+def test_observatory_unit_binds_localhost_and_runs_server(tmp_path: Path):
+    unit = observatory.render_observatory_unit(app_path=Path("/srv/obs"), user="bob", port=3000)
+    assert "server.js" in unit and "WorkingDirectory=/srv/obs" in unit
+    assert "Environment=HOSTNAME=127.0.0.1" in unit       # localhost-only by default
+    assert "Environment=PORT=3000" in unit
+    assert "User=bob" in unit
+    assert "After=titan.service" in unit                  # starts after the brain
 
 
 # ── CLI surface ──────────────────────────────────────────────────────────────

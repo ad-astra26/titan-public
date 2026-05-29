@@ -23,7 +23,7 @@ export const dynamic = 'force-dynamic';
 const VALID_TITANS = new Set<TitanId>(['T1', 'T2', 'T3']);
 
 const TITAN_INTERNAL_URLS: Record<TitanId, string> = {
-  T1: process.env.TITAN_T1_INTERNAL_URL || 'http://localhost:7777',
+  T1: process.env.TITAN_T1_INTERNAL_URL || 'http://127.0.0.1:7777',
   T2: process.env.TITAN_T2_INTERNAL_URL || 'http://10.135.0.6:7777',
   T3: process.env.TITAN_T3_INTERNAL_URL || 'http://10.135.0.6:7778',
 };

@@ -5,10 +5,16 @@ const nextConfig = {
   // keeps serving from the current .next/ — atomic swap at the end gives
   // ~3s of downtime instead of ~5min. See scripts/observatory_deploy.sh.
   distDir: process.env.NEXT_DIST_DIR || '.next',
+  // Env-gated standalone output: CI/release builds set NEXT_STANDALONE=1 to emit
+  // a self-contained .next/standalone/server.js (+ traced minimal node_modules)
+  // that ships in the GitHub Release and runs with plain `node server.js` — no
+  // build (and no full node_modules) on the user's box. Left undefined for the
+  // fleet's normal `next start` deploy (observatory_deploy.sh) so nothing breaks.
+  output: process.env.NEXT_STANDALONE === '1' ? 'standalone' : undefined,
   images: {
     // Titan API origins serve creative-work images:
     //   prod  https://iamtitan.tech/...   (via nginx)
-    //   dev   http://localhost:7777/...   (T1)
+    //   dev   http://127.0.0.1:7777/...   (T1)
     //   LAN   http://10.135.0.6:7777      (T2)
     //   LAN   http://10.135.0.6:7778      (T3)
     // remotePatterns is the Next.js 14 mechanism to allowlist origins for the
@@ -44,11 +50,11 @@ const nextConfig = {
   async rewrites() {
     return [
       // T1 — local backend
-      { source: '/v6/:path*',      destination: 'http://localhost:7777/v6/:path*' },
-      { source: '/v4/:path*',      destination: 'http://localhost:7777/v4/:path*' },
-      { source: '/status',         destination: 'http://localhost:7777/status' },
-      { source: '/status/:path*',  destination: 'http://localhost:7777/status/:path*' },
-      { source: '/health',         destination: 'http://localhost:7777/health' },
+      { source: '/v6/:path*',      destination: 'http://127.0.0.1:7777/v6/:path*' },
+      { source: '/v4/:path*',      destination: 'http://127.0.0.1:7777/v4/:path*' },
+      { source: '/status',         destination: 'http://127.0.0.1:7777/status' },
+      { source: '/status/:path*',  destination: 'http://127.0.0.1:7777/status/:path*' },
+      { source: '/health',         destination: 'http://127.0.0.1:7777/health' },
       // Media (autonomous art / audio under /media/data/studio_exports/...).
       // The same-origin API_BASE change (lib/api.ts) made image src relative
       // (`/media/...`); the Next.js image optimizer fetches the url server-side
@@ -56,12 +62,12 @@ const nextConfig = {
       // covers the next-server optimizer + dev. Without it, the optimizer
       // resolved `/media/...` against its own origin and returned null →
       // "isn't a valid image" → blank Autonomous Art tiles in /feed.
-      { source: '/media/:path*',   destination: 'http://localhost:7777/media/:path*' },
+      { source: '/media/:path*',   destination: 'http://127.0.0.1:7777/media/:path*' },
       // Chat — /api/chat + /api/chat/stream. The /api/v4-cached + /api/page
       // + /api/bff-metrics paths above are Next.js Route Handlers and take
       // precedence over these rewrites (Route Handlers match before rewrites).
-      { source: '/api/chat',           destination: 'http://localhost:7777/api/chat' },
-      { source: '/api/chat/:path*',    destination: 'http://localhost:7777/api/chat/:path*' },
+      { source: '/api/chat',           destination: 'http://127.0.0.1:7777/api/chat' },
+      { source: '/api/chat/:path*',    destination: 'http://127.0.0.1:7777/api/chat/:path*' },
       // T2 / T3 — direct VPS LAN backends, stripping the /t2 + /t3 prefix
       // since the destination is the per-Titan FastAPI root (no prefix on
       // the remote side; prefix exists only for routing on the public host).

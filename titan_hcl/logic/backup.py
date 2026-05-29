@@ -560,46 +560,19 @@ class RebirthBackup:
                 last_age_h = last_age_s / 3600.0
                 summary["last_age_h"] = round(last_age_h, 1)
                 if last_age_h > 24 and not is_local_only:
-                    if self._unified_v2_enabled():
-                        # Maker policy 2026-05-23 (D-SPEC-123 follow-up): NO legacy
-                        # full-tarball upload path when unified_v2 owns backups.
-                        # This boot catch-up (upload_personality_to_arweave, ~50MB)
-                        # was an OVERLOOKED legacy callsite — commit abbf6f84 retired
-                        # the on_meditation_complete fallback but missed this one. It
-                        # (a) re-uploaded a full tarball on EVERY worker restart — the
-                        # SOL drain Maker flagged ("I'm not paying for full daily
-                        # reuploads") — and (b) ran SYNCHRONOUSLY here, before the
-                        # worker's `booted` transition, so on a ~176k-file personality
-                        # tree the ~200s build kept the worker in `starting` past
-                        # Guardian's stale-heartbeat threshold → kill → restart →
-                        # catch-up fires again → boot-loop, which is WHY unified_v2
-                        # never got to ship its first baseline. get_latest_backup_record
-                        # reads legacy data/backup_records/ which unified_v2 never
-                        # writes, so last_age_h is ALWAYS stale under unified_v2 — the
-                        # >24h guard can never gate this off on its own. Unified events
-                        # fire on MEDITATION_COMPLETE; no boot catch-up is needed.
-                        # See RFP_phase_c_enhancements §3B.0 bugs #1/#2/#3.
-                        logger.info(
-                            "[Backup] Boot catch-up SKIPPED — unified_v2 owns "
-                            "backups; legacy full-upload path retired here per Maker "
-                            "2026-05-23 policy (last legacy record %.1fh ago is "
-                            "expected: unified_v2 writes the manifest, not "
-                            "backup_records/)", last_age_h)
-                        summary["catchup_skipped_unified_v2"] = True
-                    else:
-                        logger.info(
-                            "[Backup] Boot catch-up: last personality upload %.1fh ago — firing now",
-                            last_age_h)
-                        summary["catchup_fired"] = True
-                        try:
-                            result = await self.upload_personality_to_arweave()
-                            if result:
-                                tx = result.get("arweave_tx", "local_only")
-                                logger.info("[Backup] Boot catch-up complete: %s", tx)
-                                summary["catchup_result"] = tx
-                        except Exception as e:
-                            logger.warning("[Backup] Boot catch-up failed: %s", e)
-                            summary["catchup_error"] = str(e)
+                    logger.info(
+                        "[Backup] Boot catch-up: last personality upload %.1fh ago — firing now",
+                        last_age_h)
+                    summary["catchup_fired"] = True
+                    try:
+                        result = await self.upload_personality_to_arweave()
+                        if result:
+                            tx = result.get("arweave_tx", "local_only")
+                            logger.info("[Backup] Boot catch-up complete: %s", tx)
+                            summary["catchup_result"] = tx
+                    except Exception as e:
+                        logger.warning("[Backup] Boot catch-up failed: %s", e)
+                        summary["catchup_error"] = str(e)
             elif not latest:
                 logger.info("[Backup] Boot: no prior personality record (first run?)")
         except Exception as e:
@@ -993,7 +966,7 @@ class RebirthBackup:
     # accumulated in tracked dirs over time. NOT live state. Examples:
     #   data/reasoning/policy_net_backup_20260328_pre_reward_fix.json
     #   data/reasoning/meta_autoencoder.json.bak_20260417
-    _BACKUP_SKIP_PATTERNS = ('_backup_', '.bak_', '.bak', '.pre_', '.bksnap')
+    _BACKUP_SKIP_PATTERNS = ('_backup_', '.bak_', '.bak', '.pre_')
 
     # rFP Phase 2 failsafe cascade — local-always snapshot directory
     _LOCAL_BACKUP_DIR = "data/backups"
@@ -1918,13 +1891,6 @@ class RebirthBackup:
         IGNORE_SUFFIXES = (
             ".bak", ".tmp", ".restoring", ".staging",
             ".corrupt", ".repair",
-            # 2026-05-29: backup-snapshot hardlinks created by
-            # diff_encoders/full_ship._race_safe_snapshot. New code places
-            # these in data/.bksnap_scratch (out of tree), but skip-list as
-            # defense in depth so a stray in-tree .bksnap can never be
-            # re-snapshotted into the exponential-orphan blowup that produced
-            # 340,445 phantom hardlinks / 358 GB phantom scope.
-            ".bksnap",
         )
 
         def _ignore(name: str) -> bool:
