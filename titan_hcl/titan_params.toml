@@ -1629,6 +1629,7 @@ social = { min_n = 3, window_size = 20 }
 coding = { min_n = 4, window_size = 15 }
 emotional = { min_n = 6, window_size = 40 }
 knowledge = { min_n = 5, window_size = 30 }
+dreaming = { min_n = 3, window_size = 15 }
 reasoning = { min_n = 5, window_size = 30 }
 reasoning_strategy = { min_n = 5, window_size = 30 }
 self_model = { min_n = 4, window_size = 20 }
