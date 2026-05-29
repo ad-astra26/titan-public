@@ -3302,12 +3302,15 @@ def _check_arc(base_url: str, titan_id: str) -> dict:
         result["details"] = "API unreachable"
         return result
 
-    arc = _svc_unwrap(arc_resp)
+    arc = _svc_unwrap(arc_resp) or {}
     result["active"] = arc.get("active", False)
-    arc_results = arc.get("results", {})
-    games = arc_results.get("games", {})
-    scorecard = arc_results.get("scorecard", {})
-    scorers = arc.get("scorers", {})
+    # `.get(k, {})` returns None when the key EXISTS with a null value (e.g. a
+    # fresh install with no ARC activity sends {"results": null}); `or {}`
+    # coerces that to an empty dict so the chained .get() can't AttributeError.
+    arc_results = arc.get("results", {}) or {}
+    games = arc_results.get("games", {}) or {}
+    scorecard = arc_results.get("scorecard", {}) or {}
+    scorers = arc.get("scorers", {}) or {}
 
     result["total_games"] = len(games)
     if scorecard:
