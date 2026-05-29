@@ -1370,6 +1370,12 @@ def _handle_memory_add(msg: dict, ctx: WorkerContext) -> None:
     text = payload.get("text", "")
     source = payload.get("source", "bus")
     weight = float(payload.get("weight", 1.0))
+    # Phase 10G — Dream Bridge A injections carry a felt-state snapshot
+    # (neuromods + emotion at consolidation time). inject_memory stores it as
+    # JSON in DuckDB; agno_hooks Bridge B reads it back for recall perturbation
+    # (somatic re-experiencing). Pre-10G this handler dropped it, so even when
+    # the bridge fired the felt context never reached the graph.
+    neuromod_context = payload.get("neuromod_context") or None
     if not text:
         logger.debug("[MemoryWorker] MEMORY_ADD ignored (empty text)")
         return
@@ -1377,12 +1383,15 @@ def _handle_memory_add(msg: dict, ctx: WorkerContext) -> None:
         loop = ensure_thread_loop()
         with ctx.write_lock:
             loop.run_until_complete(
-                ctx.memory.inject_memory(text=text, source=source, weight=weight)
+                ctx.memory.inject_memory(
+                    text=text, source=source, weight=weight,
+                    neuromod_context=neuromod_context,
+                )
             )
         logger.info(
             "[MemoryWorker] MEMORY_ADD injected (source=%s, weight=%.2f, "
-            "text_len=%d)",
-            source, weight, len(text),
+            "text_len=%d, felt=%s)",
+            source, weight, len(text), bool(neuromod_context),
         )
     except Exception as e:
         logger.warning("[MemoryWorker] MEMORY_ADD handler error: %s", e,

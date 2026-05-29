@@ -31,15 +31,27 @@ def test_spirit_worker_module_deleted():
         "spirit_worker.py must stay deleted (D-SPEC-116)."
 
 
-def test_spirit_loop_preserved():
-    """spirit_loop.py is KEPT (live imports: _init_consciousness,
-    _run_consciousness_epoch, _compute_spirit_reflex_intuition, …)."""
-    assert importlib.util.find_spec("titan_hcl.modules.spirit_loop") is not None
-    from titan_hcl.modules import spirit_loop
-    assert callable(spirit_loop._compute_spirit_reflex_intuition)
-    # Dead TITAN_SELF/V5 chain removed.
-    assert not hasattr(spirit_loop, "observe_topology")
-    assert not hasattr(spirit_loop, "compose_and_emit_titan_self")
+def test_spirit_loop_fully_retired():
+    """spirit_loop.py is DELETED (rFP §3G Phase 10I) — the orphan helper module
+    left by the deleted spirit_worker is gone. Its live functions were relocated
+    to proper Phase C homes; the Rust/L2-superseded duplicates + orphaned/dead
+    functions were deleted.
+    """
+    # The module no longer exists.
+    assert importlib.util.find_spec("titan_hcl.modules.spirit_loop") is None, \
+        "spirit_loop.py must be deleted (Phase 10I)."
+
+    # Relocated LIVE logic lives in its Phase C homes:
+    from titan_hcl.logic.spirit_helpers import _compute_spirit_reflex_intuition
+    from titan_hcl.logic.consciousness_epoch import (
+        _init_consciousness, _run_consciousness_epoch,
+    )
+    assert callable(_compute_spirit_reflex_intuition)   # 10C
+    assert callable(_init_consciousness)                # 10D
+    assert callable(_run_consciousness_epoch)           # 10D (+ Rust-SHM consumer-fix)
+    # agno_hooks consumes the spirit reflex via the reflex_intuition surface.
+    from titan_hcl.logic.reflex_intuition import _compute_spirit_reflex_intuition as _via_reflex
+    assert _via_reflex is _compute_spirit_reflex_intuition
 
 
 # ── cognitive_worker now subscribes to the 3 re-homed flows ────────────

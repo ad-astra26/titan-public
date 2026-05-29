@@ -325,8 +325,48 @@ async def _run_reflex_arc(plugin, prompt_text: str, user_id: str = "") -> str:
     # Spirit Intuition needs consciousness + unified_spirit state
     consciousness_state = state_register.consciousness if state_register else {}
     consciousness = {"latest_epoch": consciousness_state} if consciousness_state else None
-    unified_spirit = None  # Would need actual object — use None for now
-    sphere_clock = None    # Would need actual object — use None for now
+
+    # rFP §3G Phase 10B — restore full reflex wiring. Pre-Phase-10 these were
+    # hardcoded `None`, leaving the spirit-velocity + sphere-clock-pulse
+    # branches (~40% of the logic) dead at runtime, so the observatory
+    # spirit-reflex route returned empty data fleet-wide. Source them from
+    # the Rust L0+L1 canonical SHM slots per ARCHITECTURE_trinity v0.2.2
+    # (D-SPEC-117): unified-spirit velocity/is_stale ← `unified_spirit_metadata`
+    # (NOT the legacy/flat `read_trinity` path — audit §5.5 caveat) and per-clock
+    # pulse counts ← `sphere_clocks`. Lightweight SimpleNamespace shims mimic
+    # the legacy attribute surface the pure function expects (`.velocity`,
+    # `.is_stale`; `.clocks` dict of objects exposing `.pulse_count`).
+    unified_spirit = None
+    sphere_clock = None
+    try:
+        from types import SimpleNamespace
+        bank = getattr(plugin, '_shm_reader_bank', None)
+        if bank is None:
+            from titan_hcl.api.shm_reader_bank import ShmReaderBank
+            bank = ShmReaderBank()
+            try:
+                plugin._shm_reader_bank = bank
+            except Exception:
+                pass
+        if bank is not None:
+            us_meta, clocks_pl = await asyncio.gather(
+                asyncio.to_thread(bank.read_unified_spirit_metadata),
+                asyncio.to_thread(bank.read_sphere_clocks),
+            )
+            if us_meta:
+                unified_spirit = SimpleNamespace(
+                    velocity=float(us_meta.get("velocity", 1.0)),
+                    is_stale=bool(us_meta.get("is_stale", False)),
+                )
+            clocks = (clocks_pl or {}).get("clocks") or {}
+            if clocks:
+                sphere_clock = SimpleNamespace(clocks={
+                    name: SimpleNamespace(pulse_count=float(c.get("pulse_count", 0.0)))
+                    for name, c in clocks.items()
+                })
+    except Exception as e:
+        logger.debug("[ReflexArc] spirit SHM shim build failed (degraded reflex): %s", e)
+
     body_state = {"values": body_tensor}
     mind_state = {"values": mind_tensor}
 
