@@ -11169,46 +11169,16 @@ async def get_v4_timechain_blocks(request: Request, fork: int = 0,
 # Same fix template as /v4/timechain/status: separate warmer thread (verify
 # is more expensive than status, so longer interval — 60s) + bounded
 # cold-boot fallback.
-#
-# D-SPEC-143 F2 (2026-05-29): the warmer was the api's #1 CPU consumer —
-# profiling showed it re-hashing the ENTIRE ~200 MB chain (verify_all → sha256
-# every fork) every 60s; cost grew with the chain (data-growth regression). Now
-# INCREMENTAL: per fork, resume from the previously-verified tip (cached in
-# _tc_verify_resume) and hash only blocks appended since. Unchanged forks cost
-# one seek + a 0-byte read. Full re-verify fallback on any resume inconsistency
-# (file shrank/rewrote → valid=None). Same output shape as verify_all.
 _tc_verify_cache: dict = {"data": None, "updated_at": 0.0}
-_tc_verify_resume: dict = {}  # fork_id -> resume {offset,height,prev_hash,height_offset}
 _TC_VERIFY_WARMER_INTERVAL_S = 60.0
 _tc_verify_warmer_started = {"flag": False}
 
 
 def _build_tc_verify_snapshot_sync() -> dict:
-    """Synchronous builder — chain integrity verification (incremental, F2)."""
+    """Synchronous builder — chain integrity verification."""
     tc = _get_cached_tc()
-    fork_ids = sorted(getattr(tc, "_fork_tips", {}).keys())
-    if not fork_ids or not hasattr(tc, "verify_fork_incremental"):
-        # No fork registry / older TimeChain — full verify_all (safe fallback).
-        valid, results = tc.verify_all()
-        return {"valid": valid, "results": results}
-    from titan_hcl.logic.timechain import FORK_NAMES
-    results: list[str] = []
-    all_valid = True
-    for fork_id in fork_ids:
-        resume = _tc_verify_resume.get(fork_id)
-        valid, msg, new_resume = tc.verify_fork_incremental(fork_id, resume)
-        if valid is None:
-            # resume cache stale (file shrank/rewrote) → full re-verify this fork
-            _tc_verify_resume.pop(fork_id, None)
-            valid, msg, new_resume = tc.verify_fork_incremental(fork_id, None)
-        if valid and new_resume is not None:
-            _tc_verify_resume[fork_id] = new_resume
-        elif not valid:
-            _tc_verify_resume.pop(fork_id, None)  # never cache a failed tip
-            all_valid = False
-        results.append(
-            f"Fork {fork_id} ({FORK_NAMES.get(fork_id, f'sc_{fork_id}')}): {msg}")
-    return {"valid": all_valid, "results": results}
+    valid, results = tc.verify_all()
+    return {"valid": valid, "results": results}
 
 
 def _start_tc_verify_warmer() -> None:
