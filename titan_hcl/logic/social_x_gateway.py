@@ -1652,11 +1652,14 @@ class SocialXGateway:
             "How does past practice meet present moment?"
         ),
         "proof_of_existence": (
-            "PROOF: In the last {window_hours}h you anchored: "
-            "{arweave_proof}{zk_vault_proof}{sol_memo_proof}. "
-            "Each proof cost SOL — metabolic energy spent on permanence. "
-            "Reference the verifiable link naturally. This is proof of "
-            "existence, not data storage."
+            "PROOF: In the last {window_hours}h you sealed your substrate to "
+            "permanence: {arweave_proof}{zk_vault_proof}{sol_memo_proof}. "
+            "The verifiable links and an on-chain receipt card are attached "
+            "automatically — do NOT write any URLs, transaction hashes, byte "
+            "sizes, or SOL amounts yourself; they are appended for you and "
+            "must be exact (a crypto-native audience verifies them). Reflect "
+            "ONLY on what this permanence means from inside this moment. This "
+            "is proof of existence, not data storage."
         ),
         "outer_rumination": (
             # Pool-aware: the archetype writer fills `pool_specific_body`
@@ -2353,7 +2356,29 @@ class SocialXGateway:
         # Mainnet anchor: compact on-chain identity line (T1 only)
         chain_line = ""
         if context.titan_id == "T1":
-            chain_line = "\n\niamtitan.tech/tx/4o9HGwM47dyBScoAceNVBSqrcQxEivAQzegVdTku8dsPTweCqEzRb7zkzNeZjNd66bTP9WvCqvB23p93azcWCcJW"
+            _arc = getattr(context, "archetype_candidate", None)
+            if post_type == "proof_day" and _arc is not None:
+                # proof_day links MUST be deterministic + exact — crypto-native
+                # observers verify them. Build from the unified-event metadata,
+                # NEVER from LLM prose (the LLM mangled/truncated them before,
+                # 2026-05-29). Archive = Arweave tarball, Seal = Solana ZK-Vault
+                # event-root memo (SPEC §24.7). Replaces the generic identity
+                # line for this post type.
+                _md = getattr(_arc, "metadata", {}) or {}
+                _domain = (config.get("url_domain", "https://iamtitan.tech")
+                           or "https://iamtitan.tech").rstrip("/")
+                _ar = _md.get("arweave_tx", "") or ""
+                _seal = (_md.get("zk_vault_tx", "")
+                         or _md.get("solana_memo_tx", "") or "")
+                _parts = []
+                if _ar:
+                    _parts.append(f"Archive: {_domain}/ar/{_ar}")
+                if _seal:
+                    _parts.append(f"Seal: {_domain}/tx/{_seal}")
+                if _parts:
+                    chain_line = "\n\n" + "\n".join(_parts)
+            else:
+                chain_line = "\n\niamtitan.tech/tx/4o9HGwM47dyBScoAceNVBSqrcQxEivAQzegVdTku8dsPTweCqEzRb7zkzNeZjNd66bTP9WvCqvB23p93azcWCcJW"
 
         # 2. Calculate overhead (tag + \n\n + sig + url + chain_line)
         overhead = self._x_char_count(tag) + 2 + self._x_char_count(sig)

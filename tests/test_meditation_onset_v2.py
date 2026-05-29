@@ -21,6 +21,9 @@ CFG = dict(
     debt_onset=1500,
     debt_ramp=900,
     max_interval_s=21600.0,
+    min_interval_s=300.0,   # 4h in prod; small here so the balance/epoch logic
+                            # tests (time_since_last=600) clear the floor. The
+                            # floor itself is covered by test_time_floor_* below.
     min_epochs=1500,
 )
 
@@ -56,6 +59,20 @@ class TestNaturalBalanceTrigger:
         d = _eval(gains=[1.0] * 6, balance_ema=1.0, epoch_gap=1000,
                   time_since_last=600.0)
         assert d["fire"] is False
+
+    def test_time_floor_blocks_early_fire(self):
+        # 2026-05-29 fix: meditation is a SPARSE ~4×/day event. Even perfectly
+        # balanced + well past min_epochs, it must NOT fire before the TIME floor
+        # (min_interval_s) — this is what stopped the ~every-30min runaway caused
+        # by the ~3Hz epoch tick vs the 7s/epoch the epoch gate assumed.
+        d = _eval(gains=[1.0] * 6, balance_ema=1.0, epoch_gap=100000,
+                  time_since_last=120.0, min_interval_s=14400.0)
+        assert d["fire"] is False, "time floor must block emergent fire before min_interval_s"
+        # ...and once the floor elapses, the same balanced state DOES fire.
+        d2 = _eval(gains=[1.0] * 6, balance_ema=1.0, epoch_gap=100000,
+                   time_since_last=15000.0, min_interval_s=14400.0)
+        assert d2["fire"] is True
+        assert d2["reason"] == "homeostatic_balance_sustained"
 
     def test_arousal_raises_agitation_drive(self):
         lo = _eval(arousal=0.0, gains=[1.2] * 6, balance_ema=0.5)
