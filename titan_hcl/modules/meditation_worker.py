@@ -273,6 +273,7 @@ def evaluate_meditation_onset(
     debt_onset: int,
     debt_ramp: int,
     max_interval_s: float,
+    min_interval_s: float,
     min_epochs: int,
 ) -> dict:
     """Pure meditation onset-v2 decision (rFP_meditation_emergent_onset_redesign).
@@ -298,6 +299,12 @@ def evaluate_meditation_onset(
     first_ever = meditation_count == 0 and epoch_gap > min_epochs
     natural_fire = (
         last_epoch > 0
+        and time_since_last > min_interval_s  # TIME floor — meditation is a SPARSE
+                                              # ~4×/day event; emergent onset cannot
+                                              # fire before this regardless of epoch
+                                              # count (epoch rate is unreliable/variable
+                                              # — gating on epochs alone fired ~every
+                                              # 30min). Dreaming is the frequent one.
         and epoch_gap > min_epochs
         and agitation < balance_band      # genuinely balanced this tick (low deviation)
         and meditate_drive > agitation_drive
@@ -922,7 +929,10 @@ def meditation_worker_main(recv_queue, send_queue, name: str,
     _med_balance_half_life = float(med_cfg.get("balance_half_life_epochs", 50.0))  # sustained-calm EMA half-life
     _med_debt_onset = int(med_cfg.get("debt_onset_epochs", 1500))         # epochs before meditation-debt starts ramping
     _med_debt_ramp = int(med_cfg.get("debt_ramp_epochs", 900))            # ramp width (mirror sleep debt)
-    _med_max_interval_s = float(med_cfg.get("max_interval_seconds", 21600.0))  # HARD cadence floor (≈6h ⇒ ~4×/day)
+    _med_max_interval_s = float(med_cfg.get("max_interval_seconds", 21600.0))  # HARD cadence CEILING (≈6h ⇒ force-fire)
+    _med_min_interval_s = float(med_cfg.get("min_interval_seconds", 14400.0))  # TIME FLOOR (4h) — emergent onset cannot
+                                                                               # fire before this (meditation is the SPARSE
+                                                                               # ~4×/day event; epoch-only gating fired ~30min)
     _med_inertia_s = float(med_cfg.get("meditation_inertia_seconds", 1800.0))  # refractory after a completed meditation
     _med_k_agit = float(med_cfg.get("agitation_norm", 1.0))               # normalizer: balance = 1 − agitation/k
     # Legacy emergent params (drain_threshold/gaba_offset) retained for the
@@ -1096,6 +1106,7 @@ def meditation_worker_main(recv_queue, send_queue, name: str,
             debt_onset=_med_debt_onset,
             debt_ramp=_med_debt_ramp,
             max_interval_s=_med_max_interval_s,
+            min_interval_s=_med_min_interval_s,
             min_epochs=_med_min_epochs,
         )
         # Always advance the sustained-calm EMA (even when not firing).
