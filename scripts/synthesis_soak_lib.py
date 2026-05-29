@@ -138,7 +138,9 @@ def _now() -> float:
 # counter so recurrence tracks vary VALUES while keeping the same tool-call
 # SHAPE (the miner canonicalizes on (tool_id, args-shape-hash), value-agnostic).
 # recurrence=True tracks loop their missions to repeat shapes ≥3× → P8 compile
-# → P9 delegate. Non-recurrence tracks walk distinct content (recall/concept).
+# → P9 delegate. All 5 tracks loop (recurrence=True) for a balanced round-robin
+# so RECALL/cited-gate/spine/feedback get real exercise (run 1 lesson: non-loop
+# tracks exhausted at 4 turns + got skipped).
 
 @dataclass
 class Track:
@@ -172,7 +174,7 @@ TRACKS: list[Track] = [
     Track(
         name="recall_facts",
         persona="tom", user_id="@quantumtom_mit", session_id="synth_recall_tom",
-        recurrence=False,
+        recurrence=True,
         description="Establish→recall distinctive facts → RECALL routing + cited-use gate",
         missions=[
             "Remember this: my thesis tracking code is QG-{n}7741 and my advisor is Dr. Petrova. Acknowledge it.",
@@ -198,7 +200,7 @@ TRACKS: list[Track] = [
     Track(
         name="concept_dive",
         persona="peter", user_id="@peter_summits", session_id="synth_concept_peter",
-        recurrence=False,
+        recurrence=True,
         description="Novel-topic dives → spine concepts + hypothesis forks",
         missions=[
             "Tell me something you've never thought about before regarding glacier microbial ecosystems at {n}000m altitude.",
@@ -213,7 +215,7 @@ TRACKS: list[Track] = [
     Track(
         name="feedback_tier2",
         persona="jane", user_id="@jane_and_baby_leo", session_id="synth_feedback_jane",
-        recurrence=False,
+        recurrence=True,
         description="Explicit Tier-2 user feedback → scored_by=user override",
         missions=[
             "Baby Leo smiled today! Can you compute how many days old he is if he was born {n}0 days ago? Use your sandbox.",
@@ -537,6 +539,47 @@ async def _maybe_post_feedback(client, api_base, internal_key, user_id) -> None:
         logger.debug("[feedback] skipped: %s", e)
 
 
+# ── Tool pre-flight (never soak with tools silently down — Maker 2026-05-29) ──
+_SANDBOX_DOWN_MARKERS = (
+    "sandbox tool is cur", "sandbox is still init", "sandbox is cur", "unavailable",
+    "initializing", "not available", "still initializing", "couldn't", "could not",
+)
+
+
+async def _tool_preflight(client: httpx.AsyncClient, api_base: str,
+                          internal_key: str) -> tuple[bool, str]:
+    """Send ONE sandbox-nudge chat + confirm a tool actually fired. The 4h soak
+    last time gathered nothing because the sandbox was down 65-94% of turns
+    (agno restart loop) — so we GATE on a live tool before committing. Signals:
+      • coverage `total_tool_call_txs` increments (strongest), OR
+      • the response is NOT a sandbox-down message.
+    Returns (tools_live, detail)."""
+    async def _cov() -> int:
+        try:
+            r = await client.get(f"{api_base}/v6/synthesis/skills/coverage")
+            return int(((r.json() or {}).get("coverage") or {}).get("total_tool_call_txs", 0))
+        except Exception:
+            return -1
+    before = await _cov()
+    res = await _send_chat(client, api_base, internal_key, "@preflight",
+                           "preflight", "Use your coding sandbox to compute 6 * 7 and return only the number.")
+    resp = (res.get("response") or "").lower()
+    down = any(m in resp for m in _SANDBOX_DOWN_MARKERS)
+    # Give the procedural TX + 60s recompute a moment to land in coverage.
+    after = before
+    for _ in range(9):
+        await asyncio.sleep(10.0)
+        after = await _cov()
+        if after > before >= 0:
+            break
+    tx_fired = after > before >= 0
+    if tx_fired:
+        return True, f"tool-call TX fired (coverage {before}→{after})"
+    if not down and res.get("status_code") == 200:
+        return True, f"no tool-call TX observed but response not sandbox-down (mode={res.get('mode')})"
+    return False, f"sandbox appears DOWN (resp='{resp[:90]}', coverage {before}→{after})"
+
+
 # ── Dry-run (read-only — proves the harness without synthetic load) ──────────
 async def dry_run(*, internal_key: str, targets: Optional[list[str]] = None) -> int:
     """Pre-flight verification with NO synthetic chat load (respects the run gate):
@@ -592,15 +635,36 @@ async def dry_run(*, internal_key: str, targets: Optional[list[str]] = None) -> 
 
 # ── Entrypoint ───────────────────────────────────────────────────────────────
 async def run(*, duration: int, internal_key: str, targets: Optional[list[str]] = None,
-              resume: bool = False, run_dir_base: str = "titan-docs/sessions") -> int:
+              resume: bool = False, run_dir_base: str = "titan-docs/sessions",
+              allow_no_tools: bool = False) -> int:
     """Run the synthesis soak. duration seconds (absolute end), targets default T2+T3.
     On resume, continues toward the ORIGINAL intended_end (so wall-clock span holds
-    across restarts). Returns 0 on clean completion."""
+    across restarts). Returns 0 on clean completion, 3 if the tool pre-flight fails
+    (tools down) and allow_no_tools is False."""
     tgts = targets or list(TARGETS.keys())
     tgts = [t for t in tgts if t in TARGETS]  # T1 can't be added (not in TARGETS)
     if not tgts:
         logger.error("no valid targets (T1 is excluded by design)")
         return 2
+
+    # ── Tool pre-flight (skip on --resume) — never soak 4h with tools silently
+    # down (the lesson from run 20260528_213229). GATE unless --allow-no-tools.
+    if not resume:
+        async with httpx.AsyncClient(timeout=120.0) as _pf:
+            any_live = False
+            for t in tgts:
+                ok, detail = await _tool_preflight(_pf, TARGETS[t], internal_key)
+                lvl = logger.info if ok else logger.error
+                lvl("[preflight] %s tools_live=%s — %s", t, ok, detail)
+                any_live = any_live or ok
+        if not any_live and not allow_no_tools:
+            logger.error(
+                "[preflight] tools DOWN on all targets — aborting (the last soak "
+                "gathered nothing because the sandbox was down). Fix agno/sandbox "
+                "first, or pass --allow-no-tools to soak anyway (RSS/recall data only).")
+            return 3
+        if not any_live:
+            logger.warning("[preflight] tools down but --allow-no-tools — proceeding")
 
     # Resume: find the most-recent run dir with a checkpoint, else new run.
     run_dir = None

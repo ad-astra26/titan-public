@@ -2017,6 +2017,11 @@ async def async_main():
         help="Read-only synthesis pre-flight (NO synthetic load): checkpoint round-trip "
              "+ telemetry poll + resource probe on T2/T3. Proves the harness is ready.",
     )
+    parser.add_argument(
+        "--allow-no-tools", action="store_true",
+        help="Proceed with the soak even if the tool pre-flight finds the sandbox "
+             "down (gathers RSS/recall data only). Default: abort if tools are down.",
+    )
     args = parser.parse_args()
 
     if args.dry_run_synthesis:
@@ -2038,6 +2043,7 @@ async def async_main():
         rc = await _soak.run(
             duration=args.duration, internal_key=internal_key,
             targets=tgts, resume=args.resume,
+            allow_no_tools=args.allow_no_tools,
         )
         sys.exit(rc)
 
