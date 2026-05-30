@@ -275,20 +275,9 @@ class SocialGraph:
                     is_following INTEGER DEFAULT 0,
                     last_synced REAL DEFAULT 0,
                     last_tweet_text TEXT DEFAULT '',
-                    last_tweet_time REAL DEFAULT 0,
-                    last_tweet_id TEXT DEFAULT ''
+                    last_tweet_time REAL DEFAULT 0
                 )
             """)
-            # Forward migration (2026-05-30): add last_tweet_id to existing
-            # community_registry tables so reflections can quote-tweet the
-            # source post (was text-only). ADD COLUMN is non-blocking; an
-            # OperationalError means the column already exists — safe to skip.
-            try:
-                conn.execute(
-                    "ALTER TABLE community_registry "
-                    "ADD COLUMN last_tweet_id TEXT DEFAULT ''")
-            except sqlite3.OperationalError:
-                pass
             conn.commit()
 
     # -------------------------------------------------------------------------
@@ -845,28 +834,14 @@ class SocialGraph:
             table="titan_social_preferences",
         )
 
-    def update_last_tweet(self, user_name: str, tweet_text: str,
-                          tweet_id: str = ""):
-        """Cache a user's latest tweet (text + id) in the community registry.
-
-        tweet_id (2026-05-30) lets reflection archetypes quote-tweet the source
-        post so the author is properly notified + the engagement threads under
-        their tweet. Empty tweet_id leaves the prior value untouched (so a
-        text-only refresh path doesn't wipe a known id)."""
-        if tweet_id:
-            self._route_write(
-                "UPDATE community_registry SET last_tweet_text=?, "
-                    "last_tweet_time=?, last_tweet_id=? WHERE user_name=?",
-                (tweet_text[:500], time.time(), str(tweet_id), user_name),
-                table="community_registry",
-            )
-        else:
-            self._route_write(
-                "UPDATE community_registry SET last_tweet_text=?, "
-                    "last_tweet_time=? WHERE user_name=?",
-                (tweet_text[:500], time.time(), user_name),
-                table="community_registry",
-            )
+    def update_last_tweet(self, user_name: str, tweet_text: str):
+        """Cache a user's latest tweet in the community registry."""
+        self._route_write(
+            "UPDATE community_registry SET last_tweet_text=?, last_tweet_time=? "
+                "WHERE user_name=?",
+            (tweet_text[:500], time.time(), user_name),
+            table="community_registry",
+        )
 
     # -------------------------------------------------------------------------
     # Async companions (rFP_social_graph_async_safety Option A+)
