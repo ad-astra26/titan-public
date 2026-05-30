@@ -246,7 +246,7 @@ class BackupCascade:
                 "wallet_keypair_path", "")
             if not keypair or not os.path.exists(keypair):
                 return False, 0.0, "no_keypair"
-            out = subprocess.check_output(
+            out = subprocess.check_output(  # noqa: async-block — backup cascade runs via loop.run_until_complete on a dedicated sequential worker loop — no concurrent coroutines to starve, not the FastAPI loop
                 ["node", "scripts/irys_upload.js", "balance", keypair,
                  "https://api.mainnet-beta.solana.com"],
                 env={**os.environ, "NODE_PATH": _node_path()},
@@ -361,7 +361,7 @@ class BackupCascade:
 
         # Step 1 — query current Irys balance
         try:
-            out = subprocess.check_output(
+            out = subprocess.check_output(  # noqa: async-block — backup cascade runs via loop.run_until_complete on a dedicated sequential worker loop — no concurrent coroutines to starve, not the FastAPI loop
                 ["node", "scripts/irys_upload.js", "balance", keypair,
                  "https://api.mainnet-beta.solana.com"],
                 env={**os.environ, "NODE_PATH": _node_path()},
@@ -403,7 +403,7 @@ class BackupCascade:
 
         # Step 4 — query wallet (T1 mainnet runtime keypair)
         try:
-            wallet_out = subprocess.check_output(
+            wallet_out = subprocess.check_output(  # noqa: async-block — backup cascade runs via loop.run_until_complete on a dedicated sequential worker loop — no concurrent coroutines to starve, not the FastAPI loop
                 ["solana", "balance", "-k", keypair, "-u", "mainnet-beta"],
                 timeout=30,
             )
@@ -432,7 +432,7 @@ class BackupCascade:
         # Step 7 — execute fund tx
         lamports = int(top_up * 1e9)
         try:
-            fund_out = subprocess.check_output(
+            fund_out = subprocess.check_output(  # noqa: async-block — backup cascade runs via loop.run_until_complete on a dedicated sequential worker loop — no concurrent coroutines to starve, not the FastAPI loop
                 ["node", "scripts/irys_upload.js", "fund", str(lamports),
                  keypair, "https://api.mainnet-beta.solana.com"],
                 env={**os.environ, "NODE_PATH": _node_path()},
@@ -498,7 +498,7 @@ class BackupCascade:
             try:
                 if size_mb < 50:
                     # Small: full fetch + hash compare
-                    with urllib.request.urlopen(url, timeout=60) as resp:
+                    with urllib.request.urlopen(url, timeout=60) as resp:  # noqa: async-block — backup cascade runs via loop.run_until_complete on a dedicated sequential worker loop — no concurrent coroutines to starve, not the FastAPI loop
                         data = resp.read()
                     actual = hashlib.sha256(data).hexdigest()
                     if actual == expected_sha256:
@@ -512,7 +512,7 @@ class BackupCascade:
                     return False
                 # Large: HEAD-only reachability check
                 req = urllib.request.Request(url, method="HEAD")
-                with urllib.request.urlopen(req, timeout=15) as resp:
+                with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: async-block — backup cascade runs via loop.run_until_complete on a dedicated sequential worker loop — no concurrent coroutines to starve, not the FastAPI loop
                     if 200 <= resp.status < 300:
                         logger.info(
                             "[Cascade] S6 verify OK (HEAD 200) tx=%s attempt=%d",
@@ -882,7 +882,7 @@ def _hash_file(path: str) -> str:
 
 def _node_path() -> str:
     try:
-        return subprocess.check_output(
+        return subprocess.check_output(  # noqa: async-block — backup cascade runs via loop.run_until_complete on a dedicated sequential worker loop — no concurrent coroutines to starve, not the FastAPI loop
             ["npm", "root", "-g"], timeout=10
         ).decode().strip()
     except Exception:

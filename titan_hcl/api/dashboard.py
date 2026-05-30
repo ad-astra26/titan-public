@@ -3105,7 +3105,7 @@ async def get_v6_polarity_homeostat(
         def _read_events_blocking():
             import sqlite3 as _sqlite3
             cutoff = time.time() - (hours * 3600)
-            conn = _sqlite3.connect(consciousness_db_path, timeout=5)
+            conn = _sqlite3.connect(consciousness_db_path, timeout=5)  # noqa: async-block — already offloaded via asyncio.to_thread at the in-loop callsite (L3126); this is the no-loop sync fallback
             try:
                 conn.execute("PRAGMA query_only=1")
                 conn.row_factory = _sqlite3.Row
