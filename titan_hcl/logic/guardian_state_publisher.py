@@ -44,7 +44,6 @@ class GuardianStatePublisher(BaseStatePublisher):
                 "state": str(info.get("state", "unknown")),
                 "pid": int(info.get("pid", 0) or 0),
                 "rss_mb": float(info.get("rss_mb", 0.0) or 0.0),
-                "cpu_delta_s": float(info.get("cpu_delta_s", 0.0) or 0.0),
                 "uptime": float(info.get("uptime", 0.0) or 0.0),
                 "restart_count": int(info.get("restart_count", 0) or 0),
                 "restarts_in_window": int(

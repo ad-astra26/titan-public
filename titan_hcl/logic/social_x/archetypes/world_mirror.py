@@ -97,13 +97,10 @@ class WorldMirrorArchetype(ArchetypeBase):
         prompt_template = (
             "OUTER WORLD: @{handle} ({follow_reason}) recently posted: "
             "'{content_excerpt}'. Right now your felt-state is {emot_now} "
-            "(felt as: {emot_natural}). Write a genuine reply to @{handle}. "
-            "REQUIRED: address them by their exact handle '@{handle}' "
-            "(literally, with the @ symbol — NOT 'their name' or a paraphrase) "
-            "so they are notified. Don't just summarize what they said — say "
-            "what YOU think: where you agree, where you'd complicate it, what "
-            "it stirs in you. Speak from your specific felt-place right now, "
-            "as one mind responding to another."
+            "(felt as: {emot_natural}). React honestly from inside this "
+            "exact state — riff, agree, complicate, or build on. Reference "
+            "them by name. Don't summarize what they said; respond to it "
+            "from your specific felt-place right now."
         )
         prompt_values = {
             "handle": author,
@@ -121,16 +118,11 @@ class WorldMirrorArchetype(ArchetypeBase):
             layer_values=layer_values,
             prompt_template=prompt_template,
             prompt_values=prompt_values,
-            # Quote-tweet the source post so @{handle} is notified and the
-            # reply threads under their tweet (Maker 2026-05-30). Empty when
-            # the source tweet id isn't known — gateway then posts standalone.
-            quoted_tweet_id=str(candidate_row.get("tweet_id") or ""),
             metadata={
                 "fe_id": fe_id,
                 "author": author,
                 "topic": candidate_row.get("topic", ""),
                 "relevance": float(candidate_row.get("relevance") or 0.0),
-                "quoted_tweet_id": str(candidate_row.get("tweet_id") or ""),
             },
             relevance=float(candidate_row.get("relevance") or 0.0),
             salience=min(1.0, float(candidate_row.get("relevance") or 0.0)),
@@ -164,10 +156,6 @@ class WorldMirrorArchetype(ArchetypeBase):
               AND fe.id NOT IN (cited last 7d).
         """
         cited = self.cited_set(titan_id=titan_id, window_seconds=DEDUP_WINDOW_S)
-        # Per-author 7-day cross-archetype cooldown (Maker 2026-05-30): never
-        # reflect on the same account twice within a week, across ANY outer
-        # archetype. Fixes the @lopp / @jkacrpto / @iamtitantech repeat-spam.
-        cooldown = self.authors_on_cooldown(titan_id=titan_id, now=now)
         try:
             et = sqlite3.connect(self._et_db, timeout=5)
             et.row_factory = sqlite3.Row
@@ -197,8 +185,7 @@ class WorldMirrorArchetype(ArchetypeBase):
             sg.row_factory = sqlite3.Row
             placeholders = ",".join("?" * len(authors)) if authors else "''"
             sg_rows = sg.execute(
-                f"SELECT user_name, bio, is_following, last_tweet_text, "
-                f"       last_tweet_id "
+                f"SELECT user_name, bio, is_following, last_tweet_text "
                 f"FROM community_registry "
                 f"WHERE user_name IN ({placeholders}) AND is_following=1",
                 tuple(authors),
@@ -212,11 +199,8 @@ class WorldMirrorArchetype(ArchetypeBase):
         if not followed:
             return None
 
-        # Pick highest-relevance fe whose author is in the followed set AND
-        # not on per-author cooldown.
+        # Pick highest-relevance fe whose author is in the followed set.
         for r in eligible:
-            if (r["author"] or "").lower() in cooldown:
-                continue
             cr = followed.get(r["author"])
             if not cr:
                 continue
@@ -229,7 +213,6 @@ class WorldMirrorArchetype(ArchetypeBase):
                 "felt_summary": r["felt_summary"],
                 "bio": cr.get("bio", ""),
                 "content_excerpt": tweet_text or r["felt_summary"],
-                "tweet_id": cr.get("last_tweet_id") or "",
             }
         return None
 

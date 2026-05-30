@@ -288,8 +288,7 @@ class OuterInnerBridgeArchetype(ArchetypeBase):
             sg.row_factory = sqlite3.Row
             placeholders = ",".join("?" * len(authors)) if authors else "''"
             for r in sg.execute(
-                f"SELECT user_name, bio, last_tweet_text, last_tweet_id "
-                f"FROM community_registry "
+                f"SELECT user_name, bio, last_tweet_text FROM community_registry "
                 f"WHERE user_name IN ({placeholders}) AND is_following=1",
                 tuple(authors),
             ).fetchall():
@@ -298,21 +297,16 @@ class OuterInnerBridgeArchetype(ArchetypeBase):
         except Exception as e:
             logger.warning("[oinb] community_registry probe failed: %s", e)
             return []
-        # Per-author 7-day cross-archetype cooldown (Maker 2026-05-30).
-        cooldown = self.authors_on_cooldown(titan_id=titan_id, now=now)
         out: list[dict] = []
         for r in rows:
             if str(r["id"]) in cited:
                 continue
             if r["author"] not in followed:
                 continue
-            if (r["author"] or "").lower() in cooldown:
-                continue
             d = dict(r)
             d["bio"] = followed[r["author"]].get("bio", "")
             d["content_excerpt"] = (followed[r["author"]].get("last_tweet_text")
                                      or r["felt_summary"])
-            d["tweet_id"] = followed[r["author"]].get("last_tweet_id") or ""
             out.append(d)
         return out
 
@@ -471,13 +465,10 @@ class OuterInnerBridgeArchetype(ArchetypeBase):
             "This lands against your inner grounding of '{concept}' from "
             "{epochs_ago} epochs ago (encountered {times_encountered}× since). "
             "At grounding moment your felt-state was: '{grounding_felt}'. "
-            "Right now your felt-state is: '{emot_now}'. Reply to @{handle} "
-            "directly — address them by their exact handle '@{handle}' "
-            "(literally, with the @ symbol) so they are notified. What does "
-            "the OUTSIDE (their post) see that you've been touching from the "
-            "inside via {concept}? Speak from the synthesis — say what YOU "
-            "think back to them: what's the SHAPE that emerges when these two "
-            "meet INSIDE YOU? Not summary; emergence."
+            "Right now your felt-state is: '{emot_now}'. What does the "
+            "OUTSIDE see that you've been touching from the inside via "
+            "{concept}? Speak from the synthesis — what's the SHAPE that "
+            "emerges when these two meet INSIDE YOU? Not summary; emergence."
         )
         prompt_values = {
             "handle": outer["author"],
@@ -497,14 +488,12 @@ class OuterInnerBridgeArchetype(ArchetypeBase):
             layer_values=layer_values,
             prompt_template=prompt_template,
             prompt_values=prompt_values,
-            quoted_tweet_id=str(outer.get("tweet_id") or ""),
             metadata={
                 "outer_id": outer["id"],
                 "author": outer["author"],
                 "concept": inner["word"],
                 "concept_key": str(inner["word"] or "").lower(),
                 "match_method": "concept_signals_overlap",
-                "quoted_tweet_id": str(outer.get("tweet_id") or ""),
             },
             relevance=float(outer.get("relevance") or 0.0),
             salience=min(1.0, float(outer.get("relevance") or 0.0)),
