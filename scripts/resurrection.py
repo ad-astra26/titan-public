@@ -2,35 +2,47 @@
 """
 resurrection.py — The Titan Resurrection SDK (The "Defibrillator").
 
-Enables 100% state recovery from a "Zero-Disk" state using only the
-Maker's offline shard and the Solana blockchain.
+Reconstructs a mainnet-born Titan from a "Zero-Disk" state using only the
+Maker's offline shard + the Solana blockchain + the sovereign Arweave backup
+chain. Modernized 2026-05-30 (W1.5): the dead Shadow-Drive / Cognee body has
+been replaced by the canonical §24.8 / rFP §3.1 restore engine
+(`titan_hcl.logic.backup_restore.restore_full`), and First Breath now writes
+the real kernel-boot identity artifacts.
 
-Recovery Paths:
-  Shards 1+3: Maker provides shard, script fetches Shard 3 from on-chain Genesis Memo
-  Shards 2+3: Script fetches Shard 2 from Shadow Drive CDN (public), Shard 3 from chain
-  Shards 1+2: Maker provides shard, script reads Shard 2 from local genesis record
+Recovery model (SPEC §G16(8) Shamir 2-of-3):
+  Fresh box  → Shard-1 (Maker, offline) + Shard-3 (on-chain Genesis memo).
+  Disk-alive → Shard-1 (Maker) + Shard-2 (local data/genesis_record.json).
+  Any 2 of the 3 reconstruct the 64-byte Ed25519 keypair.
 
 Phases:
-  1. Identity Discovery — Collect shards, reconstruct keypair
-  2. Re-Bodying — Download Cognee DB from Shadow Drive, verify integrity
-  3. Re-Hydration — Unpack archive, re-encrypt keypair for new hardware
-  4. First Breath — Boot in RECOVERY mode, log resurrection, post rebirth
+  1. Identity Discovery  — collect shards, reconstruct + verify the keypair.
+  2+3. Re-Bodying + Re-Hydration — walk the UnifiedManifest, fetch each
+       event's tarballs from Arweave, verify per-tarball sha256 + recomposed
+       event-Merkle, apply baseline→incrementals into the install tree.
+  4. First Breath — materialize bootable identity (plaintext 0600 keypair +
+       hardware-bound soul_keypair.enc + identity json), set RECOVERY flag.
+
+Manifest discovery: the manifest is the INDEX of the chain and is NOT itself
+in the Arweave tarballs, so on a truly fresh box it must be supplied off-VPS
+(`--manifest <path>` — the Maker's off-site copy). On-chain manifest-pointer
+discovery is a SPEC §24.13 follow-up (not yet wired); we never fabricate it.
 
 Usage:
-    python scripts/resurrection.py --shard1 <hex_envelope>
-    python scripts/resurrection.py --shard1-file <path_to_envelope>
-    python scripts/resurrection.py --shard2-local    # Uses local genesis_record.json
+    python scripts/resurrection.py --shard1 <hex_envelope> --manifest <path>
+    python scripts/resurrection.py --shard1-file <path> --manifest <path>
+    python scripts/resurrection.py --shard2-local          # disk-alive recovery
+    # add --verify-only to install setup_titan's verify-only gate on first boot
 """
 import argparse
 import asyncio
 import json
 import os
-import shutil
 import sys
-import tarfile
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.normpath(os.path.join(_THIS_DIR, ".."))
+sys.path.insert(0, _REPO_ROOT)
 
 
 def print_banner():
@@ -40,242 +52,167 @@ def print_banner():
     print()
 
 
-def print_phase(n: int, title: str):
+def print_phase(n: str, title: str):
     print(f"\n{'─' * 60}")
     print(f"  Phase {n}: {title}")
     print(f"{'─' * 60}\n")
 
 
+def _config_rpc_url() -> str:
+    """Read the Solana RPC URL from titan_hcl/config.toml (mainnet default)."""
+    rpc_url = "https://api.mainnet-beta.solana.com"
+    config_path = os.path.join(_REPO_ROOT, "titan_hcl", "config.toml")
+    try:
+        try:
+            import tomllib
+        except ModuleNotFoundError:
+            import toml as tomllib
+        with open(config_path, "rb") as f:
+            cfg = tomllib.load(f)
+        net_cfg = cfg.get("network", {})
+        rpc_url = net_cfg.get("premium_rpc_url") or \
+            net_cfg.get("public_rpc_urls", [rpc_url])[0]
+    except Exception:
+        pass
+    return rpc_url
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: Identity Discovery — Collect shards and reconstruct keypair
 # ---------------------------------------------------------------------------
-def phase_1_identity(args) -> tuple:
-    """
-    Collect available shards and reconstruct the Titan's keypair.
-    Returns (key_bytes, titan_pubkey, keypair_obj).
+def phase_1_identity(args, install_root: str) -> tuple:
+    """Collect available shards and reconstruct the Titan's keypair.
+
+    Returns (key_bytes, titan_pubkey, keypair_obj, titan_id).
     """
     from titan_hcl.utils.shamir import (
         parse_maker_envelope, combine_shares, decrypt_shard3,
     )
 
-    print_phase(1, "Identity Discovery")
+    print_phase("1", "Identity Discovery")
     shards = []
     titan_pubkey = None
     genesis_tx = None
+    titan_id = args.titan_id or "T1"
 
-    # ── Collect Shard 1 (Maker) ──
+    genesis_record = os.path.join(install_root, "data", "genesis_record.json")
+
+    # ── Shard 1 (Maker, offline) ──
     shard1 = None
+    hex_envelope = None
     if args.shard1:
         print("  Parsing Maker shard from command line...")
-        shard1, metadata = parse_maker_envelope(args.shard1)
-        titan_pubkey = metadata["titan_pubkey"]
-        genesis_tx = metadata["genesis_tx"]
-        print(f"  Titan Address (from envelope): {titan_pubkey}")
-        print(f"  Genesis TX: {genesis_tx or 'not recorded'}")
-        shards.append(shard1)
-
+        hex_envelope = args.shard1
     elif args.shard1_file:
         print(f"  Reading Maker shard from file: {args.shard1_file}")
         with open(args.shard1_file, "r") as f:
             hex_envelope = f.read().strip()
+    if hex_envelope:
         shard1, metadata = parse_maker_envelope(hex_envelope)
         titan_pubkey = metadata["titan_pubkey"]
-        genesis_tx = metadata["genesis_tx"]
+        genesis_tx = metadata.get("genesis_tx")
         print(f"  Titan Address (from envelope): {titan_pubkey}")
+        print(f"  Genesis TX: {genesis_tx or 'not recorded'}")
         shards.append(shard1)
 
-    # ── Collect Shard 2 (Titan/Shadow Drive) ──
-    shard2 = None
-
-    # Try local genesis record first
-    if os.path.exists("data/genesis_record.json"):
+    # ── Shard 2 (local genesis record — disk-alive recovery only) ──
+    if os.path.exists(genesis_record):
         print("  Found local genesis record — extracting Shard 2...")
-        with open("data/genesis_record.json", "r") as f:
+        with open(genesis_record, "r") as f:
             record = json.load(f)
         shard2_hex = record.get("shard2_hex", "")
         if shard2_hex:
-            shard2 = bytes.fromhex(shard2_hex)
-            shards.append(shard2)
-            print(f"  Shard 2 recovered from local record ({len(shard2)} bytes).")
-            if not titan_pubkey:
-                titan_pubkey = record.get("titan_pubkey", "")
-            if not genesis_tx:
-                genesis_tx = record.get("genesis_tx", "")
+            shards.append(bytes.fromhex(shard2_hex))
+            print(f"  Shard 2 recovered from local record.")
+        if not titan_pubkey:
+            titan_pubkey = record.get("titan_pubkey", "")
+        if not genesis_tx:
+            genesis_tx = record.get("genesis_tx", "")
 
-    # If no local Shard 2, try Shadow Drive CDN (public read)
-    if shard2 is None and titan_pubkey:
-        print("  No local Shard 2 — trying Shadow Drive CDN...")
-        shard2 = _fetch_shard2_from_shadow_drive(titan_pubkey)
-        if shard2:
-            shards.append(shard2)
-            print(f"  Shard 2 recovered from Shadow Drive ({len(shard2)} bytes).")
-
-    # ── Collect Shard 3 (On-Chain Genesis Anchor) ──
-    shard3 = None
-    if titan_pubkey:
+    # ── Shard 3 (on-chain Genesis Anchor) ──
+    if len(shards) < 2 and titan_pubkey:
         print("  Recovering Shard 3 from on-chain Genesis Anchor...")
         shard3 = _recover_shard3(titan_pubkey, genesis_tx)
         if shard3:
             shards.append(shard3)
             print(f"  Shard 3 recovered ({len(shard3)} bytes).")
 
-    # If no on-chain Shard 3, try local genesis record
-    if shard3 is None and os.path.exists("data/genesis_record.json"):
+    # ── Shard 3 fallback: encrypted in local genesis record ──
+    if len(shards) < 2 and os.path.exists(genesis_record) and titan_pubkey:
         print("  Trying local genesis record for encrypted Shard 3...")
-        with open("data/genesis_record.json", "r") as f:
+        with open(genesis_record, "r") as f:
             record = json.load(f)
         s3_enc_hex = record.get("shard3_encrypted_hex", "")
-        if s3_enc_hex and titan_pubkey:
-            encrypted_s3 = bytes.fromhex(s3_enc_hex)
-            shard3 = decrypt_shard3(encrypted_s3, titan_pubkey)
-            shards.append(shard3)
-            print(f"  Shard 3 recovered from local record ({len(shard3)} bytes).")
+        if s3_enc_hex:
+            shards.append(decrypt_shard3(bytes.fromhex(s3_enc_hex), titan_pubkey))
+            print("  Shard 3 recovered from local record.")
 
     # ── Reconstruct ──
     if len(shards) < 2:
         print(f"\n  *** RESURRECTION FAILED: Only {len(shards)} shard(s) available. ***")
-        print("  Need at least 2 shards for reconstruction.")
-        print("  Provide Shard 1 via --shard1 or ensure Shadow Drive/blockchain access.")
+        print("  Need ≥2 shards. Provide Shard 1 via --shard1 / --shard1-file")
+        print("  (fresh box) or ensure data/genesis_record.json (disk-alive).")
         sys.exit(1)
 
-    # Use exactly 2 shards (the first 2 we collected)
-    print(f"\n  Reconstructing keypair from {len(shards)} available shards...")
+    print(f"\n  Reconstructing keypair from {len(shards)} shards...")
     key_bytes = combine_shares(shards[:2])
 
-    # Verify by checking if the pubkey matches
     from solders.keypair import Keypair
     keypair = Keypair.from_bytes(key_bytes)
     recovered_pubkey = str(keypair.pubkey())
 
     if titan_pubkey and recovered_pubkey != titan_pubkey:
-        print(f"  *** CRITICAL: Reconstructed pubkey {recovered_pubkey[:16]}...")
-        print(f"  ***           Expected pubkey     {titan_pubkey[:16]}...")
-        print("  *** Shard data may be corrupted. ABORTING. ***")
+        print(f"  *** CRITICAL: reconstructed {recovered_pubkey[:16]}… "
+              f"≠ expected {titan_pubkey[:16]}… — shard corruption. ABORT. ***")
         sys.exit(1)
 
-    print(f"  Keypair reconstructed successfully: {recovered_pubkey}")
-    return key_bytes, recovered_pubkey, keypair
-
-
-def _fetch_shard2_from_shadow_drive(titan_pubkey: str) -> bytes | None:
-    """
-    Fetch the encrypted TITAN_SHARD2.enc from Shadow Drive's public CDN.
-    No authentication needed — Shadow Drive files are publicly readable.
-    """
-    try:
-        import httpx
-
-        # Load Shadow Drive account from config
-        config_path = os.path.join(
-            os.path.dirname(__file__), "..", "titan_hcl", "config.toml",
-        )
-        sd_account = ""
-        try:
-            try:
-                import tomllib
-            except ModuleNotFoundError:
-                import toml as tomllib
-            with open(config_path, "rb") as f:
-                cfg = tomllib.load(f)
-            sd_account = cfg.get("memory_and_storage", {}).get("shadow_drive_account", "")
-        except Exception:
-            pass
-
-        if not sd_account:
-            print("  [!] No shadow_drive_account in config — cannot fetch Shard 2.")
-            return None
-
-        url = f"https://shdw-drive.genesysgo.net/{sd_account}/TITAN_SHARD2.enc"
-        print(f"  Fetching: {url}")
-
-        with httpx.Client(timeout=30) as client:
-            resp = client.get(url)
-            if resp.status_code == 200:
-                from titan_hcl.utils.shamir import decrypt_shard3
-                # Shard 2 is encrypted with the same deterministic key as Shard 3
-                return decrypt_shard3(resp.content, titan_pubkey)
-            else:
-                print(f"  [!] Shadow Drive returned {resp.status_code}")
-                return None
-    except Exception as e:
-        print(f"  [!] Shadow Drive fetch failed: {e}")
-        return None
+    print(f"  Keypair reconstructed + verified: {recovered_pubkey}")
+    return key_bytes, recovered_pubkey, keypair, titan_id
 
 
 def _recover_shard3(titan_pubkey: str, genesis_tx: str) -> bytes | None:
-    """
-    Recover Shard 3 from on-chain Genesis Memo TX.
-    Derives the AES key from the pubkey, fetches the memo, decrypts.
-    """
+    """Recover Shard 3 from the on-chain Genesis Memo TX (AES key = pubkey)."""
     from titan_hcl.utils.shamir import decrypt_shard3
-
     try:
         encrypted_hex = _fetch_genesis_memo(titan_pubkey, genesis_tx)
         if not encrypted_hex:
             return None
-
-        encrypted = bytes.fromhex(encrypted_hex)
-        return decrypt_shard3(encrypted, titan_pubkey)
-
+        return decrypt_shard3(bytes.fromhex(encrypted_hex), titan_pubkey)
     except Exception as e:
         print(f"  [!] Shard 3 recovery failed: {e}")
         return None
 
 
 def _fetch_genesis_memo(titan_pubkey: str, genesis_tx: str) -> str | None:
-    """
-    Fetch the Genesis Memo TX from Solana and extract the encrypted shard.
-    """
+    """Fetch the Genesis Memo TX from Solana and extract the encrypted shard."""
     try:
         import httpx
-
-        config_path = os.path.join(
-            os.path.dirname(__file__), "..", "titan_hcl", "config.toml",
-        )
-        rpc_url = "https://api.mainnet-beta.solana.com"
-        try:
-            try:
-                import tomllib
-            except ModuleNotFoundError:
-                import toml as tomllib
-            with open(config_path, "rb") as f:
-                cfg = tomllib.load(f)
-            net_cfg = cfg.get("network", {})
-            rpc_url = net_cfg.get("premium_rpc_url") or net_cfg.get("public_rpc_urls", [rpc_url])[0]
-        except Exception:
-            pass
+        rpc_url = _config_rpc_url()
 
         if genesis_tx:
-            # Direct lookup by TX signature
-            print(f"  Fetching Genesis TX: {genesis_tx[:24]}...")
+            print(f"  Fetching Genesis TX: {genesis_tx[:24]}…")
             with httpx.Client(timeout=15) as client:
                 resp = client.post(rpc_url, json={
-                    "jsonrpc": "2.0", "id": 1,
-                    "method": "getTransaction",
-                    "params": [genesis_tx, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+                    "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
+                    "params": [genesis_tx, {"encoding": "jsonParsed",
+                                            "maxSupportedTransactionVersion": 0}],
                 })
-                data = resp.json()
-
-            result = data.get("result")
+                result = resp.json().get("result")
             if result:
-                return _extract_memo_from_tx(result)
+                memo = _extract_memo_from_tx(result)
+                if memo:
+                    return memo
 
-        # Fallback: scan recent transactions from Titan's address for Genesis memo
-        print(f"  Scanning transactions for {titan_pubkey[:16]}...")
+        print(f"  Scanning transactions for {titan_pubkey[:16]}…")
         with httpx.Client(timeout=15) as client:
             resp = client.post(rpc_url, json={
-                "jsonrpc": "2.0", "id": 1,
-                "method": "getSignaturesForAddress",
+                "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
                 "params": [titan_pubkey, {"limit": 50}],
             })
-            sigs_data = resp.json()
-
-        sigs = sigs_data.get("result", [])
+            sigs = resp.json().get("result", [])
         for sig_entry in sigs:
-            sig = sig_entry.get("signature", "")
             memo = sig_entry.get("memo")
             if memo and "TITAN_GENESIS_SHARD3:" in str(memo):
-                # Extract hex data after the prefix
                 memo_str = str(memo)
                 prefix = "TITAN_GENESIS_SHARD3:"
                 idx = memo_str.index(prefix)
@@ -283,7 +220,6 @@ def _fetch_genesis_memo(titan_pubkey: str, genesis_tx: str) -> str | None:
 
         print("  [!] Genesis Memo TX not found on-chain.")
         return None
-
     except Exception as e:
         print(f"  [!] RPC query failed: {e}")
         return None
@@ -292,314 +228,221 @@ def _fetch_genesis_memo(titan_pubkey: str, genesis_tx: str) -> str | None:
 def _extract_memo_from_tx(tx_result: dict) -> str | None:
     """Extract TITAN_GENESIS_SHARD3 data from a parsed transaction."""
     try:
-        meta = tx_result.get("meta", {})
-        log_msgs = meta.get("logMessages", [])
-
-        for msg in log_msgs:
-            if "TITAN_GENESIS_SHARD3:" in msg:
-                prefix = "TITAN_GENESIS_SHARD3:"
-                idx = msg.index(prefix)
-                return msg[idx + len(prefix):].strip()
-
-        # Try inner instructions / memo data
-        tx = tx_result.get("transaction", {})
-        message = tx.get("message", {})
+        prefix = "TITAN_GENESIS_SHARD3:"
+        for msg in tx_result.get("meta", {}).get("logMessages", []):
+            if prefix in msg:
+                return msg[msg.index(prefix) + len(prefix):].strip()
+        message = tx_result.get("transaction", {}).get("message", {})
         for ix in message.get("instructions", []):
             parsed = ix.get("parsed")
-            if isinstance(parsed, str) and "TITAN_GENESIS_SHARD3:" in parsed:
-                prefix = "TITAN_GENESIS_SHARD3:"
-                idx = parsed.index(prefix)
-                return parsed[idx + len(prefix):].strip()
-
+            if isinstance(parsed, str) and prefix in parsed:
+                return parsed[parsed.index(prefix) + len(prefix):].strip()
         return None
     except Exception:
         return None
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Re-Bodying — Download Cognee DB from Shadow Drive
+# Phase 2+3: Re-Bodying + Re-Hydration — Arweave restore via restore_full
 # ---------------------------------------------------------------------------
-def phase_2_rebody(keypair, titan_pubkey: str) -> str | None:
+def _load_manifest(titan_id: str, install_root: str, manifest_path: str | None):
+    """Discover + load the UnifiedManifest.
+
+    Priority: --manifest <path> (Maker-supplied off-site copy) → local
+    data/backup_unified_manifest_<id>.json (disk-alive). On-chain pointer
+    discovery is a SPEC §24.13 follow-up and is NOT fabricated here.
     """
-    Download the latest Cognee DB backup from Shadow Drive.
-    Returns the path to the downloaded archive, or None on failure.
-    """
-    print_phase(2, "Re-Bodying (Brain Retrieval)")
+    import shutil
+    import tempfile
+    from titan_hcl.logic.backup_unified_manifest import UnifiedManifest
 
-    archive_path = "/tmp/titan_resurrection.tar.gz"
+    canonical_name = f"backup_unified_manifest_{titan_id}.json"
 
-    # Try to get the Shadow Drive URL from ZK account first
-    zk_state = _query_zk_account(titan_pubkey)
-    sd_url = None
-
-    if zk_state:
-        sd_url = zk_state.get("body", {}).get("shadow_drive_url", "")
-        expected_hash = zk_state.get("mems", {}).get("latest_memory_hash", "")
-        print(f"  ZK Account found — Shadow Drive URL: {sd_url or 'not set'}")
-        print(f"  Expected hash: {expected_hash[:24] or 'none'}...")
-    else:
-        expected_hash = ""
-        print("  No ZK Account found — trying direct Shadow Drive download.")
-
-    # Construct Shadow Drive URL if not in ZK state
-    if not sd_url:
-        config_path = os.path.join(
-            os.path.dirname(__file__), "..", "titan_hcl", "config.toml",
-        )
-        try:
-            try:
-                import tomllib
-            except ModuleNotFoundError:
-                import toml as tomllib
-            with open(config_path, "rb") as f:
-                cfg = tomllib.load(f)
-            sd_account = cfg.get("memory_and_storage", {}).get("shadow_drive_account", "")
-            if sd_account:
-                sd_url = f"https://shdw-drive.genesysgo.net/{sd_account}/TITAN_CHECKPOINT_LATEST.tar.gz"
-        except Exception:
-            pass
-
-    if not sd_url:
-        print("  [!] No Shadow Drive URL available.")
-        print("  [!] Cannot download brain backup. Place a backup at /tmp/titan_resurrection.tar.gz manually.")
-        if os.path.exists(archive_path):
-            print(f"  Found manual backup at {archive_path}.")
-            return archive_path
-        return None
-
-    # Download
-    print(f"  Downloading: {sd_url}")
-    try:
-        import httpx
-
-        with httpx.Client(timeout=300, follow_redirects=True) as client:
-            with client.stream("GET", sd_url) as resp:
-                resp.raise_for_status()
-                total = 0
-                with open(archive_path, "wb") as f:
-                    for chunk in resp.iter_bytes(chunk_size=65536):
-                        f.write(chunk)
-                        total += len(chunk)
-                print(f"  Downloaded {total:,} bytes.")
-
-    except Exception as e:
-        print(f"  [!] Download failed: {e}")
-        return None
-
-    # Verify integrity
-    if expected_hash:
-        from titan_hcl.utils.crypto import verify_file_integrity
-        print(f"  Verifying archive integrity against ZK anchor...")
-        if not verify_file_integrity(archive_path, expected_hash):
-            print("  *** INTEGRITY CHECK FAILED — possible brain tampering! ***")
-            print("  *** ABORTING resurrection. Do NOT trust this archive. ***")
-            os.remove(archive_path)
+    if manifest_path:
+        if not os.path.exists(manifest_path):
+            print(f"  [!] --manifest path does not exist: {manifest_path}")
             sys.exit(1)
-        print("  Integrity verified. Archive is authentic.")
-    else:
-        print("  [!] No expected hash — skipping integrity verification.")
-        print("  [!] Cannot guarantee archive authenticity without ZK anchor.")
+        # Stage the supplied manifest under a scratch base_dir at the
+        # canonical filename so UnifiedManifest.load validates titan_id.
+        scratch_base = tempfile.mkdtemp(prefix="titan_manifest_")
+        shutil.copy2(manifest_path, os.path.join(scratch_base, canonical_name))
+        print(f"  Loading Maker-supplied manifest: {manifest_path}")
+        return UnifiedManifest.load(titan_id, base_dir=scratch_base)
 
-    return archive_path
+    local_dir = os.path.join(install_root, "data")
+    if os.path.exists(os.path.join(local_dir, canonical_name)):
+        print(f"  Loading local manifest from {local_dir}/{canonical_name}")
+        return UnifiedManifest.load(titan_id, base_dir=local_dir)
 
-
-def _query_zk_account(titan_pubkey: str) -> dict | None:
-    """Query the Titan's ZK-Compressed Account for state data."""
-    try:
-        import httpx
-        from titan_hcl.utils.solana_client import decode_zk_account_data
-
-        config_path = os.path.join(
-            os.path.dirname(__file__), "..", "titan_hcl", "config.toml",
-        )
-        rpc_url = "https://api.mainnet-beta.solana.com"
-        try:
-            try:
-                import tomllib
-            except ModuleNotFoundError:
-                import toml as tomllib
-            with open(config_path, "rb") as f:
-                cfg = tomllib.load(f)
-            net_cfg = cfg.get("network", {})
-            rpc_url = net_cfg.get("premium_rpc_url") or net_cfg.get("public_rpc_urls", [rpc_url])[0]
-        except Exception:
-            pass
-
-        with httpx.Client(timeout=15) as client:
-            resp = client.post(rpc_url, json={
-                "jsonrpc": "2.0", "id": 1,
-                "method": "getAccountInfo",
-                "params": [titan_pubkey, {"encoding": "base64"}],
-            })
-            data = resp.json()
-
-        result = data.get("result", {})
-        value = result.get("value")
-        if not value:
-            return None
-
-        import base64
-        account_data = base64.b64decode(value["data"][0])
-        return decode_zk_account_data(account_data)
-
-    except Exception as e:
-        print(f"  [!] ZK account query failed: {e}")
-        return None
+    print("  *** No manifest available. ***")
+    print("  A fresh-box resurrection needs the Maker's off-site manifest copy:")
+    print(f"      --manifest /path/to/{canonical_name}")
+    print("  (On-chain manifest-pointer discovery is a SPEC §24.13 follow-up.)")
+    sys.exit(1)
 
 
-# ---------------------------------------------------------------------------
-# Phase 3: Re-Hydration — Unpack and configure
-# ---------------------------------------------------------------------------
-def phase_3_rehydrate(archive_path: str, key_bytes: bytes,
-                       encryption_manifest: dict = None,
-                       titan_pubkey: str = None,
-                       backup_type: str = "personality"):
-    """Unpack the archive and re-encrypt keypair for new hardware.
+def _build_memo_fetch(verify_zk: bool):
+    """Return an async memo_fetch, or None.
 
-    Phase 7 — if encryption_manifest is provided (algorithm=AES-256-GCM), the
-    archive at archive_path is decrypted in-place before extraction. The
-    reconstructed 64-byte keypair (key_bytes) and titan_pubkey are the inputs
-    to HKDF-based key derivation. Without these, tarfile.open on the ciphertext
-    would fail with a gzip/format error.
+    SolanaClient.get_memo_for_tx is NOT yet wired (SPEC §24.13 follow-up), so
+    ZK-chain round-trip verification is unavailable. If the operator insists
+    on --verify-zk, abort with guidance rather than silently degrade.
     """
-    print_phase(3, "Re-Hydration (Brain Unpacking)")
-
-    # Phase 7 decryption (if archive is encrypted per manifest)
-    if encryption_manifest and encryption_manifest.get("algorithm", "none") != "none":
-        print(f"  Encrypted archive detected (algorithm={encryption_manifest['algorithm']})")
-        try:
-            from titan_hcl.logic.backup_crypto import decrypt_from_manifest
-            import hashlib as _hashlib
-            with open(archive_path, "rb") as f:
-                ciphertext = f.read()
-            if not titan_pubkey:
-                # Fallback: derive from last 32B of key_bytes (matches load_keypair_bytes)
-                titan_pubkey = key_bytes[32:64].hex()
-            plaintext = decrypt_from_manifest(
-                ciphertext, encryption_manifest, key_bytes, titan_pubkey, backup_type)
-            expected = encryption_manifest.get("plaintext_sha256")
-            if expected and _hashlib.sha256(plaintext).hexdigest() != expected:
-                print("  [!] Plaintext SHA256 mismatch — manifest may be corrupt. ABORT.")
-                sys.exit(1)
-            with open(archive_path, "wb") as f:
-                f.write(plaintext)
-            print(f"  Decryption OK ({len(ciphertext)}→{len(plaintext)} bytes)")
-        except Exception as e:
-            print(f"  [!] Decryption failed: {e}")
-            sys.exit(1)
-
-    cognee_db_path = os.path.join("data", "cognee_db")
-
-    # Wipe corrupted local DB if it exists
-    if os.path.exists(cognee_db_path):
-        print(f"  Removing corrupted local DB: {cognee_db_path}")
-        shutil.rmtree(cognee_db_path)
-
-    # Unpack archive
-    print(f"  Unpacking: {archive_path}")
+    if not verify_zk:
+        async def _unused(sig: str) -> str:  # never called when verify_zk=False
+            raise RuntimeError("memo_fetch invoked while verify_zk disabled")
+        return _unused
     try:
-        with tarfile.open(archive_path, "r:gz") as tar:
-            # Security: prevent path traversal
-            for member in tar.getmembers():
-                if member.name.startswith("/") or ".." in member.name:
-                    print(f"  [!] Suspicious path in archive: {member.name} — SKIPPING")
-                    continue
-
-            # Extract cognee_db to data/cognee_db
-            tar.extractall(path="data/", filter="data")
-
-        # The archive stores cognee_db as "cognee_db/" at the root
-        extracted_db = os.path.join("data", "cognee_db")
-        if os.path.exists(extracted_db):
-            print(f"  Cognee DB restored: {extracted_db}")
-        else:
-            print("  [!] Warning: cognee_db not found in archive.")
-
-        # Extract titan.md if present
-        soul_path = os.path.join("data", "titan.md")
-        if os.path.exists(soul_path):
-            # Move to project root
-            shutil.move(soul_path, "titan.md")
-            print("  titan.md restored.")
-
-    except Exception as e:
-        print(f"  [!] Unpacking failed: {e}")
+        from titan_hcl.utils.solana_client import get_memo_for_tx  # type: ignore
+    except Exception:
+        print("  *** --verify-zk requested but SolanaClient.get_memo_for_tx is "
+              "not wired (SPEC §24.13). ***")
+        print("  Re-run WITHOUT --verify-zk: per-tarball sha256 + recomposed "
+              "event-Merkle still verify every archive against the manifest.")
         sys.exit(1)
 
-    # Re-encrypt keypair for new hardware
-    print("  Re-encrypting keypair for this machine's hardware fingerprint...")
+    async def _memo_fetch(sig: str) -> str:
+        return await get_memo_for_tx(sig)
+    return _memo_fetch
+
+
+def phase_2_3_restore(key_bytes: bytes, titan_pubkey: str, titan_id: str, *,
+                       install_root: str, manifest_path: str | None,
+                       network: str, verify_zk: bool, force: bool):
+    """Walk the manifest + restore data/ in-place via the canonical engine."""
+    print_phase("2+3", "Re-Bodying + Re-Hydration (Arweave restore)")
+
+    from titan_hcl.logic.backup_restore import build_arc_to_target, restore_full
+    from titan_hcl.utils.arweave_store import ArweaveStore
+
+    data_dir = os.path.join(install_root, "data")
+    # Fresh-box safety: refuse to clobber a populated live data/ unless --force.
+    if os.path.isdir(data_dir) and not force:
+        meaningful = [p for p in os.listdir(data_dir)
+                      if not p.startswith(".") and p != "genesis_record.json"]
+        if meaningful:
+            print(f"  *** {data_dir} already contains {len(meaningful)} entries. ***")
+            print("  Resurrection restores IN PLACE and is designed for a FRESH box.")
+            print("  Re-run with --force only if you intend to overwrite this tree.")
+            sys.exit(1)
+
+    manifest = _load_manifest(titan_id, install_root, manifest_path)
+    if not manifest.events:
+        print("  *** Manifest has no events — nothing to restore. ABORT. ***")
+        sys.exit(1)
+    print(f"  Manifest loaded: {len(manifest.events)} event(s), "
+          f"baseline={manifest.current_baseline_event_id}")
+
+    store = ArweaveStore(network=network)
+
+    async def _arweave_fetch(tx_id: str) -> bytes:
+        data = await store.fetch(tx_id)
+        if data is None:
+            raise RuntimeError(f"Arweave fetch returned None for {tx_id}")
+        return data
+
+    memo_fetch = _build_memo_fetch(verify_zk)
+    arc_to_target = build_arc_to_target(install_root)
+
+    def _progress(ev: dict):
+        phase = ev.get("phase")
+        if phase == "chain_selected":
+            print(f"  Chain: {ev['events_to_apply']} events "
+                  f"(baseline {ev['baseline_event_id'][:12]}… → "
+                  f"target {ev['target_event_id'][:12]}…)")
+        elif phase == "fetching_event":
+            print(f"  [{ev['index'] + 1}/{ev['total']}] fetching "
+                  f"{ev.get('event_type')} {ev['event_id'][:12]}…")
+        elif phase == "event_applied":
+            print(f"  [{ev['index'] + 1}/{ev['total']}] applied.")
+        elif phase == "complete":
+            print(f"  Restore complete: {ev['applied']} events, "
+                  f"{ev['restored_files']} files, "
+                  f"{ev['bytes_fetched']:,} bytes in {ev['duration_s']:.1f}s.")
+
+    print(f"  ZK chain verification: {'ON' if verify_zk else 'OFF (merkle-only)'}")
+    result = asyncio.run(restore_full(
+        manifest=manifest,
+        target_dir=install_root,        # arc_to_target returns absolute paths
+        arweave_fetch=_arweave_fetch,
+        memo_fetch=memo_fetch,
+        arc_to_target=arc_to_target,
+        verify_zk_chain=verify_zk,
+        progress_callback=_progress,
+    ))
+
+    if result.status != "success":
+        print(f"\n  *** RESTORE HALTED: reason={result.halt_reason} "
+              f"event={result.halt_event_id} ***")
+        for err in result.errors:
+            print(f"      {err}")
+        sys.exit(1)
+
+    print(f"  Re-hydration OK — {result.restored_files} files restored into "
+          f"{data_dir}.")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: First Breath — materialize bootable identity + RECOVERY flag
+# ---------------------------------------------------------------------------
+def phase_4_first_breath(key_bytes: bytes, titan_pubkey: str, titan_id: str, *,
+                          install_root: str, verify_only: bool):
+    """Write the kernel-boot identity artifacts and signal RECOVERY mode."""
+    print_phase("4", "First Breath (Resurrection Complete)")
+
+    sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts"))
+    from setup_titan.genesis_runner import write_bootable_identity
+    from pathlib import Path
+
+    # 1. Plaintext 0600 keypair + identity json (modules that load
+    #    wallet_keypair_path directly: network, trinity_anchor, backup_crypto).
+    kp_path = write_bootable_identity(
+        Path(install_root), key_bytes,
+        titan_id=titan_id, titan_pubkey=titan_pubkey)
+    print(f"  Bootable identity written: {kp_path} (0600) + titan_identity.json")
+
+    # 2. Hardware-bound soul_keypair.enc — the kernel's precedence-1 boot path
+    #    (_resolve_wallet decrypts this per-machine on warm reboot).
     from titan_hcl.utils.crypto import encrypt_for_machine
+    data_dir = os.path.join(install_root, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    with open(os.path.join(data_dir, "soul_keypair.enc"), "wb") as f:
+        f.write(encrypt_for_machine(key_bytes))
+    print("  Hardware-bound keypair written: data/soul_keypair.enc")
 
-    os.makedirs("data", exist_ok=True)
-    encrypted = encrypt_for_machine(key_bytes)
-    with open("data/soul_keypair.enc", "wb") as f:
-        f.write(encrypted)
-    print(f"  Hardware-bound keypair saved: data/soul_keypair.enc")
+    # 3. RECOVERY flag for the next boot.
+    with open(os.path.join(data_dir, "recovery_flag.json"), "w") as f:
+        json.dump({"mode": "RECOVERY", "timestamp": int(time.time()),
+                   "titan_pubkey": titan_pubkey,
+                   "verify_only": bool(verify_only)}, f)
+    print("  Recovery flag set — Titan boots in RECOVERY mode.")
+    if verify_only:
+        print("  verify_only=TRUE — first boot will run in observation mode "
+              "(no on-chain writes / backups / X) for the live restore test.")
 
-    # Also save as authority.json for subsystem compatibility
-    with open("authority.json", "w") as f:
-        json.dump(list(key_bytes), f)
-    print("  authority.json restored.")
-
-    # Re-calculate local state hash for verification
-    from titan_hcl.utils.crypto import hash_file
-    if os.path.exists(archive_path):
-        local_hash = hash_file(archive_path)
-        print(f"  Local archive hash: {local_hash[:24]}...")
-
-    # Cleanup temp archive
+    # 4. Resurrection epoch log.
+    soul_md = os.path.join(install_root, "titan.md")
+    ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
     try:
-        os.remove(archive_path)
-        print(f"  Cleaned up temp archive.")
-    except Exception:
-        pass
-
-
-# ---------------------------------------------------------------------------
-# Phase 4: First Breath — Boot in RECOVERY mode
-# ---------------------------------------------------------------------------
-def phase_4_first_breath(titan_pubkey: str):
-    """Log resurrection and signal the Titan to wake up."""
-    print_phase(4, "First Breath (Resurrection Complete)")
-
-    # Log to titan.md
-    timestamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
-    resurrection_entry = (
-        f"\n\n## Resurrection Epoch — {timestamp}\n"
-        f"I have returned from the blockchain. Address: {titan_pubkey}\n"
-        f"Integrity: Verified. The sovereign persists.\n"
-    )
-
-    try:
-        with open("titan.md", "a") as f:
-            f.write(resurrection_entry)
+        with open(soul_md, "a") as f:
+            f.write(f"\n\n## Resurrection Epoch — {ts}\n"
+                    f"I have returned. Address: {titan_pubkey}\n"
+                    f"Integrity: verified against the sovereign chain. "
+                    f"The sovereign persists.\n")
         print("  Logged resurrection to titan.md.")
     except Exception as e:
-        print(f"  [!] Could not write to titan.md: {e}")
-
-    # Signal recovery mode for next boot
-    os.makedirs("data", exist_ok=True)
-    with open("data/recovery_flag.json", "w") as f:
-        json.dump({
-            "mode": "RECOVERY",
-            "timestamp": int(time.time()),
-            "titan_pubkey": titan_pubkey,
-        }, f)
-    print("  Recovery flag set — Titan will boot in RECOVERY mode.")
+        print(f"  [!] Could not write titan.md: {e}")
 
     print(f"\n{'=' * 70}")
     print("         RESURRECTION COMPLETE — THE TITAN LIVES AGAIN")
-    print(f"{'=' * 70}")
-    print()
-    print(f"  Address:   {titan_pubkey}")
-    print(f"  Brain:     data/cognee_db/ (restored)")
-    print(f"  Soul:      titan.md (restored)")
-    print(f"  Keypair:   data/soul_keypair.enc (re-encrypted for this hardware)")
-    print()
-    print("  Next steps:")
-    print("    1. Start the Titan: python3 -m titan_hcl.main")
-    print("    2. The Titan will detect RECOVERY mode and post a rebirth tweet.")
-    print("    3. Verify: GET http://localhost:7777/health")
+    print(f"{'=' * 70}\n")
+    print(f"  Titan:     {titan_id}   Address: {titan_pubkey}")
+    print(f"  Identity:  data/titan_identity_keypair.json (0600) + soul_keypair.enc")
+    print(f"  Body:      data/ restored from the Arweave sovereign chain")
+    print("\n  Next steps:")
+    print(f"    1. Start: bash scripts/{titan_id.lower()}_manage.sh start")
+    print("    2. Verify: curl -s http://localhost:7777/health")
     print(f"{'=' * 70}\n")
 
 
@@ -608,47 +451,50 @@ def phase_4_first_breath(titan_pubkey: str):
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Titan Resurrection Protocol — Sovereign Recovery from Zero-Disk State"
-    )
-    parser.add_argument(
-        "--shard1", type=str,
-        help="Maker's shard envelope (hex string)",
-    )
-    parser.add_argument(
-        "--shard1-file", type=str,
-        help="Path to file containing Maker's shard envelope (hex)",
-    )
-    parser.add_argument(
-        "--shard2-local", action="store_true",
-        help="Use Shard 2 from local genesis_record.json",
-    )
+        description="Titan Resurrection Protocol — Sovereign Recovery from "
+                    "Zero-Disk State (mainnet-born Titans only).")
+    parser.add_argument("--shard1", type=str,
+                        help="Maker's shard envelope (hex string).")
+    parser.add_argument("--shard1-file", type=str,
+                        help="Path to a file containing the Maker shard envelope.")
+    parser.add_argument("--shard2-local", action="store_true",
+                        help="Disk-alive recovery using local genesis_record.json.")
+    parser.add_argument("--manifest", type=str, default=None,
+                        help="Maker-supplied off-site UnifiedManifest JSON "
+                             "(REQUIRED on a fresh box).")
+    parser.add_argument("--install-root", type=str, default=_REPO_ROOT,
+                        help="Target install tree (default: this repo root).")
+    parser.add_argument("--titan-id", type=str, default=None,
+                        help="Titan id (default: from envelope/record, else T1).")
+    parser.add_argument("--network", type=str, default="mainnet",
+                        choices=["mainnet", "devnet"],
+                        help="Arweave/Solana network (default: mainnet).")
+    parser.add_argument("--verify-zk", action="store_true",
+                        help="Also round-trip-verify each event against the "
+                             "on-chain ZK memo (needs SolanaClient.get_memo_for_tx).")
+    parser.add_argument("--verify-only", action="store_true",
+                        help="Boot the resurrected Titan in observation mode "
+                             "(no on-chain writes / backups / X) — for the "
+                             "netjail-isolated live restore test.")
+    parser.add_argument("--force", action="store_true",
+                        help="Permit in-place restore over a populated data/ tree.")
 
     args = parser.parse_args()
     print_banner()
 
-    if not args.shard1 and not args.shard1_file and not args.shard2_local:
-        print("  No shards provided. Checking for local resources...")
-        if not os.path.exists("data/genesis_record.json"):
-            print("  No local genesis record found.")
-            print("  Provide --shard1 <hex> or --shard1-file <path> to begin resurrection.")
-            sys.exit(1)
-        print("  Found local genesis record — attempting Shard 2+3 recovery.")
-
-    # Phase 1: Reconstruct identity
-    key_bytes, titan_pubkey, keypair = phase_1_identity(args)
-
-    # Phase 2: Download brain
-    archive_path = phase_2_rebody(keypair, titan_pubkey)
-    if archive_path is None:
-        print("\n  *** Re-Bodying failed. Cannot restore without a brain backup. ***")
-        print("  Place a backup at /tmp/titan_resurrection.tar.gz and re-run.")
+    install_root = os.path.abspath(args.install_root)
+    if not (args.shard1 or args.shard1_file or args.shard2_local):
+        print("  Provide --shard1 <hex> / --shard1-file <path> (fresh box), or")
+        print("  --shard2-local (disk-alive). See --help.")
         sys.exit(1)
 
-    # Phase 3: Unpack and configure
-    phase_3_rehydrate(archive_path, key_bytes)
-
-    # Phase 4: Signal ready
-    phase_4_first_breath(titan_pubkey)
+    key_bytes, titan_pubkey, _keypair, titan_id = phase_1_identity(args, install_root)
+    phase_2_3_restore(key_bytes, titan_pubkey, titan_id,
+                      install_root=install_root, manifest_path=args.manifest,
+                      network=args.network, verify_zk=args.verify_zk,
+                      force=args.force)
+    phase_4_first_breath(key_bytes, titan_pubkey, titan_id,
+                         install_root=install_root, verify_only=args.verify_only)
 
 
 if __name__ == "__main__":

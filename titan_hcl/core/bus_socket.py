@@ -75,10 +75,6 @@ PING_INTERVAL_S = 5.0
 PING_TIMEOUT_S = 15.0           # 3 missed pings → escalate to PID check (NOT instant purge anymore)
 ACCEPT_RATE_LIMIT_PER_S = 50
 
-# SPEC §1339 MODULE_HEARTBEAT self-metrics — clock ticks/sec for converting
-# /proc/self/stat utime+stime jiffies → seconds when computing cpu_delta_s.
-_HB_CLK_TCK = float(os.sysconf("SC_CLK_TCK")) if hasattr(os, "sysconf") else 100.0
-
 # Microkernel v2 Phase B.2 §D9 (2026-05-02) — smart-liveness tunables.
 # See `BUG-BUS-PING-PONG-TIGHT-TIMEOUT-VS-HEAVY-WORKER-INIT-20260502`
 # for full context. Replaces the tight 15s purge that killed heavy-init
@@ -549,16 +545,6 @@ class BusSocketClient:
         self._stop_event = threading.Event()
         self._connected_event = threading.Event()
         self._conn_thread: Optional[threading.Thread] = None
-        # SPEC §1339 MODULE_HEARTBEAT self-metrics — this client runs in the
-        # worker's own process, so /proc/self + os.getpid() report THIS
-        # worker. We stamp {pid, rss_mb, cpu_delta_s} onto every outbound
-        # MODULE_HEARTBEAT at the producer (single chokepoint — every send
-        # funnels through publish(), so the contract can't drift across the
-        # ~30 per-worker heartbeat emit sites). guardian_hcl (supervisor)
-        # ingests these into guardian_state.bin per §7.1. cpu_delta_s needs
-        # the prior (utime+stime, wall_ts) sample to form a per-interval rate.
-        self._hb_last_cpu_s: float = 0.0
-        self._hb_last_cpu_ts: float = 0.0
         # Subscription state owned locally — re-published on every reconnect
         self._topics: set[str] = set(self._initial_topics)
         self._topics_lock = threading.Lock()
@@ -815,61 +801,7 @@ class BusSocketClient:
         """Send a message to the broker. Returns True on success, False if
         the connection is currently broken (worker should accept that publish
         attempts during a kernel swap may briefly fail)."""
-        if isinstance(msg, dict) and msg.get("type") == bus.MODULE_HEARTBEAT:
-            self._enrich_heartbeat(msg)
         return self._raw_send(msg)
-
-    def _enrich_heartbeat(self, msg: dict) -> None:
-        """SPEC §1339 — stamp self-measured {pid, rss_mb, cpu_delta_s} onto
-        every MODULE_HEARTBEAT at the producer.
-
-        This client lives in the worker's process, so os.getpid() + /proc/self
-        report THIS worker. Doing it here (the single send chokepoint —
-        SocketQueue.put/put_nowait both route through publish()) guarantees the
-        §1339 payload contract is satisfied uniformly across every L2/L3 module
-        regardless of which per-worker emit site produced the frame, and can
-        never drift. guardian_hcl (the supervisor) ingests these into
-        guardian_state.bin per §7.1 (G21 sole writer). pid is also required by
-        the supervisor for restart targeting.
-
-        Self-metrics only (cheap: two small /proc reads every
-        MODULE_HEARTBEAT_INTERVAL_S=10s). Never raises — a transient /proc read
-        failure leaves the field absent and the heartbeat still publishes.
-        """
-        payload = msg.get("payload")
-        if not isinstance(payload, dict):
-            payload = {}
-            msg["payload"] = payload
-        # pid — authoritative for this process; always overwrite.
-        payload["pid"] = os.getpid()
-        # cpu_delta_s — utime+stime seconds consumed since the previous
-        # heartbeat (per-interval CPU burn; the supervisor's CPU-aware
-        # liveness + the profiler both read it).
-        try:
-            with open("/proc/self/stat") as f:
-                fields = f.read().rsplit(") ", 1)[1].split()
-            # post-comm fields (0-indexed): state(0) ppid(1) ... utime(11) stime(12)
-            cpu_s = (int(fields[11]) + int(fields[12])) / _HB_CLK_TCK
-            now = time.monotonic()
-            if self._hb_last_cpu_ts > 0.0:
-                payload["cpu_delta_s"] = round(max(0.0, cpu_s - self._hb_last_cpu_s), 3)
-            else:
-                payload["cpu_delta_s"] = 0.0
-            self._hb_last_cpu_s = cpu_s
-            self._hb_last_cpu_ts = now
-        except Exception:  # noqa: BLE001 — never break the heartbeat
-            payload.setdefault("cpu_delta_s", 0.0)
-        # rss_mb — fill only if the emit site didn't already provide it
-        # (several workers self-report; respect their value, cover the rest).
-        if "rss_mb" not in payload:
-            try:
-                with open("/proc/self/status") as f:
-                    for line in f:
-                        if line.startswith("VmRSS:"):
-                            payload["rss_mb"] = round(int(line.split()[1]) / 1024.0, 1)
-                            break
-            except Exception:  # noqa: BLE001
-                pass
 
     def _raw_send(self, msg: dict) -> bool:
         """SPEC §8.0.ter publish path — non-blocking by construction.

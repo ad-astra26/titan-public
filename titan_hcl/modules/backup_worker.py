@@ -910,7 +910,7 @@ def _check_runway(state: dict) -> None:
 def _node_path() -> str:
     """Resolve NODE_PATH for the subprocess (for @irys/sdk global install)."""
     try:
-        return subprocess.check_output(["npm", "root", "-g"], timeout=10).decode().strip()  # noqa: async-block — backup worker sequential main loop (run_until_complete); not a concurrent/FastAPI loop
+        return subprocess.check_output(["npm", "root", "-g"], timeout=10).decode().strip()
     except Exception:
         return "/usr/lib/node_modules"
 
