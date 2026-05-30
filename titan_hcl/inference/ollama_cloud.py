@@ -40,11 +40,14 @@ logger = logging.getLogger(__name__)
 _LIGHT_MODEL = "gemma4:31b"
 _MEDIUM_MODEL = "ministral-3:8b"
 _HEAVY_MODEL = "deepseek-v3.1:671b"
-# Dedicated language-teacher model (2026-05-30): gemma4:31b proved too terse to
-# follow the "introduce ONE new word" mandate (36-char all-known responses) — a
-# stronger instruction-follower reliably teaches new vocabulary. Config-overridable
-# via [inference] ollama_cloud_teacher_model; revert by removing the override.
-_TEACHER_MODEL = "qwen3-next:80b"
+# Dedicated language-teacher model (2026-05-30). qwen3-next:80b was tried but the
+# 80B is too slow on Ollama Cloud — chat() times out at >30s / returns 0 chars,
+# breaking the teacher. gemma4:31b is fast + reliable, and PATH 3 (giving the model
+# a specific new word to use, language_teacher._pick_new_word_to_teach) removes the
+# need for a stronger instruction-follower — the model only has to use the given
+# word in a sentence. Config-overridable via [inference] ollama_cloud_teacher_model;
+# gpt-oss:20b is a faster strong-instruction alternative if richer teaching is wanted.
+_TEACHER_MODEL = "gemma4:31b"
 
 try:
     from titan_hcl.config_loader import load_titan_config
