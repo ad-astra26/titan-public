@@ -49,6 +49,42 @@ def _resolve_titan_id(install_root: Path) -> str:
     return DEFAULT_TITAN_ID
 
 
+def write_bootable_identity(
+    install_root: Path,
+    key_bytes: bytes,
+    *,
+    titan_id: str | None = None,
+    titan_pubkey: str = "",
+) -> Path:
+    """Write the kernel-boot identity artifacts from a raw 64-byte keypair.
+
+    The single primitive shared by genesis (Phase 6 materialization, below)
+    and resurrection (`scripts/resurrection.py` Phase 4 first-breath). Both
+    paths must produce the SAME two files the kernel loads at boot (SPEC
+    G16(8) B1), so the format lives in exactly one place:
+
+      - ``data/titan_identity_keypair.json`` — 0600, a JSON array of 64 ints
+        (the ``solders.Keypair.from_bytes`` byte form the kernel reads).
+      - ``data/titan_identity.json`` — ``{titan_id, titan_pubkey}``.
+
+    Always (over)writes both from ``key_bytes``; idempotency / existence
+    guards are the caller's concern. Returns the keypair Path.
+    """
+    if len(key_bytes) != 64:
+        raise ValueError(
+            f"bootable keypair must be 64 bytes, got {len(key_bytes)}"
+        )
+    kp = keypair_path(install_root)
+    kp.parent.mkdir(parents=True, exist_ok=True)
+    kp.write_text(json.dumps(list(key_bytes)))
+    kp.chmod(0o600)
+    tid = titan_id or _resolve_titan_id(install_root)
+    identity_path(install_root).write_text(
+        json.dumps({"titan_id": tid, "titan_pubkey": titan_pubkey}, indent=2)
+    )
+    return kp
+
+
 def _materialize_bootable_identity(install_root: Path) -> list[Result]:
     """Turn the kept plaintext keypair into the files the kernel boots from.
 
@@ -66,14 +102,11 @@ def _materialize_bootable_identity(install_root: Path) -> list[Result]:
                        "no plaintext keypair to materialize (authority.json absent)",
                        "Genesis must run with --keep-plaintext for local/devnet (mainnet "
                        "burns the key — boot then needs Resurrection / setup_titan restore).")]
-    kp.parent.mkdir(parents=True, exist_ok=True)
-    kp.write_bytes(authority.read_bytes())
-    kp.chmod(0o600)
-    # Wipe the stray repo-root copy — one plaintext keypair, in data/, 0600.
     try:
-        authority.unlink()
-    except OSError:
-        pass
+        key_bytes = bytes(json.loads(authority.read_text()))
+    except (OSError, json.JSONDecodeError, ValueError, TypeError) as e:
+        return [Result("identity", "fail",
+                       f"authority.json is not a valid keypair array: {e}")]
 
     titan_id = _resolve_titan_id(install_root)
     pubkey = ""
@@ -83,9 +116,18 @@ def _materialize_bootable_identity(install_root: Path) -> list[Result]:
             pubkey = json.loads(rec.read_text()).get("titan_pubkey", "")
     except (OSError, json.JSONDecodeError, ValueError):
         pass
-    ident = identity_path(install_root)
-    if not ident.exists():
-        ident.write_text(json.dumps({"titan_id": titan_id, "titan_pubkey": pubkey}, indent=2))
+
+    try:
+        write_bootable_identity(install_root, key_bytes,
+                                titan_id=titan_id, titan_pubkey=pubkey)
+    except ValueError as e:
+        return [Result("identity", "fail", f"bootable identity write failed: {e}")]
+
+    # Wipe the stray repo-root copy — one plaintext keypair, in data/, 0600.
+    try:
+        authority.unlink()
+    except OSError:
+        pass
     return [Result("identity", "ok",
                    f"bootable identity materialized (titan_id={titan_id}) → {kp}")]
 

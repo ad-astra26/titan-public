@@ -86,8 +86,6 @@ logger = logging.getLogger(__name__)
 
 HEARTBEAT_INTERVAL_S = 30.0
 CRITERIA_SNAPSHOT_EVERY_N_EPOCHS = 100  # every ~1000 actual epochs (10:1 sampled)
-_STATE_CHECKPOINT_INTERVAL_S = 300.0    # periodic disk checkpoint — survives an
-#                                         ungraceful crash (loses <= 1 interval)
 
 # Phase 11 §11.I.3/§11.I.5 — module-level readiness sentinel consumed by
 # this worker's heartbeat thread (SHM heartbeat is suppressed until the
@@ -198,35 +196,9 @@ def sovereignty_worker_main(recv_queue, send_queue, name: str,
     epoch_count = 0
     confirm_maker_count = 0
     increment_great_cycle_count = 0
-    last_state_checkpoint = time.time()  # first checkpoint ~5min after boot
-    _ckpt_thread = [None]                 # single-slot non-blocking writer
 
     try:
         while True:
-            # ── Periodic disk checkpoint (survives ANY crash) — NON-BLOCKING ──
-            # tracker._save_state() otherwise fires only every 500 epochs / on
-            # graceful shutdown, so an ungraceful death (shm_pid_dead / SIGKILL /
-            # SIGSEGV) loses all sovereignty-convergence state since the last save
-            # (observed frozen >22h). Loop-top placement fires every iteration
-            # (recv timeout=1s) regardless of traffic. Offloaded to a daemon
-            # thread so the disk write never blocks the heartbeat (esp. under
-            # disk/swap pressure); single-slot guard avoids thread pile-up.
-            _now_ck = time.time()
-            if (_now_ck - last_state_checkpoint > _STATE_CHECKPOINT_INTERVAL_S
-                    and (_ckpt_thread[0] is None
-                         or not _ckpt_thread[0].is_alive())):
-                last_state_checkpoint = _now_ck
-
-                def _do_ckpt():
-                    try:
-                        tracker._save_state()
-                    except Exception as _ckpt_err:  # noqa: BLE001
-                        logger.warning(
-                            "[SovereigntyWorker] periodic checkpoint failed: %s",
-                            _ckpt_err)
-                _ckpt_thread[0] = threading.Thread(
-                    target=_do_ckpt, daemon=True, name="sovereignty-checkpoint")
-                _ckpt_thread[0].start()
             try:
                 msg = recv_queue.get(timeout=1.0)
             except Empty:

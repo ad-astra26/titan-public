@@ -4059,7 +4059,7 @@ def get_tx_latency_stats() -> dict:
 def _sample_block_height(index_db_path: str) -> Optional[int]:
     """Read current main-fork block count. None on failure."""
     try:
-        conn = sqlite3.connect(index_db_path, timeout=1.0)  # noqa: async-block — TTL-gated block-height sampler (rare); short sqlite read
+        conn = sqlite3.connect(index_db_path, timeout=1.0)
         try:
             # Phase 14 / INV-Syn-26 — resolve 'main' chain-locally via this
             # chain's fork_registry rather than the static FORK_IDS map.
