@@ -41,6 +41,15 @@ _COORD_SNAPSHOT_CACHE: dict = {"data": None, "ts": 0.0}
 
 # Builder thread cadence: seconds of sleep BETWEEN builds (cycle ≈ build_time + interval).
 # Coord build is heaviest (~1-1.5s observed on T1), so 2.5s gives ~4s cycle.
+#
+# ⚠️ Do NOT "optimize" this cadence for CPU (PROFILING.md F5, under-load --gil
+# sweep 2026-05-30). The "21% of cognitive_worker" once attributed here was
+# py-spy WITHOUT --gil counting this builder thread's `time.sleep` (in
+# _builder_loop below) + the bus thread's blocked `recv_exact` as on-CPU. True
+# build cost is ~5-6% of cognitive's GIL time ≈ ~1% of one core — §3L.14's "now
+# cheap" was right. Dirty-track/cadence change is not worth it: inputs change
+# every epoch (rarely skips) and the build feeds 9 downstream *_UPDATED
+# consumers (real staleness risk for ~0 CPU win).
 _COORD_SNAPSHOT_BUILDER_INTERVAL = 2.5
 _SPIRIT_STATE_PUBLISHER_INTERVAL = 1.0  # SPEC §7.1 — 1 Hz for hormone_fires/impulse_engine_state/consciousness_state slots (rFP_phase_c_async_shm_consumer_migration §4.B.1)
 _SNAPSHOT_BUILDER_ERROR_BACKOFF = 2.0  # sleep on exception (avoid CPU burn + log flood)
