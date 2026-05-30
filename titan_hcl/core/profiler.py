@@ -258,19 +258,10 @@ class ProfileReport:
             for name, info in status.items():
                 pid = info.get("pid")
                 if not pid:
-                    # No live pid (e.g. imw-class socket writers that don't emit
-                    # a standard MODULE_HEARTBEAT). Still surface the self-
-                    # reported rss_mb + cpu_delta_s carried in guardian_state.bin
-                    # (§1339) so the module isn't shown as a contentless stub.
-                    slot_rss = float(info.get("rss_mb", 0.0) or 0.0)
                     report["modules"][name] = {
                         "state": info.get("state", "unknown"),
                         "pid": None,
-                        "rss_mb": round(slot_rss, 1),
-                        "cpu_delta_s": round(float(info.get("cpu_delta_s", 0.0) or 0.0), 3),
                     }
-                    total_rss += slot_rss * 1024  # MB → KB to match parent rss_kb
-                    count += 1
                     continue
                 mem = ProcStatReader.read_memory(pid)
                 cpu = ProcStatReader.read_cpu(pid)
@@ -281,7 +272,6 @@ class ProfileReport:
                     "rss_limit_mb": info.get("rss_limit_mb"),
                     "uptime_s": info.get("uptime", 0),
                     "restart_count": info.get("restart_count", 0),
-                    "cpu_delta_s": round(float(info.get("cpu_delta_s", 0.0) or 0.0), 3),
                     **_kb_to_mb_dict(mem),
                     **cpu,
                     **io_data,
