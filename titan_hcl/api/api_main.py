@@ -38,6 +38,15 @@ def entry(recv_queue, send_queue, name: str, config: dict) -> None:
     except ImportError:
         pass
 
+    # Native-crash visibility (SPEC §11.I.4) — dump a C+Python traceback to
+    # stderr→journal on a fatal native signal; the @with_error_envelope cascade
+    # only catches Python exceptions, not signals.
+    try:
+        import faulthandler as _faulthandler
+        _faulthandler.enable()
+    except Exception:
+        pass
+
     # Phase 11 §11.I.5 — populate the api module's SHM state slot so
     # /v6/readiness counts it toward mandatory_ready (W3 sweep / commit
     # 58761482 skipped this entry because api_main.py lives under
