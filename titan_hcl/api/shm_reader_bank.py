@@ -111,7 +111,6 @@ from titan_hcl.logic.spirit_state_specs import (
 from titan_hcl.logic.reasoning_state_specs import REASONING_STATE_SPEC
 from titan_hcl.logic.meta_reasoning_state_specs import META_REASONING_STATE_SPEC
 from titan_hcl.logic.meta_teacher_state_specs import META_TEACHER_STATE_SPEC
-from titan_hcl.logic.experience_stats_specs import EXPERIENCE_STATS_SPEC
 from titan_hcl.logic.guardian_state_specs import GUARDIAN_STATE_SPEC
 from titan_hcl.logic.llm_state_specs import LLM_STATE_SPEC
 from titan_hcl.logic.media_state_specs import MEDIA_STATE_SPEC
@@ -313,7 +312,6 @@ class ShmReaderBank:
         # Each slot has one canonical producer (G21).
         "_soul_state", "_cgn_engine_state",
         "_reasoning_state", "_meta_reasoning_state", "_meta_teacher_state",
-        "_experience_stats",
         "_guardian_state", "_llm_state", "_media_state", "_msl_state",
         "_consciousness_age",
         # ARCH-MAP-HEALTH-OBSERVABILITY Class B (2026-05-26): consciousness_state.bin
@@ -475,12 +473,6 @@ class ShmReaderBank:
             META_REASONING_STATE_SPEC, self.shm_root)
         self._meta_teacher_state = StateRegistryReader(
             META_TEACHER_STATE_SPEC, self.shm_root)
-        # §3L Phase 15 chunk 15.1 (D-SPEC-PHASE15) — experience_stats.bin
-        # reader. Writer is cognitive_worker (G21 single-writer;
-        # ExperienceOrchestrator instance). Replaces the retired
-        # ExperienceMemory.get_stats recompute-on-read path per G18.
-        self._experience_stats = StateRegistryReader(
-            EXPERIENCE_STATS_SPEC, self.shm_root)
         self._guardian_state = StateRegistryReader(
             GUARDIAN_STATE_SPEC, self.shm_root)
         self._llm_state = StateRegistryReader(
@@ -1364,14 +1356,6 @@ class ShmReaderBank:
         output. Producer: cognitive_worker."""
         return self._read_msgpack_variable(
             self._meta_teacher_state, "meta_teacher_state")
-
-    def read_experience_stats(self) -> dict[str, Any] | None:
-        """ExperienceStatsPublisher payload — total_records, undistilled,
-        total_wisdom, by_domain{domain→{count, avg_score, success_rate}},
-        schema_version, ts. Producer: cognitive_worker (ExperienceOrchestrator).
-        §3L Phase 15 chunk 15.1 — replaces frozen ExperienceMemory.get_stats."""
-        return self._read_msgpack_variable(
-            self._experience_stats, "experience_stats")
 
     def read_guardian_state(self) -> dict[str, Any] | None:
         """GuardianStatePublisher payload — per-module status (state, pid,

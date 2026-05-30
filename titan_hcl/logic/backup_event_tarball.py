@@ -200,7 +200,7 @@ def pack_event_tarball(
         cctx = zstandard.ZstdCompressor(level=EVENT_TARBALL_ZSTD_LEVEL)
         with open(tmp_path, "wb") as f_out, \
                 cctx.stream_writer(f_out, closefd=False) as zst_writer, \
-                tarfile.open(fileobj=zst_writer, mode="w|") as tar:  # noqa: async-block — backup cascade runs via loop.run_until_complete on a dedicated sequential worker loop — no concurrent coroutines to starve, not the FastAPI loop
+                tarfile.open(fileobj=zst_writer, mode="w|") as tar:
             for spec in file_specs:
                 patch_path = spec.diff_dict.get("patch_path")
                 if patch_path is not None:

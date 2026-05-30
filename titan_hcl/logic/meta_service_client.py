@@ -114,7 +114,6 @@ def send_meta_request(
     payload_snippet: str = "",
     send_queue=None,
     src: str = "",
-    grounding_payload: Optional[dict] = None,
 ) -> str:
     """Emit META_REASON_REQUEST via the consumer's send_queue.
 
@@ -169,15 +168,6 @@ def send_meta_request(
         "payload_snippet": str(payload_snippet)[:256],  # cap noise
         "request_id": request_id,
     }
-    # Phase A (RFP_cgn_enhancements §9.1) — concept-grounding learning events
-    # carry a grounding_payload so MetaService routes this request to the
-    # chain-trigger queue (should_trigger_meta Path #0) instead of the one-shot
-    # resolver. Absent for ordinary recruit-a-subsystem requests.
-    if grounding_payload is not None:
-        payload["grounding_payload"] = {
-            "concept_id": str(grounding_payload.get("concept_id", ""))[:128],
-            "felt_state_ref": grounding_payload.get("felt_state_ref"),
-        }
     msg = {
         "type": MSG_META_REASON_REQUEST,
         "src": src or consumer_id,

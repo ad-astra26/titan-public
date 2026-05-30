@@ -1459,37 +1459,6 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                     domain=_p8_word,
                                     reason=f"word '{_p8_word}' crossed grounding threshold (conf={_p8_conf:.3f})",
                                 )
-                                # ── Phase A (RFP_cgn_enhancements §9.1) ──────────
-                                # Same EdgeDetector gate (one per first-grounding):
-                                # ALSO fire a learning-event chain trigger so the
-                                # meta chain walks THIS concept instead of collapsing
-                                # to FORMULATE.define (§5.3). question_type =
-                                # synthesize_insight (SIGNAL_TO_PRIMITIVE dominant for
-                                # language.concept_grounded → SYNTHESIZE 0.70).
-                                # Wrapped: a meta-request failure must never break the
-                                # producer loop or the META_CGN_SIGNAL above.
-                                try:
-                                    from titan_hcl.logic.meta_service_client import (
-                                        send_meta_request)
-                                    from titan_hcl.logic.meta_consumer_contexts import (
-                                        build_language_meta_context_30d)
-                                    send_meta_request(
-                                        consumer_id="language",
-                                        question_type="synthesize_insight",
-                                        context_vector=build_language_meta_context_30d(),
-                                        time_budget_ms=2000,
-                                        send_queue=send_queue,
-                                        src="language",
-                                        grounding_payload={"concept_id": _p8_word},
-                                        payload_snippet=f"lang.concept_grounded:{_p8_word}",
-                                    )
-                                    logger.info(
-                                        "[Phase A] language.concept_grounded → "
-                                        "META_REASON_REQUEST (concept=%s)", _p8_word)
-                                except Exception as _mrq_err:
-                                    logger.warning(
-                                        "[Phase A] language concept_grounded "
-                                        "meta-request failed: %s", _mrq_err)
                                 if _p8_sent:
                                     _p8_fired += 1
                                     logger.info(
@@ -1925,33 +1894,6 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                         _qr_data.get("insights", [])
                     for _di in insights:
                         _di_source = _di.get("source_consumer", "")
-                        # ── C2 (rFP_haov_efficacy_closure §3E): verified HAOV rules
-                        # from OTHER consumers prioritise vocabulary teaching. C1
-                        # (get_cross_insights) delivers these as source="haov_verified".
-                        # Impasse-type rules carry no teachable concept (effect
-                        # "resolve_*") → skip; concept-grounding verified rules
-                        # contribute their concept token, weighted by confidence.
-                        # Currently inert by data (today's verified rules are all
-                        # impasse-type) but live the moment a concept-grounding rule
-                        # crystallizes — interface-complete per the design.
-                        if _di.get("source") == "haov_verified":
-                            if str(_di.get("effect", "")).startswith("resolve_"):
-                                continue  # impasse rule — nothing to teach (yet)
-                            _hv_rule = str(_di.get("rule", ""))
-                            _hv_tok = (_hv_rule.split("_", 1)[-1]
-                                       if "_" in _hv_rule else _hv_rule)
-                            _hv_tok = _hv_tok.replace("arc_", "").replace(
-                                "pattern_", "")
-                            for _hw in ARC_VOCABULARY_MAP.get(_hv_tok, [_hv_tok]):
-                                if _hw and _hw.lower() not in _vocab_words:
-                                    _dream_priority.append({
-                                        "word": _hw,
-                                        "source": f"haov:{_di_source}",
-                                        "source_reward": float(
-                                            _di.get("confidence", 0.5)),
-                                    })
-                                    break
-                            continue
                         for _di_concept in _di.get("top_concepts", [])[:3]:
                             _stripped = _di_concept.replace(
                                 "arc_", "").replace("pattern_", "")

@@ -1013,6 +1013,63 @@ async def emit_resurrection_memo(
         return None
 
 
+# ── production arc_to_target: restore INTO a live install tree ────────────
+
+
+def build_arc_to_target(install_root: str) -> Callable[[str, str], str]:
+    """Build the production `arc_to_target` that restores reconstructed files
+    back to their real on-disk locations under `install_root`.
+
+    The restore engine (restore_full / apply_event_components) deliberately
+    keeps `arc_to_target` caller-supplied so it never hard-depends on
+    backup.py (see module docstring). This is the *caller-side* builder for
+    a real resurrection — it inverts RebirthBackup's `(src_path, arc_name)`
+    tuples per component, mirroring `RebirthBackup._archive_name_to_path`
+    (exact arc → src_path; directory arc → src_path + suffix), and resolves
+    every result against `install_root`.
+
+    Component → path-tuple source matches backup.py's unified_v2 tier build
+    (`_run_unified_backup_v2`): personality→PERSONALITY_PATHS,
+    timechain→TIMECHAIN_PATHS, soul→WEEKLY_EXTRA_PATHS.
+
+    Raises ValueError for an unknown component or an arc_name that matches no
+    tuple in that component's map — a halt-worthy manifest/backup mismatch
+    the caller must surface, never silently drop.
+    """
+    from titan_hcl.logic.backup import RebirthBackup
+
+    component_paths = {
+        "personality": list(RebirthBackup.PERSONALITY_PATHS),
+        "timechain": list(RebirthBackup.TIMECHAIN_PATHS),
+        "soul": list(RebirthBackup.WEEKLY_EXTRA_PATHS),
+    }
+    root = os.path.abspath(install_root)
+
+    def _resolve(component: str, arc_name: str) -> str:
+        tuples = component_paths.get(component)
+        if tuples is None:
+            raise ValueError(
+                f"build_arc_to_target: unknown restore component {component!r} "
+                f"(expected one of {sorted(component_paths)})"
+            )
+        # Two-pass: exact match wins over a directory-prefix match so a
+        # directory arc can never shadow an exact file arc regardless of
+        # tuple order.
+        for source_path, arc in tuples:
+            if arc_name == arc:
+                return os.path.join(root, source_path)
+        for source_path, arc in tuples:
+            if arc_name.startswith(arc + "/"):
+                rel = source_path.rstrip("/") + arc_name[len(arc):]
+                return os.path.join(root, rel)
+        raise ValueError(
+            f"build_arc_to_target: arc_name {arc_name!r} not found in the "
+            f"{component} path map (backup/restore schema mismatch)"
+        )
+
+    return _resolve
+
+
 # ── atomic swap: target_dir → data/ ──────────────────────────────────────
 
 

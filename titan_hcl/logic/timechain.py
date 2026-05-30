@@ -532,33 +532,21 @@ class TimeChain:
             row = conn.execute("SELECT COUNT(*) FROM block_index").fetchone()
             self._total_blocks = row[0] if row else 0
 
-            # Load tag counts for sidechain auto-creation.
-            # PROFILING.md (2026-05-30): this is an O(all blocks) scan that
-            # parses every block's tags. `_tag_counts` is consumed ONLY by
-            # `_track_tags_for_sidechain` (line ~909), which is itself gated on
-            # `self._auto_sidechain`. So for read-only / auto_sidechain=False
-            # instances (e.g. the api's cached TimeChain, rebuilt every 60s) the
-            # whole scan builds a dict that is never read — it measured ~34% of
-            # one core in titan_hcl_api under py-spy --gil. Skip it when sidechain
-            # auto-creation is off. tags are stored as `str(list)` (Python repr),
-            # so parse with ast.literal_eval — safe (no code exec, unlike eval)
-            # and faster — for the write instance that does need the counts.
-            if self._auto_sidechain:
-                import ast
-                for fork_id in range(FORK_DECLARATIVE, FORK_META + 1):
-                    tag_rows = conn.execute(
-                        "SELECT tags FROM block_index WHERE fork_id = ? AND tags != ''",
-                        (fork_id,)
-                    ).fetchall()
-                    counts: dict[str, int] = {}
-                    for (tags_json,) in tag_rows:
-                        try:
-                            tags = ast.literal_eval(tags_json) if tags_json else []
-                            for tag in tags:
-                                counts[tag] = counts.get(tag, 0) + 1
-                        except (ValueError, SyntaxError):
-                            pass
-                    self._tag_counts[fork_id] = counts
+            # Load tag counts for sidechain auto-creation
+            for fork_id in range(FORK_DECLARATIVE, FORK_META + 1):
+                tag_rows = conn.execute(
+                    "SELECT tags FROM block_index WHERE fork_id = ? AND tags != ''",
+                    (fork_id,)
+                ).fetchall()
+                counts: dict[str, int] = {}
+                for (tags_json,) in tag_rows:
+                    try:
+                        tags = eval(tags_json) if tags_json else []
+                        for tag in tags:
+                            counts[tag] = counts.get(tag, 0) + 1
+                    except Exception:
+                        pass
+                self._tag_counts[fork_id] = counts
 
             # Phase 14 / INV-Syn-26 — build the chain-local fork NAME → id index
             # from the authoritative fork_registry (covers primaries AND
