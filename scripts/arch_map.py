@@ -654,10 +654,66 @@ def build_graph(scan_dirs, scripts_dirs=None):
 
 # ── Query Engine ──────────────────────────────────────────────────────
 
+def _newest_source_mtime() -> float:
+    """Max mtime across every .py file arch_map scans (titan_hcl/ + scripts/).
+
+    Cheap (~tens of ms over ~800 files) compared to the ~30s rebuild, so it is
+    safe to call on every map-reading command as a staleness probe.
+    """
+    newest = 0.0
+    for base in (*SCAN_DIRS, *SCRIPTS_DIRS):
+        if not base.exists():
+            continue
+        for p in base.rglob("*.py"):
+            try:
+                m = p.stat().st_mtime
+            except OSError:
+                continue
+            if m > newest:
+                newest = m
+    return newest
+
+
+def _rebuild_graph() -> dict:
+    """Regenerate + persist architecture_map.json. Returns the fresh graph.
+
+    Single source of truth for both the `scan` command and load_graph()'s
+    auto-freshen path.
+    """
+    graph = build_graph(SCAN_DIRS, SCRIPTS_DIRS)
+    OUTPUT_FILE.write_text(json.dumps(graph, indent=2, default=str))
+    return graph
+
+
 def load_graph() -> dict:
+    """Load the architecture map, auto-rescanning first if it is stale.
+
+    Every map-reading arch_map command funnels through here, so this is the
+    single chokepoint that guarantees analysis always runs against current
+    code. On 2026-05-30 a map that had silently gone 8 days stale produced a
+    spurious profiling conclusion; this auto-freshen closes that trap.
+
+    Staleness = map missing OR any scanned .py newer than the map. Set
+    ARCH_MAP_NO_AUTOSCAN=1 to opt out (CI / callers that manage scanning
+    explicitly and want a hard error on a missing map instead of a rebuild).
+    """
+    if os.environ.get("ARCH_MAP_NO_AUTOSCAN") == "1":
+        if not OUTPUT_FILE.exists():
+            print(f"No architecture map found. Run: python {sys.argv[0]} scan")
+            sys.exit(1)
+        return json.loads(OUTPUT_FILE.read_text())
+
     if not OUTPUT_FILE.exists():
-        print(f"No architecture map found. Run: python {sys.argv[0]} scan")
-        sys.exit(1)
+        print("[arch_map] architecture_map.json missing — scanning "
+              "titan_hcl/ + scripts/ before query ...", file=sys.stderr)
+        _rebuild_graph()
+        print("[arch_map] scan complete.", file=sys.stderr)
+    elif OUTPUT_FILE.stat().st_mtime < _newest_source_mtime():
+        print("[arch_map] architecture_map.json stale (source changed) — "
+              "rescanning titan_hcl/ + scripts/ before query ...",
+              file=sys.stderr)
+        _rebuild_graph()
+        print("[arch_map] rescan complete.", file=sys.stderr)
     return json.loads(OUTPUT_FILE.read_text())
 
 
@@ -9332,8 +9388,7 @@ def main():
 
     if cmd == "scan":
         print("Scanning titan_hcl/ ...")
-        graph = build_graph(SCAN_DIRS, SCRIPTS_DIRS)
-        OUTPUT_FILE.write_text(json.dumps(graph, indent=2, default=str))
+        graph = _rebuild_graph()
         print(f"Written: {rel(OUTPUT_FILE)}")
         print(f"  {graph['total_files']} files, {graph['total_lines']:,} lines")
         msg_count = len([k for k in graph["bus_wiring"] if not k.startswith("_SUB:")])

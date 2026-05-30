@@ -3119,7 +3119,6 @@ class SocialXGateway:
         arc_cand = getattr(context, "archetype_candidate", None)
         media_ids: list[str] = []
         quoted_tweet_id: str = ""
-        quoted_author: str = ""
         archetype_metadata_json: str = ""
         if arc_cand is not None:
             # Render+upload image for archetypes that carry a `generated_art`
@@ -3143,9 +3142,6 @@ class SocialXGateway:
                     logger.warning(
                         "[SocialXGateway] archetype media prepare failed: %s", exc)
             quoted_tweet_id = arc_cand.quoted_tweet_id or ""
-            quoted_author = str((arc_cand.metadata or {}).get("author")
-                                or (arc_cand.metadata or {}).get("handle")
-                                or "").lstrip("@").strip()
             try:
                 archetype_metadata_json = json.dumps(
                     {**arc_cand.metadata, "archetype": arc_cand.archetype,
@@ -3181,20 +3177,7 @@ class SocialXGateway:
         payload = {"tweet_text": final_text, "media_ids": media_ids,
                    "is_note_tweet": x_len > 280}
         if quoted_tweet_id:
-            # Quote the source post so it embeds as a card (Maker 2026-05-30).
-            # Live test proved `quote_tweet_id` does NOT embed on twitterapi.io
-            # (the tweet posted but carried no quoted_tweet). Switched to the
-            # documented alternative `attachment_url` (a tweet URL), which X
-            # natively renders as a quote card. Sent ALONE (not alongside
-            # quote_tweet_id) to avoid a conflicting-param rejection. The URL
-            # needs the author handle (from candidate metadata); fall back to
-            # the handle-less /i/status/ form only if author is unknown.
-            if quoted_author:
-                payload["attachment_url"] = (
-                    f"https://x.com/{quoted_author}/status/{quoted_tweet_id}")
-            else:
-                payload["attachment_url"] = (
-                    f"https://x.com/i/status/{quoted_tweet_id}")
+            payload["quoted_tweet_id"] = quoted_tweet_id
         api_result = self._call_x_api(
             "twitter/create_tweet_v2",
             method="POST",

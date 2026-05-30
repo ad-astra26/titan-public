@@ -1,4 +1,12 @@
 #!/bin/bash
+# ⚠️ DEPRECATED (2026-05-30) — DO NOT USE for CPU profiling.
+# Used wall-clock `py-spy record` (no --gil), which samples sleeping/blocked
+# threads and reports their parked line (time.sleep / blocking recv) as a
+# "hotspot" — the exact trap that produced the F1/F3/F5 phantoms. Use
+# `scripts/profile_oncpu.py` (py-spy --gil + /proc anchor + optional perf).
+# See titan-docs/PROFILING.md § METHODOLOGY.
+echo "⚠️ batch_pyspy.sh is DEPRECATED (wall-clock sampler → phantom hotspots)." >&2
+echo "   Use: sudo -E python scripts/profile_oncpu.py <worker>...  (PROFILING.md)" >&2
 # Batch py-spy: for each worker name, resolve its pid (by cwd+setproctitle),
 # sample on-CPU for DURATION, print top-6 self-time frames. Args: REPO DURATION WORKER...
 PY=/home/antigravity/projects/titan/test_env/bin/py-spy

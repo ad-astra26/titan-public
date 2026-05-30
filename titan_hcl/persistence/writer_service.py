@@ -187,7 +187,7 @@ class IMWDaemon:
 
     def _open_db(self, db_path: str) -> sqlite3.Connection:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(
+        conn = sqlite3.connect(  # noqa: async-block — boot-time one-shot in IMW dedicated-process loop; opened once before serving
             db_path,
             timeout=self._cfg.busy_timeout_sec,
             isolation_level=None,   # manage transactions manually

@@ -646,24 +646,6 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
         )
         logger.info(
             "[CognitiveWorker] Meta-service booted (Session 3 live dispatch)")
-        # Phase A (RFP_cgn_enhancements §9.1) — CANONICAL grounding_sink wiring.
-        # _init_cognitive_engines (line 588) already built meta_engine and stored
-        # state_refs["meta_engine"], so by here BOTH exist regardless of the
-        # symmetric (no-op-when-first) attempt inside _init_cognitive_engines.
-        # This routes concept-grounding META_REASON_REQUESTs into the engine's
-        # chain-trigger queue (should_trigger_meta Path #0).
-        _eng_for_grounding = state_refs.get("meta_engine")
-        if _eng_for_grounding is not None and state_refs["_meta_service"] is not None:
-            state_refs["_meta_service"]._grounding_sink = \
-                _eng_for_grounding.enqueue_grounding
-            logger.info(
-                "[CognitiveWorker] Phase A — meta_service grounding_sink wired to "
-                "meta_engine.enqueue_grounding (learning-event Path #0 ACTIVE)")
-        else:
-            logger.warning(
-                "[CognitiveWorker] Phase A — meta_engine=%s at meta-service init; "
-                "grounding_sink NOT wired (Path #0 INACTIVE)",
-                "present" if _eng_for_grounding is not None else "MISSING")
     except Exception as _ms_err:
         logger.warning("[CognitiveWorker] Meta-service init: %s", _ms_err)
 
@@ -2006,16 +1988,6 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
                 config=_meta_cfg, send_queue=send_queue)
             if coordinator is not None:
                 coordinator._meta_engine = meta_engine
-            # Phase A (RFP_cgn_enhancements §9.1) — route concept-grounding
-            # META_REASON_REQUESTs into the engine's chain-trigger queue
-            # (should_trigger_meta Path #0). MetaService was constructed earlier
-            # without an engine ref; wire the sink now that the engine exists.
-            _ms_for_grounding = state_refs.get("_meta_service")
-            if _ms_for_grounding is not None:
-                _ms_for_grounding._grounding_sink = meta_engine.enqueue_grounding
-                logger.info(
-                    "[CognitiveWorker] Phase A — meta_service grounding_sink wired "
-                    "to meta_engine.enqueue_grounding (learning-event Path #0 active)")
             # D-SPEC-70 v1.15.0 — attach inner_self_insight.bin SHM reader
             # so _prim_introspect can read pre-warmed cache per G20.
             # ShmReaderBank lazy-inited in state_refs at boot (see
