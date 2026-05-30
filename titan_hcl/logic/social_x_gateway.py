@@ -3177,12 +3177,7 @@ class SocialXGateway:
         payload = {"tweet_text": final_text, "media_ids": media_ids,
                    "is_note_tweet": x_len > 280}
         if quoted_tweet_id:
-            # twitterapi.io create_tweet_v2 expects `quote_tweet_id` (no 'd') —
-            # NOT `quoted_tweet_id`. The wrong key was silently dropped, so
-            # reflections posted with the @handle but no embedded quote ("about
-            # what post?"). Fixed 2026-05-30. (Docs: quote_tweet_id, alt
-            # attachment_url.)
-            payload["quote_tweet_id"] = quoted_tweet_id
+            payload["quoted_tweet_id"] = quoted_tweet_id
         api_result = self._call_x_api(
             "twitter/create_tweet_v2",
             method="POST",
