@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 
 from titan_hcl.logic.spirit_helpers import _send_msg
@@ -48,31 +47,6 @@ _SNAPSHOT_BUILDER_ERROR_BACKOFF = 2.0  # sleep on exception (avoid CPU burn + lo
 # Legacy TTL kept as compatibility shim for the coord QueryThread cold-boot
 # window. (Trinity/NS TTLs removed with their orphaned builders — D-SPEC-143.)
 _COORD_SNAPSHOT_TTL = 30.0
-
-# §3L Phase 15 chunk 15.2 — TEMPORARY STOPGAP (Maker 2026-05-30; real fix =
-# RFP_phase_c_actr_memory_rehoming). episodic_memory.db is FROZEN fleet-wide
-# (its write loop was dropped when spirit_worker was retired, D8-3/72f95a6b),
-# yet the coord-build ran EpisodicMemory.get_stats — COUNT(*) + GROUP BY over
-# ~245 MB — every 2.5s, producing a constant result. mtime-gate it: recompute
-# only when the DB file actually changes (frozen → computed once then cached;
-# auto-recomputes when the rehoming restores writes → self-correcting).
-_EPISODIC_STATS_CACHE: dict = {"data": None, "mtime": None}
-
-
-def _episodic_stats_mtime_gated(episodic_mem) -> dict:
-    """Return EpisodicMemory.get_stats(), recomputed only when the backing DB
-    file's mtime changes. Stopgap for the frozen-DB GROUP-BY bleed (chunk 15.2);
-    superseded by RFP_phase_c_actr_memory_rehoming once recording is live."""
-    db_path = getattr(episodic_mem, "_db_path", "./data/episodic_memory.db")
-    try:
-        mtime = os.path.getmtime(db_path)
-    except OSError:
-        mtime = None
-    if (_EPISODIC_STATS_CACHE["data"] is None
-            or mtime != _EPISODIC_STATS_CACHE["mtime"]):
-        _EPISODIC_STATS_CACHE["data"] = episodic_mem.get_stats()
-        _EPISODIC_STATS_CACHE["mtime"] = mtime
-    return _EPISODIC_STATS_CACHE["data"]
 
 
 def build_coordinator_snapshot(state_refs: dict) -> dict | None:
@@ -121,7 +95,7 @@ def build_coordinator_snapshot(state_refs: dict) -> dict | None:
     pi_monitor = state_refs.get("pi_monitor")
     e_mem = state_refs.get("e_mem")
     prediction_engine = state_refs.get("prediction_engine")
-    exp_orchestrator = state_refs.get("exp_orchestrator")
+    ex_mem = state_refs.get("ex_mem")
     episodic_mem = state_refs.get("episodic_mem")
     working_mem = state_refs.get("working_mem")
     inner_lower_topo = state_refs.get("inner_lower_topo")
@@ -159,18 +133,10 @@ def build_coordinator_snapshot(state_refs: dict) -> dict | None:
         _safe_set(stats, "experiential_memory", e_mem.get_stats)
     if prediction_engine:
         _safe_set(stats, "prediction", prediction_engine.get_stats)
-    if exp_orchestrator:
-        # §3L Phase 15 chunk 15.1 — experience stats now sourced from the LIVE
-        # ExperienceOrchestrator (incremental action_stats), not the retired
-        # frozen ExperienceMemory.get_stats. In-proc read (cognitive_worker
-        # owns the orchestrator); api reads experience_stats.bin via accessor.
-        _safe_set(stats, "experience_memory",
-                  exp_orchestrator.get_experience_stats_payload)
+    if ex_mem:
+        _safe_set(stats, "experience_memory", ex_mem.get_stats)
     if episodic_mem:
-        # §3L chunk 15.2 stopgap — mtime-gated (frozen-DB bleed). See
-        # RFP_phase_c_actr_memory_rehoming for the real fix.
-        _safe_set(stats, "episodic_memory",
-                  lambda: _episodic_stats_mtime_gated(episodic_mem))
+        _safe_set(stats, "episodic_memory", episodic_mem.get_stats)
     if working_mem:
         _safe_set(stats, "working_memory", working_mem.get_stats)
     if inner_lower_topo:

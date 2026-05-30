@@ -117,29 +117,16 @@ def test_builder_threads_populate_coord_cache_quickly():
     assert snapshot_builders._COORD_SNAPSHOT_CACHE["data"]["commits"] == 7
 
 
-def test_builder_thread_survives_build_exceptions(monkeypatch):
-    """If build_fn raises, cache keeps serving last-good; thread stays alive.
-
-    NOTE: `build_coordinator_snapshot` deliberately ISOLATES per-subsystem
-    `get_stats` failures (incl. coordinator.get_stats) and returns a partial
-    dict with a `coordinator_error` marker rather than raising — so mocking
-    coordinator.get_stats to raise no longer reaches the loop's except arm.
-    To exercise the loop's genuine raise-resilience contract (the invariant
-    that actually matters: a raising build_fn must not clobber last-good and
-    must not kill the builder thread), force the build fn itself to raise.
-    """
+def test_builder_thread_survives_build_exceptions():
+    """If build_fn raises, cache keeps serving last-good; thread stays alive."""
     # Prime cache with known-good data.
     snapshot_builders._COORD_SNAPSHOT_CACHE["data"] = {"last_good": True}
     snapshot_builders._COORD_SNAPSHOT_CACHE["ts"] = time.time()
 
-    # Force the build fn itself to raise (genuine build_fn exception that the
-    # loop's try/except must absorb without clobbering the cache).
-    def _boom(_state_refs):
-        raise RuntimeError("boom")
-    monkeypatch.setattr(snapshot_builders, "build_coordinator_snapshot", _boom)
-
+    # Refs whose coordinator raises on get_stats.
     coord = types.SimpleNamespace(
-        get_stats=lambda: {}, _meta_engine=None, _meta_service=None,
+        get_stats=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        _meta_engine=None, _meta_service=None,
         dreaming=None, inner=None, nervous_system=None,
     )
     refs = {"coordinator": coord}
