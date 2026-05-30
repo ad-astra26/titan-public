@@ -42,6 +42,23 @@ FINGERPRINT_CACHE_MAX = 500
 PERCEPTION_BUFFER_MAX = 15
 MIN_WINDOW_INTERVAL = 600  # 10 min minimum between runs (supports 15-min cron)
 
+# Distillation batching (2026-05-30 funnel-revival fix).
+#
+# ROOT CAUSE of `felt_experiences` freeze (events_stored=0 since 2026-05-18):
+# _distill_content sent ALL items in a single 5-item LLM call asking for a
+# 5-element JSON array (max_tokens=800). deepseek-v3.1:671b takes ~21s for 2
+# items, so 5 items ran ~45-50s and hit the hardcoded 45s endpoint timeout →
+# the call returned [] → nothing stored, every window, fleet-wide.
+#
+# Fix: distill in SMALL chunks that each complete well under the timeout, and
+# loop over MORE of the window's items so author coverage is broad (directly
+# counters the "Titans only reflect on the same 2-3 people" symptom). Each
+# chunk gets its own bounded LLM call; partial failures drop only their chunk.
+DISTILL_BATCH_SIZE = 2          # items per LLM call (~21s measured for 2)
+MAX_DISTILL_ITEMS = 12          # max items distilled per window (≈6 chunks)
+DISTILL_CHUNK_TIMEOUT_S = 45.0  # per-chunk endpoint timeout (headroom over ~25s)
+DISTILL_TOKENS_PER_ITEM = 320   # max_tokens budget scaled by chunk size
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Data Classes
@@ -1067,15 +1084,63 @@ class EventsTeacher:
                 if data.get("status") not in ("error", "circuit_breaker"):
                     tweets = data.get("tweets", data.get("data", []))
                     if isinstance(tweets, list):
+                        _latest_id = ""
+                        _latest_text = ""
                         for tw in tweets:
                             text = tw.get("text", "")
+                            tw_id = str(tw.get("id", "") or "")
+                            # Cache the FIRST (newest — query_type=Latest) tweet
+                            # of this account so reflection/amplify archetypes
+                            # can quote-tweet / retweet the real post (Maker
+                            # 2026-05-30). Captured even if _is_new_content
+                            # dedups it out of the distill batch.
+                            if not _latest_id and tw_id:
+                                _latest_id = tw_id
+                                _latest_text = text
                             if text and self._is_new_content(text, handle):
                                 items.append({
                                     "source": "follower_timeline",
                                     "author": handle,
                                     "text": text,
-                                    "tweet_id": tw.get("id", ""),
+                                    "tweet_id": tw_id,
                                 })
+                        if _latest_id:
+                            # Persist newest tweet (text + id) to
+                            # community_registry so reflection/amplify
+                            # archetypes can quote-tweet / retweet the real
+                            # post. Direct write to social_graph.db — same
+                            # pattern as the followers/following sync above
+                            # (this method already owns that DB this cycle).
+                            try:
+                                _cg = sqlite3.connect(
+                                    DEFAULT_SOCIAL_GRAPH_DB, timeout=10)
+                                # Defensive migration: events_teacher may write
+                                # before SocialGraph.__init__ migrates the
+                                # column on a fresh process. Idempotent.
+                                try:
+                                    _cg.execute(
+                                        "ALTER TABLE community_registry "
+                                        "ADD COLUMN last_tweet_id TEXT "
+                                        "DEFAULT ''")
+                                except sqlite3.OperationalError:
+                                    pass
+                                _cg.execute(
+                                    "INSERT INTO community_registry "
+                                    "(user_name, last_tweet_text, "
+                                    " last_tweet_time, last_tweet_id) "
+                                    "VALUES (?, ?, ?, ?) "
+                                    "ON CONFLICT(user_name) DO UPDATE SET "
+                                    "last_tweet_text=excluded.last_tweet_text, "
+                                    "last_tweet_time=excluded.last_tweet_time, "
+                                    "last_tweet_id=excluded.last_tweet_id",
+                                    (handle, _latest_text[:500], time.time(),
+                                     _latest_id))
+                                _cg.commit()
+                                _cg.close()
+                            except Exception as _e:
+                                logger.debug(
+                                    "[EventsTeacher] last_tweet cache for %s "
+                                    "failed: %s", handle, _e)
             except Exception as e:
                 logger.warning("[EventsTeacher] Timeline fetch failed for %s: %s",
                                handle, e)
@@ -1539,7 +1604,13 @@ class EventsTeacher:
         if not raw_items:
             return [], 0
 
-        batch = raw_items[:5]
+        # 2026-05-30 funnel-revival fix: distill in SMALL chunks so each LLM
+        # call completes well under the endpoint timeout (a single 5-item call
+        # ran ~45-50s and ALWAYS hit the 45s timeout → returned [] → 0 stored,
+        # fleet-wide, since 2026-05-18). Looping over more of the window's
+        # items also broadens author coverage per window. See DISTILL_*
+        # module constants.
+        items = raw_items[:MAX_DISTILL_ITEMS]
 
         emotion = titan_state.get("current_emotion", "neutral")
         nm = titan_state.get("modulators", {})
@@ -1547,12 +1618,6 @@ class EventsTeacher:
         sht = nm.get("5HT", {}).get("level", 0.5) if isinstance(nm.get("5HT"), dict) else 0.5
         ne = nm.get("NE", {}).get("level", 0.5) if isinstance(nm.get("NE"), dict) else 0.5
         gaba = nm.get("GABA", {}).get("level", 0.5) if isinstance(nm.get("GABA"), dict) else 0.5
-
-        items_text = ""
-        for i, item in enumerate(batch):
-            items_text += (f"\n--- Item {i+1} (source: {item['source']}, "
-                           f"author: {item['author']}) ---\n")
-            items_text += item["text"][:500] + "\n"
 
         system_prompt = (
             f"You are distilling social content for Titan — a sovereign AI with real "
@@ -1592,55 +1657,53 @@ class EventsTeacher:
                            "endpoint will reject auth")
             return [], 0
 
-        start = time.time()
-        try:
+        def _distill_chunk(chunk: list[dict]) -> list[DistilledEvent]:
+            """One bounded LLM call for a small item chunk. Raises on transport
+            error / bad status so the caller can skip just this chunk."""
+            items_text = ""
+            for i, item in enumerate(chunk):
+                items_text += (f"\n--- Item {i+1} (source: {item['source']}, "
+                               f"author: {item['author']}) ---\n")
+                items_text += item["text"][:500] + "\n"
             resp = httpx.post(
                 f"{api_base.rstrip('/')}/v4/llm-distill",
                 headers={"X-Titan-Internal-Key": internal_key,
                          "Content-Type": "application/json"},
                 json={
-                    # Combine system + items into instruction + text — the
-                    # llm_worker's distill builds `{instruction}\n\n{text}` as
-                    # the prompt to the LLM (single user-message form). The
-                    # JSON-formatting instructions are strong enough that the
-                    # model behaves equivalently to the prior 2-message form.
                     "instruction": system_prompt,
                     "text": items_text,
                     "model": llm_model or None,
-                    "max_tokens": 800,
+                    "max_tokens": DISTILL_TOKENS_PER_ITEM * len(chunk),
                     "temperature": 0.3,
                     "consumer": "events_teacher",
-                    "timeout_s": 45.0,
+                    "timeout_s": DISTILL_CHUNK_TIMEOUT_S,
                 },
-                timeout=50.0,   # endpoint timeout + small buffer
+                timeout=DISTILL_CHUNK_TIMEOUT_S + 5.0,  # endpoint + small buffer
             )
-            latency_ms = int((time.time() - start) * 1000)
             body = resp.json()
             if body.get("status") != "ok" or not body.get("text"):
                 logger.warning(
-                    "[EventsTeacher] /v4/llm-distill returned status=%s "
-                    "error=%s after %dms",
-                    body.get("status"), body.get("error"), latency_ms)
-                return [], latency_ms
+                    "[EventsTeacher] /v4/llm-distill returned status=%s error=%s",
+                    body.get("status"), body.get("error"))
+                return []
             content = body["text"].strip()
-
             # Handle markdown code blocks
             if content.startswith("```"):
                 content = content.split("```")[1]
                 if content.startswith("json"):
                     content = content[4:]
-
             parsed = json.loads(content)
             if not isinstance(parsed, list):
                 parsed = [parsed]
-
-            events = []
+            out: list[DistilledEvent] = []
             for i, p in enumerate(parsed):
-                if i >= len(batch):
+                if i >= len(chunk):
                     break
-                events.append(DistilledEvent(
-                    source=batch[i]["source"],
-                    author=batch[i]["author"],
+                if not isinstance(p, dict):
+                    continue
+                out.append(DistilledEvent(
+                    source=chunk[i]["source"],
+                    author=chunk[i]["author"],
                     topic=p.get("topic", "unknown"),
                     sentiment=float(p.get("sentiment", 0.0)),
                     arousal=float(p.get("arousal", 0.0)),
@@ -1649,15 +1712,25 @@ class EventsTeacher:
                     semantic_concepts=p.get("semantic_concepts", []),
                     felt_summary=p.get("felt_summary", ""),
                     contagion_type=p.get("contagion_type"),
-                    raw_text=batch[i]["text"][:200],
+                    raw_text=chunk[i]["text"][:200],
                     timestamp=time.time(),
                 ))
-            return events, latency_ms
+            return out
 
-        except Exception as e:
-            latency_ms = int((time.time() - start) * 1000)
-            logger.warning("[EventsTeacher] LLM distillation failed: %s", e)
-            return [], latency_ms
+        start = time.time()
+        events: list[DistilledEvent] = []
+        for off in range(0, len(items), DISTILL_BATCH_SIZE):
+            chunk = items[off:off + DISTILL_BATCH_SIZE]
+            try:
+                events.extend(_distill_chunk(chunk))
+            except Exception as e:
+                # Drop only this chunk; keep distilling the rest of the window.
+                logger.warning(
+                    "[EventsTeacher] distill chunk %d-%d failed (%s) — skipping "
+                    "chunk, continuing", off, off + len(chunk), e)
+                continue
+        latency_ms = int((time.time() - start) * 1000)
+        return events, latency_ms
 
     # ── Social Perception Buffer ─────────────────────────────────────
 

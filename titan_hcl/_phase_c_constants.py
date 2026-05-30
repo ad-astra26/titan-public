@@ -5,7 +5,7 @@ DO NOT EDIT BY HAND. Edit the TOML, then run:
     python scripts/generate_phase_c_constants.py
 
 SPEC version: 1.11.4
-Source SHA-256: 9840e48bbd9b42d92a334b5bd620c7e734db569f22244228918794ecad163dbc
+Source SHA-256: e120fa85eab76eada2786fbb49c51cc2a1789f905242b51770ce2e979f9511c2
 
 Per SPEC §19 + §2.6: hand-editing this file is a SPEC violation flagged by
 `arch_map phase-c verify`.
@@ -15,7 +15,7 @@ from typing import Final
 
 # ── SPEC version metadata ──────────────────────────────────────────────
 SPEC_VERSION: Final[str] = "1.11.4"
-SPEC_SOURCE_SHA256: Final[str] = "9840e48bbd9b42d92a334b5bd620c7e734db569f22244228918794ecad163dbc"
+SPEC_SOURCE_SHA256: Final[str] = "e120fa85eab76eada2786fbb49c51cc2a1789f905242b51770ce2e979f9511c2"
 
 
 # ── KERNEL ────────────────────────────────────────────────────────────────
@@ -485,8 +485,12 @@ CONSCIOUSNESS_AGE_MAX_BYTES: Final[int] = 256
 META_TEACHER_STATE_SCHEMA_VERSION: Final[int] = 1
 # Max bytes for meta_teacher_state.bin payload. Typical ≈ 600-1500 bytes. Bounded 4KB cap.
 META_TEACHER_STATE_MAX_BYTES: Final[int] = 4096
-# Schema version for guardian_state.bin slot — variable msgpack {modules: dict[str→{state: str, pid: int, rss_mb: float, uptime: float, restart_count: int, restarts_in_window: int, last_heartbeat_age: float, layer: str, start_method: str, adopted: bool, adopt_ts: float}], total_modules: int, modules_by_layer: dict[str→list[str]], escalation_count: int, schema_version: int, ts: float}. Owned by guardian (Python L1 supervisor — `titan_hcl/guardian.py`). Reader: api_subprocess StateAccessor.guardian.get_status + get_modules_by_layer.
-GUARDIAN_STATE_SCHEMA_VERSION: Final[int] = 1
+# Schema version for experience_stats.bin slot — variable msgpack {total_records: int, undistilled: int, total_wisdom: int, by_domain: dict[str→{count: int, avg_score: float, success_rate: float}], schema_version: int, ts: float}. Owned by cognitive_worker (ExperienceOrchestrator instance; G21 single-writer). Aggregated from the INCREMENTAL action_stats table (running avg/success maintained O(1) in _update_action_stats) + experience_records counts — NEVER a per-read GROUP BY. Reader: api_subprocess StateAccessor.experience + in-proc coord-snapshot build + neuromod_inputs_builder. §3L Phase 15 chunk 15.1 / D-SPEC-PHASE15: retires the frozen ExperienceMemory recompute-on-read path (spirit_worker write loop dropped in D8-3/72f95a6b).
+EXPERIENCE_STATS_SCHEMA_VERSION: Final[int] = 1
+# Max bytes for experience_stats.bin payload. by_domain has ~7-12 domains × ~80 bytes → typically 600-1000 bytes. Bounded 4KB cap.
+EXPERIENCE_STATS_MAX_BYTES: Final[int] = 4096
+# Schema version for guardian_state.bin slot — variable msgpack {modules: dict[str→{state: str, pid: int, rss_mb: float, cpu_delta_s: float, uptime: float, restart_count: int, restarts_in_window: int, last_heartbeat_age: float, layer: str, start_method: str, adopted: bool, adopt_ts: float}], total_modules: int, modules_by_layer: dict[str→list[str]], escalation_count: int, schema_version: int, ts: float}. Owned by guardian_hcl (Python L1 supervisor). Reader: api_subprocess StateAccessor.guardian.get_status + get_modules_by_layer. v2 (D-SPEC-146): + cpu_delta_s per SPEC §1339 (heartbeat-sourced); pid populated from MODULE_HEARTBEAT self-report.
+GUARDIAN_STATE_SCHEMA_VERSION: Final[int] = 2
 # Max bytes for guardian_state.bin payload. ~30-40 modules × ~200 bytes each → typically 8-10KB. Bounded 16KB cap accommodates fleet growth.
 GUARDIAN_STATE_MAX_BYTES: Final[int] = 16384
 # Schema version for llm_state.bin slot — variable msgpack {provider: str, model: str, total_completions: int, completions_this_hour: int, avg_latency_ms: float, p99_latency_ms: float, total_input_tokens: int, total_output_tokens: int, last_completion_ts: float, last_error: str, error_rate: float, schema_version: int, ts: float}. Owned by llm_worker (G21 single-writer). Reader: api_subprocess StateAccessor.llm.
