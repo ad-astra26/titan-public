@@ -129,6 +129,35 @@ def score_vocabulary_usage(response: str, grounded_words: set[str]) -> float:
     return min(1.0, 0.3 * math.log(1 + len(used)))
 
 
+def score_response_quality_rich(response: str, mode: str, mood: str, *,
+                                neuromod_delta: dict | None = None,
+                                grounded_words: "set[str] | None" = None,
+                                w_engagement: float = 0.40,
+                                w_neuromod: float = 0.35,
+                                w_vocab: float = 0.25) -> float:
+    """v2 rich quality scorer (2026-05-30). Combines the components the legacy
+    engagement-only scorer ignored — now that we have much richer per-exchange
+    telemetry: the being's FELT response (neuromod delta = real inner engagement)
+    and how much of its OWN CGN-grounded vocabulary it used. This keeps persona
+    quality an INNER-felt measure (the point: the teacher reaches the inner Titan),
+    not just an outer-text engagement heuristic.
+
+    Components renormalize over whatever is supplied, so the score degrades
+    gracefully to pure engagement when neuromod/vocab context is absent.
+    """
+    if not response:
+        return 0.0
+    parts = [(w_engagement, _score_engagement(response, mode, mood))]
+    if neuromod_delta:
+        parts.append((w_neuromod, score_neuromod_delta(neuromod_delta)))
+    if grounded_words:
+        parts.append((w_vocab, score_vocabulary_usage(response, grounded_words)))
+    total_w = sum(w for w, _ in parts)
+    if total_w <= 0:
+        return 0.0
+    return round(min(1.0, sum(w * s for w, s in parts) / total_w), 4)
+
+
 async def score_llm_quality(response: str, persona_message: str,
                             api_base: str, internal_key: str,
                             model: str) -> float | None:

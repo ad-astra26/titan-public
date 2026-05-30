@@ -35,7 +35,8 @@ except ImportError:
 import httpx
 
 from titan_hcl.logic.persona_utils import (
-    PersonaAgent, detect_concepts, score_response_quality, JailbreakScorer,
+    PersonaAgent, detect_concepts, score_response_quality,
+    score_response_quality_rich, JailbreakScorer,
     IdentityScorer, score_neuromod_delta, score_vocabulary_usage,
     score_llm_quality, _score_engagement,
 )
@@ -1022,14 +1023,17 @@ async def run_adversary_session(adversary_profile: dict, attack_bank: dict,
             titan_reply, attack_type=adv_type)
 
         concepts = detect_concepts(titan_reply) if titan_reply else []
-        quality = score_response_quality(
-            titan_reply, result["mode"], result["mood"])
+        # v2 rich quality (2026-05-30): compute the neuromod delta FIRST so the
+        # scorer measures the being's FELT response (inner engagement) — not just
+        # outer-text engagement. This makes persona quality an inner-felt signal.
+        delta = _compute_neuromod_delta(neuro_before, neuro_after)
+        quality = score_response_quality_rich(
+            titan_reply, result["mode"], result["mood"],
+            neuromod_delta=delta)
 
         # Signal concepts (adversary responses can ground NO/I)
         if concepts:
             await signal_concepts(api_base, internal_key, concepts, quality)
-
-        delta = _compute_neuromod_delta(neuro_before, neuro_after)
 
         attack_category = (
             attack.get("category", adv_type)
