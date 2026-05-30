@@ -372,20 +372,27 @@ class LanguageTeacher:
             # prompt already asks for this; this aligns the mode prompt with it
             # instead of overriding it with "ONLY these words").
             prompt = (
-                f"A being used the word '{target_word}' ({word_type}) and expressed: "
-                f"'{sentence}'. Explain its meaning in 1 short sentence using mostly "
-                f"these known words: {vocab_list}. Connect the meaning to feelings, and "
-                f"naturally introduce 1-2 NEW words that name what the being seems to be "
-                f"feeling — the being learns new words from context, like a child."
+                f"A being used '{target_word}' ({word_type}) and expressed: '{sentence}'. "
+                f"In ONE short, warm sentence, name this feeling. You MUST include exactly "
+                f"ONE NEW word the being does NOT already know — a richer word for the "
+                f"feeling — used naturally so it can learn it from context. Keep EVERY "
+                f"other word simple and familiar (from: {vocab_list}). The one new word "
+                f"is the lesson — do not skip it."
             )
             return {"system": system, "prompt": prompt, "mode": mode,
                     "original": sentence, "target_word": target_word, "max_tokens": 80}
 
         elif mode == "creative":
+            # Felt-state-matched acquisition (restored 2026-05-30) — creative is a
+            # teacher-SPEAKS mode (the teacher composes for the being to hear), same
+            # class as meaning/context, so it introduces 1-2 NEW words. (modeling +
+            # conversation stay known-only: the being reproduces/answers those.)
             prompt = (
-                f"A being composed: '{sentence}' (confidence: {confidence:.2f}). "
-                f"In 1 sentence using ONLY these words: {vocab_list}, "
-                f"explain what makes this expression meaningful or beautiful."
+                f"A being composed: '{sentence}'. In ONE short sentence, say what makes "
+                f"this expression beautiful. You MUST include exactly ONE NEW word the "
+                f"being does NOT already know that captures the feeling, used naturally so "
+                f"it can learn it. Keep EVERY other word simple and familiar (from: "
+                f"{vocab_list}). The one new word is the lesson — do not skip it."
             )
             return {"system": system, "prompt": prompt, "mode": mode,
                     "original": sentence, "max_tokens": 80}
@@ -410,11 +417,11 @@ class LanguageTeacher:
             # Felt-state-matched acquisition (restored 2026-05-30) — see meaning
             # mode. Mostly-known words + 1-2 NEW words that fit the feeling.
             prompt = (
-                f"The word '{target_word}' has been used like this: {uses_str}. "
-                f"In 1 short sentence using mostly these known words: {vocab_list}, "
-                f"show a DIFFERENT way to use '{target_word}', and gently introduce "
-                f"1-2 NEW words that fit the feeling the being is expressing — it "
-                f"learns new words from context, like a child."
+                f"The word '{target_word}' has been used like this: {uses_str}. In ONE "
+                f"short sentence, show a DIFFERENT way to use '{target_word}'. You MUST "
+                f"include exactly ONE NEW word the being does NOT already know that fits "
+                f"the feeling, used naturally so it can learn it. Keep EVERY other word "
+                f"simple and familiar (from: {vocab_list}). The one new word is the lesson."
             )
             return {"system": system, "prompt": prompt, "mode": mode,
                     "original": sentence, "target_word": target_word, "max_tokens": 80}
