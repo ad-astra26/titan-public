@@ -435,6 +435,7 @@ _COGNITIVE_WORKER_SUBSCRIBE_TOPICS = [
     # resolver Futures.
     bus.META_REASON_REQUEST,
     bus.META_REASON_OUTCOME,
+    bus.CGN_CONCEPT_GROUNDED,      # Phase B (§9.2) → meta_engine.note_concept_grounded
     bus.CGN_KNOWLEDGE_RESP,
     bus.TIMECHAIN_QUERY_RESP,
     # Subsystem-signal cache refresh (restored from spirit_worker, lost in
@@ -1565,6 +1566,19 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                         logger.warning(
                             "[MetaService] outcome handler error: %s",
                             _mso_err)
+
+            elif msg_type == bus.CGN_CONCEPT_GROUNDED:
+                # Phase B (RFP_cgn_enhancements §9.2) — a concept matured across
+                # ≥2 consumers (from cgn_worker). Feed the meta engine's Level-B
+                # abstraction accumulator; it fires synthesis when enough mature
+                # AND a neuromod gate opens (checked in meta_engine.tick).
+                _me = state_refs.get("meta_engine")
+                if _me is not None:
+                    try:
+                        _me.note_concept_grounded(msg.get("payload", {}) or {})
+                    except Exception as _ncg_err:
+                        logger.warning(
+                            "[Phase B] note_concept_grounded error: %s", _ncg_err)
 
             elif msg_type == bus.CGN_KNOWLEDGE_RESP:
                 # Session 3 live-dispatch response routing — RFP §4.1 Chunk B.7b.

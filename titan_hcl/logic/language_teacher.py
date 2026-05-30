@@ -382,10 +382,16 @@ class LanguageTeacher:
                     "original": sentence, "target_word": target_word, "max_tokens": 80}
 
         elif mode == "creative":
+            # Felt-state-matched acquisition (restored 2026-05-30) — creative is a
+            # teacher-SPEAKS mode (the teacher composes for the being to hear), same
+            # class as meaning/context, so it introduces 1-2 NEW words. (modeling +
+            # conversation stay known-only: the being reproduces/answers those.)
             prompt = (
                 f"A being composed: '{sentence}' (confidence: {confidence:.2f}). "
-                f"In 1 sentence using ONLY these words: {vocab_list}, "
-                f"explain what makes this expression meaningful or beautiful."
+                f"In 1 short sentence using mostly these known words: {vocab_list}, "
+                f"explain what makes this expression meaningful or beautiful, and "
+                f"naturally introduce 1-2 NEW words that name the feeling — the being "
+                f"learns new words from context, like a child."
             )
             return {"system": system, "prompt": prompt, "mode": mode,
                     "original": sentence, "max_tokens": 80}
