@@ -887,16 +887,25 @@ class LanguageTeacher:
         Returns:
             Number of compositions between teaching sessions
         """
+        # Catch-up cadence (2026-05-30): the Titans lost ~a month of word learning
+        # (acquisition was broken), so they are BEHIND on vocab grounding (~42%,
+        # still early-stage) even though their compositions are confident. Per the
+        # documented teacher lesson ("early-stage Titans <50% grounding need MORE
+        # cycles, not fewer"), the active-learning + near-autonomous tiers are
+        # halved to ~4/hour while they catch up. This auto-fades: as confidence
+        # rises past 0.8 the interval naturally grows again. (Deeper fix — key the
+        # cadence on grounding%, not composition confidence — is an rFP_teachers_update
+        # follow-up.) Revert to 2/3/5/10/50 to restore the pre-catch-up cadence.
         if avg_confidence < 0.4:
             return 2   # Intensive teaching
         elif avg_confidence < 0.6:
-            return 3
+            return 2   # catch-up (was 3)
         elif avg_confidence < 0.8:
-            return 5   # Active learning phase (was 10)
+            return 3   # catch-up — ~4/hour at current composition rate (was 5)
         elif avg_confidence < 0.95:
-            return 10  # Near-autonomous (was 20)
+            return 6   # catch-up (was 10)
         else:
-            return 50  # Graduate-level
+            return 50  # Graduate-level (unchanged — mature Titans don't need catch-up)
 
     # ── Meta-Feedback Parsing (Phase 4) ──
 
