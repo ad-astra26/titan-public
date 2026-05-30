@@ -19,7 +19,6 @@ Mempool Lifecycle (v2.1):
 """
 import asyncio
 import hashlib
-import heapq
 import json
 import logging
 import math
@@ -39,12 +38,6 @@ _MEMPOOL_MAX_TTL_HOURS = 24.0
 _MEMPOOL_PRUNE_THRESHOLD = 0.1  # below this weight → prune on next meditation
 _MEMPOOL_KEEP_THRESHOLD = 0.3  # between prune and this → keep but don't promote
 _MEMPOOL_PROMOTE_SCORE = 40.0  # LLM score threshold for promotion (was 50 batch-avg)
-
-# F11 (PROFILING.md 2026-05-30): max interval between full anchor-decay sweeps
-# in get_top_memories. Anchor decay (k=0.0166/day) is negligible over seconds
-# (factor ≈0.999999 over 5 s, ~0.006% over 5 min), so re-decaying every node on
-# every call — n=max(pcount,1000) every 5 s from the publisher — was wasted CPU.
-_DECAY_ALL_INTERVAL_S = 300.0
 
 
 # PERSISTENCE_BY_DESIGN: TieredMemoryGraph._duckdb is a database-connection
@@ -77,15 +70,6 @@ class TieredMemoryGraph:
         config = config or {}
         self._config = config
         self._bus_emit = bus_emit
-        # F11 (PROFILING.md 2026-05-30): timestamp of the last full anchor-decay
-        # sweep across _node_store. get_top_memories used to decay EVERY
-        # persistent node on every call — at n=max(pcount,1000) every 5 s from
-        # the memory publisher that was ~1.5-2% of a core. Anchor decay is
-        # mathematically negligible second-to-second (factor ≈0.999999 over 5 s;
-        # ~0.006% over 5 min), and per-node decay still runs on the
-        # query/reinforcement access paths, so the bulk sweep is gated to at
-        # most once per _DECAY_ALL_INTERVAL_S.
-        self._last_bulk_decay_ts = 0.0
         # BridgeRecall is process-local + lazy — only constructed on first
         # _cognee_search call so consumer processes that never recall pay
         # zero cost. The singleton accessor handles thread safety.
@@ -1143,19 +1127,11 @@ class TieredMemoryGraph:
             for v in self._node_store.values()
             if v.get("type") == "MemoryNode" and v.get("status") == "persistent"
         ]
-        # F11 (PROFILING.md): the full anchor-decay sweep is negligible
-        # second-to-second, so apply it at most once per _DECAY_ALL_INTERVAL_S
-        # rather than on every call (per-node decay still runs on
-        # query/reinforcement access paths, keeping accessed nodes current).
-        now = time.time()
-        if now - self._last_bulk_decay_ts >= _DECAY_ALL_INTERVAL_S:
-            for node in persistent:
-                self._apply_decay(node)
-            self._last_bulk_decay_ts = now
-        # heapq.nlargest is O(N log n) vs the previous O(N log N) full sort;
-        # for n >= len it returns all, descending — identical to sort()[:n].
-        return heapq.nlargest(
-            n, persistent, key=lambda x: x.get("effective_weight", 0))
+        # Apply decay before sorting so weights are current
+        for node in persistent:
+            self._apply_decay(node)
+        persistent.sort(key=lambda x: x.get("effective_weight", 0), reverse=True)
+        return persistent[:n]
 
     # -------------------------------------------------------------------------
     # Social History — Anti-repetition memory for the Omni-Voice
