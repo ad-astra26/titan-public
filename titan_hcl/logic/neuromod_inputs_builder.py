@@ -159,25 +159,30 @@ class NeuromodInputsBuilder:
             "epoch_maturity": epoch_maturity,
         }
 
-    def _prediction_state(self, prediction_stats: dict | None, ex_mem) -> dict[str, float]:
-        """prediction_state dict from cached PREDICTION_STATS_UPDATED + ex_mem stats."""
+    def _prediction_state(self, prediction_stats: dict | None,
+                          exp_orchestrator) -> dict[str, float]:
+        """prediction_state dict from cached PREDICTION_STATS_UPDATED + the LIVE
+        ExperienceOrchestrator aggregate. §3L Phase 15 chunk 15.1: replaces the
+        retired frozen ExperienceMemory.get_stats — action_outcome/success_rate
+        now derive from incrementally-maintained action_stats (by_domain),
+        read in-process (cognitive_worker owns the orchestrator)."""
         # surprise — from cached PREDICTION_STATS_UPDATED bus event (now lives
         # in self_reflection_worker per Track 2). Falls back to 0.0 on cold start.
         surprise = float((prediction_stats or {}).get("novelty_signal", 0.0) or 0.0)
 
         action_outcome = 0.5
         success_rate = 0.5
-        if ex_mem is not None:
+        if exp_orchestrator is not None:
             try:
-                stats = ex_mem.get_stats() or {}
-                types = stats.get("by_type", {}) or {}
-                if types:
-                    scores = [t.get("avg_score", 0.5) for t in types.values()
-                              if isinstance(t, dict) and t.get("avg_score") is not None]
+                stats = exp_orchestrator.get_experience_stats_payload() or {}
+                doms = stats.get("by_domain", {}) or {}
+                if doms:
+                    scores = [d.get("avg_score", 0.5) for d in doms.values()
+                              if isinstance(d, dict) and d.get("avg_score") is not None]
                     if scores:
                         action_outcome = sum(scores) / len(scores)
-                    srs = [t.get("success_rate", 0.5) for t in types.values()
-                           if isinstance(t, dict) and t.get("success_rate") is not None]
+                    srs = [d.get("success_rate", 0.5) for d in doms.values()
+                           if isinstance(d, dict) and d.get("success_rate") is not None]
                     if srs:
                         success_rate = sum(srs) / len(srs)
             except Exception:
@@ -246,7 +251,7 @@ class NeuromodInputsBuilder:
         neural_nervous_system,
         life_force_engine,
         pi_monitor,
-        ex_mem,
+        exp_orchestrator,
         sphere_clocks_snap: dict | None,
         latest_epoch: dict | None,
         is_dreaming: bool,
@@ -282,7 +287,7 @@ class NeuromodInputsBuilder:
         sphere_balance = self._sphere_balance(sphere_clocks_snap)
         trinity_coherence = self._trinity_coherence(latest_epoch)
         chi_state = self._chi_state(life_force_engine)
-        prediction_state = self._prediction_state(prediction_stats, ex_mem)
+        prediction_state = self._prediction_state(prediction_stats, exp_orchestrator)
         ns_state = self._ns_state(neural_nervous_system, filter_down_count)
         expression_state = self._expression_state(expression_stats)
         resonance_state = self._resonance_state(kin_signature, resonance_count)
