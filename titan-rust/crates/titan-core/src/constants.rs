@@ -4,7 +4,7 @@
 //!     python scripts/generate_phase_c_constants.py
 //!
 //! SPEC version: 1.11.4
-//! Source SHA-256: e120fa85eab76eada2786fbb49c51cc2a1789f905242b51770ce2e979f9511c2
+//! Source SHA-256: 4570bb68d59d5d6861d6c69aef324c956c92a2760a2fead44d15e7eee17cfeaa
 //!
 //! Per SPEC §19 + §2.6: hand-editing this file is a SPEC violation flagged by
 //! `arch_map phase-c verify`.
@@ -13,7 +13,7 @@
 // ── SPEC version metadata ──────────────────────────────────────────────
 pub const SPEC_VERSION: &str = "1.11.4";
 pub const SPEC_SOURCE_SHA256: &str =
-    "e120fa85eab76eada2786fbb49c51cc2a1789f905242b51770ce2e979f9511c2";
+    "4570bb68d59d5d6861d6c69aef324c956c92a2760a2fead44d15e7eee17cfeaa";
 
 // ── KERNEL ────────────────────────────────────────────────────────────────
 // titan-kernel-rs internals (boot, snapshot, signal handling, persistence)
@@ -476,8 +476,8 @@ pub const META_TEACHER_STATE_MAX_BYTES: u64 = 4096;
 pub const EXPERIENCE_STATS_SCHEMA_VERSION: u64 = 1;
 /// Max bytes for experience_stats.bin payload. by_domain has ~7-12 domains × ~80 bytes → typically 600-1000 bytes. Bounded 4KB cap.
 pub const EXPERIENCE_STATS_MAX_BYTES: u64 = 4096;
-/// Schema version for guardian_state.bin slot — variable msgpack {modules: dict[str→{state: str, pid: int, rss_mb: float, cpu_delta_s: float, uptime: float, restart_count: int, restarts_in_window: int, last_heartbeat_age: float, layer: str, start_method: str, adopted: bool, adopt_ts: float}], total_modules: int, modules_by_layer: dict[str→list[str]], escalation_count: int, schema_version: int, ts: float}. Owned by guardian_hcl (Python L1 supervisor). Reader: api_subprocess StateAccessor.guardian.get_status + get_modules_by_layer. v2 (D-SPEC-146): + cpu_delta_s per SPEC §1339 (heartbeat-sourced); pid populated from MODULE_HEARTBEAT self-report.
-pub const GUARDIAN_STATE_SCHEMA_VERSION: u64 = 2;
+/// Schema version for guardian_state.bin slot — variable msgpack {modules: dict[str→{state: str, pid: int, rss_mb: float, uptime: float, restart_count: int, restarts_in_window: int, last_heartbeat_age: float, layer: str, start_method: str, adopted: bool, adopt_ts: float}], total_modules: int, modules_by_layer: dict[str→list[str]], escalation_count: int, schema_version: int, ts: float}. Owned by guardian (Python L1 supervisor — `titan_hcl/guardian.py`). Reader: api_subprocess StateAccessor.guardian.get_status + get_modules_by_layer.
+pub const GUARDIAN_STATE_SCHEMA_VERSION: u64 = 1;
 /// Max bytes for guardian_state.bin payload. ~30-40 modules × ~200 bytes each → typically 8-10KB. Bounded 16KB cap accommodates fleet growth.
 pub const GUARDIAN_STATE_MAX_BYTES: u64 = 16384;
 /// Schema version for llm_state.bin slot — variable msgpack {provider: str, model: str, total_completions: int, completions_this_hour: int, avg_latency_ms: float, p99_latency_ms: float, total_input_tokens: int, total_output_tokens: int, last_completion_ts: float, last_error: str, error_rate: float, schema_version: int, ts: float}. Owned by llm_worker (G21 single-writer). Reader: api_subprocess StateAccessor.llm.
