@@ -24,7 +24,6 @@ from .composed_thought import (
     ComposedThoughtArchetype, COMPOSED_THOUGHT_POST_TYPE,
 )
 from .self_watching import SelfWatchingArchetype, SELF_WATCHING_POST_TYPE
-from .amplify import AmplifyArchetype, AMPLIFY_POST_TYPE
 
 ALL_ARCHETYPES = (
     ProofDayArchetype,
@@ -36,7 +35,6 @@ ALL_ARCHETYPES = (
     ReflectionArchetype,
     ComposedThoughtArchetype,
     SelfWatchingArchetype,
-    AmplifyArchetype,
 )
 
 ARCHETYPE_POST_TYPES = (
@@ -49,7 +47,6 @@ ARCHETYPE_POST_TYPES = (
     REFLECTION_POST_TYPE,
     COMPOSED_THOUGHT_POST_TYPE,
     SELF_WATCHING_POST_TYPE,
-    AMPLIFY_POST_TYPE,
 )
 
 __all__ = (
@@ -66,7 +63,6 @@ __all__ = (
     "ReflectionArchetype",
     "ComposedThoughtArchetype",
     "SelfWatchingArchetype",
-    "AmplifyArchetype",
     "PROOF_DAY_POST_TYPE",
     "WORLD_MIRROR_POST_TYPE",
     "OUTER_RUMINATION_POST_TYPE",
@@ -76,5 +72,4 @@ __all__ = (
     "REFLECTION_POST_TYPE",
     "COMPOSED_THOUGHT_POST_TYPE",
     "SELF_WATCHING_POST_TYPE",
-    "AMPLIFY_POST_TYPE",
 )
