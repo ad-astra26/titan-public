@@ -163,11 +163,12 @@ def test_dispatcher_epoch_tick_calls_tick_cooldown(state_refs, send_queue):
 
 def test_dispatcher_save_now_calls_save_state(state_refs, send_queue):
     msg = {"type": bus.SAVE_NOW, "payload": {}}
-    # _save_state_on_shutdown only calls prediction_engine.save_state — verify
-    # by checking the prediction_engine.save_state mock was called.
-    state_refs["prediction_engine"].save_state = MagicMock()
+    # _save_state_on_shutdown calls prediction_engine._save_state (the real
+    # method name — fixed from the nonexistent save_state in commit 55e3cdce;
+    # this assertion was stale residue of the old name). Verify the real method.
+    state_refs["prediction_engine"]._save_state = MagicMock()
     srw._dispatch_msg(msg, msg["type"], state_refs, send_queue, "self_reflection_worker")
-    state_refs["prediction_engine"].save_state.assert_called_once()
+    state_refs["prediction_engine"]._save_state.assert_called_once()
 
 
 # ── B5 — dream-cycle hook (load-bearing per rFP §2.B.5) ─────────────────────
