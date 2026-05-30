@@ -1807,6 +1807,21 @@ class EventsTeacher:
             sol = 999
 
         ok, reason = self.should_run(sol, metabolic_tier=metabolic_tier)
+        # TEMPORARY ungate (Maker 2026-05-30): when
+        # [events_teacher].ignore_metabolic_gate = true, run the window even
+        # under starving/lean tiers so the reflection funnel keeps distilling
+        # while devnet SOL is depleted. This ONLY ungates the perception/
+        # distillation window — X posting stays governed by social_x rate
+        # limits. Flip back to false to restore full metabolic governance.
+        _ignore_gate = bool(
+            (config.get("events_teacher", {}) or {}).get(
+                "ignore_metabolic_gate", False))
+        if (not ok) and _ignore_gate:
+            logger.info(
+                "[EventsTeacher] Window #%d: metabolic gate (%s) BYPASSED via "
+                "[events_teacher].ignore_metabolic_gate=true (temp Maker "
+                "override 2026-05-30)", self._window_count, reason)
+            ok, reason = True, f"ungated_override(was:{reason})"
         if not ok:
             result.skipped_reason = reason
             logger.info("[EventsTeacher] Window #%d skipped: %s",
@@ -1826,13 +1841,18 @@ class EventsTeacher:
             )
             if gresp.status_code == 200:
                 gdata = gresp.json().get("data", {})
-                if not gdata.get("should_proceed", True):
+                if (not gdata.get("should_proceed", True)) and not _ignore_gate:
                     reason = f"metabolism_gate:{gdata.get('reason', 'closed')}"
                     result.skipped_reason = reason
                     logger.info("[EventsTeacher] Window #%d gated: %s",
                                 self._window_count, reason)
                     self._log_telemetry(result)
                     return result
+                if (not gdata.get("should_proceed", True)) and _ignore_gate:
+                    logger.info(
+                        "[EventsTeacher] Window #%d: metabolism evaluate-gate "
+                        "(%s) BYPASSED via ignore_metabolic_gate=true",
+                        self._window_count, gdata.get("reason", "closed"))
         except Exception as e:
             # Gate check failure is non-fatal (observation-only mode is default).
             logger.debug("[EventsTeacher] Gate check failed: %s", e)

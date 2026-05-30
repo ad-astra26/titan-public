@@ -227,6 +227,14 @@ class MetaChainState:
     # outer_context_used flips True on first primitive that reads a
     # non-empty outer_context. Drives META_OUTER_REWARD at conclude.
     outer_context_used: bool = False
+    # ── Phase A (RFP_cgn_enhancements §9.1) — learning-event grounding ──
+    # Set by _start_chain when the chain was triggered by a consumer learning
+    # event (Path #0). grounding_concept also seeds entity_refs["current_topic"]
+    # so existing concept-aware primitives walk it; entry_primitive biases the
+    # first step toward the SIGNAL_TO_PRIMITIVE primitive (the §5.3/§11.6 fix).
+    grounding_concept: str = ""
+    grounding_consumer: str = ""
+    entry_primitive: str = ""
 
 
 # ── Policy Networks ───────────────────────────────────────────────
@@ -703,6 +711,20 @@ class MetaReasoningEngine:
         # None in standalone/test contexts — META-CGN falls back to local-only
         # grounding accumulation with no CGN worker interaction.
         self._send_queue = send_queue
+        # ── Phase A (RFP_cgn_enhancements §9.1) — learning-event chain trigger ──
+        # Consumer learning events (concept_grounded / impasse_resolved / …) are
+        # appended here as concept-grounding payloads via enqueue_grounding()
+        # (called by MetaService._grounding_sink). should_trigger_meta Path #0
+        # drains this queue and _start_chain seeds the popped concept so the
+        # chain walks a REAL concept (the §5.3 FORMULATE-collapse fix). deque
+        # append/popleft are thread-safe (bus-recv thread appends, cognitive
+        # loop pops). Bounded so a producer burst can't grow unbounded.
+        self._pending_groundings = deque(maxlen=50)
+        self._active_grounding = None
+        # Strength of the first-step bias toward the SIGNAL_TO_PRIMITIVE entry
+        # primitive (monoculture-aware entry per §11.6). Config gain, not a
+        # hardcoded behavioural floor (feedback_no_hardcoded_values).
+        self._entry_bias_strength = float(cfg.get("entry_primitive_bias", 0.5))
         # ── TUNING-012 v2: DNA (per-primitive compound reward coefficients) ──
         # Sourced from [meta_reasoning_dna] in titan_params.toml, merged with
         # per-Titan overrides ([meta_reasoning_dna.T1/T2/T3]) by the engine's
@@ -1099,8 +1121,19 @@ class MetaReasoningEngine:
 
         # If no active chain, check trigger
         if not self.state.is_active:
-            should, reason = should_trigger_meta(
-                reasoning_engine, neuromods, chain_archive, self._config)
+            # Phase A (RFP_cgn_enhancements §9.1) — Path #0: a consumer learning
+            # event (concept-grounding) takes priority over the 5 mechanical
+            # paths in should_trigger_meta. The popped payload is stashed on
+            # self._active_grounding for _start_chain to seed the concept.
+            if self._pending_groundings:
+                _g = self._pending_groundings.popleft()
+                self._active_grounding = _g
+                should = True
+                reason = (f"concept_grounding({_g.get('consumer', '?')}:"
+                          f"{_g.get('concept_id', '?')})")
+            else:
+                should, reason = should_trigger_meta(
+                    reasoning_engine, neuromods, chain_archive, self._config)
             if not should:
                 return {"action": "IDLE"}
             self._start_chain(reason, sv)
@@ -1149,11 +1182,27 @@ class MetaReasoningEngine:
         # apply_diversity_pressure(), we re-roll the primitive selection with
         # the directed negative bias added to the policy logits. This is the
         # active escape pressure that turns Phase C into a closed control loop.
-        _has_bias = (self._diversity_pressure_remaining > 0 and np.any(self._primitive_bias)) or np.any(_repeat_bias)
+        # ── Phase A (RFP_cgn_enhancements §9.1) — first-step entry-primitive bias ──
+        # When a chain was triggered by a learning event (Path #0), bias the
+        # FIRST primitive toward the SIGNAL_TO_PRIMITIVE entry primitive (a
+        # non-FORMULATE primitive by construction — SYNTHESIZE/BREAK/HYPOTHESIZE
+        # etc.). This is the monoculture-aware entry per §11.6: chains enter on
+        # the right primitive instead of defaulting to FORMULATE.
+        _entry_bias = np.zeros(NUM_META_ACTIONS, dtype=np.float32)
+        if self.state.entry_primitive and not self.state.chain:
+            try:
+                _entry_bias[META_PRIMITIVES.index(self.state.entry_primitive)] = \
+                    self._entry_bias_strength
+            except ValueError as _eb_err:
+                swallow_warn('[logic.meta_reasoning] entry_primitive bias lookup', _eb_err,
+                             key='logic.meta_reasoning.entry_bias', throttle=100)
+
+        _has_bias = ((self._diversity_pressure_remaining > 0 and np.any(self._primitive_bias))
+                     or np.any(_repeat_bias) or np.any(_entry_bias))
         if _has_bias:
             try:
                 _scores = self.meta_policy.forward(np.array(meta_input, dtype=np.float32))
-                _total_bias = _repeat_bias.copy()
+                _total_bias = _repeat_bias.copy() + _entry_bias
                 if self._diversity_pressure_remaining > 0 and np.any(self._primitive_bias):
                     _total_bias += self._primitive_bias
                 _biased = _scores + _total_bias
@@ -1947,12 +1996,38 @@ class MetaReasoningEngine:
 
     # ── Private: Chain Lifecycle ──────────────────────────────────
 
+    def enqueue_grounding(self, payload: dict) -> None:
+        """Phase A (RFP_cgn_enhancements §9.1) — append a learning-event
+        concept-grounding payload. Called by MetaService._grounding_sink on the
+        bus-recv thread; drained by Path #0 in tick() on the cognitive loop.
+        deque.append is atomic in CPython, so no extra lock is needed."""
+        try:
+            if isinstance(payload, dict) and payload.get("concept_id"):
+                self._pending_groundings.append(payload)
+        except Exception as _eg_err:
+            swallow_warn('[logic.meta_reasoning] enqueue_grounding', _eg_err,
+                         key='logic.meta_reasoning.enqueue_grounding', throttle=100)
+
     def _start_chain(self, reason, state_132d):
         self.state = MetaChainState()
         self.state.is_active = True
         self.state.trigger_reason = reason
         self.state.start_time = time.time()
         self.state.pre_state_132d = list(state_132d[:132])
+        # Phase A (RFP_cgn_enhancements §9.1) — seed the concept payload when
+        # this chain was triggered by a learning event (Path #0). Setting
+        # entity_refs["current_topic"] makes the existing RECALL.topic /
+        # DELEGATE / HYPOTHESIZE primitives walk the ACTUAL concept instead of
+        # collapsing to FORMULATE.define (proto-SPEC §5.3). entry_primitive
+        # biases the first step toward the SIGNAL_TO_PRIMITIVE primitive (§11.6).
+        _g = self._active_grounding
+        if _g is not None:
+            self.state.grounding_concept = str(_g.get("concept_id", ""))
+            self.state.grounding_consumer = str(_g.get("consumer", ""))
+            self.state.entry_primitive = str(_g.get("entry_primitive", ""))
+            if self.state.grounding_concept:
+                self.state.entity_refs["current_topic"] = self.state.grounding_concept
+            self._active_grounding = None  # consume once
         # Phase D.1 — assign monotonic chain_id for external reward correlation.
         self.state.chain_id = self._next_chain_id
         self._next_chain_id += 1
