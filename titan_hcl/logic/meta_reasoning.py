@@ -516,20 +516,6 @@ class MetaTransitionBuffer:
 
 # ── Trigger Evaluation ────────────────────────────────────────────
 
-def _nm_level(neuromods, name: str) -> float:
-    """Extract a neuromod level from a dict that may hold floats or {level:..}."""
-    if not isinstance(neuromods, dict):
-        return 0.0
-    for key in (name, name.lower(), name.upper()):
-        if key in neuromods:
-            v = neuromods[key]
-            try:
-                return float(v.get("level", v)) if isinstance(v, dict) else float(v)
-            except (TypeError, ValueError):
-                return 0.0
-    return 0.0
-
-
 def should_trigger_meta(reasoning_engine, neuromods: dict,
                         chain_archive, config: dict) -> tuple:
     """Check if meta-reasoning should start. Returns (should_trigger, reason)."""
@@ -739,22 +725,6 @@ class MetaReasoningEngine:
         # primitive (monoculture-aware entry per §11.6). Config gain, not a
         # hardcoded behavioural floor (feedback_no_hardcoded_values).
         self._entry_bias_strength = float(cfg.get("entry_primitive_bias", 0.5))
-        # ── Phase B (RFP_cgn_enhancements §9.2) — Level-B cross-consumer abstraction ──
-        # CGN_CONCEPT_GROUNDED events (concepts matured across ≥2 consumers, from
-        # cgn_worker) accumulate here; when enough have matured AND a neuromod gate
-        # opens (CURIOSITY/REFLECTION high), the Level-B step synthesizes a
-        # cross-consumer composition into the store ABOVE CGN (§11.3/§12.2).
-        self._pending_concept_grounded: list = []
-        self._concept_grounded_since_levelb = 0
-        self._levelb_count_threshold = int(cfg.get("level_b_concept_threshold", 3))
-        self._levelb_curiosity_gate = float(cfg.get("level_b_curiosity_gate", 0.7))
-        self._levelb_reflection_gate = float(cfg.get("level_b_reflection_gate", 0.75))
-        try:
-            from titan_hcl.logic.cross_consumer_composition import (
-                CrossConsumerCompositionStore)
-            self._composition_store = CrossConsumerCompositionStore()
-        except Exception:
-            self._composition_store = None
         # ── TUNING-012 v2: DNA (per-primitive compound reward coefficients) ──
         # Sourced from [meta_reasoning_dna] in titan_params.toml, merged with
         # per-Titan overrides ([meta_reasoning_dna.T1/T2/T3]) by the engine's
@@ -1149,22 +1119,6 @@ class MetaReasoningEngine:
         # stubs from _subsystem_cache. `nm` is the canonical per-tick reading.
         self._last_neuromods_dict = nm
 
-        # Phase B (RFP_cgn_enhancements §9.2) — Level-B cross-consumer abstraction
-        # trigger (one-shot synthesis, not a chain in v1; runs independent of the
-        # Level-A chain machinery so it never blocks a chain). Fires when enough
-        # multi-consumer concepts have matured AND a neuromod gate opens.
-        try:
-            if self.should_trigger_level_b(nm):
-                _lb_bid = self.synthesize_level_b()
-                if _lb_bid:
-                    logger.info(
-                        "[META] Level-B cross-consumer composition synthesized: %s "
-                        "(store=%d)", _lb_bid,
-                        self._composition_store.count() if self._composition_store else 0)
-        except Exception as _lb_err:
-            swallow_warn('[logic.meta_reasoning] level_b trigger', _lb_err,
-                         key='logic.meta_reasoning.level_b_trigger', throttle=100)
-
         # If no active chain, check trigger
         if not self.state.is_active:
             # Phase A (RFP_cgn_enhancements §9.1) — Path #0: a consumer learning
@@ -1556,17 +1510,6 @@ class MetaReasoningEngine:
             except Exception as _mcgn_save_err:
                 logger.warning("[META] META-CGN save failed: %s",
                                _mcgn_save_err)
-        # Phase B (RFP_cgn_enhancements §9.2): persist the cross-consumer
-        # composition store (the Level-B abstraction output) so accumulated
-        # compositions survive restart (SPEC §line277 — statefulness mandates
-        # periodic + graceful-shutdown persistence). The store loads on boot in
-        # its __init__; this is the periodic save half of the contract.
-        if self._composition_store is not None:
-            try:
-                self._composition_store.save()
-            except Exception as _ccc_err:
-                logger.warning("[META] CrossConsumerComposition save failed: %s",
-                               _ccc_err)
         # Save stats — bulletproof pre-flight write.
         # 2026-04-19 CRITICAL FIX: prior atomic-write pattern (open(w) +
         # os.replace) was fundamentally fragile — open("w") truncates
@@ -1688,15 +1631,6 @@ class MetaReasoningEngine:
                     "_suggested_template_q"),
                 "subsystem_cache_pending": bool(
                     getattr(self, "_subsystem_cache_pending", False)),
-                # Phase B (§9.2) — persist the Level-B accumulator so matured
-                # concepts already counted toward the trigger aren't lost on
-                # restart (matured_emitted dedups emission, so they would never
-                # re-arrive — they MUST persist here or the Level-B progress
-                # "starts over" every restart).
-                "concept_grounded_since_levelb": _safe_int(
-                    "_concept_grounded_since_levelb"),
-                "pending_concept_grounded": list(
-                    getattr(self, "_pending_concept_grounded", []))[:50],
                 # Cognitive-contract handler counters. Before 2026-04-21 these
                 # were in-memory only, so every restart reset them to 0 —
                 # dashboard showed fires=0 even when the CONTRACTS fired
@@ -2073,62 +2007,6 @@ class MetaReasoningEngine:
         except Exception as _eg_err:
             swallow_warn('[logic.meta_reasoning] enqueue_grounding', _eg_err,
                          key='logic.meta_reasoning.enqueue_grounding', throttle=100)
-
-    # ── Phase B (RFP_cgn_enhancements §9.2) — Level-B abstraction ───────────
-    def note_concept_grounded(self, payload: dict) -> None:
-        """Record a CGN_CONCEPT_GROUNDED (a concept matured across ≥2 consumers,
-        emitted by cgn_worker). Accumulates toward the Level-B abstraction trigger.
-        Called from cognitive_worker's bus handler."""
-        try:
-            cid = (payload or {}).get("concept_id")
-            if not cid:
-                return
-            self._pending_concept_grounded.append({
-                "concept_id": cid,
-                "consumers": list(payload.get("consumers", [])),
-            })
-            self._pending_concept_grounded = self._pending_concept_grounded[-50:]
-            self._concept_grounded_since_levelb += 1
-        except Exception as _ncg_err:
-            swallow_warn('[logic.meta_reasoning] note_concept_grounded', _ncg_err,
-                         key='logic.meta_reasoning.note_concept_grounded', throttle=100)
-
-    def should_trigger_level_b(self, neuromods: dict) -> bool:
-        """Level-B fires when ≥ threshold multi-consumer concepts have matured
-        AND a neuromod gate opens (CURIOSITY high OR REFLECTION high) — §5.2/§10.3."""
-        if self._concept_grounded_since_levelb < self._levelb_count_threshold:
-            return False
-        cur = _nm_level(neuromods, "CURIOSITY")
-        refl = _nm_level(neuromods, "REFLECTION")
-        return cur > self._levelb_curiosity_gate or refl > self._levelb_reflection_gate
-
-    def synthesize_level_b(self, k: int = 5) -> Optional[str]:
-        """The Level-B abstraction step: take the K most-recent matured multi-
-        consumer concepts, synthesize a cross-consumer composition, and store it
-        ABOVE CGN (CrossConsumerCompositionStore — NOT a CGN row, §11.3/§12.2).
-        Resets the trigger counter. Returns the binding_id (or None).
-
-        v1 = structural grouping (concepts co-grounded across consumers). The full
-        primitive-walk abstraction (RECALL.wisdom → HYPOTHESIZE.analogize →
-        SYNTHESIZE.abstract → FORMULATE.generalize, which NAMES the pattern) is B-4,
-        enriched once Phase A is producing multi-consumer concepts live."""
-        self._concept_grounded_since_levelb = 0
-        if self._composition_store is None or not self._pending_concept_grounded:
-            return None
-        sample = self._pending_concept_grounded[-int(k):]
-        concepts = [s["concept_id"] for s in sample]
-        consumers = sorted({c for s in sample for c in s.get("consumers", [])})
-        if len(set(concepts)) < 2:
-            return None
-        bid = self._composition_store.add(
-            member_concepts=concepts,
-            member_consumers=consumers,
-            abstraction_label="",   # B-4 names it via SYNTHESIZE.abstract
-            confidence=0.3,
-            lineage=[f"level_b@chain{self._total_meta_chains}"],
-        )
-        self._pending_concept_grounded = []
-        return bid
 
     def _start_chain(self, reason, state_132d):
         self.state = MetaChainState()
@@ -5278,13 +5156,6 @@ class MetaReasoningEngine:
                 self._total_wisdom_saved = s.get("total_wisdom_saved", 0)
                 self._total_eurekas = s.get("total_eurekas", 0)
                 self._baseline_confidence = s.get("baseline_confidence", 0.5)
-                # Phase B (§9.2) — restore the Level-B accumulator (don't start over).
-                self._concept_grounded_since_levelb = int(
-                    s.get("concept_grounded_since_levelb", 0) or 0)
-                _pcg = s.get("pending_concept_grounded", [])
-                if isinstance(_pcg, list):
-                    self._pending_concept_grounded = [
-                        p for p in _pcg if isinstance(p, dict) and p.get("concept_id")][-50:]
                 if s.get("strategy_history"):
                     self._strategy_history = np.array(s["strategy_history"], dtype=np.float32)
                 if s.get("ema_state"):

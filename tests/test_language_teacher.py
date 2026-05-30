@@ -199,13 +199,11 @@ class TestLanguageTeacher:
         rFP_teachers_update.md Phase T3 design intent + memory rule
         "early-stage Titans need MORE teacher cycles, not fewer".
         """
-        # Catch-up cadence (2026-05-30): halved for behind Titans (~4/hr) — see
-        # compute_interval. Auto-fades as confidence rises; mature tier unchanged.
         assert teacher.compute_interval(0.2) == 2   # <0.4 → intensive
-        assert teacher.compute_interval(0.5) == 2   # <0.6 (catch-up: was 3)
-        assert teacher.compute_interval(0.7) == 3   # <0.8 (catch-up: was 5)
-        assert teacher.compute_interval(0.85) == 6  # <0.95 (catch-up: was 10)
-        assert teacher.compute_interval(0.98) == 50  # ≥0.95 graduate-level (unchanged)
+        assert teacher.compute_interval(0.5) == 3   # <0.6
+        assert teacher.compute_interval(0.7) == 5   # <0.8 (was 10)
+        assert teacher.compute_interval(0.85) == 10  # <0.95 (was 20)
+        assert teacher.compute_interval(0.98) == 50  # ≥0.95 graduate-level
 
     def test_select_mode_rich_format_setpoint_relative(self, teacher_factory, sample_vocab):
         """Rich format uses setpoint-relative deviation (statistical: most-frequent over N trials).
