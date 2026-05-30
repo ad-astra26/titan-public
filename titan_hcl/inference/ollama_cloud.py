@@ -40,18 +40,12 @@ logger = logging.getLogger(__name__)
 _LIGHT_MODEL = "gemma4:31b"
 _MEDIUM_MODEL = "ministral-3:8b"
 _HEAVY_MODEL = "deepseek-v3.1:671b"
-# Dedicated language-teacher model (2026-05-30): gemma4:31b proved too terse to
-# follow the "introduce ONE new word" mandate (36-char all-known responses) — a
-# stronger instruction-follower reliably teaches new vocabulary. Config-overridable
-# via [inference] ollama_cloud_teacher_model; revert by removing the override.
-_TEACHER_MODEL = "qwen3-next:80b"
 
 try:
     from titan_hcl.config_loader import load_titan_config
     _inf = load_titan_config().get("inference", {})
     _LIGHT_MODEL = _inf.get("ollama_cloud_light_model", _LIGHT_MODEL)
     _HEAVY_MODEL = _inf.get("ollama_cloud_heavy_model", _HEAVY_MODEL)
-    _TEACHER_MODEL = _inf.get("ollama_cloud_teacher_model", _TEACHER_MODEL)
 except Exception:
     pass  # Use defaults
 
@@ -62,7 +56,7 @@ TASK_MODEL_MAP: dict[str, str] = {
     "haiku": _LIGHT_MODEL,
     "skill_validation": _LIGHT_MODEL,
     "art_title": _LIGHT_MODEL,
-    "language_teacher": _TEACHER_MODEL,   # dedicated — stronger new-word instruction-following
+    "language_teacher": _LIGHT_MODEL,
     "meta_teacher": _LIGHT_MODEL,
     # Medium — guardian analysis, social synthesis
     "guardian_veto": _MEDIUM_MODEL,
