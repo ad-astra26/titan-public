@@ -1880,126 +1880,6 @@ class RebirthBackup:
             logger.warning("[Backup] §24.7 ZK Vault event commit failed: %s", e)
             return None
 
-    # ── SPEC §24.12 (5J-2) — Sovereign v=3 chain commit (per-component memos) ─
-    async def commit_event_v3_chain(
-        self,
-        event_id: str,
-        ts: int,
-        event_type: str,
-        event_merkle_root: str,
-        components: list,
-        prev_sig: Optional[str] = None,
-    ) -> Optional[dict]:
-        """Emit one v=3 memo per uploaded component for a single backup event.
-
-        Option 1 (Maker 2026-05-30): components = ordered
-        [{"tier": "PT"|"TC"|"SL", "tx_id": <arweave>, "arc": <tarball sha256>}].
-        Each memo carries arc + url (the Arweave tx) + the shared event_merkle_root
-        (mrkl); the head (PT) TX co-bundles `commit_state(event_merkle_root)`.
-        prev= is event-level — every memo points at the prior event's head sig.
-
-        Mode: `[backup].encryption_enabled` true → data is ciphertext → Mode B
-        (plaintext URL); false → Mode A (URL AES-encrypted with the soul-seed
-        HKDF key, decryptable only after 2-of-3 Shamir recovery).
-
-        Returns {"head_sig", "component_sigs": {tier: sig}} or None on ANY failure
-        (the pipeline then emits BACKUP_EVENT_FAILED — no silent fallback).
-        """
-        if not self.network or not hasattr(self.network, "send_sovereign_transaction"):
-            logger.warning("[Backup] v=3 chain commit: no network client")
-            return None
-        try:
-            from titan_hcl.utils.solana_client import (
-                build_memo_instruction, build_vault_commit_instruction, is_available,
-            )
-            from titan_hcl.logic.backup_memo_v3 import (
-                build_v3_memo, derive_backup_url_key,
-            )
-            from titan_hcl.logic.backup_crypto import load_keypair_bytes
-        except Exception as e:
-            logger.warning("[Backup] v=3 chain commit import failed: %s", e)
-            return None
-        if not is_available() or self.network.keypair is None or self.network.pubkey is None:
-            logger.warning("[Backup] v=3 chain commit: solana unavailable / no keypair")
-            return None
-        if not components:
-            logger.error("[Backup] v=3 chain commit: empty components")
-            return None
-
-        # Mode + Mode-A URL key
-        backup_cfg = (self._full_config or {}).get("backup", {}) or {}
-        mode = "B" if backup_cfg.get("encryption_enabled", False) else "A"
-        url_key = None
-        if mode == "A":
-            try:
-                net_cfg = (self._full_config or {}).get("network", {}) or {}
-                kp_path = net_cfg.get(
-                    "wallet_keypair_path", "data/titan_identity_keypair.json")
-                kp_bytes, _pub = load_keypair_bytes(kp_path)
-                url_key = derive_backup_url_key(kp_bytes)
-            except Exception as e:
-                logger.error(
-                    "[Backup] v=3 Mode-A URL key derivation failed: %s — aborting", e)
-                return None
-
-        vault_program_id = (
-            getattr(self, "_vault_program_id", None)
-            or getattr(self.network, "_vault_program_id", None)
-        )
-        if not vault_program_id:
-            cfg = getattr(self.network, "_config", None) or self._full_config or {}
-            vault_program_id = (cfg.get("network", {}) or {}).get("vault_program_id")
-
-        try:
-            sovereignty_bp = int(float(getattr(self, "_last_sovereignty_idx", 0.0)) * 100)
-        except Exception:
-            sovereignty_bp = 0
-
-        component_sigs: dict = {}
-        head_sig: Optional[str] = None
-        for i, comp in enumerate(components):
-            try:
-                memo = build_v3_memo(
-                    event_id=event_id, ts=int(ts), event_type=event_type,
-                    tier=comp["tier"], archive_hash=comp["arc"],
-                    merkle_root=event_merkle_root, arweave_tx=comp["tx_id"],
-                    mode=mode, prev_sig=prev_sig, url_key=url_key,
-                )
-            except Exception as e:
-                logger.error("[Backup] v=3 memo build failed (%s): %s",
-                             comp.get("tier"), e)
-                return None
-            memo_ix = build_memo_instruction(self.network.pubkey, memo)
-            if memo_ix is None:
-                logger.error("[Backup] v=3 memo ix build failed (%s)", comp.get("tier"))
-                return None
-            ixs = [memo_ix]
-            if i == 0:  # head memo co-bundles commit_state(event_merkle_root)
-                try:
-                    state_root = bytes.fromhex(event_merkle_root)
-                except ValueError:
-                    logger.error("[Backup] v=3: event_merkle_root not valid hex")
-                    return None
-                commit_ix = build_vault_commit_instruction(
-                    self.network.pubkey, state_root, sovereignty_bp, vault_program_id)
-                if commit_ix is not None:
-                    ixs = [commit_ix, memo_ix]
-                else:
-                    logger.warning(
-                        "[Backup] v=3: commit_state ix unavailable — head memo-only")
-            sig = await self.network.send_sovereign_transaction(ixs, priority="LOW")
-            if not sig:
-                logger.error("[Backup] v=3 chain commit: TX send failed (%s)",
-                             comp.get("tier"))
-                return None
-            component_sigs[comp["tier"]] = sig
-            if head_sig is None:
-                head_sig = sig
-            logger.info("[Backup] v=3 memo anchored: tier=%s evt=%s tx=%s",
-                        comp.get("tier"), event_id[:8],
-                        sig[:16] if len(sig) > 16 else sig)
-        return {"head_sig": head_sig, "component_sigs": component_sigs}
-
     # ── SPEC §24 — Unified backup pipeline (Phase 5.5, 2026-05-16) ─────────
     #
     # Production wiring for backup_upload_pipeline.run_unified_event.
@@ -2245,16 +2125,13 @@ class RebirthBackup:
                 except OSError:
                     pass
 
-        # v=3 sovereign chain committer (5J-2) — emits per-component memos with
-        # the Arweave URL on-chain + commit_state on the head, replacing the
-        # v=2 merkle-only anchor. prev_sig threads event-heads back to genesis.
-        async def _v3_chain_commit(event_id: str, ts: int, event_type: str,
-                                   event_root: str, components: list,
-                                   prev_sig) -> Optional[dict]:
-            return await self.commit_event_v3_chain(
-                event_id=event_id, ts=ts, event_type=event_type,
-                event_merkle_root=event_root, components=components,
-                prev_sig=prev_sig,
+        # ZK committer wraps existing commit_event_merkle_to_zk_vault
+        async def _zk_commit(event_id: str, root: str,
+                              prev_root) -> Optional[str]:
+            return await self.commit_event_merkle_to_zk_vault(
+                event_id=event_id,
+                event_merkle_root=root,
+                prev_event_merkle_root=prev_root,
             )
 
         # Bus emit — wire to plugin/bus if available; non-fatal on absence
@@ -2272,7 +2149,7 @@ class RebirthBackup:
             titan_id=self._titan_id, manifest=manifest,
             personality_specs=p_specs, timechain_specs=t_specs,
             soul_specs=s_specs, baseline_resolver=_baseline_resolver,
-            arweave_uploader=_arweave_upload, zk_committer=_v3_chain_commit,
+            arweave_uploader=_arweave_upload, zk_committer=_zk_commit,
             bus_emit=_bus_emit,
         )
 
