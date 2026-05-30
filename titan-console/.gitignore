@@ -1,5 +1,0 @@
-node_modules/
-*.local
-.vite/
-# dist/ is committed on purpose — the install ships a prebuilt bundle and the
-# stdlib agent serves it without needing node on the target box.

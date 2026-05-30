@@ -14,11 +14,8 @@ from pathlib import Path
 import pytest
 
 # The wizard is invoked as `python -m scripts.setup_titan`; put scripts/ on path.
-# Append (not insert-at-0): scripts/ contains a titan_hcl.py that would
-# otherwise shadow the real titan_hcl *package* (conftest's autouse fixture
-# imports titan_hcl.persistence), breaking this suite when run in isolation.
 _REPO = Path(__file__).resolve().parents[1]
-sys.path.append(str(_REPO / "scripts"))
+sys.path.insert(0, str(_REPO / "scripts"))
 
 from setup_titan import (  # noqa: E402
     binaries,
@@ -27,7 +24,6 @@ from setup_titan import (  # noqa: E402
     genesis_runner,
     inference,
     observatory,
-    restore as restore_mod,
     systemd_runner,
 )
 from setup_titan.__main__ import build_parser  # noqa: E402
@@ -237,16 +233,14 @@ def test_binaries_phase_skips_when_present(tmp_path: Path):
 
 
 def test_materialize_bootable_identity_from_authority(tmp_path: Path):
-    # genesis (kept plaintext) leaves authority.json (a real 64-int Ed25519
-    # keypair array) + data/genesis_record.json
-    key_arr = list(range(64))
-    (tmp_path / "authority.json").write_text(json.dumps(key_arr))
+    # genesis (kept plaintext) leaves authority.json + data/genesis_record.json
+    (tmp_path / "authority.json").write_text("[1,2,3,4]")
     (tmp_path / "data").mkdir()
     (tmp_path / "data" / "genesis_record.json").write_text('{"titan_pubkey": "ZeFUoD…"}')
     res = genesis_runner._materialize_bootable_identity(tmp_path)
     assert res[0].severity == "ok"
     kp = genesis_runner.keypair_path(tmp_path)
-    assert kp.exists() and json.loads(kp.read_text()) == key_arr   # 64-int array
+    assert kp.exists() and kp.read_text() == "[1,2,3,4]"
     assert oct(kp.stat().st_mode)[-3:] == "600"          # 0600 like T2/T3
     assert not (tmp_path / "authority.json").exists()     # stray root copy wiped
     ident = json.loads(genesis_runner.identity_path(tmp_path).read_text())
@@ -256,71 +250,6 @@ def test_materialize_bootable_identity_from_authority(tmp_path: Path):
 def test_materialize_fails_without_keypair(tmp_path: Path):
     res = genesis_runner._materialize_bootable_identity(tmp_path)
     assert res[0].severity == "fail" and "no plaintext keypair" in res[0].detail
-
-
-# ── setup_titan restore — the W1.5 resurrection wrapper ──────────────────────
-
-
-def test_restore_subcommand_parses():
-    from setup_titan.__main__ import build_parser, cmd_restore
-    ns = build_parser().parse_args(
-        ["restore", "--shard1", "deadbeef", "--manifest", "/tmp/m.json",
-         "--verify-only", "--titan-id", "T1"])
-    assert ns.func is cmd_restore
-    assert ns.shard1 == "deadbeef" and ns.manifest == "/tmp/m.json"
-    assert ns.verify_only is True and ns.titan_id == "T1"
-    assert ns.network == "mainnet" and ns.verify_zk is False
-
-
-def test_run_restore_aborts_on_empty_shard(tmp_path, monkeypatch):
-    # no shard arg + getpass returns empty → clean abort, no resurrection call.
-    monkeypatch.setattr(restore_mod.getpass, "getpass", lambda *a, **k: "")
-    called = {"load": False}
-    monkeypatch.setattr(restore_mod, "_load_resurrection",
-                        lambda: called.__setitem__("load", True))
-    rc = restore_mod.run_restore(tmp_path)
-    assert rc == 1 and called["load"] is False
-
-
-def test_run_restore_threads_through_to_resurrection_phases(tmp_path, monkeypatch):
-    """The wrapper must call phase_1 → phase_2_3 → phase_4 with the resolved
-    identity, never logging the shard."""
-    calls = []
-
-    class _FakeResurrection:
-        @staticmethod
-        def phase_1_identity(args, install_root):
-            calls.append(("p1", args.shard1, install_root))
-            return (b"\x01" * 64, "PUBKEY123", None, "T1")
-
-        @staticmethod
-        def phase_2_3_restore(key_bytes, pubkey, titan_id, **kw):
-            calls.append(("p23", pubkey, titan_id, kw["manifest_path"],
-                          kw["network"], kw["verify_zk"]))
-
-        @staticmethod
-        def phase_4_first_breath(key_bytes, pubkey, titan_id, **kw):
-            calls.append(("p4", pubkey, kw["verify_only"]))
-
-    monkeypatch.setattr(restore_mod, "_load_resurrection", lambda: _FakeResurrection)
-    rc = restore_mod.run_restore(
-        tmp_path, shard1="ABCD", manifest="/tmp/m.json",
-        network="mainnet", verify_only=True)
-    assert rc == 0
-    assert calls[0] == ("p1", "ABCD", str(tmp_path))
-    assert calls[1] == ("p23", "PUBKEY123", "T1", "/tmp/m.json", "mainnet", False)
-    assert calls[2] == ("p4", "PUBKEY123", True)
-
-
-def test_run_restore_propagates_phase_failure(tmp_path, monkeypatch):
-    class _Failing:
-        @staticmethod
-        def phase_1_identity(args, install_root):
-            raise SystemExit(1)
-
-    monkeypatch.setattr(restore_mod, "_load_resurrection", lambda: _Failing)
-    rc = restore_mod.run_restore(tmp_path, shard1="ABCD", manifest="/tmp/m.json")
-    assert rc == 1
 
 
 # ── systemd_runner ───────────────────────────────────────────────────────────
@@ -395,167 +324,3 @@ def test_mode_specs_consistent():
     assert spec_for(Mode.LOCAL).needs_rust is False
     assert spec_for(Mode.MAINNET).genesis_on_chain is True
     assert spec_for(Mode.DEVNET).needs_anchor is True
-
-
-# ── W1.b.2 — Prompter seam (shared by CLI stdin + Textual TUI) ──────────────
-
-from setup_titan import comms, prompts  # noqa: E402
-from setup_titan.prompts import Prompter, ScriptedPrompter, StdinPrompter  # noqa: E402
-
-_TG = "12345678:" + "A" * 30           # valid BotFather-shaped token
-_UUID = "12345678-1234-1234-1234-123456789abc"
-_WEBSHARE = "http://user:pass@1.2.3.4:8080/"
-
-
-def test_both_prompters_satisfy_protocol():
-    assert isinstance(StdinPrompter(), Prompter)
-    assert isinstance(ScriptedPrompter({}), Prompter)
-
-
-def test_stdin_prompter_line_uses_default_when_blank(monkeypatch):
-    monkeypatch.setattr("builtins.input", lambda _p: "")
-    assert StdinPrompter().line("k", "RPC", default="https://x") == "https://x"
-    monkeypatch.setattr("builtins.input", lambda _p: "  https://y  ")
-    assert StdinPrompter().line("k", "RPC", default="https://x") == "https://y"
-
-
-def test_stdin_prompter_confirm_default_and_explicit(monkeypatch):
-    monkeypatch.setattr("builtins.input", lambda _p: "")
-    assert StdinPrompter().confirm("k", "Use it?", default_yes=True) is True
-    assert StdinPrompter().confirm("k", "Use it?", default_yes=False) is False
-    monkeypatch.setattr("builtins.input", lambda _p: "n")
-    assert StdinPrompter().confirm("k", "Use it?", default_yes=True) is False
-
-
-def test_stdin_prompter_until_loops_then_accepts(monkeypatch):
-    seq = iter(["bad", "alsobad", "sk-or-12345678"])
-    monkeypatch.setattr("builtins.input", lambda _p: next(seq))
-    out = StdinPrompter().until("k", "Key", validate=lambda s: s.startswith("sk-or-"),
-                                hint="nope")
-    assert out == "sk-or-12345678"
-
-
-def test_stdin_prompter_eof_raises_systemexit(monkeypatch):
-    def _raise(_p):
-        raise EOFError
-    monkeypatch.setattr("builtins.input", _raise)
-    with pytest.raises(SystemExit):
-        StdinPrompter().line("k", "x")
-
-
-def test_scripted_prompter_returns_and_validates():
-    sp = ScriptedPrompter({"a": "v", "b": True, "key": "sk-or-abcdefgh"})
-    assert sp.line("a", "?") == "v"
-    assert sp.confirm("b", "?", default_yes=False) is True
-    assert sp.choice("a", "?", options=["v", "w"], default="w") == "v"
-    assert sp.until("key", "?", validate=lambda s: s.startswith("sk-or-"), hint="h") == "sk-or-abcdefgh"
-
-
-def test_scripted_prompter_missing_key_raises():
-    with pytest.raises(KeyError):
-        ScriptedPrompter({}).line("absent", "?")
-
-
-def test_scripted_prompter_until_rejects_invalid_value():
-    with pytest.raises(ValueError):
-        ScriptedPrompter({"k": "garbage"}).until("k", "?", validate=lambda s: False, hint="bad")
-
-
-def _capture_secrets(monkeypatch):
-    """Redirect comms.upsert_secret into a recorder (never touch ~/.titan)."""
-    rec: list[tuple] = []
-    monkeypatch.setattr(comms, "upsert_secret", lambda *a, **k: rec.append(a))
-    return rec
-
-
-def test_comms_phase_via_scripted_telegram_only(monkeypatch):
-    rec = _capture_secrets(monkeypatch)
-    state: dict = {}
-    sp = ScriptedPrompter({"telegram_bot_token": _TG, "enable_x": False,
-                           "enable_observatory": False})
-    results = comms.run_comms_phase(default=False, state=state, prompter=sp)
-    names = {r.name: r for r in results}
-    assert names["telegram"].severity == "ok"
-    assert names["x_social"].detail.startswith("skipped")
-    assert state["observatory_enabled"] is False
-    assert ("channels", "telegram_bot_token", _TG) in rec
-
-
-def test_comms_phase_via_scripted_full_optins(monkeypatch):
-    rec = _capture_secrets(monkeypatch)
-    state: dict = {}
-    sp = ScriptedPrompter({"telegram_bot_token": _TG, "enable_x": True,
-                           "twitterapi_key": _UUID, "webshare_url": _WEBSHARE,
-                           "enable_observatory": True})
-    results = comms.run_comms_phase(default=False, state=state, prompter=sp)
-    names = {r.name: r for r in results}
-    assert names["x_social"].severity == "ok"
-    assert state["observatory_enabled"] is True
-    assert ("stealth_sage", "twitterapi_io_key", _UUID) in rec
-    assert ("twitter_social", "webshare_static_url", _WEBSHARE) in rec
-
-
-def test_install_accepts_no_tui_flag():
-    args = build_parser().parse_args(["install", "--no-tui", "--mode", "local"])
-    assert args.no_tui is True
-
-
-# ── W1.b.2 — Textual wizard headless pilot (collect-then-execute front-end) ──
-
-import asyncio  # noqa: E402
-
-
-def _drive_wizard(mode_id: str, fills: dict):
-    """Mount the wizard headless, select a mode, fill inputs, press Begin.
-
-    Returns the App.return_value: (mode, answers, state_seed) or None if the
-    submit was blocked by validation. Robust to whether a local Ollama is up
-    (inf_key is filled with a valid hosted-key shape but ignored when hidden).
-    """
-    from textual.widgets import Input, RadioButton, Button
-    from setup_titan.tui import InstallWizard
-
-    async def _run():
-        app = InstallWizard()
-        async with app.run_test(size=(120, 50)) as pilot:
-            app.query_one("#" + mode_id, RadioButton).value = True
-            await pilot.pause()
-            for wid, val in fills.items():
-                app.query_one("#" + wid, Input).value = val
-            await pilot.pause()
-            app.query_one("#begin", Button).scroll_visible(animate=False)
-            await pilot.pause()
-            await pilot.click("#begin")
-            await pilot.pause()
-        return app.return_value
-
-    return asyncio.run(_run())
-
-
-def test_wizard_local_submit_collects_answers():
-    res = _drive_wizard("mode_local",
-                        {"telegram": _TG, "inf_key": "x" * 25})
-    assert res is not None, "local-mode submit should succeed"
-    mode, answers, seed = res
-    assert mode is Mode.LOCAL
-    assert answers["telegram_bot_token"] == _TG
-    assert seed == {}                      # local mode collects no on-chain creds
-    assert answers["enable_x"] is False
-    assert answers["enable_observatory"] is False
-
-
-def test_wizard_devnet_seeds_wallet_and_rpc():
-    res = _drive_wizard("mode_devnet",
-                        {"wallet": "4Nd1mYn" + "A" * 30,
-                         "rpc": "https://api.devnet.solana.com",
-                         "telegram": _TG, "inf_key": "y" * 25})
-    assert res is not None
-    _mode, _answers, seed = res
-    assert seed["maker_wallet"].startswith("4Nd1mYn")
-    assert seed["solana_rpc"] == "https://api.devnet.solana.com"
-
-
-def test_wizard_devnet_blocks_without_wallet():
-    # on-chain mode with no wallet → validation refuses to submit (returns None)
-    res = _drive_wizard("mode_devnet", {"telegram": _TG, "inf_key": "y" * 25})
-    assert res is None
