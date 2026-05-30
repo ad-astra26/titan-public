@@ -5124,12 +5124,16 @@ def _persist_engine_state(state_refs: dict) -> None:
     neural_nervous_system = state_refs.get("neural_nervous_system")
     meta_engine = state_refs.get("meta_engine")
     coordinator = state_refs.get("coordinator")
+    intuition_convergence = state_refs.get("intuition_convergence")
 
     for engine, name_, method in (
         (reasoning_engine, "reasoning_engine", "save_state"),
         (pi_monitor, "pi_monitor", "_save_state"),
         (neural_nervous_system, "neural_nervous_system", "save_all"),
         (meta_engine, "meta_engine", "save_all"),
+        # intuition_convergence loaded its state at boot but never wrote it —
+        # save_state() (added 2026-05-30) closes that silent learning-loss gap.
+        (intuition_convergence, "intuition_convergence", "save_state"),
     ):
         if engine is None:
             continue
