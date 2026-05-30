@@ -76,10 +76,6 @@ _POLL_INTERVAL_S = 0.2
 # `_msl_tick_count % 30 == 0` at 1 Hz tick → ~30s. Configurable via
 # `[social_x].post_dispatch_tick_interval_seconds` in titan_hcl/config.toml.
 _DEFAULT_POST_DISPATCH_TICK_INTERVAL_S = 30.0
-# C3 (rFP_haov_efficacy_closure §3E) — cadence for pulling language's verified
-# HAOV concepts (cgn.get_cross_insights("social")) for the social engage-bias.
-# Coarse: verified rules change slowly; the reply gate reads the cache.
-_CROSS_INSIGHTS_QUERY_INTERVAL_S = 120.0
 
 # Subscribe topics — chunk 9D adds the §4.C-spec'd subscriptions + 5 catalyst
 # types. Polling-broadcast subscriptions (chunk 9O) join non-canonically.
@@ -113,11 +109,6 @@ _SOCIAL_WORKER_SUBSCRIBE_TOPICS = [
     bus.HEAL_REQUEST,
     # Phase 11 §11.I.3 probe handler.
     bus.MODULE_PROBE_REQUEST,
-    # C3 (rFP_haov_efficacy_closure §3E) — cgn replies to the periodic
-    # get_cross_insights("social") QUERY on this type; handler caches language's
-    # verified HAOV concepts on the gateway for the engage-bias. Same delivery
-    # mechanism language_worker uses for its cross-insights pull.
-    bus.QUERY_RESPONSE,
 ]
 
 
@@ -412,11 +403,9 @@ def _main_loop(recv_queue, send_queue, name: str, state_refs: dict,
     last_heartbeat = 0.0
     last_post_dispatch = 0.0
     last_emotion_check = 0.0
-    last_cross_insights = 0.0
     shutdown_requested = False
     meter = state_refs.get("social_pressure_meter")
     orchestrator = state_refs.get("post_dispatch_orchestrator")
-    gateway = state_refs.get("social_x_gateway")
 
     # D-SPEC-66 v1.11.0 PLAN §1.4 — emotion-shift catalyst (D8-3 site
     # #4 close). Reuses existing infrastructure: ShmReaderBank.read_
@@ -522,42 +511,12 @@ def _main_loop(recv_queue, send_queue, name: str, state_refs: dict,
                     "[SocialWorker] emotion-shift tick raised: %s",
                     _emo_err)
 
-        # C3 (rFP_haov_efficacy_closure §3E) — periodic pull of language's verified
-        # HAOV concepts for the engage-bias. Fire-and-forget QUERY; the reply lands
-        # on the QUERY_RESPONSE handler below → gateway.set_verified_haov_concepts.
-        # Inert until a concept-grounding verified rule crystallizes (today's are
-        # all impasse-type, filtered upstream) → no live reply-gate change yet.
-        if (gateway is not None
-                and now - last_cross_insights >= _CROSS_INSIGHTS_QUERY_INTERVAL_S):
-            last_cross_insights = now
-            _send_msg(send_queue, bus.QUERY, name, "cgn",
-                      {"action": "get_cross_insights", "consumer": "social"})
-
         try:
             msg = recv_queue.get(timeout=_POLL_INTERVAL_S)
         except Empty:
             continue
 
         msg_type = msg.get("type") if isinstance(msg, dict) else None
-        # ── C3 (§3E) — cross-insights reply → cache language's verified concepts ──
-        if msg_type == bus.QUERY_RESPONSE:
-            try:
-                _qr_p = msg.get("payload") or {}
-                if (_qr_p.get("action") == "get_cross_insights"
-                        and gateway is not None):
-                    _verified = [
-                        i for i in (_qr_p.get("insights") or [])
-                        if isinstance(i, dict)
-                        and i.get("source") == "haov_verified"]
-                    gateway.set_verified_haov_concepts(_verified)
-                    if _verified:
-                        logger.info(
-                            "[SocialWorker] C3: %d verified HAOV concept(s) "
-                            "cached for engage-bias", len(_verified))
-            except Exception as _qr_err:
-                logger.debug(
-                    "[SocialWorker] QUERY_RESPONSE handler error: %s", _qr_err)
-            continue
         # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ──
         if msg_type == bus.MODULE_PROBE_REQUEST and state_writer is not None:
             try:
