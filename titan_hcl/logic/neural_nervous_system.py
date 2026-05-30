@@ -1349,8 +1349,13 @@ class NeuralNervousSystem:
                     buf = self.buffers[name]
                     # Cast fired to plain bool (numpy.bool_ is not JSON-serializable)
                     fired_list = [bool(f) for f in buf._fired[-buf.max_size:]]
+                    # PROFILING.md F4b — observation rows may be ndarrays (binary
+                    # load keeps them as 1D arrays); normalize to lists so this
+                    # SQLite-backup json.dumps (the recovery net) never breaks.
+                    _obs_rows = [o.tolist() if hasattr(o, "tolist") else list(o)
+                                 for o in buf._observations[-buf.max_size:]]
                     b_data = json.dumps({
-                        "observations": buf._observations[-buf.max_size:],
+                        "observations": _obs_rows,
                         "urgencies": buf._urgencies[-buf.max_size:],
                         "vm_baselines": buf._vm_baselines[-buf.max_size:],
                         "rewards": buf._rewards[-buf.max_size:],

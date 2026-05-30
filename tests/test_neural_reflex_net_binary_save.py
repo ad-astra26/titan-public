@@ -71,6 +71,42 @@ def test_empty_buffer_roundtrip(tmp_path):
     assert buf2._fired == []
 
 
+def test_f4b_binary_load_keeps_ndarray_rows_and_stays_usable(tmp_path):
+    """F4b: binary load keeps observation rows as 1D ndarrays (no per-float tolist);
+    mixed ndarray(loaded)+list(added) rows must still sample/save/json-dump cleanly."""
+    buf = NervousTransitionBuffer(max_size=50)
+    for i in range(4):
+        buf.add([float(i), float(i) * 2, 0.5], urgency=0.1 * i,
+                vm_baseline=0.9, reward=float(i), fired=(i % 2 == 0))
+    p = str(tmp_path / "f4b_buffer.json")
+    buf.save(p)
+
+    buf2 = NervousTransitionBuffer(max_size=50)
+    assert buf2.load(p) is True
+    # rows from binary load are ndarrays (the F4b optimization), not python lists
+    assert all(isinstance(r, np.ndarray) for r in buf2._observations)
+    # add a fresh row (python list) → buffer is now mixed-typed
+    buf2.add([9.0, 9.0, 9.0], urgency=1.0, vm_baseline=0.9, reward=1.0, fired=True)
+    assert len(buf2._observations) == 5
+
+    # sample-style stack over mixed rows works (this is what train_step does)
+    stacked = np.asarray(buf2._observations, dtype=np.float64)
+    assert stacked.shape == (5, 3)
+
+    # re-save the mixed buffer round-trips
+    p2 = str(tmp_path / "f4b_buffer2.json")
+    buf2.save(p2)
+    buf3 = NervousTransitionBuffer(max_size=50)
+    assert buf3.load(p2) is True
+    np.testing.assert_allclose(
+        np.asarray(buf3._observations), np.asarray(buf2._observations), atol=1e-9)
+
+    # SQLite-backup normalization (the recovery net) must json.dumps mixed rows
+    obs_rows = [o.tolist() if hasattr(o, "tolist") else list(o)
+                for o in buf2._observations]
+    json.dumps({"observations": obs_rows})  # must not raise
+
+
 def test_legacy_json_weights_still_load(tmp_path):
     """A pre-F4 JSON weights file must still load (dual-read, no migration step)."""
     net = NeuralReflexNet("LEGACY", input_dim=8)

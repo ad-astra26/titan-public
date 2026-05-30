@@ -546,7 +546,14 @@ class NervousTransitionBuffer:
 
             def _tolist(x):
                 return x.tolist() if hasattr(x, "tolist") else (x or [])
-            self._observations = _tolist(data.get("observations", []))
+            # PROFILING.md F4b — observations is the 2D hot array. For the binary
+            # path keep its rows as 1D ndarrays (list(arr) = N row-views) instead
+            # of arr.tolist() (which materializes N×D Python floats — ~27% of a
+            # booting cognitive_worker). add() appends list rows; mixed list/ndarray
+            # rows are fine for index/sample/save (np.asarray stacks either). Rows
+            # are read-only views and never mutated in place (verified usages).
+            _obs = data.get("observations", [])
+            self._observations = list(_obs) if hasattr(_obs, "shape") else (_obs or [])
             self._urgencies = _tolist(data.get("urgencies", []))
             self._vm_baselines = _tolist(data.get("vm_baselines", []))
             self._rewards = _tolist(data.get("rewards", []))
