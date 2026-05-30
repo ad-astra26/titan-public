@@ -1924,7 +1924,7 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
     # ── Meta-Reasoning Foundation (M1-M3) ──
     # 2026-05-10: post-deploy follow-up to the pre-D8 ownership audit.
     # Boot-driver parity audit caught that meta_engine was wired but its
-    # 4 required positional deps (chain_archive, meta_wisdom, exp_orchestrator,
+    # 4 required positional deps (chain_archive, meta_wisdom, ex_mem,
     # meta_autoencoder) were missing in cognitive_worker — meta_engine.tick
     # was raising TypeError silently every epoch (now visible after
     # _log_driver_err visibility upgrade). Mirrors spirit_worker.py:1415-1434.
@@ -2085,7 +2085,6 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
     _reasoning_state_publisher = None
     _meta_reasoning_state_publisher = None
     _msl_state_publisher = None
-    _experience_stats_publisher = None
     _consciousness_age_publisher = None
     try:
         from titan_hcl.core.state_registry import resolve_titan_id as _resolve_tid_a4
@@ -2105,22 +2104,11 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
         from titan_hcl.logic.consciousness_age_publisher import (
             ConsciousnessAgePublisher,
         )
-        from titan_hcl.logic.experience_stats_publisher import (
-            ExperienceStatsPublisher,
-        )
         _reasoning_state_publisher = ReasoningStatePublisher(
             titan_id=_a4_tid)
         _meta_reasoning_state_publisher = MetaReasoningStatePublisher(
             titan_id=_a4_tid)
         _msl_state_publisher = MSLStatePublisher(titan_id=_a4_tid)
-        # §3L Phase 15 chunk 15.1 (D-SPEC-PHASE15) — experience_stats.bin
-        # publisher. Replaces the retired ExperienceMemory.get_stats
-        # recompute-on-read; sources from ExperienceOrchestrator's
-        # incremental action_stats. Event-driven publish (boot-seed +
-        # post-record_outcome); in-proc consumers read the orchestrator
-        # directly (always fresh), only the api reads the slot.
-        _experience_stats_publisher = ExperienceStatsPublisher(
-            titan_id=_a4_tid)
         # D-SPEC-85 v1.25.0 (2026-05-18) — consciousness_age.bin slot.
         # Producer = cognitive_worker; Consciousness object lives in
         # spirit_loop under this worker per SPEC §1 glossary.
@@ -2129,9 +2117,9 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
         logger.info(
             "[CognitiveWorker] Phase A.4 publishers attached: "
             "reasoning_state / meta_reasoning_state / msl_state / "
-            "consciousness_age / experience_stats "
+            "consciousness_age "
             "(G21 single-writers; rFP_phase_c_state_read_unification_l0_l1_canonical "
-            "+ D-SPEC-85 + D-SPEC-PHASE15)")
+            "+ D-SPEC-85)")
     except Exception as _err:
         logger.warning(
             "[CognitiveWorker] Phase A.4 publishers init failed: %s — "
@@ -2190,8 +2178,7 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
     # l0_rust=true) without needing cross-process Python attr access on
     # neuromodulator_system (which lives in neuromod_worker). NS lives
     # in this process, so record_outcome calls are in-process.
-    # ── Boot ExperientialMemory + ExperienceOrchestrator ──
-    # (ExperienceMemory RETIRED — §3L Phase 15 chunk 15.1 / D-SPEC-PHASE15)
+    # ── Boot ExperienceMemory + ExperientialMemory + ExperienceOrchestrator ──
     #
     # 2026-05-10: Block D of pre-D8 ownership audit closure. Tier 1 SPEAK
     # firing path emits SPEAK_REQUEST with experience_bias built by
@@ -2199,16 +2186,11 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
     # from spirit_worker:1133-1880 (l0_rust=false legacy path) so SPEAK
     # works on T3 (where spirit_worker is heartbeat-only). Plugins
     # registered: ArcPuzzle, LanguageLearning, CreativeExpression, Communication.
+    ex_mem = None
     e_mem = None
     exp_orchestrator = None
     try:
-        # §3L Phase 15 chunk 15.1 (D-SPEC-PHASE15): ExperienceMemory RETIRED.
-        # Its sole writer (spirit_worker) was deleted in D8-3/72f95a6b, leaving
-        # data/experience_memory.db frozen fleet-wide since 2026-05-14. The
-        # live successor is ExperienceOrchestrator (records the same outcomes
-        # via DOMAIN_MAP + closes the recall/distill/bias loop). The former
-        # ex_mem constructor dep was assignment-only (never read). Stats now
-        # flow from the orchestrator's incremental action_stats → experience_stats.bin.
+        from titan_hcl.logic.experience_memory import ExperienceMemory
         from titan_hcl.logic.experiential_memory import ExperientialMemory
         from titan_hcl.logic.experience_orchestrator import (
             ExperienceOrchestrator)
@@ -2216,6 +2198,7 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
             ArcPuzzlePlugin, LanguageLearningPlugin,
             CreativeExpressionPlugin, CommunicationPlugin,
             KnowledgePlugin, SelfModelPlugin, MetaReasoningPlugin)
+        ex_mem = ExperienceMemory(db_path="./data/experience_memory.db")
         _dev_age_fn = (lambda: pi_monitor.developmental_age) if pi_monitor else (
             lambda: 0)
         e_mem = ExperientialMemory(
@@ -2223,7 +2206,7 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
             developmental_age_fn=_dev_age_fn,
         )
         exp_orchestrator = ExperienceOrchestrator(
-            e_mem=e_mem, cognee_memory=None,
+            ex_mem=ex_mem, e_mem=e_mem, cognee_memory=None,
             db_path="./data/experience_orchestrator.db")
         exp_orchestrator.register_plugin(ArcPuzzlePlugin())
         exp_orchestrator.register_plugin(LanguageLearningPlugin())
@@ -2253,11 +2236,6 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
                 "[CognitiveWorker] ExperienceOrchestrator + e_mem wired into "
                 "coordinator dream side-effects (distill_cycle now active on "
                 "_on_dream_begin)")
-        # §3L Phase 15 chunk 15.1 — boot-seed experience_stats.bin so the api
-        # reads live aggregates immediately (not a cold-boot stub) before the
-        # first record_outcome. G18: one-time slot publish at boot.
-        if _experience_stats_publisher is not None:
-            _experience_stats_publisher.publish(exp_orchestrator)
     except Exception as _exp_err:
         logger.warning(
             "[CognitiveWorker] Experience Orchestrator init failed: %s",
@@ -2348,12 +2326,10 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
         # D-SPEC-85 v1.25.0 — consciousness_age.bin publisher (lifetime
         # self-observation tick counter for post_dispatch footer "main age").
         "_consciousness_age_publisher": _consciousness_age_publisher,
-        # §3L Phase 15 chunk 15.1 — experience_stats.bin publisher
-        # (G21 single-writer; ExperienceOrchestrator-sourced).
-        "_experience_stats_publisher": _experience_stats_publisher,
         "msl": msl,
         "neuromod_reward_observer": neuromod_reward_observer,
         # Block D — Tier 1 SPEAK migration deps:
+        "ex_mem": ex_mem,
         "e_mem": e_mem,
         "exp_orchestrator": exp_orchestrator,
         "social_pressure_meter": _social_pressure_meter,
@@ -2618,14 +2594,6 @@ def _dispatch_experience_record(state_refs: dict, payload: dict) -> None:
             epoch_id=epoch_id,
             is_dreaming=is_dreaming,
         )
-        # §3L Phase 15 chunk 15.1 — event-driven publish of experience_stats.bin
-        # after each recorded outcome (EXPERIENCE_RECORD is upstream-throttled
-        # to ≥2s via emit_experience_record). Keeps the api-read slot current
-        # without a periodic thread; in-proc consumers read the orchestrator
-        # directly. G18/G21 single-writer (cognitive_worker owns the slot).
-        _exp_stats_pub = state_refs.get("_experience_stats_publisher")
-        if _exp_stats_pub is not None:
-            _exp_stats_pub.publish(exp_orchestrator)
     except Exception as _exp_err:
         logger.debug(
             "[CognitiveWorker] EXPERIENCE_RECORD record raised: %s", _exp_err)
@@ -3828,7 +3796,7 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                         # None-tolerant.
                         life_force_engine=None,
                         pi_monitor=pi_monitor,
-                        exp_orchestrator=state_refs.get("exp_orchestrator"),
+                        ex_mem=state_refs.get("ex_mem"),
                         sphere_clocks_snap=getattr(
                             coordinator, "_sphere_clocks_snapshot", None),
                         latest_epoch=(consciousness.get("latest_epoch") or {})
@@ -4215,7 +4183,7 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
     #
     # 2026-05-10 post-deploy fix: MetaReasoningEngine.tick signature
     # (logic/meta_reasoning.py:1056) requires 4 additional positional
-    # deps — chain_archive, meta_wisdom, exp_orchestrator, meta_autoencoder —
+    # deps — chain_archive, meta_wisdom, ex_mem, meta_autoencoder —
     # that were missing from this call site. Was raising TypeError
     # silently every epoch. Foundation engines now booted in
     # _init_cognitive_engines and threaded through state_refs.
@@ -4299,7 +4267,7 @@ def _drive_one_epoch(state_refs: dict, config: dict, *,
                     reasoning_engine=reasoning_engine,
                     chain_archive=state_refs.get("chain_archive"),
                     meta_wisdom=state_refs.get("meta_wisdom"),
-                    exp_orchestrator=state_refs.get("exp_orchestrator"),
+                    ex_mem=state_refs.get("ex_mem"),
                     meta_autoencoder=state_refs.get("meta_autoencoder"),
                 )
                 # §4.Q (2026-05-15) META reward nudges — emit via bus events.

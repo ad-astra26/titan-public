@@ -4,7 +4,7 @@
 //!     python scripts/generate_phase_c_constants.py
 //!
 //! SPEC version: 1.11.4
-//! Source SHA-256: 4570bb68d59d5d6861d6c69aef324c956c92a2760a2fead44d15e7eee17cfeaa
+//! Source SHA-256: 9840e48bbd9b42d92a334b5bd620c7e734db569f22244228918794ecad163dbc
 //!
 //! Per SPEC §19 + §2.6: hand-editing this file is a SPEC violation flagged by
 //! `arch_map phase-c verify`.
@@ -13,7 +13,7 @@
 // ── SPEC version metadata ──────────────────────────────────────────────
 pub const SPEC_VERSION: &str = "1.11.4";
 pub const SPEC_SOURCE_SHA256: &str =
-    "4570bb68d59d5d6861d6c69aef324c956c92a2760a2fead44d15e7eee17cfeaa";
+    "9840e48bbd9b42d92a334b5bd620c7e734db569f22244228918794ecad163dbc";
 
 // ── KERNEL ────────────────────────────────────────────────────────────────
 // titan-kernel-rs internals (boot, snapshot, signal handling, persistence)
@@ -472,10 +472,6 @@ pub const CONSCIOUSNESS_AGE_MAX_BYTES: u64 = 256;
 pub const META_TEACHER_STATE_SCHEMA_VERSION: u64 = 1;
 /// Max bytes for meta_teacher_state.bin payload. Typical ≈ 600-1500 bytes. Bounded 4KB cap.
 pub const META_TEACHER_STATE_MAX_BYTES: u64 = 4096;
-/// Schema version for experience_stats.bin slot — variable msgpack {total_records: int, undistilled: int, total_wisdom: int, by_domain: dict[str→{count: int, avg_score: float, success_rate: float}], schema_version: int, ts: float}. Owned by cognitive_worker (ExperienceOrchestrator instance; G21 single-writer). Aggregated from the INCREMENTAL action_stats table (running avg/success maintained O(1) in _update_action_stats) + experience_records counts — NEVER a per-read GROUP BY. Reader: api_subprocess StateAccessor.experience + in-proc coord-snapshot build + neuromod_inputs_builder. §3L Phase 15 chunk 15.1 / D-SPEC-PHASE15: retires the frozen ExperienceMemory recompute-on-read path (spirit_worker write loop dropped in D8-3/72f95a6b).
-pub const EXPERIENCE_STATS_SCHEMA_VERSION: u64 = 1;
-/// Max bytes for experience_stats.bin payload. by_domain has ~7-12 domains × ~80 bytes → typically 600-1000 bytes. Bounded 4KB cap.
-pub const EXPERIENCE_STATS_MAX_BYTES: u64 = 4096;
 /// Schema version for guardian_state.bin slot — variable msgpack {modules: dict[str→{state: str, pid: int, rss_mb: float, uptime: float, restart_count: int, restarts_in_window: int, last_heartbeat_age: float, layer: str, start_method: str, adopted: bool, adopt_ts: float}], total_modules: int, modules_by_layer: dict[str→list[str]], escalation_count: int, schema_version: int, ts: float}. Owned by guardian (Python L1 supervisor — `titan_hcl/guardian.py`). Reader: api_subprocess StateAccessor.guardian.get_status + get_modules_by_layer.
 pub const GUARDIAN_STATE_SCHEMA_VERSION: u64 = 1;
 /// Max bytes for guardian_state.bin payload. ~30-40 modules × ~200 bytes each → typically 8-10KB. Bounded 16KB cap accommodates fleet growth.
