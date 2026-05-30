@@ -305,6 +305,25 @@ impl Slot {
             .map_err(|e| SlotIoError::io(&path, e))?;
         let meta = file.metadata().map_err(|e| SlotIoError::io(&path, e))?;
         let total = meta.len() as usize;
+        // Guard against a 0-byte / truncated sidecar (race window during a
+        // mid-write, or a foreign process touching the file). Without this the
+        // `mmap[..SHM_HEADER_BYTES]` slice below would panic with an
+        // out-of-bounds index instead of returning a recoverable error, so the
+        // `Slot::open(...).ok()` callers could not degrade to `None`
+        // (BUG-SLOT-OPEN-PANICS-ON-EMPTY-MMAP-20260523). Since the mmap length
+        // equals `total`, this single check makes every header-slice safe.
+        if total < SHM_HEADER_BYTES as usize {
+            return Err(SlotIoError::io(
+                &path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "slot file too short: {total} bytes (need ≥{} for header)",
+                        SHM_HEADER_BYTES
+                    ),
+                ),
+            ));
+        }
         let mmap = unsafe { MmapOptions::new().len(total).map_mut(&file) }
             .map_err(|e| SlotIoError::io(&path, std::io::Error::other(format!("mmap: {e}"))))?;
 
@@ -729,6 +748,41 @@ mod tests {
         assert_eq!(h.ready_idx(), 0);
         assert_eq!(h.version(), 4);
         assert_eq!(reopened.read().unwrap(), b"third");
+    }
+
+    #[test]
+    fn open_zero_byte_file_returns_err() {
+        // A 0-byte sidecar (mid-write race / foreign touch) must yield a
+        // recoverable SlotIoError, NOT an out-of-bounds panic, so that
+        // `Slot::open(...).ok()` callers degrade to None
+        // (BUG-SLOT-OPEN-PANICS-ON-EMPTY-MMAP-20260523).
+        let dir = tempdir();
+        let path = dir.path().join("empty.bin");
+        std::fs::File::create(&path).unwrap(); // 0 bytes
+        let err = Slot::open(&path)
+            .err()
+            .expect("0-byte open must error, not panic");
+        assert!(
+            matches!(err, SlotIoError::Io { .. }),
+            "expected SlotIoError::Io for a 0-byte file, got {err:?}"
+        );
+        // The whole point: the caller can fall back to None without unwinding.
+        assert!(Slot::open(&path).ok().is_none());
+    }
+
+    #[test]
+    fn open_truncated_below_header_returns_err() {
+        // A file shorter than SHM_HEADER_BYTES is just as unsafe to slice.
+        let dir = tempdir();
+        let path = dir.path().join("truncated.bin");
+        std::fs::write(&path, vec![0u8; (SHM_HEADER_BYTES - 1) as usize]).unwrap();
+        let err = Slot::open(&path)
+            .err()
+            .expect("sub-header open must error, not panic");
+        assert!(
+            matches!(err, SlotIoError::Io { .. }),
+            "expected SlotIoError::Io for a sub-header file, got {err:?}"
+        );
     }
 
     #[test]

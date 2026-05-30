@@ -149,6 +149,31 @@ def test_no_hardcoded_fork_resolution_outside_resolver():
     assert not offenders, "hardcoded fork resolution remains:\n" + "\n".join(offenders)
 
 
+def test_zero_fork_int_resolution_writes_fleetwide():
+    """Strict INV-Syn-26 (zero-tolerance) — no `fork_id=FORK_<NAME>` resolution
+    write/query target anywhere in the timechain stack. Forks 0-4 are genesis-
+    pinned and never relocate, but resolution still routes through the resolver
+    so the class of bug can never recur. Structural `== FORK_MAIN` identity
+    comparisons + the `FORK_MAIN = 0` class const are exempt (not resolution)."""
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    files = [
+        "titan_hcl/logic/timechain_integrity.py",
+        "titan_hcl/logic/timechain_v2.py",
+        "titan_hcl/modules/timechain_worker.py",
+        "titan_hcl/api/dashboard.py",
+    ]
+    offenders = []
+    for rel in files:
+        for line in (repo / rel).read_text().splitlines():
+            s = line.strip()
+            if s.startswith("#"):
+                continue
+            if "fork_id=FORK_" in line or "fork_id = FORK_" in line:
+                offenders.append(f"{rel}: {s}")
+    assert not offenders, ("hardcoded fork-int resolution-writes remain:\n"
+                           + "\n".join(offenders))
+
+
 def test_timechain_v2_fork_ids_is_seed_only():
     """timechain_v2.FORK_IDS may exist only as a seed-default definition — never
     referenced for resolution (resolution goes through _resolve_fork_id)."""
@@ -246,3 +271,77 @@ def test_guardian_discovered_by_registry():
                     and attr is not HealthCheckPlugin):
                 found.append(attr.name)
     assert "timechain_guardian" in found
+
+
+# ── (C) §3K.3.C conversation legacy provenance anchor ───────────────────
+
+def _relocated_chain_with_legacy_chat(tmp_path, n_chat=3, n_noise=2):
+    """Build a T2/T3-shape chain: fork 5 = topic:expression holding `n_chat`
+    genuine chat blocks (verified_output|chat tags) + `n_noise` non-chat blocks;
+    `conversation` reseeded to a relocated id."""
+    from titan_hcl.logic.timechain import BlockPayload
+    tc = _new_chain(tmp_path)
+    db = pathlib.Path(tmp_path) / "index.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute("DELETE FROM fork_registry WHERE fork_id = 5")
+    conn.execute(
+        "INSERT INTO fork_registry (fork_id, fork_name, fork_type, parent_fork, "
+        "parent_block, created_at, tip_height, tip_hash, topic, compacted) "
+        "VALUES (5, 'topic:expression', 'topic_sidechain', 3, 0, 0, -1, NULL, "
+        "'expression', 0)")
+    conn.commit()
+    conn.close()
+    # Re-open so the in-memory fork_tips knows fork 5, then commit blocks to it.
+    tc = TimeChain(data_dir=str(tmp_path), titan_id="TZ")
+    for i in range(n_chat):
+        tc.commit_block(fork_id=5, epoch_id=i,
+                        payload=BlockPayload(thought_type="conversation",
+                                             source="output_verifier",
+                                             content={"i": i},
+                                             tags=["verified_output", "chat"]),
+                        pot_nonce=1, chi_spent=0.0, neuromod_state={})
+    for i in range(n_noise):
+        tc.commit_block(fork_id=5, epoch_id=100 + i,
+                        payload=BlockPayload(thought_type="conversation",
+                                             source="v2_batch_time",
+                                             content={"i": i},
+                                             tags=["v2_batch", "time"]),
+                        pot_nonce=1, chi_spent=0.0, neuromod_state={})
+    return tc
+
+
+def test_legacy_anchor_relocated_chain(tmp_path):
+    tc = _relocated_chain_with_legacy_chat(tmp_path, n_chat=3, n_noise=2)
+    conv_id = tc.resolve_fork_id("conversation")
+    assert conv_id != 5
+    anchor = tc.write_conversation_legacy_anchor()
+    assert anchor is not None
+    c = anchor.payload.content
+    assert c["kind"] == "conversation_legacy_anchor"
+    assert c["legacy_fork_id"] == 5
+    assert c["new_conversation_fork_id"] == conv_id
+    # Only the 3 genuine chat blocks anchored — the 2 v2_batch noise excluded.
+    assert c["chat_block_count"] == 3
+    assert len(c["chat_block_hashes"]) == 3
+    assert len(c["merkle_root"]) == 64  # sha256 hex
+    # The anchor block lives in the conversation fork.
+    assert anchor.header.fork_id == conv_id
+
+
+def test_legacy_anchor_idempotent(tmp_path):
+    tc = _relocated_chain_with_legacy_chat(tmp_path)
+    assert tc.write_conversation_legacy_anchor() is not None
+    assert tc.write_conversation_legacy_anchor() is None  # second call no-ops
+
+
+def test_legacy_anchor_noop_on_canonical_chain(tmp_path):
+    """Fresh/T1-shape chain (conversation == id 5) → no relocation → no anchor."""
+    tc = _new_chain(tmp_path)
+    assert tc.resolve_fork_id("conversation") == 5
+    assert tc.write_conversation_legacy_anchor() is None
+
+
+def test_legacy_anchor_noop_when_no_chat(tmp_path):
+    """Relocated chain but legacy fork 5 has no genuine chat → no anchor."""
+    tc = _relocated_chain_with_legacy_chat(tmp_path, n_chat=0, n_noise=3)
+    assert tc.write_conversation_legacy_anchor() is None
