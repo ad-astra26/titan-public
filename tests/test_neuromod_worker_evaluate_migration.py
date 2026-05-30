@@ -282,7 +282,7 @@ def test_inputs_builder_build_returns_well_formed_payload():
         neural_nervous_system=None,
         life_force_engine=None,
         pi_monitor=None,
-        exp_orchestrator=None,
+        ex_mem=None,
         sphere_clocks_snap=None,
         latest_epoch=None,
         is_dreaming=False,
@@ -321,7 +321,7 @@ def test_inputs_builder_kin_overrides_emit_when_signal_exceeds_threshold():
     now = 1000.0
     payload = b.build(
         coordinator=None, neural_nervous_system=None, life_force_engine=None,
-        pi_monitor=None, exp_orchestrator=None, sphere_clocks_snap=None,
+        pi_monitor=None, ex_mem=None, sphere_clocks_snap=None,
         latest_epoch=None, is_dreaming=False,
         prediction_stats=None, expression_stats=None,
         kin_signature={
@@ -353,7 +353,7 @@ def test_inputs_builder_state_cache_advances_drift_delta_and_emas():
     # First build with drift=0.5 advances state
     b.build(
         coordinator=None, neural_nervous_system=None, life_force_engine=None,
-        pi_monitor=None, exp_orchestrator=None, sphere_clocks_snap=None,
+        pi_monitor=None, ex_mem=None, sphere_clocks_snap=None,
         latest_epoch={"drift_magnitude": 0.5, "curvature": 0.3, "epoch_id": 1},
         is_dreaming=False,
         prediction_stats=None, expression_stats=None, kin_signature=None,
@@ -371,7 +371,7 @@ def test_inputs_builder_handles_msgpack_round_trip():
 
     payload = NeuromodInputsBuilder(dna={}).build(
         coordinator=None, neural_nervous_system=None, life_force_engine=None,
-        pi_monitor=None, exp_orchestrator=None, sphere_clocks_snap=None,
+        pi_monitor=None, ex_mem=None, sphere_clocks_snap=None,
         latest_epoch=None, is_dreaming=False,
         prediction_stats=None, expression_stats=None, kin_signature=None,
     )

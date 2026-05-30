@@ -1080,7 +1080,7 @@ class MetaReasoningEngine:
     # ── Public API ────────────────────────────────────────────────
 
     def tick(self, state_132d, neuromods, reasoning_engine,
-             chain_archive, meta_wisdom, exp_orchestrator, meta_autoencoder) -> dict:
+             chain_archive, meta_wisdom, ex_mem, meta_autoencoder) -> dict:
         """One meta-reasoning step per epoch."""
 
         sv = list(state_132d) if state_132d else []
@@ -1299,7 +1299,7 @@ class MetaReasoningEngine:
         # Execute primitive
         result = self._execute(prim_name, sub_name, sv, nm,
                                reasoning_engine, chain_archive, meta_wisdom,
-                               exp_orchestrator, meta_autoencoder)
+                               ex_mem, meta_autoencoder)
 
         # Audit telemetry: count INTROSPECT successful executions. Divergence
         # vs _introspect_picks_lifetime indicates a re-emergent crash.
@@ -3476,7 +3476,7 @@ class MetaReasoningEngine:
     # ── Private: Primitive Execution ──────────────────────────────
 
     def _execute(self, prim, sub, sv, nm, reasoning_engine,
-                 chain_archive, meta_wisdom, exp_orchestrator, autoencoder):
+                 chain_archive, meta_wisdom, ex_mem, autoencoder):
         if prim == "FORMULATE":
             result = self._prim_formulate(sub, sv, nm, meta_wisdom, autoencoder)
             # rFP_titan_meta_outer_layer Bridge 2 — detect entity/topic refs
@@ -3485,7 +3485,7 @@ class MetaReasoningEngine:
             self._post_formulate_detect_entities()
             return result
         elif prim == "RECALL":
-            return self._prim_recall(sub, chain_archive, meta_wisdom, exp_orchestrator)
+            return self._prim_recall(sub, chain_archive, meta_wisdom, ex_mem)
         elif prim == "HYPOTHESIZE":
             return self._prim_hypothesize(sub, nm)
         elif prim == "DELEGATE":
@@ -3605,7 +3605,7 @@ class MetaReasoningEngine:
                     "confidence": 0.5, "session_1_stub": True,
                     "recruitment_resolved": False}
 
-    def _prim_recall(self, sub, chain_archive, meta_wisdom, exp_orchestrator):
+    def _prim_recall(self, sub, chain_archive, meta_wisdom, ex_mem):
         """Query memory sources."""
         results = []
         best_match = None
@@ -3618,10 +3618,10 @@ class MetaReasoningEngine:
             if results:
                 best_match = results[0]
 
-        elif sub == "experience" and exp_orchestrator:
+        elif sub == "experience" and ex_mem:
             try:
                 domain = self.state.formulate_output.get("domain", "general")
-                results = exp_orchestrator.recall_similar(domain, top_k=5)
+                results = ex_mem.recall_similar(domain, top_k=5)
                 if results:
                     best_match = results[0] if isinstance(results[0], dict) else {"score": results[0]}
             except Exception as _swallow_exc:
@@ -3682,10 +3682,10 @@ class MetaReasoningEngine:
         # Session 1: each new sub-mode falls back to the closest existing
         # retrieval path. Session 2 dispatches through Recruitment Layer
         # to episodic_memory / semantic_graph / chain_archive / timechain.
-        elif sub == "episodic_specific" and exp_orchestrator:
+        elif sub == "episodic_specific" and ex_mem:
             try:
                 domain = self.state.formulate_output.get("domain", "general")
-                results = exp_orchestrator.recall_similar(domain, top_k=5)
+                results = ex_mem.recall_similar(domain, top_k=5)
                 if results:
                     best_match = (results[0] if isinstance(results[0], dict)
                                   else {"score": results[0]})
@@ -3703,10 +3703,10 @@ class MetaReasoningEngine:
             if results:
                 best_match = results[0]
 
-        elif sub == "autobiographical_relevant" and exp_orchestrator:
+        elif sub == "autobiographical_relevant" and ex_mem:
             try:
                 domain = self.state.formulate_output.get("domain", "general")
-                results = exp_orchestrator.recall_similar(domain, top_k=10)
+                results = ex_mem.recall_similar(domain, top_k=10)
                 if results:
                     best_match = (results[0] if isinstance(results[0], dict)
                                   else {"score": results[0]})
