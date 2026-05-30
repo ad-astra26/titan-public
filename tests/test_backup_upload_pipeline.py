@@ -54,6 +54,17 @@ class FakeArweaveBackend:
         return self._store[tx_id]
 
 
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def _fake_base58_sig() -> str:
+    """A realistic base58 Solana-style signature (no 0/O/I/l/_), so the v=3
+    memo's base58 `prev=` parses exactly as a real on-chain sig would."""
+    import hashlib
+    h = hashlib.sha256(uuid.uuid4().bytes).digest()
+    return "".join(_B58_ALPHABET[b % 58] for b in h)[:24]
+
+
 class FakeSolanaBackend:
     """In-memory Solana memo store. commit returns sig, memo retrievable."""
     def __init__(self):
@@ -61,16 +72,29 @@ class FakeSolanaBackend:
         self.commit_log: list[str] = []
         self.fail_commits = False
 
-    async def commit(self, event_id: str, root: str,
-                     prev_root: Optional[str]) -> Optional[str]:
+    async def commit(self, event_id: str, ts: int, event_root: str,
+                     components: list, prev_sig: Optional[str]) -> Optional[dict]:
+        """v=3 chain committer (5J-2 contract): one memo per component,
+        returns {"head_sig", "component_sigs"}. Uses Mode B (raw URL) so the
+        mock needs no key — it exercises the real v=3 encoder + per-component
+        emission + the head/prev contract the pipeline depends on."""
         if self.fail_commits:
             return None
-        sig = "sig_" + uuid.uuid4().hex[:16]
-        memo = build_zk_memo(event_id=event_id, event_merkle_root=root,
-                             prev_event_merkle_root=prev_root)
-        self._memos[sig] = memo
-        self.commit_log.append(sig)
-        return sig
+        from titan_hcl.logic.backup_memo_v3 import build_v3_memo
+        component_sigs: dict = {}
+        head_sig: Optional[str] = None
+        for comp in components:
+            sig = _fake_base58_sig()
+            memo = build_v3_memo(
+                event_id=event_id, ts=ts, tier=comp["tier"],
+                archive_hash=comp["arc"], merkle_root=event_root,
+                arweave_tx=comp["tx_id"], mode="B", prev_sig=prev_sig)
+            self._memos[sig] = memo
+            self.commit_log.append(sig)
+            component_sigs[comp["tier"]] = sig
+            if head_sig is None:
+                head_sig = sig
+        return {"head_sig": head_sig, "component_sigs": component_sigs}
 
     async def fetch(self, sig: str) -> str:
         return self._memos[sig]
@@ -377,7 +401,7 @@ async def test_run_unified_event_zk_failure_aborts(tmp_path):
         scratch_dir=str(tmp_path / "scratch"),
     )
     assert result.status == "failed"
-    assert any("ZK Vault commit returned None" in e for e in result.errors)
+    assert any("chain_write_failed" in e for e in result.errors)
     assert len(manifest.events) == 0  # not appended on ZK failure
 
 

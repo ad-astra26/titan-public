@@ -156,45 +156,11 @@ def test_cascade_encrypted_then_decrypt_via_manifest(tmp_path):
     assert recovered == plaintext
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# 4. phase_3_rehydrate decryption integration (resurrection.py)
-# ────────────────────────────────────────────────────────────────────────────
-
-def test_resurrection_phase_3_decrypts_then_extracts(tmp_path, monkeypatch):
-    """resurrection.py phase_3_rehydrate must decrypt the archive in-place
-    before tarfile.open is attempted. Exercise with a fresh encrypted archive."""
-    import scripts.resurrection as res
-    from titan_hcl.logic.backup_crypto import derive_backup_key, encrypt_tarball
-
-    kp = _fake_kp()
-    master = derive_master_key(kp, TITAN_PUBKEY)
-    plaintext_tarball = _make_tarball_bytes(b"resurrection payload")
-    backup_id = hashlib.sha256(plaintext_tarball).hexdigest()[:16]
-    bkey = derive_backup_key(master, backup_id, "personality")
-    ct, iv, tag = encrypt_tarball(plaintext_tarball, bkey)
-
-    archive_path = tmp_path / "enc.tar.gz"
-    archive_path.write_bytes(ct)
-
-    manifest = {
-        "algorithm": ALGORITHM_ID,
-        "iv_b64": base64.b64encode(iv).decode(),
-        "auth_tag_b64": base64.b64encode(tag).decode(),
-        "plaintext_sha256": hashlib.sha256(plaintext_tarball).hexdigest(),
-        "backup_id": backup_id,
-    }
-
-    # Stub out the filesystem-mutating + re-encrypt sections so the test only
-    # covers the decryption + extraction phase.
-    monkeypatch.chdir(tmp_path)
-    os.makedirs("data", exist_ok=True)
-
-    from unittest import mock
-    with mock.patch("titan_hcl.utils.crypto.encrypt_for_machine", return_value=b""):
-        # tar extract doesn't write anything we care about (payload is "restore.bin" → data/restore.bin)
-        res.phase_3_rehydrate(str(archive_path), kp,
-                                encryption_manifest=manifest,
-                                titan_pubkey=TITAN_PUBKEY,
-                                backup_type="personality")
-    # After decryption, archive was rewritten with plaintext; phase_3 deletes it at the end.
-    assert not archive_path.exists(), "archive should be cleaned up by phase_3"
+# NOTE: the former `test_resurrection_phase_3_decrypts_then_extracts` was removed
+# 2026-05-30. It exercised `resurrection.phase_3_rehydrate`, which W1.5
+# (RFP_Titan_setup_release) deleted when Phase 2/3 were modernized to delegate to
+# `backup_restore.restore_full` (commit 8d945912). The decrypt-then-extract
+# capability it covered is now exercised against the live API by
+# `test_cascade_encrypted_then_decrypt_via_manifest` (above) + the five
+# `decrypt_from_manifest` tests; restore-side decryption rides through
+# restore_full. No coverage lost.

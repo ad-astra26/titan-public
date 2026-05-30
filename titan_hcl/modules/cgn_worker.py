@@ -842,27 +842,6 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                         _write_incremental_shm(cgn, shm_writer)
                         _stats["shm_writes"] += 1
 
-                    # ── Phase B (RFP_cgn_enhancements §9.2) — emit CGN_CONCEPT_GROUNDED
-                    # for any concept that just matured across ≥2 consumers (the
-                    # Level-B cross-consumer abstraction trigger). cgn queues these
-                    # in record_outcome; we drain + publish to cognitive_worker.
-                    try:
-                        for _mat in cgn.pop_matured_concepts():
-                            _send_msg(send_queue, bus.CGN_CONCEPT_GROUNDED, name,
-                                      "cognitive_worker", {
-                                          "concept_id": _mat["concept_id"],
-                                          "consumers": _mat["consumers"],
-                                          "first_consumer": _mat["first_consumer"],
-                                      })
-                            logger.info(
-                                "[CGN] CGN_CONCEPT_GROUNDED — concept=%s consumers=%s "
-                                "(Phase B Level-B trigger)",
-                                _mat["concept_id"], _mat["consumers"])
-                    except Exception as _cg_mat_err:
-                        swallow_warn('[CGNWorker] CGN_CONCEPT_GROUNDED emit', _cg_mat_err,
-                                     key="modules.cgn_worker.concept_grounded_emit",
-                                     throttle=100)
-
                     # SOAR impasse check (every 10 outcomes)
                     if _stats["outcomes_recorded"] % 10 == 0:
                         _check_impasses(cgn, send_queue, name)

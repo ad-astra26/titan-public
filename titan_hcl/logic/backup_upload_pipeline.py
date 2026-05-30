@@ -77,10 +77,17 @@ EVENT_BACKUP_EVENT_FAILED = "BACKUP_EVENT_FAILED"
 # ArweaveStore.upload_bytes(data, tag_app, tag_titan). Tests stub.
 ArweaveUploader = Callable[[bytes, dict], "Awaitable[str]"]
 
-# Async (event_id, event_merkle_root, prev_event_merkle_root_or_None) ->
-# Solana tx_id. Production wires RebirthBackup.commit_event_merkle_to_zk_vault.
+# Sovereign v=3 chain committer (chunk 5J-2). Async
+#   (event_id, ts_unix, event_merkle_root, components, prev_sig) -> dict | None
+# where components = ordered [{"tier": "PT"|"TC"|"SL", "tx_id": str, "arc": str}]
+# (arc = that component's tarball sha256). Emits ONE v=3 memo per component,
+# commit_state co-bundled with the head (PT) memo, prev= threaded event-level
+# (all of an event's memos carry prev = prior event's head sig). Returns
+# {"head_sig": str, "component_sigs": {tier: sig}} (head_sig = the event's chain
+# anchor) or None on ANY chain-write failure (no silent fallback). Production
+# wires RebirthBackup.commit_event_v3_chain.
 ZkCommitter = Callable[
-    [str, str, Optional[str]], "Awaitable[Optional[str]]"
+    [str, int, str, list, Optional[str]], "Awaitable[Optional[dict]]"
 ]
 
 
@@ -451,32 +458,32 @@ async def run_unified_event(
         )
         out.event_merkle_root = event_root
 
-        # Commit to ZK Vault — prev_event_merkle_root reconstructed from
-        # prior event if present (we recompute from prior event's recorded
-        # per-component merkle_roots so we don't have to persist the
-        # composite anywhere except on-chain)
-        prev_root = None
-        if prev_event is not None:
-            try:
-                p = prev_event.get("personality", {}).get("merkle_root")
-                t = prev_event.get("timechain", {}).get("merkle_root")
-                s = (prev_event.get("soul", {}) or {}).get("merkle_root")
-                if p and t:
-                    prev_root = compute_event_merkle_root(
-                        personality_merkle_root=p,
-                        timechain_merkle_root=t,
-                        soul_merkle_root=s,
-                    )
-            except Exception:
-                prev_root = None
+        # Sovereign v=3 chain commit (chunk 5J-2, Option 1) — emit ONE v=3 memo
+        # per uploaded component (PT/TC/SL), each carrying its own arc (component
+        # tarball sha256) + url (component Arweave tx_id) + the shared event_root
+        # (mrkl). commit_state(event_root) is co-bundled with the head (PT) memo.
+        # prev= is event-level: every memo of this event points at the prior
+        # event's head sig, threading the chain back to the Day-1 genesis anchor.
+        # No silent fallback — any chain-write failure fails the event loudly.
+        prev_sig = prev_event.get("zk_commit_tx") if prev_event else None
+        components = [
+            {"tier": "PT", "tx_id": tier_results["personality"].tx_id, "arc": pers_sha},
+            {"tier": "TC", "tx_id": tier_results["timechain"].tx_id, "arc": tc_sha},
+        ]
+        if soul_specs is not None and soul_sha:
+            components.append(
+                {"tier": "SL", "tx_id": tier_results["soul"].tx_id, "arc": soul_sha}
+            )
 
         try:
-            zk_sig = await zk_committer(event_id, event_root, prev_root)
+            commit_result = await zk_committer(
+                event_id, int(started), event_root, components, prev_sig)
         except Exception as e:
-            out.errors.append(f"ZK Vault commit raised: {e}")
-            zk_sig = None
-        if zk_sig is None:
-            out.errors.append("ZK Vault commit returned None")
+            out.errors.append(f"v=3 chain commit raised: {e}")
+            commit_result = None
+        head_sig = (commit_result or {}).get("head_sig") if commit_result else None
+        if not head_sig:
+            out.errors.append("v=3 chain commit returned no head_sig (chain_write_failed)")
             out.status = "failed"
             out.duration_s = time.time() - started
             if bus_emit is not None:
@@ -485,7 +492,7 @@ async def run_unified_event(
                 except Exception:
                     pass
             return out
-        out.zk_commit_tx = zk_sig
+        out.zk_commit_tx = head_sig
 
         # Append event to manifest + save
         personality_sub = {
@@ -515,8 +522,8 @@ async def run_unified_event(
             prev_event_id=prev_event_id,
             baseline_trigger=trigger if event_type == "baseline" else None,
             personality=personality_sub, timechain=timechain_sub,
-            soul=soul_sub, zk_commit_tx=zk_sig,
-            zk_memo_prev_short=(prev_root[:16] if prev_root else "genesis"),
+            soul=soul_sub, zk_commit_tx=head_sig,
+            zk_memo_prev_short=(prev_sig[:16] if prev_sig else "genesis"),
         )
         manifest.append_event(event)
         manifest.save()
@@ -531,7 +538,7 @@ async def run_unified_event(
             tier_results["timechain"].tx_id[:16] + "...",
             (tier_results["soul"].tx_id[:16] + "..."
              if soul_specs is not None else "-"),
-            zk_sig[:16] + "...", out.duration_s,
+            head_sig[:16] + "...", out.duration_s,
         )
         if bus_emit is not None:
             try:
@@ -545,7 +552,7 @@ async def run_unified_event(
                     "timechain_tx": tier_results["timechain"].tx_id,
                     "soul_tx": (tier_results["soul"].tx_id
                                 if soul_specs is not None else None),
-                    "zk_commit_tx": zk_sig,
+                    "zk_commit_tx": head_sig,
                     "event_merkle_root": event_root,
                     "duration_s": round(out.duration_s, 3),
                 })
