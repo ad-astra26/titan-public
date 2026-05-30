@@ -106,6 +106,7 @@ MODULE_NAME = "expression_worker"
 _HEARTBEAT_INTERVAL_S = 10.0            # SPEC §10.B MODULE_HEARTBEAT_INTERVAL_S
 _POLL_INTERVAL_S = 0.2                  # recv loop poll cadence
 _SHM_PUBLISH_INTERVAL_S = 1.0           # expression_composites_state.bin 1 Hz
+_STATE_CHECKPOINT_INTERVAL_S = 300.0   # periodic edge_detector disk checkpoint
 _STATS_NOTIFY_INTERVAL_S = 5.0          # EXPRESSION_COMPOSITES_UPDATED bus notify cadence
 
 # Internal evaluate_all cadence. Originally the PLAN proposed KERNEL_EPOCH_TICK
@@ -741,6 +742,8 @@ def expression_worker_main(recv_queue, send_queue, name: str,
 
     # === Main recv loop ===
     last_heartbeat = time.time()
+    last_state_checkpoint = time.time()  # first checkpoint ~5min after boot
+    _ckpt_thread = [None]                 # single-slot non-blocking writer
     while True:
         now = time.time()
         if now - last_heartbeat > _HEARTBEAT_INTERVAL_S:
@@ -752,6 +755,36 @@ def expression_worker_main(recv_queue, send_queue, name: str,
                 except Exception:  # noqa: BLE001
                     pass
             last_heartbeat = now
+
+        # ── Periodic edge_detector disk checkpoint (survives ANY crash) ──
+        # SAVE_NOW persists composite_meta_cgn only on graceful shutdown, so an
+        # ungraceful death (shm_pid_dead / SIGKILL) loses all edge-detector
+        # learning since boot. Snapshot state_dict() on the main thread (cheap,
+        # consistent), then offload the disk load+merge+write to a single-slot
+        # daemon thread so it never blocks the heartbeat under IO/swap pressure.
+        if (now - last_state_checkpoint > _STATE_CHECKPOINT_INTERVAL_S
+                and (_ckpt_thread[0] is None or not _ckpt_thread[0].is_alive())):
+            last_state_checkpoint = now
+            try:
+                _edge_snapshot = edge_holder.state_dict()
+            except Exception:  # noqa: BLE001
+                _edge_snapshot = None
+            if _edge_snapshot is not None:
+                def _do_ckpt(_snap=_edge_snapshot):
+                    try:
+                        from titan_hcl.logic.edge_detector_persistence import (
+                            save_edge_detector_state, load_edge_detector_state,
+                        )
+                        blob = load_edge_detector_state() or {}
+                        blob["composite_meta_cgn"] = _snap
+                        save_edge_detector_state(blob)
+                    except Exception as _ckpt_err:  # noqa: BLE001
+                        logger.warning(
+                            "[ExpressionWorker] periodic checkpoint failed: %s",
+                            _ckpt_err)
+                _ckpt_thread[0] = threading.Thread(
+                    target=_do_ckpt, daemon=True, name="expression-checkpoint")
+                _ckpt_thread[0].start()
 
         try:
             msg = recv_queue.get(timeout=_POLL_INTERVAL_S)

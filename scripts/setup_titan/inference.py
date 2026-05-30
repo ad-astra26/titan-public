@@ -21,7 +21,6 @@ import urllib.request
 from pathlib import Path
 
 from .preflight import Result
-from .prompts import Prompter, StdinPrompter
 from .ui import cprint
 
 OLLAMA_DEFAULT_HOST = "http://localhost:11434"
@@ -135,33 +134,21 @@ def read_secret(section: str, key: str, path: Path = SECRETS_PATH) -> str | None
         return None
 
 
-# ── key validators (shared by the standalone prompts + the Prompter seam) ────
-
-
-def is_openrouter_key(s: str) -> bool:
-    """Heuristic: starts with 'sk-or-' and has ≥8 more chars."""
-    return s.startswith(OPENROUTER_KEY_PREFIX) and len(s) >= len(OPENROUTER_KEY_PREFIX) + 8
-
-
-def is_ollama_cloud_key(s: str) -> bool:
-    """Ollama Cloud keys are opaque tokens — long, space-free, no fixed prefix."""
-    return len(s) >= 20 and " " not in s
-
-
-# ── OpenRouter / Ollama-Cloud key prompts (standalone — kept for direct tests) ─
+# ── OpenRouter key prompt ──────────────────────────────────────────────────
 
 
 def prompt_openrouter_key(prompt_fn=input) -> str:
     """Prompt for an OpenRouter key; loop until it has the right shape.
 
     `prompt_fn` is injected for unit testing (the default is built-in `input`).
+    Heuristic: starts with 'sk-or-' and is at least 14 chars total.
     """
     while True:
         try:
             ans = prompt_fn(f"  OpenRouter API key (starts with '{OPENROUTER_KEY_PREFIX}'): ").strip()
         except EOFError:
             raise SystemExit("setup_titan: stdin closed during OpenRouter key prompt")
-        if is_openrouter_key(ans):
+        if ans.startswith(OPENROUTER_KEY_PREFIX) and len(ans) >= len(OPENROUTER_KEY_PREFIX) + 8:
             return ans
         print(f"    that doesn't look like an OpenRouter key (expected '{OPENROUTER_KEY_PREFIX}…' with ≥8 more chars)")
 
@@ -177,7 +164,7 @@ def prompt_ollama_cloud_key(prompt_fn=input) -> str:
             ans = prompt_fn("  Ollama Cloud API key (from https://ollama.com → API keys): ").strip()
         except EOFError:
             raise SystemExit("setup_titan: stdin closed during Ollama Cloud key prompt")
-        if is_ollama_cloud_key(ans):
+        if len(ans) >= 20 and " " not in ans:
             return ans
         print("    that doesn't look like an Ollama Cloud key (expected a long token, no spaces)")
 
@@ -247,8 +234,7 @@ def _wire_cloud_key(install_root: Path, provider: str, key: str,
 
 
 def run_inference_phase(*, default: bool, install_root: Path,
-                        secrets_path: Path = SECRETS_PATH,
-                        prompter: Prompter | None = None) -> list[Result]:
+                        secrets_path: Path = SECRETS_PATH) -> list[Result]:
     """Phase 4 — pick provider; secret keys → secrets.toml [inference], the
     (non-secret) provider/base_url/model selection → config.toml [inference].
 
@@ -258,18 +244,16 @@ def run_inference_phase(*, default: bool, install_root: Path,
     needs one), so we collect it now — a Titan must be able to chat the moment it
     boots. `--default` auto-accepts a reachable local Ollama; the hosted choice is
     always interactive because a key is unavoidable.
-
-    All input goes through ``prompter`` (CLI stdin by default; the TUI seeds a
-    ScriptedPrompter). Prompt keys: ``use_local_ollama`` (confirm),
-    ``inference_provider_choice`` (choice 1/2), ``openrouter_key`` /
-    ``ollama_cloud_key`` (until).
     """
-    prompter = prompter or StdinPrompter()
     alive = ollama_alive()
     if alive:
-        use_local = default or prompter.confirm(
-            "use_local_ollama", f"Local Ollama detected at {OLLAMA_DEFAULT_HOST}. Use it?",
-            default_yes=True)
+        use_local = default
+        if not default:
+            try:
+                ans = input(f"  Local Ollama detected at {OLLAMA_DEFAULT_HOST}. Use it? [Y/n]: ").strip().lower()
+            except EOFError:
+                raise SystemExit("setup_titan: stdin closed during inference prompt")
+            use_local = ans in ("", "y", "yes")
         if use_local:
             cprint(f"  Using local Ollama at {OLLAMA_DEFAULT_HOST} (most sovereign — no key).",
                    role="success")
@@ -281,17 +265,10 @@ def run_inference_phase(*, default: bool, install_root: Path,
            role="text_muted")
     cprint("    [2] OpenRouter    (openrouter.ai — many models incl. a rate-limited free tier)",
            role="text_muted")
-    choice = prompter.choice("inference_provider_choice", "Provider [1/2, default 1]",
-                             options=["1", "2"], default="1")
+    try:
+        choice = (input("  Provider [1/2, default 1]: ").strip() or "1")
+    except EOFError:
+        raise SystemExit("setup_titan: stdin closed during inference provider choice")
     if choice == "2":
-        key = prompter.until("openrouter_key",
-                             f"OpenRouter API key (starts with '{OPENROUTER_KEY_PREFIX}')",
-                             validate=is_openrouter_key,
-                             hint=f"expected '{OPENROUTER_KEY_PREFIX}…' with ≥8 more chars",
-                             secret=True)
-        return _wire_cloud_key(install_root, "openrouter", key, secrets_path)
-    key = prompter.until("ollama_cloud_key",
-                         "Ollama Cloud API key (from https://ollama.com → API keys)",
-                         validate=is_ollama_cloud_key,
-                         hint="expected a long token, no spaces", secret=True)
-    return _wire_cloud_key(install_root, "ollama_cloud", key, secrets_path)
+        return _wire_cloud_key(install_root, "openrouter", prompt_openrouter_key(), secrets_path)
+    return _wire_cloud_key(install_root, "ollama_cloud", prompt_ollama_cloud_key(), secrets_path)

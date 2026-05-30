@@ -32,6 +32,7 @@ DIRECT_SUB_ACCESSORS = [
     "network", "soul", "guardian", "memory", "metabolism",
     "studio", "social", "gatekeeper", "mood_engine",
     "agency", "backup", "recorder", "language", "meta_teacher",
+    "experience",
     "cgn", "reasoning", "dreaming", "trinity", "neuromods",
     "epoch", "spirit", "body", "mind", "identity",
     "llm", "media", "timechain", "config_loader",
