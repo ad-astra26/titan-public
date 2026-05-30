@@ -464,7 +464,6 @@ def life_force_worker_main(recv_queue, send_queue, name: str,
     # === Main recv loop ===
     last_heartbeat = time.time()
     last_state_checkpoint = time.time()  # first checkpoint ~5min after boot
-    _ckpt_thread = [None]                 # single-slot non-blocking writer
     while True:
         now = time.time()
         if now - last_heartbeat > _HEARTBEAT_INTERVAL_S:
@@ -485,23 +484,14 @@ def life_force_worker_main(recv_queue, send_queue, name: str,
         # loses all chi-state since the last graceful save — life_force_state.json
         # was observed frozen ~2 days fleet-wide. Time-gated so any crash loses
         # at most one interval. Runs at the loop top (every iteration), so it
-        # fires regardless of inbound traffic (no except-Empty trap). NON-BLOCKING:
-        # offloaded to a single-slot daemon thread so the disk write never stalls
-        # the heartbeat under IO/swap pressure (would trip a false shm_pid_dead).
-        if (now - last_state_checkpoint > _STATE_CHECKPOINT_INTERVAL_S
-                and (_ckpt_thread[0] is None or not _ckpt_thread[0].is_alive())):
+        # fires regardless of inbound traffic (no except-Empty trap).
+        if now - last_state_checkpoint > _STATE_CHECKPOINT_INTERVAL_S:
+            try:
+                _save_persisted(engine)
+            except Exception as _ckpt_err:  # noqa: BLE001
+                logger.warning(
+                    "[LifeForceWorker] periodic checkpoint failed: %s", _ckpt_err)
             last_state_checkpoint = now
-
-            def _do_ckpt():
-                try:
-                    _save_persisted(engine)
-                except Exception as _ckpt_err:  # noqa: BLE001
-                    logger.warning(
-                        "[LifeForceWorker] periodic checkpoint failed: %s",
-                        _ckpt_err)
-            _ckpt_thread[0] = threading.Thread(
-                target=_do_ckpt, daemon=True, name="life_force-checkpoint")
-            _ckpt_thread[0].start()
 
         try:
             msg = recv_queue.get(timeout=_POLL_INTERVAL_S)

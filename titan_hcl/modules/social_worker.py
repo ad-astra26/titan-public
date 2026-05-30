@@ -57,7 +57,6 @@ from __future__ import annotations
 import logging
 import os
 import sys
-import threading
 import time
 from queue import Empty
 
@@ -72,7 +71,6 @@ logger = logging.getLogger(__name__)
 # (social_worker is lower priority + lower update cadence).
 _HEARTBEAT_INTERVAL_S = 30.0
 _POLL_INTERVAL_S = 0.2
-_STATE_CHECKPOINT_INTERVAL_S = 300.0   # periodic social-pressure disk checkpoint
 # Phase C-S9 chunk 9Q — post-dispatch orchestration tick cadence. Matches
 # legacy spirit_worker which gated the same block on
 # `_msl_tick_count % 30 == 0` at 1 Hz tick → ~30s. Configurable via
@@ -405,8 +403,6 @@ def _main_loop(recv_queue, send_queue, name: str, state_refs: dict,
     last_heartbeat = 0.0
     last_post_dispatch = 0.0
     last_emotion_check = 0.0
-    last_state_checkpoint = time.time()  # first checkpoint ~5min after boot
-    _ckpt_thread = [None]                 # single-slot non-blocking writer
     shutdown_requested = False
     meter = state_refs.get("social_pressure_meter")
     orchestrator = state_refs.get("post_dispatch_orchestrator")
@@ -460,27 +456,6 @@ def _main_loop(recv_queue, send_queue, name: str, state_refs: dict,
                 "orchestrator_alive": orchestrator is not None,
             }, state_writer=state_writer)
             last_heartbeat = now
-
-        # ── Periodic social-pressure disk checkpoint (survives ANY crash) ──
-        # meter.save_state() otherwise fires only on graceful SAVE_NOW, so an
-        # ungraceful death (shm_pid_dead / SIGKILL) loses urge accumulation +
-        # pending catalysts since boot. Offloaded to a single-slot daemon thread
-        # so the disk write never blocks the heartbeat under IO/swap pressure.
-        if (meter is not None
-                and now - last_state_checkpoint > _STATE_CHECKPOINT_INTERVAL_S
-                and (_ckpt_thread[0] is None or not _ckpt_thread[0].is_alive())):
-            last_state_checkpoint = now
-
-            def _do_ckpt(_m=meter):
-                try:
-                    _m.save_state()
-                except Exception as _ckpt_err:  # noqa: BLE001
-                    logger.warning(
-                        "[SocialWorker] periodic checkpoint failed: %s",
-                        _ckpt_err)
-            _ckpt_thread[0] = threading.Thread(
-                target=_do_ckpt, daemon=True, name="social-checkpoint")
-            _ckpt_thread[0].start()
 
         # Post-dispatch tick — chunk 9Q. Inline-runs the migrated
         # spirit_worker:7770-8400 orchestration loop. Best-effort: errors
@@ -565,16 +540,7 @@ def _main_loop(recv_queue, send_queue, name: str, state_refs: dict,
             shutdown_requested = True
             continue
         if msg_type == bus.SAVE_NOW:
-            # Persist social-pressure meter state (urge accumulator, catalyst
-            # queue, post counters, circuit breaker). Best-effort, synchronous
-            # here since SAVE_NOW is a graceful checkpoint (orchestrator stop()).
-            if meter is not None:
-                try:
-                    meter.save_state()
-                except Exception as _saverr:  # noqa: BLE001
-                    logger.warning(
-                        "[SocialWorker] SAVE_NOW meter persist failed: %s",
-                        _saverr)
+            # Chunk 9E adds SHM-slot write here.
             continue
 
         # === Catalyst event dispatch (chunk 9D + 9I — generic SOCIAL_CATALYST) ===
