@@ -386,7 +386,7 @@ class ChainIntegrity:
         6. META block documenting the reorg
         """
         from titan_hcl.logic.timechain import (
-            TimeChain, BlockPayload, sha256,
+            TimeChain, FORK_META, BlockPayload, sha256,
         )
 
         fork_name = self._resolve_fork_name(fork_id)
@@ -875,7 +875,7 @@ class ChainIntegrity:
                              orphans_recommitted: int = 0):
         """Commit a META block documenting the repair."""
         from titan_hcl.logic.timechain import (
-            TimeChain, BlockPayload,
+            TimeChain, FORK_META, BlockPayload,
         )
 
         tc = TimeChain(data_dir=str(self._data_dir), titan_id=self._titan_id)
@@ -909,7 +909,7 @@ class ChainIntegrity:
                      "5HT": 0.5, "GABA": 0.2, "endorphin": 0.3}
 
         block = tc.commit_block(
-            fork_id=tc.resolve_fork_id("meta"),  # Phase 14 / INV-Syn-26 chain-local
+            fork_id=FORK_META,
             epoch_id=0,
             payload=payload,
             pot_nonce=0,

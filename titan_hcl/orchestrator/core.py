@@ -749,60 +749,6 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             if not info or not info.process:
                 return
 
-            # ── Death-cause logging (SPEC §11.I.4.a — completes the cascade for
-            # signal deaths) ── On a crash/shm_pid_dead restart the worker is
-            # already dead; surface WHY via its exit code. The Supervisor (a
-            # separate process) detects the death via SHM/os.kill FASTER than our
-            # own multiprocessing.Process object reaps the zombie, so we must
-            # join() to reap before reading exitcode (else it is still None at
-            # stop() entry — observed live 2026-05-30). exitcode: 0=clean,
-            # >0=Python exit/exception, <0 = killed by signal -N (-9 SIGKILL →
-            # OOM/RSS/external; -11/-6/-7 SIGSEGV/SIGABRT/SIGBUS → native crash,
-            # also dumped by faulthandler with a traceback).
-            try:
-                _death_ctx = any(_k in reason for _k in
-                                 ("shm_pid_dead", "crash", "peer_dead", "died"))
-                if _death_ctx or not info.process.is_alive():
-                    try:
-                        info.process.join(timeout=1.0)  # reap the zombie
-                    except Exception:  # noqa: BLE001
-                        pass
-                    _dead = not info.process.is_alive()
-                    _ec = info.process.exitcode if _dead else None
-                    if _dead and _ec is not None and _ec not in (0, -signal.SIGTERM):
-                        if _ec < 0:
-                            _sig = -_ec
-                            try:
-                                _signame = signal.Signals(_sig).name
-                            except ValueError:
-                                _signame = f"signal {_sig}"
-                            _hint = ("OOM / RSS-kill / external" if _sig == signal.SIGKILL
-                                     else "native crash (C extension)"
-                                     if _sig in (signal.SIGSEGV, signal.SIGABRT,
-                                                 signal.SIGBUS, signal.SIGFPE)
-                                     else "")
-                            logger.error(
-                                "[Guardian] Module '%s' DIED by signal %d (%s) "
-                                "[exitcode=%d]%s — restart ctx: %s",
-                                name, _sig, _signame, _ec,
-                                f" -> {_hint}" if _hint else "", reason)
-                        else:
-                            logger.error(
-                                "[Guardian] Module '%s' DIED — exited code %d "
-                                "(Python sys.exit / uncaught) — restart ctx: %s",
-                                name, _ec, reason)
-                    elif _dead and _ec is None and _death_ctx:
-                        # Zombie reaped by the subreaper before us → exit code
-                        # lost. Still record the death; for a catchable signal
-                        # the faulthandler traceback above carries the crash site.
-                        logger.error(
-                            "[Guardian] Module '%s' DIED — exit code unavailable "
-                            "(reaped before orchestrator; see any faulthandler "
-                            "traceback above for the crash site) — restart ctx: %s",
-                            name, reason)
-            except Exception:  # noqa: BLE001
-                pass
-
             logger.info("[Guardian] Stopping module '%s' (reason: %s, save_first=%s)",
                         name, reason, save_first)
 
@@ -2555,24 +2501,6 @@ def _module_wrapper(entry_fn: Callable, name: str, recv_queue, send_queue,
         from titan_hcl.core.worker_lifecycle import set_proc_name
         set_proc_name(name)
     except Exception:  # noqa: BLE001 — identity is best-effort, never fatal
-        pass
-
-    # ── Native-crash visibility (SPEC §11.I.4 error cascade) ──
-    # The @with_error_envelope cascade only catches Python EXCEPTIONS. A fatal
-    # NATIVE signal (SIGSEGV/SIGABRT/SIGBUS/SIGFPE — e.g. a crash deep in a
-    # torch/numpy C extension) kills the worker WITHOUT raising an exception,
-    # so the cascade can't fire and the death is otherwise silent (the
-    # Supervisor sees only shm_pid_dead with no cause). faulthandler makes
-    # Python dump the C+Python traceback to stderr → kernel journal on any
-    # catchable fatal signal — closing the native-death gap in the error
-    # cascade. Enabled here (FIRST, before heavy imports) so it covers the
-    # whole worker lifetime. SIGKILL stays uncatchable; its exit code (-9) is
-    # logged by the orchestrator reap path instead.
-    try:
-        import faulthandler as _faulthandler
-        if not _faulthandler.is_enabled():
-            _faulthandler.enable()  # default sink = sys.stderr → journal
-    except Exception:  # noqa: BLE001
         pass
 
     # Configure logging for child process

@@ -95,7 +95,7 @@ def build_coordinator_snapshot(state_refs: dict) -> dict | None:
     pi_monitor = state_refs.get("pi_monitor")
     e_mem = state_refs.get("e_mem")
     prediction_engine = state_refs.get("prediction_engine")
-    ex_mem = state_refs.get("ex_mem")
+    exp_orchestrator = state_refs.get("exp_orchestrator")
     episodic_mem = state_refs.get("episodic_mem")
     working_mem = state_refs.get("working_mem")
     inner_lower_topo = state_refs.get("inner_lower_topo")
@@ -133,10 +133,18 @@ def build_coordinator_snapshot(state_refs: dict) -> dict | None:
         _safe_set(stats, "experiential_memory", e_mem.get_stats)
     if prediction_engine:
         _safe_set(stats, "prediction", prediction_engine.get_stats)
-    if ex_mem:
-        _safe_set(stats, "experience_memory", ex_mem.get_stats)
+    if exp_orchestrator:
+        # §3L Phase 15 chunk 15.1 — experience stats now sourced from the LIVE
+        # ExperienceOrchestrator (incremental action_stats), not the retired
+        # frozen ExperienceMemory.get_stats. In-proc read (cognitive_worker
+        # owns the orchestrator); api reads experience_stats.bin via accessor.
+        _safe_set(stats, "experience_memory",
+                  exp_orchestrator.get_experience_stats_payload)
     if episodic_mem:
-        _safe_set(stats, "episodic_memory", episodic_mem.get_stats)
+        # §3L chunk 15.2 stopgap — mtime-gated (frozen-DB bleed). See
+        # RFP_phase_c_actr_memory_rehoming for the real fix.
+        _safe_set(stats, "episodic_memory",
+                  lambda: _episodic_stats_mtime_gated(episodic_mem))
     if working_mem:
         _safe_set(stats, "working_memory", working_mem.get_stats)
     if inner_lower_topo:
