@@ -3105,7 +3105,7 @@ async def get_v6_polarity_homeostat(
         def _read_events_blocking():
             import sqlite3 as _sqlite3
             cutoff = time.time() - (hours * 3600)
-            conn = _sqlite3.connect(consciousness_db_path, timeout=5)  # noqa: async-block — already offloaded via asyncio.to_thread at the in-loop callsite (L3126); this is the no-loop sync fallback
+            conn = _sqlite3.connect(consciousness_db_path, timeout=5)
             try:
                 conn.execute("PRAGMA query_only=1")
                 conn.row_factory = _sqlite3.Row
@@ -11056,13 +11056,7 @@ def _get_cached_tc():
     now = _time.time()
     if _tc_cache["instance"] is None or (now - _tc_cache["created_at"]) > _TC_CACHE_TTL:
         from titan_hcl.logic.timechain import TimeChain
-        # auto_sidechain=False: this is the read-only query instance (the worker
-        # owns the write instance). It never adds blocks, so it must not pay the
-        # O(all-blocks) tag-count scan in _load_fork_state — that scan only feeds
-        # auto-sidechain creation and measured ~34% of one core here every 60s
-        # TTL rebuild (PROFILING.md 2026-05-30).
-        _tc_cache["instance"] = TimeChain(
-            data_dir="data/timechain", titan_id="T1", auto_sidechain=False)
+        _tc_cache["instance"] = TimeChain(data_dir="data/timechain", titan_id="T1")
         _tc_cache["created_at"] = now
     return _tc_cache["instance"]
 

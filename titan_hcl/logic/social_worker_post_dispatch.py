@@ -580,19 +580,6 @@ class PostDispatchOrchestrator:
                 ctx, consumer=dq_consumer, bus=self._bus_publish)
             if err is not None:
                 result = err
-            elif desc is not None and desc.post_type == "amplify":
-                # AMPLIFY = native retweet, no LLM compose (Maker 2026-05-30).
-                _arc = getattr(ctx, "archetype_candidate", None)
-                _meta = getattr(_arc, "metadata", {}) or {}
-                _target = str(_meta.get("retweet_target_id", "") or "")
-                if not _target:
-                    result = ActionResult(status="failed",
-                                          reason="amplify_no_target")
-                else:
-                    result = self._gateway.retweet(
-                        _target, ctx, consumer=dq_consumer,
-                        author=str(_meta.get("author", "") or ""),
-                        source_id=str(_meta.get("amplify_source_id", "") or ""))
             else:
                 ctx.composed_text = self._compose_post_text(desc)
                 if not ctx.composed_text:
@@ -1005,23 +992,6 @@ class PostDispatchOrchestrator:
                     force_ungrounded=force_ungrounded)
                 if err is not None:
                     result = err
-                elif desc is not None and desc.post_type == "amplify":
-                    # AMPLIFY = native retweet, no LLM compose (Maker
-                    # 2026-05-30). The dispatcher picked the amplify archetype;
-                    # short-circuit to a retweet of the target post. The action
-                    # row written by gateway.retweet() feeds the per-author
-                    # cooldown + amplify dedup.
-                    _arc = getattr(ctx, "archetype_candidate", None)
-                    _meta = getattr(_arc, "metadata", {}) or {}
-                    _target = str(_meta.get("retweet_target_id", "") or "")
-                    if not _target:
-                        result = ActionResult(status="failed",
-                                              reason="amplify_no_target")
-                    else:
-                        result = self._gateway.retweet(
-                            _target, ctx, consumer=self._worker_name,
-                            author=str(_meta.get("author", "") or ""),
-                            source_id=str(_meta.get("amplify_source_id", "") or ""))
                 else:
                     ctx.composed_text = self._compose_post_text(desc)
                     if not ctx.composed_text:

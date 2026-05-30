@@ -97,8 +97,6 @@ _WORKER_READY: bool = False
 # Cadence + lifecycle constants.
 _HEARTBEAT_INTERVAL_S = 10.0            # SPEC §10.B MODULE_HEARTBEAT_INTERVAL_S
 _POLL_INTERVAL_S = 0.2                  # recv loop poll cadence
-_STATE_CHECKPOINT_INTERVAL_S = 300.0   # periodic disk checkpoint — survives an
-#                                        ungraceful crash (loses <= 1 interval)
 _SHM_PUBLISH_INTERVAL_S = 1.0           # life_force_state.bin 1 Hz per SPEC §7.1
 _STATS_NOTIFY_INTERVAL_S = 1.0          # LIFE_FORCE_UPDATED bus notification cadence
 
@@ -463,8 +461,6 @@ def life_force_worker_main(recv_queue, send_queue, name: str,
 
     # === Main recv loop ===
     last_heartbeat = time.time()
-    last_state_checkpoint = time.time()  # first checkpoint ~5min after boot
-    _ckpt_thread = [None]                 # single-slot non-blocking writer
     while True:
         now = time.time()
         if now - last_heartbeat > _HEARTBEAT_INTERVAL_S:
@@ -478,30 +474,6 @@ def life_force_worker_main(recv_queue, send_queue, name: str,
             _send_heartbeat(send_queue, name, extra=stats_extra,
                             state_writer=_state_writer)
             last_heartbeat = now
-
-        # ── Periodic disk checkpoint (survives ANY crash) ──
-        # _save_persisted is otherwise only called on SAVE_NOW (graceful) /
-        # clean exit, so an ungraceful death (shm_pid_dead / SIGKILL / SIGSEGV)
-        # loses all chi-state since the last graceful save — life_force_state.json
-        # was observed frozen ~2 days fleet-wide. Time-gated so any crash loses
-        # at most one interval. Runs at the loop top (every iteration), so it
-        # fires regardless of inbound traffic (no except-Empty trap). NON-BLOCKING:
-        # offloaded to a single-slot daemon thread so the disk write never stalls
-        # the heartbeat under IO/swap pressure (would trip a false shm_pid_dead).
-        if (now - last_state_checkpoint > _STATE_CHECKPOINT_INTERVAL_S
-                and (_ckpt_thread[0] is None or not _ckpt_thread[0].is_alive())):
-            last_state_checkpoint = now
-
-            def _do_ckpt():
-                try:
-                    _save_persisted(engine)
-                except Exception as _ckpt_err:  # noqa: BLE001
-                    logger.warning(
-                        "[LifeForceWorker] periodic checkpoint failed: %s",
-                        _ckpt_err)
-            _ckpt_thread[0] = threading.Thread(
-                target=_do_ckpt, daemon=True, name="life_force-checkpoint")
-            _ckpt_thread[0].start()
 
         try:
             msg = recv_queue.get(timeout=_POLL_INTERVAL_S)

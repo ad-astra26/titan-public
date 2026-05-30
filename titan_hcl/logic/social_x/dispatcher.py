@@ -27,7 +27,6 @@ from .archetypes import (
     ReflectionArchetype,
     ComposedThoughtArchetype,
     SelfWatchingArchetype,
-    AmplifyArchetype,
 )
 from .pool_scoring import record_pending_post, reap_pending
 
@@ -42,7 +41,6 @@ PRIORITY_ORDER = (
     "world_mirror",
     "outer_inner_bridge",
     "outer_rumination",
-    "amplify",
     "grounded_today",
     "composed_thought",
     "practiced_response",
@@ -113,10 +111,6 @@ class ArchetypeDispatcher:
             ),
             "self_watching": SelfWatchingArchetype(
                 **common, inner_memory_db=inner_memory_db,
-            ),
-            "amplify": AmplifyArchetype(
-                **common, events_teacher_db=events_teacher_db,
-                social_graph_db=social_graph_db,
             ),
         }
 

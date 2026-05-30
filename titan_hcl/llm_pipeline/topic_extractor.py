@@ -110,7 +110,7 @@ def _load_topics() -> list[str]:
         # read-only open (uri=true) — extractor must never lock the
         # writer (knowledge_worker). sqlite handles concurrent reads
         # cleanly under WAL.
-        conn = sqlite3.connect(  # noqa: async-block — TTL-gated topic-cache refresh (rare); short cached sqlite read
+        conn = sqlite3.connect(
             f"file:{_db_path}?mode=ro", uri=True, timeout=2.0)
         try:
             cur = conn.execute("SELECT topic FROM knowledge_concepts")
