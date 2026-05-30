@@ -108,7 +108,6 @@ Environment=TITAN_KERNEL_LOG_LEVEL=info
 Environment=TITAN_DAEMON_BINARY_DIR={bin_dir}
 Environment=PYTHONPATH={root}/scripts:{root}
 Environment=PYTHONUNBUFFERED=1
-Environment=PYTHONFAULTHANDLER=1
 Environment=PYTHON={venv_py}
 
 # Idempotent cleanup before each start (and after each stop).
