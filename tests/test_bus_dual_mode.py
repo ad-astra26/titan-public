@@ -84,14 +84,32 @@ def test_divinebus_default_has_no_broker():
 
 
 def test_is_kernel_internal_known_names():
-    """Every kernel-internal name in the canonical allowlist returns True."""
+    """Every kernel-internal name in the canonical allowlist returns True.
+
+    NOTE: "meditation" + "sovereignty" were REMOVED from the allowlist by
+    Phase 10K (rFP §3G; D-SPEC-57/60/64) — they became separate worker
+    subprocesses with their own BusSocketClient primary names, so no
+    kernel-side subscriber uses those names anymore. See the negative
+    assertion in test_is_kernel_internal_retired_names below.
+    """
     from titan_hcl.bus import _is_kernel_internal
     for name in [
-        "guardian", "core", "meditation", "sovereignty", "kernel",
+        "guardian", "core", "kernel",
         "agency", "chat_handler", "v4_bridge",
         "state_register", "rl_proxy_stats", "api",
     ]:
         assert _is_kernel_internal(name), f"{name} should be kernel-internal"
+
+
+def test_is_kernel_internal_retired_names():
+    """meditation + sovereignty are NO LONGER kernel-internal — they're
+    standalone worker subprocesses (Phase 10K rFP §3G / D-SPEC-57/60/64).
+    Locks in the retirement so a future refactor can't silently re-add them."""
+    from titan_hcl.bus import _is_kernel_internal
+    for name in ["meditation", "sovereignty"]:
+        assert not _is_kernel_internal(name), (
+            f"{name} was retired from the kernel-internal allowlist "
+            "(now a separate worker subprocess) — must return False")
 
 
 def test_is_kernel_internal_proxy_suffix():

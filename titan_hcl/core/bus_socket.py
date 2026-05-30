@@ -561,6 +561,14 @@ class BusSocketClient:
         # locally + re-fire on every reconnect alongside topics.
         self._aliases: set[str] = set()
         self._aliases_lock = threading.Lock()
+        # Set right after the primary BUS_SUBSCRIBE (with topics) is sent on
+        # the current connection; cleared on disconnect. subscribe_alias()
+        # gates its immediate send on this so an alias frame can never be the
+        # FIRST BUS_SUBSCRIBE the broker sees on a connection — otherwise the
+        # broker promotes the alias name to primary with empty topics and
+        # WARN-spams every dst="all" broadcast until the primary subscribe
+        # lands (BUG-BROKER-ORPHAN-SUB-WARN-FROM-ALIAS-REGISTRATION-20260526).
+        self._primary_subscribed = threading.Event()
         self._reconnect_count = 0
         # SPEC §8.0.ter outbound buffer — canonical write path
         # (rFP_bus_socket_outbound_writer_thread.md, 2026-05-14, v1.6.0).
@@ -725,7 +733,21 @@ class BusSocketClient:
             return
         with self._aliases_lock:
             self._aliases.add(alias_name)
-        self._send_alias_subscribe_frame(alias_name)
+        # Only send the alias frame NOW if the primary BUS_SUBSCRIBE (with
+        # topics) has already gone out on the current connection. At boot the
+        # connection is still establishing (client.start() connects async) and
+        # callers invoke this synchronously right after — sending now would
+        # buffer the alias frame into the FIFO _outbound_buffer AHEAD of the
+        # connect sequence's primary subscribe (connection_loop), so the broker
+        # would promote this alias to primary with empty topics + reply_only=
+        # false and WARN-drop every broadcast until the primary lands. Instead
+        # we register in self._aliases above; the connect sequence fires the
+        # primary subscribe FIRST then one alias frame per self._aliases entry,
+        # guaranteeing alias-after-primary ordering. Runtime alias adds (post
+        # primary subscribe) still send immediately.
+        # (BUG-BROKER-ORPHAN-SUB-WARN-FROM-ALIAS-REGISTRATION-20260526.)
+        if self._primary_subscribed.is_set():
+            self._send_alias_subscribe_frame(alias_name)
 
     def _send_alias_subscribe_frame(self, alias_name: str) -> None:
         """Send a BUS_SUBSCRIBE frame with payload.name=<alias_name>. Empty
@@ -1002,6 +1024,10 @@ class BusSocketClient:
                 with self._topics_lock:
                     topics = list(self._topics)
                 self._send_subscribe_frame(topics)
+                # Primary subscribe is now on the wire for this connection —
+                # alias frames sent from here on (the loop below + any runtime
+                # subscribe_alias) correctly land AFTER it on the broker.
+                self._primary_subscribed.set()
                 # SPEC §8.2 v1.3.0 — re-publish alias subscriptions too.
                 # Without this, the post-reconnect broker subscriber loses
                 # the multi-name alias entries while the zombie subscriber
@@ -1059,6 +1085,9 @@ class BusSocketClient:
                 logger.debug("[bus_client] connection attempt failed: %s", e)
             finally:
                 self._connected_event.clear()
+                # Next connection must re-send the primary subscribe before any
+                # alias frame — re-arm the gate so subscribe_alias defers again.
+                self._primary_subscribed.clear()
                 with self._sock_lock:
                     if self._sock is sock:
                         self._sock = None
