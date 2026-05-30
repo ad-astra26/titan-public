@@ -235,6 +235,22 @@ def _load_meta_teacher_llm_ctx(full_config: dict):
         api_cfg = full_config.get("api", {}) or {}
         internal_key = api_cfg.get("internal_key", "") or ""
         if not internal_key:
+            # The worker's spawned `config` may not carry the [api] section
+            # (module configs are partial). Fall back to the canonical merged
+            # config (config.toml + ~/.titan/secrets.toml) — the key IS there.
+            # Without this the meta-teacher's LLM critique silently noops:
+            # every critique returns default score=0.50, reward_w=0, 0 primitives
+            # (llm_ok=False) — i.e. the teacher "runs" but teaches nothing.
+            try:
+                from titan_hcl.config_loader import load_titan_config
+                _canon_api = load_titan_config().get("api", {}) or {}
+                internal_key = _canon_api.get("internal_key", "") or ""
+                if internal_key:
+                    api_cfg = _canon_api
+            except Exception as _ck_err:
+                logger.warning(
+                    "[MetaTeacher] canonical config load failed: %s", _ck_err)
+        if not internal_key:
             logger.warning(
                 "[MetaTeacher] No api.internal_key — LLM calls will noop")
             return None, None, None
