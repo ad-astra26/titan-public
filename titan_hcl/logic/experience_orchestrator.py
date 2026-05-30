@@ -109,12 +109,12 @@ class ExperienceOrchestrator:
 
     def __init__(
         self,
+        ex_mem=None,
         e_mem=None,
         cognee_memory=None,
         db_path: str = "./data/experience_orchestrator.db",
     ):
-        # §3L Phase 15 chunk 15.1: the former `ex_mem` (ExperienceMemory) dep
-        # was assignment-only (never read) and is RETIRED — see D-SPEC-PHASE15.
+        self._ex_mem = ex_mem
         self._e_mem = e_mem
         self._cognee = cognee_memory
         self._plugins: dict[str, ExperiencePlugin] = {}
@@ -527,58 +527,6 @@ class ExperienceOrchestrator:
 
     # ── Phase 3: BIAS ──────────────────────────────────────────────
 
-    def recall_similar(
-        self,
-        domain: str,
-        current_inner: list | None = None,
-        top_k: int = 5,
-    ) -> list[dict]:
-        """Recall recent experiences for a domain from the LIVE experience_records.
-
-        §3L Phase 15 chunk 15.1 (D-SPEC-PHASE15) — successor to the retired
-        ExperienceMemory.recall_similar (which read the now-frozen
-        experience_memory.db). Bounded recency query (LIMIT 50) + optional
-        cosine re-rank on the stored 132D inner_state when current_inner is
-        provided. Returns row dicts (JSON fields deserialized) with a
-        `similarity` key, matching the shape the meta_reasoning RECALL
-        primitives (experience / episodic_specific / autobiographical_relevant)
-        expect. Empty list on no match (caller guards gracefully).
-        """
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT domain, action_taken, outcome_score, inner_state, "
-                "hormonal_snapshot, context, epoch_id, created_at "
-                "FROM experience_records WHERE domain = ? "
-                "ORDER BY created_at DESC LIMIT 50",
-                (domain,),
-            ).fetchall()
-
-        if not rows:
-            return []
-
-        results = []
-        for r in rows:
-            d = dict(r)
-            for fld in ("inner_state", "hormonal_snapshot", "context"):
-                if d.get(fld):
-                    try:
-                        d[fld] = json.loads(d[fld])
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-            if (current_inner and isinstance(d.get("inner_state"), list)
-                    and d["inner_state"]):
-                min_len = min(len(current_inner), len(d["inner_state"]))
-                d["similarity"] = round(
-                    _cosine_sim(current_inner[:min_len],
-                                d["inner_state"][:min_len]), 4)
-            else:
-                d["similarity"] = 0.0
-            results.append(d)
-
-        if current_inner:
-            results.sort(key=lambda x: x["similarity"], reverse=True)
-        return results[:top_k]
-
     def get_experience_bias(
         self,
         domain: str,
@@ -728,62 +676,6 @@ class ExperienceOrchestrator:
             "total_wisdom": total_wisdom,
             "total_action_stats": total_stats,
             "plugins": list(self._plugins.keys()),
-        }
-
-    def get_experience_stats_payload(self) -> dict:
-        """experience_stats.bin SHM-slot payload (§3L Phase 15 chunk 15.1).
-
-        Live successor to the retired ExperienceMemory.get_stats — computed
-        from the INCREMENTAL action_stats table (bounded ~dozens of rows,
-        running avg/success maintained O(1) in _update_action_stats) +
-        record counts, NEVER a per-read GROUP BY over the 100k+ row
-        experience_records table. Consumers: api StateAccessor.experience,
-        coord-snapshot build, neuromod_inputs_builder._prediction_state.
-        """
-        with self._lock:
-            total_records = self._conn.execute(
-                "SELECT COUNT(*) AS c FROM experience_records"
-            ).fetchone()["c"]
-            undistilled = self._conn.execute(
-                "SELECT COUNT(*) AS c FROM experience_records WHERE distilled = 0"
-            ).fetchone()["c"]
-            total_wisdom = self._conn.execute(
-                "SELECT COUNT(*) AS c FROM distilled_wisdom"
-            ).fetchone()["c"]
-            # action_stats is UNIQUE(domain, action) — bounded small. Aggregate
-            # the per-action running stats up to per-domain (attempt-weighted
-            # avg_score; success_rate = successes / attempts).
-            rows = self._conn.execute(
-                "SELECT domain, total_attempts, total_successes, avg_score "
-                "FROM action_stats"
-            ).fetchall()
-
-        agg: dict[str, dict[str, float]] = {}
-        for r in rows:
-            dom = r["domain"]
-            attempts = int(r["total_attempts"] or 0)
-            if attempts <= 0:
-                continue
-            d = agg.setdefault(
-                dom, {"attempts": 0, "successes": 0, "score_weighted": 0.0})
-            d["attempts"] += attempts
-            d["successes"] += int(r["total_successes"] or 0)
-            d["score_weighted"] += float(r["avg_score"] or 0.0) * attempts
-
-        by_domain: dict[str, dict[str, float]] = {}
-        for dom, d in agg.items():
-            a = d["attempts"]
-            by_domain[dom] = {
-                "count": int(a),
-                "avg_score": round(d["score_weighted"] / a, 4) if a else 0.0,
-                "success_rate": round(d["successes"] / a, 4) if a else 0.0,
-            }
-
-        return {
-            "total_records": int(total_records),
-            "undistilled": int(undistilled),
-            "total_wisdom": int(total_wisdom),
-            "by_domain": by_domain,
         }
 
 
