@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-worker CPU%% + RSS ranking probe (D-SPEC-143 self-identity era).
+"""Per-worker CPU%% + RSS + Swap ranking probe (D-SPEC-143 self-identity era; swap added 2026-05-30 / PROFILING.md).
 
 Runs on the shared VPS. Attributes each process by /proc/<pid>/cwd (T2 vs T3)
 and names it from the INV-PROC-7 setproctitle (`titan_hcl:<name>` in cmdline).
@@ -35,11 +35,16 @@ def _stat_ticks(pid):
     return int(fields[11]) + int(fields[12])  # utime, stime (0-indexed post-comm)
 
 
-def _rss_kb(pid):
+def _mem_kb(pid):
+    """Return (VmRSS, VmSwap) in kB. VmSwap = pages paged out to the HDD swap
+    file — the shared-box swap-pressure signal (PROFILING.md F8)."""
+    rss = swap = 0
     for line in open(f"/proc/{pid}/status"):
         if line.startswith("VmRSS"):
-            return int(line.split()[1])
-    return 0
+            rss = int(line.split()[1])
+        elif line.startswith("VmSwap"):
+            swap = int(line.split()[1])
+    return rss, swap
 
 
 # Pass 1
@@ -52,7 +57,9 @@ for pd in glob.glob("/proc/[0-9]*"):
         nm = _name(pid)
         if nm is None:
             continue
-        procs[pid] = {"name": nm, "t0": _stat_ticks(pid), "rss_kb": _rss_kb(pid)}
+        rss_kb, swap_kb = _mem_kb(pid)
+        procs[pid] = {"name": nm, "t0": _stat_ticks(pid),
+                      "rss_kb": rss_kb, "swap_kb": swap_kb}
     except Exception:
         continue
 
@@ -66,13 +73,16 @@ for pid, p in procs.items():
         cpu = (dt / HZ) / WINDOW * 100.0
         out.append({"pid": int(pid), "worker": p["name"],
                     "cpu_pct": round(cpu, 1),
-                    "rss_mb": round(p["rss_kb"] / 1024, 1)})
+                    "rss_mb": round(p["rss_kb"] / 1024, 1),
+                    "swap_mb": round(p["swap_kb"] / 1024, 1)})
     except Exception:
         continue
 
 out.sort(key=lambda r: r["cpu_pct"], reverse=True)
 total_cpu = round(sum(r["cpu_pct"] for r in out), 1)
 total_rss = round(sum(r["rss_mb"] for r in out), 1)
+total_swap = round(sum(r["swap_mb"] for r in out), 1)
 print(json.dumps({"repo": REPO, "window_s": WINDOW, "n": len(out),
                   "total_cpu_pct": total_cpu, "total_rss_mb": total_rss,
+                  "total_swap_mb": total_swap,
                   "ranked": out}, indent=0))
