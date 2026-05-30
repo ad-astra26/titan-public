@@ -17,7 +17,7 @@ _REPO = Path(__file__).resolve().parents[1]
 # the real titan_hcl package isn't shadowed by scripts/titan_hcl.py).
 sys.path.append(str(_REPO / "scripts"))
 
-from titan_console import backup_config, config_api, host, ops, proxy  # noqa: E402
+from titan_console import alerts, backup_config, config_api, host, ops, proxy  # noqa: E402
 from titan_console.agent import dispatch  # noqa: E402
 from titan_console.context import Context, resolve_titan_id  # noqa: E402
 from titan_console.titan_status import titan_status  # noqa: E402
@@ -375,3 +375,94 @@ def test_offsite_misconfigured_backend(tmp_path):
     secrets.write_text('[backup_offsite]\nenabled = true\nbackend = "ftp"\n')
     rc, msg = ob.run(tmp_path, secrets_path=secrets)
     assert rc == 3 and "unknown backend" in msg
+
+
+# ── alerts (decoupled degraded-health push) ─────────────────────────────────
+
+
+def _alert_ctx(tmp_path, *, up=True, secrets=None):
+    """Context whose run/http simulate a healthy or failed Titan."""
+    def run(argv, **k):
+        if "show" in argv:
+            state = "active\nSubState=running" if up else "failed\nSubState=dead"
+            return 0, f"ActiveState={state}\n", ""
+        if argv and argv[0] == "journalctl":
+            return 0, "boot ok\nOOM-killed worker\n", ""
+        return 0, "", ""
+
+    def http(method, url, **k):
+        return (200, json.dumps({"status": "healthy"}).encode()) if up else (0, b"")
+
+    return _ctx(tmp_path, run=run, http=http, secrets_path=secrets)
+
+
+def test_resolve_telegram_creds_precedence(tmp_path):
+    (tmp_path / "titan_hcl").mkdir()
+    (tmp_path / "titan_hcl" / "config.toml").write_text(
+        '[channels]\ntelegram_bot_token = "CFG_TOK"\n'
+        '[maker_relationship]\nmaker_telegram_id = "111"\n')
+    secrets = tmp_path / "secrets.toml"
+    secrets.write_text('[console]\nalert_chat_id = "999"\n')  # console override wins for chat
+    tok, chat = alerts.resolve_telegram_creds(_ctx(tmp_path, secrets_path=secrets))
+    assert tok == "CFG_TOK"        # from config.toml [channels]
+    assert chat == "999"           # [console] override beats maker_relationship
+
+
+def test_send_telegram_ok_and_fail():
+    class _Resp:
+        def __init__(self, body): self._b = body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return self._b
+
+    sent = alerts.send_telegram("t", "c", "hi",
+                                opener=lambda r, timeout: _Resp(b'{"ok":true}'))
+    assert sent is True
+    bad = alerts.send_telegram("t", "c", "hi",
+                               opener=lambda r, timeout: _Resp(b'{"ok":false}'))
+    assert bad is False
+    assert alerts.send_telegram("", "c", "hi") is False  # missing token
+
+
+def test_health_monitor_edge_triggers_on_down_then_recovery(tmp_path):
+    (tmp_path / "titan_hcl").mkdir()
+    (tmp_path / "titan_hcl" / "config.toml").write_text(
+        '[channels]\ntelegram_bot_token = "TOK"\n'
+        '[maker_relationship]\nmaker_telegram_id = "42"\n')
+    state = {"up": True}
+    pushes = []
+
+    def run(argv, **k):
+        if "show" in argv:
+            s = "active\nSubState=running" if state["up"] else "failed\nSubState=dead"
+            return 0, f"ActiveState={s}\n", ""
+        if argv and argv[0] == "journalctl":
+            return 0, "line\nOOM-killed\n", ""
+        return 0, "", ""
+
+    def http(method, url, **k):
+        return (200, b'{"status":"healthy"}') if state["up"] else (0, b"")
+
+    ctx = _ctx(tmp_path, run=run, http=http)
+    mon = alerts.HealthMonitor(ctx, sender=lambda t, c, txt: pushes.append(txt) or True)
+    mon._last_up = True  # prime baseline (start() would do this)
+
+    assert mon.check_once()["transition"] is None  # steady up → no alert
+    state["up"] = False
+    r = mon.check_once()
+    assert r["transition"] == "down" and r["alert_sent"] is True
+    assert "DOWN" in pushes[-1] and "OOM" in pushes[-1]
+    state["up"] = True
+    r = mon.check_once()
+    assert r["transition"] == "up" and "recovered" in pushes[-1]
+
+
+def test_health_monitor_no_creds_no_crash(tmp_path):
+    ctx = _alert_ctx(tmp_path, up=True)  # no config.toml → no creds
+    mon = alerts.HealthMonitor(ctx)
+    mon._last_up = True
+    # flip down: should report transition but creds False, no exception
+    ctx2 = _alert_ctx(tmp_path, up=False)
+    mon.ctx = ctx2
+    r = mon.check_once()
+    assert r["transition"] == "down" and r["creds"] is False
