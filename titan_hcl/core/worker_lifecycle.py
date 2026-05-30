@@ -146,6 +146,17 @@ def set_proc_name(name: str) -> bool:
     prctl rejected) — logged at DEBUG, never raises. Best-effort identity, not
     load-bearing for correctness.
     """
+    # Leak-attribution probe (flag-gated, no-op unless TITAN_GC_LEAK_PROBE=1).
+    # Wired here because set_proc_name is the universal per-worker self-identity
+    # call (INV-PROC-7) — every spawned worker hits it exactly once at startup,
+    # so one hook covers the whole fleet (optional allowlist narrows it). See
+    # titan_hcl/core/gc_leak_probe.py + PROFILING.md.
+    try:
+        from titan_hcl.core.gc_leak_probe import start_gc_leak_probe
+        start_gc_leak_probe(name)
+    except Exception:
+        pass
+
     try:
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
     except OSError:

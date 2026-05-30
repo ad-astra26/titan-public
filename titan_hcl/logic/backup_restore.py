@@ -58,7 +58,6 @@ from titan_hcl.logic.backup_zk_commit import (
     compute_event_merkle_root,
     parse_zk_memo,
 )
-from titan_hcl.logic.backup_memo_v3 import parse_v3_memo
 
 logger = logging.getLogger(__name__)
 
@@ -289,32 +288,11 @@ async def verify_event_zk_commit(
         raise RuntimeError(
             f"{HALT_ZK_DISCONNECT}: failed to fetch ZK memo for sig={sig!r}: {e}"
         ) from e
-    # v=3 (5J) — the event's zk_commit_tx is the head (PT) memo; its `mrkl=`
-    # carries the event_merkle_root (same role as v=2 `root=`). Chain linkage
-    # (`prev=`) is a Solana signature verified by the on-chain getSignatures
-    # walk (sovereign restore, 5J-3), not by merkle recompute — so here we
-    # verify content integrity only (event_id + event_merkle_root).
-    parsed_v3 = parse_v3_memo(memo_text)
-    if parsed_v3 is not None:
-        if parsed_v3["event_id"] != event.get("event_id"):
-            raise ValueError(
-                f"{HALT_ZK_MEMO_MISMATCH}: v=3 memo event_id={parsed_v3['event_id']!r} "
-                f"≠ manifest event_id={event.get('event_id')!r} at sig={sig!r}"
-            )
-        expected_root_short = recomposed_event_merkle_root[:32]
-        if parsed_v3["mrkl"] != expected_root_short:
-            raise ValueError(
-                f"{HALT_EVENT_MERKLE_MISMATCH}: v=3 memo mrkl={parsed_v3['mrkl']!r} "
-                f"≠ recomposed event_merkle_root[:32]={expected_root_short!r} "
-                f"for event {event.get('event_id')!r}"
-            )
-        return  # v=3 content verified
-
     parsed = parse_zk_memo(memo_text)
     if parsed is None:
         raise ValueError(
             f"{HALT_ZK_MEMO_MISMATCH}: ZK memo for sig={sig!r} did not parse "
-            f"as v=2 or v=3 format (got {memo_text!r})"
+            f"as v=2 format (got {memo_text!r})"
         )
     if parsed["event_id"] != event.get("event_id"):
         raise ValueError(
