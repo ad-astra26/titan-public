@@ -34,6 +34,7 @@ from .observatory import run_observatory_phase
 from .systemd_runner import run_systemd_phase
 from .modes import Mode, spec_for
 from .preflight import Result, summarize
+from .prompts import Prompter, StdinPrompter
 from .ui import HAZE, ANSI, PULSE, GROWTH, METAL, DANGER, cprint, section
 
 
@@ -85,12 +86,14 @@ def venv_pip(install_root: Path) -> Path:
 # ── Phase 2 — Mode confirm + Maker wallet + Solana RPC ─────────────────────
 
 
-def run_mode_phase(state: dict, mode: Mode, *, default: bool) -> list[Result]:
+def run_mode_phase(state: dict, mode: Mode, *, default: bool,
+                   prompter: Prompter) -> list[Result]:
     """Confirm mode + capture Maker wallet + Solana RPC (modes 1/2 only).
 
     The mode itself is chosen earlier (CLI flag, `--default` provisional, or
     the wizard's earlier mode-chooser screen). This phase persists it and
-    captures the per-mode credentials.
+    captures the per-mode credentials. Already-collected creds (CLI flags, a
+    prior resume, or the TUI seeding ``state``) short-circuit the prompts.
     """
     results: list[Result] = []
     spec = spec_for(mode)
@@ -105,19 +108,19 @@ def run_mode_phase(state: dict, mode: Mode, *, default: bool) -> list[Result]:
                                       "--default cannot proceed for mainnet/devnet without a Maker wallet",
                                       "Re-run interactively or set state['maker_wallet'] manually."))
                 return results
-            while True:
-                wallet = prompt_line("Maker wallet (Solana pubkey, base58)")
-                if looks_like_solana_pubkey(wallet):
-                    state["maker_wallet"] = wallet
-                    break
-                print("    that doesn't look like a Solana pubkey (32–44 base58 chars)")
+            wallet = prompter.until(
+                "maker_wallet", "Maker wallet (Solana pubkey, base58)",
+                validate=looks_like_solana_pubkey,
+                hint="that doesn't look like a Solana pubkey (32–44 base58 chars)")
+            state["maker_wallet"] = wallet
         results.append(Result("wallet", "ok", wallet))
 
         rpc = state.setdefault("solana_rpc", "")
         if not rpc:
             default_rpc = ("https://api.mainnet-beta.solana.com" if mode == Mode.MAINNET
                            else "https://api.devnet.solana.com")
-            rpc = prompt_line("Solana RPC URL", default=default_rpc) if not default else default_rpc
+            rpc = (default_rpc if default
+                   else prompter.line("solana_rpc", "Solana RPC URL", default=default_rpc))
             if not rpc.startswith(("http://", "https://")):
                 results.append(Result("rpc", "fail", f"invalid URL: {rpc!r}",
                                       "Must start with http:// or https://"))
@@ -201,11 +204,18 @@ class PhaseDef:
 
 def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
                minimal: bool, skip_genesis: bool, tag: str | None = None,
-               build_rust: bool = False) -> int:
-    """Walk Phases 2→7 (Phase 1 already ran in preflight). Returns exit code."""
+               build_rust: bool = False, prompter: Prompter | None = None) -> int:
+    """Walk Phases 2→7 (Phase 1 already ran in preflight). Returns exit code.
+
+    ``prompter`` injects the input source: the default :class:`StdinPrompter`
+    is the CLI flow; the Textual TUI passes a :class:`ScriptedPrompter` seeded
+    with answers it collected in its branded question screens. The phase bodies
+    are identical either way.
+    """
+    prompter = prompter or StdinPrompter()
     phases: list[tuple[PhaseDef, Callable[[], list[Result]]]] = [
         (PhaseDef("phase_2", "Mode + Maker wallet", "W1.b", None),
-         lambda: run_mode_phase(state, mode, default=default)),
+         lambda: run_mode_phase(state, mode, default=default, prompter=prompter)),
         (PhaseDef("phase_3", "Venv + Python deps", "W1.b", None),
          lambda: run_venv_phase(install_root)),
         (PhaseDef("phase_bin", "Rust daemon binaries", "W1.b", None),
@@ -213,9 +223,9 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
         (PhaseDef("phase_cfg", "Seed config.toml + chat auth key", "W1.f", None),
          lambda: run_config_seed_phase(install_root)),
         (PhaseDef("phase_4", "Inference autodetect", "W1.c", None),
-         lambda: run_inference_phase(default=default, install_root=install_root)),
+         lambda: run_inference_phase(default=default, install_root=install_root, prompter=prompter)),
         (PhaseDef("phase_5", "Comms (Telegram / X / Observatory)", "W1.d", None),
-         lambda: run_comms_phase(default=default, state=state)),
+         lambda: run_comms_phase(default=default, state=state, prompter=prompter)),
         (PhaseDef("phase_6", "Genesis ceremony", "W1.b", None),
          lambda: ([Result("genesis", "warn", "--skip-genesis requested.")] if skip_genesis
                   else run_genesis_phase(install_root, mode, venv_python=venv_python(install_root)))),

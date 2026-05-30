@@ -240,36 +240,6 @@ class RebirthBackup:
         # raises after those fixes, that's a real bug to investigate, not a
         # signal to ship the legacy path.
         if self._unified_v2_enabled():
-            # CRITICAL (2026-05-30): the §24 unified_v2 event IS the daily
-            # backup — it must fire ONCE per calendar day, on the 1st
-            # meditation (the documented contract: "Personality → Arweave
-            # (1st meditation of day)", on_meditation_complete docstring).
-            #
-            # Pre-fix, this branch called _run_unified_event_v2 on EVERY
-            # meditation and returned early — the per-tier daily CAS gates
-            # below (line ~305 `today != _last_personality_date`) were
-            # DEAD CODE for the unified_v2 path. run_unified_event ships
-            # whenever the diff is non-empty, so a 2nd meditation-with-
-            # changes the same day shipped a 2nd Arweave backup (observed
-            # 2× / day on T1: 05-29 16:22+17:02, 05-30 02:25+06:25). That
-            # also caused proof_day to find a fresh anchor more than once a
-            # day. Restore the daily gate by claiming the calendar day here
-            # (same CAS pattern + failure-reset as the legacy personality
-            # gate) so the unified event ships exactly once per day.
-            claim_day = False
-            prev_personality_date = self._last_personality_date
-            async with self._get_personality_cas_lock():
-                if today != self._last_personality_date:
-                    self._last_personality_date = today
-                    self._save_backup_state()
-                    claim_day = True
-            if not claim_day:
-                logger.info(
-                    "[Backup] §24 unified_v2: daily backup already done for %s "
-                    "(meditation #%d) — skipping (1st-meditation-of-day gate)",
-                    today, self._meditation_count,
-                )
-                return
             try:
                 shipped = await self._run_unified_event_v2(weekday=weekday)
             except Exception as e:
@@ -281,10 +251,6 @@ class RebirthBackup:
                 )
                 self._alert_backup_failure(
                     "unified_v2", f"pipeline raised: {e}")
-                # Release the claimed day so the next meditation retries
-                # today's backup (matches legacy personality failure-reset).
-                self._last_personality_date = prev_personality_date
-                self._save_backup_state()
                 return
             if shipped:
                 # Pipeline handled this meditation; we're done. ZK epoch
@@ -295,22 +261,16 @@ class RebirthBackup:
                 # ([mainnet_budget].zk_compression_enabled, etc.) and
                 # already early-return when disabled.
                 logger.info(
-                    "[Backup] §24 unified_v2 event shipped — daily backup "
-                    "complete for %s (meditation #%d); no legacy cascade",
-                    today, self._meditation_count,
+                    "[Backup] §24 unified_v2 event shipped — meditation "
+                    "backup complete; no legacy cascade runs",
                 )
                 return
             # shipped == False and no exception raised: unified_v2 declined
-            # to ship (e.g. nothing changed since last event) OR a non-raising
-            # failure (status != "shipped"). Either way today's backup was NOT
-            # produced — RELEASE the claimed day so a later meditation (with
-            # changes / after a transient Arweave hiccup clears) can still land
-            # exactly one backup today.
-            self._last_personality_date = prev_personality_date
-            self._save_backup_state()
+            # to ship (e.g. nothing changed since last event). That's a clean
+            # no-op — return without invoking legacy.
             logger.info(
-                "[Backup] §24 unified_v2 returned shipped=False — releasing "
-                "daily claim for %s; next meditation will retry", today)
+                "[Backup] §24 unified_v2 returned shipped=False — clean "
+                "no-op; no legacy cascade")
             return
 
         # 1. ZK Epoch Snapshot (every meditation) — DISABLED for mainnet MVM

@@ -20,7 +20,6 @@ See: titan-docs/rFP_cgn_cognitive_kernel_v2.md
 import logging
 import os
 import sys
-import threading
 import time
 from queue import Empty
 from titan_hcl.utils.silent_swallow import swallow_warn
@@ -637,7 +636,6 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     # Time-gated (not per-consolidation) to bound torch.save frequency.
     _STATE_CHECKPOINT_INTERVAL_S = 300.0  # 5 min
     _last_state_checkpoint = time.time()  # first checkpoint ~5min after boot
-    _ckpt_thread = [None]                 # single-slot non-blocking writer
 
     def _maybe_export_lexicon_snapshot() -> None:
         nonlocal _last_lexicon_export
@@ -700,30 +698,17 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         regardless of inbound traffic (avoids the recv_queue_except_empty trap).
         This is the robust persistence guarantee: cgn survives an ungraceful
         (shm_pid_dead / SIGKILL) death losing at most one interval, rather than
-        reverting to the last dream-consolidation snapshot.
-
-        NON-BLOCKING: the torch.save() is offloaded to a single-slot daemon
-        thread so a slow disk (swap / IO pressure) never stalls the heartbeat
-        and trips a false shm_pid_dead. The single-slot guard prevents pile-up
-        if a write runs longer than the interval."""
+        reverting to the last dream-consolidation snapshot."""
         nonlocal _last_state_checkpoint
         now_ts = time.time()
         if now_ts - _last_state_checkpoint < _STATE_CHECKPOINT_INTERVAL_S:
             return
-        if _ckpt_thread[0] is not None and _ckpt_thread[0].is_alive():
-            return  # prior checkpoint still writing — skip, retry next tick
         _last_state_checkpoint = now_ts
-
-        def _do_ckpt():
-            try:
-                cgn._save_state()
-            except Exception as _ckpt_err:  # noqa: BLE001
-                logger.warning(
-                    "[CGNWorker] periodic state checkpoint failed: %s",
-                    _ckpt_err)
-        _ckpt_thread[0] = threading.Thread(
-            target=_do_ckpt, daemon=True, name="cgn-checkpoint")
-        _ckpt_thread[0].start()
+        try:
+            cgn._save_state()
+        except Exception as _ckpt_err:  # noqa: BLE001
+            logger.warning(
+                "[CGNWorker] periodic state checkpoint failed: %s", _ckpt_err)
 
     while True:
         # H.3 (2026-04-28): periodic HAOV test pump. Runs at fixed cadence
@@ -1125,18 +1110,8 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             elif action == "get_cross_insights":
                 consumer = payload.get("consumer", "")
                 insights = cgn.get_cross_insights(consumer)
-                # rFP_haov_efficacy_closure §3E (C1→C2/C3 delivery fix, I-003):
-                # the consumers (language_worker:1884, social_worker) listen on
-                # QUERY_RESPONSE keyed by payload.action — NOT the generic RESPONSE
-                # that _send_response emits. Pre-fix the reply type/shape mismatched
-                # the handler, so cross-insights (incl. C1 haov_verified rules) never
-                # arrived — the apply channel was structurally dead. Reply with the
-                # type+shape the async consumers expect.
-                _send_msg(send_queue, bus.QUERY_RESPONSE, name,
-                          msg.get("src", ""),
-                          {"action": "get_cross_insights",
-                           "consumer": consumer, "insights": insights},
-                          msg.get("rid"))
+                _send_response(send_queue, name, msg.get("src", ""),
+                               {"insights": insights}, msg.get("rid"))
 
         # ── MODULE_SHUTDOWN ───────────────────────────────────────
         # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────
