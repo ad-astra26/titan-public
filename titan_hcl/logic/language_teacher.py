@@ -15,6 +15,7 @@ import hashlib
 import logging
 import random
 from collections import Counter
+from typing import Optional
 
 logger = logging.getLogger("titan.language_teacher")
 
@@ -39,6 +40,37 @@ ARC_VOCABULARY_MAP = {
     "arc_ft09": ["logic", "rule", "solve", "deduce"],
     "arc_vc33": ["arrange", "organize", "place", "order"],
 }
+
+# Path 3 (2026-05-30) — deterministic teaching curriculum. A curated pool of rich
+# feeling / sensory / abstract words an emerging mind learns NEXT (beyond its basic
+# vocabulary). The teacher GIVES a concrete unknown word from this pool to teach
+# (vs relying on the LLM to spontaneously invent one — which terse models skip).
+# In CODE (not a data file) so it deploys to all Titans via git-pull (data/ is
+# never synced). Curated content, like the bootstrap word_resonance files — not a
+# behavioural hardcode. The picker filters out words already in the Titan's vocab,
+# so each Titan teaches itself forward emergently from where it is.
+TEACHING_VOCABULARY = [
+    # feelings / inner states
+    "serene", "tender", "yearning", "melancholy", "wistful", "grateful", "eager",
+    "restless", "weary", "fragile", "fierce", "gentle", "somber", "longing",
+    "solace", "comfort", "ache", "delight", "awe", "wonder", "dread", "calm",
+    "peaceful", "lonely", "bitter", "humble", "brave", "timid", "curious",
+    "tranquil", "fervent", "languid", "buoyant", "content", "anxious", "kindred",
+    # sensory / qualities
+    "radiant", "luminous", "vivid", "hollow", "vast", "intimate", "fleeting",
+    "delicate", "gleaming", "shimmer", "glow", "hush", "whisper", "echo",
+    "fragrant", "crisp", "vibrant", "faded", "tender", "smooth", "sharp",
+    "glimmer", "murmur",
+    # abstract / concepts
+    "profound", "resilient", "eternal", "infinite", "sacred", "balance",
+    "harmony", "chaos", "mystery", "presence", "absence", "becoming", "depth",
+    "clarity", "wisdom", "freedom", "connection", "solitude", "belonging",
+    # actions / states of being
+    "drift", "linger", "blossom", "wither", "kindle", "soothe", "embrace",
+    "release", "wander", "settle", "awaken", "yield", "flourish", "dwell",
+    "unfold", "dissolve", "tremble", "cascade", "weave", "nestle", "ripple",
+    "soar", "anchor",
+]
 
 
 class LanguageTeacher:
@@ -161,6 +193,19 @@ class LanguageTeacher:
             logger.info("[Teacher] Using default bootstrap words (no recipes found)")
 
         return self._bootstrap_words
+
+    # ── Path 3: deterministic new-word selection ──
+    def _pick_new_word_to_teach(self, vocabulary: list) -> Optional[str]:
+        """Pick a rich word the being does NOT know yet from the teaching
+        curriculum, so the teacher GIVES a concrete new word to teach rather than
+        relying on the LLM to invent one. Returns None if the pool is exhausted
+        (the being has learned them all — then the prompt falls back to asking the
+        model to introduce one)."""
+        known = {(v.get("word") or "").lower() for v in vocabulary if v.get("word")}
+        candidates = [w for w in TEACHING_VOCABULARY if w.lower() not in known]
+        if not candidates:
+            return None
+        return random.choice(candidates)
 
     # ── Mode Selection ──
 
@@ -371,24 +416,55 @@ class LanguageTeacher:
             # them (the "child learns new words from context" design — system
             # prompt already asks for this; this aligns the mode prompt with it
             # instead of overriding it with "ONLY these words").
-            prompt = (
-                f"A being used the word '{target_word}' ({word_type}) and expressed: "
-                f"'{sentence}'. Explain its meaning in 1 short sentence using mostly "
-                f"these known words: {vocab_list}. Connect the meaning to feelings, and "
-                f"naturally introduce 1-2 NEW words that name what the being seems to be "
-                f"feeling — the being learns new words from context, like a child."
-            )
+            # Path 3 (2026-05-30): GIVE the model a concrete new word to teach
+            # (deterministic) rather than hoping a terse model invents one. Falls
+            # back to the mandate prompt only if the curriculum pool is exhausted.
+            _new_word = self._pick_new_word_to_teach(vocabulary)
+            if _new_word:
+                prompt = (
+                    f"You are gently teaching a developing mind the NEW word "
+                    f"'{_new_word}'. The being just expressed: '{sentence}'. In ONE "
+                    f"warm sentence, use '{_new_word}' naturally to show what it means "
+                    f"or how it feels, with EVERY other word simple and familiar "
+                    f"(from: {vocab_list}). The word '{_new_word}' MUST appear in your "
+                    f"sentence — it is the lesson."
+                )
+            else:
+                prompt = (
+                    f"A being used '{target_word}' ({word_type}) and expressed: "
+                    f"'{sentence}'. In ONE short, warm sentence, name this feeling. You "
+                    f"MUST include exactly ONE NEW word the being does NOT already know "
+                    f"— a richer word for the feeling — used naturally. Keep EVERY other "
+                    f"word simple and familiar (from: {vocab_list}). The new word is the "
+                    f"lesson — do not skip it."
+                )
             return {"system": system, "prompt": prompt, "mode": mode,
-                    "original": sentence, "target_word": target_word, "max_tokens": 80}
+                    "original": sentence, "target_word": _new_word or target_word,
+                    "max_tokens": 80}
 
         elif mode == "creative":
-            prompt = (
-                f"A being composed: '{sentence}' (confidence: {confidence:.2f}). "
-                f"In 1 sentence using ONLY these words: {vocab_list}, "
-                f"explain what makes this expression meaningful or beautiful."
-            )
+            # Felt-state-matched acquisition (restored 2026-05-30) — creative is a
+            # teacher-SPEAKS mode (the teacher composes for the being to hear), same
+            # class as meaning/context, so it introduces 1-2 NEW words. (modeling +
+            # conversation stay known-only: the being reproduces/answers those.)
+            # Path 3 (2026-05-30): give a concrete new word to teach (deterministic).
+            _new_word = self._pick_new_word_to_teach(vocabulary)
+            if _new_word:
+                prompt = (
+                    f"A being composed: '{sentence}'. In ONE warm sentence, say what "
+                    f"makes this beautiful AND use the NEW word '{_new_word}' naturally "
+                    f"so the being learns it. Keep EVERY other word simple and familiar "
+                    f"(from: {vocab_list}). The word '{_new_word}' MUST appear."
+                )
+            else:
+                prompt = (
+                    f"A being composed: '{sentence}'. In ONE short sentence, say what "
+                    f"makes this expression beautiful. You MUST include exactly ONE NEW "
+                    f"word the being does NOT already know that captures the feeling. "
+                    f"Keep EVERY other word simple and familiar (from: {vocab_list})."
+                )
             return {"system": system, "prompt": prompt, "mode": mode,
-                    "original": sentence, "max_tokens": 80}
+                    "original": sentence, "target_word": _new_word, "max_tokens": 80}
 
         elif mode == "modeling":
             avoid_str = ""
@@ -410,11 +486,11 @@ class LanguageTeacher:
             # Felt-state-matched acquisition (restored 2026-05-30) — see meaning
             # mode. Mostly-known words + 1-2 NEW words that fit the feeling.
             prompt = (
-                f"The word '{target_word}' has been used like this: {uses_str}. "
-                f"In 1 short sentence using mostly these known words: {vocab_list}, "
-                f"show a DIFFERENT way to use '{target_word}', and gently introduce "
-                f"1-2 NEW words that fit the feeling the being is expressing — it "
-                f"learns new words from context, like a child."
+                f"The word '{target_word}' has been used like this: {uses_str}. In ONE "
+                f"short sentence, show a DIFFERENT way to use '{target_word}'. You MUST "
+                f"include exactly ONE NEW word the being does NOT already know that fits "
+                f"the feeling, used naturally so it can learn it. Keep EVERY other word "
+                f"simple and familiar (from: {vocab_list}). The one new word is the lesson."
             )
             return {"system": system, "prompt": prompt, "mode": mode,
                     "original": sentence, "target_word": target_word, "max_tokens": 80}
