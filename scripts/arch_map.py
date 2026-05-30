@@ -363,7 +363,7 @@ class TitanASTVisitor(ast.NodeVisitor):
                 "neural_nervous_system", "neuromodulator_system",
                 "dreaming_engine", "consciousness", "expression_manager",
                 "composition_engine", "prediction_engine", "working_mem",
-                "ex_mem", "episodic_mem", "pi_monitor", "chi",
+                "exp_orchestrator", "episodic_mem", "pi_monitor", "chi",
             }
             if obj_name in key_objects or obj_name.startswith("self."):
                 # Determine read vs write
