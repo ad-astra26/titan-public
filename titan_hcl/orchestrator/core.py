@@ -869,9 +869,7 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                         _info = self._modules.get(_src)
                         if _info is not None:
                             _info.last_heartbeat = time.time()
-                            _rss = m.get("payload", {}).get("rss_mb", 0)
-                            if _rss:
-                                _info.rss_mb = _rss
+                            self._ingest_hb_self_metrics(_info, m.get("payload", {}))
                             inline_processed += 1
                         continue  # don't stash; consumed inline
                     # Other types (rare during SAVE_NOW): stash for re-publish
@@ -2106,10 +2104,8 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 info = self._modules.get(src)
                 if info:
                     info.last_heartbeat = time.time()
-                    # Update RSS from heartbeat payload if provided
-                    rss = msg.get("payload", {}).get("rss_mb", 0)
-                    if rss:
-                        info.rss_mb = rss
+                    # SPEC §1339 — ingest self-measured {rss_mb, pid, cpu_delta_s}
+                    self._ingest_hb_self_metrics(info, msg.get("payload", {}))
 
             elif msg_type == BUS_PEER_DIED:
                 # Phase B.2 §D9 (2026-05-02) — broker detected peer process
@@ -2274,6 +2270,36 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
             pass
         return 0.0
 
+    def _ingest_hb_self_metrics(self, info, payload: dict) -> None:
+        """Ingest SPEC §1339 MODULE_HEARTBEAT self-metrics → ModuleInfo.
+
+        Payload carries `{rss_mb, pid, cpu_delta_s}` self-measured by the worker
+        (stamped at BusSocketClient.publish). Shared by the inline (SAVE_NOW)
+        and monitor_tick heartbeat handlers so consumption is identical. These
+        feed guardian_state.bin (§7.1) via GuardianStatePublisher.
+
+        In the guardian_hcl supervisor's metadata-only orchestrator (which never
+        spawns/adopts, so pid + state default empty), the heartbeat is the ONLY
+        source of pid + liveness: a live heartbeat from a module believed
+        STOPPED reconciles it to RUNNING (the supervisor's liveness view IS
+        heartbeat-driven). Only STOPPED→RUNNING is reconciled here — a genuinely
+        stopped module emits no heartbeats; STARTING/CRASHED/DISABLED stay owned
+        by the spawn state machine.
+        """
+        if not isinstance(payload, dict):
+            return
+        rss = payload.get("rss_mb", 0)
+        if rss:
+            info.rss_mb = rss
+        pid = payload.get("pid", 0)
+        if pid:
+            info.pid = pid
+        cpu_delta = payload.get("cpu_delta_s", None)
+        if cpu_delta is not None:
+            info.cpu_delta_s = cpu_delta
+        if info.state == ModuleState.STOPPED:
+            info.state = ModuleState.RUNNING
+
     def get_status(self) -> dict:
         """Return a dict of module statuses for the Observatory API."""
         result = {}
@@ -2282,6 +2308,7 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
                 "state": info.state.value,
                 "pid": info.pid,
                 "rss_mb": round(info.rss_mb, 1),
+                "cpu_delta_s": round(info.cpu_delta_s, 3),  # SPEC §1339 per-interval CPU seconds
                 "uptime": round(time.time() - info.start_time, 1) if info.start_time else 0,
                 "restart_count": info.restart_count,
                 "restarts_in_window": len(info.restart_timestamps),
