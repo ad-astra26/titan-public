@@ -36,6 +36,37 @@ logger = logging.getLogger(__name__)
 # may bypass via `bypass_spacing=True` on their candidate.
 DEFAULT_CROSS_ARCHETYPE_SPACING_S = 4 * 3600
 
+# Outer-world engagement archetypes — those that publicly reference / engage a
+# specific external account. They share a single per-AUTHOR cooldown so one
+# account (especially a large one like @lopp) is never reflected on / amplified
+# more than once per cooldown window across ANY of these archetypes. Maker rule
+# 2026-05-30: "we cannot have <big account> notified for days talking about the
+# same post — makes zero sense / unprofessional."
+OUTER_ENGAGEMENT_POST_TYPES = (
+    "world_mirror", "outer_inner_bridge", "outer_rumination", "amplify",
+)
+DEFAULT_AUTHOR_COOLDOWN_S = 7 * 86400  # ≥ 1 week per Maker
+
+
+def ensure_handle_mention(text: str, handle: str) -> str:
+    """Guarantee the cited account's literal @handle is present in `text`.
+
+    The LLM routinely references an account by display name and drops the '@'
+    ("Lopp's warning..."), which does NOT notify the person on X. If the
+    @handle (case-insensitive, word-boundary) is missing, prepend it so the
+    mention is real and the account is notified. No-op when handle is empty or
+    already present. (Maker 2026-05-30.)
+    """
+    if not text or not handle:
+        return text
+    import re
+    h = handle.lstrip("@").strip()
+    if not h:
+        return text
+    if re.search(r"@" + re.escape(h) + r"\b", text, re.IGNORECASE):
+        return text
+    return f"@{h} {text}"
+
 
 @dataclass(slots=True)
 class ArchetypeCandidate:
@@ -166,6 +197,61 @@ class ArchetypeBase:
             if sid:
                 out.add(str(sid))
         return out
+
+    def authors_on_cooldown(
+        self,
+        *,
+        titan_id: str,
+        now: float | None = None,
+        window_seconds: float = DEFAULT_AUTHOR_COOLDOWN_S,
+    ) -> set[str]:
+        """Lowercased handles engaged by ANY outer-engagement archetype within
+        the cooldown window (cross-archetype per-author dedup, Maker 2026-05-30).
+
+        Checks BOTH `metadata.author` (world_mirror, outer_inner_bridge,
+        amplify) and `metadata.handle` (outer_rumination) since the archetypes
+        historically used different metadata keys for the cited account.
+        """
+        cutoff = (now if now is not None else time.time()) - window_seconds
+        placeholders = ",".join("?" * len(OUTER_ENGAGEMENT_POST_TYPES))
+        conn = self._conn()
+        try:
+            rows = conn.execute(
+                f"SELECT metadata FROM actions WHERE titan_id=? "
+                f"AND post_type IN ({placeholders}) "
+                f"AND status NOT IN ('failed','error') "
+                f"AND created_at >= ?",
+                (titan_id, *OUTER_ENGAGEMENT_POST_TYPES, cutoff),
+            ).fetchall()
+        except Exception:
+            return set()
+        finally:
+            conn.close()
+        out: set[str] = set()
+        for r in rows:
+            try:
+                m = json.loads(r["metadata"] or "{}")
+            except Exception:
+                continue
+            for key in ("author", "handle"):
+                v = m.get(key)
+                if v:
+                    out.add(str(v).lower())
+        return out
+
+    def author_on_cooldown(
+        self,
+        author: str,
+        *,
+        titan_id: str,
+        now: float | None = None,
+        window_seconds: float = DEFAULT_AUTHOR_COOLDOWN_S,
+    ) -> bool:
+        """True if `author` was engaged by any outer archetype within window."""
+        if not author:
+            return False
+        return str(author).lower() in self.authors_on_cooldown(
+            titan_id=titan_id, now=now, window_seconds=window_seconds)
 
     def cross_archetype_blocked(
         self,

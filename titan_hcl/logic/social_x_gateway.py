@@ -241,6 +241,14 @@ class SocialXGateway:
         self._output_verifier = None
         # Verified Context Builder (set externally via set_context_builder)
         self._context_builder = None
+        # C3 (rFP_haov_efficacy_closure §3E): language's verified HAOV concepts,
+        # refreshed externally by social_worker via set_verified_haov_concepts()
+        # (pulled from cgn.get_cross_insights("social") → source="haov_verified"
+        # entries). Biases engagement toward conversations touching a concept the
+        # agent has CONFIRMED it understands. Empty until a concept-grounding rule
+        # crystallizes (today's verified rules are all impasse-type), so the bias
+        # is 0 and live behaviour is unchanged — interface-complete per the design.
+        self._verified_haov_concepts: list[dict] = []
         # Metabolism gate callable (set externally via set_metabolism_gate).
         # Mainnet Lifecycle Wiring rFP (2026-04-20). Signature:
         #   (feature: str, caller: str) -> (should_proceed: bool, rate: float)
@@ -356,6 +364,39 @@ class SocialXGateway:
     def set_output_verifier(self, verifier) -> None:
         """Inject OutputVerifier for security gating of posts/replies."""
         self._output_verifier = verifier
+
+    def set_verified_haov_concepts(self, concepts: list) -> None:
+        """C3 (rFP_haov_efficacy_closure §3E) — refresh language's verified HAOV
+        concepts (from cgn.get_cross_insights("social") source="haov_verified").
+        social_worker calls this on each cross-insights QUERY_RESPONSE. Bounded
+        cache; empty list clears the bias."""
+        self._verified_haov_concepts = list(concepts or [])[:16]
+
+    @staticmethod
+    def _verified_concept_engage_bias(concepts: list, text: str) -> float:
+        """C3 — bounded engage-bias in [0, 0.2] when `text` mentions a concept
+        the agent has CONFIRMED via HAOV (other consumers' verified rules).
+
+        Pure + side-effect-free. Returns 0.0 when there are no verified concepts
+        (the current fleet state — all verified rules are impasse-type, filtered
+        out upstream) or no textual overlap, so it cannot perturb the live reply
+        gate until concept-grounding rules actually exist. Bias = max matched
+        confidence × 0.2 cap (engage toward what you understand)."""
+        if not concepts or not text:
+            return 0.0
+        tl = text.lower()
+        best = 0.0
+        for c in concepts:
+            # Derive a teachable token from the verified rule; skip impasse rules.
+            effect = str(c.get("effect", ""))
+            if effect.startswith("resolve_"):
+                continue
+            rule = str(c.get("rule", ""))
+            tok = (rule.split("_", 1)[-1] if "_" in rule else rule).replace(
+                "arc_", "").replace("pattern_", "").replace("_", " ").strip()
+            if len(tok) >= 3 and tok in tl:
+                best = max(best, float(c.get("confidence", 0.0)))
+        return round(min(0.2, best * 0.2), 4)
 
     def set_context_builder(self, vcb) -> None:
         """Inject VerifiedContextBuilder for memory-enriched replies."""
@@ -2993,9 +3034,45 @@ class SocialXGateway:
         catalyst = descriptor.catalyst
         voice_cfg = descriptor.voice_cfg
 
+        # 6c. Archetype-only hard guard (Maker 2026-05-30, defense-in-depth):
+        # EVERY X post MUST come from a registered archetype. _select_post_type
+        # already returns only archetype names (the legacy FELT_STATE_POOL
+        # fallback was deleted 2026-05-23), but this guard makes it impossible
+        # for any future / alternate code path to transport a non-archetype
+        # post — the post_type must be in the registered set. Refuse loudly
+        # rather than silently broadcasting an ungoverned post.
+        from titan_hcl.logic.social_x.archetypes import ARCHETYPE_POST_TYPES
+        if post_type not in ARCHETYPE_POST_TYPES:
+            self._log_telemetry({
+                "event": "post_rejected_non_archetype",
+                "post_type": post_type, "titan_id": context.titan_id,
+                "consumer": consumer,
+            })
+            logger.error(
+                "[SocialXGateway] REFUSED non-archetype post (post_type=%r) — "
+                "only registered archetypes may post to X (Maker rule)",
+                post_type)
+            return ActionResult(
+                status="non_archetype_rejected",
+                reason=f"post_type {post_type!r} is not a registered archetype")
+
         # 7. Assemble final text from the caller-supplied composition.
         final_text = self._assemble_final_text(
             context.composed_text, post_type, catalyst, context, config)
+
+        # 7b. @handle guarantee (Maker 2026-05-30): outer-engagement
+        # archetypes MUST mention the cited account by its literal @handle so
+        # the person is actually notified on X — the LLM routinely references
+        # them by display name and drops the '@' ("Lopp's warning..."), which
+        # does NOT notify. Prepend the @handle if it's absent from the body.
+        _arc_h = getattr(context, "archetype_candidate", None)
+        if _arc_h is not None and getattr(_arc_h, "archetype", "") in (
+                "world_mirror", "outer_inner_bridge", "outer_rumination"):
+            from titan_hcl.logic.social_x.archetypes.base import (
+                ensure_handle_mention)
+            _mh = getattr(_arc_h, "metadata", {}) or {}
+            final_text = ensure_handle_mention(
+                final_text, str(_mh.get("author") or _mh.get("handle") or ""))
 
         # 8. Quality gate
         qg_ok, qg_reason = self._quality_gate(final_text, post_type, config)
@@ -3279,12 +3356,20 @@ class SocialXGateway:
 
         # Only apply CGN gate if we have enough training data
         if _cgn_conf > 0.0 and _policy_weight > 0.0:
+            # C3 (rFP_haov_efficacy_closure §3E): engage-bias toward a conversation
+            # touching a HAOV-verified concept (something the agent has confirmed it
+            # understands) — relax the disengage hard-gate by the bounded bias. 0.0
+            # until a concept-grounding verified rule exists → no live change today.
+            _haov_bias = self._verified_concept_engage_bias(
+                self._verified_haov_concepts, context.mention_text or "")
+            _eff_disengage_conf = _cgn_conf - _haov_bias
             # Hard gate: suppress reply if disengage + high confidence + high weight
-            if (_cgn_action == "disengage" and _cgn_conf > 0.6
+            if (_cgn_action == "disengage" and _eff_disengage_conf > 0.6
                     and _policy_weight > 0.4):
                 logger.info("[SocialXGateway] CGN soft gate: disengage "
-                            "(conf=%.2f, weight=%.1f) for @%s",
-                            _cgn_conf, _policy_weight, context.mention_user)
+                            "(conf=%.2f, weight=%.1f, haov_bias=%.2f) for @%s",
+                            _cgn_conf, _policy_weight, _haov_bias,
+                            context.mention_user)
                 return ActionResult(status="cgn_disengage",
                                     reason=f"CGN policy: disengage (conf={_cgn_conf:.2f})")
             # Soft gate: protect → add protective tone
@@ -3644,6 +3729,80 @@ class SocialXGateway:
         self._log_telemetry({"event": "like_success", "tweet_id": tweet_id,
                               "consumer": consumer, "action_id": row_id})
 
+        return ActionResult(status="posted", tweet_id=tweet_id,
+                            action_id=row_id)
+
+    def retweet(self, tweet_id: str, context: BaseContext,
+                consumer: str = "", *, author: str = "",
+                source_id: str = "") -> ActionResult:
+        """Native retweet of a followed account's tweet (Maker 2026-05-30).
+
+        Used by the AMPLIFY archetype to boost a high-relevance post from
+        curated following — adds activity/diversity to Titan's presence
+        without composing text. Mirrors `like()` exactly (WAL row via
+        _insert_pending → _call_x_api → _update_status) so the action is
+        rate-limited, circuit-broken, telemetry-visible, and recorded.
+
+        The WAL row is written with post_type='amplify' + metadata.author +
+        metadata.amplify_source_id so the per-author 7-day cooldown, the
+        amplify dedup, and the per-day cap all see this amplification —
+        without that row, amplify would re-boost the same account every
+        cycle (the exact spam being eliminated). A failed retweet marks the
+        row FAILED, so the cooldown only counts successful amplifications.
+        """
+        config = self._load_config()
+        if not config.get("enabled"):
+            return ActionResult(status="disabled")
+        if self._cb_is_open():
+            return ActionResult(status="circuit_breaker",
+                                reason="API disabled after consecutive failures")
+
+        consumer_result = self._check_consumer(consumer, self.A_POST, config)
+        if consumer_result:
+            return consumer_result
+
+        # Retweets are outward broadcasts — share the post rate budget.
+        limit_result = self._check_rate_limits(
+            self.A_POST, config, titan_id=context.titan_id)
+        if limit_result:
+            return limit_result
+
+        if not tweet_id:
+            return ActionResult(status="failed", reason="No tweet_id")
+
+        try:
+            row_id = self._insert_pending(
+                action_type=self.A_POST,
+                titan_id=context.titan_id,
+                post_type="amplify",
+                metadata=json.dumps({
+                    "archetype": "amplify",
+                    "author": author,
+                    "amplify_source_id": source_id,
+                    "retweet_target_id": str(tweet_id),
+                }, separators=(",", ":"), sort_keys=True),
+                consumer=consumer,
+            )
+        except Exception as e:
+            return ActionResult(status="failed", reason=f"WAL insert: {e}")
+
+        api_result = self._call_x_api(
+            "twitter/retweet_tweet_v2", method="POST",
+            payload={"tweet_id": str(tweet_id)},
+            session=context.session, proxy=context.proxy,
+            api_key=context.api_key,
+        )
+
+        if api_result.get("status") != "success":
+            err = api_result.get("message", str(api_result)[:200])
+            self._update_status(row_id, self.S_FAILED, error_message=err)
+            return ActionResult(status="api_failed", reason=err,
+                                action_id=row_id)
+
+        self._update_status(row_id, self.S_POSTED, tweet_id=tweet_id)
+        self._log_telemetry({"event": "retweet_success", "tweet_id": tweet_id,
+                              "author": author, "consumer": consumer,
+                              "action_id": row_id})
         return ActionResult(status="posted", tweet_id=tweet_id,
                             action_id=row_id)
 
