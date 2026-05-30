@@ -335,79 +335,6 @@ def _init_prediction_engine(config: dict):
         return None
 
 
-# ── G18 state readers (NEUROMOD_STATE + EPOCH_COUNTER) ──────────────────────
-# Phase 3A/3B (rFP_haov_efficacy_closure): the restored coding_explorer.explore()
-# driver + self_reasoning.check_predictions() driver both need live neuromod
-# levels + the consciousness epoch. Per SPEC G18 these are SHM *state* reads —
-# never bus/RPC. Mirrors the meditation_worker NEUROMOD_STATE reader precedent
-# (meditation_worker.py:187) and the ShmReaderBank EPOCH_COUNTER read.
-# NEUROMOD_NAMES axis order matches state_registry.NEUROMOD_STATE (D-SPEC-54):
-# (DA, 5HT, NE, ACh, Endorphin, GABA); field 0 = level.
-_NEUROMOD_NAMES = ("DA", "5HT", "NE", "ACh", "Endorphin", "GABA")
-_NM_FIELD_LEVEL = 0
-
-
-def _init_shm_readers(titan_id: str) -> dict:
-    """Attach NEUROMOD_STATE + EPOCH_COUNTER readers (G18 state reads).
-
-    Best-effort, reattach-tolerant: each slot independently optional; callers
-    degrade to defaults ({} neuromods / epoch 0) and retry next tick.
-    """
-    readers: dict = {"neuromod": None, "epoch": None}
-    try:
-        from titan_hcl.core.state_registry import (
-            EPOCH_COUNTER, NEUROMOD_STATE, StateRegistryReader,
-            ensure_shm_root,
-        )
-        shm_root = ensure_shm_root(titan_id)
-        try:
-            readers["neuromod"] = StateRegistryReader(NEUROMOD_STATE, shm_root)
-        except Exception as e:
-            logger.info(
-                "[SelfReflectionWorker] neuromod_state.bin reader unavailable "
-                "(coding/self_model drivers use neutral neuromods): %s", e)
-        try:
-            readers["epoch"] = StateRegistryReader(EPOCH_COUNTER, shm_root)
-        except Exception as e:
-            logger.info(
-                "[SelfReflectionWorker] epoch_counter.bin reader unavailable "
-                "(epoch-gated drivers will idle): %s", e)
-    except Exception as e:
-        logger.warning(
-            "[SelfReflectionWorker] SHM reader init failed: %s — coding/"
-            "self_model epoch+neuromod drivers degraded this run", e)
-    return readers
-
-
-def _read_neuromods(state_refs: dict) -> dict:
-    """Read 6 modulator levels from NEUROMOD_STATE → {name: level}. {} on miss."""
-    reader = (state_refs.get("_shm_readers") or {}).get("neuromod")
-    if reader is None:
-        return {}
-    try:
-        arr = reader.read()
-        if arr is None or getattr(arr, "shape", None) != (6, 4):
-            return {}
-        return {_NEUROMOD_NAMES[i]: float(arr[i, _NM_FIELD_LEVEL])
-                for i in range(6)}
-    except Exception:
-        return {}
-
-
-def _read_epoch(state_refs: dict) -> int:
-    """Read current consciousness epoch from EPOCH_COUNTER SHM. 0 on miss."""
-    reader = (state_refs.get("_shm_readers") or {}).get("epoch")
-    if reader is None:
-        return 0
-    try:
-        arr = reader.read()
-        if arr is None or len(arr) < 1:
-            return 0
-        return int(arr[0])
-    except Exception:
-        return 0
-
-
 # ARG ORDER (template-canonical): every Guardian-spawned L2 worker entry
 # follows (recv_queue, send_queue, name, config).
 @with_error_envelope(module_name="self_reflection_worker", subsystem="entry", severity=_phase11_sev.FATAL)
@@ -569,11 +496,6 @@ def self_reflection_worker_main(recv_queue, send_queue, name: str,
         "_publisher_ts": time.time(),
         "_coding_publisher_ts": time.time(),
         "_prediction_publisher_ts": time.time(),
-        # Phase 3A/3B (rFP_haov_efficacy_closure) — G18 SHM readers for the
-        # restored coding_explorer.explore() + self_reasoning.check_predictions()
-        # drivers, + epoch tracker for the 100-epoch self-prediction cadence.
-        "_shm_readers": _init_shm_readers(titan_id),
-        "_last_self_pred_check_epoch": 0,
     }
 
     # Cadences (from [self_reflection] params with defaults).
@@ -912,7 +834,7 @@ def _dispatch_msg(msg: dict, msg_type: str, state_refs: dict,
         return
 
     if msg_type == bus.KERNEL_EPOCH_TICK:
-        _handle_epoch_tick(payload, state_refs, send_queue, name)
+        _handle_epoch_tick(payload, state_refs)
         return
 
     if msg_type == bus.SAVE_NOW:
@@ -929,7 +851,7 @@ def _dispatch_msg(msg: dict, msg_type: str, state_refs: dict,
         # cognitive_worker's next pre-warmed-cache read per G20.
         # No response publish (cognitive_worker's tick is fire-and-forget;
         # result flows back via SHM, not bus).
-        _handle_meta_introspect_request(payload, state_refs, name, send_queue)
+        _handle_meta_introspect_request(payload, state_refs, name)
         return
 
     if msg_type == bus.CGN_KNOWLEDGE_REQ:
@@ -1018,7 +940,7 @@ def _get_or_init_inner_self_insight_writer(state_refs: dict):
 
 
 def _handle_meta_introspect_request(payload: dict, state_refs: dict,
-                                      name: str, send_queue=None) -> None:
+                                      name: str) -> None:
     """rFP_meta_reasoning_self_reasoning_resolver_migration / SPEC §9.B
     + D-SPEC-70 v1.15.0 — handler for META_INTROSPECT_REQUEST from
     cognitive_worker._prim_introspect.
@@ -1103,31 +1025,6 @@ def _handle_meta_introspect_request(payload: dict, state_refs: dict,
             "[SelfReflectionWorker] sr.introspect returned non-dict "
             "(%s) — SHM slot NOT updated", type(result).__name__)
         return
-
-    # ── 3A Layer-A: gap-driven coding exploration (rFP §3 Phase 3A) ──
-    # Faithful to the legacy spirit_worker path: after a coherence-check
-    # introspect populates _coherence_gaps, derive exploration triggers and
-    # drive a coding exercise on the highest-urgency one. get_exploration_triggers
-    # self-gates (returns [] when no gaps) → no-op outside coherence gaps. The
-    # always-on Layer-B time-fallback lives in _handle_epoch_tick.
-    ce = state_refs.get("coding_explorer")
-    if (send_queue is not None and ce is not None and ce.can_explore
-            and hasattr(sr, "get_exploration_triggers")):
-        try:
-            _triggers = sr.get_exploration_triggers()
-        except Exception as _gt_err:
-            logger.debug(
-                "[SelfReflectionWorker] get_exploration_triggers failed: %s",
-                _gt_err)
-            _triggers = []
-        if _triggers:
-            _drive_coding_exploration(
-                state_refs, send_queue, name,
-                trigger=_triggers[0],
-                epoch=epoch,
-                neuromods=neuromods or _read_neuromods(state_refs),
-                context=_build_coding_explore_context(
-                    state_refs, sr, payload.get("msl_data")))
 
     shm_payload = {
         "primitive": str(result.get("primitive", "INTROSPECT")),
@@ -1323,163 +1220,8 @@ def _handle_cgn_cross_insight(payload: dict, state_refs: dict) -> None:
                 e)
 
 
-def _build_coding_explore_context(state_refs: dict, sr,
-                                  msl_data: dict = None) -> dict:
-    """Best-effort context for coding_explorer.explore() action selection.
-
-    Phase-C-faithful reconstruction of the legacy spirit_worker context build:
-    the in-process objects (msl / language_stats / reasoning_engine) no longer
-    live here, so we assemble from what the worker already caches
-    (REASONING_STATS_UPDATED) + the introspect payload's msl_data + the
-    in-process prediction EMA. explore() degrades gracefully on missing keys.
-    """
-    ctx: dict = {}
-    msl_data = msl_data or {}
-    for _k in ("chi_coherence", "i_confidence"):
-        _v = msl_data.get(_k)
-        if _v is not None:
-            try:
-                ctx[_k] = float(_v)
-            except (TypeError, ValueError):
-                pass
-    rstats = state_refs.get("_last_reasoning_stats") or {}
-    if rstats:
-        try:
-            ctx["total_chains"] = int(rstats.get("total_chains", 0) or 0)
-            ctx["commit_rate"] = float(rstats.get("commit_rate", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            pass
-    if sr is not None:
-        try:
-            ctx["prediction_accuracy"] = float(sr._prediction_accuracy_ema)
-        except Exception:
-            pass
-    return ctx
-
-
-def _drive_coding_exploration(state_refs: dict, send_queue, name: str, *,
-                              trigger: dict, epoch: int, neuromods: dict,
-                              context: dict) -> None:
-    """Run ONE coding_explorer.explore() exercise — the restored dropped loop.
-
-    rFP_haov_efficacy_closure Phase 3A / BUG-CODING-EXPLORER-EXPLORE-CALLER-
-    DROPPED: commit 72f95a6b deleted both explore() call sites with spirit_worker.
-    explore() internally records the result → emits the consumer="coding"
-    CGN_TRANSITION (the HAOV `coding` consumer feed) + META-CGN producers #5/#6
-    (problem_solved / test_failed). This is what wakes the dormant `coding`
-    HAOV consumer.
-
-    Faithful-restore scope (Maker 2026-05-30, option A): CGN/HAOV/META-CGN only;
-    NO synthesis procedural-fork logging (deferred to a separate rFP). The legacy
-    Layer-A neuromod nudge (apply_external_nudge) is intentionally NOT recreated:
-    neuromods are SHM-owned by neuromod_worker under Phase C, so a cross-worker
-    nudge would need its own bus command + greenlight — out of scope here.
-    """
-    ce = state_refs.get("coding_explorer")
-    if ce is None or not ce.can_explore:
-        return
-    try:
-        result = ce.explore(trigger=trigger, epoch=epoch,
-                            neuromods=neuromods, context=context)
-        if result is not None:
-            logger.info(
-                "[SelfReflectionWorker→CodingExplore] %s/%s → %s reward=%.3f "
-                "tests=%d/%d (trigger=%s)",
-                result.action, result.concept,
-                "PASS" if result.sandbox_success else "FAIL",
-                result.reward, result.tests_passed, result.tests_total,
-                trigger.get("gap_metric", trigger.get("action", "?")))
-    except Exception as e:
-        logger.warning(
-            "[SelfReflectionWorker] coding_explorer.explore() failed: %s", e)
-
-
-def _drive_self_prediction_check(state_refs: dict, send_queue, name: str,
-                                 epoch: int, neuromods: dict,
-                                 msl_data: dict = None,
-                                 language: dict = None) -> None:
-    """Run self_reasoning.check_predictions() + emit self_model CGN_TRANSITIONs.
-
-    Restores dropped loop #2 (rFP_haov_efficacy_closure Phase 3B; commit
-    72f95a6b removed the caller). check_predictions is the ONLY updater of
-    `_prediction_accuracy_ema` (frozen at 0.5 since retirement) and the resolver
-    of SelfPredictions created by introspect→_make_prediction.
-
-    For each resolved prediction we emit the legacy ground-truth effects that
-    still have a LIVE destination:
-      • CGN_TRANSITION consumer="self_model" (the producer the rFP §1.3 inventory
-        flagged as entirely MISSING — this is what wakes the self_model HAOV
-        consumer). Reward = legacy contract 0.5 confirmed / -0.1 falsified.
-      • TIMECHAIN_COMMIT meta-fork (self-insight provenance — timechain_worker
-        is a live subscriber).
-      • emit_chain_outcome_insight peer cross-insight (Phase C §23.1).
-    The legacy also emitted SELF_PREDICTION_VERIFIED, but that constant has NO
-    subscriber (dead even pre-retirement — spirit_worker only emitted it, never
-    consumed it); recreating it would reintroduce the F4 dead-route anti-pattern,
-    so it is intentionally dropped.
-    """
-    sr = state_refs.get("self_reasoning")
-    if sr is None or not hasattr(sr, "check_predictions"):
-        return
-    try:
-        verifications = sr.check_predictions(
-            epoch, neuromods, msl_data or {}, language or {})
-    except Exception as e:
-        logger.warning(
-            "[SelfReflectionWorker] self_reasoning.check_predictions() "
-            "failed: %s", e)
-        return
-    if not verifications:
-        return
-    for v in verifications:
-        target = v.get("target", "unknown")
-        confirmed = bool(v.get("confirmed", False))
-        reward = 0.5 if confirmed else -0.1
-        # (1) self_model CGN_TRANSITION — the missing HAOV producer (rFP §1.3).
-        _send_msg(send_queue, "CGN_TRANSITION", name, "cgn", {
-            "type": "outcome",
-            "consumer": "self_model",
-            "concept_id": f"self_pred_{target}",
-            "reward": reward,
-            "outcome_context": {
-                "source": "self_prediction",
-                "metric": str(target)[:100],
-                "predicted": v.get("predicted", 0),
-                "actual": v.get("actual", 0),
-                "error": v.get("error", 0),
-                "confirmed": confirmed,
-            },
-        })
-        # (2) meta-fork TimeChain commit (live: timechain_worker).
-        _send_msg(send_queue, bus.TIMECHAIN_COMMIT, name, "timechain", {
-            "fork": "meta", "thought_type": "meta",
-            "source": "self_reasoning",
-            "content": {"event": "SELF_PREDICTION_VERIFIED",
-                        "prediction": str(target)[:100],
-                        "error": v.get("error", 0),
-                        "confirmed": confirmed},
-            "significance": 0.6, "novelty": 0.5, "coherence": 0.5,
-            "tags": ["self_insight", "prediction_verified"],
-        })
-        # (3) peer cross-insight (informative-only gate inside; falsified only).
-        try:
-            from titan_hcl.logic.cgn_consumer_client import (
-                emit_chain_outcome_insight)
-            emit_chain_outcome_insight(
-                send_queue, name, "self_model", float(reward),
-                ctx={"source": "self_prediction", "confirmed": confirmed})
-        except Exception:
-            pass
-    logger.info(
-        "[SelfReflectionWorker] self_model: %d prediction(s) verified "
-        "(EMA accuracy=%.3f)", len(verifications),
-        getattr(sr, "_prediction_accuracy_ema", 0.5))
-
-
-def _handle_epoch_tick(payload: dict, state_refs: dict, send_queue,
-                       name: str) -> None:
-    """Per-epoch tick — drive engines' cooldown bookkeeping + the restored
-    coding-exploration time-fallback (3A) + self-prediction check (3B).
+def _handle_epoch_tick(payload: dict, state_refs: dict) -> None:
+    """Per-epoch tick — drive engines' cooldown bookkeeping.
 
     Per rFP §2.B.3: tick_cooldown for self_reasoning + coding_explorer.
     PredictionEngine doesn't have a tick() — it's input-driven via
@@ -1502,48 +1244,6 @@ def _handle_epoch_tick(payload: dict, state_refs: dict, send_queue,
             logger.debug(
                 "[SelfReflectionWorker] coding_explorer.tick_cooldown() failed: %s",
                 e)
-
-    # ── 3A Layer-B: coding-exploration time-fallback (rFP §3 Phase 3A) ──
-    # The dominant activation path on saturated-stable Titans: the gap-driven
-    # Layer-A (introspect coherence gaps) rarely fires, so this 6h time-fallback
-    # guarantees coding activity. Cheap timestamp gate first; only read SHM +
-    # build context when it actually fires.
-    if ce is not None and ce.can_explore:
-        _now = time.time()
-        try:
-            _fire = ce.should_fire_fallback(_now)
-        except Exception:
-            _fire = False
-        if _fire:
-            try:
-                _trigger = ce.build_fallback_trigger(_now)
-            except Exception as _bft_err:
-                logger.warning(
-                    "[SelfReflectionWorker] build_fallback_trigger failed: %s",
-                    _bft_err)
-                _trigger = None
-            if _trigger is not None:
-                logger.info(
-                    "[SelfReflectionWorker] CodingExplorer time-fallback fired "
-                    "(silence threshold %.0fs)", ce._time_fallback_seconds)
-                _drive_coding_exploration(
-                    state_refs, send_queue, name,
-                    trigger=_trigger,
-                    epoch=_read_epoch(state_refs),
-                    neuromods=_read_neuromods(state_refs),
-                    context=_build_coding_explore_context(state_refs, sr))
-
-    # ── 3B: self-prediction check every 100 epochs (rFP §3 Phase 3B) ──
-    # check_predictions resolves introspect-created SelfPredictions + is the only
-    # updater of _prediction_accuracy_ema. Legacy cadence = every 100 epochs.
-    if sr is not None and hasattr(sr, "check_predictions"):
-        _epoch = _read_epoch(state_refs)
-        _last = state_refs.get("_last_self_pred_check_epoch", 0)
-        if _epoch > 0 and (_epoch - _last) >= 100:
-            state_refs["_last_self_pred_check_epoch"] = _epoch
-            _drive_self_prediction_check(
-                state_refs, send_queue, name, _epoch,
-                _read_neuromods(state_refs))
 
 
 # ── Sandbox subprocess lifecycle (chunk B6) ─────────────────────────────────
