@@ -405,21 +405,19 @@ def test_bug_f_cgn_beta_snapshot_handler_retired_in_emot_cgn():
 
 
 def test_bug_e_f_plugin_broadcast_topics_retired():
-    """The emot_cgn ModuleSpec must NOT include bus.TRAJECTORY_UPDATE or
-    bus.CGN_BETA_SNAPSHOT in broadcast_topics (both retired in favor of SHM
-    slots). NOTE: the ModuleSpec catalog moved from plugin.py →
-    module_catalog.py in the legacy_core retirement (Phase 6 / D-SPEC-135);
-    the retirement notices live there now."""
-    src = Path("titan_hcl/module_catalog.py").read_text()
+    """plugin.py must NOT include bus.TRAJECTORY_UPDATE or
+    bus.CGN_BETA_SNAPSHOT in emot_cgn ModuleSpec broadcast_topics (both
+    retired in favor of SHM slots)."""
+    src = Path("titan_hcl/core/plugin.py").read_text()
     # The emot_cgn ModuleSpec broadcast_topics block lives near the
     # 5 PART B §8 substrate events — check active references in that
     # window. We look for the retirement comments AND absence of active
     # list entries.
     assert "bus.TRAJECTORY_UPDATE RETIRED" in src or \
         "TRAJECTORY_UPDATE RETIRED" in src, \
-        "retirement notice for TRAJECTORY_UPDATE missing in module_catalog.py"
+        "retirement notice for TRAJECTORY_UPDATE missing in plugin.py"
     assert "CGN_BETA_SNAPSHOT RETIRED" in src, \
-        "retirement notice for CGN_BETA_SNAPSHOT missing in module_catalog.py"
+        "retirement notice for CGN_BETA_SNAPSHOT missing in plugin.py"
 
 
 def test_emot_cgn_reads_both_shm_slots_in_bundle_path():
