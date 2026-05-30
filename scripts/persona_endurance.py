@@ -86,6 +86,12 @@ def _load_config() -> dict:
 
 
 def _get_api_base() -> str:
+    # Soak override: TITAN_PERSONA_TARGET=host:port routes persona chat at a
+    # specific Titan (e.g. 10.135.0.6:7778 for T3) instead of the local config
+    # default — lets persona load run against T3 alongside the synthesis soak.
+    override = os.environ.get("TITAN_PERSONA_TARGET", "").strip()
+    if override:
+        return f"http://{override}"
     cfg = _load_config()
     host = cfg.get("api", {}).get("host", "0.0.0.0")
     port = cfg.get("api", {}).get("port", 7777)
