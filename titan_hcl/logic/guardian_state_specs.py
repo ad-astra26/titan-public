@@ -21,12 +21,10 @@ Slot is variable-size msgpack per the established Phase C Python L2 pattern.
 Payload schema (msgpack):
   {
     "modules":              dict[str→dict],  # per-module {state, pid, rss_mb,
-                                              # cpu_delta_s, uptime,
-                                              # restart_count,
+                                              # uptime, restart_count,
                                               # restarts_in_window,
                                               # last_heartbeat_age, layer,
                                               # start_method, adopted, adopt_ts}
-                                              # (schema v2: + cpu_delta_s, §1339)
     "total_modules":        int,
     "modules_by_layer":     dict[str→list[str]],  # {"L1": [...], "L2": [...], "L3": [...]}
     "escalation_count":     int,

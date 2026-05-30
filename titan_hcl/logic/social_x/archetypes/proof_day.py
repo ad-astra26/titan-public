@@ -124,17 +124,7 @@ class ProofDayArchetype(ArchetypeBase):
     # ── Trigger ─────────────────────────────────────────────────────
 
     def already_posted_today(self, *, titan_id: str, now: float | None = None) -> bool:
-        """1/day idempotency aligned to UTC midnight (rFP §4.3.1).
-
-        Counts 'deleted' as already-posted (2026-05-30 fix): proof_day is a
-        once-per-UTC-day must-post slot. Pre-fix the guard only counted
-        ('posted','verified','pending'), so when Maker deleted a proof post on
-        X (status → 'deleted') the slot REOPENED and proof_day re-fired on the
-        very next dispatch (it bypasses rate-limit + spacing) — observed 6
-        re-fires on 2026-05-29. A delivered-then-deleted post still consumes
-        the day's slot. 'failed' is deliberately EXCLUDED so a post that never
-        reached X can still retry within the same day.
-        """
+        """1/day idempotency aligned to UTC midnight (rFP §4.3.1)."""
         n = now if now is not None else time.time()
         today = _dt.datetime.fromtimestamp(n, _dt.timezone.utc).date()
         midnight = _dt.datetime(today.year, today.month, today.day,
@@ -143,7 +133,7 @@ class ProofDayArchetype(ArchetypeBase):
         try:
             row = conn.execute(
                 "SELECT 1 FROM actions WHERE titan_id=? AND post_type=? "
-                "AND status IN ('posted','verified','pending','deleted') "
+                "AND status IN ('posted','verified','pending') "
                 "AND created_at >= ? LIMIT 1",
                 (titan_id, self.name, midnight),
             ).fetchone()
