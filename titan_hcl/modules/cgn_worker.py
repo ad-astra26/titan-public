@@ -20,7 +20,6 @@ See: titan-docs/rFP_cgn_cognitive_kernel_v2.md
 import logging
 import os
 import sys
-import threading
 import time
 from queue import Empty
 from titan_hcl.utils.silent_swallow import swallow_warn
@@ -637,7 +636,6 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     # Time-gated (not per-consolidation) to bound torch.save frequency.
     _STATE_CHECKPOINT_INTERVAL_S = 300.0  # 5 min
     _last_state_checkpoint = time.time()  # first checkpoint ~5min after boot
-    _ckpt_thread = [None]                 # single-slot non-blocking writer
 
     def _maybe_export_lexicon_snapshot() -> None:
         nonlocal _last_lexicon_export
@@ -700,30 +698,17 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         regardless of inbound traffic (avoids the recv_queue_except_empty trap).
         This is the robust persistence guarantee: cgn survives an ungraceful
         (shm_pid_dead / SIGKILL) death losing at most one interval, rather than
-        reverting to the last dream-consolidation snapshot.
-
-        NON-BLOCKING: the torch.save() is offloaded to a single-slot daemon
-        thread so a slow disk (swap / IO pressure) never stalls the heartbeat
-        and trips a false shm_pid_dead. The single-slot guard prevents pile-up
-        if a write runs longer than the interval."""
+        reverting to the last dream-consolidation snapshot."""
         nonlocal _last_state_checkpoint
         now_ts = time.time()
         if now_ts - _last_state_checkpoint < _STATE_CHECKPOINT_INTERVAL_S:
             return
-        if _ckpt_thread[0] is not None and _ckpt_thread[0].is_alive():
-            return  # prior checkpoint still writing — skip, retry next tick
         _last_state_checkpoint = now_ts
-
-        def _do_ckpt():
-            try:
-                cgn._save_state()
-            except Exception as _ckpt_err:  # noqa: BLE001
-                logger.warning(
-                    "[CGNWorker] periodic state checkpoint failed: %s",
-                    _ckpt_err)
-        _ckpt_thread[0] = threading.Thread(
-            target=_do_ckpt, daemon=True, name="cgn-checkpoint")
-        _ckpt_thread[0].start()
+        try:
+            cgn._save_state()
+        except Exception as _ckpt_err:  # noqa: BLE001
+            logger.warning(
+                "[CGNWorker] periodic state checkpoint failed: %s", _ckpt_err)
 
     while True:
         # H.3 (2026-04-28): periodic HAOV test pump. Runs at fixed cadence

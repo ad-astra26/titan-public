@@ -90,7 +90,6 @@ MODULE_NAME = "self_reflection_worker"
 
 # Cadence + lifecycle constants (defaults — overridable via [self_reflection] params).
 HEARTBEAT_INTERVAL_S = 10.0           # SPEC §10.B MODULE_HEARTBEAT_INTERVAL_S
-_PREDICTION_CHECKPOINT_INTERVAL_S = 300.0  # periodic disk checkpoint — survives crash
 POLL_INTERVAL_S = 0.2
 PUBLISHER_DEFAULT_S = 2.5             # SELF_REFLECTION_STATS_UPDATED + PREDICTION_STATS_UPDATED
 CODING_EXPLORER_PUBLISHER_S = 5.0     # CODING_EXPLORER_STATS_UPDATED
@@ -552,38 +551,12 @@ def self_reflection_worker_main(recv_queue, send_queue, name: str,
     # MODULE_SHUTDOWN. The skeleton sets SHM slot=booted + heartbeats so
     # guardian classifies us as online during the soak between B3 and B5.
     last_heartbeat_ts = 0.0
-    last_prediction_checkpoint = time.time()  # first checkpoint ~5min after boot
-    _prediction_ckpt_thread = [None]          # single-slot non-blocking writer
     while True:
         now = time.time()
 
         if now - last_heartbeat_ts >= HEARTBEAT_INTERVAL_S:
             _send_heartbeat(send_queue, name, state_writer=_state_writer)
             last_heartbeat_ts = now
-
-        # ── Periodic disk checkpoint (survives ANY crash) — NON-BLOCKING ──
-        # prediction_engine.save_state() otherwise fires only on MODULE_SHUTDOWN
-        # (graceful), so an ungraceful death loses novelty/error-window learning
-        # since the last save (novelty_state.json frozen ~16d). Offloaded to a
-        # daemon thread so the disk write never blocks the heartbeat (esp. under
-        # disk/swap pressure). Single-slot guard avoids thread pile-up.
-        if (prediction_engine is not None
-                and now - last_prediction_checkpoint
-                > _PREDICTION_CHECKPOINT_INTERVAL_S):
-            last_prediction_checkpoint = now
-            if (_prediction_ckpt_thread[0] is None
-                    or not _prediction_ckpt_thread[0].is_alive()):
-                def _do_pred_ckpt(_pe=prediction_engine):
-                    try:
-                        _pe.save_state()
-                    except Exception as _ckpt_err:  # noqa: BLE001
-                        logger.warning(
-                            "[SelfReflectionWorker] periodic checkpoint "
-                            "failed: %s", _ckpt_err)
-                _prediction_ckpt_thread[0] = threading.Thread(
-                    target=_do_pred_ckpt, daemon=True,
-                    name="self_reflection-checkpoint")
-                _prediction_ckpt_thread[0].start()
 
         # Sandbox subprocess lifecycle polled cadences (chunk B6 per
         # rFP §2.B.6). CodingSandboxHelper.status() is a lightweight PATH
