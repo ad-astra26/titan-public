@@ -394,6 +394,13 @@ class MetaService:
 
         self._response_emitter = response_emitter
         self._recruitment = recruitment
+        # Phase A (RFP_cgn_enhancements §9.1) — optional callback that receives
+        # concept-grounding requests (those carrying a grounding_payload) and
+        # appends them to the MetaReasoningEngine's _pending_groundings queue
+        # (drained by should_trigger_meta Path #0). Wired by cognitive_worker
+        # after both MetaService and the engine exist. None → grounding
+        # requests fall through to the normal one-shot resolver (back-compat).
+        self._grounding_sink: Optional[Callable] = None
         self._lock = threading.Lock()
 
         # ── Session 3 live-dispatch infrastructure ─────────────────────
@@ -929,6 +936,42 @@ class MetaService:
         # Record the request in rate trackers
         self._rate.record(f"c:{consumer_id}")
         self._rate.record("global")
+
+        # Phase A (RFP_cgn_enhancements §9.1) — concept-grounding route.
+        # If the request carries a grounding_payload and a sink is wired, hand
+        # it to the chain-trigger queue (should_trigger_meta Path #0) instead
+        # of the one-shot resolver, and ack the consumer. This is the learning-
+        # event → Level-A chain trigger. Skips the thought-cache (each grounding
+        # is a unique trigger, not a re-answerable query).
+        grounding = payload.get("grounding_payload")
+        if grounding and self._grounding_sink is not None:
+            try:
+                self._grounding_sink({
+                    "consumer": consumer_id,
+                    "concept_id": str(grounding.get("concept_id", ""))[:128],
+                    "felt_state_ref": grounding.get("felt_state_ref"),
+                    "context_vector": list(context_vector),
+                    "question_type": question_type,
+                    "entry_primitive": QUESTION_TYPE_TO_PRIMITIVE.get(
+                        question_type, ""),
+                    "request_id": request_id,
+                })
+                self._stats["grounding_enqueued"] = (
+                    self._stats.get("grounding_enqueued", 0) + 1)
+            except Exception as _gs_err:
+                logger.warning(
+                    "[MetaService] grounding_sink failed for %s.%s: %s",
+                    consumer_id, question_type, _gs_err)
+            # Ack — the chain runs async; the consumer does not block on it.
+            self._emit_response(
+                request_id=request_id,
+                consumer_id=consumer_id,
+                src=src,
+                failure_mode=None,
+                insight={"grounding_queued": True},
+                reason="grounding_enqueued",
+            )
+            return None
 
         # Cache lookup
         if self._cache_enabled:
