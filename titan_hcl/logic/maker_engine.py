@@ -28,6 +28,7 @@ Profile Structure (Cognee):
 """
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -135,6 +136,10 @@ class MakerRelationshipEngine:
         self._maker_ids: set[str] = set()
 
         self._load_maker_ids()
+        # Restore learned relationship state (topic scores + promoted-topic
+        # dedup + care queue) so it survives restarts. The save_state/load_state
+        # methods existed but were never wired — state reset every restart.
+        self.load_state()
 
     def _load_maker_ids(self) -> None:
         """Load maker platform IDs from config."""
@@ -214,6 +219,12 @@ class MakerRelationshipEngine:
 
         self._last_run_ts = time.time()
         result["duration_seconds"] = round(time.time() - start, 1)
+
+        # Persist learned relationship state at the end of each cycle so
+        # accumulated topic scores + promoted-topic dedup survive a restart.
+        # run() is an idle/post-meditation async path (not a heartbeat loop),
+        # and the file is a small JSON, so a synchronous write is fine here.
+        self.save_state()
 
         logger.info(
             "[MakerEngine] Cycle complete: %d convos → %d topics → %d promoted, %d care actions (%.1fs)",
@@ -644,8 +655,12 @@ class MakerRelationshipEngine:
 
         try:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "w") as f:
+            # Atomic write (tmp + os.replace) so a crash mid-write can't corrupt
+            # the state file — the whole point is surviving an ungraceful death.
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump(state, f, indent=2)
+            os.replace(tmp, path)
             logger.debug("[MakerEngine] State saved to %s", path)
         except Exception as e:
             logger.warning("[MakerEngine] Failed to save state: %s", e)

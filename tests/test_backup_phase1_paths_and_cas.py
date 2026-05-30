@@ -267,3 +267,91 @@ def test_cas_locks_are_lazy_constructed():
     assert isinstance(lock, asyncio.Lock)
     # Second call should return same instance
     assert rb._get_personality_cas_lock() is lock
+
+
+# ── §24 unified_v2 — daily (1st-meditation-of-day) gate ──────────────────
+# Regression guard (2026-05-30): pre-fix, _run_unified_event_v2 fired on EVERY
+# meditation (the per-tier daily CAS gates below it were dead code for the
+# unified_v2 path), shipping 2+ Arweave backups/day (observed on T1). The fix
+# claims the calendar day with the same personality CAS gate the legacy path
+# uses, so the unified event ships exactly once per UTC day.
+
+
+def _unified_v2_rb(monkeypatch, ship_counter, *, shipped=True, raises=False):
+    rb = RebirthBackup(network_client=None, titan_id="T1",
+                       arweave_store=None, full_config={
+                           "backup": {"unified_v2_enabled": True},
+                       })
+
+    async def _fake_run(*a, **kw):
+        ship_counter["n"] += 1
+        await asyncio.sleep(0.02)  # widen the concurrent race window
+        if raises:
+            raise RuntimeError("simulated pipeline failure")
+        return shipped
+
+    monkeypatch.setattr(rb, "_run_unified_event_v2", _fake_run)
+    monkeypatch.setattr(rb, "_alert_backup_failure", lambda *a, **kw: None)
+    monkeypatch.setattr(rb, "_save_backup_state", lambda *a, **kw: None)
+    return rb
+
+
+@pytest.mark.asyncio
+async def test_unified_v2_ships_once_per_day_across_concurrent_meditations(monkeypatch):
+    """10 concurrent MEDITATION_COMPLETE in one UTC day → exactly 1 ship."""
+    counter = {"n": 0}
+    rb = _unified_v2_rb(monkeypatch, counter, shipped=True)
+    payload = {"success": True, "epoch": 1, "promoted": 0}
+    await asyncio.gather(*[rb.on_meditation_complete(payload) for _ in range(10)])
+    assert counter["n"] == 1, (
+        f"unified_v2 daily gate should ship exactly once across 10 concurrent "
+        f"meditations; observed {counter['n']}. Regression: backup-v2 "
+        f"multi-fire (2+ Arweave backups/day) re-opened."
+    )
+
+
+@pytest.mark.asyncio
+async def test_unified_v2_second_meditation_same_day_is_skipped(monkeypatch):
+    """Sequential meditations the same day → only the 1st ships."""
+    counter = {"n": 0}
+    rb = _unified_v2_rb(monkeypatch, counter, shipped=True)
+    payload = {"success": True, "epoch": 1, "promoted": 0}
+    await rb.on_meditation_complete(payload)
+    await rb.on_meditation_complete(payload)
+    await rb.on_meditation_complete(payload)
+    assert counter["n"] == 1
+
+
+def _today_utc():
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+
+
+@pytest.mark.asyncio
+async def test_unified_v2_releases_day_on_failure_so_next_retries(monkeypatch):
+    """A raising pipeline must RELEASE the claimed day (date != today) so the
+    next meditation retries today's backup."""
+    counter = {"n": 0}
+    rb = _unified_v2_rb(monkeypatch, counter, raises=True)
+    rb._last_personality_date = ""  # cold start (no prior backup)
+    payload = {"success": True, "epoch": 1, "promoted": 0}
+    await rb.on_meditation_complete(payload)        # raises → day released
+    assert rb._last_personality_date != _today_utc()  # claim rolled back
+    # Second meditation can now retry (it will attempt the pipeline again).
+    await rb.on_meditation_complete(payload)
+    assert counter["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_unified_v2_releases_day_on_no_ship_so_next_retries(monkeypatch):
+    """shipped=False (no-change OR non-raising failure) must also release the
+    day — today's backup wasn't produced, so a later meditation can still
+    land exactly one backup."""
+    counter = {"n": 0}
+    rb = _unified_v2_rb(monkeypatch, counter, shipped=False)
+    rb._last_personality_date = ""  # cold start
+    payload = {"success": True, "epoch": 1, "promoted": 0}
+    await rb.on_meditation_complete(payload)
+    assert rb._last_personality_date != _today_utc()
+    await rb.on_meditation_complete(payload)
+    assert counter["n"] == 2

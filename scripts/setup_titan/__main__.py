@@ -63,53 +63,32 @@ def cmd_install(args: argparse.Namespace) -> int:
     banner()
     repo_root = Path(__file__).resolve().parents[2]
     mode = Mode(args.mode) if args.mode else None
-    prompter = None          # None → run_phases uses StdinPrompter (the CLI flow)
-    state_seed: dict = {}     # TUI pre-fills wallet/RPC so Phase 2 short-circuits
 
-    # No mode + not --default → the guided path. Launch the branded Textual
-    # wizard (W1.b.2) when we have a real terminal; otherwise (non-tty, or
-    # --no-tui) fall back to the CLI "pick a mode" guidance.
     if mode is None and not args.default:
-        use_tui = not args.no_tui and sys.stdin.isatty() and sys.stdout.isatty()
-        if not use_tui:
-            cprint("No mode selected. Re-run interactively for the guided wizard, or pick a mode:",
-                   role="warning")
-            cprint("  --mode {mainnet,devnet,local}  (or --default for the locked happy path)",
-                   role="text_muted")
-            section("The three modes")
-            for m in Mode:
-                spec = spec_for(m)
-                print(f"  {PULSE}{spec.label}{ANSI.RESET}")
-                print(f"    {spec.one_liner}")
-                print(f"    {METAL}SOL: {spec.needs_sol}{ANSI.RESET}")
-            return 2
-        from .prompts import ScriptedPrompter
-        from .tui import run_install_tui
-        result = run_install_tui()
-        if result is None:
-            cprint("Setup cancelled — nothing was written.", role="warning")
-            return 130
-        mode, answers, state_seed = result
-        prompter = ScriptedPrompter(answers)
-        banner()  # the TUI took over the screen; re-print the banner for the install log
+        cprint("No mode selected. The interactive wizard (Textual TUI) will land in the next W1 sub-phase.",
+               role="warning")
+        cprint("For now, pick a mode explicitly: --mode {mainnet,devnet,local} (or --default for the locked happy path).",
+               role="text_muted")
+        section("The three modes")
+        for m in Mode:
+            spec = spec_for(m)
+            print(f"  {PULSE}{spec.label}{ANSI.RESET}")
+            print(f"    {spec.one_liner}")
+            print(f"    {METAL}SOL: {spec.needs_sol}{ANSI.RESET}")
+        return 2
 
     if args.default and mode is None:
-        # locked --default path routes to devnet (the realistic tester path).
-        cprint("--default selected — using DEVNET (the realistic tester path).",
+        # locked --default path will route to devnet by default per RFP rationale
+        # (the realistic tester path) — confirmed in the wizard, not silently.
+        cprint("--default selected. The wizard will confirm the mode interactively (defaulting to DEVNET).",
                role="text_strong")
-        mode = Mode.DEVNET
+        mode = Mode.DEVNET   # provisional; TUI will let the user override
 
     spec = spec_for(mode)
     section(f"Mode: {spec.label}")
     print(f"  {spec.one_liner}")
     if spec.notice:
         cprint(f"  {spec.notice}", role="warning" if "⚠" in spec.notice else "text_muted")
-    if mode == Mode.MAINNET:
-        cprint("  Mainnet genesis BURNS the plaintext key after a Shamir 2-of-3 split. "
-               "Your only recovery from a lost box is `setup_titan restore` (resurrection "
-               "from your offline Shard-1 + the on-chain shard). Record your Shard-1 and "
-               "keep an off-site copy of your backup manifest — resurrection is MAINNET-ONLY.",
-               role="warning")
 
     fails = _render_preflight(run_preflight(repo_root, mode))
     if fails:
@@ -123,30 +102,18 @@ def cmd_install(args: argparse.Namespace) -> int:
                role="text_muted")
         return 0
 
-    # Walk Phases 2-7. The prompter (StdinPrompter for the CLI flow, or the
-    # TUI's ScriptedPrompter) feeds every input; the phase bodies are identical.
+    # Walk Phases 2-7 — Phase 4 (W1.c) + Phase 6 (W1.b) are real; Phase 5/7 are
+    # owned by W1.d/W1.e and emit a single 'warn' Result (skipped, not failed).
     state = install_state.load()
-    state.update(state_seed)
     state["setup_titan_version"] = __version__
     state["install_root"] = str(repo_root)
     install_state.save(state)
     return run_phases(state=state, mode=mode, install_root=repo_root,
                       default=args.default, minimal=args.minimal, skip_genesis=args.skip_genesis,
-                      tag=args.tag, build_rust=args.build_rust, prompter=prompter)
+                      tag=args.tag, build_rust=args.build_rust)
 
 
 # ── subcommands: stubs ─────────────────────────────────────────────────────
-def cmd_restore(args: argparse.Namespace) -> int:
-    banner()
-    from .restore import run_restore
-    repo_root = Path(args.install_root) if args.install_root else \
-        Path(__file__).resolve().parents[2]
-    return run_restore(
-        repo_root, shard1=args.shard1, shard1_file=args.shard1_file,
-        manifest=args.manifest, titan_id=args.titan_id, network=args.network,
-        verify_zk=args.verify_zk, verify_only=args.verify_only, force=args.force)
-
-
 def cmd_config(args: argparse.Namespace) -> int:
     banner()
     from .config import run_config
@@ -204,32 +171,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "downloading them (the fully-sovereign path; needs cargo + musl).")
     pi.add_argument("--resume", action="store_true",
                     help="Resume from the last completed phase (per ~/.titan/install_state.json).")
-    pi.add_argument("--no-tui", action="store_true",
-                    help="Skip the Textual wizard; use the plain CLI prompts "
-                         "(implied automatically when stdin/stdout is not a terminal).")
     pi.add_argument("--dry-run", action="store_true",
                     help="Preflight only; no installs, no genesis, no writes.")
     pi.set_defaults(func=cmd_install)
-
-    pr = sub.add_parser("restore",
-                        help="Resurrect a mainnet-born Titan from your Maker shard + chain")
-    pr.add_argument("--shard1", default=None,
-                    help="Maker Shard-1 envelope (hex). Omit to be prompted with no echo.")
-    pr.add_argument("--shard1-file", default=None,
-                    help="Path to a file holding the Maker Shard-1 envelope.")
-    pr.add_argument("--manifest", default=None,
-                    help="Your off-site UnifiedManifest JSON (REQUIRED on a fresh box).")
-    pr.add_argument("--titan-id", default=None, help="Titan id (default: from envelope, else T1).")
-    pr.add_argument("--install-root", default=None, help="Target install tree (default: this repo).")
-    pr.add_argument("--network", choices=["mainnet", "devnet"], default="mainnet",
-                    help="Arweave/Solana network (default: mainnet).")
-    pr.add_argument("--verify-zk", action="store_true",
-                    help="Also round-trip-verify each event against the on-chain ZK memo.")
-    pr.add_argument("--verify-only", action="store_true",
-                    help="Boot the resurrected Titan in observation mode (live restore test).")
-    pr.add_argument("--force", action="store_true",
-                    help="Permit in-place restore over a populated data/ tree.")
-    pr.set_defaults(func=cmd_restore)
 
     pc = sub.add_parser("config", help="Browse/edit config.toml + DNA params (comment-driven)")
     pc.add_argument("--list", action="store_true", help="Dump every section.key = value + help.")

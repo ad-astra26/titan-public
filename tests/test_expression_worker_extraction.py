@@ -234,10 +234,14 @@ def test_expression_worker_strong_composition_thresholds_match_spec():
 
 
 PLUGIN_PATH = REPO_ROOT / "titan_hcl" / "core" / "plugin.py"
+# ModuleSpec catalog moved plugin.py → module_catalog.py in the legacy_core
+# retirement (Phase 6 / D-SPEC-135); worker registrations live there now.
+MODULE_CATALOG_PATH = REPO_ROOT / "titan_hcl" / "module_catalog.py"
 
 
 def test_plugin_registers_expression_worker_module_spec():
-    text = PLUGIN_PATH.read_text()
+    # Registration moved to module_catalog.py (legacy_core retirement).
+    text = MODULE_CATALOG_PATH.read_text()
     assert "from titan_hcl.modules.expression_worker import" in text
     assert "expression_worker_main" in text
     assert 'name="expression_worker"' in text
@@ -248,15 +252,15 @@ def test_plugin_registers_expression_worker_module_spec():
 def test_plugin_gates_off_expression_state_publisher_under_l0_rust_true():
     """G21 single-writer ownership transfer — main plugin's
     `_expression_state_publish_loop` thread MUST be gated off when
-    `l0_rust_enabled=true` (expression_worker owns the slot)."""
+    `l0_rust_enabled=true` (expression_worker owns the slot). The publish
+    loop + its gate stay in plugin.py (the spawn-side); the load-bearing
+    SKIP-log phrases are split across a logger.info call."""
     text = PLUGIN_PATH.read_text()
-    # String is split across a logger.info call; check the load-bearing
-    # phrases on both sides of the split.
-    assert "SKIPPED under l0_rust_enabled=true" in text, (
-        "Parent's expression_state_publish_loop must be gated off "
+    assert "publisher SKIPPED under" in text, (
+        "Parent's expression_state.bin publisher must be gated off "
         "under l0_rust_enabled=true to preserve G21 single-writer")
-    assert "ownership transferred " in text
-    assert "expression_worker per §4.B" in text
+    assert "l0_rust_enabled=true" in text
+    assert "owned by expression_worker (G21)" in text
 
 
 # ─── 7. Catalyst-site #8 closure marker ──────────────────────────────
