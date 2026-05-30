@@ -241,6 +241,14 @@ class SocialXGateway:
         self._output_verifier = None
         # Verified Context Builder (set externally via set_context_builder)
         self._context_builder = None
+        # C3 (rFP_haov_efficacy_closure §3E): language's verified HAOV concepts,
+        # refreshed externally by social_worker via set_verified_haov_concepts()
+        # (pulled from cgn.get_cross_insights("social") → source="haov_verified"
+        # entries). Biases engagement toward conversations touching a concept the
+        # agent has CONFIRMED it understands. Empty until a concept-grounding rule
+        # crystallizes (today's verified rules are all impasse-type), so the bias
+        # is 0 and live behaviour is unchanged — interface-complete per the design.
+        self._verified_haov_concepts: list[dict] = []
         # Metabolism gate callable (set externally via set_metabolism_gate).
         # Mainnet Lifecycle Wiring rFP (2026-04-20). Signature:
         #   (feature: str, caller: str) -> (should_proceed: bool, rate: float)
@@ -356,6 +364,39 @@ class SocialXGateway:
     def set_output_verifier(self, verifier) -> None:
         """Inject OutputVerifier for security gating of posts/replies."""
         self._output_verifier = verifier
+
+    def set_verified_haov_concepts(self, concepts: list) -> None:
+        """C3 (rFP_haov_efficacy_closure §3E) — refresh language's verified HAOV
+        concepts (from cgn.get_cross_insights("social") source="haov_verified").
+        social_worker calls this on each cross-insights QUERY_RESPONSE. Bounded
+        cache; empty list clears the bias."""
+        self._verified_haov_concepts = list(concepts or [])[:16]
+
+    @staticmethod
+    def _verified_concept_engage_bias(concepts: list, text: str) -> float:
+        """C3 — bounded engage-bias in [0, 0.2] when `text` mentions a concept
+        the agent has CONFIRMED via HAOV (other consumers' verified rules).
+
+        Pure + side-effect-free. Returns 0.0 when there are no verified concepts
+        (the current fleet state — all verified rules are impasse-type, filtered
+        out upstream) or no textual overlap, so it cannot perturb the live reply
+        gate until concept-grounding rules actually exist. Bias = max matched
+        confidence × 0.2 cap (engage toward what you understand)."""
+        if not concepts or not text:
+            return 0.0
+        tl = text.lower()
+        best = 0.0
+        for c in concepts:
+            # Derive a teachable token from the verified rule; skip impasse rules.
+            effect = str(c.get("effect", ""))
+            if effect.startswith("resolve_"):
+                continue
+            rule = str(c.get("rule", ""))
+            tok = (rule.split("_", 1)[-1] if "_" in rule else rule).replace(
+                "arc_", "").replace("pattern_", "").replace("_", " ").strip()
+            if len(tok) >= 3 and tok in tl:
+                best = max(best, float(c.get("confidence", 0.0)))
+        return round(min(0.2, best * 0.2), 4)
 
     def set_context_builder(self, vcb) -> None:
         """Inject VerifiedContextBuilder for memory-enriched replies."""
@@ -3279,12 +3320,20 @@ class SocialXGateway:
 
         # Only apply CGN gate if we have enough training data
         if _cgn_conf > 0.0 and _policy_weight > 0.0:
+            # C3 (rFP_haov_efficacy_closure §3E): engage-bias toward a conversation
+            # touching a HAOV-verified concept (something the agent has confirmed it
+            # understands) — relax the disengage hard-gate by the bounded bias. 0.0
+            # until a concept-grounding verified rule exists → no live change today.
+            _haov_bias = self._verified_concept_engage_bias(
+                self._verified_haov_concepts, context.mention_text or "")
+            _eff_disengage_conf = _cgn_conf - _haov_bias
             # Hard gate: suppress reply if disengage + high confidence + high weight
-            if (_cgn_action == "disengage" and _cgn_conf > 0.6
+            if (_cgn_action == "disengage" and _eff_disengage_conf > 0.6
                     and _policy_weight > 0.4):
                 logger.info("[SocialXGateway] CGN soft gate: disengage "
-                            "(conf=%.2f, weight=%.1f) for @%s",
-                            _cgn_conf, _policy_weight, context.mention_user)
+                            "(conf=%.2f, weight=%.1f, haov_bias=%.2f) for @%s",
+                            _cgn_conf, _policy_weight, _haov_bias,
+                            context.mention_user)
                 return ActionResult(status="cgn_disengage",
                                     reason=f"CGN policy: disengage (conf={_cgn_conf:.2f})")
             # Soft gate: protect → add protective tone
