@@ -213,15 +213,6 @@ class ConceptGroundingNetwork:
 
         # Concept lifecycle: track concept journey across consumers
         self._concept_journeys: Dict[str, dict] = {}  # concept_id → {first_consumer, consumers_seen, ...}
-        # Phase B (RFP_cgn_enhancements §9.2) — multi-consumer maturity → CGN_CONCEPT_GROUNDED.
-        # The central cgn (cgn_worker) sees every consumer's outcomes via record_outcome,
-        # so it grows a per-concept consumer-set there; when a concept crosses ≥2 distinct
-        # consumers it has "matured" cross-consumer → queued here for cgn_worker to emit
-        # CGN_CONCEPT_GROUNDED (the Level-B trigger). _matured_emitted dedups (once per
-        # concept, persisted) so a restart doesn't re-fire.
-        self._pending_matured: list = []          # concept_ids that just crossed ≥2 consumers
-        self._matured_emitted: set = set()         # concepts already emitted (persisted)
-        self._concept_grounded_maturity_min = 2    # ≥N distinct consumers = cross-consumer mature
 
         # Shared surprise signal: any consumer records surprise, all benefit
         self._surprise_buffer: List[dict] = []
@@ -425,29 +416,6 @@ class ConceptGroundingNetwork:
                 t.reward = reward
                 t.metadata.update(outcome_context or {})
                 self._total_rewards += reward
-
-                # Phase B (§9.2) — grow the CENTRAL cross-consumer journey here
-                # (ground() runs on consumers' local clients; the central cgn only
-                # sees outcomes, so this is where it learns which consumers touched
-                # a concept). When the set crosses the maturity floor, queue a
-                # CGN_CONCEPT_GROUNDED emission (once per concept; cgn_worker drains).
-                _j = self._concept_journeys.get(concept_id)
-                if _j is None:
-                    _j = {"first_consumer": consumer, "first_ts": time.time(),
-                          "consumers_seen": set()}
-                    self._concept_journeys[concept_id] = _j
-                _seen = _j.setdefault("consumers_seen", set())
-                if not isinstance(_seen, set):
-                    _seen = set(_seen); _j["consumers_seen"] = _seen
-                _seen.add(consumer)
-                if (len(_seen) >= self._concept_grounded_maturity_min
-                        and concept_id not in self._matured_emitted):
-                    self._matured_emitted.add(concept_id)
-                    self._pending_matured.append({
-                        "concept_id": concept_id,
-                        "consumers": sorted(_seen),
-                        "first_consumer": _j.get("first_consumer", consumer),
-                    })
 
                 # Sigma: one V(s) micro-update (continuous gradient learning)
                 try:
@@ -727,18 +695,6 @@ class ConceptGroundingNetwork:
             logger.info("[CGN] Bootstrapped %d concepts for '%s'", count, consumer)
 
         return count
-
-    # ── Phase B: cross-consumer maturity (§9.2) ─────────────────────────
-    def pop_matured_concepts(self) -> list:
-        """Return + clear concepts that just crossed the cross-consumer maturity
-        floor (≥N distinct consumers). Drained by cgn_worker, which publishes a
-        CGN_CONCEPT_GROUNDED bus event per concept (the Level-B trigger). Each
-        concept reports at most once (deduped via _matured_emitted)."""
-        if not self._pending_matured:
-            return []
-        out = self._pending_matured
-        self._pending_matured = []
-        return out
 
     # ── Cross-Domain Insights ─────────────────────────��─────────────────
 
@@ -1514,9 +1470,6 @@ class ConceptGroundingNetwork:
                 k: {**v, "consumers_seen": list(v.get("consumers_seen", set()))}
                 for k, v in self._concept_journeys.items()
             }
-            # Phase B (§9.2) — persist already-emitted matured concepts so a restart
-            # doesn't re-fire CGN_CONCEPT_GROUNDED for concepts that already matured.
-            state["matured_emitted"] = list(self._matured_emitted)
             state["surprise_buffer"] = self._surprise_buffer[-50:]
 
             # HAOV: save verified rules per consumer
@@ -1605,8 +1558,6 @@ class ConceptGroundingNetwork:
                 k: {**v, "consumers_seen": set(v.get("consumers_seen", []))}
                 for k, v in raw_journeys.items()
             }
-            # Phase B (§9.2) — restore already-emitted matured concepts (don't re-fire).
-            self._matured_emitted = set(state.get("matured_emitted", []))
             self._surprise_buffer = state.get("surprise_buffer", [])
 
             # HAOV: restore verified rules per consumer
