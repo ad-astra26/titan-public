@@ -26,7 +26,24 @@ import time
 from collections import Counter
 
 _ENV_FLAG = "TITAN_GC_LEAK_PROBE"
+# Sentinel-file fallback: kernel-rs (L0) spawns the python peers with a CURATED
+# env that drops arbitrary TITAN_* vars, so env activation can't reach workers.
+# A sentinel file is env-independent: workers read it at startup. Presence =
+# enabled; file CONTENT (if non-empty) = comma-separated worker allowlist, else
+# all workers. Create: `echo "memory,social_worker,..." > /tmp/titan_gc_leak_probe`.
+_SENTINEL_FILE = "/tmp/titan_gc_leak_probe"
 _started: set[str] = set()
+
+
+def _resolve_flag() -> tuple[bool, str]:
+    """(enabled, allowlist_csv) from env first, then the sentinel file."""
+    if os.environ.get(_ENV_FLAG) == "1":
+        return True, os.environ.get("TITAN_GC_LEAK_PROBE_WORKERS", "")
+    try:
+        with open(_SENTINEL_FILE) as f:
+            return True, f.read().strip()
+    except OSError:
+        return False, ""
 
 
 def _rss_mb() -> float:
@@ -73,12 +90,13 @@ def start_gc_leak_probe(worker_name: str, interval_s: float = 30.0,
     Returns True if started, False if the flag is off (no-op) or already running.
     Safe to call unconditionally at worker startup.
     """
-    if os.environ.get(_ENV_FLAG) != "1":
+    enabled, allow = _resolve_flag()
+    if not enabled:
         return False
-    # Optional allowlist: TITAN_GC_LEAK_PROBE_WORKERS=memory,social_worker,...
-    # When set, only those workers probe (keeps the heavy-load run's overhead on
-    # the targets, not all ~40 workers). Unset = probe every worker.
-    allow = os.environ.get("TITAN_GC_LEAK_PROBE_WORKERS", "").strip()
+    # Optional allowlist (env TITAN_GC_LEAK_PROBE_WORKERS or sentinel-file
+    # content): only those workers probe — keeps the heavy-load run's overhead
+    # on the targets, not all ~40 workers. Empty = probe every worker.
+    allow = allow.strip()
     if allow and worker_name not in {w.strip() for w in allow.split(",") if w.strip()}:
         return False
     if worker_name in _started:
