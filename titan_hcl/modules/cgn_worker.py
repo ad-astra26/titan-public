@@ -1125,8 +1125,18 @@ def cgn_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             elif action == "get_cross_insights":
                 consumer = payload.get("consumer", "")
                 insights = cgn.get_cross_insights(consumer)
-                _send_response(send_queue, name, msg.get("src", ""),
-                               {"insights": insights}, msg.get("rid"))
+                # rFP_haov_efficacy_closure §3E (C1→C2/C3 delivery fix, I-003):
+                # the consumers (language_worker:1884, social_worker) listen on
+                # QUERY_RESPONSE keyed by payload.action — NOT the generic RESPONSE
+                # that _send_response emits. Pre-fix the reply type/shape mismatched
+                # the handler, so cross-insights (incl. C1 haov_verified rules) never
+                # arrived — the apply channel was structurally dead. Reply with the
+                # type+shape the async consumers expect.
+                _send_msg(send_queue, bus.QUERY_RESPONSE, name,
+                          msg.get("src", ""),
+                          {"action": "get_cross_insights",
+                           "consumer": consumer, "insights": insights},
+                          msg.get("rid"))
 
         # ── MODULE_SHUTDOWN ───────────────────────────────────────
         # ── Microkernel v2 Phase B.1 §6 — shadow swap dispatch ────
