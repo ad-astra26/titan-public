@@ -446,6 +446,10 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                     "(dry-run expected Session 1-2)", req_id[:8], failure)
             else:
                 insight = payload.get("insight") or {}
+                # Resolver insight may be a list/str (e.g. recall_context returns
+                # a list of recalled items); only dicts carry suggested_action.
+                if not isinstance(insight, dict):
+                    insight = {}
                 logger.info(
                     "[LangMeta] response req_id=%s conf=%.2f sugg=%s",
                     req_id[:8], conf,

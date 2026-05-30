@@ -398,6 +398,10 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                     "(dry-run expected)", req_id[:8], failure)
             else:
                 insight = payload.get("insight") or {}
+                # Resolver insight may be a list/str (e.g. recall_context returns
+                # a list of recalled items); only dicts carry suggested_action.
+                if not isinstance(insight, dict):
+                    insight = {}
                 logger.info(
                     "[KnMeta] response req_id=%s sugg=%s",
                     req_id[:8],
@@ -678,6 +682,36 @@ def knowledge_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                                     reason=f"first grounding of topic '{topic}' "
                                            f"(quality={quality:.2f}, requestor={requestor})",
                                 )
+                                # ── Phase A (RFP_cgn_enhancements §9.1) ──────────
+                                # Same edge gate (first grounding of this topic):
+                                # ALSO fire a learning-event chain trigger so the
+                                # meta chain walks THIS concept (the topic) instead
+                                # of collapsing to FORMULATE.define (§5.3).
+                                # question_type=hypothesize_cause (SIGNAL_TO_PRIMITIVE
+                                # dominant for knowledge.concept_grounded → HYPOTHESIZE
+                                # 0.70). Wrapped: never break the producer loop.
+                                try:
+                                    from titan_hcl.logic.meta_service_client import (
+                                        send_meta_request as _kn_mrq)
+                                    from titan_hcl.logic.meta_consumer_contexts import (
+                                        build_knowledge_meta_context_30d as _kn_mrq_ctx)
+                                    _kn_mrq(
+                                        consumer_id="knowledge",
+                                        question_type="hypothesize_cause",
+                                        context_vector=_kn_mrq_ctx(),
+                                        time_budget_ms=2000,
+                                        send_queue=send_queue,
+                                        src="knowledge",
+                                        grounding_payload={"concept_id": str(topic)[:128]},
+                                        payload_snippet=f"know.concept_grounded:{str(topic)[:40]}",
+                                    )
+                                    logger.info(
+                                        "[Phase A] knowledge.concept_grounded → "
+                                        "META_REASON_REQUEST (concept=%s)", str(topic)[:40])
+                                except Exception as _kn_mrq_err:
+                                    logger.warning(
+                                        "[Phase A] knowledge concept_grounded "
+                                        "meta-request failed: %s", _kn_mrq_err)
                                 if _p10_sent:
                                     logger.info(
                                         "[META-CGN] knowledge.concept_grounded EMIT — "
