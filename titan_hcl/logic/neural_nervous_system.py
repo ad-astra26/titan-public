@@ -22,7 +22,7 @@ import time
 
 import numpy as np
 
-from .neural_reflex_net import NeuralReflexNet, NervousTransitionBuffer
+from .neural_reflex_net import NeuralReflexNet, NervousTransitionBuffer, _load_any
 from .observation_space import ObservationSpace
 from .hormonal_pressure import HormonalSystem, extract_stimuli
 from .inner_memory import InnerMemoryStore
@@ -1349,8 +1349,13 @@ class NeuralNervousSystem:
                     buf = self.buffers[name]
                     # Cast fired to plain bool (numpy.bool_ is not JSON-serializable)
                     fired_list = [bool(f) for f in buf._fired[-buf.max_size:]]
+                    # PROFILING.md F4b — observation rows may be ndarrays (binary
+                    # load keeps them as 1D arrays); normalize to lists so this
+                    # SQLite-backup json.dumps (the recovery net) never breaks.
+                    _obs_rows = [o.tolist() if hasattr(o, "tolist") else list(o)
+                                 for o in buf._observations[-buf.max_size:]]
                     b_data = json.dumps({
-                        "observations": buf._observations[-buf.max_size:],
+                        "observations": _obs_rows,
                         "urgencies": buf._urgencies[-buf.max_size:],
                         "vm_baselines": buf._vm_baselines[-buf.max_size:],
                         "rewards": buf._rewards[-buf.max_size:],
@@ -1469,13 +1474,17 @@ class NeuralNervousSystem:
 
             # Check for dimension migration before loading
             _needs_migration = False
+            _saved = {}
             if os.path.exists(w_path):
                 try:
-                    with open(w_path) as f:
-                        _saved = json.load(f)
-                    _needs_migration = _saved.get("input_dim", 55) != net.input_dim
+                    # Dual-read (binary msgpack OR legacy JSON) — PROFILING.md F4.
+                    # MUST match NeuralReflexNet.save format; a bare json.load here
+                    # threw UnicodeDecodeError on binary files (the migration
+                    # pre-check only — net.load() below still loaded correctly).
+                    _saved = _load_any(w_path)
+                    _needs_migration = int(_saved.get("input_dim", 55)) != net.input_dim
                 except Exception as _swallow_exc:
-                    swallow_warn('[logic.neural_nervous_system] NeuralNervousSystem._load_all: with open(w_path) as f: _saved = json.load(f)', _swallow_exc,
+                    swallow_warn('[logic.neural_nervous_system] NeuralNervousSystem._load_all: _saved = _load_any(w_path)', _swallow_exc,
                                  key='logic.neural_nervous_system.NeuralNervousSystem._load_all.line1445', throttle=100)
 
             _cfg_feature_set = net._feature_set  # Config-defined (from _register_program)

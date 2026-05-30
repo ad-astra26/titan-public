@@ -21,7 +21,55 @@ from typing import Optional
 
 import numpy as np
 
+try:
+    import msgpack as _msgpack
+except Exception:  # pragma: no cover — msgpack is a core dep; fall back to JSON only
+    _msgpack = None
+
 logger = logging.getLogger(__name__)
+
+
+# ── Binary persistence (PROFILING.md F4 — f64-LE lossless (cf. D-SPEC-144 f32-BLOB)) ──────
+# JSON-dumping float arrays (`floatstr` per float) across 24+ programs on the
+# save_all() background thread was ~27% of cognitive_worker CPU (2026-05-30
+# py-spy). These helpers persist float arrays as little-endian f32 bytes inside
+# one msgpack frame instead — ~10-50x faster encode, smaller files. `load`
+# stays dual-read: legacy JSON files (first non-space byte `{`/`[`) still load.
+
+def _pack_arrays(arrays: dict) -> dict:
+    """{name: ndarray-like} → {name: [shape, f64-LE bytes]} for msgpack."""
+    out = {}
+    for k, v in arrays.items():
+        a = np.ascontiguousarray(v, dtype="<f8")
+        out[k] = [list(a.shape), a.tobytes()]
+    return out
+
+
+def _save_bin(path: str, meta: dict, arrays: dict) -> None:
+    """Atomic msgpack write: {_fmt, meta(scalars/strings), arrays(f32 blobs)}."""
+    payload = {"_fmt": "nrn1", "meta": meta, "arrays": _pack_arrays(arrays)}
+    blob = _msgpack.packb(payload, use_bin_type=True)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(blob)
+    os.replace(tmp, path)
+
+
+def _load_any(path: str) -> dict:
+    """Dual-read → flat dict (meta keys + array keys as np.float64 arrays).
+    Detects legacy JSON (first non-space byte `{`/`[`) vs the msgpack binary."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    head = raw.lstrip()[:1]
+    if head in (b"{", b"["):  # legacy JSON
+        return json.loads(raw.decode("utf-8"))
+    p = _msgpack.unpackb(raw, raw=False)
+    data = dict(p.get("meta", {}))
+    for k, (shape, b) in p.get("arrays", {}).items():
+        data[k] = np.frombuffer(b, dtype="<f8").reshape(shape)
+    return data
+
 
 # Defaults
 DEFAULT_INPUT_DIM = 55
@@ -163,8 +211,9 @@ class NeuralReflexNet:
                 self.hidden_2 * 1 + 1)
 
     def save(self, path: str) -> None:
-        """Save weights + stats to JSON. Atomic write (tmp→rename)."""
-        data = {
+        """Save weights + stats as binary msgpack (f64-LE arrays, lossless). Atomic write
+        (tmp→rename). load() stays dual-read (legacy JSON still loads). PROFILING.md F4."""
+        meta = {
             "name": self.name,
             "input_dim": self.input_dim,
             "hidden_1": self.hidden_1,
@@ -175,26 +224,25 @@ class NeuralReflexNet:
             "total_updates": self.total_updates,
             "last_loss": self.last_loss,
             "fire_count": self.fire_count,
-            "w1": self.w1.tolist(),
-            "b1": self.b1.tolist(),
-            "w2": self.w2.tolist(),
-            "b2": self.b2.tolist(),
-            "w3": self.w3.tolist(),
-            "b3": self.b3.tolist(),
         }
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, path)
+        arrays = {"w1": self.w1, "b1": self.b1, "w2": self.w2,
+                  "b2": self.b2, "w3": self.w3, "b3": self.b3}
+        if _msgpack is None:  # fallback: legacy JSON only if msgpack unavailable
+            data = {**meta, **{k: v.tolist() for k, v in arrays.items()}}
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, path)
+            return
+        _save_bin(path, meta, arrays)
 
     def load(self, path: str) -> bool:
-        """Load weights + stats from JSON. Supports dimension migration."""
+        """Load weights + stats (binary msgpack or legacy JSON). Supports dimension migration."""
         if not os.path.exists(path):
             return False
         try:
-            with open(path) as f:
-                data = json.load(f)
+            data = _load_any(path)
 
             saved_dim = data.get("input_dim", DEFAULT_INPUT_DIM)
             saved_h1 = data.get("hidden_1", DEFAULT_HIDDEN_1)
@@ -462,32 +510,54 @@ class NervousTransitionBuffer:
 
     def save(self, path: str) -> None:
         """Persist to JSON. Atomic write (tmp→rename)."""
-        data = {
-            "observations": self._observations[-self.max_size:],
-            "urgencies": self._urgencies[-self.max_size:],
-            "vm_baselines": self._vm_baselines[-self.max_size:],
-            "rewards": self._rewards[-self.max_size:],
-            # Cast fired to plain bool (numpy.bool_ is not JSON-serializable)
-            "fired": [bool(f) for f in self._fired[-self.max_size:]],
+        obs = self._observations[-self.max_size:]
+        arrays = {
+            "observations": (np.asarray(obs, dtype="<f8") if obs
+                             else np.zeros((0, 0), dtype="<f8")),
+            "urgencies": np.asarray(self._urgencies[-self.max_size:], dtype="<f8"),
+            "vm_baselines": np.asarray(self._vm_baselines[-self.max_size:], dtype="<f8"),
+            "rewards": np.asarray(self._rewards[-self.max_size:], dtype="<f8"),
+            # bools as 1.0/0.0 f32 (uniform blob; restored to bool on load)
+            "fired": np.asarray([1.0 if f else 0.0
+                                 for f in self._fired[-self.max_size:]], dtype="<f8"),
         }
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, path)
+        if _msgpack is None:  # fallback: legacy JSON only if msgpack unavailable
+            data = {
+                "observations": obs,
+                "urgencies": self._urgencies[-self.max_size:],
+                "vm_baselines": self._vm_baselines[-self.max_size:],
+                "rewards": self._rewards[-self.max_size:],
+                "fired": [bool(f) for f in self._fired[-self.max_size:]],
+            }
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, path)
+            return
+        _save_bin(path, {}, arrays)
 
     def load(self, path: str) -> bool:
-        """Load from JSON. Returns True if loaded."""
+        """Load from binary msgpack or legacy JSON. Returns True if loaded."""
         if not os.path.exists(path):
             return False
         try:
-            with open(path) as f:
-                data = json.load(f)
-            self._observations = data.get("observations", [])
-            self._urgencies = data.get("urgencies", [])
-            self._vm_baselines = data.get("vm_baselines", [])
-            self._rewards = data.get("rewards", [])
-            self._fired = data.get("fired", [])
+            data = _load_any(path)
+
+            def _tolist(x):
+                return x.tolist() if hasattr(x, "tolist") else (x or [])
+            # PROFILING.md F4b — observations is the 2D hot array. For the binary
+            # path keep its rows as 1D ndarrays (list(arr) = N row-views) instead
+            # of arr.tolist() (which materializes N×D Python floats — ~27% of a
+            # booting cognitive_worker). add() appends list rows; mixed list/ndarray
+            # rows are fine for index/sample/save (np.asarray stacks either). Rows
+            # are read-only views and never mutated in place (verified usages).
+            _obs = data.get("observations", [])
+            self._observations = list(_obs) if hasattr(_obs, "shape") else (_obs or [])
+            self._urgencies = _tolist(data.get("urgencies", []))
+            self._vm_baselines = _tolist(data.get("vm_baselines", []))
+            self._rewards = _tolist(data.get("rewards", []))
+            self._fired = [bool(x) for x in _tolist(data.get("fired", []))]
             # Find last fired index
             self._last_fired_idx = -1
             for i in range(len(self._fired) - 1, -1, -1):

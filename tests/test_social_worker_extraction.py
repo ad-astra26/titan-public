@@ -95,8 +95,12 @@ class TestSocialWorkerSkeleton:
         # MENTION_RECEIVED, FELT_EXPERIENCE_CAPTURED, ENGAGEMENT_SNAPSHOT_TAKEN
         # HEAL_REQUEST (D-SPEC-67 v1.12.0 — health_monitor_worker plugin
         #               framework; social_worker first HEAL_REQUEST owner)
-        assert len(_SOCIAL_WORKER_SUBSCRIBE_TOPICS) == 11, \
-            f"expected 11 topics, got {len(_SOCIAL_WORKER_SUBSCRIBE_TOPICS)}"
+        # MODULE_PROBE_REQUEST (Phase 11 §11.I.3 probe handler — added with the
+        #               probe dispatcher; test count had not been bumped)
+        # QUERY_RESPONSE (rFP_haov_efficacy_closure §3E C3 — cross-insights reply
+        #               carrying language's verified HAOV concepts for engage-bias)
+        assert len(_SOCIAL_WORKER_SUBSCRIBE_TOPICS) == 13, \
+            f"expected 13 topics, got {len(_SOCIAL_WORKER_SUBSCRIBE_TOPICS)}"
         assert bus.SOCIAL_CATALYST in _SOCIAL_WORKER_SUBSCRIBE_TOPICS
         assert bus.MODULE_SHUTDOWN in _SOCIAL_WORKER_SUBSCRIBE_TOPICS
         assert bus.X_FORCE_POST in _SOCIAL_WORKER_SUBSCRIBE_TOPICS

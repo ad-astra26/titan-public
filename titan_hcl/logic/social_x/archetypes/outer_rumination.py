@@ -94,16 +94,20 @@ class OuterRuminationArchetype(ArchetypeBase):
         # archetype after each source got cited once on low-volume pools.
         cited_lifetime = self.cited_set(titan_id=titan_id,
                                          window_seconds=30 * 86400)
+        # Per-author 7-day cross-archetype cooldown (Maker 2026-05-30): a hard
+        # gate ON TOP of the existing soft Pool-A penalty — no account is
+        # ruminated on if any outer archetype already engaged it this week.
+        cooldown = self.authors_on_cooldown(titan_id=titan_id, now=now)
 
         candidates: dict[str, dict] = {}
         a = self._pool_a(titan_id=titan_id, now=now, cited=cited_lifetime,
-                         context=context)
+                         context=context, cooldown=cooldown)
         if a:
             candidates[POOL_A] = a
-        b = self._pool_b(titan_id=titan_id, now=now)
+        b = self._pool_b(titan_id=titan_id, now=now, cooldown=cooldown)
         if b:
             candidates[POOL_B] = b
-        c = self._pool_c(now=now, cited=cited_lifetime)
+        c = self._pool_c(now=now, cited=cited_lifetime, cooldown=cooldown)
         if c:
             candidates[POOL_C] = c
 
@@ -121,7 +125,7 @@ class OuterRuminationArchetype(ArchetypeBase):
     # ── Pool queries ────────────────────────────────────────────────
 
     def _pool_a(self, *, titan_id: str, now: float, cited: set[str],
-                context=None) -> dict | None:
+                context=None, cooldown: set[str] | None = None) -> dict | None:
         """Pool A — felt_experiences settled. Diversified pick (2026-05-23):
 
         1. Fetch wider window [1d, 30d] × relevance ≥ 0.5 (was 2-7d × 0.65,
@@ -163,13 +167,16 @@ class OuterRuminationArchetype(ArchetypeBase):
             titan_id=titan_id, now=now)
         grounded_tokens = self._titan_grounded_token_set(context)
 
+        cooldown = cooldown or set()
         eligible: list[tuple[float, dict]] = []
         for r in rows:
             sid = f"feA:{r['id']}"
             if sid in cited:
                 continue
-            base = float(r["relevance"] or 0.0)
             author = (r["author"] or "").lower()
+            if author in cooldown:
+                continue
+            base = float(r["relevance"] or 0.0)
             penalty = (POOL_A_PER_AUTHOR_PENALTY
                        * author_citations.get(author, 0))
             boost = 0.0
@@ -267,9 +274,11 @@ class OuterRuminationArchetype(ArchetypeBase):
                 break
         return out
 
-    def _pool_b(self, *, titan_id: str, now: float) -> dict | None:
+    def _pool_b(self, *, titan_id: str, now: float,
+                cooldown: set[str] | None = None) -> dict | None:
         """Kuzu Person high-interaction, last_seen ∈ [2 d, 14 d], not subject
         of OR within 14 d."""
+        cooldown = cooldown or set()
         if self._kuzu_graph is None:
             return None
         try:
@@ -302,6 +311,8 @@ class OuterRuminationArchetype(ArchetypeBase):
         recent_subjects = self._recent_pool_b_subjects(titan_id=titan_id, now=now)
         for r in rows:
             if r["name"].lower() in recent_subjects:
+                continue
+            if r["name"].lower() in cooldown:
                 continue
             days_ago = max(1, int((now - r["last_seen"]) / 86400))
             sid = f"personB:{r['name']}"
@@ -341,7 +352,9 @@ class OuterRuminationArchetype(ArchetypeBase):
                     out.add(h)
         return out
 
-    def _pool_c(self, *, now: float, cited: set[str]) -> dict | None:
+    def _pool_c(self, *, now: float, cited: set[str],
+                cooldown: set[str] | None = None) -> dict | None:
+        cooldown = cooldown or set()
         try:
             sx = sqlite3.connect(self.db_path, timeout=5)
             sx.row_factory = sqlite3.Row
@@ -362,6 +375,8 @@ class OuterRuminationArchetype(ArchetypeBase):
         for r in rows:
             sid = f"mentionC:{r['tweet_id']}"
             if sid in cited:
+                continue
+            if (r["author_handle"] or r["author"] or "").lower() in cooldown:
                 continue
             days_ago = max(1, int((now - r["replied_at"]) / 86400))
             return {

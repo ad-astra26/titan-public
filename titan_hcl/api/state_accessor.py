@@ -542,6 +542,19 @@ class MetaTeacherAccessor(_SubAccessorBase):
         return self._shm.read_meta_teacher_state() or {}
 
 
+class ExperienceAccessor(_SubAccessorBase):
+    """Experience-orchestrator stats — SHM-direct via experience_stats.bin
+    (publisher: cognitive_worker / ExperienceOrchestrator per SPEC §7.1 /
+    D-SPEC-PHASE15). §3L Phase 15 chunk 15.1: replaces the retired frozen
+    ExperienceMemory.get_stats recompute-on-read path per Preamble G18."""
+
+    def __init__(self, shm: ShmReaderBank) -> None:
+        self._shm = shm
+
+    def get_stats(self) -> dict:
+        return self._shm.read_experience_stats() or {}
+
+
 class SocialAccessor(_SubAccessorBase):
     """Social/persona state — SHM-direct via social_graph_state.bin
     (publisher: social_graph_worker per SPEC §7.1 row 794 / D-SPEC-49).
@@ -773,6 +786,7 @@ class TitanStateAccessor:
         self.reasoning = ReasoningAccessor(shm)
         self.guardian = GuardianAccessor(shm)
         self.meta_teacher = MetaTeacherAccessor(shm)
+        self.experience = ExperienceAccessor(shm)
         self.llm = LLMAccessor(shm)
         self.media = MediaAccessor(shm)
         self.config = ConfigAccessor(full_config or {})
