@@ -364,10 +364,19 @@ class LanguageTeacher:
             # Pick a word to enrich
             target_word = self._pick_word_for_enrichment(words_used, vocabulary)
             word_type = self._get_word_type(target_word, vocabulary)
+            # Felt-state-matched acquisition (restored 2026-05-30): the being
+            # just expressed `sentence` — its felt state. Teach the meaning using
+            # MOSTLY known words, but naturally introduce 1-2 NEW words that name
+            # what it is feeling. The comprehension bridge acquires + perturbs
+            # them (the "child learns new words from context" design — system
+            # prompt already asks for this; this aligns the mode prompt with it
+            # instead of overriding it with "ONLY these words").
             prompt = (
-                f"A being used the word '{target_word}' ({word_type}). "
-                f"Explain its meaning in 1 sentence using ONLY these words: {vocab_list}. "
-                f"Connect the meaning to feelings."
+                f"A being used the word '{target_word}' ({word_type}) and expressed: "
+                f"'{sentence}'. Explain its meaning in 1 short sentence using mostly "
+                f"these known words: {vocab_list}. Connect the meaning to feelings, and "
+                f"naturally introduce 1-2 NEW words that name what the being seems to be "
+                f"feeling — the being learns new words from context, like a child."
             )
             return {"system": system, "prompt": prompt, "mode": mode,
                     "original": sentence, "target_word": target_word, "max_tokens": 80}
@@ -398,10 +407,14 @@ class LanguageTeacher:
             recent_uses = [q["sentence"] for q in queue
                           if target_word in q.get("words_used", [])][:3]
             uses_str = " / ".join(recent_uses) if recent_uses else sentence
+            # Felt-state-matched acquisition (restored 2026-05-30) — see meaning
+            # mode. Mostly-known words + 1-2 NEW words that fit the feeling.
             prompt = (
                 f"The word '{target_word}' has been used like this: {uses_str}. "
-                f"In 1 sentence using ONLY these words: {vocab_list}, "
-                f"show a DIFFERENT way to use '{target_word}'."
+                f"In 1 short sentence using mostly these known words: {vocab_list}, "
+                f"show a DIFFERENT way to use '{target_word}', and gently introduce "
+                f"1-2 NEW words that fit the feeling the being is expressing — it "
+                f"learns new words from context, like a child."
             )
             return {"system": system, "prompt": prompt, "mode": mode,
                     "original": sentence, "target_word": target_word, "max_tokens": 80}
