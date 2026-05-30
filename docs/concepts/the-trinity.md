@@ -168,12 +168,11 @@ The Trinity is visible in three places:
 - **`arch_map trinity` (or `arch_map verify trinity --all`)** —
   per-quadrant state dump (current values, recent variance, sphere-clock
   position).
-- **Observatory dashboard** — three Three.js visualizations:
-  - **Cell** — the 65D inner + 65D outer rendered as a living
-    bilayer membrane
-  - **Mandala** — the topology 30D rendered as radial symmetry
-  - **Constellation** — sphere-clock positions of all six layers as
-    points in spatial relation
+- **TC² console** (Stats tab) — the live numeric trinity state:
+  per-quadrant values, neurochemistry, and sphere-clock position.
+  (The maintainer's separate Observatory showcase additionally renders
+  these as three.js visualizations — Cell, Mandala, Constellation — but
+  that heavier UI is not part of a user install.)
 - **TimeChain entries** — every meditation anchors the 162D snapshot.
   You can walk the chain back over months and see the trinity drift.
 

@@ -1,6 +1,6 @@
 """Titan brand UI primitives — palette, Textual CSS, base App.
 
-Canonical brand source: `titan-observatory/app/globals.css` + `tailwind.config.ts`.
+Canonical brand source: `titan-console/src/index.css` (the TC² SPA brand tokens).
 Semantic names are used everywhere — never raw hex outside this file.
 
 Roles:
@@ -11,11 +11,11 @@ Roles:
     growth          teal — success, "alive", positive state
     danger          red — only for genuine errors
 
-Glows mirror the Observatory's haze-glow / pulse-glow / growth-glow shadows.
+Glows mirror the TC² console's haze-glow / pulse-glow / growth-glow shadows.
 """
 from __future__ import annotations
 
-# ── canonical brand palette (mirrors titan-observatory/app/globals.css) ──
+# ── canonical brand palette (mirrors titan-console/src/index.css) ──
 BRAND = {
     "bg":      "#0B0E14",  # --titan-bg
     "card":    "#1A1D23",  # --titan-card

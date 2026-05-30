@@ -155,12 +155,6 @@ class ModuleSpec:
     # Closes the per-subscriber flood class identified 2026-04-30
     # (backup queue receiving SPHERE_PULSE/SPIRIT_STATE/etc. it never
     # consumes). See bus_socket.py:563 BrokerSubscriber.publish docs.
-    #
-    # ⚠️ NOT a CPU lever (PROFILING.md F1, under-load --gil sweep 2026-05-30):
-    # the "recv_exact 45-100%" that motivated this filter was py-spy WITHOUT
-    # --gil counting BLOCKED bus-receive threads — the named workers burn 0%
-    # CPU idle AND under load. Any value here is bus-throughput / msgpack-unpack
-    # churn / correctness, NOT baseline CPU. Do not justify migration on CPU.
     broadcast_topics: list = field(default_factory=list)
     # Microkernel v2 Phase B.2.1 §M5 (2026-04-27 PM): adoption criticality.
     # When True (default): worker MUST adopt for shadow swap to succeed —

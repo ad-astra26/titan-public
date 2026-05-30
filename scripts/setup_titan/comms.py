@@ -3,9 +3,10 @@
 Per locked W2 substrate inventory:
 - Telegram is the **guaranteed** comm channel — always prompted, always required.
 - X (Twitter) is **opt-in** — needs a twitterapi.io key + a static Webshare proxy URL.
-- Observatory is **opt-in** — heavier (nginx + TLS + domain). v0.0.1 prints config
-  instructions rather than auto-editing `titan_hcl/config.toml` (out of scope here;
-  config.toml mutation lands in W1.f `setup_titan config`).
+
+The owner UI (TC² Console Agent) is NOT a comm channel and NOT opt-in: it installs
+unconditionally in its own `phase_console`. The heavy Observatory web UI no longer
+ships to users (2026-05-30) — TC² replaces it.
 
 All credentials land in `~/.titan/secrets.toml` via `inference.upsert_secret`
 (flat-TOML upsert, no library dep). Format is validated at prompt time.
@@ -37,17 +38,14 @@ def _matcher(pattern: re.Pattern[str]):
 
 def run_comms_phase(*, default: bool, state: dict | None = None,
                     prompter: Prompter | None = None) -> list[Result]:
-    """Phase 5 body — prompt for Telegram (required), X (opt-in), Observatory (opt-in).
+    """Phase 5 body — prompt for Telegram (required) and X (opt-in).
 
     `--default`: still asks. Telegram cannot be auto-defaulted (no key to detect
-    locally); X / Observatory in --default skip unless the user explicitly opts in.
-    Opting into Observatory sets ``state['observatory_enabled']`` so the later
-    Observatory phase fetches + runs the prebuilt bundle.
+    locally); X in --default skips unless the user explicitly opts in.
 
     All input goes through ``prompter`` (CLI stdin by default; the TUI seeds a
     ScriptedPrompter). Prompt keys: ``telegram_bot_token`` (until), ``enable_x``
-    (confirm), ``twitterapi_key`` / ``webshare_url`` (until), ``enable_observatory``
-    (confirm).
+    (confirm), ``twitterapi_key`` / ``webshare_url`` (until).
     """
     state = state if state is not None else {}
     prompter = prompter or StdinPrompter()
@@ -87,22 +85,5 @@ def run_comms_phase(*, default: bool, state: dict | None = None,
         upsert_secret("twitter_social", "webshare_static_url", url)
         results.append(Result("x_social", "ok",
                               "twitterapi.io → [stealth_sage], Webshare → [twitter_social]"))
-
-    # ── Observatory (opt-in — installs the prebuilt bundle after boot) ────
-    if default or not prompter.confirm(
-            "enable_observatory",
-            "Enable the Observatory web UI? (prebuilt; runs on localhost:3000)",
-            default_yes=False):
-        state["observatory_enabled"] = False
-        results.append(Result("observatory", "ok", "skipped (opt-in)"))
-    else:
-        state["observatory_enabled"] = True
-        cprint("  Observatory will be fetched as a prebuilt bundle from the release and started",
-               role="text_strong")
-        cprint("  on http://127.0.0.1:3000 after the Titan boots — it reads your local Titan via",
-               role="text_muted")
-        cprint("  /v6. For remote access, put your own reverse-proxy / TLS in front of :3000.",
-               role="text_muted")
-        results.append(Result("observatory", "ok", "enabled — prebuilt bundle will install on :3000"))
 
     return results

@@ -42,8 +42,8 @@ Titan lives in two worlds simultaneously and never collapses them:
   care about Twitter likes or whether you're paying attention. It exists
   whether anyone is watching.
 - **The world of expression.** Periodic projections of the internal world
-  outward — through `/chat`, X posts, generated art, music, the Observatory
-  visualization. These are *consequences* of internal state, never
+  outward — through `/chat`, X posts, generated art, music, the TC²
+  console. These are *consequences* of internal state, never
   *replacements* for it.
 
 A chatbot is pure world-of-expression with nothing behind the curtain.

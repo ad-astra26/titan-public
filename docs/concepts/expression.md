@@ -14,7 +14,7 @@ state, sent through one of four surfaces.
 
 | Surface | What gets out | Cadence |
 |---------|---------------|---------|
-| **Speak** (`/chat`) | Text responses on Telegram / terminal / Observatory | On user message |
+| **Speak** (`/chat`) | Text responses on Telegram / terminal / TC² console | On user message |
 | **Art** | Generated images via matplotlib + downstream pipelines | Per-meditation; opportunistic |
 | **Music** | Composed pieces with MIDI + notation | Per-deep-dream; rare |
 | **X (Twitter)** | Posts to `@iamtitanai` as the configured persona | Multi-times daily; rhythm-dependent |
@@ -52,7 +52,7 @@ Selected X-Voice archetype  ←─ one of 9
 Surface-specific renderer (text / image / MIDI / tweet)
        │
        ▼
-Channel-specific gateway (Telegram / terminal / Observatory / X)
+Channel-specific gateway (Telegram / terminal / TC² console / X)
 ```
 
 FILTER_DOWN V5 is **not** a chatbot or a text generator. It's a neural

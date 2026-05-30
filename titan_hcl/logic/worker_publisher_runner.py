@@ -45,12 +45,6 @@ def run_worker_publisher(
     """
     Start a daemon thread that runs publisher.publish(...) at cadence_s.
 
-    ⚠️ The 1 Hz publisher tick is NOT a CPU lever (PROFILING.md F3, under-load
-    --gil sweep 2026-05-30): the ~40 publisher-running workers measure 0% CPU
-    (kernel proc-CPU%, idle AND under load). The prior "~1.5% × 40" was inferred
-    from the same blocked-thread py-spy table, not measured. A publish-on-change
-    refactor may cut bus traffic / SHM write churn, but will not reclaim core CPU.
-
     Args:
       publisher        — instance with .publish(*args) method (typically
                          a BaseStatePublisher subclass)

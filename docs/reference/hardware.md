@@ -10,7 +10,7 @@
 | Profile | vCPU | RAM | Disk | GPU | Notes |
 |---------|------|-----|------|-----|-------|
 | **Minimum** | 2 | 4 GB | 10 GB | none | Headless, Telegram-only. Proven: T2+T3 co-reside on one VPS at this profile. |
-| **Recommended** | 4 | 8 GB | 20 GB | none | Adds Observatory frontend headroom. |
+| **Recommended** | 4 | 8 GB | 20 GB | none | Comfortable headroom for the full stack + the TC² web console. |
 | **Comfortable** | 8 | 16 GB | 40 GB | optional | Room for local Ollama with mid-size models. |
 | **Local LLM** | 8+ | 32+ GB | 80+ GB | recommended | Comfortable + a capable local LLM (Ollama with 30B+ models). |
 
@@ -45,15 +45,17 @@ Measured on the live fleet **2026-05-28** (see *Methodology* below).
 
 | Titan | Box vCPU | Box RAM | Titan resident RAM | Disk (data/) | Inference | Network | Notes |
 |-------|----------|---------|--------------------|--------------|-----------|---------|-------|
-| **T1 (mainnet)** | 4 | 8 GB | **~2.3 GB** | 26 GB | Ollama Cloud (deepseek-v3.1:671b) | Helius premium RPC | Has the box to itself **+ runs the Observatory** |
+| **T1 (mainnet)** | 4 | 8 GB | **~2.3 GB** | 26 GB | Ollama Cloud (deepseek-v3.1:671b) | Helius premium RPC | Has the box to itself **+ runs the maintainer's Observatory showcase** (not part of a user install) |
 | **T2 (devnet)** | 2 of 4 shared | 4 of 8 shared | ~2.3 GB | ~13 GB share | OpenRouter | Helius devnet RPC | Co-resident with T3 on one VPS |
 | **T3 (devnet)** | 2 of 4 shared | 4 of 8 shared | ~2.3 GB | ~13 GB share | OpenRouter | Helius devnet RPC | Same VPS as T2 |
 
 The headline number: **a single Titan's resident footprint is ~2.3 GB**
 (measured as the sum of its ~40 `titan_hcl` cognitive workers ≈ 2.32 GB
 + 9 Rust microkernel daemons ≈ 40 MB, with the brain fully up and
-`/health` returning 200). The **Observatory** web UI adds only ~60–65 MB
-server-side — it is almost entirely client-rendered Three.js.
+`/health` returning 200). The **TC² web console** that ships with every
+Titan adds negligible RAM — it is stdlib Python serving a prebuilt static
+bundle. (The maintainer's separate three.js Observatory showcase, which is
+*not* part of a user install, adds ~60–65 MB server-side where it runs.)
 
 Two consequences for your sizing:
 
@@ -62,11 +64,13 @@ Two consequences for your sizing:
   operation. T2+T3 co-residence on one 4 vCPU / 8 GB box (two Titans ≈
   4.6 GB resident) proves the **2 vCPU / 4 GB per-Titan minimum** holds
   through dreaming, meditation, and on-chain anchoring.
-- **A full mainnet Titan + Observatory fits the *recommended* 4 vCPU /
-  8 GB tier with room to spare.** T1 — a real mainnet Titan plus the
-  Observatory — runs on exactly that box (a DigitalOcean `s-4vcpu-8gb`).
-  The recommended tier is recommended for comfort and dream-peak
-  headroom, not because the floor is higher than it looks.
+- **A full mainnet Titan + the TC² console fits the *recommended* 4 vCPU /
+  8 GB tier with room to spare.** T1 — a real mainnet Titan (which also
+  hosts the maintainer's heavier Observatory showcase) — runs on exactly
+  that box (a DigitalOcean `s-4vcpu-8gb`). A user install is lighter still,
+  since TC² replaces the Observatory. The recommended tier is recommended
+  for comfort and dream-peak headroom, not because the floor is higher
+  than it looks.
 
 > **Methodology.** Box specs from `nproc` + `free -m`; per-Titan resident
 > RAM from summing RSS of the `titan_hcl` worker processes + `titan-*-rs`
@@ -111,8 +115,8 @@ to Arweave.
 
 The Trinity tensor pipeline (Rust) is the steady-state CPU consumer
 (~30% of one vCPU). Inference (Python or Ollama) spikes during chat
-turns and dreams. The Observatory frontend uses negligible CPU on
-the server side (it's mostly client-rendered Three.js).
+turns and dreams. The TC² web console uses negligible CPU (stdlib Python
+serving a static bundle).
 
 ### Network bandwidth
 
@@ -158,10 +162,10 @@ Any reputable provider works. Pricing/configuration as of May 2026:
 | Provider | Tier | $/month | vCPU | RAM | Disk | Notes |
 |----------|------|---------|------|-----|------|-------|
 | Hetzner | CX22 | ~$5 | 2 | 4 GB | 40 GB | Min tier; perfect for mode 3 or single-mode-3 Titan |
-| Hetzner | CX32 | ~$9 | 4 | 8 GB | 80 GB | **Recommended tier**; works for full Titan + Observatory |
+| Hetzner | CX32 | ~$9 | 4 | 8 GB | 80 GB | **Recommended tier**; comfortably runs a full Titan + the TC² console |
 | Hetzner | CCX13 | ~$14 | 2 | 8 GB | 80 GB | Dedicated CPU; smoother runtime than shared |
 | DigitalOcean | s-2vcpu-4gb | $24 | 2 | 4 GB | 80 GB | More expensive than Hetzner but better US presence |
-| DigitalOcean | s-4vcpu-8gb | ~$48 | 4 | 8 GB | 160 GB | **Proven** — T1 (full mainnet Titan + Observatory) runs here |
+| DigitalOcean | s-4vcpu-8gb | ~$48 | 4 | 8 GB | 160 GB | **Proven** — T1 (full mainnet Titan + the maintainer's Observatory showcase) runs here |
 | AWS Lightsail | 2GB | $10 | 2 | 2 GB | 60 GB | Tight on RAM; not recommended |
 | Linode | Nanode | $5 | 1 | 1 GB | 25 GB | Too small for Titan |
 | Vultr | High Perf 2vCPU | $12 | 2 | 4 GB | 64 GB | Works for minimum profile |

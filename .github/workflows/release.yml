@@ -140,59 +140,7 @@ jobs:
             release-staging/titan-unified-spirit-rs
             release-staging/SHA256SUMS
 
-  # Observatory web UI — built as a Next.js STANDALONE bundle in a clean CI
-  # runner (never on a Titan host — building Next pegs a 4GB box). Ships as one
-  # tarball the installer extracts + runs with `node server.js` (no on-box build,
-  # no full node_modules). Runs AFTER the binary release so an Observatory build
-  # failure never blocks the daemons. No secrets: built with public env only —
-  # .env.local is gitignored/excluded, and the only NEXT_PUBLIC_* vars are URLs/
-  # flags/the public Privy app id (PITCH_TOKEN is server-side, never inlined).
-  build-observatory:
-    runs-on: ubuntu-latest
-    needs: build-and-release
-    timeout-minutes: 30
-    steps:
-      - name: Checkout tag
-        uses: actions/checkout@v4
-
-      - name: Resolve tag name
-        id: tag
-        run: echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Build standalone bundle
-        working-directory: titan-observatory
-        env:
-          NEXT_STANDALONE: '1'
-        run: |
-          set -euo pipefail
-          npm ci
-          npm run build
-          # Next standalone emits a minimal server + traced node_modules in
-          # .next/standalone, but does NOT copy static assets or public/ — do it.
-          cp -r .next/static .next/standalone/.next/static
-          [ -d public ] && cp -r public .next/standalone/public || true
-
-      - name: Package tarball + checksum
-        id: pkg
-        working-directory: titan-observatory
-        run: |
-          set -euo pipefail
-          TAG="${{ steps.tag.outputs.name }}"
-          TARBALL="titan-observatory-${TAG}.tar.gz"
-          tar -czf "../${TARBALL}" -C .next/standalone .
-          ( cd .. && sha256sum "$TARBALL" > "${TARBALL}.sha256" )
-          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
-          ls -la "../${TARBALL}"
-
-      - name: Attach Observatory bundle to the release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.name }}
-          files: |
-            ${{ steps.pkg.outputs.tarball }}
-            ${{ steps.pkg.outputs.tarball }}.sha256
+  # NOTE: the Observatory bundle is DELIBERATELY NOT built/released (2026-05-30,
+  # Maker). The full Observatory lives ONLY in the private titan-dev repo (powers
+  # iamtitan.tech). The public repo ships TC² (titan-console) as the sole UI — its
+  # SPA dist/ is committed, so it needs no release-time build.

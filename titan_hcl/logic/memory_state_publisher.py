@@ -48,7 +48,6 @@ Failure modes (G20 + memory_state_publisher.py logging):
 """
 from __future__ import annotations
 
-import heapq
 import logging
 import math
 import time
@@ -164,27 +163,24 @@ class MemoryStatePublisher:
         except Exception:
             cognee_ready = False
         try:
+            persistent_count = int(memory.get_persistent_count())
+        except Exception as e:
+            logger.warning(
+                "[MemoryStatePublisher] get_persistent_count raised: %s",
+                e, exc_info=True)
+            persistent_count = 0
+        try:
             mempool_size = int(len(getattr(memory, "_mempool", []) or []))
         except Exception:
             mempool_size = 0
 
-        # Growth metrics + persistent_count + top-20 — SINGLE pass over
-        # _node_store. PROFILING.md (2026-05-30): this previously scanned the
-        # store THREE times per 5 s publish — get_persistent_count() +
-        # growth-metrics loop + a top-20 collect-and-full-sort — ≈5% of one
-        # core on the memory worker. One pass now computes persistent_count,
-        # high_quality and effective_24h AND maintains a bounded top-20 heap
-        # (no O(N log N) full sort). Same formulas as memory_worker
-        # action=growth_metrics + Memory.get_persistent_count.
+        # Growth metrics (single iteration over _node_store — bounded
+        # by store size; same formula as memory_worker action=growth_metrics)
         now = time.time()
         cutoff = now - 86400  # 24h
         effective_nodes = 0.0
-        persistent_count = 0
+        total_persistent_growth = 0
         high_quality = 0
-        # bounded min-heap of (weight, tiebreak, node) keeping the 20 highest
-        # weights; the running-count tiebreak keeps tuples comparable (dicts
-        # are not orderable).
-        _top_heap: list = []
         try:
             node_store = getattr(memory, "_node_store", None) or {}
             for v in node_store.values():
@@ -194,23 +190,17 @@ class MemoryStatePublisher:
                     continue
                 if v.get("status") != "persistent":
                     continue
-                persistent_count += 1
-                weight = float(v.get("effective_weight", 1.0))
-                if weight >= 1.15:
+                total_persistent_growth += 1
+                if v.get("effective_weight", 1.0) >= 1.15:
                     high_quality += 1
                 created = v.get("created_at", 0) or 0
                 accessed = v.get("last_accessed", 0) or 0
                 if created >= cutoff or accessed >= cutoff:
-                    effective_nodes += weight
-                if len(_top_heap) < 20:
-                    heapq.heappush(_top_heap, (weight, persistent_count, v))
-                elif weight > _top_heap[0][0]:
-                    heapq.heapreplace(_top_heap, (weight, persistent_count, v))
+                    effective_nodes += float(v.get("effective_weight", 1.0))
         except Exception as e:
             logger.warning(
                 "[MemoryStatePublisher] node_store iteration raised: %s",
                 e, exc_info=True)
-        total_persistent_growth = persistent_count
 
         # Pre-computed metrics at default saturation (matches the
         # legacy growth_metrics handler at memory_worker.py:668-670)
@@ -248,13 +238,19 @@ class MemoryStatePublisher:
         mempool_preview: list[dict] = []
         knowledge_graph: dict = {}
         try:
-            # top-20 already collected in the single pass above; sort the
-            # ≤20-element heap (cheap) highest-weight-first.
-            for weight, _tiebreak, v in sorted(
-                    _top_heap, key=lambda t: t[0], reverse=True):
+            node_store = getattr(memory, "_node_store", None) or {}
+            persistent = [
+                v for v in node_store.values()
+                if isinstance(v, dict) and v.get("type") == "MemoryNode"
+                and v.get("status") == "persistent"
+            ]
+            persistent.sort(
+                key=lambda v: float(v.get("effective_weight", 1.0)),
+                reverse=True)
+            for v in persistent[:20]:
                 top_memories.append({
                     "id": str(v.get("id", "") or "")[:64],
-                    "weight": round(weight, 4),
+                    "weight": round(float(v.get("effective_weight", 1.0)), 4),
                     "title": str(v.get("title", "") or "")[:120],
                     "created_at": float(v.get("created_at", 0.0) or 0.0),
                 })

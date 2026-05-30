@@ -27,7 +27,6 @@ from setup_titan import (  # noqa: E402
     console as console_phase,
     genesis_runner,
     inference,
-    observatory,
     restore as restore_mod,
     systemd_runner,
 )
@@ -343,31 +342,24 @@ def test_resolve_titan_id_falls_back_to_T1(tmp_path: Path):
     assert systemd_runner.resolve_install_titan_id(tmp_path) == "T7"
 
 
-# ── observatory (the #15 prebuilt-bundle phase) ──────────────────────────────
+# ── Observatory retirement guard (2026-05-30) ────────────────────────────────
+# The heavy Observatory no longer ships to users — TC² (titan-console) is the sole
+# front-end installed by setup_titan. The phase module must be gone, and no install
+# surface (comms phase / TUI) may set the legacy observatory_enabled flag.
 
 
-def test_observatory_bundle_name_and_fetch_refuses_untagged(tmp_path: Path):
-    assert observatory.bundle_name("v0.0.3") == "titan-observatory-v0.0.3.tar.gz"
-    for ref in ("main", "HEAD", ""):
-        res = observatory.fetch_observatory_bundle(tmp_path, ref)
-        assert res[0].severity == "fail" and "no release tag" in res[0].detail
+def test_observatory_phase_module_is_retired():
+    import importlib
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("setup_titan.observatory")
 
 
-def test_observatory_phase_skips_when_not_enabled(tmp_path: Path):
-    res = observatory.run_observatory_phase({}, tmp_path, tag="v0.0.3", user="bob")
-    assert res[0].severity == "ok" and "skipped" in res[0].detail
-    res2 = observatory.run_observatory_phase({"observatory_enabled": False}, tmp_path,
-                                             tag="v0.0.3", user="bob")
-    assert res2[0].severity == "ok" and "skipped" in res2[0].detail
-
-
-def test_observatory_unit_binds_localhost_and_runs_server(tmp_path: Path):
-    unit = observatory.render_observatory_unit(app_path=Path("/srv/obs"), user="bob", port=3000)
-    assert "server.js" in unit and "WorkingDirectory=/srv/obs" in unit
-    assert "Environment=HOSTNAME=127.0.0.1" in unit       # localhost-only by default
-    assert "Environment=PORT=3000" in unit
-    assert "User=bob" in unit
-    assert "After=titan.service" in unit                  # starts after the brain
+def test_comms_phase_does_not_set_observatory_flag(monkeypatch):
+    _capture_secrets(monkeypatch)
+    state: dict = {}
+    sp = ScriptedPrompter({"telegram_bot_token": _TG, "enable_x": False})
+    comms.run_comms_phase(default=False, state=state, prompter=sp)
+    assert "observatory_enabled" not in state
 
 
 # ── CLI surface ──────────────────────────────────────────────────────────────
@@ -472,13 +464,11 @@ def _capture_secrets(monkeypatch):
 def test_comms_phase_via_scripted_telegram_only(monkeypatch):
     rec = _capture_secrets(monkeypatch)
     state: dict = {}
-    sp = ScriptedPrompter({"telegram_bot_token": _TG, "enable_x": False,
-                           "enable_observatory": False})
+    sp = ScriptedPrompter({"telegram_bot_token": _TG, "enable_x": False})
     results = comms.run_comms_phase(default=False, state=state, prompter=sp)
     names = {r.name: r for r in results}
     assert names["telegram"].severity == "ok"
     assert names["x_social"].detail.startswith("skipped")
-    assert state["observatory_enabled"] is False
     assert ("channels", "telegram_bot_token", _TG) in rec
 
 
@@ -486,12 +476,10 @@ def test_comms_phase_via_scripted_full_optins(monkeypatch):
     rec = _capture_secrets(monkeypatch)
     state: dict = {}
     sp = ScriptedPrompter({"telegram_bot_token": _TG, "enable_x": True,
-                           "twitterapi_key": _UUID, "webshare_url": _WEBSHARE,
-                           "enable_observatory": True})
+                           "twitterapi_key": _UUID, "webshare_url": _WEBSHARE})
     results = comms.run_comms_phase(default=False, state=state, prompter=sp)
     names = {r.name: r for r in results}
     assert names["x_social"].severity == "ok"
-    assert state["observatory_enabled"] is True
     assert ("stealth_sage", "twitterapi_io_key", _UUID) in rec
     assert ("twitter_social", "webshare_static_url", _WEBSHARE) in rec
 
@@ -542,7 +530,7 @@ def test_wizard_local_submit_collects_answers():
     assert answers["telegram_bot_token"] == _TG
     assert seed == {}                      # local mode collects no on-chain creds
     assert answers["enable_x"] is False
-    assert answers["enable_observatory"] is False
+    assert "enable_observatory" not in answers
 
 
 def test_wizard_devnet_seeds_wallet_and_rpc():

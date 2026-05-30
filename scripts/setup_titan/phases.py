@@ -31,7 +31,6 @@ from .console import run_console_phase
 from .config_seed import run_config_seed_phase
 from .inference import run_inference_phase
 from .genesis_runner import run_genesis_phase
-from .observatory import run_observatory_phase
 from .systemd_runner import run_systemd_phase
 from .modes import Mode, spec_for
 from .preflight import Result, summarize
@@ -225,18 +224,15 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
          lambda: run_config_seed_phase(install_root)),
         (PhaseDef("phase_4", "Inference autodetect", "W1.c", None),
          lambda: run_inference_phase(default=default, install_root=install_root, prompter=prompter)),
-        (PhaseDef("phase_5", "Comms (Telegram / X / Observatory)", "W1.d", None),
+        (PhaseDef("phase_5", "Comms (Telegram / X)", "W1.d", None),
          lambda: run_comms_phase(default=default, state=state, prompter=prompter)),
         (PhaseDef("phase_6", "Genesis ceremony", "W1.b", None),
          lambda: ([Result("genesis", "warn", "--skip-genesis requested.")] if skip_genesis
                   else run_genesis_phase(install_root, mode, venv_python=venv_python(install_root)))),
         (PhaseDef("phase_7", "Systemd install + first start + health", "W1.e", None),
          lambda: run_systemd_phase(state, install_root, mode, default=default)),
-        (PhaseDef("phase_console", "TC² Console Agent (default owner UI)", "W8", None),
+        (PhaseDef("phase_console", "TC² Console Agent (owner UI — the sole shipped front-end)", "W8", None),
          lambda: run_console_phase(state, install_root, user=getpass.getuser())),
-        (PhaseDef("phase_obs", "Observatory web UI (opt-in showcase)", "W1.d", None),
-         lambda: run_observatory_phase(state, install_root, tag=tag or "main",
-                                       user=getpass.getuser())),
     ]
 
     for phase, run in phases:

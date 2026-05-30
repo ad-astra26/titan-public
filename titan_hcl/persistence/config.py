@@ -1,56 +1,9 @@
 """IMW configuration — loaded from titan_hcl/config.toml [persistence] section."""
 from __future__ import annotations
 
-import os
-import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-
-
-# ── Parsed-config cache (mtime-gated) ───────────────────────────────────────
-# from_titan_config[_section] is called per-route in worker hot paths (e.g.
-# EventsTeacherDB constructed per chat — events_teacher.py:140) — each call
-# re-opened + re-parsed the WHOLE config.toml from disk. Under chat load this
-# was ~7.6% of agno_worker's on-CPU time (PROFILING.md F7, --gil sweep
-# 2026-05-30). Cache the parsed dict, re-parsing only when config.toml's mtime
-# changes (config is loaded at boot; a runtime edit self-corrects on the next
-# call — same self-correcting idiom as snapshot_builders'
-# _episodic_stats_mtime_gated). A fresh IMWConfig is still built per call via
-# from_dict(), so no caller can mutate a shared instance.
-_TOML_CACHE: dict = {"data": None, "mtime": None, "path": None}
-_TOML_CACHE_LOCK = threading.Lock()
-
-
-def _load_config_toml_cached(cfg_path: Path) -> dict:
-    """Return the parsed config.toml as a dict, re-parsing only on mtime change.
-
-    Returns ``{}`` if the file is absent. Thread-safe (double-checked under a
-    lock so concurrent worker threads parse at most once per mtime)."""
-    try:
-        mtime = os.path.getmtime(cfg_path)
-    except OSError:
-        return {}
-    cache = _TOML_CACHE
-    cpath = str(cfg_path)
-    if (cache["data"] is not None and cache["mtime"] == mtime
-            and cache["path"] == cpath):
-        return cache["data"]
-    with _TOML_CACHE_LOCK:
-        # Re-check under the lock — another thread may have just loaded it.
-        if (cache["data"] is not None and cache["mtime"] == mtime
-                and cache["path"] == cpath):
-            return cache["data"]
-        try:
-            import tomllib
-        except ImportError:
-            import tomli as tomllib  # type: ignore
-        with open(cfg_path, "rb") as f:
-            full = tomllib.load(f)
-        cache["data"] = full
-        cache["mtime"] = mtime
-        cache["path"] = cpath
-        return full
 
 
 DEFAULTS = {
@@ -118,10 +71,15 @@ class IMWConfig:
 
     @classmethod
     def from_titan_config(cls) -> "IMWConfig":
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib  # type: ignore
         cfg_path = Path(__file__).resolve().parent.parent / "config.toml"
         if not cfg_path.exists():
             return cls.from_dict(None)
-        full = _load_config_toml_cached(cfg_path)
+        with open(cfg_path, "rb") as f:
+            full = tomllib.load(f)
         return cls.from_dict(full.get("persistence"))
 
     @classmethod
@@ -132,15 +90,16 @@ class IMWConfig:
         writer_service Phase 0). For example:
           - section_name="persistence"            → IMW (inner_memory.db)
           - section_name="persistence_observatory" → ObservatoryWriter
-
-        The parse is mtime-cached (``_load_config_toml_cached``) — this loader
-        is called per-route in worker hot paths, so re-parsing config.toml on
-        every call was a measurable chat-path CPU cost (PROFILING.md F7).
         """
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib  # type: ignore
         cfg_path = Path(__file__).resolve().parent.parent / "config.toml"
         if not cfg_path.exists():
             return cls.from_dict(None)
-        full = _load_config_toml_cached(cfg_path)
+        with open(cfg_path, "rb") as f:
+            full = tomllib.load(f)
         return cls.from_dict(full.get(section_name))
 
     def is_table_canonical(self, table: str) -> bool:

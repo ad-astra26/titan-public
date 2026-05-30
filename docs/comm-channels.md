@@ -1,7 +1,7 @@
 # Communication channels
 
 > How you talk to your Titan. Telegram is guaranteed; terminal-chat is a
-> safety fallback; the Observatory chat is an opt-in web UI.
+> safety fallback; the TC² console is the web UI, installed by default.
 
 The architectural commitment: **at least one channel always works.** Even
 if your DNS is down, your TLS cert lapsed, and your frontend is
@@ -15,7 +15,7 @@ unbuilt — you can still reach your Titan.
 |---------|----------|--------------------|----------------|-----------|
 | **Telegram** | YES (`--default`) | bot token (30 s) | No (private chat) | …you want the lowest-friction, always-on channel. |
 | **Terminal `/chat`** | YES (always available) | none — it's already there | Local SSH only | …Telegram is down, or you're on the box anyway. |
-| **Observatory `/chat`** | OPT-IN | nginx + TLS + domain | Yes, if you set up a domain | …you want a web UI, or you want to share access. |
+| **TC² console `/chat`** | YES (installed by default) | none — installed automatically | Needs your own reverse proxy for remote | …you want a web UI with live stats + system controls. |
 
 > **Backlog (gradual, each tested before offered):** Discord, Slack,
 > Signal, others. Discord already has scaffolding in `config.toml`
@@ -109,55 +109,58 @@ We verify this channel keeps working at every release.
 
 ---
 
-## Observatory `/chat` (opt-in web UI)
+## TC² console `/chat` (web UI — installed by default)
 
-The browser-based chat interface, served by the Observatory frontend.
+The **Titan Command Center (TC²)** is the lean owner-facing web UI that
+ships with every Titan. The installer sets it up automatically — no
+opt-in, no domain, no TLS, no node build (the SPA bundle is prebuilt and
+committed). It runs as its own `titan-console.service` on
+`http://127.0.0.1:7799`.
 
-### Why this is opt-in
+### Why it's a separate service (and why that matters)
 
-Setting up Observatory `/chat` for public-internet access requires:
+TC² runs on the **system Python, stdlib-only, decoupled from the Titan
+runtime** — it is *not* supervised by the Titan's Guardian and shares no
+dependencies with it. The point: when the Titan itself is down — a bad
+deploy, a broken venv, a crash — TC² stays up and tells you *why*
+(degraded-health banner + journal tail), instead of going dark with the
+thing it's supposed to monitor.
 
-- A domain name (registration cost: ~$10/year)
-- A TLS certificate (Let's Encrypt — free, but config)
-- An nginx reverse proxy (or equivalent)
-- Authentication wiring (your Maker wallet → signed JWT → backend)
+### Setup
 
-All of which is too heavy for "done fast" and not appropriate for every
-user. So the wizard offers it as an opt-in step:
-
-- **Skip** — Observatory chat won't be reachable from outside your box.
-  You can still use it on localhost (`http://localhost:3000`) for your
-  own use.
-- **Localhost-only** — same as skip, plus the wizard makes sure the
-  frontend builds and starts.
-- **Public** — wizard helps you set up the domain, TLS, and nginx.
-  Takes 5–10 extra minutes.
-
-### Setup (localhost-only — the most common path)
+None. If you ran the installer, it's already running. Confirm with:
 
 ```bash
-cd titan-observatory
-npm install
-npm run build
-npm start          # serves at http://localhost:3000
+systemctl status titan-console.service
+curl -s http://127.0.0.1:7799/console/health      # expect 200
 ```
 
-Open `http://localhost:3000` in your browser. The chat panel is the
-top-right tab. Auth is via Maker-wallet signature (your wallet, your
-Titan).
+Open `http://127.0.0.1:7799` in your browser. Mutating actions are
+gated by a token written to `~/.titan/console_token` at install (paste
+it once in the Settings tab).
+
+### Remote access
+
+TC² binds `127.0.0.1` only. To reach it off-box, put your **own** reverse
+proxy / TLS in front of `:7799` (nginx + Let's Encrypt, a Tailscale tail,
+an SSH tunnel — your choice). Nothing about remote access is wired for
+you, by design: the default install is private to your box.
 
 ### What works
 
-- Rich formatting (markdown rendering)
-- Live state visualization (Cell / Mandala / Constellation views) in
-  the same window as the chat
-- Conversation persistence across browser sessions
+- **Chat** tab — the same `POST /v6/chat` pipeline, in the browser
+- **Stats** tab — live consciousness / mood / SOL / memory metrics
+- **System** tab — service health, off-site backup config, restart controls
+- **Settings** tab — token + API base
 
 ### What's coming
 
-- Multi-Titan switching (T1/T2/T3 in the same UI) — already partly
-  wired
-- Mobile-responsive UI — partial
+- Multi-Titan switching (T1/T2/T3 in the same UI)
+- Mobile-responsive layout polish
+
+> The heavy three.js Observatory dashboard is **no longer shipped to
+> users** (it remains the maintainer's own public showcase). TC² is the
+> supported owner UI.
 
 ---
 
@@ -172,7 +175,7 @@ This means:
 
 - Conversation continuity is preserved across channels — you can start
   a thread on Telegram, continue it on the terminal, finish it in the
-  Observatory.
+  TC² console.
 - Authentication is uniformly Maker-wallet-signed (Ed25519). No
   channel has weaker auth than another.
 - The Synthesis Engine treats all incoming messages the same way:
@@ -187,7 +190,7 @@ This means:
 |---------|--------|-------|
 | Telegram | ✅ shipped (default) | guaranteed by `--default` |
 | Terminal `/chat` | ✅ shipped (always-on) | ships with every Titan |
-| Observatory `/chat` | ✅ shipped (opt-in) | needs domain + TLS for public |
+| TC² console `/chat` | ✅ shipped (default) | localhost; your own proxy for remote |
 | Discord | ⏳ scaffolded, untested | `config.toml [channels]` has the slot |
 | Slack | ⏳ planned | corporate user demand may bring it forward |
 | Signal | ❓ uncertain | Signal's bot story is more constrained |

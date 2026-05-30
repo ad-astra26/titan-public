@@ -167,7 +167,7 @@ year-old T1, with mature outer memory, to need single-digit LLM calls
 per hour for the *same* user workload — because the rest is recall.
 
 That ratio — **fraction of skill invocations succeeding by recall** — is
-the sovereignty ratio. It is visible in the Observatory dashboard and
+the sovereignty ratio. It is visible in the TC² console (Stats tab) and
 in `setup_titan --diagnostic`. Watch it climb.
 
 ---

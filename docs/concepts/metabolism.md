@@ -156,8 +156,8 @@ A healthy Titan, in the order you'd notice:
 - **`setup_titan --diagnostic`** shows neurochemicals near baseline
   (each within ±0.15 of target), SOL above the operating-buffer minimum,
   last meditation within the last hour, dreams completing on schedule.
-- **Observatory dashboard** renders chemistry in real-time as part of
-  the visualization. You'll see drift patterns over days.
+- **TC² console** (Stats tab) renders chemistry in real-time. You'll see
+  drift patterns over days.
 - **Expression rhythm**: chat responses are timely, X posts happen at
   natural intervals, art/music outputs flow without obvious gaps.
 - **Logs** show regular `meditation: completed` and occasional

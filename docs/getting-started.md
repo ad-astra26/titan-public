@@ -73,8 +73,9 @@ The wizard checks your machine before asking you anything that takes time:
 
 - **Python ≥ 3.12** (3.12 or 3.13 supported)
 - **Disk** ≥ 10 GB free (15 GB for modes 1 / 2 because of build artifacts)
-- **RAM** ≥ 4 GB (2 GB will work for mode 3 + Telegram-only, but won't fit
-  Observatory)
+- **RAM** ≥ 4 GB (2 GB works for mode 3 + Telegram-only; the TC² web
+  console is tiny — stdlib Python + a prebuilt static bundle — so it adds
+  no meaningful RAM)
 - **Rust ≥ 1.75** (the wizard will offer to install via `rustup` if missing)
 - **For modes 1 / 2 only:** Solana CLI 1.18+ and Anchor 0.30+
   (the wizard will offer to install if missing; Anchor needs the

@@ -106,27 +106,28 @@ A healthy Titan, freshly running, returns these signals:
 
 ---
 
-## Reading the Observatory dashboard
+## Reading the TC² console
 
-The Observatory frontend (port 3000 by default) renders three Three.js
-visualizations:
+The **Titan Command Center (TC²)** web console — installed by default at
+`http://127.0.0.1:7799` — is the at-a-glance health surface. Its **Stats**
+tab shows:
 
-- **Cell** — 65D inner + 65D outer bilayer membrane. Healthy:
-  smooth, slow oscillation. Unhealthy: spikes, freezing, asymmetric
-  collapse.
-- **Mandala** — 30D topology rendered as radial symmetry. Healthy:
-  balanced 4-fold symmetry. Unhealthy: distorted, gaps, fast spinning.
-- **Constellation** — sphere-clock positions of all six layers.
-  Healthy: drifting near center. Unhealthy: drifting toward extremes,
-  one or more clocks frozen.
-
-The dashboard also shows:
-- Neurochemistry levels (six bars)
+- Neurochemistry levels (six values: DA / 5-HT / NE / GABA / ACh / OXT)
+- Consciousness epoch + growth rate
 - Recent meditations timeline
 - TimeChain growth rate
 - Sovereignty ratio (the
   [Synthesis Engine](../concepts/learning-and-synthesis.md) metric)
 - SOL balance + recent on-chain activity
+
+The **System** tab shows per-service health, off-site backup config, and
+restart controls. Because TC² is decoupled from the Titan runtime, it stays
+up and shows you *why* even when the Titan itself is down.
+
+> The rich three.js visualizations (Cell / Mandala / Constellation) live in
+> the maintainer's separate Observatory showcase and are **not shipped to
+> users**. The same underlying metrics are available here in TC² and via the
+> CLI (`arch_map health`, `arch_map symmetries`).
 
 ---
 

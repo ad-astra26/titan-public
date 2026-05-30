@@ -34,8 +34,8 @@ for the full set):
 | Privacy | `[privacy]` | What leaves the box; observability levels |
 | API | `[api]` | Port, auth method, rate-limit policies |
 | Endurance | `[endurance]` | Long-run health-check schedules |
-| Observatory | `[observatory]` | Frontend config, dashboard layout |
-| Frontend | `[frontend]` | Next.js build flags, served URL |
+| Observatory | `[observatory]` | Telemetry DB (`observatory.db`) the API + TC² console read |
+| Frontend | `[frontend]` | Legacy three.js Observatory build config — not shipped to users; safe to ignore |
 
 ### `titan_hcl/titan_params.toml`
 

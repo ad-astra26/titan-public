@@ -33,12 +33,26 @@ _(curate as you go; lifted into the next versioned section at release time)_
 - W6: in-repo `CHANGELOG.md` (this file)
 - W7: incremental commit-preserving public sync (`sync_public_incremental.sh`),
   `docs/` and `.github/` added to allowlist, single-name author/committer
+- **W8: TC² (Titan Command Center) is the shipped owner UI** — a lean,
+  crash-decoupled web console (`titan-console.service`, `http://127.0.0.1:7799`)
+  installed by default. Runs on stdlib Python serving a prebuilt static bundle
+  (no node build), decoupled from the Titan runtime so it stays up and reports
+  *why* even when the Titan is down. Chat / Stats / System / Settings tabs +
+  off-site backup config + degraded-health Telegram alerts.
 
 ### Fixed
 - W7: `sync_public_incremental.sh` push-target bug (push to `origin` in staging clone)
 
 ### Changed
 - `phase_c.yml` trigger trimmed to `main` only (public repo has no other branches)
+
+### Removed
+- **W8: the heavy three.js Observatory web UI no longer ships to users.** TC²
+  replaces it as the owner front-end. Removed the `phase_obs` installer phase,
+  the Observatory opt-in from the comms phase, the `build-observatory` release
+  job, and `titan-observatory` from the public-sync allowlist. The full
+  Observatory remains the maintainer's own public showcase (iamtitan.tech) and
+  is not part of a user install — no Node prerequisite, lighter footprint.
 
 ---
 

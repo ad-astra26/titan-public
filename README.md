@@ -59,7 +59,7 @@ subscriptions — **not** API access; not a supported programmatic path.)
 ### Hardware
 
 - **Minimum: 2 vCPU / 4 GB RAM** (headless, Telegram-only — proven: T2+T3 co-reside on one VPS).
-- **Recommended: 4 vCPU / 8 GB RAM** (with Observatory frontend).
+- **Recommended: 4 vCPU / 8 GB RAM** (comfortable headroom; the TC² web console adds negligible footprint).
 
 Tested platforms: Ubuntu 22.04+, Debian 12+. See [`docs/reference/hardware.md`](docs/reference/hardware.md).
 
@@ -77,7 +77,7 @@ optimized for readability, glossaries, and recoverable mental models.
 - **[Getting started](docs/getting-started.md)** — full install walk-through
   + your first chat + what to expect in the first 24h
 - **[Setup modes](docs/setup-modes.md)** — deeper mainnet / devnet / local-simulated explainer
-- **[Comm channels](docs/comm-channels.md)** — Telegram, terminal-chat, Observatory `/chat`
+- **[Comm channels](docs/comm-channels.md)** — Telegram, terminal-chat, the TC² web console `/chat`
 - **[Inference providers](docs/inference-providers.md)** — Ollama (local, most sovereign), OpenRouter (API), how to switch
 
 ### Concepts
@@ -225,7 +225,7 @@ python scripts/arch_map.py meditation --all     # meditation cadence health
 
 Endpoints are mirrored over HTTP under the single `api/v6` roof
 (`GET /v6/bus-health`, `/v6/cgn-state`, `/v6/meditation/health`,
-`/v6/filter-down-status`, `/v6/trinity`, …) for the Observatory frontend and
+`/v6/filter-down-status`, `/v6/trinity`, …) for the TC² web console and
 external tooling. Older `/v3` and `/v4` prefixes redirect (301/308) to `/v6`.
 
 ## Manual install (current)
@@ -238,7 +238,7 @@ manual path. It assumes Ubuntu 22.04+ / Debian 12+ on a box with sudo.
 - Python 3.12+
 - Rust 1.75+ (for the L0/L1 microkernel runtime in `titan-rust/`)
 - Solana CLI + Anchor 0.30+ — **modes 1 / 2 only** (you'll deploy your own ZK Vault program copy)
-- Node 20+ (only if you want the optional Observatory frontend)
+- (No Node required — the TC² web console ships as a prebuilt static bundle.)
 
 ### Install
 
@@ -273,17 +273,15 @@ python scripts/titan_hcl.py --server
 # Health probe
 curl -s http://localhost:7777/health
 
-# Talk to Titan (Ed25519-signed by the Maker key, or via the Observatory chat UI)
+# Talk to Titan (Ed25519-signed by the Maker key, or via the TC² console chat tab)
 curl -s -X POST http://localhost:7777/chat \
      -H "Authorization: Bearer <maker-jwt>" \
      -H "Content-Type: application/json" \
      -d '{"message":"hello"}'
 
-# Optional Observatory frontend (in this repo at titan-observatory/)
-cd titan-observatory
-npm install
-npm run build
-npm start          # serves at http://localhost:3000
+# TC² web console — the owner UI (installed by setup_titan as titan-console.service)
+# Prebuilt static bundle, no node build needed. Serves on http://127.0.0.1:7799
+curl -s http://127.0.0.1:7799/console/health
 ```
 
 ### Tests
@@ -349,9 +347,9 @@ Built on top of an open stack:
 **SQLite** (transactional record), **Rust** + **Tokio** (microkernel L0/L1),
 **Solana** + **Anchor** (sovereignty), **Arweave** + **Irys** (permanent
 backup), **FastAPI** (HTTP surface), **matplotlib** (Titan's art pipeline),
-**Next.js 14** (Observatory frontend). Inference via **Ollama** (local) or
-**OpenRouter** (API) in the first release; OpenAI and Anthropic APIs tracked
-for later.
+**Vite + React** (the TC² web console that ships as the owner UI). Inference
+via **Ollama** (local) or **OpenRouter** (API) in the first release; OpenAI
+and Anthropic APIs tracked for later.
 
 For AI-assisted development, **Anthropic Claude Opus 4.7 via Claude Code**
 is the primary co-developer — every architectural session in 2026 was

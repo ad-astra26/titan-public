@@ -123,13 +123,6 @@ class InstallWizard(App):
                     yield Input(placeholder="Webshare static URL (http://user:pass@host:port/)",
                                 password=True, id="x_url")
 
-            # 6 — Observatory (opt-in)
-            with _Field(classes="qcard"):
-                with Horizontal():
-                    yield Switch(value=False, id="obs_on")
-                    yield Label("6 · Enable the Observatory web UI (prebuilt, localhost:3000)",
-                                classes="qtitle")
-
             yield Static("", id="error", classes="qerror")
             with Horizontal(id="actions"):
                 yield Button("Begin install", variant="success", id="begin")
@@ -231,9 +224,6 @@ class InstallWizard(App):
                 return self._fail("Webshare URL format: http://user:pass@host:port/")
             answers["twitterapi_key"] = x_key
             answers["webshare_url"] = x_url
-
-        # Observatory (opt-in)
-        answers["enable_observatory"] = self.query_one("#obs_on", Switch).value
 
         self._result = (mode, answers, state_seed)
         self.exit(self._result)
