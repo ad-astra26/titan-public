@@ -110,8 +110,14 @@ def test_publish_rich_memory_writes_correct_payload(shm_root):
                 "directive_alignment", "kg_node_count", "kg_edge_count",
                 "kg_stats_by_table", "ts"):
         assert key in decoded, f"missing key {key}"
-    # Value sanity
-    assert decoded["persistent_count"] == 42
+    # Value sanity. PROFILING.md (2026-05-30): _compute_payload now derives
+    # persistent_count from the single node_store pass (NOT a separate
+    # get_persistent_count() scan), so it equals total_persistent_for_growth —
+    # the node_store truth (8). In production these are always equal
+    # (get_persistent_count is the identical type==MemoryNode/status==persistent
+    # scan); the stub's old 42 was an impossible divergence.
+    assert decoded["persistent_count"] == 8
+    assert decoded["persistent_count"] == decoded["total_persistent_for_growth"]
     assert decoded["mempool_size"] == 3
     assert decoded["cognee_ready"] is True
     assert decoded["total_persistent_for_growth"] == 8
@@ -208,3 +214,52 @@ def test_get_stats_shape(shm_root):
                 "oversize_fails", "write_fails", "writer_attached"):
         assert key in stats
     assert stats["writer_attached"] is True
+
+
+# ── 5. Single-pass correctness (PROFILING.md memory _compute_payload) ──────
+# The publisher computes persistent_count + high_quality + effective_24h AND
+# the top-20 in ONE node_store pass (was 3 scans + a full sort). Verify the
+# single pass matches a brute-force recomputation, incl. top-20 ordering when
+# there are far more than 20 persistent nodes.
+
+def test_single_pass_matches_bruteforce_and_top20_ordering(shm_root):
+    import time as _t
+    now = _t.time()
+    # 50 persistent nodes with distinct weights + 5 non-persistent + 3 non-node
+    store = {}
+    for i in range(50):
+        store[f"p{i}"] = {
+            "type": "MemoryNode", "status": "persistent",
+            "id": f"id{i}", "title": f"t{i}",
+            "effective_weight": 1.0 + i * 0.01,   # 1.00 .. 1.49, all distinct
+            "created_at": now - 100, "last_accessed": now - 50,
+        }
+    for i in range(5):
+        store[f"np{i}"] = {"type": "MemoryNode", "status": "mempool",
+                           "effective_weight": 9.0}  # must be excluded
+    for i in range(3):
+        store[f"x{i}"] = {"type": "Other", "status": "persistent",
+                          "effective_weight": 9.0}   # must be excluded
+
+    pub = MemoryStatePublisher(titan_id="T_TEST")
+    payload = pub._compute_payload(_StubMemory(node_store=store))
+
+    # brute-force expectations over the 50 persistent MemoryNodes
+    persist = [v for v in store.values()
+               if v["type"] == "MemoryNode" and v["status"] == "persistent"]
+    assert payload["persistent_count"] == 50
+    assert payload["total_persistent_for_growth"] == 50
+    assert payload["high_quality_count"] == sum(
+        1 for v in persist if v["effective_weight"] >= 1.15)
+    assert payload["effective_nodes_24h"] == pytest.approx(
+        sum(v["effective_weight"] for v in persist), abs=1e-6)
+
+    # top-20 = the 20 highest weights, descending, excluded nodes absent
+    top = payload["top_memories"]
+    assert len(top) == 20
+    weights = [m["weight"] for m in top]
+    assert weights == sorted(weights, reverse=True)
+    expected_top20 = sorted(
+        (v["effective_weight"] for v in persist), reverse=True)[:20]
+    assert weights == pytest.approx(expected_top20)
+    assert all(m["id"].startswith("id") for m in top)  # no excluded nodes
