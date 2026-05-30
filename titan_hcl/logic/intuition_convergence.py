@@ -316,6 +316,32 @@ class IntuitionConvergenceDetector:
                         self._total_convergence_events, self._learned_weight,
                         self.get_convergence_profile().get("profile", {}))
 
+    # Default disk path — mirrors the cognitive_worker boot-restore path
+    # (cognitive_worker.py ``_ic_state_path``). The detector owns its own
+    # persistence so any holder can checkpoint it symmetrically with from_dict.
+    DEFAULT_STATE_PATH = "./data/intuition_convergence_state.json"
+
+    def save_state(self, path: str | None = None) -> None:
+        """Atomically persist learned convergence state (G16 tmp+replace).
+
+        Counterpart to ``from_dict``. Before this existed the detector loaded
+        its state at boot but NOTHING ever wrote the file, so every restart
+        reverted learned_weight + convergence counts to defaults (silent
+        permanent learning loss). Called from cognitive_worker's
+        ``_persist_engine_state`` (SAVE_NOW + 100-epoch tick + periodic
+        checkpoint)."""
+        import json
+        import os
+        target = path or self.DEFAULT_STATE_PATH
+        try:
+            os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+            tmp = target + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.to_dict(), f)
+            os.replace(tmp, target)
+        except Exception as _err:  # noqa: BLE001
+            logger.warning("[INTUITION] save_state failed: %s", _err)
+
 
 def compute_intuition_reward_shaping(action_taken: int,
                                       intuition_bias: np.ndarray | None,
