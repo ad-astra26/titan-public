@@ -32,6 +32,7 @@ from .console import run_console_phase
 from .config_seed import run_config_seed_phase
 from .inference import run_inference_phase
 from .genesis_runner import run_genesis_phase
+from .resurrect import run_resurrect_phase
 from .systemd_runner import run_systemd_phase
 from .modes import Mode, spec_for
 from .preflight import Result, summarize
@@ -205,15 +206,40 @@ class PhaseDef:
 
 def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
                minimal: bool, skip_genesis: bool, tag: str | None = None,
-               build_rust: bool = False, prompter: Prompter | None = None) -> int:
-    """Walk Phases 2→7 (Phase 1 already ran in preflight). Returns exit code.
+               build_rust: bool = False, prompter: Prompter | None = None,
+               resurrect: bool = False, rpc_url: str | None = None,
+               verify_only: bool = False, config_src: str | None = None) -> int:
+    """Walk the install phases (Phase 1 already ran in preflight). Returns exit code.
 
     ``prompter`` injects the input source: the default :class:`StdinPrompter`
     is the CLI flow; the Textual TUI passes a :class:`ScriptedPrompter` seeded
     with answers it collected in its branded question screens. The phase bodies
     are identical either way.
+
+    When ``resurrect`` is set (D1, mainnet only) the walker builds the env
+    (venv → Rust binaries) then SWAPS genesis/config/inference/comms for a single
+    :func:`run_resurrect_phase` (config + settings come from the restored backup,
+    not re-prompts), then systemd + console.
     """
     prompter = prompter or StdinPrompter()
+
+    if resurrect:
+        phases: list[tuple[PhaseDef, Callable[[], list[Result]]]] = [
+            (PhaseDef("phase_3", "Venv + Python deps", "W1.b", None),
+             lambda: run_venv_phase(install_root)),
+            (PhaseDef("phase_bin", "Rust daemon binaries", "W1.b", None),
+             lambda: run_binaries_phase(install_root, tag=tag or "main", build_rust=build_rust)),
+            (PhaseDef("phase_resurrect", "🜂 Sovereign Resurrection", "W1.5/D1", None),
+             lambda: run_resurrect_phase(install_root, venv_python=venv_python(install_root),
+                                         titan_id=state.get("titan_id"), rpc_url=rpc_url,
+                                         verify_only=verify_only, config_src=config_src)),
+            (PhaseDef("phase_7", "Systemd install + first start + health", "W1.e", None),
+             lambda: run_systemd_phase(state, install_root, mode, default=default)),
+            (PhaseDef("phase_console", "TC² Console Agent (owner UI)", "W8", None),
+             lambda: run_console_phase(state, install_root, user=getpass.getuser())),
+        ]
+        return _walk(phases, state)
+
     phases: list[tuple[PhaseDef, Callable[[], list[Result]]]] = [
         (PhaseDef("phase_2", "Mode + Maker wallet", "W1.b", None),
          lambda: run_mode_phase(state, mode, default=default, prompter=prompter)),
@@ -237,7 +263,11 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
         (PhaseDef("phase_console", "TC² Console Agent (owner UI — the sole shipped front-end)", "W8", None),
          lambda: run_console_phase(state, install_root, user=getpass.getuser())),
     ]
+    return _walk(phases, state)
 
+
+def _walk(phases: list[tuple[PhaseDef, Callable[[], list[Result]]]], state: dict) -> int:
+    """Render + persist each phase in order; halt on the first 'fail'. Returns exit code."""
     for phase, run in phases:
         if install_state.phase_done(state, phase.id):
             cprint(f"  ✓ {phase.title} (already complete — resume)", role="success")

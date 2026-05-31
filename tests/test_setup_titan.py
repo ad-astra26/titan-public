@@ -532,6 +532,69 @@ def test_backup_config_skipped_off_mainnet(tmp_path):
     assert "encryption_enabled = false" in (root / "titan_hcl" / "config.toml").read_text()
 
 
+# ── D1 — setup_titan --resurrect (sovereign on-chain recovery) ───────────
+from setup_titan.resurrect import run_resurrect_phase  # noqa: E402
+
+
+def _fake_resurrect_tree(tmp_path):
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "backup_restore_sovereign.py").write_text("# engine")
+    vp = tmp_path / "test_env" / "bin"
+    vp.mkdir(parents=True)
+    venv_python = vp / "python"
+    venv_python.write_text("x")
+    (tmp_path / "titan_hcl").mkdir()
+    return venv_python
+
+
+class _Proc:
+    returncode = 0
+
+
+def test_resurrect_builds_cmd_and_pipes_shard_off_argv(tmp_path, monkeypatch):
+    venv_python = _fake_resurrect_tree(tmp_path)
+    (tmp_path / "titan_hcl" / "config.toml").write_text("[api]\n")  # restored from backup
+    cap = {}
+    monkeypatch.setattr("setup_titan.resurrect.subprocess.run",
+                        lambda cmd, input=None, text=None, cwd=None: cap.update(cmd=cmd, input=input) or _Proc())
+    res = run_resurrect_phase(tmp_path, venv_python=venv_python, titan_id="T1",
+                              rpc_url="https://rpc", verify_only=True, shard1="deadbeef")
+    assert all(r.severity != "fail" for r in res)
+    cmd = cap["cmd"]
+    assert "--shard1-stdin" in cmd and "--commit" in cmd and "--verify-only" in cmd
+    assert "--rpc-url" in cmd and "https://rpc" in cmd
+    assert cap["input"] == "deadbeef\n"               # shard → stdin
+    assert "deadbeef" not in " ".join(cmd)            # shard NEVER on the command line
+
+
+def test_resurrect_stages_supplied_config_for_opt_out(tmp_path, monkeypatch):
+    venv_python = _fake_resurrect_tree(tmp_path)  # no config.toml restored
+    src = tmp_path / "my_config.toml"
+    src.write_text('[api]\ninternal_key = "x"\n')
+    monkeypatch.setattr("setup_titan.resurrect.subprocess.run",
+                        lambda *a, **k: _Proc())
+    res = run_resurrect_phase(tmp_path, venv_python=venv_python,
+                              config_src=str(src), shard1="ab")
+    staged = tmp_path / "titan_hcl" / "config.toml"
+    assert staged.exists() and staged.read_text() == src.read_text()
+    assert any("staged supplied config" in r.detail for r in res)
+
+
+def test_resurrect_warns_when_no_config(tmp_path, monkeypatch):
+    venv_python = _fake_resurrect_tree(tmp_path)  # no config restored, none supplied
+    monkeypatch.setattr("setup_titan.resurrect.subprocess.run", lambda *a, **k: _Proc())
+    res = run_resurrect_phase(tmp_path, venv_python=venv_python, shard1="ab")
+    assert any(r.name == "config" and r.severity == "warn" for r in res)
+
+
+def test_install_resurrect_flags_parse():
+    ns = build_parser().parse_args(
+        ["install", "--resurrect", "--verify-only", "--config", "/x.toml",
+         "--rpc-url", "https://r", "--titan-id", "T1"])
+    assert ns.resurrect and ns.verify_only and ns.config == "/x.toml"
+    assert ns.rpc_url == "https://r" and ns.titan_id == "T1"
+
+
 def test_install_accepts_no_tui_flag():
     args = build_parser().parse_args(["install", "--no-tui", "--mode", "local"])
     assert args.no_tui is True
