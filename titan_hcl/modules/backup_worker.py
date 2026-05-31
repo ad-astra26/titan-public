@@ -311,10 +311,6 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         "send_queue": send_queue,
         "name": name,
         "full_config": full_config,  # Phase 9 — offhost mirror reads [backup.mirror]
-        # Phase 1 (2026-05-31) single-flight guard: backup cascades run OFF the
-        # recv loop (daemon thread) so the multi-minute diff/upload never starves
-        # the bus socket → no BrokenPipe → no shm_pid_dead restart loop.
-        "_backup_lock": threading.Lock(),
     }
 
     last_heartbeat = time.time()
@@ -389,11 +385,11 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         try:
             if msg_type == bus.MEDITATION_COMPLETE:
                 _send_heartbeat(send_queue, name, state_writer=_state_writer)
-                _dispatch_backup_offloop(state, _handle_meditation, msg)
+                _handle_meditation(state, msg)
                 last_heartbeat = time.time()
             elif msg_type == bus.BACKUP_TRIGGER_MANUAL:
                 _send_heartbeat(send_queue, name, state_writer=_state_writer)
-                _dispatch_backup_offloop(state, _handle_manual, msg)
+                _handle_manual(state, msg)
                 last_heartbeat = time.time()
             # Ignore other msg types — don't complain (bus delivers many)
         except Exception as e:
@@ -403,49 +399,6 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     logger.info("[BackupWorker] Exiting")
     with suppress(Exception):
         loop.close()
-
-
-# ── Off-loop dispatch (Phase 1, 2026-05-31) ───────────────────────────────
-
-def _dispatch_backup_offloop(state: dict, handler, msg: dict) -> None:
-    """Run a backup cascade handler OFF the recv-loop thread.
-
-    The unified_v2 cascade reads the big mutable DBs (inner_memory.db ~1.1GB,
-    experience DBs) to diff against the baseline — seconds-to-minutes of IO+CPU.
-    Running it inline on the recv loop (the prior `_handle_*` call here) stopped
-    the worker reading its bus socket → broker silent-hang-defense BrokenPipe →
-    Guardian shm_pid_dead → restart loop → backup never completed → proof_day
-    `post_generation_failed`. We spawn it in a daemon thread so the recv loop
-    keeps reading + heartbeating throughout.
-
-    Single-flight: a non-blocking lock; a 2nd trigger while one runs is skipped
-    (the daily CAS gate inside the cascade already enforces one ship/day). The
-    cascade reuses the worker's single asyncio loop (state['loop']) — only ever
-    driven by ONE backup thread at a time — so RebirthBackup's lazily-created
-    asyncio.Locks stay loop-coherent (a fresh loop per thread would trip the
-    cross-loop Future hazard).
-    """
-    lock = state["_backup_lock"]
-    if not lock.acquire(blocking=False):
-        logger.info(
-            "[BackupWorker] backup already in flight — skipping %s trigger "
-            "(single-flight; daily CAS gate enforces one ship/day)",
-            msg.get("type", "?"))
-        return
-
-    def _runner():
-        try:
-            asyncio.set_event_loop(state["loop"])
-            handler(state, msg)
-        except Exception as e:  # noqa: BLE001
-            logger.error(
-                "[BackupWorker] off-loop backup cascade failed: %s", e,
-                exc_info=True)
-        finally:
-            lock.release()
-
-    threading.Thread(
-        target=_runner, name="backup-cascade-offloop", daemon=True).start()
 
 
 # ── Meditation-triggered cascade (Phase 2 §5.3) ───────────────────────────
