@@ -143,6 +143,12 @@ split-debuginfo = "unpacked"
 [profile.dev.package."*"]
 debug = false
 
+# NOTE: sccache is intentionally NOT used here. The release/musl profile sets
+# lto="fat" + codegen-units=1 below — fat-LTO defeats per-crate object caching
+# and the expensive work moves to the final link/LTO stage sccache never touches;
+# dev builds use incremental, also uncacheable. The shared worktree target-dir
+# (.claude/worktrees/.cargo/config.toml) is the correct caching primitive here.
+# (Workflow audit 2026-05-31 verified near-zero would-be cache hits.)
 [profile.release]
 opt-level = 3
 lto = "fat"
