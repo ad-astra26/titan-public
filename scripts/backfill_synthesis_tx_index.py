@@ -32,13 +32,20 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def _build_embedders():
+def _build_embedders(threads: int = 2):
     """Lazy fastembed BAAI/bge-small-en-v1.5 — the one engine embedding path.
     Returns (single, batch) — the batch path embeds a whole list in one call
-    (far faster + lighter than N single calls on a small box)."""
+    (far faster + lighter than N single calls on a small box). `threads` caps
+    onnxruntime intra-op parallelism so the backfill leaves cores for the live
+    Titans on a small/shared box (load discipline — devnet T2+T3 share 4 cores)."""
     from fastembed import TextEmbedding
     import numpy as np
-    model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+    try:
+        model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5", threads=int(threads))
+    except TypeError:
+        # Older fastembed without a `threads` kwarg — OMP_NUM_THREADS (set in
+        # main() before this import) still caps it.
+        model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
     def _norm(v):
         v = np.asarray(v, dtype=np.float32)
@@ -62,7 +69,15 @@ def main() -> int:
                     help="Actually embed + write. Without this flag = dry-run report only.")
     ap.add_argument("--max", type=int, default=500000,
                     help="Max blocks to scan this run (default 500000).")
+    ap.add_argument("--threads", type=int, default=2,
+                    help="Cap fastembed/onnxruntime threads (default 2) so the "
+                         "backfill leaves cores for live Titans on a shared box.")
     args = ap.parse_args()
+
+    # Cap embed threads BEFORE fastembed/onnxruntime import (belt-and-suspenders
+    # alongside the TextEmbedding(threads=) kwarg). Load discipline on a 4-core
+    # box shared by two live devnet twins.
+    os.environ.setdefault("OMP_NUM_THREADS", str(max(1, int(args.threads))))
 
     data_dir = args.data_dir
     index_db = os.path.join(data_dir, "timechain", "index.db")
@@ -79,7 +94,7 @@ def main() -> int:
 
     embedder = batch_embedder = None
     if not dry:
-        embedder, batch_embedder = _build_embedders()
+        embedder, batch_embedder = _build_embedders(threads=args.threads)
     store = SynthesisVectorStore(
         data_dir=data_dir, embedder=embedder, batch_embedder=batch_embedder)
     builder = TxIndexBuilder(store=store, data_dir=data_dir)

@@ -142,7 +142,13 @@ class TxIndexBuilder:
 
     def _resolve_fork_ids(self) -> None:
         """Resolve the indexed fork NAMES → chain-local ids via fork_registry
-        (INV-Syn-26 — ids are chain-local; conversation is 5 on T1, 115 on T3)."""
+        (INV-Syn-26 — ids are chain-local; conversation is 5 on T1, 115 on T3).
+
+        Orders `_fork_ids` by `self._forks` (INDEXED_FORKS), NOT by fork_id, so
+        the SMALL + chat-critical `conversation` fork is indexed FIRST — chat
+        recall fires as soon as the backfill starts, rather than after the
+        large declarative/procedural forks (fork_id order would do conversation
+        last on T3, where it is sidechain id 115)."""
         if self._conn is None:
             return
         try:
@@ -151,11 +157,12 @@ class TxIndexBuilder:
         except Exception as e:
             logger.warning("[TxIndexBuilder] fork_registry read failed: %s", e)
             return
-        wanted = set(self._forks)
-        for r in rows:
-            name = str(r["fork_name"])
-            if name in wanted:
-                self._fork_ids[int(r["fork_id"])] = name
+        name_to_id = {str(r["fork_name"]): int(r["fork_id"]) for r in rows}
+        # Insert in INDEXED_FORKS order (conversation first) — dict preserves it.
+        for name in self._forks:
+            fid = name_to_id.get(name)
+            if fid is not None:
+                self._fork_ids[fid] = name
 
     def _load_watermark(self) -> None:
         try:
