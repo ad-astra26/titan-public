@@ -69,13 +69,22 @@ CHANGED=0
 # Per-Titan state files (pi_heartbeat, neuromodulator, hormonal,
 # phase_status) were already not committed for the same reason.
 
-# Conversation transcripts (auto-parsed from JSONL) — the ONLY non-regenerable
-# artifact worth committing here. Dropped 2026-05-31 (workflow audit): the
-# REPORT_language_pipeline_*.md + data/language_pipeline_*.json loops (regenerable
-# observability — now local-only like twin_telemetry) and the
-# data/testsuite_checkpoint_*.json loop (learning_testsuite is RETIRED — see top
-# of this script). Those `git add -f`'d 31 regenerable files into history despite
-# data/ being gitignored; they were git rm --cached'd in the same commit.
+# Pipeline reports
+for f in titan-docs/REPORT_language_pipeline_*.md; do
+    [ -f "$f" ] && git add -f "$f" 2>/dev/null && CHANGED=1
+done
+
+# Pipeline telemetry
+for f in data/language_pipeline_*.json; do
+    [ -f "$f" ] && git add -f "$f" 2>/dev/null && CHANGED=1
+done
+
+# Learning TestSuite checkpoints
+for f in data/testsuite_checkpoint_*.json; do
+    [ -f "$f" ] && git add -f "$f" 2>/dev/null && CHANGED=1
+done
+
+# Conversation transcripts (auto-parsed from JSONL)
 for f in titan-docs/conversations/CONVERSATION_*.md; do
     [ -f "$f" ] && git add -f "$f" 2>/dev/null && CHANGED=1
 done
@@ -83,11 +92,10 @@ done
 # Only commit if there are staged changes
 if [ "$CHANGED" -eq 1 ] && ! git diff --cached --quiet 2>/dev/null; then
     TIMESTAMP=$(date +%Y%m%d_%H%M)
-    # epoch/emotion metadata dropped 2026-05-31 (workflow audit): the source was
-    # /tmp/titan_brain.log — a RETIRED Phase A/B path that never exists under
-    # Phase C — so every commit read "epoch ?, emotion=?". Logs now live in
-    # journalctl; if this metadata is wanted again pull it from the API/journal.
-    git commit -m "data: conversation transcript snapshot ${TIMESTAMP}" --no-gpg-sign 2>/dev/null
+    EPOCH_T1=$(grep "Epoch.*complete" /tmp/titan_brain.log 2>/dev/null | tail -1 | grep -oP 'Epoch \K\d+' || echo "?")
+    EMOTION=$(grep "emotion=" /tmp/titan_brain.log 2>/dev/null | tail -1 | grep -oP 'emotion=\K[^(]+' || echo "?")
+
+    git commit -m "data: Telemetry snapshot ${TIMESTAMP} — T1 epoch ${EPOCH_T1}, emotion=${EMOTION}" --no-gpg-sign 2>/dev/null
 
     echo "[${TIMESTAMP}] Telemetry committed: epoch=${EPOCH_T1} emotion=${EMOTION}"
 else
