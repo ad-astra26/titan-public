@@ -19,6 +19,18 @@ replaced by the v3 attractor-state model (emotion as multi-level
 equilibrium over composite state, named after stable recurrence).
 §16 Options A-D in rFP_emot_cgn_v2.md are superseded by that work.
 
+✅ DEAD-CLUSTER TRAP FIXED 2026-05-31 (Maker: the live system must work, not
+wait for the weeks-away attractor model). `maybe_recenter` previously skipped
+any cluster with <5 hard-wins (`if len(vecs)<5: continue`) — so a slot that
+never won (LOVE on T1) was never moved → frozen at RNG-seed → never won
+(self-reinforcing monoculture; the 2026-04-24 fix repaired the wiring, not this).
+Now: anchors hard-update toward their won obs (keep semantic seed, never
+rescued); emergent slots soft-update by responsibility OR, when dead (<3 wins),
+are RESCUED to the worst-served observation (k-means++). This is clustering-
+algorithm hygiene, NOT the forbidden seed-tuning — fully data-driven. The v3
+attractor model remains the eventual successor; this makes the legacy layer
+function correctly meanwhile. See `tests/test_emot_cgn_dead_cluster_rescue.py`.
+
 Each cluster is a candidate emotion primitive. Seeded from hand-crafted
 anchors (FLOW, IMPASSE_TENSION, RESOLUTION) + 5 emergent slots (PEACE,
 CURIOSITY, GRIEF, WONDER, LOVE). Centroids drift as experience
