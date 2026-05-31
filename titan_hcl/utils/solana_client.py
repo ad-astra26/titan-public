@@ -1306,3 +1306,149 @@ async def fetch_mpl_core_asset(network_client, asset_pubkey_str: str) -> Optiona
     except Exception as e:
         logger.error("[SolanaClient] Failed to fetch MPL Core asset: %s", e)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Live RPC read seam — Sovereign Resurrection chain walk (RFP 5J-3 / D3a)
+# ---------------------------------------------------------------------------
+# The sovereign resurrection engine (scripts/backup_restore_sovereign.py) walks
+# the Titan wallet's Solana signature history newest→oldest, then fetches each
+# transaction's SPL-Memo text to decode the v=3 backup chain. These are the two
+# read primitives it imports by name. They mirror wallet_observer.py's request
+# shape (httpx → JSON-RPC) but add FULL pagination (the resurrection walk needs
+# the entire history, not just the most recent page) and robust memo extraction
+# (jsonParsed instruction first, log-message fallback). Reads only — no signing.
+
+# Default public mainnet RPC (read-only, rate-limited). Production callers pass an
+# explicit rpc_url (premium endpoint from config) for the full historical walk.
+DEFAULT_MAINNET_RPC = "https://api.mainnet-beta.solana.com"
+
+# getSignaturesForAddress hard cap per call (Solana RPC limit).
+_SIG_PAGE_LIMIT = 1000
+
+
+async def _rpc_post(rpc_url: str, method: str, params: list) -> dict:
+    """POST a single JSON-RPC call; return the parsed JSON body.
+
+    Raises on transport error or a JSON-RPC ``error`` object so callers can tell
+    a genuine failure from an empty-but-successful result (never silent-None on
+    transport failure — that would mask a truncated chain walk as "no memos").
+    """
+    import httpx
+
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.post(rpc_url, json=payload)
+        resp.raise_for_status()
+        body = resp.json()
+    if isinstance(body, dict) and body.get("error"):
+        raise RuntimeError(f"RPC {method} error: {body['error']}")
+    return body
+
+
+async def get_signatures_for_address(
+    pubkey: str,
+    *,
+    rpc_url: Optional[str] = None,
+    limit: Optional[int] = None,
+    commitment: str = "confirmed",
+) -> List[str]:
+    """Return ALL transaction signatures for ``pubkey``, newest → oldest.
+
+    Fully paginates ``getSignaturesForAddress`` via the ``before`` cursor so the
+    resurrection engine sees the complete chain back to the genesis anchor, not
+    just the most recent page.
+
+    Args:
+        pubkey: Base58 wallet address to walk.
+        rpc_url: RPC endpoint (defaults to public mainnet-beta — pass a premium
+            endpoint for a long historical walk to avoid rate limits).
+        limit: Optional cap on total signatures (None = walk the whole history).
+        commitment: Solana commitment level.
+
+    Returns:
+        List of base58 signature strings, newest first. Empty list if the wallet
+        has no transactions. Raises on transport / RPC error.
+    """
+    url = rpc_url or DEFAULT_MAINNET_RPC
+    out: List[str] = []
+    before: Optional[str] = None
+    while True:
+        opts: dict = {"limit": _SIG_PAGE_LIMIT, "commitment": commitment}
+        if before:
+            opts["before"] = before
+        body = await _rpc_post(url, "getSignaturesForAddress", [pubkey, opts])
+        page = body.get("result") or []
+        if not page:
+            break
+        for entry in page:
+            sig = entry.get("signature") if isinstance(entry, dict) else None
+            if sig:
+                out.append(sig)
+                if limit is not None and len(out) >= limit:
+                    return out[:limit]
+        if len(page) < _SIG_PAGE_LIMIT:
+            break  # last page
+        before = page[-1].get("signature") if isinstance(page[-1], dict) else None
+        if not before:
+            break
+    return out
+
+
+def _extract_memo_from_tx(tx: dict) -> Optional[str]:
+    """Pull the SPL-Memo text out of a jsonParsed transaction, or None.
+
+    Tries the parsed instruction stream first (authoritative), then falls back to
+    the ``Memo (len N): ...`` log-message form. Returns the raw memo string so the
+    caller can hand it straight to ``parse_v3_memo``.
+    """
+    if not tx:
+        return None
+    # 1. Parsed instruction stream (top-level + inner).
+    msg = (tx.get("transaction") or {}).get("message") or {}
+    inst_groups = [msg.get("instructions") or []]
+    for inner in (tx.get("meta") or {}).get("innerInstructions") or []:
+        inst_groups.append(inner.get("instructions") or [])
+    for group in inst_groups:
+        for ix in group:
+            if not isinstance(ix, dict):
+                continue
+            prog = ix.get("program")
+            prog_id = ix.get("programId")
+            if prog == "spl-memo" or prog_id == MEMO_PROGRAM_ID:
+                parsed = ix.get("parsed")
+                if isinstance(parsed, str):
+                    return parsed
+                if isinstance(parsed, dict):
+                    # some encoders wrap it: {"info": {"memo": "..."}} or similar
+                    info = parsed.get("info")
+                    if isinstance(info, dict) and isinstance(info.get("memo"), str):
+                        return info["memo"]
+    # 2. Log-message fallback ("Program log: Memo (len N): <text>").
+    for log in (tx.get("meta") or {}).get("logMessages") or []:
+        if "Memo (len" in log and "): " in log:
+            return log[log.index("): ") + 3:]
+    return None
+
+
+async def get_memo_for_tx(
+    sig: str,
+    *,
+    rpc_url: Optional[str] = None,
+) -> Optional[str]:
+    """Return the SPL-Memo text of transaction ``sig``, or None if it carries none.
+
+    Uses ``getTransaction`` with jsonParsed encoding. Returns None for a
+    successfully-fetched transaction that simply has no memo (so the resurrection
+    walk skips it); raises only on transport / RPC error.
+    """
+    url = rpc_url or DEFAULT_MAINNET_RPC
+    body = await _rpc_post(
+        url, "getTransaction",
+        [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0,
+               "commitment": "confirmed"}],
+    )
+    tx = body.get("result")
+    if not tx:
+        return None
+    return _extract_memo_from_tx(tx)
