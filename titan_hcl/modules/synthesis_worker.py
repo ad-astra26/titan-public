@@ -67,12 +67,14 @@ from titan_hcl import bus
 from titan_hcl.bus import (
     DREAM_STATE_CHANGED,
     KERNEL_EPOCH_TICK,
+    KNOWLEDGE_MOMENT,
     MAINTAIN_BUNDLE,
     MEMORY_RETRIEVAL_USED,
     MODULE_HEARTBEAT,
     MODULE_PROBE_REQUEST,
     MODULE_SHUTDOWN,
     SYNTHESIS_FORK_COMMAND,
+    TOOL_CALL_VERDICT_RECORD,
     SYNTHESIS_FORK_COMMAND_RESULT,
     SYNTHESIS_BUFFER_COMMAND,
     SYNTHESIS_RECOMPUTE_DONE,
@@ -1938,27 +1940,64 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 # is telemetry-only — no record_access, no rich-get-richer
                 # runaway (rFP §240). The actr_working_memory_decay contract is
                 # the SPEC-correct authority; this gate makes the producer honest.
+                # Operator-closure C1: MEMORY_RETRIEVAL_USED is now the per-ITEM
+                # REINFORCEMENT signal ONLY (record_access on the cited gate).
+                # The knowledge_moment denominator moved to the per-TURN
+                # KNOWLEDGE_MOMENT signal below (SPEC §25.9) — recording a moment
+                # per surfaced item inflated the denominator N× and crushed the
+                # sovereignty ratio. Surfaced-not-cited is telemetry only.
                 if payload.get("used_by_llm") is True:
                     with cache_lock:
                         store.record_access(item_id, float(ts))
                     events_recorded += 1
-                    # Phase 10 — a cited recall is a recall-satisfied moment.
-                    if sovereignty_meter is not None:
-                        try:
-                            sovereignty_meter.record_knowledge_moment(float(ts))
-                            sovereignty_meter.record_recall_satisfied(
-                                kind="cited_recall", ts=float(ts))
-                        except Exception:
-                            pass
                 else:
                     events_surfaced += 1
-                    # Surfaced-not-cited: a knowledge moment that recall did
-                    # not satisfy (the LLM re-derived instead).
-                    if sovereignty_meter is not None:
-                        try:
-                            sovereignty_meter.record_knowledge_moment(float(ts))
-                        except Exception:
-                            pass
+                continue
+
+            if msg_type == KNOWLEDGE_MOMENT:
+                # Operator-closure C1 (SPEC §25.9) — the per-TURN sovereignty
+                # signal emitted post-LLM by agno. `needed` = the turn required
+                # knowledge (≥1 recall surfaced OR a tool call); `satisfied` =
+                # answered by ≥1 cited recall. One moment per turn, not per item.
+                if sovereignty_meter is None:
+                    continue
+                _km_ts = payload.get("ts")
+                if not isinstance(_km_ts, (int, float)):
+                    _km_ts = time.time()
+                try:
+                    if payload.get("needed"):
+                        sovereignty_meter.record_knowledge_moment(float(_km_ts))
+                    if payload.get("satisfied"):
+                        sovereignty_meter.record_recall_satisfied(
+                            kind="cited_recall", ts=float(_km_ts))
+                except Exception:
+                    pass
+                continue
+
+            if msg_type == TOOL_CALL_VERDICT_RECORD:
+                # Operator-closure C2 (W7) — a chat-time self-oracle tool
+                # (coding_sandbox in agno) shipped its pre-computed verdict.
+                # Buffer it into the OracleRouter companion buffer for the
+                # dream-boundary OracleVerdictBatch flush (→ §A.6 coverage).
+                # No plug re-run; the tool already verified by executing.
+                if oracle_router is None:
+                    continue
+                _ptx = payload.get("parent_tool_call_tx")
+                if not isinstance(_ptx, str) or not _ptx:
+                    continue
+                try:
+                    oracle_router.record_companion_verdict(
+                        parent_tool_call_tx=_ptx,
+                        oracle_id=str(payload.get("oracle_id", "coding_sandbox")),
+                        verdict=str(payload.get("verdict", "unknown")),
+                        evidence_ref=str(payload.get("evidence_ref", "")),
+                        latency_ms=int(payload.get("latency_ms", 0) or 0),
+                        fork="procedural",
+                    )
+                except Exception as _tcv_err:
+                    logger.debug(
+                        "[synthesis_worker] tool-call verdict record failed: %s",
+                        _tcv_err)
                 continue
 
             if msg_type == USER_FEEDBACK_SIGNAL:
@@ -2174,6 +2213,23 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     # in independent threads; rate-limits inside each dispatcher
                     # ensure ≤ 1 of each per dream window.
                     _maybe_run_llm_judge_async(dream_start_ts)
+                    # Operator-closure C2 (W6) — anchor the buffered oracle
+                    # companion verdicts into OracleVerdictBatch TXs (the
+                    # dream-boundary cadence flush_companion_batches always
+                    # specified but NO caller invoked → coverage stayed 0).
+                    # Cheap + synchronous; runs before the miner so the just-
+                    # anchored verdict refs are in the window the miner reads.
+                    if oracle_router is not None:
+                        try:
+                            _flushed = oracle_router.flush_companion_batches()
+                            if _flushed:
+                                logger.info(
+                                    "[synthesis_worker] oracle companion batches "
+                                    "flushed at dream boundary: %s", _flushed)
+                        except Exception as _ofb_err:
+                            logger.debug(
+                                "[synthesis_worker] companion flush failed: %s",
+                                _ofb_err)
                     _maybe_run_consolidation_async(dream_start_ts)
                     # Phase 5 §P5.H — fire the nightly ForkGC sweep on the
                     # SAME dream-boundary tick. Independent thread; the

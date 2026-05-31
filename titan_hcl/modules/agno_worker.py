@@ -57,6 +57,7 @@ from titan_hcl.bus import (
     CHAT_STREAM_REQUEST,
     DREAM_INBOX_REPLAY,
     KERNEL_EPOCH_TICK,
+    KNOWLEDGE_MOMENT,
     MEMORY_RETRIEVAL_USED,
     MODULE_HEARTBEAT,
     MODULE_SHUTDOWN,
@@ -574,6 +575,16 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
                     "ts": _now,
                     "used_by_llm": _it.item_id in _cited,
                 })
+            # Operator-closure C1 (SPEC §25.9) — ONE per-TURN knowledge-moment
+            # signal: this turn needed knowledge (≥1 item surfaced) and was
+            # `satisfied` iff the response cited ≥1 of them. synthesis_worker's
+            # SovereigntyRatioMeter records the per-turn denominator from this,
+            # replacing the per-ITEM MEMORY_RETRIEVAL_USED inflation.
+            _send(send_queue, KNOWLEDGE_MOMENT, name, "all", {
+                "needed": bool(_items),
+                "satisfied": bool(_cited),
+                "ts": _now,
+            })
     except Exception as _cu_err:
         logger.debug(
             "[AgnoWorker] cited-use gate error (chat unaffected): %s", _cu_err)
@@ -847,7 +858,28 @@ def _build_local_tool_plugs(send_queue) -> dict:
     from titan_hcl.synthesis.tools.coding_sandbox_tool import CodingSandboxTool
 
     omw = OuterMemoryWriter(send_queue, "agno_worker")
-    return {"coding_sandbox": CodingSandboxTool(writer=omw)}
+
+    # Operator-closure C2 (W7): the chat-time sandbox is its own truth oracle but
+    # the OracleRouter lives in synthesis_worker. Ship the sandbox's pre-computed
+    # verdict over the bus so it joins the dream-boundary OracleVerdictBatch flush
+    # (→ §A.6 coverage). Fire-and-forget; never re-executes the sandbox.
+    def _companion_verdict_sink(*, parent_tool_call_tx, oracle_id, verdict,
+                                evidence_ref="", latency_ms=0):
+        try:
+            send_queue.put_nowait({
+                "type": bus.TOOL_CALL_VERDICT_RECORD,
+                "src": "agno_worker", "dst": "synthesis", "ts": time.time(),
+                "payload": {
+                    "parent_tool_call_tx": parent_tool_call_tx,
+                    "oracle_id": oracle_id, "verdict": verdict,
+                    "evidence_ref": evidence_ref, "latency_ms": latency_ms,
+                },
+            })
+        except Exception:
+            pass
+
+    return {"coding_sandbox": CodingSandboxTool(
+        writer=omw, companion_verdict_sink=_companion_verdict_sink)}
 
 
 def _init_worker_plugin_and_agent(bus_client, config: dict[str, Any], send_queue):
