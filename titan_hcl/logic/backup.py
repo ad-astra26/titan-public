@@ -18,7 +18,6 @@ import os
 import tarfile
 import time
 from contextlib import suppress
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -118,36 +117,8 @@ class RebirthBackup:
         self._soul_cas_lock = None         # asyncio.Lock, lazy
         self._timechain_cas_lock = None    # asyncio.Lock, lazy
 
-        # Phase 2 pre-stage (2026-05-31): the backup worker's stager builds the
-        # day's event off the recv loop and parks it here; on_meditation_complete
-        # consumes it for a fast ship. _stage_lock guards the stager↔meditation
-        # handoff (a threading.Lock — both run on worker daemon threads, not the
-        # asyncio loop). {"staged": StagedEvent, "date": "YYYY-MM-DD"} or None.
-        self._staged_event = None
-        self._stage_lock = threading.Lock()
-
         # Load persisted backup state if available
         self._load_backup_state()
-
-    def stage_built_event(self, staged, day: str) -> None:
-        """Stager entry-point (called from the worker's background thread): park a
-        freshly-built StagedEvent for today's ship. Won't clobber an unconsumed
-        fresh stage for the same day."""
-        with self._stage_lock:
-            cur = self._staged_event
-            if cur is not None and cur.get("date") == day:
-                return  # already have a fresh stage for today
-            self._staged_event = {"staged": staged, "date": day}
-
-    def _take_fresh_staged_event(self, day: str):
-        """Atomically take + clear today's staged event (or None if absent/stale).
-        Consumed exactly once; a stale (prior-day) stage is dropped."""
-        with self._stage_lock:
-            entry = self._staged_event
-            self._staged_event = None
-            if entry is not None and entry.get("date") == day:
-                return entry.get("staged")
-            return None
 
     def _get_personality_cas_lock(self):
         """Lazy-create the personality-date CAS lock on first async use."""
@@ -285,74 +256,62 @@ class RebirthBackup:
             # day. Restore the daily gate by claiming the calendar day here
             # (same CAS pattern + failure-reset as the legacy personality
             # gate) so the unified event ships exactly once per day.
-            # SPEC §24 daily/weekly gate — MANIFEST IS THE SINGLE SOURCE OF TRUTH
-            # (2026-05-31 redesign, Maker request). The prior pattern CLAIMED the
-            # calendar day (persisting _last_personality_date) BEFORE the ship; a
-            # ship failure OR a mid-ship process death (boot-storm / restart) then
-            # left the day stuck-claimed → every later meditation skipped → no
-            # backup landed for days (the proof_day-silence + 05-31 stuck-claim
-            # root cause). Fix: there is NO separate claim flag. The gate asks the
-            # manifest "did today's event already land?" — a cheap LOCAL read (no
-            # RPC). A SUCCESSFUL ship appends today's event (next meditation then
-            # correctly skips); a FAILED ship appends nothing (next meditation
-            # correctly retries). Nothing can get stuck. The CAS lock is kept
-            # purely to serialize two near-simultaneous meditations → still ships
-            # exactly once. Weekly (Sunday soul) is covered automatically: Sunday's
-            # event is ONE atomic event that includes the soul tier.
+            claim_day = False
+            prev_personality_date = self._last_personality_date
             async with self._get_personality_cas_lock():
-                if self._todays_backup_already_landed():
-                    logger.info(
-                        "[Backup] §24 daily backup already LANDED for %s "
-                        "(manifest event exists) — skipping (meditation #%d)",
-                        today, self._meditation_count)
-                    return
-
-                # Irys auto-fund (re-homed 2026-05-31) — top up before the upload,
-                # same caps (auto_fund_enabled / daily cap / runway / reserve).
-                # Best-effort; a fund hiccup never blocks the backup.
-                try:
-                    self._auto_fund_irys_before_upload()
-                except Exception as _af_err:
-                    logger.warning(
-                        "[Backup] §24 Irys auto-fund check raised: %s", _af_err)
-
-                # Ship. Phase 2: prefer a fresh pre-staged event (built off-loop
-                # by the stager); fall back to an inline build on cold-start /
-                # stale-baseline. On ANY failure we simply return — the manifest
-                # has no today-event, so the next meditation retries (nothing
-                # stuck, no claim to release).
-                try:
-                    _staged = self._take_fresh_staged_event(today)
-                    if _staged is not None:
-                        shipped = await self._ship_staged_event_v2(_staged)
-                        if not shipped:
-                            logger.info(
-                                "[Backup] §24 staged ship declined (stale/failed)"
-                                " — falling back to inline build")
-                            shipped = await self._run_unified_event_v2(
-                                weekday=weekday)
-                    else:
-                        shipped = await self._run_unified_event_v2(
-                            weekday=weekday)
-                except Exception as e:
-                    logger.exception(
-                        "[Backup] §24 unified_v2 ship raised — no backup this "
-                        "meditation; next meditation retries (manifest has no "
-                        "today-event → nothing stuck): %s", e)
-                    self._alert_backup_failure("unified_v2", f"raised: {e}")
-                    return
-
-                if shipped:
-                    logger.info(
-                        "[Backup] §24 unified_v2 event SHIPPED — daily backup "
-                        "landed for %s (meditation #%d); manifest updated",
-                        today, self._meditation_count)
-                else:
-                    logger.info(
-                        "[Backup] §24 ship did not land for %s — no manifest "
-                        "event written; next meditation will retry (nothing "
-                        "stuck)", today)
+                if today != self._last_personality_date:
+                    self._last_personality_date = today
+                    self._save_backup_state()
+                    claim_day = True
+            if not claim_day:
+                logger.info(
+                    "[Backup] §24 unified_v2: daily backup already done for %s "
+                    "(meditation #%d) — skipping (1st-meditation-of-day gate)",
+                    today, self._meditation_count,
+                )
                 return
+            try:
+                shipped = await self._run_unified_event_v2(weekday=weekday)
+            except Exception as e:
+                logger.exception(
+                    "[Backup] §24 unified_v2 pipeline raised — NO legacy "
+                    "fallback (Maker policy 2026-05-23 D-SPEC-123 follow-up); "
+                    "this meditation produces no backup; next meditation will "
+                    "retry: %s", e,
+                )
+                self._alert_backup_failure(
+                    "unified_v2", f"pipeline raised: {e}")
+                # Release the claimed day so the next meditation retries
+                # today's backup (matches legacy personality failure-reset).
+                self._last_personality_date = prev_personality_date
+                self._save_backup_state()
+                return
+            if shipped:
+                # Pipeline handled this meditation; we're done. ZK epoch
+                # snapshot + MyDay NFT are orthogonal to §24 but per the
+                # 2026-05-23 policy ANY legacy upload path is OFF when
+                # unified_v2 is enabled — those orthogonal pieces are
+                # separately gated by their own flags
+                # ([mainnet_budget].zk_compression_enabled, etc.) and
+                # already early-return when disabled.
+                logger.info(
+                    "[Backup] §24 unified_v2 event shipped — daily backup "
+                    "complete for %s (meditation #%d); no legacy cascade",
+                    today, self._meditation_count,
+                )
+                return
+            # shipped == False and no exception raised: unified_v2 declined
+            # to ship (e.g. nothing changed since last event) OR a non-raising
+            # failure (status != "shipped"). Either way today's backup was NOT
+            # produced — RELEASE the claimed day so a later meditation (with
+            # changes / after a transient Arweave hiccup clears) can still land
+            # exactly one backup today.
+            self._last_personality_date = prev_personality_date
+            self._save_backup_state()
+            logger.info(
+                "[Backup] §24 unified_v2 returned shipped=False — releasing "
+                "daily claim for %s; next meditation will retry", today)
+            return
 
         # 1. ZK Epoch Snapshot (every meditation) — DISABLED for mainnet MVM
         #    TimeChain merkle root is now committed via vault in meditation.py.
@@ -2335,208 +2294,6 @@ class RebirthBackup:
                     "failed: %s (next incremental may full-ship)", e,
                 )
         return True
-
-    # ── Phase 2 pre-stage (2026-05-31) ─────────────────────────────────────
-    #
-    # Splits the unified_v2 event into a heavy BUILD (snapshot+diff+pack — run by
-    # the backup worker's stager OFF the recv loop, ahead of the first meditation)
-    # and a fast SHIP (upload staged tarballs + ZK + manifest — run on meditation).
-    # Removes the multi-minute diff-build from the bus-blocking meditation path.
-    # _run_unified_event_v2 above is the unchanged inline path (manual trigger +
-    # cold-start fallback when no fresh stage exists).
-
-    def _todays_backup_already_landed(self) -> bool:
-        """SPEC §24 daily/weekly gate — the MANIFEST is the source of truth.
-
-        Returns True iff a valid backup event dated today (UTC) already exists in
-        the manifest. Cheap LOCAL read (no Solana/Arweave RPC — those are costly
-        timewise, per Maker). A manifest event is only appended on a FULLY
-        successful ship (all tiers uploaded + ZK committed), so existence == the
-        backup landed. Weekly (Sunday soul) is covered: Sunday's event is one
-        atomic event that includes the soul tier, so a today-event implies both.
-
-        On an unreadable manifest, returns False (not-landed) — safer than
-        falsely claiming done: a retry that finds an existing event no-ops, but a
-        false 'done' would block a needed backup (the exact bug this replaces).
-        """
-        try:
-            from titan_hcl.logic.backup_unified_manifest import UnifiedManifest
-            manifest = UnifiedManifest.load(
-                titan_id=self._titan_id, base_dir="data")
-        except Exception as e:
-            logger.warning(
-                "[Backup] §24 gate: manifest load failed (%s) — treating as "
-                "not-landed (will attempt/retry)", e)
-            return False
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        for ev in manifest.events:
-            ts = ev.get("ts_unix", 0) or 0
-            if not ts:
-                continue
-            ev_day = datetime.fromtimestamp(
-                float(ts), timezone.utc).strftime("%Y-%m-%d")
-            # "exists AND is correct": dated today + carries the chain anchor
-            # (zk_commit_tx is only set on a fully-committed event).
-            if ev_day == today and ev.get("zk_commit_tx"):
-                return True
-        return False
-
-    def _build_staged_event_v2(self, weekday: int):
-        """Pre-BUILD a unified event (no upload, no manifest mutation). Returns a
-        StagedEvent or None (arweave gate off / manifest unloadable). Mirrors
-        _run_unified_event_v2's spec/resolver wiring."""
-        from titan_hcl.logic.backup_unified_manifest import UnifiedManifest
-        from titan_hcl.logic.backup_upload_pipeline import build_unified_event
-        try:
-            _budget = (self._full_config or {}).get("mainnet_budget", {}) or {}
-        except Exception:
-            _budget = {}
-        if not _budget.get("backup_arweave_enabled", False):
-            logger.debug("[Backup] §24 build-stage: backup_arweave_enabled=false")
-            return None
-        try:
-            manifest = UnifiedManifest.load(
-                titan_id=self._titan_id, base_dir="data")
-        except ValueError as e:
-            logger.error("[Backup] §24 build-stage: manifest load failed: %s", e)
-            return None
-        p_specs = self._tier_specs_from_paths(self.PERSONALITY_PATHS)
-        t_specs = self._tier_specs_from_paths(
-            self.TIMECHAIN_PATHS, format_hint="timechain_bin")
-        s_specs = (self._tier_specs_from_paths(self.WEEKLY_EXTRA_PATHS)
-                   if weekday == 6 else None)
-        base_dir = self._baseline_working_dir()
-
-        def _baseline_resolver(component, arc_name):
-            candidate = os.path.join(base_dir, arc_name)
-            return candidate if os.path.exists(candidate) else None
-
-        staged = build_unified_event(
-            titan_id=self._titan_id, manifest=manifest,
-            personality_specs=p_specs, timechain_specs=t_specs,
-            soul_specs=s_specs, baseline_resolver=_baseline_resolver,
-        )
-        logger.info(
-            "[Backup] §24 staged event BUILT: id=%s type=%s (off-loop; "
-            "awaiting meditation to ship)", staged.event_id[:8],
-            staged.event_type)
-        return staged
-
-    async def _ship_staged_event_v2(self, staged) -> bool:
-        """SHIP a pre-built StagedEvent (fast, on meditation). Reloads the
-        manifest fresh for the staleness check + append. Returns True if shipped;
-        False on stale-baseline (caller rebuilds) / gate-off / failure."""
-        from titan_hcl.logic.backup_unified_manifest import UnifiedManifest
-        from titan_hcl.logic.backup_upload_pipeline import ship_staged_event
-        store = self._ensure_arweave_store_for_unified()
-        if store is None:
-            logger.warning("[Backup] §24 ship-stage: no ArweaveStore available")
-            return False
-        try:
-            manifest = UnifiedManifest.load(
-                titan_id=self._titan_id, base_dir="data")
-        except ValueError as e:
-            logger.error("[Backup] §24 ship-stage: manifest load failed: %s", e)
-            return False
-
-        async def _arweave_upload(data: bytes, tags: dict) -> str:
-            import tempfile
-            with tempfile.NamedTemporaryFile(
-                delete=False, suffix=".tar.gz",
-                prefix=f"titan_unified_{self._titan_id}_",
-            ) as f:
-                f.write(data)
-                tmp_path = f.name
-            try:
-                tx = await store.upload_file(tmp_path, tags=tags)
-                if not tx:
-                    raise RuntimeError(
-                        "ArweaveStore.upload_file returned empty tx_id")
-                return tx
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-
-        async def _v3_chain_commit(event_id, ts, event_type, event_root,
-                                   components, prev_sig):
-            return await self.commit_event_v3_chain(
-                event_id=event_id, ts=ts, event_type=event_type,
-                event_merkle_root=event_root, components=components,
-                prev_sig=prev_sig)
-
-        def _bus_emit(name: str, payload: dict) -> None:
-            try:
-                bus = getattr(self, "bus", None) or getattr(self, "_bus", None)
-                if bus is not None and hasattr(bus, "emit"):
-                    bus.emit(name, payload)
-            except Exception:
-                pass
-
-        result = await ship_staged_event(
-            staged, manifest=manifest, arweave_uploader=_arweave_upload,
-            zk_committer=_v3_chain_commit, bus_emit=_bus_emit)
-
-        if result.status == "stale_baseline":
-            logger.info(
-                "[Backup] §24 staged event STALE (baseline moved since build) — "
-                "discarding, stager will rebuild: %s", result.skipped_reason)
-            return False
-        if result.status != "shipped":
-            logger.warning(
-                "[Backup] §24 staged ship NOT shipped: status=%s errors=%s",
-                result.status, result.errors)
-            return False
-        if result.event_type == "baseline":
-            try:
-                self._refresh_baseline_working_dir()
-            except Exception as e:
-                logger.warning(
-                    "[Backup] §24 ship-stage: baseline working dir refresh "
-                    "failed: %s (next incremental may full-ship)", e)
-        return True
-
-    def _auto_fund_irys_before_upload(self) -> None:
-        """Re-homed Irys auto-fund (2026-05-31). The auto-fund hook lived only in
-        the legacy BackupCascade.run() path, which the unified_v2 migration
-        retired — so it stopped firing after 2026-05-19 and the deposit went red.
-        Re-invoke it from the unified_v2 daily path, before the upload, with the
-        SAME caps (config-gated by [backup].auto_fund_enabled + daily cap +
-        runway floor + wallet reserve; the audit log + Telegram alert are emitted
-        inside auto_fund_irys_if_needed). No-op when disabled / runway sufficient.
-        """
-        bcfg = (self._full_config or {}).get("backup", {}) or {}
-        if not bcfg.get("auto_fund_enabled", False):
-            return
-        from titan_hcl.logic.backup_cascade import BackupCascade
-        cascade = BackupCascade(full_config=self._full_config)
-        # Runway estimator needs a representative upload size — use the staged
-        # event's total tarball size when available, else a sane daily default.
-        size_mb = 35.0
-        try:
-            entry = self._staged_event
-            staged = entry.get("staged") if isinstance(entry, dict) else None
-            if staged is not None:
-                total = sum(
-                    r.tarball_size_bytes for r in staged.tier_results.values()
-                    if r is not None and r.tarball_size_bytes)
-                if total > 0:
-                    size_mb = total / 1048576.0
-        except Exception:
-            pass
-        result = cascade.auto_fund_irys_if_needed(size_mb)
-        action = (result or {}).get("action")
-        if action == "funded":
-            logger.info(
-                "[Backup] §24 Irys auto-fund: FUNDED %.4f SOL (runway was %.2fd) "
-                "tx=%s", result.get("amount_sol", 0.0),
-                result.get("runway_before_days", 0.0),
-                str(result.get("tx_id", ""))[:16])
-        elif action and action != "no_action":
-            logger.info(
-                "[Backup] §24 Irys auto-fund: %s (%s)",
-                action, result.get("reason", ""))
 
     # ── Local diff/baseline event (L5, 2026-05-14) ─────────────────────────
     #

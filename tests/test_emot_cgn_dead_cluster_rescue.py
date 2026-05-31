@@ -116,6 +116,42 @@ def test_emergent_soft_update_moves_winner():
     assert dist < 0.5
 
 
+def test_buffer_persists_across_restart():
+    """The observation buffer survives a 'restart' (new clusterer, same save_dir)
+    so the recenter can actually reach its obs threshold — the reachability fix."""
+    tmp = tempfile.mkdtemp()
+    c1 = EmotionClusterer(save_dir=tmp, recenter_interval_s=0.0)
+    region = np.full(FEATURE_DIM, 0.5, dtype=np.float32); region[5:20] += 0.2
+    for v in _obs(region, 80):
+        c1.observe(v)
+    c1._save_buffer()
+    buffered_before = len(c1._observation_buffer)
+    assert buffered_before > 0
+    # "Restart": brand-new clusterer over the same save_dir.
+    c2 = EmotionClusterer(save_dir=tmp, recenter_interval_s=0.0)
+    assert len(c2._observation_buffer) > 0, "buffer did not survive restart"
+    assert len(c2._observation_buffer) == min(buffered_before, 600)
+
+
+def test_adaptive_heal_cadence_while_dead():
+    """While an emergent slot is dead (LOVE n=0), the effective recenter interval
+    is the daily heal interval, not the weekly one — so the heal fires in days."""
+    tmp = tempfile.mkdtemp()
+    clst = EmotionClusterer(save_dir=tmp, recenter_interval_s=7 * 86400)
+    # Fresh init: LOVE n_obs=0, not emerged → has_dead True → daily cadence.
+    assert clst._clusters["LOVE"].n_observations == 0
+    assert clst._heal_recenter_interval_s < clst._recenter_interval_s
+    # Simulate a recenter ~2 days ago: with weekly interval it'd be skipped, but
+    # the daily heal cadence (dead slot present) makes it due.
+    import time as _t
+    clst._last_recenter_ts = _t.time() - 2 * 86400
+    region = np.full(FEATURE_DIM, 0.5, dtype=np.float32); region[5:20] += 0.2
+    for v in _obs(region, 60):
+        clst.observe(v)
+    fired = clst.maybe_recenter(force=False)   # NOT forced — relies on cadence
+    assert fired is True, "heal cadence did not make the recenter due"
+
+
 if __name__ == "__main__":
     for _name, _fn in sorted(globals().items()):
         if _name.startswith("test_") and callable(_fn):
