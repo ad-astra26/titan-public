@@ -504,9 +504,11 @@ class SocialXGateway:
     # ── Config ──────────────────────────────────────────────────────
 
     def _load_config(self) -> dict:
-        """Reload config from disk. Called before EVERY action.
+        """Return merged config ([social_x] + credential keys). Called before
+        EVERY action — relies on config_loader's mtime-aware cache, so repeated
+        calls are cheap (no disk re-read unless a source file actually changed)
+        yet still reflect live edits to config.toml / ~/.titan/secrets.toml.
 
-        Returns merged dict of [social_x] + credential keys.
         Uses titan_hcl.config_loader so secrets in ~/.titan/secrets.toml
         are deep-merged over the base config.
         """
@@ -520,7 +522,7 @@ class SocialXGateway:
             _use_path = (_instance_path
                          if _instance_path and _instance_path != "./titan_hcl/config.toml"
                          else None)
-            full = load_titan_config(force_reload=True, config_path=_use_path)
+            full = load_titan_config(config_path=_use_path)
         except Exception as e:
             logger.warning("[SocialXGateway] Config load failed: %s", e)
             return {"enabled": False}
@@ -876,7 +878,7 @@ class SocialXGateway:
         import httpx
         try:
             from titan_hcl.config_loader import load_titan_config
-            full_cfg = load_titan_config(force_reload=True)
+            full_cfg = load_titan_config()
             tc = full_cfg.get("twitter_social", {})
 
             user_name = tc.get("user_name", "")

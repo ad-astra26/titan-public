@@ -72,7 +72,27 @@ def _per_titan_override_path() -> Path:
 
 
 _cache: dict | None = None
+_cache_sig: tuple | None = None
 _warned_missing_secrets = False
+
+
+def _source_mtimes(layer2_path: Path, override_path: Path) -> tuple:
+    """Signature of the 4 config layers' on-disk state (mtime_ns per file).
+
+    Used to make the in-process cache auto-invalidating: when any source
+    file changes on disk, its mtime advances and the signature differs, so
+    the next ``load_titan_config()`` rebuilds instead of returning a stale
+    cache. A missing file contributes ``None`` (so the cache also refreshes
+    when a layer appears or is deleted). Cost is 4 ``stat()`` calls — cheap
+    relative to read+parse+deep-merge of the same 4 files.
+    """
+    sig = []
+    for p in (TITAN_PARAMS_PATH, layer2_path, SECRETS_PATH, override_path):
+        try:
+            sig.append(p.stat().st_mtime_ns)
+        except OSError:
+            sig.append(None)
+    return tuple(sig)
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:
@@ -102,7 +122,10 @@ def load_titan_config(force_reload: bool = False,
     Later layers override earlier ones (deep-merge semantics).
 
     Args:
-        force_reload: If True, bypass the in-process cache (for tests).
+        force_reload: If True, bypass the in-process cache unconditionally.
+            Normally unnecessary: the cache is mtime-aware (it auto-refreshes
+            when any source file changes on disk), so plain calls already see
+            live config edits. Retained for tests / explicit-refresh callers.
         config_path: Optional Layer 2 path override (for tests / per-instance
             isolation). When provided, the cache is BYPASSED for both read
             and write so test configs never pollute production state.
@@ -112,12 +135,28 @@ def load_titan_config(force_reload: bool = False,
         missing/unreadable. Missing titan_params.toml is non-fatal (treated
         as empty layer); missing secrets.toml is non-fatal (warns once).
     """
-    global _cache, _warned_missing_secrets
+    global _cache, _cache_sig, _warned_missing_secrets
 
     layer2_path = Path(config_path) if config_path else BASE_CONFIG_PATH
-    use_cache = config_path is None
+    # The cache keys on the canonical config layer. A config_path that points
+    # at the real config.toml in ANY form — including an absolute path, which
+    # is how SocialXGateway passes it (os.path.join(...,'config.toml')) — must
+    # share the global cache; otherwise every caller that resolves its own
+    # absolute path bypasses the cache and re-reads+merges all layers on every
+    # call (this was the social_x reload storm: ~240 rebuilds/hr/Titan). Only a
+    # genuinely DIFFERENT path (tests injecting a tmp config) bypasses caching.
+    if config_path is None:
+        use_cache = True
+    else:
+        try:
+            use_cache = layer2_path.resolve() == BASE_CONFIG_PATH.resolve()
+        except OSError:
+            use_cache = False
+    override_path = _per_titan_override_path()
 
-    if use_cache and _cache is not None and not force_reload:
+    current_sig = _source_mtimes(layer2_path, override_path) if use_cache else None
+    if (use_cache and _cache is not None and not force_reload
+            and _cache_sig == current_sig):
         return _cache
 
     # Layer 1: titan_params.toml — engineering defaults. Non-fatal if missing
@@ -182,7 +221,7 @@ def load_titan_config(force_reload: bool = False,
     # Layer 4 (top): per-Titan microkernel override — staged flag flips.
     # Optional. Highest precedence — applied AFTER secrets so it can override
     # anything. Use case: T1 stays on legacy while T2/T3 run on microkernel v2.
-    override_path = _per_titan_override_path()
+    # (override_path resolved once at the top, reused here + in the cache sig.)
     if override_path.exists():
         try:
             with open(override_path, "rb") as f:
@@ -202,13 +241,15 @@ def load_titan_config(force_reload: bool = False,
 
     if use_cache:
         _cache = merged
+        _cache_sig = current_sig
     return merged
 
 
 def clear_cache() -> None:
     """Clear the in-process cache. Tests only."""
-    global _cache, _warned_missing_secrets
+    global _cache, _cache_sig, _warned_missing_secrets
     _cache = None
+    _cache_sig = None
     _warned_missing_secrets = False
 
 

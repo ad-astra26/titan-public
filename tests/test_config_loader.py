@@ -154,7 +154,11 @@ def test_load_with_malformed_secrets_falls_back_to_base(tmp_path, caplog):
     assert any("Failed to merge" in r.message for r in caplog.records)
 
 
-def test_cache_is_reused(tmp_path):
+def test_cache_is_reused_until_file_changes(tmp_path):
+    """The in-process cache is reused while source files are unchanged, and
+    auto-refreshes (mtime-aware) the moment any layer changes on disk — so a
+    plain ``load_titan_config()`` reflects live edits without ``force_reload``.
+    """
     base = tmp_path / "config.toml"
     secrets = tmp_path / "secrets.toml"
     _write_toml(base, "[api]\nport = 7777\n")
@@ -166,13 +170,23 @@ def test_cache_is_reused(tmp_path):
         config_loader, "SECRETS_PATH", secrets
     ):
         cfg1 = config_loader.load_titan_config(force_reload=True)
-        # Mutate the file — cached load should NOT reflect it.
-        _write_toml(secrets, '[api]\ninternal_key = "k2"\n')
+        assert cfg1["api"]["internal_key"] == "k1"
+        # Files unchanged → same cached object returned (no rebuild).
         cfg2 = config_loader.load_titan_config()
-        assert cfg2["api"]["internal_key"] == "k1"
-        # force_reload picks up the change.
-        cfg3 = config_loader.load_titan_config(force_reload=True)
+        assert cfg2 is cfg1
+        # Mutate a source file and bump its mtime forward so the change is
+        # detectable regardless of filesystem mtime granularity.
+        _write_toml(secrets, '[api]\ninternal_key = "k2"\n')
+        st = secrets.stat()
+        bump = st.st_mtime_ns + 1_000_000_000
+        os.utime(secrets, ns=(bump, bump))
+        # Plain load auto-refreshes via the mtime signature — no force_reload.
+        cfg3 = config_loader.load_titan_config()
         assert cfg3["api"]["internal_key"] == "k2"
+        assert cfg3 is not cfg1
+        # force_reload still works as an explicit bypass.
+        cfg4 = config_loader.load_titan_config(force_reload=True)
+        assert cfg4["api"]["internal_key"] == "k2"
 
 
 def test_update_secret_creates_file_and_writes_section(tmp_path):
@@ -372,14 +386,16 @@ fire_threshold = 0.20
     ):
         section = params_mod.get_params("reflexes")
 
-    # Layer 2 (config.toml) overrides Layer 1 (titan_params.toml) — fire_threshold
-    assert section["fire_threshold"] == 0.20
-    # Layer 1 keys not overridden in Layer 2 must still be visible
-    assert section["cooldown_ms"] == 250
-    # Returned dict is a copy — mutation does not affect cache
-    section["fire_threshold"] = 99.0
-    section_again = params_mod.get_params("reflexes")
-    assert section_again["fire_threshold"] == 0.20
+        # Layer 2 (config.toml) overrides Layer 1 (titan_params.toml) — fire_threshold
+        assert section["fire_threshold"] == 0.20
+        # Layer 1 keys not overridden in Layer 2 must still be visible
+        assert section["cooldown_ms"] == 250
+        # Returned dict is a copy — mutating it must not corrupt the cache.
+        # (Re-read stays inside the patched-paths context: the mtime-aware
+        # cache would otherwise correctly rebuild from the real config files.)
+        section["fire_threshold"] = 99.0
+        section_again = params_mod.get_params("reflexes")
+        assert section_again["fire_threshold"] == 0.20
 
 
 def test_params_get_params_unknown_section_returns_empty_dict(tmp_path):
