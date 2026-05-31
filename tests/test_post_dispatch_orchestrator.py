@@ -119,7 +119,6 @@ def _stub_bank() -> MagicMock:
         "read_unified_spirit_metadata", "read_reasoning_state",
         "read_meta_reasoning_state", "read_dream_state",
         "read_expression_state", "read_mind_state",
-        "read_msl_state", "read_consciousness_age",
         "read_language_state", "read_social_perception_state",
     ):
         getattr(bank, name).return_value = None
@@ -217,15 +216,10 @@ def test_build_post_context_populates_fields_from_shm():
     bank.read_expression_state.return_value = {
         "fire_counts": {"ART": 3, "MUSIC": 1},
     }
-    # attention_entropy lives in mind_state; i_confidence + concept_confidences
-    # are read from the canonical MSL self-model slot (2026-05-29 fix —
-    # mind_state never carried them). See social_worker_post_dispatch.py:249.
     bank.read_mind_state.return_value = {
-        "attention_entropy": 0.4,
-    }
-    bank.read_msl_state.return_value = {
         "i_confidence": 0.92,
         "concept_confidences": {"I": 0.9, "YOU": 0.7},
+        "attention_entropy": 0.4,
     }
     bank.read_language_state.return_value = {
         "vocab_total": 446, "vocab_producible": 342,
