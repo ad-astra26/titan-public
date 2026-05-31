@@ -12,12 +12,58 @@ import struct
 from pathlib import Path
 from typing import Iterator, Tuple
 
+from typing import Optional
+
 from titan_hcl.logic.timechain import (
     CROSS_REF_SIZE,
+    FORK_NAMES,
     HEADER_SIZE,
     BlockHeader,
     BlockPayload,
 )
+
+
+def chain_file_for(data_dir: Path, fork_id: int) -> Path:
+    """Resolve the on-disk `.bin` path for a fork_id (mirrors
+    `TimeChain._get_chain_file_path`): a named primary fork lives at
+    `chain_<name>.bin`; anything else is a sidechain at
+    `sidechains/sc_<fork_id:04d>.bin`. Used to dereference a block_index row's
+    `(fork_id, file_offset)` without opening a writable TimeChain."""
+    name = FORK_NAMES.get(int(fork_id))
+    if name:
+        return Path(data_dir) / f"chain_{name}.bin"
+    return Path(data_dir) / "sidechains" / f"sc_{int(fork_id):04d}.bin"
+
+
+def read_block_content_at(
+    data_dir: Path, fork_id: int, offset: int,
+) -> Optional[dict]:
+    """Read ONE block's content dict from `chain_<fork>.bin` (or the sidechain
+    file) at `offset` — the byte position stored in `block_index.file_offset`.
+    Read-only; returns None on a missing file / short read / parse error (the
+    caller skips that TX rather than failing the whole pass)."""
+    path = chain_file_for(data_dir, fork_id)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(int(offset))
+            header_data = f.read(HEADER_SIZE)
+            if len(header_data) < HEADER_SIZE:
+                return None
+            header = BlockHeader.from_bytes(header_data)
+            f.read(header.cross_ref_count * CROSS_REF_SIZE)
+            len_data = f.read(4)
+            if len(len_data) < 4:
+                return None
+            payload_len = struct.unpack(">I", len_data)[0]
+            payload_data = f.read(payload_len)
+            if len(payload_data) < payload_len:
+                return None
+            payload = BlockPayload.from_bytes(payload_data)
+            return payload.content if isinstance(payload.content, dict) else {}
+    except Exception:
+        return None
 
 
 def iter_block_contents(chain_path: Path) -> Iterator[Tuple[int, str, str, dict]]:
