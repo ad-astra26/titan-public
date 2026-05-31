@@ -1020,16 +1020,35 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     action="reject", reason="llm_proposer_unconfigured",
                 )
 
+        # Operator-closure Phase B4 (W4) — real embeddings into consolidation.
+        # default_mine_recent_txs returns embedding=None (the "FAISS fetch is
+        # Phase 7" TODO, never done) → tag-only clustering → no real concepts
+        # ever formed. Fill each mined candidate's embedding from the tx_hash
+        # FAISS store (Phase A) so ConsolidationPass clusters by COSINE (0.85)
+        # AND tags, not tags alone — the precondition for real concept synthesis.
+        def _mine_with_embeddings(since_ts, exclude_forks):
+            cands = default_mine_recent_txs(since_ts, exclude_forks)
+            if synth_vector_store is None:
+                return cands
+            for c in cands:
+                if c.embedding is None:
+                    vec = synth_vector_store.get_vector(c.fork, c.tx_hash)
+                    if vec is not None:
+                        c.embedding = tuple(float(x) for x in vec)
+            return cands
+
         consolidation_pass = ConsolidationPass(
             concept_store=concept_store,
             cgn_bridge=cgn_bridge,
             outer_memory_writer=writer,
-            mine_recent_txs_fn=default_mine_recent_txs,
+            mine_recent_txs_fn=_mine_with_embeddings,
             llm_propose_fn=propose_fn,
         )
         logger.info(
             "[synthesis_worker] ConsolidationPass ready — DREAM_STATE_CHANGED "
-            "subscription active; rate-limit = 1 pass / dream window",
+            "subscription active; rate-limit = 1 pass / dream window; "
+            "embeddings=%s (cosine clustering)",
+            "tx_hash_store" if synth_vector_store is not None else "tag-only",
         )
     except Exception as exc:
         logger.warning(

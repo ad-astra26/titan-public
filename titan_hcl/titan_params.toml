@@ -3223,6 +3223,14 @@ repair_fork_failure_threshold = 3      # §9.3 / §11.5 consecutive-failure thre
 user_feedback_delta           = 0.15   # INV-Syn-24 Tier-2 utility delta (vs 0.05 oracle)
 recall_parity_soft_fallback   = true   # legacy-resolver fallback during parity soak ONLY
 
+[synthesis.recall]
+# Operator-closure (tx_hash spine, INV-15) — live retrieval into the chat path.
+# When true, the agno pre-LLM hook runs EngineRecall composite retrieval over
+# the tx_hash-native FAISS spine and injects the dereferenced hits ALONGSIDE the
+# legacy memory_context (INV-4 augment-then-converge). Default false (safety);
+# T3 canary override = true via ~/.titan/microkernel_T3.toml [synthesis.recall].
+augment_chat                  = false  # tx_hash-spine recall augment in chat (T3 canary = true)
+
 [synthesis.metrics]
 # Phase 10 (D-SPEC-PHASE10) — observatory + metrics (INV-Syn-25, observation only).
 sovereignty_windows           = ["24h", "7d", "all"]  # rolling windows for the headline ratio

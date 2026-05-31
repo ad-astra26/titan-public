@@ -919,6 +919,63 @@ def create_pre_hook(plugin):
                 memory_lines.append(f"- [{w:.1f}] Q: {p} | A: {r}")
             memory_context = "### Recalled Memories\n" + "\n".join(memory_lines) + "\n\n"
 
+        # ── Operator-closure Phase B3 — synthesis tx_hash-spine recall augment ──
+        # Run EngineRecall composite retrieval over the tx_hash spine (Phase A)
+        # ALONGSIDE the legacy memory_context (INV-4 augment-then-converge):
+        # SEARCH returns tx_hashes, we dereference them into content snippets and
+        # inject as a DISTINCT block, and record the surfaced items so the
+        # post-LLM CitedUseDetector (INV-Syn-23) can score what the response
+        # actually cited (feeds W3 / the sovereignty ratio). Gated by
+        # synthesis_recall_augment (T3 override true); soft-fail — chat never
+        # breaks on a recall error. Retired vs legacy at D2 once proven.
+        synthesis_recall_context = ""
+        try:
+            _recall = getattr(plugin, "engine_recall", None)
+            if (getattr(plugin, "synthesis_recall_augment", False)
+                    and _recall is not None and prompt_text):
+                _deref = getattr(plugin, "synthesis_tx_deref", None)
+                _results = await asyncio.to_thread(_recall.recall, prompt_text, k=6)
+                _lines = []
+                _surfaced = []
+                for _r in (_results or []):
+                    _txh = getattr(_r, "tx_hash", "") or ""
+                    if not _txh:
+                        continue
+                    _snip = ""
+                    if _deref is not None:
+                        _snip = _deref.snippet(_txh, getattr(_r, "fork", "")) or ""
+                    if not _snip:
+                        _snip = getattr(_r, "summary", "") or ""
+                    if not _snip:
+                        continue
+                    _lines.append(f"- [{getattr(_r, 'score', 0.0):.2f}] {_snip[:300]}")
+                    _surfaced.append({
+                        "item_id": _txh,
+                        "title": _snip[:120],
+                        "content_snippet": _snip[:512],
+                        "concept_ids": [],
+                    })
+                if _lines:
+                    synthesis_recall_context = (
+                        "### Synthesis Recall (your own verified experience — tx_hash spine)\n"
+                        + "\n".join(_lines) + "\n\n"
+                    )
+                    _uid = getattr(plugin, "_current_user_id", "") or ""
+                    _sid = getattr(plugin, "_current_session_id", "") or ""
+                    _cid = f"{_uid}:{_sid}"
+                    _reg = getattr(plugin, "_last_surfaced_items", None)
+                    if not isinstance(_reg, dict):
+                        _reg = {}
+                        plugin._last_surfaced_items = _reg
+                    _reg.setdefault(_cid, []).extend(_surfaced)
+                    logger.info(
+                        "[PreHook] synthesis recall augment: %d tx_hash hits injected",
+                        len(_lines))
+        except Exception as _sr_err:
+            logger.debug(
+                "[PreHook] synthesis recall augment failed (chat unaffected): %s",
+                _sr_err)
+
         directive_context = ""
         if directives:
             directive_context = "### Prime Directives (Immutable, On-Chain)\n"
@@ -1703,7 +1760,7 @@ def create_pre_hook(plugin):
         # V5: inner state sections + V6: MSL/CGN/social/reasoning enrichment
         injected = (perceptual_field_text + interface_coloring + consciousness_context +
                     maker_context + voice_context + social_context + user_memory_context +
-                    memory_context + directive_context + status_context +
+                    memory_context + synthesis_recall_context + directive_context + status_context +
                     neuromod_context + embodied_context + temporal_context +
                     creative_context + metabolic_context + experience_context +
                     meta_reasoning_context + own_language_context +

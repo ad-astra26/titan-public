@@ -273,4 +273,84 @@ class TxIndexBuilder:
                 pass
 
 
-__all__ = ["TxIndexBuilder", "WATERMARK_NAME"]
+class TxContentDeref:
+    """Read-only `tx_hash → outer-memory content` dereference (arch §3.6).
+
+    SEARCH/recall return `tx_hashes`; the OPERATOR dereferences them into content
+    to assemble context. This is that dereference, for any consumer process
+    (agno / cognitive): look up the block by its canonical hash in the read-only
+    `block_index` (→ fork_id + file_offset), read the content from the chain
+    `.bin`, and return a bounded snippet. Caches a small LRU so a hot chat turn
+    that surfaces the same tx repeatedly doesn't re-read the chain.
+
+    Soft-fail throughout — a missing index.db / block / file yields None so the
+    operator simply drops that candidate from the injected context.
+    """
+
+    def __init__(self, *, data_dir: str, index_db: Optional[sqlite3.Connection] = None,
+                 cache_size: int = 512):
+        self._data_dir = str(data_dir)
+        self._owns_conn = index_db is None
+        if index_db is not None:
+            self._conn = index_db
+        else:
+            self._conn = self._open()
+        self._cache: dict[str, Optional[str]] = {}
+        self._cache_order: list[str] = []
+        self._cache_size = int(cache_size)
+
+    def _open(self) -> Optional[sqlite3.Connection]:
+        path = os.path.join(self._data_dir, "timechain", "index.db")
+        if not os.path.exists(path):
+            return None
+        try:
+            conn = sqlite3.connect(
+                f"file:{path}?mode=ro", uri=True,
+                check_same_thread=False, timeout=2.0)
+            conn.row_factory = sqlite3.Row
+            return conn
+        except Exception:
+            return None
+
+    def snippet(self, tx_hash: str, fork: str = "", *, max_chars: int = 512) -> Optional[str]:
+        """Return a bounded content snippet for `tx_hash` (the block_index PK),
+        or None if it can't be dereferenced."""
+        if not tx_hash or self._conn is None:
+            return None
+        if tx_hash in self._cache:
+            return self._cache[tx_hash]
+        snip: Optional[str] = None
+        try:
+            row = self._conn.execute(
+                "SELECT fork_id, file_offset FROM block_index WHERE block_hash = ? LIMIT 1",
+                (bytes.fromhex(tx_hash),),
+            ).fetchone()
+            if row is not None:
+                content = read_block_content_at(
+                    Path(self._data_dir), int(row["fork_id"]), int(row["file_offset"]))
+                text = _embeddable_text(fork or "", content or {})
+                snip = text[:max_chars] if text else None
+        except Exception as e:
+            logger.debug("[TxContentDeref] deref %s failed: %s", tx_hash[:12], e)
+            snip = None
+        self._cache_put(tx_hash, snip)
+        return snip
+
+    def _cache_put(self, key: str, val: Optional[str]) -> None:
+        if key in self._cache:
+            return
+        self._cache[key] = val
+        self._cache_order.append(key)
+        if len(self._cache_order) > self._cache_size:
+            old = self._cache_order.pop(0)
+            self._cache.pop(old, None)
+
+    def close(self) -> None:
+        if self._owns_conn and self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+
+__all__ = ["TxIndexBuilder", "TxContentDeref", "WATERMARK_NAME"]

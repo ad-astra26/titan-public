@@ -1317,6 +1317,62 @@ def agno_worker_main(recv_queue, send_queue, name: str,
             _dl_err,
         )
 
+    # ── Operator-closure Phase B (W1/W2/B2) — wire EngineRecall into chat ──
+    # Build a cross-process read-only EngineRecall over the tx_hash-native
+    # FaissReader (Phase A) + a lazy fastembed embedder so the chat path's
+    # SEARCH composite retrieval finally fires (kills W2 "engine_recall not
+    # wired"). Gated by [synthesis.recall].augment_chat (default false; T3
+    # override true) — the augment runs ALONGSIDE the legacy memory_context
+    # (INV-4 augment-then-converge) and is retired at D2.
+    worker_plugin.engine_recall = None
+    worker_plugin.synthesis_tx_deref = None
+    worker_plugin.synthesis_recall_augment = False
+    try:
+        _recall_cfg = (config or {}).get("synthesis", {}).get("recall", {}) or {}
+        worker_plugin.synthesis_recall_augment = bool(
+            _recall_cfg.get("augment_chat", False))
+        _data_dir_ag = os.environ.get("TITAN_DATA_DIR", "data")
+
+        def _agno_embedder(text: str):
+            try:
+                from fastembed import TextEmbedding
+                import numpy as np
+                if not hasattr(_agno_embedder, "_model"):
+                    _agno_embedder._model = TextEmbedding(
+                        model_name="BAAI/bge-small-en-v1.5")
+                vecs = list(_agno_embedder._model.embed([text]))
+                v = np.array(vecs[0], dtype=np.float32)
+                n = np.linalg.norm(v)
+                return v / n if n > 0 else v
+            except Exception as _emb_err:
+                logger.debug("[AgnoWorker] agno_embedder failed: %s", _emb_err)
+                return None
+
+        from titan_hcl.synthesis.bridge_recall import BridgeRecall
+        from titan_hcl.synthesis.recall_reader import build_recall_reader
+        from titan_hcl.synthesis.synthesis_vector_index import FaissReader
+        from titan_hcl.synthesis.tx_index_builder import TxContentDeref
+
+        _faiss_reader = FaissReader(data_dir=_data_dir_ag)
+        worker_plugin.engine_recall = build_recall_reader(
+            data_dir=_data_dir_ag,
+            bridge_recall=BridgeRecall(),
+            embedder=_agno_embedder,
+            faiss_reader=_faiss_reader,
+        )
+        worker_plugin.synthesis_tx_deref = TxContentDeref(data_dir=_data_dir_ag)
+        if not hasattr(worker_plugin, "_last_surfaced_items"):
+            worker_plugin._last_surfaced_items = {}
+        logger.info(
+            "[AgnoWorker] Phase B EngineRecall wired — augment_chat=%s "
+            "(engine=%s)", worker_plugin.synthesis_recall_augment,
+            "ready" if worker_plugin.engine_recall is not None else "none")
+    except Exception as _er_err:
+        logger.warning(
+            "[AgnoWorker] Phase B EngineRecall wiring failed: %s — chat stays "
+            "on legacy memory_context only", _er_err)
+        worker_plugin.engine_recall = None
+
     # ── SHM publisher (G21 single-writer for agno_state.bin) ──
     try:
         publisher = AgnoStatePublisher(name=name)
