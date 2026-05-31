@@ -235,17 +235,6 @@ class MetaChainState:
     grounding_concept: str = ""
     grounding_consumer: str = ""
     entry_primitive: str = ""
-    # ── Phase G (RFP_cgn_enhancements §9.3) — teacher-binding outcome tracking ──
-    # The strongest ReasoningBinding that matched this chain's context (highest
-    # sim×conf), plus whether the chain CHOSE its recommended primitive
-    # (recognized) and whether the UNBIASED policy already ranked it top
-    # (produced — the curriculum-graduation signal). Emitted in
-    # META_CHAIN_COMPLETE.binding_outcome so the teacher (sole writer) applies
-    # the G.iv counters without the policy writing to the store.
-    binding_match_id: int = -1
-    binding_match_sim: float = 0.0
-    binding_recognized: bool = False
-    binding_produced: bool = False
 
 
 # ── Policy Networks ───────────────────────────────────────────────
@@ -766,29 +755,6 @@ class MetaReasoningEngine:
             self._composition_store = CrossConsumerCompositionStore()
         except Exception:
             self._composition_store = None
-        # ── Phase G (RFP_cgn_enhancements §9.3 / proto-SPEC §9.5c) — teacher→policy binding ──
-        # The meta-teacher mints ReasoningBindings ("in context X, the proper next
-        # primitive is Y") to reasoning_bindings.db (sole writer). The policy opens
-        # that store READ-ONLY and, each pre-step, retrieves top-k bindings by cosine
-        # sim on the current numeric context_signature and adds a logit bias toward
-        # the taught primitive — the strong cross-process channel the pre-G scalar
-        # reward_bonus (≤0.05) never provided. Non-linguistic inner loop (§11.4): the
-        # bias is a precomputed scalar vector, no LLM. The legacy reward_bonus +
-        # suggested_primitives template path is KEPT (feedback_never_delete_live_logic).
-        self._teacher_bias_max = float(cfg.get("teacher_binding_bias_max", 0.5))
-        self._teacher_binding_topk = int(cfg.get("teacher_binding_topk", 3))
-        self._teacher_binding_sim_floor = float(cfg.get("teacher_binding_sim_floor", 0.6))
-        self._teacher_bias_fires_count = 0
-        try:
-            from titan_hcl.logic.reasoning_binding import ReasoningBindingStore
-            _rb_dir = os.path.join(
-                os.environ.get("TITAN_DATA_DIR", "data"), "meta_teacher")
-            self._binding_store = ReasoningBindingStore(
-                db_path=os.path.join(_rb_dir, "reasoning_bindings.db"),
-                read_only=True)
-        except Exception as _rb_err:
-            logger.debug("[META] reasoning binding store unavailable: %s", _rb_err)
-            self._binding_store = None
         # ── TUNING-012 v2: DNA (per-primitive compound reward coefficients) ──
         # Sourced from [meta_reasoning_dna] in titan_params.toml, merged with
         # per-Titan overrides ([meta_reasoning_dna.T1/T2/T3]) by the engine's
@@ -1163,67 +1129,6 @@ class MetaReasoningEngine:
         os.makedirs(self.save_dir, exist_ok=True)
         self._load()
 
-    # ── Phase G (RFP_cgn_enhancements §9.3) — context signature ──────
-    def _current_context_signature(self):
-        """Numeric context signature for ReasoningBinding retrieval/mint.
-
-        Reads the SAME state fields at the bias site (partial chain, retrieval)
-        and at conclude (full chain, mint-emit) so both vectors live in one
-        cosine space — the consistency guarantee for cross-process binding
-        match. Domain = grounding_consumer (set at chain start for learning-event
-        chains; "" otherwise). Returns an L2-normalized float32 vector, or None
-        if the binding subsystem is unavailable.
-        """
-        try:
-            from titan_hcl.logic.reasoning_binding import build_context_signature
-            return build_context_signature(
-                trigger_reason=self.state.trigger_reason or "",
-                dominant_emotion=getattr(self, "_emot_dom_at_chain_start", "FLOW"),
-                chain_so_far=list(self.state.chain),
-                domain=self.state.grounding_consumer or "",
-                # Concept-aware (Maker 2026-05-31): the concept this chain is
-                # reasoning about (Phase A learning-event chains carry it) keys
-                # the binding so the teacher learns per-concept reasoning.
-                grounding_concept=self.state.grounding_concept or "",
-            )
-        except Exception as _sig_err:
-            swallow_warn('[META] context_signature build failed', _sig_err,
-                         key="logic.meta_reasoning.context_signature_failed", throttle=100)
-            return None
-
-    def _compute_teacher_bias(self):
-        """Phase G (§9.3): logit bias from the taught ReasoningBinding curriculum.
-
-        Returns ``(bias_vec[NUM_META_ACTIONS] float32, top_hit | None)`` where each
-        matched binding contributes ``bias[recommended_primitive] += min(max, sim×conf)``.
-        ``top_hit`` is the strongest ``(binding, sim)`` — used for the G.iv
-        recognized/produced outcome. Read-only store; refresh is internally
-        rate-limited. Never raises into the hot loop.
-        """
-        bias = np.zeros(NUM_META_ACTIONS, dtype=np.float32)
-        top = None
-        if self._binding_store is None:
-            return bias, top
-        try:
-            self._binding_store.refresh()
-            qsig = self._current_context_signature()
-            if qsig is None:
-                return bias, top
-            hits = self._binding_store.retrieve_topk(
-                qsig, k=self._teacher_binding_topk,
-                sim_floor=self._teacher_binding_sim_floor)
-            for b, sim in hits:
-                pi = b.primitive_index
-                if pi is not None:
-                    bias[pi] += min(self._teacher_bias_max,
-                                    float(sim) * float(b.confidence))
-            if hits:
-                top = hits[0]
-        except Exception as _tb_err:
-            swallow_warn('[META] teacher binding bias failed', _tb_err,
-                         key='logic.meta_reasoning.teacher_bias', throttle=100)
-        return bias, top
-
     # ── Public API ────────────────────────────────────────────────
 
     def tick(self, state_132d, neuromods, reasoning_engine,
@@ -1338,24 +1243,12 @@ class MetaReasoningEngine:
                 swallow_warn('[logic.meta_reasoning] entry_primitive bias lookup', _eb_err,
                              key='logic.meta_reasoning.entry_bias', throttle=100)
 
-        # ── Phase G (RFP_cgn_enhancements §9.3 / §9.5c) — teacher binding logit bias ──
-        # Retrieve top-k taught bindings matching the current numeric context
-        # signature; each contributes bias[recommended_primitive] += sim×confidence
-        # (clamped). This is the strong cross-process teacher→policy channel that the
-        # pre-G scalar reward_bonus (≤0.05) never provided. Non-linguistic (§11.4):
-        # precomputed scalar vector, no LLM. Read-only store, refresh is internally
-        # rate-limited (~60s) so this is cheap per tick.
-        _teacher_bias, _g_binding = self._compute_teacher_bias()
-
-        _unbiased_argmax = -1
         _has_bias = ((self._diversity_pressure_remaining > 0 and np.any(self._primitive_bias))
-                     or np.any(_repeat_bias) or np.any(_entry_bias)
-                     or np.any(_teacher_bias))
+                     or np.any(_repeat_bias) or np.any(_entry_bias))
         if _has_bias:
             try:
                 _scores = self.meta_policy.forward(np.array(meta_input, dtype=np.float32))
-                _unbiased_argmax = int(np.argmax(_scores))
-                _total_bias = _repeat_bias.copy() + _entry_bias + _teacher_bias
+                _total_bias = _repeat_bias.copy() + _entry_bias
                 if self._diversity_pressure_remaining > 0 and np.any(self._primitive_bias):
                     _total_bias += self._primitive_bias
                 _biased = _scores + _total_bias
@@ -1364,7 +1257,7 @@ class MetaReasoningEngine:
                 _probs = _exp / (_exp.sum() + 1e-8)
                 prim_idx = int(np.random.choice(NUM_META_ACTIONS, p=_probs))
             except Exception as _dp_err:
-                logger.warning("[META] Diversity/repeat/teacher bias failed: %s", _dp_err)
+                logger.warning("[META] Diversity/repeat bias failed: %s", _dp_err)
                 prim_idx = self.meta_policy.select_action(meta_input, temperature)
         else:
             prim_idx = self.meta_policy.select_action(meta_input, temperature)
@@ -1373,10 +1266,8 @@ class MetaReasoningEngine:
         # Self-decays as diversity recovers (no manual disable needed).
         self._adaptive_epsilon = self._compute_adaptive_epsilon()
         _epsilon_picked_introspect = False
-        _epsilon_overrode = False
         if self._adaptive_epsilon > 0 and np.random.random() < self._adaptive_epsilon:
             prim_idx = int(np.random.randint(0, NUM_META_ACTIONS))
-            _epsilon_overrode = True
             logger.info("[META] ε-greedy override: ε=%.2f, action=%s",
                         self._adaptive_epsilon, META_PRIMITIVES[prim_idx])
             # Audit telemetry: track INTROSPECT picks for crash diagnosis.
@@ -1387,25 +1278,6 @@ class MetaReasoningEngine:
                 _epsilon_picked_introspect = True
 
         prim_name = META_PRIMITIVES[prim_idx]
-
-        # ── Phase G (RFP_cgn_enhancements §9.3 G.iv) — record binding outcome ──
-        # Track the strongest binding that matched this chain (highest sim) and
-        # whether the chain CHOSE its recommended primitive (recognized) and
-        # whether the UNBIASED policy already ranked it top (produced — the
-        # curriculum-graduation signal). ε-greedy random picks don't count (the
-        # choice wasn't policy/teacher driven). Emitted in META_CHAIN_COMPLETE so
-        # the teacher (sole writer) applies the counters — the policy never writes.
-        if _g_binding is not None and not _epsilon_overrode:
-            _gb, _gsim = _g_binding
-            if float(_gsim) > self.state.binding_match_sim:
-                _rec_idx = _gb.primitive_index
-                self.state.binding_match_id = int(_gb.binding_id)
-                self.state.binding_match_sim = float(_gsim)
-                self.state.binding_recognized = bool(_rec_idx == prim_idx)
-                self.state.binding_produced = bool(
-                    _unbiased_argmax >= 0 and _rec_idx == _unbiased_argmax)
-                if self.state.binding_recognized:
-                    self._teacher_bias_fires_count += 1
 
         # ── TUNING-012 v2 Sub-phase B: chain template soft bias ──
         # If we have a high-Q suggested template AND we're at a step where
@@ -3473,18 +3345,6 @@ class MetaReasoningEngine:
                     },
                     outer_summary=outer_summary,
                     step_arguments=step_arguments,
-                    # Phase G (RFP §9.3): emit the FULL-chain context signature
-                    # (same _current_context_signature helper the bias site uses
-                    # → one cosine space) + the per-chain binding outcome so the
-                    # teacher mints/refines + applies G.iv counters.
-                    context_signature=(
-                        _g_sig.tolist() if (_g_sig := self._current_context_signature())
-                        is not None else None),
-                    binding_outcome=(
-                        {"binding_id": int(self.state.binding_match_id),
-                         "recognized": bool(self.state.binding_recognized),
-                         "produced": bool(self.state.binding_produced)}
-                        if self.state.binding_match_id >= 0 else None),
                 )
         except Exception as _mtc_err:
             swallow_warn('[META] META_CHAIN_COMPLETE emit failed', _mtc_err,

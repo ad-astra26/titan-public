@@ -227,21 +227,18 @@ def _extract_block_ranges(file_diffs: list[tuple[str, dict]]) -> dict:
     return ranges
 
 
-def build_tier(
+async def ship_tier(
     *,
     tier: str,
     event_id: str,
     event_type: str,
     specs: Iterable[TierFileSpec],
     baseline_resolver: Optional[Callable[[str], Optional[str]]],
+    arweave_uploader: ArweaveUploader,
     scratch_dir: str,
     titan_id: str,
 ) -> TierShipResult:
-    """Pack one tier's per-file diffs into a tarball — NO upload (Phase 2,
-    2026-05-31, pre-stage split). The heavy IO+CPU (reading the big mutable DBs
-    to diff against the baseline + zstd pack) lives HERE so the stager can run it
-    off the recv loop, ahead of the meditation. Returns a TierShipResult with
-    tarball_path/sha/size populated and tx_id=None (upload is a later step).
+    """Pack one tier's per-file diffs into a tarball + upload to Arweave.
 
     baseline_resolver: callable arc_name -> on-disk path of the file's
     prior-baseline reconstructed bytes (or None if not available). For
@@ -290,31 +287,14 @@ def build_tier(
     result.files_skipped = skipped
     if tier == "timechain":
         result.block_ranges = _extract_block_ranges(file_diffs)
-    return result
 
-
-async def upload_tier(
-    result: TierShipResult,
-    *,
-    arweave_uploader: ArweaveUploader,
-    titan_id: str,
-    event_id: str,
-    event_type: str,
-) -> TierShipResult:
-    """Upload a PRE-BUILT tier tarball (from build_tier) to Arweave + set tx_id.
-
-    Mutates + returns `result`. Safe to call on a staged tarball minutes after
-    build_tier produced it (the bytes on disk are immutable once packed).
-    """
-    if result.tarball_path is None or not os.path.exists(result.tarball_path):
-        result.error = f"{result.tier}: staged tarball missing at upload time"
-        return result
-    with open(result.tarball_path, "rb") as f:
+    # Upload to Arweave
+    with open(out_path, "rb") as f:
         tarball_bytes = f.read()
     tags = {
         "App-Name": "TitanBackupUnified",
         "Titan-Id": titan_id,
-        "Tier": result.tier,
+        "Tier": tier,
         "Event-Id": event_id,
         "Event-Type": event_type,
     }
@@ -328,36 +308,6 @@ async def upload_tier(
         return result
     result.tx_id = tx_id
     return result
-
-
-async def ship_tier(
-    *,
-    tier: str,
-    event_id: str,
-    event_type: str,
-    specs: Iterable[TierFileSpec],
-    baseline_resolver: Optional[Callable[[str], Optional[str]]],
-    arweave_uploader: ArweaveUploader,
-    scratch_dir: str,
-    titan_id: str,
-) -> TierShipResult:
-    """Pack one tier's per-file diffs into a tarball + upload to Arweave.
-
-    Behavior-identical wrapper over build_tier + upload_tier (kept so existing
-    callers/tests are unchanged); the two halves are also used independently by
-    the Phase 2 pre-stage path (build ahead, upload on meditation).
-    """
-    result = build_tier(
-        tier=tier, event_id=event_id, event_type=event_type, specs=specs,
-        baseline_resolver=baseline_resolver, scratch_dir=scratch_dir,
-        titan_id=titan_id,
-    )
-    if result.error or result.tarball_path is None:
-        return result
-    return await upload_tier(
-        result, arweave_uploader=arweave_uploader, titan_id=titan_id,
-        event_id=event_id, event_type=event_type,
-    )
 
 
 # ── orchestrator ─────────────────────────────────────────────────────────
@@ -617,274 +567,6 @@ async def run_unified_event(
             try:
                 import shutil
                 shutil.rmtree(scratch_dir, ignore_errors=True)
-            except Exception:
-                pass
-
-
-@dataclass
-class StagedEvent:
-    """A unified event pre-BUILT by build_unified_event, ready for a fast
-    ship_staged_event (Phase 2 pre-stage). Tarballs live on disk in scratch_dir
-    (NOT cleaned at build); upload + chain-commit happen later on meditation.
-
-    baseline_event_id pins which baseline the incremental diffs were computed
-    against — ship_staged_event refuses to ship if the manifest baseline has
-    since changed (a rebase shipped in between), forcing a fresh rebuild.
-    """
-    event_id: str
-    event_type: str
-    baseline_trigger: Optional[str]
-    baseline_event_id: Optional[str]
-    prev_event_id: Optional[str]
-    soul_present: bool
-    tier_results: dict
-    scratch_dir: str
-    built_at: float
-    titan_id: str
-
-
-def build_unified_event(
-    *,
-    titan_id: str,
-    manifest: UnifiedManifest,
-    personality_specs: Iterable[TierFileSpec],
-    timechain_specs: Iterable[TierFileSpec],
-    soul_specs: Optional[Iterable[TierFileSpec]] = None,
-    baseline_resolver: Optional[Callable[[str, str], Optional[str]]] = None,
-    scratch_dir: Optional[str] = None,
-) -> StagedEvent:
-    """Phase 2 — BUILD a unified event's tarballs WITHOUT uploading.
-
-    The heavy half (read big mutable DBs → diff vs baseline → zstd pack); the
-    stager runs it OFF the recv loop, ahead of the meditation. event_type
-    (baseline vs incremental) is decided here from the manifest and diffs are
-    computed against the current baseline; ship_staged_event later verifies that
-    baseline is still current before committing. Returns a StagedEvent whose
-    tarballs persist in scratch_dir for ship_staged_event to upload. Pure build:
-    NO upload, NO manifest mutation, NO chain write.
-    """
-    if scratch_dir is None:
-        scratch_dir = tempfile.mkdtemp(prefix=f"titan_backup_stage_{titan_id}_")
-    else:
-        os.makedirs(scratch_dir, exist_ok=True)
-
-    should_rebase, trigger = manifest.should_rebase()
-    event_type = "baseline" if should_rebase else "incremental"
-    event_id = new_event_id()
-    prev_event = manifest.get_latest_event()
-    prev_event_id = prev_event["event_id"] if prev_event else None
-    baseline_event_id = manifest.current_baseline_event_id
-
-    tier_results: dict[str, TierShipResult] = {}
-    tier_inputs = [("personality", personality_specs),
-                   ("timechain", timechain_specs)]
-    if soul_specs is not None:
-        tier_inputs.append(("soul", soul_specs))
-    for tier_name, specs in tier_inputs:
-        tier = tier_name  # capture for resolver closure
-        tier_results[tier_name] = build_tier(
-            tier=tier_name, event_id=event_id, event_type=event_type,
-            specs=specs,
-            baseline_resolver=(
-                (lambda arc, _t=tier: baseline_resolver(_t, arc))
-                if (event_type == "incremental" and baseline_resolver is not None)
-                else None
-            ),
-            scratch_dir=scratch_dir, titan_id=titan_id,
-        )
-
-    return StagedEvent(
-        event_id=event_id, event_type=event_type,
-        baseline_trigger=(trigger if event_type == "baseline" else None),
-        baseline_event_id=baseline_event_id, prev_event_id=prev_event_id,
-        soul_present=(soul_specs is not None), tier_results=tier_results,
-        scratch_dir=scratch_dir, built_at=time.time(), titan_id=titan_id,
-    )
-
-
-async def ship_staged_event(
-    staged: StagedEvent,
-    *,
-    manifest: UnifiedManifest,
-    arweave_uploader: ArweaveUploader,
-    zk_committer: ZkCommitter,
-    bus_emit: Optional[Callable[[str, dict], None]] = None,
-    cleanup_scratch: bool = True,
-) -> EventShipResult:
-    """Phase 2 — SHIP a pre-built StagedEvent (fast, on meditation).
-
-    Validates the baseline is still current (else returns status="stale_baseline"
-    so the caller rebuilds), uploads the staged tarballs, then runs the SAME
-    merkle → v=3 ZK chain-commit → manifest-append finalize as run_unified_event
-    via the same primitives (compute_event_merkle_root / zk_committer / make_event
-    / manifest.append_event) → byte-identical on-chain event. No diff/pack here.
-    """
-    started = time.time()
-    titan_id = staged.titan_id
-    event_id = staged.event_id
-    event_type = staged.event_type
-    out = EventShipResult(
-        status="failed", event_id=event_id, event_type=event_type,
-        baseline_trigger=staged.baseline_trigger,
-    )
-    try:
-        # Staleness guard: a baseline shipped since build → the staged
-        # incrementals diff against the WRONG baseline. Refuse; caller rebuilds.
-        current_baseline = manifest.current_baseline_event_id
-        if staged.baseline_event_id != current_baseline:
-            out.status = "stale_baseline"
-            out.skipped_reason = (
-                f"staged baseline {staged.baseline_event_id} != current "
-                f"{current_baseline} — rebuild required")
-            out.errors.append(out.skipped_reason)
-            out.duration_s = time.time() - started
-            return out
-
-        tier_results = staged.tier_results
-        prev_event = manifest.get_latest_event()
-        prev_event_id = prev_event["event_id"] if prev_event else None
-
-        # Upload each pre-built tier (the only network step now).
-        tier_order = ["personality", "timechain"] + (
-            ["soul"] if staged.soul_present else [])
-        for tier_name in tier_order:
-            r = tier_results.get(tier_name)
-            if r is None or r.error or r.tarball_path is None:
-                out.status = "failed"
-                out.errors.append(
-                    f"{tier_name}: not built "
-                    f"({r.error if r else 'missing'})")
-                out.duration_s = time.time() - started
-                if bus_emit is not None:
-                    try:
-                        bus_emit(EVENT_BACKUP_EVENT_FAILED, _failed_payload(out))
-                    except Exception:
-                        pass
-                return out
-            await upload_tier(
-                r, arweave_uploader=arweave_uploader, titan_id=titan_id,
-                event_id=event_id, event_type=event_type)
-            if r.error:
-                out.errors.append(f"{tier_name}: {r.error}")
-        out.tiers = tier_results
-
-        if (tier_results["personality"].tx_id is None
-                or tier_results["timechain"].tx_id is None
-                or (staged.soul_present
-                    and tier_results["soul"].tx_id is None)):
-            out.status = "failed"
-            out.errors.append("required tier upload failed")
-            out.duration_s = time.time() - started
-            if bus_emit is not None:
-                try:
-                    bus_emit(EVENT_BACKUP_EVENT_FAILED, _failed_payload(out))
-                except Exception:
-                    pass
-            return out
-
-        # ── finalize (identical to run_unified_event) ──
-        pers_sha = tier_results["personality"].tarball_sha256
-        tc_sha = tier_results["timechain"].tarball_sha256
-        soul_sha = (tier_results["soul"].tarball_sha256
-                    if staged.soul_present else None)
-        event_root = compute_event_merkle_root(
-            personality_merkle_root=pers_sha, timechain_merkle_root=tc_sha,
-            soul_merkle_root=soul_sha)
-        out.event_merkle_root = event_root
-
-        prev_sig = prev_event.get("zk_commit_tx") if prev_event else None
-        components = [
-            {"tier": "PT", "tx_id": tier_results["personality"].tx_id,
-             "arc": pers_sha},
-            {"tier": "TC", "tx_id": tier_results["timechain"].tx_id,
-             "arc": tc_sha},
-        ]
-        if staged.soul_present and soul_sha:
-            components.append(
-                {"tier": "SL", "tx_id": tier_results["soul"].tx_id,
-                 "arc": soul_sha})
-
-        try:
-            commit_result = await zk_committer(
-                event_id, int(started), event_type, event_root, components,
-                prev_sig)
-        except Exception as e:
-            out.errors.append(f"v=3 chain commit raised: {e}")
-            commit_result = None
-        head_sig = ((commit_result or {}).get("head_sig")
-                    if commit_result else None)
-        if not head_sig:
-            out.errors.append(
-                "v=3 chain commit returned no head_sig (chain_write_failed)")
-            out.status = "failed"
-            out.duration_s = time.time() - started
-            if bus_emit is not None:
-                try:
-                    bus_emit(EVENT_BACKUP_EVENT_FAILED, _failed_payload(out))
-                except Exception:
-                    pass
-            return out
-        out.zk_commit_tx = head_sig
-
-        personality_sub = {
-            "tx_id": tier_results["personality"].tx_id,
-            "merkle_root": pers_sha,
-            "size_bytes": tier_results["personality"].tarball_size_bytes,
-            "diff_mode": event_type, "skipped_files": [],
-        }
-        timechain_sub = {
-            "tx_id": tier_results["timechain"].tx_id, "merkle_root": tc_sha,
-            "size_bytes": tier_results["timechain"].tarball_size_bytes,
-            "diff_mode": event_type,
-            "block_ranges": tier_results["timechain"].block_ranges,
-        }
-        soul_sub = None
-        if staged.soul_present:
-            soul_sub = {
-                "tx_id": tier_results["soul"].tx_id, "merkle_root": soul_sha,
-                "size_bytes": tier_results["soul"].tarball_size_bytes,
-                "diff_mode": event_type,
-            }
-        event = make_event(
-            event_id=event_id, event_type=event_type,
-            prev_event_id=prev_event_id,
-            baseline_trigger=staged.baseline_trigger,
-            personality=personality_sub, timechain=timechain_sub,
-            soul=soul_sub, zk_commit_tx=head_sig,
-            zk_memo_prev_short=(prev_sig[:16] if prev_sig else "genesis"),
-        )
-        manifest.append_event(event)
-        manifest.save()
-
-        out.status = "shipped"
-        out.duration_s = time.time() - started
-        logger.info(
-            "[BackupPipeline:%s] STAGED event SHIPPED: id=%s type=%s zk=%s "
-            "ship_dur=%.1fs (built %.0fs earlier)",
-            titan_id, event_id[:8], event_type, head_sig[:16] + "...",
-            out.duration_s, max(0.0, started - staged.built_at))
-        if bus_emit is not None:
-            try:
-                bus_emit(EVENT_BACKUP_EVENT_COMPLETE, {
-                    "event": EVENT_BACKUP_EVENT_COMPLETE, "titan_id": titan_id,
-                    "event_id": event_id, "event_type": event_type,
-                    "baseline_trigger": out.baseline_trigger,
-                    "personality_tx": tier_results["personality"].tx_id,
-                    "timechain_tx": tier_results["timechain"].tx_id,
-                    "soul_tx": (tier_results["soul"].tx_id
-                                if staged.soul_present else None),
-                    "zk_commit_tx": head_sig, "event_merkle_root": event_root,
-                    "duration_s": round(out.duration_s, 3),
-                })
-            except Exception as e:
-                logger.warning(
-                    "[BackupPipeline:%s] bus_emit raised: %s", titan_id, e)
-        return out
-    finally:
-        if cleanup_scratch:
-            try:
-                import shutil
-                shutil.rmtree(staged.scratch_dir, ignore_errors=True)
             except Exception:
                 pass
 

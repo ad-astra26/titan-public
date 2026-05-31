@@ -5951,7 +5951,7 @@ def run_preflight():
     """Comprehensive pre-session-start test — mandatory step 0.
 
     Built 2026-04-14 after Phase E session where 6 audits passed while
-    T1 was in a multi-day crash-loop. Runs 10 checks in sequence and
+    T1 was in a multi-day crash-loop. Runs 9 checks in sequence and
     produces one unified PASS/WARN/FAIL verdict. Any HARD-FAIL halts
     further work until resolved.
 
@@ -5964,8 +5964,7 @@ def run_preflight():
       5. bus-health     — API endpoint reports state=healthy (WARN)
       6. timechain      — fork integrity (HARD)
       7. cgn            — consumers registered + HAOV forming (WARN)
-      8. bugs-index     — active CRITICAL/HIGH within baseline (WARN)
-      9. errors         — cross-Titan runtime error/traceback scan (WARN)
+      8. known-issues   — no new CRITICAL entries (WARN)
 
     HARD failures set exit code 1 and print HALT banner.
     WARN failures print orange triangles but allow continuation.
@@ -5996,7 +5995,7 @@ def run_preflight():
     print("╚" + "═" * 88 + "╝")
 
     # ── 0. Stability ──
-    print("\n[0/10] STABILITY — 24h watchdog restart density")
+    print("\n[0/9] STABILITY — 24h watchdog restart density")
     rc, out = _run_cmd([sys.executable, str(Path(__file__)), "stability",
                         "--hours=24"], timeout=45)
     if "CRASH-LOOP DETECTED" in out or "CRASH_LOOP" in out:
@@ -6018,7 +6017,7 @@ def run_preflight():
             print(f"  ✓ {verdict}")
 
     # ── 1. Async-block scanner ──
-    print("\n[1/10] ASYNC-BLOCKS — sync I/O reachable from async")
+    print("\n[1/9] ASYNC-BLOCKS — sync I/O reachable from async")
     rc, out = _run_cmd([sys.executable, str(Path(__file__)), "async-blocks"], timeout=30)
     import re
     m = re.search(r"CRITICAL=(\d+)\s+HIGH=(\d+)", out)
@@ -6035,7 +6034,7 @@ def run_preflight():
         print("  ⚠ scanner output unparseable")
 
     # ── 2. Health per-Titan ──
-    print("\n[2/10] HEALTH — per-Titan system health (23 checks each)")
+    print("\n[2/9] HEALTH — per-Titan system health (23 checks each)")
     rc, out = _run_cmd([sys.executable, str(Path(__file__)), "health", "--all"], timeout=60)
     # Parse "PASSED: X/23  WARNINGS: Y  FAILED: Z"
     titan_results = re.findall(r"TITAN LIVE HEALTH CHECK — (\w+).*?PASSED:\s+(\d+)/23\s+WARNINGS:\s+(\d+)\s+FAILED:\s+(\d+)",
@@ -6053,7 +6052,7 @@ def run_preflight():
             print(f"  ✓ {tid}: {p}/23 passed, {w} warnings")
 
     # ── 3. Endpoint sweep ──
-    print("\n[3/10] ENDPOINTS — /health, /v4/bus-health response time")
+    print("\n[3/9] ENDPOINTS — /health, /v4/bus-health response time")
     t1_endpoints = [
         ("T1 /health", "http://127.0.0.1:7777/health"),
         ("T1 /v4/bus-health", "http://127.0.0.1:7777/v4/bus-health"),
@@ -6084,7 +6083,7 @@ def run_preflight():
                 print(f"  ⚠ {name}: {type(e).__name__}")
 
     # ── 4. Services ──
-    print("\n[4/10] SERVICES — teacher/ARC/persona/events per Titan")
+    print("\n[4/9] SERVICES — teacher/ARC/persona/events per Titan")
     rc, out = _run_cmd([sys.executable, str(Path(__file__)), "services"], timeout=30)
     m = re.search(r"TOTAL:\s+(\d+)/(\d+)\s+OK\s+\|\s+(\d+)\s+warnings\s+\|\s+(\d+)\s+failures", out)
     if m:
@@ -6100,7 +6099,7 @@ def run_preflight():
         print("  ⚠ services diagnostics output unparseable")
 
     # ── 5. Bus health ──
-    print("\n[5/10] BUS HEALTH — /v4/bus-health per Titan")
+    print("\n[5/9] BUS HEALTH — /v4/bus-health per Titan")
     for tid, url in [("T1", "http://127.0.0.1:7777"),
                       ("T2", "http://10.135.0.6:7777"),
                       ("T3", "http://10.135.0.6:7778")]:
@@ -6124,7 +6123,7 @@ def run_preflight():
     # Verify endpoint can 504 under load (in-line walk); not a chain-integrity
     # failure on its own, so don't HALT on its absence — only HALT when the
     # chain itself is unreachable.
-    print("\n[6/10] TIMECHAIN — fork integrity")
+    print("\n[6/9] TIMECHAIN — fork integrity")
     rc, out = _run_cmd([sys.executable, str(Path(__file__)), "timechain", "--all"], timeout=30)
     active_count = out.count("✓ TimeChain active")
     valid_count = out.count("✓ ALL FORKS VALID")
@@ -6140,7 +6139,7 @@ def run_preflight():
         print("  🔴 No active Titans — TimeChain unreachable")
 
     # ── 7. CGN pipeline ──
-    print("\n[7/10] CGN — consumers + HAOV hypothesis testing")
+    print("\n[7/9] CGN — consumers + HAOV hypothesis testing")
     rc, out = _run_cmd([sys.executable, str(Path(__file__)), "verify", "cgn", "--all"], timeout=45)
     healthy = out.count("✓ ALL STAGES HEALTHY")
     if healthy >= 1:
@@ -6154,7 +6153,7 @@ def run_preflight():
     # Rewired 2026-05-14: memory/known_issues.md retired (frozen 2026-04-25). All
     # defect tracking now lives in titan-docs/BUGS.md; the auto-generated
     # titan-docs/BUGS_index.md carries the "Active count by severity" line.
-    print("\n[8/10] BUGS INDEX — active CRITICAL/HIGH scan")
+    print("\n[8/9] BUGS INDEX — active CRITICAL/HIGH scan")
     try:
         bug_idx_path = PROJECT_ROOT / "titan-docs" / "BUGS_index.md"
         if bug_idx_path.exists():
@@ -6181,34 +6180,6 @@ def run_preflight():
     except Exception as e:
         warnings.append(f"bugs index: {e}")
         print(f"  ⚠ BUGS_index scan error: {e}")
-
-    # [9/10] ERRORS — cross-Titan runtime error/traceback scan. Folded into
-    # preflight 2026-05-31 (workflow audit): preflight billed itself as the
-    # single startup sweep but omitted the one check that surfaces fresh
-    # tracebacks — exactly the crash-loop-in-an-unopened-log class the 2026-04-14
-    # incident was about. WARN-only: `errors` reports historical log lines that
-    # may be stale/benign, so a HARD-fail here would create false HALTs. A parse
-    # miss degrades to a warning, never a crash (mirrors the services pattern).
-    print("\n[9/10] ERRORS — cross-Titan runtime error scan")
-    try:
-        rc, out = _run_cmd([sys.executable, str(Path(__file__)), "errors", "--all"], timeout=60)
-        import re as _re_err
-        # run_errors prints "✓ No errors" per clean Titan; an error-bearing Titan
-        # surfaces ERROR/CRITICAL/Traceback lines or a "✗" marker.
-        clean = len(_re_err.findall(r"No errors", out))
-        flagged = len(_re_err.findall(r"^\s*✗|Traceback|\bCRITICAL\b", out, _re_err.M))
-        if flagged > 0:
-            warnings.append(f"errors: {flagged} error/traceback line(s) across the fleet")
-            print(f"  ⚠ {flagged} ERROR/CRITICAL/traceback line(s) — review `arch_map errors --all`")
-        elif clean > 0:
-            passes.append(f"errors: {clean} Titan(s) clean")
-            print(f"  ✓ no recent errors across {clean} Titan(s)")
-        else:
-            warnings.append("errors: output unparsed")
-            print("  ⚠ errors scan output unparsed — run `arch_map errors --all` manually")
-    except Exception as e:
-        warnings.append(f"errors scan: {e}")
-        print(f"  ⚠ errors scan error: {e}")
 
     # ── Final verdict ──
     print()
