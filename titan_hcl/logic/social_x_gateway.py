@@ -212,16 +212,8 @@ class SocialXGateway:
     # Crash recovery: pending rows older than this are expired
     PENDING_EXPIRY_SECONDS = 300  # 5 minutes
 
-    # Circuit breaker: stop API calls after consecutive failures.
-    # Tracked in TWO independent domains (2026-06-01) — the WRITE path
-    # (create_tweet / reply / like / retweet / login) is proxy+session
-    # dependent, while the READ path (mentions / last_tweets / search) hits
-    # twitterapi.io directly. A single shared counter let read successes
-    # RESET the counter between write failures, so a dead webshare proxy
-    # (every write → HTTP 200 + {"status":"error","message":"...407"}) never
-    # tripped the breaker and kept burning paid write credits. Split fixes it.
-    CB_MAX_FAILURES = 5           # trip after 5 consecutive failures (per domain)
-    CB_PROXY_MAX_FAILURES = 2     # proxy/transport/auth failures are decisive — trip fast
+    # Circuit breaker: stop API calls after consecutive failures
+    CB_MAX_FAILURES = 5           # trip after 5 consecutive failures
     CB_COOLDOWN_SECONDS = 3600    # 1 hour cooldown before retrying
     CB_FATAL_CODES = {402, 403}   # payment required / forbidden → immediate trip
 
@@ -240,12 +232,9 @@ class SocialXGateway:
         self._db_path = db_path
         self._config_path = config_path
         self._telemetry_path = telemetry_path
-        # Circuit breaker state (in-memory, resets on restart). Two domains:
-        # read (GET) and write (POST) — see CB_* constants for the rationale.
-        self._cb_failures = 0          # read domain (GET endpoints)
+        # Circuit breaker state (in-memory, resets on restart)
+        self._cb_failures = 0
         self._cb_tripped_at = 0.0
-        self._cb_failures_write = 0    # write domain (POST — proxy+session)
-        self._cb_tripped_at_write = 0.0
         # Boot grace timer (in-memory, resets on restart — which is the point)
         self._boot_time = time.time()
         # Output Verification Gate (set externally via set_output_verifier)
@@ -937,33 +926,11 @@ class SocialXGateway:
 
     # ── Circuit Breaker ──────────────────────────────────────────────
 
-    def _cb_is_open(self, write: bool = False) -> bool:
-        """Check if the circuit breaker is currently tripped (API disabled).
-
-        ``write=True`` consults the write-path breaker (create_tweet / reply /
-        like / retweet — proxy+session dependent); the default consults the
-        read-path breaker (mentions / last_tweets / search). They are
-        independent so a healthy read path can't mask a dead write path.
-        """
-        tripped_at = self._cb_tripped_at_write if write else self._cb_tripped_at
-        if tripped_at <= 0:
+    def _cb_is_open(self) -> bool:
+        """Check if circuit breaker is currently tripped (API disabled)."""
+        if self._cb_tripped_at <= 0:
             return False
-        return (time.time() - tripped_at) < self.CB_COOLDOWN_SECONDS
-
-    @staticmethod
-    def _is_proxy_transport_failure(result: dict, http_code: int) -> bool:
-        """True when a write failed on proxy/session/transport plumbing rather
-        than a content rejection (duplicate / too-long / rate). Such failures
-        are decisive — the upstream path is down, so retrying within the
-        cooldown only burns paid create_tweet/upload_media credits. Matches the
-        twitterapi.io 407 signature ("API returned status 407"), explicit proxy
-        / session-refresh errors, connection errors, and 5xx gateway codes."""
-        if http_code in (407, 502, 503, 504):
-            return True
-        msg = str(result.get("message", "")).lower()
-        return any(s in msg for s in (
-            "status 407", "proxy", "session refresh failed",
-            "could not connect", "connection error", "timed out", "timeout"))
+        return (time.time() - self._cb_tripped_at) < self.CB_COOLDOWN_SECONDS
 
     # ── The ONE API Caller ──────────────────────────────────────────
 
@@ -1060,25 +1027,20 @@ class SocialXGateway:
         else:
             self._cache_stats["writes_skipped_no_cache"] += 1
 
-        # ── Circuit breaker check (per-domain: write=POST, read=GET) ──
-        is_write = (method == "POST")
-        domain = "write" if is_write else "read"
-        cb_tripped_at = self._cb_tripped_at_write if is_write else self._cb_tripped_at
-        cb_failures = self._cb_failures_write if is_write else self._cb_failures
-        if cb_tripped_at > 0:
-            elapsed = time.time() - cb_tripped_at
+        # ── Circuit breaker check ──
+        if self._cb_tripped_at > 0:
+            elapsed = time.time() - self._cb_tripped_at
             if elapsed < self.CB_COOLDOWN_SECONDS:
                 remaining = int(self.CB_COOLDOWN_SECONDS - elapsed)
                 logger.warning(
-                    "[SocialXGateway] %s circuit breaker OPEN — %d min remaining "
+                    "[SocialXGateway] Circuit breaker OPEN — %d min remaining "
                     "(tripped after %d failures)",
-                    domain, remaining // 60, cb_failures)
+                    remaining // 60, self._cb_failures)
                 return {"status": "circuit_breaker",
-                        "message": f"{domain} API disabled for {remaining}s "
-                                   f"after {cb_failures} consecutive failures"}
+                        "message": f"API disabled for {remaining}s after "
+                                   f"{self._cb_failures} consecutive failures"}
             # Cooldown expired — half-open: allow one request through
-            logger.info("[SocialXGateway] %s circuit breaker half-open — "
-                        "trying one request", domain)
+            logger.info("[SocialXGateway] Circuit breaker half-open — trying one request")
 
         base_url = "https://api.twitterapi.io"
         headers = {"X-API-Key": api_key}
@@ -1143,51 +1105,31 @@ class SocialXGateway:
                     result = {"status": "error", "message": f"retry failed: {e}"}
                     http_code = 0
 
-        # ── Circuit breaker tracking (per-domain) ──
-        # A read success must NOT reset the write counter (and vice-versa) —
-        # that conflation is exactly what let a dead proxy slip past the
-        # breaker. Write failures from proxy/transport/auth are decisive and
-        # trip after CB_PROXY_MAX_FAILURES; everything else after CB_MAX_FAILURES.
+        # ── Circuit breaker tracking ──
         is_success = (http_code == 200 and
                       result.get("status") not in ("error",))
-        if is_write:
-            if is_success:
-                if self._cb_failures_write > 0:
-                    logger.info("[SocialXGateway] write circuit breaker RESET "
-                                "(was %d failures)", self._cb_failures_write)
-                self._cb_failures_write = 0
-                self._cb_tripped_at_write = 0.0
-            else:
-                self._cb_failures_write += 1
-                proxy_fail = self._is_proxy_transport_failure(result, http_code)
-                threshold = (self.CB_PROXY_MAX_FAILURES if proxy_fail
-                             else self.CB_MAX_FAILURES)
-                if (http_code in self.CB_FATAL_CODES or
-                        self._cb_failures_write >= threshold):
-                    self._cb_tripped_at_write = time.time()
-                    logger.error(
-                        "[SocialXGateway] write circuit breaker TRIPPED — "
-                        "%d failures (%s, http=%d: %s). Writes disabled for %ds.",
-                        self._cb_failures_write,
-                        "proxy/transport" if proxy_fail else "consecutive",
-                        http_code, str(result.get("message", ""))[:100],
-                        self.CB_COOLDOWN_SECONDS)
+        if is_success:
+            if self._cb_failures > 0:
+                logger.info("[SocialXGateway] Circuit breaker RESET "
+                            "(was %d failures)", self._cb_failures)
+            self._cb_failures = 0
+            self._cb_tripped_at = 0.0
         else:
-            if is_success:
-                if self._cb_failures > 0:
-                    logger.info("[SocialXGateway] read circuit breaker RESET "
-                                "(was %d failures)", self._cb_failures)
-                self._cb_failures = 0
-                self._cb_tripped_at = 0.0
-            else:
-                self._cb_failures += 1
-                if (http_code in self.CB_FATAL_CODES or
-                        self._cb_failures >= self.CB_MAX_FAILURES):
-                    self._cb_tripped_at = time.time()
-                    logger.error(
-                        "[SocialXGateway] read circuit breaker TRIPPED — "
-                        "%d consecutive failures (http=%d). Reads disabled for %ds.",
-                        self._cb_failures, http_code, self.CB_COOLDOWN_SECONDS)
+            self._cb_failures += 1
+            # Trip immediately on fatal codes (payment/forbidden)
+            if http_code in self.CB_FATAL_CODES:
+                self._cb_tripped_at = time.time()
+                logger.error(
+                    "[SocialXGateway] Circuit breaker TRIPPED — "
+                    "HTTP %d (%s). API disabled for %ds.",
+                    http_code, result.get("message", "")[:100],
+                    self.CB_COOLDOWN_SECONDS)
+            elif self._cb_failures >= self.CB_MAX_FAILURES:
+                self._cb_tripped_at = time.time()
+                logger.error(
+                    "[SocialXGateway] Circuit breaker TRIPPED — "
+                    "%d consecutive failures. API disabled for %ds.",
+                    self._cb_failures, self.CB_COOLDOWN_SECONDS)
 
         # Log every API call to telemetry
         self._log_telemetry({
@@ -1198,7 +1140,6 @@ class SocialXGateway:
             "response_status": result.get("status", "unknown"),
             "response_msg": str(result.get("message", ""))[:200],
             "cb_failures": self._cb_failures,
-            "cb_failures_write": self._cb_failures_write,
         })
 
         # 2026-05-13 — full response logging for X-posting diagnostics.
@@ -2952,7 +2893,7 @@ class SocialXGateway:
             ), None
 
         # 1b. Circuit breaker — don't waste LLM credits if API is down
-        if self._cb_is_open(write=True):
+        if self._cb_is_open():
             return ActionResult(status="circuit_breaker",
                                 reason="API disabled after consecutive failures"), None
 
@@ -3275,23 +3216,15 @@ class SocialXGateway:
             api_tweet_id = str(api_result.get("tweet_id",
                                                api_result.get("id", "")))
 
-        # Verification (the paid last_tweets reads below) is the source of
-        # truth ONLY when the tweet might actually be live — i.e. the API
-        # ack'd success, OR it returned the known soft-fail signature
-        # ("could not extract tweet_id") where twitterapi.io often posted the
-        # tweet but couldn't parse the id back. ANY other non-success (proxy
-        # 407, "Session refresh failed", 5xx, rate/duplicate, circuit_breaker)
-        # means the request never reached X — so verification can only ever
-        # fail, and running it just burns bypass_cache last_tweets reads on a
-        # tweet that does not exist. Fail fast instead. (2026-06-01 leak
-        # closure: a dead webshare proxy turned every 30-min post retry into
-        # ~900cr of doomed verification reads — the brittle keyword allowlist
-        # here matched none of "API returned status 407". Mirrors the reply()
-        # path, which already gates on the soft-fail signature alone.)
+        # Hard failures that definitely mean the tweet did NOT post
         err_msg = api_result.get("message", str(api_result)[:200])
-        soft_fail = (not api_ok and
-                     "could not extract tweet_id" in err_msg.lower())
-        if not api_ok and not soft_fail:
+        hard_fail = (
+            "Authorization:" in err_msg or  # 422 session / too long
+            "duplicate" in err_msg.lower() or
+            "limit" in err_msg.lower() or
+            api_result.get("status") == "circuit_breaker"
+        )
+        if hard_fail and not api_ok:
             x_len = self._x_char_count(final_text)
             self._update_status(row_id, self.S_FAILED,
                                 error_message=f"{err_msg} (x_chars={x_len})")
@@ -3303,8 +3236,9 @@ class SocialXGateway:
             return ActionResult(status="api_failed", reason=err_msg,
                                 action_id=row_id)
 
-        # api_ok or soft-fail ("could not extract tweet_id") — tweet MAY be
-        # live. Fall through to verification instead of blindly trusting.
+        # Soft failure: "could not extract tweet_id" — tweet MAY be live.
+        # Fall through to verification instead of blindly trusting.
+        # (Verification below handles both api_ok and soft-fail cases.)
 
         # Verify on X: check if the tweet is actually live.
         # Wait briefly for X propagation, then check timeline.
@@ -3381,7 +3315,7 @@ class SocialXGateway:
         config = self._load_config()
         if not config.get("enabled"):
             return ActionResult(status="disabled")
-        if self._cb_is_open(write=True):
+        if self._cb_is_open():
             return ActionResult(status="circuit_breaker",
                                 reason="API disabled after consecutive failures")
 
@@ -3767,7 +3701,7 @@ class SocialXGateway:
         config = self._load_config()
         if not config.get("enabled"):
             return ActionResult(status="disabled")
-        if self._cb_is_open(write=True):
+        if self._cb_is_open():
             return ActionResult(status="circuit_breaker",
                                 reason="API disabled after consecutive failures")
 
@@ -3838,7 +3772,7 @@ class SocialXGateway:
         config = self._load_config()
         if not config.get("enabled"):
             return ActionResult(status="disabled")
-        if self._cb_is_open(write=True):
+        if self._cb_is_open():
             return ActionResult(status="circuit_breaker",
                                 reason="API disabled after consecutive failures")
 

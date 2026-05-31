@@ -432,12 +432,6 @@ class ExpressionManager:
                     "dominant_hormone": result["dominant_hormone"],
                     "action_helper": comp.action_helper,
                     "total_consumption": round(sum(fire_result.get("consumption", {}).values()), 4),
-                    # Per-hormone consumption dict so a cross-process caller
-                    # (expression_worker, hormonal_system=None) can publish
-                    # HORMONE_CONSUME and deplete the hormone owner's levels —
-                    # the in-proc depletion below only runs when hormonal_system
-                    # is provided (legacy monolith path).
-                    "consumption": dict(fire_result.get("consumption", {})),
                 })
 
                 # Apply hormone consumption + refractory — the natural cooldown

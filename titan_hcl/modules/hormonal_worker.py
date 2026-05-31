@@ -491,32 +491,5 @@ def hormonal_worker_main(
                     "[HormonalWorker] HORMONE_STIMULUS handling failed: %s", e)
             continue
 
-        # HORMONE_CONSUME — cross-worker depletion bridge (2026-06-01).
-        # Producer: expression_worker, on each EXPRESSION composite fire.
-        # Restores the consumption→refractory loop severed by the Phase C
-        # split: evaluate_all runs in expression_worker with
-        # hormonal_system=None, so its in-proc depletion is a no-op and
-        # composites re-fire every tick. We apply the per-hormone consumption
-        # here in the hormone owner so the lowered levels propagate to readers
-        # (HormonalShmReader) and the urge falls below threshold naturally.
-        if msg_type == bus.HORMONE_CONSUME:
-            try:
-                payload = msg.get("payload", {}) or {}
-                consumption = payload.get("consumption", {}) or {}
-                if consumption and hormonal_system is not None:
-                    for hormone_name, amount in consumption.items():
-                        hormone = hormonal_system.get_hormone(hormone_name)
-                        if hormone is not None:
-                            hormone.consume(float(amount))
-                        else:
-                            logger.warning(
-                                "[HormonalWorker] HORMONE_CONSUME for unknown "
-                                "hormone: %s — dropped", hormone_name)
-            except Exception as e:
-                error_count += 1
-                logger.warning(
-                    "[HormonalWorker] HORMONE_CONSUME handling failed: %s", e)
-            continue
-
         # Other messages currently no-op until per-program follow-up rFPs
         # extend HORMONE_STIMULUS to REFLEX/FOCUS/METABOLISM + 6 outer.

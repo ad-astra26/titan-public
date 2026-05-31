@@ -863,46 +863,6 @@ class TestTwoCallShape:
         assert result.status == "not_prepared"
         assert "composed_text" in (result.reason or "")
 
-    def test_post_transport_failure_skips_verification(self, gateway, monkeypatch):
-        """2026-06-01 leak closure: a transport/proxy write failure (twitterapi.io
-        returns HTTP 200 + {"status":"error","message":"API returned status 407"})
-        must FAIL FAST — never fall through to the paid bypass_cache last_tweets
-        verification reads on a tweet that never posted. Previously the brittle
-        hard_fail keyword allowlist matched none of "...407", so every doomed
-        post burned ~900cr verifying a non-existent tweet."""
-        from titan_hcl.logic.social_x_gateway import PostDescriptor
-        calls = []
-
-        def fake_call(endpoint, method="GET", payload=None, **kw):
-            calls.append(endpoint)
-            if endpoint == "twitter/create_tweet_v2":
-                return {"status": "error", "message": "API returned status 407"}
-            return {"status": "success", "tweets": []}
-
-        verify_calls = {"n": 0}
-
-        def fake_verify(*a, **k):
-            verify_calls["n"] += 1
-            return (False, "")
-
-        monkeypatch.setattr(gateway, "_call_x_api", fake_call)
-        monkeypatch.setattr(gateway, "_verify_post_on_x", fake_verify)
-        monkeypatch.setattr(gateway, "_quality_gate", lambda *a, **k: (True, ""))
-        monkeypatch.setattr(gateway, "_assemble_final_text",
-                            lambda text, *a, **k: text)
-        desc = PostDescriptor(
-            post_type="reflection", catalyst={"type": "test"},
-            system_prompt="s", user_prompt="u",
-            max_tokens=200, temperature=0.8, voice_cfg={})
-        ctx = PostContext(session="s", proxy="p", api_key="k", titan_id="T1",
-                          composed_text="A grounded reflection on becoming.")
-        result = gateway.post(ctx, consumer="spirit_worker", descriptor=desc)
-        assert result.status == "api_failed"
-        assert verify_calls["n"] == 0, (
-            "verification must be SKIPPED on a transport/proxy failure")
-        assert "twitter/user/last_tweets" not in calls, (
-            "no paid verification reads on a tweet that never posted")
-
     def test_generate_text_deleted_no_shim(self):
         """Per feedback_no_shim_old_path_must_be_deleted.md, _generate_text is gone."""
         assert not hasattr(SocialXGateway, "_generate_text"), (
@@ -1331,17 +1291,17 @@ class TestCircuitBreaker:
         assert gateway._cb_is_open()
 
     def test_cb_blocks_post(self, gateway):
-        """Tripped WRITE circuit breaker returns early from prepare_post()."""
-        gateway._cb_tripped_at_write = time.time()
-        gateway._cb_failures_write = 5
+        """Tripped circuit breaker returns early from prepare_post()."""
+        gateway._cb_tripped_at = time.time()
+        gateway._cb_failures = 5
         ctx = PostContext(session="s", proxy="p", api_key="k", titan_id="T1")
         # Phase 3 Chunk ω-bis: circuit-breaker gate now lives in prepare_post.
         err, desc = gateway.prepare_post(ctx, consumer="spirit_worker")
         assert desc is None and err.status == "circuit_breaker"
 
     def test_cb_blocks_reply(self, gateway):
-        gateway._cb_tripped_at_write = time.time()
-        gateway._cb_failures_write = 5
+        gateway._cb_tripped_at = time.time()
+        gateway._cb_failures = 5
         ctx = ReplyContext(session="s", proxy="p", api_key="k", titan_id="T1",
                           reply_to_tweet_id="123", mention_text="hi",
                           mention_user="user")
@@ -1356,45 +1316,11 @@ class TestCircuitBreaker:
         assert result.status == "circuit_breaker"
 
     def test_cb_blocks_like(self, gateway):
-        gateway._cb_tripped_at_write = time.time()
-        gateway._cb_failures_write = 5
+        gateway._cb_tripped_at = time.time()
+        gateway._cb_failures = 5
         ctx = BaseContext(session="s", proxy="p", api_key="k", titan_id="T1")
         result = gateway.like("tweet_123", ctx, consumer="spirit_worker")
         assert result.status == "circuit_breaker"
-
-    def test_cb_domains_are_independent(self, gateway):
-        """Regression (2026-06-01): a healthy read path must NOT mask a dead
-        write path and vice-versa. A read-breaker trip leaves writes open; a
-        write-breaker trip leaves reads open. This is the bug a single shared
-        counter caused — read successes reset the counter between write
-        failures, so a dead webshare proxy never tripped the breaker."""
-        # Read breaker open, write breaker closed → writes still allowed.
-        gateway._cb_tripped_at = time.time()
-        gateway._cb_failures = 5
-        gateway._cb_tripped_at_write = 0.0
-        gateway._cb_failures_write = 0
-        assert gateway._cb_is_open() is True
-        assert gateway._cb_is_open(write=True) is False
-        # Inverse: write breaker open, read breaker closed → reads still allowed.
-        gateway._cb_tripped_at = 0.0
-        gateway._cb_failures = 0
-        gateway._cb_tripped_at_write = time.time()
-        gateway._cb_failures_write = 5
-        assert gateway._cb_is_open(write=True) is True
-        assert gateway._cb_is_open() is False
-
-    def test_proxy_transport_failure_classifier(self, gateway):
-        """The 407/proxy/5xx signatures are decisive write failures; content
-        rejections (duplicate/too-long) are not."""
-        assert gateway._is_proxy_transport_failure(
-            {"status": "error", "message": "API returned status 407"}, 200)
-        assert gateway._is_proxy_transport_failure(
-            {"message": "Session refresh failed: proxy connection error"}, 200)
-        assert gateway._is_proxy_transport_failure({}, 503)
-        assert not gateway._is_proxy_transport_failure(
-            {"message": "duplicate content"}, 200)
-        assert not gateway._is_proxy_transport_failure(
-            {"message": "tweet is too long"}, 200)
 
     def test_cb_expires_after_cooldown(self, gateway):
         """Circuit breaker reopens after cooldown."""

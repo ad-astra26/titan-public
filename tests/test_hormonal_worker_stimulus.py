@@ -87,15 +87,19 @@ class TestHormonalWorkerWiring:
             or "accumulate(stimulus" in src
 
     def test_broadcast_topics_extends_for_hormonal(self):
-        """module_catalog.py wires HORMONE_STIMULUS + HORMONE_CONSUME into
-        hormonal_module broadcast_topics (worker registration moved from
-        plugin.py to module_catalog.py; HORMONE_CONSUME added 2026-06-01)."""
-        from titan_hcl import module_catalog
-        with open(module_catalog.__file__) as f:
-            src = f.read()
+        """plugin.py wires HORMONE_STIMULUS into hormonal_module
+        broadcast_topics per B.7."""
+        import inspect
+        from titan_hcl.core import plugin
+        src = inspect.getsource(plugin.TitanHCL._register_workers) \
+            if hasattr(plugin.TitanHCL, "_register_workers") \
+            else inspect.getsource(plugin)
+        # Either the helper is named differently — fall back to module source.
+        if "_HORMONAL_WORKER_BROADCAST_TOPICS" not in src:
+            with open(plugin.__file__) as f:
+                src = f.read()
         assert "_HORMONAL_WORKER_BROADCAST_TOPICS" in src
-        assert "_bus_constants.HORMONE_STIMULUS" in src
-        assert "_bus_constants.HORMONE_CONSUME" in src
+        assert "bus.HORMONE_STIMULUS" in src
 
 
 # ── ns_worker producer side (B.6) ────────────────────────────────────
@@ -114,31 +118,11 @@ class TestNsWorkerProducer:
         assert "hormone_name" in src
         assert "IMPULSE" in src
 
-    def test_hormonal_worker_consumes_hormone_consume(self):
-        """hormonal_worker handles HORMONE_CONSUME by depleting each named
-        hormone via HormonalPressure.consume() (2026-06-01 cross-process
-        refractory restoration)."""
-        import inspect
-        from titan_hcl.modules import hormonal_worker as hw
-        src = inspect.getsource(hw)
-        assert "bus.HORMONE_CONSUME" in src
-        assert "hormone.consume(" in src
-
-    def test_expression_worker_emits_hormone_consume(self):
-        """expression_worker publishes HORMONE_CONSUME to hormonal_module with
-        the per-fire consumption dict (producer side of the restored loop)."""
-        import inspect
-        from titan_hcl.modules import expression_worker as ew
-        src = inspect.getsource(ew)
-        assert "bus.HORMONE_CONSUME" in src
-        assert "hormonal_module" in src
-
     def test_broadcast_topics_extends_for_ns(self):
-        """module_catalog.py wires ACTION_RESULT into ns_module
-        broadcast_topics per B.4 + B.12 (worker registration moved from
-        plugin.py to module_catalog.py)."""
-        from titan_hcl import module_catalog
-        with open(module_catalog.__file__) as f:
+        """plugin.py wires ACTION_RESULT into ns_module broadcast_topics
+        per B.4 + B.12."""
+        from titan_hcl.core import plugin
+        with open(plugin.__file__) as f:
             src = f.read()
         assert "_NS_WORKER_BROADCAST_TOPICS" in src
-        assert "_bus_constants.ACTION_RESULT" in src
+        assert "bus.ACTION_RESULT" in src

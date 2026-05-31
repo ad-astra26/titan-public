@@ -85,42 +85,6 @@ def test_personality_adds_critical_substrate_files(added):
     )
 
 
-# ── §24.4.B — config.toml conditional inclusion (D-SPEC-147) ──────────────
-
-def test_config_toml_listed_in_personality_paths():
-    """SPEC §24.4.B / D-SPEC-147 — config.toml is statically listed (for the
-    restore inverse-map) even though the producer gate decides inclusion."""
-    paths = {p[0] for p in RebirthBackup.PERSONALITY_PATHS}
-    assert "titan_hcl/config.toml" in paths, (
-        "titan_hcl/config.toml must be in PERSONALITY_PATHS so "
-        "backup_restore.build_arc_to_target can map it back on restore"
-    )
-
-
-@pytest.mark.parametrize("flag,expected", [
-    (True, True),     # explicitly enabled → config.toml in the tarball
-    (False, False),   # explicitly disabled → excluded
-    (None, False),    # flag absent → DEFAULT is opt-OUT (false) — the safe default
-])
-def test_config_toml_backup_gate(tmp_path, monkeypatch, flag, expected):
-    """The opt-in gate: create_personality_archive includes config.toml ONLY when
-    [backup].backup_config_toml is true (default false). PERSONALITY_PATHS are
-    cwd-relative, so build a minimal tree with just config.toml present."""
-    import tarfile
-    (tmp_path / "titan_hcl").mkdir()
-    (tmp_path / "titan_hcl" / "config.toml").write_text('[api]\ninternal_key = ""\n')
-    monkeypatch.chdir(tmp_path)
-    full_config = {} if flag is None else {"backup": {"backup_config_toml": flag}}
-    rb = RebirthBackup(network_client=None, titan_id="T1", full_config=full_config)
-    out = tmp_path / "personality.tar.gz"
-    rb.create_personality_archive(output_path=str(out), arweave_tier=False)
-    with tarfile.open(out, "r:gz") as t:
-        names = set(t.getnames())
-    assert ("config.toml" in names) is expected, (
-        f"backup_config_toml={flag!r}: config.toml in tarball should be {expected}"
-    )
-
-
 # ── §24.4.C — WEEKLY_EXTRA_PATHS canonical inventory ─────────────────────
 
 

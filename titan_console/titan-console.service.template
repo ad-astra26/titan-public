@@ -1,0 +1,20 @@
+# Titan Command Center — Console Agent (TC²).
+# Installed by setup_titan as `titan-console.service`. INDEPENDENT of the
+# Titan: NOT Guardian-supervised, no shared deps, so it stays up to report
+# (and act on) a dead Titan. Double-brace placeholders are filled at install
+# time by setup_titan.console.render_unit.
+[Unit]
+Description=Titan Command Center — Console Agent (TC2)
+After=network.target
+
+[Service]
+Type=simple
+User={{USER}}
+WorkingDirectory={{INSTALL_ROOT}}
+ExecStart={{VENV_PYTHON}} -m titan_console --install-root {{INSTALL_ROOT}} --host {{BIND_HOST}} --port {{PORT}} --api-base {{API_BASE}} --dist-dir {{DIST_DIR}}
+Restart=always
+RestartSec=3
+# Deliberately minimal env — the agent must not depend on Titan runtime state.
+
+[Install]
+WantedBy=multi-user.target
