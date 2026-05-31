@@ -2568,35 +2568,6 @@ def _run_dream_bridge(state_refs: dict, neuromod_reader, send_queue, name: str) 
             "(cycle=%d, chains_marked=%d)",
             len(memories), dream_cycle, len(chain_ids))
 
-    # Observatory retention — once/day prune of telemetry rows older than 90d.
-    # Restores the spirit_worker "prune after every dream cycle" call DROPPED at
-    # the D8-3 spirit→cognitive migration (same class as the dream-bridge harvest
-    # above), capped to daily per observatory_db.prune_old_data's own follow-up
-    # note (spirit called it every ~22min dream cycle — far more than needed).
-    # The writer-routed path serializes DELETEs through observatory_writer and
-    # SKIPS VACUUM (a 1.88GB VACUUM under load caused the 2026-04-21 T3
-    # degradation), so this is lock-safe and bounds DB growth; the one-time
-    # on-disk shrink stays a separate maintenance-window op. Best-effort — a
-    # prune failure never raises into the dream/epoch path.
-    try:
-        _now = time.time()
-        if _now - float(state_refs.get("_last_observatory_prune", 0.0)) >= 86400:
-            from titan_hcl.utils.observatory_db import get_observatory_db
-            _odb = get_observatory_db()
-            # SAFETY: only prune when a writer is present → the writer-routed
-            # path (DELETEs serialized through observatory_writer, VACUUM SKIPPED).
-            # With NO writer, prune_old_data takes the direct path that runs
-            # VACUUM (observatory_db.py:867) — the 2026-04-21 T3-degradation
-            # trigger. Skip in that case; the writer-owning process owns retention.
-            if getattr(_odb, "_writer", None) is not None:
-                _odb.prune_old_data(max_days=90)
-                state_refs["_last_observatory_prune"] = _now
-            else:
-                logger.debug("[DreamBridge] observatory prune skipped — no writer "
-                             "(would hit the VACUUM direct path)")
-    except Exception as _prune_err:
-        logger.debug("[DreamBridge] observatory prune skipped: %s", _prune_err)
-
 
 def _dispatch_experience_record(state_refs: dict, payload: dict) -> None:
     """EXPERIENCE_RECORD consumer — Record stage of the ExperienceOrchestrator

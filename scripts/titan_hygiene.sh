@@ -9,10 +9,8 @@
 # baseline_active, or archives (directive_memory_preservation). Runs on T1; the
 # same script + unit is mirrored to T2/T3 (same /tmp churn).
 set -euo pipefail
-# Derive the repo from THIS script's own location so it's correct on every host:
-# T1/T2 = .../projects/titan, T3 = .../projects/titan3 (separate repo). /tmp is
-# host-shared (one VPS hosts T2+T3) so its cleanup is repo-independent.
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
+REPO="/home/antigravity/projects/titan"
+[ -d "$REPO" ] || REPO="$(cd "$(dirname "$0")/.." && pwd)"   # T3 path = titan3/
 cd "$REPO"
 echo "[hygiene] $(date -u +%FT%TZ) start ($REPO)"
 
