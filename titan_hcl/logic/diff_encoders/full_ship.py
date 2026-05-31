@@ -81,26 +81,6 @@ def _scratch_dir_for(current_path: str) -> str:
     return scratch
 
 
-# Files at/below this size are copy-snapshotted (point-in-time, truncation-immune)
-# rather than hardlinked. Covers the rotating .json/.jsonl logs + small state
-# files; big binary DBs above this stay zero-copy hardlinks (they're page-updated,
-# not truncated-to-zero, and copying multi-GB on a baseline is disk-heavy).
-_COPY_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024  # 64 MB
-
-
-def _should_copy_snapshot(current_path: str) -> bool:
-    """True → use a real copy (separate inode, truncation-immune); False →
-    hardlink (zero-copy). Copy the truncation-prone files: rotating text logs
-    (.json/.jsonl, rewritten/truncated in place by live workers) and anything
-    small enough that a copy is cheap."""
-    if current_path.endswith((".json", ".jsonl")):
-        return True
-    try:
-        return os.path.getsize(current_path) <= _COPY_SNAPSHOT_MAX_BYTES
-    except OSError:
-        return False
-
-
 def _race_safe_snapshot(current_path: str) -> tuple[str, bool]:
     """Materialize a race-immune pointer to `current_path` bytes.
 
@@ -131,33 +111,6 @@ def _race_safe_snapshot(current_path: str) -> tuple[str, bool]:
         prefix=f"{src_base}{BKSNAP_MARKER}", dir=scratch_dir)
     os.close(fd)
     os.unlink(snap_path)   # mkstemp leaves an empty file; remove before link
-
-    # 2026-05-31 truncation-race fix (Maker): a hardlink SHARES the source inode,
-    # so it survives unlink/rename but NOT in-place TRUNCATION — a fast-changing
-    # log rotated via open("w")/ftruncate shrinks the shared inode, and pack-time
-    # tar then reads fewer bytes than the encode-time size → tarfile
-    # "unexpected end of data" (observed packing data/meta_cgn/*.jsonl etc.). A
-    # real COPY is a SEPARATE inode: a point-in-time, internally-consistent
-    # snapshot immune to truncation. Copy the truncation-prone files (rotating
-    # .json/.jsonl + anything small); keep zero-copy hardlinks for big binary DBs
-    # (sqlite is page-updated, not truncated-to-zero; a full copy would be
-    # disk-heavy on a monthly baseline of multi-GB DBs).
-    if _should_copy_snapshot(current_path):
-        try:
-            shutil.copy2(current_path, snap_path)
-            return snap_path, True
-        except OSError as ce:
-            logger.warning(
-                "[full_ship] copy snapshot failed for %s: %s — falling back to "
-                "hardlink (truncation-race window reopens)", current_path, ce)
-            try:
-                os.unlink(snap_path)
-            except OSError:
-                pass
-            fd2, snap_path = tempfile.mkstemp(
-                prefix=f"{src_base}{BKSNAP_MARKER}", dir=scratch_dir)
-            os.close(fd2)
-            os.unlink(snap_path)
 
     try:
         os.link(current_path, snap_path)
