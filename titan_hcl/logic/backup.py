@@ -299,6 +299,20 @@ class RebirthBackup:
                     today, self._meditation_count,
                 )
                 return
+
+            # Irys auto-fund (RE-HOMED 2026-05-31): the unified_v2 path lost the
+            # legacy BackupCascade.run() auto-fund call at the 2026-05-16
+            # migration → the Irys deposit went red since 05-19 (last auto-fund),
+            # under-funding backups (the un-posted 05-29 baseline + ongoing 402s).
+            # Top up here before the daily upload, same caps (auto_fund_enabled /
+            # daily cap / runway floor / wallet reserve). Best-effort — a fund
+            # hiccup must never block or fail the backup.
+            try:
+                self._auto_fund_irys_before_upload()
+            except Exception as _af_err:
+                logger.warning(
+                    "[Backup] §24 Irys auto-fund check raised: %s", _af_err)
+
             try:
                 # Phase 2 (2026-05-31): prefer a fresh pre-staged event (built
                 # off-loop by the worker's stager ahead of this meditation) → fast
@@ -2462,6 +2476,47 @@ class RebirthBackup:
                     "[Backup] §24 ship-stage: baseline working dir refresh "
                     "failed: %s (next incremental may full-ship)", e)
         return True
+
+    def _auto_fund_irys_before_upload(self) -> None:
+        """Re-homed Irys auto-fund (2026-05-31). The auto-fund hook lived only in
+        the legacy BackupCascade.run() path, which the unified_v2 migration
+        retired — so it stopped firing after 2026-05-19 and the deposit went red.
+        Re-invoke it from the unified_v2 daily path, before the upload, with the
+        SAME caps (config-gated by [backup].auto_fund_enabled + daily cap +
+        runway floor + wallet reserve; the audit log + Telegram alert are emitted
+        inside auto_fund_irys_if_needed). No-op when disabled / runway sufficient.
+        """
+        bcfg = (self._full_config or {}).get("backup", {}) or {}
+        if not bcfg.get("auto_fund_enabled", False):
+            return
+        from titan_hcl.logic.backup_cascade import BackupCascade
+        cascade = BackupCascade(full_config=self._full_config)
+        # Runway estimator needs a representative upload size — use the staged
+        # event's total tarball size when available, else a sane daily default.
+        size_mb = 35.0
+        try:
+            entry = self._staged_event
+            staged = entry.get("staged") if isinstance(entry, dict) else None
+            if staged is not None:
+                total = sum(
+                    r.tarball_size_bytes for r in staged.tier_results.values()
+                    if r is not None and r.tarball_size_bytes)
+                if total > 0:
+                    size_mb = total / 1048576.0
+        except Exception:
+            pass
+        result = cascade.auto_fund_irys_if_needed(size_mb)
+        action = (result or {}).get("action")
+        if action == "funded":
+            logger.info(
+                "[Backup] §24 Irys auto-fund: FUNDED %.4f SOL (runway was %.2fd) "
+                "tx=%s", result.get("amount_sol", 0.0),
+                result.get("runway_before_days", 0.0),
+                str(result.get("tx_id", ""))[:16])
+        elif action and action != "no_action":
+            logger.info(
+                "[Backup] §24 Irys auto-fund: %s (%s)",
+                action, result.get("reason", ""))
 
     # ── Local diff/baseline event (L5, 2026-05-14) ─────────────────────────
     #
