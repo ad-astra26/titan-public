@@ -1181,6 +1181,10 @@ class MetaReasoningEngine:
                 dominant_emotion=getattr(self, "_emot_dom_at_chain_start", "FLOW"),
                 chain_so_far=list(self.state.chain),
                 domain=self.state.grounding_consumer or "",
+                # Concept-aware (Maker 2026-05-31): the concept this chain is
+                # reasoning about (Phase A learning-event chains carry it) keys
+                # the binding so the teacher learns per-concept reasoning.
+                grounding_concept=self.state.grounding_concept or "",
             )
         except Exception as _sig_err:
             swallow_warn('[META] context_signature build failed', _sig_err,

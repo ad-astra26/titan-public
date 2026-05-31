@@ -50,6 +50,22 @@ def test_signature_drift_guard():
     assert BINDING_PRIMITIVES == tuple(META_PRIMITIVES)
 
 
+def test_concept_aware_signature():
+    """Concept-aware (Maker 2026-05-31): same context but different grounding_concept
+    must diverge; same concept must match; empty concept = the legacy context-only key."""
+    base = dict(trigger_reason="concept_grounding", dominant_emotion="FLOW",
+                chain_so_far=["FORMULATE.define"], domain="language")
+    a = build_context_signature(**base, grounding_concept="warmth")
+    a2 = build_context_signature(**base, grounding_concept="warmth")
+    b = build_context_signature(**base, grounding_concept="music")
+    empty = build_context_signature(**base, grounding_concept="")
+    assert np.allclose(a, a2)                                # same concept → identical
+    assert float(a @ b) < float(a @ a2)                      # different concept → diverges
+    assert float(a @ empty) < 1.0                            # concept-keyed ≠ context-only
+    # Two DIFFERENT concepts still share the rest of the context (sim stays > 0).
+    assert float(a @ b) > 0.5
+
+
 def test_empty_chain_signature_driven_by_context():
     """At chain entry (empty chain) the signature is driven by trigger/emotion/domain."""
     s = build_context_signature("concept_grounding", "FLOW", [], "language")

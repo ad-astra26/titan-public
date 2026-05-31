@@ -50,7 +50,15 @@ N_PRIM = len(BINDING_PRIMITIVES)            # 9
 N_TRIG_BUCKETS = 8
 N_EMOT_BUCKETS = 8
 N_DOM_BUCKETS = 8
-SIG_DIM = N_PRIM + N_TRIG_BUCKETS + N_EMOT_BUCKETS + N_DOM_BUCKETS  # 33
+# Concept-aware (Maker 2026-05-31): the grounding_concept the inner Titan is
+# reasoning about (Phase A puts it on every learning-event chain) keys the
+# binding too — so the teacher learns "when reasoning about THIS concept, use
+# primitive Y", not just "in this context-shape". Highest-cardinality categorical
+# → the most buckets. Empty concept (non-grounding chains) → bucket 0, so those
+# chains behave exactly as the pre-concept-aware context-only binding.
+N_CONCEPT_BUCKETS = 24
+SIG_DIM = (N_PRIM + N_TRIG_BUCKETS + N_EMOT_BUCKETS + N_DOM_BUCKETS
+           + N_CONCEPT_BUCKETS)             # 57
 
 DEFAULT_DB_PATH = "data/meta_teacher/reasoning_bindings.db"
 
@@ -81,6 +89,7 @@ def build_context_signature(
     dominant_emotion: str,
     chain_so_far: List[str],
     domain: str,
+    grounding_concept: str = "",
 ) -> np.ndarray:
     """Deterministic numeric context signature (L2-normalized, float32, dim=SIG_DIM).
 
@@ -89,6 +98,11 @@ def build_context_signature(
     §9.5c ``post_formulate_loop_breaker`` example. ``chain_so_far`` is the partial chain at
     retrieval-time and the full chain at mint-time; cosine sim degrades gracefully on the
     prefix overlap.
+
+    Concept-aware (Maker 2026-05-31): ``grounding_concept`` (the concept the inner Titan is
+    reasoning about — Phase A puts it on every learning-event chain) keys the binding too,
+    via a process-stable hashed one-hot. Empty concept → bucket 0 (non-grounding chains
+    behave exactly as the pre-concept-aware signature).
     """
     vec = np.zeros(SIG_DIM, dtype=np.float32)
 
@@ -105,13 +119,17 @@ def build_context_signature(
         if total > 0:
             vec[0:N_PRIM] = counts / total
 
-    # [9:17] trigger, [17:25] emotion, [25:33] domain — process-stable hashed one-hots.
+    # trigger / emotion / domain / concept — process-stable hashed one-hots.
     off = N_PRIM
     vec[off + _stable_bucket(trigger_reason, N_TRIG_BUCKETS)] = 1.0
     off += N_TRIG_BUCKETS
     vec[off + _stable_bucket(dominant_emotion, N_EMOT_BUCKETS)] = 1.0
     off += N_EMOT_BUCKETS
     vec[off + _stable_bucket(domain, N_DOM_BUCKETS)] = 1.0
+    off += N_DOM_BUCKETS
+    # Empty concept lands in bucket 0 (shared across all non-grounding chains).
+    vec[off + (_stable_bucket(grounding_concept, N_CONCEPT_BUCKETS)
+               if grounding_concept else 0)] = 1.0
 
     norm = float(np.linalg.norm(vec))
     if norm > 1e-8:
