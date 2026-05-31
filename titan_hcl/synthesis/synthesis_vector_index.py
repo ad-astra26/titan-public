@@ -275,11 +275,16 @@ class SynthesisVectorStore:
         *,
         data_dir: str,
         embedder: Optional[Callable[[str], "Any"]] = None,
+        batch_embedder: Optional[Callable[[list], "Any"]] = None,
         forks: Iterable[str] = INDEXED_FORKS,
         dim: int = EMBEDDING_DIM,
     ):
         self._data_dir = str(data_dir)
         self._embedder = embedder
+        # Optional `(list[str]) -> list[vec]` batch embedder. fastembed is far
+        # faster (and far lighter on a small box) embedding a list in one call
+        # than N single-item calls — `add_texts` uses this when present.
+        self._batch_embedder = batch_embedder
         self._dim = int(dim)
         self._forks = tuple(forks)
         self._shards: dict[str, _FaissShard] = {
@@ -313,6 +318,54 @@ class SynthesisVectorStore:
         if vec is None:
             return False
         added = sh.add(tx_hash, vec)
+        if added:
+            self._dirty.add(fork)
+        return added
+
+    def add_texts(self, fork: str, items: list) -> int:
+        """Batch-embed + bind `items` (a list of `(tx_hash, text)`) into the
+        fork's shard. Skips tx_hashes already present (idempotent). Returns the
+        number actually added. Uses the batch embedder in ONE fastembed call
+        (much faster + lighter than per-text on a small box); falls back to
+        per-text `add_text` when no batch embedder is configured. Does NOT save
+        — caller batches saves."""
+        sh = self._shard(fork)
+        if sh is None or not items:
+            return 0
+        # Dedup + drop empties before embedding (don't pay to embed skips).
+        pending: list[tuple[str, str]] = []
+        for tx_hash, text in items:
+            if not tx_hash or not text or sh.has(tx_hash):
+                continue
+            pending.append((tx_hash, text))
+        if not pending:
+            return 0
+        if self._batch_embedder is None:
+            # Per-text fallback (still dedup'd above).
+            added = 0
+            for tx_hash, text in pending:
+                if self.add_text(fork, tx_hash, text):
+                    added += 1
+            return added
+        try:
+            vecs = list(self._batch_embedder([t for _, t in pending]))
+        except Exception as e:
+            logger.warning("[SynthesisVectorStore] batch embed failed: %s — "
+                           "falling back to per-text", e)
+            added = 0
+            for tx_hash, text in pending:
+                if self.add_text(fork, tx_hash, text):
+                    added += 1
+            return added
+        if len(vecs) != len(pending):
+            logger.warning(
+                "[SynthesisVectorStore] batch embed returned %d vecs for %d "
+                "texts — skipping fork %s batch", len(vecs), len(pending), fork)
+            return 0
+        added = 0
+        for (tx_hash, _), vec in zip(pending, vecs):
+            if vec is not None and sh.add(tx_hash, vec):
+                added += 1
         if added:
             self._dirty.add(fork)
         return added

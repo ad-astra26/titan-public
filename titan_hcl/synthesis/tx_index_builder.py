@@ -46,6 +46,12 @@ logger = logging.getLogger(__name__)
 # whole chain. JSON, atomic tmp+rename.
 WATERMARK_NAME = "synthesis_tx_index_watermark.json"
 
+# Embed BATCH_SIZE texts per fastembed call (one call >> N single calls,
+# especially on a small/contended box). Persist + advance the watermark every
+# SAVE_EVERY indexed so an interruption mid-backfill keeps progress.
+BATCH_SIZE = 256
+SAVE_EVERY = 2048
+
 
 def _embeddable_text(fork: str, content: dict) -> str:
     """Extract the semantically rich text to embed from a TX content dict.
@@ -226,6 +232,34 @@ class TxIndexBuilder:
                 fork_name, e)
             return stats
 
+        # Accumulate (tx_hash, text) and flush to the store in batches — ONE
+        # fastembed call per batch is dramatically faster + lighter than per-text
+        # (critical on a small/contended box). Periodic save + watermark advance
+        # so an interruption keeps progress (the index saves only on flush).
+        batch: list[tuple[str, str]] = []
+        since_save = 0
+
+        def _flush() -> None:
+            nonlocal batch, since_save
+            if not batch:
+                return
+            added = self._store.add_texts(fork_name, batch)
+            stats["indexed"] += added
+            summary["indexed"] += added
+            # Anything in the batch not added was a dedup skip.
+            skipped = len(batch) - added
+            stats["skipped"] += skipped
+            summary["skipped"] += skipped
+            since_save += added
+            batch = []
+            # Persist + advance watermark every ~SAVE_EVERY indexed so a crash
+            # mid-backfill doesn't discard the whole pass.
+            if since_save >= SAVE_EVERY:
+                self._store.save(fork_name)
+                self._watermark[fork_id] = stats["max_height"]
+                self._save_watermark()
+                since_save = 0
+
         for r in rows:
             stats["scanned"] += 1
             summary["scanned"] += 1
@@ -252,17 +286,16 @@ class TxIndexBuilder:
                 summary["indexed"] += 1
                 continue
 
-            if self._store.add_text(fork_name, tx_hash, text):
-                stats["indexed"] += 1
-                summary["indexed"] += 1
-            else:
-                stats["skipped"] += 1
-                summary["skipped"] += 1
+            batch.append((tx_hash, text))
+            if len(batch) >= BATCH_SIZE:
+                _flush()
 
-        # Advance the watermark to the highest height we scanned (even skips —
-        # they are already indexed, so we never need to revisit them).
-        if not dry_run and stats["scanned"] > 0:
-            self._watermark[fork_id] = stats["max_height"]
+        if not dry_run:
+            _flush()
+            # Advance the watermark to the highest height we scanned (even skips —
+            # they are already indexed, so we never need to revisit them).
+            if stats["scanned"] > 0:
+                self._watermark[fork_id] = stats["max_height"]
         return stats
 
     def close(self) -> None:

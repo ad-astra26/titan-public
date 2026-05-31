@@ -736,14 +736,17 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # on first embed, never at boot).
     _data_dir_sw = os.path.dirname(db_path) or "."
 
+    def _ensure_embed_model():
+        from fastembed import TextEmbedding
+        if not hasattr(_ensure_embed_model, "_model"):
+            _ensure_embed_model._model = TextEmbedding(
+                model_name="BAAI/bge-small-en-v1.5")
+        return _ensure_embed_model._model
+
     def _shared_embedder(text: str):
         try:
-            from fastembed import TextEmbedding
             import numpy as np
-            if not hasattr(_shared_embedder, "_model"):
-                _shared_embedder._model = TextEmbedding(
-                    model_name="BAAI/bge-small-en-v1.5")
-            vecs = list(_shared_embedder._model.embed([text]))
+            vecs = list(_ensure_embed_model().embed([text]))
             v = np.array(vecs[0], dtype=np.float32)
             norm = np.linalg.norm(v)
             if norm > 0:
@@ -751,6 +754,21 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             return v
         except Exception as e:
             logger.debug("[synthesis_worker] shared_embedder failed: %s", e)
+            return None
+
+    def _shared_batch_embedder(texts: list):
+        # ONE fastembed call for the whole list — far faster + lighter than N
+        # single calls (the per-tick tx-index path embeds in bulk).
+        try:
+            import numpy as np
+            out = []
+            for v in _ensure_embed_model().embed(list(texts)):
+                v = np.asarray(v, dtype=np.float32)
+                n = float(np.linalg.norm(v))
+                out.append(v / n if n > 0 else v)
+            return out
+        except Exception as e:
+            logger.debug("[synthesis_worker] batch_embedder failed: %s", e)
             return None
 
     # Operator-closure Phase A2 — the tx_hash-native FAISS store (sole writer,
@@ -762,7 +780,8 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     try:
         from titan_hcl.synthesis.synthesis_vector_index import SynthesisVectorStore
         synth_vector_store = SynthesisVectorStore(
-            data_dir=_data_dir_sw, embedder=_shared_embedder)
+            data_dir=_data_dir_sw, embedder=_shared_embedder,
+            batch_embedder=_shared_batch_embedder)
         logger.info(
             "[synthesis_worker] tx_hash FAISS store ready (forks=%s) — "
             "binding outer memory to the chain spine (INV-15)",

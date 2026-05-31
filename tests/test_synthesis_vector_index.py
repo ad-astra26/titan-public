@@ -150,6 +150,33 @@ def test_shard_files_named_per_fork(tmp_path):
     assert not os.path.exists(tmp_path / "synthesis_vectors_meta.faiss")
 
 
+def test_add_texts_batch_embeds_and_dedups(tmp_path):
+    calls = {"n": 0}
+
+    def batch_embed(texts):
+        calls["n"] += 1            # count fastembed calls — must be ONE per batch
+        return [_unit(abs(hash(t)) % (2**31)) for t in texts]
+
+    store = SynthesisVectorStore(
+        data_dir=str(tmp_path), embedder=_stub_embedder(), batch_embedder=batch_embed)
+    added = store.add_texts("declarative", [
+        ("txA", "alpha"), ("txB", "beta"), ("txC", "gamma")])
+    assert added == 3
+    assert calls["n"] == 1         # all 3 embedded in ONE batch call
+    # Re-adding (with one new) dedups the present ones, embeds only the new.
+    added2 = store.add_texts("declarative", [("txA", "alpha"), ("txD", "delta")])
+    assert added2 == 1
+    assert calls["n"] == 2         # second batch had only the 1 new text
+    store.save()
+    assert store.stats()["declarative"] == 4
+
+
+def test_add_texts_falls_back_per_text_without_batch_embedder(tmp_path):
+    store = SynthesisVectorStore(data_dir=str(tmp_path), embedder=_stub_embedder())
+    assert store.add_texts("procedural", [("txX", "x"), ("txY", "y")]) == 2
+    assert store.stats()["procedural"] == 2
+
+
 def test_indexed_forks_constant():
     assert INDEXED_FORKS == ("conversation", "declarative", "procedural")
     assert "episodic" not in INDEXED_FORKS and "meta" not in INDEXED_FORKS

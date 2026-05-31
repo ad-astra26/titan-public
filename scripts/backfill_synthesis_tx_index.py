@@ -32,19 +32,26 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def _build_embedder():
-    """Lazy fastembed BAAI/bge-small-en-v1.5 — the one engine embedding path."""
+def _build_embedders():
+    """Lazy fastembed BAAI/bge-small-en-v1.5 — the one engine embedding path.
+    Returns (single, batch) — the batch path embeds a whole list in one call
+    (far faster + lighter than N single calls on a small box)."""
     from fastembed import TextEmbedding
+    import numpy as np
     model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
-    def embed(text: str):
-        import numpy as np
-        vecs = list(model.embed([text]))
-        v = np.asarray(vecs[0], dtype=np.float32)
+    def _norm(v):
+        v = np.asarray(v, dtype=np.float32)
         n = float(np.linalg.norm(v))
         return v / n if n > 0 else v
 
-    return embed
+    def embed(text: str):
+        return _norm(list(model.embed([text]))[0])
+
+    def embed_many(texts: list):
+        return [_norm(v) for v in model.embed(list(texts))]
+
+    return embed, embed_many
 
 
 def main() -> int:
@@ -70,8 +77,11 @@ def main() -> int:
     mode = "DRY-RUN (no writes)" if dry else "EXECUTE (populate index)"
     print(f"[backfill] {mode} — data_dir={data_dir} forks={list(INDEXED_FORKS)} max={args.max}")
 
-    embedder = None if dry else _build_embedder()
-    store = SynthesisVectorStore(data_dir=data_dir, embedder=embedder)
+    embedder = batch_embedder = None
+    if not dry:
+        embedder, batch_embedder = _build_embedders()
+    store = SynthesisVectorStore(
+        data_dir=data_dir, embedder=embedder, batch_embedder=batch_embedder)
     builder = TxIndexBuilder(store=store, data_dir=data_dir)
 
     t0 = time.time()
