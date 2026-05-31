@@ -370,6 +370,16 @@ SIGNAL_TO_PRIMITIVE: dict[tuple, dict[str, float]] = {
     # BREAK is anti-monoculture primitive; EVALUATE < 0.5 gently discourages
     # re-evaluation of bad sessions.
     ("social",    "session_low_qual"):  {"EVALUATE": 0.45, "BREAK": 0.55},
+    # Phase H (RFP_cgn_enhancements §H / Inner Teacher Protocol, 2026-05-31):
+    # events-teacher grounded a RECURRING social concept into CGN (via the
+    # `social` consumer) with a felt signature + co-occurring-concept
+    # associations. "A social concept grounded → next chain, INTEGRATE it
+    # (SYNTHESIZE 0.70) / reason about its relations (HYPOTHESIZE 0.60) /
+    # feel into its social nature (SPIRIT_SELF 0.55), rather than re-formulating
+    # (FORMULATE 0.20 biases AWAY from the T1/T3 FORMULATE monoculture)."
+    # Monoculture-aware, mirroring the language/knowledge concept_grounded rows.
+    ("social",    "concept_grounded"):  {"FORMULATE": 0.20, "SYNTHESIZE": 0.70,
+                                         "HYPOTHESIZE": 0.60, "SPIRIT_SELF": 0.55},
     ("coding",    "problem_solved"):    {"SYNTHESIZE": 0.7, "EVALUATE": 0.7},
     ("coding",    "test_failed"):       {"EVALUATE": 0.4, "BREAK": 0.55},
     ("self_model", "reflection_depth"): {"INTROSPECT": 0.75, "SPIRIT_SELF": 0.65},

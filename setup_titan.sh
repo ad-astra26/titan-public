@@ -37,9 +37,6 @@ setup_titan.sh — bootstrap a sovereign Titan.
 Any other flags are passed to the wizard, e.g.:
   setup_titan.sh --default
   setup_titan.sh --tag v0.0.1 --dir ~/mytitan --mode local
-  setup_titan.sh --resurrect                 # 🜂 recover a mainnet Titan from its
-                                             #    on-chain sovereign backup (needs Shard-1)
-  setup_titan.sh --resurrect --verify-only   #    recovery observation mode (live restore-test)
 EOF
 }
 

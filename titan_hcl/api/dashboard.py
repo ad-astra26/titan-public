@@ -10620,6 +10620,10 @@ async def post_v4_social_perception(request: Request):
                     "source": evt.get("source", ""),
                     "perturbation": float(evt.get("perturbation", 0.0)),
                     "social_vocab_candidates": evt.get("social_vocab_candidates", []),
+                    # Phase H — salience-gated CGN groundings ride the first
+                    # perception event; language_worker grounds them via the
+                    # `social` consumer + emits social.concept_grounded.
+                    "social_ground_concepts": evt.get("social_ground_concepts", []),
                 }))
             published += 1
 

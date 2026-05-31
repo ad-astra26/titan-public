@@ -143,17 +143,6 @@ timechain_mode = "full"
 encryption_enabled = false
 encryption_tier = "private"
 
-# SPEC §24.4.B (D-SPEC-147) — include titan_hcl/config.toml in the PERSONALITY
-# (daily) backup tier, so a sovereign resurrection restores a FULLY-configured
-# Titan that boots ready (inference/comms/all settings come from the restored
-# config — no re-prompt). Default OFF here (the installer turns it ON for a
-# mainnet install and strongly recommends encryption_enabled=true, so config.toml
-# ships as CIPHERTEXT on Arweave). 🚨 If you enable this WITHOUT encryption, your
-# config.toml — including any credentials you put in it — is uploaded to Arweave in
-# the clear. Leave false to opt out; then keep your own copy of config.toml and
-# supply it (alongside Shard-1) when running the resurrection protocol.
-backup_config_toml = false
-
 # Phase 9 — T1-only off-host mirror from T2/T3. See rFP_backup_worker §5.2.
 [backup.mirror]
 enabled = false
