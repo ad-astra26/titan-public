@@ -63,17 +63,28 @@ def test_snapshot_survives_source_deletion(tmp_path):
     assert dd["merkle_root"] == expected_sha
 
 
-def test_snapshot_is_hardlink_when_same_filesystem(tmp_path):
-    """On same-fs (the common case), the snapshot is a hardlink — same
-    inode, no extra disk usage."""
-    source = tmp_path / "src.json"
-    source.write_text("hello")
-    dd = full_ship.encode_diff(str(source))
-    src_stat = os.stat(source)
-    snap_stat = os.stat(dd["patch_path"])
-    assert src_stat.st_ino == snap_stat.st_ino, (
-        "snapshot should be a hardlink (same inode) on same-fs")
-    assert snap_stat.st_nlink >= 2, "hardlink should bump nlink"
+def test_snapshot_copy_for_json_hardlink_for_big_binary(tmp_path):
+    """Truncation-race contract (2026-05-31): fast-changing/small files
+    (.json/.jsonl + ≤64MB) are COPY-snapshotted — a SEPARATE inode, immune to
+    in-place truncation (a rotating log shrinking via open('w')/ftruncate can't
+    corrupt the snapshot). Big binary files stay zero-copy hardlinks."""
+    # .json (rotating/truncation-prone) → COPY (different inode), bytes preserved
+    j = tmp_path / "rotating.json"
+    j.write_text("hello")
+    ddj = full_ship.encode_diff(str(j))
+    assert os.stat(j).st_ino != os.stat(ddj["patch_path"]).st_ino, (
+        ".json must be a COPY (separate inode), not a hardlink — else "
+        "in-place truncation corrupts the snapshot")
+    with open(ddj["patch_path"], "rb") as f:
+        assert f.read() == b"hello"
+
+    # big binary (>64MB, non-json) → hardlink (same inode, zero-copy)
+    big = tmp_path / "big.bin"
+    with open(big, "wb") as f:
+        f.write(b"\0" * (65 * 1024 * 1024))
+    ddb = full_ship.encode_diff(str(big))
+    assert os.stat(big).st_ino == os.stat(ddb["patch_path"]).st_ino, (
+        "big binary should be a zero-copy hardlink (same inode)")
 
 
 def test_snapshot_survives_atomic_replace(tmp_path, monkeypatch):

@@ -109,19 +109,23 @@ echo "  ✓ ${LABEL}: HEAD at ${PULLED_TIP:0:12} (matches origin/titan-v6)"
 
 # Merge new sections (any [section] in pulled but NOT in backup) into backup,
 # preserving credentials in backup. Phase 5C deploy taught us this.
-python3 <<'PYMERGE'
-import re, sys
-pulled = open('titan_hcl/config.toml').read()
-backup_path = "${BACKUP}"
-import os
+# config.toml is UNTRACKED + gitignored since 2026-05-31 (fc7dbcee — secrets must
+# never be committed). The pull removed the last tracked copy, so we restore this
+# Titan's local config from the pre-pull backup. New config sections now ship via
+# the tracked template config.toml.example (NOT the deleted tracked config.toml),
+# so merge any sections the local config is missing.
+python3 - "${BACKUP}" <<'PYMERGE'
+import re, os, sys
+backup_path = sys.argv[1]
 backup = open(backup_path).read() if os.path.exists(backup_path) else ''
-pulled_sections = re.findall(r'^\[([^\]]+)\]', pulled, re.MULTILINE)
-backup_sections = re.findall(r'^\[([^\]]+)\]', backup, re.MULTILINE)
-new_sections = [s for s in pulled_sections if s not in backup_sections]
+example = open('titan_hcl/config.toml.example').read() if os.path.exists('titan_hcl/config.toml.example') else ''
+ex_sections = re.findall(r'^\[([^\]]+)\]', example, re.MULTILINE)
+bk_sections = re.findall(r'^\[([^\]]+)\]', backup, re.MULTILINE)
+new_sections = [s for s in ex_sections if s not in bk_sections]
 if new_sections:
-    print(f'  + new sections to merge: {", ".join(new_sections)}')
+    print('  + new sections from template: ' + ', '.join(new_sections))
     for sec in new_sections:
-        m = re.search(rf'(\[{re.escape(sec)}\][^\[]*)', pulled)
+        m = re.search(r'(\[' + re.escape(sec) + r'\][^\[]*)', example)
         if m:
             backup += '\n\n' + m.group(1).rstrip() + '\n'
     open(backup_path, 'w').write(backup)
@@ -129,9 +133,11 @@ PYMERGE
 
 # Restore config.toml from merged backup (preserves credentials AND picks up new sections)
 cp "${BACKUP}" titan_hcl/config.toml
-git update-index --assume-unchanged titan_hcl/config.toml
+# No `git update-index --assume-unchanged` — config.toml is untracked + gitignored
+# now (never in the index), so that command would error under `set -e`. The
+# .gitignore entry is the guard.
 RESTORED_SIZE=$(stat -c%s titan_hcl/config.toml)
-echo "  ✓ ${LABEL}: restored config.toml (${RESTORED_SIZE} bytes)"
+echo "  ✓ ${LABEL}: restored config.toml (${RESTORED_SIZE} bytes; untracked/gitignored)"
 REMOTE_SCRIPT
 
     if [ "${include_rust}" = "1" ]; then
