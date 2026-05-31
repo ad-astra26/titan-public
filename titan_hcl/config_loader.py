@@ -138,7 +138,20 @@ def load_titan_config(force_reload: bool = False,
     global _cache, _cache_sig, _warned_missing_secrets
 
     layer2_path = Path(config_path) if config_path else BASE_CONFIG_PATH
-    use_cache = config_path is None
+    # The cache keys on the canonical config layer. A config_path that points
+    # at the real config.toml in ANY form — including an absolute path, which
+    # is how SocialXGateway passes it (os.path.join(...,'config.toml')) — must
+    # share the global cache; otherwise every caller that resolves its own
+    # absolute path bypasses the cache and re-reads+merges all layers on every
+    # call (this was the social_x reload storm: ~240 rebuilds/hr/Titan). Only a
+    # genuinely DIFFERENT path (tests injecting a tmp config) bypasses caching.
+    if config_path is None:
+        use_cache = True
+    else:
+        try:
+            use_cache = layer2_path.resolve() == BASE_CONFIG_PATH.resolve()
+        except OSError:
+            use_cache = False
     override_path = _per_titan_override_path()
 
     current_sig = _source_mtimes(layer2_path, override_path) if use_cache else None
