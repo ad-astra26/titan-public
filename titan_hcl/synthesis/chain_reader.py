@@ -26,13 +26,19 @@ from titan_hcl.logic.timechain import (
 def chain_file_for(data_dir: Path, fork_id: int) -> Path:
     """Resolve the on-disk `.bin` path for a fork_id (mirrors
     `TimeChain._get_chain_file_path`): a named primary fork lives at
-    `chain_<name>.bin`; anything else is a sidechain at
-    `sidechains/sc_<fork_id:04d>.bin`. Used to dereference a block_index row's
-    `(fork_id, file_offset)` without opening a writable TimeChain."""
+    `<data_dir>/timechain/chain_<name>.bin`; anything else is a sidechain at
+    `<data_dir>/timechain/sidechains/sc_<fork_id:04d>.bin`. Used to dereference a
+    block_index row's `(fork_id, file_offset)` without opening a writable
+    TimeChain.
+
+    NB: `data_dir` is the Titan data root (e.g. `data/`); the chain `.bin` files
+    + `index.db` live in the `timechain/` subdir under it (the TimeChain is
+    constructed with `data_dir=<root>/timechain`)."""
+    tc = Path(data_dir) / "timechain"
     name = FORK_NAMES.get(int(fork_id))
     if name:
-        return Path(data_dir) / f"chain_{name}.bin"
-    return Path(data_dir) / "sidechains" / f"sc_{int(fork_id):04d}.bin"
+        return tc / f"chain_{name}.bin"
+    return tc / "sidechains" / f"sc_{int(fork_id):04d}.bin"
 
 
 def read_block_content_at(

@@ -88,3 +88,15 @@ def test_tx_content_deref_roundtrips_snippet(tmp_path, content_map):
 def test_tx_content_deref_no_index_db_returns_none(tmp_path):
     deref = tib.TxContentDeref(data_dir=str(tmp_path))
     assert deref.snippet("ab" * 32) is None
+
+
+def test_chain_file_for_resolves_under_timechain_subdir():
+    """Regression (T3 deploy 2026-05-31): chain .bin files live in the
+    `timechain/` subdir of the data root, NOT directly under it."""
+    from titan_hcl.synthesis.chain_reader import chain_file_for
+    import os
+    # declarative is FORK_NAMES[1]; conversation sidechain (115) is sc_0115.bin.
+    p_decl = chain_file_for("data", 1)
+    p_side = chain_file_for("data", 115)
+    assert os.path.normpath(str(p_decl)) == os.path.normpath("data/timechain/chain_declarative.bin")
+    assert os.path.normpath(str(p_side)) == os.path.normpath("data/timechain/sidechains/sc_0115.bin")
