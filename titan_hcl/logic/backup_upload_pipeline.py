@@ -227,18 +227,21 @@ def _extract_block_ranges(file_diffs: list[tuple[str, dict]]) -> dict:
     return ranges
 
 
-async def ship_tier(
+def build_tier(
     *,
     tier: str,
     event_id: str,
     event_type: str,
     specs: Iterable[TierFileSpec],
     baseline_resolver: Optional[Callable[[str], Optional[str]]],
-    arweave_uploader: ArweaveUploader,
     scratch_dir: str,
     titan_id: str,
 ) -> TierShipResult:
-    """Pack one tier's per-file diffs into a tarball + upload to Arweave.
+    """Pack one tier's per-file diffs into a tarball — NO upload (Phase 2,
+    2026-05-31, pre-stage split). The heavy IO+CPU (reading the big mutable DBs
+    to diff against the baseline + zstd pack) lives HERE so the stager can run it
+    off the recv loop, ahead of the meditation. Returns a TierShipResult with
+    tarball_path/sha/size populated and tx_id=None (upload is a later step).
 
     baseline_resolver: callable arc_name -> on-disk path of the file's
     prior-baseline reconstructed bytes (or None if not available). For
@@ -287,14 +290,31 @@ async def ship_tier(
     result.files_skipped = skipped
     if tier == "timechain":
         result.block_ranges = _extract_block_ranges(file_diffs)
+    return result
 
-    # Upload to Arweave
-    with open(out_path, "rb") as f:
+
+async def upload_tier(
+    result: TierShipResult,
+    *,
+    arweave_uploader: ArweaveUploader,
+    titan_id: str,
+    event_id: str,
+    event_type: str,
+) -> TierShipResult:
+    """Upload a PRE-BUILT tier tarball (from build_tier) to Arweave + set tx_id.
+
+    Mutates + returns `result`. Safe to call on a staged tarball minutes after
+    build_tier produced it (the bytes on disk are immutable once packed).
+    """
+    if result.tarball_path is None or not os.path.exists(result.tarball_path):
+        result.error = f"{result.tier}: staged tarball missing at upload time"
+        return result
+    with open(result.tarball_path, "rb") as f:
         tarball_bytes = f.read()
     tags = {
         "App-Name": "TitanBackupUnified",
         "Titan-Id": titan_id,
-        "Tier": tier,
+        "Tier": result.tier,
         "Event-Id": event_id,
         "Event-Type": event_type,
     }
@@ -308,6 +328,36 @@ async def ship_tier(
         return result
     result.tx_id = tx_id
     return result
+
+
+async def ship_tier(
+    *,
+    tier: str,
+    event_id: str,
+    event_type: str,
+    specs: Iterable[TierFileSpec],
+    baseline_resolver: Optional[Callable[[str], Optional[str]]],
+    arweave_uploader: ArweaveUploader,
+    scratch_dir: str,
+    titan_id: str,
+) -> TierShipResult:
+    """Pack one tier's per-file diffs into a tarball + upload to Arweave.
+
+    Behavior-identical wrapper over build_tier + upload_tier (kept so existing
+    callers/tests are unchanged); the two halves are also used independently by
+    the Phase 2 pre-stage path (build ahead, upload on meditation).
+    """
+    result = build_tier(
+        tier=tier, event_id=event_id, event_type=event_type, specs=specs,
+        baseline_resolver=baseline_resolver, scratch_dir=scratch_dir,
+        titan_id=titan_id,
+    )
+    if result.error or result.tarball_path is None:
+        return result
+    return await upload_tier(
+        result, arweave_uploader=arweave_uploader, titan_id=titan_id,
+        event_id=event_id, event_type=event_type,
+    )
 
 
 # ── orchestrator ─────────────────────────────────────────────────────────
