@@ -19,6 +19,18 @@ replaced by the v3 attractor-state model (emotion as multi-level
 equilibrium over composite state, named after stable recurrence).
 §16 Options A-D in rFP_emot_cgn_v2.md are superseded by that work.
 
+✅ DEAD-CLUSTER TRAP FIXED 2026-05-31 (Maker: the live system must work, not
+wait for the weeks-away attractor model). `maybe_recenter` previously skipped
+any cluster with <5 hard-wins (`if len(vecs)<5: continue`) — so a slot that
+never won (LOVE on T1) was never moved → frozen at RNG-seed → never won
+(self-reinforcing monoculture; the 2026-04-24 fix repaired the wiring, not this).
+Now: anchors hard-update toward their won obs (keep semantic seed, never
+rescued); emergent slots soft-update by responsibility OR, when dead (<3 wins),
+are RESCUED to the worst-served observation (k-means++). This is clustering-
+algorithm hygiene, NOT the forbidden seed-tuning — fully data-driven. The v3
+attractor model remains the eventual successor; this makes the legacy layer
+function correctly meanwhile. See `tests/test_emot_cgn_dead_cluster_rescue.py`.
+
 Each cluster is a candidate emotion primitive. Seeded from hand-crafted
 anchors (FLOW, IMPASSE_TENSION, RESOLUTION) + 5 emergent slots (PEACE,
 CURIOSITY, GRIEF, WONDER, LOVE). Centroids drift as experience
@@ -183,8 +195,38 @@ class EmotionClusterer:
         self._emergence_threshold = 100   # n_observations to emerge
         self._recent_assignments: deque = deque(maxlen=CLUSTER_HISTORY_LEN)
         self._observation_buffer: deque = deque(maxlen=2000)  # for recenter
+        # ── Dead-cluster rescue + soft-assignment (2026-05-31, Maker) ──
+        # FIX for the k-means dead-cluster trap: the old recenter only updated
+        # clusters that hard-won ≥5 obs, so a slot that never wins (LOVE on T1)
+        # was never moved → frozen at its RNG-seed → never wins (self-reinforcing
+        # monoculture). Now recenter (a) soft-updates every centroid by
+        # responsibility (softmax over -distance, adaptive temperature) so dead
+        # slots drift, AND (b) RESCUES a still-starved EMERGENT slot by reseeding
+        # it to the worst-served buffered observation (k-means++ style). Anchors
+        # (FLOW/IMPASSE/RESOLUTION) keep their semantic seeds — soft-updated but
+        # never rescued. Data-driven (no hand-set positions) → honours
+        # emergence-over-determinism; this is a clustering-algorithm bug fix, NOT
+        # the forbidden seed-tuning.
+        self._starved_resp_frac = 0.05    # cluster is "starved" if its soft-mass
+                                          # share < 5% of uniform (12.5% for 8)
+        self._recenter_rescues = 0        # lifetime telemetry
+        # ── Recenter reachability fix (2026-05-31, Maker) ──
+        # The dead-cluster rescue above was DORMANT in production: the recenter
+        # that contains it needs ≥50 buffered obs, but the buffer is in-memory and
+        # wiped on every restart (RSS kills / redeploys) before it ever reaches 50
+        # → recenter hadn't fired in 14.6 days → LOVE stayed cold 40+ days. Three
+        # fixes make the rescue reachable:
+        #  (1) PERSIST the observation buffer (survives restarts → accumulates).
+        #  (2) ADAPTIVE heal cadence — daily (not weekly) recenter while any
+        #      emergent slot is dead, reverting to weekly once all have healed.
+        #  (3) very-overdue → low buffer threshold (cold-path safety net).
+        self._buffer_path = os.path.join(save_dir, "observation_buffer.npz")
+        self._heal_recenter_interval_s = 86400.0   # 1 day while a slot is dead
+        self._heal_nobs_floor = 50                 # emergent n_obs < this ⇒ "dead"
+        self._obs_since_buffer_save = 0
 
         self._load_state()
+        self._load_buffer()
 
     # ── Assignment ─────────────────────────────────────────────────
 
@@ -247,6 +289,13 @@ class EmotionClusterer:
                 self._observation_buffer.append(
                     (p_id, np.asarray(feature_vec[:FEATURE_DIM],
                                       dtype=np.float32).copy()))
+                # Persist the buffer incrementally so it SURVIVES restarts (incl.
+                # ungraceful RSS kills) — the fix for the recenter never reaching
+                # its obs threshold between restarts.
+                self._obs_since_buffer_save += 1
+                if self._obs_since_buffer_save >= 25:
+                    self._obs_since_buffer_save = 0
+                    self._save_buffer()
         except Exception as e:
             logger.debug("[EmotCluster] observe bookkeeping failed: %s", e)
         return (p_id, dist, conf)
@@ -274,7 +323,18 @@ class EmotionClusterer:
         """
         try:
             now = time.time()
-            if not force and (now - self._last_recenter_ts) < self._recenter_interval_s:
+            # ── Adaptive heal cadence — daily while any EMERGENT slot is dead
+            # (n_obs below the heal floor / not emerged), reverting to the normal
+            # weekly interval once all have healed. Lets LOVE recover in days, not
+            # weeks, then stops over-drifting healthy clusters.
+            has_dead = any(
+                (not self._clusters[p].is_emerged)
+                or self._clusters[p].n_observations < self._heal_nobs_floor
+                for p in EMOT_PRIMITIVES[3:]      # emergent slots only
+            )
+            effective_interval = (self._heal_recenter_interval_s if has_dead
+                                  else self._recenter_interval_s)
+            if not force and (now - self._last_recenter_ts) < effective_interval:
                 return False
             # BUG #10 follow-up (2026-04-24): observation_buffer is in-memory
             # only (not persisted across restarts). Post-restart, it fills at
@@ -284,35 +344,89 @@ class EmotionClusterer:
             # still at legacy 0.0 sentinel), lower the threshold to 10 so the
             # initial centroid unfreeze happens within ~1 hour. After that,
             # the full 50-obs threshold applies per the original design.
-            min_buffer = 10 if self._last_recenter_ts == 0.0 else 50
+            # Buffer threshold: normally 50 (confident recenter). First-fire OR
+            # very-overdue (>2× the effective interval — buffer not accumulating
+            # for some reason) → drop to 10 so the recenter still makes progress.
+            very_overdue = (now - self._last_recenter_ts) > 2.0 * effective_interval
+            min_buffer = 10 if (self._last_recenter_ts == 0.0 or very_overdue) else 50
             if len(self._observation_buffer) < min_buffer:
                 return False
-            by_cluster: dict[str, list] = {p: [] for p in EMOT_PRIMITIVES}
-            for p_id, vec in self._observation_buffer:
-                if p_id in by_cluster:
-                    by_cluster[p_id].append(vec)
+
+            # ── Recenter: anchor hard-update + emergent soft-update + rescue ──
+            vecs = np.stack([v for _, v in self._observation_buffer]).astype(np.float32)  # (N,150)
+            n_obs = vecs.shape[0]
+            centroids = np.stack(
+                [self._clusters[p].centroid for p in EMOT_PRIMITIVES]).astype(np.float32)  # (8,150)
+            dists = np.linalg.norm(vecs[:, None, :] - centroids[None, :, :], axis=2)  # (N,8)
+            hard_assign = dists.argmin(axis=1)                       # (N,) nearest cluster
+            hard_wins = np.bincount(hard_assign, minlength=NUM_PRIMITIVES)  # (8,)
+            nearest_d = dists.min(axis=1)                            # (N,)
+            # Soft responsibilities (for EMERGENT-slot updates only): softmax over
+            # -distance at adaptive temperature = median nearest-distance (scales
+            # with the felt-space; emergence-over-determinism, not a hardcoded const).
+            temp = max(float(np.median(nearest_d)), 1e-3)
+            logits = -dists / temp
+            logits -= logits.max(axis=1, keepdims=True)
+            resp = np.exp(logits)
+            resp /= (resp.sum(axis=1, keepdims=True) + 1e-9)         # (N,8)
+
             updates = 0
-            for p_id, vecs in by_cluster.items():
-                if len(vecs) < 5:
-                    continue  # too few to move confidently
-                stack = np.stack(vecs).astype(np.float32)
-                new_centroid = stack.mean(axis=0)
-                old_centroid = self._clusters[p_id].centroid
-                # Blend 70% old + 30% new to avoid violent drift
-                blended = 0.7 * old_centroid + 0.3 * new_centroid
-                drift = float(np.linalg.norm(blended - old_centroid))
-                self._clusters[p_id].centroid = blended.astype(np.float32)
-                updates += 1
-                logger.debug("[EmotCluster] recentered '%s' drift=%.4f n=%d",
-                             p_id, drift, len(vecs))
+            rescues = 0
+            used = np.zeros(n_obs, dtype=bool)        # obs already used for a rescue
+            running = centroids.copy()                # greedy k-means++ rescue state
+            DEAD_WINS = 3                             # < this many hard wins ⇒ dead
+            for k, p_id in enumerate(EMOT_PRIMITIVES):
+                old = self._clusters[p_id].centroid
+                if k < 3:
+                    # ── ANCHOR — hard-update toward its OWN assigned obs only
+                    # (preserves the semantic seed; no soft drag toward far data).
+                    # If starved, leave the seed untouched. NEVER rescued.
+                    own = vecs[hard_assign == k]
+                    if own.shape[0] >= 5:
+                        blended = (0.7 * old + 0.3 * own.mean(axis=0)).astype(np.float32)
+                        self._clusters[p_id].centroid = blended
+                        running[k] = blended
+                        updates += 1
+                    continue
+                if hard_wins[k] >= DEAD_WINS:
+                    # ── EMERGENT slot with real wins — soft (responsibility-
+                    # weighted) update so it drifts toward where it's relevant.
+                    w = resp[:, k]
+                    weighted_mean = (w[:, None] * vecs).sum(axis=0) / (w.sum() + 1e-9)
+                    blended = (0.7 * old + 0.3 * weighted_mean).astype(np.float32)
+                    self._clusters[p_id].centroid = blended
+                    running[k] = blended
+                    updates += 1
+                else:
+                    # ── DEAD emergent slot — rescue: reseed to the worst-served
+                    # buffered observation (max distance to nearest running
+                    # centroid) so it moves to where real under-served felt-states
+                    # are and starts winning. The fix for LOVE-never-fires.
+                    rdist = np.linalg.norm(
+                        vecs[:, None, :] - running[None, :, :], axis=2).min(axis=1)
+                    rdist[used] = -1.0
+                    worst = int(rdist.argmax())
+                    if rdist[worst] <= 0:
+                        continue
+                    noise = np.random.normal(0.0, 0.01, size=FEATURE_DIM).astype(np.float32)
+                    reseeded = (vecs[worst] + noise).astype(np.float32)
+                    self._clusters[p_id].centroid = reseeded
+                    running[k] = reseeded
+                    used[worst] = True
+                    rescues += 1
+                    self._recenter_rescues += 1
+                    logger.info(
+                        "[EmotCluster] RESCUED dead '%s' → worst-served obs "
+                        "(hard_wins=%d, served_dist=%.3f)",
+                        p_id, int(hard_wins[k]), float(rdist[worst]))
             self._last_recenter_ts = now
-            # Snapshot + clear buffer
             self._snapshot()
             self._observation_buffer.clear()
             self.save_state()
-            if updates:
-                logger.info("[EmotCluster] recentered %d clusters (force=%s)",
-                            updates, force)
+            if updates or rescues:
+                logger.info(
+                    "[EmotCluster] recentered: %d updated, %d rescued "
+                    "(temp=%.3f, force=%s)", updates, rescues, temp, force)
             return True
         except Exception as e:
             logger.warning("[EmotCluster] recenter failed: %s", e)
@@ -380,6 +494,9 @@ class EmotionClusterer:
             with open(tmp, "w") as f:
                 json.dump(data, f)
             os.replace(tmp, self._state_path)
+            # Persist the buffer alongside (graceful-shutdown durability + post-
+            # recenter clear is made durable here).
+            self._save_buffer()
         except Exception as e:
             logger.warning("[EmotCluster] save_state failed: %s", e)
 
@@ -418,6 +535,47 @@ class EmotionClusterer:
                         self._state_path)
         except Exception as e:
             logger.warning("[EmotCluster] _load_state failed: %s", e)
+
+    def _save_buffer(self) -> None:
+        """Persist the observation buffer (compressed npz) so it survives restarts.
+
+        Capped to the most-recent 600 obs (plenty for the ≤50-obs recenter, keeps
+        the file small). Writes even when empty so a post-recenter clear is durable.
+        """
+        try:
+            items = list(self._observation_buffer)[-600:]
+            tmp = self._buffer_path + ".tmp"
+            with open(tmp, "wb") as f:
+                if items:
+                    labels = np.array([str(p) for p, _ in items])
+                    vecs = np.stack([v for _, v in items]).astype(np.float32)
+                else:
+                    labels = np.array([], dtype="<U16")
+                    vecs = np.zeros((0, FEATURE_DIM), dtype=np.float32)
+                np.savez_compressed(f, labels=labels, vecs=vecs)
+            os.replace(tmp, self._buffer_path)
+        except Exception as e:
+            logger.debug("[EmotCluster] _save_buffer failed: %s", e)
+
+    def _load_buffer(self) -> None:
+        """Restore the persisted observation buffer on boot (the reachability fix)."""
+        try:
+            if not os.path.exists(self._buffer_path):
+                return
+            with np.load(self._buffer_path, allow_pickle=False) as z:
+                labels = z["labels"]
+                vecs = z["vecs"]
+            n = 0
+            for p, v in zip(labels.tolist(), vecs):
+                arr = np.asarray(v, dtype=np.float32)
+                if arr.shape[0] == FEATURE_DIM:
+                    self._observation_buffer.append((str(p), arr.copy()))
+                    n += 1
+            if n:
+                logger.info("[EmotCluster] Restored %d buffered obs from %s "
+                            "(recenter reachable across restart)", n, self._buffer_path)
+        except Exception as e:
+            logger.debug("[EmotCluster] _load_buffer failed: %s", e)
 
     def _snapshot(self) -> None:
         """Append a compact snapshot to cluster_snapshots.jsonl for audit."""

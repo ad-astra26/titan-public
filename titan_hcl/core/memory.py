@@ -448,7 +448,7 @@ class TieredMemoryGraph:
                     seen_ids.add(node["id"])
 
         # 3. Local keyword fallback for anything not found above
-        local_hits = self._local_keyword_search(prompt)
+        local_hits = self._local_keyword_search(prompt, top_k=top_k)
         for node in local_hits:
             if node["id"] not in seen_ids:
                 if node["status"] == "persistent":
@@ -768,29 +768,41 @@ class TieredMemoryGraph:
                 return node
         return None
 
-    def _local_keyword_search(self, prompt: str) -> List[Dict]:
-        """Fallback keyword search over local node store."""
-        results = []
-        prompt_lower = prompt.lower()
-        prompt_words = set(prompt_lower.split())
+    def _local_keyword_search(self, prompt: str, top_k: int = 10) -> List[Dict]:
+        """Fallback keyword search over local node store — bounded to top_k.
 
+        2026-05-31 (rFP_bus_payload_contracts §3.1): previously UNBOUNDED —
+        it appended EVERY node sharing ≥1 meaningful word with the prompt.
+        For a common greeting this matched ~7,100 of ~7,700 nodes, and the
+        `query` work-RPC then shipped all of them (full text) as the reply →
+        a 19.7 MB bus frame that exceeded MAX_FRAME_SIZE (16 MB) → frame
+        dropped → recall silently returned nothing on the chat hot path.
+        FAISS (layer 1) and mempool (layer 2) already cap to top_k; this
+        fallback now does too — scored by meaningful-word overlap (desc) so
+        the strongest keyword matches survive the cap, not arbitrary
+        dict-iteration order.
+        """
+        prompt_words = set(prompt.lower().split())
+        stopwords = {"the", "a", "an", "is", "it", "in", "to", "and", "of",
+                     "for", "do", "you", "my"}
+        meaningful_prompt = prompt_words - stopwords
+        if not meaningful_prompt:
+            return []
+
+        scored: list[tuple[int, Dict]] = []
         for v in self._node_store.values():
             if v.get("type") != "MemoryNode":
                 continue
             if v.get("status") not in ("mempool", "persistent"):
                 continue
-
-            # Score by word overlap between prompt and stored content
             content = f"{v.get('user_prompt', '')} {v.get('agent_response', '')}".lower()
             content_words = set(content.split())
-            overlap = prompt_words & content_words
-            # Require at least one meaningful word match (skip stopwords)
-            stopwords = {"the", "a", "an", "is", "it", "in", "to", "and", "of", "for", "do", "you", "my"}
-            meaningful = overlap - stopwords
-            if meaningful:
-                results.append(v)
+            overlap = len(meaningful_prompt & content_words)
+            if overlap:
+                scored.append((overlap, v))
 
-        return results
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [v for _, v in scored[:max(1, top_k)]]
 
     # -------------------------------------------------------------------------
     # Mempool Operations (local-only, fast)
