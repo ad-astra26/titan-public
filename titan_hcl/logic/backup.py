@@ -1027,6 +1027,23 @@ class RebirthBackup:
         ("data/outer_body_checkpoint.bin", "outer_body_checkpoint.bin"),                # 68B
         ("data/outer_mind_checkpoint.bin", "outer_mind_checkpoint.bin"),                # 148B
         ("data/outer_spirit_checkpoint.bin", "outer_spirit_checkpoint.bin"),            # 388B
+        # ─── Configuration (CONDITIONAL — SPEC §24.4.B / D-SPEC-147, 2026-05-31) ──────
+        # titan_hcl/config.toml — the Titan's full runtime config. Included so a
+        # sovereign resurrection restores a FULLY-configured Titan that boots ready
+        # (inference/comms/all settings read from the restored config — no re-prompt).
+        # Gated by [backup].backup_config_toml (default FALSE — opt-in): the producer
+        # SKIPS it unless enabled (see create_personality_archive); the installer turns
+        # it on for a mainnet install + strongly recommends encryption. Listing it here
+        # (statically) is also what lets the restore inverse-map
+        # (backup_restore.build_arc_to_target) map the "config.toml" archive entry back
+        # to titan_hcl/config.toml. Dev↔public divergence: on the maintainer fleet
+        # config.toml is kept SECRET-FREE (untracked + scrubbed 2026-05-31; real secrets
+        # live out-of-repo in ~/.titan/secrets.toml, never backed up). A public install
+        # carries the user's real creds → with encryption OFF (Mode A) an enabled
+        # config-backup ships them to Arweave in the clear, hence opt-in + the encryption
+        # recommendation + warning. Identity keypair is NEVER backed up (§24.4.A /
+        # G16(8)); config.toml carries no keypair.
+        ("titan_hcl/config.toml", "config.toml"),
     ]
 
     # Filename patterns excluded from ALL archives — historical dev backups that
@@ -1147,8 +1164,18 @@ class RebirthBackup:
                     return None
                 return ti
 
+            # config.toml inclusion is opt-IN per [backup].backup_config_toml
+            # (default FALSE). A public-install user who leaves it off must retain
+            # config.toml themselves + supply it alongside Shard-1 at resurrection.
+            _backup_cfg = (self._full_config or {}).get("backup", {}) or {}
+            include_config_toml = bool(_backup_cfg.get("backup_config_toml", False))
+
             with tarfile.open(output_path, "w:gz", compresslevel=9) as tar:
                 for source_path, archive_name in self.PERSONALITY_PATHS:
+                    if archive_name == "config.toml" and not include_config_toml:
+                        logger.debug("[Backup] config.toml excluded "
+                                     "([backup].backup_config_toml=false)")
+                        continue
                     # Skip large experience DBs for Arweave tier
                     if arweave_tier and archive_name in self.ARWEAVE_DAILY_EXCLUDE:
                         logger.debug("[Backup] Arweave tier: skipping %s", archive_name)
