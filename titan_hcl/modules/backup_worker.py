@@ -311,10 +311,6 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         "send_queue": send_queue,
         "name": name,
         "full_config": full_config,  # Phase 9 — offhost mirror reads [backup.mirror]
-        # Phase 1 (2026-05-31) single-flight guard: backup cascades run OFF the
-        # recv loop (daemon thread) so the multi-minute diff/upload never starves
-        # the bus socket → no BrokenPipe → no shm_pid_dead restart loop.
-        "_backup_lock": threading.Lock(),
     }
 
     last_heartbeat = time.time()
@@ -330,11 +326,6 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         worker_name=name, layer="L3", send_queue=send_queue,
         save_state_cb=_b1_save_state,
     )
-
-    # Phase 2 (2026-05-31): pre-stage the daily event off the recv loop so the
-    # meditation ship is fast + never blocks the bus (the diff-build that used to
-    # crash the worker now happens here, ahead of time).
-    _start_stager(state)
 
     while True:
         try:
@@ -394,11 +385,11 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         try:
             if msg_type == bus.MEDITATION_COMPLETE:
                 _send_heartbeat(send_queue, name, state_writer=_state_writer)
-                _dispatch_backup_offloop(state, _handle_meditation, msg)
+                _handle_meditation(state, msg)
                 last_heartbeat = time.time()
             elif msg_type == bus.BACKUP_TRIGGER_MANUAL:
                 _send_heartbeat(send_queue, name, state_writer=_state_writer)
-                _dispatch_backup_offloop(state, _handle_manual, msg)
+                _handle_manual(state, msg)
                 last_heartbeat = time.time()
             # Ignore other msg types — don't complain (bus delivers many)
         except Exception as e:
@@ -408,97 +399,6 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     logger.info("[BackupWorker] Exiting")
     with suppress(Exception):
         loop.close()
-
-
-# ── Off-loop dispatch (Phase 1, 2026-05-31) ───────────────────────────────
-
-def _dispatch_backup_offloop(state: dict, handler, msg: dict) -> None:
-    """Run a backup cascade handler OFF the recv-loop thread.
-
-    The unified_v2 cascade reads the big mutable DBs (inner_memory.db ~1.1GB,
-    experience DBs) to diff against the baseline — seconds-to-minutes of IO+CPU.
-    Running it inline on the recv loop (the prior `_handle_*` call here) stopped
-    the worker reading its bus socket → broker silent-hang-defense BrokenPipe →
-    Guardian shm_pid_dead → restart loop → backup never completed → proof_day
-    `post_generation_failed`. We spawn it in a daemon thread so the recv loop
-    keeps reading + heartbeating throughout.
-
-    Single-flight: a non-blocking lock; a 2nd trigger while one runs is skipped
-    (the daily CAS gate inside the cascade already enforces one ship/day). The
-    cascade reuses the worker's single asyncio loop (state['loop']) — only ever
-    driven by ONE backup thread at a time — so RebirthBackup's lazily-created
-    asyncio.Locks stay loop-coherent (a fresh loop per thread would trip the
-    cross-loop Future hazard).
-    """
-    lock = state["_backup_lock"]
-    if not lock.acquire(blocking=False):
-        logger.info(
-            "[BackupWorker] backup already in flight — skipping %s trigger "
-            "(single-flight; daily CAS gate enforces one ship/day)",
-            msg.get("type", "?"))
-        return
-
-    def _runner():
-        try:
-            asyncio.set_event_loop(state["loop"])
-            handler(state, msg)
-        except Exception as e:  # noqa: BLE001
-            logger.error(
-                "[BackupWorker] off-loop backup cascade failed: %s", e,
-                exc_info=True)
-        finally:
-            lock.release()
-
-    threading.Thread(
-        target=_runner, name="backup-cascade-offloop", daemon=True).start()
-
-
-# ── Phase 2 pre-stage daemon (2026-05-31) ─────────────────────────────────
-
-def _maybe_build_stage(state: dict) -> None:
-    """Ensure a fresh pre-built event exists for today (build it if not).
-
-    The heavy diff/pack runs HERE, on the stager's daemon thread, ahead of the
-    first meditation — so the meditation ship is fast + never blocks the recv
-    loop. The existing full_ship.encode_diff already race-safe-snapshots the live
-    DBs, so reading them mid-write is safe. Gate-aware: _build_staged_event_v2
-    returns None when backup_arweave is disabled.
-    """
-    backup = state["backup"]
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    cur = getattr(backup, "_staged_event", None)
-    if cur is not None and cur.get("date") == today:
-        return  # already staged for today
-    # Don't pile a heavy build on top of a meditation cascade already running
-    # (single-flight with the off-loop ship/inline-build).
-    if state["_backup_lock"].locked():
-        logger.debug("[BackupWorker] stager: cascade in flight — deferring build")
-        return
-    weekday = datetime.now(timezone.utc).weekday()
-    staged = backup._build_staged_event_v2(weekday)
-    if staged is not None:
-        backup.stage_built_event(staged, today)
-
-
-def _start_stager(state: dict) -> None:
-    """Start the Phase 2 background stager thread."""
-    poll_s = 1200.0  # 20 min — cheap no-op when a fresh stage exists; catches
-                     # the UTC day rollover well before the first meditation.
-
-    def _loop():
-        time.sleep(60.0)   # let boot + boot-dry-run settle first
-        while True:
-            try:
-                _maybe_build_stage(state)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "[BackupWorker] stager cycle failed: %s", e, exc_info=True)
-            time.sleep(poll_s)
-
-    threading.Thread(target=_loop, name="backup-stager", daemon=True).start()
-    logger.info(
-        "[BackupWorker] Phase 2 stager started (poll=%.0fs) — pre-builds the "
-        "daily event off-loop so meditation ships fast", poll_s)
 
 
 # ── Meditation-triggered cascade (Phase 2 §5.3) ───────────────────────────
