@@ -406,6 +406,26 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
             "[MetaTeacher] PeerExchangeClient load failed (continuing default): %s",
             _pe_err)
 
+    # ── Phase G (RFP_cgn_enhancements §9.3 / proto-SPEC §9.5c) — binding store ──
+    # The teacher is the SOLE writer of reasoning_bindings.db (§G21): on each
+    # critiqued chain it mints/refines a ReasoningBinding (context_signature →
+    # recommended primitive) that the meta-reasoning policy reads READ-ONLY and
+    # turns into a logit bias. It also applies the G.iv recognized/produced
+    # counters reported by the policy in META_CHAIN_COMPLETE.binding_outcome.
+    binding_store = None
+    try:
+        from titan_hcl.logic.reasoning_binding import ReasoningBindingStore
+        binding_store = ReasoningBindingStore(
+            db_path=os.path.join(data_dir, "meta_teacher", "reasoning_bindings.db"))
+        logger.info(
+            "[MetaTeacher] ReasoningBindingStore ready (Phase G — %d bindings)",
+            binding_store.count())
+    except Exception as _rb_err:
+        logger.warning(
+            "[MetaTeacher] ReasoningBindingStore init failed (Phase G disabled): %s",
+            _rb_err)
+        binding_store = None
+
     inference_cfg = config.get("inference", {}) or {}
     # Phase 3 Chunk ψ (D-SPEC-88, 2026-05-18) — LLM calls now route through
     # /v4/llm-distill. Old (llm_client, llm_model) replaced by
@@ -803,6 +823,25 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
 
         teacher.total_observed += 1
 
+        # ── Phase G (RFP_cgn_enhancements §9.3 G.iv) — binding outcome counters ──
+        # The policy reports, per chain, whether it CHOSE a matched binding's
+        # recommended primitive (recognized) and whether the UNBIASED policy
+        # already ranked it top (produced). Apply BEFORE the sampling gate so the
+        # curriculum advances for every chain, not just critiqued ones. Teacher is
+        # the sole writer (§G21) — the policy never writes the store.
+        if binding_store is not None:
+            _bo = payload.get("binding_outcome") or {}
+            _bid = int(_bo.get("binding_id", -1))
+            if _bid >= 0:
+                try:
+                    if _bo.get("produced"):
+                        binding_store.record_produced(_bid)
+                    elif _bo.get("recognized"):
+                        binding_store.record_recognized(_bid)
+                except Exception as _bo_err:
+                    logger.debug(
+                        "[MetaTeacher] binding outcome apply failed: %s", _bo_err)
+
         # Phase A: outer_summary / step_arguments may ride in the payload.
         outer_summary = payload.get("outer_summary")
 
@@ -979,6 +1018,40 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
             float(fb_payload.get("quality_score", 0.0) or 0.0),
             float(fb_payload.get("reward_bonus", 0.0) or 0.0),
             _sug_count, bool(fb_payload.get("llm_ok", False)))
+
+        # ── Phase G (RFP_cgn_enhancements §9.3 G.ii) — mint/refine binding ──
+        # When the critique recommends a primitive AND the chain carried its
+        # numeric context_signature, mint (or corroborate) a ReasoningBinding in
+        # that cosine space: "in this inner context, the proper next primitive is
+        # X." The policy reads these RO and biases toward them — the strong
+        # channel the scalar reward_bonus (≤0.05) never provided. The legacy
+        # META_TEACHER_FEEDBACK reward/suggestion path is KEPT below (complementary).
+        if binding_store is not None:
+            try:
+                from titan_hcl.logic.reasoning_binding import BINDING_PRIMITIVES
+                _ctx_sig = payload.get("context_signature")
+                _suggested = fb_payload.get("suggested_primitives") or []
+                if _ctx_sig and _suggested:
+                    _rec_prim = str(_suggested[0]).split(".", 1)[0].upper()
+                    if _rec_prim in BINDING_PRIMITIVES:
+                        _principles = fb_payload.get("principles_invoked") or []
+                        _cats = fb_payload.get("critique_categories") or []
+                        _label = str(
+                            (_principles[0] if _principles else
+                             (_cats[0] if _cats else "teacher_recommendation")))[:64]
+                        _sub = str(_suggested[0]).split(".", 1)[1] if "." in str(
+                            _suggested[0]) else ""
+                        _mid = binding_store.mint_or_refine(
+                            _ctx_sig, _rec_prim, recommended_sub_action=_sub,
+                            principle_label=_label)
+                        logger.info(
+                            "[MetaTeacher] binding mint/refine id=%s prim=%s "
+                            "label=%s domain=%s (n_bindings=%d)",
+                            _mid, _rec_prim, _label,
+                            payload.get("domain", "general"), binding_store.count())
+            except Exception as _mint_err:
+                logger.debug(
+                    "[MetaTeacher] binding mint failed: %s", _mint_err)
 
         # Persist-first, publish-second: write the critique to disk before
         # emitting bus messages. Guarantees that a crash between emit and
