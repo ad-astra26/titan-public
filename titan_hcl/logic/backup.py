@@ -18,6 +18,7 @@ import os
 import tarfile
 import time
 from contextlib import suppress
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -117,8 +118,36 @@ class RebirthBackup:
         self._soul_cas_lock = None         # asyncio.Lock, lazy
         self._timechain_cas_lock = None    # asyncio.Lock, lazy
 
+        # Phase 2 pre-stage (2026-05-31): the backup worker's stager builds the
+        # day's event off the recv loop and parks it here; on_meditation_complete
+        # consumes it for a fast ship. _stage_lock guards the stager↔meditation
+        # handoff (a threading.Lock — both run on worker daemon threads, not the
+        # asyncio loop). {"staged": StagedEvent, "date": "YYYY-MM-DD"} or None.
+        self._staged_event = None
+        self._stage_lock = threading.Lock()
+
         # Load persisted backup state if available
         self._load_backup_state()
+
+    def stage_built_event(self, staged, day: str) -> None:
+        """Stager entry-point (called from the worker's background thread): park a
+        freshly-built StagedEvent for today's ship. Won't clobber an unconsumed
+        fresh stage for the same day."""
+        with self._stage_lock:
+            cur = self._staged_event
+            if cur is not None and cur.get("date") == day:
+                return  # already have a fresh stage for today
+            self._staged_event = {"staged": staged, "date": day}
+
+    def _take_fresh_staged_event(self, day: str):
+        """Atomically take + clear today's staged event (or None if absent/stale).
+        Consumed exactly once; a stale (prior-day) stage is dropped."""
+        with self._stage_lock:
+            entry = self._staged_event
+            self._staged_event = None
+            if entry is not None and entry.get("date") == day:
+                return entry.get("staged")
+            return None
 
     def _get_personality_cas_lock(self):
         """Lazy-create the personality-date CAS lock on first async use."""
@@ -271,7 +300,21 @@ class RebirthBackup:
                 )
                 return
             try:
-                shipped = await self._run_unified_event_v2(weekday=weekday)
+                # Phase 2 (2026-05-31): prefer a fresh pre-staged event (built
+                # off-loop by the worker's stager ahead of this meditation) → fast
+                # ship, no inline diff-build on the bus path. Fall back to the
+                # inline build when there's no fresh stage (cold start) or the
+                # stage is stale (baseline moved since build → ship returns False).
+                _staged = self._take_fresh_staged_event(today)
+                if _staged is not None:
+                    shipped = await self._ship_staged_event_v2(_staged)
+                    if not shipped:
+                        logger.info(
+                            "[Backup] §24 staged ship declined (stale/failed) — "
+                            "falling back to inline build this meditation")
+                        shipped = await self._run_unified_event_v2(weekday=weekday)
+                else:
+                    shipped = await self._run_unified_event_v2(weekday=weekday)
             except Exception as e:
                 logger.exception(
                     "[Backup] §24 unified_v2 pipeline raised — NO legacy "
@@ -2293,6 +2336,131 @@ class RebirthBackup:
                     "[Backup] §24 unified_v2: baseline working dir refresh "
                     "failed: %s (next incremental may full-ship)", e,
                 )
+        return True
+
+    # ── Phase 2 pre-stage (2026-05-31) ─────────────────────────────────────
+    #
+    # Splits the unified_v2 event into a heavy BUILD (snapshot+diff+pack — run by
+    # the backup worker's stager OFF the recv loop, ahead of the first meditation)
+    # and a fast SHIP (upload staged tarballs + ZK + manifest — run on meditation).
+    # Removes the multi-minute diff-build from the bus-blocking meditation path.
+    # _run_unified_event_v2 above is the unchanged inline path (manual trigger +
+    # cold-start fallback when no fresh stage exists).
+
+    def _build_staged_event_v2(self, weekday: int):
+        """Pre-BUILD a unified event (no upload, no manifest mutation). Returns a
+        StagedEvent or None (arweave gate off / manifest unloadable). Mirrors
+        _run_unified_event_v2's spec/resolver wiring."""
+        from titan_hcl.logic.backup_unified_manifest import UnifiedManifest
+        from titan_hcl.logic.backup_upload_pipeline import build_unified_event
+        try:
+            _budget = (self._full_config or {}).get("mainnet_budget", {}) or {}
+        except Exception:
+            _budget = {}
+        if not _budget.get("backup_arweave_enabled", False):
+            logger.debug("[Backup] §24 build-stage: backup_arweave_enabled=false")
+            return None
+        try:
+            manifest = UnifiedManifest.load(
+                titan_id=self._titan_id, base_dir="data")
+        except ValueError as e:
+            logger.error("[Backup] §24 build-stage: manifest load failed: %s", e)
+            return None
+        p_specs = self._tier_specs_from_paths(self.PERSONALITY_PATHS)
+        t_specs = self._tier_specs_from_paths(
+            self.TIMECHAIN_PATHS, format_hint="timechain_bin")
+        s_specs = (self._tier_specs_from_paths(self.WEEKLY_EXTRA_PATHS)
+                   if weekday == 6 else None)
+        base_dir = self._baseline_working_dir()
+
+        def _baseline_resolver(component, arc_name):
+            candidate = os.path.join(base_dir, arc_name)
+            return candidate if os.path.exists(candidate) else None
+
+        staged = build_unified_event(
+            titan_id=self._titan_id, manifest=manifest,
+            personality_specs=p_specs, timechain_specs=t_specs,
+            soul_specs=s_specs, baseline_resolver=_baseline_resolver,
+        )
+        logger.info(
+            "[Backup] §24 staged event BUILT: id=%s type=%s (off-loop; "
+            "awaiting meditation to ship)", staged.event_id[:8],
+            staged.event_type)
+        return staged
+
+    async def _ship_staged_event_v2(self, staged) -> bool:
+        """SHIP a pre-built StagedEvent (fast, on meditation). Reloads the
+        manifest fresh for the staleness check + append. Returns True if shipped;
+        False on stale-baseline (caller rebuilds) / gate-off / failure."""
+        from titan_hcl.logic.backup_unified_manifest import UnifiedManifest
+        from titan_hcl.logic.backup_upload_pipeline import ship_staged_event
+        store = self._ensure_arweave_store_for_unified()
+        if store is None:
+            logger.warning("[Backup] §24 ship-stage: no ArweaveStore available")
+            return False
+        try:
+            manifest = UnifiedManifest.load(
+                titan_id=self._titan_id, base_dir="data")
+        except ValueError as e:
+            logger.error("[Backup] §24 ship-stage: manifest load failed: %s", e)
+            return False
+
+        async def _arweave_upload(data: bytes, tags: dict) -> str:
+            import tempfile
+            with tempfile.NamedTemporaryFile(
+                delete=False, suffix=".tar.gz",
+                prefix=f"titan_unified_{self._titan_id}_",
+            ) as f:
+                f.write(data)
+                tmp_path = f.name
+            try:
+                tx = await store.upload_file(tmp_path, tags=tags)
+                if not tx:
+                    raise RuntimeError(
+                        "ArweaveStore.upload_file returned empty tx_id")
+                return tx
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+        async def _v3_chain_commit(event_id, ts, event_type, event_root,
+                                   components, prev_sig):
+            return await self.commit_event_v3_chain(
+                event_id=event_id, ts=ts, event_type=event_type,
+                event_merkle_root=event_root, components=components,
+                prev_sig=prev_sig)
+
+        def _bus_emit(name: str, payload: dict) -> None:
+            try:
+                bus = getattr(self, "bus", None) or getattr(self, "_bus", None)
+                if bus is not None and hasattr(bus, "emit"):
+                    bus.emit(name, payload)
+            except Exception:
+                pass
+
+        result = await ship_staged_event(
+            staged, manifest=manifest, arweave_uploader=_arweave_upload,
+            zk_committer=_v3_chain_commit, bus_emit=_bus_emit)
+
+        if result.status == "stale_baseline":
+            logger.info(
+                "[Backup] §24 staged event STALE (baseline moved since build) — "
+                "discarding, stager will rebuild: %s", result.skipped_reason)
+            return False
+        if result.status != "shipped":
+            logger.warning(
+                "[Backup] §24 staged ship NOT shipped: status=%s errors=%s",
+                result.status, result.errors)
+            return False
+        if result.event_type == "baseline":
+            try:
+                self._refresh_baseline_working_dir()
+            except Exception as e:
+                logger.warning(
+                    "[Backup] §24 ship-stage: baseline working dir refresh "
+                    "failed: %s (next incremental may full-ship)", e)
         return True
 
     # ── Local diff/baseline event (L5, 2026-05-14) ─────────────────────────
