@@ -1993,8 +1993,6 @@ def emit_meta_chain_complete(
     final_observation: Optional[dict] = None,
     outer_summary: Optional[dict] = None,
     step_arguments: Optional[list] = None,
-    context_signature: Optional[list] = None,
-    binding_outcome: Optional[dict] = None,
 ) -> bool:
     """Send META_CHAIN_COMPLETE to meta_teacher (and any other subscribers).
     Called from meta_reasoning._conclude_chain after all existing hooks.
@@ -2031,15 +2029,6 @@ def emit_meta_chain_complete(
             payload["outer_summary"] = dict(outer_summary)
         if step_arguments:
             payload["step_arguments"] = list(step_arguments)
-        # Phase G additions (RFP_cgn_enhancements §9.3) — the numeric context
-        # signature the policy used, so the teacher mints a binding in the SAME
-        # cosine space; and the per-chain binding outcome so the teacher (sole
-        # writer) applies the G.iv recognized/produced counters. Both optional —
-        # legacy-chain payloads stay byte-for-byte compatible when absent.
-        if context_signature is not None:
-            payload["context_signature"] = list(context_signature)
-        if binding_outcome:
-            payload["binding_outcome"] = dict(binding_outcome)
         msg = {
             "type": META_CHAIN_COMPLETE,
             "src": src, "dst": "all", "ts": time.time(), "rid": None,

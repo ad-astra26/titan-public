@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import state as install_state
+from .backup_config import run_backup_config_phase
 from .binaries import run_binaries_phase
 from .comms import run_comms_phase
 from .console import run_console_phase
@@ -222,6 +223,8 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
          lambda: run_binaries_phase(install_root, tag=tag or "main", build_rust=build_rust)),
         (PhaseDef("phase_cfg", "Seed config.toml + chat auth key", "W1.f", None),
          lambda: run_config_seed_phase(install_root)),
+        (PhaseDef("phase_backup", "Sovereign backup posture (encryption + config-in-backup)", "W1.5/§24.4.B", None),
+         lambda: run_backup_config_phase(install_root, mode, prompter=prompter, default=default)),
         (PhaseDef("phase_4", "Inference autodetect", "W1.c", None),
          lambda: run_inference_phase(default=default, install_root=install_root, prompter=prompter)),
         (PhaseDef("phase_5", "Comms (Telegram / X)", "W1.d", None),

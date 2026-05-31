@@ -484,6 +484,54 @@ def test_comms_phase_via_scripted_full_optins(monkeypatch):
     assert ("twitter_social", "webshare_static_url", _WEBSHARE) in rec
 
 
+# ── backup-config phase (W1.5 / §24.4.B — D-SPEC-147) ────────────────────
+from setup_titan.backup_config import run_backup_config_phase  # noqa: E402
+
+
+def _seed_backup_config(tmp_path):
+    d = tmp_path / "titan_hcl"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.toml").write_text(
+        "[backup]\nencryption_enabled = false\nbackup_config_toml = false\n")
+    return tmp_path
+
+
+def test_backup_config_mainnet_opt_in(tmp_path):
+    root = _seed_backup_config(tmp_path)
+    pr = ScriptedPrompter({"encrypt_backups": True, "backup_config_toml": True})
+    res = run_backup_config_phase(root, Mode.MAINNET, prompter=pr, default=False)
+    assert all(r.severity != "fail" for r in res)
+    txt = (root / "titan_hcl" / "config.toml").read_text()
+    assert "encryption_enabled = true" in txt
+    assert "backup_config_toml = true" in txt
+
+
+def test_backup_config_mainnet_opt_out_warns(tmp_path):
+    root = _seed_backup_config(tmp_path)
+    pr = ScriptedPrompter({"encrypt_backups": False, "backup_config_toml": False})
+    res = run_backup_config_phase(root, Mode.MAINNET, prompter=pr, default=False)
+    txt = (root / "titan_hcl" / "config.toml").read_text()
+    assert "encryption_enabled = false" in txt
+    assert "backup_config_toml = false" in txt
+    assert any(r.severity == "warn" for r in res)  # encryption-off surfaces a warn
+
+
+def test_backup_config_default_does_not_prompt(tmp_path):
+    # --default curates (encrypt + include) WITHOUT prompting — an empty
+    # ScriptedPrompter raises KeyError if any prompt is reached.
+    root = _seed_backup_config(tmp_path)
+    run_backup_config_phase(root, Mode.MAINNET, prompter=ScriptedPrompter({}), default=True)
+    txt = (root / "titan_hcl" / "config.toml").read_text()
+    assert "encryption_enabled = true" in txt and "backup_config_toml = true" in txt
+
+
+def test_backup_config_skipped_off_mainnet(tmp_path):
+    root = _seed_backup_config(tmp_path)
+    res = run_backup_config_phase(root, Mode.LOCAL, prompter=ScriptedPrompter({}), default=False)
+    assert len(res) == 1 and "mainnet-only" in res[0].detail
+    assert "encryption_enabled = false" in (root / "titan_hcl" / "config.toml").read_text()
+
+
 def test_install_accepts_no_tui_flag():
     args = build_parser().parse_args(["install", "--no-tui", "--mode", "local"])
     assert args.no_tui is True

@@ -334,19 +334,6 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
             _p8_init_err)
         _concept_edge_detector = None
 
-    # ── Phase H (RFP_cgn_enhancements §H) EdgeDetector: social.concept_grounded ──
-    # Fires once per first grounding of an events-teacher-derived social concept
-    # (the `social` consumer). NOT primed at boot (social concepts aren't vocab
-    # rows) — recurrence-gating happens producer-side in events_teacher, so the
-    # first time a recurring concept arrives here it should fire.
-    try:
-        _social_concept_edge_detector = _P7EdgeDet()
-    except Exception as _h_init_err:
-        logger.warning(
-            "[META-CGN] Phase H social.concept_grounded EdgeDetector init failed: %s",
-            _h_init_err)
-        _social_concept_edge_detector = None
-
     # ── Language stats (refreshed every 30s, broadcast for inner-trinity) ──
     language_stats = update_language_stats(db_path, cached_vocab)
 
@@ -2194,76 +2181,6 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                                         "%.4f for user=%s post_type=%s",
                                         _eng_scaled, _eng_user,
                                         _eng_reward.get("post_type", ""))
-
-                    # ── Phase H (RFP_cgn_enhancements §H / Inner Teacher Protocol) ──
-                    # Ground salient RECURRING social concepts (events-teacher,
-                    # producer-side salience-gated) into CGN via the `social`
-                    # consumer — translating narrative event windows into the inner
-                    # Titan's native modality (he is non-linguistic, §11.4). Three
-                    # channels: FELT (felt-weighted encounter), SEMANTIC (co-occurring
-                    # concepts grounded jointly + carried as associations), PROCEDURAL
-                    # (social.concept_grounded META-CGN signal → SIGNAL_TO_PRIMITIVE
-                    # routing). The OUTER narrative path (felt_experiences DB) is
-                    # untouched — H ADDS an inner path (feedback_never_delete_live_logic).
-                    _sp_groundings = _sp_p.get("social_ground_concepts") or []
-                    if cgn_social and _sp_groundings:
-                        for _g in _sp_groundings[:5]:
-                            try:
-                                _gid = str(_g.get("concept_id", "")).strip().lower()
-                                if not _gid:
-                                    continue
-                                _gfelt = _g.get("felt", {}) or {}
-                                _grel = float(_gfelt.get("relevance", 0.5))
-                                _gassoc = [
-                                    str(a).strip().lower()
-                                    for a in (_g.get("associations") or [])
-                                    if str(a).strip()]
-                                # FELT + SEMANTIC — felt-weighted social encounter
-                                # for the concept AND each co-occurring concept, so
-                                # the relational web grounds jointly (meaning, for a
-                                # non-linguistic mind, IS relation).
-                                _gh_ctx = {"epoch": 0, "neuromods": {},
-                                           "concept_confidences": {},
-                                           "encounter_type": "social"}
-                                for _cid in [_gid] + _gassoc:
-                                    _cf = {"concept_id": _cid, "confidence": _grel,
-                                           "encounter_count": int(_g.get("recurrence", 2))}
-                                    _gres = cgn_social.ground(_cf, _gh_ctx)
-                                    if _gres and _gres.transition:
-                                        cgn_social.send_transition(_gres.transition)
-                                _g_reward = 0.02 + _grel * 0.04
-                                _cgn_forward_outcome(
-                                    "social", _gid, _g_reward,
-                                    {"type": "events_concept",
-                                     "associations": _gassoc[:5],
-                                     "contagion": _gfelt.get("contagion_type", "")})
-                                # PROCEDURAL — social.concept_grounded signal, gated
-                                # so it fires once per first grounding (§11.8).
-                                if (_social_concept_edge_detector is not None
-                                        and _social_concept_edge_detector.observe_first_time(_gid)):
-                                    from titan_hcl.bus import emit_meta_cgn_signal
-                                    emit_meta_cgn_signal(
-                                        send_queue, src="language", consumer="social",
-                                        event_type="concept_grounded",
-                                        intensity=min(1.0, max(0.1, _grel)),
-                                        domain=_gid[:40],
-                                        narrative_context={
-                                            "associations": _gassoc[:5],
-                                            "felt_summary": str(
-                                                _gfelt.get("felt_summary", ""))[:120],
-                                            "sentiment": float(_gfelt.get("sentiment", 0.0))},
-                                        reason=f"events-teacher grounded recurring social "
-                                               f"concept '{_gid}' "
-                                               f"(recurrence={_g.get('recurrence')}, "
-                                               f"rel={_grel:.2f})")
-                                    logger.info(
-                                        "[CGN:Social] Phase H — grounded social concept "
-                                        "'%s' (assoc=%s, rel=%.2f) + social.concept_grounded",
-                                        _gid, _gassoc[:3], _grel)
-                            except Exception as _gh_err:
-                                logger.debug(
-                                    "[CGN:Social] Phase H grounding failed for %s: %s",
-                                    _g.get("concept_id"), _gh_err)
 
                 except Exception as _sp_err:
                     logger.warning("[CGN:Social] SOCIAL_PERCEPTION error: %s",

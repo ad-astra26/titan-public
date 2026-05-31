@@ -39,10 +39,7 @@ def make_config(tmp_dir, **overrides):
         "task_key": "meta_teacher",
         "data_dir": tmp_dir,
         "inference": {
-            # NB: this no longer disables the LLM by itself — post-D-SPEC-88 the
-            # worker resolves api.internal_key via canonical-config fallback.
-            # Tests that need the LLM-disabled path monkeypatch
-            # _load_meta_teacher_llm_ctx → (None, None, None).
+            # No API key — forces LLM-disabled path (neutral critique)
             "ollama_cloud_api_key": "",
         },
     }
@@ -161,16 +158,7 @@ class TestWorkerLifecycle:
 class TestLLMFailurePath:
     """With no API key, LLM returns None → worker emits neutral feedback."""
 
-    def test_chain_complete_produces_neutral_feedback(self, monkeypatch):
-        # Force the genuine "no internal_key → LLM noop" path deterministically.
-        # The old disable mechanism (inference.ollama_cloud_api_key="") no longer
-        # works: post-D-SPEC-88 the worker ignores that key and resolves
-        # api.internal_key via the canonical-config fallback (config.toml +
-        # secrets.toml) → a live key + running :7777 makes the critique SUCCEED
-        # (llm_ok=True) in any session where T1's API is up. Patch the loader to
-        # return (None, None, None) — the exact branch this test asserts.
-        monkeypatch.setattr(
-            mtw, "_load_meta_teacher_llm_ctx", lambda full_config: (None, None, None))
+    def test_chain_complete_produces_neutral_feedback(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = make_config(tmp)
             recv = queue.Queue(maxsize=100)

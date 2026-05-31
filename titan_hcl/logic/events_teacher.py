@@ -59,16 +59,6 @@ MAX_DISTILL_ITEMS = 12          # max items distilled per window (≈6 chunks)
 DISTILL_CHUNK_TIMEOUT_S = 45.0  # per-chunk endpoint timeout (headroom over ~25s)
 DISTILL_TOKENS_PER_ITEM = 320   # max_tokens budget scaled by chunk size
 
-# ── Phase H (RFP_cgn_enhancements §H / Inner Teacher Protocol) salience gate ──
-# A distilled semantic_concept grounds into CGN (via the `social` consumer) only
-# after it recurs across ≥ N windows at relevance ≥ θ — durable social concepts
-# (people/topics that keep mattering), not transient one-off nouns. Tunable from
-# soak (feedback_observation_no_tuning).
-SOCIAL_GROUND_RELEVANCE_MIN = 0.3
-SOCIAL_GROUND_RECURRENCE_MIN = 2
-SOCIAL_GROUND_MAX_PER_WINDOW = 5     # cap groundings emitted per window (bus hygiene)
-CONCEPT_RECURRENCE_MAX = 2000        # bound the persisted recurrence dict
-
 
 # ═══════════════════════════════════════════════════════════════════════
 # Data Classes
@@ -112,8 +102,6 @@ class WindowResult:
     skipped_reason: str = ""
     # Phase 1: Social Perception — events that passed perturbation gate
     perception_events: list = field(default_factory=list)
-    # Phase H — salience-gated CGN groundings (concept_id + felt + associations)
-    social_groundings: list = field(default_factory=list)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -690,12 +678,6 @@ class EventsTeacher:
         self._perception_buffer: list[dict] = []
         self._last_engagement: dict[str, dict] = {}
         self._mode_stats: dict[str, int] = {}
-        # ── Phase H (RFP_cgn_enhancements §H / Inner Teacher Protocol) ──
-        # Per-concept window-recurrence counts for the salience gate: a distilled
-        # semantic_concept grounds into CGN (via the `social` consumer) only after
-        # it recurs across ≥2 windows (durable social concepts, not transient
-        # nouns). Persisted so recurrence survives the cron's per-run lifecycle.
-        self._concept_recurrence: dict[str, int] = {}
 
         # SQLite DB (developmental — crash-safe, accumulates)
         self._db: EventsTeacherDB | None = None
@@ -748,7 +730,6 @@ class EventsTeacher:
                 teacher._perception_buffer = state.get("perception_buffer", [])
                 teacher._last_engagement = state.get("last_engagement", {})
                 teacher._mode_stats = state.get("mode_stats", {})
-                teacher._concept_recurrence = state.get("concept_recurrence", {})
                 logger.info("[EventsTeacher] State loaded: %d fingerprints, "
                             "%d buffer events, window #%d",
                             len(teacher._fingerprints),
@@ -768,7 +749,6 @@ class EventsTeacher:
             "perception_buffer": self._perception_buffer,
             "last_engagement": self._last_engagement,
             "mode_stats": self._mode_stats,
-            "concept_recurrence": self._concept_recurrence,
         }
         Path(path).write_text(json.dumps(state, indent=2))
 
@@ -1752,71 +1732,6 @@ class EventsTeacher:
         latency_ms = int((time.time() - start) * 1000)
         return events, latency_ms
 
-    # ── Phase H (RFP_cgn_enhancements §H / Inner Teacher Protocol) ────
-    def _compute_social_groundings(self, events: list) -> list[dict]:
-        """Salience-gated CGN groundings for distilled social concepts.
-
-        Translates narrative event windows into the inner Titan's native CGN
-        modality (he is non-linguistic — §11.4 — he cannot read prose). Each
-        returned grounding carries TWO of the Inner Teacher Protocol's three
-        channels:
-          • FELT ("feel it")        — the window's felt signature.
-          • SEMANTIC ("understand it") — co-occurring concepts as CGN associations,
-            so the concept enters his web RELATED to things he already holds
-            (meaning, for a non-linguistic mind, IS relation).
-        (The third PROCEDURAL channel — the `social.concept_grounded` META-CGN
-        signal routing his meta-reasoning — is emitted consumer-side.)
-
-        Updates per-concept window-recurrence and only grounds concepts that
-        recur ≥ SOCIAL_GROUND_RECURRENCE_MIN windows at relevance ≥ θ. Returns a
-        list of grounding dicts (capped); never raises into the window loop.
-        """
-        groundings: dict[str, dict] = {}
-        try:
-            for e in events:
-                concepts = [
-                    str(c).strip().lower()
-                    for c in (getattr(e, "semantic_concepts", []) or [])
-                    if str(c).strip()
-                ]
-                if not concepts or float(getattr(e, "relevance", 0.0)) < SOCIAL_GROUND_RELEVANCE_MIN:
-                    continue
-                for c in concepts:
-                    self._concept_recurrence[c] = self._concept_recurrence.get(c, 0) + 1
-                rel = float(e.relevance)
-                for c in concepts:
-                    if self._concept_recurrence[c] < SOCIAL_GROUND_RECURRENCE_MIN:
-                        continue
-                    assoc = [x for x in concepts if x != c]
-                    prev = groundings.get(c)
-                    if prev is None or rel > prev["felt"]["relevance"]:
-                        groundings[c] = {
-                            "concept_id": c,
-                            "felt": {
-                                "sentiment": float(e.sentiment),
-                                "arousal": float(e.arousal),
-                                "relevance": rel,
-                                "felt_summary": str(e.felt_summary or "")[:200],
-                                "contagion_type": str(getattr(e, "contagion_type", "") or ""),
-                            },
-                            "associations": sorted(set(assoc))[:5],
-                            "recurrence": self._concept_recurrence[c],
-                        }
-                    else:
-                        prev["associations"] = sorted(
-                            set(prev["associations"]) | set(assoc))[:5]
-            # Bound the persisted recurrence dict (keep the most-recurring).
-            if len(self._concept_recurrence) > CONCEPT_RECURRENCE_MAX:
-                self._concept_recurrence = dict(sorted(
-                    self._concept_recurrence.items(),
-                    key=lambda kv: kv[1], reverse=True)[:CONCEPT_RECURRENCE_MAX])
-        except Exception as _sg_err:
-            logger.debug("[EventsTeacher] social grounding compute failed: %s", _sg_err)
-        # Strongest-felt first; cap per window for bus hygiene.
-        out = sorted(groundings.values(),
-                     key=lambda g: g["felt"]["relevance"], reverse=True)
-        return out[:SOCIAL_GROUND_MAX_PER_WINDOW]
-
     # ── Social Perception Buffer ─────────────────────────────────────
 
     def _update_buffer(self, events: list[DistilledEvent]):
@@ -2228,27 +2143,6 @@ class EventsTeacher:
                                 _social_vocab_candidates)
             except Exception:
                 pass
-
-            # ── Phase H — salience-gated CGN groundings (Inner Teacher Protocol) ──
-            # Translate recurring social concepts into inner-native CGN groundings
-            # (felt signature + associations); the consumer (language_worker's
-            # SOCIAL_PERCEPTION handler) grounds them via the `social` consumer and
-            # emits social.concept_grounded. Rides perception_events[0] for bus
-            # delivery (same pattern as social_vocab_candidates above). The OUTER
-            # narrative path (felt_experiences DB) is untouched — H ADDS an inner
-            # path (feedback_never_delete_live_logic).
-            try:
-                _social_groundings = self._compute_social_groundings(events)
-                if _social_groundings:
-                    result.social_groundings = _social_groundings
-                    if perception_events:
-                        perception_events[0]["social_ground_concepts"] = _social_groundings
-                    logger.info(
-                        "[EventsTeacher] Phase H — %d social concept(s) ready to "
-                        "ground in CGN: %s", len(_social_groundings),
-                        [g["concept_id"] for g in _social_groundings])
-            except Exception as _sg_err:
-                logger.debug("[EventsTeacher] social grounding attach failed: %s", _sg_err)
 
             # ── Log ──
             for e in events:
