@@ -152,6 +152,43 @@ async def test_ship_rejects_stale_baseline(tmp_path):
     assert len(manifest.events) == 1          # no second event committed
 
 
+def test_manifest_truth_gate(monkeypatch):
+    """The daily/weekly gate reads the MANIFEST (no claim flag) — landed iff a
+    today-dated event with a zk_commit_tx exists. No stuck-claim possible."""
+    import time
+    from titan_hcl.logic.backup import RebirthBackup
+    from titan_hcl.logic import backup_unified_manifest as bum
+
+    b = RebirthBackup(network_client=None, titan_id="T1")
+
+    class _FakeManifest:
+        def __init__(self, events):
+            self.events = events
+
+    def _patch(events):
+        monkeypatch.setattr(bum.UnifiedManifest, "load",
+                            lambda **kw: _FakeManifest(events))
+
+    now = time.time()
+    # empty manifest → NOT landed (would ship)
+    _patch([])
+    assert b._todays_backup_already_landed() is False
+    # today event WITH zk_commit_tx → LANDED (skip)
+    _patch([{"ts_unix": now, "zk_commit_tx": "sig123"}])
+    assert b._todays_backup_already_landed() is True
+    # today event but NO zk_commit_tx (incomplete) → NOT landed (retry)
+    _patch([{"ts_unix": now, "zk_commit_tx": ""}])
+    assert b._todays_backup_already_landed() is False
+    # only a yesterday event → NOT landed today
+    _patch([{"ts_unix": now - 90000, "zk_commit_tx": "sig123"}])
+    assert b._todays_backup_already_landed() is False
+    # manifest load failure → treated as NOT landed (never falsely skips)
+    def _boom(**kw):
+        raise ValueError("corrupt manifest")
+    monkeypatch.setattr(bum.UnifiedManifest, "load", _boom)
+    assert b._todays_backup_already_landed() is False
+
+
 def test_auto_fund_rehome_wired_to_unified_v2(monkeypatch):
     """Re-home guard (2026-05-31): the unified_v2 path must invoke the Irys
     auto-fund hook (it was orphaned in the legacy BackupCascade.run after the
