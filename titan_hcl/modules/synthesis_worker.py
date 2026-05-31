@@ -478,6 +478,7 @@ def _recompute_loop(store: "ActivationStore",
                     fork_activation_updater_holder: dict,
                     oracle_exporter_holder: dict,
                     metrics_exporter_holder: dict,
+                    tx_index_holder: dict,
                     send_queue, name: str,
                     interval_s: float,
                     stop_event: threading.Event,
@@ -555,6 +556,16 @@ def _recompute_loop(store: "ActivationStore",
                 logger.debug(
                     "[synthesis_worker] metrics_exporter call failed: %s",
                     _met_exp_err,
+                )
+            # Operator-closure Phase A2 — incrementally index new chain TXs into
+            # the tx_hash-native FAISS shards (bounded per tick; no-op until the
+            # builder is wired). Keeps SEARCH current with live chain growth.
+            try:
+                tx_index_holder["fn"]()
+            except Exception as _tix_exp_err:
+                logger.debug(
+                    "[synthesis_worker] tx_index tick failed: %s",
+                    _tix_exp_err,
                 )
             status_writer.publish(
                 last_consistent_event_ts=now,
@@ -711,6 +722,54 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # Phase 10 §P10.B — metrics snapshot exporter holder (late-bound; set to
     # MetricsAggregator.export once the meter + aggregator are constructed).
     metrics_exporter_holder: dict = {"fn": lambda: None}
+    # Operator-closure Phase A2 — tx_hash-index incremental builder holder
+    # (late-bound; set once the SynthesisVectorStore + TxIndexBuilder are wired
+    # below). Default no-op so the recompute loop fires safely before wiring.
+    tx_index_holder: dict = {"fn": lambda: None}
+
+    # Operator-closure Phase A — ONE shared embedder for the whole worker (the
+    # tx_hash FAISS store, EngineRecall's query embed, the consolidation cosine
+    # path, AND skill_store) so only a single fastembed model is resident (RSS
+    # discipline per feedback_eager_init_needs_rss_root_cause_first — lazy-loads
+    # on first embed, never at boot).
+    _data_dir_sw = os.path.dirname(db_path) or "."
+
+    def _shared_embedder(text: str):
+        try:
+            from fastembed import TextEmbedding
+            import numpy as np
+            if not hasattr(_shared_embedder, "_model"):
+                _shared_embedder._model = TextEmbedding(
+                    model_name="BAAI/bge-small-en-v1.5")
+            vecs = list(_shared_embedder._model.embed([text]))
+            v = np.array(vecs[0], dtype=np.float32)
+            norm = np.linalg.norm(v)
+            if norm > 0:
+                v /= norm
+            return v
+        except Exception as e:
+            logger.debug("[synthesis_worker] shared_embedder failed: %s", e)
+            return None
+
+    # Operator-closure Phase A2 — the tx_hash-native FAISS store (sole writer,
+    # G21). Binds outer-memory vectors to the chain by the canonical block_hash
+    # (arch §3.6 / INV-15). Serves as the in-process faiss_reader for this
+    # worker's EngineRecall (so SEARCH finally returns hits) + the by-tx_hash
+    # vector source for ConsolidationPass clustering (W4).
+    synth_vector_store = None
+    try:
+        from titan_hcl.synthesis.synthesis_vector_index import SynthesisVectorStore
+        synth_vector_store = SynthesisVectorStore(
+            data_dir=_data_dir_sw, embedder=_shared_embedder)
+        logger.info(
+            "[synthesis_worker] tx_hash FAISS store ready (forks=%s) — "
+            "binding outer memory to the chain spine (INV-15)",
+            list(synth_vector_store.stats().keys()))
+    except Exception as exc:
+        logger.warning(
+            "[synthesis_worker] tx_hash FAISS store wiring failed: %s — "
+            "SEARCH stays cold (recall falls back to FORK_READ/CROSS_REF)", exc)
+        synth_vector_store = None
 
     rc_thread = threading.Thread(
         target=_recompute_loop,
@@ -718,6 +777,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
               bundle_snapshot_path, spine_exporter_holder,
               fork_exporter_holder, fork_activation_updater_holder,
               oracle_exporter_holder, metrics_exporter_holder,
+              tx_index_holder,
               send_queue, name,
               interval_s, stop_event, cache_lock),
         daemon=True, name=f"synthesis-recompute-{name}")
@@ -768,22 +828,58 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         from titan_hcl.logic.timechain_v2 import RuleEvaluator
         evaluator = RuleEvaluator(
             orchestrator=None,
-            faiss_reader=None,    # P2D: caller-injected later (deferred)
+            # Operator-closure Phase A: the tx_hash-native FAISS store IS the
+            # faiss_reader the SEARCH op always needed (arch §12.1 / INV-15).
+            # No longer deferred — SEARCH returns real hits in-process.
+            faiss_reader=synth_vector_store,
             index_db=index_db_conn,
         )
         engine_recall = EngineRecall(
             rule_evaluator=evaluator,
             activation_lookup=store.bulk_base_level,
-            embedder=None,        # P2D: lazy-injected by future consumer
+            embedder=_shared_embedder,   # operator-closure: was deferred (B1)
             # Phase 4 §P4.H — kuzu_reader for concept-granularity recall.
             kuzu_reader=kuzu_graph_obj,
         )
         _set_engine_recall(engine_recall)
         logger.info(
             "[synthesis_worker] EngineRecall constructed — index_db=%s "
-            "faiss=deferred embedder=deferred kuzu_reader=%s",
+            "faiss=%s embedder=wired kuzu_reader=%s",
             "attached" if index_db_conn else "missing",
+            "tx_hash_store" if synth_vector_store is not None else "none",
             "attached" if kuzu_graph_obj is not None else "missing")
+
+        # Operator-closure Phase A2 — wire the incremental tx-index builder onto
+        # the recompute-loop holder. Each 60s tick indexes new conversation/
+        # declarative/procedural blocks since the watermark (bounded), keeping
+        # the tx_hash spine current with live chain growth. Read-only on the
+        # chain; the store's atomic save makes the new vectors visible to
+        # cross-process FaissReaders (agno/cognitive).
+        if synth_vector_store is not None and index_db_conn is not None:
+            try:
+                from titan_hcl.synthesis.tx_index_builder import TxIndexBuilder
+                _tx_index_builder = TxIndexBuilder(
+                    store=synth_vector_store,
+                    data_dir=_data_dir_sw,
+                    index_db=index_db_conn,
+                )
+
+                def _tx_index_tick() -> None:
+                    summary = _tx_index_builder.run(max_blocks=2000)
+                    if summary.get("indexed"):
+                        logger.info(
+                            "[synthesis_worker] tx-index tick: +%d vectors "
+                            "(scanned=%d) shards=%s",
+                            summary["indexed"], summary["scanned"],
+                            synth_vector_store.stats())
+
+                tx_index_holder["fn"] = _tx_index_tick
+                logger.info("[synthesis_worker] tx-index incremental builder wired")
+            except Exception as _tix_err:
+                logger.warning(
+                    "[synthesis_worker] tx-index builder wiring failed: %s — "
+                    "index stays at backfill state (no incremental growth)",
+                    _tix_err)
     except Exception as exc:
         logger.warning(
             "[synthesis_worker] EngineRecall construction failed: %s — "
@@ -1346,27 +1442,13 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     try:
         from titan_hcl.synthesis.skill_store import ProceduralSkillStore
 
-        def _skill_embedder(text: str):
-            try:
-                from fastembed import TextEmbedding
-                import numpy as np
-                if not hasattr(_skill_embedder, "_model"):
-                    _skill_embedder._model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
-                vecs = list(_skill_embedder._model.embed([text]))
-                v = np.array(vecs[0], dtype=np.float32)
-                norm = np.linalg.norm(v)
-                if norm > 0:
-                    v /= norm
-                return v
-            except Exception as e:
-                logger.debug("[synthesis_worker] skill_embedder failed: %s", e)
-                return None
-
+        # Operator-closure Phase A: reuse the ONE shared embedder (no second
+        # fastembed model — RSS discipline). Same BAAI/bge-small-en-v1.5 path.
         procedural_skill_store = ProceduralSkillStore(
             duckdb_conn=store._conn,
             faiss_path=skills_faiss_path,
             snapshot_path=skills_snapshot_path,
-            embedder=_skill_embedder,
+            embedder=_shared_embedder,
             soft_retire_floor=float(skill_cfg.get("soft_retire_floor", -0.5)),
             on_soft_retire=_skill_soft_retire_emit,
         )
