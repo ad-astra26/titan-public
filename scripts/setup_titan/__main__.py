@@ -59,46 +59,9 @@ def _render_preflight(results) -> int:
 
 
 # ── subcommand: install ────────────────────────────────────────────────────
-def _cmd_resurrect(args: argparse.Namespace, repo_root: Path) -> int:
-    """D1 — install in resurrection mode: recover a mainnet Titan from its on-chain
-    sovereign backup chain (the walker swaps genesis for the resurrect phase)."""
-    cprint("🜂 Sovereign Resurrection — recover a MAINNET Titan from its on-chain "
-           "backup chain (your wallet + Shard-1 alone). Local/devnet keep a plaintext "
-           "identity — just re-run install.", role="text_strong", bold=True)
-    if args.verify_only:
-        cprint("  --verify-only: RECOVERY observation mode (no on-chain writes / "
-               "backups / X) — safe to run beside a living Titan.", role="warning")
-    mode = Mode.MAINNET
-    fails = _render_preflight(run_preflight(repo_root, mode))
-    if fails:
-        section("Result")
-        cprint(f"Preflight FAILED ({fails} blocking issue(s) above). Fix and re-run.",
-               role="error", bold=True)
-        return 1
-    if args.dry_run:
-        section("Next")
-        cprint("--dry-run: preflight only. Resurrection walker = venv → Rust binaries "
-               "→ 🜂 resurrect → systemd → console (genesis/config/inference/comms are "
-               "swapped — config comes from your restored backup).", role="text_muted")
-        return 0
-    state = install_state.load()
-    state["setup_titan_version"] = __version__
-    state["install_root"] = str(repo_root)
-    if args.titan_id:
-        state["titan_id"] = args.titan_id
-    install_state.save(state)
-    return run_phases(state=state, mode=mode, install_root=repo_root, default=args.default,
-                      minimal=args.minimal, skip_genesis=False, tag=args.tag,
-                      build_rust=args.build_rust, prompter=None,
-                      resurrect=True, rpc_url=args.rpc_url, verify_only=args.verify_only,
-                      config_src=args.config)
-
-
 def cmd_install(args: argparse.Namespace) -> int:
     banner()
     repo_root = Path(__file__).resolve().parents[2]
-    if getattr(args, "resurrect", False):
-        return _cmd_resurrect(args, repo_root)
     mode = Mode(args.mode) if args.mode else None
     prompter = None          # None → run_phases uses StdinPrompter (the CLI flow)
     state_seed: dict = {}     # TUI pre-fills wallet/RPC so Phase 2 short-circuits
@@ -246,22 +209,6 @@ def build_parser() -> argparse.ArgumentParser:
                          "(implied automatically when stdin/stdout is not a terminal).")
     pi.add_argument("--dry-run", action="store_true",
                     help="Preflight only; no installs, no genesis, no writes.")
-    # D1 — resurrection install-mode (mainnet): swaps genesis for the sovereign
-    # on-chain recovery. config + settings come from the restored backup.
-    pi.add_argument("--resurrect", action="store_true",
-                    help="Recover a MAINNET Titan from its on-chain sovereign backup "
-                         "chain instead of birthing a new one (needs your Shard-1).")
-    pi.add_argument("--verify-only", action="store_true",
-                    help="With --resurrect: boot in RECOVERY observation mode (no "
-                         "on-chain writes / backups / X) — the live restore-test guard.")
-    pi.add_argument("--rpc-url", default=None,
-                    help="With --resurrect: Solana RPC for the chain walk "
-                         "(default: public mainnet-beta).")
-    pi.add_argument("--config", default=None,
-                    help="With --resurrect: path to your own config.toml to stage "
-                         "(for operators who opted config.toml OUT of their backup).")
-    pi.add_argument("--titan-id", default=None,
-                    help="With --resurrect: Titan id (default: resolved from your shard).")
     pi.set_defaults(func=cmd_install)
 
     pr = sub.add_parser("restore",

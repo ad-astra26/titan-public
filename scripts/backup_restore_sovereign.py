@@ -338,13 +338,7 @@ def main(argv: Optional[list] = None) -> int:
     p.add_argument("--commit", action="store_true",
                    help="Atomically swap the reconstructed state into data/ on success "
                         "(default: leave it in the scratch dir for inspection).")
-    p.add_argument("--verify-only", action="store_true",
-                   help="Materialize the bootable identity in RECOVERY observation mode "
-                        "(no on-chain writes / backups / X on first boot) — the live "
-                        "restore-test isolation guard. Implies --commit.")
     args = p.parse_args(argv)
-    if args.verify_only:
-        args.commit = True  # a verify-only test must produce a bootable, comparable box
 
     print("\n" + "═" * 64)
     print(PROTOCOL_BANNER)
@@ -422,30 +416,11 @@ def main(argv: Optional[list] = None) -> int:
         return 1
 
     _print(f"Resurrected {result.events_applied} events into {scratch_dir}")
-    if not args.commit:
+    if args.commit:
+        _atomic_swap_into_data(scratch_dir, install_root)
+        _print("Start the Titan and verify /health — welcome back.")
+    else:
         _print("Re-run with --commit to swap the reconstruction into data/.")
-        return 0
-
-    # ── commit: swap restored data/ into place, then materialize the bootable
-    # identity. The chain restore recovers the BODY (data/); the kernel's B1 boot
-    # additionally needs the plaintext 0600 keypair + hardware-bound
-    # soul_keypair.enc + RECOVERY flag — none of which live in the backup (mainnet
-    # genesis burns the plaintext key). phase_4_first_breath writes them from the
-    # already-reconstructed soul keypair (no second Shard-1 prompt), leaving a box
-    # the kernel can actually boot. ──────────────────────────────────────────────
-    _atomic_swap_into_data(scratch_dir, install_root)
-    try:
-        _res.phase_4_first_breath(
-            key_bytes, titan_pubkey, titan_id,
-            install_root=install_root, verify_only=args.verify_only)
-    except SystemExit:
-        _print("Bootable-identity materialization failed (see above).")
-        return 1
-    except Exception as e:
-        _print(f"Bootable-identity materialization error: {e}")
-        return 1
-    finally:
-        key_bytes = None  # drop the reconstructed key promptly
     return 0
 
 
