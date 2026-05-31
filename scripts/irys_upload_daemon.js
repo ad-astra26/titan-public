@@ -42,7 +42,7 @@ const Irys = require("@irys/sdk");
 const fs = require("fs");
 const readline = require("readline");
 
-const IRYS_NODE = "https://uploader.irys.xyz";
+const IRYS_NODE = "https://node2.irys.xyz";
 
 async function buildIrys(keypairPath, rpcUrl) {
     const keypairData = JSON.parse(fs.readFileSync(keypairPath, "utf-8"));

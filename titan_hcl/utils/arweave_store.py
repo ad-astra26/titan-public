@@ -12,7 +12,7 @@ Architecture:
   upload_file(filepath, tags) → Arweave TX ID
 
 Irys Node 2 (Solana):
-  - Endpoint: https://uploader.irys.xyz
+  - Endpoint: https://node2.irys.xyz
   - Fund with SOL, upload bytes, get Arweave TX ID
   - Data is permanent and immutable once uploaded
 
@@ -29,7 +29,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # Irys Node 2 (Solana-native)
-IRYS_NODE_URL = "https://uploader.irys.xyz"
+IRYS_NODE_URL = "https://node2.irys.xyz"
 IRYS_DEVNET_URL = "https://devnet.irys.xyz"  # For devnet testing
 
 # Arweave gateway for fetching
