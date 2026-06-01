@@ -59,6 +59,7 @@ from titan_hcl.bus import (
     KERNEL_EPOCH_TICK,
     KNOWLEDGE_MOMENT,
     MEMORY_RETRIEVAL_USED,
+    RETRIEVAL_SAMPLE,
     MODULE_HEARTBEAT,
     MODULE_SHUTDOWN,
     SAVE_NOW,
@@ -588,6 +589,19 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
     except Exception as _cu_err:
         logger.debug(
             "[AgnoWorker] cited-use gate error (chat unaffected): %s", _cu_err)
+
+    # ── Operator-closure telemetry (2026-06-01) — emit the recall sample the
+    # pre-hook stashed, so synthesis_worker's §18 chi/retrieval metrics reflect
+    # the recall that actually ran HERE (its own evaluator/ring are idle).
+    # Fire-and-forget P3, metrics-only (INV-Syn-25). Pop so it never re-emits.
+    try:
+        _rs = getattr(worker_plugin, "_last_retrieval_sample", None)
+        worker_plugin._last_retrieval_sample = None
+        if isinstance(_rs, dict):
+            _send(send_queue, RETRIEVAL_SAMPLE, name, "all", {
+                **_rs, "ts": time.time()})
+    except Exception as _rs_err:
+        logger.debug("[AgnoWorker] retrieval-sample emit failed: %s", _rs_err)
 
     # ── Assemble CHAT_RESPONSE payload ──
     # D-SPEC-74 (SPEC v1.18.0): _last_ovg_result is now a VerifiedResult

@@ -251,6 +251,17 @@ KNOWLEDGE_MOMENT = "KNOWLEDGE_MOMENT"
 # OracleRouter for the dream-boundary OracleVerdictBatch flush (no re-exec).
 # Payload: {parent_tool_call_tx, oracle_id, verdict, evidence_ref, latency_ms, ts}.
 TOOL_CALL_VERDICT_RECORD = "TOOL_CALL_VERDICT_RECORD"
+# Operator-closure telemetry (2026-06-01) — the §3 operator RECALL runs in
+# agno_worker (chat) + cognitive_worker (per-epoch), each with its OWN
+# RuleEvaluator + EngineRecall instance, so the §18 chi/retrieval metrics
+# (read off synthesis_worker's idle local evaluator + an un-fed latency ring)
+# were structurally blind to the work actually happening. The recall paths now
+# emit this fire-and-forget P3 sample after each recall; synthesis_worker
+# aggregates it into the retrieval latency ring + cross-process chi totals so
+# /v6/synthesis/metrics reflects the real loop. Metrics-only (INV-Syn-25:
+# derived, non-authoritative). Payload: {latency_ms, chi_spent, evaluations,
+# hits, fork, source, ts}.
+RETRIEVAL_SAMPLE = "RETRIEVAL_SAMPLE"
 
 # Phase 2 standing-contract event (PLAN_synthesis_engine_Phase2.md 2B,
 # D-P2-4): emitted by the post-seal contract hook in

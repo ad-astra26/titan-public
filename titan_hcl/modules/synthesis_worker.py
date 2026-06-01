@@ -73,6 +73,7 @@ from titan_hcl.bus import (
     MODULE_HEARTBEAT,
     MODULE_PROBE_REQUEST,
     MODULE_SHUTDOWN,
+    RETRIEVAL_SAMPLE,
     SYNTHESIS_FORK_COMMAND,
     TOOL_CALL_VERDICT_RECORD,
     SYNTHESIS_FORK_COMMAND_RESULT,
@@ -1727,6 +1728,12 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     sovereignty_meter: Optional[Any] = None
     metrics_aggregator: Optional[Any] = None
     retrieval_latency_ring: Optional[Any] = None
+    # Cross-process recall telemetry accumulator (2026-06-01) — fed by
+    # RETRIEVAL_SAMPLE events from agno/cognitive recall; read by the chi
+    # provider + the message-loop handler (both below). Declared here so it's
+    # in scope regardless of the metrics-enabled branch.
+    _xproc_chi = {"total_chi_spent": 0.0, "total_evaluations": 0,
+                  "total_chi_exhausted": 0}
     metrics_cfg = dict((config or {}).get("synthesis", {}).get("metrics", {}) or {})
     if bool(metrics_cfg.get("metrics_snapshot_enabled", True)):
         try:
@@ -1740,15 +1747,35 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             retrieval_latency_ring = LatencyRing(
                 maxlen=int(metrics_cfg.get("retrieval_latency_ring_size", 1000)))
 
+            # Operator-closure telemetry (2026-06-01): the §3 operator RECALL runs
+            # in agno_worker (chat) + cognitive_worker (per-epoch), NOT here, so the
+            # local `engine_recall._evaluator` is idle (chi=0) and the latency ring
+            # was never fed. Cross-process RETRIEVAL_SAMPLE events aggregate the real
+            # work into `_xproc_chi` (declared above) + the ring so
+            # /v6/synthesis/metrics is honest.
             def _chi_stats_provider() -> dict:
-                # Best-effort chi-budget compliance readout (B.5).
+                # chi-budget readout = cross-process recall chi (the real work) +
+                # this worker's own evaluator (usually idle). Both summed so the
+                # metric reflects ALL evaluator activity fleet-locally (B.5).
+                local = {}
                 try:
                     ev = getattr(engine_recall, "_evaluator", None)
                     if ev is not None and hasattr(ev, "get_stats"):
-                        return dict(ev.get_stats() or {})
+                        local = dict(ev.get_stats() or {})
                 except Exception:
-                    pass
-                return {}
+                    local = {}
+                out = dict(local)
+                out["available"] = True
+                out["total_chi_spent"] = round(
+                    float(local.get("total_chi_spent", 0.0))
+                    + _xproc_chi["total_chi_spent"], 6)
+                out["total_evaluations"] = (
+                    int(local.get("total_evaluations", 0))
+                    + _xproc_chi["total_evaluations"])
+                out["total_chi_exhausted"] = (
+                    int(local.get("total_chi_exhausted", 0))
+                    + _xproc_chi["total_chi_exhausted"])
+                return out
 
             metrics_snapshot_path = os.path.join(
                 os.environ.get("TITAN_DATA_DIR", "data"),
@@ -1993,6 +2020,25 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     events_recorded += 1
                 else:
                     events_surfaced += 1
+                continue
+
+            if msg_type == RETRIEVAL_SAMPLE:
+                # Operator-closure telemetry (2026-06-01) — a recall ran in
+                # agno/cognitive (their own evaluator/ring); fold its latency +
+                # chi into THIS worker's §18 metrics so they reflect the real
+                # loop. Metrics-only (INV-Syn-25). Soft-fail.
+                try:
+                    if retrieval_latency_ring is not None:
+                        retrieval_latency_ring.record(
+                            str(payload.get("fork", "conversation")),
+                            str(payload.get("source", "recall")),
+                            float(payload.get("latency_ms", 0.0)))
+                    _xproc_chi["total_chi_spent"] += float(
+                        payload.get("chi_spent", 0.0) or 0.0)
+                    _xproc_chi["total_evaluations"] += int(
+                        payload.get("evaluations", 0) or 0)
+                except Exception:
+                    pass
                 continue
 
             if msg_type == KNOWLEDGE_MOMENT:

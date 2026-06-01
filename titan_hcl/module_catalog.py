@@ -1263,6 +1263,10 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
             # sandbox) ships its pre-computed verdict → OracleRouter companion
             # buffer → dream-boundary OracleVerdictBatch flush (coverage).
             _bus_constants.TOOL_CALL_VERDICT_RECORD,
+            # Operator-closure telemetry (2026-06-01): recall latency + chi from
+            # agno/cognitive (their own evaluator/ring) → synthesis §18 metrics
+            # so retrieval.samples + chi reflect the real cross-process loop.
+            _bus_constants.RETRIEVAL_SAMPLE,
             # Phase 2 D-P2-4: standing-contract maintenance event, single
             # consumer = synthesis_worker (sole writer of
             # association_bundles). Post-seal contract hook in

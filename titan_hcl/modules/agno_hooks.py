@@ -934,7 +934,40 @@ def create_pre_hook(plugin):
             if (getattr(plugin, "synthesis_recall_augment", False)
                     and _recall is not None and prompt_text):
                 _deref = getattr(plugin, "synthesis_tx_deref", None)
+                # Operator-closure telemetry (2026-06-01): measure this recall's
+                # latency + chi delta so synthesis_worker's §18 metrics see the
+                # work that actually happens here (not its idle local evaluator).
+                _ev = getattr(_recall, "_evaluator", None)
+                _chi0 = 0.0
+                _ev0 = 0
+                try:
+                    if _ev is not None:
+                        _s0 = _ev.get_stats() or {}
+                        _chi0 = float(_s0.get("total_chi_spent", 0.0))
+                        _ev0 = int(_s0.get("total_evaluations", 0))
+                except Exception:
+                    pass
+                _t_recall0 = time.perf_counter()
                 _results = await asyncio.to_thread(_recall.recall, prompt_text, k=6)
+                _recall_latency_ms = (time.perf_counter() - _t_recall0) * 1000.0
+                try:
+                    _s1 = _ev.get_stats() if _ev is not None else {}
+                    plugin._last_retrieval_sample = {
+                        "latency_ms": round(_recall_latency_ms, 2),
+                        "chi_spent": max(0.0, float((_s1 or {}).get(
+                            "total_chi_spent", _chi0)) - _chi0),
+                        "evaluations": max(0, int((_s1 or {}).get(
+                            "total_evaluations", _ev0)) - _ev0),
+                        "hits": len(_results or []),
+                        "fork": "conversation",
+                        "source": "agno_chat",
+                    }
+                except Exception:
+                    plugin._last_retrieval_sample = {
+                        "latency_ms": round(_recall_latency_ms, 2),
+                        "chi_spent": 0.0, "evaluations": 0,
+                        "hits": len(_results or []),
+                        "fork": "conversation", "source": "agno_chat"}
                 _lines = []
                 _surfaced = []
                 for _r in (_results or []):
