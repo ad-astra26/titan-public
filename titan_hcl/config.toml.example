@@ -198,10 +198,10 @@ standalone_mode = false
 
 [twitter_social]
 # --- Credentials ---
-# Your X (Twitter) account — the Titan posts from this handle. Fill in your own.
-user_name = "YOUR_X_HANDLE"
-email = "you@example.com"
-password = ""  # keep in config.toml only, never in this example
+# Provided by Maker — X account @your_x_handle
+user_name = "your_x_handle"
+email = "hello@example.com"
+password = ""  # @your_x_handle — keep in config.toml only, never example
 totp_secret = ""  # 2FA seed — keep in config.toml only, never example
 
 # --- Proxy ---
@@ -275,7 +275,7 @@ enabled = true
 host = "0.0.0.0"
 port = 7777
 # CORS origins (comma-separated or array)
-cors_origins = ["http://localhost:3000", "http://localhost:5173"]  # add your own domain(s)
+cors_origins = ["http://localhost:3000", "http://localhost:5173", "https://example.com", "http://example.com"]
 # Internal API key for scripts/endurance tests (bypasses Privy JWT auth)
 internal_key = ""  # generate: python -c "import secrets; print(secrets.token_urlsafe(32))"
 # Helius webhook auth token (optional, for webhook payload verification)
@@ -377,7 +377,7 @@ outer_trinity_interval = 60
 # --- Maker Access ---
 # Comma-separated platform user IDs allowed to run maker-only commands
 # e.g., "tg_123456789,dc_987654321" (get your ID via /start on each platform)
-maker_platform_ids = ""   # e.g. "tg_123456789" — your own platform user ID(s)
+maker_platform_ids = "tg_0"
 
 # --- Telegram ---
 telegram_enabled = true
@@ -445,7 +445,7 @@ archetype_recency_boost_per_day = 0.1     # 1.0 boost per 10 days
 archetype_recency_boost_threshold = 0.5   # rank-jump kicks in at 5 days deferred
 archetype_recency_boost_max = 1.0          # cap (10 days saturation)
 # URL shortener domain (nginx redirect: /tx/HASH → solscan)
-url_domain = ""   # e.g. "https://yourdomain.tld" — your URL-shortener domain
+url_domain = "https://example.com"
 
 # Per-Titan hourly limits (personality pacing — T1 most active, T3 quietest)
 [social_x.limits.T1]
