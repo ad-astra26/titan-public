@@ -150,8 +150,26 @@ async def _do_baseline(titan_id: str, dry_run: bool, force: bool,
         "[force-baseline] ArweaveStore wired (network=%s, keypair=%s)",
         net, keypair_path)
 
+    # §24.7.a — in-process ZK-Vault network client (identity keypair is already
+    # in this process; signs the v=3 chain commit). Without it
+    # commit_event_v3_chain returns None ("no network client") → event fails
+    # AFTER the Arweave uploads already spent SOL (orphaned). Mirrors
+    # backup_worker.py's HybridNetworkClient wiring.
+    backup_network = None
+    if net == "mainnet":
+        try:
+            from titan_hcl.core.network import HybridNetworkClient
+            backup_network = HybridNetworkClient(config=net_cfg)
+            logger.info("[force-baseline] in-process ZK network client wired "
+                        "(§24.7.a) — v=3 chain commit can sign")
+        except Exception as e:
+            logger.error(
+                "[force-baseline] HybridNetworkClient wiring FAILED: %s — "
+                "v=3 chain commit will fail; aborting before any SOL spend", e)
+            return 6
+
     backup = RebirthBackup(
-        network_client=None,
+        network_client=backup_network,
         config=cfg.get("memory_and_storage", {}),
         titan_id=titan_id,
         arweave_store=arweave_store,
@@ -287,11 +305,16 @@ async def _do_baseline(titan_id: str, dry_run: bool, force: bool,
             except OSError:
                 pass
 
-    async def _zk_commit(event_id, root, prev_root):
-        return await backup.commit_event_merkle_to_zk_vault(
-            event_id=event_id,
-            event_merkle_root=root,
-            prev_event_merkle_root=prev_root,
+    async def _zk_commit(event_id, ts, event_type, event_root, components,
+                         prev_sig):
+        # v=3 sovereign chain commit (chunk 5J-2): one memo per component +
+        # commit_state(event_root) co-bundled with the head. Matches the
+        # pipeline's 6-arg ZkCommitter contract (was a stale 3-arg call that
+        # failed AFTER the uploads → orphaned SOL).
+        return await backup.commit_event_v3_chain(
+            event_id=event_id, ts=ts, event_type=event_type,
+            event_merkle_root=event_root, components=components,
+            prev_sig=prev_sig,
         )
 
     def _baseline_resolver(component, arc_name):
