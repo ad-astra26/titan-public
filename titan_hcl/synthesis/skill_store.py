@@ -287,12 +287,31 @@ class ProceduralSkillStore:
         if embedding_id < 0:
             embedding_id = self._embed_and_add(nl_description)
         with self._lock:
+            # True in-place UPSERT (NOT `INSERT OR REPLACE`). procedural_skills
+            # has two secondary indexes (idx_procedural_skills_utility /
+            # _last_used); DuckDB's OR REPLACE is DELETE+INSERT, which can corrupt
+            # those ART indexes → a later commit aborts the synthesis_worker with a
+            # FATAL "duplicate key" (same class of crash as actr_buffers, 2026-06-01).
+            # ON CONFLICT DO UPDATE mutates in place; behaviour matches OR REPLACE
+            # (a re-persist of an existing skill_id overwrites every column).
             self._db.execute(
-                "INSERT OR REPLACE INTO procedural_skills "
+                "INSERT INTO procedural_skills "
                 "(skill_id, name, nl_description, embedding_id, executable_spec, "
                 " preconditions, postconditions, compiled_from, success_count, "
                 " failure_count, last_used, created_at, utility_score, verified_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (skill_id) DO UPDATE SET "
+                "name = excluded.name, nl_description = excluded.nl_description, "
+                "embedding_id = excluded.embedding_id, "
+                "executable_spec = excluded.executable_spec, "
+                "preconditions = excluded.preconditions, "
+                "postconditions = excluded.postconditions, "
+                "compiled_from = excluded.compiled_from, "
+                "success_count = excluded.success_count, "
+                "failure_count = excluded.failure_count, "
+                "last_used = excluded.last_used, created_at = excluded.created_at, "
+                "utility_score = excluded.utility_score, "
+                "verified_at = excluded.verified_at",
                 [
                     skill_id, name, nl_description, embedding_id, spec_json,
                     pre_json, post_json, cf_json,

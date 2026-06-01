@@ -162,10 +162,23 @@ class ActrBufferStore:
         ts_val = float(ts) if ts is not None else float(self._clock())
         concepts_json = json.dumps(concept_ids, ensure_ascii=False)
         with self._lock:
+            # True in-place UPSERT (NOT `INSERT OR REPLACE`). DuckDB implements
+            # OR REPLACE as DELETE+INSERT, which re-touches every secondary index
+            # (idx_actr_buffers_chat / idx_actr_buffers_updated) and can corrupt
+            # the ART index → a later commit/revert throws a FATAL "duplicate key
+            # in PRIMARY_actr_buffers" that ABORTS the whole synthesis_worker
+            # (observed crash-loop on the devnet soak DB, 2026-06-01). ON CONFLICT
+            # DO UPDATE mutates the existing row in place, so the PK index is never
+            # deleted+reinserted. INV-Syn-16 (sole writer) preserved.
             self._db.execute(
-                "INSERT OR REPLACE INTO actr_buffers "
+                "INSERT INTO actr_buffers "
                 "(chat_id, buffer_name, content, concept_ids, embedding_hash, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (chat_id, buffer_name) DO UPDATE SET "
+                "content = excluded.content, "
+                "concept_ids = excluded.concept_ids, "
+                "embedding_hash = excluded.embedding_hash, "
+                "updated_at = excluded.updated_at",
                 [chat_id, buffer_name, content, concepts_json, emb_hash, ts_val],
             )
             self._writes_seen += 1
