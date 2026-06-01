@@ -34,7 +34,7 @@ INDEX_PATH = REPO_ROOT / "titan-docs" / "specs" / "ARCHITECTURE_mainnet_birth_re
 SECTION_RE = re.compile(r"^(#{2,4})\s+(§[\w\.]+(?:[A-Z])?)\s*[—-]\s*(.+?)\s*$")
 # §A invariants are a markdown table: | INV-MBR-N | invariant text | YYYY-MM-DD |
 INVARIANT_ROW_RE = re.compile(
-    r"^\|\s*(INV-MBR-\d+)\s*\|\s*(.+?)\s*\|\s*(\d{4}-\d{2}-\d{2})\s*\|\s*$"
+    r"^\|\s*(INV-MBR-\d+[a-z]?)\s*\|\s*(.+?)\s*\|\s*(\d{4}-\d{2}-\d{2})\s*\|\s*$"
 )
 FRONTMATTER_VERSION_RE = re.compile(r"^version:\s*(.+?)\s*$")
 FRONTMATTER_UPDATED_RE = re.compile(r"^last_updated:\s*(.+?)\s*$")
