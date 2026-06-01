@@ -13502,20 +13502,39 @@ def run_session_close(title: str = "", commit: bool = True,
     date_str = now.strftime("%Y%m%d")
     date_human = now.strftime("%Y-%m-%d")
 
-    # ── 1. Find the most recent JSONL session file ──
+    # ── 1. Resolve THIS session's JSONL DETERMINISTICALLY (not by mtime) ──
+    # The harness sets CLAUDE_CODE_SESSION_ID and the JSONL filename == that
+    # sessionId. mtime-based selection was the long-standing parser bug: with
+    # many parallel + historical session files (and git worktree checkouts
+    # touching mtimes), "latest mtime" frequently picked the WRONG / shorter
+    # session → cross-session bleed AND "only ~10% parsed". Deterministic id
+    # targeting fixes both. (Verified 2026-06-01: one file per session,
+    # filename == sessionId, no session spans >1 file.)
     jsonl_dir = os.path.expanduser(
         "~/.claude/projects/-home-antigravity-projects-titan")
-    jsonl_files = sorted(
-        _glob.glob(os.path.join(jsonl_dir, "*.jsonl")),
-        key=os.path.getmtime, reverse=True)
+    env_sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    jsonl_path = ""
+    if env_sid:
+        cand = os.path.join(jsonl_dir, f"{env_sid}.jsonl")
+        if os.path.exists(cand):
+            jsonl_path = cand
+        else:
+            print(f"  ⚠ CLAUDE_CODE_SESSION_ID={env_sid[:8]} set but {cand} "
+                  f"missing — falling back to latest-mtime guess")
+    if not jsonl_path:
+        jsonl_files = sorted(
+            _glob.glob(os.path.join(jsonl_dir, "*.jsonl")),
+            key=os.path.getmtime, reverse=True)
+        if not jsonl_files:
+            print("ERROR: No JSONL session files found in", jsonl_dir)
+            return
+        jsonl_path = jsonl_files[0]
+        print("  ⚠ session id not in env — used latest-mtime guess; VERIFY "
+              "this transcript is THIS session before relying on it")
 
-    if not jsonl_files:
-        print("ERROR: No JSONL session files found in", jsonl_dir)
-        return
-
-    jsonl_path = jsonl_files[0]
     session_id = os.path.basename(jsonl_path).replace(".jsonl", "")
     short_id = session_id[:8]
+    _target_sid = session_id  # defensive per-entry sessionId filter (below)
 
     print(f"\n  SESSION CLOSE — {date_human}")
     print("=" * 70)
@@ -13545,12 +13564,23 @@ def run_session_close(title: str = "", commit: bool = True,
     pending_decisions: dict = {}
     decisions: list[dict] = []
 
+    _lines_total = 0
+    _entries_kept = 0
     with open(jsonl_path) as f:
         for line in f:
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            _lines_total += 1
+            # Defensive completeness/purity guards (belt-and-suspenders on top
+            # of deterministic file targeting): never let a subagent sidechain
+            # or a stray other-session entry bleed into THIS transcript.
+            if obj.get("isSidechain"):
+                continue
+            if obj.get("sessionId") and obj.get("sessionId") != _target_sid:
+                continue
+            _entries_kept += 1
 
             msg_type = obj.get("type")
             if msg_type not in ("user", "assistant"):
