@@ -192,7 +192,8 @@ class _PluginRuntime:
                   heal_history_24h: list[dict] | None = None,
                   last_heal_at: float | None = None,
                   consecutive_failures: int = 0,
-                  last_heal_failed_emit_ts: float | None = None) -> None:
+                  last_heal_failed_emit_ts: float | None = None,
+                  last_result: dict | None = None) -> None:
         self.plugin = plugin
         self.next_fire_time: float = (
             next_fire_time if next_fire_time is not None else now)
@@ -206,7 +207,17 @@ class _PluginRuntime:
         # alert so we don't spam HEALTH_HEAL_FAILED every tick.
         self.last_heal_failed_emit_ts: float | None = (
             last_heal_failed_emit_ts)
+        # AUDIT §C fix (rFP §P2): restore last_result on boot. It was written to
+        # state.json (to_state_dict) but never passed back into the constructor
+        # → permanently None until the next check completed, losing the persisted
+        # last-known health status across respawn. to_dict() keys match the
+        # HealthResult dataclass fields, so HealthResult(**saved) round-trips.
         self.last_result: HealthResult | None = None
+        if isinstance(last_result, dict):
+            try:
+                self.last_result = HealthResult(**last_result)
+            except (TypeError, ValueError):
+                self.last_result = None
         # Maps correlation_id → {sent_ts, action, details} for in-flight
         # HEAL_REQUEST awaiting HEAL_RESULT.
         self.pending_heals: dict[str, dict] = {}
@@ -634,6 +645,7 @@ def health_monitor_worker_main(recv_queue, send_queue, name: str,
                 saved.get("consecutive_failures", 0)),
             last_heal_failed_emit_ts=saved.get(
                 "last_heal_failed_emit_ts"),
+            last_result=saved.get("last_result"),
         )
 
     logger.info(

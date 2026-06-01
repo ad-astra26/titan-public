@@ -264,6 +264,12 @@ class Neuromodulator:
             "setpoint": round(self.setpoint, 4),
             "peak": round(self._peak_level, 4),
             "trough": round(self._trough_level, 4),
+            # AUDIT §C fix (rFP §P2): activation_history drives the homeostatic
+            # sensitivity adaptation + allostatic setpoint drift (lines 232-245).
+            # It was in from_state() but NOT in this shallow get_state/restore
+            # path (the one _save_state/_load_state actually use) → the adaptation
+            # layer froze for ~50-100 samples after every respawn. Now persisted.
+            "activation_history": list(self._activation_history),
         }
 
     def restore_state(self, state: dict) -> None:
@@ -271,6 +277,9 @@ class Neuromodulator:
         self.tonic_level = state.get("tonic", self.tonic_level)
         self.sensitivity = state.get("sensitivity", self.sensitivity)
         self.setpoint = state.get("setpoint", self.setpoint)
+        hist = state.get("activation_history")
+        if isinstance(hist, list):
+            self._activation_history = [float(x) for x in hist][-self._history_max:]
 
 
 # PERSISTENCE_BY_DESIGN: NeuromodulatorSystem._total_evaluations is a
