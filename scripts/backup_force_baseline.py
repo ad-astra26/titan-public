@@ -65,8 +65,20 @@ def _resolve_titan_id(cli_arg: Optional[str]) -> str:
     return "T1"
 
 
-async def _do_baseline(titan_id: str, dry_run: bool, force: bool) -> int:
-    """Returns exit code: 0 = success, 1-9 = various failure modes."""
+async def _do_baseline(titan_id: str, dry_run: bool, force: bool,
+                       soul_first: bool = False) -> int:
+    """Returns exit code: 0 = success, 1-9 = various failure modes.
+
+    soul_first=True: the SPEC §24.4.C soul-tier FIRST baseline. The 05-29
+    bootstrap deliberately skipped soul (lines below), so every Sunday soul
+    package has since full-shipped consciousness.db (no baseline to diff
+    against) → 530 MB → 402. This mode ships the soul tier FULL as its first
+    baseline while keeping personality/timechain as cheap diffs against the
+    EXISTING baseline (forced incremental — today is a month-boundary day but
+    we deliberately do NOT re-baseline personality, just 3 days after 05-29).
+    After ship it refreshes the soul files into the baseline working dir so
+    the next Sunday soul package diffs (xdelta3) instead of full-shipping.
+    """
     # Lazy imports — heavy modules
     os.environ["TITAN_ID"] = titan_id
     from titan_hcl.config_loader import load_titan_config
@@ -99,7 +111,17 @@ async def _do_baseline(titan_id: str, dry_run: bool, force: bool) -> int:
         return 4
 
     existing = manifest.events
-    if existing and not force:
+    if soul_first:
+        # soul-first APPENDS to an existing chain (it needs the personality
+        # baseline to diff against) — existing events are REQUIRED, not a
+        # block condition.
+        if not existing:
+            logger.error(
+                "[force-baseline] --soul-first-baseline needs an existing "
+                "personality baseline to diff against; manifest is empty. "
+                "Run a normal baseline first.")
+            return 5
+    elif existing and not force:
         latest = manifest.get_latest_event()
         logger.error(
             "[force-baseline] manifest already has %d event(s); latest "
@@ -128,8 +150,26 @@ async def _do_baseline(titan_id: str, dry_run: bool, force: bool) -> int:
         "[force-baseline] ArweaveStore wired (network=%s, keypair=%s)",
         net, keypair_path)
 
+    # §24.7.a — in-process ZK-Vault network client (identity keypair is already
+    # in this process; signs the v=3 chain commit). Without it
+    # commit_event_v3_chain returns None ("no network client") → event fails
+    # AFTER the Arweave uploads already spent SOL (orphaned). Mirrors
+    # backup_worker.py's HybridNetworkClient wiring.
+    backup_network = None
+    if net == "mainnet":
+        try:
+            from titan_hcl.core.network import HybridNetworkClient
+            backup_network = HybridNetworkClient(config=net_cfg)
+            logger.info("[force-baseline] in-process ZK network client wired "
+                        "(§24.7.a) — v=3 chain commit can sign")
+        except Exception as e:
+            logger.error(
+                "[force-baseline] HybridNetworkClient wiring FAILED: %s — "
+                "v=3 chain commit will fail; aborting before any SOL spend", e)
+            return 6
+
     backup = RebirthBackup(
-        network_client=None,
+        network_client=backup_network,
         config=cfg.get("memory_and_storage", {}),
         titan_id=titan_id,
         arweave_store=arweave_store,
@@ -141,13 +181,13 @@ async def _do_baseline(titan_id: str, dry_run: bool, force: bool) -> int:
     t_specs = backup._tier_specs_from_paths(
         backup.TIMECHAIN_PATHS, format_hint="timechain_bin",
     )
-    # Soul tier weekly-only — bootstrap event is run on-demand (could be any
-    # weekday); per SPEC §24.3 only Sunday meditation events include soul.
-    # Bootstrap deliberately SKIPS soul so the baseline isn't bloated with
-    # consciousness.db (4.2 GB raw → could push RSS into swap territory even
-    # with streaming). Next Sunday's meditation will create a soul-inclusive
-    # incremental that anchors against this baseline.
-    s_specs = None
+    # Soul tier. Normal bootstrap SKIPS soul (the original first-baseline was
+    # personality+timechain only — that's exactly why soul never got an
+    # Arweave baseline). --soul-first-baseline includes it FULL.
+    if soul_first:
+        s_specs = backup._tier_specs_from_paths(backup.WEEKLY_EXTRA_PATHS)
+    else:
+        s_specs = None
 
     # ── Estimate sizes from tier specs (dry-run gate) ──────────────────
     total_personality_bytes = 0
@@ -165,19 +205,42 @@ async def _do_baseline(titan_id: str, dry_run: bool, force: bool) -> int:
         else:
             missing_timechain.append(s.source_path)
 
-    # Estimated post-gzip cost: assume 35% compression ratio (observed)
+    # Soul tier raw size (full-shipped in soul_first mode)
+    total_soul_bytes = 0
+    missing_soul = []
+    if soul_first:
+        for s in s_specs:
+            if os.path.exists(s.source_path):
+                total_soul_bytes += os.path.getsize(s.source_path)
+            else:
+                missing_soul.append(s.source_path)
+
+    # Estimated post-zstd cost: assume 35% compression ratio (observed).
+    # NOTE: in soul_first mode personality/timechain ship as DIFFS (xdelta3
+    # vs the existing baseline), so their FULL-size estimate here is an
+    # UPPER bound — the diff payloads are far smaller. Soul is full-ship.
     est_p_mb = total_personality_bytes * 0.35 / (1 << 20)
     est_t_mb = total_timechain_bytes * 0.35 / (1 << 20)
-    total_mb = est_p_mb + est_t_mb
+    est_s_mb = total_soul_bytes * 0.35 / (1 << 20)
+    total_mb = est_p_mb + est_t_mb + est_s_mb
     # Irys cost: ~0.0004 SOL per MB at mainnet pricing (Irys docs)
     est_sol_cost = total_mb * 0.0004
-    logger.info(
-        "[force-baseline] size estimate: personality=%.1f MB (raw=%.0f MB), "
-        "timechain=%.1f MB (raw=%.0f MB), total compressed ≈ %.1f MB, "
-        "est cost ≈ %.4f SOL",
-        est_p_mb, total_personality_bytes / (1 << 20),
-        est_t_mb, total_timechain_bytes / (1 << 20),
-        total_mb, est_sol_cost)
+    if soul_first:
+        logger.info(
+            "[force-baseline] SOUL-FIRST estimate: soul=%.1f MB FULL "
+            "(raw=%.0f MB) ≈ %.4f SOL; personality+timechain ship as DIFFS "
+            "(upper bound full=%.1f MB — real diff payload is far smaller). "
+            "Forced event_type=incremental (no personality re-baseline).",
+            est_s_mb, total_soul_bytes / (1 << 20), est_s_mb * 0.0004,
+            est_p_mb + est_t_mb)
+    else:
+        logger.info(
+            "[force-baseline] size estimate: personality=%.1f MB (raw=%.0f MB), "
+            "timechain=%.1f MB (raw=%.0f MB), total compressed ≈ %.1f MB, "
+            "est cost ≈ %.4f SOL",
+            est_p_mb, total_personality_bytes / (1 << 20),
+            est_t_mb, total_timechain_bytes / (1 << 20),
+            total_mb, est_sol_cost)
     if missing_personality:
         logger.warning(
             "[force-baseline] %d personality paths missing on disk (will "
@@ -196,14 +259,22 @@ async def _do_baseline(titan_id: str, dry_run: bool, force: bool) -> int:
 
     # ── Confirm with Maker before spending SOL ─────────────────────────
     print()
-    print(f"=== CONFIRM BASELINE COMMIT — Titan {titan_id} mainnet ===")
-    print(f"  Estimated upload size: {total_mb:.1f} MB compressed")
-    print(f"  Estimated SOL cost:    {est_sol_cost:.4f} SOL")
-    print(f"  Files in scope:        {len(p_specs)} personality + "
-          f"{len(t_specs)} timechain")
+    if soul_first:
+        print(f"=== CONFIRM SOUL-FIRST-BASELINE COMMIT — Titan {titan_id} mainnet ===")
+        print(f"  Soul tier:             {est_s_mb:.1f} MB FULL ≈ {est_s_mb*0.0004:.4f} SOL")
+        print(f"  Personality/timechain: DIFFS vs existing baseline (cheap)")
+        print(f"  Event type:            incremental (NO personality re-baseline)")
+        print(f"  Soul paths in scope:   {len(s_specs)}")
+    else:
+        print(f"=== CONFIRM BASELINE COMMIT — Titan {titan_id} mainnet ===")
+        print(f"  Estimated upload size: {total_mb:.1f} MB compressed")
+        print(f"  Estimated SOL cost:    {est_sol_cost:.4f} SOL")
+        print(f"  Files in scope:        {len(p_specs)} personality + "
+              f"{len(t_specs)} timechain")
     print()
-    ans = input("Proceed? Type EXACTLY 'commit baseline' to confirm: ").strip()
-    if ans != "commit baseline":
+    _confirm = "commit soul baseline" if soul_first else "commit baseline"
+    ans = input(f"Proceed? Type EXACTLY '{_confirm}' to confirm: ").strip()
+    if ans != _confirm:
         logger.info("[force-baseline] not confirmed — aborting.")
         return 7
 
@@ -234,16 +305,27 @@ async def _do_baseline(titan_id: str, dry_run: bool, force: bool) -> int:
             except OSError:
                 pass
 
-    async def _zk_commit(event_id, root, prev_root):
-        return await backup.commit_event_merkle_to_zk_vault(
-            event_id=event_id,
-            event_merkle_root=root,
-            prev_event_merkle_root=prev_root,
+    async def _zk_commit(event_id, ts, event_type, event_root, components,
+                         prev_sig):
+        # v=3 sovereign chain commit (chunk 5J-2): one memo per component +
+        # commit_state(event_root) co-bundled with the head. Matches the
+        # pipeline's 6-arg ZkCommitter contract (was a stale 3-arg call that
+        # failed AFTER the uploads → orphaned SOL).
+        return await backup.commit_event_v3_chain(
+            event_id=event_id, ts=ts, event_type=event_type,
+            event_merkle_root=event_root, components=components,
+            prev_sig=prev_sig,
         )
 
     def _baseline_resolver(component, arc_name):
-        # First event has no baseline → resolver returns None → encoders
-        # produce diff_mode="full"
+        if soul_first:
+            # Personality/timechain diff against the EXISTING baseline working
+            # dir; soul files are absent there → resolver returns None → soul
+            # full-ships (its first baseline). This is exactly the per-tier
+            # behavior we want from one forced-incremental event.
+            candidate = os.path.join(base_dir, arc_name)
+            return candidate if os.path.exists(candidate) else None
+        # Normal first-baseline: no baseline → full-ship everything.
         return None
 
     def _bus_emit(name: str, payload: dict) -> None:
@@ -266,6 +348,9 @@ async def _do_baseline(titan_id: str, dry_run: bool, force: bool) -> int:
         arweave_uploader=_arweave_upload,
         zk_committer=_zk_commit,
         bus_emit=_bus_emit,
+        # soul-first stays incremental even on a month-boundary day so it
+        # does NOT redundantly re-baseline personality (just done 05-29).
+        force_event_type="incremental" if soul_first else None,
     )
     dur = time.time() - t0
 
@@ -280,19 +365,59 @@ async def _do_baseline(titan_id: str, dry_run: bool, force: bool) -> int:
             "; ".join(result.errors))
         return 8
 
+    # ── soul-first: refresh soul files into the baseline working dir so the
+    # next Sunday soul package diffs (xdelta3) instead of full-shipping.
+    # CRITICAL for restore integrity: the baseline-dir bytes MUST equal the
+    # bytes we just shipped full to Arweave, so future soul diffs reconstruct
+    # correctly. Copy from source now (the shipped tarball was packed from
+    # these same source paths moments ago). ──
+    if soul_first and result.tiers.get("soul") and result.tiers["soul"].tx_id:
+        import shutil
+        refreshed = 0
+        for entry in backup.WEEKLY_EXTRA_PATHS:
+            if not isinstance(entry, (tuple, list)) or len(entry) < 2:
+                continue
+            src, arc = entry[0], entry[1]
+            if not os.path.exists(src):
+                continue
+            dst = os.path.join(base_dir, arc)
+            try:
+                parent = os.path.dirname(dst)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                if os.path.isdir(src):
+                    if os.path.exists(dst):
+                        shutil.rmtree(dst)
+                    shutil.copytree(src, dst)
+                else:
+                    shutil.copy2(src, dst)
+                refreshed += 1
+            except Exception as e:
+                logger.warning(
+                    "[force-baseline] soul baseline-dir refresh %s → %s "
+                    "FAILED: %s (next Sunday will full-ship this file)",
+                    src, dst, e)
+        logger.info(
+            "[force-baseline] refreshed %d soul path(s) into baseline "
+            "working dir %s — next Sunday soul package will diff (xdelta3)",
+            refreshed, base_dir)
+
     print()
-    print("=== BASELINE EVENT SHIPPED ===")
+    print("=== %s EVENT SHIPPED ===" % (
+        "SOUL-FIRST-BASELINE" if soul_first else "BASELINE"))
     print(f"  event_id:           {result.event_id}")
+    print(f"  event_type:         {result.event_type}")
     print(f"  baseline_trigger:   {result.baseline_trigger}")
     print(f"  duration:           {dur:.1f}s")
     print(f"  event_merkle_root:  {result.event_merkle_root}")
     print(f"  zk_commit_tx:       {result.zk_commit_tx}")
-    for tier_name in ("personality", "timechain"):
+    for tier_name in ("personality", "timechain", "soul"):
         t = result.tiers.get(tier_name)
         if t is None:
             continue
         size_mb = t.tarball_size_bytes / (1 << 20)
-        print(f"  {tier_name} tx_id:  {t.tx_id}  ({size_mb:.1f} MB)")
+        print(f"  {tier_name} tx_id:  {t.tx_id}  ({size_mb:.1f} MB, "
+              f"packed={t.files_packed} skipped={t.files_skipped})")
     print()
     print(f"  Manifest written:   data/backup_unified_manifest_{titan_id}.json")
     print()
@@ -319,6 +444,12 @@ def main() -> int:
                         "confirmation prompt.")
     p.add_argument("--force", action="store_true",
                    help="Override existing-manifest check (admin operation; rare).")
+    p.add_argument("--soul-first-baseline", action="store_true",
+                   help="Ship the SPEC §24.4.C soul-tier FIRST baseline (soul "
+                        "FULL + personality/timechain DIFFS, forced incremental). "
+                        "Establishes the soul baseline the 05-29 bootstrap "
+                        "skipped, so weekly Sunday soul packages diff (xdelta3) "
+                        "instead of full-shipping consciousness.db every week.")
     args = p.parse_args()
 
     titan_id = _resolve_titan_id(args.titan_id)
@@ -328,6 +459,7 @@ def main() -> int:
         titan_id=titan_id,
         dry_run=args.dry_run,
         force=args.force,
+        soul_first=args.soul_first_baseline,
     ))
 
 
