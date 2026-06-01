@@ -403,6 +403,17 @@ def outer_interface_worker_main(recv_queue, send_queue, name: str, config: dict)
 
     # === MODULE-SPECIFIC: OuterInterface init ===
     outer_interface = _init_outer_interface(config, titan_id)
+    if outer_interface is not None:
+        # AUDIT §C fix (rFP §P2): restore advisor refractory + composition +
+        # mode/stats from disk on boot. Previously restore_state() was never
+        # called → fresh blank state every respawn (the save side was also a
+        # NOP, now fixed). No-op on first boot (file absent).
+        try:
+            outer_interface.load_state()
+        except Exception as _ld_err:  # noqa: BLE001
+            logger.warning(
+                "[OuterInterfaceWorker] outer_interface.load_state() failed: %s",
+                _ld_err)
     if outer_interface is None:
         # Defensive — _init_outer_interface logs the failure. Fall into
         # heartbeat-only loop so guardian doesn't restart-loop us.
