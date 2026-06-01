@@ -1056,7 +1056,11 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         # FAISS store (Phase A) so ConsolidationPass clusters by COSINE (0.85)
         # AND tags, not tags alone — the precondition for real concept synthesis.
         def _mine_with_embeddings(since_ts, exclude_forks):
-            cands = default_mine_recent_txs(since_ts, exclude_forks)
+            # default_mine_recent_txs is keyword-only (def ...(*, since_ts, ...));
+            # a positional call raised TypeError every dream → mine aborted →
+            # txs_mined=0 → no concepts (2026-06-01, with the SQL-column fix).
+            cands = default_mine_recent_txs(
+                since_ts=since_ts, exclude_forks=exclude_forks)
             if synth_vector_store is None:
                 return cands
             for c in cands:
