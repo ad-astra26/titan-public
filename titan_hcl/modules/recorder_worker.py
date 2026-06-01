@@ -97,6 +97,19 @@ def recorder_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
         scholar = SageScholar(recorder)
         gatekeeper = SageGatekeeper(scholar, recorder)
 
+        # AUDIT §C fix (rFP §P2): restore the IQL policy weights on boot so the
+        # offline-RL training survives kill-respawn. recorder is heavy
+        # (kill-respawn-only); the actor/qvalue/value MLPs were previously never
+        # persisted → reset to random init on every respawn, discarding all
+        # 'dream' training. Flushed on SAVE_NOW + MODULE_SHUTDOWN below.
+        _iql_ckpt_path = os.path.join(
+            config.get("data_dir", "./data"), "sage_scholar_iql.pt")
+        try:
+            scholar.load_checkpoint(_iql_ckpt_path)
+        except Exception as _ld_err:  # noqa: BLE001
+            logger.warning(
+                "[RecorderWorker] IQL checkpoint load failed: %s", _ld_err)
+
         init_ms = (time.time() - init_start) * 1000
         logger.info("[RecorderWorker] Sage subsystems ready in %.0fms", init_ms)
     except Exception as e:
@@ -214,8 +227,27 @@ def recorder_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
                     "failed: %s", _probe_err)
             continue
 
+        if msg_type == bus.SAVE_NOW:
+            # AUDIT §C fix (rFP §P2): SAVE_NOW was defined but never handled.
+            # Flush IQL weights on graceful restart (SAVE_NOW → SAVE_DONE →
+            # SIGTERM) so the offline-RL policy survives.
+            try:
+                scholar.save_checkpoint(_iql_ckpt_path)
+            except Exception as _sv_err:  # noqa: BLE001
+                logger.warning(
+                    "[RecorderWorker] SAVE_NOW checkpoint failed: %s", _sv_err)
+            continue
+
         if msg_type == bus.MODULE_SHUTDOWN:
-            logger.info("[RecorderWorker] Shutdown requested")
+            logger.info(
+                "[RecorderWorker] Shutdown requested — saving IQL checkpoint")
+            # AUDIT §C fix (rFP §P2): previously logged + broke with NO save →
+            # all IQL training lost on respawn.
+            try:
+                scholar.save_checkpoint(_iql_ckpt_path)
+            except Exception as _sv_err:  # noqa: BLE001
+                logger.warning(
+                    "[RecorderWorker] shutdown checkpoint failed: %s", _sv_err)
             break
 
         # ── Microkernel v2 Layer 2 (2026-04-28) — Sage subprocess migration ──
