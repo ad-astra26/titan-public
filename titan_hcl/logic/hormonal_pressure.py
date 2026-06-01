@@ -278,6 +278,28 @@ class HormonalPressure:
 
         return intensity
 
+    def consume(self, amount: float) -> float:
+        """Deplete this hormone's level when a downstream EXPRESSION composite
+        fires (cross-process restoration of the monolith refractory loop).
+
+        Uses the SAME proportional formula ExpressionManager.evaluate_all
+        applied in-process before the Phase C split: low-level hormones lose
+        proportionally less (the +0.1 floor prevents a small hormone being
+        zeroed by a flat depletion). Level depletion IS the natural cooldown —
+        a lower level takes longer to rebuild past threshold. Refractory is
+        deliberately NOT touched here (it is owned exclusively by fire(), and
+        setting it here would bypass fire_count tracking — same rationale as
+        the original evaluate_all consumption block).
+
+        Returns the actual level delta (old - new) for telemetry.
+        """
+        if amount <= 0.0:
+            return 0.0
+        old = self.level
+        self.level = max(0.0, self.level * (
+            1.0 - min(1.0, amount / max(0.01, self.level + 0.1))))
+        return old - self.level
+
     def adapt_threshold(self, reward: float, lr: float = 0.01) -> None:
         """IQL-based threshold adaptation from action outcomes."""
         if reward > 0:
