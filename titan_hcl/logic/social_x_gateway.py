@@ -594,7 +594,7 @@ class SocialXGateway:
             "session": sx.get("session", tw.get("auth_session", "")),
             "proxy": sx.get("proxy", tw.get("webshare_static_url", "")),
             "api_key": sx.get("api_key", sage.get("twitterapi_io_key", "")),
-            "user_name": sx.get("user_name", tw.get("user_name", "")),
+            "user_name": sx.get("user_name", tw.get("user_name", "iamtitanai")),
             # URL shortener domain
             "url_domain": sx.get("url_domain", "https://iamtitan.tech"),
             # Consumer permissions: {consumer_name: "post,reply,like,search"}
@@ -2637,7 +2637,7 @@ class SocialXGateway:
                 result = self._call_x_api(
                     "twitter/user/last_tweets",
                     method="GET",
-                    payload={"userName": config.get("user_name", ""),
+                    payload={"userName": config.get("user_name", "iamtitanai"),
                              "count": 10},
                     api_key=config.get("api_key", ""),
                     bypass_cache=(attempt > 0),
@@ -4076,7 +4076,7 @@ class SocialXGateway:
             "DM me", "check out my", "airdrop", "giveaway",
             "free mint", "follow back", "send me", "drop your wallet"
         ])
-        user_name = config.get("user_name", "")
+        user_name = config.get("user_name", "iamtitanai")
         grounded_words = grounded_words or []
         now = time.time()
 

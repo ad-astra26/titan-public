@@ -91,7 +91,7 @@ def _cmd_resurrect(args: argparse.Namespace, repo_root: Path) -> int:
                       minimal=args.minimal, skip_genesis=False, tag=args.tag,
                       build_rust=args.build_rust, prompter=None,
                       resurrect=True, rpc_url=args.rpc_url, verify_only=args.verify_only,
-                      config_src=args.config, titan_pubkey=args.titan_pubkey)
+                      config_src=args.config)
 
 
 def cmd_install(args: argparse.Namespace) -> int:
@@ -145,9 +145,7 @@ def cmd_install(args: argparse.Namespace) -> int:
         cprint("  Mainnet genesis BURNS the plaintext key after a Shamir 2-of-3 split. "
                "Your only recovery from a lost box is `setup_titan restore` (resurrection "
                "from your offline Shard-1 + the on-chain shard). Record your Shard-1 and "
-               "your Titan's PUBLIC address — that is ALL you need: the wallet + chain + "
-               "Arweave supply everything else (NO off-site manifest, NO backup files). "
-               "Resurrection is MAINNET-ONLY.",
+               "keep an off-site copy of your backup manifest — resurrection is MAINNET-ONLY.",
                role="warning")
 
     fails = _render_preflight(run_preflight(repo_root, mode))
@@ -182,8 +180,7 @@ def cmd_restore(args: argparse.Namespace) -> int:
         Path(__file__).resolve().parents[2]
     return run_restore(
         repo_root, shard1=args.shard1, shard1_file=args.shard1_file,
-        titan_pubkey=args.titan_pubkey, manifest=args.manifest,
-        titan_id=args.titan_id, network=args.network,
+        manifest=args.manifest, titan_id=args.titan_id, network=args.network,
         verify_zk=args.verify_zk, verify_only=args.verify_only, force=args.force)
 
 
@@ -265,26 +262,17 @@ def build_parser() -> argparse.ArgumentParser:
                          "(for operators who opted config.toml OUT of their backup).")
     pi.add_argument("--titan-id", default=None,
                     help="With --resurrect: Titan id (default: resolved from your shard).")
-    pi.add_argument("--titan-pubkey", default=None,
-                    help="With --resurrect: your Titan's PUBLIC wallet address "
-                         "(printed alongside Shard-1; not a secret). NO envelope/"
-                         "manifest needed — the wallet discovers everything.")
     pi.set_defaults(func=cmd_install)
 
     pr = sub.add_parser("restore",
                         help="Resurrect a mainnet-born Titan from your Maker shard + chain")
     pr.add_argument("--shard1", default=None,
-                    help="Maker raw Shard-1 (hex). Omit to be prompted with no echo.")
+                    help="Maker Shard-1 envelope (hex). Omit to be prompted with no echo.")
     pr.add_argument("--shard1-file", default=None,
-                    help="Path to a file holding the raw Maker Shard-1 hex.")
-    pr.add_argument("--titan-pubkey", default=None,
-                    help="Your Titan's PUBLIC wallet address (printed alongside "
-                         "Shard-1; not a secret). Required on a fresh box — the "
-                         "wallet discovers Shard-3 + the v=3 chain. NO manifest needed.")
+                    help="Path to a file holding the Maker Shard-1 envelope.")
     pr.add_argument("--manifest", default=None,
-                    help="LEGACY/DEBUG ONLY: an off-site UnifiedManifest JSON. Omit "
-                         "it — the sovereign v=3 chain restore needs no manifest.")
-    pr.add_argument("--titan-id", default=None, help="Titan id (default: from record, else T1).")
+                    help="Your off-site UnifiedManifest JSON (REQUIRED on a fresh box).")
+    pr.add_argument("--titan-id", default=None, help="Titan id (default: from envelope, else T1).")
     pr.add_argument("--install-root", default=None, help="Target install tree (default: this repo).")
     pr.add_argument("--network", choices=["mainnet", "devnet"], default="mainnet",
                     help="Arweave/Solana network (default: mainnet).")

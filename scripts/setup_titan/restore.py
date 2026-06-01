@@ -14,11 +14,9 @@ This wrapper:
   3. Delegates to the modernized `scripts/resurrection.py` phases (identity →
      Arweave restore → first breath).
 
-The heavy lifting (SSS reconstruction, on-chain v=3 chain walk, Merkle verify,
-in-place restore, bootable-identity materialization) lives in resurrection.py —
-this wrapper is the guided front door + the no-capture shard prompt. By default
-it drives the SOVEREIGN v=3 chain (no manifest, no off-site files); --manifest
-selects the legacy fallback only.
+The heavy lifting (SSS reconstruction, manifest walk, Merkle verify, in-place
+restore, bootable-identity materialization) lives in resurrection.py — this
+wrapper is the guided front door + the no-capture shard prompt.
 """
 from __future__ import annotations
 
@@ -44,7 +42,6 @@ def run_restore(
     *,
     shard1: str | None = None,
     shard1_file: str | None = None,
-    titan_pubkey: str | None = None,
     manifest: str | None = None,
     titan_id: str | None = None,
     network: str = "mainnet",
@@ -78,23 +75,16 @@ def run_restore(
             cprint("No shard provided — aborting.", role="error")
             return 1
 
-    # ── Public Titan address (printed alongside Shard-1; NOT a secret) ────────
-    if not titan_pubkey and not shard1_file:
-        cprint("Enter your Titan's PUBLIC wallet address (printed with your Shard-1). "
-               "The wallet discovers Shard-3 + your v=3 backup chain from it — NO "
-               "off-site manifest or backup files are needed (Shard-1 + the chain "
-               "are enough).", role="text_strong")
-        try:
-            titan_pubkey = input("  Titan address: ").strip() or None
-        except (EOFError, KeyboardInterrupt):
-            print()
-            cprint("Resurrection cancelled — no address entered.", role="warning")
-            return 130
+    if network == "mainnet" and not manifest:
+        # A fresh box has no local manifest; the off-site copy is required.
+        cprint("Tip: a fresh box needs your off-site UnifiedManifest copy "
+               "(--manifest). Without it, resurrection cannot find the chain.",
+               role="warning")
 
     res = _load_resurrection()
     args = SimpleNamespace(
         shard1=shard1, shard1_file=shard1_file, shard2_local=False,
-        titan_id=titan_id, titan_pubkey=titan_pubkey, das_rpc_url=None,
+        titan_id=titan_id,
     )
 
     try:

@@ -174,15 +174,11 @@ def build_v3_memo(
     mode: str,
     prev_sig: Optional[str] = None,
     url_key: Optional[bytes] = None,
-    iv_b64: Optional[str] = None,
 ) -> str:
     """Build the canonical v=3 memo string. Pure — no I/O.
 
     `event_type`: "baseline" or "incremental" (recorded on-chain as typ=B|I).
-    `mode`: "A" (plaintext data, encrypted URL via `url_key`) or "B" (ENCRYPTED
-        data, plaintext URL). Mode B REQUIRES `iv_b64` — the random AES-GCM IV of
-        the encrypted component tarball — so a wallet-only restore can re-derive
-        the per-backup key (from the soul keypair + arc[:16]) and decrypt (G2).
+    `mode`: "A" (encrypt URL with `url_key`) or "B" (plaintext URL).
     `prev_sig`: prior event's Solana signature; None/"" → `genesis`.
     Raises ValueError on malformed input or if the memo exceeds the Solana cap.
     """
@@ -206,21 +202,10 @@ def build_v3_memo(
     if not arweave_tx:
         raise ValueError("arweave_tx required")
 
-    # Mode-B carries the encrypted tarball's IV (12 bytes → 16 b64 chars). Mode-A
-    # has plaintext data on Arweave, so no IV is needed (or permitted).
-    if mode == "B":
-        if not iv_b64:
-            raise ValueError("Mode B requires iv_b64 (the encrypted-tarball AES IV)")
-        if not re.fullmatch(r"[A-Za-z0-9+/=]{16,24}", iv_b64):
-            raise ValueError(f"iv_b64 malformed: {iv_b64!r}")
-    elif iv_b64:
-        raise ValueError("Mode A must NOT carry an iv (data is plaintext)")
-
     arc = archive_hash[:HASH_FRAGMENT_LEN]
     mrkl = merkle_root[:HASH_FRAGMENT_LEN]
     prev = prev_sig[:PREV_FRAGMENT_LEN] if prev_sig else "genesis"
     url = _url_field(arweave_tx, mode, url_key)
-    iv_field = f"iv={iv_b64};" if mode == "B" else ""
 
     memo = (
         f"v={V3_MEMO_VERSION};"
@@ -231,7 +216,6 @@ def build_v3_memo(
         f"arc={arc};"
         f"mrkl={mrkl};"
         f"url={url};"
-        f"{iv_field}"
         f"prev={prev}"
     )
     n = len(memo.encode("utf-8"))
@@ -251,7 +235,6 @@ V3_MEMO_PATTERN = re.compile(
     r"arc=(?P<arc>[0-9a-f]{32});"
     r"mrkl=(?P<mrkl>[0-9a-f]{32});"
     r"url=(?P<url>(?:enc:[A-Za-z0-9+/=]+)|(?:raw:[^;]+));"
-    r"(?:iv=(?P<iv>[A-Za-z0-9+/=]{16,24});)?"   # Mode-B only (encrypted-tarball IV)
     r"prev=(?P<prev>genesis|[1-9A-HJ-NP-Za-km-z]{1,16})$"
 )
 
@@ -270,12 +253,6 @@ def parse_v3_memo(memo: str) -> Optional[dict]:
         return None
     url = m.group("url")
     mode = "A" if url.startswith("enc:") else "B"
-    iv = m.group("iv")
-    # Schema integrity: Mode B MUST carry an iv; Mode A MUST NOT.
-    if mode == "B" and not iv:
-        return None
-    if mode == "A" and iv:
-        return None
     return {
         "version": 3,
         "event_id": m.group("evt"),
@@ -287,7 +264,6 @@ def parse_v3_memo(memo: str) -> Optional[dict]:
         "mrkl": m.group("mrkl"),
         "mode": mode,
         "url": url,
-        "iv": iv,
         "prev": m.group("prev"),
     }
 
