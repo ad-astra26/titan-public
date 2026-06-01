@@ -9,8 +9,11 @@ costs ~30K tokens. This script produces a compact (~200-line) index that:
      so future sessions can `Read offset=N limit=L` directly into the relevant
      section without scanning.
   2. Extracts the `## §21 — Decision Log` D-SPEC-NN entries into a
-     reverse-chronological table — pairs with the SPEC Changelog at the top
-     of SPEC_titan_architecture.md.
+     reverse-chronological table — pairs with the SPEC Changelog
+     (`SPEC_changelog.md`). Since Tier 1b SPEC-leaning (2026-06-01) the §21
+     Decision Log lives in the companion `SPEC_decision_log.md`; the main SPEC
+     keeps only a pointer stub. This generator parses D-SPEC entries from the
+     companion when present (falling back to the main SPEC's §21 if not).
   3. Extracts `## §9.B — Python tree` `#### module_name` sub-blocks into a
      worker → section line map for fast "which §9.B has worker X" lookup.
 
@@ -34,6 +37,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SPEC_PATH = REPO_ROOT / "titan-docs" / "specs" / "SPEC_titan_architecture.md"
 INDEX_PATH = REPO_ROOT / "titan-docs" / "specs" / "SPEC_index.md"
+# §21 Decision Log was extracted to this companion (Tier 1b SPEC-leaning,
+# 2026-06-01). It is the canonical source for D-SPEC-NN entries; the main SPEC
+# §21 is now a pointer stub. `parse_spec` already keys D-SPEC extraction on the
+# `## §21` header, so running it over the companion yields the D-SPEC index.
+DECISION_LOG_PATH = REPO_ROOT / "titan-docs" / "specs" / "SPEC_decision_log.md"
 
 
 SECTION_RE = re.compile(r"^(#{2,4})\s+(§[\w\.]+(?:[A-Z])?)\s*[—-]\s*(.+?)\s*$")
@@ -176,13 +184,16 @@ def render(parsed: dict) -> str:
     out.append("## Decision Log — D-SPEC-NN index (most-recent first)")
     out.append("")
     out.append(
-        "> Pair with **SPEC Changelog** (top of SPEC_titan_architecture.md) for "
-        "recent version bumps. The Decision Log holds the full architectural "
-        "rationale per D-SPEC; the Changelog holds the one-line summary + "
-        "version mapping. Read both at session start; deep-dive via line number."
+        "> Pair with the **SPEC Changelog** (`SPEC_changelog.md`) for recent "
+        "version bumps. The Decision Log holds the full architectural rationale "
+        "per D-SPEC; the Changelog holds the one-line summary + version mapping. "
+        "Read both at session start. **The `Line` column below indexes into "
+        "`SPEC_decision_log.md`** (the §21 Decision Log was extracted there in "
+        "Tier 1b SPEC-leaning, 2026-06-01) — `Read offset=N` that file to "
+        "deep-dive a decision's rationale."
     )
     out.append("")
-    out.append("| D-SPEC | Version Bump | Date | Line | Summary |")
+    out.append("| D-SPEC | Version Bump | Date | Line (SPEC_decision_log.md) | Summary |")
     out.append("|---|---|---|---|---|")
     for d in sorted(parsed["dspecs"], key=lambda x: -x["num"]):
         out.append(
@@ -224,6 +235,15 @@ def main() -> int:
         return 1
     spec_text = SPEC_PATH.read_text()
     parsed = parse_spec(spec_text)
+
+    # D-SPEC entries live in the companion since Tier 1b (the main SPEC §21 is a
+    # pointer stub). Re-parse the companion for D-SPEC entries; fall back to the
+    # main SPEC's §21 only if the companion is absent (pre-extraction state).
+    if DECISION_LOG_PATH.exists():
+        dlog_parsed = parse_spec(DECISION_LOG_PATH.read_text())
+        if dlog_parsed["dspecs"]:
+            parsed["dspecs"] = dlog_parsed["dspecs"]
+
     index_text = render(parsed)
     INDEX_PATH.write_text(index_text)
     print(
