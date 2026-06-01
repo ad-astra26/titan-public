@@ -7,7 +7,7 @@ only unwrapped shapes A (`{"tweets": [...]}`) and B (`{"data": [...]}`).
 Mirror gateway's verify-post unwrap at `social_x_gateway.py:2486-2491`.
 
 These tests are the regression bar — if the response-shape unwrap
-breaks again, this file fails before the bug reaches @iamtitanai.
+breaks again, this file fails before the bug reaches @example_handle.
 """
 import sqlite3
 import time
@@ -95,7 +95,7 @@ def test_shape_c_response_writes_snapshots(teacher_with_db):
          patch.object(teacher, "_get_x_gateway", return_value=mock_gateway), \
          patch.object(EventsTeacher, "_get_api_key",
                       return_value="test-key-non-empty"):
-        config = {"social_x": {"user_name": "iamtitanai"}}
+        config = {"social_x": {"user_name": "example_handle"}}
         items, api_calls = teacher._fetch_own_engagement(
             config, titan_id="T1")
 
@@ -136,7 +136,7 @@ def test_shape_a_response_still_works(teacher_with_db):
          patch.object(teacher, "_get_x_gateway", return_value=mock_gateway), \
          patch.object(EventsTeacher, "_get_api_key",
                       return_value="test-key-non-empty"):
-        config = {"social_x": {"user_name": "iamtitanai"}}
+        config = {"social_x": {"user_name": "example_handle"}}
         teacher._fetch_own_engagement(config, titan_id="T1")
 
     conn = sqlite3.connect(str(tmp_path / "events_teacher.db"), timeout=5)
@@ -166,7 +166,7 @@ def test_shape_b_response_still_works(teacher_with_db):
          patch.object(teacher, "_get_x_gateway", return_value=mock_gateway), \
          patch.object(EventsTeacher, "_get_api_key",
                       return_value="test-key-non-empty"):
-        config = {"social_x": {"user_name": "iamtitanai"}}
+        config = {"social_x": {"user_name": "example_handle"}}
         teacher._fetch_own_engagement(config, titan_id="T1")
 
     conn = sqlite3.connect(str(tmp_path / "events_teacher.db"), timeout=5)
@@ -195,7 +195,7 @@ def test_circuit_breaker_response_skips_writes(teacher_with_db):
          patch.object(teacher, "_get_x_gateway", return_value=mock_gateway), \
          patch.object(EventsTeacher, "_get_api_key",
                       return_value="test-key-non-empty"):
-        config = {"social_x": {"user_name": "iamtitanai"}}
+        config = {"social_x": {"user_name": "example_handle"}}
         teacher._fetch_own_engagement(config, titan_id="T1")
 
     conn = sqlite3.connect(str(tmp_path / "events_teacher.db"), timeout=5)
@@ -223,7 +223,7 @@ def test_empty_tweets_in_shape_c_no_writes(teacher_with_db):
          patch.object(teacher, "_get_x_gateway", return_value=mock_gateway), \
          patch.object(EventsTeacher, "_get_api_key",
                       return_value="test-key-non-empty"):
-        config = {"social_x": {"user_name": "iamtitanai"}}
+        config = {"social_x": {"user_name": "example_handle"}}
         items, api_calls = teacher._fetch_own_engagement(
             config, titan_id="T1")
 
@@ -252,7 +252,7 @@ def test_delta_computation_with_prior_snapshot(teacher_with_db):
          patch.object(teacher, "_get_x_gateway", return_value=mock_gateway), \
          patch.object(EventsTeacher, "_get_api_key",
                       return_value="test-key-non-empty"):
-        config = {"social_x": {"user_name": "iamtitanai"}}
+        config = {"social_x": {"user_name": "example_handle"}}
         teacher._fetch_own_engagement(config, titan_id="T1")
 
         # Second fetch: 5 likes, 1 reply, 0 quotes → delta (+3, +1, 0)

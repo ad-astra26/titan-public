@@ -44,7 +44,7 @@ def _stub_config(g, ttls: dict):
         "max_likes_per_hour": 100, "max_likes_per_day": 1000,
         "max_searches_per_hour": 100, "max_post_length": 500,
         "quality_gate": False, "session": "", "proxy": "",
-        "api_key": "test", "user_name": "iamtitanai",
+        "api_key": "test", "user_name": "example_handle",
         "url_domain": "", "limits": {}, "replies": {},
         "voice": {},
     }
@@ -57,19 +57,19 @@ def test_cache_key_filters_auth_fields(gateway):
     """Cache key must NOT include api_key/proxy/session — same query, different
     auth must hit the same cache entry."""
     k1 = gateway._cache_key_for("twitter/user/mentions", "GET",
-                                 {"userName": "iamtitanai", "count": 20,
+                                 {"userName": "example_handle", "count": 20,
                                   "X-API-Key": "key1"})
     k2 = gateway._cache_key_for("twitter/user/mentions", "GET",
-                                 {"userName": "iamtitanai", "count": 20,
+                                 {"userName": "example_handle", "count": 20,
                                   "X-API-Key": "key2"})
     assert k1 == k2
 
 
 def test_cache_key_payload_order_independent(gateway):
     k1 = gateway._cache_key_for("twitter/user/mentions", "GET",
-                                 {"userName": "iamtitanai", "count": 20})
+                                 {"userName": "example_handle", "count": 20})
     k2 = gateway._cache_key_for("twitter/user/mentions", "GET",
-                                 {"count": 20, "userName": "iamtitanai"})
+                                 {"count": 20, "userName": "example_handle"})
     assert k1 == k2
 
 
@@ -114,10 +114,10 @@ def test_cache_hit_within_ttl(gateway):
 
     with patch("httpx.get", side_effect=fake_get) as mocked:
         r1 = gateway._call_x_api("twitter/user/mentions", method="GET",
-                                  payload={"userName": "iamtitanai", "count": 20},
+                                  payload={"userName": "example_handle", "count": 20},
                                   api_key="test")
         r2 = gateway._call_x_api("twitter/user/mentions", method="GET",
-                                  payload={"userName": "iamtitanai", "count": 20},
+                                  payload={"userName": "example_handle", "count": 20},
                                   api_key="test")
     assert r1 == r2 == fake_response
     assert mocked.call_count == 1  # second call hit cache
@@ -227,11 +227,11 @@ def test_fetch_user_relationships_delegates(gateway):
 
     with patch("httpx.get", side_effect=fake_get):
         result = gateway.fetch_user_relationships(
-            user_name="iamtitanai", relationship="followers",
+            user_name="example_handle", relationship="followers",
             count=50, api_key="test")
     assert result["status"] == "success"
     assert captured["url"] == "https://api.twitterapi.io/twitter/user/followers"
-    assert captured["params"]["userName"] == "iamtitanai"
+    assert captured["params"]["userName"] == "example_handle"
     assert captured["params"]["count"] == 50
 
 
@@ -257,10 +257,10 @@ def test_fetch_recent_tweets_delegates(gateway):
 
     with patch("httpx.get", side_effect=fake_get):
         result = gateway.fetch_recent_tweets(
-            user_name="iamtitanai", count=10, api_key="test")
+            user_name="example_handle", count=10, api_key="test")
     assert result["status"] == "success"
     assert captured["url"] == "https://api.twitterapi.io/twitter/user/last_tweets"
-    assert captured["params"]["userName"] == "iamtitanai"
+    assert captured["params"]["userName"] == "example_handle"
 
 
 def test_search_tweets_delegates(gateway):
