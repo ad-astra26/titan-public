@@ -45,12 +45,20 @@ def parse_jsonl_to_conversation(jsonl_path: str) -> list[dict]:
          "content": str, "timestamp": str, "metadata": dict}
     """
     entries = []
+    # Defensive purity guard: the file is one session, but never let a
+    # subagent sidechain or a stray other-session line bleed in.
+    _target_sid = os.path.basename(jsonl_path).replace(".jsonl", "")
 
     with open(jsonl_path) as f:
         for line in f:
             try:
                 d = json.loads(line.strip())
             except json.JSONDecodeError:
+                continue
+
+            if d.get("isSidechain"):
+                continue
+            if d.get("sessionId") and d.get("sessionId") != _target_sid:
                 continue
 
             entry_type = d.get("type", "")
@@ -229,7 +237,21 @@ def get_session_date(jsonl_path: str) -> str:
 
 
 def find_latest_jsonl() -> str:
-    """Find the most recently modified JSONL file."""
+    """Resolve THIS session's JSONL deterministically.
+
+    Prefer CLAUDE_CODE_SESSION_ID (the harness sets it; the JSONL filename ==
+    sessionId) — this is the fix for the long-standing 'wrong session / only
+    ~10% parsed' bug, where latest-mtime selection picked the wrong file among
+    many parallel + historical sessions (git checkouts also touch mtimes).
+    Fall back to latest mtime only if the env var is unset/missing.
+    """
+    env_sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    if env_sid:
+        cand = Path(JSONL_DIR) / f"{env_sid}.jsonl"
+        if cand.exists():
+            return str(cand)
+        print(f"  ⚠ CLAUDE_CODE_SESSION_ID={env_sid[:8]} set but file missing "
+              f"— falling back to latest-mtime guess", file=sys.stderr)
     jsonls = list(Path(JSONL_DIR).glob("*.jsonl"))
     if not jsonls:
         return ""
