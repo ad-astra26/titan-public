@@ -63,6 +63,11 @@ class ChatResponse(BaseModel):
     state_narration: Optional[str] = None
     state_snapshot: Optional[dict] = None
     ovg: Optional[OVGData] = None
+    # Non-null when a deterministic tool ran this turn (PreHook force / OVG
+    # PostHook salvage): {tool, phase, executed, success, verdict, summary,
+    # salvaged}. Lets the UI show "Titan verified this via its sandbox" + explain
+    # the extra latency. (2026-06-01 tool-backstop.)
+    tool_activity: Optional[dict] = None
 
 
 # ─────────────────────────────────────────────────────────────────────

@@ -3249,11 +3249,13 @@ prehook_force      = true     # PreHook: run the tool BEFORE the LLM, inject ver
 posthook_backstop  = true     # OVG PostHook: salvage a missed call after the LLM
 router_model_class = "fast"   # gemma3:4b — lean, no persona; only runs on gated turns
 router_timeout_s   = 12.0     # soft cap on the fast-model router call
-# Backstop action when the PostHook catches a missed call:
-#   "execute"  — run the tool + anchor verdict + correct the reply (single sandbox exec)
-#   "reprompt" — re-run the main LLM with a lean tool-forced context (2nd full LLM call)
-#   "execute_then_reprompt" — execute; if no code extractable, fall back to reprompt
-backstop_mode      = "execute_then_reprompt"
+# Backstop action: "execute" — the fast-model router emits the exact code and we
+# run it through the coding_sandbox ToolPlug deterministically (anchors a
+# scored_by=oracle TX + injects/appends the TRUE verdict). The deterministic
+# re-execution IS the retry — no 2nd main-LLM round-trip (the codegen router
+# makes a no-code fallback effectively unreachable, so a reprompt mode would be
+# dead weight + re-entrancy risk). Surfaced to the UI via CHAT_RESPONSE.tool_activity.
+backstop_mode      = "execute"
 
 [microkernel]
 

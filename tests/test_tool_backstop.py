@@ -12,7 +12,7 @@ import pytest
 from titan_hcl.synthesis.tool_intent import detect_tool_intent, extract_executable
 from titan_hcl.synthesis.tool_router import _parse, RouteDecision
 from titan_hcl.synthesis import tool_backstop
-from titan_hcl.synthesis.tool_backstop import run_tool_backstop
+from titan_hcl.synthesis.tool_backstop import run_tool_backstop, BackstopResult
 
 
 # ── tool_intent: the gate ───────────────────────────────────────────────────
@@ -156,6 +156,22 @@ def test_backstop_plug_not_wired():
         p, prompt="compute 9*9 in your sandbox", phase="pre"))
     assert res.fired and res.executed is False
     assert res.reason == "plug_not_wired"
+
+
+def test_backstop_activity_descriptor():
+    plug = _StubPlug()
+    p = _Plugin(plug=plug, provider=_StubProvider(code="print(2+3)"))
+    res = _run(run_tool_backstop(
+        p, prompt="compute 2+3 in your sandbox", phase="pre"))
+    act = res.activity(phase="pre")
+    assert act is not None
+    assert act["tool"] == "coding_sandbox" and act["executed"] is True
+    assert act["success"] is True and act["verdict"] == "true"
+    assert act["salvaged"] is False
+    # post phase marks salvaged
+    assert res.activity(phase="post")["salvaged"] is True
+    # not executed → no activity
+    assert BackstopResult(fired=True, executed=False).activity(phase="pre") is None
 
 
 def test_backstop_disabled():

@@ -55,7 +55,8 @@ class BackstopResult:
         status = "PASS ✅" if self.success else "FAIL ❌"
         header = (
             "### Tool Backstop — coding_sandbox\n"
-            "(The model did not call the tool; Titan executed it deterministically.)\n"
+            "(The model narrated a tool call without emitting one; Titan "
+            "re-executed it deterministically to verify the result.)\n"
             if corrective else
             "### Verified Result — coding_sandbox\n"
         )
@@ -65,6 +66,22 @@ class BackstopResult:
             f"Output: {self.result_summary or '(no stdout)'}\n"
             f"Verdict: {status}\n\n"
         )
+
+    def activity(self, *, phase: str) -> Optional[dict]:
+        """Structured tool-activity descriptor for the CHAT_RESPONSE payload so
+        the frontend / comma channel can show 'Titan verified this via its
+        sandbox' (and explain the extra latency). None when nothing executed."""
+        if not self.executed:
+            return None
+        return {
+            "tool": "coding_sandbox",
+            "phase": phase,                      # "pre" (forced) | "post" (salvage)
+            "executed": True,
+            "success": self.success,
+            "verdict": self.verdict,             # "true" | "false"
+            "summary": (self.result_summary or "")[:200],
+            "salvaged": phase == "post",         # model missed the call → we ran it
+        }
 
 
 def _cfg(plugin: Any) -> dict:

@@ -1841,6 +1841,8 @@ def create_pre_hook(plugin):
         # (2026-06-01, Maker-greenlit — synthesis oracle coverage fix.)
         plugin._current_tool_intent = {
             "required": False, "executed": False, "tool_id": "coding_sandbox"}
+        # Reset per-turn tool activity (read by agno_worker into CHAT_RESPONSE).
+        plugin._last_tool_activity = None
         try:
             _tb_cfg = ((getattr(plugin, "_full_config", {}) or {})
                        .get("synthesis", {}) or {}).get("tool_backstop", {}) or {}
@@ -1853,6 +1855,7 @@ def create_pre_hook(plugin):
                     "tool_id": "coding_sandbox"}
                 if _bs.executed:
                     injected += _bs.verdict_block()
+                    plugin._last_tool_activity = _bs.activity(phase="pre")
                     logger.info(
                         "[PreHook] tool backstop ran coding_sandbox "
                         "(success=%s) — TRUE verdict injected", _bs.success)
@@ -2109,6 +2112,8 @@ def create_post_hook(plugin):
                             ).strip()
                             if hasattr(run_output, "content"):
                                 run_output.content = response_text
+                            plugin._last_tool_activity = _bs_post.activity(
+                                phase="post")
                             logger.info(
                                 "[PostHook] tool backstop salvaged a missed "
                                 "tool call (success=%s)", _bs_post.success)

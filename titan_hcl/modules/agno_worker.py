@@ -610,6 +610,13 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
                 "signature": getattr(ovg_result, "signature", None),
             }
 
+    # Tool-backstop activity (2026-06-01) — when a deterministic tool ran this
+    # turn (PreHook force or OVG PostHook salvage), surface it so the frontend /
+    # comma channel can show "Titan verified this via its sandbox" and explain
+    # the extra latency. None on ordinary turns. Pop so it never leaks forward.
+    tool_activity = getattr(worker_plugin, "_last_tool_activity", None)
+    worker_plugin._last_tool_activity = None
+
     response_payload = {
         "request_id": request_id,
         "response": response_text,
@@ -619,6 +626,7 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
         "state_narration": None,
         "state_snapshot": None,
         "ovg_data": ovg_data,
+        "tool_activity": tool_activity,
         "error": error_str,
         "ts": time.time(),
     }
