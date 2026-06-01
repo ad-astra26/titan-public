@@ -77,31 +77,47 @@ def default_mine_recent_txs(
 
     try:
         conn.row_factory = sqlite3.Row
-        # block_index schema (from timechain_v2.py:1901): tx_hash BLOB PK,
-        # fork_name, tx_type, source, significance, tags (JSON string), ts.
-        # Filter by ts > since_ts + exclude noisy forks.
-        placeholders = ",".join("?" * len(exclude_forks)) if exclude_forks else ""
-        excluded = list(exclude_forks)
-        if excluded:
+        # ACTUAL block_index schema (timechain_v2): block_hash BLOB PK, fork_id
+        # INTEGER, block_height, timestamp, tags (JSON), … There is NO `tx_hash`,
+        # NO `fork_name`, NO `ts` column — the prior SQL referenced all three →
+        # every mine threw `no such column` → txs_mined=0 → the ConsolidationPass
+        # NEVER formed a real concept (only E2E-test concepts existed). The canon
+        # tx_hash IS the block_hash (the spine is keyed by block_hash hex, see
+        # tx_index_builder). Forks are stored by chain-local fork_id; resolve to
+        # names via fork_registry (same as TxIndexBuilder._resolve_fork_ids). (2026-06-01)
+        id_to_name: dict[int, str] = {}
+        try:
+            for fr in conn.execute(
+                    "SELECT fork_id, fork_name FROM fork_registry").fetchall():
+                id_to_name[int(fr["fork_id"])] = str(fr["fork_name"])
+        except Exception as fe:
+            logger.warning("[consolidation_defaults] mine: fork_registry read "
+                           "failed (%s) — fork names unavailable", fe)
+        # Exclude noisy forks BY NAME → resolve to chain-local fork_ids.
+        excluded_ids = [fid for fid, nm in id_to_name.items()
+                        if nm in exclude_forks]
+        placeholders = ",".join("?" * len(excluded_ids)) if excluded_ids else ""
+        if excluded_ids:
             sql = (
-                "SELECT tx_hash, fork_name, tags, ts FROM block_index "
-                f"WHERE ts > ? AND fork_name NOT IN ({placeholders}) "
-                "ORDER BY ts DESC LIMIT ?"
+                "SELECT block_hash, fork_id, tags, timestamp FROM block_index "
+                f"WHERE timestamp > ? AND fork_id NOT IN ({placeholders}) "
+                "ORDER BY timestamp DESC LIMIT ?"
             )
-            params: list[Any] = [float(since_ts), *excluded, int(row_cap)]
+            params: list[Any] = [float(since_ts), *excluded_ids, int(row_cap)]
         else:
             sql = (
-                "SELECT tx_hash, fork_name, tags, ts FROM block_index "
-                "WHERE ts > ? ORDER BY ts DESC LIMIT ?"
+                "SELECT block_hash, fork_id, tags, timestamp FROM block_index "
+                "WHERE timestamp > ? ORDER BY timestamp DESC LIMIT ?"
             )
             params = [float(since_ts), int(row_cap)]
         cursor = conn.execute(sql, params)
         for row in cursor.fetchall():
-            tx_hash_blob = row["tx_hash"]
+            tx_hash_blob = row["block_hash"]
             if isinstance(tx_hash_blob, bytes):
                 tx_hex = tx_hash_blob.hex()
             else:
                 tx_hex = str(tx_hash_blob)
+            fork_name = id_to_name.get(int(row["fork_id"]), str(row["fork_id"]))
             tags_raw = row["tags"]
             tags: tuple[str, ...] = ()
             if isinstance(tags_raw, str) and tags_raw:
@@ -113,9 +129,11 @@ def default_mine_recent_txs(
                     pass
             out.append(TxCandidate(
                 tx_hash=tx_hex,
-                fork=str(row["fork_name"]),
+                fork=fork_name,
                 tags=tags,
-                embedding=None,  # raw vectors not in chain; FAISS fetch is Phase 7
+                # Filled by synthesis_worker._mine_with_embeddings from the
+                # tx_hash FAISS spine (W4) so clustering is cosine, not tags-only.
+                embedding=None,
                 content_summary="",
             ))
     except Exception as e:
