@@ -1339,9 +1339,24 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         oracle_router.register(web_api_oracle)
         oracle_router.register(cgn_meaning_oracle)  # MeaningOraclePlug — for /v6/synthesis/oracles/router visibility
 
-        # Coverage analyzer — readers default to no-op; integration
-        # boot can wire them to the chain index DB in a follow-up.
-        coverage_analyzer = CoverageAnalyzer()
+        # Coverage analyzer — wired to the procedural-fork tool_call TXs on the
+        # chain so /v6/synthesis/oracles/coverage reflects REAL invocations.
+        # (2026-06-01) The analyzer was previously left on the no-op default
+        # reader, so the Observatory coverage endpoint always read 0 even when
+        # tool_call TXs were on chain — the deferred "follow-up" never landed.
+        # Now exposed once the tool-backstop actually produces tool_call TXs.
+        from titan_hcl.synthesis.procedural_tx_reader import (
+            default_procedural_tool_call_reader as _cov_tc_reader,
+        )
+        _cov_data_dir = os.environ.get("TITAN_DATA_DIR", "data")
+        _cov_timechain_dir = os.path.join(_cov_data_dir, "timechain")
+        coverage_analyzer = CoverageAnalyzer(
+            tool_call_reader=lambda since_ts, lim: _cov_tc_reader(
+                since_ts, lim,
+                index_db_path=os.path.join(_cov_timechain_dir, "index.db"),
+                chain_dir=_cov_timechain_dir,
+            ),
+        )
 
         # Snapshot exporter — wired to the 60s tick via a holder pattern
         # (mirrors forks_snapshot pattern). Buffers for recent verdicts
