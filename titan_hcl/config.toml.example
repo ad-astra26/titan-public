@@ -200,8 +200,8 @@ standalone_mode = false
 # --- Credentials ---
 # Provided by Maker — X account @iamtitanai
 user_name = "iamtitanai"
-email = "hello@iamtitan.tech"
-password = ""  # @iamtitanai — keep in config.toml only, never example
+email = "your@email.tld"
+password = ""  # keep your X password in config.toml only, NEVER in this example
 totp_secret = ""  # 2FA seed — keep in config.toml only, never example
 
 # --- Proxy ---
