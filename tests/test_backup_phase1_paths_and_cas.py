@@ -313,12 +313,7 @@ def test_cas_locks_are_lazy_constructed():
 # uses, so the unified event ships exactly once per UTC day.
 
 
-def _unified_v2_rb(monkeypatch, ship_counter, tmp_path, *, shipped=True, raises=False):
-    # The gate (and a real ship) read/write the manifest at base_dir="data"
-    # RELATIVE to CWD — chdir to an isolated tmp so the fake never touches the
-    # real data/ tree, and "today's event already landed?" is a clean check.
-    (tmp_path / "data").mkdir(exist_ok=True)
-    monkeypatch.chdir(tmp_path)
+def _unified_v2_rb(monkeypatch, ship_counter, *, shipped=True, raises=False):
     rb = RebirthBackup(network_client=None, titan_id="T1",
                        arweave_store=None, full_config={
                            "backup": {"unified_v2_enabled": True},
@@ -329,28 +324,6 @@ def _unified_v2_rb(monkeypatch, ship_counter, tmp_path, *, shipped=True, raises=
         await asyncio.sleep(0.02)  # widen the concurrent race window
         if raises:
             raise RuntimeError("simulated pipeline failure")
-        if shipped:
-            # Faithfully LAND a today-event in the manifest — exactly what a real
-            # ship does. The gate is manifest-as-truth (2026-05-31 redesign: NO
-            # separate claim flag), so landing the event is what makes the next
-            # serialized meditation correctly SKIP. A failed/no-ship run lands
-            # nothing → the next meditation retries (tested below).
-            from titan_hcl.logic.backup_unified_manifest import (
-                UnifiedManifest, make_event)
-            try:
-                m = UnifiedManifest.load(titan_id="T1", base_dir="data")
-            except Exception:
-                m = UnifiedManifest("T1", base_dir="data")
-            if not m.events:
-                m.append_event(make_event(
-                    event_id="evt-today", event_type="baseline",
-                    prev_event_id=None, baseline_trigger="first_event",
-                    personality={"tx_id": "ar_p", "merkle_root": "p",
-                                 "size_bytes": 1, "diff_mode": "baseline"},
-                    timechain={"tx_id": "ar_t", "merkle_root": "t",
-                               "size_bytes": 1, "diff_mode": "baseline"},
-                    zk_commit_tx="fakesig"))
-                m.save()
         return shipped
 
     monkeypatch.setattr(rb, "_run_unified_event_v2", _fake_run)
@@ -360,10 +333,10 @@ def _unified_v2_rb(monkeypatch, ship_counter, tmp_path, *, shipped=True, raises=
 
 
 @pytest.mark.asyncio
-async def test_unified_v2_ships_once_per_day_across_concurrent_meditations(monkeypatch, tmp_path):
+async def test_unified_v2_ships_once_per_day_across_concurrent_meditations(monkeypatch):
     """10 concurrent MEDITATION_COMPLETE in one UTC day → exactly 1 ship."""
     counter = {"n": 0}
-    rb = _unified_v2_rb(monkeypatch, counter, tmp_path, shipped=True)
+    rb = _unified_v2_rb(monkeypatch, counter, shipped=True)
     payload = {"success": True, "epoch": 1, "promoted": 0}
     await asyncio.gather(*[rb.on_meditation_complete(payload) for _ in range(10)])
     assert counter["n"] == 1, (
@@ -374,10 +347,10 @@ async def test_unified_v2_ships_once_per_day_across_concurrent_meditations(monke
 
 
 @pytest.mark.asyncio
-async def test_unified_v2_second_meditation_same_day_is_skipped(monkeypatch, tmp_path):
+async def test_unified_v2_second_meditation_same_day_is_skipped(monkeypatch):
     """Sequential meditations the same day → only the 1st ships."""
     counter = {"n": 0}
-    rb = _unified_v2_rb(monkeypatch, counter, tmp_path, shipped=True)
+    rb = _unified_v2_rb(monkeypatch, counter, shipped=True)
     payload = {"success": True, "epoch": 1, "promoted": 0}
     await rb.on_meditation_complete(payload)
     await rb.on_meditation_complete(payload)
@@ -391,11 +364,11 @@ def _today_utc():
 
 
 @pytest.mark.asyncio
-async def test_unified_v2_releases_day_on_failure_so_next_retries(monkeypatch, tmp_path):
+async def test_unified_v2_releases_day_on_failure_so_next_retries(monkeypatch):
     """A raising pipeline must RELEASE the claimed day (date != today) so the
     next meditation retries today's backup."""
     counter = {"n": 0}
-    rb = _unified_v2_rb(monkeypatch, counter, tmp_path, raises=True)
+    rb = _unified_v2_rb(monkeypatch, counter, raises=True)
     rb._last_personality_date = ""  # cold start (no prior backup)
     payload = {"success": True, "epoch": 1, "promoted": 0}
     await rb.on_meditation_complete(payload)        # raises → day released
@@ -406,12 +379,12 @@ async def test_unified_v2_releases_day_on_failure_so_next_retries(monkeypatch, t
 
 
 @pytest.mark.asyncio
-async def test_unified_v2_releases_day_on_no_ship_so_next_retries(monkeypatch, tmp_path):
+async def test_unified_v2_releases_day_on_no_ship_so_next_retries(monkeypatch):
     """shipped=False (no-change OR non-raising failure) must also release the
     day — today's backup wasn't produced, so a later meditation can still
     land exactly one backup."""
     counter = {"n": 0}
-    rb = _unified_v2_rb(monkeypatch, counter, tmp_path, shipped=False)
+    rb = _unified_v2_rb(monkeypatch, counter, shipped=False)
     rb._last_personality_date = ""  # cold start
     payload = {"success": True, "epoch": 1, "promoted": 0}
     await rb.on_meditation_complete(payload)

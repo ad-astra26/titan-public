@@ -13502,39 +13502,20 @@ def run_session_close(title: str = "", commit: bool = True,
     date_str = now.strftime("%Y%m%d")
     date_human = now.strftime("%Y-%m-%d")
 
-    # ── 1. Resolve THIS session's JSONL DETERMINISTICALLY (not by mtime) ──
-    # The harness sets CLAUDE_CODE_SESSION_ID and the JSONL filename == that
-    # sessionId. mtime-based selection was the long-standing parser bug: with
-    # many parallel + historical session files (and git worktree checkouts
-    # touching mtimes), "latest mtime" frequently picked the WRONG / shorter
-    # session → cross-session bleed AND "only ~10% parsed". Deterministic id
-    # targeting fixes both. (Verified 2026-06-01: one file per session,
-    # filename == sessionId, no session spans >1 file.)
+    # ── 1. Find the most recent JSONL session file ──
     jsonl_dir = os.path.expanduser(
         "~/.claude/projects/-home-antigravity-projects-titan")
-    env_sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
-    jsonl_path = ""
-    if env_sid:
-        cand = os.path.join(jsonl_dir, f"{env_sid}.jsonl")
-        if os.path.exists(cand):
-            jsonl_path = cand
-        else:
-            print(f"  ⚠ CLAUDE_CODE_SESSION_ID={env_sid[:8]} set but {cand} "
-                  f"missing — falling back to latest-mtime guess")
-    if not jsonl_path:
-        jsonl_files = sorted(
-            _glob.glob(os.path.join(jsonl_dir, "*.jsonl")),
-            key=os.path.getmtime, reverse=True)
-        if not jsonl_files:
-            print("ERROR: No JSONL session files found in", jsonl_dir)
-            return
-        jsonl_path = jsonl_files[0]
-        print("  ⚠ session id not in env — used latest-mtime guess; VERIFY "
-              "this transcript is THIS session before relying on it")
+    jsonl_files = sorted(
+        _glob.glob(os.path.join(jsonl_dir, "*.jsonl")),
+        key=os.path.getmtime, reverse=True)
 
+    if not jsonl_files:
+        print("ERROR: No JSONL session files found in", jsonl_dir)
+        return
+
+    jsonl_path = jsonl_files[0]
     session_id = os.path.basename(jsonl_path).replace(".jsonl", "")
     short_id = session_id[:8]
-    _target_sid = session_id  # defensive per-entry sessionId filter (below)
 
     print(f"\n  SESSION CLOSE — {date_human}")
     print("=" * 70)
@@ -13564,23 +13545,12 @@ def run_session_close(title: str = "", commit: bool = True,
     pending_decisions: dict = {}
     decisions: list[dict] = []
 
-    _lines_total = 0
-    _entries_kept = 0
     with open(jsonl_path) as f:
         for line in f:
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            _lines_total += 1
-            # Defensive completeness/purity guards (belt-and-suspenders on top
-            # of deterministic file targeting): never let a subagent sidechain
-            # or a stray other-session entry bleed into THIS transcript.
-            if obj.get("isSidechain"):
-                continue
-            if obj.get("sessionId") and obj.get("sessionId") != _target_sid:
-                continue
-            _entries_kept += 1
 
             msg_type = obj.get("type")
             if msg_type not in ("user", "assistant"):
@@ -13876,27 +13846,12 @@ def run_session_close(title: str = "", commit: bool = True,
             decision_candidates.append(f"- [{role} {idx}] {first_line}")
 
     with open(sess_path, "w") as f:
-        # The session log is auto-generated CONTEXT for a future Claude
-        # instance (Maker points to it for context) — NOT a hand-filled report.
-        # So it is ALL-AUTO: zero TODO placeholders. (Maker 2026-06-01: "kill
-        # the TODOs — it just costs you time; the log is for you.")
-        f.write(f"# Session Log: {date_human} — {title or slug}\n\n")
-        f.write(f"> **Branch:** titan-v6 · **Session:** {short_id} · "
-                f"**Closed:** {now.strftime('%H:%M')} UTC\n")
-        f.write(f"> **Transcript:** `CONVERSATION_{date_str}_{slug}.md` (full) · "
-                f"`HIGHLIGHTS_{date_str}_{slug}.md` (design dialogue)\n\n")
+        f.write(f"# Session Log: {date_human} — {title or 'TODO: add title'}\n\n")
+        f.write(f"> **Duration:** ~TODO UTC — ~{now.strftime('%H:%M')} UTC\n")
+        f.write(f"> **Branch:** titan-v6\n")
+        f.write(f"> **Significance:** TODO: one-line summary\n\n")
         f.write("---\n\n")
-        # ── Handoff: the lean replacement for the TODO march ──
-        # Done = this session's commit subjects (objective record of what
-        # shipped); Next = one line carrying the arc forward.
-        f.write("## Handoff\n\n**Done this session** (commits):\n\n")
-        if git_log:
-            for _l in git_log.split("\n")[:15]:
-                f.write(f"- `{_l}`\n")
-        else:
-            f.write("- (no commits in window)\n")
-        f.write("\n**Next:** _(one line — what continues this arc; mirror into "
-                "`titan-docs/CURRENT_ARC.md`)_\n\n---\n\n")
+        f.write("## Summary\n\nTODO: 2-3 sentence summary of session.\n\n---\n\n")
 
         # Dead-wiring pre-close validation scan — runs on every session-close
         # as a signal for "did this session introduce any new silent-wiring
@@ -13948,12 +13903,16 @@ def run_session_close(title: str = "", commit: bool = True,
             f.write("*No automated candidates detected (no AskUserQuestion / "
                     "ExitPlanMode events + no marker hits). Hand-fill below "
                     "if any architectural decisions were made.*\n\n")
+        f.write("TODO: hand-curate the above into a clean decision list — "
+                "drop noise, add SPEC §refs / D-SPEC-NN / memory pointers.\n\n")
         f.write("---\n\n")
 
-        # Design dialogue pointer (auto — no hand-fill)
-        f.write("## Design Dialogue\n\n")
-        f.write(f"Full: `HIGHLIGHTS_{date_str}_{slug}.md` "
-                f"({len(highlight_pairs)} msgs) + `CONVERSATION_{date_str}_{slug}.md`.\n\n---\n\n")
+        # Design Discussions (links to message numbers)
+        f.write("## Design Discussions\n\n")
+        f.write(f"See `HIGHLIGHTS_{date_str}_{slug}.md` for auto-extracted "
+                f"architectural dialogue ({len(highlight_pairs)} messages).\n\n")
+        f.write("TODO: if any key design conversation isn't in HIGHLIGHTS, "
+                "link it here by message number.\n\n---\n\n")
 
         # rFPs / Tasks Touched
         f.write("## rFPs / Tasks Touched\n\n")
@@ -13974,6 +13933,13 @@ def run_session_close(title: str = "", commit: bool = True,
                 f.write("\n")
         except Exception:
             pass
+        f.write("TODO: note task state changes (completed, deferred, new tasks created).\n\n---\n\n")
+
+        f.write("## Work Done\n\nTODO: fill in from conversation\n\n---\n\n")
+        f.write("## Commits\n\n")
+        if git_log:
+            for line in git_log.split('\n')[:15]:
+                f.write(f"- `{line}`\n")
         f.write("\n---\n\n")
 
         # META-CGN primitive grounding snapshot (auto-populated from
@@ -13985,8 +13951,8 @@ def run_session_close(title: str = "", commit: bool = True,
             f.write(_mcgn_snapshot)
             f.write("\n---\n\n")
 
-        # (Next-session priority lives in the Handoff section above +
-        # titan-docs/CURRENT_ARC.md — no separate TODO block.)
+        f.write("## Next Session Priorities\n\n")
+        f.write("1. TODO\n2. TODO\n3. TODO\n")
 
     # Append snapshot row to meta_cgn_trajectory.tsv for time-series tracking
     _append_meta_cgn_trajectory(date_str, title or "")

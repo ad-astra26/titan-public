@@ -33,22 +33,30 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _build_embedders(threads: int = 2):
-    """Fleet-standard llama.cpp BAAI/bge-small-en-v1.5 — the one engine embedding
-    path (§3J.1). Returns (single, batch) — the batch path embeds a whole list in
-    one call. Vectors are L2-normalized by the singleton. `threads` / OMP_NUM_THREADS
-    (set in main() before import) caps CPU usage so the backfill leaves cores for
-    the live Titans on a small/shared box (load discipline — devnet T2+T3 share 4
-    cores); the singleton's n_threads is fixed, OMP still bounds the kernels."""
+    """Lazy fastembed BAAI/bge-small-en-v1.5 — the one engine embedding path.
+    Returns (single, batch) — the batch path embeds a whole list in one call
+    (far faster + lighter than N single calls on a small box). `threads` caps
+    onnxruntime intra-op parallelism so the backfill leaves cores for the live
+    Titans on a small/shared box (load discipline — devnet T2+T3 share 4 cores)."""
+    from fastembed import TextEmbedding
     import numpy as np
-    from titan_hcl.utils.text_embedder import get_text_embedder
-    model = get_text_embedder()
+    try:
+        model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5", threads=int(threads))
+    except TypeError:
+        # Older fastembed without a `threads` kwarg — OMP_NUM_THREADS (set in
+        # main() before this import) still caps it.
+        model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+
+    def _norm(v):
+        v = np.asarray(v, dtype=np.float32)
+        n = float(np.linalg.norm(v))
+        return v / n if n > 0 else v
 
     def embed(text: str):
-        return np.asarray(model.encode(text), dtype=np.float32)
+        return _norm(list(model.embed([text]))[0])
 
     def embed_many(texts: list):
-        vecs = np.asarray(model.encode(list(texts)), dtype=np.float32)
-        return [vecs[i] for i in range(vecs.shape[0])]
+        return [_norm(v) for v in model.embed(list(texts))]
 
     return embed, embed_many
 
@@ -62,12 +70,13 @@ def main() -> int:
     ap.add_argument("--max", type=int, default=500000,
                     help="Max blocks to scan this run (default 500000).")
     ap.add_argument("--threads", type=int, default=2,
-                    help="Cap embed (OMP) threads (default 2) so the backfill "
-                         "leaves cores for live Titans on a shared box.")
+                    help="Cap fastembed/onnxruntime threads (default 2) so the "
+                         "backfill leaves cores for live Titans on a shared box.")
     args = ap.parse_args()
 
-    # Cap embed threads BEFORE the llama.cpp embedder is constructed. Load
-    # discipline on a 4-core box shared by two live devnet twins.
+    # Cap embed threads BEFORE fastembed/onnxruntime import (belt-and-suspenders
+    # alongside the TextEmbedding(threads=) kwarg). Load discipline on a 4-core
+    # box shared by two live devnet twins.
     os.environ.setdefault("OMP_NUM_THREADS", str(max(1, int(args.threads))))
 
     data_dir = args.data_dir

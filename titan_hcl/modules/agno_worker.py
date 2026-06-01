@@ -1389,10 +1389,15 @@ def agno_worker_main(recv_queue, send_queue, name: str,
 
         def _agno_embedder(text: str):
             try:
+                from fastembed import TextEmbedding
                 import numpy as np
-                from titan_hcl.utils.text_embedder import get_text_embedder
-                # Singleton returns an L2-normalized 1-D vector already.
-                return np.asarray(get_text_embedder().encode(text), dtype=np.float32)
+                if not hasattr(_agno_embedder, "_model"):
+                    _agno_embedder._model = TextEmbedding(
+                        model_name="BAAI/bge-small-en-v1.5")
+                vecs = list(_agno_embedder._model.embed([text]))
+                v = np.array(vecs[0], dtype=np.float32)
+                n = np.linalg.norm(v)
+                return v / n if n > 0 else v
             except Exception as _emb_err:
                 logger.debug("[AgnoWorker] agno_embedder failed: %s", _emb_err)
                 return None

@@ -16,10 +16,7 @@
 set -euo pipefail
 
 PUBLIC_REPO="https://github.com/ad-astra26/titan-public.git"
-# Newest release first (incl. pre-releases) — GitHub's `/releases/latest` EXCLUDES
-# pre-releases, so we query the full list and take element 0.
-RELEASES_API="https://api.github.com/repos/ad-astra26/titan-public/releases?per_page=1"
-DEFAULT_REF=""               # empty ⇒ auto-resolve the latest published (pre)release
+DEFAULT_REF="main"            # release tags pin vX.Y.Z; main is the rolling alpha
 DEFAULT_DIR="${HOME}/titan"
 MIN_PY_MINOR=11               # require Python 3.11+
 
@@ -33,8 +30,7 @@ usage() {
     cat <<EOF
 setup_titan.sh — bootstrap a sovereign Titan.
 
-  --tag <ref>   git ref to clone (default: the latest published release; a
-                release uses vX.Y.Z — its binaries are fetched to match)
+  --tag <ref>   git ref to clone (default: ${DEFAULT_REF}; a release uses vX.Y.Z)
   --dir <path>  install directory (default: ${DEFAULT_DIR})
   --help        this message
 
@@ -58,24 +54,6 @@ while [[ $# -gt 0 ]]; do
         *) WIZARD_ARGS+=("$1"); shift ;;
     esac
 done
-
-# ── resolve the install ref ─────────────────────────────────────────────────
-# No --tag ⇒ pin to the LATEST published release so the bare one-liner
-# (`curl … | bash`) Just Works: the matching release ALSO carries the verified
-# Rust daemon binaries the wizard fetches. (Cloning `main` has no release →
-# the binaries phase would fail; a user must NOT need to know a version tag.)
-if [[ -z "$REF" ]]; then
-    if command -v curl >/dev/null 2>&1; then
-        REF="$(curl -fsSL "$RELEASES_API" 2>/dev/null \
-                | grep -m1 '"tag_name"' | cut -d'"' -f4 || true)"
-    fi
-    if [[ -n "$REF" ]]; then
-        _grow "Pinned to latest release: ${REF}"
-    else
-        REF="main"
-        _warn "Could not resolve the latest release (offline / API limit). Falling back to 'main' — pass --tag vX.Y.Z, or --build-rust, so the binaries phase can complete."
-    fi
-fi
 
 # ── self-integrity hint (checksum) ──────────────────────────────────────────
 # When run from a file we can show our own sha256 so it can be matched against

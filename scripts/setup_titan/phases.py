@@ -137,74 +137,6 @@ def run_mode_phase(state: dict, mode: Mode, *, default: bool,
 # ── Phase 3 — Venv + Python deps ───────────────────────────────────────────
 
 
-# ── Embedding model (GGUF) seed ──────────────────────────────────────────────
-# Sovereign, offline-first text embedder (§3J.1): the f16 GGUF is vendored into
-# the per-install model cache so the fleet NEVER does a runtime HF pull. Pinned by
-# sha256 so a fresh install gets byte-identical vectors to the live fleet.
-GGUF_REPO = "CompendiumLabs/bge-small-en-v1.5-gguf"
-GGUF_FILENAME = "bge-small-en-v1.5-f16.gguf"
-GGUF_SHA256 = "f0b2fef971e8366438bfd2d9aefea1b0115919389448806d290237f638bae999"
-GGUF_URL = f"https://huggingface.co/{GGUF_REPO}/resolve/main/{GGUF_FILENAME}"
-
-
-def _sha256(path: Path) -> str:
-    import hashlib
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _seed_embedding_gguf(install_root: Path, py: Path) -> list[Result]:
-    """Vendor the bge-small f16 GGUF into <install_root>/data/.gguf_cache and
-    confirm the llama.cpp embedder embeds. Idempotent: skips the download when a
-    sha-matching GGUF is already present (existing boxes seeded at P1)."""
-    import urllib.request
-
-    results: list[Result] = []
-    cache_dir = install_root / "data" / ".gguf_cache"
-    target = cache_dir / GGUF_FILENAME
-
-    if target.exists() and _sha256(target) == GGUF_SHA256:
-        results.append(Result("embed_gguf", "ok",
-                              f"GGUF already vendored ({GGUF_FILENAME}, sha verified)"))
-    else:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        cprint(f"  Vendoring embedding model {GGUF_FILENAME} (~65 MB) — offline-first…",
-               role="text_strong")
-        tmp = target.with_suffix(".gguf.partial")
-        try:
-            urllib.request.urlretrieve(GGUF_URL, tmp)  # noqa: S310 (pinned HF URL)
-        except Exception as e:  # noqa: BLE001
-            return [Result("embed_gguf", "fail", f"GGUF download failed: {e}",
-                           f"Manually place {GGUF_FILENAME} into {cache_dir} "
-                           f"(source: {GGUF_URL}).")]
-        got = _sha256(tmp)
-        if got != GGUF_SHA256:
-            tmp.unlink(missing_ok=True)
-            return [Result("embed_gguf", "fail",
-                           f"GGUF sha256 mismatch (got {got[:12]}…, want {GGUF_SHA256[:12]}…)",
-                           "Refusing to install an unverified embedding model.")]
-        tmp.rename(target)
-        results.append(Result("embed_gguf", "ok",
-                              f"vendored {GGUF_FILENAME} (sha verified)"))
-
-    # Strongest check: the §3J.1 boot self-test (constructs the singleton, embeds
-    # a probe, asserts non-zero + semantically ordered) — fails LOUD, never silent.
-    check = "from titan_hcl.utils.text_embedder import self_test; raise SystemExit(0 if self_test() else 1)"
-    r = subprocess.run([str(py), "-c", check], capture_output=True, text=True,
-                       cwd=str(install_root))
-    if r.returncode != 0:
-        results.append(Result("embed_selftest", "fail",
-                              "llama.cpp embedder self-test failed",
-                              (r.stderr.strip().splitlines()[-1] if r.stderr else "see log")))
-    else:
-        results.append(Result("embed_selftest", "ok",
-                              "llama.cpp embedder self-test passed (non-zero, ordered)"))
-    return results
-
-
 def run_venv_phase(install_root: Path) -> list[Result]:
     """Create venv at install_root/test_env; pip install -e . + import check.
 
@@ -250,17 +182,13 @@ def run_venv_phase(install_root: Path) -> list[Result]:
     results.append(Result("pip", "ok", "core dependencies installed (CPU torch wheel)"))
 
     py = venv_python(install_root)
-    check_src = "import titan_hcl; import duckdb; import faiss; import torch; import llama_cpp; print('OK')"
+    check_src = "import titan_hcl; import duckdb; import faiss; import torch; print('OK')"
     r = subprocess.run([str(py), "-c", check_src], capture_output=True, text=True)
     if r.returncode != 0:
         return results + [Result("imports", "fail",
                                   f"core imports failed: {r.stderr.strip().splitlines()[-1] if r.stderr else 'unknown'}",
                                   "Re-run pip install; check that titan-hcl is in pyproject.toml.")]
-    results.append(Result("imports", "ok", "titan_hcl + duckdb + faiss + torch + llama_cpp importable"))
-
-    # Seed the sovereign embedding GGUF + run the §3J.1 self-test (a halting
-    # 'fail' Result if the embedder can't produce non-zero vectors).
-    results.extend(_seed_embedding_gguf(install_root, py))
+    results.append(Result("imports", "ok", "titan_hcl + duckdb + faiss + torch importable"))
 
     return results
 
@@ -280,8 +208,7 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
                minimal: bool, skip_genesis: bool, tag: str | None = None,
                build_rust: bool = False, prompter: Prompter | None = None,
                resurrect: bool = False, rpc_url: str | None = None,
-               verify_only: bool = False, config_src: str | None = None,
-               titan_pubkey: str | None = None) -> int:
+               verify_only: bool = False, config_src: str | None = None) -> int:
     """Walk the install phases (Phase 1 already ran in preflight). Returns exit code.
 
     ``prompter`` injects the input source: the default :class:`StdinPrompter`
@@ -305,8 +232,7 @@ def run_phases(*, state: dict, mode: Mode, install_root: Path, default: bool,
             (PhaseDef("phase_resurrect", "🜂 Sovereign Resurrection", "W1.5/D1", None),
              lambda: run_resurrect_phase(install_root, venv_python=venv_python(install_root),
                                          titan_id=state.get("titan_id"), rpc_url=rpc_url,
-                                         verify_only=verify_only, config_src=config_src,
-                                         titan_pubkey=titan_pubkey)),
+                                         verify_only=verify_only, config_src=config_src)),
             (PhaseDef("phase_7", "Systemd install + first start + health", "W1.e", None),
              lambda: run_systemd_phase(state, install_root, mode, default=default)),
             (PhaseDef("phase_console", "TC² Console Agent (owner UI)", "W8", None),

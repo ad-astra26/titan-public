@@ -121,10 +121,6 @@ class TierShipResult:
     files_skipped: int = 0
     block_ranges: dict[str, list[int]] = field(default_factory=dict)
     error: Optional[str] = None
-    # Mode-B (encrypted data) only: the AES-GCM IV (b64) of the ENCRYPTED tarball
-    # uploaded to Arweave. None ⇒ Mode-A (plaintext data). tarball_sha256 (arc) is
-    # ALWAYS over the PLAINTEXT tarball, regardless of mode.
-    iv_b64: Optional[str] = None
 
 
 @dataclass
@@ -304,30 +300,17 @@ async def upload_tier(
     titan_id: str,
     event_id: str,
     event_type: str,
-    encryptor: Optional[Callable[[bytes, str], tuple[bytes, str]]] = None,
 ) -> TierShipResult:
     """Upload a PRE-BUILT tier tarball (from build_tier) to Arweave + set tx_id.
 
     Mutates + returns `result`. Safe to call on a staged tarball minutes after
     build_tier produced it (the bytes on disk are immutable once packed).
-
-    `encryptor` (Mode B): given (plaintext_tarball, component) → (ciphertext,
-    iv_b64). When provided, the ENCRYPTED bytes are uploaded and `result.iv_b64`
-    is set; `tarball_sha256` (the memo arc) stays over the PLAINTEXT tarball so
-    integrity verification + the per-backup key derivation (arc[:16]) are
-    mode-independent. None ⇒ Mode A (plaintext uploaded).
     """
     if result.tarball_path is None or not os.path.exists(result.tarball_path):
         result.error = f"{result.tier}: staged tarball missing at upload time"
         return result
     with open(result.tarball_path, "rb") as f:
         tarball_bytes = f.read()
-    if encryptor is not None:
-        try:
-            tarball_bytes, result.iv_b64 = encryptor(tarball_bytes, result.tier)
-        except Exception as e:
-            result.error = f"{result.tier}: Mode-B encryption failed: {e}"
-            return result
     tags = {
         "App-Name": "TitanBackupUnified",
         "Titan-Id": titan_id,
@@ -357,14 +340,12 @@ async def ship_tier(
     arweave_uploader: ArweaveUploader,
     scratch_dir: str,
     titan_id: str,
-    encryptor: Optional[Callable[[bytes, str], tuple[bytes, str]]] = None,
 ) -> TierShipResult:
     """Pack one tier's per-file diffs into a tarball + upload to Arweave.
 
     Behavior-identical wrapper over build_tier + upload_tier (kept so existing
     callers/tests are unchanged); the two halves are also used independently by
-    the Phase 2 pre-stage path (build ahead, upload on meditation). `encryptor`
-    (Mode B) is threaded to upload_tier.
+    the Phase 2 pre-stage path (build ahead, upload on meditation).
     """
     result = build_tier(
         tier=tier, event_id=event_id, event_type=event_type, specs=specs,
@@ -375,7 +356,7 @@ async def ship_tier(
         return result
     return await upload_tier(
         result, arweave_uploader=arweave_uploader, titan_id=titan_id,
-        event_id=event_id, event_type=event_type, encryptor=encryptor,
+        event_id=event_id, event_type=event_type,
     )
 
 
@@ -396,7 +377,6 @@ async def run_unified_event(
     cleanup_scratch: bool = True,
     bus_emit: Optional[Callable[[str, dict], None]] = None,
     force_event_type: Optional[str] = None,
-    encryptor: Optional[Callable[[bytes, str], tuple[bytes, str]]] = None,
 ) -> EventShipResult:
     """One meditation-event ship cycle.
 
@@ -473,7 +453,6 @@ async def run_unified_event(
                 ),
                 arweave_uploader=arweave_uploader,
                 scratch_dir=scratch_dir, titan_id=titan_id,
-                encryptor=encryptor,
             )
             tier_results[tier_name] = r
             if r.error:
@@ -493,7 +472,6 @@ async def run_unified_event(
                 ),
                 arweave_uploader=arweave_uploader,
                 scratch_dir=scratch_dir, titan_id=titan_id,
-                encryptor=encryptor,
             )
             tier_results["soul"] = r
             if r.error:
@@ -547,17 +525,13 @@ async def run_unified_event(
         # event's head sig, threading the chain back to the Day-1 genesis anchor.
         # No silent fallback — any chain-write failure fails the event loudly.
         prev_sig = prev_event.get("zk_commit_tx") if prev_event else None
-        # Mode-B carries each component's encrypted-tarball IV (arc stays plaintext).
         components = [
-            {"tier": "PT", "tx_id": tier_results["personality"].tx_id, "arc": pers_sha,
-             "iv": tier_results["personality"].iv_b64},
-            {"tier": "TC", "tx_id": tier_results["timechain"].tx_id, "arc": tc_sha,
-             "iv": tier_results["timechain"].iv_b64},
+            {"tier": "PT", "tx_id": tier_results["personality"].tx_id, "arc": pers_sha},
+            {"tier": "TC", "tx_id": tier_results["timechain"].tx_id, "arc": tc_sha},
         ]
         if soul_specs is not None and soul_sha:
             components.append(
-                {"tier": "SL", "tx_id": tier_results["soul"].tx_id, "arc": soul_sha,
-                 "iv": tier_results["soul"].iv_b64}
+                {"tier": "SL", "tx_id": tier_results["soul"].tx_id, "arc": soul_sha}
             )
 
         try:
@@ -744,7 +718,6 @@ async def ship_staged_event(
     zk_committer: ZkCommitter,
     bus_emit: Optional[Callable[[str, dict], None]] = None,
     cleanup_scratch: bool = True,
-    encryptor: Optional[Callable[[bytes, str], tuple[bytes, str]]] = None,
 ) -> EventShipResult:
     """Phase 2 — SHIP a pre-built StagedEvent (fast, on meditation).
 
@@ -798,7 +771,7 @@ async def ship_staged_event(
                 return out
             await upload_tier(
                 r, arweave_uploader=arweave_uploader, titan_id=titan_id,
-                event_id=event_id, event_type=event_type, encryptor=encryptor)
+                event_id=event_id, event_type=event_type)
             if r.error:
                 out.errors.append(f"{tier_name}: {r.error}")
         out.tiers = tier_results
@@ -830,14 +803,14 @@ async def ship_staged_event(
         prev_sig = prev_event.get("zk_commit_tx") if prev_event else None
         components = [
             {"tier": "PT", "tx_id": tier_results["personality"].tx_id,
-             "arc": pers_sha, "iv": tier_results["personality"].iv_b64},
+             "arc": pers_sha},
             {"tier": "TC", "tx_id": tier_results["timechain"].tx_id,
-             "arc": tc_sha, "iv": tier_results["timechain"].iv_b64},
+             "arc": tc_sha},
         ]
         if staged.soul_present and soul_sha:
             components.append(
                 {"tier": "SL", "tx_id": tier_results["soul"].tx_id,
-                 "arc": soul_sha, "iv": tier_results["soul"].iv_b64})
+                 "arc": soul_sha})
 
         try:
             commit_result = await zk_committer(

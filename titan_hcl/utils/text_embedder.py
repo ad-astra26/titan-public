@@ -1,34 +1,25 @@
-"""titan_hcl/utils/text_embedder.py — fleet-standard text embedder (llama.cpp).
+"""titan_hcl/utils/text_embedder.py — fleet-standard text embedder (fastembed).
 
-Phase 13 §3J.1 — the single shared text-embedding entry point. Model is
-`BAAI/bge-small-en-v1.5` (384-d), unchanged and SPEC-anchored. Only the *runtime*
-changed: `sentence_transformers` (broken — torch/torchvision ABI mismatch,
-`operator torchvision::nms does not exist` → silent ZERO vectors fleet-wide) was
-replaced by `fastembed` (ONNX), which in turn leaked unbounded RSS on the big
-mainnet chain — onnxruntime's CPU memory arena never returns memory to the OS, so
-the synthesis backfill drove RSS to ~5 GB → guardian restart-loop. The runtime is
-now **`llama-cpp-python`** (llama.cpp): same bge-small model, **identical vectors**
-(cosine 1.0000 vs fastembed), **flat ~197 MB**, and — like fastembed — **torch-free**
-(torch is reserved for RL/NN/IQL only).
+Phase 13 §3J.1 — replaces the broken `sentence_transformers` path. That import
+chain (`sentence_transformers → transformers → torchvision`) fails fleet-wide
+on a torch/torchvision ABI mismatch (`operator torchvision::nms does not exist`),
+so every consumer silently fell back to ZERO vectors — the Sage RL gatekeeper
+was deciding on noise, sage/guardian Tier-2 similarity was disabled, and
+meta_teacher semantic retrieval was dead.
 
-llama.cpp's native `embed()` is NOT thread-safe — concurrent calls on one model
-segfault uncatchably. The singleton therefore serialises every `embed()` behind a
-module `threading.Lock` (proven 120/120 concurrent, 0 errors). bge is a CLS-pooled
-model, so we construct with `pooling_type=2` (CLS) — this is what reproduces the
-fastembed vectors exactly. Vectors are L2-normalised in numpy (llama.cpp returns
-unnormalised pooled embeddings).
+`fastembed` (ONNX, `BAAI/bge-small-en-v1.5`, 384-d) has NO torch/torchvision/
+transformers dependency, imports cleanly, and is already the working embedding
+path in `memory_worker`. This module is the single shared entry point so all
+consumers use the same model + benefit from the same per-process cache.
 
-Drop-in for the `.encode()` surface the consumers use:
-`encode(str | list[str], convert_to_numpy=True)`. Single `str` → 1-D (dim,)
-vector; `list[str]` → 2-D (N, dim) — matching SentenceTransformer/fastembed
-semantics so call-sites need no shape changes. The legacy lazy-torch
-`convert_to_tensor` branch is GONE — callers that need a tensor do
-`torch.from_numpy(...)` at their own RL boundary (Phase 13 §3J.3 / migration P4).
+Drop-in for the `sentence_transformers` `.encode()` surface the 3 consumers
+used: `encode(str | list[str], convert_to_numpy=True, convert_to_tensor=False)`.
+Single `str` → 1-D vector; `list[str]` → 2-D (N, dim) — exactly matching
+SentenceTransformer semantics so call-sites need no shape changes.
 """
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from typing import Any, List, Union
 
@@ -39,57 +30,25 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 EMBED_DIM = 384
 
-# Vendored GGUF (f16) — same cache convention as the old `.fastembed_cache`, so
-# the model is present once per box and survives reboots. Seeded by P1 fleet-wide
-# and by the setup script for fresh installs (migration P5).
-GGUF_FILENAME = "bge-small-en-v1.5-f16.gguf"
-
-# Construction is guarded by `_init_lock`; every native embed() call is guarded by
-# `_embed_lock` because llama.cpp embed is NOT thread-safe (segfaults otherwise).
-_init_lock = threading.Lock()
-_embed_lock = threading.Lock()
-_singleton: "LlamaCppEncoder | None" = None
+_lock = threading.Lock()
+_singleton: "FastembedEncoder | None" = None
 
 
-def _gguf_path() -> str:
-    return os.path.join(
-        os.environ.get("TITAN_DATA_DIR", "data"), ".gguf_cache", GGUF_FILENAME)
-
-
-class LlamaCppEncoder:
-    """llama.cpp embedder with a SentenceTransformer-compatible `.encode()`.
-
-    Construction fails LOUD (no silent zero-vector fallback): a missing GGUF or a
-    failed model load raises, so the zero-vector regression can never return.
-    """
+class FastembedEncoder:
+    """Lazy fastembed wrapper with a SentenceTransformer-compatible `.encode()`."""
 
     def __init__(self, model_name: str = DEFAULT_MODEL) -> None:
-        from llama_cpp import Llama  # llama.cpp — no torch
-
-        gguf = _gguf_path()
-        if not os.path.exists(gguf):
-            raise FileNotFoundError(
-                f"[TextEmbedder] GGUF not found at {gguf} — vendor "
-                f"{GGUF_FILENAME} into $TITAN_DATA_DIR/.gguf_cache (setup P5).")
-        # pooling_type=2 == CLS (bge): reproduces fastembed bge-small vectors.
-        self._model = Llama(
-            model_path=gguf,
-            embedding=True,
-            n_ctx=512,
-            n_threads=4,
-            n_batch=512,
-            verbose=False,
-            pooling_type=2,
-        )
+        import os
+        from fastembed import TextEmbedding  # ONNX — no torch
+        # Reuse memory_worker's PERSISTENT cache (`data/.fastembed_cache`) so the
+        # model is downloaded ONCE fleet-wide and survives VPS reboots — the
+        # fastembed default (`/tmp/fastembed_cache`) is ephemeral → re-download
+        # every reboot. Same model BAAI/bge-small-en-v1.5 as memory.
+        cache_dir = os.path.join(
+            os.environ.get("TITAN_DATA_DIR", "data"), ".fastembed_cache")
+        self._model = TextEmbedding(model_name, cache_dir=cache_dir)
         self.model_name = model_name
         self.dim = EMBED_DIM
-
-    @staticmethod
-    def _normalize(vecs: np.ndarray) -> np.ndarray:
-        # L2-normalise rows; guard against zero-norm (empty input) division.
-        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-        norms[norms == 0.0] = 1.0
-        return (vecs / norms).astype(np.float32)
 
     def encode(
         self,
@@ -97,47 +56,44 @@ class LlamaCppEncoder:
         convert_to_numpy: bool = True,
         convert_to_tensor: bool = False,
         **_: Any,
-    ) -> np.ndarray:
+    ):
         single = isinstance(sentences, str)
         texts = [sentences] if single else list(sentences)
-        if not texts:
-            return np.zeros((0, self.dim), dtype=np.float32)
-        # llama.cpp embed is not thread-safe — serialise the native call.
-        with _embed_lock:
-            raw = self._model.embed(texts)
-        vecs = np.asarray(raw, dtype=np.float32)
-        if vecs.ndim == 1:  # defensive — single-text path may return (dim,)
+        # fastembed.embed → generator of (dim,) float32 arrays.
+        vecs = np.asarray(list(self._model.embed(texts)), dtype=np.float32)
+        if vecs.ndim == 1:  # defensive — should be (N, dim)
             vecs = vecs.reshape(len(texts), -1)
-        vecs = self._normalize(vecs)
-        # `convert_to_tensor` is intentionally ignored — this module is torch-free.
-        # Callers needing a tensor wrap the numpy result themselves at their RL
-        # boundary (`torch.from_numpy`). See migration P4.
+        if convert_to_tensor:
+            # Lazy torch — only hosts that still want a tensor pay the import.
+            # (Phase 13 §3J.3 will remove the remaining tensor call-sites.)
+            import torch
+            t = torch.from_numpy(vecs)
+            return t[0] if single else t
         return vecs[0] if single else vecs
 
 
-def get_text_embedder(model_name: str = DEFAULT_MODEL) -> LlamaCppEncoder:
+def get_text_embedder(model_name: str = DEFAULT_MODEL) -> FastembedEncoder:
     """Process-wide singleton encoder. Constructs on first call (lazy model load).
 
     Raises on construction failure — callers that previously swallowed
-    `ImportError` into zero vectors must NOT do so anymore; a broken embedder must
-    be loud, not silent (Phase 13 §3J.1).
+    `ImportError` into zero vectors should NOT do so anymore; a broken embedder
+    must be loud, not silent (Phase 13 §3J.1).
     """
     global _singleton
     if _singleton is None:
-        with _init_lock:
+        with _lock:
             if _singleton is None:
-                _singleton = LlamaCppEncoder(model_name)
+                _singleton = FastembedEncoder(model_name)
                 logger.info(
-                    "[TextEmbedder] llama.cpp ready (model=%s, dim=%d, gguf=%s)",
-                    model_name, EMBED_DIM, _gguf_path())
+                    "[TextEmbedder] fastembed ready (model=%s, dim=%d)",
+                    model_name, EMBED_DIM)
     return _singleton
 
 
 def self_test() -> bool:
     """Boot health-check — fail LOUD if the embedder can't produce a non-zero,
     semantically-meaningful vector. Returns True iff healthy. Logs ERROR on
-    failure so the zero-vector regression can never go silent again. Also serves
-    as the boot pre-warm (forces model construction off the hot path)."""
+    failure so the zero-vector regression can never go silent again."""
     try:
         enc = get_text_embedder()
         a, b, c = enc.encode(

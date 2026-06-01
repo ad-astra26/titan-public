@@ -71,24 +71,23 @@ class SageEncoder:
 
     @property
     def action_embedder(self):
-        """Lazy llama.cpp embedder accessor (Phase 13 §3J.1). Replaces the
-        sentence_transformers path (broken fleet-wide — torch/torchvision ABI
-        mismatch → silent zero vectors) and then fastembed/ONNX (unbounded CPU
-        arena → RSS leak). The fleet-standard llama.cpp bge-small embedder
-        (384-d) imports cleanly + has no torch dependency. Cached after first
-        access; failure cached as None (callers still soft-fall to zeros on the
-        hot path, but the boot self_test fails LOUD)."""
+        """Lazy fastembed accessor (Phase 13 §3J.1). Replaces the
+        sentence_transformers path, whose import was broken fleet-wide
+        (torch/torchvision ABI mismatch) → silent zero vectors. fastembed
+        (ONNX, 384-d) imports cleanly + has no torch dependency. Cached after
+        first access; failure cached as None (callers still soft-fall to zeros
+        on the hot path, but the boot self_test fails LOUD)."""
         if self._action_embedder_cache is _LAZY_SENTINEL:
             try:
                 from titan_hcl.utils.text_embedder import get_text_embedder
                 self._action_embedder_cache = get_text_embedder()
                 logging.info(
-                    "[SageEncoder] Lazy-initialized llama.cpp embedder "
+                    "[SageEncoder] Lazy-initialized fastembed embedder "
                     "(BAAI/bge-small-en-v1.5, 384-d) on first access.")
             except Exception as e:
                 logging.error(
-                    "[SageEncoder] embedder load failed: %s — action vectors "
-                    "will default to zero (CHECK llama.cpp + GGUF install).", e)
+                    "[SageEncoder] fastembed load failed: %s — action vectors "
+                    "will default to zero (CHECK fastembed install).", e)
                 self._action_embedder_cache = None
         return self._action_embedder_cache
 
@@ -453,12 +452,7 @@ class SageRecorder:
             # 2. Project Action Intent
             # We embed the string, pad to embedding_dim (e.g. 3072), and project to 128-dim
             if self.action_embedder is not None:
-                # Embedder is torch-free now (§3J.1 / migration P4): it returns
-                # numpy; cross into torch HERE, at the ReplayBuffer/projection
-                # boundary (torch is RL-only).
-                import numpy as np
-                action_emb = torch.from_numpy(
-                    np.asarray(self.action_embedder.encode([action])[0], dtype=np.float32))
+                action_emb = self.action_embedder.encode([action], convert_to_tensor=True)[0]
                 # Pad out to embedding_dim (e.g. 3072) to reuse the projection layer safely
                 pad_size = self.dynamic_embedding_dim - action_emb.shape[0]
                 if pad_size > 0:
