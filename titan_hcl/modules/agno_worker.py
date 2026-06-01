@@ -57,7 +57,6 @@ from titan_hcl.bus import (
     CHAT_STREAM_REQUEST,
     DREAM_INBOX_REPLAY,
     KERNEL_EPOCH_TICK,
-    KNOWLEDGE_MOMENT,
     MEMORY_RETRIEVAL_USED,
     MODULE_HEARTBEAT,
     MODULE_SHUTDOWN,
@@ -575,16 +574,6 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
                     "ts": _now,
                     "used_by_llm": _it.item_id in _cited,
                 })
-            # Operator-closure C1 (SPEC §25.9) — ONE per-TURN knowledge-moment
-            # signal: this turn needed knowledge (≥1 item surfaced) and was
-            # `satisfied` iff the response cited ≥1 of them. synthesis_worker's
-            # SovereigntyRatioMeter records the per-turn denominator from this,
-            # replacing the per-ITEM MEMORY_RETRIEVAL_USED inflation.
-            _send(send_queue, KNOWLEDGE_MOMENT, name, "all", {
-                "needed": bool(_items),
-                "satisfied": bool(_cited),
-                "ts": _now,
-            })
     except Exception as _cu_err:
         logger.debug(
             "[AgnoWorker] cited-use gate error (chat unaffected): %s", _cu_err)
@@ -858,28 +847,7 @@ def _build_local_tool_plugs(send_queue) -> dict:
     from titan_hcl.synthesis.tools.coding_sandbox_tool import CodingSandboxTool
 
     omw = OuterMemoryWriter(send_queue, "agno_worker")
-
-    # Operator-closure C2 (W7): the chat-time sandbox is its own truth oracle but
-    # the OracleRouter lives in synthesis_worker. Ship the sandbox's pre-computed
-    # verdict over the bus so it joins the dream-boundary OracleVerdictBatch flush
-    # (→ §A.6 coverage). Fire-and-forget; never re-executes the sandbox.
-    def _companion_verdict_sink(*, parent_tool_call_tx, oracle_id, verdict,
-                                evidence_ref="", latency_ms=0):
-        try:
-            send_queue.put_nowait({
-                "type": bus.TOOL_CALL_VERDICT_RECORD,
-                "src": "agno_worker", "dst": "synthesis", "ts": time.time(),
-                "payload": {
-                    "parent_tool_call_tx": parent_tool_call_tx,
-                    "oracle_id": oracle_id, "verdict": verdict,
-                    "evidence_ref": evidence_ref, "latency_ms": latency_ms,
-                },
-            })
-        except Exception:
-            pass
-
-    return {"coding_sandbox": CodingSandboxTool(
-        writer=omw, companion_verdict_sink=_companion_verdict_sink)}
+    return {"coding_sandbox": CodingSandboxTool(writer=omw)}
 
 
 def _init_worker_plugin_and_agent(bus_client, config: dict[str, Any], send_queue):
@@ -1348,62 +1316,6 @@ def agno_worker_main(recv_queue, send_queue, name: str,
             "[AgnoWorker] delegate_live config read failed (%s) — defaulting DRY-RUN",
             _dl_err,
         )
-
-    # ── Operator-closure Phase B (W1/W2/B2) — wire EngineRecall into chat ──
-    # Build a cross-process read-only EngineRecall over the tx_hash-native
-    # FaissReader (Phase A) + a lazy fastembed embedder so the chat path's
-    # SEARCH composite retrieval finally fires (kills W2 "engine_recall not
-    # wired"). Gated by [synthesis.recall].augment_chat (default false; T3
-    # override true) — the augment runs ALONGSIDE the legacy memory_context
-    # (INV-4 augment-then-converge) and is retired at D2.
-    worker_plugin.engine_recall = None
-    worker_plugin.synthesis_tx_deref = None
-    worker_plugin.synthesis_recall_augment = False
-    try:
-        _recall_cfg = (config or {}).get("synthesis", {}).get("recall", {}) or {}
-        worker_plugin.synthesis_recall_augment = bool(
-            _recall_cfg.get("augment_chat", False))
-        _data_dir_ag = os.environ.get("TITAN_DATA_DIR", "data")
-
-        def _agno_embedder(text: str):
-            try:
-                from fastembed import TextEmbedding
-                import numpy as np
-                if not hasattr(_agno_embedder, "_model"):
-                    _agno_embedder._model = TextEmbedding(
-                        model_name="BAAI/bge-small-en-v1.5")
-                vecs = list(_agno_embedder._model.embed([text]))
-                v = np.array(vecs[0], dtype=np.float32)
-                n = np.linalg.norm(v)
-                return v / n if n > 0 else v
-            except Exception as _emb_err:
-                logger.debug("[AgnoWorker] agno_embedder failed: %s", _emb_err)
-                return None
-
-        from titan_hcl.synthesis.bridge_recall import BridgeRecall
-        from titan_hcl.synthesis.recall_reader import build_recall_reader
-        from titan_hcl.synthesis.synthesis_vector_index import FaissReader
-        from titan_hcl.synthesis.tx_index_builder import TxContentDeref
-
-        _faiss_reader = FaissReader(data_dir=_data_dir_ag)
-        worker_plugin.engine_recall = build_recall_reader(
-            data_dir=_data_dir_ag,
-            bridge_recall=BridgeRecall(),
-            embedder=_agno_embedder,
-            faiss_reader=_faiss_reader,
-        )
-        worker_plugin.synthesis_tx_deref = TxContentDeref(data_dir=_data_dir_ag)
-        if not hasattr(worker_plugin, "_last_surfaced_items"):
-            worker_plugin._last_surfaced_items = {}
-        logger.info(
-            "[AgnoWorker] Phase B EngineRecall wired — augment_chat=%s "
-            "(engine=%s)", worker_plugin.synthesis_recall_augment,
-            "ready" if worker_plugin.engine_recall is not None else "none")
-    except Exception as _er_err:
-        logger.warning(
-            "[AgnoWorker] Phase B EngineRecall wiring failed: %s — chat stays "
-            "on legacy memory_context only", _er_err)
-        worker_plugin.engine_recall = None
 
     # ── SHM publisher (G21 single-writer for agno_state.bin) ──
     try:

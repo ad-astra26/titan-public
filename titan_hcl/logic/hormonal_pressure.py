@@ -279,25 +279,41 @@ class HormonalPressure:
         return intensity
 
     def consume(self, amount: float) -> float:
-        """Deplete this hormone's level when a downstream EXPRESSION composite
-        fires (cross-process restoration of the monolith refractory loop).
+        """Spend this hormone when a downstream EXPRESSION composite fires.
 
-        Uses the SAME proportional formula ExpressionManager.evaluate_all
-        applied in-process before the Phase C split: low-level hormones lose
-        proportionally less (the +0.1 floor prevents a small hormone being
-        zeroed by a flat depletion). Level depletion IS the natural cooldown —
-        a lower level takes longer to rebuild past threshold. Refractory is
-        deliberately NOT touched here (it is owned exclusively by fire(), and
-        setting it here would bypass fire_count tracking — same rationale as
-        the original evaluate_all consumption block).
+        Two coupled effects, so expressing a drive makes it genuinely SUBSIDE
+        and then rebuild at the hormone's own emergent pace — never a clock
+        (Maker 2026-06-01: degrading the urge to wall-clock timing is not how a
+        sovereign agent rests):
+
+        1. Level depletion — proportional formula from the pre-split monolith:
+           low-level hormones lose proportionally less (the +0.1 floor stops a
+           small hormone being zeroed by a flat amount).
+        2. Emergent refractory — raise `refractory` proportional to the
+           fraction actually spent. `accumulate()` suppresses secretion by
+           (1 − refractory·0.8), and refractory decays at `refractory_decay`
+           scaled by maturity — so the PAUSE LENGTH emerges from the agent's
+           own neurochemistry (GABA/Chi/maturity), not a fixed interval. A big
+           spend → longer rest; a small spend → brief one. Proportional-by-
+           fraction also respects hormone SHARING (EMPATHY drives SOCIAL and
+           KIN_SENSE) — a partial spend leaves a partial drive for siblings.
+
+        (Supersedes the earlier "refractory owned exclusively by fire()" note:
+        an expression spending a hormone is itself a legitimate fire-like
+        event; fire_count stays untouched since this is composite-driven, not
+        an NS-program fire.)
 
         Returns the actual level delta (old - new) for telemetry.
         """
         if amount <= 0.0:
             return 0.0
         old = self.level
-        self.level = max(0.0, self.level * (
-            1.0 - min(1.0, amount / max(0.01, self.level + 0.1))))
+        frac = min(1.0, amount / max(0.01, self.level + 0.1))
+        self.level = max(0.0, self.level * (1.0 - frac))
+        # Emergent rest: refractory proportional to the spent fraction, never
+        # below what's already suppressing (max), capped at full.
+        self.refractory = min(
+            1.0, max(self.refractory, self.refractory_strength * frac))
         return old - self.level
 
     def adapt_threshold(self, reward: float, lr: float = 0.01) -> None:

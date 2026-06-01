@@ -74,12 +74,6 @@ case "$INDEX_KIND" in
         python scripts/architecture_trinity_index.py > /dev/null 2>&1
         cp titan-docs/specs/ARCHITECTURE_trinity_index.md "$OURS_PATH"
         ;;
-    ARCHITECTURE_backup_restore_index)
-        # architecture_backup_restore_index.py reads titan-docs/specs/ARCHITECTURE_backup_restore.md
-        # and writes titan-docs/specs/ARCHITECTURE_backup_restore_index.md.
-        python scripts/architecture_backup_restore_index.py > /dev/null 2>&1
-        cp titan-docs/specs/ARCHITECTURE_backup_restore_index.md "$OURS_PATH"
-        ;;
     *)
         echo "regen.sh: unknown index kind '$INDEX_KIND'" >&2
         exit 1

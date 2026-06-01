@@ -218,6 +218,54 @@ def test_expression_worker_init_expression_manager_registers_six_composites():
     }
 
 
+def test_consume_overlay_optimistic_depletion_and_reconcile():
+    """Option 2 (2026-06-01): on fire, expression_worker subtracts the in-flight
+    consumption LOCALLY (so it doesn't re-fire during the HORMONE_CONSUME
+    round-trip to the NNS) and reconciles the overlay against the NNS's actual
+    SHM drops — no clock, NNS remains source of truth."""
+    import queue
+    from titan_hcl.modules.expression_worker import (
+        _init_expression_manager, _drive_evaluate_all,
+        _CompositeMetaCgnEdgeHolder,
+    )
+    em = _init_expression_manager()
+    edge = _CompositeMetaCgnEdgeHolder()
+    q = queue.Queue()
+    overlay: dict = {}
+    levels = {"EMPATHY": 2.0, "CURIOSITY": 2.0, "IMPULSE": 2.0}
+
+    # Fire 1 — SOCIAL fires (high drive); overlay records the local spend.
+    _drive_evaluate_all(em, dict(levels), edge, q, "expression_worker",
+                        vocabulary_confidence=1.0, consume_overlay=overlay)
+    consumed = dict(overlay.get("consumed", {}))
+    assert consumed.get("EMPATHY", 0.0) > 0.0, "local depletion not recorded"
+    assert overlay.get("prev_shm", {}).get("EMPATHY") == 2.0  # raw shm tracked
+
+    # Reconcile — NNS applied the consume, so SHM dropped. Overlay shrinks by
+    # the observed drop (cancels cleanly once the real depletion lands).
+    dropped = {h: v - 0.5 for h, v in levels.items()}
+    _drive_evaluate_all(em, dropped, edge, q, "expression_worker",
+                        vocabulary_confidence=1.0, consume_overlay=overlay)
+    assert overlay["consumed"]["EMPATHY"] < consumed["EMPATHY"], \
+        "overlay must reconcile down against the NNS SHM drop"
+
+
+def test_consume_overlay_none_is_backward_compatible():
+    """Without an overlay (consume_overlay=None) behaviour is unchanged — the
+    KERNEL_EPOCH_TICK / legacy callers still work."""
+    import queue
+    from titan_hcl.modules.expression_worker import (
+        _init_expression_manager, _drive_evaluate_all,
+        _CompositeMetaCgnEdgeHolder,
+    )
+    em = _init_expression_manager()
+    res = _drive_evaluate_all(
+        em, {"EMPATHY": 2.0, "CURIOSITY": 2.0, "IMPULSE": 2.0},
+        _CompositeMetaCgnEdgeHolder(), queue.Queue(), "expression_worker",
+        vocabulary_confidence=1.0)  # no consume_overlay
+    assert "tier2_fired" in res and "speak_pending" in res
+
+
 def test_expression_worker_strong_composition_thresholds_match_spec():
     """The catalyst-site #8 closure (D8-3 prereq) gates `strong_composition`
     SOCIAL_CATALYST emit on `level ≥ 7` AND `confidence ≥ 0.8`. Both
