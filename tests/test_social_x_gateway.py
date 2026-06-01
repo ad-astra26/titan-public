@@ -903,6 +903,32 @@ class TestTwoCallShape:
         assert "twitter/user/last_tweets" not in calls, (
             "no paid verification reads on a tweet that never posted")
 
+    def test_record_social_connection_resets_hunger_clock(self, gateway, tmp_path):
+        """2026-06-01: a successful post/reply records a 'social' event marker so
+        the NNS social-hunger clock (time_since_last('social'), EMPATHY stimulus)
+        resets — without it the urge pins at max (it had not fired since
+        2026-03-30). Injects a tmp InnerMemoryStore to avoid touching prod db."""
+        from titan_hcl.logic.inner_memory import InnerMemoryStore
+        store = InnerMemoryStore(str(tmp_path / "im.db"))
+        gateway._inner_memory_store = store
+        before = store.time_since_last("social")   # no event yet → large
+        gateway._record_social_connection("post", "T1")
+        after = store.time_since_last("social")
+        assert after < before, "social marker must reset the hunger clock"
+        assert after < 5.0, "marker should be fresh (just recorded)"
+        # reply path records it too
+        gateway._record_social_connection("reply", "T1")
+        assert store.time_since_last("social") < 5.0
+
+    def test_record_social_connection_never_raises(self, gateway):
+        """Best-effort: a broken inner-memory store must NOT break posting."""
+        class _Boom:
+            def record_event(self, *a, **k):
+                raise RuntimeError("db gone")
+        gateway._inner_memory_store = _Boom()
+        # must not raise
+        gateway._record_social_connection("post", "T1")
+
     def test_generate_text_deleted_no_shim(self):
         """Per feedback_no_shim_old_path_must_be_deleted.md, _generate_text is gone."""
         assert not hasattr(SocialXGateway, "_generate_text"), (

@@ -67,14 +67,12 @@ from titan_hcl import bus
 from titan_hcl.bus import (
     DREAM_STATE_CHANGED,
     KERNEL_EPOCH_TICK,
-    KNOWLEDGE_MOMENT,
     MAINTAIN_BUNDLE,
     MEMORY_RETRIEVAL_USED,
     MODULE_HEARTBEAT,
     MODULE_PROBE_REQUEST,
     MODULE_SHUTDOWN,
     SYNTHESIS_FORK_COMMAND,
-    TOOL_CALL_VERDICT_RECORD,
     SYNTHESIS_FORK_COMMAND_RESULT,
     SYNTHESIS_BUFFER_COMMAND,
     SYNTHESIS_RECOMPUTE_DONE,
@@ -480,7 +478,6 @@ def _recompute_loop(store: "ActivationStore",
                     fork_activation_updater_holder: dict,
                     oracle_exporter_holder: dict,
                     metrics_exporter_holder: dict,
-                    tx_index_holder: dict,
                     send_queue, name: str,
                     interval_s: float,
                     stop_event: threading.Event,
@@ -558,16 +555,6 @@ def _recompute_loop(store: "ActivationStore",
                 logger.debug(
                     "[synthesis_worker] metrics_exporter call failed: %s",
                     _met_exp_err,
-                )
-            # Operator-closure Phase A2 — incrementally index new chain TXs into
-            # the tx_hash-native FAISS shards (bounded per tick; no-op until the
-            # builder is wired). Keeps SEARCH current with live chain growth.
-            try:
-                tx_index_holder["fn"]()
-            except Exception as _tix_exp_err:
-                logger.debug(
-                    "[synthesis_worker] tx_index tick failed: %s",
-                    _tix_exp_err,
                 )
             status_writer.publish(
                 last_consistent_event_ts=now,
@@ -724,73 +711,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     # Phase 10 §P10.B — metrics snapshot exporter holder (late-bound; set to
     # MetricsAggregator.export once the meter + aggregator are constructed).
     metrics_exporter_holder: dict = {"fn": lambda: None}
-    # Operator-closure Phase A2 — tx_hash-index incremental builder holder
-    # (late-bound; set once the SynthesisVectorStore + TxIndexBuilder are wired
-    # below). Default no-op so the recompute loop fires safely before wiring.
-    tx_index_holder: dict = {"fn": lambda: None}
-
-    # Operator-closure Phase A — ONE shared embedder for the whole worker (the
-    # tx_hash FAISS store, EngineRecall's query embed, the consolidation cosine
-    # path, AND skill_store) so only a single fastembed model is resident (RSS
-    # discipline per feedback_eager_init_needs_rss_root_cause_first — lazy-loads
-    # on first embed, never at boot).
-    _data_dir_sw = os.path.dirname(db_path) or "."
-
-    def _ensure_embed_model():
-        from fastembed import TextEmbedding
-        if not hasattr(_ensure_embed_model, "_model"):
-            _ensure_embed_model._model = TextEmbedding(
-                model_name="BAAI/bge-small-en-v1.5")
-        return _ensure_embed_model._model
-
-    def _shared_embedder(text: str):
-        try:
-            import numpy as np
-            vecs = list(_ensure_embed_model().embed([text]))
-            v = np.array(vecs[0], dtype=np.float32)
-            norm = np.linalg.norm(v)
-            if norm > 0:
-                v /= norm
-            return v
-        except Exception as e:
-            logger.debug("[synthesis_worker] shared_embedder failed: %s", e)
-            return None
-
-    def _shared_batch_embedder(texts: list):
-        # ONE fastembed call for the whole list — far faster + lighter than N
-        # single calls (the per-tick tx-index path embeds in bulk).
-        try:
-            import numpy as np
-            out = []
-            for v in _ensure_embed_model().embed(list(texts)):
-                v = np.asarray(v, dtype=np.float32)
-                n = float(np.linalg.norm(v))
-                out.append(v / n if n > 0 else v)
-            return out
-        except Exception as e:
-            logger.debug("[synthesis_worker] batch_embedder failed: %s", e)
-            return None
-
-    # Operator-closure Phase A2 — the tx_hash-native FAISS store (sole writer,
-    # G21). Binds outer-memory vectors to the chain by the canonical block_hash
-    # (arch §3.6 / INV-15). Serves as the in-process faiss_reader for this
-    # worker's EngineRecall (so SEARCH finally returns hits) + the by-tx_hash
-    # vector source for ConsolidationPass clustering (W4).
-    synth_vector_store = None
-    try:
-        from titan_hcl.synthesis.synthesis_vector_index import SynthesisVectorStore
-        synth_vector_store = SynthesisVectorStore(
-            data_dir=_data_dir_sw, embedder=_shared_embedder,
-            batch_embedder=_shared_batch_embedder)
-        logger.info(
-            "[synthesis_worker] tx_hash FAISS store ready (forks=%s) — "
-            "binding outer memory to the chain spine (INV-15)",
-            list(synth_vector_store.stats().keys()))
-    except Exception as exc:
-        logger.warning(
-            "[synthesis_worker] tx_hash FAISS store wiring failed: %s — "
-            "SEARCH stays cold (recall falls back to FORK_READ/CROSS_REF)", exc)
-        synth_vector_store = None
 
     rc_thread = threading.Thread(
         target=_recompute_loop,
@@ -798,7 +718,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
               bundle_snapshot_path, spine_exporter_holder,
               fork_exporter_holder, fork_activation_updater_holder,
               oracle_exporter_holder, metrics_exporter_holder,
-              tx_index_holder,
               send_queue, name,
               interval_s, stop_event, cache_lock),
         daemon=True, name=f"synthesis-recompute-{name}")
@@ -846,68 +765,25 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             index_db_conn = _sqlite3.connect(
                 f"file:{index_db_path}?mode=ro", uri=True,
                 check_same_thread=False, timeout=1.0)
-            # sqlite3.Row so consumers (TxIndexBuilder, RuleEvaluator, EngineRecall)
-            # can use string-key access. Row is tuple-compatible (positional access
-            # still works), so this is safe for positional consumers. WITHOUT this,
-            # TxIndexBuilder._resolve_fork_ids did `r["fork_name"]` on a plain tuple
-            # → "tuple indices must be integers or slices, not str" → the incremental
-            # tx-index builder failed every boot ("no incremental growth"). (2026-06-01)
-            index_db_conn.row_factory = _sqlite3.Row
         from titan_hcl.logic.timechain_v2 import RuleEvaluator
         evaluator = RuleEvaluator(
             orchestrator=None,
-            # Operator-closure Phase A: the tx_hash-native FAISS store IS the
-            # faiss_reader the SEARCH op always needed (arch §12.1 / INV-15).
-            # No longer deferred — SEARCH returns real hits in-process.
-            faiss_reader=synth_vector_store,
+            faiss_reader=None,    # P2D: caller-injected later (deferred)
             index_db=index_db_conn,
         )
         engine_recall = EngineRecall(
             rule_evaluator=evaluator,
             activation_lookup=store.bulk_base_level,
-            embedder=_shared_embedder,   # operator-closure: was deferred (B1)
+            embedder=None,        # P2D: lazy-injected by future consumer
             # Phase 4 §P4.H — kuzu_reader for concept-granularity recall.
             kuzu_reader=kuzu_graph_obj,
         )
         _set_engine_recall(engine_recall)
         logger.info(
             "[synthesis_worker] EngineRecall constructed — index_db=%s "
-            "faiss=%s embedder=wired kuzu_reader=%s",
+            "faiss=deferred embedder=deferred kuzu_reader=%s",
             "attached" if index_db_conn else "missing",
-            "tx_hash_store" if synth_vector_store is not None else "none",
             "attached" if kuzu_graph_obj is not None else "missing")
-
-        # Operator-closure Phase A2 — wire the incremental tx-index builder onto
-        # the recompute-loop holder. Each 60s tick indexes new conversation/
-        # declarative/procedural blocks since the watermark (bounded), keeping
-        # the tx_hash spine current with live chain growth. Read-only on the
-        # chain; the store's atomic save makes the new vectors visible to
-        # cross-process FaissReaders (agno/cognitive).
-        if synth_vector_store is not None and index_db_conn is not None:
-            try:
-                from titan_hcl.synthesis.tx_index_builder import TxIndexBuilder
-                _tx_index_builder = TxIndexBuilder(
-                    store=synth_vector_store,
-                    data_dir=_data_dir_sw,
-                    index_db=index_db_conn,
-                )
-
-                def _tx_index_tick() -> None:
-                    summary = _tx_index_builder.run(max_blocks=2000)
-                    if summary.get("indexed"):
-                        logger.info(
-                            "[synthesis_worker] tx-index tick: +%d vectors "
-                            "(scanned=%d) shards=%s",
-                            summary["indexed"], summary["scanned"],
-                            synth_vector_store.stats())
-
-                tx_index_holder["fn"] = _tx_index_tick
-                logger.info("[synthesis_worker] tx-index incremental builder wired")
-            except Exception as _tix_err:
-                logger.warning(
-                    "[synthesis_worker] tx-index builder wiring failed: %s — "
-                    "index stays at backfill state (no incremental growth)",
-                    _tix_err)
     except Exception as exc:
         logger.warning(
             "[synthesis_worker] EngineRecall construction failed: %s — "
@@ -1048,35 +924,16 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     action="reject", reason="llm_proposer_unconfigured",
                 )
 
-        # Operator-closure Phase B4 (W4) — real embeddings into consolidation.
-        # default_mine_recent_txs returns embedding=None (the "FAISS fetch is
-        # Phase 7" TODO, never done) → tag-only clustering → no real concepts
-        # ever formed. Fill each mined candidate's embedding from the tx_hash
-        # FAISS store (Phase A) so ConsolidationPass clusters by COSINE (0.85)
-        # AND tags, not tags alone — the precondition for real concept synthesis.
-        def _mine_with_embeddings(since_ts, exclude_forks):
-            cands = default_mine_recent_txs(since_ts, exclude_forks)
-            if synth_vector_store is None:
-                return cands
-            for c in cands:
-                if c.embedding is None:
-                    vec = synth_vector_store.get_vector(c.fork, c.tx_hash)
-                    if vec is not None:
-                        c.embedding = tuple(float(x) for x in vec)
-            return cands
-
         consolidation_pass = ConsolidationPass(
             concept_store=concept_store,
             cgn_bridge=cgn_bridge,
             outer_memory_writer=writer,
-            mine_recent_txs_fn=_mine_with_embeddings,
+            mine_recent_txs_fn=default_mine_recent_txs,
             llm_propose_fn=propose_fn,
         )
         logger.info(
             "[synthesis_worker] ConsolidationPass ready — DREAM_STATE_CHANGED "
-            "subscription active; rate-limit = 1 pass / dream window; "
-            "embeddings=%s (cosine clustering)",
-            "tx_hash_store" if synth_vector_store is not None else "tag-only",
+            "subscription active; rate-limit = 1 pass / dream window",
         )
     except Exception as exc:
         logger.warning(
@@ -1346,24 +1203,9 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         oracle_router.register(web_api_oracle)
         oracle_router.register(cgn_meaning_oracle)  # MeaningOraclePlug — for /v6/synthesis/oracles/router visibility
 
-        # Coverage analyzer — wired to the procedural-fork tool_call TXs on the
-        # chain so /v6/synthesis/oracles/coverage reflects REAL invocations.
-        # (2026-06-01) The analyzer was previously left on the no-op default
-        # reader, so the Observatory coverage endpoint always read 0 even when
-        # tool_call TXs were on chain — the deferred "follow-up" never landed.
-        # Now exposed once the tool-backstop actually produces tool_call TXs.
-        from titan_hcl.synthesis.procedural_tx_reader import (
-            default_procedural_tool_call_reader as _cov_tc_reader,
-        )
-        _cov_data_dir = os.environ.get("TITAN_DATA_DIR", "data")
-        _cov_timechain_dir = os.path.join(_cov_data_dir, "timechain")
-        coverage_analyzer = CoverageAnalyzer(
-            tool_call_reader=lambda since_ts, lim: _cov_tc_reader(
-                since_ts, lim,
-                index_db_path=os.path.join(_cov_timechain_dir, "index.db"),
-                chain_dir=_cov_timechain_dir,
-            ),
-        )
+        # Coverage analyzer — readers default to no-op; integration
+        # boot can wire them to the chain index DB in a follow-up.
+        coverage_analyzer = CoverageAnalyzer()
 
         # Snapshot exporter — wired to the 60s tick via a holder pattern
         # (mirrors forks_snapshot pattern). Buffers for recent verdicts
@@ -1504,13 +1346,27 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     try:
         from titan_hcl.synthesis.skill_store import ProceduralSkillStore
 
-        # Operator-closure Phase A: reuse the ONE shared embedder (no second
-        # fastembed model — RSS discipline). Same BAAI/bge-small-en-v1.5 path.
+        def _skill_embedder(text: str):
+            try:
+                from fastembed import TextEmbedding
+                import numpy as np
+                if not hasattr(_skill_embedder, "_model"):
+                    _skill_embedder._model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+                vecs = list(_skill_embedder._model.embed([text]))
+                v = np.array(vecs[0], dtype=np.float32)
+                norm = np.linalg.norm(v)
+                if norm > 0:
+                    v /= norm
+                return v
+            except Exception as e:
+                logger.debug("[synthesis_worker] skill_embedder failed: %s", e)
+                return None
+
         procedural_skill_store = ProceduralSkillStore(
             duckdb_conn=store._conn,
             faiss_path=skills_faiss_path,
             snapshot_path=skills_snapshot_path,
-            embedder=_shared_embedder,
+            embedder=_skill_embedder,
             soft_retire_floor=float(skill_cfg.get("soft_retire_floor", -0.5)),
             on_soft_retire=_skill_soft_retire_emit,
         )
@@ -1981,64 +1837,27 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 # is telemetry-only — no record_access, no rich-get-richer
                 # runaway (rFP §240). The actr_working_memory_decay contract is
                 # the SPEC-correct authority; this gate makes the producer honest.
-                # Operator-closure C1: MEMORY_RETRIEVAL_USED is now the per-ITEM
-                # REINFORCEMENT signal ONLY (record_access on the cited gate).
-                # The knowledge_moment denominator moved to the per-TURN
-                # KNOWLEDGE_MOMENT signal below (SPEC §25.9) — recording a moment
-                # per surfaced item inflated the denominator N× and crushed the
-                # sovereignty ratio. Surfaced-not-cited is telemetry only.
                 if payload.get("used_by_llm") is True:
                     with cache_lock:
                         store.record_access(item_id, float(ts))
                     events_recorded += 1
+                    # Phase 10 — a cited recall is a recall-satisfied moment.
+                    if sovereignty_meter is not None:
+                        try:
+                            sovereignty_meter.record_knowledge_moment(float(ts))
+                            sovereignty_meter.record_recall_satisfied(
+                                kind="cited_recall", ts=float(ts))
+                        except Exception:
+                            pass
                 else:
                     events_surfaced += 1
-                continue
-
-            if msg_type == KNOWLEDGE_MOMENT:
-                # Operator-closure C1 (SPEC §25.9) — the per-TURN sovereignty
-                # signal emitted post-LLM by agno. `needed` = the turn required
-                # knowledge (≥1 recall surfaced OR a tool call); `satisfied` =
-                # answered by ≥1 cited recall. One moment per turn, not per item.
-                if sovereignty_meter is None:
-                    continue
-                _km_ts = payload.get("ts")
-                if not isinstance(_km_ts, (int, float)):
-                    _km_ts = time.time()
-                try:
-                    if payload.get("needed"):
-                        sovereignty_meter.record_knowledge_moment(float(_km_ts))
-                    if payload.get("satisfied"):
-                        sovereignty_meter.record_recall_satisfied(
-                            kind="cited_recall", ts=float(_km_ts))
-                except Exception:
-                    pass
-                continue
-
-            if msg_type == TOOL_CALL_VERDICT_RECORD:
-                # Operator-closure C2 (W7) — a chat-time self-oracle tool
-                # (coding_sandbox in agno) shipped its pre-computed verdict.
-                # Buffer it into the OracleRouter companion buffer for the
-                # dream-boundary OracleVerdictBatch flush (→ §A.6 coverage).
-                # No plug re-run; the tool already verified by executing.
-                if oracle_router is None:
-                    continue
-                _ptx = payload.get("parent_tool_call_tx")
-                if not isinstance(_ptx, str) or not _ptx:
-                    continue
-                try:
-                    oracle_router.record_companion_verdict(
-                        parent_tool_call_tx=_ptx,
-                        oracle_id=str(payload.get("oracle_id", "coding_sandbox")),
-                        verdict=str(payload.get("verdict", "unknown")),
-                        evidence_ref=str(payload.get("evidence_ref", "")),
-                        latency_ms=int(payload.get("latency_ms", 0) or 0),
-                        fork="procedural",
-                    )
-                except Exception as _tcv_err:
-                    logger.debug(
-                        "[synthesis_worker] tool-call verdict record failed: %s",
-                        _tcv_err)
+                    # Surfaced-not-cited: a knowledge moment that recall did
+                    # not satisfy (the LLM re-derived instead).
+                    if sovereignty_meter is not None:
+                        try:
+                            sovereignty_meter.record_knowledge_moment(float(ts))
+                        except Exception:
+                            pass
                 continue
 
             if msg_type == USER_FEEDBACK_SIGNAL:
@@ -2254,23 +2073,6 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                     # in independent threads; rate-limits inside each dispatcher
                     # ensure ≤ 1 of each per dream window.
                     _maybe_run_llm_judge_async(dream_start_ts)
-                    # Operator-closure C2 (W6) — anchor the buffered oracle
-                    # companion verdicts into OracleVerdictBatch TXs (the
-                    # dream-boundary cadence flush_companion_batches always
-                    # specified but NO caller invoked → coverage stayed 0).
-                    # Cheap + synchronous; runs before the miner so the just-
-                    # anchored verdict refs are in the window the miner reads.
-                    if oracle_router is not None:
-                        try:
-                            _flushed = oracle_router.flush_companion_batches()
-                            if _flushed:
-                                logger.info(
-                                    "[synthesis_worker] oracle companion batches "
-                                    "flushed at dream boundary: %s", _flushed)
-                        except Exception as _ofb_err:
-                            logger.debug(
-                                "[synthesis_worker] companion flush failed: %s",
-                                _ofb_err)
                     _maybe_run_consolidation_async(dream_start_ts)
                     # Phase 5 §P5.H — fire the nightly ForkGC sweep on the
                     # SAME dream-boundary tick. Independent thread; the

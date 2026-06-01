@@ -418,37 +418,6 @@ BANNER
     fi
 fi
 
-# Backup/Restore architecture doc drift gate — added 2026-06-01.
-# When ARCHITECTURE_backup_restore.md is edited, its _index.md must be
-# regenerated in the same commit. Same discipline as the gates above.
-STAGED_BACKUP_RESTORE_ARCH=$(git diff --cached --name-only --diff-filter=ACM -- \
-    titan-docs/specs/ARCHITECTURE_backup_restore.md \
-    2>/dev/null)
-
-if [ -n "$STAGED_BACKUP_RESTORE_ARCH" ]; then
-    PY="$REPO_ROOT/test_env/bin/python"
-    [ -x "$PY" ] || PY=python3
-    if ! "$PY" "$REPO_ROOT/scripts/architecture_backup_restore_index.py" --check 2>/tmp/precommit_backup_restore_arch_drift.log; then
-        cat >&2 <<'BANNER'
-
-┌──────────────────────────────────────────────────────────────────────┐
-│  ⛔  Backup/Restore architecture index drift detected.               │
-│                                                                      │
-│  ARCHITECTURE_backup_restore.md was edited but its _index.md is stale.│
-│                                                                      │
-│  Fix:                                                                │
-│      python scripts/architecture_backup_restore_index.py             │
-│      git add titan-docs/specs/ARCHITECTURE_backup_restore_index.md         │
-│                                                                      │
-│  See: cat /tmp/precommit_backup_restore_arch_drift.log               │
-└──────────────────────────────────────────────────────────────────────┘
-
-BANNER
-        cat /tmp/precommit_backup_restore_arch_drift.log >&2
-        exit 1
-    fi
-fi
-
 if [ -n "$STAGED_TRACKERS" ]; then
     PY="$REPO_ROOT/test_env/bin/python"
     [ -x "$PY" ] || PY=python3

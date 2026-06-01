@@ -324,6 +324,34 @@ class SocialXGateway:
             self._archetype_dispatcher = False  # sentinel: don't retry every call
         return self._archetype_dispatcher
 
+    def _record_social_connection(self, kind: str, titan_id: str = "") -> None:
+        """Reset the NNS social-hunger clock — Titan genuinely connected on X.
+
+        EMPATHY's hormonal stimulus is driven by
+        InnerMemory.time_since_last('social') (30-min half-life, BOREDOM_HALF_LIFE).
+        Without a fresh 'social' marker the hunger pins at maximum → the
+        EXPRESSION.SOCIAL urge never rests. The legacy reset (plugin.py) fires
+        only for the `social_post` AGENCY helper, but real posting runs through
+        THIS gateway — so the marker had not been recorded since 2026-03-30
+        (the social drive was starved for ~2 months). cognitive_worker's NNS
+        reads the same ./data/inner_memory.db on this Titan, so recording here
+        propagates to the hormone stimulus. (2026-06-01 — third Phase C
+        migration-dropped feedback loop; Maker-approved restoration.)
+
+        Best-effort: never raises into the posting path.
+        """
+        try:
+            if getattr(self, "_inner_memory_store", None) is None:
+                from titan_hcl.logic.inner_memory import InnerMemoryStore
+                self._inner_memory_store = InnerMemoryStore()
+            self._inner_memory_store.record_event(
+                "social", program="EMPATHY",
+                details={"via": kind, "titan_id": titan_id})
+        except Exception as _sc_err:
+            logger.debug(
+                "[SocialXGateway] social-connection marker (%s) failed: %s",
+                kind, _sc_err)
+
     def _record_archetype_post_success(self, candidate, *, tweet_id: str,
                                          titan_id: str) -> None:
         """rFP §4.7 — post-success hook for adaptive scoring. Writes a
@@ -3364,6 +3392,9 @@ class SocialXGateway:
             "action_id": row_id,
         })
 
+        # 13b. Reset the NNS social-hunger clock — Titan genuinely connected.
+        self._record_social_connection("post", context.titan_id)
+
         return ActionResult(
             status="verified" if verified else "posted",
             tweet_id=tweet_id,
@@ -3543,6 +3574,7 @@ class SocialXGateway:
                                     tweet_id="unknown_soft_fail")
                 logger.info("[SocialXGateway] Reply soft-ok (likely posted): %s",
                             err)
+                self._record_social_connection("reply", context.titan_id)
                 return ActionResult(status="posted",
                                     tweet_id="unknown_soft_fail",
                                     text=reply_text, action_id=row_id)
@@ -3560,6 +3592,9 @@ class SocialXGateway:
         self._log_telemetry({"event": "reply_success", "tweet_id": tweet_id,
                               "reply_to": context.reply_to_tweet_id,
                               "consumer": consumer, "action_id": row_id})
+
+        # Reset the NNS social-hunger clock — a reply IS genuine connection.
+        self._record_social_connection("reply", context.titan_id)
 
         return ActionResult(status="posted", tweet_id=tweet_id,
                             text=reply_text, action_id=row_id)

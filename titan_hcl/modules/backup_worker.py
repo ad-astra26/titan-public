@@ -26,13 +26,11 @@ See: titan-docs/rFP_backup_worker.md
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
 import subprocess
 import sys
-import tarfile
 import threading
 import time
 from contextlib import suppress
@@ -153,8 +151,8 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     local_rolling_days = int(backup_cfg.get("local_rolling_days", 30))
     local_snapshot_always = bool(backup_cfg.get("local_snapshot_always", True))
     upload_verify = bool(backup_cfg.get("upload_verification_enabled", True))
-    tarball_validate = bool(backup_cfg.get("tarball_validation_enabled", True))
-    dry_run_on_boot = bool(backup_cfg.get("dry_run_on_boot", True))
+    # tarball_validation_enabled / dry_run_on_boot config retired 2026-06-01
+    # with the legacy boot dry-run (the stager validates the live pack).
 
     # Build ArweaveStore once at boot (rFP BUG-5)
     arweave_store = None
@@ -267,21 +265,17 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
                 "[BackupWorker] Phase 11 write_state(booted) failed: %s",
                 _swb_err)
 
-    # rFP I4 — boot dry-run (build tarball + validate, no upload). Maker
-    # 2026-05-28: moved to a background daemon thread. It builds a FULL tar.gz
-    # of data/ (~22GB → ~444s) which previously ran SYNCHRONOUSLY before the
-    # `booted` transition, leaving backup stuck `starting` for ~7min on every
-    # boot. It is pure pre-flight validation (no upload) so it must NOT gate
-    # readiness — the slot now reaches booted→running in seconds while the
-    # dry-run completes in the background.
-    if dry_run_on_boot:
-        def _bg_dry_run() -> None:
-            try:
-                _dry_run(backup, local_dir, tarball_validate)
-            except Exception as _dr_err:  # noqa: BLE001
-                logger.warning("[BackupWorker] Dry-run failed: %s", _dr_err)
-        threading.Thread(
-            target=_bg_dry_run, name="backup-boot-dry-run", daemon=True).start()
+    # 2026-06-01 — the legacy rFP-I4 boot dry-run was REMOVED. It built a FULL
+    # legacy tar.gz via create_personality_archive (gzip/zlib + Python-side tar
+    # walks MONOPOLIZE the GIL) on a daemon thread every boot → starved the
+    # heartbeat ~53s → shm_pid_dead → a wasteful transient self-restart on
+    # every boot. Worse, it validated the RETIRED legacy archive path, not the
+    # live unified_v2 pack. The Phase 2 stager (_maybe_build_stage, ~60s post-
+    # boot) already validates the LIVE pack — it builds the real unified_v2
+    # event with zstd (which RELEASES the GIL, so it does not starve the
+    # heartbeat) and now records the result to backup_dry_run_result.json for
+    # the dashboard health card. No pre-flight value lost; the every-boot waste
+    # + heartbeat starvation are gone.
     _send(send_queue, "BACKUP_WORKER_READY", name, "all", {
         "titan_id": titan_id,
         "mode": mode,
@@ -478,6 +472,9 @@ def _maybe_build_stage(state: dict) -> None:
     staged = backup._build_staged_event_v2(weekday)
     if staged is not None:
         backup.stage_built_event(staged, today)
+        # LIVE-path validation record (replaces the retired legacy boot
+        # dry-run) — feeds the dashboard backup health card.
+        _record_stage_dry_run_result(staged)
 
 
 def _start_stager(state: dict) -> None:
@@ -888,59 +885,32 @@ def _handle_manual(state: dict, msg: dict) -> None:
 
 # ── Phase 2 / I4 helpers ─────────────────────────────────────────────────
 
-def _dry_run(backup, local_dir: Path, validate: bool) -> None:
-    """rFP I4 — full-pipeline dry-run (no upload) at boot.
-
-    Builds personality archive → validates extract-test → writes result to
-    data/backup_dry_run_result.json. Catches tarball corruption / missing
-    aux DB / signing key issues BEFORE they corrupt a real backup.
+def _record_stage_dry_run_result(staged) -> None:
+    """Write data/backup_dry_run_result.json from a freshly-built unified_v2
+    staged event — the LIVE-path replacement for the retired legacy boot
+    dry-run. Records per-tier pack sizes so the dashboard's backup health card
+    reflects a real unified_v2 build (zstd, GIL-friendly), not a redundant
+    legacy gzip archive. Best-effort; never raises into the stager loop.
     """
-    result_path = "data/backup_dry_run_result.json"
-    t0 = time.time()
-    status = {"ok": False, "ts": time.time(), "steps": {}}
-    tmp_path = None
     try:
-        # Step 1: build tarball (arweave tier — realistic daily check)
-        tmp_path = backup.create_personality_archive(
-            output_path=f"/tmp/backup_dry_run_{int(time.time())}.tar.gz",
-            arweave_tier=True,
-        )
-        if not tmp_path or not os.path.exists(tmp_path):
-            status["steps"]["build"] = "FAIL (no archive)"
-            raise RuntimeError("dry-run: archive build returned None")
-        sz = os.path.getsize(tmp_path)
-        status["steps"]["build"] = f"OK ({sz/1024/1024:.1f} MB)"
-
-        # Step 2: validate extract-test (critical: tarball not silently corrupt)
-        if validate:
-            with tarfile.open(tmp_path, "r:gz") as tf:
-                members = tf.getnames()
-            status["steps"]["validate"] = f"OK ({len(members)} members)"
-        else:
-            status["steps"]["validate"] = "SKIP (disabled)"
-
-        # Step 3: compute hash (proof of what we'd upload)
-        status["steps"]["hash"] = _sha256_file(tmp_path)[:16]
-
-        status["ok"] = True
-        status["duration_s"] = round(time.time() - t0, 2)
-        logger.info("[BackupWorker] Dry-run PASS in %.1fs (%.1f MB, %d members)",
-                    status["duration_s"], sz / 1024 / 1024,
-                    len(members) if validate else -1)
-    except Exception as e:
-        status["error"] = str(e)
-        status["duration_s"] = round(time.time() - t0, 2)
-        logger.warning("[BackupWorker] Dry-run FAIL: %s", e)
-    finally:
-        # Cleanup temp archive
-        if tmp_path:
-            with suppress(FileNotFoundError):
-                os.remove(tmp_path)
-        try:
-            with open(result_path, "w") as f:
-                json.dump(status, f, indent=2)
-        except Exception as e:
-            logger.warning("[BackupWorker] Could not write dry-run result: %s", e)
+        steps = {}
+        total = 0
+        for tier, r in (staged.tier_results or {}).items():
+            sz = int(getattr(r, "tarball_size_bytes", 0) or 0)
+            total += sz
+            steps[tier] = f"OK ({sz/1024/1024:.1f} MB)"
+        status = {
+            "ok": True,
+            "ts": time.time(),
+            "source": "unified_v2_stager",
+            "event_type": getattr(staged, "event_type", "?"),
+            "steps": steps,
+            "total_mb": round(total / 1024 / 1024, 1),
+        }
+        with open("data/backup_dry_run_result.json", "w") as f:
+            json.dump(status, f, indent=2)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[BackupWorker] stage dry-run result write failed: %s", e)
 
 
 def _check_runway(state: dict) -> None:
@@ -1013,14 +983,6 @@ def _node_path() -> str:
         return subprocess.check_output(["npm", "root", "-g"], timeout=10).decode().strip()  # noqa: async-block — backup worker sequential main loop (run_until_complete); not a concurrent/FastAPI loop
     except Exception:
         return "/usr/lib/node_modules"
-
-
-def _sha256_file(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 # ── Bus helpers (mirror memory_worker pattern) ────────────────────────────
