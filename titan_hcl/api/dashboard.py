@@ -4757,6 +4757,13 @@ async def post_v4_restart_module(name: str, request: Request,
         if reply is None:
             return _error("guardian RPC timeout (60s)")
         result_dict = reply.get("payload", {}) if isinstance(reply, dict) else {}
+        # guardian_hcl_client.restart_module() returns a bare bool (not a dict),
+        # so the RESPONSE payload can be a bool — normalize to a dict so the
+        # field reads below don't raise 'bool object has no attribute get'.
+        # (2026-06-01 — surfaced enabling synthesis/agno targeted restart.)
+        if not isinstance(result_dict, dict):
+            result_dict = {"ok": bool(result_dict),
+                           "process_alive": bool(result_dict)}
 
         # The handler already did the post-restart liveness check; trust its values.
         result = {
