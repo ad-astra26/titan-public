@@ -919,6 +919,63 @@ def create_pre_hook(plugin):
                 memory_lines.append(f"- [{w:.1f}] Q: {p} | A: {r}")
             memory_context = "### Recalled Memories\n" + "\n".join(memory_lines) + "\n\n"
 
+        # ── Operator-closure Phase B3 — synthesis tx_hash-spine recall augment ──
+        # Run EngineRecall composite retrieval over the tx_hash spine (Phase A)
+        # ALONGSIDE the legacy memory_context (INV-4 augment-then-converge):
+        # SEARCH returns tx_hashes, we dereference them into content snippets and
+        # inject as a DISTINCT block, and record the surfaced items so the
+        # post-LLM CitedUseDetector (INV-Syn-23) can score what the response
+        # actually cited (feeds W3 / the sovereignty ratio). Gated by
+        # synthesis_recall_augment (T3 override true); soft-fail — chat never
+        # breaks on a recall error. Retired vs legacy at D2 once proven.
+        synthesis_recall_context = ""
+        try:
+            _recall = getattr(plugin, "engine_recall", None)
+            if (getattr(plugin, "synthesis_recall_augment", False)
+                    and _recall is not None and prompt_text):
+                _deref = getattr(plugin, "synthesis_tx_deref", None)
+                _results = await asyncio.to_thread(_recall.recall, prompt_text, k=6)
+                _lines = []
+                _surfaced = []
+                for _r in (_results or []):
+                    _txh = getattr(_r, "tx_hash", "") or ""
+                    if not _txh:
+                        continue
+                    _snip = ""
+                    if _deref is not None:
+                        _snip = _deref.snippet(_txh, getattr(_r, "fork", "")) or ""
+                    if not _snip:
+                        _snip = getattr(_r, "summary", "") or ""
+                    if not _snip:
+                        continue
+                    _lines.append(f"- [{getattr(_r, 'score', 0.0):.2f}] {_snip[:300]}")
+                    _surfaced.append({
+                        "item_id": _txh,
+                        "title": _snip[:120],
+                        "content_snippet": _snip[:512],
+                        "concept_ids": [],
+                    })
+                if _lines:
+                    synthesis_recall_context = (
+                        "### Synthesis Recall (your own verified experience — tx_hash spine)\n"
+                        + "\n".join(_lines) + "\n\n"
+                    )
+                    _uid = getattr(plugin, "_current_user_id", "") or ""
+                    _sid = getattr(plugin, "_current_session_id", "") or ""
+                    _cid = f"{_uid}:{_sid}"
+                    _reg = getattr(plugin, "_last_surfaced_items", None)
+                    if not isinstance(_reg, dict):
+                        _reg = {}
+                        plugin._last_surfaced_items = _reg
+                    _reg.setdefault(_cid, []).extend(_surfaced)
+                    logger.info(
+                        "[PreHook] synthesis recall augment: %d tx_hash hits injected",
+                        len(_lines))
+        except Exception as _sr_err:
+            logger.debug(
+                "[PreHook] synthesis recall augment failed (chat unaffected): %s",
+                _sr_err)
+
         directive_context = ""
         if directives:
             directive_context = "### Prime Directives (Immutable, On-Chain)\n"
@@ -1703,7 +1760,7 @@ def create_pre_hook(plugin):
         # V5: inner state sections + V6: MSL/CGN/social/reasoning enrichment
         injected = (perceptual_field_text + interface_coloring + consciousness_context +
                     maker_context + voice_context + social_context + user_memory_context +
-                    memory_context + directive_context + status_context +
+                    memory_context + synthesis_recall_context + directive_context + status_context +
                     neuromod_context + embodied_context + temporal_context +
                     creative_context + metabolic_context + experience_context +
                     meta_reasoning_context + own_language_context +
@@ -1774,6 +1831,44 @@ def create_pre_hook(plugin):
                 plugin.memory.add_research_topic(prompt_text[:200])
 
         _ph_stage("after_mode_dispatch")
+
+        # ── Tool backstop (PRE) — deterministic tool/oracle invocation ────
+        # The heavy narration context makes the LLM role-play tool execution
+        # instead of emitting real tool_calls. If this turn needs a tool, run
+        # it deterministically NOW (cheap regex gate → fast-model router →
+        # coding_sandbox ToolPlug) and inject the TRUE verdict so the LLM
+        # narrates a real result. Gated so pure-conversation turns pay nothing.
+        # (2026-06-01, Maker-greenlit — synthesis oracle coverage fix.)
+        plugin._current_tool_intent = {
+            "required": False, "executed": False, "tool_id": "coding_sandbox"}
+        # Reset per-turn tool activity (read by agno_worker into CHAT_RESPONSE).
+        plugin._last_tool_activity = None
+        try:
+            _tb_cfg = ((getattr(plugin, "_full_config", {}) or {})
+                       .get("synthesis", {}) or {}).get("tool_backstop", {}) or {}
+            if _tb_cfg.get("enabled", True) and _tb_cfg.get("prehook_force", True):
+                from titan_hcl.synthesis.tool_backstop import run_tool_backstop
+                _bs = await run_tool_backstop(
+                    plugin, prompt=prompt_text, phase="pre")
+                plugin._current_tool_intent = {
+                    "required": _bs.fired, "executed": _bs.executed,
+                    "tool_id": "coding_sandbox"}
+                if _bs.executed:
+                    injected += _bs.verdict_block()
+                    plugin._last_tool_activity = _bs.activity(phase="pre")
+                    logger.info(
+                        "[PreHook] tool backstop ran coding_sandbox "
+                        "(success=%s) — TRUE verdict injected", _bs.success)
+            else:
+                # Pre-force off: still flag intent (cheap) so the PostHook backstops.
+                from titan_hcl.synthesis.tool_intent import detect_tool_intent
+                _it = detect_tool_intent(prompt_text)
+                plugin._current_tool_intent = {
+                    "required": _it.requires_tool, "executed": False,
+                    "tool_id": "coding_sandbox"}
+        except Exception as _tb_err:
+            logger.debug("[PreHook] tool backstop (pre) error (soft): %s", _tb_err)
+
         # Set the injected context on the agent (replace, not accumulate — prevents memory leak)
         if hasattr(agent, 'additional_context') and injected:
             agent.additional_context = injected
@@ -1987,6 +2082,46 @@ def create_post_hook(plugin):
                     logger.warning(
                         "[PostHook:P3] turn snapshot/tool-call extraction "
                         "failed (non-blocking): %s", _p3_err)
+
+                # ── Tool backstop (POST) — salvage a missed tool call ──────
+                # The PreHook flagged this turn as needing a tool, but the LLM
+                # narrated instead of calling it (no real tool_call) AND the
+                # PreHook pre-force didn't already run it. Execute deterministically
+                # now, anchor the verdict (→ oracle coverage), and append a
+                # corrective verdict block to the reply. (2026-06-01.)
+                try:
+                    _tb_intent = getattr(plugin, "_current_tool_intent", None) or {}
+                    _tb_cfg2 = ((getattr(plugin, "_full_config", {}) or {})
+                                .get("synthesis", {}) or {}).get(
+                                "tool_backstop", {}) or {}
+                    if (_tb_cfg2.get("enabled", True)
+                            and _tb_cfg2.get("posthook_backstop", True)
+                            and _tb_intent.get("required")
+                            and not _tb_intent.get("executed")
+                            and not _p3_tool_calls):
+                        from titan_hcl.synthesis.tool_backstop import (
+                            run_tool_backstop,
+                        )
+                        _bs_post = await run_tool_backstop(
+                            plugin, prompt=user_prompt,
+                            response=response_text, phase="post")
+                        if _bs_post.executed:
+                            response_text = (
+                                f"{response_text}\n\n"
+                                f"{_bs_post.verdict_block(corrective=True)}"
+                            ).strip()
+                            if hasattr(run_output, "content"):
+                                run_output.content = response_text
+                            plugin._last_tool_activity = _bs_post.activity(
+                                phase="post")
+                            logger.info(
+                                "[PostHook] tool backstop salvaged a missed "
+                                "tool call (success=%s)", _bs_post.success)
+                    _ph_stage("ovg_after_tool_backstop")
+                except Exception as _tbp_err:
+                    logger.debug(
+                        "[PostHook] tool backstop (post) error (soft): %s",
+                        _tbp_err)
 
                 # Phase 3 §7 NEW: topic-tag extraction (P3.C). Lives in
                 # llm_pipeline.topic_extractor; deterministic in-process

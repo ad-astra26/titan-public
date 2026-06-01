@@ -4677,6 +4677,8 @@ _RESTART_MODULE_ALLOWLIST = {
     "knowledge",    # State in DB
     "emot_cgn",     # Has MODULE_SHUTDOWN handler + save_state (2026-04-23)
     "timechain",    # 2026-04-27 — needed for index.db corruption recovery; chain_*.bin are source of truth, index is rebuildable
+    "synthesis",    # 2026-06-01 — state in synthesis.duckdb/FAISS (rebuildable, survives); enables targeted restart for synthesis-engine operator-closure work (avoids full-kernel bounce). RESTART only (kill-then-spawn) — NOT reload (see below).
+    "agno_worker",  # 2026-06-01 — state in agno_sessions.db (survives); enables targeted restart for chat-path work. RESTART only.
     "backup",       # 2026-06-01 — clean restart-isolated L2 module: MODULE_SHUTDOWN handler + state is on-disk manifest (rebuildable staged tarballs; ZK/Arweave clients re-init on boot). Enables restart-free single-module code deploys (restart-module backup?spawn=true) without a full-T1 restart.
     # 2026-06-01 (Maker: stop full-Titan restarts for single-worker code
     # deploys) — all restart-safe; state on-disk or rebuilt on boot:
@@ -4762,11 +4764,14 @@ async def post_v4_restart_module(name: str, request: Request,
             return _error(f"guardian RPC failed: {e}")
         if reply is None:
             return _error("guardian RPC timeout (60s)")
-        # Defend against a non-dict payload (older parent that returned a bare
-        # bool from restart_module → "'bool' object has no attribute 'get'").
-        _payload = reply.get("payload") if isinstance(reply, dict) else None
-        result_dict = _payload if isinstance(_payload, dict) else {
-            "ok": bool(_payload), "process_alive": bool(_payload)}
+        result_dict = reply.get("payload", {}) if isinstance(reply, dict) else {}
+        # guardian_hcl_client.restart_module() returns a bare bool (not a dict),
+        # so the RESPONSE payload can be a bool — normalize to a dict so the
+        # field reads below don't raise 'bool object has no attribute get'.
+        # (2026-06-01 — surfaced enabling synthesis/agno targeted restart.)
+        if not isinstance(result_dict, dict):
+            result_dict = {"ok": bool(result_dict),
+                           "process_alive": bool(result_dict)}
 
         # The handler already did the post-restart liveness check; trust its values.
         result = {
@@ -4809,7 +4814,12 @@ async def post_v4_restart_module(name: str, request: Request,
 # Modules safe to reload. Initially identical to _RESTART_MODULE_ALLOWLIST
 # — reload is strictly less disruptive than restart (NEW boots alongside
 # OLD, no downtime) so anything reload-safe is at least restart-safe.
-_RELOAD_MODULE_ALLOWLIST = set(_RESTART_MODULE_ALLOWLIST)
+# Reload (zero-downtime spawn-NEW→adopt→kill-OLD) is UNSAFE for `synthesis`
+# (G21 sole-writer — the overlap window would run two writers on synthesis.duckdb
+# /FAISS) and `agno_worker` (2× fastembed/OVG RSS spike during overlap). RESTART
+# (kill-then-spawn, no overlap) IS safe for both, so they're in the restart
+# allowlist above but EXCLUDED here. (2026-06-01)
+_RELOAD_MODULE_ALLOWLIST = set(_RESTART_MODULE_ALLOWLIST) - {"synthesis", "agno_worker"}
 
 
 async def post_v4_reload_module(name: str, request: Request):

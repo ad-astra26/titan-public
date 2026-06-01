@@ -121,12 +121,16 @@ def _http_get(url: str, timeout: float = 10.0) -> tuple[int, dict]:
         return 0, {"error": str(e)}
 
 
-def _http_post(url: str, payload: dict, timeout: float = 10.0) -> tuple[int, dict]:
+def _http_post(url: str, payload: dict, timeout: float = 10.0,
+               headers: Optional[dict] = None) -> tuple[int, dict]:
     try:
         body_bytes = json.dumps(payload).encode("utf-8")
+        hdrs = {"Content-Type": "application/json"}
+        if headers:
+            hdrs.update(headers)
         req = urllib.request.Request(
             url, data=body_bytes, method="POST",
-            headers={"Content-Type": "application/json"},
+            headers=hdrs,
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8", errors="replace")
@@ -1065,6 +1069,76 @@ def _check_p10_metrics(report: RunReport, base: str) -> None:
     _check(report, "P10-6 groundedness heatmap readout", "P10", _p10_6_groundedness)
 
 
+def _check_loop_consequence(report: RunReport, base: str,
+                            internal_key: Optional[str]) -> None:
+    """PLOOP — the TRUE-implementation gate (operator closure, 2026-05-31).
+
+    Every other check in this file POSTs an operator directly or asserts an
+    endpoint SHAPE — which is exactly what §0.STATUS flagged: "scores 42/46 only
+    because it POSTs each operator directly — nothing exercises the operator as a
+    *consequence* of a real chat turn." This check closes that gap: it sends a
+    REAL chat turn through `/chat` and asserts the synthesis operator fired as a
+    consequence, observable through the sovereignty meter.
+
+    Signal: a chat turn that surfaces ≥1 recalled item makes agno emit ONE
+    per-turn `KNOWLEDGE_MOMENT` (operator-closure C1), which the
+    `SovereigntyRatioMeter` records — so `knowledge_moments` in
+    `/v6/synthesis/metrics/sovereignty` MUST advance after the turn. (The metric
+    is snapshot-exported on the 60s recompute, so we poll up to ~150s.)
+
+    Requires the chat internal key (`--internal-key` or env `TITAN_INTERNAL_KEY`).
+    Absent → the check is SKIPPED (recorded passed with a skip note) so the
+    shape-gate still runs from a host without the key.
+    """
+    if not internal_key:
+        _check(report, "PLOOP consequence-of-chat (SKIPPED — no internal key)",
+               "PLOOP", lambda: (True, "no --internal-key / TITAN_INTERNAL_KEY; "
+                                 "skipped (run on the box with the key to exercise)"))
+        return
+
+    def _km_now() -> Optional[int]:
+        code, body = _http_get(f"{base}/v6/synthesis/metrics/sovereignty")
+        if code != 200:
+            return None
+        allw = (body.get("sovereignty", {}).get("windows", {}).get("all")
+                or body.get("sovereignty", {}).get("all") or {})
+        km = allw.get("knowledge_moments")
+        return int(km) if isinstance(km, (int, float)) else None
+
+    def _loop_fires():
+        baseline = _km_now()
+        if baseline is None:
+            return False, "sovereignty metric unavailable (snapshot missing?)"
+        # Send a knowledge-seeking chat turn likely to surface backfilled memory.
+        msg = ("What do you remember about your own architecture and sovereignty "
+               "from our past conversations? Recall something specific.")
+        code, body = _http_post(
+            f"{base}/chat",
+            {"message": msg, "user_id": "@e2e_ploop", "session_id": "e2e_ploop"},
+            timeout=90.0,
+            headers={"X-Titan-Internal-Key": internal_key},
+        )
+        if code != 200:
+            return False, f"POST /chat → {code} {str(body)[:120]}"
+        # Poll for the per-turn KNOWLEDGE_MOMENT to land in the snapshot
+        # (60s recompute cadence → allow ~150s).
+        deadline = time.monotonic() + 150.0
+        while time.monotonic() < deadline:
+            cur = _km_now()
+            if cur is not None and cur > baseline:
+                return True, (f"knowledge_moments {baseline}→{cur} after a real "
+                              f"chat turn — the operator fired as a CONSEQUENCE "
+                              f"(not a direct POST). §0.STATUS closed.")
+            time.sleep(10.0)
+        final = _km_now()
+        return False, (f"knowledge_moments did not advance ({baseline}→{final}) "
+                       f"within 150s — operator may not have surfaced items "
+                       f"(augment_chat off? index empty? snapshot stale?)")
+
+    _check(report, "PLOOP real chat → KNOWLEDGE_MOMENT advance (true-loop)",
+           "PLOOP", _loop_fires)
+
+
 def _check_invariants(report: RunReport, base: str) -> None:
     """Cross-phase invariant gates — the binding contracts the system
     promises to uphold regardless of phase."""
@@ -1191,7 +1265,8 @@ def _check_invariants(report: RunReport, base: str) -> None:
 # ── Per-target orchestration ────────────────────────────────────
 
 
-def run_against_target(target: Target) -> RunReport:
+def run_against_target(target: Target,
+                       internal_key: Optional[str] = None) -> RunReport:
     print()
     print("=" * 80)
     print(f"  Live runtime E2E — target={target.name} ({target.base_url})")
@@ -1211,6 +1286,7 @@ def run_against_target(target: Target) -> RunReport:
     _check_p8_procedural_skill_miner(report, target.base_url)
     _check_p9_meta_reasoning(report, target.base_url)
     _check_p10_metrics(report, target.base_url)
+    _check_loop_consequence(report, target.base_url, internal_key)
     _check_invariants(report, target.base_url)
     report.finished_at = time.time()
     return report
@@ -1276,7 +1352,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         choices=list(TARGETS.keys()) + ["all"],
         help="Which Titan to target. Default T1.",
     )
+    parser.add_argument(
+        "--internal-key", default=os.environ.get("TITAN_INTERNAL_KEY", ""),
+        help="Chat internal key (X-Titan-Internal-Key) for the PLOOP true-loop "
+             "check (real chat → KNOWLEDGE_MOMENT advance). Falls back to env "
+             "TITAN_INTERNAL_KEY. Absent → PLOOP check is skipped.",
+    )
     args = parser.parse_args(argv)
+    internal_key = args.internal_key or None
 
     if args.target == "all":
         targets = [TARGETS[k] for k in ("T3", "T2", "T1")]  # devnet first
@@ -1296,7 +1379,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             r.finished_at = time.time()
             reports.append(r)
             continue
-        reports.append(run_against_target(t))
+        reports.append(run_against_target(t, internal_key=internal_key))
 
     all_ok = _print_summary(reports)
     _write_audit_json(reports, args.target)

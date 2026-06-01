@@ -2125,71 +2125,6 @@ class RebirthBackup:
                         src, dst, e,
                     )
 
-    def _refresh_baseline_dir_from_tarballs(self, tarball_paths: list) -> int:
-        """§24 #3 (2026-06-01) — refresh the baseline working dir from the
-        FULL-mode files INSIDE the just-shipped tarballs, NOT a re-copy of live
-        source.
-
-        The baseline-dir bytes MUST equal the bytes uploaded to Arweave so a
-        future incremental diff (xdelta3) reconstructs correctly at restore.
-        Re-copying live source drifts — especially on the STAGED path, where
-        the pack (off-loop stager) and the post-ship refresh can be ~20 min of
-        live writes apart, and for live sqlite DBs a raw re-read is a torn
-        snapshot. The shipped tarball IS the canonical bytes; extracting its
-        full-mode payloads makes the diff base exact.
-
-        Only diff_mode=="full" files are written (a baseline's tiers are all
-        full; a Sunday incremental's soul diff is left to anchor on the prior
-        full soul). get_patch_bytes() verifies each file's sha256.
-        """
-        from titan_hcl.logic.backup_event_tarball import unpack_event_tarball
-        base = self._baseline_working_dir()
-        os.makedirs(base, exist_ok=True)
-        written = 0
-        for tp in tarball_paths:
-            if not tp or not os.path.exists(tp):
-                continue
-            with open(tp, "rb") as f:
-                data = f.read()
-            with unpack_event_tarball(data) as unpacked:
-                for fm in unpacked.files:
-                    if fm.get("diff_mode") != "full":
-                        continue
-                    arc = fm.get("arc_name")
-                    if not arc:
-                        continue
-                    payload = unpacked.get_patch_bytes(arc)  # full bytes (sha-verified)
-                    dst = os.path.join(base, arc)
-                    parent = os.path.dirname(dst)
-                    if parent:
-                        os.makedirs(parent, exist_ok=True)
-                    tmp = dst + ".tmp"
-                    with open(tmp, "wb") as out:
-                        out.write(payload)
-                    os.replace(tmp, dst)
-                    written += 1
-        logger.info(
-            "[Backup] §24 baseline-dir refreshed from %d full-mode file(s) "
-            "across %d tarball(s) — bytes == shipped (no source-drift)",
-            written, len(tarball_paths))
-        return written
-
-    def _cleanup_event_scratch(self, result) -> None:
-        """rmtree the pipeline scratch dir(s) for a finished event — we run the
-        pipeline with cleanup_scratch=False (to keep tarballs for the #3
-        baseline-dir refresh), so we own the cleanup."""
-        import shutil
-        seen = set()
-        tiers = getattr(result, "tiers", {}) or {}
-        for t in tiers.values():
-            tp = getattr(t, "tarball_path", None)
-            if not tp:
-                continue
-            d = os.path.dirname(tp)
-            if d and d not in seen and os.path.isdir(d):
-                seen.add(d)
-                shutil.rmtree(d, ignore_errors=True)
-
     def _tier_specs_from_paths(self, paths, format_hint=None):
         """Convert PERSONALITY_PATHS-style tuples into TierFileSpec records
         for the unified pipeline.
@@ -2341,17 +2276,9 @@ class RebirthBackup:
         t_specs = self._tier_specs_from_paths(
             self.TIMECHAIN_PATHS, format_hint="timechain_bin",
         )
-        # §24.4.C conformance: the soul tier ships on weekly Sundays
-        # (incremental diff) AND on every baseline event (a baseline is a full
-        # snapshot of ALL in-scope paths per §24.2 — soul included regardless
-        # of weekday). Gating on weekday==6 ALONE was the bug that left the
-        # soul tier without an Arweave baseline (so every Sunday full-shipped
-        # consciousness.db). _refresh_baseline_working_dir then keeps the
-        # baseline-dir soul == the shipped soul, so weekly Sundays diff.
-        _should_rebase, _ = manifest.should_rebase()
         s_specs = (
             self._tier_specs_from_paths(self.WEEKLY_EXTRA_PATHS)
-            if (weekday == 6 or _should_rebase) else None
+            if weekday == 6 else None
         )
 
         # Baseline resolver — for incremental events, point at the
@@ -2409,45 +2336,32 @@ class RebirthBackup:
             except Exception:
                 pass
 
-        # cleanup_scratch=False so the shipped tarballs survive for the #3
-        # baseline-dir refresh (extract full-mode bytes == Arweave); we rmtree
-        # the scratch ourselves in the finally below.
         result = await run_unified_event(
             titan_id=self._titan_id, manifest=manifest,
             personality_specs=p_specs, timechain_specs=t_specs,
             soul_specs=s_specs, baseline_resolver=_baseline_resolver,
             arweave_uploader=_arweave_upload, zk_committer=_v3_chain_commit,
-            bus_emit=_bus_emit, cleanup_scratch=False,
+            bus_emit=_bus_emit,
         )
 
-        try:
-            if result.status != "shipped":
-                logger.warning(
-                    "[Backup] §24 unified_v2 event NOT shipped: status=%s "
-                    "errors=%s", result.status, result.errors,
-                )
-                return False
+        if result.status != "shipped":
+            logger.warning(
+                "[Backup] §24 unified_v2 event NOT shipped: status=%s "
+                "errors=%s", result.status, result.errors,
+            )
+            return False
 
-            # §24 #3: on baseline events refresh the working dir from the
-            # just-shipped tarballs (NOT a re-copy of live source — that drifts).
-            if result.event_type == "baseline":
-                try:
-                    paths = [t.tarball_path for t in result.tiers.values()
-                             if getattr(t, "tarball_path", None)]
-                    self._refresh_baseline_dir_from_tarballs(paths)
-                except Exception as e:
-                    logger.warning(
-                        "[Backup] §24 unified_v2: baseline-dir refresh-from-tarball "
-                        "failed: %s — falling back to source copy", e)
-                    try:
-                        self._refresh_baseline_working_dir()
-                    except Exception as e2:
-                        logger.warning(
-                            "[Backup] §24 unified_v2: source-copy fallback also "
-                            "failed: %s (next incremental may full-ship)", e2)
-            return True
-        finally:
-            self._cleanup_event_scratch(result)
+        # On baseline events, refresh the working dir so subsequent
+        # incrementals diff against the just-shipped baseline state
+        if result.event_type == "baseline":
+            try:
+                self._refresh_baseline_working_dir()
+            except Exception as e:
+                logger.warning(
+                    "[Backup] §24 unified_v2: baseline working dir refresh "
+                    "failed: %s (next incremental may full-ship)", e,
+                )
+        return True
 
     # ── Phase 2 pre-stage (2026-05-31) ─────────────────────────────────────
     #
@@ -2516,11 +2430,8 @@ class RebirthBackup:
         p_specs = self._tier_specs_from_paths(self.PERSONALITY_PATHS)
         t_specs = self._tier_specs_from_paths(
             self.TIMECHAIN_PATHS, format_hint="timechain_bin")
-        # §24.4.C conformance (see _run_unified_event_v2): soul ships on weekly
-        # Sundays AND on every baseline event (full snapshot of all paths).
-        _should_rebase, _ = manifest.should_rebase()
         s_specs = (self._tier_specs_from_paths(self.WEEKLY_EXTRA_PATHS)
-                   if (weekday == 6 or _should_rebase) else None)
+                   if weekday == 6 else None)
         base_dir = self._baseline_working_dir()
 
         def _baseline_resolver(component, arc_name):
@@ -2590,47 +2501,28 @@ class RebirthBackup:
             except Exception:
                 pass
 
-        # cleanup_scratch=False: keep the staged tarballs for the #3 baseline-dir
-        # refresh (CRITICAL on the staged path — the pack ran off-loop, possibly
-        # ~20 min before this ship, so re-copying live source would drift). We
-        # rmtree staged.scratch_dir ourselves in the finally below.
         result = await ship_staged_event(
             staged, manifest=manifest, arweave_uploader=_arweave_upload,
-            zk_committer=_v3_chain_commit, bus_emit=_bus_emit,
-            cleanup_scratch=False)
+            zk_committer=_v3_chain_commit, bus_emit=_bus_emit)
 
-        try:
-            if result.status == "stale_baseline":
-                logger.info(
-                    "[Backup] §24 staged event STALE (baseline moved since build) — "
-                    "discarding, stager will rebuild: %s", result.skipped_reason)
-                return False
-            if result.status != "shipped":
+        if result.status == "stale_baseline":
+            logger.info(
+                "[Backup] §24 staged event STALE (baseline moved since build) — "
+                "discarding, stager will rebuild: %s", result.skipped_reason)
+            return False
+        if result.status != "shipped":
+            logger.warning(
+                "[Backup] §24 staged ship NOT shipped: status=%s errors=%s",
+                result.status, result.errors)
+            return False
+        if result.event_type == "baseline":
+            try:
+                self._refresh_baseline_working_dir()
+            except Exception as e:
                 logger.warning(
-                    "[Backup] §24 staged ship NOT shipped: status=%s errors=%s",
-                    result.status, result.errors)
-                return False
-            # §24 #3: refresh baseline dir from the just-shipped staged tarballs.
-            if result.event_type == "baseline":
-                try:
-                    paths = [t.tarball_path for t in staged.tier_results.values()
-                             if getattr(t, "tarball_path", None)]
-                    self._refresh_baseline_dir_from_tarballs(paths)
-                except Exception as e:
-                    logger.warning(
-                        "[Backup] §24 ship-stage: baseline-dir refresh-from-tarball "
-                        "failed: %s — falling back to source copy", e)
-                    try:
-                        self._refresh_baseline_working_dir()
-                    except Exception as e2:
-                        logger.warning(
-                            "[Backup] §24 ship-stage: source-copy fallback also "
-                            "failed: %s (next incremental may full-ship)", e2)
-            return True
-        finally:
-            import shutil
-            if getattr(staged, "scratch_dir", None) and os.path.isdir(staged.scratch_dir):
-                shutil.rmtree(staged.scratch_dir, ignore_errors=True)
+                    "[Backup] §24 ship-stage: baseline working dir refresh "
+                    "failed: %s (next incremental may full-ship)", e)
+        return True
 
     def _auto_fund_irys_before_upload(self) -> None:
         """Re-homed Irys auto-fund (2026-05-31). The auto-fund hook lived only in
