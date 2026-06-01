@@ -87,15 +87,16 @@ class TestHormonalWorkerWiring:
             or "accumulate(stimulus" in src
 
     def test_broadcast_topics_extends_for_hormonal(self):
-        """module_catalog.py wires HORMONE_STIMULUS + HORMONE_CONSUME into
-        hormonal_module broadcast_topics (worker registration moved from
-        plugin.py to module_catalog.py; HORMONE_CONSUME added 2026-06-01)."""
+        """module_catalog.py wires HORMONE_STIMULUS into hormonal_module
+        broadcast_topics (registration moved from plugin.py to module_catalog.py).
+        HORMONE_CONSUME is deliberately NOT on hormonal_module — EXPRESSION
+        consumption is applied by cognitive_worker against the NNS hormonal
+        instance expression actually reads (2026-06-01 correction)."""
         from titan_hcl import module_catalog
         with open(module_catalog.__file__) as f:
             src = f.read()
         assert "_HORMONAL_WORKER_BROADCAST_TOPICS" in src
         assert "_bus_constants.HORMONE_STIMULUS" in src
-        assert "_bus_constants.HORMONE_CONSUME" in src
 
 
 # ── ns_worker producer side (B.6) ────────────────────────────────────
@@ -114,24 +115,37 @@ class TestNsWorkerProducer:
         assert "hormone_name" in src
         assert "IMPULSE" in src
 
-    def test_hormonal_worker_consumes_hormone_consume(self):
-        """hormonal_worker handles HORMONE_CONSUME by depleting each named
-        hormone via HormonalPressure.consume() (2026-06-01 cross-process
-        refractory restoration)."""
+    def test_cognitive_worker_consumes_hormone_consume_into_nns(self):
+        """cognitive_worker handles HORMONE_CONSUME by depleting each named
+        hormone in the NNS HormonalSystem (neural_nervous_system._hormonal) —
+        the nns_hormonal_state.bin instance expression_worker reads. This is
+        the corrected target (2026-06-01); hormonal_worker's separate instance
+        the urge never reads, so consuming there had no effect."""
+        import inspect
+        from titan_hcl import bus
+        from titan_hcl.modules import cognitive_worker as cw
+        src = inspect.getsource(cw)
+        assert "bus.HORMONE_CONSUME" in src
+        assert "_hormonal" in src and ".consume(" in src
+        assert bus.HORMONE_CONSUME in cw._COGNITIVE_WORKER_SUBSCRIBE_TOPICS
+
+    def test_hormonal_worker_does_not_consume_hormone_consume(self):
+        """Regression: hormonal_worker must NOT handle HORMONE_CONSUME (it owns
+        a different hormonal_state.bin instance the expression urge never reads
+        — routing consumption there did nothing)."""
         import inspect
         from titan_hcl.modules import hormonal_worker as hw
         src = inspect.getsource(hw)
-        assert "bus.HORMONE_CONSUME" in src
-        assert "hormone.consume(" in src
+        assert "if msg_type == bus.HORMONE_CONSUME" not in src
 
     def test_expression_worker_emits_hormone_consume(self):
-        """expression_worker publishes HORMONE_CONSUME to hormonal_module with
-        the per-fire consumption dict (producer side of the restored loop)."""
+        """expression_worker publishes HORMONE_CONSUME (dst='all', like the
+        sibling NS_REWARD emit) with the per-fire consumption dict; cognitive_worker's
+        broadcast filter selects it."""
         import inspect
         from titan_hcl.modules import expression_worker as ew
         src = inspect.getsource(ew)
         assert "bus.HORMONE_CONSUME" in src
-        assert "hormonal_module" in src
 
     def test_broadcast_topics_extends_for_ns(self):
         """module_catalog.py wires ACTION_RESULT into ns_module

@@ -309,6 +309,28 @@ def test_should_rebase_true_on_month_boundary(tmp_path):
     assert reason == "month_boundary"
 
 
+def test_should_rebase_suppressed_when_baseline_too_fresh(tmp_path):
+    """§24.2 fresh-baseline guard (2026-06-01): a first_event baseline that
+    lands days before the 1st must NOT immediately re-baseline on the 1st —
+    that's a full re-ship of barely-changed tiers (the T1 05-29→06-01 case).
+    The next month boundary (baseline aged past the grace) still rebases."""
+    m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))
+    # baseline 2026-05-29 (3 days before the June boundary)
+    b1 = _baseline_event(trigger="first_event",
+                         ts=datetime(2026, 5, 29, 12, tzinfo=timezone.utc).timestamp())
+    m.append_event(b1)
+    do, reason = m.should_rebase(now=datetime(2026, 6, 1, 9, tzinfo=timezone.utc))
+    assert do is False, "fresh (3d) baseline must NOT re-baseline on month boundary"
+    assert reason is None
+    # …but a baseline aged past the grace DOES rebase on the next boundary.
+    m2 = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path / "aged"))
+    b2 = _baseline_event(trigger="first_event",
+                         ts=datetime(2026, 4, 22, 12, tzinfo=timezone.utc).timestamp())
+    m2.append_event(b2)
+    do2, reason2 = m2.should_rebase(now=datetime(2026, 6, 1, 9, tzinfo=timezone.utc))
+    assert do2 is True and reason2 == "month_boundary"
+
+
 def test_should_rebase_false_on_same_day_as_baseline(tmp_path):
     """Don't double-rebase if a baseline already landed today."""
     m = UnifiedManifest(titan_id="T1", base_dir=str(tmp_path))

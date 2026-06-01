@@ -380,6 +380,13 @@ _COGNITIVE_WORKER_SUBSCRIBE_TOPICS = [
     #   neural_nervous_system.record_outcome with the payload's reward+program.
     bus.SPEAK_REQUEST_PENDING,     # → state_refs["_speak_pending_from_bus"]
     bus.NS_REWARD,                 # → neural_nervous_system.record_outcome
+    # HORMONE_CONSUME — EXPRESSION composite fire → deplete the driving
+    # hormones in the NNS HormonalSystem (neural_nervous_system._hormonal),
+    # which is the instance published to nns_hormonal_state.bin and read by
+    # expression_worker. Restores the consumption→refractory loop the Phase C
+    # split severed (2026-06-01). MUST live here, NOT hormonal_worker: that
+    # owns a DIFFERENT hormonal_state.bin instance that expression never reads.
+    bus.HORMONE_CONSUME,           # → neural_nervous_system._hormonal.consume
     # EXPERIENCE_RECORD — Record stage of the ExperienceOrchestrator loop
     # (rFP_experience_distillation_phase_c). Per-worker producers emit; this
     # worker enriches + records via _dispatch_experience_record. Targeted
@@ -1320,6 +1327,29 @@ def cognitive_worker_main(recv_queue, send_queue, name: str, config: dict) -> No
                         logger.debug(
                             "[CognitiveWorker] NS_REWARD record_outcome "
                             "raised: %s", _nsr_err)
+
+            elif msg_type == bus.HORMONE_CONSUME:
+                # 2026-06-01 — EXPRESSION composite fire (expression_worker)
+                # depletes the driving hormones in the NNS HormonalSystem
+                # (the instance published to nns_hormonal_state.bin that
+                # expression_worker reads). Restores the consumption→refractory
+                # loop severed by the Phase C split — without it composites
+                # re-fire every tick (EXPRESSION.SOCIAL runaway). Applied here,
+                # NOT in hormonal_worker, whose hormonal_state.bin instance the
+                # expression urge never reads.
+                nns = state_refs.get("neural_nervous_system")
+                _hsys = getattr(nns, "_hormonal", None) if nns is not None else None
+                if _hsys is not None:
+                    consumption = payload.get("consumption", {}) or {}
+                    for _hname, _amt in consumption.items():
+                        try:
+                            _horm = _hsys.get_hormone(_hname)
+                            if _horm is not None:
+                                _horm.consume(float(_amt))
+                        except Exception as _hc_err:
+                            logger.debug(
+                                "[CognitiveWorker] HORMONE_CONSUME %s raised: %s",
+                                _hname, _hc_err)
 
             elif msg_type == bus.EXPERIENCE_RECORD:
                 # Record stage of the distillation loop — enrich producer-emitted

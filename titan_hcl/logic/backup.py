@@ -2276,9 +2276,17 @@ class RebirthBackup:
         t_specs = self._tier_specs_from_paths(
             self.TIMECHAIN_PATHS, format_hint="timechain_bin",
         )
+        # §24.4.C conformance: the soul tier ships on weekly Sundays
+        # (incremental diff) AND on every baseline event (a baseline is a full
+        # snapshot of ALL in-scope paths per §24.2 — soul included regardless
+        # of weekday). Gating on weekday==6 ALONE was the bug that left the
+        # soul tier without an Arweave baseline (so every Sunday full-shipped
+        # consciousness.db). _refresh_baseline_working_dir then keeps the
+        # baseline-dir soul == the shipped soul, so weekly Sundays diff.
+        _should_rebase, _ = manifest.should_rebase()
         s_specs = (
             self._tier_specs_from_paths(self.WEEKLY_EXTRA_PATHS)
-            if weekday == 6 else None
+            if (weekday == 6 or _should_rebase) else None
         )
 
         # Baseline resolver — for incremental events, point at the
@@ -2430,8 +2438,11 @@ class RebirthBackup:
         p_specs = self._tier_specs_from_paths(self.PERSONALITY_PATHS)
         t_specs = self._tier_specs_from_paths(
             self.TIMECHAIN_PATHS, format_hint="timechain_bin")
+        # §24.4.C conformance (see _run_unified_event_v2): soul ships on weekly
+        # Sundays AND on every baseline event (full snapshot of all paths).
+        _should_rebase, _ = manifest.should_rebase()
         s_specs = (self._tier_specs_from_paths(self.WEEKLY_EXTRA_PATHS)
-                   if weekday == 6 else None)
+                   if (weekday == 6 or _should_rebase) else None)
         base_dir = self._baseline_working_dir()
 
         def _baseline_resolver(component, arc_name):

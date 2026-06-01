@@ -373,24 +373,26 @@ def _drive_evaluate_all(
             _send_msg(send_queue, bus.EXPRESSION_FIRED, name, "timechain",
                       ef_payload)
 
-            # 1b) HORMONE_CONSUME — deplete the driving hormones in their
-            #     owner (hormonal_worker). Restores the consumption→refractory
-            #     loop the Phase C split severed: evaluate_all runs here with
-            #     hormonal_system=None, so the in-proc depletion never fires
-            #     and composites would otherwise re-fire every tick
-            #     (EXPRESSION.SOCIAL runaway, 2026-06-01). hormonal_worker
-            #     applies HormonalPressure.consume() per hormone; the lowered
-            #     levels feed back via HormonalShmReader next tick → urge drops
-            #     below threshold → natural pause until hormones rebuild.
+            # 1b) HORMONE_CONSUME — deplete the driving hormones so the urge
+            #     drops after firing. Restores the consumption→refractory loop
+            #     the Phase C split severed: evaluate_all runs here with
+            #     hormonal_system=None, so the in-proc depletion never fires and
+            #     composites would otherwise re-fire every tick (EXPRESSION.SOCIAL
+            #     runaway, 2026-06-01). Consumed by COGNITIVE_WORKER, which owns
+            #     the NNS HormonalSystem published to nns_hormonal_state.bin —
+            #     the exact instance HormonalShmReader feeds back into this
+            #     worker's evaluate_all. (hormonal_worker owns a DIFFERENT
+            #     hormonal_state.bin the urge never reads — routing there did
+            #     nothing.) dst="all" mirrors the sibling NS_REWARD emit;
+            #     cognitive_worker's broadcast filter selects it.
             _consumption = tf.get("consumption", {}) or {}
             if _consumption:
-                _send_msg(send_queue, bus.HORMONE_CONSUME, name,
-                          "hormonal_module", {
-                              "consumption": _consumption,
-                              "composite": composite_name,
-                              "src": name,
-                              "ts": time.time(),
-                          })
+                _send_msg(send_queue, bus.HORMONE_CONSUME, name, "all", {
+                    "consumption": _consumption,
+                    "composite": composite_name,
+                    "src": name,
+                    "ts": time.time(),
+                })
 
             # 2) NS_REWARD — cognitive_worker subscribes and calls
             #    record_outcome on its NeuralNervousSystem instance.
