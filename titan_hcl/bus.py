@@ -240,6 +240,28 @@ MODULE_PROBE_RESPONSE = "MODULE_PROBE_RESPONSE"
 # after each 60s recompute pass with {"items_recomputed": N, "duration_ms": M}.
 MEMORY_RETRIEVAL_USED = "MEMORY_RETRIEVAL_USED"
 SYNTHESIS_RECOMPUTE_DONE = "SYNTHESIS_RECOMPUTE_DONE"
+# Operator-closure (SPEC §25.9) — ONE per-turn knowledge-moment signal emitted
+# post-LLM by agno (the CitedUseDetector boundary), carrying {needed, satisfied,
+# ts}. synthesis_worker's SovereigntyRatioMeter records the per-TURN denominator
+# from this (replacing the per-ITEM MEMORY_RETRIEVAL_USED inflation). MEMORY_
+# RETRIEVAL_USED stays the per-ITEM reinforcement signal (record_access).
+KNOWLEDGE_MOMENT = "KNOWLEDGE_MOMENT"
+# Operator-closure C2 (W7) — a chat-time self-oracle tool (coding_sandbox in
+# agno) ships its PRE-COMPUTED companion verdict to synthesis_worker's
+# OracleRouter for the dream-boundary OracleVerdictBatch flush (no re-exec).
+# Payload: {parent_tool_call_tx, oracle_id, verdict, evidence_ref, latency_ms, ts}.
+TOOL_CALL_VERDICT_RECORD = "TOOL_CALL_VERDICT_RECORD"
+# Operator-closure telemetry (2026-06-01) — the §3 operator RECALL runs in
+# agno_worker (chat) + cognitive_worker (per-epoch), each with its OWN
+# RuleEvaluator + EngineRecall instance, so the §18 chi/retrieval metrics
+# (read off synthesis_worker's idle local evaluator + an un-fed latency ring)
+# were structurally blind to the work actually happening. The recall paths now
+# emit this fire-and-forget P3 sample after each recall; synthesis_worker
+# aggregates it into the retrieval latency ring + cross-process chi totals so
+# /v6/synthesis/metrics reflects the real loop. Metrics-only (INV-Syn-25:
+# derived, non-authoritative). Payload: {latency_ms, chi_spent, evaluations,
+# hits, fork, source, ts}.
+RETRIEVAL_SAMPLE = "RETRIEVAL_SAMPLE"
 
 # Phase 2 standing-contract event (PLAN_synthesis_engine_Phase2.md 2B,
 # D-P2-4): emitted by the post-seal contract hook in

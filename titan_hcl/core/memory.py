@@ -512,28 +512,13 @@ class TieredMemoryGraph:
         scored.sort(key=lambda x: x[0], reverse=True)
         results = [node for _, node in scored[:limit]]
 
-        # Synthesis Engine Phase 1 (D-SPEC-123 / SPEC v1.56.0 §25):
-        # use-gated MEMORY_RETRIEVAL_USED emit per returned user-memory
-        # node (INV-Syn-5). Same `mem:<id>` namespace as _cognee_search
-        # so the same memory_node gets unified activation across both
-        # retrieval paths. Fire-and-forget; failures degrade silently.
-        if self._bus_emit is not None and results:
-            now = time.time()
-            for node in results:
-                nid = node.get("id")
-                if nid is None:
-                    continue
-                try:
-                    self._bus_emit("MEMORY_RETRIEVAL_USED", {
-                        "item_id": f"mem:{nid}",
-                        "ts": now,
-                        "used_by_llm": False,  # INV-Syn-23: surfaced, not yet cited
-                    })
-                except Exception as _emit_err:
-                    logger.debug(
-                        "[Memory] query_user_memories emit failed: %s",
-                        _emit_err)
-                    break
+        # Operator-closure C1 (W3b): the retrieval-time `used_by_llm=False`
+        # soft emit was DROPPED. Emitting a surfaced signal per RETRIEVED
+        # candidate (most of which are never injected/used) over-counted the
+        # surfaced set and is now redundant — the agno post-LLM CitedUseDetector
+        # emits MEMORY_RETRIEVAL_USED (both true/false) over the items ACTUALLY
+        # surfaced into the prompt (B3's _last_surfaced_items), which is the
+        # honest signal for the per-item reinforcement + per-turn sovereignty.
         return results
 
     async def _cognee_search(self, prompt: str, top_k: int = 10) -> list:
@@ -625,25 +610,11 @@ class TieredMemoryGraph:
                     w_r=self._synth_w_r,
                     w_p=self._synth_w_p,
                 )
-                # SURFACED emit (INV-Syn-23 strict gate, Phase 9): retrieval-time
-                # producers emit used_by_llm=False — the item was surfaced into
-                # context, not yet cited. The post-LLM CitedUseDetector (agno) is
-                # the SOLE emitter of used_by_llm=True. synthesis_worker only
-                # reinforces (record_access) on True; False = surfaced_count
-                # telemetry. Cheap fire-and-forget.
-                now = time.time()
-                for sc in scored:
-                    try:
-                        self._bus_emit("MEMORY_RETRIEVAL_USED", {
-                            "item_id": sc.candidate.item_id,
-                            "ts": now,
-                            "used_by_llm": False,
-                        })
-                    except Exception as emit_err:
-                        logger.debug(
-                            "[Memory] synthesis emit failed (degrading): %s",
-                            emit_err)
-                        break    # break the loop on first emit error
+                # Operator-closure C1 (W3b): the retrieval-time `used_by_llm=
+                # False` soft emit was DROPPED (it surfaced every re-ranked
+                # CANDIDATE, over-counting). The agno post-LLM CitedUseDetector
+                # over the ACTUALLY-injected items is the sole emitter now. The
+                # composite re-rank stays — it still orders the results.
                 results = [sc.candidate.payload for sc in scored]
             except Exception as synth_err:
                 logger.debug(

@@ -3223,12 +3223,39 @@ repair_fork_failure_threshold = 3      # §9.3 / §11.5 consecutive-failure thre
 user_feedback_delta           = 0.15   # INV-Syn-24 Tier-2 utility delta (vs 0.05 oracle)
 recall_parity_soft_fallback   = true   # legacy-resolver fallback during parity soak ONLY
 
+[synthesis.recall]
+# Operator-closure (tx_hash spine, INV-15) — live retrieval into the chat path.
+# When true, the agno pre-LLM hook runs EngineRecall composite retrieval over
+# the tx_hash-native FAISS spine and injects the dereferenced hits ALONGSIDE the
+# legacy memory_context (INV-4 augment-then-converge). Default false (safety);
+# T3 canary override = true via ~/.titan/microkernel_T3.toml [synthesis.recall].
+augment_chat                  = false  # tx_hash-spine recall augment in chat (T3 canary = true)
+
 [synthesis.metrics]
 # Phase 10 (D-SPEC-PHASE10) — observatory + metrics (INV-Syn-25, observation only).
 sovereignty_windows           = ["24h", "7d", "all"]  # rolling windows for the headline ratio
 retrieval_latency_ring_size   = 1000   # perf-span ring length per recall reader
 groundedness_heatmap_top_n    = 50     # top-N concepts in the groundedness heatmap
 metrics_snapshot_enabled      = true   # emit synthesis_metrics_snapshot.json
+
+[synthesis.tool_backstop]
+# 2026-06-01 (Maker-greenlit) — deterministic tool/oracle invocation. The heavy
+# agno chat context makes the main LLM NARRATE fake tool execution instead of
+# emitting real tool_calls (oracle coverage sat at 0). The hooks now decide +
+# act: cheap regex gate (tool_intent) → fast-model router (tool_router) → real
+# coding_sandbox ToolPlug execution → TRUE verdict injected/appended.
+enabled            = true     # master switch for the whole backstop
+prehook_force      = true     # PreHook: run the tool BEFORE the LLM, inject verdict
+posthook_backstop  = true     # OVG PostHook: salvage a missed call after the LLM
+router_model_class = "fast"   # gemma3:4b — lean, no persona; only runs on gated turns
+router_timeout_s   = 12.0     # soft cap on the fast-model router call
+# Backstop action: "execute" — the fast-model router emits the exact code and we
+# run it through the coding_sandbox ToolPlug deterministically (anchors a
+# scored_by=oracle TX + injects/appends the TRUE verdict). The deterministic
+# re-execution IS the retry — no 2nd main-LLM round-trip (the codegen router
+# makes a no-code fallback effectively unreachable, so a reprompt mode would be
+# dead weight + re-entrancy risk). Surfaced to the UI via CHAT_RESPONSE.tool_activity.
+backstop_mode      = "execute"
 
 [microkernel]
 
