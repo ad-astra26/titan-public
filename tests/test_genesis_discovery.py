@@ -92,6 +92,46 @@ def test_find_shard3_anchor_paginates_to_genesis():
     assert res == {"shard3_tx": "SHARD3SIG", "encrypted_hex": "deadbeef"}
 
 
+def test_extract_shard3_handles_both_onchain_formats():
+    """BOTH real mainnet memo formats normalize to hex (regression: T1's LIVE
+    genesis memo is the pipe/base64 form, NOT the colon/hex form)."""
+    import base64
+    blob = bytes(range(93))  # 12 nonce + 65 shard + 16 tag
+    # T1 live: TITAN|SHARD3|v=2.0|data=<base64>
+    pipe = f'[148] TITAN|SHARD3|v=2.0|data={base64.b64encode(blob).decode()}'
+    assert gd._extract_shard3_hex(pipe) == blob.hex()
+    # current ceremony: TITAN_GENESIS_SHARD3:<hex>
+    colon = f'[207] TITAN_GENESIS_SHARD3:{blob.hex()}'
+    assert gd._extract_shard3_hex(colon) == blob.hex()
+    # hash-only variant → not recoverable on-chain
+    assert gd._extract_shard3_hex("TITAN_GENESIS_SHARD3_HASH:deadbeef") is None
+    assert gd._extract_shard3_hex("unrelated memo") is None
+
+
+def test_find_shard3_anchor_pipe_format_real_shard():
+    """The wallet walk finds + decodes a T1-style pipe/base64 Shard-3 memo,
+    round-tripping a real SSS shard back to the keypair."""
+    from solders.keypair import Keypair
+    import base64
+    kp = Keypair()
+    pubkey = str(kp.pubkey())
+    shards = shamir.split_secret(bytes(kp), n=3, t=2)
+    enc = shamir.encrypt_shard3(shards[2], pubkey)
+    memo = f"[148] TITAN|SHARD3|v=2.0|data={base64.b64encode(enc).decode()}"
+
+    def post(url, body):
+        before = body["params"][1].get("before")
+        if before:
+            return _FakeResp({"result": []})
+        return _FakeResp({"result": [{"signature": "S3PIPE", "memo": memo}]})
+
+    with _patch_httpx(post_handler=post):
+        res = _run(gd.find_shard3_anchor(pubkey, "http://rpc"))
+    assert res["shard3_tx"] == "S3PIPE"
+    s3 = shamir.decrypt_shard3(bytes.fromhex(res["encrypted_hex"]), pubkey)
+    assert shamir.combine_shares([shards[0], s3]) == bytes(kp)
+
+
 def test_find_shard3_anchor_not_found_returns_none():
     def post(url, body):
         return _FakeResp({"result": []})

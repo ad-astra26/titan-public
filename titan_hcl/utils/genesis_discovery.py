@@ -27,7 +27,16 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+import base64
+
+# The on-chain Shard-3 memo exists in TWO real formats (verified against mainnet):
+#   - "TITAN|SHARD3|v=2.0|data=<base64>"  — T1's LIVE genesis memo (2026-04-06).
+#   - "TITAN_GENESIS_SHARD3:<hex>"         — current genesis_ceremony.py.
+# Both wrap the SAME 93-byte AES-GCM blob (12 nonce + 65 shard + 16 tag). A
+# "_HASH:" variant carries only a sha256 (shard local-only) → NOT recoverable.
 _SHARD3_PREFIX = "TITAN_GENESIS_SHARD3:"
+_SHARD3_PIPE_PREFIX = "TITAN|SHARD3|"
+_SHARD3_HASH_PREFIX = "TITAN_GENESIS_SHARD3_HASH:"
 # The GenesisNFT mint name (genesis_ceremony.py mints "Titan Soul Gen 1").
 _GENESIS_NFT_NAME_HINTS = ("titan soul", "titan genesis", "sovereign soul")
 # A full paginated wallet walk caps at this many pages (1000 sigs/page) so a
@@ -46,19 +55,39 @@ async def _rpc(client, rpc_url: str, method: str, params: list) -> dict:
 
 
 def _extract_shard3_hex(memo: object) -> Optional[str]:
-    """Pull the encrypted-shard hex out of a `TITAN_GENESIS_SHARD3:{hex}` memo.
+    """Return the encrypted-shard blob as HEX from a Shard-3 memo, or None.
 
-    The RPC `memo` field may be prefixed with a byte-count, e.g.
-    `"[186] TITAN_GENESIS_SHARD3:ab12…"` — we slice from the prefix onward and
-    strip any trailing quote/whitespace.
+    Handles BOTH real on-chain formats (verified against mainnet) and normalizes
+    to hex so callers `bytes.fromhex(...)` uniformly:
+      - `TITAN|SHARD3|v=2.0|data=<base64>`  — T1's LIVE genesis memo → b64-decode.
+      - `TITAN_GENESIS_SHARD3:<hex>`         — current ceremony → hex as-is.
+    A `TITAN_GENESIS_SHARD3_HASH:` memo (shard kept local-only) is NOT
+    recoverable on-chain → None. The RPC `memo` field may carry a `"[len] "`
+    prefix, handled by slicing from the recognized marker.
     """
     if not memo:
         return None
     s = str(memo)
-    if _SHARD3_PREFIX not in s:
+    # Pipe format (T1 live): TITAN|SHARD3|v=2.0|data=<base64>
+    if _SHARD3_PIPE_PREFIX in s and "data=" in s:
+        b64 = s.split("data=", 1)[1].strip().rstrip('"').strip()
+        try:
+            return base64.b64decode(b64).hex()
+        except Exception:
+            return None
+    # Hash-only variant → the full shard is NOT on-chain.
+    if _SHARD3_HASH_PREFIX in s:
         return None
-    idx = s.index(_SHARD3_PREFIX)
-    return s[idx + len(_SHARD3_PREFIX):].strip().rstrip('"').strip()
+    # Colon/hex format (current ceremony): TITAN_GENESIS_SHARD3:<hex>
+    if _SHARD3_PREFIX in s:
+        idx = s.index(_SHARD3_PREFIX) + len(_SHARD3_PREFIX)
+        hexstr = s[idx:].strip().rstrip('"').strip()
+        try:
+            bytes.fromhex(hexstr)
+            return hexstr
+        except Exception:
+            return None
+    return None
 
 
 async def find_shard3_anchor(titan_pubkey: str, rpc_url: str) -> Optional[dict]:
