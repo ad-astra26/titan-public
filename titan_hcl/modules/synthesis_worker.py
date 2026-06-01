@@ -732,42 +732,34 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
 
     # Operator-closure Phase A — ONE shared embedder for the whole worker (the
     # tx_hash FAISS store, EngineRecall's query embed, the consolidation cosine
-    # path, AND skill_store) so only a single fastembed model is resident (RSS
-    # discipline per feedback_eager_init_needs_rss_root_cause_first — lazy-loads
-    # on first embed, never at boot).
+    # path, AND skill_store). Routed to the fleet-standard llama.cpp embedder
+    # singleton (Phase 13 §3J.1) so only a single ~197 MB model is resident — this
+    # is the RSS fix: fastembed/onnxruntime's CPU arena never returned memory to
+    # the OS and drove the bulk backfill to ~5 GB (feedback_eager_init_needs_rss_
+    # root_cause_first). llama.cpp is flat. Lazy-loads on first embed, never at boot.
     _data_dir_sw = os.path.dirname(db_path) or "."
 
     def _ensure_embed_model():
-        from fastembed import TextEmbedding
-        if not hasattr(_ensure_embed_model, "_model"):
-            _ensure_embed_model._model = TextEmbedding(
-                model_name="BAAI/bge-small-en-v1.5")
-        return _ensure_embed_model._model
+        from titan_hcl.utils.text_embedder import get_text_embedder
+        return get_text_embedder()
 
     def _shared_embedder(text: str):
         try:
             import numpy as np
-            vecs = list(_ensure_embed_model().embed([text]))
-            v = np.array(vecs[0], dtype=np.float32)
-            norm = np.linalg.norm(v)
-            if norm > 0:
-                v /= norm
-            return v
+            # Singleton returns an L2-normalized 1-D vector already.
+            return np.asarray(_ensure_embed_model().encode(text), dtype=np.float32)
         except Exception as e:
             logger.debug("[synthesis_worker] shared_embedder failed: %s", e)
             return None
 
     def _shared_batch_embedder(texts: list):
-        # ONE fastembed call for the whole list — far faster + lighter than N
-        # single calls (the per-tick tx-index path embeds in bulk).
+        # ONE embed call for the whole list — far faster + lighter than N single
+        # calls (the per-tick tx-index path embeds in bulk). Singleton normalizes.
         try:
             import numpy as np
-            out = []
-            for v in _ensure_embed_model().embed(list(texts)):
-                v = np.asarray(v, dtype=np.float32)
-                n = float(np.linalg.norm(v))
-                out.append(v / n if n > 0 else v)
-            return out
+            vecs = np.asarray(_ensure_embed_model().encode(list(texts)),
+                              dtype=np.float32)
+            return [vecs[i] for i in range(vecs.shape[0])]
         except Exception as e:
             logger.debug("[synthesis_worker] batch_embedder failed: %s", e)
             return None
