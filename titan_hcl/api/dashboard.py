@@ -4755,7 +4755,11 @@ async def post_v4_restart_module(name: str, request: Request,
             return _error(f"guardian RPC failed: {e}")
         if reply is None:
             return _error("guardian RPC timeout (60s)")
-        result_dict = reply.get("payload", {}) if isinstance(reply, dict) else {}
+        # Defend against a non-dict payload (older parent that returned a bare
+        # bool from restart_module → "'bool' object has no attribute 'get'").
+        _payload = reply.get("payload") if isinstance(reply, dict) else None
+        result_dict = _payload if isinstance(_payload, dict) else {
+            "ok": bool(_payload), "process_alive": bool(_payload)}
 
         # The handler already did the post-restart liveness check; trust its values.
         result = {
