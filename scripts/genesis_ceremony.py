@@ -473,10 +473,42 @@ def main():
         else:
             print("  Minting Genesis Soul NFT via Metaplex Core...")
 
-            # Build metadata URI (placeholder — will be Shadow Drive in production)
-            nft_uri = f"https://shdw-drive.genesysgo.net/titan/gen_1.json"
+            # Build the GenesisNFT off-chain metadata — the COMPLETE sovereign
+            # identity root (INV-MBR-5) carrying a `recovery` block (INV-MBR-5a:
+            # the on-chain Shard-3 anchor `shard3_tx`) so a wallet-only
+            # resurrection discovers Shard-3 from the NFT ALONE (no envelope, no
+            # separate off-chain record). Upload to Arweave + point the NFT uri at
+            # it; fall back to a placeholder uri only if the upload fails (the
+            # ceremony must never hard-fail on the metadata host).
+            nft_uri = "https://shdw-drive.genesysgo.net/titan/gen_1.json"
+            try:
+                import asyncio
+                from titan_hcl.logic.birth_dna import (
+                    build_genesis_nft_metadata, genesis_recovery_block,
+                )
+                from titan_hcl.utils.arweave_store import ArweaveStore
+                recovery = genesis_recovery_block(
+                    shard3_tx=genesis_tx) if genesis_tx else None
+                nft_metadata = build_genesis_nft_metadata(
+                    titan_name=titan_pubkey[:8], recovery=recovery)
+                _net = "mainnet" if not args.skip_onchain else "devnet"
+                _store = ArweaveStore(network=_net)
+                _meta_tx = asyncio.run(_store.upload_json(
+                    nft_metadata, tags={"Type": "Genesis-NFT-Metadata"}))
+                if _meta_tx:
+                    nft_uri = _store.get_permanent_url(_meta_tx)
+                    print(f"  Genesis NFT metadata → Arweave: {nft_uri}")
+                    print(f"  Recovery pointer embedded: shard3_tx="
+                          f"{(genesis_tx or '')[:16]}…")
+                else:
+                    print("  [!] NFT metadata upload returned no tx — "
+                          "using placeholder uri (recovery via wallet-walk).")
+            except Exception as _md_err:
+                print(f"  [!] NFT metadata build/upload failed ({_md_err}) — "
+                      "using placeholder uri (recovery via wallet-walk fallback).")
 
-            # NFT attributes
+            # On-chain attributes (Metaplex Core Attributes plugin) — small,
+            # always present even if the Arweave metadata host is unavailable.
             nft_attributes = {
                 "Generation": "1",
                 "Type": "Genesis",
@@ -486,6 +518,7 @@ def main():
                 nft_attributes["Art_Hash"] = genesis_art_hash[:32]
             if genesis_tx:
                 nft_attributes["Genesis_TX"] = genesis_tx[:32]
+                nft_attributes["Shard3_TX"] = genesis_tx[:32]
 
             # Generate asset keypair
             asset_kp = SoldersKeypair()

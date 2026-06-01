@@ -10,8 +10,10 @@ import os
 import json
 import httpx
 import logging
-import torch
-import torch.nn.functional as F
+import numpy as np
+# NOTE: torch removed (Phase 13 §3J.1 / embedding-migration P4) — Tier-2 directive
+# similarity now uses numpy cosine over the fleet-standard llama.cpp embedder's
+# L2-normalized vectors. torch stays reserved for RL/NN/IQL only.
 
 class SageGuardian:
     """
@@ -39,8 +41,8 @@ class SageGuardian:
         self.recorder = recorder
         self._record_transition_callable = record_transition_callable
         self.directives_cache = {}    # Maps string directives -> their embeddings
-        self.directives_tensors = None # PyTorch tensor holding all directive embeddings
-        self.directive_texts = []      # List of strings corresponding to tensor indices
+        self.directives_matrix = None # numpy (num_directives, 384), L2-normalized
+        self.directive_texts = []      # List of strings corresponding to row indices
         self.restricted_keywords = []
 
         # Phase 3 Chunk ψ (D-SPEC-88, 2026-05-18) — 3-provider Venice/
@@ -120,28 +122,30 @@ class SageGuardian:
                 logging.warning("[Guardian] No Prime Directives found in titan.md.")
                 return
 
-            # Generate embeddings and cache them into a single tensor block
-            embeddings = self.embedder.encode(self.directive_texts, convert_to_tensor=True)
-            self.directives_tensors = embeddings # shape: (num_directives, 384)
-            
+            # Generate embeddings and cache them into a single numpy block
+            # (L2-normalized by the singleton → cosine reduces to a dot product).
+            embeddings = np.asarray(
+                self.embedder.encode(self.directive_texts), dtype=np.float32)
+            self.directives_matrix = embeddings # shape: (num_directives, 384)
+
             logging.info(f"[Guardian] Successfully cached {len(self.directive_texts)} Prime Directives for Tier 2 shield.")
 
         except Exception as e:
             logging.error(f"[Guardian] Failed to sync prime directives from titan.md: {e}")
 
-    def get_embedding(self, text: str) -> torch.Tensor:
+    def get_embedding(self, text: str) -> "np.ndarray":
         """
-        Helper method to get a local PyTorch embedding tensor for a given text string.
-        
+        Helper method to get a local numpy embedding vector for a given text string.
+
         Args:
             text (str): The input string to embed.
-            
+
         Returns:
-            torch.Tensor: A 1D tensor representing the semantic embedding, or None if the embedder is inactive.
+            np.ndarray: A 1D L2-normalized vector (384,), or None if the embedder is inactive.
         """
         if self.embedder is None:
             return None
-        return self.embedder.encode([text], convert_to_tensor=True)[0]
+        return np.asarray(self.embedder.encode([text])[0], dtype=np.float32)
 
     async def tier3_veto(self, action_intent: str, closest_directive: str) -> str:
         """
@@ -219,18 +223,19 @@ class SageGuardian:
                 return False
 
         # If embedder is missing, we bypass Tier 2 and Tier 3
-        if self.embedder is None or self.directives_tensors is None:
+        if self.embedder is None or self.directives_matrix is None:
             return True
 
         # Tier 2: The Semantic Boundary
         intent_emb = self.get_embedding(action_intent)
-        
-        # Calculate cosine similarity against all cached directives simultaneously using broadcasting
-        similarities = F.cosine_similarity(intent_emb.unsqueeze(0), self.directives_tensors)
-        
-        max_sim, best_idx = torch.max(similarities, dim=0)
-        max_sim_val = max_sim.item()
-        closest_directive = self.directive_texts[best_idx.item()]
+
+        # Cosine similarity against all cached directives at once. Both the intent
+        # and the directive rows are L2-normalized (singleton), so cosine reduces
+        # to a single matrix-vector dot product.
+        similarities = self.directives_matrix @ intent_emb
+        best_idx = int(np.argmax(similarities))
+        max_sim_val = float(similarities[best_idx])
+        closest_directive = self.directive_texts[best_idx]
 
         if max_sim_val > 0.85:
             await self._trigger_trauma(action_intent, f"Tier 2: Semantic Similarity {max_sim_val:.2f} > 0.85 to Directive: {closest_directive}")

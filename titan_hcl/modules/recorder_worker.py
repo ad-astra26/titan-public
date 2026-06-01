@@ -255,13 +255,18 @@ def _handle_query(msg: dict, recorder, scholar, gatekeeper, send_queue, name: st
             # HERE from raw_prompt, so agno carries no torch. The 3072-d padded
             # observation is returned so agno's post-hook RL recording keeps the
             # real obs (round-trip; gatekeeper training loop unchanged).
+            import numpy as np
             import torch
             raw_prompt = payload.get("raw_prompt", "")
             observation_vector = None
             if payload.get("encode_host_side"):
                 try:
                     embedder = recorder.action_embedder
-                    raw_emb = embedder.encode([raw_prompt], convert_to_tensor=True)[0]
+                    # Embedder is torch-free now (§3J.1 / migration P4): it returns
+                    # numpy; cross into torch HERE, at the RL/projection boundary.
+                    raw_emb_np = np.asarray(
+                        embedder.encode([raw_prompt])[0], dtype=np.float32)
+                    raw_emb = torch.from_numpy(raw_emb_np)
                     pad_size = 3072 - raw_emb.shape[0]
                     if pad_size > 0:
                         padded = torch.cat([raw_emb, torch.zeros(

@@ -26,10 +26,25 @@ def isolated_shm(monkeypatch, tmp_path):
 
 @pytest.fixture
 def isolated_data_dir(monkeypatch, tmp_path):
-    """Point TITAN_DATA_DIR at a temp dir so the test owns its DuckDB."""
+    """Point TITAN_DATA_DIR at a temp dir so the test owns its DuckDB.
+
+    The mempool semantic index uses the fleet-standard llama.cpp embedder, whose
+    GGUF is resolved from $TITAN_DATA_DIR/.gguf_cache (§3J.1). Since we override
+    TITAN_DATA_DIR for DB isolation, link the repo's vendored GGUF into the tmp
+    cache so the embedder actually embeds (the retired fastembed used to silently
+    network-download the model here; llama.cpp is offline-only)."""
     data = tmp_path / "data"
     data.mkdir()
     monkeypatch.setenv("TITAN_DATA_DIR", str(data))
+    # Link the vendored GGUF into the tmp data dir so the embedder can load it.
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src_gguf = os.path.join(repo_root, "data", ".gguf_cache",
+                            "bge-small-en-v1.5-f16.gguf")
+    if not os.path.exists(src_gguf):
+        pytest.skip(f"vendored GGUF not found at {src_gguf} — run setup P5 seed")
+    gguf_cache = data / ".gguf_cache"
+    gguf_cache.mkdir(parents=True, exist_ok=True)
+    os.symlink(src_gguf, gguf_cache / "bge-small-en-v1.5-f16.gguf")
     # Also reset the bridge_recall singleton so each test gets a fresh one
     # pointing at the right TITAN_SHM_ROOT.
     import titan_hcl.synthesis.bridge_recall as br_mod
@@ -95,9 +110,12 @@ async def test_cognee_search_degrades_when_watermark_missing(
 ):
     """No synthesis_worker booted → watermark slot missing → activation
     lookup returns {} → composite_score falls through to cosine-only.
-    Emit still fires (it's a separate concern — the worker subscribes
-    even if the watermark is stale; future booted worker picks up the
-    backlog from the bus)."""
+
+    The retrieval-time `used_by_llm=False` soft emit was DROPPED by the
+    operator-closure (C1/W3b, memory.py) — it surfaced every re-ranked
+    CANDIDATE and over-counted. The agno post-LLM CitedUseDetector over the
+    ACTUALLY-injected items is the sole MEMORY_RETRIEVAL_USED emitter now, so
+    _cognee_search itself emits NOTHING at retrieval time."""
     emitted = []
     mem = _make_memory_with_two_persistent_nodes(
         isolated_data_dir,
@@ -106,13 +124,8 @@ async def test_cognee_search_degrades_when_watermark_missing(
     results = await mem._cognee_search("quick brown fox", top_k=5)
     assert len(results) == 2
     assert results[0]["id"] == 1   # cosine-only ranking preserved
-    # Stale watermark → BridgeRecall.activation_lookup() returns {} →
-    # composite_score still runs (just with all cold-start) → emit still
-    # fires per returned item.
-    assert len(emitted) == 2
-    assert all(t == "MEMORY_RETRIEVAL_USED" for t, _ in emitted)
-    item_ids = {p["item_id"] for _, p in emitted}
-    assert item_ids == {"mem:1", "mem:2"}
+    # Retrieval-time soft emit removed (W3b) — no MEMORY_RETRIEVAL_USED here.
+    assert emitted == []
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -160,9 +173,10 @@ async def test_cognee_search_with_fresh_watermark_reranks(
     assert results[0]["id"] == 2, (
         f"composite re-rank should put node 2 (high B_i) first, got: "
         f"{[r['id'] for r in results]}")
-    # MEMORY_RETRIEVAL_USED emitted for both
-    item_ids = {p["item_id"] for _, p in emitted}
-    assert item_ids == {"mem:1", "mem:2"}
+    # The composite re-rank is the assertion of record here. The retrieval-time
+    # soft emit was dropped (W3b) — the sole emitter is now the agno post-LLM
+    # CitedUseDetector — so _cognee_search emits nothing at retrieval time.
+    assert emitted == []
 
 
 # ─────────────────────────────────────────────────────────────────────────

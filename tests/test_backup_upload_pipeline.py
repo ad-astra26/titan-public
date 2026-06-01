@@ -76,9 +76,10 @@ class FakeSolanaBackend:
                      event_root: str, components: list,
                      prev_sig: Optional[str]) -> Optional[dict]:
         """v=3 chain committer (5J-2 contract): one memo per component,
-        returns {"head_sig", "component_sigs"}. Uses Mode B (raw URL) so the
-        mock needs no key — it exercises the real v=3 encoder + per-component
-        emission + the head/prev contract the pipeline depends on."""
+        returns {"head_sig", "component_sigs"}. Mode follows the component's iv:
+        an encrypted component (iv set) → Mode B with that iv; a plaintext
+        component → Mode A with a fixed dummy url_key. Exercises the real v=3
+        encoder + per-component emission + the head/prev contract."""
         if self.fail_commits:
             return None
         from titan_hcl.logic.backup_memo_v3 import build_v3_memo
@@ -86,11 +87,14 @@ class FakeSolanaBackend:
         head_sig: Optional[str] = None
         for comp in components:
             sig = _fake_base58_sig()
+            iv = comp.get("iv")
+            mode = "B" if iv else "A"
             memo = build_v3_memo(
                 event_id=event_id, ts=ts, event_type=event_type,
                 tier=comp["tier"], archive_hash=comp["arc"],
                 merkle_root=event_root, arweave_tx=comp["tx_id"],
-                mode="B", prev_sig=prev_sig)
+                mode=mode, prev_sig=prev_sig, iv_b64=iv,
+                url_key=(b"\x00" * 32 if mode == "A" else None))
             self._memos[sig] = memo
             self.commit_log.append(sig)
             component_sigs[comp["tier"]] = sig

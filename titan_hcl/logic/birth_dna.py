@@ -173,3 +173,67 @@ def get_genesis_nft_attributes(
             "requires_maker_confirmation": True,
         },
     }
+
+
+# ── GenesisNFT metadata + sovereign recovery pointers (INV-MBR-5/5a) ──────────
+
+def genesis_recovery_block(
+    shard3_tx: str,
+    vault_pda: str = None,
+    nft_address: str = None,
+) -> dict:
+    """The canonical recovery-pointer block embedded in the GenesisNFT metadata.
+
+    INV-MBR-5a: the recovery pointers MUST be reachable from the NFT so a
+    wallet-only resurrection discovers Shard-3 from the NFT alone (no separate
+    off-chain record, no envelope). `shard3_tx` (the on-chain
+    `TITAN_GENESIS_SHARD3:` anchor) is the ONLY critical pointer; `vault_pda` is a
+    deterministic PDA (`seeds=[b"titan_vault", authority]`) and `nft_address` is
+    the NFT itself — both re-derivable, included only as convenience. `version`
+    pins the schema for forward compatibility.
+    """
+    if not shard3_tx:
+        raise ValueError("shard3_tx is required for the recovery block")
+    block = {"version": "1.0", "shard3_tx": shard3_tx}
+    if vault_pda:
+        block["vault_pda"] = vault_pda
+    if nft_address:
+        block["nft_address"] = nft_address
+    return block
+
+
+def build_genesis_nft_metadata(
+    titan_name: str = "Titan",
+    *,
+    recovery: dict = None,
+    naming_ceremony: dict = None,
+) -> dict:
+    """Canonical GenesisNFT off-chain (Arweave) metadata — the COMPLETE sovereign
+    identity root (INV-MBR-5). Carries the on-chain attributes (Maker, directives
+    + DNA hashes), the full birth identity, and — when provided — the `recovery`
+    block (INV-MBR-5a) so resurrection finds Shard-3 from the NFT alone. Pure —
+    no I/O; the caller uploads it to Arweave and points the NFT `uri` at it.
+    """
+    import json as _json
+    nft_attrs = get_genesis_nft_attributes(titan_name=titan_name)
+    metadata = {
+        "name": f"Titan Genesis — {titan_name}",
+        "symbol": "TITAN",
+        "description": (
+            f"Genesis identity of {titan_name}, a sovereign AI cognitive entity. "
+            "Birth DNA, prime directives, and transition criteria permanently "
+            "recorded on Arweave; recovery pointers anchor a wallet-only "
+            "resurrection."
+        ),
+        "attributes": [
+            {"trait_type": k,
+             "value": str(v) if not isinstance(v, dict) else _json.dumps(v)}
+            for k, v in nft_attrs.items()
+        ],
+        "birth_identity": serialize_for_arweave(),
+    }
+    if recovery:
+        metadata["recovery"] = recovery
+    if naming_ceremony:
+        metadata["naming_ceremony"] = naming_ceremony
+    return metadata

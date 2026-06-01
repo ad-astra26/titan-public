@@ -88,23 +88,26 @@ def test_action_embedder_loads_on_access_or_returns_none(tmp_path):
 
 
 def test_action_embedder_caches_failure(tmp_path, monkeypatch):
-    """If load fails, the property caches None and does NOT retry."""
+    """If the embedder fails to load, the property caches None and does NOT retry."""
     cfg = {"sage_memory": {"storage_path": str(tmp_path / "sage_e")}}
     r = SageRecorder(cfg)
-    # Force a synthetic ImportError on the first lookup
-    fake_mod = type(sys)("sentence_transformers")
+
+    # Force a load failure on the fleet-standard llama.cpp embedder singleton.
+    import titan_hcl.utils.text_embedder as te
+    calls = {"n": 0}
 
     def _raiser(*args, **kwargs):
-        raise ImportError("synthetic missing dep")
+        calls["n"] += 1
+        raise RuntimeError("synthetic embedder load failure")
 
-    fake_mod.SentenceTransformer = _raiser
-    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_mod)
+    monkeypatch.setattr(te, "get_text_embedder", _raiser)
     # First access — cached as None
     assert r.action_embedder is None
     assert r._action_embedder_cache is None
-    # Second access — must NOT retry import (still None, no exception
-    # raised — `_raiser` would error if called again).
+    # Second access — must NOT retry the load (still None; _raiser would bump
+    # the counter again if the property re-attempted the import).
     assert r.action_embedder is None
+    assert calls["n"] == 1, "action_embedder must cache the failure, not retry"
 
 
 def test_buffer_capacity_migration_preserves_records(tmp_path):

@@ -54,6 +54,10 @@ from titan_hcl.logic.backup_memo_v3 import (  # noqa: E402
     parse_v3_memo,
     read_url,
 )
+from titan_hcl.logic.backup_crypto import (  # noqa: E402
+    decrypt_component_tarball,
+    derive_master_key,
+)
 from titan_hcl.logic.backup_restore import apply_event_components  # noqa: E402
 from titan_hcl.logic.backup_zk_commit import compute_event_merkle_root  # noqa: E402
 
@@ -71,6 +75,7 @@ HALT_BROKEN_CHAIN = "broken_prev_chain"
 HALT_ARC_MISMATCH = "component_sha256_mismatch"
 HALT_EVENT_MERKLE_MISMATCH = "event_merkle_mismatch"
 HALT_MODE_B_UNSUPPORTED = "mode_b_sovereign_decrypt_unsupported"
+HALT_MODE_B_DECRYPT_FAILED = "mode_b_decrypt_failed"
 HALT_APPLY_FAILED = "apply_failed"
 
 _TIER_COMPONENT = {"PT": "personality", "TC": "timechain", "SL": "soul"}
@@ -124,6 +129,8 @@ async def resurrect_from_chain(
         out.halt_reason = "url_key_derivation_failed"
         out.errors.append(str(e))
         return out
+    # Mode-B tarball master key — derived lazily on the first encrypted component.
+    master_key = None
 
     # ── 1. walk the wallet's signature history, decode v=3 memos ──────────────
     log(f"Walking Solana signature history for {titan_id} ({titan_pubkey[:8]}…)")
@@ -176,6 +183,7 @@ async def resurrect_from_chain(
             continue
         ev["components"][comp] = {
             "tx_id": tx_id, "arc": p["arc"], "mode": p["mode"], "sig": sig,
+            "iv": p.get("iv"),
         }
         if p["tier"] == "PT":               # personality memo = the event head
             ev["head_sig"] = sig
@@ -249,14 +257,6 @@ async def resurrect_from_chain(
         component_bytes: dict = {}
         component_sha: dict = {}
         for comp_name, meta in comps.items():
-            if meta["mode"] == "B":
-                out.status = "halted"
-                out.halt_reason = HALT_MODE_B_UNSUPPORTED
-                out.errors.append(
-                    f"event {evt_short} {comp_name} is Mode B (encrypted data); "
-                    "sovereign restore needs the AES iv on-chain (follow-up). "
-                    "T1 is Mode A.")
-                return out
             try:
                 data = await arweave_fetch(meta["tx_id"])
             except Exception as e:
@@ -264,6 +264,30 @@ async def resurrect_from_chain(
                 out.halt_reason = "arweave_fetch_failed"
                 out.errors.append(f"event {evt_short} {comp_name}: {e}")
                 return out
+            # Mode-B: the Arweave bytes are ENCRYPTED. Decrypt with the per-backup
+            # key re-derived from the reconstructed soul keypair (master key) + the
+            # arc[:16] backup_id + the on-chain iv, BEFORE the sha256==arc check
+            # (arc is over the plaintext tarball; GCM also authenticates the bytes).
+            if meta["mode"] == "B":
+                if not meta.get("iv"):
+                    out.status = "halted"
+                    out.halt_reason = HALT_MODE_B_UNSUPPORTED
+                    out.errors.append(
+                        f"event {evt_short} {comp_name}: Mode-B memo has no iv — "
+                        "cannot derive the decryption key (pre-G2 memo?).")
+                    return out
+                if master_key is None:
+                    master_key = derive_master_key(keypair_bytes, titan_pubkey)
+                try:
+                    data = decrypt_component_tarball(
+                        data, meta["iv"], master_key, comp_name, meta["arc"])
+                except Exception as e:
+                    out.status = "halted"
+                    out.halt_reason = HALT_MODE_B_DECRYPT_FAILED
+                    out.errors.append(
+                        f"event {evt_short} {comp_name}: Mode-B decrypt failed "
+                        f"({e}) — wrong key / tampered ciphertext.")
+                    return out
             sha = hashlib.sha256(data).hexdigest()
             if sha[:32] != meta["arc"]:
                 out.status = "halted"
@@ -322,19 +346,81 @@ def _atomic_swap_into_data(scratch_dir: str, install_root: str) -> None:
     _print(f"resurrected state swapped into {data_dir}")
 
 
+def restore_body_from_chain(
+    *,
+    key_bytes: bytes,
+    titan_pubkey: str,
+    titan_id: str,
+    install_root: str,
+    scratch_dir: Optional[str] = None,
+    rpc_url: Optional[str] = None,
+    network: str = "mainnet",
+    commit: bool = False,
+    verbose: bool = True,
+) -> ResurrectionResult:
+    """Canonical sovereign body-restore (INV-MBR-12): rebuild `data/` from the
+    on-chain v=3 backup chain — NO manifest, NO local files.
+
+    Builds the production seams (Solana signature walk + memo fetch + Arweave
+    fetch) and runs `resurrect_from_chain` into a scratch dir; on success +
+    `commit`, atomically swaps the reconstruction into `install_root/data/`
+    (backing up any existing tree). The SHARED engine for this module's `main()`
+    and `resurrection.py` phase 2+3 — one sovereign path, no manifest crutch.
+    Returns the `ResurrectionResult`.
+    """
+    scratch_dir = scratch_dir or os.path.join(install_root, "data.resurrect")
+    from titan_hcl.utils.arweave_store import ArweaveStore
+    from titan_hcl.logic.backup_restore import build_arc_to_target
+
+    store = ArweaveStore(network=network)
+    arc_to_target = build_arc_to_target(install_root)
+
+    async def _sig_lister() -> list:
+        from titan_hcl.utils import solana_client as sc
+        if not hasattr(sc, "get_signatures_for_address"):
+            raise RuntimeError(
+                "solana_client.get_signatures_for_address is unwired — live "
+                "chain walk pending (5J-3 live wiring). The protocol engine + "
+                "mock-chain tests are proven; live RPC walk is the remaining seam.")
+        return await sc.get_signatures_for_address(titan_pubkey, rpc_url=rpc_url)
+
+    async def _memo_fetcher(sig: str) -> Optional[str]:
+        from titan_hcl.utils import solana_client as sc
+        return await sc.get_memo_for_tx(sig, rpc_url=rpc_url)
+
+    async def _arweave_fetch(tx_id: str) -> bytes:
+        return await store.fetch(tx_id)
+
+    result = asyncio.run(resurrect_from_chain(
+        titan_id=titan_id, keypair_bytes=key_bytes, titan_pubkey=titan_pubkey,
+        sig_lister=_sig_lister, memo_fetcher=_memo_fetcher,
+        arweave_fetch=_arweave_fetch, arc_to_target=arc_to_target,
+        scratch_dir=scratch_dir, verbose=verbose))
+
+    if result.status == "resurrected" and commit:
+        _atomic_swap_into_data(scratch_dir, install_root)
+    return result
+
+
 def main(argv: Optional[list] = None) -> int:
     p = argparse.ArgumentParser(
         prog="backup_restore_sovereign",
         description=PROTOCOL_BANNER + " — resurrect a Titan from the wallet alone "
                     "(on-chain v=3 backup chain; no local files).")
     p.add_argument("--titan", required=True, help="Titan id (e.g. T1).")
-    p.add_argument("--shard1", help="Maker Shard-1 envelope (hex). Prefer --shard1-stdin.")
+    p.add_argument("--shard1", help="Maker raw Shard-1 (hex). Prefer --shard1-stdin.")
     p.add_argument("--shard1-stdin", action="store_true",
                    help="Read Shard-1 from stdin (ps-safe, never on the command line).")
+    p.add_argument("--titan-pubkey", default=None,
+                   help="The Titan's PUBLIC wallet address (printed alongside "
+                        "Shard-1; not a secret). Required for a fresh-box recovery "
+                        "(no local genesis record). NO envelope needed.")
     p.add_argument("--install-root", default=_REPO_ROOT, help="Target install tree.")
     p.add_argument("--scratch-dir", default=None,
                    help="Scratch reconstruction dir (default: <install-root>/data.resurrect).")
     p.add_argument("--rpc-url", default=None, help="Solana RPC URL override.")
+    p.add_argument("--network", default="mainnet", choices=["mainnet", "devnet"],
+                   help="Arweave/Solana network (default: mainnet).")
     p.add_argument("--commit", action="store_true",
                    help="Atomically swap the reconstructed state into data/ on success "
                         "(default: leave it in the scratch dir for inspection).")
@@ -370,7 +456,8 @@ def main(argv: Optional[list] = None) -> int:
         from types import SimpleNamespace
         key_bytes, titan_pubkey, _kp, titan_id = _res.phase_1_identity(
             SimpleNamespace(shard1=shard1, shard1_file=None, shard2_local=False,
-                            titan_id=args.titan),
+                            titan_id=args.titan, titan_pubkey=args.titan_pubkey,
+                            das_rpc_url=None),
             install_root)
     except SystemExit:
         _print("Identity recovery failed (see above).")
@@ -381,39 +468,15 @@ def main(argv: Optional[list] = None) -> int:
     finally:
         shard1 = None  # drop the shard reference promptly
 
-    # Production seams — Solana signature walk + memo fetch + Arweave fetch.
+    # ── body restore: the SHARED sovereign chain engine (no manifest) ─────────
     try:
-        from titan_hcl.utils.arweave_store import ArweaveStore
-        from titan_hcl.logic.backup_restore import build_arc_to_target
-        from titan_hcl.logic.backup import RebirthBackup  # for PATH constants
+        result = restore_body_from_chain(
+            key_bytes=key_bytes, titan_pubkey=titan_pubkey, titan_id=titan_id,
+            install_root=install_root, scratch_dir=scratch_dir,
+            rpc_url=args.rpc_url, network=args.network, commit=args.commit)
     except Exception as e:
-        _print(f"Runtime import failed: {e}")
+        _print(f"Sovereign restore error: {e}")
         return 1
-
-    store = ArweaveStore()
-    arc_to_target = build_arc_to_target(install_root)
-
-    async def _sig_lister() -> list:
-        from titan_hcl.utils import solana_client as sc
-        if not hasattr(sc, "get_signatures_for_address"):
-            raise RuntimeError(
-                "solana_client.get_signatures_for_address is unwired — live "
-                "chain walk pending (5J-3 live wiring). The protocol engine + "
-                "mock-chain tests are proven; live RPC walk is the remaining seam.")
-        return await sc.get_signatures_for_address(titan_pubkey, rpc_url=args.rpc_url)
-
-    async def _memo_fetcher(sig: str) -> Optional[str]:
-        from titan_hcl.utils import solana_client as sc
-        return await sc.get_memo_for_tx(sig, rpc_url=args.rpc_url)
-
-    async def _arweave_fetch(tx_id: str) -> bytes:
-        return await store.fetch(tx_id)
-
-    result = asyncio.run(resurrect_from_chain(
-        titan_id=titan_id, keypair_bytes=key_bytes, titan_pubkey=titan_pubkey,
-        sig_lister=_sig_lister, memo_fetcher=_memo_fetcher,
-        arweave_fetch=_arweave_fetch, arc_to_target=arc_to_target,
-        scratch_dir=scratch_dir))
 
     if result.status != "resurrected":
         _print(f"HALTED: {result.halt_reason}")
@@ -426,14 +489,13 @@ def main(argv: Optional[list] = None) -> int:
         _print("Re-run with --commit to swap the reconstruction into data/.")
         return 0
 
-    # ── commit: swap restored data/ into place, then materialize the bootable
-    # identity. The chain restore recovers the BODY (data/); the kernel's B1 boot
-    # additionally needs the plaintext 0600 keypair + hardware-bound
-    # soul_keypair.enc + RECOVERY flag — none of which live in the backup (mainnet
-    # genesis burns the plaintext key). phase_4_first_breath writes them from the
-    # already-reconstructed soul keypair (no second Shard-1 prompt), leaving a box
-    # the kernel can actually boot. ──────────────────────────────────────────────
-    _atomic_swap_into_data(scratch_dir, install_root)
+    # ── restore_body_from_chain already swapped data/ into place (commit=True);
+    # now materialize the bootable identity. The chain restore recovers the BODY
+    # (data/); the kernel's B1 boot additionally needs the plaintext 0600 keypair
+    # + hardware-bound soul_keypair.enc + RECOVERY flag — none of which live in
+    # the backup (mainnet genesis burns the plaintext key). phase_4_first_breath
+    # writes them from the already-reconstructed soul keypair (no second Shard-1
+    # prompt), leaving a box the kernel can actually boot. ────────────────────────
     try:
         _res.phase_4_first_breath(
             key_bytes, titan_pubkey, titan_id,
