@@ -4665,31 +4665,44 @@ async def post_v4_reload_config(request: Request):
 # Audit log: every call appends to /tmp/titan_restart_audit.log.
 # ---------------------------------------------------------------------------
 
-# Modules safe to restart in isolation. Excluded: rl, body, mind, llm,
-# media (low-stakes but no benefit until they have save handlers),
-# guardian itself (would deadlock), timechain (chain integrity sensitive,
-# needs careful design).
+# Modules safe to KILL-RESPAWN (kill-OLD → spawn-NEW, no RSS overlap). A module
+# is here only if its persistence is audit-verified (boots fresh from disk with
+# no critical-state loss) per rFP_module_hot_reload_persistence_program
+# (AUDIT_module_hot_reload_persistence_20260601.md, 40/40 module coverage).
+# _RELOAD (in-place, RSS-doubling) is the STRICTER subset below.
 _RESTART_MODULE_ALLOWLIST = {
-    "spirit",       # Has SAVE_NOW handler (2026-04-13)
-    "cgn",          # Has shutdown save (cgn_worker.py:428)
-    "language",     # No save handler yet — restart still works, state in DB
-    "memory",       # State in DuckDB/FAISS — survives without explicit save
-    "knowledge",    # State in DB
-    "emot_cgn",     # Has MODULE_SHUTDOWN handler + save_state (2026-04-23)
-    "timechain",    # 2026-04-27 — needed for index.db corruption recovery; chain_*.bin are source of truth, index is rebuildable
-    "synthesis",    # 2026-06-01 — state in synthesis.duckdb/FAISS (rebuildable, survives); enables targeted restart for synthesis-engine operator-closure work (avoids full-kernel bounce). RESTART only (kill-then-spawn) — NOT reload (see below).
-    "agno_worker",  # 2026-06-01 — state in agno_sessions.db (survives); enables targeted restart for chat-path work. RESTART only.
-    "backup",       # 2026-06-01 — clean restart-isolated L2 module: MODULE_SHUTDOWN handler + state is on-disk manifest (rebuildable staged tarballs; ZK/Arweave clients re-init on boot). Enables restart-free single-module code deploys (restart-module backup?spawn=true) without a full-T1 restart.
-    # 2026-06-01 — audited-safe additions only (rFP_module_hot_reload_persistence_program §P1a):
-    "hormonal_module",   # audit: reload_ok — SAVE_NOW → hormonal_state.json; HormonalSystem reloads on boot. hormonal_state.bin rebuildable.
+    # ── Grandfathered, audit-verified in §P3 (AUDIT §(D), 2026-06-01) ──────────
+    "cgn",          # reload_ok — SAVE_NOW+SHUTDOWN→_save_state + 300s checkpoint; _load_state on boot
+    "language",     # reload_ok — DB-direct immediate-commit + per-event teacher_state save; _load_teacher_state on boot
+    "memory",       # KILL-RESPAWN ONLY (528MB heavy) — DuckDB autocommit-durable per node + FAISS re-index on boot; verified
+    "knowledge",    # reload_ok — SQLite immediate-commit + jsonl append; boot reads DB
+    "emot_cgn",     # reload_ok — MODULE_SHUTDOWN→save_state; _load_state (json) on boot (2026-04-23)
+    "timechain",    # reload_ok — append-only chain_*.bin durable per-block; index.db rebuildable (chain-integrity-sensitive)
+    "synthesis",    # KILL-RESPAWN ONLY — state in synthesis.duckdb/FAISS (rebuildable); G21 sole-writer + heavy → NOT reload
+    "agno_worker",  # KILL-RESPAWN ONLY — state in agno_sessions.db (survives); heavy (414–626MB) → NOT reload
+    "backup",       # reload_ok — atomic on-disk manifest (json.dump+os.replace); no buffered critical state; clients re-init on boot
+    "hormonal_module",   # reload_ok — SAVE_NOW → hormonal_state.json; HormonalSystem reloads on boot
     "api",               # stateless HTTP layer, start_method=spawn (re-imports from disk). Lets the api self-reload code (incl. this allowlist).
-    # REVERTED 2026-06-01 (§P1a): social_worker / expression_worker / cognitive_worker
-    # were added on a casual comment then removed — the 52-agent persistence audit
-    # (AUDIT_module_hot_reload_persistence_20260601.md) found their save handlers are
-    # NOT_READY (social=SocialPressureMemory noop_stub; expression=save_edge_detector_state
-    # never_wired dict-not-instances; cognitive=save_state-vs-save_all typo). Restarting
-    # them silently LOSES state — the exact instability this program fixes. They re-enter
-    # only after the P2 persistence fix lands + re-verification.
+    # ── §P1 promotions — audit reload_ok (light + persistence-verified) ───────
+    "dream_state",          # reload_ok — stateless, SHM-only, ≤60s inbox loss intentional
+    "interface_advisor",    # reload_ok — stateless, 60s rolling deques disposable
+    "life_force",           # reload_ok — durable JSON, atomic, 300s+shutdown save, 13-field restore verified
+    "llm",                  # reload_ok — stateless inference proxy, stats cold-zero by design
+    "reflex",               # reload_ok — stateless; parent owns cooldown truth, synced per-request
+    "self_reflection_worker",  # reload_ok — durable JSON+SQLite, atomic, shutdown+SAVE_NOW+300s; ephemeral caches only
+    "social_graph",         # reload_ok — SQLite WAL, _route_write commits, WAL checkpoint post-loop + SAVE_NOW
+    "studio",               # reload_ok — stateless; artifact counts re-derived from disk
+    # ── §P1 promotions — audit kill_respawn_only (fresh-boot is the clean path) ─
+    "metabolism",           # kill_respawn_only — in-memory ring buffers by G19-strict design; fresh boot correct
+    "sovereignty",          # kill_respawn_only — scalars persist (atomic JSON+300s+shutdown); _modulator_history deques reconstruct over time
+    # REMOVED 2026-06-01 (§P3): "spirit" — DEAD ENTRY. spirit_worker_main was RETIRED
+    #   in D-SPEC-116 (module_catalog.py:690); no ModuleSpec(name="spirit") exists, so
+    #   restart-module spirit would fail at the guardian. Role moved to synthesis_worker
+    #   + outer_interface_worker. (AUDIT §(D).)
+    # HELD (not yet promoted): "media" — audit reload_ok but FAILs `arch_map persistence`
+    #   (eager-durable-write false-positive); promote in §P4 once the runtime
+    #   save→respawn→diff confirms. social/expression/cognitive stay OUT until §P2
+    #   persistence fixes land (NOT_READY per audit — total-loss on restart today).
 }
 
 
@@ -4811,15 +4824,32 @@ async def post_v4_restart_module(name: str, request: Request,
 # Per rFP_phase_c_bus_delivery_continuity_and_hot_reload §4 + D-SPEC-49.
 # ---------------------------------------------------------------------------
 
-# Modules safe to reload. Initially identical to _RESTART_MODULE_ALLOWLIST
-# — reload is strictly less disruptive than restart (NEW boots alongside
-# OLD, no downtime) so anything reload-safe is at least restart-safe.
-# Reload (zero-downtime spawn-NEW→adopt→kill-OLD) is UNSAFE for `synthesis`
-# (G21 sole-writer — the overlap window would run two writers on synthesis.duckdb
-# /FAISS) and `agno_worker` (2× fastembed/OVG RSS spike during overlap). RESTART
-# (kill-then-spawn, no overlap) IS safe for both, so they're in the restart
-# allowlist above but EXCLUDED here. (2026-06-01)
-_RELOAD_MODULE_ALLOWLIST = set(_RESTART_MODULE_ALLOWLIST) - {"synthesis", "agno_worker"}
+# Modules safe to IN-PLACE RELOAD (spawn-NEW → adopt → kill-OLD). This runs
+# BOTH copies briefly → transient RSS-doubling, so it is an EXPLICIT, STRICTER
+# subset of _RESTART_MODULE_ALLOWLIST (NOT derived). A module qualifies only if
+# it is persistence-verified AND light (< MODULE_RELOAD_RSS_CEILING_MB ≈ 120 on
+# the 8GB box) AND not a G21 sole-writer (the overlap window must never run two
+# writers on one slot/DB). rFP_module_hot_reload_persistence_program §P1
+# (2026-06-01) — decoupled from the derived `_RESTART − {synthesis, agno}` set,
+# which had silently left heavy `memory` (528MB) reloadable (RSS-doubling = the
+# instability this program fixes).
+#
+# EXCLUDED from reload (kill-respawn only, in _RESTART above):
+#   memory (528MB heavy), synthesis (G21 sole-writer + heavy), agno_worker
+#   (heavy 414–626MB), metabolism + sovereignty (audit kill_respawn_only:
+#   fresh boot is the clean path, in-place reload gains nothing).
+_RELOAD_MODULE_ALLOWLIST = {
+    # grandfathered reload_ok (§P3 audit, light, persistence-verified):
+    "cgn", "emot_cgn", "timechain", "backup", "language", "knowledge",
+    "hormonal_module",
+    # §P1 promotions — audit reload_ok (light, persistence-verified):
+    "dream_state", "interface_advisor", "life_force", "llm", "reflex",
+    "self_reflection_worker", "social_graph", "studio",
+    # stateless self-reload (lets the api hot-reload its own code incl. these lists):
+    "api",
+    # HELD: "media" — promote in §P4 after the runtime save→respawn→diff (FAILs the
+    # structural scanner today on the documented eager-durable-write false-positive).
+}
 
 
 async def post_v4_reload_module(name: str, request: Request):

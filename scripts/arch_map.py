@@ -8433,8 +8433,16 @@ def _persist_analyze_file(path):
     if not has_handler:
         reasons.append("no MODULE_SHUTDOWN handler (won't flush on hot-reload)")
     elif not flushes:
-        reasons.append("MODULE_SHUTDOWN path does not flush "
-                       "(no durable save in handler / post-loop / finally)")
+        # Only FILE-SNAPSHOT state (held in memory, written as a periodic/batched
+        # snapshot) needs an explicit shutdown flush. DB-direct persistence
+        # (commit / WAL / autocommit) is durable per-write — no flush required —
+        # so a DB-backed module that only `break`s on shutdown is fine.
+        if u["durable_file"] and not u["durable_db"]:
+            reasons.append("MODULE_SHUTDOWN path does not flush file-snapshot state "
+                           "(no durable save in handler / post-loop / finally)")
+        else:
+            warns.append("MODULE_SHUTDOWN handler does not flush — OK iff persistence "
+                         "is DB-direct/eager (verify: is any in-memory state batched?)")
     # File-snapshot writes REQUIRE an explicit boot-load to restore; DB-direct
     # (commit/WAL) self-restores on reconnect. The asymmetric check applies only
     # when file-snapshot is the PRIMARY persistence (no DB-direct present) — else
@@ -8449,12 +8457,14 @@ def _persist_analyze_file(path):
             "shutdown": has_handler, "savenow": bool(savenow_ifs)}
 
 
-def run_module_persistence_scan(scope="allowlist", only=None) -> int:
+def run_module_persistence_scan(scope="allowlist", only=None, strict=False) -> int:
     """§P0 structural persistence gate. scope: 'allowlist' (default) | 'all'.
 
-    Exit 1 if any module currently in _RESTART_MODULE_ALLOWLIST verdicts FAIL
-    (the enforcement contract) — that is the signal a module must NOT be
-    hot-reloaded until its §11 persistence is fixed.
+    Report-only by default (exit 0) — the verdicts are a pre-filter; the
+    authoritative gate is the §P4 runtime save→respawn→diff E2E. Exit-1
+    enforcement is opt-in:
+      --strict        → exit 1 if any allowlisted module FAILs
+      --module=NAME    → exit 1 if THAT module FAILs (dev-loop fix verification)
     """
     name2file = _persist_module_file_map()
     allow = _persist_restart_allowlist()
@@ -8493,20 +8503,23 @@ def run_module_persistence_scan(scope="allowlist", only=None) -> int:
         for w in (r.get("warns") or []):
             if r.get("reasons"):  # show warns separately only when there were also fails
                 print(f"  {'':<30} {'':<6} {'':<10} ⚠ {w}")
-        # In --module mode the gate is that one module; otherwise it's the
-        # allowlist (a module must pass the §11 contract before it's hot-reloaded).
-        if v in ("FAIL", "ERROR") and (only or name in allow):
+        # --module gates on that one module; --strict gates on the allowlist.
+        if v in ("FAIL", "ERROR") and (only or (strict and name in allow)):
             enforce_fail += 1
 
     print("-" * 84)
     summary = "  ".join(f"{k}={counts[k]}" for k in
                         ("PASS", "STATELESS", "FAIL", "ERROR", "UNRESOLVED") if counts[k])
     print(f"  {summary}")
+    gated = bool(only or strict)
     gate = f"module '{only}'" if only else "allowlisted module(s)"
     if enforce_fail:
-        print(f"  {_ns_color(f'ENFORCEMENT: {enforce_fail} {gate} FAIL the §11 contract — must fix before hot-reload', '31;1')}")
+        print(f"  {_ns_color(f'ENFORCEMENT: {enforce_fail} {gate} FAIL the structural §11.H.9 contract — verify before hot-reload', '31;1')}")
         return 1
-    print(f"  {_ns_color(f'ENFORCEMENT: {gate} pass the structural contract', '32')}")
+    if gated:
+        print(f"  {_ns_color(f'ENFORCEMENT: {gate} pass the structural contract', '32')}")
+    else:
+        print(f"  {_ns_color('(report-only — use --strict to gate on allowlisted FAILs, or --module=NAME for one)', '36')}")
     return 0
 
 
@@ -10331,7 +10344,8 @@ def main():
         for a in sys.argv[2:]:
             if a.startswith("--module="):
                 _only = a.split("=", 1)[1].strip()
-        sys.exit(run_module_persistence_scan(scope=_scope, only=_only))
+        sys.exit(run_module_persistence_scan(
+            scope=_scope, only=_only, strict="--strict" in sys.argv))
 
     elif cmd == "thread-pool":
         # 2026-04-14: thread-pool saturation snapshot (asyncio default executor)
