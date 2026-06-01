@@ -290,7 +290,7 @@ def test_run_restore_threads_through_to_resurrection_phases(tmp_path, monkeypatc
     class _FakeResurrection:
         @staticmethod
         def phase_1_identity(args, install_root):
-            calls.append(("p1", args.shard1, install_root))
+            calls.append(("p1", args.shard1, args.titan_pubkey, install_root))
             return (b"\x01" * 64, "PUBKEY123", None, "T1")
 
         @staticmethod
@@ -303,11 +303,12 @@ def test_run_restore_threads_through_to_resurrection_phases(tmp_path, monkeypatc
             calls.append(("p4", pubkey, kw["verify_only"]))
 
     monkeypatch.setattr(restore_mod, "_load_resurrection", lambda: _FakeResurrection)
+    # The PUBLIC address is supplied (no prompt); legacy --manifest still honoured.
     rc = restore_mod.run_restore(
-        tmp_path, shard1="ABCD", manifest="/tmp/m.json",
+        tmp_path, shard1="ABCD", titan_pubkey="PUBKEY123", manifest="/tmp/m.json",
         network="mainnet", verify_only=True)
     assert rc == 0
-    assert calls[0] == ("p1", "ABCD", str(tmp_path))
+    assert calls[0] == ("p1", "ABCD", "PUBKEY123", str(tmp_path))
     assert calls[1] == ("p23", "PUBKEY123", "T1", "/tmp/m.json", "mainnet", False)
     assert calls[2] == ("p4", "PUBKEY123", True)
 
@@ -319,7 +320,8 @@ def test_run_restore_propagates_phase_failure(tmp_path, monkeypatch):
             raise SystemExit(1)
 
     monkeypatch.setattr(restore_mod, "_load_resurrection", lambda: _Failing)
-    rc = restore_mod.run_restore(tmp_path, shard1="ABCD", manifest="/tmp/m.json")
+    rc = restore_mod.run_restore(tmp_path, shard1="ABCD", titan_pubkey="PUBKEY123",
+                                 manifest="/tmp/m.json")
     assert rc == 1
 
 
@@ -558,11 +560,14 @@ def test_resurrect_builds_cmd_and_pipes_shard_off_argv(tmp_path, monkeypatch):
     monkeypatch.setattr("setup_titan.resurrect.subprocess.run",
                         lambda cmd, input=None, text=None, cwd=None: cap.update(cmd=cmd, input=input) or _Proc())
     res = run_resurrect_phase(tmp_path, venv_python=venv_python, titan_id="T1",
-                              rpc_url="https://rpc", verify_only=True, shard1="deadbeef")
+                              rpc_url="https://rpc", verify_only=True, shard1="deadbeef",
+                              titan_pubkey="J1cdk4f1")
     assert all(r.severity != "fail" for r in res)
     cmd = cap["cmd"]
     assert "--shard1-stdin" in cmd and "--commit" in cmd and "--verify-only" in cmd
     assert "--rpc-url" in cmd and "https://rpc" in cmd
+    # the PUBLIC address is passed on argv (not a secret); Shard-3 + chain derive from it
+    assert "--titan-pubkey" in cmd and "J1cdk4f1" in cmd
     assert cap["input"] == "deadbeef\n"               # shard → stdin
     assert "deadbeef" not in " ".join(cmd)            # shard NEVER on the command line
 
@@ -574,7 +579,7 @@ def test_resurrect_stages_supplied_config_for_opt_out(tmp_path, monkeypatch):
     monkeypatch.setattr("setup_titan.resurrect.subprocess.run",
                         lambda *a, **k: _Proc())
     res = run_resurrect_phase(tmp_path, venv_python=venv_python,
-                              config_src=str(src), shard1="ab")
+                              config_src=str(src), shard1="ab", titan_pubkey="J1cdk4f1")
     staged = tmp_path / "titan_hcl" / "config.toml"
     assert staged.exists() and staged.read_text() == src.read_text()
     assert any("staged supplied config" in r.detail for r in res)
@@ -583,7 +588,8 @@ def test_resurrect_stages_supplied_config_for_opt_out(tmp_path, monkeypatch):
 def test_resurrect_warns_when_no_config(tmp_path, monkeypatch):
     venv_python = _fake_resurrect_tree(tmp_path)  # no config restored, none supplied
     monkeypatch.setattr("setup_titan.resurrect.subprocess.run", lambda *a, **k: _Proc())
-    res = run_resurrect_phase(tmp_path, venv_python=venv_python, shard1="ab")
+    res = run_resurrect_phase(tmp_path, venv_python=venv_python, shard1="ab",
+                              titan_pubkey="J1cdk4f1")
     assert any(r.name == "config" and r.severity == "warn" for r in res)
 
 

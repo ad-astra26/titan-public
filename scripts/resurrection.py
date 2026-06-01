@@ -20,24 +20,28 @@ Recovery model (SPEC §G16(8) Shamir 2-of-3) — NO ENVELOPE (INV-MBR-0/10):
 
 Phases:
   1. Identity Discovery  — collect shards, reconstruct + verify the keypair.
-  2+3. Re-Bodying + Re-Hydration — walk the UnifiedManifest, fetch each
-       event's tarballs from Arweave, verify per-tarball sha256 + recomposed
-       event-Merkle, apply baseline→incrementals into the install tree.
+  2+3. Re-Bodying + Re-Hydration — by DEFAULT walk the on-chain v=3 sovereign
+       backup chain (`backup_restore_sovereign.restore_body_from_chain`,
+       INV-MBR-12): no manifest, no local files — the chain IS the catalogue.
+       Each event's tarballs are fetched from Arweave + sha256/event-Merkle
+       verified, baseline→incrementals applied into a scratch dir, then atomically
+       swapped into data/. `--manifest <path>` selects the LEGACY non-sovereign
+       manifest path (debug/fallback only — needs the Maker's off-site copy).
   4. First Breath — materialize bootable identity (plaintext 0600 keypair +
        hardware-bound soul_keypair.enc + identity json), set RECOVERY flag.
 
-Manifest discovery: the manifest is the INDEX of the chain and is NOT itself
-in the Arweave tarballs, so on a truly fresh box it must be supplied off-VPS
-(`--manifest <path>` — the Maker's off-site copy). On-chain manifest-pointer
-discovery is a SPEC §24.13 follow-up (not yet wired); we never fabricate it.
+Body restore (INV-MBR-12): the v=3 memos put the backup catalogue ON-CHAIN
+(co-bundled with the ZK-Vault commit_state TXs), so a sovereign restore needs no
+manifest at all — Shard-1 + the wallet are enough. `--manifest` is retained only
+as an explicit legacy fallback.
 
 Usage:
-    # Fresh box — sovereign, wallet-only (no envelope, no manifest for identity):
-    python scripts/resurrection.py --shard1 <raw_hex> --titan-pubkey <address> --manifest <path>
-    python scripts/resurrection.py --shard1-file <path> --titan-pubkey <address> --manifest <path>
+    # Fresh box — sovereign, wallet-only (NO envelope, NO manifest):
+    python scripts/resurrection.py --shard1 <raw_hex> --titan-pubkey <address>
+    python scripts/resurrection.py --shard1-file <path> --titan-pubkey <address>
     python scripts/resurrection.py --shard2-local          # disk-alive recovery
     # add --verify-only to install setup_titan's verify-only gate on first boot
-    # (--manifest still gates the BODY restore until G3 switches it to the v=3 chain)
+    # legacy/debug only: append --manifest <path> to use the non-sovereign path
 """
 import argparse
 import asyncio
@@ -132,9 +136,11 @@ def phase_1_identity(args, install_root: str) -> tuple:
 
     print_phase("1", "Identity Discovery")
     shards: list = []
-    titan_pubkey = args.titan_pubkey or None
+    # getattr — callers that build an args namespace (setup_titan, the sovereign
+    # engine) may predate these optional fields; default cleanly, never crash.
+    titan_pubkey = getattr(args, "titan_pubkey", None) or None
     nft_address = None
-    titan_id = args.titan_id or "T1"
+    titan_id = getattr(args, "titan_id", None) or "T1"
 
     genesis_record = os.path.join(install_root, "data", "genesis_record.json")
 
@@ -298,12 +304,12 @@ def _build_memo_fetch(verify_zk: bool):
 
 def phase_2_3_restore(key_bytes: bytes, titan_pubkey: str, titan_id: str, *,
                        install_root: str, manifest_path: str | None,
-                       network: str, verify_zk: bool, force: bool):
-    """Walk the manifest + restore data/ in-place via the canonical engine."""
-    print_phase("2+3", "Re-Bodying + Re-Hydration (Arweave restore)")
-
-    from titan_hcl.logic.backup_restore import build_arc_to_target, restore_full
-    from titan_hcl.utils.arweave_store import ArweaveStore
+                       network: str, verify_zk: bool, force: bool,
+                       rpc_url: str | None = None):
+    """Re-body `data/` — the SOVEREIGN on-chain v=3 chain by DEFAULT (INV-MBR-12,
+    no manifest / no local files / Shard-1-only), or the LEGACY `--manifest` path
+    ONLY when a manifest is explicitly supplied (non-sovereign fallback)."""
+    print_phase("2+3", "Re-Bodying + Re-Hydration")
 
     data_dir = os.path.join(install_root, "data")
     # Fresh-box safety: refuse to clobber a populated live data/ unless --force.
@@ -316,6 +322,46 @@ def phase_2_3_restore(key_bytes: bytes, titan_pubkey: str, titan_id: str, *,
             print("  Re-run with --force only if you intend to overwrite this tree.")
             sys.exit(1)
 
+    if manifest_path:
+        print("  [legacy] --manifest supplied → NON-sovereign manifest restore.")
+        print("  (The sovereign default needs no manifest — the v=3 chain IS the")
+        print("   catalogue; INV-MBR-12. Use --manifest only for debug/legacy.)")
+        return _restore_via_manifest(
+            key_bytes, titan_pubkey, titan_id, install_root=install_root,
+            manifest_path=manifest_path, network=network, verify_zk=verify_zk)
+
+    # ── DEFAULT: the sovereign on-chain v=3 chain (no manifest, wallet-only) ──
+    print("  Sovereign v=3 chain restore — Shard-1-only, no manifest, no local files.")
+    _scripts = os.path.join(_REPO_ROOT, "scripts")
+    if _scripts not in sys.path:
+        sys.path.append(_scripts)  # append — never shadow the titan_hcl package
+    from backup_restore_sovereign import restore_body_from_chain
+    result = restore_body_from_chain(
+        key_bytes=key_bytes, titan_pubkey=titan_pubkey, titan_id=titan_id,
+        install_root=install_root, rpc_url=rpc_url, network=network, commit=True)
+    if result.status != "resurrected":
+        print(f"\n  *** SOVEREIGN RESTORE HALTED: {result.halt_reason} ***")
+        for err in result.errors[-5:]:
+            print(f"      {err}")
+        sys.exit(1)
+    print(f"  Re-hydration OK — {result.events_applied} event(s) restored into "
+          f"{data_dir}.")
+    return result
+
+
+def _restore_via_manifest(key_bytes: bytes, titan_pubkey: str, titan_id: str, *,
+                           install_root: str, manifest_path: str | None,
+                           network: str, verify_zk: bool):
+    """LEGACY non-sovereign body-restore via an off-site UnifiedManifest copy.
+
+    Retained ONLY as an explicit `--manifest` fallback; the sovereign v=3 chain
+    (the `phase_2_3_restore` default) needs no manifest (INV-MBR-12). This path
+    requires the Maker's off-site manifest, so it does NOT satisfy Shard-1-only.
+    """
+    from titan_hcl.logic.backup_restore import build_arc_to_target, restore_full
+    from titan_hcl.utils.arweave_store import ArweaveStore
+
+    data_dir = os.path.join(install_root, "data")
     manifest = _load_manifest(titan_id, install_root, manifest_path)
     if not manifest.events:
         print("  *** Manifest has no events — nothing to restore. ABORT. ***")
@@ -458,8 +504,9 @@ def main():
     parser.add_argument("--shard2-local", action="store_true",
                         help="Disk-alive recovery using local genesis_record.json.")
     parser.add_argument("--manifest", type=str, default=None,
-                        help="Maker-supplied off-site UnifiedManifest JSON "
-                             "(REQUIRED on a fresh box).")
+                        help="LEGACY/DEBUG ONLY: Maker-supplied off-site "
+                             "UnifiedManifest JSON. Omit it for the sovereign v=3 "
+                             "chain restore (the default; needs no manifest).")
     parser.add_argument("--install-root", type=str, default=_REPO_ROOT,
                         help="Target install tree (default: this repo root).")
     parser.add_argument("--titan-id", type=str, default=None,
@@ -467,6 +514,9 @@ def main():
     parser.add_argument("--network", type=str, default="mainnet",
                         choices=["mainnet", "devnet"],
                         help="Arweave/Solana network (default: mainnet).")
+    parser.add_argument("--rpc-url", type=str, default=None,
+                        help="Solana RPC URL override for the sovereign chain walk "
+                             "(default: the configured RPC).")
     parser.add_argument("--verify-zk", action="store_true",
                         help="Also round-trip-verify each event against the "
                              "on-chain ZK memo (needs SolanaClient.get_memo_for_tx).")
@@ -490,7 +540,7 @@ def main():
     phase_2_3_restore(key_bytes, titan_pubkey, titan_id,
                       install_root=install_root, manifest_path=args.manifest,
                       network=args.network, verify_zk=args.verify_zk,
-                      force=args.force)
+                      force=args.force, rpc_url=args.rpc_url)
     phase_4_first_breath(key_bytes, titan_pubkey, titan_id,
                          install_root=install_root, verify_only=args.verify_only)
 
