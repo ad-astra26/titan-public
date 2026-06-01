@@ -111,6 +111,55 @@ def decrypt_tarball(ciphertext_with_tag: bytes, iv: bytes, backup_key: bytes) ->
     return AESGCM(bytes(backup_key)).decrypt(bytes(iv), bytes(ciphertext_with_tag), None)
 
 
+# ── Mode-B sovereign component-tarball helpers (v=3 chain, RFP G2) ────────────
+# A Mode-B event tarball is encrypted on Arweave; the per-component AES key is
+# re-derivable from the reconstructed soul keypair, so a wallet-only restore needs
+# ONLY the random IV on-chain (the memo's `iv=` field). The backup_id is NOT a new
+# on-chain field: it is `sha256(plaintext_tarball)[:16]`, which is exactly the
+# first 16 hex of the memo's `arc` (arc = sha256(plaintext)[:32]). So both the
+# producer and the restore derive the same per-backup key from public, already-
+# present data + the (secret) reconstructed master key. backup_type = the component
+# name ("personality"/"timechain"/"soul").
+
+def component_backup_id(plaintext_tarball: bytes) -> str:
+    """The per-component backup_id = sha256(plaintext)[:16] (== the memo arc[:16])."""
+    import hashlib
+    return hashlib.sha256(plaintext_tarball).hexdigest()[:16]
+
+
+def encrypt_component_tarball(plaintext_tarball: bytes, master_key: bytes,
+                              component: str) -> Tuple[bytes, str]:
+    """Mode-B producer: encrypt one component tarball for the v=3 chain.
+
+    Returns (ciphertext_with_tag, iv_b64). The key derives from
+    (master_key, backup_id=sha256(plaintext)[:16], backup_type=component) — the
+    SAME inputs a restore reconstructs. Only the random IV is non-derivable, so
+    only it travels on-chain.
+    """
+    import base64
+    backup_id = component_backup_id(plaintext_tarball)
+    bkey = derive_backup_key(master_key, backup_id, component)
+    ct_and_tag, iv, _tag = encrypt_tarball(plaintext_tarball, bkey)
+    return ct_and_tag, base64.b64encode(iv).decode("ascii")
+
+
+def decrypt_component_tarball(ciphertext_with_tag: bytes, iv_b64: str,
+                              master_key: bytes, component: str, arc: str) -> bytes:
+    """Mode-B restore inverse: decrypt a fetched ciphertext tarball.
+
+    `arc` is the memo's archive-hash fragment; backup_id = arc[:16] (==
+    sha256(plaintext)[:16]). Raises InvalidTag on tamper / wrong key. The caller
+    still verifies sha256(plaintext)[:32] == arc afterwards (defence in depth).
+    """
+    import base64
+    if not arc or len(arc) < 16:
+        raise ValueError("arc fragment too short to derive backup_id")
+    backup_id = arc[:16]
+    bkey = derive_backup_key(master_key, backup_id, component)
+    iv = base64.b64decode(iv_b64)
+    return decrypt_tarball(ciphertext_with_tag, iv, bkey)
+
+
 def decrypt_from_manifest(ciphertext_with_tag: bytes,
                             encryption_manifest: dict,
                             keypair_bytes: bytes,
