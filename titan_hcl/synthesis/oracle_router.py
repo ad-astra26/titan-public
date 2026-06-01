@@ -450,38 +450,6 @@ class OracleRouter:
         decision = GateDecision(admit=True, reason="", admit_score=0.0, latency_ms=0)
         return RouterResult(verdict=verdict, gate_decision=decision, anchor_tx=None, fork=fork)
 
-    def record_companion_verdict(
-        self,
-        *,
-        parent_tool_call_tx: str,
-        oracle_id: str,
-        verdict: str,
-        evidence_ref: str = "",
-        cost: float = 0.0,
-        latency_ms: int = 0,
-        ts: Optional[float] = None,
-        fork: Optional[str] = "procedural",
-    ) -> None:
-        """Buffer a PRE-COMPUTED companion verdict (operator-closure C2 / W7).
-
-        For a tool that IS its own truth oracle (e.g. coding_sandbox — §11.1),
-        the tool's execution already produced the verdict; re-running it through
-        ``verify()`` would double-execute (and, for the sandbox, block up to 30s,
-        violating G19). The chat-time tool emits its already-known verdict here
-        (via the bus → synthesis_worker), and it is buffered for the same
-        dream-boundary OracleVerdictBatch flush as router-produced verdicts —
-        so chat-driven tool calls count toward §A.6 coverage. No plug re-run.
-        """
-        v = OracleVerdict(
-            oracle_id=str(oracle_id),
-            verdict=str(verdict),
-            evidence_ref=str(evidence_ref),
-            cost=float(cost),
-            latency_ms=int(latency_ms),
-            ts=float(ts if ts is not None else self._now_fn()),
-        )
-        self._buffer_companion(v, str(parent_tool_call_tx), fork or "procedural")
-
     # ── companion batch flush (called at dream boundary) ────────────────
 
     def flush_companion_batches(self) -> dict[str, str]:

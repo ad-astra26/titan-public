@@ -36,21 +36,6 @@ _PROCEDURAL_FORK_NAME = "procedural"
 # Default chain payload directory (chain_<fork>.bin lives here).
 _DEFAULT_CHAIN_DIR = "data/timechain"
 
-# Tool-call index query. ALL columns are table-qualified — both block_index and
-# fork_registry carry a `fork_id` column, so an unqualified `fork_id` in the
-# SELECT raises sqlite3 "ambiguous column name" (silently swallowed → []),
-# which is why oracle coverage read 0 for the entire Phase-6 lifetime. Pinned by
-# tests/test_procedural_tx_reader.py (2026-06-01).
-_TOOL_CALL_INDEX_SQL = (
-    "SELECT bi.block_hash, bi.fork_id, bi.block_height, bi.file_offset, "
-    "bi.thought_type, bi.tags, bi.timestamp "
-    "FROM block_index bi "
-    "JOIN fork_registry fr ON bi.fork_id = fr.fork_id "
-    "WHERE fr.fork_name = ? AND bi.timestamp > ? "
-    "  AND bi.thought_type = 'tool_call' "
-    "ORDER BY bi.timestamp DESC LIMIT ?"
-)
-
 
 def default_procedural_tool_call_reader(
     since_ts: float,
@@ -89,7 +74,13 @@ def default_procedural_tool_call_reader(
     try:
         conn.row_factory = sqlite3.Row
         cur = conn.execute(
-            _TOOL_CALL_INDEX_SQL,
+            "SELECT block_hash, fork_id, block_height, file_offset, "
+            "thought_type, tags, timestamp "
+            "FROM block_index bi "
+            "JOIN fork_registry fr ON bi.fork_id = fr.fork_id "
+            "WHERE fr.fork_name = ? AND bi.timestamp > ? "
+            "  AND bi.thought_type = 'tool_call' "
+            "ORDER BY bi.timestamp DESC LIMIT ?",
             [fork_name, float(since_ts), int(limit)],
         )
         rows = list(cur.fetchall())
