@@ -7,7 +7,11 @@ lifetime even when tool_call TXs were on chain. This pins the table-qualified
 fix at the SQL level (no chain-file fixture needed)."""
 import sqlite3
 
-from titan_hcl.synthesis.procedural_tx_reader import _TOOL_CALL_INDEX_SQL
+from titan_hcl.synthesis.procedural_tx_reader import (
+    _TOOL_CALL_INDEX_SQL,
+    _scored_by_from_tags,
+    _tool_id_from_tags,
+)
 
 
 def _build_index(conn):
@@ -60,3 +64,22 @@ def test_unqualified_fork_id_would_be_ambiguous():
     bad_sql = _TOOL_CALL_INDEX_SQL.replace("bi.fork_id", "fork_id", 1)
     with __import__("pytest").raises(sqlite3.OperationalError):
         conn.execute(bad_sql, ["procedural", 0.0, 100]).fetchall()
+
+
+# ── v2 tx_summaries tag parsing (the reader extracts scored_by/tool_id from
+#    the batch-block tx_summaries[].tags, since v2 stores no per-TX content) ──
+def test_scored_by_from_tags():
+    assert _scored_by_from_tags(["tool_call", "tool:coding_sandbox",
+                                 "scored_by:oracle"]) == "oracle"
+    assert _scored_by_from_tags(["scored_by:llm"]) == "llm"
+    # scored_by:none → None (unscored, not the literal string)
+    assert _scored_by_from_tags(["scored_by:none"]) is None
+    assert _scored_by_from_tags(["tool:coding_sandbox"]) is None
+    assert _scored_by_from_tags([]) is None
+
+
+def test_tool_id_from_tags():
+    assert _tool_id_from_tags(["tool_call", "tool:coding_sandbox",
+                               "scored_by:none"]) == "coding_sandbox"
+    assert _tool_id_from_tags(["tool:x_research"]) == "x_research"
+    assert _tool_id_from_tags(["tool_call"]) == ""
