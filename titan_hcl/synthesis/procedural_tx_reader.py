@@ -36,21 +36,6 @@ _PROCEDURAL_FORK_NAME = "procedural"
 # Default chain payload directory (chain_<fork>.bin lives here).
 _DEFAULT_CHAIN_DIR = "data/timechain"
 
-# Tool-call index query. ALL columns are table-qualified — both block_index and
-# fork_registry carry a `fork_id` column, so an unqualified `fork_id` in the
-# SELECT raises sqlite3 "ambiguous column name" (silently swallowed → []),
-# which is why oracle coverage read 0 for the entire Phase-6 lifetime. Pinned by
-# tests/test_procedural_tx_reader.py (2026-06-01).
-_TOOL_CALL_INDEX_SQL = (
-    "SELECT bi.block_hash, bi.fork_id, bi.block_height, bi.file_offset, "
-    "bi.thought_type, bi.tags, bi.timestamp "
-    "FROM block_index bi "
-    "JOIN fork_registry fr ON bi.fork_id = fr.fork_id "
-    "WHERE fr.fork_name = ? AND bi.timestamp > ? "
-    "  AND bi.thought_type = 'tool_call' "
-    "ORDER BY bi.timestamp DESC LIMIT ?"
-)
-
 
 def default_procedural_tool_call_reader(
     since_ts: float,
@@ -89,7 +74,13 @@ def default_procedural_tool_call_reader(
     try:
         conn.row_factory = sqlite3.Row
         cur = conn.execute(
-            _TOOL_CALL_INDEX_SQL,
+            "SELECT block_hash, fork_id, block_height, file_offset, "
+            "thought_type, tags, timestamp "
+            "FROM block_index bi "
+            "JOIN fork_registry fr ON bi.fork_id = fr.fork_id "
+            "WHERE fr.fork_name = ? AND bi.timestamp > ? "
+            "  AND bi.thought_type = 'tool_call' "
+            "ORDER BY bi.timestamp DESC LIMIT ?",
             [fork_name, float(since_ts), int(limit)],
         )
         rows = list(cur.fetchall())
@@ -105,82 +96,60 @@ def default_procedural_tool_call_reader(
     if not rows:
         return []
 
-    # v2 chain shape (2026-06-01): the procedural fork seals TXs into BATCH
-    # blocks whose content is a `{v2, tx_count, tx_merkle_root, tx_summaries}`
-    # envelope — NOT the per-TX content. Each `tx_summaries` entry carries
-    # `{hash, type, source, tags}` where the tags hold `tool:<id>` +
-    # `scored_by:<v>`. That is exactly what coverage (INV-Syn-15) needs; full
-    # args/result are not on-chain in v2 (the prior reader expected per-TX
-    # content and so returned nothing — coverage read 0 for Phase-6's whole
-    # life). We resolve each indexed block's content at its `file_offset` and
-    # walk its tx_summaries via the canonical `resolve_batch_summaries` helper
-    # (handles inline + CAS-slimmed shapes). Block timestamp (from the index)
-    # is the TX timestamp.
-    from titan_hcl.synthesis.chain_reader import read_block_content_at
-    from titan_hcl.logic.timechain_v2 import resolve_batch_summaries
+    # Resolve the chain payload path for the procedural fork. Convention:
+    # chain_<fork>.bin alongside index.db.
+    chain_path = Path(chain_dir) / f"chain_{fork_name}.bin"
+    if not chain_path.exists():
+        logger.debug("[procedural_tx_reader] chain file missing: %s", chain_path)
+        return []
 
-    data_dir = Path(chain_dir).parent  # read_block_content_at takes the DATA dir
+    # For each block index row, seek into chain_path at file_offset and parse
+    # the payload. Use the existing chain_reader iteration as the safe path
+    # (block size varies; sequential read is the canonical pattern).
+    # We perform ONE pass collecting by file_offset for efficiency.
+    offsets = {int(r["file_offset"]): r for r in rows}
     out: list[dict] = []
-    for r in rows:  # already ORDER BY timestamp DESC LIMIT in the SQL
-        block_ts = float(r["timestamp"])
-        try:
-            content = read_block_content_at(
-                data_dir, int(r["fork_id"]), int(r["file_offset"]))
-        except Exception:
+    try:
+        from titan_hcl.synthesis.chain_reader import iter_block_contents  # local import (heavy)
+    except Exception:
+        return []
+
+    # iter_block_contents yields (height, thought_type, source, content)
+    # in chain order. We accumulate matching tool_call records.
+    matched_count = 0
+    for height, thought_type, source, content in iter_block_contents(chain_path):
+        if thought_type != "tool_call":
             continue
         if not isinstance(content, dict):
             continue
-        try:
-            summaries = resolve_batch_summaries(content)
-        except Exception:
-            # Pre-v2 / non-batch block: the content may itself be the per-TX
-            # payload (legacy shape) — fall back to treating it as one TX.
-            summaries = [content] if content.get("tool_id") else []
-        for s in summaries or []:
-            if not isinstance(s, dict):
+        # Synthesize the dict expected by LLMJudge / ProceduralMiner. The
+        # content already carries all expected fields per OuterMemoryWriter.write_tool_call.
+        # We use the content-hash from the payload (the tx_hash field if present;
+        # otherwise sha256 of canonical content).
+        content_hash = (
+            content.get("tx_hash")
+            or content.get("content_hash")
+        )
+        if not content_hash:
+            # Best-effort fallback: compute the content hash like OuterMemoryWriter does
+            try:
+                import hashlib
+                canonical = json.dumps(content, sort_keys=True, separators=(",", ":")).encode()
+                content_hash = hashlib.sha256(canonical).hexdigest()
+            except Exception:
                 continue
-            if s.get("type", "tool_call") != "tool_call" and "tool_id" not in s:
-                continue
-            tags = list(s.get("tags") or [])
-            scored_by = _scored_by_from_tags(tags)
-            tool_id = _tool_id_from_tags(tags) or s.get("tool_id", "")
-            out.append({
-                "tx_hash": s.get("hash") or s.get("tx_hash") or "",
-                # Top-level scored_by + ts: the CoverageAnalyzer reads these
-                # off the record root (oracle_coverage.analyze: tc.get("scored_by")).
-                "scored_by": scored_by,
-                "ts": block_ts,
-                "content": {
-                    "tool_id": tool_id,
-                    "args": s.get("args", {}),
-                    "success": s.get("success"),
-                    "scored_by": scored_by,
-                    "ts": block_ts,
-                    "result_summary": s.get("result_summary", ""),
-                },
-                "tags": tags,
-            })
-            if len(out) >= limit:
-                return out
+        if float(content.get("ts") or 0.0) <= float(since_ts):
+            continue
+        out.append({
+            "tx_hash": content_hash,
+            "content": dict(content),
+            "tags": list(content.get("tags") or []),
+        })
+        matched_count += 1
+        if matched_count >= limit:
+            break
 
     return out
-
-
-def _scored_by_from_tags(tags: list) -> Optional[str]:
-    """Extract the `scored_by` verdict from TX tags. `scored_by:none` → None
-    (unscored); `scored_by:oracle`/`llm` → that value."""
-    for t in tags:
-        if isinstance(t, str) and t.startswith("scored_by:"):
-            v = t.split(":", 1)[1]
-            return None if v in ("none", "") else v
-    return None
-
-
-def _tool_id_from_tags(tags: list) -> str:
-    for t in tags:
-        if isinstance(t, str) and t.startswith("tool:"):
-            return t.split(":", 1)[1]
-    return ""
 
 
 class ChainContentHashReader:

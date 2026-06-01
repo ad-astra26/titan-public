@@ -451,7 +451,7 @@ def create_tools(plugin):
         chat_id = _resolve_chat_id()
         try:
             results = await asyncio.to_thread(
-                recall.recall, query, granularity=granularity, k=1,
+                recall.recall, query, granularity=granularity, top_k=1,
             )
         except Exception as e:
             logger.debug("query_retrieval engine_recall failed: %s", e)
@@ -534,8 +534,17 @@ def create_tools(plugin):
             return "synthesis not wired"
         try:
             results = await asyncio.to_thread(
-                recall.recall, goal_text, granularity="procedural", k=1,
+                recall.recall, goal_text, granularity="procedural", top_k=1,
             )
+        except TypeError:
+            # Older recall signature may not accept top_k; retry with k=
+            try:
+                results = await asyncio.to_thread(
+                    recall.recall, goal_text, granularity="procedural", k=1,
+                )
+            except Exception as e:
+                logger.debug("match_procedural_skill recall failed: %s", e)
+                return "no match"
         except Exception as e:
             logger.debug("match_procedural_skill recall failed: %s", e)
             return "no match"
