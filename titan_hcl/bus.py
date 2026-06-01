@@ -706,6 +706,13 @@ NEUROMOD_EXTERNAL_NUDGE = "NEUROMOD_EXTERNAL_NUDGE"
 # Priority lane: P1 (coalesce-by-(titan_id, hormone_name) — stimulus to same hormone
 # within one tick window naturally folds).
 HORMONE_STIMULUS = "HORMONE_STIMULUS"    # ns_worker → hormonal_worker (per-hormone stimulus accumulation)
+# expression_worker → hormonal_worker: per-hormone depletion when an EXPRESSION
+# composite fires. Restores the monolith's consumption→refractory feedback loop
+# that the Phase C process split severed — expression_manager.evaluate_all used
+# to deplete the in-process HormonalSystem on fire, but the worker now runs with
+# hormonal_system=None (cross-process), so the consumption dict was discarded
+# and composites fired every tick (EXPRESSION.SOCIAL runaway, 2026-06-01).
+HORMONE_CONSUME = "HORMONE_CONSUME"      # expression_worker → hormonal_worker (per-hormone depletion on composite fire)
 
 # Language Worker messages (spirit ↔ language process)
 # SPEAK_REQUEST schema (v1.2.1 extension per SPEC §8.5 D-SPEC-38):

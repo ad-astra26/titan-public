@@ -115,6 +115,52 @@ class TestExpressionManager:
         })
         assert len(fired) >= 1  # At least SPEAK should fire
 
+    def test_evaluate_all_exposes_per_hormone_consumption(self):
+        """2026-06-01: fired dicts carry the per-hormone consumption so a
+        cross-process caller (expression_worker, hormonal_system=None) can
+        publish HORMONE_CONSUME and deplete the hormone owner's levels. This
+        is the data that restores the severed consumption→refractory loop."""
+        from titan_hcl.logic.expression_composites import create_social
+        mgr = ExpressionManager()
+        mgr.register(create_social())
+        fired = mgr.evaluate_all(
+            {"EMPATHY": 2.0, "CURIOSITY": 2.0, "IMPULSE": 2.0},
+            vocabulary_confidence=1.0)
+        assert len(fired) == 1
+        consumption = fired[0]["consumption"]
+        # SOCIAL weights {EMPATHY:0.5, CURIOSITY:0.3, IMPULSE:0.2} × rate 0.55
+        assert set(consumption) == {"EMPATHY", "CURIOSITY", "IMPULSE"}
+        assert all(v > 0 for v in consumption.values())
+
+    def test_cross_process_consumption_pauses_social(self):
+        """End-to-end of the restored loop: applying each fire's consumption
+        dict to a separate hormone store (mimicking hormonal_worker.consume
+        over the bus) drives the SOCIAL urge below threshold — proving the
+        runaway stops once depletion is actually applied cross-process."""
+        from titan_hcl.logic.expression_composites import create_social
+        from titan_hcl.logic.hormonal_pressure import HormonalPressure
+        social = create_social()
+        # Separate hormone store = the hormonal_worker's owned levels.
+        store = {n: HormonalPressure(name=n, base_secretion_rate=0.0,
+                                     stimulus_sensitivity=1.0, decay_rate=0.0,
+                                     fire_threshold=0.5, refractory_strength=0.8,
+                                     refractory_decay=0.02)
+                 for n in ("EMPATHY", "CURIOSITY", "IMPULSE")}
+        for h in store.values():
+            h.level = 2.0
+        fires = 0
+        for _ in range(40):
+            levels = {n: h.level for n, h in store.items()}
+            if not social.evaluate(levels)["should_fire"]:
+                break
+            consumption = social.fire()["consumption"]
+            for n, amt in consumption.items():          # hormonal_worker side
+                store[n].consume(amt)
+            fires += 1
+        levels = {n: h.level for n, h in store.items()}
+        assert social.evaluate(levels)["should_fire"] is False
+        assert 0 < fires < 40   # paused by depletion, not by iteration cap
+
     def test_stats(self):
         mgr = ExpressionManager()
         mgr.register(create_speak())

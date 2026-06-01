@@ -32,6 +32,39 @@ class TestHormonalPressure:
         h.accumulate(stimulus=0.0, dt=1.0)
         assert h.level < 1.0
 
+    def test_consume_depletes_level_proportionally(self):
+        """consume() (2026-06-01 cross-process refractory restoration) depletes
+        the level using the monolith's proportional formula and never goes
+        below 0; refractory is untouched."""
+        h = self._make()
+        h.level = 1.0
+        h.refractory = 0.0
+        delta = h.consume(0.5)
+        assert 0.0 < h.level < 1.0          # depleted, not zeroed
+        assert delta == pytest.approx(1.0 - h.level)
+        assert h.refractory == 0.0          # consume must NOT touch refractory
+
+    def test_consume_zero_or_negative_is_noop(self):
+        h = self._make()
+        h.level = 0.7
+        assert h.consume(0.0) == 0.0
+        assert h.consume(-0.3) == 0.0
+        assert h.level == 0.7
+
+    def test_consume_low_level_not_zeroed_by_flat_depletion(self):
+        """The proportional formula bounds the ABSOLUTE loss so a small hormone
+        isn't killed by a flat depletion (the IMPULSE-at-0.008 case it was
+        designed for). A naive `level -= 0.13` would zero a 0.05 hormone;
+        proportional consumption leaves some, and removes less in absolute
+        terms than from a high hormone."""
+        lo = self._make(); lo.level = 0.05
+        hi = self._make(); hi.level = 1.0
+        lo_loss = lo.consume(0.13)
+        hi_loss = hi.consume(0.13)
+        assert lo.level > 0.0          # not zeroed (flat 0.13 would kill it)
+        assert lo_loss < 0.13          # absolute loss bounded below flat amount
+        assert lo_loss < hi_loss       # low hormone loses less in absolute terms
+
     def test_fire_at_threshold(self):
         h = self._make(fire_threshold=0.1)
         # Accumulate enough to fire

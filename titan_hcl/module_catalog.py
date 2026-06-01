@@ -1561,6 +1561,11 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
     # the slot each tick — no ModuleSpec subscription needed.
     _HORMONAL_WORKER_BROADCAST_TOPICS = _STATE_WORKER_BROADCAST_TOPICS + [
         _bus_constants.HORMONE_STIMULUS,
+        # expression_worker → hormonal_worker depletion-on-fire bridge
+        # (2026-06-01): restores the consumption→refractory loop the Phase C
+        # split severed. Published with dst="hormonal_module"; broker routing
+        # needs the topic in this broadcast filter (same as HORMONE_STIMULUS).
+        _bus_constants.HORMONE_CONSUME,
     ]
     if _mk.get("shm_ns_enabled", True):
         guardian.register(ModuleSpec(
