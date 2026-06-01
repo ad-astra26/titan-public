@@ -60,7 +60,7 @@ def test_existing_arcs_parses_v3_memo_for_idempotency():
     from titan_hcl.logic.backup_memo_v3 import build_v3_memo
     memo = build_v3_memo(event_id="e1", ts=100, event_type="incremental", tier="PT",
                          archive_hash=_HASH, merkle_root=_HASH, arweave_tx="ARW",
-                         mode="B")  # Mode B → plaintext url, no key needed
+                         mode="B", iv_b64="q83vEjRWeJC2yJ3k")  # Mode B → plaintext url + iv
     arcs = existing_arcs([memo, "not a v3 memo", "v=2;legacy"])
     assert _HASH[:32] in arcs  # arc fragment is the first 32 chars (HASH_FRAGMENT_LEN)
 
