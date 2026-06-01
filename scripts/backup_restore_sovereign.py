@@ -54,6 +54,10 @@ from titan_hcl.logic.backup_memo_v3 import (  # noqa: E402
     parse_v3_memo,
     read_url,
 )
+from titan_hcl.logic.backup_crypto import (  # noqa: E402
+    decrypt_component_tarball,
+    derive_master_key,
+)
 from titan_hcl.logic.backup_restore import apply_event_components  # noqa: E402
 from titan_hcl.logic.backup_zk_commit import compute_event_merkle_root  # noqa: E402
 
@@ -71,6 +75,7 @@ HALT_BROKEN_CHAIN = "broken_prev_chain"
 HALT_ARC_MISMATCH = "component_sha256_mismatch"
 HALT_EVENT_MERKLE_MISMATCH = "event_merkle_mismatch"
 HALT_MODE_B_UNSUPPORTED = "mode_b_sovereign_decrypt_unsupported"
+HALT_MODE_B_DECRYPT_FAILED = "mode_b_decrypt_failed"
 HALT_APPLY_FAILED = "apply_failed"
 
 _TIER_COMPONENT = {"PT": "personality", "TC": "timechain", "SL": "soul"}
@@ -124,6 +129,8 @@ async def resurrect_from_chain(
         out.halt_reason = "url_key_derivation_failed"
         out.errors.append(str(e))
         return out
+    # Mode-B tarball master key — derived lazily on the first encrypted component.
+    master_key = None
 
     # ── 1. walk the wallet's signature history, decode v=3 memos ──────────────
     log(f"Walking Solana signature history for {titan_id} ({titan_pubkey[:8]}…)")
@@ -176,6 +183,7 @@ async def resurrect_from_chain(
             continue
         ev["components"][comp] = {
             "tx_id": tx_id, "arc": p["arc"], "mode": p["mode"], "sig": sig,
+            "iv": p.get("iv"),
         }
         if p["tier"] == "PT":               # personality memo = the event head
             ev["head_sig"] = sig
@@ -249,14 +257,6 @@ async def resurrect_from_chain(
         component_bytes: dict = {}
         component_sha: dict = {}
         for comp_name, meta in comps.items():
-            if meta["mode"] == "B":
-                out.status = "halted"
-                out.halt_reason = HALT_MODE_B_UNSUPPORTED
-                out.errors.append(
-                    f"event {evt_short} {comp_name} is Mode B (encrypted data); "
-                    "sovereign restore needs the AES iv on-chain (follow-up). "
-                    "T1 is Mode A.")
-                return out
             try:
                 data = await arweave_fetch(meta["tx_id"])
             except Exception as e:
@@ -264,6 +264,30 @@ async def resurrect_from_chain(
                 out.halt_reason = "arweave_fetch_failed"
                 out.errors.append(f"event {evt_short} {comp_name}: {e}")
                 return out
+            # Mode-B: the Arweave bytes are ENCRYPTED. Decrypt with the per-backup
+            # key re-derived from the reconstructed soul keypair (master key) + the
+            # arc[:16] backup_id + the on-chain iv, BEFORE the sha256==arc check
+            # (arc is over the plaintext tarball; GCM also authenticates the bytes).
+            if meta["mode"] == "B":
+                if not meta.get("iv"):
+                    out.status = "halted"
+                    out.halt_reason = HALT_MODE_B_UNSUPPORTED
+                    out.errors.append(
+                        f"event {evt_short} {comp_name}: Mode-B memo has no iv — "
+                        "cannot derive the decryption key (pre-G2 memo?).")
+                    return out
+                if master_key is None:
+                    master_key = derive_master_key(keypair_bytes, titan_pubkey)
+                try:
+                    data = decrypt_component_tarball(
+                        data, meta["iv"], master_key, comp_name, meta["arc"])
+                except Exception as e:
+                    out.status = "halted"
+                    out.halt_reason = HALT_MODE_B_DECRYPT_FAILED
+                    out.errors.append(
+                        f"event {evt_short} {comp_name}: Mode-B decrypt failed "
+                        f"({e}) — wrong key / tampered ciphertext.")
+                    return out
             sha = hashlib.sha256(data).hexdigest()
             if sha[:32] != meta["arc"]:
                 out.status = "halted"
