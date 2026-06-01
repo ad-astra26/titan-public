@@ -13876,12 +13876,27 @@ def run_session_close(title: str = "", commit: bool = True,
             decision_candidates.append(f"- [{role} {idx}] {first_line}")
 
     with open(sess_path, "w") as f:
-        f.write(f"# Session Log: {date_human} — {title or 'TODO: add title'}\n\n")
-        f.write(f"> **Duration:** ~TODO UTC — ~{now.strftime('%H:%M')} UTC\n")
-        f.write(f"> **Branch:** titan-v6\n")
-        f.write(f"> **Significance:** TODO: one-line summary\n\n")
+        # The session log is auto-generated CONTEXT for a future Claude
+        # instance (Maker points to it for context) — NOT a hand-filled report.
+        # So it is ALL-AUTO: zero TODO placeholders. (Maker 2026-06-01: "kill
+        # the TODOs — it just costs you time; the log is for you.")
+        f.write(f"# Session Log: {date_human} — {title or slug}\n\n")
+        f.write(f"> **Branch:** titan-v6 · **Session:** {short_id} · "
+                f"**Closed:** {now.strftime('%H:%M')} UTC\n")
+        f.write(f"> **Transcript:** `CONVERSATION_{date_str}_{slug}.md` (full) · "
+                f"`HIGHLIGHTS_{date_str}_{slug}.md` (design dialogue)\n\n")
         f.write("---\n\n")
-        f.write("## Summary\n\nTODO: 2-3 sentence summary of session.\n\n---\n\n")
+        # ── Handoff: the lean replacement for the TODO march ──
+        # Done = this session's commit subjects (objective record of what
+        # shipped); Next = one line carrying the arc forward.
+        f.write("## Handoff\n\n**Done this session** (commits):\n\n")
+        if git_log:
+            for _l in git_log.split("\n")[:15]:
+                f.write(f"- `{_l}`\n")
+        else:
+            f.write("- (no commits in window)\n")
+        f.write("\n**Next:** _(one line — what continues this arc; mirror into "
+                "`titan-docs/CURRENT_ARC.md`)_\n\n---\n\n")
 
         # Dead-wiring pre-close validation scan — runs on every session-close
         # as a signal for "did this session introduce any new silent-wiring
@@ -13933,16 +13948,12 @@ def run_session_close(title: str = "", commit: bool = True,
             f.write("*No automated candidates detected (no AskUserQuestion / "
                     "ExitPlanMode events + no marker hits). Hand-fill below "
                     "if any architectural decisions were made.*\n\n")
-        f.write("TODO: hand-curate the above into a clean decision list — "
-                "drop noise, add SPEC §refs / D-SPEC-NN / memory pointers.\n\n")
         f.write("---\n\n")
 
-        # Design Discussions (links to message numbers)
-        f.write("## Design Discussions\n\n")
-        f.write(f"See `HIGHLIGHTS_{date_str}_{slug}.md` for auto-extracted "
-                f"architectural dialogue ({len(highlight_pairs)} messages).\n\n")
-        f.write("TODO: if any key design conversation isn't in HIGHLIGHTS, "
-                "link it here by message number.\n\n---\n\n")
+        # Design dialogue pointer (auto — no hand-fill)
+        f.write("## Design Dialogue\n\n")
+        f.write(f"Full: `HIGHLIGHTS_{date_str}_{slug}.md` "
+                f"({len(highlight_pairs)} msgs) + `CONVERSATION_{date_str}_{slug}.md`.\n\n---\n\n")
 
         # rFPs / Tasks Touched
         f.write("## rFPs / Tasks Touched\n\n")
@@ -13963,13 +13974,6 @@ def run_session_close(title: str = "", commit: bool = True,
                 f.write("\n")
         except Exception:
             pass
-        f.write("TODO: note task state changes (completed, deferred, new tasks created).\n\n---\n\n")
-
-        f.write("## Work Done\n\nTODO: fill in from conversation\n\n---\n\n")
-        f.write("## Commits\n\n")
-        if git_log:
-            for line in git_log.split('\n')[:15]:
-                f.write(f"- `{line}`\n")
         f.write("\n---\n\n")
 
         # META-CGN primitive grounding snapshot (auto-populated from
@@ -13981,8 +13985,8 @@ def run_session_close(title: str = "", commit: bool = True,
             f.write(_mcgn_snapshot)
             f.write("\n---\n\n")
 
-        f.write("## Next Session Priorities\n\n")
-        f.write("1. TODO\n2. TODO\n3. TODO\n")
+        # (Next-session priority lives in the Handoff section above +
+        # titan-docs/CURRENT_ARC.md — no separate TODO block.)
 
     # Append snapshot row to meta_cgn_trajectory.tsv for time-series tracking
     _append_meta_cgn_trajectory(date_str, title or "")
