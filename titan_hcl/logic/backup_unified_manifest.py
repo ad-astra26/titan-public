@@ -55,15 +55,6 @@ from titan_hcl._phase_c_constants import (
 
 logger = logging.getLogger(__name__)
 
-# §24.2 fresh-baseline guard (2026-06-01): the month-boundary rebase is
-# suppressed when the current baseline is younger than this. Prevents a
-# first_event/depth-cap baseline that lands days before the 1st from
-# immediately re-baselining (a full re-ship of barely-changed tiers).
-# Python-L2 policy threshold (should_rebase is pure-Python; no Rust parity) —
-# kept out of the generated _phase_c_constants. ~1 week; depth-cap (30) and the
-# next month boundary still force a rebase once the baseline ages past it.
-BACKUP_BASELINE_MIN_AGE_DAYS: int = 7
-
 
 # SPEC §24.3 — current schema version. Bump only when manifest event shape
 # changes incompatibly (older readers can't decode). Additive fields are
@@ -346,17 +337,6 @@ class UnifiedManifest:
         "month_boundary" / "depth_cap" / None.
 
         First-ever event (no current baseline) → (True, "first_event").
-
-        §24.2 fresh-baseline guard (2026-06-01): the month-boundary trigger is
-        SUPPRESSED when the current baseline is younger than
-        BACKUP_BASELINE_MIN_AGE_DAYS. Without it, a first_event/depth-cap
-        baseline that lands a few days before the 1st (as the T1 first_event
-        did on 05-29) immediately re-baselines on the 1st — a full re-ship of
-        barely-changed multi-hundred-MB tiers for ~nothing. The depth-cap
-        still forces a rebase after 30 incrementals; the NEXT month boundary
-        rebases once the baseline has aged past the grace. Monthly cadence is
-        preserved in steady state (a ~30-day-old baseline always clears the
-        grace on the 1st).
         """
         if not self.current_baseline_event_id:
             return (True, "first_event")
@@ -365,16 +345,9 @@ class UnifiedManifest:
         today_str = now.strftime("%Y-%m-%d")
 
         # Month-boundary check: today is the 1st AND we haven't already
-        # rebased today AND the current baseline has aged past the grace.
+        # rebased today
         if now.day == 1 and self.current_baseline_date != today_str:
-            age_days = self._baseline_age_days(now)
-            if age_days is None or age_days >= BACKUP_BASELINE_MIN_AGE_DAYS:
-                return (True, "month_boundary")
-            logger.info(
-                "[UnifiedManifest] month-boundary rebase SUPPRESSED — baseline "
-                "%s is %.1fd old (< %dd grace); staying incremental (depth-cap "
-                "and next month boundary still apply)",
-                self.current_baseline_date, age_days, BACKUP_BASELINE_MIN_AGE_DAYS)
+            return (True, "month_boundary")
 
         # Depth-cap check
         depth = len(self.incrementals_since_baseline())
@@ -382,18 +355,6 @@ class UnifiedManifest:
             return (True, "depth_cap")
 
         return (False, None)
-
-    def _baseline_age_days(self, now: datetime) -> Optional[float]:
-        """Age of the current baseline in days (from current_baseline_date,
-        YYYY-MM-DD UTC). None if unparseable."""
-        bdate = self.current_baseline_date
-        if not bdate:
-            return None
-        try:
-            b = datetime.strptime(bdate, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        except (ValueError, TypeError):
-            return None
-        return (now - b).total_seconds() / 86400.0
 
 
 # ── event builders ────────────────────────────────────────────────────────

@@ -364,6 +364,9 @@ def _translate_reply(reply: Optional[dict],
         "state_narration": body.get("state_narration"),
         "state_snapshot": body.get("state_snapshot"),
         "ovg": body.get("ovg_data"),
+        # Tool-backstop activity (2026-06-01) — non-null when a deterministic
+        # tool ran this turn; lets the frontend/comma show "verified via sandbox".
+        "tool_activity": body.get("tool_activity"),
     }
     extra_headers = _build_ovg_headers(body.get("ovg_data") or {})
     return {
