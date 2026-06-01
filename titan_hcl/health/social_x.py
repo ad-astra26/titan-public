@@ -41,7 +41,7 @@ logger = logging.getLogger("health.social_x")
 _PIPELINE_PROBE_URL = "https://api.twitterapi.io/twitter/user/info"
 _PIPELINE_PROBE_TIMEOUT_S = 10.0
 _POSTING_WINDOW_HOURS = 6.0
-_DEFAULT_BOT_USER_NAME = "iamtitanai"
+_DEFAULT_BOT_USER_NAME = ""
 _DEFAULT_SOCIAL_X_DB_PATH = "data/social_x.db"
 
 

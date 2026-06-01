@@ -854,7 +854,7 @@ class EventsTeacher:
 
         api_key = self._get_api_key(config)
         handle = config.get("social_x", {}).get(
-            "user_name", config.get("twitter_social", {}).get("user_name", "iamtitanai"))
+            "user_name", config.get("twitter_social", {}).get("user_name", ""))
         if not api_key:
             return 0
 
@@ -1503,7 +1503,7 @@ class EventsTeacher:
 
         api_key = self._get_api_key(config)
         handle = config.get("social_x", {}).get(
-            "user_name", config.get("twitter_social", {}).get("user_name", "iamtitanai"))
+            "user_name", config.get("twitter_social", {}).get("user_name", ""))
         if not api_key:
             return [], 0
 

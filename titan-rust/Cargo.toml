@@ -37,7 +37,7 @@ edition = "2021"
 # deploys via stable (currently 1.95); CI uses dtolnay/rust-toolchain@stable.
 # 1.75 was aspirational; we have not in fact supported it for some time.
 rust-version = "1.87"
-authors = ["Titan Architect <hello@iamtitan.tech>"]
+authors = ["Titan Architect <noreply@example.com>"]
 license = "Proprietary"
 
 # Workspace-level clippy lint allowances (2026-04-30).
