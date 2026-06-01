@@ -208,6 +208,95 @@ def test_discover_genesis_recovers_real_shard3_and_identity():
     assert disc["nft_address"] == "GenesisMint"
 
 
+# ── G1.1a: NFT-embedded recovery pointer (INV-MBR-5a) ────────────────────
+
+
+def test_genesis_recovery_block_schema():
+    from titan_hcl.logic.birth_dna import genesis_recovery_block
+    blk = genesis_recovery_block("3KCXvbShard3", vault_pda="BFgbYh", nft_address="AKZSCc")
+    assert blk == {"version": "1.0", "shard3_tx": "3KCXvbShard3",
+                   "vault_pda": "BFgbYh", "nft_address": "AKZSCc"}
+    # shard3_tx is mandatory
+    import pytest as _pt
+    with _pt.raises(ValueError):
+        genesis_recovery_block("")
+
+
+def test_build_genesis_nft_metadata_embeds_recovery():
+    from titan_hcl.logic.birth_dna import (
+        build_genesis_nft_metadata, genesis_recovery_block)
+    md = build_genesis_nft_metadata(
+        "T1", recovery=genesis_recovery_block("3KCXvbShard3"))
+    assert md["recovery"]["shard3_tx"] == "3KCXvbShard3"
+    assert md["name"].startswith("Titan Genesis")
+    assert isinstance(md["attributes"], list) and md["attributes"]
+    # without recovery, no recovery key (legacy/incomplete mint)
+    md2 = build_genesis_nft_metadata("T1")
+    assert "recovery" not in md2
+
+
+def test_read_nft_identity_extracts_recovery_block():
+    meta = {"name": "Titan Soul Gen 1",
+            "attributes": [{"trait_type": "Maker", "value": "Bsg2swDJ"}],
+            "recovery": {"version": "1.0", "shard3_tx": "S3FROMNFT",
+                         "vault_pda": "BFgbYh"}}
+
+    def get(url):
+        return _FakeResp(meta)
+
+    asset = {"content": {"json_uri": "ar://meta"}}
+    with _patch_httpx(get_handler=get):
+        ident = _run(gd.read_nft_identity(asset))
+    assert ident["shard3_tx"] == "S3FROMNFT"
+    assert ident["vault_pda"] == "BFgbYh"
+    assert ident["recovery"]["shard3_tx"] == "S3FROMNFT"
+
+
+def test_discover_genesis_prefers_nft_embedded_shard3_tx():
+    """A Titan minted WITH the recovery block resolves Shard-3 via the NFT
+    pointer (getTransaction on the embedded shard3_tx) — the wallet-history
+    walk is NOT needed. Real SSS round-trip back to the keypair."""
+    from solders.keypair import Keypair
+
+    kp = Keypair()
+    key_bytes = bytes(kp)
+    pubkey = str(kp.pubkey())
+    shards = shamir.split_secret(key_bytes, n=3, t=2)
+    enc = shamir.encrypt_shard3(shards[2], pubkey)
+
+    owned = {"result": {"items": [{"id": "GenesisMint", "content": {
+        "metadata": {"name": "Titan Soul Gen 1"}, "json_uri": "ar://meta"}}]}}
+    nft_meta = {"attributes": [{"trait_type": "Maker", "value": "MakerAddr"}],
+                "recovery": {"version": "1.0", "shard3_tx": "S3SIG_NFT"}}
+    walk_called = {"n": 0}
+
+    def post(url, body):
+        m = body["method"]
+        if m == "getAssetsByOwner":
+            return _FakeResp(owned)
+        if m == "getTransaction":
+            assert body["params"][0] == "S3SIG_NFT"  # the NFT-embedded pointer
+            return _FakeResp({"result": {"meta": {"logMessages": [
+                f"Program log: TITAN_GENESIS_SHARD3:{enc.hex()}"]},
+                "transaction": {"message": {"instructions": []}}}})
+        if m == "getSignaturesForAddress":
+            walk_called["n"] += 1     # must NOT happen — pointer path wins
+            return _FakeResp({"result": []})
+        return _FakeResp({"result": None})
+
+    def get(url):
+        return _FakeResp(nft_meta)
+
+    with _patch_httpx(post_handler=post, get_handler=get):
+        disc = _run(gd.discover_genesis(pubkey, "http://rpc"))
+
+    assert disc["shard3_tx"] == "S3SIG_NFT"
+    assert walk_called["n"] == 0, "wallet-history walk should be skipped when the NFT carries the pointer"
+    shard3 = shamir.decrypt_shard3(bytes.fromhex(disc["shard3_encrypted_hex"]), pubkey)
+    assert shamir.combine_shares([shards[0], shard3]) == key_bytes
+    assert disc["maker"] == "MakerAddr"
+
+
 # ── resurrection._parse_shard1: raw (canonical) vs legacy envelope ───────
 
 

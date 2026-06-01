@@ -224,6 +224,15 @@ async def read_nft_identity(asset: dict) -> dict:
         return out
 
     out["metadata"] = meta
+    # Recovery block (INV-MBR-5a) — the wallet-only Shard-3 pointer embedded in
+    # the NFT's own metadata. Present on Titans minted with the recovery block.
+    recovery = meta.get("recovery")
+    if isinstance(recovery, dict):
+        out["recovery"] = recovery
+        if recovery.get("shard3_tx"):
+            out["shard3_tx"] = recovery["shard3_tx"]
+        if recovery.get("vault_pda"):
+            out.setdefault("vault_pda", recovery["vault_pda"])
     # Map Metaplex attributes (trait_type/value) onto the identity fields.
     attr_map = {
         "maker": "maker", "creator": "maker",
@@ -266,13 +275,10 @@ async def discover_genesis(
     das_url = das_rpc_url or rpc_url
     out: dict = {}
 
-    # ── Shard-3 anchor (the critical, RPC-agnostic path) ──
-    anchor = await find_shard3_anchor(titan_pubkey, rpc_url)
-    if anchor:
-        out["shard3_tx"] = anchor["shard3_tx"]
-        out["shard3_encrypted_hex"] = anchor["encrypted_hex"]
-
-    # ── GenesisNFT identity (best-effort, DAS) ──
+    # ── 1. GenesisNFT identity + recovery pointer (canonical, INV-MBR-10) ──
+    # The NFT carries identity (Maker, Constitution/DNA hashes) and — when minted
+    # with the recovery block (INV-MBR-5a) — the `shard3_tx` pointer, so Shard-3
+    # discovery is wallet-only via the NFT. Best-effort (needs a DAS RPC).
     asset = None
     if nft_address:
         asset = await get_asset(nft_address, das_url)
@@ -282,5 +288,19 @@ async def discover_genesis(
         out["nft_address"] = asset.get("id") or nft_address
         ident = await read_nft_identity(asset)
         out.update({k: v for k, v in ident.items() if v is not None})
+
+    # ── 2. Resolve Shard-3 ──
+    # Prefer the NFT-embedded `shard3_tx` pointer (INV-MBR-5a). Fall back to the
+    # full wallet-history walk (`find_shard3_anchor`) — works on ANY RPC and
+    # covers T1 (immutable NFT, no embedded pointer) + non-DAS endpoints.
+    if out.get("shard3_tx") and not out.get("shard3_encrypted_hex"):
+        enc = await fetch_shard3_from_tx(out["shard3_tx"], rpc_url)
+        if enc:
+            out["shard3_encrypted_hex"] = enc
+    if not out.get("shard3_encrypted_hex"):
+        anchor = await find_shard3_anchor(titan_pubkey, rpc_url)
+        if anchor:
+            out["shard3_tx"] = anchor["shard3_tx"]
+            out["shard3_encrypted_hex"] = anchor["encrypted_hex"]
 
     return out
