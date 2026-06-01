@@ -151,6 +151,50 @@ def test_proof_day_verified_counts(tmp_path):
     assert pd.already_posted_today(titan_id="T1") is True
 
 
+# ── proof_day archive_hash freshness/dedup (2026-06-01) ──────────────────
+
+
+def test_proof_day_archive_hash_dedup_blocks_recycled_anchor(tmp_path):
+    """proof_day must never re-announce an anchor already posted (it recycled
+    archive ad0300… on 2026-05-31 AND 2026-06-01 because nothing deduped the
+    anchor). A prior post of the same archive_hash (even days ago, even
+    deleted) blocks re-announcement."""
+    db = str(tmp_path / "sx.db")
+    _make_actions_db(db)
+    h = "ad0300b832258382f73f9fb980feb186ccf663083898108ba7669a29a14329d7"
+    # Posted on a prior day.
+    _insert_action(db, post_type="proof_day", status="verified",
+                   created_at=time.time() - 2 * 86400,
+                   metadata={"archive_hash": h})
+    pd = ProofDayArchetype(gateway=None, social_x_db_path=db)
+    assert pd.archive_hash_already_posted(titan_id="T1", archive_hash=h) is True
+    # A deleted-then-republished attempt is still blocked.
+    db2 = str(tmp_path / "sx2.db")
+    _make_actions_db(db2)
+    _insert_action(db2, post_type="proof_day", status="deleted",
+                   metadata={"archive_hash": h})
+    pd2 = ProofDayArchetype(gateway=None, social_x_db_path=db2)
+    assert pd2.archive_hash_already_posted(titan_id="T1", archive_hash=h) is True
+
+
+def test_proof_day_archive_hash_allows_fresh_anchor(tmp_path):
+    """A genuinely new anchor (different archive_hash) is NOT blocked, and a
+    failed prior attempt of the same hash does not block (never reached X)."""
+    db = str(tmp_path / "sx.db")
+    _make_actions_db(db)
+    old = "fce766806cff72bc0db7e279a3e82051680b6377eed8cff2e7afd2a406b06134"
+    new = "ad0300b832258382f73f9fb980feb186ccf663083898108ba7669a29a14329d7"
+    _insert_action(db, post_type="proof_day", status="verified",
+                   metadata={"archive_hash": old})
+    _insert_action(db, post_type="proof_day", status="failed",
+                   metadata={"archive_hash": new})
+    pd = ProofDayArchetype(gateway=None, social_x_db_path=db)
+    # Fresh anchor never posted → allowed.
+    assert pd.archive_hash_already_posted(titan_id="T1", archive_hash=new) is False
+    # Empty hash is a no-op (does not block).
+    assert pd.archive_hash_already_posted(titan_id="T1", archive_hash="") is False
+
+
 # ── #8 AMPLIFY archetype ────────────────────────────────────────────────
 
 

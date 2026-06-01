@@ -151,6 +151,38 @@ class ProofDayArchetype(ArchetypeBase):
         finally:
             conn.close()
 
+    def archive_hash_already_posted(self, *, titan_id: str,
+                                    archive_hash: str) -> bool:
+        """True if this exact on-chain anchor (archive_hash) was ALREADY
+        published by proof_day on any prior dispatch (lifetime).
+
+        Freshness/dedup guard (2026-06-01): proof_day must announce a NEW
+        proof, never recycle one already on X. Without this it re-posted the
+        identical anchor across days whenever the backup pipeline produced no
+        fresh anchor — e.g. archive `ad0300…` on 2026-05-31 AND 2026-06-01, and
+        `fce766…` 7× across 2026-05-29/30 — which reads as a broken, repeating
+        feed on the public timeline. Dedups on `archive_hash` because it is
+        reliably persisted in actions.metadata (the `proof_day_source_id` key
+        is not). 'deleted' counts as published (a deleted proof was still
+        announced — don't re-announce the same one); 'failed' is excluded so a
+        proof that never reached X can still post once a fresh anchor exists.
+        """
+        if not archive_hash:
+            return False
+        conn = self._conn()
+        try:
+            # json_extract is whitespace-insensitive (robust to compact vs
+            # spaced metadata JSON) — unlike a LIKE pattern on the raw column.
+            row = conn.execute(
+                "SELECT 1 FROM actions WHERE titan_id=? AND post_type=? "
+                "AND status IN ('posted','verified','pending','deleted') "
+                "AND json_extract(metadata, '$.archive_hash') = ? LIMIT 1",
+                (titan_id, self.name, archive_hash),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
     def find_candidate(self, context) -> ArchetypeCandidate | None:
         """rFP §4.3.1 — fires on T1 only when a fresh anchor exists today.
 
@@ -192,6 +224,20 @@ class ProofDayArchetype(ArchetypeBase):
             return None
 
         archive_hash = str(anchor.get("archive_hash", ""))
+
+        # Freshness/dedup guard (2026-06-01): never re-announce a proof already
+        # posted. proof_day publishes only a GENUINELY NEW anchor; when the
+        # backup pipeline produces no fresh anchor it abstains (matches this
+        # method's "fires only when a fresh anchor exists" contract) rather
+        # than recycling the latest one day after day.
+        if self.archive_hash_already_posted(titan_id=titan_id,
+                                            archive_hash=archive_hash):
+            logger.info(
+                "[proof_day] anchor %s… already announced on a prior dispatch "
+                "— abstaining until a fresh backup produces a new anchor",
+                archive_hash[:16])
+            return None
+
         # Source-id chosen so it's unique-per-day-per-archive — matches the
         # idempotency key in actions.metadata.
         source_id = f"{titan_id}:{archive_hash[:16]}:{int(anchor.get('ts') or 0)}"
