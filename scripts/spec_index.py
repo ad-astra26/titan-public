@@ -16,6 +16,10 @@ costs ~30K tokens. This script produces a compact (~200-line) index that:
      companion when present (falling back to the main SPEC's §21 if not).
   3. Extracts `## §9.B — Python tree` `#### module_name` sub-blocks into a
      worker → section line map for fast "which §9.B has worker X" lookup.
+     Since Tier 2 SPEC-leaning (2026-06-01) the §9 matrix lives in the companion
+     `SPEC_subscriber_hierarchy_matrix.md`; the main SPEC keeps only a wiring-
+     contract stub. This generator parses the §9.B module map from the companion
+     when present (falling back to the main SPEC's §9.B if not).
 
 Output: titan-docs/specs/SPEC_index.md (overwrites; never hand-edit).
 
@@ -42,6 +46,14 @@ INDEX_PATH = REPO_ROOT / "titan-docs" / "specs" / "SPEC_index.md"
 # §21 is now a pointer stub. `parse_spec` already keys D-SPEC extraction on the
 # `## §21` header, so running it over the companion yields the D-SPEC index.
 DECISION_LOG_PATH = REPO_ROOT / "titan-docs" / "specs" / "SPEC_decision_log.md"
+# §9 Subscriber/Consumer/Hierarchy Matrix was extracted to this companion
+# (Tier 2 SPEC-leaning, 2026-06-01). It is the canonical source for the §9.B
+# Python-tree module→line map; the main SPEC §9 is now a wiring-contract stub.
+# `parse_spec` keys module extraction on the `§9.B` header, so running it over
+# the companion yields the module map.
+SUBSCRIBER_MATRIX_PATH = (
+    REPO_ROOT / "titan-docs" / "specs" / "SPEC_subscriber_hierarchy_matrix.md"
+)
 
 
 SECTION_RE = re.compile(r"^(#{2,4})\s+(§[\w\.]+(?:[A-Z])?)\s*[—-]\s*(.+?)\s*$")
@@ -209,10 +221,12 @@ def render(parsed: dict) -> str:
         out.append(
             "> Direct jump to a worker's `Owns` / bus subs / pubs / SHM "
             "reads-writes / persisted state block. For Rust L1 daemons see "
-            "§9.A (line range in TOC above)."
+            "§9.A. **The `Line` column below indexes into "
+            "`SPEC_subscriber_hierarchy_matrix.md`** (the §9 matrix was extracted "
+            "there in Tier 2 SPEC-leaning, 2026-06-01) — `Read offset=N` that file."
         )
         out.append("")
-        out.append("| Module | §9.B Line |")
+        out.append("| Module | Line (SPEC_subscriber_hierarchy_matrix.md) |")
         out.append("|---|---|")
         for m in sorted(parsed["modules"], key=lambda x: x["name"]):
             out.append(f"| `{m['name']}` | {m['line']} |")
@@ -243,6 +257,14 @@ def main() -> int:
         dlog_parsed = parse_spec(DECISION_LOG_PATH.read_text())
         if dlog_parsed["dspecs"]:
             parsed["dspecs"] = dlog_parsed["dspecs"]
+
+    # §9.B module map lives in the companion since Tier 2 (the main SPEC §9 is a
+    # wiring-contract stub). Re-parse the companion for the module→line map; fall
+    # back to the main SPEC's §9.B only if the companion is absent.
+    if SUBSCRIBER_MATRIX_PATH.exists():
+        matrix_parsed = parse_spec(SUBSCRIBER_MATRIX_PATH.read_text())
+        if matrix_parsed["modules"]:
+            parsed["modules"] = matrix_parsed["modules"]
 
     index_text = render(parsed)
     INDEX_PATH.write_text(index_text)
