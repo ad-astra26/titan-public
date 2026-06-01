@@ -950,6 +950,9 @@ def create_pre_hook(plugin):
                 _t_recall0 = time.perf_counter()
                 _results = await asyncio.to_thread(_recall.recall, prompt_text, k=6)
                 _recall_latency_ms = (time.perf_counter() - _t_recall0) * 1000.0
+                logger.info(
+                    "[PreHook] B3 synthesis recall ran: %d raw results in %.0fms",
+                    len(_results or []), _recall_latency_ms)
                 try:
                     _s1 = _ev.get_stats() if _ev is not None else {}
                     plugin._last_retrieval_sample = {
@@ -1005,9 +1008,11 @@ def create_pre_hook(plugin):
                         "[PreHook] synthesis recall augment: %d tx_hash hits injected",
                         len(_lines))
         except Exception as _sr_err:
-            logger.debug(
+            # Error-visibility: a recall failure that silently zeroes the operator
+            # loop (telemetry/sovereignty) must be LOUD, not swallowed at debug.
+            logger.warning(
                 "[PreHook] synthesis recall augment failed (chat unaffected): %s",
-                _sr_err)
+                _sr_err, exc_info=True)
 
         directive_context = ""
         if directives:
