@@ -239,7 +239,7 @@ def check_dependencies(results: DiagResult):
         "solders": "solders",
         "anchorpy": "anchorpy",
         "pydub": "pydub",
-        "llama_cpp": "llama_cpp",
+        "sentence_transformers": "sentence_transformers",
     }
 
     for display_name, module_name in modules.items():

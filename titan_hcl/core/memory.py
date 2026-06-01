@@ -236,17 +236,19 @@ class TieredMemoryGraph:
     # Mempool Embedding Index (lightweight, in-memory, fastembed)
     # -------------------------------------------------------------------------
     def _ensure_embedding_model(self):
-        """Lazy-bind the fleet-standard llama.cpp embedder singleton for mempool
-        semantic search (Phase 13 §3J.1 — shared bge-small, torch-free)."""
+        """Lazy-load the fastembed model for mempool semantic search."""
         if self._embedding_model is not None:
             return True
         try:
-            from titan_hcl.utils.text_embedder import get_text_embedder
-            self._embedding_model = get_text_embedder()
-            logger.info("[Memory] llama.cpp embedder bound for mempool semantic index.")
+            from fastembed import TextEmbedding
+            self._embedding_model = TextEmbedding(
+                model_name="BAAI/bge-small-en-v1.5",
+                cache_dir=os.path.join(self._config.get("data_dir", "./data"), ".fastembed_cache"),
+            )
+            logger.info("[Memory] Fastembed model loaded for mempool semantic index.")
             return True
         except Exception as e:
-            logger.warning("[Memory] Embedder unavailable: %s — mempool keyword-only.", e)
+            logger.debug("[Memory] Fastembed unavailable: %s — mempool keyword-only.", e)
             return False
 
     def _embed_text(self, text: str) -> Optional[np.ndarray]:
@@ -254,9 +256,9 @@ class TieredMemoryGraph:
         if not self._ensure_embedding_model():
             return None
         try:
-            vec = self._embedding_model.encode(text)
-            if vec is not None and getattr(vec, "size", 0):
-                return np.asarray(vec, dtype=np.float32)
+            embeddings = list(self._embedding_model.embed([text]))
+            if embeddings:
+                return np.array(embeddings[0], dtype=np.float32)
         except Exception as e:
             logger.debug("[Memory] Embedding failed: %s", e)
         return None
