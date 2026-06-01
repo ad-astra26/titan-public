@@ -894,15 +894,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 )
 
                 def _tx_index_tick() -> None:
-                    # 2026-06-01: bound per-tick scope so the COLD-START backfill
-                    # on a big chain (T1 mainnet) builds the spine GRADUALLY over
-                    # many 60s ticks instead of a single 2000-block scan+embed
-                    # spike (which drove synthesis RSS to ~3.5GB → guardian
-                    # restart loop). Each tick stays small + bounded; the
-                    # watermark persists progress, so the full index still builds
-                    # — just over minutes, not in one memory spike. Steady-state
-                    # (caught up) ticks index only the few new blocks per minute.
-                    summary = _tx_index_builder.run(max_blocks=300)
+                    summary = _tx_index_builder.run(max_blocks=2000)
                     if summary.get("indexed"):
                         logger.info(
                             "[synthesis_worker] tx-index tick: +%d vectors "
