@@ -9,10 +9,14 @@ been replaced by the canonical §24.8 / rFP §3.1 restore engine
 (`titan_hcl.logic.backup_restore.restore_full`), and First Breath now writes
 the real kernel-boot identity artifacts.
 
-Recovery model (SPEC §G16(8) Shamir 2-of-3):
-  Fresh box  → Shard-1 (Maker, offline) + Shard-3 (on-chain Genesis memo).
+Recovery model (SPEC §G16(8) Shamir 2-of-3) — NO ENVELOPE (INV-MBR-0/10):
+  Fresh box  → raw Shard-1 (Maker, offline) + the PUBLIC titan address. From the
+               address alone the protocol discovers the GenesisNFT and the
+               on-chain Shard-3 memo (wallet-only), decrypts Shard-3 (key =
+               public pubkey), and reconstructs the keypair (Shard-1 + Shard-3).
   Disk-alive → Shard-1 (Maker) + Shard-2 (local data/genesis_record.json).
-  Any 2 of the 3 reconstruct the 64-byte Ed25519 keypair.
+  Any 2 of the 3 reconstruct the 64-byte Ed25519 keypair. The Maker's shard
+  carries no locators — the wallet + chain are self-describing.
 
 Phases:
   1. Identity Discovery  — collect shards, reconstruct + verify the keypair.
@@ -28,10 +32,12 @@ in the Arweave tarballs, so on a truly fresh box it must be supplied off-VPS
 discovery is a SPEC §24.13 follow-up (not yet wired); we never fabricate it.
 
 Usage:
-    python scripts/resurrection.py --shard1 <hex_envelope> --manifest <path>
-    python scripts/resurrection.py --shard1-file <path> --manifest <path>
+    # Fresh box — sovereign, wallet-only (no envelope, no manifest for identity):
+    python scripts/resurrection.py --shard1 <raw_hex> --titan-pubkey <address> --manifest <path>
+    python scripts/resurrection.py --shard1-file <path> --titan-pubkey <address> --manifest <path>
     python scripts/resurrection.py --shard2-local          # disk-alive recovery
     # add --verify-only to install setup_titan's verify-only gate on first boot
+    # (--manifest still gates the BODY restore until G3 switches it to the v=3 chain)
 """
 import argparse
 import asyncio
@@ -80,66 +86,120 @@ def _config_rpc_url() -> str:
 # ---------------------------------------------------------------------------
 # Phase 1: Identity Discovery — Collect shards and reconstruct keypair
 # ---------------------------------------------------------------------------
+def _parse_shard1(hex_str: str) -> tuple:
+    """Accept a RAW Shard-1 (canonical — NO envelope) or a legacy JSON envelope.
+
+    The sovereign input (INV-MBR-0) is the raw shard hex + the PUBLIC
+    `--titan-pubkey`; the shard carries no locators. A legacy v2.0 envelope is
+    still tolerated (its embedded pubkey is read), but is never required and is
+    never the documented path. Returns (shard_bytes, titan_pubkey_or_None).
+    """
+    try:
+        raw = bytes.fromhex("".join(hex_str.split()))
+    except ValueError:
+        raise ValueError("Shard-1 is not valid hex.")
+    if raw[:1] == b"{":  # legacy envelope = hex of a JSON object
+        from titan_hcl.utils.shamir import parse_maker_envelope
+        shard, metadata = parse_maker_envelope(hex_str)
+        return shard, (metadata.get("titan_pubkey") or None)
+    return raw, None
+
+
+def _report_identity(discovery: dict) -> None:
+    """Print the GenesisNFT identity commitments recovered wallet-only (best-effort)."""
+    if not discovery:
+        return
+    maker = discovery.get("maker")
+    csha = discovery.get("constitution_sha")
+    dsha = discovery.get("birth_dna_sha")
+    if maker:
+        print(f"  GenesisNFT identity recovered: Maker {str(maker)[:16]}…")
+    if csha:
+        print(f"    Constitution SHA-256: {str(csha)[:16]}…")
+    if dsha:
+        print(f"    Birth DNA SHA-256:    {str(dsha)[:16]}…")
+
+
 def phase_1_identity(args, install_root: str) -> tuple:
     """Collect available shards and reconstruct the Titan's keypair.
 
-    Returns (key_bytes, titan_pubkey, keypair_obj, titan_id).
+    Envelope-free (INV-MBR-0/10): the Maker provides raw Shard-1 + the PUBLIC
+    Titan address; Shard-3 is discovered ON-CHAIN from the wallet alone (the
+    GenesisNFT → Shard-3 memo). Returns (key_bytes, titan_pubkey, keypair, titan_id).
     """
-    from titan_hcl.utils.shamir import (
-        parse_maker_envelope, combine_shares, decrypt_shard3,
-    )
+    from titan_hcl.utils.shamir import combine_shares, decrypt_shard3
+    from titan_hcl.utils import genesis_discovery
 
     print_phase("1", "Identity Discovery")
-    shards = []
-    titan_pubkey = None
-    genesis_tx = None
+    shards: list = []
+    titan_pubkey = args.titan_pubkey or None
+    nft_address = None
     titan_id = args.titan_id or "T1"
 
     genesis_record = os.path.join(install_root, "data", "genesis_record.json")
 
-    # ── Shard 1 (Maker, offline) ──
-    shard1 = None
-    hex_envelope = None
+    # ── Shard 1 (Maker, offline) — raw shard hex (canonical) or legacy envelope ──
+    shard1_hex = None
     if args.shard1:
-        print("  Parsing Maker shard from command line...")
-        hex_envelope = args.shard1
+        print("  Loading Maker Shard-1 from command line...")
+        shard1_hex = args.shard1
     elif args.shard1_file:
-        print(f"  Reading Maker shard from file: {args.shard1_file}")
+        print(f"  Reading Maker Shard-1 from file: {args.shard1_file}")
         with open(args.shard1_file, "r") as f:
-            hex_envelope = f.read().strip()
-    if hex_envelope:
-        shard1, metadata = parse_maker_envelope(hex_envelope)
-        titan_pubkey = metadata["titan_pubkey"]
-        genesis_tx = metadata.get("genesis_tx")
-        print(f"  Titan Address (from envelope): {titan_pubkey}")
-        print(f"  Genesis TX: {genesis_tx or 'not recorded'}")
+            shard1_hex = f.read().strip()
+    if shard1_hex:
+        shard1, env_pubkey = _parse_shard1(shard1_hex)
         shards.append(shard1)
+        if env_pubkey and not titan_pubkey:
+            titan_pubkey = env_pubkey
+        print(f"  Shard 1 loaded ({len(shard1)} bytes).")
 
-    # ── Shard 2 (local genesis record — disk-alive recovery only) ──
+    # ── Local genesis record — disk-alive Shard-2 + public pointers (NFT addr) ──
     if os.path.exists(genesis_record):
-        print("  Found local genesis record — extracting Shard 2...")
         with open(genesis_record, "r") as f:
             record = json.load(f)
-        shard2_hex = record.get("shard2_hex", "")
-        if shard2_hex:
-            shards.append(bytes.fromhex(shard2_hex))
-            print(f"  Shard 2 recovered from local record.")
         if not titan_pubkey:
-            titan_pubkey = record.get("titan_pubkey", "")
-        if not genesis_tx:
-            genesis_tx = record.get("genesis_tx", "")
+            titan_pubkey = record.get("titan_pubkey") or None
+        nft_address = (record.get("nft_address")
+                       or record.get("genesis_nft_address") or None)
+        shard2_hex = record.get("shard2_hex", "")
+        if shard2_hex and len(shards) < 2:
+            shards.append(bytes.fromhex(shard2_hex))
+            print("  Shard 2 recovered from local genesis record (disk-alive).")
 
-    # ── Shard 3 (on-chain Genesis Anchor) ──
-    if len(shards) < 2 and titan_pubkey:
-        print("  Recovering Shard 3 from on-chain Genesis Anchor...")
-        shard3 = _recover_shard3(titan_pubkey, genesis_tx)
-        if shard3:
-            shards.append(shard3)
-            print(f"  Shard 3 recovered ({len(shard3)} bytes).")
+    if not titan_pubkey:
+        print("\n  *** No Titan address available. ***")
+        print("  Provide --titan-pubkey <address> — the PUBLIC wallet address")
+        print("  printed alongside your Shard-1 (it is not a secret).")
+        sys.exit(1)
+    print(f"  Titan Address: {titan_pubkey}")
 
-    # ── Shard 3 fallback: encrypted in local genesis record ──
-    if len(shards) < 2 and os.path.exists(genesis_record) and titan_pubkey:
-        print("  Trying local genesis record for encrypted Shard 3...")
+    # ── Shard 3 (on-chain, WALLET-ONLY discovery via the GenesisNFT) ──
+    discovery: dict = {}
+    if len(shards) < 2:
+        print("  Discovering Shard 3 on-chain (wallet-only, no envelope)...")
+        rpc_url = _config_rpc_url()
+        discovery = asyncio.run(genesis_discovery.discover_genesis(
+            titan_pubkey, rpc_url,
+            das_rpc_url=getattr(args, "das_rpc_url", None) or None,
+            nft_address=nft_address))
+        enc_hex = discovery.get("shard3_encrypted_hex")
+        if not enc_hex and discovery.get("shard3_tx"):
+            enc_hex = asyncio.run(genesis_discovery.fetch_shard3_from_tx(
+                discovery["shard3_tx"], rpc_url))
+        if enc_hex:
+            try:
+                shards.append(decrypt_shard3(bytes.fromhex(enc_hex), titan_pubkey))
+                tx = discovery.get("shard3_tx")
+                print(f"  Shard 3 recovered + decrypted"
+                      f"{f' (tx {str(tx)[:16]}…)' if tx else ''}.")
+            except Exception as e:
+                print(f"  [!] Shard 3 decrypt failed: {e}")
+        else:
+            print("  [!] No on-chain Shard-3 memo found for this wallet.")
+
+    # ── Shard 3 fallback: encrypted in the local record ──
+    if len(shards) < 2 and os.path.exists(genesis_record):
         with open(genesis_record, "r") as f:
             record = json.load(f)
         s3_enc_hex = record.get("shard3_encrypted_hex", "")
@@ -147,11 +207,12 @@ def phase_1_identity(args, install_root: str) -> tuple:
             shards.append(decrypt_shard3(bytes.fromhex(s3_enc_hex), titan_pubkey))
             print("  Shard 3 recovered from local record.")
 
-    # ── Reconstruct ──
+    # ── Reconstruct + verify ──
     if len(shards) < 2:
-        print(f"\n  *** RESURRECTION FAILED: Only {len(shards)} shard(s) available. ***")
-        print("  Need ≥2 shards. Provide Shard 1 via --shard1 / --shard1-file")
-        print("  (fresh box) or ensure data/genesis_record.json (disk-alive).")
+        print(f"\n  *** RESURRECTION FAILED: only {len(shards)} shard(s). ***")
+        print("  Need ≥2. Fresh box = Shard-1 (--shard1/-file) + --titan-pubkey,")
+        print("  with an on-chain Shard-3 memo on that wallet. Disk-alive = local")
+        print("  data/genesis_record.json supplies Shard-2.")
         sys.exit(1)
 
     print(f"\n  Reconstructing keypair from {len(shards)} shards...")
@@ -161,85 +222,14 @@ def phase_1_identity(args, install_root: str) -> tuple:
     keypair = Keypair.from_bytes(key_bytes)
     recovered_pubkey = str(keypair.pubkey())
 
-    if titan_pubkey and recovered_pubkey != titan_pubkey:
+    if recovered_pubkey != titan_pubkey:
         print(f"  *** CRITICAL: reconstructed {recovered_pubkey[:16]}… "
               f"≠ expected {titan_pubkey[:16]}… — shard corruption. ABORT. ***")
         sys.exit(1)
 
     print(f"  Keypair reconstructed + verified: {recovered_pubkey}")
+    _report_identity(discovery)
     return key_bytes, recovered_pubkey, keypair, titan_id
-
-
-def _recover_shard3(titan_pubkey: str, genesis_tx: str) -> bytes | None:
-    """Recover Shard 3 from the on-chain Genesis Memo TX (AES key = pubkey)."""
-    from titan_hcl.utils.shamir import decrypt_shard3
-    try:
-        encrypted_hex = _fetch_genesis_memo(titan_pubkey, genesis_tx)
-        if not encrypted_hex:
-            return None
-        return decrypt_shard3(bytes.fromhex(encrypted_hex), titan_pubkey)
-    except Exception as e:
-        print(f"  [!] Shard 3 recovery failed: {e}")
-        return None
-
-
-def _fetch_genesis_memo(titan_pubkey: str, genesis_tx: str) -> str | None:
-    """Fetch the Genesis Memo TX from Solana and extract the encrypted shard."""
-    try:
-        import httpx
-        rpc_url = _config_rpc_url()
-
-        if genesis_tx:
-            print(f"  Fetching Genesis TX: {genesis_tx[:24]}…")
-            with httpx.Client(timeout=15) as client:
-                resp = client.post(rpc_url, json={
-                    "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
-                    "params": [genesis_tx, {"encoding": "jsonParsed",
-                                            "maxSupportedTransactionVersion": 0}],
-                })
-                result = resp.json().get("result")
-            if result:
-                memo = _extract_memo_from_tx(result)
-                if memo:
-                    return memo
-
-        print(f"  Scanning transactions for {titan_pubkey[:16]}…")
-        with httpx.Client(timeout=15) as client:
-            resp = client.post(rpc_url, json={
-                "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
-                "params": [titan_pubkey, {"limit": 50}],
-            })
-            sigs = resp.json().get("result", [])
-        for sig_entry in sigs:
-            memo = sig_entry.get("memo")
-            if memo and "TITAN_GENESIS_SHARD3:" in str(memo):
-                memo_str = str(memo)
-                prefix = "TITAN_GENESIS_SHARD3:"
-                idx = memo_str.index(prefix)
-                return memo_str[idx + len(prefix):].strip().rstrip('"')
-
-        print("  [!] Genesis Memo TX not found on-chain.")
-        return None
-    except Exception as e:
-        print(f"  [!] RPC query failed: {e}")
-        return None
-
-
-def _extract_memo_from_tx(tx_result: dict) -> str | None:
-    """Extract TITAN_GENESIS_SHARD3 data from a parsed transaction."""
-    try:
-        prefix = "TITAN_GENESIS_SHARD3:"
-        for msg in tx_result.get("meta", {}).get("logMessages", []):
-            if prefix in msg:
-                return msg[msg.index(prefix) + len(prefix):].strip()
-        message = tx_result.get("transaction", {}).get("message", {})
-        for ix in message.get("instructions", []):
-            parsed = ix.get("parsed")
-            if isinstance(parsed, str) and prefix in parsed:
-                return parsed[parsed.index(prefix) + len(prefix):].strip()
-        return None
-    except Exception:
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -454,9 +444,17 @@ def main():
         description="Titan Resurrection Protocol — Sovereign Recovery from "
                     "Zero-Disk State (mainnet-born Titans only).")
     parser.add_argument("--shard1", type=str,
-                        help="Maker's shard envelope (hex string).")
+                        help="Maker's raw Shard-1 (hex). NO envelope needed — the "
+                             "shard carries no locators; the wallet discovers them.")
     parser.add_argument("--shard1-file", type=str,
-                        help="Path to a file containing the Maker shard envelope.")
+                        help="Path to a file containing the raw Shard-1 hex.")
+    parser.add_argument("--titan-pubkey", type=str, default=None,
+                        help="The Titan's PUBLIC wallet address (printed alongside "
+                             "Shard-1; not a secret). Required on a fresh box.")
+    parser.add_argument("--das-rpc-url", type=str, default=None,
+                        help="Optional DAS-capable RPC (Helius/Triton) for "
+                             "GenesisNFT identity discovery. Defaults to the "
+                             "configured RPC; Shard-3 recovery never needs DAS.")
     parser.add_argument("--shard2-local", action="store_true",
                         help="Disk-alive recovery using local genesis_record.json.")
     parser.add_argument("--manifest", type=str, default=None,
