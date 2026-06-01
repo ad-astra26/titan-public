@@ -1055,6 +1055,8 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         # ever formed. Fill each mined candidate's embedding from the tx_hash
         # FAISS store (Phase A) so ConsolidationPass clusters by COSINE (0.85)
         # AND tags, not tags alone — the precondition for real concept synthesis.
+        import dataclasses as _dc
+
         def _mine_with_embeddings(since_ts, exclude_forks):
             # default_mine_recent_txs is keyword-only (def ...(*, since_ts, ...));
             # a positional call raised TypeError every dream → mine aborted →
@@ -1063,12 +1065,17 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 since_ts=since_ts, exclude_forks=exclude_forks)
             if synth_vector_store is None:
                 return cands
+            # TxCandidate is a FROZEN dataclass — cannot assign c.embedding in
+            # place ('cannot assign to field embedding'); rebuild via replace().
+            out = []
             for c in cands:
                 if c.embedding is None:
                     vec = synth_vector_store.get_vector(c.fork, c.tx_hash)
                     if vec is not None:
-                        c.embedding = tuple(float(x) for x in vec)
-            return cands
+                        c = _dc.replace(
+                            c, embedding=tuple(float(x) for x in vec))
+                out.append(c)
+            return out
 
         consolidation_pass = ConsolidationPass(
             concept_store=concept_store,
