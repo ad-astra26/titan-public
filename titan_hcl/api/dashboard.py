@@ -4680,13 +4680,16 @@ _RESTART_MODULE_ALLOWLIST = {
     "synthesis",    # 2026-06-01 — state in synthesis.duckdb/FAISS (rebuildable, survives); enables targeted restart for synthesis-engine operator-closure work (avoids full-kernel bounce). RESTART only (kill-then-spawn) — NOT reload (see below).
     "agno_worker",  # 2026-06-01 — state in agno_sessions.db (survives); enables targeted restart for chat-path work. RESTART only.
     "backup",       # 2026-06-01 — clean restart-isolated L2 module: MODULE_SHUTDOWN handler + state is on-disk manifest (rebuildable staged tarballs; ZK/Arweave clients re-init on boot). Enables restart-free single-module code deploys (restart-module backup?spawn=true) without a full-T1 restart.
-    # 2026-06-01 (Maker: stop full-Titan restarts for single-worker code
-    # deploys) — all restart-safe; state on-disk or rebuilt on boot:
-    "social_worker",     # SAVE_NOW + MODULE_SHUTDOWN handlers; state in social_x.db (rate limits/actions/mentions). Gateway + dispatcher re-init on boot.
-    "expression_worker", # EdgeDetector state persisted via SAVE_NOW; composite ledger + consume-overlay are transient (rebuild from hormone SHM next tick).
-    "hormonal_module",   # SAVE_NOW → hormonal_state.json; HormonalSystem reloads on boot. hormonal_state.bin is rebuildable.
-    "cognitive_worker",  # State persisted (nns weights, inner_memory.db, nns_hormonal_state.bin republished each cycle). NOTE: heavy respawn (~2GB, torch cold-load) — use only when a cognitive/NNS code change requires it.
-    "api",               # start_method=spawn (re-imports from disk); stateless HTTP layer. Lets the api self-reload code (incl. this allowlist) without a full restart.
+    # 2026-06-01 — audited-safe additions only (rFP_module_hot_reload_persistence_program §P1a):
+    "hormonal_module",   # audit: reload_ok — SAVE_NOW → hormonal_state.json; HormonalSystem reloads on boot. hormonal_state.bin rebuildable.
+    "api",               # stateless HTTP layer, start_method=spawn (re-imports from disk). Lets the api self-reload code (incl. this allowlist).
+    # REVERTED 2026-06-01 (§P1a): social_worker / expression_worker / cognitive_worker
+    # were added on a casual comment then removed — the 52-agent persistence audit
+    # (AUDIT_module_hot_reload_persistence_20260601.md) found their save handlers are
+    # NOT_READY (social=SocialPressureMemory noop_stub; expression=save_edge_detector_state
+    # never_wired dict-not-instances; cognitive=save_state-vs-save_all typo). Restarting
+    # them silently LOSES state — the exact instability this program fixes. They re-enter
+    # only after the P2 persistence fix lands + re-verification.
 }
 
 
