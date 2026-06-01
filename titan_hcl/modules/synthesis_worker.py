@@ -2285,7 +2285,14 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 # noisy publisher can't blow the LLM budget). On
                 # dreaming=False: log only — the pass running in the
                 # background must finish on its own.
-                dreaming = bool(payload.get("dreaming", False))
+                # The DREAM_STATE_CHANGED payload key is `is_dreaming` (set by
+                # dream_state_worker; life_force/observatory/timechain all read
+                # `is_dreaming`). This consumer read `dreaming` → ALWAYS False →
+                # the entire dream-boundary operator loop (ConsolidationPass ③,
+                # procedural miner + LLM judge ④, oracle companion flush W6,
+                # ForkGC) NEVER fired on any real dream. Root cause of "0 real
+                # concepts / 0 compiled skills". (2026-06-01)
+                dreaming = bool(payload.get("is_dreaming", False))
                 if dreaming:
                     dream_start_ts = float(
                         payload.get("ts", time.time())

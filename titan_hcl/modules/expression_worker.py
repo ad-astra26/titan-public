@@ -964,8 +964,10 @@ def expression_worker_main(recv_queue, send_queue, name: str,
         if hasattr(bus, "DREAM_STATE_CHANGED") and \
                 msg_type == bus.DREAM_STATE_CHANGED:
             try:
+                # Payload key is `is_dreaming` (dream_state_worker canonical) —
+                # `dreaming` was always False, so expression never saw dreams.
                 _dream_active = bool(
-                    (msg.get("payload", {}) or {}).get("dreaming", False))
+                    (msg.get("payload", {}) or {}).get("is_dreaming", False))
                 logger.info(
                     "[ExpressionWorker] DREAM_STATE_CHANGED: dreaming=%s",
                     _dream_active)
