@@ -146,6 +146,10 @@ def default_procedural_tool_call_reader(
             tool_id = _tool_id_from_tags(tags) or s.get("tool_id", "")
             out.append({
                 "tx_hash": s.get("hash") or s.get("tx_hash") or "",
+                # Top-level scored_by + ts: the CoverageAnalyzer reads these
+                # off the record root (oracle_coverage.analyze: tc.get("scored_by")).
+                "scored_by": scored_by,
+                "ts": block_ts,
                 "content": {
                     "tool_id": tool_id,
                     "args": s.get("args", {}),
