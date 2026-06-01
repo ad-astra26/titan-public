@@ -1488,33 +1488,6 @@ class RebirthBackup:
         from titan_hcl.logic.backup_crypto import build_encryption_context_from_config
         return build_encryption_context_from_config(self._full_config)
 
-    def _build_v3_encryptor(self):
-        """Mode-B encryptor for the v=3 event pipeline (RFP G2 / INV-MBR-13).
-
-        When `[backup].encryption_enabled` is true, returns a callable
-        (plaintext_tarball, component) → (ciphertext, iv_b64) that encrypts each
-        component tarball under a key derived from the soul keypair's master key —
-        the SAME key a wallet-only restore re-derives (from Shard-1+Shard-3) and
-        the arc[:16] backup_id. Mode-A → None (plaintext upload). Raises loudly on
-        init failure (no silent downgrade — an encrypted Titan must NOT ship
-        plaintext).
-        """
-        backup_cfg = (self._full_config or {}).get("backup", {}) or {}
-        if not backup_cfg.get("encryption_enabled", False):
-            return None
-        from titan_hcl.logic.backup_crypto import (
-            load_keypair_bytes, derive_master_key, encrypt_component_tarball,
-        )
-        net_cfg = (self._full_config or {}).get("network", {}) or {}
-        kp_path = net_cfg.get(
-            "wallet_keypair_path", "data/titan_identity_keypair.json")
-        kp_bytes, titan_pubkey = load_keypair_bytes(kp_path)
-        master = derive_master_key(kp_bytes, titan_pubkey)
-
-        def _encrypt(plaintext: bytes, component: str):
-            return encrypt_component_tarball(plaintext, master, component)
-        return _encrypt
-
     # -------------------------------------------------------------------------
     # Backup Records (local verification)
     # -------------------------------------------------------------------------
@@ -2059,7 +2032,6 @@ class RebirthBackup:
                     tier=comp["tier"], archive_hash=comp["arc"],
                     merkle_root=event_merkle_root, arweave_tx=comp["tx_id"],
                     mode=mode, prev_sig=prev_sig, url_key=url_key,
-                    iv_b64=comp.get("iv") if mode == "B" else None,
                 )
             except Exception as e:
                 logger.error("[Backup] v=3 memo build failed (%s): %s",
@@ -2446,7 +2418,6 @@ class RebirthBackup:
             soul_specs=s_specs, baseline_resolver=_baseline_resolver,
             arweave_uploader=_arweave_upload, zk_committer=_v3_chain_commit,
             bus_emit=_bus_emit, cleanup_scratch=False,
-            encryptor=self._build_v3_encryptor(),
         )
 
         try:
@@ -2626,7 +2597,7 @@ class RebirthBackup:
         result = await ship_staged_event(
             staged, manifest=manifest, arweave_uploader=_arweave_upload,
             zk_committer=_v3_chain_commit, bus_emit=_bus_emit,
-            cleanup_scratch=False, encryptor=self._build_v3_encryptor())
+            cleanup_scratch=False)
 
         try:
             if result.status == "stale_baseline":
