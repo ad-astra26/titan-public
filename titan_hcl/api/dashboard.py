@@ -4677,6 +4677,8 @@ _RESTART_MODULE_ALLOWLIST = {
     "knowledge",    # State in DB
     "emot_cgn",     # Has MODULE_SHUTDOWN handler + save_state (2026-04-23)
     "timechain",    # 2026-04-27 — needed for index.db corruption recovery; chain_*.bin are source of truth, index is rebuildable
+    "synthesis",    # 2026-06-01 — state in synthesis.duckdb/FAISS (rebuildable, survives); enables targeted restart for synthesis-engine operator-closure work (avoids full-kernel bounce). RESTART only (kill-then-spawn) — NOT reload (see below).
+    "agno_worker",  # 2026-06-01 — state in agno_sessions.db (survives); enables targeted restart for chat-path work. RESTART only.
 }
 
 
@@ -4797,7 +4799,12 @@ async def post_v4_restart_module(name: str, request: Request,
 # Modules safe to reload. Initially identical to _RESTART_MODULE_ALLOWLIST
 # — reload is strictly less disruptive than restart (NEW boots alongside
 # OLD, no downtime) so anything reload-safe is at least restart-safe.
-_RELOAD_MODULE_ALLOWLIST = set(_RESTART_MODULE_ALLOWLIST)
+# Reload (zero-downtime spawn-NEW→adopt→kill-OLD) is UNSAFE for `synthesis`
+# (G21 sole-writer — the overlap window would run two writers on synthesis.duckdb
+# /FAISS) and `agno_worker` (2× fastembed/OVG RSS spike during overlap). RESTART
+# (kill-then-spawn, no overlap) IS safe for both, so they're in the restart
+# allowlist above but EXCLUDED here. (2026-06-01)
+_RELOAD_MODULE_ALLOWLIST = set(_RESTART_MODULE_ALLOWLIST) - {"synthesis", "agno_worker"}
 
 
 async def post_v4_reload_module(name: str, request: Request):
