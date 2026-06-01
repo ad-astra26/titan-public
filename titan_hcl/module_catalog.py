@@ -1255,6 +1255,14 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         heartbeat_timeout=60.0,
         broadcast_topics=[
             _bus_constants.MEMORY_RETRIEVAL_USED,
+            # Operator-closure C1 (SPEC §25.9): per-TURN knowledge-moment signal
+            # from agno (post-LLM). synthesis_worker's SovereigntyRatioMeter
+            # records the per-turn denominator from this (not per-item).
+            _bus_constants.KNOWLEDGE_MOMENT,
+            # Operator-closure C2 (W7): chat-time self-oracle tool (coding_
+            # sandbox) ships its pre-computed verdict → OracleRouter companion
+            # buffer → dream-boundary OracleVerdictBatch flush (coverage).
+            _bus_constants.TOOL_CALL_VERDICT_RECORD,
             # Phase 2 D-P2-4: standing-contract maintenance event, single
             # consumer = synthesis_worker (sole writer of
             # association_bundles). Post-seal contract hook in

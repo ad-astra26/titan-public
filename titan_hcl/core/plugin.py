@@ -1044,20 +1044,10 @@ class TitanHCL:
                 # Off-load to executor — Guardian.restart_module() blocks
                 # in stop() + start() (worker SIGTERM + new spawn). Keep
                 # the asyncio loop free for concurrent admin requests.
-                _r = await asyncio.get_event_loop().run_in_executor(
+                result = await asyncio.get_event_loop().run_in_executor(
                     None, lambda: self.guardian.restart_module(
                         name=name, reason=reason,
                         start_method=start_method))
-                # guardian_hcl_client.restart_module() returns a bool; the API
-                # endpoint expects a dict payload (result_dict.get("ok") etc.).
-                # Normalize so the RESPONSE payload is always a dict (else the
-                # caller hits "'bool' object has no attribute 'get'").
-                result = _r if isinstance(_r, dict) else {
-                    "ok": bool(_r),
-                    "module": name,
-                    "process_alive": bool(_r),
-                    "start_method_used": start_method or "default",
-                }
             elif action == "start_module":
                 name = inner.get("name")
                 ok = await asyncio.get_event_loop().run_in_executor(

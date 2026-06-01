@@ -300,7 +300,6 @@ def _drive_evaluate_all(
     vocabulary_confidence: float = 1.0,
     developmental_age: int = 0,
     dream_state_gates_fire: bool = False,
-    consume_overlay: dict | None = None,
 ) -> dict:
     """Drive ExpressionManager.evaluate_all + Tier-1 SPEAK detection +
     per-fire bus emissions (EXPRESSION_FIRED + NS_REWARD + META_CGN_SIGNAL
@@ -321,29 +320,6 @@ def _drive_evaluate_all(
         # No hormone state yet — nothing to evaluate. evaluate_all would
         # short-circuit on zero hormones anyway; skip cleanly.
         return {"tier2_fired": tier2_fired, "speak_pending": speak_pending}
-
-    # Optimistic local depletion overlay (2026-06-01, Maker option 2): mirror
-    # the monolith's SYNCHRONOUS in-process consumption across the Phase C
-    # split. On fire we emit HORMONE_CONSUME to cognitive_worker (the
-    # authoritative NNS hormonal owner), but that round-trips bus→NNS→SHM and
-    # lands a few ticks later — long enough to re-fire a burst before the real
-    # depletion is visible. So we ALSO subtract the in-flight consumption
-    # locally and reconcile it against the NNS's actual SHM drops: the urge
-    # reflects the spend immediately, the agent doesn't re-fire while the real
-    # depletion is in transit, and there is NO clock — only Titan's own
-    # hormone levels (the NNS remains the single source of truth via SHM).
-    if consume_overlay is not None:
-        _consumed = consume_overlay.setdefault("consumed", {})
-        _prev_shm = consume_overlay.setdefault("prev_shm", {})
-        for _h, _lvl in hormone_levels.items():
-            _drop = _prev_shm.get(_h, _lvl) - _lvl   # NNS applied our consume
-            if _drop > 0.0 and _h in _consumed:
-                _consumed[_h] = max(0.0, _consumed[_h] - _drop)
-            _prev_shm[_h] = _lvl                     # track RAW shm
-        hormone_levels = {
-            _h: max(0.0, _lvl - _consumed.get(_h, 0.0))
-            for _h, _lvl in hormone_levels.items()
-        }
 
     if dream_state_gates_fire:
         # Dream state suppresses Tier-2 fires (matches the legacy gate
@@ -417,18 +393,6 @@ def _drive_evaluate_all(
                     "src": name,
                     "ts": time.time(),
                 })
-                # Optimistic local depletion (option 2): grow the overlay by
-                # the SAME proportional delta HormonalPressure.consume() will
-                # apply on the NNS, computed against the raw SHM level — so the
-                # local estimate matches the authoritative depletion and the
-                # SHM-drop reconciliation above cancels cleanly once it lands.
-                if consume_overlay is not None:
-                    _ov = consume_overlay.setdefault("consumed", {})
-                    _raw_shm = consume_overlay.get("prev_shm", {})
-                    for _h, _amt in _consumption.items():
-                        _raw = float(_raw_shm.get(_h, 0.0))
-                        _frac = min(1.0, float(_amt) / max(0.01, _raw + 0.1))
-                        _ov[_h] = _ov.get(_h, 0.0) + _raw * _frac
 
             # 2) NS_REWARD — cognitive_worker subscribes and calls
             #    record_outcome on its NeuralNervousSystem instance.
@@ -703,11 +667,6 @@ def expression_worker_main(recv_queue, send_queue, name: str,
     # === MODULE-SPECIFIC: 1Hz SHM publisher thread + 5s STATS notify +
     # 5s evaluate_all driver thread (live-verified necessary 2026-05-15 —
     # see _EVALUATE_ALL_INTERVAL_S rationale at the top of the file).
-    # Optimistic local-depletion overlay (option 2) — shared across BOTH
-    # evaluate paths (periodic timer + KERNEL_EPOCH_TICK) so in-flight
-    # expression consumption is reflected immediately and reconciled against
-    # the NNS's authoritative SHM drops. {"consumed": {h: amt}, "prev_shm": {…}}
-    _consume_overlay: dict = {}
     _periodic_stop = threading.Event()
 
     def _periodic_publish_loop():
@@ -736,7 +695,6 @@ def expression_worker_main(recv_queue, send_queue, name: str,
                         vocabulary_confidence=1.0,
                         developmental_age=_developmental_age,
                         dream_state_gates_fire=_dream_active,
-                        consume_overlay=_consume_overlay,
                     )
                     if result_p["speak_pending"]:
                         speak_comp_p = expression_manager.composites.get(
@@ -935,7 +893,6 @@ def expression_worker_main(recv_queue, send_queue, name: str,
                 vocabulary_confidence=1.0,
                 developmental_age=_developmental_age,
                 dream_state_gates_fire=_dream_active,
-                consume_overlay=_consume_overlay,
             )
 
             # SPEAK_REQUEST_PENDING — cognitive_worker subscribes and

@@ -4677,7 +4677,6 @@ _RESTART_MODULE_ALLOWLIST = {
     "knowledge",    # State in DB
     "emot_cgn",     # Has MODULE_SHUTDOWN handler + save_state (2026-04-23)
     "timechain",    # 2026-04-27 — needed for index.db corruption recovery; chain_*.bin are source of truth, index is rebuildable
-    "backup",       # 2026-06-01 — clean restart-isolated L2 module: MODULE_SHUTDOWN handler + state is on-disk manifest (rebuildable staged tarballs; ZK/Arweave clients re-init on boot). Enables restart-free single-module code deploys (restart-module backup?spawn=true) without a full-T1 restart.
 }
 
 
@@ -4755,11 +4754,7 @@ async def post_v4_restart_module(name: str, request: Request,
             return _error(f"guardian RPC failed: {e}")
         if reply is None:
             return _error("guardian RPC timeout (60s)")
-        # Defend against a non-dict payload (older parent that returned a bare
-        # bool from restart_module → "'bool' object has no attribute 'get'").
-        _payload = reply.get("payload") if isinstance(reply, dict) else None
-        result_dict = _payload if isinstance(_payload, dict) else {
-            "ok": bool(_payload), "process_alive": bool(_payload)}
+        result_dict = reply.get("payload", {}) if isinstance(reply, dict) else {}
 
         # The handler already did the post-restart liveness check; trust its values.
         result = {

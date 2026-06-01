@@ -792,42 +792,6 @@ def _build_semantic_graph_response(memory, name: str,
     }
 
 
-# rFP_bus_payload_contracts §3.1 (2026-05-31): every memory work-RPC reply
-# stays lean + bounded so it can never exceed the 16 MB bus frame ceiling
-# (_frame.py MAX_FRAME_SIZE). _MEMPOOL_WIRE_CAP bounds the otherwise-unbounded
-# mempool dumps; truncation is logged (no silent caps — feedback_observation).
-_MEMPOOL_WIRE_CAP = 500
-
-
-def _lean_memory_item(m: dict) -> dict:
-    """Whitelist the fields bus consumers actually read off a persistent
-    memory node (verified_context_builder / reflex_executor / dashboard).
-    Embeddings, neuromod_context, embedding_id + every other internal field
-    are dropped so a recall reply round-trips small (§3.1)."""
-    return {
-        "id": str(m.get("id", "")),
-        "user_prompt": str(m.get("user_prompt", "")),
-        "agent_response": str(m.get("agent_response", "")),
-        "effective_weight": float(m.get("effective_weight", 1.0) or 1.0),
-        "emotional_intensity": int(m.get("emotional_intensity", 0) or 0),
-        "reinforcement_count": int(m.get("reinforcement_count", 0) or 0),
-        "created_at": float(m.get("created_at", 0) or 0),
-        "status": str(m.get("status", "")),
-    }
-
-
-def _lean_mempool_item(m: dict) -> dict:
-    """Lean wire shape for a mempool node (mempool-specific weight fields)."""
-    return {
-        "id": str(m.get("id", "")),
-        "user_prompt": str(m.get("user_prompt", "")),
-        "agent_response": str(m.get("agent_response", "")),
-        "mempool_weight": float(m.get("mempool_weight", 1.0) or 1.0),
-        "mempool_reinforcements": int(m.get("mempool_reinforcements", 0) or 0),
-        "created_at": float(m.get("created_at", 0) or 0),
-    }
-
-
 def _handle_query(msg: dict, ctx: WorkerContext) -> None:
     """Dispatch QUERY to appropriate memory method and send response.
 
@@ -862,12 +826,7 @@ def _handle_query(msg: dict, ctx: WorkerContext) -> None:
                 )
                 if ctx.query_cache is not None:
                     ctx.query_cache.set(cache_key, results)
-            # §3.1: ship the lean whitelisted shape — query() may still merge
-            # raw _node_store dicts (full text + embeddings + internal fields);
-            # only the fields consumers read go on the wire.
-            lean = [_lean_memory_item(m) for m in (results or [])
-                    if isinstance(m, dict)]
-            _send_response(send_queue, name, src, {"results": lean}, rid)
+            _send_response(send_queue, name, src, {"results": results}, rid)
 
         # Phase B (rFP §3.4.1) §B6 — orphan `action == "add"` handler RETIRED.
         # The proxy's add_memory now publishes MEMORY_INGEST_REQUEST one-way
@@ -879,31 +838,16 @@ def _handle_query(msg: dict, ctx: WorkerContext) -> None:
             _send_response(send_queue, name, src, {"count": count}, rid)
 
         elif action == "fetch_mempool":
-            mempool = loop.run_until_complete(memory.fetch_mempool()) or []
+            mempool = loop.run_until_complete(memory.fetch_mempool())
             # Apply decay before sending so weights are current
             for node in mempool:
-                if isinstance(node, dict):
-                    memory._apply_mempool_decay(node)
-            # §3.1: bound + lean shape (was raw dicts, unbounded by count).
-            if len(mempool) > _MEMPOOL_WIRE_CAP:
-                logger.warning(
-                    "[MemoryWorker] fetch_mempool: %d nodes exceeds wire cap "
-                    "%d — truncating reply (heaviest by weight kept)",
-                    len(mempool), _MEMPOOL_WIRE_CAP)
-                mempool = sorted(
-                    mempool,
-                    key=lambda n: float(n.get("mempool_weight", 0) or 0)
-                    if isinstance(n, dict) else 0.0,
-                    reverse=True)[:_MEMPOOL_WIRE_CAP]
-            lean = [_lean_mempool_item(n) for n in mempool if isinstance(n, dict)]
-            _send_response(send_queue, name, src, {"mempool": lean}, rid)
+                memory._apply_mempool_decay(node)
+            _send_response(send_queue, name, src, {"mempool": mempool}, rid)
 
         elif action == "top_memories":
             n = payload.get("n", 5)
-            top = memory.get_top_memories(n=n) or []
-            # §3.1: lean shape (was raw _node_store dicts). Bounded by n.
-            lean = [_lean_memory_item(m) for m in top if isinstance(m, dict)]
-            _send_response(send_queue, name, src, {"memories": lean}, rid)
+            top = memory.get_top_memories(n=n)
+            _send_response(send_queue, name, src, {"memories": top}, rid)
 
         elif action == "top_memories_observatory":
             # rFP_bus_payload_contracts §3.1 — observatory-safe shape:
@@ -982,18 +926,19 @@ def _handle_query(msg: dict, ctx: WorkerContext) -> None:
             for node in full:
                 if isinstance(node, dict):
                     memory._apply_mempool_decay(node)
-            full = [m for m in full if isinstance(m, dict)]
-            # §3.1: bound count (lean shape already) — no silent caps.
-            if len(full) > _MEMPOOL_WIRE_CAP:
-                logger.warning(
-                    "[MemoryWorker] fetch_mempool_observatory: %d nodes exceeds "
-                    "wire cap %d — truncating reply (heaviest by weight kept)",
-                    len(full), _MEMPOOL_WIRE_CAP)
-                full = sorted(
-                    full,
-                    key=lambda n: float(n.get("mempool_weight", 0) or 0),
-                    reverse=True)[:_MEMPOOL_WIRE_CAP]
-            observatory_items = [_lean_mempool_item(m) for m in full]
+            observatory_items = []
+            for m in full:
+                if not isinstance(m, dict):
+                    continue
+                observatory_items.append({
+                    "id": str(m.get("id", "")),
+                    "user_prompt": str(m.get("user_prompt", "")),
+                    "agent_response": str(m.get("agent_response", "")),
+                    "mempool_weight": float(m.get("mempool_weight", 1.0) or 1.0),
+                    "mempool_reinforcements": int(
+                        m.get("mempool_reinforcements", 0) or 0),
+                    "created_at": float(m.get("created_at", 0) or 0),
+                })
             _send_response(send_queue, name, src,
                            {"mempool": observatory_items,
                             "count": len(observatory_items)}, rid)

@@ -376,7 +376,6 @@ async def run_unified_event(
     scratch_dir: Optional[str] = None,
     cleanup_scratch: bool = True,
     bus_emit: Optional[Callable[[str, dict], None]] = None,
-    force_event_type: Optional[str] = None,
 ) -> EventShipResult:
     """One meditation-event ship cycle.
 
@@ -407,16 +406,9 @@ async def run_unified_event(
         owns_scratch = True
 
     try:
-        # Decide event type via SPEC §24.2 first-wins logic — unless the
-        # caller forces it (controlled one-time ops, e.g. the soul-first
-        # baseline that must stay incremental on a month-boundary day so it
-        # doesn't redundantly re-baseline personality/timechain).
-        if force_event_type in ("baseline", "incremental"):
-            event_type = force_event_type
-            trigger = "forced" if event_type == "baseline" else None
-        else:
-            should_rebase, trigger = manifest.should_rebase()
-            event_type = "baseline" if should_rebase else "incremental"
+        # Decide event type via SPEC §24.2 first-wins logic
+        should_rebase, trigger = manifest.should_rebase()
+        event_type = "baseline" if should_rebase else "incremental"
         out.event_type = event_type
         out.baseline_trigger = trigger if event_type == "baseline" else None
 

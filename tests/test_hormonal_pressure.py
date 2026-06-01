@@ -32,41 +32,17 @@ class TestHormonalPressure:
         h.accumulate(stimulus=0.0, dt=1.0)
         assert h.level < 1.0
 
-    def test_consume_depletes_level_and_sets_emergent_refractory(self):
-        """consume() (2026-06-01) spends the hormone: proportional level
-        depletion PLUS an emergent refractory proportional to the fraction
-        spent, so an expressed drive subsides and rebuilds at the hormone's own
-        (refractory_decay/maturity-governed) pace — no clock."""
-        h = self._make(refractory_strength=0.8)
+    def test_consume_depletes_level_proportionally(self):
+        """consume() (2026-06-01 cross-process refractory restoration) depletes
+        the level using the monolith's proportional formula and never goes
+        below 0; refractory is untouched."""
+        h = self._make()
         h.level = 1.0
         h.refractory = 0.0
         delta = h.consume(0.5)
         assert 0.0 < h.level < 1.0          # depleted, not zeroed
         assert delta == pytest.approx(1.0 - h.level)
-        # refractory raised proportional to spent fraction (0.8 * frac), > 0,
-        # and it decays emergently via accumulate() (not a fixed interval).
-        frac = min(1.0, 0.5 / (1.0 + 0.1))
-        assert h.refractory == pytest.approx(0.8 * frac)
-
-    def test_consume_refractory_suppresses_reaccumulation(self):
-        """The emergent rest is real: a high refractory (as consume() sets)
-        damps accumulate()'s secretion vs a rested hormone — same level, same
-        stimulus, kept well below the chi capacity ceiling so the difference is
-        the refractory, not the cap."""
-        rested = self._make(decay_rate=0.0); rested.level = 0.1; rested.refractory = 0.0
-        spent = self._make(decay_rate=0.0); spent.level = 0.1; spent.refractory = 0.8
-        rested.accumulate(stimulus=0.1, dt=1.0)
-        spent.accumulate(stimulus=0.1, dt=1.0)
-        assert spent.level < rested.level   # refractory damped the rebuild
-
-    def test_consume_refractory_never_lowers_existing(self):
-        """consume() takes the MAX with existing refractory — never reduces an
-        already-suppressing rest."""
-        h = self._make(refractory_strength=0.2)
-        h.level = 1.0
-        h.refractory = 0.9
-        h.consume(0.1)                # would set a small refractory
-        assert h.refractory == 0.9    # existing higher refractory preserved
+        assert h.refractory == 0.0          # consume must NOT touch refractory
 
     def test_consume_zero_or_negative_is_noop(self):
         h = self._make()
