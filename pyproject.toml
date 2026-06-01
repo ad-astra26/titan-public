@@ -18,8 +18,11 @@ dependencies = [
     "duckdb>=1.0.0",                    # Unified metadata store (replaces SQLite memory_nodes.db)
     "faiss-cpu>=1.7.0",                 # FAISS vector index for semantic search
     "kuzu>=0.4.0",                      # Knowledge graph (Trinity-typed entities)
-    "fastembed>=0.3.0",                 # Lightweight embeddings (bge-small-en-v1.5)
-    "sentence-transformers>=4.0.0",     # Lightweight embeddings (all-MiniLM-L6-v2)
+    "llama-cpp-python>=0.3.0",          # Embedding runtime — bge-small-en-v1.5 GGUF (leak-free CPU, torch-free).
+                                        # Replaces fastembed/onnxruntime per RFP_embedding_runtime_llamacpp_migration.md.
+                                        # NOTE: installer adds --extra-index-url .../whl/cpu for the prebuilt CPU wheel.
+    "fastembed>=0.3.0",                 # Lightweight embeddings (bge-small-en-v1.5) — ⚠ DEPRECATED, removed at RFP P5
+    "sentence-transformers>=4.0.0",     # ⚠ BROKEN (torch/torchvision ABI) — slated for removal; see RFP §1
     "torch>=2.0.0",                     # RL backbone (IQL Actor/Critic/Value networks). NOTE:
                                         # the installer adds --extra-index-url .../whl/cpu so this
                                         # resolves to the light CPU wheel (no 5GB CUDA) on servers.
