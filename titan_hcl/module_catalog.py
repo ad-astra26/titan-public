@@ -1249,7 +1249,20 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         # `feedback_no_rss_band_aid_understand_root_cause` is satisfied
         # by the FU-3 + this measurement chain — each bump has a
         # documented accounted source.
-        rss_limit_mb=350,
+        #
+        # 2026-06-01: the v1.79.0 operator closure added the tx_hash FAISS spine
+        # — which loads **fastembed BAAI/bge-small-en-v1.5 (≈317MB measured)** +
+        # the SynthesisVectorStore + EngineRecall — into synthesis_worker, but
+        # the 350 cap was NOT raised. 262 (pre-closure steady) + 317 (fastembed)
+        # ≈ 580MB > 350 → synthesis faulted fleet-wide (`rss_387mb` on small-chain
+        # T3/T2; `rss_3522mb` on T1 where the cold-start backfill spikes on top).
+        # Bump 350 → 700 (≈580 accounted baseline + ~20% headroom). DOCUMENTED
+        # accounted source (fastembed is a real, required dependency of the
+        # closure) — same discipline as the FU-3 / Phase-4 bumps, NOT a band-aid
+        # (`feedback_no_rss_band_aid_understand_root_cause`). The separate T1
+        # big-chain backfill SPIKE is bounded at its source (tx-index per-tick
+        # max_blocks lowered, synthesis_worker), not by the limit.
+        rss_limit_mb=700,
         autostart=True,
         lazy=False,
         heartbeat_timeout=60.0,

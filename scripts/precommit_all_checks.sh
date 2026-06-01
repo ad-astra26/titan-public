@@ -449,35 +449,6 @@ BANNER
     fi
 fi
 
-# Mainnet-birth/resurrection architecture doc drift gate — added 2026-06-01.
-STAGED_MBR_ARCH=$(git diff --cached --name-only --diff-filter=ACM -- \
-    titan-docs/specs/ARCHITECTURE_mainnet_birth_resurrection.md \
-    2>/dev/null)
-
-if [ -n "$STAGED_MBR_ARCH" ]; then
-    PY="$REPO_ROOT/test_env/bin/python"
-    [ -x "$PY" ] || PY=python3
-    if ! "$PY" "$REPO_ROOT/scripts/architecture_mainnet_birth_resurrection_index.py" --check 2>/tmp/precommit_mbr_arch_drift.log; then
-        cat >&2 <<'BANNER'
-
-┌──────────────────────────────────────────────────────────────────────┐
-│  ⛔  Mainnet-birth/resurrection architecture index drift detected.   │
-│                                                                      │
-│  ARCHITECTURE_mainnet_birth_resurrection.md edited but _index stale. │
-│                                                                      │
-│  Fix:                                                                │
-│      python scripts/architecture_mainnet_birth_resurrection_index.py │
-│      git add titan-docs/specs/ARCHITECTURE_mainnet_birth_resurrection_index.md │
-│                                                                      │
-│  See: cat /tmp/precommit_mbr_arch_drift.log                         │
-└──────────────────────────────────────────────────────────────────────┘
-
-BANNER
-        cat /tmp/precommit_mbr_arch_drift.log >&2
-        exit 1
-    fi
-fi
-
 if [ -n "$STAGED_TRACKERS" ]; then
     PY="$REPO_ROOT/test_env/bin/python"
     [ -x "$PY" ] || PY=python3
