@@ -1831,6 +1831,41 @@ def create_pre_hook(plugin):
                 plugin.memory.add_research_topic(prompt_text[:200])
 
         _ph_stage("after_mode_dispatch")
+
+        # ── Tool backstop (PRE) — deterministic tool/oracle invocation ────
+        # The heavy narration context makes the LLM role-play tool execution
+        # instead of emitting real tool_calls. If this turn needs a tool, run
+        # it deterministically NOW (cheap regex gate → fast-model router →
+        # coding_sandbox ToolPlug) and inject the TRUE verdict so the LLM
+        # narrates a real result. Gated so pure-conversation turns pay nothing.
+        # (2026-06-01, Maker-greenlit — synthesis oracle coverage fix.)
+        plugin._current_tool_intent = {
+            "required": False, "executed": False, "tool_id": "coding_sandbox"}
+        try:
+            _tb_cfg = ((getattr(plugin, "_full_config", {}) or {})
+                       .get("synthesis", {}) or {}).get("tool_backstop", {}) or {}
+            if _tb_cfg.get("enabled", True) and _tb_cfg.get("prehook_force", True):
+                from titan_hcl.synthesis.tool_backstop import run_tool_backstop
+                _bs = await run_tool_backstop(
+                    plugin, prompt=prompt_text, phase="pre")
+                plugin._current_tool_intent = {
+                    "required": _bs.fired, "executed": _bs.executed,
+                    "tool_id": "coding_sandbox"}
+                if _bs.executed:
+                    injected += _bs.verdict_block()
+                    logger.info(
+                        "[PreHook] tool backstop ran coding_sandbox "
+                        "(success=%s) — TRUE verdict injected", _bs.success)
+            else:
+                # Pre-force off: still flag intent (cheap) so the PostHook backstops.
+                from titan_hcl.synthesis.tool_intent import detect_tool_intent
+                _it = detect_tool_intent(prompt_text)
+                plugin._current_tool_intent = {
+                    "required": _it.requires_tool, "executed": False,
+                    "tool_id": "coding_sandbox"}
+        except Exception as _tb_err:
+            logger.debug("[PreHook] tool backstop (pre) error (soft): %s", _tb_err)
+
         # Set the injected context on the agent (replace, not accumulate — prevents memory leak)
         if hasattr(agent, 'additional_context') and injected:
             agent.additional_context = injected
@@ -2044,6 +2079,44 @@ def create_post_hook(plugin):
                     logger.warning(
                         "[PostHook:P3] turn snapshot/tool-call extraction "
                         "failed (non-blocking): %s", _p3_err)
+
+                # ── Tool backstop (POST) — salvage a missed tool call ──────
+                # The PreHook flagged this turn as needing a tool, but the LLM
+                # narrated instead of calling it (no real tool_call) AND the
+                # PreHook pre-force didn't already run it. Execute deterministically
+                # now, anchor the verdict (→ oracle coverage), and append a
+                # corrective verdict block to the reply. (2026-06-01.)
+                try:
+                    _tb_intent = getattr(plugin, "_current_tool_intent", None) or {}
+                    _tb_cfg2 = ((getattr(plugin, "_full_config", {}) or {})
+                                .get("synthesis", {}) or {}).get(
+                                "tool_backstop", {}) or {}
+                    if (_tb_cfg2.get("enabled", True)
+                            and _tb_cfg2.get("posthook_backstop", True)
+                            and _tb_intent.get("required")
+                            and not _tb_intent.get("executed")
+                            and not _p3_tool_calls):
+                        from titan_hcl.synthesis.tool_backstop import (
+                            run_tool_backstop,
+                        )
+                        _bs_post = await run_tool_backstop(
+                            plugin, prompt=user_prompt,
+                            response=response_text, phase="post")
+                        if _bs_post.executed:
+                            response_text = (
+                                f"{response_text}\n\n"
+                                f"{_bs_post.verdict_block(corrective=True)}"
+                            ).strip()
+                            if hasattr(run_output, "content"):
+                                run_output.content = response_text
+                            logger.info(
+                                "[PostHook] tool backstop salvaged a missed "
+                                "tool call (success=%s)", _bs_post.success)
+                    _ph_stage("ovg_after_tool_backstop")
+                except Exception as _tbp_err:
+                    logger.debug(
+                        "[PostHook] tool backstop (post) error (soft): %s",
+                        _tbp_err)
 
                 # Phase 3 §7 NEW: topic-tag extraction (P3.C). Lives in
                 # llm_pipeline.topic_extractor; deterministic in-process
