@@ -42,6 +42,9 @@ git config merge.regen-architecture-api-family-index.driver "bash scripts/git_me
 git config merge.regen-architecture-trinity-index.name "Regenerate ARCHITECTURE_trinity_index.md from ARCHITECTURE_trinity.md"
 git config merge.regen-architecture-trinity-index.driver "bash scripts/git_merge_drivers/regen.sh %A %O %B ARCHITECTURE_trinity_index"
 
+git config merge.regen-architecture-backup-restore-index.name "Regenerate ARCHITECTURE_backup_restore_index.md from ARCHITECTURE_backup_restore.md"
+git config merge.regen-architecture-backup-restore-index.driver "bash scripts/git_merge_drivers/regen.sh %A %O %B ARCHITECTURE_backup_restore_index"
+
 # `union` driver is built-in to git; .gitattributes references it directly
 # (titan-docs/conversations/INDEX.md, sessions/meta_cgn_trajectory.tsv).
 

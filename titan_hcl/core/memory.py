@@ -448,7 +448,7 @@ class TieredMemoryGraph:
                     seen_ids.add(node["id"])
 
         # 3. Local keyword fallback for anything not found above
-        local_hits = self._local_keyword_search(prompt, top_k=top_k)
+        local_hits = self._local_keyword_search(prompt)
         for node in local_hits:
             if node["id"] not in seen_ids:
                 if node["status"] == "persistent":
@@ -512,28 +512,13 @@ class TieredMemoryGraph:
         scored.sort(key=lambda x: x[0], reverse=True)
         results = [node for _, node in scored[:limit]]
 
-        # Synthesis Engine Phase 1 (D-SPEC-123 / SPEC v1.56.0 §25):
-        # use-gated MEMORY_RETRIEVAL_USED emit per returned user-memory
-        # node (INV-Syn-5). Same `mem:<id>` namespace as _cognee_search
-        # so the same memory_node gets unified activation across both
-        # retrieval paths. Fire-and-forget; failures degrade silently.
-        if self._bus_emit is not None and results:
-            now = time.time()
-            for node in results:
-                nid = node.get("id")
-                if nid is None:
-                    continue
-                try:
-                    self._bus_emit("MEMORY_RETRIEVAL_USED", {
-                        "item_id": f"mem:{nid}",
-                        "ts": now,
-                        "used_by_llm": False,  # INV-Syn-23: surfaced, not yet cited
-                    })
-                except Exception as _emit_err:
-                    logger.debug(
-                        "[Memory] query_user_memories emit failed: %s",
-                        _emit_err)
-                    break
+        # Operator-closure C1 (W3b): the retrieval-time `used_by_llm=False`
+        # soft emit was DROPPED. Emitting a surfaced signal per RETRIEVED
+        # candidate (most of which are never injected/used) over-counted the
+        # surfaced set and is now redundant — the agno post-LLM CitedUseDetector
+        # emits MEMORY_RETRIEVAL_USED (both true/false) over the items ACTUALLY
+        # surfaced into the prompt (B3's _last_surfaced_items), which is the
+        # honest signal for the per-item reinforcement + per-turn sovereignty.
         return results
 
     async def _cognee_search(self, prompt: str, top_k: int = 10) -> list:
@@ -625,25 +610,11 @@ class TieredMemoryGraph:
                     w_r=self._synth_w_r,
                     w_p=self._synth_w_p,
                 )
-                # SURFACED emit (INV-Syn-23 strict gate, Phase 9): retrieval-time
-                # producers emit used_by_llm=False — the item was surfaced into
-                # context, not yet cited. The post-LLM CitedUseDetector (agno) is
-                # the SOLE emitter of used_by_llm=True. synthesis_worker only
-                # reinforces (record_access) on True; False = surfaced_count
-                # telemetry. Cheap fire-and-forget.
-                now = time.time()
-                for sc in scored:
-                    try:
-                        self._bus_emit("MEMORY_RETRIEVAL_USED", {
-                            "item_id": sc.candidate.item_id,
-                            "ts": now,
-                            "used_by_llm": False,
-                        })
-                    except Exception as emit_err:
-                        logger.debug(
-                            "[Memory] synthesis emit failed (degrading): %s",
-                            emit_err)
-                        break    # break the loop on first emit error
+                # Operator-closure C1 (W3b): the retrieval-time `used_by_llm=
+                # False` soft emit was DROPPED (it surfaced every re-ranked
+                # CANDIDATE, over-counting). The agno post-LLM CitedUseDetector
+                # over the ACTUALLY-injected items is the sole emitter now. The
+                # composite re-rank stays — it still orders the results.
                 results = [sc.candidate.payload for sc in scored]
             except Exception as synth_err:
                 logger.debug(
@@ -768,41 +739,29 @@ class TieredMemoryGraph:
                 return node
         return None
 
-    def _local_keyword_search(self, prompt: str, top_k: int = 10) -> List[Dict]:
-        """Fallback keyword search over local node store — bounded to top_k.
+    def _local_keyword_search(self, prompt: str) -> List[Dict]:
+        """Fallback keyword search over local node store."""
+        results = []
+        prompt_lower = prompt.lower()
+        prompt_words = set(prompt_lower.split())
 
-        2026-05-31 (rFP_bus_payload_contracts §3.1): previously UNBOUNDED —
-        it appended EVERY node sharing ≥1 meaningful word with the prompt.
-        For a common greeting this matched ~7,100 of ~7,700 nodes, and the
-        `query` work-RPC then shipped all of them (full text) as the reply →
-        a 19.7 MB bus frame that exceeded MAX_FRAME_SIZE (16 MB) → frame
-        dropped → recall silently returned nothing on the chat hot path.
-        FAISS (layer 1) and mempool (layer 2) already cap to top_k; this
-        fallback now does too — scored by meaningful-word overlap (desc) so
-        the strongest keyword matches survive the cap, not arbitrary
-        dict-iteration order.
-        """
-        prompt_words = set(prompt.lower().split())
-        stopwords = {"the", "a", "an", "is", "it", "in", "to", "and", "of",
-                     "for", "do", "you", "my"}
-        meaningful_prompt = prompt_words - stopwords
-        if not meaningful_prompt:
-            return []
-
-        scored: list[tuple[int, Dict]] = []
         for v in self._node_store.values():
             if v.get("type") != "MemoryNode":
                 continue
             if v.get("status") not in ("mempool", "persistent"):
                 continue
+
+            # Score by word overlap between prompt and stored content
             content = f"{v.get('user_prompt', '')} {v.get('agent_response', '')}".lower()
             content_words = set(content.split())
-            overlap = len(meaningful_prompt & content_words)
-            if overlap:
-                scored.append((overlap, v))
+            overlap = prompt_words & content_words
+            # Require at least one meaningful word match (skip stopwords)
+            stopwords = {"the", "a", "an", "is", "it", "in", "to", "and", "of", "for", "do", "you", "my"}
+            meaningful = overlap - stopwords
+            if meaningful:
+                results.append(v)
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [v for _, v in scored[:max(1, top_k)]]
+        return results
 
     # -------------------------------------------------------------------------
     # Mempool Operations (local-only, fast)
