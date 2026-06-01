@@ -198,8 +198,8 @@ standalone_mode = false
 
 [twitter_social]
 # --- Credentials ---
-# Provided by Maker — X account @iamtitanai
-user_name = "iamtitanai"
+# Your X/Twitter account handle (no @)
+user_name = "YOUR_X_HANDLE"
 email = "your@email.tld"
 password = ""  # keep your X password in config.toml only, NEVER in this example
 totp_secret = ""  # 2FA seed — keep in config.toml only, never example
@@ -419,7 +419,7 @@ x_art_copost_window = 1800
 # ── Social X Gateway v3 — single class, single DB, single API point ──
 [social_x]
 enabled = true                      # Master switch — DISABLED until v3 verified
-# Global limits (across ALL Titans on @iamtitanai account)
+# Global limits (across ALL Titans on YOUR X account)
 max_posts_per_hour = 4              # Global hourly cap (T1:2 + T2:1 + T3:1)
 max_posts_per_day = 30              # ~10 per Titan per day
 min_post_interval = 1800            # 30 min between any two posts (any Titan)
