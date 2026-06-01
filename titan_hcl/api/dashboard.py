@@ -4677,6 +4677,7 @@ _RESTART_MODULE_ALLOWLIST = {
     "knowledge",    # State in DB
     "emot_cgn",     # Has MODULE_SHUTDOWN handler + save_state (2026-04-23)
     "timechain",    # 2026-04-27 — needed for index.db corruption recovery; chain_*.bin are source of truth, index is rebuildable
+    "backup",       # 2026-06-01 — clean restart-isolated L2 module: MODULE_SHUTDOWN handler + state is on-disk manifest (rebuildable staged tarballs; ZK/Arweave clients re-init on boot). Enables restart-free single-module code deploys (restart-module backup?spawn=true) without a full-T1 restart.
 }
 
 
