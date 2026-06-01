@@ -18,15 +18,19 @@ dependencies = [
     "duckdb>=1.0.0",                    # Unified metadata store (replaces SQLite memory_nodes.db)
     "faiss-cpu>=1.7.0",                 # FAISS vector index for semantic search
     "kuzu>=0.4.0",                      # Knowledge graph (Trinity-typed entities)
-    "fastembed>=0.3.0",                 # Lightweight embeddings (bge-small-en-v1.5)
-    "sentence-transformers>=4.0.0",     # Lightweight embeddings (all-MiniLM-L6-v2)
+    "llama-cpp-python>=0.3.0",          # Sole embedding runtime — bge-small-en-v1.5 GGUF (leak-free CPU, torch-free).
+                                        # Replaced fastembed/onnxruntime (unbounded CPU arena → RSS leak) AND the
+                                        # broken sentence-transformers (torch/torchvision ABI) per
+                                        # RFP_embedding_runtime_llamacpp_migration.md (P5). 384-d vectors, cosine
+                                        # 1.0000 vs fastembed; same SPEC-anchored model (§3J.1).
+                                        # NOTE: installer adds --extra-index-url .../whl/cpu for the prebuilt CPU wheel.
     "torch>=2.0.0",                     # RL backbone (IQL Actor/Critic/Value networks). NOTE:
                                         # the installer adds --extra-index-url .../whl/cpu so this
                                         # resolves to the light CPU wheel (no 5GB CUDA) on servers.
     "tensordict>=0.4.0",               # TorchRL data structures
     "torchrl>=0.4.0",                  # Offline RL (ReplayBuffer, IQLLoss)
     "numpy>=1.26.0",                   # Pervasive (tensors, trinity vectors) — directly imported ~90×
-    "scipy>=1.11.0",                   # Cognition math (also transitive via sentence-transformers)
+    "scipy>=1.11.0",                   # Cognition math (clustering / consolidation analytics)
     "scikit-learn>=1.3.0",            # Clustering / meta-cognition analytics
 
     # Cognitive / Agent runtime

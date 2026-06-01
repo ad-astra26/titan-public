@@ -256,34 +256,23 @@ class TitanVectorIndex:
             logger.info("[VectorIndex] Created new empty index (dim=%d)", self._dim)
 
     def _ensure_model(self):
-        """Lazy-load Fastembed model on first use."""
+        """Lazy-bind the fleet-standard llama.cpp embedder singleton on first use
+        (Phase 13 §3J.1 — shared bge-small, torch-free)."""
         if self._model is not None:
             return
-        from fastembed import TextEmbedding
-        self._model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
-        logger.info("[VectorIndex] Fastembed model loaded (lazy)")
+        from titan_hcl.utils.text_embedder import get_text_embedder
+        self._model = get_text_embedder()
+        logger.info("[VectorIndex] llama.cpp embedder bound (lazy)")
 
     def embed(self, text: str) -> np.ndarray:
-        """Embed text to 384D normalized vector."""
+        """Embed text to 384D normalized vector (singleton normalizes already)."""
         self._ensure_model()
-        embeddings = list(self._model.embed([text]))
-        vec = np.array(embeddings[0], dtype=np.float32)
-        # Normalize for cosine similarity via inner product
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec /= norm
-        return vec
+        return np.asarray(self._model.encode(text), dtype=np.float32)
 
     def embed_batch(self, texts: List[str]) -> np.ndarray:
-        """Embed multiple texts at once for efficiency."""
+        """Embed multiple texts at once (singleton normalizes each row already)."""
         self._ensure_model()
-        embeddings = list(self._model.embed(texts))
-        vecs = np.array(embeddings, dtype=np.float32)
-        # Normalize each row
-        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-        norms[norms == 0] = 1
-        vecs /= norms
-        return vecs
+        return np.asarray(self._model.encode(texts), dtype=np.float32)
 
     def add(self, embedding: np.ndarray, node_id: int):
         """Add a single vector to the index."""

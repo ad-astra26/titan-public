@@ -30,7 +30,6 @@ ARC = "0d00d59ba8dc495796992d0155f4667130b0d8e3da0836447b84e94dab378e33"
 MRKL = "d841b3444ec9d5aa1a2ae2b54dd2c68cece909a285eb875aa97cebcf02fe0e68"
 EVENT_ID = "560d18cfb8634f5180cb12e635cdbe21"
 SEED = bytes(range(32))  # deterministic 32-byte Ed25519 seed
-IV_B64 = "q83vEjRWeJC2yJ3k"  # 16 b64 chars = a 12-byte AES-GCM IV (Mode-B only)
 
 
 # ── key derivation ───────────────────────────────────────────────────────────
@@ -116,16 +115,14 @@ def test_v3_memo_roundtrip_mode_b_incremental_byte_identical_url():
     memo = v3.build_v3_memo(
         event_id=EVENT_ID, ts=1748000001, event_type="incremental", tier="TC",
         archive_hash=ARC, merkle_root=MRKL, arweave_tx=TX_TIMECHAIN,
-        mode="B", prev_sig="5xPrevSig9aBcDeFgHiJkLmNoP", iv_b64=IV_B64,
+        mode="B", prev_sig="5xPrevSig9aBcDeFgHiJkLmNoP",
     )
     assert ";typ=I;" in memo
-    assert f";iv={IV_B64};" in memo
     parsed = v3.parse_v3_memo(memo)
     assert parsed["type"] == "incremental"
     assert parsed["mode"] == "B"
-    assert parsed["iv"] == IV_B64
     assert parsed["url"] == "raw:" + TX_TIMECHAIN
-    # Mode B needs no key to resolve the URL, and is byte-identical.
+    # Mode B needs no key to resolve, and is byte-identical.
     assert v3.read_url(parsed) == TX_TIMECHAIN
 
 
@@ -133,7 +130,7 @@ def test_prev_sig_truncated_to_16():
     memo = v3.build_v3_memo(
         event_id=EVENT_ID, ts=1, event_type="baseline", tier="SL",
         archive_hash=ARC, merkle_root=MRKL, arweave_tx=TX_DAY1, mode="B",
-        prev_sig="A" * 88, iv_b64=IV_B64,  # full base58 sig length
+        prev_sig="A" * 88,  # full base58 sig length
     )
     parsed = v3.parse_v3_memo(memo)
     assert parsed["prev"] == "A" * 16
@@ -143,7 +140,7 @@ def test_genesis_day1_anchor_parses():
     memo = v3.build_v3_memo(
         event_id="genesis-day1", ts=1744000140, event_type="baseline", tier="PT",
         archive_hash=ARC, merkle_root=MRKL, arweave_tx=TX_DAY1,
-        mode="B", prev_sig=None, iv_b64=IV_B64,
+        mode="B", prev_sig=None,
     )
     parsed = v3.parse_v3_memo(memo)
     assert parsed["prev"] == "genesis"
@@ -159,7 +156,7 @@ def test_mixed_mode_chain_decodable():
                          prev_sig=None, url_key=key)
     b = v3.build_v3_memo(event_id="e2", ts=2, event_type="incremental", tier="TC",
                          archive_hash=ARC, merkle_root=MRKL,
-                         arweave_tx=TX_TIMECHAIN, mode="B", iv_b64=IV_B64,
+                         arweave_tx=TX_TIMECHAIN, mode="B",
                          prev_sig="2bQ9xKpAemvntdef")  # valid base58 (no O/0/I/l)
     pa, pb = v3.parse_v3_memo(a), v3.parse_v3_memo(b)
     assert pa["mode"] == "A" and pb["mode"] == "B"

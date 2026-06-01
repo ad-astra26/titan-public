@@ -1262,6 +1262,15 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         # (`feedback_no_rss_band_aid_understand_root_cause`). The separate T1
         # big-chain backfill SPIKE is bounded at its source (tx-index per-tick
         # max_blocks lowered, synthesis_worker), not by the limit.
+        #
+        # 2026-06-01 (embedding-runtime migration §3J.1): fastembed/onnxruntime →
+        # llama-cpp-python. The ~317 MB fastembed model + its unbounded ONNX CPU
+        # arena (the real root cause of the T1 rss_3522mb spike — the arena never
+        # returns memory to the OS) are GONE; llama.cpp bge-small is flat ~197 MB.
+        # The 700 cap is now a comfortable ceiling (262 baseline + ~197 ≈ 459 MB),
+        # NOT a leak accommodation. Re-grounded against the migration P6 RSS soak
+        # (real resident measurement) before any further change — kept at 700 as a
+        # safe ceiling meanwhile (llama.cpp is flat, so headroom carries no risk).
         rss_limit_mb=700,
         autostart=True,
         lazy=False,
