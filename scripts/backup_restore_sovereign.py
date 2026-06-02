@@ -141,6 +141,7 @@ async def resurrect_from_chain(
     arc_to_target: ArcToTarget,
     scratch_dir: str,
     nft_genesis_ok: Optional[Callable[[], Awaitable[bool]]] = None,
+    arweave_fetch_to_file: Optional[Callable[[str, str], Awaitable[bool]]] = None,
     verbose: bool = True,
 ) -> ResurrectionResult:
     """Reconstruct a Titan's data/ from the on-chain v=3 backup chain alone.
@@ -305,84 +306,130 @@ async def resurrect_from_chain(
                 f"have {sorted(comps)}")
             return out
 
-        component_bytes: dict = {}
+        # STREAMING restore (no whole-tarball-in-RAM): fetch each component tarball
+        # to a temp file on disk, verify + unpack from the PATH. A sovereign restore
+        # pulls multi-hundred-MB component tarballs; holding them (+ their decompressed
+        # form) in memory OOMs a small box (T1: 537MB soul + 403MB personality → 4.68GB
+        # peak, 2026-06-02). component_paths carries paths, not bytes.
+        component_paths: dict = {}
         component_sha: dict = {}
-        for comp_name, meta in comps.items():
+        fetch_tmp = os.path.join(scratch_dir, ".fetch_tmp")
+        os.makedirs(fetch_tmp, exist_ok=True)
+        try:
+            for comp_name, meta in comps.items():
+                comp_file = os.path.join(fetch_tmp, f"{evt_short}_{comp_name}.tar")
+                # ── fetch to DISK (constant memory if the streaming seam is wired) ──
+                if arweave_fetch_to_file is not None:
+                    try:
+                        ok = await arweave_fetch_to_file(meta["tx_id"], comp_file)
+                    except Exception as e:
+                        out.status = "halted"
+                        out.halt_reason = "arweave_fetch_failed"
+                        out.errors.append(f"event {evt_short} {comp_name}: {e}")
+                        return out
+                    if not ok:
+                        out.status = "halted"
+                        out.halt_reason = "arweave_fetch_failed"
+                        out.errors.append(
+                            f"event {evt_short} {comp_name}: Arweave tx "
+                            f"{str(meta['tx_id'])[:16]}… returned no data (all gateways non-200)")
+                        return out
+                else:
+                    # bytes seam (tests / no streaming fetcher) — persist to disk and
+                    # drop the in-memory copy immediately (one component, not the event).
+                    try:
+                        data = await arweave_fetch(meta["tx_id"])
+                    except Exception as e:
+                        out.status = "halted"
+                        out.halt_reason = "arweave_fetch_failed"
+                        out.errors.append(f"event {evt_short} {comp_name}: {e}")
+                        return out
+                    if not data:
+                        out.status = "halted"
+                        out.halt_reason = "arweave_fetch_failed"
+                        out.errors.append(
+                            f"event {evt_short} {comp_name}: Arweave tx "
+                            f"{str(meta['tx_id'])[:16]}… returned no data (all gateways non-200)")
+                        return out
+                    with open(comp_file, "wb") as _fh:
+                        _fh.write(data)
+                    del data
+                # ── Mode-B: decrypt the on-disk ciphertext. GCM is whole-buffer, so a
+                # single component is loaded for decrypt — bounded (one component,
+                # never the whole event). Mode-A skips (plaintext on disk already).
+                if meta["mode"] == "B":
+                    if not meta.get("iv"):
+                        out.status = "halted"
+                        out.halt_reason = HALT_MODE_B_UNSUPPORTED
+                        out.errors.append(
+                            f"event {evt_short} {comp_name}: Mode-B memo has no iv — "
+                            "cannot derive the decryption key (pre-G2 memo?).")
+                        return out
+                    if master_key is None:
+                        master_key = derive_master_key(keypair_bytes, titan_pubkey)
+                    try:
+                        with open(comp_file, "rb") as _fh:
+                            enc = _fh.read()
+                        dec = decrypt_component_tarball(
+                            enc, meta["iv"], master_key, comp_name, meta["arc"])
+                        del enc
+                        with open(comp_file, "wb") as _fh:
+                            _fh.write(dec)
+                        del dec
+                    except Exception as e:
+                        out.status = "halted"
+                        out.halt_reason = HALT_MODE_B_DECRYPT_FAILED
+                        out.errors.append(
+                            f"event {evt_short} {comp_name}: Mode-B decrypt failed "
+                            f"({e}) — wrong key / tampered ciphertext.")
+                        return out
+                # ── sha256 over the on-disk tarball (streaming, constant memory) ──
+                _h = hashlib.sha256()
+                with open(comp_file, "rb") as _fh:
+                    for _chunk in iter(lambda: _fh.read(1 << 20), b""):
+                        _h.update(_chunk)
+                sha = _h.hexdigest()
+                if sha[:32] != meta["arc"]:
+                    out.status = "halted"
+                    out.halt_reason = HALT_ARC_MISMATCH
+                    out.errors.append(
+                        f"event {evt_short} {comp_name}: sha256[:32]={sha[:32]} "
+                        f"≠ memo arc={meta['arc']} (tamper / wrong tarball)")
+                    return out
+                component_paths[comp_name] = comp_file
+                component_sha[comp_name] = sha
+
+            # Event-level Merkle integrity: recompose root from component sha256s.
+            recomposed = compute_event_merkle_root(
+                personality_merkle_root=component_sha["personality"],
+                timechain_merkle_root=component_sha["timechain"],
+                soul_merkle_root=component_sha.get("soul"),
+            )
+            if recomposed[:32] != ev["mrkl"]:
+                out.status = "halted"
+                out.halt_reason = HALT_EVENT_MERKLE_MISMATCH
+                out.errors.append(
+                    f"event {evt_short}: recomposed event_merkle_root[:32]="
+                    f"{recomposed[:32]} ≠ memo mrkl={ev['mrkl']}")
+                return out
+
+            # Apply from the on-disk tarball PATHS — unpack_event_tarball(str) streams
+            # member-by-member from disk (no full decompression held in memory).
             try:
-                data = await arweave_fetch(meta["tx_id"])
+                apply_event_components(component_paths, scratch_dir, arc_to_target)
             except Exception as e:
                 out.status = "halted"
-                out.halt_reason = "arweave_fetch_failed"
-                out.errors.append(f"event {evt_short} {comp_name}: {e}")
+                out.halt_reason = HALT_APPLY_FAILED
+                out.errors.append(f"event {evt_short} apply failed: {e}")
                 return out
-            if not data:                 # gateway non-200 across retries → None/empty
-                out.status = "halted"
-                out.halt_reason = "arweave_fetch_failed"
-                out.errors.append(
-                    f"event {evt_short} {comp_name}: Arweave tx "
-                    f"{str(meta['tx_id'])[:16]}… returned no data (all gateways non-200)")
-                return out
-            # Mode-B: the Arweave bytes are ENCRYPTED. Decrypt with the per-backup
-            # key re-derived from the reconstructed soul keypair (master key) + the
-            # arc[:16] backup_id + the on-chain iv, BEFORE the sha256==arc check
-            # (arc is over the plaintext tarball; GCM also authenticates the bytes).
-            if meta["mode"] == "B":
-                if not meta.get("iv"):
-                    out.status = "halted"
-                    out.halt_reason = HALT_MODE_B_UNSUPPORTED
-                    out.errors.append(
-                        f"event {evt_short} {comp_name}: Mode-B memo has no iv — "
-                        "cannot derive the decryption key (pre-G2 memo?).")
-                    return out
-                if master_key is None:
-                    master_key = derive_master_key(keypair_bytes, titan_pubkey)
-                try:
-                    data = decrypt_component_tarball(
-                        data, meta["iv"], master_key, comp_name, meta["arc"])
-                except Exception as e:
-                    out.status = "halted"
-                    out.halt_reason = HALT_MODE_B_DECRYPT_FAILED
-                    out.errors.append(
-                        f"event {evt_short} {comp_name}: Mode-B decrypt failed "
-                        f"({e}) — wrong key / tampered ciphertext.")
-                    return out
-            sha = hashlib.sha256(data).hexdigest()
-            if sha[:32] != meta["arc"]:
-                out.status = "halted"
-                out.halt_reason = HALT_ARC_MISMATCH
-                out.errors.append(
-                    f"event {evt_short} {comp_name}: sha256[:32]={sha[:32]} "
-                    f"≠ memo arc={meta['arc']} (tamper / wrong tarball)")
-                return out
-            component_bytes[comp_name] = data
-            component_sha[comp_name] = sha
-
-        # Event-level Merkle integrity: recompose root from component sha256s.
-        recomposed = compute_event_merkle_root(
-            personality_merkle_root=component_sha["personality"],
-            timechain_merkle_root=component_sha["timechain"],
-            soul_merkle_root=component_sha.get("soul"),
-        )
-        if recomposed[:32] != ev["mrkl"]:
-            out.status = "halted"
-            out.halt_reason = HALT_EVENT_MERKLE_MISMATCH
-            out.errors.append(
-                f"event {evt_short}: recomposed event_merkle_root[:32]="
-                f"{recomposed[:32]} ≠ memo mrkl={ev['mrkl']}")
-            return out
-
-        try:
-            apply_event_components(component_bytes, scratch_dir, arc_to_target)
-        except Exception as e:
-            out.status = "halted"
-            out.halt_reason = HALT_APPLY_FAILED
-            out.errors.append(f"event {evt_short} apply failed: {e}")
-            return out
+        finally:
+            import shutil
+            shutil.rmtree(fetch_tmp, ignore_errors=True)
 
         out.events_applied += 1
-        out.components_applied += len(component_bytes)
+        out.components_applied += len(component_paths)
         log(f"[{idx + 1}/{len(apply_list)}] event {evt_short} ({ev.get('type')}) "
-            f"applied ({', '.join(sorted(component_bytes))})")
+            f"applied ({', '.join(sorted(component_paths))})")
 
     out.status = "resurrected"
     log(f"✓ Resurrection complete — {out.events_applied} events, "
@@ -449,6 +496,9 @@ def restore_body_from_chain(
     async def _arweave_fetch(tx_id: str) -> bytes:
         return await store.fetch(tx_id)
 
+    async def _arweave_fetch_to_file(tx_id: str, dest_path: str) -> bool:
+        return await store.fetch_to_file(tx_id, dest_path)
+
     result = asyncio.run(resurrect_from_chain(
         titan_id=titan_id, keypair_bytes=key_bytes, titan_pubkey=titan_pubkey,
         sig_lister=_sig_lister, memo_fetcher=_memo_fetcher,
@@ -458,6 +508,9 @@ def restore_body_from_chain(
         # no-chain-baseline anchor (e.g. T1). Reuses the chain-walk rpc_url as DAS.
         nft_genesis_ok=(lambda: _nft_genesis_recoverable(titan_pubkey, rpc_url))
         if rpc_url else None,
+        # Streaming fetch-to-disk — constant memory for multi-hundred-MB tarballs
+        # (the bytes seam above is the test/fallback path).
+        arweave_fetch_to_file=_arweave_fetch_to_file,
         verbose=verbose))
 
     if result.status == "resurrected" and commit:

@@ -37,7 +37,18 @@ IRYS_DEVNET_URL = "https://devnet.irys.xyz"  # For devnet testing
 # (transient 5xx / Cloudflare 52x / rate limits), so `fetch` tries them in order
 # with retry-with-backoff before giving up.
 ARWEAVE_GATEWAY = "https://arweave.net"
-_ARWEAVE_GATEWAYS = [ARWEAVE_GATEWAY, "https://ar-io.net", "https://permagate.io"]
+# Gateway order matters: Titans UPLOAD their backup tarballs via Irys
+# (scripts/irys_upload.js), so the Irys gateway is the canonical, most-reliable
+# retrieval host (it serves the bundle the moment it's posted; arweave.net can be
+# minutes-to-hours behind finalizing the bundle to base layer, and intermittently
+# 5xx/Cloudflare-52x's — e.g. 572 on a T1 restore 2026-06-02). Arweave is immutable,
+# so the DATA is never gone; a fetch "miss" is always a flaky-gateway problem —
+# hence Irys first, then base-layer gateways as fallbacks.
+_ARWEAVE_GATEWAYS = [
+    "https://gateway.irys.xyz",
+    ARWEAVE_GATEWAY,
+    "https://permagate.io",
+]
 
 
 class ArweaveStore:
@@ -422,6 +433,48 @@ class ArweaveStore:
         logger.error("[ArweaveStore] Fetch %s FAILED across all gateways %s",
                      tx_id[:16], _ARWEAVE_GATEWAYS)
         return None
+
+    async def fetch_to_file(self, tx_id: str, dest_path: str) -> bool:
+        """STREAM a tarball from Arweave to `dest_path` in fixed-size chunks —
+        constant memory regardless of tarball size (a sovereign restore fetches
+        multi-hundred-MB component tarballs; loading them whole OOMs a small box).
+        Same multi-gateway + retry-with-backoff policy as `fetch`. Returns True on
+        success (file fully written), False otherwise."""
+        import asyncio
+        import httpx
+
+        if tx_id.startswith("devnet_"):
+            local_path = Path("data/arweave_devnet") / f"{tx_id}.data"
+            if local_path.exists():
+                import shutil
+                shutil.copyfile(local_path, dest_path)
+                return True
+            return False
+
+        for gw in _ARWEAVE_GATEWAYS:
+            for attempt in range(3):
+                try:
+                    async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
+                        async with client.stream("GET", f"{gw}/{tx_id}") as resp:
+                            if resp.status_code == 200:
+                                with open(dest_path, "wb") as fh:
+                                    async for chunk in resp.aiter_bytes(1 << 20):  # 1 MiB
+                                        fh.write(chunk)
+                                return True
+                            if resp.status_code == 429 or resp.status_code >= 500:
+                                logger.warning("[ArweaveStore] stream %s/%s… HTTP %d (attempt %d) — retrying",
+                                               gw, tx_id[:12], resp.status_code, attempt + 1)
+                                await asyncio.sleep(min(8.0, 0.5 * (2 ** attempt)))
+                                continue
+                            logger.warning("[ArweaveStore] stream %s/%s… HTTP %d — next gateway",
+                                           gw, tx_id[:12], resp.status_code)
+                            break
+                except Exception as e:
+                    logger.warning("[ArweaveStore] %s stream error: %s — retry/next", gw, e)
+                    await asyncio.sleep(min(8.0, 0.5 * (2 ** attempt)))
+        logger.error("[ArweaveStore] Stream-fetch %s FAILED across all gateways %s",
+                     tx_id[:16], _ARWEAVE_GATEWAYS)
+        return False
 
     async def fetch_json(self, tx_id: str) -> Optional[dict]:
         """Fetch and parse JSON from Arweave."""
