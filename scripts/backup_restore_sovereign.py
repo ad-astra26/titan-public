@@ -370,8 +370,14 @@ async def resurrect_from_chain(
 
             # Apply from the on-disk tarball PATHS — unpack_event_tarball(str) streams
             # member-by-member from disk (no full decompression held in memory).
+            # verify_patch_hash=False: each component tarball was ALREADY verified
+            # against its on-chain arc (sha256[:32]==arc) above, which authenticates
+            # every member byte (INV-MBR-4/12). The per-file patch_bytes_sha256 is
+            # then redundant — and STALE for pre-2026-05-31 baselines (the live-log
+            # pack race fixed in ed5f4d0c), so a mismatch is logged, not fatal.
             try:
-                apply_event_components(component_paths, scratch_dir, arc_to_target)
+                apply_event_components(component_paths, scratch_dir, arc_to_target,
+                                       verify_patch_hash=False)
             except Exception as e:
                 out.status = "halted"
                 out.halt_reason = HALT_APPLY_FAILED

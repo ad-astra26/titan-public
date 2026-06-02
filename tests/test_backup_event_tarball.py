@@ -94,6 +94,30 @@ def test_pack_creates_zstd_tar_with_metadata(tmp_path):
         assert "titan_identity.json" in arc_names
 
 
+def test_get_patch_bytes_verify_hash_advisory(tmp_path):
+    """A stale per-file patch_bytes_sha256 (pre-ed5f4d0c pack race) HARD-RAISES
+    under verify_hash=True (default) but is DOWNGRADED to advisory under
+    verify_hash=False — for an arc-already-on-chain-verified caller (the sovereign
+    restore). The bytes are still returned intact."""
+    out = tmp_path / f"event{EVENT_TARBALL_EXT}"
+    pack_event_tarball(
+        event_id="evt_adv", event_type="baseline", component="personality",
+        file_specs=[FileDiffSpec("neural_ns/reward_log.jsonl",
+                                 _full_diff_dict(b'{"r":1}\n{"r":2}\n'))],
+        output_path=str(out),
+    )
+    with unpack_event_tarball(str(out)) as ev:
+        arc = "neural_ns/reward_log.jsonl"
+        good = ev.get_patch_bytes(arc)                     # baseline: matches
+        # Simulate the pre-fix stale hash: corrupt the recorded per-file sha256.
+        meta = next(f for f in ev.files if f["arc_name"] == arc)
+        meta["patch_bytes_sha256"] = "00" * 32
+        with pytest.raises(ValueError, match="patch_bytes sha256 mismatch"):
+            ev.get_patch_bytes(arc, verify_hash=True)
+        # Advisory: returns the (unchanged, authentic) bytes, no raise.
+        assert ev.get_patch_bytes(arc, verify_hash=False) == good
+
+
 def test_pack_validates_event_type():
     with pytest.raises(ValueError, match="event_type"):
         pack_event_tarball(

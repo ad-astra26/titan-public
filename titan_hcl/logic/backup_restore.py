@@ -348,6 +348,7 @@ def apply_event_components(
     target_dir: str,
     arc_to_target: Callable[[str, str], str],
     arweave_fetch_skipped_sync: Optional[Callable[[str], bytes]] = None,
+    verify_patch_hash: bool = True,
 ) -> dict:
     """Unpack each component tarball and apply per-file diffs into target_dir.
 
@@ -363,6 +364,10 @@ def apply_event_components(
             it because the baseline always contains the full file; skipped
             files in incrementals just mean "unchanged since last event",
             so we leave the target_dir state untouched for that arc_name.
+        verify_patch_hash: when False, a per-file patch_bytes_sha256 mismatch is
+            logged (advisory) instead of raising — safe ONLY for a caller that
+            has already authenticated each tarball against its on-chain arc
+            (the sovereign restore, INV-MBR-4/12). Default True (strict).
 
     Returns dict with {restored_files: int, errors: list[str], warnings:
     list[str]}.
@@ -385,7 +390,8 @@ def apply_event_components(
                     continue
 
                 # Reconstruct the diff_dict (Phase 3 encoders consume it)
-                diff_dict = unpacked.diff_dict_for(arc_name)
+                diff_dict = unpacked.diff_dict_for(
+                    arc_name, verify_hash=verify_patch_hash)
 
                 # Baseline path for tail / incremental diffs is the
                 # CURRENT contents of target_path (the prior event's

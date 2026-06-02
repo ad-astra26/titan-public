@@ -373,13 +373,26 @@ class UnpackedEvent:
                 pass
             self._temp_decompressed_path = None
 
-    def get_patch_bytes(self, arc_name: str) -> bytes:
+    def get_patch_bytes(self, arc_name: str, verify_hash: bool = True) -> bytes:
         """Return the raw patch_bytes for one file in this event tarball.
 
         Verifies the bytes' sha256 matches `patch_bytes_sha256` recorded
         at pack time. Mismatch raises ValueError — tarball corruption
         between pack and unpack (rare on Arweave but possible with
         gateway-rewriting proxies).
+
+        `verify_hash=False` downgrades a per-file mismatch to a logged WARNING
+        and returns the bytes anyway. This is ONLY safe when the WHOLE tarball
+        has already been authenticated against its on-chain arc
+        (`sha256(tarball)[:32]==arc`, the v=3 memo, INV-MBR-4/12): once the arc
+        matches, every member byte is provably what was committed on-chain, so
+        the per-file `patch_bytes_sha256` is strictly redundant — and for
+        tarballs packed before the 2026-05-31 copy-snapshot fix (commit
+        ed5f4d0c) it can be STALE (a live append-only log grew between the
+        addfile write and the separate verify-hash re-read). The sovereign
+        restore passes verify_hash=False because it verifies the on-chain arc
+        per component before apply; every other (arc-unverified) caller keeps
+        the default strict behaviour.
         """
         meta = next(
             (f for f in self.files if f.get("arc_name") == arc_name), None
@@ -407,17 +420,29 @@ class UnpackedEvent:
         if expected_hash:
             actual = hashlib.sha256(data).hexdigest()
             if actual != expected_hash:
-                raise ValueError(
+                msg = (
                     f"patch_bytes sha256 mismatch for {arc_name!r}: "
                     f"expected {expected_hash}, got {actual} (tarball corruption)"
                 )
+                if verify_hash:
+                    raise ValueError(msg)
+                # arc-verified caller (sovereign restore): the on-chain arc has
+                # already authenticated every byte of this tarball, so the bytes
+                # are genuine; the per-file hash is stale (pre-ed5f4d0c pack race).
+                logger.warning(
+                    "[event_tarball] %s — proceeding: tarball already "
+                    "on-chain-arc-verified; per-file hash is advisory.", msg)
         return data
 
-    def diff_dict_for(self, arc_name: str) -> dict:
+    def diff_dict_for(self, arc_name: str, verify_hash: bool = True) -> dict:
         """Reconstruct the diff_dict for `arc_name` (metadata + patch_bytes).
 
         Returned dict is suitable for `diff_encoders.apply_diff(baseline, dict,
         output)`. patch_bytes is loaded lazily via get_patch_bytes().
+
+        `verify_hash` is forwarded to get_patch_bytes — see its docstring; pass
+        False ONLY from a caller that has already authenticated the tarball
+        against its on-chain arc.
         """
         meta = next(
             (f for f in self.files if f.get("arc_name") == arc_name), None
@@ -428,7 +453,7 @@ class UnpackedEvent:
             )
         d = {k: v for k, v in meta.items()
              if k not in ("arc_name", "member", "patch_bytes_sha256")}
-        d["patch_bytes"] = self.get_patch_bytes(arc_name)
+        d["patch_bytes"] = self.get_patch_bytes(arc_name, verify_hash=verify_hash)
         return d
 
 
