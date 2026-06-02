@@ -48,17 +48,21 @@ def entry(recv_queue, send_queue, name: str, config: dict) -> None:
         pass
 
     # SPEC §11.B.5 / rFP_kernel_zero_downtime_api_reload P3 — reload-child
-    # detection. When TITAN_API_REUSEPORT=1 this process is a NEW api co-bound
-    # with the OLD api via SO_REUSEPORT during a kernel-driven zero-downtime
-    # reload. The per-module SHM state slot is SINGLE-WRITER (state_registry),
-    # so a reload child must NOT write the canonical `module_api_state.bin`
-    # while OLD still owns it. Instead it writes a DEDICATED
+    # detection. Gated on TITAN_API_RELOAD_CHILD (NOT TITAN_API_REUSEPORT —
+    # the kernel sets REUSEPORT=1 on EVERY api spawn so the running api is
+    # always swap-ready, whereas RELOAD_CHILD=1 marks ONLY the NEW process of
+    # an actual zero-downtime swap). When set, this process is a NEW api
+    # co-bound with the OLD api via SO_REUSEPORT during a kernel-driven reload.
+    # The per-module SHM state slot is SINGLE-WRITER (state_registry), so a
+    # reload child must NOT write the canonical `module_api_state.bin` while
+    # OLD still owns it. Instead it writes a DEDICATED
     # `module_api_reload_state.bin` slot (the kernel health-gates on THAT —
     # pid-specific), and only PROMOTES to the canonical slot once OLD has
     # exited (self-promote on OLD-pid-death, below). Normal boots
-    # (TITAN_API_REUSEPORT unset) write the canonical slot directly, unchanged.
+    # (RELOAD_CHILD unset) write the canonical slot directly, unchanged —
+    # single-writer everywhere.
     import os as _os
-    _is_reload_child = _os.environ.get("TITAN_API_REUSEPORT") == "1"
+    _is_reload_child = _os.environ.get("TITAN_API_RELOAD_CHILD") == "1"
     _state_module_name = "api_reload" if _is_reload_child else "api"
 
     # Phase 11 §11.I.5 — populate the api module's SHM state slot so
