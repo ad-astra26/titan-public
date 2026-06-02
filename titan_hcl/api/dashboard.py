@@ -4682,7 +4682,13 @@ _RESTART_MODULE_ALLOWLIST = {
     "agno_worker",  # KILL-RESPAWN ONLY — state in agno_sessions.db (survives); heavy (414–626MB) → NOT reload
     "backup",       # reload_ok — atomic on-disk manifest (json.dump+os.replace); no buffered critical state; clients re-init on boot
     "hormonal_module",   # reload_ok — SAVE_NOW → hormonal_state.json; HormonalSystem reloads on boot
-    "api",               # stateless HTTP layer, start_method=spawn (re-imports from disk). Lets the api self-reload code (incl. this allowlist).
+    # REMOVED 2026-06-02 (§11.H.9 + D-SPEC-146): "api" — the L3 titan_hcl_api is
+    #   a KERNEL-rs peer (kernel spawns/supervises/respawns it, kernel_supervisor.rs),
+    #   NOT an orchestrator-owned worker. reload-module/restart-module CANNOT
+    #   reload it (the reload-module api path hit GuardianHCLClient.reload_module
+    #   signature-mismatch; restart-module didn't reload its code). Deliberate api
+    #   code-reload is the future zero-downtime kernel mechanism
+    #   (rFP_kernel_zero_downtime_api_reload). Do NOT re-add to either allowlist.
     # ── §P1 promotions — audit reload_ok (light + persistence-verified) ───────
     "dream_state",          # reload_ok — stateless, SHM-only, ≤60s inbox loss intentional
     "interface_advisor",    # reload_ok — stateless, 60s rolling deques disposable
@@ -4869,8 +4875,9 @@ _RELOAD_MODULE_ALLOWLIST = {
     # §P1 promotions — audit reload_ok (light, persistence-verified):
     "dream_state", "interface_advisor", "life_force", "llm", "reflex",
     "self_reflection_worker", "social_graph", "studio",
-    # stateless self-reload (lets the api hot-reload its own code incl. these lists):
-    "api",
+    # REMOVED 2026-06-02 (§11.H.9 + D-SPEC-146): "api" — kernel-rs peer, not an
+    #   orchestrator worker; deliberate api reload is the future kernel
+    #   zero-downtime mechanism (rFP_kernel_zero_downtime_api_reload). Not reloadable here.
     # HELD: "media" — promote in §P4 after the runtime save→respawn→diff (FAILs the
     # structural scanner today on the documented eager-durable-write false-positive).
 }
