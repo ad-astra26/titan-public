@@ -63,6 +63,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from titan_hcl.synthesis.writer import on_writer, resolve_writer
+
 logger = logging.getLogger(__name__)
 
 
@@ -132,8 +134,15 @@ class ForkGC:
         activation_floor: float = -3.0,
         max_nodes_per_sweep: int = DEFAULT_MAX_NODES_PER_SWEEP,
         clock: Any = time.time,
+        writer: Any = None,
     ):
         self._store = fork_store
+        # Single-writer-thread (Option C): the DuckDB + Kuzu handles are touched
+        # only on the one SynthesisWriter thread (the @on_writer methods below).
+        # _execute_plan's BEGIN..COMMIT runs as ONE atomic writer op so no other
+        # thread's autocommit write can interleave inside the transaction
+        # (AUDIT §5.2 / INV-Syn-10). Tests inject none → InlineWriter.
+        self._writer = resolve_writer(writer)
         self._db = synthesis_duckdb_conn
         self._graph = kuzu_graph
         self._activation = activation_store
@@ -233,6 +242,7 @@ class ForkGC:
 
     # ── Plan: identify prune candidates per fork ────────────────────
 
+    @on_writer
     def _plan_prune(self, fork_id: str) -> PrunePlan:
         """Apply the §9.5 conjunction predicate. Builds a PrunePlan without
         executing any writes."""
@@ -302,6 +312,7 @@ class ForkGC:
 
         return plan
 
+    @on_writer
     def _fetch_exploration_txs(self, fork_id: str) -> list[str]:
         """Read the durable exploration-TX log for the fork (in-memory map
         is also valid but the store's API doesn't expose it directly — we
@@ -320,6 +331,7 @@ class ForkGC:
             )
             return []
 
+    @on_writer
     def _plan_memory_nodes_prune(
         self, fork_id: str, exploration_txs: list[str], plan: PrunePlan,
     ) -> None:
@@ -383,6 +395,7 @@ class ForkGC:
                 continue
             plan.memory_nodes_will_drop.append(int(mem_id))
 
+    @on_writer
     def _plan_action_chains_prune(self, fork: Any, plan: PrunePlan) -> None:
         """action_chains_step prune predicate:
           - row created within [fork.created_at, fork.last_touched]
@@ -444,6 +457,7 @@ class ForkGC:
 
     # ── Helpers — predicate evaluation ──────────────────────────────
 
+    @on_writer
     def _other_open_fork_references(
         self, memory_node_id: int, this_fork_id: str,
     ) -> bool:
@@ -504,6 +518,7 @@ class ForkGC:
                 return True
         return False
 
+    @on_writer
     def _is_node_purely_probationary(self, memory_node_id: int) -> bool:
         """Predicate (b): the row has no canonical anchor TX. memory_nodes
         in the current schema doesn't carry an explicit `anchor_tx` column
@@ -541,9 +556,12 @@ class ForkGC:
                 return False  # conservative
         return True
 
+    @on_writer
     def _activation_for_item(self, item_id: str) -> Optional[float]:
         """Read the current base_level for item_id from activation_state
-        (sole-writer is synthesis_worker = us; same process so same lock)."""
+        (shared synthesis.duckdb conn). Runs on the single SynthesisWriter
+        thread (@on_writer) — "same process" does NOT imply "same lock"; the
+        writer thread IS the serializer (Option C, AUDIT 2026-06-02)."""
         try:
             row = self._db.execute(
                 "SELECT base_level FROM activation_state WHERE item_id=?",
@@ -555,6 +573,7 @@ class ForkGC:
             return None
         return float(row[0])
 
+    @on_writer
     def _chain_is_canonically_compiled(self, chain_id: str) -> bool:
         """Does any Production node carry COMPILED_FROM → this action_chain?
         Used by the action_chains_step predicate (b)."""
@@ -572,6 +591,7 @@ class ForkGC:
 
     # ── Plan execution: transactional per-fork prune ────────────────
 
+    @on_writer
     def _execute_plan(self, plan: PrunePlan) -> int:
         """Apply a PrunePlan inside a transaction. Rolls back on any
         sub-failure; returns the actually-pruned node count.

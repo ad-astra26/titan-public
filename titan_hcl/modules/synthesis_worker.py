@@ -52,6 +52,7 @@ The recompute loop is a no-op until `MEMORY_RETRIEVAL_USED` events arrive
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import struct
@@ -96,6 +97,11 @@ from titan_hcl.synthesis.standing_store import (
     StandingBundleStore,
 )
 from titan_hcl.synthesis.recall import EngineRecall
+from titan_hcl.synthesis.writer import (
+    SynthesisWriter,
+    guard_conn,
+    resolve_writer,
+)
 from titan_hcl.core.module_error_handler import with_error_envelope
 from titan_hcl.errors import Severity as _phase11_sev
 
@@ -288,22 +294,36 @@ class ActivationStore:
     log updates to keep the hot path cheap).
     """
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, writer: Any = None) -> None:
         self._db_path = db_path
-        # DuckDB locks at the process level: TieredMemoryGraph (in
-        # memory_worker process) holds titan_memory.duckdb R/W. If
-        # synthesis_worker shared that file, the lock would conflict
-        # (different processes → DuckDB v0.8+ rejects). So synthesis_worker
-        # owns its OWN file `data/synthesis.duckdb` per G21 / INV-Syn-3 —
-        # sole writer of activation_state + (Phase 7) actr_buffers +
-        # (Phase 8) procedural_skills. Memory_worker + cross-process
-        # readers open this same file R/O via BridgeRecall +
-        # _in_process_activation_lookup.
+        # ── Single-writer-thread discipline (INV-Syn single-writer / G21 at
+        # the THREAD level; AUDIT_synthesis_engine_crashloop_concurrency_
+        # 20260602.md). This connection is the ONE shared synthesis.duckdb
+        # handle (ActivationStore + StandingBundleStore + ActrBufferStore +
+        # HypothesisForkStore + OracleSpendStore + ProceduralSkillStore all
+        # use it). DuckDB Connections are NOT thread-safe → it is created AND
+        # only ever invoked on the single SynthesisWriter thread. guard_conn()
+        # raises WriterThreadViolation on any off-thread .execute(), so a
+        # forgotten submit() fails loudly in tests instead of segfaulting in
+        # production. Tests pass no writer → a synchronous InlineWriter runs
+        # ops inline. (Process-level sole-writer per G21 / INV-Syn-3 still
+        # holds: synthesis_worker owns its own data/synthesis.duckdb file;
+        # cross-process readers use atomic JSON snapshots, never this handle.)
+        self._writer = resolve_writer(writer)
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-        self._conn = duckdb.connect(db_path)
-        # Owner-side schema creation. CREATE TABLE IF NOT EXISTS is
-        # idempotent across restarts. Mirrors the schema previously held
-        # in titan_hcl/core/direct_memory.py (D-SPEC-123 v1; relocated
+        self._conn = guard_conn(
+            self._writer,
+            self._writer.submit_sync(lambda: duckdb.connect(db_path)))
+        # Cache resumes ACT-R activation across restarts. Schema + resume-load
+        # run on the writer thread (boot is single-threaded, so they complete
+        # before any other thread submits an op).
+        self._cache: dict[str, ActivationState] = {}
+        self._writer.submit_sync(self._init_schema)
+        self._writer.submit_sync(self._load_existing)
+
+    def _init_schema(self) -> None:
+        # CREATE TABLE IF NOT EXISTS is idempotent across restarts. Mirrors the
+        # schema previously in core/direct_memory.py (D-SPEC-123 v1; relocated
         # 2026-05-23 to resolve the cross-worker lock conflict).
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS activation_state (
@@ -316,10 +336,6 @@ class ActivationStore:
                 last_recompute DOUBLE DEFAULT 0.0
             )
         """)
-        # Cache loaded lazily on first access — read existing rows so the
-        # worker resumes ACT-R activation across restarts.
-        self._cache: dict[str, ActivationState] = {}
-        self._load_existing()
 
     def _load_existing(self) -> None:
         rows = self._conn.execute(
@@ -368,7 +384,7 @@ class ActivationStore:
         """Recompute every cached state's B_i and persist to DuckDB.
         Returns the count of rows actually upserted (states that changed).
         """
-        n_touched = 0
+        rows: list[tuple] = []
         for state in self._cache.values():
             new_bi = base_level(state, now, d=d, window_n=window_n)
             changed = (new_bi != state.base_level
@@ -376,9 +392,14 @@ class ActivationStore:
             if changed:
                 state.base_level = new_bi
                 state.last_recompute = now
-                self._persist(state)
-                n_touched += 1
-        return n_touched
+                rows.append(self._row_tuple(state))
+        # The B_i math ran on the CALLER thread (under cache_lock); rows are
+        # immutable tuples, so the DuckDB upsert is submitted as ONE batch op
+        # to the writer thread — heavy compute never runs on the writer, and
+        # the persist never races another handle user.
+        if rows:
+            self._writer.submit(lambda: self._persist_rows(rows))
+        return len(rows)
 
     def export_snapshot(self, snapshot_path: str) -> int:
         """Atomic JSON export of {item_id -> base_level} for cross-process
@@ -386,7 +407,6 @@ class ActivationStore:
         (-inf, NaN) are filtered out — readers treat absent items as
         cold-start by default. Returns the count of items written.
         """
-        import json
         import math
         payload: dict[str, float] = {}
         for state in self._cache.values():
@@ -401,17 +421,31 @@ class ActivationStore:
         os.replace(tmp_path, snapshot_path)
         return len(payload)
 
-    def _persist(self, state: ActivationState) -> None:
+    def _row_tuple(self, state: ActivationState) -> tuple:
+        """Materialize an immutable upsert row from a live state — called under
+        the caller's cache_lock so the writer op never reads mutating state."""
         log_blob = msgpack.packb(state.access_log, use_bin_type=True)
-        # base_level may be -inf for cold-start states; DuckDB DOUBLE
-        # supports infinities natively, so this round-trips cleanly.
-        self._conn.execute(
-            "INSERT OR REPLACE INTO activation_state "
+        # base_level may be -inf for cold-start states; DuckDB DOUBLE supports
+        # infinities natively, so this round-trips cleanly.
+        return (state.item_id, state.last_access, log_blob, state.access_count,
+                state.first_access, state.base_level, state.last_recompute)
+
+    def _persist_rows(self, rows: list[tuple]) -> None:
+        """Batch upsert on the writer thread. ON CONFLICT DO UPDATE (NOT
+        INSERT OR REPLACE — that is DELETE+INSERT and churns the PK ART index,
+        the documented 2026-06-01 crash class). INV-Syn-3 sole writer."""
+        self._conn.executemany(
+            "INSERT INTO activation_state "
             "(item_id, last_access, access_log, access_count, first_access, "
             " base_level, last_recompute) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (state.item_id, state.last_access, log_blob, state.access_count,
-             state.first_access, state.base_level, state.last_recompute),
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (item_id) DO UPDATE SET "
+            "last_access=excluded.last_access, access_log=excluded.access_log, "
+            "access_count=excluded.access_count, "
+            "first_access=excluded.first_access, "
+            "base_level=excluded.base_level, "
+            "last_recompute=excluded.last_recompute",
+            rows,
         )
 
     def items_tracked(self) -> int:
@@ -438,12 +472,14 @@ class ActivationStore:
         # autocommit per statement (DuckDB default — committed txns are
         # WAL-recovered even on SIGKILL), so this only guards the
         # WAL-not-yet-checkpointed window, not uncommitted data.
-        try:
-            self._conn.execute("CHECKPOINT")
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "[synthesis_worker] CHECKPOINT on close failed: %s", e)
-        self._conn.close()
+        def _op() -> None:
+            try:
+                self._conn.execute("CHECKPOINT")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[synthesis_worker] CHECKPOINT on close failed: %s", e)
+            self._conn.close()
+        self._writer.submit_sync(_op)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -480,6 +516,23 @@ def _heartbeat_loop(send_queue, name: str,
             except Exception:  # noqa: BLE001
                 pass
         stop_event.wait(HEARTBEAT_INTERVAL_S)
+
+
+def _tx_index_loop(tx_index_holder: dict, stop_event: threading.Event,
+                   interval_s: float, name: str) -> None:
+    """Daemon thread — incrementally index new chain TXs into the tx_hash FAISS
+    shards on its OWN cadence (G13, AUDIT §5.3). Decoupled from the recompute
+    loop so a slow embed (the embedder lazy-load is seconds) never delays the
+    SHM freshness watermark publish that cross-process BridgeRecall consumers
+    gate on. No-op until the builder is wired (holder default). FAISS writes
+    route through the single SynthesisWriter (Option C)."""
+    stop_event.wait(min(interval_s, 10.0))
+    while not stop_event.is_set():
+        try:
+            tx_index_holder["fn"]()
+        except Exception as e:
+            logger.debug("[synthesis_worker] tx_index tick failed: %s", e)
+        stop_event.wait(interval_s)
 
 
 def _recompute_loop(store: "ActivationStore",
@@ -571,16 +624,11 @@ def _recompute_loop(store: "ActivationStore",
                     "[synthesis_worker] metrics_exporter call failed: %s",
                     _met_exp_err,
                 )
-            # Operator-closure Phase A2 — incrementally index new chain TXs into
-            # the tx_hash-native FAISS shards (bounded per tick; no-op until the
-            # builder is wired). Keeps SEARCH current with live chain growth.
-            try:
-                tx_index_holder["fn"]()
-            except Exception as _tix_exp_err:
-                logger.debug(
-                    "[synthesis_worker] tx_index tick failed: %s",
-                    _tix_exp_err,
-                )
+            # G13 (AUDIT §5.3): the tx-index FAISS build (embed + add, bounded)
+            # runs on its OWN `synthesis-tx-index` daemon thread now — NOT
+            # inline here — so a slow embed (the embedder lazy-load is seconds)
+            # never delays this watermark publish, which cross-process
+            # BridgeRecall consumers gate freshness on.
             status_writer.publish(
                 last_consistent_event_ts=now,
                 last_recompute_ts=now,
@@ -636,6 +684,24 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     titan_id = resolve_titan_id(
         (config or {}).get("titan_id") if config else None)
 
+    # ── G10 / INV-Syn-13 — live SOL balance reader for the metabolic gate ──
+    # ShmReaderBank reads network_state.bin (kernel monitor_tick = G21 single
+    # writer) via SeqLock/PROT_READ — a pure SHM read, NOT a DuckDB/Kuzu/FAISS
+    # handle op, so it deliberately does NOT route through db_writer (Option C
+    # serializes only the non-thread-safe native handles; the SHM reader is
+    # safe from any thread). NOT hand-rolled offsets (feedback_never_hand_roll_
+    # shm_reads_use_shmreaderbank) and NOT bus/RPC (G18/G19). __init__ does lazy
+    # mmap attach (no SHM touched at construction), so this is cheap + cold-slot
+    # safe. None bank → the gate uses balance_sol_baseline.
+    _shm_bank = None
+    try:
+        from titan_hcl.api.shm_reader_bank import ShmReaderBank
+        _shm_bank = ShmReaderBank(titan_id)
+    except Exception as _bank_err:  # noqa: BLE001
+        logger.warning(
+            "[synthesis_worker] ShmReaderBank init failed — INV-Syn-13 gate "
+            "uses balance_sol_baseline (no live balance): %s", _bank_err)
+
     # ── Phase 11 §11.I.5 / Chunk 11N — SHM state-slot writer (G21 per worker) ──
     # Constructed BEFORE the slow DuckDB + Kuzu + EngineRecall init so the
     # slot publishes state="starting" immediately. The heartbeat thread
@@ -674,22 +740,35 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         "recompute_interval=%.1fs (D-SPEC-123 / SPEC §25)",
         titan_id, name, db_path, interval_s)
 
+    # ── The single persistence-writer thread (Option C; AUDIT 2026-06-02).
+    # Born BEFORE ActivationStore (which submits its boot DDL/load through it)
+    # and BEFORE rc_thread/recv/dream threads start, so every native-handle op
+    # in the worker — DuckDB, Kuzu spine, FAISS — is serialized on this one
+    # thread. Realizes the sole-writer invariant at the THREAD level (G21);
+    # concurrent .execute() is impossible by construction → no SIGSEGV, and no
+    # locks → no lock-ordering deadlock. NOT the OuterMemoryWriter (`writer`
+    # below, bus-only) — this is the DB/Kuzu/FAISS invoker.
+    db_writer = SynthesisWriter(name=name).start()
+
     # Construct sole-writer surfaces (G21 / INV-Syn-3).
-    store = ActivationStore(db_path)
+    store = ActivationStore(db_path, writer=db_writer)
     status_writer = SynthStatusWriter(titan_id)
     registry = PlugRegistry()
 
     # Phase 2 D-P2-4 standing-bundle store — sole writer of
-    # data/synthesis.duckdb / association_bundles. Shares the synthesis.duckdb
-    # file with ActivationStore (same process, separate connections fine —
-    # the DuckDB cross-PROCESS lock is the constraint).
+    # data/synthesis.duckdb / association_bundles. CONN-2 FOLD (AUDIT §5.2):
+    # shares ActivationStore's ONE guarded connection (store._conn) rather than
+    # opening its own duckdb.connect to the same file — two Connection objects
+    # mutating one file's WAL/buffer-manager from two threads was a confirmed
+    # corruption path. All writes route through db_writer.
     standing_cfg = (config or {}).get("standing") or {}
     ring_size = int(standing_cfg.get(
         "user_bundle_max_txs", DEFAULT_RING_SIZE))
     max_entities = int(standing_cfg.get(
         "user_bundle_max_users", DEFAULT_MAX_ENTITIES))
     bundle_store = StandingBundleStore(
-        db_path, ring_size=ring_size, max_entities=max_entities)
+        db_path, ring_size=ring_size, max_entities=max_entities,
+        conn=store._conn, writer=db_writer)
 
     # Cross-process activation snapshot file — sits next to synthesis.duckdb
     # in the same data_dir. Readers consume via plain JSON read.
@@ -785,7 +864,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         from titan_hcl.synthesis.synthesis_vector_index import SynthesisVectorStore
         synth_vector_store = SynthesisVectorStore(
             data_dir=_data_dir_sw, embedder=_shared_embedder,
-            batch_embedder=_shared_batch_embedder)
+            batch_embedder=_shared_batch_embedder, writer=db_writer)
         logger.info(
             "[synthesis_worker] tx_hash FAISS store ready (forks=%s) — "
             "binding outer memory to the chain spine (INV-15)",
@@ -807,6 +886,15 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
               interval_s, stop_event, cache_lock),
         daemon=True, name=f"synthesis-recompute-{name}")
     rc_thread.start()
+
+    # G13 — tx-index FAISS build runs on its OWN daemon thread (off the
+    # recompute/watermark thread). No-op until the builder wires the holder
+    # below; FAISS writes route through the SynthesisWriter (Option C).
+    tx_index_thread = threading.Thread(
+        target=_tx_index_loop,
+        args=(tx_index_holder, stop_event, interval_s, name),
+        daemon=True, name=f"synthesis-tx-index-{name}")
+    tx_index_thread.start()
 
     # Phase 4 §P4.A/§P4.H — synthesis spine Kuzu graph (G21 sole writer
     # per INV-Syn-7). Uses its OWN Kuzu file `data/synthesis_spine.kuzu`
@@ -993,7 +1081,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         cgn_bridge = CGNRegistrationBridge(
             registry_path=os.path.join("data", "synthesis_spine_concepts.json"),
         )
-        concept_store = ConceptStore(kuzu_graph, writer)
+        concept_store = ConceptStore(kuzu_graph, writer, db_writer=db_writer)
 
         # Phase 4 FU-1 — wire the spine_exporter so the recompute loop's
         # next 60s tick starts writing data/spine_snapshot.json. The api
@@ -1129,6 +1217,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         from titan_hcl.synthesis.fork_gc import ForkGC
 
         hypothesis_fork_store = HypothesisForkStore(
+            writer=db_writer,           # single-writer-thread (Option C)
             duckdb_conn=store._conn,    # same DuckDB conn as ActivationStore
             kuzu_graph=kuzu_graph_obj,
             concept_store=concept_store,
@@ -1188,6 +1277,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
 
         fork_gc = ForkGC(
             fork_store=hypothesis_fork_store,
+            writer=db_writer,           # single-writer-thread (Option C)
             synthesis_duckdb_conn=store._conn,
             kuzu_graph=kuzu_graph_obj,
             activation_store=store,
@@ -1240,7 +1330,12 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         # Phase 10 — a successful delegated skill is a recall-satisfied moment.
         if _mt is not None and success:
             try:
-                _mt.record_knowledge_moment()
+                # INV-Syn-27 (AUDIT §5.3): the knowledge_moment DENOMINATOR is
+                # per-TURN only (the KNOWLEDGE_MOMENT bus handler below, SPEC
+                # §25.9). A skill delegation contributes to the recall_satisfied
+                # NUMERATOR but must NOT mint a second knowledge_moment — doing
+                # so inflated the denominator per-delegation and biased the
+                # sovereignty ratio toward 1.0.
                 _mt.record_recall_satisfied(kind="skill_delegation")
             except Exception:
                 pass
@@ -1291,26 +1386,42 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         gate_config = build_gate_config(config or {})
         gate = OracleGate(gate_config)
 
-        # Spend store shares the synthesis_worker's existing DuckDB
-        # connection (INV-Syn-3 sole writer).
-        ensure_oracle_daily_spend_table(store._conn)
-        spend_store = OracleSpendStore(store._conn)
+        # Spend store shares the synthesis_worker's existing DuckDB connection
+        # (INV-Syn-3 sole writer). OracleSpendStore.__init__ ensures the table
+        # exists ON the writer thread — no standalone DDL here (the guarded
+        # conn rejects off-writer-thread .execute by design, Option C).
+        spend_store = OracleSpendStore(store._conn, writer=db_writer)
 
-        # Balance provider — best-effort; gate_config.balance_sol_baseline
-        # ensures sensible behavior when balance lookup degrades. The
-        # synthesis_worker is a subprocess so we cannot directly reach
-        # TitanHCL.network — use a config-supplied callable or fall back
-        # to a static 1.0 (= baseline; admit_score = importance).
+        # ── Balance provider (INV-Syn-13) — LIVE SOL via G18 SHM read (G10) ──
+        # Reads balance_sol from network_state.bin (kernel monitor_tick = G21
+        # single writer) through ShmReaderBank — replaces the static 1.0 that
+        # made admit_score == importance always (the gate never tightened on
+        # low balance). Short monotonic TTL so a burst of metered claims in one
+        # dream pass shares one SHM read. Pure SHM read → does NOT route through
+        # db_writer. Soft-fail to gate_config.balance_sol_baseline (the neutral
+        # "balance unknown, don't penalize" value, NOT a magic 1.0) on
+        # cold-boot / torn-read / decode-fail.
+        _balance_refresh_s = 2.0
+        _balance_cache: dict = {"value": None, "mono": 0.0}
+
         def _balance_lookup() -> float:
+            baseline = gate_config.balance_sol_baseline
+            if _shm_bank is None:
+                return baseline
+            now = time.monotonic()
+            if (_balance_cache["value"] is not None
+                    and (now - _balance_cache["mono"]) < _balance_refresh_s):
+                return _balance_cache["value"]
+            bal = baseline
             try:
-                # network_state.bin carries balance_sol (G18 SHM read);
-                # placeholder static for now — synthesis_worker boot
-                # extension can wire ShmReaderBank in a follow-up.
-                return float(
-                    (config or {}).get("synthesis", {}).get("balance_sol_fallback", 1.0)
-                )
-            except Exception:
-                return 1.0
+                st = _shm_bank.read_network_state()
+                if isinstance(st, dict) and st.get("balance_sol") is not None:
+                    bal = float(st["balance_sol"])
+            except Exception:  # noqa: BLE001 — cold slot / torn read → baseline
+                bal = baseline
+            _balance_cache["value"] = bal
+            _balance_cache["mono"] = now
+            return bal
 
         oracle_router = OracleRouter(
             gate=gate,
@@ -1334,19 +1445,19 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         # cgn_grounder reserved for the bus-RPC follow-up (returns None
         # for now → degraded grounding per the P6.H defensive contract).
         def _concept_reader(concept_id: str, version: int):
+            # G3 (AUDIT §5.3): ConceptStore.read_spine_strands now exists (the
+            # getattr probe used to silently return None → meaning_of empty
+            # fleet-wide). Call it directly; it runs on the writer thread
+            # (@on_writer) and returns the four Timechain-anchor strands, or
+            # None for a missing concept. Soft-fail so a Kuzu hiccup on this
+            # dream-orchestrator path never crash-loops the worker.
             if concept_store is None:
                 return None
             try:
-                # ConceptStore exposes spine reads via its _read_spine_*
-                # methods (P4); we use the public read_concept_strands
-                # helper if present, else fall back to the registry
-                # ensure_grounded for shape compatibility.
-                getter = getattr(concept_store, "read_spine_strands", None)
-                if callable(getter):
-                    return getter(concept_id, version)
+                return concept_store.read_spine_strands(concept_id, version)
             except Exception:
                 logger.exception("[synthesis_worker] concept_reader failed")
-            return None
+                return None
 
         cgn_meaning_oracle = CGNMeaningOracle(
             concept_reader=_concept_reader,
@@ -1476,6 +1587,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         actr_buffer_store = ActrBufferStore(
             duckdb_conn=store._conn,           # share synthesis.duckdb (INV-Syn-3)
             snapshot_path=buffers_snapshot_path,
+            writer=db_writer,                  # single-writer-thread (Option C)
         )
         # Initial export so the snapshot file exists from boot — agno's
         # BufferCache.hydrate + Observatory routes get a real (possibly
@@ -1531,6 +1643,7 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
         # fastembed model — RSS discipline). Same BAAI/bge-small-en-v1.5 path.
         procedural_skill_store = ProceduralSkillStore(
             duckdb_conn=store._conn,
+            writer=db_writer,                  # single-writer-thread (Option C)
             faiss_path=skills_faiss_path,
             snapshot_path=skills_snapshot_path,
             embedder=_shared_embedder,
@@ -1783,6 +1896,35 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             sovereignty_meter = SovereigntyRatioMeter(
                 windows=list(metrics_cfg.get("sovereignty_windows", ["24h", "7d", "all"])),
             )
+
+            # G9 (INV-Syn-25): reseed the meter from in-window conversation-fork
+            # TXs so a worker respawn does NOT zero the rolling windows (the
+            # crash-loop audit §5.3 "respawn zeros windows" gap). The per-turn
+            # sovereignty{needed,satisfied} signal now rides arch §7 conv-TXs;
+            # the metric is a rebuildable projection over the Timechain.
+            # Read-only, bounded, soft-fail — never blocks boot.
+            try:
+                from titan_hcl.synthesis.sovereignty_meter import (
+                    boot_seed_from_conversation_chain,
+                )
+                _seed_window_s = float(metrics_cfg.get(
+                    "sovereignty_boot_seed_window_s", 7 * 24 * 3600))
+                _seed = boot_seed_from_conversation_chain(
+                    sovereignty_meter,
+                    data_dir=os.environ.get("TITAN_DATA_DIR", "data"),
+                    since_ts=time.time() - _seed_window_s,
+                    cap=int(metrics_cfg.get("sovereignty_boot_seed_cap", 5000)),
+                )
+                logger.info(
+                    "[synthesis_worker] G9 sovereignty boot-seed: scanned=%d "
+                    "knowledge_moments=%d recall_satisfied=%d capped=%s",
+                    _seed.get("scanned", 0), _seed.get("knowledge_moments", 0),
+                    _seed.get("recall_satisfied", 0), _seed.get("capped", False))
+            except Exception as _seed_err:
+                logger.warning(
+                    "[synthesis_worker] G9 sovereignty boot-seed skipped "
+                    "(non-blocking): %s", _seed_err)
+
             retrieval_latency_ring = LatencyRing(
                 maxlen=int(metrics_cfg.get("retrieval_latency_ring_size", 1000)))
 
@@ -1838,157 +1980,143 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                 "[synthesis_worker] Phase 10 metrics wiring failed: %s — "
                 "observability disabled this session", exc, exc_info=True)
 
-    # Phase 8 dream dispatchers — judge BEFORE miner (INV-Syn-21).
-    last_llm_judge_started_ts: float = 0.0
-    llm_judge_lock = threading.Lock()
+    # ── Dream-boundary orchestrator (Option C) ────────────────────────────
+    # Replaces the 4 fire-and-forget dispatchers. ONE ordered thread runs the
+    # dream passes SEQUENTIALLY so (a) the LLM judge's scored_by writes are
+    # durably visible before the miner reads the window (INV-Syn-21 happens-
+    # before, enforced by db_writer.flush()), and (b) newly-compiled skills are
+    # verified right after mining (INV-Syn-20). Compute/LLM runs on THIS thread;
+    # every store handle-op it triggers routes to the single SynthesisWriter
+    # thread (the consolidation LLM await holds NO handle), so nothing races.
+    # Rate-limited to <=1 orchestration per dream window.
+    last_dream_orchestration_ts: float = 0.0
+    dream_orchestration_lock = threading.Lock()
 
-    def _maybe_run_llm_judge_async(dream_start_ts: float) -> None:
-        nonlocal last_llm_judge_started_ts
-        if llm_judge is None:
-            return
-        with llm_judge_lock:
-            if dream_start_ts <= last_llm_judge_started_ts:
+    def _maybe_run_dream_passes_async(dream_start_ts: float) -> None:
+        nonlocal last_dream_orchestration_ts
+        with dream_orchestration_lock:
+            if dream_start_ts <= last_dream_orchestration_ts:
+                logger.debug(
+                    "[synthesis_worker] dream passes already ran for window "
+                    "%.3f — skipping", dream_start_ts)
                 return
-            last_llm_judge_started_ts = dream_start_ts
+            last_dream_orchestration_ts = dream_start_ts
         window_hours = int(skill_cfg.get("miner_window_hours", 168))
         since_ts = dream_start_ts - window_hours * 3600.0
 
-        def _run_judge():
-            try:
-                summary = llm_judge.score_window(since_ts=since_ts)
-                logger.info(
-                    "[synthesis_worker] llm_judge done — tool_calls=%d "
-                    "unscored=%d scored=%d llm_calls=%d failures=%d",
-                    summary.get("tool_calls_in_window", 0),
-                    summary.get("unscored_in_window", 0),
-                    summary.get("scored_now", 0),
-                    summary.get("llm_calls", 0),
-                    summary.get("llm_failures", 0),
-                )
-            except Exception as e:
-                logger.warning("[synthesis_worker] llm_judge crashed: %s", e, exc_info=True)
-
-        threading.Thread(target=_run_judge, name="synthesis-llm-judge", daemon=True).start()
-
-    last_miner_started_ts: float = 0.0
-    miner_lock = threading.Lock()
-
-    def _maybe_run_procedural_miner_async(dream_start_ts: float) -> None:
-        nonlocal last_miner_started_ts
-        if procedural_miner is None:
-            return
-        with miner_lock:
-            if dream_start_ts <= last_miner_started_ts:
-                return
-            last_miner_started_ts = dream_start_ts
-
-        def _run_miner():
-            try:
-                summary = procedural_miner.mine_pass(
-                    dream_pass_id=f"dream_{int(dream_start_ts)}",
-                )
-                logger.info(
-                    "[synthesis_worker] procedural_miner done — txs=%d "
-                    "recurrent=%d positive=%d negative=%d llm_calls=%d failures=%d",
-                    summary.get("txs_scanned", 0),
-                    summary.get("clusters_recurrent", 0),
-                    summary.get("positive_skills_compiled", 0),
-                    summary.get("negative_skills_compiled", 0),
-                    summary.get("llm_calls", 0),
-                    summary.get("llm_failures", 0),
-                )
-            except Exception as e:
-                logger.warning("[synthesis_worker] procedural_miner crashed: %s", e, exc_info=True)
-
-        threading.Thread(target=_run_miner, name="synthesis-procedural-miner", daemon=True).start()
-
-    def _maybe_run_consolidation_async(dream_start_ts: float) -> None:
-        """Fire a ConsolidationPass in a worker thread; never blocks the
-        bus loop. Rate-limited by dream window — second DREAM_STATE_CHANGED
-        within the same window is a no-op."""
-        nonlocal last_dream_pass_started_ts
-        if consolidation_pass is None:
-            return
-        with consolidation_thread_lock:
-            # Rate-limit: at most 1 pass per dream-start timestamp. A new
-            # dream window must arrive (last_dream_pass_started_ts differs)
-            # before another pass fires.
-            if dream_start_ts <= last_dream_pass_started_ts:
-                logger.debug(
-                    "[synthesis_worker] consolidation already ran for "
-                    "dream window %.3f — skipping",
-                    dream_start_ts,
-                )
-                return
-            last_dream_pass_started_ts = dream_start_ts
-
-        def _run():
-            try:
-                result = consolidation_pass.run()
-                logger.info(
-                    "[synthesis_worker] consolidation_pass %s done — "
-                    "created=%d bumped=%d rejected=%d llm_calls=%d "
-                    "txs_mined=%d duration_ms=%.1f",
-                    result.pass_id,
-                    len(result.concepts_created),
-                    len(result.concepts_bumped),
-                    result.rejected_clusters,
-                    result.llm_calls,
-                    result.txs_mined,
-                    result.duration_ms,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[synthesis_worker] consolidation_pass crashed: %s",
-                    e, exc_info=True,
-                )
-
-        threading.Thread(
-            target=_run, name="synthesis-consolidation",
-            daemon=True,
-        ).start()
-
-    # Phase 5 §P5.H — nightly ForkGC sweep, dream-boundary triggered.
-    # Same rate-limit / threading pattern as consolidation: never blocks
-    # the bus loop. Fires AFTER consolidation_pass (sequencing isn't
-    # critical — both are independent — but the consolidation pass may
-    # mark new graduated/abandoned forks that the sweep then handles).
-    last_fork_sweep_started_ts: float = 0.0
-    fork_sweep_lock = threading.Lock()
-
-    def _maybe_run_fork_gc_async(dream_start_ts: float) -> None:
-        nonlocal last_fork_sweep_started_ts
-        if fork_gc is None:
-            return
-        with fork_sweep_lock:
-            if dream_start_ts <= last_fork_sweep_started_ts:
-                logger.debug(
-                    "[synthesis_worker] fork_gc already swept for dream "
-                    "window %.3f — skipping", dream_start_ts,
-                )
-                return
-            last_fork_sweep_started_ts = dream_start_ts
-
-        def _run_sweep():
-            try:
-                report = fork_gc.sweep(dry_run=not fork_gc_live_mode)
-                logger.info(
-                    "[synthesis_worker] fork_gc sweep done — visited=%d "
-                    "pruned=%d skipped=%d dropped=%d dry_run=%s",
-                    report.forks_visited, report.forks_pruned,
-                    report.forks_skipped, report.total_nodes_dropped,
-                    report.dry_run,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[synthesis_worker] fork_gc sweep crashed: %s",
-                    e, exc_info=True,
-                )
+        def _run_dream_sequence() -> None:
+            # 1) Oracle companion-verdict flush FIRST so the just-anchored
+            #    verdict refs are in the window the judge + miner read (W6).
+            if oracle_router is not None:
+                try:
+                    flushed = oracle_router.flush_companion_batches()
+                    if flushed:
+                        logger.info(
+                            "[synthesis_worker] oracle companion batches flushed "
+                            "at dream boundary: %s", flushed)
+                except Exception as e:
+                    logger.warning(
+                        "[synthesis_worker] companion flush failed: %s", e,
+                        exc_info=True)
+            # 2) LLM judge — scores the tool-call window (INV-Syn-21: BEFORE miner).
+            if llm_judge is not None:
+                try:
+                    summary = llm_judge.score_window(since_ts=since_ts)
+                    logger.info(
+                        "[synthesis_worker] llm_judge done — tool_calls=%d "
+                        "unscored=%d scored=%d llm_calls=%d failures=%d",
+                        summary.get("tool_calls_in_window", 0),
+                        summary.get("unscored_in_window", 0),
+                        summary.get("scored_now", 0),
+                        summary.get("llm_calls", 0),
+                        summary.get("llm_failures", 0))
+                except Exception as e:
+                    logger.warning(
+                        "[synthesis_worker] llm_judge crashed: %s", e,
+                        exc_info=True)
+                # Barrier: the judge's scored_by-patch writes must be durably
+                # flushed before the miner reads the window (INV-Syn-21).
+                try:
+                    db_writer.flush()
+                except Exception:
+                    pass
+            # 3) Procedural miner — now sees a fully-scored window.
+            if procedural_miner is not None:
+                try:
+                    summary = procedural_miner.mine_pass(
+                        dream_pass_id=f"dream_{int(dream_start_ts)}")
+                    logger.info(
+                        "[synthesis_worker] procedural_miner done — txs=%d "
+                        "recurrent=%d positive=%d negative=%d llm_calls=%d "
+                        "failures=%d",
+                        summary.get("txs_scanned", 0),
+                        summary.get("clusters_recurrent", 0),
+                        summary.get("positive_skills_compiled", 0),
+                        summary.get("negative_skills_compiled", 0),
+                        summary.get("llm_calls", 0),
+                        summary.get("llm_failures", 0))
+                except Exception as e:
+                    logger.warning(
+                        "[synthesis_worker] procedural_miner crashed: %s", e,
+                        exc_info=True)
+            # 4) Verify newly-compiled skills (INV-Syn-20). Without this pass
+            #    verified_at stays NULL forever -> read_for_match(verified_only)
+            #    is always empty -> no skill ever delegatable (skills=0 cause b).
+            if skill_verifier is not None and procedural_skill_store is not None:
+                try:
+                    unverified = procedural_skill_store.list_unverified()
+                    verified_n = 0
+                    for sid in unverified:
+                        try:
+                            if skill_verifier.verify_skill(sid):
+                                verified_n += 1
+                        except Exception as e:
+                            logger.warning(
+                                "[synthesis_worker] verify_skill(%s) failed: %s",
+                                sid, e, exc_info=True)
+                    if unverified:
+                        logger.info(
+                            "[synthesis_worker] skill verification — "
+                            "candidates=%d verified=%d",
+                            len(unverified), verified_n)
+                except Exception as e:
+                    logger.warning(
+                        "[synthesis_worker] skill verification pass failed: %s",
+                        e, exc_info=True)
+            # 5) ConsolidationPass — concept synthesis (independent of skills).
+            if consolidation_pass is not None:
+                try:
+                    result = consolidation_pass.run()
+                    logger.info(
+                        "[synthesis_worker] consolidation_pass %s done — "
+                        "created=%d bumped=%d rejected=%d llm_calls=%d "
+                        "txs_mined=%d duration_ms=%.1f",
+                        result.pass_id, len(result.concepts_created),
+                        len(result.concepts_bumped), result.rejected_clusters,
+                        result.llm_calls, result.txs_mined, result.duration_ms)
+                except Exception as e:
+                    logger.warning(
+                        "[synthesis_worker] consolidation_pass crashed: %s", e,
+                        exc_info=True)
+            # 6) ForkGC sweep — after consolidation (which may mark new
+            #    graduated/abandoned forks the sweep then handles).
+            if fork_gc is not None:
+                try:
+                    report = fork_gc.sweep(dry_run=not fork_gc_live_mode)
+                    logger.info(
+                        "[synthesis_worker] fork_gc sweep done — visited=%d "
+                        "pruned=%d skipped=%d dropped=%d dry_run=%s",
+                        report.forks_visited, report.forks_pruned,
+                        report.forks_skipped, report.total_nodes_dropped,
+                        report.dry_run)
+                except Exception as e:
+                    logger.warning(
+                        "[synthesis_worker] fork_gc sweep crashed: %s", e,
+                        exc_info=True)
 
         threading.Thread(
-            target=_run_sweep, name="synthesis-fork-gc",
-            daemon=True,
-        ).start()
+            target=_run_dream_sequence, name="synthesis-dream",
+            daemon=True).start()
 
     try:
         while True:
@@ -2341,37 +2469,13 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         "ts=%.3f — scheduling consolidation pass",
                         dream_start_ts,
                     )
-                    # Phase 8 (INV-Syn-21) — LLM judge runs FIRST so the
-                    # procedural miner sees a fully-scored window. Both run
-                    # in independent threads; rate-limits inside each dispatcher
-                    # ensure ≤ 1 of each per dream window.
-                    _maybe_run_llm_judge_async(dream_start_ts)
-                    # Operator-closure C2 (W6) — anchor the buffered oracle
-                    # companion verdicts into OracleVerdictBatch TXs (the
-                    # dream-boundary cadence flush_companion_batches always
-                    # specified but NO caller invoked → coverage stayed 0).
-                    # Cheap + synchronous; runs before the miner so the just-
-                    # anchored verdict refs are in the window the miner reads.
-                    if oracle_router is not None:
-                        try:
-                            _flushed = oracle_router.flush_companion_batches()
-                            if _flushed:
-                                logger.info(
-                                    "[synthesis_worker] oracle companion batches "
-                                    "flushed at dream boundary: %s", _flushed)
-                        except Exception as _ofb_err:
-                            logger.debug(
-                                "[synthesis_worker] companion flush failed: %s",
-                                _ofb_err)
-                    _maybe_run_consolidation_async(dream_start_ts)
-                    # Phase 5 §P5.H — fire the nightly ForkGC sweep on the
-                    # SAME dream-boundary tick. Independent thread; the
-                    # rate-limit inside _maybe_run_fork_gc_async ensures
-                    # at most 1 sweep per dream window.
-                    _maybe_run_fork_gc_async(dream_start_ts)
-                    # Phase 8 (P8.G) — procedural miner runs AFTER the judge
-                    # so its FORK_READ sees the just-anchored scored_by patches.
-                    _maybe_run_procedural_miner_async(dream_start_ts)
+                    # Option C — ONE ordered orchestrator thread runs the full
+                    # dream sequence (oracle-flush → judge → flush-barrier →
+                    # miner → skill-verify → consolidation → fork-gc) so the
+                    # INV-Syn-21 happens-before holds (miner sees the judge's
+                    # scored_by) and nothing races on the shared DuckDB/Kuzu/
+                    # FAISS handles. Rate-limited to ≤1 per dream window inside.
+                    _maybe_run_dream_passes_async(dream_start_ts)
                 else:
                     logger.debug(
                         "[synthesis_worker] DREAM_STATE_CHANGED dreaming=False "
@@ -2397,4 +2501,12 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
             status_writer.close()
         except Exception:
             logger.exception("[synthesis_worker] status_writer close failed")
+        # Stop the single writer thread LAST — store.close()/bundle_store.close()
+        # submit their final CHECKPOINT + conn-close ops through it (submit_sync,
+        # so they have already drained by the time we get here); this joins the
+        # now-idle writer thread.
+        try:
+            db_writer.close()
+        except Exception:
+            logger.exception("[synthesis_worker] db_writer close failed")
         logger.info("[synthesis_worker] shutdown complete")

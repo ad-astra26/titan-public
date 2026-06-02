@@ -72,6 +72,16 @@ def _resolve_index_db_path() -> str:
     return os.path.join(data_dir, DEFAULT_INDEX_DB_RELATIVE)
 
 
+def _resolve_oracles_snapshot_path() -> str:
+    # G11 (AUDIT §5.3): the AUTHORITATIVE coverage source. synthesis_worker
+    # builds it via OracleSnapshotExporter → CoverageAnalyzer over the v2-AWARE
+    # procedural_tx_reader; the /v6/synthesis/oracles/coverage handler already
+    # reads exactly this. Cross-process atomic-JSON read (INV-Syn-8: api never
+    # opens synthesis.duckdb).
+    data_dir = os.environ.get("TITAN_DATA_DIR", "data")
+    return os.path.join(data_dir, "oracles_snapshot.json")
+
+
 def _load_snapshot(path: Optional[str] = None) -> Optional[dict]:
     if path is None:
         path = _resolve_snapshot_path()
@@ -182,10 +192,25 @@ async def get_v6_synthesis_skills_recent(request: Request):
         {ok, source, passes: [{tx_hash, ts, ...summary fields}, ...]}
     """
     def _impl() -> dict:
+        # G11 (AUDIT §5.3): v2-aware. skill_mining_pass TXs are sealed into
+        # meta-fork BATCH blocks whose block_index row carries the batch
+        # primary_type + a 'v2_batch' tag, NOT 'skill_mining_pass' — so the old
+        # `WHERE thought_type='skill_mining_pass'` query returned []. Walk recent
+        # meta-fork blocks, resolve each block's tx_summaries, keep the
+        # skill_mining_pass entries (the audit trail of WHEN passes ran; rich
+        # counters live in the skills snapshot summary). api reads the chain
+        # files read-only — it never opens synthesis.duckdb (INV-Syn-8).
         path = _resolve_index_db_path()
         passes: list[dict] = []
         if not os.path.exists(path):
             return {"ok": True, "source": "no_index_db", "passes": []}
+        data_dir = os.environ.get("TITAN_DATA_DIR", "data")
+        try:
+            from titan_hcl.synthesis.chain_reader import read_block_content_at
+            from titan_hcl.logic.timechain_v2 import resolve_batch_summaries
+        except Exception as e:
+            logger.debug("[synthesis_skill_handlers] chain reader unavailable: %s", e)
+            return {"ok": True, "source": "chain_reader_unavailable", "passes": []}
         try:
             conn = sqlite3.connect(
                 f"file:{path}?mode=ro&immutable=0", uri=True, timeout=5.0,
@@ -196,31 +221,50 @@ async def get_v6_synthesis_skills_recent(request: Request):
             return {"ok": True, "source": "index_open_failed", "passes": []}
         try:
             cur = conn.execute(
-                "SELECT block_hash, fork_id, block_height, timestamp, thought_type, tags "
-                "FROM block_index "
-                "WHERE thought_type = 'skill_mining_pass' "
-                "ORDER BY timestamp DESC LIMIT ?",
-                [RECENT_PASSES_LIMIT],
+                "SELECT bi.fork_id, bi.file_offset, bi.timestamp "
+                "FROM block_index bi "
+                "JOIN fork_registry fr ON bi.fork_id = fr.fork_id "
+                "WHERE fr.fork_name = 'meta' "
+                "ORDER BY bi.timestamp DESC LIMIT 500",
             )
-            for row in cur.fetchall():
-                bh = row["block_hash"]
-                tx_hash = bh.hex() if isinstance(bh, bytes) else str(bh)
-                passes.append({
-                    "tx_hash": tx_hash,
-                    "block_height": int(row["block_height"]),
-                    "ts": float(row["timestamp"]),
-                    "fork_id": int(row["fork_id"]),
-                    "thought_type": row["thought_type"],
-                    "tags_raw": row["tags"],
-                })
+            rows = list(cur.fetchall())
         except sqlite3.Error as e:
             logger.debug("[synthesis_skill_handlers] passes query failed: %s", e)
+            rows = []
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
-        return {"ok": True, "source": "block_index", "passes": passes}
+        for r in rows:
+            if len(passes) >= RECENT_PASSES_LIMIT:
+                break
+            try:
+                content = read_block_content_at(
+                    data_dir, int(r["fork_id"]), int(r["file_offset"]))
+            except Exception:
+                continue
+            if not isinstance(content, dict):
+                continue
+            try:
+                summaries = resolve_batch_summaries(content)
+            except Exception:
+                summaries = ([content]
+                             if content.get("txs_scanned") is not None else [])
+            block_ts = float(r["timestamp"])
+            for s in summaries or []:
+                if not isinstance(s, dict):
+                    continue
+                if (s.get("type") or s.get("thought_type")) != "skill_mining_pass":
+                    continue
+                passes.append({
+                    "tx_hash": s.get("hash") or s.get("tx_hash") or "",
+                    "ts": block_ts,
+                    "tags_raw": s.get("tags"),
+                })
+                if len(passes) >= RECENT_PASSES_LIMIT:
+                    break
+        return {"ok": True, "source": "chain_v2", "passes": passes}
 
     # Sync sqlite3 I/O off the event loop (§8.0.ter spirit — never block the loop).
     return await asyncio.to_thread(_impl)
@@ -237,77 +281,48 @@ async def get_v6_synthesis_skills_coverage(request: Request):
         {ok, source, window_hours, denominator, numerator,
          coverage_ratio, scored_by_breakdown}
     """
-    out_base = {
+    # G11 (AUDIT §5.3): read the AUTHORITATIVE coverage block from
+    # oracles_snapshot.json (synthesis_worker CoverageAnalyzer over the v2-aware
+    # procedural_tx_reader) instead of a hand-rolled block_index LIKE-on-tags
+    # query — that query returned ~0 under v2 BATCH blocks (per-TX scored_by
+    # lives inside tx_summaries, NOT the batch row's `tags`), silently
+    # contradicting the authoritative /v6/synthesis/oracles/coverage (~4.9%).
+    base = {
         "ok": True,
-        "window_hours": COVERAGE_WINDOW_HOURS,
+        "snapshot": "missing",
+        "source": "oracles_snapshot",
+        "window_hours": 0.0,
         "denominator": 0,
         "numerator": 0,
         "coverage_ratio": 0.0,
         "scored_by_breakdown": {"oracle": 0, "llm": 0, "null": 0},
+        "a6_gate_passes": False,
     }
-
-    def _impl() -> dict:
-        path = _resolve_index_db_path()
-        if not os.path.exists(path):
-            return {**out_base, "source": "no_index_db"}
-
-        since_ts = time.time() - COVERAGE_WINDOW_HOURS * 3600.0
-        try:
-            conn = sqlite3.connect(
-                f"file:{path}?mode=ro&immutable=0", uri=True, timeout=5.0,
-            )
-            conn.row_factory = sqlite3.Row
-        except Exception:
-            return {**out_base, "source": "index_open_failed"}
-
-        try:
-            # Coverage is derived from the `tags` blob the chain writer
-            # stores per block. write_tool_call sets tags including
-            # `scored_by:oracle|llm|none`. We rely on substring match — the
-            # tag list is a small JSON array per row so the SQL LIKE is
-            # cheap (no full chain_*.bin walk).
-            cur = conn.execute(
-                "SELECT tags FROM block_index "
-                "WHERE thought_type = 'tool_call' AND timestamp > ? "
-                "LIMIT 50000",
-                [since_ts],
-            )
-            denom = 0
-            oracle_n = 0
-            llm_n = 0
-            null_n = 0
-            for row in cur.fetchall():
-                tags_raw = row["tags"] or ""
-                denom += 1
-                if "scored_by:oracle" in tags_raw:
-                    oracle_n += 1
-                elif "scored_by:llm" in tags_raw:
-                    llm_n += 1
-                else:
-                    # 'scored_by:none' OR no scored_by tag at all
-                    null_n += 1
-            numerator = oracle_n + llm_n
-            ratio = (numerator / denom) if denom else 0.0
-            return {
-                **out_base,
-                "source": "block_index",
-                "denominator": denom,
-                "numerator": numerator,
-                "coverage_ratio": float(ratio),
-                "scored_by_breakdown": {
-                    "oracle": oracle_n,
-                    "llm": llm_n,
-                    "null": null_n,
-                },
-            }
-        except sqlite3.Error as e:
-            logger.debug("[synthesis_skill_handlers] coverage query failed: %s", e)
-            return {**out_base, "source": "coverage_query_failed"}
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    # Sync sqlite3 I/O off the event loop (§8.0.ter spirit — never block the loop).
-    return await asyncio.to_thread(_impl)
+    payload, status = _load_snapshot_with_status(_resolve_oracles_snapshot_path())
+    base["snapshot"] = status
+    if payload is None:
+        return base
+    cov = payload.get("coverage") if isinstance(payload, dict) else None
+    if not isinstance(cov, dict) or not cov:
+        return base
+    total = int(cov.get("total_tool_call_txs") or 0)
+    oracle_n = int(cov.get("scored_by_oracle") or 0)
+    llm_n = int(cov.get("scored_by_llm") or 0)
+    unscored_n = int(cov.get("unscored") or 0)
+    numerator = oracle_n + llm_n
+    ratio = float(cov.get("coverage_ratio") or 0.0)
+    window_hours = float(cov.get("window_seconds") or 0.0) / 3600.0
+    return {
+        "ok": True,
+        "snapshot": status,
+        "source": "oracles_snapshot",
+        "exported_at": payload.get("exported_at"),
+        "window_hours": round(window_hours, 2),
+        "denominator": total,
+        "numerator": numerator,
+        "coverage_ratio": ratio,
+        "scored_by_breakdown": {
+            "oracle": oracle_n, "llm": llm_n, "null": unscored_n,
+        },
+        "a6_gate_passes": bool(cov.get("a6_gate_passes", ratio >= 0.95)),
+    }

@@ -89,10 +89,15 @@ class SkillVerifier:
                 return self._reject(skill_id, reason=f"chain_resolve_miss:{tx_hash[:16]}",
                                    compiled_from=compiled_from)
             # Content-hash equality: the block's recorded content_hash MUST
-            # match the tx_hash we recorded at compile time. If the chain
-            # reader returns the block without a content_hash field, treat
-            # it as authoritative (the reader's contract is to return None
-            # on miss; non-None means the hash matched).
+            # match the tx_hash we recorded at compile time. The chain reader's
+            # CONTRACT is to return None on miss and a block ONLY on a hash
+            # match (ChainContentHashReader resolves BY content_hash), so a
+            # block returned WITHOUT an explicit content_hash field is
+            # authoritative (presence ⟺ match). We still reject an explicit
+            # MISMATCH defensively. (AUDIT §5.3 G2 proposed fail-closing the
+            # absent case, but that contradicts the documented reader contract
+            # + the test_verify_skill_accepts_when_reader_returns_block_without_
+            # hash_field invariant — declined as a false positive.)
             block_hash = block.get("content_hash") or block.get("tx_hash")
             if block_hash and block_hash != tx_hash:
                 return self._reject(skill_id, reason=f"content_hash_mismatch:{tx_hash[:16]}",

@@ -44,6 +44,8 @@ import logging
 import os
 from typing import Any, Callable, Iterable, Optional
 
+from titan_hcl.synthesis.writer import on_writer, resolve_writer
+
 logger = logging.getLogger(__name__)
 
 # 384D BAAI/bge-small-en-v1.5 — the one embedding model the engine uses
@@ -278,7 +280,14 @@ class SynthesisVectorStore:
         batch_embedder: Optional[Callable[[list], "Any"]] = None,
         forks: Iterable[str] = INDEXED_FORKS,
         dim: int = EMBEDDING_DIM,
+        writer: Any = None,
     ):
+        # Single-writer-thread (Option C): FAISS IndexFlatIP is a native C++
+        # object, unsafe under concurrent mutate (recompute add/save) + read
+        # (consolidation get_vector / EngineRecall knn). All shard ops route
+        # through the one writer thread. EMBEDDING stays off the writer (it is
+        # compute) — only the shard.add is submitted.
+        self._writer = resolve_writer(writer)
         self._data_dir = str(data_dir)
         self._embedder = embedder
         # Optional `(list[str]) -> list[vec]` batch embedder. fastembed is far
@@ -296,6 +305,7 @@ class SynthesisVectorStore:
     def _shard(self, fork: str) -> Optional[_FaissShard]:
         return self._shards.get(fork)
 
+    @on_writer
     def has(self, fork: str, tx_hash: str) -> bool:
         sh = self._shard(fork)
         return sh.has(tx_hash) if sh is not None else False
@@ -307,7 +317,9 @@ class SynthesisVectorStore:
         sh = self._shard(fork)
         if sh is None or self._embedder is None or not text or not tx_hash:
             return False
-        if sh.has(tx_hash):
+        # has-check + append touch native FAISS → writer thread. Embed (compute)
+        # runs on the caller thread between them.
+        if self._writer.submit_sync(lambda: sh.has(tx_hash)):
             return False
         try:
             vec = self._embedder(text)
@@ -317,7 +329,7 @@ class SynthesisVectorStore:
             return False
         if vec is None:
             return False
-        added = sh.add(tx_hash, vec)
+        added = self._writer.submit_sync(lambda: sh.add(tx_hash, vec))
         if added:
             self._dirty.add(fork)
         return added
@@ -332,12 +344,17 @@ class SynthesisVectorStore:
         sh = self._shard(fork)
         if sh is None or not items:
             return 0
-        # Dedup + drop empties before embedding (don't pay to embed skips).
-        pending: list[tuple[str, str]] = []
-        for tx_hash, text in items:
-            if not tx_hash or not text or sh.has(tx_hash):
-                continue
-            pending.append((tx_hash, text))
+        # Dedup + drop empties before embedding (don't pay to embed skips). The
+        # has-checks touch the native index → run on the writer thread in ONE
+        # op (not N round-trips).
+        def _dedup() -> list:
+            out: list[tuple[str, str]] = []
+            for tx_hash, text in items:
+                if not tx_hash or not text or sh.has(tx_hash):
+                    continue
+                out.append((tx_hash, text))
+            return out
+        pending = self._writer.submit_sync(_dedup)
         if not pending:
             return 0
         if self._batch_embedder is None:
@@ -348,6 +365,7 @@ class SynthesisVectorStore:
                     added += 1
             return added
         try:
+            # Batch embed runs on the CALLER thread (compute, never the writer).
             vecs = list(self._batch_embedder([t for _, t in pending]))
         except Exception as e:
             logger.warning("[SynthesisVectorStore] batch embed failed: %s — "
@@ -362,14 +380,19 @@ class SynthesisVectorStore:
                 "[SynthesisVectorStore] batch embed returned %d vecs for %d "
                 "texts — skipping fork %s batch", len(vecs), len(pending), fork)
             return 0
-        added = 0
-        for (tx_hash, _), vec in zip(pending, vecs):
-            if vec is not None and sh.add(tx_hash, vec):
-                added += 1
+
+        def _add_batch() -> int:
+            n = 0
+            for (tx_hash, _), vec in zip(pending, vecs):
+                if vec is not None and sh.add(tx_hash, vec):
+                    n += 1
+            return n
+        added = self._writer.submit_sync(_add_batch)
         if added:
             self._dirty.add(fork)
         return added
 
+    @on_writer
     def add_vector(self, fork: str, tx_hash: str, vec: "Any") -> bool:
         """Bind a precomputed vector under tx_hash (backfill from an existing
         index — A4 reuses already-computed embeddings where available)."""
@@ -381,6 +404,7 @@ class SynthesisVectorStore:
             self._dirty.add(fork)
         return added
 
+    @on_writer
     def save(self, fork: Optional[str] = None) -> None:
         """Persist dirty shards atomically. `fork=None` saves all dirty shards."""
         targets = (fork,) if fork is not None else tuple(self._dirty)
@@ -390,16 +414,19 @@ class SynthesisVectorStore:
                 sh.save()
             self._dirty.discard(f)
 
+    @on_writer
     def get_vector(self, fork: str, tx_hash: str) -> Optional["Any"]:
         sh = self._shard(fork)
         return sh.get_vector(tx_hash) if sh is not None else None
 
     # In-process faiss_reader contract (RuleEvaluator SEARCH op) ----------
+    @on_writer
     def knn(self, fork: str, vec: "Any", k: int,
             min_similarity: float = 0.0) -> list[dict]:
         return _knn_over(
             self._shards, fork, vec, k, min_similarity, allow_create=True)
 
+    @on_writer
     def stats(self) -> dict:
         return {f: sh.ntotal() for f, sh in self._shards.items()}
 

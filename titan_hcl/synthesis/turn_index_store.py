@@ -138,12 +138,14 @@ def _ensure_loaded() -> None:
             "fresh", _state_path, exc)
 
 
-def _persist() -> None:
-    """Atomic tmp+rename write of the cache to the JSON state file.
+def _persist(snapshot: dict) -> None:
+    """Atomic tmp+rename write of a cache SNAPSHOT to the JSON state file.
 
-    Caller must hold `_cache_lock`. Writes the FULL cache each tick
-    (acceptable — even at MAX_TRACKED_SESSIONS the dict is <200 KB
-    serialized; chat traffic is ≤ a few turns/sec).
+    G14 (AUDIT §5.3): the caller snapshots the cache UNDER `_cache_lock`, then
+    calls this WITHOUT the lock held, so the fsync-class disk write never stalls
+    the agno chat hot path while holding the process-global lock. Concurrent
+    writers race only on the atomic os.replace (last snapshot wins; turn indices
+    are monotonic so a lost tail is benign).
     """
     parent = os.path.dirname(_state_path) or "."
     try:
@@ -157,7 +159,7 @@ def _persist() -> None:
             prefix=".turn_index.", suffix=".tmp", dir=parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(dict(_cache), f, separators=(",", ":"))
+                json.dump(snapshot, f, separators=(",", ":"))
             os.replace(tmp_path, _state_path)
         except Exception:
             try:
@@ -214,8 +216,11 @@ def next_turn_index(chat_id: str) -> int:
                 _cache.popitem(last=False)
         _cache[cid] = new
         _cache.move_to_end(cid)
-        _persist()
-        return new
+        # G14: snapshot under the lock, write OUTSIDE it so the fsync-class
+        # disk write never stalls the chat hot path while holding the lock.
+        snapshot = dict(_cache)
+    _persist(snapshot)
+    return new
 
 
 def peek_turn_index(chat_id: str) -> Optional[int]:

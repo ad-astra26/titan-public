@@ -38,8 +38,10 @@ Invariants enforced HERE:
 
 Constructor dependencies (all duck-typed — tests inject fakes):
 
-- `duckdb_conn`: open DuckDB connection to `synthesis.duckdb` (the ActivationStore's
-  connection is reused — same process, same lock).
+- `duckdb_conn`: open DuckDB connection to `synthesis.duckdb` (the shared
+  ActivationStore connection). All access routes through the single
+  SynthesisWriter thread (`writer` param) — "same process" does NOT imply
+  "same lock"; the writer thread IS the serializer (Option C, AUDIT 2026-06-02).
 - `kuzu_graph`: `TitanKnowledgeGraph` with the Phase 5 fork-helper methods
   (`fork_create_node`, `fork_update_status`, ...).
 - `concept_store`: `ConceptStore` instance for graduation-path concept writes
@@ -75,6 +77,8 @@ import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
+
+from titan_hcl.synthesis.writer import on_writer, resolve_writer
 
 logger = logging.getLogger(__name__)
 
@@ -205,11 +209,20 @@ class HypothesisForkStore:
         # snapshot stays as a heartbeat but is no longer load-bearing for
         # visibility). Mirrors the P7 ActrBufferStore.persist() pattern.
         snapshot_path: Optional[str] = None,
+        writer: Any = None,
     ):
         self._db = duckdb_conn
         self._graph = kuzu_graph
         self._concepts = concept_store
         self._writer = outer_memory_writer
+        # Single-writer-thread (Option C): the DuckDB + Kuzu handles are touched
+        # only on the one SynthesisWriter thread (the @on_writer methods below),
+        # so the create/graduate/abandon ops that mutate BOTH substrates run
+        # atomically on one thread — no lock-ordering deadlock. Named
+        # `_db_writer` because `_writer` already holds the bus-only
+        # OuterMemoryWriter. INV-Syn-8 sole writer preserved. Tests inject no
+        # writer → InlineWriter runs ops inline.
+        self._db_writer = resolve_writer(writer)
         self._activation = activation_store
         self._floor = float(activation_floor)
         self._window = float(ttl_window_sec)
@@ -232,6 +245,7 @@ class HypothesisForkStore:
 
     # ── Schema bootstrap (P5.B) ──────────────────────────────────────
 
+    @on_writer
     def _init_schema(self) -> None:
         """CREATE TABLE IF NOT EXISTS hypothesis_forks (idempotent)."""
         self._db.execute("""
@@ -277,6 +291,7 @@ class HypothesisForkStore:
             )
         """)
 
+    @on_writer
     def _load_exploration_log_from_durable_state(self) -> None:
         """Rehydrate the in-memory exploration map from
         hypothesis_fork_explorations after a worker restart."""
@@ -300,6 +315,7 @@ class HypothesisForkStore:
 
     # ── Public surface — lifecycle ────────────────────────────────────
 
+    @on_writer
     def create_fork(
         self,
         *,
@@ -403,6 +419,7 @@ class HypothesisForkStore:
         self._maybe_write_through_snapshot()
         return fork_id
 
+    @on_writer
     def record_exploration_tx(self, fork_id: str, tx_hash: str) -> None:
         """Track one exploration TX hash inside an active fork. Called by
         the synthesis engine when it anchors a TX with `fork_class="hypothesis"`
@@ -436,6 +453,7 @@ class HypothesisForkStore:
         # P8.X write-through: closes P5 cascade flake (snapshot lag on record)
         self._maybe_write_through_snapshot()
 
+    @on_writer
     def graduate_oracle(
         self,
         *,
@@ -482,6 +500,7 @@ class HypothesisForkStore:
             concept_name=concept_name,
         )
 
+    @on_writer
     def graduate_used(
         self,
         *,
@@ -530,6 +549,7 @@ class HypothesisForkStore:
             concept_name=concept_name,
         )
 
+    @on_writer
     def abandon(
         self,
         *,
@@ -603,6 +623,7 @@ class HypothesisForkStore:
 
     # ── Public surface — FORK_READ observer (P5.F) ────────────────────
 
+    @on_writer
     def on_fork_read(self, fork_id: str) -> Optional[str]:
         """Increment use_count + touch activation for a fork the SC handler
         just FORK_READ-ed. Auto-fires graduate_used() at the threshold.
@@ -647,6 +668,7 @@ class HypothesisForkStore:
 
     # ── Public surface — readers ──────────────────────────────────────
 
+    @on_writer
     def get_fork(self, fork_id: str) -> Optional[HypothesisFork]:
         rows = self._db.execute(
             "SELECT fork_id, root_anchor, parent_concept_id, intent, status, "
@@ -678,6 +700,7 @@ class HypothesisForkStore:
     def list_by_status(self, status: str) -> list[HypothesisFork]:
         return self._list_by_status(status)
 
+    @on_writer
     def _list_by_status(self, status: str) -> list[HypothesisFork]:
         ids = [
             row[0] for row in self._db.execute(
@@ -693,6 +716,7 @@ class HypothesisForkStore:
                 out.append(f)
         return out
 
+    @on_writer
     def find_below_floor(
         self,
         floor: Optional[float] = None,
@@ -718,6 +742,7 @@ class HypothesisForkStore:
         ).fetchall()
         return [r[0] for r in rows]
 
+    @on_writer
     def pending_gc_targets(self) -> list[str]:
         """Forks whose lifecycle has ended (graduated or abandoned) but the
         Kuzu HypothesisFork node + cascade subnodes still exist. The nightly
@@ -734,6 +759,7 @@ class HypothesisForkStore:
                 out.append(fid)
         return out
 
+    @on_writer
     def update_activation(self, fork_id: str, base_level: float) -> None:
         """Called by the synthesis_worker recompute loop to persist the
         fork's latest B_i to DuckDB + Kuzu (so find_below_floor and the
@@ -755,6 +781,7 @@ class HypothesisForkStore:
                 activation=float(base_level),
             )
 
+    @on_writer
     def purge_durable_state(self, fork_id: str) -> None:
         """Called by the cascade-GC sweep after Kuzu cleanup: drop the
         durable exploration log + Kuzu fork node. The DuckDB lifecycle row
@@ -794,6 +821,7 @@ class HypothesisForkStore:
                 "[HypothesisForkStore] write-through snapshot export failed: %s", e,
             )
 
+    @on_writer
     def export_snapshot(self, snapshot_path: str) -> int:
         """Atomic JSON export of all hypothesis_forks rows + summary stats.
 
@@ -873,6 +901,7 @@ class HypothesisForkStore:
 
     # ── Internal: graduate-path orchestration ─────────────────────────
 
+    @on_writer
     def _graduate(
         self,
         *,
@@ -917,29 +946,16 @@ class HypothesisForkStore:
                 parent_id,
                 composed_from=[],
                 derivation_evidence=exploration_tx_list,
-            )
-            # Then emit the OracleVerdict TX so the verification is
-            # provenanced (arch §11.1). The concept-version TX is already
-            # anchored; we add a co-located verdict TX referencing it.
-            self._writer.write_concept_version_with_proof(
-                concept_id=new_cv.concept_id,
-                version=new_cv.version,
-                name=new_cv.name,
-                memory_type=new_cv.memory_type,
-                parent_version_tx=latest["anchor_tx"],
-                composed_from=[],
-                derivation_evidence=exploration_tx_list,
-                groundedness=new_cv.groundedness,
                 derivation_merkle_root=derivation_merkle_root,
                 oracle_verdict=oracle_verdict,
             )
-            # The first call (bump_version) emitted the canonical concept-
-            # version TX; the second (write_concept_version_with_proof)
-            # emitted a duplicate-shape concept-version TX. Both are
-            # anchored, idempotent on-chain due to content-hashing; the
-            # duplicate carries the proof + verdict. The anchor_tx that
-            # ConceptStore returned (from bump_version's bare write) is
-            # canonical; we use it as the chain handle.
+            # G4 (AUDIT §5.3): bump_version now emits the SINGLE canonical
+            # concept-version TX WITH the merkle root + companion OracleVerdict
+            # (INV-4 single write, arch §11.1). The prior second
+            # write_concept_version_with_proof call here emitted a DUPLICATE,
+            # NON-byte-identical concept-version TX (content-hash idempotency did
+            # NOT hold — it carried the proof the first lacked), polluting the
+            # chain + derivation graph. Removed.
             concept_anchor_tx = new_cv.anchor_tx
             new_concept_id = new_cv.concept_id
             new_version = new_cv.version
@@ -956,19 +972,13 @@ class HypothesisForkStore:
                 "declarative",   # net-new earned concepts default to declarative
                 composed_from=[],
                 derivation_evidence=exploration_tx_list,
-            )
-            self._writer.write_concept_version_with_proof(
-                concept_id=new_cv.concept_id,
-                version=new_cv.version,
-                name=new_cv.name,
-                memory_type=new_cv.memory_type,
-                parent_version_tx=None,
-                composed_from=[],
-                derivation_evidence=exploration_tx_list,
-                groundedness=new_cv.groundedness,
                 derivation_merkle_root=derivation_merkle_root,
                 oracle_verdict=oracle_verdict,
             )
+            # G4 (AUDIT §5.3): create_concept now emits the SINGLE canonical
+            # concept-version TX WITH the merkle root + companion OracleVerdict
+            # (INV-4 single write); the prior separate write_concept_version_
+            # with_proof here emitted a DUPLICATE concept-version TX — removed.
             concept_anchor_tx = new_cv.anchor_tx
             new_version = new_cv.version
 

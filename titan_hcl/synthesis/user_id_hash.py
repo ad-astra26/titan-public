@@ -122,17 +122,20 @@ def get_user_id_hash_salt() -> bytes:
         try:
             _salt_cache = bytes.fromhex(salt_hex)
         except ValueError:
+            # FAIL-CLOSED (AUDIT §5.3): an EXISTING-but-corrupt salt must NOT be
+            # silently rotated + persisted — that permanently orphans every
+            # prior user:<hash> bundle key (a sovereignty/continuity foot-gun,
+            # and a transient corruption would reset the keyspace forever).
+            # Alarm loudly and use a DETERMINISTIC, NON-persisted process-local
+            # salt this run so a human can restore the real salt in
+            # ~/.titan/secrets.toml without the keyspace having been rewritten.
             logger.error(
-                "[user_id_hash] secrets.toml [synthesis].user_id_hash_salt "
-                "is not valid hex — regenerating")
-            salt_hex = _generate_salt()
-            try:
-                update_secret("synthesis", "user_id_hash_salt", salt_hex)
-            except Exception:
-                logger.warning(
-                    "[user_id_hash] regen-persist failed; using "
-                    "process-local salt")
-            _salt_cache = bytes.fromhex(salt_hex)
+                "[user_id_hash] secrets.toml [synthesis].user_id_hash_salt is "
+                "CORRUPT (not valid hex) — NOT auto-rotating (that would orphan "
+                "every prior user bundle). Using a non-persisted process-local "
+                "salt this run; restore the real salt to recover continuity.")
+            _salt_cache = hashlib.sha256(
+                ("corrupt-salt-fallback:" + salt_hex).encode("utf-8")).digest()
 
         return _salt_cache
 

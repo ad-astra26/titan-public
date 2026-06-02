@@ -47,7 +47,12 @@ _TOOL_CALL_INDEX_SQL = (
     "FROM block_index bi "
     "JOIN fork_registry fr ON bi.fork_id = fr.fork_id "
     "WHERE fr.fork_name = ? AND bi.timestamp > ? "
-    "  AND bi.thought_type = 'tool_call' "
+    # G1 (AUDIT §5.3): also fetch tool_call_score blocks (the per-call llm
+    # scored_by patches ride the procedural fork) so the overlay below can fill
+    # scored_by on the matching tool_call records. A mixed v2 batch carries ONE
+    # primary thought_type, so matching either type catches the block + we
+    # resolve ALL its tx_summaries (both types) in one walk.
+    "  AND bi.thought_type IN ('tool_call', 'tool_call_score') "
     "ORDER BY bi.timestamp DESC LIMIT ?"
 )
 
@@ -59,6 +64,7 @@ def default_procedural_tool_call_reader(
     index_db_path: str = _DEFAULT_INDEX_DB,
     chain_dir: str = _DEFAULT_CHAIN_DIR,
     fork_name: str = _PROCEDURAL_FORK_NAME,
+    overlay: bool = True,
 ) -> list[dict]:
     """Return tool-call TXs from the procedural fork since `since_ts`.
 
@@ -121,6 +127,11 @@ def default_procedural_tool_call_reader(
 
     data_dir = Path(chain_dir).parent  # read_block_content_at takes the DATA dir
     out: list[dict] = []
+    # G1 (AUDIT §5.3): parent_tool_call_tx → scored_by, collected from
+    # tool_call_score summaries during the walk, overlaid onto unscored
+    # tool_call records after the loop. Keyed on the FULL 64-hex tx (no prefix)
+    # so two calls sharing a short prefix never cross-contaminate.
+    score_overlay: dict[str, str] = {}
     for r in rows:  # already ORDER BY timestamp DESC LIMIT in the SQL
         block_ts = float(r["timestamp"])
         try:
@@ -139,9 +150,19 @@ def default_procedural_tool_call_reader(
         for s in summaries or []:
             if not isinstance(s, dict):
                 continue
-            if s.get("type", "tool_call") != "tool_call" and "tool_id" not in s:
-                continue
             tags = list(s.get("tags") or [])
+            stype = s.get("type") or s.get("thought_type") or "tool_call"
+            if stype == "tool_call_score":
+                # G1 (AUDIT §5.3): a per-call llm scored_by patch — its tags
+                # carry the verdict + the FULL parent tx (v2 sealing drops
+                # content, so we read the TAGS). Overlaid below.
+                parent = _parent_from_tags(tags)
+                sb = _scored_by_from_tags(tags)
+                if parent and sb:
+                    score_overlay[parent] = sb
+                continue
+            if stype != "tool_call" and "tool_id" not in s:
+                continue
             scored_by = _scored_by_from_tags(tags)
             tool_id = _tool_id_from_tags(tags) or s.get("tool_id", "")
             out.append({
@@ -160,10 +181,21 @@ def default_procedural_tool_call_reader(
                 },
                 "tags": tags,
             })
-            if len(out) >= limit:
-                return out
 
-    return out
+    # G1 overlay: fill scored_by on tool_call records still None from the
+    # per-call tool_call_score patches (llm verdicts). Write-time oracle scores
+    # (scored_by:oracle on the tool_call itself) are NOT overwritten — only the
+    # unscored records get the llm verdict, so coverage/miner never double-count
+    # a call that was both oracle- and llm-touched (oracle write-time wins).
+    if overlay and score_overlay:
+        for rec in out:
+            if rec["scored_by"] in (None, ""):
+                sb = score_overlay.get(rec["tx_hash"])
+                if sb:
+                    rec["scored_by"] = sb
+                    rec["content"]["scored_by"] = sb
+
+    return out[:limit]
 
 
 def _scored_by_from_tags(tags: list) -> Optional[str]:
@@ -174,6 +206,17 @@ def _scored_by_from_tags(tags: list) -> Optional[str]:
             v = t.split(":", 1)[1]
             return None if v in ("none", "") else v
     return None
+
+
+def _parent_from_tags(tags: list) -> str:
+    """Extract the `parent:<full tx_hash>` tag written by a tool_call_score TX
+    (G1, AUDIT §5.3). Returns the full 64-hex parent tool_call tx, or '' if
+    absent. The full hash (not a prefix) is the overlay join key so two calls
+    sharing a short prefix never cross-contaminate scored_by."""
+    for t in tags:
+        if isinstance(t, str) and t.startswith("parent:"):
+            return t.split(":", 1)[1]
+    return ""
 
 
 def _tool_id_from_tags(tags: list) -> str:

@@ -25,7 +25,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
-__all__ = ["SurfacedItem", "CitedUseDetector"]
+__all__ = ["SurfacedItem", "CitedUseDetector", "knowledge_moment_signal"]
 
 
 @dataclass
@@ -156,3 +156,43 @@ class CitedUseDetector:
             for t in _TOKEN_RE.findall(text)
             if len(t) >= self._min_token_len
         }
+
+
+def knowledge_moment_signal(
+    detector: "CitedUseDetector",
+    surfaced_items: Iterable[SurfacedItem],
+    response_text: str,
+    *,
+    response_concept_ids: Optional[Iterable[str]] = None,
+) -> tuple[bool, bool, list[str]]:
+    """Compute the per-turn knowledge-moment signal (SPEC §25.9 / INV-Syn-25).
+
+    THE single source of this logic. It is computed ONCE per chat turn at the
+    post-LLM OVG boundary (agno PostHook) and consumed by both:
+      (a) the live `SovereigntyRatioMeter` — via agno_worker's `KNOWLEDGE_MOMENT`
+          emit (the per-turn denominator/numerator), AND the per-item
+          `MEMORY_RETRIEVAL_USED` reinforcement (INV-Syn-23), and
+      (b) the conversation-fork TX `sovereignty{needed,satisfied}` field — so the
+          meter is **rebuildable from the Timechain** (INV-Syn-25): the worker
+          boot-seeds it by replaying in-window conversation TXs.
+
+    Returns `(needed, satisfied, cited_item_ids)`:
+      needed    = ≥1 retrieval item was surfaced into context this turn.
+      satisfied = ≥1 surfaced item was cited by the response.
+      cited_item_ids = the cited subset (for per-item INV-Syn-23 reinforcement).
+
+    Soft + total: never raises (bad input / detector error → (False, False, [])),
+    so the chat hot path is never affected (INV-Syn-17).
+    """
+    try:
+        items = list(surfaced_items or [])
+        if not items:
+            return False, False, []
+        cited = detector.detect(
+            response_text=response_text,
+            surfaced_items=items,
+            response_concept_ids=response_concept_ids,
+        )
+        return True, bool(cited), list(cited)
+    except Exception:
+        return False, False, []

@@ -43,6 +43,8 @@ import threading
 import time
 from typing import Any, Optional
 
+from titan_hcl.synthesis.writer import on_writer, resolve_writer
+
 logger = logging.getLogger(__name__)
 
 
@@ -101,6 +103,7 @@ class ProceduralSkillStore:
         clock: Any = time.time,
         soft_retire_floor: float = DEFAULT_SOFT_RETIRE_FLOOR,
         on_soft_retire: Optional[Any] = None,
+        writer: Any = None,
     ):
         self._db = duckdb_conn
         self._faiss_path = str(faiss_path)
@@ -112,11 +115,14 @@ class ProceduralSkillStore:
         # FAISS index is loaded lazily on first embedding call.
         self._faiss = None
         self._faiss_dim = EMBEDDING_DIM
-        # Single lock guards every DuckDB + FAISS mutation. Sole-writer
-        # contract is preserved by the synthesis_worker process boundary;
-        # the lock makes write/snapshot-export atomic against any in-process
-        # reader (recompute_loop reading counters while recv_loop persists).
-        self._lock = threading.Lock()
+        # Single-writer-thread (Option C): every DuckDB + FAISS op runs on the
+        # one SynthesisWriter thread (the @on_writer methods below) → the writer
+        # is the serializer. INV-Syn-19 sole writer preserved. Embedding stays
+        # off the writer (compute). Tests inject no writer → InlineWriter.
+        self._writer = resolve_writer(writer)
+        # Vestigial after Option C; reentrant no-contention guard so method
+        # bodies are unchanged and nested store calls never self-deadlock.
+        self._lock = threading.RLock()
         # Counters for /v6/synthesis/skills/coverage + Observatory readouts.
         self._persists_seen = 0
         self._utility_updates = 0
@@ -127,6 +133,7 @@ class ProceduralSkillStore:
 
     # ── Schema bootstrap ────────────────────────────────────────────────
 
+    @on_writer
     def _init_schema(self) -> None:
         """CREATE TABLE IF NOT EXISTS procedural_skills (idempotent)."""
         with self._lock:
@@ -218,11 +225,15 @@ class ProceduralSkillStore:
                     vec.shape[1], self._faiss_dim,
                 )
                 return -1
-            self._ensure_faiss()
-            row_id = self._faiss.ntotal
-            self._faiss.add(vec)
-            self._save_faiss()
-            return row_id
+            # FAISS mutation on the writer thread (embed above ran on the
+            # caller thread — compute stays off the writer).
+            def _add() -> int:
+                self._ensure_faiss()
+                row_id = self._faiss.ntotal
+                self._faiss.add(vec)
+                self._save_faiss()
+                return row_id
+            return self._writer.submit_sync(_add)
         except Exception as e:
             logger.warning("[ProceduralSkillStore] embed_and_add failed: %s", e)
             return -1
@@ -261,32 +272,32 @@ class ProceduralSkillStore:
         post_json = json.dumps(list(postconditions or []), sort_keys=True, ensure_ascii=False, separators=(",", ":"))
         cf_json = json.dumps(list(compiled_from), ensure_ascii=False, separators=(",", ":"))
         utility = max(-1.0, min(1.0, float(utility_score)))
-        with self._lock:
-            # Check if skill exists — preserve counters on re-persist
-            existing = self._db.execute(
-                "SELECT embedding_id, success_count, failure_count, verified_at, created_at "
-                "FROM procedural_skills WHERE skill_id = ?",
-                [skill_id],
-            ).fetchall()
-            if existing:
-                emb_id, succ, fail, ver_at, created_at = existing[0]
-                success_count = int(succ or 0)
-                failure_count = int(fail or 0)
-                verified_at = ver_at  # preserve None or timestamp
-                created_at_val = float(created_at) if created_at is not None else ts_val
-                # Skip re-embedding if already embedded (FAISS is append-only;
-                # re-embedding would create a stale row id).
-                embedding_id = int(emb_id) if emb_id is not None and int(emb_id) >= 0 else -1
-            else:
-                success_count = 0
-                failure_count = 0
-                verified_at = None
-                created_at_val = ts_val
-                embedding_id = -1
-        # Embed AFTER releasing the lock (FAISS+embedder calls can be slow).
+        # Read existing on the writer thread (preserve counters on re-persist).
+        existing = self._writer.submit_sync(lambda: self._db.execute(
+            "SELECT embedding_id, success_count, failure_count, verified_at, created_at "
+            "FROM procedural_skills WHERE skill_id = ?",
+            [skill_id],
+        ).fetchall())
+        if existing:
+            emb_id, succ, fail, ver_at, created_at = existing[0]
+            success_count = int(succ or 0)
+            failure_count = int(fail or 0)
+            verified_at = ver_at  # preserve None or timestamp
+            created_at_val = float(created_at) if created_at is not None else ts_val
+            # Skip re-embedding if already embedded (FAISS is append-only;
+            # re-embedding would create a stale row id).
+            embedding_id = int(emb_id) if emb_id is not None and int(emb_id) >= 0 else -1
+        else:
+            success_count = 0
+            failure_count = 0
+            verified_at = None
+            created_at_val = ts_val
+            embedding_id = -1
+        # Embed on the caller thread (FAISS add inside routes to the writer).
         if embedding_id < 0:
             embedding_id = self._embed_and_add(nl_description)
-        with self._lock:
+
+        def _write() -> None:
             # True in-place UPSERT (NOT `INSERT OR REPLACE`). procedural_skills
             # has two secondary indexes (idx_procedural_skills_utility /
             # _last_used); DuckDB's OR REPLACE is DELETE+INSERT, which can corrupt
@@ -320,6 +331,7 @@ class ProceduralSkillStore:
                 ],
             )
             self._persists_seen += 1
+        self._writer.submit_sync(_write)
         self.snapshot_export()
         return embedding_id
 
@@ -331,6 +343,7 @@ class ProceduralSkillStore:
         """utility_score -= UTILITY_DELTA (clamped); failure_count += 1; last_used=now."""
         self._adjust_utility(skill_id, success=False)
 
+    @on_writer
     def apply_utility_delta(self, skill_id: str, delta: float) -> Optional[float]:
         """Apply an arbitrary utility delta (clamped to [-1,1]) WITHOUT bumping
         success/failure counts. Phase 9 / INV-Syn-24: the Tier-2 user-feedback
@@ -361,6 +374,7 @@ class ProceduralSkillStore:
         self.snapshot_export()
         return new_utility
 
+    @on_writer
     def _adjust_utility(self, skill_id: str, *, success: bool) -> None:
         if not skill_id:
             raise ValueError("skill_id must be non-empty")
@@ -412,6 +426,7 @@ class ProceduralSkillStore:
                     )
         self.snapshot_export()
 
+    @on_writer
     def mark_verified(self, skill_id: str) -> None:
         """INV-Syn-20: skill passed first-invocation chain-resolve + content-hash check."""
         now = float(self._clock())
@@ -423,6 +438,7 @@ class ProceduralSkillStore:
             self._verifications_seen += 1
         self.snapshot_export()
 
+    @on_writer
     def mark_rejected(self, skill_id: str, reason: str) -> None:
         """INV-Syn-20: skill failed first-invocation re-verification.
         Sets utility_score=-1.0 (hard ineligible) + verified_at=now (so the
@@ -443,6 +459,7 @@ class ProceduralSkillStore:
 
     # ── Read surface ────────────────────────────────────────────────────
 
+    @on_writer
     def read_skill(self, skill_id: str) -> Optional[dict]:
         """Returns the full skill row as a dict, or None if missing."""
         if not skill_id:
@@ -459,6 +476,7 @@ class ProceduralSkillStore:
             return None
         return self._row_to_dict(rows[0])
 
+    @on_writer
     def read_for_match(
         self, *, utility_floor: float = 0.3, k: int = 5, verified_only: bool = True,
     ) -> list[dict]:
@@ -490,6 +508,7 @@ class ProceduralSkillStore:
                 ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    @on_writer
     def list_all(self, *, limit: int = 100) -> list[dict]:
         """For Observatory list_skills route. Ordered by utility_score DESC."""
         with self._lock:
@@ -503,6 +522,22 @@ class ProceduralSkillStore:
             ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    @on_writer
+    def list_unverified(self, *, limit: int = 500) -> list[str]:
+        """Skill ids with verified_at IS NULL — the candidates the dream-cycle
+        SkillVerifier pass re-verifies (INV-Syn-20). Without that pass a skill's
+        verified_at stays NULL forever and read_for_match(verified_only=True)
+        never returns it → no skill is ever delegatable (skills=0 cause b)."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT skill_id FROM procedural_skills "
+                "WHERE verified_at IS NULL "
+                "ORDER BY created_at DESC LIMIT ?",
+                [max(1, int(limit))],
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    @on_writer
     def faiss_search(self, query_vec: Any, top_k: int = 20) -> list[tuple[int, float]]:
         """Returns [(embedding_id, distance), ...] for the top-k FAISS hits.
         Empty list when no FAISS index exists or it's empty."""
@@ -556,6 +591,7 @@ class ProceduralSkillStore:
 
     # ── Snapshot export ────────────────────────────────────────────────
 
+    @on_writer
     def _build_snapshot_payload(self) -> dict:
         with self._lock:
             rows = self._db.execute(
@@ -621,6 +657,7 @@ class ProceduralSkillStore:
 
     # ── Observability ───────────────────────────────────────────────────
 
+    @on_writer
     def stats(self) -> dict:
         """Counters surfaced via Observatory + the A.4/A.6 acceptance gates."""
         with self._lock:

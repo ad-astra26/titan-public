@@ -235,34 +235,69 @@ def test_synthesis_worker_main_boots_and_shuts_down(fresh_db_path, isolated_shm)
         daemon=True, name="synthesis_test_main")
     t.start()
 
-    # Give boot a moment to land MODULE_READY + initial recompute.
-    time.sleep(1.5)
+    # Deterministic timing (NOT fixed sleeps — boot in a degraded test env can
+    # take several seconds, and the recompute persist is submitted to the
+    # SynthesisWriter thread asynchronously). We poll the SYNTHESIS_RECOMPUTE_
+    # DONE payloads off send_q. MODULE_READY was RETIRED in Phase 11 §11.I.2
+    # (D2 — no dual-publish; the SHM slot state is the readiness contract now).
+    seen: list[dict] = []
 
-    # Send a use-gated access event.
+    def _drain() -> None:
+        while not send_q.empty():
+            try:
+                seen.append(send_q.get_nowait())
+            except queue.Empty:
+                break
+
+    def _types() -> list:
+        return [m.get("type") for m in seen]
+
+    def _wait(pred, timeout: float = 25.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _drain()
+            if pred():
+                return True
+            time.sleep(0.1)
+        return False
+
+    # Boot complete + recompute loop alive (a recompute pass was emitted).
+    assert _wait(lambda: bus.SYNTHESIS_RECOMPUTE_DONE in _types()), (
+        f"worker never emitted a recompute pass (boot failed?): {_types()}")
+
+    # Send the cited access event, then wait for a recompute pass that ACTUALLY
+    # persisted a row (items_recomputed>=1) — that proves the recv loop recorded
+    # the item AND a recompute materialized+submitted the persist to the writer.
+    # Counting passes alone is racy: passes that fire before the recv loop
+    # records the event report items_recomputed=0.
     recv_q.put({
         "type": bus.MEMORY_RETRIEVAL_USED,
-        "payload": {"item_id": "kuzu:NODE_42", "ts": time.time()},
+        # used_by_llm=True is REQUIRED by the Phase 9 INV-Syn-23 cited gate
+        # (synthesis_worker.py:2096): only LLM-CITED items are reinforced via
+        # record_access; surfaced-not-cited is telemetry-only. Pre-Phase-9 the
+        # field didn't exist, so this test (written then) omitted it.
+        "payload": {
+            "item_id": "kuzu:NODE_42", "ts": time.time(), "used_by_llm": True,
+        },
     })
-    time.sleep(1.2)    # let recv loop drain + next recompute fire
 
-    # Send shutdown.
+    def _persisted_a_row() -> bool:
+        return any(
+            m.get("type") == bus.SYNTHESIS_RECOMPUTE_DONE
+            and (m.get("payload") or {}).get("items_recomputed", 0) >= 1
+            for m in seen)
+    assert _wait(_persisted_a_row), (
+        f"no recompute pass persisted the access item: {_types()}")
+
+    # Shutdown — store.close() CHECKPOINTs the writer-persisted rows (FIFO after
+    # the submitted persist, so the row is durably flushed before we read).
     recv_q.put({"type": bus.MODULE_SHUTDOWN, "payload": {}})
-    t.join(timeout=5.0)
+    t.join(timeout=10.0)
     assert not t.is_alive(), "synthesis_worker did not shut down cleanly"
+    _drain()
 
-    # Drain send_q and check for MODULE_READY + at least one
-    # SYNTHESIS_RECOMPUTE_DONE.
-    seen_types: list[str] = []
-    while not send_q.empty():
-        try:
-            seen_types.append(send_q.get_nowait().get("type"))
-        except queue.Empty:
-            break
-
-    assert bus.MODULE_READY in seen_types, (
-        f"MODULE_READY missing from emitted types: {seen_types}")
-    assert bus.SYNTHESIS_RECOMPUTE_DONE in seen_types, (
-        f"SYNTHESIS_RECOMPUTE_DONE missing from emitted types: {seen_types}")
+    assert bus.SYNTHESIS_RECOMPUTE_DONE in _types(), (
+        f"SYNTHESIS_RECOMPUTE_DONE missing from emitted types: {_types()}")
 
     # Verify the access landed in DuckDB.
     import duckdb

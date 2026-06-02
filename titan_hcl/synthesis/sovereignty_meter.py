@@ -23,7 +23,11 @@ import threading
 from collections import deque
 from typing import Optional
 
-__all__ = ["SovereigntyRatioMeter", "WINDOW_SECONDS"]
+__all__ = [
+    "SovereigntyRatioMeter",
+    "WINDOW_SECONDS",
+    "boot_seed_from_conversation_chain",
+]
 
 WINDOW_SECONDS = {
     "24h": 24 * 3600,
@@ -107,3 +111,107 @@ class SovereigntyRatioMeter:
             "ratio": round(ratio, 4),
             "trend": trend,
         }
+
+
+def boot_seed_from_conversation_chain(
+    meter: "SovereigntyRatioMeter",
+    *,
+    data_dir: str,
+    since_ts: float,
+    cap: int = 5000,
+    index_db_path: Optional[str] = None,
+) -> dict:
+    """Reseed `meter` from in-window conversation-fork TXs (G9 / INV-Syn-25).
+
+    The meter holds ephemeral rolling-window marks that a worker respawn zeros
+    (the crash-loop audit §5.3 "respawn zeros windows" gap). INV-Syn-25 makes
+    metrics a **rebuildable projection over the Timechain**, so on boot we
+    replay the per-turn `sovereignty{needed,satisfied}` signal that arch §7
+    conversation-fork TXs now carry: `needed` → `record_knowledge_moment(ts)`;
+    `satisfied` → `record_recall_satisfied('cited_recall', ts)`.
+
+    Reads the conversation fork (resolved BY NAME per INV-Syn-26 — id is
+    chain-local) from the read-only `block_index` + chain `.bin` payload. The
+    conversation fork is ~one block per turn (the batched flood is the *episodic*
+    fork), so each block's content IS the per-turn TX; any batch envelope that
+    lacks a top-level `sovereignty` dict is skipped. Bounded by `since_ts` (the
+    longest standard rolling window — the unbounded "all" window's full-journey
+    accuracy is the genesis-spine aggregate's job, arch §18 TARGET) and `cap`
+    (logged when hit — no silent truncation). Read-only; never raises.
+
+    Returns `{scanned, knowledge_moments, recall_satisfied, capped,
+    window_since_ts}`.
+    """
+    import os
+    import sqlite3
+    from pathlib import Path
+
+    out = {
+        "scanned": 0,
+        "knowledge_moments": 0,
+        "recall_satisfied": 0,
+        "capped": False,
+        "window_since_ts": float(since_ts),
+    }
+    path = index_db_path or os.path.join(data_dir, "timechain", "index.db")
+    if not os.path.exists(path):
+        return out
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+    except Exception:
+        return out
+    try:
+        rows = list(conn.execute(
+            "SELECT bi.block_hash, bi.fork_id, bi.file_offset, bi.timestamp "
+            "FROM block_index bi "
+            "JOIN fork_registry fr ON bi.fork_id = fr.fork_id "
+            "WHERE fr.fork_name = 'conversation' "
+            "  AND bi.thought_type = 'conversation' "
+            "  AND bi.timestamp > ? "
+            "ORDER BY bi.timestamp ASC LIMIT ?",
+            [float(since_ts), int(cap) + 1],
+        ))
+    except sqlite3.Error:
+        rows = []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if len(rows) > cap:
+        out["capped"] = True
+        rows = rows[:cap]
+    if not rows:
+        return out
+
+    try:
+        from titan_hcl.synthesis.chain_reader import read_block_content_at
+    except Exception:
+        return out
+
+    ddir = Path(data_dir)
+    for r in rows:
+        out["scanned"] += 1
+        try:
+            content = read_block_content_at(
+                ddir, int(r["fork_id"]), int(r["file_offset"]))
+        except Exception:
+            continue
+        if not isinstance(content, dict):
+            continue
+        sov = content.get("sovereignty")
+        if not isinstance(sov, dict):
+            continue
+        ts = float(r["timestamp"])
+        try:
+            if sov.get("needed"):
+                meter.record_knowledge_moment(ts)
+                out["knowledge_moments"] += 1
+            if sov.get("satisfied"):
+                meter.record_recall_satisfied(kind="cited_recall", ts=ts)
+                out["recall_satisfied"] += 1
+        except Exception:
+            continue
+    return out

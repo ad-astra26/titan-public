@@ -224,6 +224,18 @@ class ConsolidationPass:
             self._anchor_pass_tx(result)
             return result
 
+        # G6 (AUDIT §5.3): if NO candidate carried an embedding, the tx_hash
+        # FAISS spine is unavailable → clustering degrades to tag-only, but
+        # spine TXs have no tags → ~0 clusters → 0 concepts SILENTLY. Surface
+        # the degraded pass as a health WARNING (not a silent debug) so the
+        # operator can see + fix the FAISS wiring.
+        if txs and not any(getattr(t, "embedding", None) is not None for t in txs):
+            logger.warning(
+                "[ConsolidationPass] %s — 0/%d candidate TXs carry an embedding "
+                "(tx_hash FAISS spine unavailable?); clustering degraded to "
+                "tag-only → expect ~0 concepts this pass. Check synth_vector_store.",
+                pass_id, len(txs))
+
         # Step 2 — cluster.
         clusters = self._cluster_txs(txs)
         result.clusters_considered = len(clusters)
@@ -475,15 +487,15 @@ class ConsolidationPass:
         )
         try:
             self._writer.emit(event)
-            # Use the OuterMemoryWriter's content-hash machinery indirectly
-            # — for visibility we record a hash of the content here so
-            # observability + tests can correlate.
-            import hashlib
-            import json
-            canonical = json.dumps(
-                content, sort_keys=True, separators=(",", ":"),
-            ).encode()
-            result.pass_tx_hash = hashlib.sha256(canonical).hexdigest()
+            # G5 (AUDIT §5.3): correlate pass_tx_hash to the REAL chain anchor
+            # by using the SAME canonicalization every OuterMemoryWriter
+            # anchor_tx uses (was an inline duplicate that could silently drift
+            # from the chain tx_hash convention). _canonical_concept_content_hash
+            # == Transaction.compute_hash style == the tx_hash consumers expect.
+            from titan_hcl.synthesis.outer_memory_writer import (
+                _canonical_concept_content_hash,
+            )
+            result.pass_tx_hash = _canonical_concept_content_hash(content)
         except Exception as e:
             logger.warning(
                 "[ConsolidationPass] pass-summary TX emit failed: %s", e,

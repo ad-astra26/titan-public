@@ -2179,6 +2179,62 @@ def create_post_hook(plugin):
                         "(non-blocking): %s", _tx_err)
                 _ph_stage("ovg_after_topictags")
 
+                # G9 (arch §7 / INV-Syn-25): compute the per-turn knowledge-
+                # moment signal ONCE here — the single post-LLM cited-use
+                # detection — so it is (a) persisted on the conv-TX below AND
+                # (b) reused by agno_worker's live KNOWLEDGE_MOMENT + per-item
+                # MEMORY_RETRIEVAL_USED emits (it reads `_last_cited_use`; it
+                # falls back to its own detect() if the stash is absent). Net:
+                # NO duplicate detect() on the chat hot path. Soft-fail per
+                # INV-Syn-17 — never blocks the response.
+                _p3_sovereignty = None
+                try:
+                    from titan_hcl.synthesis.cited_use import (
+                        CitedUseDetector, SurfacedItem, knowledge_moment_signal,
+                    )
+                    _km_uid = getattr(plugin, "_current_user_id", "") or ""
+                    _km_sid = getattr(plugin, "_current_session_id", "") or ""
+                    _km_cid = f"{_km_uid}:{_km_sid}"
+                    _km_reg = getattr(plugin, "_last_surfaced_items", None)
+                    _km_raw = (_km_reg.get(_km_cid, [])
+                               if isinstance(_km_reg, dict) else [])
+                    if _km_raw:
+                        _km_det = getattr(plugin, "_cited_use_detector", None)
+                        if _km_det is None:
+                            _km_det = CitedUseDetector()
+                            plugin._cited_use_detector = _km_det
+                        _km_items = [
+                            SurfacedItem(
+                                item_id=s.get("item_id", ""),
+                                title=s.get("title", ""),
+                                content_snippet=s.get("content_snippet", ""),
+                                concept_ids=s.get("concept_ids", []) or [],
+                            )
+                            for s in _km_raw if s.get("item_id")
+                        ]
+                        _km_needed, _km_satisfied, _km_cited = (
+                            knowledge_moment_signal(
+                                _km_det, _km_items, response_text))
+                        _p3_sovereignty = {
+                            "needed": _km_needed, "satisfied": _km_satisfied}
+                        # Stash for agno_worker's live emits (the cited set
+                        # drives per-item INV-Syn-23 reinforcement). Keyed
+                        # identically to `_last_surfaced_items` so the worker's
+                        # `f"{user_id}:{session_id}"` lookup matches.
+                        _km_stash = getattr(plugin, "_last_cited_use", None)
+                        if not isinstance(_km_stash, dict):
+                            _km_stash = {}
+                            plugin._last_cited_use = _km_stash
+                        _km_stash[_km_cid] = {
+                            "needed": _km_needed,
+                            "satisfied": _km_satisfied,
+                            "cited": list(_km_cited),
+                        }
+                except Exception as _km_err:
+                    logger.debug(
+                        "[PostHook:G9] knowledge-moment signal skipped "
+                        "(non-blocking): %s", _km_err)
+
                 from titan_hcl.llm_pipeline.verifier import verify_post_async
                 _ph_stage("ovg_pre_verify")
                 _verified = await verify_post_async(
@@ -2201,6 +2257,9 @@ def create_post_hook(plugin):
                     neuromods=_p3_snapshot.get("neuromods"),
                     embedding_hash=_p3_snapshot.get("embedding_hash", ""),
                     importance=_p3_snapshot.get("importance", 0.5),
+                    # G9 (arch §7 / INV-Syn-25) — per-turn knowledge-moment
+                    # signal persisted on the conv-TX (computed once above).
+                    sovereignty=_p3_sovereignty,
                 )
                 _ph_stage("ovg_post_verify")
                 response_text = _verified.text

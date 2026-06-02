@@ -58,6 +58,8 @@ from typing import Any, Optional
 import duckdb
 import msgpack
 
+from titan_hcl.synthesis.writer import on_writer, resolve_writer
+
 logger = logging.getLogger(__name__)
 
 
@@ -96,18 +98,47 @@ class StandingBundleStore:
         db_path: str,
         ring_size: int = DEFAULT_RING_SIZE,
         max_entities: int = DEFAULT_MAX_ENTITIES,
+        *,
+        conn: Any = None,
+        writer: Any = None,
     ) -> None:
         self._db_path = db_path
         self._ring_size = max(1, int(ring_size))
         self._max_entities = max(1, int(max_entities))
-        # Lock guarding the in-mem cache + DuckDB connection. Hot path is
-        # single-threaded (synthesis_worker recv loop) but the recompute
-        # daemon thread may also call export_snapshot — so the lock is
-        # required.
-        self._lock = threading.Lock()
+        # Single-writer-thread (Option C): every DuckDB op runs on the one
+        # SynthesisWriter thread (maintain() is @on_writer). CONN-2 FOLD
+        # (AUDIT §5.2): in production `conn` is ActivationStore's shared
+        # synthesis.duckdb handle — NOT a second duckdb.connect to the same
+        # file (two Connection objects mutating one file's WAL/buffer-manager
+        # was a confirmed corruption path). Tests pass no conn → own handle +
+        # InlineWriter (single-threaded). INV-Syn-3 / G21 sole writer.
+        self._writer = resolve_writer(writer)
+        self._owns_conn = conn is None
+        # Vestigial after Option C; reentrant no-contention guard.
+        self._lock = threading.RLock()
 
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-        self._conn = duckdb.connect(db_path)
+        if conn is not None:
+            self._conn = conn
+        else:
+            self._conn = self._writer.submit_sync(
+                lambda: duckdb.connect(db_path))
+        self._writer.submit_sync(self._init_schema)
+
+        # In-memory cache `(class, id, fork) -> list[record dict]`. Loaded
+        # at construction so reads + maintains hit RAM, with DuckDB as the
+        # durable backing store. Modest size — bounded by max_entities.
+        self._cache: dict[tuple[str, str, str], list[dict]] = {}
+        # last_updated mirror — used for LRU eviction without scanning DB.
+        self._last_updated: dict[tuple[str, str, str], float] = {}
+        self._writer.submit_sync(self._load_existing)
+
+        # Aggregate stats — surface on Observatory + tests.
+        self._total_maintains = 0
+        self._total_evictions = 0
+        self._total_lru_evictions = 0
+
+    def _init_schema(self) -> None:
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS association_bundles (
@@ -121,19 +152,6 @@ class StandingBundleStore:
             )
             """
         )
-
-        # In-memory cache `(class, id, fork) -> list[record dict]`. Loaded
-        # at construction so reads + maintains hit RAM, with DuckDB as the
-        # durable backing store. Modest size — bounded by max_entities.
-        self._cache: dict[tuple[str, str, str], list[dict]] = {}
-        # last_updated mirror — used for LRU eviction without scanning DB.
-        self._last_updated: dict[tuple[str, str, str], float] = {}
-        self._load_existing()
-
-        # Aggregate stats — surface on Observatory + tests.
-        self._total_maintains = 0
-        self._total_evictions = 0
-        self._total_lru_evictions = 0
 
     # ── bootstrap ─────────────────────────────────────────────────────
 
@@ -168,6 +186,7 @@ class StandingBundleStore:
 
     # ── hot path ──────────────────────────────────────────────────────
 
+    @on_writer
     def maintain(
         self,
         entity_class: str,
@@ -220,10 +239,17 @@ class StandingBundleStore:
         ec, eid, fork = key
         blob = msgpack.packb(bundle, use_bin_type=True)
         try:
+            # ON CONFLICT DO UPDATE (NOT INSERT OR REPLACE — that is
+            # DELETE+INSERT and churns the composite-PK ART index, the same
+            # crash class fixed for actr_buffers / procedural_skills on
+            # 2026-06-01; this was the un-migrated sibling per AUDIT §5.4).
             self._conn.execute(
-                "INSERT OR REPLACE INTO association_bundles "
+                "INSERT INTO association_bundles "
                 "(entity_class, entity_id, fork, bundle, last_updated, version) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (entity_class, entity_id, fork) DO UPDATE SET "
+                "bundle = excluded.bundle, last_updated = excluded.last_updated, "
+                "version = excluded.version",
                 (ec, eid, fork, blob, now, BUNDLE_SCHEMA_VERSION),
             )
         except Exception as exc:
@@ -330,11 +356,18 @@ class StandingBundleStore:
             }
 
     def close(self) -> None:
-        with self._lock:
+        # CONN-2 fold: only close if we own the handle (test mode). In
+        # production the shared synthesis.duckdb conn is owned + closed by
+        # ActivationStore; closing it here would double-close.
+        if not self._owns_conn:
+            return
+
+        def _op() -> None:
             try:
                 self._conn.close()
             except Exception:
                 logger.exception("[StandingBundleStore] close failed")
+        self._writer.submit_sync(_op)
 
 
 __all__ = [

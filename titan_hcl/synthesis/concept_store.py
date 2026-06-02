@@ -39,6 +39,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional, Protocol
 
+from titan_hcl.synthesis.writer import on_writer, resolve_writer
+
 logger = logging.getLogger(__name__)
 
 
@@ -197,14 +199,23 @@ class ConceptStore:
         *,
         groundedness_params: _GroundednessParams | None = None,
         clock: Any = time.time,                  # injectable for deterministic tests
+        db_writer: Any = None,
     ):
         self._graph = graph
         self._writer = outer_memory_writer
+        # Single-writer-thread (Option C): the Kuzu spine graph is touched only
+        # on the one SynthesisWriter thread (the @on_writer methods below) —
+        # consolidation writes, recompute exports, and fork-gc prunes can no
+        # longer race on it. Named `_db_writer` because `_writer` holds the
+        # bus-only OuterMemoryWriter. INV-Syn-7 sole writer preserved. Tests
+        # inject none → InlineWriter runs ops inline.
+        self._db_writer = resolve_writer(db_writer)
         self._params = groundedness_params or _GroundednessParams()
         self._clock = clock
 
     # ── Public surface ────────────────────────────────────────
 
+    @on_writer
     def create_concept(
         self,
         concept_id: str,
@@ -212,6 +223,8 @@ class ConceptStore:
         memory_type: str,
         composed_from: Optional[list[tuple[str, int]]] = None,
         derivation_evidence: Optional[list[str]] = None,
+        derivation_merkle_root: Optional[str] = None,
+        oracle_verdict: Optional[dict] = None,
     ) -> ConceptVersion:
         """Materialize a brand-new spine concept at v=1.
 
@@ -246,19 +259,38 @@ class ConceptStore:
             params=self._params,
         )
 
-        # Step 1: anchor the v=1 TX. Writer failure aborts the whole op.
+        # Step 1: anchor the v=1 TX. Writer failure aborts the whole op. G4
+        # (AUDIT §5.3): when a proof (oracle_verdict) is supplied — fork
+        # graduation — emit the SINGLE canonical concept-version TX WITH the
+        # derivation merkle root + companion verdict (INV-4 single write), NOT a
+        # bare TX the caller then DUPLICATES with a second
+        # write_concept_version_with_proof.
         try:
-            tx_hash = self._writer.write_concept_version(
-                concept_id=concept_id,
-                version=1,
-                name=name,
-                memory_type=memory_type,
-                parent_version_tx=None,  # v=1 — genesis of this spine concept
-                composed_from=composed_from,
-                derivation_evidence=derivation_evidence,
-                groundedness=initial_groundedness,
-                derivation_merkle_root=None,  # Phase 5 wires this
-            )
+            if oracle_verdict is not None:
+                tx_hash, _verdict_tx = self._writer.write_concept_version_with_proof(
+                    concept_id=concept_id,
+                    version=1,
+                    name=name,
+                    memory_type=memory_type,
+                    parent_version_tx=None,
+                    composed_from=composed_from,
+                    derivation_evidence=derivation_evidence,
+                    groundedness=initial_groundedness,
+                    derivation_merkle_root=derivation_merkle_root,
+                    oracle_verdict=oracle_verdict,
+                )
+            else:
+                tx_hash = self._writer.write_concept_version(
+                    concept_id=concept_id,
+                    version=1,
+                    name=name,
+                    memory_type=memory_type,
+                    parent_version_tx=None,  # v=1 — genesis of this spine concept
+                    composed_from=composed_from,
+                    derivation_evidence=derivation_evidence,
+                    groundedness=initial_groundedness,
+                    derivation_merkle_root=derivation_merkle_root,
+                )
         except Exception as e:
             logger.error(
                 "[ConceptStore] create_concept(%s) writer failed: %s",
@@ -299,12 +331,15 @@ class ConceptStore:
             anchor_tx=tx_hash, created_at=self._clock(),
         )
 
+    @on_writer
     def bump_version(
         self,
         concept_id: str,
         composed_from: Optional[list[tuple[str, int]]] = None,
         derivation_evidence: Optional[list[str]] = None,
         groundedness_at_bump: Optional[float] = None,
+        derivation_merkle_root: Optional[str] = None,
+        oracle_verdict: Optional[dict] = None,
     ) -> ConceptVersion:
         """Insert v(n+1) for an existing concept. INV-3: parent stays
         immutable; INV-10: parent MUST exist or ParentVersionMissing raises.
@@ -334,17 +369,34 @@ class ConceptStore:
             )
 
         try:
-            tx_hash = self._writer.write_concept_version(
-                concept_id=concept_id,
-                version=new_version,
-                name=name,
-                memory_type=memory_type,
-                parent_version_tx=parent_tx,
-                composed_from=composed_from,
-                derivation_evidence=derivation_evidence,
-                groundedness=groundedness_at_bump,
-                derivation_merkle_root=None,
-            )
+            # G4 (AUDIT §5.3): with a proof (oracle_verdict, fork graduation),
+            # emit the SINGLE canonical version TX WITH merkle root + companion
+            # verdict (INV-4 single write); else a bare version TX.
+            if oracle_verdict is not None:
+                tx_hash, _verdict_tx = self._writer.write_concept_version_with_proof(
+                    concept_id=concept_id,
+                    version=new_version,
+                    name=name,
+                    memory_type=memory_type,
+                    parent_version_tx=parent_tx,
+                    composed_from=composed_from,
+                    derivation_evidence=derivation_evidence,
+                    groundedness=groundedness_at_bump,
+                    derivation_merkle_root=derivation_merkle_root,
+                    oracle_verdict=oracle_verdict,
+                )
+            else:
+                tx_hash = self._writer.write_concept_version(
+                    concept_id=concept_id,
+                    version=new_version,
+                    name=name,
+                    memory_type=memory_type,
+                    parent_version_tx=parent_tx,
+                    composed_from=composed_from,
+                    derivation_evidence=derivation_evidence,
+                    groundedness=groundedness_at_bump,
+                    derivation_merkle_root=derivation_merkle_root,
+                )
         except Exception as e:
             logger.error(
                 "[ConceptStore] bump_version(%s,v%d) writer failed: %s",
@@ -383,6 +435,7 @@ class ConceptStore:
             anchor_tx=tx_hash, created_at=self._clock(),
         )
 
+    @on_writer
     def add_composition_edge(
         self,
         from_concept: tuple[str, int],
@@ -400,6 +453,7 @@ class ConceptStore:
             direction=direction,
         )
 
+    @on_writer
     def recompute_groundedness(
         self,
         concept_id: str,
@@ -426,6 +480,7 @@ class ConceptStore:
             return 0.0
         return new_value
 
+    @on_writer
     def recompute_groundedness_batch(
         self,
         rows: Iterable[dict],
@@ -454,6 +509,7 @@ class ConceptStore:
 
     # ── Snapshot export (cross-process read surface — FU-1) ──────────
 
+    @on_writer
     def export_snapshot(self, snapshot_path: str) -> int:
         """Atomic JSON export of the full spine state for cross-process
         readers. Mirrors the standing_store + activation_snapshot pattern:
@@ -560,8 +616,80 @@ class ConceptStore:
             return 0
         return len(concepts)
 
+    @on_writer
+    def read_spine_strands(self, concept_id: str, version: int) -> Optional[dict]:
+        """Four spine strands for a (concept_id, version) as Timechain-anchor
+        (tx_hash) lists — the read surface CGNMeaningOracle.meaning_of consumes
+        (INV-Syn-1 read path; G3, AUDIT §5.3).
+
+        Per ARCHITECTURE_synthesis_engine.md §6 ("Episodic + declarative strands
+        of the spine are Timechain-ref'd, not separate Kuzu nodes — Timechain is
+        canonical, INV-2") the strands are NOT separate Kuzu tables; they are
+        anchor-hash lists derived from the populated spine — the concept-
+        version's own anchor_tx (its definitional/declarative TX, §10) plus its
+        COMPOSED_FROM parents' anchor_tx bucketed by each parent's memory_type:
+          declarative := [self.anchor_tx] + declarative-typed parents
+          procedural  := procedural-typed parents (the USES_SKILL strand is
+                          schema-only/unpopulated; composed-from procedural
+                          bases are the faithful Timechain-anchored proxy)
+          episodic    := episodic-typed parents
+          felt        := [] (Phase-7 inner-outer-bridge strand; no Kuzu data
+                          backs felt yet → felt coverage = 0; INV-Syn-1: never
+                          invent a grounding. The bridge extends Concept with
+                          felt anchors later, §15.6.)
+        meta-typed parents are not one of the four strands (§6) and are skipped.
+
+        version <= 0 → latest (matches ConceptRef default version=0); >= 1 →
+        exact. Missing concept → None (CGNMeaningOracle treats None as an empty
+        MeaningStrand). Runs on the single writer thread (@on_writer): Kuzu is
+        writer-owned, so off-thread reads raise WriterThreadViolation."""
+        if version is None or int(version) <= 0:
+            row = self._graph.spine_get_latest_concept(concept_id)
+        else:
+            row = self._graph.spine_get_concept_version(concept_id, int(version))
+        if not row:
+            return None
+        resolved_version = int(row.get("version") or 0)
+        own_anchor = row.get("anchor_tx") or ""
+
+        declarative: list[str] = []
+        procedural: list[str] = []
+        episodic: list[str] = []
+        if own_anchor:
+            declarative.append(own_anchor)
+        try:
+            qr = self._graph._conn.execute(
+                "MATCH (a:Concept {concept_id: $cid, version: $v})"
+                "-[:COMPOSED_FROM]->(b:Concept) "
+                "RETURN b.memory_type, b.anchor_tx",
+                {"cid": concept_id, "v": resolved_version},
+            )
+            while qr.has_next():
+                mrow = qr.get_next()
+                mtype, atx = mrow[0], (mrow[1] or "")
+                if not atx:
+                    continue
+                if mtype == "declarative":
+                    declarative.append(atx)
+                elif mtype == "procedural":
+                    procedural.append(atx)
+                elif mtype == "episodic":
+                    episodic.append(atx)
+                # 'meta' parents are not one of the four spine strands — skip.
+        except Exception as e:
+            logger.debug(
+                "[ConceptStore] read_spine_strands: COMPOSED_FROM read failed "
+                "for %s:%s: %s", concept_id, resolved_version, e)
+        return {
+            "declarative_anchors": declarative,
+            "procedural_anchors": procedural,
+            "episodic_anchors": episodic,
+            "felt_anchors": [],
+        }
+
     # ── Internal helpers ─────────────────────────────────────
 
+    @on_writer
     def _maintain_composition_edges(
         self,
         from_concept_id: str,

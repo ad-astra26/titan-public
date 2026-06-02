@@ -60,6 +60,7 @@ from titan_hcl.synthesis.oracle_gate import (
     ensure_oracle_daily_spend_table,
 )
 from titan_hcl.synthesis.plugs import OracleClaim, OracleVerdict, TruthOraclePlug
+from titan_hcl.synthesis.writer import on_writer, resolve_writer
 
 if TYPE_CHECKING:
     from titan_hcl.synthesis.outer_memory_writer import OuterMemoryWriter
@@ -113,17 +114,24 @@ class OracleSpendStore:
     because only this process holds the DB handle.
     """
 
-    def __init__(self, conn):
+    def __init__(self, conn, writer=None):
         self._conn = conn
-        self._lock = threading.Lock()
-        # Ensure the table exists — idempotent CREATE.
-        ensure_oracle_daily_spend_table(conn)
+        # Single-writer-thread (Option C): the conn is touched only on the one
+        # SynthesisWriter thread (the @on_writer methods below). INV-Syn-3 sole
+        # writer preserved. Tests inject no writer → InlineWriter runs inline.
+        self._writer = resolve_writer(writer)
+        # Vestigial after Option C (writer thread serializes); reentrant guard.
+        self._lock = threading.RLock()
+        # Ensure the table exists — idempotent CREATE, on the writer thread.
+        self._writer.submit_sync(
+            lambda: ensure_oracle_daily_spend_table(self._conn))
 
     @staticmethod
     def _today(now: float) -> str:
         """UTC YYYY-MM-DD for grouping; matches DuckDB DATE literal."""
         return datetime.datetime.fromtimestamp(now, tz=datetime.timezone.utc).strftime("%Y-%m-%d")
 
+    @on_writer
     def spent_today(self, oracle_id: str, *, now: Optional[float] = None) -> float:
         """SOL spent on ``oracle_id`` for today (UTC). Zero if no row."""
         now = now or time.time()
@@ -135,6 +143,7 @@ class OracleSpendStore:
             ).fetchone()
         return float(row[0]) if row else 0.0
 
+    @on_writer
     def record_spend(
         self,
         oracle_id: str,
@@ -173,6 +182,7 @@ class OracleSpendStore:
             )
             return new_total
 
+    @on_writer
     def export_snapshot(self, *, now: Optional[float] = None) -> dict:
         """Today's per-oracle spend snapshot for the Observatory
         ``/v6/synthesis/oracles/budget`` route (P6.K)."""

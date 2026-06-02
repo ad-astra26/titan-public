@@ -571,9 +571,20 @@ async def _handle_chat_request(msg: dict, agent, worker_plugin, send_queue,
                 )
                 for s in _surfaced if s.get("item_id")
             ]
-            _cited = set(_detector.detect(
-                response_text=response_text, surfaced_items=_items,
-            ))
+            # G9: prefer the cited set already computed ONCE at the OVG
+            # boundary (agno PostHook, `_last_cited_use`) — avoids a SECOND
+            # detect() on the chat hot path. Fall back to computing here when
+            # the stash is absent (non-PostHook paths / nothing surfaced there)
+            # so behaviour is never worse than pre-G9.
+            _cu_stash = getattr(worker_plugin, "_last_cited_use", None)
+            _cu_hit = (_cu_stash.pop(_chat_id, None)
+                       if isinstance(_cu_stash, dict) else None)
+            if _cu_hit is not None:
+                _cited = set(_cu_hit.get("cited", []))
+            else:
+                _cited = set(_detector.detect(
+                    response_text=response_text, surfaced_items=_items,
+                ))
             _now = time.time()
             for _it in _items:
                 _send(send_queue, MEMORY_RETRIEVAL_USED, name, "all", {

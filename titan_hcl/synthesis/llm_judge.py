@@ -245,6 +245,20 @@ class LLMJudge:
                 patch_tx_hash = self._writer.write_scored_by_patch(entries=scored_pairs)
             except Exception as e:
                 logger.warning("[LLMJudge] write_scored_by_patch failed: %s", e)
+            # G1 (AUDIT §5.3): ALSO anchor a per-call tool_call_score TX on the
+            # PROCEDURAL fork for each scored call. Its tags (scored_by + the
+            # full 64-hex parent tx) survive v2 batch-sealing, so the procedural
+            # tool_call_reader overlays scored_by onto the tool_call records —
+            # the meta scored_by_patch above is kept as audit but v2 sealing
+            # drops its per-entry content, so the miner can't read it from there.
+            for pair in scored_pairs:
+                try:
+                    self._writer.write_tool_call_score(
+                        parent_tool_call_tx=pair["parent_tool_call_tx"],
+                        scored_by=pair["scored_by"],
+                    )
+                except Exception as e:
+                    logger.debug("[LLMJudge] write_tool_call_score failed: %s", e)
 
         summary = {
             "ts": now,

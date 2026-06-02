@@ -38,6 +38,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from titan_hcl.synthesis.writer import on_writer, resolve_writer
+
 logger = logging.getLogger(__name__)
 
 
@@ -94,14 +96,20 @@ class ActrBufferStore:
         duckdb_conn: _DuckDBConnLike,
         snapshot_path: str | os.PathLike,
         clock: Any = time.time,
+        writer: Any = None,
     ):
         self._db = duckdb_conn
         self._snapshot_path = str(snapshot_path)
         self._clock = clock
-        # Guards the DuckDB writes + snapshot export. Sole-writer thread
-        # in synthesis_worker, but `recv_loop` may dispatch commands while
-        # `recompute_loop` reads counters; lock keeps the window airtight.
-        self._lock = threading.Lock()
+        # Single-writer-thread (Option C): every DuckDB op runs on the one
+        # SynthesisWriter thread (the @on_writer methods below) → the writer IS
+        # the serializer. INV-Syn-16 sole writer preserved. Tests inject no
+        # writer → InlineWriter runs ops inline.
+        self._writer = resolve_writer(writer)
+        # Vestigial after Option C (the writer thread already serializes); kept
+        # as a reentrant no-contention guard so the method bodies are unchanged
+        # and a nested store call on the writer thread never self-deadlocks.
+        self._lock = threading.RLock()
         # Cheap counter exposed via `stats()` for the A.7 acceptance gate
         # (synthesis_worker counter cross-checks agno emit counter).
         self._writes_seen = 0
@@ -110,6 +118,7 @@ class ActrBufferStore:
 
     # ── Schema bootstrap ────────────────────────────────────────────────
 
+    @on_writer
     def _init_schema(self) -> None:
         """CREATE TABLE IF NOT EXISTS actr_buffers (idempotent)."""
         with self._lock:
@@ -135,6 +144,7 @@ class ActrBufferStore:
 
     # ── Write surface (INV-Syn-16) ──────────────────────────────────────
 
+    @on_writer
     def persist(
         self,
         *,
@@ -184,6 +194,7 @@ class ActrBufferStore:
             self._writes_seen += 1
         self.snapshot_export()
 
+    @on_writer
     def clear(self, *, chat_id: str, buffer_name: str) -> None:
         """DELETE one row + re-export the snapshot. Idempotent — clearing
         an absent row is not an error (agno may emit clear without prior set)."""
@@ -203,6 +214,7 @@ class ActrBufferStore:
 
     # ── Read surface ────────────────────────────────────────────────────
 
+    @on_writer
     def read_all_for_chat(self, chat_id: str) -> dict[str, dict]:
         """Return {buffer_name: {content, concept_ids, embedding_hash, updated_at}}.
 
@@ -263,6 +275,7 @@ class ActrBufferStore:
 
     # ── Snapshot export ────────────────────────────────────────────────
 
+    @on_writer
     def _build_snapshot_payload(self) -> dict:
         """Build the full snapshot dict. SELECT every row, group by chat_id."""
         with self._lock:

@@ -591,6 +591,51 @@ class OuterMemoryWriter:
         self.emit(event)
         return anchor_tx
 
+    def write_tool_call_score(
+        self,
+        *,
+        parent_tool_call_tx: str,
+        scored_by: str,
+        significance: float = 0.2,
+        novelty: float = 0.05,
+        coherence: float = 0.7,
+    ) -> str:
+        """Anchor ONE tool_call_score TX on the PROCEDURAL fork (G1, AUDIT §5.3).
+
+        The LLM judge's scored_by also lands in a meta-fork scored_by_patch TX
+        (kept as audit), but that TX's per-entry `content` does NOT survive v2
+        batch-sealing (the slim tx_summaries drop content), so the procedural
+        tool_call_reader cannot overlay it. This per-call score TX rides the
+        SAME procedural fork the reader already walks and carries the verdict in
+        its TAGS — which DO survive v2 sealing: `scored_by:<v>` + the FULL
+        64-hex `parent:<parent_tool_call_tx>` (NOT a truncated prefix — exact
+        join key, no collisions). The reader collects these and overlays
+        scored_by onto the matching tool_call record so the miner + coverage
+        see llm-scored calls (INV-Syn-15 / INV-Syn-21)."""
+        content = {
+            "parent_tool_call_tx": parent_tool_call_tx,
+            "scored_by": scored_by,
+            "ts": time.time(),
+        }
+        anchor_tx = _canonical_concept_content_hash(content)
+        tags = [
+            "tool_call_score",
+            f"scored_by:{scored_by}",
+            f"parent:{parent_tool_call_tx}",
+        ]
+        event = OuterMemoryEvent(
+            fork="procedural",
+            thought_type="tool_call_score",
+            source=self._src,
+            content=content,
+            tags=tags,
+            significance=significance,
+            novelty=novelty,
+            coherence=coherence,
+        )
+        self.emit(event)
+        return anchor_tx
+
     def write_skill_mining_pass(self, summary: dict) -> str:
         """Anchor ONE skill_mining_pass TX on the meta fork per dream window.
         `summary` carries the ProceduralMiner pass output (txs_scanned,
