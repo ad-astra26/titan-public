@@ -123,6 +123,40 @@ impl Default for KernelRunOptions {
     }
 }
 
+/// SPEC §11.B.5 — read `[api].host` / `[api].port` from `config.toml` (the
+/// `--config` path). Returns `(host, port)` as `Option`s — `None` for any key
+/// that is absent, the file unreadable, or the TOML unparseable (the caller
+/// then falls back to env / the canonical default). This keeps `config.toml`
+/// the single source of truth for the api port the kernel binds.
+fn read_api_bind_from_config(config_path: &std::path::Path) -> (Option<String>, Option<u16>) {
+    let txt = match std::fs::read_to_string(config_path) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(path = %config_path.display(), err = %e,
+                "B8.5 api socket: config unreadable — using env/default port");
+            return (None, None);
+        }
+    };
+    let val: toml::Value = match txt.parse() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(path = %config_path.display(), err = %e,
+                "B8.5 api socket: config TOML parse failed — using env/default port");
+            return (None, None);
+        }
+    };
+    let api = val.get("api");
+    let host = api
+        .and_then(|a| a.get("host"))
+        .and_then(|h| h.as_str())
+        .map(str::to_owned);
+    let port = api
+        .and_then(|a| a.get("port"))
+        .and_then(toml::Value::as_integer)
+        .and_then(|p| u16::try_from(p).ok());
+    (host, port)
+}
+
 /// SPEC §11.B.5 — bind the kernel-owned api listening socket (socket
 /// activation). The kernel binds ONCE and holds the socket for its whole
 /// lifetime; every api child (boot + every zero-downtime reload) inherits this
@@ -131,19 +165,27 @@ impl Default for KernelRunOptions {
 /// swap ⇒ zero dropped connections (OLD closing its dup only decrements the
 /// socket refcount; the kernel + NEW keep the queue alive).
 ///
-/// Bind address: `TITAN_API_HOST` env || `0.0.0.0`, port `TITAN_API_PORT` env
-/// || [`BUS_API_HTTP_PORT_DEFAULT`] (the canonical fleet api port — same env
-/// override the shadow-boot path already uses). The socket keeps its default
-/// CLOEXEC so it does NOT leak into guardian_hcl / titan_hcl (only the api
-/// child's pre-exec dup re-exposes it). Returns `None` on any failure — the
-/// api then self-binds (degraded: reloads are no longer zero-downtime, but the
-/// api still serves on boot/crash-respawn).
-fn bind_api_listen_socket() -> Option<socket2::Socket> {
+/// Bind address resolution (each source wins over the next):
+/// host — `TITAN_API_HOST` env > `config.toml [api].host` > `0.0.0.0`;
+/// port — `TITAN_API_PORT` env (shadow-boot override) > `config.toml [api].port`
+/// > [`BUS_API_HTTP_PORT_DEFAULT`]. Reading the configured port is REQUIRED for
+/// multi-Titan-per-box hosts (e.g. T2 binds 7777, T3 binds 7778) — a hardcoded
+/// default would collide. The socket keeps its default CLOEXEC so it does NOT
+/// leak into guardian_hcl / titan_hcl (only the api child's pre-exec dup
+/// re-exposes it). Returns `None` on any failure — the api then self-binds
+/// (degraded: reloads are no longer zero-downtime, but the api still serves on
+/// boot/crash-respawn).
+fn bind_api_listen_socket(config_path: &std::path::Path) -> Option<socket2::Socket> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-    let host = std::env::var("TITAN_API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let (cfg_host, cfg_port) = read_api_bind_from_config(config_path);
+    let host = std::env::var("TITAN_API_HOST")
+        .ok()
+        .or(cfg_host)
+        .unwrap_or_else(|| "0.0.0.0".to_string());
     let port: u16 = std::env::var("TITAN_API_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
+        .or(cfg_port)
         .unwrap_or(BUS_API_HTTP_PORT_DEFAULT as u16);
     let ip: std::net::IpAddr = host.parse().unwrap_or_else(|e| {
         warn!(host = %host, err = %e, "B8.5 api socket: invalid TITAN_API_HOST; using 0.0.0.0");
@@ -355,7 +397,7 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
     // failed, or api spawn disabled) ⇒ the api self-binds (degraded: reloads
     // are no longer zero-downtime, but the api still serves).
     let api_listen_socket = if options.spawn_titan_hcl_api {
-        bind_api_listen_socket()
+        bind_api_listen_socket(&cli.config)
     } else {
         None
     };
@@ -600,6 +642,65 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn read_api_bind_from_config_extracts_port_and_host() {
+        // SPEC §11.B.5 — the kernel must bind each Titan's CONFIGURED port
+        // (e.g. T3 = 7778), not a hardcoded default.
+        let f = tempfile_with("[network]\nx = 1\n\n[api]\nhost = \"127.0.0.1\"\nport = 7778\n");
+        let (host, port) = read_api_bind_from_config(f.path());
+        assert_eq!(host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(port, Some(7778));
+        f.close();
+    }
+
+    #[test]
+    fn read_api_bind_from_config_missing_keys_and_file() {
+        // No [api] section → both None (caller falls back to env/default).
+        let f = tempfile_with("[network]\nx = 1\n");
+        assert_eq!(read_api_bind_from_config(f.path()), (None, None));
+        f.close();
+        // Unreadable file → (None, None), never panics.
+        assert_eq!(
+            read_api_bind_from_config(std::path::Path::new("/nonexistent/config.toml")),
+            (None, None)
+        );
+        // Malformed TOML → (None, None).
+        let bad = tempfile_with("this is not = = toml [[[");
+        assert_eq!(read_api_bind_from_config(bad.path()), (None, None));
+        bad.close();
+    }
+
+    /// Minimal self-cleaning temp file (no extra dep — writes under the test
+    /// tmp dir keyed by the calling test via a monotonic-ish unique name).
+    struct TmpCfg {
+        path: std::path::PathBuf,
+    }
+    impl TmpCfg {
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+        fn close(self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+    fn tempfile_with(contents: &str) -> TmpCfg {
+        // Unique name from process id + a hash of the contents (Date/rand are
+        // unavailable in this workspace's test policy; contents differ per test).
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(contents, &mut hasher);
+        let h = std::hash::Hasher::finish(&hasher);
+        let path = std::env::temp_dir().join(format!(
+            "titan_kernel_api_cfg_test_{}_{}.toml",
+            std::process::id(),
+            h
+        ));
+        let mut file = std::fs::File::create(&path).expect("create temp config");
+        file.write_all(contents.as_bytes())
+            .expect("write temp config");
+        TmpCfg { path }
+    }
 
     #[test]
     fn kernel_error_to_exit_code_matches_spec_15() {

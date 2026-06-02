@@ -109,6 +109,11 @@ libc = "0.2"
 # listening socket with SO_REUSEADDR, hand its fd to api children).
 socket2 = "0.6"
 
+# TOML parse (SPEC §11.B.5 — the kernel reads `[api].port`/`[api].host` from
+# config.toml so socket activation binds each Titan's CONFIGURED port, not a
+# hardcoded default; required for multi-Titan-per-box hosts, e.g. T2:7777/T3:7778).
+toml = "0.8"
+
 # Static maps (SPEC §8 catalog as compile-time perfect hash)
 phf = { version = "0.11", features = ["macros"] }
 
