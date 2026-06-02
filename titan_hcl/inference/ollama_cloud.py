@@ -19,6 +19,7 @@ Smart task→model routing (TASK_MODEL_MAP) is preserved verbatim.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -153,6 +154,11 @@ class OllamaCloudProvider(InferenceProvider):
         # Closed when the provider is garbage-collected (httpx handles its
         # own cleanup).
         self._shared_client: Optional["httpx.AsyncClient"] = None
+        # The shared AsyncClient binds to the event loop that creates it. Track
+        # that loop so sync-worker bridges (asyncio.run per call, which closes
+        # the loop each time) get a fresh client instead of one bound to a dead
+        # loop. See chat() for the rebuild logic. (2026-06-02)
+        self._shared_client_loop: Optional[Any] = None
 
     # ── Identity ──
 
@@ -234,7 +240,28 @@ class OllamaCloudProvider(InferenceProvider):
         #   t_parse         — JSON decode + content extraction
         #   t_post          — usage tracking + success record
         _t0 = time.perf_counter()
-        # Ensure shared client (lazy-init on first call from an async loop)
+        # Ensure shared client (lazy-init on first call from an async loop).
+        # LOOP-AWARE: an httpx.AsyncClient binds to the event loop that creates
+        # it. Sync-worker bridges (synthesis_worker's ConsolidationPass /
+        # ProceduralMiner) call provider.complete() via asyncio.run(), which
+        # opens a FRESH loop per call and CLOSES it on return — orphaning a
+        # shared client bound to the now-dead loop ("Event loop is closed" on
+        # every call after the first). Detect a loop change and rebuild the
+        # client on the current loop. The API's persistent loop (agno/chat)
+        # keeps full pooling; cross-loop callers get a correct fresh client.
+        # 2026-06-02 — root cause of ProceduralMiner 7/7 abstraction failures:
+        # consolidation's asyncio.run closed the loop before the miner's calls.
+        try:
+            _cur_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _cur_loop = None
+        if (self._shared_client is not None
+                and self._shared_client_loop is not _cur_loop):
+            # Old client is bound to a different / closed loop — drop it (httpx
+            # releases its transport on GC; the old loop is gone so we cannot
+            # await aclose() here) and rebuild below on the current loop.
+            self._shared_client = None
+            self._shared_client_loop = None
         if self._shared_client is None:
             try:
                 self._shared_client = httpx.AsyncClient(
@@ -245,6 +272,7 @@ class OllamaCloudProvider(InferenceProvider):
                         keepalive_expiry=300.0,  # 5 min keepalive
                     ),
                 )
+                self._shared_client_loop = _cur_loop
                 logger.info(
                     "[OllamaCloud] shared httpx client initialized "
                     "(keepalive=300s, pool=4 idle / 8 max)")
@@ -253,6 +281,7 @@ class OllamaCloudProvider(InferenceProvider):
                     "[OllamaCloud] shared client init failed (%s) — "
                     "falling back to per-call client", _shared_err)
                 self._shared_client = None
+                self._shared_client_loop = None
         try:
             # Phase 2 Chunk ε — reuse the shared client (set up once at
             # provider construct time). New AsyncClient per call costs

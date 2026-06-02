@@ -267,6 +267,10 @@ class ProceduralMiner:
         groups = self.group_by_parent(txs)
         clusters_all = self.cluster_sequences(groups)
         recurrent = self.filter_recurrent(clusters_all)
+        logger.info(
+            "[ProceduralMiner] mine_pass: txs=%d groups=%d clusters=%d "
+            "recurrent=%d (each recurrent cluster → up to 2 LLM abstractions)",
+            len(txs), len(groups), len(clusters_all), len(recurrent))
 
         positive_compiled = 0
         negative_compiled = 0
@@ -286,6 +290,10 @@ class ProceduralMiner:
                 if len(members) < self._min_occurrences:
                     continue
                 llm_calls += 1
+                logger.info(
+                    "[ProceduralMiner] abstracting cluster (seq_len=%d, %s, "
+                    "members=%d) — LLM call %d",
+                    len(cluster["sequence"]), kind, len(members), llm_calls)
                 abstracted = self.abstract_cluster(cluster, members, kind)
                 if not abstracted:
                     llm_failures += 1
