@@ -86,6 +86,8 @@ class OuterRuminationArchetype(ArchetypeBase):
             return None
         if self.cross_archetype_blocked(titan_id=titan_id, now=now):
             return None
+        if self.same_archetype_blocked(titan_id=titan_id, now=now):
+            return None
 
         # F-3 (2026-05-17): 30-day window — every cited source becomes
         # re-citable after 30d. The 5-day archetype_pool_scores

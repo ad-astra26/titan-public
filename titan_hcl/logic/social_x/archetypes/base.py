@@ -36,6 +36,16 @@ logger = logging.getLogger(__name__)
 # may bypass via `bypass_spacing=True` on their candidate.
 DEFAULT_CROSS_ARCHETYPE_SPACING_S = 4 * 3600
 
+# Same-archetype (intra) spacing default — minimum gap between two posts of
+# the SAME archetype. The cross-archetype gate above deliberately excludes
+# self (`post_type != ?`), so without this guard an archetype whose daily cap
+# is ≥2 re-fires on the very next ~2h posting tick → two near-identical posts
+# a couple of hours apart on the public timeline (Maker 2026-06-02). WORLD_MIRROR
+# and AMPLIFY already enforced their own 6h intra-spacing; this default
+# generalizes that fix to every archetype. PROOF_DAY opts out (it has its own
+# once-per-UTC-day must-post slot).
+DEFAULT_SAME_ARCHETYPE_SPACING_S = 6 * 3600
+
 # Outer-world engagement archetypes — those that publicly reference / engage a
 # specific external account. They share a single per-AUTHOR cooldown so one
 # account (especially a large one like @lopp) is never reflected on / amplified
@@ -285,6 +295,34 @@ class ArchetypeBase:
         finally:
             conn.close()
 
+    def same_archetype_blocked(
+        self,
+        *,
+        titan_id: str,
+        now: float | None = None,
+        spacing_seconds: float = DEFAULT_SAME_ARCHETYPE_SPACING_S,
+    ) -> bool:
+        """True if THIS archetype posted within the intra-spacing window.
+
+        Enforces a minimum gap between two posts of the same archetype so a
+        ≥2/day cap doesn't collapse into a back-to-back pair on the ~2h posting
+        tick (Maker 2026-06-02). Counts only posts that actually reached — or
+        are reaching — the timeline (`posted`/`verified`/`pending`); a `failed`
+        attempt never appeared publicly, so it must not block the next try.
+        """
+        cutoff = (now if now is not None else time.time()) - spacing_seconds
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM actions WHERE titan_id=? AND post_type=? "
+                "AND status IN ('posted','verified','pending') "
+                "AND created_at >= ? LIMIT 1",
+                (titan_id, self.name, cutoff),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
     def per_titan_count_today(
         self,
         *,
@@ -338,4 +376,5 @@ __all__ = (
     "ArchetypeBase",
     "ArchetypeCandidate",
     "DEFAULT_CROSS_ARCHETYPE_SPACING_S",
+    "DEFAULT_SAME_ARCHETYPE_SPACING_S",
 )

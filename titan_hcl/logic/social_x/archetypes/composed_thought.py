@@ -67,6 +67,8 @@ class ComposedThoughtArchetype(ArchetypeBase):
             return None
         if self.cross_archetype_blocked(titan_id=titan_id, now=now):
             return None
+        if self.same_archetype_blocked(titan_id=titan_id, now=now):
+            return None
 
         cited_pairs = self._cited_pairs_lifetime(titan_id=titan_id)
 
