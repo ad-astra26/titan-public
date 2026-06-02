@@ -14,6 +14,7 @@
 #![warn(missing_docs)]
 #![warn(rust_2018_idioms)]
 
+pub mod api_reload_subscriber;
 pub mod broker_publisher;
 pub mod cli;
 pub mod exit;

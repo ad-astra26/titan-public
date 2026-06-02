@@ -125,6 +125,46 @@ def test_exposed_methods_includes_critical_paths():
     assert not missing, f"EXPOSED_METHODS missing critical paths: {missing}"
 
 
+def test_reuseport_socket_cobinds_same_port():
+    """SPEC §11.B.5 / rFP_kernel_zero_downtime_api_reload P1 — two
+    SO_REUSEPORT sockets built by _make_reuseport_socket co-bind the SAME
+    port (the OLD+NEW handover primitive). Without SO_REUSEPORT the second
+    bind would raise OSError(EADDRINUSE)."""
+    import socket
+    from titan_hcl.api.api_subprocess import _make_reuseport_socket
+
+    # Ephemeral high port; not the real api port (avoids clashing with a live api).
+    port = 17790
+    a = _make_reuseport_socket("0.0.0.0", port)
+    try:
+        a.listen(8)
+        # Second process would call the same helper — must co-bind, not raise.
+        b = _make_reuseport_socket("0.0.0.0", port)
+        try:
+            b.listen(8)
+            assert a.getsockname()[1] == port
+            assert b.getsockname()[1] == port
+            # Both sockets carry SO_REUSEPORT set.
+            assert a.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT) == 1
+            assert b.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT) == 1
+        finally:
+            b.close()
+    finally:
+        a.close()
+
+
+def test_reuseport_helper_ipv6_family():
+    """_make_reuseport_socket selects AF_INET6 for an IPv6 host literal."""
+    import socket
+    from titan_hcl.api.api_subprocess import _make_reuseport_socket
+
+    s = _make_reuseport_socket("::1", 17791)
+    try:
+        assert s.family == socket.AF_INET6
+    finally:
+        s.close()
+
+
 def test_create_app_accepts_proxy_or_plugin():
     """create_app docstring states it accepts either real plugin or
     _RPCRemoteRef proxy. Behavior identical because app.state.titan_hcl

@@ -409,6 +409,19 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
         }
     }
 
+    // B9.d: SPEC §11.B.5 / D-SPEC-149 — the kernel's FIRST inbound bus
+    // subscriber. Subscribes `KERNEL_API_RELOAD_REQUEST` over a BusClient to
+    // the kernel's own broker socket and forwards each command onto the api
+    // watch_loop's reload channel for the zero-downtime swap. Only meaningful
+    // when the api peer is supervised; spawned unconditionally (it just idles
+    // waiting for a command if the api isn't running).
+    let api_reload_subscriber_handle = crate::api_reload_subscriber::spawn_api_reload_subscriber(
+        bus_socket.clone(),
+        authkey.to_vec(),
+        kernel_supervisor.api_reload_sender(),
+        shutdown.clone(),
+    );
+
     info!(
         event = "BOOT_COMPLETE",
         boot_generation,
@@ -477,6 +490,8 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
         if let Some(h) = titan_hcl_api_watch_handle {
             let _ = h.await;
         }
+        // B9.d api reload subscriber exits on shutdown.notified().
+        let _ = api_reload_subscriber_handle.await;
     })
     .await;
 

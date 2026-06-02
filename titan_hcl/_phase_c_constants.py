@@ -5,7 +5,7 @@ DO NOT EDIT BY HAND. Edit the TOML, then run:
     python scripts/generate_phase_c_constants.py
 
 SPEC version: 1.11.4
-Source SHA-256: e120fa85eab76eada2786fbb49c51cc2a1789f905242b51770ce2e979f9511c2
+Source SHA-256: 38b16cdbece1cc82d241b808248c7cf2f16e301276d19faf340fa8fcfd3d86af
 
 Per SPEC §19 + §2.6: hand-editing this file is a SPEC violation flagged by
 `arch_map phase-c verify`.
@@ -15,7 +15,7 @@ from typing import Final
 
 # ── SPEC version metadata ──────────────────────────────────────────────
 SPEC_VERSION: Final[str] = "1.11.4"
-SPEC_SOURCE_SHA256: Final[str] = "e120fa85eab76eada2786fbb49c51cc2a1789f905242b51770ce2e979f9511c2"
+SPEC_SOURCE_SHA256: Final[str] = "38b16cdbece1cc82d241b808248c7cf2f16e301276d19faf340fa8fcfd3d86af"
 
 
 # ── KERNEL ────────────────────────────────────────────────────────────────
@@ -139,6 +139,10 @@ SUPERVISION_RESTART_JITTER_PCT: Final[int] = 25
 SUPERVISION_SUSTAINED_UPTIME_RESET_S: Final[float] = 300.0
 # Max wait for kernel ESCALATION_RESPONSE before defaulting to terminate
 SUPERVISION_ESCALATION_TIMEOUT_S: Final[float] = 10.0
+# Max wait for the NEW api to reach state=RUNNING (SHM §11.I.2) before rollback during a kernel zero-downtime api reload
+API_RELOAD_HEALTH_TIMEOUT_S: Final[float] = 30.0
+# Max graceful-drain for the OLD api uvicorn after SIGTERM before SIGKILL during a kernel zero-downtime api reload
+API_RELOAD_DRAIN_TIMEOUT_S: Final[float] = 10.0
 # How often to recheck blocked dependencies in respawn_blocked state
 SUPERVISION_DEPENDENCY_RECHECK_INTERVAL_S: Final[float] = 10.0
 # Time blocked-respawn waits before escalating to kernel for halt decision

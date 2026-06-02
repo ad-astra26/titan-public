@@ -47,6 +47,20 @@ def entry(recv_queue, send_queue, name: str, config: dict) -> None:
     except Exception:
         pass
 
+    # SPEC §11.B.5 / rFP_kernel_zero_downtime_api_reload P3 — reload-child
+    # detection. When TITAN_API_REUSEPORT=1 this process is a NEW api co-bound
+    # with the OLD api via SO_REUSEPORT during a kernel-driven zero-downtime
+    # reload. The per-module SHM state slot is SINGLE-WRITER (state_registry),
+    # so a reload child must NOT write the canonical `module_api_state.bin`
+    # while OLD still owns it. Instead it writes a DEDICATED
+    # `module_api_reload_state.bin` slot (the kernel health-gates on THAT —
+    # pid-specific), and only PROMOTES to the canonical slot once OLD has
+    # exited (self-promote on OLD-pid-death, below). Normal boots
+    # (TITAN_API_REUSEPORT unset) write the canonical slot directly, unchanged.
+    import os as _os
+    _is_reload_child = _os.environ.get("TITAN_API_REUSEPORT") == "1"
+    _state_module_name = "api_reload" if _is_reload_child else "api"
+
     # Phase 11 §11.I.5 — populate the api module's SHM state slot so
     # /v6/readiness counts it toward mandatory_ready (W3 sweep / commit
     # 58761482 skipped this entry because api_main.py lives under
@@ -56,7 +70,7 @@ def entry(recv_queue, send_queue, name: str, config: dict) -> None:
     try:
         from titan_hcl.core.module_state import BootPriority, ModuleStateWriter
         _state_writer = ModuleStateWriter(
-            module_name="api",
+            module_name=_state_module_name,
             layer="L3",
             boot_priority=BootPriority.MANDATORY,
         )
@@ -113,6 +127,81 @@ def entry(recv_queue, send_queue, name: str, config: dict) -> None:
         _threading.Thread(
             target=_self_attest_running,
             name="api-self-attest-running", daemon=True).start()
+
+        # SPEC §11.B.5 P3 — self-promote on OLD-pid-death. A reload child
+        # gates on its dedicated `module_api_reload_state.bin`; once the OLD
+        # api process (the current owner of the canonical `module_api_state.bin`
+        # slot) has exited, NEW takes over the canonical slot as its SOLE
+        # writer — so the slot never has two writers AND /v6/readiness keeps a
+        # fresh api entry after the swap (the canonical slot would otherwise go
+        # stale in 60-180s once OLD's heartbeat stops). Decoupled + IPC-free.
+        if _is_reload_child:
+            def _promote_to_canonical() -> None:
+                import time as _time
+                import logging as _plog
+                _lg = _plog.getLogger(__name__)
+                try:
+                    from titan_hcl.core.module_state import (
+                        BootPriority as _BP, ModuleStateReader as _MSR,
+                        ModuleStateWriter as _MSW)
+                except Exception as _imp_err:  # noqa: BLE001
+                    _lg.warning("[titan_hcl_api] promote import failed: %s", _imp_err)
+                    return
+                _my_pid = _os.getpid()
+                try:
+                    _canon_reader = _MSR(module_name="api")
+                except Exception:  # noqa: BLE001
+                    _canon_reader = None
+
+                def _old_alive() -> bool:
+                    # OLD owns the canonical slot. Alive iff its pid is a live,
+                    # distinct process. Missing slot / dead pid / our-own-pid
+                    # all mean "no OLD to wait for → promote now".
+                    if _canon_reader is None:
+                        return False
+                    try:
+                        _entry = _canon_reader.read()
+                    except Exception:  # noqa: BLE001
+                        return False
+                    if _entry is None:
+                        return False
+                    _old_pid = int(getattr(_entry, "pid", 0) or 0)
+                    if _old_pid <= 0 or _old_pid == _my_pid:
+                        return False
+                    try:
+                        _os.kill(_old_pid, 0)
+                        return True            # live, distinct OLD still up
+                    except ProcessLookupError:
+                        return False           # OLD gone → promote
+                    except PermissionError:
+                        return True            # exists (not ours) → still up
+                    except Exception:  # noqa: BLE001
+                        return False
+
+                # Wait for OLD to exit. Bounded by API_RELOAD_HEALTH_TIMEOUT +
+                # drain (matches §11.B.5); if OLD lingers past that, promote
+                # anyway so readiness never stalls (kernel SIGKILLs OLD on
+                # drain-timeout, so this is a safety net, not the normal path).
+                _deadline = _time.time() + 60.0
+                while _old_alive() and _time.time() < _deadline:
+                    _time.sleep(1.0)
+                try:
+                    _canon = _MSW(
+                        module_name="api", layer="L3",
+                        boot_priority=_BP.MANDATORY)
+                    _canon.write_state("running")
+                    # Keep a process-lifetime ref so its heartbeat daemon
+                    # (which keeps the canonical slot fresh) is not GC'd.
+                    globals()["_api_canonical_writer"] = _canon
+                    _lg.info(
+                        "[titan_hcl_api] §11.B.5 promoted to canonical "
+                        "module_api_state.bin (pid=%d) after OLD exit", _my_pid)
+                except Exception as _pe:  # noqa: BLE001
+                    _lg.warning("[titan_hcl_api] canonical promotion failed: %s", _pe)
+
+            _threading.Thread(
+                target=_promote_to_canonical,
+                name="api-reload-promote", daemon=True).start()
     api_subprocess_main(recv_queue, send_queue, name, config)
 
 

@@ -60,9 +60,19 @@ case "$MODE" in
         echo
         # Verify static linkage on every shippable binary
         any_failed=0
+        # The 9 shippable fleet binaries. (`titan-trinity-rs-placeholder` was
+        # renamed to `titan-trinity-rs` in C-S3 chunk C3-3 — the stale name made
+        # this loop always exit 1; restored to the real fleet list 2026-06-02.)
         for bin in \
             target/x86_64-unknown-linux-musl/release/titan-kernel-rs \
-            target/x86_64-unknown-linux-musl/release/titan-trinity-rs-placeholder
+            target/x86_64-unknown-linux-musl/release/titan-trinity-rs \
+            target/x86_64-unknown-linux-musl/release/titan-unified-spirit-rs \
+            target/x86_64-unknown-linux-musl/release/titan-inner-body-rs \
+            target/x86_64-unknown-linux-musl/release/titan-inner-mind-rs \
+            target/x86_64-unknown-linux-musl/release/titan-inner-spirit-rs \
+            target/x86_64-unknown-linux-musl/release/titan-outer-body-rs \
+            target/x86_64-unknown-linux-musl/release/titan-outer-mind-rs \
+            target/x86_64-unknown-linux-musl/release/titan-outer-spirit-rs
         do
             if [ -x "$bin" ]; then
                 if _is_static "$bin"; then

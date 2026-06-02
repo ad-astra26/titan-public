@@ -355,7 +355,28 @@ pub fn spawn_titan_hcl(config: &SpawnConfig) -> Result<Option<Child>, SpawnError
 /// Per Maker 2026-05-27 — the api runs as a kernel-rs peer to titan_hcl
 /// + guardian_hcl, not as a Guardian-supervised module. Returns Ok(None)
 /// if spawn_titan_hcl_api=false (tests).
+///
+/// Used for the INITIAL boot + crash-respawn. Every api process binds with
+/// `SO_REUSEPORT` (SPEC §11.B.5 — so a NEW reload child can always co-bind the
+/// port for a zero-downtime swap), but is NOT flagged as a reload child.
 pub fn spawn_titan_hcl_api(config: &SpawnConfig) -> Result<Option<Child>, SpawnError> {
+    spawn_titan_hcl_api_inner(config, false)
+}
+
+/// SPEC §11.B.5 — spawn the NEW api process for a kernel-driven zero-downtime
+/// reload swap. Identical to [`spawn_titan_hcl_api`] but additionally flags the
+/// child as a reload child (`TITAN_API_RELOAD_CHILD=1`) so `api_main.py` writes
+/// its readiness to the dedicated `module_api_reload_state.bin` slot (the
+/// kernel health-gates on it, pid-specific) and self-promotes to the canonical
+/// slot only after OLD exits — keeping every state slot single-writer.
+pub fn spawn_titan_hcl_api_reload_child(config: &SpawnConfig) -> Result<Option<Child>, SpawnError> {
+    spawn_titan_hcl_api_inner(config, true)
+}
+
+fn spawn_titan_hcl_api_inner(
+    config: &SpawnConfig,
+    reload_child: bool,
+) -> Result<Option<Child>, SpawnError> {
     if !config.spawn_titan_hcl_api {
         return Ok(None);
     }
@@ -379,6 +400,15 @@ pub fn spawn_titan_hcl_api(config: &SpawnConfig) -> Result<Option<Child>, SpawnE
         if let Ok(v) = std::env::var(key) {
             env.entry(key.into()).or_insert(v);
         }
+    }
+    // SPEC §11.B.5 — the api ALWAYS binds with SO_REUSEPORT so the running
+    // process is continuously swap-ready (two processes can only co-bind a
+    // port if BOTH set SO_REUSEPORT; OLD must already have it at swap time).
+    env.insert("TITAN_API_REUSEPORT".into(), "1".into());
+    if reload_child {
+        // NEW process of a zero-downtime reload: dedicated readiness slot +
+        // self-promote to canonical after OLD exits (api_main.py).
+        env.insert("TITAN_API_RELOAD_CHILD".into(), "1".into());
     }
 
     let mut cmd = Command::new(python);

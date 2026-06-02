@@ -55,6 +55,27 @@ HEARTBEAT_INTERVAL_S = 30.0
 KERNEL_CONNECT_TIMEOUT_S = 30.0
 
 
+def _make_reuseport_socket(host: str, port: int):
+    """SPEC §11.B.5 / rFP_kernel_zero_downtime_api_reload P1 — build the api's
+    listen socket with SO_REUSEPORT so OLD + NEW api processes can co-bind the
+    same port during a kernel-driven zero-downtime reload (the OS load-balances
+    new connections across both; OLD drains its in-flight set on SIGTERM).
+
+    uvicorn 0.41's Config exposes no reuse_port param and its bind_socket() sets
+    only SO_REUSEADDR — so we bind the socket ourselves and hand it to
+    server.serve(sockets=[...]), which skips uvicorn's internal bind. INV-9 — a
+    pre-bound socket adds no sync-blocking to the api event loop.
+    """
+    import socket as _socket
+    fam = _socket.AF_INET6 if (host and ":" in host) else _socket.AF_INET
+    sock = _socket.socket(fam, _socket.SOCK_STREAM)
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEPORT, 1)
+    sock.bind((host, port))
+    sock.set_inheritable(True)
+    return sock
+
+
 def _send_msg(send_queue, msg_type: str, src: str, dst: str,
               payload: dict, rid: str | None = None) -> None:
     """Standard worker → bus message helper. Mirrors emot_cgn_worker / etc."""
@@ -351,6 +372,16 @@ def api_subprocess_main(recv_queue, send_queue, name: str, config: dict) -> None
     )
     server = uvicorn.Server(uvi_config)
 
+    # SPEC §11.B.5 / rFP P1 — SO_REUSEPORT, gated on TITAN_API_REUSEPORT=1
+    # (default-OFF, inert in production until the kernel swap path P2/P3 sets it
+    # on the NEW child env). See _make_reuseport_socket above.
+    _reuse_sock = None
+    if os.environ.get("TITAN_API_REUSEPORT") == "1":
+        _reuse_sock = _make_reuseport_socket(host, port)
+        logger.info(
+            "[api_subprocess] §11.B.5 SO_REUSEPORT enabled (TITAN_API_REUSEPORT=1) "
+            "— co-bound %s:%d for zero-downtime reload child", host, port)
+
     # Capture the event loop reference so the bus listener can schedule
     # event_bus.emit() coroutines on it.
     async def _set_loop_ref():
@@ -358,7 +389,11 @@ def api_subprocess_main(recv_queue, send_queue, name: str, config: dict) -> None
 
     async def _serve_with_loop_capture():
         await _set_loop_ref()
-        await server.serve()
+        if _reuse_sock is not None:
+            # P1: serve on the SO_REUSEPORT-bound socket (uvicorn skips its own bind).
+            await server.serve(sockets=[_reuse_sock])
+        else:
+            await server.serve()
 
     try:
         logger.info(

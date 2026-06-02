@@ -182,6 +182,38 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Reset a child's restart-intensity counter + rolling reason buffer.
+    ///
+    /// Called when the kernel's escalation policy resolves to `Continue` —
+    /// the kernel grants the child more restart budget, so the rolling window
+    /// must be cleared or the very next exit would re-escalate immediately
+    /// (the `kernel_supervisor.rs` "counter reset not yet implemented" TODO).
+    /// Unlike [`ChildState::maybe_reset_counter`] this is unconditional (no
+    /// sustained-uptime gate) — the policy decision is the authority.
+    ///
+    /// Used by the api child's SPEC §11.B.5 D6 Continue+capped-backoff policy
+    /// so repeated rapid api crashes keep retrying the last-known-good with
+    /// backoff instead of escalating to a full-tree Terminate.
+    pub fn reset_restart_counter(&mut self, child_name: &str) -> Result<(), SupervisorError> {
+        let now = Instant::now();
+        let state = self
+            .children
+            .get_mut(child_name)
+            .ok_or_else(|| SupervisorError::UnknownChild(child_name.to_string()))?;
+        state.restart_count_in_window = 0;
+        state.window_start = now;
+        state.reason_buffer.clear();
+        Ok(())
+    }
+
+    /// Current restart count within the rolling intensity window (observability
+    /// + the api D6 backoff computation in `kernel_supervisor.rs`).
+    pub fn restart_count_in_window(&self, child_name: &str) -> Option<u32> {
+        self.children
+            .get(child_name)
+            .map(|s| s.restart_count_in_window)
+    }
+
     /// Handle a child exit event. Returns the next action the supervisor
     /// should take.
     ///
@@ -628,6 +660,38 @@ mod tests {
         let decision = sup.recheck_blocked_child("social").unwrap();
         assert!(matches!(decision, Some(RestartDecision::Respawn { .. })));
         assert_eq!(pub_.count_of("SUPERVISION_DEPENDENCY_RECOVERED"), 1);
+    }
+
+    #[test]
+    fn reset_restart_counter_clears_window_and_buffer() {
+        let (_, _, mut sup) = make_supervisor();
+        sup.register_child(ChildSpec::new("api")).unwrap();
+        sup.mark_running("api", 100).unwrap();
+
+        // Drive 3 crashes → counter at 3.
+        for i in 1..=3 {
+            sup.handle_child_exit("api", SupervisionReason::Panic, format!("c{i}"), Some(1))
+                .unwrap();
+        }
+        assert_eq!(sup.restart_count_in_window("api"), Some(3));
+
+        // Kernel grants Continue → reset.
+        sup.reset_restart_counter("api").unwrap();
+        assert_eq!(sup.restart_count_in_window("api"), Some(0));
+
+        // A subsequent crash starts the window fresh (does NOT immediately
+        // re-escalate) — proves the anti-crashloop Continue path works.
+        let decision = sup
+            .handle_child_exit("api", SupervisionReason::Panic, "c4", Some(1))
+            .unwrap();
+        assert!(matches!(decision, RestartDecision::Respawn { .. }));
+    }
+
+    #[test]
+    fn reset_restart_counter_unknown_child_errors() {
+        let (_, _, mut sup) = make_supervisor();
+        let err = sup.reset_restart_counter("ghost").unwrap_err();
+        assert!(matches!(err, SupervisorError::UnknownChild(_)));
     }
 
     #[test]
