@@ -71,6 +71,8 @@ class ReflectionArchetype(ArchetypeBase):
             return None
         if self.cross_archetype_blocked(titan_id=titan_id, now=now):
             return None
+        if self.same_archetype_blocked(titan_id=titan_id, now=now):
+            return None
 
         whitelist = SocialXGateway.REFLECTABLE_POST_TYPES
         excluded = SocialXGateway.REFLECTION_EXCLUDED_POST_TYPES

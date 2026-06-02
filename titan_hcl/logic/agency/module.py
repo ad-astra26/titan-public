@@ -470,23 +470,6 @@ class AgencyModule:
 
         return action_result
 
-    def flush(self) -> None:
-        """Force-persist the action history immediately (rFP §P2 — AUDIT §C).
-
-        `_record_*` persists via append_and_save which batches per
-        save_every_n=5, so up to 4 recent actions sit only in the in-memory
-        `_history` deque. On MODULE_SHUTDOWN the worker calls this to flush them
-        durably before exit — otherwise a hot-reload / kill-respawn loses 1-4
-        action_results (which drive helper-completion, mood delta, trinity
-        enrichment). RollingStateStore.save() writes atomically (tmp+fsync+
-        os.replace). SelfAssessment uses save_every_n=1 and needs no flush.
-        """
-        if self._history_store is not None:
-            try:
-                self._history_store.save(list(self._history))
-            except Exception:
-                pass  # best-effort
-
     def _check_budget_reset(self) -> None:
         """Reset hourly budget counter if the hour has passed."""
         now = time.time()

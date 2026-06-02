@@ -300,18 +300,15 @@ class ReloadState:
     new_recv_queue_registered: bool = False
     error: Optional[str] = None
     failed_step: Optional[str] = None
-    # Inter-thread routing — _process_guardian_messages fills adoption_q so the
+    # Inter-thread routing — _process_guardian_messages fills these so the
     # orchestrator thread (running on _restart_executor via _reload_module_sync)
     # doesn't block the bus drain loop.
     adoption_q: "_queue_mod.Queue" = field(
         default_factory=lambda: _queue_mod.Queue(maxsize=8)
     )
-    # NOTE: the legacy `ready_q` field was REMOVED 2026-06-01 — it held the
-    # MODULE_READY bus event the reload-completion wait used pre-Phase-11. That
-    # broadcast was deleted (D-SPEC-141 locked D1); reload now waits on the
-    # NEW worker's SHM `state=running` slot via `_wait_for_module_running`
-    # (§11.I.2/§11.I.6). Nothing fed ready_q after the migration, so the field
-    # was dead + the reload-completion wait silently timed out. No shim.
+    ready_q: "_queue_mod.Queue" = field(
+        default_factory=lambda: _queue_mod.Queue(maxsize=8)
+    )
 
 
 def _append_meta_cgn_emission_log(msg: dict, payload: dict) -> None:

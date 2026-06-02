@@ -61,7 +61,8 @@ class WorldMirrorArchetype(ArchetypeBase):
         # Per-Titan caps: max 4 / 24 h, ≥6 h since last W_M post.
         if not self._under_daily_cap(titan_id=titan_id, now=now):
             return None
-        if self._too_close_to_last_world_mirror(titan_id=titan_id, now=now):
+        if self.same_archetype_blocked(titan_id=titan_id, now=now,
+                                       spacing_seconds=MIN_INTRA_SPACING_S):
             return None
         if self.cross_archetype_blocked(titan_id=titan_id, now=now):
             return None
@@ -141,19 +142,6 @@ class WorldMirrorArchetype(ArchetypeBase):
     def _under_daily_cap(self, *, titan_id: str, now: float) -> bool:
         return self.per_titan_count_today(titan_id=titan_id, now=now) < MAX_PER_DAY
 
-    def _too_close_to_last_world_mirror(self, *, titan_id: str, now: float) -> bool:
-        conn = self._conn()
-        try:
-            row = conn.execute(
-                "SELECT created_at FROM actions WHERE titan_id=? AND post_type=? "
-                "ORDER BY created_at DESC LIMIT 1",
-                (titan_id, self.name),
-            ).fetchone()
-            if not row:
-                return False
-            return (now - float(row["created_at"])) < MIN_INTRA_SPACING_S
-        finally:
-            conn.close()
 
     def _fetch_candidate(self, *, titan_id: str, now: float) -> dict | None:
         """rFP §4.3.2 trigger predicate, mapped to actual schema:

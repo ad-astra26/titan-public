@@ -345,29 +345,21 @@ class OrchestratorReloadMixin:
                 info.start_time = time.time()
                 info.last_heartbeat = time.time()
                 info.state = ModuleState.STARTING
-                # Keep reload_in_flight=True until NEW reaches SHM state=running
-                # so NEW gets boot grace without monitor_tick heartbeat-timeout
+                # Keep reload_in_flight=True until MODULE_READY arrives so
+                # NEW gets boot grace without monitor_tick heartbeat-timeout
                 # restart-cycling it. Cleared in `finally`.
 
-            # ── Step 8: probe-new — wait for NEW to reach SHM state=running ──
-            # §11.I.2/§11.I.6 (D-SPEC-141): readiness is the worker's OWN
-            # `module_<name>_state.bin` SHM slot, NOT a MODULE_READY bus event
-            # (that broadcast was DELETED in Phase 11 — locked D1). The legacy
-            # `rs.ready_q.get()` wait here was orphaned by that migration:
-            # nothing ever fed ready_q, so every in-place reload silently hit
-            # `ready_timeout` even when NEW booted fine. `_wait_for_module_running`
-            # is the canonical primitive (its docstring already names reload as a
-            # caller): it drives the probe (BOOTED→PROBING→RUNNING) and polls the
-            # slot — the SAME path normal boot (§11.I.7) + dep-activation
-            # (§11.G.2.5) use, sharing the probe-dispatch throttle (no double-probe).
+            # ── Step 8: wait MODULE_READY from NEW ────────────────────
             timeout_left = max(
                 1.0, min(MODULE_RELOAD_HAPPY_PATH_S, deadline - time.time()))
-            if not self._wait_for_module_running(module_name, timeout_left):
-                # NEW didn't reach state=running within budget. OLD is dead,
+            try:
+                rs.ready_q.get(timeout=timeout_left)
+            except _queue_mod.Empty:
+                # NEW didn't emit MODULE_READY within budget. OLD is dead,
                 # NEW is alive — this is NOT a rollback (no recovery path).
-                # Leave NEW running as the slot's new owner; the supervisor's
-                # SHM liveness/heartbeat detector handles a truly-stuck worker
-                # post-reload. Emit failed status so the initiator knows.
+                # Leave NEW running as the slot's new owner; supervision
+                # will handle it normally via heartbeat-timeout if it never
+                # boots. Emit failed status so initiator knows.
                 self._emit_reload_ack(
                     swap_id, module_name, "failed",
                     "ready_timeout", started_ts)
@@ -375,15 +367,18 @@ class OrchestratorReloadMixin:
                     swap_id, module_name, "failed",
                     "ready_timeout", started_ts)
 
-            # NEW reached state=running. `_wait_for_module_running` already
-            # mirrored info.state=RUNNING + ready_time on the observed slot
-            # transition; this defensive finalize covers the race where Step 7's
-            # atomic swap reset state→STARTING AFTER the slot already read running
-            # (NEW boots faster than Step 6's 10s SIGKILL grace). Without it the
-            # module could stay stuck state=starting forever despite being fully
-            # alive. Live-discovered 2026-05-19 during T3 cascade of D-SPEC-93
-            # (knowledge_worker pid=1090355 stuck STARTING after pid=1090080
-            # SIGKILL). Part of D-SPEC-93 closure.
+            # NEW emitted MODULE_READY — finalize state=RUNNING explicitly
+            # here regardless of whether _process_guardian_messages
+            # already transitioned it. Race window: MODULE_READY may
+            # arrive BEFORE Step 7's atomic swap (NEW boots faster than
+            # Step 6's 10s SIGKILL grace). In that case
+            # _process_guardian_messages set state=RUNNING first, then
+            # Step 7 overwrote it back to STARTING. Without this final
+            # transition the module stays stuck at state=starting forever
+            # despite being fully alive (heartbeats arriving, requests
+            # processed). Live-discovered 2026-05-19 during T3 cascade
+            # of D-SPEC-93 (knowledge_worker pid=1090355 stuck STARTING
+            # after pid=1090080 SIGKILL). Part of D-SPEC-93 closure.
             with self._module_lock:
                 if info.state != ModuleState.RUNNING:
                     info.state = ModuleState.RUNNING

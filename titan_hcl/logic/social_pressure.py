@@ -550,14 +550,8 @@ class SocialPressureMeter:
                 ],
                 "recent_post_ids": self.recent_post_ids,
                 "timestamp": time.time(),
-                # AUDIT §C closure (rFP §P2): the old "circuit_open_until" entry
-                # was VESTIGIAL — _circuit_open_until lives on XSessionManager,
-                # not on the meter (the hasattr guard was always False → wrote
-                # 0.0). Circuit-breaker state is INTENTIONALLY reset-on-restart
-                # anyway (PERSISTENCE_BY_DESIGN, Tier B triage 2026-04-19:
-                # recomputed live from refresh attempts). Removed to match the
-                # design + stop misleading persistence audits. (Superseded the
-                # 2026-04-17 "survives restarts" attempt.)
+                # v4 persistence gap fix (2026-04-17): circuit breaker survives restarts
+                "circuit_open_until": self._circuit_open_until if hasattr(self, '_circuit_open_until') else 0.0,
             }
             os.makedirs(os.path.dirname(self._STATE_FILE) or ".", exist_ok=True)
             tmp = self._STATE_FILE + ".tmp"
@@ -590,8 +584,9 @@ class SocialPressureMeter:
                     data=ce.get("data", {}),
                     timestamp=ce.get("timestamp", time.time()),
                 ))
-            # (circuit-breaker state intentionally NOT restored — reset-by-design
-            # per the save-side note above; XSessionManager recomputes it live.)
+            # v4 persistence gap fix (2026-04-17): restore circuit breaker
+            if "circuit_open_until" in state and hasattr(self, '_circuit_open_until'):
+                self._circuit_open_until = float(state["circuit_open_until"])
             age = time.time() - state.get("timestamp", 0)
             logger.info("[SocialPressure] State restored (%.0fs old): urge=%.1f, "
                         "emotion=%s, catalysts=%d, posts=%d/hr %d/day",

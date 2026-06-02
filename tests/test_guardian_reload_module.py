@@ -7,10 +7,8 @@ Covers the Guardian-side orchestrator without spawning real subprocesses:
   reason="reload_in_flight".
 - Suppression contract (SPEC §11.B.3): restart_async returns None +
   monitor_tick skips restart paths while info.reload_in_flight=True.
-- Reload completion (§11.I.2/§11.I.6): NEW readiness detected via its
-  `module_<name>_state.bin` SHM `state=running` slot (`_wait_for_module_running`),
-  not the deleted MODULE_READY bus event. BUS_WORKER_ADOPT_REQUEST routed to the
-  reload orchestrator's adoption queue when matching in-flight state.
+- Message routing: MODULE_READY + BUS_WORKER_ADOPT_REQUEST routed to the
+  reload orchestrator's queues when matching in-flight state.
 - Dispatch (_dispatch_reload_request): malformed payload emits failed ACK
   without spawning.
 - ACK shape: _emit_reload_ack publishes a SPEC §8.3-conformant payload.
@@ -32,6 +30,7 @@ from titan_hcl import bus
 from titan_hcl.bus import (
     BUS_WORKER_ADOPT_REQUEST,
     DivineBus,
+    MODULE_READY,
     MODULE_RELOAD_ACK,
     MODULE_RELOAD_REQUEST,
     make_msg,
@@ -178,36 +177,24 @@ def test_monitor_tick_skips_heartbeat_timeout_restart_during_reload():
 # ── Message routing into in-flight reload queues ─────────────────────────
 
 
-def test_reload_completion_detects_running_via_shm_slot():
-    """§11.I.2/§11.I.6 (D-SPEC-141): reload completion reads the NEW worker's
-    `module_<name>_state.bin` SHM slot for state=running — the MODULE_READY bus
-    broadcast (and the `ready_q` it used to feed) were DELETED in Phase 11.
-    `_wait_for_module_running` drives probe-new + mirrors RUNNING into ModuleInfo.
-
-    Replaces the pre-Phase-11 `test_module_ready_routed_to_in_flight_ready_queue`,
-    which asserted MODULE_READY→ready_q routing that no longer exists (nothing fed
-    ready_q post-migration → reload silently hit ready_timeout). See
-    rFP_module_hot_reload_persistence_program §P1.5.
-    """
+def test_module_ready_routed_to_in_flight_ready_queue():
     g, info = _make_guardian_with_running_module()
-    info.state = ModuleState.STARTING  # post-Step-7 atomic-swap state
-    info.ready_time = 0.0
+    rs = ReloadState(
+        swap_id="sw1", module_name="fake_worker",
+        old_pid=99999, new_module_path=None, started_ts=time.time(),
+    )
+    rs.new_pid = 88888
+    g._reloads_in_flight["fake_worker"] = rs
+    info.reload_in_flight = True
 
-    class _RunningEntry:
-        state = "running"
+    g.bus.publish(make_msg(
+        MODULE_READY, "fake_worker", "guardian", {"src": "fake_worker"}
+    ))
+    g._process_guardian_messages()
 
-    class _FakeReaderBank:
-        def read(self, name):
-            return _RunningEntry()
-
-    # Inject a fake SHM reader bank reporting the NEW slot as running
-    # (bypasses /dev/shm provisioning in the unit fixture).
-    g._module_state_reader_bank = _FakeReaderBank()
-
-    assert g._wait_for_module_running("fake_worker", timeout_s=1.0) is True
-    # SHM truth is mirrored into the in-process ModuleInfo with no bus event.
-    assert info.state == ModuleState.RUNNING
-    assert info.ready_time > 0.0
+    # MODULE_READY should be available on rs.ready_q
+    msg = rs.ready_q.get(timeout=1.0)
+    assert msg["type"] == MODULE_READY
     g.stop_all()
 
 
@@ -452,18 +439,18 @@ def test_reload_step6_module_shutdown_includes_target_pid_and_swap_id():
 
 def test_reload_step8_finalizes_state_running_after_module_ready():
     """Companion to D-SPEC-93 — Guardian._reload_module_sync Step 8 must
-    explicitly set info.state = ModuleState.RUNNING after the SHM
-    `state=running` wait (`_wait_for_module_running`) returns True.
+    explicitly set info.state = ModuleState.RUNNING after consuming
+    MODULE_READY from rs.ready_q.
 
     Live-discovered race 2026-05-19 on T3: when NEW boots faster than
-    Step 6's 10s SIGKILL grace, the SHM slot reads running first; then
-    Step 7's atomic swap unconditionally overwrites state=STARTING; Step 8
-    returns success but state stays STARTING forever. Fix: Step 8 finalizes
-    state=RUNNING explicitly after the successful readiness wait. (Step 8
-    was repointed from the deleted MODULE_READY/ready_q path to the §11.I.2
-    SHM-readiness wait in §P1.5 — the defensive finalize is unchanged.)
+    Step 6's 10s SIGKILL grace, _process_guardian_messages sets
+    state=RUNNING first; then Step 7's atomic swap unconditionally
+    overwrites state=STARTING; Step 8 reads MODULE_READY from
+    pre-populated ready_q and returns success but state stays STARTING
+    forever. Fix: Step 8 finalizes state=RUNNING explicitly after
+    successful ready_q.get.
 
-    Source-level check: the post-readiness block must transition info.state
+    Source-level check: the post-ready_q block must transition info.state
     when it is not already RUNNING. We assert the source contains the
     sentinel "state finalized RUNNING" log line, which is uniquely
     produced by this finalization path.

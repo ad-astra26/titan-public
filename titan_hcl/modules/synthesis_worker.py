@@ -432,17 +432,6 @@ class ActivationStore:
         return out
 
     def close(self) -> None:
-        # §11.H.3 + AUDIT §C (rFP §P2): force a final DuckDB CHECKPOINT before
-        # close so the WAL is durably flushed on graceful shutdown (kill-respawn
-        # boots fresh from synthesis.duckdb). _persist's INSERTs already
-        # autocommit per statement (DuckDB default — committed txns are
-        # WAL-recovered even on SIGKILL), so this only guards the
-        # WAL-not-yet-checkpointed window, not uncommitted data.
-        try:
-            self._conn.execute("CHECKPOINT")
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "[synthesis_worker] CHECKPOINT on close failed: %s", e)
         self._conn.close()
 
 

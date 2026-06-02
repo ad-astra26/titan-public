@@ -95,6 +95,8 @@ class GroundedTodayArchetype(ArchetypeBase):
             return None
         if self.cross_archetype_blocked(titan_id=titan_id, now=now):
             return None
+        if self.same_archetype_blocked(titan_id=titan_id, now=now):
+            return None
 
         cited = self.cited_set(titan_id=titan_id,
                                 window_seconds=CITED_SET_WINDOW_S)
