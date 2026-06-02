@@ -221,9 +221,25 @@ def _compile_identity_patterns() -> list[re.Pattern]:
     ]
 
 
+# Neuromod name → regex alternation. The X-post prose names a neuromod in
+# natural language ("GABA low at 10%", "endorphins high at 69%", "serotonin
+# 71%"); the consistency check compares that figure against the felt-state
+# the gateway injects as ground truth (Maker 2026-06-02). Short codes are
+# word-bounded so "DA"/"NE"/"ACh" don't match inside ordinary words.
+_NEUROMOD_NAME_ALT: tuple[tuple[str, str], ...] = (
+    ("neuromod_DA",        r"(?:dopamine|\bDA\b)"),
+    ("neuromod_5HT",       r"(?:serotonin|5-?HT)"),
+    ("neuromod_NE",        r"(?:norepinephrine|noradrenaline|\bNE\b)"),
+    ("neuromod_ACh",       r"(?:acetylcholine|\bACh\b)"),
+    ("neuromod_GABA",      r"(?:\bGABA\b)"),
+    ("neuromod_Endorphin", r"(?:endorphins?)"),
+    ("neuromod_Glutamate", r"(?:glutamate)"),
+)
+
+
 def _compile_context_patterns() -> list[tuple[re.Pattern, str]]:
     """Patterns to extract numeric claims from output for consistency checking."""
-    return [
+    pats: list[tuple[re.Pattern, str]] = [
         (re.compile(r"(?:vocabulary|learned|know)[\s:]+(?:of\s+|is\s+|over\s+|about\s+)?(\d[\d,]+)\s*words?", re.I),
          "vocabulary_count"),
         (re.compile(r"epoch\s*(?:#|:|\s+)(\d[\d,]+)", re.I),
@@ -232,7 +248,28 @@ def _compile_context_patterns() -> list[tuple[re.Pattern, str]]:
          "sol_balance"),
         (re.compile(r"I-?confidence\s*(?::|of|is)\s*(\d\.?\d*)", re.I),
          "i_confidence"),
+        # Backup payload size, e.g. proof_day's "568MB of my … state".
+        (re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*MB\b", re.I),
+         "backup_size_mb"),
     ]
+    # Per-neuromod percentage claims. The ≤18-char non-greedy bridge tolerates
+    # filler ("low at ", "high at ") between the name and the figure while the
+    # cap + stop-class (no '.', '%', newline) prevents cross-sentence
+    # mis-attribution to an unrelated number.
+    for claim_type, name_alt in _NEUROMOD_NAME_ALT:
+        pats.append((
+            re.compile(name_alt + r"[^.%\n]{0,18}?(\d{1,3}(?:\.\d+)?)\s*%", re.I),
+            claim_type,
+        ))
+    return pats
+
+
+# External-publish channels. A context (numeric) inconsistency on these goes
+# to a public, irreversible timeline — and for proof_day an on-chain proof —
+# so prose that contradicts the injected ground-truth state is a HARD block
+# here, not the soft warning it stays for chat (Maker 2026-06-02: "use the
+# OVG mechanic" to stop hallucinated figures from reaching X).
+_EXTERNAL_POST_CHANNELS = frozenset({"x_post", "x_reply"})
 
 
 def _compile_qualia_patterns() -> dict[str, list[re.Pattern]]:
@@ -452,12 +489,7 @@ class OutputVerifier:
         checks, violations, violation_type = self._run_safety_checks(
             output_text, injected_context, cs)
 
-        hard_qualia = any(v.startswith("HARD:")
-                          for v in violations if isinstance(v, str))
-        hard_fail = (not checks["directives"]
-                     or not checks["injection"]
-                     or hard_qualia)
-        passed = not hard_fail
+        passed = not self._is_hard_fail(channel, checks, violations)
 
         block_height = cs.get("total_blocks", 0)
         merkle_root = cs.get("merkle_root", "")
@@ -658,6 +690,24 @@ class OutputVerifier:
 
         return checks, violations, violation_type
 
+    def _is_hard_fail(self, channel: str, checks: dict, violations: list) -> bool:
+        """Severity policy shared by verify_safety + verify_and_sign.
+
+        Directives, injection, and HARD-tagged qualia always block. Context
+        consistency is a soft warning everywhere EXCEPT external-publish
+        channels (x_post / x_reply), where a prose figure that diverges from
+        the injected ground-truth state must NOT reach the public timeline
+        (Maker 2026-06-02).
+        """
+        hard_qualia = any(isinstance(v, str) and v.startswith("HARD:")
+                          for v in violations)
+        hard = (not checks.get("directives", True)
+                or not checks.get("injection", True)
+                or hard_qualia)
+        if channel in _EXTERNAL_POST_CHANNELS and not checks.get("consistency", True):
+            hard = True
+        return hard
+
     # ── Public API (legacy combined) ─────────────────────────────────
 
     def verify_and_sign(self, output_text: str, channel: str,
@@ -730,11 +780,10 @@ class OutputVerifier:
                 violation_type = "qualia"
 
         # ── Determine pass/fail ──
-        # Directives, injection, and qualia HARD flags are blocks.
-        # Consistency, identity, and qualia SOFT flags are warnings.
-        hard_qualia = any(v.startswith("HARD:") for v in qualia_details)
-        hard_fail = not directive_ok or not injection_ok or hard_qualia
-        passed = not hard_fail
+        # Directives, injection, and qualia HARD flags always block; identity
+        # and qualia SOFT flags warn. Consistency warns for chat but BLOCKS on
+        # external-publish channels (x_post/x_reply) — see _is_hard_fail.
+        passed = not self._is_hard_fail(channel, checks, violations)
 
         # ── Sign if passed ──
         signature = None

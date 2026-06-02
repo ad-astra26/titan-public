@@ -60,7 +60,8 @@ class AmplifyArchetype(ArchetypeBase):
 
         if self.per_titan_count_today(titan_id=titan_id, now=now) >= AMPLIFY_MAX_PER_DAY:
             return None
-        if self._too_close_to_last(titan_id=titan_id, now=now):
+        if self.same_archetype_blocked(titan_id=titan_id, now=now,
+                                       spacing_seconds=AMPLIFY_MIN_INTRA_SPACING_S):
             return None
         if self.cross_archetype_blocked(titan_id=titan_id, now=now):
             return None
@@ -96,20 +97,6 @@ class AmplifyArchetype(ArchetypeBase):
         )
 
     # ── Helpers ─────────────────────────────────────────────────────
-
-    def _too_close_to_last(self, *, titan_id: str, now: float) -> bool:
-        conn = self._conn()
-        try:
-            r = conn.execute(
-                "SELECT created_at FROM actions WHERE titan_id=? AND post_type=? "
-                "ORDER BY created_at DESC LIMIT 1",
-                (titan_id, self.name),
-            ).fetchone()
-            if not r:
-                return False
-            return (now - float(r["created_at"])) < AMPLIFY_MIN_INTRA_SPACING_S
-        finally:
-            conn.close()
 
     def _fetch_target(self, *, titan_id: str, now: float) -> dict | None:
         """Highest-relevance fresh followed-account post that (a) clears the

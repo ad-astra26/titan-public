@@ -126,6 +126,8 @@ class OuterInnerBridgeArchetype(ArchetypeBase):
             return None
         if self.cross_archetype_blocked(titan_id=titan_id, now=now):
             return None
+        if self.same_archetype_blocked(titan_id=titan_id, now=now):
+            return None
 
         # F-3 (2026-05-17): 30-day window (was lifetime). Outer/inner
         # bridges are re-bridgeable after 30d as inner-grounding evolves.

@@ -68,6 +68,8 @@ class PracticedResponseArchetype(ArchetypeBase):
             return None
         if self.cross_archetype_blocked(titan_id=titan_id, now=now):
             return None
+        if self.same_archetype_blocked(titan_id=titan_id, now=now):
+            return None
 
         nm = getattr(context, "neuromods", {}) or {}
         a = self._pool_a(titan_id=titan_id, now=now, neuromods=nm)
