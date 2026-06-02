@@ -32,8 +32,12 @@ logger = logging.getLogger(__name__)
 IRYS_NODE_URL = "https://node2.irys.xyz"
 IRYS_DEVNET_URL = "https://devnet.irys.xyz"  # For devnet testing
 
-# Arweave gateway for fetching
+# Arweave gateway for fetching. Primary + fallbacks: a sovereign restore must
+# retrieve every component tarball, and individual public gateways are flaky
+# (transient 5xx / Cloudflare 52x / rate limits), so `fetch` tries them in order
+# with retry-with-backoff before giving up.
 ARWEAVE_GATEWAY = "https://arweave.net"
+_ARWEAVE_GATEWAYS = [ARWEAVE_GATEWAY, "https://ar-io.net", "https://permagate.io"]
 
 
 class ArweaveStore:
@@ -387,20 +391,36 @@ class ArweaveStore:
                 return local_path.read_bytes()
             return None
 
-        # Mainnet: fetch from Arweave gateway.
-        # follow_redirects=True is REQUIRED — the gateway 302-redirects
-        # {tx_id} to its content-addressed subdomain; without following,
-        # every fetch (and thus every restore + verify) got a 302 and
-        # returned None (2026-05-29). Larger timeout for multi-hundred-MB
-        # baseline tarballs.
-        try:
-            async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-                resp = await client.get(f"{ARWEAVE_GATEWAY}/{tx_id}")
-                if resp.status_code == 200:
-                    return resp.content
-                logger.warning("[ArweaveStore] Fetch %s returned %d", tx_id[:16], resp.status_code)
-        except Exception as e:
-            logger.error("[ArweaveStore] Fetch error: %s", e)
+        # Mainnet: fetch from an Arweave gateway, with MULTI-GATEWAY FALLBACK +
+        # retry-with-backoff. A sovereign restore MUST retrieve every component
+        # tarball or it halts, but public gateways are individually flaky (transient
+        # 5xx / Cloudflare 52x / rate limits — e.g. arweave.net returned 572 on a T1
+        # restore 2026-06-02). Try each gateway a few times before giving up.
+        # follow_redirects=True is REQUIRED — gateways 302-redirect {tx_id} to a
+        # content-addressed subdomain. Large timeout for multi-hundred-MB tarballs.
+        import asyncio
+        for gw in _ARWEAVE_GATEWAYS:
+            for attempt in range(3):
+                try:
+                    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                        resp = await client.get(f"{gw}/{tx_id}")
+                    if resp.status_code == 200:
+                        return resp.content
+                    # transient (5xx / Cloudflare 52x / 429) → backoff + retry; a
+                    # plain 4xx (404 etc.) → no retry, fall through to next gateway.
+                    if resp.status_code == 429 or resp.status_code >= 500:
+                        logger.warning("[ArweaveStore] %s/%s… HTTP %d (attempt %d) — retrying",
+                                       gw, tx_id[:12], resp.status_code, attempt + 1)
+                        await asyncio.sleep(min(8.0, 0.5 * (2 ** attempt)))
+                        continue
+                    logger.warning("[ArweaveStore] %s/%s… HTTP %d — next gateway",
+                                   gw, tx_id[:12], resp.status_code)
+                    break
+                except Exception as e:
+                    logger.warning("[ArweaveStore] %s fetch error: %s — retry/next", gw, e)
+                    await asyncio.sleep(min(8.0, 0.5 * (2 ** attempt)))
+        logger.error("[ArweaveStore] Fetch %s FAILED across all gateways %s",
+                     tx_id[:16], _ARWEAVE_GATEWAYS)
         return None
 
     async def fetch_json(self, tx_id: str) -> Optional[dict]:

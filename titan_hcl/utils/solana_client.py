@@ -1334,13 +1334,26 @@ async def _rpc_post(rpc_url: str, method: str, params: list) -> dict:
     a genuine failure from an empty-but-successful result (never silent-None on
     transport failure — that would mask a truncated chain walk as "no memos").
     """
+    import asyncio
     import httpx
 
     payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
     async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(rpc_url, json=payload)
-        resp.raise_for_status()
-        body = resp.json()
+        # Retry-with-backoff on 429/5xx — a full-history resurrection walk fetches
+        # one memo per backup-event signature and free-tier RPCs rate-limit it.
+        last = None
+        for attempt in range(6):
+            resp = await client.post(rpc_url, json=payload)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                last = resp
+                await asyncio.sleep(min(10.0, 0.5 * (2 ** attempt)))  # 0.5,1,2,4,8,10
+                continue
+            resp.raise_for_status()
+            body = resp.json()
+            break
+        else:
+            last.raise_for_status()
+            return {}
     if isinstance(body, dict) and body.get("error"):
         raise RuntimeError(f"RPC {method} error: {body['error']}")
     return body

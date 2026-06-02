@@ -46,12 +46,21 @@ _SIG_PAGE_LIMIT = 1000
 
 
 async def _rpc(client, rpc_url: str, method: str, params: list) -> dict:
-    """Single JSON-RPC POST. Raises on transport error; returns the parsed body."""
-    resp = await client.post(rpc_url, json={
-        "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
-    })
-    resp.raise_for_status()
-    return resp.json()
+    """Single JSON-RPC POST with retry-with-backoff on 429/5xx (free-tier RPCs
+    rate-limit a full-history resurrection walk). Raises on persistent failure."""
+    import asyncio
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    last = None
+    for attempt in range(6):
+        resp = await client.post(rpc_url, json=payload)
+        if resp.status_code == 429 or resp.status_code >= 500:
+            last = resp
+            await asyncio.sleep(min(10.0, 0.5 * (2 ** attempt)))   # 0.5,1,2,4,8,10
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    last.raise_for_status()          # exhausted retries → surface the last error
+    return {}
 
 
 def _extract_shard3_hex(memo: object) -> Optional[str]:

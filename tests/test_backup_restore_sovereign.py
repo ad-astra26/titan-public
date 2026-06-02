@@ -365,3 +365,4 @@ async def test_sovereign_halts_on_tampered_tarball(tmp_path):
         scratch_dir=str(tmp_path / "t"), verbose=False)
     assert result.status == "halted"
     assert result.halt_reason == sov.HALT_ARC_MISMATCH
+
