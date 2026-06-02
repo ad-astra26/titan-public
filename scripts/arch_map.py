@@ -8133,6 +8133,396 @@ def run_ns_signals(titan: str = "T1") -> int:
     return 0
 
 
+# ===========================================================================
+# Module Hot-Reload Persistence Scanner
+#   rFP_module_hot_reload_persistence_program §P0  (2026-06-01)
+# ===========================================================================
+# STATIC (AST) enforcement gate for the §11 persistence contract: any module a
+# hot-reload / kill-respawn touches must wire SAVE_NOW + flush-on-
+# MODULE_SHUTDOWN + symmetric boot-restore, OR be genuinely stateless.
+# Reproduces the STRUCTURAL failure classes the 52-agent audit found:
+#   • noop_stub   — a save-named fn whose body is `return []` / `pass`
+#   • no_shutdown — no MODULE_SHUTDOWN handler at all (won't flush on reload)
+#   • never_wired — MODULE_SHUTDOWN handler present but no save call inside it
+#   • asymmetric  — saves state but no boot-restore call (written, never reloaded)
+# It does NOT prove SEMANTIC correctness (right method name, right payload
+# type, checked WriteResult) — those are proven by the §P4 E2E
+# save→kill→respawn→verify test. Use as (a) a pre-promotion gate before
+# allowlisting a module and (b) a regression gate re-run after every §P2 fix.
+#
+# name→worker-file resolution is AUTHORITATIVE: parsed from
+# titan_hcl/module_catalog.py (ModuleSpec name= ↔ entry_fn= ↔ ImportFrom),
+# never convention-guessed. grep-before-write: only run_ns_persistence_check
+# (NS-specific) + run_observables_audit (doc-compliance) existed — this is the
+# general per-module structural gate.
+
+def _persist_func_token(call_node) -> str:
+    """Trailing name token of a Call's func (id, or last attribute)."""
+    f = call_node.func
+    if isinstance(f, ast.Attribute):
+        return f.attr
+    if isinstance(f, ast.Name):
+        return f.id
+    return ""
+
+
+def _persist_is_save_token(tok: str) -> bool:
+    t = (tok or "").lower()
+    return ("save" in t or "persist" in t or "checkpoint" in t
+            or t == "flush" or t.endswith("_flush") or "writeback" in t)
+
+
+def _persist_is_load_token(tok: str) -> bool:
+    # Match load/restore as the CALL func token only — never substrings of
+    # unrelated names like "payload"/"download"/"upload".
+    t = (tok or "").lower()
+    if "restore" in t or t == "from_state":
+        return True
+    return (t == "load" or t.startswith("load_")
+            or t.endswith("_load") or "_load_" in t or t.endswith("_load_state"))
+
+
+def _persist_is_durable_file_call(call_node) -> bool:
+    # File-snapshot durability: os.replace/fsync, json|pickle|yaml.dump,
+    # torch.save / model.save, open(..., "w"/"a"). These REQUIRE an explicit
+    # boot-load to restore (the asymmetric check applies).
+    tok = _persist_func_token(call_node)
+    if tok in {"replace", "fsync", "dump"} or tok == "save":
+        return True
+    if tok == "open":
+        modes = [a for a in call_node.args[1:]
+                 if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+        modes += [kw.value for kw in call_node.keywords
+                  if kw.arg == "mode" and isinstance(kw.value, ast.Constant)
+                  and isinstance(kw.value.value, str)]
+        return any(c in m.value for m in modes for c in ("w", "a"))
+    return False
+
+
+def _persist_is_durable_db_call(call_node) -> bool:
+    # DB durability: .commit() (sqlite/duckdb) or PRAGMA wal_checkpoint via
+    # .execute(). The DB FILE *is* the persistence — reconnect-on-boot restores
+    # it, so the asymmetric (needs-explicit-load) check does NOT apply.
+    tok = _persist_func_token(call_node)
+    if tok == "commit":
+        return True
+    if tok == "execute" and call_node.args:
+        a0 = call_node.args[0]
+        if isinstance(a0, ast.Constant) and isinstance(a0.value, str) \
+                and "wal_checkpoint" in a0.value.lower():
+            return True
+    return False
+
+
+def _persist_is_durable_call(call_node) -> bool:
+    return _persist_is_durable_file_call(call_node) or _persist_is_durable_db_call(call_node)
+
+
+def _persist_call_persists(call_node, noop_names) -> bool:
+    """A call that durably saves: any durable write, or a save-token call that
+    is NOT a resolved noop stub (so `_b1_save_state()` readiness callbacks and
+    other return-[] stubs do not count as a real flush)."""
+    if _persist_is_durable_call(call_node):
+        return True
+    tok = _persist_func_token(call_node)
+    return _persist_is_save_token(tok) and tok not in noop_names
+
+
+def _persist_scan_set(worker_path):
+    """worker file + its 1-level titan_hcl.logic/.modules imports — where the
+    real save/load logic usually lives (the worker only instantiates the class
+    / calls high-level helpers, so worker-file-only scans miss boot-restore)."""
+    files = [Path(worker_path)]
+    seen = {str(worker_path)}
+    try:
+        tree = ast.parse(Path(worker_path).read_text())
+    except Exception:
+        return files
+
+    def _add(dotted):
+        cand = PROJECT_ROOT / (dotted.replace(".", "/") + ".py")
+        if cand.exists() and str(cand) not in seen:
+            files.append(cand)
+            seen.add(str(cand))
+
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and n.module and \
+                n.module.startswith(("titan_hcl.logic", "titan_hcl.modules")):
+            _add(n.module)
+        elif isinstance(n, ast.Import):
+            for a in n.names:
+                if a.name.startswith(("titan_hcl.logic", "titan_hcl.modules")):
+                    _add(a.name)
+    return files
+
+
+def _persist_collect_union(files):
+    """OR-aggregate save/load/durable signals + noop names across the scan-set."""
+    out = {"save_call": False, "load_call": False, "durable_file": False,
+           "durable_db": False, "real_save_fn": False, "noop_names": set()}
+    for f in files:
+        try:
+            tree = ast.parse(Path(f).read_text())
+        except Exception:
+            continue
+        noop_here = set(_persist_noop_save_fns(tree))
+        out["noop_names"] |= noop_here
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                    and _persist_is_save_token(n.name) and n.name not in noop_here:
+                out["real_save_fn"] = True
+            elif isinstance(n, ast.Call):
+                tok = _persist_func_token(n)
+                if _persist_is_save_token(tok) and tok not in noop_here:
+                    out["save_call"] = True
+                if _persist_is_load_token(tok):
+                    out["load_call"] = True
+                if _persist_is_durable_file_call(n):
+                    out["durable_file"] = True
+                if _persist_is_durable_db_call(n):
+                    out["durable_db"] = True
+    return out
+
+
+def _persist_shutdown_flush(worker_tree, noop_names):
+    """(has_handler, flushes) for the WORKER file's recv loop. A flush counts if
+    a durable/real-save call is (a) inside a MODULE_SHUTDOWN branch, or (b) in
+    post-loop cleanup (lineno after the recv `while`), or (c) in a `finally` —
+    all three run on the shutdown path (`break`/`return` → cleanup)."""
+    has_handler = flushes = False
+    for fn in ast.walk(worker_tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        sd_ifs = _persist_handler_branches(fn, "MODULE_SHUTDOWN")
+        if not sd_ifs:
+            continue
+        has_handler = True
+        # (a) save directly inside a shutdown branch body
+        for ifn in sd_ifs:
+            for stmt in ifn.body:
+                for c in ast.walk(stmt):
+                    if isinstance(c, ast.Call) and _persist_call_persists(c, noop_names):
+                        flushes = True
+        # (b) post-loop cleanup save (after the recv while loop)
+        whiles = [n for n in ast.walk(fn) if isinstance(n, ast.While)]
+        loop_end = max((getattr(w, "end_lineno", 0) or 0) for w in whiles) if whiles else 0
+        if loop_end:
+            for c in ast.walk(fn):
+                if isinstance(c, ast.Call) and (getattr(c, "lineno", 0) or 0) > loop_end \
+                        and _persist_call_persists(c, noop_names):
+                    flushes = True
+        # (c) finally-block save
+        for t in ast.walk(fn):
+            if isinstance(t, ast.Try):
+                for stmt in t.finalbody:
+                    for c in ast.walk(stmt):
+                        if isinstance(c, ast.Call) and _persist_call_persists(c, noop_names):
+                            flushes = True
+    return has_handler, flushes
+
+
+def _persist_handler_branches(tree, const_name):
+    """If/elif nodes whose test compares `<x> == [bus.]<const_name>`."""
+    out = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.If) and isinstance(n.test, ast.Compare):
+            for c in [n.test.left] + list(n.test.comparators):
+                nm = (c.attr if isinstance(c, ast.Attribute)
+                      else c.id if isinstance(c, ast.Name) else None)
+                if nm == const_name:
+                    out.append(n)
+                    break
+    return out
+
+
+def _persist_noop_save_fns(tree):
+    out = []
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and _persist_is_save_token(n.name):
+            body = list(n.body)
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(getattr(body[0], "value", None), ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                body = body[1:]  # strip docstring
+            if not body:
+                out.append(n.name)
+                continue
+            if len(body) == 1:
+                s = body[0]
+                if isinstance(s, ast.Pass):
+                    out.append(n.name)
+                elif isinstance(s, ast.Return):
+                    v = s.value
+                    if v is None or (isinstance(v, ast.Constant) and v.value is None):
+                        out.append(n.name)
+                    elif isinstance(v, (ast.List, ast.Tuple, ast.Set)) and not v.elts:
+                        out.append(n.name)
+                    elif isinstance(v, ast.Dict) and not v.keys:
+                        out.append(n.name)
+    return out
+
+
+def _persist_module_file_map():
+    """name -> worker .py Path, parsed authoritatively from module_catalog.py."""
+    cat = PROJECT_ROOT / "titan_hcl" / "module_catalog.py"
+    tree = ast.parse(cat.read_text())
+    sym2mod = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and n.module:
+            for alias in n.names:
+                sym2mod[alias.asname or alias.name] = n.module
+    name2file = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and _persist_func_token(n) == "ModuleSpec":
+            nm = entry = None
+            for kw in n.keywords:
+                if kw.arg == "name" and isinstance(kw.value, ast.Constant):
+                    nm = kw.value.value
+                elif kw.arg == "entry_fn":
+                    if isinstance(kw.value, ast.Name):
+                        entry = kw.value.id
+                    elif isinstance(kw.value, ast.Attribute):
+                        entry = kw.value.attr
+            if not nm:
+                continue
+            p = None
+            if entry and entry in sym2mod:
+                cand = PROJECT_ROOT / (sym2mod[entry].replace(".", "/") + ".py")
+                if cand.exists():
+                    p = cand
+            name2file[nm] = p  # None = unresolved (entry_fn local or non-modules import)
+    return name2file
+
+
+def _persist_restart_allowlist():
+    dash = PROJECT_ROOT / "titan_hcl" / "api" / "dashboard.py"
+    names = set()
+    tree = ast.parse(dash.read_text())
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Set):
+            for t in n.targets:
+                if isinstance(t, ast.Name) and t.id == "_RESTART_MODULE_ALLOWLIST":
+                    for e in n.value.elts:
+                        if isinstance(e, ast.Constant) and isinstance(e.value, str):
+                            names.add(e.value)
+    return names
+
+
+def _persist_analyze_file(path):
+    """Structural persistence verdict for a module (worker file + 1-level
+    titan_hcl.logic/.modules imports). See block header for the failure classes
+    it can / cannot prove."""
+    files = _persist_scan_set(path)
+    try:
+        worker_tree = ast.parse(Path(path).read_text())
+    except Exception as e:
+        return {"verdict": "ERROR", "reasons": [f"parse failed: {e}"], "warns": []}
+
+    u = _persist_collect_union(files)
+    has_handler, flushes = _persist_shutdown_flush(worker_tree, u["noop_names"])
+    savenow_ifs = _persist_handler_branches(worker_tree, "SAVE_NOW")
+
+    intent = (u["save_call"] or u["load_call"] or u["durable_file"]
+              or u["durable_db"] or u["real_save_fn"])
+    if not intent:
+        return {"verdict": "STATELESS", "reasons": [],
+                "warns": ["no persistence intent (stateless / SHM-only / DB-direct)"],
+                "shutdown": has_handler, "savenow": bool(savenow_ifs)}
+
+    reasons, warns = [], []
+    if not has_handler:
+        reasons.append("no MODULE_SHUTDOWN handler (won't flush on hot-reload)")
+    elif not flushes:
+        # Only FILE-SNAPSHOT state (held in memory, written as a periodic/batched
+        # snapshot) needs an explicit shutdown flush. DB-direct persistence
+        # (commit / WAL / autocommit) is durable per-write — no flush required —
+        # so a DB-backed module that only `break`s on shutdown is fine.
+        if u["durable_file"] and not u["durable_db"]:
+            reasons.append("MODULE_SHUTDOWN path does not flush file-snapshot state "
+                           "(no durable save in handler / post-loop / finally)")
+        else:
+            warns.append("MODULE_SHUTDOWN handler does not flush — OK iff persistence "
+                         "is DB-direct/eager (verify: is any in-memory state batched?)")
+    # File-snapshot writes REQUIRE an explicit boot-load to restore; DB-direct
+    # (commit/WAL) self-restores on reconnect. The asymmetric check applies only
+    # when file-snapshot is the PRIMARY persistence (no DB-direct present) — else
+    # stray file writes (caches/exports) on a DB-backed module false-positive.
+    if u["durable_file"] and not u["durable_db"] and not u["load_call"]:
+        reasons.append("file-snapshot saved but no boot-restore call "
+                       "(asymmetric — written, never reloaded)")
+    if not reasons and not savenow_ifs:
+        warns.append("no SAVE_NOW handler (no API/periodic-triggered flush)")
+
+    return {"verdict": "FAIL" if reasons else "PASS", "reasons": reasons, "warns": warns,
+            "shutdown": has_handler, "savenow": bool(savenow_ifs)}
+
+
+def run_module_persistence_scan(scope="allowlist", only=None, strict=False) -> int:
+    """§P0 structural persistence gate. scope: 'allowlist' (default) | 'all'.
+
+    Report-only by default (exit 0) — the verdicts are a pre-filter; the
+    authoritative gate is the §P4 runtime save→respawn→diff E2E. Exit-1
+    enforcement is opt-in:
+      --strict        → exit 1 if any allowlisted module FAILs
+      --module=NAME    → exit 1 if THAT module FAILs (dev-loop fix verification)
+    """
+    name2file = _persist_module_file_map()
+    allow = _persist_restart_allowlist()
+    if only:
+        targets = [only]
+    elif scope == "all":
+        targets = sorted(name2file)
+    else:
+        targets = sorted(allow)
+
+    print("\nMODULE PERSISTENCE SCAN — §11 hot-reload contract (structural / AST)")
+    print("=" * 84)
+    print("  STRUCTURAL gate only — proves handler-wiring + boot-restore symmetry.")
+    print("  Semantic correctness (method names, payload types, WriteResult) → §P4 E2E.")
+    print("-" * 84)
+    print(f"  {'module':<30} {'allow':<6} {'verdict':<10} detail")
+    print("-" * 84)
+
+    enforce_fail = 0
+    counts = defaultdict(int)
+    for name in targets:
+        path = name2file.get(name)
+        allowed = "yes" if name in allow else "—"
+        if path is None:
+            print(f"  {name:<30} {allowed:<6} {'UNRESOLVED':<10} "
+                  f"entry_fn not in titan_hcl.modules (skipped)")
+            counts["UNRESOLVED"] += 1
+            continue
+        r = _persist_analyze_file(path)
+        v = r["verdict"]
+        counts[v] += 1
+        color = {"PASS": "32", "STATELESS": "36", "FAIL": "31;1",
+                 "ERROR": "33", "UNRESOLVED": "33"}.get(v, "0")
+        detail = "; ".join(r.get("reasons") or r.get("warns") or ["ok"])
+        print(f"  {name:<30} {allowed:<6} {_ns_color(v, color):<19} {detail}")
+        for w in (r.get("warns") or []):
+            if r.get("reasons"):  # show warns separately only when there were also fails
+                print(f"  {'':<30} {'':<6} {'':<10} ⚠ {w}")
+        # --module gates on that one module; --strict gates on the allowlist.
+        if v in ("FAIL", "ERROR") and (only or (strict and name in allow)):
+            enforce_fail += 1
+
+    print("-" * 84)
+    summary = "  ".join(f"{k}={counts[k]}" for k in
+                        ("PASS", "STATELESS", "FAIL", "ERROR", "UNRESOLVED") if counts[k])
+    print(f"  {summary}")
+    gated = bool(only or strict)
+    gate = f"module '{only}'" if only else "allowlisted module(s)"
+    if enforce_fail:
+        print(f"  {_ns_color(f'ENFORCEMENT: {enforce_fail} {gate} FAIL the structural §11.H.9 contract — verify before hot-reload', '31;1')}")
+        return 1
+    if gated:
+        print(f"  {_ns_color(f'ENFORCEMENT: {gate} pass the structural contract', '32')}")
+    else:
+        print(f"  {_ns_color('(report-only — use --strict to gate on allowlisted FAILs, or --module=NAME for one)', '36')}")
+    return 0
+
+
 def run_ns_persistence_check(titan: str = "T1") -> int:
     """Verify all 11 programs have weights + buffer on disk + training state."""
     print(f"\nNS PERSISTENCE CHECK — {titan}")
@@ -9943,6 +10333,19 @@ def main():
     elif cmd == "ns-persistence-check":
         # 2026-04-16 rFP β Stage 0: all 11 programs have weights + buffer + state?
         sys.exit(run_ns_persistence_check())
+
+    elif cmd == "persistence":
+        # rFP_module_hot_reload_persistence_program §P0 (2026-06-01): structural
+        # (AST) gate for the §11 hot-reload persistence contract. Default scans
+        # the _RESTART_MODULE_ALLOWLIST; --all scans every registered module;
+        # --module=NAME scans one. Exit 1 if any allowlisted module FAILs.
+        _scope = "all" if "--all" in sys.argv else "allowlist"
+        _only = None
+        for a in sys.argv[2:]:
+            if a.startswith("--module="):
+                _only = a.split("=", 1)[1].strip()
+        sys.exit(run_module_persistence_scan(
+            scope=_scope, only=_only, strict="--strict" in sys.argv))
 
     elif cmd == "thread-pool":
         # 2026-04-14: thread-pool saturation snapshot (asyncio default executor)

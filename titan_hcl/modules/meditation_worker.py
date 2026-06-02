@@ -824,8 +824,15 @@ def _orchestrator_loop(
             publisher.get_count(),
             getattr(publisher, "_titan_id", "?"))
 
-        # Persist tracker to disk — off-hot-path (Chunk 1G).
-        _schedule_persist_tracker(publisher.get_tracker())
+        # Persist tracker to disk SYNCHRONOUSLY on completion. AUDIT §C fix
+        # (rFP §P2): this was fire-and-forget (_schedule_persist_tracker), so a
+        # SIGKILL in the async window lost the just-completed meditation despite
+        # the SHM publish → on respawn _load_tracker_from_disk returned the old
+        # count, silently dropping the completion. Completions are infrequent
+        # (meditations run for minutes), so the atomic ~ms write here does not
+        # meaningfully block — and it guarantees crash-safe durability. Periodic
+        # off-hot-path persistence elsewhere stays async.
+        _persist_tracker(publisher.get_tracker())
 
         # Phase: exiting → idle
         publisher.set_phase("idle")

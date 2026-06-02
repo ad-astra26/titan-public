@@ -309,6 +309,23 @@ class ObservatoryDB:
             finally:
                 conn.close()
 
+    def flush(self, timeout: float = 30.0) -> None:
+        """Block until buffered async writes are ACKed by the writer daemon.
+
+        AUDIT §C fix (rFP §P2): the InnerMemoryWriterClient buffers writes and
+        ACKs them asynchronously. observatory_worker had no flush at
+        MODULE_SHUTDOWN, so snapshot writes queued in the final second(s) before
+        a hot-reload / kill-respawn silently evaporated. The worker now calls
+        this in its `finally`. No-op when running writer-disabled (direct WAL —
+        already committed synchronously).
+        """
+        if self._writer is not None:
+            try:
+                self._writer.flush(timeout=timeout)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[ObservatoryDB] writer flush on shutdown failed: %s", e)
+
     # ------------------------------------------------------------------
     # Vital Snapshots
     # ------------------------------------------------------------------

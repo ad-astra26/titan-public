@@ -184,8 +184,21 @@ def warning_monitor_worker_main(recv_queue, send_queue, name: str,
                 aggregated[k]["last_msg"] = str(v.get("last_msg", ""))
                 for lvl, c in (v.get("by_level") or {}).items():
                     aggregated[k]["by_level"][lvl] = int(c)
-            logger.info("[WarningMonitor] Loaded prior state: %d keys",
-                        len(aggregated))
+                # AUDIT §C fix (rFP §P2): restore rate_window timestamps so
+                # spike detection resumes accurately (was cold-started before).
+                for _t in (v.get("rate_window") or []):
+                    try:
+                        aggregated[k]["rate_window"].append(float(_t))
+                    except (TypeError, ValueError):
+                        pass
+            # AUDIT §C fix (rFP §P2): restore spike-alert cooldowns.
+            for _sk, _sts in (prior.get("spike_alerts") or {}).items():
+                try:
+                    spike_alerts[str(_sk)] = float(_sts)
+                except (TypeError, ValueError):
+                    pass
+            logger.info("[WarningMonitor] Loaded prior state: %d keys, "
+                        "%d spike cooldowns", len(aggregated), len(spike_alerts))
     except Exception as e:
         logger.warning("[WarningMonitor] State load failed: %s — starting fresh", e)
 
@@ -241,6 +254,16 @@ def warning_monitor_worker_main(recv_queue, send_queue, name: str,
                     if _swap.maybe_dispatch_swap_msg(msg):
                         continue
                     _mt = msg.get("type")
+                    # ── MODULE_SHUTDOWN — AUDIT §C fix (rFP §P2): there was NO
+                    # shutdown handler, so on hot-reload the rate_window +
+                    # spike_alerts mutated since the last periodic persist were
+                    # lost. Flush + exit cleanly. ──
+                    if _mt == bus.MODULE_SHUTDOWN:
+                        logger.info("[WarningMonitor] MODULE_SHUTDOWN — "
+                                    "persisting state + exiting")
+                        _persist_state(state_path, aggregated, recent_events,
+                                       spike_alerts=spike_alerts)
+                        return
                     # ── Phase 11 §11.I.3 — MODULE_PROBE_REQUEST handler ──
                     if _mt == bus.MODULE_PROBE_REQUEST and _state_writer is not None:
                         try:
@@ -319,7 +342,8 @@ def warning_monitor_worker_main(recv_queue, send_queue, name: str,
             # 3. Persist state every persist_interval_s
             now = time.time()
             if now - last_persist > persist_interval_s:
-                _persist_state(state_path, aggregated, recent_events)
+                _persist_state(state_path, aggregated, recent_events,
+                               spike_alerts=spike_alerts)
                 _maybe_rotate_events_log(events_path)
                 last_persist = now
 
@@ -517,6 +541,7 @@ def _evict_aggregated_lru(aggregated: dict, cap: int) -> int:
 
 def _persist_state(state_path: str, aggregated: dict,
                    recent_events: deque,
+                   spike_alerts: dict | None = None,
                    cap: int = AGGREGATED_KEY_CAP) -> None:
     """Atomically write aggregated state to disk.
 
@@ -540,10 +565,17 @@ def _persist_state(state_path: str, aggregated: dict,
                 "by_level": dict(v["by_level"]),
                 "rate_1m": sum(1 for t in v["rate_window"]
                                if time.time() - t < 60.0),
+                # AUDIT §C fix (rFP §P2): persist the actual rate_window
+                # timestamps (not just the derived rate_1m) so spike detection
+                # resumes accurately after respawn instead of cold-starting.
+                "rate_window": [float(t) for t in v["rate_window"]],
             }
             for k, v in aggregated.items()
         },
         "recent_events": list(recent_events),
+        # AUDIT §C fix (rFP §P2): persist spike-alert cooldowns so a hot-reload
+        # doesn't immediately re-fire alerts that are still in cooldown.
+        "spike_alerts": dict(spike_alerts or {}),
     }
     tmp_path = state_path + ".tmp"
     try:

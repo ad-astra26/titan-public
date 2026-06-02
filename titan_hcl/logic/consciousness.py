@@ -266,10 +266,28 @@ class ConsciousnessDB:
                 self._writer = None
 
     def _route_write(self, sql: str, params, *, table: str) -> None:
-        """Route a write through the writer daemon if available, else direct."""
+        """Route a write through the writer daemon if available, else direct.
+
+        §11.H — a critical-data write MUST be durable or LOUDLY surfaced, never
+        silently dropped. `writer_client.write()` returns a WriteResult and does
+        NOT raise on failure (ok=False means the write was not even journaled —
+        truly lost). The prior code discarded that result → silent data loss on
+        any writer-daemon outage (AUDIT §C: corrective_events_persistence +
+        journey_persistence both NOT_READY via this single discard). Fix: check
+        `.ok`; on failure log ERROR (directive_error_visibility) and fall back
+        to a direct durable write so the Trinity corrective/journey event
+        survives a transient daemon outage. No double-write risk: an ok=False
+        result means nothing was journaled, so there is no later replay.
+        """
         if self._writer is not None:
-            self._writer.write(sql, params, table=table)
-            return
+            result = self._writer.write(sql, params, table=table)
+            if result is None or result.ok:
+                return
+            logger.error(
+                "[ConsciousnessDB] writer.write FAILED (table=%s via=%s): %s — "
+                "falling back to a direct durable write to avoid data loss",
+                table, getattr(result, "via", "?"), result.error)
+            # fall through to the direct durable write below
         self._conn.execute(sql, params)
         self._conn.commit()
 

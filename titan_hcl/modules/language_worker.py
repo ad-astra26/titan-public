@@ -1220,6 +1220,16 @@ def language_worker_main(recv_queue, send_queue, name: str, config: dict) -> Non
         if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[LanguageWorker] Shutdown requested: %s",
                         msg.get("payload", {}).get("reason", ""))
+            # §P3 polish (rFP_module_hot_reload): flush teacher counters on
+            # shutdown so the sub-composition drift window is zeroed on
+            # hot-reload / kill-respawn. Core state (vocab/associations/journal)
+            # is already DB-direct immediate-commit; this covers the in-memory
+            # teacher_compositions_since / teacher_last_fire_time only.
+            try:
+                _save_teacher_state(teacher_compositions_since,
+                                    teacher_last_fire_time, teacher_queue)
+            except Exception:  # noqa: BLE001
+                pass
             break
 
         # ── QUERY handler (API → language stats) ─────────────────────

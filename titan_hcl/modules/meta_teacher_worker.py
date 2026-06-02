@@ -166,6 +166,50 @@ def _save_adoption_state(
                      key="modules.meta_teacher_worker.adoption_save_failed", throttle=100)
 
 
+COUNTERS_JSON_FILENAME = "teacher_counters.json"
+
+
+def _load_teacher_counters(data_dir: str) -> dict:
+    """Restore cumulative MetaTeacher counters (total_critiques/total_observed).
+
+    AUDIT §C fix (rFP §P2): these counters drive the IQL ramp curriculum
+    (compute_reward_weight) + the voice self-assess gate. They were NEVER
+    persisted → every respawn reset them to 0, restarting the curriculum at
+    phase 0 on each hot-reload. Kept in a SEPARATE file from
+    adoption_metrics.json on purpose: counters are cumulative and MUST survive
+    prompt-version bumps (the adoption EMAs reset on a version bump; counters
+    do not).
+    """
+    path = os.path.join(data_dir, "meta_teacher", COUNTERS_JSON_FILENAME)
+    try:
+        with open(path, "r") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            return {
+                "total_critiques": int(d.get("total_critiques", 0)),
+                "total_observed": int(d.get("total_observed", 0)),
+            }
+    except Exception:
+        pass
+    return {"total_critiques": 0, "total_observed": 0}
+
+
+def _save_teacher_counters(data_dir: str, total_critiques: int,
+                           total_observed: int) -> None:
+    """Persist cumulative MetaTeacher counters (best-effort, atomic per §11.H.2)."""
+    dir_path = os.path.join(data_dir, "meta_teacher")
+    try:
+        os.makedirs(dir_path, exist_ok=True)
+        tmp = os.path.join(dir_path, COUNTERS_JSON_FILENAME + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump({"total_critiques": int(total_critiques),
+                       "total_observed": int(total_observed)}, f)
+        os.replace(tmp, os.path.join(dir_path, COUNTERS_JSON_FILENAME))
+    except Exception as e:
+        swallow_warn('[MetaTeacher] counters save failed', e,
+                     key="modules.meta_teacher_worker.counters_save_failed", throttle=100)
+
+
 def _append_maker_info_jsonl(data_dir: str, entry: dict) -> None:
     """Append one INFO row to data/meta_teacher/maker_info_log.jsonl.
 
@@ -355,6 +399,12 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
     # Restore adoption EMAs from disk — version-aware: v1→v2→v3 bump resets.
     teacher.adoption_ema_by_domain.update(
         _load_adoption_state(data_dir, SYSTEM_PROMPT_VERSION))
+    # AUDIT §C fix (rFP §P2): restore cumulative counters so the IQL ramp
+    # curriculum + voice self-assess gate resume where they left off rather than
+    # restarting at phase 0 on every respawn.
+    _tc = _load_teacher_counters(data_dir)
+    teacher.total_critiques = _tc["total_critiques"]
+    teacher.total_observed = _tc["total_observed"]
     # rFP_teachers_update F5 (2026-05-26): bootstrap the 24h critique window
     # from disk so SHM-published dashboard stats are accurate from the first
     # heartbeat tick (steady-state appends in record_critique_entry).
@@ -737,6 +787,8 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
             _save_adoption_state(
                 data_dir, dict(teacher.adoption_ema_by_domain),
                 SYSTEM_PROMPT_VERSION)
+            _save_teacher_counters(
+                data_dir, teacher.total_critiques, teacher.total_observed)
             _maybe_emit_info(now)
             _maybe_archive(now)
             # Phase C: run voice self-assessment if eval_interval elapsed and
@@ -799,6 +851,8 @@ def meta_teacher_worker_main(recv_queue, send_queue, name: str, config: dict) ->
             _save_adoption_state(
                 data_dir, dict(teacher.adoption_ema_by_domain),
                 SYSTEM_PROMPT_VERSION)
+            _save_teacher_counters(
+                data_dir, teacher.total_critiques, teacher.total_observed)
             _hb_stop.set()
             return
 
