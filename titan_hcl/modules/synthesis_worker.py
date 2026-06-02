@@ -1580,15 +1580,19 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
 
             def _llm_judge_call(prompt: str, timeout_s: float) -> str:
                 try:
+                    import asyncio as _aio
                     from titan_hcl.inference import get_provider as _get_provider
                     provider = _get_provider("ollama_cloud", (config or {}).get("inference", {}) or {})
-                    fn = getattr(provider, "generate", None) or getattr(provider, "complete", None)
-                    if fn is None:
-                        return ""
-                    out = fn(prompt, max_tokens=300, temperature=0.2)
-                    if isinstance(out, str):
-                        return out
-                    return getattr(out, "text", "") or str(out or "")
+                    # provider.complete is ASYNC — bridge via asyncio.run (same
+                    # class of bug as the miner proposer: calling it synchronously
+                    # returned an un-awaited coroutine → judge scored 0 TXs →
+                    # nothing got scored_by → the miner's Tier-1-verified filter
+                    # starved → 0 skills. 2026-06-02.
+                    out = _aio.run(provider.complete(
+                        prompt=prompt, temperature=0.2, max_tokens=300,
+                        timeout=float(timeout_s),
+                    ))
+                    return out if isinstance(out, str) else (str(out or ""))
                 except Exception as e:
                     logger.debug("[synthesis_worker] llm_judge provider failed: %s", e)
                     return ""
