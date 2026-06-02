@@ -39,15 +39,24 @@ def proxy_readout(ctx: Context, path: str) -> tuple[int, dict]:
 
 
 def proxy_chat(ctx: Context, message: str, *, session: str | None = None) -> tuple[int, dict]:
-    """POST a chat turn to api_hcl with the internal key (CLI-style auth)."""
+    """POST an owner chat turn to /v6/pitch/chat using the api internal_key.
+
+    The owner bypass on that endpoint authenticates the local console via the
+    X-Titan-Internal-Key header (no Privy/wallet, no pitch token). Payload matches
+    PitchChatRequest: {titan, thread_id (≥8 chars), message (≤500)}.
+    """
     if not message or not message.strip():
         return 400, {"error": "empty message"}
-    payload = {"message": message}
-    if session:
-        payload["session_id"] = session
-    headers = {"Content-Type": "application/json"}
-    if ctx.internal_key:
-        headers["X-Internal-Key"] = ctx.internal_key
+    if not ctx.internal_key:
+        return 503, {"error": "owner chat unavailable — no internal_key configured "
+                     "(set api.internal_key in ~/.titan/secrets.toml)."}
+    thread_id = (session or "console-owner").strip() or "console-owner"
+    if len(thread_id) < 8:
+        thread_id = (thread_id + "-console-owner")[:64]
+    payload = {"titan": ctx.titan_id, "thread_id": thread_id[:64],
+               "message": message.strip()[:500]}
+    headers = {"Content-Type": "application/json",
+               "X-Titan-Internal-Key": ctx.internal_key}
     status, body = ctx.http("POST", f"{ctx.api_base}/v6/pitch/chat",
                             body=json.dumps(payload).encode(),
                             headers=headers, timeout=60.0)

@@ -95,9 +95,14 @@ custom_llm_api_key = ""
 # Replaces local Ollama phi3:mini for meditation scoring, guardian veto, haiku, etc.
 ollama_cloud_api_key = "YOUR_OLLAMA_CLOUD_KEY"
 ollama_cloud_base_url = "https://ollama.com/v1"
-# Model tiers — change here to switch all light/heavy tasks without touching code
+# Model tiers — change here to switch all light/heavy tasks without touching code.
+# Chat defaults to the HEAVY class (chat_tier_config: default_model_class="heavy"),
+# so keep heavy on a responsive model: deepseek-v3.1:671b cold-starts > 90s on
+# Ollama Cloud and trips the chat timeout. T1–T3 run gemma4:31b for both tiers —
+# snappy chat; bump heavy to a 671b reasoning model only if you want slower, deeper
+# replies and can tolerate the cold-start latency.
 ollama_cloud_light_model = "gemma4:31b"
-ollama_cloud_heavy_model = "deepseek-v3.1:671b"
+ollama_cloud_heavy_model = "gemma4:31b"
 
 [memory_and_storage]
 cognee_db_path = "./cognee_data"
