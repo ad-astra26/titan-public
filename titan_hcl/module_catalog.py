@@ -2085,6 +2085,17 @@ def build_catalog(bus, guardian, config, *, titan_id: str, kernel=None) -> None:
         # this Orchestrator from spawning the api as a Guardian-supervised
         # child (which would race with the kernel-rs peer-spawn).
         autostart=False,
+        # SPEC §11.B.4 INV-PROC-5 / §11.B.5 (2026-06-02): the kernel is the
+        # SOLE supervisor of the api peer (spawn / health-gate / drain / respawn
+        # all live in kernel_supervisor.rs). guardian_hcl must NOT police or
+        # restart it — autostart=False only stops BOOT spawn, but the L1
+        # Supervisor's shm_pid_dead liveness check would still fire a
+        # MODULE_RESTART_REQUEST during the kernel's zero-downtime swap (when the
+        # canonical module_api_state.bin transiently holds OLD's dead pid before
+        # NEW self-promotes) → a doomed orchestrator spawn that loses the
+        # 7777 race and zombies. kernel_supervised=True makes guardian stand
+        # down entirely (monitor_tick skips it; Orchestrator.start() refuses it).
+        kernel_supervised=True,
         lazy=False,
         heartbeat_timeout=60.0,
         layer="L3",

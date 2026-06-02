@@ -42,6 +42,22 @@ def test_module_catalog_uses_api_main_entry_not_api_subprocess_main():
     assert "entry_fn=api_main_entry" in src
 
 
+def test_api_modulespec_is_kernel_supervised():
+    """SPEC §11.B.4 INV-PROC-5 / §11.B.5 — the api ModuleSpec must carry
+    kernel_supervised=True so guardian_hcl stands down (the kernel is the sole
+    spawner/respawner). Without it, the L1 Supervisor's shm_pid_dead check
+    races the kernel's zero-downtime swap → a doomed orchestrator spawn that
+    zombies. Source-text assertion (mirrors the entry_fn check above; building
+    the full catalog needs worker imports + a Solana keypair)."""
+    src = inspect.getsource(mc)
+    assert "kernel_supervised=True" in src, (
+        "the api ModuleSpec must set kernel_supervised=True — else guardian_hcl "
+        "will race the kernel's api lifecycle (zombie on every swap/crash)")
+    # And the ModuleSpec field exists with a safe default.
+    from titan_hcl.orchestrator.module_registry import ModuleSpec
+    assert ModuleSpec(name="x", entry_fn=lambda *a: None).kernel_supervised is False
+
+
 def test_api_main_entry_imports_and_is_callable():
     from titan_hcl.api import api_main
     assert callable(api_main.entry)

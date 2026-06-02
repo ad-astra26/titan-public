@@ -454,6 +454,22 @@ class Orchestrator(OrchestratorReloadMixin, OrchestratorDepActivationMixin):
         concurrently — so the boot path passes `activate_deps=False` to avoid
         serializing the otherwise-concurrent boot on per-dep 30s waits (the
         cause of the ~90s Phase A on cold 4-core boot, Maker 2026-05-28)."""
+        # SPEC §11.B.4 INV-PROC-5 / §11.B.5 (2026-06-02) — refuse to spawn a
+        # kernel-supervised peer (the L3 api). The kernel (kernel_supervisor.rs)
+        # is its SOLE spawner/respawner; an orchestrator spawn here would collide
+        # with the kernel peer for port 7777, lose the race, and zombie. Defense
+        # in depth behind the L1 Supervisor's monitor_tick skip — also blocks any
+        # stray MODULE_RESTART_REQUEST / dep ENSURE_RUNNING / manual restart from
+        # resurrecting the api under the orchestrator.
+        _ks_info = self._modules.get(name)
+        if _ks_info is not None and getattr(_ks_info.spec, "kernel_supervised", False):
+            logger.warning(
+                "[Guardian] start('%s') REFUSED — kernel-supervised peer "
+                "(SPEC §11.B.4 INV-PROC-5: titan-kernel-rs is the sole "
+                "spawner/respawner of this L3 peer; an orchestrator spawn would "
+                "race the kernel-rs lifecycle and zombie).", name)
+            return False
+
         # Microkernel v2 Phase A retrofit (2026-04-27): autonomous swap
         # interlock. If a shadow swap is in flight, block the calling
         # thread until the swap completes — prevents proxy lazy-starts

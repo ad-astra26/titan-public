@@ -217,6 +217,18 @@ class Supervisor:
             if info.reload_in_flight:
                 continue
 
+            # SPEC §11.B.4 INV-PROC-5 / §11.B.5 (2026-06-02) — kernel-supervised
+            # peer (the L3 api). Its liveness + respawn are owned SOLELY by
+            # titan-kernel-rs (kernel_supervisor.rs). The L1 Supervisor must NOT
+            # police it: the kernel's zero-downtime swap transiently leaves the
+            # canonical module_api_state.bin holding OLD's (dead) pid until NEW
+            # self-promotes, and a shm_pid_dead check here would race the kernel
+            # → a spurious MODULE_RESTART_REQUEST → a doomed orchestrator spawn
+            # that loses the port and zombies. The slot stays enumerable for
+            # /v6/* readouts; only the restart-policing is the kernel's job.
+            if getattr(info.spec, "kernel_supervised", False):
+                continue
+
             # Modules the orchestrator never autostarted / deliberately stopped
             # have no live slot to police.
             if not info.spec.autostart and info.state in (

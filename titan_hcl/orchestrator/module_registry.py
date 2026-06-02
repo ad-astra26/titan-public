@@ -132,6 +132,19 @@ class ModuleSpec:
     restart_on_crash: bool = True
     heartbeat_timeout: float = HEARTBEAT_TIMEOUT  # per-module override
     reply_only: bool = False     # if True, skip dst="all" broadcasts (only receive targeted msgs)
+    # SPEC §11.B.4 INV-PROC-5 / §11.B.5 (2026-06-02) — kernel-supervised peer.
+    # When True, this module's liveness + restart are owned SOLELY by
+    # titan-kernel-rs (kernel_supervisor.rs spawns/health-gates/drains/respawns
+    # it), NOT by guardian_hcl. The ModuleSpec stays in the catalog so it is
+    # still enumerable in /v6/* readouts (heartbeat / rss / layer metadata), but
+    # the L1 Supervisor.monitor_tick MUST NOT police it (a shm_pid_dead check
+    # races the kernel's own respawn / zero-downtime swap → spurious
+    # MODULE_RESTART_REQUEST → a doomed orchestrator spawn that loses the port
+    # and zombies), and Orchestrator.start() MUST refuse it (the kernel is the
+    # sole spawner; an orchestrator spawn would collide with the kernel peer).
+    # Set True ONLY for the L3 `titan_hcl_api` peer (the lone kernel-spawned
+    # entry in the Guardian module catalog).
+    kernel_supervised: bool = False
     # Microkernel v2 Phase A §A.5 (2026-04-24): layer assignment.
     # Canonical values in titan_hcl._layer_canon.LAYER_CANON.
     # Validated in Guardian.register(). Used by arch_map, dashboard,

@@ -19,6 +19,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::time::Instant;
+
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -40,6 +42,16 @@ const SUBSCRIBER_NAME: &str = "kernel";
 /// race or a transient socket churn).
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
+/// Coalescing window for duplicate reload triggers. A single `reload-api`
+/// publish can reach this subscriber more than once (a publish-path fan-out
+/// artifact), and a fat-fingered operator double-fire is never a distinct
+/// operation — a swap takes seconds. We forward at most ONE reload command per
+/// window; later duplicates are dropped here so they never produce a redundant
+/// swap attempt + a spurious `SUPERVISION_API_RELOAD_REJECTED` (the
+/// concurrency guard in `run_api_swap` remains the deeper backstop for
+/// genuinely-distinct requests that arrive after a swap is already in flight).
+const RELOAD_DEDUP_WINDOW: Duration = Duration::from_secs(3);
+
 /// Spawn the kernel's inbound api-reload bus subscriber. Returns the task
 /// handle (awaited / aborted at shutdown).
 pub fn spawn_api_reload_subscriber(
@@ -57,6 +69,10 @@ async fn run(
     reload_tx: mpsc::Sender<ApiReloadCommand>,
     shutdown: Arc<Notify>,
 ) {
+    // Last reload command forwarded to the api watch loop — used to coalesce
+    // duplicate triggers within RELOAD_DEDUP_WINDOW. Held across reconnects so
+    // a duplicate that straddles a socket churn is still dropped.
+    let mut last_forwarded: Option<Instant> = None;
     loop {
         // ── Connect ───────────────────────────────────────────────────────
         let client = match BusClient::connect(&bus_socket, &authkey, SUBSCRIBER_NAME).await {
@@ -103,6 +119,22 @@ async fn run(
                             if msg_type == TOPIC =>
                         {
                             let (reason, requested_by) = decode_reload_payload(&raw_bytes);
+                            // Coalesce duplicate triggers (publish-path fan-out
+                            // or operator double-fire) within the dedup window —
+                            // forward at most one swap per window.
+                            let now = Instant::now();
+                            if let Some(prev) = last_forwarded {
+                                if now.duration_since(prev) < RELOAD_DEDUP_WINDOW {
+                                    info!(
+                                        event = "KERNEL_API_RELOAD_REQUEST_COALESCED",
+                                        reason = %reason,
+                                        requested_by = %requested_by,
+                                        "duplicate api reload request within dedup window; dropping (one swap already forwarded)"
+                                    );
+                                    continue;
+                                }
+                            }
+                            last_forwarded = Some(now);
                             info!(
                                 event = "KERNEL_API_RELOAD_REQUEST_RECV",
                                 reason = %reason,
