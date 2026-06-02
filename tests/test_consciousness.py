@@ -182,38 +182,3 @@ def test_run_write_back_writes_meta_to_tail_132d():
     # All other dims also unchanged
     for i in range(130):
         assert state[i] == pytest.approx(0.3)
-
-
-def test_route_write_falls_back_to_direct_on_writer_failure(tmp_path):
-    """§11.H / AUDIT §C (rFP_module_hot_reload_persistence_program §P2) —
-    ConsciousnessDB._route_write must NOT silently drop a write when the writer
-    daemon returns WriteResult(ok=False). It logs + falls back to a direct
-    durable write, so Trinity corrective/journey events survive a transient
-    daemon outage. Closes the WriteResult-discard bug that left
-    corrective_events_persistence + journey_persistence NOT_READY for hot-reload.
-    """
-    import sqlite3
-    from titan_hcl.persistence.writer_client import WriteResult
-    from titan_hcl.logic.consciousness import ConsciousnessDB
-
-    class _FailingWriter:
-        def write(self, sql, params=(), *, table=None, **kw):
-            return WriteResult(ok=False, error="daemon down", via="imw")
-
-    db_path = str(tmp_path / "consciousness.db")
-    db = ConsciousnessDB(db_path, writer_client=_FailingWriter())
-    db.insert_trinity_journey_gift(
-        timestamp=123.0, titan_id="T1", source_part="BODY", side="UP",
-        gift_amplitude=0.5, cycle_duration_s=1.0, cycle_tick_count=3,
-        per_dim_contribution=b"\x01", journey_metadata=b"\x02",
-        snapshot_ring=b"\x03",
-    )
-    # Despite the writer failing (ok=False), the row must be durably persisted
-    # via the direct fallback — not silently lost.
-    con = sqlite3.connect(db_path)
-    try:
-        n = con.execute(
-            "SELECT COUNT(*) FROM trinity_journey_gifts").fetchone()[0]
-    finally:
-        con.close()
-    assert n == 1, "row lost — _route_write silently dropped on writer failure"

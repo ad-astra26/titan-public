@@ -297,6 +297,7 @@ def backup_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
         "local_rolling_days": local_rolling_days,
         "local_snapshot_always": local_snapshot_always,
         "upload_verify": upload_verify,
+        "tarball_validate": tarball_validate,
         "keypair_path": keypair_path,
         "net_name": net_name,
         "titan_id": titan_id,

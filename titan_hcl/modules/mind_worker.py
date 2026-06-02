@@ -139,49 +139,6 @@ class _SocialGraphStatsShmReader:
             }
 
 
-_MIND_STATE_FILENAME = "mind_state.json"
-
-
-def _mind_state_path(config: dict) -> str:
-    data_dir = config.get("data_dir", "./data")
-    return os.path.join(data_dir, _MIND_STATE_FILENAME)
-
-
-def _load_mind_state(config: dict):
-    """Restore (severity_multipliers, focus_nudges) from disk, else (None, None)."""
-    import json
-    try:
-        with open(_mind_state_path(config)) as f:
-            d = json.load(f)
-        sm = d.get("severity_multipliers")
-        fn = d.get("focus_nudges")
-        sm = [float(x) for x in sm] if isinstance(sm, list) and len(sm) == 5 else None
-        fn = [float(x) for x in fn] if isinstance(fn, list) and len(fn) == 5 else None
-        return sm, fn
-    except Exception:
-        return None, None
-
-
-def _save_mind_state(config: dict, severity_multipliers, focus_nudges) -> None:
-    """Atomically persist Mind's Spirit-learned FILTER_DOWN weights + focus
-    nudges (§11.H.2 tmp+os.replace). AUDIT §C fix (rFP §P2): like body_worker,
-    these were never persisted (only `_b1_save_state`, the B1 readiness-reporter
-    noop) → reset to [1.0]*5 / [0.0]*5 on every respawn until the next
-    event-only FILTER_DOWN. media_state re-accumulates from SENSE_VISUAL/
-    SENSE_AUDIO events → intentionally not persisted."""
-    import json
-    path = _mind_state_path(config)
-    try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"severity_multipliers": list(severity_multipliers),
-                       "focus_nudges": list(focus_nudges)}, f)
-        os.replace(tmp, path)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("[MindWorker] state save failed: %s", e)
-
-
 @with_error_envelope(module_name="mind", subsystem="entry", severity=_phase11_sev.FATAL)
 def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the Mind module process."""
@@ -271,15 +228,6 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
     # FOCUS nudges from Spirit PID controller
     focus_nudges = [0.0] * 5
-
-    # AUDIT §C fix (rFP §P2): restore Spirit-learned FILTER_DOWN weights + focus
-    # nudges from disk so they survive hot-reload / kill-respawn instead of
-    # resetting to defaults until the next event-only FILTER_DOWN.
-    _saved_sm, _saved_fn = _load_mind_state(config)
-    if _saved_sm is not None:
-        severity_multipliers = _saved_sm
-    if _saved_fn is not None:
-        focus_nudges = _saved_fn
 
     # Outer-sources cache feeding collect_mind_15d's hormone_levels /
     # interaction_quality / assessment_quality / inner_perception args (inner_mind
@@ -496,9 +444,6 @@ def mind_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
         if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[MindWorker] Shutdown: %s", msg.get("payload", {}).get("reason"))
-            # AUDIT §C fix (rFP §P2): flush Spirit-learned weights + focus nudges
-            # before exit so a hot-reload / kill-respawn restores them.
-            _save_mind_state(config, severity_multipliers, focus_nudges)
             # Stop S7 fast-path threads cleanly so they don't keep
             # writing shm during/after subprocess teardown.
             if refresh_threads or shm_writer_thread:

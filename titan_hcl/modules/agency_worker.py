@@ -575,15 +575,7 @@ def agency_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
             continue
 
         if msg_type == bus.MODULE_SHUTDOWN:
-            logger.info("[AgencyWorker] Shutdown received — "
-                        "flushing action history + exiting")
-            # AUDIT §C fix (rFP §P2): flush the batched action history so the
-            # 1-4 actions since the last save_every_n=5 batch aren't lost on
-            # hot-reload / kill-respawn.
-            try:
-                agency.flush()
-            except Exception:  # noqa: BLE001
-                pass
+            logger.info("[AgencyWorker] Shutdown received — exiting")
             return
         if msg_type != bus.QUERY:
             continue

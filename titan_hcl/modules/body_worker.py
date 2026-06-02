@@ -91,51 +91,6 @@ _HISTORY_SIZE = 30  # ~5 minutes at 10s intervals
 _VELOCITY_WINDOW = 6  # compare last 6 readings (~1 min) for rate of change
 
 
-_BODY_STATE_FILENAME = "body_state.json"
-
-
-def _body_state_path(config: dict) -> str:
-    # Same data_dir resolution mind_worker uses (config-level "data_dir").
-    data_dir = config.get("data_dir", "./data")
-    return os.path.join(data_dir, _BODY_STATE_FILENAME)
-
-
-def _load_body_state(config: dict):
-    """Restore (severity_multipliers, focus_nudges) from disk, else (None, None)."""
-    import json
-    try:
-        with open(_body_state_path(config)) as f:
-            d = json.load(f)
-        sm = d.get("severity_multipliers")
-        fn = d.get("focus_nudges")
-        sm = [float(x) for x in sm] if isinstance(sm, list) and len(sm) == 5 else None
-        fn = [float(x) for x in fn] if isinstance(fn, list) and len(fn) == 5 else None
-        return sm, fn
-    except Exception:
-        return None, None
-
-
-def _save_body_state(config: dict, severity_multipliers, focus_nudges) -> None:
-    """Atomically persist Body's Spirit-learned FILTER_DOWN weights + focus
-    nudges (§11.H.2 tmp+os.replace). AUDIT §C fix (rFP §P2): these were NEVER
-    persisted (the only save fn, `_b1_save_state`, is the B1 readiness-reporter
-    callback that returns [] — not the persistence path), so they reset to
-    [1.0]*5 / [0.0]*5 on every respawn, losing Spirit-learned modulation until
-    the next EVENT-ONLY FILTER_DOWN arrives. The sensor `history` deques
-    re-accumulate from live sensors (~5min) → intentionally not persisted."""
-    import json
-    path = _body_state_path(config)
-    try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"severity_multipliers": list(severity_multipliers),
-                       "focus_nudges": list(focus_nudges)}, f)
-        os.replace(tmp, path)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("[BodyWorker] state save failed: %s", e)
-
-
 @with_error_envelope(module_name="body", subsystem="entry", severity=_phase11_sev.FATAL)
 def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
     """Main loop for the Body module process."""
@@ -189,15 +144,6 @@ def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
     # FOCUS nudges from Spirit PID controller (suggestions, not overrides)
     focus_nudges = [0.0] * 5
-
-    # AUDIT §C fix (rFP §P2): restore Spirit-learned FILTER_DOWN weights + focus
-    # nudges from disk so they survive hot-reload / kill-respawn instead of
-    # resetting to defaults until the next event-only FILTER_DOWN.
-    _saved_sm, _saved_fn = _load_body_state(config)
-    if _saved_sm is not None:
-        severity_multipliers = _saved_sm
-    if _saved_fn is not None:
-        focus_nudges = _saved_fn
 
     # ── S7: §L1 fast-path setup (flag-gated) ──────────────────────
     # When microkernel.shm_body_fast_enabled is true, start per-sense
@@ -381,11 +327,6 @@ def body_worker_main(recv_queue, send_queue, name: str, config: dict) -> None:
 
         if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[BodyWorker] Shutdown: %s", msg.get("payload", {}).get("reason"))
-            # AUDIT §C fix (rFP §P2): flush the current Spirit-learned weights +
-            # focus nudges before exit so a hot-reload / kill-respawn restores
-            # them. The locals here hold the live values (severity_multipliers is
-            # reassigned by FILTER_DOWN; focus_nudges is mutated in place).
-            _save_body_state(config, severity_multipliers, focus_nudges)
             # Stop S7 fast-path threads cleanly so they don't keep
             # writing shm during/after subprocess teardown.
             if refresh_threads or shm_writer_thread:

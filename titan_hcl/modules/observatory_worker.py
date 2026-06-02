@@ -471,10 +471,4 @@ def observatory_worker_main(recv_queue, send_queue, name: str,
         raise
     finally:
         stop_event.set()
-        # AUDIT §C fix (rFP §P2): flush buffered async snapshot writes so the
-        # final second(s) before reload/respawn aren't lost (writer ACKs async).
-        try:
-            obs_db.flush(timeout=30.0)
-        except Exception:  # noqa: BLE001
-            pass
         logger.info("[ObservatoryWorker] shutdown complete")
