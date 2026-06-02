@@ -66,24 +66,6 @@ def resolve_telegram_creds(ctx: Context) -> tuple[Optional[str], Optional[str]]:
     return token, chat_id
 
 
-def resolve_internal_key(ctx: Context) -> Optional[str]:
-    """api.internal_key from secrets.toml ⊕ config.toml (secrets wins).
-
-    This is the owner auth the console sends as X-Titan-Internal-Key to chat with
-    its own Titan (pitch_chat owner bypass). setup_titan generates it into
-    ~/.titan/secrets.toml [api] at install.
-    """
-    config = _read_toml(ctx.install_root / "titan_hcl" / "config.toml")
-    secrets = _read_toml(_secrets_path(ctx))
-    for src in (secrets, config):                 # secrets wins
-        api = src.get("api")
-        if isinstance(api, dict):
-            v = api.get("internal_key")
-            if v:
-                return str(v)
-    return None
-
-
 def _secrets_path(ctx: Context) -> Path:
     override = getattr(ctx, "secrets_path", None)
     import os

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from . import __version__
 from .agent import make_server
-from .alerts import HealthMonitor, resolve_internal_key, resolve_telegram_creds
+from .alerts import HealthMonitor, resolve_telegram_creds
 from .context import Context, resolve_titan_id
 
 
@@ -51,9 +51,6 @@ def main(argv: list | None = None) -> int:
 
     ctx = Context(install_root=install_root, titan_id=titan_id,
                   api_base=args.api_base, token=_read_token(), dist_dir=dist)
-    # Owner chat auth (X-Titan-Internal-Key → pitch_chat owner bypass): load the
-    # api internal_key so the owner can chat with their Titan without Privy/wallet.
-    ctx.internal_key = resolve_internal_key(ctx)
     httpd = make_server(ctx, host=args.host, port=args.port)
 
     monitor = None

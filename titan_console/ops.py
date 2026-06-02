@@ -18,27 +18,14 @@ from .context import Context
 
 
 def restart_titan(ctx: Context, *, force: bool = False) -> dict:
-    """Restart the Titan via systemd — dreaming-aware (never pkill).
-
-    The fleet's `tN_manage.sh restart` is NOT shipped to a user install, so we
-    reproduce its core guard inline: refuse to wake a dreaming Titan unless
-    ``force`` (mid-dream restart loses the in-flight consolidation), then
-    ``systemctl restart`` the RESOLVED unit (titan.service or titan-<id>.service).
-    """
-    if not force:
-        status, body = ctx.http("GET", f"{ctx.api_base}/v6/dreaming", timeout=5.0)
-        if status == 200:
-            try:
-                if json.loads(body.decode()).get("data", {}).get("is_dreaming"):
-                    return {"ok": False, "dreaming": True,
-                            "error": "Titan is dreaming — restart refused. "
-                                     "Retry with force to override."}
-            except (ValueError, AttributeError, TypeError):
-                pass  # unreadable dreaming state → don't block the restart
-    unit = ctx.service_unit
-    rc, out, err = ctx.run(["sudo", "systemctl", "restart", unit])
+    """Restart via the dreaming-aware manage script (never pkill)."""
+    script = ctx.manage_script
+    if not script.exists():
+        return {"ok": False, "error": f"manage script not found: {script}"}
+    argv = ["bash", str(script), "restart"] + (["--force"] if force else [])
+    rc, out, err = ctx.run(argv)
     return {"ok": rc == 0, "returncode": rc, "stdout": out, "stderr": err,
-            "service": unit, "dreaming_aware": not force}
+            "dreaming_aware": not force}
 
 
 def _dir_size(path: Path) -> int:

@@ -27,12 +27,12 @@ from titan_console.titan_status import titan_status  # noqa: E402
 
 
 def _ctx(tmp_path, *, run=None, http=None, token=None, titan_id="T1",
-         secrets_path=None, internal_key=None) -> Context:
+         secrets_path=None) -> Context:
     return Context(
         install_root=tmp_path, titan_id=titan_id,
         run=run or (lambda argv, **k: (0, "", "")),
         http=http or (lambda *a, **k: (0, b"")),
-        token=token, secrets_path=secrets_path, internal_key=internal_key,
+        token=token, secrets_path=secrets_path,
     )
 
 
@@ -112,52 +112,26 @@ def test_titan_status_half_up_when_service_active_but_api_dead(tmp_path):
 # ── ops ────────────────────────────────────────────────────────────────────
 
 
-def test_restart_uses_systemctl_on_resolved_unit(tmp_path):
+def test_restart_builds_dreaming_aware_command(tmp_path):
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "t1_manage.sh").write_text("#!/bin/bash\n")
     seen = {}
 
     def run(argv, **k):
         seen["argv"] = argv
         return 0, "restarted", ""
 
-    # http returns awake (not dreaming) → restart proceeds
-    def http(method, url, **k):
-        return 200, json.dumps({"data": {"is_dreaming": False}}).encode()
-
-    r = ops.restart_titan(_ctx(tmp_path, run=run, http=http), force=False)
+    r = ops.restart_titan(_ctx(tmp_path, run=run), force=False)
     assert r["ok"] and r["dreaming_aware"] is True
-    # systemctl restart on the resolved unit (no fleet manage script)
-    assert seen["argv"][:3] == ["sudo", "systemctl", "restart"]
-    assert seen["argv"][3] == r["service"]
+    assert seen["argv"][-1] == "restart" and "--force" not in seen["argv"]
+
+    ops.restart_titan(_ctx(tmp_path, run=run), force=True)
+    assert "--force" in seen["argv"]
 
 
-def test_restart_refused_while_dreaming(tmp_path):
-    ran = {"called": False}
-
-    def run(argv, **k):
-        ran["called"] = True
-        return 0, "", ""
-
-    def http(method, url, **k):
-        return 200, json.dumps({"data": {"is_dreaming": True}}).encode()
-
-    r = ops.restart_titan(_ctx(tmp_path, run=run, http=http), force=False)
-    assert r["ok"] is False and r["dreaming"] is True and not ran["called"]
-    # force overrides the dreaming guard
-    r2 = ops.restart_titan(_ctx(tmp_path, run=run, http=http), force=True)
-    assert ran["called"] and r2["dreaming_aware"] is False
-
-
-def test_restart_no_internal_key_still_restarts(tmp_path):
-    # restart does not need the chat internal_key; dreaming probe just no-ops on
-    # an unreadable state and the restart proceeds.
-    seen = {}
-
-    def run(argv, **k):
-        seen["argv"] = argv
-        return 0, "", ""
-
-    r = ops.restart_titan(_ctx(tmp_path, run=run), force=True)
-    assert r["ok"] and seen["argv"][:3] == ["sudo", "systemctl", "restart"]
+def test_restart_missing_script(tmp_path):
+    r = ops.restart_titan(_ctx(tmp_path))
+    assert r["ok"] is False and "not found" in r["error"]
 
 
 def test_clean_hdd_dry_run_then_confirm(tmp_path):
@@ -249,32 +223,9 @@ def test_dispatch_mutation_token_gate(tmp_path):
 
 
 def test_dispatch_chat_proxy(tmp_path):
-    seen = {}
-
-    def http(method, url, *, body=None, headers=None, timeout=None):
-        seen["url"] = url
-        seen["payload"] = json.loads(body.decode())
-        seen["headers"] = headers or {}
-        return 200, json.dumps({"response": "hi", "thread_id": "x"}).encode()
-
-    ctx = _ctx(tmp_path, http=http, internal_key="OWNERKEY")
-    status, p = dispatch(ctx, "POST", "/console/chat", {},
-                         json.dumps({"message": "yo"}).encode(), {})
-    assert status == 200 and p["response"] == "hi"
-    # owner auth header + PitchChatRequest-shaped payload to /v6/pitch/chat
-    assert seen["url"].endswith("/v6/pitch/chat")
-    assert seen["headers"]["X-Titan-Internal-Key"] == "OWNERKEY"
-    assert seen["payload"]["titan"] == "T1"
-    assert seen["payload"]["message"] == "yo"
-    assert len(seen["payload"]["thread_id"]) >= 8
-
-
-def test_dispatch_chat_no_internal_key_503(tmp_path):
-    # no owner key configured → clear 503, not a confusing auth error downstream
-    ctx = _ctx(tmp_path)
-    status, p = dispatch(ctx, "POST", "/console/chat", {},
-                         json.dumps({"message": "yo"}).encode(), {})
-    assert status == 503 and "internal_key" in p["error"]
+    ctx = _ctx(tmp_path, http=lambda *a, **k: (200, json.dumps({"reply": "hi"}).encode()))
+    status, p = dispatch(ctx, "POST", "/console/chat", {}, json.dumps({"message": "yo"}).encode(), {})
+    assert status == 200 and p["reply"] == "hi"
 
 
 def test_dispatch_unknown_console_route_404(tmp_path):

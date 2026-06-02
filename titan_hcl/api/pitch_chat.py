@@ -464,43 +464,27 @@ async def pitch_chat(
     req: PitchChatRequest,
     request: Request,
     x_pitch_token: Optional[str] = Header(None, alias="X-Pitch-Token"),
-    x_titan_internal_key: Optional[str] = Header(None, alias="X-Titan-Internal-Key"),
 ):
-    """Send a message to this Titan.
-
-    Two authenticated callers, no wallet/Privy required for either:
-      • Visitor pitch route — validates X-Pitch-Token against PITCH_TOKEN
-        (bad tokens 404; we never confirm the route exists). Rate-limited.
-      • Owner — the local TC² console authenticates with the api internal_key
-        (X-Titan-Internal-Key matching config api.internal_key). Bypasses the
-        pitch-token gate AND the visitor rate limits so the owner can always
-        chat with their own Titan. Mirrors auth.verify_privy_token's
-        internal-key bypass pattern.
+    """Send a message to this Titan via the wallet-less pitch route.
+    Validates the X-Pitch-Token against PITCH_TOKEN (server-side env);
+    bad tokens 404 — we never confirm the route exists.
 
     Per rFP §5. Recording (§5.5) + decline classification (§5.6) are
     additive layers around the call to plugin.run_chat().
     """
-    # ── Auth: owner internal-key bypass OR visitor pitch-token gate ──
-    is_owner = False
-    if x_titan_internal_key:
-        _plugin = getattr(request.app.state, "titan_hcl", None)
-        _expected_ik = (getattr(_plugin, "_full_config", {}) or {}).get("api", {}).get("internal_key", "")
-        if _expected_ik and _constant_time_equal(x_titan_internal_key.strip(), _expected_ik):
-            is_owner = True
-
+    # ── Token gate ────────────────────────────────────────────────
     expected = _expected_pitch_token()
-    if not is_owner:
-        if not expected:
-            # Server misconfigured (no PITCH_TOKEN set). Fail closed.
-            raise HTTPException(status_code=404)
-        if not x_pitch_token or not _constant_time_equal(x_pitch_token.strip(), expected):
-            raise HTTPException(status_code=404)
+    if not expected:
+        # Server misconfigured (no PITCH_TOKEN set). Fail closed.
+        raise HTTPException(status_code=404)
+    if not x_pitch_token or not _constant_time_equal(x_pitch_token.strip(), expected):
+        raise HTTPException(status_code=404)
 
     thread_id = _safe_thread_id(req.thread_id)
 
-    # ── Rate limit (visitors only — the owner is never throttled) ──
+    # ── Rate limit ────────────────────────────────────────────────
     now = time.time()
-    rl = None if is_owner else await _check_and_record_rate(expected, now)
+    rl = await _check_and_record_rate(expected, now)
     if rl is not None:
         # Educational failure card (rFP §5.6 / improvement #9).
         explanation_map = {
@@ -521,17 +505,14 @@ async def pitch_chat(
             decline_explanation=explanation,
         )
 
-    # ── Caller identity (synthetic) ───────────────────────────────
-    if is_owner:
-        sub = "titan-owner-console"
-    else:
-        sub = f"pitch-visitor-{hashlib.sha256(thread_id.encode('utf-8')).hexdigest()[:16]}"
-    claims = {"sub": sub}
+    # ── Visitor identity (synthetic) ──────────────────────────────
+    visitor_hash = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:16]
+    claims = {"sub": f"pitch-visitor-{visitor_hash}"}
 
     payload = {
         "message": req.message,
         "session_id": f"pitch-{thread_id}",
-        "user_id": sub,
+        "user_id": f"pitch-visitor-{visitor_hash}",
     }
 
     # ── Recording: inbound ────────────────────────────────────────

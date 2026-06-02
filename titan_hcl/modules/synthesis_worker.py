@@ -1624,11 +1624,9 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
 
             def _miner_llm_propose(cluster_meta: dict, kind: str):
                 try:
+                    import asyncio as _aio
                     from titan_hcl.inference import get_provider as _get_provider
                     provider = _get_provider("ollama_cloud", (config or {}).get("inference", {}) or {})
-                    fn = getattr(provider, "generate", None) or getattr(provider, "complete", None)
-                    if fn is None:
-                        return None
                     seq_str = " → ".join(
                         f"{tool}({args_shape})" for tool, args_shape in cluster_meta.get("sequence", [])
                     )
@@ -1640,8 +1638,18 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         f"If kind==negative, nl_description should start with "
                         f"'Approach X fails for task-shape Y'."
                     )
-                    raw = fn(prompt, max_tokens=600, temperature=0.3)
-                    text = raw if isinstance(raw, str) else (getattr(raw, "text", "") or str(raw or ""))
+                    # provider.complete is an ASYNC coroutine — bridge via
+                    # asyncio.run (mirrors consolidation_defaults.make_default_
+                    # llm_propose). The prior code grabbed `complete` and called
+                    # it SYNCHRONOUSLY → returned an un-awaited coroutine →
+                    # 'coroutine never awaited' → EVERY skill abstraction failed
+                    # (recurrent clusters found but 0 skills compiled). 2026-06-02.
+                    text = _aio.run(provider.complete(
+                        prompt=prompt,
+                        system="You are a procedural-skill abstraction engine. "
+                               "Output ONLY strict JSON, no prose.",
+                        temperature=0.3, max_tokens=600, timeout=45.0,
+                    ))
                     if not text:
                         return None
                     start = text.find("{")
