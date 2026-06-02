@@ -16,6 +16,7 @@
 //! - spawn (substrate placeholder + python_main)
 //! - shutdown (graceful SIGTERM sequence)
 
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +29,7 @@ use tracing::{info, warn};
 use titan_bus::BusBroker;
 use titan_cgn::create_cgn_live_weights;
 use titan_clocks::{run_circadian_loop, run_pi_heartbeat_loop, EpochTickPublisher};
-use titan_core::constants::{KERNEL_SHUTDOWN_GRACE_S, SPEC_VERSION};
+use titan_core::constants::{BUS_API_HTTP_PORT_DEFAULT, KERNEL_SHUTDOWN_GRACE_S, SPEC_VERSION};
 use titan_state::{Slot, SlotRegistry};
 
 use crate::broker_publisher::BrokerEpochPublisher;
@@ -120,6 +121,67 @@ impl Default for KernelRunOptions {
             auto_shutdown_after: None,
         }
     }
+}
+
+/// SPEC §11.B.5 — bind the kernel-owned api listening socket (socket
+/// activation). The kernel binds ONCE and holds the socket for its whole
+/// lifetime; every api child (boot + every zero-downtime reload) inherits this
+/// exact fd (dup'd to `TITAN_API_LISTEN_FD` in its pre-exec hook) and serves
+/// uvicorn on it — so OLD + NEW share ONE never-destroyed accept queue across a
+/// swap ⇒ zero dropped connections (OLD closing its dup only decrements the
+/// socket refcount; the kernel + NEW keep the queue alive).
+///
+/// Bind address: `TITAN_API_HOST` env || `0.0.0.0`, port `TITAN_API_PORT` env
+/// || [`BUS_API_HTTP_PORT_DEFAULT`] (the canonical fleet api port — same env
+/// override the shadow-boot path already uses). The socket keeps its default
+/// CLOEXEC so it does NOT leak into guardian_hcl / titan_hcl (only the api
+/// child's pre-exec dup re-exposes it). Returns `None` on any failure — the
+/// api then self-binds (degraded: reloads are no longer zero-downtime, but the
+/// api still serves on boot/crash-respawn).
+fn bind_api_listen_socket() -> Option<socket2::Socket> {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    let host = std::env::var("TITAN_API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let port: u16 = std::env::var("TITAN_API_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(BUS_API_HTTP_PORT_DEFAULT as u16);
+    let ip: std::net::IpAddr = host.parse().unwrap_or_else(|e| {
+        warn!(host = %host, err = %e, "B8.5 api socket: invalid TITAN_API_HOST; using 0.0.0.0");
+        std::net::IpAddr::from([0u8, 0, 0, 0])
+    });
+    let domain = if ip.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let addr = std::net::SocketAddr::new(ip, port);
+    let sock = match Socket::new(domain, Type::STREAM, Some(Protocol::TCP)) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(err = %e, "B8.5 api socket: socket() failed — api will self-bind");
+            return None;
+        }
+    };
+    if let Err(e) = sock.set_reuse_address(true) {
+        warn!(err = %e, "B8.5 api socket: SO_REUSEADDR failed (continuing)");
+    }
+    if let Err(e) = sock.bind(&SockAddr::from(addr)) {
+        warn!(addr = %addr, err = %e,
+            "B8.5 api socket: bind failed — api will self-bind (reloads not zero-downtime)");
+        return None;
+    }
+    // SOMAXCONN-class backlog (matches uvicorn's default 2048-ish accept depth).
+    if let Err(e) = sock.listen(1024) {
+        warn!(addr = %addr, err = %e, "B8.5 api socket: listen failed — api will self-bind");
+        return None;
+    }
+    info!(
+        event = "BOOT_B8_5_API_LISTEN_BOUND",
+        addr = %addr,
+        fd = sock.as_raw_fd(),
+        "B8.5 kernel api listening socket bound (socket activation, SPEC §11.B.5)"
+    );
+    Some(sock)
 }
 
 /// Run the kernel from boot to shutdown. Returns exit code.
@@ -284,6 +346,21 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
             .unwrap_or_else(|| PathBuf::from("titan-trinity-rs"))
     });
 
+    // B8.5: SPEC §11.B.5 — kernel owns the api listening socket (socket
+    // activation). Bound ONCE here, held for the kernel's whole lifetime
+    // (`api_listen_socket` must NOT be dropped until shutdown — every api child
+    // serves uvicorn on this exact fd). OLD + NEW api share this one
+    // never-destroyed accept queue across a zero-downtime reload ⇒ zero dropped
+    // connections. Also makes api crash-respawn rebind-free. `None` (bind
+    // failed, or api spawn disabled) ⇒ the api self-binds (degraded: reloads
+    // are no longer zero-downtime, but the api still serves).
+    let api_listen_socket = if options.spawn_titan_hcl_api {
+        bind_api_listen_socket()
+    } else {
+        None
+    };
+    let api_listen_fd = api_listen_socket.as_ref().map(|s| s.as_raw_fd());
+
     let spawn_config = SpawnConfig {
         titan_id: titan_id.into(),
         boot_generation,
@@ -301,6 +378,7 @@ pub async fn run(cli: &Cli, options: KernelRunOptions) -> Result<KernelExitCode,
         spawn_guardian_hcl: options.spawn_guardian_hcl,
         spawn_titan_hcl: options.spawn_titan_hcl,
         spawn_titan_hcl_api: options.spawn_titan_hcl_api,
+        api_listen_fd,
     };
 
     // Phase C C-S7 Gap B (2026-05-05): wire substrate + python_main spawns

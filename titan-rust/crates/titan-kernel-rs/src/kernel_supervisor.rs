@@ -741,15 +741,18 @@ impl KernelChildSupervisor {
     /// SPEC §11.B.5 — the zero-downtime api swap (runs inside the api
     /// watch_loop's reload arm; `old_child` is the tracked OLD api Child).
     ///
-    /// spawn-NEW(REUSEPORT+reload-child) → SHM health-gate → drain-OLD → adopt.
+    /// spawn-NEW(reload-child) → SHM health-gate → drain-OLD → adopt. NEW
+    /// inherits the kernel-owned listen fd (socket activation) so it shares
+    /// OLD's accept queue — draining OLD drops zero connections.
     /// Returns `Some(new_child)` to adopt NEW, or `None` (rollback) to keep OLD
     /// serving. INV-API-HA: OLD is never signalled until NEW is proven RUNNING;
     /// a failure at any gate is a no-op on OLD.
     async fn run_api_swap(self: &Arc<Self>, old_child: &mut Child) -> Option<Child> {
         let old_pid = old_child.id().unwrap_or(0);
 
-        // 1. Spawn NEW (always REUSEPORT; flagged reload-child so it writes the
-        //    dedicated readiness slot + self-promotes after OLD exits).
+        // 1. Spawn NEW (inherits the kernel-owned listen fd; flagged
+        //    reload-child so it writes the dedicated readiness slot + defers its
+        //    accept loop until warm + self-promotes after OLD exits).
         let mut new_child = match spawn_titan_hcl_api_reload_child(&self.spawn_config) {
             Ok(Some(c)) => c,
             Ok(None) => {

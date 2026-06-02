@@ -12,12 +12,20 @@
 //! [`SpawnConfig::spawn_guardian_hcl`] gates this child.
 
 use std::collections::HashMap;
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::process::{Child, Command};
 use tracing::{info, warn};
+
+/// SPEC §11.B.5 — fixed descriptor on which the kernel's pre-bound api
+/// listening socket is handed to the `titan_hcl_api` child (systemd
+/// `SD_LISTEN_FDS_START` convention: 0/1/2 are stdio, 3 is the first
+/// inherited socket). `api_subprocess.py` reads `TITAN_API_LISTEN_FD` and
+/// wraps this fd for uvicorn.
+const API_CHILD_LISTEN_FD: RawFd = 3;
 
 /// Errors during child spawn.
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +81,16 @@ pub struct SpawnConfig {
     /// `scripts/titan_hcl_api.py` as the L3 api peer (instead of
     /// guardian.start_all spawning it as a Guardian-supervised module).
     pub spawn_titan_hcl_api: bool,
+    /// SPEC §11.B.5 — raw fd of the kernel-owned api listening socket
+    /// (socket activation). When `Some`, every api child inherits this fd
+    /// (dup'd onto [`API_CHILD_LISTEN_FD`] in its pre-exec hook) and serves
+    /// uvicorn on it instead of binding its own — so OLD + NEW share ONE
+    /// accept queue during a zero-downtime reload (the queue is never
+    /// destroyed mid-flight ⇒ zero dropped connections). `None` = standalone
+    /// boot (tests / api-run-alone): the child self-binds. The kernel holds
+    /// the socket for its whole lifetime, so this fd stays valid across api
+    /// crash-respawns too (no rebind, no TIME_WAIT gap).
+    pub api_listen_fd: Option<RawFd>,
 }
 
 impl SpawnConfig {
@@ -356,9 +374,10 @@ pub fn spawn_titan_hcl(config: &SpawnConfig) -> Result<Option<Child>, SpawnError
 /// + guardian_hcl, not as a Guardian-supervised module. Returns Ok(None)
 /// if spawn_titan_hcl_api=false (tests).
 ///
-/// Used for the INITIAL boot + crash-respawn. Every api process binds with
-/// `SO_REUSEPORT` (SPEC §11.B.5 — so a NEW reload child can always co-bind the
-/// port for a zero-downtime swap), but is NOT flagged as a reload child.
+/// Used for the INITIAL boot + crash-respawn. Every api process serves on the
+/// kernel-owned listen socket (SPEC §11.B.5 socket activation — inherited fd on
+/// `TITAN_API_LISTEN_FD`, so a NEW reload child shares the SAME accept queue
+/// for a zero-downtime swap), but is NOT flagged as a reload child.
 pub fn spawn_titan_hcl_api(config: &SpawnConfig) -> Result<Option<Child>, SpawnError> {
     spawn_titan_hcl_api_inner(config, false)
 }
@@ -371,6 +390,37 @@ pub fn spawn_titan_hcl_api(config: &SpawnConfig) -> Result<Option<Child>, SpawnE
 /// slot only after OLD exits — keeping every state slot single-writer.
 pub fn spawn_titan_hcl_api_reload_child(config: &SpawnConfig) -> Result<Option<Child>, SpawnError> {
     spawn_titan_hcl_api_inner(config, true)
+}
+
+/// Build the full child env for a `titan_hcl_api` spawn. Pure (no spawn) so
+/// the env contract is unit-testable.
+///
+/// SPEC §11.B.5 env contract:
+/// - `TITAN_API_LISTEN_FD` (= [`API_CHILD_LISTEN_FD`]) is set whenever the
+///   kernel owns a listening socket (`config.api_listen_fd.is_some()`) — the
+///   child serves uvicorn on the inherited fd (socket activation) instead of
+///   binding. There is NO `TITAN_API_REUSEPORT` (the SO_REUSEPORT co-bind
+///   approach is retired — it cannot drain OLD's accept queue without RSTs).
+/// - `TITAN_API_RELOAD_CHILD=1` ONLY on the NEW process of a reload swap, so
+///   `api_main.py` writes the dedicated readiness slot + self-promotes after
+///   OLD exits, and `api_subprocess.py` defers its accept loop until warm.
+fn build_api_child_env(config: &SpawnConfig, reload_child: bool) -> HashMap<String, String> {
+    let mut env = config.build_child_env("titan_hcl_api");
+    for key in ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TZ"] {
+        if let Ok(v) = std::env::var(key) {
+            env.entry(key.into()).or_insert(v);
+        }
+    }
+    if config.api_listen_fd.is_some() {
+        env.insert(
+            "TITAN_API_LISTEN_FD".into(),
+            API_CHILD_LISTEN_FD.to_string(),
+        );
+    }
+    if reload_child {
+        env.insert("TITAN_API_RELOAD_CHILD".into(), "1".into());
+    }
+    env
 }
 
 fn spawn_titan_hcl_api_inner(
@@ -395,21 +445,7 @@ fn spawn_titan_hcl_api_inner(
         .as_ref()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let mut env = config.build_child_env("titan_hcl_api");
-    for key in ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TZ"] {
-        if let Ok(v) = std::env::var(key) {
-            env.entry(key.into()).or_insert(v);
-        }
-    }
-    // SPEC §11.B.5 — the api ALWAYS binds with SO_REUSEPORT so the running
-    // process is continuously swap-ready (two processes can only co-bind a
-    // port if BOTH set SO_REUSEPORT; OLD must already have it at swap time).
-    env.insert("TITAN_API_REUSEPORT".into(), "1".into());
-    if reload_child {
-        // NEW process of a zero-downtime reload: dedicated readiness slot +
-        // self-promote to canonical after OLD exits (api_main.py).
-        env.insert("TITAN_API_RELOAD_CHILD".into(), "1".into());
-    }
+    let env = build_api_child_env(config, reload_child);
 
     let mut cmd = Command::new(python);
     cmd.arg("-u")
@@ -418,6 +454,23 @@ fn spawn_titan_hcl_api_inner(
         .env_clear()
         .envs(env)
         .kill_on_drop(false);
+
+    // SPEC §11.B.5 — socket activation: hand the kernel's pre-bound listening
+    // socket to the child on a fixed descriptor. The dup2 runs post-fork /
+    // pre-exec; dup2 clears CLOEXEC on the TARGET fd so it survives the exec,
+    // while the kernel's own fd keeps its default CLOEXEC — so the socket does
+    // NOT leak into guardian_hcl / titan_hcl (they never run this hook). Only
+    // the api child inherits it. The closure is async-signal-safe (dup2 only).
+    if let Some(listen_fd) = config.api_listen_fd {
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::dup2(listen_fd, API_CHILD_LISTEN_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
 
     info!(
         python = ?python,
@@ -456,6 +509,7 @@ mod tests {
             spawn_guardian_hcl: false,
             spawn_titan_hcl: false,
             spawn_titan_hcl_api: false,
+            api_listen_fd: None,
         }
     }
 
@@ -481,6 +535,40 @@ mod tests {
             env.get("TITAN_DAEMON_PARENT_PID"),
             Some(&std::process::id().to_string())
         );
+    }
+
+    #[test]
+    fn api_child_env_socket_activation_contract() {
+        // SPEC §11.B.5 — when the kernel owns the listening socket, the child
+        // gets TITAN_API_LISTEN_FD (= fd 3) and NEVER the retired
+        // TITAN_API_REUSEPORT. Reload child also gets TITAN_API_RELOAD_CHILD.
+        let mut cfg = test_config();
+        cfg.api_listen_fd = Some(7);
+
+        let normal = build_api_child_env(&cfg, false);
+        assert_eq!(
+            normal.get("TITAN_API_LISTEN_FD"),
+            Some(&API_CHILD_LISTEN_FD.to_string())
+        );
+        assert_eq!(normal.get("TITAN_API_REUSEPORT"), None);
+        assert_eq!(normal.get("TITAN_API_RELOAD_CHILD"), None);
+
+        let reload = build_api_child_env(&cfg, true);
+        assert_eq!(
+            reload.get("TITAN_API_LISTEN_FD"),
+            Some(&API_CHILD_LISTEN_FD.to_string())
+        );
+        assert_eq!(reload.get("TITAN_API_RELOAD_CHILD"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn api_child_env_standalone_has_no_listen_fd() {
+        // No kernel socket (standalone / api-run-alone) ⇒ no TITAN_API_LISTEN_FD
+        // ⇒ api_subprocess self-binds.
+        let cfg = test_config(); // api_listen_fd = None
+        let env = build_api_child_env(&cfg, false);
+        assert_eq!(env.get("TITAN_API_LISTEN_FD"), None);
+        assert_eq!(env.get("TITAN_API_REUSEPORT"), None);
     }
 
     #[test]

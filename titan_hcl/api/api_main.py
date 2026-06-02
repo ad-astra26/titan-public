@@ -48,11 +48,10 @@ def entry(recv_queue, send_queue, name: str, config: dict) -> None:
         pass
 
     # SPEC §11.B.5 / rFP_kernel_zero_downtime_api_reload P3 — reload-child
-    # detection. Gated on TITAN_API_RELOAD_CHILD (NOT TITAN_API_REUSEPORT —
-    # the kernel sets REUSEPORT=1 on EVERY api spawn so the running api is
-    # always swap-ready, whereas RELOAD_CHILD=1 marks ONLY the NEW process of
-    # an actual zero-downtime swap). When set, this process is a NEW api
-    # co-bound with the OLD api via SO_REUSEPORT during a kernel-driven reload.
+    # detection. Gated on TITAN_API_RELOAD_CHILD, which the kernel sets ONLY on
+    # the NEW process of an actual zero-downtime swap (the kernel hands every
+    # api child its pre-bound listen fd via TITAN_API_LISTEN_FD — socket
+    # activation — so OLD + NEW share one accept queue during the swap).
     # The per-module SHM state slot is SINGLE-WRITER (state_registry), so a
     # reload child must NOT write the canonical `module_api_state.bin` while
     # OLD still owns it. Instead it writes a DEDICATED

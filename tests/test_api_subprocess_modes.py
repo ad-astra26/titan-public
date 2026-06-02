@@ -22,53 +22,17 @@ from unittest.mock import MagicMock
 import pytest
 
 
-def test_register_api_subprocess_skipped_when_flag_off():
-    """When api_process_separation_enabled=False, no api module registered."""
-    from titan_hcl.core.plugin import TitanHCL
-
-    plugin = MagicMock(spec=TitanHCL)
-    plugin._full_config = {"microkernel": {"api_process_separation_enabled": False}}
-    plugin.guardian = MagicMock()
-
-    # Call the helper directly via the unbound class method
-    TitanHCL._register_api_subprocess_module(plugin)
-
-    # No guardian.register call expected
-    plugin.guardian.register.assert_not_called()
-
-
-def test_register_api_subprocess_runs_when_flag_on():
-    """When api_process_separation_enabled=True, guardian.register called
-    with ModuleSpec(name='api', layer='L3', autostart=True, ...)."""
-    from titan_hcl.core.plugin import TitanHCL
-    from titan_hcl.guardian_hcl import ModuleSpec
-
-    plugin = MagicMock(spec=TitanHCL)
-    plugin._full_config = {
-        "microkernel": {"api_process_separation_enabled": True},
-        "api": {"host": "0.0.0.0", "port": 7777},
-    }
-    plugin.guardian = MagicMock()
-
-    TitanHCL._register_api_subprocess_module(plugin)
-
-    # guardian.register should have been called exactly once
-    plugin.guardian.register.assert_called_once()
-    call_args = plugin.guardian.register.call_args[0]
-    spec = call_args[0]
-    assert isinstance(spec, ModuleSpec)
-    assert spec.name == "api"
-    assert spec.layer == "L3"
-    assert spec.autostart is True
-    assert spec.lazy is False
-    assert spec.rss_limit_mb == 300
-    assert spec.heartbeat_timeout == 60.0
-    # entry_fn must be the api_subprocess_main function
-    from titan_hcl.api.api_subprocess import api_subprocess_main
-    assert spec.entry_fn is api_subprocess_main
-    # Sub-config carries [api] + [microkernel] sections
-    assert "api" in spec.config
-    assert "microkernel" in spec.config
+# NOTE (2026-06-02, session/20260602_apireload_drainfix): the two
+# `test_register_api_subprocess_*` tests were REMOVED here. They exercised
+# `TitanHCL._register_api_subprocess_module`, a pre-Phase-6 helper that
+# registered the api as a Guardian-supervised L2 module. Phase 6 (D-SPEC-135)
+# carved the api into a standalone kernel-rs-spawned L3 peer (SPEC §11.B.4 /
+# INV-PROC-5) — that helper was deleted (see the `# Pre-Phase-6` markers at
+# `titan_hcl/core/plugin.py:309,1872`), so the tests had been failing with
+# AttributeError ever since. The api lifecycle is now owned by
+# `kernel_supervisor.rs` (spawn/health-gate/drain/respawn); its socket-activation
+# listen path is covered by `test_adopt_listen_fd_*` below + the kernel-rs
+# `spawn.rs` env-contract tests + the T1 zero-drop E2E.
 
 
 def test_kernel_rpc_skipped_when_flag_off():
@@ -125,44 +89,58 @@ def test_exposed_methods_includes_critical_paths():
     assert not missing, f"EXPOSED_METHODS missing critical paths: {missing}"
 
 
-def test_reuseport_socket_cobinds_same_port():
-    """SPEC §11.B.5 / rFP_kernel_zero_downtime_api_reload P1 — two
-    SO_REUSEPORT sockets built by _make_reuseport_socket co-bind the SAME
-    port (the OLD+NEW handover primitive). Without SO_REUSEPORT the second
-    bind would raise OSError(EADDRINUSE)."""
+def test_adopt_listen_fd_wraps_inherited_socket():
+    """SPEC §11.B.5 / rFP_kernel_zero_downtime_api_reload — kernel socket
+    activation: _adopt_listen_fd wraps a kernel-handed, already-bound+listening
+    fd WITHOUT rebinding. In production the kernel binds the port once and hands
+    every api child a dup of that fd (dup2→fd3); OLD + NEW serve on dups of the
+    SAME socket (one accept queue → zero-drop handover). Here a stand-in
+    'kernel' socket + an os.dup model that handoff."""
+    import os
     import socket
-    from titan_hcl.api.api_subprocess import _make_reuseport_socket
+    from titan_hcl.api.api_subprocess import _adopt_listen_fd
 
     # Ephemeral high port; not the real api port (avoids clashing with a live api).
     port = 17790
-    a = _make_reuseport_socket("0.0.0.0", port)
+    kernel_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    kernel_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    kernel_sock.bind(("0.0.0.0", port))
+    kernel_sock.listen(8)
     try:
-        a.listen(8)
-        # Second process would call the same helper — must co-bind, not raise.
-        b = _make_reuseport_socket("0.0.0.0", port)
+        # The api child inherits a dup of the kernel's listening fd.
+        child_fd = os.dup(kernel_sock.fileno())
+        adopted = _adopt_listen_fd("0.0.0.0", child_fd)
         try:
-            b.listen(8)
-            assert a.getsockname()[1] == port
-            assert b.getsockname()[1] == port
-            # Both sockets carry SO_REUSEPORT set.
-            assert a.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT) == 1
-            assert b.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT) == 1
+            # Same port, already listening — no rebind happened.
+            assert adopted.getsockname()[1] == port
+            assert adopted.family == socket.AF_INET
+            # Non-blocking (asyncio create_server adopts it directly).
+            assert adopted.getblocking() is False
         finally:
-            b.close()
+            adopted.close()  # owns + closes child_fd
     finally:
-        a.close()
+        kernel_sock.close()
 
 
-def test_reuseport_helper_ipv6_family():
-    """_make_reuseport_socket selects AF_INET6 for an IPv6 host literal."""
+def test_adopt_listen_fd_ipv6_family():
+    """_adopt_listen_fd selects AF_INET6 for an IPv6 host literal."""
+    import os
     import socket
-    from titan_hcl.api.api_subprocess import _make_reuseport_socket
+    from titan_hcl.api.api_subprocess import _adopt_listen_fd
 
-    s = _make_reuseport_socket("::1", 17791)
+    kernel_sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    kernel_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    kernel_sock.bind(("::1", 17791))
+    kernel_sock.listen(8)
     try:
-        assert s.family == socket.AF_INET6
+        child_fd = os.dup(kernel_sock.fileno())
+        s = _adopt_listen_fd("::1", child_fd)
+        try:
+            assert s.family == socket.AF_INET6
+        finally:
+            s.close()
     finally:
-        s.close()
+        kernel_sock.close()
 
 
 def test_create_app_accepts_proxy_or_plugin():

@@ -105,6 +105,10 @@ arc-swap = "1"
 nix = { version = "0.27", features = ["signal", "process", "fs", "mman", "sched"] }
 libc = "0.2"
 
+# Socket construction (SPEC §11.B.5 kernel api socket activation — bind the
+# listening socket with SO_REUSEADDR, hand its fd to api children).
+socket2 = "0.6"
+
 # Static maps (SPEC §8 catalog as compile-time perfect hash)
 phf = { version = "0.11", features = ["macros"] }
 

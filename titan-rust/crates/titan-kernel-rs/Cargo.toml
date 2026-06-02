@@ -45,6 +45,12 @@ parking_lot.workspace = true
 # Unix syscalls (prctl)
 nix = { workspace = true, features = ["signal"] }
 
+# SPEC §11.B.5 socket activation — bind the api listening socket
+# (SO_REUSEADDR) the kernel hands to api children; libc::dup2 in the child's
+# pre-exec hook places it on the inherited fd (TITAN_API_LISTEN_FD).
+socket2.workspace = true
+libc.workspace = true
+
 # Hex encoding for authkey
 hex.workspace = true
 

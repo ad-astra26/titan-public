@@ -55,37 +55,45 @@ HEARTBEAT_INTERVAL_S = 30.0
 KERNEL_CONNECT_TIMEOUT_S = 30.0
 
 
-def _make_reuseport_socket(host: str, port: int):
-    """SPEC §11.B.5 / rFP_kernel_zero_downtime_api_reload P1 — build the api's
-    listen socket with SO_REUSEPORT so OLD + NEW api processes can co-bind the
-    same port during a kernel-driven zero-downtime reload (the OS load-balances
-    new connections across both; OLD drains its in-flight set on SIGTERM).
+def _adopt_listen_fd(host: str, fd: int):
+    """SPEC §11.B.5 — kernel socket activation: wrap the listening socket fd
+    the kernel pre-bound and handed us on `TITAN_API_LISTEN_FD` (dup'd onto a
+    fixed descriptor in our pre-exec). We serve uvicorn on THIS socket instead
+    of binding our own.
 
-    uvicorn 0.41's Config exposes no reuse_port param and its bind_socket() sets
-    only SO_REUSEADDR — so we bind the socket ourselves and hand it to
-    server.serve(sockets=[...]), which skips uvicorn's internal bind. INV-9 — a
-    pre-bound socket adds no sync-blocking to the api event loop.
+    Why this (not SO_REUSEPORT co-bind): a zero-downtime reload runs OLD + NEW
+    api processes at once. With SO_REUSEPORT each process has its OWN kernel
+    accept queue, and closing OLD's listening socket RSTs every connection
+    still sitting in OLD's queue — a ~1s drop window at the handover. With the
+    kernel-owned socket there is ONE accept queue, shared by every api process
+    (each holds a dup of the same open file description). OLD's graceful
+    shutdown closes only its dup → the queue is never destroyed → NEW keeps
+    accepting from it → ZERO dropped connections, by construction.
+
+    The fd is already bound + listening (the kernel did both). uvicorn's
+    `serve(sockets=[sock])` adopts it directly (asyncio sets it non-blocking and
+    re-applies listen(); both idempotent). INV-9 — no sync-blocking bind on the
+    api event loop.
     """
     import socket as _socket
     fam = _socket.AF_INET6 if (host and ":" in host) else _socket.AF_INET
-    sock = _socket.socket(fam, _socket.SOCK_STREAM)
-    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEPORT, 1)
-    sock.bind((host, port))
-    sock.set_inheritable(True)
+    # fileno=fd wraps the inherited descriptor without re-creating it.
+    sock = _socket.socket(fam, _socket.SOCK_STREAM, fileno=fd)
+    sock.setblocking(False)
     return sock
 
 
 def _await_health_ready(plugin, kernel_proxy, timeout_s: float) -> None:
     """SPEC §11.B.5 — reload-child readiness gate.
 
-    A zero-downtime reload child must NOT co-bind port 7777 until it can
-    actually serve 200s — otherwise SO_REUSEPORT routes OLD's live traffic to
-    us mid-warmup and we 503 it (the premature-routing gap). `/health` returns
-    200 off a warm in-process cache (dashboard `_health_summary_cache`,
-    refreshed by a background warmer). So we prime that warmer and block until
-    the cache is populated (or `timeout_s`), THEN the caller binds the port —
-    so OLD keeps 100% of traffic until we're genuinely ready. Bounded under the
+    A zero-downtime reload child must NOT start its accept loop on the shared
+    kernel-owned listen socket until it can actually serve 200s — otherwise it
+    pulls OLD's live traffic from the shared accept queue mid-warmup and 503s
+    it (the premature-accept gap). `/health` returns 200 off a warm in-process
+    cache (dashboard `_health_summary_cache`, refreshed by a background warmer).
+    So we prime that warmer and block until the cache is populated (or
+    `timeout_s`), THEN the caller adopts the listen fd + calls serve() — so OLD
+    keeps 100% of traffic until we're genuinely ready. Bounded under the
     kernel's API_RELOAD_HEALTH_TIMEOUT_S so the swap never stalls.
     """
     import time as _t
@@ -110,7 +118,8 @@ def _await_health_ready(plugin, kernel_proxy, timeout_s: float) -> None:
             if _get_health_summary_cached() is not None:
                 logger.info(
                     "[api_subprocess] §11.B.5 reload child health-warm — "
-                    "binding SO_REUSEPORT port now (OLD kept all traffic during warmup)")
+                    "starting accept loop on shared listen socket now "
+                    "(OLD kept all traffic during warmup)")
                 return
         except Exception:  # noqa: BLE001
             pass
@@ -416,22 +425,33 @@ def api_subprocess_main(recv_queue, send_queue, name: str, config: dict) -> None
     )
     server = uvicorn.Server(uvi_config)
 
-    # SPEC §11.B.5 / rFP P1 — SO_REUSEPORT, gated on TITAN_API_REUSEPORT=1
-    # (kernel sets it on EVERY api spawn so the running api is always
-    # swap-ready). See _make_reuseport_socket above.
+    # SPEC §11.B.5 — kernel socket activation. When the kernel owns the
+    # listening socket it hands us its fd on TITAN_API_LISTEN_FD; we serve on
+    # that inherited socket (one shared accept queue → zero-downtime reload
+    # drops zero connections). See _adopt_listen_fd above.
     #
-    # P4 refinement: a RELOAD CHILD (TITAN_API_RELOAD_CHILD=1) defers the bind
-    # until its /health is warm — otherwise SO_REUSEPORT would route OLD's live
-    # traffic to us mid-warmup and 503 it. A normal boot binds immediately
-    # (no OLD serving → nothing to protect).
-    _reuse_sock = None
-    if os.environ.get("TITAN_API_REUSEPORT") == "1":
+    # A RELOAD CHILD (TITAN_API_RELOAD_CHILD=1) defers starting its accept loop
+    # until its /health is warm — otherwise it would pull OLD's live traffic
+    # from the shared queue mid-warmup and 503 it. OLD covers 100% of traffic
+    # until we're ready. A normal boot is the sole accepter, so it serves
+    # immediately. With no TITAN_API_LISTEN_FD (standalone / api-run-alone),
+    # uvicorn self-binds the port.
+    _listen_sock = None
+    _listen_fd_env = os.environ.get("TITAN_API_LISTEN_FD")
+    if _listen_fd_env:
         if os.environ.get("TITAN_API_RELOAD_CHILD") == "1":
             _await_health_ready(titan_state, plugin_proxy, timeout_s=25.0)
-        _reuse_sock = _make_reuseport_socket(host, port)
-        logger.info(
-            "[api_subprocess] §11.B.5 SO_REUSEPORT enabled (TITAN_API_REUSEPORT=1) "
-            "— co-bound %s:%d", host, port)
+        try:
+            _listen_sock = _adopt_listen_fd(host, int(_listen_fd_env))
+            logger.info(
+                "[api_subprocess] §11.B.5 socket activation — serving on "
+                "kernel-owned listen fd %s (%s:%d)", _listen_fd_env, host, port)
+        except (ValueError, OSError) as e:
+            logger.error(
+                "[api_subprocess] §11.B.5 failed to adopt TITAN_API_LISTEN_FD=%s "
+                "(%s) — falling back to self-bind (reload not zero-downtime)",
+                _listen_fd_env, e)
+            _listen_sock = None
 
     # Capture the event loop reference so the bus listener can schedule
     # event_bus.emit() coroutines on it.
@@ -440,9 +460,10 @@ def api_subprocess_main(recv_queue, send_queue, name: str, config: dict) -> None
 
     async def _serve_with_loop_capture():
         await _set_loop_ref()
-        if _reuse_sock is not None:
-            # P1: serve on the SO_REUSEPORT-bound socket (uvicorn skips its own bind).
-            await server.serve(sockets=[_reuse_sock])
+        if _listen_sock is not None:
+            # §11.B.5: serve on the kernel-owned inherited listen socket
+            # (uvicorn skips its own bind; one shared accept queue).
+            await server.serve(sockets=[_listen_sock])
         else:
             await server.serve()
 
