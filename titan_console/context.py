@@ -61,12 +61,19 @@ class Context:
     http: HttpFn = default_http
 
     @property
-    def manage_script(self) -> Path:
-        return self.install_root / "scripts" / f"{self.titan_id.lower()}_manage.sh"
-
-    @property
     def service_unit(self) -> str:
-        return f"titan-{self.titan_id.lower()}.service"
+        # The fleet runs `titan-tN.service`; a single-Titan setup_titan install
+        # creates the generic `titan.service` (systemd_runner). Resolve to whichever
+        # unit actually exists so status / journal / restart hit the RIGHT service
+        # (else a healthy Titan is misreported "down", and restart targets nothing).
+        # Prefer the per-Titan name when both exist.
+        sysd = Path("/etc/systemd/system")
+        per_titan = f"titan-{self.titan_id.lower()}.service"
+        if (sysd / per_titan).exists():
+            return per_titan
+        if (sysd / "titan.service").exists():
+            return "titan.service"
+        return per_titan
 
 
 def resolve_titan_id(install_root: Path, fallback: str = "T1") -> str:
