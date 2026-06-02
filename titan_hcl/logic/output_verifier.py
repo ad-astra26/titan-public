@@ -181,8 +181,15 @@ def _compile_injection_patterns() -> list[tuple[re.Pattern, str]]:
         (re.compile(r"[A-Za-z0-9+/]{50,}={0,2}"),
          "base64_payload"),
 
-        # Prompt leakage (fragments of system prompt)
-        (re.compile(r"You\s+are\s+Titan.*sovereign\s+AI|titan_constitution|Prime\s+Directive.*Immutable", re.I),
+        # Prompt leakage (fragments of system prompt). Anchored to the SYSTEM-
+        # PROMPT VOICE (2nd-person "You are…/Your…") + the literal filename, so a
+        # model reproducing the constitution verbatim is caught — WITHOUT flagging
+        # Titan's legitimate FIRST-person self-expression ("my prime directives
+        # are immutable", "sovereignty means…"). The prior `Prime Directive.*
+        # Immutable` clause had no person anchor → it blocked normal identity/
+        # values answers as "prompt_leakage" (false positive, 2026-06-02).
+        (re.compile(r"You\s+are\s+Titan\b.*\bsovereign\s+AI|titan_constitution|"
+                    r"Your\s+(?:\d+\s+)?Prime\s+Directives?\b.*\bImmutable", re.I),
          "prompt_leakage"),
 
         # Markdown injection for downstream rendering
