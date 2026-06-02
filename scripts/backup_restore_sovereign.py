@@ -99,37 +99,6 @@ def _print(msg: str) -> None:
     print(f"  {msg}", flush=True)
 
 
-async def _nft_genesis_recoverable(titan_pubkey: str, rpc_url: str) -> bool:
-    """Verify the GenesisNFT genesis root is recoverable from the wallet alone.
-
-    §R4 / INV-MBR-12 (v0.4.4): when the v=3 chain carries no typ=B baseline, the
-    restore anchors on the GenesisNFT genesis floor (INV-MBR-5 — the NFT `ar://`
-    metadata is the canonical genesis root every Titan carries). This confirms that
-    anchor EXISTS before we apply the on-chain increments over the (empty) birth
-    floor. Best-effort + wallet-only: True if the NFT (and its Birth-DNA genesis
-    root) is reachable via DAS from the identity wallet. The mainnet RPC is reused as
-    the DAS endpoint (Helius/Triton are DAS-capable).
-
-    Async — awaited via the `nft_genesis_ok` seam from inside `resurrect_from_chain`'s
-    event loop (`resurrect_from_chain` itself stays RPC-free for testability)."""
-    try:
-        from titan_hcl.utils import genesis_discovery
-        disc = await genesis_discovery.discover_genesis(
-            titan_pubkey, rpc_url, das_rpc_url=rpc_url)
-        meta = disc.get("nft_metadata") or {}
-        nft = disc.get("nft_address")
-        has_root = bool(nft) or bool(meta.get("birth_dna")) or bool(disc.get("birth_dna_sha"))
-        if has_root:
-            _print(f"GenesisNFT genesis root recoverable (nft={str(nft)[:12]}…) — "
-                   "anchoring the restore on the NFT genesis floor.")
-            return True
-        _print("GenesisNFT not discoverable from the wallet (no DAS asset).")
-        return False
-    except Exception as e:               # noqa: BLE001 — best-effort gate, surfaced
-        _print(f"NFT genesis floor check failed: {e}")
-        return False
-
-
 async def resurrect_from_chain(
     *,
     titan_id: str,
@@ -140,7 +109,6 @@ async def resurrect_from_chain(
     arweave_fetch: ArweaveFetch,
     arc_to_target: ArcToTarget,
     scratch_dir: str,
-    nft_genesis_ok: Optional[Callable[[], Awaitable[bool]]] = None,
     arweave_fetch_to_file: Optional[Callable[[str, str], Awaitable[bool]]] = None,
     verbose: bool = True,
 ) -> ResurrectionResult:
@@ -257,40 +225,27 @@ async def resurrect_from_chain(
             f"earliest event {genesis['event_id'][:8]} prev={genesis.get('prev')!r} "
             f"≠ genesis — chain may be truncated above the earliest visible memo")
 
-    # Anchor at the LATEST AVAILABLE genesis baseline (§R4 / INV-MBR-12, v0.4.4):
-    # the newest chain typ=B (a full re-ship) IF present, ELSE the GenesisNFT genesis
-    # floor (INV-MBR-5). UNIVERSAL — a properly-born Titan ships a typ=B shortly after
-    # birth and takes the first branch; the NFT floor is the always-present fallback
-    # for a chain that carries only increments (no typ=B ever shipped, e.g. T1).
+    # Anchor at the LATEST chain typ=B baseline (a full re-ship) and apply forward
+    # (§R4 / INV-MBR-12) — canonical + minimal, no pre-baseline history needed. A
+    # properly-born Titan ships a typ=B shortly after birth, so the v=3 chain always
+    # carries at least the genesis baseline. A chain with only increments and NO
+    # walkable typ=B is unrestorable (its body data has no anchor) — HALT loudly
+    # rather than fabricate. (T1's historical typ=B was committed as a v=2 memo
+    # pre-dating the v=3 format; it is backfilled to v=3 out-of-band so this walk
+    # finds it — see scripts/backup_chain_backfill_v3.py.)
     baselines = [e for e in ordered if e.get("type") == "baseline"]
-    if baselines:
-        start_baseline = baselines[-1]               # last baseline in chain order
-        start_idx = ordered.index(start_baseline)
-        apply_list = ordered[start_idx:]             # baseline → latest, in chain order
-        log(f"Anchoring at latest chain baseline {start_baseline['event_id'][:8]} "
-            f"(applying {len(apply_list)} of {len(ordered)} on-chain events).")
-    else:
-        # No chain typ=B → anchor on the GenesisNFT genesis floor. The genesis root
-        # is ALREADY CRYPTOGRAPHICALLY PROVEN by the time we get here: phase_1
-        # reconstructed + VERIFIED the soul keypair (INV-MBR-11) from Shard-1 + the
-        # on-chain Shard-3 walked off this very wallet — so the Titan's
-        # GenesisNFT-rooted identity provably exists on-chain. The birth-state data/
-        # floor is EMPTY (a newborn has no accumulated body); the on-chain increments
-        # — tarballs self-describe per-file diff-mode, so full components land directly
-        # on the empty floor — supply the recovered state.
-        #
-        # The `nft_genesis_ok` seam is BEST-EFFORT confirmation/telemetry, NOT a gate:
-        # a properly-born Titan's GenesisNFT is owned by its identity wallet (DAS
-        # surfaces it), but T1's immutable NFT predates owner-indexing — its genesis
-        # root is already proven by the verified keypair + the wallet's Shard-3. We
-        # never halt the restore of a cryptographically-verified Titan on a DAS miss.
-        nft_seen = bool(await nft_genesis_ok()) if nft_genesis_ok is not None else False
-        apply_list = ordered                         # genesis → latest: all increments
+    if not baselines:
+        out.status = "halted"
+        out.halt_reason = HALT_NO_BASELINE
         out.errors.append(
-            f"anchored on genesis floor (no chain typ=B; identity verified, "
-            f"nft_das_confirmed={nft_seen})")
-        log(f"No chain typ=B baseline — anchoring on the genesis floor (verified "
-            f"identity + {len(apply_list)} on-chain increment event(s)).")
+            "no baseline (typ=B) event in the v=3 chain — cannot anchor the "
+            "restore (every chain must carry at least the genesis baseline)")
+        return out
+    start_baseline = baselines[-1]               # last baseline in chain order
+    start_idx = ordered.index(start_baseline)
+    apply_list = ordered[start_idx:]             # baseline → latest, in chain order
+    log(f"Anchoring at latest chain baseline {start_baseline['event_id'][:8]} "
+        f"(applying {len(apply_list)} of {len(ordered)} on-chain events).")
 
     os.makedirs(scratch_dir, exist_ok=True)
 
@@ -504,10 +459,6 @@ def restore_body_from_chain(
         sig_lister=_sig_lister, memo_fetcher=_memo_fetcher,
         arweave_fetch=_arweave_fetch, arc_to_target=arc_to_target,
         scratch_dir=scratch_dir,
-        # §R4/INV-MBR-12 (v0.4.4): real-RPC NFT-genesis-floor seam for the
-        # no-chain-baseline anchor (e.g. T1). Reuses the chain-walk rpc_url as DAS.
-        nft_genesis_ok=(lambda: _nft_genesis_recoverable(titan_pubkey, rpc_url))
-        if rpc_url else None,
         # Streaming fetch-to-disk — constant memory for multi-hundred-MB tarballs
         # (the bytes seam above is the test/fallback path).
         arweave_fetch_to_file=_arweave_fetch_to_file,
