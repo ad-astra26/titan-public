@@ -13,14 +13,14 @@
 #
 # Maker action: run manually OR schedule via cron (suggest weekly):
 #   crontab -e
-#   0 5 * * 0 bash /home/antigravity/projects/titan/scripts/personality_backup_archive.sh \
+#   0 5 * * 0 bash /home/youruser/projects/titan/scripts/personality_backup_archive.sh \
 #     >> /tmp/personality_archive.log 2>&1
 #
 # Closes session 2026-04-30 task #7. Companion script to studio_exports archive.
 
 set -euo pipefail
 
-BACKUPS_DIR=/home/antigravity/projects/titan/data/backups
+BACKUPS_DIR=/home/youruser/projects/titan/data/backups
 ARCHIVE_DIR="$BACKUPS_DIR/archives"
 RETENTION_DAYS=7
 LOG=/tmp/personality_archive_$(date -u +%Y%m%d_%H%M%S).log

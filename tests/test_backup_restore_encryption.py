@@ -29,7 +29,7 @@ from titan_hcl.logic.backup_crypto import (
 )
 
 
-TITAN_PUBKEY = "J1cdk4f1qZWTV1j8MSWAkPJ6Nqg63AXBn8d5JbaGLNoG"
+TITAN_PUBKEY = "YOUR_TITAN_PUBKEY"
 
 
 def _fake_kp(seed: int = 0x5E) -> bytes:

@@ -40,7 +40,7 @@ max_likes_per_day = 20
 max_searches_per_hour = 10
 max_post_length = 500
 quality_gate = true
-url_domain = "https://iamtitan.tech"
+url_domain = "https://example.com"
 
 [social_x.consumers]
 spirit_worker = "post,reply,like,search"
@@ -640,7 +640,7 @@ class TestQualityGate:
 
     def test_allows_iamtitan_url(self, gateway):
         ok, reason = gateway._quality_gate(
-            "Verified on chain: https://iamtitan.tech/tx/abc123",
+            "Verified on chain: https://example.com/tx/abc123",
             "onchain", gateway._load_config())
         assert ok is True
 
@@ -688,7 +688,7 @@ class TestAssembleFinalText:
         config = gateway._load_config()
         text = gateway._assemble_final_text(
             "Anchored to chain", "onchain", catalyst, ctx, config)
-        assert "iamtitan.tech/tx/5ByDYAE2BJ8DSsi6abc123" in text
+        assert "example.com/tx/5ByDYAE2BJ8DSsi6abc123" in text
         assert "solscan" not in text.lower()  # Uses our shortener, not Solscan
 
     def test_no_url_for_non_onchain(self, gateway):
@@ -701,7 +701,7 @@ class TestAssembleFinalText:
         config = gateway._load_config()
         text = gateway._assemble_final_text(
             "A thought", "bilingual", catalyst, ctx, config)
-        assert "iamtitan.tech/tx" not in text
+        assert "example.com/tx" not in text
 
     def test_truncates_long_text(self, gateway):
         ctx = PostContext(session="", proxy="", api_key="", titan_id="T1",

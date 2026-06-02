@@ -1939,7 +1939,7 @@ consumption_kin_sense = 0.65  # KIN_SENSE: longer refractory (20-30min)
 
 [kin]
 enabled = true
-addresses = ["http://10.135.0.6:7777"]   # Known kin (T2 on VPC)
+addresses = ["http://203.0.113.10:7777"]   # Known kin (T2 on VPC)
 exchange_strength = 0.03                   # How much kin tensors affect Outer Trinity
 resonance_threshold = 0.30                 # L2-based resonance score threshold
 great_kin_pulse_threshold = 0.80           # Resonance score above which = deep connection
@@ -2625,16 +2625,16 @@ cross_titan_confidence_scale = 0.5
 # endpoint surface. Base_url supports http:// (VPC) or https:// (public).
 
 [kin.peers.T1]
-solana = "J1cdk4f1qZWTV1j8MSWAkPJ6Nqg63AXBn8d5JbaGLNoG"
-base_url = "http://10.135.0.3:7777"
+solana = "YOUR_TITAN_PUBKEY"
+base_url = "http://203.0.113.10:7777"
 
 [kin.peers.T2]
 solana = ""                    # fill on T2 mainnet deployment
-base_url = "http://10.135.0.6:7777"
+base_url = "http://203.0.113.10:7777"
 
 [kin.peers.T3]
 solana = ""                    # fill on T3 mainnet deployment
-base_url = "http://10.135.0.6:7778"
+base_url = "http://203.0.113.10:7778"
 
 # ═══════════════════════════════════════════════════════════════════
 # OUTER INTERFACE — Track 2 of rFP_phase_c_self_improvement_subsystem_migration
@@ -3026,9 +3026,9 @@ peer_query_min_ema_to_query = 0.3         # below this, gate suppresses; above, 
 # share a host so use port differentiation; T1 is on a different host). The
 # self entry is filtered out at boot using config["titan_id"].
 [meta_teacher.peers]
-t1 = "http://10.135.0.3:7777"
-t2 = "http://10.135.0.6:7777"
-t3 = "http://10.135.0.6:7778"
+t1 = "http://203.0.113.10:7777"
+t2 = "http://203.0.113.10:7777"
+t3 = "http://203.0.113.10:7778"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # [meta_outer] — rFP_titan_meta_outer_layer

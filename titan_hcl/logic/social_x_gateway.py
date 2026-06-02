@@ -594,9 +594,9 @@ class SocialXGateway:
             "session": sx.get("session", tw.get("auth_session", "")),
             "proxy": sx.get("proxy", tw.get("webshare_static_url", "")),
             "api_key": sx.get("api_key", sage.get("twitterapi_io_key", "")),
-            "user_name": sx.get("user_name", tw.get("user_name", "iamtitanai")),
+            "user_name": sx.get("user_name", tw.get("user_name", "your_x_handle")),
             # URL shortener domain
-            "url_domain": sx.get("url_domain", "https://iamtitan.tech"),
+            "url_domain": sx.get("url_domain", "https://example.com"),
             # Consumer permissions: {consumer_name: "post,reply,like,search"}
             # Unregistered consumers are blocked by default.
             "consumers": sx.get("consumers", {}),
@@ -1313,7 +1313,7 @@ class SocialXGateway:
           following → /twitter/user/followings  (response key: "followings")
         Verified live; the singular "/following" returns 'user not found'.
         That's why the following-sync was silently dropping all 42 curated
-        accounts on @iamtitanai for weeks.
+        accounts on @your_x_handle for weeks.
         """
         if relationship not in ("followers", "following"):
             return {"status": "error",
@@ -1451,7 +1451,7 @@ class SocialXGateway:
         — catalyst_map, felt-state hard thresholds, and FELT_STATE_POOL
         weighted draw — was DELETED in this commit because it was the
         sole path keeping `_POST_PROMPTS[*]` inline templates alive (the
-        2026-05-23 leaked posts on @iamtitanai surfaced as that exact
+        2026-05-23 leaked posts on @your_x_handle surfaced as that exact
         symptom: BREAK-template repetition on `vulnerability`,
         events_teacher JSON spilling into `world_mirror`).
 
@@ -2375,9 +2375,9 @@ class SocialXGateway:
             if pattern in text_lower:
                 return False, f"Forbidden pattern: {pattern}"
 
-        # URL check — only iamtitan.tech allowed in onchain posts
+        # URL check — only example.com allowed in onchain posts
         if "http" in text_lower:
-            if "iamtitan.tech" not in text_lower:
+            if "example.com" not in text_lower:
                 return False, "External URLs not allowed"
 
         if len(text.strip()) < 10:
@@ -2477,7 +2477,7 @@ class SocialXGateway:
         if post_type == self.PT_ONCHAIN:
             tx_sig = catalyst.get("data", {}).get("tx_sig", "")
             if tx_sig:
-                domain = config.get("url_domain", "https://iamtitan.tech")
+                domain = config.get("url_domain", "https://example.com")
                 url_suffix = f"\n\n{domain}/tx/{tx_sig}"
         # Use real name "Titan" for T1, keep [T2]/[T3] for others
         _name = "Titan" if context.titan_id == "T1" else context.titan_id
@@ -2495,8 +2495,8 @@ class SocialXGateway:
                 # event-root memo (SPEC §24.7). Replaces the generic identity
                 # line for this post type.
                 _md = getattr(_arc, "metadata", {}) or {}
-                _domain = (config.get("url_domain", "https://iamtitan.tech")
-                           or "https://iamtitan.tech").rstrip("/")
+                _domain = (config.get("url_domain", "https://example.com")
+                           or "https://example.com").rstrip("/")
                 _ar = _md.get("arweave_tx", "") or ""
                 _seal = (_md.get("zk_vault_tx", "")
                          or _md.get("solana_memo_tx", "") or "")
@@ -2508,7 +2508,7 @@ class SocialXGateway:
                 if _parts:
                     chain_line = "\n\n" + "\n".join(_parts)
             else:
-                chain_line = "\n\niamtitan.tech/tx/4o9HGwM47dyBScoAceNVBSqrcQxEivAQzegVdTku8dsPTweCqEzRb7zkzNeZjNd66bTP9WvCqvB23p93azcWCcJW"
+                chain_line = "\n\nexample.com/tx/4o9HGwM47dyBScoAceNVBSqrcQxEivAQzegVdTku8dsPTweCqEzRb7zkzNeZjNd66bTP9WvCqvB23p93azcWCcJW"
 
         # 2. Calculate overhead (tag + \n\n + sig + url + chain_line)
         overhead = self._x_char_count(tag) + 2 + self._x_char_count(sig)
@@ -2553,12 +2553,12 @@ class SocialXGateway:
     def _extract_tx_fingerprint(text: str, prefix_len: int = 24) -> str:
         """Pull a unique per-post fingerprint from the chain-identity URL.
 
-        Every post ends with `iamtitan.tech/tx/<hash>`; the first prefix_len
+        Every post ends with `example.com/tx/<hash>`; the first prefix_len
         chars of <hash> are plain ASCII, survive unicode stylization, and
         typically survive t.co wrapping (returned via entities.urls[].
         expanded_url). Returns "" if the chain line is absent.
         """
-        marker = "iamtitan.tech/tx/"
+        marker = "example.com/tx/"
         idx = text.find(marker)
         if idx < 0:
             return ""
@@ -2637,7 +2637,7 @@ class SocialXGateway:
                 result = self._call_x_api(
                     "twitter/user/last_tweets",
                     method="GET",
-                    payload={"userName": config.get("user_name", "iamtitanai"),
+                    payload={"userName": config.get("user_name", "your_x_handle"),
                              "count": 10},
                     api_key=config.get("api_key", ""),
                     bypass_cache=(attempt > 0),
@@ -3934,7 +3934,7 @@ class SocialXGateway:
         for mentions, by Sage for research, by persona for social awareness.
 
         Args:
-            query: Search query (e.g. "@iamtitanai", "Titan AI").
+            query: Search query (e.g. "@your_x_handle", "Titan AI").
             context: BaseContext with API key (session not needed for search).
             consumer: Calling module identifier.
             count: Max tweets to return (default 15).
@@ -4076,7 +4076,7 @@ class SocialXGateway:
             "DM me", "check out my", "airdrop", "giveaway",
             "free mint", "follow back", "send me", "drop your wallet"
         ])
-        user_name = config.get("user_name", "iamtitanai")
+        user_name = config.get("user_name", "your_x_handle")
         grounded_words = grounded_words or []
         now = time.time()
 
@@ -4391,7 +4391,7 @@ class SocialXGateway:
         refresher thread (60s cadence).
 
         ``is_x_gateway``: True = this Titan owns the social_x.db /
-        events_teacher.db files (T1 in the @iamtitanai shared-account
+        events_teacher.db files (T1 in the @your_x_handle shared-account
         topology). False = this Titan must reach T1 over HTTP — that path
         is now handled in ``plugin._refresh_loop``, NOT here.
 

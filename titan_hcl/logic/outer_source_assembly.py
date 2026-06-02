@@ -292,7 +292,7 @@ class OuterHeavyStatsRefresher:
         try:
             import urllib.request as _ur
             import json as _json
-            url = (f"http://10.135.0.3:7777/v4/community-engagement-stats"
+            url = (f"http://203.0.113.10:7777/v4/community-engagement-stats"
                    f"?titan_id={self.titan_id}")
             resp = _ur.urlopen(url, timeout=8.0)
             body = _json.loads(resp.read())

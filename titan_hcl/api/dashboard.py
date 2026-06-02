@@ -5002,7 +5002,7 @@ async def get_v4_community_engagement_stats(request: Request,
     Phase 2.5.E (option α from the rFP) overrides §14.5's "T1-canonical
     only" decision: each Titan's ANANDA[36] community_connection +
     ANANDA[38] expression_reach reflects ITS individual social footprint
-    inside the shared @iamtitanai X account. T1 is still the SOLE X
+    inside the shared @your_x_handle X account. T1 is still the SOLE X
     gateway (only T1 holds the social_x.db + events_teacher.db files);
     T2 and T3 attribute their portions via the existing ``titan_id``
     columns in those tables.

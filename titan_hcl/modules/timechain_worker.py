@@ -1223,7 +1223,7 @@ def _build_genesis_content(titan_id: str) -> dict:
     ]
 
     # On-chain addresses
-    content["maker_pubkey"] = "8LBHvVcskwpDJsDEVYMhNCRMDi3NV4eHnynhLUo5XrrS"
+    content["maker_pubkey"] = "YOUR_DEPLOYER_PUBKEY"
     content["zk_vault_pda"] = "52an8WjtfxpkCqZZ1AYFkaDTGb4RyNFFD9VQRVdxcpJw"
 
     return content

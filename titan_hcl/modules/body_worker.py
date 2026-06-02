@@ -669,9 +669,9 @@ def _sense_entropy(thresholds: dict) -> dict:
         latencies = []
         endpoints = [
             ("127.0.0.1", 7777),      # Self (local API)
-            ("10.135.0.6", 7777),      # Twin (T2 via VPC)
-            ("67.207.73.75", 443),     # Solana RPC (api.devnet.solana.com)
-            ("1.1.1.1", 443),          # Cloudflare DNS — global internet health
+            ("203.0.113.10", 7777),      # Twin (T2 via VPC)
+            ("203.0.113.10", 443),     # Solana RPC (api.devnet.solana.com)
+            ("203.0.113.10", 443),          # Cloudflare DNS — global internet health
         ]
         for host, port in endpoints:
             try:

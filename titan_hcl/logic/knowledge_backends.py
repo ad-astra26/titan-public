@@ -60,7 +60,7 @@ class BackendResult:
 # ── Shared constants ─────────────────────────────────────────────────
 
 _UA = ("Mozilla/5.0 (compatible; TitanKnowledgeBot/1.0; "
-       "+https://iamtitan.tech)")
+       "+https://example.com)")
 
 # Cap raw_text stored per result so cache entries don't balloon on verbose
 # Wiktionary responses (common words have 50+ definitions → 100KB+ JSON).

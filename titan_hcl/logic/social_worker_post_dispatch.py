@@ -80,7 +80,7 @@ _DEFAULT_TICK_INTERVAL_S = 30.0
 # Default delegate-queue path (legacy: ./data/social_delegate_queue.json).
 _DEFAULT_DELEGATE_QUEUE = "data/social_delegate_queue.json"
 # Default twitter_social user (canary value; config overrides).
-_DEFAULT_X_USER = "iamtitanai"
+_DEFAULT_X_USER = "your_x_handle"
 
 
 class PostDispatchOrchestrator:

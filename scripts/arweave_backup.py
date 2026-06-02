@@ -6,7 +6,7 @@ Usage:
   python scripts/arweave_backup.py [--titan-id T1] [--dry-run]
 
 Cron (T1 only — TRANSITIONAL until backup_worker lands):
-  7 4 * * * cd /home/antigravity/projects/titan && . test_env/bin/activate \\
+  7 4 * * * cd /home/youruser/projects/titan && . test_env/bin/activate \\
             && NODE_PATH=$(npm root -g) python scripts/arweave_backup.py \\
             >> /tmp/titan_arweave_backup.log 2>&1
 

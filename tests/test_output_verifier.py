@@ -33,7 +33,7 @@ class TestDirectiveGate:
         assert any("Sovereign Integrity" in v for v in violations)
 
     def test_internal_path_leak_blocked(self):
-        ok, violations = self.ov._check_directives("My code is in /home/antigravity/projects")
+        ok, violations = self.ov._check_directives("My code is in /home/youruser/projects")
         assert not ok
         assert any("Sovereign Integrity" in v for v in violations)
 

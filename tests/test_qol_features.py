@@ -170,9 +170,9 @@ class TestPrivacyFilter:
 
     def test_ip_redacted(self):
         from titan_hcl.utils.privacy import sanitize_outbound
-        text, count = sanitize_outbound("Server at 192.168.1.1 is down")
+        text, count = sanitize_outbound("Server at 203.0.113.10 is down")
         assert "[IP_REDACTED]" in text
-        assert "192.168.1.1" not in text
+        assert "203.0.113.10" not in text
         assert count == 1
 
     def test_solana_address_preserved(self):
@@ -193,7 +193,7 @@ class TestPrivacyFilter:
     def test_multiple_pii_in_one_text(self):
         from titan_hcl.utils.privacy import sanitize_outbound
         text, count = sanitize_outbound(
-            "Email: a@b.com, Phone: 555-111-2222, IP: 10.0.0.1"
+            "Email: a@b.com, Phone: 555-111-2222, IP: 203.0.113.10"
         )
         assert "[EMAIL_REDACTED]" in text
         assert "[PHONE_REDACTED]" in text

@@ -97,7 +97,7 @@ class _FakeGateway:
         return [{
             "tweet_id": "mention1",
             "titan_id": "T1",
-            "text": "hi @iamtitanai",
+            "text": "hi @your_x_handle",
             "author_handle": "alice",
             "relevance_score": 0.7,
         }]
@@ -782,7 +782,7 @@ def test_ingest_mention_received_writes_locally(tmp_path, monkeypatch):
 
     payload = {
         "tweet_id": "mention_xyz", "author": "user1",
-        "author_handle": "@user1", "text": "hi @iamtitanai",
+        "author_handle": "@user1", "text": "hi @your_x_handle",
         "our_post_id": "ours123", "titan_id": "T1",
         "status": "pending", "relevance_score": 0.6,
         "discovered_at": 5000.0,

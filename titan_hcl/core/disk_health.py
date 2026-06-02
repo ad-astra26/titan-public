@@ -71,7 +71,7 @@ class DiskHealthMonitor:
 
     Usage:
         monitor = DiskHealthMonitor(
-            path="/home/antigravity/projects/titan",
+            path="/home/youruser/projects/titan",
             publish_fn=lambda state, free_bytes: bus.publish(...),
             shutdown_fn=lambda reason: guardian.stop_all(reason),
         )

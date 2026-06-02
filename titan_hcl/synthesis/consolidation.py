@@ -13,9 +13,12 @@ This module owns the orchestration logic of one consolidation pass:
      `meta` and `conversation` since those are noise sources for spine
      concepts — meta is for thoughts about thoughts, conversation is
      chat turns).
-  2. Cluster by semantic similarity (cosine ≥ threshold) AND tag
-     co-occurrence (Jaccard ≥ threshold). Both must hold so spurious
-     same-tag clusters from unrelated TXs don't fire.
+  2. Cluster by semantic similarity (cosine ≥ threshold) — the primary gate
+     per PLAN_synthesis_engine_operator_closure §B4/W4 ("cluster by cosine, not
+     tags-only"). Tag co-occurrence (Jaccard ≥ threshold, §10.4) is an additional
+     anti-spurious filter applied ONLY when both TXs carry tags, so unrelated
+     tagged TXs don't merge on a shared tag while untagged-but-semantically-near
+     chain TXs still form concepts on cosine alone.
   3. For each cluster of size ≥ `min_cluster_size`: ask the LLM
      `propose(cluster)` → one of:
        - `new_concept`: materialize a brand-new spine concept (P4.B
@@ -276,11 +279,15 @@ class ConsolidationPass:
     # ── Internal — clustering ──────────────────────────────
 
     def _cluster_txs(self, txs: list[TxCandidate]) -> list[Cluster]:
-        """Greedy single-pass clustering: each TX joins the first existing
-        cluster it's "close enough" to (cosine ≥ threshold AND Jaccard ≥
-        threshold against the cluster centroid TX); otherwise it starts a
-        new cluster. Both gates must hold so unrelated TXs that happen to
-        share a tag don't cluster on tag alone.
+        """Greedy single-pass clustering. COSINE is the primary semantic gate
+        (PLAN_synthesis_engine_operator_closure §B4/W4: "clusters by cosine
+        (0.85) NOT tags-only → real concepts form" — now that real tx_hash-spine
+        embeddings are filled in). Tag co-occurrence (Jaccard, §10.4 "both gates")
+        is applied as an ADDITIONAL anti-spurious filter ONLY when BOTH TXs carry
+        tags — the §10.4 intent ("unrelated TXs sharing a tag don't cluster on tag
+        alone") is preserved for tagged TXs, while untagged-but-semantically-near
+        chain TXs (most of them) still cluster on cosine alone. When an embedding
+        is missing, fall back to tag-only at a high Jaccard (legacy safety).
 
         Only clusters of size ≥ min_cluster_size are returned. Output is
         size-DESC so the densest clusters get LLM budget first.
@@ -290,22 +297,22 @@ class ConsolidationPass:
             best: Optional[Cluster] = None
             for cluster in clusters:
                 centroid = cluster.members[0]
-                # Jaccard over tag sets.
                 tx_tag_set = set(tx.tags)
-                jac = _jaccard(tx_tag_set, set(centroid.tags))
-                if jac < self._jac_thresh:
-                    continue
-                # Cosine over embeddings (skip if either side has none).
-                if tx.embedding is None or centroid.embedding is None:
-                    # No semantic signal → fall back to tag-only Jaccard
-                    # check at a higher threshold so we don't merge weakly
-                    # related TXs without embedding evidence.
-                    if jac >= max(0.8, self._jac_thresh):
-                        best = cluster
-                        break
-                    continue
-                cos = self._cosine(tx.embedding, centroid.embedding)
-                if cos >= self._cos_thresh:
+                centroid_tag_set = set(centroid.tags)
+                if tx.embedding is not None and centroid.embedding is not None:
+                    # Primary: cosine semantic similarity (PLAN B4).
+                    if self._cosine(tx.embedding, centroid.embedding) < self._cos_thresh:
+                        continue
+                    # Anti-spurious co-gate (§10.4) — only when BOTH are tagged.
+                    if tx_tag_set and centroid_tag_set:
+                        if _jaccard(tx_tag_set, centroid_tag_set) < self._jac_thresh:
+                            continue
+                    best = cluster
+                    break
+                # No embedding on one side → tag-only fallback at high Jaccard
+                # so we never merge weakly-related TXs without semantic evidence.
+                jac = _jaccard(tx_tag_set, centroid_tag_set)
+                if jac >= max(0.8, self._jac_thresh):
                     best = cluster
                     break
 

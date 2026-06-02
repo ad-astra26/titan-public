@@ -3,7 +3,7 @@
 POV: Titan reacts in-the-moment to a curated outer-world post they just
 encountered. Each Titan applies its own felt-state lens to the same source
 (role + felt-state modifier yields per-Titan distillation even on the
-shared @iamtitanai timeline).
+shared @your_x_handle timeline).
 
 Source: ``felt_experiences`` (the events_teacher distillation of curated
 following's content) JOIN ``community_registry`` (filtered on

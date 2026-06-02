@@ -399,7 +399,7 @@ from setup_titan.prompts import Prompter, ScriptedPrompter, StdinPrompter  # noq
 
 _TG = "12345678:" + "A" * 30           # valid BotFather-shaped token
 _UUID = "12345678-1234-1234-1234-123456789abc"
-_WEBSHARE = "http://user:pass@1.2.3.4:8080/"
+_WEBSHARE = "http://user:pass@203.0.113.10:8080/"
 
 
 def test_both_prompters_satisfy_protocol():

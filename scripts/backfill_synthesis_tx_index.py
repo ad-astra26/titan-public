@@ -16,7 +16,7 @@ DESIGN DISCIPLINE (PLAN §A4):
     per-fork height watermark resumes where the last pass stopped.
 
 Run ON each Titan against its local data/ (T3 first, then T1):
-    source /home/antigravity/projects/titan/test_env/bin/activate
+    source /home/youruser/projects/titan/test_env/bin/activate
     python scripts/backfill_synthesis_tx_index.py                 # dry-run report
     python scripts/backfill_synthesis_tx_index.py --execute       # populate
     python scripts/backfill_synthesis_tx_index.py --execute --data-dir data --max 200000

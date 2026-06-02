@@ -27,11 +27,11 @@ def _cfg(enabled=True, **overrides):
         "backup": {
             "mirror": {
                 "enabled": enabled,
-                "ssh_user": "antigravity",
-                "t2_host": "10.135.0.6",
-                "t2_backup_path": "/home/antigravity/projects/titan/data/backups",
-                "t3_host": "10.135.0.6",
-                "t3_backup_path": "/home/antigravity/projects/titan3/data/backups",
+                "ssh_user": "youruser",
+                "t2_host": "203.0.113.10",
+                "t2_backup_path": "/home/youruser/projects/titan/data/backups",
+                "t3_host": "203.0.113.10",
+                "t3_backup_path": "/home/youruser/projects/titan3/data/backups",
                 "retention_days": 7,
                 "local_base": "data/backups/mirror",
                 **overrides,
@@ -72,13 +72,13 @@ def test_skips_host_with_missing_fields():
 def test_build_rsync_cmd_has_right_flags(tmp_path):
     m = OffhostMirror(_cfg(local_base=str(tmp_path / "mirror")))
     cmd = m._build_rsync_cmd(
-        "10.135.0.6", "/remote/data/backups", str(tmp_path / "mirror" / "T2"))
+        "203.0.113.10", "/remote/data/backups", str(tmp_path / "mirror" / "T2"))
     assert cmd[0] == "rsync"
     assert "-avP" in cmd
     assert "--append-verify" in cmd
     assert "-e" in cmd
     # SSH user@host:path syntax
-    assert any("antigravity@10.135.0.6:" in c for c in cmd)
+    assert any("youruser@203.0.113.10:" in c for c in cmd)
     # include patterns
     assert any("personality_*.tar.gz" in c for c in cmd)
     assert any("personality_*.tar.gz.enc" in c for c in cmd)
@@ -124,7 +124,7 @@ def test_pull_one_success(tmp_path):
     m = OffhostMirror(_cfg(local_base=str(tmp_path / "mirror")))
     stdout = "Number of regular files transferred: 2\ntotal size is 100 speedup is 1\n"
     with mock.patch("subprocess.run", return_value=_fake_proc(0, stdout)):
-        r = m.pull_one("T2", "10.135.0.6", "/remote/path")
+        r = m.pull_one("T2", "203.0.113.10", "/remote/path")
     assert r["ok"] is True
     assert r["titan_id"] == "T2"
     assert r["files_transferred"] == 2
@@ -136,7 +136,7 @@ def test_pull_one_success(tmp_path):
 def test_pull_one_nonzero_returncode(tmp_path):
     m = OffhostMirror(_cfg(local_base=str(tmp_path / "mirror")))
     with mock.patch("subprocess.run", return_value=_fake_proc(23, "", "Permission denied")):
-        r = m.pull_one("T2", "10.135.0.6", "/remote/path")
+        r = m.pull_one("T2", "203.0.113.10", "/remote/path")
     assert r["ok"] is False
     assert r["returncode"] == 23
     assert "Permission denied" in r["error"]
@@ -147,7 +147,7 @@ def test_pull_one_timeout(tmp_path):
                             rsync_timeout_sec=1))
     with mock.patch("subprocess.run",
                      side_effect=subprocess.TimeoutExpired(cmd=["rsync"], timeout=1)):
-        r = m.pull_one("T2", "10.135.0.6", "/remote/path")
+        r = m.pull_one("T2", "203.0.113.10", "/remote/path")
     assert r["ok"] is False
     assert "timeout" in r["error"]
 

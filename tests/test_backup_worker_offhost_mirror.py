@@ -34,10 +34,10 @@ def _cfg(enabled=True, hosts=True):
         "backup": {
             "mirror": {
                 "enabled": enabled,
-                "ssh_user": "antigravity",
-                "t2_host": "10.135.0.6" if hosts else "",
+                "ssh_user": "youruser",
+                "t2_host": "203.0.113.10" if hosts else "",
                 "t2_backup_path": "/rp/t2/backups" if hosts else "",
-                "t3_host": "10.135.0.6" if hosts else "",
+                "t3_host": "203.0.113.10" if hosts else "",
                 "t3_backup_path": "/rp/t3/backups" if hosts else "",
                 "retention_days": 7,
                 "local_base": "/tmp/mirror_test_nonexistent",
@@ -89,9 +89,9 @@ def test_happy_path_emits_complete(tmp_path):
         new=mock.AsyncMock(return_value={
             "ok": True,
             "results": [
-                {"ok": True, "titan_id": "T2", "host": "10.135.0.6",
+                {"ok": True, "titan_id": "T2", "host": "203.0.113.10",
                  "duration_s": 1.2, "files_transferred": 1, "bytes_total": 500},
-                {"ok": True, "titan_id": "T3", "host": "10.135.0.6",
+                {"ok": True, "titan_id": "T3", "host": "203.0.113.10",
                  "duration_s": 0.8, "files_transferred": 0, "bytes_total": 0},
             ],
             "completed_at": 1778000000,
@@ -128,7 +128,7 @@ def test_partial_failure_emits_failed(tmp_path):
             "results": [
                 {"ok": True, "titan_id": "T2", "duration_s": 1.0,
                  "files_transferred": 1, "bytes_total": 100},
-                {"ok": False, "titan_id": "T3", "host": "10.135.0.6",
+                {"ok": False, "titan_id": "T3", "host": "203.0.113.10",
                  "duration_s": 0.5, "error": "ssh: connection refused"},
             ],
         })), \

@@ -15,9 +15,9 @@ Design:
   - Self-skip: broadcaster POSTs to all 3 kin URLs; receiver compares
     `source_titan_id` to its own and drops if match.
   - Kin URLs are hardcoded per VPC network (memory/reference_vpc_network.md):
-      T1 = http://10.135.0.3:7777
-      T2 = http://10.135.0.6:7777
-      T3 = http://10.135.0.6:7778
+      T1 = http://203.0.113.10:7777
+      T2 = http://203.0.113.10:7777
+      T3 = http://203.0.113.10:7778
     If this list changes, update this constant.
 """
 from __future__ import annotations
@@ -32,9 +32,9 @@ import requests
 logger = logging.getLogger(__name__)
 
 KIN_URLS = [
-    "http://10.135.0.3:7777",   # T1
-    "http://10.135.0.6:7777",   # T2
-    "http://10.135.0.6:7778",   # T3
+    "http://203.0.113.10:7777",   # T1
+    "http://203.0.113.10:7777",   # T2
+    "http://203.0.113.10:7778",   # T3
 ]
 
 BROADCAST_TIMEOUT_SECONDS = 5.0

@@ -26,7 +26,7 @@ Usage:
   python scripts/arch_map.py params                  # Unused titan_params.toml key audit
   python scripts/arch_map.py health                  # LIVE runtime health checks against API
   python scripts/arch_map.py health --all            # Check ALL 3 Titans (T1+T2+T3)
-  python scripts/arch_map.py health --t2             # Also check T2 (10.135.0.6:7777)
+  python scripts/arch_map.py health --t2             # Also check T2 (203.0.113.10:7777)
   python scripts/arch_map.py services                # Teacher + ARC + Persona + Events + X-HEALTH diagnostics (all Titans)
   python scripts/arch_map.py services --json         # Same, JSON output (cron-friendly)
   python scripts/arch_map.py x_check                 # Tail social_x health journal (last 24h on T1, SPEC v1.12.0)
@@ -3138,8 +3138,8 @@ def show_teacher_progress():
 
 TITAN_ENDPOINTS = {
     "T1": "http://127.0.0.1:7777",
-    "T2": "http://10.135.0.6:7777",
-    "T3": "http://10.135.0.6:7778",
+    "T2": "http://203.0.113.10:7777",
+    "T3": "http://203.0.113.10:7778",
 }
 
 
@@ -3254,8 +3254,8 @@ def _check_teacher(base_url: str, titan_id: str, db_path: str | None = None) -> 
     if _remote_titan:
         # T2/T3: query DB via SSH + sqlite3 CLI
         _remote_db_map = {
-            "T2": "/home/antigravity/projects/titan/data/inner_memory.db",
-            "T3": "/home/antigravity/projects/titan3/data/inner_memory.db",
+            "T2": "/home/youruser/projects/titan/data/inner_memory.db",
+            "T3": "/home/youruser/projects/titan3/data/inner_memory.db",
         }
         _remote_db = _remote_db_map.get(titan_id, "")
         try:
@@ -3268,7 +3268,7 @@ def _check_teacher(base_url: str, titan_id: str, db_path: str | None = None) -> 
                 f"SELECT COALESCE(MAX(level),0) FROM composition_history;\""
             )
             _ssh_r = subprocess.run(
-                f"ssh -o ConnectTimeout=3 root@10.135.0.6 '{_ssh_sql}'",
+                f"ssh -o ConnectTimeout=3 root@203.0.113.10 '{_ssh_sql}'",
                 shell=True, capture_output=True, text=True, timeout=10)
             _lines = _ssh_r.stdout.strip().split("\n")
             if len(_lines) >= 3:
@@ -3570,7 +3570,7 @@ def _check_events_teacher(base_url: str, titan_id: str) -> dict:
 
     if is_remote:
         try:
-            ssh_cmd = (f"ssh -o ConnectTimeout=3 root@10.135.0.6 "
+            ssh_cmd = (f"ssh -o ConnectTimeout=3 root@203.0.113.10 "
                        f"'stat -c %Y {log_path} 2>/dev/null; "
                        f"echo ---; tail -50 {log_path} 2>/dev/null'")
             ssh_result = subprocess.run(
@@ -3773,18 +3773,18 @@ def run_services_diagnostics(json_output: bool = False):
 #   data/health_monitor/events.jsonl — append-only audit (check_result,
 #                                       heal_request, heal_result events)
 #
-# T1 reads local files; T2/T3 SSH to root@10.135.0.6 against the remote
-# titan dir (/home/antigravity/projects/titan/ for T2, .../titan3/ for T3).
+# T1 reads local files; T2/T3 SSH to root@203.0.113.10 against the remote
+# titan dir (/home/youruser/projects/titan/ for T2, .../titan3/ for T3).
 # Per `feedback_t2t3_management_only_scripts.md` — read-only state queries
 # don't go through manage scripts; ssh + cat is fine for inspection.
 
 import subprocess as _subprocess  # noqa: E402 (import-after-code is OK
                                    # in this file; matches existing style)
 
-_HM_REMOTE_HOST = "root@10.135.0.6"
+_HM_REMOTE_HOST = "root@203.0.113.10"
 _HM_REMOTE_DIRS = {
-    "T2": "/home/antigravity/projects/titan",
-    "T3": "/home/antigravity/projects/titan3",
+    "T2": "/home/youruser/projects/titan",
+    "T3": "/home/youruser/projects/titan3",
 }
 _HM_STATE_REL = "data/health_monitor/state.json"
 _HM_JOURNAL_REL = "data/health_monitor/events.jsonl"
@@ -4337,8 +4337,8 @@ def run_live_audit(base_url: str = "http://127.0.0.1:7777",
 
 TITAN_REPORT_ENDPOINTS = [
     ("T1", "http://127.0.0.1:7777"),
-    ("T2", "http://10.135.0.6:7777"),
-    ("T3", "http://10.135.0.6:7778"),
+    ("T2", "http://203.0.113.10:7777"),
+    ("T3", "http://203.0.113.10:7778"),
 ]
 
 
@@ -4702,9 +4702,9 @@ def run_deploy(targets: list, restart: bool = False):
     import time
     import requests
 
-    T2_HOST = "root@10.135.0.6"
-    TITAN_DIR = "/home/antigravity/projects/titan"
-    T3_DIR = "/home/antigravity/projects/titan3"
+    T2_HOST = "root@203.0.113.10"
+    TITAN_DIR = "/home/youruser/projects/titan"
+    T3_DIR = "/home/youruser/projects/titan3"
 
     # Files/dirs that must NEVER be synced (per-Titan state)
     RSYNC_EXCLUDES = [
@@ -4822,8 +4822,8 @@ def run_deploy(targets: list, restart: bool = False):
         time.sleep(20)
 
         health_checks = {
-            "T2": "http://10.135.0.6:7777",
-            "T3": "http://10.135.0.6:7778",
+            "T2": "http://203.0.113.10:7777",
+            "T3": "http://203.0.113.10:7778",
         }
         for tid, url in health_checks.items():
             if tid.lower()[1:] not in [t.lower()[-1] for t in targets]:
@@ -4975,8 +4975,8 @@ def run_filter_down_status(all_titans: bool = False, gate_check: bool = False) -
     titans = [("T1", "http://127.0.0.1:7777")]
     if all_titans:
         titans += [
-            ("T2", "http://10.135.0.6:7777"),
-            ("T3", "http://10.135.0.6:7778"),
+            ("T2", "http://203.0.113.10:7777"),
+            ("T3", "http://203.0.113.10:7778"),
         ]
 
     print()
@@ -5122,8 +5122,8 @@ def run_meditation_health(all_titans: bool = False) -> int:
     titans = [("T1", "http://127.0.0.1:7777")]
     if all_titans:
         titans += [
-            ("T2", "http://10.135.0.6:7777"),
-            ("T3", "http://10.135.0.6:7778"),
+            ("T2", "http://203.0.113.10:7777"),
+            ("T3", "http://203.0.113.10:7778"),
         ]
 
     print()
@@ -5207,9 +5207,9 @@ def run_voice_diagnostics(all_titans: bool = False, hours: int = 24):
 
     sources = [("T1", "./data/social_x_telemetry.jsonl", "local")]
     if all_titans:
-        sources.append(("T2", "/home/antigravity/projects/titan/data/"
+        sources.append(("T2", "/home/youruser/projects/titan/data/"
                         "social_x_telemetry.jsonl", "ssh"))
-        sources.append(("T3", "/home/antigravity/projects/titan3/data/"
+        sources.append(("T3", "/home/youruser/projects/titan3/data/"
                         "social_x_telemetry.jsonl", "ssh"))
 
     cutoff = _t.time() - hours * 3600
@@ -5234,7 +5234,7 @@ def run_voice_diagnostics(all_titans: bool = False, hours: int = 24):
         else:
             try:
                 proc = subprocess.run(
-                    f"ssh root@10.135.0.6 'tail -5000 {path}'",
+                    f"ssh root@203.0.113.10 'tail -5000 {path}'",
                     shell=True, capture_output=True, text=True, timeout=20)
                 raw = proc.stdout.splitlines()
             except Exception as e:
@@ -5392,7 +5392,7 @@ def run_errors(all_titans: bool = False):
             try:
                 # `stat -c %Y` returns mtime as unix epoch; missing file → blank.
                 stat_proc = subprocess.run(
-                    f"ssh root@10.135.0.6 'stat -c %Y {log_path} 2>/dev/null || echo 0'",
+                    f"ssh root@203.0.113.10 'stat -c %Y {log_path} 2>/dev/null || echo 0'",
                     shell=True, capture_output=True, text=True, timeout=10)
                 mtime_str = stat_proc.stdout.strip()
                 mtime = float(mtime_str) if mtime_str else 0.0
@@ -5409,7 +5409,7 @@ def run_errors(all_titans: bool = False):
                 print("  " + "-" * 80)
                 try:
                     proc = subprocess.run(
-                        f"ssh root@10.135.0.6 'tail -2000 {log_path}'",
+                        f"ssh root@203.0.113.10 'tail -2000 {log_path}'",
                         shell=True, capture_output=True, text=True, timeout=15)
                     lines = proc.stdout.splitlines()
                 except Exception as e:
@@ -5438,7 +5438,7 @@ def run_errors(all_titans: bool = False):
                 print("  " + "-" * 80)
                 try:
                     proc = subprocess.run(
-                        f"ssh root@10.135.0.6 'journalctl -u {service_unit} "
+                        f"ssh root@203.0.113.10 'journalctl -u {service_unit} "
                         f"--since \"30 min ago\" --no-pager -n 2000 2>/dev/null'",
                         shell=True, capture_output=True, text=True, timeout=20)
                     lines = proc.stdout.splitlines()
@@ -5674,8 +5674,8 @@ def run_cgn_signals_audit(all_titans: bool = False,
     import requests
     endpoints = [("T1", "http://127.0.0.1:7777")]
     if all_titans:
-        endpoints.append(("T2", "http://10.135.0.6:7777"))
-        endpoints.append(("T3", "http://10.135.0.6:7778"))
+        endpoints.append(("T2", "http://203.0.113.10:7777"))
+        endpoints.append(("T3", "http://203.0.113.10:7778"))
     for name, base in endpoints:
         try:
             r = requests.get(f"{base}/v4/bus-health", timeout=5)
@@ -5718,8 +5718,8 @@ def run_producers_diagnostics(argv: list) -> None:
 
     Paths per Titan:
       T1: ./data/meta_cgn_emissions.jsonl              (local)
-      T2: /home/antigravity/projects/titan/data/       (ssh root@10.135.0.6)
-      T3: /home/antigravity/projects/titan3/data/      (ssh root@10.135.0.6)
+      T2: /home/youruser/projects/titan/data/       (ssh root@203.0.113.10)
+      T3: /home/youruser/projects/titan3/data/      (ssh root@203.0.113.10)
     """
     import json as _json
     import datetime as _dt
@@ -5765,10 +5765,10 @@ def run_producers_diagnostics(argv: list) -> None:
 
     titans = [
         ("T1", "http://127.0.0.1:7777", None, "./data/meta_cgn_emissions.jsonl"),
-        ("T2", "http://10.135.0.6:7777", "root@10.135.0.6",
-         "/home/antigravity/projects/titan/data/meta_cgn_emissions.jsonl"),
-        ("T3", "http://10.135.0.6:7778", "root@10.135.0.6",
-         "/home/antigravity/projects/titan3/data/meta_cgn_emissions.jsonl"),
+        ("T2", "http://203.0.113.10:7777", "root@203.0.113.10",
+         "/home/youruser/projects/titan/data/meta_cgn_emissions.jsonl"),
+        ("T3", "http://203.0.113.10:7778", "root@203.0.113.10",
+         "/home/youruser/projects/titan3/data/meta_cgn_emissions.jsonl"),
     ]
 
     # ── 1. LIVE snapshot from /v4/bus-health ──────────────────────
@@ -6057,8 +6057,8 @@ def run_preflight():
     t1_endpoints = [
         ("T1 /health", "http://127.0.0.1:7777/health"),
         ("T1 /v4/bus-health", "http://127.0.0.1:7777/v4/bus-health"),
-        ("T2 /health", "http://10.135.0.6:7777/health"),
-        ("T3 /health", "http://10.135.0.6:7778/health"),
+        ("T2 /health", "http://203.0.113.10:7777/health"),
+        ("T3 /health", "http://203.0.113.10:7778/health"),
     ]
     for name, url in t1_endpoints:
         try:
@@ -6102,8 +6102,8 @@ def run_preflight():
     # ── 5. Bus health ──
     print("\n[5/10] BUS HEALTH — /v4/bus-health per Titan")
     for tid, url in [("T1", "http://127.0.0.1:7777"),
-                      ("T2", "http://10.135.0.6:7777"),
-                      ("T3", "http://10.135.0.6:7778")]:
+                      ("T2", "http://203.0.113.10:7777"),
+                      ("T3", "http://203.0.113.10:7778")]:
         try:
             r = requests.get(f"{url}/v4/bus-health", timeout=5)
             if r.status_code == 200:
@@ -7044,8 +7044,8 @@ def run_loop_latency_check(target: str = "T1", endpoint: str = "/v4/inner-trinit
 
     targets = {
         "T1": "http://127.0.0.1:7777",
-        "T2": "http://10.135.0.6:7777",
-        "T3": "http://10.135.0.6:7778",
+        "T2": "http://203.0.113.10:7777",
+        "T3": "http://203.0.113.10:7778",
     }
     base = targets.get(target.upper())
     if not base:
@@ -7154,8 +7154,8 @@ def run_parent_thread_inventory(all_titans: bool = False):
     targets = [("T1", "http://127.0.0.1:7777")]
     if all_titans:
         targets.extend([
-            ("T2", "http://10.135.0.6:7777"),
-            ("T3", "http://10.135.0.6:7778"),
+            ("T2", "http://203.0.113.10:7777"),
+            ("T3", "http://203.0.113.10:7778"),
         ])
 
     print()
@@ -7225,8 +7225,8 @@ def run_thread_pool_check():
 
     targets = [
         ("T1", "http://127.0.0.1:7777"),
-        ("T2", "http://10.135.0.6:7777"),
-        ("T3", "http://10.135.0.6:7778"),
+        ("T2", "http://203.0.113.10:7777"),
+        ("T3", "http://203.0.113.10:7778"),
     ]
     print()
     print("THREAD-POOL SATURATION — asyncio default-executor")
@@ -7286,9 +7286,9 @@ def run_stability_check(hours: int = 24):
 
     Sources (multi-source by design — see feedback_titan_status_must_be_verified.md):
       • T1 watchdog log    : /tmp/titan1_watchdog.log
-      • T2 watchdog log    : ssh root@10.135.0.6 /tmp/titan2_watchdog.log
-      • T3 watchdog log    : ssh root@10.135.0.6 /tmp/titan3_watchdog.log
-      • Live /health       : http://127.0.0.1:7777, 10.135.0.6:7777, 10.135.0.6:7778
+      • T2 watchdog log    : ssh root@203.0.113.10 /tmp/titan2_watchdog.log
+      • T3 watchdog log    : ssh root@203.0.113.10 /tmp/titan3_watchdog.log
+      • Live /health       : http://127.0.0.1:7777, 203.0.113.10:7777, 203.0.113.10:7778
       • Brain log RESTART boundaries (cross-check that watchdog kicks led to actual restarts)
 
     Verdict per Titan:
@@ -7380,7 +7380,7 @@ def run_stability_check(hours: int = 24):
             r = subprocess.run(
                 ["ssh", "-o", "ConnectTimeout=5",
                  "-o", "BatchMode=yes",
-                 "root@10.135.0.6", f"cat {path}"],
+                 "root@203.0.113.10", f"cat {path}"],
                 capture_output=True, text=True, timeout=15)
             if r.returncode != 0:
                 return None
@@ -7493,9 +7493,9 @@ def run_stability_check(hours: int = 24):
         ("T1", "/tmp/titan1_watchdog.log", "local",
          "http://127.0.0.1:7777", "/tmp/titan_brain.log"),
         ("T2", "/tmp/titan2_watchdog.log", "remote",
-         "http://10.135.0.6:7777", "/tmp/titan2_brain.log"),
+         "http://203.0.113.10:7777", "/tmp/titan2_brain.log"),
         ("T3", "/tmp/titan3_watchdog.log", "remote",
-         "http://10.135.0.6:7778", "/tmp/titan3_brain.log"),
+         "http://203.0.113.10:7778", "/tmp/titan3_brain.log"),
     ]
 
     overall_state = "STABLE"
@@ -8272,8 +8272,8 @@ def run_backup_diagnostics(all_titans: bool = False):
     import requests
     titans = [
         ("T1", "http://127.0.0.1:7777"),
-        ("T2", "http://10.135.0.6:7777"),
-        ("T3", "http://10.135.0.6:7778"),
+        ("T2", "http://203.0.113.10:7777"),
+        ("T3", "http://203.0.113.10:7778"),
     ] if all_titans else [("T1", "http://127.0.0.1:7777")]
 
     print()
@@ -8786,8 +8786,8 @@ def run_sovereign_ops(all_titans: bool = False):
     import requests
     titans = [
         ("T1", "http://127.0.0.1:7777"),
-        ("T2", "http://10.135.0.6:7777"),
-        ("T3", "http://10.135.0.6:7778"),
+        ("T2", "http://203.0.113.10:7777"),
+        ("T3", "http://203.0.113.10:7778"),
     ] if all_titans else [("T1", "http://127.0.0.1:7777")]
 
     print()
@@ -8893,8 +8893,8 @@ def run_sovereign_ops(all_titans: bool = False):
 
 _DIM_LIVE_TITAN_URLS = {
     "T1": "http://127.0.0.1:7777",
-    "T2": "http://10.135.0.6:7777",
-    "T3": "http://10.135.0.6:7778",
+    "T2": "http://203.0.113.10:7777",
+    "T3": "http://203.0.113.10:7778",
 }
 
 # rFP §3.1 — locked parameters
@@ -9494,8 +9494,8 @@ def main():
     elif cmd == "health":
         _HEALTH_URLS = {
             "T1": ("http://127.0.0.1:7777", "T1 (localhost:7777)"),
-            "T2": ("http://10.135.0.6:7777", "T2 (10.135.0.6:7777)"),
-            "T3": ("http://10.135.0.6:7778", "T3 (10.135.0.6:7778)"),
+            "T2": ("http://203.0.113.10:7777", "T2 (203.0.113.10:7777)"),
+            "T3": ("http://203.0.113.10:7778", "T3 (203.0.113.10:7778)"),
         }
         # `--titan T1|T2|T3` selects a single Titan; `--t1/--t2/--t3` are
         # legacy aliases; `--all` runs all three. Bare `health` = T1 only.
@@ -9546,8 +9546,8 @@ def main():
             # Also run live wiring checks
             run_live_audit("http://127.0.0.1:7777", "T1")
             if "--all" in sys.argv:
-                run_live_audit("http://10.135.0.6:7777", "T2")
-                run_live_audit("http://10.135.0.6:7778", "T3")
+                run_live_audit("http://203.0.113.10:7777", "T2")
+                run_live_audit("http://203.0.113.10:7778", "T3")
 
     elif cmd == "cgn":
         run_cgn_telemetry("--all" in sys.argv)
@@ -10231,8 +10231,8 @@ def run_reload_module_command(args: list) -> int:
 
     url_map = {
         "T1": "http://127.0.0.1:7777",
-        "T2": "http://10.135.0.6:7777",
-        "T3": "http://10.135.0.6:7778",
+        "T2": "http://203.0.113.10:7777",
+        "T3": "http://203.0.113.10:7778",
     }
     base = url_map[titan_id]
     url = f"{base}/v4/admin/reload-module/{module_name}"
@@ -10874,13 +10874,13 @@ def _phase_c_daemon_tick_rate(rest: list) -> int:
         print(f"--window must be in [1, 60] seconds (got {window_s})", file=sys.stderr)
         return 2
 
-    # Resolve host. T1 = local; T2/T3 = same VPS at 10.135.0.6 per
+    # Resolve host. T1 = local; T2/T3 = same VPS at 203.0.113.10 per
     # reference_vpc_network. Same SSH login used by deploy_t2.sh /
-    # t3_manage.sh — root@10.135.0.6.
+    # t3_manage.sh — root@203.0.113.10.
     if titan_id == "T1":
         result = _daemon_tick_run_local(window_s, titan_id)
     else:
-        result = _daemon_tick_run_remote(window_s, titan_id, "root@10.135.0.6")
+        result = _daemon_tick_run_remote(window_s, titan_id, "root@203.0.113.10")
 
     if "error" in result:
         if json_mode:
@@ -12037,8 +12037,8 @@ def run_kernel_status(all_titans: bool = False) -> int:
     titans = [("T1", "http://127.0.0.1:7777", "/dev/shm/titan_T1")]
     if all_titans:
         titans += [
-            ("T2", "http://10.135.0.6:7777", "/dev/shm/titan_T2"),
-            ("T3", "http://10.135.0.6:7778", "/dev/shm/titan_T3"),
+            ("T2", "http://203.0.113.10:7777", "/dev/shm/titan_T2"),
+            ("T3", "http://203.0.113.10:7778", "/dev/shm/titan_T3"),
         ]
 
     print()
@@ -12165,8 +12165,8 @@ def run_layers(all_titans: bool = False) -> int:
     titans = [("T1", "http://127.0.0.1:7777")]
     if all_titans:
         titans += [
-            ("T2", "http://10.135.0.6:7777"),
-            ("T3", "http://10.135.0.6:7778"),
+            ("T2", "http://203.0.113.10:7777"),
+            ("T3", "http://203.0.113.10:7778"),
         ]
 
     print()
@@ -12375,8 +12375,8 @@ def run_memory_profile(all_titans: bool = False, diff: bool = False,
     ]
     if all_titans:
         targets += [
-            ("T2", "http://10.135.0.6:7777"),
-            ("T3", "http://10.135.0.6:7778"),
+            ("T2", "http://203.0.113.10:7777"),
+            ("T3", "http://203.0.113.10:7778"),
         ]
 
     params = {"diff": str(diff).lower(), "cpu": str(cpu).lower()}
@@ -12483,8 +12483,8 @@ def run_knowledge_comparison():
 
     endpoints = [
         ("T1", "http://127.0.0.1:7777"),
-        ("T2", "http://10.135.0.6:7777"),
-        ("T3", "http://10.135.0.6:7778"),
+        ("T2", "http://203.0.113.10:7777"),
+        ("T3", "http://203.0.113.10:7778"),
     ]
 
     for tid, url in endpoints:
@@ -12540,8 +12540,8 @@ def run_social_divergence():
 
     endpoints = [
         ("T1", "http://127.0.0.1:7777"),
-        ("T2", "http://10.135.0.6:7777"),
-        ("T3", "http://10.135.0.6:7778"),
+        ("T2", "http://203.0.113.10:7777"),
+        ("T3", "http://203.0.113.10:7778"),
     ]
 
     # Test with a standard user profile
@@ -12923,8 +12923,8 @@ def run_meta_teacher(scope: str = "all") -> None:
 
     TITANS = {
         "T1": "http://127.0.0.1:7777",
-        "T2": "http://10.135.0.6:7777",
-        "T3": "http://10.135.0.6:7778",
+        "T2": "http://203.0.113.10:7777",
+        "T3": "http://203.0.113.10:7778",
     }
     if scope == "t1":
         titans = {"T1": TITANS["T1"]}
@@ -13007,8 +13007,8 @@ def run_emot_cgn(
 
     TITANS = {
         "T1": "http://127.0.0.1:7777",
-        "T2": "http://10.135.0.6:7777",
-        "T3": "http://10.135.0.6:7778",
+        "T2": "http://203.0.113.10:7777",
+        "T3": "http://203.0.113.10:7778",
     }
     if scope == "t1":
         selected = {"T1": TITANS["T1"]}
@@ -13206,13 +13206,13 @@ def run_meta_outer(scope: str = "t1", as_json: bool = False,
     if scope == "all":
         targets = [
             ("T1", "http://127.0.0.1:7777"),
-            ("T2", "http://10.135.0.6:7777"),
-            ("T3", "http://10.135.0.6:7778"),
+            ("T2", "http://203.0.113.10:7777"),
+            ("T3", "http://203.0.113.10:7778"),
         ]
     elif scope == "t2":
-        targets = [("T2", "http://10.135.0.6:7777")]
+        targets = [("T2", "http://203.0.113.10:7777")]
     elif scope == "t3":
-        targets = [("T3", "http://10.135.0.6:7778")]
+        targets = [("T3", "http://203.0.113.10:7778")]
     else:
         targets = [("T1", "http://127.0.0.1:7777")]
 
@@ -13511,7 +13511,7 @@ def run_session_close(title: str = "", commit: bool = True,
     # targeting fixes both. (Verified 2026-06-01: one file per session,
     # filename == sessionId, no session spans >1 file.)
     jsonl_dir = os.path.expanduser(
-        "~/.claude/projects/-home-antigravity-projects-titan")
+        "~/.claude/projects/-home-youruser-projects-titan")
     env_sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
     jsonl_path = ""
     if env_sid:
@@ -14223,8 +14223,8 @@ def run_timechain_diagnostics(all_titans: bool = True):
 
     titans = [
         ("T1", "http://127.0.0.1:7777"),
-        ("T2", "http://10.135.0.6:7777"),
-        ("T3", "http://10.135.0.6:7778"),
+        ("T2", "http://203.0.113.10:7777"),
+        ("T3", "http://203.0.113.10:7778"),
     ] if all_titans else [("T1", "http://127.0.0.1:7777")]
 
     print()
@@ -14453,8 +14453,8 @@ def run_cognitive_contracts_diagnostics(all_titans: bool = True):
 
     titans = [
         ("T1", "http://127.0.0.1:7777"),
-        ("T2", "http://10.135.0.6:7777"),
-        ("T3", "http://10.135.0.6:7778"),
+        ("T2", "http://203.0.113.10:7777"),
+        ("T3", "http://203.0.113.10:7778"),
     ] if all_titans else [("T1", "http://127.0.0.1:7777")]
 
     print()
@@ -14572,8 +14572,8 @@ def run_verify_search_pipeline(all_titans: bool = False):
     titans = [("T1", "http://127.0.0.1:7777")]
     if all_titans:
         titans += [
-            ("T2", "http://10.135.0.6:7777"),
-            ("T3", "http://10.135.0.6:7778"),
+            ("T2", "http://203.0.113.10:7777"),
+            ("T3", "http://203.0.113.10:7778"),
         ]
 
     # Severity marker helpers
@@ -14817,8 +14817,8 @@ def run_verify_cgn_pipeline(all_titans: bool = False):
     titans = [("T1", "http://127.0.0.1:7777", "/tmp/titan_brain.log")]
     if all_titans:
         titans += [
-            ("T2", "http://10.135.0.6:7777", "ssh:/tmp/titan2_brain.log"),
-            ("T3", "http://10.135.0.6:7778", "ssh:/tmp/titan3_brain.log"),
+            ("T2", "http://203.0.113.10:7777", "ssh:/tmp/titan2_brain.log"),
+            ("T3", "http://203.0.113.10:7778", "ssh:/tmp/titan3_brain.log"),
         ]
 
     print()
@@ -15115,8 +15115,8 @@ def run_meta_audit_diagnostics(all_titans: bool = True):
 
     titans = [
         ("T1", "http://127.0.0.1:7777"),
-        ("T2", "http://10.135.0.6:7777"),
-        ("T3", "http://10.135.0.6:7778"),
+        ("T2", "http://203.0.113.10:7777"),
+        ("T3", "http://203.0.113.10:7778"),
     ] if all_titans else [("T1", "http://127.0.0.1:7777")]
 
     print()
@@ -15252,8 +15252,8 @@ def run_metabolism_gates(all_titans: bool = False, json_mode: bool = False):
 
     titans = [
         ("T1", "http://127.0.0.1:7777"),
-        ("T2", "http://10.135.0.6:7777"),
-        ("T3", "http://10.135.0.6:7778"),
+        ("T2", "http://203.0.113.10:7777"),
+        ("T3", "http://203.0.113.10:7778"),
     ] if all_titans else [("T1", "http://127.0.0.1:7777")]
 
     payloads: dict[str, dict] = {}
@@ -15327,8 +15327,8 @@ def run_cgn_telemetry(all_titans: bool = True):
 
     titans = [
         ("T1", "http://127.0.0.1:7777"),
-        ("T2", "http://10.135.0.6:7777"),
-        ("T3", "http://10.135.0.6:7778"),
+        ("T2", "http://203.0.113.10:7777"),
+        ("T3", "http://203.0.113.10:7778"),
     ] if all_titans else [("T1", "http://127.0.0.1:7777")]
 
     print()
@@ -15483,8 +15483,8 @@ def run_cgn_reasoning_strategies(all_titans: bool = False):
 
     titans = [
         ("T1", "http://127.0.0.1:7777"),
-        ("T2", "http://10.135.0.6:7777"),
-        ("T3", "http://10.135.0.6:7778"),
+        ("T2", "http://203.0.113.10:7777"),
+        ("T3", "http://203.0.113.10:7778"),
     ] if all_titans else [("T1", "http://127.0.0.1:7777")]
 
     print()
@@ -15583,8 +15583,8 @@ def run_sensors_diagnostics(all_titans: bool = True):
 
     titans = [
         ("T1", "http://127.0.0.1:7777"),
-        ("T2", "http://10.135.0.6:7777"),
-        ("T3", "http://10.135.0.6:7778"),
+        ("T2", "http://203.0.113.10:7777"),
+        ("T3", "http://203.0.113.10:7778"),
     ] if all_titans else [("T1", "http://127.0.0.1:7777")]
 
     print()
@@ -15756,7 +15756,7 @@ def run_api_status(all_titans: bool = False) -> int:
 
     titans = [("T1", "127.0.0.1", 7777)]
     if all_titans:
-        titans += [("T2", "10.135.0.6", 7777), ("T3", "10.135.0.6", 7778)]
+        titans += [("T2", "203.0.113.10", 7777), ("T3", "203.0.113.10", 7778)]
 
     print()
     print("MICROKERNEL v2 — API SUBPROCESS STATUS (per Titan)")
@@ -15960,7 +15960,7 @@ def run_module_methods(all_titans: bool = False) -> int:
     """
     titans = [("T1", "127.0.0.1", 7777)]
     if all_titans:
-        titans += [("T2", "10.135.0.6", 7777), ("T3", "10.135.0.6", 7778)]
+        titans += [("T2", "203.0.113.10", 7777), ("T3", "203.0.113.10", 7778)]
 
     print()
     print("MICROKERNEL v2 — MODULE start_method AUDIT (per Titan)")

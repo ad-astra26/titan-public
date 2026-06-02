@@ -6,8 +6,8 @@ cycle (typically the arweave_backup.py 04:07 UTC cron run). Posts ONCE
 per UTC day with two on-chain URLs in the body and a procedurally-rendered
 receipt card image:
 
-  Archive:  iamtitan.tech/ar/{arweave_tx_sig}        (Arweave artifact)
-  Seal:     iamtitan.tech/tx/{zk_vault_snapshot_sig} (ZK Vault commitment)
+  Archive:  example.com/ar/{arweave_tx_sig}        (Arweave artifact)
+  Seal:     example.com/tx/{zk_vault_snapshot_sig} (ZK Vault commitment)
 
 PROOF_DAY bypasses both the hourly rate-limit and the felt-state pool —
 it is a must-post slot. 3× retry over 6 h on failure; never silent-skip.
@@ -255,8 +255,8 @@ class ProofDayArchetype(ArchetypeBase):
         zk_vault_tx = vault.get("tx_sig", "") or ""
         arweave_tx = arweave.get("tx_id", "") or ""
 
-        archive_url = f"iamtitan.tech/ar/{arweave_tx}" if arweave_tx else ""
-        seal_url = f"iamtitan.tech/tx/{zk_vault_tx}" if zk_vault_tx else f"iamtitan.tech/tx/{sol_memo_tx}"
+        archive_url = f"example.com/ar/{arweave_tx}" if arweave_tx else ""
+        seal_url = f"example.com/tx/{zk_vault_tx}" if zk_vault_tx else f"example.com/tx/{sol_memo_tx}"
 
         # rFP §4.2.5 — proof_of_existence layer values
         layer_values = {

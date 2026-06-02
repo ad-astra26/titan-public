@@ -28,7 +28,7 @@ from titan_hcl.logic.backup_crypto import (
 )
 
 
-TITAN_PUBKEY = "J1cdk4f1qZWTV1j8MSWAkPJ6Nqg63AXBn8d5JbaGLNoG"
+TITAN_PUBKEY = "YOUR_TITAN_PUBKEY"
 
 
 def _make_tarball(path: str, payload: bytes = b"sovereign state v1") -> str:

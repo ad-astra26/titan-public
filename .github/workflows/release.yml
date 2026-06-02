@@ -142,5 +142,5 @@ jobs:
 
   # NOTE: the Observatory bundle is DELIBERATELY NOT built/released (2026-05-30,
   # Maker). The full Observatory lives ONLY in the private titan-dev repo (powers
-  # iamtitan.tech). The public repo ships TC² (titan-console) as the sole UI — its
+  # example.com). The public repo ships TC² (titan-console) as the sole UI — its
   # SPA dist/ is committed, so it needs no release-time build.

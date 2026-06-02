@@ -160,7 +160,7 @@ def get_genesis_nft_attributes(
     return {
         "titan_name": titan_name,
         "birth_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "maker_pubkey": "8LBHvVcskwpDJsDEVYMhNCRMDi3NV4eHnynhLUo5XrrS",
+        "maker_pubkey": "YOUR_DEPLOYER_PUBKEY",
         "prime_directives_hash": directive_hash,
         "birth_dna_hash": dna_hash,
         "architecture_version": "v4-132D",

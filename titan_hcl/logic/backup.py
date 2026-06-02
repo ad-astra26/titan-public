@@ -825,7 +825,7 @@ class RebirthBackup:
                     )
                     # rFP_x_voice_enrichment §4.3.1 — PROOF_DAY needs the
                     # ZK Vault snapshot signature to render the "Seal" URL
-                    # (iamtitan.tech/tx/{sig}). Persist alongside the
+                    # (example.com/tx/{sig}). Persist alongside the
                     # backup_anchor_chain so the archetype can read the
                     # most-recent vault commit on demand.
                     self._persist_vault_snapshot(
@@ -1590,7 +1590,7 @@ class RebirthBackup:
     # Telegram Alerts — Notify Maker on backup events
     # -------------------------------------------------------------------------
     _TELEGRAM_BOT_TOKEN = "8531091229:AAElGsqbsLDvDfxaCwMwG1qGdBzyVlksI0c"
-    _TELEGRAM_CHAT_ID = "6345894322"
+    _TELEGRAM_CHAT_ID = "0"
 
     def _send_telegram_alert(self, message: str):
         """Send backup alert to Maker via Telegram. Non-blocking, fire-and-forget.

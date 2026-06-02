@@ -106,8 +106,8 @@ pub struct Cli {
     /// Phase C C-S7 (2026-05-05): added `env = "TITAN_DAEMON_BINARY_DIR"`
     /// so the systemd unit / kernel-rs spawn pipeline can override the
     /// /usr/local/bin default without per-Titan symlinks. Per Titan can
-    /// have its own bin/ (T1: /home/antigravity/projects/titan/bin/,
-    /// T3: /home/antigravity/projects/titan3/bin/) and the env var
+    /// have its own bin/ (T1: /home/youruser/projects/titan/bin/,
+    /// T3: /home/youruser/projects/titan3/bin/) and the env var
     /// flows kernel → substrate → unified-spirit unchanged.
     #[arg(
         long,

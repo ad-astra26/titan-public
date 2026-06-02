@@ -422,7 +422,7 @@ class TestPhotonClient:
 
         # Use a real devnet pubkey — may return empty list
         result = await client.fetch_compressed_accounts_by_owner(
-            "8LBHvVcskwpDJsDEVYMhNCRMDi3NV4eHnynhLUo5XrrS"
+            "YOUR_DEPLOYER_PUBKEY"
         )
         assert isinstance(result, list)
 

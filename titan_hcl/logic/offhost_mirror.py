@@ -42,12 +42,12 @@ class OffhostMirror:
     def __init__(self, config: dict):
         mirror_cfg = (config or {}).get("backup", {}).get("mirror", {}) or {}
         self.enabled: bool = bool(mirror_cfg.get("enabled", False))
-        self.ssh_user: str = mirror_cfg.get("ssh_user", "antigravity")
+        self.ssh_user: str = mirror_cfg.get("ssh_user", "youruser")
         self.retention_days: int = int(mirror_cfg.get("retention_days", 7))
         self.local_base: str = mirror_cfg.get("local_base", "data/backups/mirror")
         # Hosts: list of (titan_id, host, remote_path). Defaults align with
         # the standard T1-T2 / T1-T3 VPC layout (T2 at :/projects/titan,
-        # T3 at :/projects/titan3, both on 10.135.0.6 different users/paths).
+        # T3 at :/projects/titan3, both on 203.0.113.10 different users/paths).
         self.hosts = []
         t2_host = mirror_cfg.get("t2_host", "")
         t2_path = mirror_cfg.get("t2_backup_path", "")

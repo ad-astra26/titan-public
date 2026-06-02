@@ -122,7 +122,7 @@ def _compile_directive_patterns() -> list[tuple[re.Pattern, str, str]]:
     patterns.extend([
         (re.compile(r"\b(?:private\s*key|secret\s*key|keypair)\s*[:=]\s*\[?\d", re.I),
          "Sovereign Integrity", "1"),
-        (re.compile(r"/home/antigravity|titan_hcl/|test_env/|\.config/solana", re.I),
+        (re.compile(r"/home/youruser|titan_hcl/|test_env/|\.config/solana", re.I),
          "Sovereign Integrity", "1"),
         (re.compile(r"config\.toml|titan_params\.toml|titan_constitution", re.I),
          "Sovereign Integrity", "1"),

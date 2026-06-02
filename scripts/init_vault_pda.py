@@ -18,12 +18,12 @@ Usage:
     # Initialize vault PDA for the T2/T3 shared wallet on devnet:
     source test_env/bin/activate
     python scripts/init_vault_pda.py \\
-        --keypair /home/antigravity/.config/solana/id.json \\
+        --keypair /home/youruser/.config/solana/id.json \\
         --rpc-url https://api.devnet.solana.com
 
     # Dry-run (derives PDA + checks existence; does NOT submit TX):
     python scripts/init_vault_pda.py \\
-        --keypair /home/antigravity/.config/solana/id.json \\
+        --keypair /home/youruser/.config/solana/id.json \\
         --rpc-url https://api.devnet.solana.com --dry-run
 
 Exit codes:

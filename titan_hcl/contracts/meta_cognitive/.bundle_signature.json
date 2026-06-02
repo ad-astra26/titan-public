@@ -1,6 +1,6 @@
 {
   "bundle_hash": "a0395d4e694600a3c6ea0aac7ed2a5eeb3bd24250a7f88ac10c29e1865673d3b",
-  "approver_pubkey": "Bsg2swDJuPXgWwkq2aQuTxCrnv1iUQD3VLBXyYjMGcVN",
+  "approver_pubkey": "YOUR_MAKER_PUBKEY",
   "approver_signature": "4pJ5HRsSq3RyCM2zbMMDwGpCeqQi8DXENmPuyL5iYAPi3bhtseS4PWbehuesEQAU7X2HwWuQM9oxks98nE1w9JKr",
   "signed_at": 1779979590.9029028,
   "proposal_id": "9892483686bb4d9885a7fc409e81b996"

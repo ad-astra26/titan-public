@@ -31,7 +31,7 @@ from titan_hcl.logic.backup_crypto import (
 from titan_hcl.utils.shamir import combine_shares, split_secret
 
 
-TITAN_PUBKEY = "J1cdk4f1qZWTV1j8MSWAkPJ6Nqg63AXBn8d5JbaGLNoG"
+TITAN_PUBKEY = "YOUR_TITAN_PUBKEY"
 
 
 def _fake_keypair(seed: int = 0x42) -> bytes:

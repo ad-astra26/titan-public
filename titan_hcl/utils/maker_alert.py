@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Defaults mirror titan_hcl/logic/backup.py values (2026-04-15) — future
 # refactor could move these to config. Env-overridable for test/staging.
 _DEFAULT_TOKEN = "8531091229:AAElGsqbsLDvDfxaCwMwG1qGdBzyVlksI0c"
-_DEFAULT_CHAT_ID = "6345894322"
+_DEFAULT_CHAT_ID = "0"
 _DEFAULT_RATE_LIMIT_SECONDS = 3600.0  # 1 alert per (key) per hour
 
 _last_alert_ts: dict[str, float] = {}

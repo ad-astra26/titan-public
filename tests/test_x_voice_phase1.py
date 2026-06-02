@@ -552,8 +552,8 @@ def test_proof_day_t1_only(empty_social_x_db, tmp_path, monkeypatch):
     assert cand is not None
     assert cand.bypass_spacing is True
     assert cand.bypass_rate_limit is True
-    assert "iamtitan.tech/ar/AR_TX_BBBB" == cand.prompt_values["ar_url"]
-    assert "iamtitan.tech/tx/ZK_TX_CCCC" == cand.prompt_values["tx_url"]
+    assert "example.com/ar/AR_TX_BBBB" == cand.prompt_values["ar_url"]
+    assert "example.com/tx/ZK_TX_CCCC" == cand.prompt_values["tx_url"]
 
 
 def test_proof_day_idempotent_one_per_utc_day(empty_social_x_db, tmp_path,

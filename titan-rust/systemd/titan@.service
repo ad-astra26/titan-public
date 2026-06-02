@@ -19,19 +19,19 @@
 [Unit]
 Description=Titan Microkernel v2 (Phase C — Rust L0) — Titan %i
 After=network.target
-ConditionPathExists=/home/antigravity/projects/titan/data/titan_identity_keypair.json
+ConditionPathExists=/home/youruser/projects/titan/data/titan_identity_keypair.json
 
 [Service]
 Type=simple
-User=antigravity
-WorkingDirectory=/home/antigravity/projects/titan
-EnvironmentFile=-/home/antigravity/projects/titan/.titan_env
+User=youruser
+WorkingDirectory=/home/youruser/projects/titan
+EnvironmentFile=-/home/youruser/projects/titan/.titan_env
 Environment=MALLOC_ARENA_MAX=2
 Environment=TITAN_KERNEL_LOG_LEVEL=info
 
 # The kernel binary ships to bin/ via deploy_t2.sh --include-rust-binaries.
 # Kernel locates the substrate placeholder as a sibling of its own exe.
-ExecStart=/home/antigravity/projects/titan/bin/titan-kernel-rs --titan-id %i
+ExecStart=/home/youruser/projects/titan/bin/titan-kernel-rs --titan-id %i
 
 # Graceful: kernel SIGTERM → 10s window per SPEC §18.4 +
 # KERNEL_SHUTDOWN_GRACE_S; daemons + workers cascade (3s + 5s); systemd

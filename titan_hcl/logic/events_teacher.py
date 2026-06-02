@@ -854,7 +854,7 @@ class EventsTeacher:
 
         api_key = self._get_api_key(config)
         handle = config.get("social_x", {}).get(
-            "user_name", config.get("twitter_social", {}).get("user_name", "iamtitanai"))
+            "user_name", config.get("twitter_social", {}).get("user_name", "your_x_handle"))
         if not api_key:
             return 0
 
@@ -1017,7 +1017,7 @@ class EventsTeacher:
         affinity rows yet (typical for T2/T3 which haven't accumulated
         engagement-driven affinity), fall back to community_registry
         rows where is_following=1. All three Titans post from the SAME
-        @iamtitanai account, so the local community_registry on each VPS
+        @your_x_handle account, so the local community_registry on each VPS
         is populated daily via _ensure_community_synced with the same
         Maker-curated following list. This lets T2/T3 immediately see the
         same curated AI/NN/RL voices T1 sees, instead of returning empty.
@@ -1037,7 +1037,7 @@ class EventsTeacher:
                 (self._titan_id, count)
             ).fetchall()
             if not rows:
-                # Fallback: community_registry following list (shared via @iamtitanai)
+                # Fallback: community_registry following list (shared via @your_x_handle)
                 rows = conn.execute(
                     "SELECT user_name as handle, "
                     "       1.0 as affinity, "
@@ -1477,7 +1477,7 @@ class EventsTeacher:
         archetype_pool_scores rows for low-engagement posts stayed at
         score=0 forever (pending), starving the rolling-7 and
         anti-starvation paths in select_pool. count bumped 5→15 so a
-        4 h-throttled engagement check still covers ~10 h of @iamtitanai
+        4 h-throttled engagement check still covers ~10 h of @your_x_handle
         post-rate (~1.5 posts/h), eliminating the gap where archetype
         posts time out between checks before any snapshot is taken.
         """
@@ -1503,7 +1503,7 @@ class EventsTeacher:
 
         api_key = self._get_api_key(config)
         handle = config.get("social_x", {}).get(
-            "user_name", config.get("twitter_social", {}).get("user_name", "iamtitanai"))
+            "user_name", config.get("twitter_social", {}).get("user_name", "your_x_handle"))
         if not api_key:
             return [], 0
 

@@ -5,7 +5,7 @@ created_at ∈ [2d, 7d] ORDER BY relevance DESC` and returned the FIRST
 non-cited row. With a narrow window, a high relevance floor, and a
 deterministic pick, two Titans (T1 + T3) reading the same shared X
 content kept converging on the same author (@jkacrpto) — surfacing as
-near-duplicate posts on @iamtitanai on 2026-05-23.
+near-duplicate posts on @your_x_handle on 2026-05-23.
 
 The fix widens the window (1-30d), lowers the floor (0.5), penalizes
 already-cited authors, boosts grounded-words matches, and samples

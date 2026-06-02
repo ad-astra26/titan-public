@@ -68,7 +68,7 @@ def policy(tmp_data_dir):
 
 @pytest.fixture
 def peers():
-    return {"t1": "http://10.0.0.1:7777", "t2": "http://10.0.0.2:7777"}
+    return {"t1": "http://203.0.113.10:7777", "t2": "http://203.0.113.10:7777"}
 
 
 @pytest.fixture
