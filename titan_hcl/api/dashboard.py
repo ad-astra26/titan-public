@@ -4699,10 +4699,34 @@ _RESTART_MODULE_ALLOWLIST = {
     #   in D-SPEC-116 (module_catalog.py:690); no ModuleSpec(name="spirit") exists, so
     #   restart-module spirit would fail at the guardian. Role moved to synthesis_worker
     #   + outer_interface_worker. (AUDIT §(D).)
-    # HELD (not yet promoted): "media" — audit reload_ok but FAILs `arch_map persistence`
-    #   (eager-durable-write false-positive); promote in §P4 once the runtime
-    #   save→respawn→diff confirms. social/expression/cognitive stay OUT until §P2
-    #   persistence fixes land (NOT_READY per audit — total-loss on restart today).
+    # ── §P4 promotions — the 18 §P2-fixed NOT_READY modules + media ───────────
+    # PROVISIONAL: added to enable + confirm the §11.H.9 runtime E2E
+    # (verify_hot_reload_persistence.py) on T3 devnet BEFORE the mainnet cascade.
+    # Each module's persistence fix is in titan-v6 (commits 2b726789→a08ed9ac);
+    # restart-module (kill-respawn) is safe for all (boots fresh from disk with
+    # the now-working save/load). _RELOAD membership for the light ones is a
+    # follow-up after a reload-method E2E. synthesis/agno already above.
+    "agency_worker",                  # §P2: MODULE_SHUTDOWN flush of batched action history
+    "body",                           # §P2: persist severity_multipliers + focus_nudges
+    "mind",                           # §P2: persist severity_multipliers + focus_nudges
+    "cognitive_worker",               # §P2: save_state→save_all typo fix + MSL (heavy → restart-only)
+    "corrective_events_persistence",  # §P2: shared _route_write WriteResult fallback
+    "journey_persistence",            # §P2: shared _route_write WriteResult fallback
+    "expression_worker",              # §P2: save_edge_detector_state dict-not-instances NOP fix
+    "health_monitor",                 # §P2: restore last_result on boot
+    "meditation",                     # §P2: synchronous post-completion persist
+    "meta_teacher",                   # §P2: persist total_critiques/total_observed (heavy → restart-only)
+    "neuromod_module",                # §P2: persist activation_history in shallow get/restore
+    "ns_module",                      # §P2: ungate intuition save on shutdown
+    "observatory",                    # §P2: flush async writer at MODULE_SHUTDOWN
+    "outer_interface_worker",         # §P2: implement save_state + wire restore_state on boot
+    "output_verifier",                # §P2: persist verified_count
+    "recorder",                       # §P2: IQL NN checkpoint (heavy → restart-only)
+    "social_worker",                  # §P2: circuit-breaker vestigial-cleanup (state already durable)
+    "warning_monitor",                # §P2: add shutdown handler + persist rate_window/spike_alerts
+    "media",                          # §P1 held → §P4: audit reload_ok (eager-durable-write; scanner FP)
+    # REMOVED 2026-06-01 (§P3): "spirit" — DEAD ENTRY (spirit_worker_main RETIRED
+    #   D-SPEC-116; no ModuleSpec → restart would fail at guardian). (AUDIT §(D).)
 }
 
 
