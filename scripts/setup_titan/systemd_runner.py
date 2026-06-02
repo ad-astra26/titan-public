@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import getpass
 import json
+import re
 import subprocess
 import time
 import urllib.error
@@ -67,6 +68,45 @@ def keypair_path(install_root: Path) -> Path:
 
 def cleanup_script(install_root: Path) -> Path:
     return install_root / "scripts" / "titan_phase_c_cleanup.sh"
+
+
+def microkernel_override(titan_id: str) -> Path:
+    """Per-Titan runtime override read by the kernel (wins over config.toml base)."""
+    return Path.home() / ".titan" / f"microkernel_{titan_id}.toml"
+
+
+def ensure_l0_rust_override(titan_id: str) -> Result:
+    """Phase C: turn ON the Rust L0 compute path for this install.
+
+    setup_titan ALWAYS provisions the Rust binaries (release assets, or
+    `--build-rust`), so this is a genuine Phase C microkernel — `l0_rust_enabled`
+    MUST be true. Without it the kernel boots but the L0 drivers stay dark: IQL
+    reasoning never trains, and the dream/fatigue + trinity compute never run, so
+    the Titan never dreams or meditates. The config.toml base default stays `false`
+    (safe for a binary-less source checkout); the per-Titan override at
+    ~/.titan/microkernel_<id>.toml is the authoritative on-switch and wins.
+
+    Idempotent: flips an existing `false`, inserts under an existing
+    `[microkernel]`, or creates the file — never clobbers unrelated override keys.
+    """
+    ov = microkernel_override(titan_id)
+    ov.parent.mkdir(parents=True, exist_ok=True)
+    text = ov.read_text() if ov.exists() else ""
+    if re.search(r"(?m)^\s*l0_rust_enabled\s*=\s*true\b", text):
+        return Result("microkernel", "ok",
+                      f"{ov} → l0_rust_enabled=true (already set)")
+    if re.search(r"(?m)^\s*l0_rust_enabled\s*=", text):
+        text = re.sub(r"(?m)^(\s*l0_rust_enabled\s*=).*$",
+                      r"\1 true", text, count=1)
+    elif re.search(r"(?m)^\s*\[microkernel\]\s*$", text):
+        text = re.sub(r"(?m)^(\s*\[microkernel\]\s*)$",
+                      r"\1\nl0_rust_enabled = true", text, count=1)
+    else:
+        text = (text.rstrip() + "\n\n" if text.strip() else "") \
+            + "[microkernel]\nl0_rust_enabled = true\n"
+    ov.write_text(text)
+    return Result("microkernel", "ok",
+                  f"{ov} → l0_rust_enabled=true (Phase C L0 active)")
 
 
 # ── unit rendering ──────────────────────────────────────────────────────────
@@ -194,6 +234,11 @@ def run_systemd_phase(state: dict, install_root: Path, mode: Mode, *,
     # Make sure the cleanup script is executable (git preserves the bit, but a
     # zip-download of the release would not).
     cleanup_script(install_root).chmod(0o755)
+
+    # Phase C: enable the Rust L0 compute path BEFORE first start, else the kernel
+    # boots with L0 dark (no IQL training, no dreams/meditation). Always-on for a
+    # setup_titan install since it ships the Rust binaries.
+    results.append(ensure_l0_rust_override(titan_id))
 
     unit_text = render_unit(install_root=install_root, titan_id=titan_id, user=user)
     cprint(f"  Installing {UNIT_NAME} (Titan {titan_id}, user {user}) → {UNIT_DEST}",
