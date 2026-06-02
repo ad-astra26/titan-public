@@ -517,25 +517,34 @@ def test_archetype_base_cross_archetype_spacing(empty_social_x_db):
 # ─────────────────────────────────────────────────────────────────────
 
 def _proof_day_fixtures(work_dir: str, titan_id: str = "T1") -> None:
-    os.makedirs(os.path.join(work_dir, "data/timechain"), exist_ok=True)
+    """Write the SPEC §24.3 unified manifest proof_day reads.
+
+    Repointed 2026-05-29: proof_day's three sources now come from
+    `data/backup_unified_manifest_<id>.json`; the legacy
+    `backup_anchor_chain` / `arweave_manifest` / `zk_vault_snapshots`
+    files are no longer consulted (no legacy fallback), so the fixture
+    writes only the unified manifest.
+    """
+    os.makedirs(os.path.join(work_dir, "data"), exist_ok=True)
     ts = int(time.time())
-    with open(os.path.join(work_dir, f"data/backup_anchor_chain_{titan_id}.json"), "w") as f:
-        json.dump({"version": 1, "titan_id": titan_id, "anchors": [{
-            "backup_id": 0, "archive_hash": "a" * 64, "prev_anchor_hash": "",
-            "tx": "SOL_MEMO_TX_AAAA", "ts": ts, "backup_type": "personality+state",
-            "size_mb": 847.0,
-        }]}, f)
-    with open(os.path.join(work_dir, f"data/timechain/arweave_manifest_{titan_id}.json"), "w") as f:
-        json.dump({"snapshots": [{
-            "tx_id": "AR_TX_BBBB", "merkle_root": "merkleROOT",
-            "tarball_size_bytes": 800 * 1024 * 1024, "timestamp": ts,
-        }]}, f)
-    with open(os.path.join(work_dir, f"data/zk_vault_snapshots_{titan_id}.json"), "w") as f:
-        json.dump({"version": 1, "titan_id": titan_id, "snapshots": [{
-            "tx_sig": "ZK_TX_CCCC", "archive_hash": "a" * 64,
-            "memory_count": 1234, "sovereignty_bp": 8500,
-            "arweave_url": "", "ts": ts,
-        }] * 3}, f)
+    manifest = {
+        "titan_id": titan_id,
+        "events": [{
+            "ts_unix": ts,
+            "zk_commit_tx": "ZK_TX_CCCC",        # Solana v=2 memo / seal tx
+            "prev_event_id": "genesis",
+            "personality": {
+                "tx_id": "AR_TX_BBBB",           # Arweave artifact tx
+                "merkle_root": "a" * 64,
+                "size_bytes": 800 * 1024 * 1024,
+            },
+            "timechain": {"size_bytes": 40 * 1024 * 1024},
+            "soul": {"size_bytes": 7 * 1024 * 1024},
+        }],
+    }
+    with open(os.path.join(
+            work_dir, f"data/backup_unified_manifest_{titan_id}.json"), "w") as f:
+        json.dump(manifest, f)
 
 
 def test_proof_day_t1_only(empty_social_x_db, tmp_path, monkeypatch):
@@ -544,8 +553,13 @@ def test_proof_day_t1_only(empty_social_x_db, tmp_path, monkeypatch):
     _proof_day_fixtures(str(tmp_path), "T1")
 
     class _Ctx: pass
+    # i_confidence + consciousness_age must be warm — proof_day's cold-cache
+    # guard (2026-05-29) defers when either is 0 so it never broadcasts
+    # post-restart zeros publicly.
     ctx_t1 = _Ctx(); ctx_t1.titan_id = "T1"; ctx_t1.neuromods = {"DA": 0.7}; ctx_t1.emotion = "flow"
+    ctx_t1.i_confidence = 0.95; ctx_t1.consciousness_age = 1_102_815
     ctx_t2 = _Ctx(); ctx_t2.titan_id = "T2"; ctx_t2.neuromods = {"DA": 0.7}; ctx_t2.emotion = "flow"
+    ctx_t2.i_confidence = 0.95; ctx_t2.consciousness_age = 1_102_815
     arc = ProofDayArchetype(gateway=None, social_x_db_path=empty_social_x_db)
     assert arc.find_candidate(ctx_t2) is None       # T2 abstains
     cand = arc.find_candidate(ctx_t1)
@@ -565,6 +579,7 @@ def test_proof_day_idempotent_one_per_utc_day(empty_social_x_db, tmp_path,
 
     class _Ctx: pass
     ctx = _Ctx(); ctx.titan_id = "T1"; ctx.neuromods = {}; ctx.emotion = ""
+    ctx.i_confidence = 0.95; ctx.consciousness_age = 1_102_815  # warm (cold-cache guard)
     cand = arc.find_candidate(ctx)
     assert cand is not None
     sq = sqlite3.connect(empty_social_x_db)
@@ -633,7 +648,7 @@ def test_composed_thought_pair_dedup_order_insensitive(empty_social_x_db):
 # Dispatcher integration
 # ─────────────────────────────────────────────────────────────────────
 
-def test_dispatcher_constructs_all_nine(empty_social_x_db, tmp_path):
+def test_dispatcher_constructs_all_ten(empty_social_x_db, tmp_path):
     from titan_hcl.logic.social_x.dispatcher import (
         ArchetypeDispatcher, PRIORITY_ORDER,
     )
@@ -646,7 +661,7 @@ def test_dispatcher_constructs_all_nine(empty_social_x_db, tmp_path):
         experience_db=str(tmp_path / "exp.db"),
         meta_wisdom_db=str(tmp_path / "mw.db"),
     )
-    assert len(d.archetypes) == 9
+    assert len(d.archetypes) == 10   # +amplify (10th archetype)
     assert set(d.archetypes.keys()) == set(PRIORITY_ORDER)
 
 
@@ -689,7 +704,9 @@ def test_archetype_probe_runs_before_catalyst_map(tmp_path, monkeypatch):
                       emotion="neutral",
                       neuromods={"DA": 0.5, "5HT": 0.5, "NE": 0.5,
                                   "ACh": 0.5, "GABA": 0.5,
-                                  "Endorphin": 0.5})
+                                  "Endorphin": 0.5},
+                      # Warm self-state so proof_day's cold-cache guard fires.
+                      i_confidence=0.95, consciousness_age=1_102_815)
     # Even with a `eureka` catalyst (which would normally route to
     # eureka_thread), PROOF_DAY's must-post slot wins.
     pt = g._select_post_type({"type": "eureka"}, ctx)

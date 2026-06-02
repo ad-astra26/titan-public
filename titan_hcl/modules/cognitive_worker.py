@@ -1970,38 +1970,19 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
             "[CognitiveWorker] ReasoningInterpreter init failed: %s",
             _ri_err)
 
-    # ── MeditationWatchdog (cadence + alerts) ──
-    try:
-        from titan_hcl.logic.meditation_watchdog import MeditationWatchdog
-        _med_cfg = _load_toml_section("meditation_watchdog") or {}
-        # MeditationWatchdog.__init__ takes titan_id (required) + individual
-        # kwargs — NOT a `config=` dict. The old call passed a nonexistent
-        # `config=` kwarg AND omitted the required titan_id → init ALWAYS raised
-        # "missing 1 required positional argument: 'titan_id'". titan_id is NOT
-        # in this function's scope (_init_cognitive_engines) — resolve it from
-        # config the same way the worker boot + MetaReasoningEngine init do.
-        from titan_hcl.core.state_registry import resolve_titan_id as _resolve_tid_med
-        _med_titan_id = (
-            (config.get("info_banner", {}) or {}).get("titan_id")
-            or _resolve_tid_med())
-        med_watchdog = MeditationWatchdog(
-            titan_id=_med_titan_id,
-            bootstrap_hours=float(_med_cfg.get("watchdog_bootstrap_hours", 12.0)),
-            min_alert_hours=float(_med_cfg.get("watchdog_min_alert_hours", 3.0)),
-            gap_window=int(_med_cfg.get("watchdog_gap_window", 50)),
-            stuck_threshold_seconds=float(
-                _med_cfg.get("watchdog_stuck_threshold_seconds", 600.0)),
-            backup_lag_threshold=int(
-                _med_cfg.get("watchdog_backup_lag_threshold", 2)),
-            zero_promoted_streak_threshold=int(
-                _med_cfg.get("watchdog_zero_promoted_streak_threshold", 3)),
-        )
-        logger.info(
-            "[CognitiveWorker] MeditationWatchdog booted (titan_id=%s)",
-            getattr(med_watchdog, "titan_id", "?"))
-    except Exception as _mw_err:
-        logger.warning(
-            "[CognitiveWorker] MeditationWatchdog init failed: %s", _mw_err)
+    # ── MeditationWatchdog — NOT owned here. ──
+    # The MeditationWatchdog is constructed + checked by its canonical owner,
+    # meditation_worker (which holds the `_meditation_tracker` + calls
+    # `watchdog.check(tracker_view, now, backup_state_count=...)` at cadence).
+    # cognitive_worker has NO meditation tracker, so a watchdog here could never
+    # function: the old construction raised (`config=` kwarg + missing titan_id),
+    # and the per-epoch check driver below called `check()` with no args — both
+    # latent-dead, masked only because the construction always failed → None.
+    # Leave med_watchdog = None (set above); the check driver is None-guarded and
+    # cleanly no-ops. Meditation cadence/alerts remain fully live in meditation_worker.
+    # (Merge 2026-06-02: titan-v6 c7a9602a removal supersedes the f1038bd5 titan_id
+    # construction my reconcile carried — MeditationWatchdog is meditation_worker's.)
+    med_watchdog = None
 
     # ── Meta-Reasoning Foundation (M1-M3) ──
     # 2026-05-10: post-deploy follow-up to the pre-D8 ownership audit.
