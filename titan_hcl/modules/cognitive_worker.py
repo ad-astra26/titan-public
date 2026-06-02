@@ -1973,9 +1973,24 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
     # ── MeditationWatchdog (cadence + alerts) ──
     try:
         from titan_hcl.logic.meditation_watchdog import MeditationWatchdog
-        _med_cfg = _load_toml_section("meditation_watchdog")
-        med_watchdog = MeditationWatchdog(config=_med_cfg) if _med_cfg else (
-            MeditationWatchdog())
+        _med_cfg = _load_toml_section("meditation_watchdog") or {}
+        # MeditationWatchdog.__init__ takes titan_id (required) + individual
+        # kwargs — NOT a `config=` dict. The old call passed a nonexistent
+        # `config=` kwarg AND omitted the required titan_id → init ALWAYS raised
+        # "missing 1 required positional argument: 'titan_id'". Map the toml
+        # section to the real kwargs (mirrors meditation_worker's construction).
+        med_watchdog = MeditationWatchdog(
+            titan_id=titan_id,
+            bootstrap_hours=float(_med_cfg.get("watchdog_bootstrap_hours", 12.0)),
+            min_alert_hours=float(_med_cfg.get("watchdog_min_alert_hours", 3.0)),
+            gap_window=int(_med_cfg.get("watchdog_gap_window", 50)),
+            stuck_threshold_seconds=float(
+                _med_cfg.get("watchdog_stuck_threshold_seconds", 600.0)),
+            backup_lag_threshold=int(
+                _med_cfg.get("watchdog_backup_lag_threshold", 2)),
+            zero_promoted_streak_threshold=int(
+                _med_cfg.get("watchdog_zero_promoted_streak_threshold", 3)),
+        )
         logger.info(
             "[CognitiveWorker] MeditationWatchdog booted (titan_id=%s)",
             getattr(med_watchdog, "titan_id", "?"))
