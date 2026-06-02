@@ -1662,7 +1662,12 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                         return None
                     return json.loads(text[start:end + 1])
                 except Exception as e:
-                    logger.debug("[synthesis_worker] miner_llm_propose failed: %s", e)
+                    # Error-visibility: a silent proposer failure = 0 skills with
+                    # no journal trace. Surface it (the recurrent clusters are
+                    # real; only the abstraction is failing).
+                    logger.warning(
+                        "[synthesis_worker] miner_llm_propose failed: %s", e,
+                        exc_info=True)
                     return None
 
             def _miner_bus_emit(ev: str, payload: dict) -> None:
