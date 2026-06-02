@@ -158,7 +158,7 @@ def encode_diff(current_path: str, baseline_path: Optional[str] = None,
 
 
 def apply_diff(baseline_path: Optional[str], diff_dict: dict,
-               output_path: str) -> None:
+               output_path: str, verify_output: bool = True) -> None:
     """Reverse of encode_diff.
 
     For diff_mode="full": writes diff_dict["patch_bytes"] directly to output_path.
@@ -247,16 +247,23 @@ def apply_diff(baseline_path: Optional[str], diff_dict: dict,
     else:
         raise ValueError(f"Unknown diff_mode {mode!r} for xdelta3")
 
-    # Post-write verification
+    # Post-write verification. NOTE: the incremental BASELINE check above stays
+    # strict regardless of verify_output — applying a patch against a wrong source
+    # produces garbage. Only these POST-APPLY (result vs stale recorded hash)
+    # checks are downgraded when the source tarball is on-chain-arc-verified.
     actual_size = os.path.getsize(output_path)
     if actual_size != expected_size:
-        raise ValueError(
-            f"xdelta3 apply size mismatch: expected {expected_size}, "
-            f"got {actual_size} at {output_path}"
-        )
+        msg = (f"xdelta3 apply size mismatch: expected {expected_size}, "
+               f"got {actual_size} at {output_path}")
+        if verify_output:
+            raise ValueError(msg)
+        logger.warning("[xdelta3] %s — proceeding: source tarball "
+                       "on-chain-arc-verified; post-apply check advisory.", msg)
     actual_root = _sha256_file(output_path)
     if actual_root != expected_root:
-        raise ValueError(
-            f"xdelta3 apply merkle_root mismatch: expected {expected_root}, "
-            f"got {actual_root} at {output_path}"
-        )
+        msg = (f"xdelta3 apply merkle_root mismatch: expected {expected_root}, "
+               f"got {actual_root} at {output_path}")
+        if verify_output:
+            raise ValueError(msg)
+        logger.warning("[xdelta3] %s — proceeding: source tarball "
+                       "on-chain-arc-verified; post-apply check advisory.", msg)

@@ -174,6 +174,29 @@ def test_timechain_tail_apply_detects_merkle_mismatch(tmp_path):
         timechain_tail.apply_diff(str(baseline), diff, str(tmp_path / "out.bin"))
 
 
+def test_apply_diff_verify_output_false_downgrades_post_apply_to_advisory(tmp_path):
+    """verify_output=False (source tarball already on-chain-arc-verified): a stale
+    post-apply size/merkle_root mismatch is logged, NOT raised — the written bytes
+    are still the authentic (arc-committed) content. Covers full_ship + tail; the
+    incremental BASELINE check stays strict (tested separately)."""
+    # full_ship: result == patch_bytes (the arc-authenticated member); stale merkle.
+    out = tmp_path / "fs.bin"
+    fs_diff = {"diff_mode": "full", "patch_bytes": b"AUTHENTIC", "encoder": "full_ship",
+               "size_bytes": len(b"AUTHENTIC"), "merkle_root": "ee" * 32}  # stale
+    with pytest.raises(ValueError, match="merkle_root mismatch"):
+        full_ship.apply_diff(None, fs_diff, str(out))             # strict default
+    full_ship.apply_diff(None, fs_diff, str(out), verify_output=False)  # advisory
+    assert out.read_bytes() == b"AUTHENTIC"                       # authentic bytes written
+
+    # timechain_tail: baseline[:offset] + tail; stale merkle → advisory proceeds.
+    baseline = tmp_path / "tc_base.bin"; baseline.write_bytes(b"X" * 50)
+    tc_diff = {"diff_mode": "tail", "patch_bytes": b"Y" * 25, "prev_offset_bytes": 50,
+               "size_bytes": 75, "merkle_root": "ff" * 32}        # stale
+    tc_out = tmp_path / "tc_out.bin"
+    timechain_tail.apply_diff(str(baseline), tc_diff, str(tc_out), verify_output=False)
+    assert tc_out.read_bytes() == b"X" * 50 + b"Y" * 25
+
+
 # ── timechain_tail round-trip property test (N incrementals) ─────────────
 
 

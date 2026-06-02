@@ -414,6 +414,7 @@ def apply_event_components(
                         baseline_path=baseline_path,
                         diff_dict=diff_dict,
                         output_path=scratch_path,
+                        verify_output=verify_patch_hash,
                     )
                     os.replace(scratch_path, target_path)
                 except Exception as e:

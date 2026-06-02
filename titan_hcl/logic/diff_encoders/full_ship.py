@@ -288,7 +288,7 @@ def encode_diff(current_path: str, baseline_path: Optional[str] = None,
 
 
 def apply_diff(baseline_path: Optional[str], diff_dict: dict,
-               output_path: str) -> None:
+               output_path: str, verify_output: bool = True) -> None:
     """Write the full content + verify.
 
     Accepts either `patch_bytes` (restore-side path: tarball member extracted
@@ -316,13 +316,17 @@ def apply_diff(baseline_path: Optional[str], diff_dict: dict,
     expected_size = diff_dict["size_bytes"]
     actual_size = os.path.getsize(output_path)
     if actual_size != expected_size:
-        raise ValueError(
-            f"full_ship apply size mismatch: expected {expected_size}, "
-            f"got {actual_size} at {output_path}"
-        )
+        msg = (f"full_ship apply size mismatch: expected {expected_size}, "
+               f"got {actual_size} at {output_path}")
+        if verify_output:
+            raise ValueError(msg)
+        logger.warning("[full_ship] %s — proceeding: source tarball "
+                       "on-chain-arc-verified; post-apply check advisory.", msg)
     actual_root = _sha256_file(output_path)
     if actual_root != diff_dict["merkle_root"]:
-        raise ValueError(
-            f"full_ship apply merkle_root mismatch: expected "
-            f"{diff_dict['merkle_root']}, got {actual_root} at {output_path}"
-        )
+        msg = (f"full_ship apply merkle_root mismatch: expected "
+               f"{diff_dict['merkle_root']}, got {actual_root} at {output_path}")
+        if verify_output:
+            raise ValueError(msg)
+        logger.warning("[full_ship] %s — proceeding: source tarball "
+                       "on-chain-arc-verified; post-apply check advisory.", msg)

@@ -126,8 +126,17 @@ def encode_diff(current_path: str, baseline_path: Optional[str] = None,
 
 
 def apply_diff(baseline_path: Optional[str], diff_dict: dict,
-               output_path: str) -> None:
-    """Top-level dispatch: pick encoder + delegate the apply step."""
+               output_path: str, verify_output: bool = True) -> None:
+    """Top-level dispatch: pick encoder + delegate the apply step.
+
+    `verify_output=False` downgrades the POST-APPLY size/merkle_root checks to a
+    logged warning instead of raising — safe ONLY for a caller that already
+    authenticated the source tarball against its on-chain arc (the sovereign
+    restore, INV-MBR-4/12). The result is then the on-chain-committed bytes;
+    the post-apply hashes are redundant, and STALE for pre-ed5f4d0c baselines.
+    The incremental BASELINE check (does the on-disk source match what the patch
+    expects) stays strict regardless — applying against a wrong source would
+    produce garbage, so it is never downgraded."""
     encoder_name = diff_dict.get("encoder")
     if encoder_name not in ENCODERS:
         raise ValueError(
@@ -135,7 +144,8 @@ def apply_diff(baseline_path: Optional[str], diff_dict: dict,
             f"{list(ENCODERS)}"
         )
     encoder = ENCODERS[encoder_name]
-    encoder.apply_diff(baseline_path, diff_dict, output_path)
+    encoder.apply_diff(baseline_path, diff_dict, output_path,
+                       verify_output=verify_output)
 
 
 def verify(current_path: str, expected_merkle_root: str) -> bool:

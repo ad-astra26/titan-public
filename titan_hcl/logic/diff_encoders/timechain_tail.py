@@ -36,9 +36,12 @@ member at extract time).
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import tempfile
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 def _sha256_file(path: str) -> str:
@@ -155,7 +158,7 @@ def encode_diff(current_path: str, baseline_path: Optional[str] = None,
 
 
 def apply_diff(baseline_path: Optional[str], diff_dict: dict,
-               output_path: str) -> None:
+               output_path: str, verify_output: bool = True) -> None:
     """Reverse of encode_diff.
 
     For diff_mode="full": writes diff_dict["patch_bytes"] directly to output_path.
@@ -211,16 +214,22 @@ def apply_diff(baseline_path: Optional[str], diff_dict: dict,
     else:
         raise ValueError(f"Unknown diff_mode {mode!r} for timechain_tail")
 
-    # Post-write verification
+    # Post-write verification. The 'tail' baseline dependency above is load-bearing
+    # (a wrong baseline corrupts the append) and stays strict; only these POST-APPLY
+    # checks are downgraded when the source tarball is on-chain-arc-verified.
     actual_size = os.path.getsize(output_path)
     if actual_size != expected_size:
-        raise ValueError(
-            f"timechain_tail apply size mismatch: expected {expected_size}, "
-            f"got {actual_size} at {output_path}"
-        )
+        msg = (f"timechain_tail apply size mismatch: expected {expected_size}, "
+               f"got {actual_size} at {output_path}")
+        if verify_output:
+            raise ValueError(msg)
+        logger.warning("[timechain_tail] %s — proceeding: source tarball "
+                       "on-chain-arc-verified; post-apply check advisory.", msg)
     actual_root = _sha256_file(output_path)
     if actual_root != expected_root:
-        raise ValueError(
-            f"timechain_tail apply merkle_root mismatch: expected "
-            f"{expected_root}, got {actual_root} at {output_path}"
-        )
+        msg = (f"timechain_tail apply merkle_root mismatch: expected "
+               f"{expected_root}, got {actual_root} at {output_path}")
+        if verify_output:
+            raise ValueError(msg)
+        logger.warning("[timechain_tail] %s — proceeding: source tarball "
+                       "on-chain-arc-verified; post-apply check advisory.", msg)
