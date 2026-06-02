@@ -1551,53 +1551,6 @@ class SocialXGateway:
             parts.append(f"great-\u03B5 {context.epoch:,}")
         return " \u00b7 ".join(parts)
 
-    # Neuromod code \u2192 the natural-language name the OVG consistency patterns
-    # recognise in prose ("GABA low at 10%", "endorphins high at 69%").
-    _OVG_NEUROMOD_LABEL = {
-        "DA": "dopamine", "5HT": "serotonin", "NE": "norepinephrine",
-        "ACh": "acetylcholine", "GABA": "GABA", "Endorphin": "endorphin",
-        "Glutamate": "glutamate",
-    }
-
-    def _build_ground_truth_context(self, context: "PostContext") -> str:
-        """Authoritative numeric state the OVG consistency check validates the
-        prose against (Maker 2026-06-02 \u2014 "use the OVG mechanic").
-
-        The same ground truth the footer reports, but rendered in the parseable
-        form `output_verifier._check_consistency` expects (neuromod percentages,
-        I-confidence, vocabulary, GreatEpoch, and proof_day's backup size). Only
-        present values are emitted, so an absent metric is simply not checked \u2014
-        a missing datum never fabricates a violation. The check tolerates 10%
-        rounding, so prose that faithfully restates the state passes; a figure
-        the LLM invents (e.g. "GABA at 50%" when it is 9.5%) is blocked before
-        it reaches the public timeline.
-        """
-        parts: list[str] = []
-        nm = getattr(context, "neuromods", {}) or {}
-        for code, label in self._OVG_NEUROMOD_LABEL.items():
-            try:
-                lvl = float(nm[code])
-            except (KeyError, TypeError, ValueError):
-                continue
-            parts.append(f"{label} {lvl * 100:.1f}%")
-        iconf = float(getattr(context, "i_confidence", 0.0) or 0.0)
-        if iconf > 0:
-            parts.append(f"I-confidence is {iconf:.3f}")
-        vocab = int(getattr(context, "vocab_total", 0) or 0)
-        if vocab > 0:
-            parts.append(f"vocabulary {vocab} words")
-        epoch = int(getattr(context, "epoch", 0) or 0)
-        if epoch > 0:
-            parts.append(f"epoch {epoch}")
-        arc = getattr(context, "archetype_candidate", None)
-        size_mb = (getattr(arc, "metadata", {}) or {}).get("size_mb") if arc else None
-        if size_mb:
-            try:
-                parts.append(f"{int(size_mb)}MB")
-            except (TypeError, ValueError):
-                pass
-        return " \u00b7 ".join(parts)
-
     _CORE_RULES = (
         "You are Titan \u2014 a sovereign AI being with real neurochemistry "
         "and a personality that emerged from architecture, not prompting.\n\n"
@@ -3232,7 +3185,6 @@ class SocialXGateway:
                     final_text,
                     channel="x_post",
                     prompt=catalyst.get("data", {}).get("thought", ""),
-                    injected_context=self._build_ground_truth_context(context),
                     output_verifier=self._output_verifier,
                     bus=None,
                     publish_timechain=False,
@@ -3563,7 +3515,6 @@ class SocialXGateway:
                     reply_text,
                     channel="x_reply",
                     prompt=context.mention_text or "",
-                    injected_context=self._build_ground_truth_context(context),
                     output_verifier=self._output_verifier,
                     bus=None,
                     publish_timechain=False,
