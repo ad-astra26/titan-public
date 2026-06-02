@@ -76,6 +76,50 @@ def _make_reuseport_socket(host: str, port: int):
     return sock
 
 
+def _await_health_ready(plugin, kernel_proxy, timeout_s: float) -> None:
+    """SPEC §11.B.5 — reload-child readiness gate.
+
+    A zero-downtime reload child must NOT co-bind port 7777 until it can
+    actually serve 200s — otherwise SO_REUSEPORT routes OLD's live traffic to
+    us mid-warmup and we 503 it (the premature-routing gap). `/health` returns
+    200 off a warm in-process cache (dashboard `_health_summary_cache`,
+    refreshed by a background warmer). So we prime that warmer and block until
+    the cache is populated (or `timeout_s`), THEN the caller binds the port —
+    so OLD keeps 100% of traffic until we're genuinely ready. Bounded under the
+    kernel's API_RELOAD_HEALTH_TIMEOUT_S so the swap never stalls.
+    """
+    import time as _t
+    try:
+        from titan_hcl.api.dashboard import (
+            _get_health_summary_cached, _start_health_warmer)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "[api_subprocess] §11.B.5 readiness-gate import failed (%s) — "
+            "binding immediately", e)
+        return
+    try:
+        _start_health_warmer(plugin, kernel_proxy)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "[api_subprocess] §11.B.5 health-warmer start failed (%s) — "
+            "binding immediately", e)
+        return
+    deadline = _t.time() + timeout_s
+    while _t.time() < deadline:
+        try:
+            if _get_health_summary_cached() is not None:
+                logger.info(
+                    "[api_subprocess] §11.B.5 reload child health-warm — "
+                    "binding SO_REUSEPORT port now (OLD kept all traffic during warmup)")
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        _t.sleep(0.2)
+    logger.warning(
+        "[api_subprocess] §11.B.5 reload-child readiness gate timed out after "
+        "%.0fs — binding anyway (may briefly 503 until warm)", timeout_s)
+
+
 def _send_msg(send_queue, msg_type: str, src: str, dst: str,
               payload: dict, rid: str | None = None) -> None:
     """Standard worker → bus message helper. Mirrors emot_cgn_worker / etc."""
@@ -373,14 +417,21 @@ def api_subprocess_main(recv_queue, send_queue, name: str, config: dict) -> None
     server = uvicorn.Server(uvi_config)
 
     # SPEC §11.B.5 / rFP P1 — SO_REUSEPORT, gated on TITAN_API_REUSEPORT=1
-    # (default-OFF, inert in production until the kernel swap path P2/P3 sets it
-    # on the NEW child env). See _make_reuseport_socket above.
+    # (kernel sets it on EVERY api spawn so the running api is always
+    # swap-ready). See _make_reuseport_socket above.
+    #
+    # P4 refinement: a RELOAD CHILD (TITAN_API_RELOAD_CHILD=1) defers the bind
+    # until its /health is warm — otherwise SO_REUSEPORT would route OLD's live
+    # traffic to us mid-warmup and 503 it. A normal boot binds immediately
+    # (no OLD serving → nothing to protect).
     _reuse_sock = None
     if os.environ.get("TITAN_API_REUSEPORT") == "1":
+        if os.environ.get("TITAN_API_RELOAD_CHILD") == "1":
+            _await_health_ready(titan_state, plugin_proxy, timeout_s=25.0)
         _reuse_sock = _make_reuseport_socket(host, port)
         logger.info(
             "[api_subprocess] §11.B.5 SO_REUSEPORT enabled (TITAN_API_REUSEPORT=1) "
-            "— co-bound %s:%d for zero-downtime reload child", host, port)
+            "— co-bound %s:%d", host, port)
 
     # Capture the event loop reference so the bus listener can schedule
     # event_bus.emit() coroutines on it.
