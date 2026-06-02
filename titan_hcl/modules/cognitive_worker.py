@@ -1977,10 +1977,15 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
         # MeditationWatchdog.__init__ takes titan_id (required) + individual
         # kwargs — NOT a `config=` dict. The old call passed a nonexistent
         # `config=` kwarg AND omitted the required titan_id → init ALWAYS raised
-        # "missing 1 required positional argument: 'titan_id'". Map the toml
-        # section to the real kwargs (mirrors meditation_worker's construction).
+        # "missing 1 required positional argument: 'titan_id'". titan_id is NOT
+        # in this function's scope (_init_cognitive_engines) — resolve it from
+        # config the same way the worker boot + MetaReasoningEngine init do.
+        from titan_hcl.core.state_registry import resolve_titan_id as _resolve_tid_med
+        _med_titan_id = (
+            (config.get("info_banner", {}) or {}).get("titan_id")
+            or _resolve_tid_med())
         med_watchdog = MeditationWatchdog(
-            titan_id=titan_id,
+            titan_id=_med_titan_id,
             bootstrap_hours=float(_med_cfg.get("watchdog_bootstrap_hours", 12.0)),
             min_alert_hours=float(_med_cfg.get("watchdog_min_alert_hours", 3.0)),
             gap_window=int(_med_cfg.get("watchdog_gap_window", 50)),
