@@ -8,9 +8,12 @@ sys.path.append(str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from backup_chain_backfill_v3 import (  # noqa: E402
     normalize_record, build_chain_plan, existing_arcs, GENESIS_ANCHOR_TX,
+    load_manifest_events,
 )
 
 _HASH = "f518812982628dd71c9f30aca14e2c2a8ef6b4dddad04387718ee672ba2b90c0"
+_HASH2 = "d841b3444ec9d5aa1a2ae2b54dd2c68cece909a285eb875aa97cebcf02fe0e68"
+_HASH3 = "0d00d59ba8dc495796992d0155f4667130b0d8e3da0836447b84e94dab378e33"
 
 
 def test_normalize_legacy_record_builds_component():
@@ -67,3 +70,67 @@ def test_existing_arcs_parses_v3_memo_for_idempotency():
 
 def test_genesis_anchor_constant():
     assert GENESIS_ANCHOR_TX == "5StBnZIfus1mbuYJ520Ct2a4OomNUuOm_3VGZmeNGQw"
+
+
+# ── --from-manifest loader (the v=2→v=3 backfill source) ────────────────────
+
+def _write_manifest(tmp_path, events):
+    import json
+    p = tmp_path / "m.json"
+    p.write_text(json.dumps({"titan_id": "T1", "events": events}))
+    return str(p)
+
+
+def test_load_manifest_events_baseline_and_increment(tmp_path):
+    """Baseline → typ baseline; per-component arc = manifest merkle_root; mrkl is the
+    recomputed event merkle (matches the producer + restore verifier exactly)."""
+    from titan_hcl.logic.backup_zk_commit import compute_event_merkle_root
+    man = [
+        {"event_id": "ev_base", "ts_unix": 100, "type": "baseline",
+         "personality": {"tx_id": "PT_TX", "merkle_root": _HASH3},
+         "timechain": {"tx_id": "TC_TX", "merkle_root": _HASH2}, "soul": None},
+        {"event_id": "ev_inc", "ts_unix": 200, "type": "incremental",
+         "personality": {"tx_id": "PT2", "merkle_root": _HASH},
+         "timechain": {"tx_id": "TC2", "merkle_root": _HASH2}, "soul": None},
+    ]
+    events, skipped = load_manifest_events(_write_manifest(tmp_path, man))
+    assert skipped == []
+    assert [e["event_type"] for e in events] == ["baseline", "incremental"]
+    base = events[0]
+    assert base["components"] == [
+        {"tier": "PT", "tx_id": "PT_TX", "arc": _HASH3},
+        {"tier": "TC", "tx_id": "TC_TX", "arc": _HASH2}]
+    # mrkl is the FULL recomputed root; build_v3_memo truncates [:32] at post time.
+    assert base["mrkl"] == compute_event_merkle_root(_HASH3, _HASH2, None)
+
+
+def test_load_manifest_events_soul_component_included(tmp_path):
+    man = [{"event_id": "ev_soul", "ts_unix": 50, "type": "incremental",
+            "personality": {"tx_id": "P", "merkle_root": _HASH},
+            "timechain": {"tx_id": "T", "merkle_root": _HASH2},
+            "soul": {"tx_id": "S", "merkle_root": _HASH3}}]
+    events, _ = load_manifest_events(_write_manifest(tmp_path, man))
+    tiers = [c["tier"] for c in events[0]["components"]]
+    assert tiers == ["PT", "TC", "SL"]
+
+
+def test_load_manifest_events_skips_missing_component_sha_not_fabricated(tmp_path):
+    man = [{"event_id": "bad", "ts_unix": 10, "type": "incremental",
+            "personality": {"tx_id": "P"},  # no merkle_root → cannot build a faithful memo
+            "timechain": {"tx_id": "T", "merkle_root": _HASH2}, "soul": None}]
+    events, skipped = load_manifest_events(_write_manifest(tmp_path, man))
+    assert events == [] and len(skipped) == 1
+    assert "merkle_root" in skipped[0]["_skip_reason"]
+
+
+def test_load_manifest_events_sorts_oldest_first(tmp_path):
+    man = [
+        {"event_id": "late", "ts_unix": 900, "type": "incremental",
+         "personality": {"tx_id": "P", "merkle_root": _HASH},
+         "timechain": {"tx_id": "T", "merkle_root": _HASH2}, "soul": None},
+        {"event_id": "early", "ts_unix": 100, "type": "baseline",
+         "personality": {"tx_id": "P", "merkle_root": _HASH3},
+         "timechain": {"tx_id": "T", "merkle_root": _HASH2}, "soul": None},
+    ]
+    events, _ = load_manifest_events(_write_manifest(tmp_path, man))
+    assert [e["event_id"] for e in events] == ["early", "late"]

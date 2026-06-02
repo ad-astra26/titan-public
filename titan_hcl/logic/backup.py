@@ -1984,8 +1984,15 @@ class RebirthBackup:
         event_merkle_root: str,
         components: list,
         prev_sig: Optional[str] = None,
+        commit_state: bool = True,
     ) -> Optional[dict]:
         """Emit one v=3 memo per uploaded component for a single backup event.
+
+        `commit_state` (default True) co-bundles the ZK-Vault `commit_state` on the
+        head TX — correct for a LIVE event (the vault holds the LATEST event-merkle,
+        INV-MBR-4). A historical BACKFILL must pass `commit_state=False`: it posts
+        memo-only catalogue TXs and MUST NOT regress the vault PDA to an old event's
+        root.
 
         Option 1 (Maker 2026-05-30): components = ordered
         [{"tier": "PT"|"TC"|"SL", "tx_id": <arweave>, "arc": <tarball sha256>}].
@@ -2070,7 +2077,7 @@ class RebirthBackup:
                 logger.error("[Backup] v=3 memo ix build failed (%s)", comp.get("tier"))
                 return None
             ixs = [memo_ix]
-            if i == 0:  # head memo co-bundles commit_state(event_merkle_root)
+            if i == 0 and commit_state:  # head co-bundles commit_state(event_merkle_root)
                 try:
                     state_root = bytes.fromhex(event_merkle_root)
                 except ValueError:
