@@ -161,6 +161,49 @@ class SageScholar:
         )
         self.optimizer = torch.optim.Adam(params, lr=3e-4)
 
+    def save_checkpoint(self, path: str) -> None:
+        """Persist IQL network weights + optimizer state (rFP §P2 / AUDIT §C).
+
+        The actor/qvalue/value MLPs were NEVER torch.save()'d, so the offline-RL
+        policy reset to random init on every recorder respawn — discarding all
+        accumulated 'dream' training. Atomic (tmp + os.replace per §11.H.2).
+        """
+        import os
+        try:
+            ckpt = {
+                "actor": self.actor_module.state_dict(),
+                "qvalue": self.qvalue_module.state_dict(),
+                "value": self.value_module.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+            }
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            tmp = path + ".tmp"
+            torch.save(ckpt, tmp)
+            os.replace(tmp, path)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("[Scholar] IQL checkpoint save failed: %s", e)
+
+    def load_checkpoint(self, path: str) -> bool:
+        """Restore IQL weights + optimizer on boot (pairs with save_checkpoint).
+        Returns True if a checkpoint was loaded, False if absent/failed. The
+        file is self-produced, so weights_only=False is safe + required (the
+        payload includes optimizer state, not just tensors)."""
+        import os
+        if not os.path.exists(path):
+            return False
+        try:
+            ckpt = torch.load(path, map_location="cpu", weights_only=False)
+            self.actor_module.load_state_dict(ckpt["actor"])
+            self.qvalue_module.load_state_dict(ckpt["qvalue"])
+            self.value_module.load_state_dict(ckpt["value"])
+            if "optimizer" in ckpt:
+                self.optimizer.load_state_dict(ckpt["optimizer"])
+            logging.info("[Scholar] IQL checkpoint restored from %s", path)
+            return True
+        except Exception as e:  # noqa: BLE001
+            logging.warning("[Scholar] IQL checkpoint load failed: %s", e)
+            return False
+
     async def dream(self, epochs: int = 1, batch_size: int = 256):
         """
         The core Offline RL training loop representing the Titan's "Dream State".

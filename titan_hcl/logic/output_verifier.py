@@ -421,6 +421,19 @@ class OutputVerifier:
         self._rejection_timestamps: deque = deque(restored_ts, maxlen=1000)
         # Restore rejected_count from disk so cumulative counter survives.
         self.rejected_count = len(restored_ts)
+        # AUDIT §C fix (rFP §P2): verified_count was NEVER persisted → always 0
+        # on boot, accumulated in memory, lost on respawn. Persist it in a tiny
+        # atomic JSON beside the rejection ledger; restore on boot. Flushed on
+        # MODULE_SHUTDOWN + SAVE_NOW by output_verifier_worker.
+        self._counter_path = None
+        if self._rejection_store is not None:
+            try:
+                self._counter_path = self._rejection_store._dir / "output_verifier_counters.json"
+                with open(self._counter_path) as _cf:
+                    self.verified_count = int(
+                        json.load(_cf).get("verified_count", 0) or 0)
+            except Exception:
+                pass
         # ExpressionTranslator.sovereignty_ratio analogue computed lazily
         # via @property; kept as attribute for backward compat with
         # output_verifier_worker's getattr() probes.
@@ -466,6 +479,23 @@ class OutputVerifier:
                         {"ts": now_ts}, entries)
                 except Exception:
                     pass  # best-effort
+
+    def save_counters(self) -> None:
+        """Persist cumulative verified_count + rejected_count (AUDIT §C / rFP
+        §P2). Atomic (tmp + Path.replace), best-effort. Called on SAVE_NOW +
+        MODULE_SHUTDOWN by output_verifier_worker so the counters survive a
+        hot-reload / kill-respawn instead of resetting to 0."""
+        if not self._counter_path:
+            return
+        try:
+            tmp = self._counter_path.parent / (self._counter_path.name + ".tmp")
+            tmp.write_text(json.dumps({
+                "verified_count": int(self.verified_count),
+                "rejected_count": int(self.rejected_count),
+            }))
+            tmp.replace(self._counter_path)
+        except Exception:
+            pass  # best-effort
 
     # ── D-SPEC-74 split — verify_safety + sign_and_commit ────────────
 

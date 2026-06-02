@@ -928,7 +928,14 @@ def ns_worker_main(
         if msg_type == bus.MODULE_SHUTDOWN:
             logger.info("[NSWorker] Shutdown received — persisting state + exit")
             # G16 critical-data — final state snapshot on clean shutdown.
-            if flag_on and impulse_engine is not None:
+            # AUDIT §C fix (rFP §P2): was gated on `impulse_engine is not None`
+            # while intuition state is LOADED unconditionally on boot (line 773).
+            # If ImpulseEngine init fails (None) but IntuitionEngine succeeds,
+            # intuition._trust/_suggestion_count loaded-but-never-saved → lost on
+            # respawn. _save_ns_state already serializes each engine independently
+            # (lines 493/502), so fire the flush if EITHER engine is present.
+            if flag_on and (impulse_engine is not None
+                            or intuition_engine is not None):
                 _save_ns_state(
                     ns_state_path, impulse_engine, intuition_engine)
             return

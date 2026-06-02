@@ -194,6 +194,14 @@ def output_verifier_worker_main(recv_queue, send_queue, name: str, config: dict)
                 })
             except Exception:
                 pass
+            # AUDIT §C fix (rFP §P2): also flush cumulative counters to disk on
+            # the 60s cadence so an ungraceful kill loses ≤60s, not everything.
+            # (output_verifier is reply_only, so SAVE_NOW broadcasts never reach
+            # it — periodic + MODULE_SHUTDOWN flush is the durable path.)
+            try:
+                verifier.save_counters()
+            except Exception:  # noqa: BLE001
+                pass
             last_stats_publish = now
 
         # Drain bus messages
@@ -234,7 +242,14 @@ def output_verifier_worker_main(recv_queue, send_queue, name: str, config: dict)
             continue
 
         if msg_type == bus.MODULE_SHUTDOWN:
-            logger.info("[OutputVerifierWorker] Shutdown received — exiting")
+            logger.info("[OutputVerifierWorker] Shutdown received — "
+                        "persisting counters + exiting")
+            # AUDIT §C fix (rFP §P2): flush cumulative verified/rejected counters
+            # so they survive hot-reload / kill-respawn (were lost → reset to 0).
+            try:
+                verifier.save_counters()
+            except Exception:  # noqa: BLE001
+                pass
             return
         if msg_type != bus.QUERY:
             continue

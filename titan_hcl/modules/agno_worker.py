@@ -19,7 +19,12 @@ Bus subscriptions (REQUIRED):
   • CHAT_STREAM_REQUEST     — api_worker → agno_worker SSE path (NEW)
   • KERNEL_EPOCH_TICK       — 1.0 Hz dual-trigger SHM republish cadence
   • MODULE_SHUTDOWN         — graceful drain
-  • SAVE_NOW                — forces agno_state.bin republish + session DB checkpoint
+  • SAVE_NOW                — forces agno_state.bin (SHM stats) republish. NOTE:
+    session history is durable per-write via AsyncSqliteDb (no separate DB
+    checkpoint needed/done — the prior "+ session DB checkpoint" claim was
+    incorrect, AUDIT §C / rFP §P2). The only non-durable state is in-memory
+    observability stats (session_cache/hits/misses/total_chats_24h), which are
+    SHM-published, not persisted — acceptable loss on respawn.
 
 Bus publications (non-blocking per §8.0.ter D-SPEC-48):
   • AGNO_WORKER_READY       — once on boot (NEW)
@@ -1520,6 +1525,10 @@ def agno_worker_main(recv_queue, send_queue, name: str,
                 continue
 
             if msg_type == SAVE_NOW:
+                # Republish SHM stats. Session history is already durable
+                # per-write via AsyncSqliteDb, so there is no DB checkpoint to
+                # force here (AUDIT §C / rFP §P2 — contract corrected). Only the
+                # in-memory observability stats are ephemeral (acceptable loss).
                 if publisher:
                     publisher.publish(stats)
                     last_shm_publish = time.time()

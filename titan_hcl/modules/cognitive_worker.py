@@ -1980,6 +1980,8 @@ def _init_cognitive_engines(config: dict, send_queue) -> dict:
     # latent-dead, masked only because the construction always failed → None.
     # Leave med_watchdog = None (set above); the check driver is None-guarded and
     # cleanly no-ops. Meditation cadence/alerts remain fully live in meditation_worker.
+    # (Merge 2026-06-02: titan-v6 c7a9602a removal supersedes the f1038bd5 titan_id
+    # construction my reconcile carried — MeditationWatchdog is meditation_worker's.)
     med_watchdog = None
 
     # ── Meta-Reasoning Foundation (M1-M3) ──
@@ -5225,15 +5227,23 @@ def _persist_engine_state(state_refs: dict) -> None:
     meta_engine = state_refs.get("meta_engine")
     coordinator = state_refs.get("coordinator")
     intuition_convergence = state_refs.get("intuition_convergence")
+    msl = state_refs.get("msl")
 
     for engine, name_, method in (
-        (reasoning_engine, "reasoning_engine", "save_state"),
+        # AUDIT §C fix (rFP §P2): was "save_state" — ReasoningEngine only has
+        # save_all() (logic/reasoning.py:2216); the getattr(method) lookup
+        # silently returned None → policy/buffer/totals never persisted →
+        # reasoning state lost on every respawn. Corrected to save_all.
+        (reasoning_engine, "reasoning_engine", "save_all"),
         (pi_monitor, "pi_monitor", "_save_state"),
         (neural_nervous_system, "neural_nervous_system", "save_all"),
         (meta_engine, "meta_engine", "save_all"),
         # intuition_convergence loaded its state at boot but never wrote it —
         # save_state() (added 2026-05-30) closes that silent learning-loss gap.
         (intuition_convergence, "intuition_convergence", "save_state"),
+        # MSL loaded at boot via msl.load_all() but was absent from this persist
+        # list → its mutations were lost on respawn (AUDIT §C secondary). Added.
+        (msl, "msl", "save_all"),
     ):
         if engine is None:
             continue

@@ -52,12 +52,28 @@ def save_edge_detector_state(detectors: dict,
                              path: str = EDGE_DETECTOR_STATE_PATH) -> None:
     """Atomically write EdgeDetector state (tmpfile + os.replace). Best-effort:
     WARN on failure because silent failure would hide a persistence gap.
-    `detectors` is {name: EdgeDetector-instance}."""
+
+    `detectors` is {name: value} where value is EITHER an EdgeDetector instance
+    (serialized via .to_dict()) OR an already-serialized state_dict (stored
+    as-is). AUDIT §C fix (rFP §P2): expression_worker passes state_dicts
+    (`edge_holder.state_dict()`), not instances — the old `hasattr(det,
+    "to_dict")`-only filter silently DROPPED them → composite_meta_cgn was
+    never persisted (NOP), so EdgeDetector threshold-crossings reset every
+    respawn. Accepting both forms closes that gap and keeps instance callers
+    working; load_edge_detector_state already returns this serialized form.
+    """
+    def _serialize(det):
+        if hasattr(det, "to_dict"):
+            return det.to_dict()
+        return det  # already a serialized state_dict
+
     payload = {
         "schema_version": 1,
         "saved_at": time.time(),
-        "detectors": {name: det.to_dict() for name, det in detectors.items()
-                      if det is not None and hasattr(det, "to_dict")},
+        "detectors": {
+            name: _serialize(det) for name, det in detectors.items()
+            if det is not None and (hasattr(det, "to_dict") or isinstance(det, dict))
+        },
     }
     try:
         _dir = os.path.dirname(path) or "."
