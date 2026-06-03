@@ -57,7 +57,6 @@ dependencies = [
     "aiohttp>=3.9.0",                 # Async HTTP client (sage / social / streaming paths)
     "requests>=2.31.0",              # Sync HTTP (RPC helpers, simple fetches)
     "websockets>=12.0",               # Real-time event stream (Observatory WebSocket)
-    "html2text==2025.4.15",           # HTML→markdown — the DEFAULT "fast" sage scrape (load-bearing → base, NOT [research]/--minimal)
 
     # Comms — Telegram is the guaranteed channel (RFP locked decision)
     "python-telegram-bot>=21.0",      # Telegram bot (the always-on comm channel)
@@ -83,19 +82,12 @@ dependencies = [
 
 # Research stack: Stealth-Sage multi-modal research pipeline (~500MB)
 # Install: pip install openclaw-plugin-titan[research]
-# Pinned to T1's live venv (rFP_setup_titan_auto_provisioner §6, INV-PROV-10) for
-# reproducibility. CPU-ONLY: install with --extra-index-url <pytorch cpu> so any
-# torch that unstructured-inference pulls stays +cpu (INV-PROV-9). crawl4ai runs
-# NON-browser (chromium is NEVER installed); ollama is the CLIENT only (ollama_cloud).
 research = [
-    "crawl4ai==0.8.0",                           # Web scraper (non-browser HTTP strategy + Webshare proxy)
-    "playwright==1.58.0",                        # crawl4ai dep (package only — chromium is NEVER installed)
-    "tf-playwright-stealth==1.2.0",              # crawl4ai stealth helper
-    "unstructured[pdf,docx,pptx,xlsx]==0.21.5",  # Document intelligence (Sage document_processor)
-    "unstructured-inference==1.5.2",             # Layout detection (CPU onnxruntime)
-    "onnxruntime==1.22.1",                       # CPU inference for unstructured layout
-    "nltk==3.9.3",                               # Tokenization for unstructured
-    "ollama==0.6.1",                             # Ollama CLOUD client (distillation; NOT a local daemon)
+    "crawl4ai>=0.4.0",                # Playwright-based stealth web scraper
+    "playwright>=1.42.0",             # Browser automation (needs: playwright install chromium)
+    "unstructured[pdf,docx,pptx,xlsx]>=0.14.0",  # Document intelligence
+    "ollama>=0.1.7",                  # Local LLM inference (distillation, haiku, scoring)
+    "html2text>=2024.2.26",           # HTML→markdown for scraped research pages (sage)
 ]
 
 # ARC-AGI capability: the abstraction-and-reasoning challenge solver (opt-in).

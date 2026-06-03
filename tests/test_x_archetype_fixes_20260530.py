@@ -101,7 +101,10 @@ def test_cooldown_detects_both_metadata_keys(tmp_path):
                    metadata={"handle": "VitalikButerin"})
     ab = _Dummy(gateway=None, social_x_db_path=db)
     cd = ab.authors_on_cooldown(titan_id="T1", now=now)
-    assert cd == {"lopp", "vitalikbuterin"}
+    # Both metadata keys (author + handle) detected for external authors. The set
+    # is also seeded with Titan's own handles (B1/INV-XENG-1, 2026-06-03), so test
+    # for subset rather than exact equality.
+    assert {"lopp", "vitalikbuterin"} <= cd
     assert ab.author_on_cooldown("lopp", titan_id="T1", now=now)
     assert ab.author_on_cooldown("vitalikbuterin", titan_id="T1", now=now)
     assert not ab.author_on_cooldown("someone_new", titan_id="T1", now=now)
@@ -117,8 +120,11 @@ def test_cooldown_expires_after_window(tmp_path):
     assert not ab.author_on_cooldown("olduser", titan_id="T1", now=now)
 
 
-def test_cooldown_window_is_one_week():
-    assert DEFAULT_AUTHOR_COOLDOWN_S == 7 * 86400
+def test_cooldown_window_is_48h():
+    # Maker 2026-06-03 (rFP X-post PART B / INV-XENG-2): 7d → 48h. A 7-day
+    # cooldown starved the ~5-author engagement pool to ≈0; 48h matches the
+    # felt_experience recency window.
+    assert DEFAULT_AUTHOR_COOLDOWN_S == 48 * 3600
     assert "amplify" in OUTER_ENGAGEMENT_POST_TYPES
 
 

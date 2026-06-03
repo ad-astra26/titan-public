@@ -18,7 +18,6 @@ from pathlib import Path
 
 from . import __version__
 from . import state as install_state
-from . import toolchain
 from .modes import Mode, spec_for
 from .phases import run_phases
 from .preflight import run_preflight, summarize
@@ -91,10 +90,8 @@ def _cmd_resurrect(args: argparse.Namespace, repo_root: Path) -> int:
     return run_phases(state=state, mode=mode, install_root=repo_root, default=args.default,
                       minimal=args.minimal, skip_genesis=False, tag=args.tag,
                       build_rust=args.build_rust, prompter=None,
-                      resurrect=True, rpc_url=args.rpc_url, das_rpc_url=args.das_rpc_url,
-                      verify_only=args.verify_only,
-                      config_src=args.config, titan_pubkey=args.titan_pubkey,
-                      toolchain_pins=toolchain.resolve_versions(args))
+                      resurrect=True, rpc_url=args.rpc_url, verify_only=args.verify_only,
+                      config_src=args.config, titan_pubkey=args.titan_pubkey)
 
 
 def cmd_install(args: argparse.Namespace) -> int:
@@ -174,8 +171,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     install_state.save(state)
     return run_phases(state=state, mode=mode, install_root=repo_root,
                       default=args.default, minimal=args.minimal, skip_genesis=args.skip_genesis,
-                      tag=args.tag, build_rust=args.build_rust, prompter=prompter,
-                      toolchain_pins=toolchain.resolve_versions(args))
+                      tag=args.tag, build_rust=args.build_rust, prompter=prompter)
 
 
 # ── subcommands: stubs ─────────────────────────────────────────────────────
@@ -188,8 +184,7 @@ def cmd_restore(args: argparse.Namespace) -> int:
         repo_root, shard1=args.shard1, shard1_file=args.shard1_file,
         titan_pubkey=args.titan_pubkey, manifest=args.manifest,
         titan_id=args.titan_id, network=args.network,
-        verify_zk=args.verify_zk, verify_only=args.verify_only, force=args.force,
-        rpc_url=args.rpc_url, das_rpc_url=args.das_rpc_url)
+        verify_zk=args.verify_zk, verify_only=args.verify_only, force=args.force)
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -264,11 +259,7 @@ def build_parser() -> argparse.ArgumentParser:
                          "on-chain writes / backups / X) — the live restore-test guard.")
     pi.add_argument("--rpc-url", default=None,
                     help="With --resurrect: Solana RPC for the chain walk "
-                         "(default: public mainnet-beta). Prompted if omitted.")
-    pi.add_argument("--das-rpc-url", default=None,
-                    help="With --resurrect: DAS-capable RPC (Helius/Triton) for "
-                         "GenesisNFT identity discovery. Defaults to --rpc-url when "
-                         "one endpoint serves both.")
+                         "(default: public mainnet-beta).")
     pi.add_argument("--config", default=None,
                     help="With --resurrect: path to your own config.toml to stage "
                          "(for operators who opted config.toml OUT of their backup).")
@@ -278,16 +269,6 @@ def build_parser() -> argparse.ArgumentParser:
                     help="With --resurrect: your Titan's PUBLIC wallet address "
                          "(printed alongside Shard-1; not a secret). NO envelope/"
                          "manifest needed — the wallet discovers everything.")
-    # Toolchain pin overrides (auto-provisioner — default to the T1-verified PINS
-    # in toolchain.py; pass to freeze a specific version). See rFP_setup_titan_auto_provisioner.md §6.
-    pi.add_argument("--rust-version", default=None,
-                    help="Override the Rust toolchain pin (default: stable channel + musl target).")
-    pi.add_argument("--solana-version", default=None,
-                    help="Override the Solana CLI pin (default: Agave 3.1.10).")
-    pi.add_argument("--anchor-version", default=None,
-                    help="Override the Anchor CLI pin (default: 0.32.1, via avm).")
-    pi.add_argument("--node-version", default=None,
-                    help="Override the Node.js major pin (default: 22, via NodeSource).")
     pi.set_defaults(func=cmd_install)
 
     pr = sub.add_parser("restore",
@@ -304,12 +285,6 @@ def build_parser() -> argparse.ArgumentParser:
                     help="LEGACY/DEBUG ONLY: an off-site UnifiedManifest JSON. Omit "
                          "it — the sovereign v=3 chain restore needs no manifest.")
     pr.add_argument("--titan-id", default=None, help="Titan id (default: from record, else T1).")
-    pr.add_argument("--rpc-url", default=None,
-                    help="Mainnet RPC for the chain walk (default: config/public "
-                         "mainnet-beta). Prompted if omitted.")
-    pr.add_argument("--das-rpc-url", default=None,
-                    help="DAS-capable RPC (Helius/Triton) for GenesisNFT identity "
-                         "discovery. Defaults to --rpc-url when one endpoint serves both.")
     pr.add_argument("--install-root", default=None, help="Target install tree (default: this repo).")
     pr.add_argument("--network", choices=["mainnet", "devnet"], default="mainnet",
                     help="Arweave/Solana network (default: mainnet).")
