@@ -182,9 +182,15 @@ async def run_tool_backstop(
 
     success = bool(getattr(result, "success", False))
     summary = str(getattr(result, "result_summary", "") or "")[:512]
+    # Log the ACTUAL code + result (not just lengths) so the kernel journal is a
+    # faithful audit trail — proves the sandbox really executed the emitted code
+    # (the fast-model router's code), not that the LLM invented the answer.
     logger.info(
-        "[ToolBackstop] phase=%s EXECUTED coding_sandbox success=%s "
-        "code_len=%d summary=%r", phase, success, len(code), summary[:120],
+        "[ToolBackstop] phase=%s EXECUTED coding_sandbox success=%s code_len=%d\n"
+        "  CODE: %s\n  RESULT: %s",
+        phase, success, len(code),
+        (code[:400] + ("…" if len(code) > 400 else "")).replace("\n", "\\n"),
+        summary[:256].replace("\n", "\\n"),
     )
     return BackstopResult(
         fired=True, executed=True, success=success,
