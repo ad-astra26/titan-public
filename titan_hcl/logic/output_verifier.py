@@ -1151,8 +1151,7 @@ class OutputVerifier:
                                 tool_calls: Optional[list] = None,
                                 neuromods: Optional[dict] = None,
                                 embedding_hash: str = "",
-                                importance: float = 0.5,
-                                sovereignty: Optional[dict] = None) -> dict:
+                                importance: float = 0.5) -> dict:
         """Build the TIMECHAIN_COMMIT payload for a verified/blocked output.
 
         **Phase 3 (rFP §18 — episode model, D-SPEC-127):** brings the
@@ -1167,9 +1166,7 @@ class OutputVerifier:
               signature, channel, checks, violation_type, titan_id,
               # P3 fields (NEW — arch §7 normative carry):
               user_msg, agent_response, tool_calls[], neuromods{},
-              embedding_hash (132D unified-spirit), importance, topic_tags[],
-              # G9 (arch §7 / INV-Syn-25):
-              sovereignty{needed, satisfied}
+              embedding_hash (132D unified-spirit), importance, topic_tags[]
             }
 
         With `cas_payload_slimming_enabled=true` (P3.F flip), the
@@ -1292,18 +1289,6 @@ class OutputVerifier:
                     "embedding_hash": str(embedding_hash or ""),
                     "importance": float(importance),
                     "topic_tags": normalized_topic_tags,
-                    # G9 (arch §7 / INV-Syn-25): per-turn knowledge-moment
-                    # signal, persisted so the SovereigntyRatioMeter is
-                    # rebuildable from the Timechain — the synthesis_worker
-                    # boot-seeds it by replaying in-window conversation TXs.
-                    # `needed` = ≥1 item surfaced; `satisfied` = ≥1 cited recall.
-                    # Defensive bool-coercion (OVG is the security surface).
-                    # Blocked path (below) carries no §7 content → no field.
-                    "sovereignty": {
-                        "needed": bool((sovereignty or {}).get("needed", False)),
-                        "satisfied": bool(
-                            (sovereignty or {}).get("satisfied", False)),
-                    },
                 },
                 "tags": tags,
                 "significance": 0.3,

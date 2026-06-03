@@ -2187,7 +2187,6 @@ def create_post_hook(plugin):
                 # falls back to its own detect() if the stash is absent). Net:
                 # NO duplicate detect() on the chat hot path. Soft-fail per
                 # INV-Syn-17 — never blocks the response.
-                _p3_sovereignty = None
                 try:
                     from titan_hcl.synthesis.cited_use import (
                         CitedUseDetector, SurfacedItem, knowledge_moment_signal,
@@ -2215,8 +2214,6 @@ def create_post_hook(plugin):
                         _km_needed, _km_satisfied, _km_cited = (
                             knowledge_moment_signal(
                                 _km_det, _km_items, response_text))
-                        _p3_sovereignty = {
-                            "needed": _km_needed, "satisfied": _km_satisfied}
                         # Stash for agno_worker's live emits (the cited set
                         # drives per-item INV-Syn-23 reinforcement). Keyed
                         # identically to `_last_surfaced_items` so the worker's
@@ -2257,9 +2254,6 @@ def create_post_hook(plugin):
                     neuromods=_p3_snapshot.get("neuromods"),
                     embedding_hash=_p3_snapshot.get("embedding_hash", ""),
                     importance=_p3_snapshot.get("importance", 0.5),
-                    # G9 (arch §7 / INV-Syn-25) — per-turn knowledge-moment
-                    # signal persisted on the conv-TX (computed once above).
-                    sovereignty=_p3_sovereignty,
                 )
                 _ph_stage("ovg_post_verify")
                 response_text = _verified.text

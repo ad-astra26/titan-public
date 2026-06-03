@@ -21,12 +21,12 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from typing import Optional
+from typing import Callable, Optional
 
 __all__ = [
     "SovereigntyRatioMeter",
     "WINDOW_SECONDS",
-    "boot_seed_from_conversation_chain",
+    "boot_seed_from_marks",
 ]
 
 WINDOW_SECONDS = {
@@ -45,6 +45,7 @@ class SovereigntyRatioMeter:
         windows: Optional[list] = None,
         max_marks: int = 50000,
         clock=None,
+        on_record: Optional[Callable[[str, float, Optional[str]], None]] = None,
     ) -> None:
         self._windows = list(windows) if windows else ["24h", "7d", "all"]
         import time as _time
@@ -53,21 +54,50 @@ class SovereigntyRatioMeter:
         self._knowledge: deque = deque(maxlen=max_marks)
         self._satisfied: deque = deque(maxlen=max_marks)   # (ts, kind)
         self._lock = threading.Lock()
+        # G9 durable persistence (Phase F): an optional callback fired on every
+        # NEW mark — `on_record(mark_type, ts, kind)`, mark_type ∈
+        # {"knowledge","satisfied"}, kind = satisfied-kind or None. synthesis_worker
+        # injects a SynthesisWriter INSERT into synthesis.duckdb::sovereignty_marks
+        # (INV-Syn-28). Default None ⇒ the class stays pure (unit tests + non-synthesis
+        # uses unaffected). Boot-seed replays with `_persist=False` so it never re-fires.
+        self._on_record = on_record
 
     # ── recording ─────────────────────────────────────────────────────
 
-    def record_knowledge_moment(self, ts: Optional[float] = None) -> None:
-        """A chat turn that needed knowledge (≥1 retrieval surfaced OR ≥1 tool call)."""
+    def record_knowledge_moment(
+        self, ts: Optional[float] = None, *, _persist: bool = True,
+    ) -> None:
+        """A chat turn that needed knowledge (≥1 retrieval surfaced OR ≥1 tool call).
+
+        `_persist=False` (boot-seed replay only) appends the mark WITHOUT firing
+        the durable `on_record` callback — replaying durable rows must not re-write
+        them. The callback fires OUTSIDE the lock (a slow SynthesisWriter submit
+        must not stall recording)."""
+        t = float(ts if ts is not None else self._clock())
         with self._lock:
-            self._knowledge.append(float(ts if ts is not None else self._clock()))
+            self._knowledge.append(t)
+        if _persist and self._on_record is not None:
+            try:
+                self._on_record("knowledge", t, None)
+            except Exception:
+                pass
 
     def record_recall_satisfied(
         self, kind: str = "cited_recall", ts: Optional[float] = None,
+        *, _persist: bool = True,
     ) -> None:
-        """The moment was answered by memory. kind ∈ {'skill_delegation','cited_recall'}."""
+        """The moment was answered by memory. kind ∈ {'skill_delegation',
+        'cited_recall', …} — open-ended (BRAIN Phase 12 adds 'brain_grounded').
+        `_persist=False` = boot-seed replay (no re-fire of `on_record`)."""
+        t = float(ts if ts is not None else self._clock())
+        k = str(kind)
         with self._lock:
-            self._satisfied.append(
-                (float(ts if ts is not None else self._clock()), str(kind)))
+            self._satisfied.append((t, k))
+        if _persist and self._on_record is not None:
+            try:
+                self._on_record("satisfied", t, k)
+            except Exception:
+                pass
 
     # ── compute ───────────────────────────────────────────────────────
 
@@ -113,39 +143,35 @@ class SovereigntyRatioMeter:
         }
 
 
-def boot_seed_from_conversation_chain(
+def boot_seed_from_marks(
     meter: "SovereigntyRatioMeter",
+    query_fn: Callable[[float, int], object],
     *,
-    data_dir: str,
     since_ts: float,
-    cap: int = 5000,
-    index_db_path: Optional[str] = None,
+    cap: int = 50000,
 ) -> dict:
-    """Reseed `meter` from in-window conversation-fork TXs (G9 / INV-Syn-25).
+    """Reseed `meter` from the durable `sovereignty_marks` store (G9 / INV-Syn-25).
 
-    The meter holds ephemeral rolling-window marks that a worker respawn zeros
-    (the crash-loop audit §5.3 "respawn zeros windows" gap). INV-Syn-25 makes
-    metrics a **rebuildable projection over the Timechain**, so on boot we
-    replay the per-turn `sovereignty{needed,satisfied}` signal that arch §7
-    conversation-fork TXs now carry: `needed` → `record_knowledge_moment(ts)`;
-    `satisfied` → `record_recall_satisfied('cited_recall', ts)`.
+    The meter holds ephemeral rolling-window marks that a `synthesis_worker`
+    respawn zeros (crash-loop audit §5.3 "respawn zeros windows"). INV-Syn-25
+    makes metrics a rebuildable projection over a **canonical durable source**;
+    Phase F's source is `synthesis.duckdb::sovereignty_marks(ts, mark_type, kind)`,
+    written by the `on_record` callback. On boot we replay every in-window row:
+    `mark_type='knowledge'` → `record_knowledge_moment(ts)`; `'satisfied'` →
+    `record_recall_satisfied(kind, ts)` — with `_persist=False` so the replay
+    never re-writes the rows it just read.
 
-    Reads the conversation fork (resolved BY NAME per INV-Syn-26 — id is
-    chain-local) from the read-only `block_index` + chain `.bin` payload. The
-    conversation fork is ~one block per turn (the batched flood is the *episodic*
-    fork), so each block's content IS the per-turn TX; any batch envelope that
-    lacks a top-level `sovereignty` dict is skipped. Bounded by `since_ts` (the
-    longest standard rolling window — the unbounded "all" window's full-journey
-    accuracy is the genesis-spine aggregate's job, arch §18 TARGET) and `cap`
-    (logged when hit — no silent truncation). Read-only; never raises.
+    `query_fn(since_ts, limit)` returns an iterable of `(ts, mark_type, kind)`
+    rows; the caller supplies it as a **SynthesisWriter-serialized** read so this
+    function never touches a DuckDB handle off the writer thread (INV-Syn-28).
+    `since_ts` bounds the replay to the longest standard rolling window (the
+    unbounded "all"-window full-journey aggregate is the genesis-spine's job,
+    arch §18 TARGET); `cap` is surfaced when hit — no silent truncation. Never
+    raises.
 
     Returns `{scanned, knowledge_moments, recall_satisfied, capped,
     window_since_ts}`.
     """
-    import os
-    import sqlite3
-    from pathlib import Path
-
     out = {
         "scanned": 0,
         "knowledge_moments": 0,
@@ -153,64 +179,29 @@ def boot_seed_from_conversation_chain(
         "capped": False,
         "window_since_ts": float(since_ts),
     }
-    path = index_db_path or os.path.join(data_dir, "timechain", "index.db")
-    if not os.path.exists(path):
-        return out
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
-        conn.row_factory = sqlite3.Row
+        rows = list(query_fn(float(since_ts), int(cap) + 1))
     except Exception:
         return out
-    try:
-        rows = list(conn.execute(
-            "SELECT bi.block_hash, bi.fork_id, bi.file_offset, bi.timestamp "
-            "FROM block_index bi "
-            "JOIN fork_registry fr ON bi.fork_id = fr.fork_id "
-            "WHERE fr.fork_name = 'conversation' "
-            "  AND bi.thought_type = 'conversation' "
-            "  AND bi.timestamp > ? "
-            "ORDER BY bi.timestamp ASC LIMIT ?",
-            [float(since_ts), int(cap) + 1],
-        ))
-    except sqlite3.Error:
-        rows = []
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
     if len(rows) > cap:
         out["capped"] = True
         rows = rows[:cap]
-    if not rows:
-        return out
-
-    try:
-        from titan_hcl.synthesis.chain_reader import read_block_content_at
-    except Exception:
-        return out
-
-    ddir = Path(data_dir)
     for r in rows:
-        out["scanned"] += 1
         try:
-            content = read_block_content_at(
-                ddir, int(r["fork_id"]), int(r["file_offset"]))
+            ts = float(r[0])
+            mark_type = str(r[1])
+            kind = r[2]
         except Exception:
             continue
-        if not isinstance(content, dict):
-            continue
-        sov = content.get("sovereignty")
-        if not isinstance(sov, dict):
-            continue
-        ts = float(r["timestamp"])
+        out["scanned"] += 1
         try:
-            if sov.get("needed"):
-                meter.record_knowledge_moment(ts)
+            if mark_type == "knowledge":
+                meter.record_knowledge_moment(ts, _persist=False)
                 out["knowledge_moments"] += 1
-            if sov.get("satisfied"):
-                meter.record_recall_satisfied(kind="cited_recall", ts=ts)
+            elif mark_type == "satisfied":
+                meter.record_recall_satisfied(
+                    kind=str(kind) if kind is not None else "cited_recall",
+                    ts=ts, _persist=False)
                 out["recall_satisfied"] += 1
         except Exception:
             continue

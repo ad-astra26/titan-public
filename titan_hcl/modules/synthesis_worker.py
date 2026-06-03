@@ -1954,41 +1954,94 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
     metrics_cfg = dict((config or {}).get("synthesis", {}).get("metrics", {}) or {})
     if bool(metrics_cfg.get("metrics_snapshot_enabled", True)):
         try:
-            from titan_hcl.synthesis.sovereignty_meter import SovereigntyRatioMeter
+            from titan_hcl.synthesis.sovereignty_meter import (
+                SovereigntyRatioMeter, boot_seed_from_marks,
+            )
             from titan_hcl.synthesis.metrics_aggregator import (
                 LatencyRing, MetricsAggregator,
             )
+
+            # G9 (INV-Syn-25 / Phase F): the meter's rolling windows are durable
+            # because every mark is persisted to synthesis.duckdb::sovereignty_marks
+            # (sole writer = this worker's SynthesisWriter, INV-Syn-28) and replayed
+            # on boot. Replaces the v0.22.0 conv-TX boot-seed: the conversation
+            # fork's v2 batch envelopes drop per-TX content at seal, so reading
+            # `sovereignty` back found 0 — the metric's durable home is synthesis's
+            # OWN db (exactly where BRAIN reads the §18 gauge, RFP_brain §12), not
+            # the chain envelope. The meter class stays pure; we inject an on_record
+            # callback that INSERTs each mark and boot-seed replays in-window rows.
+            _seed_window_s = float(metrics_cfg.get(
+                "sovereignty_boot_seed_window_s", 7 * 24 * 3600))
+            _prune_margin_s = 86400.0  # keep 1 day past the longest window
+            _prune_every = int(metrics_cfg.get("sovereignty_marks_prune_every", 2000))
+            _prune_state = {"n": 0}
+            _persist_mark = None
+            try:
+                # Schema DDL — serialized on the writer thread (INV-Syn-28).
+                db_writer.submit_sync(lambda: store._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS sovereignty_marks "
+                    "(ts DOUBLE, mark_type VARCHAR, kind VARCHAR)"))
+
+                def _persist_mark(mark_type, ts, kind):
+                    # Fired by the meter OUTSIDE its lock; the actual write is
+                    # serialized on the SynthesisWriter. Open-ended `kind` (NULL
+                    # for knowledge marks) so BRAIN Phase 12 can add a new
+                    # satisfied-kind with zero migration. Soft-fail.
+                    try:
+                        db_writer.submit(lambda: store._conn.execute(
+                            "INSERT INTO sovereignty_marks (ts, mark_type, kind) "
+                            "VALUES (?, ?, ?)",
+                            [float(ts), str(mark_type), kind]))
+                        _prune_state["n"] += 1
+                        if _prune_state["n"] % _prune_every == 0:
+                            _cut = time.time() - _seed_window_s - _prune_margin_s
+                            db_writer.submit(lambda: store._conn.execute(
+                                "DELETE FROM sovereignty_marks WHERE ts < ?",
+                                [_cut]))
+                    except Exception:
+                        pass
+            except Exception as _ddl_err:
+                logger.warning(
+                    "[synthesis_worker] G9 sovereignty_marks DDL failed — durable "
+                    "reseed disabled this session (live meter still works): %s",
+                    _ddl_err)
+                _persist_mark = None
+
             sovereignty_meter = SovereigntyRatioMeter(
                 windows=list(metrics_cfg.get("sovereignty_windows", ["24h", "7d", "all"])),
+                on_record=_persist_mark,
             )
 
-            # G9 (INV-Syn-25): reseed the meter from in-window conversation-fork
-            # TXs so a worker respawn does NOT zero the rolling windows (the
-            # crash-loop audit §5.3 "respawn zeros windows" gap). The per-turn
-            # sovereignty{needed,satisfied} signal now rides arch §7 conv-TXs;
-            # the metric is a rebuildable projection over the Timechain.
-            # Read-only, bounded, soft-fail — never blocks boot.
-            try:
-                from titan_hcl.synthesis.sovereignty_meter import (
-                    boot_seed_from_conversation_chain,
-                )
-                _seed_window_s = float(metrics_cfg.get(
-                    "sovereignty_boot_seed_window_s", 7 * 24 * 3600))
-                _seed = boot_seed_from_conversation_chain(
-                    sovereignty_meter,
-                    data_dir=os.environ.get("TITAN_DATA_DIR", "data"),
-                    since_ts=time.time() - _seed_window_s,
-                    cap=int(metrics_cfg.get("sovereignty_boot_seed_cap", 5000)),
-                )
-                logger.info(
-                    "[synthesis_worker] G9 sovereignty boot-seed: scanned=%d "
-                    "knowledge_moments=%d recall_satisfied=%d capped=%s",
-                    _seed.get("scanned", 0), _seed.get("knowledge_moments", 0),
-                    _seed.get("recall_satisfied", 0), _seed.get("capped", False))
-            except Exception as _seed_err:
-                logger.warning(
-                    "[synthesis_worker] G9 sovereignty boot-seed skipped "
-                    "(non-blocking): %s", _seed_err)
+            # Boot-seed: replay in-window durable marks (writer-serialized read,
+            # `_persist=False` so the replay never re-writes). Bounded + soft-fail.
+            if _persist_mark is not None:
+                def _marks_query_fn(since_ts, limit):
+                    try:
+                        return db_writer.submit_sync(lambda: store._conn.execute(
+                            "SELECT ts, mark_type, kind FROM sovereignty_marks "
+                            "WHERE ts > ? ORDER BY ts ASC LIMIT ?",
+                            [float(since_ts), int(limit)]).fetchall())
+                    except Exception:
+                        return []
+                try:
+                    _seed = boot_seed_from_marks(
+                        sovereignty_meter, _marks_query_fn,
+                        since_ts=time.time() - _seed_window_s,
+                        cap=int(metrics_cfg.get("sovereignty_boot_seed_cap", 50000)))
+                    logger.info(
+                        "[synthesis_worker] G9 sovereignty boot-seed (durable marks): "
+                        "scanned=%d knowledge_moments=%d recall_satisfied=%d capped=%s",
+                        _seed.get("scanned", 0), _seed.get("knowledge_moments", 0),
+                        _seed.get("recall_satisfied", 0), _seed.get("capped", False))
+                    # One-shot boot prune so a long-idle table is trimmed even if
+                    # live inserts are sparse.
+                    _cut0 = time.time() - _seed_window_s - _prune_margin_s
+                    db_writer.submit(lambda: store._conn.execute(
+                        "DELETE FROM sovereignty_marks WHERE ts < ?", [_cut0]))
+                except Exception as _seed_err:
+                    logger.warning(
+                        "[synthesis_worker] G9 sovereignty boot-seed skipped "
+                        "(non-blocking): %s", _seed_err)
 
             retrieval_latency_ring = LatencyRing(
                 maxlen=int(metrics_cfg.get("retrieval_latency_ring_size", 1000)))

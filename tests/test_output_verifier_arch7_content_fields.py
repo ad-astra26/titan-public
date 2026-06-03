@@ -125,37 +125,9 @@ class TestArchSection7ContentFields(unittest.TestCase):
         self.assertEqual(payload["content"]["topic_tags"],
                          ["topic:solana", "topic:kuzu"])
 
-    # ── G9 (arch §7 / INV-Syn-25): sovereignty{needed,satisfied} ──
-
-    def test_sovereignty_carried_when_passed(self):
-        payload = self.ov.build_timechain_payload(
-            _pass_result(), prompt_text="hi",
-            user_id="maker", chat_id="s1",
-            sovereignty={"needed": True, "satisfied": True})
-        self.assertEqual(
-            payload["content"]["sovereignty"],
-            {"needed": True, "satisfied": True})
-
-    def test_sovereignty_defaults_to_false_when_absent(self):
-        """Schema-stable: the field is ALWAYS present (the boot-seed reads it
-        unconditionally); absent kwarg → both False."""
-        payload = self.ov.build_timechain_payload(
-            _pass_result(), prompt_text="hi",
-            user_id="maker", chat_id="s1")
-        self.assertEqual(
-            payload["content"]["sovereignty"],
-            {"needed": False, "satisfied": False})
-
-    def test_sovereignty_bool_coerced(self):
-        """OVG is the security surface — truthy/falsy values are coerced to
-        bool, never stored raw."""
-        payload = self.ov.build_timechain_payload(
-            _pass_result(), prompt_text="hi",
-            user_id="maker", chat_id="s1",
-            sovereignty={"needed": 1, "satisfied": 0})
-        sov = payload["content"]["sovereignty"]
-        self.assertIs(sov["needed"], True)
-        self.assertIs(sov["satisfied"], False)
+    # ── (G9 sovereignty is no longer a conv-TX content field — Phase F /
+    #    synthesis-engine 0.24.0 moved it to synthesis.duckdb::sovereignty_marks;
+    #    its tests live in tests/test_sovereignty_boot_seed.py.) ──
 
     # ── Defaults preserve byte-compatible behavior ────────────────
 
@@ -173,8 +145,6 @@ class TestArchSection7ContentFields(unittest.TestCase):
         self.assertEqual(c["embedding_hash"], "")
         self.assertAlmostEqual(c["importance"], 0.5)
         self.assertEqual(c["topic_tags"], [])
-        self.assertEqual(c["sovereignty"],
-                         {"needed": False, "satisfied": False})
 
     def test_p2_fields_kept_alongside_p3(self):
         """Phase 2 closure fields MUST still be present."""
@@ -252,14 +222,12 @@ class TestArchSection7ContentFields(unittest.TestCase):
             tool_calls=[{"tool": "x"}],
             neuromods={"DA": 1.0},
             embedding_hash="ff" * 32,
-            importance=0.9,
-            sovereignty={"needed": True, "satisfied": True})
+            importance=0.9)
         self.assertEqual(payload["fork"], "meta")
         self.assertEqual(payload["content"]["event"], "OVG_BLOCKED")
-        # P3 + G9 fields NOT carried on blocked path.
+        # P3 fields NOT carried on blocked path.
         for f in ("user_msg", "agent_response", "tool_calls",
-                  "neuromods", "embedding_hash", "importance", "topic_tags",
-                  "sovereignty"):
+                  "neuromods", "embedding_hash", "importance", "topic_tags"):
             self.assertNotIn(f, payload["content"])
 
 
