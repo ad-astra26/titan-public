@@ -500,3 +500,16 @@ spam_patterns = [
     "free mint", "follow back", "send me", "drop your wallet",
     "claim your", "limited offer"
 ]
+
+# rFP X-post PART B4 (INV-XENG-4) — organic auto-follow: grow the CURATED
+# following toward recurring high-relevance voices (so B3's non-followed
+# engagements become followed relationships over time). Every follow goes
+# through SocialXGateway.follow() (audited + metered). 🚨 DISABLED by default —
+# a follow is a NEW OUTWARD MAINNET ACTION; verify the follow endpoint's exact
+# effect (one manual follow, confirm on X) before flipping enabled=true.
+[social_x.auto_follow]
+enabled = false           # master switch — keep false until the endpoint is verified live
+min_recurrence = 3        # author must appear ≥N× in felt_experiences …
+min_relevance = 0.8       # … with relevance ≥ this …
+window_days = 7           # … within this lookback window
+max_per_day = 2           # hard daily follow cap (gateway also enforces a backstop)

@@ -208,6 +208,7 @@ class SocialXGateway:
     A_REPLY = "reply"
     A_LIKE = "like"
     A_SEARCH = "search"
+    A_FOLLOW = "follow"   # rFP X-post PART B4 — organic auto-follow (INV-XENG-4)
 
     # Crash recovery: pending rows older than this are expired
     PENDING_EXPIRY_SECONDS = 300  # 5 minutes
@@ -619,6 +620,10 @@ class SocialXGateway:
             # Closes BUG-X-API-LEAK-FROM-DISCOVER-MENTIONS-20260430.
             # Surfaced to gateway methods that wrap _call_x_api (+ cache layer).
             "cache": sx.get("cache", {}),
+            # rFP X-post PART B4 (INV-XENG-4) — organic auto-follow policy knobs.
+            # DISABLED by default; the live loop must not run until the follow
+            # endpoint's exact effect is verified (one manual follow) + Maker enable.
+            "auto_follow": sx.get("auto_follow", {}),
             # Voice guardrails (rFP_phase5_narrator_evolution §9): entire
             # [voice] section is surfaced so the grounding gate can read
             # dual_mode_enabled / x_grounding_* keys via the same config
@@ -4046,6 +4051,82 @@ class SocialXGateway:
                               "action_id": row_id})
         return ActionResult(status="posted", tweet_id=tweet_id,
                             action_id=row_id)
+
+    def follow(self, user_id: str, context: BaseContext,
+               consumer: str = "auto_follow", *, handle: str = "",
+               source_id: str = "") -> ActionResult:
+        """Follow a user — the SOLE sanctioned follow-write path (rFP X-post
+        PART B4 / INV-XENG-4). Used by the organic auto-follow policy to grow
+        Titan's curated following toward recurring high-relevance voices, so
+        B3's non-followed engagements become followed relationships over time.
+
+        Mirrors retweet()/like() (WAL row → _call_x_api → _update_status) so the
+        action is circuit-broken, telemetry-visible, and audited. A hard per-day
+        backstop cap (config [social_x.auto_follow].max_per_day) is enforced HERE
+        in addition to the policy, so a buggy caller can never mass-follow.
+        NEW OUTWARD MAINNET ACTION — gated by [social_x.auto_follow].enabled.
+
+        twitterapi.io: POST /twitter/follow_user_v2 {login_cookies, user_id,
+        proxy} + X-API-Key (verified 2026-06-03; needs user_id, not handle).
+        """
+        config = self._load_config()
+        if not config.get("enabled"):
+            return ActionResult(status="disabled")
+        af_cfg = config.get("auto_follow", {}) or {}
+        if not af_cfg.get("enabled", False):
+            return ActionResult(status="disabled", reason="auto_follow disabled")
+        if self._cb_is_open(write=True):
+            return ActionResult(status="circuit_breaker",
+                                reason="API disabled after consecutive failures")
+        if not user_id:
+            return ActionResult(status="failed", reason="No user_id")
+
+        # Hard per-day backstop cap (defense-in-depth; the policy also caps).
+        max_per_day = int(af_cfg.get("max_per_day", 2))
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=5)
+            n_today = conn.execute(
+                "SELECT count(*) FROM actions WHERE action_type=? AND titan_id=? "
+                "AND status=? AND created_at >= ?",
+                (self.A_FOLLOW, context.titan_id, self.S_POSTED,
+                 time.time() - 86400),
+            ).fetchone()[0]
+            conn.close()
+        except Exception:
+            n_today = 0
+        if n_today >= max_per_day:
+            return ActionResult(status="rate_limited",
+                                reason=f"follow daily cap {max_per_day} reached")
+
+        try:
+            row_id = self._insert_pending(
+                action_type=self.A_FOLLOW,
+                titan_id=context.titan_id,
+                metadata=json.dumps({
+                    "handle": handle, "user_id": str(user_id),
+                    "source_id": source_id,
+                }, separators=(",", ":"), sort_keys=True),
+                consumer=consumer,
+            )
+        except Exception as e:
+            return ActionResult(status="failed", reason=f"WAL insert: {e}")
+
+        api_result = self._call_x_api(
+            "twitter/follow_user_v2", method="POST",
+            payload={"user_id": str(user_id)},
+            session=context.session, proxy=context.proxy,
+            api_key=context.api_key,
+        )
+        if api_result.get("status") != "success":
+            err = api_result.get("message", str(api_result)[:200])
+            self._update_status(row_id, self.S_FAILED, error_message=err)
+            return ActionResult(status="api_failed", reason=err, action_id=row_id)
+
+        self._update_status(row_id, self.S_POSTED)
+        self._log_telemetry({"event": "follow_success", "handle": handle,
+                             "user_id": str(user_id), "consumer": consumer,
+                             "action_id": row_id})
+        return ActionResult(status="posted", action_id=row_id)
 
     def search(self, query: str, context: BaseContext,
                consumer: str = "", count: int = 15) -> SearchResult:
