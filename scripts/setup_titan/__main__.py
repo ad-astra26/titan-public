@@ -111,6 +111,18 @@ def cmd_install(args: argparse.Namespace) -> int:
     # --no-tui) fall back to the CLI "pick a mode" guidance.
     if mode is None and not args.default:
         use_tui = not args.no_tui and sys.stdin.isatty() and sys.stdout.isatty()
+        if use_tui:
+            # The Textual TUI is OPTIONAL — a fresh public box may not have textual
+            # (it is not a base dep, and system `pip install` is PEP-668-locked on
+            # modern Ubuntu). Degrade to the CLI mode-picker instead of crashing;
+            # the --default / --mode paths never need the TUI.
+            try:
+                from .prompts import ScriptedPrompter
+                from .tui import run_install_tui
+            except ImportError as exc:
+                cprint(f"  Textual TUI unavailable ({exc.name}) — falling back to the CLI. "
+                       "Re-run with --default or --mode {mainnet,devnet,local}.", role="warning")
+                use_tui = False
         if not use_tui:
             cprint("No mode selected. Re-run interactively for the guided wizard, or pick a mode:",
                    role="warning")
@@ -123,9 +135,7 @@ def cmd_install(args: argparse.Namespace) -> int:
                 print(f"    {spec.one_liner}")
                 print(f"    {METAL}SOL: {spec.needs_sol}{ANSI.RESET}")
             return 2
-        from .prompts import ScriptedPrompter
-        from .tui import run_install_tui
-        result = run_install_tui()
+        result = run_install_tui()   # imported above (in the use_tui try-block)
         if result is None:
             cprint("Setup cancelled — nothing was written.", role="warning")
             return 130
