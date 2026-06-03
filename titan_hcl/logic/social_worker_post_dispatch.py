@@ -135,6 +135,19 @@ class PostDispatchOrchestrator:
         # used _x_gateway._last_mention_check_ts; we keep it on the
         # orchestrator instance to avoid mutating the gateway).
         self._last_mention_check_ts: float = 0.0
+        # rFP X-post PART C2 (INV-XEFF-4) — adaptive mention-poll backoff:
+        # consecutive empty polls widen the effective cooldown (×2 each, capped),
+        # any discovered mention resets it. ≈5% mention hit-rate ⇒ cuts most of
+        # the mentions-poll spend during quiet periods. Maker-ratified 2026-06-03.
+        self._mention_empty_streak: int = 0
+        # rFP X-post PART B4 (INV-XENG-4) — organic auto-follow: periodic, gated,
+        # DISABLED by default ([social_x.auto_follow].enabled). Grows the curated
+        # following toward recurring high-relevance voices via gateway.follow().
+        self._last_auto_follow_ts: float = 0.0
+        from titan_hcl.logic.social_x.auto_follow import AutoFollowPolicy
+        self._auto_follow = AutoFollowPolicy(
+            gateway=gateway,
+            social_x_db=getattr(gateway, "_db_path", "./data/social_x.db"))
 
         # F-phase pre-post pending request_ids → (sent_ts, kind).
         # Outcome emission pops these after gateway.post returns.
@@ -814,10 +827,23 @@ class PostDispatchOrchestrator:
         spirit_worker:8303-8390. Returns number of replies posted."""
         replies_cfg = (full_config.get("social_x") or {}).get(
             "replies") or {}
-        cooldown = float(replies_cfg.get(
+        base_cooldown = float(replies_cfg.get(
             "mention_check_cooldown_seconds",
             _DEFAULT_MENTION_COOLDOWN_S))
-        if now - self._last_mention_check_ts < cooldown:
+        # C2 (INV-XEFF-4): adaptive backoff. Effective cooldown widens with the
+        # consecutive-empty streak (×2 each) up to a cap, then resets to base on
+        # the next discovered mention. Bounds responsiveness (cap) and the streak
+        # exponent (no runaway bigint). enabled=true by default; emergent, not a
+        # static cron cut (INV-XEFF-5).
+        backoff_on = bool(replies_cfg.get("mention_backoff_enabled", True))
+        cap = float(replies_cfg.get("mention_backoff_cap_seconds", 7200.0))
+        if backoff_on:
+            effective_cooldown = min(
+                base_cooldown * (2 ** min(self._mention_empty_streak, 16)),
+                cap)
+        else:
+            effective_cooldown = base_cooldown
+        if now - self._last_mention_check_ts < effective_cooldown:
             return 0
         self._last_mention_check_ts = now
 
@@ -835,6 +861,19 @@ class PostDispatchOrchestrator:
             mentions = self._gateway.discover_mentions(
                 base, consumer=self._worker_name,
                 grounded_words=grounded_words) or []
+            # C2: any discovered mention resets the backoff to base (stay
+            # responsive while conversation is live); an empty poll widens it.
+            if mentions:
+                self._mention_empty_streak = 0
+            else:
+                self._mention_empty_streak = min(
+                    self._mention_empty_streak + 1, 16)
+                logger.debug(
+                    "[PostDispatch] Mention poll empty (streak=%d) — next "
+                    "poll backed off toward %.0fs cap",
+                    self._mention_empty_streak,
+                    float((full_config.get("social_x") or {}).get(
+                        "replies", {}).get("mention_backoff_cap_seconds", 7200.0)))
             for m in mentions[:max_replies]:
                 cgn_action: dict = {}
                 try:
@@ -946,6 +985,29 @@ class PostDispatchOrchestrator:
 
     # ── Main tick entrypoint ──
 
+    def _maybe_auto_follow(self, *, ctx) -> None:
+        """rFP PART B4: periodic organic auto-follow, gated + OFF by default.
+
+        Cheap no-op unless `[social_x.auto_follow].enabled` is true; then runs at
+        most once per `check_interval_s` (default 1h). Never raises into the tick.
+        """
+        try:
+            sx_cfg = self._gateway._load_config()
+            af = sx_cfg.get("auto_follow", {}) or {}
+            if not af.get("enabled", False):
+                return
+            now = time.time()
+            interval = float(af.get("check_interval_s", 3600))
+            if now - self._last_auto_follow_ts < interval:
+                return
+            self._last_auto_follow_ts = now
+            n = self._auto_follow.run(
+                titan_id=ctx.titan_id, context=ctx, config=sx_cfg)
+            if n:
+                logger.info("[PostDispatch] auto-follow: %d new follow(s)", n)
+        except Exception as _err:
+            logger.warning("[PostDispatch] auto-follow tick failed: %s", _err)
+
     def run_tick(self) -> None:
         """One post-dispatch orchestration tick.
 
@@ -980,6 +1042,9 @@ class PostDispatchOrchestrator:
             full_config=full_config, catalysts=catalysts)
         if ctx is None:
             return  # config load failed earlier; abort tick
+
+        # ── Organic auto-follow (rFP PART B4) — periodic, gated, OFF by default ──
+        self._maybe_auto_follow(ctx=ctx)
 
         # ── Delegate-first rotation decision ──
         delegate_first = self._delegate_first_check()
