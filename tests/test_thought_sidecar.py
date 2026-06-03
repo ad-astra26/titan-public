@@ -66,3 +66,46 @@ def test_empty_tx_hash_put_is_noop(tmp_path):
     assert r.get("") is None
     w.close()
     r.close()
+
+
+def test_iter_all(tmp_path):
+    d = str(tmp_path)
+    w = ThoughtSidecar(d)
+    w.put(tx_hash="a" * 64, node_id=1, user_prompt="p1", agent_response="r1",
+          memory_type="declarative", fork="declarative", ts=1.0)
+    w.put(tx_hash="b" * 64, node_id=2, user_prompt="p2", agent_response="r2",
+          memory_type="episodic", fork="episodic", ts=2.0)
+    r = ThoughtSidecarReader(d)
+    rows = r.iter_all(limit=10)
+    assert len(rows) == 2
+    assert {row["tx_hash"] for row in rows} == {"a" * 64, "b" * 64}
+    # newest-first ordering (ts DESC)
+    assert rows[0]["tx_hash"] == "b" * 64
+    w.close()
+    r.close()
+
+
+def test_iter_all_empty_when_no_file(tmp_path):
+    r = ThoughtSidecarReader(str(tmp_path / "absent"))
+    assert r.iter_all() == []
+    r.close()
+
+
+def test_tx_content_deref_reads_sidecar(tmp_path):
+    # Phase C end-to-end: a promoted thought in the sidecar derefs to its REAL
+    # content (not the chain envelope) via TxContentDeref.
+    from titan_hcl.synthesis.tx_index_builder import TxContentDeref
+    d = str(tmp_path)
+    w = ThoughtSidecar(d)
+    w.put(tx_hash="f" * 64, node_id=7,
+          user_prompt="I love spaghetti carbonara",
+          agent_response="Great choice!", memory_type="declarative",
+          fork="declarative", ts=1.0)
+    w.close()
+    deref = TxContentDeref(data_dir=d)   # no timechain index.db present → sidecar-only
+    snip = deref.snippet("f" * 64)
+    assert snip is not None
+    assert "spaghetti carbonara" in snip
+    # a hash absent from the sidecar (and no chain) → None, no crash
+    assert deref.snippet("0" * 64) is None
+    deref.close()

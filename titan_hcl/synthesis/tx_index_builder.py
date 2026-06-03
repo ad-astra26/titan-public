@@ -38,6 +38,7 @@ from typing import Any, Optional
 
 from titan_hcl.synthesis.chain_reader import read_block_content_at
 from titan_hcl.synthesis.synthesis_vector_index import INDEXED_FORKS
+from titan_hcl.synthesis.thought_sidecar import ThoughtSidecarReader
 
 logger = logging.getLogger(__name__)
 
@@ -313,6 +314,63 @@ class TxIndexBuilder:
                 self._watermark[fork_id] = stats["max_height"]
         return stats
 
+    def run_sidecar(self, *, max_items: int = 2000, dry_run: bool = False) -> dict:
+        """Index PROMOTED thoughts from the content sidecar (RFP spine Phase C).
+
+        Embeds the REAL thought (`user_prompt` / `agent_response` from
+        `thought_sidecar.db`) — NOT the chain envelope — keyed by its per-TX hash,
+        into the per-fork vector store, so SEARCH returns promoted-thought
+        tx_hashes the deref resolves to real content. Idempotent (`store.has`
+        skip). Forks outside `INDEXED_FORKS` (e.g. episodic) clamp to
+        `declarative` so nothing promoted is left unsearchable."""
+        summary = {"scanned": 0, "indexed": 0, "skipped": 0, "no_content": 0,
+                   "by_fork": {}, "dry_run": dry_run, "ts": time.time()}
+        try:
+            reader = ThoughtSidecarReader(self._data_dir)
+        except Exception as e:
+            summary["note"] = f"sidecar reader init failed: {e}"
+            return summary
+        rows = reader.iter_all(limit=int(max_items))
+        batch_by_fork: dict[str, list] = {}
+        for row in rows:
+            summary["scanned"] += 1
+            txh = row.get("tx_hash")
+            if not txh:
+                continue
+            fork = row.get("fork") or "declarative"
+            if fork not in INDEXED_FORKS:
+                fork = "declarative"
+            if self._store.has(fork, txh):
+                summary["skipped"] += 1
+                continue
+            text = _embeddable_text("conversation", {
+                "user_prompt": row.get("user_prompt"),
+                "agent_response": row.get("agent_response"),
+            })
+            if not text:
+                summary["no_content"] += 1
+                continue
+            if dry_run:
+                summary["indexed"] += 1
+                continue
+            batch_by_fork.setdefault(fork, []).append((txh, text))
+        for fork, items in batch_by_fork.items():
+            try:
+                added = self._store.add_texts(fork, items)
+            except Exception as e:
+                logger.warning(
+                    "[TxIndexBuilder] sidecar add_texts(%s) failed: %s", fork, e)
+                added = 0
+            summary["indexed"] += added
+            summary["by_fork"][fork] = added
+        if not dry_run and summary["indexed"] > 0:
+            try:
+                self._store.save()
+            except Exception as e:
+                logger.warning("[TxIndexBuilder] sidecar store.save failed: %s", e)
+        reader.close()
+        return summary
+
     def close(self) -> None:
         if self._owns_conn and self._conn is not None:
             try:
@@ -338,6 +396,12 @@ class TxContentDeref:
     def __init__(self, *, data_dir: str, index_db: Optional[sqlite3.Connection] = None,
                  cache_size: int = 512):
         self._data_dir = str(data_dir)
+        # Phase C: prefer the lock-free content sidecar (real promoted thoughts)
+        # over the chain envelope. Soft — an absent sidecar just means chain-only.
+        try:
+            self._sidecar: Optional[ThoughtSidecarReader] = ThoughtSidecarReader(self._data_dir)
+        except Exception:
+            self._sidecar = None
         self._owns_conn = index_db is None
         if index_db is not None:
             self._conn = index_db
@@ -361,26 +425,46 @@ class TxContentDeref:
             return None
 
     def snippet(self, tx_hash: str, fork: str = "", *, max_chars: int = 512) -> Optional[str]:
-        """Return a bounded content snippet for `tx_hash` (the block_index PK),
-        or None if it can't be dereferenced."""
-        if not tx_hash or self._conn is None:
+        """Return a bounded content snippet for `tx_hash`, or None.
+
+        Phase C (RFP spine): prefer the lock-free content SIDECAR — a promoted
+        thought's REAL text keyed by its per-TX hash — and fall back to the chain
+        block ENVELOPE only for legacy / non-promoted keys (block_hashes)."""
+        if not tx_hash:
             return None
         if tx_hash in self._cache:
             return self._cache[tx_hash]
         snip: Optional[str] = None
-        try:
-            row = self._conn.execute(
-                "SELECT fork_id, file_offset FROM block_index WHERE block_hash = ? LIMIT 1",
-                (bytes.fromhex(tx_hash),),
-            ).fetchone()
-            if row is not None:
-                content = read_block_content_at(
-                    Path(self._data_dir), int(row["fork_id"]), int(row["file_offset"]))
-                text = _embeddable_text(fork or "", content or {})
-                snip = text[:max_chars] if text else None
-        except Exception as e:
-            logger.debug("[TxContentDeref] deref %s failed: %s", tx_hash[:12], e)
-            snip = None
+        # 1) sidecar — the real promoted thought (canonical recall content).
+        if self._sidecar is not None:
+            try:
+                row = self._sidecar.get(tx_hash)
+                if row is not None:
+                    text = _embeddable_text("conversation", {
+                        "user_prompt": row.get("user_prompt"),
+                        "agent_response": row.get("agent_response"),
+                    })
+                    snip = text[:max_chars] if text else None
+            except Exception as e:
+                logger.debug("[TxContentDeref] sidecar deref %s failed: %s",
+                             str(tx_hash)[:12], e)
+                snip = None
+        # 2) fallback — chain block envelope (legacy block_hash keys).
+        if snip is None and self._conn is not None:
+            try:
+                row = self._conn.execute(
+                    "SELECT fork_id, file_offset FROM block_index WHERE block_hash = ? LIMIT 1",
+                    (bytes.fromhex(tx_hash),),
+                ).fetchone()
+                if row is not None:
+                    content = read_block_content_at(
+                        Path(self._data_dir), int(row["fork_id"]), int(row["file_offset"]))
+                    text = _embeddable_text(fork or "", content or {})
+                    snip = text[:max_chars] if text else None
+            except Exception as e:
+                logger.debug("[TxContentDeref] deref %s failed: %s",
+                             str(tx_hash)[:12], e)
+                snip = None
         self._cache_put(tx_hash, snip)
         return snip
 
@@ -397,6 +481,11 @@ class TxContentDeref:
         if self._owns_conn and self._conn is not None:
             try:
                 self._conn.close()
+            except Exception:
+                pass
+        if self._sidecar is not None:
+            try:
+                self._sidecar.close()
             except Exception:
                 pass
 

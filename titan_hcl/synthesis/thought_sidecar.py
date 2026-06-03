@@ -140,6 +140,25 @@ class ThoughtSidecarReader:
                              str(tx_hash)[:12], e)
                 return None
 
+    def iter_all(self, *, limit: int = 5000) -> list:
+        """Return up to ``limit`` sidecar rows (newest-first) as dicts — for the
+        Phase C indexer (embed real thoughts into the spine, keyed by tx_hash).
+        Materializes the result (not a live cursor) so the reader lock isn't held
+        across the caller's iteration. Soft-fail → ``[]``."""
+        with self._lock:
+            conn = self._ensure()
+            if conn is None:
+                return []
+            try:
+                rows = conn.execute(
+                    "SELECT tx_hash, node_id, user_prompt, agent_response, "
+                    "memory_type, fork, ts FROM thought_content "
+                    "ORDER BY ts DESC LIMIT ?", (int(limit),)).fetchall()
+                return [dict(r) for r in rows]
+            except Exception as e:
+                logger.debug("[ThoughtSidecarReader] iter_all failed: %s", e)
+                return []
+
     def close(self) -> None:
         with self._lock:
             if self._conn is not None:

@@ -1000,6 +1000,17 @@ def synthesis_worker_main(recv_queue, send_queue, name: str,
                             "(scanned=%d) shards=%s",
                             summary["indexed"], summary["scanned"],
                             synth_vector_store.stats())
+                    # Phase C (RFP spine): index PROMOTED thoughts from the
+                    # content sidecar (real thought text keyed by per-TX hash) so
+                    # SEARCH returns promoted-thought tx_hashes the deref resolves
+                    # to real content — not the chain envelope.
+                    sc_summary = _tx_index_builder.run_sidecar(max_items=500)
+                    if sc_summary.get("indexed"):
+                        logger.info(
+                            "[synthesis_worker] tx-index sidecar tick: +%d real "
+                            "thoughts (scanned=%d) by_fork=%s",
+                            sc_summary["indexed"], sc_summary["scanned"],
+                            sc_summary.get("by_fork"))
 
                 tx_index_holder["fn"] = _tx_index_tick
                 logger.info("[synthesis_worker] tx-index incremental builder wired")
