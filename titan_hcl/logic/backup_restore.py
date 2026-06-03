@@ -383,7 +383,8 @@ def apply_event_components(
 
     Raises ValueError on apply failure UNLESS best_effort (then skips the file).
     """
-    result = {"restored_files": 0, "errors": [], "warnings": [], "skipped": []}
+    result = {"restored_files": 0, "errors": [], "warnings": [], "skipped": [],
+              "applied": []}
 
     for component, tarball_bytes in components.items():
         with unpack_event_tarball(tarball_bytes) as unpacked:
@@ -447,6 +448,7 @@ def apply_event_components(
                     result["skipped"].append(f"{component}/{arc_name}")
                     continue
                 result["restored_files"] += 1
+                result["applied"].append(f"{component}/{arc_name}")
     return result
 
 

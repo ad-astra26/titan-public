@@ -251,6 +251,12 @@ async def resurrect_from_chain(
 
     os.makedirs(scratch_dir, exist_ok=True)
 
+    # Net-of-overwrites skip tracking: a file skipped in an early event but later
+    # FULL-SHIPPED by a downstream event is fully recovered, so it must NOT count as
+    # "kept at last-good". Key = "component/arc"; value = the event it was last
+    # skipped in. A later successful apply of the same path removes it.
+    net_skipped: dict = {}
+
     # ── 4-6. fetch + verify + apply baseline → latest in chronological order ──
     for idx, ev in enumerate(apply_list):
         evt_short = ev["event_id"][:8]
@@ -381,11 +387,16 @@ async def resurrect_from_chain(
                 _ares = apply_event_components(
                     component_paths, scratch_dir, arc_to_target,
                     verify_patch_hash=False, best_effort=best_effort)
+                # A later FULL-SHIP overwrites an earlier skip → net it out.
+                for a in (_ares.get("applied") or []):
+                    net_skipped.pop(a, None)
                 _sk = _ares.get("skipped") or []
+                for s in _sk:
+                    net_skipped[s] = evt_short
                 if _sk:
-                    out.skipped_files.extend(f"{evt_short}:{s}" for s in _sk)
                     log(f"  ⚠ best-effort: skipped {len(_sk)} unreplayable file(s) "
-                        f"in event {evt_short} (kept last-good bytes)")
+                        f"in event {evt_short} (kept last-good; may be overwritten "
+                        f"by a later full-ship)")
             except Exception as e:
                 out.status = "halted"
                 out.halt_reason = HALT_APPLY_FAILED
@@ -400,16 +411,20 @@ async def resurrect_from_chain(
         log(f"[{idx + 1}/{len(apply_list)}] event {evt_short} ({ev.get('type')}) "
             f"applied ({', '.join(sorted(component_paths))})")
 
+    # NET skips: only files never overwritten by a later full-ship remain.
+    out.skipped_files = sorted(f"{ev}:{path}" for path, ev in net_skipped.items())
+
     if out.skipped_files:
         out.status = "resurrected_partial"
         log(f"✓ Resurrection PARTIAL — {out.events_applied} events, "
-            f"{out.components_applied} components, "
-            f"{len(out.skipped_files)} file(s) kept at last-good (unreplayable "
-            f"diffs) → {scratch_dir}")
+            f"{out.components_applied} components; {len(out.skipped_files)} file(s) "
+            f"genuinely unrecoverable (kept at last-good, never overwritten) → "
+            f"{scratch_dir}")
     else:
         out.status = "resurrected"
         log(f"✓ Resurrection complete — {out.events_applied} events, "
-            f"{out.components_applied} components → {scratch_dir}")
+            f"{out.components_applied} components → {scratch_dir} "
+            f"(every skipped diff was overwritten by a later full-ship)")
     return out
 
 
@@ -450,12 +465,22 @@ def restore_body_from_chain(
     and `resurrection.py` phase 2+3 — one sovereign path, no manifest crutch.
     Returns the `ResurrectionResult`.
     """
-    scratch_dir = scratch_dir or os.path.join(install_root, "data.resurrect")
+    # The body is reconstructed under a scratch CONTAINER, then atomically swapped
+    # into install_root/data on commit. build_arc_to_target resolves the tier paths
+    # (which start with "data/…") against a root, so the files land at <root>/data/…
+    # — therefore the scratch container is the root and the body lands at
+    # <container>/data, which is exactly what we swap into install_root/data. (The
+    # earlier bug: arc_to_target was rooted at install_root, so the apply wrote the
+    # body into the LIVE install_root/data and the swap then moved THAT aside,
+    # leaving install_root/data empty.)
+    scratch_container = scratch_dir or os.path.join(install_root, "data.resurrect")
+    scratch_data = os.path.join(scratch_container, "data")
+    os.makedirs(scratch_data, exist_ok=True)
     from titan_hcl.utils.arweave_store import ArweaveStore
     from titan_hcl.logic.backup_restore import build_arc_to_target
 
     store = ArweaveStore(network=network)
-    arc_to_target = build_arc_to_target(install_root)
+    arc_to_target = build_arc_to_target(scratch_container)
 
     async def _sig_lister() -> list:
         from titan_hcl.utils import solana_client as sc
@@ -480,7 +505,7 @@ def restore_body_from_chain(
         titan_id=titan_id, keypair_bytes=key_bytes, titan_pubkey=titan_pubkey,
         sig_lister=_sig_lister, memo_fetcher=_memo_fetcher,
         arweave_fetch=_arweave_fetch, arc_to_target=arc_to_target,
-        scratch_dir=scratch_dir,
+        scratch_dir=scratch_data,
         # Streaming fetch-to-disk — constant memory for multi-hundred-MB tarballs
         # (the bytes seam above is the test/fallback path).
         arweave_fetch_to_file=_arweave_fetch_to_file,
@@ -489,8 +514,16 @@ def restore_body_from_chain(
 
     # Commit a full OR a best-effort partial recovery (the latter is still the
     # maximum restorable state — the unreplayable files kept their last-good bytes).
+    # Swap the reconstructed <container>/data (where the body actually landed) into
+    # install_root/data.
     if result.status in ("resurrected", "resurrected_partial") and commit:
-        _atomic_swap_into_data(scratch_dir, install_root)
+        _atomic_swap_into_data(scratch_data, install_root)
+        # tidy the now-empty scratch container
+        try:
+            if os.path.isdir(scratch_container) and not os.listdir(scratch_container):
+                os.rmdir(scratch_container)
+        except OSError:
+            pass
     return result
 
 
