@@ -111,14 +111,10 @@ if [[ -n "$IS_APT" ]]; then
     if [[ "$(id -u)" -ne 0 ]] && ! command -v sudo >/dev/null 2>&1; then
         _die "Need root or sudo to install prerequisites (git, python3-venv, build tools)."
     fi
-    # Base deps the wizard + provisioner need: git/python to run the wizard;
-    # build-essential/pkg-config/libssl-dev for the rust+avm compiles (Phase B);
-    # xdelta3 for sovereign restore; nftables for the resurrection-test netjail.
-    _grow "Installing OS prerequisites (git, python3-venv/dev, build-essential, pkg-config, libssl-dev, xdelta3, nftables)…"
+    _grow "Installing OS prerequisites (git, python3-venv, python3-dev, build-essential)…"
     _root apt-get update -y >/dev/null 2>&1 || _warn "apt-get update had warnings (continuing)."
     _root apt-get install -y git python3 python3-venv python3-dev build-essential ca-certificates \
-        pkg-config libssl-dev xdelta3 nftables \
-        || _die "Failed to install prerequisites. Install manually then re-run: git python3-venv python3-dev build-essential pkg-config libssl-dev xdelta3 nftables"
+        || _die "Failed to install prerequisites. Install manually then re-run: git python3-venv python3-dev build-essential"
 fi
 
 command -v git     >/dev/null 2>&1 || _die "git not found (prerequisite install failed)."

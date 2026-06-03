@@ -18,7 +18,7 @@ engagement_saturation_24h = 50
 
 [stealth_sage]
 # --- Search ---
-# Self-hosted SearXNG instance (launched by setup_titan via Docker — research services phase)
+# Self-hosted SearXNG instance (launched by install_titan.sh via Docker)
 searxng_host = "http://localhost:8080"
 # How many top URLs SearXNG results to scrape per research query
 searxng_top_num_urls = 3
@@ -43,7 +43,7 @@ firecrawl_api_key = "YOUR_FIRECRAWL_KEY"
 webshare_rotating_url = ""  # http://USER:PASS@rotating.proxy.webshare.io:80/
 
 # --- Local Inference (Ollama) ---
-# Ollama API endpoint (legacy local daemon; distillation now uses [inference] ollama_cloud — no local daemon installed)
+# Ollama API endpoint (localhost after install_titan.sh runs)
 ollama_host = "http://localhost:11434"
 # Model used for distillation and document summarization
 ollama_model = "deepseek-v3.1:671b"
@@ -451,6 +451,20 @@ archetype_recency_boost_threshold = 0.5   # rank-jump kicks in at 5 days deferre
 archetype_recency_boost_max = 1.0          # cap (10 days saturation)
 # URL shortener domain (nginx redirect: /tx/HASH → solscan)
 url_domain = ""   # e.g. "https://yourdomain.tld" — your URL-shortener domain
+# On-chain provenance footer for non-proof_day posts (rFP X-post truthfulness
+# PART A). A MAINNET Titan with a GenesisNFT → its birth-certificate URL
+# (subsumes mint tx + NFT asset + constitution), e.g. "https://yourdomain.tld/genesis".
+# A DEVNET Titan with no mainnet GenesisNFT → leave "" (renders the honest
+# "devnet — no mainnet GenesisNFT yet" marker; never spoof a birth certificate).
+genesis_identity_url = ""
+# Cluster for the Epoch-Seal /tx/ link: "" (mainnet, no param) | "devnet"
+# (appends ?cluster=devnet so a devnet anchor seal resolves on the explorer).
+seal_cluster = ""
+# Titan's OWN X handles — NEVER engaged by the outer archetypes (world_mirror /
+# outer_inner_bridge / outer_rumination / amplify), rFP X-post PART B / INV-XENG-1.
+# user_name is included automatically; list any extra owned/automation accounts
+# here so Titan never replies to / mirrors / amplifies itself.
+self_handles = []
 
 # Per-Titan hourly limits (personality pacing — T1 most active, T3 quietest)
 [social_x.limits.T1]
@@ -481,8 +495,41 @@ max_mention_age_hours = 24
 min_relevance_score = 0.3
 max_replies_per_cycle = 3
 check_interval_ticks = 30
+# Mention-poll cadence. C2 (INV-XEFF-4, 2026-06-03): base interval +
+# emergent backoff — consecutive-empty polls widen the effective interval
+# ×2 each up to the cap; any discovered mention resets to base. ~5% mention
+# hit-rate ⇒ quiet periods drift to the cap (fewer calls), active periods stay
+# responsive at base. Set mention_backoff_enabled=false for a fixed interval.
+mention_check_cooldown_seconds = 1800   # base (30 min)
+mention_backoff_enabled = true
+mention_backoff_cap_seconds = 7200      # max effective interval (2 h)
 spam_patterns = [
     "DM me", "check out my", "airdrop", "giveaway",
     "free mint", "follow back", "send me", "drop your wallet",
     "claim your", "limited offer"
 ]
+
+# C3 — conversion-anchored adaptive cycle (rFP_x_post_onchain_provenance_honesty
+# Part C, 2026-06-03). events_teacher scores each paid cycle source
+# (follower/vocab/wide) by POST-CONVERSION over a trailing window (+2 converted
+# / −1 otherwise), then GATES (skip below threshold unless exploration-due) and
+# SCALES (result count) the fetch — a persistent non-converter drifts out
+# emergently. No static cron cut (INV-XEFF-5).
+[social_x.auto_cycle]
+attribution_window_s = 172800   # 48h conversion lookback (on POST time, not storage)
+gate_threshold = 0              # fetch if conversion score >= this OR exploration-due
+explore_cycles = 3              # re-probe each gated source within N windows (never blind)
+scale_floor = 3                 # explore-probe result count (converter gets full topic_search_count)
+
+# rFP X-post PART B4 (INV-XENG-4) — organic auto-follow: grow the CURATED
+# following toward recurring high-relevance voices (so B3's non-followed
+# engagements become followed relationships over time). Every follow goes
+# through SocialXGateway.follow() (audited + metered). 🚨 DISABLED by default —
+# a follow is a NEW OUTWARD MAINNET ACTION; verify the follow endpoint's exact
+# effect (one manual follow, confirm on X) before flipping enabled=true.
+[social_x.auto_follow]
+enabled = false           # master switch — keep false until the endpoint is verified live
+min_recurrence = 3        # author must appear ≥N× in felt_experiences …
+min_relevance = 0.8       # … with relevance ≥ this …
+window_days = 7           # … within this lookback window
+max_per_day = 2           # hard daily follow cap (gateway also enforces a backstop)

@@ -69,6 +69,51 @@ SOCIAL_GROUND_RECURRENCE_MIN = 2
 SOCIAL_GROUND_MAX_PER_WINDOW = 5     # cap groundings emitted per window (bus hygiene)
 CONCEPT_RECURRENCE_MAX = 2000        # bound the persisted recurrence dict
 
+# ── C3: conversion-anchored adaptive-cycle reward (rFP_x_post_onchain_provenance
+# _honesty Part C §C.7 Phase C3, Maker-ratified 2026-06-03) ──
+# The three paid cycle sources and the felt_experiences.source labels they map to.
+_CYCLE_SOURCE_LABELS = {
+    "follower": "follower_timeline",
+    "vocab": "topic_vocab",
+    "wide": "topic_wide",
+}
+_FE_SOURCE_LABELS = ("follower_timeline", "topic_vocab", "topic_wide")
+# Outer-engagement post types whose action metadata cites a felt_experiences.id.
+_OUTER_POST_TYPES = ("world_mirror", "outer_rumination",
+                     "outer_inner_bridge", "amplify")
+# Metadata keys (checked in order) under which an archetype stores the cited
+# felt_experiences.id. The schema is heterogeneous in the wild (Gap ① of the
+# 2026-06-03 framing dig): keys vary and values may be 'feA:N'-prefixed or carry
+# a non-fe namespace (mentionC:/livetest:) that must NOT join as a cycle source.
+_FE_ID_METADATA_KEYS = ("fe_id", "amplify_source_id", "outer_id", "source_id")
+
+
+def _resolve_fe_id(metadata) -> "int | None":
+    """Extract a felt_experiences.id from an outer-engagement action's metadata.
+
+    Returns the int id, or None when the metadata cites no felt experience
+    (e.g. a mention/livetest-sourced post — `mentionC:…` / `livetest:…`).
+    Handles the multiple key names + the `feA:` prefix seen in live data.
+    """
+    if not metadata:
+        return None
+    try:
+        md = json.loads(metadata) if isinstance(metadata, str) else metadata
+    except Exception:
+        return None
+    if not isinstance(md, dict):
+        return None
+    for key in _FE_ID_METADATA_KEYS:
+        val = md.get(key)
+        if val is None:
+            continue
+        s = str(val).strip()
+        if s.startswith("feA:"):     # "felt-experience pool A" namespace
+            s = s[4:]
+        if s.isdigit():
+            return int(s)
+    return None
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Data Classes
@@ -341,6 +386,15 @@ class EventsTeacherDB:
             )
         except sqlite3.OperationalError:
             pass
+        # C3 (2026-06-03): window_number on source_cycle_scores so the
+        # exploration floor can re-probe a gated source every E windows.
+        try:
+            conn.execute(
+                "ALTER TABLE source_cycle_scores "
+                "ADD COLUMN window_number INTEGER DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
         conn.close()
 
@@ -522,15 +576,22 @@ class EventsTeacherDB:
     def record_source_outcome(self, titan_id: str, source_type: str,
                                score: int, items_fetched: int,
                                items_stored: int, api_calls_used: int,
-                               query_text: str = "") -> None:
-        """Persist one cycle's outcome for a source. Score is +1 (landed) or -1."""
+                               query_text: str = "",
+                               window_number: int = 0) -> None:
+        """Persist one cycle's outcome for a source.
+
+        C3 (2026-06-03): `score` is now the conversion-anchored value
+        (+2 if the source converted within the attribution window, else −1).
+        `window_number` lets the exploration floor track last-probe cadence;
+        `items_fetched`>0 marks a real probe (skips record 0).
+        """
         self._route_write(
             "INSERT INTO source_cycle_scores "
             "(timestamp, titan_id, source_type, score, items_fetched, "
-            "items_stored, api_calls_used, query_text) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "items_stored, api_calls_used, query_text, window_number) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (time.time(), titan_id, source_type, score, items_fetched,
-             items_stored, api_calls_used, query_text[:500]),
+             items_stored, api_calls_used, query_text[:500], window_number),
             table="source_cycle_scores")
 
     def get_source_priority_scores(self, titan_id: str, window: int = 10) -> dict:
@@ -552,6 +613,117 @@ class EventsTeacherDB:
             return scores
         finally:
             conn.close()
+
+    def get_last_fetched_windows(self, titan_id: str) -> dict:
+        """{source_type: max window_number where it was actually fetched}.
+
+        A source absent here has never been probed → the exploration floor
+        treats it as due. Only rows with items_fetched>0 count as a probe
+        (gated/skipped cycles write items_fetched=0 for audit but don't reset
+        the cadence). C3 (2026-06-03).
+        """
+        conn = self._connect()
+        try:
+            out: dict = {}
+            rows = conn.execute(
+                "SELECT source_type, MAX(window_number) AS w "
+                "FROM source_cycle_scores "
+                "WHERE titan_id=? AND items_fetched>0 "
+                "GROUP BY source_type",
+                (titan_id,)).fetchall()
+            for r in rows:
+                out[r["source_type"]] = int(r["w"] or 0)
+            return out
+        finally:
+            conn.close()
+
+    def get_source_conversion_scores(self, titan_id: str,
+                                     window_s: float = 172800.0,
+                                     social_db_path: str = DEFAULT_SOCIAL_DB
+                                     ) -> dict:
+        """Conversion-anchored score per cycle source over a trailing window.
+
+        The C3 reward (rFP Part C, Maker-ratified 2026-06-03). Joins recent
+        posted/verified OUTER_ENGAGEMENT actions (social_x.db) back through the
+        cited felt_experiences.id (events_teacher.db) to the cycle SOURCE that
+        produced them:
+
+            action.metadata.<fe-id-key>  →  felt_experiences.id  →  .source
+
+        Returns ``{label: {"converted": int, "stored": int, "score": int}}``
+        for the 3 cycle labels, where::
+
+            score = +2  if the source converted ≥1 engagement in-window
+                    −1  otherwise (stored-but-unconverted OR nothing stored)
+
+        Conversion is asynchronous — posts happen later, in the social_worker
+        process — so the window is on POST time, not on this cycle's storage.
+        """
+        now = time.time()
+        cutoff = now - max(0.0, float(window_s))
+        stored = {lbl: 0 for lbl in _FE_SOURCE_LABELS}
+        converted = {lbl: 0 for lbl in _FE_SOURCE_LABELS}
+
+        # 1) stored-in-window per source (events_teacher.db)
+        conn = self._connect()
+        try:
+            for r in conn.execute(
+                    "SELECT source, COUNT(*) AS c FROM felt_experiences "
+                    "WHERE titan_id=? AND created_at>=? GROUP BY source",
+                    (titan_id, cutoff)).fetchall():
+                if r["source"] in stored:
+                    stored[r["source"]] = int(r["c"])
+        finally:
+            conn.close()
+
+        # 2) recent conversions (social_x.db) → resolve fe ids
+        fe_ids: list = []
+        if Path(social_db_path).exists():
+            try:
+                sx = sqlite3.connect(social_db_path, timeout=10)
+                sx.row_factory = sqlite3.Row
+                try:
+                    placeholders = ",".join("?" * len(_OUTER_POST_TYPES))
+                    arows = sx.execute(
+                        f"SELECT metadata FROM actions "
+                        f"WHERE post_type IN ({placeholders}) "
+                        f"AND status IN ('posted','verified') "
+                        f"AND COALESCE(posted_at, created_at) >= ?",
+                        (*_OUTER_POST_TYPES, cutoff)).fetchall()
+                finally:
+                    sx.close()
+                for a in arows:
+                    fid = _resolve_fe_id(a["metadata"])
+                    if fid is not None:
+                        fe_ids.append(fid)
+            except Exception as e:
+                logger.warning("[EventsTeacher] conversion join (social_x "
+                               "read) failed: %s", e)
+
+        # 3) fe id → source (events_teacher.db), count per cycle source
+        if fe_ids:
+            conn = self._connect()
+            try:
+                qmarks = ",".join("?" * len(set(fe_ids)))
+                id_src = {
+                    row["id"]: row["source"]
+                    for row in conn.execute(
+                        f"SELECT id, source FROM felt_experiences "
+                        f"WHERE id IN ({qmarks})", tuple(set(fe_ids))).fetchall()
+                }
+            finally:
+                conn.close()
+            for fid in fe_ids:           # count every converting post (dupes ok)
+                src = id_src.get(fid)
+                if src in converted:
+                    converted[src] += 1
+
+        out = {}
+        for lbl in _FE_SOURCE_LABELS:
+            cv = converted[lbl]
+            out[lbl] = {"converted": cv, "stored": stored[lbl],
+                        "score": (2 if cv >= 1 else -1)}
+        return out
 
     def get_post_type_engagement_stats(self, titan_id: str,
                                         since_hours: float = 48.0) -> dict:
@@ -1311,31 +1483,89 @@ class EventsTeacher:
     _CYCLE_SOURCES = ("follower", "vocab", "wide")
 
     def _run_adaptive_cycle_fetch(self, titan_id: str,
-                                    config: dict) -> tuple[list[dict], dict]:
-        """Fetch all 3 cycle sources in priority order from last N cycles' scores.
+                                    config: dict,
+                                    window_number: int = 0
+                                    ) -> tuple[list[dict], dict]:
+        """Fetch the cycle sources, GATED and SCALED by conversion (C3).
 
         Returns (items, results) where:
           items: combined list with each item having `source` field set
                   ("follower_timeline" / "topic_vocab" / "topic_wide")
-          results: {source: {items_fetched, api_calls, query}} for telemetry
-                  + post-distillation scoring.
+          results: {source: {items_fetched, api_calls, query, score, …}} for
+                  telemetry + outcome recording.
 
-        Cost ceiling: 3 X API calls (1 per source). LLM is single batched
-        downstream so 1 LLM call regardless. Some calls may hit the
-        gateway TTL cache (no paid API).
+        C3 (rFP Part C, Maker-ratified 2026-06-03) — the score now changes
+        fetch VOLUME, not just order:
+          • GATE  — a source is fetched only if its conversion score ≥
+                    `gate_threshold` (0) OR it is exploration-due (not probed
+                    in the last `explore_cycles` windows). A persistent
+                    non-converter (e.g. topic_wide) drifts to −1 → SKIPPED
+                    ⇒ fewer paid CALLS/cycle (3→2→…).
+          • SCALE — a fetched topic-search source's result count = full
+                    `topic_search_count` for a converter, else the
+                    `scale_floor` (a cheap exploration probe) ⇒ fewer billed
+                    RESULTS. follower_timeline has no count knob → gate-only.
+          • Exploration floor — every source is re-probed ≥1× per
+                    `explore_cycles` windows so it can recover (never blind).
         """
         et_cfg = config.get("events_teacher", {})
-        window = int(et_cfg.get("cycle_window_size", 10))
-        scores = {"follower": 0, "vocab": 0, "wide": 0}
+        ac_cfg = (config.get("social_x", {}) or {}).get("auto_cycle", {}) or {}
+        window_s = float(ac_cfg.get("attribution_window_s", 172800.0))   # 48 h
+        gate_threshold = int(ac_cfg.get("gate_threshold", 0))
+        explore_cycles = max(1, int(ac_cfg.get("explore_cycles", 3)))
+        scale_floor = max(1, int(ac_cfg.get("scale_floor", 3)))
+        full_count = int(et_cfg.get("topic_search_count", 10))
+
+        conv = {}
+        last_fetched = {}
         if self._db:
-            scores = self._db.get_source_priority_scores(titan_id, window=window)
-        # Sort sources desc by score; tie-break lex (deterministic)
-        priority = sorted(
-            self._CYCLE_SOURCES,
-            key=lambda s: (-scores.get(s, 0), s))
+            try:
+                conv = self._db.get_source_conversion_scores(
+                    titan_id, window_s=window_s)
+                last_fetched = self._db.get_last_fetched_windows(titan_id)
+            except Exception as e:
+                logger.warning("[EventsTeacher] conversion scoring failed "
+                               "(%s) — fetching all sources this cycle", e)
+
+        # Build per-source decisions (gate + scale + explore).
+        decisions: dict = {}
+        for source in self._CYCLE_SOURCES:
+            label = _CYCLE_SOURCE_LABELS[source]
+            c = conv.get(label, {"converted": 0, "stored": 0, "score": -1})
+            score = int(c["score"])
+            last_w = last_fetched.get(source)
+            explore_due = (last_w is None
+                           or (window_number - last_w) >= explore_cycles)
+            passes_gate = score >= gate_threshold
+            decisions[source] = {
+                "fetch": passes_gate or explore_due,
+                "score": score,
+                "converted": c["converted"],
+                "stored_window": c["stored"],
+                "explore_due": explore_due,
+                # converter → full results; explore-only probe → cheap floor
+                "count": full_count if passes_gate else scale_floor,
+            }
+
+        # Converters first (desc score), deterministic tie-break.
+        priority = sorted(self._CYCLE_SOURCES,
+                          key=lambda s: (-decisions[s]["score"], s))
         all_items: list[dict] = []
         results: dict = {}
         for source in priority:
+            d = decisions[source]
+            if not d["fetch"]:
+                # Gated this cycle — record a 0-fetch outcome (audit; the
+                # exploration floor re-probes it within `explore_cycles`).
+                results[source] = {
+                    "items_fetched": 0, "api_calls": 0, "query": "",
+                    "score": d["score"], "converted": d["converted"],
+                    "stored_window": d["stored_window"],
+                    "explore_due": False, "gated": True,
+                    "count_requested": 0,
+                }
+                continue
+            count = d["count"]
             try:
                 if source == "follower":
                     items, api_calls = self._fetch_follower_timelines(config)
@@ -1343,11 +1573,11 @@ class EventsTeacher:
                 elif source == "vocab":
                     query = self._compose_dynamic_query(config)
                     items, api_calls = self._fetch_topic_search(
-                        query, config, "topic_vocab")
+                        query, config, "topic_vocab", count=count)
                 elif source == "wide":
                     query = self._compose_wide_query(config)
                     items, api_calls = self._fetch_topic_search(
-                        query, config, "topic_wide")
+                        query, config, "topic_wide", count=count)
                 else:
                     continue
             except Exception as e:
@@ -1359,15 +1589,25 @@ class EventsTeacher:
                 "items_fetched": len(items),
                 "api_calls": api_calls,
                 "query": (query or "")[:200],
-                "priority_score_at_start": scores.get(source, 0),
+                "score": d["score"],
+                "converted": d["converted"],
+                "stored_window": d["stored_window"],
+                "explore_due": d["explore_due"],
+                "gated": False,
+                "count_requested": count,
             }
-        # Log telemetry: cycle attempt with priorities
+        # Log telemetry: cycle attempt with conversion-driven decisions.
         try:
             self._log_telemetry({
                 "event": "adaptive_cycle_fetch",
                 "titan_id": titan_id,
+                "window_number": window_number,
                 "priority_order": list(priority),
-                "scores_at_start": scores,
+                "gate_threshold": gate_threshold,
+                "conversion_scores": {s: decisions[s]["score"]
+                                      for s in self._CYCLE_SOURCES},
+                "fetched": [s for s in priority if decisions[s]["fetch"]],
+                "gated": [s for s in priority if not decisions[s]["fetch"]],
                 "results": results,
             })
         except Exception:
@@ -1378,53 +1618,64 @@ class EventsTeacher:
                                          events: list,
                                          cycle_results: dict,
                                          et_cfg: dict) -> None:
-        """Score each source +1 if ≥land_threshold events landed, else -1.
+        """Persist each source's conversion-anchored outcome (C3).
 
-        Persists to source_cycle_scores table — drives next cycle's
-        priority order.
+        The score is the trailing-window CONVERSION value computed during the
+        fetch (+2 converted / −1 otherwise) — NOT a same-cycle storage count,
+        because conversion is asynchronous (posts happen later, in
+        social_worker). `items_stored` here is this cycle's stored count, kept
+        for audit; `window_number` drives the exploration-floor cadence. Rows
+        with items_fetched=0 are gated cycles (recorded for audit, ignored by
+        the cadence tracker).
         """
-        land_threshold = int(et_cfg.get("land_threshold_events", 1))
-        # Map DistilledEvent.source values back to cycle source labels
         source_to_label = {
             "follower": "follower_timeline",
             "vocab": "topic_vocab",
             "wide": "topic_wide",
         }
+        window_number = int(getattr(self, "_window_count", 0))
         for source, info in cycle_results.items():
             label = source_to_label.get(source, source)
-            stored_count = sum(
+            stored_this_cycle = sum(
                 1 for e in events
                 if e.source == label and e.relevance >= 0.3)
-            score = +1 if stored_count >= land_threshold else -1
+            score = int(info.get("score", -1))
             try:
                 self._db.record_source_outcome(
                     titan_id=titan_id, source_type=source, score=score,
                     items_fetched=info.get("items_fetched", 0),
-                    items_stored=stored_count,
+                    items_stored=stored_this_cycle,
                     api_calls_used=info.get("api_calls", 0),
-                    query_text=info.get("query", ""))
+                    query_text=info.get("query", ""),
+                    window_number=window_number)
             except Exception as e:
                 logger.warning("[EventsTeacher] record_source_outcome "
                                "failed for %s: %s", source, e)
-            info["items_stored"] = stored_count
-            info["score"] = score
+            info["items_stored"] = stored_this_cycle
         # Final cycle telemetry with outcomes
         try:
             self._log_telemetry({
                 "event": "adaptive_cycle_outcome",
                 "titan_id": titan_id,
+                "window_number": window_number,
                 "results": cycle_results,
             })
         except Exception:
             pass
 
     def _fetch_topic_search(self, query: str, config: dict,
-                             source_label: str) -> tuple[list[dict], int]:
+                             source_label: str,
+                             count: "int | None" = None
+                             ) -> tuple[list[dict], int]:
         """Run a single topic search via SocialXGateway. Returns
         (items_list, api_calls_used).
 
         Items tagged with `source` field so adaptive cycle scoring can
         attribute downstream landed/empty outcomes.
+
+        C3 SCALE (2026-06-03): `count` overrides the configured
+        `topic_search_count` so a low-converting source can be probed with
+        fewer (billed) results. None → full configured count.
         """
         if not query:
             return [], 0
@@ -1437,7 +1688,8 @@ class EventsTeacher:
         # Maker-tunable: topic_search_count (default 10). twitterapi.io bills
         # per result on search — halving count halves cost on this endpoint.
         et_cfg = config.get("events_teacher", {})
-        topic_count = int(et_cfg.get("topic_search_count", 10))
+        topic_count = (int(count) if count is not None
+                       else int(et_cfg.get("topic_search_count", 10)))
         try:
             data = gateway.search_tweets(
                 query=query, query_type="Latest", count=topic_count, api_key=api_key)
@@ -1998,7 +2250,7 @@ class EventsTeacher:
 
             if adaptive_enabled:
                 cycle_items, cycle_results = self._run_adaptive_cycle_fetch(
-                    titan_id, config)
+                    titan_id, config, window_number=self._window_count)
                 # Source-stored counts will be filled after distillation
                 follower_items = [i for i in cycle_items
                                   if i.get("source") == "follower_timeline"]
